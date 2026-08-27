@@ -10,30 +10,34 @@ what to bring over from oh-my-pi ("OMP") before implementing.
 - **FORK** = adopt OMP's engine as a base and drive it from CAD's UI.
 - **GLUE** = wire in an external open-source tool (firmware).
 
-OMP vendored at `scratch/omp-src` (pinned git `6ae7cdb`), upstream `github.com/can1357/oh-my-pi`.
+Production source: private `Hunter-124/omp`, pinned by `vendor/omp/OMP_VENDOR.lock`.
+Historical dossiers below name the public inspection checkout they were written against; those
+paths are evidence provenance, not the current update source.
 
 ---
 
 ## 0. TL;DR — recommended strategy
 
-**Curated selective reuse, not a wholesale fork.** Three findings drive this:
+**One private platform, thin product adapters.** The original selective-reuse finding still
+holds at the CAD engine boundary, but `Hunter-124/omp` is now the closed-source backbone for
+every AI-integrated product rather than an optional upstream sidecar:
 
-1. **CAD's real engine is the C++ core** (`core/agent/run.cpp`); `services/agent/loop.py` is a
-   dead stub. `services/agent` is the host-RPC bridge + CAD-domain reasoning.
-2. **CAD's governance layer is often *more advanced* than OMP's** — roles (versioned
-   `aicad.role/1` schema, tool-allowlists, GBNF grammar), `delegation.py` (budget tree +
-   approval + kill-switch), `councils.py`, `org.py`, `guardrails.py` (hard physics floors),
-   `redaction.py` (ITAR), and the `tool_registry.py` `_get_fn` dual-dispatch gate. OMP has no
-   equivalents. **These are the crown jewels — KEEP.**
-3. **OMP's genuine wins are the generic infra**: the 44-provider + auth layer, a production
-   **MCP client** (CAD has none), the **DAP/LSP** debugger substrate, **slash-commands**,
-   **advisor hardening**, **prewalk**, **session atomic-writes**, and the **snapcompact image
-   tier**. Precedent already exists: `compaction.py` and the handoff prompt are attributed
-   in-code as OMP ports.
+1. **Private OMP owns universal AI behavior** — provider/auth/catalog semantics, agent-loop and
+   context contracts, tool policy/budgets, model-role assignment, memory/compaction coordination,
+   durable inter-agent communication, observability, and the standalone platform UI.
+2. **CAD owns product-domain behavior** — geometry/document/daemon adapters, CAD roles and prompts,
+   physics/manufacturing guardrails, ITAR/redaction policy, and the native C++ completion path where
+   measured latency warrants it.
+3. **Migration is clean-cut and incremental.** Move one universal contract/implementation into
+   private OMP, adapt CAD through `vendor/omp/bridge`, pass the same behavior gates, then delete the
+   CAD duplicate. Do not relocate Python wholesale into a TypeScript repo and call that reuse.
+4. **No parallel UI invention here.** A concurrent OMP session owns adapting CAD's UI into the
+   standalone private-platform UI. CAD exposes and consumes stable data contracts; it does not
+   duplicate that surface.
 
-So: **reuse OMP's infra via a bun "bridge" sidecar (+ small Python ports), keep CAD's engine
-and governance, and make re-vendoring a deterministic script** so we keep inheriting upstream
-improvements. Fork stays a *later, optional* move for the engine loop only.
+So: **private OMP is the platform; CAD is a configured consumer with a thin native/domain
+adapter.** The bridge remains the reuse seam during extraction and for platform subsystems that
+should run verbatim in Bun.
 
 ---
 

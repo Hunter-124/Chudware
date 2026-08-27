@@ -2,7 +2,7 @@ telemetry = false
 
 [install]
 minimumReleaseAge = 259200 # 3 days in seconds
-minimumReleaseAgeExcludes = ["@oh-my-pi/hashline", "@oh-my-pi/omp-stats", "@oh-my-pi/pi-agent-core", "@oh-my-pi/pi-ai", "@oh-my-pi/pi-catalog", "@oh-my-pi/pi-coding-agent", "@oh-my-pi/pi-mnemopi", "@oh-my-pi/pi-natives", "@oh-my-pi/pi-natives-darwin-arm64", "@oh-my-pi/pi-natives-darwin-x64", "@oh-my-pi/pi-natives-linux-arm64", "@oh-my-pi/pi-natives-linux-x64", "@oh-my-pi/pi-natives-win32-arm64", "@oh-my-pi/pi-natives-win32-x64", "@oh-my-pi/pi-tui", "@oh-my-pi/pi-utils", "@oh-my-pi/pi-wire", "@oh-my-pi/snapcompact", "@types/bun", "bun-types"]
+minimumReleaseAgeExcludes = ["@oh-my-pi/hashline", "@oh-my-pi/omp-stats", "@oh-my-pi/omptype", "@oh-my-pi/pi-agent-core", "@oh-my-pi/pi-ai", "@oh-my-pi/pi-catalog", "@oh-my-pi/pi-coding-agent", "@oh-my-pi/pi-mnemopi", "@oh-my-pi/pi-natives", "@oh-my-pi/pi-natives-darwin-arm64", "@oh-my-pi/pi-natives-darwin-x64", "@oh-my-pi/pi-natives-linux-arm64", "@oh-my-pi/pi-natives-linux-x64", "@oh-my-pi/pi-natives-win32-arm64", "@oh-my-pi/pi-natives-win32-x64", "@oh-my-pi/pi-tui", "@oh-my-pi/pi-utils", "@oh-my-pi/pi-wire", "@oh-my-pi/snapcompact", "@types/bun", "bun-types", "kitty-vt-wasm"]
 linker = "hoisted"
 exact = true
 saveTextLockfile = true
@@ -15,6 +15,11 @@ saveTextLockfile = true
 [test]
 # bun test does NOT honor .gitignore; prune robomp's repo clones and
 # scratch dirs so a root-level `bun test` doesn't walk into them.
+#
+# `bazel-*` are Bazel's convenience symlinks, and `bazel-oh-my-pi` points at
+# the workspace root itself: without this the scanner recurses through that
+# loop, exhausts file descriptors, and every test that pipes a child process's
+# stdio fails with empty output or EPIPE.
 pathIgnorePatterns = [
   "**/node_modules/**",
   "**/.git/**",
@@ -26,6 +31,8 @@ pathIgnorePatterns = [
   "python/robomp/data/**",
   ".wt/**",
   ".worktrees/**",
+  "bazel-*/**",
+  "**/bazel-out/**",
 ]
 
 [run]

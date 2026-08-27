@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
-"""Deterministically vendor a whitelisted subset of oh-my-pi ("OMP") into vendor/omp/.
+"""Deterministically vendor a whitelisted subset of Hunter's private OMP platform into
+vendor/omp/.
 
-We reuse OMP subsystems (providers, memory, snapcompact) verbatim by importing OMP's real
-TypeScript from a bun "bridge" process. This script is the *update* mechanism: it pins an
-upstream commit, copies only the packages we recycle, regenerates a minimal bun workspace
-root, and records a content-hash lockfile so re-vendoring is reproducible and reviewable.
+CAD reuses OMP subsystems (providers, memory, snapcompact) verbatim by importing OMP's real
+TypeScript from a bun "bridge" process. This script is the *update* mechanism: it pins a
+private-harness commit, copies only the packages CAD recycles, regenerates a minimal bun
+workspace root, and records a content-hash lockfile so re-vendoring is reproducible and
+reviewable.
 
 Design:
   vendor/omp/
@@ -14,17 +16,16 @@ Design:
     bunfig.toml, tsconfig*.json, patches/   <- copied from upstream (needed by bun install)
     OMP_VENDOR.lock     <- {source, sha, dirty, dirty_files, packages, files:{path:sha256}}
 
-`sha` alone only pins the vendored bytes when the source checkout was CLEAN. Vendoring from
-a dirty checkout (the normal case for our fork, which carries local patches that exist in no
-commit) records `dirty: true` plus `dirty_files` — the paths git reported as locally modified
-or untracked — so a reader knows the tree is "upstream `sha` PLUS these local patches" and not
-a plain upstream snapshot. `files` remains the authoritative content hash either way.
+`sha` alone pins the vendored bytes when the source checkout is CLEAN. Dirty source checkouts
+remain supported for diagnosis and record `dirty: true`, `dirty_files`, plus a hash-pinned
+`local-patches/` series — but production CAD MUST vendor a clean commit from
+`Hunter-124/omp`. Local patches were the migration path, not the steady state.
 
 Usage:
-  # initial pin from the local inspection checkout (already at the pinned SHA), offline:
-  python3 scripts/vendor_omp.py --from scratch/omp-src
-  # pull a newer upstream commit (the "keep getting OMP goodies" path):
-  python3 scripts/vendor_omp.py --from https://github.com/can1357/oh-my-pi.git --sha <git-sha>
+  # production refresh from the private AI backbone (default source):
+  python3 scripts/vendor_omp.py --sha <Hunter-124/omp git sha>
+  # inspect a clean local private-harness checkout offline:
+  python3 scripts/vendor_omp.py --from /home/hunter/Repositories/omp
   # verify the working tree still matches the lockfile (CI / pre-build gate):
   python3 scripts/vendor_omp.py --verify
 
@@ -73,7 +74,7 @@ ROOT_DIRS = ["patches"]
 REPO_ROOT = Path(__file__).resolve().parent.parent
 VENDOR_DIR = REPO_ROOT / "vendor" / "omp"
 LOCK_PATH = VENDOR_DIR / "OMP_VENDOR.lock"
-DEFAULT_UPSTREAM = "https://github.com/can1357/oh-my-pi.git"
+DEFAULT_UPSTREAM = "https://github.com/Hunter-124/omp.git"
 
 # Directories inside a package we never need at runtime (tests, fixtures) — trims the vendored
 # footprint without affecting imports. Conservative: only drop clearly non-runtime dirs.
@@ -525,8 +526,9 @@ def verify() -> int:
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--from", dest="from_arg", default=DEFAULT_UPSTREAM,
-                    help="local OMP checkout path or git URL (default: upstream)")
-    ap.add_argument("--sha", default=None, help="upstream commit SHA (required for git URL)")
+                    help="local private OMP checkout path or git URL "
+                         "(default: https://github.com/Hunter-124/omp.git)")
+    ap.add_argument("--sha", default=None, help="private OMP commit SHA (required for git URL)")
     ap.add_argument("--packages", nargs="*", default=DEFAULT_PACKAGES,
                     help="package names under packages/ to vendor")
     ap.add_argument("--install", action="store_true", help="run `bun install` after vendoring")

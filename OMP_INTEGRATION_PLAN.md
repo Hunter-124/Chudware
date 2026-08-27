@@ -1,14 +1,20 @@
 # OMP Integration — Live Execution Plan (main project, ~3h push)
 
-Status board + contracts for wiring oh-my-pi ("OMP") into CAD's built-in copilot and firmware
-IDE. Detail + research live in `docs/omp-integration/` (`00-OPTIONS-AND-DECISIONS.md`,
+Status board + contracts for wiring Hunter's private OMP platform (`Hunter-124/omp`) into
+CAD's built-in copilot and firmware IDE. OMP is the reusable AI backbone for CAD,
+CloudCastle, and future products; CAD keeps domain adapters and the native C++ fast path.
+Detail + research live in `docs/omp-integration/` (`00-OPTIONS-AND-DECISIONS.md`,
 `01-DECISIONS.md`, `research/`). This file is the top-level, always-current plan.
 
-## Landed (on master) — all 6 slices, full Chudware host binary builds
-- **Vendoring** `scripts/vendor_omp.py` + `vendor/omp/` — deterministic; prebuilt `pi-natives` via npm.
-- **Bridge** `vendor/omp/bridge` — bun sidecar: `complete`, `listProviders`(67), `models_list`,
-  `cost_summary`, 13 `auth_*`, `memory_*`, `compact` (safety: sha256 frames + recoverable + text
-  fallback), `warm_cache`/`cache_policy`. Verified via bun stdio.
+## Landed (on master)
+- **Private-backbone pin** `vendor/omp/OMP_VENDOR.lock` — clean commit from
+  `https://github.com/Hunter-124/omp.git`, deterministic and zero local patches.
+- **Vendoring** `scripts/vendor_omp.py` + `vendor/omp/` — private OMP is the default source;
+  prebuilt `pi-natives` comes from npm at the matching platform version.
+- **Bridge** `vendor/omp/bridge` — bun sidecar: `complete`, provider/model catalog,
+  `cost_summary`, `auth_*`, `memory_*`, `compact` (sha256 frames + recoverable text fallback),
+  and `warm_cache`/`cache_policy`. Verified via bun stdio against private OMP: 4,500 models
+  and 78 providers, with pricing and disabled-credential metadata complete.
 - **C++ core** `core/agent/omp_bridge_client.{h,cpp}` + `providers.cpp` (52 OMP ids routed) +
   `config.cpp` + 12 `libchudware` C-ABI methods + `CompleteResult.usage`. `chudware_agent`/`chudware` build clean.
 - **Provider UI** `settings_modal.cpp` (Settings→Providers: key+OAuth sign-in) + `copilot/settings.cpp`
@@ -18,10 +24,18 @@ IDE. Detail + research live in `docs/omp-integration/` (`00-OPTIONS-AND-DECISION
 - **Firmware** `core/firmware/hardware.cpp` (avrdude/OpenOCD-GDB/simavr/Renode/serial) + 12 RPCs +
   `fw_workspace.cpp` unified Arduino-style IDE. `test_firmware` 24/24; live Renode.
 
-### Remaining (next phase, after runtime verify)
-- Cache-warming/cheap-recompact: UI toggles + C++ idle-scheduler (backend done).
-- Firmware breadth beyond ARM/AVR (RISC-V rides gdb-MI; PIC/FPGA/PLC need glue).
-- Installer bundling of `bun` (+ `pi-natives`). Prewalk/advisor/slash-commands (not started).
+### Remaining — platform extraction, in dependency order
+1. Move universal harness contracts and implementations from `services/agent` into private OMP:
+   tool policy/budgets, events, roles/model assignment, compaction/memory coordination, durable
+   inter-agent communication, and observability. Do not move CAD geometry/document tools.
+2. Make CAD consume those contracts through the bridge; delete each Python/C++ duplicate only
+   after the private implementation and CAD adapter pass the same behavior gates.
+3. Keep the native C++ provider path where measured latency warrants it; OMP owns provider/auth
+   semantics and catalog data, CAD owns the thin transport adapter.
+4. Standalone OMP UI is owned by a concurrent OMP session. CAD must expose stable data contracts
+   and consume the platform, not duplicate that UI work.
+5. Cache-warming idle scheduler, installer bundling of bun/pi-natives, and remaining firmware
+   breadth follow after the harness boundary is clean.
 
 ## Architecture (data flow)
 ```

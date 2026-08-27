@@ -27,7 +27,7 @@ import * as path from "node:path";
 import { Database } from "bun:sqlite";
 import {
 	AuthStorage,
-	isSqliteCorruptError,
+	isSqliteCorruptionError,
 	PROVIDER_REGISTRY,
 	resolveUsedFraction,
 	SqliteAuthCredentialStore,
@@ -208,7 +208,7 @@ export function getAuthContext(): Promise<AuthContext> {
 		try {
 			return await openAuthContext(dbPath);
 		} catch (err) {
-			const moved = isSqliteCorruptError(err) ? quarantineCorruptAuthDb(dbPath) : [];
+			const moved = isSqliteCorruptionError(err) ? quarantineCorruptAuthDb(dbPath) : [];
 			if (moved.length === 0) throw err;
 			process.stderr.write(
 				`[omp-bridge] WARN auth db ${dbPath} is corrupt (${err instanceof Error ? err.message : String(err)}); ` +

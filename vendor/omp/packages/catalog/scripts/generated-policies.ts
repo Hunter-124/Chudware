@@ -18,11 +18,14 @@ import { isMimoModelIdOrName } from "../src/identity/family";
 import { getLongestModelLikeIdSegment } from "../src/identity/id";
 import { buildModelReferenceIndex, resolveModelReference } from "../src/identity/reference";
 import { resolveModelThinking } from "../src/model-thinking";
+import { isOllamaCloudOutputCapped, OLLAMA_CLOUD_MAX_OUTPUT_TOKENS } from "../src/provider-models/ollama";
 import {
 	ALIBABA_TOKEN_PLAN_STATIC_MODELS,
+	applyXaiResponsesThinkingPolicy,
+	OPENAI_GPT_56_LONG_CONTEXT_COSTS,
 	resolveWaferServerlessThinkingFormat,
 } from "../src/provider-models/openai-compat";
-import type { Api, Model, ModelSpec } from "../src/types";
+import type { Api, LongContextTokenCost, Model, ModelSpec } from "../src/types";
 import { isVariantCollapsedSpec } from "../src/variant-collapse";
 import { buildCanonicalModelIndex, buildCanonicalReferenceData } from "./equivalence";
 
@@ -51,18 +54,59 @@ export const CLOUDFLARE_FALLBACK_MODEL: ModelSpec<"anthropic-messages"> = {
 	maxTokens: 64000,
 };
 
+/** True when any component of a model's per-million-token cost is nonzero. */
+export function hasBillableCost(cost: ModelSpec["cost"]): boolean {
+	return cost.input !== 0 || cost.output !== 0 || cost.cacheRead !== 0 || cost.cacheWrite !== 0;
+}
+
 /**
- * `models.dev` currently lists `jp.anthropic.claude-opus-5`, but AWS's own
- * Bedrock model card documents only `anthropic.claude-opus-5` plus the `us.`,
- * `eu.`, `au.`, and `global.` Geo/Global inference-profile IDs under
- * Programmatic Access; Japan regions are marked unsupported for Geo inference
- * in the same card's regional-availability table. Bedrock rejects an
- * undocumented inference-profile ID outright, so drop this specific upstream
- * row rather than ship a selector that 4xxs on first use (PR #6591 review).
- * https://docs.aws.amazon.com/bedrock/latest/userguide/model-card-anthropic-claude-opus-5.html
+ * Providers whose first-party list prices back-fill Antigravity's unpriced
+ * rows, in lookup order. Antigravity discovery reports no pricing (the
+ * subscription bills upstream), so without this the whole provider surfaces
+ * $0 cost for every request. Antigravity bills through Google, so Vertex
+ * prices outrank Anthropic list prices for Claude ids.
  */
-export function dropUnsupportedBedrockGeoIds(models: readonly ModelSpec[]): ModelSpec[] {
-	return models.filter(model => !(model.provider === "amazon-bedrock" && model.id === "jp.anthropic.claude-opus-5"));
+const ANTIGRAVITY_PRICING_PEERS = ["google", "google-vertex", "anthropic"] as const;
+
+/**
+ * Antigravity ids whose Google peer ships under a different id: Gemini
+ * previews carry a `-preview` suffix on the Google API, Claude ids carry a
+ * Vertex `@<version>` suffix. A dangling alias (retired Vertex id) falls back
+ * to the plain-id lookup, i.e. Anthropic list prices for Claude.
+ */
+const ANTIGRAVITY_PRICING_ID_ALIASES: Readonly<Record<string, string>> = {
+	"gemini-3-flash": "gemini-3-flash-preview",
+	"gemini-3-pro": "gemini-3-pro-preview",
+	"gemini-3.1-pro": "gemini-3.1-pro-preview",
+	"claude-opus-4-5": "claude-opus-4-5@20251101",
+	"claude-opus-4-6": "claude-opus-4-6@default",
+	"claude-sonnet-4-5": "claude-sonnet-4-5@20250929",
+	"claude-sonnet-4-6": "claude-sonnet-4-6@default",
+};
+
+/**
+ * Price `google-antigravity` models at their first-party equivalents: Gemini
+ * ids at Google API list prices, Claude ids at Google Vertex list prices
+ * (falling back to Anthropic). Models without a priced peer (gpt-oss,
+ * internal tab models) keep zero cost.
+ */
+export function applyAntigravityPricingFallback(models: readonly ModelSpec[]): ModelSpec[] {
+	const peerCosts = new Map<string, ModelSpec["cost"]>();
+	for (const peer of ANTIGRAVITY_PRICING_PEERS) {
+		for (const model of models) {
+			if (model.provider === peer && hasBillableCost(model.cost) && !peerCosts.has(model.id)) {
+				peerCosts.set(model.id, model.cost);
+			}
+		}
+	}
+	return models.map(model => {
+		if (model.provider !== "google-antigravity" || hasBillableCost(model.cost)) {
+			return model;
+		}
+		const alias = ANTIGRAVITY_PRICING_ID_ALIASES[model.id];
+		const cost = (alias ? peerCosts.get(alias) : undefined) ?? peerCosts.get(model.id);
+		return cost ? { ...model, cost: { ...cost } } : model;
+	});
 }
 
 const CODEX_GPT_5_4_PRIORITY_BY_VARIANT: Partial<Record<OpenAIVariant, number>> = {
@@ -70,6 +114,39 @@ const CODEX_GPT_5_4_PRIORITY_BY_VARIANT: Partial<Record<OpenAIVariant, number>> 
 	mini: 1,
 	nano: 2,
 };
+
+const CODEX_GPT_5_6_1M_MODEL_IDS: Record<string, true> = {
+	"gpt-5.6-luna": true,
+	"gpt-5.6-sol": true,
+	"gpt-5.6-terra": true,
+};
+
+const OPENAI_GPT_5_6_LONG_CONTEXT_COST_BY_MODEL_ID: Readonly<Record<string, LongContextTokenCost>> = {
+	"daybreak-blue-latest": OPENAI_GPT_56_LONG_CONTEXT_COSTS.sol,
+	"gpt-5.6": OPENAI_GPT_56_LONG_CONTEXT_COSTS.sol,
+	"gpt-5.6-luna": OPENAI_GPT_56_LONG_CONTEXT_COSTS.luna,
+	"gpt-5.6-sol": OPENAI_GPT_56_LONG_CONTEXT_COSTS.sol,
+	"gpt-5.6-terra": OPENAI_GPT_56_LONG_CONTEXT_COSTS.terra,
+};
+
+const OPENAI_NONE_EFFORT_MODEL_IDS: Record<string, true> = {
+	"daybreak-blue-latest": true,
+	"daybreak-red-latest": true,
+	"gpt-5.6": true,
+	"gpt-5.6-cyber": true,
+	"gpt-5.6-luna": true,
+	"gpt-5.6-sol": true,
+	"gpt-5.6-terra": true,
+};
+
+function modelOrRequestIdValue<T>(
+	model: Pick<ModelSpec<Api>, "id" | "requestModelId">,
+	values: Readonly<Record<string, T>>,
+): T | undefined {
+	const direct = values[bareModelId(model.id)];
+	if (direct !== undefined) return direct;
+	return model.requestModelId === undefined ? undefined : values[bareModelId(model.requestModelId)];
+}
 
 const COPILOT_GENERATED_LIMITS: Record<string, { contextWindow: number; maxTokens: number }> = {
 	"claude-opus-4.6": { contextWindow: 168000, maxTokens: 32000 },
@@ -100,7 +177,21 @@ export function applyGeneratedModelPolicies(models: ModelSpec<Api>[]): void {
  */
 export function rebakeModelThinking(model: ModelSpec<Api>): void {
 	if (isVariantCollapsedSpec(model)) return;
-	if (model.provider === "alibaba-token-plan" && model.id === "qwen3.8-max-preview" && model.thinking) return;
+	if (
+		model.compat &&
+		"thinkingFormat" in model.compat &&
+		model.compat.thinkingFormat === "chat-template" &&
+		model.thinking
+	)
+		return;
+	if (
+		model.provider === "alibaba-token-plan" &&
+		(model.id === "qwen3.8-max-preview" || model.id === "qwen3.8-max") &&
+		model.thinking
+	) {
+		return;
+	}
+	if (model.provider === "openrouter" && model.thinking?.requiresEffort === true) return;
 	const requiresProviderAuthoredEffort =
 		model.provider === "umans" && (model.thinking?.requiresEffort === true || model.id === "umans-kimi-k2.7");
 	const thinking = resolveModelThinking({ ...model, thinking: undefined }, buildCompat(model));
@@ -220,7 +311,31 @@ export function applyCanonicalLimitFallback(models: ModelSpec<Api>[]): void {
 	}
 }
 
+/**
+ * Pin the max-output figure for Ollama Cloud models whose deployment enforces a
+ * lower ceiling than their advertised window.
+ *
+ * Ollama's `/api/show` never reports a per-model output cap, so discovery and
+ * previous snapshots leave `maxTokens` at the full context window (or a stale
+ * conservative fallback, as with `deepseek-v4-flash:0731`). DeepSeek V4
+ * Pro/Flash deployments actually reject any output budget above
+ * {@link OLLAMA_CLOUD_MAX_OUTPUT_TOKENS} (ollama/ollama#16890, #3392/#3394), so
+ * pin those ids to `min(contextWindow, ceiling)` — the true amount the endpoint
+ * accepts (#7266). Other cloud models keep their discovered limits.
+ */
+export function applyOllamaCloudOutputCap(models: ModelSpec<Api>[]): void {
+	for (const model of models) {
+		if (model.provider !== "ollama-cloud" || model.contextWindow === null) continue;
+		if (!isOllamaCloudOutputCapped(model.id)) continue;
+		model.maxTokens = Math.min(model.contextWindow, OLLAMA_CLOUD_MAX_OUTPUT_TOKENS);
+	}
+}
+
 function applyGeneratedModelPolicy(model: ModelSpec<Api>): void {
+	if ((model.provider === "xai" || model.provider === "xai-oauth") && model.api === "openai-responses") {
+		const updated = applyXaiResponsesThinkingPolicy(model as ModelSpec<"openai-responses">);
+		model.compat = updated.compat;
+	}
 	const copilotLimits = model.provider === "github-copilot" ? COPILOT_GENERATED_LIMITS[model.id] : undefined;
 	if (copilotLimits) {
 		model.contextWindow = copilotLimits.contextWindow;
@@ -235,9 +350,13 @@ function applyGeneratedModelPolicy(model: ModelSpec<Api>): void {
 		model.omitMaxOutputTokens = true;
 	}
 
-	// GLM Coding Plan: GLM-5.2 is the selectable 1M served id; pin it so
+	// GLM Coding Plan: the selectable 1M-context served ids; pin them so
 	// endpoint discovery or older bundled fallbacks cannot regress to 200k.
-	if ((model.provider === "zai" || model.provider === "zhipu-coding-plan") && model.id === "glm-5.2") {
+	// GLM-5.3 succeeds GLM-5.2 with the same 1M context window.
+	if (
+		(model.provider === "zai" || model.provider === "zhipu-coding-plan") &&
+		(model.id === "glm-5.2" || model.id === "glm-5.3")
+	) {
 		model.contextWindow = 1_000_000;
 		model.maxTokens = 131_072;
 	}
@@ -293,7 +412,7 @@ function applyGeneratedModelPolicy(model: ModelSpec<Api>): void {
 		};
 	}
 	if (
-		model.api === "openai-completions" &&
+		(model.api === "openai-completions" || model.api === "openai-responses") &&
 		model.provider === "opencode-go" &&
 		(model.id === "deepseek-v4-flash" || model.id === "deepseek-v4-pro")
 	) {
@@ -321,7 +440,7 @@ function applyGeneratedModelPolicy(model: ModelSpec<Api>): void {
 }
 
 function applyAnthropicCatalogPolicy(model: ModelSpec<Api>, parsedModel: AnthropicModel): void {
-	// Claude Opus 4.5: models.dev reports 3x the correct cache pricing.
+	// Claude Opus 4.5: stencil.so reports 3x the correct cache pricing.
 	if (model.provider === "anthropic" && parsedModel.kind === "opus" && semverEqual(parsedModel.version, "4.5")) {
 		model.cost.cacheRead = 0.5;
 		model.cost.cacheWrite = 6.25;
@@ -336,7 +455,7 @@ function applyAnthropicCatalogPolicy(model: ModelSpec<Api>, parsedModel: Anthrop
 	}
 
 	// Claude Fable/Mythos 5: Anthropic's /v1/models omits token limits and
-	// pricing, and models.dev lags new releases. Pin authoritative values from
+	// pricing, and stencil.so lags new releases. Pin authoritative values from
 	// the model card (1M context / 128k output) and pricing docs ($10 in / $50
 	// out per MTok).
 	if (model.provider === "anthropic" && isFableOrMythos(parsedModel.kind)) {
@@ -366,6 +485,22 @@ function inferGeneratedApplyPatchToolType(
 }
 
 function applyOpenAICatalogPolicy(model: ModelSpec<Api>, parsedModel: OpenAIModel): void {
+	const isFirstPartyResponses = model.provider === "openai" && model.api === "openai-responses";
+	// Subscription Codex rates usage at the same >272K long-context tier as the
+	// API (openai/codex#32486), so first-party Codex SKUs carry the tier too —
+	// it drives both cost attribution and the extended-context window clamp.
+	const isFirstPartyCodex = model.provider === "openai-codex" && model.api === "openai-codex-responses";
+	if (isFirstPartyResponses && modelOrRequestIdValue(model, OPENAI_NONE_EFFORT_MODEL_IDS)) {
+		model.compat = { ...(model.compat ?? {}), reasoningDisableMode: "none-effort" };
+	}
+	const longContextCost =
+		isFirstPartyResponses || isFirstPartyCodex
+			? modelOrRequestIdValue(model, OPENAI_GPT_5_6_LONG_CONTEXT_COST_BY_MODEL_ID)
+			: undefined;
+	if (longContextCost) {
+		model.cost = { ...model.cost, longContext: longContextCost };
+	}
+
 	// Codex models: 400K figure includes output budget; input window is 272K.
 	if (parsedModel.variant.startsWith("codex") && parsedModel.variant !== "codex-spark") {
 		model.contextWindow = 272000;
@@ -384,12 +519,12 @@ function applyOpenAICatalogPolicy(model: ModelSpec<Api>, parsedModel: OpenAIMode
 			model.contextWindow = 272000;
 		}
 	}
-	// GPT-5.6 luna/sol/terra on the Codex transport: OpenAI's Codex model
-	// registry declares context_window = max_context_window = 372000, but Codex
-	// discovery omits `context_window` for these SKUs and falls back to
-	// DEFAULT_CONTEXT_WINDOW (272000, src/discovery/codex.ts), which regressed
-	// the bundled hard capacity (#5705). Pin the true 372K input window.
-	if (model.api === "openai-codex-responses" && semverEqual(parsedModel.version, "5.6")) {
-		model.contextWindow = 372000;
+	// GPT-5.6 luna/sol/terra on the Codex transport: OpenAI enabled a 1M-token
+	// window for subscription Codex (2026-08-16), but the Codex model registry
+	// still reports the stale 272000 (openai/codex#38917), so floor the bundled
+	// window at 1,000,000. Daybreak aliases are excluded — the registry actively
+	// reports their true window.
+	if (model.api === "openai-codex-responses" && CODEX_GPT_5_6_1M_MODEL_IDS[model.id]) {
+		model.contextWindow = Math.max(model.contextWindow ?? 0, 1_000_000);
 	}
 }

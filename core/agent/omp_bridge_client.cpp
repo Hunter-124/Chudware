@@ -669,6 +669,21 @@ void ensureBridgeDeps(const std::string& vendorOmpDir, const std::string& bunExe
         ::close(lockFd);
         return;
     }
+    // A lockfile/version cutover can REMOVE a nested package (for example the bridge's old
+    // direct pi-utils@17 dependency becomes workspace:*). `bun install` is additive here: it
+    // updates the root graph but does not reliably delete an obsolete
+    // bridge/node_modules/@oh-my-pi/pi-utils, and Bun resolves that stale nested package before
+    // the root workspace. The result is an upgrade-only import failure while clean checkouts
+    // work — exactly the kind of "ghostly" split-brain behavior this stamp was meant to prevent.
+    //
+    // We are under the cross-process install lock and both paths are generated output at fixed
+    // locations beneath the vendored workspace. Remove them before the frozen install so every
+    // fingerprint change is a genuinely clean materialization, not an overlay on an old graph.
+    std::filesystem::remove_all(vendorOmpDir + "/node_modules", ec);
+    ec.clear();
+    std::filesystem::remove_all(vendorOmpDir + "/bridge/node_modules", ec);
+    ec.clear();
+
     const bool installed = runBridgeInstall(vendorOmpDir, bunExe);
     // Stamp only a clean install: a failed one must be retried by the next process/boot
     // rather than remembered as provisioned.

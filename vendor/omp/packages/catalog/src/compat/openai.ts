@@ -16,13 +16,14 @@ import {
 	isDeepseekModelIdOrName,
 	isGlm52ReasoningEffortModelId,
 	isGrokReasoningEffortCapable,
+	isGrokXHighEffortCapable,
 	isKimiK3ModelId,
 	isKimiK26ModelId,
 	isKimiModelId,
 	isMimoModelIdOrName,
 	isOpenAISamplingRestrictedModelId,
+	isQwen38PlusTemplateEffortModelId,
 	isQwenModelId,
-	modelFamilyToken,
 } from "../identity/family";
 import type {
 	ModelSpec,
@@ -93,6 +94,8 @@ function resolveReasoningDisableMode(
 			return "qwen-enable-thinking-false";
 		case "qwen-chat-template":
 			return "qwen-template-false";
+		case "chat-template":
+			return "chat-template-thinking-false";
 		default:
 			return "lowest-effort";
 	}
@@ -178,6 +181,22 @@ const MIMO_REASONING_EFFORT_MAP: NonNullable<OpenAICompat["reasoningEffortMap"]>
 	xhigh: "high",
 };
 
+/** Shared `minimal → low` clamp. xhigh-capable Grok keeps `xhigh` unmapped. */
+const XAI_RESPONSES_MINIMAL_EFFORT_MAP: NonNullable<OpenAICompat["reasoningEffortMap"]> = {
+	minimal: "low",
+};
+/** Grok 4.5 / 4.3 / 3-mini: leftover `xhigh`/`max` clamp to `high`. */
+const XAI_RESPONSES_CLAMPED_EFFORT_MAP: NonNullable<OpenAICompat["reasoningEffortMap"]> = {
+	minimal: "low",
+	xhigh: "high",
+	max: "high",
+};
+
+/** Wire effort remap for first-party xAI Responses. */
+export function xaiResponsesReasoningEffortMap(modelId: string): NonNullable<OpenAICompat["reasoningEffortMap"]> {
+	return isGrokXHighEffortCapable(modelId) ? XAI_RESPONSES_MINIMAL_EFFORT_MAP : XAI_RESPONSES_CLAMPED_EFFORT_MAP;
+}
+
 function mergeModelReasoningEffortMap(
 	compat: ResolvedOpenAISharedCompat,
 	modelId: string,
@@ -225,6 +244,12 @@ function detectStrictModeSupport(provider: string, baseUrl: string): boolean {
  * turn's `<think>` block from `reasoning_content` (#3528).
  */
 const LOCAL_OPENAI_COMPAT_PROVIDERS = new Set(["llama.cpp", "lm-studio", "vllm", "ollama"]);
+
+/** Hosts that accept only none/auto/required rather than a named tool-choice object. */
+const STRING_ONLY_NAMED_TOOL_CHOICE_PROVIDERS: Record<string, true> = {
+	"llama.cpp": true,
+	"lm-studio": true,
+};
 
 /**
  * Local proxy providers that share the loopback-default baseUrl but forward
@@ -289,6 +314,7 @@ export function buildOpenAICompat(spec: ModelSpec<"openai-completions">): Resolv
 		modelMatchesHost(hostModel, "anthropic") || isClaudeModelId(spec.id) || isAnthropicNamespacedModelId(spec.id);
 	const isAlibaba = modelMatchesHost(hostModel, "alibabaDashscope");
 	const isNvidiaNim = modelMatchesHost(hostModel, "nvidia");
+	const isVenice = modelMatchesHost(hostModel, "venice");
 	const isQwen = isQwenModelId(spec.id);
 	// DeepSeek V4 (and other reasoning-capable DeepSeek models) reject follow-up requests in
 	// thinking mode unless prior assistant tool-call turns include `reasoning_content`. The
@@ -312,14 +338,19 @@ export function buildOpenAICompat(spec: ModelSpec<"openai-completions">): Resolv
 		isDeepseekModelIdOrName(spec.name ?? "") ||
 		isOpenCodeDeepseekAlias;
 	const isDirectDeepseekApi = modelMatchesHost(hostModel, "deepseekDirect");
-	const isDirectDeepseekReasoning = isDirectDeepseekApi && isDeepseekFamily && Boolean(spec.reasoning);
+	const isDeepseekReasoning = isDeepseekFamily && Boolean(spec.reasoning);
+	const isDirectDeepseekReasoning = isDirectDeepseekApi && isDeepseekReasoning;
 	const isGrok = modelMatchesHost(hostModel, "xai");
 	const isMistral = modelMatchesHost(hostModel, "mistral");
 	const isOpenCodeHost = modelMatchesHost(hostModel, "opencode");
+	// Google AI Studio's OpenAI-compat shim (`generativelanguage.googleapis.com/v1beta/openai`)
+	// implements a subset of chat-completions and 400s on `store` ("Unknown name \"store\"").
+	const isGoogleAistudioOpenAI = hostMatchesUrl(baseUrl, "googleAistudio");
 	const isNonStandard =
 		isCerebras ||
 		isGrok ||
 		isMistral ||
+		isGoogleAistudioOpenAI ||
 		hostMatchesUrl(baseUrl, "chutes") ||
 		hostMatchesUrl(baseUrl, "deepseekFamily") ||
 		hostMatchesUrl(baseUrl, "fireworks") ||
@@ -437,9 +468,9 @@ export function buildOpenAICompat(spec: ModelSpec<"openai-completions">): Resolv
 			? "zai"
 			: isOpenRouter
 				? "openrouter"
-				: isQwen && isNvidiaNim
+				: isQwen && (isNvidiaNim || provider === "vllm")
 					? "qwen-chat-template"
-					: isQwen && isFireworks
+					: isQwen && (isFireworks || isVenice)
 						? "openai"
 						: isAlibaba || isQwen
 							? "qwen"
@@ -461,12 +492,10 @@ export function buildOpenAICompat(spec: ModelSpec<"openai-completions">): Resolv
 		// OpenAI proprietary reasoning models (o-series, gpt-5+) reject explicit
 		// temperature/top_p/… with a 400 on every serving host (#5606).
 		supportsSamplingParams: !isOpenAISamplingRestrictedModelId(spec.id),
+		// xAI reasoning models 400 on presence/frequency penalties and stop.
+		supportsPenaltyAndStopParams: !(isGrok && Boolean(spec.reasoning)),
 		reasoningEffortMap: {},
 		supportsUsageInStreaming: !isCerebras,
-		// pi-ai's thinking-loop guard is gemini-only; default the flag from the
-		// family classifier so OpenAI-compat proxies serving Gemini are covered.
-		// An opaque alias can opt in via `compat.enableGeminiThinkingLoopGuard`.
-		enableGeminiThinkingLoopGuard: modelFamilyToken(spec.id) === "gemini",
 		// Kimi (including via OpenRouter and Fireworks router-form IDs such as
 		// `accounts/fireworks/routers/kimi-*`) calculates TPM rate limits based on
 		// max_tokens, not actual output. The official Kimi K2 model guidance
@@ -480,8 +509,13 @@ export function buildOpenAICompat(spec: ModelSpec<"openai-completions">): Resolv
 		disableReasoningOnForcedToolChoice: (isKimiModel && !isMoonshotKimiK3) || isAnthropicModel,
 		disableReasoningOnToolChoice: isDeepseekFamily && Boolean(spec.reasoning) && !isOpenRouter,
 		supportsToolChoice: !isDirectDeepseekReasoning,
-		supportsForcedToolChoice: !requiresEnabledThinking,
-		supportsNamedToolChoice: provider !== "llama.cpp",
+		// DeepSeek reasoning models on OpenCode Zen/Go 400 with
+		// "Thinking mode does not support this tool_choice" when a specific
+		// function is forced while the gateway's default thinking mode is active.
+		// Downgrade only on those gateways: other hosts can turn thinking off via
+		// disableReasoningOnToolChoice and must retain hard tool selection.
+		supportsForcedToolChoice: !requiresEnabledThinking && !(isOpenCodeHost && isDeepseekReasoning),
+		supportsNamedToolChoice: STRING_ONLY_NAMED_TOOL_CHOICE_PROVIDERS[provider] !== true,
 		maxTokensField: useMaxTokens ? "max_tokens" : "max_completion_tokens",
 		requiresToolResultName: isMistral,
 		requiresAssistantAfterToolResult: isMistral,
@@ -497,7 +531,7 @@ export function buildOpenAICompat(spec: ModelSpec<"openai-completions">): Resolv
 		// (issue #2299).
 		thinkingFormat,
 		kimiApiFormat: undefined,
-		reasoningDisableMode: resolveReasoningDisableMode(thinkingFormat),
+		reasoningDisableMode: isVenice ? "venice-disable-thinking" : resolveReasoningDisableMode(thinkingFormat),
 		omitReasoningEffort: false,
 		includeEncryptedReasoning: true,
 		filterReasoningHistory: isOpenRouter && isAnthropicModel,
@@ -557,6 +591,18 @@ export function buildOpenAICompat(spec: ModelSpec<"openai-completions">): Resolv
 		// parameter, so the flag stays a no-op outside the Qwen path.
 		qwenPreserveThinking:
 			(thinkingFormat === "qwen" || thinkingFormat === "qwen-chat-template") && isLocalOpenAICompatBackend,
+		// Qwen 3.8+ templates steer thinking depth via the `reasoning_effort`
+		// template kwarg (low/medium/xhigh, default xhigh); without routing the
+		// requested effort there, the enable_thinking toggle alone leaves the
+		// model at xhigh no matter what the user selects.
+		// Local-only like `qwenPreserveThinking`: first-party Qwen APIs
+		// (Dashscope, Qwen Portal) drive effort through their own OpenAI-style
+		// dialect, and local Ollama keeps its native effort vocabulary.
+		qwenTemplateReasoningEffort:
+			(thinkingFormat === "qwen" || thinkingFormat === "qwen-chat-template") &&
+			isLocalOpenAICompatBackend &&
+			provider !== "ollama" &&
+			isQwen38PlusTemplateEffortModelId(spec.id),
 		requiresAssistantContentForToolCalls: isKimiModel || isDirectDeepseekReasoning,
 		cacheControlFormat: isOpenRouter && spec.id.startsWith("anthropic/") ? "anthropic" : undefined,
 		supportsPromptCacheBreakpoints,
@@ -567,7 +613,7 @@ export function buildOpenAICompat(spec: ModelSpec<"openai-completions">): Resolv
 		wireModelIdMode,
 		isVercelGatewayHost: isVercelGateway,
 		supportsStrictMode: detectStrictModeSupport(provider, baseUrl),
-		extraBody: isDirectDeepseekReasoning ? { thinking: { type: "enabled" } } : undefined,
+		extraBody: undefined,
 		toolStrictMode: isCerebras ? "all_strict" : "mixed",
 		// Kimi-family ids trigger MFJS on any host, not just native base URLs:
 		// proxies (OpenRouter, custom gateways) forward `tools.function.parameters`
@@ -588,10 +634,26 @@ export function buildOpenAICompat(spec: ModelSpec<"openai-completions">): Resolv
 	};
 
 	applyCompatOverrides(compat, spec.compat);
+	const deepseekThinking = compat.extraBody?.thinking;
+	if (
+		isDirectDeepseekReasoning &&
+		typeof deepseekThinking === "object" &&
+		deepseekThinking !== null &&
+		"type" in deepseekThinking &&
+		deepseekThinking.type === "enabled"
+	) {
+		const extraBody = { ...compat.extraBody };
+		delete extraBody.thinking;
+		compat.extraBody = Object.keys(extraBody).length > 0 ? extraBody : undefined;
+	}
 	if (spec.compat?.reasoningDisableMode === undefined) {
 		compat.reasoningDisableMode = requiresEnabledThinking
 			? "omit"
-			: resolveReasoningDisableMode(compat.thinkingFormat);
+			: isDirectDeepseekReasoning
+				? "zai-thinking-disabled"
+				: isVenice
+					? "venice-disable-thinking"
+					: resolveReasoningDisableMode(compat.thinkingFormat);
 	}
 	if (spec.compat?.omitReasoningEffort === undefined && !compat.supportsReasoningEffort) {
 		compat.omitReasoningEffort = true;
@@ -599,12 +661,19 @@ export function buildOpenAICompat(spec: ModelSpec<"openai-completions">): Resolv
 	mergeModelReasoningEffortMap(compat, spec.id, isMimoReasoningEffortModel);
 
 	const whenThinkingPolicy =
-		spec.compat?.whenThinking ?? (isOpenCodeProvider && spec.reasoning ? OPENCODE_WHEN_THINKING : undefined);
+		spec.compat?.whenThinking ??
+		(isDirectDeepseekReasoning
+			? { extraBody: { ...compat.extraBody, thinking: { type: "enabled" } } }
+			: isOpenCodeProvider && spec.reasoning
+				? OPENCODE_WHEN_THINKING
+				: undefined);
 	if (whenThinkingPolicy) {
 		const variant: ResolvedOpenAICompat = { ...compat };
 		applyCompatOverrides(variant, whenThinkingPolicy);
 		if (whenThinkingPolicy.reasoningDisableMode === undefined) {
-			variant.reasoningDisableMode = resolveReasoningDisableMode(variant.thinkingFormat);
+			variant.reasoningDisableMode = isVenice
+				? "venice-disable-thinking"
+				: resolveReasoningDisableMode(variant.thinkingFormat);
 		}
 		if (whenThinkingPolicy.omitReasoningEffort === undefined && !variant.supportsReasoningEffort) {
 			variant.omitReasoningEffort = true;
@@ -654,39 +723,51 @@ export function buildOpenAIResponsesCompat(spec: OpenAIResponsesSpecLike): Resol
 	const isLocalServingBackend =
 		(!PROXY_OPENAI_COMPAT_PROVIDERS.has(spec.provider) && LOCAL_OPENAI_COMPAT_PROVIDERS.has(spec.provider)) ||
 		hasLocalLoopbackBaseUrl(baseUrl);
+	const isXaiHost = modelMatchesHost({ provider: spec.provider, baseUrl }, "xai");
 
 	const compat: ResolvedOpenAIResponsesCompat = {
 		supportsDeveloperRole: isAzure || isOpenAIUrl || hostMatchesUrl(baseUrl, "githubCopilot"),
 		supportsStrictMode: isAzure || detectStrictModeSupport(spec.provider, baseUrl),
-		supportsReasoningEffort: spec.provider !== "xai-oauth" || isGrokReasoningEffortCapable(id),
+		// Paid `xai` and SuperGrok `xai-oauth` share api.x.ai `/v1/responses`.
+		// Only the Grok effort-capable allowlist accepts `reasoning.effort`;
+		// other reasoners (grok-build, grok-code-fast-1, …) 400 if it is sent.
+		supportsReasoningEffort: !isXaiHost || isGrokReasoningEffortCapable(id),
 		supportsLongPromptCacheRetention: isOpenAIUrl,
 		supportsPromptCacheBreakpoints,
 		promptCacheBreakpointTtl: supportsPromptCacheBreakpoints ? "30m" : undefined,
 		// Azure OpenAI and GitHub Copilot Responses paths require tool results
 		// to strictly match prior tool calls when building Responses inputs.
 		strictResponsesPairing: isAzure || spec.provider === "github-copilot",
-		// GitHub Copilot and xAI OAuth reject `detail: "original"` (400 / 422).
-		// Every other host preserves native-resolution frames (snapcompact relies
-		// on `original`). Detect Copilot by provider id or base-URL host so a
-		// model pointed at the Copilot host under a different provider id still
-		// clamps; xai-oauth is provider-id only (same host family as paid `xai`).
+		// GitHub Copilot and first-party xAI `/v1/responses` reject
+		// `detail: "original"` (400 / 422). Every other host preserves
+		// native-resolution frames (snapcompact relies on `original`). Detect
+		// Copilot by provider id or base-URL host so a model pointed at the
+		// Copilot host under a different provider id still clamps.
 		supportsImageDetailOriginal:
-			spec.provider !== "xai-oauth" && !modelMatchesHost({ provider: spec.provider, baseUrl }, "githubCopilot"),
-		reasoningEffortMap: {},
+			!isXaiHost && !modelMatchesHost({ provider: spec.provider, baseUrl }, "githubCopilot"),
+		// api.x.ai rejects `reasoning.summary` (SuperGrok and paid key alike).
+		supportsReasoningSummary: !isXaiHost,
+		reasoningEffortMap: isXaiHost ? { ...xaiResponsesReasoningEffortMap(id) } : {},
 		supportsReasoningParams: true,
 		// OpenAI proprietary reasoning models (o-series, gpt-5+) reject explicit
 		// temperature/top_p/… with a 400 on every serving host (#5606).
 		supportsSamplingParams: !isOpenAISamplingRestrictedModelId(id),
+		// xAI `/v1/responses` rejects presence/frequency penalties for every
+		// model, not only reasoners (https://docs.x.ai/developers/rest-api-reference/inference/chat).
+		supportsPenaltyAndStopParams: !isXaiHost,
 		thinkingFormat,
 		reasoningDisableMode: resolveReasoningDisableMode(thinkingFormat),
 		omitReasoningEffort: false,
-		includeEncryptedReasoning: spec.provider !== "xai-oauth",
-		filterReasoningHistory: spec.provider === "xai-oauth" || (isOpenRouter && isAnthropicModel),
+		// Ask xAI `/v1/responses` for `reasoning.encrypted_content` and replay
+		// those items on later turns. OpenRouter Anthropic still filters
+		// reasoning wrappers independently.
+		includeEncryptedReasoning: true,
+		filterReasoningHistory: isOpenRouter && isAnthropicModel,
 		disableReasoningOnForcedToolChoice: isKimiModel,
 		disableReasoningOnToolChoice: isDeepseekFamily && reasoningCapable && !isOpenRouter,
 		supportsToolChoice: true,
-		supportsForcedToolChoice: true,
-		supportsNamedToolChoice: true,
+		supportsForcedToolChoice: spec.provider !== "opencode-go" && spec.provider !== "opencode-zen",
+		supportsNamedToolChoice: STRING_ONLY_NAMED_TOOL_CHOICE_PROVIDERS[spec.provider] !== true,
 		reasoningContentField: "reasoning_content",
 		requiresReasoningContentForToolCalls:
 			(isKimiModel || (isDeepseekFamily && reasoningCapable) || (isOpenRouter && reasoningCapable)) &&
@@ -700,6 +781,7 @@ export function buildOpenAIResponsesCompat(spec: OpenAIResponsesSpecLike): Resol
 		// Responses-only; the Qwen `preserve_thinking` template knob lives on
 		// the chat-completions wire shape, never on Responses.
 		qwenPreserveThinking: false,
+		qwenTemplateReasoningEffort: false,
 		requiresThinkingAsText: false,
 		requiresMistralToolIds: false,
 		requiresToolResultName: false,
@@ -714,7 +796,6 @@ export function buildOpenAIResponsesCompat(spec: OpenAIResponsesSpecLike): Resol
 		// lands on Moonshot's MFJS validator.
 		toolSchemaFlavor: isKimiModel ? "moonshot-mfjs" : undefined,
 		alwaysSendMaxTokens: spec.id ? isKimiModelId(spec.id) : false,
-		enableGeminiThinkingLoopGuard: modelFamilyToken(spec.id ?? "") === "gemini",
 		supportsObfuscationOptOut: isOpenAIUrl || spec.provider === "openai",
 		stripDeepseekSpecialTokens:
 			Boolean(id) && isDeepseekModelIdOrName(id) && (spec.provider === "nvidia" || spec.provider === "deepseek"),
@@ -723,18 +804,41 @@ export function buildOpenAIResponsesCompat(spec: OpenAIResponsesSpecLike): Resol
 			MINIMAX_PROVIDER_OR_ID_PATTERN.test(spec.provider) || (id ? MINIMAX_PROVIDER_OR_ID_PATTERN.test(id) : false),
 		emptyLengthFinishIsContextError: spec.provider === "ollama",
 		usesOpenAIToolCallIdLimit: spec.provider === "openai",
-		promptCacheSessionHeader: spec.provider === "xai-oauth" ? "x-grok-conv-id" : undefined,
+		promptCacheSessionHeader: isXaiHost ? "x-grok-conv-id" : undefined,
 		streamFirstEventTimeoutMs: isLocalServingBackend ? 0 : spec.compat?.streamFirstEventTimeoutMs,
 		streamIdleTimeoutMs: isLocalServingBackend
 			? LOCAL_OPENAI_COMPAT_STREAM_IDLE_TIMEOUT_MS
 			: spec.compat?.streamIdleTimeoutMs,
 	};
 	applyCompatOverrides(compat, spec.compat);
+	if (isXaiHost) {
+		const canonical = xaiResponsesReasoningEffortMap(id);
+		compat.reasoningEffortMap = { ...compat.reasoningEffortMap, ...canonical };
+		// xhigh-capable Grok advertises unmapped `xhigh`; drop a stale clamp
+		// from previous snapshots so 4.6 / 16-agent mode is not rewritten to `high`.
+		for (const key of ["xhigh", "max"] as const) {
+			if (!(key in canonical)) {
+				delete compat.reasoningEffortMap[key];
+			}
+		}
+	}
 	if (spec.compat?.reasoningDisableMode === undefined) {
 		compat.reasoningDisableMode = resolveReasoningDisableMode(compat.thinkingFormat);
 	}
 	if (spec.compat?.omitReasoningEffort === undefined && !compat.supportsReasoningEffort) {
 		compat.omitReasoningEffort = true;
+	}
+	// xai-oauth cache/discovery rows written before a SKU joined the
+	// effort-capable allowlist still carry omitReasoningEffort: true. The
+	// allowlist is the live wire contract; do not let that stale flag hide
+	// the picker or strip reasoning.effort.
+	if (
+		spec.provider === "xai-oauth" &&
+		isGrokReasoningEffortCapable(id) &&
+		spec.compat?.supportsReasoningEffort !== false
+	) {
+		compat.supportsReasoningEffort = true;
+		compat.omitReasoningEffort = false;
 	}
 	return compat;
 }
@@ -747,6 +851,7 @@ function pickResponsesOnly(compat: ResolvedOpenAIResponsesCompat): ResponsesOnly
 		strictResponsesPairing: compat.strictResponsesPairing,
 		supportsImageDetailOriginal: compat.supportsImageDetailOriginal,
 		supportsObfuscationOptOut: compat.supportsObfuscationOptOut,
+		supportsReasoningSummary: compat.supportsReasoningSummary,
 		isVercelGatewayHost: compat.isVercelGatewayHost,
 	} satisfies ResponsesOnlyCompat;
 }

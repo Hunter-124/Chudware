@@ -3,15 +3,15 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "CAD's bun sidecar that reuses OMP (oh-my-pi) subsystems verbatim (providers, memory, snapcompact) over a newline-delimited JSON-RPC stdio protocol. Not vendored — preserved across `scripts/vendor_omp.py` updates.",
+  "description": "CAD's thin bun adapter to the private OMP platform: provider/auth/catalog, memory and compaction over newline-delimited JSON-RPC. CAD-specific and preserved across re-vendor.",
   "main": "src/bridge.ts",
   "dependencies": {
     "@huggingface/transformers": "^4.2.0",
     "@oh-my-pi/pi-ai": "workspace:*",
     "@oh-my-pi/pi-catalog": "workspace:*",
     "@oh-my-pi/pi-mnemopi": "workspace:*",
-    "@oh-my-pi/pi-natives": "17.1.5",
-    "@oh-my-pi/pi-utils": "17.1.5",
+    "@oh-my-pi/pi-natives": "18.0.8",
+    "@oh-my-pi/pi-utils": "workspace:*",
     "@oh-my-pi/snapcompact": "workspace:*",
     "onnxruntime-node": "1.26.0"
   }

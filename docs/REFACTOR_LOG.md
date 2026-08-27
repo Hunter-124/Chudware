@@ -2678,3 +2678,47 @@ block and all 3 budget sliders return. `./build.sh` green; `gui_lint` theme/colo
 clean (the 10 `scale` findings are pre-existing in `ecad/ecad_canvas.cpp`, untouched here);
 `check.py` all 9 gates pass; vendor lock verifies. Because the session grid is shared, the
 AI workspace Options view simplifies from the same flag.
+
+---
+
+## 2026-08-27 — CAD now pins the clean private OMP backbone
+
+**Problem.** CAD still vendored six packages from public `can1357/oh-my-pi` at detached
+`d1239fd3`, then carried five uncommitted patches in a gitignored clone. Meanwhile the actual
+product platform, private `Hunter-124/omp`, had moved to 18.0.8 and already contained the
+universal fixes: OAuth's manual-close degrade and a better shared SQLite corruption classifier
+in `pi-utils` (`SQLITE_CORRUPT*` + `SQLITE_NOTADB`), re-exported by `pi-ai`. Three remaining
+patches touched `coding-agent`, which CAD never vendors. Keeping the public pin therefore
+duplicated fixes, hid 614 models and 8 providers, and made the private backbone irrelevant to
+the product it was built for.
+
+**Cutover.** `vendor/omp/OMP_VENDOR.lock` now pins clean private commit `54f0e24f09b5`
+from `https://github.com/Hunter-124/omp.git`: 805 content-hashed runtime files, six packages,
+zero dirty files, zero local patches. `scripts/vendor_omp.py` defaults to the private URL so a
+future refresh cannot silently regress CAD onto public upstream. The private repo is the
+universal platform; CAD's preserved `bridge/` is explicitly a thin domain/native adapter.
+
+**Compatibility seam.** Private OMP renamed CAD's local `isSqliteCorruptError` to the shared
+`isSqliteCorruptionError`; the adapter follows the platform name. Bridge deps moved from stale
+`pi-utils`/`pi-natives` 17.1.5 to workspace `pi-utils` and ABI-matching `pi-natives` 18.0.8,
+with a regenerated committed `bun.lock`.
+
+**Upgrade-only defect found by a clean install.** Bun does not reliably delete an obsolete
+nested workspace package. An upgraded checkout retained
+`bridge/node_modules/@oh-my-pi/pi-utils@17.1.5`, which shadowed workspace 18.0.8 and failed
+with a nonexistent Handlebars dependency, while a clean checkout worked. The C++ provisioner
+now removes both generated `node_modules` trees under its cross-process install lock whenever
+the lock fingerprint changes, then performs the frozen install. End-to-end proof seeded the
+exact stale nested 17.1.5 package and a stale stamp; the real C++ provider path deleted it,
+ran frozen install, started private OMP, and rendered Providers.
+
+**Measured result.** Full read-only surface smoke: 12/12 methods succeed; 4,500 models
+(was 3,886), zero missing `priced`; 78 providers (was 70), zero missing `disabled`. Private
+OMP also cuts cold bridge spawn→first ping from ~305 ms to **157 ms** and module import from
+~279 ms to **154 ms**. Warm `models_list` is 5.4 ms for the larger 1.63 MB/4,500-row payload.
+Providers pixel-captured at 1340×838 through rebuilt `libchudware.so`.
+
+**Platform boundary.** Universal harness behavior moves into private OMP incrementally;
+CAD retains geometry/document/daemon tools, product roles/prompts/policy, and the native C++
+fast path where measured latency warrants it. A concurrent OMP session owns the standalone
+platform UI, so CAD exposes and consumes stable contracts rather than duplicating that work.

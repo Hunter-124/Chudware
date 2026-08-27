@@ -386,15 +386,8 @@ int cliFlagIndex(int argc, char** argv, const char* flag) {
     return -1;
 }
 
-bool codeProductExecutable(int argc, char** argv) {
-    if (argc < 1 || !argv[0] || !argv[0][0]) return false;
-    const std::string name = std::filesystem::path(argv[0]).filename().string();
-    return name == "chudcode-gui" || name == "chudcode-gui.exe";
-}
-
 bool codeWorkspaceLaunch(int argc, char** argv) {
-    if (codeProductExecutable(argc, argv) || hasCliFlag(argc, argv, "--code"))
-        return true;
+    if (hasCliFlag(argc, argv, "--code")) return true;
     const char* env = std::getenv("CHUDCODE_MODE");
     if (!env || !env[0])
         env = std::getenv("CHUDWARE_CODE_MODE"); // compatibility alias
@@ -619,10 +612,8 @@ int main(int argc, char** argv) {
     // anything new on its own flag, never on this one.
     for (int i = 1; i < argc; ++i) {
         if (argv[i] && std::strcmp(argv[i], "--version") == 0) {
-            if (codeWorkspaceLaunch(argc, argv))
-                std::printf("Chudcode v0.1.0 (based on omp 18.0.8)\n");
-            else
-                std::printf("chudware %s\n", CHUDWARE_VERSION_LINE);
+            std::printf("chudware %s\n", CHUDWARE_VERSION_LINE);
+            // Same hard-exit tail every other native exit uses (T-RF23, hard_exit()
             // below), and for the same class of reason: a namespace-scope static in
             // ui/copilot/composer.cpp (g_agentCtl) spawns a DETACHED worker parked
             // forever on a condition_variable, so global destruction deadlocks in

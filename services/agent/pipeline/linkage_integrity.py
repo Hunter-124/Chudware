@@ -70,19 +70,38 @@ def check_reference_integrity(
     # Adjacency list for cycle detection (only edges between known nodes).
     adj: dict[str, list[str]] = defaultdict(list)
 
-    for e in edges:
-        src = e.get("from") or ""
-        dst = e.get("to") or ""
+    for index, edge in enumerate(edges):
+        if not isinstance(edge, dict):
+            dangling.append(
+                f"reference_edges[{index}] must be an object with string endpoints")
+            continue
+
+        raw_src = edge.get("from")
+        raw_dst = edge.get("to")
+        invalid = False
+        if not isinstance(raw_src, str) or not raw_src.strip():
+            dangling.append(
+                f"reference_edges[{index}].from must be a non-empty string")
+            invalid = True
+        if not isinstance(raw_dst, str) or not raw_dst.strip():
+            dangling.append(
+                f"reference_edges[{index}].to must be a non-empty string")
+            invalid = True
+        if invalid:
+            continue
+
+        src = raw_src.strip()
+        dst = raw_dst.strip()
         label = f"{src}→{dst}"
         has_dangling = False
-        if src and src not in valid_ids:
+        if src not in valid_ids:
             dangling.append(label)
             has_dangling = True
-        if dst and dst not in valid_ids:
+        if dst not in valid_ids:
             if label not in dangling:
                 dangling.append(label)
             has_dangling = True
-        if not has_dangling and src and dst:
+        if not has_dangling:
             adj[src].append(dst)
 
     # Cycle detection via iterative DFS.
@@ -296,15 +315,12 @@ def gate_context_from_ledger(ledger_state: dict[str, Any]) -> dict[str, Any]:
         result = machine.run_gate(Phase.LINKAGE, ctx)
 
     Keys set:
-        ``linkages``              — list of linkage dicts (gate presence check)
-        ``geometry_specs``        — list of geometry_spec dicts
-        ``ref_integrity``         — ``ReferenceIntegrityResult`` for the first linkage
-        ``datum_completeness``    — ``DatumCompletenessResult`` for the first linkage
-        ``interface_consistency`` — ``InterfaceConsistencyResult`` for the first linkage
-        ``dangling_refs``         — shortcut list for gate reasons
-        ``ref_cycles``            — shortcut list for gate reasons
-        ``datum_gaps``            — shortcut list for gate reasons
-        ``interface_mismatches``  — shortcut list for gate reasons
+        ``linkages`` / ``geometry_specs`` — the source artifact lists
+        ``*_results`` — checker results for every linkage
+        ``ref_integrity`` / ``datum_completeness`` /
+        ``interface_consistency`` — first-linkage compatibility views
+        ``dangling_refs`` / ``ref_cycles`` / ``datum_gaps`` /
+        ``interface_mismatches`` — aggregate findings, each prefixed by linkage id
     """
     linkages:       list[dict] = ledger_state.get("linkages") or []
     geometry_specs: list[dict] = ledger_state.get("geometry_specs") or []
@@ -317,21 +333,47 @@ def gate_context_from_ledger(ledger_state: dict[str, Any]) -> dict[str, Any]:
     if not linkages:
         return ctx
 
-    # Run all three checkers against the first (primary) linkage artifact.
-    primary = linkages[0]
+    ri_results: list[ReferenceIntegrityResult] = []
+    dc_results: list[DatumCompletenessResult] = []
+    ic_results: list[InterfaceConsistencyResult] = []
+    dangling_refs: list[str] = []
+    ref_cycles: list[str] = []
+    datum_gaps: list[str] = []
+    interface_mismatches: list[str] = []
 
-    ri  = check_reference_integrity(primary, geometry_specs)
-    dc  = check_datum_completeness(primary, geometry_specs)
-    ic  = check_interface_consistency(primary, geometry_specs)
+    for index, linkage in enumerate(linkages):
+        linkage_id = (
+            str(linkage.get("id") or f"linkage[{index}]")
+            if isinstance(linkage, dict)
+            else f"linkage[{index}]"
+        )
+        prefix = f"{linkage_id}: "
+        if not isinstance(linkage, dict):
+            dangling_refs.append(prefix + "linkage artifact must be an object")
+            continue
 
-    ctx["ref_integrity"]         = ri
-    ctx["datum_completeness"]    = dc
-    ctx["interface_consistency"] = ic
+        ri = check_reference_integrity(linkage, geometry_specs)
+        dc = check_datum_completeness(linkage, geometry_specs)
+        ic = check_interface_consistency(linkage, geometry_specs)
+        ri_results.append(ri)
+        dc_results.append(dc)
+        ic_results.append(ic)
+        dangling_refs.extend(prefix + finding for finding in ri.dangling_refs)
+        ref_cycles.extend(prefix + finding for finding in ri.cycles)
+        datum_gaps.extend(prefix + finding for finding in dc.unresolved_refs)
+        interface_mismatches.extend(prefix + finding for finding in ic.mismatches)
 
-    # Flat shortcut lists so _gate_linkage can surface them as reasons.
-    ctx["dangling_refs"]          = ri.dangling_refs
-    ctx["ref_cycles"]             = ri.cycles
-    ctx["datum_gaps"]             = dc.unresolved_refs
-    ctx["interface_mismatches"]   = ic.mismatches
+    ctx["ref_integrity_results"] = ri_results
+    ctx["datum_completeness_results"] = dc_results
+    ctx["interface_consistency_results"] = ic_results
+    if ri_results:
+        ctx["ref_integrity"] = ri_results[0]
+        ctx["datum_completeness"] = dc_results[0]
+        ctx["interface_consistency"] = ic_results[0]
+
+    ctx["dangling_refs"] = dangling_refs
+    ctx["ref_cycles"] = ref_cycles
+    ctx["datum_gaps"] = datum_gaps
+    ctx["interface_mismatches"] = interface_mismatches
 
     return ctx

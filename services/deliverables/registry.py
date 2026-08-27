@@ -13,6 +13,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from . import project
+from .errors import DeliverableError
 
 
 def new_run_id() -> str:
@@ -42,23 +43,41 @@ def build_record(artifact_id: str, kind: str, out_abs: Path, run_id: str,
     }
 
 
-def _read_all() -> list[dict]:
-    p = project.registry_path()
+def _read_all(path: Path | None = None) -> list[dict]:
+    p = path or project.registry_path()
     if not p.exists():
         return []
     try:
-        data = json.loads(p.read_text(encoding="utf-8"))
-    except Exception:  # noqa: BLE001 - a corrupt registry must not crash a tool
-        return []
-    return data if isinstance(data, list) else []
+        raw = p.read_text(encoding="utf-8")
+        data = json.loads(raw)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise DeliverableError(
+            "registry_corrupt",
+            f"{p.name} is malformed; repair or restore it before changing artifacts",
+        ) from exc
+    if not isinstance(data, list) or any(not isinstance(record, dict) for record in data):
+        raise DeliverableError(
+            "registry_corrupt",
+            f"{p.name} must contain a JSON list of artifact records",
+        )
+    return data
 
 
 def append_record(record: dict) -> None:
     p = project.registry_path()
-    records = _read_all()
+    records = _read_all(p)
     records.append(record)
     p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(json.dumps(records, indent=2), encoding="utf-8")
+    temp = p.with_name(f".{p.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        temp.write_text(json.dumps(records, indent=2), encoding="utf-8")
+        temp.replace(p)
+    except Exception:
+        try:
+            temp.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
 
 
 def read_records(run_id: str | None = None) -> list[dict]:

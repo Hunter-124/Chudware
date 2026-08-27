@@ -283,21 +283,42 @@ _tuning_cache: dict[str, Any] | None = None
 
 
 def _load_tuning_results(*, path: Path | None = None) -> dict[str, Any]:
-    """Load tuning_results.json; return empty dict if absent."""
+    """Load tuning results, preserving corrupt/unreadable-artifact diagnostics."""
     global _tuning_cache
     if _tuning_cache is not None:
         return _tuning_cache
     p = path or _TUNING_RESULTS_PATH
-    if p.exists():
-        try:
-            _tuning_cache = json.loads(p.read_text(encoding="utf-8"))
-        except Exception:
+    try:
+        if not p.exists():
             _tuning_cache = {}
-    else:
-        _tuning_cache = {}
+            return _tuning_cache
+        loaded = json.loads(p.read_text(encoding="utf-8"))
+        if not isinstance(loaded, dict):
+            raise ValueError(
+                f"tuning artifact root must be an object, got {type(loaded).__name__}")
+        _tuning_cache = loaded
+    except json.JSONDecodeError as exc:
+        _tuning_cache = {
+            "_load_error": _tuning_load_error("invalid_artifact", p, exc),
+        }
+    except (OSError, UnicodeError, ValueError) as exc:
+        kind = "invalid_artifact" if isinstance(exc, (UnicodeError, ValueError)) \
+            else "artifact_unavailable"
+        _tuning_cache = {"_load_error": _tuning_load_error(kind, p, exc)}
     return _tuning_cache
 
 
+
+
+def _tuning_load_error(kind: str, path: Path, exc: Exception) -> dict[str, str]:
+    detail = " ".join(str(exc).split())
+    rendered = f"{type(exc).__name__}: {detail}" if detail else type(exc).__name__
+    return {
+        "kind": kind,
+        "path": str(path),
+        "error": rendered[:240],
+        "outcome_kind": "internal_error",
+    }
 def _inject_tuning_results(data: dict[str, Any]) -> None:
     """Test helper: inject a fixture into the module-level cache."""
     global _tuning_cache
@@ -329,12 +350,19 @@ def best_scaffold_for_class(task_class: TaskClass, tier: str,
         f"tier default (local → full per contract §7)" if not tier.startswith("frontier")
         else "tier default (frontier → eco per contract §7)"
     )
+    load_error = data.get("_load_error")
+    load_reason = ""
+    if isinstance(load_error, dict):
+        load_reason = (
+            f"{str(load_error.get('kind') or 'invalid_artifact').replace('_', ' ')} "
+            f"tuning data ({load_error.get('error', 'unknown load error')}); "
+        )
 
     per_class = data.get("per_class_winners", {})
     key = f"{task_class.value}|{_normalize_tier(tier)}"
     winner = per_class.get(key)
     if not winner:
-        return default, f"no tuning data for {key}; {default_reason}"
+        return default, f"{load_reason}no tuning data for {key}; {default_reason}"
 
     w_level = winner.get("scaffold_level")
     w_rate = winner.get("win_rate", 0.0)
@@ -433,13 +461,11 @@ class RouterResult:
     scaffold_level: ScaffoldLevel
     tier: str
     reason: str
-    request_snippet: str = ""     # first 120 chars of request for transparency logs
-    # Other plausible classes (excl. chosen) for Routing-card expand UI.
+    request_snippet: str = ""
     alternatives: list[dict[str, str]] = field(default_factory=list)
-    # "dag" (default build swarm) or "linear" (single agent_turn tool-calling
-    # turn against *role*, no swarm/dag compilation) — see structure_for_class.
     structure: str = "dag"
     role: str | None = None
+    diagnostics: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -452,6 +478,7 @@ class RouterResult:
             "alternatives": list(self.alternatives),
             "structure": self.structure,
             "role": self.role,
+            "diagnostics": dict(self.diagnostics),
         }
 
 
@@ -481,7 +508,8 @@ def route(request: str, tier: str, *,
         role, and alternatives.
     """
     cls, class_why = classify_task_detailed(request)
-    level, reason = best_scaffold_for_class(cls, tier, tuning=tuning)
+    effective_tuning = tuning if tuning is not None else _load_tuning_results()
+    level, reason = best_scaffold_for_class(cls, tier, tuning=effective_tuning)
     # Prefix scaffold reason with the class match so the Routing card shows both
     # "what class" and "why this scaffold" (parity with C++ domain.reason).
     if class_why:
@@ -507,6 +535,10 @@ def route(request: str, tier: str, *,
             pass
     alternatives = collect_class_alternatives(request, cls)
     structure, exec_role = structure_for_class(cls)
+    diagnostics: dict[str, Any] = {}
+    load_error = effective_tuning.get("_load_error")
+    if isinstance(load_error, dict):
+        diagnostics["load_error"] = dict(load_error)
     return RouterResult(
         task_class=cls,
         scaffold_level=level,
@@ -516,4 +548,5 @@ def route(request: str, tier: str, *,
         alternatives=alternatives,
         structure=structure,
         role=exec_role,
+        diagnostics=diagnostics,
     )

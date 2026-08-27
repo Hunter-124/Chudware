@@ -1477,23 +1477,39 @@ class MissionDispatch:
             _prev_node = getattr(self, "_current_node_id", None)
             self._current_node_id = node_id or _prev_node
             try:
-                result = _at.run_turn(
-                    brief, provider, name=role, actor=role,
-                    credit_actor=self.chudware_actor,
-                    system_prompt=system_prompt,
-                    allowed_tools=allowed,
-                    tools_text=tools_text,
-                    mission_dispatch=self,
-                    ledger=self._ledger(), max_tool_calls=max_calls,
-                    # The delegate path missed the 2026-07-28 parent-lane fix:
-                    # falling through to agent_turn's 2048 default truncated
-                    # feature_modeler twice before its first tool call.
-                    max_tokens=LINEAR_ROLE_MAX_OUTPUT_TOKENS,
-                    max_total_tokens=granted or None,
-                    on_event=self.on_event, run_id=self.run_id,
-                    node_id=node_id, subagent_id=node_id,
-                    capability=_cap, tier=self.tier, phase=_phase,
-                    task_class=self.task_class)
+                from types import SimpleNamespace as _SimpleNamespace  # noqa: PLC0415
+                from services.mcp import org_tools as _org_tools  # noqa: PLC0415
+
+                _turn_ledger = self._ledger()
+                _org_tools.bind_mission_context(_SimpleNamespace(
+                    provider=provider,
+                    ledger=_turn_ledger,
+                    dissents_registry=getattr(self, "dissents_registry", None),
+                    stage=_phase,
+                    tier=self.tier,
+                    providers=getattr(self, "providers", None),
+                    org_state=getattr(self, "org_state", None),
+                ))
+                try:
+                    result = _at.run_turn(
+                        brief, provider, name=role, actor=role,
+                        credit_actor=self.chudware_actor,
+                        system_prompt=system_prompt,
+                        allowed_tools=allowed,
+                        tools_text=tools_text,
+                        mission_dispatch=self,
+                        ledger=_turn_ledger, max_tool_calls=max_calls,
+                        # The delegate path missed the 2026-07-28 parent-lane fix:
+                        # falling through to agent_turn's 2048 default truncated
+                        # feature_modeler twice before its first tool call.
+                        max_tokens=LINEAR_ROLE_MAX_OUTPUT_TOKENS,
+                        max_total_tokens=granted or None,
+                        on_event=self.on_event, run_id=self.run_id,
+                        node_id=node_id, subagent_id=node_id,
+                        capability=_cap, tier=self.tier, phase=_phase,
+                        task_class=self.task_class)
+                finally:
+                    _org_tools.bind_mission_context(None)
             finally:
                 self._current_node_id = _prev_node
             # mega-6: prefer real provider usage tokens over the tool-count estimate.
@@ -2525,32 +2541,50 @@ def run_linear_role_turn(
     except Exception:  # noqa: BLE001 — schema render is best-effort
         tools_text = None
 
-    result = _at.run_turn(
-        request, provider, name=role, actor=role,
-        credit_actor=chudware_actor,
-        system_prompt=system_prompt,
-        allowed_tools=allowed,
-        tools_text=tools_text,
-        max_tokens=(max_tokens if max_tokens is not None
-                    else LINEAR_ROLE_MAX_OUTPUT_TOKENS),
-        max_total_tokens=max_total_tokens,
+    # The process-global org MCP closures need the same run-scoped provider and
+    # ledger that agent_turn receives. Bind only for the duration of this turn;
+    # outside it council_convene must remain an honest no_mission_context refusal.
+    from types import SimpleNamespace as _SimpleNamespace  # noqa: PLC0415
+    from services.mcp import org_tools as _org_tools  # noqa: PLC0415
+
+    _org_tools.bind_mission_context(_SimpleNamespace(
+        provider=provider,
         ledger=ledger,
-        mission_dispatch=mission_dispatch,
-        tool_dispatch=tool_dispatch,
-        on_event=on_event,
-        run_id=run_id,
-        capability=capability,
+        dissents_registry=getattr(mission_dispatch, "dissents_registry", None),
+        stage=getattr(mission_dispatch, "phase", None),
         tier=tier or getattr(mission_dispatch, "tier", None),
-        options=options,
-        history=history,
-        attachments=attachments,
-        # The interactive lane's allow-set is an on-ramp, not a scope: the model
-        # is expected to pull packs in with enable_tools as it works. Let the
-        # harness do it on first reach instead of spending two billed
-        # completions per pack. Curated roles (sourcing, DAG nodes, subagents)
-        # leave this off, so their allow-list stays a hard boundary.
-        auto_enable_packs=(role == "general_agent"),
-    )
+        providers=getattr(mission_dispatch, "providers", None),
+        org_state=getattr(mission_dispatch, "org_state", None),
+    ))
+    try:
+        result = _at.run_turn(
+            request, provider, name=role, actor=role,
+            credit_actor=chudware_actor,
+            system_prompt=system_prompt,
+            allowed_tools=allowed,
+            tools_text=tools_text,
+            max_tokens=(max_tokens if max_tokens is not None
+                        else LINEAR_ROLE_MAX_OUTPUT_TOKENS),
+            max_total_tokens=max_total_tokens,
+            ledger=ledger,
+            mission_dispatch=mission_dispatch,
+            tool_dispatch=tool_dispatch,
+            on_event=on_event,
+            run_id=run_id,
+            capability=capability,
+            tier=tier or getattr(mission_dispatch, "tier", None),
+            options=options,
+            history=history,
+            attachments=attachments,
+            # The interactive lane's allow-set is an on-ramp, not a scope: the model
+            # is expected to pull packs in with enable_tools as it works. Let the
+            # harness do it on first reach instead of spending two billed
+            # completions per pack. Curated roles (sourcing, DAG nodes, subagents)
+            # leave this off, so their allow-list stays a hard boundary.
+            auto_enable_packs=(role == "general_agent"),
+        )
+    finally:
+        _org_tools.bind_mission_context(None)
     # TERMINAL SAVE SWEEP. Nothing closes the documents a run builds (T-RF5 deleted
     # loop._terminal_autosave_close_docs; the C++ mission path only doc_saves the doc a
     # DAG node is on), so an agent doc with no real backing file sat abandoned until the

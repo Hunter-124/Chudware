@@ -36,18 +36,39 @@ def register_advisor_tools(mcp) -> None:
             from services.agent.advisor import adapters, engine, render
             from services.agent.advisor import stages as _stages
         except ImportError as exc:
-            return {"ok": False, "error": f"advisor package unavailable: {exc}"}
+            return {
+                "ok": False,
+                "executed": False,
+                "policy_refusal": False,
+                "outcome_kind": "internal_error",
+                "status": "advisor_unavailable",
+                "error": f"advisor package unavailable: {exc}",
+            }
 
         if not _stages.is_stage(stage):
-            return {"ok": False, "error": f"unknown stage {stage!r}",
-                    "stages": list(_stages.STAGES) + [_stages.FIX_STAGE]}
+            return {
+                "ok": False,
+                "executed": False,
+                "policy_refusal": False,
+                "outcome_kind": "validation_error",
+                "status": "invalid_stage",
+                "error": f"unknown stage {stage!r}",
+                "stages": list(_stages.STAGES) + [_stages.FIX_STAGE],
+            }
 
         try:
             obs = adapters.observe_doc(doc_id, stage)
             advisory = engine.build_advisory(obs)
             block = render.render_advisory(advisory)
         except Exception as exc:  # noqa: BLE001
-            return {"ok": False, "error": f"advise failed: {exc}"}
+            return {
+                "ok": False,
+                "executed": False,
+                "policy_refusal": False,
+                "outcome_kind": "internal_error",
+                "status": "internal_error",
+                "error": f"advise failed: {exc}",
+            }
 
         if run_id:
             try:
@@ -56,10 +77,45 @@ def register_advisor_tools(mcp) -> None:
             except Exception:  # noqa: BLE001
                 pass
 
-        return {"ok": True, "doc_id": doc_id, "stage": stage,
-                "block": block, "advisory": advisory,
-                "severity": engine.max_severity(advisory),
-                "has_blocker": engine.has_blocker(advisory)}
+        errors = [
+            finding.finding
+            for finding in obs.findings
+            if finding.source_kind == "harness"
+            and finding.extra.get("outcome") == "error"
+        ]
+        skipped = [
+            finding.finding
+            for finding in obs.findings
+            if finding.source_kind == "harness"
+            and finding.extra.get("outcome") == "skipped"
+        ]
+        no_checks = not _stages.check_battery(stage)
+        executed = not errors and not skipped and not no_checks
+        if errors:
+            outcome_kind = "internal_error"
+            status = "check_error"
+        elif skipped or no_checks:
+            outcome_kind = "guard_block"
+            status = "checks_unavailable" if skipped else "no_checks"
+        else:
+            outcome_kind = "ok"
+            status = "executed"
+
+        return {
+            "ok": executed,
+            "executed": executed,
+            "policy_refusal": False,
+            "outcome_kind": outcome_kind,
+            "status": status,
+            "skipped": skipped,
+            "error": "; ".join(errors),
+            "doc_id": doc_id,
+            "stage": stage,
+            "block": block,
+            "advisory": advisory,
+            "severity": engine.max_severity(advisory),
+            "has_blocker": engine.has_blocker(advisory),
+        }
 
     @mcp.tool()
     def stage_set(run_id: str, stage: str, reason: str, actor: str = "foreman") -> dict:

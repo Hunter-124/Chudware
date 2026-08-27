@@ -55,6 +55,10 @@ def _sha(data: bytes) -> str:
     return hashlib.sha1(data).hexdigest()  # noqa: S324 — content id, not security
 
 
+def _raise_walk_error(error: OSError) -> None:
+    raise error
+
+
 # ---------------------------------------------------------------------------
 # working-file → shadow-tree content
 # ---------------------------------------------------------------------------
@@ -93,7 +97,7 @@ def _snapshot_tree(item_id: str, root: Path, max_file_bytes: int) -> dict[str, b
     prefix = snapshot.item_prefix(item_id) + "tree/"
     out: dict[str, bytes] = {}
     index: dict[str, dict[str, Any]] = {}
-    for dirpath, dirnames, filenames in os.walk(root):
+    for dirpath, dirnames, filenames in os.walk(root, onerror=_raise_walk_error):
         dirnames[:] = sorted(
             d for d in dirnames
             if d not in _EXCLUDE_DIRS
@@ -104,17 +108,11 @@ def _snapshot_tree(item_id: str, root: Path, max_file_bytes: int) -> dict[str, b
                 continue
             abs_path = Path(dirpath) / fn
             rel = abs_path.relative_to(root).as_posix()
-            try:
-                size = abs_path.stat().st_size
-            except OSError:
-                continue
+            size = abs_path.stat().st_size
             if size > max_file_bytes:
                 index[rel] = {"size": size, "skipped": True}
                 continue
-            try:
-                data = abs_path.read_bytes()
-            except OSError:
-                continue
+            data = abs_path.read_bytes()
             out[prefix + rel] = data
             index[rel] = {"size": size, "sha": _sha(data)}
     out[snapshot.item_prefix(item_id) + "tree.index.json"] = json.dumps(

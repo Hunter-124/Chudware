@@ -402,6 +402,16 @@ def default_store_root(project_dir: str | os.PathLike | None = None) -> Path:
     return p
 
 
+class ChainCorruptionError(ValueError):
+    """A chain file contains unreadable or non-record data."""
+
+    def __init__(self, doc_id: str, line: int, detail: str) -> None:
+        super().__init__(detail)
+        self.doc_id = doc_id
+        self.line = line
+        self.detail = detail
+
+
 class AiVcStore:
     """Content-addressed delta chain for one store root (many docs)."""
 
@@ -469,15 +479,27 @@ class AiVcStore:
         p = self._chain_path(doc_id)
         if not p.exists():
             return []
+        try:
+            lines = p.read_text(encoding="utf-8").splitlines()
+        except (OSError, UnicodeError) as exc:
+            raise ChainCorruptionError(
+                doc_id, 0, f"could not read chain: {type(exc).__name__}: {exc}"
+            ) from exc
         out: list[dict[str, Any]] = []
-        for line in p.read_text(encoding="utf-8").splitlines():
+        for line_number, line in enumerate(lines, start=1):
             line = line.strip()
             if not line:
                 continue
             try:
-                out.append(json.loads(line))
-            except json.JSONDecodeError:
-                continue
+                record = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise ChainCorruptionError(
+                    doc_id, line_number, f"malformed JSON: {exc.msg}"
+                ) from exc
+            if not isinstance(record, dict):
+                raise ChainCorruptionError(
+                    doc_id, line_number, "checkpoint record is not an object")
+            out.append(record)
         return out
 
     def _append_chain(self, doc_id: str, rec: dict[str, Any]) -> None:
@@ -758,22 +780,45 @@ class AiVcStore:
 
     def timeline(self, doc_id: str | None = None) -> dict[str, Any]:
         """Return checkpoints newest-first for *doc_id* (or all docs if None)."""
-        if doc_id:
-            chain = self.read_chain(doc_id)
-            cps = [self._public_cp(r) for r in reversed(chain)]
-            return {"ok": True, "checkpoints": cps, "doc_id": doc_id,
-                    "authored_by": get_authored_by(doc_id) or self._read_meta(doc_id).get("authored_by", "user")}
-        # all docs
-        cps: list[dict[str, Any]] = []
-        docs_root = self.root / "docs"
-        if docs_root.is_dir():
-            for d in sorted(docs_root.iterdir()):
-                if not d.is_dir():
-                    continue
-                for r in reversed(self.read_chain(d.name)):
-                    cps.append(self._public_cp(r))
-        cps.sort(key=lambda c: c.get("time") or "", reverse=True)
-        return {"ok": True, "checkpoints": cps}
+        try:
+            if doc_id:
+                chain = self.read_chain(doc_id)
+                cps = [self._public_cp(r) for r in reversed(chain)]
+                return {
+                    "ok": True,
+                    "checkpoints": cps,
+                    "doc_id": doc_id,
+                    "authored_by": (
+                        get_authored_by(doc_id)
+                        or self._read_meta(doc_id).get("authored_by", "user")
+                    ),
+                }
+            # all docs
+            cps: list[dict[str, Any]] = []
+            docs_root = self.root / "docs"
+            if docs_root.is_dir():
+                for d in sorted(docs_root.iterdir()):
+                    if not d.is_dir():
+                        continue
+                    for r in reversed(self.read_chain(d.name)):
+                        cps.append(self._public_cp(r))
+            cps.sort(key=lambda c: c.get("time") or "", reverse=True)
+            return {"ok": True, "checkpoints": cps}
+        except ChainCorruptionError as exc:
+            return {
+                "ok": False,
+                "reason": "timeline_corrupt",
+                "hint": (
+                    f"checkpoint timeline for {exc.doc_id} is corrupt"
+                    + (f" at line {exc.line}" if exc.line else "")
+                ),
+                "corruption": {
+                    "doc_id": exc.doc_id,
+                    "line": exc.line,
+                    "detail": exc.detail,
+                },
+                "checkpoints": [],
+            }
 
     @staticmethod
     def _public_cp(r: dict[str, Any]) -> dict[str, Any]:
@@ -1038,6 +1083,18 @@ class AiVcStore:
 # process-wide default store + capture helpers
 # ---------------------------------------------------------------------------
 
+class StoreResolutionError(RuntimeError):
+    """An explicit or bound project cannot provide its AI-VC store."""
+
+    def __init__(self, reason: str, hint: str) -> None:
+        super().__init__(hint)
+        self.reason = reason
+        self.hint = hint
+
+    def envelope(self) -> dict[str, Any]:
+        return {"ok": False, "reason": self.reason, "hint": self.hint}
+
+
 _STORE: AiVcStore | None = None
 _STORE_ROOT: Path | None = None
 
@@ -1098,15 +1155,30 @@ def resolve_store(
         return get_store(cfg=cfg)
     try:
         from services.agent.project_context import resolve_project_root
-        from services.plm import branches
-
         root = Path(resolve_project_root(candidate))
-        if not (root / ".aicadvault").is_dir():
-            return get_store(cfg=cfg)
+    except Exception as exc:  # noqa: BLE001
+        raise StoreResolutionError(
+            "project_root_unavailable",
+            f"could not resolve project root {candidate}: "
+            f"{type(exc).__name__}: {exc}",
+        ) from exc
+    if not (root / ".aicadvault").is_dir():
+        raise StoreResolutionError(
+            "vault_unavailable",
+            f"version history is unavailable for {root}",
+        )
+    try:
+        from services.plm import branches
         store_root = branches.ai_vc_root_for(root, _active_branch_name(root))
         return get_store(store_root, cfg=cfg)
-    except Exception:  # noqa: BLE001 — headless/uninitialised clients keep fallback
-        return get_store(cfg=cfg)
+    except StoreResolutionError:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        raise StoreResolutionError(
+            "vault_unavailable",
+            f"could not open version history for {root}: "
+            f"{type(exc).__name__}: {exc}",
+        ) from exc
 
 
 def reset_store_for_tests(root: str | os.PathLike | None = None,
@@ -1307,7 +1379,10 @@ def on_prompt_start(
     label = _prompt_label(prompt)
     op_batch = {"kind": "prompt", "msg_idx": msg_idx, "label": label}
 
-    st = store or resolve_store(project_dir, cfg=cfg)
+    try:
+        st = store or resolve_store(project_dir, cfg=cfg)
+    except StoreResolutionError as exc:
+        return exc.envelope()
     try:
         if content is not None:
             raw = content
@@ -1414,7 +1489,10 @@ def on_before_tool(
     op_batch = {"kind": "tool", "tool": tool, "call": call,
                 "args": _op_batch_from(tool, args)}
 
-    st = store or resolve_store(project_dir, cfg=cfg)
+    try:
+        st = store or resolve_store(project_dir, cfg=cfg)
+    except StoreResolutionError as exc:
+        return exc.envelope()
     try:
         if content is not None:
             raw = content
@@ -1514,7 +1592,10 @@ def on_ai_tool_success(
     if not is_ai_policy_doc(doc_id):
         return None
 
-    st = store or resolve_store(project_dir, cfg=cfg)
+    try:
+        st = store or resolve_store(project_dir, cfg=cfg)
+    except StoreResolutionError as exc:
+        return exc.envelope()
     op_batch = _op_batch_from(tool, args)
     if msg_idx is None:
         mi = _SESSION_TURN.get("msg_idx")

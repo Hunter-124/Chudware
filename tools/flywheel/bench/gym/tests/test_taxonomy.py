@@ -12,7 +12,7 @@ or:  PYTHONPATH=<repo> python3 tools/flywheel/bench/gym/tests/test_taxonomy.py
 from __future__ import annotations
 
 from tools.flywheel.bench.gym.taxonomy import (
-    classify_ledger, FailureClass, TAXONOMY,
+    classify_ledger, FailureClass, TAXONOMY, misuse_fingerprints,
 )
 
 
@@ -509,6 +509,50 @@ def test_grind_counts_real_agent_turn_calls():
                           graded={"criteria": [], "passed": False},
                           grind_threshold=3)
     assert [c for c in res if c.failure_class == FailureClass.GRIND.value]
+
+
+def test_policy_refusals_are_outcomes_not_tool_failures():
+    """Calls declined before dispatch are harness decisions, not failed attempts."""
+    calls = []
+    for status in ("call_cap_reached", "loop_guard_refused"):
+        for _ in range(3):
+            calls.append({"kind": "agent_turn", "payload": {
+                "event": "tool_call", "tool": "add_features",
+                "args": {"ops": []}, "ok": False, "status": status,
+                "policy_refusal": True, "executed": False,
+                "error": f"{status}: call declined before dispatch",
+            }})
+    lg = _ledger(calls)
+    res = classify_ledger(
+        lg, manifest=None, graded={"criteria": [], "passed": False},
+        grind_threshold=3,
+    )
+    classes = _classes(res)
+    assert FailureClass.POLICY_REFUSAL.value in classes
+    assert FailureClass.EXECUTION_STALL.value not in classes
+    assert FailureClass.TOOL_MISUSE.value not in classes
+    assert FailureClass.GRIND.value not in classes
+    assert misuse_fingerprints(lg) == []
+    details = " ".join(c.detail for c in res
+                       if c.failure_class == FailureClass.POLICY_REFUSAL.value)
+    assert "call_cap_reached" in details
+    assert "loop_guard_refused" in details
+
+
+def test_terminal_infrastructure_outcomes_cannot_pass_real_cell():
+    for payload in (
+        {"event": "reply_truncated_fatal"},
+        {"event": "turn_terminal", "stop_reason": "guardrail_internal_error"},
+        {"event": "done_guardrail_internal_error", "error": "KeyError: state"},
+    ):
+        graded = {"criteria": [], "passed": True}
+        res = classify_ledger(
+            _ledger([{"kind": "agent_turn", "payload": payload}]),
+            manifest=None,
+            graded=graded,
+        )
+        assert graded["passed"] is False
+        assert FailureClass.HARNESS_FAULT.value in _classes(res)
 
 
 def test_every_taxonomy_class_is_covered():

@@ -95,19 +95,24 @@ Server::Server(chudware_ipc::IpcListener listener, std::string buildId)
         sendEventToAll(line);
         touch();  // a child exit restarts the linger countdown
     });
-    chudware::mfg::lane().setEventSink(
-        [this](const std::string& line) { sendEventToAll(line); });
-    // Printer adapters (Moonraker/OctoPrint/PrusaLink) are Python; the lane reaches them
-    // through this injected seam because chudware_manufacturing is a static library and
-    // WorkerBridge only exists in the daemon. The lane still owns claims, approval, seq.
-    chudware::mfg::lane().setWorkerCall(
-        [](const std::string& method, const nlohmann::json& params) {
-            nlohmann::json result;
-            std::string err;
-            if (!WorkerBridge::instance().call(method, params, result, err))
-                throw std::runtime_error(err.empty() ? "worker call failed" : err);
-            return result;
-        });
+    std::string mfgInitError;
+    if (auto* mfg = chudware::mfg::tryLane(&mfgInitError)) {
+        mfg->setEventSink(
+            [this](const std::string& line) { sendEventToAll(line); });
+        // Printer adapters (Moonraker/OctoPrint/PrusaLink) are Python; the lane reaches them
+        // through this injected seam because chudware_manufacturing is a static library and
+        // WorkerBridge only exists in the daemon. The lane still owns claims, approval, seq.
+        mfg->setWorkerCall(
+            [](const std::string& method, const nlohmann::json& params) {
+                nlohmann::json result;
+                std::string err;
+                if (!WorkerBridge::instance().call(method, params, result, err))
+                    throw std::runtime_error(err.empty() ? "worker call failed" : err);
+                return result;
+            });
+    } else {
+        hostd::log().line("manufacturing lane unavailable: %s", mfgInitError.c_str());
+    }
     touch();
     // Fast-tier (interactive RPC) watchdog ceiling; 0 disables that tier. The long tier's far
     // more generous ceiling is engineWatchdogLongMs() above; see engine_watchdog.h for the split.
@@ -531,11 +536,22 @@ json Server::dispatch(ClientConn& c, const std::string& method, const json& para
         c.kind = params.value("client", "unknown");
         c.pid = params.value("pid", 0L);
         if (c.kind == "gui") guiDetached_ = false;  // GUI (re)attached: full linger again
-        // Manufacturing authority and document attribution use the authenticated
-        // local peer credential. `hello.user` is display metadata supplied by the
-        // client and is never accepted as an identity assertion.
+        // Two distinct identities. AUTHORITY (manufacturing leases, undo policy)
+        // always re-derives the authenticated local peer credential at the call
+        // site — `hello.user` is never accepted as an identity assertion. But doc
+        // ATTRIBUTION (doc.changed/doc.opened user stamps, _foreign_edits) uses
+        // hello-declared display metadata: the web gateway multiplexes many real
+        // tenants through one uid, so the credential cannot distinguish writers
+        // there (01117f2d). Absent/blank hello.user falls back to the credential.
         c.userId = authenticatedPeerIdentity(c);
         c.userDisplay = c.userId;
+        if (const auto user = params.value("user", json::object()); user.is_object()) {
+            if (const std::string id = user.value("id", std::string()); !id.empty())
+                c.userId = id;
+            if (const std::string display = user.value("display", std::string());
+                !display.empty())
+                c.userDisplay = display;
+        }
         return json{{"proto", 1},
                     {"abi", core::cpp_core().abiVersion()},
                     {"git_rev", buildId_},
@@ -570,9 +586,17 @@ json Server::dispatch(ClientConn& c, const std::string& method, const json& para
     // the keyboard, so manufacturing sees every raw socket as non-human.
     const chudware::mfg::LeaseOwner mfgCaller{
         "raw", authenticatedSeat, "hostd-client:" + std::to_string(c.id)};
-    if (auto result = chudware::mfg::lane().handle(method, params, mfgCaller)) {
-        isError = result->is_error;
-        return std::move(result->body);
+    if (auto* mfg = chudware::mfg::tryLane()) {
+        if (auto result = mfg->handle(method, params, mfgCaller)) {
+            isError = result->is_error;
+            return std::move(result->body);
+        }
+    } else if (method.rfind("mfg_", 0) == 0) {
+        std::string why;
+        chudware::mfg::tryLane(&why);
+        isError = true;
+        return json{{"code", "mfg_lane_unavailable"},
+                    {"message", "manufacturing lane failed to initialize: " + why}};
     }
     // TEST-ONLY (env-gated; neither name is ever a real client RPC): register an
     // in-flight engine call and sleep, to exercise the watchdog end-to-end.

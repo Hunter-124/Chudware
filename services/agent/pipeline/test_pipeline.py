@@ -179,6 +179,24 @@ def test_rule_modification_resolves_via_doc_resolver():
     assert any(f.rule == "modification_target" and f.level == "error" for f in bad)
 
 
+def test_rule_modification_resolver_failure_is_harness_error_not_bounce():
+    m = _valid_manifest()
+    m["deliverables"][0]["kind"] = "modification"
+    m["deliverables"][0]["target_refs"] = {"doc_id": "doc7", "features": []}
+
+    def unavailable(_ref):
+        raise ConnectionError("document service disconnected")
+
+    findings = validate_manifest(m, doc_resolver=unavailable)
+    failure = next(
+        f for f in findings if f.rule == "modification_target_resolution")
+    assert failure.level == "harness_error"
+    assert "ConnectionError" in failure.message
+    tracker = BounceTracker()
+    assert tracker.record_bounce(findings) == "harness_error"
+    assert tracker.attempts == 0
+
+
 def test_blocking_ambiguity_surfaces_as_blocking_finding():
     m = _valid_manifest()
     m["ambiguities"] = [{"text": "which material?", "blocking": True,
@@ -219,6 +237,33 @@ def test_intake_gate_blocks_on_invalid_manifest():
         machine.exit(Phase.INTAKE, gate)
 
 
+def test_phase_entry_requires_successful_exit_and_exact_adjacency():
+    machine = PhaseMachine(flags=PipelineFlags(org_layer=False))
+    assert machine.enter(Phase.INTAKE).ok
+    with pytest.raises(PhaseError):
+        machine.enter(Phase.DELIVER)
+    with pytest.raises(PhaseError):
+        machine.enter(Phase.SPECIFY)
+
+    gate = machine.run_gate(Phase.INTAKE, {"manifest_findings": []})
+    assert machine.exit(Phase.INTAKE, gate).ok
+    assert machine.enter(Phase.SPECIFY).ok
+    assert machine.current is Phase.SPECIFY
+
+
+def test_enter_persistence_failure_does_not_mutate_state():
+    class BrokenLedger:
+        def log_stage(self, *_args, **_kwargs):
+            raise OSError("ledger read-only")
+
+    machine = PhaseMachine(ledger=BrokenLedger())
+    result = machine.enter(Phase.INTAKE)
+    assert not result.ok
+    assert result.outcome_kind == "internal_error"
+    assert machine.current is None
+    assert machine.history == []
+
+
 def test_plan_gate_blocks_when_not_ratified():
     machine = PhaseMachine()
     gate = machine.run_gate(Phase.PLAN, {
@@ -256,10 +301,52 @@ def test_build_gate_blocks_on_unresolved_node():
 
 def test_verify_gate_waiver_by_name():
     machine = PhaseMachine()
-    ctx = {"criterion_results": {"AC1": "FAIL"}, "waived_criteria": []}
+    ctx = {
+        "expected_ac_ids": ["AC1"],
+        "criterion_results": {"AC1": "FAIL"},
+        "waived_criteria": [],
+    }
     assert not machine.run_gate(Phase.VERIFY, ctx).passed
     ctx["waived_criteria"] = ["AC1"]
     assert machine.run_gate(Phase.VERIFY, ctx).passed
+
+
+def test_verify_gate_requires_evidence_for_every_expected_criterion():
+    machine = PhaseMachine()
+    gate = machine.run_gate(Phase.VERIFY, {
+        "expected_ac_ids": ["AC1"],
+        "criterion_results": {},
+        "waived_criteria": [],
+    })
+    assert not gate.passed
+    assert "AC1" in " ".join(gate.reasons)
+
+
+def test_verify_gate_battery_guard_exception_is_harness_failure(monkeypatch):
+    from services.agent import guardrails
+
+    def broken_guard(_ctx):
+        raise RuntimeError("guard state unavailable")
+
+    monkeypatch.setattr(guardrails, "battery_missing_for_mission", broken_guard)
+    gate = PhaseMachine().run_gate(Phase.VERIFY, {
+        "expected_ac_ids": ["AC1"],
+        "criterion_results": {"AC1": "PASS"},
+        "waived_criteria": [],
+    })
+    assert not gate.passed
+    assert gate.outcome_kind == "internal_error"
+    assert "guard state unavailable" in " ".join(gate.reasons)
+
+
+def test_deliver_gate_requires_ledger_closure_evidence():
+    machine = PhaseMachine()
+    gate = machine.run_gate(Phase.DELIVER, {
+        "mission_report_emitted": True,
+        "ledger_closed": False,
+    })
+    assert not gate.passed
+    assert "ledger" in " ".join(gate.reasons)
 
 
 def test_clarify_skipped_without_blocking_ambiguity():
@@ -301,8 +388,19 @@ def test_build_council_gate_flagged():
 def test_correct_loop_reentry_is_legal():
     machine = PhaseMachine()
     machine.enter(Phase.VERIFY)
-    machine.current = Phase.CORRECT  # simulate being in CORRECT
-    # re-entering BUILD from CORRECT is the documented loop
+    machine.exit(
+        Phase.VERIFY,
+        machine.run_gate(Phase.VERIFY, {
+            "expected_ac_ids": ["AC1"],
+            "criterion_results": {"AC1": "FAIL"},
+            "waived_criteria": ["AC1"],
+        }),
+    )
+    machine.enter(Phase.CORRECT)
+    machine.exit(
+        Phase.CORRECT,
+        machine.run_gate(Phase.CORRECT, {"open_failure_cards": []}),
+    )
     machine.enter(Phase.BUILD)
     assert machine.current is Phase.BUILD
 
@@ -355,6 +453,7 @@ def test_design_pipeline_exits_checkpoint_typed_ledger_story(tmp_path):
         "driving_requirement": "R1",
     }
     ledger.append("feature_architect", "feature", feature)
+    machine.enter(Phase.DECOMPOSE)
     machine.exit(
         Phase.DECOMPOSE,
         machine.run_gate(Phase.DECOMPOSE, {"features": [feature]}),
@@ -368,6 +467,7 @@ def test_design_pipeline_exits_checkpoint_typed_ledger_story(tmp_path):
         "provenance": "derived from the recorded rail envelope",
     }
     ledger.append("geometry_designer", "geometry_spec", geometry)
+    machine.enter(Phase.GEOMETRY)
     machine.exit(
         Phase.GEOMETRY,
         machine.run_gate(
@@ -387,6 +487,7 @@ def test_design_pipeline_exits_checkpoint_typed_ledger_story(tmp_path):
         }],
     }
     ledger.append("linkage_planner", "linkage", linkage)
+    machine.enter(Phase.LINKAGE)
     machine.exit(
         Phase.LINKAGE,
         machine.run_gate(Phase.LINKAGE, {"linkages": [linkage]}),
@@ -400,6 +501,7 @@ def test_design_pipeline_exits_checkpoint_typed_ledger_story(tmp_path):
         "why": "establish the mounting face first",
     }
     ledger.append("build_strategist", "build_node", build_node)
+    machine.enter(Phase.BUILDPATH)
     machine.exit(
         Phase.BUILDPATH,
         machine.run_gate(
@@ -471,6 +573,40 @@ def test_linkage_gate_reads_ledger():
     m = PhaseMachine()
     assert not m.run_gate(Phase.LINKAGE, {"linkages": []}).passed
     assert m.run_gate(Phase.LINKAGE, {"linkages": [{"id": "LINK_MAIN"}]}).passed
+
+
+def test_linkage_context_validates_every_linkage():
+    from services.agent.pipeline.linkage_integrity import gate_context_from_ledger
+
+    state = {
+        "geometry_specs": [{"id": "G1"}],
+        "linkages": [
+            {"id": "LINK_OK", "reference_edges": []},
+            {"id": "LINK_SECOND", "reference_edges": [
+                {"from": "G1", "to": "GHOST"},
+            ]},
+        ],
+    }
+    ctx = gate_context_from_ledger(state)
+    gate = PhaseMachine().run_gate(Phase.LINKAGE, ctx)
+    assert not gate.passed
+    assert any("LINK_SECOND" in reason and "GHOST" in reason
+               for reason in gate.reasons)
+
+
+def test_linkage_reference_edge_rejects_empty_endpoint():
+    from services.agent.pipeline.linkage_integrity import gate_context_from_ledger
+
+    ctx = gate_context_from_ledger({
+        "geometry_specs": [{"id": "G1"}],
+        "linkages": [{"id": "LINK_EMPTY", "reference_edges": [
+            {"from": "", "to": "G1"},
+        ]}],
+    })
+    gate = PhaseMachine().run_gate(Phase.LINKAGE, ctx)
+    assert not gate.passed
+    assert any("LINK_EMPTY" in reason and ".from" in reason
+               for reason in gate.reasons)
 
 
 def test_buildpath_gate_rejects_dangling_element_ref():
@@ -564,6 +700,56 @@ def test_apply_replan_approved_records_ledger_event():
     assert outcome.applied["kind"] == "requirement_change"
 
 
+def test_apply_replan_dag_failure_is_not_an_approved_verdict(monkeypatch):
+    from services.dag import replan as dag_replan_module
+
+    def broken_replan(**_kwargs):
+        raise RuntimeError("splice service unavailable")
+
+    monkeypatch.setattr(dag_replan_module, "dag_replan", broken_replan)
+    req = _replan("buildgraph", proposal={
+        "buildgraph_changes": [{
+            "op": "add",
+            "node": {"id": "n_recovery", "role": "fixer"},
+        }],
+    })
+    outcome = apply_replan(
+        req,
+        approved=True,
+        run_id="run_broken",
+        after_node_id="n_build",
+    )
+    assert not outcome.approved
+    assert outcome.outcome_kind == "internal_error"
+    assert outcome.ledger_event["verdict"] == "apply_failed"
+    assert outcome.ledger_event["verdict"] != "approved"
+
+
+def test_apply_replan_spec_impact_failure_is_not_approved(monkeypatch):
+    from services.agent import derivation
+
+    class RecordingLedger:
+        def __init__(self):
+            self.events = []
+
+        def append(self, actor, kind, payload):
+            self.events.append((actor, kind, payload))
+
+    def broken_impact(*_args, **_kwargs):
+        raise ConnectionError("derivation state unavailable")
+
+    monkeypatch.setattr(derivation, "mark_faulty", broken_impact)
+    ledger = RecordingLedger()
+    req = _replan("spec", proposal={
+        "spec_changes": [{"dim_ref": "D1", "why": "fit correction"}],
+    })
+    outcome = apply_replan(req, approved=True, ledger=ledger)
+    assert not outcome.approved
+    assert outcome.outcome_kind == "internal_error"
+    assert outcome.ledger_event["verdict"] == "apply_failed"
+    assert all(event[2]["verdict"] != "approved" for event in ledger.events)
+
+
 # ===========================================================================
 # 4. Mission DAG template — role assignment + fan-out
 # ===========================================================================
@@ -596,6 +782,21 @@ def test_mission_graph_fan_out_independent_builds_share_no_edge():
     assert ("n_build_DL9", "n_build_DL1") not in build_edges
     assert ("n_plan", "n_build_DL1") in build_edges
     assert ("n_plan", "n_build_DL9") in build_edges
+
+
+def test_invalid_tuning_json_falls_back_with_diagnostic(tmp_path, monkeypatch):
+    from services.agent.pipeline import workflow_router
+
+    artifact = tmp_path / "tuning_results.json"
+    artifact.write_text("{not valid json", encoding="utf-8")
+    monkeypatch.setattr(workflow_router, "_TUNING_RESULTS_PATH", artifact)
+    workflow_router._clear_tuning_cache()
+    result = workflow_router.route("make a simple bracket", "local-24k")
+    workflow_router._clear_tuning_cache()
+
+    assert result.scaffold_level is workflow_router.ScaffoldLevel.MAXIMUM
+    assert "invalid artifact" in result.reason
+    assert result.diagnostics["load_error"]["kind"] == "invalid_artifact"
 
 
 def test_mission_graph_validates_against_dag_schema():
@@ -657,7 +858,10 @@ def test_end_to_end_all_phases_mock(tmp_path):
     # Phase 5 VERIFY — the single AC passes.
     machine.enter(Phase.VERIFY)
     machine.exit(Phase.VERIFY, machine.run_gate(Phase.VERIFY, {
-        "criterion_results": {"AC1": "PASS"}, "waived_criteria": []}))
+        "expected_ac_ids": ["AC1"],
+        "criterion_results": {"AC1": "PASS"},
+        "waived_criteria": [],
+    }))
 
     # No open failure cards → CORRECT skipped → DELIVER.
     assert machine.next_phase(Phase.VERIFY, {"open_failure_cards": []}) is Phase.DELIVER
@@ -665,7 +869,9 @@ def test_end_to_end_all_phases_mock(tmp_path):
     # Phase 7 DELIVER — mission report emitted, ledger closed.
     machine.enter(Phase.DELIVER)
     machine.exit(Phase.DELIVER, machine.run_gate(Phase.DELIVER, {
-        "mission_report_emitted": True}))
+        "mission_report_emitted": True,
+        "ledger_closed": True,
+    }))
     assert machine.next_phase(Phase.DELIVER, {}) is None  # mission complete
 
     # The ledger stage_log recorded every phase we passed through, with exit gates.

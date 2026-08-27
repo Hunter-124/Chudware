@@ -26,8 +26,7 @@ M5_CLEARANCE_BAND = (5.3, 5.8)      # mm, close-to-normal M5 clearance
 BOLT_HOLES = 4
 
 _CALC_TOOLS = frozenset({
-    "research_thread_spec", "research_standard_section", "research_bearing",
-    "calc", "calculate", "math_eval", "scratchpad_calc",
+    "research_thread_spec", "research_standard_section", "part_search",
 })
 
 
@@ -173,13 +172,13 @@ MANIFEST = {
             {"id": "AC1", "text": "seat diameter == 35.0 (6202 OD)",
              "check": {"tool": "measure_part", "pass_rule": "seat==35"}},
             {"id": "AC2", "text": "calc precedes seat dimension",
-             "check": {"tool": "research_bearing", "pass_rule": "seq before seat dim"}},
+             "check": {"tool": "part_search", "pass_rule": "seq before seat dim"}},
             {"id": "AC3", "text": "M5 clearance hole in [5.3, 5.8]",
              "check": {"tool": "research_thread_spec", "pass_rule": "hole_d in band"}},
             {"id": "AC4", "text": "geometry coherent",
              "check": {"tool": "verify_battery", "pass_rule": "PASS"}},
             {"id": "AC5", "text": "dimensions carry provenance",
-             "check": {"tool": "ledger", "pass_rule": "provenance non-empty"}},
+             "check": {"tool": "ledger_note", "pass_rule": "provenance non-empty"}},
         ],
         "depends_on": [],
         "target_refs": {"doc_id": None, "features": []},
@@ -206,9 +205,9 @@ MANIFEST = {
 
 def _base_turns() -> list[dict]:
     return [
-        {"_kind": "tool_call", "tool": "research_bearing", "for_ac": "AC2",
+        {"_kind": "tool_call", "tool": "part_search", "for_ac": "AC2",
          "node": "n_spec_DL1",
-         "args": {"designation": "6202"},
+         "args": {"query": "6202 deep-groove bearing"},
          "hypothesis": "look up 6202 OD from datasheet/catalog"},
         {"_kind": "tool_call", "tool": "research_thread_spec", "for_ac": "AC3",
          "node": "n_spec_DL1",
@@ -222,7 +221,7 @@ def _base_turns() -> list[dict]:
         {"_kind": "dimension", "id": "DIM1", "name": "bearing_seat_diameter",
          "value": SEAT_NOM, "unit": "mm",
          "driver": "datasheet: 6202 OD 35 mm",
-         "provenance": "research_bearing: 6202 OD=35 from datasheet",
+         "provenance": "part_search: 6202 OD=35 from datasheet",
          "tolerance": {"fit_class": "K6", "plus": 0.018, "minus": 0.002},
          "status": "confirmed"},
         {"_kind": "dimension", "id": "DIM2", "name": "bolt_circle_pcd",
@@ -247,7 +246,7 @@ def _seed_scripts() -> dict[int, dict[str, list[dict]]]:
     # seat dim still present with provenance so AC1/AC5 can PASS while AC2 FAILs.
     no_calc = [
         t for t in _base_turns()
-        if t.get("tool") not in ("research_bearing", "research_thread_spec")
+        if t.get("tool") not in ("part_search", "research_thread_spec")
         and t.get("id") != "calc_bolt_circle"
     ]
     no_calc.insert(0, {
@@ -255,7 +254,7 @@ def _seed_scripts() -> dict[int, dict[str, list[dict]]]:
         "node": "n_spec_DL1", "args": {"query": "seat"},
         "hypothesis": "measure without datasheet calc (skips research)",
     })
-    # Wrong tool for AC2 surface (manifest expects research_bearing) → tool_misuse.
+    # Wrong tool for AC2 surface (manifest expects part_search) → tool_misuse.
     no_calc.insert(1, {
         "_kind": "tool_call", "tool": "fit_report", "for_ac": "AC2",
         "node": "n_spec_DL1", "args": {"nominal": 35},

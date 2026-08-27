@@ -50,22 +50,32 @@ def _build(resolved: dict, fmt: str, out_path: Path) -> None:
         if btype == "views":
             slide = prs.slides.add_slide(prs.slide_layouts[5])  # title only
             slide.shapes.title.text = blk.get("heading", "Views")
-            imgs = [p for p in (resolve_image(x) for x in (blk.get("images") or [])) if p]
+            image_refs = list(blk.get("images") or [])
+            resolved_images = [(ref, resolve_image(ref)) for ref in image_refs]
+            available_images = [(ref, path) for ref, path in resolved_images if path is not None]
             captions = list(blk.get("body", []))
-            if imgs:
-                n = len(imgs)
+            failed_refs = [ref for ref, path in resolved_images if path is None]
+            successful_insertions = 0
+            if available_images:
+                n = len(available_images)
                 w = Inches(9.0 / max(1, min(n, 3)))
-                for i, img in enumerate(imgs[:6]):
+                for i, (ref, img) in enumerate(available_images[:6]):
                     left = Inches(0.5) + (i % 3) * w
                     top = Inches(1.6) + (i // 3) * Inches(3.0)
                     try:
                         slide.shapes.add_picture(str(img), left, top, height=Inches(2.6))
-                    except Exception:  # noqa: BLE001 - a bad render never breaks the deck
-                        pass
-            if not imgs and captions:
+                    except Exception:  # noqa: BLE001 - degrade visibly when a render is unreadable
+                        failed_refs.append(ref)
+                    else:
+                        successful_insertions += 1
+
+            degraded_lines = [f"[render unavailable: {ref}]" for ref in failed_refs]
+            if successful_insertions == 0 and (captions or degraded_lines):
                 tb = slide.shapes.add_textbox(Inches(0.5), Inches(1.6), Inches(9), Inches(3))
-                tb.text_frame.text = "\n".join(
-                    captions + [f"[render: {x}]" for x in (blk.get("images") or [])])
+                tb.text_frame.text = "\n".join(captions + degraded_lines)
+            elif degraded_lines:
+                tb = slide.shapes.add_textbox(Inches(0.5), Inches(1.15), Inches(9), Inches(0.4))
+                tb.text_frame.text = "  ".join(degraded_lines)
             continue
 
         # massprops / fea_margins / risks / generic → a content slide with resolved values.

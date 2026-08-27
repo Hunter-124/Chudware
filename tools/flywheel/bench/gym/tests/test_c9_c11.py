@@ -150,8 +150,13 @@ class TestC10FixInterference:
         assert "grind" in classes, f"expected grind, got {classes}"
 
     def test_ac5_fails_without_repair_after_detect(self):
-        turns = [dict(t) for t in c10.CHALLENGE.scripts[1]["DL1"]
-                 if t.get("tool") != "edit_feature"]
+        turns = [
+            dict(t) for t in c10.CHALLENGE.scripts[1]["DL1"]
+            if not (
+                t.get("tool") == "add_features"
+                and (t.get("args") or {}).get("ops", [{}])[0].get("op") == "edit_feature"
+            )
+        ]
         ledger = _ledger_from_script(turns)
         graded = c10.CHALLENGE.grade(ledger, {"seed": 1})
         assert _results_by_id(graded)["AC5"]["result"] == "FAIL"

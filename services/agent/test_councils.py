@@ -617,3 +617,334 @@ def test_validate_typed_position_unit():
     ok, err = validate_typed_position({"position": "ok", "risks": [], "must_haves": [], "extra": "x"})
     assert not ok
     assert "Extra" in err
+
+
+class _CouncilMCP:
+    def __init__(self) -> None:
+        self.tools: dict[str, Any] = {}
+
+    def tool(self, *args, **kwargs):
+        def decorate(fn):
+            self.tools[kwargs.get("name") or fn.__name__] = fn
+            return fn
+        return decorate
+
+
+def test_mcp_council_convene_uses_bound_mission_context():
+    """The registered council tool reaches the provider bound for this mission."""
+    from types import SimpleNamespace
+    from services.mcp import org_tools
+
+    calls: list[str] = []
+
+    class Provider:
+        reasoning_effort = "medium"
+
+        def complete(self, system: str, messages: list[dict],
+                     max_tokens: int = 8000, **kwargs) -> str:
+            calls.append(system)
+            if "CHAIR" in system:
+                return _SYNTHESIS
+            return _typed_position("bound provider reached", [], [])
+
+    mcp = _CouncilMCP()
+    org_tools.register_org_tools(mcp)
+    org_tools.bind_mission_context(SimpleNamespace(
+        provider=Provider(), ledger=None, dissents_registry=None,
+        stage=None, tier=None, providers=None,
+    ))
+    try:
+        record = mcp.tools["council_convene"](
+            kind="build_strategy", topic="bound path", inputs={})
+    finally:
+        org_tools.bind_mission_context(None)
+
+    assert record["schema"] == COUNCIL_SCHEMA
+    assert record["status"] == "complete"
+    assert len(calls) == 9
+
+
+def test_mcp_council_convene_refuses_without_mission_context():
+    """The global MCP fallback reports a non-executed policy refusal."""
+    from services.mcp import org_tools
+
+    mcp = _CouncilMCP()
+    org_tools.register_org_tools(mcp)
+    org_tools.bind_mission_context(None)
+    refused = mcp.tools["council_convene"](
+        kind="build_strategy", topic="outside mission", inputs={})
+    assert refused == {
+        "ok": False,
+        "policy_refusal": True,
+        "executed": False,
+        "status": "no_mission_context",
+        "error": (
+            "council_convene is only available inside a mission turn with "
+            "a bound provider."
+        ),
+    }
+
+
+
+def test_chair_policy_refusal_marks_council_incomplete_without_decision_event():
+    """A refusal envelope is diagnostic data, never a persisted council decision."""
+    events: list[dict] = []
+
+    class Ledger:
+        def append(self, actor: str, kind: str, payload: dict) -> dict:
+            event = {"actor": actor, "kind": kind, "payload": payload}
+            events.append(event)
+            return event
+
+    provider = _make_provider_for_council(
+        {p: _typed_position(f"{p} r1", [], []) for p in (
+            "manufacturing", "tolerancing", "fitment", "simplicity")},
+        {p: _typed_position(f"{p} r2", [], []) for p in (
+            "manufacturing", "tolerancing", "fitment", "simplicity")},
+        json.dumps({
+            "ok": False,
+            "policy_refusal": True,
+            "executed": False,
+            "status": "policy_refusal",
+            "error": "chair declined by policy",
+        }),
+    )
+    record = council_convene(
+        kind="build_strategy", topic="refusal", inputs={},
+        provider=provider, ledger=Ledger())
+
+    assert record["status"] == "incomplete"
+    assert record["complete"] is False
+    assert record["synthesis"]["decision"] == ""
+    assert record["diagnostics"]["chair"]["status"] == "refused"
+    assert record["diagnostics"]["chair"]["outcome_kind"] == "policy_refusal"
+    assert "policy_refusal" in record["diagnostics"]["chair"]["raw_reply"]
+    assert not [event for event in events if event["kind"] == "decision"]
+    assert len([
+        event for event in events
+        if event["kind"] == "artifact"
+        and event["payload"].get("kind") == "council"
+    ]) == 1
+
+
+def test_diagnosis_preserves_first_seat_when_second_seat_provider_call_fails():
+    """A mid-round provider fault returns and persists an explicit partial council."""
+    from services.agent.regen_diagnosis import diagnose
+
+    calls: list[str] = []
+    events: list[dict] = []
+
+    class Provider:
+        reasoning_effort = "medium"
+
+        def complete(self, system: str, messages: list[dict],
+                     max_tokens: int = 8000, **kwargs) -> str:
+            if "CAD regeneration-repair" in system:
+                return json.dumps({"diagnosis": "dangling ref", "fix_ops": []})
+            calls.append(system)
+            if len(calls) == 1:
+                return _typed_position("manufacturing seat completed", [], [])
+            raise RuntimeError("seat-2 provider unavailable")
+
+    class Ledger:
+        def append(self, actor: str, kind: str, payload: dict) -> dict:
+            event = {"actor": actor, "kind": kind, "payload": payload}
+            events.append(event)
+            return event
+
+    result = diagnose(
+        {"tree": {"features": []}},
+        Provider(),
+        wrap_logging=False,
+        council_tier="local-24k",
+        ledger=Ledger(),
+    )
+
+    council = result.council_record
+    assert council is not None
+    assert council["status"] == "incomplete"
+    assert council["complete"] is False
+    assert council["seat_outcomes"][0]["status"] == "executed"
+    assert council["seat_outcomes"][0]["outcome_kind"] == "ok"
+    assert council["seat_outcomes"][0]["position"]["position"] == (
+        "manufacturing seat completed")
+    assert council["seat_outcomes"][1]["status"] == "failed"
+    assert council["seat_outcomes"][1]["outcome_kind"] == "internal_error"
+    assert council["seat_outcomes"][1]["executed"] is False
+    assert "seat-2 provider unavailable" in council["seat_outcomes"][1]["error"]
+    artifacts = [
+        event for event in events
+        if event["kind"] == "artifact"
+        and event["payload"].get("kind") == "council"
+    ]
+    assert len(artifacts) == 1
+    assert artifacts[0]["payload"]["council"]["status"] == "incomplete"
+
+
+def test_council_clamps_provider_reasoning_effort_without_mutating_ambient_provider():
+    """Every seat and chair call observes the provider effort ceiling."""
+    observed: list[str] = []
+
+    class Provider:
+        reasoning_effort = "max"
+
+        def complete(self, system: str, messages: list[dict],
+                     max_tokens: int = 8000, **kwargs) -> str:
+            observed.append(self.reasoning_effort)
+            if "CHAIR" in system:
+                return _SYNTHESIS
+            return _typed_position("safe effort", [], [])
+
+    provider = Provider()
+    record = council_convene(
+        kind="build_strategy", topic="effort", inputs={}, provider=provider)
+
+    assert record["status"] == "complete"
+    assert observed == ["high"] * 9
+    assert provider.reasoning_effort == "max"
+
+
+def test_council_consumes_resolved_seat_and_round_token_knobs(monkeypatch):
+    """One effort resolution controls breadth and both round budgets."""
+    from types import SimpleNamespace
+    from services.agent import effort
+
+    monkeypatch.setattr(
+        effort,
+        "resolve_effort",
+        lambda tier: SimpleNamespace(values={
+            "council_seats": 2,
+            "ponder_round1_tokens": 111,
+            "ponder_round2_tokens": 222,
+        }),
+    )
+    seen_tokens: list[int] = []
+
+    class Provider:
+        reasoning_effort = "medium"
+
+        def complete(self, system: str, messages: list[dict],
+                     max_tokens: int = 8000, **kwargs) -> str:
+            seen_tokens.append(max_tokens)
+            if "CHAIR" in system:
+                return _SYNTHESIS
+            return _typed_position("budgeted", [], [])
+
+    record = council_convene(
+        kind="build_strategy", topic="budgets", inputs={},
+        provider=Provider(), stage="spec", tier="local-24k")
+
+    assert len(record["seats"]) == 2
+    assert record["policy"]["breadth"] == 2
+    assert seen_tokens == [111, 111, 222, 222, 222]
+
+
+def test_regen_council_harness_exception_returns_persisted_incomplete_marker(
+    monkeypatch, caplog,
+):
+    """An unexpected council harness fault is observable and never becomes None."""
+    from services.agent import councils
+    from services.agent.regen_diagnosis import _maybe_convene_fix_council
+
+    def fail_convene(**kwargs):
+        raise RuntimeError("council harness exploded")
+
+    monkeypatch.setattr(councils, "council_convene", fail_convene)
+    events: list[dict] = []
+
+    class Ledger:
+        def append(self, actor: str, kind: str, payload: dict) -> dict:
+            event = {"actor": actor, "kind": kind, "payload": payload}
+            events.append(event)
+            return event
+
+    with caplog.at_level("ERROR"):
+        record = _maybe_convene_fix_council(
+            diagnosis_text="diagnosis",
+            fix_ops=[],
+            failures=[],
+            provider=object(),
+            tier="local-24k",
+            ledger=Ledger(),
+        )
+
+    assert record is not None
+    assert record["status"] == "incomplete"
+    assert record["complete"] is False
+    diagnostic = record["diagnostics"]["council_exception"]
+    assert diagnostic["outcome_kind"] == "internal_error"
+    assert diagnostic["executed"] is False
+    assert "council harness exploded" in diagnostic["error"]
+    assert any(item.exc_info for item in caplog.records)
+    artifacts = [
+        event for event in events
+        if event["kind"] == "artifact"
+        and event["payload"].get("kind") == "council"
+    ]
+    assert len(artifacts) == 1
+
+
+def test_linear_turn_setup_binds_real_council_tool_to_run_provider(
+    monkeypatch,
+):
+    """The production turn seam binds the global council closure only for the run."""
+    from services.agent import agent_turn, mission_dispatch
+    from services.mcp import org_tools
+
+    provider_calls: list[str] = []
+    captured: dict[str, dict] = {}
+
+    class Provider:
+        reasoning_effort = "medium"
+
+        def complete(self, system: str, messages: list[dict],
+                     max_tokens: int = 8000, **kwargs) -> str:
+            provider_calls.append(system)
+            if "CHAIR" in system:
+                return _SYNTHESIS
+            return _typed_position("live turn provider reached", [], [])
+
+    class Result:
+        success = True
+        stop_reason = "confirmed"
+        result = {"handoff": {"status": "done", "summary": "council ran"}}
+
+    def fake_run_turn(*args, **kwargs):
+        bound = agent_turn._bind_tool("council_convene")
+        assert bound is not None
+        captured["record"] = bound(
+            kind="build_strategy",
+            topic="production turn binding",
+            inputs={},
+        )
+        return Result()
+
+    monkeypatch.setattr(agent_turn, "run_turn", fake_run_turn)
+    org_tools.bind_mission_context(None)
+    mission_dispatch.run_linear_role_turn(
+        "convene the council",
+        "department_manager",
+        Provider(),
+        run_id="council-bind-test",
+        ledger=MagicMock(),
+    )
+
+    assert captured["record"]["schema"] == COUNCIL_SCHEMA
+    assert captured["record"]["status"] == "complete"
+    assert len(provider_calls) == 9
+    assert org_tools.MISSION_CONTEXT is None
+
+    def fail_inside_turn(*args, **kwargs):
+        assert org_tools.MISSION_CONTEXT is not None
+        raise RuntimeError("turn failed")
+
+    monkeypatch.setattr(agent_turn, "run_turn", fail_inside_turn)
+    with pytest.raises(RuntimeError, match="turn failed"):
+        mission_dispatch.run_linear_role_turn(
+            "fail after binding",
+            "department_manager",
+            Provider(),
+            run_id="council-bind-failure-test",
+            ledger=MagicMock(),
+        )
+    assert org_tools.MISSION_CONTEXT is None

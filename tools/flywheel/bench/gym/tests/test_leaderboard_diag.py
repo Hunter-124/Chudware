@@ -34,6 +34,7 @@ from tools.flywheel.bench.gym.leaderboard import (
     aggregate,
     validate_leaderboard,
     build_and_write,
+    discover_cells,
     model_id_for_tier,
     SCHEMA,
 )
@@ -395,17 +396,20 @@ class TestDiagRunnerAndLeaderboard:
         # Minimal synthetic cells + diag.
         cells = [
             {
-                "challenge": "C1", "tier": "local-24k", "seed": 1, "cycle": "cycle-1",
+                "challenge": "C1", "tier": "local-24k", "model": "qwen3-4b",
+                "mode": "mock", "seed": 1, "cycle": "cycle-1",
                 "passed": False,
                 "classifications": [{"failure_class": "incoherent_geometry"}],
                 "ledger_path": "",
             },
             {
-                "challenge": "C1", "tier": "local-24k", "seed": 2, "cycle": "cycle-1",
+                "challenge": "C1", "tier": "local-24k", "model": "qwen3-4b",
+                "mode": "mock", "seed": 2, "cycle": "cycle-1",
                 "passed": True, "classifications": [], "ledger_path": "",
             },
             {
                 "challenge": "C1", "tier": "openrouter:anthropic/claude-opus-4",
+                "model": "anthropic/claude-opus-4", "mode": "mock",
                 "seed": 1, "cycle": "cycle-1",
                 "passed": True, "classifications": [], "ledger_path": "",
             },
@@ -456,6 +460,72 @@ class TestDiagRunnerAndLeaderboard:
         # Local vision skipped → null
         local = next(m for m in doc["models"] if m["kind"] == "local")
         assert local["axes"]["vision_fix"] is None
+
+    def test_real_scores_exclude_historical_mock_cells(self):
+        cells = [
+            {
+                "challenge": "C1", "tier": "local-24k", "model": "qwen3-4b",
+                "seed": 1, "cycle": "old", "division": "local", "mode": "mock",
+                "passed": True, "classifications": [], "ledger_path": "",
+            },
+            {
+                "challenge": "C1", "tier": "local-24k", "model": "qwen3-4b",
+                "seed": 1, "cycle": "current", "division": "local", "mode": "real",
+                "passed": False, "classifications": [], "ledger_path": "",
+            },
+        ]
+        doc = aggregate(
+            cells=cells,
+            cycle_reports=[
+                {"cycle": "old", "execution_mode": "mock", "tiers": ["local-24k"]},
+                {"cycle": "current", "execution_mode": "real", "tiers": ["local-24k"]},
+            ],
+            diag={},
+        )
+        model = next(row for row in doc["models"] if row["id"] == "qwen3-4b")
+        assert model["primary"] == {
+            "pass_rate": 0.0, "cells_total": 1, "cells_passed": 0,
+        }
+        assert not doc["task_suite"].endswith("-MOCK")
+
+    def test_real_report_without_real_cells_cannot_clear_mock_badge(self):
+        doc = aggregate(
+            cells=[{
+                "challenge": "C1", "tier": "local-24k", "model": "qwen3-4b",
+                "seed": 1, "cycle": "old", "division": "local", "mode": "mock",
+                "passed": True, "classifications": [], "ledger_path": "",
+            }],
+            cycle_reports=[
+                {"cycle": "old", "execution_mode": "mock", "tiers": ["local-24k"]},
+                {"cycle": "current", "execution_mode": "real", "tiers": ["local-24k"]},
+            ],
+            diag={},
+        )
+        assert doc["task_suite"].endswith("-MOCK")
+
+    def test_discover_cells_uses_exact_persisted_identity(self, tmp_path):
+        run_dir = tmp_path / "runs" / "current" / \
+            "C1_open_openrouter-anthropic-model_s1"
+        run_dir.mkdir(parents=True)
+        exact_tier = "openrouter:anthropic/model"
+        (run_dir / "cell.json").write_text(json.dumps({
+            "challenge": "C1",
+            "tier": exact_tier,
+            "model": "anthropic/model",
+            "seed": 1,
+            "division": "open",
+            "cycle": "current",
+            "mode": "real",
+            "run_id": "gym_C1_open_openrouter:anthropic/model_s1",
+            "passed": False,
+            "graded": {"passed": False, "criteria": []},
+            "classifications": [],
+        }))
+        cells = discover_cells(tmp_path, cycles={"current"})
+        assert len(cells) == 1
+        assert cells[0]["tier"] == exact_tier
+        assert cells[0]["model"] == "anthropic/model"
+        assert cells[0]["run_id"] == "gym_C1_open_openrouter:anthropic/model_s1"
 
     def test_build_and_write_from_existing_reports(self, tmp_path):
         """Smoke: aggregate real cycle-1 reports + mock diag → valid leaderboard."""

@@ -111,9 +111,9 @@ CATEGORY_SPECS: list[CategorySpec] = [
             "— schematic → board → sim → firmware → power budget."
         ),
         tools_covered=[
-            "ecad_place", "ecad_connect", "ecad_simulate", "board_from_schematic",
-            "ecad_autoroute", "ecad_check", "ecad_run_pdn", "power_budget",
-            "fw_project_create", "fw_sim_run", "antenna_design",
+            "ecad_place_symbol", "ecad_wire", "ecad_simulate", "board_from_schematic",
+            "ecad_autoroute", "ecad_run_erc", "ecad_run_drc", "ecad_run_pdn",
+            "power_budget", "fw_new_project", "fw_sim_run", "ecad_antenna_design",
         ],
         kind="multi",
     ),
@@ -235,6 +235,8 @@ def _read_modeling_last(repo: Path) -> dict | None:
             return {
                 "when": data.get("when") or _file_when(cat_summary),
                 "pass_rate": data.get("pass_rate"),
+                "executed": data.get("executed"),
+                "stage": data.get("stage"),
                 "detail_path": str(cat_summary),
             }
         except Exception:  # noqa: BLE001
@@ -284,19 +286,19 @@ def _read_modeling_last(repo: Path) -> dict | None:
     return None
 
 
-def _parse_verdict_pass_rate(summary: dict) -> float | None:
+def _verdict_stats(summary: dict) -> tuple[float | None, int]:
     counts = summary.get("counts") or {}
-    p = int(counts.get("pass") or 0)
-    w = int(counts.get("warn") or 0)
-    f = int(counts.get("fail") or 0)
-    s = int(counts.get("skip") or 0)
-    total = p + w + f + s
-    if total <= 0:
-        if "ok" in summary:
-            return 1.0 if summary["ok"] else 0.0
-        return None
-    # WARN and SKIP count as non-fail for rate (honest degradation allowed).
-    return (p + w + s) / total
+    passed = int(counts.get("pass") or 0)
+    warned = int(counts.get("warn") or 0)
+    failed = int(counts.get("fail") or 0)
+    executed = passed + warned + failed
+    if executed <= 0:
+        return None, 0
+    return passed / executed, executed
+
+
+def _parse_verdict_pass_rate(summary: dict) -> float | None:
+    return _verdict_stats(summary)[0]
 
 
 def _read_ecad_last(repo: Path) -> dict | None:
@@ -307,6 +309,8 @@ def _read_ecad_last(repo: Path) -> dict | None:
             return {
                 "when": data.get("when") or _file_when(cat_summary),
                 "pass_rate": data.get("pass_rate"),
+                "executed": data.get("executed"),
+                "stage": data.get("stage"),
                 "detail_path": str(cat_summary),
             }
         except Exception:  # noqa: BLE001
@@ -364,6 +368,8 @@ def _read_simulation_last(repo: Path) -> dict | None:
             return {
                 "when": data.get("when") or _file_when(cat_summary),
                 "pass_rate": data.get("pass_rate"),
+                "executed": data.get("executed"),
+                "stage": data.get("stage"),
                 "detail_path": str(cat_summary),
             }
         except Exception:  # noqa: BLE001
@@ -385,11 +391,16 @@ def _read_simulation_last(repo: Path) -> dict | None:
         try:
             data = json.loads(latest_sim.read_text(encoding="utf-8"))
             cases = data.get("cases") or []
-            if cases:
-                ok = sum(1 for c in cases if c.get("status") in ("ok", "pass", "PASS"))
-                skip = sum(1 for c in cases if c.get("status") == "skip")
-                # skip allowed; fail hurts rate
-                rates.append((ok + skip) / len(cases))
+            executed_cases = [
+                c for c in cases
+                if isinstance(c, dict) and str(c.get("status", "")).lower() != "skip"
+            ]
+            if executed_cases:
+                ok = sum(
+                    1 for c in executed_cases
+                    if str(c.get("status", "")).lower() in ("ok", "pass")
+                )
+                rates.append(ok / len(executed_cases))
             when = data.get("timestamp") or _file_when(latest_sim)
             detail = latest_sim
         except Exception:  # noqa: BLE001
@@ -438,20 +449,29 @@ def _read_pytest_summary(path: Path) -> dict | None:
         return {
             "when": data.get("when") or _file_when(path),
             "pass_rate": data.get("pass_rate"),
+            "executed": data.get("executed"),
+            "stage": data.get("stage"),
             "detail_path": str(path),
         }
     # pytest --json-report style (optional)
     summary = data.get("summary") or {}
-    total = int(summary.get("total") or 0)
     passed = int(summary.get("passed") or 0)
-    skipped = int(summary.get("skipped") or 0)
-    if total > 0:
+    failed = int(summary.get("failed") or 0)
+    errors = int(summary.get("error") or summary.get("errors") or 0)
+    executed = passed + failed + errors
+    if executed > 0:
         return {
             "when": data.get("created") or _file_when(path),
-            "pass_rate": (passed + skipped) / total,
+            "pass_rate": passed / executed,
+            "executed": executed,
             "detail_path": str(path),
         }
-    return None
+    return {
+        "when": data.get("created") or _file_when(path),
+        "pass_rate": None,
+        "executed": 0,
+        "detail_path": str(path),
+    }
 
 
 def _read_reveng_last(repo: Path) -> dict | None:
@@ -484,6 +504,8 @@ def _read_roundtrip_last(repo: Path) -> dict | None:
             return {
                 "when": data.get("when") or _file_when(p),
                 "pass_rate": data.get("pass_rate"),
+                "executed": data.get("executed"),
+                "stage": data.get("stage"),
                 "detail_path": str(p),
             }
         except Exception:  # noqa: BLE001
@@ -502,7 +524,7 @@ _LAST_READERS: dict[str, Callable[[Path], dict | None]] = {
 
 
 def read_last_result(cat_id: str, repo: Path | None = None) -> dict | None:
-    """Parse the category's native artifacts into {when, pass_rate, detail_path}."""
+    """Parse the category's latest result, including executed-count and stage."""
     root = repo or _repo_root()
     reader = _LAST_READERS.get(cat_id)
     if reader is None:
@@ -517,6 +539,8 @@ def read_last_result(cat_id: str, repo: Path | None = None) -> dict | None:
     out = {
         "when": hit.get("when"),
         "pass_rate": hit.get("pass_rate"),
+        "executed": hit.get("executed"),
+        "stage": hit.get("stage"),
         "detail_path": hit.get("detail_path"),
     }
     if out["detail_path"] is None:
@@ -595,13 +619,93 @@ def _run_cmd(
         logf.write(f"\n# spawn failed: {exc}\n")
         return 1
 
+def _run_cmd_capture(
+    cmd: list[str],
+    *,
+    cwd: Path,
+    env: dict[str, str],
+    logf,
+) -> tuple[int, str]:
+    logf.write(f"\n$ {' '.join(cmd)}\n")
+    logf.flush()
+    try:
+        proc = subprocess.run(
+            cmd,
+            cwd=str(cwd),
+            env=env,
+            capture_output=True,
+            text=True,
+            stdin=subprocess.DEVNULL,
+            check=False,
+        )
+        text = (proc.stdout or "") + (proc.stderr or "")
+        logf.write(text)
+        logf.flush()
+        return int(proc.returncode), text
+    except Exception as exc:  # noqa: BLE001
+        text = f"# spawn failed: {exc}\n"
+        logf.write(text)
+        logf.flush()
+        return 1, text
+
 
 def _write_summary(out_dir: Path, payload: dict) -> Path:
+    """Atomically replace ``summary.json`` with a fully serialized payload."""
     out_dir.mkdir(parents=True, exist_ok=True)
     path = out_dir / "summary.json"
     payload.setdefault("when", _utc_now())
-    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    tmp = out_dir / f".summary.{os.getpid()}.{time.time_ns()}.tmp"
+    tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    os.replace(tmp, path)
     return path
+
+
+def _begin_invocation(out_dir: Path, category: str) -> tuple[str, Path]:
+    run_id = f"{category}-{time.time_ns()}-{os.getpid()}"
+    run_dir = out_dir / "runs" / run_id
+    run_dir.mkdir(parents=True, exist_ok=False)
+    return run_id, run_dir
+
+
+def _finish_invocation(
+    out_dir: Path,
+    run_dir: Path,
+    run_id: str,
+    payload: dict,
+) -> dict:
+    """Validate this invocation, persist it, then atomically publish it as latest."""
+    summary = dict(payload)
+    summary["run_id"] = run_id
+    summary.setdefault("when", _utc_now())
+    if summary.get("category") is None:
+        raise ValueError("category summary missing category")
+    if not isinstance(summary.get("exit_code"), int):
+        raise ValueError("category summary exit_code must be an int")
+    if not isinstance(summary.get("executed"), int) or summary["executed"] < 0:
+        raise ValueError("category summary executed must be a non-negative int")
+    if summary.get("stage") not in {"done", "skipped", "error"}:
+        raise ValueError("category summary stage must be done, skipped, or error")
+    rate = summary.get("pass_rate")
+    if rate is not None and (
+        not isinstance(rate, (int, float)) or not 0.0 <= float(rate) <= 1.0
+    ):
+        raise ValueError("category summary pass_rate must be null or in [0, 1]")
+    executed = summary["executed"]
+    stage = summary["stage"]
+    exit_code = summary["exit_code"]
+    if executed == 0 and rate is not None:
+        raise ValueError("all-skipped summary must have null pass_rate")
+    if stage == "skipped" and (executed != 0 or exit_code != 0):
+        raise ValueError("skipped summary must have zero executed and exit_code 0")
+    if stage == "done" and (executed == 0 or exit_code != 0 or rate is None):
+        raise ValueError("done summary requires executed checks, pass_rate, and exit_code 0")
+    if stage == "error" and exit_code == 0:
+        raise ValueError("error summary requires non-zero exit_code")
+    invocation_path = run_dir / "summary.json"
+    summary["detail_path"] = str(invocation_path)
+    _write_summary(run_dir, summary)
+    _write_summary(out_dir, summary)
+    return summary
 
 
 def _pytest_cmd(targets: list[str], report_json: Path) -> list[str]:
@@ -633,17 +737,29 @@ def _parse_pytest_output(text: str) -> dict[str, int]:
 
 
 def run_modeling(repo: Path, out_dir: Path, logf, *, mode: str = "smoke") -> dict:
+    run_id, run_dir = _begin_invocation(out_dir, "modeling")
     env = os.environ.copy()
     env.setdefault("CHUDWARE_REPO", str(repo))
     env.setdefault("PYTHONUNBUFFERED", "1")
     py = sys.executable or "python3"
-    steps: list[dict] = []
+    artifact: Path
+    before: tuple[int, int] | None = None
 
     if mode == "diag":
+        artifact = (
+            repo / "tools" / "flywheel" / "bench" / "gym"
+            / "reports" / "diag" / "diag-latest.json"
+        )
+        if artifact.is_file():
+            stat = artifact.stat()
+            before = (stat.st_mtime_ns, stat.st_size)
         cmd = [py, "-m", "tools.flywheel.bench.gym.cli", "diag", "--tiers", "local-24k"]
     else:
-        # smoke: C1 real, local tier, no dial adjust
-        cycle = f"cat-modeling-{int(time.time())}"
+        cycle = run_id
+        artifact = (
+            repo / "tools" / "flywheel" / "bench" / "gym"
+            / "reports" / f"{cycle}.json"
+        )
         cmd = [
             py, "-m", "tools.flywheel.bench.gym.cli", "run",
             "--real", "--challenges", "C1",
@@ -651,124 +767,212 @@ def run_modeling(repo: Path, out_dir: Path, logf, *, mode: str = "smoke") -> dic
             "--cycle", cycle,
             "--no-adjust",
         ]
+
     rc = _run_cmd(cmd, cwd=repo, env=env, logf=logf)
-    steps.append({"name": f"gym_{mode}", "exit_code": rc, "cmd": cmd})
+    current = artifact.is_file()
+    if current and before is not None:
+        stat = artifact.stat()
+        current = (stat.st_mtime_ns, stat.st_size) != before
 
-    # Optional full C1–C15 dry discovery (no model) is NOT launched here — expensive
-    # and needs tiers. Last result falls back to existing gym reports.
-    last = _read_modeling_last(repo)
-    pass_rate = None if last is None else last.get("pass_rate")
-    if pass_rate is None:
-        # If the run just produced a report, re-read; else use exit code.
-        pass_rate = 1.0 if rc == 0 else 0.0
+    data: dict[str, Any] | None = None
+    artifact_error: str | None = None
+    if current:
+        try:
+            loaded = json.loads(artifact.read_text(encoding="utf-8"))
+            if not isinstance(loaded, dict):
+                raise TypeError("report root is not an object")
+            if mode != "diag" and loaded.get("cycle") != run_id:
+                raise ValueError(f"report cycle {loaded.get('cycle')!r} != {run_id!r}")
+            data = loaded
+            copied = run_dir / f"{mode}.json"
+            copied.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        except Exception as exc:  # noqa: BLE001
+            artifact_error = f"invalid current artifact {artifact}: {exc}"
+    else:
+        artifact_error = f"no artifact created by invocation {run_id}: {artifact}"
 
+    executed = 0
+    pass_rate: float | None = None
+    if data is not None and mode == "diag":
+        scores = [
+            float(axis["score"])
+            for row in data.get("results") or []
+            if isinstance(row, dict) and not row.get("error")
+            for axis in (row.get("axes") or {}).values()
+            if isinstance(axis, dict) and isinstance(axis.get("score"), (int, float))
+        ]
+        executed = len(scores)
+        pass_rate = sum(scores) / executed if executed else None
+    elif data is not None:
+        executed = int(data.get("n_cells") or 0)
+        overall = (data.get("pass_rates") or {}).get("overall")
+        pass_rate = float(overall) if executed and isinstance(overall, (int, float)) else None
+
+    exit_code = rc if rc != 0 else (1 if artifact_error else 0)
+    stage = "error" if exit_code else ("skipped" if executed == 0 else "done")
     summary = {
         "category": "modeling",
         "mode": mode,
-        "when": _utc_now(),
         "pass_rate": pass_rate,
-        "exit_code": rc,
-        "steps": steps,
-        "detail_path": None if last is None else last.get("detail_path"),
+        "executed": executed,
+        "exit_code": exit_code,
+        "stage": stage,
+        "artifact_error": artifact_error,
+        "steps": [{"name": f"gym_{mode}", "exit_code": rc, "cmd": cmd}],
     }
-    path = _write_summary(out_dir, summary)
-    summary["detail_path"] = str(path)
-    # Rewrite with self path.
-    path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
-    return summary
+    return _finish_invocation(out_dir, run_dir, run_id, summary)
 
 
 def run_ecad(repo: Path, out_dir: Path, logf) -> dict:
-    env = os.environ.copy()
-    env.setdefault("CHUDWARE_REPO", str(repo))
-    env.setdefault("PYTHONUNBUFFERED", "1")
-    env.setdefault("CHUDWARE_ENGINE_DAEMON", "0")
+    run_id, run_dir = _begin_invocation(out_dir, "ecad")
+    base_env = os.environ.copy()
+    base_env.setdefault("CHUDWARE_REPO", str(repo))
+    base_env.setdefault("PYTHONUNBUFFERED", "1")
+    base_env.setdefault("CHUDWARE_ENGINE_DAEMON", "0")
     py = sys.executable or "python3"
     scripts = [
-        ("flight_computer", repo / "scripts" / "bench_flight_computer.py"),
-        ("battery_charger", repo / "scripts" / "bench_battery_charger.py"),
+        ("flight_computer", repo / "scripts" / "bench_flight_computer.py",
+         "CHUDWARE_FC_OUT"),
+        ("battery_charger", repo / "scripts" / "bench_battery_charger.py",
+         "CHUDWARE_BC_OUT"),
     ]
     steps: list[dict] = []
-    for name, script in scripts:
+    passed = executed = 0
+    artifact_fault = False
+    observed_failures: list[int] = []
+
+    for name, script, out_var in scripts:
         if not script.is_file():
-            steps.append({"name": name, "exit_code": None, "skipped": True,
-                          "reason": f"missing {script}"})
+            steps.append({
+                "name": name, "exit_code": None, "skipped": True,
+                "reason": f"missing {script}",
+            })
             continue
-        rc = _run_cmd([py, str(script)], cwd=repo, env=env, logf=logf)
-        steps.append({"name": name, "exit_code": rc, "cmd": [py, str(script)]})
+        step_out = run_dir / name
+        env = dict(base_env)
+        env[out_var] = str(step_out)
+        cmd = [py, str(script)]
+        rc = _run_cmd(cmd, cwd=repo, env=env, logf=logf)
+        if rc != 0:
+            observed_failures.append(rc)
+        artifact = step_out / "summary.json"
+        step: dict[str, Any] = {
+            "name": name, "exit_code": rc, "cmd": cmd,
+            "artifact": str(artifact),
+        }
+        try:
+            data = json.loads(artifact.read_text(encoding="utf-8"))
+            if not isinstance(data, dict):
+                raise TypeError("summary root is not an object")
+            rate, step_executed = _verdict_stats(data)
+            step["executed"] = step_executed
+            step["pass_rate"] = rate
+            counts = data.get("counts") or {}
+            passed += int(counts.get("pass") or 0)
+            executed += step_executed
+        except Exception as exc:  # noqa: BLE001
+            artifact_fault = True
+            step["artifact_error"] = f"{type(exc).__name__}: {exc}"
+        steps.append(step)
 
-    last = _read_ecad_last(repo)
-    # Prefer native summaries over exit codes (SKIP-heavy runs exit 0).
-    pass_rate = last.get("pass_rate") if last else None
-    if pass_rate is None:
-        codes = [s["exit_code"] for s in steps if s.get("exit_code") is not None]
-        pass_rate = 1.0 if codes and all(c == 0 for c in codes) else (0.0 if codes else None)
-
-    hard_fail = any(s.get("exit_code") not in (0, None) for s in steps)
-    summary = {
+    pass_rate = passed / executed if executed else None
+    exit_code = observed_failures[0] if observed_failures else (1 if artifact_fault else 0)
+    stage = "error" if exit_code else ("skipped" if executed == 0 else "done")
+    return _finish_invocation(out_dir, run_dir, run_id, {
         "category": "ecad",
-        "when": _utc_now(),
         "pass_rate": pass_rate,
-        "exit_code": 1 if hard_fail else 0,
+        "executed": executed,
+        "exit_code": exit_code,
+        "stage": stage,
         "steps": steps,
-        "detail_path": last.get("detail_path") if last else None,
-    }
-    path = _write_summary(out_dir, summary)
-    summary["detail_path"] = summary["detail_path"] or str(path)
-    path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
-    return summary
+    })
 
 
 def run_simulation(repo: Path, out_dir: Path, logf) -> dict:
+    run_id, run_dir = _begin_invocation(out_dir, "simulation")
     env = os.environ.copy()
     env.setdefault("CHUDWARE_REPO", str(repo))
     env.setdefault("PYTHONUNBUFFERED", "1")
     env.setdefault("CHUDWARE_ENGINE_DAEMON", "0")
     py = sys.executable or "python3"
     steps: list[dict] = []
+    passed = executed = 0
+    observed_failures: list[int] = []
+    artifact_fault = False
 
     simsuite = repo / "benchmarks" / "simsuite" / "run_all.py"
     if simsuite.is_file():
-        rc = _run_cmd(
-            [py, str(simsuite), "--quick"],
-            cwd=repo, env=env, logf=logf,
-        )
-        steps.append({"name": "simsuite", "exit_code": rc})
+        sim_out = run_dir / "simsuite"
+        cmd = [py, str(simsuite), "--quick", "--out", str(sim_out)]
+        rc = _run_cmd(cmd, cwd=repo, env=env, logf=logf)
+        if rc != 0:
+            observed_failures.append(rc)
+        artifact = sim_out / "results.json"
+        step: dict[str, Any] = {
+            "name": "simsuite", "exit_code": rc, "cmd": cmd,
+            "artifact": str(artifact),
+        }
+        try:
+            data = json.loads(artifact.read_text(encoding="utf-8"))
+            cases = data.get("cases") or []
+            current = [
+                c for c in cases
+                if isinstance(c, dict) and str(c.get("status", "")).lower() != "skip"
+            ]
+            step["executed"] = len(current)
+            executed += len(current)
+            n_pass = sum(
+                1 for c in current
+                if str(c.get("status", "")).lower() in ("ok", "pass")
+            )
+            passed += n_pass
+            step["pass_rate"] = n_pass / len(current) if current else None
+        except Exception as exc:  # noqa: BLE001
+            artifact_fault = True
+            step["artifact_error"] = f"{type(exc).__name__}: {exc}"
+        steps.append(step)
     else:
-        steps.append({"name": "simsuite", "exit_code": None, "skipped": True,
-                      "reason": "run_all.py missing"})
+        steps.append({
+            "name": "simsuite", "exit_code": None, "skipped": True,
+            "reason": "run_all.py missing",
+        })
 
     vv = repo / "scripts" / "vv_benchmark.py"
     if vv.is_file():
-        # Prefer pytest smoke path (no .so required).
-        rc = _run_cmd(
-            [py, "-m", "pytest", str(vv), "-q", "-k", "smoke", "--tb=line"],
-            cwd=repo, env=env, logf=logf,
-        )
-        steps.append({"name": "vv_benchmark_smoke", "exit_code": rc})
+        cmd = [py, "-m", "pytest", str(vv), "-q", "-k", "smoke", "--tb=line"]
+        rc, text = _run_cmd_capture(cmd, cwd=repo, env=env, logf=logf)
+        counts = _parse_pytest_output(text)
+        step_executed = counts["passed"] + counts["failed"] + counts["error"]
+        passed += counts["passed"]
+        executed += step_executed
+        if rc not in (0, 5):
+            observed_failures.append(rc)
+        steps.append({
+            "name": "vv_benchmark_smoke",
+            "exit_code": rc,
+            "cmd": cmd,
+            "pytest_counts": counts,
+            "executed": step_executed,
+            "pass_rate": counts["passed"] / step_executed if step_executed else None,
+            "skipped": step_executed == 0 and rc in (0, 5),
+        })
     else:
-        steps.append({"name": "vv_benchmark", "exit_code": None, "skipped": True,
-                      "reason": "vv_benchmark.py missing"})
+        steps.append({
+            "name": "vv_benchmark", "exit_code": None, "skipped": True,
+            "reason": "vv_benchmark.py missing",
+        })
 
-    last = _read_simulation_last(repo)
-    pass_rate = last.get("pass_rate") if last else None
-    if pass_rate is None:
-        codes = [s["exit_code"] for s in steps if s.get("exit_code") is not None]
-        pass_rate = 1.0 if codes and all(c == 0 for c in codes) else (0.0 if codes else None)
-
-    hard_fail = any(s.get("exit_code") not in (0, None) for s in steps)
-    summary = {
+    pass_rate = passed / executed if executed else None
+    exit_code = observed_failures[0] if observed_failures else (1 if artifact_fault else 0)
+    stage = "error" if exit_code else ("skipped" if executed == 0 else "done")
+    return _finish_invocation(out_dir, run_dir, run_id, {
         "category": "simulation",
-        "when": _utc_now(),
         "pass_rate": pass_rate,
-        "exit_code": 1 if hard_fail else 0,
+        "executed": executed,
+        "exit_code": exit_code,
+        "stage": stage,
         "steps": steps,
-        "detail_path": last.get("detail_path") if last else None,
-    }
-    path = _write_summary(out_dir, summary)
-    summary["detail_path"] = summary["detail_path"] or str(path)
-    path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
-    return summary
+    })
 
 
 def _run_pytest_bundle(
@@ -779,62 +983,33 @@ def _run_pytest_bundle(
     category: str,
     targets: list[str],
 ) -> dict:
+    run_id, run_dir = _begin_invocation(out_dir, category)
     env = os.environ.copy()
     env.setdefault("CHUDWARE_REPO", str(repo))
     env.setdefault("PYTHONUNBUFFERED", "1")
-    # Capture pytest output to a side file for count parsing.
-    out_dir.mkdir(parents=True, exist_ok=True)
-    pytest_log = out_dir / "pytest.log"
-    cmd = _pytest_cmd(targets, out_dir / "pytest_report.json")
-    logf.write(f"\n$ {' '.join(cmd)}\n")
-    logf.flush()
-    text = ""
-    rc = 1
-    try:
-        proc = subprocess.run(
-            cmd,
-            cwd=str(repo),
-            env=env,
-            capture_output=True,
-            text=True,
-            stdin=subprocess.DEVNULL,
-            check=False,
-        )
-        rc = int(proc.returncode)
-        text = (proc.stdout or "") + (proc.stderr or "")
-        pytest_log.write_text(text, encoding="utf-8")
-        logf.write(text)
-        logf.flush()
-    except Exception as exc:  # noqa: BLE001
-        logf.write(f"\n# pytest spawn failed: {exc}\n")
-        text = str(exc)
+    cmd = _pytest_cmd(targets, run_dir / "pytest_report.json")
+    rc, text = _run_cmd_capture(cmd, cwd=repo, env=env, logf=logf)
+    (run_dir / "pytest.log").write_text(text, encoding="utf-8")
 
     counts = _parse_pytest_output(text)
-    total = sum(counts.values())
-    # pytest exit 0 = all passed; 5 = no tests collected. Treat exit 0 as pass_rate 1.
-    # Skips count as non-fail.
-    if total > 0:
-        pass_rate = (counts["passed"] + counts["skipped"] + counts["xfailed"]) / total
-    elif rc == 0:
-        pass_rate = 1.0
-    elif rc == 5:
-        pass_rate = None  # nothing collected
+    executed = counts["passed"] + counts["failed"] + counts["error"]
+    pass_rate = counts["passed"] / executed if executed else None
+    if executed == 0 and rc in (0, 5):
+        exit_code = 0
+        stage = "skipped"
     else:
-        pass_rate = 0.0
-
-    summary = {
+        exit_code = rc
+        stage = "done" if rc == 0 else "error"
+    return _finish_invocation(out_dir, run_dir, run_id, {
         "category": category,
-        "when": _utc_now(),
         "pass_rate": pass_rate,
-        "exit_code": rc,
+        "executed": executed,
+        "exit_code": exit_code,
+        "stage": stage,
         "pytest_counts": counts,
         "targets": targets,
         "steps": [{"name": "pytest", "exit_code": rc, "cmd": cmd}],
-    }
-    path = _write_summary(out_dir, summary)
-    summary["detail_path"] = str(path)
-    path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
-    return summary
+    })
 
 
 def run_reveng(repo: Path, out_dir: Path, logf) -> dict:
@@ -842,23 +1017,20 @@ def run_reveng(repo: Path, out_dir: Path, logf) -> dict:
         "services/mcp/test_reveng_e2e_scan.py",
         "services/mcp/test_reveng_e2e_datasheet.py",
     ]
-    # Only include targets that exist.
     existing = [t for t in targets if (repo / t).is_file()]
-    if not existing:
-        summary = {
-            "category": "reveng",
-            "when": _utc_now(),
-            "pass_rate": None,
-            "exit_code": 0,
-            "steps": [{"name": "pytest", "skipped": True, "reason": "no targets"}],
-        }
-        path = _write_summary(out_dir, summary)
-        summary["detail_path"] = str(path)
-        path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
-        return summary
-    return _run_pytest_bundle(
-        repo, out_dir, logf, category="reveng", targets=existing,
-    )
+    if existing:
+        return _run_pytest_bundle(
+            repo, out_dir, logf, category="reveng", targets=existing,
+        )
+    run_id, run_dir = _begin_invocation(out_dir, "reveng")
+    return _finish_invocation(out_dir, run_dir, run_id, {
+        "category": "reveng",
+        "pass_rate": None,
+        "executed": 0,
+        "exit_code": 0,
+        "stage": "skipped",
+        "steps": [{"name": "pytest", "skipped": True, "reason": "no targets"}],
+    })
 
 
 def run_parts_research(repo: Path, out_dir: Path, logf) -> dict:
@@ -867,57 +1039,69 @@ def run_parts_research(repo: Path, out_dir: Path, logf) -> dict:
         "services/mcp/test_reveng_e2e_datasheet.py",
     ]
     existing = [t for t in targets if (repo / t).is_file()]
-    # Also pick up parts v2 unit tests if present (cheap, no network).
     extra = repo / "services" / "mcp" / "test_parts_tools_v2.py"
     if extra.is_file():
         existing.append("services/mcp/test_parts_tools_v2.py")
-    if not existing:
-        summary = {
-            "category": "parts_research",
-            "when": _utc_now(),
-            "pass_rate": None,
-            "exit_code": 0,
-            "steps": [{"name": "pytest", "skipped": True, "reason": "no targets"}],
-        }
-        path = _write_summary(out_dir, summary)
-        summary["detail_path"] = str(path)
-        path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
-        return summary
-    return _run_pytest_bundle(
-        repo, out_dir, logf, category="parts_research", targets=existing,
-    )
+    if existing:
+        return _run_pytest_bundle(
+            repo, out_dir, logf, category="parts_research", targets=existing,
+        )
+    run_id, run_dir = _begin_invocation(out_dir, "parts_research")
+    return _finish_invocation(out_dir, run_dir, run_id, {
+        "category": "parts_research",
+        "pass_rate": None,
+        "executed": 0,
+        "exit_code": 0,
+        "stage": "skipped",
+        "steps": [{"name": "pytest", "skipped": True, "reason": "no targets"}],
+    })
 
 
 def run_roundtrip(repo: Path, out_dir: Path, logf) -> dict:
+    run_id, run_dir = _begin_invocation(out_dir, "roundtrip")
     env = os.environ.copy()
     env.setdefault("CHUDWARE_REPO", str(repo))
     env.setdefault("PYTHONUNBUFFERED", "1")
     py = sys.executable or "python3"
     script = repo / "tools" / "flywheel" / "bench" / "roundtrip_pipeline.py"
-    out_dir.mkdir(parents=True, exist_ok=True)
-    cmd = [py, str(script), "--out", str(out_dir)]
+    child_out = run_dir / "pipeline"
+    cmd = [py, str(script), "--out", str(child_out)]
     rc = _run_cmd(cmd, cwd=repo, env=env, logf=logf)
-    # roundtrip_pipeline writes summary.json into --out
-    summary_path = out_dir / "summary.json"
-    if summary_path.is_file():
-        try:
-            data = json.loads(summary_path.read_text(encoding="utf-8"))
-            data.setdefault("category", "roundtrip")
-            data["exit_code"] = rc if data.get("exit_code") is None else data["exit_code"]
-            return data
-        except Exception:  # noqa: BLE001
-            pass
-    summary = {
+    child_summary = child_out / "summary.json"
+
+    data: dict[str, Any] | None = None
+    artifact_error: str | None = None
+    try:
+        loaded = json.loads(child_summary.read_text(encoding="utf-8"))
+        if not isinstance(loaded, dict):
+            raise TypeError("summary root is not an object")
+        data = loaded
+    except Exception as exc:  # noqa: BLE001
+        artifact_error = (
+            f"no valid artifact created by invocation {run_id} at "
+            f"{child_summary}: {type(exc).__name__}: {exc}"
+        )
+
+    pass_rate = None
+    executed = 0
+    if data is not None:
+        pass_rate, executed = _verdict_stats(data)
+    exit_code = rc if rc != 0 else (1 if artifact_error else 0)
+    stage = "error" if exit_code else ("skipped" if executed == 0 else "done")
+    return _finish_invocation(out_dir, run_dir, run_id, {
         "category": "roundtrip",
-        "when": _utc_now(),
-        "pass_rate": 1.0 if rc == 0 else 0.0,
-        "exit_code": rc,
-        "steps": [{"name": "roundtrip_pipeline", "exit_code": rc}],
-    }
-    path = _write_summary(out_dir, summary)
-    summary["detail_path"] = str(path)
-    path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
-    return summary
+        "pass_rate": pass_rate,
+        "executed": executed,
+        "exit_code": exit_code,
+        "stage": stage,
+        "artifact_error": artifact_error,
+        "steps": [{
+            "name": "roundtrip_pipeline",
+            "exit_code": rc,
+            "cmd": cmd,
+            "artifact": str(child_summary),
+        }],
+    })
 
 
 _RUNNERS: dict[str, Callable[..., dict]] = {
@@ -931,7 +1115,7 @@ _RUNNERS: dict[str, Callable[..., dict]] = {
 
 
 def run_category(cat_id: str, *, mode: str = "smoke", repo: Path | None = None) -> int:
-    """Execute a category end-to-end; write summary under reports/categories/<id>/."""
+    """Execute a category and publish status derived only from this invocation."""
     spec = get_spec(cat_id)
     if spec is None:
         print(f"unknown category: {cat_id}", file=sys.stderr)
@@ -952,25 +1136,32 @@ def run_category(cat_id: str, *, mode: str = "smoke", repo: Path | None = None) 
         else:
             summary = runner(root, out_dir, logf)
 
-    rc = int(summary.get("exit_code") or 0)
-    # Category status file (for RPC / GUI).
+    rc = int(summary["exit_code"])
+    stage = str(summary["stage"])
     status = {
         "category": cat_id,
+        "run_id": summary["run_id"],
         "running": False,
-        "stage": "done" if rc == 0 else "error",
+        "stage": stage,
         "finished": _utc_now(),
         "exit_code": rc,
         "pass_rate": summary.get("pass_rate"),
-        "last_result_path": summary.get("detail_path") or str(out_dir / "summary.json"),
+        "executed": summary["executed"],
+        "last_result_path": summary["detail_path"],
         "log_path": str(log_path),
     }
     sp = category_status_path(cat_id, root)
     sp.parent.mkdir(parents=True, exist_ok=True)
-    sp.write_text(json.dumps(status, indent=2), encoding="utf-8")
+    tmp = sp.with_name(f".{sp.name}.{os.getpid()}.{time.time_ns()}.tmp")
+    tmp.write_text(json.dumps(status, indent=2), encoding="utf-8")
+    os.replace(tmp, sp)
+    clean_success = rc == 0 and stage == "done"
     print(json.dumps({
-        "ok": rc == 0,
+        "ok": clean_success,
         "category": cat_id,
+        "stage": stage,
         "pass_rate": summary.get("pass_rate"),
+        "executed": summary["executed"],
         "detail_path": status["last_result_path"],
         "exit_code": rc,
     }))

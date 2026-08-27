@@ -155,6 +155,35 @@ def test_design_review_presentation_pptx():
     assert "214.8" in alltext            # mass (mass1)
 
 
+def test_design_review_corrupt_image_has_visible_degraded_marker():
+    image_rel = "artifacts/corrupt-view.png"
+    image_path = project.project_dir() / image_rel
+    image_path.parent.mkdir(parents=True, exist_ok=True)
+    image_path.write_bytes(b"not a PNG")
+
+    rec = d.make_presentation({
+        "kind": "presentation",
+        "title": "Corrupt View Review",
+        "template": "design_review",
+        "outline": [
+            {"type": "views", "heading": "Rendered views", "images": [image_rel]},
+        ],
+        "attached_results": {},
+    })
+
+    assert rec["ok"] is True
+    from pptx import Presentation
+    prs = Presentation(str(_abs(rec)))
+    alltext = "\n".join(
+        shape.text_frame.text
+        for slide in prs.slides
+        for shape in slide.shapes
+        if shape.has_text_frame
+    )
+    assert "render unavailable" in alltext.lower()
+    assert "corrupt-view.png" in alltext
+
+
 def test_design_review_bare_numeral_is_provenance_violation():
     bad = d.make_presentation({
         "kind": "presentation", "title": "x", "template": "design_review",

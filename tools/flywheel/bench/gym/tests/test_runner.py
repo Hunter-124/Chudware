@@ -9,9 +9,17 @@ from __future__ import annotations
 import json
 import tempfile
 from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
 
 from tools.flywheel.bench.gym.challenges import load_challenge
-from tools.flywheel.bench.gym.runner import run_cell, execution_probe, run_cycle
+from tools.flywheel.bench.gym import cli as cli_mod
+from tools.flywheel.bench.gym import runner as runner_mod
+from tools.flywheel.bench.gym.runner import (
+    CycleResult, ExecProbe, InfrastructureUnavailable, UnknownChallengeError,
+    execution_probe, run_cell, run_cycle,
+)
 from tools.flywheel.bench.gym import report as report_mod
 from tools.flywheel.bench.gym.taxonomy import TAXONOMY
 
@@ -46,7 +54,8 @@ def test_single_cell_produces_replayable_run_dir(tmp_path):
     cell = run_cell(ch, "local-24k", 1, cycle="t", probe=probe, runs_dir=tmp_path)
     rd = Path(cell.run_dir)
     assert rd.exists() and tmp_path in rd.parents, "run dir must be under the tmp root"
-    for f in ("ledger.json", "graded.json", "classifications.json", "mission.json"):
+    for f in ("ledger.json", "graded.json", "classifications.json", "mission.json",
+              "cell.json"):
         assert (rd / f).exists(), f"missing replay artifact {f}"
     mission = json.loads((rd / "mission.json").read_text())
     assert mission.get("status") in {"running", "done", "blocked"}, mission
@@ -111,6 +120,138 @@ def test_grind_dial_delta_is_real(tmp_path):
         g2 += sum(1 for x in classify_ledger(lg, manifest=man, graded=c.graded,
                                              grind_threshold=2) if x.failure_class == "grind")
     assert g2 > g3, f"grind 3->2 must promote at least one cell: g3={g3} g2={g2}"
+
+
+def test_capable_probe_does_not_promote_explicit_mock_to_real(tmp_path):
+    probe = ExecProbe(
+        core_available=True, frontier_key=True, local_model=True,
+        real_agent_fn=True, dag_deps=True,
+    )
+    cell = run_cell(
+        load_challenge("C1"), "local-24k", 1,
+        cycle="intent", probe=probe, runs_dir=tmp_path, real=False,
+    )
+    report = report_mod.build_report(
+        CycleResult(cycle="intent", tiers=["local-24k"], probe=probe, cells=[cell]))
+    assert probe.mode == "real"
+    assert cell.mode == "mock"
+    assert report["execution_mode"] == "mock"
+
+    from tools.flywheel.bench.gym.telemetry import write_cycle_telemetry
+    events_path = write_cycle_telemetry(report, tmp_path / "telemetry")
+    events = [json.loads(line) for line in events_path.read_text().splitlines()]
+    cell_event = next(event for event in events if event.get("type") == "gym.cell")
+    assert cell_event["mode"] == "mock"
+    assert cell_event["training_usable"] is False
+
+
+def test_requested_real_refuses_before_any_cell_is_graded(tmp_path, monkeypatch):
+    incapable = ExecProbe(
+        core_available=False, frontier_key=False, local_model=False,
+        real_agent_fn=True, dag_deps=True,
+    )
+    monkeypatch.setattr(runner_mod, "execution_probe", lambda: incapable)
+    with pytest.raises(InfrastructureUnavailable) as caught:
+        run_cycle(
+            cycle="refused", tiers=["local-24k"], challenge_ids=["C1"],
+            runs_dir=tmp_path, real=True,
+        )
+    assert caught.value.status == "infrastructure_unavailable"
+    assert list(tmp_path.rglob("graded.json")) == []
+
+
+def test_unknown_challenge_is_rejected(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        runner_mod, "execution_probe",
+        lambda: ExecProbe(False, False, False, True, True),
+    )
+    with pytest.raises(UnknownChallengeError) as caught:
+        run_cycle(cycle="unknown", challenge_ids=["C999"], runs_dir=tmp_path)
+    assert caught.value.challenge_ids == ["C999"]
+
+
+def test_core_probe_uses_canonical_occt_build_candidate(tmp_path, monkeypatch):
+    from services.mcp import core_bridge
+
+    lib = tmp_path / "core" / "build-occt-linux" / "bin" / "libchudware.so"
+    lib.parent.mkdir(parents=True)
+    lib.write_bytes(b"fixture")
+    monkeypatch.delenv("CHUDWARE_LIBCHUDWARE", raising=False)
+    monkeypatch.delenv("CHUDWARE_DIST", raising=False)
+    monkeypatch.setattr(core_bridge, "_repo_root", lambda: tmp_path)
+    monkeypatch.setattr(runner_mod, "_repo_root", lambda: tmp_path / "not-the-repo")
+    assert runner_mod._core_so_present() is True
+
+
+def test_execution_probe_recognizes_xai_environment_credential(monkeypatch):
+    from services.agent import config as agent_config
+
+    for key in (
+        "ANTHROPIC_API_KEY", "OPENAI_API_KEY", "OPENROUTER_API_KEY",
+        "GEMINI_API_KEY", "GOOGLE_API_KEY", "MOONSHOT_API_KEY",
+        "CHUDWARE_PROVIDER",
+    ):
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv("XAI_API_KEY", "test-xai-key")
+    monkeypatch.setattr(agent_config, "load_config", lambda: {})
+    monkeypatch.setattr(runner_mod, "_core_so_present", lambda: True)
+    monkeypatch.setattr(runner_mod, "_local_model_present", lambda: False)
+    monkeypatch.setattr(runner_mod, "_real_agent_fn_present", lambda: True)
+    monkeypatch.setattr(runner_mod, "_dag_deps_importable", lambda: True)
+    probe = execution_probe()
+    assert probe.frontier_key is True
+    assert probe.can_run_real is True
+    monkeypatch.delenv("XAI_API_KEY")
+    monkeypatch.setattr(
+        agent_config, "load_config",
+        lambda: {"keys": {"anthropic": "stored-config-key"}},
+    )
+    assert runner_mod._frontier_credentials_present() is True
+
+
+def _run_args(**overrides):
+    values = {
+        "tiers": "local-24k", "challenges": "C1", "division": "local",
+        "smoke": False, "cycle": "cli", "real": False, "no_adjust": True,
+    }
+    values.update(overrides)
+    return SimpleNamespace(**values)
+
+
+def test_cli_returns_nonzero_for_refused_real(monkeypatch, capsys):
+    exc = InfrastructureUnavailable(["core library unavailable"])
+    monkeypatch.setattr(cli_mod, "run_cycle", lambda **_kwargs: (_ for _ in ()).throw(exc))
+    assert cli_mod.cmd_run(_run_args(real=True)) != 0
+    assert "status=infrastructure_unavailable" in capsys.readouterr().err
+
+
+def test_cli_returns_nonzero_for_unknown_challenge(monkeypatch, capsys):
+    exc = UnknownChallengeError(["C999"])
+    monkeypatch.setattr(cli_mod, "run_cycle", lambda **_kwargs: (_ for _ in ()).throw(exc))
+    assert cli_mod.cmd_run(_run_args(challenges="C999")) != 0
+    assert "status=unknown_challenge" in capsys.readouterr().err
+
+
+def test_cli_returns_nonzero_for_zero_cell_run(monkeypatch, capsys):
+    probe = ExecProbe(False, False, False, True, True)
+    empty = CycleResult(cycle="cli", tiers=["local-24k"], probe=probe)
+    monkeypatch.setattr(cli_mod, "run_cycle", lambda **_kwargs: empty)
+    assert cli_mod.cmd_run(_run_args()) != 0
+    assert "status=zero_cells" in capsys.readouterr().err
+
+
+def test_cli_returns_nonzero_when_every_diag_provider_errors(tmp_path, monkeypatch, capsys):
+    from tools.flywheel.bench.gym import diag
+
+    result = {
+        "tiers": ["xai:grok-4-5"], "axes": ["tool_validity"], "mock": False,
+        "results": [{"tier": "xai:grok-4-5", "error": "provider unavailable"}],
+    }
+    monkeypatch.setattr(diag, "run_diag", lambda *_args, **_kwargs: result)
+    monkeypatch.setattr(diag, "write_diag_results", lambda _result: tmp_path / "diag.json")
+    args = SimpleNamespace(tiers="xai:grok-4-5", axes=None, seed=1)
+    assert cli_mod.cmd_diag(args) != 0
+    assert "status=all_provider_error" in capsys.readouterr().err
 
 
 def main() -> None:

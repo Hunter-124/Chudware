@@ -15,6 +15,7 @@ Offline: no LLM, no core, no network.  The doc path is driven by an injected
 from __future__ import annotations
 
 import pytest
+import json
 
 from services.agent.advisor import adapters, engine, render, stages
 from services.agent.advisor.engine import Finding, Observation
@@ -115,6 +116,75 @@ def test_interference_loop_path_no_diameters_stays_compliant():
     assert item["candidate_fixes"][0]["confidence"] == "heuristic"
     assert item["severity"] == "action"           # advise, don't gate (no diameters)
     assert "fit_calc" in item["helper_tools"]      # fit_calc advertised as helper
+def test_default_doc_rpc_dispatches_normalized_core_method(monkeypatch):
+    from services.mcp import core_bridge, interface_check_tools
+
+    calls = []
+
+    def fake_core_call(method, params):
+        calls.append((method, params))
+        return {"interferences": [], "parts": []}
+
+    monkeypatch.setattr(core_bridge, "call", fake_core_call)
+    monkeypatch.setattr(
+        interface_check_tools,
+        "run_interface_check",
+        lambda **kwargs: json.dumps({
+            "ok": True,
+            "tool": "interface_check",
+            "findings": [],
+            "summary": "interface alignment OK",
+        }),
+    )
+
+    adapters.observe_doc("doc-default", "assembly")
+
+    assert calls[0] == ("eval_interference", {"doc_id": "doc-default"})
+
+
+def test_raising_doc_check_is_explicit_unknown_not_empty_clean():
+    def raising_rpc(method, **kwargs):
+        raise RuntimeError(f"{method} exploded")
+
+    advisory = engine.build_advisory(
+        adapters.observe_doc("doc-raising", "assembly", rpc=raising_rpc)
+    )
+
+    assert advisory["items"]
+    assert any(item["source"]["kind"] == "harness" for item in advisory["items"])
+    assert engine.has_blocker(advisory)
+
+
+
+def test_unimplemented_battery_checks_are_explicit_skips():
+    observation = adapters.observe_doc("doc-sim", "sim")
+
+    assert observation.findings
+    assert all(f.extra.get("outcome") == "skipped" for f in observation.findings)
+    assert all(f.source_kind == "harness" for f in observation.findings)
+
+
+def test_default_dispatcher_uses_registered_dfm_callable(monkeypatch):
+    from services.verify import battery
+
+    seen = []
+
+    def fake_get_fn(module, name):
+        seen.append((module, name))
+        return lambda **kwargs: json.dumps({
+            "ok": True,
+            "dfm_pass": True,
+            "checks": [],
+            "process": "fdm",
+        })
+
+    monkeypatch.setattr(battery, "_get_fn", fake_get_fn)
+
+    result = adapters._default_rpc()("dfm_check", doc_id="doc-dfm")
+
+    assert seen == [("intake", "dfm_check")]
+    assert result["dfm_pass"] is True
+
 
 
 # ---------------------------------------------------------------------------
@@ -146,6 +216,28 @@ def test_every_non_info_item_has_fix_across_providers():
     for item in advisory["items"]:
         if item["severity"] != "info":
             assert item["candidate_fixes"], f"{item['check']} missing fix"
+def test_raising_fix_provider_preserves_blocker_and_records_harness_error(monkeypatch):
+    def raising_provider(finding):
+        raise RuntimeError("fix computation exploded")
+
+    monkeypatch.setitem(engine._FIX_PROVIDERS, "rebuild", raising_provider)
+    finding = Finding(
+        kind="rebuild",
+        check="rebuild",
+        severity="blocker",
+        finding="feature failed to rebuild",
+    )
+
+    item = engine.build_advisory(
+        Observation(stage="feature", findings=[finding])
+    )["items"][0]
+
+    assert item["severity"] == "blocker"
+    assert item["candidate_fixes"][0]["action"] == "harness_error"
+    assert "fix computation exploded" in item["harness_error"]["error"]
+    assert engine.has_blocker({"items": [item]})
+
+
 
 
 # ---------------------------------------------------------------------------
@@ -338,3 +430,31 @@ def test_advise_tool_returns_block(monkeypatch):
     # unknown stage rejected
     bad = captured["advise"]("doc1", stage="nonsense")
     assert not bad["ok"]
+
+
+def test_advise_tool_reports_check_fault_as_nonexecuted_error(monkeypatch):
+    def raising_rpc(method, **kwargs):
+        raise RuntimeError(f"{method} unavailable")
+
+    monkeypatch.setattr(adapters, "_default_rpc", lambda: raising_rpc)
+    from services.mcp import advisor_tools
+
+    captured = {}
+
+    class _MCP:
+        def tool(self):
+            def deco(fn):
+                captured[fn.__name__] = fn
+                return fn
+            return deco
+
+    advisor_tools.register_advisor_tools(_MCP())
+    result = captured["advise"]("doc-error", stage="assembly")
+
+    assert result["ok"] is False
+    assert result["executed"] is False
+    assert result["outcome_kind"] == "internal_error"
+    assert result["status"] == "check_error"
+    assert result["advisory"]["items"]
+
+

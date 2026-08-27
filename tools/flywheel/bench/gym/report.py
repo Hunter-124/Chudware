@@ -658,6 +658,17 @@ def compute_instrumentation(cells: list[dict]) -> dict[str, Any]:
     }
 
 
+def _execution_mode(cells: list[dict]) -> str:
+    """Summarize actual cell execution, never machine capability."""
+    modes = {str(cell.get("mode") or "mock").lower() for cell in cells}
+    modes &= {"real", "mock"}
+    if modes == {"real"}:
+        return "real"
+    if modes == {"real", "mock"}:
+        return "mixed"
+    return "mock"
+
+
 def build_report(cycle_result, *, applied_dials: list[dict] | None = None,
                  deltas: dict | None = None) -> dict[str, Any]:
     """Assemble the JSON report dict from a CycleResult."""
@@ -669,7 +680,7 @@ def build_report(cycle_result, *, applied_dials: list[dict] | None = None,
     return {
         "cycle": cycle_result.cycle,
         "tiers": cycle_result.tiers,
-        "execution_mode": cycle_result.probe.mode,
+        "execution_mode": _execution_mode(cells),
         "execution_probe": cycle_result.probe.to_dict(),
         "pass_rates": _pass_rates(cells),
         "taxonomy": tax,
@@ -718,6 +729,11 @@ def render_markdown(report: dict[str, Any]) -> str:
                  "are identical by construction. The two-tier matrix proves the harness "
                  "runs per-tier; it does NOT show tier-dependent model behaviour (that "
                  "needs a real model). Read the tier split as scaffolding, not signal.")
+        L.append("")
+    elif mode == "mixed":
+        L.append("> HONESTY NOTE: this report contains both REAL and MOCK cells. "
+                 "Each cell's `mode` is authoritative; MOCK rows are excluded from "
+                 "training-usable telemetry and real leaderboard scores.")
         L.append("")
     p = report["execution_probe"]
     L.append("| probe | value |")

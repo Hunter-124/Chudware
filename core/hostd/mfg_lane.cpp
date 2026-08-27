@@ -18,13 +18,22 @@ namespace {
 using nlohmann::json;
 
 std::filesystem::path defaultStateDirectory() {
+    std::filesystem::path base;
     if (const char* configured = std::getenv("CHUDWARE_MFG_STATE_DIR"); configured && *configured)
-        return configured;
+        return configured;  // explicit override is taken verbatim
     if (const char* state = std::getenv("XDG_STATE_HOME"); state && *state)
-        return std::filesystem::path(state) / "chudware" / "manufacturing";
-    if (const char* home = std::getenv("HOME"); home && *home)
-        return std::filesystem::path(home) / ".local" / "state" / "chudware" / "manufacturing";
-    return std::filesystem::temp_directory_path() / "chudware-manufacturing";
+        base = std::filesystem::path(state) / "chudware" / "manufacturing";
+    else if (const char* home = std::getenv("HOME"); home && *home)
+        base = std::filesystem::path(home) / ".local" / "state" / "chudware" / "manufacturing";
+    else
+        base = std::filesystem::temp_directory_path() / "chudware-manufacturing";
+    // Scope by instance key so two daemons (e.g. the desktop hostd and a
+    // test-spawned one) never contend for the same journal writer.lock —
+    // that contention used to terminate the second daemon at startup.
+    // The default instance keeps the bare directory for continuity.
+    if (const char* key = std::getenv("CHUDWARE_INSTANCE_KEY"); key && *key)
+        base /= key;
+    return base;
 }
 
 device::ControllerIdentitySnapshot advertisedIdentity() {
@@ -2215,8 +2224,21 @@ LaneRpcResult ManufacturingLane::route(std::string_view method, const json& para
                   {{"method", method}});
 }
 
-ManufacturingLane& lane() {
-    static ManufacturingLane instance(defaultStateDirectory());
+ManufacturingLane* tryLane(std::string* init_error) {
+    // Journal construction can throw (e.g. another daemon holds writer.lock).
+    // That must disable the manufacturing lane, not kill the whole daemon —
+    // CAD editing does not depend on the manufacturing journal.
+    static std::string error;
+    static ManufacturingLane* instance = []() -> ManufacturingLane* {
+        try {
+            static ManufacturingLane lane(defaultStateDirectory());
+            return &lane;
+        } catch (const std::exception& e) {
+            error = e.what();
+            return nullptr;
+        }
+    }();
+    if (init_error) *init_error = error;
     return instance;
 }
 

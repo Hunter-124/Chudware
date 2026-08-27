@@ -48,7 +48,9 @@ import sys
 from pathlib import Path
 
 from . import report as report_mod
-from .runner import run_cycle, REPORTS_DIR
+from .runner import (
+    InfrastructureUnavailable, UnknownChallengeError, REPORTS_DIR, run_cycle,
+)
 
 
 def _apply_council_threshold_dial(new_threshold: int) -> dict:
@@ -132,8 +134,19 @@ def cmd_run(args) -> int:
         divisions = divisions or ["local"]
 
     cycle = args.cycle
-    cr = run_cycle(cycle=cycle, tiers=tiers, challenge_ids=challenge_ids,
-                   real=args.real, divisions=divisions)
+    try:
+        cr = run_cycle(cycle=cycle, tiers=tiers, challenge_ids=challenge_ids,
+                       real=args.real, divisions=divisions)
+    except InfrastructureUnavailable as exc:
+        print(f"gym {cycle}: status={exc.status}: {exc}", file=sys.stderr)
+        return 2
+    except UnknownChallengeError as exc:
+        print(f"gym {cycle}: status={exc.status}: {exc}", file=sys.stderr)
+        return 2
+
+    if not cr.cells:
+        print(f"gym {cycle}: status=zero_cells", file=sys.stderr)
+        return 3
 
     applied, deltas = ([], {})
     # The assess-adjust-rerun dials are mock-replay measurements; skip them for a
@@ -166,7 +179,8 @@ def cmd_diag(args) -> int:
     results = run_diag(tiers, seed=args.seed, axes=axes)
     path = write_diag_results(results)
     print(f"diag: tiers={results['tiers']} axes={results['axes']} mock={results['mock']}")
-    for row in results["results"]:
+    rows = results.get("results") or []
+    for row in rows:
         mid = (row.get("model") or {}).get("id", row.get("tier"))
         if row.get("error"):
             print(f"  {mid}: ERROR {row['error']}")
@@ -175,6 +189,9 @@ def cmd_diag(args) -> int:
                   for ax, payload in (row.get("axes") or {}).items()}
         print(f"  {mid}: {scores}")
     print(f"  wrote: {path}")
+    if not rows or all(row.get("error") for row in rows):
+        print("diag: status=all_provider_error", file=sys.stderr)
+        return 1
     return 0
 
 

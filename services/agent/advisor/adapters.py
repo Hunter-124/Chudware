@@ -22,6 +22,7 @@ Two sources exist:
 from __future__ import annotations
 
 from typing import Any, Optional
+import json
 
 from . import stages
 from .engine import Finding, Observation
@@ -107,6 +108,10 @@ def observe_build(res: Any, stage: str = "feature", seq: int = 0,
 
 # ---------------------------------------------------------------------------
 # Doc path — doc_id + stage battery → findings
+class _CheckUnavailable(RuntimeError):
+    """A battery check has no executable backend in this process."""
+
+
 # ---------------------------------------------------------------------------
 
 def findings_from_doc(doc_id: str, stage: str, rpc: Optional[Any] = None) -> list[Finding]:
@@ -119,15 +124,20 @@ def findings_from_doc(doc_id: str, stage: str, rpc: Optional[Any] = None) -> lis
     Only the checks in ``stages.check_battery(stage)`` run.  Cheap, read-only.
     """
     call = rpc or _default_rpc()
-    if call is None:
-        return []
 
     findings: list[Finding] = []
     for check in stages.check_battery(stage):
         try:
             findings.extend(_run_check(check, doc_id, call))
-        except Exception:  # noqa: BLE001
-            continue  # a failing check must never break the pass
+        except _CheckUnavailable as exc:
+            findings.append(_check_outcome_finding(
+                check, doc_id, severity="info", outcome="skipped", error=exc,
+            ))
+        except Exception as exc:  # noqa: BLE001
+            severity = "blocker" if check in stages.exit_gate(stage) else "action"
+            findings.append(_check_outcome_finding(
+                check, doc_id, severity=severity, outcome="error", error=exc,
+            ))
     return findings
 
 
@@ -151,6 +161,32 @@ def observe_doc(doc_id: str, stage: str, seq: int = 0,
     )
 
 
+def _check_outcome_finding(
+    check: str,
+    doc_id: str,
+    *,
+    severity: str,
+    outcome: str,
+    error: BaseException,
+) -> Finding:
+    detail = str(error).strip() or error.__class__.__name__
+    return Finding(
+        kind="check_error" if outcome == "error" else "check_skipped",
+        check=check,
+        severity=severity,
+        finding=f"{check} {outcome}: {detail}",
+        numbers={},
+        refs={"doc_id": doc_id},
+        source_kind="harness",
+        source_detail="advisor_check_dispatch",
+        extra={
+            "outcome": outcome,
+            "exception": error.__class__.__name__,
+            "error": detail,
+        },
+    )
+
+
 def _run_check(check: str, doc_id: str, call: Any) -> list[Finding]:
     if check == stages.CHECK_INTERFERENCE:
         return _check_interference(doc_id, call)
@@ -167,8 +203,8 @@ def _run_check(check: str, doc_id: str, call: Any) -> list[Finding]:
         return _check_dfm(doc_id, call)
     if check == stages.CHECK_INTERFACE_FITMENT:
         return _check_interface_fitment(doc_id, call)
-    # part_verify / sim / cam presence checks are advisory-only presence flags.
-    return []
+    # part_verify / sim / cam presence checks do not have an adapter backend.
+    raise _CheckUnavailable(f"{check} has no advisor check adapter")
 
 
 def _check_interference(doc_id: str, call: Any) -> list[Finding]:
@@ -302,10 +338,7 @@ def _check_wall_thickness(doc_id: str, call: Any) -> list[Finding]:
     table), ``process`` (name string).  Source: kernel ray-cast — cited as such.
     Returns an ``action`` finding when wall < limit, ``info`` when OK.
     """
-    try:
-        th = call("eval_thickness", doc_id=doc_id) or {}
-    except Exception:  # noqa: BLE001
-        return []
+    th = call("eval_thickness", doc_id=doc_id) or {}
     mn = th.get("min_thickness_mm")
     if mn is None:
         return []  # open/sheet body — no thickness measurement
@@ -367,10 +400,7 @@ def _check_dfm(doc_id: str, call: Any) -> list[Finding]:
     otherwise.  The ``checks`` list is carried in ``extra`` so the fix provider can
     emit per-issue targeted fixes without re-calling the tool.
     """
-    try:
-        dfm = call("dfm_check", doc_id=doc_id) or {}
-    except Exception:  # noqa: BLE001
-        return []
+    dfm = call("dfm_check", doc_id=doc_id) or {}
     dfm_pass = dfm.get("dfm_pass", True)
     checks = dfm.get("checks") or []
     proc = dfm.get("process", "process")
@@ -405,10 +435,7 @@ def _check_interface_fitment(doc_id: str, call: Any) -> list[Finding]:
     ``action`` Finding; the pre-computed ``fix`` string from T-BL49 is carried in
     ``extra`` so the engine fix provider can lift it directly into a candidate_fix.
     """
-    try:
-        ic = call("interface_check", doc_id=doc_id) or {}
-    except Exception:  # noqa: BLE001
-        return []
+    ic = call("interface_check", doc_id=doc_id) or {}
     # Only process a genuine interface_check v1 response (tool key present).
     # An empty {} from a fixture or a tool that is not yet wired returns nothing
     # so we do not inject spurious info items into unrelated tests.
@@ -476,12 +503,79 @@ def _first_error_line(error: str) -> str:
 
 
 def _default_rpc():
-    """Lazily resolve the core bridge RPC surface; ``None`` if unavailable."""
+    """Return the one explicit dispatcher for native and composed advisor checks."""
     try:
         from services.mcp import core_bridge  # type: ignore
-        def _call(method: str, **kwargs):
-            fn = getattr(core_bridge, method, None)
-            return fn(**kwargs) if callable(fn) else None
-        return _call
-    except Exception:  # noqa: BLE001
-        return None
+    except Exception as exc:  # noqa: BLE001
+        unavailable = f"core bridge unavailable: {exc}"
+
+        def _unavailable(method: str, **kwargs):
+            raise _CheckUnavailable(unavailable)
+
+        return _unavailable
+
+    native_methods = {
+        "doc_eval_interference": "eval_interference",
+        "doc_eval_feature_overlap": "eval_feature_overlap",
+        "doc_sketch_health": "sketch_health",
+        "doc_feature_status": "doc_rebuild",
+        "eval_thickness": "eval_thickness",
+    }
+
+    def _parse_composed(method: str, raw: Any) -> dict:
+        if isinstance(raw, str):
+            try:
+                raw = json.loads(raw)
+            except json.JSONDecodeError as exc:
+                raise RuntimeError(f"{method} returned invalid JSON: {exc}") from exc
+        if not isinstance(raw, dict):
+            raise RuntimeError(
+                f"{method} returned {type(raw).__name__}, expected an object"
+            )
+        if raw.get("ok") is False:
+            detail = (
+                raw.get("error")
+                or raw.get("message")
+                or raw.get("reason")
+                or raw.get("code")
+                or "unknown error"
+            )
+            raise RuntimeError(f"{method} failed: {detail}")
+        return raw
+
+    def _call(method: str, **kwargs):
+        if method == "dfm_check":
+            try:
+                from services.verify.battery import _get_fn
+                fn = _get_fn("intake", "dfm_check")
+            except Exception as exc:  # noqa: BLE001
+                raise _CheckUnavailable(f"dfm_check unavailable: {exc}") from exc
+            return _parse_composed(method, fn(**kwargs))
+
+        if method == "interface_check":
+            try:
+                from services.mcp.interface_check_tools import run_interface_check
+            except Exception as exc:  # noqa: BLE001
+                raise _CheckUnavailable(f"interface_check unavailable: {exc}") from exc
+            return _parse_composed(method, run_interface_check(**kwargs))
+
+        native = native_methods.get(method)
+        if native is None:
+            raise _CheckUnavailable(f"{method} has no registered advisor backend")
+
+        result = core_bridge.call(native, kwargs)
+        if method == "doc_feature_status":
+            rebuild = result.get("rebuild") or {}
+            statuses = rebuild.get("feature_status") or result.get("feature_status") or []
+            failed = []
+            for status in statuses:
+                if isinstance(status, dict) and not status.get("ok", True):
+                    failed.append({
+                        "id": status.get("id"),
+                        "summary": status.get("error") or status.get("warning"),
+                        "diagnosis": status.get("error"),
+                    })
+            return {"failed": failed}
+        return result
+
+    return _call

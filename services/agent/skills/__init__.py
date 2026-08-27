@@ -20,9 +20,9 @@ Activation:
 """
 from __future__ import annotations
 
-import logging
 import os
 import re
+import stat
 import sys
 import threading
 from dataclasses import dataclass, field
@@ -32,7 +32,6 @@ from typing import Any, Iterable, Optional
 
 # --------------------------------------------------------------------------- constants
 
-log = logging.getLogger(__name__)
 
 _SKILL_FILENAME = "SKILL.md"
 _FRONTMATTER_RE = re.compile(r"\A---\s*\n(.*?)\n---\s*\n?", re.DOTALL)
@@ -53,8 +52,15 @@ RESERVED_SLASH_COMMANDS: frozenset[str] = frozenset({"rule"})
 # Process-global session state: session_id -> set of skill names already injected.
 _session_injected: dict[str, set[str]] = {}
 _session_lock = threading.Lock()
-# Catalog cache (invalidated by clear_cache / save / delete).
-_catalog_cache: Optional[list["Skill"]] = None
+# Character budgets use the conservative tokenizer-independent estimate of
+# four UTF-8 text characters per token: 12k chars/skill (~3k tokens), 24k
+# chars/turn (~6k tokens). The aggregate covers activated bodies and reports.
+SKILL_BODY_CHAR_LIMIT = 12_000
+SKILL_INJECTION_CHAR_LIMIT = 24_000
+SKILL_CATALOG_CHAR_LIMIT = 4_000
+_OMISSION_REPORT_RESERVE = 1_024
+# Catalogs are isolated by their fully resolved project/user/builtin roots.
+_catalog_cache: dict[tuple[Path, Path, Path], "_Catalog"] = {}
 _catalog_lock = threading.Lock()
 
 
@@ -93,6 +99,23 @@ def builtin_skills_dir() -> Path:
     if override:
         return Path(override)
     return _BUILTIN_DIR
+
+def _resolved_path(path: Path) -> Path:
+    """Return a stable cache-key path without requiring the target to exist."""
+    try:
+        return path.expanduser().resolve(strict=False)
+    except (OSError, RuntimeError):
+        return path.expanduser().absolute()
+
+
+def _resolved_roots(
+    project_root: Path | str | None = None,
+) -> tuple[Path, Path, Path]:
+    return (
+        _resolved_path(project_skills_dir(project_root)),
+        _resolved_path(user_skills_dir()),
+        _resolved_path(builtin_skills_dir()),
+    )
 
 
 # --------------------------------------------------------------------------- data
@@ -138,6 +161,46 @@ class Skill:
             "triggers": self.triggers.as_dict(),
             "roles": list(self.roles),
         }
+
+@dataclass(frozen=True)
+class SkillLoadDiagnostic:
+    """A discovered skill/root that could not be loaded safely."""
+
+    name: str | None
+    source: str
+    path: Path
+    kind: str
+    message: str
+
+    def to_list_entry(self) -> dict[str, Any]:
+        return {
+            "name": self.name,
+            "description": "Unavailable: skill failed to load",
+            "source": self.source,
+            "inject": "unavailable",
+            "triggers": SkillTriggers().as_dict(),
+            "roles": [],
+            "available": False,
+            "path": str(self.path),
+            "load_error": {
+                "kind": self.kind,
+                "message": self.message,
+            },
+        }
+
+
+@dataclass(frozen=True)
+class _ScanRecord:
+    skill: Skill | None
+    diagnostic: SkillLoadDiagnostic | None
+    reserved_names: frozenset[str]
+
+
+@dataclass(frozen=True)
+class _Catalog:
+    skills: tuple[Skill, ...]
+    diagnostics: tuple[SkillLoadDiagnostic, ...]
+    reserved_names: frozenset[str]
 
 
 # --------------------------------------------------------------------------- frontmatter
@@ -247,7 +310,11 @@ def _parse_simple_yaml(text: str) -> dict[str, Any]:
 
 
 def parse_skill_md(text: str, *, path: Path | None = None) -> tuple[dict[str, Any], str]:
-    """Return ``(frontmatter_dict, body)``. Body has frontmatter stripped."""
+    """Return ``(frontmatter_dict, body)``. Body has frontmatter stripped.
+
+    The bundled mini-parser is only a dependency fallback. Once PyYAML imports,
+    its syntax/type errors are authoritative and must reach the load diagnostic.
+    """
     m = _FRONTMATTER_RE.match(text)
     if not m:
         return {}, text
@@ -255,11 +322,12 @@ def parse_skill_md(text: str, *, path: Path | None = None) -> tuple[dict[str, An
     body = text[m.end():]
     try:
         import yaml  # type: ignore
+    except ModuleNotFoundError:
+        data = _parse_simple_yaml(fm_text)
+    else:
         data = yaml.safe_load(fm_text) or {}
         if not isinstance(data, dict):
-            data = {}
-    except Exception:  # noqa: BLE001
-        data = _parse_simple_yaml(fm_text)
+            raise ValueError("skill frontmatter must be a YAML mapping")
     return data, body
 
 
@@ -276,23 +344,79 @@ def _triggers_from_fm(raw: Any) -> SkillTriggers:
     return SkillTriggers(keywords=_list("keywords"), tools=_list("tools"), phases=_list("phases"))
 
 
-def _load_skill_from_dir(skill_dir: Path, source: str) -> Optional[Skill]:
-    """Load one skill folder. Returns None if missing/invalid."""
+def _load_diagnostic(
+    skill_dir: Path,
+    source: str,
+    kind: str,
+    message: str,
+) -> _ScanRecord:
+    candidate = skill_dir.name if _NAME_RE.match(skill_dir.name) else None
+    return _ScanRecord(
+        skill=None,
+        diagnostic=SkillLoadDiagnostic(
+            name=candidate,
+            source=source,
+            path=skill_dir / _SKILL_FILENAME,
+            kind=kind,
+            message=message,
+        ),
+        reserved_names=frozenset({candidate} if candidate else ()),
+    )
+
+
+def _load_skill_from_dir(skill_dir: Path, source: str) -> _ScanRecord | None:
+    """Load one skill folder, preserving any failed candidate as a diagnostic."""
     skill_md = skill_dir / _SKILL_FILENAME
-    if not skill_md.is_file():
+    try:
+        file_mode = skill_md.stat().st_mode
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        return _load_diagnostic(
+            skill_dir, source, "read_error", f"{type(exc).__name__}: {exc}",
+        )
+    if not stat.S_ISREG(file_mode):
         return None
     try:
         raw = skill_md.read_text(encoding="utf-8")
-    except OSError:
-        return None
-    fm, body = parse_skill_md(raw, path=skill_md)
+    except OSError as exc:
+        return _load_diagnostic(
+            skill_dir, source, "read_error", f"{type(exc).__name__}: {exc}",
+        )
+    try:
+        fm, body = parse_skill_md(raw, path=skill_md)
+    except Exception as exc:  # PyYAML and frontmatter type failures are data.
+        return _load_diagnostic(
+            skill_dir, source, "yaml_error", f"{type(exc).__name__}: {exc}",
+        )
     name = str(fm.get("name") or skill_dir.name).strip()
+    reserved_names = {
+        candidate
+        for candidate in (skill_dir.name, name)
+        if _NAME_RE.match(candidate)
+    }
     if not name or not _NAME_RE.match(name):
-        return None
+        record = _load_diagnostic(
+            skill_dir, source, "invalid_name", f"invalid skill name: {name!r}",
+        )
+        return _ScanRecord(
+            skill=None,
+            diagnostic=record.diagnostic,
+            reserved_names=frozenset(reserved_names),
+        )
     description = str(fm.get("description") or "").strip()
     if not description:
-        log.warning("skill %r at %s has no description; skipping", name, skill_dir)
-        return None
+        return _ScanRecord(
+            skill=None,
+            diagnostic=SkillLoadDiagnostic(
+                name=name,
+                source=source,
+                path=skill_md,
+                kind="validation_error",
+                message="frontmatter description is required",
+            ),
+            reserved_names=frozenset(reserved_names),
+        )
     inject = str(fm.get("inject") or "manual").strip().lower()
     if inject not in ("auto", "manual"):
         inject = "manual"
@@ -303,7 +427,7 @@ def _load_skill_from_dir(skill_dir: Path, source: str) -> Optional[Skill]:
         roles = tuple(str(r) for r in roles_raw)
     else:
         roles = ()
-    return Skill(
+    skill = Skill(
         name=name,
         description=description,
         source=source,
@@ -315,27 +439,91 @@ def _load_skill_from_dir(skill_dir: Path, source: str) -> Optional[Skill]:
         body=body.lstrip("\n"),
         raw=raw,
     )
+    return _ScanRecord(
+        skill=skill,
+        diagnostic=None,
+        reserved_names=frozenset(reserved_names),
+    )
 
 
-def _scan_root(root: Path, source: str) -> list[Skill]:
-    """Non-recursive: ``root/<name>/SKILL.md`` only."""
-    if not root.is_dir():
-        return []
-    out: list[Skill] = []
+def _scan_root(
+    root: Path,
+    source: str,
+) -> tuple[list[_ScanRecord], list[SkillLoadDiagnostic]]:
+    """Scan ``root/<name>/SKILL.md`` and report unreadable roots/entries."""
     try:
         entries = sorted(root.iterdir(), key=lambda p: p.name.lower())
-    except OSError:
-        return []
+    except (FileNotFoundError, NotADirectoryError):
+        return [], []
+    except OSError as exc:
+        return [], [
+            SkillLoadDiagnostic(
+                name=None,
+                source=source,
+                path=root,
+                kind="scan_error",
+                message=f"{type(exc).__name__}: {exc}",
+            )
+        ]
+    records: list[_ScanRecord] = []
+    diagnostics: list[SkillLoadDiagnostic] = []
     for entry in entries:
-        if not entry.is_dir():
+        try:
+            if not stat.S_ISDIR(entry.stat().st_mode):
+                continue
+        except OSError as exc:
+            diagnostics.append(
+                SkillLoadDiagnostic(
+                    name=entry.name if _NAME_RE.match(entry.name) else None,
+                    source=source,
+                    path=entry,
+                    kind="scan_error",
+                    message=f"{type(exc).__name__}: {exc}",
+                )
+            )
             continue
-        skill = _load_skill_from_dir(entry, source)
-        if skill is not None:
-            out.append(skill)
-    return out
+        record = _load_skill_from_dir(entry, source)
+        if record is not None:
+            records.append(record)
+    return records, diagnostics
 
 
 # --------------------------------------------------------------------------- discovery
+
+
+def _discover_catalog(
+    *,
+    project_root: Path | str | None = None,
+    force: bool = False,
+) -> _Catalog:
+    roots = _resolved_roots(project_root)
+    with _catalog_lock:
+        cached = _catalog_cache.get(roots)
+        if cached is not None and not force:
+            return cached
+        by_name: dict[str, Skill] = {}
+        diagnostics: list[SkillLoadDiagnostic] = []
+        reserved: set[str] = set()
+        for root, source in zip(roots, ("project", "user", "builtin")):
+            records, root_diagnostics = _scan_root(root, source)
+            diagnostics.extend(root_diagnostics)
+            for record in records:
+                # A higher-precedence discovered candidate owns all of its valid
+                # folder/frontmatter names even when loading that candidate failed.
+                if record.reserved_names & reserved:
+                    continue
+                reserved.update(record.reserved_names)
+                if record.skill is not None:
+                    by_name.setdefault(record.skill.name, record.skill)
+                elif record.diagnostic is not None:
+                    diagnostics.append(record.diagnostic)
+        catalog = _Catalog(
+            skills=tuple(sorted(by_name.values(), key=lambda s: s.name.lower())),
+            diagnostics=tuple(diagnostics),
+            reserved_names=frozenset(reserved),
+        )
+        _catalog_cache[roots] = catalog
+        return catalog
 
 
 def discover_skills(
@@ -343,29 +531,37 @@ def discover_skills(
     project_root: Path | str | None = None,
     force: bool = False,
 ) -> list[Skill]:
-    """Discover skills with project > user > builtin precedence (first name wins)."""
-    global _catalog_cache
-    with _catalog_lock:
-        if _catalog_cache is not None and not force:
-            return list(_catalog_cache)
-        by_name: dict[str, Skill] = {}
-        # Later sources only fill gaps — load high precedence first.
-        for skill in _scan_root(project_skills_dir(project_root), "project"):
-            by_name.setdefault(skill.name, skill)
-        for skill in _scan_root(user_skills_dir(), "user"):
-            by_name.setdefault(skill.name, skill)
-        for skill in _scan_root(builtin_skills_dir(), "builtin"):
-            by_name.setdefault(skill.name, skill)
-        skills = sorted(by_name.values(), key=lambda s: s.name.lower())
-        _catalog_cache = skills
-        return list(skills)
+    """Discover skills with project > user > builtin precedence."""
+    return list(_discover_catalog(project_root=project_root, force=force).skills)
 
 
-def clear_cache() -> None:
-    """Drop the catalog cache (tests / after save/delete)."""
-    global _catalog_cache
+def clear_cache(
+    *,
+    project_root: Path | str | None = None,
+    user_root: Path | str | None = None,
+    builtin_root: Path | str | None = None,
+) -> None:
+    """Invalidate all catalogs, or only catalogs containing supplied roots."""
     with _catalog_lock:
-        _catalog_cache = None
+        if project_root is None and user_root is None and builtin_root is None:
+            _catalog_cache.clear()
+            return
+        project_path = (
+            _resolved_path(project_skills_dir(project_root))
+            if project_root is not None else None
+        )
+        user_path = _resolved_path(Path(user_root)) if user_root is not None else None
+        builtin_path = (
+            _resolved_path(Path(builtin_root)) if builtin_root is not None else None
+        )
+        stale = [
+            key for key in _catalog_cache
+            if (project_path is None or key[0] == project_path)
+            and (user_path is None or key[1] == user_path)
+            and (builtin_path is None or key[2] == builtin_path)
+        ]
+        for key in stale:
+            _catalog_cache.pop(key, None)
 
 
 def get_skill(name: str, *, project_root: Path | str | None = None) -> Optional[Skill]:
@@ -379,7 +575,22 @@ def get_skill(name: str, *, project_root: Path | str | None = None) -> Optional[
 
 
 def list_skills(*, project_root: Path | str | None = None) -> list[dict[str, Any]]:
-    return [s.to_list_entry() for s in discover_skills(project_root=project_root)]
+    """Return available skills plus structured diagnostics for failed candidates."""
+    catalog = _discover_catalog(project_root=project_root)
+    entries = [skill.to_list_entry() for skill in catalog.skills]
+    entries.extend(diagnostic.to_list_entry() for diagnostic in catalog.diagnostics)
+    return entries
+
+
+def _skill_load_diagnostic(
+    name: str,
+    *,
+    project_root: Path | str | None = None,
+) -> SkillLoadDiagnostic | None:
+    for diagnostic in _discover_catalog(project_root=project_root).diagnostics:
+        if diagnostic.name == name:
+            return diagnostic
+    return None
 
 
 # --------------------------------------------------------------------------- catalog / system context
@@ -400,17 +611,73 @@ def catalog_block(*, project_root: Path | str | None = None) -> str:
         "Activate with /skill:<name> or /<name>, or read skill://<name>. "
         "Auto-inject skills fire once per session when their triggers match."
     )
-    return "\n".join(lines)
+    block = "\n".join(lines)
+    return _truncate_semantically(
+        block,
+        SKILL_CATALOG_CHAR_LIMIT,
+        "\n[SKILLS CATALOG TRUNCATED: additional entries omitted.]",
+    )
 
 
-def format_skill_body(skill: Skill, *, args: str = "") -> str:
-    """Full skill body ready for injection into the conversation/system."""
+def _truncate_semantically(text: str, max_chars: int, marker: str) -> str:
+    """Truncate at a paragraph, then line boundary, with a visible marker."""
+    if max_chars <= 0:
+        return ""
+    if len(text) <= max_chars:
+        return text
+    if len(marker) >= max_chars:
+        return marker[:max_chars]
+    available = max_chars - len(marker)
+    boundary = text.rfind("\n\n", 0, available + 1)
+    if boundary <= 0:
+        boundary = text.rfind("\n", 0, available + 1)
+    if boundary <= 0:
+        boundary = available
+    return text[:boundary].rstrip() + marker
+
+
+def format_skill_body(
+    skill: Skill,
+    *,
+    args: str = "",
+    max_chars: int = SKILL_BODY_CHAR_LIMIT,
+) -> str:
+    """Format one skill within its measured character budget.
+
+    Character counts include the skill header, user arguments, truncation marker,
+    and source footer. Paragraph and line boundaries are preferred over hard cuts.
+    """
     header = f"[SKILL: {skill.name} ({skill.source})]"
-    parts = [header, skill.body.rstrip()]
+    footer = f"\n\n(Source: skill://{skill.name})"
+    payload = skill.body.rstrip()
     if args.strip():
-        parts.append(f"\nUser args: {args.strip()}")
-    parts.append(f"\n(Source: skill://{skill.name})")
-    return "\n".join(parts)
+        payload += f"\n\nUser args: {args.strip()}"
+    marker = (
+        "\n\n[TRUNCATED: skill injection capped at "
+        f"{max_chars} characters (~{max_chars // 4} tokens at 4 chars/token).]"
+    )
+    payload_limit = max(0, max_chars - len(header) - 1 - len(footer))
+    payload = _truncate_semantically(payload, payload_limit, marker)
+    return f"{header}\n{payload}{footer}"
+
+
+def _format_load_diagnostic(diagnostic: SkillLoadDiagnostic) -> str:
+    name = diagnostic.name or "<root>"
+    text = "\n".join(
+        [
+            f"[SKILL LOAD ERROR: {name} ({diagnostic.source})]",
+            f"kind: {diagnostic.kind}",
+            f"path: {diagnostic.path}",
+            f"message: {diagnostic.message}",
+            "The higher-precedence skill name remains reserved; no lower-precedence "
+            "skill was substituted.",
+        ]
+    )
+    return _truncate_semantically(
+        text,
+        SKILL_BODY_CHAR_LIMIT,
+        "\n[TRUNCATED: skill load diagnostic capped.]",
+    )
 
 
 # --------------------------------------------------------------------------- session activation state
@@ -555,22 +822,26 @@ def activate_skill(
     force: bool = False,
     role: str | None = None,
 ) -> Optional[str]:
-    """Activate a skill by name. Returns injection text, or None if missing/already.
+    """Activate one skill within the per-body budget.
 
-    *force* bypasses the once-per-session guard (used for explicit slash commands
-    that the user re-invokes, and for post-compaction re-inject of still-active
-    skills). It does not bypass a skill's optional role allowlist. For auto
-    triggers, leave force=False so once-per-session holds.
+    A reserved candidate that failed to load returns its structured diagnostic;
+    ``force`` only controls the once-per-session guard for valid skills.
     """
     skill = get_skill(name, project_root=project_root)
     if skill is None:
+        diagnostic = _skill_load_diagnostic(name, project_root=project_root)
+        if diagnostic is not None:
+            return _format_load_diagnostic(diagnostic)
         return None
     if skill.roles and (not role or role not in skill.roles):
         return None
     if not force and already_injected(skill.name, session_id):
         return None
+    text = format_skill_body(skill, args=args)
+    if not text:
+        return None
     _mark_injected(skill.name, session_id)
-    return format_skill_body(skill, args=args)
+    return text
 
 
 def activate_for_prompt(
@@ -581,40 +852,40 @@ def activate_for_prompt(
     phase: str | None = None,
     tools_about_to_run: Iterable[str] | None = None,
     role: str | None = None,
+    _aggregate_char_limit: int = SKILL_INJECTION_CHAR_LIMIT,
 ) -> list[str]:
-    """Collect injection bodies for slash + auto triggers on this user turn.
+    """Collect budgeted bodies in explicit > keyword > phase > tool priority.
 
-    Returns a list of skill body strings to append to system/context. Marks each
-    activated skill as injected for the session (once-per-session for auto;
-    explicit slash always injects and marks).
+    A skill is marked injected only after its formatted body fits the aggregate
+    block. Candidates that do not fit remain eligible on a later turn.
     """
-    bodies: list[str] = []
+    candidates: list[
+        tuple[str, Skill | None, str, SkillLoadDiagnostic | None]
+    ] = []
     seen: set[str] = set()
 
-    # 1) Explicit slash commands take priority and always inject.
+    # 1) Explicit slash commands take priority and always bypass once-per-session.
     cleaned, slash_hits = resolve_slash(user_text, project_root=project_root)
     for name, args in slash_hits:
         if name in seen:
             continue
-        text = activate_skill(
-            name, session_id=session_id, project_root=project_root,
-            args=args, force=True, role=role,
-        )
-        if text:
-            bodies.append(text)
-            seen.add(name)
+        skill = get_skill(name, project_root=project_root)
+        if skill is not None:
+            if not skill.roles or (role and role in skill.roles):
+                candidates.append((name, skill, args, None))
+                seen.add(name)
+        else:
+            diagnostic = _skill_load_diagnostic(name, project_root=project_root)
+            if diagnostic is not None:
+                candidates.append((name, None, "", diagnostic))
+                seen.add(name)
 
-    # 2) Auto keyword triggers on the (cleaned) user text.
+    # 2) Auto keyword triggers on the cleaned user text.
     for skill in match_keyword_triggers(
         cleaned, session_id=session_id, project_root=project_root, role=role,
     ):
-        if skill.name in seen:
-            continue
-        text = activate_skill(
-            skill.name, session_id=session_id, project_root=project_root, role=role,
-        )
-        if text:
-            bodies.append(text)
+        if skill.name not in seen:
+            candidates.append((skill.name, skill, "", None))
             seen.add(skill.name)
 
     # 3) Phase triggers.
@@ -622,13 +893,8 @@ def activate_for_prompt(
         for skill in match_phase_triggers(
             phase, session_id=session_id, project_root=project_root, role=role,
         ):
-            if skill.name in seen:
-                continue
-            text = activate_skill(
-                skill.name, session_id=session_id, project_root=project_root, role=role,
-            )
-            if text:
-                bodies.append(text)
+            if skill.name not in seen:
+                candidates.append((skill.name, skill, "", None))
                 seen.add(skill.name)
 
     # 4) Tool-about-to-run triggers.
@@ -637,15 +903,62 @@ def activate_for_prompt(
             for skill in match_tool_triggers(
                 tool, session_id=session_id, project_root=project_root, role=role,
             ):
-                if skill.name in seen:
-                    continue
-                text = activate_skill(
-                    skill.name, session_id=session_id, project_root=project_root, role=role,
-                )
-                if text:
-                    bodies.append(text)
+                if skill.name not in seen:
+                    candidates.append((skill.name, skill, "", None))
                     seen.add(skill.name)
 
+    formatted: list[tuple[str, Skill | None, str]] = []
+    for name, skill, args, diagnostic in candidates:
+        if skill is not None:
+            text = format_skill_body(skill, args=args)
+        else:
+            assert diagnostic is not None
+            text = _format_load_diagnostic(diagnostic)
+        formatted.append((name, skill, text))
+
+    full_size = sum(len(text) for _, _, text in formatted)
+    full_size += max(0, len(formatted) - 1) * 2
+    aggregate_limit = max(0, _aggregate_char_limit)
+    if full_size <= aggregate_limit:
+        for _, skill, _ in formatted:
+            if skill is not None:
+                _mark_injected(skill.name, session_id)
+        return [text for _, _, text in formatted]
+
+    # Reserve bounded space for an omission report before admitting candidates.
+    report_reserve = min(_OMISSION_REPORT_RESERVE, aggregate_limit)
+    content_limit = aggregate_limit - report_reserve
+    bodies: list[str] = []
+    injected_skills: list[Skill] = []
+    omitted: list[str] = []
+    used = 0
+    for name, skill, text in formatted:
+        separator = 2 if bodies else 0
+        if used + separator + len(text) <= content_limit:
+            bodies.append(text)
+            used += separator + len(text)
+            if skill is not None:
+                injected_skills.append(skill)
+        else:
+            omitted.append(name)
+
+    if omitted:
+        report = "\n".join(
+            [
+                "[SKILLS OMITTED: injection character budget reached]",
+                *(f"- {name}" for name in omitted),
+                "Omitted skills were not marked injected and remain eligible later.",
+            ]
+        )
+        report = _truncate_semantically(
+            report,
+            max(0, report_reserve - (2 if bodies else 0)),
+            "\n[TRUNCATED: additional omitted skill names.]",
+        )
+        if report:
+            bodies.append(report)
+    for skill in injected_skills:
+        _mark_injected(skill.name, session_id)
     return bodies
 
 
@@ -658,12 +971,15 @@ def session_system_block(
     tools_about_to_run: Iterable[str] | None = None,
     role: str | None = None,
 ) -> str:
-    """Catalog + any newly activated skill bodies for this turn's system prompt."""
+    """Return catalog and activated bodies within the aggregate character cap."""
     parts: list[str] = []
     cat = catalog_block(project_root=project_root)
     if cat:
         parts.append(cat)
     if user_text or phase or tools_about_to_run:
+        activation_budget = SKILL_INJECTION_CHAR_LIMIT - len(cat)
+        if cat:
+            activation_budget -= 2  # separator inserted by the final join
         bodies = activate_for_prompt(
             user_text or "",
             session_id=session_id,
@@ -671,6 +987,7 @@ def session_system_block(
             phase=phase,
             tools_about_to_run=tools_about_to_run,
             role=role,
+            _aggregate_char_limit=max(0, activation_budget),
         )
         parts.extend(bodies)
     return "\n\n".join(parts)
@@ -693,9 +1010,11 @@ def resolve_slash(
     """
     if not text:
         return "", []
-    known = {
-        s.name for s in discover_skills(project_root=project_root)
-    } - RESERVED_SLASH_COMMANDS
+    catalog = _discover_catalog(project_root=project_root)
+    known = (
+        {skill.name for skill in catalog.skills}
+        | {d.name for d in catalog.diagnostics if d.name}
+    ) - RESERVED_SLASH_COMMANDS
     hits: list[tuple[str, str]] = []
     lines_out: list[str] = []
 
@@ -937,7 +1256,7 @@ def save_user_skill(name: str, body: str) -> dict[str, Any]:
         (dest_dir / _SKILL_FILENAME).write_text(body, encoding="utf-8")
     except OSError as exc:
         return {"ok": False, "reason": f"write failed: {exc}"}
-    clear_cache()
+    clear_cache(user_root=user_skills_dir())
     return {"ok": True, "name": name, "path": str(dest_dir / _SKILL_FILENAME)}
 
 
@@ -961,7 +1280,7 @@ def delete_user_skill(name: str) -> dict[str, Any]:
             pass
     except OSError as exc:
         return {"ok": False, "reason": f"delete failed: {exc}"}
-    clear_cache()
+    clear_cache(user_root=user_skills_dir())
     return {"ok": True, "name": name}
 
 

@@ -75,7 +75,12 @@ def _call(method: str, **params):
 # envelopes + degradation
 # ---------------------------------------------------------------------------
 
-def test_all_methods_envelope_on_missing_path():
+def test_all_methods_envelope_on_missing_path(tmp_path, monkeypatch):
+    from services import paths
+
+    # Never inherit the workstation's real Box credentials in this missing-path
+    # contract test.
+    monkeypatch.setattr(paths, "CONFIG", tmp_path / "empty-config.json")
     # AI-VC methods are doc_id-scoped (not project-path vault); empty params are
     # valid for plm_timeline (empty list) and invalid for plm_rollback (needs `to`).
     _AI_VC = {"plm_timeline", "plm_rollback"}
@@ -88,6 +93,18 @@ def test_all_methods_envelope_on_missing_path():
         if name == "plm_rollback":
             assert out.get("ok") is False and "reason" in out, name
             _assert_no_git_vocab(str(out.get("hint", "")))
+            continue
+        if name == "box_status":
+            # box_mirror.status is a path-optional Settings query: an empty
+            # configuration is a successful disabled/unconfigured status.
+            assert out["ok"] is True
+            assert out["enabled"] is False
+            assert out["configured"] is False
+            continue
+        if name == "box_notify_save":
+            # The save notification is deliberately best-effort/no-op without
+            # a path or enabled mirror (box_mirror.notify_saved_path contract).
+            assert out == {"ok": True}
             continue
         if name in ("cad_graph_get", "cad_graph_assembly_tree"):
             # cad_graph_get {project_dir?|doc_id?} — both optional per
@@ -341,6 +358,25 @@ def test_record_outside_noop_when_clean(project):
     out = worker_rpc.WORKER_METHODS["plm_record_outside"](
         {"path": str(project)}, _emit)
     assert out["ok"] is True and out["committed"] is False
+
+
+def test_record_outside_scan_failure_is_not_a_clean_noop(project, monkeypatch):
+    from services.plm.vault import Vault
+
+    def fail_scan(_vault):
+        raise OSError("synthetic directory scan failure")
+
+    def must_not_save(_vault, *_args, **_kwargs):
+        raise AssertionError("save must not run after a failed scan")
+
+    monkeypatch.setattr(Vault, "_project_containers", fail_scan)
+    monkeypatch.setattr(Vault, "save", must_not_save)
+
+    out = worker_rpc.WORKER_METHODS["plm_record_outside"](
+        {"path": str(project)}, _emit)
+    assert out["ok"] is False
+    assert out["reason"] == "scan_failed"
+    assert "committed" not in out
 
 
 def test_record_outside_commits_disk_change(project):

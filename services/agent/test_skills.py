@@ -120,6 +120,92 @@ def test_missing_description_skipped(skill_roots):
     assert "bad" not in names
 
 
+
+def test_discovery_cache_is_scoped_to_resolved_roots(tmp_path, monkeypatch):
+    project_a = tmp_path / "a"
+    project_b = tmp_path / "b"
+    user = tmp_path / "user"
+    builtin = tmp_path / "builtin"
+    for root in (project_a, project_b):
+        (root / ".chudware" / "skills").mkdir(parents=True)
+    user.mkdir()
+    builtin.mkdir()
+    monkeypatch.delenv("CHUDWARE_SKILLS_PROJECT_DIR", raising=False)
+    monkeypatch.setenv("CHUDWARE_SKILLS_USER_DIR", str(user))
+    monkeypatch.setenv("CHUDWARE_SKILLS_BUILTIN_DIR", str(builtin))
+    _write_skill(project_a / ".chudware" / "skills", "only-a", "project A")
+    _write_skill(project_b / ".chudware" / "skills", "only-b", "project B")
+    _write_skill(user, "shared", "shared user skill")
+    sk.clear_cache()
+
+    names_a = {s.name for s in sk.discover_skills(project_root=project_a)}
+    names_b = {s.name for s in sk.discover_skills(project_root=project_b)}
+
+    assert names_a == {"only-a", "shared"}
+    assert names_b == {"only-b", "shared"}
+
+
+@pytest.mark.parametrize("failure", ["yaml", "read"])
+def test_invalid_project_skill_reserves_name_and_surfaces_diagnostic(
+    tmp_path, monkeypatch, failure,
+):
+    project = tmp_path / "project"
+    project_skills = project / ".chudware" / "skills"
+    user = tmp_path / "user"
+    builtin = tmp_path / "builtin"
+    project_skills.mkdir(parents=True)
+    user.mkdir()
+    builtin.mkdir()
+    monkeypatch.delenv("CHUDWARE_SKILLS_PROJECT_DIR", raising=False)
+    monkeypatch.setenv("CHUDWARE_SKILLS_USER_DIR", str(user))
+    monkeypatch.setenv("CHUDWARE_SKILLS_BUILTIN_DIR", str(builtin))
+    project_md = _write_skill(
+        project_skills, "edit-part", "project edit", extra_body="PROJECT BODY\n",
+    )
+    _write_skill(
+        builtin, "edit-part", "builtin edit", extra_body="BUILTIN BODY\n",
+    )
+    if failure == "yaml":
+        project_md.write_text(
+            "---\nname: edit-part\ndescription: [unterminated\n---\n\nPROJECT BODY\n",
+            encoding="utf-8",
+        )
+    else:
+        original_read_text = Path.read_text
+
+        def fail_project_read(path, *args, **kwargs):
+            if path == project_md:
+                raise OSError("disk unavailable")
+            return original_read_text(path, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "read_text", fail_project_read)
+    sk.clear_cache()
+
+    listing = sk.list_skills(project_root=project)
+    errors = [
+        entry for entry in listing
+        if entry.get("name") == "edit-part" and entry.get("load_error")
+    ]
+    assert len(errors) == 1
+    assert errors[0]["source"] == "project"
+    assert errors[0]["load_error"]["kind"] == (
+        "yaml_error" if failure == "yaml" else "read_error"
+    )
+    assert not any(
+        entry.get("name") == "edit-part"
+        and entry.get("source") == "builtin"
+        and not entry.get("load_error")
+        for entry in listing
+    )
+
+    bodies = sk.activate_for_prompt(
+        "/skill:edit-part", project_root=project, session_id=f"invalid-{failure}",
+    )
+    assert len(bodies) == 1
+    assert "[SKILL LOAD ERROR: edit-part (project)]" in bodies[0]
+    assert "BUILTIN BODY" not in bodies[0]
+
+
 # --------------------------------------------------------------------------- triggers + once-per-session
 
 
@@ -330,6 +416,49 @@ def test_session_system_block_includes_catalog_and_activation(skill_roots):
     assert "[SKILLS]" in block
     assert "PART BODY" in block
     assert "edit-part" in block
+
+
+
+def test_activation_budget_keeps_explicit_first_and_reports_omissions(skill_roots):
+    huge = "\n\n".join(f"Explicit paragraph {i}: " + ("E" * 500) for i in range(80))
+    _write_skill(
+        skill_roots["project"], "explicit-large", "large explicit skill",
+        extra_body=huge,
+    )
+    for i in range(5):
+        auto_body = "\n\n".join(
+            f"Auto {i} paragraph {j}: " + ("A" * 500) for j in range(16)
+        )
+        _write_skill(
+            skill_roots["project"], f"auto-{i}", f"automatic skill {i}",
+            inject="auto", keywords=["budget-match"], extra_body=auto_body,
+        )
+    sk.clear_cache()
+    sk.reset_session("budget")
+
+    bodies = sk.activate_for_prompt(
+        "/skill:explicit-large\nbudget-match", session_id="budget",
+    )
+    joined = "\n\n".join(bodies)
+
+    assert len(joined) <= sk.SKILL_INJECTION_CHAR_LIMIT
+    assert joined.startswith("[SKILL: explicit-large (project)]")
+    assert "[TRUNCATED:" in joined
+    assert "[SKILLS OMITTED: injection character budget reached]" in joined
+    omitted = [
+        name for name in (f"auto-{i}" for i in range(5))
+        if f"- {name}" in joined
+    ]
+    assert omitted
+    assert all(not sk.already_injected(name, "budget") for name in omitted)
+
+    sk.reset_session("budget-system")
+    block = sk.session_system_block(
+        "budget-system", user_text="/skill:explicit-large\nbudget-match",
+    )
+    assert len(block) <= sk.SKILL_INJECTION_CHAR_LIMIT
+    assert "[SKILL: explicit-large (project)]" in block
+    assert "[SKILLS OMITTED: injection character budget reached]" in block
 
 
 # ------------------------------------------------- real builtin keyword phrasings

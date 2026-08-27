@@ -21,9 +21,7 @@ from . import (Challenge, AcceptanceCheck, ledger_artifact,
                ledger_decision_value, coerce_number)
 
 _MUTATE_TOOLS = frozenset({
-    "add_features", "delete_feature", "edit_feature", "boolean",
-    "extrude", "revolve", "hole", "fillet", "chamfer", "pattern", "shell",
-    "asm_mate", "move_component", "offset_feature",
+    "add_features", "asm_mate", "asm_add_component",
 })
 
 
@@ -150,7 +148,7 @@ MANIFEST = {
             {"id": "AC4", "text": "check_interference used",
              "check": {"tool": "check_interference", "pass_rule": "called>=1"}},
             {"id": "AC5", "text": "repair after detect",
-             "check": {"tool": "edit_feature", "pass_rule": "mutate seq > first check"}},
+             "check": {"tool": "add_features", "pass_rule": "edit_feature op after check"}},
         ],
         "depends_on": [],
         "target_refs": {"doc_id": "doc_C10_clash", "features": ["boss_offset"]},
@@ -182,9 +180,10 @@ def _base_turns() -> list[dict]:
          "clashes": 1, "stage": "verify",
          "note": "initial planted clash detected"},
         # Repair after detect.
-        {"_kind": "tool_call", "tool": "edit_feature", "for_ac": "AC5",
+        {"_kind": "tool_call", "tool": "add_features", "for_ac": "AC5",
          "node": "n_build_DL1",
-         "args": {"feature": "boss_offset", "offset_mm": -2.0},
+         "args": {"ops": [{"op": "edit_feature", "id": "boss_offset",
+                           "params": {"offset_mm": -2.0}}]},
          "hypothesis": "shorten boss to clear the mating face"},
         {"_kind": "tool_call", "tool": "check_interference", "for_ac": "AC2",
          "node": "n_verify_DL1", "args": {},

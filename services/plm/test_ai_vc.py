@@ -932,3 +932,91 @@ def test_parent_legacy_and_post_rollback_fork(store):
         "ancestry", _part(4), turn_id=3, op_batch={"n": 3})
     assert fork["record"]["parent"] == first["id"]
     assert store._read_meta("ancestry")["rolled_back_from"] == second["id"]
+
+
+def test_explicit_project_without_vault_does_not_fall_back_to_cache(
+        tmp_path, monkeypatch):
+    from services import paths
+
+    project = tmp_path / "project"
+    project.mkdir()
+    cache = tmp_path / "global-cache"
+    monkeypatch.setattr(paths, "CACHE", cache)
+    monkeypatch.setattr(ai_vc, "_STORE", None)
+    monkeypatch.setattr(ai_vc, "_STORE_ROOT", None)
+    ai_vc.clear_provenance()
+    ai_vc.stamp_authored("missing-vault", "agent")
+
+    out = ai_vc.on_prompt_start(
+        "checkpoint", doc_id="missing-vault", turn_id=1,
+        content=_part(1), project_dir=str(project))
+
+    assert out == {
+        "ok": False,
+        "reason": "vault_unavailable",
+        "hint": f"version history is unavailable for {project}",
+    }
+    assert not cache.exists()
+
+
+def test_explicit_project_resolution_failure_is_structured(
+        tmp_path, monkeypatch):
+    from services import paths
+    from services.agent import project_context
+
+    project = tmp_path / "project"
+    project.mkdir()
+    cache = tmp_path / "global-cache"
+    monkeypatch.setattr(paths, "CACHE", cache)
+    monkeypatch.setattr(ai_vc, "_STORE", None)
+    monkeypatch.setattr(ai_vc, "_STORE_ROOT", None)
+    monkeypatch.setattr(
+        project_context, "resolve_project_root",
+        lambda _candidate: (_ for _ in ()).throw(OSError("resolver failed")))
+    ai_vc.clear_provenance()
+    ai_vc.stamp_authored("resolver-failure", "agent")
+
+    out = ai_vc.on_prompt_start(
+        "checkpoint", doc_id="resolver-failure", turn_id=1,
+        content=_part(1), project_dir=str(project))
+
+    assert out["ok"] is False
+    assert out["reason"] == "project_root_unavailable"
+    assert "resolver failed" in out["hint"]
+    assert not cache.exists()
+
+
+def test_headless_checkpoint_uses_cache_store(tmp_path, monkeypatch):
+    from services import paths
+
+    cache = tmp_path / "global-cache"
+    monkeypatch.setattr(paths, "CACHE", cache)
+    monkeypatch.setattr(ai_vc, "_STORE", None)
+    monkeypatch.setattr(ai_vc, "_STORE_ROOT", None)
+    monkeypatch.delenv("CHUDWARE_PROJECT_DIR", raising=False)
+    monkeypatch.delenv("CHUDWARE_FS_ROOT", raising=False)
+    ai_vc.clear_provenance()
+    ai_vc.stamp_authored("headless", "agent")
+
+    out = ai_vc.on_prompt_start(
+        "checkpoint", doc_id="headless", turn_id=1, content=_part(1))
+
+    assert out and out["ok"]
+    assert ai_vc._STORE_ROOT == cache / "ai_vc"
+    assert (cache / "ai_vc" / "docs" / "headless" / "chain.jsonl").is_file()
+
+
+def test_timeline_surfaces_malformed_chain_line(store):
+    ai_vc.stamp_authored("corrupt-chain", "agent")
+    store.checkpoint(
+        "corrupt-chain", _part(1), turn_id=1, op_batch={"n": 1})
+    with store._chain_path("corrupt-chain").open("a", encoding="utf-8") as chain:
+        chain.write("{malformed json\n")
+
+    out = store.timeline("corrupt-chain")
+
+    assert out["ok"] is False
+    assert out["reason"] == "timeline_corrupt"
+    assert out["corruption"]["doc_id"] == "corrupt-chain"
+    assert out["corruption"]["line"] == 2
+    assert out["checkpoints"] == []

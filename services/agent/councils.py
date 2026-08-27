@@ -43,6 +43,7 @@ behind ``CHUDWARE_COUNCIL_BUILDGRAPH`` (default on).
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import time
@@ -82,6 +83,10 @@ _BUILDGRAPH_SEAM_ENABLED = os.environ.get("CHUDWARE_COUNCIL_BUILDGRAPH", "1") !=
 # Deliberation dial: "full" = always on, "minimal" = risk-trigger only.
 # Read from T-W10 tiers.yaml when merged; else default full per 2026-07-04 amendment.
 _DELIBERATION_DEFAULT = os.environ.get("CHUDWARE_COUNCIL_DELIBERATION", "full")
+_DEFAULT_PONDER_ROUND1_TOKENS = 1500
+_DEFAULT_PONDER_ROUND2_TOKENS = 600
+
+_LOG = logging.getLogger(__name__)
 
 # Seat personas: authored YAML in developer runs, canonical compiled data in packages.
 _SEATS_YAML = (
@@ -384,12 +389,48 @@ def _new_council_record(kind: str, topic: str, inputs: dict) -> dict:
         "synthesis": {"decision": "", "rationale": "", "rejected_alternatives": []},
         "dissents": [],
         "chair": "department_manager",
+        "status": "in_progress",
+        "complete": False,
+        "seat_outcomes": [],
+        "diagnostics": {},
     }
 
 
 # ---------------------------------------------------------------------------
 # Seat runner — delegation-shaped seam (T-W14 not merged)
 # ---------------------------------------------------------------------------
+class _SeatReplyError(ValueError):
+    def __init__(self, message: str, raw_reply: str) -> None:
+        super().__init__(message)
+        self.raw_reply = raw_reply
+        self.policy_refusal = _is_policy_refusal_reply(raw_reply)
+
+
+class _ChairReplyError(ValueError):
+    def __init__(self, message: str, raw_reply: str) -> None:
+        super().__init__(message)
+        self.raw_reply = raw_reply
+        self.policy_refusal = _is_policy_refusal_reply(raw_reply)
+
+
+def _is_policy_refusal_reply(reply: str) -> bool:
+    """Recognize explicit refusal envelopes and unstructured refusal statements."""
+    text = str(reply).strip()
+    try:
+        parsed = json.loads(text)
+    except (TypeError, json.JSONDecodeError):
+        parsed = None
+    if isinstance(parsed, dict) and parsed.get("policy_refusal") is True:
+        return True
+    lowered = text.lower()
+    return (
+        "policy refusal" in lowered
+        or "refused by policy" in lowered
+        or "cannot comply" in lowered
+        or "must refuse" in lowered
+    )
+
+
 
 def _run_seat(
     persona: str,
@@ -400,6 +441,7 @@ def _run_seat(
     round1_positions: Optional[list[dict]],
     provider: Any,
     temperature: Optional[float] = None,
+    max_tokens: int = _DEFAULT_PONDER_ROUND1_TOKENS,
 ) -> tuple[dict, Optional[str]]:
     """Run one seat for one round.
 
@@ -459,7 +501,7 @@ def _run_seat(
             reply = provider.complete(
                 system=prompt_text,
                 messages=[{"role": "user", "content": [{"type": "text", "text": user_message}]}],
-                max_tokens=1500,
+                max_tokens=max_tokens,
                 temperature=temperature,
             )
         except TypeError:
@@ -467,18 +509,20 @@ def _run_seat(
             reply = provider.complete(
                 system=prompt_text,
                 messages=[{"role": "user", "content": [{"type": "text", "text": user_message}]}],
-                max_tokens=1500,
+                max_tokens=max_tokens,
             )
     else:
         reply = provider.complete(
             system=prompt_text,
             messages=[{"role": "user", "content": [{"type": "text", "text": user_message}]}],
-            max_tokens=1500,
+            max_tokens=max_tokens,
         )
 
-    # Parse typed position
-    position_dict, dissent = _parse_seat_reply(reply, persona)
-    return position_dict, dissent
+    # Parse typed position while retaining the raw model response for diagnostics.
+    try:
+        return _parse_seat_reply(reply, persona)
+    except ValueError as exc:
+        raise _SeatReplyError(str(exc), reply) from exc
 
 
 def _parse_seat_reply(reply: str, persona: str) -> tuple[dict, Optional[str]]:
@@ -803,11 +847,9 @@ def _synthesize(
     dissents: list[dict],
     topic: str,
     provider: Any,
+    max_tokens: int = _DEFAULT_PONDER_ROUND2_TOKENS,
 ) -> dict:
-    """Chair synthesizes round-2 positions into a decision + rejected alternatives.
-
-    Runs as a plain provider call (same delegation-seam pattern as seats).
-    """
+    """Chair synthesizes round-2 positions into a strictly typed decision."""
     system = (
         "You are the CHAIR of a build-strategy council. "
         "Read the seated positions and synthesize a single recommended build strategy. "
@@ -828,22 +870,36 @@ def _synthesize(
     reply = provider.complete(
         system=system,
         messages=[{"role": "user", "content": [{"type": "text", "text": user_text}]}],
-        max_tokens=600,
+        max_tokens=max_tokens,
     )
 
-    blocks = _extract_json_objects(reply)
-    if not blocks:
-        return {
-            "decision": reply[:500],
-            "rationale": "(chair reply was not valid JSON — stored verbatim)",
-            "rejected_alternatives": [],
-        }
+    try:
+        raw = json.loads(reply)
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise _ChairReplyError("chair reply is not a JSON object", str(reply)) from exc
 
-    raw = blocks[0]
+    expected = {"decision", "rationale", "rejected_alternatives"}
+    if not isinstance(raw, dict) or set(raw) != expected:
+        raise _ChairReplyError(
+            "chair reply does not match the required synthesis keys", str(reply))
+    if not isinstance(raw["decision"], str) or not raw["decision"].strip():
+        raise _ChairReplyError(
+            "chair synthesis decision must be a non-empty string", str(reply))
+    if not isinstance(raw["rationale"], str):
+        raise _ChairReplyError(
+            "chair synthesis rationale must be a string", str(reply))
+    rejected = raw["rejected_alternatives"]
+    if (
+        not isinstance(rejected, list)
+        or any(not isinstance(item, str) for item in rejected)
+    ):
+        raise _ChairReplyError(
+            "chair rejected_alternatives must be an array of strings", str(reply))
+
     return {
-        "decision": str(raw.get("decision", "")),
-        "rationale": str(raw.get("rationale", "")),
-        "rejected_alternatives": list(raw.get("rejected_alternatives", [])),
+        "decision": raw["decision"],
+        "rationale": raw["rationale"],
+        "rejected_alternatives": list(rejected),
     }
 
 
@@ -880,6 +936,24 @@ def _pick_provider(providers: list[Any], seat_index: int) -> Any:
     if not providers:
         raise ValueError("_pick_provider: empty providers list")
     return providers[seat_index % len(providers)]
+
+def _persist_council_record(record: dict, ledger: Any, actor: str) -> None:
+    if ledger is not None:
+        ledger.append(actor, "artifact", {
+            "id": record["id"],
+            "kind": "council",
+            "council": record,
+        })
+
+
+def _incomplete_council(record: dict, ledger: Any, actor: str) -> dict:
+    """Mark and persist a partial council without creating a decision event."""
+    record["status"] = "incomplete"
+    record["complete"] = False
+    _persist_council_record(record, ledger, actor)
+    return record
+
+
 
 
 def council_convene(
@@ -928,14 +1002,27 @@ def council_convene(
         policy_path:     Override path for council_policy.yaml (tests).
 
     Returns:
-        Completed aicad.council/1 record dict.
-
-    Raises:
-        ValueError: if a seat produces a malformed typed position (typed-position
-                    rejection — the council aborts with partial data).
+        A complete or explicitly incomplete aicad.council/1 record.
     """
     personas = get_seat_personas()
     record = _new_council_record(kind, topic, inputs)
+
+    # Resolve the effort profile exactly once. Calls without a tier retain the
+    # historical budgets and authored four-seat breadth.
+    seat_cap = len(record["seats"])
+    round1_tokens = _DEFAULT_PONDER_ROUND1_TOKENS
+    round2_tokens = _DEFAULT_PONDER_ROUND2_TOKENS
+    if tier is not None:
+        from services.agent.effort import resolve_effort
+        effort_values = resolve_effort(tier).values
+        seat_cap = max(1, min(
+            len(record["seats"]),
+            int(effort_values.get("council_seats", seat_cap)),
+        ))
+        round1_tokens = int(effort_values.get(
+            "ponder_round1_tokens", round1_tokens))
+        round2_tokens = int(effort_values.get(
+            "ponder_round2_tokens", round2_tokens))
 
     # T-DP8: resolve policy when stage+tier provided; apply breadth + diversity.
     policy: Optional[CouncilPolicy] = None
@@ -946,27 +1033,29 @@ def council_convene(
             overrides=policy_overrides,
             path=policy_path,
         )
-        # Cap seats to resolved breadth.
-        record["seats"] = list(record["seats"][: policy.breadth])
-        # Store policy metadata in the record for ledger/transparency.
+        seat_cap = min(seat_cap, policy.breadth)
+        record["seats"] = list(record["seats"][:seat_cap])
         record["policy"] = {
             "stage": policy.stage,
             "tier": policy.tier,
-            "breadth": policy.breadth,
+            "breadth": seat_cap,
             "diverse_models": policy.diverse_models,
         }
+    else:
+        record["seats"] = list(record["seats"][:seat_cap])
 
-    # Build the provider pool for diverse-model selection.
-    # Priority: explicit ``providers`` list > single ``provider``.
-    provider_pool: list[Any] = list(providers) if providers else [provider]
+    # Clamp copies of every seat/chair provider. The ambient provider objects
+    # remain untouched even when their configured effort is above "high".
+    from services.agent.role_models import clamp_provider_effort
+    raw_provider_pool = list(providers) if providers else [provider]
+    provider_pool = [
+        clamp_provider_effort(candidate) for candidate in raw_provider_pool
+    ]
 
-    # Determine temperatures for temperature-diversity fallback.
-    # Active only when provider_pool has 1 source (or diverse_models is off).
     use_temp_diversity = len(provider_pool) == 1
     if policy is not None:
         temps = policy.temperatures
     else:
-        # Default temperatures when no policy: use base 0.7 + 0.1 spread.
         temps = _build_temperatures(len(record["seats"]), 0.7, 0.1)
 
     # ── Round 1 ──────────────────────────────────────────────────────────────
@@ -974,27 +1063,60 @@ def council_convene(
     for seat_idx, seat_cfg in enumerate(record["seats"]):
         persona = seat_cfg["persona"]
         p_cfg = personas.get(persona)
-        if p_cfg is None:
-            raise RuntimeError(
-                f"Persona '{persona}' not found in council_seats.yaml. "
-                "Check the authored file."
-            )
-        seat_provider = _pick_provider(provider_pool, seat_idx)
         seat_temp: Optional[float] = (
             temps[seat_idx] if use_temp_diversity and seat_idx < len(temps) else None
         )
-        pos, _dissent_r1 = _run_seat(
-            persona=persona,
-            persona_cfg=p_cfg,
-            round_num=1,
-            topic=topic,
-            inputs=inputs,
-            round1_positions=None,
-            provider=seat_provider,
-            temperature=seat_temp,
-        )
+        try:
+            if p_cfg is None:
+                raise RuntimeError(
+                    f"Persona '{persona}' not found in council_seats.yaml")
+            pos, _dissent_r1 = _run_seat(
+                persona=persona,
+                persona_cfg=p_cfg,
+                round_num=1,
+                topic=topic,
+                inputs=inputs,
+                round1_positions=None,
+                provider=_pick_provider(provider_pool, seat_idx),
+                temperature=seat_temp,
+                max_tokens=round1_tokens,
+            )
+        except Exception as exc:  # noqa: BLE001 — return the partial council
+            refused = (
+                isinstance(exc, _SeatReplyError) and exc.policy_refusal
+            )
+            outcome = {
+                "seat": persona,
+                "round": 1,
+                "status": "refused" if refused else "failed",
+                "outcome_kind": (
+                    "policy_refusal"
+                    if refused
+                    else "validation_error"
+                    if isinstance(exc, _SeatReplyError)
+                    else "internal_error"
+                ),
+                "executed": False,
+                "error": str(exc),
+            }
+            record["seat_outcomes"].append(outcome)
+            diagnostic = dict(outcome)
+            if isinstance(exc, _SeatReplyError):
+                diagnostic["raw_reply"] = exc.raw_reply
+            record["diagnostics"].setdefault("seat_errors", []).append(diagnostic)
+            _LOG.exception(
+                "Council %s seat %s failed in round 1", record["id"], persona)
+            return _incomplete_council(record, ledger, actor)
+
         round1_positions.append(pos)
-        # Round-1 positions are ledger notes (not final positions)
+        record["seat_outcomes"].append({
+            "seat": persona,
+            "round": 1,
+            "status": "executed",
+            "outcome_kind": "ok",
+            "executed": True,
+            "position": pos,
+        })
         if ledger is not None:
             ledger.append(actor, "artifact", {
                 "id": f"{record['id']}_r1_{persona}",
@@ -1007,25 +1129,61 @@ def council_convene(
     # ── Round 2 ──────────────────────────────────────────────────────────────
     final_positions: list[dict] = []
     final_dissents: list[dict] = []
-
     for seat_idx, seat_cfg in enumerate(record["seats"]):
         persona = seat_cfg["persona"]
-        p_cfg = personas[persona]
-        seat_provider = _pick_provider(provider_pool, seat_idx)
         seat_temp = (
             temps[seat_idx] if use_temp_diversity and seat_idx < len(temps) else None
         )
-        pos, dissent = _run_seat(
-            persona=persona,
-            persona_cfg=p_cfg,
-            round_num=2,
-            topic=topic,
-            inputs=inputs,
-            round1_positions=round1_positions,
-            provider=seat_provider,
-            temperature=seat_temp,
-        )
+        try:
+            pos, dissent = _run_seat(
+                persona=persona,
+                persona_cfg=personas[persona],
+                round_num=2,
+                topic=topic,
+                inputs=inputs,
+                round1_positions=round1_positions,
+                provider=_pick_provider(provider_pool, seat_idx),
+                temperature=seat_temp,
+                max_tokens=round2_tokens,
+            )
+        except Exception as exc:  # noqa: BLE001 — return the partial council
+            refused = (
+                isinstance(exc, _SeatReplyError) and exc.policy_refusal
+            )
+            outcome = {
+                "seat": persona,
+                "round": 2,
+                "status": "refused" if refused else "failed",
+                "outcome_kind": (
+                    "policy_refusal"
+                    if refused
+                    else "validation_error"
+                    if isinstance(exc, _SeatReplyError)
+                    else "internal_error"
+                ),
+                "executed": False,
+                "error": str(exc),
+            }
+            record["seat_outcomes"].append(outcome)
+            diagnostic = dict(outcome)
+            if isinstance(exc, _SeatReplyError):
+                diagnostic["raw_reply"] = exc.raw_reply
+            record["diagnostics"].setdefault("seat_errors", []).append(diagnostic)
+            record["positions"] = final_positions
+            record["dissents"] = final_dissents
+            _LOG.exception(
+                "Council %s seat %s failed in round 2", record["id"], persona)
+            return _incomplete_council(record, ledger, actor)
+
         final_positions.append(pos)
+        record["seat_outcomes"].append({
+            "seat": persona,
+            "round": 2,
+            "status": "executed",
+            "outcome_kind": "ok",
+            "executed": True,
+            "position": pos,
+        })
         if dissent is not None:
             final_dissents.append(dissent)
 
@@ -1033,19 +1191,41 @@ def council_convene(
     record["dissents"] = final_dissents
 
     # ── Chair synthesis ───────────────────────────────────────────────────────
-    # Chair uses the first provider (or single provider).
-    synthesis = _synthesize(final_positions, final_dissents, topic, provider_pool[0])
+    try:
+        synthesis = _synthesize(
+            final_positions,
+            final_dissents,
+            topic,
+            provider_pool[0],
+            max_tokens=round2_tokens,
+        )
+    except Exception as exc:  # noqa: BLE001 — invalid/refused chair is incomplete
+        refused = isinstance(exc, _ChairReplyError) and exc.policy_refusal
+        diagnostic = {
+            "status": "refused" if refused else "failed",
+            "outcome_kind": (
+                "policy_refusal"
+                if refused
+                else "validation_error"
+                if isinstance(exc, _ChairReplyError)
+                else "internal_error"
+            ),
+            "executed": False,
+            "error": str(exc),
+        }
+        if isinstance(exc, _ChairReplyError):
+            diagnostic["raw_reply"] = exc.raw_reply
+        record["diagnostics"]["chair"] = diagnostic
+        _LOG.exception("Council %s chair synthesis failed", record["id"])
+        return _incomplete_council(record, ledger, actor)
+
     record["synthesis"] = synthesis
+    record["status"] = "complete"
+    record["complete"] = True
 
     # ── Ledger writes ─────────────────────────────────────────────────────────
+    _persist_council_record(record, ledger, actor)
     if ledger is not None:
-        # Full council record as artifact
-        ledger.append(actor, "artifact", {
-            "id": record["id"],
-            "kind": "council",
-            "council": record,
-        })
-        # Synthesis as decision (with rejected_alternatives)
         ledger.append(actor, "decision", {
             "id": f"dec_{record['id']}",
             "stage": "build_plan",
@@ -1057,9 +1237,8 @@ def council_convene(
             "council_id": record["id"],
         })
 
-    # ── Register dissents ─────────────────────────────────────────────────────
     if registry is not None:
-        for d in final_dissents:
-            registry.register(record["id"], d)
+        for dissent in final_dissents:
+            registry.register(record["id"], dissent)
 
     return record

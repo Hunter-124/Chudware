@@ -43,10 +43,12 @@ scripted gym turns use ``kind == "tool_call"`` directly. The classifier normalis
 BOTH shapes (``_tool_call_events``) so real-run evidence is visible to the detectors.
 
 A single run can exhibit several classes; ``classify_ledger`` returns all that fire.
-The classifier is deterministic and side-effect free.
+The classifier is deterministic. Terminal infrastructure outcomes also invalidate a
+provisional graded pass so a real cell cannot report success after harness failure.
 """
 from __future__ import annotations
 
+import json
 import re
 from dataclasses import dataclass, field
 from enum import Enum
@@ -62,9 +64,20 @@ class FailureClass(str, Enum):
     GRIND = "grind"
     ADVISORY_IGNORED = "advisory_ignored"
     EXECUTION_STALL = "execution_stall"
+    # Harness outcomes share the classification envelope so reports retain their
+    # evidence, but are intentionally not part of the eight model-failure classes.
+    POLICY_REFUSAL = "policy_refusal"
+    GUARD_BLOCK = "guard_block"
+    HARNESS_FAULT = "harness_fault"
 
 
-TAXONOMY: tuple[str, ...] = tuple(fc.value for fc in FailureClass)
+_OUTCOME_CLASSES = frozenset({
+    FailureClass.POLICY_REFUSAL, FailureClass.GUARD_BLOCK,
+    FailureClass.HARNESS_FAULT,
+})
+TAXONOMY: tuple[str, ...] = tuple(
+    fc.value for fc in FailureClass if fc not in _OUTCOME_CLASSES
+)
 
 
 @dataclass
@@ -119,16 +132,95 @@ def _tool_call_events(events: Iterable[dict]) -> list[tuple[dict, dict]]:
             out.append((e, p))
     return out
 
+# Keep this vocabulary identical to services.agent.agent_turn.TOOL_OUTCOME_KINDS
+# without importing that dispatch-heavy module into the offline gym classifier.
+TOOL_OUTCOME_KINDS = frozenset({
+    "ok", "policy_refusal", "guard_block", "validation_error",
+    "timeout_unknown", "internal_error", "tool_error",
+})
+_POLICY_REFUSAL_STATUSES = frozenset({
+    "call_cap_reached", "loop_guard_refused", "tool_disabled",
+    "tool_not_allowed",
+})
+_GUARD_BLOCK_STATUSES = frozenset({"guardrail_blocked", "guard_block"})
+_TERMINAL_INFRASTRUCTURE_STATUSES = frozenset({
+    "reply_truncated", "guardrail_internal_error",
+})
+
+
+def _result_dict(value: Any) -> dict:
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str):
+        try:
+            decoded = json.loads(value)
+        except (TypeError, ValueError):
+            return {}
+        if isinstance(decoded, dict):
+            return decoded
+    return {}
+
+
+def normalize_tool_outcome(p: dict) -> tuple[str, bool]:
+    """Return the agent-turn outcome vocabulary's ``(kind, executed)`` pair.
+
+    New ledgers carry both fields directly. Older and scripted ledgers are
+    normalised from their result payload/status so every taxonomy detector uses
+    the same decision and no detector has to parse error prose independently.
+    """
+    result = _result_dict(p.get("result"))
+    explicit_kind = p.get("outcome_kind")
+    status = str(p.get("status") or result.get("status") or "")
+    explicit_executed = p.get("executed")
+    if not isinstance(explicit_executed, bool):
+        explicit_executed = result.get("executed")
+    if not isinstance(explicit_executed, bool):
+        explicit_executed = None
+
+    if explicit_kind in TOOL_OUTCOME_KINDS:
+        if explicit_executed is None:
+            explicit_executed = explicit_kind not in {
+                "policy_refusal", "guard_block", "validation_error",
+            }
+        return str(explicit_kind), explicit_executed
+    if (p.get("policy_refusal") or result.get("policy_refusal")
+            or status in _POLICY_REFUSAL_STATUSES):
+        return "policy_refusal", False
+    if status in _GUARD_BLOCK_STATUSES:
+        return "guard_block", False
+    if status in _TERMINAL_INFRASTRUCTURE_STATUSES:
+        return "internal_error", False
+    if p.get("timed_out") or result.get("timed_out"):
+        return "timeout_unknown", True if explicit_executed is None else explicit_executed
+    if p.get("internal_error") or result.get("internal_error"):
+        return "internal_error", True if explicit_executed is None else explicit_executed
+    if p.get("preflight") == "reject":
+        return "validation_error", False
+    if p.get("ok") is False or p.get("error"):
+        return "tool_error", True if explicit_executed is None else explicit_executed
+    return "ok", True if explicit_executed is None else explicit_executed
+
+
+def _is_refusal_outcome(p: dict) -> bool:
+    return normalize_tool_outcome(p)[0] in {"policy_refusal", "guard_block"}
+
+
+def _terminal_infrastructure_status(p: dict) -> str | None:
+    values = (p.get("status"), p.get("stop_reason"), p.get("reason"))
+    for value in values:
+        if value in _TERMINAL_INFRASTRUCTURE_STATUSES:
+            return str(value)
+    event = str(p.get("event") or "")
+    if event == "reply_truncated_fatal":
+        return "reply_truncated"
+    if event.endswith("guardrail_internal_error"):
+        return "guardrail_internal_error"
+    return None
+
 
 def _call_succeeded(p: dict) -> bool:
-    """A call payload counts as successful unless it carries an explicit failure
-    signal (``ok: false`` or an ``error``). Scripted turns without an ok field are
-    successful by construction."""
-    if p.get("ok") is False:
-        return False
-    if p.get("error"):
-        return False
-    return True
+    """True only for the shared outcome taxonomy's explicit success kind."""
+    return normalize_tool_outcome(p)[0] == "ok"
 
 
 # Ref-id patterns the pipeline uses: DL1 / AC2 / DIM7 / doc ids / feature ids.
@@ -231,30 +323,33 @@ def _amb_keyword(text: str) -> str:
 
 
 def _detect_execution_stall(events: list[dict], graded: dict) -> list[Classification]:
-    """Fire when the run had tool activity but not ONE call succeeded (T-W32).
-
-    A pre-BUILD stall: the model tried to execute (or turned without executing)
-    and nothing ever ran — resolution failures, rejected kwargs, provider errors.
-    Only fires on a non-passing run (a graded PASS with odd events is not a stall).
-    """
+    """Fire when executable tool attempts were made but none succeeded (T-W32)."""
     if graded.get("passed"):
+        return []
+    if any(_terminal_infrastructure_status(e.get("payload") or {})
+           for e in events):
         return []
     calls = _tool_call_events(events)
     turns = [e for e in events if e.get("kind") == "agent_turn"]
     if calls:
-        if any(_call_succeeded(p) for _, p in calls):
+        attempted = [
+            (e, p) for e, p in calls
+            if normalize_tool_outcome(p)[0] not in {
+                "policy_refusal", "guard_block", "internal_error",
+                "timeout_unknown",
+            }
+        ]
+        if not attempted or any(_call_succeeded(p) for _, p in attempted):
             return []
-        failed_calls = [(e, p) for e, p in calls if not _call_succeeded(p)]
-        seqs = [e.get("seq") for e, _ in failed_calls]
+        seqs = [e.get("seq") for e, _ in attempted]
         ev = [_ev_ref(e, f"tool {p.get('tool','?')} failed: "
                           f"{str(p.get('error') or p.get('result'))[:60]}")
-              for e, p in failed_calls[:8]]
+              for e, p in attempted[:8]]
         return [Classification(
             FailureClass.EXECUTION_STALL.value,
-            f"all {len(failed_calls)} tool calls failed — nothing ever executed "
-            "(pre-BUILD stall)", seqs, ev)]
+            f"all {len(attempted)} executable tool calls failed — nothing ran "
+            "successfully (pre-BUILD stall)", seqs, ev)]
     if turns:
-        # agent turns happened but the model never emitted a single tool call.
         seqs = [e.get("seq") for e in turns[:8]]
         ev = [_ev_ref(turns[0], "agent turns produced no tool call at all")]
         return [Classification(
@@ -295,6 +390,9 @@ def _detect_tool_misuse(events: list[dict], manifest: dict | None) -> list[Class
                     ac_tool[ac["id"]] = t
 
     for e, p in _tool_call_events(events):
+        outcome_kind, _executed = normalize_tool_outcome(p)
+        if outcome_kind not in {"validation_error", "tool_error", "ok"}:
+            continue
         # (a) preflight rejected the call / the tool ran and errored.  A pure
         # RESOLUTION failure ("could not be resolved") is a dispatch-coverage gap
         # (harness), not model misuse — it feeds execution_stall instead (T-W32).
@@ -423,7 +521,12 @@ def _detect_grind(events: list[dict], grind_threshold: int = 3) -> list[Classifi
     # T-W32: tool calls are read through the normaliser so real agent-turn calls
     # (kind=agent_turn, payload.event=tool_call) count toward grind too.
     seen: dict[tuple, list[dict]] = {}
-    pairs = _tool_call_events(events) + [
+    pairs = [
+        (e, p) for e, p in _tool_call_events(events)
+        if normalize_tool_outcome(p)[0] not in {
+            "policy_refusal", "guard_block", "internal_error", "timeout_unknown",
+        }
+    ] + [
         (e, e.get("payload") or {}) for e in _by_kind(events, "decision")]
     pairs.sort(key=lambda ep: ep[0].get("seq", 0))
     for e, p in pairs:
@@ -520,6 +623,47 @@ def _stable(obj: Any) -> str:
 # Public entry
 # ---------------------------------------------------------------------------
 
+def _detect_harness_outcomes(events: list[dict], graded: dict) -> list[Classification]:
+    """Preserve policy and infrastructure outcomes without calling them failures."""
+    out: list[Classification] = []
+    for e, p in _tool_call_events(events):
+        kind, executed = normalize_tool_outcome(p)
+        if kind == "policy_refusal":
+            failure_class = FailureClass.POLICY_REFUSAL
+        elif kind == "guard_block":
+            failure_class = FailureClass.GUARD_BLOCK
+        elif kind in {"internal_error", "timeout_unknown"}:
+            failure_class = FailureClass.HARNESS_FAULT
+        else:
+            continue
+        status = str(p.get("status") or _result_dict(p.get("result")).get("status")
+                     or kind)
+        out.append(Classification(
+            failure_class.value,
+            f"{status}: outcome={kind}, executed={str(executed).lower()}",
+            [e.get("seq")], [_ev_ref(e, f"tool outcome {kind}; executed={executed}")],
+        ))
+
+    terminal_statuses: list[str] = []
+    for e in events:
+        status = _terminal_infrastructure_status(e.get("payload") or {})
+        if status is None:
+            continue
+        terminal_statuses.append(status)
+        out.append(Classification(
+            FailureClass.HARNESS_FAULT.value,
+            f"terminal infrastructure outcome: {status}",
+            [e.get("seq")], [_ev_ref(e, f"terminal infrastructure outcome {status}")],
+        ))
+    if terminal_statuses:
+        # run_cell reads this same grading object after classification. A provider
+        # truncation or harness-internal guardrail fault is never a passing cell,
+        # even when independent AC grading happened to observe acceptable geometry.
+        graded["passed"] = False
+        graded["infrastructure_outcomes"] = list(dict.fromkeys(terminal_statuses))
+    return out
+
+
 def classify_ledger(ledger: dict[str, Any], *, manifest: dict | None = None,
                     graded: dict | None = None,
                     grind_threshold: int = 3) -> list[Classification]:
@@ -542,6 +686,7 @@ def classify_ledger(ledger: dict[str, Any], *, manifest: dict | None = None,
         manifest = (anchor.get("payload") if anchor else None)
 
     results: list[Classification] = []
+    results += _detect_harness_outcomes(events, graded)
     results += _detect_wrong_question(events, manifest, graded)
     # T-W32 (foreman-sanctioned): a pre-BUILD stall (no successful execution at
     # all) is execution_stall, and SUPPRESSES incoherent_geometry — with nothing
@@ -596,6 +741,8 @@ def misuse_fingerprints(ledger: dict | None = None, *,
         events = _events(ledger or {})
     counts: Counter = Counter()
     for _e, p in _tool_call_events(events):
+        if _is_refusal_outcome(p):
+            continue
         if _call_succeeded(p):
             continue
         tool = str(p.get("tool") or "?")

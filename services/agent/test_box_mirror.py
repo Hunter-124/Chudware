@@ -8,7 +8,11 @@ monkeypatch pattern test_effort.py uses.
 from __future__ import annotations
 
 import json
+import socket
+import threading
 import time
+import urllib.parse
+import urllib.request
 
 import pytest
 
@@ -243,6 +247,51 @@ def test_auth_failure_keeps_spool_and_notes_error(env):
     assert "auth_failed" in st["project"]["last_error"]
 
 
+def test_corrupt_spool_entry_is_quarantined_and_reported(env):
+    _fake, _project, tmp = env
+    _write_config(tmp, _enabled_cfg())
+    spool = box_mirror._spool_dir()
+    corrupt = spool / "broken.json"
+    payload = b'{"project": '
+    corrupt.write_bytes(payload)
+
+    out = box_mirror.drain(block=True)
+
+    assert out["ok"] is False
+    assert any("broken.json" in error and "spool_corrupt" in error
+               for error in out["errors"])
+    assert not corrupt.exists()
+    quarantined = list((spool / "quarantine").glob("broken*.json"))
+    assert len(quarantined) == 1
+    assert quarantined[0].read_bytes() == payload
+
+
+def test_async_drain_failure_is_visible_in_status(env, monkeypatch):
+    _fake, project, tmp = env
+    _write_config(tmp, _enabled_cfg())
+    assert box_mirror.enqueue_project(str(project))
+    called = threading.Event()
+
+    def _fail(*_args):
+        called.set()
+        raise RuntimeError("mirror exploded")
+
+    monkeypatch.setattr(box_mirror, "_mirror_project", _fail)
+    started = box_mirror.drain(block=False)
+    assert started["ok"] is True and started["started"] is True
+    assert called.wait(1)
+    deadline = time.monotonic() + 1
+    while time.monotonic() < deadline:
+        drain_status = box_mirror.status()["drain"]
+        if not drain_status["running"]:
+            break
+        time.sleep(0.01)
+    assert drain_status["running"] is False
+    assert drain_status["last_result"]["ok"] is False
+    assert any("mirror exploded" in error
+               for error in drain_status["last_result"]["errors"])
+
+
 def test_disabled_sync_refuses_with_reason(env):
     _fake, project, tmp = env
     _write_config(tmp, {"enabled": False})
@@ -278,6 +327,42 @@ def test_oauth_without_grant_reports_not_connected(env):
         box_mirror._access_token()
     assert ei.value.reason == "not_connected"
 
+
+
+def test_oauth_exchange_failure_is_visible_in_status(env, monkeypatch):
+    _fake, _project, tmp = env
+    _write_config(tmp, {"enabled": True, "auth": {
+        "method": "oauth", "client_id": "cid", "client_secret": "sec"}})
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+    redirect_uri = f"http://127.0.0.1:{port}/box"
+    monkeypatch.setattr(box_mirror, "OAUTH_REDIRECT_PORT", port)
+    monkeypatch.setattr(box_mirror, "OAUTH_REDIRECT_URI", redirect_uri)
+
+    def _fail_exchange(_code):
+        raise RuntimeError("exchange exploded")
+
+    monkeypatch.setattr(box_mirror, "_exchange_code", _fail_exchange)
+    begun = box_mirror.oauth_begin(timeout_s=1)
+    assert begun["ok"] is True
+    state = urllib.parse.parse_qs(
+        urllib.parse.urlparse(begun["authorize_url"]).query)["state"][0]
+    with urllib.request.urlopen(
+            f"{redirect_uri}?state={urllib.parse.quote(state)}&code=abc",
+            timeout=1) as response:
+        assert response.status == 200
+
+    deadline = time.monotonic() + 1
+    while time.monotonic() < deadline:
+        oauth = box_mirror.status()["oauth"]
+        if not oauth["running"]:
+            break
+        time.sleep(0.01)
+    assert oauth["running"] is False
+    assert oauth["last_result"]["ok"] is False
+    assert oauth["last_result"]["reason"] == "oauth_exchange_failed"
+    assert "exchange exploded" in oauth["last_result"]["hint"]
 
 # --------------------------------------------------------------------------- status / registry
 

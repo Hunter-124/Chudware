@@ -192,6 +192,9 @@ private:
     std::map<std::string, nlohmann::json, std::less<>> attention_;
 };
 
-ManufacturingLane& lane();
+// Lazily constructs the process-wide lane. Returns nullptr if construction
+// failed (e.g. the manufacturing journal already has a writer); the failure
+// reason is copied into *init_error when provided. Never throws.
+ManufacturingLane* tryLane(std::string* init_error = nullptr);
 
 }  // namespace chudware::mfg

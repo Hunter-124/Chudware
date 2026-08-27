@@ -15,8 +15,10 @@ re-running the same bench must produce the same hash (else the dataset drifted).
 from __future__ import annotations
 
 import argparse
+import importlib
 import json
 import os
+import shutil
 import sys
 import tempfile
 from typing import Optional
@@ -51,18 +53,39 @@ def register(driver: BenchDriver) -> None:
     REGISTRY[driver.bench_id] = driver
 
 
-# Self-wiring: each bench module exposes a module-level `DRIVER = BenchDriver(...)`. Import
-# them tolerantly so the runner works whether or not every bench has landed yet (and so a
-# broken bench module never takes down the others).
+# Library imports remain tolerant, but every failure is retained as structured data.
+# CLI runs call this in strict mode so a broken module can never shrink a green suite.
 _BENCH_MODULES = ("elicitation", "spec_sketch", "cam", "vlm", "advisor_e2e")
-for _name in _BENCH_MODULES:
-    try:
-        _mod = __import__(f"tools.flywheel.bench.benches.{_name}", fromlist=["DRIVER"])
-        _drv = getattr(_mod, "DRIVER", None)
-        if isinstance(_drv, BenchDriver):
-            REGISTRY[_drv.bench_id] = _drv
-    except Exception:
-        pass  # not landed yet / import error — surfaced when that bench is run explicitly
+DISCOVERY_ERRORS: list[dict[str, str]] = []
+
+
+def discover_benches(*, strict: bool = False) -> list[dict[str, str]]:
+    errors: list[dict[str, str]] = []
+    for name in _BENCH_MODULES:
+        module_name = f"tools.flywheel.bench.benches.{name}"
+        try:
+            mod = importlib.import_module(module_name)
+            drv = getattr(mod, "DRIVER", None)
+            if not isinstance(drv, BenchDriver):
+                raise TypeError("missing valid DRIVER export")
+            REGISTRY[drv.bench_id] = drv
+        except Exception as exc:
+            errors.append({
+                "module": module_name,
+                "error_type": type(exc).__name__,
+                "error": str(exc),
+            })
+    DISCOVERY_ERRORS[:] = errors
+    if strict and errors:
+        details = "; ".join(
+            f"{item['module']}: {item['error_type']}: {item['error']}"
+            for item in errors
+        )
+        raise ImportError(f"bench discovery failed: {details}")
+    return list(errors)
+
+
+discover_benches()
 
 
 def run_bench(bench_id: str, *, smoke: bool = False,
@@ -73,15 +96,16 @@ def run_bench(bench_id: str, *, smoke: bool = False,
     workdir = workdir or tempfile.mkdtemp(prefix=f"bench_{bench_id}_")
     try:
         result = REGISTRY[bench_id].run(smoke, workdir)
+        if write:
+            out_dir = os.path.join(BENCHES_DIR, bench_id, "results")
+            os.makedirs(out_dir, exist_ok=True)
+            name = "smoke_result.json" if smoke else "latest.json"
+            with open(os.path.join(out_dir, name), "w", encoding="utf-8") as f:
+                f.write(result.to_json())
+        return result
     finally:
-        pass
-    if write:
-        out_dir = os.path.join(BENCHES_DIR, bench_id, "results")
-        os.makedirs(out_dir, exist_ok=True)
-        name = "smoke_result.json" if smoke else "latest.json"
-        with open(os.path.join(out_dir, name), "w", encoding="utf-8") as f:
-            f.write(result.to_json())
-    return result
+        if own_tmp:
+            shutil.rmtree(workdir)
 
 
 def _summary_line(r: BenchResult) -> str:
@@ -101,6 +125,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     ap.add_argument("--all", action="store_true", help="run every registered bench")
     ap.add_argument("--no-write", action="store_true", help="do not write report files")
     args = ap.parse_args(argv)
+    discover_benches(strict=True)
 
     ids = list(REGISTRY) if (args.all or not args.benches) else args.benches
     rc = 0

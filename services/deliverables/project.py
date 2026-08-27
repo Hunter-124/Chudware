@@ -2,9 +2,9 @@
 
 Two roots, deliberately separate (2026-07-27):
 
-* ``project_dir()`` — the USER's project folder ($CHUDWARE_PROJECT_DIR). This is
-  their Documents tree. Only things the user asked for and would recognise as
-  their own work belong here: the parts the agent creates or edits.
+* ``project_dir()`` — the USER's resolved project folder
+  (``$CHUDWARE_PROJECT_DIR``). This is their Documents tree. Only things the
+  user asked for and would recognise as their own work belong here.
 * ``artifacts_dir()`` — a HIDDEN per-project store under the app's data root.
   Everything a ``make_*`` generates — rendered pages, previews, the artifact
   registry, extraction by-products — lands here instead.
@@ -24,6 +24,8 @@ import hashlib
 import os
 from pathlib import Path
 
+from .errors import DeliverableError
+
 try:  # services.paths gives the app's %APPDATA%/Chudware root; degrade for a bare checkout.
     from services import paths as _paths
 
@@ -38,18 +40,23 @@ _REGISTRY = "registry.json"
 
 def project_dir() -> Path:
     env = os.environ.get("CHUDWARE_PROJECT_DIR")
-    root = Path(env) if env else (_APP_ROOT / "project")
+    if not env or not env.strip():
+        raise DeliverableError(
+            "project_root_unavailable",
+            "CHUDWARE_PROJECT_DIR is not set; attach or open a project first",
+        )
+    root = Path(env).expanduser().resolve()
     root.mkdir(parents=True, exist_ok=True)
     return root
 
 
-def _project_slug() -> str:
+def _project_slug(root: Path | None = None) -> str:
     """Stable, collision-free folder name for the active project.
 
     Basename keeps the directory browsable by a human; the path digest keeps two
     same-named projects apart.
     """
-    root = project_dir()
+    root = root or project_dir()
     digest = hashlib.sha1(str(root.resolve()).encode("utf-8", "replace")).hexdigest()[:10]
     safe = "".join(c if (c.isalnum() or c in "-_") else "_" for c in root.name) or "project"
     return f"{safe}-{digest}"
@@ -57,8 +64,9 @@ def _project_slug() -> str:
 
 def artifacts_dir() -> Path:
     """Hidden per-project artifact store — NOT inside the user's project folder."""
+    root = project_dir()
     env = os.environ.get("CHUDWARE_ARTIFACTS_DIR")
-    d = Path(env) if env else (_APP_ROOT / "projects" / _project_slug() / _ARTIFACTS)
+    d = Path(env) if env else (_APP_ROOT / "projects" / _project_slug(root) / _ARTIFACTS)
     d.mkdir(parents=True, exist_ok=True)
     return d
 

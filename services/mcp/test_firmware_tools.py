@@ -112,7 +112,9 @@ def test_authoring_loop_puts_real_source_where_the_build_compiles_it(tools):
     assert next(w for w in written["written"] if w["path"] == "src/main.c")["abs_path"] == main_abs
     with open(main_abs, encoding="utf-8") as fh:
         assert fh.read() == MAIN_C
-    # ...and through the tool an agent would use, which is NOT jailed for reads.
+    # ...and through the tool an agent would use — reads are jailed in general
+    # (3aaee658), but a REGISTERED firmware project root is the one read carve-out:
+    # fw_sources' contract is "write through fw_sources, read it back with fs_read".
     got = _call(tools, "fs_read", path=main_abs, raw=True)
     assert got["ok"] and "CHUDWARE_AUTHORED_MARKER" in got["text"]
     assert "blink_once" in got["text"]

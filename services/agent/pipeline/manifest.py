@@ -12,8 +12,8 @@ Rules enforced (contract §16, verbatim):
   * a ``check.tool == "manual"`` criterion must be paired with a ``needs_confirm``
     assumption OR an ``ask_user`` question (the manual-kind pairing rule);
   * ``modification`` deliverables must resolve ``target_refs`` against an existing
-    doc (a ``doc_resolver`` callback supplies the resolution; unresolved →
-    blocking);
+    doc; an authoritative ``False`` is not-found, while resolver exceptions are
+    surfaced separately as harness-resolution failures;
   * no dependency cycles among deliverables (``depends_on`` edges);
   * ``depends_on`` references resolve to real deliverable ids.
 
@@ -22,10 +22,10 @@ Bounce-once-then-escalate: the intake_analyst's ``escalation_policy`` is
 bounces so the pipeline bounces the manifest back to the role ONCE, then escalates
 to the user instead of grinding.
 
-Findings carry a ``level`` (``"error"`` blocks the phase exit; ``"blocking"`` means
-a blocking ambiguity that routes to CLARIFY, not a structural error) so the caller
-can distinguish "the manifest is malformed" from "the manifest is fine but needs a
-user answer before Phase 2".
+Findings carry a ``level``: ``"error"`` is malformed user/model data,
+``"blocking"`` routes a well-formed ambiguity to CLARIFY, ``"harness_error"``
+means validation infrastructure was unavailable, and ``"hint"`` is advisory.
+Harness errors block progress but are never charged as a manifest bounce.
 """
 from __future__ import annotations
 
@@ -69,10 +69,10 @@ class ManifestFinding:
     """One validation finding.
 
     ``level``:
-      * ``"error"``    — the manifest is structurally invalid (blocks phase exit);
-      * ``"blocking"`` — a blocking ambiguity: the manifest is well-formed but a
-        user answer is required before Phase 2 (routes to CLARIFY, not a bounce);
-      * ``"hint"``     — advisory (e.g. an unrecognised check tool), never blocks.
+      * ``"error"``         — structurally invalid manifest (bounce);
+      * ``"blocking"``      — user input is required before Phase 2;
+      * ``"harness_error"`` — validator infrastructure failed (never a bounce);
+      * ``"hint"``          — advisory, never blocks.
     """
     level: str
     rule: str
@@ -300,16 +300,47 @@ def _validate_modification_target(
     if doc_resolver is not None:
         try:
             resolved = doc_resolver(target_refs)
-        except Exception:  # noqa: BLE001 — resolver failure is treated as unresolved
-            resolved = False
-        if not resolved:
+        except Exception as exc:  # noqa: BLE001 — distinguish harness from not-found
+            findings.append(ManifestFinding(
+                "harness_error",
+                "modification_target_resolution",
+                f"modification deliverable {did!r} target resolver unavailable: "
+                f"{_bounded_error(exc)}",
+                refs={
+                    "id": did,
+                    "target_refs": target_refs,
+                    "outcome_kind": "internal_error",
+                    "executed": False,
+                },
+            ))
+            return
+        if resolved is False:
             findings.append(ManifestFinding(
                 "error", "modification_target",
                 f"modification deliverable {did!r} names doc "
                 f"{target_refs.get('doc_id')!r} but it does not resolve to an "
                 "existing doc", refs={"id": did, "target_refs": target_refs}))
+        elif resolved is not True:
+            findings.append(ManifestFinding(
+                "harness_error",
+                "modification_target_resolution",
+                f"modification deliverable {did!r} target resolver returned "
+                f"non-boolean result {type(resolved).__name__}",
+                refs={
+                    "id": did,
+                    "target_refs": target_refs,
+                    "outcome_kind": "internal_error",
+                    "executed": False,
+                },
+            ))
 
 
+
+
+def _bounded_error(exc: Exception, limit: int = 240) -> str:
+    detail = " ".join(str(exc).split())
+    rendered = f"{type(exc).__name__}: {detail}" if detail else type(exc).__name__
+    return rendered[:limit]
 def manifest_template() -> dict[str, Any]:
     """A minimal manifest that passes :func:`validate_manifest` cleanly.
 
@@ -530,18 +561,18 @@ def _has_ask_user(manifest: dict[str, Any]) -> bool:
 # ---------------------------------------------------------------------------
 
 def manifest_valid(findings: Iterable[ManifestFinding]) -> bool:
-    """True when no ``error``-level finding is present (blocking/hint are allowed —
-    they do not make the manifest malformed, they route it)."""
-    return not any(f.level == "error" for f in findings)
+    """True when neither malformed-data nor harness-error findings are present."""
+    return not any(f.level in {"error", "harness_error"} for f in findings)
 
 
 def blocking_ambiguities(findings: Iterable[ManifestFinding]) -> list[ManifestFinding]:
-    """The ``blocking``-level findings — these route the mission to CLARIFY (Phase 1)."""
+    """The ``blocking``-level findings — these route the mission to CLARIFY."""
     return [f for f in findings if f.level == "blocking"]
 
 
 def errors(findings: Iterable[ManifestFinding]) -> list[ManifestFinding]:
-    return [f for f in findings if f.level == "error"]
+    """Findings that block INTAKE; callers bounce only the ``error`` subset."""
+    return [f for f in findings if f.level in {"error", "harness_error"}]
 
 
 # ---------------------------------------------------------------------------
@@ -550,24 +581,22 @@ def errors(findings: Iterable[ManifestFinding]) -> list[ManifestFinding]:
 
 @dataclass
 class BounceTracker:
-    """Enforces the intake_analyst escalation_policy ``{max_attempts: 2,
-    on_exhaust: ask_user}``.
+    """Track manifest-data bounces without charging harness failures.
 
-    The manifest may be bounced back to the role ONCE on a validator failure; a
-    second failure escalates to the user rather than grinding a third attempt.
-    ``attempts`` counts validation attempts (starts at 0; ``record_bounce`` after
-    each failed validation).
+    ``record_bounce(findings)`` returns ``"harness_error"`` and preserves the
+    attempt count when validation infrastructure was unavailable.
     """
     max_attempts: int = 2
     attempts: int = 0
 
-    def record_bounce(self) -> str:
-        """Register one failed validation attempt and return the next action:
-
-          * ``"retry"``    — bounce the manifest back to the role for a fix;
-          * ``"escalate"`` — the budget is exhausted; escalate to the user
-            (``on_exhaust: ask_user``).
-        """
+    def record_bounce(
+        self,
+        findings: Iterable[ManifestFinding] | None = None,
+    ) -> str:
+        if findings is not None and any(
+            finding.level == "harness_error" for finding in findings
+        ):
+            return "harness_error"
         self.attempts += 1
         if self.attempts >= self.max_attempts:
             return "escalate"

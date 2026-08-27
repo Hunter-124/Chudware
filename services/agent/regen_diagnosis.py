@@ -23,12 +23,16 @@ MockProvider it is fully unit-testable without credentials or the C++ core.
 from __future__ import annotations
 
 import json
+import logging
 import os
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Optional
 
 from .providers.base import Provider, text_part, user
+
+_LOG = logging.getLogger(__name__)
 
 # Selector kinds the doc schema accepts (kept in lockstep with the regen_fix bench detector).
 VALID_SELECTOR_KINDS = ("face", "edge", "vertex", "body", "datum", "region", "plane")
@@ -494,8 +498,8 @@ def _maybe_convene_fix_council(
 ) -> Optional[dict]:
     """Convene a fix-stage council when the policy is enabled for this tier.
 
-    Returns the aicad.council/1 record, or None when policy is disabled/skipped.
-    Council errors are caught so they never break the diagnosis pipeline.
+    Returns None only when policy disables the council. Once execution starts,
+    failures return an explicit incomplete record and are logged with traceback.
     """
     try:
         from .councils import council_convene, resolve_policy
@@ -524,5 +528,55 @@ def _maybe_convene_fix_council(
             stage="fix",
             tier=tier,
         )
-    except Exception:  # council must never break the diagnosis pipeline
-        return None
+    except Exception as exc:  # noqa: BLE001 — diagnosis survives, failure stays visible
+        _LOG.exception("Fix-stage council failed after execution began")
+        partial = getattr(exc, "council_record", None)
+        if not isinstance(partial, dict):
+            partial = {
+                "schema": "aicad.council/1",
+                "id": f"cn_{uuid.uuid4().hex[:10]}",
+                "kind": "failure_review",
+                "topic": "Error diagnosis review",
+                "inputs": {
+                    "diagnosis": diagnosis_text[:800],
+                    "fix_ops": fix_ops[:5],
+                    "failures": failures[:3],
+                },
+                "seats": [],
+                "rounds": 2,
+                "positions": [],
+                "synthesis": {
+                    "decision": "",
+                    "rationale": "",
+                    "rejected_alternatives": [],
+                },
+                "dissents": [],
+                "chair": "department_manager",
+                "seat_outcomes": [],
+                "diagnostics": {},
+            }
+        partial["status"] = "incomplete"
+        partial["complete"] = False
+        partial.setdefault("seat_outcomes", [])
+        partial.setdefault("diagnostics", {})["council_exception"] = {
+            "status": "failed",
+            "outcome_kind": "internal_error",
+            "executed": False,
+            "error": str(exc),
+        }
+        if ledger is not None:
+            try:
+                ledger.append("council", "artifact", {
+                    "id": partial["id"],
+                    "kind": "council",
+                    "council": partial,
+                })
+            except Exception as persist_exc:  # noqa: BLE001 — keep diagnosis alive
+                _LOG.exception("Could not persist incomplete fix-stage council")
+                partial["diagnostics"]["persistence_error"] = {
+                    "status": "failed",
+                    "outcome_kind": "internal_error",
+                    "executed": False,
+                    "error": str(persist_exc),
+                }
+        return partial

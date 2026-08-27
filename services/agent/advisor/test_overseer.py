@@ -484,6 +484,95 @@ def test_inapp_audit_now_end_to_end(tmp_path):
     assert out["audit"]["verdicts"][0]["class"] == "wrong_order"
     assert out["advisory"]["items"][0]["source"]["kind"] == "llm"
     json.dumps(out)
+def test_audit_now_distinguishes_policy_credential_and_unprovisioned(
+    tmp_path, monkeypatch
+):
+    from services.agent import config
+    from services.agent.advisor import overseer_tools as ot
+
+    ledger_path = tmp_path / "provider-outcomes.ledger.json"
+
+    def offline_provider(**kwargs):
+        raise config.OfflineModeError("local_only refuses cloud overseer")
+
+    monkeypatch.setattr(config, "get_provider", offline_provider)
+    offline = ot.audit_now("run-offline", ledger_path=ledger_path)
+    assert offline["ok"] is False
+    assert offline["executed"] is False
+    assert offline["policy_refusal"] is True
+    assert offline["status"] == "offline_policy"
+
+    def missing_credential(**kwargs):
+        raise ValueError("openrouter provider requires an API key")
+
+    monkeypatch.setattr(config, "get_provider", missing_credential)
+    missing = ot.audit_now("run-missing", ledger_path=ledger_path)
+    assert missing["ok"] is False
+    assert missing["executed"] is False
+    assert missing["policy_refusal"] is False
+    assert missing["status"] == "credential_unavailable"
+
+    unprovisioned = ot.audit_now(
+        "run-none", providers={}, ledger_path=ledger_path
+    )
+    assert unprovisioned["ok"] is False
+    assert unprovisioned["executed"] is False
+    assert unprovisioned["policy_refusal"] is False
+    assert unprovisioned["status"] == "unprovisioned"
+    assert unprovisioned["skipped"]
+
+    def bad_config(**kwargs):
+        raise TypeError("provider constructor received invalid config")
+
+    monkeypatch.setattr(config, "get_provider", bad_config)
+    bad = ot.audit_now("run-bad-config", ledger_path=ledger_path)
+    assert bad["ok"] is False
+    assert bad["executed"] is False
+    assert bad["policy_refusal"] is False
+    assert bad["outcome_kind"] == "internal_error"
+    assert bad["status"] == "provider_error"
+
+
+def test_default_overseer_provider_effort_is_clamped_on_copy(monkeypatch):
+
+    from services.agent import config
+    from services.agent.advisor import overseer_tools as ot
+
+    class Provider:
+        name = "mock"
+        reasoning_effort = "max"
+
+    provider = Provider()
+    monkeypatch.setattr(config, "get_provider", lambda **kwargs: provider)
+
+    resolution = ot._default_providers()
+
+    assert resolution.providers["mock"].reasoning_effort == "high"
+    assert provider.reasoning_effort == "max"
+
+
+def test_overseer_dispatch_clamps_effort_on_copy():
+    class Provider:
+        name = "mock"
+        reasoning_effort = "max"
+
+        def __init__(self):
+            self.seen = []
+
+        def complete(self, system, messages, max_tokens=None):
+            self.seen.append(self.reasoning_effort)
+            return _ok_audit()
+
+    provider = Provider()
+    result = Overseer(
+        provider=provider, role_card={"system_prompt": "audit."}
+    ).audit("manual", _scope())
+
+    assert not result.error
+    assert provider.seen == ["high"]
+    assert provider.reasoning_effort == "max"
+
+
 
 
 # ---------------------------------------------------------------------------

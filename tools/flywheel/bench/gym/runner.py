@@ -17,8 +17,9 @@ per seed, on the configured tier(s), and:
      (challenge.grade — independent of the pipeline verdict),
   5. CLASSIFIES failures by taxonomy over the ledger, evidence-ref'd.
 
-Every run writes a replayable run dir under ``reports/runs/<cycle>/<challenge>_<tier>_<seed>/``
-containing ledger.json, graded.json, classifications.json, and mission.json.
+Every run writes a replayable run dir under ``reports/runs/<cycle>/<portable-cell>/``
+containing exact ``cell.json`` identity plus ledger.json, graded.json,
+classifications.json, and mission.json.
 """
 from __future__ import annotations
 
@@ -60,9 +61,10 @@ class ExecProbe:
 
     @property
     def can_run_real(self) -> bool:
-        # A genuine model-in-the-loop cycle needs a tool-executing agent, a model, AND
-        # the DAG deps in-process (execute_dag=True imports services.dag.executor).
-        return self.real_agent_fn and self.dag_deps and (self.frontier_key or self.local_model)
+        # A genuine CAD/model-in-the-loop cycle needs the engine, a tool-executing
+        # agent, the DAG deps in-process, and at least one provisioned model path.
+        return (self.core_available and self.real_agent_fn and self.dag_deps
+                and (self.frontier_key or self.local_model))
 
     @property
     def mode(self) -> str:
@@ -74,6 +76,79 @@ class ExecProbe:
                 "dag_deps": self.dag_deps, "mode": self.mode}
 
 
+class InfrastructureUnavailable(RuntimeError):
+    """A requested REAL gym matrix cannot be executed on this machine."""
+
+    status = "infrastructure_unavailable"
+
+    def __init__(self, reasons: list[str]):
+        self.reasons = list(reasons)
+        super().__init__("; ".join(self.reasons))
+
+
+class UnknownChallengeError(ValueError):
+    """The requested challenge set contains ids absent from the registry."""
+
+    status = "unknown_challenge"
+
+    def __init__(self, challenge_ids: list[str]):
+        self.challenge_ids = list(challenge_ids)
+        super().__init__(", ".join(self.challenge_ids))
+
+
+def _frontier_credentials_present() -> bool:
+    """Resolve cloud credential capability through the production config seams.
+
+    ``config.get_provider`` sees persisted config credentials and OMP-backed
+    subscription providers; parameterized tier resolution additionally covers xAI
+    OAuth/API-key and OpenRouter's scoped-key precedence. Environment-only classic
+    keys remain a final compatibility source for providers whose adapters delegate
+    environment lookup to their SDK.
+    """
+    try:
+        from services.agent import config
+        from services.agent.tiers import provider_for_tier
+
+        cfg = config.load_config()
+        keys = cfg.get("keys") if isinstance(cfg.get("keys"), dict) else {}
+        nested_keys = [
+            section.get("api_key")
+            for section in cfg.values()
+            if isinstance(section, dict)
+        ]
+        if cfg.get("api_key") or any(keys.values()) or any(nested_keys):
+            return True
+        for tier in ("openrouter:openai/gpt-4.1", "xai:grok-4-5"):
+            try:
+                provider = provider_for_tier(tier, cfg=cfg)
+            except Exception:
+                continue
+            if not str(getattr(provider, "name", "")).startswith("mock"):
+                return True
+
+        configured_name = str(
+            os.environ.get("CHUDWARE_PROVIDER") or cfg.get("provider") or ""
+        ).strip().lower()
+        if configured_name and configured_name not in {
+            "mock", "llamacpp", "llama.cpp", "llama-cpp", "vllm",
+        }:
+            try:
+                provider = config.get_provider(cfg=cfg)
+                name = str(getattr(provider, "name", ""))
+                if (name and not name.startswith("mock")
+                        and not config.provider_offline_safe(provider)):
+                    return True
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    return any(os.environ.get(key) for key in (
+        "ANTHROPIC_API_KEY", "OPENAI_API_KEY", "OPENROUTER_API_KEY",
+        "GEMINI_API_KEY", "GOOGLE_API_KEY", "XAI_API_KEY", "MOONSHOT_API_KEY",
+    ))
+
+
 def execution_probe() -> ExecProbe:
     """Probe the environment for real-execution capability — NO side effects.
 
@@ -83,11 +158,7 @@ def execution_probe() -> ExecProbe:
     resolvable ``.so`` path only — never by importing core_bridge and calling
     ``available()`` (which dlopen's the library)."""
     core = _core_so_present()
-
-    frontier = any(os.environ.get(k) for k in
-                   ("ANTHROPIC_API_KEY", "OPENAI_API_KEY", "OPENROUTER_API_KEY",
-                    "GEMINI_API_KEY"))
-
+    frontier = _frontier_credentials_present()
     local = _local_model_present()
 
     # A "real" tool-executing agent_fn is the node_runner's default path being a
@@ -199,20 +270,16 @@ def _real_agent_fn_present() -> bool:
 
 
 def _core_so_present() -> bool:
-    """Is a libchudware .so resolvable WITHOUT loading it? Checks the same env knobs
-    core_bridge honours ($CHUDWARE_LIBCHUDWARE / $CHUDWARE_DIST) plus the conventional build
-    output path — pure filesystem inspection, no dlopen, no import side effect."""
-    direct = os.environ.get("CHUDWARE_LIBCHUDWARE")
-    if direct and Path(direct).exists():
-        return True
-    dist = os.environ.get("CHUDWARE_DIST")
-    if dist and (Path(dist) / "libchudware.so").exists():
-        return True
-    for p in (_repo_root() / "core" / "build-linux" / "bin" / "libchudware.so",
-              _repo_root() / "core" / "build" / "bin" / "libchudware.so"):
-        if p.exists():
-            return True
-    return False
+    """True when the production core-library resolver finds an existing library.
+
+    This stays a pure filesystem probe: importing ``core_bridge`` defines its
+    resolver but does not call ``_resolve_lib``/``ctypes.CDLL``.
+    """
+    try:
+        from services.mcp import core_bridge
+        return any(path.exists() for path in core_bridge._lib_candidates())
+    except Exception:
+        return False
 
 
 def _local_model_present() -> bool:
@@ -401,13 +468,18 @@ class CellResult:
     division: str = "local"           # "local" | "open" (WI-1)
     # tools offered after division filter (LOCAL strips vision)
     tools_offered: list[str] = field(default_factory=list)
+    cycle: str = ""
+    model: str = ""
+    run_id: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "challenge": self.challenge, "tier": self.tier, "seed": self.seed,
             "division": self.division,
+            "cycle": self.cycle, "model": self.model, "run_id": self.run_id,
             "mode": self.mode, "passed": self.passed, "graded": self.graded,
-            "classifications": [c.to_dict() for c in self.classifications],
+            "classifications": [c.to_dict() if hasattr(c, "to_dict") else dict(c)
+                                for c in self.classifications],
             "mission_status": self.mission_status, "mission_phase": self.mission_phase,
             "run_dir": self.run_dir,
             "tools_offered": list(self.tools_offered),
@@ -426,12 +498,10 @@ def run_cell(challenge: Challenge, tier: str, seed: int, *, cycle: str,
     *division* is ``"local"`` or ``"open"`` (WI-1). Vision-eyes challenges refuse
     LOCAL. LOCAL cells strip vision tools from the offered tools surface.
 
-    *real* (T-W30): when True AND the probe reports a real-runnable environment,
-    drive the FULL pipeline with execute_dag=True, the node_runner's real
-    tool-executing agent_fn, and a resolved local/frontier provider — the mission
-    genuinely executes tool calls and the reviewer genuinely runs the acceptance
-    checks (no scripted ledger replay).  Otherwise the cell runs in MOCK mode: the
-    real phase machine to PLAN + scripted ledger turns as the gradeable signal.
+    *real* is explicit execution intent. ``False`` always produces a MOCK cell,
+    regardless of machine capability. ``True`` is accepted only after ``run_cycle``
+    preflights the complete matrix; direct callers must likewise supply a capable
+    probe, otherwise the cell refuses before creating a run directory.
     """
     from services.agent.ledger import Ledger
 
@@ -442,7 +512,11 @@ def run_cell(challenge: Challenge, tier: str, seed: int, *, cycle: str,
             f"(allowed={challenge.divisions})"
         )
 
-    real_mode = bool(real and probe.can_run_real)
+    if real:
+        reasons = _real_unavailable_reasons(probe, [tier])
+        if reasons:
+            raise InfrastructureUnavailable(reasons)
+    real_mode = bool(real)
     run_id = f"gym_{challenge.id}_{division}_{tier}_s{seed}"
     base = runs_dir if runs_dir is not None else (REPORTS_DIR / "runs")
     # Keep legacy dir shape when division is default-local for backward paths;
@@ -534,7 +608,10 @@ def run_cell(challenge: Challenge, tier: str, seed: int, *, cycle: str,
         mission_phase=(mission or {}).get("phase", "n/a"),
         run_dir=str(run_dir),
         division=division,
-        tools_offered=tools_offered)
+        tools_offered=tools_offered,
+        cycle=cycle,
+        model=_model_for_tier(tier),
+        run_id=run_id)
 
     # Persist the replayable artifacts.
     (run_dir / "graded.json").write_text(json.dumps(graded, indent=2), encoding="utf-8")
@@ -542,6 +619,8 @@ def run_cell(challenge: Challenge, tier: str, seed: int, *, cycle: str,
         json.dumps([c.to_dict() for c in classifications], indent=2), encoding="utf-8")
     (run_dir / "mission.json").write_text(json.dumps(mission or {}, indent=2, default=str),
                                           encoding="utf-8")
+    (run_dir / "cell.json").write_text(
+        json.dumps(cell.to_dict(), indent=2), encoding="utf-8")
     return cell
 
 
@@ -911,6 +990,47 @@ def _default_divisions_for_tier(tier: str) -> list[str]:
     return ["local", "open"]
 
 
+def _model_for_tier(tier: str) -> str:
+    """Exact model identity persisted with a cell; never reconstructed from paths."""
+    from services.agent.tiers import (
+        LOCAL_TIER_MODELS, load_local_models, parse_openrouter_tier, parse_xai_tier,
+    )
+
+    parameterized = parse_openrouter_tier(tier) or parse_xai_tier(tier)
+    if parameterized:
+        return parameterized
+    ollama = _parse_ollama_tier(tier)
+    if ollama:
+        return ollama
+    if tier.startswith("local"):
+        try:
+            return LOCAL_TIER_MODELS.get(tier) or load_local_models().get("fanout") or tier
+        except Exception:
+            return LOCAL_TIER_MODELS.get(tier) or tier
+    return tier
+
+
+def _real_unavailable_reasons(probe: ExecProbe, tiers: list[str]) -> list[str]:
+    """Explain every missing prerequisite for the requested REAL tier set."""
+    reasons: list[str] = []
+    if not probe.core_available:
+        reasons.append("core library unavailable")
+    if not probe.real_agent_fn:
+        reasons.append("tool-executing agent unavailable")
+    if not probe.dag_deps:
+        reasons.append("DAG dependencies unavailable")
+
+    local_tiers = [tier for tier in tiers if _default_divisions_for_tier(tier) == ["local"]]
+    cloud_tiers = [tier for tier in tiers if tier not in local_tiers]
+    if local_tiers and not probe.local_model:
+        reasons.append("local model unavailable for: " + ", ".join(local_tiers))
+    if cloud_tiers and not probe.frontier_key:
+        reasons.append("provider credentials unavailable for: " + ", ".join(cloud_tiers))
+    if not reasons and not probe.can_run_real:
+        reasons.append("real execution unavailable")
+    return reasons
+
+
 def run_cycle(cycle: str = "cycle-1", *, tiers: list[str] | None = None,
               challenge_ids: list[str] | None = None,
               grind_threshold: int = 3,
@@ -926,14 +1046,23 @@ def run_cycle(cycle: str = "cycle-1", *, tiers: list[str] | None = None,
     local tiers → local; frontier/openrouter → open). Calibration challenges that
     list both divisions still only run the divisions present in this list.
 
-    *real* (T-W30): request REAL execution (honoured per-cell only when the probe
-    reports a real-runnable environment)."""
+    *real* is an all-or-nothing request. The complete tier set is preflighted before
+    any cell directory is created; unavailable infrastructure raises
+    ``InfrastructureUnavailable`` rather than substituting scripted MOCK cells."""
     probe = execution_probe()
     tiers = tiers or ["local-24k", "frontier-200k"]
     challenges = load_challenges()
     if challenge_ids:
-        challenges = [c for c in challenges if c.id in set(challenge_ids)]
-
+        requested = {str(challenge_id).strip() for challenge_id in challenge_ids}
+        known = {challenge.id for challenge in challenges}
+        unknown = sorted(requested - known)
+        if unknown:
+            raise UnknownChallengeError(unknown)
+        challenges = [challenge for challenge in challenges if challenge.id in requested]
+    if real:
+        reasons = _real_unavailable_reasons(probe, tiers)
+        if reasons:
+            raise InfrastructureUnavailable(reasons)
     result = CycleResult(cycle=cycle, tiers=tiers, probe=probe)
     for ch in challenges:
         ch_divs = set(getattr(ch, "divisions", ("local", "open")) or ("local", "open"))

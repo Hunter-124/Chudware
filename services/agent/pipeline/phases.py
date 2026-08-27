@@ -1,34 +1,26 @@
-"""phases.py — the 8-phase mission state machine + exit gates (doc §1).
+"""phases.py — mission phase components and deterministic exit gates (doc §1).
 
-The mission machine is a linear phase sequence with two feature-flagged additions
-(the 1.3 org layer):
+This module provides the state machine and gate implementations for the intended
+mission sequence:
 
     INTAKE → [CLARIFY] → SPECIFY
-             → [DECOMPOSE → GEOMETRY → LINKAGE → BUILDPATH]   (T-DP1, flagged OFF)
+             → [DECOMPOSE → GEOMETRY → LINKAGE → BUILDPATH]
              → [ORGANIZE] → PLAN → BUILD → VERIFY → [CORRECT ↺] → DELIVER
 
-Each phase has an EXIT GATE: a named deterministic check that must pass before the
-mission advances.  A gate never calls a model — it inspects durable state (the
-manifest, the ledger, the build graphs, per-node foreman verdicts, criterion
-results).  Phase entry/exit are recorded as ledger ``stage`` events, so mission
-status (what the GUI and mission control render) is a pure read of the ledger.
+The components are ready for a mission runtime to supply durable context and
+record transitions.  They are not yet wired into the production ``mission_start``
+or DAG mission-template path: that runtime currently compiles and executes the
+graph directly.  Until that product integration lands, these gates are reusable
+pipeline components rather than a claim that live missions are phase-enforced.
 
-Gate → named check (doc §1):
-  * INTAKE   — manifest valid (contract §16 validator);
-  * CLARIFY  — no blocking ambiguity remains open;
-  * SPECIFY  — spec audited + every criterion covered by a verification plan;
-  * ORGANIZE — departments instantiated (feature-flagged: T-W22/T-W23);
-  * PLAN     — build graphs valid + (council synthesis recorded, feature-flagged)
-               + overseer ratified;
-  * BUILD    — every node's exit gate passed OR carries a failure card / replan;
-  * VERIFY   — all criteria PASS or waived-by-name;
-  * CORRECT  — no open failure cards (loops with BUILD/VERIFY);
-  * DELIVER  — mission report emitted, ledger closed.
+Each phase has a deterministic EXIT GATE.  A gate never calls a model; it inspects
+the manifest, ledger evidence, build graphs, node verdicts, and criterion results.
+When a caller supplies a ledger, successful phase entry/exit is recorded as
+``stage`` events before the in-memory transition is committed.
 
-Feature flags (``PipelineFlags``) gate the 1.3 org additions.  ORGANIZE and the
-PLAN-phase build-strategy council are OFF by default because T-W22 (org runtime)
-and T-W23 (councils) are NOT merged; when they land, flip the flags on and the
-machine inserts/enforces those phases without any structural change here.
+Feature flags (``PipelineFlags``) control the optional organization and design
+pipeline stages.  Disabled stages are omitted when transition adjacency is
+checked.
 """
 from __future__ import annotations
 
@@ -107,6 +99,21 @@ class GateResult:
     gate: str
     reasons: list[str] = field(default_factory=list)
     overseer: bool = False
+    outcome_kind: str = "ok"
+    executed: bool = True
+
+
+@dataclass
+class TransitionResult:
+    """Structured result of persisting a phase transition."""
+
+    ok: bool
+    action: str
+    phase: Phase
+    status: str
+    outcome_kind: str
+    executed: bool
+    error: str = ""
 
 
 @dataclass
@@ -153,16 +160,16 @@ GateCheck = Callable[["PhaseMachine", dict[str, Any]], GateResult]
 
 
 class PhaseMachine:
-    """Drives one mission through the phase sequence, logging each transition to the
-    ledger and enforcing exit gates.
+    """Deterministic mission phase state machine and exit-gate dispatcher.
 
-    The machine is deterministic and headless: it never calls a model.  The caller
-    (``run_mission`` / the DAG mission template) supplies *context* — the durable
-    artifacts a gate inspects — and the machine decides whether the phase may exit
-    and which phase is next.
+    No production mission front door currently instantiates this class.  A future
+    runtime integration can supply durable gate context and use the transition
+    contract here; today callers and tests may use it directly.
 
-    ``ledger`` is optional so the machine is unit-testable without a live ledger;
-    when present, every ``enter``/``exit`` writes a ``stage`` event (``log_stage``).
+    ``ledger`` is optional for isolated use.  When present, transition persistence
+    is mandatory: a failed ``log_stage`` returns a structured ``internal_error``
+    result and leaves ``current``, ``history``, and the successful-exit token
+    unchanged.
     """
 
     def __init__(
@@ -186,28 +193,54 @@ class PhaseMachine:
                     pass
         self.current: Optional[Phase] = None
         self.history: list[Phase] = []
+        self._exited_phase: Optional[Phase] = None
 
     # ------------------------------------------------------------------ transitions
 
-    def enter(self, phase: Phase) -> None:
-        """Enter *phase*, recording a ledger stage-entry event.
+    def enter(self, phase: Phase) -> TransitionResult:
+        """Persist and enter *phase*.
 
-        Enforces the legal-order rule: a phase may only be entered from its
-        predecessor in the (skip-adjusted) sequence, or re-entered from a later
-        phase during a CORRECT loop (BUILD/VERIFY re-entry).
+        The first entry establishes a starting phase.  Every subsequent entry
+        requires a successful exit token for ``current`` and must be exactly
+        adjacent in the feature-flag-adjusted sequence (including the two
+        conditional CLARIFY/CORRECT choices).
         """
-        if self.current is not None and not self._legal_transition(self.current, phase):
-            raise PhaseError(
-                f"illegal transition {self.current.value} → {phase.value}: "
-                "the exit gate for the current phase must pass and the target must "
-                "be the next phase (or a CORRECT-loop re-entry)")
-        self.current = phase
-        self.history.append(phase)
+        if self.current is not None:
+            if self._exited_phase is not self.current:
+                raise PhaseError(
+                    f"cannot enter {phase.value} from {self.current.value}: "
+                    "the current phase has not exited through a successful gate")
+            if not self._legal_transition(self.current, phase):
+                raise PhaseError(
+                    f"illegal transition {self.current.value} → {phase.value}: "
+                    "the target must be the next skip-adjusted phase "
+                    "(or a CORRECT-loop re-entry)")
+
         if self.ledger is not None:
             try:
                 self.ledger.log_stage(self.actor, phase.value)
-            except Exception:  # noqa: BLE001 — ledger is best-effort, never blocks
-                pass
+            except Exception as exc:  # noqa: BLE001 — persistence is load-bearing
+                return TransitionResult(
+                    ok=False,
+                    action="enter",
+                    phase=phase,
+                    status="ledger_persistence_failed",
+                    outcome_kind="internal_error",
+                    executed=False,
+                    error=_bounded_error(exc),
+                )
+
+        self.current = phase
+        self.history.append(phase)
+        self._exited_phase = None
+        return TransitionResult(
+            ok=True,
+            action="enter",
+            phase=phase,
+            status="entered",
+            outcome_kind="ok",
+            executed=True,
+        )
 
     def exit(
         self,
@@ -215,25 +248,40 @@ class PhaseMachine:
         gate: GateResult,
         *,
         item_artifacts: dict[str, str] | None = None,
-    ) -> None:
-        """Record a successful exit and its design-history checkpoint.
-
-        ``item_artifacts`` maps PLM item ids to the buildgraph work unit that
-        produced each part, preserving per-part attribution for assembly runs.
-        """
+    ) -> TransitionResult:
+        """Persist a successful exit and issue the gate-passed transition token."""
+        if self.current is not phase:
+            current = self.current.value if self.current is not None else "none"
+            raise PhaseError(
+                f"cannot exit {phase.value}: current phase is {current}")
         if not gate.passed:
             raise PhaseError(
                 f"phase {phase.value} exit gate {gate.gate!r} failed: "
                 f"{'; '.join(gate.reasons)}")
+
         stage_logged = False
         if self.ledger is not None:
             try:
-                from services.agent.ledger import _now  # local import, best-effort
-                self.ledger.log_stage(self.actor, phase.value,
-                                      exited=_now(), exit_gate=gate.gate)
+                from services.agent.ledger import _now
+                self.ledger.log_stage(
+                    self.actor,
+                    phase.value,
+                    exited=_now(),
+                    exit_gate=gate.gate,
+                )
                 stage_logged = True
-            except Exception:  # noqa: BLE001
-                pass
+            except Exception as exc:  # noqa: BLE001 — persistence is load-bearing
+                return TransitionResult(
+                    ok=False,
+                    action="exit",
+                    phase=phase,
+                    status="ledger_persistence_failed",
+                    outcome_kind="internal_error",
+                    executed=False,
+                    error=_bounded_error(exc),
+                )
+
+        self._exited_phase = phase
         if (
             stage_logged
             and self.flags.design_pipeline
@@ -249,6 +297,15 @@ class PhaseMachine:
                 )
             except Exception:  # noqa: BLE001 — History never blocks mission progress
                 pass
+
+        return TransitionResult(
+            ok=True,
+            action="exit",
+            phase=phase,
+            status="exited",
+            outcome_kind="ok",
+            executed=True,
+        )
 
     def next_phase(self, phase: Phase, context: dict[str, Any]) -> Optional[Phase]:
         """The phase that follows *phase*, applying the skip rules:
@@ -278,18 +335,33 @@ class PhaseMachine:
         return None
 
     def _legal_transition(self, frm: Phase, to: Phase) -> bool:
-        """True if ``frm → to`` is legal.  Forward-by-one (skip-adjusted) is legal;
-        a CORRECT loop may re-enter BUILD or VERIFY from CORRECT."""
-        # CORRECT loops back into BUILD/VERIFY (doc §1: "re-enter here").
-        if frm is Phase.CORRECT and to in (Phase.BUILD, Phase.VERIFY):
+        """True when *to* is an exact skip-adjusted successor of *frm*."""
+        if frm is Phase.CORRECT:
+            # CORRECT may loop to repair/reverify, or finish after cards clear.
+            return to in (Phase.BUILD, Phase.VERIFY, Phase.DELIVER)
+
+        active = [
+            phase for phase in PHASE_ORDER
+            if not (
+                (phase in _DESIGN_PIPELINE_PHASES and not self.flags.design_pipeline)
+                or (phase is Phase.ORGANIZE and not self.flags.org_layer)
+            )
+        ]
+        if frm not in active:
+            return False
+        idx = active.index(frm)
+        immediate = active[idx + 1] if idx + 1 < len(active) else None
+        if to is immediate:
             return True
-        # VERIFY may route to CORRECT when criteria fail.
-        if frm is Phase.VERIFY and to is Phase.CORRECT:
-            return True
-        # Otherwise the target must be a forward phase (never backward except the
-        # explicit CORRECT loop above).  We do not recompute skips here (the caller
-        # drives next_phase); any forward phase is accepted.
-        return PHASE_ORDER.index(to) > PHASE_ORDER.index(frm)
+
+        # These two phases are selected from runtime context, which ``enter`` does
+        # not own.  Accept exactly the adjacent skip alternative, never a farther
+        # forward jump.
+        if frm is Phase.INTAKE and immediate is Phase.CLARIFY:
+            return to is Phase.SPECIFY
+        if frm is Phase.VERIFY and immediate is Phase.CORRECT:
+            return to is Phase.DELIVER
+        return False
 
     # ------------------------------------------------------------------ exit gates
 
@@ -530,37 +602,61 @@ def _gate_build(m: PhaseMachine, ctx: dict[str, Any]) -> GateResult:
 
 
 def _gate_verify(m: PhaseMachine, ctx: dict[str, Any]) -> GateResult:
-    """All acceptance criteria PASS/SKIP, or the failing ones are waived-by-name.
+    """Require a concrete PASS, SKIP, or named waiver for every expected AC id."""
+    expected_raw = ctx.get("expected_ac_ids")
+    if not isinstance(expected_raw, (list, tuple, set)) or not expected_raw:
+        return GateResult(
+            False,
+            "criteria_pass_or_waived",
+            ["expected acceptance-criterion ids missing from VERIFY gate context"],
+            outcome_kind="internal_error",
+        )
+    expected = [ac for ac in expected_raw if isinstance(ac, str) and ac.strip()]
+    if len(expected) != len(expected_raw):
+        return GateResult(
+            False,
+            "criteria_pass_or_waived",
+            ["expected_ac_ids must contain only non-empty strings"],
+            outcome_kind="internal_error",
+        )
 
-    ``criterion_results`` is ``{ac_id: "PASS"|"FAIL"|"SKIP"|...}``; ``waived`` is the
-    set of ac_ids the user waived via ask_user.  A FAIL/NOT-CHECKED that is not
-    waived blocks VERIFY (routes to CORRECT via ``next_phase`` because it populates
-    open_failure_cards). mega-11: honest SKIP (provision-absence) is gate-ok.
-
-    WI-11: missing verify_battery is FAIL not silent when the mission context
-    indicates geometry was built (``geometry_built`` / ``mutating_tools_ran`` /
-    ``require_battery``) and no battery evidence/waiver is present.
-    """
-    results = ctx.get("criterion_results") or {}
+    results = ctx.get("criterion_results")
+    if not isinstance(results, dict):
+        return GateResult(
+            False,
+            "criteria_pass_or_waived",
+            ["criterion_results missing or not an object"],
+            outcome_kind="internal_error",
+        )
     waived = set(ctx.get("waived_criteria") or [])
-    ok = {"PASS", "SKIP"}
-    failing = [ac for ac, res in results.items()
-               if res not in ok and ac not in waived]
-    if failing:
-        return GateResult(False, "criteria_pass_or_waived",
-                          [f"acceptance criteria failed and not waived: {failing}"])
+    accepted = {"PASS", "SKIP"}
+    unresolved = [
+        ac for ac in expected
+        if ac not in waived and results.get(ac) not in accepted
+    ]
+    if unresolved:
+        return GateResult(
+            False,
+            "criteria_pass_or_waived",
+            [f"acceptance criteria lack PASS/SKIP/waiver evidence: {unresolved}"],
+        )
 
-    # HARD floor: battery-before-done (WI-11). ImportError-safe.
     try:
-        from services.agent import guardrails as _gr  # noqa: PLC0415
+        from services.agent import guardrails as _gr
         if _gr.battery_missing_for_mission(ctx):
             return GateResult(
-                False, "criteria_pass_or_waived",
+                False,
+                "criteria_pass_or_waived",
                 ["verify_battery missing (run battery or waive with reason) — "
                  "HARD guardrail WI-11"],
             )
-    except Exception:  # noqa: BLE001
-        pass
+    except Exception as exc:  # noqa: BLE001 — guard evaluation is load-bearing
+        return GateResult(
+            False,
+            "criteria_pass_or_waived",
+            [f"battery guard evaluation unavailable: {_bounded_error(exc)}"],
+            outcome_kind="internal_error",
+        )
 
     return GateResult(True, "criteria_pass_or_waived")
 
@@ -576,12 +672,22 @@ def _gate_correct(m: PhaseMachine, ctx: dict[str, Any]) -> GateResult:
 
 
 def _gate_deliver(m: PhaseMachine, ctx: dict[str, Any]) -> GateResult:
-    """Mission report emitted + ledger closed (the terminal gate)."""
+    """Require both mission-report evidence and a durably closed ledger."""
     reasons: list[str] = []
     if not ctx.get("mission_report_emitted"):
         reasons.append("mission report not emitted")
+    if not ctx.get("ledger_closed"):
+        reasons.append("ledger closure not recorded")
     return GateResult(not reasons, "mission_report_ledger_closed", reasons)
 
+
+
+
+def _bounded_error(exc: Exception, limit: int = 240) -> str:
+    """Bound an exception diagnostic while retaining its harness-relevant type."""
+    detail = " ".join(str(exc).split())
+    rendered = f"{type(exc).__name__}: {detail}" if detail else type(exc).__name__
+    return rendered[:limit]
 
 _GATES: dict[Phase, GateCheck] = {
     Phase.INTAKE: _gate_intake,

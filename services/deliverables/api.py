@@ -37,6 +37,17 @@ def _unique_path(path: Path) -> Path:
     return path.with_name(f"{stem}-{Path(path).name}{suffix}")
 
 
+def _fault_envelope(exc: Exception, operation: str, *,
+                    runtime_reason: str, io_reason: str, fallback_reason: str) -> dict:
+    if isinstance(exc, ImportError):
+        reason = runtime_reason
+    elif isinstance(exc, OSError):
+        reason = io_reason
+    else:
+        reason = fallback_reason
+    return fail(reason, f"{operation} failed: {type(exc).__name__}: {exc}")
+
+
 def _make(spec, expected_kind: str, default_format: str, allowed: tuple, toolname: str) -> dict:
     try:
         if not isinstance(spec, dict):
@@ -60,8 +71,14 @@ def _make(spec, expected_kind: str, default_format: str, allowed: tuple, toolnam
         adir = project.artifacts_dir()
         out_abs = _unique_path(adir / f"{_slugify(resolved.get('title') or expected_kind)}.{fmt}")
 
-        # Build the artifact (validation already passed — no hole can reach the file).
+        # A builder returning normally is not success unless it produced a real artifact.
         template.build(resolved, fmt, out_abs)
+        if (not out_abs.exists() or out_abs.is_symlink() or not out_abs.is_file()
+                or out_abs.stat().st_size == 0):
+            raise DeliverableError(
+                "artifact_write_failed",
+                f"{toolname} did not produce a non-empty regular file",
+            )
 
         # Persist the verbatim spec for reproducibility (§3 spec_ref).
         spec_abs = adir / f"{artifact_id}.spec.json"
@@ -74,7 +91,13 @@ def _make(spec, expected_kind: str, default_format: str, allowed: tuple, toolnam
     except DeliverableError as e:
         return e.envelope()
     except Exception as e:  # noqa: BLE001 - engine faults must still be contract-shaped
-        return fail("invalid_spec", f"{toolname} failed: {type(e).__name__}: {e}")
+        return _fault_envelope(
+            e,
+            toolname,
+            runtime_reason="runtime_unavailable",
+            io_reason="artifact_write_failed",
+            fallback_reason="render_failed",
+        )
 
 
 def make_presentation(spec) -> dict:
@@ -141,10 +164,27 @@ def render_document(path) -> dict:
     except DeliverableError as e:
         return e.envelope()
     except Exception as e:  # noqa: BLE001
-        return fail("artifact_not_found", f"render failed: {type(e).__name__}: {e}")
+        return _fault_envelope(
+            e,
+            "render",
+            runtime_reason="converter_missing",
+            io_reason="render_failed",
+            fallback_reason="render_failed",
+        )
 
 
 def list_artifacts(run_id=None) -> dict:
-    """Read the artifact registry (§5.5), newest-first; optional ``run_id`` filter. Never errors."""
-    records = registry.read_records(run_id)
-    return {"ok": True, "count": len(records), "artifacts": records}
+    """Read the artifact registry (§5.5), newest-first; optional ``run_id`` filter."""
+    try:
+        records = registry.read_records(run_id)
+        return {"ok": True, "count": len(records), "artifacts": records}
+    except DeliverableError as e:
+        return e.envelope()
+    except Exception as e:  # noqa: BLE001
+        return _fault_envelope(
+            e,
+            "registry read",
+            runtime_reason="registry_unavailable",
+            io_reason="registry_unavailable",
+            fallback_reason="internal_error",
+        )

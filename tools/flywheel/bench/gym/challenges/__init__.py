@@ -99,8 +99,7 @@ class Challenge:
         return {"challenge": self.id, "criteria": crit, "passed": passed}
 
 
-# Pre-register C9–C15 module names; import-guarded so missing modules skip cleanly
-# until the challenge agents land them (WI-13).
+# Every suite member is required. Discovery failures are harness failures, not skips.
 _CHALLENGE_MODULES = (
     "c1_flanged_bushing", "c2_clamshell_enclosure",
     "c3_bearing_block", "c4_two_part_hinge",
@@ -119,21 +118,26 @@ def _apply_legacy_defaults(ch: Challenge) -> Challenge:
     return ch
 
 
-def load_challenges(*, strict: bool = False) -> list[Challenge]:
-    """Load every landed challenge module. When *strict*, a missing/broken module
-    raises; otherwise it is skipped (mirrors the bench runner's tolerant self-wiring)
-    so a partial suite still runs during development."""
+def load_challenges(*, strict: bool = True) -> list[Challenge]:
+    """Load the complete challenge suite, failing with the broken module named."""
+    if not strict:
+        raise ValueError("tolerant challenge discovery is unsupported")
     out: list[Challenge] = []
     for name in _CHALLENGE_MODULES:
+        module_name = f"{__name__}.{name}"
         try:
-            mod = importlib.import_module(f"{__name__}.{name}")
-        except Exception:
-            if strict:
-                raise
-            continue
+            mod = importlib.import_module(module_name)
+        except Exception as exc:
+            raise ImportError(
+                f"failed to import challenge module {module_name}: "
+                f"{type(exc).__name__}: {exc}"
+            ) from exc
         ch = getattr(mod, "CHALLENGE", None)
-        if isinstance(ch, Challenge):
-            out.append(_apply_legacy_defaults(ch))
+        if not isinstance(ch, Challenge):
+            raise TypeError(
+                f"challenge module {module_name} has no valid CHALLENGE export"
+            )
+        out.append(_apply_legacy_defaults(ch))
     return out
 
 

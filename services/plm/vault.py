@@ -1057,17 +1057,51 @@ class Vault:
         files: dict[str, bytes] = {}
         head = self._bind.head_commit()
         head_tree = self._bind.read_tree(head) if head else {}
-        for path in self._project_containers():
-            raw = path.read_bytes()
+        try:
+            container_paths = {
+                path.relative_to(self.project_dir).as_posix(): path
+                for path in self._project_containers()
+            }
+        except OSError as exc:
+            raise VaultError(
+                "snapshot_failed",
+                f"could not scan tracked project items: {exc}",
+            ) from exc
+        # Discovery is best-effort for new files, but manifest-owned containers
+        # are read by their exact path so permission/stat failures cannot make
+        # them disappear from a replacement tree.
+        for tracked_item in m["items"]:
+            rel = tracked_item.get("path", "")
+            dt = tracked_item.get("doc_type")
+            if (rel and (not dt or dt in doctypes.CONTAINER_DOC_TYPES)
+                    and any(rel.endswith(s) for s in _CONTAINER_SUFFIXES)):
+                container_paths.setdefault(rel, self.project_dir / rel)
+
+        for rel, path in sorted(container_paths.items()):
+            item = manifest.find_item_by_path(m, rel)
+            try:
+                raw = path.read_bytes()
+            except FileNotFoundError:
+                continue  # an actually missing tracked path is an intentional deletion
+            except OSError as exc:
+                if item is None:
+                    continue  # first discovery of unregistered junk remains best-effort
+                raise VaultError(
+                    "snapshot_failed",
+                    f"could not read tracked item {rel}: {exc}",
+                ) from exc
             try:
                 exploded = snapshot.explode_container(raw)
-            except (ValueError, Exception):
-                continue  # not a valid container — skip (graceful degradation)
-            import json as _json
-            doc = _json.loads(exploded.document_json.decode("utf-8"))
+                import json as _json
+                doc = _json.loads(exploded.document_json.decode("utf-8"))
+            except Exception as exc:
+                if item is None:
+                    continue  # first discovery of an invalid container is harmless
+                raise VaultError(
+                    "corrupt_item",
+                    f"tracked item {rel} is unreadable or corrupt",
+                ) from exc
             doc_uuid = doc.get("id", "")
-            rel = path.relative_to(self.project_dir).as_posix()
-            item = manifest.find_item_by_path(m, rel)
             schema_kind = _kind_from_schema(doc.get("schema", ""))
             if item is None:
                 suffix = next((s for s in _CONTAINER_SUFFIXES if rel.endswith(s)), "")
@@ -1110,8 +1144,15 @@ class Vault:
                 continue  # container item (handled above) or legacy CAD item
             iid = it["item_id"]
             injected = inject.get(iid)
-            content = (injected if injected is not None
-                       else generic_snapshot.content_paths(it, self.project_dir, head_tree))
+            try:
+                content = (injected if injected is not None
+                           else generic_snapshot.content_paths(
+                               it, self.project_dir, head_tree))
+            except OSError as exc:
+                raise VaultError(
+                    "snapshot_failed",
+                    f"could not read tracked item {it['path']}: {exc}",
+                ) from exc
             old_content = generic_snapshot.head_content(iid, head_tree)
             if enforce_released_lock and old_content and content != old_content:
                 try:
@@ -1245,8 +1286,18 @@ class Vault:
             live_ids.add(iid)
             stamp = self._working_stamp(it)
             if stamp is None:
-                # container path missing — not dirty (matches prior skip behavior)
-                item_cache.pop(iid, None)
+                path = self.project_dir / it["path"]
+                try:
+                    path.stat()
+                except FileNotFoundError:
+                    # An actually missing path is an intentional deletion.
+                    item_cache.pop(iid, None)
+                    continue
+                except OSError:
+                    pass
+                # Existing-but-unreadable and wrong-kind paths are not clean.
+                item_cache[iid] = {"stamp": ("unreadable",), "dirty": True}
+                dirty.append(iid)
                 continue
 
             prev = item_cache.get(iid)
@@ -1267,13 +1318,15 @@ class Vault:
                 try:
                     exploded = snapshot.explode_container(path.read_bytes())
                 except Exception:
-                    item_cache.pop(iid, None)
-                    continue
-                # Path-direct HEAD blob — avoid flattening hundreds of item trees
-                # just to compare document.json on cold overview.
-                head_doc = self._bind.read_blob_at(
-                    head, snapshot.item_prefix(iid) + "document.json")
-                is_dirty = head_doc != exploded.document_json
+                    # A malformed tracked container is not clean: surface it as
+                    # dirty so callers do not mistake corruption for no change.
+                    is_dirty = True
+                else:
+                    # Path-direct HEAD blob — avoid flattening hundreds of item
+                    # trees just to compare document.json on cold overview.
+                    head_doc = self._bind.read_blob_at(
+                        head, snapshot.item_prefix(iid) + "document.json")
+                    is_dirty = head_doc != exploded.document_json
 
             item_cache[iid] = {"stamp": stamp, "dirty": is_dirty}
             if is_dirty:

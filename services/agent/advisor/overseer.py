@@ -744,8 +744,13 @@ class Overseer:
         user_msg = _audit_user_message(trigger, evidence)
 
         try:
-            reply = self.provider.complete(self._system, [{"role": "user", "content": user_msg}],
-                                           max_tokens=self.max_tokens)
+            from services.agent.role_models import clamp_provider_effort
+            provider = clamp_provider_effort(self.provider)
+            reply = provider.complete(
+                self._system,
+                [{"role": "user", "content": user_msg}],
+                max_tokens=self.max_tokens,
+            )
         except Exception as exc:  # noqa: BLE001 — provider failure never blocks the mission
             return AuditResult(audit={}, advisory=_empty_advisory(scope),
                                error=f"provider error: {exc}")

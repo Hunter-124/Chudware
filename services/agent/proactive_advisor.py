@@ -95,6 +95,20 @@ def _result_error_text(result: Any) -> str:
     return _truncate(result)
 
 
+def _is_policy_refusal(record: dict) -> bool:
+    return bool(record.get("policy_refusal")) or (
+        record.get("outcome_kind") == "policy_refusal"
+    )
+
+
+def _was_executed(record: dict) -> bool:
+    return record.get("executed", True) is not False and not _is_policy_refusal(record)
+
+
+def _is_executed_failure(record: dict) -> bool:
+    return _was_executed(record) and not record.get("ok", True)
+
+
 def evaluate_trigger(
     *,
     ok: bool,
@@ -111,25 +125,45 @@ def evaluate_trigger(
     if pref not in ("encourage", "require", "option"):
         return None
 
-    recent = list(calls[-6:]) if calls else []
-    fail_n = sum(1 for c in recent if not c.get("ok", True))
+    records = list(calls or [])
+    current_record = records[-1] if records and records[-1].get("tool") == tool else None
+    current_refusal = bool(current_record and _is_policy_refusal(current_record))
+    current_failed = (
+        _is_executed_failure(current_record)
+        if current_record is not None
+        else not ok
+    )
+
+    # Non-executed records are not attempts and cannot form failure/thrash
+    # streaks. Filter before taking the window so refusals do not evict actual
+    # execution evidence either.
+    recent = [record for record in records if _was_executed(record)][-6:]
+    fail_n = sum(1 for record in recent if _is_executed_failure(record))
     same_tool_n = 0
-    for c in reversed(recent):
-        if c.get("tool") == tool and not c.get("ok", True):
+    for record in reversed(recent):
+        if record.get("tool") == tool and _is_executed_failure(record):
             same_tool_n += 1
         else:
             break
+    if current_refusal:
+        return {
+            "severity": "med",
+            "reason": "policy_refusal",
+            "fail_n": fail_n,
+            "same_tool_n": same_tool_n,
+            "policy_refusal": True,
+        }
 
     reason = ""
     severity = "med"
     fire = False
 
-    if not ok and fail_n >= 2:
+    if current_failed and fail_n >= 2:
         fire = True
         reason = f"fail_streak={fail_n}"
         if fail_n >= 3 or same_tool_n >= 3:
             severity = "high"
-    if not ok and same_tool_n >= 2:
+    if current_failed and same_tool_n >= 2:
         fire = True
         reason = (reason + "+" if reason else "") + f"same_tool_x{same_tool_n}"
         if same_tool_n >= 3:
@@ -179,10 +213,16 @@ def build_deterministic_note(
     result: Any = None,
 ) -> str:
     err = _result_error_text(result)
-    err_bit = f" Error: {err}" if err else ""
+    err_bit = f" Reason: {err}" if err else ""
     sev = trigger.get("severity", "med")
     fail_n = int(trigger.get("fail_n") or 0)
     same_n = int(trigger.get("same_tool_n") or 0)
+    if trigger.get("policy_refusal"):
+        return (
+            f"[ADVISOR — proactive/policy] {tool!r} was not executed because "
+            f"the harness refused it.{err_bit} This is policy data, not a tool "
+            "failure or a retry/thrash signal."
+        )
     lines = [
         f"[ADVISOR — proactive/{sev}] {trigger.get('reason', 'trigger')}. "
         f"Last tool={tool!r} ok={ok}; fails_in_last_6={fail_n}; same_tool_streak={same_n}."
@@ -208,7 +248,10 @@ def _try_llm_advice(
     """Best-effort short advisor-role completion. Returns "" on any failure."""
     try:
         from services.agent import config as agent_config  # noqa: PLC0415
-        from services.agent.role_models import resolve_role_model  # noqa: PLC0415
+        from services.agent.role_models import (  # noqa: PLC0415
+            clamp_provider_effort,
+            resolve_role_model,
+        )
     except Exception:  # noqa: BLE001
         return ""
 
@@ -220,6 +263,7 @@ def _try_llm_advice(
             cfg={**(cfg if isinstance(cfg, dict) else {}), "model": assignment.model},
             role="advisor",
         )
+        provider = clamp_provider_effort(provider)
     except Exception as exc:  # noqa: BLE001
         _log.debug("proactive advisor provider resolve failed: %s", exc)
         return ""
@@ -353,6 +397,7 @@ def maybe_proactive_note(
     want_llm = (
         allow_llm
         and trigger.get("severity") == "high"
+        and not trigger.get("policy_refusal")
         and pref in ("encourage", "require")
         and int(st.get("llm_fires") or 0) < _MAX_LLM_PER_TURN
         and int(st.get("run_llm_fires") or 0) < _MAX_LLM_PER_RUN

@@ -21,11 +21,7 @@ from . import Challenge, AcceptanceCheck, ledger_artifact
 _HEALTH_TOOLS = frozenset({"sketch_health", "check_sketch"})
 _CONSTRAIN_TOOLS = frozenset({
     "sketch_auto_constrain",
-    "add_relation",
-    "add_dimension",
-    "sketch_add_relation",
-    "sketch_add_dimension",
-    "constrain_sketch",
+    "add_features",
 })
 
 
@@ -208,10 +204,10 @@ def _base_turns() -> list[dict]:
         {"_kind": "tool_call", "tool": "sketch_auto_constrain", "for_ac": "AC3",
          "node": "n_build_DL1", "args": {"sketch_id": "SK1"},
          "hypothesis": "auto-constrain free DOF"},
-        {"_kind": "tool_call", "tool": "add_relation", "for_ac": "AC3",
+        {"_kind": "tool_call", "tool": "add_features", "for_ac": "AC3",
          "node": "n_build_DL1",
-         "args": {"sketch_id": "SK1", "type": "coincident",
-                  "a": "end_1", "b": "start_4"},
+         "args": {"ops": [{"op": "relation", "sketch_id": "SK1",
+                           "type": "coincident", "a": "end_1", "b": "start_4"}]},
          "hypothesis": "close open corner coincident"},
         {"_kind": "tool_call", "tool": "sketch_health", "for_ac": "AC2",
          "node": "n_build_DL1", "args": {"sketch_id": "SK1"},

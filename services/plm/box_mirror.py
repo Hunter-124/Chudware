@@ -48,6 +48,7 @@ root at ``box_mirror/state-<digest>.json`` so unchanged files cost nothing.
 from __future__ import annotations
 
 import contextlib
+import copy
 import hashlib
 import json
 import os
@@ -293,6 +294,11 @@ def _exchange_code(code: str) -> None:
     if status != 200 or not isinstance(body, dict) or not body.get("access_token"):
         raise BoxError("auth_failed", f"Box code exchange failed (HTTP {status}): {body}")
     _persist_tokens(body)
+_oauth_activity_lock = threading.Lock()
+_oauth_activity: dict[str, Any] = {
+    "running": False,
+    "last_result": None,
+}
 
 
 def oauth_begin(timeout_s: float = 300.0) -> dict:
@@ -347,18 +353,46 @@ def oauth_begin(timeout_s: float = 300.0) -> dict:
     srv.timeout = 1.0
 
     def _wait() -> None:
-        deadline = time.time() + timeout_s
+        oauth_result: dict
         try:
+            deadline = time.time() + timeout_s
             while time.time() < deadline and "code" not in result:
                 srv.handle_request()
+            code = result.get("code")
+            if not code:
+                oauth_result = {
+                    "ok": False,
+                    "reason": "authorization_timeout",
+                    "hint": "Box did not redirect back before the authorization deadline",
+                }
+            else:
+                try:
+                    _exchange_code(code)
+                    oauth_result = {"ok": True, "connected": True}
+                except BoxError as e:
+                    oauth_result = {"ok": False, "reason": e.reason, "hint": e.hint}
+                except Exception as e:  # noqa: BLE001 — status must retain the fault
+                    oauth_result = {
+                        "ok": False,
+                        "reason": "oauth_exchange_failed",
+                        "hint": f"{type(e).__name__}: {e}",
+                    }
+        except Exception as e:  # noqa: BLE001 — retain listener failures too
+            oauth_result = {
+                "ok": False,
+                "reason": "oauth_callback_failed",
+                "hint": f"{type(e).__name__}: {e}",
+            }
         finally:
             with contextlib.suppress(Exception):
                 srv.server_close()
-        code = result.get("code")
-        if code:
-            with contextlib.suppress(Exception):
-                _exchange_code(code)
+        with _oauth_activity_lock:
+            _oauth_activity["running"] = False
+            _oauth_activity["last_result"] = oauth_result
 
+    with _oauth_activity_lock:
+        _oauth_activity["running"] = True
+        _oauth_activity["last_result"] = None
     threading.Thread(target=_wait, name="box-oauth-wait", daemon=True).start()
     return {"ok": True, "authorize_url": url, "redirect_uri": OAUTH_REDIRECT_URI,
             "hint": "open authorize_url in a browser and approve access; the token "
@@ -580,20 +614,37 @@ def _mirror_project(project: str, box: dict, deadline: float) -> dict:
 # --------------------------------------------------------------------------- drain
 
 _drain_lock = threading.Lock()
+_drain_activity_lock = threading.Lock()
+_drain_activity: dict[str, Any] = {
+    "running": False,
+    "last_result": None,
+}
 
 
-def drain(*, block: bool = False, budget_s: float = 300.0) -> dict:
-    """Mirror every spooled project up to Box.
+def _quarantine_spool_entry(entry: Path) -> Path:
+    """Move a corrupt spool record aside without altering its bytes."""
+    quarantine = entry.parent / "quarantine"
+    quarantine.mkdir(parents=True, exist_ok=True)
+    destination = quarantine / entry.name
+    if destination.exists():
+        destination = quarantine / f"{entry.stem}-{uuid.uuid4().hex}{entry.suffix}"
+    os.replace(entry, destination)
+    return destination
 
-    ``block=False`` starts a named daemon thread and returns immediately —
-    correct for the long-lived GUI worker; a fresh-per-turn agent process must
-    pass ``block=True`` (the spool survives either way, so a killed drain only
-    defers work to the next one).
-    """
-    if not block:
-        threading.Thread(target=lambda: drain(block=True, budget_s=budget_s),
-                         name="box-mirror-drain", daemon=True).start()
-        return {"ok": True, "started": True}
+
+def _drain_async(budget_s: float) -> None:
+    try:
+        result = _drain_once(budget_s)
+    except Exception as e:  # noqa: BLE001 — detached failures must remain observable
+        message = f"{type(e).__name__}: {e}"
+        result = {"ok": False, "reason": "internal_error",
+                  "hint": message, "projects": [], "errors": [message]}
+    with _drain_activity_lock:
+        _drain_activity["running"] = False
+        _drain_activity["last_result"] = result
+
+
+def _drain_once(budget_s: float) -> dict:
     if not _drain_lock.acquire(timeout=min(budget_s, 30.0)):
         return {"ok": False, "reason": "busy",
                 "hint": "another Box drain is already running; the spool keeps the work"}
@@ -610,14 +661,23 @@ def drain(*, block: bool = False, budget_s: float = 300.0) -> dict:
                 break
             try:
                 stamp = ent.stat().st_mtime_ns
-                project = str(json.loads(ent.read_text(encoding="utf-8")).get("project") or "")
-            except Exception:  # noqa: BLE001 — unreadable entry: drop it
-                with contextlib.suppress(OSError):
-                    ent.unlink()
-                continue
-            if not project:
-                with contextlib.suppress(OSError):
-                    ent.unlink()
+                raw = ent.read_bytes()
+                record = json.loads(raw.decode("utf-8"))
+                if not isinstance(record, dict):
+                    raise ValueError("entry must be a JSON object")
+                project = record.get("project")
+                if not isinstance(project, str) or not project:
+                    raise ValueError("entry has no project path")
+            except Exception as e:  # noqa: BLE001 — quarantine and report corrupt input
+                out["ok"] = False
+                detail = f"{type(e).__name__}: {e}"
+                try:
+                    quarantined = _quarantine_spool_entry(ent)
+                    detail += f"; quarantined as {quarantined.name}"
+                except Exception as quarantine_error:  # noqa: BLE001
+                    detail += (f"; quarantine failed: {type(quarantine_error).__name__}: "
+                               f"{quarantine_error}")
+                out["errors"].append(f"spool_corrupt: {ent.name}: {detail}")
                 continue
             try:
                 summary = _mirror_project(project, box, deadline)
@@ -638,6 +698,31 @@ def drain(*, block: bool = False, budget_s: float = 300.0) -> dict:
         return out
     finally:
         _drain_lock.release()
+
+
+def drain(*, block: bool = False, budget_s: float = 300.0) -> dict:
+    """Mirror every spooled project up to Box.
+
+    ``block=False`` starts one observable daemon drain. Its eventual envelope is
+    retained in :func:`status`; ``block=True`` returns that envelope directly.
+    """
+    if block:
+        return _drain_once(budget_s)
+    with _drain_activity_lock:
+        if _drain_activity["running"]:
+            return {"ok": True, "started": False, "running": True}
+        _drain_activity["running"] = True
+    try:
+        threading.Thread(target=_drain_async, args=(budget_s,),
+                         name="box-mirror-drain", daemon=True).start()
+    except Exception as e:  # noqa: BLE001
+        result = {"ok": False, "reason": "internal_error",
+                  "hint": f"{type(e).__name__}: {e}"}
+        with _drain_activity_lock:
+            _drain_activity["running"] = False
+            _drain_activity["last_result"] = result
+        return result
+    return {"ok": True, "started": True, "running": True}
 
 
 def sync_project(project: str, *, budget_s: float = 600.0) -> dict:
@@ -691,7 +776,12 @@ def status(path: str | None = None, *, live: bool = False) -> dict:
                           and (auth["refresh_token"] or auth["access_token"]))
     out: dict = {"ok": True, "enabled": box["enabled"], "method": auth["method"],
                  "configured": configured, "folder_id": box["folder_id"],
-                 "pending": len(list(_spool_dir().glob("*.json")))}
+                 "pending": len(list(_spool_dir().glob("*.json"))),
+                 "quarantined": len(list((_spool_dir() / "quarantine").glob("*")))}
+    with _drain_activity_lock:
+        out["drain"] = copy.deepcopy(_drain_activity)
+    with _oauth_activity_lock:
+        out["oauth"] = copy.deepcopy(_oauth_activity)
     if path:
         st = _load_state(path)
         out["project"] = {"last_sync": st.get("last_sync"),

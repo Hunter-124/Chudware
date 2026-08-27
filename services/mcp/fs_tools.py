@@ -35,21 +35,20 @@ SCOPING (the "limited cases" the base tooling is deliberately narrowed for):
   * A fixed, always-on credential-directory block applies to EVERY tool below (read and
     write alike) — ~/.ssh, ~/.aws, ~/.gnupg, cloud CLI credential stores, .netrc, etc. are
     refused outright regardless of any allow-list or env override; see ``_sensitive_block``.
-  * ``CHUDWARE_FS_ROOT`` (unset by default = no jail, matches historical behavior) opts a
-    caller into a workspace jail for the WRITE-class tools (fs_write, fs_edit, run_shell's
-    cwd): paths outside that root are refused. The DAG/mission runner sets this to the
-    active project directory before dispatching a role so a role acting "like an engineer"
-    stays inside the project it was asked to work in, not the whole filesystem.
-    ``CHUDWARE_FS_ALLOW_OUTSIDE_ROOT=1`` is the explicit escape hatch for a legitimate
-    cross-root need (e.g. importing a downloaded part from ~/Downloads).
+  * ``CHUDWARE_FS_ROOT`` is the MANDATORY workspace jail for every tool below, read and
+    write alike (3aaee658 hardening): paths outside that root are refused. The DAG/mission
+    runner sets this to the active project directory before dispatching a role so a role
+    acting "like an engineer" stays inside the project it was asked to work in, not the
+    whole filesystem. Unset/invalid root fails closed (``workspace_root_unavailable``).
   * A write refused because it lands inside a FIRMWARE project (fw_new_project scaffolds
     under firmware_root(), which is never inside a workspace) is still refused — the jail
     does not widen — but the envelope is ``use_fw_sources`` and names
     ``fw_sources(project_id, write={...})``, the tool that can author those sources.
-  * Read tools (fs_read/fs_list/fs_glob/fs_grep) are never root-jailed — only the
-    credential-directory block applies — since browsing/reading elsewhere on disk is the
-    normal "look things up like an engineer would" case and carries far less risk than a
-    write or an arbitrary shell command.
+  * The one read-only jail carve-out: READ-class tools (fs_read/fs_list/fs_glob/fs_grep)
+    may read files inside a REGISTERED firmware project root, because fw_sources'
+    contract is "write through fw_sources, read it back with fs_read" and those
+    tool-managed roots deliberately live outside every workspace. Writes there stay
+    refused, and the credential denylist still applies.
 """
 from __future__ import annotations
 
@@ -102,14 +101,34 @@ def _firmware_project_redirect(raw_path: str) -> Optional[str]:
             "writes it AND registers it so the next fw_build compiles it")
 
 
-def _canonical_target(raw_path: str, *, allow_missing: bool = False) -> tuple[Optional[Path], Optional[dict]]:
-    """Resolve *raw_path* once and enforce the mandatory root and secret denylist."""
+def _inside_firmware_project(resolved: Path) -> bool:
+    """True when *resolved* lives inside a registered firmware project root."""
+    try:
+        from services.mcp.firmware_tools import project_for_path  # noqa: PLC0415
+    except Exception:  # noqa: BLE001
+        return False
+    try:
+        return project_for_path(str(resolved)) is not None
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _canonical_target(raw_path: str, *, allow_missing: bool = False,
+                      read: bool = False) -> tuple[Optional[Path], Optional[dict]]:
+    """Resolve *raw_path* once and enforce the mandatory root and secret denylist.
+
+    Every tool class is root-jailed (3aaee658 hardening). ``read=True``
+    (fs_read/fs_list/fs_glob/fs_grep) additionally admits paths inside a
+    REGISTERED firmware project root — fw_sources' contract is "write through
+    fw_sources, read it back with fs_read" and those tool-managed roots live
+    outside every workspace by design. The credential denylist always applies.
+    """
     root = _workspace_root()
-    if root is None:
-        return None, _err("workspace_root_unavailable",
-                          "CHUDWARE_FS_ROOT must name an existing directory")
     candidate = Path(raw_path).expanduser()
     if not candidate.is_absolute():
+        if root is None:
+            return None, _err("workspace_root_unavailable",
+                              "CHUDWARE_FS_ROOT must name an existing directory")
         candidate = root / candidate
     try:
         resolved = candidate.resolve(strict=False)
@@ -117,7 +136,11 @@ def _canonical_target(raw_path: str, *, allow_missing: bool = False) -> tuple[Op
         return None, _err("invalid_path", str(exc))
     if not allow_missing and not resolved.exists():
         return None, _err_not_found(str(candidate))
-    if resolved != root and root not in resolved.parents:
+    inside_root = root is not None and (resolved == root or root in resolved.parents)
+    if not inside_root and not (read and _inside_firmware_project(resolved)):
+        if root is None:
+            return None, _err("workspace_root_unavailable",
+                              "CHUDWARE_FS_ROOT must name an existing directory")
         firmware = _firmware_project_redirect(raw_path)
         if firmware:
             return None, _err("use_fw_sources", firmware)
@@ -604,7 +627,7 @@ def register_fs_tools(mcp) -> None:
         Returns {ok, path, kind, text, total_lines, shown_lines, truncated, next_offset?}.
         """
         clean, sel = _split_path_selector(path)
-        p, blocked = _canonical_target(clean)
+        p, blocked = _canonical_target(clean, read=True)
         if blocked:
             return blocked
         assert p is not None
@@ -629,7 +652,7 @@ def register_fs_tools(mcp) -> None:
         call import_part(path=...) for a doc_id and read the model with describe_part /
         measure_part / inspect_part. Risk: read.
         """
-        p, blocked = _canonical_target(path)
+        p, blocked = _canonical_target(path, read=True)
         if blocked:
             return blocked
         assert p is not None
@@ -645,7 +668,7 @@ def register_fs_tools(mcp) -> None:
         Any CAD/geometry match is also listed under ``open_with_import_part`` — read those
         with import_part(path=...), never fs_read. Risk: read.
         """
-        base, blocked = _canonical_target(path)
+        base, blocked = _canonical_target(path, read=True)
         if blocked:
             return blocked
         assert base is not None
@@ -653,7 +676,7 @@ def register_fs_tools(mcp) -> None:
         hits: list[str] = []
         try:
             for match in base.glob(pattern):
-                resolved, descendant_block = _canonical_target(str(match))
+                resolved, descendant_block = _canonical_target(str(match), read=True)
                 if descendant_block or resolved is None:
                     continue
                 hits.append(str(resolved))
@@ -679,7 +702,7 @@ def register_fs_tools(mcp) -> None:
                 max_matches: int = 0) -> dict:
         """Regex-search files under *path* (optionally filtered by *glob*, e.g. '*.py').
         Returns {file, line, text} matches, capped at 500. Risk: read."""
-        base, blocked = _canonical_target(path)
+        base, blocked = _canonical_target(path, read=True)
         if blocked:
             return blocked
         assert base is not None
@@ -691,7 +714,7 @@ def register_fs_tools(mcp) -> None:
         files: list[Path] = [base] if base.is_file() else []
         if base.is_dir():
             for candidate in base.rglob(glob or "*"):
-                resolved, descendant_block = _canonical_target(str(candidate))
+                resolved, descendant_block = _canonical_target(str(candidate), read=True)
                 if not descendant_block and resolved is not None and resolved.is_file():
                     files.append(resolved)
         matches: list[dict] = []

@@ -372,14 +372,19 @@ def _plm_record_outside(params: dict, _emit: Callable) -> dict:
     def run(v: Any) -> dict:
         m = v.manifest()
         tracked = {it["path"] for it in m.get("items", [])}
-        # unregistered containers = new files not yet in the manifest
+        # A clean no-op is only trustworthy after both discovery and dirty
+        # comparison complete. Never reinterpret an unreadable project as empty.
         try:
             on_disk = {p.relative_to(v.project_dir).as_posix()
                        for p in v._project_containers()}
-        except Exception:  # noqa: BLE001
-            on_disk = set()
+            dirty = v.status().get("dirty") or []
+        except Exception as exc:  # noqa: BLE001
+            return {
+                "ok": False,
+                "reason": "scan_failed",
+                "hint": f"could not scan project changes: {type(exc).__name__}: {exc}",
+            }
         new_containers = on_disk - tracked
-        dirty = v.status().get("dirty") or []
         if not dirty and not new_containers:
             return {"ok": True, "committed": False}
         res = v.save("auto")
@@ -405,9 +410,11 @@ def _plm_timeline(params: dict, _emit: Callable) -> dict:
         doc_id = str(doc_id) or None
     project_dir = ((params or {}).get("path")
                    or (params or {}).get("project_dir"))
-    store = ai_vc.resolve_store(project_dir)
     try:
+        store = ai_vc.resolve_store(project_dir)
         return ai_vc.plm_timeline(doc_id, store=store)
+    except ai_vc.StoreResolutionError as e:
+        return e.envelope()
     except Exception as e:  # noqa: BLE001
         return {"ok": False, "reason": "internal",
                 "hint": f"{type(e).__name__}: {e}"}
@@ -428,9 +435,11 @@ def _plm_rollback(params: dict, _emit: Callable) -> dict:
     to = str((params or {}).get("to", "") or "")
     project_dir = ((params or {}).get("path")
                    or (params or {}).get("project_dir"))
-    store = ai_vc.resolve_store(project_dir)
     try:
+        store = ai_vc.resolve_store(project_dir)
         return ai_vc.plm_rollback(doc_id, to, store=store)
+    except ai_vc.StoreResolutionError as e:
+        return e.envelope()
     except Exception as e:  # noqa: BLE001
         return {"ok": False, "reason": "internal",
                 "hint": f"{type(e).__name__}: {e}"}
@@ -457,7 +466,10 @@ def _plm_rollback_check(params: dict, _emit: Callable) -> dict:
     chat_size = (params or {}).get("chat_size")
     project_dir = ((params or {}).get("path")
                    or (params or {}).get("project_dir"))
-    store = ai_vc.resolve_store(project_dir)
+    try:
+        store = ai_vc.resolve_store(project_dir)
+    except ai_vc.StoreResolutionError as e:
+        return e.envelope()
     try:
         chat_size = int(chat_size) if chat_size is not None else None
     except (TypeError, ValueError):

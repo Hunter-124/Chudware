@@ -460,6 +460,18 @@ def _fix_interface_fitment(f: Finding) -> tuple[list[dict], list[str]]:
     return fixes, helper
 
 
+def _fix_check_error(f: Finding) -> tuple[list[dict], list[str]]:
+    """Keep an unknown/failed battery result visible and actionable."""
+    detail = f.extra.get("error") or f.finding
+    return [{
+        "action": "inspect_advisor_check",
+        "params": {"check": f.check, "error": detail},
+        "basis": "advisor check did not produce a verdict",
+        "predicted_effect": "check backend is restored and the verdict is rerun",
+        "confidence": "harness",
+    }], []
+
+
 _FIX_PROVIDERS = {
     "interference": _fix_interference,
     "overlap": _fix_overlap,
@@ -472,6 +484,7 @@ _FIX_PROVIDERS = {
     "wall_thickness": _fix_wall_thickness,
     "dfm": _fix_dfm,
     "interface_fitment": _fix_interface_fitment,
+    "check_error": _fix_check_error,
 }
 
 
@@ -479,30 +492,48 @@ _FIX_PROVIDERS = {
 # Engine core
 # ---------------------------------------------------------------------------
 
-def _compute_fixes(f: Finding) -> tuple[list[dict], list[str]]:
-    """Return (candidate_fixes, extra_helper_tools) for a finding, if a provider
-    exists.  Providers never raise — a failing provider yields no computed fix."""
+def _compute_fixes(f: Finding) -> tuple[list[dict], list[str], dict | None]:
+    """Return fixes, helpers, and an explicit provider-fault record when needed."""
     provider = _FIX_PROVIDERS.get(f.kind)
     if provider is None:
-        return [], []
+        return [], [], None
     try:
-        return provider(f)
-    except Exception:  # noqa: BLE001
-        return [], []
+        fixes, helpers = provider(f)
+        return fixes, helpers, None
+    except Exception as exc:  # noqa: BLE001
+        error = str(exc).strip() or exc.__class__.__name__
+        harness_error = {
+            "component": "advisor_fix_provider",
+            "finding_kind": f.kind,
+            "exception": exc.__class__.__name__,
+            "error": error,
+        }
+        fallback = [{
+            "action": "harness_error",
+            "params": harness_error,
+            "basis": (
+                "candidate-fix computation failed; original evidence severity "
+                "is preserved"
+            ),
+            "predicted_effect": "harness fault is visible for repair",
+            "confidence": "harness",
+        }]
+        return fallback, [], harness_error
 
 
 def _finding_to_item(seq: int, stage: str, f: Finding) -> dict:
-    fixes, extra_helpers = _compute_fixes(f)
+    fixes, extra_helpers, harness_error = _compute_fixes(f)
 
-    # Engine invariant (§3): non-info items MUST carry ≥1 candidate fix.  If a
-    # provider produced none, downgrade to info rather than emit an illegal item.
+    # Engine invariant (§3): non-info items MUST carry ≥1 candidate fix. Unknown
+    # kinds still downgrade, but a provider fault gets a harness-error fallback
+    # and therefore never erases the evidence severity.
     severity = f.severity
     if severity != "info" and not fixes:
         severity = "info"
 
     helpers = list(dict.fromkeys(stages.helper_tools(stage) + extra_helpers))
 
-    return {
+    item = {
         "id": _adv_id(seq, f.kind, f.finding),
         "severity": severity,
         "check": f.check,
@@ -513,6 +544,9 @@ def _finding_to_item(seq: int, stage: str, f: Finding) -> dict:
         "helper_tools": helpers,
         "source": {"kind": f.source_kind, "detail": f.source_detail},
     }
+    if harness_error is not None:
+        item["harness_error"] = harness_error
+    return item
 
 
 def build_advisory(obs: Observation) -> dict:

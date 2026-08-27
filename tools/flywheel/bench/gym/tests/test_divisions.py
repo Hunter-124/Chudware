@@ -393,18 +393,21 @@ class TestLeaderboardAdditive:
     def test_aggregate_emits_division_keys(self):
         cells = [
             {
-                "challenge": "C1", "tier": "local-24k", "seed": 1, "cycle": "c",
+                "challenge": "C1", "tier": "local-24k", "model": "qwen3-4b",
+                "mode": "mock", "seed": 1, "cycle": "c",
                 "division": "local", "passed": True, "classifications": [],
                 "discipline_index": 0.8, "ledger_path": "",
             },
             {
-                "challenge": "C1", "tier": "local-24k", "seed": 2, "cycle": "c",
+                "challenge": "C1", "tier": "local-24k", "model": "qwen3-4b",
+                "mode": "mock", "seed": 2, "cycle": "c",
                 "division": "local", "passed": False, "classifications": [
                     {"failure_class": "incoherent_geometry"}],
                 "discipline_index": 0.4, "ledger_path": "",
             },
             {
                 "challenge": "C1", "tier": "openrouter:anthropic/claude-opus-4",
+                "model": "anthropic/claude-opus-4", "mode": "mock",
                 "seed": 1, "cycle": "c", "division": "open", "passed": True,
                 "classifications": [], "discipline_index": 0.9, "ledger_path": "",
             },
@@ -464,26 +467,25 @@ class TestLeaderboardAdditive:
         # Ensure we can re-aggregate without crash.
         assert isinstance(doc.get("models"), list)
 
-    def test_discover_cells_parses_division_dirname(self, tmp_path):
-        run = tmp_path / "runs" / "cyc" / "C1_local_local-24k_s1"
+    def test_discover_cells_reads_persisted_metadata(self, tmp_path):
+        run = tmp_path / "runs" / "cyc" / "lossy-portable-name"
         run.mkdir(parents=True)
-        (run / "graded.json").write_text(json.dumps({
-            "challenge": "C1", "passed": True, "criteria": [],
+        (run / "cell.json").write_text(json.dumps({
+            "challenge": "C1", "tier": "local-24k", "model": "qwen3-4b",
+            "seed": 1, "division": "local", "cycle": "cyc", "mode": "mock",
+            "run_id": "gym_C1_local_local-24k_s1", "passed": True,
+            "graded": {"passed": True, "criteria": []}, "classifications": [],
         }))
-        (run / "classifications.json").write_text("[]")
-        cells = discover_cells(tmp_path)
+        cells = discover_cells(tmp_path, cycles={"cyc"})
         assert len(cells) == 1
         assert cells[0]["division"] == "local"
         assert cells[0]["challenge"] == "C1"
         assert cells[0]["tier"] == "local-24k"
 
-    def test_discover_cells_legacy_dirname_defaults_local(self, tmp_path):
+    def test_discover_cells_ignores_legacy_unidentified_grades(self, tmp_path):
         run = tmp_path / "runs" / "cyc" / "C1_local-24k_s1"
         run.mkdir(parents=True)
         (run / "graded.json").write_text(json.dumps({
             "challenge": "C1", "passed": False, "criteria": [],
         }))
-        (run / "classifications.json").write_text("[]")
-        cells = discover_cells(tmp_path)
-        assert cells[0]["division"] == "local"
-        assert cells[0]["tier"] == "local-24k"
+        assert discover_cells(tmp_path, cycles={"cyc"}) == []

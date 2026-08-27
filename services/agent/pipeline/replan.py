@@ -156,22 +156,16 @@ def validate_replan_request(request: dict[str, Any]) -> list[str]:
 
 @dataclass
 class ReplanOutcome:
-    """The result of ruling on a replan request.
-
-    ``approved``    — the verdict.
-    ``applied``     — what was spliced/edited (a dict describing the mutation), or
-                      ``None`` when denied or when no structural change was needed.
-    ``ledger_event``— the ledger event dict that was (or should be) appended.
-    ``returned_reason`` — set on denial: the reason the role can act on.
-    ``frozen_branch``— on a ``blocked``-urgency request, the node id whose branch is
-                       frozen until ruled on (the anti-grind freeze).
-    """
+    """Result of ruling on and, when approved, applying a replan request."""
     approved: bool
     scope: str
     applied: Optional[dict[str, Any]] = None
     ledger_event: dict[str, Any] = field(default_factory=dict)
     returned_reason: str = ""
     frozen_branch: Optional[str] = None
+    outcome_kind: str = "ok"
+    status: str = "completed"
+    executed: bool = True
 
 
 def apply_replan(
@@ -233,16 +227,61 @@ def apply_replan(
     elif scope == "spec":
         applied = _apply_spec_change(proposal, ledger=ledger)
     elif scope == "requirement":
-        # The manifest edit (new/changed AC) is the overseer/caller's job; we only
-        # record that the requirement change was approved.
-        applied = {"kind": "requirement_change",
-                   "requirement_changes": proposal.get("requirement_changes", [])}
+        applied = {
+            "kind": "requirement_change",
+            "requirement_changes": proposal.get("requirement_changes", []),
+        }
+
+    apply_failed = bool(
+        isinstance(applied, dict)
+        and (
+            (scope in ("approach", "buildgraph", "org")
+             and applied.get("spliced") is not True)
+            or (scope == "spec" and applied.get("applied") is False)
+        )
+    )
+    if apply_failed:
+        reason = str(applied.get("error") or applied.get("note")
+                     or "approved replan could not be applied")
+        event = {
+            "schema": SCHEMA,
+            "id": request.get("id"),
+            "scope": scope,
+            "from_role": from_role,
+            "verdict": "apply_failed",
+            "status": "replan_apply_failed",
+            "outcome_kind": "internal_error",
+            "executed": False,
+            "applied": applied,
+        }
+        outcome = ReplanOutcome(
+            approved=False,
+            scope=scope,
+            applied=applied,
+            ledger_event=event,
+            returned_reason=reason,
+            frozen_branch=frozen,
+            outcome_kind="internal_error",
+            status="replan_apply_failed",
+            executed=False,
+        )
+        _log(ledger, from_role, event)
+        return outcome
 
     outcome = ReplanOutcome(
-        approved=True, scope=scope, applied=applied, frozen_branch=None,
+        approved=True,
+        scope=scope,
+        applied=applied,
+        frozen_branch=None,
         ledger_event={
-            "schema": SCHEMA, "id": request.get("id"), "scope": scope,
-            "from_role": from_role, "verdict": "approved", "applied": applied,
+            "schema": SCHEMA,
+            "id": request.get("id"),
+            "scope": scope,
+            "from_role": from_role,
+            "verdict": "approved",
+            "outcome_kind": "ok",
+            "executed": True,
+            "applied": applied,
         },
     )
     _log(ledger, from_role, outcome.ledger_event)
@@ -319,9 +358,24 @@ def _apply_spec_change(proposal: dict[str, Any], *, ledger: Any) -> dict[str, An
                     continue
                 impacts.append(mark_faulty(
                     ref, why=sc.get("why", "spec replan"), ledger=ledger))
-        except Exception:  # noqa: BLE001 — impact analysis is best-effort
-            pass
-    return {"kind": "spec_change", "spec_changes": spec_changes, "impacts": impacts}
+        except Exception as exc:  # noqa: BLE001 — application failure is explicit
+            detail = " ".join(str(exc).split())
+            rendered = (
+                f"{type(exc).__name__}: {detail}" if detail else type(exc).__name__
+            )
+            return {
+                "kind": "spec_change",
+                "applied": False,
+                "spec_changes": spec_changes,
+                "impacts": impacts,
+                "error": rendered[:240],
+            }
+    return {
+        "kind": "spec_change",
+        "applied": True,
+        "spec_changes": spec_changes,
+        "impacts": impacts,
+    }
 
 
 def _log(ledger: Any, actor: str, event: dict[str, Any]) -> None:

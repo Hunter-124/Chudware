@@ -17,8 +17,11 @@ guard in ``worker_rpc.py``.
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import subprocess
+import threading
+import time
 from typing import Any
 
 # ---------------------------------------------------------------------------
@@ -26,6 +29,9 @@ from typing import Any
 # ---------------------------------------------------------------------------
 
 _TIMEOUT = 60  # seconds — network ops (push/pull/gh) can be slow but not forever
+_GH_AUTH_START_TIMEOUT_S = 8.0
+_gh_auth_lock = threading.Lock()
+_gh_auth_job: dict[str, Any] | None = None
 
 
 def _have(binary: str) -> bool:
@@ -387,14 +393,79 @@ def gh_auth_status(path: str = ".") -> dict:
     return {"ok": True, "authed": False, "user": ""}
 
 
-def gh_auth_login(path: str = ".", hostname: str = "") -> dict:
-    """Kick off web-based OAuth sign-in.
+def _read_gh_auth_output(proc: subprocess.Popen, job: dict[str, Any]) -> None:
+    """Drain login output without ever blocking the caller's deadline."""
+    stream = proc.stdout
+    if stream is None:
+        with _gh_auth_lock:
+            job["reader_done"] = True
+            job["changed"].set()
+        return
+    try:
+        for line in iter(stream.readline, ""):
+            code_match = re.search(r"one-time code:\s*([A-Z0-9-]+)", line)
+            url_match = re.search(r"(https?://\S+)", line)
+            with _gh_auth_lock:
+                job["output"].append(line.rstrip())
+                if len(job["output"]) > 32:
+                    del job["output"][:-32]
+                if code_match:
+                    job["code"] = code_match.group(1)
+                if url_match and "device" in line.lower():
+                    job["url"] = url_match.group(1)
+                    job["flow_seen"] = True
+                job["changed"].set()
+    except Exception as e:  # noqa: BLE001 — surfaced through the status path
+        with _gh_auth_lock:
+            job["reader_error"] = f"{type(e).__name__}: {e}"
+    finally:
+        with _gh_auth_lock:
+            job["reader_done"] = True
+            job["changed"].set()
 
-    ``gh auth login --web`` prints a one-time device code and a verification
-    URL, then opens the default browser. We spawn it non-blocking and parse the
-    code/URL from its early output so the GUI can display (and re-open) them.
-    Self-hosted GitHub Enterprise: pass *hostname*.
-    """
+
+def _gh_auth_snapshot(job: dict[str, Any], *, cancel: bool = False) -> dict:
+    proc = job["process"]
+    if cancel and proc.poll() is None:
+        try:
+            proc.terminate()
+            job["cancelled"] = True
+        except Exception as e:  # noqa: BLE001 — report cancellation failure
+            return _fail("cancel_failed", f"{type(e).__name__}: {e}")
+    exit_code = proc.poll()
+    with _gh_auth_lock:
+        code = job["code"]
+        url = job["url"]
+        usable = bool(code or job["flow_seen"])
+        output = "\n".join(job["output"]).strip()
+        cancelled = bool(job["cancelled"])
+        reader_error = job["reader_error"]
+    running = exit_code is None
+    common = {"started": running, "running": running, "completed": not running,
+              "cancelled": cancelled, "exit_code": exit_code,
+              "code": code, "url": url}
+    if cancelled:
+        return {**_fail("login_cancelled", "GitHub sign-in was cancelled."),
+                **common}
+    if not running and not usable:
+        hint = output or reader_error or f"gh auth login exited with status {exit_code}"
+        return {**_fail("login_failed", hint), **common}
+    return {"ok": True, **common,
+            "hint": "Enter the code in your browser to finish signing in."}
+
+
+def gh_auth_login_status(*, cancel: bool = False) -> dict:
+    """Poll, or cancel, the most recently started ``gh auth login`` process."""
+    with _gh_auth_lock:
+        job = _gh_auth_job
+    if job is None:
+        return _fail("no_login", "No GitHub sign-in process has been started.")
+    return _gh_auth_snapshot(job, cancel=cancel)
+
+
+def gh_auth_login(path: str = ".", hostname: str = "") -> dict:
+    """Start web OAuth and wait only briefly for its device-code output."""
+    global _gh_auth_job
     if not _have("gh"):
         return _gh_missing()
     args = ["gh", "auth", "login", "--web", "--git-protocol", "https"]
@@ -403,34 +474,40 @@ def gh_auth_login(path: str = ".", hostname: str = "") -> dict:
     try:
         env = dict(os.environ)
         proc = subprocess.Popen(args, cwd=path if os.path.isdir(path) else None,
-                                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                 text=True, env=env)
+                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                text=True, env=env)
     except Exception as e:  # noqa: BLE001
         return _fail("login_failed", f"{type(e).__name__}: {e}")
 
-    # Read the first lines to capture the one-time code + URL, then detach.
-    code = ""
-    url = "https://github.com/login/device"
-    import re
-    import time
-    deadline = time.time() + 8
-    assert proc.stdout is not None
-    while time.time() < deadline:
-        line = proc.stdout.readline()
-        if not line:
-            if proc.poll() is not None:
-                break
-            continue
-        m = re.search(r"one-time code:\s*([A-Z0-9-]+)", line)
-        if m:
-            code = m.group(1)
-        m = re.search(r"(https?://\S+)", line)
-        if m and "device" in line.lower():
-            url = m.group(1)
-        if code:
-            break
-    return {"ok": True, "started": True, "code": code, "url": url,
-            "hint": "Enter the code in your browser to finish signing in."}
+    job: dict[str, Any] = {
+        "process": proc,
+        "code": "",
+        "url": "https://github.com/login/device",
+        "flow_seen": False,
+        "output": [],
+        "reader_error": "",
+        "reader_done": False,
+        "cancelled": False,
+        "changed": threading.Event(),
+    }
+    with _gh_auth_lock:
+        _gh_auth_job = job
+    threading.Thread(target=_read_gh_auth_output, args=(proc, job),
+                     name="gh-auth-login-output", daemon=True).start()
+
+    deadline = time.monotonic() + _GH_AUTH_START_TIMEOUT_S
+    while True:
+        snapshot = _gh_auth_snapshot(job)
+        with _gh_auth_lock:
+            usable = bool(job["code"] or job["flow_seen"])
+            reader_done = bool(job["reader_done"])
+        if usable or (not snapshot["running"] and reader_done):
+            return snapshot
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return snapshot
+        job["changed"].wait(min(remaining, 0.05))
+        job["changed"].clear()
 
 
 def repo_info(path: str) -> dict:
@@ -468,12 +545,19 @@ def pr_list(path: str, limit: int = 20) -> dict:
     import json
     try:
         rows = json.loads(r["out"])
+        if not isinstance(rows, list) or any(not isinstance(x, dict) for x in rows):
+            raise ValueError("expected a JSON list of objects")
+        prs = []
+        for x in rows:
+            author = x.get("author") or {}
+            if not isinstance(author, dict):
+                raise ValueError("expected author to be an object")
+            prs.append({"number": x.get("number"), "title": x.get("title", ""),
+                        "state": (x.get("state") or "").lower(),
+                        "author": author.get("login", ""),
+                        "branch": x.get("headRefName", "")})
     except Exception:  # noqa: BLE001
-        return {"ok": True, "prs": []}
-    prs = [{"number": x.get("number"), "title": x.get("title", ""),
-            "state": (x.get("state") or "").lower(),
-            "author": (x.get("author") or {}).get("login", ""),
-            "branch": x.get("headRefName", "")} for x in rows]
+        return _fail("parse_failed", "could not read GitHub pull requests")
     return {"ok": True, "prs": prs}
 
 
@@ -488,9 +572,16 @@ def issue_list(path: str, limit: int = 20) -> dict:
     import json
     try:
         rows = json.loads(r["out"])
+        if not isinstance(rows, list) or any(not isinstance(x, dict) for x in rows):
+            raise ValueError("expected a JSON list of objects")
+        issues = []
+        for x in rows:
+            author = x.get("author") or {}
+            if not isinstance(author, dict):
+                raise ValueError("expected author to be an object")
+            issues.append({"number": x.get("number"), "title": x.get("title", ""),
+                           "state": (x.get("state") or "").lower(),
+                           "author": author.get("login", "")})
     except Exception:  # noqa: BLE001
-        return {"ok": True, "issues": []}
-    issues = [{"number": x.get("number"), "title": x.get("title", ""),
-               "state": (x.get("state") or "").lower(),
-               "author": (x.get("author") or {}).get("login", "")} for x in rows]
+        return _fail("parse_failed", "could not read GitHub issues")
     return {"ok": True, "issues": issues}

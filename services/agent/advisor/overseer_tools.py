@@ -20,6 +20,7 @@ the deterministic mapping is useful on its own.
 """
 from __future__ import annotations
 
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Optional
 
@@ -56,24 +57,92 @@ def _load_buildgraph(run_id: str, runs_dir: Optional[Path]) -> dict | None:
 # ProviderResolver: called with nothing, returns {name: provider} available now.
 # Injected so this module never reaches into GUI settings directly (testable).
 ProviderMap = dict[str, Any]
+@dataclass(frozen=True)
+class _ProviderResolution:
+    providers: ProviderMap
+    status: str
+    error: str = ""
+    policy_refusal: bool = False
 
 
-def _default_providers() -> ProviderMap:
-    """Resolve the overseer provider from routing.yaml (T-W14 seam, now wired).
+def _is_credential_fault(exc: BaseException) -> bool:
+    text = str(exc).lower()
+    return any(marker in text for marker in (
+        "credential unavailable",
+        "credential missing",
+        "requires an api key",
+        "missing api key",
+        "missing access_token",
+        "authentication credential",
+    ))
 
-    Uses services.agent.config.get_provider(role="overseer") — the same
-    routing.yaml role→source resolution (contract §14) the agent loop uses.
-    Returns ``{}`` when no provider can be constructed (unconfigured env,
-    offline refusal, missing credentials); callers that want a specific map
-    pass ``providers=`` explicitly (the GUI/loop wire it).
-    """
+
+def _default_providers() -> _ProviderResolution:
+    """Resolve and type provider construction instead of collapsing every fault."""
     try:
-        from services.agent.config import get_provider  # lazy: heavy module
-        provider = get_provider(role="overseer")
-    except Exception:  # noqa: BLE001 — an unconfigured env must not break audit_now
-        return {}
+        from services.agent import config as agent_config
+    except Exception as exc:  # noqa: BLE001
+        return _ProviderResolution({}, "provider_error", str(exc))
+
+    try:
+        provider = agent_config.get_provider(role="overseer")
+    except agent_config.OfflineModeError as exc:
+        return _ProviderResolution(
+            {}, "offline_policy", str(exc), policy_refusal=True,
+        )
+    except Exception as exc:  # noqa: BLE001
+        if _is_credential_fault(exc):
+            return _ProviderResolution({}, "credential_unavailable", str(exc))
+        return _ProviderResolution({}, "provider_error", str(exc))
+
+    if provider is None:
+        return _ProviderResolution({}, "unprovisioned")
+
+    from services.agent.role_models import clamp_provider_effort
+    provider = clamp_provider_effort(provider)
     name = getattr(provider, "name", "") or "resolved"
-    return {name: provider}
+    return _ProviderResolution({name: provider}, "ready")
+
+
+def _resolve_provider_input(providers: ProviderMap | None) -> _ProviderResolution:
+    if providers is None:
+        return _default_providers()
+    if not providers or not any(provider is not None for provider in providers.values()):
+        return _ProviderResolution({}, "unprovisioned")
+    return _ProviderResolution(dict(providers), "ready")
+
+
+def _nonexecuted_audit(scope: AuditScope, resolution: _ProviderResolution) -> dict:
+    skipped = (
+        "no provider configured for overseer (routing seam)"
+        if resolution.status == "unprovisioned"
+        else ""
+    )
+    outcome_kind = (
+        "policy_refusal" if resolution.policy_refusal
+        else "guard_block" if resolution.status == "unprovisioned"
+        else "internal_error"
+    )
+    return {
+        "ok": False,
+        "executed": False,
+        "policy_refusal": resolution.policy_refusal,
+        "outcome_kind": outcome_kind,
+        "status": resolution.status,
+        "reason": resolution.error,
+        "skipped": skipped,
+        "error": "" if resolution.policy_refusal else resolution.error,
+        "audit": {},
+        "advisory": {
+            "schema": "aicad.advisory/1",
+            "seq": 0,
+            "stage": scope.stage,
+            "items": [],
+            "user_override": False,
+        },
+        "escalated": False,
+        "escalation_text": "",
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -97,9 +166,8 @@ def audit_now(
     """
     ledger = Ledger.load(run_id, ledger_path)
     graph = _load_buildgraph(run_id, runs_dir)
-    prov_map = providers if providers is not None else _default_providers()
-    provider = resolve_overseer_provider(prov_map)
-
+    resolution = _resolve_provider_input(providers)
+    provider = resolve_overseer_provider(resolution.providers)
     budget = budget or EvidenceBudget()
     sc = AuditScope(
         run_id=run_id,
@@ -107,12 +175,25 @@ def audit_now(
         roles=list((scope or {}).get("roles", [])),
         buildgraph_nodes=list((scope or {}).get("buildgraph_nodes", [])),
     )
+    if resolution.status != "ready" or provider is None:
+        if provider is None and resolution.status == "ready":
+            resolution = _ProviderResolution({}, "unprovisioned")
+        return _nonexecuted_audit(sc, resolution)
     ledger_text = ledger_render(ledger, budget.ledger)
 
     o = Overseer(provider=provider, ledger=ledger, budget=budget)
     res = o.audit(trigger, sc, ledger_text=ledger_text, buildgraph=graph)
+    executed = bool(res.audit) and not res.error and not res.skipped
     return {
-        "ok": not res.error,
+        "ok": executed,
+        "executed": executed,
+        "policy_refusal": False,
+        "outcome_kind": (
+            "ok" if executed else "internal_error" if res.error else "guard_block"
+        ),
+        "status": (
+            "executed" if executed else "provider_error" if res.error else "skipped"
+        ),
         "skipped": res.skipped,
         "error": res.error,
         "audit": res.audit,
@@ -143,8 +224,8 @@ def change_request(
     """
     ledger = Ledger.load(run_id, ledger_path)
     graph = _load_buildgraph(run_id, runs_dir)
-    prov_map = providers if providers is not None else _default_providers()
-    provider = resolve_overseer_provider(prov_map)
+    resolution = _resolve_provider_input(providers)
+    provider = resolve_overseer_provider(resolution.providers)
     overseer = Overseer(provider=provider, ledger=ledger) if provider is not None else None
 
     result = _cr.route_change_request(
@@ -162,6 +243,11 @@ def change_request(
         "dispatch": result.dispatch,
         "needs_user_confirm": result.needs_user_confirm,
         "user_summary": result.user_summary,
+        "audit_status": (
+            "executed" if result.audit else resolution.status
+        ),
+        "audit_error": resolution.error,
+        "audit_policy_refusal": resolution.policy_refusal,
     }
 
 

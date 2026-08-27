@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import time
+from types import SimpleNamespace
 
 import pytest
 
@@ -37,6 +38,57 @@ def test_trigger_same_tool_twice():
     )
     assert t is not None
     assert t["same_tool_n"] >= 2
+def test_policy_refusals_do_not_feed_failure_or_thrash_streaks():
+    calls = [
+        {
+            "tool": "extrude",
+            "ok": False,
+            "policy_refusal": True,
+            "executed": False,
+        },
+        {
+            "tool": "extrude",
+            "ok": False,
+            "policy_refusal": True,
+            "executed": False,
+        },
+    ]
+
+    trigger = pa.evaluate_trigger(
+        ok=False,
+        tool="extrude",
+        calls=calls,
+        tool_calls_made=2,
+        preference="encourage",
+    )
+
+    assert trigger is not None
+    assert trigger["reason"] == "policy_refusal"
+    assert trigger["fail_n"] == 0
+    assert trigger["same_tool_n"] == 0
+    assert trigger["policy_refusal"] is True
+
+
+def test_explicitly_executed_failures_still_feed_streaks():
+    calls = [
+        {"tool": "extrude", "ok": False, "executed": True},
+        {"tool": "extrude", "ok": False, "executed": True},
+    ]
+
+    trigger = pa.evaluate_trigger(
+        ok=False,
+        tool="extrude",
+        calls=calls,
+        tool_calls_made=2,
+        preference="encourage",
+    )
+
+    assert trigger is not None
+    assert trigger["fail_n"] == 2
+    assert trigger["same_tool_n"] == 2
+    assert "same_tool_x2" in trigger["reason"]
+
+
 
 
 def test_no_trigger_on_success():
@@ -54,6 +106,48 @@ def test_option_requires_high_severity():
     )
     # fail_n=2 is med unless same_tool — option suppresses med
     assert t is None
+def test_policy_note_is_deterministic_and_never_spends_llm_budget(monkeypatch):
+    import services.agent.config as cfg
+
+    monkeypatch.setattr(cfg, "proactive_advisor_enabled", lambda cfg=None: True)
+    monkeypatch.setattr(cfg, "get_advisor_preference", lambda cfg=None: "encourage")
+    monkeypatch.setattr(
+        pa,
+        "_try_llm_advice",
+        lambda **kwargs: pytest.fail("policy refusal must not call advisor provider"),
+    )
+    calls = [
+        {
+            "tool": "extrude",
+            "ok": False,
+            "policy_refusal": True,
+            "executed": False,
+        },
+        {
+            "tool": "extrude",
+            "ok": False,
+            "policy_refusal": True,
+            "executed": False,
+        },
+    ]
+    options = {}
+
+    note, meta = pa.maybe_proactive_note(
+        ok=False,
+        tool="extrude",
+        result={"status": "offline_policy"},
+        calls=calls,
+        tool_calls_made=2,
+        options=options,
+        allow_llm=True,
+    )
+
+    assert "policy" in note
+    assert "not executed" in note
+    assert meta["llm"] is False
+    assert options[pa._STATE_KEY]["llm_fires"] == 0
+
+
 
 
 def test_deterministic_note_contains_tool():
@@ -148,3 +242,44 @@ def test_proactive_off_when_advisor_off(monkeypatch):
 
     monkeypatch.setattr(cfg, "get_advisor_preference", lambda c=None: "off")
     assert cfg.proactive_advisor_enabled({"proactive_advisor": True}) is False
+
+
+def test_proactive_provider_effort_is_clamped_without_mutating_parent(monkeypatch):
+    import services.agent.config as cfg
+    import services.agent.role_models as role_models
+
+    class Provider:
+        reasoning_effort = "max"
+
+        def __init__(self):
+            self.seen = []
+
+        def complete(self, system, messages, max_tokens=None):
+            self.seen.append(self.reasoning_effort)
+            return '{"verdict":"steer","notes":["inspect the executed failure"],"focus":"ids"}'
+
+    provider = Provider()
+    monkeypatch.setattr(cfg, "load_config", lambda: {})
+    monkeypatch.setattr(cfg, "get_provider", lambda **kwargs: provider)
+    monkeypatch.setattr(
+        role_models,
+        "resolve_role_model",
+        lambda role, config: SimpleNamespace(provider="mock", model="mock-model"),
+    )
+
+    note = pa._try_llm_advice(
+        tool="extrude",
+        ok=False,
+        trigger={
+            "severity": "high",
+            "reason": "fail_streak=3",
+            "fail_n": 3,
+            "same_tool_n": 3,
+        },
+        result={"error": "bad id"},
+        recent_calls=[],
+    )
+
+    assert note
+    assert provider.seen == ["high"]
+    assert provider.reasoning_effort == "max"

@@ -5,8 +5,11 @@ gh is absent or unauthenticated, so CI stays green without network/credentials.
 """
 from __future__ import annotations
 
+import io
 import shutil
 import subprocess
+import threading
+import time
 
 import pytest
 
@@ -118,3 +121,76 @@ def test_diff_staged(repo):
 def test_gh_auth_status_shape():
     r = gitscm.gh_auth_status(".")
     assert r["ok"] and "authed" in r and "user" in r
+
+
+class _FakeLoginProcess:
+    def __init__(self, stdout, returncode=None):
+        self.stdout = stdout
+        self.returncode = returncode
+        self.terminated = False
+
+    def poll(self):
+        return self.returncode
+
+    def terminate(self):
+        self.terminated = True
+        self.returncode = -15
+
+
+def test_gh_auth_login_deadline_is_not_blocked_by_readline(monkeypatch, tmp_path):
+    blocked = threading.Event()
+
+    class _BlockingStdout:
+        def readline(self):
+            blocked.wait()
+            return ""
+
+    proc = _FakeLoginProcess(_BlockingStdout())
+    monkeypatch.setattr(gitscm, "_have", lambda binary: True)
+    monkeypatch.setattr(gitscm, "_GH_AUTH_START_TIMEOUT_S", 0.03)
+    monkeypatch.setattr(gitscm.subprocess, "Popen", lambda *a, **kw: proc)
+
+    started = time.monotonic()
+    out = gitscm.gh_auth_login(str(tmp_path))
+    elapsed = time.monotonic() - started
+
+    assert out["ok"] is True and out["started"] is True
+    assert elapsed < 0.2
+    assert gitscm.gh_auth_login_status()["running"] is True
+    cancelled = gitscm.gh_auth_login_status(cancel=True)
+    assert cancelled["cancelled"] is True and proc.terminated is True
+    blocked.set()
+
+
+def test_gh_auth_login_immediate_nonzero_exit_is_failure(monkeypatch, tmp_path):
+    proc = _FakeLoginProcess(io.StringIO("fatal: browser unavailable\n"), returncode=9)
+    monkeypatch.setattr(gitscm, "_have", lambda binary: True)
+    monkeypatch.setattr(gitscm, "_GH_AUTH_START_TIMEOUT_S", 0.1)
+    monkeypatch.setattr(gitscm.subprocess, "Popen", lambda *a, **kw: proc)
+
+    out = gitscm.gh_auth_login(str(tmp_path))
+
+    assert out["ok"] is False
+    assert out["reason"] == "login_failed"
+    assert "browser unavailable" in out["hint"]
+
+
+@pytest.mark.parametrize(("call", "label"), [
+    (gitscm.pr_list, "pull requests"),
+    (gitscm.issue_list, "issues"),
+])
+@pytest.mark.parametrize("payload", ["not json", '{"number": 1}'])
+def test_gh_lists_reject_malformed_json(monkeypatch, call, label, payload):
+    monkeypatch.setattr(gitscm, "_have", lambda binary: True)
+    monkeypatch.setattr(
+        gitscm, "_gh",
+        lambda *a, **kw: {"ok": True, "code": 0, "out": payload, "err": ""},
+    )
+
+    out = call(".")
+
+    assert out == {
+        "ok": False,
+        "reason": "parse_failed",
+        "hint": f"could not read GitHub {label}",
+    }

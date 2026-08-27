@@ -84,6 +84,15 @@ _STATEFUL_TOOLS = frozenset({
     "get_job", "ask_user",
 })
 
+EXIT_NO_DATA = 3
+
+# A scratch document exists before replay. Tools that can create content in an
+# empty document remain meaningful when seed geometry failed; every other
+# document-scoped tool would only measure the seed failure and is unscoreable.
+_SEED_INDEPENDENT_DOC_TOOLS = frozenset({
+    "add_features", "new_part", "new_assembly", "new_schematic",
+})
+
 
 def _iter_nodes(obj: Any) -> Iterator[dict]:
     if isinstance(obj, dict):
@@ -96,12 +105,16 @@ def _iter_nodes(obj: Any) -> Iterator[dict]:
 
 
 def load_failures(runs_dir: pathlib.Path) -> list[dict]:
-    """Every recorded ``tool_call`` whose ``ok`` was false, with its args."""
+    """Recorded failures plus unscored policy/guard refusals."""
+    from tools.flywheel.bench.gym.taxonomy import normalize_tool_outcome
+
     out: list[dict] = []
     for ledger in sorted(runs_dir.rglob("ledger.json")):
         try:
             data = json.loads(ledger.read_text())
-        except (OSError, ValueError):
+        except (OSError, ValueError) as exc:
+            print(f"unreadable ledger {ledger}: {type(exc).__name__}: {exc}",
+                  file=sys.stderr)
             continue
         for node in _iter_nodes(data):
             if node.get("event") != "tool_call" or node.get("ok") is not False:
@@ -110,24 +123,26 @@ def load_failures(runs_dir: pathlib.Path) -> list[dict]:
             if not isinstance(tool, str) or not tool:
                 continue
             args = node.get("args")
-            out.append({
+            outcome_kind, executed = normalize_tool_outcome(node)
+            row = {
                 "run": str(ledger.relative_to(runs_dir).parent),
                 "tool": tool,
                 "args": args if isinstance(args, dict) else {},
-                "was": _message(node.get("result")),
-            })
+                "was": _message(node.get("error") or node.get("result")),
+                "outcome_kind": outcome_kind,
+                "executed": executed,
+            }
+            if outcome_kind in {"policy_refusal", "guard_block"} and not executed:
+                row.update(status="refusal", fixed=None,
+                           now=f"{outcome_kind}: declined before dispatch")
+            out.append(row)
     return out
 
 
 def load_live_failures(runs_dir: pathlib.Path, *, since_days: float = 0.0) -> list[dict]:
-    """Every failed tool call from the LIVE desktop run tree (``events.jsonl``).
-
-    This is the corpus that reflects what the user actually hits.  Args come from
-    ``args_preview`` (capped, so occasionally truncated); a preview that does not
-    parse as JSON is kept with ``truncated=True`` and skipped at replay rather than
-    silently scored.
-    """
+    """Failed live calls, retaining pre-dispatch refusals as unscored rows."""
     import time  # noqa: PLC0415 — only this loader needs a clock
+    from tools.flywheel.bench.gym.taxonomy import normalize_tool_outcome
 
     cutoff = time.time() - since_days * 86400 if since_days > 0 else 0.0
     out: list[dict] = []
@@ -139,14 +154,17 @@ def load_live_failures(runs_dir: pathlib.Path, *, since_days: float = 0.0) -> li
             if cutoff and events.stat().st_mtime < cutoff:
                 continue
             text = events.read_text(errors="replace")
-        except OSError:
+        except OSError as exc:
+            print(f"unreadable live events {events}: {type(exc).__name__}: {exc}",
+                  file=sys.stderr)
             continue
         for line in text.splitlines():
             if '"agent.tool_call"' not in line:
                 continue
             try:
                 ev = json.loads(line)
-            except ValueError:
+            except ValueError as exc:
+                print(f"malformed live event {events}: {exc}", file=sys.stderr)
                 continue
             if ev.get("kind") != "agent.tool_call" or ev.get("ok") is not False:
                 continue
@@ -163,13 +181,20 @@ def load_live_failures(runs_dir: pathlib.Path, *, since_days: float = 0.0) -> li
                 truncated = not isinstance(args, dict)
                 if truncated:
                     args = {}
-            out.append({
+            outcome_kind, executed = normalize_tool_outcome(ev)
+            row = {
                 "run": run_dir.name,
                 "tool": tool,
                 "args": args,
                 "was": ev.get("error_preview") or "",
                 "truncated": truncated,
-            })
+                "outcome_kind": outcome_kind,
+                "executed": executed,
+            }
+            if outcome_kind in {"policy_refusal", "guard_block"} and not executed:
+                row.update(status="refusal", fixed=None,
+                           now=f"{outcome_kind}: declined before dispatch")
+            out.append(row)
     return out
 
 
@@ -223,7 +248,7 @@ def _redact(message: str) -> str:
     return re.sub(r"\d+", "N", message)[:110]
 
 
-def _substitute_doc(fn: Any, args: dict, doc_id: str | None) -> dict:
+def _substitute_doc(fn: Any, args: dict, doc_id: str | None, *, at: Any = None) -> dict:
     """Point a recorded call at the live scratch document.
 
     Two rewrites, both needed to isolate the thing we are actually measuring:
@@ -242,7 +267,7 @@ def _substitute_doc(fn: Any, args: dict, doc_id: str | None) -> dict:
             out[key] = doc_id
     if "doc_id" not in out:
         try:
-            spec = _agent_turn()._signature_spec(fn)
+            spec = (at or _agent_turn())._signature_spec(fn)
         except Exception:  # noqa: BLE001
             return out
         if "doc_id" in spec.get("params", ()):
@@ -262,29 +287,62 @@ def _skip_reason(tool: str, args: dict, *, truncated: bool = False) -> str | Non
             return f"args reference unreproducible state ({key})"
     return None
 
+def _requires_seed_geometry(tool: str, fn: Any, args: dict, *, at: Any) -> bool:
+    if tool in _SEED_INDEPENDENT_DOC_TOOLS:
+        return False
+    if any(key in args for key in ("doc_id", "document", "part_id")):
+        return True
+    try:
+        params = at._signature_spec(fn).get("params", ())
+    except Exception:  # noqa: BLE001
+        return False
+    return any(key in params for key in ("doc_id", "document", "part_id"))
 
-def replay(failures: list[dict], *, doc_id: str | None) -> list[dict]:
-    at = _agent_turn()
 
+
+
+def replay(failures: list[dict], *, doc_id: str | None,
+           geometry_seeded: bool = True,
+           environment_error: str | None = None) -> list[dict]:
+    """Replay executable failures; preserve refusals/unavailable rows unscored."""
+    from tools.flywheel.bench.gym.taxonomy import normalize_tool_outcome
+
+    at = None
     results: list[dict] = []
     for rec in failures:
         tool, args = rec["tool"], rec["args"]
         row = dict(rec, klass=classify(rec["was"]))
 
+        if rec.get("status") == "refusal" and rec.get("fixed") is None:
+            results.append(row)
+            continue
+        if environment_error is not None:
+            results.append(dict(row, status="skipped", now=environment_error,
+                                fixed=None))
+            continue
         skip = _skip_reason(tool, args, truncated=bool(rec.get("truncated")))
         if skip is not None:
-            results.append(dict(row, status="skipped", now=skip))
-            results[-1]["fixed"] = None
+            results.append(dict(row, status="skipped", now=skip, fixed=None))
             continue
 
+        if at is None:
+            at = _agent_turn()
         fn = at._bind_tool(tool)
         if fn is None:
             err = at._unresolved_tool_error(tool)
             results.append(dict(row, status=err.get("status", "unbound"),
                                 now=err.get("error", ""), fixed=False))
             continue
+        if (not geometry_seeded
+                and _requires_seed_geometry(tool, fn, args, at=at)):
+            results.append(dict(
+                row, status="skipped",
+                now="seed geometry unavailable; document-scoped result is unscoreable",
+                fixed=None,
+            ))
+            continue
 
-        call_args = _substitute_doc(fn, args, doc_id)
+        call_args = _substitute_doc(fn, args, doc_id, at=at)
         kwargs, notes, arg_error = at._reconcile_kwargs(tool, fn, call_args)
         if arg_error is not None:
             results.append(dict(row, status="rejected-args",
@@ -294,7 +352,8 @@ def replay(failures: list[dict], *, doc_id: str | None) -> list[dict]:
         try:
             raw = fn(**kwargs)
         except Exception as exc:  # noqa: BLE001 - a raise IS the failure signal
-            results.append(dict(row, status="raised", now=f"{type(exc).__name__}: {exc}"[:400],
+            results.append(dict(row, status="raised",
+                                now=f"{type(exc).__name__}: {exc}"[:400],
                                 fixed=False))
             continue
 
@@ -305,9 +364,21 @@ def replay(failures: list[dict], *, doc_id: str | None) -> list[dict]:
             except ValueError:
                 payload = {"ok": True, "raw": raw[:200]}
         ok = payload.get("ok", True) if isinstance(payload, dict) else True
+        outcome_payload = dict(payload) if isinstance(payload, dict) else {}
+        outcome_payload.setdefault("ok", ok)
+        outcome_payload["result"] = payload
+        outcome_kind, executed = normalize_tool_outcome(outcome_payload)
+        if outcome_kind in {"policy_refusal", "guard_block"} and not executed:
+            results.append(dict(
+                row, status="refusal", now=_message(payload)[:400],
+                fixed=None, notes=notes, outcome_kind=outcome_kind,
+                executed=False,
+            ))
+            continue
         results.append(dict(row, status="ok" if ok else "failed",
                             now=("" if ok else _message(payload))[:400],
-                            fixed=bool(ok), notes=notes))
+                            fixed=bool(ok), notes=notes,
+                            outcome_kind=outcome_kind, executed=executed))
     return results
 
 
@@ -317,28 +388,27 @@ def _agent_turn():
     return at
 
 
-def _mint_doc() -> str | None:
-    """A live part with REAL geometry, so the replay measures the tool.
-
-    An empty document would make every evaluate/measure/describe call fail with
-    "no bodies" no matter how good the tool is, hiding the argument-shape result
-    we came here for. A plate with a through hole is the smallest shape that has
-    a body, more than one planar face, a cylindrical face, and a subtractive
-    feature — enough for every eval tool in the corpus to have something to say.
-    """
+def _mint_doc() -> tuple[str | None, bool, str]:
+    """Mint an isolated scratch document and prove its seed geometry succeeded."""
     at = _agent_turn()
     new_part = at._bind_tool("new_part")
     add_features = at._bind_tool("add_features")
     if new_part is None:
-        return None
+        return None, False, "new_part unavailable"
     try:
-        doc_id = json.loads(new_part(name="replay_scratch")).get("doc_id")
-    except Exception:  # noqa: BLE001
-        return None
-    if doc_id is None or add_features is None:
-        return doc_id
+        raw_new = new_part(name="replay_scratch")
+        created = json.loads(raw_new) if isinstance(raw_new, str) else raw_new
+    except Exception as exc:  # noqa: BLE001
+        return None, False, f"scratch document mint failed: {type(exc).__name__}: {exc}"
+    if not isinstance(created, dict) or created.get("ok") is False:
+        return None, False, f"scratch document mint failed: {_message(created)}"
+    doc_id = created.get("doc_id")
+    if not doc_id:
+        return None, False, "scratch document mint returned no doc_id"
+    if add_features is None:
+        return str(doc_id), False, "add_features unavailable for seed geometry"
     try:
-        add_features(doc_id=doc_id, ops=[
+        raw_seed = add_features(doc_id=doc_id, ops=[
             {"op": "add_feature", "feature": {
                 "type": "box", "name": "Plate",
                 "params": {"length": 80, "width": 60, "height": 10}}},
@@ -347,9 +417,14 @@ def _mint_doc() -> str | None:
                 "params": {"radius": 6, "height": 40},
                 "mode": "cut"}},
         ])
-    except Exception:  # noqa: BLE001
-        pass  # geometry is a nicety; the replay still measures arg shape without it
-    return doc_id
+        seeded = json.loads(raw_seed) if isinstance(raw_seed, str) else raw_seed
+    except Exception as exc:  # noqa: BLE001
+        return str(doc_id), False, f"seed geometry failed: {type(exc).__name__}: {exc}"
+    if not isinstance(seeded, dict):
+        return str(doc_id), False, "seed geometry returned a non-object result"
+    if seeded.get("ok") is False:
+        return str(doc_id), False, f"seed geometry failed: {_message(seeded)}"
+    return str(doc_id), True, ""
 
 
 def report(results: list[dict], *, detail: bool) -> int:
@@ -361,7 +436,7 @@ def report(results: list[dict], *, detail: bool) -> int:
     print(f"  replayable      : {len(scored)}")
     print(f"  still failing   : {len(scored) - len(fixed)}")
     print(f"  now succeed     : {len(fixed)}")
-    print(f"  not scoreable   : {len(skipped)}  (live run state; never counted as fixed)")
+    print(f"  not scoreable   : {len(skipped)}  (refusal/state/isolation; never fixed)")
     if scored:
         print(f"  fix rate        : {100.0 * len(fixed) / len(scored):.1f}% of replayable")
 
@@ -420,25 +495,43 @@ def main(argv: list[str] | None = None) -> int:
         wanted = set(args.tool)
         failures = [f for f in failures if f["tool"] in wanted]
     if not failures:
+        if args.tool:
+            print("no recorded failures matched explicit --tool filter", file=sys.stderr)
+            return EXIT_NO_DATA
         print("no recorded failures matched")
         return 0
 
+    if all(f.get("status") == "refusal" and f.get("fixed") is None
+           for f in failures):
+        results = replay(failures, doc_id=None)
+        if args.json:
+            args.json.write_text(json.dumps(results, indent=1, default=str))
+        return report(results, detail=args.detail)
+
     os.environ.setdefault("CHUDWARE_PREFLIGHT", "0")  # replay measures the tool, not preflight
 
-    # Replay MINTS documents. Against the daemon behind the user's open window that
-    # fans out doc.opened and buries their tab strip in scratch parts that outlive the
-    # run — the same way a bare `pytest services/mcp` did before conftest isolated it.
+    # Mutating replay is valid only inside a private daemon. Falling back to the
+    # user's ambient daemon would both alter their session and bypass the exact
+    # policy refusal the ledger recorded.
     from services.mcp.private_hostd import private_daemon  # noqa: PLC0415
 
     with private_daemon() as isolated:
         if not isolated:
-            print("warning: no private daemon — replaying against the ambient engine",
-                  file=sys.stderr)
-        doc_id = _mint_doc()
-        if doc_id is None:
-            print("warning: no engine available; doc-targeted calls will fail on lookup",
-                  file=sys.stderr)
-        results = replay(failures, doc_id=doc_id)
+            results = replay(
+                failures, doc_id=None,
+                environment_error="private daemon unavailable; replay not executed",
+            )
+        else:
+            doc_id, geometry_seeded, seed_error = _mint_doc()
+            if doc_id is None:
+                results = replay(
+                    failures, doc_id=None,
+                    environment_error=f"{seed_error}; replay not executed",
+                )
+            else:
+                results = replay(
+                    failures, doc_id=doc_id, geometry_seeded=geometry_seeded,
+                )
     if args.json:
         args.json.write_text(json.dumps(results, indent=1, default=str))
     return report(results, detail=args.detail)

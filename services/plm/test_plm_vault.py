@@ -376,6 +376,66 @@ def test_unreadable_container_is_skipped_not_fatal(tmp_path):
         v.close()
 
 
+def test_tracked_corrupt_container_aborts_save_without_moving_head(tmp_path):
+    _write(tmp_path, "Bracket.step+", _part())
+    v = Vault.open(tmp_path)
+    try:
+        head_before = v._bind.head_commit()
+        item_id = v.status()["items"][0]["item_id"]
+        document_before = v._bind.read_blob_at(
+            head_before, snapshot.item_prefix(item_id) + "document.json")
+
+        (tmp_path / "Bracket.step+").write_bytes(b"not a zip anymore")
+
+        assert item_id in v.status()["dirty"]
+        with pytest.raises(VaultError) as exc:
+            v.save("auto")
+        assert exc.value.reason == "corrupt_item"
+        assert v._bind.head_commit() == head_before
+        assert v._bind.read_blob_at(
+            head_before, snapshot.item_prefix(item_id) + "document.json"
+        ) == document_before
+    finally:
+        v.close()
+
+
+def test_unreadable_tracked_tree_member_aborts_without_deleting_blob(
+        tmp_path, monkeypatch):
+    from services.plm import generic_snapshot
+
+    _write(tmp_path, "Bracket.step+", _part())
+    source = tmp_path / "source"
+    source.mkdir()
+    readable = source / "readable.py"
+    unreadable = source / "unreadable.py"
+    readable.write_text("print('kept')\n", encoding="utf-8")
+    unreadable.write_text("print('must not vanish')\n", encoding="utf-8")
+
+    v = Vault.open(tmp_path)
+    try:
+        item = v.add_item("source", doc_type="software")
+        head_before = v._bind.head_commit()
+        stored_path = snapshot.item_prefix(item["item_id"]) + "tree/unreadable.py"
+        stored_before = v._bind.read_blob_at(head_before, stored_path)
+        assert stored_before == b"print('must not vanish')\n"
+
+        original_read_bytes = generic_snapshot.Path.read_bytes
+
+        def fail_one_member(path):
+            if path == unreadable:
+                raise OSError("synthetic unreadable member")
+            return original_read_bytes(path)
+
+        monkeypatch.setattr(generic_snapshot.Path, "read_bytes", fail_one_member)
+        with pytest.raises(VaultError) as exc:
+            v.save("auto")
+        assert exc.value.reason == "snapshot_failed"
+        assert v._bind.head_commit() == head_before
+        assert v._bind.read_blob_at(head_before, stored_path) == stored_before
+    finally:
+        v.close()
+
+
 def test_extra_container_entries_survive_roundtrip(tmp_path):
     # netlist.json (a derived .ecad+ entry) must not be dropped on restore
     _write(tmp_path, "Controller.ecad+", _ecad(), extras={"netlist.json": b'{"nets":[1,2,3]}'})

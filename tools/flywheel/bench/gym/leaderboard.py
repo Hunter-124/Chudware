@@ -10,16 +10,14 @@ CLI::
                                                          [--diag PATH]
                                                          [--mock]
 
-Walks gym cycle JSON reports + per-cell graded/classifications under
-reports/runs/, folds in diag-v1 axis scores, and emits
-benchmarks/leaderboard/leaderboard.json. Idempotent: re-running rebuilds
-from sources (append-cycles semantics via counting distinct cycles per model).
+Loads exact per-cell metadata for an explicit cycle set, folds in eligible
+mode-matched diag-v1 axis scores, and emits benchmarks/leaderboard/leaderboard.json.
+Idempotent: re-running rebuilds from authoritative cell records.
 """
 from __future__ import annotations
 
 import argparse
 import json
-import re
 import statistics
 import sys
 from collections import defaultdict
@@ -130,56 +128,64 @@ def discover_cycle_reports(reports_dir: Path) -> list[dict[str, Any]]:
     return out
 
 
-def discover_cells(reports_dir: Path) -> list[dict[str, Any]]:
-    """Walk reports/runs/**/graded.json + classifications.json into cell records."""
+def discover_cells(
+    reports_dir: Path,
+    *,
+    cycles: set[str] | None = None,
+) -> list[dict[str, Any]]:
+    """Load exact persisted ``CellResult`` records for the selected cycles.
+
+    Directory names are portable, lossy storage details and are never parsed. Old
+    ``graded.json`` files without ``cell.json`` metadata are intentionally ineligible:
+    they do not carry trustworthy tier/model/mode identity.
+    """
     runs = reports_dir / "runs"
-    cells: list[dict[str, Any]] = []
     if not runs.is_dir():
-        return cells
-    for graded_path in sorted(runs.rglob("graded.json")):
-        run_dir = graded_path.parent
-        graded = _load_json(graded_path)
-        if not isinstance(graded, dict):
-            continue
-        classifications = _load_json(run_dir / "classifications.json") or []
-        # Infer challenge/division/tier/seed from dirname:
-        #   C1_local_local-24k_s1  (new, with division)
-        #   C1_local-24k_s1        (legacy, no division → default local)
-        #   C1_openrouter:x_s1
-        name = run_dir.name
-        division = "local"
-        m = re.match(
-            r"^(?P<ch>[A-Za-z0-9-]+)_(?P<div>local|open)_(?P<tier>.+)_s(?P<seed>\d+)$",
-            name,
-        )
-        if m:
-            challenge = m.group("ch")
-            division = m.group("div")
-            tier = m.group("tier")
-            seed = int(m.group("seed"))
-        else:
-            m = re.match(r"^(?P<ch>[A-Za-z0-9-]+)_(?P<tier>.+)_s(?P<seed>\d+)$", name)
-            if m:
-                challenge, tier, seed = m.group("ch"), m.group("tier"), int(m.group("seed"))
-            else:
-                challenge, tier, seed = graded.get("challenge", "?"), "unknown", 0
-        # Cycle name = parent folder under runs/
+        return []
+
+    if cycles is None:
+        metadata_paths = sorted(runs.glob("*/cell.json"))
+    else:
+        metadata_paths = [
+            path
+            for cycle in sorted(cycles)
+            for path in sorted((runs / cycle).glob("*/cell.json"))
+        ]
+
+    cells: list[dict[str, Any]] = []
+    required = {"challenge", "tier", "seed", "division", "cycle",
+                "model", "mode", "run_id"}
+    for metadata_path in metadata_paths:
         try:
-            cycle = run_dir.relative_to(runs).parts[0]
-        except (ValueError, IndexError):
-            cycle = "unknown"
-        cells.append({
-            "challenge": challenge,
-            "tier": tier,
-            "seed": seed,
-            "division": division,
-            "cycle": cycle,
-            "passed": bool(graded.get("passed")),
-            "graded": graded,
-            "classifications": classifications if isinstance(classifications, list) else [],
-            "run_dir": str(run_dir),
-            "ledger_path": str(run_dir / "ledger.json"),
-        })
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ValueError(f"unreadable cell metadata {metadata_path}: {exc}") from exc
+        if not isinstance(metadata, dict):
+            raise ValueError(f"cell metadata {metadata_path} must be a JSON object")
+        missing = sorted(required - metadata.keys())
+        if missing:
+            raise ValueError(
+                f"cell metadata {metadata_path} missing exact identity: {', '.join(missing)}")
+        cycle = str(metadata["cycle"])
+        if cycles is not None and cycle not in cycles:
+            continue
+        mode = str(metadata["mode"]).lower()
+        if mode not in ("real", "mock"):
+            raise ValueError(f"cell metadata {metadata_path} has invalid mode {mode!r}")
+
+        run_dir = metadata_path.parent
+        cell = dict(metadata)
+        cell["mode"] = mode
+        cell["passed"] = bool(cell.get("passed"))
+        cell["graded"] = cell.get("graded") if isinstance(cell.get("graded"), dict) else {}
+        cell["classifications"] = (
+            cell.get("classifications")
+            if isinstance(cell.get("classifications"), list)
+            else []
+        )
+        cell["run_dir"] = str(run_dir)
+        cell["ledger_path"] = str(run_dir / "ledger.json")
+        cells.append(cell)
     return cells
 
 
@@ -313,78 +319,95 @@ def aggregate(
     cells: list[dict[str, Any]] | None = None,
     cycle_reports: list[dict[str, Any]] | None = None,
     diag: dict[str, Any] | None = None,
+    cycles: set[str] | None = None,
 ) -> dict[str, Any]:
-    """Build an aicad.leaderboard/1 document from gym + diag sources."""
+    """Build an aicad.leaderboard/1 document from explicit cycles and cell modes."""
     reports_dir = Path(reports_dir) if reports_dir else REPORTS_DIR
-    if cells is None:
-        cells = discover_cells(reports_dir)
     if cycle_reports is None:
         cycle_reports = discover_cycle_reports(reports_dir)
+
+    report_cycles = {
+        str(report.get("cycle"))
+        for report in cycle_reports
+        if report.get("cycle") is not None
+    }
+    selected_cycles = set(cycles) if cycles is not None else report_cycles
+    cycle_reports = [
+        report for report in cycle_reports
+        if str(report.get("cycle")) in selected_cycles
+    ]
+
+    if cells is None:
+        cells = discover_cells(reports_dir, cycles=selected_cycles)
+    else:
+        cells = [
+            cell for cell in cells
+            if str(cell.get("cycle")) in selected_cycles
+        ]
     if diag is None:
         diag = load_diag(diag_path)
 
-    # Real builds keep only evaluated models. Scripted/mock paid cells (e.g. the
-    # historical frontier-200k fixture matrix) must not pollute the committed
-    # leaderboard — GUI empty-state covers missing paid providers. Local models
-    # always stay; paid models require a non-mock diag row or an openrouter:* tier
-    # cell from a cycle whose execution_mode is "real".
-    real_cycle_names: set[str] = set()
-    for rep in cycle_reports:
-        if rep.get("execution_mode") == "real":
-            real_cycle_names.add(str(rep.get("cycle") or Path(str(rep.get("_source") or "")).stem))
-    diag_is_mock = bool(diag and diag.get("mock"))
+    selected_mode = "mock" if force_mock else "real"
+    cells = [
+        cell for cell in cells
+        if str(cell.get("mode") or "").lower() == selected_mode
+    ]
+    cycle_reports = [
+        report for report in cycle_reports
+        if str(report.get("execution_mode") or "").lower() == selected_mode
+    ]
+
+    # A mock diagnostic source is ineligible for a real leaderboard, just like a
+    # mock cell. It may be included only by an explicit force_mock build.
+    if diag and diag.get("mock") and not force_mock:
+        diag = None
+
     diag_model_ids: set[str] = set()
-    if diag and not diag_is_mock:
+    if diag:
         for row in diag.get("results") or []:
             mid = (row.get("model") or {}).get("id")
             if mid and not row.get("error"):
                 diag_model_ids.add(mid)
 
-    # Group cells by model id (derived from tier).
+    # Group by the exact persisted model id. Tier parsing supplies labels/provider
+    # metadata only; it is never asked to recover identity from a run directory.
     by_model: dict[str, list[dict[str, Any]]] = defaultdict(list)
     tier_for_model: dict[str, str] = {}
-    for c in cells:
-        meta = model_id_for_tier(c["tier"])
-        mid = meta["id"]
-        by_model[mid].append(c)
-        tier_for_model.setdefault(mid, c["tier"])
+    for cell in cells:
+        tier = str(cell["tier"])
+        parsed = model_id_for_tier(tier)
+        mid = str(cell.get("model") or parsed["id"])
+        by_model[mid].append(cell)
+        tier_for_model.setdefault(mid, tier)
 
-    # Also include models that only appear in diag (no gym cells yet).
+    # Also include models that only appear in an eligible diag (no gym cells yet).
     if diag:
         for row in diag.get("results") or []:
-            m = (row.get("model") or {})
-            mid = m.get("id")
+            model = row.get("model") or {}
+            mid = model.get("id")
             if mid and mid not in by_model:
                 by_model[mid] = []
-                tier_for_model[mid] = row.get("tier") or m.get("tier") or mid
+                tier_for_model[mid] = row.get("tier") or model.get("tier") or mid
 
     models_out: list[dict[str, Any]] = []
     now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
     for mid, mcells in sorted(by_model.items()):
         tier = tier_for_model.get(mid, mid)
-        meta = model_id_for_tier(tier)
-        # Prefer diag model meta when present.
+        meta = {**model_id_for_tier(tier), "id": mid}
+        # Prefer diag display metadata when present, while preserving the exact id.
         if diag:
             for row in diag.get("results") or []:
                 if (row.get("model") or {}).get("id") == mid:
                     meta = {**meta, **{k: v for k, v in (row.get("model") or {}).items()
-                                       if k in ("id", "label", "provider", "kind")}}
+                                       if k in ("label", "provider", "kind")}}
                     break
 
-        # Drop mock paid models from a real store.
         if not force_mock and meta.get("kind") == "paid":
-            has_real_paid_cell = any(
-                (c.get("tier", "").startswith("openrouter:")
-                 or c.get("tier", "").startswith("xai:"))
-                and str(c.get("cycle") or "") in real_cycle_names
-                for c in mcells
-            )
-            has_real_diag = mid in diag_model_ids
-            if not (has_real_paid_cell or has_real_diag):
+            if not mcells and mid not in diag_model_ids:
                 continue
         n_total = len(mcells)
-        n_passed = sum(1 for c in mcells if c.get("passed"))
+        n_passed = sum(1 for cell in mcells if cell.get("passed"))
         pass_rate = round(n_passed / n_total, 4) if n_total else 0.0
 
         # Failure taxonomy counts.
@@ -557,18 +580,9 @@ def aggregate(
             "instrumentation_summary": instrumentation_summary,
         })
 
-    # Mock detection: force flag, diag.mock, or all cycle reports in mock mode.
-    is_mock = bool(force_mock)
-    if diag and diag.get("mock"):
-        is_mock = True
-    if cycle_reports and all(r.get("execution_mode") == "mock" for r in cycle_reports):
-        is_mock = True
-    # Existing cycle-1 cells that are mock-mode (no real provider usage events)
-    # — if we only have local scripted cells and a mock diag, badge it.
-    if not is_mock and diag is None and cycle_reports:
-        # Keep real if any report says real.
-        if not any(r.get("execution_mode") == "real" for r in cycle_reports):
-            is_mock = True
+    # The badge follows eligible scored data, not a global report toggle. A lone
+    # REAL report with no REAL cell can no longer launder historical MOCK scores.
+    is_mock = bool(force_mock or not (cells or diag_model_ids))
 
     suite = TASK_SUITE + ("-MOCK" if is_mock else "")
 
@@ -628,12 +642,14 @@ def build_and_write(
     reports_dir: Path | None = None,
     diag_path: Path | None = None,
     force_mock: bool = False,
+    cycles: set[str] | None = None,
 ) -> Path:
     """Aggregate and write leaderboard.json. Returns the output path."""
     doc = aggregate(
         reports_dir=reports_dir,
         diag_path=diag_path,
         force_mock=force_mock,
+        cycles=cycles,
     )
     errs = validate_leaderboard(doc)
     if errs:
@@ -654,6 +670,8 @@ def cmd_build(args: argparse.Namespace) -> int:
         reports_dir=Path(args.reports) if args.reports else None,
         diag_path=Path(args.diag) if args.diag else None,
         force_mock=bool(args.mock),
+        cycles={cycle.strip() for cycle in args.cycles.split(",") if cycle.strip()}
+        if args.cycles else None,
     )
     doc = json.loads(out.read_text(encoding="utf-8"))
     print(f"leaderboard written: {out}")
@@ -680,6 +698,8 @@ def main(argv: list[str] | None = None) -> int:
                    help="gym reports directory (default: tools/flywheel/bench/gym/reports)")
     b.add_argument("--diag", default=None,
                    help="diag-latest.json path (default: reports/diag/diag-latest.json)")
+    b.add_argument("--cycles", default=None,
+                   help="explicit comma-separated cycle ids to score")
     b.add_argument("--mock", action="store_true",
                    help="force -MOCK task_suite suffix (smoke/mock runs)")
     b.set_defaults(func=cmd_build)

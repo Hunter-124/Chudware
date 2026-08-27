@@ -1,20 +1,15 @@
-"""services.agent.pipeline — the copilot mission pipeline glue (T-W19).
+"""Reusable deterministic components for the intended copilot mission pipeline.
 
-The deterministic front-door helpers that turn a user request into delivered
-parts through the 8-phase mission machine specified in
-``docs/COPILOT_MISSION_PIPELINE.md``.  Everything here composes from already-built
-pieces (ledger T-W1, foreman T-W5, roles T-W7, buildgraph T-W15) — this package
-owns only the deterministic glue:
+The package contains the deliverable-manifest validator, phase state machine,
+exit gates, linkage checks, and replan routing specified by the mission-pipeline
+contracts.  These components are ready for runtime integration, but the
+production ``mission_start`` / mission-template path does not currently
+instantiate :class:`PhaseMachine`: ``services/mcp/mission_tools.py`` compiles the
+DAG directly.
 
-  * ``manifest``  — the ``aicad.deliverables/1`` validator (contract §16).
-  * ``phases``    — the phase state machine + exit gates (doc §1), state logged
-                    as ledger ``stage`` events.
-  * ``replan``    — the ``aicad.replan/1`` approval routing (contract §17).
-
-The DAG mission template (``services/dag/mission_template.py``) turns a validated
-manifest into an ``aicad.dag/1`` graph whose nodes carry role assignments; the
-MCP tools (``services/mcp/mission_tools.py``) and ``services.agent.loop.run_mission``
-are the callable front doors.
+Accordingly, importing this package does not imply that live missions are
+phase-enforced.  Wiring the machine into those front doors remains a separate
+product decision.
 """
 from __future__ import annotations
 
@@ -34,6 +29,7 @@ from .phases import (
     PhaseMachine,
     PhaseError,
     GateResult,
+    TransitionResult,
     PipelineFlags,
 )
 from .replan import (
@@ -61,6 +57,7 @@ __all__ = [
     "PhaseError",
     "GateResult",
     "PipelineFlags",
+    "TransitionResult",
     # replan
     "RoutingDecision",
     "route_replan",

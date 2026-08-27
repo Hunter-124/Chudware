@@ -20,6 +20,19 @@ from __future__ import annotations
 
 from typing import Any, Optional
 
+# Bound by the owner of a live mission for the process-global MCP fallback.
+# MissionDispatch serves its own run-scoped tools directly; this registration is
+# the same explicit fallback seam used by delegation_tools.DELEGATION_TREE.
+MISSION_CONTEXT: Any = None
+
+
+def bind_mission_context(context: Any) -> None:
+    """Bind, or clear with ``None``, the live context for org fallback tools."""
+    global MISSION_CONTEXT
+    MISSION_CONTEXT = context
+
+
+
 
 def register_org_tools(mcp) -> None:
     """Register the four org-layer tools under the ``org`` family."""
@@ -44,12 +57,8 @@ def register_org_tools(mcp) -> None:
 
         Returns the message event dict.
         """
-        try:
-            from services.agent.interaction import get_mission_context
-            ctx = get_mission_context()
-            org = getattr(ctx, "org_state", None) if ctx else None
-        except Exception:  # noqa: BLE001
-            org = None
+        ctx = MISSION_CONTEXT
+        org = getattr(ctx, "org_state", None) if ctx is not None else None
 
         if org is None:
             return {
@@ -81,12 +90,8 @@ def register_org_tools(mcp) -> None:
 
         Returns the resolved request dict.
         """
-        try:
-            from services.agent.interaction import get_mission_context
-            ctx = get_mission_context()
-            org = getattr(ctx, "org_state", None) if ctx else None
-        except Exception:  # noqa: BLE001
-            org = None
+        ctx = MISSION_CONTEXT
+        org = getattr(ctx, "org_state", None) if ctx is not None else None
 
         if org is None:
             return {
@@ -118,12 +123,8 @@ def register_org_tools(mcp) -> None:
 
         Returns the request dict with id and sla fields.
         """
-        try:
-            from services.agent.interaction import get_mission_context
-            ctx = get_mission_context()
-            org = getattr(ctx, "org_state", None) if ctx else None
-        except Exception:  # noqa: BLE001
-            org = None
+        ctx = MISSION_CONTEXT
+        org = getattr(ctx, "org_state", None) if ctx is not None else None
 
         if org is None:
             return {
@@ -161,32 +162,34 @@ def register_org_tools(mcp) -> None:
 
         Returns the completed council record dict.
         """
-        try:
-            from services.agent.interaction import get_mission_context
-            ctx = get_mission_context()
-            provider = getattr(ctx, "provider", None) if ctx else None
-            ledger = getattr(ctx, "ledger", None) if ctx else None
-            registry = getattr(ctx, "dissents_registry", None) if ctx else None
-            # T-DP8: read stage/tier from mission context when not explicitly given.
-            ctx_stage: Optional[str] = getattr(ctx, "stage", None) if ctx else None
-            ctx_tier: Optional[str] = getattr(ctx, "tier", None) if ctx else None
-            # Multiple providers for diverse-model selection (T-DP8).
-            ctx_providers: Optional[list] = getattr(ctx, "providers", None) if ctx else None
-        except Exception:  # noqa: BLE001
-            provider = None
-            ledger = None
-            registry = None
-            ctx_stage = None
-            ctx_tier = None
-            ctx_providers = None
+        ctx = MISSION_CONTEXT
+        provider = getattr(ctx, "provider", None) if ctx is not None else None
+        ledger = getattr(ctx, "ledger", None) if ctx is not None else None
+        registry = (
+            getattr(ctx, "dissents_registry", None) if ctx is not None else None
+        )
+        # T-DP8: read stage/tier from mission context when not explicitly given.
+        ctx_stage: Optional[str] = (
+            getattr(ctx, "stage", None) if ctx is not None else None
+        )
+        ctx_tier: Optional[str] = (
+            getattr(ctx, "tier", None) if ctx is not None else None
+        )
+        # Multiple providers for diverse-model selection (T-DP8).
+        ctx_providers: Optional[list] = (
+            getattr(ctx, "providers", None) if ctx is not None else None
+        )
 
-        if provider is None:
+        if ctx is None or provider is None:
             return {
+                "ok": False,
+                "policy_refusal": True,
+                "executed": False,
+                "status": "no_mission_context",
                 "error": (
-                    "council_convene: no provider in mission context. "
-                    "A provider must be configured for the mission."
+                    "council_convene is only available inside a mission turn with "
+                    "a bound provider."
                 ),
-                "status": "failed",
             }
 
         resolved_stage = stage or ctx_stage

@@ -6775,9 +6775,13 @@ int run_gui(const char *screenshotPath, const char *openPath) {
           std::string ext = std::filesystem::path(path).extension().string();
           std::transform(ext.begin(), ext.end(), ext.begin(),
                          [](unsigned char c) { return (char)std::tolower(c); });
+          const bool isDrawing = (ext == ".draw+");
           const bool isEcad = (ext == ".ecad+" || ext == ".ecad" ||
                                ext == ".kicad_sch" || ext == ".kicad_pcb");
-          if (isEcad) {
+          if (isDrawing) {
+            if (ui::featureTreeOpenDrawingPath(st, path))
+              st.pushRecentFile(path);
+          } else if (isEcad) {
             ecadOpenPath(st, path); // records Recent itself
           } else if (ui::featureTreeOpenPath(st, path)) {
             // ITEM 13: queue Zoom-to-Fit for THIS doc's first real display,

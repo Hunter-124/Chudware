@@ -138,10 +138,6 @@ set(CHUDWARE_CORE_SOURCES
   src/ui/scenarios.cpp   # scripted screenshot/test scenarios (extracted from app.cpp)
   src/core/app_state.cpp
   src/core/jobs.cpp
-  # --- Chudcode: ACP-backed Code workspace over the maintained Copilot UI ---
-  src/ui/code/code_acp.cpp              # stdio NDJSON/JSON-RPC transport (no UI state)
-  src/ui/code/code_mapping.cpp          # ACP updates -> existing Conversation/ChatMsg model
-  src/ui/code/code_workspace.cpp        # GL-thread lifecycle + command adapter
   # --- AI Copilot (T-RF6: split of the legacy_chat.cpp monolith — one chat impl, two hosts) ---
   src/ui/copilot/ui_common.cpp          # glass/bubble toolkit + shared small-UI helpers
   src/ui/copilot/chat_log.cpp           # message list rendering + stick-to-bottom
@@ -878,38 +874,6 @@ add_test(NAME test_stream_rows
   COMMAND test_stream_rows
   WORKING_DIRECTORY "${CMAKE_BINARY_DIR}")
 # --- end streamed-delta row routing ---
-
-# --- Chudcode ACP transport (GL/ImGui-free, self-spawning fake child) ---
-find_package(Threads REQUIRED)
-add_executable(test_code_acp_transport
-  src/ui/code/code_acp.cpp
-  tests/test_code_acp_transport.cpp)
-target_include_directories(test_code_acp_transport PRIVATE
-  ${CMAKE_CURRENT_SOURCE_DIR}/src)
-target_link_libraries(test_code_acp_transport PRIVATE
-  nlohmann_json::nlohmann_json
-  Threads::Threads)
-set_target_properties(test_code_acp_transport PROPERTIES
-  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
-add_test(NAME test_code_acp_transport
-  COMMAND test_code_acp_transport
-  WORKING_DIRECTORY "${CMAKE_BINARY_DIR}")
-
-# --- Chudcode ACP mapping into the real Copilot state model (GL-free) ---
-add_executable(test_code_workspace_mapping
-  src/ui/code/code_mapping.cpp
-  tests/test_code_workspace_mapping.cpp)
-target_include_directories(test_code_workspace_mapping PRIVATE
-  ${CMAKE_CURRENT_SOURCE_DIR}/src
-  ${imgui_SOURCE_DIR})
-target_link_libraries(test_code_workspace_mapping PRIVATE
-  nlohmann_json::nlohmann_json)
-set_target_properties(test_code_workspace_mapping PROPERTIES
-  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
-add_test(NAME test_code_workspace_mapping
-  COMMAND test_code_workspace_mapping
-  WORKING_DIRECTORY "${CMAKE_BINARY_DIR}")
-# --- end Chudcode ACP seams ---
 
 # --- CAM mirror parsing/timing + simulation-field mesh conversion (GL-free) ---
 # Links the real mirror implementation only. These contracts drive viewport overlays and the

@@ -8,7 +8,6 @@
 
 #include "ui/ai/ai_workspace.h"  // ui::agentDagToJson / agentDagFromJson — persist the live
                                  // agent-execution DAG with the active session's artifacts.
-#include "ui/code/code_workspace.h"
 
 #include "conv_ids.h"  // session-id allocation (GL-free TU, unit-tested in host/tests)
 #include <algorithm>
@@ -269,7 +268,6 @@ static void applyPromptDraftObject(AppState& st, const nlohmann::json& d) {
 }
 
 void savePromptDraft(AppState& st, bool force) {
-    if (st.codeWorkspaceMode) return;  // ACP/OMP owns Code-session persistence.
     // Per-key debounce so switching conversations never confuses last-write state.
     static std::string s_lastKey;
     static std::string s_lastSaved;
@@ -305,7 +303,6 @@ void savePromptDraft(AppState& st, bool force) {
 }
 
 void clearPromptDraft(AppState& st) {
-    if (st.codeWorkspaceMode) return;
     try {
         namespace fs = std::filesystem;
         const std::string path = promptDraftsPath();
@@ -325,7 +322,6 @@ void clearPromptDraft(AppState& st) {
 }
 
 static void restorePromptDraft(AppState& st) {
-    if (st.codeWorkspaceMode) return;
     // Don't clobber a non-empty composer (user already typing) — session switch clears first.
     if (st.prompt.data() && st.prompt.data()[0] != '\0') return;
     // Also skip if chips already present (e.g. mid-frame attach) unless both empty.
@@ -747,7 +743,6 @@ static void bindChatRawOwners(const std::string& conversationId,
 }
 
 void appendChatRawMessage(AppState& st, const ChatMsg& message) noexcept {
-    if (st.codeWorkspaceMode) return;
     try {
         const std::string conversationId = activeConversationId(st);
         if (conversationId.empty()) return;
@@ -856,7 +851,6 @@ static bool conversationIsFresh(const AppState& st, int idx);
 // every session is resident by design). Fresh sessions (no messages, no queue, no run) are
 // never written — same rule as empty parts never autosaving.
 void persistChatHistory(AppState& st) {
-    if (st.codeWorkspaceMode) return;  // ~/.omp is the sole Code transcript store.
     if (st.conversations.empty()) return;
     namespace fs = std::filesystem;
     std::error_code dirEc;
@@ -1168,7 +1162,6 @@ static void applyPendingScopeAssessment(AppState& st) {
 
 // Debounced flush while a turn is running (min 1.0s). Force bypasses the timer.
 void maybePersistChatHistoryDebounced(AppState& st, bool force) {
-    if (st.codeWorkspaceMode) return;
     applyPendingScopeAssessment(st);
     if (!force && !s_chatHistoryDirty.load(std::memory_order_relaxed)) return;
     const double now = ImGui::GetTime();
@@ -1370,7 +1363,6 @@ static void restoreActiveConversation(AppState& st);
 // so there is no per-document load path anymore; the WASM shared-store merge is the only
 // re-entry.
 void loadChatHistory(AppState& st) {
-    if (st.codeWorkspaceMode) return;
     // Park + drop everything resident — this runs before any session work has happened
     // (or from the WASM merge, which accepts a rebuild).
     parkActiveConversation(st);
@@ -1710,7 +1702,6 @@ static void relinkSavedDocSessions(AppState& st) {
 // st.chatDocKey (the current document's key, for run launches + prompt drafts), runs the
 // relink sweep, and kicks the one-time startup load.
 void syncChatToDoc(AppState& st) {
-    if (st.codeWorkspaceMode) return;
     relinkSavedDocSessions(st);
 #ifdef __EMSCRIPTEN__
     wasmKickSharedChatFetch();       // once: async GET full shared store
@@ -1805,12 +1796,6 @@ bool activeConversationRunning(AppState& st) {
 }
 
 void newConversation(AppState& st) {
-    if (st.codeWorkspaceMode) {
-        std::string err;
-        if (!ui::code::newSession(st, err) && !err.empty())
-            st.toast(ui::ToastLevel::Warn, err.c_str());
-        return;
-    }
     ensureConversations(st);
     // A fresh outgoing session is replaced, not parked — "+ New session" from an untouched
     // chat must not accumulate "Chat 1, Chat 2, …" empties in the list or on disk.
@@ -1830,13 +1815,6 @@ void newConversation(AppState& st) {
 }
 
 void switchConversation(AppState& st, int idx) {
-    if (st.codeWorkspaceMode) {
-        if (idx == st.activeConv || idx < 0 || idx >= (int)st.conversations.size()) return;
-        std::string err;
-        if (!ui::code::selectSession(st, st.conversations[idx].id, err) && !err.empty())
-            st.toast(ui::ToastLevel::Warn, err.c_str());
-        return;
-    }
     if (idx == st.activeConv || idx < 0 || idx >= (int)st.conversations.size()) return;
     // Same fresh-session rule as newConversation: never park an empty session.
     const int oldActive = st.activeConv;
@@ -1856,9 +1834,6 @@ void switchConversation(AppState& st, int idx) {
 }
 
 void closeConversation(AppState& st, int idx) {
-    // ACP v0.1 exposes resource release, not deletion, and the shared controller deliberately
-    // has no close action yet. Code-mode UI omits this action; never fall through to CAD delete.
-    if (st.codeWorkspaceMode) return;
     if (idx < 0 || idx >= (int)st.conversations.size()) return;
     bool closingActive = (idx == st.activeConv);
     if (closingActive) {
@@ -1921,7 +1896,6 @@ void closeConversation(AppState& st, int idx) {
 // session (preferring later indices, matching closeConversation's "next" bias); if none are
 // left, starts a fresh session so the composer never lands on a hidden conversation.
 void archiveConversation(AppState& st, int idx, bool archived) {
-    if (st.codeWorkspaceMode) return;  // ACP v0.1 has no archive/pin capability.
     if (idx < 0 || idx >= (int)st.conversations.size()) return;
     if (st.conversations[idx].archived == archived) return;
     st.conversations[idx].archived = archived;
@@ -1941,13 +1915,6 @@ void archiveConversation(AppState& st, int idx, bool archived) {
 }
 
 int forkConversation(AppState& st, int idx) {
-    if (st.codeWorkspaceMode) {
-        if (idx < 0 || idx >= (int)st.conversations.size()) return -1;
-        std::string err;
-        if (!ui::code::forkSession(st, st.conversations[idx].id, err) && !err.empty())
-            st.toast(ui::ToastLevel::Warn, err.c_str());
-        return st.activeConv;
-    }
     if (idx < 0 || idx >= (int)st.conversations.size()) return -1;
 
     const Conversation& source = st.conversations[idx];

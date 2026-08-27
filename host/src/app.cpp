@@ -117,7 +117,6 @@ inline void wasmBootReady() {
 #include "core/cpp_core.h" // sampling-profiler RPCs (prof_start/prof_stop) via libchudware
 #include "core/jobs.h"
 #include "ui/ai/ai_workspace.h" // AI workspace full-body hub (sessions + DAG + chat + settings)
-#include "ui/code/code_workspace.h" // Chudcode ACP-backed workspace lifecycle
 #include "ui/ai/active_work.h" // Active Work view live op feed
 #include "ui/appearance_common.h" // Appearance tab: MaterialPreset table (kMaterials) for presets
 #include "ui/cam/cam_panel.h" // CAM: manufacturing workspace (toolpaths / post / sim)
@@ -2504,7 +2503,6 @@ EMSCRIPTEN_KEEPALIVE void chudware_mobile_toggle_menu(void) {
 int run_gui(const char *screenshotPath, const char *openPath) {
   WASM_BOOT_LOG("[wasm-boot] run_gui enter\n");
   const bool shot = screenshotPath != nullptr;
-  const bool codeMode = ui::code::requested();
 #ifdef __EMSCRIPTEN__
   if (!glfwInit())
     return 1;
@@ -2548,10 +2546,10 @@ int run_gui(const char *screenshotPath, const char *openPath) {
   if (!shot)
     glfwWindowHint(GLFW_MAXIMIZED, GLFW_TRUE);
 #if !defined(_WIN32) && !defined(__EMSCRIPTEN__)
-  // CAD uses the maintained custom title bar. Code suppresses that CAD
-  // navigation entirely and keeps the native frame for move/resize/close.
-  if (!codeMode)
-    glfwWindowHint(GLFW_DECORATED, GLFW_FALSE);
+  // Borderless: the app draws its own title bar; chrome::tick handles
+  // move/resize. (Windows creates a normal window and strips the frame later
+  // via the WndProc in chrome::install.)
+  glfwWindowHint(GLFW_DECORATED, GLFW_FALSE);
 #endif
   // T-G15 dev/test hook: CHUDWARE_HIDDEN=1 creates the window unmapped so
   // headless shot runs never enter the compositor's present path (on an
@@ -2562,13 +2560,13 @@ int run_gui(const char *screenshotPath, const char *openPath) {
   if (shot && std::getenv("CHUDWARE_HIDDEN"))
     glfwWindowHint(GLFW_VISIBLE, GLFW_FALSE);
   // Stable window class / app_id so the desktop shell (KDE/GNOME) matches the
-  // correct installed desktop entry. Code and CAD are separate products while
-  // retaining the same renderer and UI implementation.
-  const char *windowClass = codeMode ? "chudcode" : "chudware";
-  const char *windowTitle = codeMode ? "Chudcode" : "Chudware";
-  glfwWindowHintString(GLFW_X11_CLASS_NAME, windowClass);
-  glfwWindowHintString(GLFW_X11_INSTANCE_NAME, windowClass);
-  glfwWindowHintString(GLFW_WAYLAND_APP_ID, windowClass);
+  // window to the installed .desktop entry (StartupWMClass=chudware) and shows
+  // the app icon in the taskbar instead of a generic placeholder. Without this,
+  // GLFW's WM_CLASS falls back to the window title, which may match no .desktop
+  // entry. Harmless on Windows (no-op hints). Must match chudware.desktop.
+  glfwWindowHintString(GLFW_X11_CLASS_NAME, "chudware");
+  glfwWindowHintString(GLFW_X11_INSTANCE_NAME, "chudware");
+  glfwWindowHintString(GLFW_WAYLAND_APP_ID, "chudware");
   // CHUDWARE_WIN_SIZE=WxH: explicit window geometry for managed/headless sessions
   // (chudware-web streams a fixed-size Xvfb display with no WM, so maximize hints
   // are no-ops there — the window must be created at display size and at 0,0).
@@ -2583,7 +2581,7 @@ int run_gui(const char *screenshotPath, const char *openPath) {
       winSized = true;
     }
   }
-  GLFWwindow *win = glfwCreateWindow(winW, winH, windowTitle, nullptr, nullptr);
+  GLFWwindow *win = glfwCreateWindow(winW, winH, "Chudware", nullptr, nullptr);
 #ifdef __EMSCRIPTEN__
   WASM_BOOT_LOG("[wasm-boot] glfwCreateWindow %s\n", win ? "ok" : "FAIL");
 #endif
@@ -2682,12 +2680,12 @@ int run_gui(const char *screenshotPath, const char *openPath) {
   ImGui_ImplOpenGL3_Init("#version 330");
 #endif
 
-  // CAD installs its borderless custom chrome. Code deliberately omits the CAD
-  // title/navigation strip and uses the native frame established above.
+  // Borderless window: strip the OS title bar/frame and drive our own
+  // (drag/resize/snap stay native). Must be installed after the ImGui GLFW
+  // backend so our WndProc is on top.
   static chrome::HitLayout hitLayout;
   hitLayout.resizeBorder = (int)(6 * scale);
-  if (!codeMode)
-    chrome::install(win, &hitLayout);
+  chrome::install(win, &hitLayout);
 
   Tex wordmark = loadTexture(assets + "/logo_wordmark.png");
   Tex wordmarkDark = loadTexture(assets + "/logo_wordmark_dark.png");
@@ -2970,12 +2968,6 @@ int run_gui(const char *screenshotPath, const char *openPath) {
   st.recentProjects = st.settings.recentProjects;
   st.workspaceDir = st.settings.workspaceDir;
   ui::ensureWorkspaceDir(st);
-  if (st.codeWorkspaceMode) {
-    // Process-only selection: never write this workspace/layout choice back to
-    // CAD Settings. The frame loop reasserts it after input/event pumps.
-    st.activeWorkspace = AppState::Workspace::AI;
-    st.showAIPanel = true;
-  }
 
   // Re-apply theme from persisted settings (env override already applied above;
   // if a saved setting differs, the persisted value wins unless env was set).
@@ -3610,11 +3602,8 @@ int run_gui(const char *screenshotPath, const char *openPath) {
   // OCCT + daemon hello) off the pre-loop path so the first frames can paint
   // chrome and become interactive. Shot/scenario mode still boots synchronously
   // so captures stay deterministic.
-  // Chudcode's backend is ACP, not the CAD engine/runtime. Booting libchudware/hostd here
-  // adds a multi-second delay, emits irrelevant setup errors, and can overwrite the ACP
-  // connection status with "Setup needed". CAD mode keeps the established runtime path.
   st.rtReady = runtimeReady();
-  if (!st.codeWorkspaceMode) {
+
 #ifndef _WIN32
   // On Linux/macOS the backend is the in-process C++ core (libchudware), not a
   // managed Python venv — route through tryStartWorker, whose libchudware guard
@@ -3651,32 +3640,6 @@ int run_gui(const char *screenshotPath, const char *openPath) {
         false); // self-provision from the payload next to the exe / source tree
   }
 #endif
-  } else {
-    st.rtReady = true;
-    st.workerBootPending = false;
-    st.startupPhase.clear();
-  }
-  if (st.codeWorkspaceMode) {
-    ui::code::StartupOptions options;
-    const char *cli = std::getenv("CHUDCODE_CLI");
-    if (!cli || !cli[0])
-      cli = std::getenv("CHUDWARE_CODE_CLI"); // compatibility alias
-    if (cli && cli[0])
-      options.executable = cli;
-    options.cwd = st.plmProjectPath();
-    std::string codeErr;
-    if (!ui::code::start(st, options, codeErr)) {
-      // start() also records the mapper's blocked state; keep the shell-side
-      // status explicit so an immediate spawn failure can never look connected.
-      st.status = "Chudcode unavailable";
-      if (!codeErr.empty())
-        st.status += ": " + codeErr;
-      st.statusKind = 2;
-      st.addLog("[code] startup blocked: " +
-                (codeErr.empty() ? std::string("failed to start ACP")
-                                 : codeErr));
-    }
-  }
 
   // NOTE: the old "welcome model" (mounting_plate.stl into the bare renderer)
   // is gone — it contradicted the empty Part1 document (a mesh with no tree
@@ -4705,9 +4668,10 @@ int run_gui(const char *screenshotPath, const char *openPath) {
     }
 #endif
 
-    // Code keeps native window chrome; CAD keeps the established custom hit map.
-    if (!st.codeWorkspaceMode)
-      chrome::tick(win, &hitLayout);
+    // Borderless-window chrome: drag / edge-resize / double-click-maximize off
+    // the same title-bar HitLayout the GUI publishes. No-op on Windows (the
+    // WndProc handles it).
+    chrome::tick(win, &hitLayout);
 
     // Unsaved-changes guard on exit. A close request (title-bar X / Alt+F4 /
     // File > Quit all set glfwSetWindowShouldClose) is intercepted here: if any
@@ -4738,7 +4702,7 @@ int run_gui(const char *screenshotPath, const char *openPath) {
       }
     }
 
-    if (st.setupDone.exchange(false) && !st.codeWorkspaceMode) {
+    if (st.setupDone.exchange(false)) {
       bool ok;
       std::string msg;
       {
@@ -4806,25 +4770,41 @@ int run_gui(const char *screenshotPath, const char *openPath) {
     // the GL thread, before this frame's panels draw, so results land like any
     // other state.
     st.rpc.drain();
-    // Every operation in this block belongs to CAD documents/geometry. Calling even the
-    // apparently-cheap event pump initializes engine::daemonMode(), which used to make
-    // Chudcode spend ~3 seconds trying hostd and then display irrelevant setup failures.
-    if (!st.codeWorkspaceMode) {
-      // Manufacturing panels enqueue intent only. Dispatch after the prior frame's
-      // callbacks drain, before hostd events update the read-only mirror.
-      ui::dispatchManufactureRequests(st);
-      // T-PERF3: commit mesh loads that finished disk-parse on the loader thread.
-      st.drainMeshLoads();
+    // Manufacturing panels enqueue intent only. Dispatch after the prior frame's
+    // callbacks drain, before hostd events update the read-only mirror.
+    ui::dispatchManufactureRequests(st);
+    // T-PERF3: commit mesh loads that finished disk-parse on the loader thread
+    // (GL upload only here; stale gens dropped so keep-last-good stays on
+    // screen).
+    st.drainMeshLoads();
 #ifdef __EMSCRIPTEN__
-      drainWebFileDrop(st);
+    // Browser canvas drop → fsUpload → requestOpenPath (set by
+    // chudware_web_drop_done).
+    drainWebFileDrop(st);
 #endif
-      // Shared-engine daemon events and legacy file handoff are mutually exclusive.
-      core::engineEventsTick(st);
-      st.sweepRetiredSessions();
-      if (!engine::daemonMode())
-        ui::pollAiCadHandoff(st);
-      ui::pollChatOpenFoam(st);
-    }
+    // Phase 4 (shared engine daemon): drain hostd push events — foreign-edit
+    // mirror refresh, mirror tabs from doc.opened, lease toasts. No-op in
+    // legacy (in-process) mode.
+    core::engineEventsTick(st);
+    // Multi-document: release closed-tab sessions whose async work (PM preview
+    // / sketch / eval callbacks that captured `this`) has now fully drained —
+    // safe to destroy once rpc is idle.
+    st.sweepRetiredSessions();
+
+    // Live MCP handoff: if the external Chudware MCP server (the engine Claude
+    // drives) published a new part, open/refresh it in the viewport so the user
+    // watches the AI build. Self-guards and no-ops the vast majority of frames
+    // (a single mtime stat). In daemon mode the live preview arrives as
+    // doc.changed events with the mesh path (engineEventsTick above) — the
+    // .step+ file handoff is legacy only, so skip the poller entirely (no
+    // second source of truth).
+    if (!engine::daemonMode())
+      ui::pollAiCadHandoff(st);
+
+    // If a chat-triggered accurate (OpenFOAM) CFD finished on the SimClient
+    // channel, post its Cd/Cl onto the running chat bubble. No-op unless a chat
+    // OpenFOAM run is pending.
+    ui::pollChatOpenFoam(st);
 
     // C48: click telemetry for interaction debugging — only when
     // CHUDWARE_DEBUG_INPUT is set (pairs with CHUDWARE_LOG_FILE). Logs what ImGui
@@ -6880,16 +6860,6 @@ int run_gui(const char *screenshotPath, const char *openPath) {
       } // fileReady
     }
 
-    // ACP is another event source, drained exactly once on the GL thread after
-    // the frame's existing event/request pumps and before drawAiWorkspace().
-    // Reassert the process-only product layout here so hidden CAD shortcuts,
-    // document activation, or restored state cannot escape the Code workspace.
-    if (st.codeWorkspaceMode) {
-      ui::code::tick(st);
-      st.activeWorkspace = AppState::Workspace::AI;
-      st.showAIPanel = true;
-    }
-
     // Re-push palette-derived viewport visuals every frame so a runtime theme
     // toggle (from the title bar) takes effect immediately. Cheap uniform/state
     // sets; no GPU allocation.
@@ -6957,17 +6927,14 @@ int run_gui(const char *screenshotPath, const char *openPath) {
     const bool maximized = glfwGetWindowAttrib(win, GLFW_MAXIMIZED) != 0;
 
     float barH = 0.0f;
-    if (!st.codeWorkspaceMode)
-      ui::drawTitleBar(st, maximized, barH);
+    ui::drawTitleBar(st, maximized, barH);
 
     // Window title mirrors the active document + dirty marker
     // (SolidWorks-style). Cheap change-detection so glfwSetWindowTitle only
     // fires when the string actually changes.
     {
       std::string title;
-      if (st.codeWorkspaceMode) {
-        title = "Chudcode";
-      } else if (st.activeTab >= 0 && st.activeTab < (int)st.docTabs.size()) {
+      if (st.activeTab >= 0 && st.activeTab < (int)st.docTabs.size()) {
         const auto &tab = st.docTabs[st.activeTab];
         title = tab.title.empty() ? "Untitled" : tab.title;
         if (tab.dirty)
@@ -7028,10 +6995,9 @@ int run_gui(const char *screenshotPath, const char *openPath) {
     // active title-bar workspace so Model shows modeling tools, Simulate shows
     // sim tools, etc. (WIRE_REQUESTS).
     ui::setRibbonWorkspace(static_cast<int>(st.activeWorkspace));
-    float ribbonH = ui::drawRibbon(
-        st.ribbonTab, st.showRibbon && !st.codeWorkspaceMode,
-        st.showSimulationTools, st.showPcbTools, barH,
-        st.activeTabIsDrawing());
+    float ribbonH =
+        ui::drawRibbon(st.ribbonTab, st.showRibbon, st.showSimulationTools,
+                       st.showPcbTools, barH, st.activeTabIsDrawing());
 
     // Electronics: surface the PCB DRC/unrouted summary in the ribbon band's
     // trailing dead space (the board canvas gave up its bottom results strip to
@@ -7069,11 +7035,10 @@ int run_gui(const char *screenshotPath, const char *openPath) {
     const float entBarH = 0.0f;
 #endif
 
-    // Code is a workspace product, not a hidden CAD document session. Keeping
-    // the starter out also prevents document activation from pulling the
-    // process-only AI workspace back to Model.
-    if (!st.codeWorkspaceMode)
-      ensureStarterDoc(st, shot);
+    // ---------- default starter document ----------
+    // Open straight into a fresh part on launch (non-shot) so the app is
+    // immediately usable.
+    ensureStarterDoc(st, shot);
 
     // ---------- active document reconciliation ----------
     // The browser/SolidWorks-style document tabs are rendered by the central
@@ -8212,17 +8177,6 @@ int run_gui(const char *screenshotPath, const char *openPath) {
     // to start wantTree and treeShotDone: take the screenshot at frame 10 (tree
     // has repainted)
     int shotFrame = st.wantTree ? (st.treeShotDone ? 10 : 30) : 6;
-    // ACP startup is asynchronous and a generic frame-6 capture can photograph an
-    // indeterminate "Starting…" shell. Wait for the real initialized/authenticated
-    // connection, but bound the proof so a broken CLI still produces a failure image.
-    if (st.codeWorkspaceMode) {
-      static int s_codeConnectedFrame = -1;
-      if (ui::code::connected() && s_codeConnectedFrame < 0)
-        s_codeConnectedFrame = st.frame;
-      shotFrame = s_codeConnectedFrame >= 0
-                      ? s_codeConnectedFrame + 2
-                      : (st.frame >= 300 ? st.frame : 99999);
-    }
     // equations shot: wait (up to 30 frames) for the worker, then capture at
     // frame 10 once the two globals are seeded and the dialog has repainted
     // with its rows.
@@ -8332,11 +8286,6 @@ int run_gui(const char *screenshotPath, const char *openPath) {
     emscripten_sleep(0);
 #endif
   }
-  // Release the ACP resource/process before persisting its final mapped rows
-  // and before any worker, texture, ImGui, or GLFW owner is destroyed.
-  if (st.codeWorkspaceMode)
-    ui::code::shutdown(st);
-
 
   // Clean-exit signal (daemon mode): closing the app normally is a DELIBERATE
   // exit. In-flight agent runs are NOT cancelled here — they execute
@@ -8357,7 +8306,7 @@ int run_gui(const char *screenshotPath, const char *openPath) {
   //    autosave and lose the work. A plain detach leaves it for the daemon's
   //    GC/retire tier so it's recoverable — closing the real data-loss hole.
   //    Screenshot/headless runs skip it.
-  if (!st.codeWorkspaceMode && !shot && engine::daemonMode()) {
+  if (!shot && engine::daemonMode()) {
     if (auto *c = engine::client()) {
       for (const auto &t : st.docTabs) {
         if (t.docId.empty() || (t.kind != AppState::DocTab::TabKind::Part &&

@@ -12,7 +12,6 @@
 #include "ui/clipboard_image.h"          // image-kind probe / mime / clipboard->PNG capture
 #include "ui/copilot/image_lightbox.h"   // attachment thumbnail tile + full-size viewer
 #include "ui/copilot/context_estimate.h"  // transcript-size estimate behind the context meter
-#include "ui/code/code_workspace.h"
 #include <climits>                        // INT_MAX saturation in activityCharsOf()
 
 // ---- auto-growing, wrapping chat input -------------------------------------------------------
@@ -3081,22 +3080,6 @@ static bool modeMenuRow(const char* iconName, const char* label, bool selected,
 // (inline, only while a run is active) + context meter (right).
 // Permissions live only in the Settings overlay (not the composer).
 static void drawComposerPrelude(AppState& st, bool busy) {
-    if (st.codeWorkspaceMode) {
-        // ACP owns the session mode and provider configuration. Keep only the authoritative
-        // context readout (updated from ACP usage) and live-state mark; CAD's mutable
-        // Agent/Plan/Swarm/Edit/Ask and provider-quota controls do not apply here.
-        const float room = ImGui::GetContentRegionAvail().x;
-        const float meterW = measureContextMeter(st, room);
-        if (busy || activeConversationRunning(st)) {
-            drawBusyMark(ImGui::GetFrameHeight());
-            ImGui::SameLine(0.0f, ui::metrics::px(6));
-        }
-        const float rightX = ImGui::GetContentRegionMax().x - meterW;
-        if (rightX > ImGui::GetCursorPosX()) ImGui::SetCursorPosX(rightX);
-        drawContextMeter(st, room);
-        return;
-    }
-
 
     const auto& pal = ui::palette;
     const float sc = ui::uiScale;
@@ -3586,63 +3569,6 @@ static void drawComposerToolbar(AppState& st, bool busy, bool embedded = false) 
     ImGui::PushStyleColor(ImGuiCol_Button, chipBg);
     ImGui::PushStyleColor(ImGuiCol_ButtonHovered, chipHov);
     ImGui::PushStyleColor(ImGuiCol_ButtonActive, chipAct);
-    if (st.codeWorkspaceMode) {
-        // ACP owns the session configuration. Render the values it actually reported,
-        // read-only; stale CAD provider/model settings are not authoritative in Code mode.
-        const auto& config = ui::code::sessionConfiguration();
-        const std::string mode = config.mode.empty() ? "mode pending" : config.mode;
-        const std::string model = config.model.empty() ? "model pending" : config.model;
-        const std::string thinking =
-            config.thinking.empty() ? "thinking pending" : config.thinking;
-        ImGui::PushStyleColor(ImGuiCol_Text, surf.textSecondary);
-        ImGui::AlignTextToFramePadding();
-        ImGui::TextUnformatted((mode + "  \xC2\xB7  " + model +
-                                "  \xC2\xB7  " + thinking).c_str());
-        ImGui::PopStyleColor();
-
-        if (ui::code::capabilities().images) {
-            ImGui::SameLine();
-            if (ImGui::Button("Image")) {
-                if (std::getenv("CHUDWARE_NO_FILE_DIALOGS")) {
-                    st.toast(ui::ToastLevel::Info,
-                             "File dialogs are disabled (CHUDWARE_NO_FILE_DIALOGS).");
-                } else {
-                    std::string p = openFileDialog(
-                        "Images (*.png;*.jpg;*.jpeg;*.webp;*.gif)\0"
-                        "*.png;*.jpg;*.jpeg;*.webp;*.gif\0");
-                    if (!p.empty() && ui::isImageAttachment(p) &&
-                        std::find(st.pendingAttachments.begin(), st.pendingAttachments.end(), p) ==
-                            st.pendingAttachments.end()) {
-                        st.pendingAttachments.push_back(std::move(p));
-                    }
-                }
-            }
-            if (ImGui::IsItemHovered())
-                ImGui::SetTooltip("Attach an image to the next Chudcode prompt.");
-        }
-
-        ImGui::SameLine();
-        if (busy) ImGui::BeginDisabled();
-        if (ImGui::Button("New")) {
-            std::string err;
-            if (ui::code::newSession(st, err)) {
-                clearPromptDraft(st);
-                st.prompt[0] = 0;
-                st.pendingAttachments.clear();
-                st.showAISettingsOverlay = false;
-            } else if (!err.empty()) {
-                st.toast(ui::ToastLevel::Warn, err.c_str());
-            }
-        }
-        if (busy) ImGui::EndDisabled();
-        if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
-            ImGui::SetTooltip("Start a fresh Chudcode session.");
-
-        ImGui::PopStyleColor(3);
-        ImGui::PopStyleVar(3);
-        return;
-    }
-
 
     // Thinking effort — ALWAYS present. Show just the level (no "Thinking: " prefix)
     // so the model label has room to extend left.
@@ -4282,35 +4208,31 @@ static void drawComposerSendStop(AppState& st, const ImVec2& inMin, const ImVec2
 // ---- the composer: a rounded input box (in-box send) + inline toolbar (model, thinking, +) ----
 // Submits on Enter or the in-box send button. Returns nothing; runs the turn directly.
 void drawComposer(AppState& st, bool busy, bool canRun) {
-    const bool codeMode = st.codeWorkspaceMode;
-    if (codeMode) {
-        // Process-level Code mode has no CAD context/file carrier. Remove impossible stale
-        // payloads before they can make an otherwise valid ACP prompt reject invisibly.
-        st.pendingAttachments.erase(
-            std::remove_if(st.pendingAttachments.begin(), st.pendingAttachments.end(),
-                           [](const std::string& path) { return !ui::isImageAttachment(path); }),
-            st.pendingAttachments.end());
-        st.pendingContextRefs.clear();
-        st.contextPickActive = false;
-    }
-    if (!codeMode) {
-        // GL-thread-only drain of Stop/steer log lines queued by the CAD control-channel worker.
-        agentControlDrainLogs(st);
+    // GL-thread-only drain of Stop/steer log lines queued by the control-channel worker
+    // thread (see AgentControlChannel above) — must run every visible frame, not just on
+    // Stop, so nothing queued right before a frame boundary is lost.
+    agentControlDrainLogs(st);
+    // Forging busy affordance lives in drawComposerPrelude (inline between mode
+    // dropdown and context meter) — no reserved row above the input.
 
-        const bool hasDoc = st.docMirror.hasDoc();
-        // Keep CAD mode valid + sync settings.copilotMode (persisted).
-        if (st.aiInteraction == (int)CopilotMode::Edit && !hasDoc) {
-            st.aiInteraction = (int)CopilotMode::Agent;
-            st.settings.copilotMode = (int)CopilotMode::Agent;
-        }
-        if (st.aiInteraction < 0 || st.aiInteraction > 5) st.aiInteraction = 0;
-        st.agentV2 = (st.aiInteraction != (int)CopilotMode::Ask);
-        static bool s_modeSeeded = false;
-        if (!s_modeSeeded) {
-            s_modeSeeded = true;
-            int cm = st.settings.copilotMode;
-            if (cm >= 0 && cm <= 4) st.aiInteraction = cm;
-        }
+
+    const bool hasDoc = st.docMirror.hasDoc();
+
+    // Keep mode valid + sync settings.copilotMode (persisted).
+    // Edit requires a doc — fall back to Agent when none is open.
+    if (st.aiInteraction == (int)CopilotMode::Edit && !hasDoc) {
+        st.aiInteraction = (int)CopilotMode::Agent;
+        st.settings.copilotMode = (int)CopilotMode::Agent;
+    }
+    if (st.aiInteraction < 0 || st.aiInteraction > 5) st.aiInteraction = 0;
+    // agentV2 flag: any mutating orchestrator mode (Agent/Plan/Swarm/Edit). Ask is one-shot.
+    st.agentV2 = (st.aiInteraction != (int)CopilotMode::Ask);
+    // One-shot: seed live mode from persisted settings after loadSettings.
+    static bool s_modeSeeded = false;
+    if (!s_modeSeeded) {
+        s_modeSeeded = true;
+        int cm = st.settings.copilotMode;
+        if (cm >= 0 && cm <= 4) st.aiInteraction = cm;
     }
 
     // Esc: close slash autocomplete first, then staged edit restore, else disarm context pick.
@@ -4336,22 +4258,21 @@ void drawComposer(AppState& st, bool busy, bool canRun) {
     // Also require the viewed conversation's run to be idle: after Stop, aiTurnActive is false
     // (stopRequested terminal) but the cancelled run may still be unwinding — don't launch a
     // queued turn on top of it. Another conversation's run is irrelevant here.
-    if (!codeMode && !aiTurnActive(st) && !st.convRunning(st.activeConvId()) &&
-        !st.queuedPrompts.empty() && canRun) {
+    if (!aiTurnActive(st) && !st.convRunning(st.activeConvId()) && !st.queuedPrompts.empty() &&
+        canRun) {
         std::string next = st.queuedPrompts.front();
         st.queuedPrompts.erase(st.queuedPrompts.begin());
         // Queued sends never commit a staged edit (stage should already be cleared).
         submitTurn(st, next);
     }
 
-    const bool active = codeMode ? (busy || activeConversationRunning(st)) : aiTurnActive(st);
-    const bool runtimeReady = codeMode ? ui::code::connected() : canRun;
-    bool canStart = runtimeReady && !composerText(st).empty() && !active;
-    bool submit   = false;
-    bool stopReq  = false;
+    const bool active = aiTurnActive(st);
+    bool canStart = canRun && !composerText(st).empty() && !active;  // start now only when idle
+    bool submit   = false;   // send / queue requested this frame
+    bool stopReq  = false;   // stop requested this frame
 
     // ---- queued messages (shown above the composer: send-now-and-interrupt, or remove) ----
-    if (!codeMode && !st.queuedPrompts.empty()) {
+    if (!st.queuedPrompts.empty()) {
         ImGui::PushStyleColor(ImGuiCol_Text, chatSurf().textSecondary);
         for (size_t qi = 0; qi < st.queuedPrompts.size(); ++qi) {
             ImGui::PushID((int)qi + 9000);
@@ -4387,17 +4308,10 @@ void drawComposer(AppState& st, bool busy, bool canRun) {
     // One prune per frame, ahead of the chip row: drops document extracts whose file is no
     // longer attached, whichever path removed it (the detach ×, a send that consumed the
     // chips, a conversation switch that cleared them). Cheap — the chip row is a handful.
-    if (!codeMode) pruneAttachInfo(st);
+    pruneAttachInfo(st);
 
-    const bool codeImages = !codeMode || ui::code::capabilities().images;
-    const bool hasVisibleAttachment = std::any_of(
-        st.pendingAttachments.begin(), st.pendingAttachments.end(),
-        [&](const std::string& path) {
-            return !codeMode || (codeImages && ui::isImageAttachment(path));
-        });
-    // Code mode deliberately omits non-image files and CAD selection/context references:
-    // ACP v0.1 can carry image content, but none of those other payloads.
-    if (hasVisibleAttachment || (!codeMode && !st.pendingContextRefs.empty())) {
+    // ---- chips above the input: file attachments (M23) + context refs (Wave4) ----
+    if (!st.pendingAttachments.empty() || !st.pendingContextRefs.empty()) {
         const ui::AdaptiveSurface& asurf = chatSurf();
         const float sc = ui::uiScale;
         ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, ui::metrics::rounding(6.0f));
@@ -4441,8 +4355,6 @@ void drawComposer(AppState& st, bool busy, bool canRun) {
         const float chipPadX = 6 * sc, chipPadY = 3 * sc;
 
         for (size_t ai = 0; ai < st.pendingAttachments.size(); ++ai) {
-            if (codeMode && (!codeImages || !ui::isImageAttachment(st.pendingAttachments[ai])))
-                continue;
             ImGui::PushID((int)ai + 12000);
             const std::string apath = st.pendingAttachments[ai];  // copy: the vector can erase
             const bool  isImg   = ui::isImageAttachment(apath);
@@ -4534,7 +4446,7 @@ void drawComposer(AppState& st, bool busy, bool canRun) {
         chipSplit.Merge(chipDl);
 
         // Context-ref chips: kind letter + label + ×
-        if (!codeMode) for (size_t ci = 0; ci < st.pendingContextRefs.size(); ++ci) {
+        for (size_t ci = 0; ci < st.pendingContextRefs.size(); ++ci) {
             ImGui::PushID((int)ci + 14000);
             const auto& ref = st.pendingContextRefs[ci];
             char kindLetter = '?';
@@ -4572,7 +4484,7 @@ void drawComposer(AppState& st, bool busy, bool canRun) {
     }
 
     // Armed pick hint (selection-well language) above the prelude.
-    if (!codeMode && st.contextPickActive) {
+    if (st.contextPickActive) {
         const ui::AdaptiveSurface& asurf = chatSurf();
         const float sc = ui::uiScale;
         ImGui::PushStyleColor(ImGuiCol_Text,
@@ -4587,12 +4499,11 @@ void drawComposer(AppState& st, bool busy, bool canRun) {
     drawComposerPrelude(st, busy);
 
     const char* placeholder =
-        codeMode                                      ? "Ask Chudcode\xE2\x80\xA6"
-      : st.aiInteraction == (int)CopilotMode::Ask    ? "Ask about this part\xE2\x80\xA6"
-      : st.aiInteraction == (int)CopilotMode::Edit   ? "Describe a change to this part\xE2\x80\xA6"
-      : st.aiInteraction == (int)CopilotMode::Plan   ? "Describe what to plan\xE2\x80\xA6"
-      : st.aiInteraction == (int)CopilotMode::Swarm  ? "Describe a multi-agent mission\xE2\x80\xA6"
-                                                     : "Describe what to build\xE2\x80\xA6";
+        st.aiInteraction == (int)CopilotMode::Ask   ? "Ask about this part\xE2\x80\xA6"
+      : st.aiInteraction == (int)CopilotMode::Edit  ? "Describe a change to this part\xE2\x80\xA6"
+      : st.aiInteraction == (int)CopilotMode::Plan  ? "Describe what to plan\xE2\x80\xA6"
+      : st.aiInteraction == (int)CopilotMode::Swarm ? "Describe a multi-agent mission\xE2\x80\xA6"
+                                                    : "Describe what to build\xE2\x80\xA6";
 
     ImDrawList* composerDl = ImGui::GetWindowDrawList();
     ImDrawListSplitter composerSplit;
@@ -4628,15 +4539,10 @@ void drawComposer(AppState& st, bool busy, bool canRun) {
         s_refocusComposer = false;
     }
     // Prime slash-menu skill catalog once the worker is up (cheap TTL'd RPC).
-    if (!codeMode && st.workerStarted) pollComposerSkills(st, /*force=*/false);
+    if (st.workerStarted) pollComposerSkills(st, /*force=*/false);
 
-    if (codeMode) {
-        // ACP publishes its own slash-command semantics. Do not intercept them with CAD's
-        // host-side /compact, /shake, /handoff, or local skill menu.
-        g_slashMenuActive = false;
-        s_slash.open = false;
-        s_slash.matches.clear();
-    } else {
+    // Slash query opens before the InputText so Up/Down history callbacks fire this frame.
+    {
         std::string q;
         g_slashMenuActive = parseSlashQuery(st.prompt.data(), q);
     }
@@ -4654,8 +4560,7 @@ void drawComposer(AppState& st, bool busy, bool canRun) {
     static bool s_composerInputActive = false;
     {
         const ImGuiIO& pio = ImGui::GetIO();
-        if ((!codeMode || ui::code::capabilities().images) && s_composerInputActive &&
-            (pio.KeyCtrl || pio.KeySuper) &&
+        if (s_composerInputActive && (pio.KeyCtrl || pio.KeySuper) &&
             ImGui::IsKeyPressed(ImGuiKey_V, false) && ui::clipboardHasImage()) {
             std::string imgPath, imgErr;
             if (ui::clipboardImageToPng(imgPath, imgErr)) {
@@ -4686,25 +4591,23 @@ void drawComposer(AppState& st, bool busy, bool canRun) {
     ImGui::PopStyleColor(6);
     // Send/stop rides INSIDE the input box, anchored bottom-right of the composer glass.
     drawComposerSendStop(st, inputMin, inputMax,
-                         composerMin.x + composerW, runtimeReady, canStart, active, submit, stopReq);
+                         composerMin.x + composerW, canRun, canStart, active, submit, stopReq);
 
     // Slash autocomplete drop-up (commands + skills). Accept steals Enter from submit.
-    if (!codeMode) {
-        bool slashAteEnter = false;
-        if (drawSlashAutocomplete(st, inputMin, inputMax, slashAteEnter)) {
-            ++s_composerGen;          // active InputText ignores external buffer writes
-            s_refocusComposer = true;
-            submitInput = false;
-            submit = false;
-        } else if (slashAteEnter || (s_slash.open && submitInput)) {
-            // Menu open with matches: Enter must not send the half-typed `/foo` token.
-            submitInput = false;
-            submit = false;
-        }
+    bool slashAteEnter = false;
+    if (drawSlashAutocomplete(st, inputMin, inputMax, slashAteEnter)) {
+        ++s_composerGen;          // active InputText ignores external buffer writes
+        s_refocusComposer = true;
+        submitInput = false;
+        submit = false;
+    } else if (slashAteEnter || (s_slash.open && submitInput)) {
+        // Menu open with matches: Enter must not send the half-typed `/foo` token.
+        submitInput = false;
+        submit = false;
     }
 
     // No usage/provider id strip above the toolbar — model lives in the toolbar chip.
-    drawComposerToolbar(st, codeMode ? active : busy, true);
+    drawComposerToolbar(st, busy, true);
     ImGui::PopStyleVar();
 
     const ImVec2 composerMax(composerMin.x + composerW, ImGui::GetItemRectMax().y);
@@ -4714,15 +4617,7 @@ void drawComposer(AppState& st, bool busy, bool canRun) {
     composerSplit.Merge(composerDl);
 
     // ---- stop / submit / queue ----
-    if (stopReq) {
-        if (codeMode) {
-            std::string err;
-            if (!ui::code::cancel(st, err) && !err.empty())
-                st.toast(ui::ToastLevel::Warn, err.c_str());
-        } else {
-            requestStopRun(st);
-        }
-    }
+    if (stopReq) requestStopRun(st);
     auto clearComposerBox = [&]() {
         clearPromptDraft(st);
         st.prompt[0] = 0;
@@ -4731,18 +4626,7 @@ void drawComposer(AppState& st, bool busy, bool canRun) {
     };
     if (submit || submitInput) {
         const std::string text = composerText(st);   // flattened + trimmed; empty = no message
-        if (codeMode) {
-            // The controller consumes text + any image attachments only after the ACP request
-            // is accepted. A rejected dispatch leaves both the draft and its images intact.
-            if (!text.empty()) {
-                std::string err;
-                if (ui::code::submit(st, text, err)) {
-                    clearComposerBox();
-                } else if (!err.empty()) {
-                    st.toast(ui::ToastLevel::Warn, err.c_str());
-                }
-            }
-        } else if (active) {
+        if (active) {
             // A turn is running — STEER it mid-run when the engine knows the run_id
             // (agent_steer: text is folded into the live turn at its next step). Fall
             // back to next-turn queueing only when no run_id is available (e.g. the

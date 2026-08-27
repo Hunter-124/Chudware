@@ -3,7 +3,7 @@
 // Modes:
 //   Chudware --render  <in.stl> <out.png> [view]   single offscreen view (iso/front/right/top)
 //   Chudware --contact <in.stl> <out.png>          2x2 contact sheet
-//   Chudware [--gui] [--code]                      interactive CAD / Code desktop app
+//   Chudware [--gui]                               interactive desktop app (ImGui)
 //   Chudware --version                             print the product version and exit
 //
 // The offscreen modes need only a hidden GL context, so they verify the whole render
@@ -35,7 +35,6 @@
 #include "api/chudware_version.h"  // CHUDWARE_VERSION_LINE (generated, <build>/generated)
 #include "bootstrap.h"
 #include "core/app_state.h"  // appstateInitPersist (WASM IDBFS)
-#include "ui/code/code_workspace.h"
 #include "ipc_discovery.h"   // chudware_ipc::SingleInstance/instanceKey/guiLockPath (services/ipc)
 #include "mesh.h"
 #include "renderer.h"
@@ -374,29 +373,10 @@ long readGuiLockPid(const std::string& lockFile) {
 #endif
 
 std::string selfExePath() { return chudware::platform::executablePath(); }
-bool hasCliFlag(int argc, char** argv, const char* flag) {
-    for (int i = 1; i < argc; ++i)
-        if (argv[i] && std::strcmp(argv[i], flag) == 0) return true;
-    return false;
-}
-
-int cliFlagIndex(int argc, char** argv, const char* flag) {
-    for (int i = 1; i < argc; ++i)
-        if (argv[i] && std::strcmp(argv[i], flag) == 0) return i;
-    return -1;
-}
-
-bool codeWorkspaceLaunch(int argc, char** argv) {
-    if (hasCliFlag(argc, argv, "--code")) return true;
-    const char* env = std::getenv("CHUDCODE_MODE");
-    if (!env || !env[0])
-        env = std::getenv("CHUDWARE_CODE_MODE"); // compatibility alias
-    return env && env[0] && env[0] != '0';
-}
-
 
 bool automationLaunch(int argc, char** argv) {
-    if (hasCliFlag(argc, argv, "--ui-screenshot")) return true;
+    for (int i = 1; i < argc; ++i)
+        if (argv[i] && std::strcmp(argv[i], "--ui-screenshot") == 0) return true;
     if (const char* s = std::getenv("CHUDWARE_SHOT"); s && *s) return true;
     const char* multi = std::getenv("CHUDWARE_ALLOW_MULTI");
     return multi && multi[0] && multi[0] != '0';
@@ -419,11 +399,7 @@ std::string g_activationDoc;
 bool claimSingleInstance(int argc, char** argv) {
     if (automationLaunch(argc, argv)) return true;
 
-    // Preserve the established CAD key byte-for-byte. Only an explicit --code
-    // launch gets a product suffix, so the dev Chudware binary can host one CAD
-    // and one Code window simultaneously even when CHUDWARE_INSTANCE_KEY is set.
-    std::string key = chudware_ipc::instanceKey(selfExePath());
-    if (hasCliFlag(argc, argv, "--code")) key += "-code";
+    const std::string key = chudware_ipc::instanceKey(selfExePath());
     const std::string lock = chudware_ipc::guiLockPath(key);
     if (lock.empty()) return true;  // no usable runtime dir — fail open
     // "Open with" hand-off note: the app opens documents from argv, so a second launch carrying
@@ -700,22 +676,6 @@ int main(int argc, char** argv) {
     // Point the C++ core at its prompts on EVERY launch path (run_gui only calls
     // ensureRuntime when provisioning is needed, so it can't be relied on for this).
     ensurePromptsDir();
-    // Product selection must be established before AppState is constructed in
-    // run_gui. CHUDCODE_MODE is the screenshot/automation equivalent of the
-    // GUI-only --code flag; only the explicit flag changes lock identity.
-    const bool codeMode = codeWorkspaceLaunch(argc, argv);
-    ui::code::setRequested(codeMode);
-    if (codeMode) {
-        // Chudcode has no CAD document/geometry backend. Force the legacy engine selector
-        // off before any static/helper seam gets a chance to call engine::daemonMode();
-        // otherwise startup waits for hostd and emits setup failures for a service this
-        // product neither needs nor exposes.
-#ifdef _WIN32
-        _putenv_s("CHUDWARE_ENGINE_DAEMON", "0");
-#else
-        setenv("CHUDWARE_ENGINE_DAEMON", "0", 1);
-#endif
-    }
     if (argc >= 4 && std::strcmp(argv[1], "--render") == 0)
         return renderSingle(argv[2], argv[3], argc >= 5 ? argv[4] : "iso");
     if (argc >= 4 && std::strcmp(argv[1], "--contact") == 0)
@@ -732,10 +692,10 @@ int main(int argc, char** argv) {
     // without spinning Chromium up (and then having to tear it down); every headless CLI mode
     // above has already returned, and --ui-screenshot is exempted inside the guard itself.
     if (!claimSingleInstance(argc, argv)) return 0;
-    const int uiScreenshotArg = cliFlagIndex(argc, argv, "--ui-screenshot");
-    const bool updateShot = uiScreenshotArg >= 0;
+    const bool updateShot =
+        argc >= 2 && std::strcmp(argv[1], "--ui-screenshot") == 0;
     auto& desktopUpdater = chudware::update::globalUpdater();
-    if (!updateShot && !codeMode) {
+    if (!updateShot) {
         desktopUpdater.configure(CHUDWARE_VERSION, appdataAppDir(),
                                  chudware::platform::executablePath());
         const auto apply = desktopUpdater.applyStagedBeforeWindow();
@@ -762,16 +722,13 @@ int main(int argc, char** argv) {
     // lazy is unset). Prefer leaving both unset for the production path.
     if (!cefLazy) ui::cef::initialize();
 #endif
-    if (uiScreenshotArg >= 0) {
-        // Headless UI capture. --ui-screenshot is a GUI flag and may follow
-        // --code; its explicit output path is the next non-flag argument.
-        // When omitted, default next to the executable so capture still exits.
+    if (argc >= 2 && std::strcmp(argv[1], "--ui-screenshot") == 0) {
+        // Headless UI capture. An explicit output path is optional; when omitted (the common
+        // smoke-test invocation `Chudware --ui-screenshot`), default to a PNG next to the exe so
+        // `shot` is still enabled and the capture-then-exit path runs (otherwise we'd fall
+        // through to interactive GUI mode and hang headlessly, never writing a PNG).
         static std::string defShot = exeDir() + "/ui_screenshot.png";
-        const char* shotPath = defShot.c_str();
-        if (uiScreenshotArg + 1 < argc && argv[uiScreenshotArg + 1] &&
-            argv[uiScreenshotArg + 1][0] != '-')
-            shotPath = argv[uiScreenshotArg + 1];
-        const int rc = run_gui(shotPath);
+        const int rc = run_gui(argc >= 3 ? argv[2] : defShot.c_str());
         // Chromium threads outlive CefShutdown() on this build and hang static/AtExit
         // destruction AFTER run_gui's teardown already completed (chat persisted, workers
         // stopped, shot written) — the gate's shot smoke then never exits. Exit directly,
@@ -797,8 +754,7 @@ int main(int argc, char** argv) {
     };
     auto runGuiWithUpdater = [&](const char* openPath) {
         const int rc = run_gui(nullptr, openPath);
-        if (!codeMode)
-            desktopUpdater.stop();  // joins the CAD update worker when it was started
+        desktopUpdater.stop();  // joins the poll/download worker before hard_exit
         return rc;
     };
     if (argc >= 2 && argv[1] && argv[1][0] != '-')

@@ -36,7 +36,6 @@
 #include "../ui/toast.h"    // W1-B: ToastLevel / Toast (toast queue lives on AppState)
 #include "../ui/cursors.h"  // W1-B: CursorKind (per-frame cursor request)
 #include "../ui/model_registry.h"  // ui::ModelInfo / ui::PROV_COUNT — ProviderModels::rows below
-#include "../ui/code/code_workspace.h"  // ui::code::requested() for process-only workspace mode
 
 struct GLFWwindow;
 class Renderer;
@@ -877,9 +876,6 @@ struct AppState {
     // ---- window / render context (initialized in run_gui before the loop) ----
     GLFWwindow* win = nullptr;
     bool shot = false;
-    // Process-only product selection. This is intentionally not part of Settings:
-    // launching Chudcode must never rewrite the CAD workspace preference.
-    bool codeWorkspaceMode = ui::code::requested();
     float scale = 1.0f;
     std::string assets;
     ui::Fonts fonts;

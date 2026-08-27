@@ -1429,17 +1429,57 @@ void AppState::pushRecentProject(const std::string& path) {
     saveSettings(settings);
 }
 
+// Canonical text for an engine-transport outage. Every worker RPC that fails while the daemon
+// is down reports its own method ("Worker error (skills_list): not connected to hostd ..."),
+// and the app's error sink dedupes on method+error for 60s — so ONE dead socket produced one
+// toast PER METHOD. Observed 2026-08-27: eight simultaneous cards (doc_new, skills_list,
+// fw_projects, agent_list_models, agent_models_list, agent_provider_state, subscription_usage,
+// plus a direct "New part failed" from the doc-tabs call site).
+//
+// The method name is deliberately dropped. Which RPC happened to be in flight is not the
+// user's problem and is not actionable; the daemon being down is. Method-level detail stays in
+// the log, where a diagnosis actually starts.
+static constexpr const char* kDaemonOutageToast =
+    "Engine daemon unavailable \xe2\x80\x94 requests are failing; retrying";
+
+// Matches the transport-failure signature only. A real per-RPC error (bad argument, missing
+// document, engine exception) must keep its own message and its own card.
+static bool isDaemonTransportFailure(const std::string& m) {
+    return m.find("not connected to hostd") != std::string::npos ||
+           m.find("engine daemon unreachable") != std::string::npos;
+}
+
 // W1-B: post a transient toast. born is filled by drawToasts on the first frame it's seen (we can't
 // reach ImGui's clock from here cheaply), so we leave born=0 and let drawToasts stamp it.
 // C39: thread-safe — the worker errorSink calls this from background threads.
 void AppState::toast(ui::ToastLevel level, std::string msg) {
     if (suppressToasts) return;
+    // Collapse a transport outage into a single card BEFORE queueing. drawToasts already
+    // collapses identical *consecutive* toasts, but these arrive with different text and
+    // interleaved with unrelated toasts, so neither condition holds.
+    const bool outage = isDaemonTransportFailure(msg);
+    if (outage) {
+        level = ui::ToastLevel::Error;
+        msg.assign(kDaemonOutageToast);
+    }
     ui::Toast t;
     t.level = level;
     t.msg = std::move(msg);
     t.born = 0.0;  // 0 = unstamped; drawToasts stamps it with ImGui::GetTime() on first sight
     t.ttl = ui::toastTtl(level);
     std::lock_guard<std::mutex> lk(toastsMtx);
+    if (outage) {
+        for (auto& q : toasts) {
+            // Toasts carrying an action are never merged — they own a reversible affordance.
+            if (!q.action && q.msg == kDaemonOutageToast) {
+                ++q.count;
+                // Re-stamp so the card's lifetime refreshes while the outage continues instead
+                // of expiring mid-storm and re-appearing as a "new" error.
+                q.born = 0.0;
+                return;
+            }
+        }
+    }
     toasts.push_back(std::move(t));
     // Cap the backing queue so an error storm can't grow it without bound (drawToasts shows <= 5).
     if (toasts.size() > 32) toasts.erase(toasts.begin(), toasts.begin() + (toasts.size() - 32));

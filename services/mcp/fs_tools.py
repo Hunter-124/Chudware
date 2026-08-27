@@ -287,7 +287,10 @@ SHELL_DEFAULT_TIMEOUT_S = 60
 SHELL_MAX_TIMEOUT_S = 900
 SHELL_MAX_OUTPUT_BYTES = 96 * 1024
 
-DOC_EXTS = {"pptx", "xlsx", "xlsm", "csv", "pdf", "doc", "docx"}
+DOC_EXTS = {
+    "pptx", "ppt", "odp", "xlsx", "xlsm", "xls", "ods",
+    "csv", "pdf", "doc", "docx", "odt",
+}
 
 # CAD/geometry files fs_read must NOT try to dump as text — the right reader is
 # import_part(path=...) which returns a doc_id for describe_part / measure_part /
@@ -614,8 +617,9 @@ def register_fs_tools(mcp) -> None:
         path   : file/dir path; may carry a trailing selector — ':50' (from line 50),
                  ':50-200' (inclusive), ':50+150' (150 lines from 50), ':5-16,960-973'
                  (multi-range), ':raw' (verbatim, no line numbers). A directory lists its
-                 entries. A document (.pdf/.docx/.pptx/.xlsx/.xlsm/.csv/.doc) is extracted
-                 to text (via office_extract) and paginated the same way. A CAD/geometry
+                 entries. A document (.pdf/.docx/.doc/.odt/.pptx/.ppt/.odp/.xlsx/.xlsm/
+                 .xls/.ods/.csv) is extracted to text (via office_extract) and paginated
+                 the same way. A CAD/geometry
                  file (.step+/.step/.stp/.iges/.stl/.3mf/.obj/…) is NOT dumped — you get a
                  use_import_part redirect: open it with import_part(path=...) and read the
                  model via describe_part / measure_part / inspect_part (plain-text exchange

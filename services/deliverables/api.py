@@ -1,4 +1,4 @@
-"""The five tool implementations (contract §1, §5) — plain functions returning MCP envelopes.
+"""Spec-driven deliverable tool implementations — plain functions returning MCP envelopes.
 
 ``services/mcp/server.py`` wraps each of these as a FastMCP ``@mcp.tool()``. Every function
 returns the flat envelope: the §3 record (or a preview / list payload) on success, and a
@@ -19,6 +19,7 @@ from .templates import get_template
 _PRESENTATION_FORMATS = ("pptx",)
 _REPORT_FORMATS = ("docx", "pdf")
 _WORKBOOK_FORMATS = ("xlsx",)
+_SHOP_INSTRUCTION_FORMATS = _REPORT_FORMATS
 
 
 def _slugify(text: str) -> str:
@@ -113,6 +114,28 @@ def make_report(spec) -> dict:
 def make_workbook(spec) -> dict:
     """Build a ``.xlsx`` workbook with live formulas from a spec (§2.3). Returns the §3 record."""
     return _make(spec, "workbook", "xlsx", _WORKBOOK_FORMATS, "make_workbook")
+
+
+def make_work_instruction(spec) -> dict:
+    """Build a controlled machining work instruction as DOCX/PDF and return its artifact record."""
+    return _make(
+        spec,
+        "work_instruction",
+        "docx",
+        _SHOP_INSTRUCTION_FORMATS,
+        "make_work_instruction",
+    )
+
+
+def make_weldment_traveler(spec) -> dict:
+    """Build a controlled weldment traveler as DOCX/PDF and return its artifact record."""
+    return _make(
+        spec,
+        "weldment_traveler",
+        "docx",
+        _SHOP_INSTRUCTION_FORMATS,
+        "make_weldment_traveler",
+    )
 
 
 def render_document(path) -> dict:

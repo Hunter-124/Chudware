@@ -1,8 +1,8 @@
 """FastMCP registration for the deliverables tool family (contract §1).
 
-``services/mcp/server.py`` calls :func:`register_deliverables_tools` (append-only). The five
-tools are thin wrappers over :mod:`deliverables.api`; each returns the flat MCP envelope
-(``{ok:...}``) already, so there is no per-call try/except here.
+``services/mcp/server.py`` calls :func:`register_deliverables_tools`.  The tools are thin
+wrappers over :mod:`deliverables.api`; each returns the flat MCP envelope (``{ok:...}``)
+already, so there is no per-call try/except here.
 """
 from __future__ import annotations
 
@@ -12,7 +12,7 @@ from . import api
 
 
 def register_deliverables_tools(mcp) -> None:
-    """Attach make_presentation / make_report / make_workbook / render_document / list_artifacts."""
+    """Attach office artifact creation, preview, and registry tools."""
 
     @mcp.tool()
     def make_presentation(spec: dict) -> dict:
@@ -35,6 +35,27 @@ def register_deliverables_tools(mcp) -> None:
         written. See cad_guide('deliverables').
         """
         return api.make_report(spec)
+
+    @mcp.tool()
+    def make_work_instruction(spec: dict) -> dict:
+        """Build a controlled machining work instruction (.docx or .pdf).
+
+        The spec kind and template are both `work_instruction`. Ordered operation blocks carry
+        setup datum/WCS, fixturing, machine/tool, provenance-backed process parameters, and
+        in-process inspection. A machined operation missing setup or inspection is rejected before
+        any artifact is written. Returns the same typed artifact/failure envelope as make_report.
+        """
+        return api.make_work_instruction(spec)
+
+    @mcp.tool()
+    def make_weldment_traveler(spec: dict) -> dict:
+        """Build a controlled weldment traveler (.docx or .pdf).
+
+        The spec kind and template are both `weldment_traveler`. The outline carries cut and joint
+        lists, provenance-backed WPS fields, fit-up/distortion controls, visual/NDT inspection, and
+        signoff. Returns the same typed artifact/failure envelope as make_report.
+        """
+        return api.make_weldment_traveler(spec)
 
     @mcp.tool()
     def make_workbook(spec: dict) -> dict:
@@ -67,4 +88,12 @@ def register_deliverables_tools(mcp) -> None:
         return api.list_artifacts(run_id)
 
     # Silence "assigned but never used" — the decorator registers them by side effect.
-    _ = (make_presentation, make_report, make_workbook, render_document, list_artifacts)
+    _ = (
+        make_presentation,
+        make_report,
+        make_work_instruction,
+        make_weldment_traveler,
+        make_workbook,
+        render_document,
+        list_artifacts,
+    )

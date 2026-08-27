@@ -87,9 +87,16 @@ json tree_of(const Job& job) {
     json setups = json::array();
     for (auto& su : job.setups) {
         json ops = json::array();
-        for (auto& o : su.operations)
-            ops.push_back(json{{"id", o.id}, {"name", o.name}, {"type", to_string(o.type)},
-                               {"tool_number", o.tool_number}, {"suppressed", o.suppressed}});
+        for (auto& o : su.operations) {
+            json op{{"id", o.id}, {"name", o.name}, {"type", to_string(o.type)},
+                    {"tool_number", o.tool_number}, {"suppressed", o.suppressed}};
+            // Per-op frame + untyped overflow (datum/fixture notes live in
+            // `extra`) — additive so setup sheets / work instructions can show
+            // the real per-op WCS instead of assuming the setup's.
+            if (o.wcs) op["wcs"] = o.wcs->to_json();
+            if (!o.extra.empty()) op["extra"] = o.extra;
+            ops.push_back(std::move(op));
+        }
         setups.push_back(json{{"id", su.id}, {"name", su.name},
                               {"machine", to_string(su.machine.kind)},
                               {"machine_detail", su.machine.to_json()},
@@ -99,7 +106,10 @@ json tree_of(const Job& job) {
     json tools = json::array();
     for (auto& t : job.tools.tools)
         tools.push_back(json{{"number", t.number}, {"name", t.name}, {"type", to_string(t.type)},
-                             {"diameter", t.diameter}});
+                             {"diameter", t.diameter},
+                             {"holder_diameter", t.holder_diameter},
+                             {"holder_length", t.holder_length},
+                             {"tool_material", t.tool_material}});
     return json{{"id", job.id}, {"name", job.name}, {"units", job.units}, {"post", job.post},
                 {"tools", tools}, {"setups", setups}};
 }

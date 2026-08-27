@@ -10,6 +10,7 @@ Registered onto the FastMCP instance by ``register_cam_tools(mcp)``.
 """
 from __future__ import annotations
 
+import html
 import json
 import os
 import re
@@ -395,6 +396,195 @@ def _motion_line_count(gcode: str) -> int:
     return sum(1 for ln in str(gcode or "").splitlines() if _MOTION_RE.match(ln))
 
 
+def _cam_display(value: Any) -> str:
+    if isinstance(value, float):
+        return f"{value:g}"
+    if isinstance(value, (list, tuple)):
+        return "[" + ", ".join(_cam_display(item) for item in value) + "]"
+    if isinstance(value, dict):
+        return ", ".join(f"{key}={_cam_display(item)}" for key, item in value.items())
+    return str(value)
+
+
+def _wcs_display(wcs: Any) -> str:
+    if not isinstance(wcs, dict):
+        return _cam_display(wcs) if wcs not in (None, "") else ""
+    offset = wcs.get("offset")
+    label = f"G{int(offset)}" if isinstance(offset, (int, float)) else ""
+    sub = wcs.get("offset_sub")
+    if sub:
+        label += f".1 P{int(sub)}"
+    origin = wcs.get("origin")
+    if origin is not None:
+        label += (": " if label else "") + f"origin {_cam_display(origin)}"
+    return label
+
+
+def _stock_display(stock: Any) -> str:
+    if not isinstance(stock, dict):
+        return _cam_display(stock) if stock not in (None, "") else ""
+    pieces = []
+    stock_type = stock.get("type")
+    if stock_type:
+        pieces.append(str(stock_type))
+    lo, hi = stock.get("min"), stock.get("max")
+    if (isinstance(lo, (list, tuple)) and isinstance(hi, (list, tuple))
+            and len(lo) >= 3 and len(hi) >= 3):
+        try:
+            size = [float(hi[i]) - float(lo[i]) for i in range(3)]
+            pieces.append(" x ".join(f"{axis:g}" for axis in size) + " mm")
+        except (TypeError, ValueError):
+            pieces.append(f"min {_cam_display(lo)} / max {_cam_display(hi)}")
+    elif stock.get("radius") is not None and stock.get("height") is not None:
+        pieces.append(
+            f"diameter {2 * float(stock['radius']):g} x {_cam_display(stock['height'])} mm")
+    material = stock.get("material")
+    if material:
+        pieces.append(str(material))
+    return " — ".join(pieces)
+
+
+def _first_present(mapping: Any, names: tuple[str, ...]) -> Any:
+    if not isinstance(mapping, dict):
+        return None
+    for name in names:
+        value = mapping.get(name)
+        if value not in (None, "", [], {}):
+            return value
+    for container in ("extra", "cutting_overrides"):
+        nested = mapping.get(container)
+        if not isinstance(nested, dict):
+            continue
+        for name in names:
+            value = nested.get(name)
+            if value not in (None, "", [], {}):
+                return value
+    return None
+
+def _tool_holder_display(tool: dict) -> str:
+    holder = _first_present(tool, ("holder", "holder_name", "holder_id"))
+    if holder is not None:
+        return _cam_display(holder)
+    dims = []
+    for key, label in (("holder_diameter", "diameter"), ("holder_length", "length")):
+        value = tool.get(key)
+        if isinstance(value, (int, float)) and value > 0:
+            dims.append(f"{label} {_cam_display(value)} mm")
+    return ", ".join(dims)
+
+
+def _tool_stickout_display(tool: dict) -> str:
+    value = _first_present(
+        tool, ("stickout", "stickout_mm", "tool_stickout", "tool_stickout_mm"))
+    return f"{_cam_display(value)} mm" if value is not None else ""
+
+
+def _setup_sheet_details(tree: dict) -> tuple[str, str]:
+    html_parts = [
+        "<section class='operator-details'><h2>Setup, Stock &amp; Fixture Details</h2>"
+    ]
+    text_parts = ["", "SETUP, STOCK & FIXTURE DETAILS"]
+    wrote = False
+    for setup in tree.get("setups") or []:
+        if not isinstance(setup, dict):
+            continue
+        name = str(setup.get("name") or setup.get("id") or "Setup")
+        wcs = _wcs_display(setup.get("wcs"))
+        datum = _first_present(setup, ("datum", "datum_notes", "datum_note"))
+        fixture = _first_present(
+            setup, ("fixturing", "fixture", "fixture_notes", "fixture_note"))
+        stock = _stock_display(setup.get("stock"))
+        html_parts.append(f"<h3>{html.escape(name)}</h3><dl>")
+        text_parts.append(f"  {name}")
+        for label, value in (
+            ("WCS", wcs),
+            ("Datum", datum),
+            ("Stock", stock),
+            ("Fixture notes", fixture),
+        ):
+            if value not in (None, ""):
+                shown = _cam_display(value)
+                html_parts.append(
+                    f"<dt><b>{html.escape(label)}</b></dt><dd>{html.escape(shown)}</dd>")
+                text_parts.append(f"    {label}: {shown}")
+                wrote = True
+        html_parts.append("</dl>")
+        operations = [op for op in (setup.get("operations") or []) if isinstance(op, dict)]
+        if operations:
+            html_parts.append(
+                "<table><tr><th>#</th><th>Operation</th><th>WCS</th><th>Datum</th>"
+                "<th>Fixture notes</th></tr>")
+            text_parts.append("    OPERATIONS — WCS / DATUM / FIXTURE")
+            for index, operation in enumerate(operations, 1):
+                op_name = str(operation.get("name") or operation.get("id") or f"Operation {index}")
+                op_wcs = _wcs_display(operation.get("wcs") or setup.get("wcs"))
+                op_datum = _first_present(
+                    operation, ("datum", "datum_notes", "datum_note")) or datum or ""
+                op_fixture = _first_present(
+                    operation, ("fixturing", "fixture", "fixture_notes", "fixture_note"),
+                ) or fixture or ""
+                values = [str(index), op_name, op_wcs, _cam_display(op_datum),
+                          _cam_display(op_fixture)]
+                html_parts.append("<tr>" + "".join(
+                    f"<td>{html.escape(value)}</td>" for value in values) + "</tr>")
+                text_parts.append(
+                    f"      {index}. {op_name} | WCS: {op_wcs} | Datum: "
+                    f"{_cam_display(op_datum)} | Fixture: {_cam_display(op_fixture)}")
+                wrote = True
+            html_parts.append("</table>")
+    tools = [tool for tool in (tree.get("tools") or []) if isinstance(tool, dict)]
+    tool_rows = []
+    for tool in tools:
+        holder = _tool_holder_display(tool)
+        stickout = _tool_stickout_display(tool)
+        if holder or stickout:
+            tool_rows.append((tool, holder, stickout))
+    if tool_rows:
+        html_parts.append(
+            "<h2>Tool Holder &amp; Stickout</h2><table><tr><th>T#</th><th>Tool</th>"
+            "<th>Holder</th><th>Stickout</th></tr>")
+        text_parts.extend(["", "TOOL HOLDER & STICKOUT"])
+        for tool, holder, stickout in tool_rows:
+            number = _cam_display(tool.get("number", ""))
+            name = str(tool.get("name") or tool.get("type") or "")
+            html_parts.append("<tr>" + "".join(
+                f"<td>{html.escape(value)}</td>"
+                for value in (number, name, holder, stickout)) + "</tr>")
+            text_parts.append(
+                f"  T{number} {name} | Holder: {holder} | Stickout: {stickout}")
+            wrote = True
+        html_parts.append("</table>")
+    html_parts.append("</section>")
+    if not wrote:
+        return "", ""
+    return "".join(html_parts), "\n".join(text_parts) + "\n"
+
+
+def _enrich_setup_sheet(result: Any, tree_response: Any) -> Any:
+    if not isinstance(result, dict):
+        return result
+    tree = tree_response.get("tree") if isinstance(tree_response, dict) else None
+    if not isinstance(tree, dict) and isinstance(tree_response, dict):
+        tree = tree_response
+    if not isinstance(tree, dict):
+        return result
+    html_detail, text_detail = _setup_sheet_details(tree)
+    if not html_detail and not text_detail:
+        return result
+    enriched = dict(result)
+    base_html = enriched.get("html")
+    if isinstance(base_html, str) and html_detail:
+        marker = "</body>"
+        enriched["html"] = (
+            base_html.replace(marker, html_detail + marker, 1)
+            if marker in base_html else base_html + html_detail
+        )
+    base_text = enriched.get("text")
+    if isinstance(base_text, str) and text_detail:
+        enriched["text"] = base_text.rstrip() + "\n" + text_detail
+    return enriched
+
+
 def register_cam_tools(mcp: FastMCP) -> None:
     """Attach the CAM toolpath/post/sim tools to the FastMCP server."""
 
@@ -601,7 +791,10 @@ def register_cam_tools(mcp: FastMCP) -> None:
         `geometry`: {regions|contours|points|profile|mesh} (use cam_extract to get it).
         `heights`: {clearance,retract,top,bottom}. `params`: any extra op fields (stepover,
         stepdown, stock_to_leave, direction, lead_in/out, cycle, peck, comp_side, ...).
-        Feeds/speeds auto-resolve from material+tool unless you pin rpm/feed/etc in params."""
+        `params.extra` may carry `datum` and `fixture_notes`; cam_setup_sheet prints them beside
+        this operation's effective WCS. Feeds/speeds auto-resolve from material+tool unless you
+        pin rpm/feed/etc in params.
+        """
         try:
             # LIVE-DIALECT guard: `geometry.get(k)` below (and the bare `op.update(params)`)
             # crash on stringified dicts — same shape as the run-97813015264134 'str' object
@@ -805,13 +998,24 @@ def register_cam_tools(mcp: FastMCP) -> None:
 
     @mcp.tool()
     def cam_setup_sheet(dialect: Optional[str] = None) -> str:
-        """Generate the operator setup sheet (HTML + text): tool list + per-operation cut
-        length and time + total machining time."""
+        """Generate the operator setup sheet as backward-compatible HTML + text.
+
+        In addition to the established tool list, per-operation cut length/time, and total time,
+        the sheet includes each setup/operation's available WCS and datum, stock and fixture notes,
+        plus holder/stickout columns when those fields exist in the CAM job.
+        """
         try:
-            params: dict = {"doc_id": _job()}
+            doc_id = _job()
+            params: dict = {"doc_id": doc_id}
             if dialect:
                 params["dialect"] = dialect
-            return _dumps(cb.call("cam_setup_sheet", params))
+            result = cb.call("cam_setup_sheet", params)
+            try:
+                tree = cb.call("cam_tree", {"doc_id": doc_id})
+                enriched = _enrich_setup_sheet(result, tree)
+            except Exception:  # noqa: BLE001 - enrichment must never erase a valid legacy sheet
+                return _dumps(result)
+            return _dumps(enriched)
         except Exception as e:  # noqa: BLE001
             return _err(e)
 

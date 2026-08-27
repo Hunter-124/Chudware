@@ -22,9 +22,11 @@ from .errors import DeliverableError
 MAX_LONG_EDGE = 1024
 MAX_BYTES = 1_000_000
 
-_OFFICE_EXTS = {"pptx", "docx", "xlsx", "ppt", "doc", "xls", "odt", "odp", "ods", "rtf"}
+_OFFICE_EXTS = {
+    "pptx", "ppt", "odp", "docx", "doc", "odt", "xlsx", "xlsm", "xls", "ods", "rtf",
+}
 _IMAGE_EXTS = {"png", "jpg", "jpeg", "bmp", "gif", "tif", "tiff"}
-_TEXT_EXTS = {"csv", "md", "markdown", "txt"}
+_TEXT_EXTS = {"csv", "html", "md", "markdown", "txt"}
 
 
 # --------------------------------------------------------------------------- discovery

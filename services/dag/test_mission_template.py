@@ -90,3 +90,87 @@ def test_ecad_analysis_does_not_fall_back_to_sim_engineer_for_delivery():
     roles = {node["id"]: node["inputs"].get("role") for node in graph["nodes"]}
     assert roles["n_build_d1"] == "ecad_engineer"
     assert roles["n_deliver_d1"] == "reviewer"
+
+
+
+def test_report_is_built_and_delivered_by_report_capable_role():
+    graph = build_mission_graph(_manifest_for("report", "Inspection report"))
+    by_id = {node["id"]: node for node in graph["nodes"]}
+
+    assert by_id["n_build_d1"]["inputs"]["role"] == "general_agent"
+    assert "make_report" in by_id["n_build_d1"]["inputs"]["request"]
+    assert by_id["n_deliver_d1"]["inputs"]["role"] == "general_agent"
+
+
+def test_multi_part_manufacturing_package_expands_artifacts_and_complexity():
+    manifest = {
+        "request_verbatim": (
+            "Create a complete manufacturing package for this multi-part welded press."
+        ),
+        "ambiguities": [],
+        "deliverables": [
+            {
+                "id": "frame",
+                "name": "Welded frame",
+                "kind": "part",
+                "description": "Fabricated weldment frame.",
+                "acceptance_criteria": [],
+            },
+            {
+                "id": "ram",
+                "name": "Ram",
+                "kind": "part",
+                "description": "Machined ram.",
+                "acceptance_criteria": [],
+            },
+            {
+                "id": "press",
+                "name": "Press assembly",
+                "kind": "assembly",
+                "description": "Assembly of the welded frame and ram.",
+                "acceptance_criteria": [],
+                "depends_on": ["frame", "ram"],
+            },
+            {
+                "id": "package",
+                "name": "Manufacturing package",
+                "kind": "report",
+                "description": "All controlled shop documentation.",
+                "acceptance_criteria": [],
+                "depends_on": ["press"],
+            },
+        ],
+    }
+
+    graph = build_mission_graph(manifest)
+    by_id = {node["id"]: node for node in graph["nodes"]}
+
+    expected = {
+        "n_build_frame_drawing",
+        "n_build_ram_drawing",
+        "n_build_manufacturing_assembly_drawing",
+        "n_build_manufacturing_bom",
+        "n_build_manufacturing_work_instructions",
+        "n_build_manufacturing_weldment_traveler",
+    }
+    assert expected <= set(by_id)
+    assert "n_deliver_package" not in by_id
+    assert (
+        by_id["n_build_manufacturing_assembly_drawing"]["inputs"]["task_class"]
+        != "simple_part"
+    )
+    assert by_id["n_build_manufacturing_bom"]["inputs"]["role"] == "general_agent"
+    assert (
+        by_id["n_build_manufacturing_work_instructions"]["inputs"]["role"]
+        == "general_agent"
+    )
+    edges = {(edge["from"], edge["to"]) for edge in graph["edges"]}
+    assert ("n_build_frame", "n_build_frame_drawing") in edges
+    assert (
+        "n_build_manufacturing_assembly_drawing",
+        "n_build_manufacturing_work_instructions",
+    ) in edges
+    assert (
+        "n_build_manufacturing_bom",
+        "n_build_manufacturing_work_instructions",
+    ) in edges

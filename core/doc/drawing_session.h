@@ -60,6 +60,14 @@ nlohmann::json drawing_new(const nlohmann::json& source_doc, const nlohmann::jso
 // open source in the oracle). Returns {doc_id, revision, source_revision}.
 nlohmann::json drawing_set_source(const std::string& doc_id, const nlohmann::json& source_doc,
                                   const nlohmann::json& env);
+// Sheet lifecycle. A newly-created drawing starts with s1 active; callers may add
+// further sheets and direct sheet-less view/table operations to the active sheet.
+nlohmann::json drawing_add_sheet(const std::string& doc_id, const std::string& size,
+                                 const std::string& name = "");
+nlohmann::json drawing_list_sheets(const std::string& doc_id);
+nlohmann::json drawing_set_active_sheet(const std::string& doc_id,
+                                        const std::string& sheet_id);
+
 
 // drawing_add_view: append a base|projected|iso view to a sheet. Returns
 // {view_id, revision, view:<projected geometry>}.
@@ -100,6 +108,14 @@ nlohmann::json drawing_add_dim(const std::string& doc_id, const std::string& vie
                                const nlohmann::json& b, const nlohmann::json& c,
                                const nlohmann::json& d, const nlohmann::json& pos,
                                const nlohmann::json& text);
+// Structured manufacturing dimensions rendered by annot_draw.
+nlohmann::json drawing_add_chamfer_dimension(const std::string& doc_id,
+                                             const std::string& view_id,
+                                             const nlohmann::json& spec);
+nlohmann::json drawing_add_ordinate_dimensions(const std::string& doc_id,
+                                               const std::string& view_id,
+                                               const nlohmann::json& spec);
+
 
 // drawing_remove_annotation: delete an annotation by id from a view.
 nlohmann::json drawing_remove_annotation(const std::string& doc_id, const std::string& view_id,
@@ -168,6 +184,13 @@ nlohmann::json drawing_set_titleblock(const std::string& doc_id, const std::stri
 // Returns {size, drawing}.
 nlohmann::json drawing_set_sheet(const std::string& doc_id, const std::string& sheet_id,
                                  const std::string& size);
+// drawing_add_table: append a first-class structured on-sheet table.
+// kind = bom|revision|holes|notes|cutlist. `spec` may carry anchor:[x,y],
+// columns:[{key,title,width}], rows:[...], title, and table-specific options.
+// BOM and hole rows are recomputed from the associative source/callouts on fetch.
+nlohmann::json drawing_add_table(const std::string& doc_id, const std::string& sheet_id,
+                                 const std::string& kind, const nlohmann::json& spec);
+
 
 // drawing_make: ONE-SHOT drawing authoring for the copilot. From a live source part
 // (source_doc_id) build a complete drawing in a single call and return {doc_id, drawing}. The

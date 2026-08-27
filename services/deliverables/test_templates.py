@@ -393,5 +393,290 @@ def test_assembly_manual_bare_numeral_is_provenance_violation():
     assert bad["reason"] == "provenance_violation"
 
 
+# ============================================================ 6. structured shop instructions
+
+def _shop_route():
+    return J.attach("route1", "approved_process_plan", {
+        "material": "AISI 4140 HT",
+        "stock_prep": "Saw blank 52 x 52 x 20 mm",
+        "spindle_speed": 4200,
+        "feed_rate": 310,
+        "speed_feed_provenance": "Approved CAM Plan CP-104 Rev B",
+        "bore_limits": "10.000–10.018 mm",
+        "wps": "WPS-GMAW-12 / Rev C",
+        "member_length": 700,
+        "member_qty": 2,
+        "weld_size": 6,
+        "weld_sequence": 3,
+    })
+
+
+def _docx_text(rec):
+    from docx import Document
+    doc = Document(str(_abs(rec)))
+    paragraphs = [p.text for p in doc.paragraphs]
+    cells = [c.text for table in doc.tables for row in table.rows for c in row.cells]
+    return "\n".join(paragraphs + cells)
+
+
+@pytest.mark.parametrize("missing", ["setup", "inspection"])
+def test_work_instruction_rejects_machined_operation_without_setup_or_inspection(missing):
+    from services.deliverables import api
+
+    operation = {
+        "type": "operation",
+        "op_no": 10,
+        "heading": "Finish bore",
+        "machined": True,
+        "setup": {"datum": "A", "wcs": "G54", "fixturing": "Soft jaws"},
+        "machine": "VMC-3",
+        "parameters": [{"label": "Inspection limit", "slot": "bore_limits"}],
+        "tool": "T12 boring head",
+        "inspection": [
+            {"feature": "Finished bore", "gauge": "Air gauge", "limits_slot": "bore_limits"},
+        ],
+        "slots": {"bore_limits": J.ref("route1", "bore_limits")},
+    }
+    operation.pop(missing)
+    outline = _minimal_work_instruction_outline()
+    outline[1] = operation
+    bad = api.make_work_instruction({
+        "kind": "work_instruction",
+        "title": "Shaft WI",
+        "template": "work_instruction",
+        "outline": outline,
+        "attached_results": J.results_map(_shop_route()),
+    })
+    assert bad["ok"] is False
+    assert missing in bad["hint"]
+    assert bad["reason"] == "invalid_spec"
+
+
+def test_work_instruction_docx_carries_provenance_values_verbatim():
+    rec = d.make_work_instruction({
+        "kind": "work_instruction",
+        "title": "Shaft Work Instruction",
+        "template": "work_instruction",
+        "format": "docx",
+        "outline": [
+            {"type": "part", "part_id": "SHAFT-01", "revision": "D",
+             "slots": {
+                 "material": J.ref("route1", "material"),
+                 "stock_prep": J.ref("route1", "stock_prep"),
+             }},
+            {"type": "operation", "op_no": 10, "heading": "Finish bore", "machined": True,
+             "setup": {"datum": "A", "wcs": "G54", "fixturing": "Soft jaws on OD"},
+             "machine": "VMC-3", "tool": "T12 boring head",
+             "parameters": [
+                 {"label": "Spindle speed", "slot": "spindle_speed"},
+                 {"label": "Feed rate", "slot": "feed_rate"},
+                 {"label": "Speed/feed provenance", "slot": "speed_feed_provenance"},
+             ],
+             "inspection": [
+                 {"feature": "Finished bore", "gauge": "Air gauge",
+                  "limits_slot": "bore_limits"},
+             ],
+             "slots": {
+                 "spindle_speed": J.ref("route1", "spindle_speed", unit="rpm"),
+                 "feed_rate": J.ref("route1", "feed_rate", unit="mm/min"),
+                 "speed_feed_provenance": J.ref("route1", "speed_feed_provenance"),
+                 "bore_limits": J.ref("route1", "bore_limits"),
+             }},
+            {"type": "finish", "heading": "Deburr and finish",
+             "body": ["Break sharp edges; clean before inspection."]},
+            {"type": "hold_point", "heading": "QA hold",
+             "body": ["Do not release before bore inspection acceptance."]},
+            {"type": "safety", "ppe": ["Safety glasses", "Cut-resistant gloves"],
+             "body": ["Stop spindle before gauging."]},
+            {"type": "approval", "prepared_by": "Manufacturing Engineering",
+             "approved_by": "Quality", "signoff": "Name / signature / date"},
+            {"type": "revision", "revision": "D", "date": "2026-08-26",
+             "description": "Released routing", "approved_by": "Quality"},
+        ],
+        "attached_results": J.results_map(_shop_route()),
+    })
+    assert rec["ok"] is True
+    assert rec["kind"] == "work_instruction"
+    text = _docx_text(rec)
+    for expected in (
+        "AISI 4140 HT",
+        "Saw blank 52 x 52 x 20 mm",
+        "4200 rpm",
+        "310 mm/min",
+        "Approved CAM Plan CP-104 Rev B",
+        "10.000–10.018 mm",
+    ):
+        assert expected in text
+    for expected in (
+        "G54",
+        "Soft jaws on OD",
+        "VMC-3",
+        "T12 boring head",
+        "Finished bore",
+        "Air gauge",
+        "Deburr and finish",
+        "QA hold",
+        "Safety glasses",
+        "Approval and signoff",
+        "Revision record",
+    ):
+        assert expected in text
+
+
+
+def test_work_instruction_rejects_literal_process_values():
+    outline = _minimal_work_instruction_outline()
+    outline[1] = {
+        "type": "operation",
+        "op_no": 10,
+        "heading": "Mill",
+        "slots": {"spindle_speed": 4200},
+    }
+    bad = d.make_work_instruction({
+        "kind": "work_instruction",
+        "title": "Uncontrolled route",
+        "template": "work_instruction",
+        "outline": outline,
+        "attached_results": J.results_map(_shop_route()),
+    })
+    assert bad["ok"] is False
+    assert bad["reason"] == "provenance_violation"
+
+
+def test_weldment_traveler_docx_carries_controlled_values():
+    rec = d.make_weldment_traveler({
+        "kind": "weldment_traveler",
+        "title": "Frame Weldment Traveler",
+        "template": "weldment_traveler",
+        "format": "docx",
+        "outline": [
+            {"type": "document_control", "part_id": "FRAME-01", "revision": "C",
+             "material": "ASTM A500 Grade B"},
+            {"type": "cut_list",
+             "rows": [
+                 ["Member", "Profile", "Length", "Qty"],
+                 ["Upright", "50 x 50 x 3 SHS",
+                  J.ref("route1", "member_length", unit="mm"),
+                  J.ref("route1", "member_qty")],
+             ]},
+            {"type": "joint_list",
+             "rows": [
+                 ["Joint", "Type", "Size", "Symbol", "Sequence"],
+                 ["J1", "Fillet", J.ref("route1", "weld_size", unit="mm"),
+                  "FILLET BOTH SIDES", J.ref("route1", "weld_sequence")],
+             ]},
+            {"type": "wps", "slots": {"reference": J.ref("route1", "wps")}},
+            {"type": "fit_up", "body": ["Verify diagonals and root gap before tack welding."]},
+            {"type": "distortion_control",
+             "body": ["Back-step opposing joints; allow to cool between passes."]},
+            {"type": "inspection",
+             "rows": [["Stage", "Method", "Acceptance", "Inspector / Date"],
+                      ["Final", "Visual + MT", "Per WPS and drawing", ""]]},
+            {"type": "signoff", "welder": "Name / ID", "inspector": "Name / ID",
+             "quality_release": "Signature / date"},
+        ],
+        "attached_results": J.results_map(_shop_route()),
+    })
+    assert rec["ok"] is True
+    assert rec["kind"] == "weldment_traveler"
+    text = _docx_text(rec)
+    for expected in ("700 mm", "WPS-GMAW-12 / Rev C", "6 mm", "FILLET BOTH SIDES"):
+        assert expected in text
+    for expected in (
+        "Cut list",
+        "Joint list and weld sequence",
+        "Fit-up checks",
+        "Distortion control",
+        "Visual / NDT inspection",
+        "Traveler signoff",
+    ):
+        assert expected in text
+
+
+def _minimal_work_instruction_outline():
+    return [
+        {"type": "part", "part_id": "P-1", "revision": "A",
+         "slots": {
+             "material": J.ref("route1", "material"),
+             "stock_prep": J.ref("route1", "stock_prep"),
+         }},
+        {"type": "operation", "op_no": 10, "heading": "Verify prepared blank"},
+        {"type": "finish", "body": ["Deburr and clean."]},
+        {"type": "hold_point", "body": ["Quality release required."]},
+        {"type": "safety", "ppe": ["Safety glasses"]},
+        {"type": "approval", "prepared_by": "ME", "approved_by": "Quality"},
+        {"type": "revision", "revision": "A", "description": "Initial release"},
+    ]
+
+
+def _minimal_weldment_traveler_outline():
+    return [
+        {"type": "document_control", "part_id": "W-1", "revision": "A",
+         "material": "ASTM A500 Grade B"},
+        {"type": "cut_list",
+         "rows": [["Member", "Profile", "Length", "Qty"],
+                  ["M1", "SHS", J.ref("route1", "member_length"),
+                   J.ref("route1", "member_qty")]]},
+        {"type": "joint_list",
+         "rows": [["Joint", "Type", "Size", "Symbol", "Sequence"],
+                  ["J1", "Fillet", J.ref("route1", "weld_size"), "FILLET",
+                   J.ref("route1", "weld_sequence")]]},
+        {"type": "wps", "slots": {"reference": J.ref("route1", "wps")}},
+        {"type": "fit_up", "checks": ["Verify root gap."]},
+        {"type": "distortion_control", "notes": ["Back-step opposing joints."]},
+        {"type": "inspection", "checks": ["Visual inspection."]},
+        {"type": "signoff", "welder": "Name / ID", "inspector": "Name / ID"},
+    ]
+
+
+@pytest.mark.parametrize(
+    ("entrypoint", "kind", "template_name", "outline_factory"),
+    [
+        (d.make_work_instruction, "work_instruction", "work_instruction",
+         _minimal_work_instruction_outline),
+        (d.make_weldment_traveler, "weldment_traveler", "weldment_traveler",
+         _minimal_weldment_traveler_outline),
+    ],
+)
+def test_shop_instruction_templates_render_pdf(
+        entrypoint, kind, template_name, outline_factory):
+    rec = entrypoint({
+        "kind": kind,
+        "title": f"{kind} PDF",
+        "template": template_name,
+        "format": "pdf",
+        "outline": outline_factory(),
+        "attached_results": J.results_map(_shop_route()),
+    })
+    assert rec["ok"] is True
+    assert _abs(rec).read_bytes()[:5] == b"%PDF-"
+
+
+@pytest.mark.parametrize(
+    ("entrypoint", "kind", "template_name"),
+    [
+        ("make_work_instruction", "work_instruction", "work_instruction"),
+        ("make_weldment_traveler", "weldment_traveler", "weldment_traveler"),
+    ],
+)
+def test_shop_instruction_entrypoints_require_a_real_artifact(
+        monkeypatch, entrypoint, kind, template_name):
+    from services.deliverables import api
+    from services.deliverables.templates import get_template
+
+    template = get_template(template_name, kind)
+    monkeypatch.setattr(template, "_build", lambda resolved, fmt, out_path: None)
+    bad = getattr(api, entrypoint)({
+        "kind": kind,
+        "title": "No artifact",
+        "template": template_name,
+        "format": "docx",
+        "outline": [],
+        "attached_results": {},
+    })
+    assert bad["ok"] is False
+    assert bad["reason"] == "artifact_write_failed"
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-q"]))

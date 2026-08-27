@@ -39,6 +39,9 @@ SCHEMA = "aicad.deliverables/1"
 VALID_KINDS = frozenset({
     "part", "assembly", "drawing", "cam_program",
     "analysis", "report", "modification",
+    # 2026-08-26 additive (contracts/advisor.md §16 version note): structured
+    # shop-instruction deliverables built by services/deliverables templates.
+    "work_instruction", "weldment_traveler",
 })
 
 # The check tools a criterion may name (contract §16 example enumerates these; the

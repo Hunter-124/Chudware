@@ -1,10 +1,8 @@
-"""MCP tools: office_* — read + edit .pptx/.xlsx/.xlsm/.csv/.pdf/.doc/.docx (T-office).
+"""MCP tools for extracting, converting, and narrowly editing Office documents.
 
-Reuses the already-pinned deliverables-pack libraries (python-pptx, openpyxl, python-docx,
-pypdfium2 — see requirements.txt "deliverables pack" block) against arbitrary EXISTING files,
-not just fresh templates, plus pypdf (BSD-3, new dep) for PDF page-level edits pypdfium2 can't
-do, and the LibreOffice-headless subprocess bridge already wired for
-``services/deliverables/engines.py::office_to_pdf`` for legacy .doc round-trips.
+The in-process readers use the pinned deliverables-pack libraries (python-pptx, openpyxl,
+python-docx, pypdfium2, and pypdf). LibreOffice is the sanctioned subprocess bridge for
+legacy and OpenDocument extraction, legacy .doc edits, and general office conversion.
 
 Read path prefers ``office_oxide`` (https://github.com/yfedoseev/office_oxide — MIT/Apache-2.0,
 pip ``office-oxide``) for fast native text extraction when installed; falls back to the Python
@@ -22,10 +20,8 @@ AND as the ``office_extract`` worker RPC (``services/agent/worker_rpc.py``) the 
 ``docs_panel`` calls via ``st.rpc.call``. Both call the SAME module-level :func:`extract_office`
 so the read logic lives exactly once.
 
-Registration: ``register_office_tools(mcp)`` → adds office_extract, office_read_pptx,
-office_edit_pptx, office_read_xlsx, office_edit_xlsx, office_read_csv, office_edit_csv,
-office_read_pdf, office_edit_pdf, office_read_docx, office_edit_docx, office_read_doc,
-office_edit_doc.
+Registration: ``register_office_tools(mcp)`` adds the per-format read/edit tools,
+``office_extract``, and ``office_convert``.
 
 Write limits (see contracts/office.md for the full list): .doc edits round-trip lossily through
 LibreOffice; .pptx edits are shape/text/table content only (no layout/theme/animation); .pdf
@@ -36,6 +32,7 @@ from __future__ import annotations
 
 import csv
 import json
+import shutil
 import subprocess
 import tempfile
 from pathlib import Path
@@ -228,40 +225,144 @@ def _extract_docx(path: str) -> dict:
 
 
 def _apply_docx_ops(doc, ops: list) -> int | dict:
-    """Apply office_edit_docx-style ops to an open python-docx Document in place.
-    Returns the number of paragraphs changed, or an {ok:false,...} error dict."""
+    """Apply the lossless python-docx operation subset to an open document.
+
+    Existing whole-paragraph replacement and ``append_paragraph`` behavior is retained.
+    New operations only mutate the addressed run, insertion point, or table cell; python-docx
+    features without a safe structural edit primitive (headers, fields, drawings, and text
+    boxes) are explicitly refused.
+    """
     if ops:
         try:
-            # A stringified ops batch (JSON or Python-repr) used to reach `op.get(...)`
-            # below as raw characters (iterating a string, not a list) and crash with a
-            # bare "'str' object has no attribute 'get'" — coerce it the same way the
-            # already-hardened mcp/*_tools.py modules do.
-            ops = require_list(ops, "ops",
-                                'a list of docx ops, e.g. '
-                                '[{"op":"append_paragraph","text":"..."}] or '
-                                '[{"paragraph_index":0,"text":"..."}]')
+            ops = require_list(
+                ops,
+                "ops",
+                'a list of docx ops, e.g. [{"op":"replace_run_text",'
+                '"paragraph_index":0,"run_index":0,"text":"..."}]',
+            )
         except ValueError as exc:
             return {"ok": False, "reason": "invalid_op", "hint": str(exc)}
     else:
         ops = []
+
+    def _index(value: Any, name: str, size: int) -> int | dict:
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0 or value >= size:
+            bounds = "no entries exist" if size == 0 else f"expected 0..{size - 1}"
+            return {"ok": False, "reason": "invalid_op",
+                    "hint": f"{name} {value!r} out of range ({bounds})"}
+        return value
+
     changed = 0
     for i, op in enumerate(ops):
         op = coerce_json_or_repr(op) or {}
         if not isinstance(op, dict):
             return {"ok": False, "reason": "invalid_op",
-                     "hint": f"ops[{i}] must be a dict, got {type(op).__name__}: {op!r}"}
-        if op.get("op") == "append_paragraph":
+                    "hint": f"ops[{i}] must be a dict, got {type(op).__name__}: {op!r}"}
+        kind = op.get("op")
+        text = op.get("text")
+
+        if kind == "append_paragraph":
             doc.add_paragraph(op.get("text", ""))
             changed += 1
             continue
+
+        if kind == "replace_run_text":
+            para_idx = _index(op.get("paragraph_index"), "paragraph_index", len(doc.paragraphs))
+            if isinstance(para_idx, dict):
+                return para_idx
+            para = doc.paragraphs[para_idx]
+            run_idx = _index(op.get("run_index"), "run_index", len(para.runs))
+            if isinstance(run_idx, dict):
+                return run_idx
+            if text is None:
+                return {"ok": False, "reason": "invalid_op",
+                        "hint": "replace_run_text needs text"}
+            para.runs[run_idx].text = str(text)
+            changed += 1
+            continue
+
+        if kind == "insert_paragraph_after":
+            para_idx = _index(op.get("paragraph_index"), "paragraph_index", len(doc.paragraphs))
+            if isinstance(para_idx, dict):
+                return para_idx
+            paragraph = doc.add_paragraph("" if text is None else str(text))
+            doc.paragraphs[para_idx]._p.addnext(paragraph._p)
+            changed += 1
+            continue
+
+        if kind == "set_table_cell":
+            table_idx = _index(op.get("table_index"), "table_index", len(doc.tables))
+            if isinstance(table_idx, dict):
+                return table_idx
+            table = doc.tables[table_idx]
+            row_idx = _index(op.get("row"), "row", len(table.rows))
+            if isinstance(row_idx, dict):
+                return row_idx
+            column_idx = _index(op.get("column"), "column", len(table.columns))
+            if isinstance(column_idx, dict):
+                return column_idx
+            if text is None:
+                return {"ok": False, "reason": "invalid_op",
+                        "hint": "set_table_cell needs text"}
+            table.cell(row_idx, column_idx).text = str(text)
+            changed += 1
+            continue
+
+        if kind == "insert_heading":
+            level = op.get("level", 1)
+            if not isinstance(level, int) or isinstance(level, bool) or not 0 <= level <= 9:
+                return {"ok": False, "reason": "invalid_op",
+                        "hint": "insert_heading level must be an integer from 0 through 9"}
+            if text is None:
+                return {"ok": False, "reason": "invalid_op",
+                        "hint": "insert_heading needs text"}
+            after = op.get("after_paragraph_index")
+            if after is not None:
+                para_idx = _index(after, "after_paragraph_index", len(doc.paragraphs))
+                if isinstance(para_idx, dict):
+                    return para_idx
+            heading = doc.add_heading(str(text), level=level)
+            if after is not None:
+                doc.paragraphs[para_idx]._p.addnext(heading._p)
+            changed += 1
+            continue
+
+        if kind in {
+            "edit_header", "edit_footer", "edit_field", "edit_drawing",
+            "edit_text_box", "replace_text",
+        }:
+            return {
+                "ok": False,
+                "reason": "unsupported_op",
+                "hint": f"{kind} cannot be changed losslessly with python-docx; supported "
+                        "structural ops are replace_run_text, insert_paragraph_after, "
+                        "set_table_cell, insert_heading, and append_paragraph",
+            }
+
+        if kind is not None:
+            return {
+                "ok": False,
+                "reason": "invalid_op",
+                "hint": f"unknown op {kind!r}; supported ops are append_paragraph, "
+                        "replace_run_text, insert_paragraph_after, set_table_cell, "
+                        "and insert_heading",
+            }
+
+        # Legacy operation: omitted ``op`` plus paragraph_index+text replaces the
+        # entire paragraph exactly as before this richer operation set.
         idx = op.get("paragraph_index")
-        text = op.get("text")
         if idx is None or text is None:
-            return {"ok": False, "reason": "invalid_op",
-                     "hint": "each op needs paragraph_index + text, or op:\"append_paragraph\""}
-        if idx < 0 or idx >= len(doc.paragraphs):
-            return {"ok": False, "reason": "invalid_op", "hint": f"paragraph_index {idx} out of range"}
-        para = doc.paragraphs[idx]
+            return {
+                "ok": False,
+                "reason": "invalid_op",
+                "hint": "each op needs paragraph_index + text, or op one of "
+                        "append_paragraph, replace_run_text, insert_paragraph_after, "
+                        "set_table_cell, insert_heading",
+            }
+        para_idx = _index(idx, "paragraph_index", len(doc.paragraphs))
+        if isinstance(para_idx, dict):
+            return para_idx
+        para = doc.paragraphs[para_idx]
         if para.runs:
             para.runs[0].text = text
             for run in para.runs[1:]:
@@ -285,20 +386,24 @@ def _soffice_bin_or_err():
     binary = soffice_bin()
     if not binary:
         return None, {"ok": False, "reason": "converter_missing",
-                       "hint": "install LibreOffice (soffice) — legacy .doc needs headless conversion"}
+                      "hint": "install LibreOffice"}
     return binary, None
 
 
 def _soffice_convert(binary: str, src: Path, outdir: Path, target: str) -> Path | None:
-    """Convert *src* to *target* (a bare extension: "docx"/"doc") via LibreOffice headless.
-    Mirrors services/deliverables/engines.py::office_to_pdf's subprocess shape exactly."""
+    """Convert *src* to a bare target extension through LibreOffice headless."""
     outdir.mkdir(parents=True, exist_ok=True)
-    proc = subprocess.run(
-        [binary, "--headless", "--convert-to", target, "--outdir", str(outdir), str(src)],
-        capture_output=True, text=True, timeout=120,
-    )
-    out = outdir / (src.stem + "." + target)
-    if proc.returncode != 0 or not out.exists():
+    try:
+        proc = subprocess.run(
+            [binary, "--headless", "--convert-to", target, "--outdir", str(outdir), str(src)],
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    out = outdir / f"{src.stem}.{target}"
+    if proc.returncode != 0 or not out.is_file():
         return None
     return out
 
@@ -317,6 +422,88 @@ def _extract_doc(path: str) -> dict:
         result = dict(result)
         result["kind"] = "doc"
     return result
+
+
+_CONVERTED_EXTRACT_TARGETS = {
+    "odt": "docx",
+    "odp": "pptx",
+    "ods": "xlsx",
+    "ppt": "pptx",
+    "xls": "xlsx",
+}
+_CONVERT_KINDS = frozenset({
+    "docx", "odt", "pdf", "pptx", "odp", "xlsx", "ods", "csv", "html", "txt",
+})
+
+
+def _extract_converted(path: str, kind: str, target: str) -> dict:
+    binary, err = _soffice_bin_or_err()
+    if err:
+        return err
+    with tempfile.TemporaryDirectory() as tmp:
+        converted = _soffice_convert(binary, Path(path), Path(tmp), target)
+        if converted is None:
+            return {
+                "ok": False,
+                "reason": "conversion_failed",
+                "hint": f"LibreOffice could not convert {Path(path).name} to {target}",
+            }
+        if target == "docx":
+            result = _extract_docx(str(converted))
+        elif target == "pptx":
+            result = _extract_pptx(str(converted))
+        else:
+            result = _extract_xlsx(str(converted), keep_vba=False)
+    if result.get("ok"):
+        result = dict(result)
+        result["kind"] = kind
+    return result
+
+
+def _convert_office_file(path: str, target: str, out: str = "") -> dict:
+    src = Path(path)
+    source_kind = src.suffix.lower().lstrip(".")
+    target = target.lower().lstrip(".")
+    if source_kind not in _CONVERT_KINDS:
+        return {
+            "ok": False,
+            "reason": "unsupported_kind",
+            "hint": f"source '.{source_kind}' is unsupported; supported: "
+                    f"{', '.join(sorted(_CONVERT_KINDS))}",
+        }
+    if target not in _CONVERT_KINDS:
+        return {
+            "ok": False,
+            "reason": "unsupported_kind",
+            "hint": f"target '.{target}' is unsupported; supported: "
+                    f"{', '.join(sorted(_CONVERT_KINDS))}",
+        }
+    if not src.is_file():
+        return {"ok": False, "reason": "not_found", "hint": f"no file at {src}"}
+    dest = Path(out) if out else src.with_suffix(f".{target}")
+    if dest.suffix.lower() != f".{target}":
+        return {
+            "ok": False,
+            "reason": "invalid_output",
+            "hint": f"out must end in '.{target}' so its format is not misrepresented",
+        }
+    binary, err = _soffice_bin_or_err()
+    if err:
+        return err
+    with tempfile.TemporaryDirectory() as tmp:
+        converted = _soffice_convert(binary, src, Path(tmp), target)
+        if converted is None:
+            return {
+                "ok": False,
+                "reason": "conversion_failed",
+                "hint": f"LibreOffice could not convert {src.name} to {target}",
+            }
+        try:
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(converted, dest)
+        except OSError as exc:
+            return {"ok": False, "reason": "write_failed", "hint": str(exc)}
+    return {"ok": True, "path": str(dest), "kind": target, "source_kind": source_kind}
 
 
 # --------------------------------------------------------------------------- frozen shared extraction
@@ -369,28 +556,25 @@ def _extract_via_office_oxide(path: str, kind: str) -> dict | None:
 
 
 def extract_office(path: str) -> dict:
-    """Read-only text/structure extraction, dispatched by file extension. FROZEN contract
-    (contracts/office.md): both the ``office_extract`` MCP tool and the ``office_extract``
-    worker RPC (services/agent/worker_rpc.py) call this exact function, so the read logic
-    lives exactly once.
+    """Extract text/structure by extension for MCP and the shared worker RPC.
 
-    Prefers ``office_oxide`` (native) for Office formats when installed; falls back to
-    python-pptx / openpyxl / python-docx / LibreOffice. Returns
-    ``{ok, kind, text, sheets?}`` — ``kind`` in {pptx,xlsx,xlsm,csv,pdf,doc,docx};
-    ``sheets`` present only for xlsx/xlsm (``[{name, rows:[[...]]}]``). Never raises —
-    every failure is an ``{ok:false, reason, hint}`` dict.
+    Native readers handle pptx/xlsx/xlsm/csv/pdf/docx. LibreOffice converts
+    odt→docx, odp→pptx, ods→xlsx, ppt→pptx, xls→xlsx before those same readers run;
+    legacy doc keeps its existing doc→docx path. The source extension is returned as
+    ``kind`` and spreadsheet sources include ``sheets``.
     """
     kind = _kind_for(path)
+    if kind in _CONVERTED_EXTRACT_TARGETS:
+        return _extract_converted(path, kind, _CONVERTED_EXTRACT_TARGETS[kind])
+
     oxide = _extract_via_office_oxide(path, kind)
-    # Spreadsheets still need the structured sheets payload for the host docs panel —
-    # oxide text is a fine preview, but keep openpyxl for xlsx/xlsm when available.
+    # Spreadsheets still need the structured sheets payload for the host docs panel.
     if oxide is not None and kind not in ("xlsx", "xlsm"):
         return oxide
     if kind == "pptx":
         return _extract_pptx(path)
     if kind in ("xlsx", "xlsm"):
         result = _extract_xlsx(path, keep_vba=(kind == "xlsm"))
-        # Attach oxide text as a richer `text` when openpyxl succeeded but text is thin.
         if result.get("ok") and oxide is not None and oxide.get("text"):
             result = dict(result)
             result["text"] = oxide["text"]
@@ -404,9 +588,12 @@ def extract_office(path: str) -> dict:
         return _extract_doc(path)
     if kind == "docx":
         return _extract_docx(path)
-    return {"ok": False, "reason": "unsupported_kind",
-             "hint": f"office_extract does not support '.{kind}' — supported: "
-                     "pptx, xlsx, xlsm, csv, pdf, doc, docx"}
+    return {
+        "ok": False,
+        "reason": "unsupported_kind",
+        "hint": f"office_extract does not support '.{kind}' — supported: "
+                "pptx, ppt, odp, xlsx, xlsm, xls, ods, csv, pdf, docx, doc, odt",
+    }
 
 
 # --------------------------------------------------------------------------- registration
@@ -416,11 +603,24 @@ def register_office_tools(mcp) -> None:
 
     @mcp.tool()
     def office_extract(path: str) -> str:
-        """Read-only text/structure extraction, dispatched by file extension. ``kind`` in
-        {pptx,xlsx,xlsm,csv,pdf,doc,docx}. Returns ``{ok, kind, text, sheets?}`` (``sheets``
-        present only for xlsx/xlsm: ``[{name, rows:[[...]]}]``). This is the FROZEN contract
-        also exposed as the ``office_extract`` worker RPC for the host docs_panel."""
+        """Extract pptx/ppt/odp, xlsx/xlsm/xls/ods, csv, pdf, docx/doc, or odt.
+
+        OpenDocument and legacy ppt/xls inputs require LibreOffice and return
+        ``reason:"converter_missing"`` with an install hint when it is unavailable.
+        Spreadsheet results include ``sheets:[{name, rows:[[...]]}]``. This is also the
+        frozen ``office_extract`` worker RPC used by the host documents panel.
+        """
         return _to_envelope(extract_office(path))
+
+    @mcp.tool()
+    def office_convert(path: str, to: str, out: str = "") -> str:
+        """Convert between docx, odt, pdf, pptx, odp, xlsx, ods, csv, html, and txt.
+
+        LibreOffice runs headlessly as an external converter. By default the result is
+        written beside *path* with the target suffix; pass *out* for an explicit output
+        path. Returns ``{ok,path,kind,source_kind}``.
+        """
+        return _to_envelope(_convert_office_file(path, to, out))
 
     @mcp.tool()
     def office_read_pptx(path: str) -> str:
@@ -444,9 +644,12 @@ def register_office_tools(mcp) -> None:
 
     @mcp.tool()
     def office_edit_pptx(path: str, ops: list[dict], out_path: str = "") -> str:
-        """``ops``: ``[{slide, shape_index, text}]`` — in-place text-frame replacements
-        (content only; no layout/theme/animation edits). Saves over *path*, or *out_path*
-        if given. Returns ``{ok, path, slides_changed}``."""
+        """Edit text frames or table cells without changing slide layout.
+
+        Text op: ``{slide, shape_index, text}``. Table op adds zero-based ``row`` and
+        ``column``. Saves over *path* or to *out_path* and returns
+        ``{ok,path,slides_changed}``.
+        """
         try:
             Presentation = _pptx_module()
         except ImportError:
@@ -478,9 +681,24 @@ def register_office_tools(mcp) -> None:
             if shi < 0 or shi >= len(shapes):
                 return _err("invalid_op", f"shape_index {shi} out of range on slide {si}")
             shape = shapes[shi]
-            if not shape.has_text_frame:
-                return _err("invalid_op", f"shape {shi} on slide {si} has no text frame")
-            shape.text_frame.text = text
+            row, column = op.get("row"), op.get("column")
+            if row is not None or column is not None:
+                if row is None or column is None:
+                    return _err("invalid_op", "table edits need both row and column")
+                if not shape.has_table:
+                    return _err("invalid_op", f"shape {shi} on slide {si} has no table")
+                table = shape.table
+                if (not isinstance(row, int) or isinstance(row, bool)
+                        or row < 0 or row >= len(table.rows)):
+                    return _err("invalid_op", f"row {row!r} out of range")
+                if (not isinstance(column, int) or isinstance(column, bool)
+                        or column < 0 or column >= len(table.columns)):
+                    return _err("invalid_op", f"column {column!r} out of range")
+                table.cell(row, column).text = text
+            else:
+                if not shape.has_text_frame:
+                    return _err("invalid_op", f"shape {shi} on slide {si} has no text frame")
+                shape.text_frame.text = text
             changed += 1
         dest = out_path or path
         try:
@@ -707,8 +925,14 @@ def register_office_tools(mcp) -> None:
 
     @mcp.tool()
     def office_edit_docx(path: str, ops: list[dict], out_path: str = "") -> str:
-        """``ops``: ``[{paragraph_index, text}]`` or ``[{op:"append_paragraph", text}]``.
-        Returns ``{ok, path, paragraphs_changed}``."""
+        """Apply lossless body-level edits while preserving non-target content and formatting.
+
+        Operations: legacy whole-paragraph ``{paragraph_index,text}``,
+        ``append_paragraph``, ``replace_run_text`` (paragraph_index/run_index/text),
+        ``insert_paragraph_after`` (paragraph_index/text), ``set_table_cell``
+        (table_index/row/column/text), and ``insert_heading`` (text/level, optional
+        after_paragraph_index). Returns ``{ok,path,paragraphs_changed}``.
+        """
         try:
             docx = _docx_module()
         except ImportError:
@@ -717,7 +941,14 @@ def register_office_tools(mcp) -> None:
             doc = docx.Document(path)
         except Exception as exc:  # noqa: BLE001
             return _err("open_failed", str(exc))
-        changed = _apply_docx_ops(doc, ops)
+        try:
+            changed = _apply_docx_ops(doc, ops)
+        except Exception as exc:  # noqa: BLE001
+            return _err(
+                "unsupported_op",
+                f"python-docx could not apply the requested edit without risking "
+                f"non-target content: {exc}",
+            )
         if isinstance(changed, dict):
             return _to_envelope(changed)
         dest = out_path or path

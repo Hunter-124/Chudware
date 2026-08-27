@@ -86,6 +86,28 @@ def _known_processes() -> list:
         pass
     return ["fdm", "cnc_mill", "lathe", "sheet_metal", "laser", "injection"]
 
+def _process_verdict(process: Any, tool: str) -> tuple[Optional[str], Optional[dict]]:
+    """Require an explicit canonical manufacturing process; never fall back to FDM."""
+    known = sorted({str(item) for item in _known_processes()})
+    if process is None or not str(process).strip():
+        return None, {
+            "ok": False,
+            "reason": "process_required",
+            "error": f"{tool}: process is required; refusing to assume FDM for a drawing or "
+                     "machined feature.",
+            "valid_processes": known,
+        }
+    canonical = re.sub(r"[\s\-]+", "_", str(process).strip().lower())
+    if canonical not in known:
+        return None, {
+            "ok": False,
+            "reason": "unknown_process",
+            "error": f"{tool}: unknown process {process!r}; choose one of "
+                     + ", ".join(known) + ".",
+            "valid_processes": known,
+        }
+    return canonical, None
+
 
 def _profile_params(process: str) -> dict | None:
     """The DfM params dict for ``process``, or ``None`` when there is no engine bridge.
@@ -426,6 +448,162 @@ def _make_bore_sketch(bore_dia_mm: float = 20.0) -> list[dict]:
         "tags": ["bore"],
     }]
 
+def _feature_value(params: Any, *names: str) -> Any:
+    if not isinstance(params, dict):
+        return None
+    for name in names:
+        value = params.get(name)
+        if isinstance(value, dict) and "value" in value:
+            value = value["value"]
+        if value is not None:
+            return value
+    return None
+
+
+def _feature_number(params: Any, *names: str) -> Optional[float]:
+    value = _feature_value(params, *names)
+    if isinstance(value, bool):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _drawing_plan_from_features(features: list[dict], process: str,
+                                it_grade: int) -> list[dict]:
+    """Translate authored feature semantics into drawing-dimension/callout proposals."""
+    items: list[dict] = []
+
+    def add_dimension(feature: dict, source_param: str, nominal: Optional[float],
+                      dim_type: str, why: str) -> None:
+        if nominal is None or nominal <= 0:
+            return
+        items.append({
+            "feature_ref": feature.get("id") or feature.get("name"),
+            "feature_name": feature.get("name"),
+            "feature_type": str(feature.get("type") or "").lower(),
+            "source_param": source_param,
+            "annotation_kind": "dimension_tolerance",
+            "suggested_tool": "add_dimension",
+            "dim_type": dim_type,
+            "suggested_value": nominal,
+            "default_tolerance": _bilateral_tolerance(nominal, it_grade),
+            "why_critical": why,
+            "needs_user_confirm": True,
+        })
+
+    def add_angle(feature: dict, source_param: str, nominal: Optional[float],
+                  why: str) -> None:
+        if nominal is None or nominal <= 0:
+            return
+        items.append({
+            "feature_ref": feature.get("id") or feature.get("name"),
+            "feature_name": feature.get("name"),
+            "feature_type": str(feature.get("type") or "").lower(),
+            "source_param": source_param,
+            "annotation_kind": "dimension_tolerance",
+            "suggested_tool": "add_dimension",
+            "dim_type": "angular_dim",
+            "suggested_value": nominal,
+            "default_tolerance": None,
+            "why_critical": why,
+            "needs_user_confirm": True,
+            "tolerance_note": "ISO 286 IT grades are linear; choose an angular tolerance from "
+                              "function/process capability rather than converting IT blindly.",
+        })
+
+    for feature in features:
+        if not isinstance(feature, dict):
+            continue
+        kind = re.sub(r"[\s\-]+", "_", str(feature.get("type") or "").lower())
+        params = feature.get("params") if isinstance(feature.get("params"), dict) else {}
+        if kind in {"box", "block", "primitive_box"}:
+            for key in ("length", "width", "height"):
+                add_dimension(feature, key, _feature_number(params, key),
+                              "linear_dim", f"{key} controls the feature envelope")
+        elif kind in {"cylinder", "primitive_cylinder"}:
+            diameter = _feature_number(params, "diameter", "dia")
+            if diameter is None:
+                radius = _feature_number(params, "radius", "r")
+                diameter = 2.0 * radius if radius is not None else None
+            add_dimension(feature, "diameter", diameter, "diameter_dim",
+                          "cylindrical size controls mating/stock geometry")
+            add_dimension(feature, "height", _feature_number(params, "height", "length"),
+                          "linear_dim", "cylinder axial extent controls the feature")
+        elif kind == "hole":
+            style = re.sub(r"[\s\-]+", "_",
+                           str(_feature_value(params, "style", "hole_type") or "simple").lower())
+            thread = _feature_value(params, "thread", "tap", "standard", "thread_size")
+            end = re.sub(r"[\s\-]+", "_",
+                         str(_feature_value(params, "end", "end_condition") or "").lower())
+            if style in {"tap", "tapped"} or thread:
+                items.append({
+                    "feature_ref": feature.get("id") or feature.get("name"),
+                    "feature_name": feature.get("name"),
+                    "feature_type": "hole",
+                    "annotation_kind": "thread",
+                    "suggested_tool": "add_hole_callout",
+                    "thread": str(thread) if thread else None,
+                    "depth": _feature_number(params, "depth"),
+                    "thru": end in {"through", "through_all", "thru"},
+                    "why_critical": "finished thread and engagement replace the tap-drill diameter",
+                    "needs_user_confirm": not bool(thread),
+                })
+            else:
+                add_dimension(feature, "diameter",
+                              _feature_number(params, "diameter", "dia", "d"),
+                              "diameter_dim", "finished hole size controls fit/fastener clearance")
+                depth = _feature_number(params, "depth")
+                if depth is not None:
+                    add_dimension(feature, "depth", depth, "linear_dim",
+                                  "blind-hole depth controls remaining wall and engagement")
+            for key, names, dim_type, why in (
+                ("cbore_dia", ("cbore_dia", "cbore_d"), "diameter_dim",
+                 "counterbore diameter controls fastener-head fit"),
+                ("cbore_depth", ("cbore_depth",), "linear_dim",
+                 "counterbore depth controls head seating"),
+                ("csk_dia", ("csk_dia", "csink_d"), "diameter_dim",
+                 "countersink major diameter controls head seating"),
+            ):
+                add_dimension(feature, key, _feature_number(params, *names), dim_type, why)
+            add_angle(feature, "csk_angle",
+                      _feature_number(params, "csk_angle", "csink_angle"),
+                      "countersink angle must match the fastener")
+        elif kind in {"extrude", "pad", "pocket", "cut"}:
+            add_dimension(feature, "depth", _feature_number(params, "depth", "length"),
+                          "linear_dim", "feature depth controls the resulting step")
+        elif kind in {"fillet", "round"}:
+            add_dimension(feature, "radius", _feature_number(params, "radius", "r"),
+                          "radial_dim", "edge radius controls stress concentration and tool path")
+        elif kind in {"chamfer", "bevel"}:
+            add_dimension(feature, "distance",
+                          _feature_number(params, "distance", "size", "length"),
+                          "chamfer", "chamfer size controls edge condition/lead-in")
+            add_angle(feature, "angle", _feature_number(params, "angle"),
+                      "chamfer angle controls mating lead-in")
+        elif kind == "thread":
+            items.append({
+                "feature_ref": feature.get("id") or feature.get("name"),
+                "feature_name": feature.get("name"),
+                "feature_type": kind,
+                "annotation_kind": "thread",
+                "suggested_tool": "add_hole_callout",
+                "thread": _feature_value(params, "size", "thread", "designation"),
+                "depth": _feature_number(params, "length", "depth"),
+                "why_critical": "thread designation and engagement are manufacturing controls",
+                "needs_user_confirm": not bool(_feature_value(
+                    params, "size", "thread", "designation")),
+            })
+        elif "pattern" in kind:
+            add_dimension(feature, "spacing",
+                          _feature_number(params, "spacing", "pitch", "distance"),
+                          "linear_dim", "pattern spacing controls feature locations from a datum")
+            add_dimension(feature, "radius",
+                          _feature_number(params, "radius", "pattern_radius"),
+                          "radial_dim", "pattern radius controls the bolt circle")
+    return items
+
 
 # ──────────────────────────────────────────────────── MCP registration ────────
 
@@ -454,22 +632,14 @@ def register_dimension_scheme_tools(mcp: FastMCP) -> None:
           CNC mill/lathe → IT7, sheet/laser → IT10, injection → IT11, FDM → IT12.
         - Function-critical dims listed first; envelope/auxiliary dims last.
 
-        `process` is optional: resolved from the doc's DFM profile if omitted (defaults
-        to FDM per the project default-prior rule). `material` is informational only
-        (affects the DFM default but not the IT grade lookup in this release).
+        `process` is REQUIRED. Omitted or unknown values are refused with the valid process
+        list; the planner never silently assumes FDM for a machined feature. ``material`` is
+        informational only.
         """
         try:
-            # Resolve process
-            resolved_process = "fdm"  # default prior
-            if process:
-                try:
-                    prof = _resolve_process(process + (f" {material}" if material else ""))
-                    resolved_process = prof.get("process", process) if isinstance(prof, dict) else process
-                except Exception:
-                    resolved_process = process.lower().strip().replace(" ", "_")
-                    if resolved_process not in _known_processes():
-                        resolved_process = "fdm"
-
+            resolved_process, bad = _process_verdict(process, "suggest_dimension_scheme")
+            if bad:
+                return _dumps(bad)
             it_grade = _it_grade_for_process(resolved_process)
 
             # Try to read sketch entities from live bridge
@@ -534,5 +704,58 @@ def register_dimension_scheme_tools(mcp: FastMCP) -> None:
             }
             return _dumps(result)
 
+        except Exception as exc:  # noqa: BLE001
+            return _err(exc)
+
+    @mcp.tool()
+    def suggest_drawing_dimension_scheme(doc_id: str, process: str) -> str:
+        """Propose per-feature drawing dimensions, tolerances and semantic callouts.
+
+        ``process`` is REQUIRED and must be one of the returned valid_processes; there is no
+        FDM default.  The plan reads authored feature parameters from the live document and
+        proposes add_dimension/add_hole_callout work without placing annotations.
+        """
+        try:
+            resolved_process, bad = _process_verdict(
+                process, "suggest_drawing_dimension_scheme")
+            if bad:
+                return _dumps(bad)
+            import services.mcp.core_bridge as cb
+            d = _doc(doc_id)
+            result = cb.call("doc_list_features", {"doc_id": d})
+            features = result.get("features") or []
+            if not features:
+                return _dumps({
+                    "ok": False,
+                    "reason": "no_features",
+                    "doc_id": d,
+                    "error": "suggest_drawing_dimension_scheme: the document has no authored "
+                             "features to plan from.",
+                })
+            it_grade = _it_grade_for_process(resolved_process)
+            items = _drawing_plan_from_features(features, resolved_process, it_grade)
+            if not items:
+                return _dumps({
+                    "ok": False,
+                    "reason": "no_semantic_dimensions",
+                    "doc_id": d,
+                    "process": resolved_process,
+                    "error": "suggest_drawing_dimension_scheme: no supported dimensional "
+                             "feature semantics were found; author the controlling dimensions "
+                             "explicitly rather than using envelope defaults.",
+                })
+            return _dumps({
+                "ok": True,
+                "doc_id": d,
+                "process": resolved_process,
+                "it_grade": f"IT{it_grade}",
+                "items": items,
+                "notes": [
+                    f"Size tolerance proposals use ±IT{it_grade}/2 bilateral, ISO 286-1.",
+                    "Every needs_user_confirm row must be reconciled with fits, function and "
+                    "the governing spec before placing it on sheet.",
+                    "Thread rows intentionally call for add_hole_callout, not tap-drill diameter.",
+                ],
+            })
         except Exception as exc:  # noqa: BLE001
             return _err(exc)

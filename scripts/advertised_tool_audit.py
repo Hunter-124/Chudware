@@ -119,6 +119,27 @@ NON_TOOL_MENTIONS: dict[str, tuple[str, tuple[str, ...]]] = {
         "doc_checkpoint",
         ("services/mcp/cad_common.py",),
     ),
+    "replace_run_text": (
+        "office_edit_docx op= value, not a tool (office_edit_docx(ops=[{'op': "
+        "'replace_run_text', ...}]))",
+        ("services/mcp/office_tools.py",),
+    ),
+    "insert_paragraph_after": (
+        "office_edit_docx op= value, not a tool",
+        ("services/mcp/office_tools.py",),
+    ),
+    "insert_heading": (
+        "office_edit_docx op= value, not a tool",
+        ("services/mcp/office_tools.py",),
+    ),
+    "set_table_cell": (
+        "office_edit_docx/office_edit_pptx op= value, not a tool",
+        ("services/mcp/office_tools.py",),
+    ),
+    "append_paragraph": (
+        "office_edit_docx op= value, not a tool",
+        ("services/mcp/office_tools.py",),
+    ),
     "add_executable": (
         "CMake command — fw_sources appends compilable paths to the project CMakeLists",
         ("services/agent/tool_guidance/firmware.py",),

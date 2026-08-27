@@ -44,9 +44,13 @@ namespace chudware::doc {
 // Never throws; an unrecognized / malformed annotation yields empty primitive arrays.
 nlohmann::json compile_annotation(const nlohmann::json& ann, const std::string& units);
 
-// Compile the 45° section hatch for a closed polygon (already sheet mm). `spacing` and
-// `angle_deg` default to 3 mm / 45°. Returns {"segments":[...]} of clipped hatch lines.
-// Used to move section hatching off the host so exports/PNG hatch too.
+// Compile section hatch for a closed polygon (already sheet mm). The style overload accepts
+// `pattern` ("single" default, "cross", or "double"), `spacing_mm`, and `angle_deg`; unknown
+// or unset fields retain the backward-compatible generic 45 degree / 3 mm hatch. `material`
+// and `body` may accompany the style as provenance for per-body material selection.
+nlohmann::json compile_hatch(const nlohmann::json& polygon, const nlohmann::json& style);
+
+// Compatibility overload for existing callers.
 nlohmann::json compile_hatch(const nlohmann::json& polygon, double spacing, double angle_deg);
 
 // True for annotation kinds the compiler knows how to draw (so callers can detect

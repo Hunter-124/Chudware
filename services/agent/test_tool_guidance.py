@@ -62,6 +62,15 @@ class TestGuidanceEntries(unittest.TestCase):
         self.assertEqual(guidance_for("no_such_tool_zzz"), {})
 
 
+class TestDrawingRoleCoverageGate(unittest.TestCase):
+    def test_drawing_detailer_keeps_audit_tool_within_role_cap(self):
+        from services.agent import roles
+
+        card = roles.load_role("drawing_detailer")
+        self.assertLessEqual(len(card.tool_allowlist), roles.MAX_TOOLS_PER_ROLE)
+        self.assertIn("audit_drawing", card.concrete_tools)
+
+
 def _resolved_signature(name: str):
     """inspect.signature of the live callable for *name*, or None when the
     tool does not resolve in-process (pseudo-tools need a mission dispatcher)."""

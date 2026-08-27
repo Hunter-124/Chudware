@@ -803,3 +803,19 @@ config.
   effective rail is soft_depth_limit (advisory) + max_agents (advisory) + kill().
 - Ledger: mission start appends one `kind: effort_profile` event with the fully
   resolved values + provenance for every tier (replayable).
+
+## Deliverable kinds: work_instruction, weldment_traveler (2026-08-26, additive)
+
+§16's `kind` enum gains two values (append-only; `aicad.deliverables/1` records
+with the original seven kinds remain valid):
+- `work_instruction` — structured machining/fabrication work instruction
+  (routing, setups, fixturing, in-process inspection, signoff), built by
+  `services/deliverables/templates/work_instruction.py` via
+  `make_work_instruction`.
+- `weldment_traveler` — weldment cut list / joint list / WPS / inspection
+  traveler, built by `services/deliverables/templates/weldment_traveler.py`
+  via `make_weldment_traveler`.
+Validators (`services/agent/pipeline/manifest.py::VALID_KINDS`) accept both;
+mission compilation routes them like `report`-class deliverables (buildable by
+a role granted the corresponding make_* tool). Consumers MUST tolerate the new
+kinds per the existing conformance rules.

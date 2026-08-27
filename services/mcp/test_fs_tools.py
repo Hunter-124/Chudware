@@ -180,6 +180,27 @@ def test_fs_read_routes_documents_through_office_extract():
         assert t["fs_read"](csv, offset=2, limit=1)["shown_lines"] == 1
 
 
+@pytest.mark.parametrize("suffix", ["odt", "odp", "ods", "ppt", "xls"])
+def test_fs_read_routes_converted_office_formats_through_office_extract(
+    tmp_path, monkeypatch, suffix
+):
+    called = []
+
+    def _fake_extract(path):
+        called.append(path)
+        return {"ok": True, "kind": suffix, "text": f"routed {suffix} text"}
+
+    monkeypatch.setattr("services.mcp.office_tools.extract_office", _fake_extract)
+    path = tmp_path / f"fixture.{suffix}"
+    path.write_bytes(b"PK\x03\x04binary office fixture")
+
+    result = _tools()["fs_read"](str(path))
+
+    assert result["ok"] and result["is_document"] and result["kind"] == suffix
+    assert f"routed {suffix} text" in result["text"]
+    assert called == [str(path)]
+
+
 def test_fs_read_document_with_space_and_ampersand_path():
     """Paths containing spaces and '&' must survive selector splitting + document routing
     (the user's project literally has a 'CAD & Design Geometry' folder)."""

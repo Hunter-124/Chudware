@@ -223,6 +223,7 @@ _TOOL_FAMILIES: dict[str, set[str]] = {
     },
     "deliverables": {
         "make_report", "make_presentation", "make_workbook",
+        "make_work_instruction", "make_weldment_traveler",
         "render_document", "list_artifacts", "list_spec_templates",
     },
     "sourcing": {

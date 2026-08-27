@@ -10,10 +10,11 @@ Shipped here:
 
 - ``deliverables/1`` smoke templates (:mod:`.smoke`): ``smoke_deck`` / ``smoke_report`` /
   ``smoke_workbook`` — one per format, proving the seam end-to-end.
-- **T-F15 engineering templates v1** — the standard documents a professional engineer ships,
-  every load-bearing number resolved from an attached tool result (contract §4):
+- **Engineering templates** — the standard documents a professional engineer ships, every
+  load-bearing number resolved from an attached tool result (contract §4):
   ``design_review`` (pptx), ``calc_package`` (docx/pdf), ``bom_workbook`` (xlsx),
-  ``verification_report`` (docx/pdf), ``assembly_manual`` (docx/pdf).
+  ``verification_report`` (docx/pdf), ``assembly_manual`` (docx/pdf),
+  ``work_instruction`` (docx/pdf), and ``weldment_traveler`` (docx/pdf).
 
 Every engine import is lazy (inside a builder) so importing this package — e.g. for
 ``list_artifacts`` — never requires python-pptx/docx/openpyxl/reportlab to be installed.
@@ -134,6 +135,8 @@ from . import (  # noqa: E402,F401
     smoke,
     user_manual,
     verification_report,
+    weldment_traveler,
+    work_instruction,
 )
 
 __all__ = [

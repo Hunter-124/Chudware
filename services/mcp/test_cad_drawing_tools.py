@@ -47,6 +47,34 @@ def _call(name: str, args: dict):
     assert isinstance(text, str), (name, structured)
     return json.loads(text)
 
+@pytest.fixture(autouse=True)
+def discard_minted_documents():
+    """Keep engine-backed drawing tests isolated from later agent terminal-save sweeps."""
+    before = {
+        row.get("doc_id")
+        for row in (cb.call("doc_list", {}).get("docs") or [])
+        if isinstance(row, dict) and row.get("doc_id")
+    }
+    yield
+    after = [
+        row for row in (cb.call("doc_list", {}).get("docs") or [])
+        if isinstance(row, dict) and row.get("doc_id") not in before
+    ]
+    drawings = [row for row in after if str(row.get("doc_id")).startswith("dwg-")
+                or str(row.get("kind") or row.get("type") or "").lower() == "drawing"]
+    parts = [row for row in after if row not in drawings]
+    for row in reversed(drawings):
+        doc_id = row["doc_id"]
+        result = cb.call("drawing_close", {"doc_id": doc_id})
+        closed = result.get("result", result.get("ok")) if isinstance(result, dict) else result
+        assert closed, f"failed to close scratch drawing {doc_id}: {result}"
+    for row in reversed(parts):
+        doc_id = row["doc_id"]
+        result = _call("close_part", {"doc_id": doc_id, "discard": True})
+        assert result.get("ok"), (
+            f"failed to discard drawing-tool scratch document {doc_id}: "
+            f"{result.get('error')}")
+
 
 def _plate_with_hole() -> str:
     """A 60x40x10 plate with a single ⌀8 through bore in the top face."""
@@ -1431,3 +1459,253 @@ def test_set_titleblock_guards_the_nested_fields_door_too():
     assert tb.get("title") == "40mm Cube" and "part_name" not in tb, tb
     bad = _agent_call("set_titleblock", {"doc_id": dwg, "fields": {"colour": "blue"}})
     assert bad["ok"] is False and "colour" in bad["error"], bad
+
+
+# ------------------------------------------------ manufacturing drawing release contract
+
+def _complete_titleblock(dwg: str) -> None:
+    result = _call("set_titleblock", {
+        "doc_id": dwg,
+        "fields": {
+            "title": "TEST PLATE", "part_number": "TP-1", "material": "6061-T6 ALUMINUM",
+            "scale": "1:1", "rev": "A", "finish": "AS SPECIFIED",
+        },
+    })
+    assert result["ok"], result
+
+
+def _review_summary(dwg: str, audit_result=None) -> dict:
+    from services.mcp import server
+    args = {"doc_id": dwg}
+    if audit_result is not None:
+        args["audit_result"] = audit_result
+    raw = asyncio.run(server.mcp.call_tool("review_drawing", args))
+    content = raw[0] if isinstance(raw, tuple) else raw
+    text_items = [item for item in content if getattr(item, "type", "") == "text"]
+    assert text_items, content
+    return json.loads(text_items[-1].text)
+
+
+def test_hole_callout_emits_finished_thread_and_depth_text():
+    dwg, view_id, center = _drawing_with_circle(_plate_with_hole())
+    result = _call("add_hole_callout", {
+        "doc_id": dwg, "view_id": view_id, "a": center,
+        "hole_type": "tapped", "thread": "M6x1.0", "depth": 14,
+    })
+    assert result["ok"], result
+    assert "M6x1.0" in result["text"] and "14" in result["text"], result
+    assert "\u21a7" in result["text"], result
+    stored = _the_annotation(dwg, view_id, result["annotation"])
+    assert stored["thread"] == "M6x1.0" and stored["depth"] == 14
+
+
+def test_dimension_tolerance_is_applied_atomically_at_creation():
+    dwg, _mk = _sheet_drawing()
+    bbox = _view(dwg, "v2")["bbox"]
+    result = _call("add_dimension", {
+        "doc_id": dwg, "view_id": "v2",
+        "a": [bbox[0], bbox[1]], "b": [bbox[2], bbox[1]],
+        "tol_type": "deviation", "tol_upper": 0.02, "tol_lower": 0.05,
+        "precision": 2,
+    })
+    assert result["ok"], result
+    stored = _the_annotation(dwg, "v2", result["annotation"])
+    assert stored["tol_type"] == "deviation"
+    assert stored["tol_upper"] == 0.02 and stored["tol_lower"] == 0.05
+    assert "+0.02" in stored["text"] and "-0.05" in stored["text"]
+
+
+def test_review_never_releases_a_bare_nominal_sheet_without_audit():
+    dwg, _mk = _sheet_drawing()
+    _complete_titleblock(dwg)
+    summary = _review_summary(dwg)
+    assert summary["layout_clean"] is True, summary
+    assert summary["manufacturing_ready"] is False, summary
+    assert "audit_drawing" in summary["manufacturing_ready_reason"], summary
+
+
+def test_audit_flags_missing_row_and_passes_when_exact_annotation_is_covered():
+    dwg, made = _sheet_drawing()
+    _complete_titleblock(dwg)
+    bbox = _view(dwg, "v2")["bbox"]
+    dimension = _call("add_dimension", {
+        "doc_id": dwg, "view_id": "v2",
+        "a": [bbox[0], bbox[1]], "b": [bbox[2], bbox[1]],
+        "tol_type": "symmetric", "tol_upper": 0.1, "precision": 1,
+    })
+    assert dimension["ok"], dimension
+    missing = _call("audit_drawing", {
+        "doc_id": made["source_doc_id"], "drawing_id": dwg,
+        "spec": {"requirements": [{
+            "requirement_id": "D1", "type": "dimension_tolerance",
+            "annotation_id": "missing-ann", "critical": True,
+        }]},
+    })
+    assert missing["verdict"] == "not_release_ready", missing
+    assert missing["coverage_matrix"][0]["status"] == "missing", missing
+    covered = _call("audit_drawing", {
+        "doc_id": made["source_doc_id"], "drawing_id": dwg,
+        "spec": {"requirements": [{
+            "requirement_id": "D1", "type": "dimension_tolerance",
+            "annotation_id": dimension["annotation"], "critical": True,
+        }]},
+    })
+    assert covered["verdict"] == "release_ready", covered
+    assert covered["coverage_matrix"][0]["annotation_id"] == dimension["annotation"]
+    review = _review_summary(dwg, covered)
+    assert review["manufacturing_ready"] is True, review
+
+
+def test_missing_new_annotation_rpc_returns_engine_unsupported(monkeypatch):
+    dwg, _mk = _sheet_drawing()
+    real_call = cb.call
+
+    def missing_rpc(method, params=None):
+        if method == "drawing_add_chamfer_dimension":
+            raise cb.CoreError("unknown method drawing_add_chamfer_dimension")
+        return real_call(method, params)
+
+    monkeypatch.setattr(cb, "call", missing_rpc)
+    result = _call("add_chamfer_dimension", {
+        "doc_id": dwg, "view_id": "front", "a": [200, 150],
+        "pos": [215, 165], "length": 1.0, "angle": 45,
+    })
+    assert result == {
+        "ok": False,
+        "reason": "engine_unsupported",
+        "tool": "add_chamfer_dimension",
+        "rpc": "drawing_add_chamfer_dimension",
+        "error": "unknown method drawing_add_chamfer_dimension",
+    }
+
+
+def test_composite_gdt_preserves_second_row_and_full_modifiers():
+    dwg, _mk = _sheet_drawing()
+    result = _call("add_gdt", {
+        "doc_id": dwg, "view_id": "top", "symbol": "position", "tolerance": "0.2",
+        "a": [200, 210], "pos": [240, 230], "modifier": "free",
+        "datums": [{"ref": "A", "modifier": "tangent"}],
+        "row2": {"tolerance": "0.05", "diameter": True, "modifier": "mmc",
+                 "datums": [{"ref": "A", "modifier": "mmc"}]},
+    })
+    assert result["ok"], result
+    stored = _the_annotation(dwg, "v2", result["annotation"])
+    assert stored["tol_modifier"] == "free"
+    assert stored["datums"][0]["modifier"] == "tangent"
+    assert stored["row2"]["tol_value"] == "0.05"
+
+
+def test_hole_feature_ref_auto_populates_thread_depth_and_count(monkeypatch):
+    source = _plate_with_hole()
+    dwg, view_id, center = _drawing_with_circle(source)
+    real_call = cb.call
+
+    def with_tapped_semantics(method, params=None):
+        if method == "doc_tree" and params.get("doc_id") == source:
+            return {"tree": {"features": [{
+                "id": "f-taps", "name": "Clamp Threads", "type": "hole",
+                "params": {
+                    "style": "tap", "thread": "M6x1.0", "depth": 14, "end": "blind",
+                    "diameter": 5.0,
+                    "positions": [[-10, -10], [10, -10], [10, 10], [-10, 10]],
+                },
+            }]}}
+        return real_call(method, params)
+
+    monkeypatch.setattr(cb, "call", with_tapped_semantics)
+    result = _call("add_hole_callout", {
+        "doc_id": dwg, "view_id": view_id, "a": center, "feature_ref": "f-taps",
+    })
+    assert result["ok"], result
+    assert result["text"].startswith("4\u00d7 M6x1.0"), result
+    assert "\u21a7 14" in result["text"], result
+
+
+def test_sheet_table_and_multi_sheet_export_tools_round_trip(tmp_path):
+    made = _a_drawing(_plain_plate())
+    dwg = made["drawing_doc_id"]
+    added = _call("add_drawing_sheet", {
+        "doc_id": dwg, "size": "A4", "name": "DETAILS", "title": "DETAILS",
+    })
+    assert added["ok"] and added["sheet_id"], added
+    listed = _call("list_drawing_sheets", {"doc_id": dwg})
+    assert listed["ok"] and len(listed["sheets"]) >= 2, listed
+    active = _call("set_active_drawing_sheet", {
+        "doc_id": dwg, "sheet_id": added["sheet_id"],
+    })
+    assert active["ok"] and active["sheet_id"] == added["sheet_id"], active
+    table = _call("add_drawing_table", {
+        "doc_id": dwg, "kind": "notes", "position": [20, 30],
+        "title": "GENERAL NOTES", "rows": [{"note": "BREAK SHARP EDGES"}],
+    })
+    assert table["ok"] and table["table_id"], table
+    exported = _call("export_drawing", {
+        "doc_id": dwg, "fmt": "pdf", "sheet": "all",
+        "path": str(tmp_path / "multi-sheet.pdf"),
+    })
+    assert exported["ok"] and os.path.exists(exported["path"]), exported
+
+
+def test_native_chamfer_ordinate_balloon_datum_and_extended_weld_tools():
+    dwg, _mk = _sheet_drawing()
+    bbox = _view(dwg, "v2")["bbox"]
+    chamfer = _call("add_chamfer_dimension", {
+        "doc_id": dwg, "view_id": "top", "a": [bbox[0], bbox[1]],
+        "pos": [bbox[0] - 15, bbox[1] - 15], "length": 1.5, "angle": 45,
+    })
+    assert chamfer["ok"] and chamfer["kind"] == "chamfer", chamfer
+    ordinate = _call("add_ordinate_dimensions", {
+        "doc_id": dwg, "view_id": "top", "origin": [bbox[0], bbox[1]],
+        "points": [[bbox[2], bbox[1]], [bbox[0], bbox[3]]], "axis": "both",
+    })
+    assert ordinate["ok"] and ordinate["count"] >= 2, ordinate
+    balloon = _call("add_balloon", {
+        "doc_id": dwg, "view_id": "top", "a": [bbox[0], bbox[1]], "item": 1,
+    })
+    assert balloon["ok"] and balloon["text"] == "1", balloon
+    bom = _call("drawing_bom", {"doc_id": dwg})
+    assert bom["ok"] and bom["rows"] == [] and bom["is_assembly"] is False, bom
+    target = _call("add_datum_target", {
+        "doc_id": dwg, "view_id": "top", "label": "A1", "target_type": "point",
+        "a": [bbox[0], bbox[1]], "pos": [bbox[0] - 10, bbox[1] - 10],
+    })
+    assert target["ok"] and target["label"] == "A1", target
+    weld = _call("add_weld_symbol", {
+        "doc_id": dwg, "view_id": "top", "weld_type": "fillet", "size": "6",
+        "a": [bbox[0], bbox[1]], "pos": [bbox[0] - 20, bbox[1] - 20],
+        "intermittent_length": 40, "pitch": 100, "contour": "flush",
+        "finish": "grinding", "field_weld": True, "tail_text": "E7018",
+        "full_penetration": True,
+    })
+    assert weld["ok"], weld
+
+
+def test_extended_view_and_section_controls_reach_the_engine():
+    dwg, _mk = _sheet_drawing()
+    changed = _call("set_view", {
+        "doc_id": dwg, "view_id": "top", "orientation": "bottom", "show_hidden": True,
+    })
+    assert changed["ok"], changed
+    assert changed["orientation"] == "bottom" and changed["show_hidden"] is True, changed
+    bbox = _view(dwg, "v1")["bbox"]
+    cut_y = (bbox[1] + bbox[3]) / 2
+    cut = [
+        [bbox[0], cut_y],
+        [(bbox[0] + bbox[2]) / 2, cut_y],
+        [bbox[2], cut_y],
+    ]
+    section = _call("add_section_view", {
+        "doc_id": dwg, "parent": "front", "axis": "horizontal",
+        "multipoint": cut, "offset": 2, "depth": 5,
+        "reverse": True, "show_hidden": True, "label": "B",
+    })
+    assert section["ok"], section
+    assert len(section["cut_line"]) == 3
+    assert section["depth"] == 5 and section["reverse"] is True
+    plane = _call("add_section_view", {
+        "doc_id": dwg, "parent": "front",
+        "plane": {"normal": [0, 0, 1], "point": [0, 0, 0]},
+        "offset": 3, "mode": "full", "label": "C",
+    })
+    assert plane["ok"], plane
+    assert plane["plane"]["point"] == [0.0, 0.0, 3.0]

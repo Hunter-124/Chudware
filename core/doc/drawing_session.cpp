@@ -148,7 +148,9 @@ json blank_drawing(const std::string& name, const std::string& source_doc_id) {
         {"name", name},
         {"units", {{"system", "MMGS"}}},
         {"source", source_doc_id},
-        {"sheets", json::array({json{{"id", "s1"}, {"size", "A3"}, {"views", json::array()}}})},
+        {"active_sheet", "s1"},
+        {"sheets", json::array({json{{"id", "s1"}, {"name", "Sheet 1"}, {"size", "A3"},
+                                      {"views", json::array()}, {"tables", json::array()}}})},
     };
 }
 
@@ -226,10 +228,12 @@ json& find_sheet(json& doc, const std::string& sheet_id) {
     if (!doc.contains("sheets") || !doc["sheets"].is_array() || doc["sheets"].empty())
         throw OpError("invalid_op", "drawing has no sheets", {{"reason", "no sheet"}});
     json& sheets = doc["sheets"];
-    if (sheet_id.empty()) return sheets[0];
+    std::string wanted = sheet_id;
+    if (wanted.empty()) wanted = doc.value("active_sheet", std::string());
+    if (wanted.empty()) return sheets[0];
     for (json& sh : sheets)
-        if (sh.value("id", std::string()) == sheet_id) return sh;
-    throw OpError("invalid_op", "no sheet '" + sheet_id + "'", {{"reason", "unknown sheet"}});
+        if (sh.value("id", std::string()) == wanted) return sh;
+    throw OpError("invalid_op", "no sheet '" + wanted + "'", {{"reason", "unknown sheet"}});
 }
 
 std::string next_view_id(json& doc) {
@@ -245,6 +249,33 @@ std::string next_view_id(json& doc) {
     }
     return "v" + std::to_string(hi + 1);
 }
+std::string next_sheet_id(const json& doc) {
+    int hi = 0;
+    for (const json& sh : doc.value("sheets", json::array())) {
+        const std::string id = sh.value("id", std::string());
+        if (id.size() < 2 || id[0] != 's') continue;
+        bool digits = true;
+        for (std::size_t i = 1; i < id.size(); ++i)
+            if (!std::isdigit(static_cast<unsigned char>(id[i]))) { digits = false; break; }
+        if (digits) hi = std::max(hi, std::atoi(id.c_str() + 1));
+    }
+    return "s" + std::to_string(hi + 1);
+}
+
+std::string next_table_id(const json& doc) {
+    int hi = 0;
+    for (const json& sh : doc.value("sheets", json::array()))
+        for (const json& table : sh.value("tables", json::array())) {
+            const std::string id = table.value("id", std::string());
+            if (id.size() < 2 || id[0] != 't') continue;
+            bool digits = true;
+            for (std::size_t i = 1; i < id.size(); ++i)
+                if (!std::isdigit(static_cast<unsigned char>(id[i]))) { digits = false; break; }
+            if (digits) hi = std::max(hi, std::atoi(id.c_str() + 1));
+        }
+    return "t" + std::to_string(hi + 1);
+}
+
 
 std::string next_label(json& doc) {
     std::set<char> used;
@@ -367,6 +398,22 @@ json resolve_section_plane(const json& view, const json& parent_view) {
         if (view.contains("depth") && view["depth"].is_number()) plane["depth"] = view["depth"];
         if (view.contains("reverse") && view["reverse"].is_boolean())
             plane["reverse"] = view["reverse"];
+        if (view.contains("offset") && view["offset"].is_number() &&
+            plane.contains("normal") && plane.contains("point") &&
+            plane["normal"].is_array() && plane["normal"].size() == 3 &&
+            plane["point"].is_array() && plane["point"].size() == 3) {
+            Vec3 n = v_norm({plane["normal"][0].get<double>(),
+                             plane["normal"][1].get<double>(),
+                             plane["normal"][2].get<double>()});
+            const double offset = view["offset"].get<double>();
+            for (int i = 0; i < 3; ++i)
+                plane["point"][i] = plane["point"][i].get<double>() + n[i] * offset;
+            plane["offset"] = offset;
+        }
+        if (view.contains("hatch_style") && view["hatch_style"].is_object())
+            plane["hatch_style"] = view["hatch_style"];
+        if (view.contains("hatch_styles") && view["hatch_styles"].is_array())
+            plane["hatch_styles"] = view["hatch_styles"];
         return plane;
     };
     if (view.contains("plane") && view["plane"].is_object() &&
@@ -375,15 +422,39 @@ json resolve_section_plane(const json& view, const json& parent_view) {
         return attach_mode(view["plane"]);
     }
     const json& cut_line = view.contains("cut_line") ? view["cut_line"] : json(nullptr);
-    // Accept a 2-point straight cut OR a multi-point (offset/jogged) polyline cut line; the
-    // section plane is taken through the first and last points (the dominant cut direction),
-    // and the jog points still draw on the parent as a stepped cut-line marker.
+    // A straight cut may contain redundant collinear points. A genuinely jogged/offset
+    // cut crosses multiple planes and is not representable by project_section's single
+    // BRep cut plane, so reject it instead of silently projecting the dominant endpoint plane.
     if (!(cut_line.is_array() && cut_line.size() >= 2 && is_xy(cut_line[0]) &&
           is_xy(cut_line[cut_line.size() - 1])))
         throw OpError("invalid_op",
                       "section needs a world 'plane' {normal, point} or a 2D 'cut_line' "
                       "[[x,y],[x,y],...]",
                       {{"reason", "no plane"}});
+    if (cut_line.size() > 2) {
+        const double ax = cut_line[0][0].get<double>();
+        const double ay = cut_line[0][1].get<double>();
+        const double bx = cut_line[cut_line.size() - 1][0].get<double>();
+        const double by = cut_line[cut_line.size() - 1][1].get<double>();
+        const double dx = bx - ax, dy = by - ay;
+        const double len = std::hypot(dx, dy);
+        if (len < 1e-9)
+            throw OpError("invalid_op", "section cut_line endpoints coincide",
+                          {{"reason", "degenerate"}});
+        for (std::size_t i = 1; i + 1 < cut_line.size(); ++i) {
+            if (!is_xy(cut_line[i]))
+                throw OpError("invalid_op", "section cut_line points must be [x,y]",
+                              {{"reason", "bad cut_line"}});
+            const double cross = std::fabs((cut_line[i][0].get<double>() - ax) * dy -
+                                           (cut_line[i][1].get<double>() - ay) * dx);
+            if (cross > 1e-6 * len)
+                throw OpError(
+                    "unsupported_offset_section",
+                    "multi-plane offset section cut lines are not supported; supply one "
+                    "straight cut line or an explicit world plane",
+                    {{"reason", "multi_plane_cut_line"}, {"cut_line", cut_line}});
+        }
+    }
     std::string p_orient = parent_view.value("orientation", std::string("front"));
     double p_scale = parent_view.value("scale", 1.0);
     if (p_scale == 0.0) p_scale = 1.0;
@@ -496,6 +567,9 @@ json project_one(DrawingSession& s, const json& view,
         out["parent"] = view.value("parent", json(nullptr));
         if (view.contains("cut_line")) out["cut_line"] = view["cut_line"];
         if (view.contains("plane")) out["plane"] = view["plane"];
+        for (const char* key : {"mode", "depth", "reverse", "offset",
+                                "hatch_style", "hatch_styles"})
+            if (view.contains(key)) out[key] = view[key];
     } else if (vtype == "detail") {
         out["parent"] = view.value("parent", json(nullptr));
         std::array<double, 2> center = get_pos(view.value("center", json::array({0.0, 0.0})));
@@ -736,6 +810,274 @@ json line_intersection(const json& a, const json& b, const json& c, const json& 
     return json::array({x1 + t * (x2 - x1), y1 + t * (y2 - y1)});
 }
 
+json live_source_tree(const DrawingSession& s) {
+    if (!s.source_ref_id.empty()) {
+        json live = doc_live_source(s.source_ref_id);
+        if (live.is_object() && live.contains("tree")) return live["tree"];
+    }
+    return s.source_doc;
+}
+
+json bom_rows_locked(const DrawingSession& s) {
+    const std::string src_id = s.source_ref_id;
+    json comps = src_id.empty() ? json::array() : doc_asm_bom_components(src_id);
+    if (!comps.is_array() || comps.empty()) return json::array();
+    std::vector<std::string> order;
+    std::map<std::string, json> groups;
+    for (const json& c : comps) {
+        std::string name = c.value("name", std::string());
+        if (name.empty()) name = c.value("component", std::string("Part"));
+        std::string source = c.value("source", std::string());
+        std::string key = !source.empty() ? source : ("name:" + name);
+        if (!groups.count(key)) {
+            groups[key] = json{{"name", name}, {"source", source}, {"quantity", 0}};
+            order.push_back(key);
+        }
+        groups[key]["quantity"] =
+            groups[key]["quantity"].get<int>() + c.value("quantity", 1);
+    }
+    json rows = json::array();
+    int item = 1;
+    for (const std::string& key : order) {
+        const json& g = groups[key];
+        rows.push_back({{"item", item++}, {"name", g["name"]},
+                        {"quantity", g["quantity"]}, {"source", g["source"]}});
+    }
+    return rows;
+}
+
+double scalar_number(const json& v, double fallback = 0.0) {
+    if (v.is_number()) return v.get<double>();
+    if (v.is_object() && v.contains("value") && v["value"].is_number())
+        return v["value"].get<double>();
+    return fallback;
+}
+
+std::string scalar_text(const json& v) {
+    if (v.is_string()) return v.get<std::string>();
+    if (v.is_number_integer()) return std::to_string(v.get<long long>());
+    if (v.is_number_float()) {
+        char buf[64];
+        std::snprintf(buf, sizeof(buf), "%.6g", v.get<double>());
+        return buf;
+    }
+    if (v.is_boolean()) return v.get<bool>() ? "true" : "false";
+    if (v.is_object() && v.contains("value")) return scalar_text(v["value"]);
+    return "";
+}
+
+void collect_hole_features(const json& node, json& rows) {
+    if (node.is_array()) {
+        for (const json& child : node) collect_hole_features(child, rows);
+        return;
+    }
+    if (!node.is_object()) return;
+    if (node.value("type", std::string()) == "hole") {
+        const json& p = node.contains("params") && node["params"].is_object()
+                            ? node["params"] : node;
+        std::string style = p.value("style", std::string("simple"));
+        std::string thread;
+        for (const char* key : {"thread", "tap", "standard", "size"})
+            if (p.contains(key) && p[key].is_string() && !p[key].get<std::string>().empty()) {
+                thread = p[key].get<std::string>();
+                break;
+            }
+        const bool tapped = style == "tap" || style == "tapped" ||
+                            p.contains("tap") || p.value("tapped", false);
+        int count = 1;
+        if (p.contains("positions") && p["positions"].is_array() && !p["positions"].empty())
+            count = static_cast<int>(p["positions"].size());
+        double dia = 0.0;
+        for (const char* key : {"diameter", "dia", "d", "hole_diameter"})
+            if (p.contains(key)) {
+                dia = scalar_number(p[key]);
+                if (dia > 0.0) break;
+            }
+        double depth = p.contains("depth") ? scalar_number(p["depth"]) : 0.0;
+        std::string description;
+        if (tapped && !thread.empty()) description = thread + " TAPPED";
+        else {
+            char buf[96];
+            std::snprintf(buf, sizeof(buf), "DIA %.6g %s", dia,
+                          style == "cbore" ? "CBORE" :
+                          (style == "csink" || style == "countersink") ? "CSK" : "HOLE");
+            description = buf;
+        }
+        if (p.value("end", std::string()) == "through_all") description += " THRU";
+        rows.push_back({{"item", static_cast<int>(rows.size()) + 1},
+                        {"feature", node.value("name", node.value("id", std::string("Hole")))},
+                        {"quantity", count}, {"description", description},
+                        {"diameter", dia}, {"depth", depth}, {"thread", thread},
+                        {"hole_type", tapped ? "tapped" : style}});
+    }
+    for (auto it = node.begin(); it != node.end(); ++it)
+        if (it.key() != "params") collect_hole_features(it.value(), rows);
+}
+
+json hole_rows_locked(const DrawingSession& s) {
+    json rows = json::array();
+    collect_hole_features(live_source_tree(s), rows);
+    if (!rows.empty()) return rows;
+    for (const json& sh : s.doc.value("sheets", json::array()))
+        for (const json& view : sh.value("views", json::array()))
+            for (const json& ann : view.value("annotations", json::array()))
+                if (ann.value("kind", ann.value("type", std::string())) == "hole_callout")
+                    rows.push_back({{"item", static_cast<int>(rows.size()) + 1},
+                                    {"feature", ann.value("id", std::string("Hole"))},
+                                    {"quantity", ann.value("count", 1)},
+                                    {"description", ann.value("text", std::string())},
+                                    {"diameter", ann.value("value", 0.0)},
+                                    {"depth", ann.value("depth", 0.0)},
+                                    {"thread", ann.value("thread", std::string())},
+                                    {"hole_type", ann.value("hole_type", std::string("simple"))}});
+    return rows;
+}
+
+json default_table_columns(const std::string& kind) {
+    auto col = [](const char* key, const char* title, double width) {
+        return json{{"key", key}, {"title", title}, {"width", width}};
+    };
+    if (kind == "bom")
+        return json::array({col("item", "ITEM", 14), col("name", "PART", 52),
+                            col("quantity", "QTY", 16), col("source", "SOURCE", 48)});
+    if (kind == "holes")
+        return json::array({col("item", "ID", 12), col("quantity", "QTY", 14),
+                            col("description", "HOLE / THREAD", 64),
+                            col("depth", "DEPTH", 22)});
+    if (kind == "revision")
+        return json::array({col("rev", "REV", 14), col("date", "DATE", 28),
+                            col("description", "DESCRIPTION", 65),
+                            col("approved_by", "APPROVED", 30)});
+    if (kind == "cutlist")
+        return json::array({col("item", "ITEM", 14), col("description", "MEMBER", 50),
+                            col("quantity", "QTY", 14), col("length", "LENGTH", 24),
+                            col("material", "MATERIAL", 36)});
+    return json::array({col("note", "GENERAL NOTES", 125)});
+}
+
+json resolved_table(const DrawingSession& s, const json& stored) {
+    json table = stored;
+    const std::string kind = table.value("kind", std::string());
+    if (!table.contains("columns") || !table["columns"].is_array() || table["columns"].empty())
+        table["columns"] = default_table_columns(kind);
+    if (kind == "bom") {
+        if (!table.contains("rows") || !table["rows"].is_array() || table["rows"].empty())
+            table["rows"] = bom_rows_locked(s);
+    } else if (kind == "holes") {
+        if (!table.contains("rows") || !table["rows"].is_array() || table["rows"].empty())
+            table["rows"] = hole_rows_locked(s);
+    } else if (!table.contains("rows") || !table["rows"].is_array()) {
+        table["rows"] = json::array();
+    }
+    return table;
+}
+
+json compile_table_draw(const json& table) {
+    const json columns = table.value("columns", json::array());
+    const json rows = table.value("rows", json::array());
+    std::array<double, 2> anchor = get_pos(table.value("anchor", json::array({15.0, 270.0})));
+    const double row_h = table.value("row_height", 6.0);
+    double total_w = 0.0;
+    for (const json& c : columns) total_w += std::max(8.0, c.value("width", 30.0));
+    const std::string title = table.value("title", std::string());
+    const int title_rows = title.empty() ? 0 : 1;
+    const int nrows = 1 + title_rows + static_cast<int>(rows.size());
+    const double bottom = anchor[1] - nrows * row_h;
+    json segs = json::array();
+    json texts = json::array();
+    auto line = [&](double x0, double y0, double x1, double y1) {
+        segs.push_back(json::array({json::array({x0, y0}), json::array({x1, y1})}));
+    };
+    for (int r = 0; r <= nrows; ++r)
+        line(anchor[0], anchor[1] - r * row_h, anchor[0] + total_w,
+             anchor[1] - r * row_h);
+    double x = anchor[0];
+    line(x, bottom, x, anchor[1]);
+    for (const json& c : columns) {
+        x += std::max(8.0, c.value("width", 30.0));
+        line(x, bottom, x, anchor[1] - title_rows * row_h);
+    }
+    if (!title.empty())
+        texts.push_back({{"pos", json::array({anchor[0] + 2.0, anchor[1] - row_h + 1.5})},
+                         {"text", title}, {"h", 3.0}});
+    const double header_y = anchor[1] - (title_rows + 1) * row_h + 1.5;
+    x = anchor[0];
+    for (const json& c : columns) {
+        texts.push_back({{"pos", json::array({x + 1.5, header_y})},
+                         {"text", c.value("title", c.value("key", std::string()))}, {"h", 2.7}});
+        x += std::max(8.0, c.value("width", 30.0));
+    }
+    for (std::size_t r = 0; r < rows.size(); ++r) {
+        const json& row = rows[r];
+        const double y = anchor[1] - (title_rows + 2 + static_cast<int>(r)) * row_h + 1.5;
+        x = anchor[0];
+        for (std::size_t ci = 0; ci < columns.size(); ++ci) {
+            const json& c = columns[ci];
+            std::string value;
+            if (row.is_object()) {
+                const std::string key = c.value("key", std::string());
+                if (!key.empty() && row.contains(key)) value = scalar_text(row[key]);
+            } else if (row.is_array() && ci < row.size()) value = scalar_text(row[ci]);
+            else if (ci == 0) value = scalar_text(row);
+            if (!value.empty())
+                texts.push_back({{"pos", json::array({x + 1.5, y})},
+                                 {"text", value}, {"h", 2.6}});
+            x += std::max(8.0, c.value("width", 30.0));
+        }
+    }
+    return json{{"segments", segs}, {"dashed", json::array()}, {"tris", json::array()},
+                {"arcs", json::array()}, {"texts", texts}};
+}
+
+json compile_title_extension_draw(const json& sheet) {
+    const json& tb = sheet.value("title_block", json::object());
+    static const std::array<const char*, 6> keys = {
+        "checked_by", "approved_by", "drawing_standard",
+        "projection", "general_tolerance", "mass"};
+    bool any = false;
+    for (const char* key : keys)
+        if (tb.contains(key) && !scalar_text(tb[key]).empty()) any = true;
+    if (!any) return json();
+    const json& mm = sheet.value("size_mm", json::array({420.0, 297.0}));
+    const double page_w = mm.is_array() && mm.size() == 2 ? mm[0].get<double>() : 420.0;
+    json rows = json::array();
+    for (int i = 0; i < 3; ++i) {
+        json row;
+        row["left"] = std::string(i == 0 ? "CHECKED BY: " :
+                                  i == 1 ? "STANDARD: " : "GENERAL TOL: ") +
+                      scalar_text(tb[keys[2 * i]]);
+        row["right"] = std::string(i == 0 ? "APPROVED BY: " :
+                                   i == 1 ? "PROJECTION: " : "MASS: ") +
+                       scalar_text(tb[keys[2 * i + 1]]);
+        rows.push_back(std::move(row));
+    }
+    json table = {{"anchor", json::array({page_w - 190.0, 101.0})},
+                  {"columns", json::array({
+                      json{{"key", "left"}, {"title", "DOCUMENT CONTROL"}, {"width", 95.0}},
+                      json{{"key", "right"}, {"title", "ENGINEERING DATA"}, {"width", 85.0}}})},
+                  {"rows", rows}, {"row_height", 7.0}};
+    json draw = compile_table_draw(table);
+    std::string projection = scalar_text(tb.value("projection", json()));
+    std::transform(projection.begin(), projection.end(), projection.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::toupper(c)); });
+    if (!projection.empty()) {
+        const bool first_angle = projection.find("FIRST") != std::string::npos;
+        const double cy = 83.5;
+        const double circle_x = first_angle ? page_w - 29.0 : page_w - 16.0;
+        const double cone_x = first_angle ? page_w - 19.0 : page_w - 31.0;
+        draw["arcs"].push_back(
+            json{{"center", json::array({circle_x, cy})}, {"radius", 2.4},
+                 {"a0", 0.0}, {"a1", 2.0 * CHUDWARE_PI}});
+        draw["segments"].push_back(
+            json::array({json::array({cone_x - 4.0, cy - 2.4}),
+                         json::array({cone_x + 4.0, cy - 1.4}),
+                         json::array({cone_x + 4.0, cy + 1.4}),
+                         json::array({cone_x - 4.0, cy + 2.4}),
+                         json::array({cone_x - 4.0, cy - 2.4})}));
+    }
+    return draw;
+}
+
 // drawing_get without taking g_mtx (the caller already holds it). The full drawing
 // doc + every view's re-projected geometry (drawing.py::get_drawing_full).
 json drawing_get_locked_unsafe(const std::string& doc_id) {
@@ -763,25 +1105,63 @@ json drawing_get_locked_unsafe(const std::string& doc_id) {
                         if (an.is_object()) an["draw"] = compile_annotation(an, units);
                 if (g.contains("section_faces") && g["section_faces"].is_array()) {
                     json hatch = json::array();
-                    for (const json& poly : g["section_faces"]) {
-                        json hr = compile_hatch(poly, 0.0, 45.0);
-                        if (hr.contains("segments"))
-                            for (const json& sgmt : hr["segments"]) hatch.push_back(sgmt);
+                    if (g.contains("section_bodies") && g["section_bodies"].is_array()) {
+                        for (const json& body : g["section_bodies"]) {
+                            const json style = body.value("hatch_style", json::object());
+                            for (const json& poly : body.value("faces", json::array())) {
+                                json hr = compile_hatch(poly, style);
+                                if (hr.contains("segments"))
+                                    for (const json& segment : hr["segments"])
+                                        hatch.push_back(segment);
+                            }
+                        }
+                    } else {
+                        for (const json& poly : g["section_faces"]) {
+                            json hr = compile_hatch(poly, 3.0, 45.0);
+                            if (hr.contains("segments"))
+                                for (const json& segment : hr["segments"]) hatch.push_back(segment);
+                        }
                     }
                     g["hatch"] = hatch;
                 }
             }
             std::array<double, 2> sz = sheet_dims(sh.value("size", std::string()));
-            sheets_out.push_back(json{{"id", sh.value("id", json(nullptr))},
-                                      {"size", sh.value("size", json(nullptr))},
-                                      {"size_mm", json::array({sz[0], sz[1]})},
-                                      {"title_block", sh.value("title_block", json::object())},
-                                      {"views", views_out}});
+            json sh_out = {{"id", sh.value("id", json(nullptr))},
+                           {"name", sh.value("name", json(nullptr))},
+                           {"size", sh.value("size", json(nullptr))},
+                           {"size_mm", json::array({sz[0], sz[1]})},
+                           {"title_block", sh.value("title_block", json::object())}};
+            json tables_out = json::array();
+            json overlay_annotations = json::array();
+            for (const json& stored : sh.value("tables", json::array())) {
+                json table = resolved_table(s, stored);
+                table["draw"] = compile_table_draw(table);
+                tables_out.push_back(table);
+                overlay_annotations.push_back(
+                    json{{"id", table.value("id", std::string())},
+                         {"type", "table"}, {"kind", table.value("kind", std::string())},
+                         {"draw", table["draw"]}});
+            }
+            json title_ext = compile_title_extension_draw(sh_out);
+            if (title_ext.is_object())
+                overlay_annotations.push_back(
+                    json{{"id", "__title_extension"}, {"type", "title_extension"},
+                         {"draw", title_ext}});
+            if (!overlay_annotations.empty())
+                views_out.push_back(
+                    json{{"view_id", "__tables_" + sh.value("id", std::string())},
+                         {"type", "table_overlay"}, {"orientation", "sheet"},
+                         {"visible", json::array()}, {"hidden", json::array()},
+                         {"annotations", overlay_annotations}, {"bbox", json(nullptr)}});
+            sh_out["tables"] = tables_out;
+            sh_out["views"] = views_out;
+            sheets_out.push_back(std::move(sh_out));
         }
     return json{
         {"doc_id", doc_id}, {"revision", s.revision},
         {"source_doc_id", s.source_ref_id.empty() ? s.doc_id : s.source_ref_id},
         {"source_revision", s.source_revision}, {"tree", s.doc}, {"sheets", sheets_out},
+        {"active_sheet_id", s.doc.value("active_sheet", std::string("s1"))},
         {"total_hlr_ms", round6(total_ms)},
     };
 }
@@ -837,6 +1217,52 @@ json drawing_set_source(const std::string& doc_id, const json& source_doc, const
     s.source_revision += 1;
     return json{{"doc_id", doc_id}, {"revision", s.revision}, {"source_revision", s.source_revision}};
 }
+json drawing_add_sheet(const std::string& doc_id, const std::string& size,
+                       const std::string& name) {
+    DrawingLock lk;
+    DrawingSession& s = require_session(doc_id);
+    const std::string paper = size.empty() ? "A3" : size;
+    if (sheet_dims(paper)[0] <= 0.0)
+        throw OpError("invalid_op", "unknown sheet size '" + paper + "'",
+                      {{"reason", "bad size"}});
+    const std::string id = next_sheet_id(s.doc);
+    const std::string sheet_name =
+        name.empty() ? ("Sheet " + id.substr(1)) : name;
+    json sheet = {{"id", id}, {"name", sheet_name}, {"size", paper},
+                  {"views", json::array()}, {"tables", json::array()}};
+    s.doc["sheets"].push_back(sheet);
+    s.doc["active_sheet"] = id;
+    ++s.revision;
+    return json{{"doc_id", doc_id}, {"sheet_id", id}, {"sheet", sheet},
+                {"active_sheet_id", id}, {"revision", s.revision}};
+}
+
+json drawing_list_sheets(const std::string& doc_id) {
+    DrawingLock lk;
+    DrawingSession& s = require_session(doc_id);
+    json sheets = json::array();
+    for (const json& sh : s.doc.value("sheets", json::array()))
+        sheets.push_back({{"id", sh.value("id", json(nullptr))},
+                          {"name", sh.value("name", json(nullptr))},
+                          {"size", sh.value("size", json(nullptr))},
+                          {"view_count", sh.value("views", json::array()).size()},
+                          {"table_count", sh.value("tables", json::array()).size()}});
+    return json{{"doc_id", doc_id}, {"sheets", sheets},
+                {"active_sheet_id", s.doc.value("active_sheet", std::string("s1"))},
+                {"revision", s.revision}};
+}
+
+json drawing_set_active_sheet(const std::string& doc_id, const std::string& sheet_id) {
+    DrawingLock lk;
+    DrawingSession& s = require_session(doc_id);
+    json& sheet = find_sheet(s.doc, sheet_id);
+    const std::string id = sheet.value("id", std::string());
+    s.doc["active_sheet"] = id;
+    ++s.revision;
+    return json{{"doc_id", doc_id}, {"sheet_id", id}, {"sheet", sheet},
+                {"active_sheet_id", id}, {"revision", s.revision}};
+}
+
 
 json drawing_add_view(const std::string& doc_id, const std::string& type,
                       const std::string& orientation, const std::string& sheet_id,
@@ -915,11 +1341,31 @@ json drawing_add_section(const std::string& doc_id, const std::string& parent_vi
     };
     if (plane.is_object()) view["plane"] = plane;
     if (cut_line.is_array() && cut_line.size() >= 2) {
-        // Store the full (possibly jogged) cut-line polyline; resolve uses first+last.
         json cl = json::array();
-        for (const auto& q : cut_line)
-            if (is_xy(q)) cl.push_back(json::array({q[0].get<double>(), q[1].get<double>()}));
-        if (cl.size() >= 2) view["cut_line"] = cl;
+        for (const auto& q : cut_line) {
+            if (!is_xy(q))
+                throw OpError("invalid_op", "section cut_line points must be [x,y]",
+                              {{"reason", "bad cut_line"}});
+            cl.push_back(json::array({q[0].get<double>(), q[1].get<double>()}));
+        }
+        // Validate now, before mutating the sheet. project_one will revalidate restored docs.
+        if (cl.size() > 2) {
+            const double ax = cl[0][0].get<double>(), ay = cl[0][1].get<double>();
+            const double bx = cl.back()[0].get<double>(), by = cl.back()[1].get<double>();
+            const double dx = bx - ax, dy = by - ay, len = std::hypot(dx, dy);
+            if (len < 1e-9)
+                throw OpError("invalid_op", "section cut_line endpoints coincide",
+                              {{"reason", "degenerate"}});
+            for (std::size_t i = 1; i + 1 < cl.size(); ++i)
+                if (std::fabs((cl[i][0].get<double>() - ax) * dy -
+                              (cl[i][1].get<double>() - ay) * dx) > 1e-6 * len)
+                    throw OpError(
+                        "unsupported_offset_section",
+                        "multi-plane offset section cut lines are not supported; supply one "
+                        "straight cut line or an explicit world plane",
+                        {{"reason", "multi_plane_cut_line"}, {"cut_line", cl}});
+        }
+        view["cut_line"] = cl;
     }
     // Custom-section controls (optional, default a full straight section).
     if (opts.is_object()) {
@@ -927,8 +1373,14 @@ json drawing_add_section(const std::string& doc_id, const std::string& parent_vi
         if (mode == "full" || mode == "half") view["mode"] = mode;
         if (opts.contains("depth") && opts["depth"].is_number() && opts["depth"].get<double>() > 0.0)
             view["depth"] = opts["depth"].get<double>();
+        if (opts.contains("offset") && opts["offset"].is_number())
+            view["offset"] = opts["offset"].get<double>();
         if (opts.contains("reverse") && opts["reverse"].is_boolean())
             view["reverse"] = opts["reverse"].get<bool>();
+        if (opts.contains("hatch_style") && opts["hatch_style"].is_object())
+            view["hatch_style"] = opts["hatch_style"];
+        if (opts.contains("hatch_styles") && opts["hatch_styles"].is_array())
+            view["hatch_styles"] = opts["hatch_styles"];
     }
     sheet["views"].push_back(view);
     s.revision += 1;
@@ -1174,6 +1626,114 @@ json drawing_add_dim(const std::string& doc_id, const std::string& view_id, cons
     s.revision += 1;
     return json{{"annotation", ann}, {"drawing", drawing_get_locked_unsafe(doc_id)}};
 }
+json drawing_add_chamfer_dimension(const std::string& doc_id,
+                                   const std::string& view_id,
+                                   const json& spec) {
+    DrawingLock lk;
+    DrawingSession& s = require_session(doc_id);
+    json* view = find_view(s.doc, view_id);
+    if (!view)
+        throw OpError("invalid_op", "no view '" + view_id + "'",
+                      {{"reason", "unknown view"}});
+    const json a = spec.contains("a") ? spec["a"] : json();
+    if (!is_xy(a))
+        throw OpError("invalid_op", "chamfer dimension needs feature anchor a [x,y]",
+                      {{"reason", "bad points"}});
+    json pos = spec.contains("pos") ? spec["pos"] : json();
+    if (!is_xy(pos))
+        pos = json::array({a[0].get<double>() + 18.0, a[1].get<double>() + 12.0});
+    json ann = {{"id", next_ann_id(*view)}, {"type", "note"},
+                {"kind", "chamfer"},
+                {"a", json::array({a[0].get<double>(), a[1].get<double>()})},
+                {"pos", json::array({pos[0].get<double>(), pos[1].get<double>()})}};
+    if (spec.contains("length")) ann["length"] = spec["length"];
+    else if (spec.contains("distance")) ann["length"] = spec["distance"];
+    else
+        throw OpError("invalid_op", "chamfer dimension needs length",
+                      {{"reason", "missing length"}});
+    if (spec.contains("angle")) ann["angle"] = spec["angle"];
+    else if (spec.contains("angle_deg")) ann["angle"] = spec["angle_deg"];
+    else ann["angle"] = 45.0;
+    for (const char* key : {"count", "precision", "prefix", "suffix"})
+        if (spec.contains(key)) ann[key] = spec[key];
+    if (spec.contains("text") && spec["text"].is_string() &&
+        !spec["text"].get<std::string>().empty()) {
+        ann["text"] = spec["text"];
+    } else {
+        std::string composed = scalar_text(ann["length"]) + " \xC3\x97 " +
+                               scalar_text(ann["angle"]) + "\xC2\xB0";
+        const int count = ann.value("count", 0);
+        if (count > 1) composed = std::to_string(count) + "X " + composed;
+        composed = ann.value("prefix", std::string()) + composed +
+                   ann.value("suffix", std::string());
+        ann["text"] = composed;
+    }
+    (*view)["annotations"].push_back(ann);
+    ++s.revision;
+    return json{{"annotation", ann}, {"drawing", drawing_get_locked_unsafe(doc_id)}};
+}
+
+json drawing_add_ordinate_dimensions(const std::string& doc_id,
+                                     const std::string& view_id,
+                                     const json& spec) {
+    DrawingLock lk;
+    DrawingSession& s = require_session(doc_id);
+    json* view = find_view(s.doc, view_id);
+    if (!view)
+        throw OpError("invalid_op", "no view '" + view_id + "'",
+                      {{"reason", "unknown view"}});
+    const json origin = spec.contains("origin") ? spec["origin"] : json();
+    if (!is_xy(origin))
+        throw OpError("invalid_op", "ordinate dimensions need origin [x,y]",
+                      {{"reason", "bad origin"}});
+    const std::string axis = spec.value("axis", std::string("x"));
+    if (axis != "x" && axis != "y")
+        throw OpError("invalid_op", "ordinate axis must be x|y",
+                      {{"reason", "bad axis"}});
+    json points = spec.contains("points") && spec["points"].is_array()
+                      ? spec["points"] : json::array();
+    if (points.empty() && spec.contains("a")) points.push_back(spec["a"]);
+    if (points.empty())
+        throw OpError("invalid_op", "ordinate dimensions need points[] or a",
+                      {{"reason", "no points"}});
+    double scale = view->value("scale", 1.0);
+    if (scale == 0.0) scale = 1.0;
+    const std::string units = doc_units(s.doc);
+    json annotations = json::array();
+    for (std::size_t i = 0; i < points.size(); ++i) {
+        const json& entry = points[i];
+        const json point = entry.is_object() && entry.contains("point")
+                               ? entry["point"] : entry;
+        if (!is_xy(point))
+            throw OpError("invalid_op", "ordinate point must be [x,y]",
+                          {{"reason", "bad points"}, {"index", i}});
+        double value = (point[axis == "x" ? 0 : 1].get<double>() -
+                        origin[axis == "x" ? 0 : 1].get<double>()) / scale;
+        if (entry.is_object() && entry.contains("value") && entry["value"].is_number())
+            value = entry["value"].get<double>();
+        json pos = spec.contains("pos") ? spec["pos"] : json();
+        if (entry.is_object() && entry.contains("pos")) pos = entry["pos"];
+        if (!is_xy(pos))
+            pos = axis == "x"
+                      ? json::array({point[0].get<double>(),
+                                     origin[1].get<double>() + 15.0})
+                      : json::array({origin[0].get<double>() + 15.0,
+                                     point[1].get<double>()});
+        json ann = {{"id", next_ann_id(*view)}, {"type", "note"},
+                    {"kind", "ordinate_dim"}, {"origin", origin},
+                    {"a", json::array({point[0].get<double>(), point[1].get<double>()})},
+                    {"axis", axis}, {"value", round6(value)}, {"pos", pos}};
+        if (entry.is_object() && entry.contains("text")) ann["text"] = entry["text"];
+        else if (spec.contains("text") && points.size() == 1) ann["text"] = spec["text"];
+        else ann["text"] = format_dim_value(value, units, "linear_dim");
+        (*view)["annotations"].push_back(ann);
+        annotations.push_back(ann);
+    }
+    ++s.revision;
+    return json{{"annotations", annotations},
+                {"drawing", drawing_get_locked_unsafe(doc_id)}};
+}
+
 
 json drawing_remove_annotation(const std::string& doc_id, const std::string& view_id,
                                const std::string& ann_id) {
@@ -1205,39 +1765,14 @@ json drawing_get(const std::string& doc_id) {
 json drawing_bom(const std::string& doc_id) {
     DrawingLock lk;
     DrawingSession& s = require_session(doc_id);
-    const std::string src_id = s.source_ref_id;
-    // No live source (inline probe) -> no BOM. Else ask the source session for its real
-    // components (empty array when the source is a part or has since closed).
-    json comps = src_id.empty() ? json::array() : doc_asm_bom_components(src_id);
-    if (!comps.is_array() || comps.empty())
-        return json{{"rows", json::array()}, {"is_assembly", false},
-                    {"source_doc_id", src_id.empty() ? doc_id : src_id},
-                    {"note", src_id.empty() ? "inline-source drawing has no BOM"
-                                            : "part drawings have no BOM"}};
-    // Group identical parts: same source path (or name when there is no path). Each
-    // component contributes its own quantity (pattern instances already rolled in).
-    std::vector<std::string> order;
-    std::map<std::string, json> groups;
-    for (const json& c : comps) {
-        std::string name = c.value("name", std::string());
-        if (name.empty()) name = c.value("component", std::string("Part"));
-        std::string source = c.value("source", std::string());
-        std::string key = !source.empty() ? source : ("name:" + name);
-        auto g = groups.find(key);
-        if (g == groups.end()) {
-            groups[key] = json{{"name", name}, {"source", source}, {"quantity", 0}};
-            order.push_back(key);
-        }
-        groups[key]["quantity"] = groups[key]["quantity"].get<int>() + c.value("quantity", 1);
-    }
-    json rows = json::array();
-    int item = 1;
-    for (const std::string& key : order) {
-        const json& g = groups[key];
-        rows.push_back({{"item", item++}, {"name", g["name"]},
-                        {"quantity", g["quantity"]}, {"source", g["source"]}});
-    }
-    return json{{"rows", rows}, {"is_assembly", true}, {"source_doc_id", src_id}};
+    json rows = bom_rows_locked(s);
+    const std::string src_id = s.source_ref_id.empty() ? doc_id : s.source_ref_id;
+    json out = {{"rows", rows}, {"is_assembly", !rows.empty()},
+                {"source_doc_id", src_id}};
+    if (rows.empty())
+        out["note"] = s.source_ref_id.empty() ? "inline-source drawing has no BOM"
+                                               : "part drawings have no BOM";
+    return out;
 }
 
 std::map<std::string, std::string> drawings_for_source(const std::string& source_doc_id) {
@@ -1263,6 +1798,18 @@ json register_restored_drawing(const json& drawing_doc, const std::string& sourc
     s.source_ref_id = source_doc_id;  // re-point the live source to the reopened part
     s.doc = drawing_doc;
     s.doc["source"] = source_doc_id;  // keep the doc's own source ref in sync
+    if (!s.doc.contains("active_sheet") || !s.doc["active_sheet"].is_string()) {
+        const json& sheets = s.doc.value("sheets", json::array());
+        s.doc["active_sheet"] = !sheets.empty() ? sheets[0].value("id", std::string("s1"))
+                                                : "s1";
+    }
+    if (s.doc.contains("sheets") && s.doc["sheets"].is_array())
+        for (json& sheet : s.doc["sheets"]) {
+            if (!sheet.contains("tables") || !sheet["tables"].is_array())
+                sheet["tables"] = json::array();
+            if (!sheet.contains("name") || !sheet["name"].is_string())
+                sheet["name"] = sheet.value("id", std::string("Sheet"));
+        }
     s.source_doc = json::object();    // no inline snapshot — re-pull live from the source
     s.source_env = json::object();
     s.revision = 0;
@@ -1631,8 +2178,26 @@ json drawing_add_weld(const std::string& doc_id, const std::string& view_id, con
     json ann = {{"id", next_ann_id(*view)}, {"type", "gdt"}, {"kind", "weld_symbol"},
                 {"weld_type", wtype}, {"other_side", sp.value("other_side", false)},
                 {"all_around", sp.value("all_around", false)}};
-    if (sp.contains("size") && sp["size"].is_string()) ann["size"] = sp["size"];
-    ann["text"] = std::string("WELD ") + wtype + " " + ann.value("size", std::string());
+    if (sp.contains("size") &&
+        (sp["size"].is_string() || sp["size"].is_number()))
+        ann["size"] = scalar_text(sp["size"]);
+    for (const char* key : {"pitch", "contour", "finish", "field_weld",
+                            "tail_text", "full_penetration"})
+        if (sp.contains(key) && (sp[key].is_string() || sp[key].is_number() ||
+                                 sp[key].is_boolean()))
+            ann[key] = sp[key];
+    if (sp.contains("intermittent_length") &&
+        (sp["intermittent_length"].is_string() ||
+         sp["intermittent_length"].is_number())) {
+        ann["intermittent_length"] = sp["intermittent_length"];
+        ann["length"] = sp["intermittent_length"];
+    } else if (sp.contains("length") &&
+               (sp["length"].is_string() || sp["length"].is_number())) {
+        ann["length"] = sp["length"];
+        ann["intermittent_length"] = sp["length"];
+    }
+    ann["text"] = std::string("WELD ") + wtype + " " +
+                  ann.value("size", std::string());
     if (is_xy(sp.value("a", json(nullptr))))
         ann["a"] = json::array({sp["a"][0].get<double>(), sp["a"][1].get<double>()});
     if (is_xy(sp.value("pos", json(nullptr))))
@@ -1781,6 +2346,48 @@ json drawing_set_sheet(const std::string& doc_id, const std::string& sheet_id,
     return json{{"doc_id", doc_id}, {"sheet_id", sheet.value("id", json(nullptr))},
                 {"size", size}, {"drawing", drawing_get_locked_unsafe(doc_id)}};
 }
+json drawing_add_table(const std::string& doc_id, const std::string& sheet_id,
+                       const std::string& kind, const json& spec) {
+    DrawingLock lk;
+    DrawingSession& s = require_session(doc_id);
+    json& sheet = find_sheet(s.doc, sheet_id);
+    if (kind != "bom" && kind != "revision" && kind != "holes" &&
+        kind != "notes" && kind != "cutlist")
+        throw OpError("invalid_op",
+                      "table kind '" + kind +
+                          "' must be bom|revision|holes|notes|cutlist",
+                      {{"reason", "bad table kind"}, {"kind", kind}});
+    const json& cfg = spec.is_object() ? spec : json::object();
+    const std::array<double, 2> mm = sheet_dims(sheet.value("size", std::string("A3")));
+    json anchor = cfg.contains("anchor") ? cfg["anchor"] :
+                  cfg.contains("position") ? cfg["position"] :
+                  json::array({15.0, std::max(30.0, mm[1] - 15.0)});
+    if (!is_xy(anchor))
+        throw OpError("invalid_op", "table position must be [x,y] sheet mm",
+                      {{"reason", "bad position"}});
+    static const std::map<std::string, std::string> titles = {
+        {"bom", "BILL OF MATERIALS"}, {"revision", "REVISION HISTORY"},
+        {"holes", "HOLE TABLE"}, {"notes", "GENERAL NOTES"},
+        {"cutlist", "WELD CUT LIST"}};
+    json table = {{"id", next_table_id(s.doc)}, {"kind", kind},
+                  {"title", cfg.value("title", titles.at(kind))},
+                  {"anchor", json::array({anchor[0].get<double>(), anchor[1].get<double>()})},
+                  {"columns", cfg.contains("columns") ? cfg["columns"]
+                                                       : default_table_columns(kind)},
+                  {"rows", cfg.contains("rows") && cfg["rows"].is_array()
+                               ? cfg["rows"] : json::array()},
+                  {"row_height", cfg.value("row_height", 6.0)}};
+    if (!sheet.contains("tables") || !sheet["tables"].is_array())
+        sheet["tables"] = json::array();
+    sheet["tables"].push_back(table);
+    ++s.revision;
+    json resolved = resolved_table(s, table);
+    resolved["draw"] = compile_table_draw(resolved);
+    return json{{"doc_id", doc_id}, {"sheet_id", sheet.value("id", json(nullptr))},
+                {"table_id", table["id"]}, {"table", resolved},
+                {"revision", s.revision}};
+}
+
 
 json drawing_make(const std::string& source_doc_id, const json& spec) {
     // Orchestrates the public single-step RPCs (each takes g_mtx itself) — so we must NOT hold

@@ -134,6 +134,9 @@ try:
         _it_grade_for_process,
         _bilateral_tolerance,
         _find_bolt_patterns,
+        _drawing_plan_from_features,
+        _process_verdict,
+        register_dimension_scheme_tools,
     )
 finally:
     _restore_stubs()
@@ -606,6 +609,79 @@ class TestSketchHealthText(unittest.TestCase):
         self.assertIn("+8 more", t)           # elision is counted, not silent
         self.assertNotIn("line e12", t)       # the tail is not enumerated
 
+
+
+class TestDrawingDimensionScheme(unittest.TestCase):
+    class Registry:
+        def __init__(self):
+            self.tools = {}
+
+        def tool(self):
+            def decorate(function):
+                self.tools[function.__name__] = function
+                return function
+            return decorate
+
+    def _tools(self):
+        registry = self.Registry()
+        register_dimension_scheme_tools(registry)
+        return registry.tools
+
+    def test_unknown_and_omitted_process_are_refused_with_valid_list(self):
+        for process, reason in ((None, "process_required"), ("lost_wax", "unknown_process")):
+            resolved, error = _process_verdict(process, "suggest_drawing_dimension_scheme")
+            self.assertIsNone(resolved)
+            self.assertEqual(error["reason"], reason)
+            self.assertIn("cnc_mill", error["valid_processes"])
+            self.assertIn("fdm", error["valid_processes"])
+
+    def test_sketch_entry_point_no_longer_falls_back_to_fdm(self):
+        result = json.loads(self._tools()["suggest_dimension_scheme"](
+            doc_id="doc-1", sketch_id="sk1", process="lost_wax"))
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["reason"], "unknown_process")
+        self.assertNotEqual(result.get("process"), "fdm")
+
+    def test_drawing_entry_point_reads_hole_semantics_and_requires_process(self):
+        features = [{
+            "id": "f-hole", "name": "Clamp threads", "type": "hole",
+            "params": {"style": "tap", "thread": "M6x1.0", "depth": 14,
+                       "end": "blind", "positions": [[-10, -10], [10, -10],
+                                                     [10, 10], [-10, 10]]},
+        }]
+        plan = _drawing_plan_from_features(features, "cnc_mill", 7)
+        self.assertEqual(len(plan), 1)
+        self.assertEqual(plan[0]["annotation_kind"], "thread")
+        self.assertEqual(plan[0]["suggested_tool"], "add_hole_callout")
+        self.assertEqual(plan[0]["thread"], "M6x1.0")
+        self.assertEqual(plan[0]["depth"], 14.0)
+
+    def test_drawing_entry_point_returns_process_specific_feature_plan(self):
+        import services.mcp.core_bridge as core_bridge
+
+        def fake_call(method, params=None):
+            if method == "dfm_known_processes":
+                return {"ok": True, "result": [
+                    "fdm", "cnc_mill", "lathe", "sheet_metal", "laser", "injection"]}
+            if method == "doc_list":
+                return {"docs": [{"doc_id": "doc-1", "name": "Plate"}]}
+            if method == "doc_list_features":
+                return {"features": [{
+                    "id": "f-box", "name": "Stock", "type": "box",
+                    "params": {"length": 60, "width": 40, "height": 10},
+                }]}
+            raise AssertionError(method)
+
+        with unittest.mock.patch.object(core_bridge, "call", fake_call):
+            result = json.loads(self._tools()["suggest_drawing_dimension_scheme"](
+                doc_id="doc-1", process="cnc_mill"))
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["process"], "cnc_mill")
+        self.assertEqual(result["it_grade"], "IT7")
+        self.assertEqual({item["source_param"] for item in result["items"]},
+                         {"length", "width", "height"})
+        self.assertTrue(all(item["default_tolerance"]["it_grade"] == "IT7"
+                            for item in result["items"]))
 
 if __name__ == "__main__":
     unittest.main()

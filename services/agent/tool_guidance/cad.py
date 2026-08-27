@@ -62,10 +62,28 @@ ENTRIES: dict[str, dict[str, Any]] = {
             "set_config_override / set_config_suppression, then activate_configuration."
         ),
     },
+    "add_balloon": {
+        "prompt_note": (
+            "Link item to a drawing_bom row, then anchor a/pos from review_drawing "
+            "sheet mm; re-review so the leader and balloon do not obscure geometry."
+        ),
+    },
+    "add_chamfer_dimension": {
+        "prompt_note": (
+            "Create a semantic chamfer callout from the ledger's distance/angle; use "
+            "review_drawing sheet-mm anchors and include it in audit_drawing spec coverage."
+        ),
+    },
     "add_datum": {
         "prompt_note": (
             "Read feature/label points from review_drawing first (sheet mm); declare "
             "datums before any add_gdt frame that references them."
+        ),
+    },
+    "add_datum_target": {
+        "prompt_note": (
+            "Use for a controlled point/line/area target (not a whole datum feature); "
+            "read a/pos from review_drawing and reference the target honestly in GD&T."
         ),
     },
     "add_detail_view": {
@@ -76,15 +94,16 @@ ENTRIES: dict[str, dict[str, Any]] = {
     },
     "add_dimension": {
         "prompt_note": (
-            "For whole-view auto-dimensioning prefer make_drawing's model_items; use "
-            "feature names/SIDs or exact circles/points from review_drawing for one-offs. "
-            "dtype='note' takes one anchor plus required text='...'."
+            "Shop drawings should start make_drawing(model_items=False); place each "
+            "ledger-driven dimension explicitly with tol_type/tol_upper/tol_lower at "
+            "creation. dtype='note' takes one anchor plus required text='...'."
         ),
     },
     "add_drawing_view": {
         "prompt_note": (
-            "One view per call on an existing drawing_doc_id (from make_drawing); the "
-            "first/anchor view should be view_type='base', x,y are sheet mm."
+            "Add one base/projected view to a make_drawing doc; x/y are sheet mm. "
+            "Set show_hidden deliberately and use orientation controls only when the "
+            "canonical directions do not expose the specified feature."
         ),
     },
     "add_features": {
@@ -95,20 +114,54 @@ ENTRIES: dict[str, dict[str, Any]] = {
     },
     "add_gdt": {
         "prompt_note": (
-            "Place from review_drawing sheet-mm coordinates; declare referenced datums "
-            "with add_datum first, diameter=True adds the ⌀ zone."
+            "Declare add_datum/add_datum_target references first; row2 creates a "
+            "composite frame and datum/material modifiers must match the ledger. "
+            "Re-check placement with review_drawing and coverage with audit_drawing."
+        ),
+    },
+    "add_hole_callout": {
+        "prompt_note": (
+            "Use instead of a projected tap-drill diameter: specify simple/tapped/"
+            "counterbore/countersink semantics, full thread, count and THRU/depth from "
+            "the ledger, then retain its annotation id for audit coverage."
+        ),
+    },
+    "add_ordinate_dimensions": {
+        "prompt_note": (
+            "Use a shared datum origin for patterns/locations that must not accumulate "
+            "chain error; every ordinate value and tolerance must trace to the ledger."
         ),
     },
     "add_section_view": {
         "prompt_note": (
-            "Cuts the parent view through its centre only — no sheet math needed; a "
-            "magnified local region is add_detail_view instead."
+            "Use axis for a centre cut or plane/offset/depth/multipoint for a specified "
+            "cut; sections must expose hidden bores, threads, pockets or welds that need "
+            "controlled annotations."
         ),
     },
     "add_surface_finish": {
         "prompt_note": (
             "a/pos are sheet mm from review_drawing; ra is a string (\"1.6\"). One "
             "symbol per call — review_drawing again to check placement."
+        ),
+    },
+    "add_weld_symbol": {
+        "prompt_note": (
+            "Place the structured weld requirement (type/size/side plus intermittent "
+            "length/pitch, contour/finish, field/all-around, tail or full penetration) "
+            "from the ledger; never replace it with a free note."
+        ),
+    },
+    "add_drawing_sheet": {
+        "prompt_note": (
+            "Add a controlled sheet to an existing drawing package, then "
+            "set_active_drawing_sheet before adding its views/tables/annotations."
+        ),
+    },
+    "add_drawing_table": {
+        "prompt_note": (
+            "Place kind=bom|revision|holes|notes|cutlist on the active sheet; use "
+            "auto-population where supported and verify row content plus layout."
         ),
     },
     "asm_add_component": {
@@ -127,6 +180,13 @@ ENTRIES: dict[str, dict[str, Any]] = {
         "prompt_note": (
             "Run at PLANNING time, before a large build — it advises subassembly "
             "grouping; deep products should be mated subassemblies, not one giant file."
+        ),
+    },
+    "audit_drawing": {
+        "prompt_note": (
+            "Required release gate after current review_drawing: doc_id is the SOURCE "
+            "part/assembly, drawing_id is its DRAWING doc, and spec comes from the ledger. "
+            "Export needs verdict=release_ready with missing_critical empty."
         ),
     },
     "cad_graph": {
@@ -239,17 +299,23 @@ ENTRIES: dict[str, dict[str, Any]] = {
             "of ingesting the whole report; source='phases' needs no start."
         ),
     },
+    "drawing_bom": {
+        "prompt_note": (
+            "Read live assembly item/name/quantity/source rows before add_balloon or "
+            "a BOM table; preserve item-number linkage instead of retyping a prose list."
+        ),
+    },
     "edit_drawing_annotation": {
         "prompt_note": (
-            "Fix or delete an existing dimension/note by the view_id + annotation_id "
-            "listed in review_drawing — never rebuild a whole sheet to remove one callout."
+            "Patch/delete by view_id + annotation_id from review_drawing; any mutation "
+            "invalidates the release sequence, so review_drawing then audit_drawing again."
         ),
     },
     "export_drawing": {
         "prompt_note": (
-            "2D drawings only (doc_id = drawing_doc_id). The built-in agent must call "
-            "review_drawing AFTER its last sheet mutation and inspect the attached pixels "
-            "and warnings before export; 3D parts go through export_part."
+            "Final drawing artifact only: make_drawing → current review_drawing → "
+            "audit_drawing(verdict=release_ready) → export. Use sheet='all' for the "
+            "controlled multi-sheet package; 3D exchange files use export_part."
         ),
     },
     "export_part": {
@@ -326,6 +392,12 @@ ENTRIES: dict[str, dict[str, Any]] = {
             "add_configuration + set_config_override, switch with activate_configuration."
         ),
     },
+    "list_drawing_sheets": {
+        "prompt_note": (
+            "Inspect sheet ids, names and active state before set_active_drawing_sheet "
+            "or export_drawing(sheet='all'); never assume the first sheet is the package."
+        ),
+    },
     "list_parts": {
         "prompt_note": (
             "Open docs in this session; after a server restart this is empty — "
@@ -352,8 +424,9 @@ ENTRIES: dict[str, dict[str, Any]] = {
     },
     "make_drawing": {
         "prompt_note": (
-            "Empty docs are rejected — build geometry first; returns drawing_doc_id + "
-            "view map, then review_drawing and refine with the add_* drawing tools."
+            "Build geometry first, then start shop drawings with model_items=False and "
+            "an explicit ledger-driven annotation plan. Returns drawing_doc_id + view "
+            "map; refine, review_drawing, audit_drawing, then export_drawing."
         ),
         "timeout_s": 300,
     },
@@ -367,6 +440,20 @@ ENTRIES: dict[str, dict[str, Any]] = {
         "prompt_note": (
             "Same spec envelope as make_presentation; format docx (default) or pdf. "
             "Provenance is enforced BEFORE any file is written."
+        ),
+    },
+    "make_weldment_traveler": {
+        "prompt_note": (
+            "Controlled weld shop handoff (kind/template weldment_traveler): cut and "
+            "joint lists, provenance-backed WPS values, fit-up/distortion controls, "
+            "visual/NDT inspection, signoff; format docx or pdf."
+        ),
+    },
+    "make_work_instruction": {
+        "prompt_note": (
+            "Controlled machining routing (kind/template work_instruction): every machined "
+            "operation needs setup datum/WCS, fixturing, machine/tool, provenance-backed "
+            "process values, and in-process inspection; format docx or pdf."
         ),
     },
     "make_standard_part": {
@@ -513,9 +600,9 @@ ENTRIES: dict[str, dict[str, Any]] = {
     },
     "review_drawing": {
         "prompt_note": (
-            "SEE the attached sheet pixels AND read the paired sheet-mm JSON. Fix every "
-            "overlap/off-sheet/title/material warning with set_view, annotation tools, "
-            "set_titleblock or source set_material; review again after the last edit."
+            "Inspect attached pixels plus sheet-mm JSON and clear layout/title/material "
+            "warnings after the last mutation. layout_clean is necessary, not release: "
+            "follow with audit_drawing against the ledger spec."
         ),
     },
     "save_part": {
@@ -523,6 +610,12 @@ ENTRIES: dict[str, dict[str, Any]] = {
             "Native editable Chudware document only (.step+ ZIP); it is NOT ISO STEP and "
             "a machine shop cannot treat it as .step. Save it for project history, and for "
             "external manufacturing also call export_part(fmt='step', path='...step')."
+        ),
+    },
+    "set_active_drawing_sheet": {
+        "prompt_note": (
+            "Select the destination sheet_id before adding views/tables/annotations; "
+            "confirm with list_drawing_sheets and re-review the changed sheet."
         ),
     },
     "set_config_override": {
@@ -549,14 +642,15 @@ ENTRIES: dict[str, dict[str, Any]] = {
     },
     "set_titleblock": {
         "prompt_note": (
-            "fields: title/drawn_by/date/material/finish/scale/rev/sheet/part_number/"
-            "company; verify the filled block with review_drawing."
+            "Fill title/drawn_by/date/material/finish/scale/rev/sheet/part_number/"
+            "company; review material must match the source and audit_drawing decides "
+            "release completeness."
         ),
     },
     "set_view": {
         "prompt_note": (
-            "Fix overlapping views reported by review_drawing — x,y are sheet mm; "
-            "scale 1.0 = 1:1, 0.5 = 1:2, 2.0 = 2:1."
+            "Use review_drawing sheet mm to fix layout; x/y/scale move or resize, while "
+            "show_hidden/orientation change the projection. Re-review and re-audit after."
         ),
     },
     "show_in_app": {
@@ -677,6 +771,13 @@ ENTRIES: dict[str, dict[str, Any]] = {
         "prompt_note": (
             "Dimension plan for an existing sketch; size mating bores with fit_calc "
             "FIRST (they come back needs_user_confirm). process drives the IT grade."
+        ),
+    },
+    "suggest_drawing_dimension_scheme": {
+        "prompt_note": (
+            "Plan explicit shop-drawing coverage from doc_id + process; it proposes a "
+            "scheme but never supplies provenance or places annotations, so reconcile "
+            "every row with the ledger before add_dimension/add_hole_callout."
         ),
     },
     "undo": {

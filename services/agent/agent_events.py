@@ -354,6 +354,9 @@ _ARTIFACT_PRODUCER_TOOLS = frozenset({
     "review_drawing",
     # CAD document/report writers (services/deliverables + layout plan)
     "make_report", "make_workbook", "make_presentation", "layout_plan_report",
+    "make_work_instruction", "make_weldment_traveler",
+    # Office format conversion (LibreOffice bridge)
+    "office_convert",
     # CAM deliverables (gcode / .cam+ job / operator setup sheet)
     "cam_post", "cam_save", "cam_setup_sheet",
     # ECAD + reverse-engineering export bundles

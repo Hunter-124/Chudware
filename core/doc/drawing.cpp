@@ -541,6 +541,8 @@ json project_section(const std::vector<TopoDS_Shape>& shapes, const json& plane,
 
         std::vector<TopoDS_Shape> cut_shapes;
         std::vector<std::vector<std::array<double, 2>>> section_faces;
+        json section_bodies = json::array();
+        std::size_t body_index = 0;
         for (const auto& raw : shapes) {
             TopoDS_Shape cs;
             try {
@@ -549,7 +551,23 @@ json project_section(const std::vector<TopoDS_Shape>& shapes, const json& plane,
                 cs = raw;
             }
             cut_shapes.push_back(cs);
-            section_face_polygons(cs, normal, point, sx, sy, scale, position, section_faces);
+            std::vector<std::vector<std::array<double, 2>>> body_faces;
+            section_face_polygons(cs, normal, point, sx, sy, scale, position, body_faces);
+            section_faces.insert(section_faces.end(), body_faces.begin(), body_faces.end());
+            json body = {{"body_index", body_index},
+                         {"faces", polylines_to_json(body_faces)}};
+            if (plane.contains("hatch_styles") && plane["hatch_styles"].is_array() &&
+                body_index < plane["hatch_styles"].size() &&
+                plane["hatch_styles"][body_index].is_object())
+                body["hatch_style"] = plane["hatch_styles"][body_index];
+            else if (plane.contains("hatch_style") && plane["hatch_style"].is_object())
+                body["hatch_style"] = plane["hatch_style"];
+            else
+                body["hatch_style"] = json{{"pattern", "single"},
+                                            {"angle_deg", 45.0 + 90.0 * (body_index % 2)},
+                                            {"spacing_mm", 3.0}};
+            section_bodies.push_back(std::move(body));
+            ++body_index;
         }
 
         gp_Ax2 ax(gp_Pnt(0, 0, 0), gp_Dir(look[0], look[1], look[2]),
@@ -623,6 +641,7 @@ json project_section(const std::vector<TopoDS_Shape>& shapes, const json& plane,
         base["visible"] = polylines_to_json(visible);
         base["hidden"] = polylines_to_json(hidden);
         base["section_faces"] = polylines_to_json(section_faces);
+        base["section_bodies"] = section_bodies;
         base["bbox"] = bbox;
         if (section_faces.empty()) base["error"] = "cut plane does not intersect the model";
     } catch (const std::exception& exc) {

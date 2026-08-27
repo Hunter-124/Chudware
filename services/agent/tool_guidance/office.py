@@ -11,6 +11,17 @@ ENTRIES: dict[str, dict[str, Any]] = {
             "structure (pptx notes, pdf page_range, single xlsx sheet)."
         ),
     },
+    "office_convert": {
+        "prompt_note": (
+            "LibreOffice-headless format bridge (docx/odt/pdf/pptx/odp/xlsx/"
+            "ods/csv/html/txt). Writes beside the input unless out= is given. "
+            "Requires LibreOffice on the machine — a converter_missing refusal "
+            "means it is not installed, not that the file is bad. Conversion "
+            "is one-way authoring: prefer editing the native format "
+            "(office_edit_*) and converting LAST, since round-trips can drop "
+            "format-specific features."
+        ),
+    },
     "office_read_csv": {
         "prompt_note": (
             "First row is always returned as header, never as data; the "

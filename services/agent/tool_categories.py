@@ -50,6 +50,11 @@ CATEGORY_PACKS: dict[str, list[str]] = {
         # hint names it). advertised_tool_audit, 2026-07-30.
         "get_part",
         "recover_parts",
+        # Displaced from the capped `family:cad` expansion when the 2026-08-26
+        # drawing-overhaul tools registered (family:cad is 40-cap trimmed, and
+        # 16 new cad-family names pushed these past the cut). Same crowding
+        # class as get_part above. advertised_tool_audit, 2026-08-26.
+        "code_check",
     ],
     "sketch": [
         "family:gsl",
@@ -85,6 +90,9 @@ CATEGORY_PACKS: dict[str, list[str]] = {
         "sketch3d_as_sweep_guide",
         "sketch3d_to_ledger",
         "doc_sketch_contact_sheet",
+        # Displaced from the capped `family:cad` expansion by the 2026-08-26
+        # drawing-overhaul registrations — see the modeling pack note.
+        "check_sketch3d",
     ],
     "measure": [
         "measure_part",
@@ -115,6 +123,9 @@ CATEGORY_PACKS: dict[str, list[str]] = {
         "design_review",
         "dfm_check",
         "verify_battery",
+        # Displaced from the capped `family:cad` expansion by the 2026-08-26
+        # drawing-overhaul registrations — see the modeling pack note.
+        "check_geometry_health",
         # Named in prose, previously in no pack: doc_diff_tool is what the doc-compare
         # guidance points at, and the engine_profile pair is how a slow rebuild gets
         # diagnosed instead of guessed at.
@@ -331,16 +342,44 @@ CATEGORY_PACKS: dict[str, list[str]] = {
         "make_drawing",
         "export_drawing",
         "review_drawing",
+        "audit_drawing",
         "add_drawing_view",
         "add_section_view",
         "add_detail_view",
         "add_dimension",
+        "add_hole_callout",
+        "add_chamfer_dimension",
+        "add_ordinate_dimensions",
         "add_gdt",
         "add_datum",
+        "add_datum_target",
         "add_surface_finish",
+        "add_weld_symbol",
+        "add_balloon",
+        "drawing_bom",
+        "add_drawing_sheet",
+        "list_drawing_sheets",
+        "set_active_drawing_sheet",
+        "add_drawing_table",
         "edit_drawing_annotation",
         "set_view",
         "set_titleblock",
+        "suggest_drawing_dimension_scheme",
+    ],
+    # Shop documentation writers (2026-08-26): reports, work instructions,
+    # weld travelers, office conversion. Kept separate from "drawing" so a
+    # drafter lane can request sheet tools without the writer family and
+    # vice versa.
+    "docs": [
+        "make_report",
+        "make_presentation",
+        "make_workbook",
+        "make_work_instruction",
+        "make_weldment_traveler",
+        "render_document",
+        "list_artifacts",
+        "office_convert",
+        "cam_setup_sheet",
     ],
     # Reverse engineering. There was NO reveng pack at all until 2026-07-28, so
     # the general_agent lane — the universal entry point for every request — could
@@ -469,6 +508,10 @@ CATEGORY_PACKS: dict[str, list[str]] = {
         "plm_graph_keyword",
         "plm_graph_neighbors",
         "plm_graph_links",
+        # Displaced from the capped `family:cad` expansion by the 2026-08-26
+        # drawing-overhaul registrations — see the modeling pack note.
+        "cad_graph",
+        "cad_graph_link",
         "plm_graph_changes",
         "plm_graph_brief",
         "plm_graph_suggest",

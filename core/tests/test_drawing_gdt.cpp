@@ -22,6 +22,7 @@
 #include <nlohmann/json.hpp>
 
 #include "doc/drawing_session.h"
+#include "doc/annot_draw.h"
 #include "doc/export2d.h"
 #include "doc/session.h"
 
@@ -891,5 +892,273 @@ TEST_CASE("make_drawing auto-section stays inside the sheet (right-column parent
         }
     }
     CHECK(saw_section);
+    doc::drawing_close(did);
+}
+
+TEST_CASE("Annotation compiler emits manufacturing dimension geometry") {
+    SUBCASE("angular dimension has witnesses, arc, and tangent arrowheads") {
+        json draw = doc::compile_annotation(
+            json{{"kind", "angular_dim"},
+                 {"a", json::array({0.0, 0.0})},
+                 {"b", json::array({20.0, 0.0})},
+                 {"line2", json::array({json::array({0.0, 0.0}),
+                                         json::array({0.0, 20.0})})},
+                 {"vertex", json::array({0.0, 0.0})},
+                 {"pos", json::array({8.0, 8.0})},
+                 {"text", "90\xC2\xB0"}},
+            "MMGS");
+
+        REQUIRE(draw["arcs"].size() == 1);
+        CHECK(draw["segments"].size() >= 2);
+        CHECK(draw["tris"].size() == 2);
+        const json& arc = draw["arcs"][0];
+        CHECK(arc["center"] == json::array({0.0, 0.0}));
+        CHECK(arc["radius"].get<double>() == doctest::Approx(std::sqrt(128.0)));
+        CHECK(std::fabs(arc["a1"].get<double>() - arc["a0"].get<double>()) ==
+              doctest::Approx(0.5 * 3.14159265358979323846));
+    }
+
+    SUBCASE("note has a polyline leader and an arrow at its anchor") {
+        json draw = doc::compile_annotation(
+            json{{"kind", "note"},
+                 {"a", json::array({2.0, 3.0})},
+                 {"b", json::array({8.0, 10.0})},
+                 {"pos", json::array({12.0, 10.0})},
+                 {"text", "BREAK SHARP EDGES"}},
+            "MMGS");
+
+        REQUIRE(draw["segments"].size() >= 1);
+        CHECK(draw["segments"][0].size() >= 3);
+        CHECK(draw["segments"][0][0] == json::array({2.0, 3.0}));
+        CHECK(draw["tris"].size() == 1);
+    }
+
+    SUBCASE("chamfer callout composes semantic distance angle and count") {
+        json draw = doc::compile_annotation(
+            json{{"kind", "chamfer"},
+                 {"a", json::array({5.0, 5.0})},
+                 {"pos", json::array({20.0, 15.0})},
+                 {"length", 1.5},
+                 {"angle", 45.0},
+                 {"count", 2}},
+            "MMGS");
+
+        CHECK(draw["segments"].size() >= 1);
+        CHECK(draw["tris"].size() == 1);
+        REQUIRE(draw["texts"].size() == 1);
+        CHECK(draw["texts"][0]["text"].get<std::string>() == "2X 1.5 X 45\xC2\xB0");
+    }
+
+    SUBCASE("ordinate set marks the origin and aligns values to one baseline") {
+        json draw = doc::compile_annotation(
+            json{{"kind", "ordinate"},
+                 {"origin", json::array({5.0, 5.0})},
+                 {"axis", "x"},
+                 {"points", json::array({json::array({15.0, 7.0}),
+                                          json::array({30.0, 12.0})})},
+                 {"pos", json::array({0.0, 20.0})}},
+            "MMGS");
+
+        CHECK(draw["arcs"].size() >= 1);
+        CHECK(draw["segments"].size() >= 4);
+        REQUIRE(draw["texts"].size() == 2);
+        CHECK(draw["texts"][0]["pos"][1].get<double>() ==
+              doctest::Approx(draw["texts"][1]["pos"][1].get<double>()));
+        CHECK(draw["texts"][0]["text"].get<std::string>() == "10");
+        CHECK(draw["texts"][1]["text"].get<std::string>() == "25");
+    }
+}
+
+TEST_CASE("Complete AWS weld fields compile to visible primitives") {
+    json draw = doc::compile_annotation(
+        json{{"kind", "weld_symbol"},
+             {"a", json::array({0.0, 0.0})},
+             {"pos", json::array({20.0, 20.0})},
+             {"weld_type", "fillet"},
+             {"size", "6"},
+             {"length", "50"},
+             {"pitch", "100"},
+             {"contour", "convex"},
+             {"finish", "G"},
+             {"field_weld", true},
+             {"tail_text", "GMAW / AWS D1.1"},
+             {"full_penetration", true}},
+        "MMGS");
+
+    auto has_text = [&](const std::string& wanted) {
+        for (const json& text : draw["texts"])
+            if (text.value("text", std::string()) == wanted) return true;
+        return false;
+    };
+    CHECK(has_text("50-100"));
+    CHECK(has_text("G"));
+    CHECK(has_text("GMAW / AWS D1.1"));
+    CHECK(draw["segments"].size() >= 7);  // reference, weld, field flag, tail, leader
+    CHECK(draw["arcs"].size() >= 2);      // convex contour + full-penetration indication
+    CHECK(draw["tris"].size() >= 1);      // leader arrow; field flag is AWS outline geometry
+}
+
+TEST_CASE("Section hatch honors per-body pattern angle and spacing") {
+    const json polygon = json::array({json::array({0.0, 0.0}),
+                                      json::array({20.0, 0.0}),
+                                      json::array({20.0, 20.0}),
+                                      json::array({0.0, 20.0})});
+    json generic = doc::compile_hatch(polygon, json::object());
+    REQUIRE(generic["segments"].size() > 0);
+    CHECK(generic["style"]["pattern"] == "single");
+    CHECK(generic["style"]["angle_deg"].get<double>() == doctest::Approx(45.0));
+    CHECK(generic["style"]["spacing_mm"].get<double>() == doctest::Approx(3.0));
+
+    json material = doc::compile_hatch(
+        polygon, json{{"pattern", "cross"},
+                      {"angle_deg", 0.0},
+                      {"spacing_mm", 5.0},
+                      {"material", "steel"},
+                      {"body", "body-2"}});
+    CHECK(material["style"]["pattern"] == "cross");
+    CHECK(material["style"]["angle_deg"].get<double>() == doctest::Approx(0.0));
+    CHECK(material["style"]["spacing_mm"].get<double>() == doctest::Approx(5.0));
+    bool horizontal = false, vertical = false;
+    for (const json& segment : material["segments"]) {
+        REQUIRE(segment.size() == 2);
+        double dx = std::fabs(segment[1][0].get<double>() - segment[0][0].get<double>());
+        double dy = std::fabs(segment[1][1].get<double>() - segment[0][1].get<double>());
+        horizontal = horizontal || (dx > 1.0 && dy < 1e-6);
+        vertical = vertical || (dy > 1.0 && dx < 1e-6);
+    }
+    CHECK(horizontal);
+    CHECK(vertical);
+}
+
+TEST_CASE("Multi-sheet drawing tables and extended title data survive and export") {
+    json nr = doc::doc_new("part", "TappedPlate");
+    const std::string src = nr.at("doc_id").get<std::string>();
+    doc::doc_apply_ops(
+        src, -1,
+        json::array({
+            json{{"op", "add_feature"},
+                 {"feature", {{"type", "box"}, {"name", "Plate"},
+                              {"params", {{"length", dimv(50)}, {"width", dimv(35)},
+                                          {"height", dimv(12)}}}}}},
+            json{{"op", "add_feature"},
+                 {"feature", {{"type", "hole"}, {"name", "Mount Tap"},
+                              {"params", {{"style", "tap"}, {"standard", "M6"},
+                                          {"end", "blind"}, {"depth", dimv(9)}}},
+                              {"refs", {{"face", json{{"of", "face"},
+                                                      {"side", "top"}}}}}}}},
+        }),
+        false);
+
+    json created = doc::drawing_new(json::object(), json::object(), "Controlled Drawing", src);
+    const std::string did = created.at("doc_id").get<std::string>();
+    doc::drawing_add_view(did, "base", "front", "s1", json(1.0),
+                          json::array({120.0, 170.0}), json(false));
+    json added = doc::drawing_add_sheet(did, "A4", "Manufacturing Details");
+    CHECK(added["sheet_id"] == "s2");
+    CHECK(added["active_sheet_id"] == "s2");
+    doc::drawing_add_view(did, "base", "top", "", json(1.0),
+                          json::array({145.0, 135.0}), json(false));
+
+    json bom = doc::drawing_add_table(
+        did, "s2", "bom",
+        json{{"position", json::array({15.0, 195.0})},
+             {"rows", json::array({
+                 json{{"item", 1}, {"name", "BOM-PART-ALPHA"},
+                      {"quantity", 2}, {"source", "alpha.step+"}}})}});
+    REQUIRE(bom["table"]["rows"].size() == 1);
+    CHECK(bom["table"]["rows"][0]["name"] == "BOM-PART-ALPHA");
+    json holes = doc::drawing_add_table(
+        did, "s2", "holes", json{{"position", json::array({15.0, 150.0})}});
+    REQUIRE(holes["table"]["rows"].size() == 1);
+    CHECK(holes["table"]["rows"][0]["hole_type"] == "tapped");
+    CHECK(holes["table"]["rows"][0]["thread"] == "M6");
+
+    doc::drawing_set_titleblock(
+        did, "s2",
+        json{{"title", "TAPPED PLATE"}, {"part_number", "TP-001"},
+             {"material", "STEEL"}, {"finish", "PASSIVATE"},
+             {"drawn_by", "DESIGN"}, {"date", "2026-08-26"},
+             {"scale", "1:1"}, {"rev", "B"}, {"sheet", "2 OF 2"},
+             {"company", "CHUDWARE"}, {"checked_by", "QA"},
+             {"approved_by", "CHIEF"}, {"drawing_standard", "ISO 128 / ASME Y14.5"},
+             {"projection", "FIRST ANGLE"}, {"general_tolerance", "ISO 2768-m"},
+             {"mass", "2.5 kg"}});
+
+    json listed = doc::drawing_list_sheets(did);
+    REQUIRE(listed["sheets"].size() == 2);
+    CHECK(listed["active_sheet_id"] == "s2");
+    json full = doc::drawing_get(did);
+    REQUIRE(full["sheets"].size() == 2);
+    CHECK(full["sheets"][1]["tables"].size() == 2);
+    bool saw_table_overlay = false;
+    for (const json& view : full["sheets"][1]["views"])
+        if (view.value("type", std::string()) == "table_overlay") {
+            saw_table_overlay = true;
+            CHECK(view["annotations"].size() >= 3);  // BOM + holes + title extension
+            bool saw_projection_symbol = false;
+            for (const json& annotation : view["annotations"])
+                if (annotation.value("type", std::string()) == "title_extension") {
+                    saw_projection_symbol =
+                        annotation["draw"].value("arcs", json::array()).size() == 1 &&
+                        annotation["draw"].value("segments", json::array()).size() > 0;
+                }
+            CHECK(saw_projection_symbol);
+        }
+    CHECK(saw_table_overlay);
+
+    json restored = doc::register_restored_drawing(full["tree"], src);
+    json restored_sheets = doc::drawing_list_sheets(restored.at("doc_id").get<std::string>());
+    CHECK(restored_sheets["sheets"].size() == 2);
+    CHECK(restored_sheets["active_sheet_id"] == "s2");
+
+    auto pdf = std::filesystem::temp_directory_path() / "chudware_multisheet_test.pdf";
+    json exported = doc::export_drawing(did, pdf.string(), "pdf");
+    CHECK(exported["page_count"] == 2);
+    CHECK(exported["sheets"] == json::array({"s1", "s2"}));
+    std::ifstream stream(pdf, std::ios::binary);
+    std::string bytes((std::istreambuf_iterator<char>(stream)),
+                      std::istreambuf_iterator<char>());
+    CHECK(bytes.find("/Count 2") != std::string::npos);
+    std::size_t pages = 0, cursor = 0;
+    while ((cursor = bytes.find("/Type /Page /Parent", cursor)) != std::string::npos) {
+        ++pages;
+        cursor += 6;
+    }
+    CHECK(pages == 2);
+    CHECK(bytes.find("(BOM-PART-ALPHA)") != std::string::npos);
+    CHECK(bytes.find("(M6 TAPPED)") != std::string::npos);
+    CHECK(bytes.find("(CHECKED BY: QA)") != std::string::npos);
+    CHECK(bytes.find("(STANDARD: ISO 128 / ASME Y14.5)") != std::string::npos);
+    CHECK(bytes.find("(PROJECTION: FIRST ANGLE)") != std::string::npos);
+    CHECK(bytes.find("(GENERAL TOL: ISO 2768-m)") != std::string::npos);
+    CHECK(bytes.find("(MASS: 2.5 kg)") != std::string::npos);
+
+    std::error_code ec;
+    std::filesystem::remove(pdf, ec);
+    doc::drawing_close(restored.at("doc_id").get<std::string>());
+    doc::drawing_close(did);
+}
+
+TEST_CASE("Jogged multi-plane section cut is refused instead of approximated") {
+    const std::string src = make_block();
+    json created = doc::drawing_new(json::object(), json::object(), "Offset Refusal", src);
+    const std::string did = created.at("doc_id").get<std::string>();
+    const std::string vid =
+        doc::drawing_add_view(did, "base", "front", "s1", json(1.0),
+                              json::array({130.0, 175.0}), json(false))
+            .at("view_id").get<std::string>();
+    const json jogged = json::array({
+        json::array({100.0, 150.0}), json::array({120.0, 150.0}),
+        json::array({120.0, 190.0}), json::array({150.0, 190.0})});
+    try {
+        doc::drawing_add_section(did, vid, json(nullptr), jogged, json("A"),
+                                 json(1.0), json::array({300.0, 170.0}), "s1",
+                                 json(false), json::object());
+        FAIL("jogged multi-plane cut must be rejected");
+    } catch (const doc::OpError& error) {
+        CHECK(error.code == "unsupported_offset_section");
+        CHECK(error.detail.value("reason", std::string()) == "multi_plane_cut_line");
+    }
+    CHECK(doc::drawing_get(did)["sheets"][0]["views"].size() == 1);
     doc::drawing_close(did);
 }

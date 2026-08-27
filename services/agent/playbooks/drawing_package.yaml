@@ -3,53 +3,59 @@ id: drawing_package
 stage: deliver
 # Owning role: drawing_detailer. Helper tools ⊆ drawing_detailer.tool_allowlist.
 steps:
-  - id: read_brief
-    goal: read the brief and acceptance criteria; measure every critical size from the part BEFORE placing anything
-    helper_tools: [measure_part]
+  - id: coverage_plan
+    goal: map every critical ledger specification row to a planned on-sheet annotation before drafting
+    helper_tools: []
     checklist:
-      - acceptance criteria named from injected ledger context, not memory
-      - entity ids come from injected part description; critical sizes confirmed by measure_part
+      - each critical row records spec_dimension, value, tolerance and source
+      - annotation_id starts null and must resolve before release
+      - absent source value or geometry is blocking, never guessed
     output:
       type: object
-      required: [criteria, critical_dims]
+      required: [coverage_matrix]
   - id: sheet_and_views
-    goal: create the sheet and place views in order — base, projected, then section/detail only where needed
-    helper_tools: [make_drawing, add_drawing_view, add_section_view, add_detail_view]
+    goal: create the sheet with model_items=false and place the views needed by the per-feature plan
+    helper_tools: [make_drawing, add_drawing_view, add_section_view]
     checklist:
+      - automatic model_items disabled for shop drawings
       - base view first, then projected orthographics
-      - section/detail only where a hidden feature or tight zone needs them
-      - view set covers every feature the criteria name before dimensioning starts
+      - sections expose every hidden bore, thread, pocket or weld named by the spec
+      - lower-frequency view/detail controls loaded through enable_tools(categories=["drawing"]) when needed
     output:
       type: object
       required: [drawing_id, views]
-  - id: dimension_and_callouts
-    goal: dimension from measured values only; fix annotations in place; add GD&T and finish where required
-    helper_tools: [add_dimension, edit_drawing_annotation, add_gdt, add_datum, add_surface_finish, set_view]
+  - id: dimensions_and_callouts
+    goal: resolve every coverage row with a semantic, toleranced on-sheet annotation
+    helper_tools: [add_dimension, add_hole_callout, edit_drawing_annotation, add_gdt, add_datum, add_surface_finish, add_weld_symbol]
     checklist:
-      - every dimension traceable to a measurement, the ledger, or an explicit user answer
-      - functional/manufacturing dims preferred over redundant chains
-      - wrong callouts patched/deleted by id, never left behind or worked around in prose
-      - no decoration; incomplete geometry → blocked with the missing feature named
+      - every size dimension carries the ledger tolerance at creation
+      - threads and blind/counterbored/countersunk holes use semantic hole callouts
+      - datum and GD&T references are valid; finishes and welds match process requirements
+      - heat treat, coating, deburr and inspection notes are represented on-sheet
+      - wrong callouts patched/deleted by annotation id, never overridden in side prose
+      - no critical coverage row retains annotation_id null
     output:
       type: object
-      required: [annotations]
+      required: [annotations, coverage_matrix]
   - id: titleblock
-    goal: fill the manufacturing title block and resolve any source-material mismatch
+    goal: fill the controlled manufacturing title block and resolve any source-material mismatch
     helper_tools: [set_titleblock, review_drawing]
     checklist:
-      - title block carries title, part number, rev, material, scale and finish
+      - title block carries title, drawn_by, date, material, finish, scale, rev, sheet, part_number and company
       - source model material and printed material agree
     output:
       type: object
       required: [title_block]
-  - id: final_review_and_export
-    goal: review after the final mutation, clear every visual/structured warning, then export
-    helper_tools: [review_drawing, set_view, edit_drawing_annotation, set_titleblock, export_drawing]
+  - id: review_audit_export
+    goal: clear current layout warnings, pass the specification coverage audit, then export
+    helper_tools: [review_drawing, edit_drawing_annotation, set_titleblock, audit_drawing, export_drawing]
     checklist:
-      - attached pixels inspected after the last sheet mutation
+      - review_drawing performed after the final sheet mutation and attached pixels inspected
       - no overlap, off-sheet, missing-title-field or material warning remains
-      - export runs only after that clean current review
+      - audit_drawing run against the ledger specification after the current review
+      - audit verdict is release_ready and missing_critical is empty
+      - export runs only after that current release_ready verdict
     output:
       type: object
-      required: [export_artifact, review_clean]
-exit_gate: [views_cover_criteria, dims_from_measurements, final_review_clean, export_or_summary]
+      required: [export_artifact, audit_verdict, coverage_matrix]
+exit_gate: [views_cover_spec, critical_rows_resolved, final_review_clean, audit_release_ready, export_or_blocked_summary]

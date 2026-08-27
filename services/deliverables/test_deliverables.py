@@ -346,6 +346,7 @@ def test_registration_and_guide():
     stub = _Stub()
     d.register_deliverables_tools(stub)
     assert set(stub.names) == {"make_presentation", "make_report", "make_workbook",
+                               "make_work_instruction", "make_weldment_traveler",
                                "render_document", "list_artifacts"}
     assert "provenance" in d.DELIVERABLES_GUIDE.lower()
 

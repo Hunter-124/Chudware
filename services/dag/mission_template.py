@@ -15,14 +15,15 @@ Phase → node mapping:
   * ORGANIZE → one ``plan`` node, role ``department_manager`` (feature-flagged).
   * PLAN     → one ``plan`` node, role ``orchestrator`` (build graphs) — for
                assemblies a preceding ``design`` node, role ``layout_engineer``.
-  * BUILD    → one ``design`` node per part deliverable, role by kind
-               (part → ``feature_modeler``; assembly → ``assembly_fit_engineer``).
-               These fan out — they only depend on their SPECIFY node (and the
-               PLAN node), so ready-set execution runs them in parallel when
-               multi-doc leases are available (T-W16), sequentially otherwise.
-  * VERIFY   → one ``verify`` node per deliverable, role ``reviewer``.
-  * DELIVER  → one ``report`` node per deliverable by kind, role by kind
-               (cam_program → ``cam_programmer``; else ``reviewer``/report).
+  * BUILD    → one ``design`` node per buildable deliverable, role by kind
+               (part → ``feature_modeler``; assembly → ``assembly_fit_engineer``;
+               drawing → ``drawing_detailer``; controlled documents →
+               ``general_agent`` with the docs pack).
+               Independent builds fan out; declared ``depends_on`` relationships
+               add peer edges so drawings/documents wait for source artifacts.
+  * VERIFY   → one ``verify`` node per buildable deliverable, role ``reviewer``.
+  * DELIVER  → one ``report`` node per deliverable by kind; controlled-document
+               kinds retain ``general_agent`` rather than a tool-less reviewer.
 
 The graph is validated against ``aicad.dag/1`` before return (raises on invalid).
 Fan-out at Phase 4 is expressed structurally: BUILD nodes for independent parts
@@ -56,14 +57,18 @@ _BUILD_ROLE_BY_KIND = {
     "drawing": "drawing_detailer",
     "cam_program": "feature_modeler",
     "analysis": "sim_engineer",         # default; overridden by name heuristics
-    "report": "reviewer",
+    "report": "general_agent",
+    "work_instruction": "general_agent",
+    "weldment_traveler": "general_agent",
     "modification": "feature_modeler",
 }
 _DELIVER_ROLE_BY_KIND = {
     "cam_program": "cam_programmer",
     "drawing": "reviewer",
     "analysis": "reviewer",
-    "report": "reviewer",
+    "report": "general_agent",
+    "work_instruction": "general_agent",
+    "weldment_traveler": "general_agent",
 }
 
 # mega-7: map deliverable kind → role_models TaskClass so depth-0 leaf nodes
@@ -77,7 +82,9 @@ _KIND_TASK_CLASS = {
     "modification": "modification",
     "enclosure": "enclosure",
     "drawing": "simple_part",
-    "report": "simple_part",
+    "report": "multi_feature_part",
+    "work_instruction": "multi_feature_part",
+    "weldment_traveler": "assembly",
 }
 # Phase/role leaf classes (low difficulty) — conservation routing targets.
 _LEAF_TASK_CLASS = "leaf"
@@ -85,7 +92,8 @@ _REPORT_TASK_CLASS = "simple_part"
 
 # Kinds that get a real BUILD + VERIFY node (not only SPECIFY → DELIVER leaf).
 _BUILDABLE_KINDS = frozenset({
-    "part", "assembly", "modification", "analysis", "drawing",
+    "part", "assembly", "modification", "analysis", "drawing", "report",
+    "work_instruction", "weldment_traveler",
 })
 
 
@@ -143,6 +151,249 @@ def _deliverable_blob(d: dict[str, Any]) -> str:
         str(d.get("id") or ""),
     ]
     return " ".join(parts).lower()
+
+
+_PACKAGE_PHRASES = (
+    "manufacturing package",
+    "manufacturing-package",
+    "shop package",
+    "production drawing package",
+)
+
+
+def _coverage_criterion(cid: str, text: str, tool: str,
+                        pass_rule: str) -> dict[str, Any]:
+    return {
+        "id": cid,
+        "text": text,
+        "check": {"tool": tool, "params_hint": {}, "pass_rule": pass_rule},
+    }
+
+
+def _expand_manufacturing_package(
+    manifest: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """Expand a generic multi-part manufacturing-package placeholder.
+
+    Intake sometimes names one ``report`` called "manufacturing package". That
+    is not an executable artifact: shops need controlled part drawings, an
+    assembly drawing, a BOM/cut list and instructions. Expand that placeholder
+    deterministically without mutating the validated caller-owned manifest.
+    """
+    original = [
+        dict(d) for d in (manifest.get("deliverables") or [])
+        if isinstance(d, dict)
+    ]
+    request_blob = str(manifest.get("request_verbatim") or "").lower()
+    package_markers = [
+        d for d in original
+        if any(phrase in _deliverable_blob(d) for phrase in _PACKAGE_PHRASES)
+    ]
+    wants_package = (
+        any(phrase in request_blob for phrase in _PACKAGE_PHRASES)
+        or bool(package_markers)
+    )
+    parts = [d for d in original if d.get("kind") == "part"]
+    assemblies = [d for d in original if d.get("kind") == "assembly"]
+    if not wants_package or (len(parts) < 2 and not assemblies):
+        return original
+
+    marker_ids = {str(d.get("id")) for d in package_markers}
+    marker_criteria = [
+        dict(ac) for d in package_markers
+        for ac in (d.get("acceptance_criteria") or [])
+        if isinstance(ac, dict)
+    ]
+    expanded = [d for d in original if str(d.get("id")) not in marker_ids]
+    used_ids = {str(d.get("id")) for d in expanded}
+
+    def unique_id(base: str) -> str:
+        candidate = base
+        index = 2
+        while candidate in used_ids:
+            candidate = f"{base}_{index}"
+            index += 1
+        used_ids.add(candidate)
+        return candidate
+
+    def add_generated(base_id: str, *, name: str, kind: str,
+                      description: str, depends_on: list[str],
+                      criteria: list[dict[str, Any]]) -> str:
+        did = unique_id(base_id)
+        expanded.append({
+            "id": did,
+            "name": name,
+            "kind": kind,
+            "description": description,
+            "acceptance_criteria": criteria,
+            "depends_on": list(dict.fromkeys(depends_on)),
+            "package_complexity": "multi_part",
+        })
+        return did
+
+    drawing_ids: list[str] = []
+    for part in parts:
+        pid = str(part.get("id"))
+        existing = next((
+            d for d in expanded
+            if d.get("kind") == "drawing"
+            and list(d.get("depends_on") or []) == [pid]
+        ), None)
+        if existing:
+            drawing_ids.append(str(existing.get("id")))
+            continue
+        drawing_ids.append(add_generated(
+            f"{pid}_drawing",
+            name=f"{part.get('name') or pid} manufacturing drawing",
+            kind="drawing",
+            description=(
+                f"Controlled part drawing for {part.get('name') or pid}, including "
+                "all ledger dimensions, tolerances, callouts and process notes."
+            ),
+            depends_on=[pid],
+            criteria=[_coverage_criterion(
+                f"{pid}_DRAWING_AUDIT",
+                "Every critical specification row is covered on-sheet.",
+                "audit_drawing",
+                "verdict == release_ready",
+            )],
+        ))
+
+    product_deps = [
+        str(d.get("id")) for d in (assemblies or parts) if d.get("id")
+    ]
+    assembly_drawing = next((
+        d for d in expanded
+        if d.get("kind") == "drawing"
+        and "assembly" in _deliverable_blob(d)
+    ), None)
+    if assembly_drawing:
+        assembly_drawing_id = str(assembly_drawing.get("id"))
+    else:
+        assembly_drawing_id = add_generated(
+            "manufacturing_assembly_drawing",
+            name="Manufacturing assembly drawing",
+            kind="drawing",
+            description=(
+                "Multi-part assembly/weldment drawing with balloons, interfaces, "
+                "weld symbols, sections and controlled notes."
+            ),
+            depends_on=product_deps,
+            criteria=[_coverage_criterion(
+                "ASSEMBLY_DRAWING_AUDIT",
+                "Assembly drawing covers interfaces, balloons and required welds.",
+                "audit_drawing",
+                "verdict == release_ready",
+            )],
+        )
+    drawing_ids.append(assembly_drawing_id)
+
+    bom = next((
+        d for d in expanded
+        if d.get("kind") == "report"
+        and any(key in _deliverable_blob(d) for key in ("bom", "cut list"))
+    ), None)
+    if bom:
+        bom_id = str(bom.get("id"))
+    else:
+        bom_id = add_generated(
+            "manufacturing_bom",
+            name="Manufacturing BOM / cut list",
+            kind="report",
+            description=(
+                "Controlled bill of materials and weldment cut list with item "
+                "numbers matching assembly-drawing balloons."
+            ),
+            depends_on=product_deps,
+            criteria=[_coverage_criterion(
+                "BOM_COMPLETE",
+                "Every modeled part/component has a quantity and source row.",
+                "manual",
+                "controlled BOM/cut-list review passes",
+            )],
+        )
+
+    instruction = next((
+        d for d in expanded if d.get("kind") == "work_instruction"
+    ), None)
+    if instruction:
+        instruction_id = str(instruction.get("id"))
+    else:
+        instruction_id = add_generated(
+            "manufacturing_work_instructions",
+            name="Manufacturing and assembly work instructions",
+            kind="work_instruction",
+            description=(
+                "Ordered shop routing, setup, inspection hold points, finishing "
+                "and assembly instructions with source provenance."
+            ),
+            depends_on=[*drawing_ids, bom_id],
+            criteria=[
+                *marker_criteria,
+                _coverage_criterion(
+                    "WORK_INSTRUCTIONS_COMPLETE",
+                    "Routing, inspection, finish and assembly steps are controlled.",
+                    "manual",
+                    "work-instruction review passes",
+                ),
+            ],
+        )
+
+    weldment = any(
+        "weld" in _deliverable_blob(d) for d in [*parts, *assemblies]
+    )
+    if weldment and not any(
+        d.get("kind") == "weldment_traveler" for d in expanded
+    ):
+        add_generated(
+            "manufacturing_weldment_traveler",
+            name="Weldment traveler",
+            kind="weldment_traveler",
+            description=(
+                "Weld sequence, procedure references, fit-up and inspection "
+                "signoffs for the fabricated weldment."
+            ),
+            depends_on=[assembly_drawing_id, bom_id, instruction_id],
+            criteria=[_coverage_criterion(
+                "WELD_TRAVELER_COMPLETE",
+                "Every weld has a sequence, procedure reference and inspection hold.",
+                "manual",
+                "weldment-traveler review passes",
+            )],
+        )
+    return expanded
+
+
+def _task_class_for(
+    d: dict[str, Any],
+    deliverables: list[dict[str, Any]],
+) -> str:
+    """Classify drawings by their real sheet/product complexity."""
+    kind = str(d.get("kind") or "")
+    if kind != "drawing":
+        return _KIND_TASK_CLASS.get(kind, "unknown")
+    blob = _deliverable_blob(d)
+    deps = set(d.get("depends_on") or [])
+    dep_kinds = {
+        str(other.get("kind") or "")
+        for other in deliverables if other.get("id") in deps
+    }
+    if (
+        d.get("package_complexity") == "multi_part"
+        or "assembly" in dep_kinds
+        or len(deps) > 1
+        or any(key in blob for key in (
+            "assembly", "weldment", "welded", "multi-part", "multipart",
+            "multi part", "bom", "cut list", "multi-sheet",
+        ))
+    ):
+        return "assembly"
+    if any(key in blob for key in (
+        "thread", "tolerance", "gd&t", "datum", "surface finish",
+        "chamfer", "ordinate", "section",
+    )):
+        return "multi_feature_part"
+    return "simple_part"
 
 
 def _resolve_build_role(d: dict[str, Any]) -> str:
@@ -221,6 +472,39 @@ def _build_job_for(d: dict[str, Any], role: str) -> str:
             "criteria (anchor first, then solve, then compare). Record "
             "verdicts with numbers — do not invent outcomes."
         )
+    kind = str(d.get("kind") or "")
+    if role == "drawing_detailer":
+        return (
+            "AUTHOR the controlled drawing artifact, not geometry or a prose "
+            "summary. Start make_drawing with model_items=false, then place an "
+            "explicit per-feature view/dimension/callout plan from the ledger. "
+            "Cover threads, fits/tolerances, finishes, datums/GD&T, welds and "
+            "notes as applicable. Run review_drawing for layout, then "
+            "audit_drawing against the specification; export_drawing is allowed "
+            "only when the current audit verdict is release_ready."
+        )
+    if kind == "report":
+        return (
+            "Call enable_tools(categories=[\"docs\"]), then BUILD the requested "
+            "report artifact with make_report. Populate it from recorded tool "
+            "evidence and return its path; a prose summary without the report "
+            "file is not done."
+        )
+    if kind == "work_instruction":
+        return (
+            "Call enable_tools(categories=[\"docs\"]), then BUILD the controlled "
+            "shop document with make_work_instruction. Include operation routing, "
+            "stock/setup/fixturing, process parameters with provenance, inspection "
+            "hold points, finishing and assembly steps. Return the artifact path; "
+            "prose alone is not done."
+        )
+    if kind == "weldment_traveler":
+        return (
+            "Call enable_tools(categories=[\"docs\"]), then BUILD the controlled "
+            "weld document with make_weldment_traveler. Cover every weld's "
+            "procedure, fit-up, sequence, process variables and inspection/signoff "
+            "hold points. Return the artifact path; prose alone is not done."
+        )
     # Mechanical / default BUILD — concrete airframe geometry guidance (mega-13 AC1)
     name = str(d.get("name") or d.get("id") or "").lower()
     desc = str(d.get("description") or "").lower()
@@ -255,6 +539,32 @@ def _build_job_for(d: dict[str, Any], role: str) -> str:
         "not empty shells. After the solid exists, run verify_battery(doc_id) "
         "(or check_feature_overlap) and record the honest PASS/WARN/FAIL — do "
         "not declare done without a battery or check tool run."
+    )
+
+
+
+
+def _verify_job_for(d: dict[str, Any]) -> str:
+    kind = str(d.get("kind") or "")
+    if kind == "drawing":
+        return (
+            "run each acceptance criterion's NAMED check tool, then run "
+            "review_drawing for current layout evidence and audit_drawing against "
+            "the specification. PASS requires audit verdict release_ready; a clean "
+            "layout or legacy manufacturing_ready flag alone is insufficient."
+        )
+    if kind in {"report", "work_instruction", "weldment_traveler"}:
+        return (
+            "run each acceptance criterion's NAMED check and inspect the produced "
+            "document artifact for required sections and provenance. Report "
+            "PASS/FAIL/NOT-CHECKED per criterion; do not substitute a prose "
+            "summary for the file."
+        )
+    return (
+        "run each acceptance criterion's NAMED check tool and report "
+        "PASS/FAIL/NOT-CHECKED per criterion — never guess a result. ALWAYS also "
+        "run verify_battery(doc_id) and log the per-check verdicts "
+        "(PASS/WARN/FAIL honest) before handoff."
     )
 
 
@@ -328,7 +638,7 @@ def build_mission_graph(
         An ``aicad.dag/1`` graph dict (validated).  Raises ``GraphValidationError``
         if the assembled graph is malformed (a bug in this mapper, not the manifest).
     """
-    deliverables = manifest.get("deliverables") or []
+    deliverables = _expand_manufacturing_package(manifest)
     has_blocking = any(
         isinstance(a, dict) and a.get("blocking")
         for a in manifest.get("ambiguities", []) or []
@@ -370,7 +680,7 @@ def build_mission_graph(
         did = d["id"]
         sid = f"n_spec_{did}"
         spec_ids[did] = sid
-        tc = _KIND_TASK_CLASS.get(d.get("kind"), "unknown")
+        tc = _task_class_for(d, deliverables)
         nodes.append(_node(sid, _TYPE_SPEC, f"SPECIFY {did}: {d.get('name', '')}",
                            "spec_writer",
                            inputs={"deliverable": did,
@@ -441,7 +751,7 @@ def build_mission_graph(
         bid = f"n_build_{did}"
         build_ids[did] = bid
         role = _resolve_build_role(d)
-        tc = _KIND_TASK_CLASS.get(d.get("kind"), "multi_feature_part")
+        tc = _task_class_for(d, deliverables)
         # Domain tags help auto_pick / multi-domain gate classify producing legs.
         domain_tags: list[str] = []
         if role == "ecad_engineer":
@@ -471,6 +781,15 @@ def build_mission_graph(
                            on_fail="pause", autonomy=default_autonomy))
         edges.append({"from": plan_id, "to": bid})
 
+    # Preserve declared artifact dependencies inside the BUILD fan-out. PLAN still
+    # precedes every build, while independent parts retain no peer edge.
+    for d in buildable:
+        bid = build_ids[d["id"]]
+        for dep in d.get("depends_on") or []:
+            dep_bid = build_ids.get(dep)
+            if dep_bid:
+                edges.append({"from": dep_bid, "to": bid})
+
     # --- Phase 5: VERIFY (one per buildable deliverable, runs the ACs) -----
     verify_ids: dict[str, str] = {}
     for d in buildable:
@@ -483,12 +802,7 @@ def build_mission_graph(
                                    "task_class": _LEAF_TASK_CLASS,
                                    "risk": "low",
                                    "request": _deliverable_request(
-                                       manifest, d,
-                                       "run each acceptance criterion's NAMED check "
-                                       "tool and report PASS/FAIL/NOT-CHECKED per "
-                                       "criterion — never guess a result. ALWAYS also "
-                                       "run verify_battery(doc_id) and log the per-check "
-                                       "verdicts (PASS/WARN/FAIL honest) before handoff.")},
+                                       manifest, d, _verify_job_for(d))},
                            on_fail="pause", autonomy=default_autonomy))
         edges.append({"from": build_ids[did], "to": vid})
 

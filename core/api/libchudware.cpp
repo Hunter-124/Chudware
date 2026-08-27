@@ -118,6 +118,13 @@
 #include "sim/spice.h"
 
 using nlohmann::json;
+namespace chudware::doc {
+nlohmann::json export_drawing_selected(const std::string& doc_id,
+                                       const std::string& path,
+                                       const std::string& fmt,
+                                       const nlohmann::json& sheet);
+}
+
 
 namespace {
 
@@ -3682,7 +3689,7 @@ static int chudware_call_inner(const char* method, const char* params_json, char
                             out_json, 0);
             // 2D exports (engine/doc/export2d.py). Format = explicit param else the path's
             // .dxf/.pdf extension (mirrors export2d.py::_resolve_format).
-            if (m == "export_drawing" || m == "export_flat_dxf") {
+            if (m == "export_drawing" || m == "drawing_export" || m == "export_flat_dxf") {
                 const std::string path = params.value("path", std::string());
                 std::string fmt = params.value("format", std::string());
                 if (fmt.empty()) {
@@ -3692,8 +3699,13 @@ static int chudware_call_inner(const char* method, const char* params_json, char
                     if (ext == "dxf" || ext == "pdf") fmt = ext;
                 }
                 const std::string doc_id = params.value("doc_id", std::string());
-                if (m == "export_drawing")
-                    return emit(chudware::doc::export_drawing(doc_id, path, fmt), out_json, 0);
+                if (m == "export_drawing" || m == "drawing_export")
+                    return emit(chudware::doc::export_drawing_selected(
+                                    doc_id, path, fmt,
+                                    params.contains("sheet")
+                                        ? params["sheet"]
+                                        : json(m == "drawing_export" ? "" : "all")),
+                                out_json, 0);
                 return emit(chudware::doc::export_flat_dxf(doc_id, path, fmt), out_json, 0);
             }
             if (m == "import_file")
@@ -3776,6 +3788,21 @@ static int chudware_call_inner(const char* method, const char* params_json, char
                                                            src, env),
                             out_json, 0);
             }
+            if (m == "drawing_add_sheet")
+                return emit(chudware::doc::drawing_add_sheet(
+                                params.value("doc_id", std::string()),
+                                params.value("size", std::string("A3")),
+                                params.value("name", params.value("title", std::string()))),
+                            out_json, 0);
+            if (m == "drawing_list_sheets")
+                return emit(chudware::doc::drawing_list_sheets(
+                                params.value("doc_id", std::string())),
+                            out_json, 0);
+            if (m == "drawing_set_active_sheet")
+                return emit(chudware::doc::drawing_set_active_sheet(
+                                params.value("doc_id", std::string()),
+                                params.value("sheet_id", std::string())),
+                            out_json, 0);
             if (m == "drawing_add_view")
                 return emit(chudware::doc::drawing_add_view(
                                 params.value("doc_id", std::string()),
@@ -3787,7 +3814,8 @@ static int chudware_call_inner(const char* method, const char* params_json, char
             if (m == "drawing_add_section") {
                 json sopts = params.contains("opts") && params["opts"].is_object() ? params["opts"]
                                                                                    : json::object();
-                for (const char* k : {"mode", "depth", "reverse"})
+                for (const char* k : {"mode", "depth", "reverse", "offset",
+                                      "hatch_style", "hatch_styles"})
                     if (params.contains(k)) sopts[k] = params[k];
                 return emit(chudware::doc::drawing_add_section(
                                 params.value("doc_id", std::string()),
@@ -3825,6 +3853,22 @@ static int chudware_call_inner(const char* method, const char* params_json, char
                                 params.value("type", std::string("linear_dim")),
                                 opt("a"), opt("b"), opt("c"), opt("d"), opt("pos"), opt("text")),
                             out_json, 0);
+            if (m == "drawing_add_chamfer_dimension" ||
+                m == "drawing_add_ordinate_dimensions") {
+                json spec = params.contains("spec") && params["spec"].is_object()
+                                ? params["spec"] : json::object();
+                for (const char* key : {"a", "pos", "length", "distance", "angle",
+                                        "angle_deg", "count", "text", "precision",
+                                        "prefix", "suffix", "origin", "axis", "points"})
+                    if (params.contains(key)) spec[key] = params[key];
+                const std::string did = params.value("doc_id", std::string());
+                const std::string vid = params.value("view_id", std::string());
+                if (m == "drawing_add_chamfer_dimension")
+                    return emit(chudware::doc::drawing_add_chamfer_dimension(
+                                    did, vid, spec), out_json, 0);
+                return emit(chudware::doc::drawing_add_ordinate_dimensions(
+                                did, vid, spec), out_json, 0);
+            }
             if (m == "drawing_remove_annotation")
                 return emit(chudware::doc::drawing_remove_annotation(
                                 params.value("doc_id", std::string()),
@@ -3867,7 +3911,9 @@ static int chudware_call_inner(const char* method, const char* params_json, char
                 for (const char* k : {"symbol", "tol_value", "tol_diameter", "tol_modifier",
                                       "datums", "row2", "label", "target_type", "size", "value",
                                       "ra", "machining", "all_around", "lay", "weld_type",
-                                      "other_side", "a", "pos"})
+                                      "other_side", "a", "pos", "intermittent_length", "length",
+                                      "pitch", "contour", "finish", "field_weld", "tail_text",
+                                      "full_penetration"})
                     if (params.contains(k)) spec[k] = params[k];
                 std::string did = params.value("doc_id", std::string());
                 std::string vid = params.value("view_id", std::string());
@@ -3901,6 +3947,19 @@ static int chudware_call_inner(const char* method, const char* params_json, char
                                 params.value("sheet_id", std::string()),
                                 params.value("size", std::string("A3"))),
                             out_json, 0);
+            if (m == "drawing_add_table") {
+                json table_spec =
+                    params.contains("spec") && params["spec"].is_object()
+                        ? params["spec"] : json::object();
+                for (const char* key : {"position", "anchor", "title", "rows",
+                                        "columns", "row_height"})
+                    if (params.contains(key)) table_spec[key] = params[key];
+                return emit(chudware::doc::drawing_add_table(
+                                params.value("doc_id", std::string()),
+                                params.value("sheet_id", std::string()),
+                                params.value("kind", std::string()), table_spec),
+                            out_json, 0);
+            }
             if (m == "drawing_make") {
                 // One-shot copilot drawing authoring. Source is a live part session id
                 // (source_doc_id|doc_id); the compact spec rides as "spec" (or flat keys).

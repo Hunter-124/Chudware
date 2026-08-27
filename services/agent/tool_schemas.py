@@ -187,11 +187,13 @@ def render_tools_block(
 
     Returns:
         ``(text, meta)`` where meta = {tokens, budget_tokens, rendered, omitted,
-        unresolved, disabled, trimmed, expanded, categories} — tokens is the
-        MEASURED count of the returned text, ``expanded`` names the tools that
-        got their full docstring, and ``disabled`` names the tools dropped
-        because Settings → AI → Tools has them switched off (never advertise a
-        tool whose every call dispatch would refuse).
+        unresolved, disabled, trimmed, compacted, expanded, categories} — tokens
+        is the MEASURED count of the returned text, ``expanded`` names the tools
+        that got their full docstring, ``compacted`` names first-paragraph floors
+        reduced to their first sentence to fund one of those authored blocks, and
+        ``disabled`` names tools dropped because Settings → AI → Tools has them
+        switched off (never advertise a tool whose every call dispatch would
+        refuse).
     """
     tier_budget, tier_trim = tier_tools_slot(tier)
     budget = int(budget_tokens) if budget_tokens else tier_budget
@@ -221,6 +223,7 @@ def render_tools_block(
         except Exception:  # noqa: BLE001 — a broken resolver entry is unresolved
             fn = None
         full: str | None = None
+        compact: str | None = None
         if fn is None:
             # Built-in meta-tool schemas when no live callable is registered yet.
             entry = _FALLBACK_SCHEMAS.get(tool) or f"- {tool}(…)  # schema unavailable"
@@ -257,6 +260,7 @@ def render_tools_block(
             except Exception:  # noqa: BLE001
                 pass
             desc = _description_line(schema["description"], trim=use_trim)
+            compact_desc = _description_line(schema["description"], trim=True)
             head = f"- {schema['signature']}"
             default_note = ""
             if defaults:
@@ -278,6 +282,9 @@ def render_tools_block(
             prompt_note = f"\n    Note: {note}" if note else ""
             tail = default_note + cap_note + prompt_note
             entry = head + (f"\n    {desc}" if desc else "") + tail
+            compact = head + (
+                f"\n    {compact_desc}" if compact_desc else ""
+            ) + tail
             body = (schema["description"] or "").strip()
             block = _description_block(body) if body else ""
             # Only worth an upgrade when there is genuinely more to say.
@@ -287,7 +294,14 @@ def render_tools_block(
         if used + cost > budget:
             omitted.append(tool)
             continue
-        slots.append({"tool": tool, "text": entry, "cost": cost, "full": full})
+        slots.append({
+            "tool": tool,
+            "text": entry,
+            "cost": cost,
+            "compact": compact or entry,
+            "compact_cost": _count_tokens(compact or entry),
+            "full": full,
+        })
         used += cost
         if fn is None and tool not in _FALLBACK_SCHEMAS:
             unresolved.append(tool)
@@ -297,20 +311,60 @@ def render_tools_block(
     # Pass 2 — spend what the tier actually allocated. Everything after a docstring's
     # first paragraph used to be discarded unconditionally, which threw away 87% of
     # the authored guidance (add_features shipped 77 of its 10,989 chars) while the
-    # slot sat at ~15% of its own budget. That gap is why models learned op shapes
-    # from rejection messages instead of from the tool. Upgrade in allowlist order:
-    # role cards lead with the tools the role exists to call.
+    # slot sat at ~15% of its own budget. A large authored block that cannot fit in
+    # the conservative 2500-token slot gets first claim on a larger tier's surplus.
+    # Otherwise dozens of small alphabetically-earlier upgrades can dilute that
+    # surplus below the one threshold only the larger tier can pay.
+    #
+    # The grown 64-seat modeling pack now leaves 2822 tokens after every tool's
+    # untrimmed floor, while add_features needs 3114 to replace its floor with the
+    # authored block. Reclaim only that shortfall by compacting the few floor entries
+    # with the largest first-paragraph savings. Signatures and first sentences remain,
+    # so the priority expansion never costs another tool its slot. Within each class,
+    # preserve allowlist order: role cards still lead with their principal tools.
     expanded: list[str] = []
+    compacted: list[str] = []
     if expand:
-        for slot in slots:
+        upgrades: list[tuple[bool, int, dict[str, Any], int]] = []
+        for index, slot in enumerate(slots):
             block = slot["full"]
             if not block:
                 continue
             full_cost = _count_tokens(block)
+            frontier_only = full_cost > DEFAULT_TOOLS_BUDGET_TOKENS
+            upgrades.append((not frontier_only, index, slot, full_cost))
+        upgrades.sort(key=lambda item: (item[0], item[1]))
+        for ordinary, _index, slot, full_cost in upgrades:
+            shortfall = used - slot["cost"] + full_cost - budget
+            if not ordinary and 0 < shortfall and full_cost <= budget:
+                donors = [
+                    donor for donor in slots
+                    if donor is not slot
+                    and donor["tool"] not in expanded
+                    and donor["cost"] > donor["compact_cost"]
+                ]
+                donors.sort(
+                    key=lambda donor: donor["cost"] - donor["compact_cost"],
+                    reverse=True,
+                )
+                if sum(
+                    donor["cost"] - donor["compact_cost"] for donor in donors
+                ) >= shortfall:
+                    for donor in donors:
+                        saving = donor["cost"] - donor["compact_cost"]
+                        donor["text"] = donor["compact"]
+                        donor["cost"] = donor["compact_cost"]
+                        used -= saving
+                        compacted.append(donor["tool"])
+                        shortfall -= saving
+                        if shortfall <= 0:
+                            break
             if used - slot["cost"] + full_cost > budget:
                 continue
             used += full_cost - slot["cost"]
-            slot["text"], slot["cost"] = block, full_cost
+            slot["text"], slot["cost"] = slot["full"], full_cost
+            if slot["tool"] in compacted:
+                compacted.remove(slot["tool"])
             expanded.append(slot["tool"])
 
     lines.extend(slot["text"] for slot in slots)
@@ -356,6 +410,7 @@ def render_tools_block(
         "unresolved": unresolved,
         "disabled": disabled,
         "trimmed": bool(trim),
+        "compacted": compacted,
         "expanded": expanded,
         "categories": categories_listed,
     }

@@ -240,8 +240,20 @@ def test_analysis_deliverables_get_build_nodes():
     assert "n_build_DL4" in by_id
     assert "n_verify_DL3" in by_id
     assert "n_verify_DL4" in by_id
-    # report stays non-buildable
-    assert "n_build_DL5" not in by_id
+    # Reports are BUILDABLE now (2026-08-26 drawing/documentation overhaul).
+    # The old pin ("report stays non-buildable") encoded the audited defect:
+    # a report deliverable went SPECIFY -> reviewer DELIVER, and reviewer has
+    # no make_report tool, so no report could ever be produced. Reports now
+    # get a build node routed to a role that can actually author them.
+    assert "n_build_DL5" in by_id
+    role5 = by_id["n_build_DL5"]["inputs"]["role"]
+    from services.agent import roles as _roles
+    card5 = _roles.load_role(role5)
+    # The role must be able to reach make_report: either a card seat or the
+    # requestable 'docs' category pack (enable_tools route).
+    from services.agent import tool_categories as _tc
+    assert ("make_report" in set(card5.concrete_tools)
+            or "make_report" in _tc.resolve_categories(["docs"]))
 
 
 def test_ecad_fw_build_roles_and_briefs():

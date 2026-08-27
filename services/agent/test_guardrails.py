@@ -508,6 +508,8 @@ def test_orphan_sketch_blanket_waiver():
 
 # ===========================================================================
 # WI-11 mission gate
+# VERIFY is fail-closed: phases._gate_verify requires every expected AC id to
+# have explicit PASS/SKIP/waiver evidence before the battery guard is evaluated.
 # ===========================================================================
 
 def test_gate_verify_missing_battery_fails():
@@ -515,6 +517,7 @@ def test_gate_verify_missing_battery_fails():
 
     m = PhaseMachine()
     ctx = {
+        "expected_ac_ids": ["AC1"],
         "criterion_results": {"AC1": "PASS"},
         "geometry_built": True,
         "require_battery": True,
@@ -529,6 +532,7 @@ def test_gate_verify_with_battery_ran_passes():
 
     m = PhaseMachine()
     ctx = {
+        "expected_ac_ids": ["AC1"],
         "criterion_results": {"AC1": "PASS"},
         "geometry_built": True,
         "battery_ran": True,
@@ -542,6 +546,7 @@ def test_gate_verify_battery_waived_passes():
 
     m = PhaseMachine()
     ctx = {
+        "expected_ac_ids": ["AC1"],
         "criterion_results": {"AC1": "PASS"},
         "geometry_built": True,
         "waived_criteria": ["verify_battery"],
@@ -554,7 +559,11 @@ def test_gate_verify_still_fails_on_ac_fail():
     from services.agent.pipeline.phases import PhaseMachine, Phase
 
     m = PhaseMachine()
-    ctx = {"criterion_results": {"AC1": "FAIL"}, "battery_ran": True}
+    ctx = {
+        "expected_ac_ids": ["AC1"],
+        "criterion_results": {"AC1": "FAIL"},
+        "battery_ran": True,
+    }
     g = m.run_gate(Phase.VERIFY, ctx)
     assert not g.passed
     assert "AC1" in g.reasons[0]

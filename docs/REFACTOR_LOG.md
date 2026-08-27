@@ -8135,3 +8135,70 @@ Pro/Max subscription sign-in is a 212-line product and billing decision, not a h
 fix, so it is surfaced rather than taken. The failure message now names both source
 lines and the two accepted remediations. Also unresolved and environmental: the
 `services/mcp` ECAD/FEA/CFD/hostd suites need a live engine and daemon.
+
+## 2026-08-26 — drawing overhaul: from nominal sheets to machinable packages
+
+Trigger: the press package. Six one-page PDFs with bare nominal dimensions, a
+`4X DIA 5` where `4X M6×1.0 ⌵14` belonged, every tolerance/finish/weld exiled
+to a Markdown disclaimer, and a review gate that called it "manufacturing_
+ready" because the LAYOUT was clean. The audit found three strata and all
+three were repaired: the renderer lacked primitives (text-only angular dims,
+leaderless notes, no tables/multi-sheet), the engine had capability no tool
+exposed (smart tapped callouts, balloons, BOM rows, weld symbols, datum
+targets), and the pipeline never demanded completeness (auto-dimension
+preferred, coverage never required, release gated on pixels).
+
+Engine: multi-sheet drawings with export-all (multi-page PDF, side-by-side
+DXF); first-class BOM/revision/hole/notes/cut-list tables feeding raster and
+vector alike; real angular arcs, note leaders, chamfer callouts, ordinate
+sets, full AWS weld symbols, material-aware hatch; title block extended with
+checked/approved, drawing standard, projection glyph, general tolerance,
+mass; jogged multi-plane sections refuse rather than silently approximating.
+Tools: hole callouts auto-populated from Hole features, tolerances at
+dimension creation, composite GD&T, sheets/tables, and audit_drawing — a
+spec-to-annotation coverage matrix plus a standards category (title
+completeness, GD&T datum resolution, thread grammar, dangling annotations);
+release_ready requires full critical coverage AND zero standards failures.
+review_drawing no longer claims manufacturing readiness from layout.
+Pipeline: drawing_detailer hands off a coverage matrix; spec_writer owns the
+machined-part checklist; missions expand a manufacturing package into part
+drawings + assembly drawing + BOM/cut list + work instruction + weldment
+traveler. Formats: standalone editable .draw+ (aicad.draw+/1, embedded
+source, honest missing-source state), SVG exports with real text and layer
+groups, PDF companions=[dxf,svg], ODT/ODP/ODS + legacy PPT/XLS reading,
+office_convert, structural DOCX edits. Deliverables: work_instruction and
+weldment_traveler templates (provenance-backed, signoff blocks).
+
+Proved live in-process: box + bore + M6 tap → drawing → tapped callout
+"M6x1.0 ⌵ 14" → audit passes coverage, BLOCKS release on genuinely missing
+projection/standard/general-tolerance title fields → PDF/DXF/SVG all carry
+the thread text.
+
+## 2026-08-26 — manufacturing planner, machining reference, standards floor
+
+The agents now THINK about manufacturing before they model. `mfg_plan` is the
+fifth typed ledger kind: process with resolved DfM profile snapshot, stock,
+datum/setup strategy, ordered operations, inspection plan, and CRITICAL
+DIMENSIONS derived from the part's function — every numeric row carries
+required provenance and is audit-native, so `mfg_plan_get(view="audit_spec")`
+feeds `audit_drawing` byte-for-byte and `view="work_instructions"` projects
+straight into `make_work_instruction`. `mfg_plan_check` is three-state; an
+empty evaluation can never read as pass (the same fix landed in dfm_check,
+which also gained min-feature, hole-aspect, and thread-strategy checks). A
+new manufacturing_planner role runs between SPECIFY and BUILD for machined/
+fabricated deliverables; spec_writer, feature_modeler, drawing_detailer,
+cam_programmer and fixer all read `mfg_plans` and follow the plan → model →
+check → audit → instruction chain.
+
+`machining_ref_search/get` is the Machinery's-Handbook-class reference: a
+curated dataset where every row cites its governing standard (ISO 2768
+general tolerances, IT-by-operation capability, ream/bore allowances,
+finish-by-process, drill series, counterbores per B18.3, thread engagement,
+keyways, press-fit and heat-treat/grind stock guidance) and queries about
+facts that already have canonical calculators DELEGATE to them rather than
+duplicating tables. `machining_ref_index_pdf/search_pdf` index the user's own
+handbook PDF locally (per-page FTS5, page-cited snippets, nothing
+redistributed) — drop a PDF in and cite it by page. Fixing the reference
+layer also fixed a real defect: the fit catalog's own H7/m6 bearing-seat
+recommendation was uncomputable because ISO 286 shaft `m` was missing; every
+recommendation row is now pinned computable.

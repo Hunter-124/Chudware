@@ -22,11 +22,34 @@ import uuid
 import pytest
 
 from services.mcp import core_bridge as cb
+from services.agent import agent_turn as at
 
 pytestmark = pytest.mark.skipif(
     not cb.available(),
     reason="libchudware not staged; engine-backed IntakeLedger reopen test unavailable",
 )
+
+@pytest.fixture()
+def minted_documents():
+    """Track and discard every document minted by a real reopen test."""
+    close_part = at._bind_tool("close_part")
+    if close_part is None:
+        pytest.skip("close_part unavailable")
+
+    doc_ids: list[str] = []
+
+    def track(doc_id: str) -> str:
+        doc_ids.append(doc_id)
+        return doc_id
+
+    yield track
+
+    for doc_id in reversed(doc_ids):
+        result = json.loads(close_part(doc_id=doc_id, discard=True))
+        assert result.get("ok"), (
+            f"failed to discard intake-ledger scratch document {doc_id}: "
+            f"{result.get('error')}"
+        )
 
 
 def _question():
@@ -40,7 +63,7 @@ def _question():
     }
 
 
-def test_real_reopen_never_re_asks(tmp_path):
+def test_real_reopen_never_re_asks(tmp_path, minted_documents):
     """Session 1: record a doc-scoped answer, doc_save.  Session 2: doc_open the
     file (fresh doc_id), construct the ledger FROM THE DOC ALONE, replay."""
     from services.agent.interaction import ask_user
@@ -48,7 +71,7 @@ def test_real_reopen_never_re_asks(tmp_path):
 
     # --- Session 1 ---------------------------------------------------------- #
     r = cb.call("doc_new", {"kind": "part", "name": f"il_{uuid.uuid4().hex[:8]}"})
-    doc1 = r["doc_id"]
+    doc1 = minted_documents(r["doc_id"])
     q = _question()
 
     ledger1 = IntakeLedger(doc1)                    # production accessors — no injection
@@ -62,7 +85,7 @@ def test_real_reopen_never_re_asks(tmp_path):
 
     # --- Session 2: reopen — the engine mints a NEW doc_id ------------------- #
     opened = cb.call("doc_open", {"path": str(path)})
-    doc2 = opened["doc_id"]
+    doc2 = minted_documents(opened["doc_id"])
     assert doc2 != doc1, (
         "doc_open re-used the doc_id — this test exists because it does NOT; "
         "if id semantics changed, revisit the ledger keying rationale"
@@ -86,13 +109,13 @@ def test_real_reopen_never_re_asks(tmp_path):
     assert r2["output_shaft.dia"]["canonical"] == {"value": 8.0, "unit": "mm"}
 
 
-def test_real_reopen_default_ledger_path(tmp_path):
+def test_real_reopen_default_ledger_path(tmp_path, minted_documents):
     """Same reopen guarantee through ask_user's DEFAULT ledger (ledger=None,
     scope=doc): the production wiring users actually hit — nothing injected."""
     from services.agent.interaction import ask_user
 
     r = cb.call("doc_new", {"kind": "part", "name": f"il_{uuid.uuid4().hex[:8]}"})
-    doc1 = r["doc_id"]
+    doc1 = minted_documents(r["doc_id"])
     q = _question()
 
     r1 = ask_user([q], scope="doc", doc_id=doc1, autonomy="auto")   # ledger=None
@@ -101,7 +124,7 @@ def test_real_reopen_default_ledger_path(tmp_path):
     path = tmp_path / "part.step+"
     cb.call("doc_save", {"doc_id": doc1, "path": str(path)})
 
-    doc2 = cb.call("doc_open", {"path": str(path)})["doc_id"]
+    doc2 = minted_documents(cb.call("doc_open", {"path": str(path)})["doc_id"])
 
     r2 = ask_user([q], scope="doc", doc_id=doc2, autonomy="auto")   # ledger=None
     assert r2["output_shaft.dia"]["source"] == "resumed", (
@@ -109,7 +132,7 @@ def test_real_reopen_default_ledger_path(tmp_path):
     )
 
 
-def test_confirm_dimensions_persists_through_reopen(tmp_path):
+def test_confirm_dimensions_persists_through_reopen(tmp_path, minted_documents):
     """The MCP call-site route (contract §5 'ask_user/intake call sites'):
     confirm_dimensions with no run_id lands the answer in the doc record, and it
     is still there — replayable — after save + reopen."""
@@ -125,7 +148,7 @@ def test_confirm_dimensions_persists_through_reopen(tmp_path):
     register_intake_tools(mcp)
 
     r = cb.call("doc_new", {"kind": "part", "name": f"il_{uuid.uuid4().hex[:8]}"})
-    doc1 = r["doc_id"]
+    doc1 = minted_documents(r["doc_id"])
 
     # Seed a critical-dim ledger so confirm_dimensions has a row to close.
     from services.intake import intake as ik
@@ -149,7 +172,7 @@ def test_confirm_dimensions_persists_through_reopen(tmp_path):
     # Save + reopen; the interaction answer must have travelled with the doc.
     path = tmp_path / "part.step+"
     cb.call("doc_save", {"doc_id": doc1, "path": str(path)})
-    doc2 = cb.call("doc_open", {"path": str(path)})["doc_id"]
+    doc2 = minted_documents(cb.call("doc_open", {"path": str(path)})["doc_id"])
 
     replay = IntakeLedger(doc2).answered("intake.dim.output_shaft.dia")
     assert replay is not None, (

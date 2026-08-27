@@ -48,6 +48,7 @@ assignments:
   intake_analyst:         [strong]
   clarifier:              [cheap_local, strong]
   spec_writer:            [cheap_local, strong]
+  manufacturing_planner:  [cheap_local, strong]   # 2026-08-26 mfg plan stage
   feature_architect:      [cheap_local, strong]   # T-DP2 design-pipeline Stage 1
   geometry_designer:      [cheap_local, strong]   # T-DP3 design-pipeline Stage 2
   linkage_planner:        [cheap_local, strong]   # T-DP4 design-pipeline Stage 3

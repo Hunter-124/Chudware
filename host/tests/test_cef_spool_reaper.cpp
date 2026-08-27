@@ -32,7 +32,12 @@ class TempTree {
 public:
     explicit TempTree(const char* label) {
         static unsigned sequence = 0;
-        const auto stamp = fs::file_time_type::clock::now().time_since_epoch().count();
+        // libc++ may expose file_clock::duration::rep as a wider implementation
+        // type with no std::to_string overload. This is only a per-process temp
+        // name; narrowing the tick count plus the monotonic sequence is sufficient
+        // and keeps the fixture portable across libstdc++ and libc++.
+        const auto stamp = static_cast<long long>(
+            fs::file_time_type::clock::now().time_since_epoch().count());
         root = fs::temp_directory_path() /
                (std::string("chudware-cef-reaper-") + label + "-" +
                 std::to_string(stamp) + "-" + std::to_string(++sequence));

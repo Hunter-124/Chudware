@@ -100,15 +100,16 @@ leg at the generic `cloudcastle-ci` pool without also pinning a builder label.
 - `CMakePresets.json` requires **CMake >= 3.24** on any runner that runs
   `cmake --preset`; `native-build.yml` checks this explicitly and fails with
   that message rather than a confusing generator error.
-- **`native-build.yml` deliberately configures every host GUI build with
-  `CHUDWARE_ENABLE_CEF=OFF`.** The per-push compile-and-test gate therefore uses
-  `NullWebView` and does not compile the CEF backend; a CEF-only break surfaces
-  at release time. Its Windows row additionally launches the built GUI with a
-  deliberately missing managed worker, loads the same row's
+- **`native-build.yml` is release-only** (`v*` tags plus manual dispatch), and
+  deliberately configures every host GUI build with `CHUDWARE_ENABLE_CEF=OFF`.
+  Ordinary pushes run fast-gate + linux-gate without claiming Windows/macOS
+  hardware. The native release gate uses `NullWebView` and therefore does not
+  compile the CEF backend; CEF is covered by the separate packaging workflow.
+  The Windows row additionally launches the built GUI with a deliberately
+  missing managed worker, loads that row's
   `build/windows-core/bin/libchudware.dll` through the in-process fallback, and
-  validates a real PNG headless capture. Tagged releases remain CEF-enabled, so
-  `cc-linux-build` and `cc-win-package` need the platform CEF SDK provisioned
-  before the first tagged release.
+  validates a real PNG headless capture. Release packaging remains CEF-enabled,
+  so `cc-linux-build` and `cc-win-package` need the platform CEF SDK provisioned.
 
 ### Provisioning: `runner-smoke.yml`'s dispatch-only `provision` job
 

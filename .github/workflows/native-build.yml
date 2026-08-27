@@ -1,28 +1,25 @@
-# Per-platform configure + build + ctest. This is the only thing keeping the
-# Windows and macOS trees compiling between releases.
-#
-# Nothing else in CI compiles anything off Linux: fast-gate is stdlib text
-# analysis and linux-gate is Linux by definition. Without this workflow a
-# Windows-only or macOS-only compile break lands on master and is discovered
-# during packaging, when it is expensive and blocking.
+# Release-time per-platform configure + build + ctest. Ordinary master pushes
+# use fast-gate + linux-gate only; Windows and macOS runners are reserved for a
+# `v*` release tag (or an explicit manual dispatch).
 #
 # Each row configures through the CMake preset that platform actually ships
 # with, builds it, and then runs that tree's ctest. The presets are the same
-# ones a developer uses by hand, so a green row here means the documented build
-# command works on a clean checkout — not that some CI-only incantation does.
+# ones a developer uses by hand, so a green release row means the documented
+# build command works on a clean checkout, not that a CI-only incantation does.
 #
 # Rows are independent (fail-fast: false): a broken macOS toolchain must not
 # hide a Windows regression.
 #
-# Nothing is uploaded. Build outputs are ~500 MB per platform and Actions
+# Nothing is uploaded. Build outputs are about 500 MB per platform and Actions
 # artifact storage is metered above the 500 MB shared with Packages, accrued
-# hourly and never refunded. Release artifacts go to R2 (phase 5); diagnostics
-# go to the job log and the step summary, neither of which is metered.
+# hourly and never refunded. Release artifacts go through release.yml's
+# authenticated handoff; diagnostics stay in the job log and step summary.
 name: native-build
 
 on:
   push:
-    branches: [master]
+    tags:
+      - 'v*'
   workflow_dispatch:
 
 permissions:

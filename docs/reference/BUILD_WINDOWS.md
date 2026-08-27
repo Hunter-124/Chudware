@@ -92,8 +92,8 @@ correctness proof on Windows is `ctest` on the `windows-core` / `windows-occt` c
 ## GUI app (`host/`) — Windows build
 
 The single cross-platform GUI is `host/` (target `Chudware`, output binary
-`chudware.exe`). The self-hosted Windows runner now builds the OCCT-free core
-and restored `host/` tree on every push through
+`chudware.exe`). The self-hosted Windows runner builds the OCCT-free core and
+restored `host/` tree for `v*` release tags (and manual dispatches) through
 `.github/workflows/native-build.yml`, runs both CTest trees, then launches the
 GUI in `CHUDWARE_SHOT=chat` mode and verifies a real PNG capture. That smoke
 forces the managed worker to fail and points `CHUDWARE_LIBCHUDWARE` at the DLL

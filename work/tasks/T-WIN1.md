@@ -3,13 +3,12 @@ id: T-WIN1
 title: Windows 10 full-app bring-up (OCCT core + imgui GUI) under MSVC
 workstream: WIN
 owner: gissa
-status: blocked
+status: todo
 branch: task/T-WIN1-windows-bringup
 depends_on: []
 lane: platform-infra
 kind: new
 priority: 2
-blocker: needs a Windows machine running the CURRENT host/ tree; Hunter is standing up his Windows box as a CI runner (see the new T-WIN2 card).
 ---
 
 ## Context
@@ -117,6 +116,10 @@ hang with NO stdout diagnostic (errors go to the in-app log only). **Observed tw
 picks up the Windows worker-start fix.
 
 ## Progress log
+- 2026-08-27 [T-WIN2]: Unblocked. The CAD-scoped Windows runner is online,
+  native core+host builds are green, and `AppState::tryStartWorker()` now falls
+  back to the in-process C++ core on Windows. Release tags carry the forced
+  worker-failure PNG smoke; owner remains `gissa`.
 - 2026-07-05 [gissa/opus-wynn] Branch task/T-WIN1-win10-bringup created off master
   c745f0fe. Preserved prior verified WIN work as commit 750c0bbb (fix_math.h /FI
   MSVC 14.51 guard + build.bat dual-layout core staging) — both platform-guarded,

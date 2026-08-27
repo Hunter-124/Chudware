@@ -313,10 +313,10 @@ graph TD
     T_W9["T-W9: Simulation verification advisor - pre-sim sanity, hand-calc cross-check, margin-policy narration"]:::done
   end
   subgraph WS_WIN["workstream WIN"]
-    T_WIN1["T-WIN1: Windows 10 full-app bring-up (OCCT core + imgui GUI) under MSVC"]:::blocked
+    T_WIN1["T-WIN1: Windows 10 full-app bring-up (OCCT core + imgui GUI) under MSVC"]:::todo
   end
   subgraph WS_X["workstream X"]
-    T_WIN2["T-WIN2: Windows CI runner — build + smoke the host/ GUI on Hunter's Windows box"]:::doing
+    T_WIN2["T-WIN2: Windows CI runner — build + smoke the host/ GUI on Hunter's Windows box"]:::done
     T_X1["T-X1: Browser session service - persistent per-site login profiles + headless fetch"]:::done
     T_X2["T-X2: Source adapter framework + GrabCAD/TraceParts adapters"]:::done
     T_X3["T-X3: part_search federation seam - browser adapters as providers"]:::done

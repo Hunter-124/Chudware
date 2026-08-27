@@ -4197,6 +4197,11 @@ static void drawHarnessOrganizationSection(AppState& st, float sc) {
 bool drawHarnessSessionKnobs(AppState& st, float sc) {
     Settings& settings = st.settings;
     bool changed = false;
+    // Progressive disclosure. This grid is shared with the AI workspace's Options view, so
+    // gating here simplifies both surfaces from one place. Of its 36 controls the AI-tab
+    // inventory classified 9 as everyday; the rest are orchestration-policy, budget,
+    // transcript-density and experimental knobs that ship with correct defaults.
+    const bool adv = st.settings.showAdvanced;
     // One cell-padding tier for every grid in this function (pref combos, checkboxes,
     // sliders, budgets) — the default 4x3dp table padding was the biggest vertical waste
     // in the modal.
@@ -4222,32 +4227,38 @@ bool drawHarnessSessionKnobs(AppState& st, float sc) {
         }
     };
 
-    // ---- Preferences (4 combos) + role adoption in a 2-col grid ----
-    if (ImGui::BeginTable("##harness_prefs", 2,
-                          ImGuiTableFlags_SizingStretchSame |
-                          ImGuiTableFlags_NoPadOuterX)) {
-        ImGui::TableNextColumn();
-        prefCombo("Plan preference", "##h_plan_pref", &settings.planPreference,
-                  "Off = never plan first (default — agent tools directly). "
-                  "Option = model may plan. "
-                  "Encourage = plan by default. "
-                  "Require = always draft a plan before building.");
-        ImGui::TableNextColumn();
-        prefCombo("Task list preference", "##h_tasklist_pref", &settings.taskListPreference,
-                  "Whether the agent publishes a live task list (the Tasks panel "
-                  "in the copilot). Off = never. Option = model's choice. "
-                  "Encourage = publish for any multi-step job. "
-                  "Require = always publish before starting work.");
-        ImGui::TableNextColumn();
-        prefCombo("Subagent preference", "##h_sub_pref", &settings.subagentPreference,
-                  "How freely the main agent may spawn subagents. "
-                  "Off disables nesting; Require pushes multi-agent splits.");
-        ImGui::TableNextColumn();
-        prefCombo("Advisor preference", "##h_adv_pref", &settings.advisorPreference,
-                  "Off = no advisor. Option = only when the model asks. "
-                  "Encourage = stronger guidance tone when proactive fires. "
-                  "Require = more frequent checks when proactive is on.");
-        ImGui::EndTable();
+    // ---- Preferences (4 combos) — ADVANCED in full ----
+    // Plan / task-list / subagent / advisor preference are agent-orchestration policy. The
+    // shipped defaults already produce the normal behavior, and a user who has not read the
+    // harness docs cannot tell Encourage from Require.
+    if (adv) {
+        if (ImGui::BeginTable("##harness_prefs", 2,
+                              ImGuiTableFlags_SizingStretchSame |
+                              ImGuiTableFlags_NoPadOuterX)) {
+            ImGui::TableNextColumn();
+            prefCombo("Plan preference", "##h_plan_pref", &settings.planPreference,
+                      "Off = never plan first (default — agent tools directly). "
+                      "Option = model may plan. "
+                      "Encourage = plan by default. "
+                      "Require = always draft a plan before building.");
+            ImGui::TableNextColumn();
+            prefCombo("Task list preference", "##h_tasklist_pref",
+                      &settings.taskListPreference,
+                      "Whether the agent publishes a live task list (the Tasks panel "
+                      "in the copilot). Off = never. Option = model's choice. "
+                      "Encourage = publish for any multi-step job. "
+                      "Require = always publish before starting work.");
+            ImGui::TableNextColumn();
+            prefCombo("Subagent preference", "##h_sub_pref", &settings.subagentPreference,
+                      "How freely the main agent may spawn subagents. "
+                      "Off disables nesting; Require pushes multi-agent splits.");
+            ImGui::TableNextColumn();
+            prefCombo("Advisor preference", "##h_adv_pref", &settings.advisorPreference,
+                      "Off = no advisor. Option = only when the model asks. "
+                      "Encourage = stronger guidance tone when proactive fires. "
+                      "Require = more frequent checks when proactive is on.");
+            ImGui::EndTable();
+        }
     }
 
     ImGui::Dummy(ImVec2(0, 6.0f * sc));
@@ -4257,33 +4268,41 @@ bool drawHarnessSessionKnobs(AppState& st, float sc) {
     if (ImGui::BeginTable("##harness_flags", flagCols,
                           ImGuiTableFlags_SizingStretchSame |
                           ImGuiTableFlags_NoPadOuterX)) {
-        ImGui::TableNextColumn();
-        if (ImGui::Checkbox("Proactive advisor", &settings.proactiveAdvisor)) changed = true;
-        helpMarker("Opt-in mid-run guidance on failure streaks and thrash. "
-                   "Cheap deterministic notes by default; at most one short "
-                   "advisor-model call on severe streaks (encourage/require). "
-                   "Off = no proactive injects (pull request_advice still works).");
-        ImGui::TableNextColumn();
-        if (ImGui::Checkbox("Company structure auto-route", &settings.corporateMode)) changed = true;
-        helpMarker("When on, complex cross-discipline requests may route as "
-                   "company (director + departments). Default off — Agent will "
-                   "not auto-invoke company; use Swarm / Eng. Firm modes or "
-                   "turn this on when ready.");
+        // Orchestration-topology flags: all ADVANCED. Each one changes how work is routed
+        // (advisor injects, company departments, auto-missions, tool-catalog breadth) and
+        // all four ship off/lean, which is the correct normal configuration.
+        if (adv) {
+            ImGui::TableNextColumn();
+            if (ImGui::Checkbox("Proactive advisor", &settings.proactiveAdvisor))
+                changed = true;
+            helpMarker("Opt-in mid-run guidance on failure streaks and thrash. "
+                       "Cheap deterministic notes by default; at most one short "
+                       "advisor-model call on severe streaks (encourage/require). "
+                       "Off = no proactive injects (pull request_advice still works).");
+            ImGui::TableNextColumn();
+            if (ImGui::Checkbox("Company structure auto-route", &settings.corporateMode))
+                changed = true;
+            helpMarker("When on, complex cross-discipline requests may route as "
+                       "company (director + departments). Default off — Agent will "
+                       "not auto-invoke company; use Swarm / Eng. Firm modes or "
+                       "turn this on when ready.");
 
-        ImGui::TableNextColumn();
-        if (ImGui::Checkbox("Auto-route missions", &settings.autoMissionRouting))
-            changed = true;
-        helpMarker("When on, Agent mode may auto-launch a mission (intake, "
-                   "breakdown, specialists) for build+analyze phrasing. "
-                   "Default off — the main chat stays on one direct agent "
-                   "turn with tools.");
-        ImGui::TableNextColumn();
-        if (ImGui::Checkbox("Full tool loadout (main chat)", &settings.directAgentFullTools))
-            changed = true;
-        helpMarker("When on, the main-chat agent gets the full MCP catalog "
-                   "(still respecting per-tool Options and role family "
-                   "assignments). When off, it starts lean and pulls packs "
-                   "via enable_tools. Saved as agent.direct_agent_full_tools.");
+            ImGui::TableNextColumn();
+            if (ImGui::Checkbox("Auto-route missions", &settings.autoMissionRouting))
+                changed = true;
+            helpMarker("When on, Agent mode may auto-launch a mission (intake, "
+                       "breakdown, specialists) for build+analyze phrasing. "
+                       "Default off — the main chat stays on one direct agent "
+                       "turn with tools.");
+            ImGui::TableNextColumn();
+            if (ImGui::Checkbox("Full tool loadout (main chat)",
+                                &settings.directAgentFullTools))
+                changed = true;
+            helpMarker("When on, the main-chat agent gets the full MCP catalog "
+                       "(still respecting per-tool Options and role family "
+                       "assignments). When off, it starts lean and pulls packs "
+                       "via enable_tools. Saved as agent.direct_agent_full_tools.");
+        }
 
         ImGui::TableNextColumn();
         if (ImGui::Checkbox("Vision (send screenshots)", &settings.vision)) changed = true;
@@ -4319,19 +4338,22 @@ bool drawHarnessSessionKnobs(AppState& st, float sc) {
                        "AI -> Roles -> redaction) for a residual pass. Compliance/IP "
                        "protection for cloud providers.");
         }
-        ImGui::TableNextColumn();
-        // Moved out of the retired Experimental tab: a modeling-behaviour preference, so it
-        // belongs beside the other run preferences (and rides along into the AI workspace's
-        // Options view, which shares this grid).
-        if (ImGui::Checkbox("Editable feature sequence",
-                            &settings.expCadSequenceMode))
-            changed = true;
-        helpMarker("Nudges the modeler to build the part as an ordered sequence of "
-                   "individually editable features (sketch -> extrude/revolve/loft/sweep -> "
-                   "fillet/chamfer/hole/pattern) that reconstructs a clean design history, "
-                   "rather than one fused monolithic solid \xe2\x80\x94 the DeepCAD / CAD-Coder "
-                   "command-sequence direction. Saved under config.json "
-                   "experimental.cad_sequence_mode.");
+        if (adv) {
+            ImGui::TableNextColumn();
+            // Moved out of the retired Experimental tab: a modeling-behaviour preference,
+            // so it belongs beside the other run preferences (and rides along into the AI
+            // workspace's Options view, which shares this grid). ADVANCED: experimental.
+            if (ImGui::Checkbox("Editable feature sequence",
+                                &settings.expCadSequenceMode))
+                changed = true;
+            helpMarker(
+                "Nudges the modeler to build the part as an ordered sequence of "
+                "individually editable features (sketch -> extrude/revolve/loft/sweep -> "
+                "fillet/chamfer/hole/pattern) that reconstructs a clean design history, "
+                "rather than one fused monolithic solid \xe2\x80\x94 the DeepCAD / CAD-Coder "
+                "command-sequence direction. Saved under config.json "
+                "experimental.cad_sequence_mode.");
+        }
         ImGui::EndTable();
     }
 
@@ -4341,73 +4363,95 @@ bool drawHarnessSessionKnobs(AppState& st, float sc) {
     // config.json (agent.ui_chat_*) and persist themselves inside the ui/ai/ai_prefs.h setters,
     // so they deliberately do NOT flip `changed` — a saveSettings from here would write back
     // unrelated AppState::Settings state the caller never touched.
-    ImGui::PushStyleColor(ImGuiCol_Text,
-                          ImVec4(ui::palette.textDim[0], ui::palette.textDim[1],
-                                 ui::palette.textDim[2], 1));
-    ImGui::TextUnformatted("Chat display");
-    ImGui::PopStyleColor();
-    ImGui::Dummy(ImVec2(0, 2.0f * sc));
+    //
+    // Of the five, only "Show renders inline" is an everyday choice (whether you see the
+    // images the model is looking at). The other four are transcript-density and diagnostic
+    // formatting, so Basic shows the one and drops the section header with them.
+    if (!adv) {
+        bool renders = ui::chatShowRenders();
+        if (ImGui::Checkbox("Show renders inline", &renders))
+            ui::setChatShowRenders(renders);
+        helpMarker("Display the images the vision model is looking at in the "
+                   "transcript and the Artifacts panel. Off shows file paths instead.");
+    } else {
+        ImGui::PushStyleColor(ImGuiCol_Text,
+                              ImVec4(ui::palette.textDim[0], ui::palette.textDim[1],
+                                     ui::palette.textDim[2], 1));
+        ImGui::TextUnformatted("Chat display");
+        ImGui::PopStyleColor();
+        ImGui::Dummy(ImVec2(0, 2.0f * sc));
 
-    if (ImGui::BeginTable("##harness_chat_display", flagCols,
-                          ImGuiTableFlags_SizingStretchSame |
-                          ImGuiTableFlags_NoPadOuterX)) {
-        ImGui::TableNextColumn();
-        {
-            ImGui::AlignTextToFramePadding();
-            ImGui::TextUnformatted("Tool call detail");
-            helpMarker("Simplified: plain sentences only. Normal: sentences with an "
-                       "expandable raw drawer. Diagnostic: raw arguments, engine document "
-                       "ids and timings, drawers open by default.");
-            ImGui::SameLine();
-            ImGui::SetNextItemWidth(-1.0f);
-            static const char* kChatDetail[] = {"Simplified", "Normal", "Diagnostic"};
-            int detail = ui::chatToolDetail();
-            if (detail < 0 || detail > 2) detail = 1;
-            if (settingsPopupRowCombo("##h_chat_detail", &detail, kChatDetail, 3))
-                ui::setChatToolDetail(detail);
-        }
+        if (ImGui::BeginTable("##harness_chat_display", flagCols,
+                              ImGuiTableFlags_SizingStretchSame |
+                              ImGuiTableFlags_NoPadOuterX)) {
+            ImGui::TableNextColumn();
+            {
+                ImGui::AlignTextToFramePadding();
+                ImGui::TextUnformatted("Tool call detail");
+                helpMarker("Simplified: plain sentences only. Normal: sentences with an "
+                           "expandable raw drawer. Diagnostic: raw arguments, engine "
+                           "document ids and timings, drawers open by default.");
+                ImGui::SameLine();
+                ImGui::SetNextItemWidth(-1.0f);
+                static const char* kChatDetail[] = {"Simplified", "Normal", "Diagnostic"};
+                int detail = ui::chatToolDetail();
+                if (detail < 0 || detail > 2) detail = 1;
+                if (settingsPopupRowCombo("##h_chat_detail", &detail, kChatDetail, 3))
+                    ui::setChatToolDetail(detail);
+            }
 
-        ImGui::TableNextColumn();
-        {
-            bool anim = ui::chatCollapseAnim();
-            if (ImGui::Checkbox("Animate collapsing boxes", &anim))
-                ui::setChatCollapseAnim(anim);
-            helpMarker("Thinking boxes and tool drawers slide shut when the next step "
-                       "starts instead of snapping.");
-        }
+            ImGui::TableNextColumn();
+            {
+                bool anim = ui::chatCollapseAnim();
+                if (ImGui::Checkbox("Animate collapsing boxes", &anim))
+                    ui::setChatCollapseAnim(anim);
+                helpMarker("Thinking boxes and tool drawers slide shut when the next step "
+                           "starts instead of snapping.");
+            }
 
-        ImGui::TableNextColumn();
-        {
-            bool group = ui::chatGroupToolCalls();
-            if (ImGui::Checkbox("Group repeated tool calls", &group))
-                ui::setChatGroupToolCalls(group);
-            helpMarker("Fold consecutive calls of the same tool into one card with a "
-                       "count. Failures are never folded.");
-        }
+            ImGui::TableNextColumn();
+            {
+                bool group = ui::chatGroupToolCalls();
+                if (ImGui::Checkbox("Group repeated tool calls", &group))
+                    ui::setChatGroupToolCalls(group);
+                helpMarker("Fold consecutive calls of the same tool into one card with a "
+                           "count. Failures are never folded.");
+            }
 
-        ImGui::TableNextColumn();
-        {
-            bool renders = ui::chatShowRenders();
-            if (ImGui::Checkbox("Show renders inline", &renders))
-                ui::setChatShowRenders(renders);
-            helpMarker("Display the images the vision model is looking at in the "
-                       "transcript and the Artifacts panel. Off shows file paths instead.");
-        }
+            ImGui::TableNextColumn();
+            {
+                bool renders = ui::chatShowRenders();
+                if (ImGui::Checkbox("Show renders inline", &renders))
+                    ui::setChatShowRenders(renders);
+                helpMarker("Display the images the vision model is looking at in the "
+                           "transcript and the Artifacts panel. Off shows file paths "
+                           "instead.");
+            }
 
-        ImGui::TableNextColumn();
-        {
-            bool human = ui::chatHumanizeDocIds();
-            if (ImGui::Checkbox("Humanize document ids", &human))
-                ui::setChatHumanizeDocIds(human);
-            helpMarker("Replace engine ids like doc-cpp0000001f with the part's name in "
-                       "agent text. Turn off to see exactly what the model sent.");
+            ImGui::TableNextColumn();
+            {
+                bool human = ui::chatHumanizeDocIds();
+                if (ImGui::Checkbox("Humanize document ids", &human))
+                    ui::setChatHumanizeDocIds(human);
+                helpMarker("Replace engine ids like doc-cpp0000001f with the part's name "
+                           "in agent text. Turn off to see exactly what the model sent.");
+            }
+            ImGui::EndTable();
         }
-        ImGui::EndTable();
+    }
+
+    // ---- Sliders / budgets — ADVANCED in full ----
+    // Subagent tool-call budget, nesting depth and memory token budget are all convergence
+    // and prompt-budget tuning. Each already self-tunes ("automatic" / shipped cap), and a
+    // wrong value here degrades runs in ways that are hard to attribute. This table is the
+    // last thing the function draws, so Basic mode simply stops here.
+    if (!adv) {
+        ImGui::PopStyleVar();  // CellPadding
+        return changed;
     }
 
     ImGui::Dummy(ImVec2(0, 2.0f * sc));
 
-    // ---- Sliders / budgets in 2 columns ----
     if (ImGui::BeginTable("##harness_sliders", 2,
                           ImGuiTableFlags_SizingStretchSame |
                           ImGuiTableFlags_NoPadOuterX)) {
@@ -4470,6 +4514,7 @@ bool drawHarnessSessionKnobs(AppState& st, float sc) {
 
         ImGui::EndTable();
     }
+
     ImGui::PopStyleVar();  // CellPadding
     return changed;
 }
@@ -4706,6 +4751,26 @@ static void drawMemoryLearningSection(AppState& st, float sc) {
         s_cacheWarm = loadAgentConfigBool("cache_warming", false);
     }
 
+
+    // ---- Basic mode ----
+    // Of the 14 controls in this section the inventory found exactly three everyday, and
+    // one of those ("Project memory (per-folder)", settings.memoryEnabled) is a DUPLICATE
+    // of the session-knobs grid rendered directly above on this same page — showing it
+    // twice on one screen is pure confusion, so Basic drops the second copy rather than
+    // the capability. Everything else here is a storage-backend, compaction-algorithm,
+    // extraction-model or render-density knob whose default is already right.
+    if (!st.settings.showAdvanced) {
+        if (ImGui::Checkbox("Remember decisions & notes", &s_learn))
+            saveAgentConfigValue("memory_learn", s_learn);
+        helpMarker("Learning switch: when on, the agent writes decisions and notes it "
+                   "judges worth keeping into project memory (agent.memory_learn, "
+                   "default on). Recall still works when off; nothing new is learned.");
+        if (ImGui::Checkbox("Autopopulate (follow active session)", &s_follow))
+            ui::setAiFollowActiveSession(s_follow);
+        helpMarker("Views follow the ACTIVE chat session / latest run automatically "
+                   "instead of manual picking.");
+        return;
+    }
     static const char* kMemBackends[] = {"SQLite", "Mnemopi"};
     static const char* kCompModes[] = {
         "Off",
@@ -6120,6 +6185,66 @@ const SettingsEntry kSettingsEntries[] = {
 const int kSettingsEntryCount =
     (int)(sizeof(kSettingsEntries) / sizeof(kSettingsEntries[0]));
 
+// ---- AI hub sub-section disclosure ----
+// Which of the AI tab's 8 sub-sections are power surfaces.
+//
+// This split is measured, not guessed. A full inventory of the AI tab classified 155
+// interactive controls as 10 EVERYDAY / 145 ADVANCED / 0 auto-derivable. Per-section:
+//   Harness      9 everyday / 27 advanced
+//   Roles        0 everyday / 59 advanced   <- per-role model pinning; the resolver default
+//                                              is the normal path, and the everyday "which
+//                                              model do I use" choice lives in Providers
+//   Prompts      0 everyday /  8 advanced   <- authoring system/role instruction prose
+//   Skills       0 everyday /  6 advanced
+//   Rules        0 everyday / 16 advanced
+//   Benchmarks   0 everyday /  5 advanced
+//   Tools        1 everyday / 22 advanced   <- the 1 is "Repair / install runtime", which
+//                                              Basic mode re-homes onto Harness (see the
+//                                              Maintenance block in the Harness body) so
+//                                              hiding this section costs nothing
+//   Dev Preview  0 everyday /  2 advanced
+// So Basic mode showing Harness alone is what the data supports, and it is the difference
+// between ~10 controls and 155.
+//
+// Indices MUST stay aligned with kAiSubLabels in the AI tab; both are fixed 8-element
+// arrays and the static_assert below pins the length.
+const bool kAiSubAdvanced[8] = {
+    false,  // 0 Harness      — session behavior; the only page with everyday controls
+    true,   // 1 Roles        — per-role model/effort pinning
+    true,   // 2 Prompts      — system + role prompt authoring
+    true,   // 3 Skills       — skill catalog authoring
+    true,   // 4 Rules        — context-injection trigger authoring
+    true,   // 5 Benchmarks   — leaderboard + diagnostic runner
+    true,   // 6 Tools        — tool-family gating, per-tool overrides, bug reports
+    true,   // 7 Dev Preview  — dev-only prompt-assembly inspection
+};
+static_assert(sizeof(kAiSubAdvanced) / sizeof(kAiSubAdvanced[0]) == 8,
+              "kAiSubAdvanced must carry one flag per kAiSubLabels entry");
+
+// ---- Maintenance (runtime repair) ----
+// Extracted so Basic mode can re-home it. The AI-tab inventory found this is the ONLY
+// everyday control on the otherwise all-advanced Tools page, and a user whose runtime is
+// broken must be able to repair it without first discovering the Advanced switch. Rendered
+// on Tools when Advanced is on, on Harness when it is off — never both at once, so this is
+// placement, not duplication.
+static void drawRuntimeMaintenanceSection(AppState& st, float sc) {
+    settingsGlassSectionBegin("##ai_maintenance", "Maintenance");
+    dimText("Repair the local CAD engine runtime.");
+    const bool canSetup = !st.setupRunning.load() && !st.anyRunActive();
+    if (!canSetup) ImGui::BeginDisabled();
+    if (ImGui::Button("Repair / install runtime", ImVec2(220.0f * sc, 0)))
+        st.startSetup(true);
+    if (!canSetup) ImGui::EndDisabled();
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+        ImGui::SetTooltip("Rebuild the local Python/CAD runtime (same as "
+                          "Chudware -> Repair / install runtime).");
+    if (st.setupRunning.load()) {
+        ImGui::SameLine();
+        dimText("Running\xe2\x80\xa6");
+    }
+    settingsGlassSectionEnd();
+}
+
 
 namespace ui {
 
@@ -6279,7 +6404,20 @@ void drawSettingsModal(AppState& st, bool busy) {
             jumpToTab = 2;
         }
         // A resolved jump drives the rail selection directly, so it lands the same frame.
-        if (s_aiSubJump >= 0) s_aiSubSel = s_aiSubJump;
+        //
+        // Reachability guarantee: a jump may target a section Basic mode hides — Settings
+        // search indexes every entry, and the composer's /rule jumps straight at Rules,
+        // which is an advanced section. Rather than dropping the user on a page that is not
+        // in the rail, reveal advanced and persist it. This is why hiding a section can
+        // never hide a capability: every programmatic route into one turns disclosure on.
+        if (s_aiSubJump >= 0) {
+            s_aiSubSel = s_aiSubJump;
+            if (s_aiSubJump < 8 && kAiSubAdvanced[s_aiSubJump] &&
+                !st.settings.showAdvanced) {
+                st.settings.showAdvanced = true;
+                saveSettings(st.settings);
+            }
+        }
         // wantSettings (screenshot/automation shot) opens the AI tab.
         static bool s_wantSettingsTabDone = false;
         if (st.wantSettings && !s_wantSettingsTabDone) {
@@ -6870,10 +7008,41 @@ void drawSettingsModal(AppState& st, bool busy) {
                 static const char* kAiSubLabels[8] = {
                     "Harness", "Roles", "Prompts", "Skills",
                     "Rules", "Benchmarks", "Tools", "Dev Preview"};
+                // Basic mode paints only the everyday sections (kAiSubAdvanced, file scope).
+                // visIdx maps a rail/combo row back to its REAL section index, so the body
+                // dispatch below keeps switching on the stable index and needs no edits —
+                // that is what keeps this filter from touching eight section bodies.
+                const char* visLabels[8];
+                int visIdx[8];
+                int visN = 0;
+                for (int i = 0; i < 8; ++i) {
+                    if (!st.settings.showAdvanced && kAiSubAdvanced[i]) continue;
+                    visLabels[visN] = kAiSubLabels[i];
+                    visIdx[visN] = i;
+                    ++visN;
+                }
+                // Turning Advanced off while parked on an advanced section would otherwise
+                // render a body with no corresponding rail row. Fall back to Harness.
+                if (!st.settings.showAdvanced && s_aiSubSel >= 0 && s_aiSubSel < 8 &&
+                    kAiSubAdvanced[s_aiSubSel])
+                    s_aiSubSel = 0;
+                int visSel = 0;
+                for (int k = 0; k < visN; ++k)
+                    if (visIdx[k] == s_aiSubSel) {
+                        visSel = k;
+                        break;
+                    }
+                // With one visible section there is nothing to navigate: a rail (or combo)
+                // offering a single choice is pure noise, and skipping it hands the whole
+                // pane width to the content. This is the Basic-mode shape.
+                const bool aiNav = visN > 1;
                 const bool aiNarrow = ImGui::GetContentRegionAvail().x < 640.0f * sc;
-                if (aiNarrow) {
+                if (!aiNav) {
+                    // No navigation chrome at all.
+                } else if (aiNarrow) {
                     ImGui::SetNextItemWidth(-1);
-                    settingsPopupRowCombo("##ai_sub_pick", &s_aiSubSel, kAiSubLabels, 8);
+                    if (settingsPopupRowCombo("##ai_sub_pick", &visSel, visLabels, visN))
+                        s_aiSubSel = visIdx[visSel];
                 } else {
                     // Borderless nav rail. Its rows paint against this child's own inner
                     // borders, so the wash fills the rail without entering the content pane.
@@ -6889,13 +7058,23 @@ void drawSettingsModal(AppState& st, bool busy) {
                                       ImGuiWindowFlags_NoScrollbar |
                                           ImGuiWindowFlags_NoScrollWithMouse);
                     const float railRowH = ImGui::GetTextLineHeight() + 6.0f * sc;
-                    for (int i = 0; i < 8; ++i) {
+                    for (int k = 0; k < visN; ++k) {
+                        const int i = visIdx[k];
                         ImGui::PushID(i);
                         const bool selRow = (i == s_aiSubSel);
                         if (settingsChildRowSelectable(kAiSubLabels[i], selRow, railRowH))
                             s_aiSubSel = i;
                         if (selRow) ImGui::SetItemDefaultFocus();
                         ImGui::PopID();
+                    }
+                    // Discoverability: say that more sections exist rather than leaving the
+                    // hidden ones to be found by accident. Without this the rail silently
+                    // shrinks from 8 rows to 3 and looks like the app lost features.
+                    if (!st.settings.showAdvanced && visN < 8) {
+                        ImGui::Dummy(ImVec2(0, 4.0f * sc));
+                        char more[32];
+                        std::snprintf(more, sizeof(more), "+%d in Advanced", 8 - visN);
+                        dimText(more);
                     }
                     ImGui::EndChild();
                     ImGui::PopStyleVar(2);  // ItemSpacing, WindowPadding
@@ -6922,6 +7101,15 @@ void drawSettingsModal(AppState& st, bool busy) {
                         s_aiSubDrawnPrev = s_aiSubSel;
                     }
 
+                    // Basic mode draws no rail (one visible section), so the "more exists"
+                    // cue has to live in the body or the tab silently looks like it lost
+                    // seven pages. Names them explicitly rather than just counting.
+                    if (!aiNav && !st.settings.showAdvanced) {
+                        dimText("Roles, Prompts, Skills, Rules, Benchmarks, Tools and Dev "
+                                "Preview are in Advanced (switch at the top right).");
+                        ImGui::Dummy(ImVec2(0, 6.0f * sc));
+                    }
+
                     // Harness is first: full quick-settings mirror + mode grid.
                     // (Behavior was absorbed here so knobs aren't duplicated.)
                     if (s_aiSubSel == 0) {
@@ -6939,9 +7127,21 @@ void drawSettingsModal(AppState& st, bool busy) {
                         drawMemoryLearningSection(st, sc);
                         settingsGlassSectionEnd();
 
-                        settingsGlassSectionBegin("##ai_harness_org", "Harness organization");
-                        drawHarnessOrganizationSection(st, sc);
-                        settingsGlassSectionEnd();
+                        // Harness organization is a structural/diagnostic surface — the
+                        // shipped arrangement is correct for normal use.
+                        if (st.settings.showAdvanced) {
+                            settingsGlassSectionBegin("##ai_harness_org",
+                                                      "Harness organization");
+                            drawHarnessOrganizationSection(st, sc);
+                            settingsGlassSectionEnd();
+                        }
+                        // Basic mode hides the Tools page, whose only everyday control is
+                        // runtime repair. Re-home it here so a broken runtime is always
+                        // fixable; Advanced keeps it on Tools where it has always lived.
+                        if (!st.settings.showAdvanced) {
+                            ImGui::Dummy(ImVec2(0, 10.0f * sc));
+                            drawRuntimeMaintenanceSection(st, sc);
+                        }
                     }
 
 
@@ -6952,21 +7152,28 @@ void drawSettingsModal(AppState& st, bool busy) {
                         drawModelRolesSection(st, sc);
                         settingsGlassSectionEnd();
 
-                        settingsGlassSectionBegin("##ai_vision_routing",
-                                                  "Vision & spatial routing");
-                        drawVisionRoutingSection(st, sc);
-                        settingsGlassSectionEnd();
-                        ImGui::Dummy(ImVec2(0, 8.0f * sc));
-                        {
-                            static bool s_efOpen = false;
-                            ImGui::SetNextItemOpen(s_efOpen, ImGuiCond_Once);
-                            if (ImGui::CollapsingHeader("Eng. Firm model assignments")) {
-                                s_efOpen = true;
-                                settingsGlassSectionBegin("##ai_eng_firm", "Eng. Firm");
-                                drawEngFirmModelAssignments(st, sc);
-                                settingsGlassSectionEnd();
-                            } else {
-                                s_efOpen = false;
+                        // Vision/spatial routing and the Eng. Firm per-role model matrix are
+                        // both power routing surfaces: the defaults resolve a working model
+                        // for every role, and getting these wrong is worse than not touching
+                        // them. Model roles above stays visible in Basic because choosing
+                        // "which model does my CAD work" is an everyday decision.
+                        if (st.settings.showAdvanced) {
+                            settingsGlassSectionBegin("##ai_vision_routing",
+                                                      "Vision & spatial routing");
+                            drawVisionRoutingSection(st, sc);
+                            settingsGlassSectionEnd();
+                            ImGui::Dummy(ImVec2(0, 8.0f * sc));
+                            {
+                                static bool s_efOpen = false;
+                                ImGui::SetNextItemOpen(s_efOpen, ImGuiCond_Once);
+                                if (ImGui::CollapsingHeader("Eng. Firm model assignments")) {
+                                    s_efOpen = true;
+                                    settingsGlassSectionBegin("##ai_eng_firm", "Eng. Firm");
+                                    drawEngFirmModelAssignments(st, sc);
+                                    settingsGlassSectionEnd();
+                                } else {
+                                    s_efOpen = false;
+                                }
                             }
                         }
                     }
@@ -8178,24 +8385,7 @@ void drawSettingsModal(AppState& st, bool busy) {
                         settingsGlassSectionEnd();
 
                         ImGui::Dummy(ImVec2(0, 10.0f * sc));
-                        settingsGlassSectionBegin("##ai_maintenance", "Maintenance");
-                        dimText("Repair the local CAD engine runtime.");
-                        {
-                            const bool canSetup = !st.setupRunning.load() && !st.anyRunActive();
-                            if (!canSetup) ImGui::BeginDisabled();
-                            if (ImGui::Button("Repair / install runtime", ImVec2(220.0f * sc, 0)))
-                                st.startSetup(true);
-                            if (!canSetup) ImGui::EndDisabled();
-                            if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
-                                ImGui::SetTooltip(
-                                    "Rebuild the local Python/CAD runtime (same as "
-                                    "Chudware -> Repair / install runtime).");
-                            if (st.setupRunning.load()) {
-                                ImGui::SameLine();
-                                dimText("Running\xe2\x80\xa6");
-                            }
-                        }
-                        settingsGlassSectionEnd();
+                        drawRuntimeMaintenanceSection(st, sc);
                     }
 
                     // ---- Dev Preview: assembled general_agent system prompt ----
@@ -8404,6 +8594,36 @@ void drawSettingsModal(AppState& st, bool busy) {
                 ImGui::EndTabItem();
             }
 
+            // ---- Basic / Advanced disclosure switch ----
+            // Right-aligned in the tab strip itself (Trailing), so it is visible from every
+            // tab and reads as a property of the whole modal rather than of one page.
+            //
+            // Why this exists: the settings surface had grown to ~130 indexed entries across
+            // 4 tabs plus an 8-section AI hub with NO triage whatsoever — a tool-call budget
+            // slider carried exactly the same visual weight as "should the assistant plan
+            // before building". Reading all of it end to end is the hour the owner reported.
+            // Basic mode is the fix; it hides power controls and disables nothing.
+            //
+            // Plain ASCII label: the tab strip is drawn with the UI font, and a glyph the
+            // atlas has no cell for renders as '?' (scripts/gui_lint.py --rule glyph).
+            {
+                const char* advLabel =
+                    st.settings.showAdvanced ? "Advanced: On" : "Advanced: Off";
+                if (ImGui::TabItemButton(advLabel, ImGuiTabItemFlags_Trailing |
+                                                       ImGuiTabItemFlags_NoTooltip)) {
+                    st.settings.showAdvanced = !st.settings.showAdvanced;
+                    saveSettings(st.settings);
+                }
+                if (ImGui::IsItemHovered()) {
+                    ImGui::SetTooltip(
+                        "Advanced settings\n"
+                        "Off: only the controls most users need.\n"
+                        "On: every tuning, authoring and diagnostic control.\n\n"
+                        "Nothing is disabled while this is off — hidden controls keep "
+                        "their current values, config.json stays authoritative, and\n"
+                        "searching for a hidden setting turns this on for you.");
+                }
+            }
             // --- end C22b marked block ---
             ImGui::EndTabBar();
         }

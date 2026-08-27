@@ -678,6 +678,9 @@ void loadSettings(Settings& s) {
         // T-G21: pinned-column vertical-collapse state.
         s.fmCollapsed = j.value("fm_collapsed", false);
         s.copilotCollapsed = j.value("copilot_collapsed", false);
+        // Settings-modal progressive disclosure. Absent => false => the modal opens in its
+        // readable basic form, which is the whole point of the default.
+        s.showAdvanced = j.value("show_advanced", false);
         // Wave 3: File Explorer workspace + Recent files.
         s.workspaceDir = j.value("workspace_dir", std::string());
         s.recentFiles.clear();
@@ -1105,6 +1108,9 @@ static void applyGuiOwnedSettings(nlohmann::json& j, const Settings& s) {
     // T-G21: pinned-column vertical-collapse state.
     j["fm_collapsed"] = s.fmCollapsed;
     j["copilot_collapsed"] = s.copilotCollapsed;
+    // Settings-modal progressive disclosure. Omitted while false so a default config
+    // carries no trace of it.
+    if (s.showAdvanced) j["show_advanced"] = true;
     // Wave 3: File Explorer workspace + Recent files.
     if (!s.workspaceDir.empty()) j["workspace_dir"] = s.workspaceDir;
     j["recent_files"] = s.recentFiles;

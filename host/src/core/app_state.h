@@ -218,6 +218,21 @@ struct Settings {
     bool fmCollapsed = false;
     bool copilotCollapsed = false;
 
+    // Progressive disclosure for the Settings modal (the "Advanced" switch beside the tab
+    // strip). OFF by default: every tab shows only the controls a normal user plausibly
+    // changes, which is what keeps the AI surface readable instead of a wall of tuning
+    // knobs. Turning it ON reveals every control in place.
+    //
+    // This NEVER removes a capability — the fork's mission statement is explicit that
+    // "removing a setting must never remove a capability". Three escape hatches guarantee
+    // that: (1) this switch, (2) config.json remains authoritative and is read whether or
+    // not the control is currently painted, and (3) Settings search still indexes every
+    // entry and auto-reveals advanced when a hit lands in a hidden section. So a hidden
+    // knob is never an unreachable knob.
+    //
+    // Serialized top-level "show_advanced" (alongside "fm_collapsed"), omitted when false.
+    bool showAdvanced = false;
+
     // Animation style of the copilot brand mark (the live tesseract logo): 0 = 8-cell
     // inside-out, 1 = double rotation, 2 = isoclinic, 3 = octave (2:1 locked planes). Plain
     // int, not ui::TesseractAnim, so core/ stays free of the UI header; the UI clamps it on

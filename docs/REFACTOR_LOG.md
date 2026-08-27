@@ -8564,3 +8564,55 @@ Baseline unchanged: `services/agent`+`services/dag` 3809 pass / 2 pre-existing f
 `services/mcp` 2891 pass / 1 pre-existing fail (proven at HEAD). NOTE for future runs:
 this host's `TMPDIR` is `~/.cache/tmp`, which makes `AF_UNIX` paths too long and fails two
 hostd tests that pass under `TMPDIR=/tmp`.
+
+---
+
+## 2026-08-27 — Settings progressive disclosure: 155 AI controls down to 9 by default
+
+**Why.** Owner report: "the current setup for all ai settings is like over 1 hour if you
+read everything." The OMP fork's own mission statement names this exact defect — "the
+surface has grown far past useful. Fewer, better defaults; everything still reachable via
+config file or an explicit 'advanced' mode. **Removing a setting must never remove a
+capability.**" A grep for `showAdvanced` / `advanced mode` across the modal returned **zero
+hits**: there was no progressive disclosure of any kind, so a tool-call-budget slider
+carried the same visual weight as "should the assistant plan before building".
+
+**Measured first, then cut.** A full read-only inventory of the AI tab classified **155
+interactive controls: 10 EVERYDAY / 145 ADVANCED / 0 auto-derivable**, per section —
+Harness 9/27, Roles 0/59, Prompts 0/8, Skills 0/6, Rules 0/16, Benchmarks 0/5, Tools 1/22,
+Dev Preview 0/2. Roles being entirely advanced is the load-bearing finding: per-role model
+pinning is a power surface, and the everyday "which model do I use" choice already lives on
+the Providers tab. So Basic showing Harness alone is what the data supports.
+
+**Mechanism.** New `Settings::showAdvanced` (top-level `show_advanced` in config.json,
+omitted while false), surfaced as a right-aligned `Advanced: On/Off` item in the tab strip
+itself (`ImGuiTabItemFlags_Trailing`) so it reads as a property of the modal, not of a page.
+`kAiSubAdvanced[8]` marks which sub-sections are power surfaces; the rail filters through a
+`visIdx` map so the eight section bodies keep switching on their STABLE index and needed no
+edits. With one visible section the rail is suppressed entirely and the pane gets the width.
+Within Harness, the all-advanced preference combos, orchestration flags, Chat-display block
+and budget sliders are gated (the last via early return, since that table ends the
+function); Memory & Learning early-branches to its two non-duplicate everyday controls.
+
+**Three guarantees that hiding never removes a capability.** (1) The switch. (2) config.json
+stays authoritative and is read whether or not a control is painted. (3) Settings search
+still indexes all ~130 entries, and a jump that lands in a hidden section **turns disclosure
+on and persists it** — which also keeps the composer's `/rule` route (Rules is advanced)
+working. Plus: Tools' single everyday control ("Repair / install runtime") is re-homed onto
+Harness in Basic via an extracted `drawRuntimeMaintenanceSection`, rendered in exactly one
+place at a time, so a broken runtime is always fixable without discovering the switch.
+
+**Duplicates removed** (no capability cost, both were rendered on ONE screen): the second
+`settings.memoryEnabled` checkbox and the second `settings.memoryTokenBudget` slider, which
+Memory & Learning repeated from the session grid directly above it. Separately,
+`ai_workspace.cpp` had a hand-rolled max-tokens/context-window pair lacking the canonical
+widget's clamping, tooltips and "0 = automatic" hint; it now calls
+`drawAiSettingsSection(...Generation)` and threads real `busy` state instead of `false`.
+
+**Verified by A/B pixel capture** at 1340x838, tab 2. Basic (config key genuinely absent, so
+this is the shipped default): 9 controls, one screen, no scroll, no rail. Advanced: full
+8-item rail, all 4 preference combos, every orchestration flag, the complete Chat-display
+block and all 3 budget sliders return. `./build.sh` green; `gui_lint` theme/color/glyph/dupe
+clean (the 10 `scale` findings are pre-existing in `ecad/ecad_canvas.cpp`, untouched here);
+`check.py` all 9 gates pass; vendor lock verifies. Because the session grid is shared, the
+AI workspace Options view simplifies from the same flag.

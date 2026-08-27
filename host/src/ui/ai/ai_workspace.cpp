@@ -1682,16 +1682,15 @@ static void drawChatCenter(AppState& st, bool busy, bool canRun) {
 }
 
 // ---- Options view (v3): run-behavior + workspace-visibility knobs -------------------
-// The model / reasoning-effort / API key / privacy controls are reachable ONLY on the main
-// Settings page (Settings -> AI). This view keeps the run-behavior knobs (same config.json
-// fields, no parallel store, shared verbatim with Settings -> AI -> Harness via
-// drawHarnessSessionKnobs) + a couple of generation knobs + the command-center visibility
+// The model / API key / privacy controls are reachable ONLY on the main Settings page
+// (Settings -> AI). This view keeps the run-behavior knobs (same config.json fields, no
+// parallel store, shared verbatim with Settings -> AI -> Harness via
+// drawHarnessSessionKnobs) + the shared generation controls + the command-center visibility
 // prefs (agent.ui_*). 2-col stretch-same tables keep every label/control pair aligned
 // regardless of label length (a fixed SameLine(labelW) crowded longer labels against their
 // control) and a left indent keeps content off the panel's glass edge.
-static void drawOptionsView(AppState& st) {
+static void drawOptionsView(AppState& st, bool busy) {
     const float S = ui::uiScale;
-    bool changed = false;
     const ImGuiTableFlags gridFlags =
         ImGuiTableFlags_SizingStretchSame | ImGuiTableFlags_NoPadOuterX;
 
@@ -1740,23 +1739,8 @@ static void drawOptionsView(AppState& st) {
     ImGui::Dummy(ImVec2(0, ui::metrics::cpMenuSectionGap()));
 
     sectionHeader("Generation");
-    if (ImGui::BeginTable("##ai_ws_gen", 2, gridFlags)) {
-        auto intKnob = [&](const char* label, const char* id, int& v, const char* tip) {
-            ImGui::AlignTextToFramePadding();
-            ImGui::TextUnformatted(label);
-            ImGui::SetNextItemWidth(-1.0f);
-            if (ImGui::InputInt(id, &v, 0, 0)) { v = std::max(0, v); changed = true; }
-            if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", tip);
-        };
-        ImGui::TableNextColumn();
-        intKnob("Max output tokens", "##ai_ws_maxtok", st.settings.maxTokens,
-                "Max output tokens per model call. 0 = provider default.");
-        ImGui::TableNextColumn();
-        intKnob("Context window", "##ai_ws_ctx", st.settings.contextWindow,
-                "Model's total token window. 0 = automatic (cloud large, local 8192).");
-        ImGui::EndTable();
-    }
-    if (changed) saveSettings(st.settings);
+    if (ui::drawAiSettingsSection(st, busy, ui::AiSettingsSection::Generation))
+        saveSettings(st.settings);
     ImGui::Dummy(ImVec2(0, ui::metrics::cpMenuSectionGap()));
 
     sectionHeader("More");
@@ -1769,8 +1753,8 @@ static void drawOptionsView(AppState& st) {
         ImVec4(palette.textDisabled[0], palette.textDisabled[1],
                palette.textDisabled[2], 1.0f));
     ImGui::TextWrapped("Workflow knobs persist to config.json (shared with the docked Copilot). "
-                       "Model, reasoning effort, API key and privacy live on the main Settings "
-                       "page (Settings -> AI).");
+                       "Provider, model, API key and privacy live on the main Settings page "
+                       "(Settings -> AI).");
     ImGui::PopStyleColor();
 }
 
@@ -1833,7 +1817,7 @@ static void drawViewPane(AppState& st, bool busy) {
             drawInsightsView(st);
             break;
         case 5:  // Options: run-behavior + workspace-visibility knobs.
-            drawOptionsView(st);
+            drawOptionsView(st, busy);
             break;
         default:
             s_ai.view = 0;

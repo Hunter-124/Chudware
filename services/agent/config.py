@@ -29,9 +29,9 @@ from urllib.parse import urlparse
 
 from services import paths
 
-from .providers.base import Provider
-
 from . import model_catalog
+from ._omp_bridge_provider_ids import OMP_BRIDGE_PROVIDER_IDS
+from .providers.base import Provider
 
 
 # --------------------------------------------------------------------------- load/save cache
@@ -1876,29 +1876,6 @@ _PROVIDER_BASE_URL_CFG_KEY = {
     "vllm": "vllm",
     "openrouter": "openrouter",
 }
-
-# Provider ids served by the OMP bun sidecar (vendor/omp/bridge/src/bridge.ts) instead of a
-# native Python SDK adapter. Kept verbatim in sync with the C++ source of truth,
-# core/agent/providers.cpp:1131-1146 (omp_bridge_provider_ids()) — re-sync by copying that
-# set over whenever the vendored OMP catalog is re-pulled and provider coverage shifts.
-#
-# It deliberately EXCLUDES every id CAD serves natively (openai, gemini, xai/xai-sub,
-# moonshot, cursor-sub, llamacpp, vllm, mock), so routing a bridge id can never shadow a
-# loopback endpoint or an already-working native adapter.
-OMP_BRIDGE_PROVIDER_IDS = frozenset({
-    "aimlapi", "alibaba-coding-plan", "amazon-bedrock", "anthropic", "anthropic-sub",
-    "azure", "baseten", "cerebras",
-    "cloudflare-ai-gateway", "coreweave", "deepseek", "devin", "firepass", "fireworks",
-    "github-copilot", "gitlab-duo", "gitlab-duo-agent", "google-antigravity",
-    "google-gemini-cli", "google-vertex", "groq", "huggingface", "kilo", "kimi-code",
-    "minimax", "minimax-cn", "minimax-code", "minimax-code-cn", "mistral", "nanogpt",
-    "novita", "nvidia", "ollama-cloud", "openai-codex", "opencode", "opencode-go",
-    "opencode-zen", "openrouter", "qianfan", "qwen-portal", "sakana", "synthetic",
-    "together", "umans", "venice", "vercel-ai-gateway", "wafer-serverless", "xiaomi",
-    "xiaomi-token-plan-ams", "xiaomi-token-plan-cn", "xiaomi-token-plan-sgp", "zai",
-    "zenmux", "zhipu-coding-plan",
-})
-
 
 # Persisted provider ids that were renamed to a bridge id. _resolve_provider normalizes the
 # name through this table, but a config written before the rename still files the nested

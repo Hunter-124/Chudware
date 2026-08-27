@@ -2772,3 +2772,22 @@ Deleted the Python adapter and unreachable resolver branch. Conformance now pins
 contract — provider/model/key fields on `OmpBridgeProvider` — and tier prose names the private
 OMP bridge. Private `pi-ai` is the single owner of OpenRouter wire format, service tier,
 reasoning effort, retries, usage, and catalog semantics. 110 provider/tier tests pass.
+
+---
+
+## 2026-08-27 — Provider routing is generated from private OMP
+
+CAD copied the same 54 OMP bridge provider IDs into Python and C++, with a comment telling
+maintainers to re-copy the list after every catalog update. Private OMP 18.0.8 had already
+grown beyond it, silently leaving seven supported providers unreachable.
+
+`scripts/vendor_omp.py` now owns the only authored routing policy: six exact OMP IDs served by
+native CAD transports (`openai`, `google`, `xai`, `xai-oauth`, `moonshot`, `cursor`) and the
+auth-only bridge alias `anthropic-sub`. It derives the remaining sorted set from private
+`models.json`, generating a Python frozenset and C++ initializer include. `verify()` fails if
+either output is missing or changed.
+
+Result: 61 bridge routes, adding `aiand`, `alibaba-token-plan`, `bedrock-mantle`, `deepinfra`,
+`gmi-cloud`, `meta`, and `yolo-auto`. Resolution remains static — no runtime catalog file read
+and no Bun spawn. Vendor tests pin generation, native exclusion, deterministic order, missing/
+changed drift, and malformed catalog failure.

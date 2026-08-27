@@ -17,6 +17,9 @@ Detail + research live in `docs/omp-integration/` (`00-OPTIONS-AND-DECISIONS.md`
   Verified via bun stdio against private OMP: 4,500 models and 78 providers, with pricing and
   disabled-credential metadata complete. Speculative zero-caller compact/cache-warming RPCs
   were deleted under YAGNI; platform APIs are added when a real consumer ships.
+- **Generated provider routing** — vendoring derives 61 bridge provider IDs from the private
+  catalog, minus six CAD-native transports plus the `anthropic-sub` tenancy alias. Python and
+  C++ consume generated outputs; seven private providers no longer require hand edits.
 - **First harness extraction** — private `pi-agent-core` owns shake selection/mutation and a
   product-neutral JSON adapter; CAD keeps only JSON-RPC and image-block conversion. The
   duplicated Python fenced/XML/tool-result algorithm and fake `artifact://shake` link are gone.

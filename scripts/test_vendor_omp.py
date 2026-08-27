@@ -11,6 +11,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import runpy
 import subprocess
 import sys
 from pathlib import Path
@@ -32,6 +33,20 @@ def _fake_upstream(root: Path) -> Path:
     (root / "packages" / "ai" / "src").mkdir(parents=True)
     (root / "packages" / "ai" / "src" / "index.ts").write_text("export const x = 1;\n")
     (root / "packages" / "ai" / "package.json").write_text('{"name":"@oh-my-pi/pi-ai"}\n')
+    (root / "packages" / "catalog" / "src").mkdir(parents=True)
+    (root / "packages" / "catalog" / "src" / "models.json").write_text(
+        json.dumps(
+            {
+                "future-provider": {},
+                "openai": {},
+                "openrouter": {},
+            }
+        )
+        + "\n"
+    )
+    (root / "packages" / "catalog" / "package.json").write_text(
+        '{"name":"@oh-my-pi/pi-catalog"}\n'
+    )
     # A pruned dir must not survive vendoring.
     (root / "packages" / "ai" / "test").mkdir()
     (root / "packages" / "ai" / "test" / "spec.test.ts").write_text("// test\n")
@@ -67,7 +82,9 @@ def vendored(tmp_path, monkeypatch):
     monkeypatch.setattr(vendor_omp, "VENDOR_DIR", vendor_dir)
     monkeypatch.setattr(vendor_omp, "LOCK_PATH", vendor_dir / "OMP_VENDOR.lock")
 
-    vendor_omp.vendor(str(source), sha="deadbeef", packages=["ai"], run_install=False)
+    vendor_omp.vendor(
+        str(source), sha="deadbeef", packages=["ai", "catalog"], run_install=False
+    )
     return vendor_dir
 
 
@@ -109,6 +126,107 @@ def test_revendor_prunes_non_runtime_dirs(vendored):
     assert not (vendored / "packages" / "ai" / "test").exists()
 
 
+def _generated_cpp_ids(repo_root: Path) -> tuple[str, ...]:
+    path = repo_root / "core" / "agent" / "omp_bridge_provider_ids.inc"
+    lines = path.read_text().splitlines()
+    return tuple(json.loads(line.strip().removesuffix(",")) for line in lines[1:])
+
+
+def test_revendor_generates_bridge_routes_from_catalog(vendored):
+    repo_root = vendored.parent
+    generated = runpy.run_path(
+        str(repo_root / "services" / "agent" / "_omp_bridge_provider_ids.py")
+    )["OMP_BRIDGE_PROVIDER_IDS"]
+    expected = frozenset({"anthropic-sub", "future-provider", "openrouter"})
+
+    assert generated == expected
+    assert _generated_cpp_ids(repo_root) == tuple(sorted(expected))
+    assert "openai" not in generated
+
+
+def test_provider_route_order_is_deterministic():
+    catalog = {
+        "z-provider": {},
+        "openai": {},
+        "a-provider": {},
+    }
+    assert vendor_omp.omp_bridge_provider_ids(catalog) == (
+        "a-provider",
+        "anthropic-sub",
+        "z-provider",
+    )
+
+
+def test_verify_accepts_generated_provider_routes(vendored):
+    assert vendor_omp.verify() == 0
+
+
+def test_verify_flags_missing_generated_python_routes(vendored, capsys):
+    generated = vendored.parent / "services" / "agent" / "_omp_bridge_provider_ids.py"
+    generated.unlink()
+
+    assert vendor_omp.verify() == 1
+    assert "missing generated provider routes" in capsys.readouterr().err
+
+
+def test_verify_flags_changed_generated_cpp_routes(vendored, capsys):
+    generated = vendored.parent / "core" / "agent" / "omp_bridge_provider_ids.inc"
+    generated.write_text(generated.read_text() + '        "tampered",\n')
+
+    assert vendor_omp.verify() == 1
+    assert "changed generated provider routes" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    "catalog",
+    [
+        None,
+        [],
+        {},
+        {"": {}},
+        {1: {}},
+    ],
+)
+def test_provider_route_derivation_rejects_malformed_catalog(catalog):
+    with pytest.raises(ValueError):
+        vendor_omp.omp_bridge_provider_ids(catalog)
+
+
+@pytest.mark.parametrize("catalog_contents", [None, "{not json"])
+def test_vendor_fails_when_requested_catalog_is_missing_or_malformed(
+    tmp_path, monkeypatch, catalog_contents
+):
+    source = _fake_upstream(tmp_path / "src")
+    models = source / "packages" / "catalog" / "src" / "models.json"
+    if catalog_contents is None:
+        models.unlink()
+    else:
+        models.write_text(catalog_contents)
+    vendor_dir = tmp_path / "vendor-omp"
+    monkeypatch.setattr(vendor_omp, "REPO_ROOT", tmp_path)
+    monkeypatch.setattr(vendor_omp, "VENDOR_DIR", vendor_dir)
+    monkeypatch.setattr(vendor_omp, "LOCK_PATH", vendor_dir / "OMP_VENDOR.lock")
+
+    with pytest.raises(SystemExit, match="cannot generate OMP bridge provider routes"):
+        vendor_omp.vendor(
+            str(source), sha="deadbeef", packages=["catalog"], run_install=False
+        )
+
+
+def test_vendor_without_catalog_package_skips_route_generation(tmp_path, monkeypatch):
+    source = _fake_upstream(tmp_path / "src")
+    vendor_dir = tmp_path / "vendor-omp"
+    monkeypatch.setattr(vendor_omp, "REPO_ROOT", tmp_path)
+    monkeypatch.setattr(vendor_omp, "VENDOR_DIR", vendor_dir)
+    monkeypatch.setattr(vendor_omp, "LOCK_PATH", vendor_dir / "OMP_VENDOR.lock")
+
+    vendor_omp.vendor(str(source), sha="deadbeef", packages=["ai"], run_install=False)
+
+    py_path, cpp_path = vendor_omp._provider_route_output_paths()
+    assert not py_path.exists()
+    assert not cpp_path.exists()
+
+
 def _git(root: Path, *args: str) -> None:
     subprocess.run(
         ["git", "-C", str(root), *args],
@@ -139,7 +257,9 @@ def vendored_dirty(tmp_path, monkeypatch):
     monkeypatch.setattr(vendor_omp, "REPO_ROOT", tmp_path)
     monkeypatch.setattr(vendor_omp, "VENDOR_DIR", vendor_dir)
     monkeypatch.setattr(vendor_omp, "LOCK_PATH", vendor_dir / "OMP_VENDOR.lock")
-    vendor_omp.vendor(str(source), sha=None, packages=["ai"], run_install=False)
+    vendor_omp.vendor(
+        str(source), sha=None, packages=["ai", "catalog"], run_install=False
+    )
     return vendor_dir
 
 

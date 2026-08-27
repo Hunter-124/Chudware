@@ -2651,6 +2651,7 @@ int run_gui(const char *screenshotPath, const char *openPath) {
   // Explorer + File menu read; pushRecentFile() mirrors changes back into
   // settings.
   st.recentFiles = st.settings.recentFiles;
+  st.recentProjects = st.settings.recentProjects;
   st.workspaceDir = st.settings.workspaceDir;
   ui::ensureWorkspaceDir(st);
 
@@ -3702,7 +3703,12 @@ int run_gui(const char *screenshotPath, const char *openPath) {
       ui::plmSelectComparePage();
     else if (pg && std::strcmp(pg, "versions") == 0)
       ui::plmSelectVersionsPage();
-    else
+    else if (pg && std::strcmp(pg, "releases") == 0)
+      ui::plmSelectReleasesPage();
+    else if (pg && std::strcmp(pg, "tour") == 0) {
+      ui::plmSelectOverviewPage();
+      ui::plmStartGuidedTour();
+    } else
       ui::plmSelectGitPage();
     // CHUDWARE_PLM_PROJECT points the capture at a specific project folder.
     // Without it the shot falls back to the cwd, which is fine for the pages

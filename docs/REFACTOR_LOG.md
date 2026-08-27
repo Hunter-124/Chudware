@@ -8301,3 +8301,7 @@ A/B'd against a HEAD-pinned hostd built out-of-tree (`/tmp/headhostd`) and fail 
 Gotcha for the next pass: `test_inprocess_internal_agent_docs_are_registered_but_silent`
 fails on HEAD too — it is the concurrent ECAD session's in-progress `core/api/libchudware.cpp`,
 not this work.
+
+## 2026-08-27 — PLM Project Hub completion (T-R6)
+
+Completed the full-screen Project Hub in `host/src/ui/plm/`: a reachable three-lane release board, item/person/AI activity filters, cached direct where-used explorer, thumbnailed grid activation with PLM identity/lifecycle metadata, honest Project/History/Release onboarding, guided tour, recent-project persistence, project-open landing, and release/tour/grid headless selectors. `host/src/core/app_state.{h,cpp}` owns the bounded recent-project list and landing transition; `host/src/app.cpp` only seeds the persisted list and dispatches the two new shot pages. Existing `plm_*` contracts and async cache paths were reused unchanged. Verified with isolated compilation of all changed TUs, scoped GUI lints, a successful integrated host build, and three real `CHUDWARE_SHOT=git` captures. The concurrent ECAD/public-site/hostd work was excluded from the commit.

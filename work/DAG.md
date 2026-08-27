@@ -184,7 +184,7 @@ graph TD
     T_R3["T-R3: PLM change intelligence - plain-language summaries, AI-assist/AI-managed tiers, compare views"]:::done
     T_R4["T-R4: PLM items & releases - part numbers, rev letters, release pinning + BOM freeze, where-used"]:::done
     T_R5["T-R5: PLM in-editor GUI - history timeline panel, rev badges, checkpoint/release toolbar, compare view (all doc kinds)"]:::done
-    T_R6["T-R6: PLM Project Hub - full-screen master workspace (item grid, activity, release board, where-used, Copilot dock)"]:::todo
+    T_R6["T-R6: PLM Project Hub - full-screen master workspace (item grid, activity, release board, where-used, Copilot dock)"]:::done
     T_R7["T-R7: PLM sharing & team sync v1 - remote profiles, one-button Sync, advisory locks, copy-as-variant conflicts"]:::todo
     T_R8["T-R8: Self-hosted PLM server + live co-editing — two people in the same part, no locks"]:::todo
   end

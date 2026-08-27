@@ -764,6 +764,88 @@ void doUntrack(AppState& st, const std::string& itemId) {
     });
 }
 
+
+// The where-used explorer: a cached band under the Files list answering "who uses
+// this item?" with the DIRECT consumers plm_where_used derives from the project's
+// own documents — nothing inferred, no invented relationships. Rows are drillable
+// (ask the same question of a consumer) and openable when they carry a real path.
+void drawWhereUsedExplorer(AppState& st, float bandH) {
+    auto& H = g_plmHub;
+    const float S = ui::uiScale;
+    plmEnsureWhereUsed(st);
+
+    // Selected item's display title (fall back to the raw id if its row is gone).
+    std::string title = H.wuTarget;
+    for (const auto& it : H.items)
+        if (it.itemId == H.wuTarget) { title = it.path; break; }
+
+    ui::pushGlassChildStyle(9.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(10 * S, 8 * S));
+    ImGui::BeginChild("##wu_panel", ImVec2(0, bandH), ImGuiChildFlags_Borders);
+    ImGui::PopStyleVar();
+
+    plmSectionHeader("Where used", "mesh");
+    ImGui::SameLine();
+    ImGui::AlignTextToFramePadding();
+    dimText("%s", title.c_str());
+    const float closeW = 52 * S;
+    ImGui::SameLine(ImGui::GetContentRegionMax().x - closeW);
+    const bool close = ImGui::SmallButton("Close");
+    ImGui::Separator();
+
+    if (H.wuLoading && (H.wuFor != H.wuTarget || H.wuRows.empty())) {
+        plmSpinner("Finding consumers");
+    } else if (!H.wuErr.empty()) {
+        plmError(H.wuErr);
+    } else if (H.wuRows.empty()) {
+        (void)ui::kit::emptyState("mesh", "Not used anywhere else",
+            "No assembly, drawing or CAM job in this project references it.");
+    } else {
+        ImGui::BeginChild("##wu_rows", ImVec2(0, 0), ImGuiChildFlags_None);
+        for (const auto& c : H.wuRows) {
+            ImGui::PushID(c.itemId.c_str());
+            plmCardBegin("##wu_row", false, 8.0f, 4.0f, palette.accent, 0.12f);
+            plmDocTypeTag("", c.kind);
+            ImGui::SameLine();
+            ImGui::AlignTextToFramePadding();
+            ImGui::TextWrapped("%s", !c.path.empty() ? c.path.c_str()
+                                                     : c.itemId.c_str());
+            ImGui::SameLine();
+            char via[32];
+            if (c.via == "source")
+                std::snprintf(via, sizeof(via), "source");
+            else if (c.count > 1)
+                std::snprintf(via, sizeof(via), "component x%d", c.count);
+            else
+                std::snprintf(via, sizeof(via), "component");
+            ui::kit::chip(via, ui::kit::Tone::Neutral);
+            if (!c.partNumber.empty()) dimText("%s", c.partNumber.c_str());
+            plmActionRowBegin();
+            if (ImGui::SmallButton("Where used")) {   // drill one level upward
+                H.wuTarget = c.itemId;
+                H.wuErr.clear();
+            }
+            if (!c.path.empty()) {
+                ImGui::SameLine();
+                if (ImGui::SmallButton("Open")) {
+                    std::string abs = st.plmProjectPath();
+                    if (!abs.empty() && abs.back() != '/' && abs.back() != '\\')
+                        abs += '/';
+                    abs += c.path;
+                    for (char& ch : abs) if (ch == '\\') ch = '/';
+                    st.requestOpenPath = abs;
+                }
+            }
+            plmActionRowEnd();
+            plmCardEnd();
+            ImGui::PopID();
+        }
+        ImGui::EndChild();
+    }
+    ImGui::EndChild();
+    ui::popGlassChildStyle();
+    if (close) H.wuTarget.clear();
+}
 }  // namespace
 
 void drawFilesTab(AppState& st) {
@@ -832,12 +914,21 @@ void drawFilesTab(AppState& st) {
     ImGui::Spacing();
 
     // Only the item list scrolls; the header + track/link + filter row above stay
-    // pinned at the top of the panel.
+    // pinned at the top of the panel. An open where-used explorer takes a band at
+    // the bottom; the list gives up that height.
+    const float wuBandH = !H.wuTarget.empty()
+        ? std::max(150.0f * S, ImGui::GetContentRegionAvail().y * 0.38f) : 0.0f;
+    auto endList = [&]() {
+        ImGui::EndChild();
+        if (wuBandH > 0.0f) drawWhereUsedExplorer(st, wuBandH);
+    };
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
-    ImGui::BeginChild("##files_list", ImVec2(0, 0), ImGuiChildFlags_None);
+    ImGui::BeginChild("##files_list",
+                      ImVec2(0, wuBandH > 0.0f ? -(wuBandH + 6 * S) : 0.0f),
+                      ImGuiChildFlags_None);
     ImGui::PopStyleVar();
-    if (H.itemsLoading && H.items.empty()) { plmSpinner("Loading"); ImGui::EndChild(); return; }
-    if (!H.itemsErr.empty()) { plmError(H.itemsErr); ImGui::EndChild(); return; }
+    if (H.itemsLoading && H.items.empty()) { plmSpinner("Loading"); endList(); return; }
+    if (!H.itemsErr.empty()) { plmError(H.itemsErr); endList(); return; }
 
     // build a filtered + sorted view (pointers into H.items — no copies)
     std::vector<const PlmItemRow*> view;
@@ -900,17 +991,8 @@ void drawFilesTab(AppState& st) {
                     it.docType.empty() ? "design document" : it.docType.c_str(),
                     it.partNumber.empty() ? "" : ("  \xc2\xb7  " + it.partNumber).c_str());
             if (ImGui::SmallButton("Where used")) {
-                nlohmann::json p = pathParam(st);
-                p["item_id"] = it.itemId;
-                st.rpc.call("plm_where_used", p, [&st](const core::RpcResult& r) {
-                    std::string h; if (!plmOk(r, h)) { st.toast(ui::ToastLevel::Error, h); return; }
-                    int n = 0;
-                    if (auto c = r.result.find("consumers");
-                        c != r.result.end() && c->is_array()) n = (int)c->size();
-                    st.toast(ui::ToastLevel::Info,
-                             n ? (std::to_string(n) + " place(s) use this")
-                               : "Not used elsewhere");
-                });
+                H.wuTarget = it.itemId;   // opens the cached explorer band below
+                H.wuErr.clear();
             }
             ImGui::SameLine();
             if (ImGui::SmallButton("Open")) {
@@ -933,7 +1015,7 @@ void drawFilesTab(AppState& st) {
     if (shown == 0)
         plmEmptyState("(#)", "No files here yet",
                       "Save a design, or Track a document/folder above.");
-    ImGui::EndChild();
+    endList();
 }
 
 // The Files destination folds in History + Releases as sub-tabs, so the whole
@@ -993,6 +1075,7 @@ void plmDrawHistoryPage(AppState& st) {
     auto& H = g_plmHub;
     const float S = ui::uiScale;
     plmEnsureHistory(st);
+    plmEnsureItems(st);   // the item filter draws its choices from the Files rows
 
     plmSectionHeader("History", "history");
 
@@ -1009,6 +1092,58 @@ void plmDrawHistoryPage(AppState& st) {
             H.histGen = -1;  // force refetch for the new scope
         }
         ImGui::PopStyleColor();
+    }
+    // Live filters: item narrows the fetch itself (plm_history filters by item_id
+    // server-side); person and AI-vs-human apply to the cached rows. Every choice
+    // is derived from cached rows — nothing invented.
+    {
+        const float itemW = 170 * S, authW = 120 * S;
+        std::string itemLabel = "All items";
+        for (const auto& it : H.items)
+            if (it.itemId == H.histItemFilter) { itemLabel = it.path; break; }
+        ImGui::SetNextItemWidth(itemW);
+        if (ImGui::BeginCombo("##hist_item", itemLabel.c_str())) {
+            if (ImGui::Selectable("All items", H.histItemFilter.empty()) &&
+                !H.histItemFilter.empty()) {
+                H.histItemFilter.clear();
+                H.histGen = -1;              // refetch without the item narrow
+            }
+            for (const auto& it : H.items) {
+                ImGui::PushID(it.itemId.c_str());
+                if (ImGui::Selectable(it.path.c_str(),
+                                      H.histItemFilter == it.itemId) &&
+                    H.histItemFilter != it.itemId) {
+                    H.histItemFilter = it.itemId;
+                    H.histGen = -1;          // refetch narrowed to this item
+                }
+                ImGui::PopID();
+            }
+            ImGui::EndCombo();
+        }
+        // person choices are the people actually present in the cached rows
+        std::vector<std::string> authors;
+        for (const auto& e : H.history)
+            if (!e.author.empty() &&
+                std::find(authors.begin(), authors.end(), e.author) == authors.end())
+                authors.push_back(e.author);
+        std::sort(authors.begin(), authors.end());
+        ImGui::SameLine();
+        if (ImGui::GetContentRegionAvail().x < authW + 8 * S) ImGui::NewLine();
+        ImGui::SetNextItemWidth(authW);
+        if (ImGui::BeginCombo("##hist_author",
+                H.histAuthorFilter.empty() ? "Anyone"
+                                           : H.histAuthorFilter.c_str())) {
+            if (ImGui::Selectable("Anyone", H.histAuthorFilter.empty()))
+                H.histAuthorFilter.clear();
+            for (const auto& a : authors)
+                if (ImGui::Selectable(a.c_str(), H.histAuthorFilter == a))
+                    H.histAuthorFilter = a;
+            ImGui::EndCombo();
+        }
+        static const char* kActor[] = {"All", "People", "AI"};
+        ImGui::SameLine();
+        if (ImGui::GetContentRegionAvail().x < 120 * S) ImGui::NewLine();
+        (void)ui::kit::segmented("##hist_actor", kActor, 3, &H.histActor);
     }
     ImGui::Separator();
     ImGui::Spacing();
@@ -1030,7 +1165,18 @@ void plmDrawHistoryPage(AppState& st) {
     ImU32 lineCol = ImGui::ColorConvertFloat4ToU32(
         ImVec4(palette.border[0], palette.border[1], palette.border[2], palette.border[3]));
     float prevY = -1.0f;
+    // client-side row filters (person, AI-vs-human) over the cached fetch
+    auto passes = [&](const PlmEntryRow& e) {
+        if (!H.histAuthorFilter.empty() && e.author != H.histAuthorFilter)
+            return false;
+        if (H.histActor == 1 && e.authorKind == "ai") return false;
+        if (H.histActor == 2 && e.authorKind != "ai") return false;
+        return true;
+    };
+    size_t matched = 0;
     for (const auto& e : H.history) {
+        if (!passes(e)) continue;
+        ++matched;
         ImGui::PushID(e.commit.c_str());
         bool sel = (H.selectedEntry == e.commit);
         bool rel = (e.kind == "release");
@@ -1093,6 +1239,10 @@ void plmDrawHistoryPage(AppState& st) {
         if (clicked) H.selectedEntry = sel ? "" : e.commit;
         ImGui::PopID();
     }
+    if (matched == 0)
+        plmEmptyState("history", "No matching entries",
+                      "Nothing in this scope matches the item, person and AI "
+                      "filters. Loosen a filter to see more history.");
     ImGui::EndChild();
 }
 
@@ -1133,73 +1283,110 @@ void plmDrawReleasesPage(AppState& st) {
     dimText("Stamp the next revision and freeze the design.");
     ImGui::Spacing();
 
-    // Header stays pinned; the release list scrolls below.
+    // Header stays pinned; the lifecycle board scrolls below.
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
     ImGui::BeginChild("##rel_scroll", ImVec2(0, 0), ImGuiChildFlags_None);
     ImGui::PopStyleVar();
     if (!H.itemsErr.empty()) { plmError(H.itemsErr); ImGui::EndChild(); return; }
+    if (H.itemsLoading && H.items.empty()) {
+        plmSpinner("Loading");
+        ImGui::EndChild();
+        return;
+    }
     if (H.items.empty() && H.gitLog.empty()) {
         plmEmptyState("(#)", "Nothing to release yet",
                       "Add a design or document, then release it here.");
         ImGui::EndChild();
         return;
     }
-    if (H.items.empty()) {
-        dimText("No documents to release yet.");
-        ImGui::Dummy(ImVec2(0, 6 * S));
+
+    // The lifecycle board: In work / Released / Superseded. Buckets come straight
+    // from each item's lifecycle; anything not yet released is in work.
+    struct Lane {
+        const char* title; const char* hint; const float* tint;
+        std::vector<const PlmItemRow*> rows;
+    };
+    Lane lanes[3] = {
+        {"In work", "Nothing waiting — everything here is released.",
+         palette.accent, {}},
+        {"Released", "No released revisions yet.", palette.statusOk, {}},
+        {"Superseded", "No revision has been replaced yet.", palette.textDim, {}},
+    };
+    for (const auto& it : H.items) {
+        if (it.lifecycle == "Released")        lanes[1].rows.push_back(&it);
+        else if (it.lifecycle == "Superseded") lanes[2].rows.push_back(&it);
+        else                                   lanes[0].rows.push_back(&it);
     }
 
-    for (const auto& it : H.items) {
+    // One card per item; the in-work lane carries the inline release form (note +
+    // plain-language failure + confirm override) — the SAME doRelease path as
+    // before, never a second implementation of release logic.
+    auto drawCard = [&](const PlmItemRow& it, int lane) {
         ImGui::PushID(it.itemId.c_str());
-        bool open = (s_releaseItem == it.itemId);
-        plmCardBegin("##rel", open, 8.0f, 6.0f,
-                     it.lifecycle == "Released" ? palette.statusOk : palette.accent, 0.13f);
+        const bool open = (s_releaseItem == it.itemId);
+        plmCardBegin("##rel", open, 8.0f, 6.0f, lanes[lane].tint, 0.13f);
         plmDocTypeTag(it.docType, it.kind);
         ImGui::SameLine();
         ImGui::AlignTextToFramePadding();
-        ImGui::TextUnformatted(it.path.c_str());
-
-        // right cluster: [rev · lifecycle]  [Release… | released] — clamp so the
-        // controls never overrun the path text in a narrow embedded card.
-        const float ctrlW = 200 * S;
-        float pinX = ImGui::GetContentRegionMax().x - ctrlW;
-        bool tight = pinX <= ImGui::GetCursorPosX() + 8 * S;
-        if (tight) { ImGui::NewLine(); } else { ImGui::SameLine(pinX); }
+        ImGui::TextWrapped("%s", it.path.c_str());
         plmLifecycleBadge(it.lifecycle, !it.rev.empty() ? it.rev : it.workingRev);
-        ImGui::SameLine(0, 12 * S);
-        if (it.lifecycle == "Released") {
-            ImGui::AlignTextToFramePadding();
-            dimText("released");
-        } else if (ImGui::SmallButton(open ? "Cancel" : "Release\xe2\x80\xa6")) {
-            s_releaseItem = open ? "" : it.itemId;
-            s_releaseNote[0] = '\0';
-            H.actionErr.clear();
-        }
-        if (open) {
-            ImGui::Indent(16 * S);
-            ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(6 * S, 4 * S));
-            ImGui::SetNextItemWidth(-1);
-            ImGui::InputTextWithHint("##relnote", "release note (what this revision is)",
-                                     s_releaseNote, sizeof(s_releaseNote));
-            ImGui::PopStyleVar();
-            accentButtonColors();
-            if (!H.busy && ImGui::Button("Release", ImVec2(120 * S, 0)))
-                doRelease(st, it.itemId, false);
-            ImGui::PopStyleColor(2);
-            if (!H.actionErr.empty()) {
-                plmError(H.actionErr);
-                ImGui::PushStyleColor(ImGuiCol_Button,
-                    ImVec4(palette.statusWarn[0], palette.statusWarn[1], palette.statusWarn[2], 0.6f));
-                if (!H.busy && ImGui::Button("Release anyway", ImVec2(140 * S, 0)))
-                    doRelease(st, it.itemId, true);
-                ImGui::PopStyleColor();
+        if (lane == 0) {
+            ImGui::SameLine(0, 12 * S);
+            if (ImGui::SmallButton(open ? "Cancel" : "Release\xe2\x80\xa6")) {
+                s_releaseItem = open ? "" : it.itemId;
+                s_releaseNote[0] = '\0';
+                H.actionErr.clear();
             }
-            if (H.busy) plmSpinner("Releasing");
-            ImGui::Unindent(16 * S);
+            if (open) {
+                ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(6 * S, 4 * S));
+                ImGui::SetNextItemWidth(-1);
+                ImGui::InputTextWithHint("##relnote",
+                                         "release note (what this revision is)",
+                                         s_releaseNote, sizeof(s_releaseNote));
+                ImGui::PopStyleVar();
+                accentButtonColors();
+                if (!H.busy && ImGui::Button("Release", ImVec2(120 * S, 0)))
+                    doRelease(st, it.itemId, false);
+                ImGui::PopStyleColor(2);
+                if (!H.actionErr.empty()) {
+                    plmError(H.actionErr);
+                    ImGui::PushStyleColor(ImGuiCol_Button,
+                        ImVec4(palette.statusWarn[0], palette.statusWarn[1],
+                               palette.statusWarn[2], 0.6f));
+                    if (!H.busy &&
+                        ImGui::Button("Release anyway", ImVec2(140 * S, 0)))
+                        doRelease(st, it.itemId, true);
+                    ImGui::PopStyleColor();
+                }
+                if (H.busy) plmSpinner("Releasing");
+            }
         }
         plmCardEnd();
         ImGui::PopID();
+    };
+    auto drawLane = [&](int lane, bool first) {
+        ui::kit::sectionHeader(lanes[lane].title, nullptr, nullptr,
+                               (int)lanes[lane].rows.size(), first);
+        if (lanes[lane].rows.empty()) dimText("%s", lanes[lane].hint);
+        for (const PlmItemRow* it : lanes[lane].rows) drawCard(*it, lane);
+    };
+
+    // Three columns when the pane is wide enough; stacked lanes when it is not
+    // (the Files page embeds this board in a half-width panel).
+    const bool wide = ImGui::GetContentRegionAvail().x >= ui::metrics::px(620.0f);
+    if (wide && ImGui::BeginTable("##rel_board", 3,
+                                  ImGuiTableFlags_SizingStretchSame |
+                                  ImGuiTableFlags_NoPadOuterX)) {
+        ImGui::TableNextRow();
+        for (int lane = 0; lane < 3; ++lane) {
+            ImGui::TableSetColumnIndex(lane);
+            drawLane(lane, true);
+        }
+        ImGui::EndTable();
+    } else {
+        for (int lane = 0; lane < 3; ++lane) drawLane(lane, lane == 0);
     }
+
     if (!H.gitLog.empty()) {
         ImGui::Dummy(ImVec2(0, 8 * S));
         plmSectionHeader("Git history", "git");

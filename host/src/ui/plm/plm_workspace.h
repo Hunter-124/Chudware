@@ -19,6 +19,11 @@ void plmSelectFilesPage();
 void plmSelectVersionsPage();
 void plmSelectGraphPage();
 void plmSelectComparePage();
+void plmSelectReleasesPage();
+
+// Start (or restart) the Project Hub guided tour band — also lets a headless
+// shot force the tour on without clicking through onboarding.
+void plmStartGuidedTour();
 
 // True while the active PLM page still has data in flight. The
 // CHUDWARE_SHOT=git capture waits on this so it photographs real content

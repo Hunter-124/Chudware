@@ -5706,9 +5706,13 @@ std::string elideToWidth(const std::string &s, float maxW) {
 
 // Grid view — structural nodes (assembly/part/doc) of the current scope's
 // visible set as responsive square cells: iso-preview tile + kind chip +
-// elided label. Click selects (inspector), double-click drills (mirrors the
-// list rows). Missing previews paint a kind-icon placeholder immediately and
-// render on demand via the .plm/thumbs disk cache (graph_thumbs).
+// elided label + vault identity (part number / lifecycle) when the manifest
+// carries it. Click selects (inspector). Double-click is the primary
+// activation: leaf design/document tiles open the underlying document
+// (st.requestOpenPath — the side panel's "Open document" routing); assembly
+// group tiles keep the drill-in navigation. Missing previews paint a
+// kind-icon placeholder immediately and render on demand via the
+// .plm/thumbs disk cache (graph_thumbs).
 void drawGridView(AppState &st, ImVec2 canvasSz) {
   auto &G = S();
   const float Sc = ui::uiScale;
@@ -5809,6 +5813,19 @@ void drawGridView(AppState &st, ImVec2 canvasSz) {
     return;
   }
 
+  // Vault identity (manifest part number / lifecycle) earns a third text
+  // line only when at least one listed tile actually carries it — projects
+  // with no vault data keep the compact two-line cell. Never invented:
+  // tiles without meta simply leave the row blank.
+  bool anyMeta = false;
+  for (int ii : items) {
+    const GNode &mn = G.nodes[ii];
+    if (!mn.metaPartNumber.empty() || !mn.metaLifecycle.empty()) {
+      anyMeta = true;
+      break;
+    }
+  }
+
   // Responsive columns: target ~168px cells, then stretch to fill the row so
   // the grid tracks the window width with no dead gutter.
   const float availW = ImGui::GetContentRegionAvail().x;
@@ -5820,8 +5837,8 @@ void drawGridView(AppState &st, ImVec2 canvasSz) {
   const float pad = 6.0f * Sc;
   const float tile = cellW - 2.0f * pad; // square preview box
   const float lineH = ImGui::GetTextLineHeight();
-  const float cellH =
-      pad + tile + 4.0f * Sc + lineH + 2.0f * Sc + lineH + 6.0f * Sc;
+  const float cellH = pad + tile + 4.0f * Sc + lineH + 2.0f * Sc + lineH +
+                      (anyMeta ? 2.0f * Sc + lineH : 0.0f) + 6.0f * Sc;
   const int rows = ((int)items.size() + cols - 1) / cols;
 
   ImDrawList *dl = ImGui::GetWindowDrawList();
@@ -5843,6 +5860,17 @@ void drawGridView(AppState &st, ImVec2 canvasSz) {
         const ImVec2 cellPos(rowPos.x + (float)col * (cellW + gap), rowPos.y);
         ImGui::SetCursorScreenPos(cellPos);
 
+        // Resolve the preview/open target once. Instance nodes resolve
+        // INSTANCE_OF first (their own path is the containing assembly), so
+        // both the thumbnail and the open action land on the instanced doc.
+        const GNode *instTgt = instanceTarget(G, n);
+        const GNode &tn = instTgt ? *instTgt : n;
+        const std::string absPath = resolveNodeAbsPath(st, tn);
+        // Assemblies are the grid's group tiles: activation keeps the
+        // drill-in navigation. Part/doc tiles are leaf documents: activation
+        // opens the document itself.
+        const bool groupTile = (n.kind == "assembly");
+
         ImGui::PushID(n.id.c_str());
         ImGui::InvisibleButton("##cell", ImVec2(cellW, cellH));
         const bool hov = ImGui::IsItemHovered();
@@ -5853,9 +5881,18 @@ void drawGridView(AppState &st, ImVec2 canvasSz) {
           if (!sameSel)
             clearBlast(G);
         }
-        if (hov && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left) &&
-            isDrillableKind(n.kind) && n.id != G.scopeDocId) {
-          drillInto(G, n.id);
+        if (hov && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
+          if (!groupTile && !absPath.empty()) {
+            // Leaf design/document tile: the primary activation opens the
+            // underlying document. requestOpenPath routes by document kind
+            // in app.cpp's pump (Model / Drawing / Simulate / Electronics),
+            // exactly like the side panel's "Open document" action.
+            st.requestOpenPath = absPath;
+          } else if (isDrillableKind(n.kind) && n.id != G.scopeDocId) {
+            // Group tile (assembly) — or a leaf whose file did not resolve —
+            // keeps the drill navigation. Single click never drills.
+            drillInto(G, n.id);
+          }
         }
 
         const ImVec2 p1(cellPos.x + cellW, cellPos.y + cellH);
@@ -5890,9 +5927,6 @@ void drawGridView(AppState &st, ImVec2 canvasSz) {
         const ImVec2 t1(t0.x + tile, t0.y + tile);
         ui::glassBackground(dl, t0, t1, 8.0f);
 
-        const GNode *instTgt = instanceTarget(G, n);
-        const GNode &tn = instTgt ? *instTgt : n;
-        const std::string absPath = resolveNodeAbsPath(st, tn);
         GraphGridThumb th;
         if (!absPath.empty()) {
           const std::string key = graphThumbKey(tn.metaDh, tn.metaMt, absPath);
@@ -5936,6 +5970,34 @@ void drawGridView(AppState &st, ImVec2 canvasSz) {
         dl->AddText(ImVec2(textX, ty), Palette::toU32(palette.text),
                     lab.c_str());
 
+        // ---- vault identity row (part number · lifecycle) ----------------
+        // The lifecycle badge is the shared hub widget, so Released reads
+        // the same green here as on the Files page and in the feature tree.
+        if (anyMeta) {
+          ty += lineH + 2.0f * Sc;
+          float mx = textX;
+          if (!n.metaPartNumber.empty()) {
+            float pnW = textW;
+            if (!n.metaLifecycle.empty())
+              pnW -=
+                  ImGui::CalcTextSize(n.metaLifecycle.c_str()).x + 8.0f * Sc;
+            const std::string pn =
+                elideToWidth(n.metaPartNumber, std::max(pnW, 24.0f * Sc));
+            dl->AddText(ImVec2(mx, ty),
+                        ui::kit::toneU32(ui::kit::Tone::Info, 1.0f),
+                        pn.c_str());
+            mx += ImGui::CalcTextSize(pn.c_str()).x + 8.0f * Sc;
+          }
+          if (!n.metaLifecycle.empty() &&
+              mx + ImGui::CalcTextSize(n.metaLifecycle.c_str()).x <=
+                  textX + textW + 1.0f) {
+            const ImVec2 keep = ImGui::GetCursorScreenPos();
+            ImGui::SetCursorScreenPos(ImVec2(mx, ty));
+            plmLifecycleBadge(n.metaLifecycle);
+            ImGui::SetCursorScreenPos(keep);
+          }
+        }
+
         if (hov) {
           ImGui::BeginTooltip();
           ImGui::TextUnformatted(n.label.c_str());
@@ -5947,6 +6009,19 @@ void drawGridView(AppState &st, ImVec2 canvasSz) {
             ImGui::TextUnformatted(n.path.c_str());
             ImGui::PopStyleColor();
           }
+          if (!n.metaPartNumber.empty() || !n.metaLifecycle.empty()) {
+            std::string idLine = n.metaPartNumber;
+            if (!n.metaLifecycle.empty()) {
+              if (!idLine.empty())
+                idLine += " \xc2\xb7 ";
+              idLine += n.metaLifecycle;
+            }
+            ImGui::PushStyleColor(ImGuiCol_Text,
+                                  ImVec4(palette.textDim[0], palette.textDim[1],
+                                         palette.textDim[2], 1.0f));
+            ImGui::TextUnformatted(idLine.c_str());
+            ImGui::PopStyleColor();
+          }
           if (th.pending) {
             ImGui::PushStyleColor(ImGuiCol_Text,
                                   ImVec4(palette.textDim[0], palette.textDim[1],
@@ -5954,6 +6029,15 @@ void drawGridView(AppState &st, ImVec2 canvasSz) {
             ImGui::TextUnformatted("Preview rendering...");
             ImGui::PopStyleColor();
           }
+          ImGui::PushStyleColor(ImGuiCol_Text,
+                                ImVec4(palette.textDisabled[0],
+                                       palette.textDisabled[1],
+                                       palette.textDisabled[2], 1.0f));
+          if (!groupTile && !absPath.empty())
+            ImGui::TextUnformatted("double-click to open in its editor");
+          else if (isDrillableKind(n.kind) && n.id != G.scopeDocId)
+            ImGui::TextUnformatted("double-click to drill in");
+          ImGui::PopStyleColor();
           ImGui::EndTooltip();
         }
 

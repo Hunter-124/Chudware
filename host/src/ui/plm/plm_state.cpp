@@ -59,6 +59,8 @@ PlmEntryRow parseEntry(const nlohmann::json& e) {
     r.scope      = getStr(e, "scope");
     r.authoredAt = getStr(e, "authored_at");
     r.author     = getActor(e, "author");
+    if (auto a = e.find("author"); a != e.end() && a->is_object())
+        r.authorKind = getStr(*a, "kind");        // "user" | "ai" (history.py §3.4)
     r.message    = getStr(e, "message");
     r.summary    = getStr(e, "summary");
     return r;
@@ -309,6 +311,7 @@ void plmEnsureHistory(AppState& st) {
     nlohmann::json p = pathParam(st);
     p["limit"] = 100;
     p["scope"] = (H.histScope == 1) ? "planning" : (H.histScope == 2) ? "all" : "design";
+    if (!H.histItemFilter.empty()) p["item_id"] = H.histItemFilter;
     st.rpc.call("plm_history", p, [gen](const core::RpcResult& r) {
         auto& H = g_plmHub;
         H.histLoading = false;
@@ -318,6 +321,38 @@ void plmEnsureHistory(AppState& st) {
         H.history.clear();
         if (auto e = r.result.find("entries"); e != r.result.end() && e->is_array())
             for (const auto& en : *e) H.history.push_back(parseEntry(en));
+    });
+}
+
+void plmEnsureWhereUsed(AppState& st) {
+    auto& H = g_plmHub;
+    if (H.wuTarget.empty()) return;
+    if (H.wuLoading || (H.wuGen == H.generation && H.wuFor == H.wuTarget)) return;
+    H.wuLoading = true;
+    const int gen = H.generation;
+    const std::string target = H.wuTarget;
+    nlohmann::json p = pathParam(st);
+    p["item_id"] = target;   // direct consumers only — never inferred relationships
+    st.rpc.call("plm_where_used", p, [gen, target](const core::RpcResult& r) {
+        auto& H = g_plmHub;
+        H.wuLoading = false;
+        H.wuGen = gen;
+        H.wuFor = target;
+        H.wuRows.clear();
+        if (!plmOk(r, H.wuErr)) return;
+        H.wuErr.clear();
+        if (auto c = r.result.find("consumers"); c != r.result.end() && c->is_array())
+            for (const auto& row : *c) {
+                if (!row.is_object()) continue;
+                PlmWhereUsedRow w;
+                w.itemId     = getStr(row, "item_id");
+                w.kind       = getStr(row, "kind");
+                w.path       = getStr(row, "path");
+                w.partNumber = getStr(row, "part_number");
+                w.via        = getStr(row, "via");
+                w.count      = row.value("count", 1);
+                H.wuRows.push_back(std::move(w));
+            }
     });
 }
 

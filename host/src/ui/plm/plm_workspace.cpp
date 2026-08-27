@@ -153,13 +153,15 @@ void plmDocTypeTag(const std::string& docType, const std::string& kind) {
 namespace {
 
 struct RailItem { PlmPage page; const char* label; const char* icon; };
-// The hub collapsed to four destinations: Files folds in History + Releases;
-// Planning folds in Milestones, Issues and Team & Sync (see plm_pages.cpp).
+// The rail's destinations. Files still folds in History + Releases side panels,
+// but Releases is ALSO reachable directly — the lifecycle board deserves the full
+// pane. Planning folds in Milestones, Issues and Team & Sync (see plm_pages.cpp).
 static const RailItem kRail[] = {
     {PlmPage::Overview, "Overview", "app"},
     {PlmPage::Files,    "Files",    "body_folder"},
     {PlmPage::Versions, "Versions", "history"},
     {PlmPage::Compare,  "Compare",  "split"},
+    {PlmPage::Releases, "Releases", "ok_badge"},
     {PlmPage::Planning, "Planning", "plan_board"},
     {PlmPage::Graph,    "Graph",    "mesh"},
     {PlmPage::Git,      "Git",      "git"},
@@ -271,21 +273,156 @@ static void drawTopNav(AppState& st) {
     }
 }
 
+// ---- guided tour ----------------------------------------------------------------
+//
+// A kit card walking the basic loop: choose a project -> save a design ->
+// checkpoint -> release. Each step reports its REAL observed state ("Done" only
+// when the cached hub data shows it happened) and names any unmet prerequisite —
+// the tour never pretends a step happened. Next/Back/Skip only navigate.
+static bool s_tourOn = false;
+static int  s_tourStep = 0;
+constexpr int kTourSteps = 4;
+
+static void drawGuidedTour(AppState& st) {
+    auto& H = g_plmHub;
+    const bool haveProject = !st.plmProjectPath().empty();
+    if (haveProject) plmEnsureItems(st);   // the release step reads item lifecycles
+
+    bool released = false;
+    for (const auto& it : H.items)
+        if (it.lifecycle == "Released") { released = true; break; }
+    bool checkpointed = false;
+    for (const auto& e : H.overview.recent)
+        if (e.kind != "auto") { checkpointed = true; break; }
+    const bool haveFiles = haveProject && H.overview.itemsCount > 0;
+
+    struct Step {
+        const char* title; const char* icon; const char* teach;
+        bool done;
+        const char* prereq;   // unmet prerequisite ("" = ready to do now)
+    };
+    const Step steps[kTourSteps] = {
+        {"Choose or create a project", "body_folder",
+         "A project is a folder — pick one with the folder button in the title "
+         "bar, or reuse a recent project from the opening page.",
+         haveProject, ""},
+        {"Save or open a design", "open",
+         "Open or save a part, assembly or document under the project folder — "
+         "it is tracked from then on (see it on the Files page).",
+         haveFiles, haveProject ? "" : "Needs a project first."},
+        {"Save a checkpoint", "save",
+         "A checkpoint records the whole project as a version you can compare "
+         "and restore — use the box on the Overview page.",
+         haveProject && checkpointed,
+         haveFiles ? "" : "Needs a project with a tracked design or document."},
+        {"Release", "ok_badge",
+         "Releasing stamps the next revision and freezes it; superseded "
+         "revisions stay in History.",
+         haveProject && released,
+         checkpointed ? "" : "Needs a design with recorded history."},
+    };
+    s_tourStep = std::min(std::max(s_tourStep, 0), kTourSteps - 1);
+    const Step& stp = steps[s_tourStep];
+
+    (void)kit::cardBegin("##plm_tour", "Guided tour", "app");
+    char cap[32];
+    std::snprintf(cap, sizeof(cap), "Step %d of %d", s_tourStep + 1, kTourSteps);
+    kit::progressBar((s_tourStep + 1) / (float)kTourSteps, cap);
+    kit::sectionHeader(stp.title, stp.icon, nullptr, -1, /*first=*/true);
+    kit::dimText(stp.teach);
+    if (stp.prereq[0]) kit::inlineStatus(stp.prereq, kit::Tone::Warn);
+    kit::chip(stp.done ? "Done" : "Not done yet",
+              stp.done ? kit::Tone::Ok : kit::Tone::Neutral, /*dot=*/true);
+    // A shortcut to where this step's action actually lives.
+    const char* go = nullptr;
+    PlmPage goPage = PlmPage::Overview;
+    if (s_tourStep == 1) { go = "Go to Files";    goPage = PlmPage::Files; }
+    if (s_tourStep == 2) { go = "Go to Overview"; goPage = PlmPage::Overview; }
+    if (s_tourStep == 3) { go = "Go to Releases"; goPage = PlmPage::Releases; }
+    if (go && haveProject) {
+        ImGui::SameLine();
+        if (kit::secondaryButton(go)) H.page = goPage;
+    }
+    kit::gapRow();
+    if (kit::secondaryButton("Back", s_tourStep > 0)) --s_tourStep;
+    ImGui::SameLine();
+    if (s_tourStep + 1 < kTourSteps) {
+        if (kit::primaryButton("Next")) ++s_tourStep;
+    } else if (kit::primaryButton("Finish")) {
+        s_tourOn = false;
+        s_tourStep = 0;
+    }
+    ImGui::SameLine();
+    if (kit::secondaryButton("Skip tour")) { s_tourOn = false; s_tourStep = 0; }
+    kit::cardEnd();
+}
+
 // ---- onboarding (no project resolvable) ---------------------------------------
 
 static void drawOnboarding(AppState& st) {
-    // The "use my workspace" offer IS the empty state's action, so it rides the kit's
-    // centred action slot instead of a hand-tinted ImGui::Button under it.
+    const float S = ui::uiScale;
     const bool haveWorkspace = !st.workspaceDir.empty();
-    ImGui::Dummy(ImVec2(0.0f, ImGui::GetContentRegionAvail().y * kPlmEmptyDropFrac));
+    ImGui::Dummy(ImVec2(0.0f, ImGui::GetContentRegionAvail().y * 0.08f));
+
+    // A centred, readable column instead of rows stretched across the whole pane.
+    const float availW = ImGui::GetContentRegionAvail().x;
+    const float colW = std::min(availW, 560.0f * S);
+    ImGui::SetCursorPosX(ImGui::GetCursorPosX() + (availW - colW) * 0.5f);
+    ImGui::BeginChild("##plm_onboard", ImVec2(colW, 0), ImGuiChildFlags_AutoResizeY,
+                      ImGuiWindowFlags_NoScrollbar);
+
+    // The "use my workspace" offer IS the empty state's action, so it rides the
+    // kit's centred action slot instead of a hand-tinted button under it.
     if (kit::emptyState(
             "open", "Open a project folder",
-            "Use the folder button (top-right) to pick an existing project folder. "
-            "If the folder already has a .aicadvault, it is reused — history is never "
-            "reinitialized. Opening the same folder again is safe and idempotent. "
-            "You can also open or save a document under a folder to start history there.",
+            "Pick a folder with the folder button (top-right). A folder that "
+            "already holds a project is reused — history is never reinitialized.",
             haveWorkspace ? "Use my workspace folder" : nullptr))
         setActiveProjectDir(st, st.workspaceDir);
+
+    // The whole model, one sentence each.
+    kit::gapSection();
+    struct Lesson { const char* name; const char* line; };
+    static const Lesson kLessons[] = {
+        {"Project", "A project is a folder — Chudware keeps its history in a "
+                    "hidden vault inside it."},
+        {"History", "Every save and checkpoint becomes a version you can compare "
+                    "and restore."},
+        {"Release", "Releasing stamps the design as a frozen revision; later work "
+                    "supersedes it without losing anything."},
+    };
+    for (const auto& l : kLessons) {
+        kit::chip(l.name, kit::Tone::Accent);
+        ImGui::SameLine();
+        kit::dimText(l.line);
+    }
+
+    // Recent projects — one click back into anything opened before.
+    if (!st.recentProjects.empty()) {
+        kit::sectionHeader("Recent projects", "history");
+        std::string activate;   // applied after the loop: activation reorders the list
+        for (const auto& p : st.recentProjects) {
+            std::string name = p;
+            while (!name.empty() && (name.back() == '/' || name.back() == '\\'))
+                name.pop_back();
+            const size_t cut = name.find_last_of("/\\");
+            if (cut != std::string::npos) name = name.substr(cut + 1);
+            kit::RowStyle rs;
+            rs.icon = "body_folder";
+            rs.secondary = p.c_str();
+            ImGui::PushID(p.c_str());
+            if (kit::row("##recent_proj", name.c_str(), rs)) activate = p;
+            ImGui::PopID();
+        }
+        if (!activate.empty()) setActiveProjectDir(st, activate);
+    }
+
+    kit::gapSection();
+    if (kit::secondaryButton("Start the guided tour")) {
+        s_tourOn = true;
+        s_tourStep = 0;
+    }
+    ImGui::EndChild();
 }
 
 } // anonymous namespace
@@ -299,6 +436,12 @@ void plmSelectFilesPage() { g_plmHub.page = PlmPage::Files; }
 void plmSelectGraphPage() { g_plmHub.page = PlmPage::Graph; }
 void plmSelectVersionsPage() { g_plmHub.page = PlmPage::Versions; }
 void plmSelectComparePage() { g_plmHub.page = PlmPage::Compare; }
+void plmSelectReleasesPage() { g_plmHub.page = PlmPage::Releases; }
+
+void plmStartGuidedTour() {
+    s_tourOn = true;
+    s_tourStep = 0;
+}
 
 // Whatever page is showing, is it still waiting on data? Only the fetches that
 // gate visible content count — this is the headless capture's "settled" signal.
@@ -309,6 +452,7 @@ bool plmBusy() {
         case PlmPage::Overview: return H.ovLoading || H.gitLoading || H.planLoading;
         case PlmPage::Planning:
         case PlmPage::Issues:   return H.planLoading;
+        case PlmPage::Releases: return H.gitLoading;
         case PlmPage::Git:      return H.gitLoading;
         case PlmPage::Compare:  return plmCompareBusy();
         case PlmPage::Versions: return H.versionsGraph.loading;
@@ -332,6 +476,20 @@ void drawPlmWorkspace(AppState& st) {
         plmInvalidate();
         plmGraphOnProjectChanged();
         plmVersionsOnProjectChanged();
+    }
+    // The guided tour rides above whatever the workspace shows — including the
+    // onboarding page, where its first step (choose a project) happens.
+    if (s_tourOn) {
+        const float TM = 10.0f * S;
+        ImGui::Dummy(ImVec2(0, 3 * S));
+        ImGui::Indent(TM);
+        ImGui::BeginChild("##plm_tour_band", ImVec2(-TM, 0),
+                          ImGuiChildFlags_AutoResizeY,
+                          ImGuiWindowFlags_NoScrollbar |
+                          ImGuiWindowFlags_NoScrollWithMouse);
+        drawGuidedTour(st);
+        ImGui::EndChild();
+        ImGui::Unindent(TM);
     }
     if (proj.empty()) { drawOnboarding(st); return; }
 

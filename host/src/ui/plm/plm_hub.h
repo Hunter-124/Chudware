@@ -33,7 +33,7 @@ struct PlmItemRow {
 };
 
 struct PlmEntryRow {
-    std::string commit, kind, scope, authoredAt, author, message, summary;
+    std::string commit, kind, scope, authoredAt, author, authorKind, message, summary;
 };
 
 struct PlmTaskRow {
@@ -46,6 +46,12 @@ struct PlmIssueRow {
 
 struct PlmMilestoneRow {
     std::string id, title, status, due;
+};
+
+// One direct consumer from plm_where_used (derived, never stored — services/plm/whereused.py).
+struct PlmWhereUsedRow {
+    std::string itemId, kind, path, partNumber, via;   // via: "component" | "source"
+    int count = 1;                                     // reference multiplicity
 };
 
 // ---- Git tab row shapes (parsed from the git_* envelopes) ---------------------
@@ -154,8 +160,17 @@ struct PlmHubState {
     // history (History page)
     int         histGen = -1; bool histLoading = false; std::string histErr;
     int         histScope = 0;            // 0 design | 1 planning | 2 all
+    std::string histItemFilter;           // item_id ("" = all items) — refetches server-side
+    std::string histAuthorFilter;         // author display name ("" = anyone) — client-side
+    int         histActor = 0;            // 0 all | 1 people | 2 AI — client-side
     std::vector<PlmEntryRow> history;
     std::string selectedEntry;
+
+    // where-used explorer (Files page) — cached consumers of one item
+    std::string wuTarget;                 // item whose consumers are shown ("" = closed)
+    std::string wuFor;                    // item the cache was actually fetched for
+    int         wuGen = -1; bool wuLoading = false; std::string wuErr;
+    std::vector<PlmWhereUsedRow> wuRows;
 
 
     // planning (Planning/Issues pages)
@@ -250,6 +265,7 @@ std::string plmProjectName(AppState& st);    // display name of the current proj
 void        plmEnsureOverview(AppState& st);
 void        plmEnsureItems(AppState& st);
 void        plmEnsureHistory(AppState& st);
+void        plmEnsureWhereUsed(AppState& st);   // fetches for g_plmHub.wuTarget
 void        plmEnsureVersionGraph(AppState& st);
 void        plmEnsurePlanning(AppState& st);
 void        plmEnsureSettings(AppState& st);

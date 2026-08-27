@@ -684,6 +684,10 @@ void loadSettings(Settings& s) {
         if (auto it = j.find("recent_files"); it != j.end() && it->is_array())
             for (const auto& e : *it)
                 if (e.is_string()) s.recentFiles.push_back(e.get<std::string>());
+        s.recentProjects.clear();
+        if (auto it = j.find("recent_projects"); it != j.end() && it->is_array())
+            for (const auto& e : *it)
+                if (e.is_string()) s.recentProjects.push_back(e.get<std::string>());
         // Box.com project mirror. Only GUI-owned fields are modeled here; OAuth tokens in
         // box.auth stay on disk and are preserved by applyGuiOwnedSettings().
         auto box = j.value("box", nlohmann::json::object());
@@ -1104,6 +1108,7 @@ static void applyGuiOwnedSettings(nlohmann::json& j, const Settings& s) {
     // Wave 3: File Explorer workspace + Recent files.
     if (!s.workspaceDir.empty()) j["workspace_dir"] = s.workspaceDir;
     j["recent_files"] = s.recentFiles;
+    j["recent_projects"] = s.recentProjects;
     // Box.com mirror. Merge-overlay both levels so Python-owned OAuth tokens and unknown
     // future fields survive every GUI settings write.
     boxOut["enabled"] = s.boxEnabled;
@@ -1391,6 +1396,30 @@ void AppState::pushRecentFile(const std::string& path) {
     recentFiles.insert(recentFiles.begin(), path);
     if (recentFiles.size() > kRecentFilesMax) recentFiles.resize(kRecentFilesMax);
     settings.recentFiles = recentFiles;   // mirror so saveSettings serializes the live list
+    saveSettings(settings);
+}
+
+void AppState::pushRecentProject(const std::string& path) {
+    if (path.empty()) return;
+    auto samePath = [](const std::string& a, const std::string& b) {
+        if (a.size() != b.size()) return false;
+        for (size_t i = 0; i < a.size(); ++i) {
+            char ca = a[i], cb = b[i];
+            if (ca == '/') ca = '\\';
+            if (cb == '/') cb = '\\';
+            if (std::tolower((unsigned char)ca) != std::tolower((unsigned char)cb))
+                return false;
+        }
+        return true;
+    };
+    recentProjects.erase(
+        std::remove_if(recentProjects.begin(), recentProjects.end(),
+                       [&](const std::string& entry) { return samePath(entry, path); }),
+        recentProjects.end());
+    recentProjects.insert(recentProjects.begin(), path);
+    if (recentProjects.size() > kRecentProjectsMax)
+        recentProjects.resize(kRecentProjectsMax);
+    settings.recentProjects = recentProjects;
     saveSettings(settings);
 }
 
@@ -3002,7 +3031,8 @@ void setActiveProjectDir(AppState& st, const std::string& absDir) {
     st.plmProjectDir = absDir;
     st.workspaceDir = absDir;
     st.settings.workspaceDir = absDir;
-    saveSettings(st.settings);   // persist workspace_dir into config.json
+    st.pushRecentProject(absDir);
+    st.activeWorkspace = AppState::Workspace::PLM;
     ui::plmInvalidate();         // drop PLM caches → refetch against the new dir
     // Capture drift since last session (files copied in / edited outside). Best
     // effort — a failure must never block the switch.

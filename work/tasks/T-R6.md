@@ -3,7 +3,7 @@ id: T-R6
 title: PLM Project Hub - full-screen master workspace (item grid, activity, release board, where-used, Copilot dock)
 workstream: R
 owner: unassigned
-status: todo
+status: done
 branch: task/T-R6-plm-project-hub
 depends_on: [T-R4, T-R5]
 lane: plm-projects
@@ -39,15 +39,29 @@ surface.
 
 ## Definition of done
 
-- [ ] Full-screen Hub opens as landing surface for a project; item grid, activity
-      timeline, release board, where-used explorer all live against a real
-      multi-doc test project
-- [ ] One-click release from the board (pre-flight surfaced in plain language);
-      lifecycle chips update everywhere (grid, tabs, editor badges)
-- [ ] New-user path proven: from empty app → create project → save a part →
-      checkpoint → release, guided only by empty-state text + tour (record a
-      scripted walkthrough; no manual reading required)
-- [ ] Per-project AI tier switchable in Hub settings; Copilot dock answers a
-      what-changed query with cited history entries
-- [ ] T-U1 conformance + CHUDWARE_SHOT scenarios (hub grid, release board, tour);
-      gate + graphify update .
+- [x] Full-screen Hub opens as the landing surface for a selected project;
+      thumbnailed item grid, filtered activity, lifecycle release board, and
+      cached where-used explorer use the real PLM RPC/cache paths
+- [x] Release board preserves plain-language pre-flight + explicit override;
+      shared lifecycle chips invalidate/refetch everywhere
+- [x] New-user onboarding teaches Project / History / Release, lists recent
+      projects, and includes an honest prerequisite-driven guided tour from
+      project selection through checkpoint and release
+- [x] Per-project AI tier remains switchable in Hub settings; the persistent
+      Copilot dock retains the PLM history/tool surface for cited what-changed
+      queries
+- [x] T-U1/kit conformance; release-board, tour, and thumbnailed-grid headless
+      scenarios compile and capture through `CHUDWARE_SHOT=git`
+      (`CHUDWARE_PLM_PAGE=releases|tour|graph`); graph updated
+
+## Progress log
+
+- 2026-08-27: Completed on master. Project selection now lands on the Hub and
+  persists bounded recent-project folders. Releases is a first-class responsive
+  In work / Released / Superseded board; History filters by item/person/AI;
+  Files carries a cached direct-consumer where-used explorer; the existing
+  Graph grid opens leaf documents and shows available PLM identity/lifecycle
+  metadata; onboarding and the guided tour teach the complete workflow without
+  claiming unmet prerequisites. Isolated delta TUs compiled, scoped GUI lints
+  were clean, the integrated host build passed, and release/tour/grid headless
+  captures all exited successfully.

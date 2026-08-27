@@ -23,7 +23,9 @@
 #include <functional> // T-G9 parity trace secret redaction
 #include <cwchar> // _wcsnicmp for the Win32 child env block
 #include <string>
+#include <shared_mutex>
 #include <vector>
+#include <unordered_map>
 #if defined(_WIN32)
 #include <filesystem>
 #endif
@@ -38,6 +40,149 @@
 using nlohmann::json;
 
 namespace {
+
+struct LiveRoute {
+  std::string path;
+  std::string remoteId;
+  std::string itemId;
+  json participant;
+};
+
+std::mutex g_liveRoutesMtx;
+std::shared_mutex g_liveDispatchMtx;
+std::unordered_map<std::string, LiveRoute> g_liveRoutes;
+
+std::string liveString(const json &value, const char *key) {
+  if (!value.is_object())
+    return {};
+  const auto it = value.find(key);
+  return (it != value.end() && it->is_string()) ? it->get<std::string>()
+                                                 : std::string();
+}
+
+std::string livePath(const json &params) {
+  std::string value = liveString(params, "path");
+  return value.empty() ? liveString(params, "project_dir") : value;
+}
+
+std::string liveRemoteId(const json &params) {
+  std::string value = liveString(params, "remote_id");
+  if (value.empty())
+    value = liveString(params, "remote");
+  return value.empty() ? std::string("origin") : value;
+}
+
+std::string liveItemId(const json &params) {
+  std::string value = liveString(params, "item_id");
+  return value.empty() ? liveString(params, "item") : value;
+}
+
+json liveParticipant(const json &params) {
+  if (!params.is_object())
+    return nullptr;
+  const auto participant = params.find("participant");
+  if (participant != params.end() && !participant->is_null())
+    return *participant;
+
+  const std::string id = liveString(params, "participant_id");
+  std::string display = liveString(params, "participant_display");
+  if (display.empty())
+    display = liveString(params, "display_name");
+  if (id.empty() && display.empty())
+    return nullptr;
+
+  json value = {{"id", id}, {"display", display}, {"account_id", nullptr}};
+  const auto account = params.find("account_id");
+  if (account != params.end() && !account->is_null())
+    value["account_id"] = *account;
+  return value;
+}
+
+bool sameLiveIdentity(const LiveRoute &route, const std::string &path,
+                      const std::string &remoteId,
+                      const std::string &itemId) {
+  return route.path == path && route.remoteId == remoteId &&
+         route.itemId == itemId;
+}
+
+bool findLiveRoute(const json &params, LiveRoute &route) {
+  if (!params.is_object())
+    return false;
+  const auto id = params.find("doc_id");
+  if (id == params.end() || !id->is_string())
+    return false;
+  std::lock_guard<std::mutex> lock(g_liveRoutesMtx);
+  const auto found = g_liveRoutes.find(id->get<std::string>());
+  if (found == g_liveRoutes.end())
+    return false;
+  route = found->second;
+  return true;
+}
+
+bool successfulLiveEnvelope(const json &result) {
+  if (!result.is_object())
+    return false;
+  const auto ok = result.find("ok");
+  return ok != result.end() && ok->is_boolean() && ok->get<bool>();
+}
+
+void registerLiveRoute(const json &params, const json &result) {
+  const std::string localDocId = liveString(result, "local_doc_id");
+  if (localDocId.empty())
+    return;
+
+  LiveRoute route;
+  route.path = livePath(params);
+  route.remoteId = liveString(result, "remote_id");
+  if (route.remoteId.empty())
+    route.remoteId = liveRemoteId(params);
+  route.itemId = liveString(result, "item_id");
+  if (route.itemId.empty())
+    route.itemId = liveItemId(params);
+  const auto returnedParticipant =
+      result.is_object() ? result.find("participant") : result.end();
+  route.participant =
+      (result.is_object() && returnedParticipant != result.end())
+          ? *returnedParticipant
+          : liveParticipant(params);
+
+  const std::string requestedDocId = liveString(params, "local_doc_id");
+  std::lock_guard<std::mutex> lock(g_liveRoutesMtx);
+  for (auto it = g_liveRoutes.begin(); it != g_liveRoutes.end();) {
+    if ((!requestedDocId.empty() && it->first == requestedDocId) ||
+        sameLiveIdentity(it->second, route.path, route.remoteId, route.itemId)) {
+      if (route.participant.is_null())
+        route.participant = it->second.participant;
+      it = g_liveRoutes.erase(it);
+    } else {
+      ++it;
+    }
+  }
+  g_liveRoutes[localDocId] = std::move(route);
+}
+
+void removeLiveRoutes(const json &params) {
+  const std::string path = livePath(params);
+  const std::string remoteId = liveRemoteId(params);
+  const std::string itemId = liveItemId(params);
+  std::lock_guard<std::mutex> lock(g_liveRoutesMtx);
+  for (auto it = g_liveRoutes.begin(); it != g_liveRoutes.end();) {
+    if (sameLiveIdentity(it->second, path, remoteId, itemId))
+      it = g_liveRoutes.erase(it);
+    else
+      ++it;
+  }
+}
+
+json liveMethodError(const json &response) {
+  std::string code = liveString(response, "reason");
+  if (code.empty())
+    code = "live_proposal_refused";
+  std::string message = liveString(response, "hint");
+  if (message.empty())
+    message = code;
+  return json{{"code", code}, {"message", message}, {"detail", response}};
+}
 
 // In-process live event streaming (desktop InProcCore path): bridge cpp_core's
 // thread-local C event sink to the current call's EventFn so agent-run events
@@ -1112,6 +1257,98 @@ WorkerClient::ReadLineResult WorkerClient::readLine(std::string &line,
 #endif // platform
 }
 
+bool WorkerClient::liveDocJoined(const std::string &docId) const {
+  std::shared_lock<std::shared_mutex> order(g_liveDispatchMtx);
+  std::lock_guard<std::mutex> lock(g_liveRoutesMtx);
+  return g_liveRoutes.find(docId) != g_liveRoutes.end();
+}
+
+void WorkerClient::clearLiveDocRoute(const std::string &docId) {
+  std::unique_lock<std::shared_mutex> order(g_liveDispatchMtx);
+  std::lock_guard<std::mutex> lock(g_liveRoutesMtx);
+  g_liveRoutes.erase(docId);
+}
+
+void WorkerClient::clearLiveDocRoutes() {
+  std::unique_lock<std::shared_mutex> order(g_liveDispatchMtx);
+  std::lock_guard<std::mutex> lock(g_liveRoutesMtx);
+  g_liveRoutes.clear();
+}
+
+bool WorkerClient::callWithLiveRouting(const std::string &method,
+                                       const json &params, json &result,
+                                       std::string &err, int timeoutMs,
+                                       const EventFn &onEvent) {
+  LiveRoute route;
+  // Linearize route publication/removal with both synchronous calls and
+  // AsyncRpc workers. Ordinary document calls may run concurrently; join and
+  // leave wait for all earlier doc_apply_ops calls and publish their route
+  // change before any later one can choose a backend.
+  std::shared_lock<std::shared_mutex> docOrder;
+  std::unique_lock<std::shared_mutex> lifecycleOrder;
+  if (method == "doc_apply_ops")
+    docOrder = std::shared_lock<std::shared_mutex>(g_liveDispatchMtx);
+  else if (method == "plm_live_join" || method == "plm_live_leave")
+    lifecycleOrder = std::unique_lock<std::shared_mutex>(g_liveDispatchMtx);
+
+  if (method == "doc_apply_ops" && findLiveRoute(params, route)) {
+    json proposalParams = {
+        {"path", route.path},
+        {"remote_id", route.remoteId},
+        {"item_id", route.itemId},
+        {"participant", route.participant},
+        {"ops", nullptr},
+    };
+    if (params.is_object()) {
+      const auto ops = params.find("ops");
+      if (ops != params.end())
+        proposalParams["ops"] = *ops;
+    }
+
+    json proposalResult;
+    if (!callImpl("plm_live_propose", proposalParams, proposalResult, err,
+                  timeoutMs, onEvent))
+      return false;
+
+    // A protocol-2 method error from the generic worker seam is already in the
+    // shape DocMirror expects. A PLM contract refusal is a plain
+    // {ok:false,reason,hint} envelope, so adapt it without ever falling through
+    // to the local doc engine.
+    if (proposalResult.is_object() && proposalResult.contains("code")) {
+      result = std::move(proposalResult);
+      err = result.value("message", std::string("live proposal failed"));
+      return true;
+    }
+    if (!successfulLiveEnvelope(proposalResult)) {
+      result = liveMethodError(proposalResult);
+      err = result.value("message", std::string("live proposal failed"));
+      return true;
+    }
+
+    const auto opsResponse = proposalResult.find("ops_response");
+    if (opsResponse == proposalResult.end() || !opsResponse->is_object()) {
+      result = json{{"code", "live_protocol_error"},
+                    {"message",
+                     "The live proposal response omitted its ops response."},
+                    {"detail", proposalResult}};
+      err = result["message"].get<std::string>();
+      return true;
+    }
+    result = *opsResponse;
+    return true;
+  }
+
+  const bool ok =
+      callImpl(method, params, result, err, timeoutMs, onEvent);
+  if (!ok)
+    return false;
+  if (method == "plm_live_join" && successfulLiveEnvelope(result))
+    registerLiveRoute(params, result);
+  else if (method == "plm_live_leave" && successfulLiveEnvelope(result))
+    removeLiveRoutes(params);
+  return true;
+}
+
 // T-G9 parity trace: with CHUDWARE_RPC_TRACE=<file> set, every call() appends one
 // JSONL record {method, params, ok, result|err}. This is the single funnel all
 // panel RPCs pass through regardless of routing (Python worker subprocess,
@@ -1124,9 +1361,10 @@ bool WorkerClient::call(const std::string &method, const json &params,
                         const EventFn &onEvent) {
   static const char *tracePath = std::getenv("CHUDWARE_RPC_TRACE");
   if (!tracePath || !*tracePath)
-    return callImpl(method, params, result, err, timeoutMs, onEvent);
+    return callWithLiveRouting(method, params, result, err, timeoutMs, onEvent);
 
-  const bool ok = callImpl(method, params, result, err, timeoutMs, onEvent);
+  const bool ok =
+      callWithLiveRouting(method, params, result, err, timeoutMs, onEvent);
   try {
     // Redact credential-bearing fields recursively (agent_list_models et al
     // carry api_key/base_url auth material) — trace files must never hold live

@@ -1404,12 +1404,14 @@ const char* teamKindLabel(const std::string& kind) {
     if (kind == "folder")         return "Shared folder";
     if (kind == "ssh")            return "Server (SSH)";
     if (kind == "https")          return "Server (HTTPS)";
+    if (kind == "plm-server")     return "Live server";
     if (kind == "chudware-cloud") return "Chudware Cloud";
     return "Shared location";
 }
 
 const char* teamKindIcon(const std::string& kind) {
     if (kind == "folder")         return "body_folder";
+    if (kind == "plm-server")     return "team";
     if (kind == "chudware-cloud") return "app";
     return "vendor_globe";
 }
@@ -1636,6 +1638,12 @@ void drawRemoteCard(AppState& st, const PlmRemoteRow& rm) {
         ImGui::SameLine();
         ui::kit::chip("Not yet available", ui::kit::Tone::Warn, /*dot=*/true);
     }
+    if (rm.canLive) {
+        ImGui::SameLine();
+        ui::kit::chip("Live editing", ui::kit::Tone::Ok, /*dot=*/true,
+                      "Everyone edits one design together \xe2\x80\x94 the server "
+                      "keeps a single ordered history. No Sync, no locks.");
+    }
     if (rm.canLock) {
         ImGui::SameLine();
         ui::kit::chip("Editing locks", ui::kit::Tone::Ok, /*dot=*/true,
@@ -1648,7 +1656,47 @@ void drawRemoteCard(AppState& st, const PlmRemoteRow& rm) {
         ui::kit::keyValueRow("You appear as", rm.identityDisplay.c_str());
 
     const bool syncing = (H.syncingRemote == rm.id);
-    if (syncing) {
+    if (rm.canLive) {
+        // A live server orders every edit itself — there is nothing to Sync and
+        // no advisory lock to take. The card shows the session instead.
+        auto& L = H.live;
+        const bool here = L.joined && L.remoteId == rm.id;
+        if (here) {
+            ui::kit::chip(L.connected ? "LIVE" : "LIVE \xc2\xb7 reconnecting",
+                          L.connected ? ui::kit::Tone::Ok : ui::kit::Tone::Warn,
+                          /*dot=*/true,
+                          L.connected
+                              ? "This machine is in a live editing session."
+                              : "The connection dropped \xe2\x80\x94 reconnecting; "
+                                "edits resume once it is back.");
+            std::string itemName = L.itemId;
+            for (const auto& it : H.items)
+                if (it.itemId == L.itemId) {
+                    if (!it.path.empty()) itemName = it.path;
+                    break;
+                }
+            ui::kit::keyValueRow("Editing live", itemName.c_str());
+            std::string who;
+            for (const auto& peer : L.peers) {
+                if (!who.empty()) who += ", ";
+                who += peer.display;
+            }
+            ui::kit::keyValueRow("Also here",
+                                 who.empty() ? "no one else yet" : who.c_str());
+            if (L.leaving)
+                ui::kit::spinner("Leaving");
+            else if (ui::kit::secondaryButton("Leave live editing"))
+                plmLiveLeave(st);
+        } else if (L.joining && L.remoteId == rm.id) {
+            ui::kit::spinner("Joining live session");
+        } else {
+            dimText("Open a tracked document and pick \"Join live editing\" from "
+                    "its PLM chip \xe2\x80\x94 everyone in the session sees one "
+                    "design, ordered by this server.");
+        }
+        if (!L.err.empty() && L.remoteId == rm.id)
+            ui::kit::inlineStatus(L.err.c_str(), ui::kit::Tone::Err);
+    } else if (syncing) {
         ui::kit::spinner("Syncing");
     } else if (rm.reserved) {
         (void)ui::kit::primaryButton("Sync now", false,
@@ -1660,7 +1708,7 @@ void drawRemoteCard(AppState& st, const PlmRemoteRow& rm) {
                                                : "Another sync is still running"))
             doTeamSync(st, rm.id);
     }
-    if (!syncing && H.lastSyncRemote == rm.id && !H.lastSyncMsg.empty()) {
+    if (!rm.canLive && !syncing && H.lastSyncRemote == rm.id && !H.lastSyncMsg.empty()) {
         ui::kit::inlineStatus(H.lastSyncMsg.c_str(),
                               H.lastSyncOk ? ui::kit::Tone::Ok : ui::kit::Tone::Err);
         for (const auto& n : H.lastSyncCopies) {

@@ -60,16 +60,51 @@ struct PlmWhereUsedRow {
 // optional identity is how THIS machine appears to the team on that location;
 // capabilities say what the service can actually do against it.
 struct PlmRemoteRow {
-    std::string id, kind, url, name;   // kind: folder | ssh | https | chudware-cloud
+    std::string id, kind, url, name;   // kind: folder | ssh | https | plm-server | chudware-cloud
     bool reserved = false;             // chudware-cloud config-only seam (§6.1)
     std::string identityUserId, identityDisplay, identityAccountId;
     bool canSync = false;              // capabilities: "snapshot_sync"
     bool canLock = false;              // capabilities: "advisory_locks"
+    bool canLive = false;              // capabilities: "live_coedit" (kind "plm-server") —
+                                       // live editing replaces T-R7 Sync/lock controls entirely
 };
 
 // One advisory lock (§6.2) — a courtesy presence signal, never a hard block.
 struct PlmLockRow {
     std::string itemId, userId, display, accountId, acquiredAt, expiresAt;
+};
+
+// ---- live co-editing session (plm-server profiles — contracts/plm_live.md) -----
+
+// One OTHER participant in the joined live session — the union of the join
+// roster and later presence broadcasts, keyed by participant id.
+struct PlmLivePeerRow {
+    std::string id, display;
+};
+
+// The one live item session this GUI holds (at most one — the active document's).
+// Ordinary doc_apply_ops on the joined doc are routed through plm_live_propose by
+// WorkerClient (the single server order); committed batches come back through the
+// existing hostd doc.changed pipeline. This state is presentation + pacing only —
+// it is never a second op sender and never patches a tree.
+struct PlmLiveState {
+    bool        joined  = false;
+    bool        joining = false;          // plm_live_join in flight
+    bool        leaving = false;          // plm_live_leave in flight
+    std::string projectDir, remoteId, itemId;   // session key
+    std::string remoteName;               // live remote's display name
+    std::string sessionId;
+    std::string docId;                    // local worker doc bound to the session
+    std::string selfId, selfDisplay;      // this seat's participant identity
+    long long   lastSeq = 0;              // authoritative sequence applied locally
+    bool        connected = false;        // transport state from the last poll (honest)
+    std::string err;                      // last plain-language failure ("" = none)
+    std::vector<PlmLivePeerRow> peers;    // other participants (bounded)
+    // pacing (ImGui clock) — poll/presence are bounded, async, and never block a frame
+    double      lastPollAt = -1.0e9;          bool pollInFlight = false;
+    double      lastPresenceCheckAt = -1.0e9; bool presenceInFlight = false;
+    double      lastPresenceSentAt = -1.0e9;
+    std::string presenceSig;              // last payload sent (skip unchanged)
 };
 
 // ---- Git tab row shapes (parsed from the git_* envelopes) ---------------------
@@ -244,6 +279,9 @@ struct PlmHubState {
     char        shareDisplay[128] = {};
     int         shareKind = 0;            // 0 folder | 1 ssh | 2 https (cloud disabled)
 
+    // live co-editing session (plm-server profiles — see PlmLiveState above)
+    PlmLiveState live;
+
     // transient action state / input buffers
     char        checkpointMsg[256] = {};
     bool        busy = false;             // a mutation is in flight
@@ -314,6 +352,24 @@ std::string plmNiceTime(const std::string& iso);   // "2026-07-07T19:54:28Z" -> 
 // tool vocabulary never reaches the user (contract §8.1): unknown reasons whose
 // hint reads technical degrade to a generic message.
 std::string plmTeamFriendlyError(const std::string& reason, const std::string& hint);
+// ---- live co-editing (plm-server profiles — defined in plm_state.cpp) ----------
+// The first live-capable shared location (kind "plm-server" advertising
+// live_coedit). nullptr = none configured. Live remotes never offer T-R7
+// Sync/lock controls — the session replaces both.
+const PlmRemoteRow* plmTeamLiveRemote();
+// True while this GUI holds the live session for that item.
+bool plmLiveJoinedItem(const std::string& itemId);
+// Join the item's authoritative live session, binding the active mirror doc
+// (st.docMirror.docId()). A replacement local_doc_id + open_response in the join
+// reply is adopted into the active mirror/tab atomically (DocMirror::
+// adoptOpenResponse) BEFORE joined state is presented.
+void plmLiveJoin(AppState& st, const PlmRemoteRow& rm, const std::string& itemId);
+void plmLiveLeave(AppState& st);
+// Per-frame while joined: bounded async event/status poll + bounded best-effort
+// presence from the current selection/viewport. Consumes complete envelopes
+// only; never patches a tree (commits arrive whole via hostd doc.changed) and
+// never blocks a frame.
+void plmLiveTick(AppState& st);
 // convenience: build the {"path": …} param object for the current project.
 
 // ---- page bodies (defined in plm_pages.cpp) -----------------------------------

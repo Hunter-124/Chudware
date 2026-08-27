@@ -186,7 +186,7 @@ graph TD
     T_R5["T-R5: PLM in-editor GUI - history timeline panel, rev badges, checkpoint/release toolbar, compare view (all doc kinds)"]:::done
     T_R6["T-R6: PLM Project Hub - full-screen master workspace (item grid, activity, release board, where-used, Copilot dock)"]:::done
     T_R7["T-R7: PLM sharing & team sync v1 - remote profiles, one-button Sync, advisory locks, copy-as-variant conflicts"]:::done
-    T_R8["T-R8: Self-hosted PLM server + live co-editing — two people in the same part, no locks"]:::doing
+    T_R8["T-R8: Self-hosted PLM server + live co-editing — two people in the same part, no locks"]:::done
   end
   subgraph WS_RE["workstream RE"]
     RE_00["RE-00: Reveng contracts + schemas + DAG templates + anchors"]:::done

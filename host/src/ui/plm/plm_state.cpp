@@ -5,6 +5,7 @@
 // g_plmHub.generation; each ensureX refetches when its cached generation is stale.
 // All calls pass {"path": st.plmProjectPath()} — the vault worker is path-addressed.
 #include "plm_hub.h"
+#include <cmath>
 #include <algorithm>
 #include <cstdio>
 #include <ctime>
@@ -231,12 +232,18 @@ PlmRemoteRow parseRemote(const nlohmann::json& x) {
             const std::string s = cap.get<std::string>();
             if (s == "snapshot_sync")  r.canSync = true;
             if (s == "advisory_locks") r.canLock = true;
+            if (s == "live_coedit")    r.canLive = true;
         }
     } else {
         // Profile predating capabilities: sync always existed; never advertise
         // locks the service has not confirmed.
         r.canSync = !r.reserved;
     }
+    // Live editing is kind + capability driven (manifest.remote_mode). A live
+    // remote's own snapshot capability is server-internal: T-R7 sync/locks against
+    // it are refused (live_join_required), so never advertise those controls.
+    r.canLive = r.canLive && r.kind == "plm-server";
+    if (r.canLive) { r.canSync = false; r.canLock = false; }
     return r;
 }
 
@@ -302,7 +309,13 @@ bool plmLockLive(const PlmLockRow& l) {
 
 const PlmRemoteRow* plmTeamLockRemote() {
     for (const auto& rm : g_plmHub.remotes)
-        if (rm.canLock && !rm.reserved) return &rm;
+        if (rm.canLock && !rm.reserved && !rm.canLive) return &rm;
+    return nullptr;
+}
+
+const PlmRemoteRow* plmTeamLiveRemote() {
+    for (const auto& rm : g_plmHub.remotes)
+        if (rm.canLive && !rm.reserved) return &rm;
     return nullptr;
 }
 
@@ -710,6 +723,293 @@ void plmEnsureTeam(AppState& st) {
             for (const auto& x : *ls)
                 if (x.is_object()) H.locks.push_back(parseLock(x));
     });
+}
+
+// ---- live co-editing (plm-server profiles — contracts/plm_live.md) --------------
+//
+// The GUI holds at most ONE live item session: the active document's. Joining
+// binds the already-open mirror doc; ordinary doc_apply_ops on a joined doc are
+// routed through plm_live_propose by WorkerClient (services/worker), so nothing
+// here sends ops. Incoming commits are applied by the Python live manager as one
+// whole doc_apply_ops and reach the viewport through the existing hostd
+// doc.changed pipeline — this file only consumes COMPLETE poll/presence
+// envelopes for status and never patches a tree (no-torn-preview rule).
+
+namespace {
+
+constexpr double kLivePollEveryS     = 1.0;   // bounded event/status drain
+constexpr double kLivePresenceEveryS = 2.0;   // bounded best-effort presence checks
+constexpr double kLivePresenceIdleS  = 20.0;  // unchanged-payload heartbeat
+constexpr size_t kLiveMaxPeers       = 64;    // roster bound (server caps at 256)
+
+nlohmann::json liveParams(const PlmLiveState& L) {
+    nlohmann::json p;
+    p["path"]      = L.projectDir;
+    p["remote_id"] = L.remoteId;
+    p["item_id"]   = L.itemId;
+    return p;
+}
+
+// Session-ending reasons: the client object is gone server-side — joined state
+// would be a lie. Transient transport trouble is NOT in this set (poll keeps the
+// session and reports connected=false honestly).
+bool liveFatalReason(const std::string& reason) {
+    return reason == "not_joined" || reason == "left" ||
+           reason == "wrong_session" || reason == "wrong_participant" ||
+           reason == "join_failed";
+}
+
+// Fold one participant identity into the peer roster (union, keyed by id; this
+// seat is excluded). Accepts both roster rows ({id, display, …}) and presence
+// broadcast rows ({participant: {…}, cursor?, selection?, viewport?}).
+void liveFoldPeer(const nlohmann::json& row) {
+    if (!row.is_object()) return;
+    const nlohmann::json* part = &row;
+    if (auto p = row.find("participant"); p != row.end() && p->is_object())
+        part = &*p;
+    auto& L = g_plmHub.live;
+    const std::string id = getStr(*part, "id");
+    if (id.empty() || id == L.selfId) return;
+    const std::string display = getStr(*part, "display");
+    for (auto& peer : L.peers)
+        if (peer.id == id) {
+            if (!display.empty()) peer.display = display;
+            return;
+        }
+    if (L.peers.size() >= kLiveMaxPeers) return;
+    L.peers.push_back({id, display.empty() ? id : display});
+}
+
+// Atomically adopt a live-materialized doc_open response into the ACTIVE
+// mirror/tab: DocMirror::adoptOpenResponse re-points the mirror (tree + feature
+// status + owner map + datums + tess in ONE adoption — never a partial
+// snapshot), the active Part/Assembly tab keeps its identity but tracks the
+// replacement worker doc, and a mirror tab the daemon's doc.opened event may
+// have auto-revealed for the same doc is detached (view-only close; the live
+// manager holds its own attach, so the doc survives). On failure the old doc
+// stays on screen untouched and the caller reports the error honestly.
+bool liveAdoptOpenResponse(AppState& st, const nlohmann::json& res,
+                           const std::string& newDocId) {
+    const std::string oldDocId = st.docMirror.docId();
+    std::string err;
+    if (!st.docMirror.adoptOpenResponse(res, err)) {
+        st.addLog("[live] adopt of the authoritative snapshot failed: " + err);
+        return false;
+    }
+    if (st.activeTab >= 0 && st.activeTab < (int)st.docTabs.size()) {
+        auto& t = st.docTabs[st.activeTab];
+        if ((t.kind == AppState::DocTab::TabKind::Part ||
+             t.kind == AppState::DocTab::TabKind::Assembly) &&
+            (t.docId == oldDocId || t.docId.empty()))
+            t.docId = newDocId;
+    }
+    for (int i = (int)st.docTabs.size() - 1; i >= 0; --i) {
+        if (i == st.activeTab) continue;
+        if (st.docTabs[i].aiHandoff && st.docTabs[i].docId == newDocId)
+            st.closeDocTab(i, /*detachOnly=*/true);
+    }
+    // The open response carries its own tess block — load it directly (the same
+    // fast path applyOpenedDoc takes) so the viewport shows the authoritative
+    // state the moment the adoption lands. Later commits refresh via doc.changed.
+    if (!st.docMirror.lastOpenedAicm().empty())
+        st.loadDocMeshAsync(st.docMirror.lastOpenedAicm());
+    st.addLog("[live] adopted authoritative doc " + newDocId +
+              (oldDocId.empty() ? std::string() : " (was " + oldDocId + ")"));
+    return true;
+}
+
+}  // namespace
+
+bool plmLiveJoinedItem(const std::string& itemId) {
+    const auto& L = g_plmHub.live;
+    return L.joined && !itemId.empty() && L.itemId == itemId;
+}
+
+void plmLiveJoin(AppState& st, const PlmRemoteRow& rm, const std::string& itemId) {
+    auto& L = g_plmHub.live;
+    if (L.joining || L.leaving || L.joined) return;   // one session at a time
+    const std::string proj = st.plmProjectPath();
+    if (proj.empty() || itemId.empty()) return;
+    const std::string sentDocId =
+        st.docMirror.hasDoc() ? st.docMirror.docId() : std::string();
+    L = PlmLiveState{};
+    L.joining     = true;
+    L.projectDir  = proj;
+    L.remoteId    = rm.id;
+    L.remoteName  = rm.name.empty() ? rm.id : rm.name;
+    L.itemId      = itemId;
+    L.selfId      = rm.identityUserId;
+    L.selfDisplay = rm.identityDisplay;
+    nlohmann::json p = liveParams(L);
+    if (!sentDocId.empty()) p["local_doc_id"] = sentDocId;
+    st.rpc.call("plm_live_join", p, [&st, sentDocId](const core::RpcResult& r) {
+        auto& L = g_plmHub.live;
+        L.joining = false;
+        std::string hint;
+        if (!plmOk(r, hint)) {
+            L.err    = plmTeamFriendlyError(plmReason(r), hint);
+            L.joined = false;
+            st.toast(ui::ToastLevel::Error, "Couldn't join live editing: " + L.err);
+            return;
+        }
+        // The manager fills the participant it actually joined as (profile
+        // identity when we sent none) — that id keys the peer-roster exclusion.
+        if (auto me = r.result.find("participant"); me != r.result.end() && me->is_object()) {
+            L.selfId      = getStr(*me, "id");
+            L.selfDisplay = getStr(*me, "display");
+        }
+        const std::string newDocId = getStr(r.result, "local_doc_id");
+        // Replacement local doc: adopt its open response into the active
+        // mirror/tab BEFORE presenting joined state (never a torn view).
+        if (!newDocId.empty() && newDocId != sentDocId) {
+            auto o = r.result.find("open_response");
+            if (o == r.result.end() || !o->is_object() ||
+                !liveAdoptOpenResponse(st, *o, newDocId)) {
+                // Honest failure: the server-side session exists but the local
+                // view could not bind — leave it quietly rather than present a
+                // torn state (the "Left live editing" toast would only confuse).
+                st.rpc.call("plm_live_leave", liveParams(L),
+                            [](const core::RpcResult&) {}, 30000);
+                L = PlmLiveState{};
+                L.err = "The live design could not be opened on this machine.";
+                st.toast(ui::ToastLevel::Error, "Couldn't join live editing: " + L.err);
+                return;
+            }
+        }
+        L.docId     = newDocId.empty() ? sentDocId : newDocId;
+        L.sessionId = getStr(r.result, "session_id");
+        if (auto s = r.result.find("head_seq"); s != r.result.end() && s->is_number())
+            L.lastSeq = s->get<long long>();
+        else if (auto ls = r.result.find("last_seq"); ls != r.result.end() && ls->is_number())
+            L.lastSeq = ls->get<long long>();
+        L.peers.clear();
+        if (auto ps = r.result.find("participants"); ps != r.result.end() && ps->is_array())
+            for (const auto& row : *ps) liveFoldPeer(row);
+        L.err.clear();
+        L.joined    = true;
+        L.connected = true;
+        st.toast(ui::ToastLevel::Success,
+                 L.peers.empty()
+                     ? std::string("Live editing on — teammates joining this "
+                                   "design will appear here")
+                     : "Live editing on — everyone sees one design");
+    }, 60000);
+}
+
+void plmLiveLeave(AppState& st) {
+    auto& L = g_plmHub.live;
+    if (L.leaving || !L.joined) return;
+    L.leaving = true;
+    st.rpc.call("plm_live_leave", liveParams(L), [&st](const core::RpcResult& r) {
+        // The manager forgets the session on leave even on an error path, so the
+        // local state is gone either way; only the wording differs.
+        std::string hint;
+        const bool ok = plmOk(r, hint);
+        g_plmHub.live = PlmLiveState{};
+        if (ok)
+            st.toast(ui::ToastLevel::Info, "Left live editing");
+        else
+            st.toast(ui::ToastLevel::Warn,
+                     "Left live editing — the server may not have heard (" +
+                         plmTeamFriendlyError(plmReason(r), hint) + ")");
+    }, 30000);
+}
+
+void plmLiveTick(AppState& st) {
+    auto& L = g_plmHub.live;
+    if (!L.joined || L.leaving) return;
+    // The session follows one project; switching projects leaves it honestly.
+    if (st.plmProjectPath() != L.projectDir) {
+        plmLiveLeave(st);
+        return;
+    }
+    const double now = ImGui::GetTime();
+
+    // Bounded event/status poll. Complete envelopes only: a commit's geometry
+    // reaches the viewport through hostd doc.changed; the poll carries seq /
+    // connection honesty plus whole snapshot events (which may swap the local doc).
+    if (!L.pollInFlight && now - L.lastPollAt >= kLivePollEveryS) {
+        L.pollInFlight = true;
+        L.lastPollAt = now;
+        nlohmann::json p = liveParams(L);
+        p["limit"] = 64;
+        st.rpc.call("plm_live_poll", p, [&st](const core::RpcResult& r) {
+            auto& L = g_plmHub.live;
+            L.pollInFlight = false;
+            if (!L.joined) return;   // left while the poll was in flight
+            std::string hint;
+            if (!plmOk(r, hint)) {
+                const std::string reason = plmReason(r);
+                if (liveFatalReason(reason)) {
+                    g_plmHub.live = PlmLiveState{};
+                    g_plmHub.live.err = "The live session ended. Join again to "
+                                        "keep co-editing.";
+                    st.toast(ui::ToastLevel::Warn, g_plmHub.live.err);
+                } else {
+                    L.connected = false;   // honest reconnect state, session kept
+                    L.err = plmTeamFriendlyError(reason, hint);
+                }
+                return;
+            }
+            L.err.clear();
+            L.connected = r.result.value("connected", false);
+            if (auto s = r.result.find("last_seq"); s != r.result.end() && s->is_number())
+                L.lastSeq = s->get<long long>();
+            if (auto ev = r.result.find("events"); ev != r.result.end() && ev->is_array())
+                for (const auto& e : *ev) {
+                    if (!e.is_object()) continue;
+                    // A mid-session authoritative snapshot may have materialized
+                    // a REPLACEMENT local doc — adopt it exactly like join did.
+                    if (getStr(e, "type") != "snapshot") continue;
+                    const std::string nd = getStr(e, "local_doc_id");
+                    if (nd.empty() || nd == L.docId) continue;
+                    auto o = e.find("open_response");
+                    if (o != e.end() && o->is_object() &&
+                        liveAdoptOpenResponse(st, *o, nd))
+                        L.docId = nd;
+                }
+        }, 30000);
+    }
+
+    // Bounded best-effort presence from available selection/viewport state.
+    // Skipped while reconnecting (a presence send would park on the transport's
+    // ready gate) and when the payload hasn't changed, with a slow heartbeat.
+    if (L.connected && !L.presenceInFlight &&
+        now - L.lastPresenceCheckAt >= kLivePresenceEveryS) {
+        L.lastPresenceCheckAt = now;
+        nlohmann::json sel = nlohmann::json::object();
+        if (!st.selectedFeatureId.empty()) sel["feature_id"] = st.selectedFeatureId;
+        // Coarse camera pose: a tenth of a degree is plenty for presence and
+        // keeps the unchanged-signature dedupe effective during idle frames.
+        nlohmann::json vp;
+        vp["yaw"]   = std::round((double)st.yaw * 10.0) / 10.0;
+        vp["pitch"] = std::round((double)st.pitch * 10.0) / 10.0;
+        vp["zoom"]  = std::round((double)st.zoom * 1000.0) / 1000.0;
+        vp["pan"]   = {std::round((double)st.pan[0] * 1000.0) / 1000.0,
+                       std::round((double)st.pan[1] * 1000.0) / 1000.0,
+                       std::round((double)st.pan[2] * 1000.0) / 1000.0};
+        std::string sig = sel.dump();
+        sig += '|';
+        sig += vp.dump();
+        if (sig != L.presenceSig || now - L.lastPresenceSentAt >= kLivePresenceIdleS) {
+            L.presenceInFlight = true;
+            L.lastPresenceSentAt = now;
+            L.presenceSig = std::move(sig);
+            nlohmann::json p = liveParams(L);
+            if (!sel.empty()) p["selection"] = sel;
+            p["viewport"] = vp;
+            st.rpc.call("plm_live_presence", p, [](const core::RpcResult& r) {
+                auto& L = g_plmHub.live;
+                L.presenceInFlight = false;
+                if (!L.joined) return;
+                std::string hint;
+                if (!plmOk(r, hint)) return;   // best-effort: presence never nags
+                if (auto ps = r.result.find("participants");
+                    ps != r.result.end() && ps->is_array())
+                    for (const auto& row : *ps) liveFoldPeer(row);
+            }, 15000);
+        }
+    }
 }
 
 }  // namespace ui

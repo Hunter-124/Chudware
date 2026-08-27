@@ -35,6 +35,13 @@ public:
     void markStarted() { running_ = true; }
     void stop();
 
+    // A joined PLM live document sends every ordinary doc_apply_ops batch through
+    // the live proposal relay. These helpers expose only process-local route
+    // membership; they do not contact the worker or mutate a document.
+    bool liveDocJoined(const std::string& docId) const;
+    void clearLiveDocRoute(const std::string& docId);
+    void clearLiveDocRoutes();
+
     // Send {method, params}; block until the matching response. Returns the "result"
     // object on success; fills err and returns false on transport/rpc error. While
     // waiting, any matching "event" notification lines are delivered to onEvent (if set).
@@ -59,10 +66,17 @@ public:
     void abortPending();
 
 private:
-    // Real call() body; the public call() wraps it with the T-G9 parity trace (env
-    // CHUDWARE_RPC_TRACE=<file> appends one JSONL record per RPC — method/params/ok/result —
-    // regardless of routing: Python worker, in-process libchudware, ECAD/agent C++ paths).
-    // Off (no env) = byte-for-byte the previous behavior.
+    // Applies the process-local PLM live-route overlay around callImpl. Keeping
+    // this outside callImpl lets a relayed doc_apply_ops enter the generic
+    // plm_live_propose seam without recursively intercepting itself.
+    bool callWithLiveRouting(const std::string& method,
+                             const nlohmann::json& params,
+                             nlohmann::json& result, std::string& err,
+                             int timeoutMs, const EventFn& onEvent);
+
+    // Real backend-routing body; the public call() wraps callWithLiveRouting
+    // with the T-G9 parity trace (CHUDWARE_RPC_TRACE=<file>) so the trace still
+    // records the caller-visible method, params, and unwrapped result.
     bool callImpl(const std::string& method, const nlohmann::json& params,
                   nlohmann::json& result, std::string& err, int timeoutMs,
                   const EventFn& onEvent);

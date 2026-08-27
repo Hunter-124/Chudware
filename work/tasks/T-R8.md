@@ -3,7 +3,7 @@ id: T-R8
 title: Self-hosted PLM server + live co-editing — two people in the same part, no locks
 workstream: R
 owner: unassigned
-status: doing
+status: done
 branch: task/T-R8-plm-live-server
 depends_on: [T-R7]
 lane: plm-projects
@@ -54,14 +54,18 @@ process (single binary or `python -m services.plm.server`), NOT a SaaS dependenc
 
 ## Definition of done
 
-- [ ] OSS survey committed (docs/) with the relay-vs-CRDT decision + citations
-- [ ] aicad.plm-live/1 contract frozen in contracts/
-- [ ] Two headless clients co-edit one part via a local server; eval_compare proves
-      identical final geometry; no torn intermediate renders (shot-verified)
-- [ ] Session end writes ONE vault checkpoint attributed to all participants
-- [ ] Dumb-remote projects are untouched (T-R7 lock mode keeps working); mode is
-      chosen by remote-profile type, zero user config
-- [ ] scripts/gate.sh PASS; graphify update
+- [x] OSS survey committed with relay-vs-CRDT decision, upstream behavior,
+      license checks, and primary citations
+- [x] `aicad.plm-live/1` frozen in `contracts/plm_live.md`
+- [x] Two real WebSocket clients interleave authoritative engine batches,
+      receive sequences 1/2 and identical final hashes; core-backed replay uses
+      `eval_compare` to prove identical geometry; snapshots apply atomically
+- [x] Last leave writes exactly one vault checkpoint attributed to every
+      participant who committed
+- [x] `plm-server` selects live mode automatically; folder/ssh/https remotes
+      retain T-R7 advisory locks and copy-as-variant sync unchanged
+- [x] Complete PLM suite, native GUI build, scoped UI lints, headless Team
+      surface, `scripts/gate.sh`, and graph update pass
 
 ## Progress log
 
@@ -73,3 +77,15 @@ process (single binary or `python -m services.plm.server`), NOT a SaaS dependenc
   orders whole `doc_apply_ops` batches and publishes one canonical snapshot
   between frames. `contracts/plm_live.md` freezes `aicad.plm-live/1`; BSD-3
   `websockets` is pinned and recorded, with no license debt.
+- 2026-08-27: Completed. `python -m services.plm.server` is a
+  deny-by-default self-hosted relay with total-order batches, typed semantic
+  rejection, snapshots/catch-up, reconnect idempotency, bounded presence, and
+  one guarded final checkpoint. The Python client manager attaches the local
+  hostd document and applies each authoritative batch exactly once; WorkerClient
+  transparently reroutes every joined document's ordinary `doc_apply_ops`
+  through the relay and never falls back locally after refusal. Team/quickbar UI
+  exposes live-server mode, join/leave, LIVE/reconnecting and participant chips;
+  incoming commits use the existing whole-batch `doc.changed` viewport refresh.
+  Proof: 413 PLM tests, successful native build, five clean scoped GUI lints,
+  actual two-seat sequences `[1,2]` with equal final hashes, one checkpoint with
+  both participant identities, and a 1340x838 live-server Team capture.

@@ -209,17 +209,24 @@ void doLockAction(AppState& st, bool acquire, bool force) {
 }  // namespace
 
 void drawPlmQuickChip(AppState& st) {
-    if (st.activeWorkspace == AppState::Workspace::PLM) return;  // hub already showing
     if (!st.workerStarted || st.plmProjectPath().empty()) return;
+    // The live co-editing session outlives any one workspace: poll + presence
+    // pacing runs from the status bar every frame (bounded, async, never blocks).
+    plmLiveTick(st);
+    if (st.activeWorkspace == AppState::Workspace::PLM) return;  // hub already showing
     resolve(st);
 
     // Team presence: once the item resolves, keep the shared advisory-lock cache
     // warm (g_plmHub team cache — refetches at most once a minute) and find a
     // LIVE lock on this document. Advisory locks warn, they never block.
     if (q.haveItem) plmEnsureTeam(st);
+    // Live co-editing (plm-server profile): while THIS item is joined, the
+    // session is the presence signal — every advisory-lock control for it hides.
+    const PlmRemoteRow* liveRemote = plmTeamLiveRemote();
+    const bool liveJoined = q.haveItem && plmLiveJoinedItem(q.itemId);
     const PlmRemoteRow* lockRemote = plmTeamLockRemote();
     const PlmLockRow* lock = nullptr;
-    if (lockRemote && q.haveItem)
+    if (lockRemote && q.haveItem && !liveJoined)
         for (const auto& l : g_plmHub.locks)
             if (l.itemId == q.itemId && plmLockLive(l)) { lock = &l; break; }
     const bool lockMine = lock && !lockRemote->identityUserId.empty() &&
@@ -289,6 +296,42 @@ void drawPlmQuickChip(AppState& st) {
         kit::chip(chipLabel.c_str(), kit::Tone::Warn, /*dot=*/true, chipTip.c_str());
     }
 
+    // Live session chips: an unmissable LIVE state plus who else is in the
+    // session, straight in the status bar. Reconnect state is honest — the chip
+    // never claims LIVE while the transport is down.
+    if (liveJoined) {
+        const auto& L = g_plmHub.live;
+        ImGui::SameLine();
+        if (L.connected) {
+            std::string liveTip = "Live editing on " + L.remoteName +
+                                  " \xe2\x80\x94 every change is ordered by the "
+                                  "server and everyone sees one design.";
+            kit::chip("LIVE", kit::Tone::Ok, /*dot=*/true, liveTip.c_str());
+        } else {
+            std::string liveTip = "Reconnecting to " + L.remoteName +
+                                  " \xe2\x80\xa6 your edits resume once the "
+                                  "connection is back.";
+            kit::chip("LIVE \xc2\xb7 reconnecting", kit::Tone::Warn, /*dot=*/true,
+                      liveTip.c_str());
+        }
+        int shown = 0;
+        for (const auto& peer : L.peers) {
+            if (shown == 2) break;
+            ImGui::SameLine();
+            std::string peerTip = peer.display + " is in this live session.";
+            kit::chip(peer.display.c_str(), kit::Tone::Accent, /*dot=*/true,
+                      peerTip.c_str());
+            ++shown;
+        }
+        if ((int)L.peers.size() > shown) {
+            ImGui::SameLine();
+            char more[16];
+            std::snprintf(more, sizeof(more), "+%d", (int)L.peers.size() - shown);
+            kit::chip(more, kit::Tone::Accent, /*dot=*/false,
+                      "More teammates are in this live session.");
+        }
+    }
+
     if (ImGui::BeginPopup("##plm_quick")) {
         const float S = ui::uiScale;
         if (q.haveItem) {
@@ -329,10 +372,63 @@ void drawPlmQuickChip(AppState& st) {
             }
         }
 
+        // Live co-editing (plm-server profile — contracts/plm_live.md). Joining
+        // binds this open document to the one authoritative server order; while
+        // joined the session IS the presence signal, so the advisory-lock
+        // controls below hide for this item.
+        if (q.haveItem && (liveRemote || liveJoined)) {
+            ImGui::Separator();
+            auto& L = g_plmHub.live;
+            if (liveJoined) {
+                std::string line;
+                if (!L.connected)
+                    line = "Live editing \xe2\x80\x94 reconnecting to " +
+                           L.remoteName + "\xe2\x80\xa6";
+                else if (L.peers.empty())
+                    line = "Live editing on " + L.remoteName +
+                           " \xe2\x80\x94 you're the only one here";
+                else if (L.peers.size() == 1)
+                    line = "Live editing with " + L.peers.front().display;
+                else
+                    line = "Live editing with " +
+                           std::to_string(L.peers.size()) + " teammates";
+                const float* tone = L.connected ? pal.statusOk : pal.statusWarn;
+                ImGui::PushStyleColor(ImGuiCol_Text,
+                    ImVec4(tone[0], tone[1], tone[2], 1));
+                ImGui::TextUnformatted(line.c_str());
+                ImGui::PopStyleColor();
+                if (!L.err.empty()) plmError(L.err);
+                if (L.leaving) {
+                    plmSpinner("Leaving live editing");
+                } else if (ImGui::SmallButton("Leave live editing")) {
+                    plmLiveLeave(st);
+                }
+            } else if (L.joining) {
+                plmSpinner("Joining live editing");
+            } else if (L.joined) {
+                ImGui::PushStyleColor(ImGuiCol_Text,
+                    ImVec4(pal.textDim[0], pal.textDim[1], pal.textDim[2], 1));
+                ImGui::TextUnformatted("Live editing is active on another document.");
+                ImGui::PopStyleColor();
+            } else {
+                if (ImGui::SmallButton("Join live editing"))
+                    plmLiveJoin(st, *liveRemote, q.itemId);
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("Edit this design together on %s.\nEvery "
+                                      "change is ordered by the server \xe2\x80\x94 "
+                                      "everyone sees one design, live.",
+                                      liveRemote->name.empty()
+                                          ? liveRemote->id.c_str()
+                                          : liveRemote->name.c_str());
+                if (!L.err.empty()) plmError(L.err);
+            }
+        }
+
         // Team presence + the advisory lock for this document. Only shown when a
         // lock-capable shared location is configured; this is the teammate
-        // courtesy signal, not the local engine document hold.
-        if (q.haveItem && lockRemote) {
+        // courtesy signal, not the local engine document hold. Hidden while the
+        // item is joined live — the session already says who is here.
+        if (q.haveItem && lockRemote && !liveJoined) {
             ImGui::Separator();
             if (lock && !lockMine) {
                 const std::string who =

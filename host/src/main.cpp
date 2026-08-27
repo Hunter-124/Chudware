@@ -652,6 +652,25 @@ int main(int argc, char** argv) {
         const int idle = argc >= 4 ? std::atoi(argv[3]) : 120;
         return ui::cef::run_cef_daemon(argv[2], idle);
     }
+#else
+    // NO CEF in this build. These argv forms must still be CLAIMED and fail fast: without
+    // this they fell through to the normal GUI launch, so `chudware --cef-daemon <sock> 120`
+    // started a whole desktop app that never listened on the socket and never exited. The
+    // Python client (services/browser/cef_client.py) only checks that the binary exists, so
+    // every later request spawned another one — 193 were found alive at once, 34 h old.
+    if (argc >= 2 && std::strncmp(argv[1], "--cef-", 6) == 0) {
+        std::fprintf(stderr,
+                     "%s: this build has no CEF backend (CHUDWARE_ENABLE_CEF=OFF); "
+                     "rebuild with -DCHUDWARE_ENABLE_CEF=ON to use the headless browser\n",
+                     argv[1]);
+        // Same hard-exit tail as --version above, and for the same reason: a
+        // namespace-scope static spawns a detached worker parked on a condition_variable,
+        // so `return` deadlocks in global destruction. Verified: `return 2` printed the
+        // message and then hung forever — which is the very failure mode this branch exists
+        // to prevent.
+        std::fflush(nullptr);
+        std::_Exit(2);
+    }
 #endif
     installCrashHandler();  // symbolized stack + minidump on any unhandled fault
     // Point the C++ core at its prompts on EVERY launch path (run_gui only calls

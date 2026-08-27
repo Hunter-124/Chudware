@@ -159,6 +159,13 @@ judgment).
   turn that found nothing listening minted another daemon: 193 were found alive at once, 34 h
   old. Probe shape: 8 concurrent and 6 sequential spawners against a never-listening binary
   must both yield exactly ONE process, and killing the incumbent must allow a replacement.
+  The biggest single contributor was upstream of all that: `--cef-*` argv lived entirely
+  inside `#ifdef CHUDWARE_ENABLE_CEF` in `host/src/main.cpp`, so in a CEF-OFF build
+  `chudware --cef-daemon <sock> 120` FELL THROUGH to the normal GUI launch — a whole desktop
+  app that never listened on the socket and never exited. There is now an `#else` branch that
+  claims those argv forms and refuses. It must use the `std::fflush(nullptr); std::_Exit(n)`
+  tail (like `--version`): a plain `return` deadlocks in global destruction on a detached
+  worker parked in `cv.wait` — verified, it printed the message and hung forever.
 - **GUI reconnect:** status bar shows a sticky unreachable chip; `engine_events` reconnects
   with backoff and re-bootstraps doc tabs on `reconnectGeneration` bump
   (`CHUDWARE_SHOT=daemon_h2`). See gui-workspaces for the status-bar surface.

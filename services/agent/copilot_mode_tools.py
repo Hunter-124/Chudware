@@ -200,16 +200,33 @@ def apply_mode_tools(
 # Escape hatches a restricted lane must be able to SEE, not merely call.
 META_TOOL_FLOOR: tuple[str, ...] = ("enable_tools", "list_tool_categories")
 
+# Polling dependencies named by the curated guidance for background-capable
+# tools.  The registry has no ``list_jobs`` sibling for ``get_job``; ``sim_jobs``
+# belongs to the separate sim_run/sim_status lifecycle.
+JOB_POLL_FLOOR: dict[str, frozenset[str]] = {
+    "get_job": frozenset({
+        "add_features",
+        "run_cfd_flow",
+        "run_cfd_accurate",
+        "run_fea_adaptive",
+        "run_fea_fatigue",
+        "run_fea_frequency_response",
+        "run_fea_modal",
+        "run_fea_static",
+    }),
+}
+
 
 def apply_meta_tool_floor(allowed: Iterable[str] | None, *,
                           advisor: bool | None = None) -> Optional[list[str]]:
-    """Union the category escape hatches onto a RESTRICTED tool grant.
+    """Union shared capability floors onto a RESTRICTED tool grant.
 
     A restricted allowlist without ``enable_tools`` / ``list_tool_categories``
     is a closed world: role cards cap at ``roles.MAX_TOOLS_PER_ROLE = 14``, so
     every other tool in the catalog becomes unreachable with no way to ask for
-    it. ``advise`` rides along when the advisor is on, matching the delegate
-    lane.
+    it. ``advise`` and ``advisory_dispute`` ride along when the advisor is on,
+    matching the child lanes that receive advisory verdicts. Background-capable
+    tools also bring their polling dependency from :data:`JOB_POLL_FLOOR`.
 
     ``allowed=None`` (unrestricted) passes straight through — the open-vs-
     explicit tri-state must survive, or an open lane collapses into an
@@ -227,6 +244,9 @@ def apply_meta_tool_floor(allowed: Iterable[str] | None, *,
         return None
     out = {str(t) for t in allowed if t}
     out.update(META_TOOL_FLOOR)
+    for poll_tool, producers in JOB_POLL_FLOOR.items():
+        if not out.isdisjoint(producers):
+            out.add(poll_tool)
     use_advisor = advisor
     if use_advisor is None:
         use_advisor = True
@@ -234,7 +254,7 @@ def apply_meta_tool_floor(allowed: Iterable[str] | None, *,
         try:
             from services.agent.config import advisor_enabled  # noqa: PLC0415
             if advisor_enabled():
-                out.add("advise")
+                out.update(("advise", "advisory_dispute"))
         except Exception:  # noqa: BLE001 — advisor probe never narrows the floor
             pass
     return sorted(out)

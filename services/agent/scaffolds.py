@@ -820,10 +820,10 @@ def reference_build_context(profile: Any, request: str, *,
 # ---------------------------------------------------------------------------
 
 def refine_pass_limit(profile: Any) -> Optional[int]:
-    """Max successful-geometry refine passes after first stable geometry.
+    """Maximum post-settlement geometry reworks permitted.
 
-    A: refine_passes=0 → at most 1 stable-geometry pass total (cap ≤1).
-    B: 1 refine after first stable.
+    A: refine_passes=0 → no rework after the first settled build.
+    B: refine_passes=1 → one rework after the first settled build.
     C: None (untouched — existing DEFAULT_MAX_ITERS / runaway kills).
     """
     if profile is None or is_frontier(profile):
@@ -832,25 +832,25 @@ def refine_pass_limit(profile: Any) -> Optional[int]:
         n = int(getattr(profile, "refine_passes", 2))
     except (TypeError, ValueError):
         return None
-    # "0 refine thrash budget beyond single pass" → allow 1 stable geometry total
-    # (the first success counts as the single pass; 0 further refines).
-    # Implementation: max successful geometry iterations = 1 + refine_passes.
-    return 1 + max(0, n)
+    # The first settled build is not a refine pass. The caller proposes the
+    # next post-settlement rework number, so the configured value is the limit
+    # directly rather than one plus the configured value.
+    return max(0, n)
 
 
-def should_stop_refine(profile: Any, stable_geometry_count: int,
+def should_stop_refine(profile: Any, proposed_refine_round_count: int,
                        *, ledger: Any = None,
                        actor: str = "scaffolds") -> bool:
-    """True when A/B refine budget is exhausted after stable geometry."""
+    """True when a proposed post-settlement rework would exceed the A/B cap."""
     limit = refine_pass_limit(profile)
     if limit is None:
         return False
-    if stable_geometry_count >= limit:
+    if proposed_refine_round_count > limit:
         emit_capability_dial(
             ledger, "refine_passes",
             getattr(profile, "refine_passes", None),
             forced=True, actor=actor,
-            extra={"stable_geometry_count": stable_geometry_count,
+            extra={"proposed_refine_round_count": proposed_refine_round_count,
                    "limit": limit, "reason": "refine_cap"},
         )
         return True

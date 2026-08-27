@@ -98,6 +98,40 @@ def test_previously_unreachable_tools_resolve(tool):
 
 
 # ---------------------------------------------------------------------------
+# Shared child-lane capability floors
+# ---------------------------------------------------------------------------
+
+def _child_effective_tools(role: str, *, advisor: bool) -> set[str]:
+    """Assemble the effective grant through the same two child-lane helpers."""
+    from services.agent import copilot_mode_tools as cmt
+
+    card = R.load_role(role)
+    mode_allowed = cmt.apply_mode_tools(
+        "agent", card.concrete_tools, subagent=True)
+    return set(cmt.apply_meta_tool_floor(
+        mode_allowed, advisor=advisor) or ())
+
+
+def test_job_producing_role_inherits_get_job_polling():
+    """A backgrounded add_features call must not strand its job_id."""
+    card = R.load_role("model3d")
+    assert "add_features" in card.concrete_tools
+    assert "get_job" not in card.concrete_tools
+    assert "get_job" in _child_effective_tools("model3d", advisor=False)
+
+
+def test_advisor_child_inherits_advisory_dispute(monkeypatch):
+    """Every child that receives advisor verdicts can challenge one with evidence."""
+    from services.agent import config
+
+    card = R.load_role("model3d")
+    assert "advisory_dispute" not in card.concrete_tools
+    monkeypatch.setattr(config, "advisor_enabled", lambda: True)
+    effective = _child_effective_tools("model3d", advisor=True)
+    assert {"advise", "advisory_dispute"} <= effective
+
+
+# ---------------------------------------------------------------------------
 # 2. Budgets must fit the role's mandated chain
 # ---------------------------------------------------------------------------
 
@@ -673,3 +707,52 @@ def test_a_capped_tool_refusal_names_a_remedy_and_is_flagged_policy():
     assert "max_calls_per_turn" not in refused["error"]
     assert at._classify_tool_outcome(refused, ok=False) == (
         at.OUTCOME_POLICY_REFUSAL, False)
+
+
+def test_ai_vc_capture_fault_is_visible_and_tool_still_executes(monkeypatch):
+    """Losing the pre-mutation revision is observable but never blocks mutation."""
+    from services.agent.test_directive_batching import (
+        _DONE,
+        _ScriptedProvider,
+        _fence,
+    )
+    from services.plm import ai_vc
+
+    class _Ledger:
+        def __init__(self):
+            self.entries: list[tuple[str, str, dict]] = []
+
+        def append(self, actor, kind, payload):
+            self.entries.append((actor, kind, payload))
+
+    def _fail_capture(*args, **kwargs):
+        raise RuntimeError("timeline unavailable")
+
+    monkeypatch.setattr(ai_vc, "set_session_context", lambda **kwargs: None)
+    monkeypatch.setattr(ai_vc, "on_before_tool", _fail_capture)
+    dispatched: list[str] = []
+    ledger = _Ledger()
+    provider = _ScriptedProvider([
+        _fence("ledger_note", section="decisions", text="captured"),
+        _DONE,
+    ])
+
+    at.run_turn(
+        "record the decision",
+        provider,
+        allowed_tools=["ledger_note"],
+        max_tool_calls=2,
+        tool_dispatch=lambda tool, args: (
+            dispatched.append(tool) or {"ok": True}),
+        ledger=ledger,
+        actor="general_agent",
+    )
+
+    assert dispatched == ["ledger_note"]
+    failures = [
+        payload for _actor, _kind, payload in ledger.entries
+        if payload.get("event") == "ai_vc_capture_failed"
+    ]
+    assert len(failures) == 1
+    assert failures[0]["tool"] == "ledger_note"
+    assert failures[0]["error"] == "RuntimeError: timeline unavailable"

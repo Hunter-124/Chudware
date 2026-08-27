@@ -21,6 +21,7 @@ Offline discipline: mock providers, no network, no LLM, no all-skip.
 """
 from __future__ import annotations
 
+from contextlib import nullcontext
 import unittest
 from typing import Any
 from unittest.mock import MagicMock, patch
@@ -681,6 +682,130 @@ class TestDelegateTool(unittest.TestCase):
             "parent", "delegate", {}, result, ok=False, latency_ms=1.0,
         )
         self.assertEqual(event["error_preview"], result["error"])
+
+
+class TestDelegateTerminalTransitions(unittest.TestCase):
+    """A delegate run always leaves its coordination node terminal."""
+
+    def setUp(self):
+        from services.agent.mission_dispatch import MissionDispatch
+
+        self.ledger = _MockLedger()
+        self.tree = DelegationTree(
+            run_id="r_delegate_terminal",
+            orchestrator_budget=10_000,
+            ledger=self.ledger,
+            routing=_two_source_routing(),
+        )
+        self.node = self.tree.request_delegation(
+            "sketcher", "Build the delegated profile", 500,
+        )
+        self.mission = MissionDispatch(
+            run_id="r_delegate_terminal",
+            delegation_tree=self.tree,
+            provider=object(),
+        )
+
+    def _run_with(self, *, outcome=None, error: Exception | None = None):
+        runner = MagicMock(return_value=outcome, side_effect=error)
+        with (
+            patch("services.mcp.cad_common.doc_scope", return_value=nullcontext()),
+            patch.object(self.mission, "_run_subagent_turn", runner),
+            patch("services.agent.subagent_registry.set_status"),
+        ):
+            return self.mission._run_subagent(self.node.to_dict(), "delegate brief")
+
+    def test_delegate_exception_still_marks_child_terminal(self):
+        result = self._run_with(error=RuntimeError("provider exploded"))
+
+        self.assertIs(result["ok"], False)
+        self.assertIn("provider exploded", result["error"])
+        self.assertEqual(self.tree._nodes[self.node.id].status, "failed")
+        terminal = [
+            event for event in self.ledger.events_of_kind("delegation")
+            if event["payload"].get("node_id") == self.node.id
+            and event["payload"].get("status") in ("done", "failed")
+        ]
+        self.assertEqual(len(terminal), 1)
+
+    def test_raising_terminal_write_emits_observability_event(self):
+        with (
+            patch("services.mcp.cad_common.doc_scope", return_value=nullcontext()),
+            patch.object(
+                self.mission,
+                "_run_subagent_turn",
+                side_effect=RuntimeError("provider exploded"),
+            ),
+            patch.object(
+                self.tree,
+                "fail",
+                side_effect=RuntimeError("terminal store unavailable"),
+            ),
+            self.assertLogs("services.agent.delegation", level="ERROR"),
+        ):
+            result = self.mission._run_subagent(
+                self.node.to_dict(), "delegate brief",
+            )
+
+        self.assertIs(result["ok"], False)
+        events = self.ledger.events_of_kind(
+            "delegation_terminal_transition_error",
+        )
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["payload"]["node_id"], self.node.id)
+        self.assertEqual(events[0]["payload"]["target_status"], "failed")
+        self.assertIn(
+            "terminal store unavailable",
+            events[0]["payload"]["error"],
+        )
+
+    def test_delegate_success_path_still_completes_once(self):
+        outcome = {
+            "ok": True,
+            "subagent_status": "done",
+            "result": {"summary": "profile built"},
+            "tokens_used": 125,
+        }
+        result = self._run_with(outcome=outcome)
+
+        self.assertIs(result, outcome)
+        node = self.tree._nodes[self.node.id]
+        self.assertEqual(node.status, "done")
+        self.assertEqual(node.budget.tokens_spent, 125)
+        terminal = [
+            event for event in self.ledger.events_of_kind("delegation")
+            if event["payload"].get("node_id") == self.node.id
+            and event["payload"].get("status") in ("done", "failed")
+        ]
+        self.assertEqual(len(terminal), 1)
+
+    def test_stop_path_marks_child_failed_and_registry_terminated(self):
+        outcome = {
+            "ok": False,
+            "subagent_status": "terminated",
+            "stop_reason": "terminated_by_user",
+            "tokens_used": 25,
+        }
+        with (
+            patch("services.mcp.cad_common.doc_scope", return_value=nullcontext()),
+            patch.object(
+                self.mission, "_run_subagent_turn", return_value=outcome,
+            ),
+            patch("services.agent.subagent_registry.set_status") as set_status,
+        ):
+            result = self.mission._run_subagent(
+                self.node.to_dict(), "delegate brief",
+            )
+
+        self.assertIs(result, outcome)
+        node = self.tree._nodes[self.node.id]
+        self.assertEqual(node.status, "failed")
+        self.assertEqual(node.budget.tokens_spent, 25)
+        set_status.assert_any_call(
+            self.node.id,
+            "terminated",
+            note="terminated by user at turn boundary",
+        )
 
 
 class TestArtifactShape(unittest.TestCase):

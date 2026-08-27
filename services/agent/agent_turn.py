@@ -2351,11 +2351,16 @@ def _run_turn_impl(request: str, provider: Any, *, name: str = "dag_node",
         ``[]``, which means "succeeded, nothing new was added".
         """
         nonlocal system, tools_text
+        from services.agent.copilot_mode_tools import (  # noqa: PLC0415
+            apply_meta_tool_floor,
+        )
         from services.agent.tool_categories import resolve_categories  # noqa: PLC0415
         expanded = resolve_categories(cats)
-        newly = sorted(expanded - allow)
-        candidate = set(allow) | set(expanded) | {
-            "enable_tools", "list_tool_categories"}
+        candidate = set(allow) | set(expanded)
+        floored = apply_meta_tool_floor(candidate)
+        if floored is not None:
+            candidate = set(floored)
+        newly = sorted(candidate - allow)
         # 1. Render the schemas the model would get. A pack the model cannot see
         #    the schema for is worse than one it cannot call.
         new_text = None
@@ -4018,8 +4023,16 @@ def _run_turn_impl(request: str, provider: Any, *, name: str = "dag_node",
                     actor=actor or "agent_turn",
                     project_dir=_pc_root,
                 )
-            except Exception:  # noqa: BLE001 — AI-VC never breaks the turn
-                pass
+            except Exception as exc:  # noqa: BLE001 — AI-VC never breaks the turn
+                _log_mod.exception(
+                    "AI-VC capture failed before tool %s; dispatching tool anyway",
+                    tool,
+                )
+                _log(ledger, actor or "agent_turn", {
+                    "event": "ai_vc_capture_failed",
+                    "tool": tool,
+                    "error": f"{type(exc).__name__}: {exc}",
+                })
         # mega-17/18 Z2: sanitize ecad_wire endpoints against live place/power
         # refs BEFORE dispatch (model invents #PWR1 or R1↔R1 self-loops).
         if tool == "ecad_wire":

@@ -31,6 +31,7 @@ Honesty rules:
 from __future__ import annotations
 
 import json
+import logging
 from typing import Any, Callable, Optional
 
 # Ledger section / kind vocabulary lives in ONE place (services.agent.ledger_vocab)
@@ -58,6 +59,8 @@ from services.agent.interaction import (  # noqa: E402
     ask_user_bad_arguments_error as _ask_user_bad_arguments_error,
     normalize_questions as _normalize_questions,
 )
+
+logger = logging.getLogger(__name__)
 
 
 def _coerce_ledger_payload(payload: Any) -> dict:
@@ -920,14 +923,86 @@ class MissionDispatch:
         return _actionable_delegate_failure(node)
 
     def _run_subagent(self, node: dict, brief: str) -> dict:
-        """Run a sub-agent turn with its OWN current part.
+        """Run a scoped child and guarantee one best-effort terminal transition."""
+        node_id = str(node.get("id", ""))
+        outcome: dict | None = None
+        try:
+            try:
+                self.delegation_tree.start(node_id)
+            except Exception:  # noqa: BLE001 — terminal write below remains authoritative
+                pass
+            from services.mcp.cad_common import doc_scope  # noqa: PLC0415
+            with doc_scope():
+                outcome = self._run_subagent_turn(node, brief)
+            return outcome
+        except Exception as exc:  # noqa: BLE001 — execution error is data
+            outcome = {
+                "ok": False,
+                "subagent_status": "failed",
+                "error": f"sub-agent execution failed: {exc}",
+            }
+            return outcome
+        finally:
+            self._record_subagent_terminal(node_id, outcome)
 
-        The parts it creates or opens are current for IT; ours is restored when it
-        returns, so a sub-agent can never silently redirect our next edit into a
-        document we never asked for."""
-        from services.mcp.cad_common import doc_scope  # noqa: PLC0415
-        with doc_scope():
-            return self._run_subagent_turn(node, brief)
+    def _record_subagent_terminal(
+        self,
+        node_id: str,
+        outcome: dict | None,
+    ) -> None:
+        """Best-effort terminal write shared by every delegate exit path."""
+        result = outcome if isinstance(outcome, dict) else {}
+        succeeded = result.get("ok") is True
+        child_status = str(result.get("subagent_status") or "")
+        try:
+            tokens = int(result.get("tokens_used") or 0)
+        except (TypeError, ValueError):
+            tokens = 0
+
+        if not succeeded and tokens > 0:
+            try:
+                self.delegation_tree.accrue(node_id, tokens)
+            except Exception:  # noqa: BLE001 — terminal transition must still run
+                logger.exception(
+                    "Failed to accrue terminal token usage for delegation node %s",
+                    node_id,
+                )
+
+        target_status = "done" if succeeded else "failed"
+        try:
+            if succeeded:
+                self.delegation_tree.complete(node_id, tokens_used=tokens)
+            else:
+                reason = str(
+                    result.get("stop_reason")
+                    or result.get("error")
+                    or child_status
+                    or "sub-agent execution aborted"
+                )
+                self.delegation_tree.fail(node_id, reason=reason)
+        except Exception as exc:  # noqa: BLE001 — observability must survive write failure
+            try:
+                self.delegation_tree.record_terminal_transition_error(
+                    node_id,
+                    target_status=target_status,
+                    error=exc,
+                )
+            except Exception:  # noqa: BLE001 — do not mask the delegate's real outcome
+                logger.exception(
+                    "Failed to report terminal transition error for delegation node %s",
+                    node_id,
+                )
+
+        if child_status in ("terminated", "cancelled"):
+            try:
+                from services.agent import subagent_registry as _sreg  # noqa: PLC0415
+                _sreg.set_status(
+                    node_id,
+                    child_status,
+                    note=f"{child_status} by user at turn boundary",
+                )
+            except Exception:  # noqa: BLE001
+                pass
 
     def _run_subagent_turn(self, node: dict, brief: str) -> dict:
         """Run one bounded synchronous sub-agent turn for an approved node.
@@ -942,10 +1017,6 @@ class MissionDispatch:
         try:
             from services.agent import agent_turn as _at
             from services.agent import subagent_registry as _sreg
-            try:
-                self.delegation_tree.start(node_id)  # pending→ mirror handles registry
-            except Exception:  # noqa: BLE001 — status mirror is best-effort
-                pass
             try:
                 _sreg.append_transcript(node_id, "system",
                                         f"Sub-agent {role!r} started. Brief: {brief}"[:800])
@@ -1488,21 +1559,8 @@ class MissionDispatch:
             if isinstance(node, dict):
                 role_model = node.get("role_model")
             if result.stop_reason == "terminated_by_user":
-                if tokens > 0:
-                    try:
-                        self.delegation_tree.accrue(node_id, tokens)
-                    except Exception:  # noqa: BLE001
-                        pass
-                try:
-                    self.delegation_tree.fail(node_id, reason="terminated by user")
-                except Exception:  # noqa: BLE001
-                    pass
-                try:  # the tree-fail mirror wrote "failed" — the truthful status is "terminated"
-                    _sreg.set_status(node_id, "terminated",
-                                     note="terminated by user at turn boundary")
-                except Exception:  # noqa: BLE001
-                    pass
                 out = {"ok": False, "subagent_status": "terminated",
+                        "stop_reason": result.stop_reason,
                         "result": result.result, "tokens_used": tokens,
                         "tokens_used_estimate": tokens_used_estimate,
                         "handoff": handoff,
@@ -1512,10 +1570,6 @@ class MissionDispatch:
                     out["role_model"] = role_model
                 return out
             if result.success:
-                try:
-                    self.delegation_tree.complete(node_id, tokens_used=tokens)
-                except Exception:  # noqa: BLE001
-                    pass
                 out = {"ok": True, "subagent_status": "done",
                         "handoff": handoff,
                         "result": result.result,
@@ -1526,15 +1580,6 @@ class MissionDispatch:
                 if role_model is not None:
                     out["role_model"] = role_model
                 return out
-            if tokens > 0:
-                try:
-                    self.delegation_tree.accrue(node_id, tokens)
-                except Exception:  # noqa: BLE001
-                    pass
-            try:
-                self.delegation_tree.fail(node_id, reason=result.stop_reason)
-            except Exception:  # noqa: BLE001
-                pass
             child_status = (
                 result.stop_reason
                 if result.stop_reason in ("blocked", "escalated")
@@ -1551,20 +1596,20 @@ class MissionDispatch:
                 out["role_model"] = role_model
             return out
         except Exception as exc:  # noqa: BLE001 — execution error is data
+            failed_tokens = 0
             try:
                 from services.agent.providers import token_usage as _token_usage  # noqa: PLC0415
                 failed_tokens = int(
                     (_token_usage.get_turn_usage() or {}).get("total_tokens") or 0)
-                if failed_tokens > 0:
-                    self.delegation_tree.accrue(node_id, failed_tokens)
             except Exception:  # noqa: BLE001
-                pass
-            try:
-                self.delegation_tree.fail(node_id, reason=str(exc))
-            except Exception:  # noqa: BLE001
-                pass
-            return {"ok": False, "subagent_status": "failed",
-                    "error": f"sub-agent execution failed: {exc}"}
+                failed_tokens = 0
+            return {
+                "ok": False,
+                "subagent_status": "failed",
+                "error": f"sub-agent execution failed: {exc}",
+                "tokens_used": failed_tokens,
+                "tokens_used_estimate": failed_tokens <= 0,
+            }
 
     # ------------------------------------------------------------------ parts
     def part_search(self, query: str = "", domain: str = "", limit: int = 20,

@@ -559,11 +559,16 @@ def test_wi8_a_agent_turn_context_has_reference():
 # WI-10 — refine passes
 # ===========================================================================
 
-def test_wi10_a_refine_limit_is_one():
-    cap = profile_for_letter("A")
-    assert sc.refine_pass_limit(cap) == 1  # 1 + refine_passes(0)
-    assert sc.should_stop_refine(cap, 1) is True
-    assert sc.should_stop_refine(cap, 0) is False
+def test_wi10_refine_limit_counts_only_post_settlement_reworks():
+    cap_zero = profile_for_letter("A")
+    assert sc.refine_pass_limit(cap_zero) == 0
+    assert sc.should_stop_refine(cap_zero, 0) is False
+    assert sc.should_stop_refine(cap_zero, 1) is True
+
+    cap_one = profile_for_letter("B")
+    assert sc.refine_pass_limit(cap_one) == 1
+    assert sc.should_stop_refine(cap_one, 1) is False
+    assert sc.should_stop_refine(cap_one, 2) is True
 
 
 def test_wi10_c_refine_untouched():
@@ -641,7 +646,7 @@ def test_wi10_a_rework_after_a_declared_finish_trips_the_cap():
     dial = _dials(led, "refine_passes")
     assert len(dial) == 1, dial
     assert dial[0]["payload"]["reason"] == "refine_cap"
-    assert dial[0]["payload"]["limit"] == 1
+    assert dial[0]["payload"]["limit"] == 0
     assert res.success is True
     assert res.result["handoff"]["status"] == "done"
     assert res.result["handoff"]["outputs"]["refinement_capped"] is True
@@ -665,7 +670,7 @@ def test_wi10_b_allows_one_rework_before_capping():
     # re-work is refused before it can run.
     assert seen.count("add_features") == 2, seen
     assert seen[-1] in agent_turn._GEOMETRY_SETTLERS, seen
-    assert _dials(led, "refine_passes")[0]["payload"]["limit"] == 2
+    assert _dials(led, "refine_passes")[0]["payload"]["limit"] == 1
     assert res.success is True
     assert res.result["handoff"]["status"] == "done"
 

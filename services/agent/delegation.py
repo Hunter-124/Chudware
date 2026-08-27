@@ -68,12 +68,15 @@ Doc leases
 """
 from __future__ import annotations
 
+import logging
 import time
 import uuid
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
 from services.agent.routing import Resolution, RoutingTable
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -791,6 +794,37 @@ class DelegationTree:
         self._transition(node, "failed", f"sub-agent failed: {reason}")
         self._flush_artifact()
         return node
+
+    def record_terminal_transition_error(
+        self,
+        node_id: str,
+        *,
+        target_status: str,
+        error: BaseException,
+    ) -> None:
+        """Record a failed best-effort terminal write for operator visibility."""
+        logger.exception(
+            "Failed to record terminal status %s for delegation node %s",
+            target_status,
+            node_id,
+        )
+        node = self._nodes.get(node_id)
+        role = node.role if node is not None else "subagent"
+        self._emit_event(
+            actor=role,
+            kind="delegation_terminal_transition_error",
+            payload={
+                "schema": DELEGATION_SCHEMA,
+                "node_id": node_id,
+                "role": role,
+                "target_status": target_status,
+                "error": str(error),
+                "message": (
+                    f"Could not record delegate terminal status {target_status!r}; "
+                    "the coordination board may show a stale running child."
+                ),
+            },
+        )
 
     def accrue(self, node_id: str, tokens: int) -> None:
         """Accrue token spend to *node_id* AND all its ancestors (contract §12).

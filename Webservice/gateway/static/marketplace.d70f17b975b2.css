@@ -1,9 +1,24 @@
+/* Storefront. Colour tokens come from base.css (shared layer); the type scale
+   below mirrors portal.css / chudware.com — keep in sync. */
+.mk-shell {
+  --step--2: .7rem;
+  --step--1: clamp(.78rem, .75rem + .1vw, .86rem);
+  --step-0: clamp(1rem, .96rem + .18vw, 1.1rem);
+  --step-1: clamp(1.2rem, 1.1rem + .45vw, 1.45rem);
+  --step-2: clamp(1.55rem, 1.35rem + .8vw, 2.1rem);
+  --step-3: clamp(2.1rem, 1.65rem + 1.8vw, 3.25rem);
+}
+
+/* icon sizing: mirrors portal.css .icon — keep in sync */
+.icon { width: 1.15em; height: 1.15em; flex: none; }
+
 body { min-width: 300px; overflow-y: scroll; }
 [hidden] { display: none !important; }
 .mk-shell { width: min(1680px, 100%); min-height: 100%; margin: 0 auto; padding: 0 28px 64px; }
 #mk-header { min-height: 72px; display: flex; align-items: center; justify-content: space-between; gap: 24px; border-bottom: 1px solid var(--border); }
 #mk-brand { display: inline-flex; align-items: center; gap: 10px; color: var(--text); text-decoration: none; letter-spacing: -.02em; }
-#mk-brand > span { width: 34px; height: 34px; display: grid; place-items: center; border: 1px solid var(--border-strong); border-radius: 10px; background: var(--teal-dim); color: var(--teal-hi); font: 700 11px/1 var(--mono); letter-spacing: .08em; }
+#mk-brand > span { width: 34px; height: 34px; display: grid; place-items: center; border: 1px solid var(--border-strong); border-radius: 10px; background: var(--teal-dim); color: var(--teal-hi); }
+#mk-brand > span svg { width: 20px; height: 20px; display: block; }
 #mk-brand > strong { font-size: 17px; }
 #mk-primary-nav { display: flex; align-items: center; gap: 6px; }
 #mk-primary-nav a { padding: 8px 11px; border-radius: 9px; color: var(--text-dim); font-weight: 600; text-decoration: none; }
@@ -39,7 +54,7 @@ button.mk-chip:hover, button.mk-chip:focus-visible, .mk-chip[aria-pressed="true"
 #mk-open-hero { position: relative; overflow: hidden; display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: end; gap: 24px; margin: 0 0 24px; padding: 32px; border: 1px solid var(--border-strong); border-radius: calc(var(--radius) + 4px); background: linear-gradient(125deg, var(--teal-dim), var(--bg-panel) 58%, var(--bg-elev)); }
 #mk-open-hero::after { content: ""; position: absolute; width: 320px; height: 320px; right: -100px; top: -190px; border: 1px solid var(--border-strong); border-radius: 50%; box-shadow: 0 0 0 34px var(--teal-dim), 0 0 0 70px var(--bg-soft); opacity: .55; pointer-events: none; }
 #mk-open-hero > * { position: relative; z-index: 1; }
-#mk-open-hero h1 { margin: 0 0 8px; font-size: clamp(26px, 4vw, 48px); line-height: 1.05; }
+#mk-open-hero h1 { margin: 0 0 8px; font-size: var(--step-3); line-height: 1.05; }
 #mk-open-hero p { max-width: 700px; margin: 0 0 18px; color: var(--text-dim); font-size: 15px; }
 #mk-open-licenses { max-width: 620px; }
 #mk-results-summary { display: flex; justify-content: space-between; align-items: center; min-height: 32px; margin-bottom: 12px; color: var(--text-dim); }
@@ -58,7 +73,7 @@ button.mk-chip:hover, button.mk-chip:focus-visible, .mk-chip[aria-pressed="true"
 .mk-card-body h2 a, .mk-card-body h3 a { color: var(--text); text-decoration: none; }
 .mk-card-body > p { display: -webkit-box; overflow: hidden; min-height: 40px; margin: 0 0 10px; color: var(--text-dim); -webkit-box-orient: vertical; -webkit-line-clamp: 2; }
 .mk-badges { display: flex; flex-wrap: wrap; gap: 5px; min-height: 22px; }
-.mk-badge { display: inline-flex; align-items: center; min-height: 22px; padding: 3px 7px; border: 1px solid var(--border); border-radius: 999px; color: var(--text-dim); font-size: 10px; font-weight: 700; letter-spacing: .025em; text-transform: uppercase; }
+.mk-badge { display: inline-flex; align-items: center; min-height: 22px; padding: 3px 8px; border: 1px solid var(--border); border-radius: 999px; color: var(--text-dim); font-size: 11px; font-weight: 650; }
 .mk-badge.is-open { border-color: var(--border-strong); background: var(--teal-dim); color: var(--teal-hi); }
 .mk-badge.is-human { border-color: color-mix(in srgb, var(--ok) 35%, transparent); color: var(--ok); }
 .mk-badge.is-ai { border-color: color-mix(in srgb, var(--warn) 35%, transparent); background: var(--warn-bg); color: var(--warn); }
@@ -82,7 +97,7 @@ button.mk-chip:hover, button.mk-chip:focus-visible, .mk-chip[aria-pressed="true"
 #mk-breadcrumbs { margin-bottom: 18px; color: var(--text-mute); }
 #mk-breadcrumbs a { color: var(--text-dim); text-decoration: none; }
 #mk-detail-head { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 20px; align-items: start; margin-bottom: 20px; }
-#mk-detail-head h1 { margin: 5px 0 8px; font-size: clamp(26px, 4vw, 46px); line-height: 1.08; }
+#mk-detail-head h1 { margin: 5px 0 8px; font-size: var(--step-3); line-height: 1.08; }
 #mk-detail-head p { max-width: 800px; margin: 0; color: var(--text-dim); font-size: 16px; }
 #mk-detail-layout { display: grid; grid-template-columns: minmax(0, 1fr) minmax(300px, 390px); gap: 28px; align-items: start; }
 .mk-gallery { min-width: 0; padding: 12px; border: 1px solid var(--border); border-radius: var(--radius); background: var(--bg-elev); }
@@ -141,7 +156,7 @@ button.mk-chip:hover, button.mk-chip:focus-visible, .mk-chip[aria-pressed="true"
 #mk-overflow { position: relative; text-align: right; }
 #mk-overflow summary { list-style: none; width: 40px; height: 40px; display: grid; place-items: center; border: 1px solid var(--border); border-radius: 10px; background: var(--bg-soft); color: var(--text); cursor: pointer; }
 #mk-overflow summary::-webkit-details-marker { display: none; }
-#mk-overflow summary::before { content: "•••"; letter-spacing: 2px; transform: translateY(-3px); }
+#mk-overflow summary::before { content: ""; width: 4px; height: 4px; border-radius: 50%; background: currentColor; box-shadow: -7px 0 currentColor, 7px 0 currentColor; }
 #mk-overflow > div { position: absolute; z-index: 30; right: 0; top: 48px; width: min(320px, calc(100vw - 48px)); padding: 14px; border: 1px solid var(--border-strong); border-radius: var(--radius-sm); background: var(--bg-panel); box-shadow: var(--shadow); text-align: left; }
 #mk-overflow form { display: grid; gap: 9px; }
 #mk-overlay { position: fixed; z-index: 100; inset: 0; display: grid; place-items: center; padding: 24px; background: color-mix(in srgb, var(--bg) 88%, transparent); backdrop-filter: blur(12px); }
@@ -151,7 +166,7 @@ button.mk-chip:hover, button.mk-chip:focus-visible, .mk-chip[aria-pressed="true"
 #mk-notice { position: fixed; z-index: 120; right: 20px; bottom: 20px; max-width: min(420px, calc(100vw - 40px)); padding: 12px 16px; border: 1px solid var(--border-strong); border-radius: var(--radius-sm); background: var(--bg-panel); box-shadow: var(--shadow); }
 #mk-notice[data-error="true"] { border-color: var(--danger); color: var(--danger); }
 #mk-seller-head, #mk-library-head { display: flex; justify-content: space-between; align-items: end; gap: 18px; padding: 34px 0 22px; }
-#mk-seller-head h1, #mk-library-head h1 { margin: 0 0 5px; font-size: clamp(28px, 4vw, 44px); }
+#mk-seller-head h1, #mk-library-head h1 { margin: 0 0 5px; font-size: var(--step-3); }
 #mk-seller-head p, #mk-library-head p { max-width: 720px; margin: 0; color: var(--text-dim); }
 #mk-library-sections { display: grid; gap: 20px; }
 #mk-library-sections > section > h2 { margin-top: 0; }

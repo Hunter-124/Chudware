@@ -3,14 +3,27 @@ from __future__ import annotations
 import hashlib
 import os
 import re
+import time
 from pathlib import Path
 
 os.environ["CHUDWARE_WEB_DEV"] = "1"
 os.environ.setdefault("CHUDWARE_WEB_DATA_ROOT", str(Path.home() / "chudware-web-data-test"))
 
+import pytest  # noqa: E402
+from fastapi import HTTPException  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
-from gateway import accounts, app as app_mod, authn, billing, db, entitlement, oauth  # noqa: E402
+from gateway import (  # noqa: E402
+    accounts,
+    app as app_mod,
+    authn,
+    billing,
+    db,
+    entitlement,
+    oauth,
+    portal_serve,
+    releases,
+)
 from gateway.config import settings  # noqa: E402
 
 
@@ -284,3 +297,169 @@ def test_portal_device_list_and_revoke_are_account_scoped(pg, monkeypatch):
     revoked = client.delete(f"/api/portal/devices/{own}")
     assert revoked.status_code == 200
     assert entitlement.list_devices(email)[0]["revoked_at"] is not None
+
+
+# ---------------------------------------------------------------------------
+# Download tokens, /install.sh, /brand-assets
+# ---------------------------------------------------------------------------
+
+
+def test_download_token_is_issued_with_the_literal_install_command(pg, monkeypatch):
+    email = "portal-download@example.com"
+    _seed(email)
+    monkeypatch.setattr(settings, "session_secret", "portal-download-secret")
+    monkeypatch.setenv("CHUDWARE_RELEASES_PUBLIC_BASE_URL", "https://app.chudware.test")
+    client = _client(monkeypatch, email)
+    response = client.post("/api/portal/download-token")
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert set(body) == {"token", "expires_in", "install_command"}
+    assert body["expires_in"] == 900
+    assert body["install_command"] == (
+        "curl -fsSL https://app.chudware.test/install.sh | sh -s -- --token "
+        + body["token"]
+    )
+    # The command must be built from the CONFIGURED origin, never the Host
+    # header: this string is one a customer is told to pipe into a shell.
+    spoofed = client.post(
+        "/api/portal/download-token", headers={"Host": "evil.example.com"}
+    )
+    assert "evil.example.com" not in spoofed.json()["install_command"]
+    assert releases._redeem_download_token(body["token"]) == email
+
+
+def test_download_token_is_bound_to_its_own_account(pg, monkeypatch):
+    monkeypatch.setattr(settings, "session_secret", "portal-download-secret")
+    first, second = "portal-dl-a@example.com", "portal-dl-b@example.com"
+    _seed(first)
+    _seed(second)
+    token = _client(monkeypatch, first).post("/api/portal/download-token").json()["token"]
+    assert releases._redeem_download_token(token) == first
+    assert releases._redeem_download_token(token) != second
+    # Cross-signing: B's token minted under B's email must not verify as A's.
+    other = _client(monkeypatch, second).post("/api/portal/download-token").json()["token"]
+    assert releases._redeem_download_token(other) == second
+    assert token != other
+
+
+def test_download_token_requires_a_session(pg, monkeypatch):
+    monkeypatch.setattr(settings, "dev_mode", False)
+    monkeypatch.setattr(settings, "session_secret", "portal-download-secret")
+    response = TestClient(app_mod.app).post("/api/portal/download-token")
+    assert response.status_code == 401
+    # A POST is never redirected to sign-in: that would answer HTML to a fetch.
+    assert "location" not in response.headers
+
+
+def test_download_token_is_refused_for_a_suspended_account(pg, monkeypatch):
+    email = "portal-dl-suspended@example.com"
+    _seed(email)
+    monkeypatch.setattr(settings, "session_secret", "portal-download-secret")
+    client = _client(monkeypatch, email)
+    token = client.post("/api/portal/download-token").json()["token"]
+    accounts.set_status(email, "suspended", decided_by="test")
+    assert releases._redeem_download_token(token) is None
+
+
+def test_download_token_expires_after_fifteen_minutes(pg, monkeypatch):
+    email = "portal-dl-expiry@example.com"
+    _seed(email)
+    monkeypatch.setattr(settings, "session_secret", "portal-download-secret")
+    token = _client(monkeypatch, email).post("/api/portal/download-token").json()["token"]
+    minted_at = int(time.time())
+    assert releases._redeem_download_token(token, now=minted_at + 899) == email
+    assert releases._redeem_download_token(token, now=minted_at + 900) is None
+
+
+def test_install_script_is_served_publicly_as_plain_text(pg, monkeypatch):
+    """`curl … | sh` has no session, so this must answer a script — not the
+    sign-in page — to an anonymous caller."""
+    monkeypatch.setattr(settings, "dev_mode", False)
+    response = TestClient(app_mod.app).get("/install.sh")
+    assert response.status_code == 200, response.text
+    assert response.headers["content-type"] == "text/plain; charset=utf-8"
+    assert response.headers["cache-control"] == "public, max-age=300"
+    assert response.headers["x-content-type-options"] == "nosniff"
+    body = response.text
+    assert body.startswith("#!/bin/sh")
+    assert "--token" in body and "sha256" in body
+    # It is the file in the tree, not a copy that can drift from it.
+    on_disk = (
+        Path(__file__).resolve().parents[3] / "packaging" / "linux" / "install.sh"
+    ).read_text()
+    assert body == on_disk
+
+
+def test_brand_assets_serve_the_fonts_anonymously_and_nothing_else(pg, monkeypatch):
+    """base.css is public and asks for these families by name. Without a public
+    font route the sign-in page and the storefront render in a system font."""
+    monkeypatch.setattr(settings, "dev_mode", False)
+    anonymous = TestClient(app_mod.app)
+    fonts = sorted(
+        (Path(app_mod.__file__).resolve().parent / "static" / "fonts").glob("*.woff2")
+    )
+    assert fonts, "no self-hosted typefaces on disk"
+    for font in fonts:
+        response = anonymous.get(f"/brand-assets/{font.name}")
+        assert response.status_code == 200, f"{font.name}: {response.text[:200]}"
+        assert response.headers["content-type"] == "font/woff2"
+        assert response.headers["cache-control"] == (
+            "public, max-age=31536000, immutable"
+        )
+        assert hashlib.sha256(response.content).hexdigest().startswith(
+            font.name.split(".")[1]
+        )
+
+    # The prefix is two typefaces, not a reader over static/. Anything that is
+    # not a bare content-hashed *.woff2 basename is a 404, including a directory
+    # component that would otherwise reach the same file by a second name.
+    real = fonts[0].name
+    for name in (
+        f"fonts/{real}",
+        real.replace(".woff2", ".txt"),
+        "base.css",
+        "index.html",
+        "login.js",
+        "Rubik-VF.woff2",
+    ):
+        assert anonymous.get(f"/brand-assets/{name}").status_code == 404, name
+
+    # Traversal. A normalising client (httpx, every browser) collapses
+    # "/brand-assets/../x" to "/x" before it is sent, so that spelling never
+    # reaches this route at all — it lands on a non-public path and gets 401.
+    # Percent-encoding is what actually delivers the traversal intact: the ASGI
+    # server decodes it into scope["path"] AFTER routing, so the handler really
+    # does receive "../portal.<hash>.css". That is the case worth asserting.
+    _seed("brand@example.com")
+    portal_css = re.search(
+        r'"/portal-assets/(portal\.[0-9a-f]{12}\.css)"',
+        _client(monkeypatch, "brand@example.com").get("/").text,
+    )
+    assert portal_css, "portal page must load a content-hashed stylesheet"
+    monkeypatch.setattr(settings, "dev_mode", False)
+    for path in (
+        "/brand-assets/%2e%2e/portal-assets/" + portal_css.group(1),
+        "/brand-assets/%2e%2e/" + portal_css.group(1),
+        "/brand-assets/..%2f..%2f..%2f..%2fetc%2fpasswd",
+        f"/brand-assets/%2e%2e/static/fonts/{real}",
+    ):
+        response = anonymous.get(path)
+        assert response.status_code == 404, f"{path} -> {response.status_code}"
+        assert "font-face" not in response.text and "root:" not in response.text
+
+    # The same file by its real, non-traversing name is a 404 too: the suffix
+    # check is what refuses it, and that is the check a normalising client hits.
+    assert anonymous.get(
+        f"/brand-assets/{portal_css.group(1)}"
+    ).status_code == 404
+
+    # Collapsed spelling: not 200, whichever layer refuses it.
+    collapsed = anonymous.get("/brand-assets/../" + portal_css.group(1))
+    assert collapsed.status_code in (401, 404)
+    assert "font-face" not in collapsed.text
+
+    # And the clamp itself, directly: even a woff2-suffixed traversal that got
+    # past the name check could not escape static/.
+    with pytest.raises(HTTPException) as escape:
+        portal_serve._resolve_under_app("../portal_serve.py")
+    assert escape.value.status_code == 400

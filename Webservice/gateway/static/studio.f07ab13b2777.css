@@ -1,3 +1,17 @@
+/* Seller studio. Colour tokens come from base.css (shared storefront layer);
+   the type scale below mirrors portal.css / chudware.com — keep in sync. */
+.st-shell {
+  --step--2: .7rem;
+  --step--1: clamp(.78rem, .75rem + .1vw, .86rem);
+  --step-0: clamp(1rem, .96rem + .18vw, 1.1rem);
+  --step-1: clamp(1.2rem, 1.1rem + .45vw, 1.45rem);
+  --step-2: clamp(1.55rem, 1.35rem + .8vw, 2.1rem);
+  --step-3: clamp(2.1rem, 1.65rem + 1.8vw, 3.25rem);
+}
+
+/* icon sizing: mirrors portal.css .icon — keep in sync */
+.icon { width: 1.15em; height: 1.15em; flex: none; }
+
 .st-shell {
   min-height: 100vh;
   display: grid;
@@ -36,9 +50,8 @@
   border-radius: 12px;
   background: var(--teal-dim);
   color: var(--teal-hi);
-  font: 700 12px/1 var(--mono);
-  letter-spacing: .08em;
 }
+.st-brand-mark svg { width: 22px; height: 22px; display: block; }
 
 .st-brand strong,
 .st-brand small { display: block; }
@@ -61,6 +74,9 @@
 }
 
 .st-nav { display: grid; gap: 4px; }
+.st-nav .icon { margin-right: 10px; color: var(--text-mute); }
+.st-nav a:hover .icon,
+.st-nav a.is-active .icon { color: inherit; }
 .st-nav a {
   display: flex;
   align-items: center;
@@ -103,7 +119,7 @@
   gap: 24px;
   margin-bottom: 28px;
 }
-.st-page-head h1 { margin: 2px 0 6px; font-size: clamp(26px, 3vw, 38px); line-height: 1.12; }
+.st-page-head h1 { margin: 2px 0 6px; font-size: var(--step-2); line-height: 1.12; }
 .st-page-head p:not(.st-eyebrow) { margin: 0; color: var(--text-dim); max-width: 700px; }
 .st-eyebrow {
   margin: 0;
@@ -147,7 +163,8 @@
   color: var(--text-dim);
   font-size: 11px;
   font-weight: 700;
-  text-transform: capitalize;
+  /* No text-transform: chip copy is authored in sentence case; capitalize
+     was rendering "No Listing Fee" / "In Review" Title Case. */
 }
 .st-status.is-published,
 .st-status.is-verified { color: var(--ok); border-color: var(--border-strong); }

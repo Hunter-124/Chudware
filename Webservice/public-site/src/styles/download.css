@@ -1,0 +1,55 @@
+/* /download/ only. Every class is dl-* prefixed so nothing here can collide
+   with global.css or another page slice. Joins the cascade layers global.css
+   declares, exactly like company.css does. */
+
+@layer pages {
+  .dl-primary { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; gap: var(--s6); align-items: center; padding: var(--s6); }
+  .dl-primary[data-state="fallback"] { border-color: var(--line-hi); }
+  .dl-mark { display: grid; place-items: center; width: var(--s8); height: var(--s8); flex: none; border: var(--border) solid var(--line-hi); border-radius: var(--radius); background: var(--bg-deep); color: var(--technical); }
+  .dl-mark .icon { width: var(--s6); height: var(--s6); }
+  .dl-primary-body { display: grid; gap: var(--s2); }
+  .dl-primary-body h2 { font-size: var(--step-2); }
+  .dl-note { max-width: var(--measure); color: var(--muted); }
+  .dl-note:empty { display: none; }
+  .release-meta:empty { display: none; }
+
+  .dl-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: var(--s4); margin-top: var(--s6); }
+  .dl-card { display: flex; min-width: 0; flex-direction: column; align-items: stretch; gap: var(--s4); padding: var(--s6); }
+  .dl-card-head { display: flex; align-items: center; gap: var(--s3); }
+  .dl-card-head .dl-mark { width: var(--s7); height: var(--s7); }
+  .dl-card-head .dl-mark .icon { width: var(--s5); height: var(--s5); }
+  .dl-card-head h3 { font-size: var(--step-1); }
+  .dl-card > p { color: var(--muted); font-size: var(--step--1); }
+  .dl-builds { display: grid; list-style: none; border-top: var(--border) solid var(--line); }
+  .dl-builds:empty { display: none; }
+  .dl-builds li { display: flex; flex-wrap: wrap; justify-content: space-between; gap: var(--s1) var(--s4); padding-block: var(--s3); border-bottom: var(--border) solid var(--line); font-size: var(--step--1); }
+  .dl-builds li span:first-child { color: var(--text); font-weight: 620; }
+  .dl-builds li span + span { color: var(--technical); font: var(--step--1)/1.5 var(--mono); }
+  .dl-card .text-link { margin-top: auto; font-size: var(--step--1); }
+  .dl-sysnote { margin-top: var(--s5); font-size: var(--step--1); }
+
+  /* min-width: 0 at every level, or the nowrap command widens the whole
+     .split column and paints under the formats list beside it. */
+  .dl-command-row { display: flex; flex-wrap: wrap; gap: var(--s3); align-items: stretch; min-width: 0; max-width: var(--measure); }
+  .dl-command { flex: 1 1 24rem; min-width: 0; overflow-x: auto; padding: var(--s4); border: var(--border) solid var(--line-hi); border-radius: var(--radius-sm); background: var(--bg-deep); white-space: nowrap; }
+  .dl-token-note { margin-top: var(--s4); font-size: var(--step--1); }
+  .dl-copy-status { min-height: 1.5em; margin-top: var(--s2); color: var(--faint); font: var(--step--1)/1.5 var(--mono); }
+
+  .dl-formats { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); column-gap: var(--s7); align-content: start; margin-top: var(--s6); border-top: var(--border) solid var(--line); }
+  .dl-formats > div { display: grid; grid-template-columns: minmax(8rem, .4fr) minmax(0, 1fr); gap: var(--s4); padding-block: var(--s4); border-bottom: var(--border) solid var(--line); }
+  .dl-formats dt { display: flex; align-items: center; gap: var(--s2); color: var(--technical-hi); font: var(--step--1)/1.5 var(--mono); }
+  .dl-formats dd { color: var(--muted); font-size: var(--step--1); }
+}
+
+@layer responsive {
+  @media (max-width: 60rem) {
+    .dl-grid { grid-template-columns: 1fr; }
+    .dl-formats { grid-template-columns: 1fr; }
+  }
+  @media (max-width: 45rem) {
+    .dl-primary { grid-template-columns: minmax(0, 1fr); padding: var(--s5); }
+    .dl-primary > .button { justify-self: start; }
+    .dl-card { padding: var(--s5); }
+    .dl-formats > div { grid-template-columns: 1fr; gap: var(--s1); }
+  }
+}

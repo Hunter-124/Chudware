@@ -12,6 +12,26 @@
  * this file into app.chudware.com/app cannot restyle the canvas host page.
  */
 
+/* Brand typography, self-hosted; same two faces as portal.css and chudware.com.
+   Served from the public /brand-assets route so the desktop app's modal host
+   (and any future anonymous embed) can fetch them without a portal session.
+   @font-face only registers faces — it cannot restyle the host page. */
+@font-face {
+  font-family: "Chudware Sans";
+  src: url("/brand-assets/Rubik-VF.247dbaa0aa4a.woff2") format("woff2-variations");
+  font-style: normal;
+  font-weight: 300 900;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: "Chudware Mono";
+  src: url("/brand-assets/JetBrainsMono-Regular.8f0f0cc0353e.woff2") format("woff2");
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+}
+
 .bucket-page,
 .bucket-surface {
   color-scheme: dark;
@@ -31,7 +51,18 @@
   --hover: rgba(255, 255, 255, .045);
   --ring: 0 0 0 3px rgba(66, 236, 206, .18);
   --shadow: 0 22px 60px rgba(0, 0, 0, .3);
-  --font: Inter, ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  --faint: #6c7b8c;
+  --teal-wash: rgba(66, 236, 206, .09);
+  /* Type and space scale: mirrors portal.css token layer — keep in sync. */
+  --sans: "Chudware Sans", "Arial Narrow", sans-serif;
+  --mono: "Chudware Mono", ui-monospace, Consolas, monospace;
+  --step--2: .7rem;
+  --step--1: clamp(.78rem, .75rem + .1vw, .86rem);
+  --step-0: clamp(1rem, .96rem + .18vw, 1.1rem);
+  --step-1: clamp(1.2rem, 1.1rem + .45vw, 1.45rem);
+  --radius-sm: .25rem;
+  --radius: .625rem;
+  --radius-lg: 1rem;
 }
 
 .bucket-page,
@@ -46,6 +77,10 @@
 .bucket-page [hidden],
 .bucket-surface [hidden] { display: none !important; }
 
+/* icon sizing: mirrors portal.css .icon — keep in sync */
+.bucket-page .icon,
+.bucket-surface .icon { width: 1.15em; height: 1.15em; flex: none; }
+
 /* ========================================================== standalone page */
 
 .bucket-page {
@@ -56,7 +91,7 @@
     radial-gradient(900px 540px at 82% -5%, rgba(66, 236, 206, .08), transparent 62%),
     radial-gradient(700px 500px at 50% 110%, rgba(109, 152, 255, .07), transparent 60%),
     var(--bg);
-  font-family: var(--font);
+  font-family: var(--sans);
   -webkit-font-smoothing: antialiased;
 }
 
@@ -68,7 +103,7 @@
   background: #fff;
   color: #000;
   padding: 10px 14px;
-  border-radius: 9px;
+  border-radius: var(--radius);
   font-weight: 650;
   text-decoration: none;
   transition: top .15s ease-out;
@@ -95,13 +130,19 @@
   gap: 10px;
   color: var(--text);
   text-decoration: none;
-  font-weight: 750;
-  letter-spacing: .01em;
 }
 .bucket-page .brand svg { width: 30px; height: 30px; color: var(--teal); }
+/* The wordmark treatment shared with the site and portal sidebar:
+   logo mark + CHUDWARE, uppercase, .08em tracking. */
+.bucket-page .brand span {
+  font-size: var(--step--1);
+  font-weight: 700;
+  letter-spacing: .08em;
+  text-transform: uppercase;
+}
 .bucket-page .brand-tag {
   color: var(--muted);
-  font: 650 .68rem ui-monospace, SFMono-Regular, monospace;
+  font: 650 var(--step--2) var(--mono);
   text-transform: uppercase;
   letter-spacing: .09em;
   border: 1px solid var(--edge);
@@ -110,12 +151,15 @@
 }
 .bucket-page .topbar-spacer { flex: 1; }
 .bucket-page .back-link {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
   color: var(--muted);
   text-decoration: none;
-  font-size: .86rem;
+  font-size: var(--step--1);
   padding: 8px 12px;
   border: 1px solid transparent;
-  border-radius: 9px;
+  border-radius: var(--radius);
 }
 .bucket-page .back-link:hover,
 .bucket-page .back-link:focus-visible { color: var(--text); border-color: var(--edge); }
@@ -125,10 +169,10 @@
   margin: 0 0 20px;
   padding: 13px 16px;
   border: 1px solid var(--edge);
-  border-radius: 11px;
+  border-radius: var(--radius);
   background: var(--panel-2);
   color: var(--muted);
-  font-size: .86rem;
+  font-size: var(--step--1);
 }
 
 @media (max-width: 720px) {
@@ -141,8 +185,8 @@
 
 .bucket-surface {
   color: var(--text);
-  font-family: var(--font);
-  font-size: 15px;
+  font-family: var(--sans);
+  font-size: var(--step-0);
   line-height: 1.45;
   text-align: left;
   -webkit-font-smoothing: antialiased;
@@ -170,7 +214,7 @@
   gap: 18px;
   padding: 16px 18px;
   border: 1px solid var(--edge-soft);
-  border-radius: 14px;
+  border-radius: var(--radius-lg);
   background:
     linear-gradient(180deg, rgba(255, 255, 255, .022), transparent 70%),
     var(--panel);
@@ -190,7 +234,7 @@
   place-items: center;
   width: 42px;
   height: 42px;
-  border-radius: 12px;
+  border-radius: var(--radius);
   border: 1px solid var(--edge);
   background: var(--panel-3);
   color: var(--muted);
@@ -207,7 +251,7 @@
 .bucket-surface .dest-kind {
   margin: 0 0 3px;
   color: var(--muted);
-  font: 650 .66rem ui-monospace, SFMono-Regular, monospace;
+  font: 650 var(--step--2) var(--mono);
   text-transform: uppercase;
   letter-spacing: .1em;
 }
@@ -216,7 +260,7 @@
 .bucket-surface .dest-kind.is-pending { color: var(--muted); }
 .bucket-surface h1 {
   margin: 0 0 5px;
-  font-size: 1.32rem;
+  font-size: var(--step-1);
   line-height: 1.2;
   letter-spacing: -.01em;
   overflow-wrap: anywhere;
@@ -224,7 +268,7 @@
 .bucket-surface .scope-context {
   margin: 0;
   color: var(--muted);
-  font-size: .82rem;
+  font-size: var(--step--1);
   overflow-wrap: anywhere;
 }
 
@@ -236,7 +280,7 @@
 }
 .bucket-surface .dest-picker label {
   color: var(--muted);
-  font-size: .66rem;
+  font-size: var(--step--2);
   text-transform: uppercase;
   letter-spacing: .09em;
   font-weight: 650;
@@ -245,12 +289,12 @@
   width: 100%;
   min-height: 40px;
   border: 1px solid var(--edge);
-  border-radius: 10px;
+  border-radius: var(--radius);
   background: var(--panel-3);
   color: var(--text);
   padding: 8px 12px;
   font: inherit;
-  font-size: .88rem;
+  font-size: var(--step--1);
   outline: 0;
   cursor: pointer;
 }
@@ -267,10 +311,10 @@
   margin: 0;
   padding: 11px 14px;
   border: 1px solid rgba(255, 113, 133, .35);
-  border-radius: 11px;
+  border-radius: var(--radius);
   background: rgba(255, 113, 133, .08);
   color: var(--danger-text);
-  font-size: .83rem;
+  font-size: var(--step--1);
   line-height: 1.45;
 }
 
@@ -279,7 +323,7 @@
 .bucket-surface .card {
   background: var(--panel);
   border: 1px solid var(--edge-soft);
-  border-radius: 15px;
+  border-radius: var(--radius-lg);
   box-shadow: var(--shadow);
   overflow: hidden;
 }
@@ -310,9 +354,9 @@
   background: transparent;
   color: var(--muted);
   font: inherit;
-  font-size: .85rem;
+  font-size: var(--step--1);
   padding: 5px 8px;
-  border-radius: 8px;
+  border-radius: var(--radius-sm);
   cursor: pointer;
 }
 .bucket-surface .crumb:hover:not(:disabled) { color: var(--text); background: var(--hover); }
@@ -322,7 +366,7 @@
 .bucket-surface .crumb-sep {
   flex: none;
   color: var(--edge);
-  font-size: .85rem;
+  font-size: var(--step--1);
   user-select: none;
 }
 
@@ -341,16 +385,15 @@
   min-height: 36px;
   padding: 8px 13px;
   border: 1px solid var(--edge);
-  border-radius: 9px;
+  border-radius: var(--radius);
   background: transparent;
   color: var(--text);
   font: inherit;
-  font-size: .85rem;
+  font-size: var(--step--1);
   white-space: nowrap;
   cursor: pointer;
   transition: border-color .12s ease-out, background .12s ease-out;
 }
-.bucket-surface .btn svg { width: 15px; height: 15px; flex: none; }
 .bucket-surface .btn:hover { border-color: var(--teal-2); background: var(--hover); }
 .bucket-surface .btn:focus-visible { outline: 0; border-color: var(--teal); box-shadow: var(--ring); }
 .bucket-surface .btn.primary {
@@ -377,7 +420,7 @@
   margin: 14px 16px 4px;
   padding: 13px 16px;
   border: 1.5px dashed var(--edge);
-  border-radius: 12px;
+  border-radius: var(--radius);
   background: rgba(255, 255, 255, .012);
   color: var(--muted);
   text-align: left;
@@ -391,8 +434,8 @@
   transition: color .12s ease-out;
 }
 .bucket-surface .drop-copy { display: grid; gap: 2px; min-width: 0; }
-.bucket-surface .drop-title { font-size: .85rem; color: var(--text); font-weight: 600; }
-.bucket-surface .drop-hint { font-size: .77rem; }
+.bucket-surface .drop-title { font-size: var(--step--1); color: var(--text); font-weight: 600; }
+.bucket-surface .drop-hint { font-size: var(--step--2); }
 .bucket-surface .drop-zone.drag {
   border-color: var(--teal);
   border-style: solid;
@@ -422,14 +465,14 @@
   padding: 7px 10px 8px;
   border-bottom: 1px solid var(--edge-soft);
   color: var(--muted);
-  font: 650 .66rem ui-monospace, SFMono-Regular, monospace;
+  font: 650 var(--step--2) var(--mono);
   text-transform: uppercase;
   letter-spacing: .09em;
 }
 
 .bucket-surface .row {
   padding: 8px 10px;
-  border-radius: 10px;
+  border-radius: var(--radius);
   border: 1px solid transparent;
 }
 .bucket-surface .row:hover,
@@ -451,10 +494,10 @@
   padding: 3px 2px;
   color: var(--text);
   font: inherit;
-  font-size: .89rem;
+  font-size: var(--step--1);
   text-decoration: none;
   cursor: pointer;
-  border-radius: 7px;
+  border-radius: var(--radius-sm);
 }
 .bucket-surface .row-name:hover { color: var(--teal); }
 .bucket-surface .row-name:focus-visible { outline: 0; box-shadow: var(--ring); }
@@ -462,7 +505,7 @@
 .bucket-surface .row-size,
 .bucket-surface .row-when {
   color: var(--muted);
-  font-size: .76rem;
+  font-size: var(--step--2);
   font-variant-numeric: tabular-nums;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -480,9 +523,9 @@
   background: transparent;
   color: var(--muted);
   font: inherit;
-  font-size: .76rem;
+  font-size: var(--step--2);
   padding: 5px 8px;
-  border-radius: 7px;
+  border-radius: var(--radius-sm);
   cursor: pointer;
   text-decoration: none;
   white-space: nowrap;
@@ -511,13 +554,13 @@
 .bucket-surface .list-state p {
   margin: 0;
   color: var(--muted);
-  font-size: .87rem;
+  font-size: var(--step--1);
   max-width: 44ch;
   line-height: 1.5;
 }
 .bucket-surface .list-state .state-title {
   color: var(--text);
-  font-size: .95rem;
+  font-size: var(--step-0);
   font-weight: 650;
 }
 .bucket-surface .list-state.error .state-glyph { color: rgba(255, 113, 133, .6); }
@@ -527,7 +570,7 @@
   display: block;
   margin-top: 6px;
   color: var(--muted);
-  font: .76rem/1.5 ui-monospace, SFMono-Regular, monospace;
+  font: var(--step--2)/1.5 var(--mono);
   overflow-wrap: anywhere;
 }
 .bucket-surface .list-state.loading .state-spinner {
@@ -541,7 +584,7 @@
 .bucket-surface .skeleton-rows { width: 100%; display: grid; gap: 9px; }
 .bucket-surface .skeleton-row {
   height: 15px;
-  border-radius: 6px;
+  border-radius: var(--radius-sm);
   background: linear-gradient(90deg, rgba(255, 255, 255, .05), rgba(255, 255, 255, .085), rgba(255, 255, 255, .05));
   background-size: 260% 100%;
   animation: bucket-shimmer 1.5s ease-in-out infinite;
@@ -579,7 +622,7 @@
   margin: 0;
   flex: none;
   color: var(--muted);
-  font-size: .74rem;
+  font-size: var(--step--2);
   font-variant-numeric: tabular-nums;
   white-space: nowrap;
 }
@@ -598,7 +641,7 @@
 .bucket-surface .status {
   min-height: 1.25em;
   color: var(--muted);
-  font-size: .8rem;
+  font-size: var(--step--1);
   overflow-wrap: anywhere;
 }
 .bucket-surface .status.ok { color: var(--teal); }
@@ -609,27 +652,27 @@
 .bucket-surface dialog {
   width: min(430px, calc(100vw - 40px));
   border: 1px solid var(--edge);
-  border-radius: 14px;
+  border-radius: var(--radius-lg);
   background: var(--panel-2);
   color: var(--text);
-  font-family: var(--font);
-  font-size: 15px;
+  font-family: var(--sans);
+  font-size: var(--step-0);
   padding: 22px;
   box-shadow: var(--shadow);
 }
 .bucket-surface dialog::backdrop { background: rgba(4, 7, 10, .66); backdrop-filter: blur(2px); }
-.bucket-surface dialog h2 { margin: 0 0 10px; font-size: 1.02rem; }
-.bucket-surface dialog p { margin: 0 0 16px; color: var(--muted); font-size: .86rem; line-height: 1.5; }
-.bucket-surface dialog label { display: block; margin-bottom: 6px; color: var(--muted); font-size: .78rem; }
+.bucket-surface dialog h2 { margin: 0 0 10px; font-size: var(--step-0); }
+.bucket-surface dialog p { margin: 0 0 16px; color: var(--muted); font-size: var(--step--1); line-height: 1.5; }
+.bucket-surface dialog label { display: block; margin-bottom: 6px; color: var(--muted); font-size: var(--step--2); }
 .bucket-surface dialog input[type="text"] {
   width: 100%;
   border: 1px solid var(--edge);
-  border-radius: 9px;
+  border-radius: var(--radius);
   background: var(--panel-3);
   color: var(--text);
   padding: 10px 12px;
   font: inherit;
-  font-size: .9rem;
+  font-size: var(--step--1);
   outline: 0;
   margin-bottom: 16px;
 }
@@ -647,6 +690,8 @@
 
 @container bucket (max-width: 720px) {
   .bucket-surface .surface-head { flex-direction: column; align-items: stretch; padding: 14px; }
+  /* In column direction the row flex-basis (320px) would become HEIGHT. */
+  .bucket-surface .dest-identity { flex: 0 0 auto; }
   .bucket-surface .dest-picker { flex: 1 1 auto; min-width: 0; }
   .bucket-surface .toolbar { padding: 11px 13px; }
   .bucket-surface .crumbs { flex: 1 1 100%; }

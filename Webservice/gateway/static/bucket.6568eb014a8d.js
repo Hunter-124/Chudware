@@ -32,12 +32,45 @@
   // is bounded and surfaces a retryable error instead.
   var READ_TIMEOUT_MS = 20000;
 
+  // Row and state icons. Line style mirrors the portal icon set: 24 viewBox,
+  // stroke 1.7, round caps/joins, decorative (aria-hidden) with the adjacent
+  // text carrying the meaning.
+  function lineIcon(body) {
+    return '<svg class="icon" viewBox="0 0 24 24" aria-hidden="true" fill="none" ' +
+           'stroke="currentColor" stroke-width="1.7" stroke-linecap="round" ' +
+           'stroke-linejoin="round">' + body + "</svg>";
+  }
+
   var ICONS = {
-    dir: '<svg class="icon" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7z"/></svg>',
-    file: '<svg class="icon" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6"/></svg>',
+    dir: lineIcon('<path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7z"/>'),
+    file: lineIcon('<path d="M14 2.6H6.2A1.8 1.8 0 0 0 4.4 4.4v15.2a1.8 1.8 0 0 0 1.8 1.8h11.6a1.8 1.8 0 0 0 1.8-1.8V8.2z"/><path d="M14 2.6v5.6h5.6"/>'),
+    doc: lineIcon('<path d="M14 2.6H6.2A1.8 1.8 0 0 0 4.4 4.4v15.2a1.8 1.8 0 0 0 1.8 1.8h11.6a1.8 1.8 0 0 0 1.8-1.8V8.2z"/><path d="M14 2.6v5.6h5.6M8.4 13h7.2M8.4 16.4h4.8"/>'),
+    image: lineIcon('<rect x="3.6" y="4.6" width="16.8" height="14.8" rx="2.2"/><circle cx="9" cy="9.6" r="1.6"/><path d="M20.4 15.4 15.8 10.8l-7.4 7.4"/>'),
+    model: lineIcon('<path d="M3.6 7.9 12 3.6l8.4 4.3v8.2L12 20.4 3.6 16.1z"/><path d="M3.6 7.9 12 12.2l8.4-4.3M12 12.2v8.2"/>'),
+    archive: lineIcon('<path d="M4.6 4.6h14.8v3.6H4.6zM6 8.2v11.2h12V8.2"/><path d="M10.4 11.8h3.2"/>'),
+    code: lineIcon('<rect x="3" y="4.6" width="18" height="14.8" rx="2.2"/><path d="M7.4 10l2.6 2.4-2.6 2.4M12.8 15h4"/>'),
     empty: '<svg class="state-glyph" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7z"/><path d="M12 11v5M9.5 13.5h5"/></svg>',
     error: '<svg class="state-glyph" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 7.5v5.5M12 16.2v.6"/></svg>',
   };
+
+  // Extension -> ICONS key. CAD and mesh formats get the package icon; the
+  // fallback for anything unlisted is the plain file.
+  var EXT_ICONS = {};
+  [
+    ["model", "step stp iges igs stl obj 3mf amf brep sldprt sldasm prt asm f3d fcstd scad aicm dxf dwg"],
+    ["image", "png jpg jpeg gif webp svg bmp tif tiff avif heic"],
+    ["archive", "zip tar gz tgz bz2 xz zst 7z rar"],
+    ["code", "js mjs ts py c cc cpp h hpp rs go java kt swift sh bat json xml yaml yml toml ini cfg html css"],
+    ["doc", "txt md rst rtf csv tsv log pdf doc docx odt"],
+  ].forEach(function (group) {
+    group[1].split(" ").forEach(function (ext) { EXT_ICONS[ext] = group[0]; });
+  });
+
+  function iconFor(name) {
+    var match = /\.([a-z0-9]+)$/i.exec(name || "");
+    var kind = match && EXT_ICONS[match[1].toLowerCase()];
+    return (kind && ICONS[kind]) || ICONS.file;
+  }
 
   // ------------------------------------------------------------- formatting
 
@@ -296,7 +329,7 @@
 
     function scopeLabel() {
       return state.team ? "the " + state.team.name + " team space (" + state.team.orgName + ")"
-                        : "your personal bucket";
+                        : "your personal space";
     }
 
     // ------------------------------------------------------------ destinations
@@ -488,7 +521,7 @@
 
     function fileRow(f) {
       var li = elem("li", "row");
-      li.insertAdjacentHTML("afterbegin", ICONS.file);
+      li.insertAdjacentHTML("afterbegin", iconFor(f.name));
       var name = elem("a", "row-name", f.name);
       name.href = "/api/bucket/download?" + bucketQuery({ path: f.path });
       name.setAttribute("download", "");
@@ -710,23 +743,23 @@
           doneBatches++;
           progressEl.value = doneBatches;
           if (totalBatches > 1) {
-            setStatus("Uploading to " + destination + "… " + doneBatches + "/" + totalBatches +
-                      " batch(es), " + uploadedCount + " file(s) done so far");
+            setStatus("Uploading to " + destination + "… part " + doneBatches + " of " +
+                      totalBatches + ", " + plural(uploadedCount, "file") + " done so far");
           }
         }
       }
 
-      setStatus("Uploading " + entries.length + " file(s) to " + destination +
-                (totalBatches > 1 ? " in " + totalBatches + " batch(es)" : "") + "…");
+      setStatus("Uploading " + plural(entries.length, "file") + " to " + destination +
+                (totalBatches > 1 ? " in " + plural(totalBatches, "part") : "") + "…");
       var workers = [];
       for (var i = 0; i < Math.min(UPLOAD_CONCURRENCY, totalBatches); i++) workers.push(worker());
       await Promise.all(workers);
 
       progressEl.hidden = true;
-      var msg = "Uploaded " + uploadedCount + " file(s) to " + destination + ".";
-      if (skippedCount) msg += " Skipped " + skippedCount + ".";
-      if (oversize.length) msg += " " + oversize.length + " file(s) exceeded the ~95MB single-request limit (Cloudflare Tunnel cap) and were not uploaded.";
-      if (failedBatches.length) msg += " " + failedBatches.length + " batch(es) failed: " + failedBatches[0] + (failedBatches.length > 1 ? " (+" + (failedBatches.length - 1) + " more)" : "");
+      var msg = "Uploaded " + plural(uploadedCount, "file") + " to " + destination + ".";
+      if (skippedCount) msg += " " + plural(skippedCount, "file") + " had a name that can't be stored and " + (skippedCount === 1 ? "was" : "were") + " skipped.";
+      if (oversize.length) msg += " " + plural(oversize.length, "file") + " over the 95 MB browser upload limit " + (oversize.length === 1 ? "was" : "were") + " not uploaded — use the desktop app for very large files.";
+      if (failedBatches.length) msg += " " + plural(failedBatches.length, "part") + " failed: " + failedBatches[0] + (failedBatches.length > 1 ? " (+" + (failedBatches.length - 1) + " more)" : "");
       setStatus(msg, (failedBatches.length || oversize.length) ? "err" : "ok");
       // Only repaint if the user is still looking at the destination we wrote to.
       if (state.dir === dir && (state.team ? state.team.id : null) === teamId) refresh();

@@ -1,9 +1,6 @@
-/* chudware-web /admin — deploy ops card */
-
-.deploy-card h2 {
-  margin: 0 0 12px;
-  font-size: 1rem;
-}
+/* chudware-web /admin — deploy ops card.
+   Card headings come from admin.html's shared .admin-card h2 rule; this file
+   used to duplicate them per card. */
 
 .deploy-card .deploy-section {
   margin: 0 0 12px;
@@ -15,7 +12,7 @@
 
 .deploy-card .deploy-label {
   display: block;
-  font-size: 0.85rem;
+  font-size: var(--step--1);
   color: var(--muted, #8b93a3);
   margin: 0 0 8px;
 }
@@ -32,7 +29,7 @@
   display: inline-flex;
   align-items: center;
   gap: 6px;
-  font-size: 0.88rem;
+  font-size: var(--step--1);
   color: var(--fg, #e8eaf0);
   cursor: pointer;
   user-select: none;
@@ -59,7 +56,7 @@
 }
 
 .deploy-note {
-  font-size: 0.78rem;
+  font-size: var(--step--1);
   color: var(--muted, #8b93a3);
   margin: 0 0 10px;
   line-height: 1.35;
@@ -77,7 +74,7 @@
   display: inline-block;
   padding: 4px 10px;
   border-radius: 999px;
-  font-size: 0.78rem;
+  font-size: var(--step--1);
   min-height: 28px;
   line-height: 1.4;
   border: 1px solid transparent;
@@ -111,8 +108,8 @@
   max-height: 180px;
   overflow-y: auto;
   overflow-x: hidden;
-  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-  font-size: 0.72rem;
+  font-family: var(--mono, ui-monospace, Consolas, monospace);
+  font-size: var(--step--2);
   line-height: 1.4;
   background: #0b0d12;
   border: 1px solid var(--border, #2a2e36);
@@ -125,10 +122,6 @@
   box-sizing: border-box;
 }
 
-.releases-card h2 {
-  margin: 0 0 12px;
-  font-size: 1rem;
-}
 
 .releases-list {
   display: flex;
@@ -155,13 +148,15 @@
 }
 
 .release-name {
-  font-size: 0.88rem;
+  font-size: var(--step--1);
   color: var(--fg, #e8eaf0);
   overflow-wrap: anywhere;
 }
 
 .release-meta {
-  font-size: 0.76rem;
+  /* Sizes and stamps are data: mono per the type rules. */
+  font-family: var(--mono, monospace);
+  font-size: var(--step--2);
   color: var(--muted, #8b93a3);
 }
 
@@ -191,7 +186,7 @@
 .release-upload input[type="file"] {
   flex: 1 1 auto;
   min-width: 0;
-  font-size: 0.8rem;
+  font-size: var(--step--1);
   color: var(--muted, #8b93a3);
 }
 
@@ -203,7 +198,7 @@
 
 .release-upload-status {
   flex: 0 0 100%;
-  font-size: 0.76rem;
+  font-size: var(--step--2);
   color: var(--muted, #8b93a3);
   overflow-wrap: anywhere;
 }

@@ -82,14 +82,40 @@ SUPPORT_EMAIL = "support@chudware.com"
 # "login". "/static/base.css" is an exact entry, not a prefix, so it does not
 # open /static: it is the shared design-token stylesheet, it contains no data,
 # and the storefront cannot render without it.
+#
+# The three download entries below are the same shape of decision.
+#
+# "/api/releases/available" is the anonymous download catalogue: platform,
+# arch, format, version, size, sha256 and a notes URL for the newest build of
+# each tuple. It deliberately carries NO artifact URL and NO signature for any
+# caller, so it grants nothing an attacker could not learn by installing the
+# product, and the downloads page has to render real versions and sizes before
+# anyone signs in. Downloading still requires a session, an entitlement or a
+# download token, enforced by _may_download inside the artifact route.
+#
+# "/install.sh" is the Linux installer script. The command customers are given
+# is `curl -fsSL .../install.sh | sh -s -- --token <token>`; the token
+# authorises the download, not the fetch of the script, and gating the script
+# behind a session would only pipe an HTML sign-in page into a shell. It is a
+# static file in the checkout, it contains no secret, and it is a single exact
+# path rather than a prefix.
+#
+# "/brand-assets" is two content-hashed WOFF2 typefaces and nothing else. It
+# exists because neither existing public asset prefix can serve them:
+# /portal-assets is not public at all, and /auth-assets requires the filename to
+# start with "login". base.css — already public — asks for those families by
+# name, so without this the anonymous sign-in page and storefront render in a
+# system font. The route refuses anything that is not a bare hashed *.woff2
+# resolved inside static/fonts/, so opening the prefix does not open /static.
 PUBLIC_PATHS = frozenset(
     {
         "/healthz", "/api/billing/webhook", "/api/entitlement/refresh",
         "/api/security/events", "/api/releases/latest", "/api/auth",
         "/api/releases/base-version", "/api/releases/ci", "/api/releases/artifact",
+        "/api/releases/available",
         "/signin", "/signup", "/forgot", "/reset", "/auth-assets",
         "/marketplace", "/api/marketplace", "/marketplace-assets",
-        "/static/base.css",
+        "/static/base.css", "/install.sh", "/brand-assets",
     }
 )
 

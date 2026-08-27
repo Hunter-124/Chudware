@@ -2,17 +2,36 @@ from __future__ import annotations
 
 import gzip
 import json
+import os
 import time
 import uuid
+from pathlib import Path
 
-import pytest
-from cryptography.hazmat.primitives import serialization
-from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
-from fastapi import FastAPI
-from fastapi.testclient import TestClient
+# Before ANY gateway import: config.Settings is built once, at import time, from
+# the environment as it stands then. Whichever gateway test module pytest
+# imports first therefore decides dev_mode for the whole session, and without
+# this preamble a combined run in which this file is collected first leaves
+# dev_mode False — which makes AuthMiddleware refuse to construct and every
+# real-app test in a sibling module fail with "no strong auth configured".
+# Same preamble as test_portal.py, test_releases.py and test_releases_ci.py.
+os.environ["CHUDWARE_WEB_DEV"] = "1"
+os.environ.setdefault(
+    "CHUDWARE_WEB_DATA_ROOT", str(Path.home() / "chudware-web-data-test")
+)
 
-from Webservice.gateway import accounts, entitlement, security
-from Webservice.gateway.db import tx
+import pytest  # noqa: E402
+from cryptography.hazmat.primitives import serialization  # noqa: E402
+from cryptography.hazmat.primitives.asymmetric.ed25519 import (  # noqa: E402
+    Ed25519PrivateKey,
+)
+from fastapi import FastAPI  # noqa: E402
+from fastapi.testclient import TestClient  # noqa: E402
+
+# `gateway.*`, not `Webservice.gateway.*`: conftest puts both the gateway dir and
+# its parent on sys.path, so only this spelling resolves when the suite is run
+# from Webservice/gateway, which is the documented invocation.
+from gateway import accounts, entitlement, security  # noqa: E402
+from gateway.db import tx  # noqa: E402
 
 
 @pytest.fixture

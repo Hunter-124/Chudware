@@ -1,4 +1,31 @@
-/* Chudware web — shared design tokens, page reset and button family. */
+/* Chudware web — shared design tokens, page reset and button family.
+ *
+ * Linked by the storefront, the seller studio, the sign-in page and the file
+ * bucket. "/static/base.css" is an EXACT entry in auth.PUBLIC_PATHS (not a
+ * prefix), so this file is fetchable anonymously and everything it references
+ * must be too — hence /brand-assets for the typefaces rather than
+ * /portal-assets, which is authenticated-only.
+ */
+
+/* --font and --mono below have always named "Rubik" and "JetBrains Mono", but
+ * nothing ever loaded them, so every page using this stylesheet silently fell
+ * back to a system sans while chudware.com rendered Rubik. These two rules are
+ * that fix; the families are self-hosted and content-hashed. */
+@font-face {
+  font-family: "Chudware Sans";
+  src: url("/brand-assets/Rubik-VF.247dbaa0aa4a.woff2") format("woff2-variations");
+  font-style: normal;
+  font-weight: 300 900;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: "Chudware Mono";
+  src: url("/brand-assets/JetBrainsMono-Regular.8f0f0cc0353e.woff2") format("woff2");
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+}
 
 :root {
   --bg: #0b0d12;
@@ -21,8 +48,8 @@
   --shadow: 0 18px 48px rgba(0, 0, 0, 0.45);
   --radius: 14px;
   --radius-sm: 10px;
-  --font: "Rubik", "Segoe UI", system-ui, -apple-system, sans-serif;
-  --mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+  --font: "Chudware Sans", "Rubik", "Segoe UI", system-ui, -apple-system, sans-serif;
+  --mono: "Chudware Mono", "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
 }
 
 * { box-sizing: border-box; }

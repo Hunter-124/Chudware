@@ -39,7 +39,7 @@
     event.preventDefault(); var button = this.querySelector("button[type=submit]"); button.disabled = true; setStatus("Signing in…", false);
     try {
       var result = await api("/api/auth/login", { email: el("login-email").value, password: el("login-password").value });
-      setStatus(result.status === "active" ? "Signed in. Opening your account…" : "Signed in. Checking account status…", false);
+      setStatus(result.status === "active" ? "Signed in. Opening your account…" : "Signed in — one more step. Taking you there…", false);
       window.location.assign(safeNext());
     } catch (error) { setStatus(error.message, true); button.disabled = false; }
   });

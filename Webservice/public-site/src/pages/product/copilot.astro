@@ -1,6 +1,7 @@
 ---
 import BaseLayout from '../../layouts/BaseLayout.astro';
 import '../../styles/product.css';
+import Icon from '../../components/Icon.astro';
 ---
 <BaseLayout title="AI copilot" description="An AI copilot that works inside the open Chudware document: it drives real modeling tools, its geometry lands in the same feature tree, and provider keys stay with your own account.">
   <header class="page-hero">
@@ -136,7 +137,7 @@ import '../../styles/product.css';
         </header>
         <p class="product-body">During onboarding you choose how AI work is paid for and where it is sent. Managed work consumes Chudware credits. Bring-your-own-key work is sent directly through the provider you configured and does not consume Chudware credits.</p>
         <p class="product-body">A provider key you add belongs to your account and is entered in Chudware's AI setup screen. It is a secret: never paste it into a chat message or a project note.</p>
-        <p class="product-body"><a class="text-link" href="/pricing/">Access and commercial status <span aria-hidden="true">&rarr;</span></a></p>
+        <p class="product-body"><a class="text-link" href="/pricing/">Access and commercial status <Icon name="arrow-right" /></a></p>
       </div>
       <div class="product-spec-wrap">
         <table class="product-spec">
@@ -155,7 +156,7 @@ import '../../styles/product.css';
       <div class="product-note product-note-warning product-stack product-span-all">
         <p class="eyebrow">Machine actions stay deliberate</p>
         <p>The copilot may prepare CAM operations and output, but anything that affects a physical machine requires explicit operator review and control. Safety, tolerance, material, and manufacturing decisions remain yours.</p>
-        <p><a class="text-link" href="/product/cam/">Manufacturing hand-off <span aria-hidden="true">&rarr;</span></a></p>
+        <p><a class="text-link" href="/product/cam/">Manufacturing hand-off <Icon name="arrow-right" /></a></p>
       </div>
     </div>
   </section>

@@ -2,13 +2,14 @@
 import BaseLayout from '../layouts/BaseLayout.astro';
 import TesseractHero from '../components/TesseractHero.astro';
 import HeroCanvas from '../components/HeroCanvas.astro';
+import Icon from '../components/Icon.astro';
 ---
-<BaseLayout title="Parametric CAD from sketch to shop floor" description="Chudware is a parametric CAD system for mechanical engineers: exact solid geometry, an editable feature tree, assemblies, CAM, PLM, and simulation, in a browser or as a native Windows and Linux desktop application.">
+<BaseLayout title="Parametric CAD from sketch to shop floor" description="Chudware is a parametric CAD system for mechanical engineers: exact solid geometry, an editable feature tree, assemblies, CAM, PLM, and simulation, in a browser or as a native Windows, macOS, and Linux desktop application.">
   <TesseractHero>
     <p class="eyebrow">Parametric CAD · Browser or native</p>
     <h1>Parametric CAD, <span class="text-gradient">from sketch to shop floor.</span></h1>
     <p class="lede">Chudware is built for mechanical engineers and product teams who want modeling, assemblies, CAM, PLM, simulation, reverse engineering, and an AI copilot in the same workspace.</p>
-    <p class="hero-note">In a browser you get the real application, not a video stream of a machine in a data centre. Native Windows and Linux preview builds are available on request.</p>
+    <p class="hero-note">In a browser you get the real application, not a video stream of a machine in a data centre. Signed native builds for Windows, macOS, and Linux are ready to download.</p>
     <div class="actions">
       <a class="button" href="https://app.chudware.com/signup">Create an account</a>
       <a class="button button-secondary" href="/product/">Tour the product</a>
@@ -17,7 +18,7 @@ import HeroCanvas from '../components/HeroCanvas.astro';
       <div><dt>Geometry</dt><dd>Exact B-rep solids, not meshes</dd></div>
       <div><dt>Interoperability</dt><dd>STEP, IGES, and BREP in and out</dd></div>
       <div><dt>Isolation</dt><dd>Per-account roots at the gateway</dd></div>
-      <div><dt>Native</dt><dd>Windows + Linux</dd></div>
+      <div><dt>Native</dt><dd>Windows, macOS, Linux</dd></div>
     </dl>
   </TesseractHero>
 
@@ -42,7 +43,7 @@ import HeroCanvas from '../components/HeroCanvas.astro';
         <p class="eyebrow">The real application, in a tab</p>
         <h2>Full CAD in a browser tab, without turning CAD into a web toy.</h2>
         <p class="lede">The browser runs the same application as the desktop build. Model state and tool calls go over the wire — never a video stream of a machine in a data centre — so the geometry kernel and the full engineering toolchain stay intact instead of being reduced to fit a web page.</p>
-        <p class="supporting-copy">Prefer local execution? Native Windows and Linux builds use the same product surface on an engineering workstation.</p>
+        <p class="supporting-copy">Prefer local execution? <a class="text-link" href="/download/">Native builds for Windows, macOS, and Linux</a> run the same product surface on an engineering workstation.</p>
       </header>
       <div class="pricing-note">
         <p class="eyebrow">Open a supplier's file, not only your own</p>
@@ -72,9 +73,9 @@ import HeroCanvas from '../components/HeroCanvas.astro';
           <figcaption>Captured from Chudware's real manufacturing workspace.</figcaption>
         </figure>
         <ol class="workflow-list">
-          <li><span>01</span><div><h3>Model with intent</h3><p>Constrained sketches and ordered features keep dimensions, references, and revisions explicit.</p></div></li>
-          <li><span>02</span><div><h3>Carry geometry into production</h3><p>Build CAM operations and inspect simulation alongside the source design.</p></div></li>
-          <li><span>03</span><div><h3>Trace the product</h3><p>PLM connects project history and artifacts to the engineering work that produced them.</p></div></li>
+          <li><span><Icon name="overview" /></span><div><h3>Model with intent</h3><p>Constrained sketches and ordered features keep dimensions, references, and revisions explicit.</p></div></li>
+          <li><span><Icon name="package" /></span><div><h3>Carry geometry into production</h3><p>Build CAM operations and inspect simulation alongside the source design.</p></div></li>
+          <li><span><Icon name="archive" /></span><div><h3>Trace the product</h3><p>PLM connects project history and artifacts to the engineering work that produced them.</p></div></li>
         </ol>
       </div>
     </div>
@@ -101,7 +102,7 @@ import HeroCanvas from '../components/HeroCanvas.astro';
     <div class="wrap source-band">
       <div><p class="eyebrow">Verify before you cut metal</p><h2>Analysis attached to the model that produced it.</h2></div>
       <p>Run linear static stress, modal, and thermal studies against the same feature tree you modeled, with error-driven adaptive mesh refinement and a second, independent mesher available to check whether a result is a property of the part or of the mesh.</p>
-      <a class="text-link" href="/product/simulation/">How simulation works <span aria-hidden="true">→</span></a>
+      <a class="text-link" href="/product/simulation/">How simulation works <Icon name="arrow-right" /></a>
     </div>
   </section>
 
@@ -109,8 +110,8 @@ import HeroCanvas from '../components/HeroCanvas.astro';
     <div class="wrap section-heading">
       <p class="eyebrow">Start in the browser</p>
       <h2>Open a full engineering workspace from a tab.</h2>
-      <p class="lede">Create an account for browser access, or ask about a native Windows or Linux preview build.</p>
-      <div class="actions"><a class="button" href="https://app.chudware.com/signup">Create an account</a><a class="button button-secondary" href="/download/">Native desktop details</a></div>
+      <p class="lede">Create an account for browser access, or download the desktop app for Windows, macOS, or Linux.</p>
+      <div class="actions"><a class="button" href="https://app.chudware.com/signup">Create an account</a><a class="button button-secondary" href="/download/">Download the desktop app</a></div>
     </div>
   </section>
 </BaseLayout>

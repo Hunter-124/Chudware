@@ -1,12 +1,23 @@
 "use strict";
 
 (function () {
-  var state = { account: null, loaded: {}, releases: new Map(), subProviders: new Map(), subFlows: {}, orgs: [], openTeams: {}, pendingInviteToken: null };
+  var state = {
+    account: null,
+    loaded: {},
+    // releases: channel -> the builds[] array from /api/releases/available.
+    releases: new Map(),
+    download: { detected: null, target: null, substituted: false, channel: null, installCommand: null, copyTimer: 0 },
+    subProviders: new Map(),
+    subFlows: {},
+    orgs: [],
+    openTeams: {},
+    pendingInviteToken: null
+  };
   var pages = ["overview", "team", "downloads", "ai", "usage", "billing", "account", "devices"];
   var PAGE_TITLES = {
     overview: "Overview",
-    team: "Team & files",
-    downloads: "Download desktop",
+    team: "Files & teams",
+    downloads: "Download",
     ai: "AI setup",
     usage: "Usage & credits",
     billing: "Plans & billing",
@@ -15,22 +26,33 @@
   };
 
   function el(id) { return document.getElementById(id); }
-  function q(selector, root) { return (root || document).querySelector(selector); }
   function qa(selector, root) { return Array.from((root || document).querySelectorAll(selector)); }
   function titleCase(value) {
     value = String(value || "");
     return value ? value.charAt(0).toUpperCase() + value.slice(1) : "—";
   }
   function number(value) { return new Intl.NumberFormat().format(Number(value || 0)); }
+  function asDate(value) {
+    // Postgres numeric columns (EXTRACT(EPOCH FROM …)) arrive as JSON STRINGS,
+    // e.g. "1787850111.706034", so an epoch has to be recognised before
+    // falling back to Date's string parsing. Treating one as a date literal
+    // produced an Invalid Date and Intl then threw "Invalid time value",
+    // which took the whole Devices table down.
+    var epoch = typeof value === "number" ? value : Number(value);
+    var parsed = isFinite(epoch) ? new Date(epoch * 1000) : new Date(value);
+    return isFinite(parsed.getTime()) ? parsed : null;
+  }
   function date(value) {
     if (!value) return "—";
-    var parsed = typeof value === "number" ? new Date(value * 1000) : new Date(value);
+    var parsed = asDate(value);
+    if (!parsed) return "—";
     return new Intl.DateTimeFormat(undefined, { year: "numeric", month: "short", day: "numeric" })
       .format(parsed);
   }
   function dateTime(value) {
     if (!value) return "Never";
-    var parsed = typeof value === "number" ? new Date(value * 1000) : new Date(value);
+    var parsed = asDate(value);
+    if (!parsed) return "Unknown";
     return new Intl.DateTimeFormat(undefined, { dateStyle: "medium", timeStyle: "short" })
       .format(parsed);
   }
@@ -130,6 +152,18 @@
     arrowLink(el("dest-cloud-cta"), allowed ? "Open workspace" : "Included with Studio — upgrade", "→");
   }
 
+  var PROVIDER_LABELS = { google: "Google", github: "GitHub", microsoft: "Microsoft", apple: "Apple" };
+  function providerLabel(provider) {
+    var key = String(provider || "").toLowerCase();
+    return PROVIDER_LABELS[key] || titleCase(provider);
+  }
+  function providerSentence(providers) {
+    var names = (Array.isArray(providers) ? providers : []).map(providerLabel);
+    if (!names.length) return "a linked identity provider";
+    if (names.length === 1) return names[0];
+    return names.slice(0, -1).join(", ") + " or " + names[names.length - 1];
+  }
+
   function renderAccount(account) {
     state.account = account;
     var display = account.display || account.email.split("@")[0];
@@ -151,18 +185,23 @@
         : "Your Desktop plan keeps native CAD active. Upgrade to Studio for the browser workspace.";
     el("admin-link").hidden = account.role !== "admin";
     el("password-form").hidden = !account.has_password;
-    if (!account.has_password) el("password-status").textContent = "This account signs in through a linked provider and has no password.";
+    // The form is hidden for provider-only accounts, so the explanation lives
+    // OUTSIDE it: hiding the form must never leave an empty card behind.
+    el("password-status").textContent = account.has_password
+      ? ""
+      : "This account signs in with " + providerSentence(account.linked_identities)
+        + ", so there is no password to change.";
     el("credits-option").hidden = !account.ai_grant;
     var identities = el("identity-list");
     clear(identities);
     if (account.has_password) {
       var password = text("div", "", "identity");
-      password.append(text("i", "P"), text("span", "Password"), text("b", "Active"));
+      password.append(icon("key"), text("span", "Password"), text("b", "Active"));
       identities.appendChild(password);
     }
     (account.linked_identities || []).forEach(function (provider) {
       var row = text("div", "", "identity");
-      row.append(text("i", provider.charAt(0).toUpperCase()), text("span", provider), text("b", "Linked"));
+      row.append(icon("account"), text("span", providerLabel(provider)), text("b", "Linked"));
       identities.appendChild(row);
     });
     if (!identities.childElementCount) identities.appendChild(text("p", "No sign-in method is linked.", "empty"));
@@ -207,6 +246,7 @@
     if (state.loaded.billing) return;
     var table = el("invoice-rows");
     clear(table);
+    var note = el("billing-portal-note");
     if (!state.account.billing_configured) {
       var unavailable = document.createElement("tr");
       var cell = text("td", "Billing is not configured on this deployment.", "empty");
@@ -214,10 +254,18 @@
       unavailable.appendChild(cell);
       table.appendChild(unavailable);
       el("billing-portal").disabled = true;
-      qa(".plan-action,.pack-action").forEach(function (button) { button.disabled = true; });
+      qa(".plan-action,.pack-action").forEach(function (button) {
+        button.disabled = true;
+        // A disabled control has to say why. The plan buttons are covered by
+        // the note beside "Manage payment details"; the credit packs sit in
+        // their own section, so they carry the reason as their label.
+        if (button.classList.contains("pack-action")) button.textContent = "Payments not set up";
+      });
+      note.textContent = "Payments are not set up on this deployment yet — contact support to change your plan.";
       state.loaded.billing = true;
       return;
     }
+    note.textContent = "";
     var payload = await api("/api/portal/invoices");
     var invoices = payload.invoices || [];
     if (!invoices.length) {
@@ -484,25 +532,546 @@
     state.loaded.ai = true;
   }
 
+  // ---- Downloads ----------------------------------------------------------
+  // /api/releases/available is the only source of truth for what exists. The
+  // portal asks once per channel and renders exactly the builds it names: no
+  // card, chip, or row is ever drawn for a tuple the API did not return, and
+  // neither the artifact filename nor the install command is reconstructed
+  // here.
+
+  var SVG_NS = "http://www.w3.org/2000/svg";
+  // Solid marks are OS logos (filled), line icons are stroked. Path data is the
+  // canonical set from the design contract — do not redraw it.
+  var ICONS = {
+    windows: {
+      solid: true,
+      shapes: [["path", { d: "M3.4 6.2 10.3 5.25v6.29H3.4zM11.35 5.1 20.6 3.84v7.7h-9.25zM3.4 12.46h6.9v6.29L3.4 17.8zM11.35 12.46h9.25v7.7l-9.25-1.26z" }]]
+    },
+    apple: {
+      solid: true,
+      shapes: [
+        ["path", { d: "M17.02 12.62c.02-2.2 1.8-3.25 1.88-3.3-1.03-1.5-2.62-1.71-3.18-1.74-1.35-.14-2.64.79-3.32.79-.69 0-1.74-.77-2.87-.75-1.48.02-2.85.86-3.6 2.19-1.54 2.67-.4 6.62 1.1 8.79.74 1.06 1.61 2.24 2.77 2.2 1.1-.04 1.53-.71 2.87-.71 1.33 0 1.71.71 2.87.69 1.19-.02 1.95-1.08 2.69-2.14.85-1.23 1.2-2.42 1.22-2.48-.03-.01-2.34-.9-2.36-3.54z" }],
+        ["path", { d: "M14.86 5.9c.6-.73 1.01-1.75.9-2.77-.87.04-1.93.58-2.56 1.31-.56.65-1.05 1.69-.92 2.68.97.08 1.96-.49 2.58-1.22z" }]
+      ]
+    },
+    linux: {
+      solid: true,
+      shapes: [["path", {
+        "fill-rule": "evenodd",
+        d: "M8.55 19.75c.72.2 1.05 1.05.74 1.9-.31.85-1.15 1.3-1.87 1.05-.72-.25-.99-1.1-.62-1.93.37-.83 1.03-1.22 1.75-1.02zM15.45 19.75c-.72.2-1.05 1.05-.74 1.9.31.85 1.15 1.3 1.87 1.05.72-.25.99-1.1.62-1.93-.37-.83-1.03-1.22-1.75-1.02z M12 2.4c-2.52 0-4.18 1.76-4.18 4.32 0 .74.06 1.38.06 1.92 0 .95-.6 1.76-1.46 2.96-1.03 1.44-1.84 2.66-2.2 4.16-.37 1.53.26 2.5 1.44 2.5.23 0 .36.17.46.62.4 1.68 2.33 3.08 5.88 3.08s5.48-1.4 5.88-3.08c.1-.45.23-.62.46-.62 1.18 0 1.81-.97 1.44-2.5-.36-1.5-1.17-2.72-2.2-4.16-.86-1.2-1.46-2.01-1.46-2.96 0-.54.06-1.18.06-1.92 0-2.56-1.66-4.32-4.18-4.32z M12 4.85c1.83 0 3.32 1.4 3.32 3.13 0 1.72-1.49 3.12-3.32 3.12S8.68 9.7 8.68 7.98c0-1.73 1.49-3.13 3.32-3.13z M10.62 6.55c.5 0 .9.52.9 1.16s-.4 1.16-.9 1.16-.9-.52-.9-1.16.4-1.16.9-1.16z M13.38 6.55c.5 0 .9.52.9 1.16s-.4 1.16-.9 1.16-.9-.52-.9-1.16.4-1.16.9-1.16z M12 8.6l1.35 1.05L12 10.7l-1.35-1.05z"
+      }]]
+    },
+    package: {
+      shapes: [
+        ["path", { d: "M3.6 7.9 12 3.6l8.4 4.3v8.2L12 20.4 3.6 16.1z" }],
+        ["path", { d: "M3.6 7.9 12 12.2l8.4-4.3M12 12.2v8.2" }]
+      ]
+    },
+    copy: {
+      shapes: [
+        ["rect", { x: "9", y: "9", width: "11", height: "11", rx: "2.2" }],
+        ["path", { d: "M15 9V6.2A2.2 2.2 0 0 0 12.8 4H6.2A2.2 2.2 0 0 0 4 6.2v6.6A2.2 2.2 0 0 0 6.2 15H9" }]
+      ]
+    },
+    check: { shapes: [["path", { d: "M5 12.6 9.6 17.2 19 7.4" }]] },
+    key: {
+      shapes: [
+        ["circle", { cx: "8.6", cy: "15.4", r: "3.9" }],
+        ["path", { d: "M11.4 12.6 19.4 4.6M16.6 7.4l2.2 2.2M18.8 5.2l2.2 2.2" }]
+      ]
+    },
+    account: {
+      shapes: [
+        ["path", { d: "M12 3.2l7 2.5v5.5c0 4.3-2.8 7.4-7 8.6-4.2-1.2-7-4.3-7-8.6V5.7z" }],
+        ["path", { d: "M9.1 11.9l2.2 2.2 4.1-4.4" }]
+      ]
+    }
+  };
+
+  function icon(name) {
+    var spec = ICONS[name] || ICONS.package;
+    var svg = document.createElementNS(SVG_NS, "svg");
+    svg.setAttribute("class", "icon");
+    svg.setAttribute("viewBox", "0 0 24 24");
+    svg.setAttribute("aria-hidden", "true");
+    if (spec.solid) {
+      svg.setAttribute("fill", "currentColor");
+    } else {
+      svg.setAttribute("fill", "none");
+      svg.setAttribute("stroke", "currentColor");
+      svg.setAttribute("stroke-width", "1.7");
+      svg.setAttribute("stroke-linecap", "round");
+      svg.setAttribute("stroke-linejoin", "round");
+    }
+    spec.shapes.forEach(function (shape) {
+      var node = document.createElementNS(SVG_NS, shape[0]);
+      Object.keys(shape[1]).forEach(function (attribute) { node.setAttribute(attribute, shape[1][attribute]); });
+      svg.appendChild(node);
+    });
+    return svg;
+  }
+
+  var PLATFORM_MARKS = { windows: "windows", macos: "apple", linux: "linux" };
+  var PLATFORM_LABELS = { windows: "Windows", macos: "macOS", linux: "Linux" };
+  var ARCH_LABELS = { x86_64: "64-bit", arm64: "ARM64" };
+  var MACOS_ARCH_LABELS = { x86_64: "Intel", arm64: "Apple silicon" };
+  // Chip order for the primary card only (design contract): deb, rpm,
+  // AppImage, tar.zst on Linux. The all-platforms list keeps the API's own
+  // order, which puts `default` first inside each tuple.
+  var CHIP_ORDER = {
+    linux: ["deb", "rpm", "default", "tar"],
+    windows: ["default", "deb", "rpm", "tar"],
+    macos: ["default", "deb", "rpm", "tar"]
+  };
+  var GENERIC_CHIP_ORDER = ["default", "deb", "rpm", "tar"];
+  var FORMAT_CHIPS = { deb: "deb", rpm: "rpm", tar: "tar.zst" };
+  var DEFAULT_FORMAT_CHIPS = { windows: "Installer", macos: "Zip archive", linux: "AppImage" };
+  var FORMAT_NOUNS = { deb: "deb package", rpm: "rpm package", tar: "tar.zst archive" };
+  var DEFAULT_FORMAT_NOUNS = { windows: "installer", macos: "zip archive", linux: "AppImage" };
+  var FORMAT_NOTES = {
+    deb: "Debian package for Debian, Ubuntu, Mint, and other apt systems.",
+    rpm: "RPM package for Fedora, RHEL, and openSUSE.",
+    tar: "Portable archive — unpack it anywhere, no package manager needed."
+  };
+  var DEFAULT_FORMAT_NOTES = {
+    windows: "Signed installer for Windows.",
+    macos: "Zipped application bundle — unzip it into Applications.",
+    linux: "Single-file AppImage — make it executable and run it."
+  };
+
+  function platformLabel(platform) { return PLATFORM_LABELS[platform] || titleCase(platform); }
+  function archLabel(platform, arch) {
+    if (platform === "macos") return MACOS_ARCH_LABELS[arch] || String(arch || "");
+    return ARCH_LABELS[arch] || String(arch || "");
+  }
+  function targetLabel(platform, arch) {
+    var suffix = archLabel(platform, arch);
+    return suffix ? platformLabel(platform) + " " + suffix : platformLabel(platform);
+  }
+  function formatChipLabel(platform, format) {
+    return format === "default" ? (DEFAULT_FORMAT_CHIPS[platform] || "Default") : (FORMAT_CHIPS[format] || format);
+  }
+  function formatNoun(platform, format) {
+    return format === "default" ? (DEFAULT_FORMAT_NOUNS[platform] || "build") : (FORMAT_NOUNS[format] || format);
+  }
+  function formatNote(platform, format) {
+    if (format === "default") return DEFAULT_FORMAT_NOTES[platform] || "Native application for " + platformLabel(platform) + ".";
+    return FORMAT_NOTES[format] || "Native application for " + platformLabel(platform) + ".";
+  }
+  function chipOrder(platform) { return CHIP_ORDER[platform] || GENERIC_CHIP_ORDER; }
+
+  function formatBytes(bytes) {
+    var value = Number(bytes);
+    if (!isFinite(value) || value <= 0) return "unknown size";
+    var units = ["B", "KB", "MB", "GB", "TB"];
+    var index = 0;
+    while (value >= 1024 && index < units.length - 1) {
+      value /= 1024;
+      index += 1;
+    }
+    var rounded = index > 0 && value < 10 ? value.toFixed(1) : String(Math.round(value));
+    return rounded + " " + units[index];
+  }
+
+  function shortDigest(digest) {
+    var value = String(digest || "");
+    return value.length > 12 ? value.slice(0, 4) + "…" + value.slice(-4) : value;
+  }
+
+  function platformFromString(value) {
+    var probe = String(value || "").toLowerCase();
+    if (probe.indexOf("win") >= 0) return "windows";
+    if (probe.indexOf("iphone") >= 0 || probe.indexOf("ipod") >= 0) return null;
+    if (probe.indexOf("android") >= 0) return null;
+    if (probe.indexOf("cros") >= 0 || probe.indexOf("chrome os") >= 0) return null;
+    if (probe.indexOf("mac") >= 0 || probe.indexOf("darwin") >= 0) return "macos";
+    if (probe.indexOf("linux") >= 0 || probe.indexOf("x11") >= 0 || probe.indexOf("bsd") >= 0) return "linux";
+    return null;
+  }
+
+  function archFromHint(value) {
+    // Client hints report "x86" for both 32- and 64-bit Intel; only 64-bit
+    // desktops are published and /api/releases/available decides what exists,
+    // so the hint only has to pick the right family.
+    var probe = String(value || "").toLowerCase();
+    if (probe === "arm" || probe === "arm64" || probe === "aarch64") return "arm64";
+    if (probe === "x86" || probe === "x86_64" || probe === "x64" || probe === "amd64") return "x86_64";
+    return null;
+  }
+
+  function rendererMentionsApple() {
+    try {
+      var canvas = document.createElement("canvas");
+      var gl = canvas.getContext("webgl") || canvas.getContext("experimental-webgl");
+      if (!gl) return false;
+      var debugInfo = gl.getExtension("WEBGL_debug_renderer_info");
+      if (!debugInfo) return false;
+      return String(gl.getParameter(debugInfo.UNMASKED_RENDERER_WEBGL) || "").indexOf("Apple") >= 0;
+    } catch (error) {
+      return false;
+    }
+  }
+
+  function archWithoutHints(platform) {
+    if (platform === "macos") {
+      // Apple silicon exposes a touch-capable pointer surface or an "Apple"
+      // WebGL renderer string; Intel Macs do neither.
+      return navigator.maxTouchPoints > 0 || rendererMentionsApple() ? "arm64" : "x86_64";
+    }
+    var probe = String(navigator.platform || "") + " " + String(navigator.userAgent || "");
+    return /aarch64|arm64|armv8/i.test(probe) ? "arm64" : "x86_64";
+  }
+
+  async function detectPlatform() {
+    var hintSource = navigator.userAgentData;
+    if (hintSource && typeof hintSource.getHighEntropyValues === "function") {
+      try {
+        var hints = await hintSource.getHighEntropyValues(["architecture", "platform", "platformVersion"]);
+        var hinted = platformFromString(hints.platform || hintSource.platform);
+        if (hinted) return { platform: hinted, arch: archFromHint(hints.architecture) || archWithoutHints(hinted) };
+      } catch (error) {
+        // Hints can be refused; fall through to the legacy navigator fields.
+      }
+    }
+    var platform = platformFromString(String(navigator.platform || "") + " " + String(navigator.userAgent || ""));
+    if (!platform) return { platform: null, arch: null };
+    return { platform: platform, arch: archWithoutHints(platform) };
+  }
+
+  function findBuild(builds, platform, arch, format) {
+    for (var index = 0; index < builds.length; index += 1) {
+      var build = builds[index];
+      if (build.platform === platform && build.arch === arch && build.format === format) return build;
+    }
+    return null;
+  }
+
+  function availableFormats(builds, platform, arch) {
+    return chipOrder(platform).filter(function (format) {
+      return Boolean(findBuild(builds, platform, arch, format));
+    });
+  }
+
+  function groupBuilds(builds) {
+    // Response order is preserved: the API sorts platform → arch → format with
+    // `default` first inside each tuple.
+    var groups = [];
+    var byTarget = new Map();
+    builds.forEach(function (build) {
+      var key = build.platform + ":" + build.arch;
+      var group = byTarget.get(key);
+      if (!group) {
+        group = { platform: build.platform, arch: build.arch, builds: [] };
+        byTarget.set(key, group);
+        groups.push(group);
+      }
+      group.builds.push(build);
+    });
+    return groups;
+  }
+
+  function renderPrimaryMeta(build) {
+    var meta = el("primary-meta");
+    clear(meta);
+    if (!build) return;
+    meta.appendChild(document.createTextNode("Version " + build.version + " · " + formatBytes(build.size) + " · sha256 "));
+    meta.appendChild(text("code", shortDigest(build.sha256), "digest"));
+  }
+
+  function renderFormatChips(builds, target) {
+    var host = el("primary-formats");
+    clear(host);
+    availableFormats(builds, target.platform, target.arch).forEach(function (format) {
+      var chip = text("button", formatChipLabel(target.platform, format), "format-chip");
+      chip.type = "button";
+      chip.dataset.format = format;
+      chip.setAttribute("aria-pressed", format === target.format ? "true" : "false");
+      host.appendChild(chip);
+    });
+  }
+
+  function cloudFallbackLink() {
+    var allowed = Boolean(state.account && state.account.cloud);
+    var link = text("a", allowed ? "Open the browser workspace" : "See plans that include the browser workspace");
+    link.href = allowed ? "/app/" : "#billing";
+    return link;
+  }
+
+  function substitutionNote(target) {
+    var detected = state.download.detected;
+    if (target.platform === "macos" && detected.arch === "arm64" && target.arch === "x86_64") {
+      // Rosetta 2 is Apple's translation layer for x86_64 binaries. This states
+      // a fact about macOS, not a claim that an Apple-silicon build exists.
+      return "The Apple-silicon build is not published yet. This Intel build runs on Apple silicon through Rosetta 2.";
+    }
+    return "The " + targetLabel(detected.platform, detected.arch) + " build is not published yet. This is the "
+      + archLabel(target.platform, target.arch) + " build.";
+  }
+
+  function renderPrimary(builds) {
+    var target = state.download.target;
+    var detected = state.download.detected || { platform: null, arch: null };
+    var mark = el("primary-mark");
+    var note = el("primary-note");
+    var action = el("primary-action");
+    clear(mark);
+    clear(note);
+    if (target) {
+      mark.appendChild(icon(PLATFORM_MARKS[target.platform] || "package"));
+      el("primary-eyebrow").textContent = "Detected · " + targetLabel(detected.platform, detected.arch);
+      el("primary-title").textContent = "Chudware for " + platformLabel(target.platform);
+      note.textContent = state.download.substituted ? substitutionNote(target) : formatNote(target.platform, target.format);
+      renderPrimaryMeta(findBuild(builds, target.platform, target.arch, target.format));
+      action.hidden = false;
+      action.disabled = false;
+      action.textContent = "Download " + formatNoun(target.platform, target.format);
+      renderFormatChips(builds, target);
+      return;
+    }
+    mark.appendChild(icon(PLATFORM_MARKS[detected.platform] || "package"));
+    el("primary-title").textContent = "Chudware desktop";
+    el("primary-meta").textContent = "";
+    clear(el("primary-formats"));
+    action.hidden = true;
+    action.disabled = true;
+    if (detected.platform) {
+      el("primary-eyebrow").textContent = "Detected · " + targetLabel(detected.platform, detected.arch);
+      note.appendChild(document.createTextNode("No build is published for " + platformLabel(detected.platform) + " yet. "));
+      note.appendChild(cloudFallbackLink());
+      note.appendChild(document.createTextNode(" in the meantime, or pick another platform below."));
+    } else {
+      el("primary-eyebrow").textContent = "Choose your platform";
+      note.textContent = "We could not tell which computer you are using. Pick a build from the list below.";
+    }
+    el("download-all").open = true;
+  }
+
+  function renderDownloadList(builds) {
+    var host = el("download-list");
+    clear(host);
+    var groups = groupBuilds(builds);
+    if (!groups.length) {
+      host.appendChild(text("p", "No builds have been published on this channel yet.", "empty"));
+      return;
+    }
+    groups.forEach(function (group) {
+      var section = text("div", "", "download-group");
+      var head = text("div", "", "download-group-head");
+      head.appendChild(icon(PLATFORM_MARKS[group.platform] || "package"));
+      head.appendChild(text("h3", platformLabel(group.platform)));
+      head.appendChild(text("span", archLabel(group.platform, group.arch), "download-group-arch"));
+      section.appendChild(head);
+      group.builds.forEach(function (build) {
+        var row = text("div", "", "download-row");
+        row.appendChild(text("span", formatNoun(group.platform, build.format), "download-row-name"));
+        row.appendChild(text("span", "Version " + build.version + " · " + formatBytes(build.size), "download-row-meta"));
+        var button = text("button", "Download", "secondary small download-row-action");
+        button.type = "button";
+        button.dataset.platform = build.platform;
+        button.dataset.arch = build.arch;
+        button.dataset.format = build.format;
+        row.appendChild(button);
+        section.appendChild(row);
+      });
+      host.appendChild(section);
+    });
+  }
+
+  function setCopyButton(iconName, label) {
+    var button = el("install-copy");
+    clear(button);
+    button.appendChild(icon(iconName));
+    button.appendChild(text("span", label));
+  }
+
+  function selectNodeContents(node) {
+    var range = document.createRange();
+    range.selectNodeContents(node);
+    var selection = window.getSelection();
+    selection.removeAllRanges();
+    selection.addRange(range);
+  }
+
+  async function mintInstallCommand() {
+    // The command — host, script path, and token format — is issued by the
+    // server, so it is rendered exactly as given and never assembled here.
+    var issued = await api("/api/portal/download-token", { method: "POST" });
+    state.download.installCommand = issued.install_command;
+    el("install-command").textContent = issued.install_command;
+    var minutes = Math.round(Number(issued.expires_in || 0) / 60);
+    el("install-status").textContent = minutes > 0
+      ? "This command is personal to your account and expires in " + minutes + " minute" + (minutes === 1 ? "" : "s") + "."
+      : "This command is personal to your account.";
+    return issued.install_command;
+  }
+
+  async function copyInstallCommand() {
+    var command = el("install-command");
+    var value = String(command.textContent || "").trim();
+    // Tokens are short-lived, so the copy is what gets minted: re-issue on
+    // every click so the command the customer pastes is freshly signed.
+    try {
+      value = await mintInstallCommand();
+    } catch (error) {
+      if (!value) {
+        el("install-status").textContent = "The install command could not be issued: " + error.message;
+        return;
+      }
+      el("install-status").textContent = "Could not refresh the command (" + error.message + "). Copying the one already shown.";
+    }
+    if (!value) return;
+    try {
+      await navigator.clipboard.writeText(value);
+      setCopyButton("check", "Copied");
+      window.clearTimeout(state.download.copyTimer);
+      state.download.copyTimer = window.setTimeout(function () { setCopyButton("copy", "Copy"); }, 1600);
+    } catch (error) {
+      selectNodeContents(command);
+      el("install-status").textContent = "Your browser blocked clipboard access. The command is selected — press Ctrl+C to copy it.";
+    }
+  }
+
+  async function refreshInstallCard() {
+    var card = el("install-card");
+    var target = state.download.target;
+    if (!target || target.platform !== "linux") {
+      card.hidden = true;
+      return;
+    }
+    card.hidden = false;
+    if (state.download.installCommand) {
+      el("install-command").textContent = state.download.installCommand;
+      return;
+    }
+    el("install-command").textContent = "Requesting your install command…";
+    try {
+      await mintInstallCommand();
+    } catch (error) {
+      el("install-command").textContent = "";
+      el("install-status").textContent = "The install command could not be issued: " + error.message;
+    }
+  }
+
+  async function startDownload(platform, arch, format, button) {
+    var label = button.textContent;
+    button.disabled = true;
+    button.textContent = "Preparing…";
+    try {
+      var query = new URLSearchParams({
+        channel: el("release-channel").value,
+        platform: platform,
+        arch: arch,
+        format: format
+      });
+      var manifest = await api("/api/releases/latest?" + query.toString());
+      if (!manifest.url) {
+        showMessage("Sign in again to get a download link.", true);
+        return;
+      }
+      window.location.assign(manifest.url);
+    } finally {
+      button.disabled = false;
+      button.textContent = label;
+    }
+  }
+
+  function selectFormat(format) {
+    var target = state.download.target;
+    if (!target || target.format === format) return;
+    target.format = format;
+    renderPrimary(state.releases.get(state.download.channel) || []);
+    refreshInstallCard().catch(function (error) { showMessage(error.message, true); });
+  }
+
+  function setDownloadsPending() {
+    clear(el("primary-mark"));
+    el("primary-eyebrow").textContent = "Detecting your computer…";
+    el("primary-note").textContent = "";
+    el("primary-meta").textContent = "";
+    clear(el("primary-formats"));
+    var action = el("primary-action");
+    action.hidden = false;
+    action.disabled = true;
+    action.textContent = "Download";
+    var list = el("download-list");
+    clear(list);
+    list.appendChild(text("p", "Loading published builds…", "empty"));
+  }
+
+  function renderDownloadsFailure(error) {
+    var mark = el("primary-mark");
+    clear(mark);
+    mark.appendChild(icon("package"));
+    el("primary-eyebrow").textContent = "Downloads unavailable";
+    el("primary-title").textContent = "Chudware desktop";
+    el("primary-note").textContent = "The list of published builds could not be loaded: " + error.message;
+    el("primary-meta").textContent = "";
+    clear(el("primary-formats"));
+    var action = el("primary-action");
+    action.hidden = true;
+    action.disabled = true;
+    el("install-card").hidden = true;
+    clear(el("download-list"));
+  }
+
+  function preferredFormat(formats, previous) {
+    // A remembered choice wins; otherwise `default` — the AppImage, .exe or
+    // .zip — because it is the one build that installs on any distribution.
+    // Chip ORDER is a separate, purely visual contract.
+    if (previous && formats.indexOf(previous) >= 0) return previous;
+    return formats.indexOf("default") >= 0 ? "default" : formats[0];
+  }
+
+  function chooseTarget(builds) {
+    var detected = state.download.detected;
+    var previous = state.download.target ? state.download.target.format : null;
+    state.download.substituted = false;
+    if (!detected.platform) return null;
+    var formats = availableFormats(builds, detected.platform, detected.arch);
+    if (formats.length) {
+      return {
+        platform: detected.platform,
+        arch: detected.arch,
+        format: preferredFormat(formats, previous)
+      };
+    }
+    // Nothing published for the detected architecture. Offer another
+    // architecture of the same platform rather than a dead button: x86_64
+    // first, because translation layers run Intel binaries on ARM and not the
+    // other way round.
+    var alternatives = ["x86_64", "arm64"].filter(function (arch) {
+      return arch !== detected.arch && availableFormats(builds, detected.platform, arch).length > 0;
+    });
+    if (!alternatives.length) return null;
+    var substituteArch = alternatives[0];
+    var substituteFormats = availableFormats(builds, detected.platform, substituteArch);
+    state.download.substituted = true;
+    return {
+      platform: detected.platform,
+      arch: substituteArch,
+      format: preferredFormat(substituteFormats, previous)
+    };
+  }
+
   async function loadDownloads(force) {
     if (state.loaded.downloads && !force) return;
     var channel = el("release-channel").value;
-    var cards = qa(".download-card");
-    await Promise.all(cards.map(async function (card) {
-      var meta = q(".release-meta", card); var button = q(".download-action", card);
-      meta.textContent = "Checking latest release…"; button.disabled = true;
-      try {
-        var query = new URLSearchParams({ channel: channel, platform: card.dataset.platform, arch: card.dataset.arch });
-        var release = await api("/api/releases/latest?" + query.toString());
-        state.releases.set(card.dataset.platform + ":" + card.dataset.arch, release);
-        meta.textContent = "Version " + release.version + " · " + number(release.size) + " bytes";
-        button.disabled = !release.url;
-        button.textContent = release.url ? "Download" : "Sign in to download";
-      } catch (error) {
-        meta.textContent = error.message;
-        button.textContent = "Unavailable";
-      }
-    }));
+    if (!state.download.detected) state.download.detected = await detectPlatform();
+    setDownloadsPending();
+    var payload;
+    try {
+      payload = await api("/api/releases/available?" + new URLSearchParams({ channel: channel }).toString());
+    } catch (error) {
+      renderDownloadsFailure(error);
+      throw error;
+    }
+    var builds = Array.isArray(payload.builds) ? payload.builds : [];
+    state.releases.set(channel, builds);
+    state.download.channel = channel;
+    state.download.target = chooseTarget(builds);
+    renderPrimary(builds);
+    renderDownloadList(builds);
+    await refreshInstallCard();
     state.loaded.downloads = true;
   }
 
@@ -514,26 +1083,74 @@
     var table = el("device-rows"); clear(table);
     var select = el("appeal-subject");
     while (select.options.length > 1) select.remove(1);
-    if (!devices.length) { var row = document.createElement("tr"); var cell = text("td", "No desktop devices are authorized.", "empty"); cell.colSpan = 7; row.appendChild(cell); table.appendChild(row); }
+    if (!devices.length) {
+      var empty = document.createElement("tr");
+      var emptyCell = text("td", "No desktop devices are authorized.", "empty");
+      emptyCell.colSpan = 5;
+      empty.appendChild(emptyCell);
+      table.appendChild(empty);
+    }
     devices.forEach(function (device) {
       var status = securityState(device);
       var row = document.createElement("tr");
-      row.append(text("td", device.device_name), text("td", dateTime(device.created_at)), text("td", dateTime(device.last_checkin_at)), text("td", securityStateLabel(status), "status-" + status), text("td", reasonLabels(device.reason_codes)), text("td", dateTime(device.action_at || device.revoked_at)));
+      row.append(
+        text("td", device.device_name),
+        text("td", dateTime(device.created_at)),
+        text("td", dateTime(device.last_checkin_at))
+      );
+      // Security status carries its reason and action time inline: the table is
+      // five columns wide, not seven.
+      var statusCell = document.createElement("td");
+      statusCell.appendChild(text("span", securityStateLabel(status), "status-" + status));
+      var actionAt = device.action_at || device.revoked_at;
+      var detail = [];
+      if (Array.isArray(device.reason_codes) && device.reason_codes.length) detail.push(reasonLabels(device.reason_codes));
+      if (actionAt) detail.push(dateTime(actionAt));
+      if (detail.length) statusCell.appendChild(text("small", detail.join(" · ")));
+      row.appendChild(statusCell);
       var action = document.createElement("td");
-      if (!device.revoked_at) { var button = text("button", "Revoke", "danger small"); button.dataset.subject = device.subject; action.appendChild(button); }
-      if (device.revoked_at && !appeals.some(function (appeal) { return appeal.subject === device.subject && appeal.state === "pending"; })) {
-        var option = document.createElement("option"); option.value = device.subject; option.textContent = device.device_name; select.appendChild(option);
+      if (!device.revoked_at) {
+        var button = text("button", "Revoke", "danger small");
+        button.dataset.subject = device.subject;
+        action.appendChild(button);
       }
-      row.appendChild(action); table.appendChild(row);
+      if (device.revoked_at && !appeals.some(function (appeal) { return appeal.subject === device.subject && appeal.state === "pending"; })) {
+        var option = document.createElement("option");
+        option.value = device.subject;
+        option.textContent = device.device_name;
+        select.appendChild(option);
+      }
+      row.appendChild(action);
+      table.appendChild(row);
     });
     renderAppeals(appeals);
-    el("appeal-submit").disabled = select.options.length === 1;
+    // The first option is the "Select a revoked device" placeholder, so one
+    // option means nothing is eligible.
+    renderAppealForm(select.options.length > 1);
     state.loaded.devices = true;
+  }
+
+  function renderAppealForm(eligible) {
+    var form = el("appeal-form");
+    var placeholder = el("appeal-empty");
+    form.hidden = !eligible;
+    el("appeal-submit").disabled = !eligible;
+    if (eligible) {
+      if (placeholder) placeholder.remove();
+      return;
+    }
+    // A form whose only outcome is an error is not a form: the card says what
+    // has to happen first instead, matching the neighbouring appeals card.
+    if (!placeholder) {
+      placeholder = text("p", "No devices are eligible for review. Appeals appear here after a device is revoked.", "empty");
+      placeholder.id = "appeal-empty";
+      form.parentNode.insertBefore(placeholder, form.nextSibling);
+    }
   }
 
   function renderAppeals(appeals) {
     var host = el("appeal-list"); clear(host);
-    if (!appeals.length) { host.appendChild(text("p", "No appeals submitted. Revoked devices eligible for review appear in the form.", "empty")); return; }
+    if (!appeals.length) { host.appendChild(text("p", "No appeals submitted. A review you request for a revoked device appears here.", "empty")); return; }
     appeals.forEach(function (appeal) {
       var item = text("article", "", "appeal-item");
       var head = text("div", "", "appeal-item-head");
@@ -1149,8 +1766,30 @@
       showMessage(error.message, true);
     }
   });
-  el("release-channel").addEventListener("change", function () { loadDownloads(true).catch(function (error) { showMessage(error.message, true); }); });
-  qa(".download-action").forEach(function (button) { button.addEventListener("click", function () { var card = button.closest(".download-card"); var release = state.releases.get(card.dataset.platform + ":" + card.dataset.arch); if (release && release.url) window.location.assign(release.url); }); });
+  el("release-channel").addEventListener("change", function () {
+    // The chosen format is kept across channels when the other channel
+    // publishes it; chooseTarget falls back when it does not.
+    loadDownloads(true).catch(function (error) { showMessage(error.message, true); });
+  });
+  el("primary-formats").addEventListener("click", function (event) {
+    var chip = event.target.closest("button[data-format]");
+    if (chip) selectFormat(chip.dataset.format);
+  });
+  el("primary-action").addEventListener("click", function () {
+    var target = state.download.target;
+    if (!target) return;
+    startDownload(target.platform, target.arch, target.format, this)
+      .catch(function (error) { showMessage(error.message, true); });
+  });
+  el("download-list").addEventListener("click", function (event) {
+    var button = event.target.closest("button[data-format]");
+    if (!button) return;
+    startDownload(button.dataset.platform, button.dataset.arch, button.dataset.format, button)
+      .catch(function (error) { showMessage(error.message, true); });
+  });
+  el("install-copy").addEventListener("click", function () {
+    copyInstallCommand().catch(function (error) { showMessage(error.message, true); });
+  });
   el("device-rows").addEventListener("click", async function (event) { var button = event.target.closest("button[data-subject]"); if (!button || !window.confirm("Revoke this desktop device?")) return; button.disabled = true; try { await api("/api/portal/devices/" + encodeURIComponent(button.dataset.subject), { method: "DELETE" }); await loadDevices(true); showMessage("Device revoked. Its next refresh will be refused.", false); } catch (error) { button.disabled = false; showMessage(error.message, true); } });
   el("appeal-message").addEventListener("input", function () { el("appeal-count").textContent = this.value.length + " / 4096"; });
   el("appeal-form").addEventListener("submit", async function (event) {

@@ -1,15 +1,34 @@
 ---
-title: Linux desktop preview
-description: Request access to the Chudware Linux desktop preview.
+title: Install on Linux
+description: Install Chudware on Linux with one command, a .deb or .rpm package, an AppImage, or a plain archive.
 section: Installation
 order: 30
 ---
-## Native access is on request
+## One-line install
 
-The Linux desktop build is not yet published through a public release channel. Use the [access page](/download/) to request the Linux preview; there is no public archive or checksum to download today.
+The quickest route detects your package manager, installs the signed package, and registers the desktop entry:
 
-Do not install a package presented as an official Chudware release from a third-party source.
+```sh
+curl -fsSL https://app.chudware.com/install.sh | sh -s -- --token <token>
+```
 
-## Use the browser now
+The token is personal and expires after 15 minutes. Sign in at [app.chudware.com](https://app.chudware.com/#downloads), open the download page, and it issues one alongside this same command, ready to paste.
 
-The browser client requires no desktop installation. [Create an account](https://app.chudware.com/signup) to use Chudware from a Linux browser while native distribution is being prepared.
+## Packages and archives
+
+Every format is issued from the same download page:
+
+- **`.deb`** — Debian and Ubuntu; installs with `apt` and removes cleanly.
+- **`.rpm`** — Fedora, RHEL, and openSUSE; installs with `dnf` or `zypper`.
+- **AppImage** — one portable file with nothing to install; make it executable and run it.
+- **`.tar.zst`** — plain archive for any distribution; unpack and run from anywhere.
+
+The `.deb` and `.rpm` packages install to `/opt/chudware`, put a `chudware` command on your `PATH`, and register the desktop entry and icons.
+
+The build is 64-bit and needs a graphics driver capable of a modern hardware-accelerated 3D context; without one the application does not start.
+
+Do not install a package presented as an official Chudware release from a third-party source; the download page in your account is the only official source.
+
+## Or skip the install
+
+The browser client requires no desktop installation. [Create an account](https://app.chudware.com/signup) to use Chudware from a tab.

@@ -36,7 +36,14 @@ Every night, and on demand from the Actions tab:
    and platform-test evidence. The finished AppImage is then extracted and
    verified — zero `not found` in `ldd`, `chudware-hostd --status` loads and
    reports this exact version, and the signed payload manifest matches the
-   extracted bytes — before anything is offered to a customer.
+   extracted bytes — before anything is offered to a customer. It then packages
+   that same verified tree as `chudware_<version>_amd64.deb` and
+   `chudware-<version>-<release>.x86_64.rpm` via
+   `packaging/linux/build_linux_packages.sh`, signs each package's own digest
+   under both the beta and the stable version, and publishes them with
+   `format` `deb` / `rpm`. Those two formats are best-effort: a packaging
+   failure is a warning naming the missing formats, and never costs the nightly
+   its AppImage. They need `rpm-build` and `xz` on `cc-linux-build`.
 3. **`windows-beta`** (`cc-win-package`) does the same for Windows: junctions,
    protected assets, `windows-occt` preset plus the host GUI at the pinned
    version, `ctest`, compiled sidecars, and the **Inno Setup** installer

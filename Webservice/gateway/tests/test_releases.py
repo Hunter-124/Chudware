@@ -1,14 +1,33 @@
 from __future__ import annotations
 
 import base64
+import os
+import time
 from contextlib import contextmanager
-from typing import Any
+from pathlib import Path
+from typing import Any, get_args
 
-import pytest
-from fastapi import FastAPI
-from fastapi.testclient import TestClient
+# Before ANY gateway import: config.Settings is built once, at import time, from
+# the environment as it stands then. Whichever gateway test module pytest
+# imports first therefore decides dev_mode for the whole session, and without
+# this preamble a combined run in which this file is collected first leaves
+# dev_mode False — which makes AuthMiddleware refuse to construct and every
+# real-app test in a sibling module fail with "no strong auth configured".
+# Same preamble as test_portal.py and test_releases_ci.py, deliberately.
+os.environ["CHUDWARE_WEB_DEV"] = "1"
+os.environ.setdefault(
+    "CHUDWARE_WEB_DATA_ROOT", str(Path.home() / "chudware-web-data-test")
+)
 
-from Webservice.gateway import auth, releases
+import pytest  # noqa: E402
+from fastapi import FastAPI  # noqa: E402
+from fastapi.testclient import TestClient  # noqa: E402
+
+# `gateway.*`, not `Webservice.gateway.*`: conftest puts both the gateway dir and
+# its parent on sys.path, so only this spelling works when the suite is run from
+# Webservice/gateway (the documented invocation), and it is the same module
+# object test_releases_ci.py monkeypatches.
+from gateway import artifact_names, auth, releases  # noqa: E402
 
 
 @pytest.fixture
@@ -70,9 +89,9 @@ def test_anonymous_and_bad_entitlement_receive_byte_identical_metadata(
     assert anonymous.content == invalid.content
     assert "url" not in anonymous.json()
     assert set(anonymous.json()) == {
-        "version", "min_supported", "platform", "arch", "key_id", "sha256", "size",
-        "signature", "notes_url", "payload_manifest_key", "payload_manifest_sha256",
-        "payload_signature_key", "payload_signature_sha256",
+        "version", "min_supported", "platform", "arch", "format", "key_id", "sha256",
+        "size", "signature", "notes_url", "payload_manifest_key",
+        "payload_manifest_sha256", "payload_signature_key", "payload_signature_sha256",
     }
 
 
@@ -184,7 +203,10 @@ def test_publish_is_bearer_gated_and_idempotent(
     assert response.json()["sbom_key"] == manifest_row["sbom_key"]
     assert len(statements) == 3
     assert "FOR UPDATE" in statements[0][0]
-    assert "ON CONFLICT (channel, version, platform, arch) DO NOTHING" in statements[1][0]
+    assert (
+        "ON CONFLICT (channel, version, platform, arch, format) DO NOTHING"
+        in statements[1][0]
+    )
     assert "release_channels" in statements[2][0]
     assert statements[1][1][5] == "release-v1"
 
@@ -452,3 +474,552 @@ def test_anonymous_manifest_is_rate_limited(
     response = client.get("/api/releases/latest" + query)
     assert response.status_code == 429
     assert int(response.headers["retry-after"]) >= 1
+
+
+# ---------------------------------------------------------------------------
+# Formats
+# ---------------------------------------------------------------------------
+
+
+def test_format_literal_and_artifact_names_cannot_drift() -> None:
+    """``Format`` is hand-written because FastAPI needs a literal; this is the
+    only thing keeping it equal to the runtime tuple everything else uses."""
+    assert get_args(releases.Format) == artifact_names.FORMATS
+    assert releases.DEFAULT_FORMAT == artifact_names.FORMATS[0] == "default"
+
+
+@pytest.mark.parametrize(
+    ("version", "fmt", "expected"),
+    [
+        ("0.1.1", "default", "Chudware-0.1.1-linux-x86_64.AppImage"),
+        ("0.1.1", "deb", "chudware_0.1.1_amd64.deb"),
+        ("0.1.1", "rpm", "chudware-0.1.1-1.x86_64.rpm"),
+        ("0.1.1", "tar", "Chudware-0.1.1-linux-x86_64.tar.zst"),
+        (
+            "0.1.0-beta.21", "default",
+            "Chudware-0.1.0-beta.21-linux-x86_64.AppImage",
+        ),
+        # Debian and RPM both refuse '-' in a version, and they sanitise it
+        # differently. Getting either wrong makes the beta sort NEWER than the
+        # release it precedes, so the upgrade is never offered.
+        ("0.1.0-beta.21", "deb", "chudware_0.1.0~beta.21_amd64.deb"),
+        ("0.1.0-beta.21", "rpm", "chudware-0.1.0-0.beta.21.x86_64.rpm"),
+        ("0.1.0-beta.21", "tar", "Chudware-0.1.0-beta.21-linux-x86_64.tar.zst"),
+    ],
+)
+def test_canonical_artifact_names_every_linux_format(
+    version: str, fmt: str, expected: str
+) -> None:
+    assert releases._canonical_artifact(version, "linux", "x86_64", fmt) == expected
+    # The CI pipeline reaches the same rule through the dependency-free module.
+    assert artifact_names.canonical_artifact(version, "linux", "x86_64", fmt) == expected
+
+
+def test_deb_and_rpm_version_fields_sort_the_prerelease_first() -> None:
+    """The filenames are only half of it: the package METADATA has to order the
+    beta below the final release or `apt upgrade` becomes a downgrade."""
+    assert artifact_names.deb_version("0.1.0-beta.21") == "0.1.0~beta.21"
+    assert artifact_names.deb_version("0.1.1") == "0.1.1"
+    assert artifact_names.rpm_version_release("0.1.0-beta.21") == ("0.1.0", "0.beta.21")
+    assert artifact_names.rpm_version_release("0.1.1") == ("0.1.1", "1")
+
+
+@pytest.mark.parametrize("platform", ["windows", "macos"])
+@pytest.mark.parametrize("fmt", ["deb", "rpm", "tar"])
+def test_only_linux_publishes_a_package_format(platform: str, fmt: str) -> None:
+    with pytest.raises(Exception) as error:
+        releases._canonical_artifact("0.1.1", platform, "x86_64", fmt)
+    assert getattr(error.value, "status_code", None) == 422
+    assert "only the default format" in error.value.detail
+
+
+def test_canonical_artifact_keeps_its_pre_format_names_untouched() -> None:
+    """Existing published rows were validated against these exact strings; a
+    change here invalidates every artifact_key already in the table."""
+    assert releases._canonical_artifact("1.2.0", "linux", "x86_64") == (
+        "Chudware-1.2.0-linux-x86_64.AppImage"
+    )
+    assert releases._canonical_artifact("1.2.0", "windows", "x86_64") == (
+        "Chudware-Setup-1.2.0-x86_64.exe"
+    )
+    assert releases._canonical_artifact("1.2.0", "macos", "arm64") == (
+        "Chudware-1.2.0-macos-arm64.zip"
+    )
+
+
+def test_format_is_absent_from_the_frozen_signature_preimage() -> None:
+    """Every shipped client verifies against this tuple. Adding format would
+    make each new release fail verification on every installed 0.1.1."""
+    digest = "a" * 64
+    preimage = releases._artifact_signature_preimage(
+        "release-v1", "0.1.1", "linux", "x86_64", digest
+    )
+    assert preimage.split(b"\0") == [
+        b"chudware-artifact-v1", b"release-v1", b"0.1.1", b"linux", b"x86_64",
+        digest.encode("ascii"),
+    ]
+    for fmt in artifact_names.FORMATS:
+        assert fmt.encode("ascii") not in preimage.split(b"\0")
+
+
+def test_latest_without_a_format_still_asks_for_the_appimage(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, manifest_row: dict[str, Any]
+) -> None:
+    """The shipped desktop updater sends channel+platform+arch and nothing else.
+    It must keep receiving the row it received before this column existed."""
+    seen: list[tuple[Any, ...]] = []
+
+    def fake_fetch(*args: Any) -> dict[str, Any]:
+        seen.append(args)
+        return dict(manifest_row)
+
+    monkeypatch.setattr(releases, "_fetch_latest", fake_fetch)
+    body = client.get(
+        "/api/releases/latest?channel=stable&platform=linux&arch=x86_64"
+    ).json()
+    assert seen == [("stable", "linux", "x86_64", "default")]
+    assert body["format"] == "default"
+    assert body["version"] == manifest_row["version"]
+
+
+def test_latest_selects_and_echoes_the_requested_format(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, manifest_row: dict[str, Any]
+) -> None:
+    seen: list[tuple[Any, ...]] = []
+
+    def fake_fetch(*args: Any) -> dict[str, Any]:
+        seen.append(args)
+        return dict(manifest_row)
+
+    monkeypatch.setattr(releases, "_fetch_latest", fake_fetch)
+    body = client.get(
+        "/api/releases/latest?channel=stable&platform=linux&arch=x86_64&format=deb"
+    ).json()
+    assert seen == [("stable", "linux", "x86_64", "deb")]
+    assert body["format"] == "deb"
+
+
+def test_latest_rejects_an_unknown_format(client: TestClient) -> None:
+    response = client.get(
+        "/api/releases/latest?channel=stable&platform=linux&arch=x86_64&format=snap"
+    )
+    assert response.status_code == 422
+
+
+# ---------------------------------------------------------------------------
+# /api/releases/available
+# ---------------------------------------------------------------------------
+
+
+_AVAILABLE_ROWS = [
+    {
+        "platform": "linux", "arch": "x86_64", "format": "rpm", "version": "0.1.1",
+        "size": 318767104, "sha256": "4" * 64,
+        "notes_url": "https://chudware.com/releases/0.1.1",
+        # Never returned. Present here because _fetch_available selects from the
+        # same table, and a careless route would forward whatever it was handed.
+        "artifact_key": "stable/0.1.1/chudware-0.1.1-1.x86_64.rpm",
+        "signature": "should-never-be-published",
+    },
+    {
+        "platform": "linux", "arch": "x86_64", "format": "default",
+        "version": "0.1.1", "size": 340724216, "sha256": "1" * 64,
+        "notes_url": "https://chudware.com/releases/0.1.1",
+    },
+    {
+        "platform": "windows", "arch": "x86_64", "format": "default",
+        "version": "0.1.1", "size": 239491858, "sha256": "2" * 64,
+        "notes_url": "https://chudware.com/releases/0.1.1",
+    },
+    {
+        "platform": "linux", "arch": "x86_64", "format": "deb", "version": "0.1.1",
+        "size": 318767105, "sha256": "3" * 64,
+        "notes_url": "https://chudware.com/releases/0.1.1",
+    },
+]
+
+
+@pytest.fixture
+def available_client(monkeypatch: pytest.MonkeyPatch) -> TestClient:
+    """Fakes the CURSOR, not ``_fetch_available``.
+
+    The declared-order re-key lives in ``_fetch_available``, so stubbing that
+    function would leave the ordering contract every consumer depends on
+    untested. Rows come back in the order Postgres would give them — format
+    sorted as text — so the re-key has something to actually fix.
+    """
+    monkeypatch.setattr(releases, "_available_by_ip", releases.RateLimiter(1000, 60.0))
+
+    class Cursor:
+        def execute(self, _statement: str, _values: tuple[Any, ...]) -> None:
+            pass
+
+        def fetchall(self) -> list[dict[str, Any]]:
+            return [
+                dict(row)
+                for row in sorted(
+                    _AVAILABLE_ROWS,
+                    key=lambda row: (row["platform"], row["arch"], row["format"]),
+                )
+            ]
+
+    @contextmanager
+    def fake_tx():
+        yield Cursor()
+
+    monkeypatch.setattr(releases, "tx", fake_tx)
+    app = FastAPI()
+    app.include_router(releases.router)
+    return TestClient(app)
+
+
+def test_available_is_anonymous_and_publishes_no_url_or_signature(
+    available_client: TestClient,
+) -> None:
+    response = available_client.get("/api/releases/available?channel=stable")
+    assert response.status_code == 200
+    body = response.json()
+    assert set(body) == {"channel", "builds"}
+    assert body["channel"] == "stable"
+    for build in body["builds"]:
+        assert set(build) == {
+            "platform", "arch", "format", "version", "size", "sha256", "notes_url",
+        }
+    assert "signature" not in response.text
+    assert "artifact_key" not in response.text
+    assert response.headers["cache-control"] == "public, max-age=300"
+
+
+def test_available_echoes_only_an_allowlisted_origin(
+    available_client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """chudware.com renders live versions from this route and is a different
+    origin. An allowlist, never a wildcard and never a reflector."""
+    monkeypatch.setattr(releases.settings, "dev_mode", False)
+    for origin in ("https://chudware.com", "https://www.chudware.com"):
+        response = available_client.get(
+            "/api/releases/available", headers={"Origin": origin}
+        )
+        assert response.status_code == 200
+        assert response.headers["access-control-allow-origin"] == origin
+        # Without this, the five-minute edge cache would serve one origin's
+        # response — header and all — to every other caller.
+        assert response.headers["vary"] == "Origin"
+
+
+@pytest.mark.parametrize(
+    "origin",
+    [
+        "https://evil.example",
+        "https://chudware.com.evil.example",
+        "https://chudware.com/",
+        "http://chudware.com",
+        "null",
+        "*",
+    ],
+)
+def test_available_refuses_every_other_origin(
+    available_client: TestClient, monkeypatch: pytest.MonkeyPatch, origin: str
+) -> None:
+    monkeypatch.setattr(releases.settings, "dev_mode", False)
+    response = available_client.get(
+        "/api/releases/available", headers={"Origin": origin}
+    )
+    assert response.status_code == 200
+    assert "access-control-allow-origin" not in response.headers
+    # Still varies, so a refusal is not cached as an approval for someone else.
+    assert response.headers["vary"] == "Origin"
+
+
+def test_available_allows_the_astro_dev_origin_only_in_dev_mode(
+    available_client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(releases.settings, "dev_mode", False)
+    assert releases._catalogue_cors_origins() == (
+        "https://chudware.com", "https://www.chudware.com",
+    )
+    for origin in ("http://localhost:4321", "http://127.0.0.1:4321"):
+        production = available_client.get(
+            "/api/releases/available", headers={"Origin": origin}
+        )
+        assert "access-control-allow-origin" not in production.headers, origin
+
+    monkeypatch.setattr(releases.settings, "dev_mode", True)
+    for origin in ("http://localhost:4321", "http://127.0.0.1:4321"):
+        development = available_client.get(
+            "/api/releases/available", headers={"Origin": origin}
+        )
+        assert development.headers["access-control-allow-origin"] == origin
+
+
+def test_no_other_release_or_portal_route_is_opened_cross_origin(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`available` is safe to open BECAUSE it carries no URL, signature or
+    identity. Anything that does must stay same-origin."""
+    monkeypatch.setattr(releases.settings, "dev_mode", False)
+    monkeypatch.setattr(releases, "_active_entitlement", lambda _token: False)
+    manifest = client.get(
+        "/api/releases/latest?channel=stable&platform=linux&arch=x86_64",
+        headers={"Origin": "https://chudware.com"},
+    )
+    assert manifest.status_code == 200
+    assert "access-control-allow-origin" not in manifest.headers
+    # No preflight handler was added anywhere: a bare GET needs none, and one
+    # would be a door nothing is knocking on.
+    assert not any(
+        "OPTIONS" in (getattr(route, "methods", None) or set())
+        for route in releases.router.routes
+    )
+
+
+def test_available_orders_platform_then_arch_then_declared_format(
+    available_client: TestClient,
+) -> None:
+    """'default' leads each tuple so a consumer can feature builds[0]; the rest
+    follow the declared order, NOT the alphabetical one Postgres would give."""
+    builds = available_client.get("/api/releases/available?channel=stable").json()[
+        "builds"
+    ]
+    assert [(b["platform"], b["arch"], b["format"]) for b in builds] == [
+        ("linux", "x86_64", "default"),
+        ("linux", "x86_64", "deb"),
+        ("linux", "x86_64", "rpm"),
+        ("windows", "x86_64", "default"),
+    ]
+
+
+def test_available_defaults_to_stable_and_refuses_an_unknown_channel(
+    available_client: TestClient,
+) -> None:
+    assert available_client.get("/api/releases/available").json()["channel"] == "stable"
+    assert (
+        available_client.get("/api/releases/available?channel=nightly").status_code
+        == 422
+    )
+
+
+def test_available_is_rate_limited(
+    available_client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(releases, "_available_by_ip", releases.RateLimiter(1, 60.0))
+    assert available_client.get("/api/releases/available").status_code == 200
+    assert available_client.get("/api/releases/available").status_code == 429
+
+
+# ---------------------------------------------------------------------------
+# Download tokens
+# ---------------------------------------------------------------------------
+
+
+class _Account:
+    def __init__(self, status: str = "active") -> None:
+        self.status = status
+
+
+@pytest.fixture
+def token_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(releases.settings, "session_secret", "download-token-secret")
+    monkeypatch.setattr(releases.accounts, "get_account", lambda _email: _Account())
+
+
+def test_download_token_round_trips_and_carries_its_account(token_env: None) -> None:
+    token, ttl = releases.mint_download_token("buyer@example.com")
+    assert ttl == releases.DOWNLOAD_TOKEN_TTL == 900
+    assert releases._redeem_download_token(token) == "buyer@example.com"
+
+
+def test_download_token_expires(token_env: None) -> None:
+    token, ttl = releases.mint_download_token("buyer@example.com")
+    minted_at = int(time.time())
+    assert releases._redeem_download_token(token, now=minted_at + ttl - 1) is not None
+    assert releases._redeem_download_token(token, now=minted_at + ttl) is None
+    assert releases._redeem_download_token(token, now=minted_at + ttl + 3600) is None
+
+
+@pytest.mark.parametrize(
+    "mangle",
+    [
+        pytest.param(lambda t: t[:-1] + ("0" if t[-1] != "0" else "1"), id="signature"),
+        pytest.param(
+            lambda t: t.split(".")[0] + "." + str(int(t.split(".")[1]) + 86400)
+            + "." + t.split(".")[2],
+            id="extended_expiry",
+        ),
+        pytest.param(
+            lambda t: base64.urlsafe_b64encode(b"attacker@example.com")
+            .decode("ascii").rstrip("=") + "." + ".".join(t.split(".")[1:]),
+            id="swapped_account",
+        ),
+        pytest.param(lambda t: t.replace(".", "", 1), id="shape"),
+        pytest.param(lambda _t: "", id="empty"),
+    ],
+)
+def test_download_token_rejects_every_tampering(token_env: None, mangle) -> None:
+    token, _ = releases.mint_download_token("buyer@example.com")
+    assert releases._redeem_download_token(mangle(token)) is None
+
+
+def test_download_token_is_refused_when_the_account_stops_being_active(
+    monkeypatch: pytest.MonkeyPatch, token_env: None
+) -> None:
+    """A token minted while active must stop working the moment the account is
+    suspended — which is why status is re-read at redeem time rather than baked
+    into the token."""
+    token, _ = releases.mint_download_token("buyer@example.com")
+    assert releases._redeem_download_token(token) == "buyer@example.com"
+    monkeypatch.setattr(
+        releases.accounts, "get_account", lambda _email: _Account("suspended")
+    )
+    assert releases._redeem_download_token(token) is None
+    monkeypatch.setattr(releases.accounts, "get_account", lambda _email: None)
+    assert releases._redeem_download_token(token) is None
+
+
+def test_download_token_signing_domain_differs_from_the_entitlement_domain() -> None:
+    assert releases._DOWNLOAD_TOKEN_DOMAIN == b"chudware-download-token-v1"
+    assert releases._DOWNLOAD_TOKEN_DOMAIN != releases._ARTIFACT_SIGNATURE_DOMAIN
+
+
+def test_download_token_needs_a_session_secret(monkeypatch: pytest.MonkeyPatch) -> None:
+    """With no secret every token would share one forgeable MAC, so minting
+    refuses rather than issuing something unverifiable."""
+    monkeypatch.setattr(releases.settings, "session_secret", "")
+    with pytest.raises(Exception) as error:
+        releases.mint_download_token("buyer@example.com")
+    assert getattr(error.value, "status_code", None) == 503
+
+
+@pytest.mark.parametrize("carrier", ["header", "query"])
+def test_a_download_token_earns_a_download_url_by_header_or_query(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, token_env: None, carrier: str
+) -> None:
+    """Both carriers are required: a browser can set the header, but curl
+    following the manifest's URL cannot, so the script appends the query."""
+    monkeypatch.setattr(releases, "_active_entitlement", lambda _token: False)
+    for name in releases._R2_ENV:
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.delenv("CHUDWARE_RELEASES_PUBLIC_BASE_URL", raising=False)
+    token, _ = releases.mint_download_token("buyer@example.com")
+    query = "?channel=stable&platform=linux&arch=x86_64"
+    if carrier == "header":
+        response = client.get(
+            "/api/releases/latest" + query,
+            headers={"X-Chudware-Download-Token": token},
+        )
+    else:
+        response = client.get(
+            "/api/releases/latest" + query + "&download_token=" + token
+        )
+    assert response.status_code == 200
+    assert response.json()["url"].startswith("https://app.chudware.com/api/releases/")
+    assert response.headers["cache-control"] == "private, no-store"
+
+
+def test_a_forged_download_token_gets_the_anonymous_body(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, token_env: None
+) -> None:
+    monkeypatch.setattr(releases, "_active_entitlement", lambda _token: False)
+    monkeypatch.setattr(
+        releases, "_presigned_url",
+        lambda _key: pytest.fail("a forged token must not mint a URL"),
+    )
+    response = client.get(
+        "/api/releases/latest?channel=stable&platform=linux&arch=x86_64"
+        "&download_token=not-a-real-token"
+    )
+    assert response.status_code == 200
+    assert "url" not in response.json()
+
+
+def test_the_new_public_paths_are_exactly_scoped() -> None:
+    assert auth._is_public_path("/api/releases/available")
+    assert auth._is_public_path("/install.sh")
+    assert auth._is_public_path("/brand-assets/Rubik-VF.247dbaa0aa4a.woff2")
+    # The authenticated minting route must NOT have been opened along the way.
+    assert not auth._is_public_path("/api/portal/download-token")
+    assert not auth._is_public_path("/api/releases/availablely")
+    assert not auth._is_public_path("/install.shx")
+    assert not auth._is_public_path("/brand-assetsx")
+
+
+# ---------------------------------------------------------------------------
+# Retention
+# ---------------------------------------------------------------------------
+
+
+def test_retention_keeps_three_beta_versions_per_tuple_and_every_stable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Row selection only — the filesystem half is exercised against a real
+    database and real bytes in test_releases_ci.py."""
+    rows = []
+    for platform, fmt in (("linux", "default"), ("linux", "deb"), ("windows", "default")):
+        for index in range(5):
+            rows.append(
+                {
+                    "channel": "beta",
+                    "version": f"0.1.0-beta.{20 - index}",
+                    "platform": platform,
+                    "arch": "x86_64",
+                    "format": fmt,
+                    "artifact_key": f"beta/0.1.0-beta.{20 - index}/{platform}-{fmt}",
+                    "size": 1024,
+                }
+            )
+
+    class Cursor:
+        def execute(self, _statement: str, _values: tuple[Any, ...]) -> None:
+            pass
+
+        def fetchall(self) -> list[dict[str, Any]]:
+            return rows
+
+    @contextmanager
+    def fake_tx():
+        yield Cursor()
+
+    monkeypatch.setattr(releases, "tx", fake_tx)
+    prunable = releases._prunable_beta_rows(releases.BETA_RETENTION_VERSIONS)
+    assert releases.BETA_RETENTION_VERSIONS == 3
+    # Three tuples x (5 published - 3 kept).
+    assert len(prunable) == 6
+    kept = {(r["platform"], r["format"], r["version"]) for r in rows} - {
+        (r["platform"], r["format"], r["version"]) for r in prunable
+    }
+    assert {version for _, _, version in kept} == {
+        "0.1.0-beta.20", "0.1.0-beta.19", "0.1.0-beta.18",
+    }
+    # Stable is never a candidate: the query itself filters on the beta channel.
+    assert all(row["channel"] == "beta" for row in prunable)
+
+
+def test_retention_is_a_noop_when_nothing_is_superseded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Cursor:
+        def execute(self, _statement: str, _values: tuple[Any, ...] = ()) -> None:
+            pytest.fail("an idle prune must not issue a DELETE")
+
+        def fetchall(self) -> list[dict[str, Any]]:
+            return []
+
+    @contextmanager
+    def fake_tx():
+        yield Cursor()
+
+    monkeypatch.setattr(releases, "_prunable_beta_rows", lambda _keep: [])
+    monkeypatch.setattr(releases, "_incoming_orphans", lambda: [])
+    monkeypatch.setattr(releases, "tx", fake_tx)
+    report = releases.prune_release_store()
+    assert report == {
+        "ok": True,
+        "dry_run": False,
+        "keep_beta_versions": 3,
+        "pruned": [],
+        "deleted_files": 0,
+        "freed_bytes": 0,
+        "incoming_orphans": [],
+        "incoming_freed_bytes": 0,
+        "errors": [],
+    }

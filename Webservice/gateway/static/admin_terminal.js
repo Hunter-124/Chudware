@@ -31,6 +31,16 @@
   var pickerEmpty = document.getElementById("term-picker-empty");
   if (!host || !tabsEl || !newBtn) return;
 
+  // Contract line icons (paths verbatim); decorative — the host control's
+  // aria-label or title carries the meaning.
+  function lineIcon(path) {
+    return "<svg class='icon' viewBox='0 0 24 24' aria-hidden='true' fill='none'" +
+           " stroke='currentColor' stroke-width='1.7' stroke-linecap='round'" +
+           " stroke-linejoin='round'>" + path + "</svg>";
+  }
+  var ICON_CLOSE = lineIcon("<path d='M6.4 6.4l11.2 11.2M17.6 6.4 6.4 17.6'/>");
+  var ICON_PLUS = lineIcon("<path d='M12 5v14M5 12h14'/>");
+
   // Parent scaffolds #wm-root + #snap-preview; guard-create if missing.
   var termPane = host.parentNode;
   var wmRoot = document.getElementById("wm-root");
@@ -960,7 +970,7 @@
     xBtn.setAttribute("role", "button");
     xBtn.setAttribute("aria-label", "Detach " + label);
     xBtn.title = "Detach (session keeps running)";
-    xBtn.textContent = "\u00d7";
+    xBtn.innerHTML = ICON_CLOSE;
     tabBtn.appendChild(xBtn);
 
     tabsEl.insertBefore(tabBtn, newBtn);
@@ -1340,7 +1350,7 @@
 
       var clients = document.createElement("span");
       clients.className = "term-pill-clients" + (s.clients > 0 ? " live" : "");
-      clients.textContent = s.clients > 0 ? "\u25cf " + s.clients : "idle";
+      clients.textContent = s.clients > 0 ? String(s.clients) : "idle";
       clients.title = s.clients + " watching";
       pill.appendChild(clients);
 
@@ -1348,7 +1358,8 @@
       kill.className = "term-pill-kill";
       kill.setAttribute("role", "button");
       kill.title = "Kill session";
-      kill.textContent = "\u00d7";
+      kill.setAttribute("aria-label", "Kill session " + s.name);
+      kill.innerHTML = ICON_CLOSE;
       pill.appendChild(kill);
 
       pill.addEventListener("click", function (ev) {
@@ -1383,7 +1394,7 @@
     var addPill = document.createElement("button");
     addPill.type = "button";
     addPill.className = "term-pill term-pill-new";
-    addPill.textContent = "+ New session";
+    addPill.innerHTML = ICON_PLUS + "<span>New session</span>";
     addPill.title = "Start a new shared session (Ctrl+Alt+T)";
     addPill.addEventListener("click", newSession);
     pickerEl.appendChild(addPill);

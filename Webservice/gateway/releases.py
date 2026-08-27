@@ -29,13 +29,17 @@ from pydantic import BaseModel
 
 try:
     from . import accounts, entitlement
+    from .artifact_names import FORMATS, canonical_artifact
     from .auth import get_current_user
+    from .config import settings
     from .db import tx
     from .limits import RateLimiter
 except ImportError:  # uvicorn app:app from package dir
     import accounts  # type: ignore
     import entitlement  # type: ignore
+    from artifact_names import FORMATS, canonical_artifact  # type: ignore
     from auth import get_current_user  # type: ignore
+    from config import settings  # type: ignore
     from db import tx  # type: ignore
     from limits import RateLimiter  # type: ignore
 
@@ -44,6 +48,11 @@ router = APIRouter(tags=["releases"])
 Channel = Literal["stable", "beta"]
 Platform = Literal["linux", "windows", "macos"]
 Architecture = Literal["x86_64", "arm64"]
+# Mirrors artifact_names.FORMATS, which is the runtime source of truth; a
+# Literal cannot be built from a tuple in a way FastAPI can introspect, so the
+# two are pinned together by a test rather than by construction.
+Format = Literal["default", "deb", "rpm", "tar"]
+DEFAULT_FORMAT = "default"
 
 _SEMVER_RE = re.compile(r"(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)")
 
@@ -110,10 +119,25 @@ _EVIDENCE_COLUMNS = ("commit_sha",) + tuple(
     for prefix, _ in _EVIDENCE_SIDECARS
     for field in ("key", "sha256", "signature_key", "signature_sha256")
 )
+# Every file a publication owns, relative to its artifact's basename: the
+# artifact itself, the mandatory payload manifest pair, and the evidence triple
+# with its signatures. Promotion copies exactly this set and retention deletes
+# exactly this set, so the two cannot drift apart.
+_ARTIFACT_SUFFIXES = ("",) + _PAYLOAD_SIDECAR_SUFFIXES + tuple(
+    f".{filename}{tail}"
+    for _, filename in _EVIDENCE_SIDECARS
+    for tail in ("", ".sig")
+)
 _R2_ENV = ("R2_ENDPOINT", "R2_ACCESS_KEY_ID", "R2_SECRET_ACCESS_KEY")
 _DEFAULT_PUBLIC_BASE_URL = "https://app.chudware.com"
 
-_SAFE_NAME_RE = re.compile(r"[A-Za-z0-9._-]{1,128}")
+# '~' is in the charset because Debian spells a prerelease with it:
+# chudware_0.1.0~beta.21_amd64.deb is the canonical .deb name, and without '~'
+# every nightly .deb would 400 on its own filename. It is inert on the paths
+# this module builds — nothing here shells out and nothing calls expanduser()
+# on an artifact name — while the charset still forbids '/', '\' and a leading
+# '.', which is what actually stops traversal.
+_SAFE_NAME_RE = re.compile(r"[A-Za-z0-9._~-]{1,128}")
 _manifest_by_ip = RateLimiter(120, 60.0)
 _publish_by_ip = RateLimiter(20, 60.0)
 # CI runners all NAT through one public address, and a single platform leg can
@@ -121,6 +145,10 @@ _publish_by_ip = RateLimiter(20, 60.0)
 # ci/* routes are Bearer-token gated, so this limiter is only an abuse backstop.
 _ci_by_ip = RateLimiter(240, 60.0)
 _base_version_by_ip = RateLimiter(60, 60.0)
+# The portal's downloads view and the marketing site's download page both call
+# /available on every visit, so it gets its own budget rather than spending the
+# desktop updater's manifest budget.
+_available_by_ip = RateLimiter(120, 60.0)
 _artifact_by_ip = RateLimiter(30, 60.0)
 
 
@@ -131,6 +159,10 @@ class PublishRelease(BaseModel):
     min_supported: str
     platform: Platform
     arch: Architecture
+    # Optional with a default so every existing caller — the shipped desktop
+    # updater, the current nightly workflow, the admin manifest form — keeps
+    # publishing and reading the AppImage/exe/zip with no change at all.
+    format: Format = DEFAULT_FORMAT
     sha256: str
     size: int
     signature: str
@@ -177,6 +209,7 @@ class CiPublish(BaseModel):
     stable_version: str
     platform: Platform
     arch: Architecture
+    format: Format = DEFAULT_FORMAT
     channel: Channel = _CI_CHANNEL
     key_id: str = _CI_KEY_ID
     min_supported: str
@@ -205,6 +238,7 @@ class PromoteRelease(BaseModel):
     version: str
     platform: Platform
     arch: Architecture
+    format: Format = DEFAULT_FORMAT
 
 
 def _require_admin(request: Request):
@@ -282,20 +316,37 @@ def _decode_signature(value: str, field: str) -> bytes:
     return signature
 
 
-def _canonical_artifact(version: str, platform: str, arch: str) -> str:
-    if platform == "linux" and arch == "x86_64":
-        return f"Chudware-{version}-linux-x86_64.AppImage"
-    if platform == "windows" and arch == "x86_64":
-        return f"Chudware-Setup-{version}-x86_64.exe"
-    if platform == "macos":
-        return f"Chudware-{version}-macos-{arch}.zip"
-    raise HTTPException(422, "unsupported platform and architecture combination")
+def _canonical_artifact(
+    version: str, platform: str, arch: str, fmt: str = DEFAULT_FORMAT
+) -> str:
+    """The one filename this identity may be published under.
 
+    A thin wrapper over ``artifact_names.canonical_artifact``, which is where
+    the rule actually lives. It is a separate, dependency-free module because
+    the Linux packaging CI has to produce exactly these names with a bare
+    ``python3`` on a build runner that has no gateway virtualenv, and a second
+    implementation over there would drift on the first prerelease.
+    """
+    try:
+        return canonical_artifact(version, platform, arch, fmt)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
 
 
 def _artifact_signature_preimage(
     key_id: str, version: str, platform: str, arch: str, sha256: str
 ) -> bytes:
+    """FROZEN. Do not add ``format`` — or anything else — to this tuple.
+
+    Every shipped client verifies a release against
+    (domain, key_id, version, platform, arch, sha256), so a new field here
+    makes every future release fail signature verification on every installed
+    copy of 0.1.1 and permanently strands them with no update path. That is
+    also why it does not NEED format: sha256 already binds the exact bytes, so
+    the .deb's signature cannot be replayed onto the AppImage of the same
+    version. Format is a routing key that selects WHICH artifact a caller
+    wants; the digest is the identity claim.
+    """
     return b"\0".join((
         _ARTIFACT_SIGNATURE_DOMAIN, key_id.encode("ascii"), version.encode("ascii"),
         platform.encode("ascii"), arch.encode("ascii"), sha256.encode("ascii"),
@@ -362,7 +413,9 @@ def _validate_publish(value: PublishRelease) -> None:
     parsed_notes = urlparse(value.notes_url)
     if parsed_notes.scheme not in {"http", "https"} or not parsed_notes.netloc:
         raise HTTPException(422, "notes_url must be an absolute HTTP(S) URL")
-    expected_name = _canonical_artifact(value.version, value.platform, value.arch)
+    expected_name = _canonical_artifact(
+        value.version, value.platform, value.arch, value.format
+    )
     expected_key = f"{value.channel}/{value.version}/{expected_name}"
     path = PurePosixPath(value.artifact_key)
     if path.is_absolute() or ".." in path.parts or value.artifact_key != expected_key:
@@ -384,7 +437,9 @@ def _require_publish_token(request: Request) -> None:
         raise HTTPException(401, "invalid release publishing token")
 
 
-def _fetch_latest(channel: str, platform: str, arch: str) -> dict[str, Any] | None:
+def _fetch_latest(
+    channel: str, platform: str, arch: str, fmt: str = DEFAULT_FORMAT
+) -> dict[str, Any] | None:
     with tx() as cur:
         cur.execute(
             """
@@ -392,14 +447,46 @@ def _fetch_latest(channel: str, platform: str, arch: str) -> dict[str, Any] | No
                    artifact_key, payload_manifest_key, payload_manifest_sha256,
                    payload_signature_key, payload_signature_sha256
               FROM releases
-             WHERE channel = %s AND platform = %s AND arch = %s
+             WHERE channel = %s AND platform = %s AND arch = %s AND format = %s
              ORDER BY published_at DESC, version DESC
              LIMIT 1
             """,
-            (channel, platform, arch),
+            (channel, platform, arch, fmt),
         )
         row = cur.fetchone()
     return dict(row) if row is not None else None
+
+
+def _fetch_available(channel: str) -> list[dict[str, Any]]:
+    """Newest publication per (platform, arch, format) for one channel.
+
+    No artifact_key, no signature, no URL: this is the anonymous catalogue the
+    downloads UI paints itself from, and it must stay safe to cache in a CDN for
+    five minutes. DISTINCT ON does the newest-per-tuple selection in one index
+    scan over releases_latest_idx rather than one query per tuple.
+    """
+    with tx() as cur:
+        cur.execute(
+            """
+            SELECT DISTINCT ON (platform, arch, format)
+                   platform, arch, format, version, size, sha256, notes_url
+              FROM releases
+             WHERE channel = %s
+             ORDER BY platform, arch, format, published_at DESC, version DESC
+            """,
+            (channel,),
+        )
+        rows = [dict(row) for row in cur.fetchall()]
+    # Postgres sorted `format` as text; re-key it onto the declared order so
+    # "default" leads each tuple and the UI can feature builds[0].
+    rows.sort(
+        key=lambda row: (
+            str(row["platform"]),
+            str(row["arch"]),
+            FORMATS.index(str(row["format"])) if str(row["format"]) in FORMATS else len(FORMATS),
+        )
+    )
+    return rows
 
 
 def _active_entitlement(token: str) -> bool:
@@ -418,6 +505,86 @@ def _active_entitlement(token: str) -> bool:
         return False
 
 
+# Stateless, HMAC-signed, 15 minutes, bound to one account. It exists because
+# `curl … | sh` has no browser session and no desktop entitlement: the portal
+# mints one of these on a click and the install script presents it. The signing
+# domain is deliberately NOT the entitlement domain — an entitlement is a
+# long-lived, Ed25519-signed capability the desktop app verifies offline, this
+# is a short-lived bearer string only this gateway ever checks, and a shared
+# domain would let one be replayed as the other.
+_DOWNLOAD_TOKEN_DOMAIN = b"chudware-download-token-v1"
+DOWNLOAD_TOKEN_TTL = 900
+DOWNLOAD_TOKEN_HEADER = "x-chudware-download-token"
+
+
+def _download_token_mac(email: str, expires_at: int) -> str:
+    secret = (settings.session_secret or "").encode("utf-8")
+    if not secret:
+        # No secret means every token would share one forgeable MAC. Refusing is
+        # the only safe answer, and a deployment with no session_secret cannot
+        # authenticate the portal caller who would ask for one anyway.
+        raise HTTPException(503, "download tokens are not configured")
+    return hmac.new(
+        secret,
+        b"\0".join(
+            (_DOWNLOAD_TOKEN_DOMAIN, email.encode("utf-8"), str(expires_at).encode("ascii"))
+        ),
+        hashlib.sha256,
+    ).hexdigest()
+
+
+def mint_download_token(email: str, now: int | None = None) -> tuple[str, int]:
+    """``(token, ttl_seconds)`` for *email*. Nothing is persisted."""
+    issued_at = int(time.time()) if now is None else int(now)
+    expires_at = issued_at + DOWNLOAD_TOKEN_TTL
+    encoded = base64.urlsafe_b64encode(email.encode("utf-8")).decode("ascii").rstrip("=")
+    return f"{encoded}.{expires_at}.{_download_token_mac(email, expires_at)}", DOWNLOAD_TOKEN_TTL
+
+
+def _redeem_download_token(token: str, now: int | None = None) -> str | None:
+    """The email a valid, unexpired token belongs to, or None.
+
+    Signature first, then expiry, then account status — an account suspended
+    after the token was minted must stop downloading immediately, which is the
+    whole reason status is re-read here instead of being baked into the token.
+    """
+    encoded, _, rest = (token or "").partition(".")
+    expiry, _, signature = rest.partition(".")
+    if not encoded or not expiry or not signature:
+        return None
+    try:
+        email = base64.urlsafe_b64decode(encoded + "=" * (-len(encoded) % 4)).decode("utf-8")
+        expires_at = int(expiry)
+    except (ValueError, binascii.Error, UnicodeDecodeError):
+        return None
+    try:
+        expected = _download_token_mac(email, expires_at)
+    except HTTPException:
+        return None
+    if not hmac.compare_digest(signature, expected):
+        return None
+    # Parenthesised deliberately: `a if c else b >= x` binds the comparison to
+    # the else-branch only, which made every unexpired token look expired.
+    checked_at = int(time.time()) if now is None else int(now)
+    if checked_at >= expires_at:
+        return None
+    account = accounts.get_account(email)
+    if account is None or getattr(account, "status", "") != "active":
+        return None
+    return email
+
+
+def _download_token_from(request: Request) -> str:
+    """Header first, then the query string.
+
+    Both are required: a browser fetch can set the header, but `curl -fsSL`
+    following the manifest's redirect to the artifact route cannot carry one, so
+    the install script appends ?download_token= instead.
+    """
+    header = request.headers.get(DOWNLOAD_TOKEN_HEADER, "")
+    return header or request.query_params.get("download_token", "")
+
+
 def _may_download(request: Request) -> bool:
     if getattr(request.state, "user", None) is not None:
         return True
@@ -425,7 +592,10 @@ def _may_download(request: Request) -> bool:
     if not token:
         authorization = request.headers.get("authorization", "")
         token = authorization[7:] if authorization.startswith("Bearer ") else ""
-    return bool(token) and _active_entitlement(token)
+    if token and _active_entitlement(token):
+        return True
+    download_token = _download_token_from(request)
+    return bool(download_token) and _redeem_download_token(download_token) is not None
 
 
 def _r2_missing() -> list[str]:
@@ -493,10 +663,14 @@ async def latest_release(
     channel: Channel,
     platform: Platform,
     arch: Architecture,
+    # OPTIONAL, and it must stay optional. The shipped 0.1.1 desktop updater
+    # requests channel+platform+arch and nothing else; making format required
+    # would 422 every installed client's update check.
+    format: Format = DEFAULT_FORMAT,
 ) -> dict[str, Any]:
     client = request.client.host if request.client else "unknown"
     _manifest_by_ip.enforce(client, "release manifest checks")
-    row = _fetch_latest(channel, platform, arch)
+    row = _fetch_latest(channel, platform, arch, format)
     if row is None:
         raise HTTPException(404, "release not found")
     artifact_key = str(row.pop("artifact_key"))
@@ -511,6 +685,10 @@ async def latest_release(
         # selected by exactly these two values, so echoing them is exact.
         "platform": platform,
         "arch": arch,
+        # Echoed for the same reason: the row was selected by it. An updater
+        # that does not know about formats never sends one, gets "default"
+        # back, and ignores a field it does not read.
+        "format": format,
         "key_id": str(row["key_id"]),
         "sha256": str(row["sha256"]),
         "size": int(row["size"]),
@@ -529,6 +707,81 @@ async def latest_release(
     return manifest
 
 
+# Cross-origin readers of the download catalogue. chudware.com (Cloudflare
+# Pages) is a DIFFERENT origin from app.chudware.com, and without an
+# Access-Control-Allow-Origin header its download page can never show a real
+# version or size and permanently renders its degraded static card.
+#
+# An explicit allowlist, echoed only on an exact match — never a wildcard and
+# never a reflected arbitrary Origin. The response happens to contain nothing
+# secret today, but "safe to read cross-origin" is a property of this route's
+# body, and a wildcard or a reflector would keep granting access if that body
+# ever gained a field. The allowlist costs nothing and does not.
+_CATALOGUE_CORS_ORIGINS = ("https://chudware.com", "https://www.chudware.com")
+# Astro's dev/preview port, and ONLY while dev_mode is on, so a production
+# deployment never carries a localhost origin in its allowlist.
+_CATALOGUE_CORS_DEV_ORIGINS = ("http://localhost:4321", "http://127.0.0.1:4321")
+
+
+def _catalogue_cors_origins() -> tuple[str, ...]:
+    if settings.dev_mode:
+        return _CATALOGUE_CORS_ORIGINS + _CATALOGUE_CORS_DEV_ORIGINS
+    return _CATALOGUE_CORS_ORIGINS
+
+
+def _apply_catalogue_cors(request: Request, response: Response) -> None:
+    """Echo an allowed Origin, and always Vary on it.
+
+    ``Vary: Origin`` is unconditional: this route is cached for five minutes at
+    the edge, and without it Cloudflare would store one origin's response —
+    header included or omitted — and serve it to every other caller.
+
+    No Access-Control-Allow-Credentials and no OPTIONS handler: the consumers
+    send a bare GET with no custom request headers, which browsers dispatch with
+    no preflight at all. Adding a permissive preflight would open a door nothing
+    is knocking on.
+    """
+    response.headers["Vary"] = "Origin"
+    origin = request.headers.get("origin", "")
+    if origin and origin in _catalogue_cors_origins():
+        response.headers["Access-Control-Allow-Origin"] = origin
+
+
+@router.get("/api/releases/available")
+async def available_releases(
+    request: Request, response: Response, channel: Channel = "stable"
+) -> dict[str, Any]:
+    """The public download catalogue: what exists, for whom, how big.
+
+    Anonymous by design and identical for every caller — no URL, no signature,
+    no artifact key — so the downloads UI can auto-detect a visitor's platform
+    and paint real versions and sizes before anybody signs in, and so the whole
+    response is safe to cache for five minutes at the edge.
+
+    A (platform, arch) tuple with no publication is simply ABSENT from builds.
+    That is the contract every consumer keys its "no build yet" state off:
+    macos/arm64 has never published, and inventing a placeholder row here would
+    put a download button in front of bytes that do not exist.
+    """
+    client = request.client.host if request.client else "unknown"
+    _available_by_ip.enforce(client, "release catalogue reads")
+    builds = [
+        {
+            "platform": str(row["platform"]),
+            "arch": str(row["arch"]),
+            "format": str(row["format"]),
+            "version": str(row["version"]),
+            "size": int(row["size"]),
+            "sha256": str(row["sha256"]),
+            "notes_url": str(row["notes_url"]),
+        }
+        for row in _fetch_available(channel)
+    ]
+    response.headers["Cache-Control"] = "public, max-age=300"
+    _apply_catalogue_cors(request, response)
+    return {"channel": channel, "builds": builds}
+
+
 _RELEASE_COLUMNS = (
     "channel", "version", "min_supported", "platform", "arch", "key_id", "sha256",
     "size", "signature", "notes_url", "artifact_key", "payload_manifest_key",
@@ -537,6 +790,9 @@ _RELEASE_COLUMNS = (
     "sbom_signature_sha256", "provenance_key", "provenance_sha256",
     "provenance_signature_key", "provenance_signature_sha256", "platform_test_key",
     "platform_test_sha256", "platform_test_signature_key", "platform_test_signature_sha256",
+    # Appended, not inserted in identity order: this tuple is positional in the
+    # generated INSERT, and tests pin column positions.
+    "format",
 )
 
 
@@ -573,7 +829,7 @@ def _insert_release_row(row: dict[str, Any], extra_columns: tuple[str, ...] = ()
             f"""
             INSERT INTO releases ({', '.join(columns)}, published_at)
             VALUES ({', '.join(['%s'] * len(columns))}, now())
-            ON CONFLICT (channel, version, platform, arch) DO NOTHING
+            ON CONFLICT (channel, version, platform, arch, format) DO NOTHING
             """,
             values,
         )
@@ -693,14 +949,17 @@ def _collect_ci_sidecars(
     return sidecars, columns
 
 
-def _release_exists(channel: str, version: str, platform: str, arch: str) -> bool:
+def _release_exists(
+    channel: str, version: str, platform: str, arch: str, fmt: str = DEFAULT_FORMAT
+) -> bool:
     with tx() as cur:
         cur.execute(
             """
             SELECT 1 FROM releases
              WHERE channel = %s AND version = %s AND platform = %s AND arch = %s
+               AND format = %s
             """,
-            (channel, version, platform, arch),
+            (channel, version, platform, arch, fmt),
         )
         return cur.fetchone() is not None
 
@@ -720,7 +979,9 @@ async def ci_publish_release(value: CiPublish, request: Request) -> dict[str, An
     _require_publish_token(request)
     signature, stable_signature = _validate_ci_publish(value)
 
-    name = _safe_name(_canonical_artifact(value.version, value.platform, value.arch))
+    name = _safe_name(
+        _canonical_artifact(value.version, value.platform, value.arch, value.format)
+    )
     staged = _staged(name)
     if not staged.is_file():
         raise HTTPException(404, f"staged artifact is missing from incoming/: {name}")
@@ -748,7 +1009,9 @@ async def ci_publish_release(value: CiPublish, request: Request) -> dict[str, An
             raise
 
     artifact_key = f"{_CI_CHANNEL}/{value.version}/{name}"
-    if _release_exists(_CI_CHANNEL, value.version, value.platform, value.arch):
+    if _release_exists(
+        _CI_CHANNEL, value.version, value.platform, value.arch, value.format
+    ):
         raise HTTPException(409, "release identity is immutable and already registered")
     sidecars, columns = _collect_ci_sidecars(value, name, artifact_key)
 
@@ -772,6 +1035,7 @@ async def ci_publish_release(value: CiPublish, request: Request) -> dict[str, An
             "min_supported": value.min_supported,
             "platform": value.platform,
             "arch": value.arch,
+            "format": value.format,
             "key_id": value.key_id,
             "sha256": digest,
             "size": size,
@@ -787,6 +1051,7 @@ async def ci_publish_release(value: CiPublish, request: Request) -> dict[str, An
         "ok": True,
         "channel": _CI_CHANNEL,
         "version": value.version,
+        "format": value.format,
         "stable_version": value.stable_version,
         "artifact_key": artifact_key,
         "sha256": digest,
@@ -1039,7 +1304,7 @@ async def list_release_manifests(request: Request) -> list[dict[str, Any]]:
                        AS has_stable_pair,
                    ({_EVIDENCE_COMPLETE_SQL}) AS evidence_complete
               FROM releases
-             ORDER BY published_at DESC, channel, platform, arch
+             ORDER BY published_at DESC, channel, platform, arch, format
             """
         )
         rows = cur.fetchall()
@@ -1062,6 +1327,7 @@ async def delete_release_manifest(
     version: str,
     platform: Platform,
     arch: Architecture,
+    format: Format = DEFAULT_FORMAT,
 ) -> dict[str, Any]:
     _require_admin(request)
     _parse_prerelease_version(version, "version")
@@ -1070,8 +1336,9 @@ async def delete_release_manifest(
             """
             DELETE FROM releases
              WHERE channel = %s AND version = %s AND platform = %s AND arch = %s
+               AND format = %s
             """,
-            (channel, version, platform, arch),
+            (channel, version, platform, arch, format),
         )
         deleted = cur.rowcount
     if not deleted:
@@ -1080,15 +1347,16 @@ async def delete_release_manifest(
 
 
 def _fetch_release_row(
-    channel: str, version: str, platform: str, arch: str
+    channel: str, version: str, platform: str, arch: str, fmt: str = DEFAULT_FORMAT
 ) -> dict[str, Any] | None:
     with tx() as cur:
         cur.execute(
             """
             SELECT * FROM releases
              WHERE channel = %s AND version = %s AND platform = %s AND arch = %s
+               AND format = %s
             """,
-            (channel, version, platform, arch),
+            (channel, version, platform, arch, fmt),
         )
         row = cur.fetchone()
     return dict(row) if row is not None else None
@@ -1108,7 +1376,9 @@ async def promote_release(value: PromoteRelease, request: Request) -> dict[str, 
     if value.channel != _CI_CHANNEL:
         raise HTTPException(422, "only beta releases can be promoted")
     _parse_prerelease_version(value.version, "version")
-    row = _fetch_release_row(_CI_CHANNEL, value.version, value.platform, value.arch)
+    row = _fetch_release_row(
+        _CI_CHANNEL, value.version, value.platform, value.arch, value.format
+    )
     if row is None:
         raise HTTPException(404, "beta release not found")
     stable_version = row.get("stable_version")
@@ -1135,11 +1405,15 @@ async def promote_release(value: PromoteRelease, request: Request) -> dict[str, 
         str(row["sha256"]),
         _decode_signature(stable_signature, "stable_signature"),
     )
-    if _release_exists("stable", stable_version, value.platform, value.arch):
+    if _release_exists(
+        "stable", stable_version, value.platform, value.arch, value.format
+    ):
         raise HTTPException(409, "stable release identity is already registered")
 
+    # The promoted row keeps the beta's format — the bytes are the same bytes,
+    # so a .deb beta promotes to a .deb stable and never to the AppImage.
     stable_name = _safe_name(
-        _canonical_artifact(stable_version, value.platform, value.arch)
+        _canonical_artifact(stable_version, value.platform, value.arch, value.format)
     )
     stable_key = f"stable/{stable_version}/{stable_name}"
     source = _store_path(str(row["artifact_key"]))
@@ -1149,12 +1423,7 @@ async def promote_release(value: PromoteRelease, request: Request) -> dict[str, 
             409, "beta artifact bytes are not present on this host; cannot promote"
         )
     destination.parent.mkdir(parents=True, exist_ok=True)
-    suffixes = ("",) + _PAYLOAD_SIDECAR_SUFFIXES + tuple(
-        f".{filename}{tail}"
-        for _, filename in _EVIDENCE_SIDECARS
-        for tail in ("", ".sig")
-    )
-    for suffix in suffixes:
+    for suffix in _ARTIFACT_SUFFIXES:
         sidecar = source.with_name(source.name + suffix)
         if not sidecar.is_file():
             raise HTTPException(
@@ -1183,10 +1452,258 @@ async def promote_release(value: PromoteRelease, request: Request) -> dict[str, 
         **{
             column: promoted[column]
             for column in ("channel", "version", "min_supported", "platform", "arch",
-                           "key_id", "sha256", "size", "signature", "notes_url",
-                           "artifact_key", "commit_sha")
+                           "format", "key_id", "sha256", "size", "signature",
+                           "notes_url", "artifact_key", "commit_sha")
         },
     }
+
+
+# Retention.
+#
+# Measured, not estimated. The live 0.1.1 manifests give the AppImage as
+# 340 724 216 B, the Windows installer 239 491 858 B and the macOS zip
+# 121 394 445 B — 669 MiB, ~0.70 GB, of artifact per nightly today. The Linux
+# packaging build measures a .deb at 0.293x and an .rpm at 0.315x the AppDir
+# payload, which against the real payload is 340-410 MiB of NEW bytes per
+# nightly on top of the AppImage; a .tar.zst sysroot, if it also publishes
+# nightly, adds roughly another AppImage. So a nightly goes from ~0.70 GB to
+# ~1.0 GB (deb + rpm) or ~1.35 GB (all four Linux formats).
+#
+# Production's filesystem is 97% used with 3.9 GB free and ~6.8 GB already in
+# chudware-releases. Unbounded, that is about ten nights before the disk is full
+# and takes the gateway, PostgreSQL and the tunnel with it — so retention is not
+# an admin convenience, it runs on a daily systemd timer
+# (Webservice/deploy/chudware-release-retention.timer).
+#
+# N = 3 beta versions per (platform, arch, format), re-checked now that a Linux
+# platform has four formats instead of one. The bound is per tuple, so four
+# formats means four times the directories at the same N — that is the intended
+# behaviour, not an oversight: the .deb's history is as useful to a .deb user as
+# the AppImage's is to an AppImage user, and keeping the newest of one format
+# while dropping another would make "roll back one build" work for some users
+# and not others. Three is the smallest count that stays honest: the newest is
+# what /api/releases/latest serves, the one before it is what a tester rolls
+# back to when the newest is broken, and the third is slack for a night when CI
+# publishes twice. It bounds beta at ~3 GB (deb + rpm) to ~4 GB (all four),
+# which fits the disk once the current unbounded history is pruned.
+#
+# Stable is deliberately NOT bounded here: a customer who pinned 0.1.0 must
+# still be able to download 0.1.0. That pile grows ~1 GB per SHIPPED release
+# rather than per night, and capping it is a product decision about how long an
+# old version stays downloadable, not something this function should decide.
+BETA_RETENTION_VERSIONS = 3
+
+# An artifact CI staged but never published — a 422 on a digest mismatch, a run
+# cancelled between upload and publish, an abandoned `.part` from a chunked
+# upload — sits in incoming/ forever. It is a second unbounded pile, and nothing
+# was watching it. A day of grace is generous: publication follows an upload
+# within one workflow run, minutes apart.
+INCOMING_ORPHAN_AGE_SECONDS = 24 * 60 * 60
+
+
+def _prunable_beta_rows(keep: int) -> list[dict[str, Any]]:
+    """Beta rows older than the newest *keep* per (platform, arch, format).
+
+    Stable is never a candidate. A customer who pinned 0.1.0 must still be able
+    to download 0.1.0, and a stable artifact is the only copy of its bytes —
+    promotion copied them out of the beta directory, it did not link them.
+    """
+    with tx() as cur:
+        cur.execute(
+            """
+            SELECT channel, version, platform, arch, format, artifact_key, size
+              FROM releases
+             WHERE channel = %s
+             ORDER BY platform, arch, format, published_at DESC, version DESC
+            """,
+            (_CI_CHANNEL,),
+        )
+        rows = [dict(row) for row in cur.fetchall()]
+    seen: dict[tuple[str, str, str], int] = {}
+    prunable: list[dict[str, Any]] = []
+    for row in rows:
+        tuple_key = (str(row["platform"]), str(row["arch"]), str(row["format"]))
+        rank = seen.get(tuple_key, 0)
+        seen[tuple_key] = rank + 1
+        if rank >= keep:
+            prunable.append(row)
+    return prunable
+
+
+def _published_artifact_names() -> set[str]:
+    """Basename of every published artifact_key, for the incoming/ sweep."""
+    with tx() as cur:
+        cur.execute("SELECT artifact_key FROM releases")
+        return {
+            PurePosixPath(str(row["artifact_key"])).name for row in cur.fetchall()
+        }
+
+
+def _incoming_orphans(now: float | None = None) -> list[Path]:
+    """Staged files older than a day that no release row accounts for.
+
+    An artifact stays in incoming/ only between its upload and its publication —
+    minutes, inside one workflow run — because ci/publish MOVES it into store/.
+    Anything still here a day later is the residue of a failed publish (a 422 on
+    a digest mismatch, a cancelled run, an abandoned ``.part`` from a chunked
+    upload) and nothing will ever come back for it.
+
+    The age bound is what makes this safe rather than a race with a live upload:
+    a run whose publish is still pending is minutes old, not a day.
+    """
+    incoming = _incoming_dir()
+    if not incoming.is_dir():
+        return []
+    cutoff = (time.time() if now is None else now) - INCOMING_ORPHAN_AGE_SECONDS
+    published = _published_artifact_names()
+    orphans: list[Path] = []
+    for path in sorted(incoming.iterdir()):
+        if not path.is_file():
+            continue
+        try:
+            if path.stat().st_mtime > cutoff:
+                continue
+        except OSError:
+            continue
+        # A sidecar is <artifact><suffix>; strip the suffix before matching so a
+        # published artifact's sidecars are recognised as accounted for too.
+        stem = path.name
+        for suffix in _ARTIFACT_SUFFIXES:
+            if suffix and stem.endswith(suffix):
+                stem = stem[: -len(suffix)]
+                break
+        if stem not in published:
+            orphans.append(path)
+    return orphans
+
+
+def prune_release_store(
+    *, dry_run: bool = False, keep: int = BETA_RETENTION_VERSIONS
+) -> dict[str, Any]:
+    """Drop superseded beta publications, their bytes, and staging orphans.
+
+    Idempotent: a second call with nothing newly superseded reports zero of
+    everything and touches nothing.
+
+    Rows are deleted FIRST, in one transaction, and bytes second. That order is
+    the safe one — a row whose bytes are gone would advertise a download that
+    404s, while bytes whose row is gone are simply unreachable, because the
+    artifact route requires an exact `releases.artifact_key` match before it
+    opens anything. This is also why nothing here can delete an artifact a live
+    row still points at: the only files it unlinks are the ones derived from the
+    basename of a key whose row it just removed, and `artifact_key` is UNIQUE.
+
+    There is deliberately NO orphan sweep over `store/`. ci/publish moves bytes
+    into place BEFORE inserting its row, so a file with no row may be a
+    publication in flight, and only directories this call emptied itself are
+    removed — for the same reason. ``incoming/`` is different and IS swept: a
+    file there is by definition unpublished, and the one-day age bound separates
+    residue from an upload in flight.
+    """
+    keep = max(1, int(keep))
+    prunable = _prunable_beta_rows(keep)
+    orphans = _incoming_orphans()
+    report: dict[str, Any] = {
+        "ok": True,
+        "dry_run": bool(dry_run),
+        "keep_beta_versions": keep,
+        "pruned": [],
+        "deleted_files": 0,
+        "freed_bytes": 0,
+        "incoming_orphans": [],
+        "incoming_freed_bytes": 0,
+        "errors": [],
+    }
+    for path in orphans:
+        try:
+            size = path.stat().st_size
+        except OSError:
+            size = 0
+        report["incoming_orphans"].append({"name": path.name, "bytes": size})
+        report["incoming_freed_bytes"] += size
+    if not prunable and not orphans:
+        return report
+
+    # Resolve and measure before deleting anything, so a dry run reports the
+    # same numbers a real run would free.
+    plans: list[tuple[dict[str, Any], list[Path]]] = []
+    for row in prunable:
+        artifact_key = str(row["artifact_key"])
+        try:
+            base = _store_path(artifact_key)
+        except HTTPException:
+            # A key that no longer maps onto the store layout (hand-edited row)
+            # must not stop the sweep; its row is still superseded.
+            report["errors"].append(f"{artifact_key}: not a store path")
+            plans.append((row, []))
+            continue
+        files = [
+            candidate
+            for candidate in (base.with_name(base.name + s) for s in _ARTIFACT_SUFFIXES)
+            if candidate.is_file()
+        ]
+        bytes_on_disk = 0
+        for path in files:
+            try:
+                bytes_on_disk += path.stat().st_size
+            except OSError:
+                pass
+        plans.append((row, files))
+        report["pruned"].append(
+            {
+                "channel": str(row["channel"]),
+                "version": str(row["version"]),
+                "platform": str(row["platform"]),
+                "arch": str(row["arch"]),
+                "format": str(row["format"]),
+                "artifact_key": artifact_key,
+                "files": len(files),
+                "bytes": bytes_on_disk,
+            }
+        )
+        report["deleted_files"] += len(files)
+        report["freed_bytes"] += bytes_on_disk
+
+    if dry_run:
+        return report
+
+    keys = [str(row["artifact_key"]) for row in prunable]
+    if keys:
+        with tx() as cur:
+            cur.execute("DELETE FROM releases WHERE artifact_key = ANY(%s)", (keys,))
+
+    emptied: set[Path] = set()
+    for _, files in plans:
+        for path in files:
+            try:
+                path.unlink()
+                emptied.add(path.parent)
+            except OSError as exc:
+                report["errors"].append(f"{path.name}: {exc.strerror or exc}")
+    for directory in sorted(emptied, key=lambda p: len(p.parts), reverse=True):
+        try:
+            next(directory.iterdir())
+        except StopIteration:
+            try:
+                directory.rmdir()
+            except OSError as exc:
+                report["errors"].append(f"{directory.name}/: {exc.strerror or exc}")
+        except OSError as exc:
+            report["errors"].append(f"{directory.name}/: {exc.strerror or exc}")
+    for path in orphans:
+        try:
+            path.unlink()
+        except OSError as exc:
+            report["errors"].append(f"incoming/{path.name}: {exc.strerror or exc}")
+    return report
+
+
+@router.post("/api/admin/releases/prune")
+async def prune_releases(request: Request, dry_run: bool = False) -> dict[str, Any]:
+    """Apply the retention policy now. Idempotent; ``?dry_run=true`` reports
+    exactly what a real run would remove and changes nothing."""
+    _require_admin(request)
+    return prune_release_store(dry_run=dry_run)
 
 
 @router.get("/api/admin/ci/builds")

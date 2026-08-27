@@ -1,6 +1,7 @@
 ---
 import { getCollection } from 'astro:content';
 import BaseLayout from './BaseLayout.astro';
+import Icon from '../components/Icon.astro';
 
 interface Props {
   title: string;
@@ -16,7 +17,7 @@ const path = Astro.url.pathname;
   <div class="wrap docs-shell">
     <aside class="docs-sidebar" aria-label="Documentation sidebar">
       <div class="docs-sidebar-inner">
-        <form class="doc-search" data-doc-search role="search"><input name="q" type="search" aria-label="Search documentation" placeholder="Search docs" /><button type="submit" aria-label="Submit search">⌕</button></form>
+        <form class="doc-search" data-doc-search role="search"><input name="q" type="search" aria-label="Search documentation" placeholder="Search docs" /><button type="submit" aria-label="Submit search"><Icon name="search" /></button></form>
         <details open>
           <summary>Documentation menu</summary>
           <nav class="docs-nav" aria-label="Documentation">

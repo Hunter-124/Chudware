@@ -19,3 +19,9 @@ X-BinaryName=chudware
 # ui/imgui (AI-CAD2) is retired; host/ is the single cross-platform GUI (see docs/PORT_LEDGER.md).
 # BRANDING NOTE: the binary is now chudware (2026-07 deep rename); a Billet compat
 # symlink ships beside it in the build dir for legacy scripts/harnesses.
+# PACKAGING NOTE: packaging/linux/build_linux_packages.sh ships the entry that
+# build_appimage.sh staged into the AppDir, with every comment line and the
+# AppImage-only X-AppImage-Version key removed, and X-Chudware-Version=<version>
+# appended. So these comments are repository documentation and never reach an
+# installed system — never put a load-bearing key in a comment here, and never
+# rely on a comment surviving into the .deb/.rpm/AppImage entry.

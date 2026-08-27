@@ -106,9 +106,10 @@ def _stage(
     arch: str = "x86_64",
     *,
     evidence: bool = True,
+    fmt: str = "default",
 ) -> dict[str, bytes]:
     """Write an artifact plus its sidecars into incoming/, exactly as CI does."""
-    name = releases._canonical_artifact(version, platform, arch)
+    name = releases._canonical_artifact(version, platform, arch, fmt)
     files = {name: f"artifact bytes for {name}".encode()}
     for suffix in releases._PAYLOAD_SIDECAR_SUFFIXES:
         files[name + suffix] = f"{name}{suffix} contents".encode()
@@ -132,9 +133,10 @@ def _body(
     arch: str = "x86_64",
     *,
     evidence: bool = True,
+    fmt: str = "default",
     **overrides: Any,
 ) -> dict[str, Any]:
-    name = releases._canonical_artifact(version, platform, arch)
+    name = releases._canonical_artifact(version, platform, arch, fmt)
     artifact = files[name]
     digest = hashlib.sha256(artifact).hexdigest()
     body: dict[str, Any] = {
@@ -142,11 +144,15 @@ def _body(
         "stable_version": stable_version,
         "platform": platform,
         "arch": arch,
+        "format": fmt,
         "channel": "beta",
         "key_id": releases._CI_KEY_ID,
         "min_supported": "0.1.0",
         "sha256": digest,
         "size": len(artifact),
+        # The preimage is (key_id, version, platform, arch, sha256) with NO
+        # format, so the same signature is valid for every format of a version
+        # that happens to share a digest — the digest is what binds the bytes.
         "signature": _sign(private, version, platform, arch, digest),
         "stable_signature": _sign(private, stable_version, platform, arch, digest),
         "notes_url": f"https://chudware.com/releases/{version}",
@@ -170,31 +176,44 @@ def _publish(ci: TestClient, private: Ed25519PrivateKey, **kwargs: Any):
         kwargs.get("platform", "linux"),
         kwargs.get("arch", "x86_64"),
         evidence=kwargs.get("evidence", True),
+        fmt=kwargs.get("fmt", "default"),
     )
     return ci.post("/api/releases/ci/publish", json=_body(private, files, **kwargs))
 
 
-def _insert_stable(version: str, platform: str = "linux", arch: str = "x86_64") -> None:
+def _insert_stable(
+    version: str, platform: str = "linux", arch: str = "x86_64", fmt: str = "default"
+) -> None:
     """A published stable row, inserted directly: base-version math must hold for
     rows this module did not mint, including ones older than the CI key."""
-    name = releases._canonical_artifact(version, platform, arch)
+    name = releases._canonical_artifact(version, platform, arch, fmt)
     key = f"stable/{version}/{name}"
     with db.tx() as cur:
         cur.execute(
             """
             INSERT INTO releases
-                   (channel, version, min_supported, platform, arch, key_id, sha256,
-                    size, signature, notes_url, artifact_key, payload_manifest_key,
-                    payload_manifest_sha256, payload_signature_key, payload_signature_sha256)
-            VALUES ('stable', %s, '0.1.0', %s, %s, 'release-v1', %s, 4096, 'sig',
+                   (channel, version, min_supported, platform, arch, format, key_id,
+                    sha256, size, signature, notes_url, artifact_key,
+                    payload_manifest_key, payload_manifest_sha256,
+                    payload_signature_key, payload_signature_sha256)
+            VALUES ('stable', %s, '0.1.0', %s, %s, %s, 'release-v1', %s, 4096, 'sig',
                     'https://chudware.com/releases', %s, %s, %s, %s, %s)
             """,
             (
-                version, platform, arch, hashlib.sha256(key.encode()).hexdigest(),
+                version, platform, arch, fmt,
+                hashlib.sha256(key.encode()).hexdigest(),
                 key, key + ".payload-manifest.v1.json", "a" * 64,
                 key + ".payload-manifest.v1.sig", "b" * 64,
             ),
         )
+    # Bytes as well as a row: a published row with nothing behind it is not a
+    # state the gateway can be in, and retention has to be able to observe that
+    # a stable artifact it must never delete is actually on disk.
+    store = releases._store_path(key)
+    store.parent.mkdir(parents=True, exist_ok=True)
+    store.write_bytes(f"stable artifact bytes for {name}".encode())
+    for suffix in releases._PAYLOAD_SIDECAR_SUFFIXES:
+        store.with_name(store.name + suffix).write_bytes(b"sidecar")
 
 
 # ---------------------------------------------------------------------------
@@ -909,3 +928,358 @@ def test_ci_upload_then_publish_round_trip(ci: TestClient, ci_key, ci_env) -> No
         "/api/releases/ci/publish", json=_body(ci_key, files, evidence=False)
     )
     assert response.status_code == 200, response.text
+
+
+# ---------------------------------------------------------------------------
+# Formats: publish -> latest -> promote, against a real database
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("fmt", "expected_beta", "expected_stable"),
+    [
+        (
+            "default",
+            f"Chudware-{BETA}-linux-x86_64.AppImage",
+            f"Chudware-{STABLE}-linux-x86_64.AppImage",
+        ),
+        # 0.1.0-beta.42 -> 0.1.0~beta.42; the release drops the suffix entirely.
+        ("deb", "chudware_0.1.0~beta.42_amd64.deb", "chudware_0.1.0_amd64.deb"),
+        ("rpm", "chudware-0.1.0-0.beta.42.x86_64.rpm", "chudware-0.1.0-1.x86_64.rpm"),
+        (
+            "tar",
+            f"Chudware-{BETA}-linux-x86_64.tar.zst",
+            f"Chudware-{STABLE}-linux-x86_64.tar.zst",
+        ),
+    ],
+)
+def test_a_format_round_trips_through_publish_latest_and_promote(
+    pg, ci: TestClient, admin: TestClient, ci_key, fmt, expected_beta, expected_stable
+) -> None:
+    published = _publish(ci, ci_key, fmt=fmt)
+    assert published.status_code == 200, published.text
+    assert published.json()["format"] == fmt
+    assert published.json()["artifact_key"] == f"beta/{BETA}/{expected_beta}"
+
+    manifest = ci.get(
+        "/api/releases/latest",
+        params={"channel": "beta", "platform": "linux", "arch": "x86_64", "format": fmt},
+    )
+    assert manifest.status_code == 200, manifest.text
+    assert manifest.json()["format"] == fmt
+    assert manifest.json()["version"] == BETA
+
+    promoted = admin.post(
+        "/api/admin/releases/promote",
+        json={
+            "channel": "beta", "version": BETA, "platform": "linux",
+            "arch": "x86_64", "format": fmt,
+        },
+    )
+    assert promoted.status_code == 200, promoted.text
+    assert promoted.json()["format"] == fmt
+    assert promoted.json()["artifact_key"] == f"stable/{STABLE}/{expected_stable}"
+    # The bytes were copied, not re-signed, so the digest is unchanged.
+    assert promoted.json()["sha256"] == manifest.json()["sha256"]
+    assert (releases._store_dir() / "stable" / STABLE / expected_stable).is_file()
+
+    stable_manifest = ci.get(
+        "/api/releases/latest",
+        params={
+            "channel": "stable", "platform": "linux", "arch": "x86_64", "format": fmt,
+        },
+    )
+    assert stable_manifest.status_code == 200
+    assert stable_manifest.json()["version"] == STABLE
+    assert stable_manifest.json()["format"] == fmt
+
+
+def test_four_formats_of_one_version_coexist_and_latest_picks_the_right_one(
+    pg, ci: TestClient, ci_key
+) -> None:
+    """The whole point of moving the primary key. Before 0018 the second format
+    of a version was a 409 that read like a duplicate publish."""
+    for fmt in ("default", "deb", "rpm", "tar"):
+        response = _publish(ci, ci_key, fmt=fmt)
+        assert response.status_code == 200, f"{fmt}: {response.text}"
+
+    with db.tx() as cur:
+        cur.execute("SELECT format FROM releases WHERE channel='beta' ORDER BY format")
+        assert [row["format"] for row in cur.fetchall()] == [
+            "deb", "default", "rpm", "tar",
+        ]
+
+    digests = {}
+    for fmt in ("default", "deb", "rpm", "tar"):
+        body = ci.get(
+            "/api/releases/latest",
+            params={
+                "channel": "beta", "platform": "linux", "arch": "x86_64", "format": fmt,
+            },
+        ).json()
+        assert body["format"] == fmt
+        digests[fmt] = body["sha256"]
+    # Four different files, so four different digests: a manifest that handed
+    # back the AppImage's digest for the .deb would break every verification.
+    assert len(set(digests.values())) == 4
+
+
+def test_latest_without_a_format_serves_the_appimage_beside_three_packages(
+    pg, ci: TestClient, ci_key
+) -> None:
+    """The shipped 0.1.1 updater's exact request, with all four formats present."""
+    for fmt in ("deb", "rpm", "tar", "default"):
+        assert _publish(ci, ci_key, fmt=fmt).status_code == 200
+    body = ci.get(
+        "/api/releases/latest",
+        params={"channel": "beta", "platform": "linux", "arch": "x86_64"},
+    ).json()
+    assert body["format"] == "default"
+    appimage = releases._canonical_artifact(BETA, "linux", "x86_64", "default")
+    assert body["sha256"] == hashlib.sha256(
+        f"artifact bytes for {appimage}".encode()
+    ).hexdigest()
+
+
+def test_ci_publish_refuses_a_package_format_for_windows(
+    pg, ci: TestClient, ci_key
+) -> None:
+    _stage(BETA, "linux", "x86_64")
+    response = ci.post(
+        "/api/releases/ci/publish",
+        json=_body(ci_key, _stage(BETA, "linux", "x86_64"), platform="linux")
+        | {"platform": "windows", "format": "deb"},
+    )
+    assert response.status_code == 422
+    assert "only the default format" in response.json()["detail"]
+
+
+# ---------------------------------------------------------------------------
+# /api/releases/available against a real database
+# ---------------------------------------------------------------------------
+
+
+def test_available_lists_the_newest_build_per_tuple_anonymously(
+    pg, ci: TestClient, ci_key
+) -> None:
+    for fmt in ("default", "deb"):
+        assert _publish(ci, ci_key, fmt=fmt).status_code == 200
+    # A second, newer beta of the AppImage only: `available` must report the
+    # newer one for that tuple and leave the .deb's older version alone.
+    newer = "0.1.0-beta.43"
+    assert _publish(ci, ci_key, version=newer, fmt="default").status_code == 200
+    _insert_stable("0.1.1", "windows", "x86_64")
+
+    anonymous = TestClient(app_mod.app)
+    beta = anonymous.get("/api/releases/available", params={"channel": "beta"})
+    assert beta.status_code == 200, beta.text
+    assert beta.headers["cache-control"] == "public, max-age=300"
+    builds = beta.json()["builds"]
+    assert [(b["platform"], b["arch"], b["format"], b["version"]) for b in builds] == [
+        ("linux", "x86_64", "default", newer),
+        ("linux", "x86_64", "deb", BETA),
+    ]
+    for build in builds:
+        assert set(build) == {
+            "platform", "arch", "format", "version", "size", "sha256", "notes_url",
+        }
+    assert "signature" not in beta.text and "artifact_key" not in beta.text
+
+    stable = anonymous.get("/api/releases/available").json()
+    assert stable["channel"] == "stable"
+    assert [(b["platform"], b["format"]) for b in stable["builds"]] == [
+        ("windows", "default")
+    ]
+
+
+# ---------------------------------------------------------------------------
+# Retention
+# ---------------------------------------------------------------------------
+
+
+def _store_files(channel: str) -> set[str]:
+    root = releases._store_dir() / channel
+    if not root.is_dir():
+        return set()
+    return {str(path.relative_to(root)) for path in root.rglob("*") if path.is_file()}
+
+
+def test_retention_prunes_old_betas_per_format_and_never_touches_stable(
+    pg, ci: TestClient, ci_key
+) -> None:
+    versions = [f"0.1.0-beta.{run}" for run in (40, 41, 42, 43, 44)]
+    for version in versions:
+        for fmt in ("default", "deb"):
+            assert _publish(
+                ci, ci_key, version=version, fmt=fmt
+            ).status_code == 200, f"{version} {fmt}"
+    _insert_stable("0.1.0")
+    stable_before = _store_files("stable")
+    assert stable_before
+
+    report = releases.prune_release_store()
+    assert report["ok"] is True and report["dry_run"] is False
+    assert report["keep_beta_versions"] == 3
+    # Two tuples x (5 published - 3 kept) = 4 rows, each with 9 files.
+    assert len(report["pruned"]) == 4
+    assert {(entry["version"], entry["format"]) for entry in report["pruned"]} == {
+        ("0.1.0-beta.40", "default"), ("0.1.0-beta.40", "deb"),
+        ("0.1.0-beta.41", "default"), ("0.1.0-beta.41", "deb"),
+    }
+    assert report["deleted_files"] == 4 * 9
+    assert report["freed_bytes"] > 0
+    assert report["errors"] == []
+
+    with db.tx() as cur:
+        cur.execute(
+            "SELECT version, format FROM releases WHERE channel='beta'"
+            " ORDER BY version, format"
+        )
+        remaining = [(row["version"], row["format"]) for row in cur.fetchall()]
+    assert remaining == [
+        ("0.1.0-beta.42", "deb"), ("0.1.0-beta.42", "default"),
+        ("0.1.0-beta.43", "deb"), ("0.1.0-beta.43", "default"),
+        ("0.1.0-beta.44", "deb"), ("0.1.0-beta.44", "default"),
+    ]
+
+    # The bytes went with the rows, and the emptied version directories with
+    # them; nothing a surviving row points at was touched.
+    beta_files = _store_files("beta")
+    assert not any(path.startswith(("0.1.0-beta.40/", "0.1.0-beta.41/")) for path in beta_files)
+    assert not (releases._store_dir() / "beta" / "0.1.0-beta.40").exists()
+    for version in ("0.1.0-beta.42", "0.1.0-beta.43", "0.1.0-beta.44"):
+        assert any(path.startswith(version + "/") for path in beta_files)
+    assert _store_files("stable") == stable_before
+
+    # Idempotent: nothing is superseded any more.
+    again = releases.prune_release_store()
+    assert again["pruned"] == [] and again["deleted_files"] == 0
+
+
+def test_retention_dry_run_reports_without_deleting(pg, ci: TestClient, ci_key) -> None:
+    for run in (40, 41, 42, 43):
+        assert _publish(ci, ci_key, version=f"0.1.0-beta.{run}").status_code == 200
+    before_files = _store_files("beta")
+
+    report = releases.prune_release_store(dry_run=True)
+    assert report["dry_run"] is True
+    assert [entry["version"] for entry in report["pruned"]] == ["0.1.0-beta.40"]
+    assert report["deleted_files"] == 9
+    assert report["freed_bytes"] > 0
+    assert _store_files("beta") == before_files
+    with db.tx() as cur:
+        cur.execute("SELECT count(*) AS n FROM releases WHERE channel='beta'")
+        assert cur.fetchone()["n"] == 4
+
+    # And the numbers a dry run reported are the numbers a real run frees.
+    real = releases.prune_release_store()
+    assert real["deleted_files"] == report["deleted_files"]
+    assert real["freed_bytes"] == report["freed_bytes"]
+
+
+def test_retention_keeps_a_promoted_beta_downloadable_as_stable(
+    pg, ci: TestClient, admin: TestClient, ci_key
+) -> None:
+    """Promotion copies bytes rather than linking them, so pruning the beta it
+    came from must leave the stable artifact intact and downloadable."""
+    assert _publish(ci, ci_key, version="0.1.0-beta.40").status_code == 200
+    assert admin.post(
+        "/api/admin/releases/promote",
+        json={
+            "channel": "beta", "version": "0.1.0-beta.40", "platform": "linux",
+            "arch": "x86_64",
+        },
+    ).status_code == 200
+    for run in (41, 42, 43):
+        assert _publish(ci, ci_key, version=f"0.1.0-beta.{run}").status_code == 200
+
+    assert [e["version"] for e in releases.prune_release_store()["pruned"]] == [
+        "0.1.0-beta.40"
+    ]
+    stable_name = releases._canonical_artifact(STABLE, "linux", "x86_64")
+    assert (releases._store_dir() / "stable" / STABLE / stable_name).is_file()
+    downloaded = admin.get(f"/api/releases/artifact/stable/{STABLE}/{stable_name}")
+    assert downloaded.status_code == 200
+    assert downloaded.content
+
+
+def test_prune_route_is_admin_only(pg, ci: TestClient, admin: TestClient) -> None:
+    assert TestClient(app_mod.app).post("/api/admin/releases/prune").status_code in (
+        401, 403,
+    )
+    response = admin.post("/api/admin/releases/prune?dry_run=true")
+    assert response.status_code == 200, response.text
+    assert response.json() == {
+        "ok": True,
+        "dry_run": True,
+        "keep_beta_versions": 3,
+        "pruned": [],
+        "deleted_files": 0,
+        "freed_bytes": 0,
+        "incoming_orphans": [],
+        "incoming_freed_bytes": 0,
+        "errors": [],
+    }
+
+
+def test_retention_sweeps_stale_incoming_orphans_only(
+    pg, ci: TestClient, ci_key
+) -> None:
+    """A 422 or a cancelled run leaves bytes in incoming/ that nothing ever
+    comes back for. That was a second unbounded pile with nothing watching it."""
+    import os
+    import time as _time
+
+    incoming = releases._incoming_dir()
+    incoming.mkdir(parents=True, exist_ok=True)
+    stale = incoming / "Chudware-0.1.0-beta.9-linux-x86_64.AppImage"
+    stale.write_bytes(b"abandoned artifact" * 512)
+    part = incoming / "Chudware-Setup-0.1.0-beta.9-x86_64.exe.part"
+    part.write_bytes(b"truncated chunk upload" * 256)
+    old = _time.time() - releases.INCOMING_ORPHAN_AGE_SECONDS - 60
+    for path in (stale, part):
+        os.utime(path, (old, old))
+    # An upload in flight: same shape, minutes old rather than a day.
+    fresh = incoming / "Chudware-0.1.0-beta.10-linux-x86_64.AppImage"
+    fresh.write_bytes(b"upload in flight" * 64)
+
+    report = releases.prune_release_store(dry_run=True)
+    assert sorted(e["name"] for e in report["incoming_orphans"]) == sorted(
+        [stale.name, part.name]
+    )
+    assert report["incoming_freed_bytes"] == stale.stat().st_size + part.stat().st_size
+    assert stale.is_file() and part.is_file(), "a dry run must delete nothing"
+
+    real = releases.prune_release_store()
+    assert real["incoming_freed_bytes"] == report["incoming_freed_bytes"]
+    assert real["errors"] == []
+    assert not stale.exists() and not part.exists()
+    assert fresh.is_file(), "an upload in flight must survive"
+
+    # Idempotent.
+    assert releases.prune_release_store()["incoming_orphans"] == []
+
+
+def test_retention_keeps_a_stale_incoming_file_that_a_release_row_accounts_for(
+    pg, ci: TestClient, ci_key
+) -> None:
+    """A published artifact's name is not an orphan even when a copy lingers:
+    the sweep is for bytes NOTHING accounts for, and deleting a duplicate of a
+    live release on a name match is a rule with no upside and a real downside."""
+    assert _publish(ci, ci_key).status_code == 200
+    import os
+    import time as _time
+
+    name = releases._canonical_artifact(BETA, "linux", "x86_64")
+    incoming = releases._incoming_dir()
+    lingering = incoming / name
+    lingering.write_bytes(b"a copy of a published artifact")
+    sidecar = incoming / (name + ".payload-manifest.v1.json")
+    sidecar.write_bytes(b"a copy of a published sidecar")
+    old = _time.time() - releases.INCOMING_ORPHAN_AGE_SECONDS - 60
+    for path in (lingering, sidecar):
+        os.utime(path, (old, old))
+
+    report = releases.prune_release_store()
+    assert report["incoming_orphans"] == []
+    assert lingering.is_file() and sidecar.is_file()

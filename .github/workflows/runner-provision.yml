@@ -25,7 +25,7 @@ on:
   workflow_dispatch:
     inputs:
       runner_label:
-        description: runner label set to provision (cc-win-* or cc-mac-*)
+        description: runner label set to provision (cc-win-*, cc-mac-* or cc-linux-build)
         required: true
         type: choice
         options: [cc-win-package, cc-mac-intel, cc-mac-arm, cc-linux-build]
@@ -330,10 +330,71 @@ jobs:
     if: startsWith(inputs.runner_label, 'cc-linux-')
     runs-on: [self-hosted, Linux, X64, cloudcastle-ci, "${{ inputs.runner_label }}"]
     timeout-minutes: 60
+    env:
+      # nightly-release's linux-beta job packages the verified AppDir as a .deb and an
+      # .rpm (packaging/linux/build_linux_packages.sh). rpmbuild builds the .rpm; xz
+      # compresses the deb's data.tar.xz. The .deb needs no dpkg tooling at all — the ar
+      # archive and its control tarball are written directly — which is why this list is
+      # two entries and not a Debian toolchain.
+      #
+      # Package names differ by distribution: Fedora/RHEL call them rpm-build and xz,
+      # Debian/Ubuntu call them rpm and xz-utils. Both are listed and the step installs
+      # whichever set matches the package manager it finds.
+      LINUX_PACKAGES_DNF: rpm-build xz
+      LINUX_PACKAGES_APT: rpm xz-utils
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           persist-credentials: false
+
+      - name: Install the distro packages the release packaging needs
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Idempotent by construction: if both binaries already resolve, this step does
+          # nothing and never touches a working builder underneath a running release.
+          if command -v rpmbuild >/dev/null 2>&1 && command -v xz >/dev/null 2>&1; then
+            echo "rpmbuild: $(command -v rpmbuild) ($(rpmbuild --version))"
+            echo "xz:       $(command -v xz) ($(xz --version | head -n 1))"
+            exit 0
+          fi
+
+          manager=""
+          packages=""
+          if command -v dnf >/dev/null 2>&1; then
+            manager=dnf
+            packages="${LINUX_PACKAGES_DNF}"
+          elif command -v apt-get >/dev/null 2>&1; then
+            manager=apt-get
+            packages="${LINUX_PACKAGES_APT}"
+          else
+            echo "::error::${RUNNER_NAME:-unknown} has neither dnf nor apt-get, so CI cannot install rpmbuild and xz unattended. Install them by hand with this host's package manager and re-run this workflow."
+            exit 1
+          fi
+
+          # A system package install needs root. Passwordless sudo is the only
+          # unattended path, and this is the same call the job would make anyway, so ask
+          # before installing rather than half-way through: `sudo -n true` fails
+          # immediately when sudo would prompt.
+          if ! sudo -n true >/dev/null 2>&1; then
+            echo "::error::${RUNNER_NAME:-unknown} has no passwordless sudo, so CI cannot install ${packages} unattended. Run 'sudo ${manager} install -y ${packages}' on that host as the login user, then re-run this workflow. Without them nightly-release publishes the AppImage and SILENTLY publishes no .deb and no .rpm (its packaging step degrades to a warning on purpose, so the gap does not show up as a failed build)."
+            exit 1
+          fi
+
+          echo "installing with ${manager}: ${packages}"
+          if [ "${manager}" = dnf ]; then
+            sudo -n dnf install -y ${packages}
+          else
+            sudo -n apt-get update
+            sudo -n DEBIAN_FRONTEND=noninteractive apt-get install -y ${packages}
+          fi
+
+          for tool in rpmbuild xz; do
+            command -v "${tool}" >/dev/null 2>&1 || {
+              echo "::error::${manager} reported success but ${tool} is still not on PATH"; exit 1; }
+          done
+          echo "rpmbuild: $(rpmbuild --version)"
+          echo "xz:       $(xz --version | head -n 1)"
 
       - name: Provision the release Python (Nuitka, cryptography, pyyaml)
         shell: bash
@@ -362,7 +423,12 @@ jobs:
           set -uo pipefail
           venv="${HOME}/chudware-ci-tools/release-python/bin/python3"
           missing=0
-          for tool in cmake ninja ctest bun xvfb-run rsync strip; do
+          # rpmbuild and xz are asserted here, not merely installed above, because
+          # nightly-release's packaging step degrades to a ::warning:: when they are
+          # absent: without this line a runner that lost them would publish the AppImage
+          # and quietly stop publishing .deb and .rpm, and nothing would go red. Caught
+          # at provision time instead of at 3am in a release job.
+          for tool in cmake ninja ctest bun xvfb-run rsync strip rpmbuild xz; do
             if command -v "${tool}" >/dev/null 2>&1; then
               printf '%-22s %s\n' "${tool}" "$(command -v "${tool}")"
             else

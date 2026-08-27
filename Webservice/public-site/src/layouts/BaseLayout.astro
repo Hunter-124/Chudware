@@ -1,4 +1,5 @@
 ---
+import Icon from '../components/Icon.astro';
 import '../styles/global.css';
 
 interface Props {
@@ -14,6 +15,7 @@ const nav = [
   { href: '/docs/', label: 'Docs' },
   { href: '/pricing/', label: 'Pricing' },
   { href: '/changelog/', label: 'Changelog' },
+  { href: '/download/', label: 'Download' },
 ];
 const active = (href: string) => href === '/' ? path === '/' : path.startsWith(href);
 ---
@@ -45,7 +47,7 @@ const active = (href: string) => href === '/' ? path === '/' : path.startsWith(h
           <a class="button button-small" href="https://app.chudware.com/signup">Create an account</a>
         </div>
         <details class="mobile-nav">
-          <summary class="tap">Menu</summary>
+          <summary class="tap"><Icon name="menu" /><span>Menu</span></summary>
           <nav aria-label="Mobile primary">
             {nav.map((item) => <a class="tap" href={item.href} aria-current={active(item.href) ? 'page' : undefined}>{item.label}</a>)}
             <a class="tap" href="https://app.chudware.com/signin">Sign in</a>
@@ -67,7 +69,7 @@ const active = (href: string) => href === '/' ? path === '/' : path.startsWith(h
         </nav>
         <nav aria-label="Explore links">
           <strong>Explore</strong>
-          <a class="tap" href="/product/">Overview</a><a class="tap" href="/gallery/">Gallery</a><a class="tap" href="/pricing/">Pricing</a><a class="tap" href="/download/">Access</a><a class="tap" href="/docs/">Docs</a><a class="tap" href="/faq/">FAQ</a><a class="tap" href="/changelog/">Changelog</a>
+          <a class="tap" href="/product/">Overview</a><a class="tap" href="/gallery/">Gallery</a><a class="tap" href="/pricing/">Pricing</a><a class="tap" href="/download/">Download</a><a class="tap" href="/docs/">Docs</a><a class="tap" href="/faq/">FAQ</a><a class="tap" href="/changelog/">Changelog</a>
         </nav>
         <nav aria-label="Company and legal links">
           <strong>Company &amp; legal</strong>

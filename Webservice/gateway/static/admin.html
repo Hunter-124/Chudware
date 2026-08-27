@@ -8,10 +8,58 @@
 <link rel="stylesheet" href="/static/base.css">
 <link rel="stylesheet" href="/static/vendor/xterm.css">
 <link rel="stylesheet" href="/static/admin_wm.css?v=1">
-<link rel="stylesheet" href="/static/admin_ops.css?v=1">
+<link rel="stylesheet" href="/static/admin_ops.css?v=2">
 <link rel="stylesheet" href="/static/admin_billing.css?v=1">
 <link rel="stylesheet" href="/static/admin_marketplace.css?v=1">
 <style>
+  /* Brand typography — the same two self-hosted faces the portal and the
+     marketing site load. base.css declares them too, but the console keeps its
+     own copy so it stays correctly branded even if the shared sheet changes.
+     Browsers dedupe identical family+src declarations, so this costs nothing. */
+  @font-face {
+    font-family: "Chudware Sans";
+    src: url("/brand-assets/Rubik-VF.247dbaa0aa4a.woff2") format("woff2-variations");
+    font-style: normal;
+    font-weight: 300 900;
+    font-display: swap;
+  }
+  @font-face {
+    font-family: "Chudware Mono";
+    src: url("/brand-assets/JetBrainsMono-Regular.8f0f0cc0353e.woff2") format("woff2");
+    font-style: normal;
+    font-weight: 400;
+    font-display: swap;
+  }
+
+  /* Type + space scale from the shared brand contract (same names and values
+     as portal.css and the marketing site). Colour, radius and --mono tokens
+     come from base.css and are intentionally NOT redefined here — --radius
+     means something different there and base.css classes depend on it. */
+  :root {
+    --sans: "Chudware Sans", "Arial Narrow", sans-serif;
+    --step--2: .7rem;
+    --step--1: clamp(.78rem, .75rem + .1vw, .86rem);
+    --step-0: clamp(1rem, .96rem + .18vw, 1.1rem);
+    --step-1: clamp(1.2rem, 1.1rem + .45vw, 1.45rem);
+    --step-2: clamp(1.55rem, 1.35rem + .8vw, 2.1rem);
+    --step-3: clamp(2.1rem, 1.65rem + 1.8vw, 3.25rem);
+    --s1: .25rem;
+    --s2: .5rem;
+    --s3: .75rem;
+    --s4: 1rem;
+    --s5: 1.5rem;
+    --s6: 2rem;
+    --s7: 3rem;
+    --s8: 4rem;
+  }
+  body { font-family: var(--sans); }
+
+  /* icon sizing: mirrors portal.css .icon — keep in sync */
+  .icon { width: 1.15em; height: 1.15em; flex: none; }
+  /* Contract icon paths are copied verbatim; direction variants are CSS-only. */
+  .icon-flip { transform: scaleX(-1); }
+  .icon-up { transform: rotate(-90deg); }
+
   html, body {
     height: 100%;
     margin: 0;
@@ -62,7 +110,7 @@
   .admin-brand .brand-sub {
     color: var(--text-mute, #6d788c);
     font-weight: 400;
-    font-size: .82rem;
+    font-size: var(--step--1);
   }
   .admin-tabs {
     display: flex;
@@ -80,12 +128,13 @@
   .admin-tab {
     display: inline-flex;
     align-items: center;
+    gap: 7px;
     padding: 7px 13px;
     border-radius: 9px;
     border: 1px solid transparent;
     color: var(--text-dim, #9aa6b8);
     text-decoration: none;
-    font-size: .86rem;
+    font-size: var(--step--1);
     font-weight: 500;
     white-space: nowrap;
     min-height: 34px;
@@ -164,7 +213,7 @@
     border: 1px solid transparent;
     background: transparent;
     color: var(--muted, #8b93a3);
-    font-size: .82rem;
+    font-size: var(--step--1);
     cursor: pointer;
     white-space: nowrap;
     min-height: 32px;
@@ -186,13 +235,13 @@
     border: none;
     background: transparent;
     color: inherit;
-    font-size: .85rem;
+    font-size: var(--step--1);
     line-height: 1;
     cursor: pointer;
     padding: 0;
     opacity: .65;
   }
-  .term-tab .term-tab-x:hover { opacity: 1; background: rgba(255,107,122,.18); color: #ff6b7a; }
+  .term-tab .term-tab-x:hover { opacity: 1; background: var(--danger-bg, rgba(255,107,122,.18)); color: var(--danger, #ff6b7a); }
   .term-tab-new {
     display: inline-flex;
     align-items: center;
@@ -203,7 +252,7 @@
     border: 1px dashed var(--border, #2a2e36);
     background: transparent;
     color: var(--muted, #8b93a3);
-    font-size: 1.1rem;
+    font-size: var(--step-0);
     line-height: 1;
     cursor: pointer;
     flex-shrink: 0;
@@ -253,9 +302,9 @@
     flex-shrink: 0;
   }
   .term-picker-label {
-    font-size: .72rem;
+    font-size: var(--step--2);
     text-transform: uppercase;
-    letter-spacing: .05em;
+    letter-spacing: .16em;
     color: var(--muted, #8b93a3);
     margin-right: 4px;
   }
@@ -268,7 +317,7 @@
     border: 1px solid var(--border, #2a2e36);
     background: #151922;
     color: var(--fg, #e8eaf0);
-    font-size: .78rem;
+    font-size: var(--step--1);
     cursor: pointer;
     white-space: nowrap;
     touch-action: manipulation;
@@ -276,10 +325,21 @@
   .term-pill:hover { border-color: var(--teal-hi, #42ecce); }
   .term-pill.open { border-color: var(--teal-hi, #42ecce); background: #17202a; }
   .term-pill .term-pill-clients {
-    font-size: .68rem;
+    font-size: var(--step--2);
     color: var(--muted, #8b93a3);
   }
   .term-pill .term-pill-clients.live { color: var(--teal-hi, #42ecce); }
+  /* Live-viewer dot is drawn, not typed — no "●" glyphs in markup. */
+  .term-pill .term-pill-clients.live::before {
+    content: "";
+    display: inline-block;
+    width: .45em;
+    height: .45em;
+    margin-right: .35em;
+    border-radius: 999px;
+    background: currentColor;
+    vertical-align: 8%;
+  }
   .term-pill .term-pill-kill {
     display: inline-flex;
     align-items: center;
@@ -288,16 +348,16 @@
     height: 16px;
     border-radius: 999px;
     opacity: .6;
-    font-size: .8rem;
+    font-size: var(--step--1);
     line-height: 1;
   }
-  .term-pill .term-pill-kill:hover { opacity: 1; background: rgba(255,107,122,.2); color: #ff6b7a; }
+  .term-pill .term-pill-kill:hover { opacity: 1; background: var(--danger-bg, rgba(255,107,122,.2)); color: var(--danger, #ff6b7a); }
   .term-pill-new {
     border-style: dashed;
     color: var(--muted, #8b93a3);
   }
   .term-pill-new:hover { color: var(--fg, #e8eaf0); }
-  .term-picker-empty { font-size: .76rem; color: var(--muted, #8b93a3); }
+  .term-picker-empty { font-size: var(--step--2); color: var(--muted, #8b93a3); }
 
   /* ---- cards ---- */
   .admin-card {
@@ -308,16 +368,16 @@
     margin-bottom: 12px;
   }
   .card-grid > .admin-card { margin-bottom: 0; }
-  .admin-card h2 { margin: 0 0 12px; font-size: 1rem; }
-  .card-note { font-size: .85rem; color: var(--muted, #8b93a3); margin: 0 0 10px; }
+  .admin-card h2 { margin: 0 0 12px; font-size: var(--step-0); font-weight: 620; }
+  .card-note { font-size: var(--step--1); color: var(--muted, #8b93a3); margin: 0 0 10px; }
   .accounts-scroll { overflow-x: auto; }
-  table.accounts { width: 100%; border-collapse: collapse; font-size: .82rem; }
+  table.accounts { width: 100%; border-collapse: collapse; font-size: var(--step--1); }
   table.accounts th, table.accounts td { text-align: left; padding: 6px 6px;
                 border-bottom: 1px solid var(--border, #2a2e36); vertical-align: top; }
   table.accounts th { color: var(--muted, #8b93a3); font-weight: 500; white-space: nowrap; }
   table.accounts .ac-email { word-break: break-all; min-width: 92px; }
-  table.accounts .ac-role, table.accounts .ac-when { white-space: nowrap; }
-  /* On narrow viewports seven columns do not fit, so the row's identity and its
+  table.accounts .ac-when { white-space: nowrap; }
+  /* On narrow viewports six columns do not fit, so the row's identity and its
      actions stay pinned while the middle scrolls under them. */
   table.accounts .ac-email, table.accounts .ac-act {
           position: sticky; z-index: 1; background: var(--panel, #16181d); }
@@ -326,8 +386,8 @@
           box-shadow: inset 1px -1px 0 var(--border, #2a2e36); }
   table.accounts .ac-act .ac-actions { justify-content: flex-end; }
   table.accounts .ac-actions .btn, table.accounts .ac-actions .rm-btn {
-          padding: 5px 10px; min-height: 30px; border-radius: 8px; font-size: .78rem; }
-  .pill { display: inline-block; padding: 4px 10px; border-radius: 999px; font-size: .78rem;
+          padding: 5px 10px; min-height: 30px; border-radius: 8px; font-size: var(--step--1); }
+  .pill { display: inline-block; padding: 4px 10px; border-radius: 999px; font-size: var(--step--1);
           min-height: 28px; line-height: 1.4; }
   .pill[hidden] { display: none; }
   .pill.admin { background: #3d2f10; color: #eeba4a; }
@@ -338,20 +398,23 @@
   .pill.st-suspended { background: #3d2f10; color: #eeba4a; }
   .pill.st-unknown { background: #232833; color: #8b93a3; }
   .pill.st-running { background: #1d2b3a; color: #6aa8ff; }
-  .rm-btn { background: none; border: 1px solid #55303a; color: #e07a8a;
+  /* Destructive actions share base.css's .btn.danger palette so "this removes
+     something" reads the same on every admin surface. */
+  .rm-btn { background: var(--danger-bg, rgba(255,107,122,.12));
+            border: 1px solid rgba(255,107,122,.35); color: var(--danger, #ff6b7a);
             border-radius: 8px; padding: 8px 14px; min-height: 40px; cursor: pointer;
             touch-action: manipulation; }
-  .rm-btn:hover, .rm-btn:focus-visible { background: #2a1a20; }
+  .rm-btn:hover, .rm-btn:focus-visible { background: rgba(255,107,122,.2); }
   .admin-shell select {
       background: var(--bg, #0e1013); color: var(--fg, #e8eaf0);
       border: 1px solid var(--border, #2a2e36);
       border-radius: 8px; padding: 6px 8px; min-height: 32px;
-      font-size: .82rem; box-sizing: border-box; }
+      font-size: var(--step--1); box-sizing: border-box; }
   .credit-controls { display: flex; flex-wrap: wrap; gap: 6px; align-items: center;
                      min-width: 190px; }
   .credit-balance { color: var(--teal-hi, #42ecce); font-weight: 600; white-space: nowrap; }
   .credit-controls label { display: inline-flex; align-items: center; gap: 4px;
-                           color: var(--muted, #8b93a3); font-size: .76rem; }
+                           color: var(--muted, #8b93a3); font-size: var(--step--2); }
   .credit-controls input[type="number"] { width: 88px; }
   .admin-shell input[type="number"], .admin-shell textarea {
       background: var(--bg, #0e1013); color: var(--fg, #e8eaf0);
@@ -361,7 +424,7 @@
   .manifest-form { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr));
                    gap: 8px; margin-bottom: 12px; }
   .manifest-form label { display: grid; gap: 4px; color: var(--muted, #8b93a3);
-                         font-size: .72rem; }
+                         font-size: var(--step--2); }
   .manifest-form .wide { grid-column: 1 / -1; }
   .manifest-form input, .manifest-form textarea {
       width: 100%; background: var(--bg, #0e1013); color: var(--fg, #e8eaf0);
@@ -371,21 +434,21 @@
   .manifest-row { border-top: 1px solid var(--border, #2a2e36); padding: 9px 0;
                   display: flex; justify-content: space-between; gap: 8px; align-items: flex-start; }
   .manifest-row strong, .manifest-row span { display: block; word-break: break-word; }
-  .manifest-row span { color: var(--muted, #8b93a3); font-size: .72rem; margin-top: 3px; }
-  details.admin-card > summary { cursor: pointer; font-size: .92rem; font-weight: 600;
+  .manifest-row span { color: var(--muted, #8b93a3); font-size: var(--step--2); margin-top: 3px; }
+  details.admin-card > summary { cursor: pointer; font-size: var(--step--1); font-weight: 600;
                                  color: var(--text-dim, #9aa6b8); }
   details.admin-card[open] > summary { margin-bottom: 12px; color: var(--text, #e8eef5); }
   .ac-toolbar { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; margin: 0 0 10px; }
-  .ac-toolbar label { font-size: .82rem; color: var(--muted, #8b93a3); }
-  .ac-count { font-size: .8rem; font-weight: 400; color: var(--muted, #8b93a3); margin-left: 6px; }
+  .ac-toolbar label { font-size: var(--step--1); color: var(--muted, #8b93a3); }
+  .ac-count { font-size: var(--step--1); font-weight: 400; color: var(--muted, #8b93a3); margin-left: 6px; }
   .ac-dim { color: var(--muted, #8b93a3); }
   .ac-admin { color: #eeba4a; font-weight: 600; }
   .ac-actions { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
   .ac-pager { display: flex; align-items: center; justify-content: space-between;
               gap: 8px; margin-top: 10px; }
-  .ac-pager .btn { padding: 6px 12px; min-height: 34px; font-size: .8rem; }
-  .ac-range { font-size: .8rem; color: var(--muted, #8b93a3); }
-  .err { color: #e07a8a; }
+  .ac-pager .btn { padding: 6px 12px; min-height: 34px; font-size: var(--step--1); }
+  .ac-range { font-size: var(--step--1); color: var(--muted, #8b93a3); }
+  .err { color: var(--danger, #ff6b7a); }
 
   /* Global status line — every setStatus() call stays visible on any tab. */
   #admin-status {
@@ -398,14 +461,15 @@
     border: 1px solid var(--border, #2a2e36);
     border-radius: 10px;
     padding: 8px 12px;
-    font-size: .82rem;
+    font-size: var(--step--1);
     color: var(--muted, #8b93a3);
     white-space: pre-wrap;
     box-shadow: var(--shadow, 0 18px 48px rgba(0,0,0,.45));
   }
   #admin-status:empty { display: none; }
-  #admin-status.err { color: #e07a8a; border-color: rgba(255,107,122,.4); }
-  .back { color: var(--muted, #8b93a3); text-decoration: none; font-size: .88rem;
+  #admin-status.err { color: var(--danger, #ff6b7a); border-color: rgba(255,107,122,.4); }
+  .back { color: var(--muted, #8b93a3); text-decoration: none; font-size: var(--step--1);
+          gap: 6px;
           display: inline-flex; align-items: center; min-height: 36px; white-space: nowrap; }
   #account-cards { display: none; flex-direction: column; gap: 10px; }
   .account-card {
@@ -418,19 +482,19 @@
     gap: 8px;
   }
   .account-card .ac-email { font-weight: 600; word-break: break-all; }
-  .account-card .ac-meta { color: var(--muted, #8b93a3); font-size: .85rem; }
+  .account-card .ac-meta { color: var(--muted, #8b93a3); font-size: var(--step--1); }
   .account-card .ac-row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
   .account-card .ac-plan { display: flex; align-items: center; gap: 8px;
-                           color: var(--muted, #8b93a3); font-size: .85rem; }
+                           color: var(--muted, #8b93a3); font-size: var(--step--1); }
   .account-card .ac-actions { gap: 8px; }
   .account-card .ac-actions .btn, .account-card .ac-actions .rm-btn { flex: 1 1 auto; min-height: 40px; }
   .appeal-admin-list { display: grid; gap: 10px; }
   .appeal-admin-item { border: 1px solid var(--border, #2a2e36); border-radius: 10px; padding: 12px; background: var(--bg, #0e1013); }
   .appeal-admin-head { display: flex; justify-content: space-between; gap: 8px; align-items: flex-start; }
   .appeal-admin-head strong { word-break: break-all; }
-  .appeal-admin-meta, .appeal-admin-reason { color: var(--muted, #8b93a3); font-size: .78rem; line-height: 1.5; margin: 6px 0 0; }
+  .appeal-admin-meta, .appeal-admin-reason { color: var(--muted, #8b93a3); font-size: var(--step--1); line-height: 1.5; margin: 6px 0 0; }
   .appeal-resolve { display: grid; gap: 8px; margin-top: 10px; }
-  .appeal-resolve label { display: grid; gap: 4px; color: var(--muted, #8b93a3); font-size: .76rem; }
+  .appeal-resolve label { display: grid; gap: 4px; color: var(--muted, #8b93a3); font-size: var(--step--2); }
   .appeal-resolve textarea { width: 100%; min-height: 64px; resize: vertical; }
   .appeal-actions { display: flex; flex-wrap: wrap; gap: 8px; }
   .sub-actions { margin: 0 0 10px; }
@@ -440,64 +504,81 @@
              justify-content: space-between; align-items: flex-start; }
   .sub-row .sub-who { display: flex; flex-wrap: wrap; gap: 6px; align-items: center;
                       font-weight: 600; word-break: break-all; }
-  .sub-row .sub-meta { color: var(--muted, #8b93a3); font-size: .74rem; margin: 4px 0 0;
+  .sub-row .sub-meta { color: var(--muted, #8b93a3); font-size: var(--step--2); margin: 4px 0 0;
                        word-break: break-word; }
   .sub-flow { border: 1px solid var(--border, #2a2e36); border-radius: 10px; padding: 12px;
               background: var(--bg, #0e1013); margin: 0 0 10px; }
   .sub-flow[hidden] { display: none; }
-  .sub-step { font-size: .82rem; line-height: 1.5; margin: 0 0 8px; }
-  .sub-code { display: block; font-family: monospace; font-size: 1.3rem; letter-spacing: .12em;
+  .sub-step { font-size: var(--step--1); line-height: 1.5; margin: 0 0 8px; }
+  .sub-code { display: block; font-family: var(--mono, monospace); font-size: var(--step-1); letter-spacing: .12em;
               color: var(--teal-hi, #42ecce); user-select: all; word-break: break-all;
               margin: 0 0 10px; }
   .sub-paste { width: 100%; background: var(--bg, #0e1013); color: var(--fg, #e8eaf0);
                border: 1px solid var(--border, #2a2e36); border-radius: 8px; padding: 7px 8px;
                font: inherit; box-sizing: border-box; margin: 0 0 10px; }
-  #sub-status { margin-top: 10px; font-size: .82rem; white-space: pre-wrap; }
-  #sub-status.err { color: #e07a8a; }
+  #sub-status { margin-top: 10px; font-size: var(--step--1); white-space: pre-wrap; }
+  #sub-status.err { color: var(--danger, #ff6b7a); }
 
   /* ---- dashboard ---- */
-  .dash-hostbar { font-size: .85rem; color: var(--muted, #8b93a3); margin: 0; }
+  .dash-hostbar { font-size: var(--step--1); color: var(--muted, #8b93a3); margin: 0; }
   .dash-stats { display: flex; flex-wrap: wrap; gap: 16px; margin: 0 0 12px; }
   .dash-stat { display: flex; flex-direction: column; gap: 2px; min-width: 88px; }
-  .dash-num { font-size: 1.45rem; font-weight: 600; color: var(--teal-hi, #42ecce);
+  .dash-num { font-size: var(--step-1); font-weight: 600; color: var(--teal-hi, #42ecce);
               line-height: 1.1; }
-  .dash-lbl { font-size: .74rem; text-transform: uppercase; letter-spacing: .05em;
+  .dash-lbl { font-size: var(--step--2); text-transform: uppercase; letter-spacing: .16em;
               color: var(--muted, #8b93a3); }
   .dash-actions { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-top: 10px; }
-  .dash-actions .btn { min-height: 34px; padding: 6px 12px; font-size: .82rem; }
-  .dash-list { display: grid; gap: 6px; font-size: .84rem; }
+  .dash-actions .btn { min-height: 34px; padding: 6px 12px; font-size: var(--step--1); }
+  .dash-list { display: grid; gap: 6px; font-size: var(--step--1); }
   .dash-item { display: flex; flex-wrap: wrap; gap: 6px; align-items: baseline;
                justify-content: space-between; padding: 6px 0;
                border-bottom: 1px solid var(--border, #2a2e36); }
   .dash-item:last-child { border-bottom: none; }
   .dash-item .dash-who { color: var(--text, #e8eef5); font-weight: 500; }
-  .dash-item .dash-what { color: var(--muted, #8b93a3); font-size: .78rem;
+  .dash-item .dash-what { color: var(--muted, #8b93a3); font-size: var(--step--1);
                           overflow-wrap: anywhere; }
 
   /* ---- release + CI tables ---- */
   .table-scroll { overflow-x: auto; }
-  table.data-table { width: 100%; border-collapse: collapse; font-size: .82rem; }
+  table.data-table { width: 100%; border-collapse: collapse; font-size: var(--step--1); }
   table.data-table th, table.data-table td {
       text-align: left; padding: 7px 8px; vertical-align: top;
       border-bottom: 1px solid var(--border, #2a2e36); }
   table.data-table th { color: var(--muted, #8b93a3); font-weight: 500; white-space: nowrap; }
   table.data-table td.col-num { text-align: right; white-space: nowrap; }
   table.data-table td.col-mono, table.data-table td.col-when {
-      font-family: var(--mono, monospace); font-size: .76rem; white-space: nowrap; }
-  table.data-table td.col-detail { color: var(--muted, #8b93a3); font-size: .76rem;
+      font-family: var(--mono, monospace); font-size: var(--step--2); white-space: nowrap; }
+  table.data-table td.col-detail { color: var(--muted, #8b93a3); font-size: var(--step--2);
       max-width: 320px; overflow-wrap: anywhere; }
   table.data-table td.col-act { text-align: right; white-space: nowrap; }
   table.data-table td.col-act .ac-actions { justify-content: flex-end; }
   table.data-table td.col-act .btn, table.data-table td.col-act .rm-btn {
-      padding: 4px 10px; min-height: 30px; border-radius: 8px; font-size: .78rem; }
-  table.data-table tr.row-err td { color: #e07a8a; font-size: .78rem; }
+      padding: 4px 10px; min-height: 30px; border-radius: 8px; font-size: var(--step--1); }
+  table.data-table tr.row-err td { color: var(--danger, #ff6b7a); font-size: var(--step--1); }
+  /* A table with nothing in it says so in words, never a bare dash. */
+  td.table-empty { color: var(--muted, #8b93a3); padding: var(--s4) 8px; }
   .evi-badge { display: inline-block; padding: 3px 9px; border-radius: 999px;
-               font-size: .72rem; white-space: nowrap; }
+               font-size: var(--step--2); white-space: nowrap; }
   .evi-badge.ok { background: rgba(66,236,206,.14); color: #42ecce; }
   .evi-badge.missing { background: rgba(240,180,41,.14); color: #f0b429; }
-  .pair-badge { display: inline-block; margin-left: 6px; padding: 2px 7px;
-                border-radius: 999px; font-size: .68rem;
+  /* Artifact format chip: deb / rpm / tar.zst / the platform's default build. */
+  .fmt-badge { display: inline-block; padding: 3px 9px; border-radius: 999px;
+               font-size: var(--step--2); white-space: nowrap;
+               font-family: var(--mono, monospace);
+               background: var(--bg-soft, #1c2130); color: var(--text-dim, #9aa6b8);
+               border: 1px solid var(--border, #2a2e36); }
+  .pair-badge { display: inline-flex; align-items: center; gap: .3em;
+                margin-left: 6px; padding: 2px 7px;
+                border-radius: 999px; font-size: var(--step--2);
                 background: rgba(107,168,255,.14); color: #6aa8ff; white-space: nowrap; }
+  /* Host-file browser rows (built by admin.js). */
+  .browse-row { display: flex; align-items: center; gap: var(--s2);
+                padding: 5px 14px; font-size: var(--step--1); }
+  .browse-row .icon { color: var(--text-mute, #6d788c); flex: none; }
+  .browse-row.dir { cursor: pointer; }
+  .browse-row.dir:hover { background: rgba(255,255,255,.06); }
+  .browse-row.part { color: var(--ok, #3dd68c); }
+  .browse-row.part .icon { color: inherit; }
 
   #browse-modal > div {
     max-width: 640px;
@@ -513,7 +594,7 @@
   #log-pre {
     max-height: 260px;
     overflow: auto;
-    font-size: .72rem;
+    font-size: var(--step--2);
     background: var(--bg, #0e1013);
     border: 1px solid var(--border, #2a2e36);
     border-radius: 8px;
@@ -525,7 +606,8 @@
   @media (max-width: 720px) {
     .admin-top { gap: 8px; }
     .admin-brand .brand-sub { display: none; }
-    .admin-tab { padding: 7px 10px; font-size: .82rem; }
+    .admin-tab { padding: 7px 10px; font-size: var(--step--1); }
+    /* 16px is deliberate: below that iOS Safari zooms the page on focus. */
     .admin-shell select { font-size: 16px; min-height: 40px; }
     .accounts-scroll { display: none; }
     #account-cards { display: flex; }
@@ -546,15 +628,15 @@
       Chudware <span class="brand-sub">admin</span>
     </span>
     <nav class="admin-tabs" id="admin-tabs" role="tablist" aria-label="Admin sections">
-      <a class="admin-tab" id="tab-dashboard" role="tab" data-tab="dashboard" href="#dashboard" aria-controls="panel-dashboard">Dashboard</a>
-      <a class="admin-tab" id="tab-releases" role="tab" data-tab="releases" href="#releases" aria-controls="panel-releases">Releases</a>
-      <a class="admin-tab" id="tab-accounts" role="tab" data-tab="accounts" href="#accounts" aria-controls="panel-accounts">Accounts</a>
-      <a class="admin-tab" id="tab-billing" role="tab" data-tab="billing" href="#billing" aria-controls="panel-billing">Billing</a>
-      <a class="admin-tab" id="tab-marketplace" role="tab" data-tab="marketplace" href="#marketplace" aria-controls="panel-marketplace">Marketplace</a>
-      <a class="admin-tab" id="tab-terminal" role="tab" data-tab="terminal" href="#terminal" aria-controls="panel-terminal">Terminal</a>
-      <a class="admin-tab" id="tab-system" role="tab" data-tab="system" href="#system" aria-controls="panel-system">System</a>
+      <a class="admin-tab" id="tab-dashboard" role="tab" data-tab="dashboard" href="#dashboard" aria-controls="panel-dashboard"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M4 4.8h6.4v5.6H4zM13.6 4.8H20v3.2h-6.4zM13.6 11.2H20V19.2h-6.4zM4 13.6h6.4v5.6H4z"/></svg>Dashboard</a>
+      <a class="admin-tab" id="tab-releases" role="tab" data-tab="releases" href="#releases" aria-controls="panel-releases"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M3.6 7.9 12 3.6l8.4 4.3v8.2L12 20.4 3.6 16.1z"/><path d="M3.6 7.9 12 12.2l8.4-4.3M12 12.2v8.2"/></svg>Releases</a>
+      <a class="admin-tab" id="tab-accounts" role="tab" data-tab="accounts" href="#accounts" aria-controls="panel-accounts"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><circle cx="9" cy="8.2" r="3.3"/><path d="M3.2 20c.5-3.8 2.7-5.9 5.8-5.9s5.3 2.1 5.8 5.9"/><path d="M16.3 11.4a2.7 2.7 0 1 0 0-5.4"/><path d="M17.1 14.3c2.2.3 3.5 2.1 3.9 5.7"/></svg>Accounts</a>
+      <a class="admin-tab" id="tab-billing" role="tab" data-tab="billing" href="#billing" aria-controls="panel-billing"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="5.6" width="18" height="12.8" rx="2.2"/><path d="M3 10.2h18M6.6 14.6h4.2"/></svg>Billing</a>
+      <a class="admin-tab" id="tab-marketplace" role="tab" data-tab="marketplace" href="#marketplace" aria-controls="panel-marketplace"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M4.6 4.6h14.8v3.6H4.6zM6 8.2v11.2h12V8.2"/><path d="M10.4 11.8h3.2"/></svg>Marketplace</a>
+      <a class="admin-tab" id="tab-terminal" role="tab" data-tab="terminal" href="#terminal" aria-controls="panel-terminal"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4.6" width="18" height="14.8" rx="2.2"/><path d="M7.4 10l2.6 2.4-2.6 2.4M12.8 15h4"/></svg>Terminal</a>
+      <a class="admin-tab" id="tab-system" role="tab" data-tab="system" href="#system" aria-controls="panel-system"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><rect x="4.2" y="4.8" width="15.6" height="10.4" rx="1.8"/><path d="M2.4 18.8h19.2"/></svg>System</a>
     </nav>
-    <a class="back" href="/">&larr; back to portal</a>
+    <a class="back" href="/"><svg class="icon icon-flip" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M4 12h14.6M13 6.4 18.6 12 13 17.6"/></svg>Back to portal</a>
   </header>
 
   <main class="tab-stack">
@@ -564,7 +646,7 @@
         <div class="card-grid">
           <div class="admin-card">
             <h2>Host health</h2>
-            <div id="host-bar" class="dash-hostbar">loading&hellip;</div>
+            <div id="host-bar" class="dash-hostbar">Loading&hellip;</div>
             <div class="dash-actions">
               <button type="button" class="btn ghost" data-goto="system">Deploy &amp; logs</button>
               <button type="button" class="btn ghost" data-goto="terminal">Open terminal</button>
@@ -605,20 +687,21 @@
         <div class="admin-card">
           <h2>Published releases</h2>
           <p class="card-note">
-            Signed, customer-facing manifests. A beta row that carries a stable signature pair
-            and a complete evidence bundle can be promoted to the stable channel in one click.
+            Signed release manifests, exactly what customers are offered. A beta row with a
+            stable signature pair and complete evidence can be promoted to stable in one click.
           </p>
           <div class="table-scroll">
             <table class="data-table" id="rel-table">
               <thead><tr>
-                <th>Channel</th><th>Version</th><th>Platform</th><th>Size</th>
+                <th>Channel</th><th>Version</th><th>Platform</th><th>Format</th><th>Size</th>
                 <th>SHA-256</th><th>Evidence</th><th>Published</th><th>Actions</th>
               </tr></thead>
-              <tbody id="rel-rows"><tr><td colspan="8" class="ac-dim">Loading&hellip;</td></tr></tbody>
+              <tbody id="rel-rows"><tr><td colspan="9" class="table-empty">Loading&hellip;</td></tr></tbody>
             </table>
           </div>
           <div class="dash-actions">
-            <button type="button" class="btn ghost" id="rel-refresh">Refresh</button>
+            <button type="button" class="btn ghost" id="rel-refresh"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M20.4 12a8.4 8.4 0 1 1-2.7-6.2"/><path d="M20.6 4.4v4.4h-4.4"/></svg>Refresh</button>
+            <button type="button" class="btn danger" id="rel-prune"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M4.4 7.2h15.2M9.6 7.2V5a1 1 0 0 1 1-1h2.8a1 1 0 0 1 1 1v2.2"/><path d="M6.6 7.2l.9 12a1.8 1.8 0 0 0 1.8 1.7h5.4a1.8 1.8 0 0 0 1.8-1.7l.9-12"/></svg>Prune old betas&hellip;</button>
             <span id="rel-status" class="ac-dim" role="status" aria-live="polite"></span>
           </div>
         </div>
@@ -635,11 +718,11 @@
                 <th>Run</th><th>Platform</th><th>Version</th><th>Status</th>
                 <th>Commit</th><th>Updated</th><th>Detail</th>
               </tr></thead>
-              <tbody id="ci-rows"><tr><td colspan="7" class="ac-dim">Loading&hellip;</td></tr></tbody>
+              <tbody id="ci-rows"><tr><td colspan="7" class="table-empty">Loading&hellip;</td></tr></tbody>
             </table>
           </div>
           <div class="dash-actions">
-            <button type="button" class="btn ghost" id="ci-refresh">Refresh</button>
+            <button type="button" class="btn ghost" id="ci-refresh"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M20.4 12a8.4 8.4 0 1 1-2.7-6.2"/><path d="M20.6 4.4v4.4h-4.4"/></svg>Refresh</button>
             <span id="ci-status" class="ac-dim" role="status" aria-live="polite"></span>
           </div>
         </div>
@@ -658,6 +741,7 @@
             <label>Version<input id="manifest-version" required placeholder="1.2.0"></label>
             <label>Platform<select id="manifest-platform"><option value="windows">Windows</option><option value="macos">macOS</option><option value="linux">Linux</option></select></label>
             <label>Architecture<select id="manifest-arch"><option value="x86_64">x86_64</option><option value="arm64">arm64</option></select></label>
+            <label>Format<select id="manifest-format"><option value="default">Default (AppImage / exe / zip)</option><option value="deb">deb</option><option value="rpm">rpm</option><option value="tar">tar.zst</option></select></label>
             <label>Minimum supported<input id="manifest-min" required placeholder="1.0.0"></label>
             <label>Size in bytes<input id="manifest-size" type="number" min="1" required></label>
             <label class="wide">SHA-256<input id="manifest-sha" required pattern="[0-9a-f]{64}"></label>
@@ -694,7 +778,7 @@
           </div>
           <div class="accounts-scroll">
             <table class="accounts">
-              <thead><tr><th class="ac-email">Email</th><th>Name</th><th>Status</th><th>Plan</th><th>Credits</th><th>Role</th><th>Created</th><th class="ac-act">Actions</th></tr></thead>
+              <thead><tr><th class="ac-email">Email</th><th>Status</th><th>Plan</th><th>Credits</th><th>Created</th><th class="ac-act">Actions</th></tr></thead>
               <tbody id="account-rows"></tbody>
             </table>
           </div>
@@ -740,10 +824,10 @@
     <section class="tab-panel term-panel" id="panel-terminal" data-tab="terminal" role="tabpanel" aria-labelledby="tab-terminal">
       <div class="term-picker" id="term-picker" aria-label="Shared sessions">
         <span class="term-picker-label">Shared sessions</span>
-        <span class="term-picker-empty" id="term-picker-empty">loading&hellip;</span>
+        <span class="term-picker-empty" id="term-picker-empty">Loading&hellip;</span>
       </div>
       <div class="term-tabs" id="term-tabs" role="tablist" aria-label="Open terminals">
-        <button type="button" class="term-tab-new" id="term-new" title="New shared session (Ctrl+Alt+T)" aria-label="New shared session">+</button>
+        <button type="button" class="term-tab-new" id="term-new" title="New shared session (Ctrl+Alt+T)" aria-label="New shared session"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5v14M5 12h14"/></svg></button>
       </div>
       <div id="term-host"></div>
       <div id="wm-root"></div>
@@ -765,9 +849,9 @@
         <div class="admin-card">
           <h2>Gateway log</h2>
           <div style="display:flex;gap:10px;margin:0 0 10px">
-            <button type="button" id="log-refresh" class="btn ghost">Refresh</button>
-            <label style="font-size:.85rem;color:var(--muted,#8b93a3);align-self:center">
-              <input type="checkbox" id="log-follow"> follow</label>
+            <button type="button" id="log-refresh" class="btn ghost"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M20.4 12a8.4 8.4 0 1 1-2.7-6.2"/><path d="M20.6 4.4v4.4h-4.4"/></svg>Refresh</button>
+            <label style="font-size:var(--step--1);color:var(--muted,#8b93a3);align-self:center">
+              <input type="checkbox" id="log-follow"> Follow</label>
           </div>
           <pre id="log-pre">(press Refresh)</pre>
         </div>
@@ -799,23 +883,24 @@
 </div>
 <div id="browse-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:50">
   <div>
-    <h2 style="margin:0 0 6px;font-size:1rem">Host files</h2>
-    <div style="font-size:.82rem;color:var(--muted,#8b93a3);margin-bottom:10px">
+    <h2 style="margin:0 0 6px;font-size:var(--step-0)">Host files</h2>
+    <div style="font-size:var(--step--1);color:var(--muted,#8b93a3);margin-bottom:10px">
       Read-only. Click a folder to open it; part files are listed in green.
     </div>
-    <div id="browse-path" style="font-family:monospace;font-size:.82rem;margin-bottom:8px;word-break:break-all"></div>
+    <div id="browse-path" style="font-family:var(--mono,monospace);font-size:var(--step--1);margin-bottom:8px;word-break:break-all"></div>
     <div id="browse-list" style="flex:1;overflow-y:auto;border:1px solid var(--border,#2a2e36);border-radius:8px;padding:6px 0;min-height:200px"></div>
     <div style="display:flex;gap:10px;justify-content:flex-end;margin-top:12px;flex-wrap:wrap">
       <button type="button" id="browse-close" class="btn ghost">Close</button>
     </div>
   </div>
 </div>
-<!-- admin.js goes to v=13: the TABS array gained "billing" and "marketplace",
-     and a browser holding v=12 would render both nav links as dead ends. This
+<!-- admin.js goes to v=14: the release tables gained a format column, the
+     accounts table dropped two columns, and the host browser rows changed
+     shape — a browser holding v=13 would render against the old markup. This
      query-string bump is the only cache-busting these unhashed admin assets
      have; see the note in this file's header about the three separate
      mechanisms in play across the app. -->
-<script src="/static/admin.js?v=13"></script>
+<script src="/static/admin.js?v=14"></script>
 <!-- Loaded AFTER admin.js because each guards on a mount id that lives in the
      markup above, not on anything admin.js creates; the ordering is for
      determinism when reading the file, not a dependency. Both files are served
@@ -826,6 +911,6 @@
 <script src="/static/vendor/xterm.js"></script>
 <script src="/static/vendor/xterm-addon-fit.js"></script>
 <script src="/static/vendor/winbox/winbox.bundle.min.js"></script>
-<script src="/static/admin_terminal.js?v=4"></script>
+<script src="/static/admin_terminal.js?v=5"></script>
 </body>
 </html>

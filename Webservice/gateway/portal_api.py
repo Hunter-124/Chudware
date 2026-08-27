@@ -13,7 +13,7 @@ from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
 
 try:
-    from . import accounts, authn, billing, credits, entitlement
+    from . import accounts, authn, billing, credits, entitlement, releases
     from .auth import get_current_user
     from .limits import api_writes
     from .plans import limits_for
@@ -23,6 +23,7 @@ except ImportError:  # uvicorn app:app from package dir
     import billing  # type: ignore
     import credits  # type: ignore
     import entitlement  # type: ignore
+    import releases  # type: ignore
     from auth import get_current_user  # type: ignore
     from limits import api_writes  # type: ignore
     from plans import limits_for  # type: ignore
@@ -125,6 +126,39 @@ async def portal_revoke_device(subject: str, request: Request) -> dict[str, bool
     if not entitlement.revoke_device(user.email, subject):
         raise HTTPException(404, "device not found")
     return {"ok": True}
+
+
+@router.post("/download-token")
+async def portal_download_token(request: Request) -> dict[str, Any]:
+    """A short-lived credential the Linux install script can present.
+
+    ``curl … | sh`` has no browser session and no desktop entitlement, so
+    without this the one-line install could only be offered to anonymous
+    downloaders — which would mean either an open artifact route or an install
+    command that does not work. The token is stateless, HMAC-signed, expires in
+    fifteen minutes, is bound to this account, and is re-checked against the
+    account's status when it is redeemed.
+
+    Rate-limited as a write even though it writes nothing: minting is a
+    signing operation and the button that calls it is one click.
+    """
+    user, account = _account(request)
+    if account.status != "active":
+        raise HTTPException(403, "an active account is required to download releases")
+    api_writes.enforce(user.email, "portal download tokens")
+    token, expires_in = releases.mint_download_token(user.email)
+    # Built from the gateway's own configured public base URL, exactly like the
+    # release manifests' download URLs, and never from the Host header — a
+    # proxy or an attacker can set that, and this string is a command we are
+    # telling a customer to pipe into a shell.
+    base = releases._public_base_url()
+    return {
+        "token": token,
+        "expires_in": expires_in,
+        "install_command": (
+            f"curl -fsSL {base}/install.sh | sh -s -- --token {token}"
+        ),
+    }
 
 
 __all__ = ["router"]

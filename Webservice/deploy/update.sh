@@ -68,6 +68,8 @@ case "$ENVIRONMENT" in
     GATEWAY_PORT=8300
     RETENTION_UNIT="chudware-security-retention.service"
     RETENTION_TIMER="chudware-security-retention.timer"
+    RELEASE_RETENTION_UNIT="chudware-release-retention.service"
+    RELEASE_RETENTION_TIMER="chudware-release-retention.timer"
     EXPECTED_DB="chudware_prod"
     DO_HOST=1
     DO_ENGINE=1
@@ -80,6 +82,8 @@ case "$ENVIRONMENT" in
     GATEWAY_PORT=8310
     RETENTION_UNIT="chudware-security-retention-staging.service"
     RETENTION_TIMER="chudware-security-retention-staging.timer"
+    RELEASE_RETENTION_UNIT="chudware-release-retention-staging.service"
+    RELEASE_RETENTION_TIMER="chudware-release-retention-staging.timer"
     # assert_database_target, backup_database and run_migrations all reference
     # EXPECTED_DB unconditionally whenever the gateway is deployed, so leaving
     # it out of this arm would abort every staging run on an unbound variable.
@@ -344,6 +348,8 @@ install_current_units() {
   install -m 644 "$REPO/Webservice/deploy/$GATEWAY_UNIT" "$unit_dir/$GATEWAY_UNIT"
   install -m 644 "$REPO/Webservice/deploy/$RETENTION_UNIT" "$unit_dir/$RETENTION_UNIT"
   install -m 644 "$REPO/Webservice/deploy/$RETENTION_TIMER" "$unit_dir/$RETENTION_TIMER"
+  install -m 644 "$REPO/Webservice/deploy/$RELEASE_RETENTION_UNIT" "$unit_dir/$RELEASE_RETENTION_UNIT"
+  install -m 644 "$REPO/Webservice/deploy/$RELEASE_RETENTION_TIMER" "$unit_dir/$RELEASE_RETENTION_TIMER"
   systemctl --user daemon-reload \
     || { echo "ERROR: systemd user daemon-reload failed" >&2; exit 1; }
 }
@@ -353,6 +359,22 @@ enable_security_retention() {
   systemctl --user disable --now chudware-security-retention.timer chudware-security-retention-staging.timer >/dev/null 2>&1 || true
   if ! systemctl --user enable --now "$RETENTION_UNIT" "$RETENTION_TIMER"; then
     echo "WARN: failed to enable retention for $ENVIRONMENT; expired security batches will not be purged" >&2
+  fi
+}
+enable_release_retention() {
+  # Separate from the security timer above because the failure modes are not
+  # comparable. Expired security batches are a database-size problem; superseded
+  # release artifacts are a DISK problem — one nightly now writes an AppImage
+  # plus a .deb, an .rpm and a .tar.zst, which on a filesystem with under 4 GB
+  # free is roughly ten nights before PostgreSQL and the tunnel go down with the
+  # gateway. The admin route stays for a manual dry-run-then-confirm, but
+  # nothing load-bearing may depend on somebody pressing it.
+  #
+  # Both environments' timers are disabled first so a prod deploy cannot leave a
+  # staging timer running against the staging database, or the reverse.
+  systemctl --user disable --now chudware-release-retention.timer chudware-release-retention-staging.timer >/dev/null 2>&1 || true
+  if ! systemctl --user enable --now "$RELEASE_RETENTION_UNIT" "$RELEASE_RETENTION_TIMER"; then
+    echo "WARN: failed to enable release retention for $ENVIRONMENT; superseded beta artifacts will accumulate until the disk fills" >&2
   fi
 }
 assert_entitlement_credential() {
@@ -525,6 +547,7 @@ if [[ "$DO_GATEWAY" = 1 ]]; then
   run_migrations
   install_current_units
   enable_security_retention
+  enable_release_retention
   echo "=== [$(date -Iseconds)] restart $GATEWAY_UNIT ==="
   systemctl --user cat "$GATEWAY_UNIT" >/dev/null 2>&1 \
     || { echo "ERROR: $GATEWAY_UNIT is not installed" >&2; exit 1; }

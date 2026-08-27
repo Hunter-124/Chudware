@@ -76,6 +76,12 @@ def test_update_selects_staging_units_and_fails_closed_before_service_changes():
 def test_unit_installation_is_idempotent_copy_not_append():
     update = (DEPLOY / "update.sh").read_text(encoding="utf-8")
     function = update[update.index("install_current_units()") : update.index("enable_security_retention()")]
-    assert function.count("install -m 644") == 3
+    # gateway + security retention (service, timer) + release retention
+    # (service, timer). Release retention was added when one nightly went from
+    # publishing one Linux artifact to four and the disk became the binding
+    # constraint; see Webservice/deploy/chudware-release-retention.timer.
+    assert function.count("install -m 644") == 5
+    assert 'install -m 644 "$REPO/Webservice/deploy/$RELEASE_RETENTION_UNIT"' in function
+    assert 'install -m 644 "$REPO/Webservice/deploy/$RELEASE_RETENTION_TIMER"' in function
     assert ">>" not in function
     assert "cp -n" not in function

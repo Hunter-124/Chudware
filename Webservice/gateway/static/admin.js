@@ -33,6 +33,21 @@
     return d.innerHTML;
   }
 
+  /* ---- shared line icons (paths verbatim from the brand contract) ----
+     Icons are decorative: every svg is aria-hidden and the adjacent text or
+     the host control's aria-label carries the meaning. */
+  var ICON_PATHS = {
+    "arrow-right": "<path d='M4 12h14.6M13 6.4 18.6 12 13 17.6'/>",
+    "archive": "<path d='M4.6 4.6h14.8v3.6H4.6zM6 8.2v11.2h12V8.2'/><path d='M10.4 11.8h3.2'/>",
+    "package": "<path d='M3.6 7.9 12 3.6l8.4 4.3v8.2L12 20.4 3.6 16.1z'/><path d='M3.6 7.9 12 12.2l8.4-4.3M12 12.2v8.2'/>"
+  };
+  function iconHtml(name, extraClass) {
+    return "<svg class='icon" + (extraClass ? " " + extraClass : "") +
+           "' viewBox='0 0 24 24' aria-hidden='true' fill='none' stroke='currentColor'" +
+           " stroke-width='1.7' stroke-linecap='round' stroke-linejoin='round'>" +
+           ICON_PATHS[name] + "</svg>";
+  }
+
   /* ---- tab shell: hash-routed panels ----
      Dashboard/Releases/Accounts/Billing/Marketplace/Terminal/System.
      Billing and Marketplace render into a bare mount div from
@@ -116,6 +131,24 @@
 
   function platformLabel(row) {
     return String(row.platform || "?") + "/" + String(row.arch || "?");
+  }
+
+  // Release rows carry a `format` since migration 0018: default|deb|rpm|tar.
+  // "default" is the platform's native artifact (AppImage / .exe / .zip), so
+  // the badge names the artifact a customer actually downloads.
+  var FORMAT_LABEL = { deb: "deb", rpm: "rpm", tar: "tar.zst" };
+  var DEFAULT_FORMAT_LABEL = { linux: "AppImage", windows: "exe", macos: "zip" };
+  function rowFormat(row) {
+    return String(row.format || "default");
+  }
+  function formatLabel(row) {
+    var f = rowFormat(row);
+    if (f !== "default") return FORMAT_LABEL[f] || f;
+    return DEFAULT_FORMAT_LABEL[String(row.platform || "")] || "default";
+  }
+  function formatBadge(row) {
+    return "<span class='fmt-badge' title='format: " + esc(rowFormat(row)) + "'>" +
+           esc(formatLabel(row)) + "</span>";
   }
 
   // The server flags these, but fall back to the raw columns so a stale gateway
@@ -268,9 +301,10 @@
            esc(status || "unknown") + "</span>";
   }
 
-  function roleHtml(role) {
-    return "<span class='" + (role === "admin" ? "ac-admin" : "ac-dim") + "'>" +
-           esc(role || "user") + "</span>";
+  // Nearly every account is a plain user, so a whole Role column was noise:
+  // the rare admin gets a chip beside their email instead.
+  function adminChip(role) {
+    return role === "admin" ? " <span class='pill admin'>admin</span>" : "";
   }
 
   // One literal per endpoint the card drives, so the API surface greps cleanly.
@@ -450,7 +484,7 @@
   }
 
   function placeholder(msg) {
-    rows.innerHTML = "<tr><td colspan='8' class='ac-dim'>" + esc(msg) + "</td></tr>";
+    rows.innerHTML = "<tr><td colspan='6' class='table-empty'>" + esc(msg) + "</td></tr>";
     cardsEl.innerHTML = "<div class='ac-dim'>" + esc(msg) + "</div>";
   }
 
@@ -460,12 +494,11 @@
     list.forEach(function (a) {
       var tr = document.createElement("tr");
       tr.innerHTML =
-        "<td class='ac-email'>" + esc(a.email) + "</td>" +
-        "<td>" + (a.display ? esc(a.display) : "<span class='ac-dim'>\u2014</span>") + "</td>" +
+        "<td class='ac-email'>" + esc(a.email) + adminChip(a.role) +
+          (a.display ? "<div class='ac-dim'>" + esc(a.display) + "</div>" : "") + "</td>" +
         "<td>" + statusPill(a.status) + "</td>" +
         "<td class='ac-plan'></td>" +
         "<td class='ac-credit'></td>" +
-        "<td class='ac-role'>" + roleHtml(a.role) + "</td>" +
         "<td class='ac-when' title='" + esc(fmtWhen(a.created_at)) + "'>" +
           esc(fmtDate(a.created_at)) + "</td>" +
         "<td class='ac-act'><div class='ac-actions'></div></td>";
@@ -477,9 +510,9 @@
       var card = document.createElement("div");
       card.className = "account-card";
       card.innerHTML =
-        "<div class='ac-email'>" + esc(a.email) + "</div>" +
-        "<div class='ac-meta'>" + (a.display ? esc(a.display) : "No display name") + "</div>" +
-        "<div class='ac-row'>" + statusPill(a.status) + roleHtml(a.role) + "</div>" +
+        "<div class='ac-email'>" + esc(a.email) + adminChip(a.role) + "</div>" +
+        (a.display ? "<div class='ac-meta'>" + esc(a.display) + "</div>" : "") +
+        "<div class='ac-row'>" + statusPill(a.status) + "</div>" +
         "<div class='ac-meta'>Created " + esc(fmtDate(a.created_at)) + "</div>" +
         "<div class='ac-plan'></div>" +
         "<div class='ac-credit'></div>" +
@@ -608,27 +641,24 @@
     document.getElementById("browse-path").textContent = data.path;
     var list = document.getElementById("browse-list");
     list.innerHTML = "";
-    function row(label, cls, onClick) {
+    // Rows use the contract line icons (archive = folder, package = part file,
+    // flipped arrow = up one level) — no emoji or arrow glyphs as icons.
+    function row(label, cls, iconName, iconClass, onClick) {
       var d = document.createElement("div");
-      d.textContent = label;
-      d.style.cssText = "padding:5px 14px;font-size:.88rem" +
-                        (onClick ? ";cursor:pointer" : "") +
-                        (cls === "part" ? ";color:#55d98a" : "");
-      if (onClick) {
-        d.addEventListener("mouseenter", function () { d.style.background = "rgba(255,255,255,.06)"; });
-        d.addEventListener("mouseleave", function () { d.style.background = ""; });
-        d.addEventListener("click", onClick);
-      }
+      d.className = "browse-row" + (cls ? " " + cls : "");
+      d.innerHTML = iconHtml(iconName, iconClass) + "<span></span>";
+      d.querySelector("span").textContent = label;
+      if (onClick) d.addEventListener("click", onClick);
       list.appendChild(d);
     }
-    if (data.parent) row("\u2B06 ..", "dir", function () { browseTo(data.parent).catch(showBrowseErr); });
+    if (data.parent) row("..", "dir", "arrow-right", "icon-up", function () { browseTo(data.parent).catch(showBrowseErr); });
     data.dirs.forEach(function (n) {
-      row("\uD83D\uDCC1 " + n, "dir", function () {
+      row(n, "dir", "archive", "", function () {
         browseTo(data.path.replace(/\/$/, "") + "/" + n).catch(showBrowseErr);
       });
     });
     data.parts.forEach(function (n) {
-      row("\u2699 " + n, "part", null);
+      row(n, "part", "package", "", null);
     });
     if (!data.dirs.length && !data.parts.length) {
       var empty = document.createElement("div");
@@ -933,6 +963,7 @@
         min_supported: value("manifest-min"),
         platform: value("manifest-platform"),
         arch: value("manifest-arch"),
+        format: value("manifest-format"),
         sha256: value("manifest-sha"),
         size: Number(value("manifest-size")),
         signature: value("manifest-signature"),
@@ -946,6 +977,7 @@
       setValue("manifest-min", row.min_supported);
       setValue("manifest-platform", row.platform);
       setValue("manifest-arch", row.arch);
+      setValue("manifest-format", rowFormat(row));
       setValue("manifest-sha", row.sha256);
       setValue("manifest-size", row.size);
       setValue("manifest-signature", row.signature);
@@ -955,10 +987,11 @@
     }
     async function remove(row) {
       if (!window.confirm("Delete " + row.channel + " " + row.version + " " +
-                          row.platform + "/" + row.arch + "?")) return;
+                          row.platform + "/" + row.arch + " (" + formatLabel(row) + ")?")) return;
+      // format is explicit: omitting it would address the platform-default row.
       var query = new URLSearchParams({
         channel: row.channel, version: row.version,
-        platform: row.platform, arch: row.arch
+        platform: row.platform, arch: row.arch, format: rowFormat(row)
       });
       await api("/api/admin/release-manifests?" + query.toString(), { method: "DELETE" });
       status.textContent = "Manifest deleted.";
@@ -977,15 +1010,15 @@
         var info = document.createElement("div");
         var name = document.createElement("strong");
         name.textContent = row.channel + " · " + row.version + " · " +
-                           row.platform + "/" + row.arch;
+                           row.platform + "/" + row.arch + " · " + formatLabel(row);
         var meta = document.createElement("span");
-        meta.textContent = row.artifact_key + " · " + Number(row.size).toLocaleString() + " bytes";
+        meta.textContent = row.artifact_key + " · " + fmtBytes(row.size);
         info.appendChild(name);
         info.appendChild(meta);
         var actions = document.createElement("div");
         actions.className = "ac-actions";
         actions.appendChild(actionBtn("Edit", "btn ghost", function () { fill(row); }));
-        actions.appendChild(actionBtn("Delete", "btn ghost danger", function () {
+        actions.appendChild(actionBtn("Delete", "btn danger", function () {
           remove(row).catch(function (e) { status.textContent = e.message || String(e); });
         }));
         host.appendChild(info);
@@ -1037,40 +1070,30 @@
     var uploadBtn = document.getElementById("release-upload-btn");
     var uploadStatus = document.getElementById("release-upload-status");
 
-    function fmtSize(n) {
-      if (n < 1024) return n + " B";
-      var units = ["KB", "MB", "GB", "TB"];
-      var v = n / 1024;
-      var i = 0;
-      while (v >= 1024 && i < units.length - 1) { v /= 1024; i++; }
-      return v.toFixed(v < 10 ? 2 : 1) + " " + units[i];
-    }
-
-    function fmtDate(iso) {
-      var d = new Date(iso);
-      return isNaN(d.getTime()) ? iso : d.toLocaleString();
-    }
+    // Sizes and stamps use the shared fmtBytes/fmtStamp helpers above — the
+    // card used to carry its own near-identical copies.
 
     async function refreshReleases() {
       var data = await api("/api/admin/releases");
       if (!data || !data.length) {
         listEl.innerHTML =
-          "<p class='deploy-note'>No releases yet. Windows installers can't be built on this " +
-          "Linux host — build one on a Windows box (scripts\\build_windows.ps1, then " +
-          "installer\\build_release.py --zip, then packaging\\windows\\chudware.iss) and upload " +
-          "it below, or drop it into ~/chudware-releases on the server.</p>";
+          "<p class='deploy-note'>No installer files on this host yet. Windows installers " +
+          "can't be built on this Linux host — build one on a Windows box " +
+          "(scripts\\build_windows.ps1, then installer\\build_release.py --zip, then " +
+          "packaging\\windows\\chudware.iss) and upload it below, or drop it into " +
+          "~/chudware-releases on the server.</p>";
         return;
       }
       listEl.innerHTML = data.map(function (r) {
         return "<div class='release-row'>" +
           "<div class='release-info'>" +
             "<span class='release-name'>" + esc(r.name) + "</span>" +
-            "<span class='release-meta'>" + fmtSize(r.size) + " \xb7 " + fmtDate(r.mtime) + "</span>" +
+            "<span class='release-meta'>" + fmtBytes(r.size) + " \xb7 " + fmtStamp(r.mtime) + "</span>" +
           "</div>" +
           "<div class='release-actions'>" +
             "<a class='btn ghost' href='/api/admin/releases/download/" + encodeURIComponent(r.name) +
               "' download>Download</a>" +
-            "<button type='button' class='btn ghost danger release-delete' data-name='" +
+            "<button type='button' class='btn danger release-delete' data-name='" +
               esc(r.name) + "'>Delete</button>" +
           "</div>" +
         "</div>";
@@ -1079,7 +1102,7 @@
       Array.prototype.forEach.call(listEl.querySelectorAll(".release-delete"), function (btn) {
         btn.addEventListener("click", async function () {
           var name = btn.getAttribute("data-name");
-          if (!window.confirm("Delete " + name + "?")) return;
+          if (!window.confirm("Delete " + name + " from the host? Customers can no longer download it.")) return;
           btn.disabled = true;
           try {
             await api("/api/admin/releases/" + encodeURIComponent(name), { method: "DELETE" });
@@ -1095,11 +1118,11 @@
     uploadBtn.addEventListener("click", async function () {
       var f = fileEl.files && fileEl.files[0];
       if (!f) {
-        uploadStatus.textContent = "choose a file first";
+        uploadStatus.textContent = "Choose a file first.";
         return;
       }
       uploadBtn.disabled = true;
-      uploadStatus.textContent = "uploading " + f.name + "\u2026";
+      uploadStatus.textContent = "Uploading " + f.name + "\u2026";
       try {
         var fd = new FormData();
         fd.append("file", f, f.name);
@@ -1109,11 +1132,11 @@
         if (!res.ok) {
           throw new Error((data && (data.detail || data.error)) || res.status + " " + res.statusText);
         }
-        uploadStatus.textContent = "uploaded " + f.name;
+        uploadStatus.textContent = "Uploaded " + f.name + ".";
         fileEl.value = "";
         await refreshReleases();
       } catch (e) {
-        uploadStatus.textContent = "upload failed: " + (e.message || e);
+        uploadStatus.textContent = "Upload failed: " + (e.message || e);
       } finally {
         uploadBtn.disabled = false;
       }
@@ -1213,7 +1236,7 @@
 
         var actions = document.createElement("div");
         actions.className = "ac-actions";
-        actions.appendChild(actionBtn("Disconnect", "btn ghost danger", function () {
+        actions.appendChild(actionBtn("Disconnect", "btn danger", function () {
           disconnect(account).catch(function (e) { setSubStatus(String(e.message || e), true); });
         }));
         row.appendChild(actions);
@@ -1453,15 +1476,17 @@
       dashMessage("dash-releases", "Nothing published yet.");
       return;
     }
+    // Key includes format: a (platform, arch) can publish up to four builds
+    // (default/deb/rpm/tar) and each newest one deserves a line.
     latestPerKey(rows, function (row) {
-      return row.channel + "|" + row.platform + "|" + row.arch;
+      return row.channel + "|" + row.platform + "|" + row.arch + "|" + rowFormat(row);
     }).slice(0, 8).forEach(function (row) {
       var pill = document.createElement("span");
       pill.className = "pill " + (row.channel === "stable" ? "st-active" : "st-pending");
       pill.textContent = row.channel;
       dashItem(host,
         row.version + " \u00b7 " + platformLabel(row),
-        fmtBytes(row.size) + " \u00b7 " + fmtStamp(row.published_at),
+        formatLabel(row) + " \u00b7 " + fmtBytes(row.size) + " \u00b7 " + fmtStamp(row.published_at),
         pill);
     });
   }
@@ -1526,7 +1551,7 @@
     if (isErr) tr.className = "row-err";
     var td = document.createElement("td");
     td.colSpan = cols;
-    td.className = isErr ? "" : "ac-dim";
+    td.className = isErr ? "" : "table-empty";
     td.textContent = text;
     tr.appendChild(td);
     tbody.appendChild(tr);
@@ -1535,14 +1560,17 @@
   async function promoteRelease(row) {
     var target = row.stable_version || "the paired stable version";
     if (!window.confirm(
-          "Promote " + row.version + " (" + platformLabel(row) + ") to the stable channel as " +
-          target + "?\n\nEvery customer on stable will be offered this build.")) return false;
-    relStatus("Promoting " + row.version + " \u2192 " + target + " \u2026");
+          "Promote " + row.version + " (" + platformLabel(row) + ", " + formatLabel(row) +
+          ") to the stable channel as " + target +
+          "?\n\nEvery customer on stable will be offered this build.")) return false;
+    relStatus("Promoting " + row.version + " to stable " + target + " \u2026");
     var created = await api("/api/admin/releases/promote", {
       method: "POST",
       body: JSON.stringify({
+        // format is explicit: omitting it would promote the platform-default
+        // (AppImage/exe/zip) row even when this row is a deb/rpm/tar build.
         channel: "beta", version: row.version,
-        platform: row.platform, arch: row.arch
+        platform: row.platform, arch: row.arch, format: rowFormat(row)
       })
     });
     relStatus("Published stable " + ((created && created.version) || target) + " for " +
@@ -1552,10 +1580,11 @@
 
   async function deleteRelease(row) {
     if (!window.confirm("Delete the " + row.channel + " " + row.version + " " +
-                        platformLabel(row) + " manifest?")) return false;
+                        platformLabel(row) + " (" + formatLabel(row) + ") manifest?")) return false;
+    // format is explicit: omitting it would address the platform-default row.
     var query = new URLSearchParams({
       channel: row.channel, version: row.version,
-      platform: row.platform, arch: row.arch
+      platform: row.platform, arch: row.arch, format: rowFormat(row)
     });
     relStatus("Deleting " + row.channel + " " + row.version + " \u2026");
     await api("/api/admin/release-manifests?" + query.toString(), { method: "DELETE" });
@@ -1580,7 +1609,7 @@
       } else {
         var why = document.createElement("span");
         why.className = "ac-dim";
-        why.style.fontSize = ".74rem";
+        why.style.fontSize = "var(--step--2)";
         why.textContent = !pair ? "no stable signature pair" : "evidence incomplete";
         why.title = "Only CI-signed beta builds carrying both signatures and the full " +
                     "evidence bundle can be promoted.";
@@ -1607,10 +1636,11 @@
           esc(row.channel) + "</span></td>" +
         "<td>" + esc(row.version) +
           (hasStablePair(row) && row.channel === "beta"
-            ? "<span class='pair-badge' title='Signed stable pair ready'>\u2192 " +
-              esc(row.stable_version || "stable") + "</span>"
+            ? "<span class='pair-badge' title='Signed stable pair ready'>" +
+              iconHtml("arrow-right") + esc(row.stable_version || "stable") + "</span>"
             : "") + "</td>" +
         "<td>" + esc(platformLabel(row)) + "</td>" +
+        "<td>" + formatBadge(row) + "</td>" +
         "<td class='col-num'>" + esc(fmtBytes(row.size)) + "</td>" +
         "<td class='col-mono' title='" + esc(row.sha256) + "'>" + esc(shortHash(row.sha256, 12)) + "</td>" +
         "<td><span class='evi-badge " + (evidence ? "ok" : "missing") + "'>" +
@@ -1627,7 +1657,7 @@
     if (!tbody) return;
     var rows = await fetchManifests();
     if (!rows.length) {
-      tableMessage(tbody, 8, "No customer release manifests published.");
+      tableMessage(tbody, 9, "No customer release manifests published.");
       return;
     }
     renderReleaseRows(tbody, rows);
@@ -1661,7 +1691,7 @@
     var relBody = document.getElementById("rel-rows");
     if (relBody) {
       loadReleaseTable().catch(function (e) {
-        tableMessage(relBody, 8, "Couldn't load release manifests: " + (e.message || e), true);
+        tableMessage(relBody, 9, "Couldn't load release manifests: " + (e.message || e), true);
       });
     }
     var ciBody = document.getElementById("ci-rows");
@@ -1677,7 +1707,7 @@
     manifestReloaders.push(function () {
       var relBody = document.getElementById("rel-rows");
       loadReleaseTable().catch(function (e) {
-        if (relBody) tableMessage(relBody, 8, "Couldn't load release manifests: " + (e.message || e), true);
+      if (relBody) tableMessage(relBody, 9, "Couldn't load release manifests: " + (e.message || e), true);
       });
       refreshDashboard();
     });
@@ -1694,6 +1724,61 @@
       loadCiTable().catch(function (e) {
         if (ciStatus) { ciStatus.textContent = e.message || String(e); ciStatus.className = "ac-dim err"; }
       });
+    });
+    // Prune superseded beta builds: always a dry run first, then an explicit
+    // confirmation that names what will be removed. Stable rows are never
+    // touched; the gateway keeps the newest 3 beta versions per build. The
+    // same sweep also garbage-collects incoming/ orphans (failed CI publishes,
+    // abandoned chunk uploads) — nothing published points at those, and their
+    // numbers are reported separately from the release rows. A daily systemd
+    // timer (chudware-release-retention) runs this automatically; the button
+    // is the manual override.
+    var relPrune = document.getElementById("rel-prune");
+    if (relPrune) relPrune.addEventListener("click", async function () {
+      relPrune.disabled = true;
+      relStatus("Checking what pruning would remove \u2026");
+      try {
+        var dry = await api("/api/admin/releases/prune?dry_run=true", { method: "POST", body: "{}" });
+        var doomed = (dry && dry.pruned) || [];
+        var orphans = (dry && dry.incoming_orphans) || [];
+        if (!doomed.length && !orphans.length) {
+          relStatus("Nothing to prune \u2014 every beta build is still within the newest " +
+                    ((dry && dry.keep_beta_versions) || 3) + " versions and there are no orphaned uploads.");
+          return;
+        }
+        var lines = doomed.slice(0, 12).map(function (r) {
+          return r.channel + " " + r.version + " " + platformLabel(r) + " (" + formatLabel(r) + ")";
+        });
+        if (doomed.length > 12) lines.push("\u2026 and " + (doomed.length - 12) + " more");
+        if (orphans.length) {
+          lines.push("plus " + orphans.length + " orphaned upload(s) in incoming/, " +
+                     fmtBytes(dry.incoming_freed_bytes) + " \u2014 nothing published points at them");
+        }
+        var totalFreed = (Number(dry && dry.freed_bytes) || 0) +
+                         (Number(dry && dry.incoming_freed_bytes) || 0);
+        if (!window.confirm(
+              "Prune " + doomed.length + " superseded beta build(s), freeing " +
+              fmtBytes(totalFreed) + " in total?\n\n" + lines.join("\n") +
+              "\n\nStable builds and the newest 3 beta versions of each build are kept.")) {
+          relStatus("");
+          return;
+        }
+        var res = await api("/api/admin/releases/prune?dry_run=false", { method: "POST", body: "{}" });
+        var errors = (res && res.errors) || [];
+        var freed = (Number(res && res.freed_bytes) || 0) +
+                    (Number(res && res.incoming_freed_bytes) || 0);
+        var cleaned = ((res && res.incoming_orphans) || []).length;
+        relStatus("Pruned " + ((res && res.pruned) || []).length + " build(s)" +
+                  (cleaned ? " and " + cleaned + " orphaned upload(s)" : "") +
+                  ", freed " + fmtBytes(freed) +
+                  (errors.length ? " \u2014 " + errors.length + " error(s), see the gateway log." : "."),
+                  errors.length > 0);
+        reloadManifestViews();
+      } catch (e) {
+        relStatus("Prune failed: " + (e.message || e), true);
+      } finally {
+        relPrune.disabled = false;
+      }
     });
     // The tables load on first activation of the Releases tab (see showTab).
   })();

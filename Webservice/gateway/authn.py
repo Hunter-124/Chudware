@@ -513,6 +513,79 @@ def clear_session_cookie(response: Response, request: Request) -> None:
 # ---------------------------------------------------------------------------
 
 
+# Brand tokens for the server-rendered unauthenticated pages (pending, denied,
+# suspended, link-expired, OAuth failure). Same values as the portal stylesheet
+# and the marketing site's global.css; the fonts are the two public
+# /brand-assets files (content-hashed — rehash_static.py rewrites these
+# references too, so never retype a digest by hand).
+#
+# A plain constant, not part of the f-string, so the CSS needs no doubled
+# braces. app.py's global CSP carries style-src 'unsafe-inline', so an inline
+# <style> on these responses is permitted (portal_serve.py's stricter CSP
+# applies only to the static portal assets, not to these routes).
+_PAGE_STYLE = """
+    @font-face { font-family: "Chudware Sans";
+      src: url("/brand-assets/Rubik-VF.247dbaa0aa4a.woff2") format("woff2-variations");
+      font-style: normal; font-weight: 300 900; font-display: swap; }
+    @font-face { font-family: "Chudware Mono";
+      src: url("/brand-assets/JetBrainsMono-Regular.8f0f0cc0353e.woff2") format("woff2");
+      font-style: normal; font-weight: 400; font-display: swap; }
+    :root { color-scheme: dark;
+      --bg: #090d12; --panel: #111821; --panel-2: #151e29; --edge: #273342;
+      --edge-soft: rgba(255,255,255,.075); --text: #eef4f8; --muted: #8d9aaa;
+      --teal: #42ecce; --teal-wash: rgba(66,236,206,.09);
+      --ring: 0 0 0 3px rgba(66,236,206,.18); --shadow: 0 22px 60px rgba(0,0,0,.3);
+      --sans: "Chudware Sans", "Arial Narrow", sans-serif;
+      --mono: "Chudware Mono", ui-monospace, Consolas, monospace;
+      --step-0: clamp(1rem, .96rem + .18vw, 1.1rem);
+      --step-1: clamp(1.2rem, 1.1rem + .45vw, 1.45rem);
+      --s2: .5rem; --s4: 1rem; --s5: 1.5rem; --s6: 2rem;
+      --radius: .625rem; --radius-lg: 1rem; }
+    body { font-family: var(--sans); color: var(--text);
+           background: radial-gradient(900px 540px at 82% -5%, rgba(66,236,206,.08), transparent 62%), var(--bg);
+           display: flex; flex-direction: column; min-height: 100vh; min-height: 100dvh;
+           align-items: center; justify-content: center; gap: var(--s5);
+           margin: 0; padding: max(16px, env(safe-area-inset-top)) max(16px, env(safe-area-inset-right))
+                    max(16px, env(safe-area-inset-bottom)) max(16px, env(safe-area-inset-left));
+           box-sizing: border-box; -webkit-font-smoothing: antialiased; }
+    .brand { display: flex; align-items: center; gap: 12px; color: var(--text);
+             font-weight: 720; font-size: .98rem; text-transform: uppercase; letter-spacing: .08em; }
+    .brand svg { width: 30px; height: 30px; color: var(--teal);
+                 filter: drop-shadow(0 0 10px rgba(66,236,206,.25)); }
+    .card { max-width: 32rem; width: 100%; padding: var(--s6); box-sizing: border-box;
+            border: 1px solid var(--edge-soft); border-radius: var(--radius-lg);
+            background: linear-gradient(145deg, rgba(22,31,42,.96), rgba(13,19,27,.96));
+            box-shadow: var(--shadow); }
+    h1 { margin: 0 0 var(--s2); font-size: var(--step-1); letter-spacing: -.01em; font-weight: 650; }
+    p { margin: var(--s2) 0 0; line-height: 1.55; font-size: var(--step-0); color: var(--muted); }
+    code { font-family: var(--mono); font-size: .9em; color: var(--text);
+           background: var(--panel-2); border: 1px solid var(--edge);
+           padding: .1rem .35rem; border-radius: .25rem; word-break: break-all; }
+    a { color: var(--teal); text-decoration: underline; text-underline-offset: 3px; }
+    button { display: inline-flex; align-items: center; justify-content: center;
+             min-height: 42px; margin-top: var(--s2); padding: 10px 16px;
+             border: 1px solid var(--teal); border-radius: var(--radius);
+             background: var(--teal); color: #06110f; font: 650 .81rem/1 var(--sans);
+             cursor: pointer; transition: .14s ease;
+             box-shadow: 0 7px 22px rgba(66,236,206,.15); }
+    button:hover:not(:disabled) { background: #68f5da; }
+    button:disabled { cursor: wait; opacity: .45; }
+    :is(a, button):focus-visible { outline: none; box-shadow: var(--ring); }
+    @media (prefers-reduced-motion: reduce) { button { transition: none; } }
+    @media (max-width: 480px) {
+      .card { padding: var(--s4); }
+    }
+"""
+
+# The teal tesseract mark — same geometry as the portal sidebar and favicon.
+_BRAND_MARK = (
+    '<svg viewBox="0 0 64 64" aria-hidden="true"><g fill="none" stroke="currentColor" '
+    'stroke-width="3.2"><rect x="9" y="9" width="46" height="46"/>'
+    '<rect x="21" y="21" width="22" height="22"/>'
+    '<path d="M9 9l12 12M55 9L43 21M55 55L43 43M9 55l12-12"/></g></svg>'
+)
+
+
 def page_html(title: str, heading: str, body_html: str) -> str:
     """The one HTML shell every unauthenticated gateway page uses.
 
@@ -525,29 +598,10 @@ def page_html(title: str, heading: str, body_html: str) -> str:
   <meta charset="utf-8"/>
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <title>{title} — Chudware</title>
-  <style>
-    body {{ font-family: system-ui, sans-serif; background: #0f1419; color: #e7ecf1;
-           display: flex; min-height: 100vh; min-height: 100dvh; align-items: center; justify-content: center;
-           margin: 0; padding: max(16px, env(safe-area-inset-top)) max(16px, env(safe-area-inset-right))
-                    max(16px, env(safe-area-inset-bottom)) max(16px, env(safe-area-inset-left));
-           box-sizing: border-box; }}
-    .card {{ max-width: 32rem; width: 100%; padding: 2rem; border-radius: 12px; background: #1a2332;
-             border: 1px solid #2a3a4e; box-shadow: 0 8px 32px rgba(0,0,0,.4); box-sizing: border-box; }}
-    h1 {{ margin: 0 0 .75rem; font-size: 1.35rem; }}
-    p {{ line-height: 1.5; color: #b0bcc8; }}
-    code {{ background: #0f1419; padding: .1rem .35rem; border-radius: 4px; word-break: break-all; }}
-    a {{ color: #6cb6ff; }}
-    button {{ border: 0; border-radius: 7px; padding: .7rem 1rem; background: #2f81f7;
-              color: #fff; font: inherit; font-weight: 650; cursor: pointer; }}
-    button:hover {{ background: #4b91f7; }}
-    button:disabled {{ cursor: wait; opacity: .65; }}
-    @media (max-width: 480px) {{
-      .card {{ padding: 1.25rem; }}
-      h1 {{ font-size: 1.2rem; }}
-    }}
-  </style>
+  <style>{_PAGE_STYLE}</style>
 </head>
 <body>
+  <div class="brand">{_BRAND_MARK}<span>Chudware</span></div>
   <div class="card">
     <h1>{heading}</h1>
 {body_html}

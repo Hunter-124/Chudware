@@ -455,6 +455,31 @@ stage_appimage_smoke() {
     echo "  PASS ($(du -h "$img" | cut -f1) image, shot at $shot)"
 }
 
+# ---- Stage 3e: Linux distro packaging ----------------------------------------
+# packaging/test_linux_packages.py builds .deb and .rpm from a small synthetic
+# AppDir and asserts the ar member order, the control/spec metadata, the
+# prerelease version sanitisation the gateway's _canonical_artifact() agrees
+# with, byte-for-byte determinism, and that packaging never mutates the signed
+# payload. No network, ~2s. Unlike the AppImage smoke above this needs no GUI,
+# no Xvfb and no real build tree, so it runs by default rather than opt-in.
+# rpmbuild is optional: the suite skips its rpm cases without it.
+stage_linux_packages() {
+    echo "=== [3e/6] Linux distro packaging ==="
+    if [ ! -f packaging/test_linux_packages.py ]; then
+        skip_stage env "linux packages" "packaging/test_linux_packages.py missing" "suite not present"
+        return 0
+    fi
+    if python3 -m pytest -q packaging/test_linux_packages.py \
+            > ${GATE_TMP}/linux_packages.out 2>&1; then
+        record "linux packages     PASS    $(tail -n 1 ${GATE_TMP}/linux_packages.out)"
+        echo "  PASS ($(tail -n 1 ${GATE_TMP}/linux_packages.out))"
+        return 0
+    fi
+    record "linux packages     FAIL    deb/rpm packaging suite failed (see ${GATE_TMP}/linux_packages.out)"
+    echo "  FAIL"; tail -n 20 ${GATE_TMP}/linux_packages.out | sed 's/^/    /'
+    fail_fatal=1
+}
+
 # ---- Stage 4: engine + agent pytest -----------------------------------------
 # Uses the provisioned service venv discovered by resolve_gate_python() (Chudware, then the
 # legacy Billet/AI-CAD names, then the repo-local .venv-mcp) — those venvs have all
@@ -1050,6 +1075,7 @@ stage_ctest
 stage_hostd_smoke
 stage_web_parity
 stage_appimage_smoke
+stage_linux_packages
 stage_pytest
 stage_vv
 stage_modeling

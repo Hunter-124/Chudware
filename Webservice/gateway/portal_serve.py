@@ -19,6 +19,15 @@ from fastapi.responses import FileResponse, Response
 router = APIRouter(tags=["portal"])
 
 _PORTAL_ROOT = Path(__file__).resolve().parent / "static"
+_FONT_DIR = "fonts"
+# packaging/ is a sibling of Webservice/ in the checkout the gateway runs from
+# (chudware-gateway.service sets WorkingDirectory to
+# ~/Repositories/CAD/Webservice/gateway), so the script served at /install.sh is
+# the same file the Linux packaging pipeline is built against — there is no
+# second copy to keep in sync.
+_INSTALL_SCRIPT = (
+    Path(__file__).resolve().parents[2] / "packaging" / "linux" / "install.sh"
+)
 
 # Copied from appserve.py: explicit suffixes avoid OS-dependent MIME databases.
 _MIME_OVERRIDES: dict[str, str] = {
@@ -245,6 +254,66 @@ async def portal_asset(asset_path: str, request: Request) -> Response:
     if not _HASHED_ASSET_RE.fullmatch(target.name):
         raise HTTPException(status_code=404, detail="hashed portal asset not found")
     return _file_response(target, request, immutable=True)
+
+
+@router.get("/brand-assets/{asset_path:path}", response_model=None)
+async def brand_asset(asset_path: str, request: Request) -> Response:
+    """The two self-hosted typefaces, reachable without a session.
+
+    A third public asset prefix exists because neither of the other two can
+    serve a font to an anonymous visitor: ``/portal-assets`` is not in
+    ``auth.PUBLIC_PATHS`` at all, and ``/auth-assets`` additionally requires the
+    filename to start with "login". The sign-in page, the storefront and the
+    seller studio all link ``base.css``, which asks for Chudware Sans and
+    Chudware Mono by family name — so without a public font route every one of
+    those pages renders its headings in whatever the system happens to pick,
+    which is exactly the "off-brand typography" this surface was rebuilt to fix.
+
+    The surface opened is two WOFF2 files. This route will not serve anything
+    else: the name must be a bare content-hashed ``*.woff2`` basename, it is
+    resolved only inside ``static/fonts/``, and any directory component,
+    traversal attempt or other suffix is a 404 rather than a hint that the file
+    exists. Fonts are content-hashed, so they are immutable like every other
+    hashed asset.
+    """
+    name = asset_path.strip("/")
+    if (
+        "/" in name
+        or not name.lower().endswith(".woff2")
+        or not _HASHED_ASSET_RE.fullmatch(name)
+    ):
+        raise HTTPException(status_code=404, detail="brand asset not found")
+    target = _resolve_under_app(f"{_FONT_DIR}/{name}")
+    return _file_response(target, request, immutable=True)
+
+
+@router.get("/install.sh", response_model=None)
+async def install_script(request: Request) -> Response:
+    """The Linux one-line installer, served as plain text.
+
+    Public and anonymous on purpose: the command a customer is told to run is
+    ``curl -fsSL …/install.sh | sh -s -- --token <token>``, and the token is
+    what authorises the DOWNLOAD, not the fetch of the script. Requiring a
+    session here would only mean the pipe silently received an HTML sign-in page
+    instead of a script.
+
+    ``text/plain`` rather than a shell MIME type so a browser shows it — a
+    script people are asked to pipe into a shell must be readable first — and
+    five minutes of caching so a fix reaches the next visitor quickly.
+    """
+    if not _INSTALL_SCRIPT.is_file():
+        raise HTTPException(status_code=503, detail="install script is not deployed")
+    return FileResponse(
+        str(_INSTALL_SCRIPT),
+        media_type="text/plain; charset=utf-8",
+        headers={
+            "Content-Security-Policy": _PORTAL_CSP,
+            "Cache-Control": "public, max-age=300",
+            # Read in a browser, never rendered: this is text, and nothing may
+            # sniff it into something executable.
+            "X-Content-Type-Options": "nosniff",
+        },
+    )
 
 
 __all__ = ["router"]

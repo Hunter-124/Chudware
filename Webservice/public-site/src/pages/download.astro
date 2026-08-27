@@ -1,52 +1,341 @@
 ---
 import BaseLayout from '../layouts/BaseLayout.astro';
+import Icon from '../components/Icon.astro';
+import '../styles/download.css';
+
+const DOWNLOADS = 'https://app.chudware.com/#downloads';
 ---
-<BaseLayout title="Access Chudware" description="Open Chudware in a browser with no installation, or ask about native Windows and Linux preview builds.">
+<BaseLayout title="Download Chudware" description="Download the signed Chudware desktop app for Windows, macOS, and Linux — installer, AppImage, .deb, .rpm, .tar.zst, or a one-line terminal install — or open the browser workspace with no installation.">
   <header class="page-hero">
     <div class="wrap">
-      <p class="eyebrow">Browser + native</p>
-      <h1>Start in a browser. Install nothing.</h1>
-      <p class="lede">The browser client is available now. Create an account to open Chudware in a tab, in your own workspace.</p>
-      <div class="actions"><a class="button" href="https://app.chudware.com/signup">Create an account</a><a class="button button-secondary" href="https://app.chudware.com/signin">Sign in</a></div>
+      <p class="eyebrow">Native desktop</p>
+      <h1>Download Chudware.</h1>
+      <p class="lede">Signed builds for Windows, macOS, and Linux. Every download is issued to an account, so the buttons here open the download page in your workspace — signing in is the only extra step.</p>
     </div>
   </header>
 
   <section class="section">
-    <div class="wrap split">
-      <header class="section-heading">
-        <p class="eyebrow">Available now</p>
-        <h2>Full product, running in your tab.</h2>
-        <p class="lede">Chudware in the browser is the same application as the desktop build, running in your tab — not a video stream of a machine in a data centre, and not a viewer. The gateway verifies your identity and clamps every file path to your own workspace root.</p>
-      </header>
-      <div class="pricing-note">
-        <p class="eyebrow">No local setup</p>
-        <p>Use parametric modeling, assemblies, CAM, PLM, <a class="text-link" href="/product/simulation/">simulation</a>, reverse engineering, and the AI copilot without installing a desktop package. Open STEP, IGES, and BREP solids or STL, OBJ, PLY, and glTF meshes straight from the tab.</p>
-        <a class="text-link" href="https://app.chudware.com/signup">Open the signup page <span aria-hidden="true">→</span></a>
+    <div class="wrap">
+      <article class="panel dl-primary" id="dl-primary" aria-live="polite">
+        <span class="dl-mark" id="dl-primary-mark" aria-hidden="true">
+          <span data-os=""><Icon name="download" /></span>
+          <span data-os="windows" hidden><Icon name="windows" /></span>
+          <span data-os="macos" hidden><Icon name="apple" /></span>
+          <span data-os="linux" hidden><Icon name="linux" /></span>
+        </span>
+        <div class="dl-primary-body">
+          <p class="eyebrow" id="dl-primary-eyebrow">Signed release</p>
+          <h2 id="dl-primary-title">Chudware desktop</h2>
+          <p class="dl-note" id="dl-primary-note">Builds for Windows, macOS, and Linux, published from the download page in your workspace.</p>
+          <p class="release-meta" id="dl-primary-meta"></p>
+        </div>
+        <a class="button" id="dl-primary-action" href={DOWNLOADS}>Go to the download page</a>
+      </article>
+
+      <div class="dl-grid">
+        <article class="panel dl-card">
+          <header class="dl-card-head">
+            <span class="dl-mark" aria-hidden="true"><span data-os="windows"><Icon name="windows" /></span></span>
+            <h3>Windows</h3>
+          </header>
+          <p>Signed installer. Installs per user and updates itself from the same signed release manifests.</p>
+          <ul class="dl-builds" data-dl-platform="windows"></ul>
+          <a class="text-link" href={DOWNLOADS}>Download for Windows <Icon name="arrow-right" /></a>
+        </article>
+        <article class="panel dl-card">
+          <header class="dl-card-head">
+            <span class="dl-mark" aria-hidden="true"><span data-os="macos"><Icon name="apple" /></span></span>
+            <h3>macOS</h3>
+          </header>
+          <p>Zip archive: unpack and drag Chudware to Applications. On Apple silicon the Intel build runs through Rosetta 2.</p>
+          <ul class="dl-builds" data-dl-platform="macos"></ul>
+          <a class="text-link" href={DOWNLOADS}>Download for macOS <Icon name="arrow-right" /></a>
+        </article>
+        <article class="panel dl-card">
+          <header class="dl-card-head">
+            <span class="dl-mark" aria-hidden="true"><span data-os="linux"><Icon name="linux" /></span></span>
+            <h3>Linux</h3>
+          </header>
+          <p>AppImage, .deb, .rpm, .tar.zst, or the one-line terminal install below.</p>
+          <ul class="dl-builds" data-dl-platform="linux"></ul>
+          <a class="text-link" href={DOWNLOADS}>Download for Linux <Icon name="arrow-right" /></a>
+        </article>
       </div>
+      <p class="supporting-copy dl-sysnote">All native builds are 64-bit and need a graphics driver capable of a modern hardware-accelerated 3D context; without one the application does not start.</p>
+    </div>
+  </section>
+
+  <section class="section" aria-labelledby="dl-terminal-title">
+    <div class="wrap">
+      <header class="section-heading">
+        <p class="eyebrow">Linux</p>
+        <h2 id="dl-terminal-title">Install from a terminal.</h2>
+        <p class="lede">One command detects your package manager, installs the signed package, and registers the desktop entry.</p>
+      </header>
+      <div class="dl-command-row">
+        <code class="dl-command" id="dl-install-command">curl -fsSL https://app.chudware.com/install.sh | sh -s -- --token &lt;token from your account&gt;</code>
+        <button class="button button-secondary button-small" id="dl-install-copy" type="button">
+          <span class="dl-when-idle"><Icon name="copy" /></span>
+          <span class="dl-when-copied" hidden><Icon name="check" /></span>
+          <span id="dl-copy-label">Copy</span>
+        </button>
+      </div>
+      <p class="supporting-copy dl-token-note">The token is personal and expires after 15 minutes. Sign in at app.chudware.com, open the download page, and it issues one alongside this same command, ready to paste.</p>
+      <p class="dl-copy-status" id="dl-copy-status" role="status"></p>
+      <dl class="dl-formats">
+        <div><dt><Icon name="package" /> .deb</dt><dd>For Debian and Ubuntu; installs with apt and removes cleanly.</dd></div>
+        <div><dt><Icon name="package" /> .rpm</dt><dd>For Fedora, RHEL, and openSUSE; installs with dnf or zypper.</dd></div>
+        <div><dt><Icon name="download" /> AppImage</dt><dd>One portable file with nothing to install; make it executable and run it.</dd></div>
+        <div><dt><Icon name="archive" /> .tar.zst</dt><dd>Plain archive for any distribution; unpack and run from anywhere.</dd></div>
+      </dl>
     </div>
   </section>
 
   <section class="section">
-    <div class="wrap">
+    <div class="wrap split">
       <header class="section-heading">
-        <p class="eyebrow">Native desktop preview</p>
-        <h2>Windows and Linux builds exist, but are not publicly published yet.</h2>
-        <p class="lede">Native preview access is available on request while the public release channel is being prepared. There are no public artifact links, version numbers, or checksums to publish today.</p>
-        <p class="supporting-copy">Both native builds are 64-bit only and need a graphics driver capable of a modern hardware-accelerated 3D context; without one the application does not start. No minimum RAM, CPU, or disk figures are published, because none have been measured and ratified — the browser workspace is the quickest way to find out whether a machine is comfortable.</p>
+        <p class="eyebrow">No installation at all</p>
+        <h2>The same application also runs in a browser tab.</h2>
+        <p class="lede">The browser workspace is the full product — not a video stream of a machine in a data centre, and not a viewer. It is the quickest way to try Chudware or to work from a machine you cannot install on.</p>
       </header>
-      <div class="platform-grid platform-grid-native">
-        <article class="panel platform-card"><p class="eyebrow">Native build</p><h3>Windows</h3><p>Ask about access to the Windows desktop preview.</p><a class="button button-secondary" href="mailto:sales@chudware.com?subject=Windows%20desktop%20preview">Request Windows access</a></article>
-        <article class="panel platform-card"><p class="eyebrow">Native build</p><h3>Linux</h3><p>Ask about access to the Linux desktop preview.</p><a class="button button-secondary" href="mailto:sales@chudware.com?subject=Linux%20desktop%20preview">Request Linux access</a></article>
+      <div class="pricing-note">
+        <p class="eyebrow">One account, both routes</p>
+        <p>Use parametric modeling, assemblies, CAM, PLM, <a class="text-link" href="/product/simulation/">simulation</a>, reverse engineering, and the AI copilot straight from the tab. The account that signs in to the browser workspace is the account the desktop app activates with.</p>
+        <a class="text-link" href="https://app.chudware.com/signup">Create an account <Icon name="arrow-right" /></a>
       </div>
     </div>
   </section>
 
   <section class="section cta-band">
     <div class="wrap section-heading">
-      <p class="eyebrow">The shortest route</p>
-      <h2>Open Chudware from the browser.</h2>
-      <p class="lede">Create an account and start in the browser; no desktop package is required.</p>
-      <div class="actions"><a class="button" href="https://app.chudware.com/signup">Create an account</a><a class="button button-secondary" href="/docs/first-part/">Read the first-part guide</a></div>
+      <p class="eyebrow">Get started</p>
+      <h2>Install it, or open it in a tab.</h2>
+      <p class="lede">Both routes run the same product against the same account.</p>
+      <div class="actions"><a class="button" href={DOWNLOADS}>Go to the download page</a><a class="button button-secondary" href="/docs/">Read the install guides</a></div>
     </div>
   </section>
 </BaseLayout>
+
+<script>
+  const API = 'https://app.chudware.com/api/releases/available?channel=stable';
+  const SIGNUP = 'https://app.chudware.com/signup';
+  const PLATFORM_LABELS: Record<string, string> = { windows: 'Windows', macos: 'macOS', linux: 'Linux' };
+  const FORMAT_LABELS: Record<string, Record<string, string>> = {
+    windows: { default: 'Installer (.exe)' },
+    macos: { default: 'Zip archive (.zip)' },
+    linux: { default: 'AppImage', deb: '.deb package', rpm: '.rpm package', tar: '.tar.zst archive' },
+  };
+
+  interface Build { platform: string; arch: string; format: string; version: string; size: number }
+  interface Detected { platform: string; arch: string }
+
+  const formatLabel = (platform: string, format: string): string =>
+    FORMAT_LABELS[platform]?.[format] ?? format;
+
+  const archLabel = (platform: string, arch: string): string =>
+    platform === 'macos' ? (arch === 'arm64' ? 'Apple silicon' : 'Intel') : arch;
+
+  /** Human-readable size, binary units, one decimal below 10: 1.4 GB, 228 MB, 812 KB. */
+  function formatBytes(n: number): string {
+    if (!Number.isFinite(n) || n < 0) return '';
+    const units = ['bytes', 'KB', 'MB', 'GB', 'TB'];
+    let v = n;
+    let i = 0;
+    while (v >= 1024 && i < units.length - 1) { v /= 1024; i += 1; }
+    return `${i > 0 && v < 10 ? v.toFixed(1) : Math.round(v)} ${units[i]}`;
+  }
+
+  function normPlatform(value: string | undefined): string | null {
+    const s = (value ?? '').toLowerCase();
+    if (s.includes('win')) return 'windows';
+    if (s.includes('mac')) return 'macos';
+    if (s.includes('linux')) return 'linux';
+    return null;
+  }
+
+  /** Apple-silicon heuristic for browsers that mask the architecture. */
+  function macArch(): string {
+    if (navigator.maxTouchPoints > 0) return 'arm64';
+    try {
+      const gl = document.createElement('canvas').getContext('webgl');
+      if (gl) {
+        const dbg = gl.getExtension('WEBGL_debug_renderer_info');
+        const renderer = String(dbg ? gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL) : gl.getParameter(gl.RENDERER));
+        if (renderer.includes('Apple')) return 'arm64';
+      }
+    } catch { /* fall through to Intel */ }
+    return 'x86_64';
+  }
+
+  async function detect(): Promise<Detected | null> {
+    const uad = (navigator as any).userAgentData;
+    if (uad?.getHighEntropyValues) {
+      try {
+        const h = await uad.getHighEntropyValues(['architecture', 'platform', 'platformVersion']);
+        const platform = normPlatform(h.platform ?? uad.platform);
+        if (platform) {
+          const a = (h.architecture ?? '').toLowerCase();
+          const arch = a.includes('arm') ? 'arm64' : a.includes('x86') ? 'x86_64' : platform === 'macos' ? macArch() : 'x86_64';
+          return { platform, arch };
+        }
+      } catch { /* fall back to UA sniffing */ }
+    }
+    const p = navigator.platform ?? '';
+    const ua = navigator.userAgent ?? '';
+    const arm = /arm64|aarch64/i.test(ua);
+    if (/win/i.test(p) || /Windows NT/.test(ua)) return { platform: 'windows', arch: arm ? 'arm64' : 'x86_64' };
+    if (/mac/i.test(p) || /Mac OS X/.test(ua)) return { platform: 'macos', arch: macArch() };
+    if (/linux|x11/i.test(p) || /Linux/.test(ua)) return { platform: 'linux', arch: arm ? 'arm64' : 'x86_64' };
+    return null;
+  }
+
+  function setMark(platform: string | null): void {
+    document.querySelectorAll<HTMLElement>('#dl-primary-mark [data-os]').forEach((el) => {
+      el.hidden = el.dataset.os !== (platform ?? '');
+    });
+  }
+
+  function renderPrimary(detected: Detected | null, builds: Build[] | null): void {
+    const eyebrow = document.getElementById('dl-primary-eyebrow')!;
+    const title = document.getElementById('dl-primary-title')!;
+    const note = document.getElementById('dl-primary-note')!;
+    const meta = document.getElementById('dl-primary-meta')!;
+    const action = document.getElementById('dl-primary-action') as HTMLAnchorElement;
+    const card = document.getElementById('dl-primary')!;
+    card.dataset.detected = detected ? `${detected.platform}/${detected.arch}` : 'unknown';
+
+    if (!detected) {
+      // Do not guess: leave the honest static card, point at the platform list.
+      eyebrow.textContent = 'Choose your platform';
+      note.textContent = 'Every published build is listed below; each links to the download page in your workspace.';
+      return;
+    }
+
+    const platformName = PLATFORM_LABELS[detected.platform];
+    const detectedLine = `Detected: ${platformName} · ${archLabel(detected.platform, detected.arch)}`;
+
+    if (!builds) {
+      // Release metadata unreachable: name the platform but never invent a version.
+      eyebrow.textContent = detectedLine;
+      title.textContent = `Download for ${platformName}`;
+      setMark(detected.platform);
+      return;
+    }
+
+    const forPlatform = builds.filter((b) => b.platform === detected.platform);
+    const exact = forPlatform.filter((b) => b.arch === detected.arch);
+    const pick = (list: Build[]) => list.find((b) => b.format === 'default') ?? list[0];
+
+    if (exact.length > 0) {
+      const build = pick(exact)!;
+      eyebrow.textContent = detectedLine;
+      title.textContent = `Download for ${platformName}`;
+      meta.textContent = `Version ${build.version} · ${formatBytes(build.size)}`;
+      setMark(detected.platform);
+      if (detected.platform === 'linux') {
+        const extras = exact.filter((b) => b.format !== 'default').map((b) => formatLabel('linux', b.format).replace(' package', '').replace(' archive', ''));
+        note.textContent = extras.length > 0
+          ? `${formatLabel('linux', build.format)}, or choose ${extras.join(', ')} on the download page.`
+          : 'The download page issues the link once you are signed in.';
+      } else {
+        note.textContent = 'The download page issues the link once you are signed in.';
+      }
+      return;
+    }
+
+    if (forPlatform.length > 0) {
+      // Same platform, different architecture: offer it and say why, per the
+      // design ruling — no disabled button, no "Unavailable".
+      const build = pick(forPlatform)!;
+      eyebrow.textContent = detectedLine;
+      title.textContent = `Chudware for ${platformName}`;
+      meta.textContent = `Version ${build.version} · ${formatBytes(build.size)}`;
+      setMark(detected.platform);
+      note.textContent = detected.platform === 'macos' && detected.arch === 'arm64'
+        ? 'The Apple-silicon build is not published yet. This Intel build runs on Apple silicon through Rosetta 2.'
+        : `The ${archLabel(detected.platform, detected.arch)} build is not published yet; this ${archLabel(detected.platform, build.arch)} build is offered instead.`;
+      return;
+    }
+
+    // Nothing for this platform at all.
+    eyebrow.textContent = detectedLine;
+    title.textContent = `No build is published for ${platformName} yet`;
+    note.textContent = 'Open the browser workspace instead — it is the same application with nothing to install.';
+    meta.textContent = '';
+    action.href = SIGNUP;
+    action.textContent = 'Open the browser workspace';
+    card.dataset.state = 'fallback';
+  }
+
+  function renderGrid(builds: Build[]): void {
+    document.querySelectorAll<HTMLUListElement>('[data-dl-platform]').forEach((list) => {
+      const platform = list.dataset.dlPlatform!;
+      // Rows come from the API response only: a build that was not returned
+      // does not get a row.
+      for (const build of builds.filter((b) => b.platform === platform)) {
+        const li = document.createElement('li');
+        const what = document.createElement('span');
+        what.textContent = `${formatLabel(platform, build.format)} · ${archLabel(platform, build.arch)}`;
+        const detail = document.createElement('span');
+        detail.textContent = `${build.version} · ${formatBytes(build.size)}`;
+        li.append(what, detail);
+        list.append(li);
+      }
+    });
+  }
+
+  function wireCopy(): void {
+    const button = document.getElementById('dl-install-copy')!;
+    const command = document.getElementById('dl-install-command')!;
+    const status = document.getElementById('dl-copy-status')!;
+    const label = document.getElementById('dl-copy-label')!;
+    const idle = button.querySelector<HTMLElement>('.dl-when-idle')!;
+    const copied = button.querySelector<HTMLElement>('.dl-when-copied')!;
+    button.addEventListener('click', async () => {
+      const text = (command.textContent ?? '').trim();
+      try {
+        // Some browsers leave writeText pending forever when the permission
+        // dialog cannot be shown; treat a slow write as a failure.
+        await Promise.race([
+          navigator.clipboard.writeText(text),
+          new Promise((_, reject) => setTimeout(reject, 1500, new Error('timeout'))),
+        ]);
+        idle.hidden = true;
+        copied.hidden = false;
+        label.textContent = 'Copied';
+        status.textContent = 'Copied. Replace the token placeholder before running it.';
+        setTimeout(() => {
+          idle.hidden = false;
+          copied.hidden = true;
+          label.textContent = 'Copy';
+        }, 1600);
+      } catch {
+        const selection = getSelection();
+        if (selection) {
+          const range = document.createRange();
+          range.selectNodeContents(command);
+          selection.removeAllRanges();
+          selection.addRange(range);
+        }
+        status.textContent = 'Copy failed — the command is selected, copy it manually.';
+      }
+    });
+  }
+
+  async function main(): Promise<void> {
+    wireCopy();
+    const detected = await detect();
+    let builds: Build[] | null = null;
+    try {
+      const res = await fetch(API);
+      if (res.ok) {
+        const data = await res.json();
+        if (Array.isArray(data?.builds)) builds = data.builds;
+      }
+    } catch { /* static card already reads correctly without release data */ }
+    renderPrimary(detected, builds);
+    if (builds) renderGrid(builds);
+  }
+
+  main();
+</script>

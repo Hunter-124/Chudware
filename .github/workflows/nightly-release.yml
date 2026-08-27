@@ -608,36 +608,26 @@ jobs:
           cp "${root}/payload-manifest.v1.json" "${work}/payload-manifest.v1.json"
           cp "${root}/payload-manifest.v1.sig" "${work}/payload-manifest.v1.sig"
 
-      - name: Stage the artifact and sidecars for the gateway
+      - name: Package the verified tree as .deb and .rpm
+        env:
+          CHUDWARE_RELEASE_CI_KEY: ${{ secrets.CHUDWARE_RELEASE_CI_KEY }}
         shell: bash
         run: |
           set -euo pipefail
-          name="Chudware-${RELEASE_VERSION}-linux-x86_64.AppImage"
-          incoming="${RELEASES_DIR}/incoming"
-          install -m 0644 "${ARTIFACT}" "${incoming}/${name}"
-          install -m 0644 "${RUNNER_TEMP}/verify/payload-manifest.v1.json" "${incoming}/${name}.payload-manifest.v1.json"
-          install -m 0644 "${RUNNER_TEMP}/verify/payload-manifest.v1.sig" "${incoming}/${name}.payload-manifest.v1.sig"
-          if [ "${HAS_EVIDENCE}" = 1 ]; then
-            for evidence in sbom.cdx.json provenance.slsa.json platform-test.v1.json; do
-              install -m 0644 "${RUNNER_TEMP}/final/evidence/${evidence}" "${incoming}/${name}.${evidence}"
-              install -m 0644 "${RUNNER_TEMP}/final/evidence/${evidence}.sig" "${incoming}/${name}.${evidence}.sig"
-            done
-          fi
-          echo "ARTIFACT_NAME=${name}" >> "$GITHUB_ENV"
-          ls -l "${incoming}/${name}"*
 
-      - name: Publish the beta release over the gateway loopback
-        shell: bash
-        run: |
-          set -euo pipefail
-          . "${RUNNER_TEMP}/gw.sh"
-          ci_status publishing "posting ci/publish for ${ARTIFACT_NAME}"
+          # ------------------------------------------------------------------
+          # Shared publish path. Written FIRST and unconditionally: the AppImage
+          # publish step below sources it too, so nothing here may be reachable
+          # only when packaging succeeds.
+          # ------------------------------------------------------------------
+          cat > "${RUNNER_TEMP}/publish_body.py" <<'PY'
+          """Build one ci/publish body. Used by the AppImage and by every package.
 
-          body="${RUNNER_TEMP}/publish.json"
-          # Digests are computed from the STAGED bytes, which is what the gateway
-          # recomputes and rejects on mismatch.
-          python3 - "${RELEASES_DIR}/incoming/${ARTIFACT_NAME}" \
-            "${RUNNER_TEMP}/artifact.sig" "${RUNNER_TEMP}/artifact-stable.sig" > "${body}" <<'PY'
+          `format` is a routing key, not an identity claim: the artifact signature
+          preimage stays (key_id, version, platform, arch, sha256), and the digest
+          already binds these exact bytes. Every format therefore signs its own
+          digest, and shipped 0.1.1 clients keep verifying releases unchanged.
+          """
           import hashlib, json, os, pathlib, sys
 
           def digest(path):
@@ -654,6 +644,7 @@ jobs:
               "platform": os.environ["RELEASE_PLATFORM"],
               "arch": os.environ["RELEASE_ARCH"],
               "channel": "beta",
+              "format": sys.argv[4],
               "key_id": os.environ["CHUDWARE_RELEASE_KEY_ID"],
               "min_supported": os.environ["CHUDWARE_RELEASE_MIN_SUPPORTED"],
               "sha256": digest(artifact),
@@ -664,13 +655,12 @@ jobs:
               "commit_sha": os.environ["RELEASE_COMMIT"],
           }
           if os.environ.get("HAS_EVIDENCE") == "1":
-              fields = (
+              evidence = {}
+              for field, suffix in (
                   ("sbom", "sbom.cdx.json"),
                   ("provenance", "provenance.slsa.json"),
                   ("platform_test", "platform-test.v1.json"),
-              )
-              evidence = {}
-              for field, suffix in fields:
+              ):
                   document = artifact.with_name(artifact.name + "." + suffix)
                   evidence[field + "_sha256"] = digest(document)
                   evidence[field + "_signature_sha256"] = digest(document.with_name(document.name + ".sig"))
@@ -678,12 +668,155 @@ jobs:
           json.dump(body, sys.stdout)
           PY
 
+          cat > "${RUNNER_TEMP}/pkg.sh" <<'SH'
+          # canonical_name <format>: ask the gateway's own naming module. The publish
+          # endpoint looks for a staged file by exactly this name, so nothing in CI may
+          # hand-format it (prereleases sanitise '-' differently per format).
+          canonical_name() {
+            python3 "${GITHUB_WORKSPACE}/Webservice/gateway/artifact_names.py" \
+              --version "${RELEASE_VERSION}" --platform "${RELEASE_PLATFORM}" \
+              --arch "${RELEASE_ARCH}" --format "$1"
+          }
+          # sign_artifact_identity <artifact> <version> <output>: one Ed25519 artifact
+          # signature over these exact bytes. ci_sign.py writes with O_EXCL, so a retry
+          # has to clear the target first.
+          sign_artifact_identity() {
+            rm -f "$3"
+            "${CHUDWARE_RELEASE_PYTHON}" packaging/ci_sign.py \
+              --expect-public-key "${CHUDWARE_RELEASE_CI_PUBLIC_KEY}" --output "$3" \
+              artifact --key-id "${CHUDWARE_RELEASE_KEY_ID}" --version "$2" \
+              --platform "${RELEASE_PLATFORM}" --arch "${RELEASE_ARCH}" \
+              --artifact "$1" > /dev/null
+          }
+          # sign_identities <artifact> <prefix>: the beta version published now, and the
+          # stable version /admin will promote to without rebuilding a byte.
+          sign_identities() {
+            sign_artifact_identity "$1" "${RELEASE_VERSION}" "$2.sig"
+            sign_artifact_identity "$1" "${RELEASE_STABLE_VERSION}" "$2-stable.sig"
+          }
+          # stage_release_file <source> <canonical name>: the artifact plus a copy of the
+          # SAME signed payload manifest and evidence sidecars, under this file's own
+          # basename, which is how the gateway pairs them.
+          #
+          # Every command carries `|| return 1` and both helpers end in an explicit
+          # `return 0`. That is not belt-and-braces: the package step below runs WITHOUT
+          # -e (one format must not abort the other) and calls these in an `if` test,
+          # and bash suppresses errexit for the whole subtree of an `if` condition —
+          # including a nested subshell that sets `set -e` itself (measured: a subshell
+          # guard reported success after a failed install). Without explicit returns a
+          # format would be reported "published" from a stage that never happened.
+          stage_release_file() {
+            local source="$1" name="$2" incoming="${RELEASES_DIR}/incoming" evidence
+            install -m 0644 "${source}" "${incoming}/${name}" || return 1
+            install -m 0644 "${RUNNER_TEMP}/verify/payload-manifest.v1.json" \
+              "${incoming}/${name}.payload-manifest.v1.json" || return 1
+            install -m 0644 "${RUNNER_TEMP}/verify/payload-manifest.v1.sig" \
+              "${incoming}/${name}.payload-manifest.v1.sig" || return 1
+            if [ "${HAS_EVIDENCE}" = 1 ]; then
+              for evidence in sbom.cdx.json provenance.slsa.json platform-test.v1.json; do
+                install -m 0644 "${RUNNER_TEMP}/final/evidence/${evidence}" \
+                  "${incoming}/${name}.${evidence}" || return 1
+                install -m 0644 "${RUNNER_TEMP}/final/evidence/${evidence}.sig" \
+                  "${incoming}/${name}.${evidence}.sig" || return 1
+              done
+            fi
+            ls -l "${incoming}/${name}"* || true
+            return 0
+          }
+          # publish_release_file <staged file> <format> <sig prefix>. Digests come from
+          # the STAGED bytes, which is what the gateway recomputes and rejects on
+          # mismatch. A 422 makes the gateway DELETE the staged artifact (sidecars
+          # survive), so callers must stage immediately before publishing and never
+          # reuse a stage across a retry.
+          publish_release_file() {
+            local staged="$1" format="$2" prefix="$3"
+            local body="${RUNNER_TEMP}/publish-${format}.json"
+            local response="${RUNNER_TEMP}/publish-response-${format}.json"
+            python3 "${RUNNER_TEMP}/publish_body.py" "${staged}" "${prefix}.sig" \
+              "${prefix}-stable.sig" "${format}" > "${body}" || return 1
+            gw_post /api/releases/ci/publish "${body}" > "${response}" || return 1
+            python3 -c 'import json,sys; print(json.dumps(json.load(open(sys.argv[1])), indent=2, sort_keys=True))' \
+              "${response}" || return 1
+            return 0
+          }
+          SH
+          . "${RUNNER_TEMP}/gw.sh"
+          . "${RUNNER_TEMP}/pkg.sh"
+
+          # ------------------------------------------------------------------
+          # The packages themselves. Everything below is best-effort ON PURPOSE:
+          # the AppImage is the release, .deb/.rpm are additive routing formats,
+          # and a runner without rpmbuild or a packaging regression must not cost
+          # the nightly its AppImage. Failures are ::warning:: annotations plus a
+          # named-formats line in the step summary and in the ci/status detail,
+          # so a silently missing package is still visible in /admin.
+          # ------------------------------------------------------------------
+          missing=""
+          # Only what the deb and rpm legs actually invoke: xz compresses data.tar.xz,
+          # rpmbuild builds the rpm (its zstd payload is internal to librpm). The
+          # tar.zst format is not published by the nightly, so `zstd` is not required.
+          for tool in rpmbuild xz; do
+            command -v "${tool}" >/dev/null 2>&1 || missing="${missing} ${tool}"
+          done
+          published_formats=""
+          if [ -n "${missing}" ]; then
+            echo "::warning::runner ${RUNNER_NAME:-unknown} is missing${missing}; the Linux .deb/.rpm packages are skipped for this build (the AppImage is unaffected). Run runner-provision against this label to add them."
+          else
+            ci_status packaging "building .deb and .rpm from the verified tree"
+            root="${RUNNER_TEMP}/verify/squashfs-root"
+            out="${RUNNER_TEMP}/packages"
+            rm -rf "${out}"
+            mkdir -p "${out}"
+            # One invocation per format so a failure in one leaves the other
+            # publishable, and so each format's stage+publish stays independently
+            # retryable. The deb run also re-verifies the signed payload manifest
+            # from inside the built archive, which covers the shared staging code.
+            for format in deb rpm; do
+              name="$(canonical_name "${format}")"
+              if ! packaging/linux/build_linux_packages.sh --appdir "${root}" \
+                     --version "${RELEASE_VERSION}" --out "${out}" --format "${format}"; then
+                echo "::warning::building ${name} failed; this format will not be published"
+                continue
+              fi
+              if [ ! -s "${out}/${name}" ]; then
+                echo "::warning::${name} was not produced; this format will not be published"
+                continue
+              fi
+              # Guarded, not bare: this step runs under `set -e`, so an unguarded
+              # signing failure would abort it BEFORE the AppImage is staged and
+              # published, losing the release over an additive format.
+              if ! sign_identities "${out}/${name}" "${RUNNER_TEMP}/artifact-${format}"; then
+                echo "::warning::signing ${name} failed; this format will not be published"
+                continue
+              fi
+              published_formats="${published_formats}${published_formats:+ }${format}"
+              echo "packaged and signed ${name} ($(stat -c %s "${out}/${name}") bytes)"
+            done
+          fi
+          echo "PACKAGE_FORMATS=${published_formats}" >> "$GITHUB_ENV"
+
+      - name: Stage the artifact and sidecars for the gateway
+        shell: bash
+        run: |
+          set -euo pipefail
+          . "${RUNNER_TEMP}/pkg.sh"
+          name="$(canonical_name default)"
+          stage_release_file "${ARTIFACT}" "${name}"
+          echo "ARTIFACT_NAME=${name}" >> "$GITHUB_ENV"
+
+      - name: Publish the beta release over the gateway loopback
+        shell: bash
+        run: |
+          set -euo pipefail
+          . "${RUNNER_TEMP}/gw.sh"
+          . "${RUNNER_TEMP}/pkg.sh"
+          ci_status publishing "posting ci/publish for ${ARTIFACT_NAME}"
+
           # A 422 for a digest/size mismatch makes the gateway DELETE the staged
           # artifact (sidecars survive), so a retry must re-stage it. Re-running
           # this job does exactly that: it rebuilds and re-copies before publishing.
-          response="${RUNNER_TEMP}/publish-response.json"
-          gw_post /api/releases/ci/publish "${body}" > "${response}"
-          python3 -c 'import json,sys; print(json.dumps(json.load(open(sys.argv[1])), indent=2, sort_keys=True))' "${response}"
+          publish_release_file "${RELEASES_DIR}/incoming/${ARTIFACT_NAME}" default \
+            "${RUNNER_TEMP}/artifact"
           ci_status published "${ARTIFACT_NAME} published to beta"
           {
             echo '## Linux beta published'
@@ -691,6 +824,55 @@ jobs:
             echo "* artifact: \`${ARTIFACT_NAME}\`"
             echo "* stable pair signed for: \`${RELEASE_STABLE_VERSION}\`"
             echo "* evidence bundle: \`${HAS_EVIDENCE}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Stage and publish the Linux packages
+        shell: bash
+        run: |
+          set -uo pipefail
+          . "${RUNNER_TEMP}/gw.sh"
+          . "${RUNNER_TEMP}/pkg.sh"
+
+          # Runs AFTER the AppImage publish on purpose: the release has already
+          # shipped by the time these formats are attempted, so no packaging
+          # problem can cost the nightly its AppImage. Each format stages
+          # immediately before it publishes, because a 422 deletes the staged
+          # artifact and the next attempt has to start from a fresh copy.
+          published=""
+          failed=""
+          for format in ${PACKAGE_FORMATS:-}; do
+            name="$(canonical_name "${format}")"
+            source="${RUNNER_TEMP}/packages/${name}"
+            if [ ! -s "${source}" ]; then
+              echo "::warning::${name} is missing from the packaging output; skipping"
+              failed="${failed}${failed:+ }${format}"
+              continue
+            fi
+            if stage_release_file "${source}" "${name}" \
+               && publish_release_file "${RELEASES_DIR}/incoming/${name}" "${format}" \
+                    "${RUNNER_TEMP}/artifact-${format}"; then
+              published="${published}${published:+ }${format}"
+              echo "published ${name} as format ${format}"
+            else
+              echo "::warning::publishing ${name} (format ${format}) failed; the AppImage release is unaffected and this format can be retried by re-dispatching"
+              failed="${failed}${failed:+ }${format}"
+            fi
+          done
+
+          # The ci_builds row is keyed by (run, platform, arch) and has no format
+          # dimension, so the detail string is the only place the per-format
+          # outcome can show up in /admin. Name both sets explicitly rather than
+          # letting a missing package look like a package nobody asked for.
+          detail="${ARTIFACT_NAME} published to beta; formats: default"
+          [ -n "${published}" ] && detail="${detail} ${published}"
+          [ -n "${failed}" ] && detail="${detail}; NOT published: ${failed}"
+          ci_status published "${detail}"
+          {
+            echo ''
+            echo "* package formats published: \`default${published:+ ${published}}\`"
+            if [ -n "${failed}" ]; then
+              echo "* package formats NOT published: \`${failed}\`"
+            fi
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Report failure to the gateway

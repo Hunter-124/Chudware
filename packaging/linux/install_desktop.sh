@@ -124,3 +124,18 @@ command -v gtk-update-icon-cache   >/dev/null 2>&1 && gtk-update-icon-cache -f -
 
 echo "installed chudware.desktop + icon."
 echo "If you have a pinned taskbar launcher, un-pin and re-pin it (it may cache the old Billet/AI-CAD/aicad2-dev entry)."
+
+# A system-wide install (the .deb/.rpm from packaging/linux/build_linux_packages.sh)
+# writes /usr/share/applications/chudware.desktop with Exec=chudware, resolving through
+# the /usr/bin/chudware -> /opt/chudware/AppRun symlink. XDG_DATA_DIRS puts ~/.local
+# first, so the entry written above SHADOWS the packaged one: the launcher will start
+# this development build, not the installed release. That is usually what a developer
+# wants, which is why it is a note rather than a refusal — but it is also exactly the
+# shape of "I installed the release and the launcher still opens my old build", so say
+# so out loud.
+if [ -f /usr/share/applications/chudware.desktop ]; then
+  echo
+  echo "note: a packaged Chudware is installed system-wide, and this user entry now shadows it."
+  echo "      launcher -> $BIN (this development build)"
+  echo "      to use the installed release instead: rm $APPS/chudware.desktop && update-desktop-database $APPS"
+fi

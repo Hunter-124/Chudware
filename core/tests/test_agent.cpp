@@ -13,6 +13,7 @@
 #include "agent/firm_bid.h"
 #include "agent/iface_plan.h"
 #include "agent/run.h"
+#include "agent/mission.h"
 
 
 using namespace chudware::agent;
@@ -29,6 +30,88 @@ TEST_CASE("sanitize_part_name keeps revision identity in PLM") {
     CHECK(sanitize_part_name(
               "Very/Long:Part*Name?With<Illegal>|Characters_and_more_characters_rev12") ==
           "VeryLongPartNameWithIllegalCharacters_and_more_c");
+}
+
+TEST_CASE("mission mint boundary normalizes model-authored names and paths") {
+    CHECK(mission_mint_name("gear_rev2", "Part") == "gear");
+    CHECK(mission_mint_name("Motor/Gear", "Part") == "MotorGear");
+    CHECK(mission_mint_name("../outside_rev3", "Part") == "..outside");
+    CHECK(mission_mint_name("", "Assembly") == "Assembly");
+
+    const auto root =
+        std::filesystem::temp_directory_path() / "chudware_test_agent_mission_names";
+    const auto output = mission_output_path(root, "../outside_rev3", "Assembly");
+    CHECK(output.filename() == "..outside.step+");
+    CHECK(mission_path_is_beneath(root, output));
+    CHECK(output.parent_path() == std::filesystem::absolute(root).lexically_normal());
+    CHECK(mission_output_path(root, "", "Assembly").filename() == "Assembly.step+");
+}
+
+TEST_CASE("worker workspace emission is absent or an existing directory") {
+    const auto root =
+        std::filesystem::temp_directory_path() / "chudware_test_agent_workspace_emission";
+    const auto missing = root / "missing";
+    std::error_code ec;
+    std::filesystem::remove_all(root, ec);
+
+    json params = json::object();
+    CHECK_FALSE(emit_existing_workspace_dir(params, missing.string()));
+    CHECK_FALSE(params.contains("workspace_dir"));
+
+    std::filesystem::create_directories(root, ec);
+    REQUIRE_FALSE(ec);
+    CHECK(emit_existing_workspace_dir(params, root.string()));
+    REQUIRE(params.contains("workspace_dir"));
+    CHECK(std::filesystem::is_directory(params["workspace_dir"].get<std::string>()));
+
+    std::filesystem::remove_all(root, ec);
+}
+
+TEST_CASE("assembly child acceptance requires success and proven geometry") {
+    const auto success =
+        classify_assembly_child(json{{"status", "done"}, {"stop_reason", "built"}}, true);
+    CHECK(success.accept);
+    CHECK_FALSE(success.cancelled);
+    CHECK(success.failure_reason.empty());
+
+    const auto empty =
+        classify_assembly_child(json{{"status", "done"}, {"stop_reason", "built"}}, false);
+    CHECK_FALSE(empty.accept);
+    CHECK(empty.failure_reason == "no_geometry");
+
+    const auto failed = classify_assembly_child(
+        json{{"status", "failed"}, {"stop_reason", "provider_error"}}, true);
+    CHECK_FALSE(failed.accept);
+    CHECK(failed.failure_reason == "provider_error");
+
+    const auto cancelled = classify_assembly_child(
+        json{{"status", "cancelled"}, {"stop_reason", "cancelled"}}, true);
+    CHECK_FALSE(cancelled.accept);
+    CHECK(cancelled.cancelled);
+
+    const auto mixed = classify_assembly_finish(1, true, "provider_error");
+    CHECK(mixed.status == "partial");
+    CHECK(mixed.stop_reason == "provider_error");
+    CHECK(classify_assembly_finish(2, false, "").status == "done");
+    CHECK(classify_assembly_finish(0, true, "no_geometry").status == "failed");
+}
+
+TEST_CASE("mission rejects planner capabilities without native executors") {
+    CHECK(mission_capability_has_executor("design"));
+    CHECK(mission_capability_has_executor("assembly"));
+    CHECK(mission_capability_has_executor("simulate_flow"));
+    CHECK(mission_capability_has_executor("report"));
+    CHECK(mission_capability_has_executor("reverse_engineer"));
+
+    CHECK_FALSE(mission_capability_has_executor("simulate_fea"));
+    CHECK_FALSE(mission_capability_has_executor("drawing"));
+    CHECK_FALSE(mission_capability_has_executor("evaluate"));
+
+    const auto unavailable = classify_mission_capability("simulate_fea");
+    CHECK_FALSE(unavailable.executable);
+    CHECK(unavailable.stop_reason == "capability_unavailable");
+    CHECK(classify_mission_capability("design").executable);
+    CHECK_FALSE(mission_capability_has_executor("unknown_future_capability"));
 }
 TEST_CASE("base64 standard encoding") {
     CHECK(base64_encode("") == "");

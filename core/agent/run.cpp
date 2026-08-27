@@ -297,20 +297,29 @@ std::string fallback_part_name(const std::string& request) {
 // ----------------------------------------------------------------- file-first persistence
 
 // Where the agent persists the part file it creates BEFORE modeling starts (so
-// version control / PLM sees a real file from the first feature, not only
-// after the run). Resolution order: options.save_dir (host override) →
-// config.json "workspace_dir" (Settings → General workspace folder) → the
-// host's default workspace root (Documents/Chudware when present, else
-// Documents/Chudware — mirrors fs_backend defaultRoot()).
+// version control / PLM sees a real file from the first feature, not only after
+// the run). Explicit caller/configured paths are usable only when they already
+// name a directory. With no explicit workspace, create and validate the
+// product-owned Documents/Chudware default. Returning empty means "absent" and
+// causes the worker RPC to omit workspace_dir.
 std::string agent_workspace_dir(const json& options) {
-    if (options.contains("save_dir") && options["save_dir"].is_string() &&
-        !options["save_dir"].get<std::string>().empty())
-        return options["save_dir"].get<std::string>();
-    json cfg = load_config();
-    if (cfg.is_object() && cfg.contains("workspace_dir") && cfg["workspace_dir"].is_string() &&
-        !cfg["workspace_dir"].get<std::string>().empty())
-        return cfg["workspace_dir"].get<std::string>();
     namespace fs = std::filesystem;
+    auto existing_dir = [](const std::string& value) -> std::string {
+        if (value.empty()) return {};
+        std::error_code ec;
+        const fs::path absolute = fs::absolute(value, ec).lexically_normal();
+        if (ec || !fs::is_directory(absolute, ec) || ec) return {};
+        return absolute.string();
+    };
+    if (options.contains("save_dir") && options["save_dir"].is_string()) {
+        const std::string requested = options["save_dir"].get<std::string>();
+        if (!requested.empty()) return existing_dir(requested);
+    }
+    json cfg = load_config();
+    if (cfg.is_object() && cfg.contains("workspace_dir") && cfg["workspace_dir"].is_string()) {
+        const std::string configured = cfg["workspace_dir"].get<std::string>();
+        if (!configured.empty()) return existing_dir(configured);
+    }
 #ifdef _WIN32
     const char* up = std::getenv("USERPROFILE");
     const fs::path base = up && *up ? fs::path(up) / "Documents" : fs::path();
@@ -318,11 +327,12 @@ std::string agent_workspace_dir(const json& options) {
     const char* home = std::getenv("HOME");
     const fs::path base = home && *home ? fs::path(home) / "Documents" : fs::path();
 #endif
-    if (base.empty()) return std::string();
+    if (base.empty()) return {};
+    const fs::path product_default = base / "Chudware";
     std::error_code ec;
-    const fs::path legacy = base / "Chudware";
-    if (fs::exists(legacy, ec)) return legacy.string();
-    return (base / "Chudware").string();
+    fs::create_directories(product_default, ec);
+    if (ec || !fs::is_directory(product_default, ec) || ec) return {};
+    return fs::absolute(product_default, ec).lexically_normal().string();
 }
 
 // Filename stem from a part name — mirrors the host auto-save rule (app.cpp):
@@ -803,10 +813,10 @@ bool call_admin_worker_turn(const std::string& request, const std::string& run_i
     // omitted rather than sent as "" so the worker's "caller supplied nothing" branch
     // stays distinguishable from "caller supplied a blank".
     json params{{"request", request}, {"run_id", run_id}, {"role", "general_agent"}};
-    // The user's project/workspace dir (agent_workspace_dir(options)): the services worker
-    // jails fs_* on CHUDWARE_FS_ROOT and chdirs here so file work lands in the user's folder
-    // instead of the application install or developer checkout.
-    if (!workspace_dir.empty()) params["workspace_dir"] = workspace_dir;
+    // Invalid/absent workspace configuration is omitted. Python distinguishes
+    // omission from an explicit invalid workspace_dir and rejects the latter
+    // before provider construction.
+    emit_existing_workspace_dir(params, workspace_dir);
     // Bind the services worker's lossless sub-agent raw transcripts to the owning GUI
     // conversation. Empty identity is omitted, matching workspace/history semantics.
     if (!session_id.empty()) params["session_id"] = session_id;
@@ -3320,9 +3330,46 @@ json run_assembly_design(const std::string& request, const std::string& doc_id,
                                 {"assembly", true},
                                 {"part_count", static_cast<int>(parts.size())}});
 
+    // Normalize every planner-authored part title before it enters interface
+    // lookup maps, doc_new payloads, emitted names, or persistence paths.
+    std::vector<std::string> part_names;
+    part_names.reserve(parts.size());
+    for (size_t pi = 0; pi < parts.size(); ++pi) {
+        const auto& p = parts[pi];
+        const std::string raw_name =
+            (p.contains("name") && p["name"].is_string())
+                ? p["name"].get<std::string>()
+                : std::string();
+        part_names.push_back(
+            mission_mint_name(raw_name, "part" + std::to_string(pi + 1)));
+    }
+
     // Interface ledger from the planner plan (interfaces:[{between,kind,seed,holes,...}]).
     // Drives build order (seed before dependent), advisory injection, and pre-assemble verify.
     json plan_j_for_iface = plan.is_null() ? json::object() : json::parse(plan.dump());
+    if (plan_j_for_iface.contains("parts") && plan_j_for_iface["parts"].is_array()) {
+        for (size_t pi = 0; pi < plan_j_for_iface["parts"].size() &&
+                            pi < part_names.size();
+             ++pi) {
+            if (plan_j_for_iface["parts"][pi].is_object())
+                plan_j_for_iface["parts"][pi]["name"] = part_names[pi];
+        }
+    }
+    if (plan_j_for_iface.contains("interfaces") &&
+        plan_j_for_iface["interfaces"].is_array()) {
+        for (auto& iface : plan_j_for_iface["interfaces"]) {
+            if (!iface.is_object()) continue;
+            if (iface.contains("seed") && iface["seed"].is_string())
+                iface["seed"] =
+                    mission_mint_name(iface["seed"].get<std::string>(), "Part");
+            if (iface.contains("between") && iface["between"].is_array()) {
+                for (auto& participant : iface["between"])
+                    if (participant.is_string())
+                        participant =
+                            mission_mint_name(participant.get<std::string>(), "Part");
+            }
+        }
+    }
     InterfaceLedger iface_ledger = parse_interface_ledger(plan_j_for_iface);
     if (!iface_ledger.interfaces.empty()) {
         json iface_arr = json::array();
@@ -3361,6 +3408,7 @@ json run_assembly_design(const std::string& request, const std::string& doc_id,
                     existing_name = tree0["name"].get<std::string>();
             } catch (...) {
             }
+            existing_name = mission_mint_name(existing_name, "existing");
             MeasuredInterface em =
                 measure_interface_from_tree(existing_name, tree_body, bb);
             em.doc_id = doc_id;
@@ -3368,9 +3416,8 @@ json run_assembly_design(const std::string& request, const std::string& doc_id,
             // Also alias under each plan part name that is NOT about to be rebuilt when
             // the request looks like an add-to-assembly (single new part). Heuristic: if
             // planner listed a part matching the existing doc name, bind it.
-            for (const auto& p : parts) {
-                if (!p.is_object() || !p.contains("name") || !p["name"].is_string()) continue;
-                std::string pn = p["name"].get<std::string>();
+            for (size_t pi = 0; pi < parts.size() && pi < part_names.size(); ++pi) {
+                const std::string& pn = part_names[pi];
                 if (iface_norm_name(pn) == iface_norm_name(existing_name))
                     built_ifaces[pn] = em;
             }
@@ -3390,15 +3437,6 @@ json run_assembly_design(const std::string& request, const std::string& doc_id,
         double rot[3];
         size_t plan_index = 0;
     };
-    std::vector<std::string> part_names;
-    part_names.reserve(parts.size());
-    for (size_t pi = 0; pi < parts.size(); ++pi) {
-        const auto& p = parts[pi];
-        std::string name = (p.contains("name") && p["name"].is_string())
-                               ? p["name"].get<std::string>()
-                               : ("part" + std::to_string(pi + 1));
-        part_names.push_back(name);
-    }
     std::vector<size_t> build_order = order_parts_by_interfaces(part_names, iface_ledger);
     if (build_order.size() != part_names.size()) {
         build_order.clear();
@@ -3416,6 +3454,14 @@ json run_assembly_design(const std::string& request, const std::string& doc_id,
     std::map<std::string, std::string> part_reqs;
 
     int built_count = 0;
+    bool any_child_failed = false;
+    bool child_cancelled = false;
+    std::string first_child_failure;
+    auto record_child_failure = [&](const std::string& reason) {
+        any_child_failed = true;
+        if (first_child_failure.empty())
+            first_child_failure = reason.empty() ? "child_failed" : reason;
+    };
     for (size_t oi = 0; oi < build_order.size(); ++oi) {
         // User Stop mid-build: don't start another part. In-flight sub-run HTTP already
         // aborted via the cascaded cancel flag; just stop orchestrating.
@@ -3471,6 +3517,7 @@ json run_assembly_design(const std::string& request, const std::string& doc_id,
         }
 
         std::string child;
+        std::string mint_failure;
         try {
             json nd = doc::doc_new("part", name);
             publish_doc_call("doc_new",
@@ -3478,17 +3525,19 @@ json run_assembly_design(const std::string& request, const std::string& doc_id,
                              nd);
             child = jstr(nd, "doc_id");
         } catch (const std::exception& e) {
-            events.emit("part_skipped",
-                        json{{"index", static_cast<int>(idx)},
-                             {"name", name},
-                             {"reason", e.what()}});
+            mint_failure = e.what();
         } catch (...) {
+            mint_failure = "doc_new failed";
+        }
+        if (child.empty()) {
+            if (mint_failure.empty()) mint_failure = "doc_new failed";
+            record_child_failure(mint_failure);
             events.emit("part_skipped",
                         json{{"index", static_cast<int>(idx)},
                              {"name", name},
-                             {"reason", "doc_new failed"}});
+                             {"reason", mint_failure}});
+            continue;
         }
-        if (child.empty()) continue;
 
         json sub_opts = options;
         sub_opts["run_id"] = run_id + "-p" + std::to_string(idx);
@@ -3504,9 +3553,34 @@ json run_assembly_design(const std::string& request, const std::string& doc_id,
             // Ensure advisor path is on so run_design applies the advisory block.
             if (!sub_opts.contains("advisor")) sub_opts["advisor"] = true;
         }
-        run_design(part_req, child, provider_cfg, emit, sub_opts);
+        const json child_result = run_design(part_req, child, provider_cfg, emit, sub_opts);
+        bool geometry_proven = false;
+        if (child_result.value("status", std::string()) == "done") {
+            try {
+                const json mass = doc::doc_eval_mass(child, -1, 1.0);
+                geometry_proven = mass.value("body_count", 0) > 0;
+            } catch (...) {
+                // No independent body proof means the child is not component-worthy.
+            }
+        }
+        AssemblyChildDecision child_decision =
+            classify_assembly_child(child_result, geometry_proven);
+        if (child_decision.cancelled || run_ctl.cancelled()) {
+            child_cancelled = true;
+            break;
+        }
+        if (!child_decision.accept) {
+            record_child_failure(child_decision.failure_reason);
+            events.emit("part_skipped",
+                        json{{"index", static_cast<int>(idx)},
+                             {"name", name},
+                             {"reason", child_decision.failure_reason},
+                             {"child_status",
+                              child_result.value("status", std::string("failed"))}});
+            continue;
+        }
 
-        // Measure built interface geometry for downstream dependents + verify.
+        // Measure proven interface geometry for downstream dependents + verify.
         try {
             json tree_now = doc::doc_tree(child);
             json tree_body = tree_now.contains("tree") ? tree_now["tree"] : json::object();
@@ -3542,23 +3616,25 @@ json run_assembly_design(const std::string& request, const std::string& doc_id,
             sp.rot[2] = rot[2];
             sp.plan_index = idx;
             saved.push_back(sp);
+            ++built_count;
         } catch (const std::exception& e) {
+            record_child_failure(e.what());
             events.emit("part_skipped",
                         json{{"index", static_cast<int>(idx)},
                              {"name", name},
                              {"reason", e.what()}});
         } catch (...) {
+            record_child_failure("doc_save failed");
             events.emit("part_skipped",
                         json{{"index", static_cast<int>(idx)},
                              {"name", name},
                              {"reason", "doc_save failed"}});
         }
-        ++built_count;
     }
 
     // Stopped by the user: report honestly and skip the (expensive) interface verify +
     // assembly creation. Any parts already built are left as saved .step+ files.
-    if (run_ctl.cancelled()) {
+    if (child_cancelled || run_ctl.cancelled()) {
         events.emit("run_finished", json{{"status", "cancelled"},
                                          {"stop_reason", "cancelled"},
                                          {"revision", 0}});
@@ -3607,7 +3683,31 @@ json run_assembly_design(const std::string& request, const std::string& doc_id,
                                                        : ("Fix interface on part '" + dep + "'");
                 req += "\n\nINTERFACE FIX REQUIRED: match the SEED part's measured interface. "
                        "Do not change the seed.";
-                run_design(req, dit->second, provider_cfg, emit, fix_opts);
+                const json fix_result =
+                    run_design(req, dit->second, provider_cfg, emit, fix_opts);
+                bool fix_geometry_proven = false;
+                if (fix_result.value("status", std::string()) == "done") {
+                    try {
+                        const json mass = doc::doc_eval_mass(dit->second, -1, 1.0);
+                        fix_geometry_proven = mass.value("body_count", 0) > 0;
+                    } catch (...) {
+                    }
+                }
+                const AssemblyChildDecision fix_decision =
+                    classify_assembly_child(fix_result, fix_geometry_proven);
+                if (fix_decision.cancelled || run_ctl.cancelled()) {
+                    child_cancelled = true;
+                    break;
+                }
+                if (!fix_decision.accept) {
+                    record_child_failure(fix_decision.failure_reason);
+                    events.emit("part_skipped",
+                                json{{"name", dep},
+                                     {"reason", fix_decision.failure_reason},
+                                     {"child_status",
+                                      fix_result.value("status", std::string("failed"))}});
+                    continue;
+                }
                 // Re-measure + re-save the fixed dependent.
                 try {
                     json tree_now = doc::doc_tree(dit->second);
@@ -3626,7 +3726,10 @@ json run_assembly_design(const std::string& request, const std::string& doc_id,
                         if (sp.name != dep) continue;
                         try {
                             doc::doc_save(dit->second, sp.path);
+                        } catch (const std::exception& e) {
+                            record_child_failure(e.what());
                         } catch (...) {
+                            record_child_failure("doc_save failed");
                         }
                         break;
                     }
@@ -3639,16 +3742,36 @@ json run_assembly_design(const std::string& request, const std::string& doc_id,
         }
     }
 
+    if (child_cancelled || run_ctl.cancelled()) {
+        events.emit("run_finished", json{{"status", "cancelled"},
+                                         {"stop_reason", "cancelled"},
+                                         {"revision", 0}});
+        return json{{"run_id", run_id},
+                    {"status", "cancelled"},
+                    {"stop_reason", "cancelled"},
+                    {"revision", 0},
+                    {"doc_id", doc_id}};
+    }
+
     if (saved.empty()) {
-        events.emit("run_finished", json{{"status", "failed"},
-                                         {"stop_reason", "no_parts_built"}, {"revision", 0}});
-        return json{{"run_id", run_id}, {"status", "failed"}, {"stop_reason", "no_parts_built"},
-                    {"revision", 0}, {"doc_id", doc_id}};
+        const AssemblyFinish finish =
+            classify_assembly_finish(0, any_child_failed, first_child_failure);
+        events.emit("run_finished", json{{"status", finish.status},
+                                         {"stop_reason", finish.stop_reason},
+                                         {"revision", 0}});
+        return json{{"run_id", run_id},
+                    {"status", finish.status},
+                    {"stop_reason", finish.stop_reason},
+                    {"revision", 0},
+                    {"doc_id", doc_id}};
     }
 
     // 3) Create the assembly doc and insert each saved part as a positioned, fixed component.
-    std::string asm_name = (!plan.is_null() && plan.contains("name") && plan["name"].is_string())
-                               ? plan["name"].get<std::string>() : "Assembly";
+    const std::string raw_asm_name =
+        (!plan.is_null() && plan.contains("name") && plan["name"].is_string())
+            ? plan["name"].get<std::string>()
+            : std::string();
+    const std::string asm_name = mission_mint_name(raw_asm_name, "Assembly");
     std::string asm_id;
     try {
         json nd = doc::doc_new("assembly", asm_name);
@@ -3664,8 +3787,12 @@ json run_assembly_design(const std::string& request, const std::string& doc_id,
     if (asm_id.empty()) {
         events.emit("run_finished", json{{"status", "failed"},
                                          {"stop_reason", "assembly_doc_failed"}, {"revision", 0}});
-        return json{{"run_id", run_id}, {"status", "failed"}, {"stop_reason", "assembly_doc_failed"},
-                    {"revision", 0}, {"doc_id", doc_id}};
+        return json{{"run_id", run_id},
+                    {"status", "failed"},
+                    {"stop_reason", "assembly_doc_failed"},
+                    {"first_fail_reason", first_child_failure},
+                    {"revision", 0},
+                    {"doc_id", doc_id}};
     }
     // 4x4 row-major component transform = R(rot)·... + translation. Rotation is Euler degrees
     // applied X then Y then Z (R = Rz·Ry·Rx), matching the placement.rot the planner emits.
@@ -3699,8 +3826,23 @@ json run_assembly_design(const std::string& request, const std::string& doc_id,
     // the Python worker — exactly the File>Open / Explorer-double-click path. Components are
     // referenced by absolute .step+ paths (saved above under the same run_dir), so the loaded
     // assembly resolves its parts regardless of the host's cwd.
-    std::string asm_path =
-        std::filesystem::absolute(run_dir(run_id) / (asm_name + ".step+")).string();
+    const std::filesystem::path asm_output =
+        mission_output_path(run_dir(run_id), asm_name, "Assembly");
+    if (asm_output.empty() ||
+        !mission_path_is_beneath(run_dir(run_id), asm_output)) {
+        events.emit("run_finished", json{{"status", "failed"},
+                                         {"stop_reason", "invalid_assembly_path"},
+                                         {"revision", 0}});
+        return json{{"run_id", run_id},
+                    {"status", "failed"},
+                    {"stop_reason", "invalid_assembly_path"},
+                    {"revision", 0},
+                    {"doc_id", asm_id},
+                    {"created_doc", true},
+                    {"assembly", true},
+                    {"first_fail_reason", first_child_failure}};
+    }
+    const std::string asm_path = asm_output.string();
     try {
         json before = doc::doc_tree(asm_id);
         const int base_revision = before.value("revision", 0);
@@ -3717,25 +3859,40 @@ json run_assembly_design(const std::string& request, const std::string& doc_id,
         events.emit("run_finished", json{{"status", "failed"},
                                          {"stop_reason", std::string("assemble_failed: ") + e.what()},
                                          {"revision", 0}});
-        return json{{"run_id", run_id}, {"status", "failed"},
-                    {"stop_reason", "assemble_failed"}, {"revision", 0}, {"doc_id", asm_id},
-                    {"created_doc", true}, {"assembly", true}};
+        return json{{"run_id", run_id},
+                    {"status", "failed"},
+                    {"stop_reason", "assemble_failed"},
+                    {"first_fail_reason", first_child_failure},
+                    {"revision", 0},
+                    {"doc_id", asm_id},
+                    {"created_doc", true},
+                    {"assembly", true}};
     }
 
-    events.emit("run_finished", json{{"status", "done"},
-                                     {"stop_reason", "assembled"},
+    const AssemblyFinish finish = classify_assembly_finish(
+        static_cast<int>(saved.size()), any_child_failed, first_child_failure);
+    events.emit("run_finished", json{{"status", finish.status},
+                                     {"stop_reason", finish.stop_reason},
                                      {"revision", asm_rev},
                                      {"components", static_cast<int>(saved.size())}});
-    return json{{"run_id", run_id}, {"status", "done"}, {"stop_reason", "assembled"},
-                {"revision", asm_rev}, {"doc_id", asm_id}, {"created_doc", true},
-                {"assembly", true}, {"asm_path", asm_path},
+    json result{{"run_id", run_id},
+                {"status", finish.status},
+                {"stop_reason", finish.stop_reason},
+                {"revision", asm_rev},
+                {"doc_id", asm_id},
+                {"created_doc", true},
+                {"assembly", true},
+                {"asm_path", asm_path},
                 {"components", static_cast<int>(saved.size())}};
+    if (!first_child_failure.empty())
+        result["first_fail_reason"] = first_child_failure;
+    return result;
 }
 
 // ============================================================================ mission
-// The closed set of capabilities the mission planner may emit. design/assembly both map
-// to run_assembly_design (it auto-detects assembly from its own planner); the rest map to
-// the noted backends. Anything outside this set is skipped (forward-compatible).
+// The closed planner/storage vocabulary. It intentionally includes capabilities
+// without native executors so approved plans remain parseable; the acceptance
+// gate below rejects those plans with capability_unavailable before execution.
 namespace {
 
 // One human + deterministic line per flow result, plus a qualitative read. Kept honest:
@@ -4129,6 +4286,50 @@ json run_mission(const std::string& request, const std::string& doc_id, const js
         }
     }
 
+    // Plan-acceptance capability gate. Stored plans keep the full planner
+    // vocabulary, but a task with no native executor must terminate here,
+    // before mission_started, per-task provider resolution, or any mutation.
+    for (const auto& tk : tasks) {
+        // Draft plans may advertise the full vocabulary for user review. Once
+        // a plan is approved, plan_only must not bypass executor validation.
+        if (plan_only && !has_approved_plan) continue;
+        const MissionCapabilityDecision capability =
+            classify_mission_capability(tk.capability);
+        if (capability.executable) continue;
+        json refused_tasks = json::array();
+        for (const auto& planned : tasks) {
+            const bool unavailable = planned.id == tk.id;
+            refused_tasks.push_back(
+                json{{"capability", planned.capability},
+                     {"title", planned.title},
+                     {"id", planned.id},
+                     {"status", unavailable ? "failed" : "pending"},
+                     {"doc_id", doc_id},
+                     {"summary", unavailable ? capability.stop_reason : ""}});
+        }
+        events.emit("mission_finished",
+                    json{{"status", "failed"},
+                         {"stop_reason", capability.stop_reason},
+                         {"capability", tk.capability},
+                         {"execution_style", execution_style},
+                         {"tasks_completed", 0},
+                         {"tasks_failed", 1},
+                         {"tasks_abandoned", 0}});
+        return json{{"run_id", run_id},
+                    {"status", "failed"},
+                    {"stop_reason", capability.stop_reason},
+                    {"capability", tk.capability},
+                    {"error_detail",
+                     "Mission capability '" + tk.capability +
+                         "' has no native executor in this build."},
+                    {"execution_style", execution_style},
+                    {"doc_id", doc_id},
+                    {"revision", 0},
+                    {"tasks", refused_tasks},
+                    {"tasks_completed", 0},
+                    {"tasks_failed", 1},
+                    {"tasks_abandoned", 0}};
+    }
     // Manual plan_only on mission: return plan_ready for the host.
     if (plan_only) {
         if (mission_plan_obj.is_null() || !mission_plan_obj.is_object()) {
@@ -4163,6 +4364,7 @@ json run_mission(const std::string& request, const std::string& doc_id, const js
                     {"revision", 0},
                     {"tasks", task_list}};
     }
+
 
     json task_list = json::array();
     for (const auto& tk : tasks)
@@ -4602,7 +4804,10 @@ json run_mission(const std::string& request, const std::string& doc_id, const js
             }
             final_doc = current_doc;
             revision = rr.value("revision", revision);
-            if (status == "done") {
+            // A partial assembly still produced a proven, persisted assembly
+            // document; retain that fact so the mission terminal is partial
+            // rather than collapsing the mixed outcome to failed.
+            if (status == "done" || (status == "partial" && created_doc && components > 0)) {
                 any_built = true;
                 design_summary = doc_design_summary(current_doc);
                 // Record measured interface for later dependent units.

@@ -20,8 +20,10 @@
 // ever attached. The parity gate neutralizes the Python side to match.
 #pragma once
 
+#include <filesystem>
 #include <functional>
 #include <string>
+#include <system_error>
 
 #include <nlohmann/json.hpp>
 
@@ -43,6 +45,97 @@ void set_doc_publish_sink(DocPublishFn sink);
 
 // Pure filename/display-title normalization used by the mission naming lane.
 std::string sanitize_part_name(std::string name);
+
+// Mission names are model-authored and therefore cross both a document-mint and
+// filesystem boundary. This is the single boundary helper used by the assembly
+// lane: normalize the model value first, then a deterministic caller-owned
+// fallback, and never allow an empty title through to doc_new or a path.
+inline std::string mission_mint_name(const std::string& model_name,
+                                     const std::string& fallback) {
+    std::string out = sanitize_part_name(model_name);
+    if (out.empty()) out = sanitize_part_name(fallback);
+    return out.empty() ? std::string("Part") : out;
+}
+
+inline bool mission_path_is_beneath(const std::filesystem::path& root,
+                                    const std::filesystem::path& candidate) {
+    std::error_code ec;
+    const auto abs_root = std::filesystem::absolute(root, ec).lexically_normal();
+    if (ec || abs_root.empty()) return false;
+    const auto abs_candidate = std::filesystem::absolute(candidate, ec).lexically_normal();
+    if (ec || abs_candidate.empty()) return false;
+    const auto rel = abs_candidate.lexically_relative(abs_root);
+    if (rel.empty() || rel.is_absolute()) return false;
+    const auto first = rel.begin();
+    return first != rel.end() && *first != "..";
+}
+
+inline std::filesystem::path mission_output_path(const std::filesystem::path& run_root,
+                                                 const std::string& model_name,
+                                                 const std::string& fallback = "Assembly") {
+    std::error_code ec;
+    const auto abs_root = std::filesystem::absolute(run_root, ec).lexically_normal();
+    if (ec || abs_root.empty()) return {};
+    auto candidate =
+        (abs_root / (mission_mint_name(model_name, fallback) + ".step+")).lexically_normal();
+    if (!mission_path_is_beneath(abs_root, candidate))
+        candidate = (abs_root / (mission_mint_name("", fallback) + ".step+")).lexically_normal();
+    return mission_path_is_beneath(abs_root, candidate) ? candidate : std::filesystem::path();
+}
+
+// Add workspace_dir to a worker RPC only when the exact directory is usable.
+// Missing configuration and an invalid explicit path must remain distinguishable:
+// both omit the key instead of forwarding a path Python will reject.
+inline bool emit_existing_workspace_dir(json& params, const std::string& candidate) {
+    if (candidate.empty()) return false;
+    std::error_code ec;
+    const auto absolute = std::filesystem::absolute(candidate, ec).lexically_normal();
+    if (ec || !std::filesystem::is_directory(absolute, ec) || ec) return false;
+    params["workspace_dir"] = absolute.string();
+    return true;
+}
+
+struct AssemblyChildDecision {
+    bool accept = false;
+    bool cancelled = false;
+    std::string failure_reason;
+};
+
+// A child is component-worthy only when its terminal result says it completed
+// and the live document independently proves at least one body.
+inline AssemblyChildDecision classify_assembly_child(const json& child_result,
+                                                      bool geometry_proven) {
+    if (!child_result.is_object())
+        return {false, false, "child_result_invalid"};
+    const std::string status = child_result.value("status", std::string());
+    const std::string stop = child_result.value("stop_reason", std::string());
+    if (status == "cancelled" || stop == "cancelled")
+        return {false, true, "cancelled"};
+    if (status == "done" && geometry_proven)
+        return {true, false, {}};
+    if (status == "done")
+        return {false, false, "no_geometry"};
+    if (!stop.empty())
+        return {false, false, stop};
+    if (!status.empty())
+        return {false, false, status};
+    return {false, false, "child_failed"};
+}
+
+struct AssemblyFinish {
+    std::string status;
+    std::string stop_reason;
+};
+
+inline AssemblyFinish classify_assembly_finish(int accepted_components, bool any_child_failed,
+                                               const std::string& first_failure,
+                                               bool cancelled = false) {
+    if (cancelled) return {"cancelled", "cancelled"};
+    if (accepted_components > 0 && any_child_failed)
+        return {"partial", first_failure.empty() ? "child_failed" : first_failure};
+    if (accepted_components > 0) return {"done", "assembled"};
+    return {"failed", first_failure.empty() ? "no_parts_built" : first_failure};
+}
 // Extract the optional web billing actor without manufacturing one for trusted
 // desktop/BYOK turns. Missing must remain JSON null so the worker omits the field.
 json worker_actor_from_options(const json& options);
@@ -101,12 +194,14 @@ struct WorkerStop {
 };
 WorkerStop classify_worker_stop(bool crashed, bool timed_out, bool reached_worker);
 
-// run_assembly_design — multi-part TRUE assembly. Plans the request; if the plan is a single part
-// (or assembly:false) it delegates to run_design on `doc_id` (unchanged behavior). Otherwise it
-// builds each part in its OWN child doc (run_design per part), saves each to a .step+ file under
-// run_dir, creates an ASSEMBLY doc, and inserts each part as a positioned component (transform from
-// the planner's placement; no constraint mates). Returns the run result for the ASSEMBLY doc with
-// {created_doc:true, assembly:true, doc_id:<asm>} so the host can open it as a new tab.
+// run_assembly_design — multi-part TRUE assembly. Plans the request; if the plan
+// is a single part (or assembly:false) it delegates to run_design on `doc_id`.
+// Otherwise it builds each part in its own child doc, but accepts a component
+// only after status=done and an independent live-body proof. It saves accepted
+// parts under run_dir, creates an assembly doc, and inserts each part at the
+// planner's transform. Mixed accepted and failed children return status=partial
+// with the first child failure preserved. A created assembly returns
+// {created_doc:true, assembly:true, doc_id:<asm>} so the host can open it.
 json run_assembly_design(const std::string& request, const std::string& doc_id,
                          const json& provider_cfg, EmitFn emit = nullptr,
                          const json& options = json::object());

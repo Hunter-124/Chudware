@@ -2,16 +2,16 @@
 //
 // run_mission() sits ONE level above run_design / run_assembly_design. Where those
 // build a single part (or one assembly) from a request, the mission layer decomposes a
-// request into an ORDERED list of high-level capability tasks
+// request into an ORDERED list of high-level capability tasks. The planner
+// vocabulary remains
 //   {design | assembly | simulate_flow | simulate_fea | drawing | evaluate | report}
-// and runs them in sequence, threading the working document forward (so a wind-tunnel
-// task simulates the geometry an earlier design/assembly task produced). A final report
-// task turns measured results into a plain-language verdict ("is this a good design?").
-//
-// This is what lets one chat message express a whole workflow — e.g. "model an airplane,
-// then run CFD and prove it's a good design" — instead of the old one-capability-per-
-// message routing. It is domain-general: "design a bracket and FEA it at 200 N" works the
-// same way.
+// for compatibility with stored/approved plans, but only capabilities with a
+// native executor may cross the execution boundary. Plans containing
+// simulate_fea, drawing, or evaluate currently terminate before execution with
+// stop_reason="capability_unavailable"; they are never counted as skipped work.
+// Executable tasks thread the working document forward (so a wind-tunnel task
+// simulates the geometry an earlier design/assembly task produced). A final
+// report task turns measured results into a plain-language verdict.
 //
 // The body lives in run.cpp so it can reuse that TU's file-local helpers (make_provider,
 // agent_call, extract_json_obj, call_budget_for). The simulate_flow capability is supplied
@@ -21,6 +21,7 @@
 
 #include <functional>
 #include <string>
+#include <string_view>
 
 #include <nlohmann/json.hpp>
 
@@ -38,6 +39,25 @@ using nlohmann::json;
 // then resolves to status "skipped".
 using SimFn = std::function<json(const std::string& doc_id, const std::string& request,
                                  const json& params)>;
+
+// Keep the accepted planner vocabulary separate from executable truth. Stored
+// plans may still contain the unavailable values; run_mission uses this helper
+// at plan acceptance, before emitting mission_started or spending task budget.
+inline bool mission_capability_has_executor(std::string_view capability) {
+    return capability == "design" || capability == "assembly" ||
+           capability == "simulate_flow" || capability == "report" ||
+           capability == "reverse_engineer";
+}
+
+struct MissionCapabilityDecision {
+    bool executable;
+    std::string stop_reason;
+};
+
+inline MissionCapabilityDecision classify_mission_capability(std::string_view capability) {
+    if (mission_capability_has_executor(capability)) return {true, {}};
+    return {false, "capability_unavailable"};
+}
 
 // run_mission — decompose `request` into an ordered task list (one mission_planner LLM
 // call), execute each task threading the working doc forward, and synthesize a verdict.

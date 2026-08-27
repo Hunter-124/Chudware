@@ -744,6 +744,8 @@ bool WorkerClient::start(std::string &err, const std::string &module) {
   childStdoutRd_ = outRd;
   childStdinWr_ = inWr;
   running_ = true;
+  workerModule_ = module;
+  poisoned_ = false;
   return true;
 #else
   // POSIX: outPipe = child stdout -> parent; inPipe = parent -> child stdin.
@@ -792,6 +794,8 @@ bool WorkerClient::start(std::string &err, const std::string &module) {
   childStdoutRd_ = outPipe[0];
   childStdinWr_ = inPipe[1];
   running_ = true;
+  workerModule_ = module;
+  poisoned_ = false;
   return true;
 #endif // _WIN32
 #endif // __EMSCRIPTEN__
@@ -851,6 +855,120 @@ void WorkerClient::stop() {
   }
 #endif
   running_ = false;
+  poisoned_ = false;
+}
+
+bool WorkerClient::terminatePoisonedWorker(std::string &err) {
+  bool terminated = true;
+#ifdef __EMSCRIPTEN__
+  running_ = false;
+#elif defined(_WIN32)
+  // A timed-out request may still be mutating state. Do not enqueue the normal
+  // graceful shutdown behind it: break the poisoned stream and terminate now.
+  if (childStdinWr_) {
+    CloseHandle(childStdinWr_);
+    childStdinWr_ = nullptr;
+  }
+  if (process_) {
+    if (WaitForSingleObject(process_, 0) != WAIT_OBJECT_0) {
+      if (!TerminateProcess(process_, 1)) {
+        err = "could not terminate timed-out worker (" +
+              win32Error(GetLastError()) + ")";
+        terminated = false;
+      } else if (WaitForSingleObject(process_, 2000) != WAIT_OBJECT_0) {
+        err = "timed-out worker did not terminate within 2 seconds";
+        terminated = false;
+      }
+    }
+    if (terminated) {
+      CloseHandle(process_);
+      process_ = nullptr;
+    }
+  }
+  if (childStdoutRd_) {
+    CloseHandle(childStdoutRd_);
+    childStdoutRd_ = nullptr;
+  }
+#else
+  // Closing stdin prevents another request from entering the poisoned stream.
+  // SIGTERM normally stops the Python worker immediately; bound that wait and
+  // escalate so a stuck handler cannot outlive its timed-out caller.
+  if (childStdinWr_ >= 0) {
+    ::close(childStdinWr_);
+    childStdinWr_ = -1;
+  }
+  if (process_ >= 0) {
+    bool reaped = false;
+    if (::kill(process_, SIGTERM) != 0 && errno != ESRCH) {
+      err = std::string("could not terminate timed-out worker: ") +
+            std::strerror(errno);
+      terminated = false;
+    }
+    if (terminated) {
+      for (int i = 0; i < 25; ++i) {
+        int status = 0;
+        pid_t r = waitpid(process_, &status, WNOHANG);
+        if (r == process_ || (r < 0 && errno == ECHILD)) {
+          reaped = true;
+          break;
+        }
+        if (r < 0 && errno != EINTR) {
+          err = std::string("could not reap timed-out worker: ") +
+                std::strerror(errno);
+          terminated = false;
+          break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+      }
+    }
+    if (terminated && !reaped) {
+      if (::kill(process_, SIGKILL) != 0 && errno != ESRCH) {
+        err = std::string("could not kill timed-out worker: ") +
+              std::strerror(errno);
+        terminated = false;
+      } else {
+        for (;;) {
+          pid_t r = waitpid(process_, nullptr, 0);
+          if (r == process_ || (r < 0 && errno == ECHILD)) {
+            reaped = true;
+            break;
+          }
+          if (r < 0 && errno == EINTR)
+            continue;
+          err = std::string("could not reap killed worker: ") +
+                std::strerror(errno);
+          terminated = false;
+          break;
+        }
+      }
+    }
+    if (terminated && reaped)
+      process_ = -1;
+  }
+  if (childStdoutRd_ >= 0) {
+    ::close(childStdoutRd_);
+    childStdoutRd_ = -1;
+  }
+#endif
+  readBuf_.clear();
+  running_ = false;
+  return terminated;
+}
+
+bool WorkerClient::restartPoisonedWorker(std::string &err) {
+  if (!poisoned_)
+    return true;
+  if (!terminatePoisonedWorker(err))
+    return false;
+  if (abort_.load()) {
+    err = "aborted";
+    return false;
+  }
+  const std::string module = workerModule_;
+  if (!start(err, module))
+    return false;
+  poisoned_ = false;
+  return true;
 }
 
 void WorkerClient::abortPending() {
@@ -868,35 +986,36 @@ void WorkerClient::abortPending() {
   }
 }
 
-bool WorkerClient::readLine(std::string &line, int timeoutMs) {
+WorkerClient::ReadLineResult WorkerClient::readLine(std::string &line,
+                                                    int timeoutMs) {
 #ifdef __EMSCRIPTEN__
   (void)line;
   (void)timeoutMs;
-  return false;
+  return ReadLineResult::Closed;
 #elif defined(_WIN32)
   ULONGLONG start = GetTickCount64();
   for (;;) {
     if (abort_.load())
-      return false; // C39: teardown — stop polling immediately
+      return ReadLineResult::Closed; // C39: teardown — stop polling immediately
     size_t nl = readBuf_.find('\n');
     if (nl != std::string::npos) {
       line = readBuf_.substr(0, nl);
       readBuf_.erase(0, nl + 1);
-      return true;
+      return ReadLineResult::Line;
     }
     if ((int)(GetTickCount64() - start) > timeoutMs)
-      return false;
+      return ReadLineResult::Timeout;
 
     DWORD avail = 0;
     if (!PeekNamedPipe(childStdoutRd_, nullptr, 0, nullptr, &avail, nullptr))
-      return false;
+      return ReadLineResult::Closed;
     if (avail == 0) {
       if (WaitForSingleObject(process_, 0) == WAIT_OBJECT_0) {
         // process exited; drain whatever is buffered one last time
         if (!PeekNamedPipe(childStdoutRd_, nullptr, 0, nullptr, &avail,
                            nullptr) ||
             avail == 0)
-          return false;
+          return ReadLineResult::Closed;
       } else {
         // W1-B (item 11): tighter poll. For the first ~2ms after the request
         // was written, yield with Sleep(0) (no enforced minimum sleep) so a
@@ -916,25 +1035,25 @@ bool WorkerClient::readLine(std::string &line, int timeoutMs) {
     DWORD got = 0;
     if (!ReadFile(childStdoutRd_, chunk.data(), avail, &got, nullptr) ||
         got == 0)
-      return false;
+      return ReadLineResult::Closed;
     readBuf_.append(chunk.data(), got);
   }
 #else
   auto start = std::chrono::steady_clock::now();
   for (;;) {
     if (abort_.load())
-      return false; // C39: teardown — stop polling immediately
+      return ReadLineResult::Closed; // C39: teardown — stop polling immediately
     size_t nl = readBuf_.find('\n');
     if (nl != std::string::npos) {
       line = readBuf_.substr(0, nl);
       readBuf_.erase(0, nl + 1);
-      return true;
+      return ReadLineResult::Line;
     }
     auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
                        std::chrono::steady_clock::now() - start)
                        .count();
     if ((int)elapsed > timeoutMs)
-      return false;
+      return ReadLineResult::Timeout;
 
     struct pollfd pfd;
     pfd.fd = childStdoutRd_;
@@ -945,7 +1064,7 @@ bool WorkerClient::readLine(std::string &line, int timeoutMs) {
     if (pr < 0) {
       if (errno == EINTR)
         continue;
-      return false;
+      return ReadLineResult::Closed;
     }
     if (pr == 0) { // no data this tick — detect a child exit, else keep polling
       int status = 0;
@@ -959,7 +1078,7 @@ bool WorkerClient::readLine(std::string &line, int timeoutMs) {
           readBuf_.append(chunk, (size_t)got);
           continue;
         }
-        return false;
+        return ReadLineResult::Closed;
       }
       continue;
     }
@@ -968,9 +1087,9 @@ bool WorkerClient::readLine(std::string &line, int timeoutMs) {
     if (got > 0) {
       readBuf_.append(chunk, (size_t)got);
     } else if (got == 0) {
-      return false; // EOF: pipe closed
+      return ReadLineResult::Closed; // EOF: pipe closed
     } else if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
-      return false;
+      return ReadLineResult::Closed;
     }
   }
 #endif // platform
@@ -1624,6 +1743,15 @@ bool WorkerClient::callImpl(const std::string &method, const json &params,
     }
   }
 #endif
+  if (poisoned_) {
+    std::string restartErr;
+    if (!restartPoisonedWorker(restartErr)) {
+      err = "worker restart after timeout failed: " + restartErr;
+      if (errorSink_)
+        errorSink_(method, err);
+      return false;
+    }
+  }
   if (!running_) {
     err = "worker not started";
     if (errorSink_)
@@ -1648,12 +1776,33 @@ bool WorkerClient::callImpl(const std::string &method, const json &params,
   }
   for (;;) {
     std::string resp;
-    if (!readLine(resp, timeoutMs)) {
+    const ReadLineResult readStatus = readLine(resp, timeoutMs);
+    if (readStatus != ReadLineResult::Line) {
       if (abort_.load()) { // C39: teardown abort, not a worker failure
         err = "aborted";
         return false;
       }
       err = "timeout/closed waiting for response";
+      if (readStatus == ReadLineResult::Timeout) {
+        poisoned_ = true;
+        std::fprintf(
+            stderr,
+            "worker request %d (%s) exceeded the local-pipe timeout; "
+            "connection poisoned, discarding any late result and restarting "
+            "before the next request\n",
+            id, method.c_str());
+        std::string restartErr;
+        if (restartPoisonedWorker(restartErr)) {
+          std::fprintf(stderr,
+                       "worker restarted on a fresh local-pipe stream after "
+                       "timed-out request %d\n",
+                       id);
+        } else {
+          std::fprintf(stderr,
+                       "worker restart after timed-out request %d failed: %s\n",
+                       id, restartErr.c_str());
+        }
+      }
       if (errorSink_)
         errorSink_(method, err); // W1-B
       return false;

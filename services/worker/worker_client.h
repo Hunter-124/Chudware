@@ -78,7 +78,10 @@ private:
                            nlohmann::json& result, std::string& err, int timeoutMs,
                            const EventFn& onEvent);
 
-    bool readLine(std::string& line, int timeoutMs);
+    enum class ReadLineResult { Line, Timeout, Closed };
+    ReadLineResult readLine(std::string& line, int timeoutMs);
+    bool terminatePoisonedWorker(std::string& err);
+    bool restartPoisonedWorker(std::string& err);
 
 #ifdef _WIN32
     void* childStdinWr_ = nullptr;   // HANDLE
@@ -92,6 +95,8 @@ private:
     std::string readBuf_;
     int nextId_ = 1;
     bool running_ = false;
+    std::string workerModule_ = "services.worker_main";
+    bool poisoned_ = false;
     std::mutex callMtx_;             // serialize concurrent call()s
     ErrorSink errorSink_;            // W1-B: transport-error notification (optional)
     std::atomic<bool> abort_{false}; // C39: teardown abort (one-way; see abortPending)

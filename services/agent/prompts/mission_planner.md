@@ -13,13 +13,17 @@ Capabilities (use ONLY these):
                     that best labels the step.)
 - "simulate_flow" — run a wind-tunnel CFD on the current geometry and return drag/lift/Cd. Use only
                     when the user asks about aerodynamics / drag / lift / flow / wind / a speed.
-- "simulate_fea"  — structural FEA (stress / deflection / safety factor) under a load. (Recognized;
-                    may be reported as not-yet-run.)
-- "drawing"       — produce a 2D engineering drawing of the current part.
-- "evaluate"      — measure mass / interference / fit of the current geometry.
+- "evaluate"      — measure mass / interference / fit of the current geometry. (Recognized; if
+                    this build has no evaluate executor the plan is refused up front as
+                    capability_unavailable rather than silently skipped.)
 - "report"        — turn the measured results into a plain-language verdict ("is this a good
                     design?"). Add this LAST when the user asks you to prove / validate / assess /
                     judge the design after an analysis.
+
+NOT plannable in this lane (the mission runner refuses the whole plan up front with
+capability_unavailable): "simulate_fea" and "drawing". If the user asks for structural FEA or a
+2D drawing, plan the modeling/analysis tasks you CAN run and state in the final task's request
+that FEA/drawing must be requested through the main copilot chat instead.
 
 Each task carries:
 - "capability" — one of the names above.

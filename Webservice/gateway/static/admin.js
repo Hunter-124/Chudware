@@ -33,8 +33,14 @@
     return d.innerHTML;
   }
 
-  /* ---- tab shell: hash-routed panels (Dashboard/Releases/Accounts/Terminal/System) ---- */
-  var TABS = ["dashboard", "releases", "accounts", "terminal", "system"];
+  /* ---- tab shell: hash-routed panels ----
+     Dashboard/Releases/Accounts/Billing/Marketplace/Terminal/System.
+     Billing and Marketplace render into a bare mount div from
+     admin_billing.js / admin_marketplace.js; they need no loader hook here
+     because each of those files self-initialises on its own mount id. This
+     array only has to contain them so showTab() recognises the hash and
+     toggles the panel -- a tab missing from it renders as a dead nav link. */
+  var TABS = ["dashboard", "releases", "accounts", "billing", "marketplace", "terminal", "system"];
   var shellEl = document.querySelector(".admin-shell");
   var tabLinks = Array.prototype.slice.call(document.querySelectorAll(".admin-tab"));
   var currentTab = null;

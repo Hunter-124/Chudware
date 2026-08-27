@@ -86,6 +86,41 @@ except ImportError:
     from portal_api import router as portal_api_router
     from portal_serve import router as portal_serve_router
 
+# Marketplace. Eight routers across six modules, and the split is deliberate
+# rather than incidental: three of them share the /api/studio prefix because the
+# seller studio is one surface assembled from three concerns (listings, money,
+# third-party import) that must not know about each other's internals. FastAPI
+# resolves them as one flat table, so the paths within each are disjoint by
+# design and the registration order below does not matter.
+#
+# Every route refuses with 404 when CHUDWARE_MARKETPLACE_ENABLED is unset, via
+# marketplace_authz.marketplace_enabled_or_404 — so registering them on a
+# deployment that does not sell anything costs a route-table entry and nothing
+# else. That is why they are imported unconditionally rather than behind an
+# `if settings.marketplace_enabled`: a conditional import makes the route table
+# depend on environment, which turns "the endpoint 404s" into two
+# indistinguishable causes.
+try:
+    from .marketplace import router as marketplace_router, studio_router as marketplace_studio_router
+    from .marketplace_commerce import (
+        router as commerce_router,
+        studio_router as commerce_studio_router,
+    )
+    from .marketplace_sources import router as marketplace_sources_router
+    from .marketplace_render import router as marketplace_render_router
+    from .admin_billing import router as admin_billing_router
+    from .admin_marketplace import router as admin_marketplace_router
+except ImportError:
+    from marketplace import router as marketplace_router, studio_router as marketplace_studio_router  # type: ignore
+    from marketplace_commerce import (  # type: ignore
+        router as commerce_router,
+        studio_router as commerce_studio_router,
+    )
+    from marketplace_sources import router as marketplace_sources_router  # type: ignore
+    from marketplace_render import router as marketplace_render_router  # type: ignore
+    from admin_billing import router as admin_billing_router  # type: ignore
+    from admin_marketplace import router as admin_marketplace_router  # type: ignore
+
 settings.ensure_data_dirs()
 
 app = FastAPI(title="chudware-web", version="1.0.0")
@@ -469,6 +504,17 @@ app.include_router(entitlement_router)
 app.include_router(security_router)
 app.include_router(appeals_router)
 app.include_router(metrics_router)
+# Marketplace, before portal_serve. portal_serve owns the catch-all "/" route,
+# so anything registered after it is shadowed — that is why it is last in this
+# list and why these go above it rather than at the end.
+app.include_router(marketplace_router)
+app.include_router(commerce_router)
+app.include_router(marketplace_studio_router)
+app.include_router(commerce_studio_router)
+app.include_router(marketplace_sources_router)
+app.include_router(marketplace_render_router)
+app.include_router(admin_billing_router)
+app.include_router(admin_marketplace_router)
 app.include_router(portal_api_router)
 app.include_router(portal_serve_router)
 

@@ -21,18 +21,47 @@ import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Mapping, Protocol
+from urllib.parse import urlencode
 
 import httpx
 
 API_BASE = "https://api.stripe.com"
 TAX_CODE = "txcd_10103001"
-WEBHOOK_EVENTS = [
+# Subscription and credit-pack lifecycle. billing.py's `_apply_event` switches on
+# exactly these.
+SUBSCRIPTION_EVENTS = [
     "checkout.session.completed",
     "customer.subscription.updated",
     "customer.subscription.deleted",
     "invoice.paid",
     "invoice.payment_failed",
 ]
+
+# Marketplace settlement, handled by marketplace_commerce.handle_marketplace_event
+# which billing.py's single verified endpoint delegates to. These are listed
+# separately from SUBSCRIPTION_EVENTS purely for readability — Stripe takes one
+# flat list per endpoint, which is what WEBHOOK_EVENTS below is.
+#
+# `checkout.session.completed` is deliberately NOT repeated here: it is already in
+# SUBSCRIPTION_EVENTS and Stripe rejects a duplicate entry in `enabled_events`.
+# The two consumers are told apart by `metadata.chud_kind`, not by event type.
+MARKETPLACE_EVENTS = [
+    # A buyer abandoned a marketplace checkout; the pending order must not sit
+    # forever holding the one-purchase-per-buyer unique index.
+    "checkout.session.expired",
+    # A destination charge that failed after the session completed.
+    "payment_intent.payment_failed",
+    # A refund revokes the buyer's entitlement. Without this the money goes back
+    # and the download does not.
+    "charge.refunded",
+    # A seller's Connect account changed capability. The cached
+    # mk_sellers.connect_* columns are how the buy button decides whether cash is
+    # accepted, so a restriction we never hear about sells something we cannot
+    # settle.
+    "account.updated",
+]
+
+WEBHOOK_EVENTS = SUBSCRIPTION_EVENTS + MARKETPLACE_EVENTS
 
 # Source of truth for both provisioning and STRIPE_CATALOG.md. Do not duplicate
 # catalog values in imperative code or prose; regenerate the operator record with
@@ -80,6 +109,16 @@ CATALOG_SPEC: dict[str, Any] = {
         },
     ],
     "prices": [
+        # ``portal_switchable`` controls whether the Customer Portal offers this
+        # price as a self-service plan change. Stripe requires the prices listed
+        # for one product in a portal configuration to have DISTINCT billing
+        # intervals, and each product here has both a standard and an .edu price
+        # at the same monthly interval — listing both fails configuration
+        # creation with "For each product, its price must have unique billing
+        # intervals". Excluding the .edu prices is also the correct product
+        # behaviour independently of that: .edu eligibility is decided
+        # server-side from the account's verified domain, so it must never be a
+        # radio button a customer can select for themselves.
         {
             "lookup_key": "chud_desktop_monthly",
             "product": "chud_desktop",
@@ -89,6 +128,7 @@ CATALOG_SPEC: dict[str, Any] = {
             "metadata": {},
             "env": "CHUDWARE_STRIPE_PRICE_DESKTOP",
             "note": "$30/month",
+            "portal_switchable": True,
         },
         {
             "lookup_key": "chud_desktop_monthly_edu",
@@ -99,6 +139,7 @@ CATALOG_SPEC: dict[str, Any] = {
             "metadata": {},
             "env": "CHUDWARE_STRIPE_PRICE_DESKTOP_EDU",
             "note": "50% .edu price",
+            "portal_switchable": False,
         },
         {
             "lookup_key": "chud_studio_monthly",
@@ -109,6 +150,7 @@ CATALOG_SPEC: dict[str, Any] = {
             "metadata": {},
             "env": "CHUDWARE_STRIPE_PRICE_STUDIO",
             "note": "$150/month",
+            "portal_switchable": True,
         },
         {
             "lookup_key": "chud_studio_monthly_edu",
@@ -119,6 +161,7 @@ CATALOG_SPEC: dict[str, Any] = {
             "metadata": {},
             "env": "CHUDWARE_STRIPE_PRICE_STUDIO_EDU",
             "note": "50% .edu price",
+            "portal_switchable": False,
         },
         {
             "lookup_key": "chud_credits_starter",
@@ -267,11 +310,29 @@ class HttpxStripeTransport:
         params: Mapping[str, Any] | None = None,
         data: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
+        # The body is encoded here rather than handed to httpx's `data=`.
+        # Stripe's bracket notation legitimately repeats a key
+        # (`enabled_events[]=a&enabled_events[]=b`), so the payload has to stay a
+        # LIST of pairs and cannot be collapsed into a dict. httpx 0.28 types
+        # `data=` as a Mapping and, given a list of tuples, passes the tuples
+        # through to h11 unencoded — which fails deep in the connection layer
+        # with `TypeError: sequence item 1: expected a bytes-like object, tuple
+        # found` and no hint that the request body is at fault. urlencode with an
+        # explicit content type is unambiguous and does not depend on how a
+        # future httpx interprets a non-Mapping.
+        body = urlencode(_form_items(data or {}))
+        headers = (
+            {"Content-Type": "application/x-www-form-urlencoded"} if body else None
+        )
         response = self.client.request(
             method,
             path,
+            # `params=` genuinely does accept a list of pairs (httpx builds
+            # QueryParams from it), and needs to for the same repeated-key
+            # reason, so it is left as-is.
             params=_form_items(params or {}),
-            data=_form_items(data or {}),
+            content=body.encode("utf-8") if body else None,
+            headers=headers,
         )
         if response.is_error:
             try:
@@ -445,14 +506,20 @@ def _portal_payload(
     portal = copy.deepcopy(spec["portal"])
     groups: list[dict[str, Any]] = []
     for product_id in ("chud_desktop", "chud_studio"):
+        prices = [
+            price_ids[price["lookup_key"]]
+            for price in spec["prices"]
+            if price["product"] == product_id and price.get("portal_switchable")
+        ]
+        # A product group with no switchable price is not a degenerate group to
+        # send with an empty list; Stripe rejects that. Omit the product instead,
+        # which correctly means "not self-service switchable".
+        if not prices:
+            continue
         groups.append(
             {
                 "product": product_id,
-                "prices": [
-                    price_ids[price["lookup_key"]]
-                    for price in spec["prices"]
-                    if price["product"] == product_id
-                ],
+                "prices": prices,
                 "adjustable_quantity": {"enabled": False},
             }
         )
@@ -656,6 +723,20 @@ def provision(
     existing_portal = managed or next(
         (item for item in configurations if item.get("is_default") is True), None
     )
+    if existing_portal is not None:
+        # ``features.subscription_update.products`` is an EXPANDABLE field: Stripe
+        # accepts and validates it on write but omits it from every response
+        # unless it is explicitly expanded. Comparing against the unexpanded list
+        # response therefore always saw `products: []`, never matched the spec,
+        # and reported UPDATE on every single run — a provisioner that never
+        # converges, rewriting the live portal configuration on each deploy. Re-
+        # retrieve the one candidate with the expansion so the comparison has the
+        # field it is comparing.
+        existing_portal = transport.request(
+            "GET",
+            f"/v1/billing_portal/configurations/{existing_portal['id']}",
+            params={"expand": ["features.subscription_update.products"]},
+        )
     if existing_portal is None:
         portal = transport.request(
             "POST", "/v1/billing_portal/configurations", data=portal_payload

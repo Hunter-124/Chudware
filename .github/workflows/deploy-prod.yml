@@ -66,8 +66,41 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  # Live Stripe verification, ahead of the promotion. Deliberately a separate
+  # job calling the reusable workflow rather than another inline step in
+  # `deploy`: that job executes ON livingroom-pc as liveuser, and a suite whose
+  # job is to create charges and refunds has no business running on the
+  # production gateway host with production's environment in scope. The reusable
+  # workflow pins itself to cc-linux-build for exactly that reason.
+  #
+  # This IS a blocking gate, unlike the three advisory workflow states read in
+  # the preflight step. The distinction that makes it safe to block on is the one
+  # the header block draws: cc-linux-build is the runner linux-gate already
+  # concludes on, so this gate can actually reach a verdict. fast-gate and
+  # native-build cannot, because they matrix onto an offline mac.
+  #
+  # Until secrets.STRIPE_SANDBOX_ENV exists it reports NOT RUN with a warning
+  # annotation and does not block. require_credentials is left at its default
+  # false on purpose: flipping it on before the secret is added would wedge every
+  # deploy on a credential nobody has entered yet. Flip it to true once the
+  # secret is in place, and the gate becomes enforcing.
+  stripe-gate:
+    name: Gate — live Stripe sandbox
+    uses: ./.github/workflows/stripe-sandbox.yml
+    # Required. Without it the called workflow cannot see STRIPE_SANDBOX_ENV and
+    # would silently report the gate as not run on every single deploy.
+    secrets: inherit
+
   deploy:
     name: Promote master to production
+    # A failed Stripe gate skips the promotion. This is the one place in this
+    # file where a CI job genuinely blocks a deploy, and it earns that because it
+    # concludes: it runs on cc-linux-build, the runner linux-gate already reaches
+    # verdicts on, and it finishes in well under a minute. If the live catalog has
+    # drifted, a price id points at the wrong object, or a webhook endpoint has
+    # stopped being subscribed to an event we settle money on, shipping is the
+    # wrong move.
+    needs: stripe-gate
     # The job runs for a direct master push, for a green linux-gate, or for a
     # manual dispatch. The fork clause still matters on the workflow_run path: a
     # fork's workflow_run carries the fork's head_repository, and deploying a

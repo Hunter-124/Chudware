@@ -32,9 +32,30 @@ env:
   CHUDWARE_RELEASE_CHANNEL: ${{ inputs.channel || (contains(github.ref_name, '-') && 'beta' || 'stable') }}
 
 jobs:
+  # Live Stripe verification before a release is built.
+  #
+  # A desktop release is not obviously a billing artifact, so the reason this
+  # gates it is worth stating: the installers carry the entitlement client, and
+  # entitlements are minted from plan state that Stripe owns. Shipping a build
+  # against a catalog whose price ids no longer resolve produces desktop clients
+  # that cannot verify a paid plan, and the failure appears on customers'
+  # machines rather than in CI.
+  #
+  # It also costs ~40s against a 240-minute four-platform matrix, so gating is
+  # close to free. Reports NOT RUN without secrets.STRIPE_SANDBOX_ENV; see
+  # .github/workflows/stripe-sandbox.yml.
+  stripe-gate:
+    name: Gate — live Stripe sandbox
+    if: ${{ github.event_name == 'push' || inputs.phase == 'prepare' }}
+    uses: ./.github/workflows/stripe-sandbox.yml
+    secrets: inherit
+
   prepare:
     name: Prepare immutable ${{ matrix.platform }}-${{ matrix.arch }} payload
     if: ${{ github.event_name == 'push' || inputs.phase == 'prepare' }}
+    # Four platforms burn hours of runner time; find out the catalog is broken
+    # before committing any of it.
+    needs: stripe-gate
     runs-on: [self-hosted, "${{ matrix.runner_os }}", "${{ matrix.runner_arch }}", cloudcastle-ci, "${{ matrix.runner_label }}"]
     timeout-minutes: 240
     strategy:

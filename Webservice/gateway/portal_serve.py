@@ -190,6 +190,55 @@ async def bucket_page(request: Request) -> Response:
     return _file_response(_resolve_under_app("bucket.html"), request, immutable=False)
 
 
+@router.get("/marketplace", response_model=None)
+async def marketplace_page(request: Request) -> Response:
+    """The 3D model storefront.
+
+    Served to ANONYMOUS callers on purpose. ``auth.PUBLIC_PATHS`` covers
+    ``/marketplace`` so the middleware does not demand a session, because a
+    marketplace nobody can link to or crawl is not a marketplace. The page then
+    calls ``/api/marketplace/*``, whose read routes use
+    ``marketplace_authz.optional_user`` and personalise themselves only when a
+    session happens to exist.
+
+    Revalidated HTML, immutable hashed assets — the same split as the portal
+    index and ``/bucket``.
+    """
+    return _file_response(_resolve_under_app("marketplace.html"), request, immutable=False)
+
+
+@router.get("/studio", response_model=None)
+async def studio_page(request: Request) -> Response:
+    """The seller studio.
+
+    NOT public, and deliberately not listed in ``auth.PUBLIC_PATHS``: every
+    ``/api/studio/*`` route requires a session, so serving the shell to an
+    anonymous caller would render a page whose every request 401s. The
+    middleware redirects them to sign-in instead.
+    """
+    return _file_response(_resolve_under_app("studio.html"), request, immutable=False)
+
+
+@router.get("/marketplace-assets/{asset_path:path}", response_model=None)
+async def marketplace_asset(asset_path: str, request: Request) -> Response:
+    """Immutable hashed storefront assets, reachable without a session.
+
+    A separate route from ``/portal-assets`` purely to keep the public surface
+    minimal. ``auth.PUBLIC_PATHS`` has to name a prefix, and naming
+    ``/portal-assets`` would expose the account dashboard's and the file
+    bucket's bundles as well to reach these two files. The ``marketplace``
+    filename requirement is the same restriction ``/auth-assets`` applies to
+    ``login``, and it is what stops this public prefix from being a general
+    reader for every hashed asset on disk.
+    """
+    target = _resolve_under_app(asset_path)
+    if not _HASHED_ASSET_RE.fullmatch(target.name) or not target.name.startswith(
+        "marketplace"
+    ):
+        raise HTTPException(status_code=404, detail="hashed marketplace asset not found")
+    return _file_response(target, request, immutable=True)
+
+
 @router.get("/portal-assets/{asset_path:path}", response_model=None)
 async def portal_asset(asset_path: str, request: Request) -> Response:
     target = _resolve_under_app(asset_path)

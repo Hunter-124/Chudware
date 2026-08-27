@@ -389,6 +389,33 @@ def _apply_event(store: AccountStore, event: Any) -> None:
     stripe = _stripe()
     stripe.api_key = cfg.secret_key
 
+    # Marketplace settlement gets first refusal on every event.
+    #
+    # Deliberately inside `_apply_event`, which `_process_event_once` calls after
+    # inserting the `processed_events` row and inside the SAME `tx()`. Because
+    # `db.tx()` is re-entrant, the marketplace handler's own transaction joins
+    # this one, so "event recorded as processed" and "order settled, credits
+    # moved, entitlement granted" commit or roll back together. A second webhook
+    # route would have been the obvious design and would have had its own
+    # idempotency table, its own signature verification, and no such guarantee.
+    #
+    # It returns True only for events it recognises as its own — marketplace
+    # events carry `metadata.chud_kind == "marketplace"`, and `account.updated`
+    # is matched against `mk_sellers.connect_account_id` because that is
+    # authoritative where dashboard-editable metadata is not. Everything else
+    # falls through to the subscription and credit-pack handling below, including
+    # `checkout.session.completed`, which both consumers legitimately receive.
+    #
+    # Imported lazily: marketplace_commerce reads plan and account state and a
+    # module-scope import here would make the two modules mutually dependent at
+    # import time for no benefit.
+    try:
+        from marketplace_commerce import handle_marketplace_event
+    except ImportError:  # pragma: no cover - marketplace is an optional module
+        handle_marketplace_event = None  # type: ignore[assignment]
+    if handle_marketplace_event is not None and handle_marketplace_event(event):
+        return
+
     if event_type == "checkout.session.completed":
         if str(_field(obj, "mode", "") or "") == "payment":
             _grant_credit_checkout(obj, event, cfg, stripe)

@@ -53,12 +53,43 @@ SUPPORT_EMAIL = "support@chudware.com"
 #                 because a CI runner has no browser session to present
 #   artifact      _may_download decides inside the route, so an entitlement
 #                 token works exactly as it already does for /api/releases/latest
+#
+# The marketplace entries are the storefront, and they are public by product
+# requirement: a model marketplace that cannot be linked, shared or crawled has
+# no discovery. They are soft-auth like the release entries — the middleware
+# still attaches a session when one is presented, and every route reads it
+# through marketplace_authz.optional_user to personalise (owned, favourited,
+# can-review) without ever requiring it.
+#
+# Scope is deliberately narrow. "/api/marketplace" covers the whole READ subtree
+# including /listings, /meta, /sellers, /assets and /handle-check, and each of
+# those routes still enforces its own rules: gated bytes require an entitlement,
+# evidence assets 404 for everyone here, and every write route inside the subtree
+# calls require_user itself and so 401s an anonymous caller regardless of this
+# list. A suspended or trial-expired session is also refused: _resolve_user
+# raises for a non-active account, the soft-auth path swallows that and leaves
+# the caller anonymous, so they may browse but cannot buy or review.
+# "/studio" is NOT here — the seller surface requires a session, and
+# serving its shell anonymously would render a page whose every request 401s.
+#
+# "/marketplace-assets" rather than "/portal-assets", and the difference matters.
+# The storefront needs its CSS and JS to load for a signed-out visitor, but
+# /portal-assets also serves the account dashboard's and the file bucket's
+# bundles, which belong to authenticated surfaces. Opening that whole prefix to
+# reach two files would be a widening with no upside, so there is a dedicated
+# public prefix whose route additionally requires the filename to start with
+# "marketplace" — exactly the restriction /auth-assets already applies to
+# "login". "/static/base.css" is an exact entry, not a prefix, so it does not
+# open /static: it is the shared design-token stylesheet, it contains no data,
+# and the storefront cannot render without it.
 PUBLIC_PATHS = frozenset(
     {
         "/healthz", "/api/billing/webhook", "/api/entitlement/refresh",
         "/api/security/events", "/api/releases/latest", "/api/auth",
         "/api/releases/base-version", "/api/releases/ci", "/api/releases/artifact",
         "/signin", "/signup", "/forgot", "/reset", "/auth-assets",
+        "/marketplace", "/api/marketplace", "/marketplace-assets",
+        "/static/base.css",
     }
 )
 

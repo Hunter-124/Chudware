@@ -318,12 +318,152 @@ class Settings:
     stripe_price_credits_bulk: str = field(
         default_factory=lambda: _env("CHUDWARE_STRIPE_PRICE_CREDITS_BULK", "") or ""
     )
+    # Published to the browser for Stripe.js. Safe to expose by design; it is
+    # here so the front end never hard-codes a key and a test/live swap is one
+    # env change.
+    stripe_publishable_key: str = field(
+        default_factory=lambda: _env("CHUDWARE_WEB_STRIPE_PUBLISHABLE_KEY", "") or ""
+    )
+    # ---- Marketplace ----------------------------------------------------
+    # The marketplace is off unless switched on: it introduces public,
+    # anonymously readable routes, and a half-configured deployment should serve
+    # 404 rather than an empty storefront.
+    marketplace_enabled: bool = field(
+        default_factory=lambda: _env_bool("CHUDWARE_MARKETPLACE_ENABLED", False)
+    )
+    marketplace_root_raw: str = field(
+        default_factory=lambda: _env("CHUDWARE_MARKETPLACE_ROOT", "") or ""
+    )
+    # Platform cut on a cash sale, in basis points. Charged as a Stripe Connect
+    # ``application_fee_amount`` on a destination charge, so this is the only
+    # place the number exists and Stripe enforces it.
+    marketplace_fee_bps: int = field(
+        default_factory=lambda: _env_int("CHUDWARE_MARKETPLACE_FEE_BPS", 1500)
+    )
+    # Deliberately lower than the cash fee. A credit sale costs us no card
+    # processing and the credits stay on the platform, so taking the same cut
+    # would be charging for a service we did not perform.
+    marketplace_credit_fee_bps: int = field(
+        default_factory=lambda: _env_int("CHUDWARE_MARKETPLACE_CREDIT_FEE_BPS", 1000)
+    )
+    # 1 credit == $0.001 of upstream model cost (credits.py's module docstring),
+    # so 1000 credits to the dollar is the identity rate. Changing it re-prices
+    # every seller cash-out, which is why mk_payout_requests freezes the rate it
+    # was created under.
+    marketplace_credits_per_dollar: int = field(
+        default_factory=lambda: _env_int("CHUDWARE_MARKETPLACE_CREDITS_PER_DOLLAR", 1000)
+    )
+    # Cash-out floor. Below this a Stripe transfer's fixed cost eats the payout.
+    marketplace_payout_min_credits: int = field(
+        default_factory=lambda: _env_int("CHUDWARE_MARKETPLACE_PAYOUT_MIN_CREDITS", 25_000)
+    )
+    # Per-asset ceiling, separate from max_upload_bytes: a purchasable CAD
+    # assembly is legitimately far larger than a scratch upload.
+    marketplace_max_asset_bytes: int = field(
+        default_factory=lambda: _env_int(
+            "CHUDWARE_MARKETPLACE_MAX_ASSET_BYTES", 512 * 1024 * 1024
+        )
+    )
+    # Total bytes one seller's published listings may occupy.
+    marketplace_seller_quota_bytes: int = field(
+        default_factory=lambda: _env_int(
+            "CHUDWARE_MARKETPLACE_SELLER_QUOTA_BYTES", 20 * 1024 * 1024 * 1024
+        )
+    )
+    # A first paid listing goes through human review; later ones publish
+    # immediately. Off means everything publishes immediately, which is only
+    # appropriate on a staging host.
+    marketplace_review_first_paid: bool = field(
+        default_factory=lambda: _env_bool("CHUDWARE_MARKETPLACE_REVIEW_FIRST_PAID", True)
+    )
+    # Where a Connect onboarding return/refresh lands. Stripe requires absolute
+    # URLs and will not accept a relative path.
+    marketplace_connect_return_url: str = field(
+        default_factory=lambda: _env(
+            "CHUDWARE_MARKETPLACE_CONNECT_RETURN_URL",
+            "https://app.chudware.com/studio#payouts",
+        )
+        or "https://app.chudware.com/studio#payouts"
+    )
+    marketplace_success_url: str = field(
+        default_factory=lambda: _env(
+            "CHUDWARE_MARKETPLACE_SUCCESS_URL",
+            "https://app.chudware.com/marketplace#purchased",
+        )
+        or "https://app.chudware.com/marketplace#purchased"
+    )
+    marketplace_cancel_url: str = field(
+        default_factory=lambda: _env(
+            "CHUDWARE_MARKETPLACE_CANCEL_URL",
+            "https://app.chudware.com/marketplace#canceled",
+        )
+        or "https://app.chudware.com/marketplace#canceled"
+    )
+    # ---- Marketplace import sources -------------------------------------
+    # Each is optional and independent. An unset credential degrades its adapter
+    # to public-metadata mode rather than disabling the source, because reading a
+    # public page needs no key and is the majority of real imports.
+    mk_thingiverse_token: str = field(
+        default_factory=lambda: _env("CHUDWARE_MK_THINGIVERSE_TOKEN", "") or ""
+    )
+    mk_sketchfab_token: str = field(
+        default_factory=lambda: _env("CHUDWARE_MK_SKETCHFAB_TOKEN", "") or ""
+    )
+    mk_myminifactory_token: str = field(
+        default_factory=lambda: _env("CHUDWARE_MK_MYMINIFACTORY_TOKEN", "") or ""
+    )
+    mk_github_token: str = field(
+        default_factory=lambda: _env("CHUDWARE_MK_GITHUB_TOKEN", "") or ""
+    )
+    mk_onshape_client_id: str = field(
+        default_factory=lambda: _env("CHUDWARE_MK_ONSHAPE_CLIENT_ID", "") or ""
+    )
+    mk_onshape_client_secret: str = field(
+        default_factory=lambda: _env("CHUDWARE_MK_ONSHAPE_CLIENT_SECRET", "") or ""
+    )
 
 
     def __post_init__(self) -> None:
         if self.max_engine_bridges_per_user < 1:
             raise ValueError(
                 "CHUDWARE_WEB_MAX_ENGINE_BRIDGES_PER_USER must be at least 1"
+            )
+        # Marketplace money knobs. Validated at boot because every one of them
+        # is read inside a transaction that moves value: a nonsense fee
+        # discovered at checkout time has already taken the customer's money.
+        if not 0 <= self.marketplace_fee_bps <= 10_000:
+            raise ValueError(
+                "CHUDWARE_MARKETPLACE_FEE_BPS must be between 0 and 10000 basis points"
+            )
+        if not 0 <= self.marketplace_credit_fee_bps <= 10_000:
+            raise ValueError(
+                "CHUDWARE_MARKETPLACE_CREDIT_FEE_BPS must be between 0 and 10000 "
+                "basis points"
+            )
+        if self.marketplace_credits_per_dollar < 1:
+            raise ValueError(
+                "CHUDWARE_MARKETPLACE_CREDITS_PER_DOLLAR must be at least 1"
+            )
+        if self.marketplace_payout_min_credits < 1:
+            raise ValueError(
+                "CHUDWARE_MARKETPLACE_PAYOUT_MIN_CREDITS must be at least 1"
+            )
+        if self.marketplace_max_asset_bytes < 1:
+            raise ValueError("CHUDWARE_MARKETPLACE_MAX_ASSET_BYTES must be positive")
+        if self.marketplace_seller_quota_bytes < self.marketplace_max_asset_bytes:
+            raise ValueError(
+                "CHUDWARE_MARKETPLACE_SELLER_QUOTA_BYTES must be at least "
+                "CHUDWARE_MARKETPLACE_MAX_ASSET_BYTES, or no seller could upload "
+                "a single largest-allowed asset"
+            )
+        # Cash sales need Connect, which needs a secret key. Enabling the
+        # marketplace without one yields a storefront where every paid listing's
+        # buy button 503s, so refuse the combination outright.
+        if self.marketplace_enabled and not self.stripe_secret_key:
+            raise ValueError(
+                "CHUDWARE_MARKETPLACE_ENABLED=1 requires "
+                "CHUDWARE_WEB_STRIPE_SECRET_KEY: cash listings settle through "
+                "Stripe Connect and cannot be served without it"
             )
         if self.mail_backend not in MAIL_BACKENDS:
             raise ValueError(
@@ -458,6 +598,35 @@ class Settings:
             / "teams"
             / _canonical_uuid(team_id)
         )
+
+    @property
+    def marketplace_root(self) -> Path:
+        """Root of all marketplace asset storage.
+
+        Deliberately NOT under ``workspace_root`` or ``bucket_root``. Those two
+        trees are per-tenant private storage whose whole contract is that nobody
+        else can read them; marketplace assets are the opposite — published
+        bytes served to strangers — and mixing the two would put a public route
+        one path-handling bug away from a private file. Defaults beside the rest
+        of the app's own state rather than in a customer tree.
+        """
+        raw = self.marketplace_root_raw.strip()
+        if raw:
+            return _expand_path(raw)
+        return self.data_root / "marketplace"
+
+    def listing_asset_root(self, listing_id: str) -> Path:
+        """Asset directory for one listing.
+
+        The listing UUID is re-validated as canonical UUID text here even though
+        every caller already holds it from a database row, for the same reason
+        ``team_bucket_root`` does it: this is the last function before the join,
+        and it is the one place that has to be right if something upstream is
+        ever wrong. Sharded on the first two hex digits so a directory listing of
+        the root stays usable at a million listings.
+        """
+        canonical = _canonical_uuid(listing_id)
+        return self.marketplace_root / "listings" / canonical[:2] / canonical
 
     @property
     def terminal_layout_file(self) -> Path:

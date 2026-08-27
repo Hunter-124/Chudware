@@ -9,6 +9,8 @@
 <link rel="stylesheet" href="/static/vendor/xterm.css">
 <link rel="stylesheet" href="/static/admin_wm.css?v=1">
 <link rel="stylesheet" href="/static/admin_ops.css?v=1">
+<link rel="stylesheet" href="/static/admin_billing.css?v=1">
+<link rel="stylesheet" href="/static/admin_marketplace.css?v=1">
 <style>
   html, body {
     height: 100%;
@@ -547,6 +549,8 @@
       <a class="admin-tab" id="tab-dashboard" role="tab" data-tab="dashboard" href="#dashboard" aria-controls="panel-dashboard">Dashboard</a>
       <a class="admin-tab" id="tab-releases" role="tab" data-tab="releases" href="#releases" aria-controls="panel-releases">Releases</a>
       <a class="admin-tab" id="tab-accounts" role="tab" data-tab="accounts" href="#accounts" aria-controls="panel-accounts">Accounts</a>
+      <a class="admin-tab" id="tab-billing" role="tab" data-tab="billing" href="#billing" aria-controls="panel-billing">Billing</a>
+      <a class="admin-tab" id="tab-marketplace" role="tab" data-tab="marketplace" href="#marketplace" aria-controls="panel-marketplace">Marketplace</a>
       <a class="admin-tab" id="tab-terminal" role="tab" data-tab="terminal" href="#terminal" aria-controls="panel-terminal">Terminal</a>
       <a class="admin-tab" id="tab-system" role="tab" data-tab="system" href="#system" aria-controls="panel-system">System</a>
     </nav>
@@ -769,6 +773,26 @@
         </div>
       </div>
     </section>
+
+    <!-- ============================= Billing ============================= -->
+    <!-- Both new panels are a bare mount point on purpose. admin.html owns the
+         shell; admin_billing.js and admin_marketplace.js own everything inside
+         their own div and build it at runtime. That keeps the markup for two
+         large dashboards out of a file five other features already share, and it
+         is why each script is a self-invoking IIFE guarded on its mount id --
+         absent the div, it does nothing. -->
+    <section class="tab-panel" id="panel-billing" data-tab="billing" role="tabpanel" aria-labelledby="tab-billing">
+      <div class="panel-inner">
+        <div id="billing-mount"></div>
+      </div>
+    </section>
+
+    <!-- =========================== Marketplace =========================== -->
+    <section class="tab-panel" id="panel-marketplace" data-tab="marketplace" role="tabpanel" aria-labelledby="tab-marketplace">
+      <div class="panel-inner">
+        <div id="marketplace-mount"></div>
+      </div>
+    </section>
   </main>
 
   <div id="admin-status" role="status" aria-live="polite"></div>
@@ -786,7 +810,19 @@
     </div>
   </div>
 </div>
-<script src="/static/admin.js?v=12"></script>
+<!-- admin.js goes to v=13: the TABS array gained "billing" and "marketplace",
+     and a browser holding v=12 would render both nav links as dead ends. This
+     query-string bump is the only cache-busting these unhashed admin assets
+     have; see the note in this file's header about the three separate
+     mechanisms in play across the app. -->
+<script src="/static/admin.js?v=13"></script>
+<!-- Loaded AFTER admin.js because each guards on a mount id that lives in the
+     markup above, not on anything admin.js creates; the ordering is for
+     determinism when reading the file, not a dependency. Both files are served
+     through _AdminGatedStatic, which refuses any /static/admin* asset to a
+     non-admin, so the dashboards are unreadable as well as unusable. -->
+<script src="/static/admin_billing.js?v=1"></script>
+<script src="/static/admin_marketplace.js?v=1"></script>
 <script src="/static/vendor/xterm.js"></script>
 <script src="/static/vendor/xterm-addon-fit.js"></script>
 <script src="/static/vendor/winbox/winbox.bundle.min.js"></script>

@@ -44,8 +44,8 @@ Configuration IDs: sandbox `________________`; live `________________`.
 
 | Environment | URL | Stripe modes | Enabled events (exact) | Signing-secret env var | Sandbox `we_` id | Live `we_` id |
 |---|---|---|---|---|---|---|
-| production | `https://app.chudware.com/api/billing/webhook` | test, live | `checkout.session.completed`<br>`customer.subscription.updated`<br>`customer.subscription.deleted`<br>`invoice.paid`<br>`invoice.payment_failed` | `CHUDWARE_WEB_STRIPE_WEBHOOK_SECRET` | — | — |
-| staging | `https://staging.chudware.com/api/billing/webhook` | test | `checkout.session.completed`<br>`customer.subscription.updated`<br>`customer.subscription.deleted`<br>`invoice.paid`<br>`invoice.payment_failed` | `CHUDWARE_WEB_STRIPE_STAGING_WEBHOOK_SECRET` | — | — |
+| production | `https://app.chudware.com/api/billing/webhook` | test, live | `checkout.session.completed`<br>`customer.subscription.updated`<br>`customer.subscription.deleted`<br>`invoice.paid`<br>`invoice.payment_failed`<br>`checkout.session.expired`<br>`payment_intent.payment_failed`<br>`charge.refunded`<br>`account.updated` | `CHUDWARE_WEB_STRIPE_WEBHOOK_SECRET` | — | — |
+| staging | `https://staging.chudware.com/api/billing/webhook` | test | `checkout.session.completed`<br>`customer.subscription.updated`<br>`customer.subscription.deleted`<br>`invoice.paid`<br>`invoice.payment_failed`<br>`checkout.session.expired`<br>`payment_intent.payment_failed`<br>`charge.refunded`<br>`account.updated` | `CHUDWARE_WEB_STRIPE_STAGING_WEBHOOK_SECRET` | — | — |
 
 Stripe returns a webhook signing secret only when the endpoint is created. Copy the
 printed secret immediately into the matching `gateway.env`; a no-op rerun cannot

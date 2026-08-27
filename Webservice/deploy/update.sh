@@ -52,6 +52,12 @@ EOF
 }
 
 [[ $# -ge 1 ]] || { usage >&2; exit 2; }
+# Snapshot argv and our own bytes before anything consumes or replaces them.
+# `git pull` below can rewrite this very file while bash is still reading it;
+# see the re-exec guard after the pull for why that matters.
+SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
+SELF_SHA_BEFORE="$(sha256sum "$SELF" | cut -d' ' -f1)"
+ORIGINAL_ARGV=("$@")
 ENVIRONMENT="$1"
 shift
 case "$ENVIRONMENT" in
@@ -493,6 +499,39 @@ if [[ "$DO_PULL" = 1 ]]; then
   echo "    HEAD $BEFORE -> $AFTER"
   if [[ "$BEFORE" != "$AFTER" ]]; then
     git log --oneline -n 30 "$BEFORE..$AFTER"
+  fi
+fi
+
+# Re-exec when the pull replaced THIS script.
+#
+# Bash reads a script incrementally rather than slurping it, so a pull that
+# rewrites update.sh mid-run leaves the already-parsed definitions in memory
+# while later reads come from the new bytes. On 2026-08-27 that produced a
+# deploy which reported "finished ok" while silently running the PRE-pull
+# copy: install_current_units was still the three-unit version and
+# enable_release_retention — a function the new file adds and calls — was never
+# invoked, so a newly added systemd timer was not installed and nothing said
+# so. A deploy that omits half of what the committed script asks for and still
+# exits 0 is the worst failure shape available, so re-exec once, under a guard,
+# and say that it happened.
+#
+# The lock is briefly released across the handoff: exec inherits fd 9, but the
+# new process runs its own `exec 9>"$LOCK"` and flock, which closes the
+# inherited file description and drops the lock with it. That window is
+# acceptable — one host, and the workflow's concurrency group already
+# serialises deploys — but do not describe this as lock-preserving.
+# CHUDWARE_DEPLOY_REEXECED bounds it to a single hop even if the new copy
+# somehow hashes differently again.
+if [[ "${CHUDWARE_DEPLOY_REEXECED:-0}" != 1 && -f "$SELF" ]]; then
+  SELF_SHA_AFTER="$(sha256sum "$SELF" | cut -d' ' -f1)"
+  if [[ "$SELF_SHA_AFTER" != "$SELF_SHA_BEFORE" ]]; then
+    echo "=== [$(date -Iseconds)] update.sh changed in this pull; re-executing the new copy ==="
+    echo "    ${SELF_SHA_BEFORE:0:12} -> ${SELF_SHA_AFTER:0:12}"
+    export CHUDWARE_DEPLOY_REEXECED=1
+    # --no-pull: the pull already happened and the tree is at the target ref.
+    # Re-pulling would be harmless but re-checking a v* tag against a moving
+    # remote is not, and it keeps the second hop's log honest about what it did.
+    exec bash "$SELF" "$ENVIRONMENT" "${ORIGINAL_ARGV[@]:1}" --no-pull
   fi
 fi
 

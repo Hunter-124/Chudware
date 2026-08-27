@@ -1,6 +1,6 @@
 # Commands Reference
 
-Every ribbon command (344 total), grouped by tab and ribbon group.
+Every ribbon command (359 total), grouped by tab and ribbon group.
 
 ## Annotation
 
@@ -938,13 +938,59 @@ _Available from the Schematic ▸ Analyze ribbon group._
 
 _Available from the Schematic ▸ New ribbon group._
 
+### Outputs
+
+#### BOM
+
+_Available from the Schematic ▸ Outputs ribbon group._
+
+#### Export KiCad
+
+_Available from the Schematic ▸ Outputs ribbon group._
+
+#### Import KiCad
+
+_Available from the Schematic ▸ Outputs ribbon group._
+
+#### Netlist
+
+_Available from the Schematic ▸ Outputs ribbon group._
+
+#### PDF
+
+_Available from the Schematic ▸ Outputs ribbon group._
+
+#### Plot / Print
+
+_Available from the Schematic ▸ Outputs ribbon group._
+
+#### SPICE
+
+_Available from the Schematic ▸ Outputs ribbon group._
+
+#### SVG
+
+_Available from the Schematic ▸ Outputs ribbon group._
+
 ### Schematic
 
 #### Annotate
 
 _Available from the Schematic ▸ Schematic ribbon group._
 
+#### Bus
+
+_Available from the Schematic ▸ Schematic ribbon group._
+
+#### Junction
+
+_Available from the Schematic ▸ Schematic ribbon group._
+
 #### Net Label
+
+_Available from the Schematic ▸ Schematic ribbon group._
+
+#### No Connect
 
 _Available from the Schematic ▸ Schematic ribbon group._
 
@@ -960,9 +1006,27 @@ _Available from the Schematic ▸ Schematic ribbon group._
 
 _Available from the Schematic ▸ Schematic ribbon group._
 
+#### Text
+
+_Available from the Schematic ▸ Schematic ribbon group._
+
 #### Wire
 
 _Available from the Schematic ▸ Schematic ribbon group._
+
+### Sheet
+
+#### New Sheet
+
+_Available from the Schematic ▸ Sheet ribbon group._
+
+#### Properties
+
+_Available from the Schematic ▸ Sheet ribbon group._
+
+#### Sheet
+
+_Available from the Schematic ▸ Sheet ribbon group._
 
 ## Sheet Metal
 

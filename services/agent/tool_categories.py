@@ -543,6 +543,19 @@ CATEGORY_PACKS: dict[str, list[str]] = {
         "plm_release",
         "plm_item_set",
         "plm_add_remote",
+        # Team sync + advisory locks (T-R7) and live co-editing (T-R8). Registering
+        # a remote with plm_add_remote was reachable while every tool that remote
+        # exists to enable was not, so the model could configure sharing and then
+        # never sync, lock, or join it — the same advertised-but-uncallable dead end
+        # this pack's note above documents. advertised_tool_audit, 2026-08-27.
+        "plm_sync",
+        "plm_lock",
+        "plm_unlock",
+        "plm_live_join",
+        "plm_live_propose",
+        "plm_live_poll",
+        "plm_live_presence",
+        "plm_live_leave",
         "plm_set_ai_mode",
         "plm_graph_search",
         "plm_graph_keyword",

@@ -164,6 +164,48 @@ ENTRIES: dict[str, dict[str, Any]] = {
             "the edit is saved so teammates are not blocked."
         ),
     },
+    "plm_live_join": {
+        "prompt_note": (
+            "Only for a plm-server remote registered with live_coedit — "
+            "folder/ssh/https remotes use plm_lock instead. Pass item_id plus "
+            "local_doc_id so the open document joins the session; the reply "
+            "may return a REPLACEMENT local_doc_id when the server's "
+            "authoritative snapshot supersedes local state. The bearer token "
+            "comes from CHUDWARE_PLM_LIVE_TOKEN; never write it into a "
+            "project file."
+        ),
+    },
+    "plm_live_propose": {
+        "prompt_note": (
+            "Rarely called directly: once an item is joined, ordinary "
+            "document edits already travel this path and receive the one "
+            "server-assigned order. Send a whole op batch (never a partial "
+            "one) and read seq plus ops_response. A refusal is authoritative "
+            "— fix the batch and re-send; never apply it locally instead."
+        ),
+    },
+    "plm_live_poll": {
+        "prompt_note": (
+            "Drains complete, in-order commit/snapshot events for a joined "
+            "item. Apply nothing yourself — each event is already applied "
+            "whole; poll only to observe sequence, participants, and "
+            "connection state."
+        ),
+    },
+    "plm_live_presence": {
+        "prompt_note": (
+            "Best-effort cursor/selection sharing only; it never changes the "
+            "document, revision, or history. Safe to skip entirely."
+        ),
+    },
+    "plm_live_leave": {
+        "prompt_note": (
+            "Idempotent — leaving when not joined is a successful no-op. When "
+            "the LAST participant leaves, the server writes one vault "
+            "checkpoint attributed to everyone who committed, so leave "
+            "deliberately rather than abandoning the session."
+        ),
+    },
     "box_sync": {
         "prompt_note": (
             "Uploads the project's saved files to the configured Box.com "

@@ -427,6 +427,11 @@
    "plm_item_add",
    "plm_item_set",
    "plm_link_repo",
+   "plm_live_join",
+   "plm_live_leave",
+   "plm_live_poll",
+   "plm_live_presence",
+   "plm_live_propose",
    "plm_lock",
    "plm_open",
    "plm_plan",
@@ -860,7 +865,7 @@
   "piping_report": "Per-segment pressure-drop report with an explicit K-factor breakdown.",
   "piping_solve": "Solve an ``aicad.piping/1`` pipe network for node pressures/heads and link flows.",
   "piping_verify_cfd": "DAG verify node: compare 1D pipe-network pressure drop with 3D CFD pressure drop.",
-  "plm_add_remote": "Register a remote profile for team sync. ``kind`` ∈ ``folder`` | ``ssh`` | ``https`` | ``chudware-cloud`` (config-only). Folder remotes use …",
+  "plm_add_remote": "Register a team-sync profile with optional account identity.",
   "plm_checkpoint": "Save a named checkpoint the user can return to. ``message`` describes the change in plain language. Returns ``{ok, commit, entry}``.",
   "plm_compare": "Compare an item between two history points — including a RENDERED GRAPHICAL DIFF of the geometry that changed.",
   "plm_graph_brief": "One-node dossier: identity, degree, edge-kind histogram, neighbors.",
@@ -877,7 +882,12 @@
   "plm_item_add": "Track a non-design file or folder as a versioned item — a specification, report, datasheet, spreadsheet, image, simulation folder or source …",
   "plm_item_set": "Edit an item's registry entry: give it a new part number (kept unique within the project) and/or start a new revision of a released item so …",
   "plm_link_repo": "Link an external source-code repository to the project by reference (the code is never copied in — only a pointer, pinned to a version at …",
-  "plm_lock": "Advisory lock on an item via the shared project (compare-and-swap). Returns ``{ok, lock}`` or ``{ok:false, reason:\"locked\"}`` when held.",
+  "plm_live_join": "Join an authoritative live item session.",
+  "plm_live_leave": "Leave a live item session and release its ephemeral presence.",
+  "plm_live_poll": "Drain complete, atomically applied live commit/snapshot events.",
+  "plm_live_presence": "Publish bounded ephemeral cursor, selection, and viewport presence.",
+  "plm_live_propose": "Propose one atomic operation batch and wait for its ordered commit.",
+  "plm_lock": "Acquire an advisory item lock.",
   "plm_open": "Open a project folder, auto-creating history if absent (zero-config). Returns ``{ok, project_id, manifest}``.",
   "plm_plan": "Plan the work: read or change the project's tasks, issues and milestones (stored with the project, so they version and restore with it). …",
   "plm_release": "Release an item: checks first (unsaved changes, out-of-date component references, never-released components), then stamps the next revision …",
@@ -2088,6 +2098,21 @@
   },
   "plm_link_repo": {
    "prompt_note": "Links a repo by reference only — nothing is copied in; the version pin lands at release. Use plm_item_add when the sources should be versioned in the vault."
+  },
+  "plm_live_join": {
+   "prompt_note": "Only for a plm-server remote registered with live_coedit — folder/ssh/https remotes use plm_lock instead. Pass item_id plus local_doc_id so the open document joins the session; the reply may return a REPLACEMENT local_doc_id when the server's authoritative snapshot supersedes local state. The bearer token comes from CHUDWARE_PLM_LIVE_TOKEN; never write it into a project file."
+  },
+  "plm_live_leave": {
+   "prompt_note": "Idempotent — leaving when not joined is a successful no-op. When the LAST participant leaves, the server writes one vault checkpoint attributed to everyone who committed, so leave deliberately rather than abandoning the session."
+  },
+  "plm_live_poll": {
+   "prompt_note": "Drains complete, in-order commit/snapshot events for a joined item. Apply nothing yourself — each event is already applied whole; poll only to observe sequence, participants, and connection state."
+  },
+  "plm_live_presence": {
+   "prompt_note": "Best-effort cursor/selection sharing only; it never changes the document, revision, or history. Safe to skip entirely."
+  },
+  "plm_live_propose": {
+   "prompt_note": "Rarely called directly: once an item is joined, ordinary document edits already travel this path and receive the one server-assigned order. Send a whole op batch (never a partial one) and read seq plus ops_response. A refusal is authoritative — fix the batch and re-send; never apply it locally instead."
   },
   "plm_lock": {
    "prompt_note": "Advisory, team-visible; reason='locked' means someone holds it — do not edit around it. Lock before editing a shared item, plm_unlock after."

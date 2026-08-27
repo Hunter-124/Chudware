@@ -1,11 +1,12 @@
 # Contracts Summary
 
-46 frozen contracts under `contracts/`:
+48 frozen contracts under `contracts/`:
 
 - `README.md` — contracts/ — frozen interface seams
 - `advisor.md` — contracts/advisor.md — Advisory Layer contracts (aicad.advisor/1.7)
 - `agent_events.md` — Contract: Agent Events — `aicad.agent_events/2`
 - `ai_vc.md` — Contract: AI-VC (silent agent version control) — v1
+- `box_mirror.md` — Box.com mirror seam (`aicad.box_mirror/1`)
 - `cad_graph.md` — Contract: CAD Project Graph — v1
 - `cam.md` — Contract: CAM simulation frames, audit, machines, job diff
 - `copilot_modes.md` — Copilot modes — Agent|Plan|Swarm|Edit|Ask tool gating (aicad.copilot_modes/1)
@@ -32,6 +33,7 @@
 - `parts.md` — Contract: Unified Parts Library — `aicad.parts/1`
 - `piping_schema.md` — Contract: `aicad.piping/1` document schema
 - `plm.md` — Contract: PLM / Version Control — `aicad.plm/1`
+- `plm_live.md` — PLM live-session protocol — `aicad.plm-live/1`
 - `plm_planning.md` — Contract: PLM Planning — `aicad.planning/1`
 - `providers.md` — Contract: Providers & Session Layer — v1
 - `requirements.md` — Contract: Requirements layer — `aicad.req/1`

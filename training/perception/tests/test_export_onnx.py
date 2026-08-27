@@ -10,6 +10,12 @@ def test_onnx_matches_numpy_reference_when_optional_stack_is_installed(tmp_path)
     pytest.importorskip("torch")
     pytest.importorskip("onnx")
     pytest.importorskip("onnxruntime")
+    # torch's ONNX exporter imports onnxscript (torch/onnx/_internal/exporter);
+    # without it export_onnx raises ModuleNotFoundError. The optional stack is
+    # only "installed" when every piece the export path uses is present, so
+    # guard it here rather than reporting a missing optional dependency as a
+    # product failure.
+    pytest.importorskip("onnxscript")
     corpus = generate_synthetic_corpus(windows=8, seed=29)
     one = corpus.windows.subset(np.array([0]))
     inputs = one.model_inputs()

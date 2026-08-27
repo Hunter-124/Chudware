@@ -261,8 +261,9 @@ def _patch_bunfig(path: Path, catalog: dict) -> None:
 
 
 def _excluded_from_lock(rel: str) -> bool:
-    """Paths the content-hash lock must not pin: our preserved bridge/, install output
-    (node_modules at any depth, the bun.lock `bun install` regenerates), and the lock itself."""
+    """Paths the content-hash lock must not pin, because they are ours rather than upstream
+    bytes: our preserved bridge/ and bun.lock, install output (node_modules at any depth), and
+    the lock itself. bun.lock is excluded from the manifest but PRESERVED across re-vendor."""
     return (
         rel.startswith("bridge/")
         or rel.startswith("node_modules/")
@@ -280,12 +281,19 @@ def vendor(from_arg: str, sha: str | None, packages: list[str], run_install: boo
             if not (pkgs_src / pkg).is_dir():
                 raise SystemExit(f"package '{pkg}' not found under {pkgs_src}")
 
-        # Preserve our bridge/ across updates; clobber everything else under vendor/omp.
-        bridge_backup = None
+        # Preserve our own artifacts across updates; clobber everything else under vendor/omp.
+        # bridge/ is our package. bun.lock is our committed install input: the C++ core
+        # materializes node_modules from it with --frozen-lockfile so providers work with no
+        # manual `bun install` step (core/agent/omp_bridge_client.cpp). Upstream's lock
+        # describes a much larger workspace than our generated root package.json, so it cannot
+        # be copied from source — it has to survive the clobber or every re-vendor silently
+        # breaks provider auth until someone notices node_modules can no longer be built.
+        preserved = Path(tempfile.mkdtemp(prefix="omp-preserve-"))
+        cleanup.append(preserved)
         if (VENDOR_DIR / "bridge").exists():
-            bridge_backup = Path(tempfile.mkdtemp(prefix="omp-bridge-"))
-            shutil.copytree(VENDOR_DIR / "bridge", bridge_backup / "bridge")
-            cleanup.append(bridge_backup)
+            shutil.copytree(VENDOR_DIR / "bridge", preserved / "bridge")
+        if (VENDOR_DIR / "bun.lock").exists():
+            shutil.copy2(VENDOR_DIR / "bun.lock", preserved / "bun.lock")
         if VENDOR_DIR.exists():
             shutil.rmtree(VENDOR_DIR)
         (VENDOR_DIR / "packages").mkdir(parents=True)
@@ -310,8 +318,10 @@ def vendor(from_arg: str, sha: str | None, packages: list[str], run_install: boo
             encoding="utf-8",
         )
 
-        if bridge_backup is not None:
-            shutil.copytree(bridge_backup / "bridge", VENDOR_DIR / "bridge")
+        if (preserved / "bridge").exists():
+            shutil.copytree(preserved / "bridge", VENDOR_DIR / "bridge")
+        if (preserved / "bun.lock").exists():
+            shutil.copy2(preserved / "bun.lock", VENDOR_DIR / "bun.lock")
 
         # Content-hash manifest (exclude our bridge/ and any node_modules/lock churn).
         manifest: dict[str, str] = {}

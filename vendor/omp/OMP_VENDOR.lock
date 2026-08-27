@@ -4,6 +4,8 @@
   "dirty": true,
   "dirty_files": [
     "packages/ai/src/auth-storage.ts",
+    "packages/ai/src/registry/oauth/oauth.html",
+    "packages/ai/test/callback-server-launch-route.test.ts",
     "packages/coding-agent/src/session/agent-storage.ts",
     "packages/coding-agent/test/agent-storage-sqlite-compat.test.ts"
   ],
@@ -257,7 +259,7 @@
     "packages/ai/src/registry/oauth/index.ts": "4392f02cd314d77198b58c21498c65f97d8903f55379791cd56c4f864c67cfd0",
     "packages/ai/src/registry/oauth/kimi.ts": "4f1c834a47ba2e0689774e0c23f1fc348fed29a0f3e32910e5e34222bb79c128",
     "packages/ai/src/registry/oauth/minimax-code.ts": "4a6a307be147f0cafd9e2c9f7c713a0f64983d5c87a31eb66a33e3d900c3e049",
-    "packages/ai/src/registry/oauth/oauth.html": "fbb2d78d94c08aa847be853285c6b1ee644d57fd008ad200b57adcec43da064b",
+    "packages/ai/src/registry/oauth/oauth.html": "63c21b4a6f44e6f8a3ec71e8a3a38e8fa0751e5e745b32e9415b31c02062533a",
     "packages/ai/src/registry/oauth/openai-codex.ts": "9dedc3d773aeb19c12f2815993aa1853248e9e22a674a040f5d4c4263907d1ba",
     "packages/ai/src/registry/oauth/opencode.ts": "3a9126b8614269448a667aeaf30940b4f992a9381ac4616ef4547812f082a499",
     "packages/ai/src/registry/oauth/perplexity.ts": "f1652ae305eda0d9b1569a1bf0136736880f65af629eb9cfe9ef09f8ecfc22be",

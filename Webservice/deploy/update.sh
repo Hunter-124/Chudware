@@ -202,13 +202,25 @@ STATUS="$DATA_ROOT/logs/deploy-status.json"
 # parallel even though their logs and databases are separate.
 LOCK="${CHUDWARE_DEPLOY_LOCK:-$HOME/chudware-web-data/logs/deploy.lock}"
 mkdir -p "$(dirname "$LOCK")"
-exec 9>"$LOCK"
-if ! flock -n 9; then
-  echo "busy (another prod/staging deployment holds $LOCK)" >&2
-  exit 3
+# The re-exec hop after a self-replacing pull INHERITS fd 9 and the flock on it,
+# because exec keeps the process and its descriptors. It must not re-open fd 9:
+# doing so closes the inherited open file description, and the lock does not
+# come back, because the parent's `tee` co-process below forked while fd 9 was
+# open and still holds a duplicate of that description. The first attempt at
+# this re-exec guard did exactly that and every second hop died with
+# "busy (another prod/staging deployment holds ...)" — a deploy that correctly
+# detected the stale-script bug and then refused to finish.
+if [[ "${CHUDWARE_DEPLOY_REEXECED:-0}" != 1 ]]; then
+  exec 9>"$LOCK"
+  if ! flock -n 9; then
+    echo "busy (another prod/staging deployment holds $LOCK)" >&2
+    exit 3
+  fi
 fi
 
-exec > >(tee -a "$LOGFILE") 2>&1
+# `exec 9>&-` inside the process substitution keeps the log co-process from
+# holding a duplicate of the lock descriptor for its whole lifetime.
+exec > >(exec 9>&-; tee -a "$LOGFILE") 2>&1
 STARTED_AT="$(date +%s)"
 printf '{"running":true,"kind":"deploy-%s","started_at":%s,"last":null}\n' \
   "$ENVIRONMENT" "$STARTED_AT" >"$STATUS"

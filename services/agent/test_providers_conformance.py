@@ -89,12 +89,21 @@ def test_openai_wire_shape(tmp_path):
     assert m == {"role": "user", "content": "a\n\nb"}
 
 
-def test_openrouter_pins_openrouter_base_url():
-    pytest.importorskip("openai")
-    from services.agent.providers.openrouter_provider import OpenRouterProvider, BASE_URL
+def test_openrouter_resolves_to_private_omp_bridge():
+    """OMP owns OpenRouter transport semantics; no second Python adapter exists."""
+    from services.agent.providers.omp_bridge_provider import OmpBridgeProvider
 
-    r = OpenRouterProvider(api_key="sk-or-x")
-    assert r.name == "openrouter"
-    assert r.base_url == BASE_URL
-    # inherits the OpenAI-compatible wire form
-    assert r._content(base.text_part("hi")) == {"type": "text", "text": "hi"}
+    provider = config.get_provider(
+        name="openrouter",
+        cfg={
+            "provider": "openrouter",
+            "model": "openai/gpt-4o",
+            "api_key": "sk-or-x",
+        },
+    )
+
+    assert isinstance(provider, OmpBridgeProvider)
+    assert provider.name == "openrouter"
+    assert provider.wire_provider == "openrouter"
+    assert provider.model == "openai/gpt-4o"
+    assert provider.api_key == "sk-or-x"

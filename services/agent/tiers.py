@@ -373,10 +373,11 @@ def provider_for_tier(tier: str | None, cfg: Optional[dict] = None):
     tokenmaxx benchmark's per-model tier matrix (T-W29/T-DP19).
 
     Parameterized paid tiers use the ``openrouter:<model-id>`` syntax (e.g.
-    ``openrouter:anthropic/claude-opus-4``). They resolve to
-    :class:`OpenRouterProvider` with that model id and the OpenRouter API key
-    from config / ``OPENROUTER_API_KEY``. This is the multi-provider benchmark
-    path that feeds the leaderboard (contracts/leaderboard.md).
+    ``openrouter:anthropic/claude-opus-4``). They resolve to the private OMP
+    bridge with that model id and the OpenRouter API key from config /
+    ``OPENROUTER_API_KEY``. Private ``pi-ai`` owns the OpenRouter transport;
+    this is the multi-provider benchmark path that feeds the leaderboard
+    (contracts/leaderboard.md).
 
     Parameterized xAI tiers use ``xai:<model-id>`` (e.g. ``xai:grok-4.5`` /
     ``xai:grok-4-5``). They prefer the SuperGrok subscription provider

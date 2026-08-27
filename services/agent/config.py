@@ -2197,28 +2197,6 @@ def _resolve_provider(name: str | None, cfg: dict, role: str | None = None) -> P
                               reasoning_effort=cfg.get("reasoning_effort"))
         return _attach_catalog_meta(prov, caps)
 
-    if name == "openrouter":
-        # OpenAI-compatible endpoint pinned to OpenRouter. Key is BYO (OPENROUTER_API_KEY)
-        # or minted by the blessed PKCE login and stored as api_key (contract §4.1).
-        # mega-16: also honour config.keys.openrouter (GUI keys map).
-        from .providers.openrouter_provider import OpenRouterProvider, DEFAULT_MODEL
-
-        oc = cfg.get("openrouter") or {}
-        key = _openrouter_api_key(cfg)
-        if not key:
-            _refuse_keyless_openrouter()
-        model = cfg.get("model", DEFAULT_MODEL)
-        caps = _catalog_caps("openrouter", model, cfg)
-        vision = (
-            oc["vision"] if isinstance(oc, dict) and "vision" in oc
-            else caps.get("vision", True)
-        )
-        timeout = float(oc.get("timeout", 120.0)) if isinstance(oc, dict) else 120.0
-        prov = OpenRouterProvider(api_key=key, model=model,
-                                  supports_vision=bool(vision),
-                                  timeout=timeout,
-                                  reasoning_effort=cfg.get("reasoning_effort"))
-        return _attach_catalog_meta(prov, caps)
 
     if name == "xai":
         # Classic API-key path (console.x.ai). OpenAI-compatible at https://api.x.ai/v1.

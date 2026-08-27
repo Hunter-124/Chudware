@@ -2753,3 +2753,16 @@ invented.
 **Proof.** Real bridge RPC aggressively shook a 9,750-token tool result to one placeholder,
 saved ~9,734 tokens, and emitted no fake artifact URL. Existing CAD compaction/session-command
 tests pass unchanged apart from reversing the obsolete fake-link assertion: 25/25.
+
+---
+
+## 2026-08-27 — OpenRouter transport is private-OMP-only
+
+`config.get_provider("openrouter")` returned `OmpBridgeProvider` from the shared bridge-ID
+branch before reaching CAD's direct `OpenRouterProvider` branch, making the latter and its
+module production-unreachable. The only remaining direct consumer was a conformance test.
+
+Deleted the Python adapter and unreachable resolver branch. Conformance now pins the real
+contract — provider/model/key fields on `OmpBridgeProvider` — and tier prose names the private
+OMP bridge. Private `pi-ai` is the single owner of OpenRouter wire format, service tier,
+reasoning effort, retries, usage, and catalog semantics. 110 provider/tier tests pass.

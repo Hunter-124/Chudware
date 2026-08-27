@@ -48,6 +48,7 @@
 #include "ui/ai/plan_board.h"
 #include "ui/ai/ai_prefs.h"
 #include "ui/settings_modal.h"     // drawHarnessSessionKnobs (shared Options-tab run-behavior grid)
+#include "ui/code/code_workspace.h"
 #include "ui/ai/activity_view.h"   // composed Activity view (Active Work + Documents)
 #include "ui/ai/insights_view.h"   // composed Insights view (Leaderboard + Metrics)
 
@@ -1592,6 +1593,25 @@ static void drawNavColumn(AppState& st, float navW) {
     glassPanel(dl, wRect, GlassLevel::Thin, rowRoundDp(), surf);
 
     ImGui::Dummy(ImVec2(0, ui::metrics::cpMenuRowGap()));
+    if (st.codeWorkspaceMode) {
+        // ACP v0.1 supplies transcript Todo plans and sessions, but no job/subagent roster,
+        // CAD documents/artifacts, or leaderboard. Submit only the real Code surfaces so the
+        // rows naturally close up with no dead slots.
+        if (s_ai.view != 1 && s_ai.view != 3 && s_ai.view != 5) s_ai.view = 1;
+        if (navRow(1, "Tasks", s_ai.view == 1, surf))       s_ai.view = 1;
+        if (navRow(3, "Sessions", s_ai.view == 3, surf))    s_ai.view = 3;
+        ImGui::Dummy(ImVec2(0, ui::metrics::cpMenuSectionGap()));
+        const ImVec2 c = ImGui::GetCursorScreenPos();
+        dl->AddLine(ImVec2(c.x + ui::metrics::cpMenuRowGap(), c.y),
+                    ImVec2(c.x + navW - ui::metrics::cpMenuGutter() * 2.0f, c.y),
+                    ui::Palette::toU32(palette.glassBorder), ui::metrics::stroke(1.0f));
+        ImGui::Dummy(ImVec2(0, ui::metrics::cpMenuHeadGap()));
+        if (navRow(5, "Options", s_ai.view == 5, surf)) s_ai.view = 5;
+        drawWindowPillScrollbarV(surf);
+        ImGui::EndChild();
+        return;
+    }
+
 
     // Live-agent badge for the Agent Hub row; in-flight doc badge for Activity.
     int live = 0;
@@ -1659,7 +1679,9 @@ static void drawChatCenter(AppState& st, bool busy, bool canRun) {
         GlassGroup::Global);
     if (st.chat.empty()) {
         emptyState("ai_panel", "Start a conversation",
-                   "Describe what to build — the copilot plans, models and verifies it.");
+                   st.codeWorkspaceMode
+                       ? "Ask Chudcode about this workspace."
+                       : "Describe what to build — the copilot plans, models and verifies it.");
     } else {
         chatDrawLog(st);
         // Shared stick-to-bottom (releases on a user scroll-up). The region id scopes the flag
@@ -1690,6 +1712,27 @@ static void drawChatCenter(AppState& st, bool busy, bool canRun) {
 // regardless of label length (a fixed SameLine(labelW) crowded longer labels against their
 // control) and a left indent keeps content off the panel's glass edge.
 static void drawOptionsView(AppState& st, bool busy) {
+    if (st.codeWorkspaceMode) {
+        // ACP has no provider/model/effort configuration update in v0.1. Show the values the
+        // session reported, but do not render CAD config widgets whose writes cannot reach it.
+        sectionHeader("Chudcode session");
+        ImGui::Text("Provider: %s", ui::providerLabelForEndpoint(
+            st.settings.provider, st.settings.baseUrl));
+        ImGui::Text("Model: %s", st.settings.model[0] ? st.settings.model : "Default");
+        ImGui::Text("Effort: %s",
+                    st.settings.reasoningEffort[0] ? st.settings.reasoningEffort : "Default");
+        ImGui::Text("Transport: %s",
+                    ui::code::connected() ? "ACP connected" : "ACP disconnected");
+        ImGui::Dummy(ImVec2(0, ui::metrics::cpMenuCtlGap()));
+        ImGui::PushStyleColor(ImGuiCol_Text,
+            ImVec4(palette.textDisabled[0], palette.textDisabled[1],
+                   palette.textDisabled[2], 1.0f));
+        ImGui::TextWrapped("Provider, model, effort, workflow and CAD context controls are "
+                           "managed by Chudcode for this session.");
+        ImGui::PopStyleColor();
+        return;
+    }
+
     const float S = ui::uiScale;
     const ImGuiTableFlags gridFlags =
         ImGuiTableFlags_SizingStretchSame | ImGuiTableFlags_NoPadOuterX;
@@ -1787,7 +1830,8 @@ static void drawViewPane(AppState& st, bool busy) {
     // yanks the panel to the Agent Hub view so the streaming roster + execution trace show
     // without manual picking (a background chat's run never steals the panel).
     const std::string& liveRun = agStore(st.activeConvId()).runId;
-    if (aiFollowActiveSession() && !liveRun.empty() && liveRun != s_ai.lastAutoRun) {
+    if (!st.codeWorkspaceMode && aiFollowActiveSession() &&
+        !liveRun.empty() && liveRun != s_ai.lastAutoRun) {
         s_ai.lastAutoRun = liveRun;
         s_ai.view        = 0;
     }
@@ -1800,8 +1844,10 @@ static void drawViewPane(AppState& st, bool busy) {
         case 0:  // Agent Hub: sub-agent roster + live agent-execution DAG.
             drawAgentHubView(st);
             break;
-        case 1:  // Session Plan: the plan board over persisted buildgraph runs.
-            if (!st.workerStarted)
+        case 1:
+            if (st.codeWorkspaceMode)
+                chatDrawTasksList(st, busy);  // ACP Todo plan mapped into the real task renderer
+            else if (!st.workerStarted)
                 emptyState("health_check", "Worker not running",
                            "The Chudware worker service is required to load and steer plans.");
             else
@@ -1820,7 +1866,7 @@ static void drawViewPane(AppState& st, bool busy) {
             drawOptionsView(st, busy);
             break;
         default:
-            s_ai.view = 0;
+            s_ai.view = st.codeWorkspaceMode ? 1 : 0;
             break;
     }
     drawWindowPillScrollbarV(viewSurf);
@@ -1828,23 +1874,19 @@ static void drawViewPane(AppState& st, bool busy) {
 }
 
 void drawAiWorkspace(AppState& st) {
-    const float S      = ui::uiScale;
-    const bool  busy   = st.convRunning(st.activeConvId());
-    const bool  canRun = st.workerStarted && !busy;
+    const float S = ui::uiScale;
+    const bool busy = chatTurnActive(st);
+    const bool canRun = st.codeWorkspaceMode
+        ? (ui::code::connected() && !busy)
+        : (st.workerStarted && !busy);
 
-    // Keep model discovery + the doc-bound conversation set fresh even when the docked
-    // Copilot column is not drawn (this hub replaces it in the AI workspace).
-    refreshModelAvailability(st, false);
+    if (!st.codeWorkspaceMode) refreshModelAvailability(st, false);
     chatWorkspaceSync(st);
-    activeWorkPump(st);  // drive at most one Active Work preview render per frame (thumb queue)
-    // Registry poll lives at the workspace level (throttled, single in-flight) so the nav
-    // badge, the popup transcripts and the auto-pop of NEW live sub-agents work no matter
-    // which view is selected — not just while the Agent Hub is showing.
-    pollSubagentList(st);
-    // Resume-safe autosave: the docked Copilot column (which normally drives this) is not
-    // drawn while the AI tab is active, so flush streaming chat here too — a crash mid-turn
-    // keeps the assistant text on disk (drafts ride the shared composer's savePromptDraft).
-    maybePersistChatHistoryDebounced(st, /*force=*/false);
+    if (!st.codeWorkspaceMode) {
+        activeWorkPump(st);
+        pollSubagentList(st);
+        maybePersistChatHistoryDebounced(st, /*force=*/false);
+    }
 
     // v3 layout (Hunter's directive): MAIN CHAT on the left, everything else in the right
     // utility panel — a vertical nav menu + the selected view. No sessions rail, no bottom
@@ -1918,7 +1960,7 @@ void drawAiWorkspace(AppState& st) {
     }
 
     // Floating sub-agent chat windows draw last (above the whole workspace).
-    drawSubagentPopups(st);
+    if (!st.codeWorkspaceMode) drawSubagentPopups(st);
 }
 
 }  // namespace ui

@@ -25,6 +25,7 @@
 #include "core/engine_events.h"  // core::mirrorRecoveredDocs — Reopen a dismissed live agent doc
 #include "ui/ai/ai_prefs.h"      // ui::chatShowRenders — Artifacts render-thumbnail display pref
 #include "gl_compat.h"           // glDeleteTextures — LRU eviction of render thumbnails
+#include "ui/code/code_workspace.h"
 #include <string_view>
 
 namespace ui {
@@ -44,13 +45,14 @@ enum class CpTab { Chat, Tasks, Artifacts, Sessions, Settings };
 
 static CpTab cpActiveTab(const AppState& st) {
     if (st.showTaskList)          return CpTab::Tasks;
-    if (st.showArtifacts)         return CpTab::Artifacts;
+    if (st.showArtifacts && !st.codeWorkspaceMode) return CpTab::Artifacts;
     if (st.showSessionsPicker)    return CpTab::Sessions;
     if (st.showAISettingsOverlay) return CpTab::Settings;
     return CpTab::Chat;
 }
 
 static void cpSetTab(AppState& st, CpTab t) {
+    if (st.codeWorkspaceMode && t == CpTab::Artifacts) t = CpTab::Chat;
     st.showTaskList          = (t == CpTab::Tasks);
     st.showArtifacts         = (t == CpTab::Artifacts);
     st.showSessionsPicker    = (t == CpTab::Sessions);
@@ -98,6 +100,7 @@ static void copilotTaskProgress(AppState& st, int& done, int& total) {
 }
 
 static void drawCopilotHeader(AppState& st, bool busy) {
+    if (st.codeWorkspaceMode && st.showArtifacts) cpSetTab(st, CpTab::Chat);
     const auto& pal = ui::palette;
     const float sc = ui::uiScale;
     const ImGuiStyle& style = ImGui::GetStyle();
@@ -159,30 +162,30 @@ static void drawCopilotHeader(AppState& st, bool busy) {
     // every pill to the same overlapping x, piling "0/0" on top of the wordmark. Shed LABELS in
     // order of value instead (icons + tooltips still identify each tab); never drop a tab.
     // The gear is always icon-only — it reads as a gear, and its tooltip names it.
+    const bool showArtifacts = !st.codeWorkspaceMode;
+    const char* optionsLabel = st.codeWorkspaceMode ? "Options" : "Settings";
     const float markGap = 6.0f * sc;
-    const float gearW = measureBtn("Settings", "settings", false);
-    bool lChat = true, lTasks = true, lArts = true, lSess = true;
+    const float gearW = measureBtn(optionsLabel, "settings", false);
+    bool lChat = true, lTasks = true, lArts = showArtifacts, lSess = true;
     auto rowFits = [&]() -> bool {
         const float chatMeasured = measureBtn("Chat", "ai_panel", lChat);
         const float sessMeasured = measureBtn("Sessions", "history", lSess);
         const float chatSessionsW = std::max(chatMeasured, sessMeasured);
-        const float w = chatSessionsW * 2.0f +
-                        measureBtn(tlLabel, "plan_board", lTasks) +
-                        measureBtn("Artifacts", "artifacts", lArts) +
-                        gearW + 4.0f * minGap;
+        float w = chatSessionsW * 2.0f +
+                  measureBtn(tlLabel, "plan_board", lTasks) + gearW + 3.0f * minGap;
+        if (showArtifacts)
+            w += measureBtn("Artifacts", "artifacts", lArts) + minGap;
         return w <= (colW - rightInset - contentLeftInset - markSz - markGap);
     };
-    if (!rowFits()) { lArts = false;
-    if (!rowFits()) { lSess = false;
-    if (!rowFits()) { lTasks = false;
-    if (!rowFits()) { lChat = false; } } } }
-    // Chat and Sessions are one visual pair: both use the larger of their current responsive
-    // measurements, so their submitted hit boxes and painted pills remain exactly equal.
+    if (showArtifacts && !rowFits()) lArts = false;
+    if (!rowFits()) lSess = false;
+    if (!rowFits()) lTasks = false;
+    if (!rowFits()) lChat = false;
     const float chatSessionsW = std::max(measureBtn("Chat", "ai_panel", lChat),
                                          measureBtn("Sessions", "history", lSess));
     const float chatW = chatSessionsW;
     const float tlW   = measureBtn(tlLabel, "plan_board", lTasks);
-    const float artW  = measureBtn("Artifacts", "artifacts", lArts);
+    const float artW  = showArtifacts ? measureBtn("Artifacts", "artifacts", lArts) : 0.0f;
     const float sessW = chatSessionsW;
 
     // ---- Collapse chip: drawn INSIDE this window at an absolute screen position
@@ -294,10 +297,13 @@ static void drawCopilotHeader(AppState& st, bool busy) {
     HeaderBtnHit hTasks = headerTextButtonHit("##hdr_tasks", tlW);
     if (hTasks.clicked) tabOut = cpTabAfterClick(tabIn, CpTab::Tasks);
 
-    centerY(frameH);
-    ImGui::SetCursorPosX(place(artW));
-    HeaderBtnHit hArts = headerTextButtonHit("##hdr_arts", artW);
-    if (hArts.clicked) tabOut = cpTabAfterClick(tabIn, CpTab::Artifacts);
+    HeaderBtnHit hArts{};
+    if (showArtifacts) {
+        centerY(frameH);
+        ImGui::SetCursorPosX(place(artW));
+        hArts = headerTextButtonHit("##hdr_arts", artW);
+        if (hArts.clicked) tabOut = cpTabAfterClick(tabIn, CpTab::Artifacts);
+    }
 
     centerY(frameH);
     ImGui::SetCursorPosX(place(sessW));
@@ -314,9 +320,11 @@ static void drawCopilotHeader(AppState& st, bool busy) {
     if (tabOut != tabIn) cpSetTab(st, tabOut);
     headerTextButtonPaint(hChat,  "Chat",      tabOut == CpTab::Chat,      "ai_panel",  lChat);
     headerTextButtonPaint(hTasks, tlLabel,     tabOut == CpTab::Tasks,     "plan_board", lTasks);
-    headerTextButtonPaint(hArts,  "Artifacts", tabOut == CpTab::Artifacts, "artifacts", lArts);
-    headerTextButtonPaint(hSess,  "Sessions",  tabOut == CpTab::Sessions,  "history",   lSess);
-    headerTextButtonPaint(hGear,  "Settings",  tabOut == CpTab::Settings,  "settings",  false);
+    if (showArtifacts)
+        headerTextButtonPaint(hArts, "Artifacts", tabOut == CpTab::Artifacts,
+                              "artifacts", lArts);
+    headerTextButtonPaint(hSess, "Sessions", tabOut == CpTab::Sessions, "history", lSess);
+    headerTextButtonPaint(hGear, optionsLabel, tabOut == CpTab::Settings, "settings", false);
 
     // One tooltip at most; each says what the click will DO, including the click that takes
     // you back to the conversation. The brand mark's tooltip is the run status.
@@ -328,7 +336,7 @@ static void drawCopilotHeader(AppState& st, bool busy) {
         if (tabOut == CpTab::Tasks) ImGui::SetTooltip("%s", kBack);
         else ImGui::SetTooltip("Tasks \xc2\xb7 %d of %d done \xc2\xb7 click for the task list",
                                tlDone, tlTotal);
-    } else if (hArts.hovered) {
+    } else if (showArtifacts && hArts.hovered) {
         ImGui::SetTooltip(tabOut == CpTab::Artifacts
                               ? kBack
                               : "Artifacts \xc2\xb7 documents, renders and files this session");
@@ -338,7 +346,9 @@ static void drawCopilotHeader(AppState& st, bool busy) {
     } else if (hGear.hovered) {
         ImGui::SetTooltip(tabOut == CpTab::Settings
                               ? kBack
-                              : "AI settings \xc2\xb7 provider, model, privacy");
+                              : (st.codeWorkspaceMode
+                                     ? "Chudcode options \xc2\xb7 current session configuration"
+                                     : "AI settings \xc2\xb7 provider, model, privacy"));
     } else if (markHovered) {
         ImGui::SetTooltip("%s", statusTip);
     }
@@ -433,30 +443,28 @@ static bool hasProjectArtifact(const std::vector<ChatMsg>& msgs,
 
 // Sessions list — replaces the chat log while open so users can jump between sessions easily.
 void drawSessionsPanel(AppState& st, bool busy) {
-    (void)busy;  // runs are per-conversation; this panel never locks on the viewed run
+    (void)busy;
+    const bool codeMode = st.codeWorkspaceMode;
     const float sc = ui::uiScale;
-    const auto& pal = ui::palette;
     const ui::AdaptiveSurface& surf = chatSurf();
 
-    ensureConversations(st);
+    if (!codeMode) ensureConversations(st);
 
-    // One title treatment for every copilot menu (ui_common cpMenu*). The "Show archived"
-    // filter sits in the header's accessory slot — above the rule, next to the title cluster
-    // — instead of a full body row between the button and the list.
     static bool s_showArchived = false;
-    ui::cpMenuHeader(st.fonts, "Sessions", nullptr, [&]{
-        // Checkbox ink must come from the glass surface like every other label in this menu:
-        // the theme's default text tone is tuned for opaque panels and vanished against the
-        // bright viewport backdrop showing through the copilot column.
-        ImGui::PushStyleColor(ImGuiCol_Text, surf.textPrimary);
-        ImGui::Checkbox("Show archived", &s_showArchived);
-        ImGui::PopStyleColor();
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip(s_showArchived
-                ? "Showing archived sessions only. Uncheck to return to your active list."
-                : "Archived sessions are hidden from this list \xe2\x80\x94 check to review or "
-                  "restore them. Archiving keeps the full transcript (unlike Delete).");
-    });
+    if (codeMode) {
+        ui::cpMenuHeader(st.fonts, "Sessions");
+    } else {
+        ui::cpMenuHeader(st.fonts, "Sessions", nullptr, [&]{
+            ImGui::PushStyleColor(ImGuiCol_Text, surf.textPrimary);
+            ImGui::Checkbox("Show archived", &s_showArchived);
+            ImGui::PopStyleColor();
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip(s_showArchived
+                    ? "Showing archived sessions only. Uncheck to return to your active list."
+                    : "Archived sessions are hidden from this list \xe2\x80\x94 check to review or "
+                      "restore them. Archiving keeps the full transcript (unlike Delete).");
+        });
+    }
 
     // New-session is the one PRIMARY action in the copilot menus, so it uses the accent
     // primaryButton rather than the theme's default slab (which rendered as a flat dark block
@@ -467,9 +475,22 @@ void drawSessionsPanel(AppState& st, bool busy) {
     // sessions mid-run is safe — this is the multi-session workflow.
     ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, ui::metrics::cpMenuChipRound());
     if (primaryButton("+ New session", ImVec2(-1, 0))) {
-        newConversation(st);
-        st.prompt[0] = 0;
-        cpSetTab(st, CpTab::Chat);   // land in the new chat, not stuck on the list
+        bool accepted = true;
+        if (codeMode) {
+            std::string err;
+            accepted = ui::code::newSession(st, err);
+            if (!accepted && !err.empty()) st.toast(ui::ToastLevel::Warn, err.c_str());
+        } else {
+            newConversation(st);
+            st.prompt[0] = 0;
+        }
+        if (accepted) {
+            if (codeMode) {
+                st.prompt[0] = 0;
+                st.pendingAttachments.clear();
+            }
+            cpSetTab(st, CpTab::Chat);
+        }
     }
     ImGui::PopStyleVar();
     if (ImGui::IsItemHovered()) ImGui::SetTooltip("Start a fresh conversation.");
@@ -497,12 +518,11 @@ void drawSessionsPanel(AppState& st, bool busy) {
     // most recent session — walk the vector back-to-front so it lands at the TOP of the list.
     for (int i = (int)st.conversations.size() - 1; i >= 0; --i) {
         Conversation& c = st.conversations[i];
-        if (c.archived != s_showArchived) continue;
-        // A session belongs in this project-scoped list only when its own transcript has a
-        // produced file/image/mesh under the active project root. The active transcript lives
-        // in st.chat; parked conversations retain theirs in Conversation::msgs.
+        if (!codeMode && c.archived != s_showArchived) continue;
+        // CAD sessions remain project/artifact scoped. ACP sessions are already the
+        // authoritative list for the selected Code workspace and must never be filtered by CAD.
         const std::vector<ChatMsg>& msgs = (i == st.activeConv) ? st.chat : c.msgs;
-        if (!hasProjectArtifact(msgs, projectRoot, projectKey)) continue;
+        if (!codeMode && !hasProjectArtifact(msgs, projectRoot, projectKey)) continue;
         anyRowShown = true;
         // Fallback number is the conversation's own slot, not the display row — with the
         // newest-first order a row position changes every session, a slot number does not.
@@ -522,20 +542,18 @@ void drawSessionsPanel(AppState& st, bool busy) {
             std::snprintf(sub, sizeof(sub), "1 message");
         else
             std::snprintf(sub, sizeof(sub), "%d messages", nMsg);
+        const bool allowFork = !codeMode || ui::code::capabilities().fork;
         const char* archLabel = c.archived ? "Restore" : "Archive";
         const float archBtnW = ImGui::CalcTextSize(archLabel).x + 16.0f * sc;
         const float forkBtnW = ImGui::CalcTextSize("Fork").x + 16.0f * sc;
         const float actionGap = 4.0f * sc;
-        // Action-zone geometry must be computed ONCE and shared by the title clip and the
-        // buttons below: the reserve used to assume the trash button was trashSz wide, but
-        // the drawn ImageButton is img + FramePadding*2 (wider) — the Archive button slid
-        // left over the title text on active/hovered rows.
         const float delImg  = trashSz - 8.0f * sc;
         const float delBtnW = delImg + style.FramePadding.x * 2.0f;
         const float delBtnH = delImg + style.FramePadding.y * 2.0f;
         const float rightMargin = 4.0f * sc;
-        const float actionsW = delBtnW + archBtnW + forkBtnW +
-                               actionGap * 2.0f + rightMargin;
+        const float actionsW = codeMode
+            ? (allowFork ? forkBtnW + rightMargin : 0.0f)
+            : delBtnW + archBtnW + forkBtnW + actionGap * 2.0f + rightMargin;
 
         ImGui::PushID(i);
         const ImVec2 rowMin = ImGui::GetCursorScreenPos();
@@ -548,7 +566,7 @@ void drawSessionsPanel(AppState& st, bool busy) {
         // as the buttons taking their place. Hover is tested against the row rect directly:
         // the reserve is needed BEFORE this frame's InvisibleButton reports its hover state.
         const bool rowHot = active || ImGui::IsMouseHoveringRect(rowMin, rowMax);
-        const float actionsReserve = rowHot ? actionsW : 0.0f;
+        const float actionsReserve = (rowHot && actionsW > 0.0f) ? actionsW : 0.0f;
 
         bool picked = ImGui::InvisibleButton("##pickconv",
                                             ImVec2(std::max(1.0f, rowW - actionsReserve - padX), rowH));
@@ -559,11 +577,18 @@ void drawSessionsPanel(AppState& st, bool busy) {
         // Picking stays live during a run (multi-session): switching parks the viewed
         // conversation; its run keeps streaming into it in the background.
         if (picked) {
-            // Always land in chat for the chosen session — including re-clicking
-            // the already-active one (switchConversation early-returns on same idx).
-            if (i != st.activeConv)
-                switchConversation(st, i);
-            cpSetTab(st, CpTab::Chat);
+            bool accepted = true;
+            if (i != st.activeConv) {
+                if (codeMode) {
+                    std::string err;
+                    accepted = ui::code::selectSession(st, c.id, err);
+                    if (!accepted && !err.empty())
+                        st.toast(ui::ToastLevel::Warn, err.c_str());
+                } else {
+                    switchConversation(st, i);
+                }
+            }
+            if (accepted) cpSetTab(st, CpTab::Chat);
         }
 
         // Re-read the selection: `active` above was captured BEFORE the click that just
@@ -578,7 +603,7 @@ void drawSessionsPanel(AppState& st, bool busy) {
         // semanticOnGlass keeps the chip ink legible over dark + light glass. (The old 3px
         // left-edge bar read as a stray vertical line above the rows — removed.)
         float chipW = 0.0f;   // chip + its gap to the title — the title clip reserves this
-        if (c.scopeClass >= 0) {
+        if (!codeMode && c.scopeClass >= 0) {
             float scopeRgba[4];
             scopeClassColor(c.scopeClass, scopeRgba);
             const ImVec4 scopeCol = semanticOnGlass(scopeRgba, surf);
@@ -634,7 +659,7 @@ void drawSessionsPanel(AppState& st, bool busy) {
         // badge's invisible click target swallowed the row-action clicks).
         std::string badge;
         int badgeTab = -1;
-        const bool showBadge = !rowHot;
+        const bool showBadge = !codeMode && !rowHot;
         if (showBadge && c.docLink.rfind("file:", 0) == 0) {
             const std::string p = c.docLink.substr(5);
             const size_t slash = p.find_last_of("/\\");
@@ -698,16 +723,21 @@ void drawSessionsPanel(AppState& st, bool busy) {
         bool doDel = false;
         bool doArchiveToggle = false;
         bool doFork = false;
-        if (rowHot) {
+        if (rowHot && codeMode && allowFork) {
+            const float forkX = rowMax.x - forkBtnW - rightMargin;
+            ImGui::SetCursorScreenPos(ImVec2(forkX, rowMin.y + (rowH - delBtnH) * 0.5f));
+            doFork = ImGui::Button("Fork", ImVec2(forkBtnW, delBtnH));
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Fork this Chudcode session.");
+        } else if (rowHot && !codeMode) {
             const float delX = rowMax.x - delBtnW - rightMargin;
             ImGui::SetCursorScreenPos(ImVec2(delX, rowMin.y + (rowH - delBtnH) * 0.5f));
             IconUV trash = ui::getIcon("delete", 20);
             bool del = trash.valid
-                ? ImGui::ImageButton("##delconv", trash.texId, ImVec2(delImg, delImg), trash.uv0, trash.uv1)
+                ? ImGui::ImageButton("##delconv", trash.texId, ImVec2(delImg, delImg),
+                                     trash.uv0, trash.uv1)
                 : ImGui::SmallButton("x");
             if (ImGui::IsItemHovered()) ImGui::SetTooltip("Delete this session");
-            // Destructive row actions are blocked only for the row whose own run is live —
-            // an unrelated background run never locks them.
             doDel = del && !running;
 
             const float archX = delX - archBtnW - actionGap;
@@ -730,13 +760,23 @@ void drawSessionsPanel(AppState& st, bool busy) {
         ImGui::SetCursorScreenPos(ImVec2(rowMin.x, rowMax.y + rowGap));
         ImGui::PopID();
         if (doDel) { closeConversation(st, i); break; }
-        if (doFork) { forkConversation(st, i); break; }
+        if (doFork) {
+            if (codeMode) {
+                std::string err;
+                if (!ui::code::forkSession(st, c.id, err) && !err.empty())
+                    st.toast(ui::ToastLevel::Warn, err.c_str());
+            } else {
+                forkConversation(st, i);
+            }
+            break;
+        }
         if (doArchiveToggle) { archiveConversation(st, i, !c.archived); break; }
     }
     if (!anyRowShown) {
-        // Same tone and indent as every other "nothing here yet" line in the copilot menus.
-        ui::cpMenuHint(s_showArchived ? "No archived sessions match this project."
-                                      : "No sessions with artifacts in this project.");
+        ui::cpMenuHint(codeMode
+            ? "No Chudcode sessions yet."
+            : (s_showArchived ? "No archived sessions match this project."
+                              : "No sessions with artifacts in this project."));
     }
 
 }
@@ -1545,6 +1585,7 @@ static void drawArtifactsPanel(AppState& st, bool busy) {
                       ui_.showOtherDocs ? "Hide" : "Show", (int)otherDocs.size(),
                       otherDocs.size() == 1 ? "" : "s");
         if (ui::kit::secondaryButton(line)) ui_.showOtherDocs = !ui_.showOtherDocs;
+
         if (ui_.showOtherDocs) {
             ImGui::PushID("arti_other_docs");
             for (const ArtiDocRow* r : otherDocs)
@@ -1553,6 +1594,29 @@ static void drawArtifactsPanel(AppState& st, bool busy) {
         }
     }
     ImGui::Dummy(ImVec2(0, ui::kit::rowGap()));
+}
+static void drawCodeOptionsBody(AppState& st) {
+    ui::cpMenuHeader(st.fonts, "Options",
+                     "Chudcode session configuration is reported by ACP and is read-only here.");
+    ui::cpMenuSection("Session");
+    const ui::AdaptiveSurface& surf = chatSurf();
+    ImGui::PushStyleColor(ImGuiCol_Text, surf.textSecondary);
+    ImGui::TextUnformatted("Provider");
+    ImGui::SameLine();
+    ImGui::TextUnformatted(ui::providerLabelForEndpoint(
+        st.settings.provider, st.settings.baseUrl));
+    ImGui::TextUnformatted("Model");
+    ImGui::SameLine();
+    ImGui::TextUnformatted(st.settings.model[0] ? st.settings.model : "Default");
+    ImGui::TextUnformatted("Effort");
+    ImGui::SameLine();
+    ImGui::TextUnformatted(st.settings.reasoningEffort[0]
+                               ? st.settings.reasoningEffort
+                               : "Default");
+    ImGui::TextUnformatted("Transport");
+    ImGui::SameLine();
+    ImGui::TextUnformatted(ui::code::connected() ? "ACP connected" : "ACP disconnected");
+    ImGui::PopStyleColor();
 }
 
 
@@ -1565,7 +1629,7 @@ void drawAIPanel(AppState& st, bool busy, bool canRun) {
     // model loaded in LM Studio isn't discovered until the user opens the picker ("pokes around
     // in settings"). The probe is throttled to ~5s and no-ops for a non-loopback (cloud)
     // base_url, so this is cheap.
-    refreshModelAvailability(st, false);
+    if (!st.codeWorkspaceMode) refreshModelAvailability(st, false);
 
     static float s_paneW = 0.0f;                    // column width (px), session-persistent
     // s_cpCollapsed is file-scoped (shared with drawCopilotHeader's collapse chevron). Seed it
@@ -1682,8 +1746,12 @@ void drawAIPanel(AppState& st, bool busy, bool canRun) {
     // focusSettingsTab opens the Settings modal AI tab (full form + leaderboard).
     // The in-column gear uses showAISettingsOverlay instead.
     if (st.focusSettingsTab) {
-        st.openSettings     = true;
-        st.openSettingsTab  = 2;
+        if (st.codeWorkspaceMode) {
+            cpSetTab(st, CpTab::Settings);
+        } else {
+            st.openSettings = true;
+            st.openSettingsTab = 2;
+        }
         st.focusSettingsTab = false;
     }
 
@@ -1699,6 +1767,7 @@ void drawAIPanel(AppState& st, bool busy, bool canRun) {
     // AFTER syncChatToDoc (which loads/ensures the resident sessions) and re-tops-up each frame so
     // the demo rows survive to the capture frame. Screenshot-only — gated on the env var, no effect
     // in a normal run.
+    if (!st.codeWorkspaceMode)
     if (const char* cpView = std::getenv("CHUDWARE_COPILOT_VIEW")) {
         ensureConversations(st);
         st.conversations[0].title = "Knurled hex standoff";
@@ -1730,7 +1799,7 @@ void drawAIPanel(AppState& st, bool busy, bool canRun) {
     // runtime banner down is gated on bodyVisible() so a collapsed column costs nothing per frame.
     s_cpAnim.measureHeader();
     if (s_cpAnim.bodyVisible()) {
-        drawRuntimeBanner(st);
+        if (!st.codeWorkspaceMode) drawRuntimeBanner(st);
 
         // Settings / Sessions / Tasks / Artifacts overlays replace the chat log (and hide the
         // composer) while open. They are mutually exclusive (the header toggles clear the
@@ -1796,7 +1865,8 @@ void drawAIPanel(AppState& st, bool busy, bool canRun) {
                           ImGuiWindowFlags_NoScrollbar);
         if (padR > padL) ImGui::Indent(padL - padR);   // negative: pull the LEFT edge back to padL
         if (st.showAISettingsOverlay) {
-            drawAISettingsBody(st, busy);
+            if (st.codeWorkspaceMode) drawCodeOptionsBody(st);
+            else drawAISettingsBody(st, busy);
         } else if (st.showTaskList || st.showArtifacts || st.showSessionsPicker) {
             // The menu views run at the docked-pane rhythm whatever the host pushed around us.
             ui::kit::pushDensity(ui::kit::Density::Cozy);
@@ -1859,7 +1929,7 @@ void drawAIPanel(AppState& st, bool busy, bool canRun) {
     }  // s_cpAnim.bodyVisible()
 
     // Side-channel /btw answer panel (not part of chat history).
-    drawBtwPanel(st);
+    if (!st.codeWorkspaceMode) drawBtwPanel(st);
 
     ImGui::End();
 }
@@ -1872,10 +1942,12 @@ void drawAIPanel(AppState& st, bool busy, bool canRun) {
 void chatWorkspaceSync(AppState& st) {
     syncChatToDoc(st);
     maybePersistChatHistoryDebounced(st, /*force=*/false);
-    ensureConversations(st);
+    if (!st.codeWorkspaceMode) ensureConversations(st);
 }
 
-bool chatTurnActive(AppState& st) { return aiTurnActive(st); }
+bool chatTurnActive(AppState& st) {
+    return st.codeWorkspaceMode ? activeConversationRunning(st) : aiTurnActive(st);
+}
 
 void chatDrawLog(AppState& st) {
     drawChatLogWindowed(st);   // M19: render-windowed endless scroll-back (shared with drawAIPanel)
@@ -1884,6 +1956,8 @@ void chatDrawLog(AppState& st) {
 void chatDrawComposer(AppState& st, bool busy, bool canRun) { drawComposer(st, busy, canRun); }
 
 void chatDrawSessionsList(AppState& st, bool busy) { drawSessionsPanel(st, busy); }
+
+void chatDrawTasksList(AppState& st, bool busy) { drawTaskListPanel(st, busy); }
 
 
 }  // namespace ui

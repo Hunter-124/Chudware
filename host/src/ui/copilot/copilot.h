@@ -188,8 +188,5 @@ void chatLogJumpToBottom(const char* regionId);
 void chatDrawJumpToLatest(const char* regionId, const ImVec2& viewMin, const ImVec2& viewMax);
 void chatDrawComposer(AppState& st, bool busy, bool canRun);  // prelude + input + toolbar (real send path)
 void chatDrawSessionsList(AppState& st, bool busy);           // session rows + "+ New session"
-// Same authoritative phased Todo/plan renderer used by the docked Copilot Tasks view.
-// Exported for the Code-mode AI workspace so it never grows a second task UI.
-void chatDrawTasksList(AppState& st, bool busy);
 
 }  // namespace ui

@@ -12,7 +12,6 @@
 #include "status_bar.h"
 
 #include "../core/app_state.h"
-#include "code/code_workspace.h"
 #include "sketch_mode.h"   // C18
 #include "sketch3d_mode.h" // 3D sketch status readout
 #include "plm/plm_quickbar.h"  // embedded per-doc PLM control
@@ -422,21 +421,11 @@ void drawStatusBar(AppState& st, ImGuiViewport* vp, float statusH, bool busy,
     // providers like ZenMux); the old hardcoded 0-6 chain mislabeled newer slots "Local".
     // Endpoint-refined so the shared cloud slot names the ACTUAL service (Moonshot / DeepSeek /
     // DashScope) instead of reading "OpenRouter / Cloud API" for all of them.
-    const auto& codeConfig = ui::code::sessionConfiguration();
     const char* provName =
         ui::providerLabelForEndpoint(st.settings.provider, st.settings.baseUrl);
-    std::string ptxt;
-    if (st.codeWorkspaceMode) {
-        const std::string mode = codeConfig.mode.empty() ? "mode pending" : codeConfig.mode;
-        const std::string model = codeConfig.model.empty() ? "model pending" : codeConfig.model;
-        const std::string thinking =
-            codeConfig.thinking.empty() ? "thinking pending" : codeConfig.thinking;
-        ptxt = mode + "  /  " + model + "  /  " + thinking;
-    } else {
-        ptxt = std::string(provName) + "  /  " +
-               (st.settings.model[0] ? st.settings.model : "default") +
-               (st.settings.planMode ? "   [plan mode]" : "");
-    }
+    std::string ptxt = std::string(provName) + "  /  " +
+                       (st.settings.model[0] ? st.settings.model : "default") +
+                       (st.settings.planMode ? "   [plan mode]" : "");
     // C24: the unit-system cluster mirrors SolidWorks — it shows MMGS / IPS and clicking it
     // toggles the active document unit system, reformatting every dimension display app-wide.
     const char* unitsTxt = st.ips() ? "IPS" : "MMGS";
@@ -502,18 +491,11 @@ void drawStatusBar(AppState& st, ImGuiViewport* vp, float statusH, bool busy,
         }
         return w;
     };
-    bool showWs = !wsTok.empty() && !st.codeWorkspaceMode,
-         showVs = vsTxt[0] != 0 && !st.codeWorkspaceMode,
-         showUnits = !st.codeWorkspaceMode,
-         showEdit = !editStr.empty() && !st.codeWorkspaceMode,
-         showProv = true, showModel = true;
-    // Provider without the model id: in Code mode the compact form is still the
-    // authoritative ACP model; CAD mode keeps the established provider label.
-    const std::string provShort = st.codeWorkspaceMode
-                                      ? (codeConfig.model.empty() ? "model pending"
-                                                                  : codeConfig.model)
-                                      : std::string(provName) +
-                                            (st.settings.planMode ? "   [plan mode]" : "");
+    bool showWs = !wsTok.empty(), showVs = vsTxt[0] != 0, showUnits = true,
+         showEdit = !editStr.empty(), showProv = true, showModel = true;
+    // Provider without the model id: the shortest form that still names where completions go.
+    const std::string provShort =
+        std::string(provName) + (st.settings.planMode ? "   [plan mode]" : "");
     auto rebuild = [&]() {
         toks.clear();
         if (showWs)    toks.push_back({RTokKind::Ws,    wsTok,    wsTok});

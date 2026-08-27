@@ -1,0 +1,34 @@
+diff --git a/packages/coding-agent/test/agent-storage-sqlite-compat.test.ts b/packages/coding-agent/test/agent-storage-sqlite-compat.test.ts
+index 290da402..4a1b5ec1 100644
+--- a/packages/coding-agent/test/agent-storage-sqlite-compat.test.ts
++++ b/packages/coding-agent/test/agent-storage-sqlite-compat.test.ts
+@@ -1,5 +1,6 @@
+ import { Database } from "bun:sqlite";
+ import { afterEach, describe, expect, it } from "bun:test";
++import * as fs from "node:fs";
+ import * as path from "node:path";
+ import { AgentStorage, SCHEMA_VERSION } from "@oh-my-pi/pi-coding-agent/session/agent-storage";
+ import { TempDir } from "@oh-my-pi/pi-utils";
+@@ -96,4 +97,22 @@ describe("AgentStorage SQLite compatibility", () => {
+ 		expect(storage.getModelUsageOrder()).toEqual(["anthropic/claude-sonnet-4-5"]);
+ 		expect(readSettingsRows(dbPath)).toEqual([{ key: "theme", value: '"dark"', updated_at: LEGACY_TIMESTAMP }]);
+ 	});
++
++	it("quarantines a corrupted database and opens a fresh one", async () => {
++		tempDir = TempDir.createSync("@omp-agent-storage-corrupt-");
++		const dbPath = path.join(tempDir.path(), "agent.db");
++		fs.writeFileSync(dbPath, "definitely not a sqlite database, garbage bytes here");
++		fs.writeFileSync(`${dbPath}-wal`, "garbage-wal");
++		fs.writeFileSync(`${dbPath}-shm`, "garbage-shm");
++
++		const storage = await AgentStorage.open(dbPath);
++
++		expect(storage.getModelUsageOrder()).toEqual([]);
++		expect(readSchemaVersion(dbPath)).toBe(SCHEMA_VERSION);
++		const files = fs.readdirSync(tempDir.path());
++		expect(files.some(name => name.startsWith("agent.db.corrupt-"))).toBe(true);
++		expect(files.some(name => name.startsWith("agent.db-wal.corrupt-"))).toBe(true);
++		expect(files.some(name => name.startsWith("agent.db-shm.corrupt-"))).toBe(true);
++		expect(fs.existsSync(dbPath)).toBe(true);
++	});
+ });

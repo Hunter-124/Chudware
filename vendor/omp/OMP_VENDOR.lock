@@ -9,6 +9,14 @@
     "packages/coding-agent/src/session/agent-storage.ts",
     "packages/coding-agent/test/agent-storage-sqlite-compat.test.ts"
   ],
+  "local_patches": {
+    "01-packages__ai__src__auth-storage.ts.patch": "bf4550bcc79328e86369fc2e8ddd35f1129871ef3afad854d3d842f4c27d3e5d",
+    "02-packages__ai__src__registry__oauth__oauth.html.patch": "9f4182b67d9ae7b3b95f80f8095574e9e71b96d5e39eb485ad10d3d4480288b7",
+    "03-packages__ai__test__callback-server-launch-route.test.ts.patch": "94b8fd231f1bfd150045c0eb5142315df0464ee5ec1e9d9b27a94c5ecd1957c9",
+    "04-packages__coding-agent__src__session__agent-storage.ts.patch": "982385ba84fc7600f88bf37874e59aad4d1533780990bd49d8c868f14d76c023",
+    "05-packages__coding-agent__test__agent-storage-sqlite-compat.test.ts.patch": "e26b3e0efaeab940f32c2f77355d6d48aaaeac8b6e29adbc02bdad3d90ac3d55",
+    "README.md": "3d09e2a72347f75d8bb9e7f6945d3a4e0d785ea33d82cecee85af8a7746171a8"
+  },
   "packages": [
     "ai",
     "catalog",

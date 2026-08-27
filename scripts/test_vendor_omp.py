@@ -8,7 +8,10 @@ points nowhere near the vendoring step.
 
 from __future__ import annotations
 
+import hashlib
 import json
+import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -104,3 +107,100 @@ def test_preserved_artifacts_are_not_content_pinned(vendored):
 def test_revendor_prunes_non_runtime_dirs(vendored):
     """Vendoring trims test dirs; if that stops working the vendored tree balloons."""
     assert not (vendored / "packages" / "ai" / "test").exists()
+
+
+def _git(root: Path, *args: str) -> None:
+    subprocess.run(
+        ["git", "-C", str(root), *args],
+        check=True,
+        capture_output=True,
+        env={**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+             "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"},
+    )
+
+
+@pytest.fixture
+def vendored_dirty(tmp_path, monkeypatch):
+    """Vendor from a REAL git checkout carrying local patches.
+
+    Mirrors production: our fork's fixes live as uncommitted work over a pinned upstream
+    sha, as one modified tracked file plus one untracked file.
+    """
+    source = _fake_upstream(tmp_path / "src")
+    _git(source, "init", "-q", ".")
+    _git(source, "add", "-A")
+    _git(source, "commit", "-qm", "upstream")
+    # A local patch over a tracked file, and a brand-new local file.
+    (source / "packages" / "ai" / "src" / "index.ts").write_text("export const x = 2;\n")
+    (source / "packages" / "ai" / "src" / "extra.ts").write_text("export const y = 3;\n")
+
+    vendor_dir = tmp_path / "vendor-omp"
+    vendor_dir.mkdir()
+    monkeypatch.setattr(vendor_omp, "REPO_ROOT", tmp_path)
+    monkeypatch.setattr(vendor_omp, "VENDOR_DIR", vendor_dir)
+    monkeypatch.setattr(vendor_omp, "LOCK_PATH", vendor_dir / "OMP_VENDOR.lock")
+    vendor_omp.vendor(str(source), sha=None, packages=["ai"], run_install=False)
+    return vendor_dir
+
+
+def test_local_patches_are_captured_into_the_repo(vendored_dirty):
+    """The whole point: the patch series must survive losing the source checkout.
+
+    Before this, the lock recorded only the NAMES of locally-modified files, so the
+    vendored bytes were reproducible solely from a gitignored scratch clone's uncommitted
+    working tree. One `git clean` there and the provider stack's local fixes could not be
+    rebuilt, while `--verify` kept passing.
+    """
+    lock = json.loads((vendored_dirty / "OMP_VENDOR.lock").read_text())
+    captured = lock["local_patches"]
+    patches = sorted(k for k in captured if k != "README.md")
+    assert len(patches) == 2, f"expected both local changes captured, got {patches}"
+    assert "README.md" in captured, "the series must carry reapplication instructions"
+
+    for name in captured:
+        p = vendored_dirty / vendor_omp.LOCAL_PATCH_DIRNAME / name
+        assert p.exists(), f"lock references {name} but the file is absent"
+        digest = hashlib.sha256(p.read_bytes()).hexdigest()
+        assert digest == captured[name], f"{name} hash does not match the lock"
+
+    # The diffs must carry the actual local content, not just a filename.
+    bodies = "\n".join(
+        (vendored_dirty / vendor_omp.LOCAL_PATCH_DIRNAME / n).read_text() for n in patches
+    )
+    assert "export const x = 2;" in bodies, "modified tracked file's diff not captured"
+    assert "export const y = 3;" in bodies, "untracked local file not captured"
+
+
+def test_captured_patches_are_not_content_pinned_as_upstream(vendored_dirty):
+    """`files` pins upstream bytes; the patch series is ours and is pinned separately."""
+    lock = json.loads((vendored_dirty / "OMP_VENDOR.lock").read_text())
+    assert not [
+        rel for rel in lock["files"] if rel.startswith(vendor_omp.LOCAL_PATCH_DIRNAME + "/")
+    ]
+    assert lock["local_patches"], "but they must still be pinned under local_patches"
+
+
+def test_verify_flags_a_deleted_local_patch(vendored_dirty, monkeypatch, capsys):
+    """A vanished patch file is drift, not a clean tree.
+
+    Neuter check: without the local_patches loop in verify(), deleting the only record of
+    how to reproduce the vendored tree would still report "vendor OK".
+    """
+    assert vendor_omp.verify() == 0, "baseline must be clean before neutering it"
+    lock = json.loads((vendored_dirty / "OMP_VENDOR.lock").read_text())
+    victim = next(k for k in lock["local_patches"] if k != "README.md")
+    (vendored_dirty / vendor_omp.LOCAL_PATCH_DIRNAME / victim).unlink()
+
+    assert vendor_omp.verify() == 1, "deleting a captured patch must fail verification"
+    assert "missing local patch" in capsys.readouterr().err
+
+
+def test_verify_flags_an_edited_local_patch(vendored_dirty, capsys):
+    """Silent edits to the series break reproducibility just as badly as deletion."""
+    lock = json.loads((vendored_dirty / "OMP_VENDOR.lock").read_text())
+    victim = next(k for k in lock["local_patches"] if k != "README.md")
+    p = vendored_dirty / vendor_omp.LOCAL_PATCH_DIRNAME / victim
+    p.write_text(p.read_text() + "\n# tampered\n")
+
+    assert vendor_omp.verify() == 1
+    assert "changed local patch" in capsys.readouterr().err

@@ -417,9 +417,14 @@ def fake_stripe(monkeypatch):
     calls: list[tuple[str, dict]] = []
 
     def record(name, result=None):
-        def _call(**kwargs):
-            calls.append((name, kwargs))
-            value = result(**kwargs) if callable(result) else result
+        # *args as well as **kwargs: the SDK is called positionally in places
+        # (`stripe.Account.retrieve(account_id)`), and a kwargs-only recorder
+        # raises TypeError there. refresh_connect swallows that into a 502
+        # "stripe_error", so a working Connect path looked like a Stripe outage
+        # and every test had to stub around it.
+        def _call(*args, **kwargs):
+            calls.append((name, {**kwargs, "_args": list(args)} if args else kwargs))
+            value = result(*args, **kwargs) if callable(result) else result
             return {} if value is None else value
         return _call
 
@@ -443,7 +448,7 @@ def fake_stripe(monkeypatch):
 
     fake.checkout = types.SimpleNamespace(
         Session=types.SimpleNamespace(
-            create=record("checkout.Session.create", lambda **kw: {
+            create=record("checkout.Session.create", lambda *a, **kw: {
                 "id": "cs_test_fake",
                 "url": "https://checkout.stripe.com/c/pay/cs_test_fake",
                 "payment_intent": "pi_test_fake",

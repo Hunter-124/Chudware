@@ -428,6 +428,18 @@ def _cash_order(
     buyer_email = buyer_email.strip().lower()
     preliminary = _listing_for_money(listing_id, buyer_email)
     seller_email = preliminary["seller_email"].strip().lower()
+    # Resolve the price for the requested currency BEFORE touching Stripe.
+    #
+    # Reversing these made a USD checkout against a FREE listing report
+    # `connect_incomplete` whenever the seller had not onboarded, so a buyer
+    # clicking a free model was told the seller was "finishing Stripe
+    # onboarding" for something that is not sold in dollars at all, and the
+    # operator got a Connect-shaped support ticket for a pricing mistake. The
+    # refusal reason must depend on the listing, not on unrelated seller state.
+    # For a tip the caller supplies the amount, so there is no listing price to
+    # resolve and this check does not apply.
+    if kind != "tip":
+        _purchase_price(preliminary, "usd")
     refreshed = refresh_connect(seller_email)
     if not refreshed["charges_enabled"]:
         raise MarketplaceError(
@@ -1695,6 +1707,22 @@ def _settle_checkout(
                     currency,
                     order["amount_cents"],
                 )
+                # Refusing to grant is the security property, but the event is
+                # acknowledged so Stripe never retries: without a durable marker
+                # the buyer has paid Stripe and the order sits 'pending' with an
+                # empty failure_reason forever, visible only in a log line. Record
+                # it so the admin order view and any reconciliation sweep can see
+                # "settled at Stripe, refused here" instead of an abandoned cart.
+                cur.execute(
+                    "UPDATE mk_orders SET failure_reason=%s, stripe_event_id=%s"
+                    " WHERE id=%s AND status='pending'",
+                    (
+                        f"amount_mismatch: session={amount_total} {currency}"
+                        f" order={order['amount_cents']} usd",
+                        event_id,
+                        order["id"],
+                    ),
+                )
                 return
             payment_intent = _text_id(
                 _field(obj, "payment_intent")
@@ -1703,6 +1731,11 @@ def _settle_checkout(
                 log.error(
                     "paid marketplace checkout event %s has no payment intent",
                     event_id,
+                )
+                cur.execute(
+                    "UPDATE mk_orders SET failure_reason=%s"
+                    " WHERE id=%s AND status='pending'",
+                    ("paid session carried no payment intent", order["id"]),
                 )
                 return
             cur.execute(

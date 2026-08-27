@@ -373,15 +373,38 @@ def normalize_tags(raw: object) -> list[str]:
     return out
 
 
+_CONTROL_CHARS = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+
+
+def scrub_text(value: object) -> str:
+    """Coerce untrusted input to text psycopg can actually bind.
+
+    A NUL byte in a bound parameter makes psycopg3 raise ``DataError`` BEFORE the
+    statement reaches PostgreSQL, so it surfaces as an unhandled 500 rather than
+    a validation error. That was reachable anonymously across the whole
+    storefront -- ``?q=``, ``?category=``, ``?seller=``, ``/suggest``, and both
+    the listing and seller path parameters -- and on every authenticated text
+    body field. PostgreSQL cannot store NUL in a ``text`` column at all, so there
+    is nothing to preserve: stripping it is strictly better than 500ing, and
+    strictly better than rejecting, because a scrubbed slug simply fails to match
+    and yields an honest 404.
+
+    Other C0 controls go too. Tab, newline and carriage return are kept because a
+    listing description legitimately contains them.
+    """
+    return _CONTROL_CHARS.sub("", str(value or ""))
+
+
 def to_tsquery_text(query: str) -> str:
     """Turn a user's search box into a safe ``websearch_to_tsquery`` argument.
 
     ``websearch_to_tsquery`` already tolerates arbitrary text — it never raises
     the way ``to_tsquery`` does on unbalanced operators — so the only work left
-    is bounding the length and collapsing whitespace. Keeping quotes and ``-``
-    is the point: they are the phrase and negation syntax users expect.
+    is scrubbing unbindable bytes, bounding the length and collapsing
+    whitespace. Keeping quotes and ``-`` is the point: they are the phrase and
+    negation syntax users expect.
     """
-    return re.sub(r"\s+", " ", query).strip()[:200]
+    return re.sub(r"\s+", " ", scrub_text(query)).strip()[:200]
 
 
 # --- Provenance --------------------------------------------------------------

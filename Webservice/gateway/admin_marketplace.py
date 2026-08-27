@@ -19,6 +19,7 @@ from marketplace_schema import (
     decode_cursor,
     encode_cursor,
     safe_media_type,
+    scrub_text,
     to_tsquery_text,
 )
 
@@ -44,7 +45,10 @@ def _write_admin(request: Request, label: str) -> Any:
 
 
 def _body_text(body: dict[str, Any], key: str, *, required: bool = False) -> str:
-    value = str(body.get(key) or "").strip()
+    # scrub_text, not str(): a NUL reaching a bound parameter makes psycopg raise
+    # DataError before the statement is sent, turning an operator moderation note
+    # into a 500. Same bug class as the storefront query parameters.
+    value = scrub_text(body.get(key)).strip()
     if required and not value:
         raise MarketplaceError(400, "invalid_request", f"{key} is required")
     if len(value) > 8000:
@@ -346,9 +350,23 @@ async def decide_attestation(attestation_id: str, request: Request, body: dict[s
                     (claim["listing_id"],),
                 )
                 released = cur.rowcount == 1
-    updated["listing_attestation_status"] = listing["attestation_status"]
+        # Read the status back rather than reusing the earlier RETURNING.
+        #
+        # `listing` came from the attestation_status UPDATE, which ran BEFORE the
+        # release above. Reporting it verbatim told an operator who had just
+        # released a listing that it was still 'in_review' -- so the panel invited
+        # a second, unnecessary moderate action on a listing that was already
+        # published. Same hazard on the withdraw path.
+        cur.execute(
+            "SELECT status, attestation_status FROM mk_listings WHERE id=%s",
+            (claim["listing_id"],),
+        )
+        final = cur.fetchone() or {}
+    updated["listing_attestation_status"] = final.get(
+        "attestation_status", listing["attestation_status"]
+    )
     updated["listing_published"] = released
-    updated["listing_status"] = listing["status"]
+    updated["listing_status"] = final.get("status", listing["status"])
     updated["listing_moved_to_review"] = moved_to_review
     if released:
         try:

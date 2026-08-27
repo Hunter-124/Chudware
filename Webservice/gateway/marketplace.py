@@ -59,6 +59,7 @@ from marketplace_schema import (
     handleify,
     normalize_tags,
     slugify,
+    scrub_text,
     to_tsquery_text,
     content_disposition,
     safe_media_type,
@@ -87,7 +88,11 @@ def _uuid(value: object, name: str) -> str:
 
 
 def _text(value: object, name: str, maximum: int, minimum: int = 0) -> str:
-    out = str(value or "").strip()
+    # scrub_text before length checks, not after: a NUL reaching a bound
+    # parameter makes psycopg raise DataError before the statement is sent, so
+    # every text body field -- listing title, collection name, report detail --
+    # returned 500 instead of a validation error.
+    out = scrub_text(value).strip()
     if len(out) < minimum or len(out) > maximum:
         raise MarketplaceError(
             400, "invalid_input",
@@ -101,7 +106,7 @@ def _int(
 ) -> int:
     try:
         out = int(value)
-    except (TypeError, ValueError) as exc:
+    except (TypeError, ValueError, OverflowError) as exc:
         raise MarketplaceError(400, "invalid_input", f"{name} must be an integer") from exc
     if out < minimum or (maximum is not None and out > maximum):
         raise MarketplaceError(400, "invalid_input", f"{name} is outside its allowed range")
@@ -289,11 +294,16 @@ def _listing_select() -> str:
 
 
 def load_listing(listing_id_or_slug: str) -> dict[str, Any] | None:
+    # Scrubbed here rather than at each call site: every caller passes a raw path
+    # parameter, and a NUL in it makes psycopg raise DataError before the query
+    # is sent -- a 500 on an anonymous GET. A scrubbed value simply matches
+    # nothing, which is the honest 404 the caller already handles.
+    needle = scrub_text(listing_id_or_slug)
     with tx() as cur:
         cur.execute(
             _listing_select()
             + " WHERE l.id::text=%s OR lower(l.slug)=lower(%s) LIMIT 1",
-            (listing_id_or_slug, listing_id_or_slug),
+            (needle, needle),
         )
         row = cur.fetchone()
     return dict(row) if row else None
@@ -733,22 +743,27 @@ def _browse_state(request: Request) -> dict[str, Any]:
     return {
         "q": search,
         "shelf": shelf,
-        "category": query.get("category") or None,
-        "license": query.get("license") or None,
-        "origin": query.get("origin") or None,
+        # Every string below is bound as a SQL parameter, so each is scrubbed of
+        # NUL first: psycopg raises DataError before the statement is sent, which
+        # surfaced as a 500 on an anonymous GET rather than a validation error.
+        # `tags` needs no scrub -- normalize_tags already strips control bytes,
+        # which is exactly why ?tag= survived this bug class while ?q= did not.
+        "category": scrub_text(query.get("category")) or None,
+        "license": scrub_text(query.get("license")) or None,
+        "origin": scrub_text(query.get("origin")) or None,
         "tags": normalize_tags(query.getlist("tag")),
-        "source": query.get("source") or None,
+        "source": scrub_text(query.get("source")) or None,
         "min_price_cents": optional_number("min_price_cents"),
         "max_price_cents": optional_number("max_price_cents"),
         "max_credits": optional_number("max_credits"),
-        "pricing": query.get("pricing") or None,
+        "pricing": scrub_text(query.get("pricing")) or None,
         "verified_only": _bool(query.get("verified_only")),
         "commercial_only": _bool(query.get("commercial_only")),
         "no_share_alike": _bool(query.get("no_share_alike")),
         "featured_only": _bool(query.get("featured_only")),
-        "seller": query.get("seller") or None,
+        "seller": scrub_text(query.get("seller")) or None,
         "sort": sort,
-        "cursor": query.get("cursor") or "",
+        "cursor": scrub_text(query.get("cursor")) or "",
         "limit": clamp_limit(query.get("limit")),
     }
 
@@ -1149,7 +1164,8 @@ async def public_seller(request: Request, handle: str) -> dict[str, Any]:
     viewer = user.email.lower() if user else None
     with tx() as cur:
         cur.execute(
-            "SELECT * FROM mk_sellers WHERE lower(handle)=lower(%s)", (handle,)
+            "SELECT * FROM mk_sellers WHERE lower(handle)=lower(%s)",
+            (scrub_text(handle),),
         )
         seller = cur.fetchone()
         if seller is None:

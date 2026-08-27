@@ -112,9 +112,20 @@ ENTRIES: dict[str, dict[str, Any]] = {
             "fallback is labeled confidence:limited."
         ),
         "timeout_s": 120,
-        # Retry-with-rephrased-query loops burn paid provider quota and
-        # context; three searches is enough to triangulate before switching
-        # to research_fetch_page reads.
-        "max_calls_per_turn": 3,
+        # SCOPE: this cap is per RUN — one whole user request — not per model
+        # round-trip (see tool_guidance/__init__.py). It was set to 3 on
+        # per-round-trip reasoning ("three searches is enough to triangulate"),
+        # which as a per-RUN bound meant three web searches for an entire
+        # engineering task. Live 2026-08-27: an open-ended two-product research
+        # request was refused mid-work with "I could fetch more technical
+        # references" as the model's very next thought. No role card bounds
+        # research at any number, so nothing mandated 3.
+        # 24 is ~9% of MAIN_CHAT_RUNAWAY_TOOL_CALL_BACKSTOP (256) and well
+        # above any observed legitimate chain, so it can now only fire on a
+        # genuine loop — while still bounding a rephrase spin at 24 paid
+        # searches rather than 250. Identical repeated queries are the loop
+        # guard's job (tool_loop_guard.py), not this counter's: this one counts
+        # by tool NAME and cannot tell a new subtopic from a retry.
+        "max_calls_per_turn": 24,
     },
 }

@@ -227,6 +227,127 @@ def test_http_get_revalidates_private_redirect_before_next_connection(monkeypatc
     assert requested == ["https://example.com/start"]
 
 
+# ------------------------------------------------------- redirect-walk budget
+# A fresh request per hop means a per-hop timeout MULTIPLIES. These pin the
+# WHOLE-walk bound that keeps this tool's worst case inside the outer harness
+# deadline (services/agent/tool_guidance/research.py research_fetch_page
+# timeout_s), rather than the current numbers.
+
+
+class _FakeClock:
+    """Stand-in for the ``time`` module inside fetch_page (only ``monotonic`` is
+    used), so a full-scale 60-90 s walk is measured without sleeping."""
+
+    def __init__(self) -> None:
+        self.t = 0.0
+
+    def monotonic(self) -> float:
+        return self.t
+
+
+def _stub_public_dns(monkeypatch) -> None:
+    monkeypatch.setattr(fp_mod.socket, "getaddrinfo", lambda *a, **k: [
+        (fp_mod.socket.AF_INET, fp_mod.socket.SOCK_STREAM, fp_mod.socket.IPPROTO_TCP,
+         "", ("93.184.216.34", 443))
+    ])
+
+
+def _stub_slow_redirect_chain(monkeypatch, clock, *, hop_cost: float) -> list:
+    """httpx stub whose every hop is an eligible public redirect that burns
+    ``hop_cost`` seconds — the pathological vendor/catalog chain. Returns the
+    growing list of requested URLs."""
+    requested: list = []
+
+    class _Redirect:
+        is_redirect = True
+
+        def __init__(self, hop: int):
+            self.headers = {"location": f"https://example.com/hop{hop + 1}"}
+
+    class _Client:
+        def __init__(self, **kwargs):
+            assert kwargs["follow_redirects"] is False
+            assert kwargs["timeout"] == fp_mod._HOP_TIMEOUT_S
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return None
+
+        def get(self, url):
+            requested.append(url)
+            clock.t += hop_cost            # this hop ran to its own deadline
+            return _Redirect(len(requested))
+
+    import httpx
+    monkeypatch.setattr(httpx, "Client", _Client)
+    return requested
+
+
+def test_redirect_walk_stops_on_its_whole_walk_budget(monkeypatch):
+    """Full scale, deterministic (fake clock, no sleeping): a chain where EVERY
+    hop burns its whole _HOP_TIMEOUT_S is exactly the shape that made the old
+    per-hop-only bound (10 + 1) * 30 = 330 s against a 120 s harness ceiling.
+    The walk must stop on the WHOLE-walk budget — not on _MAX_REDIRECTS — and
+    say which hop it gave up on."""
+    clock = _FakeClock()
+    monkeypatch.setattr(fp_mod, "time", clock)
+    _stub_public_dns(monkeypatch)
+    requested = _stub_slow_redirect_chain(
+        monkeypatch, clock, hop_cost=fp_mod._HOP_TIMEOUT_S)
+
+    try:
+        fp_mod._http_get("https://example.com/hop0")
+        assert False, "an all-slow redirect chain must not walk to completion"
+    except fp_mod.RedirectBudgetError as exc:
+        message = str(exc)
+
+    assert len(requested) < fp_mod._MAX_REDIRECTS + 1, requested
+    assert f"hop {len(requested)}" in message, message
+    assert "redirect budget" in message, message
+    # Measured walk + the ONE uncancellable getaddrinfo the budget check cannot
+    # clamp is this tool's worst case, and it must fit inside the declared one.
+    assert clock.t <= fp_mod._WALK_BUDGET_S + fp_mod._HOP_TIMEOUT_S, clock.t
+    assert clock.t + fp_mod._DNS_STALL_RESERVE_S <= fp_mod.FETCH_WORST_CASE_S
+
+
+def test_fetch_page_reports_a_too_slow_redirect_chain_actionably(monkeypatch):
+    """The tool boundary must return the §6 degradation shape naming the hop it
+    quit on, so the model has a remedy — never leave the harness to abandon the
+    call with "still running in the background, may still mutate state"."""
+    clock = _FakeClock()
+    monkeypatch.setattr(fp_mod, "time", clock)
+    monkeypatch.setattr(fp_mod, "is_offline", lambda: False)
+    _stub_public_dns(monkeypatch)
+    _stub_slow_redirect_chain(monkeypatch, clock, hop_cost=fp_mod._HOP_TIMEOUT_S)
+
+    with tempfile.TemporaryDirectory() as td:
+        out = fp_mod.fetch_page("https://example.com/hop0", cache=_tmp_cache(td))
+    assert out["ok"] is False and out["reason"] == "network", out
+    assert "too slow" in out["hint"] and "redirect budget" in out["hint"], out
+    assert "redirect hop" in out["hint"], out
+
+
+def test_fetch_page_worst_case_fits_research_fetch_page_harness_ceiling():
+    """Arithmetic lockstep with the harness: 60 s walk budget + 15 s in-flight
+    hop + 15 s uncancellable DNS stall = 90 s, under the outer deadline
+    agent_turn._dispatch_tool takes from tool_guidance."""
+    from services.agent.tool_guidance import research as research_guidance
+
+    ceiling = research_guidance.ENTRIES["research_fetch_page"]["timeout_s"]
+    assert fp_mod.FETCH_WORST_CASE_S == (
+        fp_mod._WALK_BUDGET_S + fp_mod._HOP_TIMEOUT_S + fp_mod._DNS_STALL_RESERVE_S)
+    assert fp_mod.FETCH_WORST_CASE_S == 90.0
+    assert fp_mod.FETCH_WORST_CASE_S < ceiling, (
+        f"fetch_page worst case {fp_mod.FETCH_WORST_CASE_S}s does not fit "
+        f"research_fetch_page timeout_s={ceiling}s")
+    # The per-hop bound ALONE is still 11 * 15 = 165 s > the ceiling, so the
+    # whole-walk budget is the load-bearing part: lowering _MAX_REDIRECTS or the
+    # hop timeout without it would not make this tool fit.
+    assert (fp_mod._MAX_REDIRECTS + 1) * fp_mod._HOP_TIMEOUT_S > ceiling
+
+
 # --------------------------------------------------------------------------- extraction
 
 

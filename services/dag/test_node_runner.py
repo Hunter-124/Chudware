@@ -789,6 +789,99 @@ class TestDefaultAgentFnSeams:
         assert seen["capability"] is not None
 
 
+class TestDispatchLaneParity:
+    """The compiled-DAG lane and ``MissionDispatch._run_subagent_turn`` both fan
+    into ``agent_turn.run_turn``, and every budget-, retry- or policy-level rule
+    has to hold on BOTH. Copy-paste drift between the two is the recurring bug
+    in this subsystem, so these pin the SHARED helpers rather than the behavior.
+    """
+
+    def test_retryable_verdict_routes_through_the_shared_predicate(
+        self, monkeypatch,
+    ):
+        """Neutering ``mission_dispatch.retryable_child_failure`` must strip this
+        lane's retry upgrade too — proof the two lanes agree on WHICH provider
+        faults are transient instead of each keeping a private rule."""
+        from services.agent import mission_dispatch as md
+
+        result = _fake_run("provider_error", False)
+        result.result = {"retryable": True, "error": "HTTP 429"}
+        node = _minimal_node()
+
+        pack = cp.assemble(node, {"retry_remaining": 2})
+        verdict, _out = nr.run(node, pack, agent_fn=lambda req, ctx: result)
+        assert verdict == nr.VERDICT_RETRY
+
+        monkeypatch.setattr(md, "retryable_child_failure", lambda _r: False)
+        pack = cp.assemble(node, {"retry_remaining": 2})
+        verdict, _out = nr.run(node, pack, agent_fn=lambda req, ctx: result)
+        assert verdict == nr.VERDICT_ESCALATE
+
+    def test_non_retryable_provider_error_still_escalates(self):
+        """A 404 dead route / real auth failure is stamped retryable=False and
+        must NOT consume a retry: re-running fails identically."""
+        result = _fake_run("provider_error", False)
+        result.result = {"retryable": False, "error": "HTTP 404 no such model"}
+        node = _minimal_node()
+        pack = cp.assemble(node, {"retry_remaining": 2})
+        verdict, out = nr.run(node, pack, agent_fn=lambda req, ctx: result)
+        assert verdict == nr.VERDICT_ESCALATE
+        assert out["retry_remaining"] == 2
+
+    def test_subagent_tool_call_budget_slider_reaches_dag_nodes(self, monkeypatch):
+        """``agent.subagent_tool_call_budget`` is one GUI slider. This lane used
+        to not read the key at all, so moving it governed only the ``delegate``
+        lane and had ZERO effect on compiled-DAG (mission_start) roles."""
+        from services.agent import agent_turn as at
+        from services.agent import config as agent_config
+
+        monkeypatch.delenv("CHUDWARE_AGENT_MAX_TOOL_CALLS", raising=False)
+        monkeypatch.setattr(agent_config, "get_subagent_tool_call_budget",
+                            lambda *a, **k: 9)
+        seen: dict = {}
+
+        def _spy(*args, **kwargs):
+            seen.update(kwargs)
+            return _fake_run("confirmed", True)
+
+        monkeypatch.setattr(at, "run_turn", _spy)
+        nr._default_agent_fn(
+            "go",
+            {"node_name": "sourcing_specialist",
+             "role_id": "sourcing_specialist",
+             "allowed_tools": ["part_search", "parts_taxonomy"]},
+            provider=_TurnScriptedProvider(),
+        )
+        assert seen["max_tool_calls"] == 9
+
+    def test_zero_slider_leaves_the_producer_floor_intact(self, monkeypatch):
+        """0 is the default and means "derive automatically" — it must not reset
+        the role floor this lane computes from tool_budget.floor_for."""
+        from services.agent import agent_turn as at
+        from services.agent import config as agent_config
+
+        monkeypatch.delenv("CHUDWARE_AGENT_MAX_TOOL_CALLS", raising=False)
+        monkeypatch.setattr(agent_config, "get_subagent_tool_call_budget",
+                            lambda *a, **k: 0)
+        seen: dict = {}
+
+        def _spy(*args, **kwargs):
+            seen.update(kwargs)
+            return _fake_run("confirmed", True)
+
+        monkeypatch.setattr(at, "run_turn", _spy)
+        nr._default_agent_fn(
+            "go",
+            {"node_name": "feature_modeler", "role_id": "feature_modeler",
+             "allowed_tools": ["new_part", "add_features", "save_part"]},
+            provider=_TurnScriptedProvider(),
+        )
+        from services.agent import tool_budget as tb
+        assert seen["max_tool_calls"] == tb.floor_for(
+            "feature_modeler", ["new_part", "add_features", "save_part"], None,
+            base=None)
+
+
 class TestProviderTierResolution:
     """Regression coverage for the mission-tier provider leak: an INTERNAL DAG
     node (not just the mission's entry/INTAKE call) must stay on the tier/

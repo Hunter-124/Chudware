@@ -37,6 +37,13 @@ re-implement it.
 All knobs read conservative defaults that can be raised or lowered via env vars
 (``CHUDWARE_BROWSER_*``); nothing here ever raises — ceiling/cooldown states are
 reported back as data for the caller to degrade on.
+
+A caller under a wall-clock deadline must never be *put to sleep* past it:
+:func:`seconds_until_ready` answers "how long would this wait be" without
+waiting, and :func:`wait`'s ``max_wait_s`` bounds the block and hands the
+unslept remainder back as data. That is the only way an agent tool can turn "the
+site is cooling down" into an answer instead of a timeout — see
+:func:`services.browser.session.browser_download`.
 """
 from __future__ import annotations
 
@@ -220,9 +227,25 @@ def seconds_until_ready(site: str, *, min_interval: float = DEFAULT_MIN_INTERVAL
 
 
 def wait(site: str, *, min_interval: float = DEFAULT_MIN_INTERVAL_S,
-         url: str | None = None, _sleep=time.sleep) -> float:
-    """Block until ``site`` is ready to fetch again. Returns seconds waited."""
+         url: str | None = None, max_wait_s: float | None = None,
+         _sleep=time.sleep) -> float:
+    """Block until ``site`` is ready to fetch again. Returns seconds waited.
+
+    ``max_wait_s`` BOUNDS the block: when the remaining wait exceeds it, nothing
+    is slept and the full remaining wait comes back as DATA, so a return value
+    ``> max_wait_s`` means "refused, this much is still owed" and any other
+    return value means "slept exactly that long". Callers under a wall-clock
+    deadline need that, because :data:`BACKOFF_MAX_S` (900 s) is larger than the
+    LONGEST harness tool timeout in the repo (600 s): an unbounded wait on a
+    site whose 429/403 cooldown is still armed spends the caller's entire budget
+    asleep and the tool is abandoned mid-sleep, never having fetched anything.
+
+    ``None`` (the default) keeps the original unbounded behaviour byte for byte —
+    the politeness policy itself is unchanged, only its observability.
+    """
     remaining = seconds_until_ready(site, min_interval=min_interval, url=url)
+    if max_wait_s is not None and remaining > max_wait_s:
+        return remaining
     if remaining > 0:
         _sleep(remaining)
     return remaining

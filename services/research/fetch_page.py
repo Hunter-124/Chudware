@@ -11,14 +11,60 @@ from __future__ import annotations
 import ipaddress
 import re
 import socket
+import time
 from html.parser import HTMLParser
 from typing import Callable, Optional
 from urllib.parse import urljoin, urlparse
+
+# ---------------------------------------------------------------------------
+# Redirect-walk budget: this tool's own worst case MUST fit its harness ceiling.
+# ---------------------------------------------------------------------------
+# research_fetch_page runs under ONE outer deadline — its curated ``timeout_s``
+# (services/agent/tool_guidance/research.py, 120 s) enforced by
+# agent_turn._dispatch_tool's ThreadPoolExecutor. ``_http_get`` opens a FRESH
+# httpx request per redirect hop, so a PER-HOP timeout MULTIPLIES: 10 redirects
+# at 30 s/hop was a (10 + 1) * 30 = 330 s worst case, 2.75x the tool's own
+# ceiling. A slow chain could therefore only ever end as the harness's useless
+# "abandoned in the background, may still be running" payload, and a realistic
+# 3-5 hop vendor/catalog chain at 10-20 s/hop already spent 30-100 s of the 120.
+# The walk is now bounded AS A WHOLE rather than per hop:
+#   _HOP_TIMEOUT_S        15 s  connect+read for one hop (was 30)
+#   _WALK_BUDGET_S        60 s  no further hop may START once the walk has spent
+#                               this much; hop 0 always runs (the caller's own URL
+#                               is not a redirect the tool chose to follow)
+#   _DNS_STALL_RESERVE_S  15 s  a single getaddrinfo is uncancellable and takes no
+#                               timeout argument; glibc resolv.conf defaults
+#                               (timeout:5, attempts:2 -> 5 s then 10 s) bound one
+#                               lookup at ~15 s, and that is the only work that can
+#                               overrun the budget check
+#   _MAX_REDIRECTS        10    UNCHANGED — a fast 10-hop chain is still legal; the
+#                               wall-clock budget, not the hop count, is the guard
+# Worst case = _WALK_BUDGET_S (a hop starts just under the budget)
+#            + _HOP_TIMEOUT_S (that hop runs to its own deadline)
+#            + _DNS_STALL_RESERVE_S (its pre-flight DNS revalidation stalls)
+#            = 60 + 15 + 15 = 90 s
+# i.e. 30 s (25%) inside the 120 s ceiling, which covers readability->markdown of
+# the <=_MAX_CONTENT body. FETCH_WORST_CASE_S is asserted against the LIVE
+# guidance value in test_research.py, so the two cannot drift apart.
 _MAX_REDIRECTS = 10
+_HOP_TIMEOUT_S = 15.0
+_WALK_BUDGET_S = 60.0
+_DNS_STALL_RESERVE_S = 15.0
+FETCH_WORST_CASE_S = _WALK_BUDGET_S + _HOP_TIMEOUT_S + _DNS_STALL_RESERVE_S
 
 
 class OutboundPolicyError(ValueError):
     """The requested URL is not an eligible public research destination."""
+
+
+class RedirectBudgetError(RuntimeError):
+    """The redirect walk exhausted ``_WALK_BUDGET_S`` before reaching a page.
+
+    Distinct from :class:`OutboundPolicyError`: the chain was *eligible*, just
+    too slow to finish inside this tool's harness deadline. The message names the
+    hop it gave up on so the model can act (fetch the final URL directly, or pick
+    a different source) instead of retrying the same slow chain.
+    """
 
 
 def _public_address(value: str) -> bool:
@@ -152,13 +198,31 @@ def _valid_url(url: str) -> bool:
 
 
 def _http_get(url: str) -> tuple[str, str, str]:
-    """Fetch a public HTTPS page, revalidating DNS and every redirect target."""
+    """Fetch a public HTTPS page, revalidating DNS and every redirect target.
+
+    The redirect walk is bounded by ``_WALK_BUDGET_S`` in TOTAL (see the budget
+    block at the top of this module): a hop that would start past the budget
+    raises :class:`RedirectBudgetError` naming that hop, instead of letting
+    per-hop timeouts multiply past this tool's harness deadline.
+    """
     import httpx
 
     current = url
-    with httpx.Client(headers={"User-Agent": _UA}, timeout=30.0,
+    started = time.monotonic()
+    with httpx.Client(headers={"User-Agent": _UA}, timeout=_HOP_TIMEOUT_S,
                       follow_redirects=False) as client:
-        for _ in range(_MAX_REDIRECTS + 1):
+        for hop in range(_MAX_REDIRECTS + 1):
+            elapsed = time.monotonic() - started
+            if hop and elapsed >= _WALK_BUDGET_S:
+                raise RedirectBudgetError(
+                    f"gave up at redirect hop {hop} ({current}) after "
+                    f"{elapsed:.1f}s of the {_WALK_BUDGET_S:.0f}s redirect budget")
+            # One DNS revalidation per hop, at the top, before any connection is
+            # opened to `current`. The redirect target used to be validated a
+            # second time right after urljoin below; that was a strict duplicate
+            # of this check on the next iteration (nothing is fetched in between),
+            # so dropping it halves the uncancellable getaddrinfo work per hop
+            # without weakening the policy.
             _validate_public_url(current)
             resp = client.get(current)
             if resp.is_redirect:
@@ -166,7 +230,6 @@ def _http_get(url: str) -> tuple[str, str, str]:
                 if not location:
                     raise OutboundPolicyError("redirect omitted Location")
                 current = urljoin(current, location)
-                _validate_public_url(current)
                 continue
             resp.raise_for_status()
             md, title = html_to_markdown(resp.text)
@@ -230,6 +293,15 @@ def fetch_page(
         stale = store.get(url, tier=tier, allow_stale=True)
         if stale is not None:
             return _from_cache(stale, offline=False)  # stale beats nothing on a fetch error
+        if isinstance(exc, RedirectBudgetError):
+            # contract §6 `reason` is a closed token set, so this stays "network";
+            # the hint carries the hop and the budget so the remedy is actionable
+            # instead of "retry the same slow chain".
+            return fail(
+                "network",
+                f"The redirect chain for this URL is too slow: {exc}. Fetch the "
+                "final URL directly, or pick a different source.",
+            )
         return fail("network", f"Could not fetch the page: {exc}. Check the URL / connectivity.")
 
     fetched_ts = now_ts()

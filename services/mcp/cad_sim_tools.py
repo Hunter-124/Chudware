@@ -2797,7 +2797,10 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
                     "a conduction length from those selections.")
             _, b, h = _part_bbox_dims(d)
             gen = fa.build_thermal_bar_inp(L, b, h, k_cond, T_hot, T_cold)
-            run = fa.run_ccx(gen["inp"], job="thermal")
+            # Inner subprocess clock, deliberately shorter than this tool's outer
+            # harness timeout_s — see fea_advanced's layered-timeout block.
+            run = fa.run_ccx(gen["inp"], job="thermal",
+                             timeout=fa.HARNESS_CCX_TIMEOUT_S)
             if run.get("skipped"):
                 return _dumps(run)
             if not run.get("ok") or not run.get("dat_path"):
@@ -2968,7 +2971,8 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
             b, h = transverse
             gen = fa.build_buckling_column_inp(
                 L, b, h, E, nu, P, nz=4, n_modes=n_modes)
-            run = fa.run_ccx(gen["inp"], job="buckle")
+            run = fa.run_ccx(gen["inp"], job="buckle",
+                             timeout=fa.HARNESS_CCX_TIMEOUT_S)
             if run.get("skipped"):
                 return _dumps(run)
             if not run.get("ok") or not run.get("dat_path"):
@@ -3043,7 +3047,8 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
             nu = _finite_float(mat["nu"], "material.nu")
             L, b, h = _part_bbox_dims(d)
             gen = fa.build_contact_block_inp(L, b, h, E, nu, pressure_mpa)
-            run = fa.run_ccx(gen["inp"], job="contact")
+            run = fa.run_ccx(gen["inp"], job="contact",
+                             timeout=fa.HARNESS_CCX_TIMEOUT_S)
             if run.get("skipped"):
                 return _dumps(run)
             if not run.get("ok") or not run.get("dat_path"):

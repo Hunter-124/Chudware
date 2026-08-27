@@ -110,6 +110,55 @@ def _busy(site: str) -> dict:
                 f"session (or finish the login wizard) and retry")
 
 
+#: The most a single agent-facing fetch/download is allowed to SLEEP inside the
+#: rate limiter before it gives up and answers instead (seconds).
+#:
+#: THE LINE THIS DRAWS: politeness spacing is waited out, punishment cooldowns are
+#: reported. ``ratelimit.BACKOFF_BASE_S`` is 30 s, so the *smallest* cooldown the
+#: 429/403 backoff ladder can ever arm (30 s) already exceeds this budget and every
+#: rung above it (60, 120, … up to ``BACKOFF_MAX_S`` = 900 s) does too — an armed
+#: cooldown therefore ALWAYS short-circuits. Meanwhile the ordinary inter-request
+#: window (``DEFAULT_MIN_INTERVAL_S`` = 3 s, stretched by a published robots.txt
+#: ``Crawl-delay``, which tops out at 10 s across the vendors we honour) stays well
+#: under it and is still slept normally, so nothing about normal pacing changes.
+#:
+#: WHY IT MUST EXIST: 900 s is longer than the LONGEST harness tool timeout in the
+#: repo (600 s) and 5x the tightest path that reaches here
+#: (``research_datasheet_fetch``, 180 s; ``reverse_engineer_product``, 300 s). An
+#: unbounded wait meant the tool was abandoned by the harness while still politely
+#: sleeping, and the model was told "timed out, may still be running" — the exact
+#: opposite of the truth, which is "this site cannot be fetched inside any call".
+#: 20 s is also ~11% of that tightest 180 s ceiling, so the pacing we do still
+#: honour cannot eat a meaningful share of a caller's budget.
+COOLDOWN_WAIT_BUDGET_S = _env_float("CHUDWARE_BROWSER_COOLDOWN_BUDGET_S", 20.0)
+
+
+def _cooldown_refusal(site: str, url: str, remaining_s: float, verb: str) -> dict:
+    """§6 degradation for a site whose 429/403 backoff cooldown outlasts this call.
+
+    A cooldown is a POLICY decision, so it comes back as DATA with the remedy
+    attached rather than as a blocking sleep or a bare error string: the model can
+    only route around a wall it is told about. ``retry_after_s`` is machine-readable
+    so a harvest loop can bail out of this site and keep its partial results.
+    """
+    mins = remaining_s / 60.0
+    span = f"{remaining_s:.0f}s" if remaining_s < 90.0 else f"~{mins:.0f} min"
+    out = fail("cooldown_active",
+               f"{site} is rate-limiting us: it returned 429/403 and its backoff "
+               f"cooldown still has {span} to run (until "
+               f"{time.strftime('%H:%M:%SZ', time.gmtime(time.time() + remaining_s))}). "
+               f"Nothing was {verb} and WAITING INSIDE THIS CALL IS IMPOSSIBLE — the "
+               f"cooldown outlasts the tool's own time budget, so retrying {url} now, "
+               f"or with different arguments, is refused the same way. Proceed with "
+               f"other sources you can already reach (a different vendor, an already "
+               f"fetched page, the local library) and come back to {site} after the "
+               f"cooldown if you still need it.")
+    out["retry_after_s"] = round(remaining_s, 1)
+    out["policy_refusal"] = True
+    out["executed"] = False
+    return out
+
+
 def _apply_staged_cookies(context: Any, site: str) -> None:
     """Inject a GUI-exported cookie jar staged by the login wizard (CEF →
     Playwright hand-off, see embed.import_session_cookies). One-shot: the
@@ -762,10 +811,15 @@ def _browser_fetch_locked(url: str, site: str, *, render_settle: float,
         return fail(ceiling, f"{site}: per-session request ceiling reached — this run has "
                              f"already made the maximum allowed fetches (a runaway-loop guard). "
                              f"Nothing was fetched.")
+    # Ceiling first (in-memory, and a tripped runaway guard must count before the
+    # fetch), then a BOUNDED wait: an armed 429/403 cooldown is reported, not slept.
     t0 = time.perf_counter() if timing is not None else 0.0
-    ratelimit.wait(site, min_interval=min_interval, url=url)
+    waited = ratelimit.wait(site, min_interval=min_interval, url=url,
+                            max_wait_s=COOLDOWN_WAIT_BUDGET_S)
     if timing is not None:
         timing["rate_ms"] = (time.perf_counter() - t0) * 1000.0
+    if waited > COOLDOWN_WAIT_BUDGET_S:
+        return _cooldown_refusal(site, url, waited, "fetched")
     status: int | None = None
     content = ""
     t_backend = time.perf_counter() if timing is not None else 0.0
@@ -852,7 +906,10 @@ def browser_interact(url: str, site: str, script: str, *,
             return fail(ceiling, f"{site}: per-session request ceiling reached — this run "
                                  f"has already made the maximum allowed fetches (a "
                                  f"runaway-loop guard). Nothing was fetched.")
-        ratelimit.wait(site, min_interval=min_interval, url=url)
+        waited = ratelimit.wait(site, min_interval=min_interval, url=url,
+                                max_wait_s=COOLDOWN_WAIT_BUDGET_S)
+        if waited > COOLDOWN_WAIT_BUDGET_S:
+            return _cooldown_refusal(site, url, waited, "fetched")
         status: int | None = None
         content = ""
         try:
@@ -893,6 +950,12 @@ def browser_download(url: str, site: str, dest: Path, *,
     Playwright's context request API with the same persistent profile cookies.
     A missing profile is auto-created; gated files fail naturally and surface
     login_required upstream.
+
+    A site whose 429/403 backoff cooldown is still armed is REFUSED immediately
+    (``reason: "cooldown_active"`` plus ``retry_after_s``) instead of being slept
+    through — see :data:`COOLDOWN_WAIT_BUDGET_S`. Callers that harvest many URLs
+    (``services.reveng.worker_rpc``) use that to bail out of the site and keep
+    their partial results.
     """
     profiles.ensure_profile(site)
     lock = profiles.profile_lock(site)
@@ -911,7 +974,10 @@ def _browser_download_locked(url: str, site: str, dest: Path, *,
         return fail(ceiling, f"{site}: per-session request ceiling reached — this run has "
                              f"already made the maximum allowed fetches (a runaway-loop guard). "
                              f"Nothing was downloaded.")
-    ratelimit.wait(site, min_interval=min_interval, url=url)
+    waited = ratelimit.wait(site, min_interval=min_interval, url=url,
+                            max_wait_s=COOLDOWN_WAIT_BUDGET_S)
+    if waited > COOLDOWN_WAIT_BUDGET_S:
+        return _cooldown_refusal(site, url, waited, "downloaded")
     status: int | None = None
     dest.parent.mkdir(parents=True, exist_ok=True)
     try:

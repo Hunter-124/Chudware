@@ -217,6 +217,58 @@ def test_crawl_delay_cached_and_used(browser_mods):
                                          url="https://siteE.example/x") > 3.5
 
 
+def test_wait_without_max_is_unbounded_exactly_as_before(browser_mods):
+    """The default path must be untouched: it sleeps the FULL remaining wait, even a
+    900 s one, and returns it. Regression guard for the bounded-wait seam."""
+    _profiles, ratelimit, _session = browser_mods
+    for _ in range(20):
+        ratelimit.note_result("siteF", 429)          # ladder is pinned at BACKOFF_MAX_S
+    owed = ratelimit.seconds_until_ready("siteF", min_interval=0.0)
+    assert owed > ratelimit.BACKOFF_MAX_S - 1.0
+
+    slept = []
+    returned = ratelimit.wait("siteF", min_interval=0.0, _sleep=slept.append)
+    assert len(slept) == 1
+    assert slept[0] > ratelimit.BACKOFF_MAX_S - 1.0   # really slept the whole 900 s
+    assert returned == slept[0]
+
+
+def test_wait_with_max_refuses_instead_of_sleeping_past_it(browser_mods):
+    """An armed cooldown longer than ``max_wait_s`` sleeps NOTHING and reports the
+    full remaining wait as data (return value > max_wait_s marks the refusal)."""
+    _profiles, ratelimit, _session = browser_mods
+    ratelimit.note_result("siteG", 429)              # BACKOFF_BASE_S, i.e. 30 s
+
+    slept = []
+    remaining = ratelimit.wait("siteG", min_interval=0.0, max_wait_s=20.0,
+                               _sleep=slept.append)
+    assert slept == []                               # the whole point: no blocking
+    assert remaining > 20.0
+    assert remaining <= ratelimit.BACKOFF_BASE_S + 1.0
+
+
+def test_wait_with_max_still_sleeps_ordinary_spacing(browser_mods):
+    """Politeness spacing under the budget is waited out, not refused — the bound
+    changes deadline behaviour, never the pacing policy."""
+    _profiles, ratelimit, _session = browser_mods
+    ratelimit.mark_hit("siteH")
+
+    slept = []
+    waited = ratelimit.wait("siteH", min_interval=3.0, max_wait_s=20.0,
+                            _sleep=slept.append)
+    assert len(slept) == 1 and 0.0 < slept[0] <= 3.0
+    assert waited == slept[0] and waited <= 20.0
+
+
+def test_backoff_ladder_never_fits_the_session_cooldown_budget(browser_mods):
+    """The arithmetic behind session.COOLDOWN_WAIT_BUDGET_S: the SMALLEST cooldown
+    the ladder can arm already exceeds the budget, so an armed 429/403 always
+    short-circuits while a published crawl-delay never does."""
+    _profiles, ratelimit, session = browser_mods
+    assert ratelimit.BACKOFF_BASE_S > session.COOLDOWN_WAIT_BUDGET_S
+    assert ratelimit.DEFAULT_MIN_INTERVAL_S < session.COOLDOWN_WAIT_BUDGET_S
+
+
 # --- session: browser_login -----------------------------------------------------
 
 def test_browser_login_creates_profile_and_metadata(browser_mods):
@@ -406,10 +458,92 @@ def test_browser_fetch_rate_limits_between_calls(browser_mods, monkeypatch):
 
     calls = []
     monkeypatch.setattr(ratelimit, "wait",
-                        lambda site, *, min_interval=ratelimit.DEFAULT_MIN_INTERVAL_S, url=None:
-                        calls.append((site, min_interval)))
+                        lambda site, *, min_interval=ratelimit.DEFAULT_MIN_INTERVAL_S,
+                        url=None, max_wait_s=None:
+                        (calls.append((site, min_interval)), 0.0)[1])
 
     session.browser_fetch("https://grabcad.com/a", "grabcad", _cef=_FakeCef(),
                           min_interval=5.0)
 
     assert calls == [("grabcad", 5.0)]
+
+
+# --- session: 429/403 cooldown refusals (harness-deadline defect) ----------------
+#
+# BACKOFF_MAX_S is 900 s while the LARGEST harness tool timeout in the repo is 600 s
+# and the two paths that reach browser_download are research_datasheet_fetch (180 s)
+# and reverse_engineer_product (300 s). A synchronous wait therefore guaranteed the
+# harness abandoned the call mid-sleep and told the model "timed out, may still be
+# running" — when the truth was "this site is in a cooldown no call can outlast".
+# These tests are TIMED on purpose: the assertion that matters is wall clock.
+
+#: A cooldown a test can be sure no CI machine will ever wait out.
+_FAR_FUTURE_COOLDOWN_S = 900.0
+#: Ceiling for "returned promptly instead of blocking". Generous enough for a slow
+#: CI box (profile creation + two JSON meta reads) and still 900x under the sleep
+#: it is proving did not happen.
+_PROMPT_S = 1.0
+
+
+def test_browser_download_refuses_a_far_future_cooldown_promptly(browser_mods, tmp_path):
+    _profiles, ratelimit, session = browser_mods
+    import time as _time
+    session.profiles.save_meta(
+        "grabcad", rl_cooldown_until=_time.time() + _FAR_FUTURE_COOLDOWN_S)
+    cef = _FakeCef()
+
+    t0 = _time.perf_counter()
+    result = session.browser_download("https://grabcad.com/a.pdf", "grabcad",
+                                      tmp_path / "dl" / "a.pdf", _cef=cef,
+                                      min_interval=0.0)
+    elapsed = _time.perf_counter() - t0
+
+    assert elapsed < _PROMPT_S, f"blocked for {elapsed:.1f}s instead of refusing"
+    assert result["ok"] is False
+    assert result["reason"] == "cooldown_active"
+    assert result["policy_refusal"] is True and result["executed"] is False
+    # retry_after_s is the real remaining cooldown, not a placeholder.
+    assert _FAR_FUTURE_COOLDOWN_S - 5.0 < result["retry_after_s"] <= _FAR_FUTURE_COOLDOWN_S
+    assert cef.downloaded == []                      # nothing was fetched
+    # The hint must teach, not just name a state.
+    hint = result["hint"]
+    assert "grabcad" in hint and "IMPOSSIBLE" in hint.upper()
+    assert "other sources" in hint
+    assert ratelimit.seconds_until_ready("grabcad", min_interval=0.0) > 0.0
+
+
+def test_browser_fetch_and_interact_refuse_the_same_cooldown(browser_mods):
+    """Both other agent-reachable entry points share the policy — the two dispatch
+    paths drifting apart is the recurring defect class here."""
+    _profiles, _ratelimit, session = browser_mods
+    import time as _time
+    for site in ("vendorf", "vendori"):
+        session.profiles.save_meta(
+            site, rl_cooldown_until=_time.time() + _FAR_FUTURE_COOLDOWN_S)
+
+    t0 = _time.perf_counter()
+    fetched = session.browser_fetch("https://vendorf.example/p", "vendorf",
+                                    _cef=_FakeCef(), min_interval=0.0, no_cache=True)
+    interacted = session.browser_interact("https://vendori.example/p", "vendori",
+                                          "js();", _cef=_FakeCef(), min_interval=0.0)
+    elapsed = _time.perf_counter() - t0
+
+    assert elapsed < _PROMPT_S * 2, f"blocked for {elapsed:.1f}s instead of refusing"
+    for result in (fetched, interacted):
+        assert result["ok"] is False and result["reason"] == "cooldown_active"
+        assert result["retry_after_s"] > 0.0
+
+
+def test_ordinary_spacing_is_not_a_cooldown_refusal(browser_mods, tmp_path):
+    """A plain inter-request window under the budget still fetches — the refusal is
+    scoped to punishment cooldowns, so normal pacing is unchanged."""
+    _profiles, _ratelimit, session = browser_mods
+    cef = _FakeCef()
+    first = session.browser_download("https://grabcad.com/a.pdf", "grabcad",
+                                     tmp_path / "dl" / "a.pdf", _cef=cef,
+                                     min_interval=0.0)
+    second = session.browser_download("https://grabcad.com/b.pdf", "grabcad",
+                                      tmp_path / "dl" / "b.pdf", _cef=cef,
+                                      min_interval=0.0)
+    assert first["ok"] is True and second["ok"] is True
+    assert len(cef.downloaded) == 2

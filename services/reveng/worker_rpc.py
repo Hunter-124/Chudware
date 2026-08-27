@@ -223,9 +223,34 @@ def _site_of(url_or_part_id: str) -> str:
         return "product"
 
 
-def _download_into(url: str, site: str, dest_dir: Path) -> Path | None:
-    """Download one media URL into ``dest_dir`` under the user's session; return
-    the local path, or None on any failure (best-effort — never raises)."""
+#: Ceiling on media items this call will ATTEMPT to download, images + documents.
+#:
+#: ARITHMETIC: ``reverse_engineer_product`` carries ``timeout_s: 300`` (see
+#: ``services/agent/tool_guidance/parts.py``). Each item pays
+#: ``ratelimit.DEFAULT_MIN_INTERVAL_S`` = 3 s of mandatory same-site spacing plus a
+#: real vendor image/PDF body, measured 1-4 s — call it ~7 s worst case per item.
+#: 24 * 7 s = 168 s, leaving ~130 s of the 300 s for reveng_start_session, the
+#: per-document ingest lane, and the session write. Without a bound the worst case
+#: was unbounded: product pages routinely list 30-60 media URLs (Amazon, Home Depot
+#: galleries), so a full harvest could not fit in ANY tool budget and the harness
+#: abandoned the call mid-download, discarding every item already fetched.
+_MAX_HARVEST_ITEMS = 24
+
+#: Browser refusals that mean "stop asking THIS site" rather than "that one URL
+#: failed". ``cooldown_active`` is the site's own 429/403 backoff, which is
+#: per-site and persisted, so every remaining same-site URL would be refused too —
+#: continuing just burns the tool budget one pointless call at a time.
+_SITE_STOP_REASONS = frozenset({"cooldown_active"})
+
+
+def _download_into(url: str, site: str, dest_dir: Path) -> tuple[Path | None, dict | None]:
+    """Download one media URL into ``dest_dir`` under the user's session.
+
+    Returns ``(local_path, refusal)``: the path on success, or ``(None, envelope)``
+    when the browser declined with a reason the harvest must ACT on
+    (:data:`_SITE_STOP_REASONS`). Every other failure stays ``(None, None)`` —
+    best-effort, never raises.
+    """
     try:
         from services.browser import session as _bsession
         dest_dir.mkdir(parents=True, exist_ok=True)
@@ -233,10 +258,69 @@ def _download_into(url: str, site: str, dest_dir: Path) -> Path | None:
         dest = dest_dir / name
         out = _bsession.browser_download(url, site, dest)
         if out.get("ok") and dest.is_file():
-            return dest
+            return dest, None
+        if out.get("reason") in _SITE_STOP_REASONS:
+            return None, out
     except Exception:  # noqa: BLE001
         pass
-    return None
+    return None, None
+
+
+def _harvest_downloads(urls: list[str], site: str, dest_dir: Path, budget: int) -> dict:
+    """Download at most ``budget`` of ``urls``, keeping whatever it gets.
+
+    Returns ``{paths, attempts, skipped, skip_reason, retry_after_s}``. The loop
+    stops early on the ``budget`` ceiling or on a site-level refusal, and ``skipped``
+    counts every URL left untried at that point — a partial harvest reported honestly
+    beats a whole call abandoned by the harness on media item #1.
+    """
+    paths: list[Path] = []
+    attempts = 0
+    for index, url in enumerate(urls):
+        if attempts >= budget:
+            return {"paths": paths, "attempts": attempts, "skipped": len(urls) - index,
+                    "skip_reason": "harvest_item_cap", "retry_after_s": None}
+        attempts += 1
+        path, refusal = _download_into(url, site, dest_dir)
+        if path is not None:
+            paths.append(path)
+            continue
+        if refusal is not None:
+            retry_after = refusal.get("retry_after_s")
+            return {"paths": paths, "attempts": attempts, "skipped": len(urls) - index,
+                    "skip_reason": str(refusal.get("reason")),
+                    "retry_after_s": (float(retry_after)
+                                      if isinstance(retry_after, (int, float)) else None)}
+    return {"paths": paths, "attempts": attempts, "skipped": 0,
+            "skip_reason": None, "retry_after_s": None}
+
+
+def _harvest_skip_hint(site: str, sid: str, skipped: int, reason: str,
+                       retry_after_s: float | None) -> str:
+    """Teaching note for a harvest that returned PARTIAL media, in the same posture
+    as ``agent_turn._call_cap_error``: name the next action, not the config knob.
+
+    The session exists and holds real items, so the model must not read this as a
+    failed call and re-issue it — re-calling into an armed cooldown is refused
+    identically and costs another tool call for nothing.
+    """
+    head = (f"{skipped} media item(s) were NOT downloaded, but session {sid} is live "
+            f"with everything that was. ")
+    if reason in _SITE_STOP_REASONS:
+        when = (f" after ~{retry_after_s:.0f}s" if retry_after_s is not None
+                else " once its cooldown expires")
+        return (head + f"{site} started rate-limiting us mid-harvest (429/403 backoff), "
+                       f"so the remaining URLs were abandoned rather than waited on — "
+                       f"waiting is impossible inside one call. Do NOT re-call "
+                       f"reverse_engineer_product now; it will be refused the same way. "
+                       f"Work the session you have (reveng_reconstruct / "
+                       f"reveng_single_photo), add your own photos with "
+                       f"reveng_add_images(session_id, paths), and only revisit {site}"
+                       f"{when}.")
+    return (head + f"the harvest stopped at its {_MAX_HARVEST_ITEMS}-item ceiling, which "
+                   f"keeps this call inside its time budget. Continue with the media the "
+                   f"session already holds; if a specific missing view matters, add just "
+                   f"that file with reveng_add_images(session_id, paths).")
 
 
 def _reveng_start_from_product(params: dict, _emit: Callable) -> dict:
@@ -245,7 +329,14 @@ def _reveng_start_from_product(params: dict, _emit: Callable) -> dict:
     own; the session work itself routes through the bridged tools, so nothing is
     reimplemented here. A zero-media harvest STILL creates a session (the user adds
     their own photos). Each download/ingest is guarded — one failure never fails
-    the whole call."""
+    the whole call.
+
+    The media harvest is BOUNDED and INTERRUPTIBLE: at most
+    :data:`_MAX_HARVEST_ITEMS` items are attempted, and a site-level refusal
+    (:data:`_SITE_STOP_REASONS`) abandons the remaining same-site URLs instead of
+    blocking on them. Such a call still succeeds, reporting ``media_skipped``,
+    ``media_skipped_reason``, ``retry_after_s`` and an actionable ``hint`` alongside
+    the items it did collect."""
     try:
         from services.mcp.reveng_tools import _session_path
 
@@ -277,34 +368,60 @@ def _reveng_start_from_product(params: dict, _emit: Callable) -> dict:
             return started
         sid = started["session_id"]
 
-        # Download images into <session>/images, then thread through reveng_add_images.
+        # Bounded, interruptible harvest: images then documents share ONE item
+        # budget (:data:`_MAX_HARVEST_ITEMS`), and a site-level refusal abandons the
+        # rest of the SITE while keeping everything already collected. A single
+        # backed-off vendor used to spend the tool's whole 300 s on media item #1 and
+        # take the entire harvest down with it.
+        budget = _MAX_HARVEST_ITEMS
+        skipped = 0
+        skip_reason: str | None = None
+        retry_after_s: float | None = None
+
         images_added = 0
         if images:
-            img_dir = _session_path(sid) / "_harvest_images"
-            local_imgs = [str(pth) for u in images
-                          if (pth := _download_into(u, site, img_dir)) is not None]
-            if local_imgs:
+            got = _harvest_downloads(images, site,
+                                     _session_path(sid) / "_harvest_images", budget)
+            budget -= got["attempts"]
+            skipped += got["skipped"]
+            skip_reason = got["skip_reason"]
+            retry_after_s = got["retry_after_s"]
+            if got["paths"]:
                 added = _call_tool("reveng_add_images",
-                                   {"session_id": sid, "paths": local_imgs})
+                                   {"session_id": sid,
+                                    "paths": [str(pth) for pth in got["paths"]]})
                 if added.get("ok"):
                     images_added = added.get("added", 0)
 
         # Download each document, then ingest via the existing datasheet lane.
         documents_ingested = 0
-        for doc_url in documents:
-            local = _download_into(doc_url, site, _session_path(sid) / "_harvest_docs")
-            if local is None:
-                continue
-            ing = _call_tool("reveng_ingest_datasheet",
-                             {"session_id": sid, "path": str(local)})
-            if ing.get("ok"):
-                documents_ingested += 1
+        if documents and skip_reason in _SITE_STOP_REASONS:
+            skipped += len(documents)  # same site, same cooldown — don't even try
+        elif documents:
+            got = _harvest_downloads(documents, site,
+                                     _session_path(sid) / "_harvest_docs", budget)
+            skipped += got["skipped"]
+            skip_reason = got["skip_reason"] or skip_reason
+            retry_after_s = got["retry_after_s"] if retry_after_s is None else retry_after_s
+            for local in got["paths"]:
+                ing = _call_tool("reveng_ingest_datasheet",
+                                 {"session_id": sid, "path": str(local)})
+                if ing.get("ok"):
+                    documents_ingested += 1
 
-        return {"ok": True, "session_id": sid,
-                "images_added": images_added,
-                "documents_ingested": documents_ingested,
-                "source_url": source_url,
-                "activeWorkspace": "ReverseEng"}
+        out = {"ok": True, "session_id": sid,
+               "images_added": images_added,
+               "documents_ingested": documents_ingested,
+               "media_skipped": skipped,
+               "source_url": source_url,
+               "activeWorkspace": "ReverseEng"}
+        if skip_reason:
+            out["media_skipped_reason"] = skip_reason
+            out["hint"] = _harvest_skip_hint(site, sid, skipped, skip_reason,
+                                             retry_after_s)
+        if retry_after_s is not None:
+            out["retry_after_s"] = round(retry_after_s, 1)
+        return out
     except Exception as exc:  # noqa: BLE001
         return _wrap_exc(exc)
 

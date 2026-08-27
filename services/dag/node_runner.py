@@ -630,6 +630,26 @@ def _default_agent_fn(request: str, context_pack: dict[str, Any], *,
             )
         except Exception:  # noqa: BLE001 — floor is best-effort, never blocks
             pass
+    # ...then the Settings → AI "sub-agent tool-call budget" slider
+    # (agent.subagent_tool_call_budget), through the SAME helper and in the SAME
+    # last position as MissionDispatch._run_subagent_turn. This lane never read
+    # that config key at all, so the one GUI slider governed the `delegate` lane
+    # and had ZERO effect on every compiled-DAG (mission_start) role while
+    # presenting itself as uniform. It stays a SOFT convergence threshold: the
+    # hard runaway ceiling remains agent_turn's alone.
+    #
+    # Deliberately NOT gated on CHUDWARE_AGENT_MAX_TOOL_CALLS: the delegate lane
+    # does not read that env var, so gating here would leave the two lanes
+    # disagreeing on exactly the state this fix exists to unify. An explicit
+    # user setting outranks a bench cap; the slider defaults to 0 (derive
+    # automatically), so an unconfigured bench box is untouched.
+    try:
+        from services.agent.mission_dispatch import (  # noqa: PLC0415
+            configured_subagent_tool_budget,
+        )
+        max_tools = configured_subagent_tool_budget(max_tools)
+    except Exception:  # noqa: BLE001 — automatic derivation is the fallback
+        pass
 
     # T-W32: render the §9.1 tools slot — trimmed schemas for EXACTLY the node's
     # allowed tools, within the tier's budgets.tools, resolved through the SAME
@@ -1132,23 +1152,25 @@ def run(
     success: bool = bool(getattr(agent_result, "success", False))
 
     verdict = _map_verdict(stop_reason, success)
-    # Provider retryability is structured data, not a stop-reason guess.
-    # Both legacy "failed" and current "provider_error" shapes use the same rule.
-    if (
-        not success
-        and stop_reason in ("failed", "provider_error")
-    ):
-        agent_result_dict_probe = getattr(agent_result, "result", None) or {}
-        if (
-            isinstance(agent_result_dict_probe, dict)
-            and agent_result_dict_probe.get("retryable") is True
-        ):
-            verdict = VERDICT_RETRY
-            # Next attempt should prefer cheaper effort/provider band.
-            try:
-                context_pack["retry_cheap"] = True
-            except Exception:  # noqa: BLE001
-                pass
+    # Provider retryability is structured data, not a stop-reason guess. Same
+    # predicate the `delegate` lane gates its own one-shot recovery on
+    # (mission_dispatch.retryable_child_failure) so the two dispatch paths
+    # cannot drift on WHICH faults are transient; it covers both the legacy
+    # "failed" and the current "provider_error" stop_reason shapes.
+    try:
+        from services.agent.mission_dispatch import (  # noqa: PLC0415
+            retryable_child_failure,
+        )
+        _retryable = retryable_child_failure(agent_result)
+    except Exception:  # noqa: BLE001 — an unclassifiable failure escalates
+        _retryable = False
+    if _retryable:
+        verdict = VERDICT_RETRY
+        # Next attempt should prefer cheaper effort/provider band.
+        try:
+            context_pack["retry_cheap"] = True
+        except Exception:  # noqa: BLE001
+            pass
 
     # mega-8 (advisor Q2): multi-domain PLAN/BUILD soft gate — auto-complete
     # blocks until a real delegate call OR a TYPED refusal envelope

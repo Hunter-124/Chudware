@@ -131,6 +131,109 @@ def test_start_from_product_empty_harvest_still_starts_session(reveng_dir, monke
     assert got["ok"]
 
 
+# --- §2b harvest: partial results beat an abandoned call ------------------------
+#
+# reverse_engineer_product carries timeout_s=300 (tool_guidance/parts.py) and calls
+# browser_download once per harvested media URL. A site whose 429/403 backoff is
+# armed used to block the FIRST item for up to BACKOFF_MAX_S (900 s), so the harness
+# killed the call and every already-downloaded item was thrown away.
+
+def _media_harvest(monkeypatch, images, documents):
+    """Point harvest_product_media at a fixed media list."""
+    from services.parts import product_media as pm
+    monkeypatch.setattr(pm, "harvest_product_media", lambda ref: {
+        "ok": True, "source_url": "https://shop.example/widget",
+        "images": images, "documents": documents,
+    })
+
+
+def _writing_download(cooldown_after: int | None = None, calls: list | None = None):
+    """browser_download stub: writes a plausible body, and after ``cooldown_after``
+    successful calls starts answering with the cooldown_active refusal."""
+    def _download(url, site, dest, **_k):
+        if calls is not None:
+            calls.append(url)
+        if cooldown_after is not None and len(calls or []) > cooldown_after:
+            return {"ok": False, "reason": "cooldown_active", "retry_after_s": 612.0,
+                    "policy_refusal": True, "executed": False, "hint": "cooling down"}
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(b"%PDF-1.4\n" if str(dest).endswith(".pdf")
+                         else b"\xff\xd8\xff\xe0" + b"\x00" * 8)
+        return {"ok": True, "dest": str(dest)}
+    return _download
+
+
+def test_harvest_keeps_partial_results_when_the_site_starts_cooling_down(
+        reveng_dir, monkeypatch):
+    """Item #3 is refused with cooldown_active: the call still SUCCEEDS with the two
+    images it got, reports how many were skipped and why, and never touches the
+    remaining same-site URLs (documents included)."""
+    from services.browser import session as bsession
+
+    _media_harvest(monkeypatch,
+                   images=[f"https://cdn.example/{n}.jpg" for n in "abcde"],
+                   documents=["https://cdn.example/ds.pdf"])
+    calls: list[str] = []
+    monkeypatch.setattr(bsession, "browser_download",
+                        _writing_download(cooldown_after=2, calls=calls))
+    monkeypatch.setattr("services.mcp.reveng_session_tools._ingest_pdf",
+                        lambda path, out_dir: {"ok": True, "tables": [], "crops": []})
+
+    r = _call("reveng_start_from_product", {"url": "https://shop.example/widget"})
+
+    assert r["ok"] is True and r["session_id"]
+    assert r["images_added"] == 2                     # the partial harvest was KEPT
+    assert r["documents_ingested"] == 0
+    # 3 remaining images (c,d,e) + the 1 document, none of them attempted after the refusal
+    assert r["media_skipped"] == 4
+    assert r["media_skipped_reason"] == "cooldown_active"
+    assert r["retry_after_s"] == 612.0
+    assert len(calls) == 3, calls                     # stopped AT the refusal, not after
+    assert "ds.pdf" not in " ".join(calls)
+    # The hint must route the model somewhere, not just name the state.
+    assert "reveng_add_images" in r["hint"]
+    assert "reverse_engineer_product" in r["hint"]    # ...and say not to re-call it
+
+
+def test_harvest_is_bounded_by_the_item_cap(reveng_dir, monkeypatch):
+    """A 60-image gallery cannot be allowed to define this tool's worst case."""
+    from services.browser import session as bsession
+
+    cap = reveng_rpc._MAX_HARVEST_ITEMS
+    _media_harvest(monkeypatch,
+                   images=[f"https://cdn.example/i{n}.jpg" for n in range(60)],
+                   documents=["https://cdn.example/ds.pdf"])
+    calls: list[str] = []
+    monkeypatch.setattr(bsession, "browser_download", _writing_download(calls=calls))
+
+    r = _call("reveng_start_from_product", {"url": "https://shop.example/widget"})
+
+    assert r["ok"] is True
+    assert len(calls) == cap                          # images + documents share ONE budget
+    assert r["images_added"] == cap
+    assert r["media_skipped"] == 61 - cap
+    assert r["media_skipped_reason"] == "harvest_item_cap"
+    assert "retry_after_s" not in r                   # a cap is not a cooldown
+    assert str(cap) in r["hint"]
+
+
+def test_clean_harvest_reports_zero_skips_and_no_hint(reveng_dir, monkeypatch):
+    """The happy path stays clean: no skip fields beyond the honest zero count."""
+    from services.browser import session as bsession
+
+    _media_harvest(monkeypatch, images=["https://cdn.example/a.jpg"],
+                   documents=["https://cdn.example/ds.pdf"])
+    monkeypatch.setattr(bsession, "browser_download", _writing_download(calls=[]))
+    monkeypatch.setattr("services.mcp.reveng_session_tools._ingest_pdf",
+                        lambda path, out_dir: {"ok": True, "tables": [], "crops": []})
+
+    r = _call("reveng_start_from_product", {"url": "https://shop.example/widget"})
+
+    assert r["ok"] is True and r["images_added"] == 1 and r["documents_ingested"] == 1
+    assert r["media_skipped"] == 0
+    assert "media_skipped_reason" not in r and "hint" not in r
+
+
 def test_missing_session_is_structured_failure(reveng_dir):
     r = _call("reveng_add_images", {"session_id": "nope", "paths": []})
     assert r["ok"] is False and "not found" in r["reason"]

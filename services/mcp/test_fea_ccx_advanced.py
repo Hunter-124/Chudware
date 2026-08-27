@@ -363,3 +363,128 @@ def test_ccx_timeout_clean_error():
     r = fa.run_ccx(gen["inp"], job="slow", timeout=0.01)
     assert time.time() - t0 < 10.0
     assert r.get("ok") is False and "timed out" in r.get("error", ""), r
+
+
+# ---------------------------------------------------------------------------
+# Layered timeouts — the inner CalculiX clock must stay strictly inside the
+# outer harness clock (services/agent/tool_guidance/sim.py timeout_s enforced
+# by agent_turn._dispatch_tool's ThreadPoolExecutor).
+# ---------------------------------------------------------------------------
+# Both clocks were 300 s, i.e. EQUAL, and the outer one starts EARLIER (at
+# dispatch, before deck generation / mesh build / tempdir setup), so it always
+# expired first: run_ccx's actionable "ccx timed out" branch was unreachable
+# through the harness and the model only ever got "abandoned in the background,
+# may still be running". These pin the INVARIANT (inner < outer, margin covers
+# pre-solve work), not the particular seconds.
+
+_RUN_FEA_TOOLS = (
+    "run_fea_adaptive", "run_fea_buckling", "run_fea_contact", "run_fea_fatigue",
+    "run_fea_frequency_response", "run_fea_modal", "run_fea_static",
+    "run_fea_thermal",
+)
+
+
+def test_every_run_fea_tool_outer_ceiling_exceeds_the_inner_ccx_clock():
+    """For EVERY run_fea_* tool the harness advertises, the inner subprocess
+    budget must be strictly smaller than the outer dispatch ceiling, by the
+    declared setup margin. A new family member that forgets timeout_s (as
+    run_fea_adaptive did) fails here rather than silently inheriting the global
+    default and racing its own solver."""
+    from services.agent.tool_guidance import sim as sim_guidance
+
+    assert fa.HARNESS_CCX_TIMEOUT_S < fa.HARNESS_FEA_TIMEOUT_S, (
+        "inner ccx clock must be strictly shorter than the outer harness clock")
+    assert (fa.HARNESS_FEA_TIMEOUT_S - fa.HARNESS_CCX_TIMEOUT_S
+            == fa.CCX_SETUP_MARGIN_S)
+    # The margin has to be able to absorb real pre-solve work (mesh build +
+    # autosave + STEP export), not a token epsilon.
+    assert fa.CCX_SETUP_MARGIN_S >= 60.0, fa.CCX_SETUP_MARGIN_S
+
+    advertised = sorted(k for k in sim_guidance.ENTRIES if k.startswith("run_fea_"))
+    assert advertised == sorted(_RUN_FEA_TOOLS), advertised
+    for tool in advertised:
+        outer = sim_guidance.ENTRIES[tool].get("timeout_s")
+        assert outer is not None, f"{tool} has no outer timeout_s"
+        assert float(outer) == fa.HARNESS_FEA_TIMEOUT_S, (
+            f"{tool} outer ceiling {outer}s is out of lockstep with "
+            f"fea_advanced.HARNESS_FEA_TIMEOUT_S={fa.HARNESS_FEA_TIMEOUT_S}s")
+        assert fa.HARNESS_CCX_TIMEOUT_S < float(outer), (
+            f"{tool}: inner ccx {fa.HARNESS_CCX_TIMEOUT_S}s is not inside outer "
+            f"{outer}s — CalculiX's own timeout diagnostic is unreachable")
+
+
+def test_mcp_ccx_call_sites_pass_the_harness_budget_explicitly():
+    """Anti-drift on the wiring: every ``run_ccx`` call in the MCP tool layer —
+    the only layer that runs under agent_turn's outer deadline — must pass the
+    harness budget. run_ccx's 300 s default exists for DIRECT callers (benches,
+    vv_benchmark, the GUI worker seam), which have no outer clock; inheriting it
+    inside a tool re-creates the equality that buried the diagnostic."""
+    import ast
+
+    path = Path(__file__).with_name("cad_sim_tools.py")
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    sites = [n for n in ast.walk(tree)
+             if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+             and n.func.attr == "run_ccx"]
+    assert sites, "no run_ccx call sites in cad_sim_tools.py — did they move?"
+    for call in sites:
+        kwargs = {kw.arg: kw.value for kw in call.keywords}
+        assert "timeout" in kwargs, (
+            f"cad_sim_tools.py:{call.lineno} calls run_ccx with no timeout= — it "
+            "inherits the 300 s default and equals the harness ceiling")
+        expr = ast.unparse(kwargs["timeout"])
+        assert expr == "fa.HARNESS_CCX_TIMEOUT_S", (
+            f"cad_sim_tools.py:{call.lineno} passes timeout={expr}, not the "
+            "harness budget")
+
+
+@needs_ccx
+def test_slow_solve_surfaces_ccx_timeout_not_harness_abandonment(monkeypatch, tmp_path):
+    """END TO END through the REAL harness dispatcher, with both clocks scaled by
+    the same factor so the test costs ~2 s instead of 7 minutes.
+
+    A solve that outruns its budget must come back as CalculiX's own
+    ``{ok: false, error: "ccx timed out after Ns"}`` — the payload that tells the
+    model to coarsen the mesh — and NOT as agent_turn's ``timed_out: True``
+    "abandoned in the background" payload, which names no remedy. Setup work
+    (here a real sleep standing in for deck generation and the mesh build) runs
+    inside the outer window before the inner clock starts, which is exactly why
+    equal budgets could never surface the inner message."""
+    from services.agent import agent_turn as at
+    from services.agent import config as agent_config
+
+    outer = 2.0                                     # scaled HARNESS_FEA_TIMEOUT_S
+    scale = outer / fa.HARNESS_FEA_TIMEOUT_S
+    inner = fa.HARNESS_CCX_TIMEOUT_S * scale        # 1.43 s at scale 2/420
+    setup = fa.CCX_SETUP_MARGIN_S * scale * 0.5     # 0.29 s of pre-solve work
+
+    # A ccx that never converges: the inner subprocess timeout is the only thing
+    # that can end it. `exec` matters — subprocess.run kills the pid it spawned,
+    # and a non-exec /bin/sh would fork `sleep` and leak it past the test.
+    fake_ccx = tmp_path / "ccx_slow"
+    fake_ccx.write_text("#!/bin/sh\nexec sleep 60\n", encoding="utf-8")
+    fake_ccx.chmod(0o755)
+    monkeypatch.setattr(fa, "ccx_path", lambda: str(fake_ccx))
+
+    # The outer clock comes from the real per-tool option resolver, so this
+    # exercises the same layering the live harness uses.
+    monkeypatch.setattr(agent_config, "load_config", lambda *a, **k: {
+        "agent": {"tool_options": {"run_fea_thermal": {"timeout_s": int(outer)}}}})
+
+    def _tool_body(_tool, _args):
+        time.sleep(setup)                            # deck generation + mesh build
+        gen = fa.build_thermal_bar_inp(200.0, 20.0, 20.0, 50.0, 100.0, 0.0)
+        return fa.run_ccx(gen["inp"], job="thermal", timeout=inner)
+
+    t0 = time.time()
+    result = at._dispatch_tool("run_fea_thermal", {}, _inner=_tool_body)
+    spent = time.time() - t0
+
+    assert result.get("ok") is False, result
+    assert "timed out" in str(result.get("error", "")), result
+    assert result.get("backend", "").startswith("calculix"), result
+    # The harness abandonment shape must NOT be what came back.
+    assert result.get("timed_out") is not True, result
+    assert "abandoned" not in str(result.get("error", "")), result
+    # And the whole call finished inside the outer ceiling.
+    assert spent < outer, f"{spent:.2f}s >= outer ceiling {outer}s"

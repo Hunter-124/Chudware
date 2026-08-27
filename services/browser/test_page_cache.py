@@ -296,7 +296,8 @@ def test_cache_hit_skips_the_profile_lock_and_rate_limiter(cache_mods, monkeypat
 
     waits: list[str] = []
     monkeypatch.setattr(ratelimit, "wait",
-                        lambda site, *, min_interval=0.0, url=None: waits.append(site))
+                        lambda site, *, min_interval=0.0, url=None, max_wait_s=None:
+                        (waits.append(site), 0.0)[1])
     monkeypatch.setattr(session.profiles, "profile_lock",
                         lambda site: pytest.fail("cache hit must not take the profile lock"))
     monkeypatch.setattr(session.profiles, "ensure_profile",
@@ -326,10 +327,13 @@ def test_no_cache_flag_skips_lookup_and_store(cache_mods):
 def test_browser_fetch_never_caches_an_http_error(cache_mods, monkeypatch):
     _page_cache, session, ratelimit = cache_mods
     cef = _CountingCef(html="<html>Access Denied</html>", status=403)
-    # A 403 arms the rate limiter's exponential backoff; skip the real sleep so
-    # the second call measures the cache, not the (correct) 30 s penalty.
+    # A 403 arms the rate limiter's exponential backoff; neutralise it so the second
+    # call measures the CACHE, not the (correct) 30 s penalty. Returning 0.0 is
+    # "no wait was needed" — session.py reads that return value now, because a wait
+    # longer than session.COOLDOWN_WAIT_BUDGET_S short-circuits to a cooldown_active
+    # refusal instead of a second fetch.
     monkeypatch.setattr(ratelimit, "wait",
-                        lambda site, *, min_interval=0.0, url=None: None)
+                        lambda site, *, min_interval=0.0, url=None, max_wait_s=None: 0.0)
 
     first = session.browser_fetch("https://grabcad.com/p/4", "grabcad",
                                   _cef=cef, min_interval=0.0)

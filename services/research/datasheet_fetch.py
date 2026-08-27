@@ -25,6 +25,14 @@ from .common import HIGH, MEDIUM, envelope, fail, is_offline, now_ts
 
 _MAX_MD = 200_000  # cap markdown to protect the model window (matches fetch_page §3)
 
+#: Browser-fallback refusal reasons that must reach the model VERBATIM instead of
+#: being flattened into the generic ``network`` degradation. ``cooldown_active``
+#: means the site's 429/403 backoff is armed for longer than this tool's whole
+#: 180 s harness budget (``tool_guidance/research.py``), so it is not a transient
+#: fetch error the model should retry — it is a wall it must route around, and the
+#: refusal already carries ``retry_after_s`` and the remedy.
+_ACTIONABLE_BROWSER_REASONS = frozenset({"cooldown_active"})
+
 
 def _load_extractor():
     """Return a ``(text_fn, name)`` for an installed MIT PDF extractor, or ``None``.
@@ -54,7 +62,9 @@ def _to_markdown(text: str) -> str:
     return md[:_MAX_MD]
 
 
-def _try_browser_fallback(url: str) -> tuple[Optional[bytes], Optional[str]]:
+def _try_browser_fallback(
+    url: str,
+) -> tuple[Optional[bytes], Optional[str], Optional[dict]]:
     """On a 401/403 from a plain fetch, retry ``url`` via T-X1's authenticated browser
     session — ONLY when a matching site profile already exists (never triggers a login
     from this path; a missing profile just falls through to the existing degradation).
@@ -63,17 +73,21 @@ def _try_browser_fallback(url: str) -> tuple[Optional[bytes], Optional[str]]:
     runtime deps) — any import failure here degrades to "no fallback available", same
     posture as the ``_load_extractor`` optional-dependency check above.
 
-    Returns ``(data, session_profile_used)`` on success, or ``(None, None)``.
+    Returns ``(data, session_profile_used, refusal)``. ``refusal`` carries the browser's
+    own §6 envelope when it declined for a reason the model must ACT on rather than see
+    flattened into ``network`` — today that is ``cooldown_active``: the site's 429/403
+    backoff outlasts this tool's 180 s budget, so "could not fetch: HTTP 403" would be a
+    lie and burying it behind ``raise_for_status`` costs the caller its whole turn.
     """
     try:
         from services.browser import profiles as _profiles
         from services.browser.session import browser_download
     except Exception:  # noqa: BLE001 - services.browser / playwright not available
-        return None, None
+        return None, None, None
 
     site = urlparse(url).netloc
     if not site:
-        return None, None
+        return None, None, None
     # No has_profile gate: anonymous downloads are allowed (browser_download
     # auto-creates a profile); gated files fail via the result envelope below.
     _ = _profiles  # kept for the availability probe in the import above
@@ -82,12 +96,13 @@ def _try_browser_fallback(url: str) -> tuple[Optional[bytes], Optional[str]]:
         dest = Path(tmp) / "datasheet.pdf"
         result = browser_download(url, site, dest)
         if not result.get("ok"):
-            return None, None
+            return None, None, (result if result.get("reason") in _ACTIONABLE_BROWSER_REASONS
+                                else None)
         try:
             data = dest.read_bytes()
         except OSError:
-            return None, None
-        return data, result.get("session_profile_used")
+            return None, None, None
+        return data, result.get("session_profile_used"), None
 
 
 def _read_bytes(source: str) -> tuple[Optional[bytes], Optional[dict], Optional[str]]:
@@ -96,7 +111,10 @@ def _read_bytes(source: str) -> tuple[Optional[bytes], Optional[dict], Optional[
     Returns ``(data, None, session_profile_used)`` on success or ``(None, degradation, None)``
     on failure. ``session_profile_used`` is non-``None`` only when the T-X4 authenticated-
     browser fallback served the bytes (additive; ``None`` for the plain-fetch and local-file
-    paths, unchanged from before this task).
+    paths, unchanged from before this task). When the fallback refuses with an actionable
+    reason (:data:`_ACTIONABLE_BROWSER_REASONS`) that envelope IS the degradation returned,
+    so ``cooldown_active`` + ``retry_after_s`` survive to the tool boundary instead of being
+    replaced by ``raise_for_status``'s "HTTP 403" a line later.
     """
     s = str(source).strip()
     if s.lower().startswith(("http://", "https://")):
@@ -107,9 +125,11 @@ def _read_bytes(source: str) -> tuple[Optional[bytes], Optional[dict], Optional[
             r = httpx.get(s, follow_redirects=True, timeout=30.0,
                           headers={"User-Agent": "Chudware-research/1.0"})
             if r.status_code in (401, 403):
-                data, session_profile_used = _try_browser_fallback(s)
+                data, session_profile_used, refusal = _try_browser_fallback(s)
                 if data is not None:
                     return data, None, session_profile_used
+                if refusal is not None:
+                    return None, refusal, None
             r.raise_for_status()
             return r.content, None, None
         except Exception as exc:  # noqa: BLE001

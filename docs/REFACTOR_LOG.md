@@ -8372,3 +8372,113 @@ Completed the existing contract-first remote stack in `services/plm/remote.py`, 
 ## 2026-08-27 — self-hosted PLM live collaboration (T-R8)
 
 Added the frozen `aicad.plm-live/1` authoritative relay after an OSS survey rejected CRDT/OT duplication of Chudware's semantic engine order. `services/plm/server.py` and `live_client.py` provide authenticated total-order batches, canonical snapshot catch-up, bounded presence, reconnect idempotency, local-hostd atomic application, and one participant-attributed final checkpoint; worker/MCP live methods and `plm-server` profiles select the mode without changing T-R7 dumb-remotes. `WorkerClient` transparently reroutes joined documents' ordinary `doc_apply_ops` to the live proposal seam, never falling back locally after refusal. Project Hub/quickbar render live-server join/leave, LIVE/reconnecting, and participant state while retaining advisory locks for folder/SSH/HTTPS profiles. Proof: actual clients observed sequences 1/2 and equal final hashes, one checkpoint named both committers, core replay passed `eval_compare`, 413 PLM tests passed, native and WASM builds passed, all 103 core CTests passed, the 9,627-test full gate returned PASS, scoped GUI lints were clean, and a live-server Team headless capture wrote 1340x838. Concurrent marketplace/ECAD/public-site/hostd/browser work was excluded.
+
+## 2026-08-27 — agent harness: limits calibrated against what they bound
+
+Triggered by a live card reading `tool 'research_web_search' exceeded
+max_calls_per_turn=3 (agent.tool_options)` mid-research, with the model's own next
+thought being "I could fetch more technical references". The 2026-08-26 session had
+already fixed that message's PROSE; this session found the defect class underneath it:
+**a ceiling calibrated without reference to what the wrapped mechanism actually takes.**
+Four read-only audits (refusal surface, turn budgets, guardrail satisfiability,
+timeouts/retries) plus four repair slices. `services/agent` + `services/dag`: 3809 pass,
+2 fail, both pre-existing (below).
+
+**The unit mismatch.** `max_calls_per_turn` is enforced against a counter created once per
+`run_turn`, i.e. per whole USER REQUEST, not per model round-trip. `research_web_search`'s
+3 was reasoned per-round-trip ("three searches is enough to triangulate"), so it meant
+three web searches for an entire engineering task. Now 24, with the RUN scope stated at the
+entry and the arithmetic given (~9% of `MAIN_CHAT_RUNAWAY_TOOL_CALL_BACKSTOP` = 256, an
+order of magnitude above any observed legitimate chain, still bounding a rephrase spin at
+24 paid searches instead of 250). Identical repeated queries are the loop guard's job; this
+counter counts by tool NAME and cannot tell a new subtopic from a retry.
+
+**Refusals: bounded, not free.** `_refusals_made` claimed in its own stop text to be
+"consecutive … without a single accepted call" while being a lifetime total that was never
+reset, so twelve single-shot guard corrections scattered across a 256-call run forced a
+stop. It is now genuinely consecutive (reset by every accepted dispatch) and DISPATCH-time
+refusals (per-turn cap, loop guard, Settings kill-switch) are charged to it — at HEAD only
+PRE-dispatch blocks were, so an identical-call spin had no bound short of the runaway
+ceiling. Measured by neutering the fix: **256 paid provider round-trips**, reported as
+`main_chat_runaway_backstop`; with it, ~14 and an honest `refusal_ceiling`. The ceiling is
+checked at the TOP of the loop so the refusal that trips it still emits its card — the stop
+text promises "the last refusal text names what it demanded", and breaking at the increment
+discarded exactly that. A REFUND of `tool_calls_made` was tried and reverted: that counter
+is simultaneously the runaway bound and the reported `tool_calls`, so refunding made
+refusals free AND unbounded (41 round-trips against a nominal 20-call ceiling, honest stop
+replaced by `no_code`). A tighter bound is the fix; a free retry is not.
+
+**Remedies must name tools the lane holds.** `_empty_product_handoff_block` OR-ed an
+actor-NAME substring (`"ecad" in actor_l`) as an alternative to its tool-availability check,
+so `ecad_engineer` — 14/14 tools, none of them board tools, no widening path — was told to
+finish through `board_from_schematic` → `ecad_run_drc` and could only earn allowlist
+denials. Both name-based branches now gate purely on the GRANT, with a schematic-only lane
+that ends at `ecad_netlist`/`ecad_bom`/`ecad_plot`, the artifacts its own card mandates;
+those three also joined `_DELIVERED_PRODUCT_TOOLS`, which had made a legitimate ECAD finish
+read as zero delivered product.
+
+**Budgets vs mandated chains.** `ROLE_MIN_CALLS` gained `reviewer: 24` (AC1-AC9 grading plus
+its card's standard battery; it holds no `PRODUCER_TOOLS` and its real phase `deliver` misses
+`BUILD_PHASES`, so all three producer signals missed the one role that decides PASS/FAIL —
+and `reviewer_exec` treats `not_checked` as first-class, so early convergence yields
+honest-looking NOT_CHECKED rows rather than a loud failure), `drawing_detailer: 24`,
+`cam_programmer: 22`; `PRODUCER_MIN_CALLS` 16 → 20. `MAX_TOOLS_PER_ROLE` 14 → 16: it carried
+no rationale at all and 13 of 32 cards sat exactly on it, so it had stopped bounding cards
+and started designing them — `ecad_engineer` was ordered by UNIVERSAL RULE 3 to
+`ledger_note` every artifact while holding no `ledger_note` seat. Verified zero cards were
+losing tools to truncation before raising, so no existing grant changed.
+`render_schematic_ascii` left that card: it is a GSL script function, never a registered
+tool, and the loader reported it unresolvable.
+
+**Two lanes, one policy.** `delegate` never read the `result['retryable']` flag the DAG lane
+has always used, so a transient 429/5xx/truncation killed a delegated child while an
+identical DAG node recovered for free; both lanes now share one predicate and a bounded
+single retry. `agent.subagent_tool_call_budget` was applied only by `mission_dispatch`, so
+the Settings slider silently governed half the dispatch surface; both lanes now call one
+shared helper (currently `mission_dispatch.py:217-268`; `configured_subagent_tool_budget`
+would sit more naturally in `tool_budget.py`, deferred).
+
+**Layered clocks with no margin.** `ratelimit.BACKOFF_MAX_S` is 900 s and `wait()` slept it
+synchronously, while the largest harness ceiling anywhere is 600 s — so a site punished
+earlier in the same mission guaranteed abandonment (`research_datasheet_fetch`, 180 s, 5x
+over). `wait()` now takes `max_wait_s`, and the three agent-reachable session paths
+short-circuit to a `cooldown_active` teaching refusal with `retry_after_s`: **35.1 ms
+instead of a 900 s sleep**. Budget 20 s, sitting strictly below `BACKOFF_BASE_S`=30 (so every
+rung of the ladder short-circuits) and strictly above `DEFAULT_MIN_INTERVAL_S`=3 and every
+crawl-delay (so ordinary pacing still sleeps), with a test pinning that inequality. The
+reveng harvest returns partial results plus a skip count instead of losing the whole gallery,
+capped at 24 items. FEA: outer 300 s == inner `run_ccx` 300 s, and the outer clock starts
+first, so CalculiX's own "try a coarser mesh" was unreachable; outer is now 420 s with a
+derived 300 s inner (`run_fea_adaptive` had NO `timeout_s` at all). `fetch_page`'s redirect
+walk was `(10+1) x 30 = 330 s` against a 120 s ceiling; a whole-walk budget brings the worst
+case to 90 s, so its ceiling stays 120.
+
+**Test-order pollution, pre-existing.** `test_arg_reconciliation.py` drives the real MCP
+ToolManager and minted live documents it never discarded, so `save_touched_docs()` at each
+linear-turn terminal found the orphan and failed turns that had created no document, with
+`persistence_failed` / `no_project_save_dir`. It cost three unrelated linear-turn tests and
+was invisible whenever either file ran alone. An autouse fixture discards minted docs AND
+restores `cad_common._TOUCHED_DOCS` — restoring the list is as load-bearing as closing the
+doc, since `save_touched_docs` reads it directly. Same class as the `test_cheatsheet_examples`
+leak.
+
+**OMP fork.** Hunter's internal fork lives as UNCOMMITTED local patches in the gitignored
+`scratch/omp-src` (upstream `d1239fd3` + 76 lines adding `isSqliteCorruptError` and
+SQLite-corruption quarantine). Its `packages/ai` half is now vendored, but its only consumer
+was `packages/coding-agent`, which CAD does not vendor — so the improvement was inert here.
+CAD's own equivalent now lives in `vendor/omp/bridge/src/auth-context.ts` (OUR file, survives
+re-vendor): a corrupt `omp-bridge-auth.db` is quarantined with its `-wal`/`-shm` companions
+and recreated once, warning to stderr only. Verified end to end — before, every auth RPC
+failed for the process lifetime with "file is not a database". `OMP_VENDOR.lock` now records
+`dirty` + `dirty_files` so it stops claiming the vendored bytes are reproducible from an
+upstream sha they are not, and `--verify` no longer reports its own gitignored install
+artifacts as drift (it was permanently red, which trains people to ignore it).
+
+**Deferred / known-red.** (1) `test_mega11_legs::test_ecad_engineer_role_has_domain_tools_and_delegate`
+still fails, as it did at HEAD: it demands `ecad_add_power`/`board_from_schematic`/
+`ecad_run_erc`/`ecad_run_drc`/`ecad_simulate`/`ecad_antenna_design`, which together with the
+schematic build loop need ~22 tools. `board_from_schematic` is reachable only through
+`spec_writer`'s `family: ecad`, and ERC/DRC/power/sim/antenna are held by NO role at all —
+the PCB half of the ECAD pipeline is unreachable. That needs a deliberate role split
+(schematic vs PCB), not more seats. (2) `test_prohibited_auth::test_no_consumer_oauth_token_reuse`
+remains a deliberate open product decision. (3) The shared budget helper's home, above.

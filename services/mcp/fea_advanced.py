@@ -92,6 +92,50 @@ def _positive_int(value, name: str) -> int:
 # CalculiX solver discovery: PATH only. No bundled binary, no linked library.
 _CCX_NAMES = ("ccx", "ccx_2.20", "ccx_2.21", "ccx_2.19", "calculix")
 
+# ---------------------------------------------------------------------------
+# Layered-timeout contract: the INNER solver clock must be strictly SHORTER
+# than the OUTER harness clock — never equal to it.
+# ---------------------------------------------------------------------------
+# Two clocks bound every harness ``run_fea_*`` call, and they do NOT start
+# together:
+#   OUTER  services/agent/agent_turn.py::_dispatch_tool runs the tool on a
+#          ThreadPoolExecutor and gives up at ``fut.result(timeout=timeout_f)``,
+#          where ``timeout_f`` is the tool's services/agent/tool_guidance/sim.py
+#          ``timeout_s``. That clock starts the instant the tool is DISPATCHED.
+#   INNER  ``run_ccx``'s ``subprocess.run(timeout=...)`` clock starts strictly
+#          LATER — after face-query resolution, ``_autosave_all_open()``, STEP
+#          export, the second-order tet mesh build, and tempdir/deck setup have
+#          already spent outer-clock seconds.
+# Both were 300 s, i.e. EQUAL, so the outer deadline ALWAYS fired first: the
+# actionable ``{"ok": False, "error": "ccx timed out after Ns"}`` branch in
+# ``run_ccx`` below (which tells the model to try a coarser mesh) was
+# UNREACHABLE through the harness, and a solve that needed slightly over five
+# minutes could only ever surface the outer "abandoned in the background, may
+# still be running" payload — which names no remedy at all.
+#
+# Arithmetic, naming both clocks:
+#   CCX_SETUP_MARGIN_S    = 120 s — the pre-solve share of the OUTER clock that
+#       the INNER clock cannot see. Clean-room deck generation itself is ~1 ms
+#       (measured 2026-08-27 on the 7600X3D: build_thermal_bar_inp 0.9 ms,
+#       build_buckling_column_inp 1.4 ms, build_contact_block_inp 0.9 ms), so the
+#       margin is sized for what actually dominates — the mesh build and the
+#       autosave/STEP round trip. A cold bench mesh is 0.982 s and a 54k-DOF
+#       modal assembly 2.0 s (benchmarks/simsuite/DAG_PLAN.md P4/P2, same box),
+#       so 120 s covers pre-solve work two orders of magnitude heavier than the
+#       bench parts.
+#   HARNESS_CCX_TIMEOUT_S = 420 - 120 = 300 s — the solver budget the harness
+#       hands ``run_ccx``. It lands on exactly the 300 s that ``run_ccx``'s own
+#       public default already gave, so this change cannot shorten a solve that
+#       used to fit; it only stops the outer clock from stealing the diagnostic.
+#   HARNESS_FEA_TIMEOUT_S = 420 s — the OUTER ceiling every ``run_fea_*`` entry
+#       in services/agent/tool_guidance/sim.py carries.
+# The invariant to preserve is HARNESS_CCX_TIMEOUT_S < HARNESS_FEA_TIMEOUT_S;
+# services/mcp/test_fea_ccx_advanced.py pins the guidance table and these
+# constants in lockstep so the two clocks cannot drift back to equality.
+HARNESS_FEA_TIMEOUT_S: float = 420.0
+CCX_SETUP_MARGIN_S: float = 120.0
+HARNESS_CCX_TIMEOUT_S: float = HARNESS_FEA_TIMEOUT_S - CCX_SETUP_MARGIN_S
+
 
 def ccx_path() -> Optional[str]:
     """Return the CalculiX executable on PATH, or None (subprocess-only discovery)."""
@@ -136,6 +180,13 @@ def run_ccx(inp_text: str, job: str = "job", timeout: float = 300.0,
     the paths/result leave scope, so existing post-return parsers can finish and
     the directory is then removed. Errors are cleaned before return.
     ``keep_dir=True`` is the only mode that retains and reports the workdir.
+
+    ``timeout`` stays 300 s for DIRECT callers (benchmarks, scripts/vv_benchmark.py,
+    the GUI worker seam in services/sim/multiphysics_rpc.py) — none of them run
+    under an outer harness deadline. Agent-harness call sites must instead pass
+    ``timeout=HARNESS_CCX_TIMEOUT_S`` so the inner clock stays strictly inside
+    ``HARNESS_FEA_TIMEOUT_S`` and the "timed out" branch below is reachable; see
+    the layered-timeout block above.
     """
     if not isinstance(inp_text, str) or not inp_text.strip():
         raise ValueError("inp_text must be a non-empty CalculiX deck")

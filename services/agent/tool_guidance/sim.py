@@ -3,6 +3,20 @@ from __future__ import annotations
 
 from typing import Any
 
+# OUTER harness ceiling for the whole run_fea_* family: the deadline
+# agent_turn._dispatch_tool enforces with ThreadPoolExecutor.result(timeout=...)
+# from the instant the tool is dispatched. It MUST stay strictly larger than the
+# INNER CalculiX subprocess clock (services.mcp.fea_advanced.HARNESS_CCX_TIMEOUT_S,
+# 300 s) by fea_advanced.CCX_SETUP_MARGIN_S (120 s): 420 = 300 + 120. The margin
+# is the pre-solve work — face queries, autosave, STEP export, tet mesh build,
+# deck generation — which burns outer-clock seconds BEFORE the inner clock even
+# starts. Both were 300 s, i.e. equal, so the outer deadline always fired first
+# and buried CalculiX's own actionable "ccx timed out ... try a coarser mesh"
+# result under the harness's "abandoned in the background, may still be running"
+# payload, which names no remedy. services/mcp/test_fea_ccx_advanced.py pins
+# this value against the fea_advanced constants so they cannot drift apart.
+_FEA_TIMEOUT_S = 420
+
 ENTRIES: dict[str, dict[str, Any]] = {
     "sim_cancel": {
         "prompt_note": (
@@ -207,6 +221,7 @@ ENTRIES: dict[str, dict[str, Any]] = {
             "mesh-sensitive. Its relative indicator is not a stress-error bound; "
             "background=True returns job_id for get_job."
         ),
+        "timeout_s": _FEA_TIMEOUT_S,
     },
     "run_fea_buckling": {
         "prompt_note": (
@@ -216,7 +231,7 @@ ENTRIES: dict[str, dict[str, Any]] = {
             "The tool returns ok:false, skipped:true when ccx is unavailable; compare "
             "euler_reference_pcr_n."
         ),
-        "timeout_s": 300,
+        "timeout_s": _FEA_TIMEOUT_S,
     },
     "run_fea_contact": {
         "prompt_note": (
@@ -225,7 +240,7 @@ ENTRIES: dict[str, dict[str, Any]] = {
             "base_reaction_n≈applied_load_n; ok:false or skipped:true means no verified "
             "contact result. Use run_fea_static for real-part stresses."
         ),
-        "timeout_s": 300,
+        "timeout_s": _FEA_TIMEOUT_S,
     },
     "run_fea_fatigue": {
         "prompt_note": (
@@ -234,7 +249,7 @@ ENTRIES: dict[str, dict[str, Any]] = {
             "endurance_mpa. State load_type/load_ratio, surface, reliability and theory; "
             "regime='infinite' means >1e6-cycle runout, not immortal. Refine the static mesh."
         ),
-        "timeout_s": 300,
+        "timeout_s": _FEA_TIMEOUT_S,
     },
     "run_fea_frequency_response": {
         "prompt_note": (
@@ -244,7 +259,7 @@ ENTRIES: dict[str, dict[str, Any]] = {
             "Hz. PSD breakpoints are g²/Hz; no PSD means random.ok=false and no "
             "vibration_spec means verdict=null. Output is acceleration only, not stress/deflection."
         ),
-        "timeout_s": 300,
+        "timeout_s": _FEA_TIMEOUT_S,
     },
     "run_fea_modal": {
         "prompt_note": (
@@ -253,7 +268,7 @@ ENTRIES: dict[str, dict[str, Any]] = {
             "mounted. Compare the first elastic mode to a justified beam/order anchor and across "
             "mesh_fineness presets; properties come from material=, never set_material."
         ),
-        "timeout_s": 300,
+        "timeout_s": _FEA_TIMEOUT_S,
     },
     "run_fea_static": {
         "prompt_note": (
@@ -264,7 +279,7 @@ ENTRIES: dict[str, dict[str, Any]] = {
             "appearance only. Repeat at a finer mesh and compare governing stress/deflection "
             "(<10% change) before PASS."
         ),
-        "timeout_s": 300,
+        "timeout_s": _FEA_TIMEOUT_S,
     },
     "run_fea_thermal": {
         "prompt_note": (
@@ -276,7 +291,7 @@ ENTRIES: dict[str, dict[str, Any]] = {
             "h_w_m2k/t_amb_c; flux-only heat-up is valid and needs conductivity, "
             "density_g_cm3, and cp_j_kgk/specific_heat_j_kgk in J/(kg·K)."
         ),
-        "timeout_s": 300,
+        "timeout_s": _FEA_TIMEOUT_S,
     },
     "simulate_motion": {
         "prompt_note": (

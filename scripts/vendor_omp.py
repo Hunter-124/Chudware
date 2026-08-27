@@ -12,7 +12,13 @@ Design:
     bridge/             <- OUR bun bridge package (PRESERVED; never touched here)
     package.json        <- generated minimal workspace root (workspaces: packages/* + bridge)
     bunfig.toml, tsconfig*.json, patches/   <- copied from upstream (needed by bun install)
-    OMP_VENDOR.lock     <- {source, sha, packages, files:{path:sha256}} for reproducibility
+    OMP_VENDOR.lock     <- {source, sha, dirty, dirty_files, packages, files:{path:sha256}}
+
+`sha` alone only pins the vendored bytes when the source checkout was CLEAN. Vendoring from
+a dirty checkout (the normal case for our fork, which carries local patches that exist in no
+commit) records `dirty: true` plus `dirty_files` — the paths git reported as locally modified
+or untracked — so a reader knows the tree is "upstream `sha` PLUS these local patches" and not
+a plain upstream snapshot. `files` remains the authoritative content hash either way.
 
 Usage:
   # initial pin from the local inspection checkout (already at the pinned SHA), offline:
@@ -93,6 +99,68 @@ def _iter_files(root: Path):
     for p in sorted(root.rglob("*")):
         if p.is_file():
             yield p
+
+
+def _local_modifications(root: Path) -> list[str]:
+    """Paths in the source checkout that differ from its own HEAD, as git reports them.
+
+    A non-empty result means the vendored bytes are NOT reproducible from the recorded
+    `sha` alone: they are upstream plus uncommitted local work (our fork's patches live
+    exactly there). Untracked files count — they get copied into vendor/ just the same.
+    Returns [] when the source is not a git checkout (nothing to compare against) or for
+    the git-URL path, whose temp clone is clean by construction.
+    """
+    res = subprocess.run(
+        ["git", "-C", str(root), "status", "--porcelain=v1", "-z"],
+        capture_output=True,
+        text=True,
+    )
+    if res.returncode != 0:
+        return []
+    # `-z` records are NUL-separated "XY path" (note: NOT stripped — an unstaged-only change
+    # reports a LEADING SPACE in the code, so the path always starts at index 3).
+    # Rename/copy records append the source path as a second record; it changed locally too.
+    fields = [f for f in res.stdout.split("\0") if f]
+    mods: list[str] = []
+    i = 0
+    while i < len(fields):
+        entry = fields[i]
+        i += 1
+        if len(entry) < 4:
+            continue
+        if entry[0] in ("R", "C") and i < len(fields):
+            mods.append(fields[i])
+            i += 1
+        mods.append(entry[3:])
+    return sorted(set(mods))
+
+
+def _git_ignored(rels: list[str]) -> set[str]:
+    """Subset of vendor-relative paths that git itself ignores.
+
+    `--verify` must not cry drift over per-machine artifacts the repo deliberately does not
+    track (the bridge install fingerprint + its lock today, whatever lands beside them
+    tomorrow). Asking git instead of hardcoding names keeps that true as .gitignore grows.
+    `check-ignore` consults the index, so a TRACKED vendored file is never reported ignored
+    and genuine drift still surfaces. Degrades to the old strict behavior (empty set) when
+    git is missing or errors.
+    """
+    if not rels or not shutil.which("git"):
+        return set()
+    args = [(VENDOR_DIR / rel).relative_to(REPO_ROOT).as_posix() for rel in rels]
+    res = subprocess.run(
+        ["git", "-C", str(REPO_ROOT), "check-ignore", "-z", "--stdin"],
+        input="\0".join(args),
+        capture_output=True,
+        text=True,
+    )
+    # 0 = some ignored, 1 = none ignored; anything else (128) means git could not answer.
+    if res.returncode not in (0, 1):
+        return set()
+    ignored = {line for line in res.stdout.split("\0") if line}
+    prefix = VENDOR_DIR.relative_to(REPO_ROOT).as_posix() + "/"
+    return {p[len(prefix) :] for p in ignored if p.startswith(prefix)}
+
 
 
 def _resolve_source(from_arg: str, sha: str | None) -> tuple[Path, str, str, list[Path]]:
@@ -252,17 +320,26 @@ def vendor(from_arg: str, sha: str | None, packages: list[str], run_install: boo
             if _excluded_from_lock(rel):
                 continue
             manifest[rel] = _sha256_file(p)
+        dirty_files = _local_modifications(source_root)
         lock = {
             "source": source_id,
             "sha": resolved_sha,
+            # Honesty about provenance: `dirty` true => the bytes below are upstream `sha`
+            # PLUS the uncommitted local work listed in `dirty_files`, reproducible only
+            # from that same working tree. `files` is what actually pins the content.
+            "dirty": bool(dirty_files),
+            "dirty_files": dirty_files,
             "packages": packages,
             "file_count": len(manifest),
             "files": manifest,
         }
         LOCK_PATH.write_text(json.dumps(lock, indent=2) + "\n", encoding="utf-8")
 
-        print(f"vendored {len(packages)} packages from {source_id} @ {resolved_sha[:12]}")
+        suffix = " (DIRTY source)" if dirty_files else ""
+        print(f"vendored {len(packages)} packages from {source_id} @ {resolved_sha[:12]}{suffix}")
         print(f"  {len(manifest)} files -> {VENDOR_DIR.relative_to(REPO_ROOT)}")
+        for rel in dirty_files:
+            print(f"  local patch (not in {resolved_sha[:12]}): {rel}")
 
         if run_install:
             bun = shutil.which("bun")
@@ -288,19 +365,26 @@ def verify() -> int:
             drift.append(f"missing: {rel}")
         elif _sha256_file(p) != want:
             drift.append(f"changed: {rel}")
-    # New tracked files (excluding bridge/ + install output) that are not in the lock.
+    # Files present under vendor/omp but absent from the lock. Paths git ignores are not
+    # drift: they are per-machine artifacts the repo intentionally does not track.
+    extra = []
     for p in _iter_files(VENDOR_DIR):
         rel = p.relative_to(VENDOR_DIR).as_posix()
-        if _excluded_from_lock(rel):
+        if _excluded_from_lock(rel) or rel in lock["files"]:
             continue
-        if rel not in lock["files"]:
-            drift.append(f"untracked: {rel}")
+        extra.append(rel)
+    ignored = _git_ignored(extra)
+    drift += [f"untracked: {rel}" for rel in extra if rel not in ignored]
     if drift:
         print(f"VENDOR DRIFT ({len(drift)}):", file=sys.stderr)
         for d in drift[:50]:
             print("  " + d, file=sys.stderr)
         return 1
-    print(f"vendor OK: {lock['file_count']} files match {lock['sha'][:12]}")
+    # `dirty`/`dirty_files` are absent from pre-existing locks; treat that as clean.
+    note = ""
+    if lock.get("dirty"):
+        note = f" + {len(lock.get('dirty_files', []))} local patch(es)"
+    print(f"vendor OK: {lock['file_count']} files match {lock['sha'][:12]}{note}")
     return 0
 
 

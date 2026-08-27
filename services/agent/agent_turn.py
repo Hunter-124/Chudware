@@ -2263,10 +2263,22 @@ def _run_turn_impl(request: str, provider: Any, *, name: str = "dag_node",
     _forced_tool_stop: str | None = None
     # Pre-dispatch refusals (scaffold / guardrail / review gate) no longer spend
     # the execution budget, so they need their own bound or a wedged guard could
-    # loop the turn indefinitely. Generous: a legitimate run corrects a guard in
-    # one or two attempts, and this only has to stop a genuine spin.
+    # loop the turn indefinitely. The counter is CONSECUTIVE — it is reset by
+    # every accepted call below — because that is the only thing that
+    # distinguishes a wedged guard from a run that corrects a guard and moves
+    # on. It used to be a lifetime total that was never reset, so twelve
+    # single-shot refusals scattered across a 256-call main-chat run — each one
+    # corrected on the very next attempt, never a spin — still forced the turn
+    # to stop, while the stop text claimed they had been "consecutive
+    # ... without a single accepted call".
     _refusals_made = 0
     _refusal_ceiling = 12
+    # NB: a refusal is NOT refunded out of `tool_calls_made`. That counter is
+    # simultaneously the runaway bound and the reported `tool_calls`, so
+    # refunding it makes refusals free AND unbounded — measured at 41 provider
+    # round-trips against a nominal 20-call ceiling (257 at the defaults), with
+    # the honest ceiling stop replaced by `no_code`. Refusals are bounded by the
+    # tighter consecutive ceiling above instead.
     _tasklist_pref = "off"
     if auto_enable_packs:
         try:
@@ -3924,6 +3936,16 @@ def _run_turn_impl(request: str, provider: Any, *, name: str = "dag_node",
             )
             last_reason = _RETRY
             break
+        if _refusals_made >= _refusal_ceiling:
+            # Checked HERE, at the top, rather than at either increment site, so
+            # the refusal that trips the ceiling still finishes its iteration:
+            # its tool_call_event fires and its text reaches the model and the
+            # GUI. Breaking at the increment discarded exactly the message the
+            # stop text below promises ("the last refusal text names what it
+            # demanded").
+            _forced_tool_stop = "refusal_ceiling"
+            last_reason = _RETRY
+            break
         if (
             subagent_id
             and tool_calls_made >= _soft_tool_call_budget
@@ -3995,11 +4017,8 @@ def _run_turn_impl(request: str, provider: Any, *, name: str = "dag_node",
             # burn four of the model's calls and then the turn died at the
             # ceiling having built nothing. Refusals get their own bounded
             # counter instead, so a wedged guard still cannot spin forever.
+            # The bound itself is enforced at the top of the loop.
             _refusals_made += 1
-            if _refusals_made >= _refusal_ceiling:
-                _forced_tool_stop = "refusal_ceiling"
-                last_reason = _RETRY
-                break
         # AI-VC v2: checkpoint BEFORE mutating tool call (kind=tool).
         # call.turn = msg_idx when provided, else internal tool-call ordinal.
         if _blocked is None:
@@ -4137,6 +4156,25 @@ def _run_turn_impl(request: str, provider: Any, *, name: str = "dag_node",
         # call and is no evidence of a defect.
         _refused_by_policy = not _executed and _outcome_kind in (
             OUTCOME_POLICY_REFUSAL, OUTCOME_GUARD_BLOCK)
+        if _blocked is None and _refused_by_policy:
+            # A DISPATCH-time refusal — per-turn call cap, loop guard, Settings
+            # kill-switch — is charged to the CONSECUTIVE refusal ceiling, so a
+            # wedged spin stops after 12 straight refusals. At HEAD only
+            # PRE-dispatch blocks were counted, so nothing bounded a loop-guard
+            # spin short of the runaway ceiling: 128 refused dispatches for a
+            # subagent, 256 for main chat, every one a paid provider round-trip.
+            #
+            # It is deliberately NOT refunded out of `tool_calls_made`. That
+            # counter is also the runaway bound and the reported `tool_calls`,
+            # and refunding it made refusals free AND unbounded — measured at
+            # 41 provider round-trips against a nominal 20-call ceiling (257 at
+            # the defaults), with the honest ceiling stop replaced by `no_code`.
+            # A tighter refusal bound is the fix; a free retry is not.
+            _refusals_made += 1
+        elif _blocked is None:
+            # An accepted call proves the harness is not wedged, which is what
+            # makes the ceiling above a CONSECUTIVE bound.
+            _refusals_made = 0
         if not ok and pending_directives and _executed:
             # Stop-on-first-failure. The queued calls were planned against a
             # state that no longer holds — a sketch that did not take means the
@@ -10845,6 +10883,12 @@ _ARTIFACT_PRODUCT_GATES: tuple[
 _DELIVERED_PRODUCT_TOOLS: frozenset[str] = frozenset({
     "add_features", "edit_feature", "export_part",
     "board_from_schematic", "ecad_run_drc", "ecad_make_board", "fw_build",
+    # A schematic-only ECAD lane never reaches the board stage: ecad_engineer's
+    # own card mandates "a confirmed netlist, BOM, and vector plot artifact" as
+    # its finish condition, and its 14/14-tool grant holds no board tool at all.
+    # Omitting these made a legitimate ECAD finish read as zero delivered
+    # product to every gate that consults this set.
+    "ecad_netlist", "ecad_bom", "ecad_plot",
     "cam_generate", "cam_post", "make_drawing", "export_drawing",
     "run_fea_static", "run_fea_adaptive", "run_fea_modal", "run_cfd_flow",
 })
@@ -10882,17 +10926,36 @@ def _empty_product_handoff_block(
     Live: ollama ecad_engineer emitted fabricated schematic/board doc_ids and
     completed with tool_calls=0 — force-chain never fired. Same class for
     firmware/geometry producers with domain mutators on the allowlist.
+    A remedy is only worth emitting if the blocked lane can actually WALK it,
+    so every branch gates on the tool GRANT. The ECAD and firmware branches
+    used to OR in an actor-name substring (``"ecad" in actor_l``), which told
+    ecad_engineer to finish through ``board_from_schematic`` → ``ecad_run_drc``
+    — two tools its card does not hold and, sitting at the hard 14-tool cap,
+    cannot be given. A model that followed that roadmap literally earned
+    nothing but allowlist denials. The grant-gated geometry branch below was
+    always the correct template.
     """
+    # `actor` is retained for the call signature but deliberately NOT consulted:
+    # gating a remedy on the role's NAME is what produced the unsatisfiable
+    # ECAD roadmap above. Only the grant decides.
+    del actor
     allow_set = allow or set()
-    actor_l = str(actor or "").lower()
-    if _ECAD_PRODUCT_TOOLS & allow_set or "ecad" in actor_l:
+    if _ECAD_PRODUCT_TOOLS & allow_set:
         return (
             "ECAD product role cannot declare done with zero tool calls. "
             "ENTRY PATH required: ecad_new_schematic → place → ecad_wire/"
             "ecad_add_power → board_from_schematic → ecad_run_drc. Call a tool "
             "NOW (start with ecad_new_schematic)."
         )
-    if "fw_build" in allow_set or "firmware" in actor_l:
+    if "ecad_new_schematic" in allow_set:
+        # Schematic-only lane: finish at the artifacts it really owns.
+        return (
+            "ECAD product role cannot declare done with zero tool calls. "
+            "ENTRY PATH required: ecad_new_schematic → ecad_place_symbol → "
+            "ecad_wire → ecad_netlist → ecad_bom → ecad_plot. Call a tool NOW "
+            "(start with ecad_new_schematic)."
+        )
+    if "fw_build" in allow_set:
         return (
             "Firmware product role cannot declare done with zero tool calls. "
             "Call fw_new_project then fw_build NOW."

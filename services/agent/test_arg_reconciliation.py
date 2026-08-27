@@ -71,6 +71,42 @@ def _server_call(tool: str, arguments: dict) -> dict:
     return json.loads(text)
 
 
+@pytest.fixture(autouse=True)
+def _discard_documents_minted_by_this_file():
+    """Discard every engine document a test in this file mints.
+
+    These tests drive the REAL MCP ToolManager, so several of them mint live
+    documents (`export_part` resolves an active part, `ecad_new_schematic`
+    mints a schematic). Left open they poisoned every LATER test in the
+    process: `cad_common.save_touched_docs()` runs at each linear-turn
+    terminal, found the orphan, and failed the whole turn with
+    `persistence_failed` / `no_project_save_dir` — a turn that had created no
+    document of its own. It cost three unrelated tests
+    (`test_linear_turn_fs_dispatch::test_linear_turn_executes_real_fs_tools`
+    and both linear-turn handoff tests in `test_harness_integrity`) and was
+    invisible whenever either file ran alone, which is exactly why it survived.
+    Same defect class as the documented `test_cheatsheet_examples` leak.
+
+    Restoring `_TOUCHED_DOCS` is as load-bearing as closing the doc: it is a
+    module-level list and `save_touched_docs` reads it directly, so an entry
+    left behind fails a later turn even after the document itself is gone.
+    """
+    from services.mcp import cad_common as _cc
+    before = list(getattr(_cc, "_TOUCHED_DOCS", []))
+    try:
+        yield
+    finally:
+        touched = getattr(_cc, "_TOUCHED_DOCS", None)
+        if touched is None:
+            return
+        for doc_id in [d for d in touched if d not in before]:
+            try:
+                _server_call("close_part", {"doc_id": doc_id, "discard": True})
+            except Exception:  # noqa: BLE001 — cleanup never fails a test
+                pass
+        touched[:] = before
+
+
 # --------------------------------------------------------------------- anti-drift: one table
 
 def test_no_second_synonym_table_exists_anywhere_in_services():

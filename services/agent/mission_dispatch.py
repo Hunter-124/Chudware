@@ -195,6 +195,15 @@ def _actionable_delegate_failure(node: dict) -> dict:
             ". The delegated work was not completed; retry only if the cause is "
             "transient, otherwise continue with the concrete tools available here."
         )
+    if node.get("provider_retry"):
+        # The clip is ~999 chars and starts at `error`, so the retry has to be
+        # named HERE or the parent model reads a one-shot terminal failure and
+        # cannot tell a dead route from a provider that was already given its
+        # second chance.
+        error += (
+            " A transient-fault retry was already spent on this spawn "
+            "(see provider_retry)."
+        )
 
     # Keep these keys first: both agent_events._error_text and the persisted
     # tool-result clip must expose the cause before the spawn record / brief.
@@ -203,6 +212,60 @@ def _actionable_delegate_failure(node: dict) -> dict:
         if key not in {"ok", "reason", "error"}
     }
     return {"ok": False, "reason": reason, "error": error, **rest}
+
+
+#: Total ``run_turn`` attempts a `delegate` child gets when the FIRST failure was
+#: classified transient by ``agent_turn.classify_provider_error``: 1 initial +
+#: 1 retry == ``services.dag.context_pack.DEFAULT_RETRY_BUDGET`` (1). The two
+#: dispatch lanes must recover the same single 429 / 5xx / truncated reply /
+#: mid-stream disconnect and no more; a larger budget here is exactly the
+#: cross-path drift this subsystem keeps regressing into.
+SUBAGENT_RETRYABLE_ATTEMPTS = 2
+
+
+def retryable_child_failure(result: Any) -> bool:
+    """True when a child turn failed on a fault the provider classifier calls transient.
+
+    The single predicate BOTH dispatch lanes gate on — ``_run_subagent_turn``
+    (the ``delegate`` tool) and ``services.dag.node_runner._map_verdict``
+    (compiled-DAG nodes). ``agent_turn.run_turn`` stamps ``result['retryable']``
+    from ``classify_provider_error``; a 404 dead route and a real auth failure
+    are stamped ``False`` there, and that is load-bearing — an absent or False
+    flag must still fail fast, because re-running those burns a spawn to fail
+    identically. Both the legacy ``failed`` and the current ``provider_error``
+    stop_reason shapes carry the flag.
+    """
+    if bool(getattr(result, "success", False)):
+        return False
+    if str(getattr(result, "stop_reason", "") or "") not in ("failed", "provider_error"):
+        return False
+    payload = getattr(result, "result", None)
+    return isinstance(payload, dict) and payload.get("retryable") is True
+
+
+def configured_subagent_tool_budget(base: int | None) -> int | None:
+    """Apply the Settings → AI ``agent.subagent_tool_call_budget`` slider.
+
+    Called LAST on both dispatch lanes, so a user's explicit threshold is never
+    silently raised by token-grant derivation or a producer floor. The value
+    stays a SOFT convergence threshold — the hard runaway ceiling belongs to
+    ``agent_turn.SUBAGENT_HARD_TOOL_CALL_CEILING`` alone.
+
+    Zero (the default) means "derive automatically" and returns *base* untouched.
+    This lives in one function because the slider used to be read only by
+    ``_run_subagent_turn``: ``services/dag/node_runner`` never read the key at
+    all, so moving the slider governed the ``delegate`` lane and had ZERO effect
+    on every compiled-DAG (``mission_start``) role, while the GUI presented it
+    as one uniform setting.
+    """
+    try:
+        from services.agent.config import (  # noqa: PLC0415
+            get_subagent_tool_call_budget,
+        )
+        configured = get_subagent_tool_call_budget()
+    except Exception:  # noqa: BLE001 — automatic derivation is the fallback
+        return base
+    return configured if configured > 0 else base
 
 
 class MissionDispatch:
@@ -1195,15 +1258,10 @@ class MissionDispatch:
             # Settings override is intentionally last: max_calls is now a SOFT
             # convergence warning, so a user's explicit threshold must not be
             # silently raised by producer floors or token-grant derivation.
-            try:
-                from services.agent.config import (  # noqa: PLC0415
-                    get_subagent_tool_call_budget,
-                )
-                _configured_calls = get_subagent_tool_call_budget()
-                if _configured_calls > 0:
-                    max_calls = _configured_calls
-            except Exception:  # noqa: BLE001 — automatic derivation is the fallback
-                pass
+            # Shared helper — node_runner (the compiled-DAG lane) applies the
+            # SAME one, because this slider being read here and nowhere else is
+            # what made it govern only half the dispatch surface.
+            max_calls = configured_subagent_tool_budget(max_calls)
             # WS2/WS4 + mega-5: always attempt per-spawn model assignment with
             # depth-aware min_rank. resolve_for_node returns None when ai_roles
             # is unset (legacy path) — fall through to resolve_role_model so
@@ -1475,6 +1533,10 @@ class MissionDispatch:
                         allowed, resolver=_at.resolver_for(self), tier=self.tier)
                 except Exception:  # noqa: BLE001 — schema render is best-effort
                     pass
+            # Set only when a transient provider fault cost this spawn its one
+            # retry. Reported on EVERY exit path, success included — a parent
+            # that cannot see the first attempt failed cannot judge the run.
+            provider_retry: dict | None = None
             # Mark the node this turn IS, so a nested delegate() from inside it
             # attaches to this node instead of the tree root. Saved/restored so
             # sibling and deeper spawns nest correctly.
@@ -1495,23 +1557,70 @@ class MissionDispatch:
                     org_state=getattr(self, "org_state", None),
                 ))
                 try:
-                    result = _at.run_turn(
-                        brief, provider, name=role, actor=role,
-                        credit_actor=self.chudware_actor,
-                        system_prompt=system_prompt,
-                        allowed_tools=allowed,
-                        tools_text=tools_text,
-                        mission_dispatch=self,
-                        ledger=_turn_ledger, max_tool_calls=max_calls,
-                        # The delegate path missed the 2026-07-28 parent-lane fix:
-                        # falling through to agent_turn's 2048 default truncated
-                        # feature_modeler twice before its first tool call.
-                        max_tokens=LINEAR_ROLE_MAX_OUTPUT_TOKENS,
-                        max_total_tokens=granted or None,
-                        on_event=self.on_event, run_id=self.run_id,
-                        node_id=node_id, subagent_id=node_id,
-                        capability=_cap, tier=self.tier, phase=_phase,
-                        task_class=self.task_class)
+                    def _attempt() -> Any:
+                        return _at.run_turn(
+                            brief, provider, name=role, actor=role,
+                            credit_actor=self.chudware_actor,
+                            system_prompt=system_prompt,
+                            allowed_tools=allowed,
+                            tools_text=tools_text,
+                            mission_dispatch=self,
+                            ledger=_turn_ledger, max_tool_calls=max_calls,
+                            # The delegate path missed the 2026-07-28 parent-lane fix:
+                            # falling through to agent_turn's 2048 default truncated
+                            # feature_modeler twice before its first tool call.
+                            max_tokens=LINEAR_ROLE_MAX_OUTPUT_TOKENS,
+                            max_total_tokens=granted or None,
+                            on_event=self.on_event, run_id=self.run_id,
+                            node_id=node_id, subagent_id=node_id,
+                            capability=_cap, tier=self.tier, phase=_phase,
+                            task_class=self.task_class)
+
+                    result = _attempt()
+                    # Transient provider faults get the SAME bounded one-shot
+                    # recovery the compiled-DAG lane has always had
+                    # (node_runner._map_verdict upgrades ESCALATE → RETRY on this
+                    # flag, within DEFAULT_RETRY_BUDGET=1). Without it a 429, a
+                    # 5xx, a truncated reply or a mid-stream disconnect ended a
+                    # `delegate` as a FLAT TERMINAL FAILURE while the
+                    # architecturally identical graph node silently recovered.
+                    for _attempt_i in range(1, SUBAGENT_RETRYABLE_ATTEMPTS):
+                        if not retryable_child_failure(result):
+                            break
+                        provider_retry = {
+                            "attempts": _attempt_i + 1,
+                            "first_stop_reason": str(result.stop_reason or ""),
+                            "first_error": str(
+                                (result.result or {}).get("error")
+                                or (result.result or {}).get("error_detail")
+                                or ""
+                            )[:400],
+                        }
+                        logger.warning(
+                            "Retrying delegation node %s (role %s) once: first "
+                            "attempt failed with a retryable provider fault "
+                            "stop_reason=%s",
+                            node_id, role, provider_retry["first_stop_reason"],
+                        )
+                        if _turn_ledger is not None:
+                            try:
+                                _turn_ledger.append("agent", "note", {
+                                    "event": "subagent_retryable_retry",
+                                    "subagent_id": node_id,
+                                    "role": role,
+                                    **provider_retry,
+                                })
+                            except Exception:  # noqa: BLE001 — audit is best-effort
+                                pass
+                        try:
+                            _sreg.append_transcript(
+                                node_id, "system",
+                                "Transient provider fault "
+                                f"({provider_retry['first_stop_reason']}); "
+                                "retrying this sub-agent turn once.")
+                        except Exception:  # noqa: BLE001
+                            pass
+                        result = _attempt()
                 finally:
                     _org_tools.bind_mission_context(None)
             finally:
@@ -1578,6 +1687,11 @@ class MissionDispatch:
             role_model = None
             if isinstance(node, dict):
                 role_model = node.get("role_model")
+            _trailer: dict = {}
+            if role_model is not None:
+                _trailer["role_model"] = role_model
+            if provider_retry is not None:
+                _trailer["provider_retry"] = provider_retry
             if result.stop_reason == "terminated_by_user":
                 out = {"ok": False, "subagent_status": "terminated",
                         "stop_reason": result.stop_reason,
@@ -1586,8 +1700,7 @@ class MissionDispatch:
                         "handoff": handoff,
                         "provider_usage_recorded": bool(
                             res_dict.get("provider_usage_recorded"))}
-                if role_model is not None:
-                    out["role_model"] = role_model
+                out.update(_trailer)
                 return out
             if result.success:
                 out = {"ok": True, "subagent_status": "done",
@@ -1597,8 +1710,7 @@ class MissionDispatch:
                         "tokens_used_estimate": tokens_used_estimate,
                         "provider_usage_recorded": bool(
                             res_dict.get("provider_usage_recorded"))}
-                if role_model is not None:
-                    out["role_model"] = role_model
+                out.update(_trailer)
                 return out
             child_status = (
                 result.stop_reason
@@ -1612,8 +1724,7 @@ class MissionDispatch:
                     "tokens_used_estimate": tokens_used_estimate,
                     "provider_usage_recorded": bool(
                         res_dict.get("provider_usage_recorded"))}
-            if role_model is not None:
-                out["role_model"] = role_model
+            out.update(_trailer)
             return out
         except Exception as exc:  # noqa: BLE001 — execution error is data
             failed_tokens = 0

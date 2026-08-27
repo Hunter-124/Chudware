@@ -337,3 +337,50 @@ def test_datasheet_fetch_403_without_profile_degrades_unchanged(monkeypatch, fak
     out = research.datasheet_fetch("https://example-vendor.com/widget.pdf")
     assert out["ok"] is False
     assert out["reason"] == "network"
+
+
+def test_datasheet_fetch_propagates_a_browser_cooldown_refusal(monkeypatch, fake_pdf_extractor):
+    """A ``cooldown_active`` refusal must reach the tool boundary INTACT.
+
+    Flattening it into ``network`` (which is what ``raise_for_status`` did a line
+    later) told the model "could not fetch: HTTP 403" — so it retried, and every
+    retry hit the same persisted per-site cooldown. The site's backoff can be up to
+    900 s while this tool's harness budget is 180 s, so the only useful answer is the
+    refusal itself plus ``retry_after_s``.
+    """
+    import httpx
+    from services.browser import session as browser_session
+
+    monkeypatch.setattr(httpx, "get", lambda *a, **k: _FakeHttpResponse(403))
+
+    def _cooling(url, site, dest, **kwargs):
+        return {"ok": False, "reason": "cooldown_active", "retry_after_s": 873.4,
+                "policy_refusal": True, "executed": False,
+                "hint": f"{site} is rate-limiting us; waiting inside this call is "
+                        f"impossible — proceed with other sources."}
+
+    monkeypatch.setattr(browser_session, "browser_download", _cooling)
+
+    out = research.datasheet_fetch("https://example-vendor.com/widget.pdf")
+    assert out["ok"] is False
+    assert out["reason"] == "cooldown_active"      # NOT flattened to "network"
+    assert out["retry_after_s"] == 873.4
+    assert "other sources" in out["hint"]
+
+
+def test_datasheet_fetch_other_browser_failures_still_degrade_as_network(
+        monkeypatch, fake_pdf_extractor):
+    """Only the actionable reasons are propagated; an ordinary browser failure keeps
+    the pre-existing ``network`` degradation so nothing else changes shape."""
+    import httpx
+    from services.browser import session as browser_session
+
+    monkeypatch.setattr(httpx, "get", lambda *a, **k: _FakeHttpResponse(403))
+    monkeypatch.setattr(browser_session, "browser_download",
+                        lambda url, site, dest, **k: {"ok": False,
+                                                      "reason": "browser_download_failed",
+                                                      "hint": "no body"})
+
+    out = research.datasheet_fetch("https://example-vendor.com/widget.pdf")
+    assert out["ok"] is False
+    assert out["reason"] == "network"

@@ -143,15 +143,27 @@ class TestRouteRequestGeneralAgent:
 
     def test_main_chat_runs_past_old_thirty_call_limit(self):
         """The old linear budget killed a composed 31st dispatch. Main chat now
-        runs until the model itself emits a finish envelope."""
+        runs until the model itself emits a finish envelope.
+
+        The 31 dispatches carry DISTINCT paths on purpose. They used to be one
+        identical ``fs_list {"path": "."}`` repeated 31 times, which is a wedged
+        model, not a long one: the loop guard refused 29 of the 31 and the test
+        only passed because nothing bounded a refusal streak. Real work that
+        legitimately runs long makes DIFFERENT calls, so that is what this pins —
+        the identical-call spin is pinned separately by
+        test_harness_integrity.py::test_identical_call_spin_stops_at_the_refusal_ceiling.
+        """
         from services.agent import agent_turn
 
-        tool = '```json\n{"tool": "fs_list", "args": {"path": "."}}\n```'
+        tools = [
+            '```json\n{"tool": "fs_list", "args": {"path": "./d%d"}}\n```' % i
+            for i in range(31)
+        ]
         done = (
             '```json\n{"done": true, "handoff": {"status": "done", '
             '"summary": "all work finished", "outputs": {}}}\n```'
         )
-        provider = _ScriptedProvider(([tool] * 31) + [done])
+        provider = _ScriptedProvider(tools + [done])
         turn = agent_turn.run_turn(
             _CLEANUP_REQUEST,
             provider,

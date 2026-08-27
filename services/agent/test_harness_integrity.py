@@ -135,22 +135,40 @@ def test_advisor_child_inherits_advisory_dispute(monkeypatch):
 # 2. Budgets must fit the role's mandated chain
 # ---------------------------------------------------------------------------
 
-@pytest.mark.parametrize("role,allowed", [
-    ("cam_programmer", ["ledger_get", "cam_generate", "cam_post"]),
-    ("sim_engineer", ["ledger_get", "run_fea_static"]),
-    ("drawing_detailer", ["ledger_get", "make_drawing", "export_drawing"]),
-    ("model3d", ["ledger_get", "new_part", "add_features"]),
-    ("ecad_engineer", ["ledger_get", "ecad_new_schematic", "ecad_run_drc"]),
+@pytest.mark.parametrize("role,allowed,expected", [
+    ("cam_programmer", ["ledger_get", "cam_generate", "cam_post"], 22),
+    ("sim_engineer", ["ledger_get", "run_fea_static"], 20),
+    ("drawing_detailer", ["ledger_get", "make_drawing", "export_drawing"], 24),
+    ("model3d", ["ledger_get", "new_part", "add_features"], 24),
+    ("ecad_engineer", ["ledger_get", "ecad_new_schematic", "ecad_run_drc"], 35),
+    # The role that decides PASS/FAIL for a whole mission. It holds none of
+    # PRODUCER_TOOLS and its real phase ("deliver") misses BUILD_PHASES, so all
+    # three producer signals missed it and it was left on the derived [4,12] —
+    # below the AC1-AC9 grading chain its own card mandates.
+    ("reviewer", ["ledger_get", "design_review"], 24),
 ])
-def test_producer_roles_clear_the_old_twelve_call_ceiling(role, allowed):
+def test_producer_roles_clear_the_old_twelve_call_ceiling(role, allowed,
+                                                          expected):
     """max(4, min(12, granted // 2000)) capped every producer at 12 calls no
-    matter how large the grant, while cam/drawing/ecad chains need 15-16."""
+    matter how large the grant, while these chains need 20-35.
+
+    Asserts each role's OWN audited floor, not a blanket >= 16: a generic
+    threshold passed happily while cam_programmer and drawing_detailer were
+    still being nagged to converge partway through a mandated per-setup /
+    per-coverage-row loop.
+    """
     derived = max(4, min(12, 12000 // 2000))  # the old computation → 6
-    assert tb.floor_for(role, allowed, None, base=derived) >= 16
+    assert tb.floor_for(role, allowed, None, base=derived) == expected
 
 
 def test_non_producer_roles_keep_their_derived_budget():
-    assert tb.floor_for("reviewer", ["ledger_get", "design_review"],
+    """A genuinely non-producing role is not boosted.
+
+    Uses design_thinker: reviewer used to stand here, but it is a verification
+    producer with an audited floor (see the parametrized test above), so pinning
+    it as un-boosted encoded the under-budgeting defect as intended behaviour.
+    """
+    assert tb.floor_for("design_thinker", ["ledger_get", "advise"],
                         None, base=6) == 6
 
 
@@ -707,6 +725,46 @@ def test_a_capped_tool_refusal_names_a_remedy_and_is_flagged_policy():
     assert "max_calls_per_turn" not in refused["error"]
     assert at._classify_tool_outcome(refused, ok=False) == (
         at.OUTCOME_POLICY_REFUSAL, False)
+
+
+def test_identical_call_spin_stops_at_the_refusal_ceiling():
+    """A model repeating ONE identical call is wedged, and must be cut off by the
+    consecutive refusal ceiling — not left to run to the runaway ceiling.
+
+    At HEAD only PRE-dispatch guard blocks were charged to ``_refusals_made``, so
+    a loop-guard spin had no bound short of the runaway ceiling: 128 refused
+    dispatches for a subagent, 256 for main chat, every one a paid provider
+    round-trip. Measured live before the fix: 41 provider round-trips against a
+    nominal 20-call ceiling, and 257 at the defaults.
+
+    Note the contrast with
+    test_sourcing_subagent.py::test_hard_ceiling_stays_above_derived_threshold,
+    which drives DISTINCT arguments — a model still doing real work but never
+    finishing — and must therefore still reach ``subagent_hard_ceiling``.
+    """
+    from services.agent.test_directive_batching import (
+        _ScriptedProvider,
+        _fence,
+    )
+
+    spin = _fence("fs_list", path=".")
+    provider = _ScriptedProvider([spin] * 300)
+    res = at.run_turn(
+        "list it",
+        provider,
+        allowed_tools=["fs_list"],
+        tool_dispatch=lambda t, a: {"ok": True},
+        subagent_id=None,
+    )
+
+    assert (res.result or {}).get("forced_stop") == "refusal_ceiling", res.result
+    # Bounded by the 12-refusal ceiling, nowhere near the 256 main-chat backstop.
+    recorded = (res.result or {}).get("calls") or []
+    assert len(recorded) < 20, len(recorded)
+    refused = [c for c in recorded
+               if (c.get("result") or {}).get("status") == "loop_guard_refused"]
+    assert refused, recorded
+    assert all(c["executed"] is False for c in refused)
 
 
 def test_ai_vc_capture_fault_is_visible_and_tool_still_executes(monkeypatch):

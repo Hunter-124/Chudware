@@ -1,6 +1,12 @@
 {
   "source": "/home/hunter/Repositories/CAD/scratch/omp-src",
   "sha": "d1239fd3e57a48a35b483663d16ab078db75a87b",
+  "dirty": true,
+  "dirty_files": [
+    "packages/ai/src/auth-storage.ts",
+    "packages/coding-agent/src/session/agent-storage.ts",
+    "packages/coding-agent/test/agent-storage-sqlite-compat.test.ts"
+  ],
   "packages": [
     "ai",
     "catalog",
@@ -34,7 +40,7 @@
     "packages/ai/src/auth-gateway/server.ts": "cd24b17f8febc1ae9a11816d8b80a0fd6c1703b6e28b085dce7af75f1b5e1457",
     "packages/ai/src/auth-gateway/types.ts": "7214e98be6fe4fa49092af844961e9a08fb591ed785d6fc780f2d37ed90bd954",
     "packages/ai/src/auth-retry.ts": "f39b0aceeb809410a836c93537cd86e6bbb09a9f60c1f2258f826614144534fc",
-    "packages/ai/src/auth-storage.ts": "72aa2f3fd38c7c8095bad28b3fcffcdec4a3a9057fc9de29d4181c4fc50627a7",
+    "packages/ai/src/auth-storage.ts": "dcee9b93d327e44a7467846b770efc3cb3403174b3a401db33abd22147987020",
     "packages/ai/src/dialect/anthropic.md": "9cf0c980ead16cb083e0141d5eff624e0f38429bfd8a086f2994516093dbfd22",
     "packages/ai/src/dialect/anthropic.ts": "fc773687e0d728062b8b810c6dbb1365b0a2ec30c097e490de432e7027d264b0",
     "packages/ai/src/dialect/catalog.ts": "c1d3b9398f7a46d5caf4e95ddcf6d71e020a6a1c5459f29fc8bd46a671e37761",

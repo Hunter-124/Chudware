@@ -71,25 +71,50 @@ BUILD_PHASES: frozenset[str] = frozenset({
 
 # Role-specific SOFT convergence thresholds, counted from the mandatory calls in
 # each role card (optional retries excluded):
-#   ecad_engineer   ledger + schematic + find×7 + place×7 + wire×6 + power×2
-#                   + ERC + ERC note + simulate + board + DRC + DRC note
-#                   + artifact notes×2 = 32; antenna design + analysis + note = 35
+#   ecad_engineer   describe_board + status, then symbols/place/edit per part,
+#                   wire/label per net, status + render + lint, and the card's
+#                   own finish artifacts netlist + bom + plot              = 35
+#                   (this card holds no board/DRC tool — it is capped at the
+#                   hard 14-tool limit and finishes at the schematic stage)
 #   model3d         delegate + render + preflight + add + post-check for each of
 #                   four features, then new_part + material + battery + overlap = 24
 #   feature_modeler mandatory build/verification chain                         = 18
 #   spec_writer     research plus nine ledger/spec entries                     = 18
+#   reviewer        one grading call per acceptance criterion (AC1-AC9, and AC4
+#                   alone is ecad_run_drc + ecad_run_erc = 2) plus the card's
+#                   "standard battery regardless of criteria" — verify_battery +
+#                   design_review + fit_report + measure_part spot-checks  = 24
+#                   Under-budgeting this role is uniquely costly: reviewer_exec
+#                   treats `not_checked` as a first-class verdict, so a reviewer
+#                   nagged to converge early emits honest-looking NOT_CHECKED
+#                   rows for criteria it never reached instead of failing loudly.
+#   cam_programmer  job setup + feeds/speeds per material-tool-op, then the JOB
+#                   LOOP's mandated cam_generate + cam_simulate for EVERY setup,
+#                   cam_post + cam_audit + ledger notes                     = 22
+#   drawing_detailer  plan + make_drawing + views + review, then the COVERAGE
+#                   CONTRACT's one add_dimension/add_hole_callout PER critical
+#                   row, set_titleblock, review + audit, export             = 24
 # These are warnings to converge, not dispatch caps. The runaway hard ceiling
 # remains owned by agent_turn.
 ROLE_MIN_CALLS: dict[str, int] = {
     "ecad_engineer": 35,
     "model3d": 24,
+    "reviewer": 24,
+    "drawing_detailer": 24,
+    "cam_programmer": 22,
     "feature_modeler": 18,
     "spec_writer": 18,
 }
 
 # Fallback for other producer roles whose shorter cards still exceed the bare
 # default. Keep this separate from the audited per-role thresholds above.
-PRODUCER_MIN_CALLS = 16
+# 20, not 16: sim_engineer (multi-criterion studies), assembly_fit_engineer
+# (>4-part assemblies), sketcher/sketch2d (one driving dimension per functional
+# dimension), layout_engineer (per-clearance measure_between) and re_modeler
+# (per-region rebuild) all scale their mandated chain with part complexity and
+# sat just over 16. This is a soft nudge, so the extra headroom costs nothing on
+# a simple part and stops a complex one being told to converge mid-chain.
+PRODUCER_MIN_CALLS = 20
 
 # agent_turn.run_turn's bare default when max_tool_calls is None.
 DEFAULT_MAX_CALLS = 16

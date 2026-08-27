@@ -2279,7 +2279,7 @@
    "prompt_note": "Only length/angle/count families (to mm/deg/count) — stress units like ksi are out of scope. A unit outside its family is rejected as bad_unit, never silently coerced."
   },
   "research_web_search": {
-   "max_calls_per_turn": 3,
+   "max_calls_per_turn": 24,
    "prompt_note": "FIND step: returns ranked sources to then READ with research_fetch_page. Without TAVILY_API_KEY the DuckDuckGo fallback is labeled confidence:limited.",
    "timeout_s": 120
   },
@@ -2360,35 +2360,36 @@
    "timeout_s": 300
   },
   "run_fea_adaptive": {
-   "prompt_note": "Adaptive remesh-and-resolve for a decision-driving peak stress; use run_fea_static for an initial screen, then this when the peak is mesh-sensitive. Its relative indicator is not a stress-error bound; background=True returns job_id for get_job."
+   "prompt_note": "Adaptive remesh-and-resolve for a decision-driving peak stress; use run_fea_static for an initial screen, then this when the peak is mesh-sensitive. Its relative indicator is not a stress-error bound; background=True returns job_id for get_job.",
+   "timeout_s": 420
   },
   "run_fea_buckling": {
    "prompt_note": "CalculiX fixed-free BOX PROXY, not real CAD stress/buckling. Pass exactly one fixture face and one inward axial force in N on one load face; pressure, shear, and tension are rejected. lambda*applied_load is Pcr; lambda<1 fails. The tool returns ok:false, skipped:true when ccx is unavailable; compare euler_reference_pcr_n.",
-   "timeout_s": 300
+   "timeout_s": 420
   },
   "run_fea_contact": {
    "prompt_note": "CalculiX TWO-BLOCK PROXY proving contact load transfer, not the document's actual contact pair. pressure_mpa must be finite and >0 MPa. Require base_reaction_n≈applied_load_n; ok:false or skipped:true means no verified contact result. Use run_fea_static for real-part stresses.",
-   "timeout_s": 300
+   "timeout_s": 420
   },
   "run_fea_fatigue": {
    "prompt_note": "Runs real static FEA then S-N postprocessing. Needs the same mounted faces and non-zero N/MPa loads as run_fea_static plus material ultimate_mpa and endurance_mpa. State load_type/load_ratio, surface, reliability and theory; regime='infinite' means >1e6-cycle runout, not immortal. Refine the static mesh.",
-   "timeout_s": 300
+   "timeout_s": 420
   },
   "run_fea_frequency_response": {
    "prompt_note": "Base-excited modal superposition. fixtures must represent the mount; excitation_dir is a unit direction, base_accel_g is g, damping zeta is assumed, and material density drives Hz. Response peaks should align with returned modal Hz. PSD breakpoints are g²/Hz; no PSD means random.ok=false and no vibration_spec means verdict=null. Output is acceleration only, not stress/deflection.",
-   "timeout_s": 300
+   "timeout_s": 420
   },
   "run_fea_modal": {
    "prompt_note": "Material density drives Hz. fixtures=[] is a legitimate free-free solve: expect six near-zero rigid-body modes before elastic modes; otherwise fix it exactly as mounted. Compare the first elastic mode to a justified beam/order anchor and across mesh_fineness presets; properties come from material=, never set_material.",
-   "timeout_s": 300
+   "timeout_s": 420
   },
   "run_fea_static": {
    "prompt_note": "Real-part linear static FEA. Confirm face queries first. fixtures must react a non-zero load: force vectors/magnitude are N, pressure is MPa; zero loads are refused and there is no gravity/self-weight term. An explicit material dict needs E_mpa, nu, and yield_mpa; named registry materials resolve them. set_material is appearance only. Repeat at a finer mesh and compare governing stress/deflection (<10% change) before PASS.",
-   "timeout_s": 300
+   "timeout_s": 420
   },
   "run_fea_thermal": {
    "prompt_note": "Steady default is a CalculiX 1-D BOX PROXY: exactly one hot_faces and one cold_faces entry need {face,temperature °C}; temperatures must differ and loads are rejected. Compare mid_plane_T to the linear Fourier anchor; ccx absent returns SKIP. Steady needs conductivity_w_mk/k_w_mk in W/(m·K). transient={t_end_s,dt_s,...} uses the real tet mesh with flux_w_m2 or h_w_m2k/t_amb_c; flux-only heat-up is valid and needs conductivity, density_g_cm3, and cp_j_kgk/specific_heat_j_kgk in J/(kg·K).",
-   "timeout_s": 300
+   "timeout_s": 420
   },
   "run_shell": {
    "prompt_note": "Use for builds/tests/scripts; prefer fs_read/fs_grep/fs_glob/fs_write for plain file work. Stateless per call — pass cwd each time; pipe noisy output through head; check exit_code/timed_out."

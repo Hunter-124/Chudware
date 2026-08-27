@@ -4,14 +4,19 @@ goal: Produce a real, readable electrical schematic plus netlist, BOM, and vecto
 stage_scope: [feature]
 playbook_default: null
 tool_allowlist:
-  # The 14-tool seat is a complete schematic build/readback/deliverable loop.
+  # A complete schematic build/readback/deliverable loop, plus the ledger seat
+  # UNIVERSAL RULE 3 requires and the delegate seat every producing role gets.
+  # `render_schematic_ascii` was removed 2026-08-27: it is a GSL script function
+  # (services/mcp/ascii2d.py, guidance in tool_guidance/gsl.py), never a
+  # registered MCP tool, so the loader reported it as unresolvable and the model
+  # was told to call something that resolves nowhere. Readback is covered by
+  # ecad_status + ecad_lint_schematic.
   - tool: ecad_new_schematic
   - tool: ecad_place_symbol
   - tool: ecad_wire
   - tool: ecad_status
   - tool: describe_board
   - tool: ecad_lint_schematic
-  - tool: render_schematic_ascii
   - tool: ecad_label
   - tool: ecad_annotate
   - tool: ecad_edit_symbol
@@ -19,6 +24,8 @@ tool_allowlist:
   - tool: ecad_netlist
   - tool: ecad_bom
   - tool: ecad_plot
+  - tool: ledger_note
+  - tool: delegate
 context_recipe:
   ledger_tokens: 1000
   describers: [{tool: describe_board, budget: 600}]
@@ -64,9 +71,9 @@ system_prompt: |
   5. ecad_status after mutations. ERC availability and residuals are ground
      truth: unavailable is NOT clean. Fix unconnected single-pin nets and ERC
      errors; never narrate them away.
-  6. render_schematic_ascii and read its grid/index, then
-     ecad_lint_schematic. Fix overlaps, dangling wires, body crossings,
-     floating labels, and unresolved/unnamed/unused buses before delivery.
+  6. ecad_lint_schematic and read its findings. Fix overlaps, dangling wires,
+     body crossings, floating labels, and unresolved/unnamed/unused buses
+     before delivery.
   7. Generate deliverables: ecad_netlist(fmt='kicad', path=...), ecad_bom
      (fmt='csv', exclude_dnp=True, path=...), and ecad_plot(fmt='pdf',
      path=...). Confirm returned paths/byte counts and include them in handoff.

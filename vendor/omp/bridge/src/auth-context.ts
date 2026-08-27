@@ -4,6 +4,10 @@
  * singleton store per bridge process, at a CAD-owned SQLite path (never OMP's
  * `~/.omp/agent/agent.db`).
  *
+ * That db is CAD's analogue of `agent.db`, so it gets the same corruption recovery OMP's
+ * `AgentStorage` has: a malformed file is quarantined aside and recreated rather than failing
+ * every auth RPC forever. See `quarantineCorruptAuthDb` / `getAuthContext`.
+ *
  * Implements: auth_list_providers, auth_state, auth_validate_key, auth_set_key,
  * auth_remove_key, auth_logout. OAuth login/poll/manual/cancel live in
  * oauth-flow.ts (they need the same AuthStorage instance, hence `getAuthContext`
@@ -14,6 +18,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import {
 	AuthStorage,
+	isSqliteCorruptError,
 	PROVIDER_REGISTRY,
 	resolveUsedFraction,
 	SqliteAuthCredentialStore,
@@ -87,15 +92,82 @@ interface AuthContext {
 
 let authContextPromise: Promise<AuthContext> | undefined;
 
-/** Lazily open the CAD-owned SQLite auth store and reload `AuthStorage` from it. Called once; every RPC handler awaits the same promise. */
+/**
+ * Move a corrupt auth db aside so the next open recreates a usable one, and report which
+ * files were moved. The `-wal`/`-shm` companions go with it: a stale WAL left beside a fresh
+ * db is replayed into it and re-corrupts it immediately, which is why OMP's own `agent.db`
+ * recovery moves all three. (SQLite often deletes its own companions while failing the open,
+ * in which case there is simply nothing left to move.) The timestamped suffix means
+ * successive failures never collide and nothing is ever deleted — the bad file stays on disk
+ * for postmortem. Returns [] when the MAIN db file could not be moved; the caller must then
+ * propagate its ORIGINAL open error rather than a confusing rename error.
+ */
+function quarantineCorruptAuthDb(dbPath: string): string[] {
+	const stamp = `corrupt-${Date.now()}`;
+	const moved: string[] = [];
+	let movedMain = false;
+	for (const file of [dbPath, `${dbPath}-wal`, `${dbPath}-shm`]) {
+		try {
+			if (!fs.existsSync(file)) continue;
+			const dest = `${file}.${stamp}`;
+			fs.renameSync(file, dest);
+			moved.push(dest);
+			if (file === dbPath) movedMain = true;
+		} catch (err) {
+			process.stderr.write(
+				`[omp-bridge] WARN could not quarantine corrupt auth db file ${file}: ${err instanceof Error ? err.message : String(err)}\n`,
+			);
+			break;
+		}
+	}
+	return movedMain ? moved : [];
+}
+
+/**
+ * `SqliteAuthCredentialStore.open` already closes its own handle when it throws, but a
+ * failure in `reload()` (corruption in a data page rather than the schema) leaves the db —
+ * and its live `-wal`/`-shm` — held open. Close it before letting the error out: a caller
+ * that quarantines the file must not be renaming a db this process still has open (that is
+ * outright forbidden on Windows).
+ */
+async function openAuthContext(dbPath: string): Promise<AuthContext> {
+	const store = await SqliteAuthCredentialStore.open(dbPath);
+	try {
+		const authStorage = new AuthStorage(store, { sourceLabel: `local ${dbPath}` });
+		await authStorage.reload();
+		return { authStorage, store };
+	} catch (err) {
+		store.close();
+		throw err;
+	}
+}
+
+/**
+ * Lazily open the CAD-owned SQLite auth store and reload `AuthStorage` from it. Called once;
+ * every RPC handler awaits the same promise.
+ *
+ * `SQLITE_CORRUPT`/`SQLITE_NOTADB` cannot be retried in place — a malformed db would
+ * otherwise fail every auth RPC for the whole life of the install. So the corrupt file is
+ * quarantined aside EXACTLY ONCE and the open retried against a fresh db (bounded retry, no
+ * loop); a second failure, or any non-corruption error, propagates unchanged. Stored
+ * credentials are the casualty, hence the stderr warning telling the user to sign in again.
+ */
 export function getAuthContext(): Promise<AuthContext> {
 	if (!authContextPromise) {
 		authContextPromise = (async () => {
 			const dbPath = resolveAuthDbPath();
-			const store = await SqliteAuthCredentialStore.open(dbPath);
-			const authStorage = new AuthStorage(store, { sourceLabel: `local ${dbPath}` });
-			await authStorage.reload();
-			return { authStorage, store };
+			try {
+				return await openAuthContext(dbPath);
+			} catch (err) {
+				const moved = isSqliteCorruptError(err) ? quarantineCorruptAuthDb(dbPath) : [];
+				if (moved.length === 0) throw err;
+				process.stderr.write(
+					`[omp-bridge] WARN auth db ${dbPath} is corrupt (${err instanceof Error ? err.message : String(err)}); ` +
+						`quarantined ${moved.join(", ")} and recreated the db empty — ` +
+						"stored provider credentials are lost, please sign in again\n",
+				);
+				return await openAuthContext(dbPath);
+			}
 		})();
 	}
 	return authContextPromise;

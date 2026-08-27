@@ -89,7 +89,18 @@ _FAMILY_SEED_TOOLS: dict[str, tuple[str, ...]] = {
         "fw_verify_board", "fw_sensor_scenario", "fw_power_profile",
     ),
 }
-MAX_TOOLS_PER_ROLE = 14
+# Per-card ceiling on CONCRETE tools after family expansion. Two jobs: bound the
+# rendered tools block, and keep the model's choice space small enough to pick
+# well. Raised 14 -> 16 on 2026-08-27: 13 of the 32 cards sat EXACTLY on 14, so
+# the cap had stopped bounding cards and started designing them — ecad_engineer
+# was ordered by its own UNIVERSAL RULE 3 to `ledger_note` every artifact while
+# holding no ledger_note seat, an unsatisfiable mandate created purely by the
+# ceiling. Verified before raising: zero cards were losing tools to truncation
+# at 14, so no existing grant changes; the two extra seats cost a few hundred
+# tokens of schema on the cards that use them. `validate_role` reports an
+# over-cap allowlist as an ERROR and test_roles.py asserts zero errors, so this
+# stays a gate rather than the silent truncation it once was.
+MAX_TOOLS_PER_ROLE = 16
 
 # Allowlist tools that do not yet resolve to a registered MCP tool — they land with
 # sibling W tasks (workspace status T-W23+). Reported by the loader as feature-flagged

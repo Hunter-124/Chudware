@@ -60,6 +60,13 @@ class _FakeTree:
     def fail(self, node_id, reason=""):
         self.transitions.append(("fail", node_id, reason))
 
+    def accrue(self, node_id, tokens_used=0):
+        # Real DelegationTree exposes this; mission_dispatch calls it
+        # best-effort. Without it every failing-delegate test in this file
+        # logged an AttributeError traceback through logger.exception, burying
+        # the actual assertion in captured-log noise.
+        self.transitions.append(("accrue", node_id, tokens_used))
+
 
 class _CapturingProvider:
     """MockProvider-style scripted provider that records every system prompt."""
@@ -189,12 +196,28 @@ class TestSourcingSubagent:
         assert "not in allowed list" in calls[0]["error"]
         assert calls[1]["tool"] == "parts_taxonomy" and calls[1]["ok"]
 
+    # A never-finishing model that keeps doing REAL work: 40 distinct node_ids,
+    # every one accepted by the stubbed taxonomy_browse. These used to be one
+    # identical `parts_taxonomy {}` repeated forever, which is a wedged model
+    # rather than a busy one — the loop guard refused all but the first two, and
+    # the hard ceiling was only reachable because a refusal streak was unbounded.
+    # The spin case is pinned separately in test_harness_integrity.py. The list
+    # must stay LONGER than any ceiling monkeypatched below, because
+    # _CapturingProvider drains and then repeats its LAST reply forever, which
+    # would re-arm the loop guard.
+    @staticmethod
+    def _never_finishing_replies(count: int = 40) -> list[str]:
+        return [
+            _fence({"tool": "parts_taxonomy",
+                    "args": {"node_id": f"bearings_motion.n{i}"}})
+            for i in range(count)
+        ]
+
     def test_budget_derives_soft_threshold_not_hard_stop(self, env, monkeypatch):
         # 16000 granted → soft warning at 8; the separate ceiling remains 20.
         from services.agent import agent_turn
         monkeypatch.setattr(agent_turn, "SUBAGENT_HARD_TOOL_CALL_CEILING", 20)
-        looping = _fence({"tool": "parts_taxonomy", "args": {}})
-        provider = _CapturingProvider([looping])  # never finishes
+        provider = _CapturingProvider(self._never_finishing_replies())
         tree = _FakeTree(tokens_granted=16000)
         md = _dispatch(env, provider, tree)
         node = md.delegate(role="sourcing_specialist", brief="loop",
@@ -205,10 +228,10 @@ class TestSourcingSubagent:
     def test_hard_ceiling_stays_above_derived_threshold(self, env, monkeypatch):
         from services.agent import agent_turn
         monkeypatch.setattr(agent_turn, "SUBAGENT_HARD_TOOL_CALL_CEILING", 20)
-        looping = _fence({"tool": "parts_taxonomy", "args": {}})
         for granted, soft in ((2000, 4), (100000, 12), (0, 10)):
             tree = _FakeTree(tokens_granted=granted)
-            md = _dispatch(env, _CapturingProvider([looping]), tree)
+            md = _dispatch(
+                env, _CapturingProvider(self._never_finishing_replies()), tree)
             node = md.delegate(role="sourcing_specialist", brief="loop",
                                budget_tokens=granted)
             assert node["result"]["tool_calls"] == max(20, soft * 2), granted

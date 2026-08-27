@@ -79,6 +79,11 @@ struct ModelSpend {
     std::string provider, model;
     double usd = 0;
     long long tin = 0, tout = 0;
+    // `priced` = the OMP catalog carries a real price for this model, so `usd` is a computed
+    // figure. `localFree` = a local runtime, where $0 is the true price. Neither one true means
+    // "no price data": `usd` stays 0 and must never be shown as money.
+    bool priced = false;
+    bool localFree = false;
 };
 
 struct SessionSpend {
@@ -86,6 +91,7 @@ struct SessionSpend {
     double usd = 0;
     long long tin = 0, tout = 0;
     int turns = 0;
+    int unpricedTurns = 0;   // turns whose model has no catalog price -> usd is a floor
     bool active = false;
 };
 
@@ -102,14 +108,20 @@ void drawMetricsView(AppState& st) {
     const AdaptiveSurface& surf =
         adaptivePanel(panelId("ai_ws_view_glass"), paneRect, GlassGroup::Global);
 
-    // ---- aggregate every priced (completed, model-stamped) assistant turn across every
-    // session — active (st.chat) + parked (Conversation::msgs) — pricing with the cached
-    // OMP bridge catalog. Same $/Mtok formula the per-session cost strip's agent_cost_summary
-    // RPC uses (a pure linear calculator), computed client-side so Metrics needs zero extra
-    // round-trips and works even when the bridge RPC path is unavailable.
+    // ---- aggregate every completed, model-stamped assistant turn across every session —
+    // active (st.chat) + parked (Conversation::msgs) — pricing with the cached OMP bridge
+    // catalog. Same $/Mtok formula the per-session cost strip's agent_cost_summary RPC uses (a
+    // pure linear calculator), computed client-side so Metrics needs zero extra round-trips and
+    // works even when the bridge RPC path is unavailable.
+    // Pricing provenance is carried through with the money, exactly like the cost strip: a model
+    // the catalog has no price for adds tokens but NO dollars, so every total it touches is a
+    // floor and is labelled one. `hasCost` cannot make that distinction (`cost` is an object
+    // even when all four fields are zero, and live-only rows report cost:null with priced:false)
+    // — `priced` can.
     double totalUsd = 0;
     long long totalIn = 0, totalOut = 0;
     int totalTurns = 0;
+    int unpricedTurns = 0;
     std::vector<SessionSpend> sessions;
     std::unordered_map<std::string, ModelSpend> byModel;
 
@@ -131,15 +143,19 @@ void drawMetricsView(AppState& st) {
             const BridgeModelMeta* meta = bridgeModelMeta("", m.model);
             const std::string prov = (meta && !meta->provider.empty()) ? meta->provider
                                                                        : std::string("unknown");
+            const bool localFree = bridgeProviderIsLocalFree(prov);
+            const bool priced = (meta && meta->priced);
             double usd = 0;
-            if (meta && meta->hasCost)
+            if (priced)
                 usd = (tin / 1.0e6) * meta->costIn + (tout / 1.0e6) * meta->costOut;
 
             ss.usd += usd; ss.tin += tin; ss.tout += tout; ss.turns++;
             totalUsd += usd; totalIn += tin; totalOut += tout; totalTurns++;
+            if (!priced && !localFree) { ss.unpricedTurns++; unpricedTurns++; }
 
             ModelSpend& ms = byModel[prov + "/" + m.model];
             ms.provider = prov; ms.model = m.model;
+            ms.priced = priced; ms.localFree = localFree;
             ms.usd += usd; ms.tin += tin; ms.tout += tout;
         }
         if (ss.turns > 0) sessions.push_back(std::move(ss));
@@ -148,9 +164,10 @@ void drawMetricsView(AppState& st) {
     if (totalTurns == 0) {
         float avail = ImGui::GetContentRegionAvail().y;
         ImGui::Dummy(ImVec2(0, avail * 0.35f));
-        const char* msg = "No priced turns yet";
-        const char* sub = "Token spend shows up here once an assistant turn completes with a "
-                          "priced model. Start a run to see it.";
+        const char* msg = "No token usage yet";
+        const char* sub = "Tokens and spend show up here once an assistant turn completes. "
+                          "Models the OMP catalog has no price for still report their tokens — "
+                          "they just can't report dollars.";
         float mw = ImGui::CalcTextSize(msg).x;
         ImGui::SetCursorPosX(ImGui::GetCursorPosX() +
                              (ImGui::GetContentRegionAvail().x - mw) * 0.5f);
@@ -176,29 +193,47 @@ void drawMetricsView(AppState& st) {
     std::vector<ModelSpend> models;
     models.reserve(byModel.size());
     for (auto& kv : byModel) models.push_back(std::move(kv.second));
+    // Priced rows first by money, then unpriced rows by traffic — an unpriced row's usd is 0 by
+    // construction, so money alone would order them arbitrarily.
     std::sort(models.begin(), models.end(),
-             [](const ModelSpend& a, const ModelSpend& b) { return a.usd > b.usd; });
+             [](const ModelSpend& a, const ModelSpend& b) {
+        if (a.usd != b.usd) return a.usd > b.usd;
+        return (a.tin + a.tout) > (b.tin + b.tout);
+    });
     std::sort(sessions.begin(), sessions.end(),
              [](const SessionSpend& a, const SessionSpend& b) { return a.usd > b.usd; });
 
+    // How much of the money is actually knowable: a model is "priced" here when the catalog
+    // prices it, or when it is a local runtime where $0 is the real price.
+    int knownPriceModels = 0;
+    for (const auto& mrow : models)
+        if (mrow.priced || mrow.localFree) ++knownPriceModels;
+    const bool incomplete = (unpricedTurns > 0);
+
     // ---- headline totals ----
     secHeader("Overall");
-    if (ImGui::BeginTable("##ai_metrics_totals", 4,
+    if (ImGui::BeginTable("##ai_metrics_totals", 5,
                           ImGuiTableFlags_SizingStretchSame | ImGuiTableFlags_NoPadOuterX)) {
-        auto stat = [&](const char* label, const std::string& value) {
+        auto stat = [&](const char* label, const std::string& value, bool warn) {
             ImGui::TableNextColumn();
             ImGui::PushStyleColor(ImGuiCol_Text,
                 ImVec4(palette.textDim[0], palette.textDim[1], palette.textDim[2], 1.0f));
             ImGui::TextUnformatted(label);
             ImGui::PopStyleColor();
             ImGui::PushFont(st.fonts.medium);
+            if (warn) ImGui::PushStyleColor(ImGuiCol_Text, Palette::toU32(palette.statusWarn));
             ImGui::TextUnformatted(value.c_str());
+            if (warn) ImGui::PopStyleColor();
             ImGui::PopFont();
         };
-        stat("Total spend", fmtUsd(totalUsd));
-        stat("Total tokens", fmtTok(totalIn + totalOut));
-        stat("Sessions tracked", std::to_string((int)sessions.size()));
-        stat("Priced turns", std::to_string(totalTurns));
+        // ">= " in ASCII: U+2265 is outside the font atlas (ui_theme.cpp uiGlyphRanges()).
+        stat("Total spend", (incomplete ? ">= " : "") + fmtUsd(totalUsd), incomplete);
+        stat("Total tokens", fmtTok(totalIn + totalOut), false);
+        stat("Sessions tracked", std::to_string((int)sessions.size()), false);
+        stat("Turns counted", std::to_string(totalTurns), false);
+        stat("Models priced",
+             std::to_string(knownPriceModels) + " of " + std::to_string((int)models.size()),
+             incomplete);
         ImGui::EndTable();
     }
     ImGui::Dummy(ImVec2(0, ui::metrics::cpMenuSectionGap()));
@@ -225,9 +260,20 @@ void drawMetricsView(AppState& st) {
             ImGui::TableNextColumn();
             ImGui::Text("%s / %s", fmtTok(mrow.tin).c_str(), fmtTok(mrow.tout).c_str());
             ImGui::TableNextColumn();
-            // Share of total spend as the shared circular gauge, not a mini-bar.
-            fractionBadge(surf, totalUsd > 0.0 ? (float)(mrow.usd / totalUsd) : 0.0f,
-                          fmtUsd(mrow.usd).c_str());
+            if (mrow.priced) {
+                // Share of total spend as the shared circular gauge, not a mini-bar.
+                fractionBadge(surf, totalUsd > 0.0 ? (float)(mrow.usd / totalUsd) : 0.0f,
+                              fmtUsd(mrow.usd).c_str());
+            } else {
+                // No ring and no dollars: this row's 0 is an absence of price data, not a spend
+                // of zero, and a gauge would render that absence as a measured share.
+                ImGui::PushStyleColor(ImGuiCol_Text, mrow.localFree
+                    ? ImVec4(palette.textDim[0], palette.textDim[1], palette.textDim[2], 1.0f)
+                    : ImVec4(palette.statusWarn[0], palette.statusWarn[1],
+                             palette.statusWarn[2], 1.0f));
+                ImGui::TextUnformatted(mrow.localFree ? "free (local)" : "no price data");
+                ImGui::PopStyleColor();
+            }
         }
         ImGui::EndTable();
     }
@@ -259,8 +305,22 @@ void drawMetricsView(AppState& st) {
             ImGui::TableNextColumn();
             ImGui::Text("%s / %s", fmtTok(srow.tin).c_str(), fmtTok(srow.tout).c_str());
             ImGui::TableNextColumn();
-            fractionBadge(surf, totalUsd > 0.0 ? (float)(srow.usd / totalUsd) : 0.0f,
-                          fmtUsd(srow.usd).c_str());
+            if (srow.unpricedTurns > 0) {
+                // Mixed session: the dollars are real for its priced turns and missing for the
+                // rest, so the cell is a floor and the ring's share would overstate certainty.
+                ImGui::PushStyleColor(ImGuiCol_Text,
+                    ImVec4(palette.statusWarn[0], palette.statusWarn[1],
+                           palette.statusWarn[2], 1.0f));
+                ImGui::Text(">= %s", fmtUsd(srow.usd).c_str());
+                ImGui::PopStyleColor();
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("%d of %d turns in this session ran on a model with no "
+                                      "catalog price \xe2\x80\x94 their tokens are counted, "
+                                      "their cost is unknown.", srow.unpricedTurns, srow.turns);
+            } else {
+                fractionBadge(surf, totalUsd > 0.0 ? (float)(srow.usd / totalUsd) : 0.0f,
+                              fmtUsd(srow.usd).c_str());
+            }
         }
         ImGui::EndTable();
     }
@@ -268,9 +328,17 @@ void drawMetricsView(AppState& st) {
 
     ImGui::PushStyleColor(ImGuiCol_Text,
         ImVec4(palette.textDisabled[0], palette.textDisabled[1], palette.textDisabled[2], 1.0f));
-    ImGui::TextWrapped("OMP-observed spend (catalog pricing \xc3\x97 tokens from completed "
-                       "turns) \xe2\x80\x94 not a bill. Sessions or models with no priced turns "
-                       "aren't listed; unpriced/local models show token counts with no $ figure.");
+    if (incomplete)
+        ImGui::TextWrapped(
+            "Spend is catalog pricing \xc3\x97 tokens from completed turns \xe2\x80\x94 not a "
+            "bill, and here not even a complete estimate: %d of %d models that spent tokens have "
+            "no price in the OMP catalog, so every \">=\" figure above is a floor. Those models' "
+            "tokens are counted; their dollars are unknown, not zero.",
+            (int)models.size() - knownPriceModels, (int)models.size());
+    else
+        ImGui::TextWrapped("Spend is catalog pricing \xc3\x97 tokens from completed turns "
+                           "\xe2\x80\x94 not a bill, but every model that spent tokens here has "
+                           "a catalog price. Turns with no token counts aren't listed.");
     ImGui::PopStyleColor();
 }
 

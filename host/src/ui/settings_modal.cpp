@@ -1163,6 +1163,17 @@ struct OmpAccountRow {
     std::string email;
     std::string orgName;
 };
+// A credential the bridge itself has taken out of service (revoked token, refresh that came
+// back invalid_grant, key the provider now rejects). auth_state reports these per provider in
+// `disabled[]`; `id` is the credential rowid and is what agent_provider_remove_key wants as
+// its `account`, so the panel can actually clear the dead row instead of only re-polling it.
+struct OmpDisabledRow {
+    std::string id;            // credential rowid, verbatim (auth_remove_key's `account`)
+    std::string cause;         // bridge's reason text — the only honest thing to show the user
+    std::string type;          // api_key | oauth
+    std::string email;         // may be absent/null
+    double disabledAtMs = 0.0; // 0 = bridge has no timestamp for this row (legacy); not 1970
+};
 struct OmpProvDetail {
     bool loaded = false;
     std::string state;
@@ -1171,6 +1182,7 @@ struct OmpProvDetail {
     std::vector<OmpAccountRow> accounts;
     std::vector<ui::UsageWindow> usage;
     std::vector<std::string> usageNotes;
+    std::vector<OmpDisabledRow> disabled;
 };
 struct OmpOAuthFlow {
     bool active = false;
@@ -1208,6 +1220,12 @@ struct OmpProvUi {
     std::vector<OmpProviderRow> rows;
     std::string selectedId;
     std::string lastError;
+    // Set when the ONE bulk agent_provider_list call failed outright. rows/detail are then the
+    // last known state (or empty on a cold first poll) — never "this account has no providers".
+    bool listFailed = false;
+    // A response that arrived but carried entries this UI could not read: the readable rows are
+    // live, and this names how many were dropped instead of silently shrinking the list.
+    std::string listPartial;
     OmpProvDetail detail;
     std::string detailFor;
     std::string detailRequestFor;
@@ -1233,6 +1251,9 @@ struct OmpProvUi {
     int lastDrawnFrame = -100;
 };
 static OmpProvUi s_omp;
+// Bound by the error branch when no detail fetch has landed yet for the selected provider —
+// s_omp.detail.disabled would then still describe a DIFFERENT provider.
+static const std::vector<OmpDisabledRow> kNoDisabledRows;
 
 static uint64_t nextOmpRequestGeneration() {
     return ++s_omp.nextRequestGeneration;
@@ -1327,13 +1348,17 @@ static bool ompRpcAbsent(const core::RpcResult& r) {
     return false;
 }
 
-// Claude stack + Kimi first (design brief), then signed-in providers, then the rest alpha.
+// Claude stack + Kimi first (design brief), then providers that need attention, then the rest
+// of the signed-in ones, then everything else alpha. "error"/"disabled" outrank a healthy
+// sign-in on purpose: a revoked credential is the one row in this list with an action waiting
+// on it, and burying it among the signed-out providers is how it stayed invisible.
 static int ompProviderRank(const OmpProviderRow& r) {
     if (r.id == "anthropic") return 0;
     if (r.id == "kimi-code") return 1;
     if (r.id == "moonshot") return 2;
-    if (r.state != "signed_out" && !r.state.empty()) return 3;
-    return 4;
+    if (r.state == "error" || r.state == "disabled") return 3;
+    if (r.state == "key_set" || r.state == "oauth_connected") return 4;
+    return 5;
 }
 
 static void pollOmpProviderList(AppState& st, bool force) {
@@ -1356,31 +1381,55 @@ static void pollOmpProviderList(AppState& st, bool force) {
         if (ompRpcAbsent(r)) {
             s_omp.available = false;
             s_omp.lastError = "Provider sign-in bridge unavailable in this runtime.";
+            s_omp.listPartial.clear();
             return;
         }
         s_omp.available = true;
+        // Wholesale failure of the single bulk RPC: there is no per-provider data in the
+        // response to salvage, so the only honest degrade is to say the CALL failed, keep
+        // whatever rows we last read (marked as last-known) and never let the panel imply the
+        // user has no providers. rows/detail are deliberately left untouched below.
+        auto listCallFailed = [](std::string why) {
+            if (why.empty()) why = "no reason reported";
+            s_omp.listFailed = true;
+            s_omp.listPartial.clear();
+            s_omp.lastError =
+                "Could not read the provider list from the auth bridge (" + why +
+                "). This is a failed service call, not an empty provider set" +
+                (s_omp.rows.empty() ? "." : " \xe2\x80\x94 the providers below are the last "
+                                            "state this panel successfully read.");
+        };
         if (!r.ok || !r.result.is_object()) {
-            s_omp.lastError = r.err.empty() ? "provider list unavailable" : r.err;
+            listCallFailed(r.err);
             return;
         }
         if (!optionalJsonBool(r.result, "ok", true)) {
-            s_omp.lastError = optionalJsonString(r.result, "error");
-            if (s_omp.lastError.empty()) s_omp.lastError = "provider list failed";
+            listCallFailed(optionalJsonString(r.result, "error"));
             return;
         }
         const auto* arr = optionalJsonArr(r.result, "providers");
         if (!arr) {
-            s_omp.lastError = "provider list response was incomplete";
+            listCallFailed("response carried no providers array");
             return;
         }
 
         std::vector<OmpProviderRow> rows;
         rows.reserve(arr->size());
+        // An entry this UI cannot key (not an object / no id) is dropped from the list — that
+        // used to happen silently, i.e. one bad provider entry made a provider vanish with no
+        // trace. Count them and report the count instead; the readable rows stay fully live.
+        int unreadable = 0;
         for (const auto& p : *arr) {
-            if (!p.is_object()) continue;
+            if (!p.is_object()) {
+                ++unreadable;
+                continue;
+            }
             OmpProviderRow row;
             row.id = optionalJsonString(p, "id");
-            if (row.id.empty()) continue;
+            if (row.id.empty()) {
+                ++unreadable;
+                continue;
+            }
             row.label = optionalJsonString(p, "label");
             if (row.label.empty()) row.label = row.id;
             row.state = optionalJsonString(p, "state");
@@ -1412,13 +1461,26 @@ static void pollOmpProviderList(AppState& st, bool force) {
         for (const auto& row : rows)
             if (row.id == s_omp.selectedId) selectedStillExists = true;
         s_omp.rows = std::move(rows);
+        s_omp.listFailed = false;
         s_omp.lastError.clear();
-        // Sole writer of the signed-in bridge set: anything with credentials
-        // (key_set / oauth_connected / connected / error-with-creds) counts;
-        // only a plain signed_out state excludes a provider.
+        s_omp.listPartial =
+            unreadable == 0
+                ? std::string()
+                : (std::to_string(unreadable) +
+                   (unreadable == 1 ? " provider entry in the bridge response could not be read"
+                                    : " provider entries in the bridge response could not be read") +
+                   " and is not listed below; every provider shown is current.");
+        // Sole writer of the signed-in bridge set, and it gates whether the copilot model
+        // picker offers this provider at all. Only a USABLE credential counts. This used to be
+        // `!= "signed_out"`, which was harmless while the bridge could never actually report
+        // "error" — now that a revoked credential surfaces as state:"error" (auth-context.ts
+        // computeAuthState, states: signed_out|key_set|oauth_connected|error|disabled), that
+        // test would advertise a provider whose every request is guaranteed to fail. A provider
+        // that still holds a working credential alongside a dead one reports key_set /
+        // oauth_connected and carries the dead row in disabled[], so nothing usable is lost.
         st.signedInBridgeProviders.clear();
         for (const auto& row : s_omp.rows)
-            if (!row.state.empty() && row.state != "signed_out")
+            if (row.state == "key_set" || row.state == "oauth_connected")
                 st.signedInBridgeProviders.insert(row.id);
         if (!selectedStillExists && !s_omp.rows.empty())
             selectOmpProvider(s_omp.rows.front().id);
@@ -1463,6 +1525,25 @@ static void fetchOmpProviderDetail(AppState& st, const std::string& id, bool for
         d.state = optionalJsonString(r.result, "state");
         d.origin = optionalJsonString(r.result, "origin");
         d.error = optionalJsonString(r.result, "error");
+        // auth_state's `disabled[]` — credentials the bridge has taken out of service. Filtered
+        // per provider by the bridge (confirmed against computeAuthState), so every row here
+        // belongs to `id`. `id` is a string per the wire contract; read it with the stamp helper
+        // so a numeric rowid is still carried through verbatim rather than silently dropped.
+        if (const auto* dis = optionalJsonArr(r.result, "disabled")) {
+            for (const auto& x : *dis) {
+                if (!x.is_object()) continue;
+                OmpDisabledRow dr;
+                dr.id = optionalJsonStamp(x, "id");
+                // No rowid = nothing agent_provider_remove_key could address.
+                if (dr.id.empty()) continue;
+                dr.cause = optionalJsonString(x, "cause");
+                dr.type = optionalJsonString(x, "type");
+                dr.email = optionalJsonString(x, "email");
+                auto at = x.find("disabledAtMs");
+                if (at != x.end() && at->is_number()) dr.disabledAtMs = at->get<double>();
+                d.disabled.push_back(std::move(dr));
+            }
+        }
         if (const auto* accts = optionalJsonArr(r.result, "accounts")) {
             for (const auto& a : *accts) {
                 if (!a.is_object()) continue;
@@ -1805,6 +1886,64 @@ static bool modelMatches(const ui::BridgeModelMeta& m, const std::string& needle
            toLowerAscii(m.id).find(needleLower) != std::string::npos;
 }
 
+// Remove ONE credential row from the auth bridge (account = its rowid, as reported by
+// accounts[].credentialId or disabled[].id), or every credential for the provider when
+// account is empty. Reuses the frozen agent_provider_remove_key proxy — a disabled row is
+// removable through the exact same call as a live key, so no new method is involved.
+static void removeOmpCredential(AppState& st, const std::string& provider,
+                                const std::string& account) {
+    nlohmann::json params{{"provider", provider}};
+    if (!account.empty()) params["account"] = account;   // omitted = all rows for the provider
+    const uint64_t modalGeneration = s_omp.modalGeneration;
+    const uint64_t viewGeneration = s_omp.viewGeneration;
+    const uint64_t selectionGeneration = s_omp.selectionGeneration;
+    const uint64_t requestGeneration = nextOmpRequestGeneration();
+    s_omp.keyRequestGeneration = requestGeneration;
+    st.rpc.call("agent_provider_remove_key", std::move(params),
+                [&st, provider, modalGeneration, viewGeneration, selectionGeneration,
+                 requestGeneration](const core::RpcResult& r) {
+        if (!ompSelectionCallbackCurrent(modalGeneration, viewGeneration,
+                                         selectionGeneration, provider) ||
+            s_omp.keyRequestGeneration != requestGeneration ||
+            s_omp.keyFor != provider)
+            return;
+        if (!r.ok || !r.result.is_object() || !optionalJsonBool(r.result, "ok", true)) {
+            const std::string why = !r.ok ? r.err : optionalJsonString(r.result, "error");
+            s_omp.lastError = why.empty() ? "The auth bridge refused to remove that credential."
+                                          : why;
+        } else {
+            s_omp.lastError.clear();
+        }
+        // Either way the stored state may have moved: re-read it rather than guessing.
+        refreshOmpProvider(st);
+    });
+}
+
+// "2026-08-27 14:05" in local time. The bridge sends 0 for rows whose disable timestamp it
+// never recorded, and 0 must read as unknown — printing the epoch would be a wrong number
+// presented as fact.
+static std::string ompDisabledWhen(double ms) {
+    if (!(ms > 0.0)) return {};
+    const std::time_t t = (std::time_t)(ms / 1000.0);
+    const std::tm* lt = std::localtime(&t);
+    if (!lt) return {};
+    char buf[32];
+    if (std::strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M", lt) == 0) return {};
+    return buf;
+}
+
+// What the provider list shows when it has no rows to paint. The wide pane used to claim "No
+// providers reported by the bridge" even when the bulk read had simply failed — i.e. it told
+// the user they own no providers to describe a transport failure. Both panes share this now.
+static const char* ompEmptyListMessage() {
+    if (s_omp.listInFlight) return "Loading providers\xe2\x80\xa6";
+    if (!s_omp.rows.empty()) return "No providers match your search.";
+    if (s_omp.listFailed)
+        return "The provider list could not be read \xe2\x80\x94 the call to the auth bridge "
+               "failed (reason above). This does NOT mean you have no providers.";
+    return "No providers reported by the bridge.";
+}
+
 static void drawOmpProviderDetail(AppState& st, float sc) {
     const OmpProviderRow* row = nullptr;
     for (const auto& r : s_omp.rows)
@@ -1898,11 +2037,58 @@ static void drawOmpProviderDetail(AppState& st, float sc) {
     // ---- Sign-in section ----
     settingsGlassSectionBegin("##omp_signin", "Sign-in", colW);
     if (state == "error") {
+        // The cause is the whole point of this branch: a credential the bridge has rejected or
+        // taken out of service. Prefer the per-provider detail error, fall back to the list
+        // row's, and when neither is populated say that plainly instead of rendering a blank
+        // red line that looks like a rendering bug.
+        std::string cause = detailReady && !s_omp.detail.error.empty()
+                                ? s_omp.detail.error : prov.error;
+        const std::vector<OmpDisabledRow>& dead =
+            detailReady ? s_omp.detail.disabled : kNoDisabledRows;
+        if (cause.empty() && !dead.empty()) cause = dead.front().cause;
         ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(pal.statusErr));
-        ImGui::TextWrapped("%s", (detailReady && !s_omp.detail.error.empty()
-                                      ? s_omp.detail.error : prov.error).c_str());
+        ImGui::TextWrapped("%s", cause.empty()
+                                     ? "This provider's stored credential is not usable and the "
+                                       "bridge did not report a reason."
+                                     : cause.c_str());
         ImGui::PopStyleColor();
+        // One row per credential the bridge disabled, each with the Remove that clears exactly
+        // that rowid. Retrying a revoked token can never succeed — removing it is the only
+        // action that changes anything, so it has to exist here.
+        for (const auto& dr : dead) {
+            ImGui::PushID(dr.id.c_str());
+            std::string who = !dr.email.empty() ? dr.email : ("credential #" + dr.id);
+            if (!dr.type.empty()) who += " (" + dr.type + ")";
+            const std::string when = ompDisabledWhen(dr.disabledAtMs);
+            std::string line = who + " \xe2\x80\x94 disabled";
+            if (!when.empty()) line += " " + when;
+            if (!dr.cause.empty()) line += ": " + dr.cause;
+            ImGui::Bullet();
+            ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(pal.textDim));
+            ImGui::TextUnformatted(
+                ellipsizeToFit(line, ImGui::GetContentRegionAvail().x - 80.0f * sc).c_str());
+            ImGui::PopStyleColor();
+            ImGui::SameLine(0, 8.0f * sc);
+            if (ImGui::SmallButton("Remove")) removeOmpCredential(st, prov.id, dr.id);
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Delete this dead credential from the auth bridge, so the "
+                                  "provider stops reporting an error and you can sign in again.");
+            ImGui::PopID();
+        }
         if (ImGui::SmallButton("Retry")) refreshOmpProvider(st);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Re-read this provider's state from the auth bridge. This does not "
+                              "clear anything \xe2\x80\x94 a revoked credential stays revoked.");
+        if (dead.empty()) {
+            // The bridge reports an unusable credential but named no removable row, so the only
+            // handle we have is the provider-wide removal the same RPC supports.
+            ImGui::SameLine(0, 8.0f * sc);
+            if (ImGui::SmallButton("Remove credentials"))
+                removeOmpCredential(st, prov.id, std::string());
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("The bridge did not name a specific credential row, so this "
+                                  "removes EVERY stored credential for this provider.");
+        }
         ImGui::SameLine(0, 8.0f * sc);
     }
     if (state == "oauth_connected") {
@@ -1963,28 +2149,8 @@ static void drawOmpProviderDetail(AppState& st, float sc) {
                              : "API key set",
                          pal.statusOk, /*filled=*/true);
         ImGui::SameLine(0, 12.0f * sc);
-        if (ImGui::SmallButton("Remove key")) {
-            const std::string provider = prov.id;
-            const uint64_t modalGeneration = s_omp.modalGeneration;
-            const uint64_t viewGeneration = s_omp.viewGeneration;
-            const uint64_t selectionGeneration = s_omp.selectionGeneration;
-            const uint64_t requestGeneration = nextOmpRequestGeneration();
-            s_omp.keyRequestGeneration = requestGeneration;
-            st.rpc.call("agent_provider_remove_key",
-                        nlohmann::json{{"provider", provider}},
-                        [&st, provider, modalGeneration, viewGeneration,
-                         selectionGeneration, requestGeneration](const core::RpcResult& r) {
-                if (!ompSelectionCallbackCurrent(modalGeneration, viewGeneration,
-                                                 selectionGeneration, provider) ||
-                    s_omp.keyRequestGeneration != requestGeneration ||
-                    s_omp.keyFor != provider)
-                    return;
-                if (!r.ok || !r.result.is_object() ||
-                    !optionalJsonBool(r.result, "ok", true))
-                    s_omp.lastError = !r.ok ? r.err : optionalJsonString(r.result, "error");
-                refreshOmpProvider(st);
-            });
-        }
+        if (ImGui::SmallButton("Remove key"))
+            removeOmpCredential(st, prov.id, std::string());
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip("Remove the stored key from the auth bridge. "
                               "Paste a new key below to replace it.");
@@ -2468,6 +2634,13 @@ static void drawOmpProviderManager(AppState& st) {
         ImGui::TextWrapped("%s", s_omp.lastError.c_str());
         ImGui::PopStyleColor();
     }
+    if (!s_omp.listPartial.empty()) {
+        // A successful read that lost some entries: the list below is still live, so this is a
+        // note rather than the panel-wide error above.
+        ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(pal.statusWarn));
+        ImGui::TextWrapped("%s", s_omp.listPartial.c_str());
+        ImGui::PopStyleColor();
+    }
 
     const float footerH = ImGui::GetFrameHeightWithSpacing() + 4.0f * sc;
     const float paneH = -footerH;
@@ -2561,7 +2734,7 @@ static void drawOmpProviderManager(AppState& st) {
             }
             if (filteredRows.empty()) {
                 ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(pal.textDim));
-                ImGui::TextUnformatted("No providers match your search.");
+                ImGui::TextWrapped("%s", ompEmptyListMessage());
                 ImGui::PopStyleColor();
             }
             settingsEndPopupRowCombo();
@@ -2630,9 +2803,7 @@ static void drawOmpProviderManager(AppState& st) {
         }
         if (filteredRows.empty()) {
             ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(pal.textDim));
-            ImGui::TextWrapped(s_omp.listInFlight ? "Loading providers\xe2\x80\xa6"
-                               : (s_omp.rows.empty() ? "No providers reported by the bridge."
-                                                     : "No providers match your search."));
+            ImGui::TextWrapped("%s", ompEmptyListMessage());
             ImGui::PopStyleColor();
         }
         ImGui::EndChild();
@@ -5855,7 +6026,6 @@ const SettingsEntry kSettingsEntries[] = {
     { "Send bug reports",         "AI",           2 },
     { "Sketch 2D",                "AI",           2 },
     { "Model 3D",                 "AI",           2 },
-    { "Reasoning effort",         "AI",           2 },
     { "Model roles",              "AI",           2 },
     { "Hidden models",            "AI",           2 },
     { "Harness organization",     "AI",           2 },
@@ -5887,6 +6057,15 @@ const SettingsEntry kSettingsEntries[] = {
     { "Usage & cost",             "Providers",    3 },
     { "Session cost",             "Providers",    3 },
     { "Model routing",            "Providers",    3 },
+    // Generation block — the ONE Settings-modal home for these three controls, rendered by
+    // drawAiSettingsSection(Generation) at the top of the Providers tab. "Reasoning effort"
+    // used to target the AI tab, which has no such control anywhere: the search hit landed
+    // the user on a page where the thing they searched for did not exist.
+    { "Generation",               "Providers",    3 },
+    { "Reasoning effort",         "Providers",    3 },
+    { "Thinking effort",          "Providers",    3 },
+    { "Max response tokens",      "Providers",    3 },
+    { "Model context window",     "Providers",    3 },
     // Benchmarks (tab 4)
     { "Benchmarks",               "AI",    2 },
     { "Model leaderboard",        "AI",    2 },
@@ -8180,6 +8359,16 @@ void drawSettingsModal(AppState& st, bool busy) {
                               "never in this browser and never shared with another account."
                             : "API providers, sign-in, and model routing. Credentials are stored by "
                               "the auth bridge \xe2\x80\x94 never written to config.json.");
+                // Generation knobs (reasoning effort / max response tokens / model context
+                // window) sit ABOVE the provider manager on purpose: drawOmpProviderManager's
+                // two-pane child is sized -footerH, i.e. it eats the whole remaining tab
+                // height, so anything emitted after it starts below the fold. This card is the
+                // ONLY Settings-modal home for these three controls, and the command-search
+                // "Reasoning effort" entry lands on this tab, so it must be visible on open.
+                settingsGlassSectionBegin("##prov_generation", "Generation");
+                if (ui::drawAiSettingsSection(st, busy, ui::AiSettingsSection::Generation))
+                    saveSettings(st.settings);
+                settingsGlassSectionEnd();
                 drawOmpProviderManager(st);
                 settingsGlassSectionBegin("##prov_freeai", "Free AI (FreeLLMAPI)");
                 if (ui::drawFreeAiProviderCard(st)) saveSettings(st.settings);
@@ -8189,7 +8378,9 @@ void drawSettingsModal(AppState& st, bool busy) {
                     // runtime — keep the legacy sections while the manager periodically
                     // re-probes for a reopened or reconnected bridge.
                     settingsGlassSectionBegin("##prov_provider", "Provider \x26 Model");
-                    ui::drawAiSettingsSection(st, busy, ui::AiSettingsSection::ProviderModel);
+                    if (ui::drawAiSettingsSection(st, busy,
+                                                  ui::AiSettingsSection::ProviderModel))
+                        saveSettings(st.settings);
                     settingsGlassSectionEnd();
 
                     settingsGlassSectionBegin("##prov_moonshot", "Moonshot (Kimi)");

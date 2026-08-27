@@ -1038,6 +1038,7 @@ static const ToolDesc kToolDescs[] = {
     {"suggest_dimension_scheme", "Propose which dimensions to drive in a sketch, with process-aware tolerances."},
     {"suggest_drawing_dimension_scheme", "Propose per-feature drawing dimensions, tolerances and semantic callouts."},
     {"tap_drill", "Return the standard tap drill diameter for a thread designation (aicad.calc/1, contracts/advisor.md §7)."},
+    {"task_list", "Publish the LIVE task list shown in the copilot's Task list panel."},
     {"undo", "Undo the last edit on the current part."},
     {"vendor_login", "Open a HEADED browser window so the user can log into a vendor site."},
     {"vendor_part_register", "Register scraped price/availability for bom_price; import_artifact handles geometry."},

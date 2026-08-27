@@ -22,9 +22,17 @@ appears when you open this project, and so each machine gets paths that are corr
 Grok is written both user-global and project-scoped. Antigravity is global-only.
 
 ``--profile lite|full`` selects the MCP instruction/tool surface (env
-``CHUDWARE_MCP_PROFILE``). ``lite`` keeps every CAD/sim capability but drops orchestration
-scaffolding (DAG/mission/ledger/workspace) — preferred for capable models (Grok, Claude
-Code, opencode). Default is ``full`` for backward compatibility with small local models.
+``CHUDWARE_MCP_PROFILE``). ``lite`` keeps every CAD/sim capability, the design ledger
+(``ledger_get``/``ledger_note``) and the ``task_list`` plan publisher, and swaps the long
+prescriptive instruction block for a short one; it drops only the supervision scaffolding
+a self-driving model will not follow — the DAG supervisor, the mission phase machine, the
+buildgraph planner, the advisory foreman, the workspace lease registry, and ``delegate``.
+Preferred for capable models (Grok, Claude Code, opencode, Claude in cowork). Default is
+``full`` for backward compatibility with small local models.
+
+The ledger is deliberately IN lite: it is the anti-context-loss note store, and lite is the
+profile that drives the longest unattended external sessions. See services/mcp/server.py
+(the ``if not _LITE`` block) for what each profile actually registers.
 
 The writes are idempotent and non-destructive: existing servers in each file are preserved,
 each file is backed up (*.chudware-bak) before the first change, and re-running only rewrites a
@@ -392,7 +400,13 @@ def _status_of(t: dict) -> dict:
         connected = False
         if path.exists():
             txt = path.read_text(encoding="utf-8")
-            connected = bool(_GROK_SECTION_RE.search(txt)) or bool(_GROK_LEGACY_RE.search(txt))
+            # Same membership test _apply_grok uses (has_server/has_legacy). This used to
+            # call _GROK_SECTION_RE/_GROK_LEGACY_RE, two module globals that do not exist
+            # anywhere in this file, so BOTH --detect and --wizard died with NameError the
+            # moment they reached a Grok target (they always do: _targets always appends
+            # the user + project Grok rows).
+            connected = (f"[mcp_servers.{SERVER_NAME}]" in txt
+                         or f"[mcp_servers.{SERVER_NAME_LEGACY}]" in txt)
         return {"client": t["client"], "path": str(path), "present": present,
                 "connected": connected}
 
@@ -432,7 +446,9 @@ def main(argv: list[str]) -> int:
     ap.add_argument("--repo", default=_default_repo(),
                     help="Repository root (default: auto-detect from this script)")
     ap.add_argument("--profile", choices=["lite", "full"], default="full",
-                    help="MCP profile: lite (capable models) or full (supervised/local). "
+                    help="MCP profile: lite (capable models: every capability + ledger + "
+                         "task_list, no DAG/mission/buildgraph/advisor/workspace/delegate "
+                         "scaffolding) or full (supervised/local: everything). "
                          "Sets CHUDWARE_MCP_PROFILE in every client entry.")
     ap.add_argument("--unregister", action="store_true", help="Remove the chudware/ai-cad entries")
     ap.add_argument("--dry-run", action="store_true", help="Show what would change")

@@ -62,6 +62,22 @@ export function resolveModel(provider: string, modelId: string, baseUrl?: string
 	return baseUrl ? { ...model, baseUrl } : model;
 }
 
+/**
+ * Whether the catalog carries real price data for this model.
+ *
+ * `Model.cost` is a MANDATORY `{input,output,cacheRead,cacheWrite}` number object with no
+ * "unknown price" sentinel, and many discovery adapters (aimlapi, antigravity, codex, cursor,
+ * devin, gemini, gitlab-duo-workflow, openai-compatible, ollama, …) emit all-zeros for models
+ * whose real price they never learned — 1658 of the 3902 bundled rows are all-zero. All-zero
+ * therefore means "no price data", which is NOT the same as "free": a $0 derived from it is a
+ * placeholder, never a measured amount, and callers MUST render it as unknown rather than as
+ * an authoritative total.
+ */
+function isPriced(m: Model<Api>): boolean {
+	const c = m.cost;
+	return c.input > 0 || c.output > 0 || c.cacheRead > 0 || c.cacheWrite > 0;
+}
+
 /** Display row for one catalog model: capabilities + cost, no wire-only fields. */
 export function modelInfo(m: Model<Api>): Json {
 	return {
@@ -78,7 +94,11 @@ export function modelInfo(m: Model<Api>): Json {
 		reasoningEfforts: m.thinking?.efforts ?? [],
 		contextWindow: m.contextWindow ?? null,
 		maxTokens: m.maxTokens ?? null,
-		cost: m.cost ?? null,
+		// `cost` is a mandatory catalog field (never undefined here: 0 of 3902 bundled rows
+		// lack it), so it is emitted verbatim; `priced` is the only thing that distinguishes
+		// a real $0 from an unpriced row full of zeros.
+		cost: m.cost,
+		priced: isPriced(m),
 	};
 }
 
@@ -207,10 +227,12 @@ function bundledRows(provider: string): Map<string, Json> {
 /** Display row for a live id with no catalog entry. `resolveModel` clones the provider's first
  *  bundled model as a template, which is exactly the shape completion will use for this id, so the
  *  capabilities stay truthful. Cost is nulled: the template's prices belong to a different model
- *  and a wrong price is worse than an absent one. */
+ *  and a wrong price is worse than an absent one — which also makes the row unpriced regardless
+ *  of what the template charged. */
 function liveOnlyRow(provider: string, m: LiveModel): Json {
 	const row = modelInfo({ ...resolveModel(provider, m.id), name: m.name });
 	row.cost = null;
+	row.priced = false;
 	return row;
 }
 
@@ -281,6 +303,9 @@ function readCostEvent(v: unknown): CostEvent | undefined {
 interface CostRollup {
 	provider: string;
 	model: string;
+	/** Whether the catalog priced this model at all (see `isPriced`). `false` ⇒ `usd` is a
+	 *  placeholder 0 with no pricing behind it, not a measured $0. */
+	priced: boolean;
 	usd: number;
 	input: number;
 	output: number;
@@ -288,8 +313,11 @@ interface CostRollup {
 	cacheWrite: number;
 }
 
-function newRollup(provider: string, model: string): CostRollup {
-	return { provider, model, usd: 0, input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
+/** `provider`/`model` are `"*"` for the session aggregate, which is hand-serialized in
+ *  `handleCostSummary` and never passes through `rollupRow`, so its `priced` is never emitted —
+ *  aggregate provenance is reported as `pricedModels`/`unpricedModels` instead. */
+function newRollup(provider: string, model: string, priced = false): CostRollup {
+	return { provider, model, priced, usd: 0, input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
 }
 
 function rollupRow(r: CostRollup): Json {
@@ -297,6 +325,7 @@ function rollupRow(r: CostRollup): Json {
 		provider: r.provider,
 		model: r.model,
 		usd: r.usd,
+		priced: r.priced,
 		tokens: { input: r.input, output: r.output, cacheRead: r.cacheRead, cacheWrite: r.cacheWrite },
 	};
 }
@@ -306,6 +335,11 @@ function rollupRow(r: CostRollup): Json {
  * caller-supplied token counts, no persistence, no network. `events[].model` unresolvable
  * against the catalog (unknown provider/model, never bundled and no template) is skipped
  * rather than guessed at, since a wrong price would be worse than an absent one.
+ *
+ * A model the catalog never priced contributes exactly 0 to `usd`, which is indistinguishable
+ * from a genuinely free turn, so the result also carries provenance: `priced` per row plus
+ * `totalModels`/`pricedModels`/`unpricedModels` over the models that actually moved tokens.
+ * A caller that sees `unpricedModels` non-empty MUST NOT present `total.usd` as complete.
  */
 export function handleCostSummary(params: Json): Json {
 	const rawEvents = Array.isArray(params.events) ? params.events : [];
@@ -327,7 +361,8 @@ export function handleCostSummary(params: Json): Json {
 				event.cacheWrite * model.cost.cacheWrite) /
 			1_000_000;
 		const key = `${event.provider}/${event.model}`;
-		const entry = perModel.get(key) ?? newRollup(event.provider, event.model);
+		// Same key ⇒ same resolved catalog entry, so `priced` is decided once at row creation.
+		const entry = perModel.get(key) ?? newRollup(event.provider, event.model, isPriced(model));
 		entry.usd += usd;
 		entry.input += event.input;
 		entry.output += event.output;
@@ -340,8 +375,18 @@ export function handleCostSummary(params: Json): Json {
 		total.cacheRead += event.cacheRead;
 		total.cacheWrite += event.cacheWrite;
 	}
+	const rows = Array.from(perModel.values());
+	// A row only counts toward priced/unpriced provenance once it actually moved tokens: naming a
+	// model the user never spent anything on would be noise.
+	const counted = rows.filter((r) => r.input > 0 || r.output > 0 || r.cacheRead > 0 || r.cacheWrite > 0);
+	const unpricedModels = counted.filter((r) => !r.priced).map((r) => `${r.provider}/${r.model}`);
 	return {
-		perModel: Array.from(perModel.values()).map(rollupRow),
+		perModel: rows.map(rollupRow),
 		total: { usd: total.usd, tokens: { input: total.input, output: total.output, cacheRead: total.cacheRead, cacheWrite: total.cacheWrite } },
+		// All three range over token-contributing rows only, so
+		// `pricedModels + unpricedModels.length === totalModels` always holds.
+		totalModels: counted.length,
+		pricedModels: counted.length - unpricedModels.length,
+		unpricedModels,
 	};
 }

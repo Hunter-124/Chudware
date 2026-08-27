@@ -17,7 +17,9 @@ Runs over stdio; the desktop host registers it into the machine's MCP client con
 """
 from __future__ import annotations
 
+import atexit
 import os
+import signal
 import sys
 import tempfile
 import threading
@@ -117,7 +119,10 @@ _LITE_INSTRUCTIONS = (
     "are the text-only read when you have no vision.\n"
     "PARALLEL WORK: when more than one part is open — e.g. several subagents each building a "
     "different part — pass the opaque doc_id from new_part/open on tool calls so you address "
-    "your OWN part; omitting it errors (the 'current part' is process-wide and shared). Prefer "
+    "your OWN part; omitting it errors (the 'current part' is process-wide and shared). A "
+    "part opened by a DIFFERENT AI client on this engine is never adopted by a bare call "
+    "either: that refuses with doc_owned_by_other_client — call new_part() for your own, or "
+    "list_parts() and name the doc_id deliberately. Prefer "
     "the part's name in user-facing narration and examples; keep the opaque id as the tool "
     "handle when multi-doc or ambiguous.\n"
     "LOOK IT UP, DON'T RECALL: use research_* for any load-bearing number (materials, sections, "
@@ -144,7 +149,10 @@ _FULL_INSTRUCTIONS = (
         "different part in this shared engine — pass the opaque doc_id returned by "
         "new_part/new_assembly/import on tool calls so you address your OWN part; omitting it "
         "errors when >1 part is open (the 'current part' is process-wide, so a bare call would "
-        "edit another agent's part). Prefer the part's name in user-facing narration and "
+        "edit another agent's part), and a part minted by a DIFFERENT AI client is never "
+        "adopted by a bare call at all — that refuses with doc_owned_by_other_client, so "
+        "call new_part() for your own or list_parts() and name the doc_id. "
+        "Prefer the part's name in user-facing narration and "
         "examples; keep the opaque id as the tool handle when multi-doc or ambiguous. The "
         "engine serialises ops safely, so parallel agents just work.\n"
         "TYPICAL LOOP: new_part(name) -> add_features([...ops...]) to build with standard "
@@ -509,9 +517,24 @@ register_regen_tools(_reg.view(mcp, "cad"))
 # Code compliance (T-D4): deterministic rule engine + agentic RAG for building-code checks.
 from services.mcp.code_compliance_tools import register_code_compliance_tools
 register_code_compliance_tools(_reg.view(mcp, "cad"))
+# Design ledger (T-W1, Pillar 20): persistent mission state (aicad.ledger/1).
+# ledger_get / ledger_note let any agent role read or write the design ledger without
+# holding the full chat history — the anti-context-loss mechanism for 24k local models.
+# ledger_get is risk-class READ; ledger_note is WRITE (auto-classified by tool_registry).
+#
+# NOT lite-gated (2026-08-27). It used to live inside the orchestration block below, but
+# `lite` is the profile services/installer/setup_mcp_clients.py RECOMMENDS for the capable
+# external clients (Claude Code, opencode, Cowork) — which run the LONGEST multi-step
+# sessions, i.e. exactly the ones that lose context and most need a durable place to put
+# findings. The ledger is a two-tool note store, not orchestration scaffolding: it
+# prescribes no workflow and costs a self-driving model nothing it does not ask for.
+# The genuinely heavy orchestration families (dag / mission / buildgraph / advisor /
+# workspace) stay gated below, where the "runs freer" argument does apply.
+from services.mcp.ledger_tools import register_ledger_tools
+register_ledger_tools(_reg.view(mcp, "ledger"))
 # ---------------------------------------------------------------------------
 # Orchestration / supervision families — the DAG supervisor, mission phase
-# machine, build-order planner, foreman, ledger, and workspace lease registry.
+# machine, build-order planner, foreman, and workspace lease registry.
 # These are the "pre-designed plans / workflows" scaffolding tuned for small
 # local models. The `lite` profile omits them so a capable self-driving model
 # runs unconstrained (all real capabilities above stay registered).
@@ -535,12 +558,6 @@ if not _LITE:
     # services.agent.loop.run_mission.
     from services.mcp.mission_tools import register_mission_tools
     register_mission_tools(_reg.view(mcp, "mission"))
-    # Design ledger (T-W1, Pillar 20): persistent mission state (aicad.ledger/1).
-    # ledger_get / ledger_note let any agent role read or write the design ledger without
-    # holding the full chat history — the anti-context-loss mechanism for 24k local models.
-    # ledger_get is risk-class READ; ledger_note is WRITE (auto-classified by tool_registry).
-    from services.mcp.ledger_tools import register_ledger_tools
-    register_ledger_tools(_reg.view(mcp, "ledger"))
     # Build-order DAG planner (T-W15): buildgraph_plan / buildgraph_status.
     # LLM-free planner converts BUILD PLAN / dag/1 mission into aicad.buildgraph/1 graph
     # with prerequisite edges; validator findings are aicad.advisory/1 items.
@@ -558,6 +575,25 @@ if not _LITE:
     # no write-lease required to poll status.
     from services.mcp.workspace_tools import register_workspace_tools
     register_workspace_tools(_reg.view(mcp, "workspace"))
+    # delegate is deliberately NOT registered here. It reads as an obvious parity gap --
+    # the orchestrator / department_manager cards advertise it and roles.py:35 calls it "a
+    # real registered tool" -- but it is modelled on purpose as a mission-scoped pseudo-tool
+    # with no registry callable, and two tests pin that:
+    #   test_tool_binding_gaps.py::test_delegate_is_correctly_diagnosed_as_mission_scoped_not_dead
+    #   test_prompt_preview_autolearn.py::test_tool_catalog_covers_registry_and_guidance
+    # Both exist because of a live forensics incident (2026-07-29): when an unbindable tool
+    # got a fabricated cause, it "sends an engineer to mission plumbing and away from the
+    # actual break". Outside a mission, `delegate` MUST stay unbound so
+    # _unresolved_tool_error can say precisely "mission-scoped", instead of binding to a
+    # callable with no delegation tree behind it. MissionDispatch.resolve owns the
+    # run-scoped handler and is consulted first (agent_turn.py:1802-1817), so a real
+    # mission is unaffected either way -- registering it here would only change the
+    # OUT-of-mission case, and only for the worse.
+    #
+    # So an external MCP client genuinely cannot spawn sub-agents today. Closing that for
+    # real is not a registry line: it needs an external-facing mission entry point that
+    # binds a run_id + ledger + delegation tree for a client that has none, which is a
+    # design task, not a wiring one.
 
 # Design review battery (T-F12): one-call battery dispatching through DISPATCH_TABLE
 # (verify.py) + battery._get_fn for feature_overlap/dfm.  Returns a narrated verdict
@@ -583,6 +619,14 @@ def design_recipe(query: str = "", max_results: int = 3) -> dict:
 # failure context is auto-captured by agent_turn via services.agent.bugreport_context.
 from services.mcp.bugreport_tools import register_bugreport_tools
 register_bugreport_tools(_reg.view(mcp, "workspace"))
+# task_list (contracts/agent_events.md §plan_state) — the LIVE plan the copilot's Task
+# list panel renders. It too existed only in reviewer_exec's private catalog, so an
+# external MCP client could never publish one and the panel stayed empty for the whole
+# session however long the external agent worked. NOT lite-gated: it is a cheap always-on
+# helper like design_recipe in the same family, it spawns nothing, and plan visibility
+# matters MOST during the long unattended external sessions `lite` exists to serve.
+from services.mcp.task_list_tools import register_task_list_tools
+register_task_list_tools(_reg.view(mcp, "workspace"))
 
 # Interface alignment checker (T-BL49): interface_check inspects mating component pairs for
 # hole-pattern registration, bore coaxiality, contact-plane flushness, and fastener pass-through
@@ -635,8 +679,9 @@ _reg.mark_warm_baseline()
 # ---------------------------------------------------------------------------
 # Argument teaching (bench evidence: ~40 recorded run failures were "unexpected
 # keyword argument" / opaque pydantic dumps, plus a silent-drop class that never
-# failed at all). ONE wrapper at the FastMCP dispatch seam, so all 389 tools get
-# it without touching a single tool module.
+# failed at all). ONE wrapper at the FastMCP dispatch seam, so EVERY registered tool
+# gets it without touching a single tool module (485 in the default `full` profile,
+# 468 in `lite` — counted 2026-08-27 from mcp._tool_manager._tools).
 #
 # Seam: ``FastMCP._tool_manager.call_tool``. Both entry points funnel through it —
 # the wire path (``Server.call_tool`` handler registered in FastMCP.__init__ with
@@ -867,8 +912,8 @@ def _validation_payload(tool, meta, arguments, exc) -> dict | None:
 def _emit_payload(tool, payload: dict, convert_result: bool):
     """Return *payload* in whatever shape this tool's own results take.
 
-    355 of 389 tools are ``-> str`` (wrap_output, {"result": string}); the other 34
-    declare no output schema (images/content blocks). Feeding the wrong one to
+    423 of the 485 tools are ``-> str`` (wrap_output, {"result": string}); the other 62
+    return dict/list/Any (images/content blocks, no wrapper). Feeding the wrong one to
     ``convert_result`` would trip the output model, so try the tool's native shape
     first and fall back.
     """
@@ -1120,8 +1165,143 @@ def _reexec_with_fast_malloc() -> None:
         pass  # exec failed -> fall through and run on the default allocator
 
 
+# ---------------------------------------------------------------------------
+# Terminal persistence sweep — an external client's disconnect IS our turn boundary
+# ---------------------------------------------------------------------------
+# The in-app agent promotes AI-authored documents to real project files at its turn
+# boundary: mission_dispatch.run_linear_role_turn and worker_rpc._agent_admin_turn both
+# call cad_common.save_touched_docs(), the ONLY code that writes a doc into
+# CHUDWARE_PROJECT_SAVE_DIR rather than a crash-recovery autosave.
+#
+# This entry point — the standalone external MCP server — had no such boundary, and so
+# never called it. An external client (Claude Code / Cowork / Cursor) opened a part, kept
+# building, and disconnected; the project file (if any) still held whatever the doc looked
+# like at its LAST explicit save, and everything after that existed only in hostd memory
+# and in the periodic crash-recovery autosave — a temp directory reachable solely through
+# the `recover_parts` tool the now-disconnected client will never call. That is the same
+# silent-loss class the in-app agent was explicitly fixed for.
+#
+# A connection-scoped server's turn boundary is its shutdown, so that is where the sweep
+# goes. Every realistic disconnect path is covered:
+#   * stdio EOF / main() returning normally   -> the `finally` in main()
+#   * SIGTERM / SIGINT / SIGHUP               -> _install_shutdown_savers
+#   * anything else that unwinds the process  -> atexit (same function)
+#   * parent died without closing our pipes   -> _start_orphan_watchdog, below
+# The sweep runs at most once per process: a signal followed by EOF must not save twice.
+#
+# It is BOUNDED on purpose. save_touched_docs() talks to hostd and may drain a Box mirror
+# with a 90 s budget of its own; a shutdown that waits for that is, from the client's side,
+# a server that will not die. So the work runs on a worker thread and the caller waits at
+# most CHUDWARE_MCP_SHUTDOWN_SAVE_S (default 20 s) before letting the process go. A slow
+# save beats lost work; a hung server beats neither.
+_SHUTDOWN_SAVE_BUDGET_S: float = float(
+    os.environ.get("CHUDWARE_MCP_SHUTDOWN_SAVE_S", "20") or 20)
+
+_SAVE_LOCK = threading.Lock()
+_SAVE_STARTED = False
+_SAVE_FINISHED = threading.Event()
+_SAVE_STATUS: dict = {}
+# Set once a caller's budget expires. Later callers on the same shutdown (a signal
+# handler that chains into KeyboardInterrupt, then main()'s finally, then atexit) must
+# NOT each spend a fresh budget waiting on the same wedged sweep — that is how a 20 s
+# bound turns into a minute of "the server will not die".
+_SAVE_TIMED_OUT = False
+
+
+def _run_terminal_save(reason: str) -> None:
+    """Worker body: sweep once, publish the status, always set the done event."""
+    try:
+        from services.mcp.cad_common import save_touched_docs
+        status = save_touched_docs() or {}
+    except BaseException as exc:  # noqa: BLE001 — a shutdown sweep never raises
+        status = {"saved": [], "errors": [f"{type(exc).__name__}: {exc}"]}
+    status["reason"] = reason
+    _SAVE_STATUS.clear()
+    _SAVE_STATUS.update(status)
+    _SAVE_FINISHED.set()
+    # stderr ONLY: fd 1 is the JSON-RPC channel (see _install_clean_stdout).
+    saved = status.get("saved") or []
+    failure = status.get("persistence_failure")
+    if saved or failure or status.get("errors"):
+        print(f"[services.mcp] terminal save ({reason}): "
+              f"saved={[s.get('path') for s in saved]} "
+              f"errors={status.get('errors') or []} failure={failure}",
+              file=sys.stderr, flush=True)
+
+
+def terminal_save(reason: str, budget_s: float | None = None) -> dict:
+    """Persist this connection's unsaved AI-authored documents. Runs at most once.
+
+    Returns the ``save_touched_docs()`` status, or ``{"reason": ..., "timeout": True}``
+    when the sweep did not finish inside the budget. Never raises and never blocks
+    longer than *budget_s* — every caller is a shutdown path, including a signal
+    handler and the orphan watchdog's last act before ``os._exit``.
+
+    The sweep is UNCONDITIONAL, exactly like the in-app agent's. It is tempting to skip
+    it when ``cad_common._TOUCHED_DOCS`` is empty, but that list only holds docs a tool in
+    THIS process created or resumed: ``recover_autosaved()`` (run at startup by _warm_core)
+    reopens crash-survivor documents without recording them, and those are picked up solely
+    by save_touched_docs' ``origin_kind in ("mcp", "agent")`` branch. Skipping on an empty
+    list would silently reintroduce the loss for exactly the documents that already survived
+    one crash. The cost of being unconditional is one ``doc_list`` against a daemon that
+    _warm_core has already connected to.
+    """
+    global _SAVE_STARTED, _SAVE_TIMED_OUT
+    with _SAVE_LOCK:
+        first = not _SAVE_STARTED
+        _SAVE_STARTED = True
+    if first:
+        threading.Thread(target=_run_terminal_save, args=(reason,),
+                         name="chudware-terminal-save", daemon=True).start()
+    if _SAVE_TIMED_OUT:
+        return {"reason": reason, "timeout": True}
+    if not _SAVE_FINISHED.wait(
+            _SHUTDOWN_SAVE_BUDGET_S if budget_s is None else budget_s):
+        _SAVE_TIMED_OUT = True
+        print(f"[services.mcp] terminal save ({reason}) exceeded its "
+              "CHUDWARE_MCP_SHUTDOWN_SAVE_S budget — exiting anyway",
+              file=sys.stderr, flush=True)
+        return {"reason": reason, "timeout": True}
+    return dict(_SAVE_STATUS)
+
+
+def _install_shutdown_savers() -> None:
+    """Arm the atexit + signal terminal sweeps. Called from main(), on the main thread.
+
+    Signal handlers CHAIN: the previous handler still runs (SIGINT's default is
+    ``signal.default_int_handler``, so Ctrl-C still raises KeyboardInterrupt and anyio
+    still unwinds normally), and a non-callable previous handler (SIG_DFL/SIG_IGN) is
+    restored and re-raised so the process still dies with the right disposition. The
+    save itself happens on the worker thread, so the handler only waits.
+    """
+    atexit.register(terminal_save, "atexit")
+    if threading.current_thread() is not threading.main_thread():
+        return  # only the main thread may install signal handlers
+    for name in ("SIGTERM", "SIGINT", "SIGHUP"):
+        sig = getattr(signal, name, None)
+        if sig is None:
+            continue  # not on this platform (SIGHUP on Windows)
+        try:
+            previous = signal.getsignal(sig)
+        except (OSError, ValueError):
+            continue
+
+        def _saver(signum, frame, _sig=sig, _prev=previous, _name=name):
+            terminal_save(f"signal:{_name}")
+            if callable(_prev):
+                _prev(signum, frame)
+                return
+            signal.signal(_sig, signal.SIG_DFL)
+            os.kill(os.getpid(), signum)
+
+        try:
+            signal.signal(sig, _saver)
+        except (OSError, ValueError):
+            continue  # handler install refused (embedded/non-main interpreter)
+
+
 def _start_orphan_watchdog() -> None:
-    """Exit when the client that spawned us is gone.
+    """Save, then exit, when the client that spawned us is gone.
 
     stdio MCP servers are children of their client (Claude Desktop/Code, Cursor,
     the GUI copilot). When that parent dies without closing our pipes cleanly —
@@ -1130,8 +1310,14 @@ def _start_orphan_watchdog() -> None:
     its docs never GC'd, and orphaned bridges piled up one per dead session
     (observed: 5 on one box). The parent can't be relied on to clean us up, so
     we watch it ourselves: if our ppid changes (parent died; we were reparented
-    to init/a subreaper), exit. The engine state lives in hostd, not here, so
-    an abrupt exit loses nothing. Opt out with CHUDWARE_ORPHAN_WATCHDOG=0."""
+    to init/a subreaper), exit. Opt out with CHUDWARE_ORPHAN_WATCHDOG=0.
+
+    ``os._exit(0)`` is kept — it is the whole point of the watchdog that nothing,
+    including a wedged transport or a stuck atexit handler, can stop us from going
+    away. But it bypasses atexit entirely, which is why it used to be the one exit
+    path that guaranteed the client's work was never persisted. So it is no longer
+    the FIRST thing we do: we run the bounded terminal sweep, then hard-exit
+    regardless of whether the sweep finished. A save that hangs still exits."""
     if os.name == "nt" or os.environ.get("CHUDWARE_ORPHAN_WATCHDOG") == "0":
         return  # Windows has no reparenting signal; Job Objects handle teardown
     parent = os.getppid()
@@ -1142,8 +1328,9 @@ def _start_orphan_watchdog() -> None:
         while True:
             time.sleep(15.0)
             if os.getppid() != parent:
-                print("[services.mcp] parent client died — exiting orphan bridge",
-                      file=sys.stderr)
+                print("[services.mcp] parent client died — saving, then exiting "
+                      "orphan bridge", file=sys.stderr, flush=True)
+                terminal_save("orphan_watchdog")
                 os._exit(0)
 
     threading.Thread(target=_watch, name="chudware-orphan-watchdog", daemon=True).start()
@@ -1151,27 +1338,37 @@ def _start_orphan_watchdog() -> None:
 
 def main() -> None:
     _reexec_with_fast_malloc()  # fast-allocator preload (best-effort, before any core alloc)
+    # Arm the sweeps AFTER the possible re-exec (execve does not run atexit handlers)
+    # and BEFORE anything can build geometry.
+    _install_shutdown_savers()
     _start_orphan_watchdog()  # a dead client must never leave a zombie bridge pinning hostd
     real_stream = _install_clean_stdout()
     # Warm the core only AFTER fd 1 is redirected, so its load-time prints land in the log,
     # never on the protocol pipe.
     threading.Thread(target=_warm_core, name="chudware-warm", daemon=True).start()
 
-    if real_stream is None:
-        mcp.run()  # fallback (fd redirect unsupported) — stdio transport on sys.stdout
-        return
+    try:
+        if real_stream is None:
+            mcp.run()  # fallback (fd redirect unsupported) — stdio transport on sys.stdout
+            return
 
-    import anyio
-    from mcp.server.stdio import stdio_server
+        import anyio
+        from mcp.server.stdio import stdio_server
 
-    async def _serve() -> None:
-        async with stdio_server(stdout=real_stream) as (read_stream, write_stream):
-            await mcp._mcp_server.run(
-                read_stream, write_stream,
-                mcp._mcp_server.create_initialization_options(),
-            )
+        async def _serve() -> None:
+            async with stdio_server(stdout=real_stream) as (read_stream, write_stream):
+                await mcp._mcp_server.run(
+                    read_stream, write_stream,
+                    mcp._mcp_server.create_initialization_options(),
+                )
 
-    anyio.run(_serve)
+        anyio.run(_serve)
+    finally:
+        # The client closing our pipes (stdio EOF) lands here, as does any exception
+        # that unwinds the transport. atexit would catch it too, but sweeping on the
+        # normal path keeps persistence inside the server's own shutdown instead of
+        # depending on interpreter-teardown ordering.
+        terminal_save("stdio_eof")
 
 
 if __name__ == "__main__":

@@ -42,6 +42,23 @@ def doc_scope():
         _CUR["doc_id"] = saved
 
 
+# Cross-PROCESS document ownership. `_CUR` and `doc_scope()` only ever separate work inside ONE
+# interpreter; they say nothing across the OS-process boundary that separates two MCP client
+# connections. Each external client (Claude Code, Cursor, a cowork swarm member) is its own
+# `services.mcp.server` process with its own `_CUR` — but they all talk to the SAME
+# chudware-hostd and therefore see the SAME engine-global `doc_list`. `_PROCESS_DOCS` is this
+# process's claim set: every document it created, opened, recovered, or was explicitly handed
+# by doc_id. It is what lets the sole-open-document adopt in `_doc()` tell "the part I am
+# working on" from "another agent's part that happens to be the only one open right now".
+_PROCESS_DOCS: set = set()
+
+
+def claim_process_doc(doc_id: Optional[str]) -> None:
+    """Record `doc_id` as a document THIS process has a claim on."""
+    if doc_id:
+        _PROCESS_DOCS.add(str(doc_id))
+
+
 # doc_id STABILITY across an autosave-recovery (Issue 1). When a transport timeout kills the
 # server and it restarts, recovery reopens each autosaved .step+ — which the engine assigns a
 # FRESH doc_id (the per-process counter doesn't reset). Any doc_id the agent was holding would
@@ -500,6 +517,73 @@ def _doc_near_misses(docs: list, value: str) -> list:
     return [by_name[m] for m in difflib.get_close_matches(v, list(by_name), n=3, cutoff=0.72)]
 
 
+# Origin kinds the daemon stamps on each `doc_list` entry (core/hostd/doc_registry.cpp
+# annotateDocList, :740-763): the KIND of the client that MINTED the doc — gui | mcp | agent |
+# test | unknown. "mcp"/"agent" means an AI client: an external MCP server process, or the
+# in-app copilot's Python worker (which also hellos as "mcp", daemon_bridge.py:446-448).
+#
+# That kind is the ONLY per-document attribution on the wire. The engine's own entry carries
+# doc_id / name / kind / path / revision / dirty / feature_count / component_count / empty and
+# nothing about who made it (core/doc/session.cpp doc_list, :5653-5663); the daemon adds
+# `origin_kind` and nothing else — no minting client id, pid, or session — and `hello` does not
+# even hand a client its own connection id back (core/hostd/server.cpp:599-612). So "some other
+# AI client's document" is as fine-grained as this can be made from here; distinguishing WHICH
+# peer would need a new daemon field.
+_AI_ORIGIN_KINDS = ("mcp", "agent")
+
+
+def _sole_doc_is_adoptable(entry: dict) -> bool:
+    """May an omitted doc_id silently adopt `entry`, the only document open engine-wide?
+
+    Yes when there is no shared engine to steal from, when the doc is already ours, or when it
+    is not an AI client's private working part:
+
+      * legacy (non-daemon) mode — `doc_list` is THIS process's own in-process engine, so every
+        document it can see is ours by construction. There is no second client; adopt.
+      * a doc this process created / opened / recovered / was handed explicitly. `_doc()`
+        reconciles `_PROCESS_DOCS` against the open documents on every call, so this is a
+        claim on a doc that is still THERE — not a stale id the engine's per-daemon counter
+        later handed to somebody else. Covers a sub-agent's part after `doc_scope()` put
+        `_CUR` back, and our own part after a `close_part` of a different doc cleared it.
+        (`_TOUCHED_DOCS` is deliberately NOT consulted: `note_touched_doc` feeds
+        `_PROCESS_DOCS` too, and that list is never pruned because the terminal save sweep
+        needs its full history — exactly the staleness this decision must not inherit.)
+      * `origin_kind` "gui" (the human's own part in the viewport), "test", "unknown", or absent
+        — acting on the part the user is actually looking at is the whole point of the adopt.
+
+    No when the sole open document was minted by an AI client and we hold no claim on it: that
+    is another swarm member's part. From the engine's global view it looks exactly like our own
+    would, purely because we have not made one yet — which is precisely the first tool call of
+    a fresh cowork swarm member, the most common moment in a multi-agent session.
+    """
+    try:
+        if not cb.active_daemon_mode():
+            return True
+    except Exception:  # noqa: BLE001 — mode unknown: fall through to the origin test
+        pass
+    if entry.get("doc_id") in _PROCESS_DOCS:
+        return True
+    return (entry.get("origin_kind") or "") not in _AI_ORIGIN_KINDS
+
+
+def _foreign_sole_doc(entry: dict) -> "DocRefError":
+    """The one open document belongs to another AI client: refuse, and name the exact way out.
+
+    Never silently adopt here. An omitted doc_id cannot have meant a part this process never
+    opened, and a WRITE tool landing in a peer's part is unrecoverable for that peer.
+    """
+    did = entry.get("doc_id")
+    return _doc_error(
+        "You have not created or opened a part yet, and the one document open here "
+        f"({did!r}, named {entry.get('name') or ''!r}) was created by a DIFFERENT AI client "
+        f"(origin_kind={entry.get('origin_kind')!r}). Every MCP client attached to this engine "
+        "shares one document list, so adopting it would edit a part you never opened.",
+        [entry], code="doc_owned_by_other_client",
+        hint=('call new_part(name="…") to work in your own part — its doc_id then becomes your '
+              "default and every later bare call lands there. If you genuinely mean that part, "
+              f'call list_parts() and pass it explicitly: doc_id="{did}".'))
+
+
 def _doc(doc_id: Optional[str]) -> str:
     # `_CUR` is a single PROCESS-WIDE "current part", and it is only ever set by a doc THIS
     # process created or opened. A part the human already had open in the GUI — or one another
@@ -523,8 +607,8 @@ def _doc(doc_id: Optional[str]) -> str:
                 "open here, so there is nothing to pick unambiguously.",
                 docs, code="doc_ambiguous",
                 hint=('call new_part(name="…") to work in your own part (its doc_id then '
-                      'becomes your default), or name the one you mean, e.g. '
-                      f'doc_id="{docs[0].get("doc_id")}" — an open part\'s name works too.'))
+                      'becomes your default), or call list_parts() and name the one you mean, '
+                      f'e.g. doc_id="{docs[0].get("doc_id")}" — an open part\'s name works too.'))
         return _doc_error(
             f"Ambiguous doc_id={supplied!r}: {len(candidates)} open parts answer to that name "
             f"({_doc_listing(candidates)}), so it does not identify one document.",
@@ -559,6 +643,9 @@ def _doc(doc_id: Optional[str]) -> str:
 
         resolved = _lookup(raw)
         if resolved:
+            # Naming a document explicitly IS a claim on it: record it so this process's later
+            # bare calls can still resolve to it once `_CUR` is cleared or scoped away.
+            claim_process_doc(resolved)
             return resolved
         if _FOREIGN_HANDLE_RE.match(raw):
             # A drawing / ECAD handle: its registry, not doc_list, is the authority on
@@ -610,20 +697,39 @@ def _doc(doc_id: Optional[str]) -> str:
     # cannot have meant either, so counting them was only ever a way to reject a call we
     # could already answer. A sub-agent sharing this process is scoped by `doc_scope()`,
     # so its part never becomes its parent's.
+    live = {e.get("doc_id") for e in docs} if listed else set()
+    if listed:
+        # Drop claims on documents that are GONE. Engine doc_ids are a per-daemon counter and
+        # reset when the daemon restarts, so a claim kept past its document's close would
+        # eventually match a PEER's freshly minted "doc-cpp00000001" and hand the adopt below
+        # exactly the false positive it exists to prevent. Reconciling against what is open
+        # keeps the claim set as short-lived as the documents themselves.
+        _PROCESS_DOCS.intersection_update(live)
     d = _resolve_alias(_CUR["doc_id"]) if _CUR["doc_id"] else None
-    if d and listed and d not in {e.get("doc_id") for e in docs}:
+    if d and listed and d not in live:
         # Our part is gone — closed in the app, or reaped by doc-GC. Holding the dead
         # handle only defers the failure to a confusing "no such document"; drop it and
         # resolve from what is actually open.
         _CUR["doc_id"] = None
         d = None
     if d:
+        claim_process_doc(d)
         return d
     if len(docs) == 1:
         # Nothing claimed, one part open: adopt it, so every read/measure/edit tool acts on
         # the part the user is actually looking at instead of demanding a redundant
-        # new_part().
+        # new_part() — UNLESS that part is another AI client's own working document.
+        #
+        # `docs` is the ENGINE-GLOBAL listing, shared by every client attached to this
+        # chudware-hostd, not a per-caller view. So "exactly one document open" is equally
+        # what a fresh cowork swarm member sees the instant a PEER created its first part,
+        # and adopting there silently redirected this caller's reads — and its WRITES — into
+        # the peer's part. The window closes once a second doc opens (`_ambiguous()` below),
+        # which is exactly why it bit the first tool call of every new swarm member.
+        if not _sole_doc_is_adoptable(docs[0]):
+            raise _foreign_sole_doc(docs[0])
         _CUR["doc_id"] = docs[0]["doc_id"]
+        claim_process_doc(_CUR["doc_id"])
         return _resolve_alias(_CUR["doc_id"])
     if docs:
         raise _ambiguous()
@@ -1516,6 +1622,7 @@ def note_touched_doc(doc_id: Optional[str]) -> None:
     A list, not a set: order is the order the run built them, which is the order the
     sweep reports and the order a human reads. Cheap — a turn touches a handful.
     """
+    claim_process_doc(doc_id)   # creating/resuming a doc is also a cross-process claim on it
     if doc_id and doc_id not in _TOUCHED_DOCS:
         _TOUCHED_DOCS.append(doc_id)
 

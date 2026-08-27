@@ -307,13 +307,51 @@ static std::string attachmentBaseName(const std::string& p) {
     return cut == std::string::npos ? p : p.substr(cut + 1);
 }
 
+// Inline cap shared by BOTH delivery routes below (verbatim text file / extracted document
+// text). One cap, one place: if the two routes were bounded differently one of them would
+// quietly become the exception nobody remembers.
+static constexpr size_t kAttachInlineCap = 64 * 1024;
+
+// True for a byte string that is well-formed UTF-8. Load-bearing, not pedantry: everything
+// inlined below ends up inside a JSON string, and nlohmann::json::dump() THROWS
+// (type_error.316) on an invalid byte. That throw happens on the RPC path, well away from
+// here, and takes the whole send with it — so a file we cannot represent has to be refused at
+// the door and reported, not smuggled through.
+static bool isValidUtf8(const std::string& s) {
+    const unsigned char* p = (const unsigned char*)s.data();
+    const size_t n = s.size();
+    for (size_t i = 0; i < n;) {
+        const unsigned char c = p[i];
+        size_t extra = 0;
+        unsigned int cp = 0;
+        if (c < 0x80) { ++i; continue; }
+        else if ((c & 0xE0) == 0xC0) { extra = 1; cp = c & 0x1Fu; }
+        else if ((c & 0xF0) == 0xE0) { extra = 2; cp = c & 0x0Fu; }
+        else if ((c & 0xF8) == 0xF0) { extra = 3; cp = c & 0x07u; }
+        else return false;                                  // continuation byte / 0xF8+
+        if (i + extra >= n) return false;                   // sequence runs off the end
+        for (size_t k = 1; k <= extra; ++k) {
+            const unsigned char cc = p[i + k];
+            if ((cc & 0xC0) != 0x80) return false;
+            cp = (cp << 6) | (cc & 0x3Fu);
+        }
+        if (extra == 1 && cp < 0x80) return false;          // overlong
+        if (extra == 2 && cp < 0x800) return false;
+        if (extra == 3 && cp < 0x10000) return false;
+        if (cp > 0x10FFFF) return false;
+        if (cp >= 0xD800 && cp <= 0xDFFF) return false;     // surrogate half
+        i += extra + 1;
+    }
+    return true;
+}
+
 // Read a reasonably-sized TEXT file for inline injection into the request. Returns false for
-// binary or large files — those ride as path-only attachments (no fabricated previews).
+// large files, binary files, and text we cannot put in a JSON string. Documents that have a
+// real extractor are refused outright — see isBinaryDocument below.
 static bool readAttachmentText(const std::string& path, std::string& out) {
-    constexpr uintmax_t kMaxInline = 64 * 1024;   // inline cap: keep the prompt sane
     std::error_code ec;
     const uintmax_t sz = std::filesystem::file_size(path, ec);
-    if (ec || sz == 0 || sz > kMaxInline) return false;
+    if (ec || sz == 0 || sz > (uintmax_t)kAttachInlineCap) return false;
     std::ifstream f(path, std::ios::binary);
     if (!f) return false;
     std::ostringstream ss;
@@ -325,22 +363,310 @@ static bool readAttachmentText(const std::string& path, std::string& out) {
         if (c < 9 || (c > 13 && c < 32)) ++ctrl;     // odd control chars
     }
     if (ctrl * 10 > data.size()) return false;       // >10% control bytes => binary
+    if (!isValidUtf8(data)) return false;            // cannot be carried in the JSON payload
     out = std::move(data);
     return true;
 }
 
-// Consume st.pendingAttachments into (a) an augmented request string — the text the model
-// actually receives: small text files inlined verbatim, everything else as an explicit path —
-// and (b) the structured "attachments" array carried in the RPC payload, where every entry now
-// declares its "kind" ("image"|"file") and, for images, its "mime".
+// ---- attached DOCUMENTS: actually read them ---------------------------------------------------
+// readAttachmentText cannot read a document, so a PDF/DOCX/PPTX/XLSX used to ride as
+// "path only; content not inlined": the user saw a chip that looked fully handled while the
+// model was handed a filename and nothing else, and the document was read only if the agent
+// independently decided to call a document tool on that exact path. CAD already ships the
+// reader — the FROZEN `office_extract` worker RPC (contracts/office.md §2), the same one the
+// AI-tab documents panel uses. This wires it to the attach path.
 //
-// The two kinds are delivered by DIFFERENT routes, and both are real:
+// Extraction runs at ATTACH time, never at send time. consumeAttachments() below is
+// call-and-clear: it empties st.pendingAttachments as a side effect of building the payload, so
+// a worker round-trip in there could consume-and-clear before a send that then fails, losing
+// the user's attachments with no re-add path. Attaching is also when the user is looking at the
+// chip, which is when feedback is worth anything.
+// Every non-image attachment gets one of these, not just documents: the "chip looks handled
+// while the content was dropped" failure is the same failure for a Latin-1 .txt as for a PDF,
+// and one classification per file is also what stops the sniffing read from re-running every
+// frame the chip is on screen.
+enum class AttachState {
+    PlainText,    // small, textual, JSON-safe: consumeAttachments inlines it verbatim
+    PathOnly,     // no extractor for this kind and not inlinable as text
+    Running,      // office_extract in flight
+    Ready,        // text in hand (possibly empty — a scanned PDF has none)
+    Failed,       // per-file failure (bad/encrypted file, missing engine)
+    Unavailable,  // this worker has no office_extract at all
+};
+struct AttachInfo {
+    AttachState state = AttachState::Running;
+    std::string text;         // already capped at kAttachInlineCap, on a UTF-8 boundary
+    size_t      rawBytes = 0; // extractor's FULL text size, before the cap
+    bool        truncated = false;
+    std::string err;          // reason[: hint] for Failed
+};
+// Keyed by ABSOLUTE PATH, never by chip index: the chip row erases st.pendingAttachments
+// BY INDEX on detach, so an index key would silently re-point one file's extract at another
+// file's chip. The path key is also why there is no parallel vector here to desync.
+static std::unordered_map<std::string, AttachInfo> g_attachInfo;
+
+static const AttachInfo* attachInfoFor(const std::string& path) {
+    auto it = g_attachInfo.find(path);
+    return it == g_attachInfo.end() ? nullptr : &it->second;
+}
+
+// Drop entries for files that are no longer attached (detach, a send that consumed the chips,
+// a conversation switch that cleared them). Keeps the cache the size of the chip row instead of
+// the size of the session. An in-flight callback whose slot is gone simply does nothing.
+static void pruneAttachInfo(const AppState& st) {
+    for (auto it = g_attachInfo.begin(); it != g_attachInfo.end();) {
+        const bool attached = std::find(st.pendingAttachments.begin(),
+                                        st.pendingAttachments.end(),
+                                        it->first) != st.pendingAttachments.end();
+        if (attached) ++it;
+        else it = g_attachInfo.erase(it);
+    }
+}
+
+// Lowercase extension, or "" when the path has none.
+static std::string attachmentExt(const std::string& path) {
+    const size_t dot = path.find_last_of('.');
+    if (dot == std::string::npos) return {};
+    const size_t slash = path.find_last_of("\\/");
+    if (slash != std::string::npos && dot < slash) return {};   // dot in a directory name
+    std::string ext = path.substr(dot + 1);
+    for (char& c : ext) c = (char)std::tolower((unsigned char)c);
+    return ext;
+}
+
+// Extensions office_extract handles (contracts/office.md §2 / services/mcp/office_tools.py).
+static bool isExtractableDocument(const std::string& path) {
+    static const char* const kExts[] = {"pdf",  "docx", "doc",  "odt", "pptx", "ppt",
+                                        "odp",  "xlsx", "xlsm", "xls", "ods",  "csv"};
+    const std::string ext = attachmentExt(path);
+    if (ext.empty()) return false;
+    for (const char* e : kExts)
+        if (ext == e) return true;
+    return false;
+}
+
+// A document whose bytes are NOT text and must never reach readAttachmentText. Its sniffer is
+// heuristic, and a small PDF slips through it: no NUL byte, few control bytes, so a 1.6 KB
+// reportlab PDF was inlined as "text" — dumping the raw PDF header into the prompt AND, since
+// those bytes are not valid UTF-8, throwing type_error.316 out of json::dump() on the RPC
+// thread mid-send. Extension beats sniffing here: every one of these has a real extractor, so
+// there is no case where reading the raw bytes is the better answer. .csv is the lone member
+// of the extractable set that genuinely IS text, and keeps the verbatim path.
+static bool isBinaryDocument(const std::string& path) {
+    return isExtractableDocument(path) && attachmentExt(path) != "csv";
+}
+
+static std::string extractSizeLabel(size_t n) {
+    char buf[48];
+    if (n >= 1024) std::snprintf(buf, sizeof(buf), "%.0f KB", (double)n / 1024.0);
+    else           std::snprintf(buf, sizeof(buf), "%zu B", n);
+    return buf;
+}
+
+// Store an extract under the inline cap, marking the cut EXPLICITLY. Never silently truncate:
+// a model handed 64 KB of a 900 KB spec with no marker answers as if it read the whole thing.
+static void capExtract(AttachInfo& d, std::string text) {
+    d.rawBytes = text.size();
+    if (text.size() > kAttachInlineCap) {
+        text.resize(kAttachInlineCap);
+        // Back off to a UTF-8 boundary. A cut mid-sequence leaves invalid UTF-8 and
+        // nlohmann::json::dump() THROWS on that — it would take the whole send down.
+        while (!text.empty() && ((unsigned char)text.back() & 0xC0) == 0x80) text.pop_back();
+        if (!text.empty() && ((unsigned char)text.back() & 0x80)) text.pop_back();
+        d.truncated = true;
+    }
+    d.text = std::move(text);
+}
+
+// Permanently-absent RPC (older worker, method not registered) vs a per-file failure — the
+// same distinction the AI-tab documents panel draws for this exact method.
+static bool officeExtractAbsent(const core::RpcResult& r) {
+    if (!r.ok)
+        return r.err.find("unknown") != std::string::npos ||
+               r.err.find("method") != std::string::npos ||
+               r.err.find("not found") != std::string::npos ||
+               r.err.find("not_found") != std::string::npos;
+    if (!r.result.is_object()) return false;
+    const std::string code = r.result.value("code", std::string());
+    const std::string reason =
+        r.result.value("ok", true) ? std::string() : r.result.value("reason", std::string());
+    for (const std::string& s : {code, reason}) {
+        if (s.empty()) continue;
+        if (s == "method_not_found" || s == "unknown_method" || s == "not_implemented" ||
+            s.find("unknown") != std::string::npos)
+            return true;
+    }
+    return false;
+}
+
+// Decide, once per attached file, how its CONTENT will reach the model, and start the document
+// read if that is the answer. Idempotent and cheap enough to call every frame for every chip,
+// which is the point: EVERY attach route funnels through here — the paperclip, a draft restored
+// by conversations.cpp, anything added later — so exactly one place decides a file's story, and
+// the sniffing read happens once instead of once per frame.
+static void ensureAttachmentContent(AppState& st, const std::string& path) {
+    if (ui::isImageAttachment(path)) return;   // images ride structurally, not as text
+    if (g_attachInfo.count(path)) return;      // already classified, running, or settled
+    if (!isBinaryDocument(path)) {
+        std::string verbatim;
+        if (readAttachmentText(path, verbatim)) {  // small, textual, JSON-safe: verbatim wins
+            AttachInfo& d = g_attachInfo[path];
+            d.state    = AttachState::PlainText;
+            d.rawBytes = verbatim.size();
+            d.text     = std::move(verbatim);      // kept so the send does not re-read the file
+            return;
+        }
+        if (!isExtractableDocument(path)) {     // nothing can turn this into text
+            g_attachInfo[path].state = AttachState::PathOnly;
+            return;
+        }
+    }
+    if (!st.workerStarted) return;              // no document service yet — retried next frame
+    g_attachInfo[path].state = AttachState::Running;
+    // Async by design: a 900-page PDF must not park the GL thread. AsyncRpc runs this callback
+    // inside st.rpc.drain() on the GL thread, so touching g_attachInfo here is safe.
+    st.rpc.call("office_extract", nlohmann::json{{"path", path}},
+                [path](const core::RpcResult& r) {
+        auto it = g_attachInfo.find(path);
+        if (it == g_attachInfo.end()) return;   // detached (and pruned) mid-flight
+        AttachInfo& d = it->second;
+        if (officeExtractAbsent(r)) { d.state = AttachState::Unavailable; return; }
+        if (!r.ok) {
+            d.state = AttachState::Failed;
+            d.err = r.err.empty() ? "the document service did not respond" : r.err;
+            return;
+        }
+        if (!r.result.is_object() || !r.result.value("ok", true)) {
+            d.state = AttachState::Failed;
+            d.err = r.result.is_object() ? r.result.value("reason", std::string())
+                                         : std::string();
+            if (d.err.empty()) d.err = "extraction failed";
+            const std::string hint =
+                r.result.is_object() ? r.result.value("hint", std::string()) : std::string();
+            if (!hint.empty()) d.err += ": " + hint;
+            return;
+        }
+        d.state = AttachState::Ready;
+        capExtract(d, r.result.value("text", std::string()));
+    });
+}
+
+// The bracket header the model sees above an inlined extract.
+static std::string extractHeadline(const AttachInfo& d) {
+    std::string h = "extracted text, " + extractSizeLabel(d.text.size());
+    if (d.truncated)
+        h += " of " + extractSizeLabel(d.rawBytes) +
+             " \xE2\x80\x94 TRUNCATED at the 64 KB inline cap; the remainder is NOT below, read "
+             "the path above with a document tool if you need it";
+    return h;
+}
+
+// Why this file rides as a path. Stated in the request text itself, because "the content was
+// dropped and nobody said so" is the bug being fixed — not something to relocate.
+static std::string pathOnlyNote(const AttachInfo* d) {
+    if (!d) return "path only; content not inlined";
+    switch (d->state) {
+        case AttachState::Running:
+            return "path only \xE2\x80\x94 text extraction was still running when this message "
+                   "was sent; read it with a document tool";
+        case AttachState::Ready:
+            return "path only \xE2\x80\x94 the extractor found no text in this document "
+                   "(scanned or image-only?)";
+        case AttachState::Failed:
+            return "path only \xE2\x80\x94 text extraction failed: " + d->err;
+        case AttachState::Unavailable:
+            return "path only \xE2\x80\x94 no document text extractor in this runtime";
+        case AttachState::PathOnly:
+            return "path only \xE2\x80\x94 not text we can inline (binary, over the 64 KB cap, "
+                   "or not UTF-8); open it from the path if you need it";
+        case AttachState::PlainText:
+            break;
+    }
+    return "path only; content not inlined";
+}
+
+// Short chip badge naming what ACTUALLY happened to this file's text. Empty = nothing worth
+// saying. A chip that reads as "handled" while the content was dropped is exactly the defect,
+// so this is the visible half of the fix, not decoration.
+static std::string attachChipBadge(const AppState& st, const std::string& path,
+                                   const AttachInfo* d) {
+    if (!d)
+        return (isExtractableDocument(path) && !st.workerStarted) ? "queued" : std::string();
+    switch (d->state) {
+        case AttachState::PlainText:   return {};
+        case AttachState::PathOnly:    return {};   // no badge: this is the normal, expected case
+        case AttachState::Running:     return "extracting\xE2\x80\xA6";
+        case AttachState::Ready:
+            if (d->text.empty()) return "no text found";
+            return extractSizeLabel(d->text.size()) +
+                   (d->truncated ? " text, clipped" : " text");
+        case AttachState::Failed:      return "not extracted";
+        case AttachState::Unavailable: return "no extractor";
+    }
+    return {};
+}
+
+static std::string attachChipTooltip(const AppState& st, const std::string& path,
+                                     const AttachInfo* d) {
+    std::string t = path + "\n";
+    if (!d) {
+        if (isExtractableDocument(path) && !st.workerStarted)
+            return t + "Attached. Waiting for the document service to start before its text "
+                       "can be extracted \xE2\x80\x94 sent now it rides as a path only, and "
+                       "the message says so.";
+        return t + "Attached \xE2\x80\x94 rides your next message.";
+    }
+    switch (d->state) {
+        case AttachState::PlainText:
+            return t + "Attached \xE2\x80\x94 the file's text is inlined into your message.";
+        case AttachState::PathOnly:
+            return t + "Attached by PATH only \xE2\x80\x94 its bytes are not text we can inline "
+                       "(binary, over the 64 KB cap, or not UTF-8), so the model gets the path "
+                       "and opens the file itself.";
+        case AttachState::Running:
+            return t + "Reading the document (office_extract)\xE2\x80\xA6 Send before it "
+                       "finishes and it rides as a path only \xE2\x80\x94 the message says so.";
+        case AttachState::Ready:
+            if (d->text.empty())
+                return t + "The extractor found no text in this document (scanned or "
+                           "image-only?). It rides as a path only.";
+            t += "Extracted " + extractSizeLabel(d->text.size()) + " of text";
+            if (d->truncated)
+                t += ", CLIPPED from " + extractSizeLabel(d->rawBytes) +
+                     " at the 64 KB inline cap. Your message says so and names the path, so "
+                     "the agent can read the rest.";
+            else
+                t += ", inlined into your message.";
+            return t;
+        case AttachState::Failed:
+            return t + "Text extraction failed: " + (d->err.empty() ? "unknown reason" : d->err) +
+                   "\nIt rides as a path only \xE2\x80\x94 your message says so.";
+        case AttachState::Unavailable:
+            return t + "No document text extractor in this runtime. It rides as a path only "
+                       "\xE2\x80\x94 your message says so.";
+    }
+    return t;
+}
+
+// Consume st.pendingAttachments into (a) an augmented request string — the text the model
+// actually receives: text files inlined verbatim, documents inlined as their extract,
+// everything else as an explicit path WITH the reason its content is absent — and (b) the
+// structured "attachments" array carried in the RPC payload, where every entry now declares
+// its "kind" ("image"|"file") and, for images, its "mime".
+//
+// The kinds are delivered by DIFFERENT routes, and all of them are real:
 //   TEXT files  — the inline injection below is what actually delivers their content, because
 //                 the request text is all a text-only model ever sees.
+//   DOCUMENTS   — likewise inlined, from the extract office_extract produced at attach time
+//                 (ensureAttachmentContent above). Never extracted here: this function clears
+//                 the attachments as it runs and must not depend on a round-trip.
 //   IMAGES      — ride STRUCTURALLY: the kind/mime entry is forwarded through the core to the
 //                 Python worker, which turns it into a provider image part for the vision model.
 //                 The request text only gets a short marker naming the file, so a text-only
 //                 model still knows an image was attached rather than silently missing it.
+//
+// Both inline routes read from the AttachInfo the classifier already filled, so the bytes sent
+// are the bytes the chip described — and the file is read once per attach, not once per send.
 static nlohmann::json consumeAttachments(AppState& st, std::string& requestText) {
     nlohmann::json atts = nlohmann::json::array();
     if (st.pendingAttachments.empty()) return atts;
@@ -358,16 +684,34 @@ static nlohmann::json consumeAttachments(AppState& st, std::string& requestText)
             continue;
         }
         a["kind"] = "file";
-        std::string content;
-        if (readAttachmentText(path, content)) {
+        const AttachInfo* info = attachInfoFor(path);
+        std::string fallback;
+        if (!info && !isBinaryDocument(path) && readAttachmentText(path, fallback)) {
+            // No classification yet — a send path that never drew a chip. Read it here rather
+            // than drop a text file's content over a missing reconcile tick.
             a["inline"] = true;
             requestText += "\n\n[Attached file: " + base + " (" + path +
-                           ")]\n```\n" + content;
-            if (content.empty() || content.back() != '\n') requestText += "\n";
+                           ")]\n```\n" + fallback;
+            if (fallback.empty() || fallback.back() != '\n') requestText += "\n";
+            requestText += "```";
+        } else if (info && info->state == AttachState::PlainText) {
+            a["inline"] = true;
+            requestText += "\n\n[Attached file: " + base + " (" + path +
+                           ")]\n```\n" + info->text;
+            if (info->text.empty() || info->text.back() != '\n') requestText += "\n";
+            requestText += "```";
+        } else if (info && info->state == AttachState::Ready && !info->text.empty()) {
+            a["inline"]            = true;
+            a["extracted"]         = true;
+            a["extract_chars"]     = (uint64_t)info->text.size();
+            a["extract_truncated"] = info->truncated;
+            requestText += "\n\n[Attached document: " + base + " (" + path + ") \xE2\x80\x94 " +
+                           extractHeadline(*info) + "]\n```\n" + info->text;
+            if (info->text.back() != '\n') requestText += "\n";
             requestText += "```";
         } else {
             a["inline"] = false;
-            requestText += "\n\n[Attached file (path only; content not inlined): " + path + "]";
+            requestText += "\n\n[Attached file (" + pathOnlyNote(info) + "): " + path + "]";
         }
         atts.push_back(std::move(a));
     }
@@ -3335,12 +3679,17 @@ static void drawComposerToolbar(AppState& st, bool busy, bool embedded = false) 
                               p) == st.pendingAttachments.end()) {
                     st.pendingAttachments.push_back(p);
                     savePromptDraft(st, /*force=*/true);
+                    // Start reading a document NOW rather than at send time: see
+                    // ensureAttachmentContent. (The chip loop also reconciles every frame,
+                    // which is what covers drafts restored from disk.)
+                    ensureAttachmentContent(st, p);
                 }
             }
         }
         if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("Attach a file — it rides your next message (small text "
-                              "files are inlined; other files are passed by path).");
+            ImGui::SetTooltip("Attach a file — it rides your next message (text files are "
+                              "inlined; PDF/Word/Excel/PowerPoint are read to text and "
+                              "inlined; anything else is passed by path).");
         {
             ImDrawList* adl = ImGui::GetWindowDrawList();
             const ImVec2 amn = ImGui::GetItemRectMin(), amx = ImGui::GetItemRectMax();
@@ -3956,6 +4305,11 @@ void drawComposer(AppState& st, bool busy, bool canRun) {
         ImGui::PopStyleColor();
     }
 
+    // One prune per frame, ahead of the chip row: drops document extracts whose file is no
+    // longer attached, whichever path removed it (the detach ×, a send that consumed the
+    // chips, a conversation switch that cleared them). Cheap — the chip row is a handful.
+    pruneAttachInfo(st);
+
     // ---- chips above the input: file attachments (M23) + context refs (Wave4) ----
     if (!st.pendingAttachments.empty() || !st.pendingContextRefs.empty()) {
         const ui::AdaptiveSurface& asurf = chatSurf();
@@ -3996,6 +4350,8 @@ void drawComposer(AppState& st, bool busy, bool canRun) {
         const ImU32 chipEdgeCol = ImGui::ColorConvertFloat4ToU32(
             ImVec4(asurf.textPrimary.x, asurf.textPrimary.y, asurf.textPrimary.z, 0.35f));
         const ImU32 chipInkCol  = ImGui::ColorConvertFloat4ToU32(asurf.textPrimary);
+        const ImU32 chipDimCol  = ImGui::ColorConvertFloat4ToU32(
+            ImVec4(asurf.textPrimary.x, asurf.textPrimary.y, asurf.textPrimary.z, 0.55f));
         const float chipPadX = 6 * sc, chipPadY = 3 * sc;
 
         for (size_t ai = 0; ai < st.pendingAttachments.size(); ++ai) {
@@ -4007,11 +4363,24 @@ void drawComposer(AppState& st, bool busy, bool canRun) {
             const float lineH   = ImGui::GetTextLineHeight();
             const float thumbSz = lineH * 2.0f;            // about two text lines tall
             const float rowH    = isImg ? thumbSz : lineH;
+            // Reconcile every frame, not only on attach: this is what picks up a draft
+            // restored by conversations.cpp (which has no hook into the composer) and a
+            // document attached before the worker was up. Idempotent by design.
+            if (!isImg) ensureAttachmentContent(st, apath);
+            const AttachInfo* ainfo = isImg ? nullptr : attachInfoFor(apath);
+            // The badge is load-bearing, not decoration: without it a document whose text was
+            // dropped looks exactly like one that was read.
+            const std::string badge = attachChipBadge(st, apath, ainfo);
+            const std::string badgeText =
+                badge.empty() ? std::string() : "  \xC2\xB7  " + badge;
             const float nameW   = ImGui::CalcTextSize(name.c_str()).x;
+            const float badgeW  = badgeText.empty()
+                                      ? 0.0f : ImGui::CalcTextSize(badgeText.c_str()).x;
+            const float labelW  = nameW + badgeW;
             const float xBtnW   = ImGui::CalcTextSize("\xC3\x97").x +
                                   ImGui::GetStyle().FramePadding.x * 2.0f;
             const float chipW   = chipPadX * 2.0f + (isImg ? thumbSz + 4 * sc : 0.0f) +
-                                  nameW + 6 * sc + xBtnW;
+                                  labelW + 6 * sc + xBtnW;
             placeChip(chipW, 14 * sc);   // wider gap than the ref chips: these fills are inflated
 
             bool view = false, detach = false;
@@ -4030,12 +4399,15 @@ void drawComposer(AppState& st, bool busy, bool canRun) {
             }
             // The name is an InvisibleButton + hand-drawn text rather than a Text item so it
             // hit-tests reliably while the composer input holds ImGui's active id.
-            ImGui::InvisibleButton("##attname", ImVec2(nameW, rowH));
+            ImGui::InvisibleButton("##attname", ImVec2(labelW, rowH));
             const bool nameClicked = ImGui::IsItemClicked();
             const bool nameHovered = ImGui::IsItemHovered();
             const ImVec2 nameMin = ImGui::GetItemRectMin();
             chipDl->AddText(ImVec2(nameMin.x, nameMin.y + (rowH - lineH) * 0.5f),
                             chipInkCol, name.c_str());
+            if (!badgeText.empty())
+                chipDl->AddText(ImVec2(nameMin.x + nameW, nameMin.y + (rowH - lineH) * 0.5f),
+                                chipDimCol, badgeText.c_str());
             if (isImg) {
                 if (nameClicked) view = true;
                 if (nameHovered) {
@@ -4043,9 +4415,9 @@ void drawComposer(AppState& st, bool busy, bool canRun) {
                     ImGui::SetTooltip("%s\nClick to view.", apath.c_str());
                 }
             } else if (nameHovered) {
-                // Deliberately inert: detaching is the × alone.
-                ImGui::SetTooltip("%s\nAttached \xE2\x80\x94 rides your next message.",
-                                  apath.c_str());
+                // Deliberately inert: detaching is the × alone. The tooltip is where the
+                // full truth about this file's content lives.
+                ImGui::SetTooltip("%s", attachChipTooltip(st, apath, ainfo).c_str());
             }
             ImGui::SameLine(0, 6 * sc);
             ImGui::SetCursorPosY(rowTop + (rowH - lineH) * 0.5f);

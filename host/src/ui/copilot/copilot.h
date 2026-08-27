@@ -36,19 +36,16 @@ namespace ui {
 void drawAIPanel(AppState& state, bool busy, bool canRun);
 
 // Shared AI settings fields (provider/model/auth, generation). Rendered by the Settings modal's
-// AI tab as glass-grouped sections. Privacy (offline mode) + assistant-thoughts live in the AI
-// Harness "Session knobs" grid now, and per-model visibility moved to Settings -> Providers
+// Providers tab as glass-grouped sections — one call per section, each inside its own glass
+// card, so the caller owns the headers. Privacy (offline mode) + assistant-thoughts live in the
+// AI Harness "Session knobs" grid now, and per-model visibility moved to Settings -> Providers
 // (per-provider model checkboxes) — so neither is a shared section anymore.
 // Returns true if a setting changed this frame (caller may persist).
 enum class AiSettingsSection {
     ProviderModel = 0,  // provider, model, sign-in / API key + status, vision
     Generation,         // reasoning effort, max response tokens, context window
-    All,                // full form (Provider + Generation)
 };
 bool drawAiSettingsSection(AppState& state, bool busy, AiSettingsSection section);
-
-// Full form: Provider + Generation. (Single-call convenience; slim is a legacy no-op flag.)
-bool drawProviderModelPicker(AppState& state, bool busy, bool slim = false);
 
 // Free AI (FreeLLMAPI) provider card — always reachable from Settings -> Providers regardless
 // of OMP bridge availability (that tab is otherwise entirely bridge-catalog driven and has no
@@ -90,6 +87,11 @@ struct BridgeModelMeta {
     std::vector<std::string> reasoningEfforts;  // OMP catalog effort ladder; empty = no dial
     int contextWindow = 0;   // tokens; 0 = unknown
     int maxTokens = 0;       // max output tokens; 0 = unknown
+    // `priced` is the bridge's pricing PROVENANCE flag (models_list "priced"): true only when
+    // the OMP catalog carries a real non-zero price. `hasCost` merely means the row had a cost
+    // object at all — which is always, even when every field is zero. So !priced means "no
+    // price data", NOT "free": never render a dollar figure derived from an unpriced row.
+    bool priced = false;
     bool hasCost = false;
     double costIn = 0, costOut = 0, costCacheRead = 0, costCacheWrite = 0;  // $/Mtok
     // Release/lifecycle metadata (populated by refreshBridgeModelCatalog from the model id/name;
@@ -109,13 +111,22 @@ const BridgeModelMeta* bridgeModelMeta(const std::string& providerId, const std:
 // the OMP provider id, then find the model; falls back to a global id match. nullptr = absent.
 const BridgeModelMeta* bridgeModelMetaForCad(int cadProvider, const std::string& modelId,
                                              const char* cloudBaseUrl);
+// True for OMP provider ids that are genuinely-local runtimes CAD talks to unauthenticated
+// (the bridge's KEYLESS_PROVIDERS set): their catalog rows carry no price because inference on
+// your own hardware really is $0, so "free" is the honest label there. Exact id match — the
+// hosted "ollama-cloud" subscription is NOT in this set. Everywhere else an absent price means
+// "no price data", and no dollar figure may be derived from it.
+bool bridgeProviderIsLocalFree(const std::string& providerId);
 // OMP model-browser.ts display formats: "ctx 200k \xc2\xb7 $3/$15 \xc2\xb7 tools vision" row
-// sublabel, and the cache-pricing detail line for tooltips.
+// sublabel, and the cache-pricing detail line for tooltips. Unpriced non-local rows render
+// "no price data" rather than a fabricated "free".
 std::string bridgeModelSublabel(const BridgeModelMeta& m);
 std::string bridgeModelCostDetail(const BridgeModelMeta& m);
 // Per-session cost strip (agent_cost_summary, a pure $/Mtok calculator fed with the session's
 // completed-turn token events): "Session $1.87 \xc2\xb7 142k tok" + click popover with the
-// per-model breakdown. Hidden while the bridge method is unavailable. Emits into the CURRENT
+// per-model breakdown. When some model that spent tokens has no catalog price the total is
+// shown as a floor ("Session \xe2\x89\xa5 $1.87 \xc2\xb7 3 of 4 models priced") instead of a
+// complete figure. Hidden while the bridge method is unavailable. Emits into the CURRENT
 // window; drawn by the composer model dropdown footer and the Settings->Providers footer.
 void drawSessionCostStrip(AppState& state);
 

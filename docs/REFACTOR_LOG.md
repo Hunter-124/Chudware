@@ -8482,3 +8482,85 @@ schematic build loop need ~22 tools. `board_from_schematic` is reachable only th
 the PCB half of the ECAD pipeline is unreachable. That needs a deliberate role split
 (schematic vs PCB), not more seats. (2) `test_prohibited_auth::test_no_consumer_oauth_token_reuse`
 remains a deliberate open product decision. (3) The shared budget helper's home, above.
+
+## 2026-08-27 — OMP fork: port what applied, and close the cowork-mode document gap
+
+Audited Hunter's oh-my-pi fork (`Hunter-124/oh-my-pi`, 10 branches, checkout at
+`~/Repositories/omp-inspection/oh-my-pi`) against CAD and ported what actually applies.
+Its `REQUIREMENTS.md` is the binding mission statement and names CAD as a consumer;
+its clauses (transparency over cleverness, failure local not machine-wide, fewer
+better defaults without removing capability) drove every fix below.
+
+**Vendored (commit `34354df3`).** `cad/oauth-fix-on-vendored-base` is cherry-picked onto
+CAD's exact pin, so adopting it was a no-version-jump change. CAD genuinely serves that
+page (`callback-server.ts:14` imports `oauth.html` as text; Anthropic/Codex/Google/Devin/
+GitLab-Duo/Z.ai all terminate there), and its `window.close()` is a no-op for a tab the
+script did not open, so the button was dead AND the promised auto-close never fired.
+Also fixed `vendor_omp.py` silently deleting `vendor/omp/bun.lock` on every re-vendor —
+the C++ core installs `node_modules` from that committed lock with `--frozen-lockfile`,
+so re-vendoring broke provider auth at the next clean build. Now preserved like `bridge/`;
+`scripts/test_vendor_omp.py` guards it (neuter-verified).
+**Deliberately NOT ported:** `feat/catalog-cursor-effort-and-release-date`. Its data lives
+in a 2 MB generated `models.json` and CAD's pinned copy has ZERO date fields, so porting
+the predicate ships dead code. Regenerating that blob is version-jump-class work.
+
+**Cost honesty.** 1646 of 3886 catalog models carry no price (`cursor`, `devin`,
+`google-gemini-cli`, `xai-oauth`, `ollama-cloud` have zero priced models; nanogpt 539).
+All were rendered as measured $0 and folded into a total whose tooltip asserted
+"OMP-observed spend". `models.ts` now emits `priced` per model plus
+`pricedModels`/`totalModels`/`unpricedModels[]` on `cost_summary`; both C++ aggregation
+sites (`settings.cpp drawSessionCostStrip`, `ai/metrics_view.cpp` — fixing one leaves the
+other lying) now show a floor with an "N of M priced" provenance, and unpriced rows read
+"no price data" rather than "free". Genuinely-local runtimes keep "free" (hosted
+`ollama-cloud` deliberately excluded).
+
+**Auth truth + failure locality.** `computeAuthState`'s `state:"error"` branch was
+structurally dead: it filtered for `disabledCause !== null` over rows from
+`listAuthCredentials`, whose SQL is hard-coded `WHERE disabled_cause IS NULL`. A revoked
+credential therefore reported `signed_out`, so users re-signed-in blindly forever, and
+`listDisabledCredentials` had zero call sites. Now reachable with cause + a removable
+`disabled[]`, with user-initiated causes excluded (Hunter's real db holds 4 rows all
+caused "deleted by user" — without that filter his panel would have shown false errors).
+Separately, a non-corrupt auth-db open failure (CANTOPEN/IOERR) cached its rejected
+promise at module scope and killed every provider RPC for the bridge's whole life; the
+memo is now cleared with a 2 s cooldown (strace: 12 calls → 2 `openat`).
+
+**Settings reachability.** The canonical Generation block (reasoning effort, max tokens,
+context window, with clamping) was doubly unreachable — the sole caller passed
+`ProviderModel`, and that call sat inside `if (!s_omp.available)`. Reasoning effort had no
+Settings control at all while the search index offered an entry that went nowhere. Now a
+Generation card on Providers, search entries retargeted, dead `drawProviderModelPicker`
+and the `All` enum value removed, and the degrade-path call now persists its edits (it
+discarded the save-me return).
+
+**Cowork mode** (external MCP client driving CAD). `save_touched_docs()` — the only thing
+that turns an AI-created part into a real file — was wired ONLY into the two internal
+turn boundaries, so an external client's work was never durably saved, and the orphan
+watchdog's `os._exit(0)` skipped even atexit. `server.py` now has a bounded terminal sweep
+on EOF/signal/atexit and the watchdog saves before its hard exit. `task_list` is now on the
+shared registry; the design ledger moved into `lite` (the profile the installer recommends
+for exactly the long external sessions that need it). `_doc()` no longer adopts a sole
+engine-global document minted by another AI client (`doc_list` exposes only `origin_kind`,
+no client id — that is the finest distinction the wire allows today), with legacy mode
+gated unconditionally so single-client callers never regress.
+
+**Left deliberately.** `delegate` stays OUT of the shared registry. It reads as a parity
+gap, but two tests pin it as a mission-scoped pseudo-tool so `_unresolved_tool_error` can
+name mission scope precisely — both written after a live incident where a fabricated cause
+sent an engineer to the wrong subsystem. Real external delegation needs an external-facing
+mission entry point binding a run_id + ledger + tree, which is design work, not a
+registration line. Also open: composer folder-attach, `agent.model_assignment` has no GUI
+consumer so Auto-mode roles never show their resolved model, and no basic/advanced
+settings split yet.
+
+**Also found en route:** a small PDF passed the composer's binary sniff, so its raw bytes
+were inlined and invalid UTF-8 crashed `json::dump()` mid-send (`type_error.316`) — attached
+documents now route through the existing `office_extract` RPC instead; and
+`setup_mcp_clients.py --detect/--wizard` died with `NameError` on every run (two regex
+globals that exist nowhere), i.e. the script the README tells users to run to register CAD
+with Claude Code was broken.
+
+Baseline unchanged: `services/agent`+`services/dag` 3809 pass / 2 pre-existing fail;
+`services/mcp` 2891 pass / 1 pre-existing fail (proven at HEAD). NOTE for future runs:
+this host's `TMPDIR` is `~/.cache/tmp`, which makes `AF_UNIX` paths too long and fails two
+hostd tests that pass under `TMPDIR=/tmp`.

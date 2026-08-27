@@ -1,8 +1,8 @@
 // Copilot AI settings (T-RF6 split of legacy_chat.cpp): the shared AI settings sections
-// (provider/model/auth, generation, privacy, manage-models — ui::drawAiSettingsSection /
-// drawProviderModelPicker, consumed by the Settings modal AI tab and the in-column settings
-// overlay), the searchable model dropdown, model availability probing, and provider-usability
-// gating (providerUsable / cloud+moonshot key presence).
+// (provider/model/auth, generation, privacy, manage-models — ui::drawAiSettingsSection, called
+// once per section by the Settings modal's Providers tab), the searchable model dropdown, model
+// availability probing, and provider-usability gating (providerUsable / cloud+moonshot key
+// presence).
 
 #include "copilot_internal.h"
 
@@ -948,6 +948,16 @@ bool drawAiSettingsSection(AppState& st, bool busy, AiSettingsSection section) {
                 ImGui::SetTooltip("How much hidden reasoning the model spends before answering.\n"
                                   "Higher = better planning on hard parts, slower + more tokens.");
             ImGui::Dummy(ImVec2(0, 4 * S));
+        } else {
+            // Settings search has a "Reasoning effort" entry pointing here, and the chat toolbar
+            // has the same dial: say why the control is absent instead of showing nothing and
+            // letting the user conclude the search lied.
+            ImGui::AlignTextToFramePadding();
+            ImGui::TextUnformatted("Reasoning effort");
+            ImGui::SameLine(labelW);
+            ImGui::AlignTextToFramePadding();
+            dimText("not offered by this model");
+            ImGui::Dummy(ImVec2(0, 4 * S));
         }
 
         // Max response tokens (0 = auto). Keep label on the same row as the InputInt so a scroll
@@ -990,6 +1000,8 @@ bool drawAiSettingsSection(AppState& st, bool busy, AiSettingsSection section) {
 
     };
 
+    // Two sections, two calls: the Settings Providers tab wraps each in its own glass card and
+    // owns the header, so this switch deliberately has no "draw everything" case.
     switch (section) {
     case AiSettingsSection::ProviderModel:
         drawProviderModel();
@@ -997,20 +1009,8 @@ bool drawAiSettingsSection(AppState& st, bool busy, AiSettingsSection section) {
     case AiSettingsSection::Generation:
         drawGeneration();
         break;
-    case AiSettingsSection::All:
-        drawProviderModel();
-        ImGui::Dummy(ImVec2(0, 8 * S));
-        ImGui::SeparatorText("Generation");
-        drawGeneration();
-        break;
     }
     return changed;
-}
-
-// Full form: Provider + Generation. (Single-call convenience; slim is a legacy no-op flag.)
-bool drawProviderModelPicker(AppState& st, bool busy, bool slim) {
-    (void)slim;
-    return drawAiSettingsSection(st, busy, AiSettingsSection::All);
 }
 
 // Quick-settings helpers + overlay body (Copilot gear). Full providers/roles/prompts live in Settings.
@@ -1666,6 +1666,16 @@ void refreshBridgeModelCatalog(AppState& st, bool force) {
                 b.costCacheRead = c->value("cacheRead", 0.0);
                 b.costCacheWrite = c->value("cacheWrite", 0.0);
             }
+            // Pricing provenance: the bridge marks a row `priced` only when the catalog carries
+            // a real non-zero price. `hasCost` cannot answer that — `cost` is an object even
+            // when every field is zero, which is why an unpriced model used to render as "free".
+            // A bridge predating the field gets the bridge's own rule applied locally instead of
+            // every model silently losing its price.
+            if (m.contains("priced") && m["priced"].is_boolean())
+                b.priced = m["priced"].get<bool>();
+            else
+                b.priced = b.costIn > 0.0 || b.costOut > 0.0 ||
+                           b.costCacheRead > 0.0 || b.costCacheWrite > 0.0;
             inferReleaseDate(b.id, b.name, b.releaseDate, b.releaseSort);
             b.deprecated = isDeprecatedModelId(b.id);
             rows.push_back(std::move(b));
@@ -1720,6 +1730,14 @@ const ui::BridgeModelMeta* bridgeModelMetaForCad(int cadProvider, const std::str
     return bridgeModelMeta("", modelId);
 }
 
+bool bridgeProviderIsLocalFree(const std::string& providerId) {
+    // Mirrors the bridge's KEYLESS_PROVIDERS (auth-context.ts): runtimes serving from your own
+    // hardware, where an absent catalog price means $0 and not "unknown". Exact match on
+    // purpose — "ollama-cloud" is a paid hosted subscription whose rows carry no price either,
+    // and calling that "free" is exactly the fabrication this set exists to avoid.
+    return providerId == "ollama" || providerId == "llama-cpp" || providerId == "lm-studio";
+}
+
 std::string bridgeModelSublabel(const ui::BridgeModelMeta& m) {
     // "ctx 200k \xc2\xb7 $3/$15 \xc2\xb7 tools vision" — OMP model-browser.ts row format.
     std::string out;
@@ -1731,13 +1749,15 @@ std::string bridgeModelSublabel(const ui::BridgeModelMeta& m) {
             std::snprintf(buf, sizeof(buf), "ctx %dk", m.contextWindow / 1000);
         out = buf;
     }
-    if (m.hasCost) {
-        if (!out.empty()) out += " \xc2\xb7 ";
-        if (m.costIn == 0.0 && m.costOut == 0.0)
-            out += "free";
-        else
-            out += fmtUsd(m.costIn) + "/" + fmtUsd(m.costOut);
-    }
+    // Price, or the honest absence of one. `hasCost` is true for every catalog row, so it can
+    // only gate the FORMAT — `priced` decides whether there is a number to show at all.
+    if (!out.empty()) out += " \xc2\xb7 ";
+    if (m.priced)
+        out += fmtUsd(m.costIn) + "/" + fmtUsd(m.costOut);
+    else if (bridgeProviderIsLocalFree(m.provider))
+        out += "free";
+    else
+        out += "no price data";
     std::string caps;
     if (m.tools) caps = "tools";
     if (m.vision) caps += caps.empty() ? "vision" : " vision";
@@ -1752,10 +1772,14 @@ std::string bridgeModelSublabel(const ui::BridgeModelMeta& m) {
 std::string bridgeModelCostDetail(const ui::BridgeModelMeta& m) {
     // Tooltip line: full precision + cache pricing (OMP keeps cache cost off the row).
     std::string out;
-    if (m.hasCost) {
+    if (m.priced) {
         out = "in " + fmtUsd(m.costIn) + "/M \xc2\xb7 out " + fmtUsd(m.costOut) + "/M";
         if (m.costCacheRead > 0.0 || m.costCacheWrite > 0.0)
             out += " \xc2\xb7 cache " + fmtUsd(m.costCacheRead) + "/" + fmtUsd(m.costCacheWrite);
+    } else if (bridgeProviderIsLocalFree(m.provider)) {
+        out = "runs locally \xe2\x80\x94 no per-token charge";
+    } else {
+        out = "no price in the OMP catalog \xe2\x80\x94 spend can't be computed for this model";
     }
     if (m.maxTokens > 0) {
         char buf[24];
@@ -1774,10 +1798,18 @@ struct CostModelRow {
     std::string model;
     double usd = 0;
     int tokensIn = 0, tokensOut = 0;
+    bool priced = false;   // bridge pricing provenance: false = no catalog price, NOT free
 };
 double s_costUsd = 0;
 int s_costTin = 0, s_costTout = 0;
 std::vector<CostModelRow> s_costRows;
+// Pricing provenance of the aggregate, straight from cost_summary. These three range over the
+// models that actually MOVED tokens (pricedModels + unpricedModels.size() == totalModels), so
+// s_costUsd is a FLOOR whenever s_costUnpriced is non-empty: those models' tokens are counted
+// but add $0 to the dollars.
+int s_costPricedModels = 0;
+int s_costTotalModels = 0;
+std::vector<std::string> s_costUnpriced;   // "<provider>/<model>", displayed verbatim
 bool s_costAvailable = true;   // false after unknown_method
 bool s_costInFlight = false;
 bool s_costHasData = false;
@@ -1841,6 +1873,9 @@ void drawSessionCostStrip(AppState& st) {
                 }
             }
             s_costRows.clear();
+            s_costUnpriced.clear();
+            s_costPricedModels = 0;
+            s_costTotalModels = 0;
             const auto pm = r.result.find("perModel");
             if (pm != r.result.end() && pm->is_array()) {
                 for (const auto& row : *pm) {
@@ -1854,7 +1889,33 @@ void drawSessionCostStrip(AppState& st) {
                         cr.tokensIn = tok->value("input", 0);
                         cr.tokensOut = tok->value("output", 0);
                     }
+                    if (row.contains("priced") && row["priced"].is_boolean())
+                        cr.priced = row["priced"].get<bool>();
+                    else if (const ui::BridgeModelMeta* meta =
+                                 bridgeModelMeta(cr.provider, cr.model))
+                        cr.priced = meta->priced;   // bridge predating the field
                     s_costRows.push_back(std::move(cr));
+                }
+            }
+            // Provenance counters come from the bridge: they range over the models that actually
+            // moved tokens, which is exactly the population the strip talks about, and
+            // pricedModels + unpricedModels.size() == totalModels. A bridge predating them is
+            // reconstructed from the rows over the same population, so an old bridge degrades to
+            // the same honest answer instead of implying a complete figure.
+            const auto tm = r.result.find("totalModels");
+            if (tm != r.result.end() && tm->is_number_integer()) {
+                s_costTotalModels = tm->get<int>();
+                s_costPricedModels = r.result.value("pricedModels", 0);
+                const auto up = r.result.find("unpricedModels");
+                if (up != r.result.end() && up->is_array())
+                    for (const auto& e : *up)
+                        if (e.is_string()) s_costUnpriced.push_back(e.get<std::string>());
+            } else {
+                for (const auto& row : s_costRows) {
+                    if (row.tokensIn <= 0 && row.tokensOut <= 0) continue;
+                    ++s_costTotalModels;
+                    if (row.priced) ++s_costPricedModels;
+                    else s_costUnpriced.push_back(row.provider + "/" + row.model);
                 }
             }
             s_costHasData = true;
@@ -1862,28 +1923,62 @@ void drawSessionCostStrip(AppState& st) {
     }
     if (!s_costHasData) return;
 
-    // Compact one-liner: "Session $1.87 \xc2\xb7 142k tok". Click = per-model breakdown popover.
-    char line[96];
+    // Compact one-liner: "Session $1.87 \xc2\xb7 142k tok" when every model that spent tokens
+    // has a catalog price, and "Session >= $1.87 \xc2\xb7 142k tok \xc2\xb7 3 of 4 models priced"
+    // when some don't — their tokens are in the token total but add $0 to the dollars, so the
+    // figure is a floor. ">=" is spelled in ASCII on purpose: U+2265 is not in the font atlas
+    // (ui_theme.cpp uiGlyphRanges()) and would paint as notdef.
+    const bool incomplete = !s_costUnpriced.empty();
+    char line[192];
     const long long tokTotal = (long long)s_costTin + (long long)s_costTout;
     char tokBuf[24];
     if (tokTotal >= 1000000)
         std::snprintf(tokBuf, sizeof(tokBuf), "%.1fM tok", tokTotal / 1.0e6);
     else
         std::snprintf(tokBuf, sizeof(tokBuf), "%lldk tok", tokTotal / 1000);
-    std::snprintf(line, sizeof(line), "Session %s \xc2\xb7 %s", fmtUsd(s_costUsd).c_str(), tokBuf);
-    ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(ui::palette.textDim));
+    if (incomplete)
+        std::snprintf(line, sizeof(line),
+                      "Session >= %s \xc2\xb7 %s \xc2\xb7 %d of %d models priced",
+                      fmtUsd(s_costUsd).c_str(), tokBuf, s_costPricedModels, s_costTotalModels);
+    else
+        std::snprintf(line, sizeof(line), "Session %s \xc2\xb7 %s",
+                      fmtUsd(s_costUsd).c_str(), tokBuf);
+    ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(incomplete ? ui::palette.statusWarn
+                                                                      : ui::palette.textDim));
     ImGui::TextUnformatted(line);
     ImGui::PopStyleColor();
-    if (ImGui::IsItemHovered())
-        ImGui::SetTooltip("OMP-observed spend (catalog pricing \xc3\x97 session tokens) \xe2\x80\x94 "
-                          "not a bill. Click for the per-model breakdown.");
+    if (ImGui::IsItemHovered()) {
+        std::string tip;
+        if (incomplete) {
+            tip = "This is a FLOOR, not a bill: only " + std::to_string(s_costPricedModels) +
+                  " of " + std::to_string(s_costTotalModels) +
+                  " models that spent tokens have a price in the OMP catalog.\n"
+                  "No price data for: ";
+            const size_t kShow = 6;
+            for (size_t i = 0; i < s_costUnpriced.size() && i < kShow; ++i) {
+                if (i) tip += ", ";
+                tip += s_costUnpriced[i];
+            }
+            if (s_costUnpriced.size() > kShow)
+                tip += ", +" + std::to_string(s_costUnpriced.size() - kShow) + " more";
+            tip += ".\nTheir tokens are counted in the token total but add $0 to the dollar "
+                   "figure, so real spend is higher by an unknown amount.\n"
+                   "The priced part is catalog pricing \xc3\x97 completed-turn tokens.\n"
+                   "Click for the per-model breakdown.";
+        } else {
+            tip = "OMP-observed spend (catalog pricing \xc3\x97 session tokens) \xe2\x80\x94 not "
+                  "a bill, but every model that spent tokens here has a catalog price.\n"
+                  "Click for the per-model breakdown.";
+        }
+        ImGui::SetTooltip("%s", tip.c_str());
+    }
     if (ImGui::IsItemClicked()) ImGui::OpenPopup("##session_cost_detail");
     if (ImGui::BeginPopup("##session_cost_detail")) {
         ImGui::TextUnformatted("Session cost by model");
         ImGui::Separator();
         if (s_costRows.empty()) {
             ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(ui::palette.textDim));
-            ImGui::TextUnformatted("No priced turns yet this session.");
+            ImGui::TextUnformatted("No turns with token counts yet this session.");
             ImGui::PopStyleColor();
         }
         for (const auto& row : s_costRows) {
@@ -1894,8 +1989,25 @@ void drawSessionCostStrip(AppState& st) {
             ImGui::Text("%d in / %d out", row.tokensIn, row.tokensOut);
             ImGui::PopStyleColor();
             ImGui::SameLine(380.0f * sc);
-            ImGui::TextUnformatted(fmtUsd(row.usd).c_str());
+            // An unpriced row's usd is 0 because nothing priced it, not because it was free:
+            // print the reason where the money would go instead of a fabricated $0.0000.
+            if (row.priced) {
+                ImGui::TextUnformatted(fmtUsd(row.usd).c_str());
+            } else {
+                const bool localFree = bridgeProviderIsLocalFree(row.provider);
+                ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(
+                    localFree ? ui::palette.textDim : ui::palette.statusWarn));
+                ImGui::TextUnformatted(localFree ? "free (local)" : "no price data");
+                ImGui::PopStyleColor();
+            }
             ImGui::PopID();
+        }
+        if (incomplete) {
+            ImGui::Separator();
+            ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(ui::palette.textDim));
+            ImGui::TextUnformatted("Rows marked \"no price data\" contribute tokens but no "
+                                   "dollars \xe2\x80\x94 the session total is a floor.");
+            ImGui::PopStyleColor();
         }
         ImGui::EndPopup();
     }
@@ -2007,6 +2119,18 @@ static void seedModelDefaultsOnce(AppState& st) {
     saveSettings(st.settings);
 }
 
+// Providers whose ONLY credential is dead (bridge state "error": no active key/OAuth grant but
+// at least one revoked row on file). They are deliberately kept OUT of the usable set below —
+// every request against them fails — so the picker names them instead, or the models would just
+// vanish from the list with no reason given.
+namespace {
+struct DeadCredProvider {
+    std::string label;
+    std::string cause;
+};
+std::vector<DeadCredProvider> s_deadCredProviders;
+}  // namespace
+
 // Poll agent_provider_list so the composer knows which OMP providers are signed in WITHOUT the
 // user having opened Settings -> Providers. Fills st.signedInBridgeProviders (same set the
 // Providers panel writes) so the dropdown mirrors the Providers tab. TTL'd; degrades silently.
@@ -2024,12 +2148,27 @@ static void refreshSignedInProviders(AppState& st, bool force) {
         const auto it = r.result.find("providers");
         if (it == r.result.end() || !it->is_array()) return;
         std::set<std::string> live;
+        std::vector<DeadCredProvider> dead;
         for (const auto& p : *it) {
             if (!p.is_object()) continue;
             const std::string id = p.value("id", std::string());
             const std::string state = p.value("state", std::string());
-            if (!id.empty() && !state.empty() && state != "signed_out") live.insert(id);
+            if (id.empty()) continue;
+            // WHITELIST, not "anything but signed_out". The bridge vocabulary is
+            // signed_out|key_set|oauth_connected|error|disabled (auth-context.ts:239), and a
+            // provider that still holds a working credential alongside a revoked one reports
+            // key_set/oauth_connected — so only these two mean "requests can succeed". `error`
+            // used to be structurally unreachable; treating it as signed-in would advertise a
+            // provider whose every call is guaranteed to fail.
+            if (state == "key_set" || state == "oauth_connected") {
+                live.insert(id);
+            } else if (state == "error") {
+                std::string cause = p.value("error", std::string());
+                if (cause.empty()) cause = "credential disabled";
+                dead.push_back({p.value("label", id), std::move(cause)});
+            }
         }
+        s_deadCredProviders = std::move(dead);
         st.signedInBridgeProviders = std::move(live);
     }, 15000);
 }
@@ -2238,6 +2377,23 @@ void drawModelDropdown(AppState& st, bool busy) {
     if (st.signedInBridgeProviders.empty()) {
         ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(pal.textDim));
         ImGui::TextUnformatted("Sign in to a provider in Settings -> Providers to add models.");
+        ImGui::PopStyleColor();
+    }
+
+    // A provider whose only credential died is NOT in the usable set, so its models are absent
+    // from the list above. Say so with the bridge's own cause instead of letting the model
+    // silently disappear — the user's next move is to re-authenticate, not to keep looking.
+    if (!s_deadCredProviders.empty()) {
+        ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(pal.statusWarn));
+        const size_t kShow = 3;
+        for (size_t i = 0; i < s_deadCredProviders.size() && i < kShow; ++i)
+            ImGui::TextWrapped("%s credential is dead \xe2\x80\x94 %s. Re-authenticate in "
+                               "Settings -> Providers to get its models back.",
+                               s_deadCredProviders[i].label.c_str(),
+                               s_deadCredProviders[i].cause.c_str());
+        if (s_deadCredProviders.size() > kShow)
+            ImGui::TextWrapped("+%d more provider(s) with a dead credential.",
+                               (int)(s_deadCredProviders.size() - kShow));
         ImGui::PopStyleColor();
     }
 

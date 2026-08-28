@@ -106,6 +106,12 @@ def _invalidate_dirty_cache(project_dir: str | os.PathLike) -> None:
 # copies timestamps) still misses. It is captured BEFORE the read: a write that
 # races the read stores fresh content under a stale stamp, which only costs the
 # next save a re-explode — never a stale commit.
+#
+# One more hazard the stat tuple alone cannot see, and git's index solves the
+# same way ("racily clean"): a rewrite that lands in the SAME clock tick the
+# entry was recorded in produces an identical stamp. An entry is therefore only
+# trusted once the wall clock has moved past the tick it was stored in, so a
+# same-tick rewrite re-explodes instead of silently committing stale blobs.
 _EXPLODE_CACHE_MAX_BYTES = 64 * 1024 * 1024
 # "<resolved root>\0<rel>" -> {"stamp": tuple, "exploded": ExplodedItem,
 #                              "doc": dict, "bytes": int}
@@ -131,13 +137,29 @@ def _explode_cache_put(key: str, stamp: tuple[int, int, int, int],
     if size > _EXPLODE_CACHE_MAX_BYTES:
         return  # a single container larger than the whole budget is not cached
     _explode_cache[key] = {"stamp": stamp, "exploded": exploded,
-                           "doc": doc, "bytes": size}
+                           "doc": doc, "bytes": size, "recorded_ns": time.time_ns()}
     _explode_cache_bytes += size
     while _explode_cache_bytes > _EXPLODE_CACHE_MAX_BYTES:
         oldest = next(iter(_explode_cache))  # insertion-ordered
         if oldest == key:
             break
         _explode_cache_drop(oldest)
+
+
+def _explode_cache_get(key: str, stamp: tuple[int, int, int, int] | None
+                       ) -> dict[str, Any] | None:
+    """Cached explode for `key`, or None when it is absent, stale or racy."""
+    if stamp is None:
+        return None
+    entry = _explode_cache.get(key)
+    if entry is None or entry["stamp"] != stamp:
+        return None
+    if int(stamp[0]) >= int(entry["recorded_ns"]):
+        # Written in the same tick we recorded: the stat tuple cannot prove the
+        # bytes are the ones we exploded. Re-read instead of trusting it.
+        _explode_cache_drop(key)
+        return None
+    return entry
 
 
 def _explode_cache_drop(key: str) -> None:
@@ -1187,8 +1209,8 @@ class Vault:
             # full read below.
             cache_key = f"{root_key}\x00{rel}"
             stamp = _container_stamp(path)
-            cached = _explode_cache.get(cache_key) if stamp is not None else None
-            if cached is not None and cached["stamp"] == stamp:
+            cached = _explode_cache_get(cache_key, stamp)
+            if cached is not None:
                 exploded = cached["exploded"]
                 doc = cached["doc"]
             else:

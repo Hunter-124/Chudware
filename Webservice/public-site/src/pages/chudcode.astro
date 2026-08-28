@@ -1,0 +1,233 @@
+---
+import BaseLayout from '../layouts/BaseLayout.astro';
+import Icon from '../components/Icon.astro';
+import '../styles/chudcode.css';
+---
+<BaseLayout title="Chudcode" description="Chudcode is a desktop workspace built around a coding agent: repository context, language servers, a debugger, browser control, live review, and sessions you can resume or fork. The desktop app will be free — public builds are in preparation.">
+  <div class="cc-page">
+    <header class="page-hero" aria-labelledby="cc-hero-title">
+      <div class="wrap">
+        <div class="cc-hero-grid">
+          <div class="cc-hero-copy">
+            <p class="eyebrow">Companion product / Software tooling</p>
+            <img class="cc-wordmark" src="/images/chudcode/logo-wordmark.png" width="1024" height="256" alt="Chudcode" />
+            <h1 id="cc-hero-title">A desktop workspace built around a coding agent.</h1>
+            <p class="lede">Chudcode gives an agent the same footing an engineer has &mdash; the repository, language servers, a debugger, a browser &mdash; and gives you the instruments that make delegation safe: diffs, approvals, live review, and sessions you can resume or fork.</p>
+            <p class="cc-status">In development &mdash; public preview in preparation</p>
+            <ul class="cc-hero-meta">
+              <li>Companion to Chudware CAD</li>
+              <li>Desktop app will be free &mdash; no subscription</li>
+              <li>Public binaries being prepared</li>
+            </ul>
+            <div class="actions">
+              <a class="button cc-button" href="#availability">Desktop build status</a>
+              <a class="button button-secondary" href="#capabilities">See the capabilities</a>
+            </div>
+          </div>
+          <figure class="cc-diagram">
+            <svg class="cc-svg" viewBox="0 0 560 500" role="img" aria-labelledby="cc-flow-title">
+              <title id="cc-flow-title">Schematic of the Chudcode workspace: repository context, symbols, and memory feed an agent session; a live advisor and approvals gate it; the session drives debugger, browser, and git tools; results are recorded as diffs and artifacts on a session timeline that can be resumed or forked.</title>
+              <defs>
+                <marker id="cc-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+                  <path class="cc-svg-arrow" d="M0,0 L10,5 L0,10 Z" />
+                </marker>
+              </defs>
+
+              <rect class="cc-svg-node" x="30" y="36" width="220" height="78" rx="4" />
+              <text class="cc-svg-title" x="50" y="66">CONTEXT</text>
+              <text class="cc-svg-label" x="50" y="88">repo &#183; symbols &#183; memory</text>
+
+              <rect class="cc-svg-node" x="310" y="36" width="220" height="78" rx="4" />
+              <text class="cc-svg-title" x="330" y="66">REVIEW</text>
+              <text class="cc-svg-label" x="330" y="88">advisor &#183; approvals</text>
+
+              <rect class="cc-svg-node-accent" x="155" y="196" width="250" height="88" rx="4" />
+              <text class="cc-svg-title" x="185" y="234">SESSION</text>
+              <text class="cc-svg-label" x="185" y="256">the agent at work</text>
+              <path class="cc-svg-star" d="M368 222 l5.5 12.5 12.5 5.5 -12.5 5.5 -5.5 12.5 -5.5 -12.5 -12.5 -5.5 12.5 -5.5 z" />
+
+              <rect class="cc-svg-node" x="30" y="356" width="220" height="78" rx="4" />
+              <text class="cc-svg-title" x="50" y="386">TOOLS</text>
+              <text class="cc-svg-label" x="50" y="408">debugger &#183; browser &#183; git</text>
+
+              <rect class="cc-svg-node" x="310" y="356" width="220" height="78" rx="4" />
+              <text class="cc-svg-title" x="330" y="386">HISTORY</text>
+              <text class="cc-svg-label" x="330" y="408">diffs &#183; artifacts</text>
+
+              <line class="cc-svg-flow" x1="140" y1="118" x2="212" y2="190" marker-end="url(#cc-arrow)" />
+              <line class="cc-svg-flow" x1="420" y1="118" x2="348" y2="190" marker-end="url(#cc-arrow)" />
+              <line class="cc-svg-flow" x1="212" y1="290" x2="140" y2="350" marker-end="url(#cc-arrow)" />
+              <line class="cc-svg-flow" x1="348" y1="290" x2="420" y2="350" marker-end="url(#cc-arrow)" />
+
+              <text class="cc-svg-faint" x="146" y="158" text-anchor="end">FEEDS</text>
+              <text class="cc-svg-faint" x="414" y="158">GATES</text>
+              <text class="cc-svg-faint" x="146" y="330" text-anchor="end">DRIVES</text>
+              <text class="cc-svg-faint" x="414" y="330">RECORDS</text>
+
+              <line class="cc-svg-timeline" x1="40" y1="470" x2="520" y2="470" />
+              <path class="cc-svg-timeline" d="M250 470 L306 444 H520" />
+              <circle class="cc-svg-dot" cx="70" cy="470" r="4" />
+              <circle class="cc-svg-dot" cx="130" cy="470" r="4" />
+              <circle class="cc-svg-dot" cx="190" cy="470" r="4" />
+              <circle class="cc-svg-dot" cx="250" cy="470" r="4" />
+              <circle class="cc-svg-dot" cx="320" cy="470" r="4" />
+              <circle class="cc-svg-dot" cx="390" cy="470" r="4" />
+              <circle class="cc-svg-dot" cx="350" cy="444" r="4" />
+              <circle class="cc-svg-dot" cx="420" cy="444" r="4" />
+              <text class="cc-svg-faint" x="40" y="496">SESSION TIMELINE &mdash; RESUME OR FORK ANY POINT</text>
+            </svg>
+            <figcaption>Schematic, not a screenshot &mdash; the desktop app is in development.</figcaption>
+          </figure>
+        </div>
+      </div>
+    </header>
+
+    <section class="section" id="capabilities" aria-labelledby="cc-cap-title">
+      <div class="wrap">
+        <header class="section-heading">
+          <p class="eyebrow" id="cc-cap-title">Capabilities</p>
+          <h2>What the workspace gives the agent &mdash; and you.</h2>
+          <p class="lede">Twelve capabilities from the current builds. This is the working set, not a roadmap.</p>
+        </header>
+        <div class="cc-matrix">
+          <section class="cc-matrix-group" aria-labelledby="cc-g1">
+            <p class="cc-matrix-kicker">Know</p>
+            <h3 id="cc-g1">Ground truth</h3>
+            <ul>
+              <li><strong>Repository context</strong><span>The agent reads the project as a repository &mdash; structure, files, history &mdash; not as pasted fragments.</span></li>
+              <li><strong>Language servers</strong><span>Symbols, references, and diagnostics through LSP: the same signal your editor works from.</span></li>
+              <li><strong>Debugger</strong><span>Breakpoints, stepping, and live program state when reading the code is not proof enough.</span></li>
+              <li><strong>Memory</strong><span>Durable project facts carry across sessions instead of being re-explained every morning.</span></li>
+            </ul>
+          </section>
+          <section class="cc-matrix-group" aria-labelledby="cc-g2">
+            <p class="cc-matrix-kicker">Act</p>
+            <h3 id="cc-g2">Reach</h3>
+            <ul>
+              <li><strong>Browser &amp; computer control</strong><span>Web apps and desktop surfaces are testable targets, not descriptions.</span></li>
+              <li><strong>Git workflow</strong><span>Branches, commits, and status live inside the loop, so finished work lands as ordinary commits.</span></li>
+              <li><strong>Subagents</strong><span>Independent slices fan out to scoped workers and come back as one reviewable change.</span></li>
+              <li><strong>Artifacts</strong><span>Reports, patches, and generated files persist beyond the conversation that produced them.</span></li>
+            </ul>
+          </section>
+          <section class="cc-matrix-group" aria-labelledby="cc-g3">
+            <p class="cc-matrix-kicker">Steer</p>
+            <h3 id="cc-g3">Control</h3>
+            <ul>
+              <li><strong>Diffs</strong><span>Every edit is a reviewable diff before it is anything else.</span></li>
+              <li><strong>Live advisor &amp; review</strong><span>A second pass watches the work while it happens, not after it ships.</span></li>
+              <li><strong>Approvals</strong><span>Consequential actions stop and ask. The default is to gate, not to guess.</span></li>
+              <li><strong>Session resume &amp; fork</strong><span>Pick a session back up, or fork it to explore an alternative without losing the baseline.</span></li>
+            </ul>
+          </section>
+        </div>
+      </div>
+    </section>
+
+    <section class="section" aria-labelledby="cc-sys-title">
+      <div class="wrap">
+        <header class="section-heading">
+          <p class="eyebrow" id="cc-sys-title">One system</p>
+          <h2>Context, tools, and sessions are one loop, not three features.</h2>
+          <p class="lede">Most agent tooling bolts these together after the fact. Chudcode is arranged so each one feeds the next.</p>
+        </header>
+        <div class="cc-cols">
+          <div class="cc-col">
+            <h3>Context in</h3>
+            <p>Every turn starts grounded. Repository state, language-server diagnostics, and remembered project facts arrive before the first line of planning &mdash; so the agent argues from the codebase, not from a guess about it.</p>
+          </div>
+          <div class="cc-col">
+            <h3>Evidence out</h3>
+            <p>Claims are checked against the running system: a debugger stack, a browser session, a failing command. &ldquo;Done&rdquo; means demonstrated, not asserted, and the evidence stays attached to the work as artifacts.</p>
+          </div>
+          <div class="cc-col">
+            <h3>Sessions hold</h3>
+            <p>The whole exchange is a durable session. Resume it tomorrow, fork it to try the other approach, or hand its artifacts and remembered facts to the next one. Nothing important lives only in a scroll buffer.</p>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="section" aria-labelledby="cc-flow-eyebrow">
+      <div class="wrap split">
+        <header class="section-heading">
+          <p class="eyebrow" id="cc-flow-eyebrow">Workflow</p>
+          <h2>History is the interface.</h2>
+          <p class="lede">Chudcode treats your repository&rsquo;s history as the medium of collaboration. Work arrives as diffs, survives as commits, and branches as forked sessions &mdash; readable by every tool you already use.</p>
+          <p class="supporting-copy">There is no parallel store of truth. What the agent did is what the diff says it did, and what you kept is what the log says you kept.</p>
+        </header>
+        <ol class="cc-steps">
+          <li>
+            <div>
+              <h3>Brief</h3>
+              <p>Describe the change the way you would brief a colleague: intent, constraints, and what must not move.</p>
+            </div>
+          </li>
+          <li>
+            <div>
+              <h3>Watch</h3>
+              <p>Live review runs alongside the work. Interject when it drifts; approve when it asks before doing something consequential.</p>
+            </div>
+          </li>
+          <li>
+            <div>
+              <h3>Read the diff</h3>
+              <p>Work lands as diffs against your working tree. Nothing merges itself, and nothing hides inside a generated blob.</p>
+            </div>
+          </li>
+          <li>
+            <div>
+              <h3>Commit or fork</h3>
+              <p>Commit what holds up. Fork the session for the alternative worth comparing. Either way the record is ordinary version control, owned by you.</p>
+            </div>
+          </li>
+        </ol>
+      </div>
+    </section>
+
+    <section class="section" id="availability" aria-labelledby="cc-avail-title">
+      <div class="wrap">
+        <header class="section-heading">
+          <p class="eyebrow" id="cc-avail-title">Availability</p>
+          <h2>The desktop app will be free. The binaries are being prepared.</h2>
+          <p class="lede">When public builds ship, Chudcode&rsquo;s desktop app will be free to download and free to keep using &mdash; no subscription, no seat license. Until then, this page carries no download links, because a link that does not work is worse than none.</p>
+        </header>
+        <ol class="cc-stages">
+          <li class="cc-stage cc-stage-now">
+            <p class="cc-stage-k">Now &mdash; in development</p>
+            <h3>The core runs</h3>
+            <p>v0.1.0 is tagged, with a verified Linux command-line build. The desktop workspace exists and is being completed &mdash; it is not downloadable yet.</p>
+          </li>
+          <li class="cc-stage">
+            <p class="cc-stage-k">Next &mdash; public preview</p>
+            <h3>Packaged builds</h3>
+            <p>Desktop binaries are being prepared for public release. This section will link them the day they exist &mdash; no placeholders before that.</p>
+          </li>
+          <li class="cc-stage">
+            <p class="cc-stage-k">Then &mdash; release</p>
+            <h3>Free, and kept free</h3>
+            <p>The desktop app ships free with no subscription. The workspace described above is the product, not the top tier of one.</p>
+          </li>
+        </ol>
+        <aside class="cc-note" aria-label="Contact about Chudcode">
+          <img class="cc-note-mark" src="/images/chudcode/logo-icon.png" width="256" height="256" alt="" />
+          <div>
+            <p class="eyebrow">Want a note when builds land?</p>
+            <p>Write to <a href="mailto:sales@chudware.com?subject=Chudcode">sales@chudware.com</a> &mdash; the general front door &mdash; or use the <a href="/contact/">contact page</a>. No mailing list, no signup wall; a person reads it.</p>
+          </div>
+        </aside>
+      </div>
+    </section>
+
+    <section class="section cc-flagship" aria-labelledby="cc-flag-title">
+      <div class="wrap cc-flagship-band">
+        <div>
+          <p class="eyebrow" id="cc-flag-title">The flagship</p>
+          <h2>Chudware CAD comes first.</h2>
+        </div>
+        <p>Chudcode is the companion &mdash; the tool for the software around the hardware. The flagship is Chudware itself: parametric CAD, simulation, CAM, and product data, from sketch to shop floor.</p>
+        <a class="text-link" href="/product/">Explore Chudware CAD <Icon name="arrow-right" /></a>
+      </div>
+    </section>
+  </div>
+</BaseLayout>

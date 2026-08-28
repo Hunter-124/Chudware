@@ -2625,7 +2625,21 @@ with Claude Code was broken.
 Baseline unchanged: `services/agent`+`services/dag` 3809 pass / 2 pre-existing fail;
 `services/mcp` 2891 pass / 1 pre-existing fail (proven at HEAD). NOTE for future runs:
 this host's `TMPDIR` is `~/.cache/tmp`, which makes `AF_UNIX` paths too long and fails two
-hostd tests that pass under `TMPDIR=/tmp`.
+hostd tests that pass under `TMPDIR=/tmp`. But `/tmp` here is a 2 GB tmpfs shared with
+other sessions, and a full `services/mcp` run needs roughly a gigabyte of scratch. When it
+runs short it fails in bulk with `OSError: [Errno 28] No space left on device` — 65 such
+failures in one 17-minute run, every one of which then passed 169/169 on re-run with space
+free. Errno 28 in this suite is an environment limit, never a code regression: check
+`df -h /tmp` before believing a red run.
+
+Also: never select a subset by passing test *files* as pytest arguments. That puts
+`services/` on `sys.path`, so CAD's own `services/mcp` package shadows the installed MCP
+SDK (`cannot import name 'Image' from 'mcp.server.fastmcp'`) and every reveng module fails
+to import — 132 phantom failures. Pass the `services/mcp` directory and exclude the
+complement with `--ignore`; `~/.cache/mcp_chunk.sh` and `~/.cache/mcp_keep.sh` do this.
+Subsets can still hang in `daemon_bridge`/`core_bridge` on cross-file daemon fixtures, so a
+subset that hangs is likewise not evidence about HEAD. The full suite exceeds the 600 s
+bash ceiling; run it under `hub op:"start"` instead.
 
 ---
 

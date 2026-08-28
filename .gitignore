@@ -48,12 +48,18 @@ imgui.ini
 /.mcp.json
 /opencode.json
 /.cursor/mcp.json
+/.cursor/mcp.json.disabled
 /.vscode/mcp.json
 # Grok project-scoped MCP config (absolute machine paths) — written by setup_mcp_clients.py
 /.grok/
 
 # Scratch + spike outputs
 scratch/
+#
+# Runtime outputs must never land at repository root.
+/preflight_events.jsonl
+/runs/
+/*.step+
 
 # Vendored OMP (oh-my-pi) bun workspace — SOURCE under vendor/omp/ IS tracked (deterministic,
 # re-pulled by scripts/vendor_omp.py); installed deps + native binaries are not.

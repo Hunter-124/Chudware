@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import json
 import logging
+import threading
 from typing import Any, Callable, Optional
 
 # Ledger section / kind vocabulary lives in ONE place (services.agent.ledger_vocab)
@@ -2534,6 +2535,188 @@ def _apply_session_preferences(
     return allowed, system_prompt
 
 
+# ---------------------------------------------------------------- static prompt
+#: Warning prefixes ``prompt_cache.compose`` emits when a step of THIS lane's
+#: composition degraded to a fallback (role policy, capability assembly, session
+#: preferences). Such an entry is not this lane's bytes, so its tool text is not
+#: trusted and the slot is rendered live instead of copied from a degraded mirror.
+_PROMPT_CACHE_COMPOSE_WARNINGS = frozenset(
+    {"effective_role_policy", "prompt_tiers", "session_preferences"}
+)
+
+#: In-process memo for the rendered TOOLS SLOT, keyed by everything
+#: ``render_tools_block`` reads: the prompt-cache fingerprint (config.json, the
+#: role cards, packs, skills and the composing source — so a settings write or an
+#: edited docstring drops the entry), the tier's ``(budget, trim)`` allocation,
+#: the allowlist, and the identity of the callable each tool resolves to.
+#:
+#: The disk cache normally cannot serve this text: it renders with
+#: ``resolver_for(None)`` and no tier, while a live turn resolves the
+#: mission-scoped meta tools (``ask_user``, ``delegate``) against its
+#: ``MissionDispatch``, whose signatures and docstrings are different bytes, and
+#: allocates its own tier slot. The slot is budget-coupled (pass 2 spends the
+#: tier's surplus across the whole allowlist), so splicing cached entries around
+#: live ones would change the rendered text — those entries therefore stay live
+#: and the whole render is reused from here instead.
+_TOOLS_SLOT_MEMO: dict[tuple, str] = {}
+_TOOLS_SLOT_LOCK = threading.RLock()
+
+
+def _tool_render_ident(fn: Any) -> tuple[str, str] | None:
+    """Identity of what a schema render would describe for one tool.
+
+    ``tool_schemas.describe_callable`` reads only ``inspect.signature`` and the
+    docstring, both carried by the underlying function — so two resolutions with
+    the same module + qualname render byte-identical entries, and a bound
+    ``MissionDispatch`` method compares equal across dispatcher instances (which
+    is what makes the memo reusable from one turn to the next).
+    """
+    if fn is None:
+        return None
+    target = getattr(fn, "__func__", fn)
+    return (str(getattr(target, "__module__", "")),
+            str(getattr(target, "__qualname__", None) or repr(target)))
+
+
+def _tools_render_idents(
+    allowed: list[str], resolver: Callable[[str], Any],
+) -> tuple[tuple[str, str] | None, ...]:
+    """Per-tool render identity under *resolver*, in allowlist order."""
+    out: list[tuple[str, str] | None] = []
+    for tool in allowed:
+        try:
+            fn = resolver(tool)
+        except Exception:  # noqa: BLE001 — a broken entry renders name-only
+            fn = None
+        out.append(_tool_render_ident(fn))
+    return tuple(out)
+
+
+def linear_role_prompt(
+    role: str,
+    *,
+    resolver: Callable[[str], Any],
+    card: Any | None = None,
+    capability: Any | None = None,
+    tier: str | None = None,
+) -> tuple[str, list[str], str | None]:
+    """``(system_prompt, allowed, tools_text)`` for one linear role turn.
+
+    Every turn used to recompose all three (~16 ms for the main-chat floor: 20
+    ``inspect.signature`` calls, 20 docstring reads and ~40 config reads, of
+    which the tool-schema render is ~11 ms) while ``prompt_cache`` — which
+    performs exactly this sequence, fingerprinted — was consulted only by the
+    GUI context meter and the tests. This routes the live path through it.
+
+    The result is byte-identical to composing inline, which is what decides how
+    much may be reused:
+
+    * ``system_prompt`` / ``allowed`` are composed HERE, every turn. They cost
+      ~4 ms and they read the preference accessors directly, so the cached
+      entry's copies are used only as a witness: it must agree with this
+      composition before its tool text is trusted. A knob whose value changed
+      without a config.json write (Settings writes call
+      ``prompt_cache.invalidate``; the harness tests monkeypatch the accessors)
+      would otherwise be silently overridden by a fingerprint-valid entry.
+    * ``tools_text`` — the expensive part — is taken from the entry only when it
+      provably renders the same bytes: same role prose and allowlist, the tier
+      must allocate the same ``(budget, trim)`` slot the entry was rendered
+      with, and every allowed tool must resolve to the same callable under
+      *resolver* as under the entry's ``resolver_for(None)``.
+    * Otherwise the slot is rendered live with *resolver* — the mission-scoped
+      meta tools (``ask_user``, ``delegate``) resolve to ``MissionDispatch``
+      methods whose signatures and docstrings are different bytes, and the slot
+      is budget-coupled, so splicing cached entries around live ones would
+      change the rendered text — and memoized against the cache fingerprint, so
+      a repeat turn reuses the text without recomposing it while a fingerprint
+      change (settings write, edited docstring, new role card) recomposes.
+
+    Never raises: a cache fault degrades to the live composition, and a failed
+    schema render yields ``None`` exactly as the inline path did.
+    """
+    from services.agent import agent_turn as _at  # noqa: PLC0415
+    from services.agent import prompt_cache as _pcache  # noqa: PLC0415
+    from services.agent import tool_schemas as _tool_schemas  # noqa: PLC0415
+
+    if card is None:
+        from services.agent.roles import load_role  # noqa: PLC0415
+        card = load_role(role)
+    # Main chat gets both halves of the derived fs/shell floor. Rare CAD
+    # families remain behind enable_tools; previews call the same helper.
+    allowed = linear_role_allowed_tools(card)
+    base_system_prompt = effective_role_system_prompt(card)
+    system_prompt = base_system_prompt
+    try:
+        from services.agent.prompt_tiers import (  # noqa: PLC0415
+            assemble_system_for_capability,
+            letter_from_capability,
+        )
+        system_prompt = assemble_system_for_capability(
+            base_system_prompt, letter_from_capability(capability))
+    except Exception:  # noqa: BLE001
+        system_prompt = base_system_prompt
+    # Preferences BEFORE the tools render: a dropped tool must also vanish from
+    # the schema block, or the model is shown a tool every call to which will be
+    # refused.
+    allowed, system_prompt = _apply_session_preferences(
+        role, allowed, system_prompt)
+
+    static = None
+    try:
+        # No project_root: nothing this lane takes from the entry (role prose,
+        # allowlist, tool schemas) depends on the project folder, while keying on
+        # it would fold that folder's mtimes into the fingerprint and recompose
+        # the slot every time a file there changes. This is also the key
+        # ``prompt_cache.warm()`` fills at worker start.
+        static = _pcache.get(role=role, capability=capability)
+        if any(w.split(":", 1)[0] in _PROMPT_CACHE_COMPOSE_WARNINGS
+               for w in static.warnings):
+            static = None
+    except Exception:  # noqa: BLE001 — the cache is an optimisation, never fatal
+        static = None
+
+    slot = _tool_schemas.tier_tools_slot(tier)
+    idents = _tools_render_idents(allowed, resolver)
+
+    if (static is not None and static.tools_text
+            and static.role_system == system_prompt
+            and list(static.allowed) == allowed
+            and slot == _tool_schemas.tier_tools_slot(None)
+            and idents == _tools_render_idents(allowed,
+                                               _at.resolver_for(None))):
+        return system_prompt, allowed, static.tools_text
+
+    if static is not None:
+        # The fingerprint the entry was just validated against — no second stat
+        # sweep, and the memo shares the cache's invalidation epoch.
+        fingerprint = static.fingerprint
+    else:
+        try:
+            fingerprint = _pcache.fingerprint()
+        except Exception:  # noqa: BLE001 — no fingerprint means no memo
+            fingerprint = ""
+
+    key = (fingerprint, slot, tuple(allowed), idents)
+    if fingerprint:
+        with _TOOLS_SLOT_LOCK:
+            hit = _TOOLS_SLOT_MEMO.get(key)
+        if hit is not None:
+            return system_prompt, allowed, hit
+
+    try:
+        tools_text, _meta = _tool_schemas.render_tools_block(
+            allowed, resolver=resolver, tier=tier)
+    except Exception:  # noqa: BLE001 — schema render is best-effort
+        return system_prompt, allowed, None
+
+    if fingerprint:
+        with _TOOLS_SLOT_LOCK:
+            for stale in [k for k in _TOOLS_SLOT_MEMO if k[0] != fingerprint]:
+                _TOOLS_SLOT_MEMO.pop(stale, None)
+            _TOOLS_SLOT_MEMO[key] = tools_text
+    return system_prompt, allowed, tools_text
+
+
 def run_linear_role_turn(
     request: str,
     role: str,
@@ -2567,10 +2750,10 @@ def run_linear_role_turn(
     from services.agent import agent_turn as _at
     from services.agent.roles import load_role
 
+    # Loaded here (not lazily): an unknown role must fail the turn exactly as it
+    # always did, and the card is the fallback when the prompt cache cannot
+    # serve this lane's composition.
     card = load_role(role)
-    # Main chat gets both halves of the derived fs/shell floor. Rare CAD
-    # families remain behind enable_tools; previews call the same helper.
-    allowed = linear_role_allowed_tools(card)
 
     # Meta-tool coverage (live admin path passes no dispatcher): ask_user &
     # the other coordination tools resolve only via MissionDispatch.resolve,
@@ -2609,32 +2792,16 @@ def run_linear_role_turn(
         except Exception:  # noqa: BLE001 — ledger observability never blocks a turn
             ledger = None
 
-    base_system_prompt = effective_role_system_prompt(card)
-    system_prompt = base_system_prompt
-    try:
-        from services.agent.prompt_tiers import (  # noqa: PLC0415
-            assemble_system_for_capability,
-            letter_from_capability,
-        )
-        system_prompt = assemble_system_for_capability(
-            base_system_prompt, letter_from_capability(capability))
-    except Exception:  # noqa: BLE001
-        system_prompt = base_system_prompt
-
-    # Preferences BEFORE render_tools_block: a dropped tool must also vanish
-    # from the schema block, or the model is shown a tool every call to which
-    # will be refused.
-    allowed, system_prompt = _apply_session_preferences(
-        role, allowed, system_prompt)
-
-    tools_text = None
-    try:
-        from services.agent.tool_schemas import render_tools_block  # noqa: PLC0415
-        tools_text, _meta = render_tools_block(
-            allowed, resolver=_at.resolver_for(mission_dispatch),
-            tier=tier or getattr(mission_dispatch, "tier", None))
-    except Exception:  # noqa: BLE001 — schema render is best-effort
-        tools_text = None
+    # Role prose, allowlist and the tool-schema slot: served from the
+    # fingerprinted prompt cache when it renders these exact bytes, composed
+    # live (and memoized) when the mission-scoped meta tools make it not.
+    system_prompt, allowed, tools_text = linear_role_prompt(
+        role,
+        resolver=_at.resolver_for(mission_dispatch),
+        card=card,
+        capability=capability,
+        tier=tier or getattr(mission_dispatch, "tier", None),
+    )
 
     # The process-global org MCP closures need the same run-scoped provider and
     # ledger that agent_turn receives. Bind only for the duration of this turn;

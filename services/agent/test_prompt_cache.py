@@ -67,6 +67,39 @@ def _old_inline(system_prompt, tools_text, allow, *, catalog, project_root,
     return system
 
 
+def _old_linear_inline(role, capability, tier, dispatcher):
+    """The composition exactly as ``run_linear_role_turn`` wrote it inline before
+    the lane was routed through the cache. Kept verbatim as the reference the
+    routed path must reproduce byte for byte."""
+    from services.agent import mission_dispatch as md
+    from services.agent.prompt_tiers import (
+        assemble_system_for_capability,
+        letter_from_capability,
+    )
+    from services.agent.roles import load_role
+    from services.agent.tool_schemas import render_tools_block
+
+    card = load_role(role)
+    allowed = md.linear_role_allowed_tools(card)
+    base_system_prompt = md.effective_role_system_prompt(card)
+    system_prompt = base_system_prompt
+    try:
+        system_prompt = assemble_system_for_capability(
+            base_system_prompt, letter_from_capability(capability))
+    except Exception:
+        system_prompt = base_system_prompt
+    allowed, system_prompt = md._apply_session_preferences(
+        role, allowed, system_prompt)
+    tools_text = None
+    try:
+        tools_text, _meta = render_tools_block(
+            allowed, resolver=at.resolver_for(dispatcher),
+            tier=tier or getattr(dispatcher, "tier", None))
+    except Exception:
+        tools_text = None
+    return system_prompt, allowed, tools_text
+
+
 @pytest.fixture
 def isolated_cache(tmp_path, monkeypatch):
     """Point the on-disk cache at a tmp dir; never touch the user's data root."""
@@ -78,6 +111,16 @@ def isolated_cache(tmp_path, monkeypatch):
     yield d
     pc._mem.clear()
     pc._fp_cache = None
+
+
+@pytest.fixture
+def linear_tools_memo():
+    """Empty the linear lane's in-process tools-slot memo around a test."""
+    from services.agent import mission_dispatch as md
+
+    md._TOOLS_SLOT_MEMO.clear()
+    yield md._TOOLS_SLOT_MEMO
+    md._TOOLS_SLOT_MEMO.clear()
 
 
 # --------------------------------------------------------------------------- join rules
@@ -219,6 +262,107 @@ def test_compose_uses_the_same_main_chat_floor_as_live_turn():
     # role/category enablement, never on the automatic main-chat floor.
     assert "run_shell" not in MAIN_CHAT_DEFAULT_TOOLS
     assert "run_shell" not in composed.allowed
+
+
+# --------------------------------------------------------------------------- the linear lane
+
+@pytest.mark.parametrize("tier", [None, "frontier"])
+@pytest.mark.parametrize("role", ["general_agent", "feature_modeler"])
+def test_linear_lane_prompt_is_byte_identical_to_the_inline_composition(
+        isolated_cache, linear_tools_memo, role, tier):
+    """Routing the lane through the cache must not move a single byte.
+
+    ``frontier`` is the interesting tier: it allocates a 10000-token slot with
+    ``tool_schema_trim`` off, where the cache's own render (no tier, no
+    dispatcher) is a different block entirely — so the routed path must not
+    serve it.
+    """
+    from services.agent import mission_dispatch as md
+
+    dispatcher = md.MissionDispatch(run_id="equiv", tier=tier)
+    reference = _old_linear_inline(role, None, tier, dispatcher)
+    routed = md.linear_role_prompt(
+        role, resolver=at.resolver_for(dispatcher), capability=None,
+        tier=tier or getattr(dispatcher, "tier", None))
+    assert routed[0] == reference[0], "role prose drifted"
+    assert routed[1] == reference[1], "the allowlist drifted"
+    assert routed[2] == reference[2], "the tools block drifted"
+
+
+def test_a_repeat_turn_reuses_the_tools_block_but_a_new_fingerprint_recomposes(
+        isolated_cache, linear_tools_memo, tmp_path, monkeypatch):
+    """The point of the routing: turn two must not re-render the tool schemas.
+
+    Each turn builds its own ``MissionDispatch``, so the reuse cannot depend on
+    dispatcher identity — only on what the render actually reads. A fingerprint
+    change (here a settings write, the same event that calls ``invalidate``)
+    must still recompose, or a Settings change would never reach the model.
+    """
+    from services.agent import mission_dispatch as md
+    from services.agent import tool_schemas as tsch
+
+    rendered: list[list[str]] = []
+    real_render = tsch.render_tools_block
+
+    def counting(allowed, **kw):
+        rendered.append(list(allowed))
+        return real_render(allowed, **kw)
+
+    monkeypatch.setattr(tsch, "render_tools_block", counting)
+
+    def _turn():
+        dispatcher = md.MissionDispatch(run_id="turn", tier="frontier")
+        return md.linear_role_prompt(
+            "general_agent", resolver=at.resolver_for(dispatcher),
+            tier="frontier")
+
+    first = _turn()
+    assert first[2], "the tools slot must render on the first turn"
+    after_first = len(rendered)
+    assert after_first >= 1
+
+    second = _turn()
+    assert second == first, "a repeat turn must hand back the identical block"
+    assert len(rendered) == after_first, (
+        "the tools block was recomposed on an identical second turn")
+
+    cfg = tmp_path / "config.json"
+    cfg.write_text("{}", encoding="utf-8")
+    monkeypatch.setattr("services.paths.CONFIG", cfg)
+    pc._mem.clear()
+    pc._fp_cache = None
+
+    third = _turn()
+    assert len(rendered) > after_first, (
+        "a fingerprint change must recompose the tools block")
+    assert third[2], "the recomposed slot must still render"
+
+
+def test_a_session_preference_override_beats_a_valid_cache_entry(
+        isolated_cache, linear_tools_memo, monkeypatch):
+    """The Harness knobs are read through ``config`` accessors, so an entry
+    composed with the other value is fingerprint-VALID: config.json never
+    changed. Trusting the entry's allowlist would silently re-arm ``delegate``
+    for a session that switched sub-agents off — the dead-knob defect the
+    preferences were added to fix, reintroduced by a cache."""
+    from services.agent import config as agent_config
+    from services.agent import mission_dispatch as md
+
+    monkeypatch.setattr(agent_config, "get_subagent_preference",
+                        lambda *a, **k: "option", raising=False)
+    entry = pc.get(role="general_agent")
+    assert "delegate" in entry.allowed, "precondition: the entry allows it"
+
+    monkeypatch.setattr(agent_config, "get_subagent_preference",
+                        lambda *a, **k: "off", raising=False)
+    dispatcher = md.MissionDispatch(run_id="pref")
+    system_prompt, allowed, tools_text = md.linear_role_prompt(
+        "general_agent", resolver=at.resolver_for(dispatcher))
+
+    assert "delegate" not in allowed and "mission_start" not in allowed
+    assert "not available" in system_prompt
+    assert "\n- delegate(" not in (tools_text or ""), (
+        "a dropped tool must also vanish from the schema block")
 
 # --------------------------------------------------------------------------- caching
 

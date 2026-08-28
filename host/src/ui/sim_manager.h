@@ -574,6 +574,11 @@ private:
     bool emTabSync_ = false;               // force the in-panel tab bar to emForm_ for ONE frame
                                            // (after a ribbon command); else the user's clicks win
     bool emRunning_ = false;               // an em_* run launched by this manager is in flight
+    // Form validation is shared by dispatch and draw-time gating. The path cache keeps the
+    // optional STL existence probe off the per-frame hot path until the input changes.
+    mutable std::string emStlCheckedPath_;
+    mutable bool emStlPathExists_ = true;
+    const char* emRunBlocker() const;
     void openEmForm(AppState& st, EmForm f);
     void drawEmPanel(AppState& st);        // full panel (header + form + results); returns via emPanelOpen_
     void drawEmForm(AppState& st);         // the active form's inputs
@@ -626,6 +631,7 @@ private:
     void openElectronicsPanel(AppState& st);
     void drawElectronicsPanel(AppState& st);
     void runElectronics(AppState& st);
+    const char* electronicsRunBlocker(bool dispatchText) const;
     void selectElTrace(int idx);          // rebuild xs/ys from raw for probes[idx]
 
     // Firmware emulation panel — runs fw_sim_run against an on-disk firmware project

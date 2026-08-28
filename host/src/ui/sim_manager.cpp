@@ -1950,32 +1950,40 @@ nlohmann::json SimManager::emWaveguideSpec() const {
   return nlohmann::json{{"waveguide", wg}};
 }
 
+const char *SimManager::emRunBlocker() const {
+  if (emForm_ == EmForm::Driven && emStlCheckedPath_ != em_.stlPath) {
+    const bool exists =
+        !em_.stlPath[0] || std::filesystem::exists(em_.stlPath);
+    emStlCheckedPath_ = em_.stlPath;
+    emStlPathExists_ = exists;
+  }
+
+  auto positive = [](float v) { return std::isfinite(v) && v > 0.0f; };
+  if (em_.stdIdx < 0 &&
+      ((em_.shape == 0 && (!positive(em_.a_mm) || !positive(em_.b_mm))) ||
+       (em_.shape == 1 && !positive(em_.radius_mm))))
+    return "Waveguide dimensions must be finite and positive.";
+  if (emForm_ != EmForm::Eigenmode && !positive(em_.lengthMm))
+    return "Guide length must be finite and positive.";
+  if (emForm_ == EmForm::Driven &&
+      (!positive(em_.fStartGhz) || !positive(em_.fStopGhz) ||
+       em_.fStopGhz <= em_.fStartGhz || em_.nFreq < 3))
+    return "Driven sweep needs positive increasing frequencies and at least 3 points.";
+  if (emForm_ == EmForm::TimeDomain &&
+      (!positive(em_.f0Ghz) || !positive(em_.bwGhz)))
+    return "Time-domain center frequency and bandwidth must be positive.";
+  if (emForm_ == EmForm::Driven && em_.stlPath[0] && !emStlPathExists_)
+    return "The optional geometry STL path does not exist.";
+  return nullptr;
+}
+
 // Dispatch the active form's em_* RPC asynchronously (st.rpc — the callback
 // lands in a later drain() on the GL thread, safe to touch em_). A single
 // in-flight guard blocks re-entry.
 void SimManager::runEmForm(AppState &st) {
   if (emRunning_)
     return;
-  std::string blocker;
-  auto positive = [](float v) { return std::isfinite(v) && v > 0.0f; };
-  if (em_.stdIdx < 0 &&
-      ((em_.shape == 0 && (!positive(em_.a_mm) || !positive(em_.b_mm))) ||
-       (em_.shape == 1 && !positive(em_.radius_mm))))
-    blocker = "Waveguide dimensions must be finite and positive.";
-  else if (emForm_ != EmForm::Eigenmode && !positive(em_.lengthMm))
-    blocker = "Guide length must be finite and positive.";
-  else if (emForm_ == EmForm::Driven &&
-           (!positive(em_.fStartGhz) || !positive(em_.fStopGhz) ||
-            em_.fStopGhz <= em_.fStartGhz || em_.nFreq < 3))
-    blocker =
-        "Driven sweep needs positive increasing frequencies and at least 3 points.";
-  else if (emForm_ == EmForm::TimeDomain &&
-           (!positive(em_.f0Ghz) || !positive(em_.bwGhz)))
-    blocker = "Time-domain center frequency and bandwidth must be positive.";
-  else if (emForm_ == EmForm::Driven && em_.stlPath[0] &&
-           !std::filesystem::exists(em_.stlPath))
-    blocker = "The optional geometry STL path does not exist.";
-  if (!blocker.empty()) {
+  if (const char *blocker = emRunBlocker()) {
     st.toast(ui::ToastLevel::Warn, blocker);
     return;
   }
@@ -2424,26 +2432,8 @@ void SimManager::drawEmPanel(AppState &st) {
   // ---- run ----
   ImGui::Spacing();
   ImGui::Separator();
-  std::string emBlocker;
-  auto positive = [](float v) { return std::isfinite(v) && v > 0.0f; };
-  if (em_.stdIdx < 0 &&
-      ((em_.shape == 0 && (!positive(em_.a_mm) || !positive(em_.b_mm))) ||
-       (em_.shape == 1 && !positive(em_.radius_mm))))
-    emBlocker = "Waveguide dimensions must be finite and positive.";
-  else if (emForm_ != EmForm::Eigenmode && !positive(em_.lengthMm))
-    emBlocker = "Guide length must be finite and positive.";
-  else if (emForm_ == EmForm::Driven &&
-           (!positive(em_.fStartGhz) || !positive(em_.fStopGhz) ||
-            em_.fStopGhz <= em_.fStartGhz || em_.nFreq < 3))
-    emBlocker =
-        "Driven sweep needs positive increasing frequencies and at least 3 points.";
-  else if (emForm_ == EmForm::TimeDomain &&
-           (!positive(em_.f0Ghz) || !positive(em_.bwGhz)))
-    emBlocker = "Time-domain center frequency and bandwidth must be positive.";
-  else if (emForm_ == EmForm::Driven && em_.stlPath[0] &&
-           !std::filesystem::exists(em_.stlPath))
-    emBlocker = "The optional geometry STL path does not exist.";
-  if (emRunning_ || !emBlocker.empty()) {
+  const char *emBlocker = emRunBlocker();
+  if (emRunning_ || emBlocker) {
     if (emRunning_)
       ImGui::TextDisabled("Solving\xe2\x80\xa6");
     ImGui::BeginDisabled();
@@ -2452,8 +2442,8 @@ void SimManager::drawEmPanel(AppState &st) {
   } else if (ImGui::Button("Run", ImVec2(-FLT_MIN, 0))) {
     runEmForm(st);
   }
-  if (!emBlocker.empty())
-    ImGui::TextWrapped("%s", emBlocker.c_str());
+  if (emBlocker)
+    ImGui::TextWrapped("%s", emBlocker);
   simTip("Run the electromagnetics solve for this analysis (async — the panel "
          "stays responsive).");
 
@@ -10749,6 +10739,34 @@ void SimManager::selectElTrace(int idx) {
   }
 }
 
+const char *SimManager::electronicsRunBlocker(bool dispatchText) const {
+  if (el_.analysis == 1) {
+    const double span = (double)el_.dcStop - el_.dcStart;
+    if (!el_.dcSource[0])
+      return "DC sweep needs a voltage/current source name.";
+    if (!std::isfinite(el_.dcStart) || !std::isfinite(el_.dcStop) ||
+        !std::isfinite(el_.dcStep) || el_.dcStep == 0.0f || span == 0.0 ||
+        span * el_.dcStep < 0.0)
+      return dispatchText
+                 ? "DC sweep needs a non-zero step directed from start toward stop."
+                 : "DC step must be non-zero and directed from start toward stop.";
+    if (std::fabs(span / el_.dcStep) > 1000000.0)
+      return "DC sweep exceeds the one-million-point solver limit.";
+  } else if (el_.analysis == 2 &&
+             (!std::isfinite(el_.acStartHz) ||
+              !std::isfinite(el_.acStopHz) || el_.acStartHz <= 0.0f ||
+              el_.acStopHz <= el_.acStartHz || el_.acPoints < 2)) {
+    return "AC sweep needs positive increasing frequencies and at least 2 points.";
+  } else if (el_.analysis == 3 &&
+             (!std::isfinite(el_.tranStopMs) ||
+              !std::isfinite(el_.tranStepUs) || el_.tranStopMs <= 0.0f ||
+              el_.tranStepUs <= 0.0f ||
+              el_.tranStepUs * 1e-3f >= el_.tranStopMs)) {
+    return "Transient stop time must exceed a positive finite time step.";
+  }
+  return nullptr;
+}
+
 void SimManager::runElectronics(AppState &st) {
   if (elRunning_ || el_.docTab < 0 ||
       el_.docTab >= (int)st.docTabs.size() ||
@@ -10757,33 +10775,7 @@ void SimManager::runElectronics(AppState &st) {
     st.toast(ui::ToastLevel::Warn, "Select an open schematic first");
     return;
   }
-  std::string blocker;
-  if (el_.analysis == 1) {
-    const double span = (double)el_.dcStop - el_.dcStart;
-    if (!el_.dcSource[0])
-      blocker = "DC sweep needs a voltage/current source name.";
-    else if (!std::isfinite(el_.dcStart) || !std::isfinite(el_.dcStop) ||
-             !std::isfinite(el_.dcStep) || el_.dcStep == 0.0f ||
-             span == 0.0 || span * el_.dcStep < 0.0)
-      blocker =
-          "DC sweep needs a non-zero step directed from start toward stop.";
-    else if (std::fabs(span / el_.dcStep) > 1000000.0)
-      blocker = "DC sweep exceeds the one-million-point solver limit.";
-  } else if (el_.analysis == 2 &&
-             (!std::isfinite(el_.acStartHz) ||
-              !std::isfinite(el_.acStopHz) || el_.acStartHz <= 0.0f ||
-              el_.acStopHz <= el_.acStartHz || el_.acPoints < 2)) {
-    blocker =
-        "AC sweep needs positive increasing frequencies and at least 2 points.";
-  } else if (el_.analysis == 3 &&
-             (!std::isfinite(el_.tranStopMs) ||
-              !std::isfinite(el_.tranStepUs) || el_.tranStopMs <= 0.0f ||
-              el_.tranStepUs <= 0.0f ||
-              el_.tranStepUs * 1e-3f >= el_.tranStopMs)) {
-    blocker =
-        "Transient stop time must exceed a positive finite time step.";
-  }
-  if (!blocker.empty()) {
+  if (const char *blocker = electronicsRunBlocker(true)) {
     st.toast(ui::ToastLevel::Warn, blocker);
     return;
   }
@@ -10971,35 +10963,10 @@ void SimManager::drawElectronicsPanel(AppState &st) {
     ImGui::InputFloat("##eltstep", &el_.tranStepUs, 0, 0, "t_step = %.1f us");
   }
 
-  std::string elBlocker;
-  if (el_.analysis == 1) {
-    const double span = (double)el_.dcStop - el_.dcStart;
-    if (!el_.dcSource[0])
-      elBlocker = "DC sweep needs a voltage/current source name.";
-    else if (!std::isfinite(el_.dcStart) || !std::isfinite(el_.dcStop) ||
-             !std::isfinite(el_.dcStep) || el_.dcStep == 0.0f ||
-             span == 0.0 || span * el_.dcStep < 0.0)
-      elBlocker =
-          "DC step must be non-zero and directed from start toward stop.";
-    else if (std::fabs(span / el_.dcStep) > 1000000.0)
-      elBlocker = "DC sweep exceeds the one-million-point solver limit.";
-  } else if (el_.analysis == 2 &&
-             (!std::isfinite(el_.acStartHz) ||
-              !std::isfinite(el_.acStopHz) || el_.acStartHz <= 0.0f ||
-              el_.acStopHz <= el_.acStartHz || el_.acPoints < 2)) {
-    elBlocker =
-        "AC sweep needs positive increasing frequencies and at least 2 points.";
-  } else if (el_.analysis == 3 &&
-             (!std::isfinite(el_.tranStopMs) ||
-              !std::isfinite(el_.tranStepUs) || el_.tranStopMs <= 0.0f ||
-              el_.tranStepUs <= 0.0f ||
-              el_.tranStepUs * 1e-3f >= el_.tranStopMs)) {
-    elBlocker =
-        "Transient stop time must exceed a positive finite time step.";
-  }
+  const char *elBlocker = electronicsRunBlocker(false);
 
   ImGui::Spacing();
-  if (elRunning_ || !elBlocker.empty()) {
+  if (elRunning_ || elBlocker) {
     ImGui::BeginDisabled();
     ImGui::Button(elRunning_ ? "Running\xe2\x80\xa6" : "Run",
                   ImVec2(-FLT_MIN, 0));
@@ -11007,8 +10974,8 @@ void SimManager::drawElectronicsPanel(AppState &st) {
   } else if (ImGui::Button("Run", ImVec2(-FLT_MIN, 0))) {
     runElectronics(st);
   }
-  if (!elBlocker.empty())
-    ImGui::TextWrapped("%s", elBlocker.c_str());
+  if (elBlocker)
+    ImGui::TextWrapped("%s", elBlocker);
   simTip("Build the SPICE netlist from the schematic and solve (async). Probes "
          "default to every node voltage + source current.");
 

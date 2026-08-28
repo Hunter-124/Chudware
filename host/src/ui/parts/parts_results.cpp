@@ -346,6 +346,29 @@ static bool resultsPreamble(const char* noResultsSub, const char* promptSub) {
     }
     return false;
 }
+// Queue the rows the user can see before the surrounding prefetch margin.  Re-prioritising
+// only touches requests that are still queued: already-dispatched offscreen work is allowed
+// to finish, while a fast scroll does not leave the new viewport behind stale queued rows.
+static void requestThumbWindow(AppState& st, int visibleStart, int visibleEnd, int marginItems) {
+    const int count = static_cast<int>(S().results.size());
+    visibleStart = std::max(0, std::min(visibleStart, count));
+    visibleEnd   = std::max(visibleStart, std::min(visibleEnd, count));
+
+    for (int i = visibleStart; i < visibleEnd; ++i)
+        requestThumb(st, S().results[i]);
+    // prioritizeThumb moves one item to the front, so visit bottom-to-top to retain visual order.
+    for (int i = visibleEnd; i-- > visibleStart;)
+        prioritizeThumb(S().results[i].id);
+
+    marginItems = std::max(1, marginItems);
+    const int prefetchStart = std::max(0, visibleStart - marginItems);
+    const int prefetchEnd   = std::min(count, visibleEnd + marginItems);
+    for (int i = prefetchStart; i < visibleStart; ++i)
+        requestThumb(st, S().results[i]);
+    for (int i = visibleEnd; i < prefetchEnd; ++i)
+        requestThumb(st, S().results[i]);
+}
+
 
 void drawResultsList(AppState& st) {
     const float sc = ui::uiScale;
@@ -418,7 +441,18 @@ void drawResultsList(AppState& st) {
     const float iconSz = 18.0f * sc;
     ImDrawList* dl = ImGui::GetWindowDrawList();
 
-    for (auto& item : S().results) {
+    // Body rows are fixed-height. Include the table's vertical cell padding in the clipper
+    // stride: TableNextRow's requested height covers the Selectable, while the table adds
+    // CellPadding above and below it.
+    const float rowStride = rowH + 2.0f * ImGui::GetStyle().CellPadding.y;
+    ImGuiListClipper clipper;
+    clipper.Begin(static_cast<int>(S().results.size()), rowStride);
+    while (clipper.Step()) {
+        const int visibleCount = std::max(1, clipper.DisplayEnd - clipper.DisplayStart);
+        requestThumbWindow(st, clipper.DisplayStart, clipper.DisplayEnd, visibleCount);
+
+        for (int itemIndex = clipper.DisplayStart; itemIndex < clipper.DisplayEnd; ++itemIndex) {
+        auto& item = S().results[itemIndex];
         ImGui::PushID(item.id.c_str());
         ImGui::TableNextRow(ImGuiTableRowFlags_None, rowH);
         ImGui::TableSetColumnIndex(0);
@@ -471,7 +505,6 @@ void drawResultsList(AppState& st) {
 
         // ---- Name cell: thumbnail (or domain icon fallback) + status badges + name ----
         ImGui::SetCursorScreenPos(rowPos);
-        requestThumb(st, item);
         auto th = S().thumbs.find(item.id);
         if (th != S().thumbs.end() && th->second.tex) {
             th->second.lastUse = ImGui::GetTime();  // LRU: keep on-screen thumbs resident
@@ -559,6 +592,7 @@ void drawResultsList(AppState& st) {
 
         ImGui::PopID();
     }
+        }
     ImGui::EndTable();
     ImGui::PopStyleVar();  // CellPadding
 }
@@ -611,20 +645,34 @@ void drawResultsGrid(AppState& st) {
                                     ui::metrics::U(12));
     const float cardW    = std::min(168.0f * sc, availW);
     const int   cols     = std::max(1, (int)((availW + gap) / (cardW + gap)));
-    const float startX   = ImGui::GetCursorPosX();
     // The card reserves `pad` on BOTH sides; the floor keeps a squeezed pane from producing a
     // negative content width (which would make the ellipsize loop and AddImage draw garbage).
     const float contentW = std::max(ui::metrics::U(4), cardW - 2.0f * pad);
     // lineH / titleH / bandH computed above — the card height depends on them.
     ImDrawList* dl       = ImGui::GetWindowDrawList();
+    const float gridX   = ImGui::GetCursorScreenPos().x;
 
     ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(gap, gap));  // uniform row gap
-    int i = 0;
-    for (auto& item : S().results) {
-        const int col = i % cols;
-        if (col != 0)
-            ImGui::SameLine(startX + col * (cardW + gap));   // absolute → columns stay aligned
-        ImGui::PushID(item.id.c_str());
+    const int itemCount = static_cast<int>(S().results.size());
+    const int rowCount  = (itemCount + cols - 1) / cols;
+    ImGuiListClipper clipper;
+    clipper.Begin(rowCount, cardH + gap);
+    while (clipper.Step()) {
+        const int visibleRows = std::max(1, clipper.DisplayEnd - clipper.DisplayStart);
+        requestThumbWindow(st, clipper.DisplayStart * cols,
+                           std::min(itemCount, clipper.DisplayEnd * cols),
+                           visibleRows * cols);
+
+        for (int row = clipper.DisplayStart; row < clipper.DisplayEnd; ++row) {
+            const ImVec2 rowOrigin(gridX, ImGui::GetCursorScreenPos().y);
+            for (int col = 0; col < cols; ++col) {
+                const int itemIndex = row * cols + col;
+                if (itemIndex >= itemCount)
+                    break;
+                ImGui::SetCursorScreenPos(
+                    ImVec2(rowOrigin.x + col * (cardW + gap), rowOrigin.y));
+                auto& item = S().results[itemIndex];
+                ImGui::PushID(item.id.c_str());
 
         // ---- fixed footprint + hover/tooltip item -----------------------------------
         const ImVec2 p0 = ImGui::GetCursorScreenPos();
@@ -659,7 +707,6 @@ void drawResultsGrid(AppState& st) {
         dl->AddLine(ImVec2(p0.x, bandBR.y - 0.5f), ImVec2(p1.x, bandBR.y - 0.5f),
                     Palette::toU32(palette.border), ui::metrics::stroke(1.0f));
 
-        requestThumb(st, item);
         auto th = S().thumbs.find(item.id);
         if (th != S().thumbs.end() && th->second.tex) {
             th->second.lastUse = ImGui::GetTime();  // LRU: keep on-screen thumbs resident
@@ -820,13 +867,14 @@ void drawResultsGrid(AppState& st) {
                 }
             }
             // Re-anchor layout on the card rect so the buttons' line doesn't skew the
-            // next SameLine/new-row bookkeeping.
+            // next column or clipped-row bookkeeping.
             ImGui::SetCursorScreenPos(p0);
             ImGui::Dummy(ImVec2(cardW, cardH));
         }
 
-        ImGui::PopID();
-        ++i;
+                ImGui::PopID();
+            }
+        }
     }
     ImGui::PopStyleVar();  // ItemSpacing
 }

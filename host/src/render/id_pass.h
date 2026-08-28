@@ -47,12 +47,12 @@ inline PickHit decodeId(uint32_t v) {
     return h;
 }
 
-// ---- id-pass frame caching (task 01: selection lag) ----
+// ---- id-pass frame caching ----
 // The id buffer is an offscreen FBO that nothing else draws into, so its contents stay valid across
 // frames as long as the inputs that produced them are unchanged. render() fingerprints those inputs
 // into an IdPassFrameKey and skips the per-body draw work when the key matches the last rendered
-// frame — turning a static-camera hover from O(bodies) draw calls every frame into a no-op. This is
-// the dominant per-frame pick cost in large assemblies. Kept pure/inline so it unit-tests w/o GL.
+// frame. Callers can therefore render on demand immediately before a pick: an unchanged hover is a
+// no-op, while the first pick after a camera, geometry, visibility, clip, or size change is fresh.
 
 // FNV-1a fold of the hidden-body ids. std::set iterates ascending, so the result is deterministic
 // and independent of insertion order — toggling a body's visibility changes the digest, nothing
@@ -103,13 +103,14 @@ public:
     bool setDoc(const DocMesh& doc, std::string& err);
 
     // Render the id buffer for the given camera (matches a Renderer::camera() frame), sizing the
-    // R32UI attachment to cam.ssWidth x cam.ssHeight.
-    void render(const Renderer::CameraXform& cam);
-
+    // R32UI attachment to cam.ssWidth x cam.ssHeight. Returns true when a current frame is available;
+    // unchanged inputs reuse the existing frame without issuing draw calls.
+    bool render(const Renderer::CameraXform& cam);
     // Pick the pixel at (px, py) in FINAL (non-supersampled) viewport coordinates, top-left
     // origin (ImGui convention). Internally scales by the supersample factor and flips to GL's
-    // bottom-left origin. Must be called after render() for the same frame. Returns an empty hit
-    // for out-of-range / background pixels.
+    // bottom-left origin. The caller must call render() with the current camera immediately before
+    // reading. Returns an empty hit if no current cached frame exists, or for out-of-range /
+    // background pixels.
     PickHit pickFinal(int px, int py, int finalW, int finalH);
 
     // Like pickFinal, but if the exact pixel is a Face (or background) it searches outward up to
@@ -126,7 +127,11 @@ public:
     // unpickable (a click goes through to whatever is behind it — never an invisible hit).
     // Persists across setDoc(); AppState::applyBodyVisibility() re-syncs it after every reload
     // and clearViewportForNewDoc() clears it.
-    void setHiddenBodies(const std::set<uint32_t>& bodyIds) { hidden_ = bodyIds; }
+    void setHiddenBodies(const std::set<uint32_t>& bodyIds) {
+        if (hidden_ == bodyIds) return;
+        hidden_ = bodyIds;
+        haveCachedFrame_ = false;
+    }
 
     // Keep picking in lock-step with Section View. A fragment is pickable only inside every
     // active section half-space: dot(world, normal[i]) <= offset[i].
@@ -172,10 +177,12 @@ private:
     float clipNormals_[3][3] = {{1,0,0},{0,1,0},{0,0,1}};
     float clipOffsets_[3] = {0,0,0};
 
-    // Frame cache (task 01): the last rendered id buffer is reused when its inputs are unchanged.
+    // The last rendered id buffer is reused when every draw input is unchanged. Input setters
+    // invalidate eagerly so an accidental read cannot consume old geometry/visibility/clip data;
+    // render() additionally validates camera, target size, and all draw inputs before reuse.
     IdPassFrameKey lastKey_;
-    bool haveCachedFrame_ = false;  // false until the first render() at the current buffer state
-    uint64_t docGen_ = 0;           // monotonically bumped by setDoc() to invalidate the cache
+    bool haveCachedFrame_ = false;
+    uint64_t docGen_ = 0;  // monotonically bumped by each topology upload in setDoc()
 };
 
 }  // namespace render

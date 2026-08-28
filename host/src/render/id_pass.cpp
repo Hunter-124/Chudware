@@ -100,13 +100,24 @@ IdPass::~IdPass() {
 }
 
 void IdPass::setSectionClip(int count, const float normals[3][3], const float offsets[3]) {
-    clipCount_ = count < 0 ? 0 : (count > 3 ? 3 : count);
+    const int nextCount = count < 0 ? 0 : (count > 3 ? 3 : count);
+    bool changed = nextCount != clipCount_;
+    for (int i = 0; !changed && i < nextCount; ++i) {
+        changed = clipNormals_[i][0] != normals[i][0] ||
+                  clipNormals_[i][1] != normals[i][1] ||
+                  clipNormals_[i][2] != normals[i][2] ||
+                  clipOffsets_[i] != offsets[i];
+    }
+    if (!changed) return;
+
+    clipCount_ = nextCount;
     for (int i = 0; i < clipCount_; ++i) {
         clipNormals_[i][0] = normals[i][0];
         clipNormals_[i][1] = normals[i][1];
         clipNormals_[i][2] = normals[i][2];
         clipOffsets_[i] = offsets[i];
     }
+    haveCachedFrame_ = false;
 }
 
 void IdPass::destroy() {
@@ -166,7 +177,7 @@ bool IdPass::setDoc(const DocMesh& doc, std::string& err) {
     if (!linked) { err = "id_pass program link failed"; return false; }
 
     destroy();  // drop old per-body buffers (keep prog_ + targets)
-    ++docGen_;                 // new geometry: invalidate the frame cache (task 01)
+    ++docGen_;  // every topology upload produces a distinct render input generation
     haveCachedFrame_ = false;
 
     // Bind pos (location 0, float3) + id (location 1, uint) attribute buffers into a fresh VAO and
@@ -258,13 +269,13 @@ bool IdPass::setDoc(const DocMesh& doc, std::string& err) {
     return true;
 }
 
-void IdPass::render(const Renderer::CameraXform& cam) {
-    if (!built_) return;
+bool IdPass::render(const Renderer::CameraXform& cam) {
+    if (!built_ || cam.ssWidth <= 0 || cam.ssHeight <= 0) return false;
 
-    // Frame cache (task 01: selection lag). Fingerprint everything the draws depend on; if it
-    // matches the last rendered frame, the offscreen id buffer is still valid and we skip the
-    // O(bodies) redraw entirely. This is what keeps hover/pick instant in large assemblies — a
-    // static camera no longer re-renders every body's faces/edges/verts each frame.
+    // Fingerprint every input consulted by the draw. The viewport invokes this only when it is
+    // about to read a pick (or service the scripted pick driver), so non-viewport interaction does
+    // not even enter the pass. Repeated hover with unchanged inputs reaches this cheap comparison;
+    // camera, framebuffer size, topology upload, visibility, or active clip changes force a redraw.
     IdPassFrameKey key;
     std::memcpy(key.mvp, cam.mvp.m, sizeof(key.mvp));
     key.w = cam.ssWidth;
@@ -278,7 +289,7 @@ void IdPass::render(const Renderer::CameraXform& cam) {
     }
     key.hiddenHash = idPassHiddenHash(hidden_);
     key.docGen = docGen_;
-    if (haveCachedFrame_ && key == lastKey_) return;  // cached id buffer still valid — skip redraw
+    if (haveCachedFrame_ && key == lastKey_) return true;
 
     allocTargets(cam.ssWidth, cam.ssHeight);
 
@@ -347,14 +358,15 @@ void IdPass::render(const Renderer::CameraXform& cam) {
     glBindVertexArray(0);
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
 
-    // The id buffer now reflects `key`; reuse it until one of these inputs changes (task 01).
+    // The id buffer now reflects `key`; reuse it until one of these inputs changes.
     lastKey_ = key;
     haveCachedFrame_ = true;
+    return true;
 }
 
 PickHit IdPass::pickFinal(int px, int py, int finalW, int finalH) {
     PickHit empty;
-    if (!built_ || finalW <= 0 || finalH <= 0) return empty;
+    if (!built_ || !haveCachedFrame_ || finalW <= 0 || finalH <= 0) return empty;
     if (px < 0 || py < 0 || px >= finalW || py >= finalH) return empty;
 
     // Map final (top-left) pixel -> supersampled (bottom-left) pixel. Sample the SS-block center.
@@ -384,7 +396,8 @@ PickHit IdPass::pickFinalPreferEdge(int px, int py, int finalW, int finalH, int 
     PickHit center = pickFinal(px, py, finalW, finalH);
     // A vertex/edge already under the cursor wins outright (it's exactly what was asked for).
     if (center.kind == PickKind::Edge || center.kind == PickKind::Vertex) return center;
-    if (!built_ || finalW <= 0 || finalH <= 0 || radiusPx <= 0) return center;
+    if (!built_ || !haveCachedFrame_ || finalW <= 0 || finalH <= 0 || radiusPx <= 0)
+        return center;
     if (px < 0 || py < 0 || px >= finalW || py >= finalH) return center;
 
     // Map the cursor + search radius into supersampled (GL bottom-left) space and read one block.

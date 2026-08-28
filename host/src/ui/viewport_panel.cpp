@@ -1989,6 +1989,8 @@ static bool dimHandleGeometry(AppState& st, const Renderer& renderer, const ImVe
 // owns the live preview and the single OK/Cancel commit, so there is no separate doc op to manage.)
 
 void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
+    // Valid only for an explicit pick demand serviced by this invocation.
+    st.pickReady = false;
     if (!st.renderer) return;
     Renderer& renderer = *st.renderer;
     // Liquid-glass v2 (H6a): st.renderer is a stable singleton for the app's lifetime (set once
@@ -2534,6 +2536,17 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
 
         // ---- topology picking (C15): id pass + overlay highlights drawn over the shaded view ----
         const bool picking = st.hasDocMesh && st.idPass && st.overlays;
+        // Refresh lazily at the point of read. render() validates the complete draw key, so this is
+        // a no-op for an unchanged hover while frames woken by typing or other panels do no ID-pass
+        // work at all. Re-sample section state here because a section interaction may change it
+        // after the visual overlay was configured earlier in the frame.
+        auto ensurePickFresh = [&]() {
+            float pickClipN[3][3] = {{1,0,0},{0,1,0},{0,0,1}};
+            float pickClipOff[3] = {0,0,0};
+            const int pickClipCount = renderer.sectionClip(pickClipN, pickClipOff);
+            st.idPass->setSectionClip(pickClipCount, pickClipN, pickClipOff);
+            st.pickReady = st.idPass->render(renderer.camera());
+        };
         if (picking) {
             float clipN[3][3] = {{1,0,0},{0,1,0},{0,0,1}};
             float clipOff[3] = {0,0,0};
@@ -2546,9 +2559,9 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
             // that in too so authored widths stay constant in screen px after the upscale.
             st.overlays->setWidthScale((float)renderer.supersample() * renderer.renderScale() *
                                        ui::uiScale);
-            // Render the R32UI id buffer for this exact camera frame so picks are pixel-accurate.
-            st.idPass->render(renderer.camera());
-            st.pickReady = true;
+            // The scripted center-pick consumer runs after this panel, so satisfy that explicit
+            // demand here. Normal mouse hover/picks refresh at their read sites below.
+            if (st.wantPick) ensurePickFresh();
             // Re-draw hover + selection highlights into the studio color FBO before it's sampled.
             renderer.beginOverlay();
             // C37-C item 4: draw feature-highlight faces first (underneath selection/hover) using
@@ -3636,6 +3649,7 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
             if (imgHovered && !s_lmbDragActive && st.idPass) {
                 int px = (int)(io.MousePos.x - vr0.x);
                 int py = (int)(io.MousePos.y - vr0.y);
+                ensurePickFresh();
                 st.hover = st.idPass->pickFinal(px, py, vw, vh);
             } else {
                 st.hover = render::PickHit{};
@@ -3875,6 +3889,7 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
                 // radius for the tools that explicitly hunt edges (Convert Entities, edge wells).
                 // pickFinalPreferEdge falls back to the exact-pixel face when nothing thin is in range.
                 const float snapRadius = preferEdge ? 14.0f : 7.0f;
+                ensurePickFresh();
                 st.hover = st.idPass->pickFinalPreferEdge(px, py, vw, vh,
                                                           (int)(snapRadius * ui::uiScale));
             } else {

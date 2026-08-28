@@ -17,6 +17,20 @@ Unset defaults to `playwright` on macOS and `cef` on Linux/Windows. See the
 [canonical macOS Parts Library platform note](https://chudware.com/docs/troubleshooting/#macos-parts-library-vendor-access);
 release notes should link there rather than duplicate its wording.
 
+## Why the CEF backend remains
+
+An August 2026 audit considered Chudcode's `browser` and `computer` tools. They work in their
+intended harness, but are currently in-process AgentTools rather than a stable bridge, CLI,
+or library API callable by this service. The `browser` and relay modes use CDP-family
+transports, so they are not substitutes for the CEF daemon's deliberately no-CDP vendor
+anti-bot path. `computer` drives an isolated Xvfb desktop but does not expose an embeddable
+texture or off-screen frame source suitable for `IWebViewBackend`.
+
+Keep the CEF guidance above. Re-evaluate a Chudcode integration only when upstream provides
+a **stable callable service/library API plus a non-CDP vendor transport and/or an embeddable
+off-screen frame surface**. This records an integration-capability mismatch, not a general
+failure of Chudcode.
+
 One-time setup (already done in the shared mcp-venv; needed again only for a
 fresh venv). **Never auto-downloads at import** — provision explicitly:
 

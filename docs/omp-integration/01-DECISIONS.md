@@ -64,6 +64,17 @@ the "Open decisions" section of `00-OPTIONS-AND-DECISIONS.md`. Implementation fo
   (board→compile→flash→debug/serial + editor + AI copilot in one scaled view).
 - **Cross-platform + local/webui parity is a hard requirement.** Keep it clean, YAGNI.
 
+## Browser automation
+- **No Chudcode browser cutover was attempted.** The audited `browser` and `computer` tools
+  work in their intended harness, but are currently exposed only as in-process AgentTools,
+  without a stable bridge, CLI, or library entry point callable by CAD.
+- `browser` and relay modes use CDP-family transports, which do not satisfy the deliberately
+  no-CDP CEF vendor/anti-bot path. `computer` drives an isolated Xvfb desktop; it does not
+  expose an embeddable texture or off-screen frame source for CAD's web-view surface.
+- Reconsider integration when upstream provides a **stable callable service/library API plus
+  a non-CDP vendor transport and/or an embeddable off-screen frame surface**. This is a
+  current integration-capability mismatch, not a claim that Chudcode is generally broken.
+
 ## Runtime / distribution
 - Bundle **bun** (hard dep: `bun:sqlite`) in the AppDir/installer, per-OS/arch. Bundle
   **pi-natives** only where the snapcompact image tier runs. Bridge runs `bun install` once

@@ -754,6 +754,7 @@ BuiltContext build_context(const DesignState& state, const std::string& role,
     BuiltContext out;
     out.system = system;
     out.body = body;
+    out.prompt_source = pr.second;
     // Python: len(system) + len(body) — Unicode code points, not bytes.
     out.context_chars = utf8_len(system) + utf8_len(body);
     out.context_tokens_est = est_tokens(system) + est_tokens(body);

@@ -6,6 +6,7 @@
 #include "agent/config.h"
 #include "agent/machine.h"
 #include "agent/state.h"
+#include "agent/roles.h"
 #include "agent/events.h"
 #include "agent/ops_emit.h"
 #include "agent/complexity.h"
@@ -2751,4 +2752,31 @@ TEST_CASE("compliance_mode=local_only refuses non-loopback, redact threads descr
     CHECK_FALSE(redact.contains("error"));
     CHECK(redact.value("compliance_mode", std::string()) == "redact");
     CHECK(redact.value("offline_safe", true) == false);
+}
+
+TEST_CASE("BuiltContext carries the prompt source telemetry used to re-load") {
+    // agent_call / the reviewer stage used to call load_prompt() a SECOND time with
+    // default flags purely to recover the source path for telemetry. build_context now
+    // carries it. The source path depends only on (role, prompts_dir) + the override
+    // file, never on the cheatsheet flags, so telemetry is byte-identical to the old
+    // second load — and only one prompt assembly happens per model call.
+    DesignState st;
+    st.request = "make a 20mm cube";
+
+    BuiltContext intake = build_context(st, "intake", /*prompts_dir=*/"", kContextTokenCap);
+    CHECK_FALSE(intake.prompt_source.empty());
+    CHECK(intake.prompt_source == load_prompt("intake", /*prompts_dir=*/"").second);
+
+    // An ops role with Solo complexity loads the SLIM cheatsheet (different system text,
+    // different load_prompt flags) yet reports the same source path telemetry recorded.
+    st.complexity = Complexity::Solo;
+    st.complexity_set = true;
+    BuiltContext solo = build_context(st, "modeler", /*prompts_dir=*/"", kContextTokenCap);
+    CHECK(solo.prompt_source == load_prompt("modeler", /*prompts_dir=*/"").second);
+
+    st.complexity = Complexity::Standard;
+    BuiltContext full = build_context(st, "modeler", /*prompts_dir=*/"", kContextTokenCap);
+    CHECK(full.prompt_source == solo.prompt_source);
+    // Guard the premise: the two systems really are different assemblies of one source.
+    CHECK(full.system != solo.system);
 }

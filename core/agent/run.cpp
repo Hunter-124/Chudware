@@ -434,9 +434,8 @@ AgentCall agent_call(const ProviderFn& provider, const DesignState& state, const
                      const std::string& extra_directive = std::string()) {
     BuiltContext bc = build_context(state, role, prompts_dir, context_cap);
     std::string system = "ROLE: " + role + "\n" + bc.system;
-    auto pr = load_prompt(role, prompts_dir);
     AgentCall ac;
-    ac.prompt_file = pr.second;
+    ac.prompt_file = bc.prompt_source;
     ac.prompt_hash = prompt_hash(system);
     ac.context_chars = bc.context_chars;
     ac.context_tokens_est = bc.context_tokens_est;
@@ -2507,9 +2506,8 @@ json run_design(const std::string& request, const std::string& doc_id, const jso
             if (rr.value("ok", false)) st.last_render = png.string();
         }
         BuiltContext bc = build_context(st, "reviewer", prompts_dir, review_ctx_cap);
-        auto pr = load_prompt("reviewer", prompts_dir);
         StageOutcome o;
-        o.prompt_file = pr.second;
+        o.prompt_file = bc.prompt_source;
         o.prompt_hash = prompt_hash(bc.system);  // reviewer system is NOT role-prefixed here,
         // mirroring run.py review() which hashes the bare build_context system (not "ROLE:..").
         o.context_chars = bc.context_chars;

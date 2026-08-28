@@ -145,6 +145,10 @@ void plan_display_meta(const ojson& plan, std::string& title_out, std::string& s
 struct BuiltContext {
     std::string system;
     std::string body;  // the single user message's joined text
+    // Path the role prompt was read from (override file or built-in source), as
+    // resolved by the load_prompt() call that produced `system`. Carried here so
+    // telemetry reports the source of the prompt actually used without a second load.
+    std::string prompt_source;
     int context_chars = 0;
     int context_tokens_est = 0;
     bool trimmed = false;  // true if a block was dropped or hard-truncated to fit the cap

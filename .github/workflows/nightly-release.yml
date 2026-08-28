@@ -324,6 +324,7 @@ jobs:
 
           cmake --preset "${CORE_PRESET}" \
             -DCHUDWARE_DEVELOPER_BUILD=OFF \
+            -DCHUDWARE_LTO=ON \
             -DCHUDWARE_VERSION_OVERRIDE="${RELEASE_VERSION}" \
             -DCHUDWARE_PROTECTED_ASSETS_DIR="${GITHUB_WORKSPACE}/${protected_assets}"
           cmake --build --preset "${CORE_PRESET}"
@@ -337,6 +338,7 @@ jobs:
           cmake -S host -B "${HOST_BUILD_DIR}" -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
             -DCHUDWARE_DEVELOPER_BUILD=OFF \
+            -DCHUDWARE_LTO=ON \
             -DCHUDWARE_VERSION_OVERRIDE="${RELEASE_VERSION}" \
             -DCHUDWARE_PROTECTED_ASSETS_DIR="${GITHUB_WORKSPACE}/${protected_assets}" \
             -DCEF_ROOT="${cef_root}"
@@ -1156,6 +1158,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
           & cmake --preset $env:CORE_PRESET -DCHUDWARE_DEVELOPER_BUILD=OFF `
+            -DCHUDWARE_LTO=ON `
             "-DCHUDWARE_VERSION_OVERRIDE=$env:RELEASE_VERSION" `
             "-DCHUDWARE_PROTECTED_ASSETS_DIR=$env:GITHUB_WORKSPACE/$protected"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
@@ -1172,6 +1175,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           & cmake -S host -B $env:HOST_BUILD_DIR -G Ninja -DCMAKE_BUILD_TYPE=Release `
             -DCHUDWARE_DEVELOPER_BUILD=OFF `
+            -DCHUDWARE_LTO=ON `
             "-DCHUDWARE_VERSION_OVERRIDE=$env:RELEASE_VERSION" `
             "-DCHUDWARE_PROTECTED_ASSETS_DIR=$env:GITHUB_WORKSPACE/$protected"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
@@ -1752,6 +1756,7 @@ jobs:
 
           cmake --preset "${CORE_PRESET}" \
             -DCHUDWARE_DEVELOPER_BUILD=OFF \
+            -DCHUDWARE_LTO=ON \
             -DCHUDWARE_VERSION_OVERRIDE="${RELEASE_VERSION}" \
             -DCHUDWARE_PROTECTED_ASSETS_DIR="${GITHUB_WORKSPACE}/${protected_assets}"
           cmake --build --preset "${CORE_PRESET}"
@@ -1765,6 +1770,7 @@ jobs:
           cmake -S host -B "${HOST_BUILD_DIR}" -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
             -DCHUDWARE_DEVELOPER_BUILD=OFF \
+            -DCHUDWARE_LTO=ON \
             -DCHUDWARE_VERSION_OVERRIDE="${RELEASE_VERSION}" \
             -DCHUDWARE_PROTECTED_ASSETS_DIR="${GITHUB_WORKSPACE}/${protected_assets}" \
             -DCEF_ROOT="${cef_root}"

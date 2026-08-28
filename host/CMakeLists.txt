@@ -45,6 +45,23 @@ if(CHUDWARE_DEVELOPER_BUILD)
   add_compile_definitions(CHUDWARE_DEVELOPER_BUILD=1)
 endif()
 
+# Link-time optimization is opt-in so developer and gate builds retain their fast links.
+# Release packaging enables it explicitly; unsupported toolchains degrade to a warning.
+option(CHUDWARE_LTO "Enable interprocedural (link-time) optimization for release artifacts" OFF)
+if(CHUDWARE_LTO)
+  if(POLICY CMP0069)
+    cmake_policy(SET CMP0069 NEW)
+    set(CMAKE_POLICY_DEFAULT_CMP0069 NEW)
+  endif()
+  include(CheckIPOSupported)
+  check_ipo_supported(RESULT _chudware_ipo_ok OUTPUT _chudware_ipo_msg LANGUAGES CXX)
+  if(_chudware_ipo_ok)
+    message(STATUS "CHUDWARE_LTO: interprocedural optimization ENABLED")
+  else()
+    message(WARNING "CHUDWARE_LTO requested but IPO unsupported by this toolchain: ${_chudware_ipo_msg}")
+  endif()
+endif()
+
 if(MSVC)
   add_compile_options(/utf-8 /MP)
 endif()
@@ -189,7 +206,6 @@ set(CHUDWARE_CORE_SOURCES
   src/core/doc_mirror.cpp
   ../services/worker/cpp_core.cpp
   ../core/util/platform_paths.cpp # executablePath(): one readlink/_NSGetExecutablePath/GetModuleFileNameW
-  ../services/worker/worker_router.cpp
   src/ui/feature_tree.cpp
   src/ui/feature_tree_nested.cpp # recursive cached referenced-part/assembly document tree
   src/ui/component_features.cpp  # assembly tree: cached read of a component `.step+` feature list
@@ -382,6 +398,10 @@ else()
   add_executable(Chudware ${CHUDWARE_NATIVE_SOURCES})
 endif()
 
+if(CHUDWARE_LTO AND _chudware_ipo_ok)
+  set_property(TARGET Chudware PROPERTY INTERPROCEDURAL_OPTIMIZATION ON)
+endif()
+
 
 # Embed the Windows application icon + version info into chudware.exe so File
 # Explorer and the taskbar show the brand icon instead of the default. The .rc
@@ -527,6 +547,18 @@ elseif(APPLE)
   target_link_options(Chudware PRIVATE $<$<CONFIG:Release>:-Wl,-x>)
 else()
   target_link_options(Chudware PRIVATE $<$<CONFIG:Release>:-Wl,--strip-all>)
+endif()
+
+if(APPLE AND CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+  target_compile_options(Chudware PRIVATE
+    $<$<CONFIG:Release>:-ffunction-sections>
+    $<$<CONFIG:Release>:-fdata-sections>)
+  target_link_options(Chudware PRIVATE $<$<CONFIG:Release>:-Wl,-dead_strip>)
+elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+  target_compile_options(Chudware PRIVATE
+    $<$<CONFIG:Release>:-ffunction-sections>
+    $<$<CONFIG:Release>:-fdata-sections>)
+  target_link_options(Chudware PRIVATE $<$<CONFIG:Release>:-Wl,--gc-sections>)
 endif()
 if(WIN32)
   target_link_libraries(Chudware PRIVATE dwmapi comdlg32 dbghelp)  # comdlg32: C41 file dialogs; dbghelp: crash stack/minidump

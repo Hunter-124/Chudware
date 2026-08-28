@@ -3,7 +3,7 @@
 # Two phase: --prepare-signing --key-id ID retains the immutable .app and emits a preimage;
 # --finalize-signing SIG --release-public-key KEY seals and archives that exact retained bundle.
 # Release configure: generate into host/build-macos-<arch>/generated/protected-assets, then
-# configure host and core/hostd with -DCHUDWARE_DEVELOPER_BUILD=OFF.
+# configure host and core/hostd with -DCHUDWARE_DEVELOPER_BUILD=OFF -DCHUDWARE_LTO=ON.
 set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"

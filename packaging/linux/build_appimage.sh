@@ -7,7 +7,7 @@
 #   python3 packaging/embed_protected_assets.py --source-root . \
 #     --output-dir host/build-linux/generated/protected-assets
 #   cmake -S host -B host/build-linux -G Ninja -DCMAKE_BUILD_TYPE=Release \
-#     -DCHUDWARE_DEVELOPER_BUILD=OFF
+#     -DCHUDWARE_DEVELOPER_BUILD=OFF -DCHUDWARE_LTO=ON
 #   ninja -C host/build-linux Chudware
 #
 # Usage:

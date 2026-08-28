@@ -107,10 +107,12 @@ jobs:
           protected_assets="${{ matrix.host_build_dir }}/generated/protected-assets"
           python3 packaging/embed_protected_assets.py --source-root . --output-dir "$protected_assets"
           cmake --preset "${{ matrix.preset }}" -DCHUDWARE_DEVELOPER_BUILD=OFF \
+            -DCHUDWARE_LTO=ON \
             -DCHUDWARE_PROTECTED_ASSETS_DIR="$GITHUB_WORKSPACE/$protected_assets"
           cmake --build --preset "${{ matrix.preset }}"
           cmake -S host -B "${{ matrix.host_build_dir }}" -G Ninja \
             -DCMAKE_BUILD_TYPE=Release -DCHUDWARE_DEVELOPER_BUILD=OFF \
+            -DCHUDWARE_LTO=ON \
             -DCHUDWARE_PROTECTED_ASSETS_DIR="$GITHUB_WORKSPACE/$protected_assets"
           cmake --build "${{ matrix.host_build_dir }}"
           grep -Fqx 'CHUDWARE_DEVELOPER_BUILD:BOOL=OFF' "build/${{ matrix.preset }}/CMakeCache.txt"

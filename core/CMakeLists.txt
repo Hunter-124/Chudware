@@ -86,6 +86,16 @@ if(CHUDWARE_LTO)
   endif()
 endif()
 
+# Split every Release object feeding the shared engine so the final ELF/Mach-O link can
+# discard unreachable code and data. Developer configurations and unsupported platforms
+# retain their existing compiler flags.
+if((APPLE OR CMAKE_SYSTEM_NAME STREQUAL "Linux") AND
+   CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+  add_compile_options(
+    $<$<CONFIG:Release>:-ffunction-sections>
+    $<$<CONFIG:Release>:-fdata-sections>)
+endif()
+
 # Wave 2: provision + link the OCCT 3D B-rep kernel. OFF keeps the fast solver
 # build (Wave 1) self-contained; -DCHUDWARE_WITH_OCCT=ON auto-downloads OCCT and
 # builds the geometry kernel + smoke test (see cmake/ProvisionOCCT.cmake).
@@ -2320,10 +2330,15 @@ if(CHUDWARE_WITH_OCCT)
     target_compile_options(chudware PRIVATE /Zi)
     target_link_options(chudware PRIVATE /DEBUG /OPT:REF /OPT:ICF)
   elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
-    # On ELF, keep our default-visible symbols in the dynamic symbol table for the sampling
-    # profiler's dladdr() lookup. Mach-O dylibs already export default-visible symbols, so macOS
-    # needs neither GNU ld's --export-dynamic nor ld64's executable-only -export_dynamic.
-    target_link_options(chudware PRIVATE -Wl,--export-dynamic)
+    # Keep default-visible symbols available to the sampling profiler's dladdr() lookup while
+    # allowing the Release linker to discard unreachable function and data sections.
+    target_link_options(chudware PRIVATE
+      -Wl,--export-dynamic
+      $<$<CONFIG:Release>:-Wl,--gc-sections>)
+  elseif(APPLE AND CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    # Mach-O dylibs already export default-visible symbols; ld64 needs no executable-only
+    # -export_dynamic flag, and dead stripping is confined to Release artifacts.
+    target_link_options(chudware PRIVATE $<$<CONFIG:Release>:-Wl,-dead_strip>)
   endif()
   set_target_properties(chudware PROPERTIES
     OUTPUT_NAME libchudware   # Windows: libchudware.dll. With PREFIX "" below, Linux: libchudware.so
@@ -2406,6 +2421,16 @@ if(CHUDWARE_WITH_OCCT)
     # Job Objects, CreateProcessW) is kernel32, linked by default.
     target_link_libraries(chudware-hostd PRIVATE advapi32)
   else()
+    if(UNIX)
+      find_library(CHUDWARE_TCMALLOC_MINIMAL_LIBRARY NAMES tcmalloc_minimal)
+      if(CHUDWARE_TCMALLOC_MINIMAL_LIBRARY)
+        target_link_libraries(chudware-hostd PRIVATE
+          "$<$<CONFIG:Release>:${CHUDWARE_TCMALLOC_MINIMAL_LIBRARY}>")
+        message(STATUS "chudware-hostd: Release tcmalloc_minimal enabled")
+      else()
+        message(STATUS "chudware-hostd: tcmalloc_minimal not found")
+      endif()
+    endif()
     # Optional system tray (libappindicator3). Disable at runtime with
     # CHUDWARE_HOSTD_TRAY=0, or at configure time by leaving the package missing.
     find_package(PkgConfig QUIET)

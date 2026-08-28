@@ -14,6 +14,7 @@
       "binaryDir": "${sourceDir}/build/linux-core",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Release",
+        "CHUDWARE_LTO": "ON",
         "CHUDWARE_BUILD_CORE": "ON",
         "CHUDWARE_WITH_OCCT": "ON",
         "CHUDWARE_WITH_NETGEN": "ON"
@@ -27,6 +28,7 @@
       "binaryDir": "${sourceDir}/build/windows-core",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Release",
+        "CHUDWARE_LTO": "ON",
         "CHUDWARE_BUILD_CORE": "ON",
         "CHUDWARE_WITH_OCCT": "OFF"
       },
@@ -44,6 +46,7 @@
       "binaryDir": "${sourceDir}/build/windows-occt",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Release",
+        "CHUDWARE_LTO": "ON",
         "CHUDWARE_BUILD_CORE": "ON",
         "CHUDWARE_WITH_OCCT": "ON"
       },
@@ -61,6 +64,7 @@
       "binaryDir": "${sourceDir}/build/macos-arm64",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Release",
+        "CHUDWARE_LTO": "ON",
         "CMAKE_OSX_ARCHITECTURES": "arm64",
         "CMAKE_PREFIX_PATH": "/opt/homebrew",
         "CHUDWARE_BUILD_CORE": "ON",
@@ -82,6 +86,7 @@
       "binaryDir": "${sourceDir}/build/macos-x86_64",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Release",
+        "CHUDWARE_LTO": "ON",
         "CMAKE_OSX_ARCHITECTURES": "x86_64",
         "CMAKE_PREFIX_PATH": "/usr/local",
         "CHUDWARE_BUILD_CORE": "ON",

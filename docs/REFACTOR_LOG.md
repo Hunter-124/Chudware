@@ -1394,3 +1394,105 @@ gateway's `personal` scope matches that intent, but its `shared` scope (an opera
 account backing a managed pool) is pooled reuse that §4.4 does not cover. Remedy is one of
 two lines — remove the flow, or record an owner-approved exception in
 `contracts/providers.md` and add a narrow ALLOWLIST entry. Do not fabricate the approval.
+
+## 2026-08-28 — a deduplication and performance pass, and the browser cutover that isn't one
+
+Eight parallel read-only audits (browser migration, agent/copilot duplication, host frame loop,
+core kernel, parts latency, build flags, services complexity, repo hygiene) fed one implementation
+wave. Everything below is measured or reference-checked; the negative results are recorded with
+the same weight as the changes.
+
+**The Chudcode browser capability cannot replace CEF yet, and that is an upstream fact, not a
+packaging gap.** Chudcode's `browser`/`computer` tools live in `packages/coding-agent` and are
+reachable only from inside a live agent turn — no CLI subcommand, no RPC, no importable service —
+and `scripts/vendor_omp.py` deliberately does not vendor that package. Even reachable, they are
+the wrong shape twice over: every non-cmux browser mode is CDP, and CAD moved to CEF precisely
+because the CDP `Runtime.enable` handshake is what vendor bot walls fingerprint
+(`services/browser/cef_client.py`'s own header says so); and the three GUI consumers of
+`ui::IWebViewBackend` (`parts_browser_panel.cpp` vendor sign-in, `oauth_capture.cpp`, `web_panel.cpp`)
+need an embeddable off-screen frame source, which `computer`'s private Xvfb stage is not. The
+decision and the exact upstream prerequisite — a callable service API plus either a non-CDP vendor
+transport or a texture-handoff surface — are recorded in `docs/omp-integration/01-DECISIONS.md`
+and `services/browser/README.md` so this is not re-attempted blind.
+
+**Copy amplification on the hottest RPC.** `apply_ops_locked` (`core/doc/session.cpp`) took a
+speculative rollback snapshot on EVERY edit: a second full copy of the document tree plus deep
+copies of both undo and redo stacks (each budgeted to 256 MB), then pushed undo BEFORE knowing
+whether compile would accept the batch. The pre-edit tree is now moved, not copied, the undo push
+is deferred until compile succeeds (a new explicit-document helper; `push_undo` is unchanged for
+its other callers), and failure restores by move — so the history vectors are never copied at all.
+`stepplus_doc_hash` similarly copied the whole tree just to erase one root key before
+`canonical_doc_json` copied it again to round floats; the rounding traversal now takes an
+optional root-only key to omit, halving that work on the doc_save/doc_open cache-validation path.
+Both are byte-identical in output, pinned by `document`, `import_roundtrip` and `sketch3d_doc`.
+
+**The GUI was re-rendering the picking buffer for nothing.** `viewport_panel.cpp` ran a full
+second offscreen geometry pass into the ID framebuffer every woken frame a mesh was loaded —
+including every frame spent typing in chat — while the `glReadPixels` consumers were correctly
+gated on hover. `IdPass` now owns its own freshness: camera matrices, target size, topology
+uploads, body visibility and section clipping invalidate the cached frame, readback refuses when
+no valid frame exists, and the viewport forces a refresh immediately before a real pick or a
+scripted one. Parts results stopped demanding thumbnails for all 100 hits on first paint (grid
+and list are clipped to the visible range plus a screen of prefetch, dedup untouched), and warm
+`vendor_results.sqlite` hits no longer queue behind the three-wide CEF scrape semaphore — the
+slot is now taken only around the real `_search`, with the cancellation recheck moved inside it.
+`scan_library_folder` did N+1 full-catalog FTS rebuilds and N whole-file registry rewrites for N
+files; it now registers in bulk, persists once and rebuilds once. `SimManager`'s EM and DC-sweep
+blocker ladders existed twice each (dispatch and draw), one of them issuing a `stat()` per frame;
+they are single const helpers with the STL-existence result cached by path — the DC pair's two
+observably different strings are preserved deliberately.
+
+**Dead code, with the callers checked in both languages.** Gone: `drawPlanCard` (zero call sites;
+`chat_log.cpp` already inlines the same normalize+draw), `mission_dispatch.route_request` (the
+live GUI lane calls `run_linear_role_turn` directly from `worker_rpc._agent_admin_turn`; only its
+own tests and stale prose referenced it), `services/worker/worker_router.{h,cpp}` (superseded by
+`worker_client.cpp`'s own routing flags at T-RF21, still compiled into the host binary), and the
+Settings "Load built-in prompt" button with its `get_prompts` RPC — it loaded `loop.py`'s
+SYSTEM_PROMPT, which still described the DELETED build123d two-fenced-block contract, straight
+into a live override on the tool-calling lane. Three duplicated platform runs-dir resolvers in
+`services/dag` now import `executor.default_runs_dir`, and `close_part` finally evicts
+`_LAST_VOLUME`/`_PROCESS_DOCS` like its sibling caches (a refused close still evicts nothing).
+
+**Build flags: the LTO option that existed and was never used.** `CHUDWARE_LTO` has been defined,
+`check_ipo_supported`-guarded and documented as release-only in `core/CMakeLists.txt` for months,
+and no packaging script or workflow ever set it; `host/` had no equivalent at all. Both now have
+the same option, all five production presets and every native release/nightly host configure pass
+`-DCHUDWARE_LTO=ON`, and Release builds compile with `-ffunction-sections -fdata-sections` (core
+directory-wide so the static libraries feeding the engine are sectioned too) and link with
+`--gc-sections` / `-dead_strip`, preserving `--export-dynamic` for the sampling profiler's
+`dladdr()`. Developer and gate builds are untouched — they never invoke the presets. Measured on
+this box: a production host configured with LTO links clean and is 14.49 MB against 15.29 MB
+without. `chudware-hostd` picks up `tcmalloc_minimal` in Release when the library is present
+(absent here; the configure line says so rather than failing).
+
+**A production binary that printed a refusal and then hung forever.** Verifying the LTO build
+surfaced it: `chudware --version` on a build with `CHUDWARE_DEVELOPER_BUILD=OFF` and no payload
+manifest printed `installed payload integrity failed` and never exited — 600 s and still alive.
+The integrity refusal, the `--verify-payload-manifest` result (both branches) and the Windows
+update-recovery failure all used `return`, which deadlocks in global destruction on the detached
+`g_agentCtl` worker parked in `cv.wait` — exactly the trap `--version` documents thirty lines
+below and solves with `std::fflush(nullptr); std::_Exit(n)`. All four now take that tail. After:
+the same invocation exits 78 immediately. This only ever affected shipped builds, which is why
+nobody had seen it; the installer's own verify step would have hung the same way.
+
+**Housekeeping.** Five tracked artifacts the 2026-08-27 pass missed are gone and now ignored:
+`preflight_events.jsonl` (the repo-root default sink of `advisor/preflight.py`), the gym leftovers
+`bushing_flanged_20mm`, `hydraulic_manifold_block.cwpart.step+` (133 KB) and `runs/*.buildgraph.json`
+(the real sidecar dir is `~/.local/share/Chudware/runs`), and `.cursor/mcp.json.disabled`, which
+leaked an absolute home path past the ignore rule for its non-suffixed sibling.
+
+Verification: `scripts/check.py` 9/9 PASS; `./build.sh all` green; core `ctest` **103/103**;
+`services/agent` + `services/dag` 3801 passed, 42 skipped (the standing
+`test_prohibited_auth::test_no_consumer_oauth_token_reuse` red is deselected, unchanged and
+untouched — still the owner's `contracts/providers.md` §4.4 decision); `services/mcp` 2868 passed
+with four failures, all reproduced from PRISTINE HEAD sources against the same daemon
+(`test_fs_read_not_found_in_unreadable_parent_still_clean`,
+`test_inprocess_internal_agent_docs_are_registered_but_silent`) or caused by a long `TMPDIR`
+(`test_config_path_is_not_the_users`, `test_instance_key_parity_with_cpp`); five `CHUDWARE_SHOT`
+scenarios (m1, parts, workspaces, simdisc_em, sketch) exit 0. Deferred, honestly: T-PERF6b's
+out-of-line `embedded_brep` blob store is still the dominant import-heavy doc_open cost and needs
+its own migration-aware task; `libchudware.cpp`'s linear if/else RPC dispatch was measured as
+noise next to millisecond compile work and deliberately left alone; the MCP envelope-helper
+duplicates (~120 lines across nine files, four incompatible conventions) were scoped and not
+taken this pass.
+

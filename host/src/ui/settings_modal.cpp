@@ -70,7 +70,6 @@ struct PromptRecord {
 static std::vector<PromptRecord> s_promptRecs;
 static bool s_promptsLoaded = false;
 static bool s_promptsLoading = false;
-static bool s_builtinPromptLoading = false;
 static int  s_selectedRole  = 0;
 
 static std::string s_promptsError;
@@ -7258,33 +7257,6 @@ void drawSettingsModal(AppState& st, bool busy) {
                             }
                             ImGui::PopFont();
                             flushSystemPromptOverride(st, /*force=*/false);
-                            if (!canFetch || s_builtinPromptLoading) ImGui::BeginDisabled();
-                            if (ImGui::Button("Load built-in prompt")) {
-                                s_builtinPromptLoading = true;
-                                st.rpc.call("get_prompts", nlohmann::json::object(),
-                                            [&st](const core::RpcResult& r) {
-                                    s_builtinPromptLoading = false;
-                                    if (r.ok) {
-                                        std::fill(st.spBuf.begin(), st.spBuf.end(), 0);
-                                        std::strncpy(st.spBuf.data(),
-                                                     r.result.value("system_prompt", "").c_str(),
-                                                     st.spBuf.size() - 1);
-                                        commitSystemPromptOverride(st);  // deliberate load: persist
-                                    } else {
-                                        st.addLog("[err] get_prompts: " + r.err);
-                                    }
-                                }, 20000);
-                            }
-                            if (!canFetch || s_builtinPromptLoading) ImGui::EndDisabled();
-                            if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
-                                ImGui::SetTooltip(s_builtinPromptLoading
-                                    ? "Loading built-in prompt"
-                                    : "Copy the built-in prompt into the editor");
-                            if (s_builtinPromptLoading) {
-                                ImGui::SameLine();
-                                dimText("Loading\xe2\x80\xa6");
-                            }
-                            ImGui::SameLine();
                             if (ImGui::Button("Clear (use built-in)")) {
                                 std::fill(st.spBuf.begin(), st.spBuf.end(), 0);
                                 commitSystemPromptOverride(st);  // empty = built-in, persist now

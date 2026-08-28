@@ -8,7 +8,7 @@ what remains here are the services-side orchestration surfaces that legitimately
 Python:
 
   run_model (build123d script execution — needs an interpreter by nature),
-  get_prompts / list_editable_prompts / agent_cancel (no-op stub),
+  list_editable_prompts / agent_cancel (no-op stub),
   vendor-parts registry, deliverables, parts hub FTS, agent GUI seams, reveng,
   dag steering, subagent RPC, PLM vault, EM (T-SIM11 hold), multi-physics seam.
 
@@ -54,15 +54,6 @@ def _run_model(params: dict, _emit_event: EmitFn) -> dict:
     return asdict(res)
 
 
-def _get_prompts(_params: dict, _emit_event: EmitFn) -> dict:
-    """The built-in prompts (+ the active override) for the GUI's Settings editor."""
-    from services.agent import config, loop
-
-    return {"system_prompt": loop.SYSTEM_PROMPT,
-            "plan_prompt": loop.PLAN_PROMPT,
-            "override": config.load_config().get("system_prompt", "")}
-
-
 def _list_editable_prompts(_params: dict, _emit_event=None):
     """Settings → AI → Prompts: YAML mission roles + core .md prompts (merged)."""
     try:
@@ -89,7 +80,6 @@ def _agent_cancel(params: dict, _emit_event: EmitFn) -> dict:
 _METHODS = {
     "ping": _ping,
     "run_model": _run_model,
-    "get_prompts": _get_prompts,
     "list_editable_prompts": _list_editable_prompts,
     "agent_cancel": _agent_cancel,
 }

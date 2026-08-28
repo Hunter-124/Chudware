@@ -1,28 +1,16 @@
-"""test_router_dispatch.py — model-driven routing (harness overhaul).
+"""test_router_dispatch.py — live linear-turn and routing regression coverage.
 
-Proves ``services.agent.mission_dispatch.route_request`` after the deterministic
-structure gate was removed:
-
-  * EVERY request — file-org/cleanup/PLM *and* geometry-build — runs ONE
-    ``agent_turn.run_turn`` against the ``general_agent`` role card. There is no
-    keyword/regex classifier deciding dag-vs-linear anymore; ``general_agent`` is
-    the universal entry and decides for itself whether to finish inline,
-    ``delegate`` a scoped build, or ``mission_start`` the full build swarm.
-  * ``workflow_router.route`` still runs, but only to emit the
-    ``agent.classification`` telemetry the GUI Routing card renders — its
-    ``task_class`` is advisory; the executed ``role`` is always general_agent.
-  * The build swarm compiler (``build_mission_graph``) is untouched and still
-    compiles the classic intake -> BUILD -> VERIFY shape when the model escalates.
+Pins the real ``run_linear_role_turn`` entry, the advisory workflow-router
+classification telemetry rendered by the GUI Routing card, and the build-swarm
+DAG compiler used when the model escalates.  There is no deterministic
+dag-vs-linear structure gate.
 
 Discipline: scripted providers only (T-mega24-style), no model/network/port.
 Run: pytest services/agent/test_router_dispatch.py -q
 """
 from __future__ import annotations
 
-from services.agent.mission_dispatch import (
-    route_request,
-    run_linear_role_turn,
-)
+from services.agent.mission_dispatch import run_linear_role_turn
 
 
 class _ScriptedProvider:
@@ -59,10 +47,10 @@ _CLEANUP_REQUEST = (
 _BUILD_REQUEST = "design a two-part hinge assembly with clearance fit"
 
 
-class TestRouteRequestGeneralAgent:
-    """Every request runs the linear general_agent lane — the model decides."""
+class TestLinearRoleTurn:
+    """The worker-facing single-turn entry executes the requested role directly."""
 
-    def test_cleanup_request_runs_general_agent(self):
+    def test_general_agent_cleanup_uses_main_chat_loadout(self):
         dispatched: list[str] = []
 
         def _dispatch(tool, args):
@@ -74,24 +62,14 @@ class TestRouteRequestGeneralAgent:
             '```json\n{"tool": "plm_checkpoint", "args": {"message": "cleanup"}}\n```',
             "Cleaned up the project and checkpointed it; nothing else to do.",
         ])
-        events: list[tuple[str, dict]] = []
 
-        out = route_request(
-            _CLEANUP_REQUEST, "local-24k", provider,
-            on_event=lambda kind, payload: events.append((kind, payload)),
+        turn = run_linear_role_turn(
+            _CLEANUP_REQUEST,
+            "general_agent",
+            provider,
             tool_dispatch=_dispatch,
         )
 
-        assert out["ok"] is True
-        assert out["structure"] == "linear"
-        # Classification stays advisory (Routing card), role is always general.
-        assert out["task_class"] == "project_admin"
-        assert out["role"] == "general_agent"
-        # No DAG/swarm auto-compiled: no planner/modeler role name in the outcome.
-        assert "feature_modeler" not in str(out)
-        assert "spec_writer" not in str(out)
-
-        turn = out["turn"]
         assert turn["success"] is True
         assert turn["role"] == "general_agent"
         assert dispatched == ["fs_list", "plm_checkpoint"]
@@ -113,33 +91,35 @@ class TestRouteRequestGeneralAgent:
         for t in ("new_part", "add_features", "asm_add_component", "asm_mate"):
             assert t not in allowed, f"{t} must not be in the base general loadout"
 
-        # agent.classification fired once, before dispatch (Routing card).
-        kinds = [k for k, _ in events]
-        assert kinds.count("agent.classification") == 1
-        _, payload = events[0]
-        assert payload["task_class"] == "project_admin"
+    def test_router_classification_emits_routing_card_telemetry(self):
+        from services.agent import agent_events
+        from services.agent.pipeline import workflow_router
 
-    def test_build_request_also_runs_general_agent(self):
-        """A geometry-build request is no longer force-routed into the swarm:
-        it runs the general_agent turn, which decides whether/how to escalate."""
-        dispatched: list[str] = []
-        provider = _ScriptedProvider([
-            "This needs the build swarm; escalating.",
-        ])
-
-        out = route_request(
-            _BUILD_REQUEST, "local-24k", provider,
-            tool_dispatch=lambda t, a: (dispatched.append(t) or {"ok": True}),
+        route = workflow_router.route(_CLEANUP_REQUEST, "local-24k")
+        kind, payload = agent_events.classification_event(
+            "router-test",
+            task_class=route.task_class,
+            scaffold_level=route.scaffold_level,
+            tier="local-24k",
+            reason=route.reason,
+            request_snippet=_CLEANUP_REQUEST,
+            alternatives=route.alternatives,
         )
-        assert out["ok"] is True
-        assert out["structure"] == "linear"
-        assert out["role"] == "general_agent"
-        assert out["task_class"] == "assembly"  # advisory classification only
-        # The turn actually ran (model in the loop), not a deterministic bypass.
-        assert provider.calls >= 1
-        allowed = out["turn"]["allowed_tools"]
-        for t in ("mission_start", "delegate", "enable_tools"):
-            assert t in allowed, f"{t} (escalation lever) missing"
+        events: list[tuple[str, dict]] = []
+        agent_events.emit_event(
+            kind,
+            payload,
+            live=lambda event_kind, event_payload: events.append(
+                (event_kind, event_payload)
+            ),
+            journal=None,
+        )
+
+        assert len(events) == 1
+        event_kind, event_payload = events[0]
+        assert event_kind == "agent.classification"
+        assert event_payload["task_class"] == "project_admin"
+        assert event_payload["tier"] == "local-24k"
 
     def test_main_chat_runs_past_old_thirty_call_limit(self):
         """The old linear budget killed a composed 31st dispatch. Main chat now

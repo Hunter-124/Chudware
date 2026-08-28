@@ -1486,7 +1486,7 @@ OFFICE_METHODS: dict[str, Callable] = {
 # run.cpp has no tool-calling loop of its own (its pipeline is intake/plan/model —
 # geometry only). This RPC is the seam it calls out to: ONE bounded linear role
 # turn via ``mission_dispatch.run_linear_role_turn`` (T-W32) — the same machinery
-# a "linear" ``route_request`` dispatch and every sub-agent spawn already use — so
+# every sub-agent spawn uses — so
 # fs/plm/shell tools (and, on demand via enable_tools, any other pack) resolve
 # through the normal global tool registry instead of refusing the request. The
 # role defaults to ``general_agent`` (the inverted-default general lane); callers

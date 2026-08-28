@@ -1,5 +1,5 @@
 // Copilot cards (T-RF6 split of legacy_chat.cpp): the Plan/Objectives section (tiles + todos
-// tree + subagents, plus the drawPlanCard/drawPlanSection/drawPartsLine adapters declared in
+// tree + subagents, plus the drawPlanSection/drawPartsLine adapters declared in
 // core/app_state.h), the clarify + plan-approve cards, the corporate-org cards
 // (aicad.corporate/1), the exec-mode cards (swarm waves / eng-firm bids+award+team+comms /
 // advisor / sub-run), and the AI-VC (agent version control) checkpoint timeline + turn
@@ -785,18 +785,6 @@ void drawPlanSection(const PlanState& plan, const std::vector<ActivityItem>& act
     }
 }
 
-// Back-compat: legacy PlanInfo card → normalize to PlanState and draw the section.
-void drawPlanCard(const PlanInfo& plan, const std::vector<ActivityItem>& activity,
-                  const ui::Fonts& fonts) {
-    if (!plan.present) return;
-    PlanState ps = planStateFromPlanInfo(plan);
-    // Enrich part statuses from activity (same heuristic as the old card).
-    for (auto& it : ps.items) {
-        if (it.status.empty() || it.status == "pending")
-            it.status = planItemStatusFromActivity(it, activity);
-    }
-    drawPlanSection(ps, activity, fonts);
-}
 
 
 // One line "Parts: a, b, c" with each name tinted its assembly color.

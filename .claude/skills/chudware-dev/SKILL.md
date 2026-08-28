@@ -294,7 +294,8 @@ judgment).
   pulls modeling/sketch/sim/… on demand (verified:
   `enable_tools(categories=["modeling"])` unlocks `new_part` mid-turn) — never a
   multi-step plan forced onto basic work.
-  Python path: `mission_dispatch.route_request` always runs `general_agent`;
+  Python path: `worker_rpc._agent_admin_turn` calls
+  `mission_dispatch.run_linear_role_turn` with `general_agent` by default;
   `workflow_router.route`/`classify_task`/`structure_for_class` survive ONLY as
   advisory Routing-card telemetry (`agent.classification`), never a gate. C++ live
   path (the single in-app agent entry per `loop.py`): `run.cpp`'s pre-flight hands

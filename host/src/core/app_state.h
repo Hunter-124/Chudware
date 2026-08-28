@@ -833,10 +833,6 @@ void drawProseBox(const char* id, const std::string& text, float maxH, bool grow
 // the per-pair overlap volumes (red) and clearance gaps (dim) below it.
 void drawFitReadout(const FitReport& fit, bool detailed);
 
-// The build-plan card: an accent-edged panel listing each planned part.
-// Back-compat adapter — normalizes PlanInfo → PlanState and draws the Plan/Objectives section.
-void drawPlanCard(const PlanInfo& plan, const std::vector<ActivityItem>& activity,
-                  const ui::Fonts& fonts);
 // Multi-shape Plan / Objectives section (tiles + todos tree + subagents).
 void drawPlanSection(const PlanState& plan, const std::vector<ActivityItem>& activity,
                      const ui::Fonts& fonts);

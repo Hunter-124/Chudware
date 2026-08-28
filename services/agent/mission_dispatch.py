@@ -2377,28 +2377,6 @@ class MissionDispatch:
             blocked=bool(blocked),
         )
 
-# ---------------------------------------------------------------------------
-# Router-driven dispatch (workflow_router structure=="linear")
-# ---------------------------------------------------------------------------
-#
-# workflow_router.route() classifies a raw request into a TaskClass and, via
-# structure_for_class(), an execution *structure*: "dag" (the default 8-phase
-# intake->spec->build->verify->deliver swarm, compiled by
-# services.dag.mission_template.build_mission_graph) or "linear" (a single
-# services.agent.agent_turn.run_turn against one role's card — no swarm/dag
-# compilation at all). PROJECT_ADMIN (file-org/cleanup/PLM requests) is the
-# first "linear" class: routing it into the geometry BUILD swarm hands the
-# model geometry-only role tools and it fabricates a dummy part instead of
-# doing the file/PLM work the user actually asked for (4 live runs — see
-# ~/.local/share/Chudware/chat_history.json).
-#
-# route_request() is the entry a mission caller should run BEFORE compiling a
-# manifest/DAG: "dag" classes get back the router decision so the caller
-# proceeds with the EXISTING manifest -> build_mission_graph -> dag_run flow
-# unchanged; "linear" classes run to completion right here via
-# run_linear_role_turn(), reusing agent_turn.run_turn — the same single-turn
-# machinery MissionDispatch._run_subagent uses for sub-agent spawns — instead
-# of a new executor.
 
 
 # 2048 output tokens (agent_turn's `completion_cap` default) truncated the live
@@ -2577,11 +2555,9 @@ def run_linear_role_turn(
 ) -> dict[str, Any]:
     """Run ONE bounded ``agent_turn.run_turn`` against *role*'s card.
 
-    The linear-structure executor for ``workflow_router.RouterResult.structure
-    == "linear"``: no manifest, no DAG compilation — just the role's card + the
-    same file-handling floor every DAG-node/sub-agent gets
-    (``copilot_mode_tools.SUBAGENT_DEFAULT_TOOLS``), streamed through *on_event*
-    the same way a normal run is so the GUI chat renders it.
+    This is the real single-turn entry used by the worker RPC: no manifest or
+    DAG compilation, just the named role's card and its effective tool floor,
+    streamed through *on_event* so the GUI chat renders it.
 
     A delegation tree IS bound (see below): the role cards used on this path
     advertise ``delegate`` in their allowlist and their prompts tell the model to
@@ -2828,60 +2804,3 @@ def run_linear_role_turn(
     }
 
 
-def route_request(
-    request: str,
-    tier: str,
-    provider: Any,
-    *,
-    on_event: Optional[Callable[..., None]] = None,
-    run_id: str | None = None,
-    ledger: Any | None = None,
-    mission_dispatch: MissionDispatch | None = None,
-    capability: Any | None = None,
-    tool_dispatch: Optional[Callable[[str, dict], Any]] = None,
-    tuning: dict | None = None,
-) -> dict[str, Any]:
-    """Classify *request* for the advisory Routing card, then run it.
-
-    Model-driven routing (2026-07): there is NO deterministic structure gate.
-    EVERY request runs ONE ``run_linear_role_turn`` against ``general_agent`` —
-    the universal entry — which decides for itself whether to finish the work
-    inline, ``delegate`` a scoped build, or ``mission_start`` the full build
-    swarm. ``workflow_router.route`` is still consulted, but ONLY to emit the
-    ``agent.classification`` telemetry (contracts/agent_events.md) the GUI
-    Routing card renders; its ``structure``/``role`` are advisory, not a gate.
-    """
-    from services.agent.pipeline import workflow_router
-
-    route = workflow_router.route(request, tier, tuning=tuning, capability=capability)
-
-    if on_event is not None:
-        try:
-            from services.agent import agent_events as _ae  # noqa: PLC0415
-            _kind, _payload = _ae.classification_event(
-                run_id or "mission",
-                task_class=route.task_class,
-                scaffold_level=route.scaffold_level,
-                tier=tier,
-                reason=route.reason,
-                request_snippet=request[:120],
-                alternatives=route.alternatives,
-            )
-            _ae.emit_event(_kind, _payload, live=on_event, journal=None)
-        except Exception:  # noqa: BLE001 — telemetry must never block dispatch
-            pass
-
-    turn = run_linear_role_turn(
-        request, "general_agent", provider,
-        on_event=on_event, run_id=run_id, ledger=ledger,
-        mission_dispatch=mission_dispatch, capability=capability,
-        tool_dispatch=tool_dispatch,
-    )
-    return {
-        "ok": True,
-        "structure": "linear",
-        "task_class": route.task_class.value,
-        "role": "general_agent",
-        "route": route.to_dict(),
-        "turn": turn,
-    }

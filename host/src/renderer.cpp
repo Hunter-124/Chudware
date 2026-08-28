@@ -374,6 +374,16 @@ void eyeForView(const std::string& v, float& yaw, float& pitch) {
     else if (v == "top")   { yaw = 0.0f;   pitch = 89.5f; }
     else { yaw = 35.0f; pitch = 30.0f; }  // iso
 }
+
+// Cached origin-plane quad layout: per plane, 6 fill verts (two triangles) followed by the 4
+// border verts (a line loop). Draw ranges are plane*kPlaneQuadVerts + {0, 6}.
+constexpr int kPlaneQuadVerts = 10;
+
+// The GL-free datum builder reports primitive modes as raw numbers so it needs no GL header;
+// a drift between those and the real enums is a compile error, not garbled geometry.
+static_assert(render::kModeLines == GL_LINES, "datum batch mode must match GL_LINES");
+static_assert(render::kModeLineLoop == GL_LINE_LOOP, "datum batch mode must match GL_LINE_LOOP");
+static_assert(render::kModeTriangles == GL_TRIANGLES, "datum batch mode must match GL_TRIANGLES");
 }  // namespace
 
 Renderer::~Renderer() {
@@ -410,6 +420,8 @@ Renderer::~Renderer() {
     if (planeProg_) glDeleteProgram(planeProg_);
     if (planeVbo_) glDeleteBuffers(1, &planeVbo_);
     if (planeVao_) glDeleteVertexArrays(1, &planeVao_);
+    if (datumVbo_) glDeleteBuffers(1, &datumVbo_);
+    if (datumVao_) glDeleteVertexArrays(1, &datumVao_);
     if (capProg_) glDeleteProgram(capProg_);
     if (capVbo_) glDeleteBuffers(1, &capVbo_);
     if (capVao_) glDeleteVertexArrays(1, &capVao_);
@@ -511,15 +523,27 @@ bool Renderer::init(int width, int height, std::string& err) {
     if (!ok) { err = "downsample program link failed"; return false; }
     glGetProgramiv(kawaseProg_, GL_LINK_STATUS, &ok);
     if (!ok) { err = "kawase program link failed"; return false; }
+    cacheUniformLocations();  // one name lookup per uniform, for the life of the program
 
     glGenVertexArrays(1, &bgVao_);
 
-    // Dynamic buffer for reference-plane quads (6 verts/quad; re-filled per plane per frame).
+    // Origin reference-plane quads: 3 planes x (6 fill verts + 4 border verts), camera-independent
+    // and refilled by refreshPlaneQuads() only when center_/radius_ change.
     glGenVertexArrays(1, &planeVao_);
     glGenBuffers(1, &planeVbo_);
     glBindVertexArray(planeVao_);
     glBindBuffer(GL_ARRAY_BUFFER, planeVbo_);
-    glBufferData(GL_ARRAY_BUFFER, sizeof(float) * 3 * 6, nullptr, GL_DYNAMIC_DRAW);
+    glBufferData(GL_ARRAY_BUFFER, sizeof(float) * 3 * kPlaneQuadVerts * 3, nullptr,
+                 GL_DYNAMIC_DRAW);
+    glEnableVertexAttribArray(0);
+    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 3 * sizeof(float), (void*)0);
+    glBindVertexArray(0);
+
+    // Batched datum overlay geometry (grown on demand by refreshDatumBatch()).
+    glGenVertexArrays(1, &datumVao_);
+    glGenBuffers(1, &datumVbo_);
+    glBindVertexArray(datumVao_);
+    glBindBuffer(GL_ARRAY_BUFFER, datumVbo_);
     glEnableVertexAttribArray(0);
     glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 3 * sizeof(float), (void*)0);
     glBindVertexArray(0);
@@ -552,6 +576,68 @@ bool Renderer::init(int width, int height, std::string& err) {
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
     glEnable(GL_DEPTH_TEST);
     return true;
+}
+
+// Resolve every uniform location once, right after the programs link. The draw paths then read
+// ints instead of calling glGetUniformLocation (a driver-side name lookup) per uniform per frame.
+// A uniform the compiler optimized out resolves to -1, which glUniform* ignores — identical to the
+// previous behaviour, where the same -1 came back from every per-frame query.
+void Renderer::cacheUniformLocations() {
+    uFace_.mvp        = glGetUniformLocation(prog_, "uMVP");
+    uFace_.keyDir     = glGetUniformLocation(prog_, "uKeyDir");
+    uFace_.fillDir    = glGetUniformLocation(prog_, "uFillDir");
+    uFace_.rimDir     = glGetUniformLocation(prog_, "uRimDir");
+    uFace_.camPos     = glGetUniformLocation(prog_, "uCamPos");
+    uFace_.color      = glGetUniformLocation(prog_, "uColor");
+    uFace_.useScalar  = glGetUniformLocation(prog_, "uUseScalar");
+    uFace_.scalarMin  = glGetUniformLocation(prog_, "uScalarMin");
+    uFace_.scalarMax  = glGetUniformLocation(prog_, "uScalarMax");
+    uFace_.metallic   = glGetUniformLocation(prog_, "uMetallic");
+    uFace_.roughness  = glGetUniformLocation(prog_, "uRoughness");
+    uFace_.lut        = glGetUniformLocation(prog_, "uLut");
+    uFace_.clipCount  = glGetUniformLocation(prog_, "uClipCount");
+    uFace_.clipN      = glGetUniformLocation(prog_, "uClipN");
+    uFace_.clipOff    = glGetUniformLocation(prog_, "uClipOff");
+    uFace_.realView   = glGetUniformLocation(prog_, "uRealView");
+    uFace_.zebra      = glGetUniformLocation(prog_, "uZebra");
+    uFace_.zebraFreq  = glGetUniformLocation(prog_, "uZebraFreq");
+    uFace_.alpha      = glGetUniformLocation(prog_, "uAlpha");
+
+    uEdge_.mvp        = glGetUniformLocation(edgeProg_, "uMVP");
+    uEdge_.color      = glGetUniformLocation(edgeProg_, "uColor");
+    uEdge_.clipCount  = glGetUniformLocation(edgeProg_, "uClipCount");
+    uEdge_.clipN      = glGetUniformLocation(edgeProg_, "uClipN");
+    uEdge_.clipOff    = glGetUniformLocation(edgeProg_, "uClipOff");
+
+    uBg_.top          = glGetUniformLocation(bgProg_, "uTop");
+    uBg_.mid          = glGetUniformLocation(bgProg_, "uMid");
+    uBg_.bot          = glGetUniformLocation(bgProg_, "uBot");
+
+    uShadow_.mvp      = glGetUniformLocation(shadowProg_, "uMVP");
+    uShadow_.color    = glGetUniformLocation(shadowProg_, "uColor");
+    uShadow_.maxAlpha = glGetUniformLocation(shadowProg_, "uMaxAlpha");
+
+    uPlane_.mvp       = glGetUniformLocation(planeProg_, "uMVP");
+    uPlane_.color     = glGetUniformLocation(planeProg_, "uColor");
+
+    uCap_.mvp         = glGetUniformLocation(capProg_, "uMVP");
+    uCap_.color       = glGetUniformLocation(capProg_, "uColor");
+    uCap_.n           = glGetUniformLocation(capProg_, "uN");
+    uCap_.keyDir      = glGetUniformLocation(capProg_, "uKeyDir");
+    uCap_.clipCount   = glGetUniformLocation(capProg_, "uClipCount");
+    uCap_.clipN       = glGetUniformLocation(capProg_, "uClipN");
+    uCap_.clipOff     = glGetUniformLocation(capProg_, "uClipOff");
+    uCap_.capExclude  = glGetUniformLocation(capProg_, "uCapExclude");
+
+    uResolve_.src     = glGetUniformLocation(resolveProg_, "uSrc");
+    uResolve_.ss      = glGetUniformLocation(resolveProg_, "uSS");
+
+    uDown_.src        = glGetUniformLocation(downsampleProg_, "uSrc");
+    uDown_.invSrcSize = glGetUniformLocation(downsampleProg_, "uInvSrcSize");
+
+    uKawase_.src      = glGetUniformLocation(kawaseProg_, "uSrc");
+    uKawase_.texel    = glGetUniformLocation(kawaseProg_, "uTexel");
+    uKawase_.offset   = glGetUniformLocation(kawaseProg_, "uOffset");
 }
 
 // ---- T-RF13 (R3a): adaptive quality ladder ----
@@ -1204,9 +1290,9 @@ void Renderer::drawCurrent(float yawDeg, float pitchDeg, float zoom) {
     // gradient studio background (fullscreen triangle, depth-independent)
     glDisable(GL_DEPTH_TEST);
     glUseProgram(bgProg_);
-    glUniform3fv(glGetUniformLocation(bgProg_, "uTop"), 1, bgTop_);
-    glUniform3fv(glGetUniformLocation(bgProg_, "uMid"), 1, bgMid_);
-    glUniform3fv(glGetUniformLocation(bgProg_, "uBot"), 1, bgBot_);
+    glUniform3fv(uBg_.top, 1, bgTop_);
+    glUniform3fv(uBg_.mid, 1, bgMid_);
+    glUniform3fv(uBg_.bot, 1, bgBot_);
     glBindVertexArray(bgVao_);
     glDrawArrays(GL_TRIANGLES, 0, 3);
     glBindVertexArray(0);
@@ -1319,34 +1405,34 @@ void Renderer::drawCurrent(float yawDeg, float pitchDeg, float zoom) {
     const bool drawEdges = (ds != DisplayStyle::Shaded);
 
     glUseProgram(prog_);
-    glUniformMatrix4fv(glGetUniformLocation(prog_, "uMVP"), 1, GL_FALSE, mvp.m);
-    glUniform3f(glGetUniformLocation(prog_, "uKeyDir"), keyDir.x, keyDir.y, keyDir.z);
-    glUniform3f(glGetUniformLocation(prog_, "uFillDir"), fillDir.x, fillDir.y, fillDir.z);
-    glUniform3f(glGetUniformLocation(prog_, "uRimDir"), rimDir.x, rimDir.y, rimDir.z);
-    glUniform3f(glGetUniformLocation(prog_, "uCamPos"), eye.x, eye.y, eye.z);
-    int colorLoc = glGetUniformLocation(prog_, "uColor");
-    int useScalarLoc = glGetUniformLocation(prog_, "uUseScalar");
-    int sminLoc = glGetUniformLocation(prog_, "uScalarMin");
-    int smaxLoc = glGetUniformLocation(prog_, "uScalarMax");
-    int metallicLoc = glGetUniformLocation(prog_, "uMetallic");   // C32-A RealView material
-    int roughnessLoc = glGetUniformLocation(prog_, "uRoughness");
+    glUniformMatrix4fv(uFace_.mvp, 1, GL_FALSE, mvp.m);
+    glUniform3f(uFace_.keyDir, keyDir.x, keyDir.y, keyDir.z);
+    glUniform3f(uFace_.fillDir, fillDir.x, fillDir.y, fillDir.z);
+    glUniform3f(uFace_.rimDir, rimDir.x, rimDir.y, rimDir.z);
+    glUniform3f(uFace_.camPos, eye.x, eye.y, eye.z);
+    const int colorLoc = uFace_.color;
+    const int useScalarLoc = uFace_.useScalar;
+    const int sminLoc = uFace_.scalarMin;
+    const int smaxLoc = uFace_.scalarMax;
+    const int metallicLoc = uFace_.metallic;    // C32-A RealView material
+    const int roughnessLoc = uFace_.roughness;
     // Bind the colormap LUT to texture unit 0.
     glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, lutTex_);
-    glUniform1i(glGetUniformLocation(prog_, "uLut"), 0);
+    glUniform1i(uFace_.lut, 0);
     // C28-C: multi-plane section clip (faces). Push all active planes as arrays.
     {
         int cnt = section_.count;
-        glUniform1i(glGetUniformLocation(prog_, "uClipCount"), cnt);
+        glUniform1i(uFace_.clipCount, cnt);
         if (cnt > 0) {
-            glUniform3fv(glGetUniformLocation(prog_, "uClipN"),   cnt, section_.normals[0]);
-            glUniform1fv(glGetUniformLocation(prog_, "uClipOff"), cnt, section_.offsets);
+            glUniform3fv(uFace_.clipN,   cnt, section_.normals[0]);
+            glUniform1fv(uFace_.clipOff, cnt, section_.offsets);
         }
     }
-    glUniform1f(glGetUniformLocation(prog_, "uRealView"), realView_ ? 1.0f : 0.0f);  // C30-C
-    glUniform1i(glGetUniformLocation(prog_, "uZebra"), zebra_ ? 1 : 0);              // Zebra stripes
-    glUniform1f(glGetUniformLocation(prog_, "uZebraFreq"), zebraFreq_);
-    int alphaLoc = glGetUniformLocation(prog_, "uAlpha");
+    glUniform1f(uFace_.realView, realView_ ? 1.0f : 0.0f);  // C30-C
+    glUniform1i(uFace_.zebra, zebra_ ? 1 : 0);              // Zebra stripes
+    glUniform1f(uFace_.zebraFreq, zebraFreq_);
+    const int alphaLoc = uFace_.alpha;
     // Per-feature edit-preview isolation: when a feature is being previewed (previewAlpha_ < 1 with a
     // non-empty owned-face set) ONLY that feature's faces draw translucent, in a second pass over the
     // opaque model. HLR forces everything opaque (its faces only write depth, no color).
@@ -1463,7 +1549,7 @@ void Renderer::drawCurrent(float yawDeg, float pitchDeg, float zoom) {
             // feeds inverse(editedComponent.placement) so the ghost's copy of the edited component
             // lands on the live part at its own origin. Restored to mvp after the loop.
             const Mat4 ghostMvp = mul(mvp, ghostXform_);
-            glUniformMatrix4fv(glGetUniformLocation(prog_, "uMVP"), 1, GL_FALSE, ghostMvp.m);
+            glUniformMatrix4fv(uFace_.mvp, 1, GL_FALSE, ghostMvp.m);
             glEnable(GL_BLEND);
             glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
             glDepthMask(GL_FALSE);
@@ -1481,7 +1567,7 @@ void Renderer::drawCurrent(float yawDeg, float pitchDeg, float zoom) {
             glDepthMask(GL_TRUE);
             glDisable(GL_BLEND);
             // Restore the unshifted MVP for any later prog_ pass in this frame (cheap insurance).
-            glUniformMatrix4fv(glGetUniformLocation(prog_, "uMVP"), 1, GL_FALSE, mvp.m);
+            glUniformMatrix4fv(uFace_.mvp, 1, GL_FALSE, mvp.m);
         }
 
         // CAM remnant-stock aux mesh (playhead remnant): same translucent shaded pass as
@@ -1520,15 +1606,15 @@ void Renderer::drawCurrent(float yawDeg, float pitchDeg, float zoom) {
 
     if (drawEdges) {
         glUseProgram(edgeProg_);
-        glUniformMatrix4fv(glGetUniformLocation(edgeProg_, "uMVP"), 1, GL_FALSE, mvp.m);
-        int eColorLoc = glGetUniformLocation(edgeProg_, "uColor");
+        glUniformMatrix4fv(uEdge_.mvp, 1, GL_FALSE, mvp.m);
+        const int eColorLoc = uEdge_.color;
         // C28-C: multi-plane clip for edges.
         {
             int cnt = section_.count;
-            glUniform1i(glGetUniformLocation(edgeProg_, "uClipCount"), cnt);
+            glUniform1i(uEdge_.clipCount, cnt);
             if (cnt > 0) {
-                glUniform3fv(glGetUniformLocation(edgeProg_, "uClipN"),   cnt, section_.normals[0]);
-                glUniform1fv(glGetUniformLocation(edgeProg_, "uClipOff"), cnt, section_.offsets);
+                glUniform3fv(uEdge_.clipN,   cnt, section_.normals[0]);
+                glUniform1fv(uEdge_.clipOff, cnt, section_.offsets);
             }
         }
         glLineWidth(edgeWidthPx_ * (float)SS);  // screen-space width after downsample
@@ -1626,9 +1712,9 @@ unsigned int Renderer::renderThumbnail(float yawDeg, float pitchDeg, int px, boo
         // equal — avoids a separate clear-color path and keeps the near-white look of the main view).
         glDisable(GL_DEPTH_TEST);
         glUseProgram(bgProg_);
-        glUniform3fv(glGetUniformLocation(bgProg_, "uTop"), 1, bgTop_);
-        glUniform3fv(glGetUniformLocation(bgProg_, "uMid"), 1, bgMid_);
-        glUniform3fv(glGetUniformLocation(bgProg_, "uBot"), 1, bgBot_);
+        glUniform3fv(uBg_.top, 1, bgTop_);
+        glUniform3fv(uBg_.mid, 1, bgMid_);
+        glUniform3fv(uBg_.bot, 1, bgBot_);
         glBindVertexArray(bgVao_);
         glDrawArrays(GL_TRIANGLES, 0, 3);
         glBindVertexArray(0);
@@ -1671,19 +1757,19 @@ unsigned int Renderer::renderThumbnail(float yawDeg, float pitchDeg, int px, boo
 
     // Solids (flat part colors — skip the colormap LUT path for clarity; section clip off).
     glUseProgram(prog_);
-    glUniformMatrix4fv(glGetUniformLocation(prog_, "uMVP"), 1, GL_FALSE, mvp.m);
-    glUniform3f(glGetUniformLocation(prog_, "uKeyDir"), keyDir.x, keyDir.y, keyDir.z);
-    glUniform3f(glGetUniformLocation(prog_, "uFillDir"), fillDir.x, fillDir.y, fillDir.z);
-    glUniform3f(glGetUniformLocation(prog_, "uRimDir"), rimDir.x, rimDir.y, rimDir.z);
-    glUniform3f(glGetUniformLocation(prog_, "uCamPos"), eye.x, eye.y, eye.z);
-    glUniform1i(glGetUniformLocation(prog_, "uUseScalar"), 0);
-    glUniform1i(glGetUniformLocation(prog_, "uClipCount"), 0);  // thumbnail: no section clip
-    glUniform1f(glGetUniformLocation(prog_, "uRealView"), 1.0f);  // C30-C: reflections on in previews
-    glUniform1i(glGetUniformLocation(prog_, "uZebra"), 0);       // thumbnail: never striped
-    glUniform1f(glGetUniformLocation(prog_, "uAlpha"), 1.0f);    // thumbnail: always opaque
-    int colorLoc = glGetUniformLocation(prog_, "uColor");
-    int metallicLoc = glGetUniformLocation(prog_, "uMetallic");   // C32-A RealView material
-    int roughnessLoc = glGetUniformLocation(prog_, "uRoughness");
+    glUniformMatrix4fv(uFace_.mvp, 1, GL_FALSE, mvp.m);
+    glUniform3f(uFace_.keyDir, keyDir.x, keyDir.y, keyDir.z);
+    glUniform3f(uFace_.fillDir, fillDir.x, fillDir.y, fillDir.z);
+    glUniform3f(uFace_.rimDir, rimDir.x, rimDir.y, rimDir.z);
+    glUniform3f(uFace_.camPos, eye.x, eye.y, eye.z);
+    glUniform1i(uFace_.useScalar, 0);
+    glUniform1i(uFace_.clipCount, 0);   // thumbnail: no section clip
+    glUniform1f(uFace_.realView, 1.0f);  // C30-C: reflections on in previews
+    glUniform1i(uFace_.zebra, 0);        // thumbnail: never striped
+    glUniform1f(uFace_.alpha, 1.0f);     // thumbnail: always opaque
+    const int colorLoc = uFace_.color;
+    const int metallicLoc = uFace_.metallic;    // C32-A RealView material
+    const int roughnessLoc = uFace_.roughness;
     glEnable(GL_POLYGON_OFFSET_FILL);
     glPolygonOffset(1.0f, 1.0f);
     for (const auto& s : subs_) {
@@ -1699,9 +1785,9 @@ unsigned int Renderer::renderThumbnail(float yawDeg, float pitchDeg, int px, boo
 
     // Feature edges (so the preview reads like the main ShadedEdges view).
     glUseProgram(edgeProg_);
-    glUniformMatrix4fv(glGetUniformLocation(edgeProg_, "uMVP"), 1, GL_FALSE, mvp.m);
-    glUniform3fv(glGetUniformLocation(edgeProg_, "uColor"), 1, edgeColor_);
-    glUniform1i(glGetUniformLocation(edgeProg_, "uClipCount"), 0);  // thumbnail: no clip
+    glUniformMatrix4fv(uEdge_.mvp, 1, GL_FALSE, mvp.m);
+    glUniform3fv(uEdge_.color, 1, edgeColor_);
+    glUniform1i(uEdge_.clipCount, 0);   // thumbnail: no clip
     glLineWidth(1.0f);  // no supersample here, so 1px lines
     for (const auto& s : subs_) {
         if (!s.visible || s.edgeVerts <= 0) continue;
@@ -1767,9 +1853,9 @@ void Renderer::drawGroundShadow(const Mat4& mvp, const Vec3& eye, const Vec3& up
     // Own VAO/VBO with a 5-float stride (pos + uv); the shadow shader binds
     // location 0 (pos) and 1 (uv). Lazily created once.
     glUseProgram(shadowProg_);
-    glUniformMatrix4fv(glGetUniformLocation(shadowProg_, "uMVP"), 1, GL_FALSE, mvp.m);
-    glUniform3fv(glGetUniformLocation(shadowProg_, "uColor"), 1, groundShadow_);
-    glUniform1f(glGetUniformLocation(shadowProg_, "uMaxAlpha"), groundShadow_[3]);
+    glUniformMatrix4fv(uShadow_.mvp, 1, GL_FALSE, mvp.m);
+    glUniform3fv(uShadow_.color, 1, groundShadow_);
+    glUniform1f(uShadow_.maxAlpha, groundShadow_[3]);
 
     static unsigned int shadowVao = 0, shadowVbo = 0;
     if (!shadowVao) {
@@ -1792,7 +1878,6 @@ void Renderer::drawGroundShadow(const Mat4& mvp, const Vec3& eye, const Vec3& up
     glEnable(GL_BLEND);
     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
     glDepthMask(GL_FALSE);
-    glDisable(GL_CULL_FACE);
     glDrawArrays(GL_TRIANGLES, 0, 6);
     glDepthMask(GL_TRUE);
     glDisable(GL_BLEND);
@@ -1871,6 +1956,34 @@ bool Renderer::planeQuad(int plane, Vec3 out[4]) const {
     return true;
 }
 
+// Rebuild the cached origin-plane quad geometry. The quads are CAMERA-INDEPENDENT — they depend
+// only on center_ and radius_ — so orbiting, zooming, emphasis changes and palette changes all
+// reuse the same upload. Layout per plane: 6 fill verts (two triangles) then 4 border verts.
+void Renderer::refreshPlaneQuads() {
+    const float e = ((radius_ > 0.0f) ? radius_ : kEmptySceneRadius) * 1.25f;
+    if (planeQuadExtent_ == e && planeQuadCenter_.x == center_.x &&
+        planeQuadCenter_.y == center_.y && planeQuadCenter_.z == center_.z)
+        return;
+    // Fill is (c0,c1,c2) (c0,c2,c3); border is the 4 corners as a line loop.
+    static const int kOrder[kPlaneQuadVerts] = {0, 1, 2, 0, 2, 3, 0, 1, 2, 3};
+    float v[3 * kPlaneQuadVerts * 3];
+    for (int p = 0; p < 3; ++p) {
+        Vec3 c[4];
+        planeCorners(p, e, c);
+        float* dst = v + (size_t)p * kPlaneQuadVerts * 3;
+        for (int i = 0; i < kPlaneQuadVerts; ++i) {
+            const Vec3& src = c[kOrder[i]];
+            dst[i * 3 + 0] = src.x;
+            dst[i * 3 + 1] = src.y;
+            dst[i * 3 + 2] = src.z;
+        }
+    }
+    glBindBuffer(GL_ARRAY_BUFFER, planeVbo_);
+    glBufferSubData(GL_ARRAY_BUFFER, 0, sizeof(v), v);
+    planeQuadExtent_ = e;
+    planeQuadCenter_ = center_;
+}
+
 void Renderer::drawReferencePlanes(const Mat4& mvp) {
     if (!(showPlane_[0] || showPlane_[1] || showPlane_[2])) return;
 
@@ -1880,24 +1993,29 @@ void Renderer::drawReferencePlanes(const Mat4& mvp) {
     // C25: empty doc falls back to kEmptySceneRadius so a fresh part shows its planes.
     const float* fillC = planeFill_;
     const float* lineC = planeOutline_;
-    const float e = ((radius_ > 0.0f) ? radius_ : kEmptySceneRadius) * 1.25f;
+
+    refreshPlaneQuads();   // no-op unless the model bbox / scene radius moved
 
     glUseProgram(planeProg_);
-    glUniformMatrix4fv(glGetUniformLocation(planeProg_, "uMVP"), 1, GL_FALSE, mvp.m);
-    GLint colLoc = glGetUniformLocation(planeProg_, "uColor");
+    glUniformMatrix4fv(uPlane_.mvp, 1, GL_FALSE, mvp.m);
+    const int colLoc = uPlane_.color;
 
     glEnable(GL_BLEND);
     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
     glEnable(GL_DEPTH_TEST);          // must occlude behind solid faces (CASE B bleed-through)
     glDepthMask(GL_FALSE);            // test against geometry but don't occlude it
+    // Face culling is never enabled anywhere in the host (GL's default is off, and ImGui's GL3
+    // backend saves/restores the flag around its own draw), so the glDisable(GL_CULL_FACE) that
+    // used to sit in every overlay pass could not change state — these two-sided quads, cones and
+    // caps are drawn from either side regardless.
     // Match the solid-face glPolygonOffset(1,1) so we compare against the SAME depth values the
     // shaded pass wrote. Without this, solid depths are pushed farther while planes sit at true
     // depth and always win GL_LESS — planes (and the origin triad) bleed through the mesh.
     glEnable(GL_POLYGON_OFFSET_FILL);
     glEnable(GL_POLYGON_OFFSET_LINE);
     glPolygonOffset(1.0f, 1.0f);
-    glDisable(GL_CULL_FACE);
     glBindVertexArray(planeVao_);
+    glLineWidth(1.5f);
 
     for (int p = 0; p < 3; ++p) {
         if (!showPlane_[p]) continue;
@@ -1908,31 +2026,13 @@ void Renderer::drawReferencePlanes(const Mat4& mvp) {
         float lScale = emph ? 1.0f : (dim ? 0.55f : 0.85f);
         float fillA = fillC[3] * fScale;
         float lineA = lineC[3] * lScale;
+        const int base = p * kPlaneQuadVerts;
 
-        Vec3 c[4];
-        planeCorners(p, e, c);
-
-        // Fill: two triangles (c0,c1,c2) (c0,c2,c3).
-        float tri[18] = {
-            c[0].x,c[0].y,c[0].z, c[1].x,c[1].y,c[1].z, c[2].x,c[2].y,c[2].z,
-            c[0].x,c[0].y,c[0].z, c[2].x,c[2].y,c[2].z, c[3].x,c[3].y,c[3].z,
-        };
-        glBindBuffer(GL_ARRAY_BUFFER, planeVbo_);
-        glBufferSubData(GL_ARRAY_BUFFER, 0, sizeof(tri), tri);
         glUniform4f(colLoc, fillC[0], fillC[1], fillC[2], fillA);
-        glDrawArrays(GL_TRIANGLES, 0, 6);
-
-        // Border: line loop of the 4 corners.
-        float loop[12] = {
-            c[0].x,c[0].y,c[0].z, c[1].x,c[1].y,c[1].z,
-            c[2].x,c[2].y,c[2].z, c[3].x,c[3].y,c[3].z,
-        };
-        glBufferSubData(GL_ARRAY_BUFFER, 0, sizeof(loop), loop);
+        glDrawArrays(GL_TRIANGLES, base, 6);
         glUniform4f(colLoc, lineC[0], lineC[1], lineC[2], lineA);
-        glLineWidth(1.5f);
-        glDrawArrays(GL_LINE_LOOP, 0, 4);
+        glDrawArrays(GL_LINE_LOOP, base + 6, 4);
     }
-
     glBindVertexArray(0);
     glDisable(GL_POLYGON_OFFSET_LINE);
     glDisable(GL_POLYGON_OFFSET_FILL);
@@ -1941,13 +2041,52 @@ void Renderer::drawReferencePlanes(const Mat4& mvp) {
 }
 
 float Renderer::refAxisHalfLength(const std::string& id) const {
-    // Match drawReferencePlanes / drawRefDatums: e = sceneRadius * 1.25.
+    // Match drawReferencePlanes / drawRefDatums: e = sceneRadius * 1.25. The rule itself lives with
+    // the GL-free datum builder so draw and hit-test can never drift apart.
+    return render::refAxisHalfLength(id,
+                                     ((radius_ > 0.0f) ? radius_ : kEmptySceneRadius) * 1.25f);
+}
+
+// Rebuild + re-upload the batched datum geometry when any input changed. Inputs are the datum set
+// (revision), the FeatureManager-hidden ids, the selected / PM-edited datum, the scene half-extent
+// e, and the palette axis/accent roles — everything the build reads. The camera is NOT an input, so
+// orbiting, zooming, panning and section changes all reuse the upload.
+void Renderer::refreshDatumBatch() {
     const float e = ((radius_ > 0.0f) ? radius_ : kEmptySceneRadius) * 1.25f;
-    // Auto axes from a USER plane pair (axis.auto:<a>|<b>) are drawn only across that plane's
-    // quad (half-extent ps = e*0.55), not the full origin-plane span.
-    if (id.rfind("axis.auto:", 0) == 0)
-        return e * 0.55f;
-    return e;
+    render::RefDatumPalette pal;
+    for (int i = 0; i < 4; ++i) {
+        pal.axisX[i] = ui::palette.axisX[i];
+        pal.axisY[i] = ui::palette.axisY[i];
+        pal.axisZ[i] = ui::palette.axisZ[i];
+        pal.accent[i] = ui::palette.accent[i];
+    }
+    if (datumBatchValid_ && datumBatchRevision_ == datumsRevision_ && datumBatchExtent_ == e &&
+        datumBatchSelected_ == selectedDatumId_ && datumBatchEditing_ == editingDatumId_ &&
+        datumBatchPalette_ == pal && datumBatchHidden_ == hiddenDatums_)
+        return;
+
+    render::buildRefDatumBatch(refDatums_, hiddenDatums_, selectedDatumId_, editingDatumId_, e, pal,
+                               datumBatch_);
+    const size_t floats = datumBatch_.verts.size();
+    if (floats > 0) {
+        glBindBuffer(GL_ARRAY_BUFFER, datumVbo_);
+        if (floats > datumVboFloats_) {
+            // Grow (and orphan the old storage) only when the batch outgrew the buffer.
+            glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)(floats * sizeof(float)),
+                         datumBatch_.verts.data(), GL_DYNAMIC_DRAW);
+            datumVboFloats_ = floats;
+        } else {
+            glBufferSubData(GL_ARRAY_BUFFER, 0, (GLsizeiptr)(floats * sizeof(float)),
+                            datumBatch_.verts.data());
+        }
+    }
+    datumBatchRevision_ = datumsRevision_;
+    datumBatchExtent_ = e;
+    datumBatchSelected_ = selectedDatumId_;
+    datumBatchEditing_ = editingDatumId_;
+    datumBatchHidden_ = hiddenDatums_;
+    datumBatchPalette_ = pal;
+    datumBatchValid_ = true;
 }
 
 // Feature reference geometry: datum axes (lines), planes (quads), points (markers), and coordinate
@@ -1960,15 +2099,20 @@ float Renderer::refAxisHalfLength(const std::string& id) const {
 // Two-pass draw from drawCurrent: non-axis datums after origin planes, then axesOnly=true LAST so
 // dashed axes composite OVER translucent plane fills (planes write no depth). Axes use per-axis
 // RGB colors at high opacity; selectedDatumId_ draws bold/bright (set each frame from selection).
+//
+// The geometry itself is built by render::buildRefDatumBatch into ONE vertex buffer with a merged
+// draw list (render/ref_datum_geom.cpp) and cached; this function is pure GL state + a handful of
+// glDrawArrays. It used to upload a 2..6-vertex range and issue a draw call per primitive — per
+// dash, per cone triangle, per octahedron face — every frame.
 void Renderer::drawRefDatums(const Mat4& mvp, bool axesOnly) {
     if (refDatums_.empty() || planeProg_ == 0) return;
-    // Same half-extent as drawReferencePlanes (radius*1.25) so a datum axis spans exactly as far
-    // as the datum-plane edges and its dashes reach the plane boundary. Picker must match.
-    const float e = ((radius_ > 0.0f) ? radius_ : kEmptySceneRadius) * 1.25f;
+    refreshDatumBatch();
+    const std::vector<render::RefDatumDraw>& cmds =
+        axesOnly ? datumBatch_.axis : datumBatch_.nonAxis;
+    if (cmds.empty()) return;
 
     glUseProgram(planeProg_);
-    glUniformMatrix4fv(glGetUniformLocation(planeProg_, "uMVP"), 1, GL_FALSE, mvp.m);
-    GLint colLoc = glGetUniformLocation(planeProg_, "uColor");
+    glUniformMatrix4fv(uPlane_.mvp, 1, GL_FALSE, mvp.m);
 
     glEnable(GL_BLEND);
     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
@@ -1977,266 +2121,18 @@ void Renderer::drawRefDatums(const Mat4& mvp, bool axesOnly) {
     glEnable(GL_POLYGON_OFFSET_FILL);
     glEnable(GL_POLYGON_OFFSET_LINE);
     glPolygonOffset(1.0f, 1.0f);      // match solid-face offset (see drawReferencePlanes)
-    glDisable(GL_CULL_FACE);
-    glBindVertexArray(planeVao_);
+    glBindVertexArray(datumVao_);
 
-    auto upload = [&](const float* data, int floats) {
-        glBindBuffer(GL_ARRAY_BUFFER, planeVbo_);
-        glBufferSubData(GL_ARRAY_BUFFER, 0, (GLsizeiptr)(floats * sizeof(float)), data);
-    };
-    auto setCol = [&](float r, float g, float b, float a) { glUniform4f(colLoc, r, g, b, a); };
-
-    // Soft grey datum line (axis), green-ish datum plane, white point marker, RGB csys triad.
-    // Default-axis half-length equals origin-plane half-extent e (NOT e*1.6). User-plane auto
-    // axes (axis.auto:*) use ps so they span only the drawn user-plane quad. Pickers must call
-    // refAxisHalfLength(id) so draw and hit-test share one source of truth.
-    const float ps = e * 0.55f;   // half-extent of a datum-plane quad (smaller than origin planes)
-    const float ms = e * 0.04f;   // half-size of a point marker cross
-    const float cs = e * 0.35f;   // csys axis length
-
-    for (const auto& d : refDatums_) {
-        if (!d.id.empty() && hiddenDatums_.count(d.id)) continue;  // FeatureManager eye hid this datum
-        const bool isAxis = (d.kind == RefDatum::Kind::Axis);
-        if (axesOnly != isAxis) continue;  // split pass: non-axes then axes (drawn last over planes)
-        const bool selected = !selectedDatumId_.empty() && d.id == selectedDatumId_;
-        switch (d.kind) {
-            case RefDatum::Kind::Axis: {
-                // Dashed reference axis. Drawn AFTER origin planes (axesOnly pass last) so
-                // translucent plane fills never wash the line out. CPU-side dashes (core GL has
-                // no stipple). World-space pitch is uniform on the whole span so +/− halves are
-                // identical (same dash length, count, and spacing) and the pattern clips exactly
-                // at ±halfLen — no overshoot past the plane edge. Unselected = per-principal RGB
-                // at high opacity; selected = bold full-opacity accent blue.
-                Vec3 dir = d.dir;
-                const float dlen = std::sqrt(dir.x * dir.x + dir.y * dir.y + dir.z * dir.z);
-                if (dlen < 1e-8f) break;
-                dir = dir * (1.0f / dlen);
-                // Plane-derived auto axes are born from a user plane's quad (half-extent ps);
-                // default/user axes span the origin-plane extent e.
-                const float halfLen = refAxisHalfLength(d.id);
-                if (halfLen < 1e-8f) break;
-                // Principal-axis tint from palette.axisX/Y/Z. Arbitrary user axes (not near a
-                // cardinal) get palette.accent-dim cyan so they still read over planes.
-                const float* px = ui::palette.axisX;
-                const float* py = ui::palette.axisY;
-                const float* pz = ui::palette.axisZ;
-                const float* pac = ui::palette.accent;
-                float ar = pac[0], ag = pac[1], ab = pac[2];  // accent fallback for free axes
-                const float ax = std::fabs(dir.x), ay = std::fabs(dir.y), az = std::fabs(dir.z);
-                if (ax >= ay && ax >= az && ax > 0.85f) { ar = px[0]; ag = px[1]; ab = px[2]; }
-                else if (ay >= ax && ay >= az && ay > 0.85f) { ar = py[0]; ag = py[1]; ab = py[2]; }
-                else if (az >= ax && az >= ay && az > 0.85f) { ar = pz[0]; ag = pz[1]; ab = pz[2]; }
-                // Selected: thicker + full-opacity accent (picked reference look).
-                // Unselected: axis RGB at high opacity so it stays legible over plane fills.
-                if (selected) {
-                    glLineWidth(4.5f);
-                    setCol(pac[0], pac[1], pac[2], 1.0f);
-                } else {
-                    glLineWidth(2.75f);
-                    setCol(ar, ag, ab, 0.92f);
-                }
-                // One world-space pitch for the whole span: dashLen = halfLen/20. Equal dash and
-                // gap; walk outward from the origin on BOTH sides so +/− halves are identical
-                // (same count, same spacing). Final segment clips exactly at ±halfLen — no
-                // overshoot past the plane boundary, no separate tip/arrow past the edge.
-                const float dashLen = halfLen / 20.0f;
-                if (dashLen < 1e-9f) break;
-                auto drawHalf = [&](const Vec3& hdir) {
-                    // Start with a gap at the origin so both halves share a continuous centre
-                    // gap; the final segment is a dash clipped exactly to halfLen (tip on the
-                    // plane edge — full dash when halfLen is an integer multiple of dashLen).
-                    float s = 0.0f;
-                    bool onDash = false;
-                    while (s < halfLen - 1e-7f) {
-                        const float s1 = std::min(s + dashLen, halfLen);
-                        if (onDash && s1 > s) {
-                            const Vec3 p0 = d.origin + hdir * s;
-                            const Vec3 p1 = d.origin + hdir * s1;
-                            float seg[6] = {p0.x, p0.y, p0.z, p1.x, p1.y, p1.z};
-                            upload(seg, 6);
-                            glDrawArrays(GL_LINES, 0, 2);
-                        }
-                        s = s1;
-                        onDash = !onDash;
-                    }
-                };
-                drawHalf(dir);
-                drawHalf(Vec3(-dir.x, -dir.y, -dir.z));
-                break;
-            }
-            case RefDatum::Kind::Plane: {
-                static const float uv[4][2] = {{-1, -1}, {1, -1}, {1, 1}, {-1, 1}};
-                Vec3 c[4];
-                for (int i = 0; i < 4; ++i)
-                    c[i] = d.origin + d.xdir * (uv[i][0] * ps) + d.ydir * (uv[i][1] * ps);
-                float tri[18] = {
-                    c[0].x,c[0].y,c[0].z, c[1].x,c[1].y,c[1].z, c[2].x,c[2].y,c[2].z,
-                    c[0].x,c[0].y,c[0].z, c[2].x,c[2].y,c[2].z, c[3].x,c[3].y,c[3].z};
-                upload(tri, 18);
-                setCol(0.36f, 0.74f, 0.42f, 0.16f);
-                glDrawArrays(GL_TRIANGLES, 0, 6);
-                float loop[12] = {c[0].x,c[0].y,c[0].z, c[1].x,c[1].y,c[1].z,
-                                  c[2].x,c[2].y,c[2].z, c[3].x,c[3].y,c[3].z};
-                upload(loop, 12);
-                if (selected) setCol(0.40f, 0.90f, 0.50f, 1.0f);
-                else          setCol(0.30f, 0.62f, 0.34f, 0.85f);
-                glLineWidth(selected ? 2.5f : 1.5f);
-                glDrawArrays(GL_LINE_LOOP, 0, 4);
-
-                // Normal arrow (SolidWorks plane-normal handle): a shaft from the plane centre along
-                // +normal plus a 4-line arrowhead in the in-plane (xdir/ydir) frame, so the user sees
-                // which way the new plane faces. Drawn ONLY while this plane is the one open in the
-                // PropertyManager (being created/edited) — once committed the arrow disappears so
-                // finished planes don't carry a persistent normal handle.
-                if (!editingDatumId_.empty() && d.id == editingDatumId_) {
-                    const float aLen = ps * 0.95f;   // shaft length ~ the quad half-extent
-                    const float hh   = ps * 0.22f;   // arrowhead back-set along -normal
-                    const float hw   = ps * 0.11f;   // arrowhead half-width
-                    Vec3 tip  = d.origin + d.dir * aLen;
-                    Vec3 base = tip - d.dir * hh;
-                    if (selected) setCol(0.45f, 0.95f, 0.55f, 1.0f);
-                    else          setCol(0.33f, 0.68f, 0.38f, 0.95f);
-                    glLineWidth(selected ? 2.5f : 1.8f);
-                    float shaft[6] = {d.origin.x,d.origin.y,d.origin.z, tip.x,tip.y,tip.z};
-                    upload(shaft, 6);
-                    glDrawArrays(GL_LINES, 0, 2);
-                    Vec3 head[4] = {base + d.xdir * hw, base - d.xdir * hw,
-                                    base + d.ydir * hw, base - d.ydir * hw};
-                    for (int i = 0; i < 4; ++i) {
-                        float seg[6] = {tip.x,tip.y,tip.z, head[i].x,head[i].y,head[i].z};
-                        upload(seg, 6);
-                        glDrawArrays(GL_LINES, 0, 2);
-                    }
-                }
-                break;
-            }
-            case RefDatum::Kind::Point: {
-                // The synthetic WORLD ORIGIN ("point.origin", injected in app.cpp) gets the full
-                // CAD-convention treatment instead of the plain cross: color-coded axes (X=red,
-                // Y=green, Z=blue), a solid arrow on the positive direction, and a dimmer DASHED
-                // tail on the negative direction. No screen-space +/- axis letter labels.
-                if (d.id == "point.origin") {
-                    const float os = e * 0.06f;   // positive axis length (issue #19: much shorter,
-                                                  // arrowheads removed)
-                    const float ns = os * 0.80f;  // negative tail length (shorter, subdued)
-                    static const Vec3 kDirs[3] = {Vec3(1, 0, 0), Vec3(0, 1, 0), Vec3(0, 0, 1)};
-                    static const float kAxCol[3][3] = {{0.90f, 0.25f, 0.25f},   // X red
-                                                       {0.25f, 0.80f, 0.30f},   // Y green
-                                                       {0.30f, 0.45f, 0.95f}};  // Z blue
-                    const Vec3 o = d.origin;
-                    for (int ai = 0; ai < 3; ++ai) {
-                        const Vec3& dir = kDirs[ai];
-                        const Vec3& u = kDirs[(ai + 1) % 3];   // cone base ring lives in the other
-                        const Vec3& v = kDirs[(ai + 2) % 3];   // two cardinal axes
-                        const float r = kAxCol[ai][0], g = kAxCol[ai][1], b = kAxCol[ai][2];
-                        // Positive axis: a thicker colored shaft capped by a REAL 3D cone head
-                        // (issue #29). The shaft stops at the cone base so it doesn't poke through.
-                        const float coneLen = os * 0.34f, coneRad = coneLen * 0.42f;
-                        Vec3 tip = o + dir * os;
-                        Vec3 cbase = tip - dir * coneLen;
-                        setCol(selected ? r + 0.10f : r, selected ? g + 0.10f : g,
-                               selected ? b + 0.05f : b, 1.0f);
-                        glLineWidth(selected ? 4.5f : 3.5f);   // ~1px thicker than before
-                        float shaft[6] = {o.x, o.y, o.z, cbase.x, cbase.y, cbase.z};
-                        upload(shaft, 6);
-                        glDrawArrays(GL_LINES, 0, 2);
-                        // Filled cone: side fan + base cap around the axis. planeVbo_ holds only 6
-                        // verts, so emit one triangle (9 floats) per upload. Cull is off here, so
-                        // winding doesn't matter.
-                        const int cseg = 12;
-                        Vec3 prevR = cbase + u * coneRad;
-                        for (int ci = 1; ci <= cseg; ++ci) {
-                            float a = (float)ci / cseg * 6.2831853f;
-                            Vec3 cur = cbase + (u * std::cos(a) + v * std::sin(a)) * coneRad;
-                            float side[9] = {tip.x, tip.y, tip.z, prevR.x, prevR.y, prevR.z, cur.x, cur.y, cur.z};
-                            upload(side, 9); glDrawArrays(GL_TRIANGLES, 0, 3);
-                            float cap[9] = {cbase.x, cbase.y, cbase.z, cur.x, cur.y, cur.z, prevR.x, prevR.y, prevR.z};
-                            upload(cap, 9); glDrawArrays(GL_TRIANGLES, 0, 3);
-                            prevR = cur;
-                        }
-                        // Negative: dimmer dashed tail (CPU dashes — core GL has no stipple).
-                        setCol(r, g, b, selected ? 0.55f : 0.40f);
-                        glLineWidth(2.5f);
-                        Vec3 nEnd = o - dir * ns;
-                        const int cells = 12;  // 6 visible dashes
-                        for (int i = 0; i < cells; i += 2) {
-                            float t0 = (float)i / cells, t1 = (float)(i + 1) / cells;
-                            Vec3 p0 = o + (nEnd - o) * t0, p1 = o + (nEnd - o) * t1;
-                            float seg[6] = {p0.x, p0.y, p0.z, p1.x, p1.y, p1.z};
-                            upload(seg, 6);
-                            glDrawArrays(GL_LINES, 0, 2);
-                        }
-                    }
-                    // Issue #19/#29: a tiny 3D sphere (octahedron approximation) at absolute (0,0,0)
-                    // as a grabbable reference point (selection routes via drawPointPicker for
-                    // "point.origin"). Drawn last over the axes; depth-mask stays off (same as the
-                    // rest of this pass) so the sphere still depth-tests against the solid.
-                    {
-                        const float rd = os * 0.16f;
-                        static const Vec3 A[6] = {Vec3(1, 0, 0), Vec3(-1, 0, 0), Vec3(0, 1, 0),
-                                                  Vec3(0, -1, 0), Vec3(0, 0, 1), Vec3(0, 0, -1)};
-                        static const int F[8][3] = {{4, 0, 2}, {4, 2, 1}, {4, 1, 3}, {4, 3, 0},
-                                                    {5, 2, 0}, {5, 1, 2}, {5, 3, 1}, {5, 0, 3}};
-                        auto drawOcta = [&](float rad, float cr, float cg, float cb, float ca) {
-                            setCol(cr, cg, cb, ca);
-                            for (int f = 0; f < 8; ++f) {
-                                Vec3 p0 = o + A[F[f][0]] * rad, p1 = o + A[F[f][1]] * rad,
-                                     p2 = o + A[F[f][2]] * rad;
-                                float t[9] = {p0.x, p0.y, p0.z, p1.x, p1.y, p1.z, p2.x, p2.y, p2.z};
-                                upload(t, 9); glDrawArrays(GL_TRIANGLES, 0, 3);
-                            }
-                        };
-                        // Selected highlight is a constant screen-space ring in viewport_panel
-                        // (matches the hover grab radius) — world-space rd*2.4 halo scaled with
-                        // scene radius and is intentionally not drawn for point.origin.
-                        drawOcta(rd, selected ? 1.0f : 0.92f, selected ? 1.0f : 0.92f,
-                                 selected ? 1.0f : 0.95f, 1.0f);
-                    }
-                    break;
-                }
-                // A 3-axis cross marker centered on the point.
-                Vec3 o = d.origin;
-                float cross[18] = {
-                    o.x - ms,o.y,o.z, o.x + ms,o.y,o.z,
-                    o.x,o.y - ms,o.z, o.x,o.y + ms,o.z,
-                    o.x,o.y,o.z - ms, o.x,o.y,o.z + ms};
-                upload(cross, 18);
-                if (selected) setCol(1.0f, 0.95f, 0.45f, 1.0f);
-                else          setCol(0.95f, 0.85f, 0.30f, 0.95f);
-                glLineWidth(selected ? 3.0f : 2.0f);
-                glDrawArrays(GL_LINES, 0, 6);
-                break;
-            }
-            case RefDatum::Kind::Csys: {
-                // Three axes from the origin: X=xdir (red), Y=ydir (green), Z=normal (blue).
-                Vec3 o = d.origin, x = o + d.xdir * cs, y = o + d.ydir * cs, z = o + d.dir * cs;
-                glLineWidth(2.0f);
-                float ax[6] = {o.x,o.y,o.z, x.x,x.y,x.z};
-                upload(ax, 6); setCol(0.90f, 0.25f, 0.25f, 0.95f); glDrawArrays(GL_LINES, 0, 2);
-                float ay[6] = {o.x,o.y,o.z, y.x,y.y,y.z};
-                upload(ay, 6); setCol(0.25f, 0.80f, 0.30f, 0.95f); glDrawArrays(GL_LINES, 0, 2);
-                float az[6] = {o.x,o.y,o.z, z.x,z.y,z.z};
-                upload(az, 6); setCol(0.30f, 0.45f, 0.95f, 0.95f); glDrawArrays(GL_LINES, 0, 2);
-                break;
-            }
-            case RefDatum::Kind::Curve: {
-                // A helix / spiral / spline path: draw the sampled polyline as a solid
-                // cyan curve (brighter + thicker when selected), one GL_LINES segment
-                // per sample pair so the small plane VBO is never overflowed.
-                if (d.points.size() < 2) break;
-                glLineWidth(selected ? 3.5f : 2.25f);
-                if (selected) setCol(0.35f, 0.95f, 1.0f, 1.0f);
-                else          setCol(0.20f, 0.75f, 0.92f, 0.95f);
-                for (size_t i = 1; i < d.points.size(); ++i) {
-                    const Vec3& p0 = d.points[i - 1];
-                    const Vec3& p1 = d.points[i];
-                    float seg[6] = {p0.x, p0.y, p0.z, p1.x, p1.y, p1.z};
-                    upload(seg, 6);
-                    glDrawArrays(GL_LINES, 0, 2);
-                }
-                break;
-            }
+    // Draw order inside the pass is the build order, which is the old per-primitive order — the
+    // pass blends with depth-write off, so order is the only observable besides the pixels.
+    float lineWidth = -1.0f;
+    for (const render::RefDatumDraw& c : cmds) {
+        if (c.lineWidth > 0.0f && c.lineWidth != lineWidth) {
+            glLineWidth(c.lineWidth);
+            lineWidth = c.lineWidth;
         }
+        glUniform4fv(uPlane_.color, 1, c.rgba);
+        glDrawArrays(c.mode, c.first, c.count);
     }
 
     glLineWidth(1.0f);
@@ -2263,18 +2159,17 @@ void Renderer::drawSectionCap(const Mat4& mvp, int planeIdx) {
     glColorMask(GL_FALSE, GL_FALSE, GL_FALSE, GL_FALSE);
     glDepthMask(GL_FALSE);
     glDisable(GL_DEPTH_TEST);
-    glDisable(GL_CULL_FACE);
     glStencilFunc(GL_ALWAYS, 0, 0xFF);
     glStencilOpSeparate(GL_FRONT, GL_KEEP, GL_KEEP, GL_INCR_WRAP);
     glStencilOpSeparate(GL_BACK,  GL_KEEP, GL_KEEP, GL_DECR_WRAP);
 
     // Reuse the face program — all active clip planes already set from drawCurrent.
     glUseProgram(prog_);
-    glUniformMatrix4fv(glGetUniformLocation(prog_, "uMVP"), 1, GL_FALSE, mvp.m);
-    glUniform1i(glGetUniformLocation(prog_, "uClipCount"), section_.count);
-    glUniform3fv(glGetUniformLocation(prog_, "uClipN"),   section_.count, section_.normals[0]);
-    glUniform1fv(glGetUniformLocation(prog_, "uClipOff"), section_.count, section_.offsets);
-    glUniform1i(glGetUniformLocation(prog_, "uUseScalar"), 0);
+    glUniformMatrix4fv(uFace_.mvp, 1, GL_FALSE, mvp.m);
+    glUniform1i(uFace_.clipCount, section_.count);
+    glUniform3fv(uFace_.clipN,   section_.count, section_.normals[0]);
+    glUniform1fv(uFace_.clipOff, section_.count, section_.offsets);
+    glUniform1i(uFace_.useScalar, 0);
     for (const auto& s : subs_) {
         if (!s.visible) continue;   // hidden body never marks the cap stencil
         glBindVertexArray(s.vao);
@@ -2305,15 +2200,15 @@ void Renderer::drawSectionCap(const Mat4& mvp, int planeIdx) {
     };
 
     glUseProgram(capProg_);
-    glUniformMatrix4fv(glGetUniformLocation(capProg_, "uMVP"), 1, GL_FALSE, mvp.m);
-    glUniform3fv(glGetUniformLocation(capProg_, "uColor"), 1, section_.capRgb);
-    glUniform3fv(glGetUniformLocation(capProg_, "uN"),     1, pNorm);
-    glUniform3f(glGetUniformLocation(capProg_, "uKeyDir"), capKeyDir_.x, capKeyDir_.y, capKeyDir_.z);
+    glUniformMatrix4fv(uCap_.mvp, 1, GL_FALSE, mvp.m);
+    glUniform3fv(uCap_.color, 1, section_.capRgb);
+    glUniform3fv(uCap_.n,     1, pNorm);
+    glUniform3f(uCap_.keyDir, capKeyDir_.x, capKeyDir_.y, capKeyDir_.z);
     // Cross-plane clipping in the cap shader (excludes this plane's own half-space).
-    glUniform1i(glGetUniformLocation(capProg_, "uClipCount"),  section_.count);
-    glUniform3fv(glGetUniformLocation(capProg_, "uClipN"),     section_.count, section_.normals[0]);
-    glUniform1fv(glGetUniformLocation(capProg_, "uClipOff"),   section_.count, section_.offsets);
-    glUniform1i(glGetUniformLocation(capProg_, "uCapExclude"), planeIdx);
+    glUniform1i(uCap_.clipCount,  section_.count);
+    glUniform3fv(uCap_.clipN,     section_.count, section_.normals[0]);
+    glUniform1fv(uCap_.clipOff,   section_.count, section_.offsets);
+    glUniform1i(uCap_.capExclude, planeIdx);
 
     glBindVertexArray(capVao_);
     glBindBuffer(GL_ARRAY_BUFFER, capVbo_);
@@ -2389,8 +2284,8 @@ void Renderer::resolveColorTexture() const {
     glUseProgram(resolveProg_);
     glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, colorTex_);
-    glUniform1i(glGetUniformLocation(resolveProg_, "uSrc"), 0);
-    glUniform1i(glGetUniformLocation(resolveProg_, "uSS"), SS);
+    glUniform1i(uResolve_.src, 0);
+    glUniform1i(uResolve_.ss, SS);
     glBindVertexArray(bgVao_);
     glDrawArrays(GL_TRIANGLES, 0, 3);
     glBindVertexArray(0);
@@ -2460,9 +2355,8 @@ void Renderer::updateBackdropBlur() const {
     glUseProgram(downsampleProg_);
     glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, resolvedTex_);
-    glUniform1i(glGetUniformLocation(downsampleProg_, "uSrc"), 0);
-    glUniform2f(glGetUniformLocation(downsampleProg_, "uInvSrcSize"), 1.0f / (float)rw_,
-                1.0f / (float)rh_);
+    glUniform1i(uDown_.src, 0);
+    glUniform2f(uDown_.invSrcSize, 1.0f / (float)rw_, 1.0f / (float)rh_);
     glDrawArrays(GL_TRIANGLES, 0, 3);
 
     unsigned int srcTex = blurDownTex_;
@@ -2473,10 +2367,9 @@ void Renderer::updateBackdropBlur() const {
         glViewport(0, 0, blurW_, blurH_);
         glUseProgram(kawaseProg_);
         glBindTexture(GL_TEXTURE_2D, srcTex);
-        glUniform1i(glGetUniformLocation(kawaseProg_, "uSrc"), 0);
-        glUniform2f(glGetUniformLocation(kawaseProg_, "uTexel"), 1.0f / (float)blurW_,
-                    1.0f / (float)blurH_);
-        glUniform1f(glGetUniformLocation(kawaseProg_, "uOffset"), 1.0f + (float)pass);
+        glUniform1i(uKawase_.src, 0);
+        glUniform2f(uKawase_.texel, 1.0f / (float)blurW_, 1.0f / (float)blurH_);
+        glUniform1f(uKawase_.offset, 1.0f + (float)pass);
         glDrawArrays(GL_TRIANGLES, 0, 3);
         srcTex = dstTex;
     }

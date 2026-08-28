@@ -453,7 +453,6 @@ void Overlays::drawSimulationTriangles(const Renderer::CameraXform& cam, uint64_
     glDepthFunc(GL_LEQUAL);
     glEnable(GL_BLEND);
     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-    glDisable(GL_CULL_FACE);
     if (overSurface) glDepthRange(0.0, 0.999);
     glBindVertexArray(buf->vao);
     glDrawArrays(GL_TRIANGLES, 0, buf->vertCount);
@@ -629,7 +628,6 @@ void Overlays::drawCamToolMarker(const Renderer::CameraXform& cam, const float p
     glEnable(GL_BLEND);
     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
     glDepthMask(GL_FALSE);
-    glDisable(GL_CULL_FACE);
     glBindVertexArray(camMarkerVao_);
     const float spindle[4] = {rgba[0], rgba[1], rgba[2], rgba[3] * 0.48f};
     glUniform4fv(uColor_, 1, spindle);
@@ -653,7 +651,8 @@ void Overlays::drawTriangles(const Renderer::CameraXform& cam, const std::vector
     glDepthFunc(GL_LEQUAL);
     glEnable(GL_BLEND);
     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-    glDisable(GL_CULL_FACE);  // glyph cones/quads are viewed from either side
+    // Glyph cones/quads are viewed from either side; face culling is never enabled anywhere in the
+    // host (GL default off, ImGui restores it), so no glDisable(GL_CULL_FACE) is needed here.
     if (overSurface) glDepthRange(0.0, 0.999);
     glBindVertexArray(triVao_);
     glBindBuffer(GL_ARRAY_BUFFER, triVbo_);

@@ -12,6 +12,7 @@
 
 #include "vec_math.h"
 #include "mesh.h"
+#include "render/ref_datum_geom.h"   // render::RefDatum + the GL-free datum batch builder
 
 // Display style for the shaded pass (SolidWorks "Display Style" toolbar).
 enum class DisplayStyle {
@@ -241,21 +242,14 @@ public:
     // A datum feature builds NO body, so the engine ships its resolved geometry out-of-band
     // (doc_mirror::refDatums); the host draws these as reference overlays after the model, the way
     // SolidWorks shows a created Axis/Plane/Point. setRefDatums replaces the whole set each rebuild.
-    struct RefDatum {
-        enum class Kind { Axis, Plane, Point, Csys, Curve };
-        Kind kind = Kind::Axis;
-        Vec3 origin{0, 0, 0};   // axis: a point on the line; plane/csys: origin; point: the point
-        Vec3 dir{0, 0, 1};      // axis: unit direction; plane/csys: unit normal; (point: unused)
-        Vec3 xdir{1, 0, 0};     // plane/csys: in-plane +U  (unused for axis / point)
-        Vec3 ydir{0, 1, 0};     // plane/csys: in-plane +V  (unused for axis / point)
-        // curve (helix / spiral / spline path): the sampled world-space polyline.
-        // A curve feature builds no body — this is what the host draws AND hit-tests
-        // so the user can pick the helix as a sweep path.
-        std::vector<Vec3> points;
-        std::string id;
-        std::string name;
-    };
-    void setRefDatums(std::vector<RefDatum> datums) { refDatums_ = std::move(datums); }
+    // The record itself lives in render/ref_datum_geom.h with the GL-free builder that turns a
+    // datum set into batched overlay geometry — one definition, aliased here so every existing
+    // `Renderer::RefDatum` user keeps working. setRefDatums replaces the whole set each rebuild.
+    using RefDatum = render::RefDatum;
+    void setRefDatums(std::vector<RefDatum> datums) {
+        refDatums_ = std::move(datums);
+        ++datumsRevision_;   // invalidates the cached datum batch (see drawRefDatums)
+    }
     // Read-only view of currently injected reference datums (axes/planes/points/…). Used by
     // hit-testing / PM routing so they consume the same geometry inject already solved — never
     // re-pair planes on the pick path.
@@ -439,6 +433,9 @@ private:
     void drawRefDatums(const Mat4& mvp, bool axesOnly);
     void drawSectionCap(const Mat4& mvp, int planeIdx);  // C28-C: cap for one plane, clipped by others
     void planeCorners(int plane, float e, Vec3 out[4]) const;  // 4 world corners of plane quad
+    void refreshDatumBatch();      // rebuild the cached datum geometry when its inputs changed
+    void refreshPlaneQuads();      // rebuild the cached origin-plane quad geometry (center/radius)
+    void cacheUniformLocations();  // resolve every program's uniform locations once, after linking
     void freeSubs();
     void freeSubVector(std::vector<Sub>& subs);
     void meshCacheTouch(const std::string& key);   // mark key MRU; insert if absent from order
@@ -447,6 +444,32 @@ private:
     void uploadDeformed(Sub& s);  // C19: re-upload displaced positions for the current scale
     void resolveColorTexture() const;  // SS colorTex_ -> final-size resolvedTex_ by box filter
     void updateBackdropBlur() const;   // resolvedTex_ -> quarter-res Kawase blur chain
+
+    // ---- uniform locations, resolved once per program link ----
+    // Every per-frame draw path used to re-query its uniforms BY STRING (glGetUniformLocation is a
+    // driver-side name lookup): ~70 lookups per frame across the face/edge/bg/shadow/plane/cap
+    // programs. The programs are linked exactly once in init(), so the locations are constants;
+    // cacheUniformLocations() resolves them there. -1 (uniform optimized out) is a documented
+    // no-op for glUniform*, exactly as before.
+    struct FaceUniforms {
+        int mvp = -1, keyDir = -1, fillDir = -1, rimDir = -1, camPos = -1, color = -1;
+        int useScalar = -1, scalarMin = -1, scalarMax = -1, metallic = -1, roughness = -1;
+        int lut = -1, clipCount = -1, clipN = -1, clipOff = -1, realView = -1;
+        int zebra = -1, zebraFreq = -1, alpha = -1;
+    } uFace_;
+    struct EdgeUniforms {
+        int mvp = -1, color = -1, clipCount = -1, clipN = -1, clipOff = -1;
+    } uEdge_;
+    struct BgUniforms { int top = -1, mid = -1, bot = -1; } uBg_;
+    struct ShadowUniforms { int mvp = -1, color = -1, maxAlpha = -1; } uShadow_;
+    struct PlaneUniforms { int mvp = -1, color = -1; } uPlane_;
+    struct CapUniforms {
+        int mvp = -1, color = -1, n = -1, keyDir = -1, clipCount = -1, clipN = -1, clipOff = -1;
+        int capExclude = -1;
+    } uCap_;
+    struct ResolveUniforms { int src = -1, ss = -1; } uResolve_;
+    struct DownsampleUniforms { int src = -1, invSrcSize = -1; } uDown_;
+    struct KawaseUniforms { int src = -1, texel = -1, offset = -1; } uKawase_;
 
     // ---- F1 async luminance pipeline (ported from ui/viewport/renderer.cpp) ----
     void issueLumaReadback() const;   // one glReadPixels/frame -> PBO ring + fence, or fallback
@@ -547,7 +570,23 @@ private:
     unsigned int edgeProg_ = 0;
     unsigned int bgProg_ = 0, bgVao_ = 0;
     unsigned int shadowProg_ = 0;  // ground contact-shadow quad
+    // planeProg_ draws both the origin planes and every datum overlay (flat uMVP+uColor).
+    // planeVao_/planeVbo_ now hold the CACHED origin-plane quads (3 planes x 6 fill + 4 border
+    // verts) instead of being re-filled twice per plane per frame; datumVao_/datumVbo_ hold the
+    // batched datum geometry. Both are camera-independent, so a frame is pure draw calls.
     unsigned int planeProg_ = 0, planeVao_ = 0, planeVbo_ = 0;
+    Vec3  planeQuadCenter_{0, 0, 0};   // center_ the cached plane quads were built at
+    float planeQuadExtent_ = -1.0f;    // half-extent e they were built at (-1 = never built)
+    unsigned int datumVao_ = 0, datumVbo_ = 0;
+    size_t datumVboFloats_ = 0;        // current datum VBO capacity, in floats
+    render::RefDatumBatch datumBatch_;   // cached datum geometry + merged draw lists
+    bool datumBatchValid_ = false;
+    unsigned int datumsRevision_ = 0;    // bumped by setRefDatums()
+    unsigned int datumBatchRevision_ = 0;               // revision the batch was built from
+    float datumBatchExtent_ = -1.0f;                    // e the batch was built at
+    std::string datumBatchSelected_, datumBatchEditing_;
+    std::unordered_set<std::string> datumBatchHidden_;   // hidden set the batch was built from
+    render::RefDatumPalette datumBatchPalette_;          // palette roles it was built from
     std::vector<RefDatum> refDatums_;   // feature datum geometry to draw (reference overlays)
     std::unordered_set<std::string> hiddenDatums_;  // datum ids hidden via the FeatureManager eye
     std::string selectedDatumId_;       // id of the emphasized (selected) datum, "" = none

@@ -200,6 +200,7 @@ set(CHUDWARE_CORE_SOURCES
   src/render/splat_renderer.cpp     # RE-28: 3DGS splat renderer
   src/render/re_points.cpp          # RE-21: sparse point-cloud + camera-frusta overlay (GL)
   src/render/re_points_fixture.cpp  # RE-21: GL-free fixture builder (also linked by ctest)
+  src/render/ref_datum_geom.cpp     # GL-free batched datum overlay geometry (also linked by ctest)
   src/core/selection.cpp
   # --- end C15 ---
   # --- C16: feature tree + doc mirror ---
@@ -753,6 +754,22 @@ add_test(NAME test_re_points
   COMMAND test_re_points
   WORKING_DIRECTORY "${CMAKE_BINARY_DIR}")
 # --- end RE-21 ---
+
+# --- batched reference-datum overlay geometry: links the REAL ref_datum_geom.cpp (GL-free).
+# Guards the batching rewrite: the test replays the OLD per-primitive upload+draw sequence and
+# asserts the batch expands to a byte-identical (mode, color, width, vertex) stream, so a future
+# edit to the builder cannot silently move a dash, cone or plane border on screen.
+add_executable(test_ref_datum_geom
+  src/render/ref_datum_geom.cpp
+  tests/test_ref_datum_geom.cpp)
+target_include_directories(test_ref_datum_geom PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/src)
+set_target_properties(test_ref_datum_geom PROPERTIES
+  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+add_test(NAME test_ref_datum_geom
+  COMMAND test_ref_datum_geom
+  WORKING_DIRECTORY "${CMAKE_BINARY_DIR}")
+# --- end datum batch ---
 
 # --- copilot session-id allocation: links the REAL conv_ids.cpp (no GL / imgui / AppState).
 # Guards the restart-collision data loss: convCounter restarted at 0 every launch and

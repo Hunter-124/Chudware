@@ -1496,3 +1496,95 @@ noise next to millisecond compile work and deliberately left alone; the MCP enve
 duplicates (~120 lines across nine files, four incompatible conventions) were scoped and not
 taken this pass.
 
+## 2026-08-28 — second cycle: the quadratic ratsnest, the immediate-mode datums, and a prompt cache nobody called
+
+A second audit wave covered what the first did not (CAM/sim/ECAD/solver, the agent turn's own
+overhead, the scene renderer, and the PLM vault), then landed six disjoint units. Everything
+below is measured against the code it replaced, not estimated.
+
+**ECAD DRC was quadratic in the wrong variable, twice.** `net_class_of` linear-scanned
+`board["nets"]` on every lookup, and the clearance rule calls it twice per shape PAIR — so the
+O(shapes²) pass was really O(shapes²·nets), with the same extra factor on zone clearance, track
+width and via checks. A `NetRules` index built once per invocation removes it. Worse,
+`ratsnest()` — which runs on **every interactive board compile**, not just batch DRC — rebuilt
+and re-sorted its Prim frontier every iteration and recomputed the full in-tree × remaining
+cross product each round: O(V²logV) sorting on top of ~O(k·n²) distance work. It now keeps a
+per-remaining-component best-edge cache relaxed only against the component just added. The
+tie-break was the whole risk: equal distances resolve by row-major first pair, and mirrored
+layouts hit that for real, so the change ships with a reference implementation in
+`test_drc_geometry.cpp` and a 406-board differential corpus (400 randomized + 6 deliberately
+symmetric) — 4433 airwires and 8951 violations, zero mismatches — plus five mutations, each
+caught. Measured: ratsnest 100/200/400 components 17.95→0.43 ms, 143.13→1.11 ms,
+1007.45→2.56 ms (394×); `run_drc` on 1000 nets × 300 pads 547→9.55 ms.
+
+**The renderer was drawing reference datums one primitive at a time.** Every dash, cone
+triangle, octahedron face and tail segment got its own `glBufferSubData` + `glDrawArrays` into a
+six-vertex scratch buffer, every frame — 161 draws and 161 uploads for the *default* scene
+(origin marker plus three axes). The pure geometry now lives in a GL-free
+`host/src/render/ref_datum_geom.{h,cpp}`, is built once into a single buffer with merged
+same-state ranges, and is rebuilt only when the datum set, hidden set, selection, PM-edit target,
+scene extent or palette changes: 13 draws and 0 steady-state uploads. The rich 13-datum case goes
+248 draws + 248 uploads → 24 + 1. Reference-plane quads are cached the same way (6 uploads → 0),
+all 75 per-frame `glGetUniformLocation` sites are resolved once at link like `overlays.cpp`
+already did, and seven `glDisable(GL_CULL_FACE)` calls that could not change state are gone.
+Equivalence is a committed ctest (`host/tests/test_ref_datum_geom.cpp`) that replays the old
+per-primitive path and diffs the primitive streams — mode, colour, width and vertices — across
+every datum kind and selection state.
+
+**The PLM vault re-walked and re-exploded everything on every write.** `_project_containers`
+`rglob`'d the entire project — including the vault's own `.aicadvault/objects` fan-out — on every
+save, checkpoint, release and even manifest-only edits; a pruned `os.walk` (the pattern
+`_tree_working_stamp` already used) gives the identical, identically ordered list at 6.231 →
+0.090 ms on a 12-container project with 478 vault objects. `_explode_project_into_shadow` then
+re-read and re-canonicalized every tracked `.step+`/`.ecad+` regardless of whether it changed;
+it now stamps `(mtime_ns, ctime_ns, size, ino)` before the read and reuses the previous explode
+on a hit — 12 explodes per save → 1 when one container changed, 0 when nothing did. And
+`history(limit=N)` walked the entire commit chain and decoded every commit twice before applying
+the limit; a lazy `iter_log()` generator plus scope filtering inside the walk makes
+`history(limit=5)` decode 5 commits instead of 82+ on a 41-commit vault. Equivalence for the
+explode cache is an end-to-end replay of save/checkpoint/add_item/release/rev/restore with and
+without the cache: every commit id, blob sha, manifest and history variant byte-identical.
+
+**The prompt cache existed, was warmed at worker start, and the live chat lane never called it.**
+`run_linear_role_turn` recomposed the role prose, allowlist and the full §9.1 tool-schema block
+every turn — per-tool `inspect.signature`/`getdoc` plus a config lookup for each of 22+ tools —
+while `prompt_cache.compose()` did exactly that with fingerprinted memory+disk caching for the
+GUI meters and tests only. Two things stopped a naive swap and are worth knowing: the cache's
+resolver renders `ask_user` and `delegate` differently from the mission dispatcher's, and
+`render_tools_block` is budget-coupled (tier surplus is spread across the whole allowlist), so
+splicing cached entries around live ones would change bytes. The slot is therefore rendered with
+the turn's own resolver and memoized on (fingerprint, tier budget slot, allowlist, per-tool
+resolved identity); the cached prose is used as a witness, not blindly, because Harness knobs
+read through `config` accessors make a stale-but-fingerprint-valid entry possible — trusting it
+re-armed `delegate` for a session with sub-agents OFF, which the existing truncation test caught
+and a new test now pins. Measured on the general_agent floor at frontier tier: composition
+16.1 → 7.6 ms, `inspect.signature` 21 → 0, `config.load_config` 45 → 5, `os.stat` 47 → 7, and
+three consecutive turns render the tools block once instead of three times.
+
+**Two smaller ones.** `core/agent`'s `agent_call` and reviewer stage called `build_context`
+(which already assembles the prompt) and then re-read the prompt file a second time with the
+WRONG default flags purely to recover a telemetry path — for a modeler that meant re-reading the
+31 KB shared ops cheatsheet it wasn't even using. The built context now carries the source path
+its own load resolved, which also removes a real hazard: the reported path could previously come
+from a different read than the prompt actually sent. And the AI Docs panel stat'd the selected
+file every frame plus every visible row every frame; both now use a one-second cached existence
+check (720 stats → 12 over 60 frames of 12 rows), with deletion still surfacing within a second.
+Nine MCP tool modules carried four mutually incompatible envelope conventions duplicated
+pairwise; `services/mcp/_envelopes.py` now owns each convention explicitly (they are NOT merged —
+`reason`-keyed dict, `error`-keyed string, compact and sorted variants stay distinct) and the
+147 duplicated lines are gone, with the numpy/callable JSON-default differences expressed as
+arguments and byte-identity checked against the pre-edit helpers.
+
+Verification: `scripts/check.py` 9/9 PASS; `./build.sh all` green; core `ctest` **103/103**
+(including the new `drc_geometry` differential cases) and host `ctest` 20/20 with the new
+`test_ref_datum_geom`; `services/agent` + `services/dag` 3807 passed, 42 skipped; `services/plm`
++ prompt-cache + truncation 456 passed; `services/mcp` 2869 passed with the same three
+environment/pre-existing reds as the previous entry; seven `CHUDWARE_SHOT` scenarios (m1, parts,
+workspaces, ecad, sketch, asm, drawing) exit 0 and the m1 capture is pixel-unchanged against the
+pre-change shot. Deliberately deferred with reasons recorded in the audits: DRC's remaining
+unindexed pairwise scans (clearance, zone-island fixed point, hole-to-hole) want a real spatial
+index and their own measurement; `node_runner.py` and `delegation.py` cannot reuse the prompt
+cache until it can key on a resolved allowlist rather than role+capability; `zonefill.cpp` keeps
+its own net-class scan.
+
+

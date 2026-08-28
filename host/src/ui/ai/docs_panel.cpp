@@ -79,6 +79,14 @@ struct TexSlot {
 // used to keep one GL texture per path forever; past this the least-recently-drawn is deleted.
 constexpr size_t kMaxTexCache = 24;
 
+// How long a cached filesystem-existence answer stays good, in seconds. Out-of-band deletion
+// is rare, so one stat per path per second is plenty to keep the "not found on disk" warning
+// honest without stat-ing every visible row every frame.
+constexpr double kExistsTtl = 1.0;
+// Guard against unbounded growth as conversations churn through artifact paths; the whole map
+// is dropped when it gets silly, and the next frame simply re-stats what it draws.
+constexpr size_t kMaxExistsCache = 512;
+
 struct DocsState {
     // Per-session user attachments, keyed by conversation id ("" -> "default").
     std::unordered_map<std::string, std::vector<std::string>> attachedByConv;
@@ -99,6 +107,15 @@ struct DocsState {
 
     // Image texture cache keyed by path, bounded by kMaxTexCache with LRU eviction.
     std::unordered_map<std::string, TexSlot> tex;
+
+    // Low-frequency existence cache keyed by row path, mirroring the preview pane's approach:
+    // the list stats a path at most once per kExistsTtl, so steady-state drawing costs no
+    // syscall per visible row per frame while an out-of-band deletion still surfaces in ~1s.
+    struct ExistsSlot {
+        double checkedAt = 0.0;
+        bool   exists    = false;
+    };
+    std::unordered_map<std::string, ExistsSlot> existsCache;
 
     // Artifact kind of the entry `selected` addresses, refreshed by the list each frame. Lets
     // the preview honour an artifact the agent tagged "image" whatever its extension is.
@@ -219,6 +236,21 @@ const TexSlot& texFor(DocsState& D, const std::string& path) {
         D.tex.erase(oldest);   // erase never invalidates `it` (only the erased iterator)
     }
     return it->second;
+}
+
+// Cached std::filesystem::exists for a list row. Same answer as a direct stat within kExistsTtl.
+bool pathExists(DocsState& D, const std::string& path) {
+    const double now = ImGui::GetTime();
+    auto it = D.existsCache.find(path);
+    if (it != D.existsCache.end() && now - it->second.checkedAt < kExistsTtl) return it->second.exists;
+    if (it == D.existsCache.end()) {
+        if (D.existsCache.size() >= kMaxExistsCache) D.existsCache.clear();
+        it = D.existsCache.emplace(path, DocsState::ExistsSlot{}).first;
+    }
+    std::error_code ec;
+    it->second.exists    = std::filesystem::exists(path, ec);
+    it->second.checkedAt = now;
+    return it->second.exists;
 }
 
 // ---------------------------------------------------------------- artifact collection
@@ -679,8 +711,19 @@ void drawPreview(AppState& st, DocsState& D, const AdaptiveSurface& surf, float 
         return;
     }
     const std::string& path = D.selected;
-    std::error_code ec;
-    if (!std::filesystem::exists(path, ec)) {
+    // Out-of-band deletion is rare; stat once per selection and then only about once a
+    // second, so a steady preview costs no syscall per frame.
+    static std::string existsCachedPath;
+    static double existsCheckedAt = 0.0;
+    static bool existsCached = false;
+    const double now = ImGui::GetTime();
+    if (existsCachedPath != path || now - existsCheckedAt >= 1.0) {
+        std::error_code ec;
+        existsCached = std::filesystem::exists(path, ec);
+        existsCachedPath = path;
+        existsCheckedAt = now;
+    }
+    if (!existsCached) {
         ImGui::PushStyleColor(ImGuiCol_Text, surf.textPrimary);
         ImGui::TextUnformatted(baseName(path).c_str());
         ImGui::PopStyleColor();
@@ -754,8 +797,7 @@ bool docRow(DocsState& D, const DocEntry& e, bool selected, const AdaptiveSurfac
     ImDrawList* dl = ImGui::GetWindowDrawList();
     ui::glassRowBackground(dl, p0, ImVec2(p0.x + rowW, p0.y + rowH), rowRoundDp(), false,
                            selected, selected ? 0.5f : 0.30f);
-    std::error_code ec;
-    const bool missing = !e.path.empty() && !std::filesystem::exists(e.path, ec);
+    const bool missing = !e.path.empty() && !pathExists(D, e.path);
     const ImVec4 txt = missing    ? surf.textTertiary
                      : selected   ? surf.textPrimary
                                   : surf.textSecondary;

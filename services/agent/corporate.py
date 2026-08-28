@@ -120,6 +120,7 @@ ROLE_TO_DEPT: dict[str, str] = {
     "drawing_detailer": "documentation",
     "re_datasheet_reader": "documentation",
     "ecad_engineer": "electronics",
+    "pcb_engineer": "electronics",
     "firmware_engineer": "firmware",
     "sourcing_specialist": "sourcing",
     "intake_analyst": "intake",

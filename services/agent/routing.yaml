@@ -68,6 +68,7 @@ assignments:
   memory:                 [cheap_local, strong]
   drawing_detailer:       [cheap_local, strong]
   ecad_engineer:          [strong, cheap_local]
+  pcb_engineer:           [strong, cheap_local]
   firmware_engineer:      [strong, cheap_local]
   # 2D/3D split roles.
   sketch2d:               [cheap_local, strong]

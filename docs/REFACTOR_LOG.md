@@ -1292,3 +1292,105 @@ assertions. `services/agent` + `services/dag`: 3828 passed, 2 pre-existing failu
 pristine HEAD in an out-of-tree archive; `test_prohibited_auth::test_no_consumer_oauth_token_reuse`
 names `Webservice/gateway/provider_accounts.py:127`, landed 2026-08-19 in `c7b27bd7b`, and
 neither file was touched here).
+
+## 2026-08-27 — a clean workspace, and the ECAD lane that no role could walk
+
+Hunter asked for the repo and its agent memory to be cleaned before further work. The
+preceding entry's provider-refusal change was sitting uncommitted in the tree; it built,
+its 18 Python tests and both `test_agent` cases passed, so it landed first (`7b7ed75b8`)
+rather than being swept up in a cleanup diff.
+
+**Deleted, each reference-checked first.** `tools/flywheel/bench/gym/reports/runs/` (391
+raw per-seed `ledger/mission/graded` files): `leaderboard.discover_cells` rejects every one
+of them for having no `cell.json`, `repomix.config.json` already excludes the tree, and its
+colon-bearing directory names are what `scripts/portable_paths_audit.py`'s docstring blames
+for a Windows checkout failure. `.gitignore`'s `reports/runs/` rule was supposed to stop
+exactly this and never could: a mid-pattern slash anchors a pattern to the repo root, so it
+only ever matched a top-level `reports/runs/`. Added `**/reports/runs/` beside it. Also
+gone: 14 one-off `tools/probe_*|verify_round*|repro_*` scripts (every one loads a Windows
+`dist/Chudware/libchudware.dll` by absolute path — a dev-box session artifact, zero inbound
+references), `core/Testing/` ctest scratch, `assets/icons/batches/` + `icon_prompts.json`
+(its `output_dir` names `host/assets/icons/src/`, a layout this repo has not had for
+months), 8 dated `diag-*.json` archives where only `diag-latest.json` is read, the
+self-documented `_invalid/` quarantine, and one captured console log. Tracked paths:
+9188 → 5075.
+
+**`.aicadvault/` is untracked now.** It is not source — it is the PLM vault
+(`services/plm/gitbind.py` `VAULT_DIRNAME`) that any run treating the repo root as a project
+creates, and it had grown from the 2463 files the 2026-08-14 entry noticed to 3684. No test
+depends on the repo-root one (they all build vaults under `tmp_path`). `git rm --cached` +
+`/.aicadvault/`; the bytes stay on disk and in history.
+
+**`OMP_INTEGRATION_PLAN.md` is gone, but its contract is not.** The root file was a one-sprint
+status board whose "Landed" half duplicates `docs/omp-integration/` and whose "Remaining"
+half this log already records as done. Its one unique artifact — the frozen twelve-name
+`agent_provider_*` → bridge RPC table — is now a section in `01-DECISIONS.md`, and all five
+referrers (`core/api/libchudware.cpp` ×2, `host/src/ui/settings_modal.cpp`,
+`services/agent/omp_bridge.py`, `services/agent/project_memory.py`, `docs/README.md`) point
+at it, so nothing dangles.
+
+**Archive splits, not rewrites.** `REFACTOR_LOG.md` 2906 → 1294 lines, with 2026-08-03..08
+moved verbatim to `docs/refactor-log/2026-08-01-to-08.md` on an entry boundary;
+`host/GUI_POLISH_TRACKER.md` 189 → 28 and `host/WIRE_REQUESTS.md` 293 → 27, resolved sections
+verbatim into `host/archive/`. The live files keep their names because
+`docs/plans/GUI_OVERHAUL_SPEC.md`, `docs/reference/EM_SIMULATION.md`,
+`host/src/ui/ai/ai_workspace.cpp` and `work/tasks/T-SIM11.md` link to them.
+
+**Board and skill truth.** T-BL10/T-BL15 were self-declared superseded by the finished
+workstream R and are retired; T-BL45 is done. Every card citing `engine_oracle/`,
+`ui/imgui/` or the nonexistent `docs/HANDOFF_GUI_OVERHAUL.md` was retargeted at what exists,
+including T-WIN1, which still asserted "host/ stays deleted" from the reversed T-G11.
+`.claude/skills/chudware-dev/SKILL.md` had the mirror-image defect: its ⚠️ warning said
+AGENTS.md was stale on GUI ownership when AGENTS.md is now correct and the warning was not,
+and its repo map named `docs/PLAN.md`, `docs/CPP_MIGRATION.md` and `engine_oracle/`, all
+deleted. Off-index: 7 stashes (6–8 weeks old) and two `~/.cache` worktrees removed —
+recoverable from `refs/archive/stash-0..6` and `~/Backups/CAD-stashes-2026-08-28/` — plus
+three branches. `ci/provisioning-repair` looked like unmerged work but every one of its 8
+real Windows-CI fixes is already on master (ASCII policy gate, `PYTHONUTF8`,
+`ErrorActionPreference`, python-build-standalone provisioning); its only unique content was
+a stale `mcp_server/server.py` path in a comment. Archived to
+`refs/archive/ci-provisioning-repair`.
+
+**The ECAD role split (the long-deferred known-red).** `test_mega11_legs::…ecad_engineer…`
+demanded 22 tools from a card capped at `MAX_TOOLS_PER_ROLE = 16` — unsatisfiable by
+construction, because `ecad_run_erc`/`ecad_run_drc`/`ecad_add_power`/`ecad_simulate`/
+`ecad_antenna_design`/`ecad_make_board`/`ecad_autoroute` were held by NO role and
+`board_from_schematic` only by `spec_writer`'s family expansion: the PCB half of the pipeline
+was unreachable. `ecad_engineer` is now explicitly schematic capture (16 seats, ending at
+netlist/BOM/plot, which is what `agent_turn._DELIVERED_PRODUCT_TOOLS` already treated as a
+legitimate ECAD finish), and a new `pcb_engineer` (16 seats) owns
+`board_from_schematic` → `ecad_autoroute` → `ecad_fill_zones` → `ecad_run_drc` →
+`ecad_export`, plus antenna/RF. `ecad_simulate` is deliberately NOT a permanent seat: the card
+spends one seat on `enable_tools` and its prompt, mission job and cheatsheet all call
+`enable_tools(categories=['ecad'])` before SPICE — a regression pins that `ecad_simulate` is
+really in that category, so the path is reachable rather than merely asserted. Registered in
+the family map, catalog, department map, `routing.yaml`, `tool_budget` (28 calls, justified
+like its neighbour's 35) and `mission_template._resolve_build_role`, which now sends
+schematic/SPICE work to `ecad_engineer`, board/antenna/DRC/Gerber work to `pcb_engineer`, and
+starts a mixed deliverable at the schematic with an explicit delegate hand-off.
+`_empty_product_handoff_block` had to split with it: `_ECAD_PRODUCT_TOOLS & allow` now
+matches `pcb_engineer`, and the old combined remedy would have told it to "start with
+`ecad_new_schematic`" — a tool it cannot hold, which is precisely the unsatisfiable roadmap
+that function's own docstring was written to prevent. The PCB branch starts at `ledger_get`
+and says to delegate the capture if no schematic exists;
+`test_empty_product_handoff_block_pcb_lane_is_walkable` loads the real card and asserts the
+remedy names only tools in its grant.
+
+**Memory.** The project's Mnemopi bank held 41 entries, 11 of them raw session transcripts
+(258 KB, up to 69 KB each). Each was condensed to a dense fact paragraph (74 KB total,
+preserving SHAs, paths, measured numbers and stated decisions) and the raw rows invalidated
+with `replacement_id` set, so history stays inspectable. Worth knowing for whoever looks:
+`~/.omp/agent/memories/mnemopi/banks/CAD-…/banks/` has accumulated ~60 sub-banks belonging to
+OTHER projects (CloudCastle, Stimlab, …) nested under CAD's bank directory. Left alone —
+that is other projects' memory, not this one's — but the nesting looks like a bank-path
+resolution bug worth a look.
+
+Verification: `scripts/check.py` all 9 gates PASS; `./build.sh all` green; `services/agent` +
+`services/dag` 3801 passed, 42 skipped, **1 failed** —
+`test_prohibited_auth::test_no_consumer_oauth_token_reuse`, unchanged and untouched here. It
+is the owner's open product decision: `contracts/providers.md` §4.4 already authorizes this
+exact flow for the DESKTOP as opt-in use of the user's own paid subscription, and the
+gateway's `personal` scope matches that intent, but its `shared` scope (an operator-owned
+account backing a managed pool) is pooled reuse that §4.4 does not cover. Remedy is one of
+two lines — remove the flow, or record an owner-approved exception in
+`contracts/providers.md` and add a narrow ALLOWLIST entry. Do not fabricate the approval.

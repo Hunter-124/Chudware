@@ -11037,9 +11037,10 @@ _DELIVERED_PRODUCT_TOOLS: frozenset[str] = frozenset({
     "board_from_schematic", "ecad_run_drc", "ecad_make_board", "fw_build",
     # A schematic-only ECAD lane never reaches the board stage: ecad_engineer's
     # own card mandates "a confirmed netlist, BOM, and vector plot artifact" as
-    # its finish condition, and its 14/14-tool grant holds no board tool at all.
-    # Omitting these made a legitimate ECAD finish read as zero delivered
-    # product to every gate that consults this set.
+    # its finish condition, and its full 16-seat grant holds no board tool at all
+    # (the board half is pcb_engineer's, split out 2026-08-27). Omitting these
+    # made a legitimate ECAD finish read as zero delivered product to every gate
+    # that consults this set.
     "ecad_netlist", "ecad_bom", "ecad_plot",
     "cam_generate", "cam_post", "make_drawing", "export_drawing",
     "run_fea_static", "run_fea_adaptive", "run_fea_modal", "run_cfd_flow",
@@ -11092,12 +11093,24 @@ def _empty_product_handoff_block(
     # ECAD roadmap above. Only the grant decides.
     del actor
     allow_set = allow or set()
-    if _ECAD_PRODUCT_TOOLS & allow_set:
+    if _ECAD_PRODUCT_TOOLS & allow_set and "ecad_new_schematic" in allow_set:
         return (
             "ECAD product role cannot declare done with zero tool calls. "
             "ENTRY PATH required: ecad_new_schematic → place → ecad_wire/"
             "ecad_add_power → board_from_schematic → ecad_run_drc. Call a tool "
             "NOW (start with ecad_new_schematic)."
+        )
+    if _ECAD_PRODUCT_TOOLS & allow_set:
+        # PCB lane (pcb_engineer): holds the board half and NOT ecad_new_schematic,
+        # so the combined roadmap above would name a tool it cannot call — the exact
+        # failure this function's docstring records. Start it where its own grant
+        # starts: read the schematic the schematic lane handed over, then build.
+        return (
+            "PCB product role cannot declare done with zero tool calls. "
+            "ENTRY PATH required: ledger_get (find the handed-over schematic doc) "
+            "→ board_from_schematic → ecad_autoroute → ecad_run_drc. If no "
+            "schematic exists yet, delegate the capture instead of finishing. "
+            "Call a tool NOW (start with ledger_get)."
         )
     if "ecad_new_schematic" in allow_set:
         # Schematic-only lane: finish at the artifacts it really owns.

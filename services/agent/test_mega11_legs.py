@@ -1,14 +1,15 @@
 """Mega-11 LegProduction regressions (LazyVulture).
 
-Axes: K/L/M support — ECAD/firmware/antenna legs must (1) resolve role cards
-with domain tools + delegate, (2) be classified to tool-capable tiers on
-BUILD (not one-shot ollama leaves), and (3) carry concrete entry-tool briefs.
+Axes: K/L/M support — schematic ECAD, PCB, firmware, and antenna legs must
+(1) resolve role cards with domain tools + delegate, (2) be classified to
+tool-capable tiers on BUILD (not one-shot ollama leaves), and (3) carry
+concrete entry-tool briefs.
 
 Run: python3 -m pytest services/agent/test_mega11_legs.py -q
 """
 from __future__ import annotations
 
-from services.agent.roles import MAX_TOOLS_PER_ROLE, load_role
+from services.agent.roles import MAX_TOOLS_PER_ROLE, load_all_roles, load_role
 from services.agent.role_models import (
     domain_tags_from_context,
     is_leaf_task_class,
@@ -27,27 +28,92 @@ from services.dag.mission_template import (
 # ---------------------------------------------------------------------------
 
 
-def test_ecad_engineer_role_has_domain_tools_and_delegate():
+def test_ecad_engineer_role_has_schematic_tools_and_delegate():
     card = load_role("ecad_engineer")
     tools = card.concrete_tools
     assert len(tools) <= MAX_TOOLS_PER_ROLE, (len(tools), tools)
-    assert "delegate" in tools
     for must in (
         "ecad_new_schematic",
+        "ecad_symbols",
+        "ecad_place_symbol",
         "ecad_wire",
         "ecad_add_power",
-        "board_from_schematic",
+        "ecad_label",
+        "ecad_status",
         "ecad_run_erc",
-        "ecad_run_drc",
-        "ecad_simulate",
-        "ecad_antenna_design",
+        "ecad_lint_schematic",
+        "enable_tools",
+        "ecad_netlist",
+        "ecad_bom",
+        "ecad_plot",
         "ledger_get",
         "ledger_note",
+        "delegate",
     ):
         assert must in tools, (must, tools)
     prompt = card.system_prompt.lower()
     assert "ecad_new_schematic" in prompt
+    assert "pcb_engineer" in prompt
+    from services.agent.tool_categories import resolve_categories
+    assert "ecad_simulate" in resolve_categories(["ecad"])
+
+
+def test_pcb_engineer_role_has_board_tools_and_delegate():
+    card = load_role("pcb_engineer")
+    tools = card.concrete_tools
+    assert len(tools) <= MAX_TOOLS_PER_ROLE, (len(tools), tools)
+    for must in (
+        "board_from_schematic",
+        "ecad_make_board",
+        "ecad_autoroute",
+        "ecad_run_drc",
+        "ecad_fill_zones",
+        "ecad_update_from_sch",
+        "describe_board",
+        "ecad_plot",
+        "ecad_bom",
+        "ecad_status",
+        "ecad_antenna_design",
+        "ecad_antenna_analyze",
+        "ledger_get",
+        "ledger_note",
+        "delegate",
+    ):
+        assert must in tools, (must, tools)
+    prompt = card.system_prompt.lower()
     assert "board_from_schematic" in prompt
+    assert "drc-clean" in prompt
+
+
+def test_ecad_split_or_dynamic_grants_cover_required_tools():
+    required = {
+        "board_from_schematic",
+        "ecad_run_erc",
+        "ecad_run_drc",
+        "ecad_add_power",
+        "ecad_simulate",
+        "ecad_annotate",
+        "ecad_edit_symbol",
+        "ecad_antenna_design",
+        "ecad_antenna_analyze",
+        "ecad_make_board",
+        "ecad_autoroute",
+        "ecad_fill_zones",
+        "ecad_update_from_sch",
+    }
+    cards = load_all_roles().values()
+    grants = {
+        tool
+        for card in cards
+        for tool in card.concrete_tools
+    }
+    # ecad_engineer deliberately spends one permanent seat on enable_tools so
+    # conditional SPICE/edit/annotation surfaces remain reachable without
+    # evicting the load-bearing capture/ERC/deliverable chain.
+    if "enable_tools" in grants:
+        from services.agent.tool_categories import resolve_categories
+        grants.update(resolve_categories(["ecad"]))
+    assert not (required - grants), required - grants
 
 
 def test_firmware_engineer_role_has_domain_tools_and_delegate():
@@ -72,7 +138,7 @@ def test_firmware_engineer_role_has_domain_tools_and_delegate():
 
 def test_producing_roles_not_plan_capability_split():
     """Producing legs KEEP domain mutators (unlike layout/orchestrator)."""
-    for rid in ("ecad_engineer", "firmware_engineer"):
+    for rid in ("ecad_engineer", "pcb_engineer", "firmware_engineer"):
         tools = load_role(rid).concrete_tools
         assert "add_features" not in tools  # not geometry
         assert "ledger_note" in tools
@@ -92,6 +158,16 @@ def test_resolve_build_role_ecad_by_name():
         "description": "schematic + board + antenna",
     }
     assert _resolve_build_role(d) == "ecad_engineer"
+
+
+def test_resolve_build_role_pcb_by_name():
+    d = {
+        "id": "DL3B",
+        "name": "flight_computer_pcb",
+        "kind": "analysis",
+        "description": "route, fill, DRC, and export the physical board",
+    }
+    assert _resolve_build_role(d) == "pcb_engineer"
 
 
 def test_resolve_build_role_firmware_by_name():
@@ -114,16 +190,26 @@ def test_resolve_build_role_generic_analysis_stays_sim():
     assert _resolve_build_role(d) == "sim_engineer"
 
 
-def test_build_job_names_entry_tools():
+def test_build_job_names_split_entry_tools():
     ecad = {
         "id": "DL3",
-        "name": "flight_computer_ecad",
+        "name": "flight_computer_schematic",
         "kind": "analysis",
     }
     job = _build_job_for(ecad, "ecad_engineer")
     assert "ecad_new_schematic" in job
-    assert "board_from_schematic" in job
-    assert "ecad_run_drc" in job
+    assert "ecad_run_erc" in job
+    assert "pcb_engineer" in job
+
+    pcb = {
+        "id": "DL3B",
+        "name": "flight_computer_pcb",
+        "kind": "analysis",
+    }
+    job_pcb = _build_job_for(pcb, "pcb_engineer")
+    assert "board_from_schematic" in job_pcb
+    assert "ecad_fill_zones" in job_pcb
+    assert "ecad_run_drc" in job_pcb
 
     fw = {
         "id": "DL4",
@@ -135,17 +221,16 @@ def test_build_job_names_entry_tools():
     assert "fw_build" in job_fw
 
 
-def test_build_job_ecad_requires_wire_before_sim_and_board():
-    """mega-13: empty-netlist residual — brief must force wire + board chain."""
+def test_build_job_ecad_requires_wire_before_sim_and_handoff():
+    """Empty-netlist residual: the schematic brief forces wire before SPICE/handoff."""
     job = _build_job_for(
-        {"id": "DL3", "name": "flight_computer_ecad", "kind": "analysis"},
+        {"id": "DL3", "name": "flight_computer_schematic", "kind": "analysis"},
         "ecad_engineer",
     )
     assert "ecad_wire" in job
     assert "ecad_add_power" in job
-    assert "board_from_schematic" in job
-    assert "ecad_run_drc" in job
-    # wire before simulate called out
+    assert "ecad_simulate" in job
+    assert "pcb_engineer" in job
     assert "empty netlist" in job.lower() or "nets required" in job.lower()
 
 
@@ -256,6 +341,26 @@ def test_analysis_deliverables_get_build_nodes():
             or "make_report" in _tc.resolve_categories(["docs"]))
 
 
+def test_board_stage_deliverable_routes_to_pcb_engineer():
+    manifest = {
+        "request_verbatim": "Route and deliver a flight-computer PCB.",
+        "ambiguities": [],
+        "deliverables": [{
+            "id": "DLPCB",
+            "name": "flight_computer_pcb",
+            "kind": "analysis",
+            "description": "Physical board place, route, zones, DRC, and Gerbers.",
+            "acceptance_criteria": [],
+        }],
+    }
+    graph = build_mission_graph(manifest, graph_id="mega11-pcb")
+    node = {n["id"]: n for n in graph["nodes"]}["n_build_DLPCB"]
+    assert node["inputs"]["role"] == "pcb_engineer"
+    assert node["inputs"]["domain_tags"] == ["ecad", "pcb", "analysis"]
+    assert "board_from_schematic" in node["inputs"]["request"]
+    assert "ecad_run_drc" in node["inputs"]["request"]
+
+
 def test_ecad_fw_build_roles_and_briefs():
     g = build_mission_graph(_fc_manifest(), graph_id="mega11-legs")
     by_id = {n["id"]: n for n in g["nodes"]}
@@ -265,7 +370,7 @@ def test_ecad_fw_build_roles_and_briefs():
     assert b3["inputs"]["task_class"] == "analysis"
     req3 = b3["inputs"]["request"]
     assert "ecad_new_schematic" in req3
-    assert "board_from_schematic" in req3
+    assert "pcb_engineer" in req3
     assert b3["inputs"].get("domain_tags") == ["ecad", "analysis"]
 
     b4 = by_id["n_build_DL4"]
@@ -307,6 +412,12 @@ def test_producing_legs_skip_multi_domain_delegate_gate():
         task_class="analysis",
     )
     assert not is_multi_domain_plan_or_build(
+        role_id="pcb_engineer",
+        node_type="design",
+        domain_tags=["ecad", "pcb", "analysis"],
+        task_class="analysis",
+    )
+    assert not is_multi_domain_plan_or_build(
         role_id="firmware_engineer",
         node_type="design",
         domain_tags=["firmware", "analysis"],
@@ -321,6 +432,13 @@ def test_domain_tags_from_producing_roles():
     )
     assert "ecad" in tags
     assert "analysis" in tags
+    tags_pcb = domain_tags_from_context(
+        {"role_id": "pcb_engineer", "task_class": "analysis"},
+        {},
+    )
+    assert "ecad" in tags_pcb
+    assert "pcb" in tags_pcb
+    assert "analysis" in tags_pcb
     tags_fw = domain_tags_from_context(
         {"role_id": "firmware_engineer", "task_class": "analysis"},
         {},
@@ -712,6 +830,30 @@ def test_empty_product_handoff_block_ecad():
     )
     assert msg is not None
     assert "board_from_schematic" in msg
+
+
+def test_empty_product_handoff_block_pcb_lane_is_walkable():
+    """The remedy may only name tools the blocked lane actually holds.
+
+    pcb_engineer holds the board half and NOT ecad_new_schematic. Before the
+    2026-08-27 split there was one combined branch, so a PCB lane was told to
+    "start with ecad_new_schematic" — a tool its card cannot be given, which is
+    the exact unsatisfiable-roadmap failure `_empty_product_handoff_block`'s
+    docstring records.
+    """
+    from services.agent.agent_turn import _empty_product_handoff_block
+    from services.agent.roles import load_role
+
+    grant = set(load_role("pcb_engineer").concrete_tools)
+    assert "ecad_new_schematic" not in grant, grant
+    msg = _empty_product_handoff_block(grant, "BUILD DL3: flight_computer_pcb")
+    assert msg is not None
+    assert "ecad_new_schematic" not in msg, msg
+    named = {w.strip(".,()→") for w in msg.replace("→", " ").split()}
+    for tool in named & {
+        "ledger_get", "board_from_schematic", "ecad_autoroute", "ecad_run_drc",
+    }:
+        assert tool in grant, (tool, sorted(grant))
 
 
 def test_ecad_zero_tool_done_not_accepted(tmp_path, monkeypatch):

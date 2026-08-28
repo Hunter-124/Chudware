@@ -1,14 +1,19 @@
 ECAD — schematic capture, SPICE, PCB layout, controlled impedance, 3D/physics handoff
 
-WORKFLOW (schematic -> board -> fab):
+ROLE HANDOFF:
+  ecad_engineer owns schematic capture, ERC/SPICE, netlist, BOM, and vector plot.
+  It ledger_note's the verified sch_doc_id + artifacts for pcb_engineer. PCB layout,
+  zones, DRC, Gerbers, and board antenna analysis belong to pcb_engineer.
+
+WORKFLOW (schematic -> explicit handoff -> board -> fab):
   ecad_new_schematic('amp')          start a schematic (ecad_status() = THE context tool)
   ecad_find_part('opamp')            ranked real libids -> ecad_place_symbol(libid, x, y)
   ecad_wire('U1','1','R1','2')       pin-to-pin; ecad_add_power('GND')/ecad_label(...)
-  ecad_run_erc() / ecad_simulate()   check + SPICE (op/dc/tran/ac, four/mc/temp/noise)
-  ecad_make_board('board1')          ONE SHOT: sync -> route -> fill -> DRC; sets current board
-  ecad_autoroute() / ecad_run_drc()  route + rule check (widths/clearances from NET CLASSES)
+  ecad_run_erc(); enable_tools(categories=['ecad']); ecad_simulate()  ERC + SPICE
+  board_from_schematic(sch_doc_id)   pcb_engineer consumes the verified handoff
+  ecad_autoroute() / ecad_fill_zones() / ecad_run_drc()  route, pour, rule check
   ecad_export('gerber') / ecad_to_3d()   fab outputs / STEP + boardphys sidecar (below)
-  BIAS: fix ERC errors before layout; fix DRC errors before export.
+  BIAS: fix ERC errors before handoff; fix DRC errors before export.
 
 SIMULATION BACKENDS (ecad_simulate / ecad_tf, param backend=):
   'mna' (DEFAULT)  validated internal Python MNA solver — deterministic, always

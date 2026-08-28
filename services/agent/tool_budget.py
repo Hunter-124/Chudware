@@ -61,7 +61,7 @@ BUILD_ROLES: frozenset[str] = frozenset({
     "assembly_fit_engineer", "layout_engineer",
     "model3d", "sketch2d", "re_modeler", "fixer",
     "cam_programmer", "sim_engineer", "drawing_detailer", "ecad_engineer",
-    "firmware_engineer", "spec_writer",
+    "pcb_engineer", "firmware_engineer", "spec_writer",
 })
 
 BUILD_PHASES: frozenset[str] = frozenset({
@@ -71,11 +71,12 @@ BUILD_PHASES: frozenset[str] = frozenset({
 
 # Role-specific SOFT convergence thresholds, counted from the mandatory calls in
 # each role card (optional retries excluded):
-#   ecad_engineer   describe_board + status, then symbols/place/edit per part,
-#                   wire/label per net, status + render + lint, and the card's
-#                   own finish artifacts netlist + bom + plot              = 35
-#                   (this card holds no board/DRC tool — it is capped at the
-#                   hard 14-tool limit and finishes at the schematic stage)
+#   ecad_engineer   ledger/status, symbols/place per part, wire/label per net,
+#                   ERC + lint + optional SPICE, then netlist + BOM + plot
+#                   and the pcb_engineer handoff                              = 35
+#   pcb_engineer    ledger/handoff read + board conversion, status/readback,
+#                   sync/route/fill, DRC/fix/re-run, optional antenna analysis,
+#                   Gerber + schematic package artifacts + ledger handoff      = 28
 #   model3d         delegate + render + preflight + add + post-check for each of
 #                   four features, then new_part + material + battery + overlap = 24
 #   feature_modeler mandatory build/verification chain                         = 18
@@ -98,6 +99,7 @@ BUILD_PHASES: frozenset[str] = frozenset({
 # remains owned by agent_turn.
 ROLE_MIN_CALLS: dict[str, int] = {
     "ecad_engineer": 35,
+    "pcb_engineer": 28,
     "model3d": 24,
     "reviewer": 24,
     "drawing_detailer": 24,

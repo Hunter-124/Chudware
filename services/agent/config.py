@@ -658,6 +658,7 @@ YAML_ROLE_TO_HARNESS: dict[str, str] = {
     "cam_programmer": "cam",
     "sim_engineer": "sim",
     "ecad_engineer": "ecad",
+    "pcb_engineer": "ecad",
     "firmware_engineer": "ecad",
     "drawing_detailer": "drawing",
     "re_modeler": "reveng",

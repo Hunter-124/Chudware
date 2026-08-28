@@ -455,9 +455,10 @@ def _task_class_for(
 def _resolve_build_role(d: dict[str, Any]) -> str:
     """Pick the BUILD worker role for a deliverable.
 
-    mega-11: analysis kinds named for ECAD/board/schematic/antenna →
-    ``ecad_engineer``; firmware/sensor_loop → ``firmware_engineer``; else
-    kind table (sim_engineer for generic analysis).
+    mega-11: schematic/SPICE analysis → ``ecad_engineer``; PCB/board/antenna
+    analysis → ``pcb_engineer``. A mixed schematic+board deliverable starts in
+    ``ecad_engineer`` and uses its explicit handoff/delegate path to pcb_engineer.
+    Firmware/sensor_loop → ``firmware_engineer``; generic analysis → sim_engineer.
     Reveng keyword scan (any kind) → ``re_modeler`` before the analysis-only gate.
     """
     kind = d.get("kind") or ""
@@ -478,9 +479,18 @@ def _resolve_build_role(d: dict[str, Any]) -> str:
     )
     if any(k in blob for k in fw_keys):
         return "firmware_engineer"
+    schematic_keys = (
+        "schematic", "spice", "erc", "netlist",
+    )
+    if any(k in blob for k in schematic_keys):
+        return "ecad_engineer"
+    pcb_keys = (
+        "pcb", "board", "antenna", "rf", "drc", "gerber", "autoroute",
+    )
+    if any(k in blob for k in pcb_keys):
+        return "pcb_engineer"
     ecad_keys = (
-        "ecad", "schematic", "pcb", "board", "antenna", "rf", "spice",
-        "flight_computer", "flight-computer", "avionics board",
+        "ecad", "flight_computer", "flight-computer", "avionics",
     )
     if any(k in blob for k in ecad_keys):
         return "ecad_engineer"
@@ -498,18 +508,35 @@ def _build_job_for(d: dict[str, Any], role: str) -> str:
     """Concrete BUILD job text naming deliverable + entry tools (mega-11 legs)."""
     if role == "ecad_engineer":
         return (
-            "PRODUCE this deliverable's ECAD artifacts with the engine tools — "
-            "not prose. Entry path (forced order): ecad_new_schematic → "
-            "ecad_find_part + ecad_place_symbol → ecad_wire + ecad_add_power "
-            "(nets REQUIRED before SPICE; place-only yields empty netlist) → "
-            "ecad_run_erc → ecad_simulate OP on 3V3 (measure V(3V3)) → "
-            "board_from_schematic → ecad_run_drc. After place/wire the next "
-            "tools MUST be board_from_schematic then ecad_run_drc — schematic+place "
-            "alone is NOT done. Antenna/RF when required: ecad_antenna_design + "
-            "ecad_antenna_analyze (honest SKIP with provision note if backend "
-            "absent). ledger_note every artifact (sch/board doc_id). Do not "
-            "declare done without schematic + board tool evidence (or a blocked "
-            "handoff naming the tool failure)."
+            "PRODUCE this deliverable's schematic artifacts with the engine "
+            "tools — not prose. Entry path (forced order): ledger_get → "
+            "ecad_new_schematic → ecad_symbols + ecad_place_symbol → ecad_wire "
+            "+ ecad_add_power (nets REQUIRED; place-only yields an empty "
+            "netlist) → ecad_run_erc + ecad_lint_schematic → "
+            "enable_tools(categories=['ecad']) + ecad_simulate when SPICE is "
+            "required → ecad_netlist + ecad_bom + ecad_plot. "
+            "ledger_note the sch_doc_id, checks, and artifact refs. The physical "
+            "board stage belongs to pcb_engineer: hand off that exact schematic "
+            "package, and when this deliverable also requests a board, delegate "
+            "pcb_engineer rather than claiming board/DRC work. Do not declare "
+            "done without schematic tool evidence (or a blocked handoff naming "
+            "the tool failure)."
+        )
+    if role == "pcb_engineer":
+        return (
+            "PRODUCE this deliverable's physical PCB and fabrication artifacts "
+            "with the engine tools — not prose. Entry path: ledger_get the "
+            "ecad_engineer schematic handoff; if no usable sch_doc_id exists, "
+            "delegate that scoped capture stage to ecad_engineer → "
+            "board_from_schematic → describe_board + ecad_status → "
+            "ecad_update_from_sch when the source changed → ecad_autoroute → "
+            "ecad_fill_zones → ecad_run_drc until errors==0 → "
+            "ecad_export(fmt='gerber'). Preserve ecad_plot/ecad_bom artifacts. "
+            "When antenna/RF is required, run ecad_antenna_design + "
+            "ecad_antenna_analyze and report an honest backend SKIP/failure. "
+            "ledger_note source sch_doc_id, pcb_doc_id, final DRC, and artifact "
+            "refs. Do not declare done without a DRC-clean board and confirmed "
+            "artifact tool results (or a blocked handoff naming the failure)."
         )
     if role == "firmware_engineer":
         return (
@@ -814,6 +841,8 @@ def build_mission_graph(
         domain_tags: list[str] = []
         if role == "ecad_engineer":
             domain_tags = ["ecad", "analysis"]
+        elif role == "pcb_engineer":
+            domain_tags = ["ecad", "pcb", "analysis"]
         elif role == "firmware_engineer":
             domain_tags = ["firmware", "analysis"]
         elif role == "sim_engineer":

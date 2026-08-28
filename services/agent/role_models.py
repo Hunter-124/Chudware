@@ -70,6 +70,7 @@ ROLE_MODEL_KEY_ALIASES: dict[str, str] = {
     "cam_programmer": "cam",
     "sim_engineer": "sim",
     "ecad_engineer": "ecad",
+    "pcb_engineer": "ecad",
     "layout_engineer": "ecad",
     "firmware_engineer": "ecad",
     "drawing_detailer": "drawing",
@@ -1626,8 +1627,12 @@ def domain_tags_from_context(
         _add("fit")
     if role in ("sim_engineer",):
         _add("analysis")
-    if role in ("ecad_engineer",):
+    if role == "ecad_engineer":
         _add("ecad")
+        _add("analysis")
+    if role == "pcb_engineer":
+        _add("ecad")
+        _add("pcb")
         _add("analysis")
     if role in ("firmware_engineer",):
         _add("firmware")
@@ -1688,7 +1693,7 @@ def is_multi_domain_plan_or_build(
     if role in (
         "spec_writer", "reviewer", "intake_analyst", "clarifier",
         "overseer",  # join/audit — not a multi-domain coordinator
-        "ecad_engineer", "firmware_engineer",
+        "ecad_engineer", "pcb_engineer", "firmware_engineer",
     ):
         return False
     # Leaf report/verify classes never hit this gate.

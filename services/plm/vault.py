@@ -20,6 +20,7 @@ from __future__ import annotations
 import getpass
 import os
 import time
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
@@ -88,6 +89,62 @@ def _vault_cache_key(project_dir: str | os.PathLike) -> str:
 def _invalidate_dirty_cache(project_dir: str | os.PathLike) -> None:
     """Drop cached dirty verdicts for *project_dir* (any in-process mutation)."""
     _dirty_scan_cache.pop(_vault_cache_key(project_dir), None)
+
+
+# ---------------------------------------------------------------------------
+# Container explode cache (process-wide)
+# ---------------------------------------------------------------------------
+# Every whole-tree commit re-explodes EVERY tracked container, even though a
+# save typically touches one of them: an N-container project paid N ZIP reads +
+# N canonical JSON re-serializations per save. Keyed by container path and
+# validated against an on-disk stamp, so an untouched container is exploded
+# once per process and then reused verbatim (the exploded blobs are what the
+# commit stores, so reuse is byte-identical by construction).
+#
+# The stamp is stat-only and includes ctime_ns and the inode alongside
+# mtime_ns/size, so an in-place rewrite that preserves mtime (or a restore that
+# copies timestamps) still misses. It is captured BEFORE the read: a write that
+# races the read stores fresh content under a stale stamp, which only costs the
+# next save a re-explode — never a stale commit.
+_EXPLODE_CACHE_MAX_BYTES = 64 * 1024 * 1024
+# "<resolved root>\0<rel>" -> {"stamp": tuple, "exploded": ExplodedItem,
+#                              "doc": dict, "bytes": int}
+_explode_cache: dict[str, dict[str, Any]] = {}
+_explode_cache_bytes = 0
+
+
+def _container_stamp(path: Path) -> tuple[int, int, int, int] | None:
+    """Stat fingerprint of a container file, or None when it cannot be stat'ed."""
+    try:
+        st = path.stat()
+    except OSError:
+        return None
+    return (int(st.st_mtime_ns), int(st.st_ctime_ns), int(st.st_size), int(st.st_ino))
+
+
+def _explode_cache_put(key: str, stamp: tuple[int, int, int, int],
+                       exploded: snapshot.ExplodedItem, doc: dict[str, Any]) -> None:
+    global _explode_cache_bytes
+    _explode_cache_drop(key)
+    size = len(exploded.document_json) + len(exploded.thumbnail_png or b"")
+    size += sum(len(v) for v in exploded.extras.values())
+    if size > _EXPLODE_CACHE_MAX_BYTES:
+        return  # a single container larger than the whole budget is not cached
+    _explode_cache[key] = {"stamp": stamp, "exploded": exploded,
+                           "doc": doc, "bytes": size}
+    _explode_cache_bytes += size
+    while _explode_cache_bytes > _EXPLODE_CACHE_MAX_BYTES:
+        oldest = next(iter(_explode_cache))  # insertion-ordered
+        if oldest == key:
+            break
+        _explode_cache_drop(oldest)
+
+
+def _explode_cache_drop(key: str) -> None:
+    global _explode_cache_bytes
+    old = _explode_cache.pop(key, None)
+    if old is not None:
+        _explode_cache_bytes -= int(old["bytes"])
 
 
 def _tree_working_stamp(root: Path) -> tuple[tuple[str, int, int], ...]:
@@ -248,44 +305,58 @@ class Vault:
         diffed at all. The oldest surviving entry is therefore the item's
         creation, and every adjacent pair is a valid compare pair.
         """
-        commits = self._bind.log()
-        if scope != "all":
-            commits = [c for c in commits
-                       if hist.scope_from_commit_message(
-                           self._bind.commit_meta(c)["message"]) == scope]
+        # The chain is walked lazily so a limited history stops decoding
+        # commits as soon as it has its N entries: the scope filter runs on the
+        # metadata that the walk already decoded (no second read per commit),
+        # and the older tail of the chain is never touched at all.
+        def scoped_chain() -> Iterator[tuple[str, dict[str, Any]]]:
+            for commit, cmeta in self._bind.iter_log():
+                if (scope != "all"
+                        and hist.scope_from_commit_message(cmeta["message"]) != scope):
+                    continue
+                yield commit, cmeta
+
         if item_id is None:
             entries: list[dict[str, Any]] = []
-            for commit in commits:
-                entries.append(self._entry_view_light(commit))
+            for commit, cmeta in scoped_chain():
+                entries.append(self._entry_view_light(commit, meta=cmeta))
                 if limit is not None and len(entries) >= limit:
                     break
             return entries
 
         # per-item pass over the scope-filtered chain. Each commit's tree is read
-        # at most once even though index i is inspected as both "this commit" and
-        # (on the next step) "the parent".
-        trees: dict[int, dict[str, bytes]] = {}
+        # at most once even though a commit is inspected as both "this commit"
+        # and (on the next step) "the parent", and each tree is dropped as soon
+        # as the walk moves past it.
+        trees: dict[str, dict[str, bytes]] = {}
 
-        def tree_at(i: int) -> dict[str, bytes]:
-            t = trees.get(i)
+        def tree_at(commit: str) -> dict[str, bytes]:
+            t = trees.get(commit)
             if t is None:
-                t = self._bind.read_tree(commits[i])
-                trees[i] = t
+                t = self._bind.read_tree(commit)
+                trees[commit] = t
             return t
 
+        def signature_at(commit: str) -> object | None:
+            return self._item_content_signature(tree_at(commit), item_id)
+
         entries = []
-        for i, commit in enumerate(commits):
-            cur = self._item_content_signature(tree_at(i), item_id)
-            if cur is None:
-                continue  # the item does not exist yet at this point
-            if i + 1 < len(commits):
-                parent = self._item_content_signature(tree_at(i + 1), item_id)
-                if parent is not None and parent == cur:
-                    continue  # unchanged by this commit
-            entries.append(self._entry_view(commit, tree_at(i), item_id))
-            trees.pop(i - 1, None)  # the older-side tree is never needed again
-            if limit is not None and len(entries) >= limit:
-                break
+        chain = scoped_chain()
+        cur = next(chain, None)
+        cur_sig = signature_at(cur[0]) if cur is not None else None
+        while cur is not None:
+            commit, cmeta = cur
+            parent = next(chain, None)
+            parent_sig = signature_at(parent[0]) if parent is not None else None
+            emit = cur_sig is not None and not (
+                parent is not None and parent_sig is not None and parent_sig == cur_sig)
+            if emit:
+                entries.append(
+                    self._entry_view(commit, tree_at(commit), item_id, meta=cmeta))
+                if limit is not None and len(entries) >= limit:
+                    break
+            cur, cur_sig = parent, parent_sig
+            trees.pop(commit, None)  # the newer-side tree is never needed again
         return entries
 
     def _item_content_signature(self, tree: dict[str, bytes],
@@ -985,7 +1056,7 @@ class Vault:
         nodes: list[dict[str, Any]] = []
         for commit in commits:
             cmeta = self._bind.commit_meta(commit)
-            entry = self._entry_view_light(commit)
+            entry = self._entry_view_light(commit, meta=cmeta)
             parents = cmeta["parents"]
             pin = hist.pin_from_commit_message(cmeta["message"])
             if not pin and entry["kind"] == hist.KIND_RELEASE:
@@ -1036,16 +1107,27 @@ class Vault:
         self._bind.commit_tree(files, emeta)
 
     def _project_containers(self) -> list[Path]:
+        """Every versioned container file under the project root, path-sorted.
+
+        Dot-prefixed directories (``.aicadvault``, ``.git``, ``.plm``, …) are
+        pruned at walk time — the same policy as :func:`_tree_working_stamp`.
+        The old ``rglob('*')`` enumerated *and stat'ed* every object in the
+        vault's own store before throwing the results away, on every save.
+        The result set is unchanged: dot-prefixed names, at any depth, never
+        qualified.
+        """
         out: list[Path] = []
-        for p in sorted(self.project_dir.rglob("*")):
-            if not (p.is_file() and any(p.name.endswith(s)
-                                        for s in _CONTAINER_SUFFIXES)):
-                continue
-            # skip anything inside a dot-prefixed dir (.aicadvault/.plm/.git/…)
-            rel = p.relative_to(self.project_dir)
-            if any(part.startswith(".") for part in rel.parts):
-                continue
-            out.append(p)
+        for dirpath, dirnames, filenames in os.walk(self.project_dir):
+            dirnames[:] = [d for d in dirnames if not d.startswith(".")]
+            for fn in filenames:
+                if fn.startswith("."):
+                    continue
+                if not any(fn.endswith(s) for s in _CONTAINER_SUFFIXES):
+                    continue
+                p = Path(dirpath) / fn
+                if p.is_file():  # skip dangling symlinks / non-regular entries
+                    out.append(p)
+        out.sort()
         return out
 
     def _explode_project_into_shadow(
@@ -1095,30 +1177,46 @@ class Vault:
                     and any(rel.endswith(s) for s in _CONTAINER_SUFFIXES)):
                 container_paths.setdefault(rel, self.project_dir / rel)
 
+        import json as _json
+        root_key = _vault_cache_key(self.project_dir)
         for rel, path in sorted(container_paths.items()):
             item = manifest.find_item_by_path(m, rel)
-            try:
-                raw = path.read_bytes()
-            except FileNotFoundError:
-                continue  # an actually missing tracked path is an intentional deletion
-            except OSError as exc:
-                if item is None:
-                    continue  # first discovery of unregistered junk remains best-effort
-                raise VaultError(
-                    "snapshot_failed",
-                    f"could not read tracked item {rel}: {exc}",
-                ) from exc
-            try:
-                exploded = snapshot.explode_container(raw)
-                import json as _json
-                doc = _json.loads(exploded.document_json.decode("utf-8"))
-            except Exception as exc:
-                if item is None:
-                    continue  # first discovery of an invalid container is harmless
-                raise VaultError(
-                    "corrupt_item",
-                    f"tracked item {rel} is unreadable or corrupt",
-                ) from exc
+            # Stat first: an unchanged container is reused from the process
+            # explode cache instead of being re-read and re-exploded. Any
+            # change, a new file, or an unstattable path falls through to the
+            # full read below.
+            cache_key = f"{root_key}\x00{rel}"
+            stamp = _container_stamp(path)
+            cached = _explode_cache.get(cache_key) if stamp is not None else None
+            if cached is not None and cached["stamp"] == stamp:
+                exploded = cached["exploded"]
+                doc = cached["doc"]
+            else:
+                try:
+                    raw = path.read_bytes()
+                except FileNotFoundError:
+                    _explode_cache_drop(cache_key)
+                    continue  # an actually missing tracked path is an intentional deletion
+                except OSError as exc:
+                    if item is None:
+                        continue  # first discovery of unregistered junk remains best-effort
+                    raise VaultError(
+                        "snapshot_failed",
+                        f"could not read tracked item {rel}: {exc}",
+                    ) from exc
+                try:
+                    exploded = snapshot.explode_container(raw)
+                    doc = _json.loads(exploded.document_json.decode("utf-8"))
+                except Exception as exc:
+                    _explode_cache_drop(cache_key)
+                    if item is None:
+                        continue  # first discovery of an invalid container is harmless
+                    raise VaultError(
+                        "corrupt_item",
+                        f"tracked item {rel} is unreadable or corrupt",
+                    ) from exc
+                if stamp is not None:
+                    _explode_cache_put(cache_key, stamp, exploded, doc)
             doc_uuid = doc.get("id", "")
             schema_kind = _kind_from_schema(doc.get("schema", ""))
             if item is None:
@@ -1361,13 +1459,16 @@ class Vault:
     def _item_view(self, it: dict[str, Any]) -> dict[str, Any]:
         return items_mod.item_view(it)
 
-    def _entry_view_light(self, commit: str) -> dict[str, Any]:
+    def _entry_view_light(self, commit: str, *,
+                          meta: dict[str, Any] | None = None) -> dict[str, Any]:
         """Entry view without flattening the whole commit tree.
 
         Used by overview/full-timeline history. Pulls commit meta + one
         representative item's meta/summary via path-direct blob reads.
+        Callers that already decoded the commit pass its *meta* in rather than
+        paying for a second decode of the same object.
         """
-        cmeta = self._bind.commit_meta(commit)
+        cmeta = meta if meta is not None else self._bind.commit_meta(commit)
         kind = hist.kind_from_commit_message(cmeta["message"])
         scope = hist.scope_from_commit_message(cmeta["message"])
         msg = hist.user_message_from_commit(cmeta["message"])
@@ -1435,8 +1536,9 @@ class Vault:
             return None
         return None
 
-    def _entry_view(self, commit: str, tree: dict[str, bytes], item_id: str | None) -> dict[str, Any]:
-        cmeta = self._bind.commit_meta(commit)
+    def _entry_view(self, commit: str, tree: dict[str, bytes], item_id: str | None, *,
+                    meta: dict[str, Any] | None = None) -> dict[str, Any]:
+        cmeta = meta if meta is not None else self._bind.commit_meta(commit)
         kind = hist.kind_from_commit_message(cmeta["message"])
         scope = hist.scope_from_commit_message(cmeta["message"])
         msg = hist.user_message_from_commit(cmeta["message"])

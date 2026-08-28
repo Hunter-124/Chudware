@@ -23,7 +23,8 @@ import zipfile
 
 import pytest
 
-from services.plm import manifest, snapshot
+from services.plm import gitbind, manifest, snapshot
+from services.plm import vault as vault_mod
 from services.plm.client import PLMVaultClient
 from services.plm.vault import Vault, VaultError
 
@@ -599,5 +600,125 @@ def test_nested_container_tracked_and_restored(tmp_path):
         assert (sub / "Part.step+").is_file()
         assert _doc_from_container((sub / "Part.step+").read_bytes())["id"] \
             == "uuid-part-1"
+    finally:
+        v.close()
+
+
+# ---------------------------------------------------------------------------
+# per-save scan cost: pruned container walk, explode reuse, bounded history
+# ---------------------------------------------------------------------------
+
+
+def test_container_scan_does_not_walk_the_vault(tmp_path, monkeypatch):
+    """The per-save rescan still happens, but never descends into dot-dirs."""
+    _write(tmp_path, "Bracket.step+", _part())
+    (tmp_path / "sub").mkdir()
+    _write(tmp_path / "sub", "Nested.step+", _assembly())
+    # decoys the scan must ignore: a container inside a dot-dir and a dot-named one
+    (tmp_path / ".derived").mkdir()
+    _write(tmp_path / ".derived", "Ignored.step+", _part())
+    _write(tmp_path, ".Hidden.step+", _part())
+
+    v = Vault.open(tmp_path)
+    try:
+        walked: list[str] = []
+        real_walk = os.walk
+
+        def counting_walk(top, *a, **kw):
+            for row in real_walk(top, *a, **kw):
+                walked.append(os.path.relpath(row[0], tmp_path))
+                yield row
+
+        monkeypatch.setattr(vault_mod.os, "walk", counting_walk)
+        found = [p.relative_to(tmp_path).as_posix() for p in v._project_containers()]
+        assert found == ["Bracket.step+", "sub/Nested.step+"]
+        assert walked, "the rescan must still run on every call"
+        assert sorted(walked) == [".", "sub"], walked
+    finally:
+        v.close()
+
+
+def test_unchanged_container_is_not_re_exploded(tmp_path, monkeypatch):
+    _write(tmp_path, "Bracket.step+", _part(3.0))
+    _write(tmp_path, "Gearbox.step+", _assembly())
+    vault_mod._explode_cache.clear()
+
+    v = Vault.open(tmp_path)  # seeding explodes both containers
+    try:
+        exploded: list[bytes] = []
+        real_explode = snapshot.explode_container
+
+        def counting_explode(raw):
+            exploded.append(raw)
+            return real_explode(raw)
+
+        monkeypatch.setattr(vault_mod.snapshot, "explode_container", counting_explode)
+
+        # nothing changed on disk -> no container is read or exploded again
+        r_clean = v.save()
+        assert exploded == []
+        seed_tree = v._bind.read_tree(v._bind.log()[1])
+        clean_tree = v._bind.read_tree(r_clean["commit"])
+        content = {p: b for p, b in seed_tree.items()
+                   if not p.endswith(("meta.json", "summary.txt", "manifest.json"))}
+        assert {p: b for p, b in clean_tree.items()
+                if not p.endswith(("meta.json", "summary.txt", "manifest.json"))} == content
+
+        # touch exactly one container -> exactly one explode
+        _write(tmp_path, "Bracket.step+", _part(5.0))
+        r_edit = v.save()
+        assert len(exploded) == 1, exploded
+
+        # and the committed blobs are byte-identical to a fresh explode of disk
+        tree = v._bind.read_tree(r_edit["commit"])
+        for it in v.manifest()["items"]:
+            prefix = snapshot.item_prefix(it["item_id"])
+            fresh = real_explode((tmp_path / it["path"]).read_bytes())
+            assert tree[prefix + "document.json"] == fresh.document_json
+            assert tree.get(prefix + "thumbnail.png") == fresh.thumbnail_png
+        assert _doc_from_container(
+            (tmp_path / "Bracket.step+").read_bytes())["features"][0]["params"]["wall"] == 5.0
+        assert json.loads(tree[snapshot.item_prefix(
+            v.manifest()["items"][0]["item_id"]) + "document.json"]
+        )["features"][0]["params"]["wall"] == 5.0
+    finally:
+        v.close()
+
+
+def test_history_limit_stops_decoding_the_chain(tmp_path, monkeypatch):
+    _write(tmp_path, "Bracket.step+", _part(1.0))
+    v = Vault.open(tmp_path)
+    try:
+        for wall in (2.0, 3.0, 4.0, 5.0, 6.0):
+            _write(tmp_path, "Bracket.step+", _part(wall))
+            v.save()
+        total = len(v._bind.log())
+        assert total >= 6
+
+        full = v.history()
+        decoded: list[str] = []
+        real_meta = gitbind._meta_from_commit
+
+        def counting_meta(commit_hex, c):
+            decoded.append(commit_hex)
+            return real_meta(commit_hex, c)
+
+        monkeypatch.setattr(gitbind, "_meta_from_commit", counting_meta)
+
+        limited = v.history(limit=2)
+        # identical answer, and the older tail of the chain was never decoded
+        assert limited == full[:2]
+        assert len(decoded) == 2, decoded
+
+        # scope='all' is unaffected in content and ordering
+        decoded.clear()
+        assert [e["commit"] for e in v.history(scope="all")] == v._bind.log()
+
+        # the per-item walk is bounded the same way
+        item_id = v.manifest()["items"][0]["item_id"]
+        item_full = v.history(item_id)
+        decoded.clear()
+        assert v.history(item_id, limit=1) == item_full[:1]
+        assert len(decoded) <= 2, decoded
     finally:
         v.close()

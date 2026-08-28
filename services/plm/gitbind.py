@@ -33,6 +33,7 @@ import os
 import shutil
 import subprocess
 import time
+from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -72,6 +73,17 @@ def _tree_cache_put(commit_hex: str, tree: dict[str, bytes]) -> None:
     while len(_tree_cache_order) > _TREE_CACHE_MAX:
         old = _tree_cache_order.pop(0)
         _tree_cache.pop(old, None)
+
+
+def _meta_from_commit(commit_hex: str, c: Commit) -> dict[str, Any]:
+    """Commit-level metadata from an already-decoded commit object."""
+    return {
+        "commit": commit_hex,
+        "authored_at": int(c.author_time),
+        "author_raw": c.author.decode("utf-8", "replace"),
+        "message": c.message.decode("utf-8", "replace"),
+        "parents": [p.decode("ascii") for p in c.parents],
+    }
 
 
 
@@ -208,25 +220,31 @@ class GitBinding:
 
     def commit_meta(self, commit_hex: str) -> dict[str, Any]:
         """Return commit-level metadata (author, timestamp, message, parents)."""
-        c: Commit = self._repo[commit_hex.encode("ascii")]
-        return {
-            "commit": commit_hex,
-            "authored_at": int(c.author_time),
-            "author_raw": c.author.decode("utf-8", "replace"),
-            "message": c.message.decode("utf-8", "replace"),
-            "parents": [p.decode("ascii") for p in c.parents],
-        }
+        return _meta_from_commit(commit_hex, self._repo[commit_hex.encode("ascii")])
+
+    def iter_log(self) -> Iterator[tuple[str, dict[str, Any]]]:
+        """Yield ``(commit_id, meta)`` newest-first along the linear parent chain.
+
+        Lazy on purpose: a caller that stops early (limited or filtered
+        history) never reads — let alone decodes — the older tail of the
+        chain. The parent link and the metadata come out of the same object
+        read, so a full drain costs exactly one decode per commit, the same as
+        :meth:`log`.
+        """
+        head = self.head_commit()
+        while head is not None:
+            meta = _meta_from_commit(head, self._repo[head.encode("ascii")])
+            yield head, meta
+            parents = meta["parents"]
+            head = parents[0] if parents else None
 
     def log(self, limit: int | None = None) -> list[str]:
         """Return commit ids newest-first along the linear parent chain."""
         out: list[str] = []
-        head = self.head_commit()
-        while head is not None:
-            out.append(head)
+        for commit_hex, _meta in self.iter_log():
+            out.append(commit_hex)
             if limit is not None and len(out) >= limit:
                 break
-            parents = self._repo[head.encode("ascii")].parents
-            head = parents[0].decode("ascii") if parents else None
         return out
 
     def log_dag(self, start_shas: list[str], limit: int) -> list[str]:

@@ -150,8 +150,11 @@ std::string iso_utc_now() {
 //   - nlohmann::json uses std::map → keys are already sorted alphabetically.
 //   - The resulting string is deterministic for the same document tree.
 //
-// Recursively round every JSON float to `decimals` decimal places.
-json round_floats(const json& v, int decimals = 6) {
+// Recursively round every JSON float to `decimals` decimal places. When
+// `skip_root_key` is set, omit that key from this object only; recursive calls
+// deliberately do not forward it, so identically named nested keys survive.
+json round_floats(const json& v, int decimals = 6,
+                  const char* skip_root_key = nullptr) {
     const double factor = std::pow(10.0, decimals);
     if (v.is_number_float()) {
         double d = v.get<double>();
@@ -164,7 +167,10 @@ json round_floats(const json& v, int decimals = 6) {
     }
     if (v.is_object()) {
         json out = json::object();
-        for (auto& [k, val] : v.items()) out[k] = round_floats(val, decimals);
+        for (auto& [k, val] : v.items()) {
+            if (skip_root_key != nullptr && k == skip_root_key) continue;
+            out[k] = round_floats(val, decimals);
+        }
         return out;
     }
     return v;  // bool, int, null, string — unchanged
@@ -173,8 +179,9 @@ json round_floats(const json& v, int decimals = 6) {
 // Return the canonical document.json serialization:
 //   round_floats(doc, 6) then dump(2).  Keys are sorted because nlohmann::json
 //   (std::map) always iterates in lexicographic order.
-std::string canonical_doc_json(const json& doc) {
-    return round_floats(doc).dump(2);
+std::string canonical_doc_json(const json& doc,
+                               const char* skip_root_key = nullptr) {
+    return round_floats(doc, 6, skip_root_key).dump(2);
 }
 
 }  // namespace
@@ -415,14 +422,10 @@ std::string fnv1a_hex(const std::string& s) {
 std::string stepplus_doc_hash(const json& doc) {
     // Hash the SAME canonical form stepplus_save writes, so an unchanged saved tree hashes
     // identically on reopen (a hand-edit of document.json changes it -> cache rejected). Strip
-    // the volatile top-level "id" first: doc_open re-stamps it to the new session id BEFORE the
-    // hash check, and it never affects geometry — leaving it in would miss every cache.
-    if (doc.is_object() && doc.contains("id")) {
-        json d = doc;
-        d.erase("id");
-        return fnv1a_hex(canonical_doc_json(d));
-    }
-    return fnv1a_hex(canonical_doc_json(doc));
+    // the volatile top-level "id": doc_open re-stamps it to the new session id BEFORE the hash
+    // check, and it never affects geometry — leaving it in would miss every cache. Nested "id"
+    // keys remain part of the hash.
+    return fnv1a_hex(canonical_doc_json(doc, "id"));
 }
 
 std::string brep_cache_encode(const std::vector<TopoDS_Shape>& bodies) {

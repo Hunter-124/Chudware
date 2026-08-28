@@ -4030,12 +4030,16 @@ void trim_history(const std::string& doc_id, std::vector<std::string>& stack) {
     }
 }
 
-void push_undo(Session& s) {
-    s.undo_stack.push_back(s.doc.dump());
+void push_undo_document(Session& s, const json& pre_edit_doc) {
+    s.undo_stack.push_back(pre_edit_doc.dump());
     trim_history(s.doc_id, s.undo_stack);
     // Clearing redo drops any journal files those entries pointed at.
     for (const std::string& e : s.redo_stack) drop_history_entry(e);
     s.redo_stack.clear();
+}
+
+void push_undo(Session& s) {
+    push_undo_document(s, s.doc);
 }
 
 std::string config_active_name(const json& doc);  // defined below (configurations section)
@@ -4407,55 +4411,32 @@ json apply_ops_locked(Session& s, long base_revision, const json& ops, bool coal
         return ops_response(s, r, id_map, /*with_tess=*/true);
     }
 
-    // Bugs C2/C3/C4 — failed-batch undo corruption. Below we optimistically commit the
-    // edit (push the undo snapshot, swap in `working`, bump the revision) BEFORE compiling.
-    // If the batch then fails to compile (a feature errored — fillet that can't apply, a
-    // boolean that produced nothing, etc., so r.ok==false), we MUST NOT leave that wreckage
-    // behind: a ghost revision on the undo stack + an errored feature in the live tree make
-    // later undo/redo step through phantom states and block a subsequent edit_feature.
-    // So we snapshot the EXACT pre-batch session state (doc, revision, both stacks, dirty)
-    // and, on a rejected compile, restore all of it verbatim — no ghost revision, no errored
-    // feature persisted, stacks untouched. We then RETURN the normal ops-response (with the
-    // per-feature failure surfaced in r.statuses), NOT throw: doc_apply_ops's contract is an
-    // in-band {ok:false} rejection at rc 0 (the original pre-C2/C3/C4 return path), so the
-    // Python add_features wrapper sees the failing feature_status, reverts, and reports
-    // rolled_back:true. The SUCCESSFUL path is byte-for-byte identical to before (push undo
-    // => clears redo, swap doc, bump revision, return the compiled response).
-    const json pre_doc = s.doc;  // deep copy of the live tree (cheap vs. a corrupted doc)
-    const long pre_revision = s.revision;
-    const std::vector<std::string> pre_undo = s.undo_stack;
-    const std::vector<std::string> pre_redo = s.redo_stack;
-    const bool pre_dirty = s.dirty;
-    auto restore_pre_batch = [&]() {
-        s.doc = pre_doc;
-        s.revision = pre_revision;
-        s.undo_stack = pre_undo;
-        s.redo_stack = pre_redo;
-        s.dirty = pre_dirty;
-    };
+    // Compile against the candidate as the live document, but keep sole ownership of
+    // the pre-edit tree for rollback and the eventual undo entry. History remains
+    // untouched until the candidate compiles successfully, so a rejection needs no
+    // speculative undo/redo vector copies or journal cleanup.
+    json rollback_doc = std::move(s.doc);
+    const long rollback_revision = s.revision;
+    const bool rollback_dirty = s.dirty;
 
-    if (!coalesce) push_undo(s);  // NOTE: push_undo clears the redo stack
     s.doc = std::move(working);
     s.revision += 1;
     s.dirty = true;
     if (s.is_assembly()) {
         rebuild_assembly(s);
+        if (!coalesce) push_undo_document(s, rollback_doc);
         return ops_response_assembly(s, id_map);
     }
     CompileResult r = compile_session(s);
     if (!r.ok) {
-        // Rejected batch: restore the document AND the undo/redo stacks to exactly their
-        // pre-batch state — no ghost revision, no errored feature persisted, stacks untouched
-        // (the load-bearing C2/C3/C4 correctness fix). We do NOT throw: doc_apply_ops returns
-        // an in-band rejection at rc 0 (the original contract), so the caller reads the
-        // per-feature failure out of feature_status. `r` was compiled against the failing
-        // `working` tree, so r.statuses carries the offending feature (ok:false + error);
-        // ops_response surfaces it while reporting the restored (pre-batch) revision/tree —
-        // nothing from the batch was kept. The Python add_features wrapper then sees ok==false
-        // (some feature_status.ok is false), reverts its checkpoint, and reports rolled_back:true.
-        restore_pre_batch();
+        // `r` retains the rejected tree's feature failures for the in-band response;
+        // restore the live document by move and leave both history stacks untouched.
+        s.doc = std::move(rollback_doc);
+        s.revision = rollback_revision;
+        s.dirty = rollback_dirty;
         return ops_response(s, r, id_map, /*with_tess=*/true);
     }
+    if (!coalesce) push_undo_document(s, rollback_doc);
     return warm_and_respond(s, std::move(r), id_map, /*with_tess=*/true);
 }
 

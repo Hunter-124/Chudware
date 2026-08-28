@@ -12,25 +12,18 @@ Every tool returns the flat envelope: ``{ok:true, …}`` / ``{ok:false, reason, 
 """
 from __future__ import annotations
 
-import json
 from pathlib import Path
 from typing import Any, Optional
 
 from mcp.server.fastmcp import FastMCP
+
+from services.mcp._envelopes import compact_err as _err, stringly_dumps as _dumps
 
 # token guard — cap the node/edge payload so a huge project can't blow the context.
 _MAX_NODES = 400
 _MAX_EDGES = 400
 # token guard for the change-diff lists (nodes/edges added/removed).
 _MAX_DIFF = 200
-
-
-def _err(reason: str, hint: str = "") -> str:
-    return json.dumps({"ok": False, "reason": reason, "hint": hint})
-
-
-def _dumps(obj: Any) -> str:
-    return json.dumps(obj, indent=2, sort_keys=False, default=str)
 
 
 def register_graph_tools(mcp: FastMCP) -> None:

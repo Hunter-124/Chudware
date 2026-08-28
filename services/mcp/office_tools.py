@@ -31,22 +31,14 @@ VBA project as an opaque blob (macro *code* is never read or edited, only cell/s
 from __future__ import annotations
 
 import csv
-import json
 import shutil
 import subprocess
 import tempfile
 from pathlib import Path
 from typing import Any
 
+from ._envelopes import compact_err as _err, sorted_ok as _ok
 from .cad_common import coerce_json_or_repr, require_list, require_mapping
-
-
-def _err(reason: str, hint: str = "") -> str:
-    return json.dumps({"ok": False, "reason": reason, "hint": hint})
-
-
-def _ok(**fields: Any) -> str:
-    return json.dumps({"ok": True, **fields}, indent=2, sort_keys=True)
 
 
 def _to_envelope(result: dict) -> str:

@@ -38,21 +38,10 @@ from typing import Any, Optional, Union
 
 from . import core_bridge as cb
 from services.mcp import simhandoff as sh
+from services.mcp._envelopes import plain_dumps as _dumps, reason_err as _err
 
 # Session bookkeeping: the last active circuit document
 _HYD: dict = {"doc": None}
-
-
-def _dumps(payload: dict) -> str:
-    return json.dumps(payload, indent=2)
-
-
-def _err(reason: str, hint: Optional[str] = None, **extra: Any) -> dict:
-    out: dict[str, Any] = {"ok": False, "reason": reason}
-    if hint:
-        out["hint"] = hint
-    out.update(extra)
-    return out
 
 
 # ------------------------------------------------------- component-type dialect (live fix)

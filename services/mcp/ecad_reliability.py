@@ -46,13 +46,13 @@ reserved ``simhandoff`` key (coupling ``ecad_to_structural_fea``: one
 
 from __future__ import annotations
 
-import json
 import math
-from typing import Any, Optional, Union
+from typing import Optional, Union
 
 from services.mcp import simhandoff as sh
 from services.mcp.cad_common import coerce_json_or_repr, require_list
 from services.mcp.ecad_thermal import _faceset  # shared faceset shape (tol/normal)
+from services.mcp._envelopes import plain_dumps as _dumps, report_err as _err
 
 # --------------------------------------------------------------------------- constants
 
@@ -104,18 +104,6 @@ _NPTH_MIN_DRILL_MM = 1.5      # NPTH pads at/above this are treated as mounting 
 _UNNETTED_THT_MIN_DRILL_MM = 2.0  # unconnected plated holes this large = mounts
 
 _VIBE: dict = {"last": None}   # session state (parity with ecad_thermal)
-
-
-def _dumps(payload: dict) -> str:
-    return json.dumps(payload, indent=2)
-
-
-def _err(reason: str, hint: str = "", next_actions: Optional[list] = None,
-         **extra: Any) -> str:
-    out: dict = {"ok": False, "error": reason, "warnings": [],
-                 "hint": hint or reason, "next_actions": next_actions or []}
-    out.update(extra)
-    return _dumps(out)
 
 
 # --------------------------------------------------------------------------- pure helpers

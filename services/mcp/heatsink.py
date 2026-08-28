@@ -35,11 +35,11 @@ such in warnings.
 
 from __future__ import annotations
 
-import json
 import math
-from typing import Any, Optional
+from typing import Optional
 
 from services.mcp import simhandoff as sh
+from services.mcp._envelopes import plain_dumps as _dumps, report_err as _err
 # Import the same canonical module object the server registers so thermal state is shared.
 from services.mcp import ecad_thermal as et
 
@@ -59,18 +59,6 @@ _PARAM_MIN_BASE_MM = 12.0
 _PARAM_MAX_BASE_MM = 100.0
 
 _HEATSINK: dict = {"winner_study": None}   # kept winner study (session state)
-
-
-def _dumps(payload: dict) -> str:
-    return json.dumps(payload, indent=2)
-
-
-def _err(reason: str, hint: str = "", next_actions: Optional[list] = None,
-         **extra: Any) -> str:
-    out: dict = {"ok": False, "error": reason, "warnings": [],
-                 "hint": hint or reason, "next_actions": next_actions or []}
-    out.update(extra)
-    return _dumps(out)
 
 
 # --------------------------------------------------------------------------- pure helpers

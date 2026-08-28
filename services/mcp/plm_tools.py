@@ -33,15 +33,8 @@ from typing import Any
 
 from mcp.server.fastmcp import FastMCP
 
+from ._envelopes import compact_err as _err, sorted_ok as _ok
 from .cad_common import require_mapping
-
-
-def _err(reason: str, hint: str = "") -> str:
-    return json.dumps({"ok": False, "reason": reason, "hint": hint})
-
-
-def _ok(**fields: Any) -> str:
-    return json.dumps({"ok": True, **fields}, indent=2, sort_keys=True)
 
 # A live general-lane replay ended with bare plm_checkpoint(), after earlier bare
 # plm_open() and file-as-path plm_item_add() calls. ``path`` means the project root

@@ -15,50 +15,11 @@ import json
 import math
 from typing import Any, Optional
 
+from services.mcp._envelopes import analysis_envelope
 from services.sim.em import analytic
 from services.sim.em.worker_rpc import WORKER_METHODS
 
-
-def _dumps(payload: dict) -> str:
-    return json.dumps(payload, indent=2, default=_json_default)
-
-
-def _json_default(obj: Any):
-    # numpy scalars / arrays may leak through worker payloads; keep JSON clean.
-    try:
-        import numpy as np
-        if isinstance(obj, np.generic):
-            return obj.item()
-        if isinstance(obj, np.ndarray):
-            return obj.tolist()
-    except Exception:  # noqa: BLE001
-        pass
-    return str(obj)
-
-
-def _err(reason: str, *, hint: str = "", next_actions: Optional[list] = None,
-         **extra: Any) -> str:
-    out: dict[str, Any] = {
-        "ok": False,
-        "error": reason,
-        "warnings": [],
-        "hint": hint or reason,
-        "next_actions": next_actions or [],
-    }
-    out.update(extra)
-    return _dumps(out)
-
-
-def _ok(payload: dict, *, hint: str = "", next_actions: Optional[list] = None,
-        warnings: Optional[list] = None) -> str:
-    out = {
-        "ok": True,
-        "warnings": list(warnings or []),
-        "hint": hint,
-        "next_actions": list(next_actions or []),
-        **payload,
-    }
-    return _dumps(out)
+_dumps, _err, _ok = analysis_envelope()
 
 
 def _call_worker(method: str, params: dict) -> dict:

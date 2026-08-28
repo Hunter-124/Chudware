@@ -47,6 +47,34 @@ class BridgeUnavailable(RuntimeError):
         self.status = status
 
 
+class ProviderRefused(BridgeUnavailable):
+    """The provider serviced the call and DECLINED to answer it.
+
+    Not a bridge failure and not an outage — the sidecar, the credential and
+    the endpoint were all fine; the vendor's own content classifier refused
+    this particular prompt (Anthropic ``stop_reason=refusal``, OpenAI
+    ``content_policy_violation``, Gemini ``PROHIBITED_CONTENT``, …). It
+    subclasses :class:`BridgeUnavailable` so the existing
+    catch-and-fall-back call sites (``project_memory``, ``compaction``) keep
+    working unchanged, but ``agent_turn`` tells the two apart: retrying the
+    identical prompt on the SAME vendor buys nothing, while a DIFFERENT
+    vendor routinely answers it. That distinction is the whole point — a
+    legitimate engineering request (pharmaceutical tooling, ballistics
+    fixtures, energetic-materials handling gear) refused by one vendor used
+    to kill the run with an opaque "BridgeUnavailable", stranding a project
+    with four other providers configured and credentialed.
+
+    ``category`` is the vendor's own label when it supplied one (Anthropic
+    ``stop_details.category``, e.g. ``"bio"``); empty when it did not.
+    """
+
+    def __init__(self, message: str, *, status: int | None = None,
+                 provider: str = "", category: str = "") -> None:
+        super().__init__(message, status=status)
+        self.provider = provider
+        self.category = category
+
+
 class _ChildDead(Exception):
     """Internal signal: the bridge process died (write failed / stdout EOF).
 
@@ -267,10 +295,21 @@ class OmpBridgeClient:
 
             error = msg.get("error")
             if isinstance(error, dict):
-                raise BridgeUnavailable(
-                    str(error.get("message") or "OMP bridge RPC error"),
-                    status=error.get("status") if isinstance(error.get("status"), int) else None,
-                )
+                message = str(error.get("message") or "OMP bridge RPC error")
+                status = (error.get("status")
+                          if isinstance(error.get("status"), int) else None)
+                # bridge.ts forwards ProviderResponseError.kind. Gemini and the OpenAI
+                # Responses path report a safety-filter block by THROWING, so this is
+                # the only place their refusals are distinguishable from an outage —
+                # and the distinction decides whether agent_turn retries this vendor
+                # or hands the same prompt to a different one.
+                if str(error.get("kind") or "") == "content-blocked":
+                    raise ProviderRefused(
+                        f"the provider declined this request: {message}",
+                        status=status,
+                        provider=str(params.get("provider") or ""),
+                    )
+                raise BridgeUnavailable(message, status=status)
             raise BridgeUnavailable(str(error) if error else "unknown OMP bridge RPC error")
 
     def call(self, method: str, params: dict[str, Any] | None = None, timeout: float = 120,

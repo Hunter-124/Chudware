@@ -5644,6 +5644,20 @@ int run_gui(const char *screenshotPath, const char *openPath) {
                           "ask for changes, "
                           "or edit any feature directly (double-click / "
                           "right-click it).";
+          } else if (job.generalLane && !job.agentSummary.empty()) {
+            // Same reason the converged branch above prefers agentSummary: the
+            // general lane touched NO geometry, so the boilerplate below is a
+            // false claim ("whatever was built so far is in the FeatureManager
+            // tree" when nothing was built), and the turn's own handoff is the
+            // only real account of why it stopped. Before this, agentSummary was
+            // captured by jobs.cpp and then rendered only on success, so a model
+            // that declined the work with a paragraph of reasoning and three
+            // offered alternatives surfaced as "I stopped before fully
+            // finishing (blocked)" and every word of it was discarded
+            // (live 2026-08-27, pharm-press tooling request).
+            setStatus("Stopped early", 1);
+            assistant = job.agentSummary;
+            assistantErrHuman = job.errorHuman;
           } else {
             setStatus("Stopped early", 1);
             assistantErr = ERR_CAD;

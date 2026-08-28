@@ -1021,6 +1021,10 @@ std::string concise_http_error(const std::string& provider, int status, const st
     return provider + " HTTP " + std::to_string(status) + ": " + body;
 }
 
+bool is_provider_refusal(const std::string& raw) {
+    return raw.find(kProviderRefusedMarker) != std::string::npos;
+}
+
 std::string humanize_provider_error(const std::string& raw) {
     if (raw.empty()) return "The model provider failed.";
     std::string s = raw;
@@ -1031,6 +1035,13 @@ std::string humanize_provider_error(const std::string& raw) {
     for (char& c : low) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
 
     auto has = [&](const char* n) { return low.find(n) != std::string::npos; };
+
+    // Content refusal FIRST, and on OUR marker, not on prose: the transport branch below
+    // matches the substring "refused", so a vendor refusal reaching it would be reported as
+    // a connection failure and send the user to check their network.
+    if (is_provider_refusal(s))
+        return "That provider declined this request on content policy. Its credential and "
+               "connection are fine — pick a different provider in Settings → AI to run it.";
 
     // Transport / connectivity
     if (has("could not connect") || has("connection refused") || has("failed to connect") ||
@@ -1823,8 +1834,21 @@ CompleteResult complete(const std::string& provider, const json& cfg, const std:
             std::string em = result.value("errorMessage", std::string("provider error"));
             if (result.contains("errorStatus") && result["errorStatus"].is_number())
                 res.http_status = result["errorStatus"].get<int>();
-            res.error = "omp-bridge " + provider + ": " + em;
-            res.error_excerpt = truncate_excerpt(em);
+            // bridge.ts forwards the vendor's structured stopDetails. type=="refusal" means
+            // the request was SERVICED and declined, which is a different fact from a broken
+            // endpoint: the stage must fail on this attempt instead of paying to re-ask.
+            const json* sd = result.contains("stopDetails") && result["stopDetails"].is_object()
+                                 ? &result["stopDetails"]
+                                 : nullptr;
+            const bool refused = sd && sd->value("type", std::string()) == "refusal";
+            if (refused) {
+                const std::string category = sd->value("category", std::string());
+                res.error = provider + " " + kProviderRefusedMarker +
+                            (category.empty() ? std::string() : " (" + category + ")") + ": " + em;
+            } else {
+                res.error = "omp-bridge " + provider + ": " + em;
+            }
+            res.error_excerpt = truncate_excerpt(refused ? res.error : em);
             return finish(std::move(res));
         }
         if (res.text.empty() && res.thinking.empty()) {

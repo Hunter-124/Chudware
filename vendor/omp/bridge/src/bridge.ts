@@ -170,6 +170,14 @@ function collapse(msg: AssistantMessage): Json {
 	if (msg.stopReason === "error") {
 		out.errorStatus = msg.errorStatus ?? null;
 		out.errorMessage = msg.errorMessage ?? "provider error";
+		// stopDetails is how a vendor says "I serviced this and DECLINED" rather than
+		// "I broke": Anthropic sets {type:"refusal", category, explanation} alongside an
+		// error-class stop. Without it the Python side has only the prose errorMessage to
+		// go on, so it cannot tell a content refusal (retry a DIFFERENT vendor) from an
+		// endpoint fault (retry the SAME one) except by string sniffing. Forward the
+		// structured field; omp_bridge_provider prefers it and keeps the prose match as
+		// the fallback for vendors that never populate it.
+		out.stopDetails = (msg.stopDetails as Json) ?? null;
 	}
 	return out;
 }
@@ -401,6 +409,14 @@ async function main(): Promise<void> {
 			if (err && typeof err === "object") {
 				if ("message" in err && typeof err.message === "string") message = err.message;
 				if ("status" in err && typeof err.status === "number") error.status = err.status;
+				// ProviderResponseError.kind (packages/ai/src/error/provider.ts) is the only
+				// machine-readable statement of WHY a provider call failed. "content-blocked"
+				// in particular is a safety-filter refusal, which Gemini and the OpenAI
+				// Responses path raise as a THROW rather than returning an error-stop
+				// message — so without this the Python side sees an opaque RPC failure and
+				// cannot tell a policy refusal (try another vendor) from an outage (retry
+				// this one). Anthropic's equivalent rides collapse()'s stopDetails above.
+				if ("kind" in err && typeof err.kind === "string") error.kind = err.kind;
 			}
 			error.message = message;
 			writeFrame({ id, ok: false, error });

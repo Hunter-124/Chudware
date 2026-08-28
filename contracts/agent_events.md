@@ -205,7 +205,7 @@ A conforming consumer MUST:
 On `run_finished` / terminal `status` (phase done|error|failed|cancelled) and the
 agent run RPC result (`agent_run_v2`; formerly also `agent_design`, removed T-RF5),
 optional additive fields:
-- `stop_reason` — short enum-ish string (confirmed|stabilized|refine_cap|max_iters|no_code|failed|provider_error|provider_auth|provider_unavailable|phase_step_cap|terminated_by_user|…)
+- `stop_reason` — short enum-ish string (confirmed|stabilized|refine_cap|max_iters|no_code|failed|provider_error|provider_auth|provider_unavailable|provider_refused|phase_step_cap|terminated_by_user|…)
 - `error_detail` — human sentence, secret-scrubbed, ≤~300 chars; empty on normal completion. Prefer over legacy `error`.
 GUI renders error bubbles as `stopped: <stop_reason> — <error_detail>` when present.
 

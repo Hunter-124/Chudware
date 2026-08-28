@@ -194,6 +194,28 @@ struct WorkerStop {
 };
 WorkerStop classify_worker_stop(bool crashed, bool timed_out, bool reached_worker);
 
+// general_lane_status / general_lane_error_detail — how a general-lane turn's own
+// account of itself becomes the host-facing status + error_detail. Extracted for the
+// same reason as classify_worker_stop above: the mapping is pure, and it was wrong.
+//
+// The general lane runs no geometry pipeline, so the handoff envelope is the ONLY
+// record of what happened. Only `partial` and the guardrail stop used to be mapped;
+// every other non-success became "failed", so a model that DECIDED not to do the work
+// and explained why through the harness's own `blocked`/`escalated` handoff reached the
+// GUI indistinguishable from a provider fault, and `error_detail` came through null so
+// events.jsonl kept no statement of the reason either (live 2026-08-27: a machine-shop
+// tooling request returned status=failed carrying a paragraph of reasoning and three
+// offered alternatives, none of which anything rendered).
+//
+// error_detail is the contract's ~300-char human sentence (contracts/agent_events.md),
+// so a long summary is clipped rather than dropped; an error_detail the turn supplied
+// itself always wins.
+std::string general_lane_status(bool turn_ok, const std::string& handoff_status,
+                                const std::string& stop_reason);
+std::string general_lane_error_detail(const std::string& turn_error_detail,
+                                      const std::string& status,
+                                      const std::string& summary);
+
 // run_assembly_design — multi-part TRUE assembly. Plans the request; if the plan
 // is a single part (or assembly:false) it delegates to run_design on `doc_id`.
 // Otherwise it builds each part in its own child doc, but accepts a component

@@ -89,5 +89,36 @@ WorkerStop classify_worker_stop(bool crashed, bool timed_out, bool reached_worke
     return {"worker_error", "failed", true};
 }
 
+std::string general_lane_status(bool turn_ok, const std::string& handoff_status,
+                                const std::string& stop_reason) {
+    if (turn_ok) return "done";
+    // Order matters: `partial` means geometry WAS produced and some of it failed, which
+    // the host renders differently from a stop that produced nothing.
+    if (handoff_status == "partial") return "partial";
+    if (stop_reason == "guardrail_blocked") return "blocked";
+    // The model's own considered outcome. A decline it explained is not a fault, and
+    // reporting it as one both mislabels the model and buries the explanation.
+    if (handoff_status == "blocked" || handoff_status == "escalated") return "blocked";
+    return "failed";
+}
+
+std::string general_lane_error_detail(const std::string& turn_error_detail,
+                                      const std::string& status,
+                                      const std::string& summary) {
+    // An error_detail the turn built itself is already the contract shape — never
+    // second-guess it.
+    if (!turn_error_detail.empty()) return turn_error_detail;
+    if (status == "done" || summary.empty()) return std::string();
+    // events.jsonl is the forensics record and `error_detail: null` on a stopped run
+    // destroys the only statement of why. Carry the turn's own words, clipped to the
+    // ~300-char human sentence contracts/agent_events.md specifies. The clip is on a
+    // UTF-8 boundary: cutting mid-sequence would emit an invalid byte into the event
+    // stream and the chat card.
+    if (summary.size() <= 300) return summary;
+    size_t cut = 299;
+    while (cut > 0 && (static_cast<unsigned char>(summary[cut]) & 0xC0) == 0x80) --cut;
+    return summary.substr(0, cut) + "\xE2\x80\xA6";  // U+2026 HORIZONTAL ELLIPSIS
+}
+
 }  // namespace agent
 }  // namespace chudware

@@ -2818,3 +2818,89 @@ still never stage or publish its installer.
 The tracked production unit now grants only that explicit release root alongside the existing
 data/bucket roots. A deployment-unit regression test pins it. 158 deploy/release tests pass on
 the production-matching gateway venv.
+
+## 2026-08-27 — A vendor's refusal is not an outage, and a decline is not a crash
+
+`~/Desktop/pharm-press-2` was handed over as a real test project: a machine-shop pellet
+press plus a jack-driven bulk powder press, with toleranced shop prints. The folder held a
+PLM vault, an AI-VC chain and **zero deliverables**. Two runs explained why.
+`run-153290332111741` died `status=failed stop_reason=provider_error
+error_detail="anthropic: BridgeUnavailable: omp-bridge anthropic: Refusal (bio)"` — the
+sidecar, the credential and the endpoint were all healthy, three other credentialed
+providers sat idle in the same config, and the user was told the *bridge* was unavailable.
+`run-153641706610580` was cancelled by hand.
+
+A content refusal is now its own fact end to end. `vendor/omp/bridge/src/bridge.ts` (ours,
+preserved by `vendor_omp.py`) forwards the vendor's `stopDetails` on a completion and
+`ProviderResponseError.kind` on an RPC error frame — the latter matters because Google and
+the OpenAI Responses path report a safety block by THROWING, so without it those two
+vendors were indistinguishable from a dead bridge. `omp_bridge.ProviderRefused` subclasses
+`BridgeUnavailable` (existing `project_memory`/`compaction` fall-backs keep working) and
+carries `provider` + `category`; `omp_bridge_provider` prefers the structured field and
+keeps a deliberately narrow prose fallback for `openai-completions`' `content_filter`
+(narrow because `"connection refused"` must never read as a policy decision — pinned both
+ways). A refusal is never salvaged from a partial stream. `classify_provider_error` returns
+the new non-retryable `provider_refused` BEFORE the auth bucket, because Gemini answers a
+safety block with HTTP 400 and that used to send the user to re-check working credentials.
+`run_turn` then re-issues the identical prompt to the next enabled vendor FAMILY
+(`role_models.refusal_failover_candidates`, capability-ordered, one shot per family,
+`anthropic`/`anthropic-sub` collapsed since they share a classifier) and rebinds `provider`
+so the rest of the turn runs there. The refusing vendor is NOT marked process-unavailable —
+it is healthy for every other request. **Measured on the real stack:** injecting the live
+refusal envelope into the real `anthropic` provider moved the turn onto Moonshot (8 real
+HTTP 200s, 67k prompt tokens billed there, `new_part` → `add_features` ×2 →
+`measure_part`); before, the identical turn produced zero tool calls and died. C++ mirror:
+`providers.h::kProviderRefusedMarker` / `is_provider_refusal`, stamped from the bridge
+branch using the forwarded `stopDetails`, humanized ahead of the transport branch (which
+matches the bare substring `refused`), and `machine.cpp` fails a refused stage on the FIRST
+attempt like the auth case instead of paying to re-ask. Its five hand-spelled
+`provider_error||provider_auth` verdict chains are now one `is_terminal_provider_verdict`.
+
+Re-running the verbatim project prompt exposed a second, separate defect. Anthropic
+accepted it, researched, then the MODEL declined through the harness's own handoff —
+`status:"blocked"`, a paragraph of reasoning, three concrete alternatives. `run.cpp` mapped
+only `partial` and `guardrail_blocked`, so that landed on `status=failed` with
+`error_detail: null`; `jobs.cpp` captured the explanation into `job->agentSummary` and
+`app.cpp` rendered it only on the converged path. The user got *"I stopped before fully
+finishing (blocked). Whatever was built so far is in the FeatureManager tree"* — wrong
+label, false claim, and not one word of the reason. The mapping is now
+`run_stop.cpp::general_lane_status` / `general_lane_error_detail` behind `run.h`
+declarations (same testability pattern as `classify_worker_stop`), a blocked/escalated
+handoff reads `blocked`, the summary backfills `error_detail` clipped to the contract's
+~300 chars on a UTF-8 boundary, and `app.cpp` prints the general lane's own account when it
+stops. `partial` still outranks a blocked handoff, and a genuine fault still reads `failed`.
+
+Deliberately NOT done: nothing here routes around a model's considered decision. The
+failover recovers from a *provider classifier* refusal in a multi-vendor config — an
+infrastructure-shaped failure that was reported dishonestly. A model that declines through
+the handoff envelope is reported accurately and the turn ends.
+
+Also: `build.sh`'s engine-staleness gate now prunes `core/tests` alongside `core/hostd`.
+Test sources compile into their own doctest executables and nothing outside `core/tests`
+includes a test header, so adding one `TEST_CASE` made `./build.sh core` print *"ERROR: a
+consumed engine is STILL stale after building"* and refuse a completely correct build — the
+"gate that cries wolf" the surrounding comment already warns about. The real staleness check
+still fires (it caught `core/agent/run.h` mid-session).
+
+Chudcode side (`Hunter-124/chudcode` @ `537a653415`, `docs/fork/CHUDWARE-CONSUMER-FINDINGS.md`):
+four findings filed there rather than patched here, because `vendor_omp.py` clobbers
+`vendor/omp/packages/` on every re-vendor. The headline is that a refusal has FOUR
+incompatible shapes in `packages/ai` — `Flag.ContentBlocked` and
+`ProviderResponseErrorKind "content-blocked"` already exist but Anthropic puts it on the
+message, Google and OpenAI Responses throw it, `openai-completions` returns English prose,
+and OpenAI `refusal` content parts are folded into ordinary text by `finalizeMessageText`
+with `stopReason` left at `"stop"`, which is **undetectable downstream and has no
+workaround here**. Also filed: `stopDetails` is an undocumented consumer contract,
+`error/flags.ts` has zero refusal handling, and `gui/src/app/app.cpp:627-634` sets
+`io.IniFilename` from a `std::string` declared AFTER `ImGuiLifetime`, so every clean exit
+saves the ini through a freed pointer — eleven junk-named 96-byte files in that repo root,
+one per exit, and the window layout never persists.
+
+Tests: `services/agent/test_provider_refusal.py` (18, covering both the message and throw
+refusal paths, the transport-fault converse, family exclusion, real failover, and
+exhaustion) and two `core/tests/test_agent.cpp` cases. `test_agent` 103/103, 1075
+assertions. `services/agent` + `services/dag`: 3828 passed, 2 pre-existing failures
+(`test_mega11_legs::test_ecad_engineer_role_has_domain_tools_and_delegate` reproduces at
+pristine HEAD in an out-of-tree archive; `test_prohibited_auth::test_no_consumer_oauth_token_reuse`
+names `Webservice/gateway/provider_accounts.py:127`, landed 2026-08-19 in `c7b27bd7b`, and
+neither file was touched here).

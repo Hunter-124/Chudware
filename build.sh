@@ -170,7 +170,15 @@ report_engine_staleness() {
         # in, a daemon-only edit marked every engine permanently stale and the strict
         # gate then failed a build that was in fact correct — a gate that cries wolf
         # is one people learn to ignore. The daemon gets its own check below.
-        hit="$(find "$ROOT/core" -type d \( -name 'build*' -o -name hostd \) -prune -o \
+        # core/tests is pruned for the SAME reason: every file there compiles into its own
+        # doctest executable (core/CMakeLists.txt `add_executable(test_* tests/test_*.cpp)`)
+        # and nothing outside core/tests includes a test header, so a test edit cannot
+        # possibly change libchudware.so. Left in, `./build.sh core` after adding one
+        # TEST_CASE printed "ERROR: a consumed engine is STILL stale after building" and
+        # refused to report success on a build that was completely correct — the strict
+        # gate failing over a file it had already proved irrelevant (caught 2026-08-27).
+        hit="$(find "$ROOT/core" -type d \( -name 'build*' -o -name hostd -o -name tests \) \
+                -prune -o \
                 \( -name '*.cpp' -o -name '*.h' \) -newer "$consumer" -print -quit \
                 2>/dev/null || true)"
         if [ -n "$hit" ]; then

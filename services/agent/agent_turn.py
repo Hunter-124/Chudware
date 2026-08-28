@@ -60,6 +60,15 @@ _GUARD_BLOCKED = "guardrail_blocked"
 # blames it for our defect and sends retry policy down the guardrail branch,
 # where nothing the model can do will ever clear it.
 _GUARD_INTERNAL = "guardrail_internal_error"
+# The vendor serviced the call and DECLINED the prompt (Anthropic
+# stop_reason=refusal, OpenAI content_policy_violation, Gemini
+# PROHIBITED_CONTENT). Distinct from provider_error because the sidecar, the
+# credential and the endpoint were all HEALTHY, and distinct from
+# provider_unavailable because the vendor is fine for every other request —
+# so it must not be marked dead process-wide. Retrying the identical prompt on
+# the same vendor is guaranteed to refuse again; a different vendor routinely
+# answers it, which is what the failover below does.
+_PROVIDER_REFUSED = "provider_refused"
 
 
 def _guard_stop_reason(block: str) -> str:
@@ -132,8 +141,34 @@ def _provider_label(provider: Any) -> str:
     return ""
 
 
+def _refusal_detail(exc: BaseException, provider: Any = None) -> str:
+    """Human sentence for a vendor content refusal.
+
+    Deliberately NOT routed through the generic formatter: that one prefixes the
+    exception class, and "ProviderRefused"/"BridgeUnavailable" in front of a
+    policy decision is what sent the user to re-check working credentials. Name
+    the vendor, the category it gave, and the one action that helps — a different
+    provider — because the harness has already tried every one it could reach.
+    """
+    who = str(getattr(exc, "provider", "") or _provider_label(provider) or "the provider")
+    category = str(getattr(exc, "category", "") or "")
+    label = f" (category: {category})" if category else ""
+    return format_error_detail(
+        f"{who} declined this request on content policy{label}. The provider, the "
+        "credential and the connection were all fine — this is that vendor's own "
+        "refusal. Every other configured provider was tried and none accepted it; "
+        "add or enable a different provider in Settings to run this work."
+    )
+
+
 def format_provider_error_detail(exc: BaseException, provider: Any = None) -> str:
     """HTTP status + provider name + exception text, scrubbed for the GUI."""
+    try:
+        from services.agent.omp_bridge import ProviderRefused  # noqa: PLC0415
+        if isinstance(exc, ProviderRefused):
+            return _refusal_detail(exc, provider)
+    except Exception:  # noqa: BLE001 — formatting must never raise
+        pass
     pname = _provider_label(provider)
     status = getattr(exc, "status_code", None)
     if status is None:
@@ -194,7 +229,8 @@ def error_detail_for_stop(
             extra or "Conversation outgrew the model's context window "
                      "(trimmed and retried once)."
         )
-    if stop_reason in ("provider_error", "provider_auth", "provider_unavailable"):
+    if stop_reason in ("provider_error", "provider_auth", "provider_unavailable",
+                       _PROVIDER_REFUSED):
         # Prefer caller-supplied detail (already formatted); never "budget exhausted".
         if extra:
             return format_error_detail(extra)
@@ -203,6 +239,12 @@ def error_detail_for_stop(
         if stop_reason == "provider_unavailable":
             return format_error_detail(
                 "Provider unavailable (credits/tier/spending limit)."
+            )
+        if stop_reason == _PROVIDER_REFUSED:
+            return format_error_detail(
+                "The provider declined this request on content policy. Its "
+                "credential and connection were fine; no other configured "
+                "provider accepted it either."
             )
         return format_error_detail("Provider error (no detail).")
     if stop_reason in (_RETRY, "max_iters"):
@@ -1192,6 +1234,19 @@ def classify_provider_error(exc: BaseException) -> tuple[str, bool]:
         status_i = int(status) if status is not None else None
     except (TypeError, ValueError):
         status_i = None
+
+    # A content refusal FIRST: it is the only outcome here where the provider was
+    # demonstrably healthy, so it must not be diluted into provider_auth (Gemini
+    # answers a safety block with 400) or provider_error. Typed detection only —
+    # ProviderRefused is raised by omp_bridge_provider after it has read the
+    # vendor's structured stopDetails, and marker-sniffing a generic exception here
+    # would misread a TLS "connection refused" as a policy decision.
+    try:
+        from services.agent.omp_bridge import ProviderRefused  # noqa: PLC0415
+        if isinstance(exc, ProviderRefused):
+            return _PROVIDER_REFUSED, False
+    except Exception:  # noqa: BLE001 — bridge import must never break classification
+        pass
 
     # mega-16: spending-limit BEFORE generic 403→provider_auth so auto_pick can
     # fall through to openrouter paid instead of fatal-auth aborting the mission.
@@ -2341,6 +2396,10 @@ def _run_turn_impl(request: str, provider: Any, *, name: str = "dag_node",
                 pass
     # One trim-and-retry per turn on context overflow, then fail honestly.
     _ctx_overflow_retried = False
+    # Vendors that DECLINED this turn's prompt. Per-turn, never process-wide: the
+    # refusing vendor stays healthy for every other request, so marking it
+    # unavailable would wrongly demote it for the rest of the session.
+    _refused_providers: list[str] = []
     # Auto-enable-on-reach budget. Bounded so a model that keeps reaching for
     # unrelated packs still converges on a refusal instead of silently widening
     # its own permissions for the whole turn.
@@ -2829,6 +2888,99 @@ def _run_turn_impl(request: str, provider: Any, *, name: str = "dag_node",
                             "context-overflow retry failed stop_reason=%s: %s\n%s",
                             stop, exc, traceback.format_exc(),
                         )
+            # A content refusal is the one provider failure where the SAME request
+            # succeeds elsewhere: the sidecar, the credential and the endpoint were
+            # all healthy, and only this vendor's classifier objected. Live
+            # 2026-08-26 (run-153290332111741): a shop-drawing request for a
+            # hand-hammer pellet press was refused "(bio)" by anthropic and the
+            # whole run died provider_error with three other credentialed providers
+            # sitting idle in the same config, delivering nothing. Re-issue the
+            # identical prompt to the next vendor FAMILY instead. Bounded by the
+            # candidate list (one shot per family) so a request every vendor
+            # declines still terminates — honestly, and saying so.
+            if not recovered and stop == _PROVIDER_REFUSED:
+                refusing = str(
+                    getattr(exc, "provider", "")
+                    or getattr(provider, "name", "")
+                    or "")
+                if refusing and refusing not in _refused_providers:
+                    _refused_providers.append(refusing)
+                try:
+                    from services.agent import config as agent_config  # noqa: PLC0415
+                    from services.agent.role_models import (  # noqa: PLC0415
+                        refusal_failover_candidates,
+                    )
+                    cfg = dict(agent_config.load_config() or {})
+                    candidates = refusal_failover_candidates(
+                        _refused_providers, cfg=cfg)
+                except Exception:  # noqa: BLE001 — never mask the refusal itself
+                    candidates = []
+                for cand in candidates:
+                    cand_provider = str(cand.get("provider") or "")
+                    cand_model = str(cand.get("model") or "")
+                    _log(ledger, actor, {
+                        "event": "provider_refused",
+                        "provider": refusing,
+                        "category": str(getattr(exc, "category", "") or ""),
+                        "failover_to": f"{cand_provider}/{cand_model}",
+                        "error": str(exc)[:300],
+                    })
+                    try:
+                        cfg_alt = dict(cfg)
+                        cfg_alt["provider"] = cand_provider
+                        cfg_alt["model"] = cand_model
+                        if cand.get("base_url"):
+                            cfg_alt["base_url"] = str(cand["base_url"])
+                        alt = agent_config.get_provider(
+                            name=cand_provider, cfg=cfg_alt,
+                            **({"actor": credit_actor}
+                               if credit_actor is not None else {}))
+                        _usage_before = (
+                            _tu.usage_event_count() if _tu is not None else 0)
+                        _provider_failed = False
+                        try:
+                            reply = alt.complete(
+                                system, messages, max_tokens=call_completion_cap)
+                        except BaseException:
+                            _provider_failed = True
+                            raise
+                        finally:
+                            if (_tu is not None
+                                    and _tu.usage_event_count() == _usage_before):
+                                _tu.record_usage(
+                                    provider=str(getattr(alt, "name", "") or ""),
+                                    model=str(getattr(alt, "model", "") or ""),
+                                    prompt_tokens=0, completion_tokens=0,
+                                    total_tokens=0, context_tokens=0,
+                                    source=("provider_error_unreported"
+                                            if _provider_failed
+                                            else "provider_unreported"))
+                        # The rest of the turn (and every later iteration) runs on
+                        # the vendor that accepted the work.
+                        provider = alt
+                        recovered = True
+                        break
+                    except Exception as alt_exc:  # noqa: BLE001
+                        alt_stop, _alt_retryable = classify_provider_error(alt_exc)
+                        if alt_stop == _PROVIDER_REFUSED:
+                            fam = str(getattr(alt_exc, "provider", "")
+                                      or cand_provider)
+                            if fam and fam not in _refused_providers:
+                                _refused_providers.append(fam)
+                        _log_mod.error(
+                            "refusal failover to %s/%s failed stop_reason=%s: %s",
+                            cand_provider, cand_model, alt_stop, alt_exc)
+                        # Report the FIRST refusal, not a downstream vendor's
+                        # unrelated fault — the user needs to know who declined.
+                        continue
+                if not recovered:
+                    _log(ledger, actor, {
+                        "event": "provider_refused_exhausted",
+                        "provider": refusing,
+                        "category": str(getattr(exc, "category", "") or ""),
+                        "tried": list(_refused_providers),
+                        "alternatives": len(candidates),
+                    })
             if (not recovered and localish
                     and not getattr(provider, "_mega6_degraded", False)):
                 try:

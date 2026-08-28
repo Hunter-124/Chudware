@@ -139,6 +139,51 @@ def _directive_from_thinking(thinking: str) -> str:
     return ""
 
 
+# A vendor content refusal is NOT a bridge/endpoint failure, and the difference is
+# actionable: retrying the same prompt on the same vendor is guaranteed to fail again,
+# while a different vendor routinely answers it. Live 2026-08-26 (run-153290332111741):
+# a shop-drawing request for a hand-hammer pellet press died with
+#   "anthropic: BridgeUnavailable: omp-bridge anthropic: Refusal (bio)"
+# — a run-ending provider_error that reported a healthy sidecar as unavailable and never
+# tried the three other credentialed providers in the same config.
+#
+# `stopDetails.type == "refusal"` is the structured signal (bridge.ts forwards it).
+# Vendors that never populate it still name the refusal in prose, so the markers below
+# cover OpenAI/Gemini/Moonshot phrasing. Deliberately NARROW: "refused"/"decline" alone
+# would swallow a TLS "connection refused", so every marker is either the vendor's own
+# enum value or a phrase no transport error produces.
+_REFUSAL_MARKERS = (
+    "refusal",                      # Anthropic label + OpenAI `refusal` content part
+    "content flagged by safety filters",
+    "content_policy_violation",
+    "content_filter",
+    "prohibited_content",           # Gemini finishReason
+    "safety_settings",
+    "blocked by safety",
+    "responsible ai",               # Azure OpenAI content-management wording
+    "usage policies",
+    "content management policy",
+)
+
+
+def _refusal_category(result: dict, message: str) -> str | None:
+    """The vendor's refusal category, or None when this was not a refusal.
+
+    Returns "" for a refusal the vendor did not categorise, so callers must test
+    ``is not None`` rather than truthiness.
+    """
+    details = result.get("stopDetails")
+    if isinstance(details, dict):
+        if str(details.get("type") or "").strip().lower() == "refusal":
+            return str(details.get("category") or "").strip()
+        # An error-class stop that names a NON-refusal type (overloaded, api_error)
+        # is authoritative: trust it over a prose match on the same message.
+        if details.get("type"):
+            return None
+    low = message.lower()
+    return "" if any(m in low for m in _REFUSAL_MARKERS) else None
+
+
 #: Per-(provider, model) sidecar catalog caps, cached for the life of the worker.
 #: The worker is a fresh fork per turn, so this is at most ONE extra `models_list`
 #: call per turn against an already-running sidecar (~0.4 s cold, served from its
@@ -307,6 +352,15 @@ class OmpBridgeProvider(Provider):
                     result = bridge.call(
                         "complete", call_params, timeout=self.timeout)
             except bridge.BridgeUnavailable as call_exc:
+                if isinstance(call_exc, bridge.ProviderRefused):
+                    # A refusal is a DECISION, not a cut stream. Whatever the model
+                    # emitted before the filter tripped is not an answer, and salvaging
+                    # it as a truncated reply would hide the refusal from agent_turn —
+                    # the turn would then "succeed" on a fragment instead of failing
+                    # over to a vendor that will actually do the work.
+                    if not call_exc.provider:
+                        call_exc.provider = self.name
+                    raise
                 salvaged_text, salvaged_thinking = _salvage_stream()
                 if salvaged_text:
                     # No terminal line means the stream may be partial. Preserve
@@ -334,13 +388,27 @@ class OmpBridgeProvider(Provider):
                 self._record_usage(result.get("usage"))
                 text = str(result.get("errorMessage") or "provider error")
                 status = result.get("errorStatus")
+                status_i = (
+                    status
+                    if isinstance(status, int) and not isinstance(status, bool)
+                    else None
+                )
+                category = _refusal_category(result, text)
+                if category is not None:
+                    # Say what actually happened. "BridgeUnavailable" here was a
+                    # lie about a healthy sidecar and sent the user to check
+                    # credentials that were fine; agent_turn reads this type to
+                    # fail the turn over to a different vendor instead of dying.
+                    label = f" ({category})" if category else ""
+                    raise bridge.ProviderRefused(
+                        f"{self.name} declined this request{label}: {text}",
+                        status=status_i,
+                        provider=self.name,
+                        category=category,
+                    )
                 raise bridge.BridgeUnavailable(
                     f"omp-bridge {self.name}: {text}",
-                    status=(
-                        status
-                        if isinstance(status, int) and not isinstance(status, bool)
-                        else None
-                    ),
+                    status=status_i,
                 )
 
             if not str(result.get("text") or ""):

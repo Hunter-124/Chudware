@@ -249,6 +249,14 @@ void emit_call_events(RunEvents& events, const std::string& stage, const std::st
     }
 }
 
+// Verdicts that end a stage on the PROVIDER's terms, not the model's — no retry of the
+// same request can change them. Kept as ONE predicate because the five call sites below
+// each spelled the OR-chain out by hand: adding `provider_refused` to four of them and
+// missing the fifth would silently fall through to "retry" and pay for a refusal again.
+bool is_terminal_provider_verdict(const std::string& v) {
+    return v == "provider_error" || v == "provider_auth" || v == "provider_refused";
+}
+
 }  // namespace
 
 json run_machine(DesignState& state, const StageActions& actions, RunEvents& events,
@@ -338,6 +346,16 @@ json run_machine(DesignState& state, const StageActions& actions, RunEvents& eve
         return false;
     };
 
+    // A vendor content refusal, matched on providers.h's own marker (never on prose —
+    // "connection refused" is a transport fault, not a policy decision). Like the auth
+    // case above this must fail on the FIRST attempt: the same vendor asked the same
+    // question refuses identically every time, so the retry budget buys nothing but
+    // billed completions. Live 2026-08-26: an Anthropic "(bio)" refusal of a machinable
+    // pellet-press request ended the run reported as a generic provider_error.
+    auto looks_like_refusal_error = [](const StageOutcome& o) -> bool {
+        return is_provider_refusal(o.reason) || (o.has_error && is_provider_refusal(o.error));
+    };
+
     auto run_attempt = [&](const std::string& stage, const Action& action, const std::string& role,
                            int attempt, int budget) -> std::string {
         if (cancelled()) return "cancelled";
@@ -386,6 +404,25 @@ json run_machine(DesignState& state, const StageActions& actions, RunEvents& eve
                                              {"error_detail", reason},
                                              {"error_human", humanize_provider_error(reason)}});
             return "provider_auth";
+        }
+
+        if (outcome.has_error && !outcome.free_retry && looks_like_refusal_error(outcome)) {
+            const std::string reason =
+                is_provider_refusal(outcome.reason)
+                    ? outcome.reason
+                    : outcome.error;
+            last_fail_reason = reason;
+            last_was_provider_error = true;
+            last_was_parse_error = false;
+            run_provider_error = reason;
+            events.emit("stage_result", json{{"stage", stage},
+                                             {"attempt", attempt},
+                                             {"verdict", "fail"},
+                                             {"reason", reason},
+                                             {"stop_reason", "provider_refused"},
+                                             {"error_detail", reason},
+                                             {"error_human", humanize_provider_error(reason)}});
+            return "provider_refused";
         }
 
         if (outcome.has_error && !outcome.free_retry) {
@@ -482,7 +519,7 @@ json run_machine(DesignState& state, const StageActions& actions, RunEvents& eve
         for (int attempt = 1; attempt <= budget; ++attempt) {
             std::string v = run_attempt(stage, action, role, attempt, budget);
             if (v == "cancelled" || v == "pass" || v == "fail" || v == "skip" ||
-                v == "provider_error" || v == "provider_auth")
+                is_terminal_provider_verdict(v))
                 return v;
             // v == "retry" — tool-scope free retries re-prompt without burning the attempt.
             if (last_was_free_retry && free_retries < kMaxFreeRetries) {
@@ -558,7 +595,7 @@ json run_machine(DesignState& state, const StageActions& actions, RunEvents& eve
     if (budget_of("plan") > 0) {
         std::string plan_v = run_stage("plan", actions.plan, "planner");
         if (plan_v == "cancelled") return cancel_result();
-        if (plan_v == "provider_error" || plan_v == "provider_auth") {
+        if (is_terminal_provider_verdict(plan_v)) {
             const std::string detail =
                 run_provider_error.empty() ? last_fail_reason : run_provider_error;
             return json{{"status", "failed"},
@@ -727,7 +764,7 @@ json run_machine(DesignState& state, const StageActions& actions, RunEvents& eve
         }
         std::string v = run_stage("model", actions.model, "modeler");
         if (v == "cancelled") return cancel_result();
-        if (v == "provider_error" || v == "provider_auth") {
+        if (is_terminal_provider_verdict(v)) {
             model_status = "fail";
             if (plan_skipped) emit_stage_checklist();
             if (emit_model_steps) {
@@ -824,7 +861,7 @@ json run_machine(DesignState& state, const StageActions& actions, RunEvents& eve
                 review_status = "done";
                 break;
             }
-            if (v == "fail" || v == "provider_error" || v == "provider_auth") {
+            if (v == "fail" || is_terminal_provider_verdict(v)) {
                 review_status = "fail";
                 break;
             }
@@ -844,7 +881,7 @@ json run_machine(DesignState& state, const StageActions& actions, RunEvents& eve
                 std::string fix_v =
                     run_attempt("fix", actions.fix, "fixer", fix_calls, fix_limit);
                 if (fix_v == "cancelled") return cancel_result();
-                if (fix_v == "provider_error" || fix_v == "fail" || fix_v == "provider_auth") {
+                if (fix_v == "fail" || is_terminal_provider_verdict(fix_v)) {
                     fix_terminal_fail = true;
                     fix_status = "fail";
                     break;

@@ -108,6 +108,18 @@ std::string concise_http_error(const std::string& provider, int status, const st
 // error_detail so the phase card can show "Claude rejected the request" + the HTTP line.
 std::string humanize_provider_error(const std::string& raw);
 
+// Stable marker THIS layer stamps into `complete().error` when the vendor serviced the
+// request and DECLINED it (Anthropic stop_details.type=="refusal", OpenAI
+// content_policy_violation, Gemini PROHIBITED_CONTENT). Downstream classification matches
+// on this constant, never on vendor prose: a refusal must fail its stage on the FIRST
+// attempt, because re-asking the same vendor the same question is paid-for and certain to
+// refuse again — and "connection refused" must never be mistaken for one. Mirrors
+// services/agent/omp_bridge.ProviderRefused on the Python lane.
+inline constexpr const char* kProviderRefusedMarker = "declined by content policy";
+
+// True when *raw* (a complete().error or "provider error: …" reason) carries the marker above.
+bool is_provider_refusal(const std::string& raw);
+
 // --- mock_provider.py -------------------------------------------------------
 // MockProvider: scripted replies in order; the last repeats once exhausted.
 class MockProvider {

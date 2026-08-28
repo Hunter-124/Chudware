@@ -1286,27 +1286,15 @@ json run_design(const std::string& request, const std::string& doc_id, const jso
                                  : json::object();
         const std::string handoff_status =
             handoff.is_object() ? handoff.value("status", std::string()) : std::string();
-        const std::string status =
-            turn_ok                         ? "done"
-            : handoff_status == "partial"   ? "partial"
-            : stop_reason == "guardrail_blocked" ? "blocked"
-                                             : "failed";
         const std::string role = turn.value("role", std::string("general_agent"));
-        const std::string error_detail =
-            turn_result.is_object()
-                ? turn_result.value("error_detail", std::string())
-                : std::string();
-        json finished{{"status", status},
-                      {"stop_reason", stop_reason},
-                      {"role", role}};
-        if (!error_detail.empty()) finished["error_detail"] = error_detail;
-        events.emit("run_finished", std::move(finished));
+
         // The general lane runs NO geometry pipeline: whatever happened, the
         // turn's own handoff is the only honest account of it. Hand it up so
         // the host can print it instead of the built-geometry boilerplate
         // (2026-07-27: a turn that created nothing still rendered "Done - I
         // built this as parametric features; see the FeatureManager tree").
-        // Preserve the worker's terminal envelope verbatim below.
+        // Harvested BEFORE the status/error_detail derivation below, which both
+        // fall back to it.
         std::string summary;
         if (turn_result.is_object()) {
             // Models write the finish text under several keys: the canonical
@@ -1329,6 +1317,21 @@ json run_design(const std::string& request, const std::string& doc_id, const jso
             if (handoff.is_object()) harvest(handoff.value("outputs", json::object()));
             harvest(turn_result);
         }
+
+        // Both mappings live in run_stop.cpp behind run.h declarations so a test can
+        // LINK the shipped rule instead of restating it (same reason as
+        // classify_worker_stop above).
+        const std::string status =
+            general_lane_status(turn_ok, handoff_status, stop_reason);
+        const std::string error_detail = general_lane_error_detail(
+            turn_result.is_object() ? turn_result.value("error_detail", std::string())
+                                    : std::string(),
+            status, summary);
+        json finished{{"status", status},
+                      {"stop_reason", stop_reason},
+                      {"role", role}};
+        if (!error_detail.empty()) finished["error_detail"] = error_detail;
+        events.emit("run_finished", std::move(finished));
         json out{{"run_id", run_id},
                  {"status", status},
                  {"stop_reason", stop_reason},

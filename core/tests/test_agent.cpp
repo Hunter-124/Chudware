@@ -240,6 +240,28 @@ TEST_CASE("concise_http_error: 429 quota becomes one actionable line") {
     CHECK(concise_http_error("openai", 500, "boom") == "openai HTTP 500: boom");
 }
 
+TEST_CASE("a vendor content refusal is not a transport failure") {
+    // Live 2026-08-26: Anthropic refused a machinable pellet-press design "(bio)". The
+    // whole run reported a generic provider error, so the retry budget kept paying to
+    // re-ask a vendor that refuses the same prompt every time.
+    const std::string refused =
+        std::string("anthropic ") + kProviderRefusedMarker + " (bio): Refusal (bio)";
+    CHECK(is_provider_refusal(refused));
+    // …and it survives the "provider error: " reason prefix the stage actions add.
+    CHECK(is_provider_refusal("provider error: " + refused));
+
+    const std::string human = humanize_provider_error(refused);
+    CHECK(human.find("declined this request on content policy") != std::string::npos);
+    // The transport branch matches the bare substring "refused"; a refusal must never be
+    // reported as a network fault, which would send the user to check their connection.
+    CHECK(human.find("Could not reach") == std::string::npos);
+
+    // The converse: an actual connection failure is never read as a policy decision.
+    CHECK_FALSE(is_provider_refusal("omp-bridge ollama: connection refused"));
+    CHECK(humanize_provider_error("omp-bridge ollama: connection refused to 127.0.0.1")
+              .find("Could not reach") != std::string::npos);
+}
+
 TEST_CASE("context_window_for: override wins, else per-provider default") {
     CHECK(context_window_for(json{{"name", "gemini"}}) == 1048576);
     CHECK(context_window_for(json{{"name", "anthropic"}}) == 200000);
@@ -2118,6 +2140,57 @@ TEST_CASE("a silent worker is not a non-modeling request") {
     CHECK(declined.stop_reason == "worker_error");
     CHECK(declined.status == "failed");
     CHECK(declined.may_have_changed_the_model);
+}
+
+TEST_CASE("a considered decline is not a crash, and keeps its reason") {
+    // Live 2026-08-27 (pharm-press-2): a machine-shop tooling request ran research,
+    // then the model declined through the harness's own handoff — status "blocked",
+    // a paragraph of reasoning, three offered alternatives. It reached the GUI as
+    // status=failed with error_detail=null, so the chat card printed
+    // "I stopped before fully finishing (blocked). Whatever was built so far is in
+    // the FeatureManager tree" — a wrong label, a false claim (nothing was built),
+    // and not one word of the actual reason.
+    using chudware::agent::general_lane_error_detail;
+    using chudware::agent::general_lane_status;
+
+    CHECK(general_lane_status(false, "blocked", "blocked") == "blocked");
+    CHECK(general_lane_status(false, "escalated", "blocked") == "blocked");
+    // Unchanged mappings.
+    CHECK(general_lane_status(true, "done", "confirmed") == "done");
+    CHECK(general_lane_status(false, "partial", "max_iters") == "partial");
+    CHECK(general_lane_status(false, "", "guardrail_blocked") == "blocked");
+    // A genuine fault must still read as one — this is not "everything is blocked".
+    CHECK(general_lane_status(false, "", "provider_error") == "failed");
+    CHECK(general_lane_status(false, "", "worker_crash") == "failed");
+    // `partial` outranks a blocked handoff: geometry exists and the host renders it.
+    CHECK(general_lane_status(false, "partial", "guardrail_blocked") == "partial");
+
+    // The reason survives into error_detail, which events.jsonl records.
+    const std::string why = "Declined to produce the tooling package; offered three "
+                            "alternatives.";
+    CHECK(general_lane_error_detail("", "blocked", why) == why);
+    // A detail the turn built itself always wins over the summary.
+    CHECK(general_lane_error_detail("HTTP 401", "failed", why) == "HTTP 401");
+    // A successful run has nothing to explain.
+    CHECK(general_lane_error_detail("", "done", why).empty());
+    CHECK(general_lane_error_detail("", "blocked", "").empty());
+
+    // Long summaries are clipped to the contract's ~300-char sentence, on a UTF-8
+    // boundary — a mid-sequence cut would put an invalid byte in the event stream.
+    const std::string wide(150, 'x');
+    std::string mb = wide;
+    for (int i = 0; i < 80; ++i) mb += "\xC3\xA9";  // é, 2 bytes each
+    const std::string clipped = general_lane_error_detail("", "blocked", mb);
+    CHECK(clipped.size() <= 302);          // <=299 payload + 3-byte ellipsis
+    CHECK(clipped.size() > 290);
+    for (size_t i = 0; i < clipped.size();) {
+        const unsigned char c = static_cast<unsigned char>(clipped[i]);
+        const size_t len = c < 0x80 ? 1 : (c >> 5) == 0x6 ? 2 : (c >> 4) == 0xE ? 3 : 4;
+        REQUIRE(i + len <= clipped.size());  // no truncated code point
+        for (size_t k = 1; k < len; ++k)
+            CHECK((static_cast<unsigned char>(clipped[i + k]) & 0xC0) == 0x80);
+        i += len;
+    }
 }
 
 TEST_CASE("mission stop_reason propagates real unit failure") {

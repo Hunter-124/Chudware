@@ -234,13 +234,7 @@ def _load() -> ctypes.CDLL:
         # Geometry queries + the agent cheatsheets resolve relative to the prompts dir; point
         # it at the staged/source copy so the MCP behaves identically to the engine. Don't
         # clobber an explicit override.
-        # An explicit CHUDWARE_PROMPTS_DIR override must reach the C++ core, which
-        # still reads CHUDWARE_PROMPTS_DIR — propagate before the default kicks in.
-        _sc_prompts = os.environ.get("CHUDWARE_PROMPTS_DIR")
-        if _sc_prompts:
-            os.environ.setdefault("CHUDWARE_PROMPTS_DIR", _sc_prompts)
         os.environ.setdefault("CHUDWARE_PROMPTS_DIR", str(_prompts_default()))
-        os.environ.setdefault("CHUDWARE_PROMPTS_DIR", os.environ["CHUDWARE_PROMPTS_DIR"])
         dll = ctypes.CDLL(str(lib_path))
         dll.chudware_call.restype = ctypes.c_int
         dll.chudware_call.argtypes = [

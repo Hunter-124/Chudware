@@ -31,14 +31,13 @@ which has its own agent_fn injection point.
 from __future__ import annotations
 
 import json
-import os
-import platform
 from pathlib import Path
 from typing import Annotated, Any, Optional
 
 from pydantic import Field
 
 from services.dag import session
+from services.dag.executor import default_runs_dir as _runs_dir
 
 # Var-keyword parameters below are annotated ``Annotated[Any, Field(default=None)]``
 # rather than left bare.  FastMCP's func_metadata turns a bare ``**kwargs`` into a
@@ -64,15 +63,6 @@ def _err(reason: str, hint: str = "", **extra: Any) -> str:
         out["hint"] = hint
     out.update(extra)
     return _dumps(out)
-
-
-def _runs_dir() -> Path:
-    """Platform default runs directory (mirrors executor.default_runs_dir)."""
-    if platform.system() == "Windows":
-        appdata = os.environ.get("APPDATA") or os.path.expanduser(r"~\AppData\Roaming")
-        return Path(appdata) / "Chudware" / "runs"
-    xdg = os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share")
-    return Path(xdg) / "Chudware" / "runs"
 
 
 def _load_run_status(run_id: str, runs_dir: Path) -> dict[str, Any] | None:

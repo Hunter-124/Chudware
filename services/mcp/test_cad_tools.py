@@ -473,9 +473,18 @@ def test_close_part_warns_on_unsaved_changes():
     """close_part on a dirty doc refuses (unsaved_changes) so the AI saves deliverables —
     the user is never nagged about the AI's docs, so the discipline lives here."""
     doc = _new_plate_with_hole()  # has edits -> dirty
+    from services.mcp import cad_common
+    assert doc in cad_common._LAST_VOLUME
+    assert doc in cad_common._PROCESS_DOCS
+    assert doc in cad_common._TOUCHED_DOCS
+    volume_before = cad_common._LAST_VOLUME[doc]
     r, _ = _call("close_part", {"doc_id": doc})
     assert r.get("ok") is False and r.get("code") == "unsaved_changes", r
     assert r.get("dirty") is True, r
+    assert cad_common._LAST_VOLUME.get(doc) == volume_before, \
+        "refused close must preserve the volume baseline"
+    assert doc in cad_common._PROCESS_DOCS, "refused close must preserve process ownership"
+    assert doc in cad_common._TOUCHED_DOCS, "refused close must preserve touched-doc state"
     # The doc is untouched — still listable and closable.
     ids = {e.get("doc_id") for e in cb.call("doc_list", {}).get("docs", [])}
     assert doc in ids, "refused close must not have dropped the doc"
@@ -485,10 +494,17 @@ def test_close_part_warns_on_unsaved_changes():
 def test_close_part_discard_drops_scratch():
     """close_part(discard=True) closes a dirty scratch doc without saving."""
     doc = _new_plate_with_hole()
+    from services.mcp import cad_common
+    assert doc in cad_common._LAST_VOLUME
+    assert doc in cad_common._PROCESS_DOCS
+    assert doc in cad_common._TOUCHED_DOCS
     r, _ = _call("close_part", {"doc_id": doc, "discard": True})
     assert r.get("ok") is True, r
     ids = {e.get("doc_id") for e in cb.call("doc_list", {}).get("docs", [])}
     assert doc not in ids, "discard must actually close the doc"
+    assert doc not in cad_common._LAST_VOLUME, "discard must evict the volume baseline"
+    assert doc not in cad_common._PROCESS_DOCS, "discard must evict process ownership"
+    assert doc not in cad_common._TOUCHED_DOCS, "discard must evict touched-doc state"
 
 
 def test_close_part_clean_after_save():

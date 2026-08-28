@@ -17,19 +17,10 @@ services.deliverables.worker_rpc / parts_hub.worker_rpc precedent.
 from __future__ import annotations
 
 import json
-import os
-import platform
 from pathlib import Path
 from typing import Callable
 
-
-def _runs_dir() -> Path:
-    """Platform default runs directory (mirrors executor.default_runs_dir)."""
-    if platform.system() == "Windows":
-        appdata = os.environ.get("APPDATA") or os.path.expanduser(r"~\AppData\Roaming")
-        return Path(appdata) / "Chudware" / "runs"
-    xdg = os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share")
-    return Path(xdg) / "Chudware" / "runs"
+from services.dag.executor import default_runs_dir as _runs_dir
 
 
 def _dag_status(params: dict, _emit: Callable) -> dict:

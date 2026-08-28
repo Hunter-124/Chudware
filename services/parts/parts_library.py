@@ -78,10 +78,10 @@ def _supplier_for(path: Path, root: Path) -> str:
     return "library"
 
 
-def _index_by_path() -> dict[str, dict]:
+def _index_by_path(index: dict[str, dict]) -> dict[str, dict]:
     """Map resolved cad_path -> record for fast already-registered lookup."""
     out: dict[str, dict] = {}
-    for rec in vendor_parts._load_index().values():  # noqa: SLF001 (intentional: same package)
+    for rec in index.values():
         cp = rec.get("cad_path")
         if cp:
             try:
@@ -104,9 +104,10 @@ def scan_library_folder(folder: str | None = None) -> dict:
     if not root.exists():
         raise FileNotFoundError(f"parts library folder not found: {root}")
 
-    by_path = _index_by_path()
+    index = vendor_parts._load_index()  # noqa: SLF001 (intentional: same package)
+    by_path = _index_by_path(index)
     scanned = added = updated = 0
-    touched: list[dict] = []
+    pending: list[dict[str, Any]] = []
 
     for f in _iter_cad_files(root):
         scanned += 1
@@ -121,30 +122,24 @@ def scan_library_folder(folder: str | None = None) -> dict:
         specs = parse_specs_from_name(f.stem)
         # Register WITHOUT copying: the library folder is itself the canonical store, so we
         # point cad_path at the file in place (keeps scans cheap + avoids duplicate bytes).
-        rec = vendor_parts.register_local_cad(
-            supplier=supplier,
-            part_number=part_number,
-            description=f.stem,
-            cad_path=resolved,
-            specs=specs,
-            source="library",
-            copy_file=False,
-            source_mtime=mtime,
-        )
-        touched.append(rec)
+        pending.append({
+            "supplier": supplier,
+            "part_number": part_number,
+            "description": f.stem,
+            "cad_path": resolved,
+            "specs": specs,
+            "source": "library",
+            "copy_file": False,
+            "source_mtime": mtime,
+        })
         if existing is None:
             added += 1
         else:
             updated += 1
 
-    # Federate into PartsHub FTS so part_search finds the newly scanned files.
-    # Best-effort: hub may be unavailable in pure-metadata tests / core-less CI.
-    if added or updated:
-        try:
-            from services.parts import rebuild_index as _rebuild  # noqa: PLC0415
-            _rebuild()
-        except Exception:  # noqa: BLE001
-            pass
+    # Persist the registry and federate it into PartsHub once for the whole scan. Supplying the
+    # snapshot used above avoids a second index read during bulk registration.
+    touched = vendor_parts.register_local_cads(pending, index=index)
 
     return {"scanned": scanned, "added": added, "updated": updated, "parts": touched}
 

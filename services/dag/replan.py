@@ -46,11 +46,10 @@ Usage
 from __future__ import annotations
 
 import json
-import os
-import platform
 from pathlib import Path
 from typing import Any, Optional
 
+from .executor import default_runs_dir as _default_runs_dir
 from .graph_loader import GraphValidationError, validate_graph
 
 # ---------------------------------------------------------------------------
@@ -60,18 +59,6 @@ from .graph_loader import GraphValidationError, validate_graph
 
 class ReplannError(ValueError):
     """Raised when the splice is invalid and cannot be applied."""
-
-
-# ---------------------------------------------------------------------------
-# Runs dir
-# ---------------------------------------------------------------------------
-
-def _default_runs_dir() -> Path:
-    if platform.system() == "Windows":
-        appdata = os.environ.get("APPDATA") or os.path.expanduser(r"~\AppData\Roaming")
-        return Path(appdata) / "Chudware" / "runs"
-    xdg = os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share")
-    return Path(xdg) / "Chudware" / "runs"
 
 
 # ---------------------------------------------------------------------------

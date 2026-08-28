@@ -680,8 +680,8 @@ def vendor_cache_purge(site: str | None = None) -> int:
 
 def _run_live_site_inner(site: str, rt: dict, limit: int, p: dict, job: dict) -> None:
     from services.parts import search as _search
-    # Cache probe first (cheap, off-lock): a hit skips the scrape entirely, so this
-    # vendor never flashes "loading" and goes straight to "done".
+    # Probe before taking a scarce CEF slot. Warm results and their status/cancel
+    # bookkeeping must never queue behind unrelated vendor navigations.
     cached = _vendor_cache_get(site, rt["vendor_query"], limit)
     with _live_lock:
         if job.get("cancelled"):
@@ -693,13 +693,21 @@ def _run_live_site_inner(site: str, rt: dict, limit: int, p: dict, job: dict) ->
     if cached is not None:
         recs = cached
     else:
+        _live_fetch_slots.acquire()
+        # A cold worker may have been superseded while waiting for a scrape slot.
+        # Check again before turning that slot into a real vendor navigation.
+        if job.get("cancelled"):
+            _live_fetch_slots.release()
+            return
         try:
             recs = _search(rt["vendor_query"], domain="catalog", limit=limit, sites=[site])
         except Exception:  # noqa: BLE001 — one vendor failing must not sink the others
             recs = []
             site_status = "error"
-        else:
-            # Only a clean scrape is cacheable; an exception path must stay uncached.
+        finally:
+            _live_fetch_slots.release()
+        if site_status == "done":
+            # Cache writes are disk work, not CEF work, and must not occupy a scrape slot.
             _vendor_cache_put(site, rt["vendor_query"], limit, recs)
     with _live_lock:
         if job.get("cancelled"):
@@ -737,9 +745,8 @@ def _run_live_site_inner(site: str, rt: dict, limit: int, p: dict, job: dict) ->
 
 
 def _run_live_site(site: str, rt: dict, limit: int, p: dict, job: dict) -> None:
-    """Run one vendor scrape inside the process-wide CEF concurrency budget."""
-    with _live_fetch_slots:
-        _run_live_site_inner(site, rt, limit, p, job)
+    """Run one vendor search; only a cold scrape consumes a shared CEF slot."""
+    _run_live_site_inner(site, rt, limit, p, job)
 
 
 def _parts_search_live_start(params: dict, _emit: Callable) -> dict:

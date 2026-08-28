@@ -350,37 +350,151 @@ class TestVendorResultCache:
 
 
 class TestLiveVendorConcurrency:
-    def test_vendor_fetches_respect_cef_concurrency_budget(self, monkeypatch):
-        import threading
-        import time
+    @staticmethod
+    def _job(site):
+        return {
+            "results": [],
+            "notices": [],
+            "seen_ids": set(),
+            "seen_notices": set(),
+            "pending": 1,
+            "done": False,
+            "cancelled": False,
+            "vendors": {site: {"site": site, "status": "queued"}},
+        }
 
+    @staticmethod
+    def _routing(query):
+        return {"vendor_query": query, "facet_defs": []}
+
+    def test_cold_vendor_scrapes_respect_cef_concurrency_budget(self, monkeypatch):
+        import threading
+
+        from services import parts
         from services.parts import gui_rpc
 
         lock = threading.Lock()
+        three_running = threading.Event()
+        release_scrapes = threading.Event()
         active = 0
         max_active = 0
+        search_calls = 0
 
-        def fake_inner(*_args):
-            nonlocal active, max_active
+        def fake_search(*_args, **_kwargs):
+            nonlocal active, max_active, search_calls
             with lock:
                 active += 1
+                search_calls += 1
                 max_active = max(max_active, active)
-            time.sleep(0.03)
+                if active == gui_rpc._LIVE_FETCH_CONCURRENCY:
+                    three_running.set()
+            release_scrapes.wait(timeout=2.0)
             with lock:
                 active -= 1
+            return []
 
         monkeypatch.setattr(gui_rpc, "_live_fetch_slots", threading.BoundedSemaphore(3))
-        monkeypatch.setattr(gui_rpc, "_run_live_site_inner", fake_inner)
+        monkeypatch.setattr(gui_rpc, "_vendor_cache_get", lambda *_args: None)
+        monkeypatch.setattr(gui_rpc, "_vendor_cache_put", lambda *_args: None)
+        monkeypatch.setattr(parts, "search", fake_search)
         threads = [
-            threading.Thread(target=gui_rpc._run_live_site, args=(str(i), {}, 1, {}, {}))
+            threading.Thread(
+                target=gui_rpc._run_live_site,
+                args=(str(i), self._routing(f"cold-{i}"), 1, {}, self._job(str(i))),
+            )
             for i in range(9)
         ]
-        for thread in threads:
-            thread.start()
-        for thread in threads:
-            thread.join()
+        try:
+            for thread in threads:
+                thread.start()
+            assert three_running.wait(timeout=1.0)
+        finally:
+            release_scrapes.set()
+            for thread in threads:
+                thread.join(timeout=2.0)
 
+        assert all(not thread.is_alive() for thread in threads)
+        assert search_calls == 9
         assert max_active == gui_rpc._LIVE_FETCH_CONCURRENCY == 3
+
+    def test_warm_vendor_hit_bypasses_saturated_scrape_slots(self, monkeypatch):
+        import threading
+
+        from services import parts
+        from services.parts import gui_rpc
+
+        lock = threading.Lock()
+        slots_saturated = threading.Event()
+        release_scrapes = threading.Event()
+        active = 0
+        max_active = 0
+        search_calls = 0
+        warm_record = {
+            "part_id": "catalog:warm::https://example.test/cached",
+            "title": "Cached bearing",
+            "domain": "catalog",
+            "source": "live",
+            "params": {},
+        }
+
+        def fake_cache_get(site, *_args):
+            return [warm_record] if site == "warm" else None
+
+        def fake_search(*_args, **_kwargs):
+            nonlocal active, max_active, search_calls
+            with lock:
+                active += 1
+                search_calls += 1
+                max_active = max(max_active, active)
+                if active == gui_rpc._LIVE_FETCH_CONCURRENCY:
+                    slots_saturated.set()
+            release_scrapes.wait(timeout=2.0)
+            with lock:
+                active -= 1
+            return []
+
+        monkeypatch.setattr(gui_rpc, "_live_fetch_slots", threading.BoundedSemaphore(3))
+        monkeypatch.setattr(gui_rpc, "_vendor_cache_get", fake_cache_get)
+        monkeypatch.setattr(gui_rpc, "_vendor_cache_put", lambda *_args: None)
+        monkeypatch.setattr(parts, "search", fake_search)
+        cold_threads = [
+            threading.Thread(
+                target=gui_rpc._run_live_site,
+                args=(site, self._routing(site), 1, {}, self._job(site)),
+            )
+            for site in ("cold-a", "cold-b", "cold-c")
+        ]
+        warm_job = self._job("warm")
+        warm_finished = threading.Event()
+
+        def run_warm():
+            gui_rpc._run_live_site(
+                "warm", self._routing("cached"), 1, {}, warm_job
+            )
+            warm_finished.set()
+
+        warm_thread = threading.Thread(target=run_warm)
+        try:
+            for thread in cold_threads:
+                thread.start()
+            assert slots_saturated.wait(timeout=1.0)
+            warm_thread.start()
+            completed_while_saturated = warm_finished.wait(timeout=1.0)
+            with lock:
+                calls_while_saturated = search_calls
+        finally:
+            release_scrapes.set()
+            for thread in cold_threads:
+                thread.join(timeout=2.0)
+            if warm_thread.ident is not None:
+                warm_thread.join(timeout=2.0)
+
+        assert completed_while_saturated
+        assert calls_while_saturated == 3
+        assert max_active == gui_rpc._LIVE_FETCH_CONCURRENCY == 3
+        assert warm_job["done"] is True
+        assert warm_job["vendors"]["warm"]["status"] == "done"
+        assert [item["id"] for item in warm_job["results"]] == [warm_record["part_id"]]
 
     def test_vendor_failure_is_attributed_and_marked_error(self, monkeypatch):
         from services import parts

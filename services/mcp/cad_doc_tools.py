@@ -16,11 +16,13 @@ import re
 from .cad_common import (
     _CUR,
     _DOC_ALIASES,
+    _PROCESS_DOCS,
     _JOBS,
     _JOB_LOCK,
     _DURABLE_JOB_PREFIX,
     _LAST_DELIVER_REV,
     _LAST_VOLUME,
+    _TOUCHED_DOCS,
     _SID_RE,
     _autosave,
     _default_deliverable_path,
@@ -7757,6 +7759,13 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
                                    f"to deliver it, or close_part(discard=True) to drop it",
                     })
             r = cb.call("doc_close", {"doc_id": d})
+            # A completed close (including daemon detach while another client keeps the
+            # document alive) ends this process's ownership. Drop every per-doc cache now;
+            # the unsaved-changes refusal above returns before reaching this point.
+            _LAST_VOLUME.pop(d, None)
+            _PROCESS_DOCS.discard(d)
+            if d in _TOUCHED_DOCS:
+                _TOUCHED_DOCS.remove(d)
             if r.get("detached"):
                 # Another client is editing it: our view detached, the doc lives on.
                 _unpublish(d)

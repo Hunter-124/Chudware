@@ -91,6 +91,43 @@ def test_parse_specs_from_name() -> None:
     assert parts_library.parse_specs_from_name("flat_washer") == {}
 
 
+def test_scan_batches_index_persistence_and_hub_rebuild(tmp_path, monkeypatch) -> None:
+    _isolate_registry(tmp_path)
+    lib = tmp_path / "lib"
+    lib.mkdir()
+    for name in ("Bracket-A.step", "Bracket-B.step", "Bracket-C.step"):
+        (lib / name).write_text(_STEP, encoding="utf-8")
+
+    loads: list[int] = []
+    writes: list[int] = []
+    rebuilds: list[int] = []
+    load_index = vendor_parts._load_index
+    write_index = vendor_parts._write_index
+
+    def _load() -> dict[str, dict]:
+        loads.append(1)
+        return load_index()
+
+    def _write(index: dict[str, dict]) -> None:
+        writes.append(1)
+        write_index(index)
+
+    monkeypatch.setattr(vendor_parts, "_load_index", _load)
+    monkeypatch.setattr(vendor_parts, "_write_index", _write)
+    import services.parts as ph
+    monkeypatch.setattr(ph, "rebuild_index", lambda: rebuilds.append(1))
+
+    result = parts_library.scan_library_folder(str(lib))
+
+    assert result["scanned"] == 3
+    assert result["added"] == 3
+    assert [part["part_number"] for part in result["parts"]] == [
+        "Bracket-A", "Bracket-B", "Bracket-C"]
+    assert loads == [1], "a scan must read the vendor index once"
+    assert writes == [1], "a scan must persist the vendor index once"
+    assert rebuilds == [1], "a multi-file scan must rebuild PartsHub exactly once"
+
+
 def test_scanned_step_is_searchable_via_parts_hub(tmp_path, monkeypatch) -> None:
     """A dropped local STEP becomes searchable by title/part-number after scan,
     and part_place routes it as import_file (editable)."""

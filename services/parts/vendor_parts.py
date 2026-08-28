@@ -17,6 +17,7 @@ import json
 import os
 import re
 import shutil
+import tempfile
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -77,7 +78,21 @@ def _load_index() -> dict[str, dict]:
 
 def _write_index(data: dict[str, dict]) -> None:
     INDEX.parent.mkdir(parents=True, exist_ok=True)
-    INDEX.write_text(json.dumps(data, indent=2, sort_keys=True), encoding="utf-8")
+    payload = json.dumps(data, indent=2, sort_keys=True)
+    tmp: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            "w", encoding="utf-8", dir=INDEX.parent,
+            prefix=f".{INDEX.name}.", suffix=".tmp", delete=False,
+        ) as handle:
+            tmp = Path(handle.name)
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, INDEX)
+    finally:
+        if tmp is not None:
+            tmp.unlink(missing_ok=True)
 
 
 def _detect_format(path: Path) -> str:
@@ -91,10 +106,11 @@ def _part_dir(part: VendorPart) -> Path:
     return paths.VENDOR_PARTS / slug(part.supplier) / slug(part.part_number)
 
 
-def register_local_cad(*, supplier: str, part_number: str, cad_path: str,
+def _prepare_local_cad(*, supplier: str, part_number: str, cad_path: str,
                        description: str = "", product_url: str = "",
                        specs: dict | None = None, source: str = "manual",
-                       copy_file: bool = True, source_mtime: float | None = None) -> dict:
+                       copy_file: bool = True,
+                       source_mtime: float | None = None) -> tuple[str, dict]:
     if not part_number:
         raise ValueError("part_number is required")
     src = Path(os.path.expandvars(os.path.expanduser(cad_path))).resolve()
@@ -113,18 +129,52 @@ def register_local_cad(*, supplier: str, part_number: str, cad_path: str,
         part.cad_path = str(dest)
     else:
         part.cad_path = str(src)
+    return part.key, asdict(part)
 
-    rec = asdict(part)
-    idx = _load_index()
-    idx[part.key] = rec
-    _write_index(idx)
-    # Keep PartsHub FTS in sync so part_search finds freshly registered files.
+
+def _rebuild_parts_index() -> None:
+    """Best-effort PartsHub refresh after the vendor index is durable."""
     try:
         from services.parts import rebuild_index as _rebuild  # noqa: PLC0415
         _rebuild()
     except Exception:  # noqa: BLE001 — hub optional in pure-metadata contexts
         pass
-    return rec
+
+
+def register_local_cads(registrations: list[dict[str, Any]], *,
+                        index: dict[str, dict] | None = None) -> list[dict]:
+    """Register a batch with one vendor-index write and one PartsHub rebuild.
+
+    ``index`` may supply an already-loaded registry snapshot so a scanner can use the same
+    read for change detection and registration. Records are fully prepared before the snapshot
+    is changed, and the snapshot is atomically replaced before the best-effort hub refresh.
+    """
+    if not registrations:
+        return []
+    prepared = [_prepare_local_cad(**registration) for registration in registrations]
+    current = _load_index() if index is None else index
+    for key, rec in prepared:
+        current[key] = rec
+    _write_index(current)
+    _rebuild_parts_index()
+    return [rec for _, rec in prepared]
+
+
+def register_local_cad(*, supplier: str, part_number: str, cad_path: str,
+                       description: str = "", product_url: str = "",
+                       specs: dict | None = None, source: str = "manual",
+                       copy_file: bool = True, source_mtime: float | None = None) -> dict:
+    return register_local_cads([{
+        "supplier": supplier,
+        "part_number": part_number,
+        "cad_path": cad_path,
+        "description": description,
+        "product_url": product_url,
+        "specs": specs,
+        "source": source,
+        "copy_file": copy_file,
+        "source_mtime": source_mtime,
+    }])[0]
 
 
 def list_parts(supplier: str | None = None, query: str | None = None) -> list[dict]:

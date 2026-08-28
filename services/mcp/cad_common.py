@@ -546,8 +546,8 @@ def _sole_doc_is_adoptable(entry: dict) -> bool:
         later handed to somebody else. Covers a sub-agent's part after `doc_scope()` put
         `_CUR` back, and our own part after a `close_part` of a different doc cleared it.
         (`_TOUCHED_DOCS` is deliberately NOT consulted: `note_touched_doc` feeds
-        `_PROCESS_DOCS` too, and that list is never pruned because the terminal save sweep
-        needs its full history — exactly the staleness this decision must not inherit.)
+        `_PROCESS_DOCS` too, while the terminal save sweep keeps touched history until a
+        successful close explicitly evicts the document.)
       * `origin_kind` "gui" (the human's own part in the viewport), "test", "unknown", or absent
         — acting on the part the user is actually looking at is the whole point of the adopt.
 
@@ -1620,7 +1620,7 @@ def note_touched_doc(doc_id: Optional[str]) -> None:
     """Record a doc this process created or resumed, for the terminal sweep.
 
     A list, not a set: order is the order the run built them, which is the order the
-    sweep reports and the order a human reads. Cheap — a turn touches a handful.
+    sweep reports and the order a human reads. Successful close evicts the document.
     """
     claim_process_doc(doc_id)   # creating/resuming a doc is also a cross-process claim on it
     if doc_id and doc_id not in _TOUCHED_DOCS:

@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstddef>
 #include <cstdio>
 #include <limits>
 #include <map>
@@ -367,44 +368,76 @@ bool same_net(const json& a, const json& b) {
 
 namespace {
 
-// net-class of a net name (drc.py::_net_class_of) -> the class string, or null.
-json net_class_of(const json& board, const json& net) {
-    if (board.contains("nets") && board["nets"].is_array()) {
+// Net-class rules for one DRC invocation. drc.py::_net_class_of rescans
+// board["nets"] on every query, and the clearance, zone, track-width and via
+// checks query it per copper item (per item PAIR for clearance), so the scan was
+// an extra O(nets) factor on those rules. Index the nets array once instead.
+// Keeps a pointer into `board`, so it must not outlive the board it was built from.
+class NetRules {
+  public:
+    explicit NetRules(const json& board) {
+        if (board.contains("rules") && board["rules"].is_object())
+            global_clearance_ = getf(board["rules"].contains("clearance")
+                                         ? board["rules"]["clearance"]
+                                         : json(0.0));
+        if (board.contains("net_classes") && board["net_classes"].is_object())
+            net_classes_ = &board["net_classes"];
+        if (!board.contains("nets") || !board["nets"].is_array()) return;
         for (const auto& n : board["nets"]) {
-            if (n.is_object() && n.contains("name") && n["name"] == net)
-                return n.contains("class") ? n["class"] : json(nullptr);
+            if (!n.is_object() || !n.contains("name")) continue;
+            json cls = n.contains("class") ? n["class"] : json(nullptr);
+            const json& name = n["name"];
+            // First entry for a name wins, exactly as the linear scan did. A
+            // non-string name can only ever match a non-string query, so those
+            // stay in a side list rather than forcing a json-keyed map.
+            if (name.is_string())
+                by_name_.emplace(name.get_ref<const std::string&>(), std::move(cls));
+            else
+                by_other_name_.emplace_back(name, std::move(cls));
         }
     }
-    return json(nullptr);
-}
 
-double clearance_for(const json& board, const Shape& a, const Shape& b) {
-    double g = 0.0;
-    if (board.contains("rules") && board["rules"].is_object())
-        g = getf(board["rules"].contains("clearance") ? board["rules"]["clearance"] : json(0.0));
-    json ca = net_class_of(board, a.net);
-    json cb = net_class_of(board, b.net);
-    if (!ca.is_null() && ca == cb && board.contains("net_classes") &&
-        board["net_classes"].is_object() && ca.is_string() &&
-        board["net_classes"].contains(ca.get<std::string>())) {
-        const json& nc = board["net_classes"][ca.get<std::string>()];
-        if (nc.is_object() && nc.contains("clearance"))
-            return std::max(getf(nc["clearance"]), 0.0);
+    // net-class of a net name (drc.py::_net_class_of) -> the class string, or null.
+    const json& class_of(const json& net) const {
+        static const json kNoClass;  // null
+        if (net.is_string()) {
+            const auto it = by_name_.find(net.get_ref<const std::string&>());
+            return it == by_name_.end() ? kNoClass : it->second;
+        }
+        for (const auto& [name, cls] : by_other_name_)
+            if (name == net) return cls;
+        return kNoClass;
     }
-    return g;
-}
 
-double net_class_minimum(const json& board, const json& net, const char* key,
-                         double global_minimum) {
-    const json cls = net_class_of(board, net);
-    if (!cls.is_string() || !board.contains("net_classes") ||
-        !board["net_classes"].is_object() ||
-        !board["net_classes"].contains(cls.get<std::string>()))
-        return global_minimum;
-    const json& nc = board["net_classes"][cls.get<std::string>()];
-    if (!nc.is_object() || !nc.contains(key)) return global_minimum;
-    return std::max(global_minimum, std::max(getf(nc[key]), 0.0));
-}
+    double clearance_between(const Shape& a, const Shape& b) const {
+        const json& ca = class_of(a.net);
+        if (!ca.is_string() || ca != class_of(b.net)) return global_clearance_;
+        const json* nc = net_class(ca.get_ref<const std::string&>());
+        if (nc && nc->contains("clearance")) return std::max(getf((*nc)["clearance"]), 0.0);
+        return global_clearance_;
+    }
+
+    double minimum(const json& net, const char* key, double global_minimum) const {
+        const json& cls = class_of(net);
+        if (!cls.is_string()) return global_minimum;
+        const json* nc = net_class(cls.get_ref<const std::string&>());
+        if (!nc || !nc->contains(key)) return global_minimum;
+        return std::max(global_minimum, std::max(getf((*nc)[key]), 0.0));
+    }
+
+  private:
+    const json* net_class(const std::string& name) const {
+        if (!net_classes_) return nullptr;
+        const auto it = net_classes_->find(name);
+        if (it == net_classes_->end() || !it->is_object()) return nullptr;
+        return &*it;
+    }
+
+    std::map<std::string, json> by_name_;
+    std::vector<std::pair<json, json>> by_other_name_;
+    const json* net_classes_ = nullptr;
+    double global_clearance_ = 0.0;
+};
 
 using PolygonEdge = std::pair<Point, Point>;
 
@@ -793,25 +826,37 @@ json ratsnest(const json& board) {
         // components of terminals keyed by UF root.
         std::map<std::string, std::vector<Terminal>> comp;
         for (const auto& r : terms) comp[uf.find("T:" + r.id)].push_back(r);
-        // reps sorted by min terminal id in each component.
+        // reps sorted by min terminal id in each component (memoized: the sort
+        // comparator used to rescan the component on every comparison).
         std::vector<std::string> reps;
-        for (auto& [root, cterms] : comp) reps.push_back(root);
-        auto min_id = [&](const std::string& root) {
-            std::string m = comp[root][0].id;
-            for (const auto& t : comp[root]) m = std::min(m, t.id);
-            return m;
-        };
-        std::sort(reps.begin(), reps.end(),
-                  [&](const std::string& a, const std::string& b) { return min_id(a) < min_id(b); });
+        std::map<std::string, std::string> min_id;
+        for (auto& [root, cterms] : comp) {
+            reps.push_back(root);
+            std::string m = cterms[0].id;
+            for (const auto& t : cterms) m = std::min(m, t.id);
+            min_id.emplace(root, std::move(m));
+        }
+        std::sort(reps.begin(), reps.end(), [&](const std::string& a, const std::string& b) {
+            return min_id.at(a) < min_id.at(b);
+        });
         if (reps.size() < 2) continue;
 
-        auto comp_dist = [&](const std::string& ca, const std::string& cb) {
+        // Components in rep order; a "rank" below is an index into this vector,
+        // so ascending rank IS the min-terminal-id order the old in_sorted /
+        // rem_sorted re-sorts produced every round.
+        std::vector<const std::vector<Terminal>*> comp_terms;
+        comp_terms.reserve(reps.size());
+        for (const auto& root : reps) comp_terms.push_back(&comp[root]);
+
+        // Closest terminal pair between two components; ties keep the first pair
+        // in row-major order over the (id-sorted) terminal lists.
+        auto closest_pair = [](const std::vector<Terminal>& a, const std::vector<Terminal>& b) {
             double best = std::numeric_limits<double>::infinity();
             const Terminal* bta = nullptr;
             const Terminal* btb = nullptr;
-            for (const auto& ta : comp[ca])
-                for (const auto& tb : comp[cb]) {
-                    double d = dist(ta.at, tb.at);
+            for (const auto& ta : a)
+                for (const auto& tb : b) {
+                    const double d = dist(ta.at, tb.at);
                     if (d < best) {
                         best = d;
                         bta = &ta;
@@ -821,36 +866,43 @@ json ratsnest(const json& board) {
             return std::make_tuple(best, bta, btb);
         };
 
-        // Prim from reps[0].
-        std::set<std::string> in_tree{reps[0]};
-        std::set<std::string> remaining(reps.begin() + 1, reps.end());
+        // Prim from reps[0]. Each remaining component caches its best edge to the
+        // tree, so a round only measures the component just added instead of
+        // re-sorting both sides and recomputing the whole cross product. The cached
+        // key is (distance, from-rank) and the round's winner is the smallest
+        // (distance, from-rank, to-rank) — byte-for-byte the pair the row-major
+        // full recomputation picked, since it scanned from-ranks outermost and
+        // replaced only on a strictly smaller distance.
+        struct Candidate {
+            double d = std::numeric_limits<double>::infinity();
+            size_t from = 0;
+            const Terminal* ta = nullptr;
+            const Terminal* tb = nullptr;
+        };
+        std::vector<Candidate> best(reps.size());
+        std::vector<size_t> remaining(reps.size() - 1);
+        for (size_t i = 0; i < remaining.size(); ++i) remaining[i] = i + 1;
+        size_t added = 0;  // rank of the component most recently joined to the tree
         while (!remaining.empty()) {
-            std::vector<std::string> in_sorted(in_tree.begin(), in_tree.end());
-            std::sort(in_sorted.begin(), in_sorted.end(),
-                      [&](const std::string& a, const std::string& b) { return min_id(a) < min_id(b); });
-            std::vector<std::string> rem_sorted(remaining.begin(), remaining.end());
-            std::sort(rem_sorted.begin(), rem_sorted.end(),
-                      [&](const std::string& a, const std::string& b) { return min_id(a) < min_id(b); });
-            double best = std::numeric_limits<double>::infinity();
-            std::string best_to;
-            const Terminal* bta = nullptr;
-            const Terminal* btb = nullptr;
-            for (const auto& fr : in_sorted) {
-                for (const auto& to : rem_sorted) {
-                    auto [d, ta, tb] = comp_dist(fr, to);
-                    if (d < best) {
-                        best = d;
-                        best_to = to;
-                        bta = ta;
-                        btb = tb;
-                    }
-                }
+            for (const size_t to : remaining) {
+                const auto [d, ta, tb] = closest_pair(*comp_terms[added], *comp_terms[to]);
+                Candidate& cached = best[to];
+                if (d < cached.d || (d == cached.d && added < cached.from))
+                    cached = {d, added, ta, tb};
             }
+            size_t pick = 0;
+            for (size_t i = 1; i < remaining.size(); ++i) {
+                const Candidate& c = best[remaining[i]];
+                const Candidate& b = best[remaining[pick]];
+                if (c.d < b.d || (c.d == b.d && c.from < b.from)) pick = i;
+            }
+            const Candidate& edge = best[remaining[pick]];
+            if (edge.ta == nullptr) break;  // non-finite terminal coordinates
             out.push_back(json{{"net", net},
-                               {"p1", json::array({bta->at.first, bta->at.second})},
-                               {"p2", json::array({btb->at.first, btb->at.second})}});
-            in_tree.insert(best_to);
-            remaining.erase(best_to);
+                               {"p1", json::array({edge.ta->at.first, edge.ta->at.second})},
+                               {"p2", json::array({edge.tb->at.first, edge.tb->at.second})}});
+            added = remaining[pick];
+            remaining.erase(remaining.begin() + static_cast<std::ptrdiff_t>(pick));
         }
     }
 
@@ -877,6 +929,9 @@ json run_drc(const json& board) {
 
     std::vector<Shape> shapes = copper_shapes(board);
 
+    // One net-class index for the whole run; every rule below shares it.
+    const NetRules net_rules(board);
+
     // clearance
     std::set<std::tuple<std::string, std::string, std::string>> reported_clearance_pairs;
     for (size_t i = 0; i < shapes.size(); ++i) {
@@ -885,7 +940,7 @@ json run_drc(const json& board) {
             const Shape& b = shapes[k];
             if (same_net(a.net, b.net)) continue;
             if (!shared_layer(a, b)) continue;
-            double req = clearance_for(board, a, b);
+            double req = net_rules.clearance_between(a, b);
             double d = edge_distance(a, b);
             if (d < req - kEps) {
                 std::set<std::string> common;
@@ -918,7 +973,7 @@ json run_drc(const json& board) {
             if (same_net(polygon.net, shape.net) || !shape.layers.count(polygon.layer))
                 continue;
             const double required =
-                std::max(polygon.clearance, clearance_for(board, zone_shape, shape));
+                std::max(polygon.clearance, net_rules.clearance_between(zone_shape, shape));
             const double distance = polygon_shape_distance(polygon, shape);
             if (distance >= required - kEps || reported_items.count(shape.item_id)) continue;
             reported_items.insert(shape.item_id);
@@ -943,7 +998,7 @@ json run_drc(const json& board) {
             const Shape b_shape = zone_metadata_shape(b);
             const double required =
                 std::max(std::max(a.clearance, b.clearance),
-                         clearance_for(board, a_shape, b_shape));
+                         net_rules.clearance_between(a_shape, b_shape));
             const double distance = polygon_polygon_distance(a, b);
             if (distance >= required - kEps) continue;
             const std::string message =
@@ -1008,7 +1063,7 @@ json run_drc(const json& board) {
         for (const auto& t : board["tracks"]) {
             double w = getf(t.contains("width") ? t["width"] : json(0.0));
             const json net = t.contains("net") ? t["net"] : json(nullptr);
-            const double effective_min = net_class_minimum(board, net, "track_width", tw_min);
+            const double effective_min = net_rules.minimum(net, "track_width", tw_min);
             if (w < effective_min - kEps) {
                 Point p1{0, 0}, p2{0, 0};
                 if (t.contains("p1") && t["p1"].is_array())
@@ -1039,9 +1094,9 @@ json run_drc(const json& board) {
             std::string vid = v.value("id", std::string());
             const json net = v.contains("net") ? v["net"] : json(nullptr);
             const double effective_dia_min =
-                net_class_minimum(board, net, "via_diameter", dia_min);
+                net_rules.minimum(net, "via_diameter", dia_min);
             const double effective_drill_min =
-                net_class_minimum(board, net, "via_drill", drill_min);
+                net_rules.minimum(net, "via_drill", drill_min);
             if (dia < effective_dia_min - kEps) {
                 out.push_back(make_violation(
                     "via_size", "error", {{at.first, at.second, "F.Cu"}}, {vid},

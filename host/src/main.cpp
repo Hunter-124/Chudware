@@ -546,20 +546,28 @@ int main(int argc, char** argv) {
         const auto root = chudware::security::installedPayloadRoot(executable);
         const auto verified = chudware::security::verifyPayloadManifest(
             root, argv[2], argv[3], chudware::security::VerifyMode::Full, executable);
+        // Every early exit below takes the hard-exit tail `--version` documents: a
+        // namespace-scope static spawns a DETACHED worker parked on a condition
+        // variable, so `return` deadlocks in global destruction. Measured: a
+        // production binary whose manifest is missing printed this refusal and then
+        // hung forever instead of exiting.
         if (!verified.ok) {
             std::fprintf(stderr, "chudware: payload integrity failed (%s): %s\n",
                          chudware::security::integrityReasonName(verified.reason),
                          verified.detail.c_str());
-            return chudware::security::kIntegrityFailureExitCode;
+            std::fflush(nullptr);
+            std::_Exit(chudware::security::kIntegrityFailureExitCode);
         }
-        return 0;
+        std::fflush(nullptr);
+        std::_Exit(0);
     }
 #ifdef _WIN32
     {
         std::string recoveryError;
         if (!chudware::update::recoverPendingWindowsUpdate(executable, &recoveryError)) {
             std::fprintf(stderr, "chudware: update recovery failed: %s\n", recoveryError.c_str());
-            return 79;
+            std::fflush(nullptr);
+            std::_Exit(79);
         }
     }
 #endif
@@ -570,7 +578,8 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "chudware: installed payload integrity failed (%s): %s\n",
                          chudware::security::integrityReasonName(verified.reason),
                          verified.detail.c_str());
-            return chudware::security::kIntegrityFailureExitCode;
+            std::fflush(nullptr);
+            std::_Exit(chudware::security::kIntegrityFailureExitCode);
         }
     }
     // `chudware --version` — first thing checked, before CEF stashes argv and long

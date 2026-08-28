@@ -18,7 +18,7 @@ Lead-time risk: API approvals for Nexar, Digi-Key, Mouser, Xometry, JLCPCB, and 
 
 ## Files / areas touched
 
-- `engine_oracle/vendor_parts.py` — VendorPart schema, will gain price fields once keys arrive
+- `services/parts/vendor_parts.py` — VendorPart schema, will gain price fields once keys arrive
 - `contracts/sourcing_schema.md` — will be frozen on T-B1a
 - Environment / secrets store (`.env` / OS keychain) — store keys outside repo
 
@@ -31,14 +31,14 @@ Lead-time risk: API approvals for Nexar, Digi-Key, Mouser, Xometry, JLCPCB, and 
 5. Create JLCPCB account; apply for developer API (jlcpcb.com/api).
 6. Contact McMaster-Carr eProcurement team for API / EDI approval (haedmonds69@gmail.com as contact).
 7. Store approved keys in `.env` (gitignored) under names `NEXAR_CLIENT_ID`, `NEXAR_CLIENT_SECRET`, `DIGIKEY_CLIENT_ID`, `DIGIKEY_CLIENT_SECRET`, `MOUSER_API_KEY`, `XOMETRY_API_KEY`, `JLCPCB_API_KEY`.
-8. Verify each key works with a minimal test call; record status in a comment in `engine_oracle/vendor_parts.py`.
+8. Verify each key works with a minimal test call; record status in a comment in `services/parts/vendor_parts.py`.
 
 ## Definition of done
 
 - [ ] Applications submitted for all six providers (Nexar, Digi-Key, Mouser, Xometry, JLCPCB, McMaster)
 - [x] At least Nexar key is active and a test GraphQL query returns part data
 - [x] Keys stored in `.env`, `.env` is in `.gitignore`
-- [ ] Status of each application noted (pending / active) in a comment block at top of `engine_oracle/vendor_parts.py`
+- [ ] Status of each application noted (pending / active) in a comment block at top of `services/parts/vendor_parts.py`
 
 ## Status (2026-07-03)
 
@@ -51,23 +51,16 @@ Only two of six keys obtained so far — Digi-Key, Mouser, Xometry, McMaster sti
   in this repo auto-loads it). Ran `NexarProvider().fetch("NE555P")` against the real
   API and got live pricing/stock back.
   - **Real bug found+fixed while verifying:** the `supSearchMpn` GraphQL query asked
-    for a `datasheetUrl` field that no longer exists on Nexar's `SupPart` type (schema
-    drift since T-B1b) — every `fetch()` call was silently swallowing the GraphQL error
-    and returning "no supply results" instead of real data. Introspected the live schema,
-    found the field moved to `bestDatasheet { url }`, fixed the query + mapper in
-    `engine_oracle/parts_providers.py`, updated the mocked test fixture in
-    `test_parts_providers.py` (`datasheetUrl` → `bestDatasheet.url`). 17/17 tests pass.
-- **JLCPCB: keys held, NOT wired.** Got an `accesskey`/`secretkey` pair (JLCPCB's real
-  Open API auth model — signed requests, not a static bearer token). But
-  `engine_oracle/quote_providers.py::JLCPCBProvider` only supports a single static
-  bearer token (`JLCPCB_KEY` / `quote_providers.jlcpcb.api_key`) — a scaffold-era
-  assumption that doesn't match the real API. Raw keys recorded in `.env` (see comment
-  there); needs a small follow-up task to rework `JLCPCBProvider`'s auth flow before
-  these can be used. Not attempted blind — didn't want to guess-implement a signing
-  scheme without the real API docs in hand.
+    for a `datasheetUrl` field that no longer exists on Nexar's `SupPart` type. The
+    live query and mapper in `core/sourcing/providers.cpp` use
+    `bestDatasheet { url }`; `core/tests/test_sourcing.cpp` carries the matching fixture.
+- **JLCPCB: keys held; signing wired, live smoke pending.** The live
+  `core/sourcing/quote.cpp` path uses JLCPCB's signed-request credential triple
+  (`appid`/`accesskey`/`secretkey`) and rejects the retired static bearer form. The
+  remaining credentialed end-to-end smoke is tracked by T-BL24.
 
 ## AI hints
 
 - `graphify query "vendor parts provider interface"` to see current VendorPart schema
-- Relevant file: `engine_oracle/vendor_parts.py` — check existing provider pattern before adding new ones
+- Relevant file: `services/parts/vendor_parts.py` — check the existing VendorPart pattern before adding new fields
 - Nexar GraphQL playground: https://nexar.com/api (free tier, no credit card)

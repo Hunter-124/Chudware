@@ -13,17 +13,19 @@ priority: 4
 
 ## Context
 
-Two unassigned GUI-polish ideas from `docs/HANDOFF_GUI_OVERHAUL.md` §5 (items 11-12),
-parked so they aren't lost. Implement against the NEW tree (`ui/imgui` theme) once the
-migration waves (T-G5..T-G9) own that surface — don't add them to host/.
+Two unassigned GUI-polish ideas, parked so they are not lost. Implement them in the sole
+GUI tree: theme/glass and adaptive-surface logic live in `host/src/ui_theme.cpp` and
+`host/src/ui_theme.h`; overlay layout lives in `host/src/ui/layout.cpp` and
+`host/src/ui/layout.h`; Appearance controls live in `host/src/ui/settings_modal.cpp`.
 
 1. **Per-document glass accent** — tint each doc tab's pill + its bubbles' accent from a
    per-document hue so multi-doc sessions read at a glance. The per-group style API
    already supports it; needs a per-doc hue field + an Appearance toggle.
-2. **Luminance-variance scrim boost** — `adaptiveSurface` uses mean luminance; busy
-   high-contrast backdrops (FEA fringes) still fight text. Add variance sampling to
-   auto-raise scrim alpha (check first whether the core agent already shipped it:
-   grep `variance` in the theme implementation).
+2. **Luminance-variance scrim boost** — `adaptivePanel` already samples mean luminance
+   and can consume `BackdropStats::variance` when dynamic color is enabled. Make the
+   busy-backdrop scrim boost an explicit Appearance behavior so high-contrast backdrops
+   (FEA fringes) do not fight text; extend the existing stats bridge rather than adding
+   a second sampler.
 
 ## Definition of done
 

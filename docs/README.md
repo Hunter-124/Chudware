@@ -22,7 +22,8 @@ The following documents live at the repository root and are registered as projec
 - `README.md` — project overview
 - `AGENTS.md` — agent system contract
 - `ARCHITECTURE.md` — system architecture
-- `OMP_INTEGRATION_PLAN.md` — OpenMinded integration plan
+- `omp-integration/` — OMP integration decisions, options and research (`01-DECISIONS.md`
+  carries the frozen RPC contract)
 - `CONTRIBUTING.md` — contributor guide
 - `CLAUDE.md` — Claude-specific instructions
 

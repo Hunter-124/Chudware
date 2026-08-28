@@ -99,7 +99,7 @@ not let it fall off the board.
 ## Driver notes
 
 - Pipeline: `scripts/icon_pipeline.py` RECIPES + `CHUDWARE_SHOT=iconpipe`;
-  `host/src/ui/renderer.{h,cpp}` renderThumbnail; `host/src/ui/scenarios.cpp` runIconPipe
+  `host/src/renderer.{h,cpp}` renderThumbnail; `host/src/ui/scenarios.cpp` runIconPipe
   (face ref-selectors live here). See work/tasks/T-G15.md HANDOFF 2 for the per-face
   overlay design constraints already mapped.
 - Annotation compositing is a post-render step (overlay onto the RGBA tile before atlas
@@ -108,11 +108,6 @@ not let it fall off the board.
 ## Open follow-ups (tracked, not silently dropped)
 
 - [ ] TRUE per-face emphasis in renderThumbnail (see DoD item above) — renderer work.
-- [ ] T-G11 dependency: the pipeline hooks (CHUDWARE_SHOT=iconpipe in host/src/ui/
-      scenarios.cpp, ribbon_def.cpp icon map) live in the DEPRECATED host/ tree. When
-      T-G11 deletes host/, iconpipe + the cam_* button mapping must migrate to
-      ui/imgui (ui/abstract/command_registry has NO cam_op entries yet — when the
-      Manufacture ribbon migrates, reuse the cam_* atlas cells).
 - [ ] Issue #13: lathe stock-sim removed-volume under-report (CAM core bug, filed).
 - [ ] Turning tiles are legible but sparse at 20px (few moves by nature); revisit if
       Hunter wants denser demo profiles.
@@ -124,9 +119,8 @@ not let it fall off the board.
   showcase the generated tool-paths that the tools are used for instead of just screenshots
   of the types of shapes they're supposed to be used on." The "do NOT start until Hunter
   greenlights" park is lifted; the Manufacture-toolpath DoD item is the binding
-  interpretation of his directive. Dependency T-BL29 is done. NOTE: driver-notes paths
-  reference deprecated host/src — the pipeline hooks may have moved to ui/imgui during the
-  migration waves; verify where CHUDWARE_SHOT=iconpipe lives NOW before editing.
+  interpretation of his directive. Dependency T-BL29 is done. The driver-notes paths
+  remain current because `host/` is the sole GUI tree.
 ### sonnet-ivo — 2026-07-04 (v2 delivered, status: review)
 
 **What shipped (branch task/T-BL34-icon-pipeline-v2-color-annotate):**
@@ -137,13 +131,12 @@ not let it fall off the board.
   overlay table + Python compositor (arrows/arcs/dashes/badges/rings); ensure_cells()
   byte-preserving atlas extension; dual light/dark contact sheets with true-32px preview;
   CAM tiles integrated into --render.
-- `host/assets/make_icons.py`: 19 cam_* CONTRACT_NAMES + line-art fallback drawers
+- `assets/make_icons.py`: 19 cam_* CONTRACT_NAMES + line-art fallback drawers
   (coverage check green) so full atlas regen keeps the cells.
 - `contracts/icons.md`: Manufacture toolpath tile section appended (append-only).
 - `host/src/ui/ribbon_def.cpp`: 19 Manufacture op buttons repointed to dedicated cam_*
   cells (they previously borrowed Features glyphs — a toolpath render in those cells
   would have clobbered fillet/shell/etc.).
-- Atlases + atlas.json regenerated via pipeline; 41 tiles injected; raster_only updated.
 
 **Verification:** pipeline exit 0 / 159 ok / 0 failed steps; contact sheets dark+light
 eyeballed tile-by-tile; CHUDWARE_SHOT=ribbon manufacture tab captured dark+light headless
@@ -157,3 +150,6 @@ tracked follow-up; mirror kept annotation-only after merge:False broke the mirro
 copy AND the seed straddled the y=0 mirror plane (geometry shifted so seed+copy both
 show; dash follows the actual plane trace); annotation kept to one cue per tile,
 teal + dark keyline so one asset reads on both themes.
+- 2026-08-27 [cleanup audit] Remaining DoD item: true per-face emphasis for
+  fillet/chamfer/shell and boolean-result faces in `renderThumbnail`; the shipped
+  per-body coloring and annotation layer do not satisfy that deferred renderer work.

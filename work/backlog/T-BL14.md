@@ -14,8 +14,7 @@ deferred: yes
 
 ## Context
 
-Follow-ups from the AI-experience lane (`docs/HANDOFF_GUI_OVERHAUL.md` §5 items 8-9),
-parked so they aren't lost:
+Deferred follow-ups from the AI-experience lane, parked so they are not lost:
 
 1. **GNN adapter training** — `docs/RECOGNITION_RESIDUAL.md` gave a GO verdict for
    exactly three families (ribbed_bracket, shelled_enclosure, swept_pipe); deterministic

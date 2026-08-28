@@ -21,13 +21,13 @@ Assigned to **mooseinatree** (human) — has the competitor CAD software (NX/Sol
 CATIA/Inventor/Altium) and a reverse-engineering setup on Windows to actually produce
 the format specs/samples this task consumes. Division of labor: mooseinatree reverses
 each format and lands the clean-room protocol memo + sample files; an agent driver can
-then be dispatched per-format to write the `engine/doc/formats.py` importer + fixture
-round-trip tests once a spec/sample is available. Don't claim this whole task via the
-normal agent auto-claim path — coordinate with mooseinatree on which format is ready.
+then be dispatched per-format to add the importer in `core/doc/formats.cpp` plus
+fixture round-trip tests once a spec/sample is available. Don't claim this whole task
+via the normal agent auto-claim path — coordinate with mooseinatree on which format is ready.
 
 ## Definition of done
 
-- [ ] Each format lands as an engine/doc/formats.py importer with fixture round-trip tests
+- [ ] Each remaining format lands in `core/doc/formats.cpp` with fixture round-trip tests
 - [ ] Clean-room protocol memo followed for every reversed format
 - [ ] ODA membership decision recorded for DWG/Revit
 
@@ -36,24 +36,22 @@ normal agent auto-claim path — coordinate with mooseinatree on which format is
 ### 2026-07-03 — mooseinatree (Opus driver, isolated Windows checkout)
 
 Picking up the greenlit no-reversing slice: **DXF import via ezdxf (MIT)**. Status:
-- `.3dm` (rhino3dm, MIT) importer/exporter already exists in engine/doc/formats.py at
-  the mesh level (NURBS/Brep-only .3dm still skip — rhino3dm has no mesher; documented).
-- `.dxf` is entirely absent (no ext map, no FormatInfo, no importer) → building it now:
-  `engine_oracle/doc/formats_dxf.py` (new module, mirrors formats_solidworks.py),
-  wired into the registry + import_path; ezdxf → build123d edges → wires → faces where
-  closed → Compound. Import-only for now (2D→DXF export deferred; stated honestly).
+- `.3dm` mesh import/export and DXF/DWG import now live in `core/doc/formats.cpp`.
+- `.dxf` was absent when this slice began; its live C++ importer now handles the
+  clean-room entity subset and assembles OCCT edges, wires, and faces. It remains
+  import-only (2D-to-DXF export is still deferred).
 
-**Environment note (this Windows checkout only, local/non-committed):** the top-level
-`engine`, `services.mcp`, `dag`, `deliverables`, `agent`, `installer`, `app`, `corpus*`,
-`corpora/sw_fixtures` names are git symlinks (mode 120000, e.g. `engine → engine_oracle`)
-that got materialized as real directory copies because core.symlinks=false on Windows.
-Git reported all 11 as "deleted", which tripped `work.py claim`'s dirty-tree guard
-(BUSY on every claim). Remedy applied: `git update-index --skip-worktree` on those 11
-paths — local-only, reversible (`--no-skip-worktree`), does NOT change committed content
-or the Linux symlink layout. Canonical edits go in the tracked tree (`engine_oracle/`);
-the runtime `engine/` copy is kept in sync for pytest (Python imports resolve to `engine/`).
-- 2026-07-04 00:53 UTC [mooseinatree] DXF import slice complete + pushed on branch task/T-BL02-format-interop (merge-ready). ezdxf (MIT) -> engine/doc/formats_dxf.py: LINE/CIRCLE/ARC/LWPOLYLINE(bulge)/POLYLINE/ELLIPSE/SPLINE/INSERT -> build123d planar B-rep (closed wires -> Faces, open -> wires), wired into import_path + FORMAT_REGISTRY (.dxf, import-only) + doc_formats matrix. 8 round-trip tests pass (python -m pytest engine/doc/test_formats_dxf.py). requirements.txt + contracts/licenses.md updated (ezdxf MIT, no debt). scripts/check.py stdlib gate PASS; core-build/ctest/full-pytest need Linux env (SKIP on this Windows box) - foreman Linux merge pass to run full gate.sh. ORACLE SIDE ONLY: GUI/MCP import runs in the C++ core (core/doc/formats.cpp, no DXF reader yet) -> follow-up T-BL47 cut for the bit-identical C++ mirror; import_part MCP docstring intentionally left unchanged until the core can import DXF. T-BL02 remains the ongoing interop umbrella (reopen after merge for next format: Parasolid/CATIA/etc.).
-- 2026-07-04 02:25 UTC [mooseinatree] Added DWG import + folded in clean-room format reference docs (branch task/T-BL02-format-interop, pushed). DWG: engine/doc/formats_dwg.py converts DWG->DXF via an external user-provided converter (ODA File Converter through ezdxf.addons.odafc, or LibreDWG dwg2dxf on PATH; subprocess-only, never bundled) then reuses the DXF pipeline (refactored formats_dxf.bodies_from_doc for sharing). Import-only; wired into import_path + FORMAT_REGISTRY + doc_formats. 5 DWG tests (12 pass incl. DXF, 1 skipped real-roundtrip needs a converter). licenses.md rows added (ODA FC proprietary + LibreDWG GPL, both subprocess-only). Reference docs: docs/reference/ (file-format survey, Db/Ge/Gi/Gs data model, build guidance) adapted clean-room from public-spec sources, cross-linked to formats.py/T-BL02/licenses.md. Still oracle-side (C++ core mirror = T-BL47 covers DXF; DWG would follow the same converter->DXF path there).
+**Historical environment note:** the 2026-07-03 Windows checkout materialized the old
+Python-oracle symlinks as directories because `core.symlinks=false`. That tree and its
+symlinks were retired on 2026-07-23; canonical format work now lives in
+`core/doc/formats.cpp`.
+- 2026-07-04 00:53 UTC [mooseinatree] DXF import slice completed in the former Python
+  oracle, then ported to `core/doc/formats.cpp` by T-BL47. The live C++ importer covers
+  LINE/CIRCLE/ARC/LWPOLYLINE/POLYLINE/ELLIPSE/SPLINE as OCCT edges, wires, and faces.
+  T-BL02 remains the ongoing interop umbrella for Parasolid/CATIA V5/Inventor/Altium.
+- 2026-07-04 02:25 UTC [mooseinatree] DWG import and clean-room reference docs landed.
+  The live implementation is in `core/doc/formats.cpp`: an external user-provided
+  LibreDWG converter produces DXF, then the DXF importer handles it in-process.
 - 2026-08-04 [audit] DXF/DWG/.3dm shipped and were ported to C++ (core/doc/formats.cpp);
   Parasolid/CATIA V5/Inventor/Altium and the ODA membership decision remain untouched;
   last prior activity 2026-07-04.

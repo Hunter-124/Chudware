@@ -1138,7 +1138,7 @@ static void drawSubscriptionAccounts(AppState& st, float sc) {
 
 // ---- OMP provider manager (Settings → Providers) — S-UI-PROV ----------------------
 // Two-pane provider sign-in/manager per docs/omp-integration/research/design-provider-signin-ui.md
-// §3.1, driven by the frozen libchudware C-ABI methods (OMP_INTEGRATION_PLAN.md RPC CONTRACT),
+// §3.1, driven by the frozen libchudware C-ABI methods (docs/omp-integration/01-DECISIONS.md §Stable RPC quick reference),
 // which proxy the bun bridge auth_*/models_list methods. The UI holds no auth truth — it
 // renders the last agent_provider_list/agent_provider_state response and re-polls on open +
 // short TTL (mirrors drawSubscriptionAccounts above). Degrade: unknown_method (sibling slice

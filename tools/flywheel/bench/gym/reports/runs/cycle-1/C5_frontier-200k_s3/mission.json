@@ -1,9 +1,0 @@
-{
-  "status": "running",
-  "phase": "plan",
-  "phases_completed": [
-    "intake"
-  ],
-  "findings": [],
-  "stop_reason": ""
-}

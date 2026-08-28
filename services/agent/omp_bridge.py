@@ -1,6 +1,6 @@
 """Python client for the OMP (oh-my-pi) bridge — the newline-delimited JSON-RPC
 sidecar at ``vendor/omp/bridge/src/bridge.ts`` that reuses OMP's provider/memory/
-compaction subsystems verbatim (see ``OMP_INTEGRATION_PLAN.md`` §RPC CONTRACT).
+compaction subsystems verbatim (see ``docs/omp-integration/01-DECISIONS.md`` §Stable RPC quick reference).
 
 Protocol (stdin/stdout of a ``bun run <repo>/vendor/omp/bridge/src/bridge.ts``
 child): one JSON object per line each direction —

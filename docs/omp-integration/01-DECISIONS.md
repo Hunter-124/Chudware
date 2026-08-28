@@ -37,8 +37,9 @@ the "Open decisions" section of `00-OPTIONS-AND-DECISIONS.md`. Implementation fo
   text→PNG renderer; the canonical cut/serialize stays local in
   `services/agent/compaction.py` (its tests define the semantics). The earlier full-bridge
   `compact` consumption (`_bridge_compact`) was deleted — its divergent cut semantics broke
-  the local suite under `CHUDWARE_COMPACTION_BACKEND=omp`; the bridge's `compact` RPC itself
-  remains for the C++ side. OG source + frames persist in `services/agent/snap_store.py`
+  the local suite under `CHUDWARE_COMPACTION_BACKEND=omp`; the zero-caller bridge `compact`
+  RPC was also deleted in the 2026-08-27 YAGNI sweep. OG source + frames persist in
+  `services/agent/snap_store.py`
   (content-addressed, sha256-validated), enabling cumulative re-snap (stamp-line chain in the
   conversation) and cross-provider re-snap on switch — no data loss either way.
 - **New UI options**:
@@ -67,6 +68,26 @@ the "Open decisions" section of `00-OPTIONS-AND-DECISIONS.md`. Implementation fo
 - Bundle **bun** (hard dep: `bun:sqlite`) in the AppDir/installer, per-OS/arch. Bundle
   **pi-natives** only where the snapcompact image tier runs. Bridge runs `bun install` once
   against the vendored workspace (gitignored node_modules).
+
+## Stable RPC quick reference
+- The original twelve host/UI C-ABI names remain stable. Parameters and results are JSON; the
+  core forwards each call to the parenthesized bun bridge method:
+  - `agent_provider_list` → `auth_list_providers`
+  - `agent_provider_state` `{provider?}` → `auth_state`
+  - `agent_provider_validate_key` `{provider, apiKey}` → `auth_validate_key`
+  - `agent_provider_set_key` `{provider, apiKey}` → `auth_set_key`
+  - `agent_provider_remove_key` `{provider, account?}` → `auth_remove_key`
+  - `agent_provider_begin_oauth` `{provider}` → `auth_begin_oauth`
+  - `agent_provider_oauth_poll` `{handle}` → `auth_oauth_poll`
+  - `agent_provider_oauth_manual` `{handle, code}` → `auth_oauth_manual`
+  - `agent_provider_oauth_cancel` `{handle}` → `auth_oauth_cancel`
+  - `agent_provider_logout` `{provider, account?}` → `auth_logout`
+  - `agent_models_list` `{provider?}` → `models_list`
+  - `agent_cost_summary` `{events?}` → `cost_summary`
+- Memory callers use the bridge directly:
+  - `memory_remember` `{root, content, kind?, source?, importance?}` → `{id}`
+  - `memory_recall` `{root, query, limit?, tokenBudget?, kind?}` → `{hits}`
+  - `memory_stats` `{root}` → the per-project memory statistics
 
 ## Implementation order (YAGNI, focus-first)
 1. **Foundation**: vendoring layout + `scripts/vendor_omp.py` (pinned SHA, whitelist, lockfile);

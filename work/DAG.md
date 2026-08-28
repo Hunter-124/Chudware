@@ -313,7 +313,7 @@ graph TD
     T_W9["T-W9: Simulation verification advisor - pre-sim sanity, hand-calc cross-check, margin-policy narration"]:::done
   end
   subgraph WS_WIN["workstream WIN"]
-    T_WIN1["T-WIN1: Windows 10 full-app bring-up (OCCT core + imgui GUI) under MSVC"]:::todo
+    T_WIN1["T-WIN1: Windows 10 full-app bring-up (OCCT core + host GUI) under MSVC"]:::todo
   end
   subgraph WS_X["workstream X"]
     T_WIN2["T-WIN2: Windows CI runner — build + smoke the host/ GUI on Hunter's Windows box"]:::done
@@ -338,12 +338,12 @@ graph TD
     T_BL07["T-BL07: Wire harness / cable design"]:::backlog
     T_BL08["T-BL08: Tolerance stack-up analysis"]:::done
     T_BL09["T-BL09: Wire the requirements layer to the verify battery (req evidence auto-population)"]:::done
-    T_BL10["T-BL10: SUPERSEDED by workstream R — PDM-lite (git-backed revisioning)"]:::backlog
+    T_BL10["T-BL10: SUPERSEDED by workstream R — PDM-lite (git-backed revisioning)"]:::dropped
     T_BL11["T-BL11: Docs + compliance generation"]:::backlog
     T_BL12["T-BL12: TraceParts + Werk24 paid tiers"]:::backlog
     T_BL13["T-BL13: Per-document glass accent + luminance-variance scrim boost"]:::backlog
     T_BL14["T-BL14: GNN adapter training for GO families + sw_fixtures STEP export"]:::backlog
-    T_BL15["T-BL15: SUPERSEDED by workstream R — in-app document version control (Pillar 19)"]:::backlog
+    T_BL15["T-BL15: SUPERSEDED by workstream R — in-app document version control (Pillar 19)"]:::dropped
     T_BL16["T-BL16: Motion/kinematics simulation of mechanisms"]:::done
     T_BL16b["T-BL16b: GUI viewport playback/scrub for a simulate_motion trajectory"]:::done
     T_BL17["T-BL17: Random/harmonic vibration response (frequency response analysis)"]:::done
@@ -374,7 +374,7 @@ graph TD
     T_BL42["T-BL42: Feature tree — extrude/revolve/sweep/loft absorb their sketches/references as hidden children; eye-toggle to show+highlight; sketches stay reusable"]:::done
     T_BL43["T-BL43: Sketch external references — project external faces/edges/planes into a sketch, fix Convert Entities, select external features while in a sketch"]:::done
     T_BL44["T-BL44: Sketch — spacebar orients the view normal to the active sketch plane"]:::done
-    T_BL45["T-BL45: 3D sketcher — OSS survey + design/plan freeze (data model, 3D constraint solver, integration with 2D sketch + features)"]:::review
+    T_BL45["T-BL45: 3D sketcher — OSS survey + design/plan freeze (data model, 3D constraint solver, integration with 2D sketch + features)"]:::done
     T_BL46["T-BL46: Sketch — larger drag dead zone / element-drag priority so repositioning/resizing elements doesn't instantly pan the view"]:::done
     T_BL47["T-BL47: DXF import — C++ core mirror (reach GUI/MCP import_part end-to-end)"]:::done
     T_BL48["T-BL48: Wire ui/imgui interactive sketcher entry — dispatch sketch enter/edit/exit so active sketch editing works (unblocks T-BL41/44/46)"]:::done

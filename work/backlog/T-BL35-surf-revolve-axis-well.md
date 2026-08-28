@@ -70,3 +70,6 @@ done is the literal in-GUI mouse pick, which is blocked by a SEPARATE Windows ru
 Claude-launched host the in-process C++ doc core doesn't wire up (doc ops fall back to the Python worker,
 which no longer implements doc_new), so sketch/draw silently no-op. The DLL itself is fine headlessly.
 Left at status=review; the in-GUI pick is trivial to confirm on a normal user launch.
+- 2026-08-27 [cleanup audit] Remaining DoD item: complete the literal in-GUI mouse pick
+  of a real datum axis through the surf_revolve Axis well and confirm a successful surface;
+  the form kind, two-well preview gate, and engine datum-axis route are present in the tree.

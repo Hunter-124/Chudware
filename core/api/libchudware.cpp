@@ -165,7 +165,7 @@ int emit_error(const std::string& msg, char** out_json) {
 }
 
 // Proxy one of the twelve agent_provider_*/agent_models_list/agent_cost_summary C-ABI methods
-// straight to the OMP bun bridge (RPC CONTRACT, OMP_INTEGRATION_PLAN.md). Params pass through
+// straight to the OMP bun bridge (RPC CONTRACT, docs/omp-integration/01-DECISIONS.md §Stable RPC quick reference). Params pass through
 // verbatim — the C-ABI method's param shape IS the bridge method's param shape for all twelve
 // (see the frozen contract comment at each call site below). On ok:false, the bridge's
 // structured {message,status?} error (result, when supplied) takes precedence over the raw
@@ -1783,7 +1783,7 @@ static int chudware_call_inner(const char* method, const char* params_json, char
                         out_json, 0);
         }
         // --- S-CORE: 12 libchudware proxies for the bridge auth/model/cost surface (frozen RPC
-        // CONTRACT in OMP_INTEGRATION_PLAN.md — every param name below is copied verbatim into
+        // CONTRACT in docs/omp-integration/01-DECISIONS.md — every param name below is copied verbatim into
         // the bridge call; see omp_bridge_proxy() above and vendor/omp/bridge/src/{auth-context,
         // oauth-flow,models}.ts for the handlers each one reaches). ---
         if (m == "agent_provider_list") {

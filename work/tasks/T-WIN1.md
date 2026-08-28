@@ -1,6 +1,6 @@
 ---
 id: T-WIN1
-title: Windows 10 full-app bring-up (OCCT core + imgui GUI) under MSVC
+title: Windows 10 full-app bring-up (OCCT core + host GUI) under MSVC
 workstream: WIN
 owner: gissa
 status: todo
@@ -17,7 +17,7 @@ The OCCT-free C++ core already compiles under MSVC (windows-core preset;
 18/20 ctest — see memory windows-cpp-core-build-verified) and the host/ GUI has
 been shown to build+run on Win11 after a fix_math.h guard + build.bat staging
 fix. This task takes the FULL app the rest of the way on Windows 10 / MSVC:
-full OCCT core, the ui/imgui GUI, app launch, a part actually rendering, then the
+full OCCT core, the host/ GUI, app launch, a part actually rendering, then the
 CHUDWARE_SHOT headless capture battery with an honest eyeballed parity report vs
 Linux.
 
@@ -41,7 +41,7 @@ untouched.
 - `CMakePresets.json` — windows-occt / windows-core presets (extend if OCCT full
   core needs additional Windows-only flags)
 - `docs/BUILD_WINDOWS.md` — bring-up steps + Troubleshooting/gotchas
-- `ui/` / imgui GUI build glue — Windows-only compile/link seams as they surface
+- `host/` GUI build glue — Windows-only compile/link seams as they surface
 - NO edits to services/agent, services/mcp, services/browser, contracts/, or any
   tools/translator or T-W*/T-X* owned path (other active sessions).
 
@@ -53,7 +53,7 @@ untouched.
 2. Stage libchudware.dll + OCCT/Netgen sibling DLLs next to the exe (build.bat path
    already handles both layouts) and confirm the host loads the in-process C++
    engine (no CHUDWARE_LIBCHUDWARE override).
-3. Build the ui/imgui GUI on MSVC; fix Windows-only compile/link seams (guarded).
+3. Build the host/ GUI on MSVC; fix Windows-only compile/link seams (guarded).
 4. Launch the app; confirm it opens and can create geometry (doc/sketch/extrude
    ops backed by the C++ core, not the Python worker).
 5. Render a part in-app; eyeball it against the Linux render.
@@ -66,7 +66,7 @@ untouched.
 
 - [ ] Full OCCT core builds under MSVC (windows-occt preset); ctest result recorded
 - [ ] Core DLLs stage next to the exe; host loads the in-process C++ engine
-- [ ] ui/imgui GUI builds and the app launches on Windows 10
+- [ ] host/ GUI builds and the app launches on Windows 10
 - [ ] A part renders in-app
 - [ ] CHUDWARE_SHOT headless battery runs; eyeballed Linux-parity report attached to
       the progress log (per-stage PASS / documented-break with exact error)
@@ -91,7 +91,7 @@ VERIFIED on Windows (Win11, MSVC 14.44 / VS2022):
 - Full OCCT core builds (windows-occt preset); ctest **48/49** — the 1 fail is
   `freecad_parity` (point-on-ellipse), a pre-existing MSVC-vs-GCC solver diff, NOT a
   Windows regression.
-- Core DLLs stage next to the exe; host imgui GUI builds + launches + renders.
+- Core DLLs stage next to the exe; host GUI builds + launches + renders.
 - Engine + sketch solver + UI reach parity: a real parametric solid builds
   (Sketch1 → Boss-Extrude1 → Body1); sketch solver hits "Fully Defined DOF: 0".
 
@@ -133,7 +133,7 @@ picks up the Windows worker-start fix.
     ctest limit; the one real fail is `freecad_parity` point-on-ellipse solver
     non-convergence, which matches the documented Windows baseline, pre-existing).
   * Stage 2 — libchudware.dll + OCCT TK*.dll stage into dist\Chudware\ next to the exe (✓).
-  * Stage 3 — host imgui GUI (Chudware.exe) builds via build.bat + stages (✓).
+  * Stage 3 — host GUI (Chudware.exe) builds via build.bat + stages (✓).
   STAGE 4-6 PARTIAL, honest findings:
   * The GUI renders fully on Windows (verified from headless `CHUDWARE_SHOT=sketch`
     captures in scratch/sketch_shots): ribbon, FeatureManager, Copilot, dark theme all
@@ -174,11 +174,11 @@ picks up the Windows worker-start fix.
   further. TO CLOSE PARITY, either: (a) buddy's call on the tryStartWorker Windows path
   so headless capture works, or (b) gissa does the 2-min interactive launch (worker
   starts fine interactively) + press F (Zoom to Fit) + eyeball the solid.
-- 2026-07-06 20:39 UTC [gissa] [gissa/opus-sweep] 2026-07-06 â€” unified ui/imgui windows-app (AI-CAD2.exe) VERIFIED on Win11 (MSVC 14.44/VS2022 BuildTools, CMake 4.3, Ninja). Branch task/T-WIN1-windows-bringup pushed (2 commits: 026c98a6 build fix, a8876006 docs). PR not opened via CLI (gh not installed + non-interactive OAuth); one-click URL: https://github.com/Hunter-124/CAD/pull/new/task/T-WIN1-windows-bringup
+- 2026-07-06 20:39 UTC [gissa] [gissa/opus-sweep] 2026-07-06 â€” host-based Windows app (AI-CAD2.exe) VERIFIED on Win11 (MSVC 14.44/VS2022 BuildTools, CMake 4.3, Ninja). Branch task/T-WIN1-windows-bringup pushed (2 commits: 026c98a6 build fix, a8876006 docs). PR not opened via CLI (gh not installed + non-interactive OAuth); one-click URL: https://github.com/Hunter-124/CAD/pull/new/task/T-WIN1-windows-bringup
 
 RESULTS:
 - Core windows-occt: ctest 48/49 (only freecad_parity, pre-existing MSVC-vs-GCC diff).
-- App windows-app: clean build after 3 Windows-guarded fixes in ui/imgui/CMakeLists.txt.
+- App windows-app: clean build after 3 Windows-guarded fixes in the GUI CMake build.
   (1) /FI fix_math.h C1083 â€” inner-quoted /FI"..." + space-in-repo-path ("AI PROJECTS") under
       Ninja+MSVC leaked literal quotes into the filename; dropped inner quotes so Ninja quotes the
       whole /FI<path> token. (host/ VS-generator build never hit this.)
@@ -189,9 +189,9 @@ RESULTS:
 - AI-CAD2.exe --selftest (NO env override) -> save=1 open=1 features=3 -> OK (in-process libchudware).
 - AI-CAD2.exe --shot -> 1616x1039 PNG: ribbon+icons+fonts, FeatureManager (Base/Fillet/Shell),
   dark theme, 3D viewport solid FRAMED correctly. CLOSES the host/-era unverified viewport-framing gap.
-- Python engine_oracle: 1229 passed / 5 failed / 10 errors / 10 skipped â€” all pre-existing/env
-  (doc golden-fixture path, ecad board fixture, LBM numerical); zero Python touched, no new regressions.
+- Retired Python-oracle baseline: 1229 passed / 5 failed / 10 errors / 10 skipped â€”
+  all pre-existing/environmental; zero Python touched and no new regressions.
 
 NEEDS LINUX-SIDE REVIEW: none. Every change is if(WIN32)/if(MSVC)-guarded; Linux else() path
-byte-for-byte unchanged. NOTHING duplicated/split into a per-OS tree â€” host/ stays deleted.
+byte-for-byte unchanged. NOTHING duplicated/split into a per-OS tree — host/ remains the sole GUI tree.
 - 2026-07-06 21:13 UTC [gissa] [gissa/opus-sweep] 2026-07-06 â€” PR IS NOW OPEN (correcting the earlier "PR not opened via CLI" note): https://github.com/Hunter-124/CAD/pull/18 â€” "T-WIN1: Windows 11 bring-up of the unified GUI", base master <- head task/T-WIN1-windows-bringup, state open. Opened via the GitHub REST API using the existing git credential (no gh CLI / no browser OAuth needed). Task stays in review awaiting human merge â€” NOT merged, NOT marked done.

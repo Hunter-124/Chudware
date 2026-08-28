@@ -35,6 +35,11 @@ dist/
 # Local config / secrets
 config.json
 
+# This repo's OWN PLM vault — created by any run that treats the repo root as a project
+# (services/plm/gitbind.py VAULT_DIRNAME). It accumulated 3684 files of local object churn
+# before being untracked on 2026-08-27. Per-project vaults live beside their project, never here.
+/.aicadvault/
+
 # Editor / app state
 imgui.ini
 
@@ -133,7 +138,11 @@ Webservice/**/*.env
 !Webservice/gateway/config.example.env
 
 # local artifacts — never commit
+# `reports/runs/` alone is root-anchored (the mid-pattern slash), so it never matched the
+# nested gym tree: 391 raw per-seed ledger/mission/graded files accumulated under
+# tools/flywheel/bench/gym/reports/runs/ and were deleted on 2026-08-27. `**/` catches both.
 reports/runs/
+**/reports/runs/
 signal-desktop*
 services/corpora/
 .omp/

@@ -14,9 +14,10 @@ deferred: yes
 
 ## Context
 
-Phase 4 of the 3D sketcher plan (`docs/SKETCH3D_PLAN.md`, T-BL45). PARKED until greenlight.
-Depends on P2 (T-BL52) for the solver+entities and on T-BL48 (sketch-entry wiring) — see
-`uiimgui-sketcher-entry-unwired`: interactive sketch dispatch in `ui/imgui` must be wired first.
+Phase 4 of the 3D sketcher plan (`docs/plans/SKETCH3D_PLAN.md`, T-BL45). PARKED until greenlight.
+Depends on P2 (T-BL52) for the solver+entities and on T-BL48 (sketch-entry wiring): interactive
+sketch dispatch in `host/src/ui/` must be wired first (the old `ui/imgui` shell it once named is
+retired — `host/` is the sole GUI tree).
 
 ## Scope
 

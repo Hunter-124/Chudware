@@ -116,7 +116,7 @@ def close_all() -> None:
 # --------------------------------------------------------------------------- OMP bridge hybrid backend
 # Optional: recall/remember/stats can route through the OMP bridge's mnemopi-backed
 # memory_* RPCs (real reuse of vendor/omp/packages/mnemopi — see
-# OMP_INTEGRATION_PLAN.md §RPC CONTRACT, docs/omp-integration/01-DECISIONS.md §Memory)
+# docs/omp-integration/01-DECISIONS.md §Stable RPC quick reference + §Memory)
 # instead of the SQLite+FTS5 path below. Off by default (unchanged behavior); opt in
 # with env CHUDWARE_MEMORY_BACKEND=mnemopi or config.json agent.memory_backend="mnemopi".
 # Any bridge failure (bun/script missing, crash, timeout, RPC error) raises

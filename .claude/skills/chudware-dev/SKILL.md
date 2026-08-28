@@ -36,11 +36,9 @@ The repo has a knowledge graph at `graphify-out/` (skill: `.claude/skills/graphi
 - `graphify-out/GRAPH_REPORT.md` / `graphify-out/wiki/index.md` — broad architecture only
 - After meaningful structural changes: `graphify update .` (AST-only, free)
 
-## Repo map (verified against master, 2026-07-10)
+## Repo map (verified against master, 2026-08-27)
 
-⚠️ **AGENTS.md is stale on GUI ownership** — it claims `host/` was deleted (T-G11) and
-`ui/imgui/` is the GUI. That was **reverted**: `build.sh` is authoritative — "the legacy `ui/imgui` / `ui/abstract` shells are retired; host/ is the single cross-platform GUI target."
-Trust build.sh/gate.sh and this map over AGENTS.md's repo-map rows where they conflict.
+**Current GUI ownership:** `host/` is the sole GUI target; `ui/imgui/` and `ui/abstract/` are gone, and T-G11's deletion of `host/` was reversed.
 
 | Dir | What it is |
 |---|---|
@@ -49,9 +47,8 @@ Trust build.sh/gate.sh and this map over AGENTS.md's repo-map rows where they co
 | `core/manufacturing/**` | Journal + durable sequence, result registry, invalidation, tier0, policy, gates, approval, lease, and arbiter |
 | `core/twin/**` | Manufacturing digital twin |
 | `core/print/**` | Additive-print model |
-| `engine_oracle/` (symlink `engine/`) | Python parity oracle (build123d on OpenCASCADE) — frozen while `core/` strangles it out; kept in lockstep via parity corpus; deleted last |
 | `host/` | **The production GUI** — C++ GLFW/ImGui desktop app. `host/src/app.cpp` frame loop, `host/src/ui/` panels (52k LOC), `host/src/core/app_state.h` central data model. Details: the gui-* skills |
-| `ui/viewport/` | Shared OpenGL render module (renderer/mesh/camera, id-pass picking, AICM loader) |
+| `ui/viewport/` | AICM mesh loader (`render/aicm_loader.*`) consumed by `core/`; the host renderer lives under `host/src/render/` |
 | `services/agent/` | Built-in AI agent loop (Python): agent_turn, councils, delegation, events |
 | `services/mcp/` | MCP server exposing the engine to external agents (Claude Code etc.) |
 | `services/worker/` | Engine routing seam: WorkerClient / DocMirror / bootstrap |
@@ -61,12 +58,12 @@ Trust build.sh/gate.sh and this map over AGENTS.md's repo-map rows where they co
 | `contracts/` | **Frozen interface contracts — THE seams. Append-only.** `worker_rpc.md`, `doc_ops.md`, `feature_params.md`, `icons.md`, `parts.md`, `ecad/`, … (`contracts/README.md`) |
 | `corpora/` | Consolidated test fixtures (sketch/render/sw_parity), referenced by canonical paths |
 | `scripts/` | Gates & audits: `gate.sh`, `check.py`, `gui_lint.py`, `icon_pipeline.py` |
-| `docs/` | Design docs, `PLAN.md`, `CPP_MIGRATION.md`, `REFACTOR_LOG.md` (one-paragraph handoffs go here) |
+| `docs/` | Design docs and live handoffs in `docs/REFACTOR_LOG.md`, with older handoffs split under `docs/refactor-log/` |
 | `docs/manufacturing/**` | Manufacturing subsystem design corpus |
 | `work/` | Task board (`work/tools/work.py`) + backlog cards `work/backlog/T-*.md` |
 | `assets/` | Icons + generators (`make_icons.py`, `pack_icons.py`), logo |
 | `tools/`, `benchmarks/`, `training/`, `services/dag/`, `services/deliverables/` | Dev tools, benches, ML training, DAG missions, deliverable templates |
-| `Webservice/` | chudware-web: self-hosted multi-user streamed sessions — `gateway/` (FastAPI portal+auth+session mgr+chat), `image/` (Fedora 44 session container), `deploy/` (systemd user units, cf_provision.py, RUNBOOK.md), `DESIGN.md`. T-R7 PLM remote subset lives in `services/plm/remote.py`. Secrets NEVER committed (`Cloudflare-info.txt` gitignored) |
+| `Webservice/` | chudware-web: browser-native `host/` WASM GUI backed by one shared hostd — `gateway/` (FastAPI portal+auth+engine bridge+chat), `deploy/` (systemd user units, cf_provision.py, RUNBOOK.md), `DESIGN.md`. T-R7 PLM remote subset lives in `services/plm/remote.py`. Secrets NEVER committed (`Cloudflare-info.txt` gitignored) |
 | `scratch/` | Throwaway output — never commit anything load-bearing here |
 
 Env/naming compat: `CHUDWARE_*` env vars canonical, `CHUDWARE_*` honored; MCP id `chudware`
@@ -85,8 +82,8 @@ python3 work/tools/work.py ready|board            # task board
 ```
 
 Gate semantics: OCCT-absent and runtime-venv-absent are **SKIPs, not failures** — the gate
-stays green on an unprovisioned box. Engine+agent pytest runs as
-`<venv>/python -X utf8 -m pytest engine/doc services/agent -q` when the venv exists.
+stays green on an unprovisioned box. Python pytest sweeps run per unit under `services/`,
+plus `tools/` and `training/`, when the runtime venv exists.
 Scripted GUI launches use `xvfb-run` automatically; set `CHUDWARE_SHOT_HEADED=1` to see a real
 window. Headless scenario smoke: `CHUDWARE_SHOT=<m1|sketch|asm|fea|flow|drawing|…>
 ./host/build-linux/bin/chudware --ui-screenshot scratch/smoke.png` (crash check, not visual
@@ -97,14 +94,15 @@ judgment).
 - **Contracts and seam files are append-only** and integrator-owned: `contracts/*`,
   `core/api/libchudware.h`, top-level CMake, `scripts/gate.sh`, `AGENTS.md`. If you're a
   subagent, request these edits from your orchestrator instead of making them.
-- **Subagents never run git**; the session driver commits. Parallel agents need disjoint
-  write-sets. **No git worktrees in this repo** — they branch from a stale base and have
-  silently reverted master before; run subagents in the main tree.
+- **Subagents never run git**; the session driver commits, parallel agents use disjoint
+  write-sets, and all run in the main tree because **this repo has no git worktrees** —
+  they branch from stale bases and have silently reverted master. On 2026-08-27 the stale
+  `~/.cache/wt-cad-code` and `~/.cache/wt-cad-release` worktrees plus 7 stale stashes were
+  removed; the stashes remain archived as local refs `refs/archive/stash-0..6` and patches
+  in `~/Backups/CAD-stashes-2026-08-28/`.
 - A change is done when the relevant gate is green: `./build.sh` compiles at minimum;
   `scripts/gate.sh` for anything touching core/engine/agent; `scripts/gui_lint.py --rule
   theme|icons` when styling/icons changed.
-- Engine parity: if you change behavior in `core/`, check whether the Python oracle
-  (`engine_oracle/`) and parity corpus need the same change — lockstep is the contract.
 - Notable multi-file efforts get a one-paragraph handoff appended to `docs/REFACTOR_LOG.md`
   (files touched, deferred items, gotchas).
 

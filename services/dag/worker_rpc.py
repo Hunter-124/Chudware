@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Callable
 
 from services.dag.executor import default_runs_dir as _runs_dir
+from services.dag.run_ids import validate_run_id
 
 
 def _dag_status(params: dict, _emit: Callable) -> dict:
@@ -34,6 +35,7 @@ def _dag_status(params: dict, _emit: Callable) -> dict:
         run_id = (params or {}).get("run_id", "")
         if not run_id:
             return {"ok": False, "reason": "run_id is required"}
+        run_id = validate_run_id(run_id)
         base = Path((params or {}).get("runs_dir") or _runs_dir())
         db_path = base / f"{run_id}.db"
         graph_path = base / f"{run_id}.graph.json"

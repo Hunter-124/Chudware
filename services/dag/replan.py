@@ -51,6 +51,7 @@ from typing import Any, Optional
 
 from .executor import default_runs_dir as _default_runs_dir
 from .graph_loader import GraphValidationError, validate_graph
+from .run_ids import validate_run_id
 
 # ---------------------------------------------------------------------------
 # Error
@@ -240,6 +241,7 @@ def dag_replan(
                            missing retry back-edge, id collision, etc.).
         GraphValidationError: if the merged graph fails aicad.dag/1 validation.
     """
+    run_id = validate_run_id(run_id)
     base_dir: Path = runs_dir if runs_dir is not None else _default_runs_dir()
     graph_path = base_dir / f"{run_id}.graph.json"
 

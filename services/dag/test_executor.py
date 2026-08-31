@@ -137,6 +137,98 @@ class TestExecutorSmoke:
 
 
 # ---------------------------------------------------------------------------
+# Run ID path containment
+# ---------------------------------------------------------------------------
+
+class TestRunIdValidation:
+    @pytest.mark.parametrize(
+        "run_id",
+        [
+            "aaaabbbb-cccc-dddd-eeee-ffff00001111",
+            "mission",
+            "run_walk01",
+            "r_deadbeef",
+            "run.id",
+        ],
+    )
+    def test_existing_run_id_shapes_are_accepted_unchanged(self, run_id: str) -> None:
+        assert executor.validate_run_id(run_id) == run_id
+
+    @pytest.mark.parametrize(
+        "run_id",
+        [
+            "",
+            ".",
+            "..",
+            "../escape",
+            r"..\escape",
+            "/tmp/escape",
+            r"C:\tmp\escape",
+            "run/id",
+            r"run\id",
+            "run id",
+            "run:1",
+            "rún",
+            "x" * 129,
+        ],
+    )
+    def test_unsafe_run_ids_are_rejected(self, run_id: str) -> None:
+        with pytest.raises(ValueError, match="run_id"):
+            executor.validate_run_id(run_id)
+
+    @pytest.mark.parametrize(
+        "run_id",
+        [
+            "",
+            ".",
+            "..",
+            "../escaped",
+            "/tmp/escaped",
+            r"C:\tmp\escaped",
+            "run id",
+            "x" * 129,
+        ],
+    )
+    def test_run_rejects_invalid_id_before_any_write(
+        self,
+        run_id: str,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        runs_dir = tmp_path / "runs"
+        xdg_root = tmp_path / "xdg"
+        monkeypatch.setenv("XDG_DATA_HOME", str(xdg_root))
+
+        with pytest.raises(ValueError, match="run_id"):
+            executor.run(
+                _two_node_graph(),
+                run_id=run_id,
+                runs_dir=runs_dir,
+                agent_fn=_done_agent_fn,
+            )
+
+        assert not runs_dir.exists()
+        assert not (tmp_path / "escaped.db").exists()
+        assert not (tmp_path / "escaped.graph.json").exists()
+        assert not xdg_root.exists()
+
+    def test_resume_rejects_traversal_before_any_write(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        runs_dir = tmp_path / "runs"
+        xdg_root = tmp_path / "xdg"
+        monkeypatch.setenv("XDG_DATA_HOME", str(xdg_root))
+
+        with pytest.raises(ValueError, match="path separators"):
+            executor.resume("../escaped", runs_dir=runs_dir)
+
+        assert not runs_dir.exists()
+        assert not (tmp_path / "escaped.db").exists()
+        assert not (tmp_path / "escaped.graph.json").exists()
+        assert not xdg_root.exists()
+
+
+# ---------------------------------------------------------------------------
 # Validation tests
 # ---------------------------------------------------------------------------
 

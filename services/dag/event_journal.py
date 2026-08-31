@@ -24,6 +24,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Optional
 
+from .run_ids import validate_run_id
+
 
 # ---------------------------------------------------------------------------
 # Run-directory resolution (mirrors executor.py's default_runs_dir pattern
@@ -40,6 +42,7 @@ def _default_cache_runs_dir() -> Path:
 
 def run_events_path(run_id: str, runs_dir: Optional[Path] = None) -> Path:
     """Return the events.jsonl path for a run, creating the directory if needed."""
+    run_id = validate_run_id(run_id)
     base = runs_dir if runs_dir is not None else _default_cache_runs_dir()
     run_dir = base / run_id
     run_dir.mkdir(parents=True, exist_ok=True)

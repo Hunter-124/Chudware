@@ -23,6 +23,7 @@ from langgraph.types import Command
 
 from .graph_loader import DagState, EmitFn, build_state_graph, validate_graph
 from .event_journal import EventJournal
+from .run_ids import validate_run_id
 
 # ---------------------------------------------------------------------------
 # Runs directory resolution
@@ -64,7 +65,7 @@ def run(
     Args:
         graph_json:        Validated aicad.dag/1 graph document.
         initial_state:     Extra keys merged into the initial DAG state (optional).
-        run_id:            UUID4 string. Generated if not supplied.
+        run_id:            Safe run identifier. Generated as a UUID4 if not supplied.
         runs_dir:          Directory for checkpoint .db files.
                            Defaults to default_runs_dir(). Pass a tmp dir for hermetic tests.
         emit:              Optional event callback ``(event_type: str, payload: dict) -> None``.
@@ -78,7 +79,7 @@ def run(
 
     Returns:
         dict with keys:
-          run_id        : str (UUID4)
+          run_id        : str (caller-supplied safe ID or generated UUID4)
           status        : RunState string — "done" | "failed" | "paused" | "running"
           nodes         : {node_id: {"status": NodeState, "output": dict}}
           checkpoint_db : str (absolute path to the SQLite checkpoint file)
@@ -87,9 +88,10 @@ def run(
           interrupted     : list of interrupt payload dicts (aicad.interaction/1 shape)
         The caller (or UI) persists graph_json beside the .db for resume().
     """
+    if run_id is None:
+        run_id = str(uuid.uuid4())
+    run_id = validate_run_id(run_id)
     validate_graph(graph_json)
-
-    run_id = run_id or str(uuid.uuid4())
     graph_id = graph_json.get("id", "unknown")
     node_count = len(graph_json["nodes"])
 
@@ -222,6 +224,7 @@ def resume(
         Same shape as run() — {run_id, status, nodes, checkpoint_db, …}.
         May be "paused" again if another gate fires downstream.
     """
+    run_id = validate_run_id(run_id)
     base_dir: Path = runs_dir if runs_dir is not None else default_runs_dir()
     db_path = base_dir / f"{run_id}.db"
 

@@ -38,6 +38,7 @@ from pydantic import Field
 
 from services.dag import session
 from services.dag.executor import default_runs_dir as _runs_dir
+from services.dag.run_ids import validate_run_id
 
 # Var-keyword parameters below are annotated ``Annotated[Any, Field(default=None)]``
 # rather than left bare.  FastMCP's func_metadata turns a bare ``**kwargs`` into a
@@ -79,6 +80,7 @@ def _load_run_status(run_id: str, runs_dir: Path) -> dict[str, Any] | None:
     topology is restart-safe; per-node verdicts are in-session only unless
     T-F17 adds a narration DB.  dag_status documents this limitation.
     """
+    run_id = validate_run_id(run_id)
     db_path = runs_dir / f"{run_id}.db"
     graph_path = runs_dir / f"{run_id}.graph.json"
     if not db_path.exists():
@@ -289,7 +291,10 @@ def _resolve_run_id(kwargs: dict, tool: str, notes: list) -> tuple[str, str]:
     if isinstance(val, str) and val.strip():
         if _norm_key(spelling) != "runid":
             notes.append(f"{spelling}= read as run_id=")
-        return val.strip(), ""
+        try:
+            return validate_run_id(val.strip()), ""
+        except ValueError as exc:
+            return "", str(exc)
     if val is not None:
         return "", (f"run_id must be the UUID4 string from dag_run's response, got "
                     f"{type(val).__name__}")
@@ -299,7 +304,10 @@ def _resolve_run_id(kwargs: dict, tool: str, notes: list) -> tuple[str, str]:
             f"run_id was not supplied — used {last!r}, the most recent run started in "
             "this session. Pass run_id= explicitly to address a different run."
         )
-        return last, ""
+        try:
+            return validate_run_id(last), ""
+        except ValueError as exc:
+            return "", str(exc)
     return "", (
         f"{tool} needs run_id — the UUID4 a run is identified by, and nothing in this "
         "session has started one yet.\n"
@@ -356,6 +364,13 @@ def _prep_resume(tool: str, run_id: Any, graph_json: Any, autonomy_default: str,
                       if known else "No runs exist on disk yet either."),
                 known_run_ids=known,
             )
+
+    try:
+        run_id = validate_run_id(run_id)
+    except ValueError as exc:
+        return "", graph_json, autonomy_default, notes, _err(
+            str(exc), hint="Use the run_id exactly as returned by dag_run."
+        )
 
     if graph_json is not None:
         graph_json, coerce_error = _coerce_graph(graph_json, notes)
@@ -691,6 +706,12 @@ def register_dag_tools(mcp) -> None:
                       "graph_json straight through."),
             )
 
+
+        if run_id:
+            try:
+                run_id = validate_run_id(run_id)
+            except ValueError as exc:
+                return _err(str(exc), hint="Use a simple identifier or omit run_id.")
         # A run_id naming a run that has never checkpointed is a FIRST START under
         # a chosen id, not a resume of something missing.  mission_start returns
         # run_id="mission" for a freshly compiled graph, so routing that to
@@ -815,6 +836,11 @@ def register_dag_tools(mcp) -> None:
                 )
         else:
             run_id = run_id.strip()
+
+        try:
+            run_id = validate_run_id(run_id)
+        except ValueError as exc:
+            return _err(str(exc), hint="Use the run_id exactly as returned by dag_run.")
 
         base = Path(runs_dir) if runs_dir else _runs_dir()
         info = _load_run_status(run_id, base)
@@ -1179,6 +1205,11 @@ def register_dag_replan_tools(mcp) -> None:
             run_id, id_error = _resolve_run_id(kwargs, "dag_replan", notes)
             if id_error:
                 return _err(id_error, known_run_ids=_known_run_ids(_runs_dir()))
+
+        try:
+            run_id = validate_run_id(run_id)
+        except ValueError as exc:
+            return _err(str(exc), hint="Use the run_id exactly as returned by dag_run.")
 
         missing = [name for name, val in (("splice_nodes", splice_nodes),
                                           ("after_node_id", after_node_id))

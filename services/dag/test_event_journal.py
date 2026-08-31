@@ -79,6 +79,16 @@ def test_run_events_path_creates_dir(tmp_path: Path) -> None:
     assert p.name == "events.jsonl"
 
 
+@pytest.mark.parametrize("run_id", [".", "..", "../escape", r"..\escape", "/tmp/escape"])
+def test_run_events_path_rejects_unsafe_ids_before_writing(
+    tmp_path: Path, run_id: str
+) -> None:
+    with pytest.raises(ValueError, match="run_id"):
+        run_events_path(run_id, runs_dir=tmp_path / "runs")
+
+    assert not (tmp_path / "runs").exists()
+
+
 def test_unknown_fields_tolerated(tmp_path: Path) -> None:
     """Consumers must tolerate unknown fields (contracts/agent_events.md §5)."""
     j = EventJournal("run-test-005", runs_dir=tmp_path)

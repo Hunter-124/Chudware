@@ -14,6 +14,7 @@ Design (token budget first):
     AND under per-turn / per-run caps (max 1 LLM call per turn, max 3/run).
   * Never blocks the turn; every failure path returns "".
 """
+
 from __future__ import annotations
 
 import json
@@ -21,6 +22,8 @@ import logging
 import re
 import time
 from typing import Any, Callable
+
+from services.agent.chudcode_roles import run_role_turn
 
 _log = logging.getLogger("chudware.proactive_advisor")
 
@@ -30,7 +33,9 @@ _MIN_SECONDS = 45.0
 _MAX_FIRES_PER_TURN = 3
 _MAX_LLM_PER_TURN = 1
 _MAX_LLM_PER_RUN = 3
-_REQUIRE_EVERY_N = 4  # fallback only; _require_every_n() reads config.supervision_interval_calls()
+_REQUIRE_EVERY_N = (
+    4  # fallback only; _require_every_n() reads config.supervision_interval_calls()
+)
 _LLM_MAX_TOKENS = 220
 _EVIDENCE_CHARS = 900
 
@@ -71,6 +76,7 @@ def _require_every_n() -> int:
     """
     try:
         from services.agent import config  # noqa: PLC0415
+
         return max(0, int(config.supervision_interval_calls()))
     except Exception:  # noqa: BLE001
         return _REQUIRE_EVERY_N
@@ -126,12 +132,12 @@ def evaluate_trigger(
         return None
 
     records = list(calls or [])
-    current_record = records[-1] if records and records[-1].get("tool") == tool else None
+    current_record = (
+        records[-1] if records and records[-1].get("tool") == tool else None
+    )
     current_refusal = bool(current_record and _is_policy_refusal(current_record))
     current_failed = (
-        _is_executed_failure(current_record)
-        if current_record is not None
-        else not ok
+        _is_executed_failure(current_record) if current_record is not None else not ok
     )
 
     # Non-executed records are not attempts and cannot form failure/thrash
@@ -244,28 +250,40 @@ def _try_llm_advice(
     trigger: dict,
     result: Any,
     recent_calls: list[dict],
+    options: dict | None = None,
+    on_event: Callable[..., None] | None = None,
 ) -> str:
-    """Best-effort short advisor-role completion. Returns "" on any failure."""
+    """Best-effort one-shot advisor role turn. Returns "" on any failure."""
     try:
         from services.agent import config as agent_config  # noqa: PLC0415
         from services.agent.role_models import (  # noqa: PLC0415
-            clamp_provider_effort,
+            clamp_subagent_effort,
             resolve_role_model,
+            resolve_role_thinking,
         )
-    except Exception:  # noqa: BLE001
-        return ""
 
-    try:
-        cfg = agent_config.load_config()
-        assignment = resolve_role_model("advisor", cfg)
-        provider = agent_config.get_provider(
-            name=assignment.provider,
-            cfg={**(cfg if isinstance(cfg, dict) else {}), "model": assignment.model},
-            role="advisor",
+        source_options = options if isinstance(options, dict) else {}
+        cfg_value = source_options.get("config")
+        cfg = (
+            dict(cfg_value)
+            if isinstance(cfg_value, dict)
+            else dict(agent_config.load_config() or {})
         )
-        provider = clamp_provider_effort(provider)
+        assignment = resolve_role_model("advisor", cfg)
+        ambient_effort = (
+            source_options.get("reasoning_effort")
+            or cfg.get("reasoning_effort")
+            or cfg.get("thinking")
+        )
+        effort = resolve_role_thinking(
+            "advisor",
+            cfg,
+            task_class="analysis",
+            dispatch_effort=clamp_subagent_effort(ambient_effort),
+            rank=getattr(assignment, "rank", None),
+        )
     except Exception as exc:  # noqa: BLE001
-        _log.debug("proactive advisor provider resolve failed: %s", exc)
+        _log.debug("proactive advisor role resolution failed: %s", exc)
         return ""
 
     # Compact evidence — last few tool outcomes only.
@@ -277,35 +295,79 @@ def _try_llm_advice(
         )
     evidence = "\n".join(rows) if rows else "(no prior calls)"
     err = _result_error_text(result)
-    user = (
+    request = (
+        "ADVISOR COMPLETION CONTRACT\n"
+        "You are the ADVISOR steering a stuck CAD agent. Be brief. "
+        "Output JSON only. Prefer steer over escalate.\n\n"
         f"SEVERITY={trigger.get('severity')} REASON={trigger.get('reason')}\n"
         f"LAST_TOOL={tool!r} OK={ok}\n"
         f"ERROR={err or '(none)'}\n"
         f"RECENT:\n{evidence}\n\n"
         "Reply with STRICT JSON only:\n"
         '{"verdict":"steer|revise|escalate","notes":["..."],"focus":"..."}\n'
-        "Max 4 short notes. No markdown. No CAD mutators. No invented dimensions."
+        "Max 4 short notes. No markdown. No tools or CAD mutators. "
+        "No invented dimensions."
     )
-    system = (
-        "You are the ADVISOR steering a stuck CAD agent. Be brief. "
-        "Output JSON only. Prefer steer over escalate."
+    parent_session = str(
+        source_options.get("session_id")
+        or source_options.get("parent_session_id")
+        or source_options.get("run_id")
+        or "proactive-advisor"
     )
-    try:
-        reply = provider.complete(
-            system,
-            [{"role": "user", "content": user}],
-            max_tokens=_LLM_MAX_TOKENS,
-        )
-    except TypeError:
-        try:
-            reply = provider.complete(system, [{"role": "user", "content": user}])
-        except Exception as exc:  # noqa: BLE001
-            _log.debug("proactive advisor LLM failed: %s", exc)
-            return ""
-    except Exception as exc:  # noqa: BLE001
-        _log.debug("proactive advisor LLM failed: %s", exc)
-        return ""
+    run_id = str(source_options.get("run_id") or f"{parent_session}:proactive")
+    parent_id = str(
+        source_options.get("node_id")
+        or source_options.get("subagent_id")
+        or source_options.get("parent_id")
+        or parent_session
+    )
+    settings = {
+        "provider": str(getattr(assignment, "provider", "") or ""),
+        "model": str(getattr(assignment, "model", "") or ""),
+    }
+    if effort:
+        settings["reasoning_effort"] = effort
+    role_options: dict[str, Any] = {
+        "config": cfg,
+        "settings": settings,
+        "allowed_tools": [],
+    }
+    if source_options.get("offline") is True or agent_config.offline_enabled(cfg):
+        role_options["offline"] = True
+        if source_options.get("offline_provider") is not None:
+            role_options["offline_provider"] = source_options["offline_provider"]
+    for key in ("workspace_dir", "project_dir", "chudcode_session_dir"):
+        if source_options.get(key) is not None:
+            role_options[key] = source_options[key]
 
+    try:
+        turn = run_role_turn(
+            request,
+            "advisor",
+            session_id=parent_session,
+            run_id=run_id,
+            parent_id=parent_id,
+            on_event=on_event,
+            options=role_options,
+            max_tokens=_LLM_MAX_TOKENS,
+            max_total_tokens=_LLM_MAX_TOKENS,
+            close_session=True,
+        )
+    except Exception as exc:  # noqa: BLE001
+        _log.debug("proactive advisor Chudcode turn failed: %s", exc)
+        return ""
+    if not isinstance(turn, dict) or not turn.get("success") or turn.get("cancelled"):
+        return ""
+    reply = turn.get("result")
+    if isinstance(reply, dict):
+        reply = next(
+            (
+                reply.get(key)
+                for key in ("text", "result", "message", "content")
+                if isinstance(reply.get(key), str)
+            ),
+            "",
+        )
     text = str(reply or "").strip()
     if not text:
         return ""
@@ -348,6 +410,7 @@ def maybe_proactive_note(
     tool_calls_made: int,
     options: dict | None = None,
     allow_llm: bool = True,
+    on_event: Callable[..., None] | None = None,
 ) -> tuple[str, dict]:
     """Return ``(note, meta)``. Empty note means do not inject.
 
@@ -389,7 +452,11 @@ def maybe_proactive_note(
         return "", meta
 
     note = build_deterministic_note(
-        tool=tool, ok=ok, trigger=trigger, preference=pref, result=result,
+        tool=tool,
+        ok=ok,
+        trigger=trigger,
+        preference=pref,
+        result=result,
     )
     source = "deterministic"
     used_llm = False
@@ -409,6 +476,8 @@ def maybe_proactive_note(
             trigger=trigger,
             result=result,
             recent_calls=calls,
+            options=options,
+            on_event=on_event,
         )
         if llm_note:
             # Keep deterministic context, append LLM steer.
@@ -459,6 +528,7 @@ def inject_if_needed(
         tool_calls_made=tool_calls_made,
         options=options,
         allow_llm=allow_llm,
+        on_event=on_event,
     )
     if not note:
         return False

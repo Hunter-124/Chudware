@@ -38,6 +38,7 @@ resolves that assignment from routing.yaml (T-W14) when a routing table is passe
 falling back to a hardcoded provider-preference list only when routing.yaml has no
 configured sources.
 """
+
 from __future__ import annotations
 
 import hashlib
@@ -48,21 +49,37 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Optional
 
+from services.agent.chudcode_roles import run_role_turn
+
+
 AUDIT_SCHEMA = "aicad.audit/1"
 _CHARS_PER_TOKEN = 4  # repo-wide heuristic (matches ledger.py / render.py)
 
 # The trigger points the overseer fires at (contract §11 + pipeline §2).  Never
 # per-turn — the caller invokes :meth:`Overseer.audit` at exactly these points.
-TRIGGERS = frozenset({
-    "plan_ratify", "stage_exit", "escalation",
-    "preflight_override", "change_request", "manual",
-})
+TRIGGERS = frozenset(
+    {
+        "plan_ratify",
+        "stage_exit",
+        "escalation",
+        "preflight_override",
+        "change_request",
+        "manual",
+    }
+)
 
 # Verdict classes (contract §11).
-VERDICT_CLASSES = frozenset({
-    "plan_gap", "wrong_order", "spec_drift", "missed_requirement",
-    "bad_fix", "cot_error", "ok",
-})
+VERDICT_CLASSES = frozenset(
+    {
+        "plan_gap",
+        "wrong_order",
+        "spec_drift",
+        "missed_requirement",
+        "bad_fix",
+        "cot_error",
+        "ok",
+    }
+)
 
 _SEVERITIES = frozenset({"info", "action", "blocker"})
 _ACTION_KINDS = frozenset({"replan", "reorder", "edit", "ask_user", "none"})
@@ -86,6 +103,7 @@ def load_role_card(role_id: str = "overseer", roles_dir: Path | None = None) -> 
     """
     try:
         from services.agent.roles import load_role  # lazy: avoid import cost/cycles
+
         card = load_role(role_id, roles_dir=roles_dir)
         return {"id": card.id, "goal": card.goal, "system_prompt": card.system_prompt}
     except Exception:  # noqa: BLE001 — missing/broken card must not break the run
@@ -111,8 +129,15 @@ _FALLBACK_SYSTEM = (
 # Fallback preference order used when routing.yaml is unavailable or has no sources
 # configured.  This is a last-resort fallback ONLY — contract §14 forbids hardcoded
 # role→model bindings; routing.yaml is the canonical source of truth.
-_STRONGEST_PREFERENCE_FALLBACK = ("anthropic", "openai", "openrouter", "gemini", "vllm",
-                                   "llamacpp", "mock")
+_STRONGEST_PREFERENCE_FALLBACK = (
+    "anthropic",
+    "openai",
+    "openrouter",
+    "gemini",
+    "vllm",
+    "llamacpp",
+    "mock",
+)
 
 
 def resolve_overseer_provider(
@@ -167,9 +192,11 @@ def resolve_overseer_provider(
 # Evidence assembly (budgeted)
 # ---------------------------------------------------------------------------
 
+
 @dataclass
 class AuditScope:
     """What one audit covers (mirrors the ``scope`` object in §11)."""
+
     run_id: str = ""
     stage: str = ""
     roles: list[str] = field(default_factory=list)
@@ -182,6 +209,7 @@ class EvidenceBudget:
 
     Frontier default; a caller on a smaller tier passes a shrunken budget.
     """
+
     ledger: int = 2500
     buildgraph: int = 800
     handoffs: int = 1500
@@ -217,14 +245,17 @@ def _slice_buildgraph(graph: dict, scope: AuditScope, budget_chars: int) -> str:
         if not selected:
             selected = list(nodes)
 
-    lines = [f"[BUILDGRAPH mission={graph.get('mission','')}]"]
+    lines = [f"[BUILDGRAPH mission={graph.get('mission', '')}]"]
     used = len(lines[0])
     dropped = 0
     for n in selected:
         req = ",".join(n.get("requires") or [])
-        line = (f"  {n.get('id','?')} [{n.get('kind','?')}/{n.get('status','?')}] "
-                f"{n.get('label','')}" + (f"  requires: {req}" if req else "")
-                + (f"  why: {n.get('why')}" if n.get("why") else ""))
+        line = (
+            f"  {n.get('id', '?')} [{n.get('kind', '?')}/{n.get('status', '?')}] "
+            f"{n.get('label', '')}"
+            + (f"  requires: {req}" if req else "")
+            + (f"  why: {n.get('why')}" if n.get("why") else "")
+        )
         if used + len(line) + 1 > budget_chars and len(lines) > 1:
             dropped += 1
             continue
@@ -264,7 +295,9 @@ def _render_handoffs(handoffs: list[dict], budget_chars: int, max_n: int) -> str
         if reasoning:
             block.append(f"    reasoning: {reasoning}")
         else:
-            block.append("    reasoning: (none surfaced — cannot audit CoT for this handoff)")
+            block.append(
+                "    reasoning: (none surfaced — cannot audit CoT for this handoff)"
+            )
         text = "\n".join(block)
         if used + len(text) + 1 > budget_chars and len(lines) > 1:
             dropped += 1
@@ -277,8 +310,9 @@ def _render_handoffs(handoffs: list[dict], budget_chars: int, max_n: int) -> str
     return "\n".join(lines)
 
 
-def _render_history(prior_audits: list[dict], prior_advisories: list[dict],
-                    budget_chars: int) -> str:
+def _render_history(
+    prior_audits: list[dict], prior_advisories: list[dict], budget_chars: int
+) -> str:
     """Fingerprints of prior audits/advisories — cheap dedupe + repeat detection.
 
     We do not re-inject full prior findings (budget); a one-line fingerprint per
@@ -288,10 +322,14 @@ def _render_history(prior_audits: list[dict], prior_advisories: list[dict],
     for aud in prior_audits[-8:]:
         for v in aud.get("verdicts", []):
             fp = _fingerprint(v)
-            lines.append(f"  audit {aud.get('id','?')}: {v.get('class','?')}/{v.get('severity','?')} [{fp}]")
+            lines.append(
+                f"  audit {aud.get('id', '?')}: {v.get('class', '?')}/{v.get('severity', '?')} [{fp}]"
+            )
     for adv in prior_advisories[-8:]:
         for it in adv.get("items", []):
-            lines.append(f"  advisory {it.get('id','?')}: {it.get('severity','?')} {it.get('check','')}")
+            lines.append(
+                f"  advisory {it.get('id', '?')}: {it.get('severity', '?')} {it.get('check', '')}"
+            )
     if not lines:
         return ""
     body = "\n".join(lines)
@@ -300,8 +338,9 @@ def _render_history(prior_audits: list[dict], prior_advisories: list[dict],
     return "[PRIOR-FINDINGS]\n" + body + "\n[/PRIOR-FINDINGS]"
 
 
-def render_master_intent(brief: dict | None, requirements: list[dict] | None,
-                         *, max_reqs: int = 12) -> str:
+def render_master_intent(
+    brief: dict | None, requirements: list[dict] | None, *, max_reqs: int = 12
+) -> str:
     """Render the PINNED, non-truncatable master-intent block (T-DP5 §3.1).
 
     The overseer "holds and re-grounds the master intent so fresh-context stages
@@ -367,37 +406,48 @@ def assemble_evidence(
     worker issues (T-W22, §18 concern-aging rule).
     """
     budget = budget or EvidenceBudget()
-    parts: list[str] = [f"TRIGGER: {trigger}",
-                        f"SCOPE: run={scope.run_id} stage={scope.stage} "
-                        f"roles={scope.roles} nodes={scope.buildgraph_nodes}"]
+    parts: list[str] = [
+        f"TRIGGER: {trigger}",
+        f"SCOPE: run={scope.run_id} stage={scope.stage} "
+        f"roles={scope.roles} nodes={scope.buildgraph_nodes}",
+    ]
     if master_intent:
         # Pinned first, never truncated — the ground truth for drift detection.
         parts.append(master_intent)
     if ledger_text:
         parts.append(ledger_text)
-    bg = _slice_buildgraph(buildgraph or {}, scope, budget.buildgraph * _CHARS_PER_TOKEN)
+    bg = _slice_buildgraph(
+        buildgraph or {}, scope, budget.buildgraph * _CHARS_PER_TOKEN
+    )
     if bg:
         parts.append(bg)
-    ho = _render_handoffs(handoffs or [], budget.handoffs * _CHARS_PER_TOKEN, budget.max_handoffs)
+    ho = _render_handoffs(
+        handoffs or [], budget.handoffs * _CHARS_PER_TOKEN, budget.max_handoffs
+    )
     if ho:
         parts.append(ho)
-    hist = _render_history(prior_audits or [], prior_advisories or [],
-                           budget.history * _CHARS_PER_TOKEN)
+    hist = _render_history(
+        prior_audits or [], prior_advisories or [], budget.history * _CHARS_PER_TOKEN
+    )
     if hist:
         parts.append(hist)
     if change_plan is not None:
         # Self-audit of a change plan (change_request trigger): the plan IS the
         # evidence to audit — surface it verbatim.
-        parts.append("[CHANGE-PLAN UNDER AUDIT]\n"
-                     + json.dumps(change_plan, ensure_ascii=False, indent=2)
-                     + "\n[/CHANGE-PLAN]")
+        parts.append(
+            "[CHANGE-PLAN UNDER AUDIT]\n"
+            + json.dumps(change_plan, ensure_ascii=False, indent=2)
+            + "\n[/CHANGE-PLAN]"
+        )
     if org_concerns:
         # Unresolved worker concerns that have aged past one manager turn (§18).
         # Surface them so the auditor can decide whether to escalate.
-        lines = [f"  • [{c['request_id']}] from={c['from']} "
-                 f"raised_turn={c['raised_turn']} current_turn={c['current_turn']}: "
-                 f"{c['body'][:120]}"
-                 for c in org_concerns]
+        lines = [
+            f"  • [{c['request_id']}] from={c['from']} "
+            f"raised_turn={c['raised_turn']} current_turn={c['current_turn']}: "
+            f"{c['body'][:120]}"
+            for c in org_concerns
+        ]
         parts.append("[ORG-CONCERNS]\n" + "\n".join(lines) + "\n[/ORG-CONCERNS]")
     return "\n\n".join(parts)
 
@@ -405,6 +455,7 @@ def assemble_evidence(
 # ---------------------------------------------------------------------------
 # Verdict parsing + validation (strict aicad.audit/1)
 # ---------------------------------------------------------------------------
+
 
 class AuditValidationError(ValueError):
     """Raised when a model reply is not a valid aicad.audit/1 record."""
@@ -425,7 +476,7 @@ def _extract_json(text: str) -> dict:
         end = s.rfind("}")
         if start == -1 or end == -1 or end <= start:
             raise AuditValidationError("no JSON object in audit reply")
-        s = s[start:end + 1]
+        s = s[start : end + 1]
     try:
         obj = json.loads(s)
     except json.JSONDecodeError as exc:
@@ -445,7 +496,9 @@ def validate_audit(obj: dict) -> dict:
     Fills defaults for ``id``/``model``/``tokens``.  Returns the normalized dict.
     """
     if obj.get("schema") != AUDIT_SCHEMA:
-        raise AuditValidationError(f"schema must be {AUDIT_SCHEMA!r}, got {obj.get('schema')!r}")
+        raise AuditValidationError(
+            f"schema must be {AUDIT_SCHEMA!r}, got {obj.get('schema')!r}"
+        )
     trigger = obj.get("trigger")
     if trigger not in TRIGGERS:
         raise AuditValidationError(f"trigger {trigger!r} not in {sorted(TRIGGERS)}")
@@ -459,42 +512,53 @@ def validate_audit(obj: dict) -> dict:
             raise AuditValidationError(f"verdict[{i}] is not an object")
         cls = v.get("class")
         if cls not in VERDICT_CLASSES:
-            raise AuditValidationError(f"verdict[{i}].class {cls!r} not in {sorted(VERDICT_CLASSES)}")
+            raise AuditValidationError(
+                f"verdict[{i}].class {cls!r} not in {sorted(VERDICT_CLASSES)}"
+            )
         sev = v.get("severity")
         if sev not in _SEVERITIES:
-            raise AuditValidationError(f"verdict[{i}].severity {sev!r} not in {sorted(_SEVERITIES)}")
+            raise AuditValidationError(
+                f"verdict[{i}].severity {sev!r} not in {sorted(_SEVERITIES)}"
+            )
         action = v.get("required_action") or {}
         akind = action.get("kind", "none")
         if akind not in _ACTION_KINDS:
-            raise AuditValidationError(f"verdict[{i}].required_action.kind {akind!r} not in {sorted(_ACTION_KINDS)}")
+            raise AuditValidationError(
+                f"verdict[{i}].required_action.kind {akind!r} not in {sorted(_ACTION_KINDS)}"
+            )
         evidence = v.get("evidence") or {}
         if not isinstance(evidence, dict):
             raise AuditValidationError(f"verdict[{i}].evidence is not an object")
         # Evidence-refs rule (role card §HOW TO RULE 1): a non-ok finding without
         # any evidence ref is itself a cot_error — reject it.
         if cls != "ok":
-            any_ref = any(evidence.get(k) for k in ("ledger_events", "advisories", "handoffs", "preflight"))
+            any_ref = any(
+                evidence.get(k)
+                for k in ("ledger_events", "advisories", "handoffs", "preflight")
+            )
             if not any_ref:
                 raise AuditValidationError(
                     f"verdict[{i}] class={cls!r} has no evidence refs — an audit "
                     "finding without evidence is itself a cot_error (role card rule)"
                 )
-        norm_verdicts.append({
-            "class": cls,
-            "finding": str(v.get("finding", "")),
-            "evidence": {
-                "ledger_events": list(evidence.get("ledger_events") or []),
-                "advisories": list(evidence.get("advisories") or []),
-                "handoffs": list(evidence.get("handoffs") or []),
-                "preflight": list(evidence.get("preflight") or []),
-            },
-            "required_action": {
-                "kind": akind,
-                "detail": str(action.get("detail", "")),
-                "dispatch_role": action.get("dispatch_role"),
-            },
-            "severity": sev,
-        })
+        norm_verdicts.append(
+            {
+                "class": cls,
+                "finding": str(v.get("finding", "")),
+                "evidence": {
+                    "ledger_events": list(evidence.get("ledger_events") or []),
+                    "advisories": list(evidence.get("advisories") or []),
+                    "handoffs": list(evidence.get("handoffs") or []),
+                    "preflight": list(evidence.get("preflight") or []),
+                },
+                "required_action": {
+                    "kind": akind,
+                    "detail": str(action.get("detail", "")),
+                    "dispatch_role": action.get("dispatch_role"),
+                },
+                "severity": sev,
+            }
+        )
 
     model = obj.get("model") or {}
     return {
@@ -503,7 +567,10 @@ def validate_audit(obj: dict) -> dict:
         "trigger": trigger,
         "scope": obj.get("scope") or {},
         "verdicts": norm_verdicts,
-        "model": {"provider": str(model.get("provider", "")), "id": str(model.get("id", ""))},
+        "model": {
+            "provider": str(model.get("provider", "")),
+            "id": str(model.get("id", "")),
+        },
         "tokens": int(obj.get("tokens") or 0),
     }
 
@@ -521,10 +588,12 @@ def _fingerprint(verdict: dict) -> str:
     """
     reentry = verdict.get("targeted_reentry")
     if isinstance(reentry, dict) and reentry.get("stage"):
-        raw = (f"reentry|{reentry.get('stage','')}|{reentry.get('role','')}|"
-              f"{reentry.get('feature') or ''}")
+        raw = (
+            f"reentry|{reentry.get('stage', '')}|{reentry.get('role', '')}|"
+            f"{reentry.get('feature') or ''}"
+        )
     else:
-        raw = f"class|{verdict.get('class','')}|{verdict.get('finding','').strip().lower()}"
+        raw = f"class|{verdict.get('class', '')}|{verdict.get('finding', '').strip().lower()}"
     return hashlib.sha256(raw.encode()).hexdigest()[:12]
 
 
@@ -544,38 +613,46 @@ def audit_to_advisory(audit: dict, seq: int = 0) -> dict:
         sev = sev_map.get(v.get("severity"), "info")
         akind = act.get("kind", "none")
         if akind not in (None, "none"):
-            fixes = [{
-                "action": akind,
-                "params": {"dispatch_role": act.get("dispatch_role")} if act.get("dispatch_role") else {},
-                "basis": "overseer audit finding",
-                "predicted_effect": act.get("detail", ""),
-                "confidence": "llm",
-            }]
+            fixes = [
+                {
+                    "action": akind,
+                    "params": {"dispatch_role": act.get("dispatch_role")}
+                    if act.get("dispatch_role")
+                    else {},
+                    "basis": "overseer audit finding",
+                    "predicted_effect": act.get("detail", ""),
+                    "confidence": "llm",
+                }
+            ]
         elif sev != "info":
             # §3 invariant: a non-info advisory item MUST carry ≥1 candidate fix.
             # A non-info verdict with required_action.kind=="none" would violate it,
             # so we emit a "review" fix — the honest action is "a human/role should
             # look at this finding" — rather than an illegal empty-fix item.
-            fixes = [{
-                "action": "review_finding",
-                "params": {},
-                "basis": "overseer flagged this but named no specific action",
-                "predicted_effect": v.get("finding", ""),
-                "confidence": "llm",
-            }]
+            fixes = [
+                {
+                    "action": "review_finding",
+                    "params": {},
+                    "basis": "overseer flagged this but named no specific action",
+                    "predicted_effect": v.get("finding", ""),
+                    "confidence": "llm",
+                }
+            ]
         else:
             fixes = []
-        items.append({
-            "id": f"adv_{_fingerprint(v)}",
-            "severity": sev,
-            "check": v.get("class", "audit"),
-            "finding": v.get("finding", ""),
-            "refs": {"audit_id": audit.get("id", ""), **(v.get("evidence") or {})},
-            "numbers": {},
-            "candidate_fixes": fixes,
-            "helper_tools": [],
-            "source": {"kind": "llm", "detail": f"overseer:{audit.get('id','')}"},
-        })
+        items.append(
+            {
+                "id": f"adv_{_fingerprint(v)}",
+                "severity": sev,
+                "check": v.get("class", "audit"),
+                "finding": v.get("finding", ""),
+                "refs": {"audit_id": audit.get("id", ""), **(v.get("evidence") or {})},
+                "numbers": {},
+                "candidate_fixes": fixes,
+                "helper_tools": [],
+                "source": {"kind": "llm", "detail": f"overseer:{audit.get('id', '')}"},
+            }
+        )
     return {
         "schema": "aicad.advisory/1",
         "seq": seq,
@@ -596,20 +673,20 @@ LedgerLike = Any
 @dataclass
 class AuditResult:
     """The outcome of one :meth:`Overseer.audit` call."""
-    audit: dict                       # validated aicad.audit/1 record (or {} if skipped/failed)
-    advisory: dict                    # aicad.advisory/1 block (verdicts as review findings)
-    escalated: bool = False           # a repeat-blocker forced ask_user
-    escalation_text: str = ""         # human-facing text when escalated
-    skipped: str = ""                 # non-empty reason when the audit did not run
-    error: str = ""                   # non-empty when the reply was rejected
+
+    audit: dict  # validated aicad.audit/1 record (or {} if skipped/failed)
+    advisory: dict  # aicad.advisory/1 block (verdicts as review findings)
+    escalated: bool = False  # a repeat-blocker forced ask_user
+    escalation_text: str = ""  # human-facing text when escalated
+    skipped: str = ""  # non-empty reason when the audit did not run
+    error: str = ""  # non-empty when the reply was rejected
 
 
 class Overseer:
-    """Trigger-driven auditor.  Holds a provider, the role card, and per-run state.
-
-    The provider is a ``services.agent.providers.base.Provider`` (mockable) — the
-    engine is deterministic around it (offline discipline).  ``ledger`` is optional;
-    when present, every audit is appended as a ledger event.
+    """Trigger-driven auditor with per-run debounce and persisted blocker state.
+    Online audits are one-shot Chudcode role turns. Direct provider injection is
+    treated as an explicit offline test/local request unless ``offline=False`` is
+    supplied; provider objects are never used by the online path.
     """
 
     def __init__(
@@ -620,12 +697,22 @@ class Overseer:
         ledger: LedgerLike | None = None,
         budget: EvidenceBudget | None = None,
         max_tokens: int = 4000,
+        session_id: str = "",
+        on_event: Callable[..., None] | None = None,
+        options: dict[str, Any] | None = None,
+        offline: bool | None = None,
     ) -> None:
-        self.provider = provider
-        self.role_card = role_card if role_card is not None else load_role_card("overseer")
+        self.offline = provider is not None if offline is None else bool(offline)
+        self.offline_provider = provider if self.offline else None
+        self.role_card = (
+            role_card if role_card is not None else load_role_card("overseer")
+        )
         self.ledger = ledger
         self.budget = budget or EvidenceBudget()
         self.max_tokens = max_tokens
+        self.session_id = session_id
+        self.on_event = on_event
+        self.options = dict(options or {})
         self._system = (self.role_card.get("system_prompt") or _FALLBACK_SYSTEM).strip()
         # Debounce: one audit per (trigger, scope-fingerprint) — a stage-exit that
         # fires twice for the same stage does not double-audit.
@@ -709,20 +796,26 @@ class Overseer:
         so the [ORG-CONCERNS] block is visible to the auditor (T-W22, §18).
         """
         if trigger not in TRIGGERS:
-            return AuditResult(audit={}, advisory=_empty_advisory(scope),
-                               skipped=f"unknown trigger {trigger!r}")
+            return AuditResult(
+                audit={},
+                advisory=_empty_advisory(scope),
+                skipped=f"unknown trigger {trigger!r}",
+            )
         if not self.should_run(trigger, scope):
-            return AuditResult(audit={}, advisory=_empty_advisory(scope),
-                               skipped="debounced (already audited this trigger/scope)")
+            return AuditResult(
+                audit={},
+                advisory=_empty_advisory(scope),
+                skipped="debounced (already audited this trigger/scope)",
+            )
         self._seen_triggers.add(self._trigger_key(trigger, scope))
-
-        if self.provider is None:
-            return AuditResult(audit={}, advisory=_empty_advisory(scope),
-                               skipped="no provider configured for overseer (routing seam)")
 
         # Prior findings default to what the ledger already recorded, so the
         # "you already flagged X" dedupe survives fresh-Overseer-per-call in-app use.
-        if prior_audits is None and prior_advisories is None and self.ledger is not None:
+        if (
+            prior_audits is None
+            and prior_advisories is None
+            and self.ledger is not None
+        ):
             prior_audits, prior_advisories = self.prior_findings_from_ledger()
 
         # Pin the master intent (brief + requirements) so a small-context audit never
@@ -731,29 +824,81 @@ class Overseer:
         master_intent = ""
         if self.ledger is not None:
             state = getattr(self.ledger, "state", None) or {}
-            master_intent = render_master_intent(state.get("brief"),
-                                                  state.get("requirements"))
+            master_intent = render_master_intent(
+                state.get("brief"), state.get("requirements")
+            )
 
         evidence = assemble_evidence(
-            trigger, scope,
-            ledger_text=ledger_text, master_intent=master_intent,
-            buildgraph=buildgraph, handoffs=handoffs,
-            prior_audits=prior_audits, prior_advisories=prior_advisories,
-            change_plan=change_plan, org_concerns=org_concerns, budget=self.budget,
+            trigger,
+            scope,
+            ledger_text=ledger_text,
+            master_intent=master_intent,
+            buildgraph=buildgraph,
+            handoffs=handoffs,
+            prior_audits=prior_audits,
+            prior_advisories=prior_advisories,
+            change_plan=change_plan,
+            org_concerns=org_concerns,
+            budget=self.budget,
         )
         user_msg = _audit_user_message(trigger, evidence)
+        turn_key = self._trigger_key(trigger, scope)
+        turn_node_id = f"overseer:{turn_key}"
+        turn_run_id = (
+            "overseer-"
+            + hashlib.sha256(f"{scope.run_id}|{turn_key}".encode("utf-8")).hexdigest()[
+                :24
+            ]
+        )
 
+        turn_options = {
+            **self.options,
+            "ledger": self.ledger,
+            "phase": scope.stage,
+            "node_id": turn_node_id,
+            "subagent_id": turn_node_id,
+            "offline": self.offline,
+        }
+        if self.offline_provider is not None:
+            turn_options["offline_provider"] = self.offline_provider
         try:
-            from services.agent.role_models import clamp_provider_effort
-            provider = clamp_provider_effort(self.provider)
-            reply = provider.complete(
-                self._system,
-                [{"role": "user", "content": user_msg}],
+            turn = run_role_turn(
+                user_msg,
+                "overseer",
+                session_id=self.session_id or scope.run_id or "overseer",
+                run_id=turn_run_id,
+                parent_id=f"{scope.run_id}:{turn_node_id}",
+                on_event=self.on_event,
+                options=turn_options,
                 max_tokens=self.max_tokens,
+                actor="overseer",
+                close_session=True,
             )
-        except Exception as exc:  # noqa: BLE001 — provider failure never blocks the mission
-            return AuditResult(audit={}, advisory=_empty_advisory(scope),
-                               error=f"provider error: {exc}")
+        except Exception as exc:  # noqa: BLE001 — auditor failure never blocks mission
+            return AuditResult(
+                audit={},
+                advisory=_empty_advisory(scope),
+                error=f"provider error: {exc}",
+            )
+        if not isinstance(turn, dict) or not turn.get("success"):
+            reason = ""
+            if isinstance(turn, dict):
+                payload = turn.get("result")
+                if isinstance(payload, dict):
+                    reason = str(payload.get("error") or payload.get("reason") or "")
+                reason = reason or str(turn.get("stop_reason") or "")
+            return AuditResult(
+                audit={},
+                advisory=_empty_advisory(scope),
+                error=f"provider error: {reason or 'Chudcode overseer turn failed'}",
+            )
+        reply = _role_turn_reply(turn)
+        if not reply:
+            return AuditResult(
+                audit={},
+                advisory=_empty_advisory(scope),
+                error="provider error: Chudcode overseer returned no audit",
+            )
 
         try:
             parsed = _extract_json(reply)
@@ -762,16 +907,20 @@ class Overseer:
             parsed["trigger"] = trigger
             parsed.setdefault("scope", {})
             parsed["scope"] = {
-                "run_id": scope.run_id, "stage": scope.stage,
-                "roles": scope.roles, "buildgraph_nodes": scope.buildgraph_nodes,
+                "run_id": scope.run_id,
+                "stage": scope.stage,
+                "roles": scope.roles,
+                "buildgraph_nodes": scope.buildgraph_nodes,
             }
             audit = validate_audit(parsed)
         except AuditValidationError as exc:
-            return AuditResult(audit={}, advisory=_empty_advisory(scope),
-                               error=str(exc))
+            return AuditResult(
+                audit={}, advisory=_empty_advisory(scope), error=str(exc)
+            )
 
-        # Token accounting (cost control §step 3): trust the model's count if it
-        # gave one, else estimate from evidence+reply length.
+        # Prefer authoritative Chudcode usage when the audit omitted its count.
+        if not audit["tokens"]:
+            audit["tokens"] = int(turn.get("tokens_used") or 0)
         if not audit["tokens"]:
             audit["tokens"] = _estimate_tokens(self._system, user_msg, reply)
 
@@ -781,6 +930,7 @@ class Overseer:
         # Computed from the evidence ledger-kinds, not the model's prose (validate
         # already stripped any model-supplied reroute — the harness owns routing).
         from .reroute import route_audit
+
         route_audit(audit, ledger=self.ledger)
 
         # Persist as a ledger event (audits are ledger events, §11).
@@ -796,9 +946,15 @@ class Overseer:
         # assigns it.
         escalated, esc_text = self._check_repeat_blockers(audit)
 
-        advisory = audit_to_advisory(audit, seq=len(getattr(self.ledger, "events", []) or []))
-        return AuditResult(audit=audit, advisory=advisory,
-                           escalated=escalated, escalation_text=esc_text)
+        advisory = audit_to_advisory(
+            audit, seq=len(getattr(self.ledger, "events", []) or [])
+        )
+        return AuditResult(
+            audit=audit,
+            advisory=advisory,
+            escalated=escalated,
+            escalation_text=esc_text,
+        )
 
     def _check_repeat_blockers(self, audit: dict) -> tuple[bool, str]:
         """Bump the fingerprint counter for each non-ok verdict; escalate at 2.
@@ -820,20 +976,26 @@ class Overseer:
                 escalated = True
                 texts.append(
                     f"The overseer flagged this the same way {self._blocker_counts[fp]} times "
-                    f"and it is still unresolved:\n  • {v.get('finding','')}\n"
-                    f"  Suggested action: {(v.get('required_action') or {}).get('kind','?')} — "
-                    f"{(v.get('required_action') or {}).get('detail','')}"
+                    f"and it is still unresolved:\n  • {v.get('finding', '')}\n"
+                    f"  Suggested action: {(v.get('required_action') or {}).get('kind', '?')} — "
+                    f"{(v.get('required_action') or {}).get('detail', '')}"
                 )
         esc_text = ""
         if escalated:
-            esc_text = ("This needs a human decision.\n\n" + "\n\n".join(texts) +
-                        "\n\nYour options: approve the suggested change, redirect the work, "
-                        "or tell the mission to proceed anyway.")
+            esc_text = (
+                "This needs a human decision.\n\n"
+                + "\n\n".join(texts)
+                + "\n\nYour options: approve the suggested change, redirect the work, "
+                "or tell the mission to proceed anyway."
+            )
             if self.ledger is not None:
                 try:
-                    self.ledger.add_question("overseer",
-                                             f"q_esc_{uuid.uuid4().hex[:6]}",
-                                             esc_text, blocking=True)
+                    self.ledger.add_question(
+                        "overseer",
+                        f"q_esc_{uuid.uuid4().hex[:6]}",
+                        esc_text,
+                        blocking=True,
+                    )
                 except Exception:  # noqa: BLE001
                     pass
         return escalated, esc_text
@@ -842,6 +1004,28 @@ class Overseer:
 # ---------------------------------------------------------------------------
 # Prompt + helpers
 # ---------------------------------------------------------------------------
+
+
+def _role_turn_reply(turn: dict[str, Any]) -> str:
+    """Extract the terminal audit text without weakening the audit schema."""
+    payload = turn.get("result")
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, dict):
+        if payload.get("schema") == AUDIT_SCHEMA:
+            return json.dumps(payload)
+        handoff = payload.get("handoff")
+        if isinstance(handoff, dict):
+            for key in ("summary", "text", "content"):
+                value = handoff.get(key)
+                if isinstance(value, str) and value.strip():
+                    return value.strip()
+        for key in ("text", "content", "summary"):
+            value = payload.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+    return ""
+
 
 def _audit_user_message(trigger: str, evidence: str) -> str:
     return (
@@ -856,8 +1040,13 @@ def _audit_user_message(trigger: str, evidence: str) -> str:
 
 
 def _empty_advisory(scope: AuditScope) -> dict:
-    return {"schema": "aicad.advisory/1", "seq": 0, "stage": scope.stage,
-            "items": [], "user_override": False}
+    return {
+        "schema": "aicad.advisory/1",
+        "seq": 0,
+        "stage": scope.stage,
+        "items": [],
+        "user_override": False,
+    }
 
 
 def _estimate_tokens(system: str, user_msg: str, reply: str) -> int:

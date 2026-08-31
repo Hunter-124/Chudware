@@ -197,6 +197,8 @@ def test_online_role_prompt_tools_lineage_settings_history_attachments_and_resul
         },
         "tokens_used": 18,
         "provider_usage_recorded": True,
+        "calls": [],
+        "tool_calls": 0,
         "offline": False,
     }
     usage_event = next(
@@ -441,3 +443,104 @@ def test_host_failure_retains_nested_result_shape(monkeypatch, online_runtime):
     assert result["allowed_tools"] == ["measure_part", "render_part"]
     assert result["tokens_used"] == 0
     assert result["provider_usage_recorded"] is False
+
+
+@pytest.mark.parametrize(
+    ("options", "expected"),
+    [
+        ({"mission_dispatch": object()}, ["role_tool"]),
+        ({"mission_dispatch": object(), "allowed_tools": None}, None),
+        ({"mission_dispatch": object(), "allowed_tools": []}, []),
+        (
+            {
+                "mission_dispatch": object(),
+                "allowed_tools": ["exact_tool", "exact_tool", ""],
+            },
+            ["exact_tool", "exact_tool"],
+        ),
+    ],
+)
+def test_role_runtime_preserves_explicit_allowed_tool_tristate(
+    monkeypatch,
+    options,
+    expected,
+):
+    from services.agent import agent_turn
+    from services.agent import mission_dispatch as mission
+
+    captured = {}
+    monkeypatch.setattr(
+        agent_turn, "resolver_for", lambda _dispatch: lambda _name: None
+    )
+    monkeypatch.setattr(
+        mission,
+        "linear_role_prompt",
+        lambda *_args, **_kwargs: ("SYSTEM", ["role_tool"], None),
+    )
+
+    def fake_build_host_tools(context):
+        captured.update(context)
+        return []
+
+    monkeypatch.setattr(roles, "build_host_tools", fake_build_host_tools)
+    card = SimpleNamespace(concrete_tools=["role_tool"])
+    roles._assemble_role_runtime(
+        card,
+        "reviewer",
+        "run",
+        "parent",
+        {**options, "categories": ["analysis"]},
+        None,
+        None,
+        None,
+        None,
+    )
+    assert captured["allowed_tools"] == expected
+    assert captured["categories"] == ["analysis"]
+
+
+def test_bounded_tool_calls_preserve_order_doc_id_and_redact_secrets():
+    records = [
+        {
+            "tool": "new_part",
+            "args": {"name": "bracket", "api_key": "sk-secret"},
+            "ok": True,
+            "result": {"ok": True, "doc_id": "doc-7", "mesh": "x" * 8000},
+        }
+    ] + [
+        {
+            "tool": f"measure_{index}",
+            "args": {"authorization": "Bearer raw-token", "index": index},
+            "ok": True,
+            "result": {"ok": True, "value": index},
+        }
+        for index in range(44)
+    ]
+
+    calls, total = roles._bounded_tool_calls(records)
+
+    assert total == 45
+    assert len(calls) == 40
+    assert calls[0]["tool"] == "new_part"
+    assert calls[0]["args"]["api_key"] == "[redacted]"
+    assert calls[0]["result"]["doc_id"] == "doc-7"
+    assert calls[1]["args"]["authorization"] == "[redacted]"
+    assert len(str(calls[0]["result"])) < 2200
+
+
+def test_role_events_preserve_single_dict_live_sink(monkeypatch, online_runtime):
+    host = _Host()
+    monkeypatch.setattr(roles, "get_default_chudcode_host", lambda: host)
+    events = []
+
+    roles.run_role_turn(
+        "audit",
+        "reviewer",
+        session_id="conversation",
+        run_id="run",
+        parent_id="node",
+        on_event=lambda event: events.append(event),
+    )
+
+    assert any(event.get("kind") == "agent.provider_usage" for event in events)
+    assert all(event.get("parent_id") == "node" for event in events)

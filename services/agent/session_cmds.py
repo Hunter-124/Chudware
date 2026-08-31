@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import copy
 import importlib
-from typing import Any, Optional
+from typing import Any
 
 # ---------------------------------------------------------------------------
 # Handoff prompt — structure LITERALLY from omp handoff-document.md
@@ -181,39 +181,85 @@ def _normalize_messages(messages: list | None) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
-# Provider resolution (oneshot complete)
+# One-shot role helpers
 # ---------------------------------------------------------------------------
 
 
-def _resolve_provider(provider: Any = None, model: str | None = None):
-    """Return a Provider with ``.complete(system, messages, max_tokens=...)``.
+def _role_turn_text(turn: dict[str, Any], command: str) -> str:
+    if not isinstance(turn, dict):
+        raise SessionCommandUnavailable(f"{command} returned a non-object response")
+    if turn.get("success") is not True:
+        nested = turn.get("result") if isinstance(turn.get("result"), dict) else {}
+        reason = str(
+            nested.get("error")
+            or nested.get("error_detail")
+            or turn.get("stop_reason")
+            or f"{command} failed"
+        )
+        raise SessionCommandUnavailable(reason)
+    result = turn.get("result")
+    if isinstance(result, str):
+        return result.strip()
+    if isinstance(result, dict):
+        handoff = result.get("handoff")
+        if isinstance(handoff, dict):
+            for key in ("document", "summary", "text", "response"):
+                value = handoff.get(key)
+                if isinstance(value, str) and value.strip():
+                    return value.strip()
+        for key in ("document", "answer", "text", "response", "summary"):
+            value = result.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+    return ""
 
-    *provider* may be:
-      - a Provider instance (tests inject mocks this way)
-      - a provider name string (``\"xai\"``, ``\"anthropic\"``, …)
-      - None → config default via ``get_provider``
-    """
-    if provider is not None and hasattr(provider, "complete"):
-        return provider
-    name = provider if isinstance(provider, str) and provider.strip() else None
-    cfg: dict = {}
-    if model:
-        cfg["model"] = model
-    try:
-        from services.agent import config as agent_config  # type: ignore
-    except Exception:  # noqa: BLE001
-        from services.agent import config as agent_config  # type: ignore
-    return agent_config.get_provider(name=name, cfg=cfg or None)
 
-
-def _complete(
-    provider: Any, system: str, messages: list[dict], *, max_tokens: int = 4096
+def _run_one_shot_role(
+    *,
+    command: str,
+    request: str,
+    messages: list[dict],
+    session_id: str | None,
+    provider: Any,
+    model: str | None,
+    max_tokens: int,
+    standalone: bool,
 ) -> str:
-    """Oneshot completion; tool_choice is none by construction (no tools passed)."""
-    text = provider.complete(system, messages, max_tokens=max_tokens)
-    if isinstance(text, tuple):
-        text = text[0]
-    return (text or "").strip()
+    from services.agent.chudcode_roles import run_role_turn  # noqa: PLC0415
+
+    local = _local_compaction(standalone)
+    parent_session = str(session_id or "").strip()
+    if not parent_session:
+        if not local:
+            raise SessionCommandUnavailable(
+                f"{command} requires a live Chudcode session_id"
+            )
+        parent_session = f"offline-{command}"
+    settings: dict[str, Any] = {}
+    if isinstance(provider, str) and provider.strip():
+        settings["provider"] = provider.strip()
+    if model and str(model).strip():
+        settings["model"] = str(model).strip()
+    options: dict[str, Any] = {
+        "allowed_tools": [],
+        "settings": settings,
+        "offline": local,
+    }
+    if local and provider is not None and not isinstance(provider, str):
+        options["offline_provider"] = provider
+    turn = run_role_turn(
+        request,
+        "general_agent",
+        session_id=parent_session,
+        run_id=f"{parent_session}:{command}",
+        parent_id=f"{parent_session}:{command}",
+        options=options,
+        history=messages,
+        max_tokens=max_tokens,
+        max_total_tokens=max_tokens * 2,
+        close_session=True,
+    )
+    return _role_turn_text(turn, command)
 
 
 class SessionCommandUnavailable(RuntimeError):
@@ -290,16 +336,48 @@ def handoff_document(
     focus: str | None = None,
     provider: Any = None,
     model: str | None = None,
+    *,
+    session_id: str | None = None,
+    standalone: bool = False,
 ) -> str:
-    """Generate a structured handoff document via oneshot LLM completion.
+    """Generate a handoff from the authoritative live Chudcode session.
 
-    Returns the document text only. New-session creation is host-side.
-    Does **not** mutate *messages*.
+    Online mode calls the session's native ``handoff`` side request so it sees
+    Chudcode's persisted/compacted context and selected provider.  Explicit
+    offline/standalone mode uses one bounded offline-safe role turn.  Caller
+    messages are snapshotted and never mutated.
     """
     history = _normalize_messages(_snapshot_messages(messages))
-    prompt_msgs = history + [_as_text_message("user", _handoff_user_prompt(focus))]
-    prov = _resolve_provider(provider, model)
-    return _complete(prov, _HANDOFF_SYSTEM, prompt_msgs, max_tokens=4096)
+    if _local_compaction(standalone):
+        request = _HANDOFF_SYSTEM + "\n\n" + _handoff_user_prompt(focus)
+        return _run_one_shot_role(
+            command="handoff",
+            request=request,
+            messages=history,
+            session_id=session_id,
+            provider=provider,
+            model=model,
+            max_tokens=4096,
+            standalone=True,
+        )
+
+    payload: dict[str, Any] = {}
+    note = str(focus or "").strip()
+    if note:
+        payload["customInstructions"] = note
+    result = _chudcode_session_call(session_id, "handoff", payload)
+    for key in ("document", "handoff", "text", "summary", "result"):
+        value = result.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+        if isinstance(value, dict):
+            for nested_key in ("document", "text", "summary"):
+                nested = value.get(nested_key)
+                if isinstance(nested, str) and nested.strip():
+                    return nested.strip()
+    raise SessionCommandUnavailable(
+        "Chudcode session handoff returned no document text"
+    )
 
 
 def btw_answer(
@@ -307,22 +385,32 @@ def btw_answer(
     question: str,
     provider: Any = None,
     model: str | None = None,
+    *,
+    session_id: str | None = None,
+    standalone: bool = False,
 ) -> str:
-    """Ephemeral side-channel Q&A over a snapshot of *messages*.
-
-    Never mutates *messages* / history. No tools. Brief answer only.
-    """
+    """Answer one bounded side question without mutating the parent session."""
     q = (question or "").strip()
     if not q:
         return ""
     history = _normalize_messages(_snapshot_messages(messages))
-    # Append no-tools reminder + <btw> question (omp order)
-    prompt_msgs = history + [
-        _as_text_message("user", _BTW_NO_TOOLS_REMINDER),
-        _as_text_message("user", _btw_user_prompt(q)),
-    ]
-    prov = _resolve_provider(provider, model)
-    return _complete(prov, _BTW_SYSTEM, prompt_msgs, max_tokens=2048)
+    request = "\n\n".join(
+        (
+            _BTW_SYSTEM,
+            _BTW_NO_TOOLS_REMINDER,
+            _btw_user_prompt(q),
+        )
+    )
+    return _run_one_shot_role(
+        command="btw",
+        request=request,
+        messages=history,
+        session_id=session_id,
+        provider=provider,
+        model=model,
+        max_tokens=2048,
+        standalone=standalone,
+    )
 
 
 def compact_session(

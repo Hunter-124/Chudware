@@ -437,7 +437,7 @@ def _session_shake(params: dict, _emit: Callable) -> dict:
 
 
 def _session_handoff(params: dict, _emit: Callable) -> dict:
-    """``session_handoff`` — oneshot handoff document (host creates new session)."""
+    """Route a handoff through its named live Chudcode session (offline stays local)."""
     try:
         p = params or {}
         messages = _as_list(p.get("messages"))
@@ -448,11 +448,15 @@ def _session_handoff(params: dict, _emit: Callable) -> dict:
         model = p.get("model")
         if model is not None:
             model = str(model)
+        session_id = str(p.get("session_id") or "").strip() or None
+        standalone = bool(p.get("standalone") or p.get("offline"))
         document = _cmds().handoff_document(
             messages,
             focus=focus,
             provider=provider,
             model=model,
+            session_id=session_id,
+            standalone=standalone,
         )
         return {"ok": True, "document": document or ""}
     except Exception as exc:  # noqa: BLE001
@@ -475,11 +479,15 @@ def _session_btw(params: dict, _emit: Callable) -> dict:
         model = p.get("model")
         if model is not None:
             model = str(model)
+        session_id = str(p.get("session_id") or "").strip() or None
+        standalone = bool(p.get("standalone") or p.get("offline"))
         answer = _cmds().btw_answer(
             messages,
             question,
             provider=provider,
             model=model,
+            session_id=session_id,
+            standalone=standalone,
         )
         return {"ok": True, "answer": answer or ""}
     except Exception as exc:  # noqa: BLE001
@@ -2116,6 +2124,18 @@ def _redact_sensitive_response(value: Any) -> Any:
     return value
 
 
+def _redact_literal(value: Any, literal: str) -> Any:
+    if not literal:
+        return value
+    if isinstance(value, Mapping):
+        return {str(key): _redact_literal(item, literal) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_redact_literal(item, literal) for item in value]
+    if isinstance(value, str):
+        return value.replace(literal, "<redacted>")
+    return value
+
+
 _CHUDCODE_MAX_PROVIDERS = 128
 _CHUDCODE_MAX_MODELS = 512
 _CHUDCODE_MAX_TOOLS = 256
@@ -2169,6 +2189,9 @@ def _chudcode_transient_call(
         if not isinstance(result, dict):
             return {"ok": False, "reason": f"Chudcode {command} returned non-object"}
         clean = _redact_sensitive_response(result)
+        api_key = params.get("apiKey")
+        if secret_input and isinstance(api_key, str):
+            clean = _redact_literal(clean, api_key)
         clean.setdefault("ok", True)
         return clean
     except Exception as exc:  # noqa: BLE001 - worker methods return clean refusals
@@ -2358,11 +2381,36 @@ def _chudcode_auth_state(params: dict, _emit: Callable) -> dict:
 
 
 def _chudcode_validate_key(params: dict, emit: Callable) -> dict:
-    return _chudcode_auth_call("validate_api_key", params, emit)
+    raw = _chudcode_auth_call("validate_api_key", params, emit)
+    if not raw.get("ok"):
+        return raw
+    return {
+        "ok": True,
+        "providerId": _bounded_text(raw.get("providerId"), 128)
+        or _bounded_text(params.get("providerId"), 128),
+        "valid": bool(raw.get("valid")),
+    }
 
 
 def _chudcode_set_key(params: dict, emit: Callable) -> dict:
-    return _chudcode_auth_call("set_api_key", params, emit)
+    raw = _chudcode_auth_call("set_api_key", params, emit)
+    if not raw.get("ok"):
+        return raw
+    provider_raw = raw.get("provider")
+    provider = _auth_provider(provider_raw)
+    if provider is None:
+        return {"ok": False, "reason": "Chudcode set_api_key returned no provider"}
+    native_provider = {
+        "providerId": provider["id"],
+        "name": provider["name"],
+        "authenticated": provider["authenticated"],
+        "hasApiKey": provider["hasApiKey"],
+        "hasOAuth": provider["hasOAuth"],
+        "accounts": provider["accounts"],
+    }
+    if "origin" in provider:
+        native_provider["origin"] = provider["origin"]
+    return {"ok": True, "provider": native_provider}
 
 
 def _chudcode_remove_key(params: dict, emit: Callable) -> dict:
@@ -2581,6 +2629,76 @@ def _chudcode_tool_state(params: dict, _emit: Callable) -> dict:
             )
     tools.sort(key=lambda item: item["name"])
     return {"ok": True, "tools": tools[:_CHUDCODE_MAX_TOOLS]}
+
+
+def _chudcode_stt_failure(raw: Mapping[str, Any], command: str) -> dict:
+    reason = _bounded_text(raw.get("reason") or raw.get("error"), 4_096)
+    return {
+        "ok": False,
+        "reason": reason or f"Chudcode {command} failed",
+    }
+
+
+def _chudcode_stt_status(params: dict, _emit: Callable) -> dict:
+    if _has_unknown_params(params, frozenset({"session_id"})):
+        return {"ok": False, "reason": "chudcode_stt_status has unknown params"}
+    raw = _chudcode_session_call("stt_status", params)
+    if not raw.get("ok"):
+        return _chudcode_stt_failure(raw, "stt_status")
+    state = _bounded_text(raw.get("state"), 32)
+    if state not in {"idle", "recording", "transcribing"}:
+        state = "idle"
+    result: dict[str, Any] = {
+        "ok": True,
+        "available": bool(raw.get("available")),
+        "state": state,
+        "model": _bounded_text(raw.get("model"), 256) or "",
+    }
+    progress = raw.get("progress")
+    if isinstance(progress, (int, float)) and not isinstance(progress, bool):
+        result["progress"] = min(100, max(0, int(_finite_number(progress))))
+    error = _bounded_text(raw.get("error"), 4_096)
+    if error is not None:
+        result["error"] = error
+    return result
+
+
+def _chudcode_stt_start(params: dict, _emit: Callable) -> dict:
+    if _has_unknown_params(params, frozenset({"session_id"})):
+        return {"ok": False, "reason": "chudcode_stt_start has unknown params"}
+    raw = _chudcode_session_call("stt_start", params)
+    if not raw.get("ok"):
+        return _chudcode_stt_failure(raw, "stt_start")
+    return {
+        "ok": True,
+        "available": True,
+        "state": "recording",
+        "model": _bounded_text(raw.get("model"), 256) or "",
+        "progress": 100,
+    }
+
+
+def _chudcode_stt_stop(params: dict, _emit: Callable) -> dict:
+    if _has_unknown_params(params, frozenset({"session_id"})):
+        return {"ok": False, "reason": "chudcode_stt_stop has unknown params"}
+    raw = _chudcode_session_call("stt_stop", params)
+    if not raw.get("ok"):
+        return _chudcode_stt_failure(raw, "stt_stop")
+    text = raw.get("text")
+    if not isinstance(text, str):
+        text = ""
+    encoded = text.encode("utf-8")[:65_536]
+    text = encoded.decode("utf-8", errors="ignore")
+    return {"ok": True, "available": True, "state": "idle", "text": text}
+
+
+def _chudcode_stt_cancel(params: dict, _emit: Callable) -> dict:
+    if _has_unknown_params(params, frozenset({"session_id"})):
+        return {"ok": False, "reason": "chudcode_stt_cancel has unknown params"}
+    raw = _chudcode_session_call("stt_cancel", params)
+    if not raw.get("ok"):
+        return _chudcode_stt_failure(raw, "stt_cancel")
+    return {"ok": True, "available": True, "state": "idle"}
 
 
 def _agent_cancel(params: dict, _emit: Callable) -> dict:
@@ -3235,6 +3353,10 @@ ADMIN_METHODS: dict[str, Callable] = {
     "chudcode_set_auto_compaction": _chudcode_set_auto_compaction,
     "chudcode_set_auto_retry": _chudcode_set_auto_retry,
     "chudcode_tool_state": _chudcode_tool_state,
+    "chudcode_stt_status": _chudcode_stt_status,
+    "chudcode_stt_start": _chudcode_stt_start,
+    "chudcode_stt_stop": _chudcode_stt_stop,
+    "chudcode_stt_cancel": _chudcode_stt_cancel,
     "memory_remember": _memory_remember,
     "memory_recall": _memory_recall,
     "memory_stats": _memory_stats,

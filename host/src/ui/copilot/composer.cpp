@@ -3283,7 +3283,7 @@ static void drawComposerPrelude(AppState& st, bool busy) {
     // Tight gap to the prompt — prelude sits closer to the input box.
 }
 
-// ---- voice input (OMP ASR sidecar via agent_stt_*) --------------------------------------------
+// ---- voice input (live Chudcode session STT) -------------------------------------------------
 enum class VoiceUiState { Idle, Listening, Processing, Error, Unavailable };
 
 struct VoiceInputUi {
@@ -3291,16 +3291,19 @@ struct VoiceInputUi {
     bool probed = false;
     bool rpcBusy = false;
     bool pollQueued = false;
-    std::string reason;       // unavailable / error tip
+    std::string reason;
     std::string modelLabel;
-    std::string sizeHint;
     bool modelCached = false;
+    int progress = -1;
     std::string partial;
     std::string committed;
     float level = 0.0f;
     float animT = 0.0f;
-    std::string basePrompt;   // composer text at start of this listen session
+    std::string basePrompt;
+    std::string sessionId;
+    unsigned long long requestGeneration = 0;
     double lastPollSec = 0.0;
+    double lastProbeSec = -1e9;
 };
 
 static VoiceInputUi& voiceUi() {
@@ -3308,85 +3311,105 @@ static VoiceInputUi& voiceUi() {
     return v;
 }
 
+static nlohmann::json voiceSessionParams(const VoiceInputUi& v) {
+    return nlohmann::json{{"session_id", v.sessionId}};
+}
+
+static std::string voiceRpcReason(const core::RpcResult& r, const char* fallback) {
+    if (!r.err.empty()) return r.err;
+    if (r.result.is_object()) {
+        for (const char* key : {"reason", "error"}) {
+            const auto it = r.result.find(key);
+            if (it != r.result.end() && it->is_string()) return it->get<std::string>();
+        }
+    }
+    return fallback;
+}
+
 static void voiceApplyPrompt(AppState& st, const std::string& base, const std::string& committed,
                              const std::string& partial) {
-    std::string out = base;
-    auto append = [&](const std::string& piece) {
-        if (piece.empty()) return;
-        if (!out.empty() && out.back() != ' ' && out.back() != '\n') out.push_back(' ');
-        out += piece;
-    };
-    append(committed);
-    append(partial);
+    const std::string out = ui::composeChudcodeTranscript(base, committed, partial);
     if (st.prompt.size() < out.size() + 1) st.prompt.resize(out.size() + 256, 0);
     std::memcpy(st.prompt.data(), out.c_str(), out.size() + 1);
 }
 
-static void voiceApplyStatus(AppState& st, const nlohmann::json& r) {
+static bool voiceApplyStatus(AppState& st, const nlohmann::json& r) {
     VoiceInputUi& v = voiceUi();
-    const bool available = r.value("available", false);
-    const std::string bridgeState = r.value("state", std::string("idle"));
-    v.modelLabel = r.value("modelLabel", std::string());
-    v.sizeHint = r.value("modelSizeHint", std::string());
-    v.modelCached = r.value("modelCached", false);
-    v.partial = r.value("partial", std::string());
-    v.committed = r.value("committed", std::string());
-    v.level = r.value("level", 0.0f);
-    if (r.contains("error") && r["error"].is_string())
-        v.reason = r["error"].get<std::string>();
-    else if (r.contains("reason") && r["reason"].is_string())
-        v.reason = r["reason"].get<std::string>();
+    ui::ChudcodeSttResult status;
+    if (!ui::parseChudcodeSttResult(r, status)) return false;
+    v.modelLabel = status.model;
+    v.progress = status.progress;
+    if (status.progress >= 100 || status.state == "recording") v.modelCached = true;
+    if (!status.error.empty())
+        v.reason = status.error;
+    else if (status.available)
+        v.reason.clear();
 
-    if (!available) {
+    if (!status.available) {
         v.state = VoiceUiState::Unavailable;
-        return;
-    }
-    if (bridgeState == "listening") {
+    } else if (status.state == "recording") {
         v.state = VoiceUiState::Listening;
         voiceApplyPrompt(st, v.basePrompt, v.committed, v.partial);
-    } else if (bridgeState == "processing") {
+    } else if (status.state == "transcribing" ||
+               (status.state == "idle" && v.rpcBusy)) {
         v.state = VoiceUiState::Processing;
-    } else if (bridgeState == "error") {
-        v.state = VoiceUiState::Error;
     } else {
         v.state = VoiceUiState::Idle;
+    }
+    return true;
+}
+
+static void voiceBindSession(AppState& st) {
+    VoiceInputUi& v = voiceUi();
+    const std::string sessionId = st.activeConvId();
+    if (v.sessionId == sessionId) return;
+    const std::string priorSession = v.sessionId;
+    const bool cancelPrior = !priorSession.empty() &&
+                             (v.state == VoiceUiState::Listening ||
+                              v.state == VoiceUiState::Processing || v.rpcBusy);
+    const auto generation = v.requestGeneration + 1;
+    v = VoiceInputUi{};
+    v.sessionId = sessionId;
+    v.requestGeneration = generation;
+    if (cancelPrior) {
+        st.rpc.call(ui::kChudcodeSttCancelMethod,
+                    nlohmann::json{{"session_id", priorSession}},
+                    [](const core::RpcResult&) {}, 15000);
     }
 }
 
 static void voiceProbe(AppState& st) {
+    voiceBindSession(st);
     VoiceInputUi& v = voiceUi();
-    if (v.probed || v.rpcBusy) return;
+    if (v.rpcBusy) return;
 #ifdef __EMSCRIPTEN__
+    if (v.probed) return;
     v.probed = true;
     v.state = VoiceUiState::Unavailable;
     v.reason = "Voice input is not available in the web build.";
     return;
 #else
+    if (v.probed && ImGui::GetTime() - v.lastProbeSec < 5.0) return;
+    v.lastProbeSec = ImGui::GetTime();
+    if (v.sessionId.empty()) {
+        v.probed = true;
+        v.state = VoiceUiState::Unavailable;
+        v.reason = "Voice input needs an active copilot session.";
+        return;
+    }
     v.rpcBusy = true;
-    st.rpc.call("agent_stt_status", nlohmann::json::object(),
-                [](const core::RpcResult& r) {
+    const std::string sessionId = v.sessionId;
+    const auto generation = v.requestGeneration;
+    st.rpc.call(ui::kChudcodeSttStatusMethod, voiceSessionParams(v),
+                [&st, sessionId, generation](const core::RpcResult& r) {
                     VoiceInputUi& vv = voiceUi();
+                    if (vv.sessionId != sessionId || vv.requestGeneration != generation) return;
                     vv.rpcBusy = false;
                     vv.probed = true;
-                    if (!r.ok || !r.result.is_object()) {
+                    if (!r.ok || !voiceApplyStatus(st, r.result)) {
                         vv.state = VoiceUiState::Unavailable;
-                        vv.reason = r.err.empty()
-                                        ? "Speech-to-text unavailable (OMP bridge)."
-                                        : r.err;
-                        return;
-                    }
-                    // AppState not captured — status-only; prompt rewrite needs st in poll.
-                    const auto& res = r.result;
-                    vv.modelLabel = res.value("modelLabel", std::string());
-                    vv.sizeHint = res.value("modelSizeHint", std::string());
-                    vv.modelCached = res.value("modelCached", false);
-                    if (!res.value("available", false)) {
-                        vv.state = VoiceUiState::Unavailable;
-                        vv.reason = res.value("reason",
-                                              std::string("Speech-to-text unavailable."));
-                    } else {
-                        vv.state = VoiceUiState::Idle;
-                        vv.reason.clear();
+                        vv.reason = voiceRpcReason(
+                            r, "Speech-to-text unavailable in this Chudcode session.");
                     }
                 },
                 15000);
@@ -3396,17 +3419,20 @@ static void voiceProbe(AppState& st) {
 static void voicePoll(AppState& st) {
     VoiceInputUi& v = voiceUi();
     if (v.state != VoiceUiState::Listening && v.state != VoiceUiState::Processing) return;
-    if (v.rpcBusy || v.pollQueued) return;
+    if (v.pollQueued) return;
     const double now = ImGui::GetTime();
     if (now - v.lastPollSec < 0.20) return;
     v.lastPollSec = now;
     v.pollQueued = true;
-    st.rpc.call("agent_stt_status", nlohmann::json::object(),
-                [&st](const core::RpcResult& r) {
+    const std::string sessionId = v.sessionId;
+    const auto generation = v.requestGeneration;
+    st.rpc.call(ui::kChudcodeSttStatusMethod, voiceSessionParams(v),
+                [&st, sessionId, generation](const core::RpcResult& r) {
                     VoiceInputUi& vv = voiceUi();
+                    if (vv.sessionId != sessionId) return;
                     vv.pollQueued = false;
-                    if (!r.ok || !r.result.is_object()) return;
-                    voiceApplyStatus(st, r.result);
+                    if (vv.requestGeneration != generation) return;
+                    if (r.ok) voiceApplyStatus(st, r.result);
                 },
                 10000);
 }
@@ -3418,49 +3444,49 @@ static void voiceStart(AppState& st) {
     v.partial.clear();
     v.committed.clear();
     v.reason.clear();
+    v.progress = 0;
     v.rpcBusy = true;
-    v.state = VoiceUiState::Processing;  // warming / opening mic
-    st.rpc.call("agent_stt_start", nlohmann::json::object(),
-                [&st](const core::RpcResult& r) {
+    v.state = VoiceUiState::Processing;
+    const std::string sessionId = v.sessionId;
+    const auto generation = ++v.requestGeneration;
+    st.rpc.call(ui::kChudcodeSttStartMethod, voiceSessionParams(v),
+                [&st, sessionId, generation](const core::RpcResult& r) {
                     VoiceInputUi& vv = voiceUi();
+                    if (vv.sessionId != sessionId || vv.requestGeneration != generation) return;
                     vv.rpcBusy = false;
-                    if (!r.ok || !r.result.is_object()) {
+                    if (!r.ok || !voiceApplyStatus(st, r.result)) {
                         vv.state = VoiceUiState::Error;
-                        vv.reason = r.err.empty() ? "Failed to start voice input." : r.err;
+                        vv.reason = voiceRpcReason(r, "Failed to start voice input.");
                         st.toast(ui::ToastLevel::Warn, vv.reason.c_str());
-                        return;
-                    }
-                    voiceApplyStatus(st, r.result);
-                    if (vv.state == VoiceUiState::Error ||
-                        vv.state == VoiceUiState::Unavailable) {
-                        st.toast(ui::ToastLevel::Warn,
-                                 vv.reason.empty() ? "Voice input unavailable." : vv.reason.c_str());
                     }
                 },
-                300000);  // first-use model download can take a while
+                300000);
 }
 
 static void voiceStop(AppState& st) {
     VoiceInputUi& v = voiceUi();
-    if (v.rpcBusy) return;
+    if (v.rpcBusy && v.state != VoiceUiState::Listening) return;
     v.rpcBusy = true;
     v.state = VoiceUiState::Processing;
-    st.rpc.call("agent_stt_stop", nlohmann::json::object(),
-                [&st](const core::RpcResult& r) {
+    const std::string sessionId = v.sessionId;
+    const auto generation = ++v.requestGeneration;
+    st.rpc.call(ui::kChudcodeSttStopMethod, voiceSessionParams(v),
+                [&st, sessionId, generation](const core::RpcResult& r) {
                     VoiceInputUi& vv = voiceUi();
+                    if (vv.sessionId != sessionId || vv.requestGeneration != generation) return;
                     vv.rpcBusy = false;
-                    if (!r.ok || !r.result.is_object()) {
+                    ui::ChudcodeSttResult result;
+                    if (!r.ok || !ui::parseChudcodeSttResult(r.result, result)) {
                         vv.state = VoiceUiState::Error;
-                        vv.reason = r.err.empty() ? "Transcription failed." : r.err;
+                        vv.reason = voiceRpcReason(r, "Transcription failed.");
                         st.toast(ui::ToastLevel::Warn, vv.reason.c_str());
                         return;
                     }
-                    const std::string text = r.result.value("text", std::string());
-                    voiceApplyPrompt(st, vv.basePrompt, text, "");
+                    voiceApplyPrompt(st, vv.basePrompt, result.text, "");
                     vv.partial.clear();
-                    vv.committed = text;
+                    vv.committed = result.text;
                     vv.state = VoiceUiState::Idle;
-                    if (text.empty())
+                    if (result.text.empty())
                         st.toast(ui::ToastLevel::Info, "No speech detected.");
                 },
                 120000);
@@ -3468,13 +3494,14 @@ static void voiceStop(AppState& st) {
 
 static void voiceCancel(AppState& st) {
     VoiceInputUi& v = voiceUi();
-    if (v.rpcBusy && v.state != VoiceUiState::Listening) return;
     v.rpcBusy = true;
-    st.rpc.call("agent_stt_cancel", nlohmann::json::object(),
-                [&st](const core::RpcResult& r) {
+    const std::string sessionId = v.sessionId;
+    const auto generation = ++v.requestGeneration;
+    st.rpc.call(ui::kChudcodeSttCancelMethod, voiceSessionParams(v),
+                [&st, sessionId, generation](const core::RpcResult&) {
                     VoiceInputUi& vv = voiceUi();
+                    if (vv.sessionId != sessionId || vv.requestGeneration != generation) return;
                     vv.rpcBusy = false;
-                    (void)r;
                     voiceApplyPrompt(st, vv.basePrompt, "", "");
                     vv.partial.clear();
                     vv.committed.clear();
@@ -3712,7 +3739,7 @@ static void drawComposerToolbar(AppState& st, bool busy, bool embedded = false) 
         }
     }
 
-    // ---- 4/6 mic (OMP ASR voice input) ----
+    // ---- 4/6 mic (live Chudcode speech-to-text) ----
     ImGui::SameLine();
     {
         voiceProbe(st);
@@ -3762,17 +3789,19 @@ static void drawComposerToolbar(AppState& st, bool busy, bool embedded = false) 
             } else if (listening) {
                 ImGui::SetTooltip("Listening — click to stop & insert text (Esc/right-click cancels).");
             } else if (processing) {
-                ImGui::SetTooltip("Processing speech… click to cancel.");
+                if (v.progress >= 0 && v.progress < 100)
+                    ImGui::SetTooltip("Preparing speech model — %d%%. Click to cancel.",
+                                      v.progress);
+                else
+                    ImGui::SetTooltip("Processing speech… click to cancel.");
             } else if (errored) {
                 ImGui::SetTooltip("%s\nClick to retry.",
                                   v.reason.empty() ? "Voice input error." : v.reason.c_str());
             } else {
-                const char* cacheHint = v.modelCached ? "model ready" : "first use downloads model";
-                ImGui::SetTooltip("Dictate into the composer (%s%s%s — %s).\nClick to start; click again to stop.",
-                                  v.modelLabel.empty() ? "Whisper" : v.modelLabel.c_str(),
-                                  v.sizeHint.empty() ? "" : ", ",
-                                  v.sizeHint.c_str(),
-                                  cacheHint);
+                const char* cacheHint = v.modelCached ? "model ready" : "downloads on first use";
+                ImGui::SetTooltip(
+                    "Dictate into the composer (%s — %s).\nClick to start; click again to stop.",
+                    v.modelLabel.empty() ? "speech model" : v.modelLabel.c_str(), cacheHint);
             }
         }
         {

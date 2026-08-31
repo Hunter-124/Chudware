@@ -171,6 +171,75 @@ void test_tool_state_rows() {
     assert(!ui::parseChudcodeToolState({{"ok", false}, {"tools", json::array()}}, rows));
 }
 
+void test_stt_contract_and_transcript_insertion() {
+    assert(std::string(ui::kChudcodeSttStatusMethod) == "chudcode_stt_status");
+    assert(std::string(ui::kChudcodeSttStartMethod) == "chudcode_stt_start");
+    assert(std::string(ui::kChudcodeSttStopMethod) == "chudcode_stt_stop");
+    assert(std::string(ui::kChudcodeSttCancelMethod) == "chudcode_stt_cancel");
+
+    ui::ChudcodeSttResult status;
+    assert(ui::parseChudcodeSttResult(
+        {{"ok", true}, {"available", true}, {"state", "transcribing"},
+         {"model", "whisper-small"}, {"progress", 135}},
+        status));
+    assert(status.available && status.state == "transcribing");
+    assert(status.model == "whisper-small" && status.progress == 100);
+
+    assert(ui::parseChudcodeSttResult(
+        {{"ok", true}, {"available", false}, {"state", "idle"},
+         {"error", "microphone unavailable"}},
+        status));
+    assert(!status.available && status.error == "microphone unavailable");
+
+    assert(ui::parseChudcodeSttResult(
+        {{"ok", true}, {"available", true}, {"state", "idle"},
+         {"text", "make the bore wider"}},
+        status));
+    assert(status.text == "make the bore wider");
+    assert(ui::composeChudcodeTranscript("Existing prompt", status.text, "") ==
+           "Existing prompt make the bore wider");
+    assert(ui::composeChudcodeTranscript("Existing prompt\n", "committed", "partial") ==
+           "Existing prompt\ncommitted partial");
+
+    ui::ChudcodeSttResult untouched;
+    untouched.state = "sentinel";
+    assert(!ui::parseChudcodeSttResult(
+        {{"ok", true}, {"available", true}, {"state", "listening"}}, untouched));
+    assert(!ui::parseChudcodeSttResult(
+        {{"ok", false}, {"reason", "session_not_live"}}, untouched));
+    assert(untouched.state == "sentinel");
+}
+
+void test_onboarding_key_acknowledgements_are_provider_bound() {
+    assert(std::string(ui::kChudcodeValidateKeyMethod) == "chudcode_validate_key");
+    assert(std::string(ui::kChudcodeSetKeyMethod) == "chudcode_set_key");
+    assert(ui::chudcodeKeyValidationAccepted(
+        {{"ok", true}, {"providerId", "openai"}, {"valid", true}}, "openai"));
+    assert(!ui::chudcodeKeyValidationAccepted(
+        {{"ok", true}, {"providerId", "openai"}, {"valid", false}}, "openai"));
+    assert(!ui::chudcodeKeyValidationAccepted(
+        {{"ok", true}, {"providerId", "anthropic"}, {"valid", true},
+         {"apiKey", "must-never-matter"}},
+        "openai"));
+    assert(!ui::chudcodeKeyValidationAccepted(
+        {{"ok", false}, {"providerId", "openai"}, {"valid", true},
+         {"reason", "rejected"}},
+        "openai"));
+
+    const json saved = {
+        {"ok", true},
+        {"provider",
+         {{"providerId", "openai"}, {"authenticated", true}, {"hasApiKey", true}}},
+    };
+    assert(ui::chudcodeKeySaveAccepted(saved, "openai"));
+    assert(!ui::chudcodeKeySaveAccepted(saved, "anthropic"));
+    assert(!ui::chudcodeKeySaveAccepted(
+        {{"ok", true},
+         {"provider",
+          {{"providerId", "openai"}, {"authenticated", false}, {"hasApiKey", true}}}},
+        "openai"));
+}
+
 void test_compact_replacement_guard() {
     // The live defect this guards: Chudcode online compaction rewrites the service-side
     // session and returns NO messages — the visible chat must stay intact.
@@ -206,6 +275,8 @@ int main() {
     test_session_stats_nested_and_flat();
     test_tool_state_rows();
     test_compact_replacement_guard();
+    test_stt_contract_and_transcript_insertion();
+    test_onboarding_key_acknowledgements_are_provider_bound();
     std::printf("test_chudcode_descriptors: OK\n");
     return 0;
 }

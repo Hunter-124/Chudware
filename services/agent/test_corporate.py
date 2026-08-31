@@ -8,6 +8,7 @@ Proofs:
   5. Flat mode untouched when corporate_mode is off.
   6. Config accessors honour defaults + overrides.
 """
+
 from __future__ import annotations
 
 import json
@@ -40,21 +41,46 @@ from services.agent.mission_dispatch import MissionDispatch
 # Fixtures
 # ---------------------------------------------------------------------------
 
+
 def _mixed_tasks() -> list[dict]:
     """Tasks spanning geometry, simulation, manufacturing, documentation."""
     return [
-        {"id": "t1", "role": "feature_modeler", "task_class": "multi_feature_part",
-         "brief": "model the bracket body"},
-        {"id": "t2", "role": "sketcher", "stage": "sketch",
-         "brief": "profile the base flange"},
-        {"id": "t3", "role": "sim_engineer", "task_class": "analysis",
-         "brief": "static FEA on the bracket"},
-        {"id": "t4", "role": "cam_programmer", "task_class": "cam_program",
-         "brief": "3-axis toolpaths"},
-        {"id": "t5", "role": "reviewer", "stage": "deliver",
-         "brief": "verify acceptance criteria"},
-        {"id": "t6", "role": "spec_writer", "task_class": "report",
-         "brief": "write the design report"},
+        {
+            "id": "t1",
+            "role": "feature_modeler",
+            "task_class": "multi_feature_part",
+            "brief": "model the bracket body",
+        },
+        {
+            "id": "t2",
+            "role": "sketcher",
+            "stage": "sketch",
+            "brief": "profile the base flange",
+        },
+        {
+            "id": "t3",
+            "role": "sim_engineer",
+            "task_class": "analysis",
+            "brief": "static FEA on the bracket",
+        },
+        {
+            "id": "t4",
+            "role": "cam_programmer",
+            "task_class": "cam_program",
+            "brief": "3-axis toolpaths",
+        },
+        {
+            "id": "t5",
+            "role": "reviewer",
+            "stage": "deliver",
+            "brief": "verify acceptance criteria",
+        },
+        {
+            "id": "t6",
+            "role": "spec_writer",
+            "task_class": "report",
+            "brief": "write the design report",
+        },
     ]
 
 
@@ -90,6 +116,7 @@ def _clean_charts():
 # Config
 # ---------------------------------------------------------------------------
 
+
 class TestCorporateConfig:
     def test_defaults_when_absent(self):
         assert agent_config.corporate_mode_enabled({}) is False
@@ -100,8 +127,12 @@ class TestCorporateConfig:
         assert c["director_review"] is True
 
     def test_overrides(self):
-        cfg = _cfg_on(max_departments=2, team_leads=False,
-                      meeting_cadence=3, director_review=False)
+        cfg = _cfg_on(
+            max_departments=2,
+            team_leads=False,
+            meeting_cadence=3,
+            director_review=False,
+        )
         assert agent_config.corporate_mode_enabled(cfg) is True
         c = agent_config.get_corporate_config(cfg)
         assert c["max_departments"] == 2
@@ -119,6 +150,7 @@ class TestCorporateConfig:
 # ---------------------------------------------------------------------------
 # Department derivation + org build
 # ---------------------------------------------------------------------------
+
 
 class TestOrgBuild:
     def test_mixed_tasks_multiple_departments(self):
@@ -159,10 +191,12 @@ class TestOrgBuild:
 
     def test_single_dept_not_active(self):
         chart = OrgChart("r_one", cfg=_cfg_on())
-        snap = chart.build_from_tasks([
-            {"role": "feature_modeler"},
-            {"role": "sketcher"},
-        ])
+        snap = chart.build_from_tasks(
+            [
+                {"role": "feature_modeler"},
+                {"role": "sketcher"},
+            ]
+        )
         assert snap["active"] is False
 
     def test_build_corporate_org_entry(self):
@@ -182,6 +216,7 @@ class TestOrgBuild:
 # ---------------------------------------------------------------------------
 # Communication enforcement
 # ---------------------------------------------------------------------------
+
 
 class TestCommunication:
     def _ready_chart(self) -> OrgChart:
@@ -208,7 +243,9 @@ class TestCommunication:
         chart = self._ready_chart()
         # Direct heads channel
         r = chart.post_message(
-            "worker_geo_1", CHANNEL_HEADS, "hey director, help",
+            "worker_geo_1",
+            CHANNEL_HEADS,
+            "hey director, help",
             kind="question",
         )
         assert r["ok"] is False
@@ -228,7 +265,10 @@ class TestCommunication:
 
         # Invented director channel name
         r3 = chart.post_message(
-            "worker_geo_1", "director", "ping", kind="info",
+            "worker_geo_1",
+            "director",
+            "ping",
+            kind="info",
         )
         assert r3["ok"] is False
 
@@ -247,7 +287,10 @@ class TestCommunication:
         chart = self._ready_chart()
         geo = next(d for d in chart.departments if d["id"] == "geometry")
         r = chart.post_message(
-            geo["head_id"], CHANNEL_HEADS, "geometry status green", kind="info",
+            geo["head_id"],
+            CHANNEL_HEADS,
+            "geometry status green",
+            kind="info",
         )
         assert r["ok"] is True
 
@@ -261,6 +304,7 @@ class TestCommunication:
 # ---------------------------------------------------------------------------
 # Meeting cadence + director review
 # ---------------------------------------------------------------------------
+
 
 class TestMeetings:
     def test_cadence_triggers_digest(self):
@@ -283,7 +327,9 @@ class TestMeetings:
 
         # 1, 2 — no meeting yet
         r1 = chart.record_worker_completion(
-            "geometry", worker_id="w_geo_0", summary="done sketch",
+            "geometry",
+            worker_id="w_geo_0",
+            summary="done sketch",
         )
         assert r1["ok"]
         assert r1["meeting"] is None
@@ -291,16 +337,19 @@ class TestMeetings:
         assert r1["posted"] is True
         assert "post_error" not in r1
 
-
         r2 = chart.record_worker_completion(
-            "geometry", worker_id="w_geo_1", summary="done boss extrude",
+            "geometry",
+            worker_id="w_geo_1",
+            summary="done boss extrude",
         )
         assert r2["meeting"] is None
         assert r2["completions_since_meeting"] == 2
 
         # 3rd hits cadence
         r3 = chart.record_worker_completion(
-            "geometry", worker_id="w_geo_2", summary="done fillets complete",
+            "geometry",
+            worker_id="w_geo_2",
+            summary="done fillets complete",
         )
         assert r3["meeting"] is not None
         digest = r3["meeting"]["digest"]
@@ -327,7 +376,9 @@ class TestMeetings:
         chart.build_from_tasks(_mixed_tasks())
         geo = next(d for d in chart.departments if d["id"] == "geometry")
         chart.spawn_worker(
-            head_id=geo["head_id"], role="sketcher", worker_id="w_b",
+            head_id=geo["head_id"],
+            role="sketcher",
+            worker_id="w_b",
         )
         r = chart.record_worker_completion(
             "geometry",
@@ -357,7 +408,6 @@ class TestMeetings:
         assert r["posted"] is False
         assert "post_error" in r
         assert r["post"]["ok"] is False
-
 
     def test_director_review_on_blockage(self):
         chart = OrgChart(
@@ -389,6 +439,7 @@ class TestMeetings:
 # ---------------------------------------------------------------------------
 # Head spawn + depth cap
 # ---------------------------------------------------------------------------
+
 
 class TestSpawnDepth:
     def test_head_spawn_within_depth_cap(self):
@@ -431,7 +482,9 @@ class TestSpawnDepth:
         chart.build_from_tasks(_mixed_tasks())
         geo = next(d for d in chart.departments if d["id"] == "geometry")
         chart.spawn_worker(
-            head_id=geo["head_id"], role="sketcher", worker_id="w1",
+            head_id=geo["head_id"],
+            role="sketcher",
+            worker_id="w1",
         )
         r = chart.spawn_worker(head_id="w1", role="feature_modeler")
         assert r["ok"] is False
@@ -462,6 +515,7 @@ class TestSpawnDepth:
 # ---------------------------------------------------------------------------
 # Flat mode untouched when off
 # ---------------------------------------------------------------------------
+
 
 class TestFlatMode:
     def test_should_use_corporate_false_when_off(self):
@@ -549,6 +603,7 @@ class TestFlatMode:
 # Registry helpers
 # ---------------------------------------------------------------------------
 
+
 class TestRegistry:
     def test_get_drop_chart(self):
         c1 = get_org_chart("r_reg", create=True)
@@ -561,6 +616,7 @@ class TestRegistry:
 # ---------------------------------------------------------------------------
 # classify_task_department — role→dept completeness + word-boundary fallback
 # ---------------------------------------------------------------------------
+
 
 class TestClassifyDepartment:
     def test_model3d_and_sketch2d_map_to_geometry(self):
@@ -582,12 +638,16 @@ class TestClassifyDepartment:
 
     def test_real_board_keyword_still_routes_to_electronics(self):
         # The word-boundary fix must not break the genuine keyword match.
-        assert classify_task_department({"brief": "lay out the circuit board"}) == "electronics"
+        assert (
+            classify_task_department({"brief": "lay out the circuit board"})
+            == "electronics"
+        )
 
 
 # ---------------------------------------------------------------------------
 # Gap 1: auto-activate ≥2 depts / flat when 1
 # ---------------------------------------------------------------------------
+
 
 class TestAutoActivate:
     def test_auto_activate_multi_dept(self, tmp_path):
@@ -596,7 +656,9 @@ class TestAutoActivate:
         def on_event(data, *args):
             if args:
                 # (kind, payload)
-                events.append({"kind": data, **(args[0] if isinstance(args[0], dict) else {})})
+                events.append(
+                    {"kind": data, **(args[0] if isinstance(args[0], dict) else {})}
+                )
             elif isinstance(data, dict):
                 events.append(data)
 
@@ -636,9 +698,13 @@ class TestAutoActivate:
         )
         assert out["ok"] is True
         assert out["active"] is False
-        assert get_org_chart("r_auto_one", create=False) is None or not (
-            get_org_chart("r_auto_one", create=False) or type("X", (), {"active": False})()
-        ).active
+        assert (
+            get_org_chart("r_auto_one", create=False) is None
+            or not (
+                get_org_chart("r_auto_one", create=False)
+                or type("X", (), {"active": False})()
+            ).active
+        )
 
     def test_mission_dispatch_maybe_auto_activate(self):
         md = MissionDispatch(run_id="r_md_auto", on_event=None)
@@ -657,6 +723,7 @@ class TestAutoActivate:
 # ---------------------------------------------------------------------------
 # Gap 2 + depth: lead→worker at effective cap 3 with global cap 2
 # ---------------------------------------------------------------------------
+
 
 class TestEffectiveDepthAndLiveHeads:
     def test_lead_to_worker_allowed_at_effective_cap_3(self):
@@ -724,25 +791,41 @@ class TestEffectiveDepthAndLiveHeads:
 # Gap 4: LLM steering only on blockage / needs_llm
 # ---------------------------------------------------------------------------
 
+
 class TestLlmSteering:
-    def test_steering_llm_only_on_blockage(self):
-        calls: list[tuple] = []
+    def test_steering_uses_bounded_one_shot_role_turn_on_blockage(
+        self,
+        monkeypatch,
+    ):
+        from services.agent import corporate as corporate_module
 
-        class Prov:
-            def complete(self, system, messages, max_tokens=400):
-                calls.append((system, messages, max_tokens))
-                return "LLM STEERING: unblock regen then re-align to FEA goal."
+        calls: list[dict] = []
 
+        def fake_role_turn(request, role, **kwargs):
+            calls.append({"request": request, "role": role, **kwargs})
+            return {
+                "success": True,
+                "cancelled": False,
+                "result": ("LLM STEERING: unblock regen then re-align to FEA goal."),
+            }
+
+        monkeypatch.setattr(
+            agent_config,
+            "get_provider",
+            lambda **kwargs: pytest.fail(
+                "online corporate steering must not resolve a provider"
+            ),
+        )
+        monkeypatch.setattr(corporate_module, "run_role_turn", fake_role_turn)
         chart = OrgChart(
             "r_llm",
             cfg=_cfg_on(director_review=True),
             mission_goals=["bracket FEA pass"],
             director_review=True,
             max_subagent_depth=2,
-            provider=Prov(),
         )
         chart.build_from_tasks(_mixed_tasks())
-        # Aligned meeting → no LLM
+        # Aligned meeting → no model turn.
         ok_mtg = chart.hold_meeting(
             "geometry",
             done=["boss extrude"],
@@ -754,13 +837,10 @@ class TestLlmSteering:
         assert ok_mtg["ok"]
         rev_ok = ok_mtg["director_review"]
         assert rev_ok is not None
-        # Template-aligned → no LLM call
         if rev_ok.get("aligned"):
-            assert len(calls) == 0
+            assert calls == []
             assert rev_ok.get("needs_llm") is False
 
-        # Blockage → needs_llm → one complete()
-        n_before = len(calls)
         bad = chart.hold_meeting(
             "geometry",
             done=[],
@@ -773,18 +853,105 @@ class TestLlmSteering:
         rev = bad["director_review"]
         assert rev["needs_llm"] is True
         assert rev["aligned"] is False
-        assert len(calls) == n_before + 1
-        assert "LLM STEERING" in rev["steering"] or "STEERING" in rev["steering"]
+        assert "LLM STEERING" in rev["steering"]
+        assert len(calls) == 1
+        call = calls[0]
+        assert call["role"] == "advisor"
+        assert call["session_id"] == "r_llm"
+        assert call["run_id"] == "r_llm"
+        assert call["parent_id"].startswith("director_r_llm:meeting:")
+        assert call["close_session"] is True
+        assert call["max_tokens"] == 400
+        assert call["max_total_tokens"] == 400
+        assert call["options"]["allowed_tools"] == []
+        assert call["options"].get("offline") is not True
         steer_evs = [
-            e for e in chart._events if e.get("corp_event") == "steering"
+            event for event in chart._events if event.get("corp_event") == "steering"
         ]
         assert steer_evs
-        assert steer_evs[-1]["payload"].get("needs_llm") is True
+        assert steer_evs[-1]["payload"]["needs_llm"] is True
+        assert steer_evs[-1]["payload"]["llm_refined"] is True
+
+    @pytest.mark.parametrize(
+        "turn",
+        [
+            {"success": False, "cancelled": False, "result": {"error": "down"}},
+            {"success": False, "cancelled": True, "result": {"error": "stop"}},
+            {"success": True, "cancelled": False, "result": ""},
+        ],
+    )
+    def test_steering_role_failure_keeps_deterministic_template(
+        self,
+        monkeypatch,
+        turn,
+    ):
+        from services.agent import corporate as corporate_module
+
+        monkeypatch.setattr(
+            corporate_module,
+            "run_role_turn",
+            lambda *args, **kwargs: turn,
+        )
+        chart = OrgChart(
+            "r_degrade",
+            cfg=_cfg_on(director_review=True),
+            mission_goals=["bracket FEA pass"],
+            director_review=True,
+            max_subagent_depth=2,
+        )
+        chart.build_from_tasks(_mixed_tasks())
+        meeting = chart.hold_meeting(
+            "geometry",
+            blocked=["regen failure"],
+            risks=[],
+            trigger="blockage",
+        )
+        review = meeting["director_review"]
+        assert review["needs_llm"] is True
+        assert "STEERING" in review["steering"]
+        assert "llm steering refined" not in review["notes"]
+
+    def test_steering_explicit_offline_mode_reaches_role_turn(
+        self,
+        monkeypatch,
+    ):
+        from services.agent import corporate as corporate_module
+
+        calls = []
+
+        def fake_role_turn(*args, **kwargs):
+            calls.append(kwargs)
+            return {
+                "success": True,
+                "cancelled": False,
+                "result": "Local steering.",
+            }
+
+        monkeypatch.setattr(corporate_module, "run_role_turn", fake_role_turn)
+        cfg = _cfg_on(director_review=True)
+        cfg["offline_mode"] = True
+        chart = OrgChart(
+            "r_offline",
+            cfg=cfg,
+            mission_goals=["bracket FEA pass"],
+            director_review=True,
+            max_subagent_depth=2,
+        )
+        chart.build_from_tasks(_mixed_tasks())
+        meeting = chart.hold_meeting(
+            "geometry",
+            blocked=["regen failure"],
+            risks=[],
+            trigger="blockage",
+        )
+        assert meeting["director_review"]["steering"] == "Local steering."
+        assert calls[0]["options"]["offline"] is True
 
 
 # ---------------------------------------------------------------------------
 # Gap 5: wind-down artifact + events order
 # ---------------------------------------------------------------------------
+
 
 class TestWindDownAndEvents:
     def test_wind_down_writes_artifact_and_events_order(self, tmp_path):
@@ -798,7 +965,9 @@ class TestWindDownAndEvents:
         chart.build_from_tasks(_mixed_tasks())
         geo = next(d for d in chart.departments if d["id"] == "geometry")
         chart.spawn_worker(
-            head_id=geo["head_id"], role="feature_modeler", worker_id="w_wind",
+            head_id=geo["head_id"],
+            role="feature_modeler",
+            worker_id="w_wind",
         )
         # Force a rejection event
         chart.post_message("w_wind", CHANNEL_HEADS, "hey director", kind="question")
@@ -831,7 +1000,9 @@ class TestWindDownAndEvents:
         chart.build_from_tasks(_mixed_tasks())
         geo = next(d for d in chart.departments if d["id"] == "geometry")
         chart.spawn_worker(
-            head_id=geo["head_id"], role="sketcher", worker_id="w_rej",
+            head_id=geo["head_id"],
+            role="sketcher",
+            worker_id="w_rej",
         )
         r = chart.post_message("w_rej", CHANNEL_HEADS, "help", kind="question")
         assert r.get("status") == "rejected"

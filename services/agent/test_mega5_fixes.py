@@ -6,6 +6,7 @@ Watch-list from mega-4 deferred + mega-5 spawn_probe:
 3. xAI semaphore occupancy telemetry + default concurrency 3 + read-timeout retry.
 4. Retryable provider failures map to DAG retry instead of instant escalate.
 """
+
 from __future__ import annotations
 
 import threading
@@ -68,16 +69,6 @@ def test_delegate_emits_model_assignment_event(tmp_path, monkeypatch):
         def fail(self, node_id, reason=""):
             return None
 
-    class _Provider:
-        name = "mock"
-        model = "mock-model"
-
-        def complete(self, system, messages, max_tokens=8000):
-            return (
-                '```json\n{"tool":"ledger_note","args":{"kind":"decision",'
-                '"id":"x","summary":"ok"}}\n```'
-            )
-
     events = []
 
     def on_event(*args, **kwargs):
@@ -90,7 +81,6 @@ def test_delegate_emits_model_assignment_event(tmp_path, monkeypatch):
         run_id="mega5_assign",
         ledger=ledger,
         delegation_tree=_Tree(),
-        provider=_Provider(),
         on_event=on_event,
         task_class="assembly",
     )
@@ -107,13 +97,12 @@ def test_delegate_emits_model_assignment_event(tmp_path, monkeypatch):
 
     import services.agent.delegation as dlg
     import services.agent.role_models as rm
-    import services.agent.agent_turn as at
+    import services.agent.chudcode_roles as cr
 
     real_delegate = dlg.delegate
     real_resolve = rm.resolve_for_node
     real_resolve_role = rm.resolve_role_model
-    real_run = at.run_turn
-    real_get_provider = None
+    real_run = cr.run_role_turn
 
     def _spy_delegate(role, brief, budget_tokens, **kw):
         return {
@@ -142,17 +131,19 @@ def test_delegate_emits_model_assignment_event(tmp_path, monkeypatch):
             reason=f"min_rank={kw.get('min_rank')}",
         )
 
-    class _Turn:
-        success = True
-        stop_reason = "confirmed"
-        result = {"handoff": {"status": "done", "summary": "ok"}}
-
-    def _spy_run(*a, **k):
-        return _Turn()
+    def _spy_run(*_args, **_kwargs):
+        return {
+            "success": True,
+            "stop_reason": "completed",
+            "result": {"handoff": {"status": "done", "summary": "ok"}},
+            "session_id": "cad-role-mega5-assign",
+            "tokens_used": 100,
+            "provider_usage_recorded": True,
+            "cancelled": False,
+        }
 
     from services.agent import config as agent_config
 
-    real_get_provider = agent_config.get_provider
     real_load = agent_config.load_config
 
     def _fake_load():
@@ -163,15 +154,11 @@ def test_delegate_emits_model_assignment_event(tmp_path, monkeypatch):
             ],
         }
 
-    def _fake_provider(name=None, cfg=None):
-        return _Provider()
-
     dlg.delegate = _spy_delegate
     rm.resolve_for_node = _spy_resolve
     rm.resolve_role_model = _spy_resolve_role
-    at.run_turn = _spy_run
+    cr.run_role_turn = _spy_run
     agent_config.load_config = _fake_load
-    agent_config.get_provider = _fake_provider
     try:
         out = md.delegate(
             role="feature_modeler",
@@ -182,9 +169,8 @@ def test_delegate_emits_model_assignment_event(tmp_path, monkeypatch):
         dlg.delegate = real_delegate
         rm.resolve_for_node = real_resolve
         rm.resolve_role_model = real_resolve_role
-        at.run_turn = real_run
+        cr.run_role_turn = real_run
         agent_config.load_config = real_load
-        agent_config.get_provider = real_get_provider
 
     assert out.get("ok") is True, out
     assert out.get("role_model"), out
@@ -199,11 +185,14 @@ def test_delegate_emits_model_assignment_event(tmp_path, monkeypatch):
     assert row.get("min_rank") is not None
     assert row.get("picked_model") == "local-c"
     assert row.get("cost_tier") is not None
-    assert int(row["cost_tier"]) <= int(row.get("min_rank") or 5) or True  # cost independent
+    assert (
+        int(row["cost_tier"]) <= int(row.get("min_rank") or 5) or True
+    )  # cost independent
 
     # Ledger note mirror
     notes = [
-        e for e in ledger.events
+        e
+        for e in ledger.events
         if (e.get("payload") or {}).get("event") == "model_assignment"
     ]
     assert notes, "ledger missing model_assignment note"
@@ -211,7 +200,6 @@ def test_delegate_emits_model_assignment_event(tmp_path, monkeypatch):
     assert payload["picked_model"] == "local-c"
     assert payload["depth"] == 1
     assert payload["min_rank"] is not None
-
 
 
 def test_delegate_assigns_without_ai_roles_config(tmp_path, monkeypatch):
@@ -237,13 +225,6 @@ def test_delegate_assigns_without_ai_roles_config(tmp_path, monkeypatch):
         def fail(self, node_id, reason=""):
             return None
 
-    class _Provider:
-        name = "xai-sub"
-        model = "grok-4.5"
-
-        def complete(self, system, messages, max_tokens=8000):
-            return "```json\n{\"status\":\"done\"}\n```"
-
     events = []
 
     def on_event(*args, **kwargs):
@@ -254,19 +235,17 @@ def test_delegate_assigns_without_ai_roles_config(tmp_path, monkeypatch):
         run_id="mega5_no_ai_roles",
         ledger=ledger,
         delegation_tree=_Tree(),
-        provider=_Provider(),
         on_event=on_event,
         task_class="simple_part",
     )
 
     import services.agent.delegation as dlg
-    import services.agent.agent_turn as at
+    import services.agent.chudcode_roles as cr
     from services.agent import config as agent_config
 
     real_delegate = dlg.delegate
-    real_run = at.run_turn
+    real_run = cr.run_role_turn
     real_load = agent_config.load_config
-    real_get = agent_config.get_provider
 
     def _spy_delegate(role, brief, budget_tokens, **kw):
         return {
@@ -279,13 +258,19 @@ def test_delegate_assigns_without_ai_roles_config(tmp_path, monkeypatch):
             "budget": {"tokens_granted": int(budget_tokens)},
         }
 
-    class _Turn:
-        success = True
-        stop_reason = "confirmed"
-        result = {"handoff": {"status": "done"}}
+    def _run_role(*_args, **_kwargs):
+        return {
+            "success": True,
+            "stop_reason": "completed",
+            "result": {"handoff": {"status": "done"}},
+            "session_id": "cad-role-mega5-no-roles",
+            "tokens_used": 100,
+            "provider_usage_recorded": True,
+            "cancelled": False,
+        }
 
     dlg.delegate = _spy_delegate
-    at.run_turn = lambda *a, **k: _Turn()
+    cr.run_role_turn = _run_role
     # Config with NO ai_roles — the mega-run fingerprint.
     agent_config.load_config = lambda: {
         "provider": "xai-sub",
@@ -295,7 +280,6 @@ def test_delegate_assigns_without_ai_roles_config(tmp_path, monkeypatch):
             {"provider": "xai-sub", "model": "grok-4.5"},
         ],
     }
-    agent_config.get_provider = lambda name=None, cfg=None: _Provider()
     try:
         out = md.delegate(
             role="sketcher",
@@ -304,9 +288,8 @@ def test_delegate_assigns_without_ai_roles_config(tmp_path, monkeypatch):
         )
     finally:
         dlg.delegate = real_delegate
-        at.run_turn = real_run
+        cr.run_role_turn = real_run
         agent_config.load_config = real_load
-        agent_config.get_provider = real_get
 
     assert out.get("ok") is True, out
     assert out.get("role_model"), out
@@ -315,7 +298,8 @@ def test_delegate_assigns_without_ai_roles_config(tmp_path, monkeypatch):
     assert assign_events[0]["picked_model"]
     assert assign_events[0]["min_rank"] is not None
     notes = [
-        e for e in ledger.events
+        e
+        for e in ledger.events
         if (e.get("payload") or {}).get("event") == "model_assignment"
     ]
     assert notes
@@ -367,15 +351,16 @@ def test_depth2_low_difficulty_spawn_not_xai(monkeypatch):
         "model": "grok-4.5",
         "subscription_auth": {"xai-sub": {"access_token": "t"}},
         "enabled_providers": [
-            {"provider": "ollama", "model": "llama3.2:latest",
-             "base_url": "http://127.0.0.1:11434/v1"},
+            {
+                "provider": "ollama",
+                "model": "llama3.2:latest",
+                "base_url": "http://127.0.0.1:11434/v1",
+            },
             {"provider": "openrouter", "model": "mistralai/mistral-small:free"},
             {"provider": "xai-sub", "model": "grok-4.5"},
         ],
     }
-    monkeypatch.setattr(
-        "services.agent.config.load_config", lambda: dict(cfg)
-    )
+    monkeypatch.setattr("services.agent.config.load_config", lambda: dict(cfg))
 
     pick = rm.auto_pick_model(
         cfg=cfg,
@@ -391,26 +376,6 @@ def test_depth2_low_difficulty_spawn_not_xai(monkeypatch):
         name = "xai-sub"
         model = "grok-4.5"
 
-    # get_provider for ollama maps to openai local; mock construction.
-    from services.agent.providers.openai_provider import OpenAIProvider
-
-    def _fake_get_provider(name=None, cfg=None, role=None):
-        c = cfg or {}
-        if (name or "").lower() in ("openai", "ollama") or (
-            (c.get("openai") or {}).get("base_url") or ""
-        ).find("11434") >= 0:
-            return OpenAIProvider(
-                api_key="ollama",
-                model=c.get("model") or "llama3.2:latest",
-                base_url="http://127.0.0.1:11434/v1",
-            )
-        # Must not be chosen for this test path.
-        return _Frontier()
-
-    monkeypatch.setattr(
-        "services.agent.config.get_provider", _fake_get_provider
-    )
-
     context = {
         "role_id": "feature_modeler",
         "task_class": "simple_part",
@@ -422,8 +387,8 @@ def test_depth2_low_difficulty_spawn_not_xai(monkeypatch):
         },
         "retry_remaining": 2,
     }
-    resolved = nr._resolve_provider(context, provider=_Frontier())
-    assert not isinstance(resolved, _Frontier), resolved
+    settings = nr._resolve_role_settings(context, injected=_Frontier())
+    assert settings["provider"] not in ("xai-sub", "xai"), settings
     rm_row = context.get("role_model") or {}
     assert rm_row.get("provider") not in ("xai-sub", "xai"), rm_row
     assert rm_row.get("picked_model", rm_row.get("model")) != "grok-4.5" or (
@@ -438,28 +403,20 @@ def test_depth2_low_difficulty_spawn_not_xai(monkeypatch):
 def test_retry_cheap_forces_low_effort(monkeypatch):
     """Retries must not re-burn frontier reasoning effort."""
     from services.dag import node_runner as nr
-    from services.agent.providers.openai_provider import OpenAIProvider
 
     cfg = {
         "provider": "xai-sub",
         "model": "grok-4.5",
         "enabled_providers": [
-            {"provider": "ollama", "model": "llama3.2:latest",
-             "base_url": "http://127.0.0.1:11434/v1"},
+            {
+                "provider": "ollama",
+                "model": "llama3.2:latest",
+                "base_url": "http://127.0.0.1:11434/v1",
+            },
             {"provider": "xai-sub", "model": "grok-4.5"},
         ],
     }
     monkeypatch.setattr("services.agent.config.load_config", lambda: dict(cfg))
-
-    def _fake_get_provider(name=None, cfg=None, role=None):
-        c = cfg or {}
-        return OpenAIProvider(
-            api_key="ollama",
-            model=c.get("model") or "llama3.2:latest",
-            base_url="http://127.0.0.1:11434/v1",
-        )
-
-    monkeypatch.setattr("services.agent.config.get_provider", _fake_get_provider)
 
     context = {
         "role_id": "sketcher",
@@ -469,12 +426,10 @@ def test_retry_cheap_forces_low_effort(monkeypatch):
         "retry_remaining": 1,
         "retry_cheap": True,
     }
-    nr._resolve_provider(context, provider=None)
+    settings = nr._resolve_role_settings(context)
     row = context.get("role_model") or {}
     assert row.get("reasoning_effort") == "low", row
-
-
-
+    assert settings["reasoning_effort"] == "low"
 
 
 # ---------------------------------------------------------------------------
@@ -517,7 +472,6 @@ def test_all_roles_concrete_tools_within_cap():
         assert n <= MAX_TOOLS_PER_ROLE, (p.stem, n, card.concrete_tools)
 
 
-
 # ---------------------------------------------------------------------------
 # 8. Productive delegation: brief soft-truncate + role alias + token estimate
 # ---------------------------------------------------------------------------
@@ -545,30 +499,21 @@ def test_delegate_soft_truncates_overlong_brief(tmp_path, monkeypatch):
         def fail(self, node_id, reason=""):
             return None
 
-    class _Provider:
-        name = "mock"
-        model = "mock"
-
-        def complete(self, system, messages, max_tokens=8000):
-            return "```json\n{\"status\":\"done\",\"summary\":\"ok\"}\n```"
-
     tree = _Tree()
     md = MissionDispatch(
         run_id="mega5_brief",
         ledger=ledger,
         delegation_tree=tree,
-        provider=_Provider(),
         task_class="simple_part",
     )
 
     import services.agent.delegation as dlg
-    import services.agent.agent_turn as at
+    import services.agent.chudcode_roles as cr
     from services.agent import config as agent_config
 
     real_delegate = dlg.delegate
-    real_run = at.run_turn
+    real_run = cr.run_role_turn
     real_load = agent_config.load_config
-    real_get = agent_config.get_provider
 
     captured = {}
 
@@ -586,26 +531,34 @@ def test_delegate_soft_truncates_overlong_brief(tmp_path, monkeypatch):
             "budget": {"tokens_granted": int(budget_tokens)},
         }
 
-    class _Turn:
-        success = True
-        stop_reason = "confirmed"
-        result = {
-            "handoff": {"status": "done"},
-            "tool_calls": 2,
-            "calls": [{"tool": "new_part"}, {"tool": "add_features"}],
+    def _run_role(*_args, **_kwargs):
+        return {
+            "success": True,
+            "stop_reason": "completed",
+            "result": {
+                "handoff": {"status": "done"},
+                "tool_calls": 2,
+                "calls": [{"tool": "new_part"}, {"tool": "add_features"}],
+            },
+            "session_id": "cad-role-mega5-brief",
+            "tokens_used": 1400,
+            "provider_usage_recorded": True,
+            "cancelled": False,
         }
 
     dlg.delegate = _spy_delegate
-    at.run_turn = lambda *a, **k: _Turn()
+    cr.run_role_turn = _run_role
     agent_config.load_config = lambda: {
         "provider": "xai-sub",
         "model": "grok-4.5",
         "enabled_providers": [
-            {"provider": "ollama", "model": "llama3.2:latest",
-             "base_url": "http://127.0.0.1:11434/v1"},
+            {
+                "provider": "ollama",
+                "model": "llama3.2:latest",
+                "base_url": "http://127.0.0.1:11434/v1",
+            },
         ],
     }
-    agent_config.get_provider = lambda name=None, cfg=None: _Provider()
     long_brief = "Create airframe. " + ("detail " * 200)  # >> 500
     assert len(long_brief) > 500
     try:
@@ -616,17 +569,23 @@ def test_delegate_soft_truncates_overlong_brief(tmp_path, monkeypatch):
         )
     finally:
         dlg.delegate = real_delegate
-        at.run_turn = real_run
+        cr.run_role_turn = real_run
         agent_config.load_config = real_load
-        agent_config.get_provider = real_get
 
-    assert out.get("ok") is True or out.get("executed") is True or out.get("status") in (
-        "approved", "done", None
-    ) or out.get("subagent_status") == "done", out
+    assert (
+        out.get("ok") is True
+        or out.get("executed") is True
+        or out.get("status") in ("approved", "done", None)
+        or out.get("subagent_status") == "done"
+    ), out
     assert captured.get("brief_len", 9999) <= 500, captured
     # part_fixer → feature_modeler (has new_part)
     assert captured.get("role") == "feature_modeler", captured
-    assert out.get("brief_truncated") is True or out.get("role_resolved") == "feature_modeler" or True
+    assert (
+        out.get("brief_truncated") is True
+        or out.get("role_resolved") == "feature_modeler"
+        or True
+    )
     # Token meter must not stay 0 after a successful child with tool calls.
     if hasattr(tree, "last_tokens"):
         assert tree.last_tokens > 0, tree.last_tokens
@@ -642,7 +601,7 @@ def test_delegate_executes_child_on_full_brief_not_the_record_summary(tmp_path):
     from services.agent.ledger import Ledger
     from services.agent.mission_dispatch import MissionDispatch
     import services.agent.delegation as dlg
-    import services.agent.agent_turn as at
+    import services.agent.chudcode_roles as cr
     import services.agent.config as agent_config
 
     ledger = Ledger("mega5_fullbrief", path=tmp_path / "ledger.json")
@@ -654,22 +613,18 @@ def test_delegate_executes_child_on_full_brief_not_the_record_summary(tmp_path):
         def start(self, node_id):
             return None
 
-        def finish(self, node_id, **kw):
+        def complete(self, node_id, tokens_used=0):
             return None
 
         def fail(self, node_id, reason=""):
             return None
 
-    class _Provider:
-        name = "mock"
-        model = "mock"
-
-        def complete(self, system, messages, max_tokens=8000):
-            return '```json\n{"status":"done","summary":"ok"}\n```'
-
-    md = MissionDispatch(run_id="mega5_fullbrief", ledger=ledger,
-                         delegation_tree=_Tree(), provider=_Provider(),
-                         task_class="simple_part")
+    md = MissionDispatch(
+        run_id="mega5_fullbrief",
+        ledger=ledger,
+        delegation_tree=_Tree(),
+        task_class="simple_part",
+    )
 
     head = "Build a mud bucket. "
     tail = " HANDLE: bent round bar welded near the top rim."
@@ -680,32 +635,44 @@ def test_delegate_executes_child_on_full_brief_not_the_record_summary(tmp_path):
 
     def _spy_delegate(role, brief, budget_tokens, **kw):
         seen["record_brief"] = brief
-        return {"id": "dg_fb", "status": "approved", "role": role, "depth": 1,
-                "kind": "worker", "parent": "root",
-                "budget": {"tokens_granted": int(budget_tokens)}}
+        return {
+            "id": "dg_fb",
+            "status": "approved",
+            "role": role,
+            "depth": 1,
+            "kind": "worker",
+            "parent": "root",
+            "budget": {"tokens_granted": int(budget_tokens)},
+        }
 
-    class _Turn:
-        success = True
-        stop_reason = "confirmed"
-        result = {"handoff": {"status": "done"}, "tool_calls": 1,
-                  "calls": [{"tool": "new_part"}]}
-
-    def _spy_run_turn(brief, provider, **kw):
+    def _spy_run_turn(brief, _role, **kw):
         seen["exec_brief"] = brief
         seen["max_tokens"] = kw.get("max_tokens")
-        seen["max_tool_calls"] = kw.get("max_tool_calls")
-        return _Turn()
+        seen["max_tool_calls"] = kw.get("options", {}).get("max_tool_calls")
+        return {
+            "success": True,
+            "stop_reason": "completed",
+            "result": {
+                "handoff": {"status": "done"},
+                "tool_calls": 1,
+                "calls": [{"tool": "new_part"}],
+            },
+            "session_id": "cad-role-mega5-fullbrief",
+            "tokens_used": 1200,
+            "provider_usage_recorded": True,
+            "cancelled": False,
+        }
 
-    real_delegate, real_run = dlg.delegate, at.run_turn
+    real_delegate, real_run = dlg.delegate, cr.run_role_turn
     real_budget_get = agent_config.get_subagent_tool_call_budget
-    dlg.delegate, at.run_turn = _spy_delegate, _spy_run_turn
+    dlg.delegate, cr.run_role_turn = _spy_delegate, _spy_run_turn
     agent_config.get_subagent_tool_call_budget = lambda: 23
     try:
         # budget_tokens as a STRING: models send "12000" and the bare
         # `budget_tokens <= 0` comparison used to raise TypeError.
         md.delegate(role="model3d", brief=long_brief, budget_tokens="12000")
     finally:
-        dlg.delegate, at.run_turn = real_delegate, real_run
+        dlg.delegate, cr.run_role_turn = real_delegate, real_run
         agent_config.get_subagent_tool_call_budget = real_budget_get
 
     # Record row stays contract-compliant...
@@ -714,6 +681,7 @@ def test_delegate_executes_child_on_full_brief_not_the_record_summary(tmp_path):
     assert seen["exec_brief"] == long_brief
     assert tail in seen["exec_brief"]
     from services.agent.mission_dispatch import LINEAR_ROLE_MAX_OUTPUT_TOKENS
+
     assert seen["max_tokens"] == LINEAR_ROLE_MAX_OUTPUT_TOKENS
     assert seen["max_tool_calls"] == 23
 
@@ -723,6 +691,7 @@ def test_delegate_role_alias_part_fixer_to_feature_modeler():
 
     assert MissionDispatch._ROLE_ALIASES["part_fixer"] == "feature_modeler"
     assert MissionDispatch._BRIEF_MAX == 500
+
 
 # ---------------------------------------------------------------------------
 # 3. xAI semaphore occupancy + default concurrency + timeout retry
@@ -763,9 +732,7 @@ def test_xai_semaphore_stats_track_occupancy(monkeypatch):
         def _post_once(self, body):
             time.sleep(0.05)
             return {
-                "choices": [
-                    {"message": {"content": "ok", "reasoning_content": ""}}
-                ]
+                "choices": [{"message": {"content": "ok", "reasoning_content": ""}}]
             }
 
     p = _Prov()

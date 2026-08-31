@@ -13,6 +13,7 @@ Proves, offline (mock provider, tmpdir registry — no all-skip):
   * the ``subagent_*`` worker RPC envelopes (list / transcript / steer / the
     M16 confirm-guarded terminate).
 """
+
 from __future__ import annotations
 
 import json
@@ -35,10 +36,12 @@ def _tmp_registry(tmp_path, monkeypatch):
     # ollama default when config is empty. Either replaces the mock with a live
     # provider. Force the legacy no-assignment path instead.
     monkeypatch.setattr("services.agent.config.load_config", lambda *a, **k: {})
-    monkeypatch.setattr("services.agent.role_models.resolve_for_node",
-                        lambda *a, **k: None)
-    monkeypatch.setattr("services.agent.role_models.resolve_role_model",
-                        lambda *a, **k: None)
+    monkeypatch.setattr(
+        "services.agent.role_models.resolve_for_node", lambda *a, **k: None
+    )
+    monkeypatch.setattr(
+        "services.agent.role_models.resolve_role_model", lambda *a, **k: None
+    )
     # bind_session is a process-level global: clear it so a session-bound raw
     # path from one test can never leak into the next one's fallback assertions.
     reg.bind_session("", "")
@@ -78,9 +81,15 @@ _LIST_CATS = '```json\n{"tool": "list_tool_categories", "args": {}}\n```'
 # Registry basics
 # ---------------------------------------------------------------------------
 
+
 def test_register_list_and_status_roundtrip():
-    meta = reg.register_session("dg_abc123", role="sketcher", brief="draw the plate",
-                                parent_run_id="r_1", budget_tokens=4000)
+    meta = reg.register_session(
+        "dg_abc123",
+        role="sketcher",
+        brief="draw the plate",
+        parent_run_id="r_1",
+        budget_tokens=4000,
+    )
     assert meta["status"] == "pending" and meta["schema"] == reg.SCHEMA
     assert reg.set_status("dg_abc123", "running")
     got = reg.get_session("dg_abc123")
@@ -104,23 +113,27 @@ def test_transcript_append_and_fetch():
     reg.append_transcript("dg_t1", "system", "started")
     reg.append_transcript("dg_t1", "subagent", "hello")
     recs = reg.get_transcript("dg_t1")
-    assert [(r["who"], r["text"]) for r in recs] == [("system", "started"),
-                                                     ("subagent", "hello")]
+    assert [(r["who"], r["text"]) for r in recs] == [
+        ("system", "started"),
+        ("subagent", "hello"),
+    ]
 
 
 # ---------------------------------------------------------------------------
 # Steering queue semantics
 # ---------------------------------------------------------------------------
 
+
 def test_steer_queue_consume_exactly_once():
     reg.register_session("dg_q1", role="worker")
     a = reg.queue_steer("dg_q1", "focus on the fillet")
     b = reg.queue_steer("dg_q1", "use 6061 aluminum")
-    assert [s["steer_id"] for s in reg.pending_steers("dg_q1")] == \
-        [a["steer_id"], b["steer_id"]]
+    assert [s["steer_id"] for s in reg.pending_steers("dg_q1")] == [
+        a["steer_id"],
+        b["steer_id"],
+    ]
     drained = reg.consume_steers("dg_q1")
-    assert [s["text"] for s in drained] == ["focus on the fillet",
-                                            "use 6061 aluminum"]
+    assert [s["text"] for s in drained] == ["focus on the fillet", "use 6061 aluminum"]
     assert reg.pending_steers("dg_q1") == []
     assert reg.consume_steers("dg_q1") == []  # exactly-once
 
@@ -137,6 +150,7 @@ def test_terminate_flag():
 # The REAL consumption point: agent_turn.run_turn(subagent_id=...)
 # ---------------------------------------------------------------------------
 
+
 def test_run_turn_consumes_pre_queued_steer():
     reg.register_session("dg_s1", role="worker", status="running")
     reg.queue_steer("dg_s1", "prefer a revolve over a loft")
@@ -144,12 +158,14 @@ def test_run_turn_consumes_pre_queued_steer():
     # A BUILD brief that finishes with zero real tool calls is an unearned
     # finish (the harness nudges, then fails it — browsing packs is not work).
     # This test covers steer DELIVERY, so use a brief that needs no tools.
-    res = run_turn("summarize the shaft design decisions", prov, name="worker",
-                   subagent_id="dg_s1")
+    res = run_turn(
+        "summarize the shaft design decisions", prov, name="worker", subagent_id="dg_s1"
+    )
     assert res.success
     # the steer landed as a user message BEFORE the first completion
-    assert "[Human steering] prefer a revolve over a loft" in \
-        _msg_texts(prov.seen_messages[0])
+    assert "[Human steering] prefer a revolve over a loft" in _msg_texts(
+        prov.seen_messages[0]
+    )
     assert reg.pending_steers("dg_s1") == []
     # transcript captured the reply + the applied-steer marker
     whos = [r["who"] for r in reg.get_transcript("dg_s1")]
@@ -167,13 +183,19 @@ def test_run_turn_consumes_steer_queued_mid_turn():
         return {"ok": True}
 
     prov = RecordingProvider([_TOOL, _DONE])
-    res = run_turn("probe the part", prov, name="worker",
-                   tool_dispatch=tool_dispatch, subagent_id="dg_s2")
+    res = run_turn(
+        "probe the part",
+        prov,
+        name="worker",
+        tool_dispatch=tool_dispatch,
+        subagent_id="dg_s2",
+    )
     assert res.success
     # not in the first call, present in the second
     assert "stop after this step" not in _msg_texts(prov.seen_messages[0])
-    assert "[Human steering] stop after this step and report" in \
-        _msg_texts(prov.seen_messages[1])
+    assert "[Human steering] stop after this step and report" in _msg_texts(
+        prov.seen_messages[1]
+    )
 
 
 def test_run_turn_honors_terminate_at_boundary():
@@ -190,60 +212,86 @@ def test_run_turn_honors_terminate_at_boundary():
 # Full spawn→register→execute path (MissionDispatch + DelegationTree)
 # ---------------------------------------------------------------------------
 
-def test_delegate_registers_streams_spawn_and_executes():
+
+def test_delegate_registers_streams_spawn_and_executes(monkeypatch):
+    from services.agent import chudcode_roles
+
     events: list[dict] = []
 
     def on_event(data: dict) -> None:  # loop.py single-dict live convention
         events.append(dict(data))
 
+    monkeypatch.setattr(
+        chudcode_roles,
+        "run_role_turn",
+        lambda *args, **kwargs: {
+            "success": True,
+            "stop_reason": "completed",
+            "result": "finished",
+            "session_id": "cad-role-registry",
+            "tokens_used": 120,
+            "provider_usage_recorded": True,
+            "allowed_tools": ["measure_part"],
+            "cancelled": False,
+        },
+    )
     tree = DelegationTree(run_id="r_test", on_event=on_event)
-    # mega-13 refuses a zero-tool done on product roles; the unearned-finish
-    # gate goes further — a META call (list_tool_categories) is NOT work, so a
-    # BUILD brief still needs a real tool. This test covers spawn/stream/
-    # registry wiring, so the brief is an analysis one that needs no tools.
-    prov = MockProvider([_LIST_CATS, _DONE])
-    md = MissionDispatch(run_id="r_test", delegation_tree=tree, provider=prov,
-                         on_event=on_event)
-    out = md.delegate(role="sketcher", brief="review the base plate layout",
-                      budget_tokens=2000)
+    md = MissionDispatch(
+        run_id="r_test",
+        delegation_tree=tree,
+        on_event=on_event,
+        options={"session_id": "chat-registry"},
+    )
+    out = md.delegate(
+        role="sketcher",
+        brief="review the base plate layout",
+        budget_tokens=2000,
+    )
     assert out.get("executed") is True and out.get("ok") is True
-    # mega-8 multi-domain gate augments outputs with a residual typed_refusal —
-    # assert the scripted handoff content, not exact envelope equality.
     assert (out.get("handoff") or {}).get("summary") == "finished"
     node_id = out["id"]
-    # agent.spawn streamed live with the child's subagent_id
-    spawns = [e for e in events if e.get("kind") == "agent.spawn"]
+    spawns = [event for event in events if event.get("kind") == "agent.spawn"]
     assert len(spawns) == 1 and spawns[0]["subagent_id"] == node_id
-    # registry session ended done, with a real transcript
     sess = reg.get_session(node_id)
     assert sess["status"] == "done" and sess["role"] == "sketcher"
-    assert any(r["who"] == "subagent" for r in reg.get_transcript(node_id))
+    assert any(row["who"] == "subagent" for row in reg.get_transcript(node_id))
 
 
-def test_delegate_without_provider_is_honest_not_executed():
+def test_delegate_without_python_provider_surfaces_chudcode_failure(monkeypatch):
+    from services.agent import chudcode_roles
+
+    monkeypatch.setattr(
+        chudcode_roles,
+        "run_role_turn",
+        lambda *args, **kwargs: {
+            "success": False,
+            "stop_reason": "provider_error",
+            "result": {"error": "Chudcode session unavailable"},
+            "tokens_used": 0,
+            "provider_usage_recorded": False,
+            "cancelled": False,
+        },
+    )
     tree = DelegationTree(run_id="r_np")
-    md = MissionDispatch(run_id="r_np", delegation_tree=tree)  # no provider
+    md = MissionDispatch(run_id="r_np", delegation_tree=tree)
     out = md.delegate(role="sketcher", brief="do a thing", budget_tokens=1000)
-    # The "nothing ran" text moved from `note` to `ok`/`reason`/`error`, which are
-    # emitted FIRST so the cause survives the ledger's ~999-char result clip and
-    # reaches both the model and the GUI card (it used to show the brief instead).
-    assert out.get("executed") is False and out.get("ok") is False
-    assert out.get("reason") == "subagent_not_run"
-    assert "NOT" in (out.get("error") or "")
-    assert reg.get_session(out["id"])["status"] == "approved"  # spawned, not run
+    assert out.get("executed") is True and out.get("ok") is False
+    assert out.get("reason") == "subagent_provider_error"
+    assert "Chudcode session unavailable" in (out.get("error") or "")
+    assert reg.get_session(out["id"])["status"] == "failed"
 
 
 # ---------------------------------------------------------------------------
 # Worker RPC envelopes
 # ---------------------------------------------------------------------------
 
+
 def _rpc(name, params):
     return subagent_rpc.WORKER_METHODS[name](params, lambda *_: None)
 
 
 def test_rpc_list_transcript_steer_roundtrip():
-    reg.register_session("dg_r1", role="reviewer", brief="check it",
-                         status="running")
+    reg.register_session("dg_r1", role="reviewer", brief="check it", status="running")
     out = _rpc("subagent_list", {})
     assert out["ok"] and out["sessions"][0]["id"] == "dg_r1"
 
@@ -314,8 +362,7 @@ def test_rpc_control_runtime_effort_validation_and_list_roundtrip():
     assert reg.runtime_override("dg_ctl_runtime")["effort"] == "high"
     listed = _rpc("subagent_list", {})
     session = next(
-        item for item in listed["sessions"]
-        if item["id"] == "dg_ctl_runtime"
+        item for item in listed["sessions"] if item["id"] == "dg_ctl_runtime"
     )
     assert session["effort_override"] == "high"
 
@@ -359,6 +406,7 @@ def test_rpc_list_defaults_control_keys_for_legacy_meta():
 # this existed a sub-agent's real conversation died with run_turn's local list.
 # ---------------------------------------------------------------------------
 
+
 def test_raw_log_lands_beside_the_owning_conversation(tmp_path):
     """A bound session puts the raw log in the conversation's sidecar dir."""
     sessions = tmp_path / "Sessions"
@@ -389,11 +437,17 @@ def test_raw_log_is_verbatim_and_uncapped():
     """
     reg.register_session("dg_raw_big", role="worker", status="running")
     payload = "x" * 25000
-    reg.append_raw("dg_raw_big", {
-        "kind": "message",
-        "message": {"role": "assistant", "content": payload,
-                    "tool_calls": [{"name": "fs_write", "args": {"body": payload}}]},
-    })
+    reg.append_raw(
+        "dg_raw_big",
+        {
+            "kind": "message",
+            "message": {
+                "role": "assistant",
+                "content": payload,
+                "tool_calls": [{"name": "fs_write", "args": {"body": payload}}],
+            },
+        },
+    )
 
     records = reg.read_raw("dg_raw_big")
     body = [r for r in records if r.get("kind") == "message"]
@@ -405,11 +459,13 @@ def test_raw_log_is_verbatim_and_uncapped():
 
 def test_raw_log_header_identifies_the_session_and_seq_is_monotonic():
     reg.bind_session("conv_hdr", "")
-    reg.register_session("dg_raw_seq", role="sketcher", status="running",
-                         parent_run_id="run_7")
+    reg.register_session(
+        "dg_raw_seq", role="sketcher", status="running", parent_run_id="run_7"
+    )
     for i in range(3):
-        reg.append_raw("dg_raw_seq", {"kind": "lifecycle", "event": "steer",
-                                      "note": f"n{i}"})
+        reg.append_raw(
+            "dg_raw_seq", {"kind": "lifecycle", "event": "steer", "note": f"n{i}"}
+        )
 
     records = reg.read_raw("dg_raw_seq")
     header = records[0]
@@ -432,6 +488,7 @@ def test_raw_log_seq_survives_a_process_restart():
     reg.append_raw("dg_raw_restart", {"kind": "lifecycle", "event": "paused"})
 
     import importlib  # noqa: PLC0415
+
     importlib.reload(reg)
     reg.append_raw("dg_raw_restart", {"kind": "lifecycle", "event": "resumed"})
 
@@ -445,8 +502,9 @@ def test_raw_log_never_raises_into_the_agent_loop():
     class _Unserializable:
         pass
 
-    reg.append_raw("dg_raw_bad", {"kind": "message",
-                                  "message": {"o": _Unserializable()}})
+    reg.append_raw(
+        "dg_raw_bad", {"kind": "message", "message": {"o": _Unserializable()}}
+    )
     reg.append_raw("dg_raw_bad", {"kind": "lifecycle", "event": "finished"})
 
     kinds = [r.get("kind") for r in reg.read_raw("dg_raw_bad")]
@@ -471,8 +529,7 @@ def test_bound_main_turn_writes_full_agent_conversation(tmp_path):
     assert records[0]["schema"] == "chudware.chat.agent/1"
     assert records[0]["session_id"] == "conv_main"
     messages = [
-        record["message"] for record in records
-        if record.get("kind") == "message"
+        record["message"] for record in records if record.get("kind") == "message"
     ]
     assert messages[:-1] == provider.seen_messages[0]
     assert messages[-1]["role"] == "assistant"
@@ -495,9 +552,10 @@ def test_unbound_main_turn_writes_no_agent_archive(tmp_path):
 def test_rpc_transcript_raw_flag_returns_raw_records():
     reg.register_session("dg_raw_rpc", role="worker", status="running")
     reg.append_transcript("dg_raw_rpc", "subagent", "display copy")
-    reg.append_raw("dg_raw_rpc", {
-        "kind": "message",
-        "message": {"role": "assistant", "content": "raw copy"}})
+    reg.append_raw(
+        "dg_raw_rpc",
+        {"kind": "message", "message": {"role": "assistant", "content": "raw copy"}},
+    )
 
     display = _rpc("subagent_transcript", {"subagent_id": "dg_raw_rpc"})
     assert display["ok"]
@@ -506,8 +564,7 @@ def test_rpc_transcript_raw_flag_returns_raw_records():
     raw = _rpc("subagent_transcript", {"subagent_id": "dg_raw_rpc", "raw": True})
     assert raw["ok"]
     assert any(
-        m.get("message", {}).get("content") == "raw copy"
-        for m in raw["messages"]
+        m.get("message", {}).get("content") == "raw copy" for m in raw["messages"]
     )
 
 
@@ -526,6 +583,7 @@ def test_rpc_list_filters_by_owning_conversation():
 # ---------------------------------------------------------------------------
 # Controller liveness — the ONLY automatic release of a pause hold.
 # ---------------------------------------------------------------------------
+
 
 def test_controller_heartbeat_marks_a_controller_alive():
     reg.note_controller("gui")
@@ -554,7 +612,6 @@ def test_removed_approval_ops_are_rejected():
     """Spawn approval is automatic now; the ops are gone, not defaulted to yes."""
     reg.register_session("dg_no_approval", role="worker", status="running")
     for op in ("approve", "deny"):
-        refused = _rpc("subagent_control",
-                       {"subagent_id": "dg_no_approval", "op": op})
+        refused = _rpc("subagent_control", {"subagent_id": "dg_no_approval", "op": op})
         assert not refused["ok"]
         assert "pause, resume, set_runtime" in refused["reason"]

@@ -1,7 +1,7 @@
-"""Offline tests for session_cmds + session_rpc (batch 2b).
+"""Focused Chudcode session-command and explicit-offline coverage.
 
-Mock providers only — no live network. Compaction engines are mocked so this
-suite is independent of PyCompaction's file landing order.
+No live network: Chudcode hosts and role turns are faked, and local compaction
+engines are isolated from optional dependency landing order.
 """
 
 from __future__ import annotations
@@ -89,69 +89,135 @@ def _history() -> list[dict]:
 
 
 class TestHandoffDocument(unittest.TestCase):
-    def test_structure_and_no_mutation(self) -> None:
+    def test_online_handoff_uses_live_session_and_does_not_mutate(self) -> None:
+        from services.agent import chudcode_host
         from services.agent import session_cmds as sc
 
         msgs = _history()
-        msgs_before = copy.deepcopy(msgs)
-        prov = _MockProvider(_SAMPLE_HANDOFF)
-        doc = sc.handoff_document(
-            msgs, focus="RPC shapes", provider=prov, model="mock-1"
-        )
-        self.assertEqual(msgs, msgs_before, "handoff must not mutate input messages")
+        before = copy.deepcopy(msgs)
+        host = _FakeChudcodeHost()
+        host.result = {"ok": True, "document": _SAMPLE_HANDOFF}
+        with patch.object(
+            chudcode_host, "get_default_chudcode_host", return_value=host
+        ):
+            doc = sc.handoff_document(
+                msgs, focus="RPC shapes", session_id="conversation-7"
+            )
+        self.assertEqual(msgs, before)
         self.assertIn("## Goal", doc)
-        self.assertIn("## Constraints & Preferences", doc)
-        self.assertIn("## Progress", doc)
-        self.assertIn("### Done", doc)
-        self.assertIn("### In Progress", doc)
-        self.assertIn("### Pending", doc)
-        self.assertIn("## Key Decisions", doc)
-        self.assertIn("## Critical Context", doc)
-        self.assertIn("## Next Steps", doc)
-        self.assertEqual(len(prov.calls), 1)
-        # Prompt must request the structure and carry focus
-        last_user = prov.calls[0]["messages"][-1]
-        last_text = last_user["content"][0]["text"]
-        self.assertIn("## Goal", last_text)
-        self.assertIn("Additional focus: RPC shapes", last_text)
-        # History preserved in prompt (snapshot, not same object)
-        self.assertGreaterEqual(len(prov.calls[0]["messages"]), len(msgs) + 1)
+        self.assertEqual(
+            host.calls,
+            [
+                (
+                    "conversation-7",
+                    "handoff",
+                    {"customInstructions": "RPC shapes"},
+                )
+            ],
+        )
+
+    def test_explicit_offline_handoff_uses_bounded_safe_role_turn(self) -> None:
+        from services.agent import session_cmds as sc
+
+        msgs = _history()
+        before = copy.deepcopy(msgs)
+        with patch.object(
+            sc, "_run_one_shot_role", return_value=_SAMPLE_HANDOFF
+        ) as run:
+            doc = sc.handoff_document(
+                msgs,
+                focus="offline state",
+                provider=_MockProvider(_SAMPLE_HANDOFF),
+                standalone=True,
+            )
+        self.assertEqual(msgs, before)
+        self.assertIn("## Goal", doc)
+        kwargs = run.call_args.kwargs
+        self.assertEqual(kwargs["command"], "handoff")
+        self.assertTrue(kwargs["standalone"])
+        self.assertIn("Additional focus: offline state", kwargs["request"])
+
+    def test_online_handoff_requires_session_id(self) -> None:
+        from services.agent import session_cmds as sc
+
+        with patch.object(sc, "_offline_enabled", return_value=False):
+            with self.assertRaises(sc.SessionCommandUnavailable):
+                sc.handoff_document(_history())
 
 
 class TestBtwAnswer(unittest.TestCase):
-    def test_no_history_mutation(self) -> None:
+    def test_bounded_one_shot_role_turn_and_no_history_mutation(self) -> None:
+        from services.agent import chudcode_roles
         from services.agent import session_cmds as sc
 
         msgs = _history()
-        msgs_before = copy.deepcopy(msgs)
-        prov = _MockProvider("The mounting holes should be M5 on a 40 mm pitch.")
-        answer = sc.btw_answer(msgs, "What hole size?", provider=prov, model="mock-1")
-        self.assertEqual(msgs, msgs_before)
+        before = copy.deepcopy(msgs)
+        seen: list[dict[str, Any]] = []
+
+        def fake_turn(request, role, **kwargs):
+            seen.append({"request": request, "role": role, **kwargs})
+            return {
+                "success": True,
+                "stop_reason": "completed",
+                "result": "The mounting holes should be M5.",
+            }
+
+        with patch.object(chudcode_roles, "run_role_turn", side_effect=fake_turn):
+            answer = sc.btw_answer(
+                msgs,
+                "What hole size?",
+                provider="fixture-provider",
+                model="fixture-model",
+                session_id="conversation-7",
+            )
+        self.assertEqual(msgs, before)
         self.assertIn("M5", answer)
-        self.assertEqual(len(prov.calls), 1)
-        # Last user message is the <btw> wrapper
-        last = prov.calls[0]["messages"][-1]["content"][0]["text"]
-        self.assertIn("<btw>", last)
-        self.assertIn("What hole size?", last)
-        self.assertIn("NEVER use tools", last)
-        # No-tools reminder is present earlier
-        texts = [
-            m["content"][0]["text"]
-            for m in prov.calls[0]["messages"]
-            if m.get("content")
-            and isinstance(m["content"], list)
-            and m["content"]
-            and m["content"][0].get("type") == "text"
-        ]
-        self.assertTrue(any("side-channel" in t or "NOT available" in t for t in texts))
+        self.assertEqual(len(seen), 1)
+        call = seen[0]
+        self.assertEqual(call["role"], "general_agent")
+        self.assertEqual(call["session_id"], "conversation-7")
+        self.assertTrue(call["close_session"])
+        self.assertEqual(call["max_tokens"], 2048)
+        self.assertEqual(call["max_total_tokens"], 4096)
+        self.assertEqual(call["options"]["allowed_tools"], [])
+        self.assertEqual(
+            call["options"]["settings"],
+            {"provider": "fixture-provider", "model": "fixture-model"},
+        )
+        self.assertIn("<btw>", call["request"])
+        self.assertIn("NEVER use tools", call["request"])
+        self.assertEqual(call["history"], _history())
+
+    def test_explicit_offline_btw_marks_role_turn_offline(self) -> None:
+        from services.agent import chudcode_roles
+        from services.agent import session_cmds as sc
+
+        provider = _MockProvider("offline answer")
+        seen: list[dict[str, Any]] = []
+
+        def fake_turn(_request, _role, **kwargs):
+            seen.append(kwargs)
+            return {
+                "success": True,
+                "stop_reason": "confirmed",
+                "result": {"handoff": {"summary": "offline answer"}},
+            }
+
+        with patch.object(chudcode_roles, "run_role_turn", side_effect=fake_turn):
+            answer = sc.btw_answer(
+                _history(),
+                "status?",
+                provider=provider,
+                standalone=True,
+            )
+        self.assertEqual(answer, "offline answer")
+        self.assertTrue(seen[0]["options"]["offline"])
+        self.assertIs(seen[0]["options"]["offline_provider"], provider)
 
     def test_empty_question(self) -> None:
         from services.agent import session_cmds as sc
 
-        prov = _MockProvider("should not be called")
-        answer = sc.btw_answer(_history(), "  ", provider=prov)
-        self.assertEqual(answer, "")
-        self.assertEqual(prov.calls, [])
+        self.assertEqual(sc.btw_answer(_history(), "  "), "")
 
 
 class _FakeChudcodeHost:
@@ -329,9 +395,7 @@ class TestSessionRpc(unittest.TestCase):
     def test_rpc_handoff_and_btw_shapes(self) -> None:
         from services.agent import worker_rpc as rpc
 
-        prov = _MockProvider(_SAMPLE_HANDOFF)
-        # Patch get_provider path by injecting provider object via params
-        # session_cmds accepts provider instance directly.
+        # Worker RPC forwards the live Chudcode identity and explicit-local bit.
         with patch.object(
             rpc._cmds(),
             "handoff_document",
@@ -343,29 +407,35 @@ class TestSessionRpc(unittest.TestCase):
                     "focus": "tests",
                     "provider": "mock",
                     "model": "m",
+                    "session_id": "conversation-7",
                 },
                 lambda *a, **k: None,
             )
         self.assertTrue(r.get("ok"))
         self.assertIn("document", r)
         self.assertIn("## Goal", r["document"])
+        self.assertEqual(_hd.call_args.kwargs["session_id"], "conversation-7")
+        self.assertFalse(_hd.call_args.kwargs["standalone"])
 
         with patch.object(
             rpc._cmds(),
             "btw_answer",
             return_value="brief answer",
-        ):
+        ) as _btw:
             r2 = rpc.SESSION_METHODS["session_btw"](
                 {
                     "messages": _history(),
                     "question": "status?",
                     "provider": "mock",
                     "model": "m",
+                    "session_id": "conversation-7",
                 },
                 lambda *a, **k: None,
             )
         self.assertTrue(r2.get("ok"))
         self.assertEqual(r2["answer"], "brief answer")
+        self.assertEqual(_btw.call_args.kwargs["session_id"], "conversation-7")
+        self.assertFalse(_btw.call_args.kwargs["standalone"])
 
     def test_rpc_btw_requires_question(self) -> None:
         from services.agent import worker_rpc as rpc

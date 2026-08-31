@@ -10,6 +10,7 @@ Two standing rules this module locks in:
 2. Prefer a STRONGER model at LOW effort over a weaker model at HIGH effort —
    concretely, Opus must win over Sonnet when their capability ranks tie.
 """
+
 from __future__ import annotations
 
 import pytest
@@ -22,8 +23,21 @@ from services.agent import role_models as rm
 # 1. The clamp itself
 # ---------------------------------------------------------------------------
 
-@pytest.mark.parametrize("raw", ["max", "MAX", " Max ", "xhigh", "x-high",
-                                 "extra_high", "ultra", "highest", "maximum"])
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "max",
+        "MAX",
+        " Max ",
+        "xhigh",
+        "x-high",
+        "extra_high",
+        "ultra",
+        "highest",
+        "maximum",
+    ],
+)
 def test_above_high_levels_collapse_to_high(raw):
     assert rm.clamp_subagent_effort(raw) == "high"
 
@@ -67,30 +81,26 @@ def test_provider_clamp_rebinds_child_without_mutating_parent():
 # 2. The clamp is WIRED into sub-agent dispatch
 # ---------------------------------------------------------------------------
 
+
 def test_dag_node_never_inherits_global_max_effort(monkeypatch):
     """cfg_pick = dict(cfg) inherits the user's global reasoning_effort, and the
     resolver only OVERWRITES it on success. With resolution returning None a
     Settings-level 'max' used to reach the child provider untouched."""
     from services.dag import node_runner as nr
-    from services.agent.providers.openai_provider import OpenAIProvider
 
     cfg = {
         "provider": "xai-sub",
         "model": "grok-4.5",
         "reasoning_effort": "max",  # the user's global Settings pin
         "enabled_providers": [
-            {"provider": "ollama", "model": "llama3.2:latest",
-             "base_url": "http://127.0.0.1:11434/v1"},
+            {
+                "provider": "ollama",
+                "model": "llama3.2:latest",
+                "base_url": "http://127.0.0.1:11434/v1",
+            },
         ],
     }
     monkeypatch.setattr("services.agent.config.load_config", lambda: dict(cfg))
-    monkeypatch.setattr(
-        "services.agent.config.get_provider",
-        lambda name=None, cfg=None, role=None: OpenAIProvider(
-            api_key="ollama",
-            model=(cfg or {}).get("model") or "llama3.2:latest",
-            base_url="http://127.0.0.1:11434/v1"),
-    )
     # Force the "resolver leaves it unset" branch — the exact leak path.
     monkeypatch.setattr(
         "services.agent.role_models.resolve_role_thinking",
@@ -101,23 +111,23 @@ def test_dag_node_never_inherits_global_max_effort(monkeypatch):
         "role_id": "sketcher",
         "task_class": "modification",
         "depth": 1,
-        "node_inputs": {"role": "sketcher", "task_class": "modification",
-                        "depth": 1},
+        "node_inputs": {"role": "sketcher", "task_class": "modification", "depth": 1},
         "retry_remaining": 2,
     }
-    nr._resolve_provider(context, provider=None)
+    settings = nr._resolve_role_settings(context)
     row = context.get("role_model") or {}
     assert row.get("reasoning_effort") == "high", row
+    assert settings["reasoning_effort"] == "high"
 
 
 def test_dag_session_default_clamps_final_ambient_provider(monkeypatch):
     """Path B's session-default branch reuses ambient state unless clamped last."""
     from services.dag import node_runner as nr
 
-    ambient = SimpleNamespace(
-        name="ambient", model="frontier", reasoning_effort="max")
+    ambient = SimpleNamespace(name="ambient", model="frontier", reasoning_effort="max")
     assignment = rm.RoleModelAssignment(
-        role="task", provider="", model="", mode=rm.SESSION_DEFAULT)
+        role="task", provider="", model="", mode=rm.SESSION_DEFAULT
+    )
     monkeypatch.setattr(
         "services.agent.config.load_config",
         lambda: {"reasoning_effort": "max"},
@@ -125,7 +135,7 @@ def test_dag_session_default_clamps_final_ambient_provider(monkeypatch):
     monkeypatch.setattr(rm, "resolve_for_node", lambda *a, **k: assignment)
     monkeypatch.setattr(rm, "resolve_role_thinking", lambda *a, **k: None)
 
-    child = nr._resolve_provider(
+    settings = nr._resolve_role_settings(
         {
             "role_id": "sketcher",
             "task_class": "modification",
@@ -136,11 +146,14 @@ def test_dag_session_default_clamps_final_ambient_provider(monkeypatch):
                 "depth": 1,
             },
         },
-        provider=ambient,
+        injected=ambient,
     )
 
-    assert child is not ambient
-    assert child.reasoning_effort == "high"
+    assert settings == {
+        "provider": "ambient",
+        "model": "frontier",
+        "reasoning_effort": "high",
+    }
     assert ambient.reasoning_effort == "max"
 
 
@@ -150,16 +163,17 @@ def test_dag_session_default_clamps_final_ambient_provider(monkeypatch):
     ids=["session-default", "resolution-exception-fallback"],
 )
 def test_delegate_session_default_clamps_final_ambient_provider(
-    monkeypatch, role_resolution_fails,
+    monkeypatch,
+    role_resolution_fails,
 ):
-    """Path A must clamp the provider object reused by session-default roles."""
-    from services.agent import agent_turn
+    """Path A passes only a capped effort setting into online Chudcode."""
+    from services.agent import chudcode_roles
     from services.agent.mission_dispatch import MissionDispatch
 
-    ambient = SimpleNamespace(
-        name="ambient", model="frontier", reasoning_effort="max")
+    ambient = SimpleNamespace(name="ambient", model="frontier", reasoning_effort="max")
     assignment = rm.RoleModelAssignment(
-        role="task", provider="", model="", mode=rm.SESSION_DEFAULT)
+        role="task", provider="", model="", mode=rm.SESSION_DEFAULT
+    )
     captured = {}
 
     monkeypatch.setattr(
@@ -171,20 +185,30 @@ def test_delegate_session_default_clamps_final_ambient_provider(
         lambda: {"reasoning_effort": "max"},
     )
     if role_resolution_fails:
+
         def resolve_for_node(*_args, **_kwargs):
             raise RuntimeError("role resolution unavailable")
     else:
+
         def resolve_for_node(*_args, **_kwargs):
             return assignment
+
     monkeypatch.setattr(rm, "resolve_for_node", resolve_for_node)
     monkeypatch.setattr(rm, "resolve_role_thinking", lambda *a, **k: None)
 
-    def fake_run_turn(request, provider, **kwargs):
-        captured["provider"] = provider
-        return SimpleNamespace(
-            success=True, stop_reason="confirmed", result={})
+    def fake_run_turn(_request, _role, **kwargs):
+        captured["options"] = kwargs.get("options") or {}
+        return {
+            "success": True,
+            "stop_reason": "completed",
+            "result": "done",
+            "session_id": "cad-role-effort",
+            "tokens_used": 100,
+            "provider_usage_recorded": True,
+            "cancelled": False,
+        }
 
-    monkeypatch.setattr(agent_turn, "run_turn", fake_run_turn)
+    monkeypatch.setattr(chudcode_roles, "run_role_turn", fake_run_turn)
     dispatch = MissionDispatch(run_id="", provider=ambient)
     result = dispatch._run_subagent_turn(
         {
@@ -196,20 +220,18 @@ def test_delegate_session_default_clamps_final_ambient_provider(
         "Build the assigned feature.",
     )
 
-    child = captured["provider"]
+    options = captured["options"]
     assert result["ok"] is True
-    assert child is not ambient
-    assert child.reasoning_effort == "high"
+    assert options["settings"]["reasoning_effort"] == "high"
+    assert "offline_provider" not in options
     assert ambient.reasoning_effort == "max"
-
 
 
 def _feature_modeler_budget_requirements():
     from services.agent.delegation import delegation_budget_requirements
 
     brief = "Build the ratified feature chain and verify the finished part."
-    req = delegation_budget_requirements(
-        "feature_modeler", brief, tier="local-24k")
+    req = delegation_budget_requirements("feature_modeler", brief, tier="local-24k")
     return brief, req
 
 
@@ -222,13 +244,13 @@ def _feature_modeler_tree(run_id):
         tier="local-24k",
     )
 
+
 def test_absurd_positive_grant_spawns_with_budget_advisory():
     from services.agent.delegation import delegate
 
     brief, req = _feature_modeler_budget_requirements()
     tree = _feature_modeler_tree("budget-advisory")
-    result = delegate(
-        "feature_modeler", brief, 50, tree=tree)
+    result = delegate("feature_modeler", brief, 50, tree=tree)
 
     assert result["ok"] is True
     assert result["status"] == "approved"
@@ -239,7 +261,8 @@ def test_absurd_positive_grant_spawns_with_budget_advisory():
     assert "proceeding" in result["remedy"].lower()
 
     warnings = [
-        event for event in tree._pending_events
+        event
+        for event in tree._pending_events
         if event.get("kind") == "delegation_budget_warning"
     ]
     assert len(warnings) == 1
@@ -249,9 +272,11 @@ def test_absurd_positive_grant_spawns_with_budget_advisory():
     assert payload["mandated_calls"] == 18
     assert "proceeding" in payload["message"].lower()
 
+
 # ---------------------------------------------------------------------------
 # 3. Stronger-model-at-low-effort beats weaker-model-at-high-effort
 # ---------------------------------------------------------------------------
+
 
 def test_auto_pick_prefers_opus_over_sonnet_at_equal_rank():
     """Directive: prefer Opus at low effort over Sonnet at high effort.
@@ -267,7 +292,8 @@ def test_auto_pick_prefers_opus_over_sonnet_at_equal_rank():
     ]
     ranks = rm.load_rankings({})
     assert ranks["claude-opus-4-8"].rank == ranks["claude-sonnet-5"].rank, (
-        "test premise: the two must tie on rank for the tie-break to decide")
+        "test premise: the two must tie on rank for the tie-break to decide"
+    )
 
     for order in (enabled, list(reversed(enabled))):
         pick = rm.auto_pick_model(cfg={}, enabled=order, min_rank=5)
@@ -278,4 +304,5 @@ def test_opus_at_low_effort_is_reachable_for_subagents():
     """The ceiling must not block the preferred combination: Opus + low."""
     assert rm.clamp_subagent_effort("low") == "low"
     from services.agent.providers.anthropic_provider import _normalize_effort
+
     assert _normalize_effort("low") == "low"

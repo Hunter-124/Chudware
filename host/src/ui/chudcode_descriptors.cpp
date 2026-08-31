@@ -1,6 +1,8 @@
 // chudcode_descriptors.cpp — see chudcode_descriptors.h. GL/ImGui/AppState-free on purpose.
 #include "chudcode_descriptors.h"
 
+#include <algorithm>
+
 namespace ui {
 
 namespace {
@@ -118,6 +120,49 @@ bool parseChudcodeLoginEvent(const nlohmann::json& ev, ChudcodeLoginEvent& out) 
     if (e.kind.empty() && e.message.empty()) return false;
     out = std::move(e);
     return true;
+}
+
+bool parseChudcodeSttResult(const nlohmann::json& r, ChudcodeSttResult& out) {
+    if (!r.is_object() || !jbool(r, "ok", false)) return false;
+    ChudcodeSttResult s;
+    s.available = jbool(r, "available", false);
+    s.state = jstr(r, "state");
+    if (s.state != "idle" && s.state != "recording" && s.state != "transcribing")
+        return false;
+    s.model = jstr(r, "model");
+    const auto progress = r.find("progress");
+    if (progress != r.end() && progress->is_number())
+        s.progress = std::clamp((int)progress->get<double>(), 0, 100);
+    s.error = jstrAny(r, {"error", "reason"});
+    s.text = jstr(r, "text");
+    out = std::move(s);
+    return true;
+}
+
+std::string composeChudcodeTranscript(const std::string& base, const std::string& committed,
+                                     const std::string& partial) {
+    std::string out = base;
+    const auto append = [&out](const std::string& piece) {
+        if (piece.empty()) return;
+        if (!out.empty() && out.back() != ' ' && out.back() != '\n') out.push_back(' ');
+        out += piece;
+    };
+    append(committed);
+    append(partial);
+    return out;
+}
+
+bool chudcodeKeyValidationAccepted(const nlohmann::json& r, const std::string& providerId) {
+    return r.is_object() && jbool(r, "ok", false) && jbool(r, "valid", false) &&
+           jstr(r, "providerId") == providerId;
+}
+
+bool chudcodeKeySaveAccepted(const nlohmann::json& r, const std::string& providerId) {
+    if (!r.is_object() || !jbool(r, "ok", false)) return false;
+    const auto provider = r.find("provider");
+    return provider != r.end() && provider->is_object() &&
+           jstr(*provider, "providerId") == providerId &&
+           jbool(*provider, "authenticated", false) && jbool(*provider, "hasApiKey", false);
 }
 
 bool parseChudcodeSessionStats(const nlohmann::json& r, ChudcodeSessionStats& out) {

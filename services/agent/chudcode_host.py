@@ -57,9 +57,14 @@ _TRANSIENT_SHAPES: dict[str, tuple[frozenset[str], frozenset[str]]] = {
 _SESSION_SHAPES: dict[str, tuple[frozenset[str], frozenset[str]]] = {
     "get_session_stats": (frozenset(), frozenset()),
     "compact": (frozenset(), frozenset({"customInstructions"})),
+    "handoff": (frozenset(), frozenset({"customInstructions"})),
     "set_auto_compaction": (frozenset({"enabled"}), frozenset()),
     "set_auto_retry": (frozenset({"enabled"}), frozenset()),
     "get_state": (frozenset(), frozenset()),
+    "stt_status": (frozenset(), frozenset()),
+    "stt_start": (frozenset(), frozenset()),
+    "stt_stop": (frozenset(), frozenset()),
+    "stt_cancel": (frozenset(), frozenset()),
 }
 
 
@@ -488,11 +493,11 @@ class ChudcodeSessionHost:
         ):
             raise TypeError(f"{command_name} enabled must be a boolean")
         if (
-            command_name == "compact"
+            command_name in {"compact", "handoff"}
             and "customInstructions" in payload
             and not isinstance(payload["customInstructions"], str)
         ):
-            raise TypeError("compact customInstructions must be a string")
+            raise TypeError(f"{command_name} customInstructions must be a string")
         with self._lock:
             session = self._sessions.get(session_key)
             if session is None or session.closed:
@@ -819,9 +824,16 @@ def _invoke_session_canonical(
 ) -> Any:
     method = getattr(client, command, None)
     if callable(method):
-        if command in {"get_session_stats", "get_state"}:
+        if command in {
+            "get_session_stats",
+            "get_state",
+            "stt_status",
+            "stt_start",
+            "stt_stop",
+            "stt_cancel",
+        }:
             return method()
-        if command == "compact":
+        if command in {"compact", "handoff"}:
             return method(payload.get("customInstructions"))
         if command in {"set_auto_compaction", "set_auto_retry"}:
             method(payload["enabled"])

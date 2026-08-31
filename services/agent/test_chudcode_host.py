@@ -34,6 +34,9 @@ class FakeClient:
         self._protocol_version = factory.protocol_version
         self.session_id = f"cc-{len(factory.clients) + 1}"
         self.session_file = f"/sessions/{self.session_id}.jsonl"
+        self.stt_available = True
+        self.stt_state = "idle"
+        self.stt_progress = None
 
     def start(self):
         self.started = True
@@ -216,6 +219,39 @@ class FakeClient:
             "firstKeptEntryId": "entry-2",
             "tokensBefore": 100,
         }
+
+    def handoff(self, custom_instructions=None):
+        self.calls.append(("handoff", {"customInstructions": custom_instructions}))
+        return {"document": f"handoff: {custom_instructions or 'continue'}"}
+
+    def stt_status(self):
+        self.calls.append(("stt_status", {}))
+        result = {
+            "available": self.stt_available,
+            "state": self.stt_state,
+            "model": "whisper-small",
+        }
+        if self.stt_progress is not None:
+            result["progress"] = self.stt_progress
+        if not self.stt_available:
+            result["error"] = "microphone unavailable"
+        return result
+
+    def stt_start(self):
+        self.calls.append(("stt_start", {}))
+        self.stt_state = "recording"
+        self.stt_progress = 100
+        return {"state": self.stt_state, "model": "whisper-small"}
+
+    def stt_stop(self):
+        self.calls.append(("stt_stop", {}))
+        self.stt_state = "idle"
+        return {"state": self.stt_state, "text": "make the bore wider"}
+
+    def stt_cancel(self):
+        self.calls.append(("stt_cancel", {}))
+        self.stt_state = "idle"
+        return {"state": self.stt_state}
 
 
 class FakeFactory:
@@ -578,6 +614,9 @@ def test_live_session_calls_are_isolated_and_never_create_for_status():
     auto_retry = host.session_call("b", "set_auto_retry", {"enabled": True})
     state = host.session_call("a", "get_state")
 
+    handoff = host.session_call(
+        "a", "handoff", {"customInstructions": "Focus on the sketch"}
+    )
     assert len(factory.clients) == count
     assert stats["sessionId"] == factory.clients[0].session_id
     assert compact["summary"] == "trimmed"
@@ -585,8 +624,45 @@ def test_live_session_calls_are_isolated_and_never_create_for_status():
     assert auto_retry == {"ok": True, "enabled": True}
     assert state["_hostToolNames"] == ["cad_tool"]
     assert "get_session_stats" in call_names(factory.clients[0])
+    assert handoff["document"] == "handoff: Focus on the sketch"
+    assert "handoff" in call_names(factory.clients[0])
     assert "compact" not in call_names(factory.clients[0])
     assert "compact" in call_names(factory.clients[1])
+
+
+def test_live_stt_calls_preserve_state_progress_cancel_and_session_isolation():
+    factory = FakeFactory()
+    host = ChudcodeSessionHost(client_factory=factory)
+    for command in ("stt_status", "stt_start", "stt_stop", "stt_cancel"):
+        assert host.session_call("missing", command) == {
+            "ok": False,
+            "reason": "session_not_live",
+        }
+    assert factory.clients == []
+
+    run(host, "a", "a1")
+    run(host, "b", "b1")
+    with pytest.raises(ValueError, match="unknown params"):
+        host.session_call("a", "stt_status", {"device": "wrong-layer"})
+    assert host.session_call("a", "stt_start") == {
+        "ok": True,
+        "state": "recording",
+        "model": "whisper-small",
+    }
+    factory.clients[0].stt_progress = 37
+    status_a = host.session_call("a", "stt_status")
+    status_b = host.session_call("b", "stt_status")
+    assert status_a["state"] == "recording" and status_a["progress"] == 37
+    assert status_b["state"] == "idle" and "progress" not in status_b
+    assert host.session_call("a", "stt_stop")["text"] == "make the bore wider"
+    assert host.session_call("b", "stt_cancel") == {"ok": True, "state": "idle"}
+
+    factory.clients[1].stt_available = False
+    unavailable = host.session_call("b", "stt_status")
+    assert unavailable["available"] is False
+    assert unavailable["error"] == "microphone unavailable"
+    assert "stt_start" in call_names(factory.clients[0])
+    assert "stt_start" not in call_names(factory.clients[1])
 
 
 def test_shutdown_cancels_an_inflight_transient_login_once():
@@ -711,6 +787,16 @@ def test_real_rpc_client_protocol_covers_transient_and_live_session_calls(tmp_pa
                     })
                 elif kind == "compact":
                     respond(request_id, kind, {"summary": "trimmed", "firstKeptEntryId": "entry-1", "tokensBefore": 50})
+                elif kind == "handoff":
+                    respond(request_id, kind, {"document": "protocol handoff"})
+                elif kind == "stt_status":
+                    respond(request_id, kind, {"ok": True, "available": True, "state": "transcribing", "model": "whisper-small", "progress": 42})
+                elif kind == "stt_start":
+                    respond(request_id, kind, {"ok": True, "state": "recording", "model": "whisper-small"})
+                elif kind == "stt_stop":
+                    respond(request_id, kind, {"ok": True, "state": "idle", "text": "protocol transcript"})
+                elif kind == "stt_cancel":
+                    respond(request_id, kind, {"ok": True, "state": "idle"})
                 elif kind in {"set_auto_compaction", "set_auto_retry"}:
                     respond(request_id, kind, {})
                 else:
@@ -735,5 +821,10 @@ def test_real_rpc_client_protocol_covers_transient_and_live_session_calls(tmp_pa
     assert host.session_call("live", "set_auto_compaction", {"enabled": False})["ok"]
     assert host.session_call("live", "set_auto_retry", {"enabled": True})["ok"]
     assert host.session_call("live", "get_state")["dumpTools"][0]["name"] == "browser"
+    assert host.session_call("live", "handoff")["document"] == "protocol handoff"
+    assert host.session_call("live", "stt_status")["progress"] == 42
+    assert host.session_call("live", "stt_start")["state"] == "recording"
+    assert host.session_call("live", "stt_stop")["text"] == "protocol transcript"
+    assert host.session_call("live", "stt_cancel")["state"] == "idle"
     assert emitted[0]["kind"] == "open_url"
     host.shutdown()

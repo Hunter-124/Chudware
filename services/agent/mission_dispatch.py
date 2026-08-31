@@ -28,6 +28,7 @@ Honesty rules:
   * Handlers return plain dicts (``{"ok": bool, ...}``) — errors are data fed
     back to the model, mirroring the MCP tool modules they shadow.
 """
+
 from __future__ import annotations
 
 import json
@@ -133,18 +134,25 @@ def _delegation_execution_verdict(node: dict) -> dict:
     )
     if ran:
         return {}
-    bound = str(model.get("provider") or "").strip() or str(model.get("id") or "").strip()
-    why = ("no model was bound to the sub-agent role" if not bound
-           else "the sub-agent produced no attempt, no tokens, no handoff and no documents")
+    bound = (
+        str(model.get("provider") or "").strip() or str(model.get("id") or "").strip()
+    )
+    why = (
+        "no model was bound to the sub-agent role"
+        if not bound
+        else "the sub-agent produced no attempt, no tokens, no handoff and no documents"
+    )
     return {
         "executed": False,
         "ok": False,
         "status": node.get("status") or "approved",
         "subagent_status": "not_run",
-        "note": (f"sub-agent '{node.get('role') or '?'}' was SPAWNED but did NOT run: {why}. "
-                 f"Nothing was produced, so do not report this brief as done — either do the "
-                 f"work directly with the concrete tools, or say plainly that delegation is "
-                 f"unavailable in this run."),
+        "note": (
+            f"sub-agent '{node.get('role') or '?'}' was SPAWNED but did NOT run: {why}. "
+            f"Nothing was produced, so do not report this brief as done — either do the "
+            f"work directly with the concrete tools, or say plainly that delegation is "
+            f"unavailable in this run."
+        ),
     }
 
 
@@ -209,7 +217,8 @@ def _actionable_delegate_failure(node: dict) -> dict:
     # Keep these keys first: both agent_events._error_text and the persisted
     # tool-result clip must expose the cause before the spawn record / brief.
     rest = {
-        key: value for key, value in node.items()
+        key: value
+        for key, value in node.items()
         if key not in {"ok", "reason", "error"}
     }
     return {"ok": False, "reason": reason, "error": error, **rest}
@@ -238,7 +247,10 @@ def retryable_child_failure(result: Any) -> bool:
     """
     if bool(getattr(result, "success", False)):
         return False
-    if str(getattr(result, "stop_reason", "") or "") not in ("failed", "provider_error"):
+    if str(getattr(result, "stop_reason", "") or "") not in (
+        "failed",
+        "provider_error",
+    ):
         return False
     payload = getattr(result, "result", None)
     return isinstance(payload, dict) and payload.get("retryable") is True
@@ -263,6 +275,7 @@ def configured_subagent_tool_budget(base: int | None) -> int | None:
         from services.agent.config import (  # noqa: PLC0415
             get_subagent_tool_call_budget,
         )
+
         configured = get_subagent_tool_call_budget()
     except Exception:  # noqa: BLE001 — automatic derivation is the fallback
         return base
@@ -288,48 +301,72 @@ class MissionDispatch:
     #: The run-scoped tool families this layer serves (T-W32 DoD list + the
     #: Parts Library V2 sourcing surface — workstream 5) + coordination board
     #: + corporate org mode (aicad.corporate/1).
-    TOOLS = ("ledger_get", "ledger_note", "dag_plan", "ask_user",
-             "delegate", "part_search", "parts_taxonomy", "part_get",
-             "part_source", "match_model", "reverse_engineer_product", "vendors_health",
-             "scrape_enqueue", "scrape_queue_status", "import_artifact",
-             "cam_tool_import",
-             # Coordination board (shared claims / progress across sub-agents)
-             "coordinate_claim", "coordinate_release",
-             "coordinate_progress", "coordinate_board",
-             # Corporate org mode channels / meetings / head spawn
-             "corporate_channel_post", "corporate_channel_read",
-             "corporate_chart", "corporate_spawn_worker",
-             "corporate_hold_meeting", "corporate_record_completion",
-             "corporate_activate")
+    TOOLS = (
+        "ledger_get",
+        "ledger_note",
+        "dag_plan",
+        "ask_user",
+        "delegate",
+        "part_search",
+        "parts_taxonomy",
+        "part_get",
+        "part_source",
+        "match_model",
+        "reverse_engineer_product",
+        "vendors_health",
+        "scrape_enqueue",
+        "scrape_queue_status",
+        "import_artifact",
+        "cam_tool_import",
+        # Coordination board (shared claims / progress across sub-agents)
+        "coordinate_claim",
+        "coordinate_release",
+        "coordinate_progress",
+        "coordinate_board",
+        # Corporate org mode channels / meetings / head spawn
+        "corporate_channel_post",
+        "corporate_channel_read",
+        "corporate_chart",
+        "corporate_spawn_worker",
+        "corporate_hold_meeting",
+        "corporate_record_completion",
+        "corporate_activate",
+    )
 
-
-    def __init__(self, *, run_id: str, ledger=None, autonomy: str = "auto",
-                 graph: dict | None = None, delegation_tree=None,
-                 doc_id: str | None = None, provider=None, on_event=None,
-                 capability=None, tier: str | None = None,
-                 phase: str | None = None,
-                 task_class: str | None = None,
-                 coordination_board=None,
-                 org_chart=None,
-                 corporate_agent_id: str | None = None,
-                 options: dict | None = None,
-                 mode: str | None = None,
-                 corporate_force: bool | None = None,
-                 plan_only: bool | None = None,
-                 advisor: bool | None = None,
-                 chudware_actor: Any | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        run_id: str,
+        ledger=None,
+        autonomy: str = "auto",
+        graph: dict | None = None,
+        delegation_tree=None,
+        doc_id: str | None = None,
+        provider=None,
+        on_event=None,
+        capability=None,
+        tier: str | None = None,
+        phase: str | None = None,
+        task_class: str | None = None,
+        coordination_board=None,
+        org_chart=None,
+        corporate_agent_id: str | None = None,
+        options: dict | None = None,
+        mode: str | None = None,
+        corporate_force: bool | None = None,
+        plan_only: bool | None = None,
+        advisor: bool | None = None,
+        chudware_actor: Any | None = None,
+    ) -> None:
         self.run_id = run_id
         self.ledger = ledger
         self.autonomy = autonomy
         self.graph = graph
         self.delegation_tree = delegation_tree
         self.doc_id = doc_id
-        # Phase 4 (M11): when a *provider* is bound, ``delegate`` actually RUNS the
-        # approved sub-agent (one bounded agent_turn, synchronous) instead of only
-        # minting a node — so the registry session gets a real transcript and the
-        # GUI's queued steering lands at the sub-agent's turn boundaries.
-        # *on_event* is the mission's live event sink (agent.tool_call etc. stream
-        # from inside the sub-agent turn through the same drain).
+        # Online delegated turns execute through Chudcode and never consume this
+        # object.  ``provider`` survives only as an injected deterministic local
+        # provider for an explicit ``options={"offline": True}`` run.
         self.provider = provider
         self.on_event = on_event
         self.chudware_actor = chudware_actor
@@ -344,6 +381,7 @@ class MissionDispatch:
         else:
             try:
                 from services.agent.coordination import get_board  # noqa: PLC0415
+
                 self.coordination_board = get_board(run_id) if run_id else None
             except Exception:  # noqa: BLE001
                 self.coordination_board = None
@@ -353,15 +391,20 @@ class MissionDispatch:
         # Identity of the agent currently using this dispatch (for corporate
         # channel posts / spawn authority). Root/director when unset.
         self.corporate_agent_id = corporate_agent_id
+        # Preserve non-mode execution context (parent Chudcode session,
+        # explicit offline provider, settings, workspace and attachments).
+        # mode_options_from_mapping intentionally returns only UI mode fields.
+        self.execution_options = dict(options) if isinstance(options, dict) else {}
         # Copilot mode overhaul: options.mode / corporate_force / plan_only /
         # advisor threaded from host/core so tool + org policy can honor them.
         try:
             from services.agent.copilot_mode_tools import (  # noqa: PLC0415
                 mode_options_from_mapping,
             )
+
             # Merge explicit kwargs into options BEFORE normalize so
             # mode==swarm → corporate_force and mode==plan → plan_only couple.
-            _raw = dict(options) if isinstance(options, dict) else {}
+            _raw = dict(self.execution_options)
             if mode is not None:
                 _raw["mode"] = mode
             if corporate_force is not None:
@@ -378,8 +421,10 @@ class MissionDispatch:
             self.advisor = bool(_opts.get("advisor", True))
         except Exception:  # noqa: BLE001 — never break dispatch construction
             self.options = {}
-            self.mode = (mode or "agent")
-            self.corporate_force = bool(corporate_force) if corporate_force is not None else False
+            self.mode = mode or "agent"
+            self.corporate_force = (
+                bool(corporate_force) if corporate_force is not None else False
+            )
             self.plan_only = bool(plan_only) if plan_only is not None else False
             self.advisor = True if advisor is None else bool(advisor)
         self._handlers: dict[str, Callable[..., Any]] = {
@@ -412,7 +457,6 @@ class MissionDispatch:
             "corporate_activate": self.corporate_activate,
         }
 
-
     # ------------------------------------------------------------------ resolve
     def resolve(self, tool: str) -> Optional[Callable[..., Any]]:
         """Return the bound handler for a mission-scoped *tool*, or None so the
@@ -420,8 +464,12 @@ class MissionDispatch:
         return self._handlers.get(tool)
 
     # ------------------------------------------------------------------ ledger
-    def ledger_get(self, section: str | None = None, budget_tokens: int = 800,
-                   run_id: str | None = None) -> dict:
+    def ledger_get(
+        self,
+        section: str | None = None,
+        budget_tokens: int = 800,
+        run_id: str | None = None,
+    ) -> dict:
         """Return the design ledger for this run, rendered within *budget_tokens*.
 
         section filters to one of brief | requirements | decisions | dimensions |
@@ -447,32 +495,54 @@ class MissionDispatch:
         # mega-2: models ask for section="events" (raw event log).
         if section == "events":
             return {
-                "ok": True, "run_id": led.run_id, "section": "events",
+                "ok": True,
+                "run_id": led.run_id,
+                "section": "events",
                 "data": list(led.events),
                 "event_count": len(led.events),
             }
         if section:
             if section == "manifest":
                 arts = led.state.get("artifacts") or []
-                manifests = [a for a in arts
-                             if (a.get("kind") == "manifest"
-                                 or a.get("id") == "manifest")]
+                manifests = [
+                    a
+                    for a in arts
+                    if (a.get("kind") == "manifest" or a.get("id") == "manifest")
+                ]
                 data = manifests[0] if manifests else None
                 # Prefer embedded payload when intake wrote it.
                 if isinstance(data, dict) and data.get("manifest"):
                     data = data["manifest"]
-                return {"ok": True, "run_id": led.run_id, "section": "manifest",
-                        "data": data}
-            return {"ok": True, "run_id": led.run_id, "section": section,
-                    "data": led.state.get(section)}
+                return {
+                    "ok": True,
+                    "run_id": led.run_id,
+                    "section": "manifest",
+                    "data": data,
+                }
+            return {
+                "ok": True,
+                "run_id": led.run_id,
+                "section": section,
+                "data": led.state.get(section),
+            }
         from services.agent.ledger import ledger_render
-        rendered = ledger_render(led, budget_tokens)
-        return {"ok": True, "run_id": led.run_id, "rendered": rendered,
-                "event_count": len(led.events)}
 
-    def ledger_note(self, kind: str = "note", payload: dict | None = None,
-                    actor: str = "agent", run_id: str | None = None,
-                    **extra: Any) -> dict:
+        rendered = ledger_render(led, budget_tokens)
+        return {
+            "ok": True,
+            "run_id": led.run_id,
+            "rendered": rendered,
+            "event_count": len(led.events),
+        }
+
+    def ledger_note(
+        self,
+        kind: str = "note",
+        payload: dict | None = None,
+        actor: str = "agent",
+        run_id: str | None = None,
+        **extra: Any,
+    ) -> dict:
         """Append a structured event to this run's design ledger.
 
         kind: brief | decision | dimension | question | requirement | stage |
@@ -504,25 +574,44 @@ class MissionDispatch:
         if raw_kind != kind:
             body.setdefault("aliased_kind", raw_kind)
         # Promote common aliases so kind=decision/dimension always has id.
-        if kind in ("decision", "dimension", "question", "artifact",
-                    "feature", "geometry_spec", "linkage", "build_node",
-                    "mfg_plan", "criterion_result"):
+        if kind in (
+            "decision",
+            "dimension",
+            "question",
+            "artifact",
+            "feature",
+            "geometry_spec",
+            "linkage",
+            "build_node",
+            "mfg_plan",
+            "criterion_result",
+        ):
             if not body.get("id"):
-                for alt in ("name", "decision_id", "dim_id", "req_id",
-                            "artifact_id", "feature_id", "spec_id", "node_id",
-                            "plan_id", "deliverable", "criterion_id"):
+                for alt in (
+                    "name",
+                    "decision_id",
+                    "dim_id",
+                    "req_id",
+                    "artifact_id",
+                    "feature_id",
+                    "spec_id",
+                    "node_id",
+                    "plan_id",
+                    "deliverable",
+                    "criterion_id",
+                ):
                     if body.get(alt):
                         body["id"] = str(body[alt])
                         break
             if not body.get("id") and body.get("text"):
                 slug = "".join(
-                    c if c.isalnum() else "_"
-                    for c in str(body["text"])[:48].lower()
+                    c if c.isalnum() else "_" for c in str(body["text"])[:48].lower()
                 ).strip("_")
                 body["id"] = slug or f"{kind}_{len(getattr(led, 'events', []) or [])}"
             if not body.get("id"):
                 body["id"] = (
-                    "main" if kind == "mfg_plan"
+                    "main"
+                    if kind == "mfg_plan"
                     else f"{kind}_{len(getattr(led, 'events', []) or [])}"
                 )
         if kind == "artifact" and raw_kind != kind:
@@ -537,9 +626,12 @@ class MissionDispatch:
                     or body.get("value")
                     or str(body.get("id") or "decision")
                 )
-            body.setdefault("rationale", body.get("evidence") or body.get("driver") or "")
+            body.setdefault(
+                "rationale", body.get("evidence") or body.get("driver") or ""
+            )
         try:
             from services.agent.ledger import validate_ledger_payload
+
             validate_ledger_payload(kind, body)
         except ValueError as exc:
             return {"ok": False, "error": str(exc)}
@@ -554,13 +646,18 @@ class MissionDispatch:
                         workspace_dir,
                     )
                     from services.agent import project_memory as _pm  # noqa: PLC0415
+
                     if memory_enabled() and memory_learn_enabled():
-                        _root = getattr(self, "project_dir", None) or getattr(self, "workspace_dir", None)
-                        _path = _pm.resolve_project_root(_root) or workspace_dir()
-                        _text = (
-                            str(body.get("text") or body.get("summary") or body.get("value") or "")
-                            .strip()
+                        _root = getattr(self, "project_dir", None) or getattr(
+                            self, "workspace_dir", None
                         )
+                        _path = _pm.resolve_project_root(_root) or workspace_dir()
+                        _text = str(
+                            body.get("text")
+                            or body.get("summary")
+                            or body.get("value")
+                            or ""
+                        ).strip()
                         if not _text and body.get("id"):
                             _text = f"{kind}: {body.get('id')}"
                         if _text and _path is not None:
@@ -573,9 +670,14 @@ class MissionDispatch:
                             )
                 except Exception:  # noqa: BLE001
                     pass
-            return {"ok": True, "seq": event["seq"], "run_id": led.run_id,
-                    "kind": kind, "ts": event["ts"],
-                    **({"aliased_from": raw_kind} if raw_kind != kind else {})}
+            return {
+                "ok": True,
+                "seq": event["seq"],
+                "run_id": led.run_id,
+                "kind": kind,
+                "ts": event["ts"],
+                **({"aliased_from": raw_kind} if raw_kind != kind else {}),
+            }
         except Exception as exc:  # noqa: BLE001 — error is data for the model
             return {"ok": False, "error": f"ledger write failed: {exc}"}
 
@@ -594,6 +696,7 @@ class MissionDispatch:
         if self.ledger is None and self.run_id:
             try:
                 from services.agent.ledger import Ledger  # noqa: PLC0415
+
                 self.ledger = Ledger.load(str(self.run_id))
             except Exception:  # noqa: BLE001 — fall back to structured error
                 return None
@@ -626,21 +729,38 @@ class MissionDispatch:
         graph = self.graph
         out: dict[str, Any] = {"ok": True, "run_id": self.run_id}
         if graph:
-            nodes = [{"id": n.get("id"), "type": n.get("type"), "name": n.get("name"),
-                      "role": (n.get("inputs") or {}).get("role")}
-                     for n in graph.get("nodes", [])]
+            nodes = [
+                {
+                    "id": n.get("id"),
+                    "type": n.get("type"),
+                    "name": n.get("name"),
+                    "role": (n.get("inputs") or {}).get("role"),
+                }
+                for n in graph.get("nodes", [])
+            ]
             source = str(self.run_id or "")
-            out["note"] = ("mission plan already compiled; to change it, "
-                           "emit a replan_request in your handoff")
-            out["graph"] = {"id": graph.get("id"), "name": graph.get("name"),
-                            "nodes": nodes, "edges": graph.get("edges", [])}
+            out["note"] = (
+                "mission plan already compiled; to change it, "
+                "emit a replan_request in your handoff"
+            )
+            out["graph"] = {
+                "id": graph.get("id"),
+                "name": graph.get("name"),
+                "nodes": nodes,
+                "edges": graph.get("edges", []),
+            }
             out["graph_json"] = graph
             try:
                 from services.dag import session as _dag_session  # noqa: PLC0415
+
                 _dag_session.remember_graph(graph, source=source)
-                out["next_actions"] = [f"dag_run(run_id={source!r})"] if source else ["dag_run()"]
-                out["hint"] = ("dag_run() with no arguments executes this graph — you do "
-                               "not need to copy graph_json back.")
+                out["next_actions"] = (
+                    [f"dag_run(run_id={source!r})"] if source else ["dag_run()"]
+                )
+                out["hint"] = (
+                    "dag_run() with no arguments executes this graph — you do "
+                    "not need to copy graph_json back."
+                )
             except Exception:  # noqa: BLE001 — plan reporting must not break dispatch
                 out["next_actions"] = ["dag_run(graph_json=<result.graph_json>)"]
             return out
@@ -649,13 +769,17 @@ class MissionDispatch:
         # long-lived hostd serves many sessions, so the session slot is not
         # evidence about this run.  It IS worth reporting that a graph exists and
         # what would execute it, with its provenance attached.
-        out["note"] = ("this mission has no compiled DAG graph bound — mission_start "
-                       "(with an aicad.deliverables/1 manifest) is what compiles one; "
-                       "to change an existing plan, emit a replan_request in your handoff")
-        out["next_actions"] = ["mission_start(request='<the ask>', "
-                               "manifest=<aicad.deliverables/1>)"]
+        out["note"] = (
+            "this mission has no compiled DAG graph bound — mission_start "
+            "(with an aicad.deliverables/1 manifest) is what compiles one; "
+            "to change an existing plan, emit a replan_request in your handoff"
+        )
+        out["next_actions"] = [
+            "mission_start(request='<the ask>', manifest=<aicad.deliverables/1>)"
+        ]
         try:
             from services.dag import session as _dag_session  # noqa: PLC0415
+
             planned = _dag_session.planned_graph()
             if planned:
                 origin = _dag_session.planned_from() or str(planned.get("id") or "")
@@ -664,11 +788,15 @@ class MissionDispatch:
                     "graph_id": planned.get("id"),
                     "graph_name": planned.get("name"),
                     "node_count": len(planned.get("nodes") or []),
-                    "note": ("planned elsewhere in this process (not bound to this "
-                             "mission run) — dag_run() would execute THIS graph"),
+                    "note": (
+                        "planned elsewhere in this process (not bound to this "
+                        "mission run) — dag_run() would execute THIS graph"
+                    ),
                 }
-                out["next_actions"] = [f"dag_run(run_id={origin!r})" if origin else "dag_run()",
-                                       *out["next_actions"]]
+                out["next_actions"] = [
+                    f"dag_run(run_id={origin!r})" if origin else "dag_run()",
+                    *out["next_actions"],
+                ]
         except Exception:  # noqa: BLE001 — plan reporting must not break dispatch
             pass
         if self.ledger is not None:
@@ -676,8 +804,13 @@ class MissionDispatch:
         return out
 
     # ------------------------------------------------------------------ ask_user
-    def ask_user(self, questions: Any = None, question: Any = None,
-                 scope: str = "run", **extra: Any) -> dict:
+    def ask_user(
+        self,
+        questions: Any = None,
+        question: Any = None,
+        scope: str = "run",
+        **extra: Any,
+    ) -> dict:
         """Ask the human a typed question batch (contract §4).
 
         In an autonomous run there is no blocking transport: every question is
@@ -704,9 +837,14 @@ class MissionDispatch:
             return _ask_user_bad_arguments_error()
         try:
             from services.agent import interaction
+
             answers = interaction.ask_user(
-                norm, scope="run", run_id=self.run_id, blocking=False,
-                autonomy=self.autonomy)
+                norm,
+                scope="run",
+                run_id=self.run_id,
+                blocking=False,
+                autonomy=self.autonomy,
+            )
         except Exception as exc:  # noqa: BLE001 — error is data for the model
             return {"ok": False, "error": f"ask_user failed: {exc}"}
         # Mirror the Q&A onto the mission design ledger so the run record (and the
@@ -715,15 +853,22 @@ class MissionDispatch:
             for q in norm:
                 try:
                     self.ledger.add_question(
-                        "agent", q["id"], q.get("prompt", ""), blocking=False)
+                        "agent", q["id"], q.get("prompt", ""), blocking=False
+                    )
                     ans = answers.get(q["id"]) or {}
                     self.ledger.answer_question(
-                        "agent", q["id"], json.dumps(ans.get("value"), default=str))
+                        "agent", q["id"], json.dumps(ans.get("value"), default=str)
+                    )
                 except Exception:  # noqa: BLE001 — mirroring is best-effort
                     pass
-        return {"ok": True, "answers": answers,
-                "note": ("autonomous run: questions recorded for the human; "
-                         "suggested defaults applied (source per answer)")}
+        return {
+            "ok": True,
+            "answers": answers,
+            "note": (
+                "autonomous run: questions recorded for the human; "
+                "suggested defaults applied (source per answer)"
+            ),
+        }
 
     # ------------------------------------------------------------------ delegate
     # Model-facing role aliases → loadable role cards (mega-5: part_fixer invented).
@@ -747,19 +892,22 @@ class MissionDispatch:
     _BRIEF_MAX = 500  # contract §12 — the RECORDED node-row brief, not the child's task
     _BRIEF_EXEC_MAX = 20000  # sanity bound on what the child actually executes
 
-
-
-    def delegate(self, role: str = "", brief: str = "", budget_tokens: int = 0,
-                 kind: str = "worker", parent_id: str | None = None,
-                 docs: list | None = None, **_ignored: Any) -> dict:
+    def delegate(
+        self,
+        role: str = "",
+        brief: str = "",
+        budget_tokens: int = 0,
+        kind: str = "worker",
+        parent_id: str | None = None,
+        docs: list | None = None,
+        **_ignored: Any,
+    ) -> dict:
         """Spawn a sub-agent role with an isolated brief and token budget (§12).
 
-        A mission that reaches this call with no delegation tree but WITH a model
-        provider gets one bound on the spot (same tree run_linear_role_turn binds,
-        recorded as ``delegation_tree_autobound``) so an advertised tool is not a
-        guaranteed failure. With neither tree nor provider nothing could execute,
-        so the call returns a structured refusal naming what to do instead — do
-        the work directly and record the remainder with ledger_note.
+        A mission that reaches this call with no delegation tree gets one bound
+        on the spot.  Online execution needs no Python provider: Chudcode owns
+        provider construction and the persistent child session.  An explicit
+        offline mission may use only the injected offline-safe local provider.
 
         WS4: spawn-depth policy (max_spawn_depth from capability / config) is
         checked before the tree spawn; deeper spawns require decreasing
@@ -777,13 +925,16 @@ class MissionDispatch:
         role_resolved = self._ROLE_ALIASES.get(role_key, role_raw)
         try:
             from services.agent.roles import load_all_roles  # noqa: PLC0415
+
             known_roles = load_all_roles()
         except Exception:  # noqa: BLE001
             known_roles = {}
         if not role_resolved or role_resolved not in known_roles:
             from difflib import get_close_matches  # noqa: PLC0415
+
             suggestions = get_close_matches(
-                role_resolved, sorted(known_roles), n=3, cutoff=0.55)
+                role_resolved, sorted(known_roles), n=3, cutoff=0.55
+            )
             return {
                 "ok": False,
                 "executed": False,
@@ -828,49 +979,57 @@ class MissionDispatch:
         exec_brief = brief_raw[: self._BRIEF_EXEC_MAX]
 
         if self.delegation_tree is None:
-            # ADVERTISED BUT IMPOSSIBLE (15 dead calls in the gym ledgers): every
-            # role card on the orchestrator/manager path lists `delegate` and the
-            # prompt tells the model to use it, so an unbound tree made an
-            # advertised tool fail 100% of the time. run_linear_role_turn already
-            # binds a tree for exactly this reason — do the same here, lazily, so
-            # any mission that reaches delegate() with a provider gets a REAL
-            # spawn. The tree self-limits (budget meter, max_subagent_depth), and
-            # the binding is recorded, never silent.
-            if self.provider is not None:
-                try:
-                    from services.agent.delegation import (  # noqa: PLC0415
-                        DelegationTree as _DelegationTree,
-                    )
-                    self.delegation_tree = _DelegationTree(
-                        run_id=str(getattr(self, "run_id", "") or ""),
-                        ledger=self.ledger,
-                        tier=self.tier,
-                        on_event=self.on_event,
-                    )
-                    self._delegation_tree_autobound = True
-                    if self.ledger is not None:
-                        try:
-                            self.ledger.append("agent", "note", {
+            # Every advertised delegate must have a real, budgeted tree.  Online
+            # Chudcode execution does not require a Python provider, so bind the
+            # tree unconditionally; explicit offline safety is checked later by
+            # chudcode_roles.run_role_turn before the local loop can run.
+            try:
+                from services.agent.delegation import (  # noqa: PLC0415
+                    DelegationTree as _DelegationTree,
+                )
+
+                self.delegation_tree = _DelegationTree(
+                    run_id=str(getattr(self, "run_id", "") or ""),
+                    ledger=self.ledger,
+                    tier=self.tier,
+                    on_event=self.on_event,
+                )
+                self._delegation_tree_autobound = True
+                if self.ledger is not None:
+                    try:
+                        self.ledger.append(
+                            "agent",
+                            "note",
+                            {
                                 "event": "delegation_tree_autobound",
                                 "run_id": str(getattr(self, "run_id", "") or ""),
-                                "why": ("delegate called on a mission with no tree; "
-                                        "a provider is bound so the spawn really runs"),
-                            })
-                        except Exception:  # noqa: BLE001
-                            pass
-                except Exception:  # noqa: BLE001 — degrade to the honest refusal
-                    self.delegation_tree = None
+                                "why": (
+                                    "delegate called on a mission with no tree; "
+                                    "Chudcode will run the approved child"
+                                ),
+                            },
+                        )
+                    except Exception:  # noqa: BLE001
+                        pass
+            except Exception:  # noqa: BLE001 - degrade to the honest refusal
+                self.delegation_tree = None
 
         if self.delegation_tree is None:
-            # No provider ⇒ a spawned node could not execute; saying "spawned"
-            # would be a fabricated success. Refuse, and name the alternative.
+            # Tree construction failed; saying "spawned" would be fabricated.
             if self.ledger is not None:
                 try:
-                    self.ledger.append("agent", "note", {
-                        "event": "delegation_request", "role": role_resolved,
-                        "role_requested": role_raw,
-                        "brief": brief[:500], "budget_tokens": budget_tokens,
-                        "status": "unavailable"})
+                    self.ledger.append(
+                        "agent",
+                        "note",
+                        {
+                            "event": "delegation_request",
+                            "role": role_resolved,
+                            "role_requested": role_raw,
+                            "brief": brief[:500],
+                            "budget_tokens": budget_tokens,
+                            "status": "unavailable",
+                        },
+                    )
                 except Exception:  # noqa: BLE001
                     pass
             return {
@@ -878,12 +1037,12 @@ class MissionDispatch:
                 "reason": "delegation_unavailable",
                 "status": "unavailable",
                 "error": (
-                    "delegate is not available in this run: no delegation tree and "
-                    "no model provider are bound to it, so no sub-agent can execute. "
-                    "Do NOT retry delegate — do the work yourself with the concrete "
-                    f"tools this turn already has (the {role_resolved!r} work you "
-                    "were about to hand off), and record what is left for another "
-                    "run with ledger_note(kind='handoff', ...)."
+                    "delegate is not available in this run: its governed "
+                    "delegation tree could not be created, so no sub-agent can "
+                    "execute. Do NOT retry delegate — do the work yourself with "
+                    "the concrete tools this turn already has, and record what "
+                    f"is left from the {role_resolved!r} assignment with "
+                    "ledger_note(kind='handoff', ...)."
                 ),
                 "role_requested": role_raw,
                 "role_resolved": role_resolved,
@@ -898,11 +1057,15 @@ class MissionDispatch:
             from services.agent.role_models import (  # noqa: PLC0415
                 check_spawn_depth_policy,
             )
+
             parent = None
             try:
                 pid = parent_id or getattr(self.delegation_tree, "root_id", None)
-                parent = (self.delegation_tree._nodes.get(pid)  # noqa: SLF001
-                          if pid is not None else None)
+                parent = (
+                    self.delegation_tree._nodes.get(pid)  # noqa: SLF001
+                    if pid is not None
+                    else None
+                )
             except Exception:  # noqa: BLE001
                 parent = None
             depth = (int(getattr(parent, "depth", 0)) + 1) if parent is not None else 1
@@ -929,10 +1092,16 @@ class MissionDispatch:
 
         try:
             from services.agent.delegation import delegate as _delegate
+
             node = _delegate(
-                role_resolved, brief, budget_tokens,
+                role_resolved,
+                brief,
+                budget_tokens,
                 tree=self.delegation_tree,
-                parent_id=parent_id, kind=kind, docs=docs)
+                parent_id=parent_id,
+                kind=kind,
+                docs=docs,
+            )
         except Exception as exc:  # noqa: BLE001 — error is data for the model
             return {
                 "ok": False,
@@ -945,14 +1114,14 @@ class MissionDispatch:
                 "brief_truncated": brief_truncated,
             }
 
-        if isinstance(node, dict) and getattr(self, "_delegation_tree_autobound", False):
+        if isinstance(node, dict) and getattr(
+            self, "_delegation_tree_autobound", False
+        ):
             # Observable, not silent: this mission had no tree until this call.
             node["delegation_tree_autobound"] = True
 
-
-        # Phase 4 (M11): run the approved sub-agent NOW (synchronous, bounded).
-        # HONESTY: without a bound provider nothing executes — the node is returned
-        # spawned-but-not-run with an explicit note (never a fabricated result).
+        # Approved children run synchronously.  Online Chudcode needs no bound
+        # Python provider; explicit offline safety is enforced by run_role_turn.
         if not isinstance(node, dict) or node.get("status") != "approved":
             if isinstance(node, dict):
                 if role_raw and role_resolved != role_raw:
@@ -962,17 +1131,10 @@ class MissionDispatch:
                     node["brief_truncated"] = True
                     node["brief_len_original"] = len(brief_raw)
             return _actionable_delegate_failure(node)
-        if self.provider is None:
-            node["executed"] = False
-            node["ok"] = False
-            node["reason"] = "subagent_not_run"
-            node["error"] = (
-                "sub-agent spawned (registry session created) but did NOT execute: "
-                "no provider is bound to this mission dispatch. Do the work directly "
-                "with the concrete tools available in this turn."
-            )
-            return _actionable_delegate_failure(node)
         node["executed"] = True
+        # The tree may apply its own grant policy, but it must never enlarge the
+        # caller's requested credit ceiling.
+        node["budget_requested"] = budget_tokens
         if role_raw and role_resolved != role_raw:
             node["role_requested"] = role_raw
             node["role_resolved"] = role_resolved
@@ -1004,6 +1166,7 @@ class MissionDispatch:
             except Exception:  # noqa: BLE001 — terminal write below remains authoritative
                 pass
             from services.mcp.cad_common import doc_scope  # noqa: PLC0415
+
             with doc_scope():
                 outcome = self._run_subagent_turn(node, brief)
             return outcome
@@ -1068,6 +1231,7 @@ class MissionDispatch:
         if child_status in ("terminated", "cancelled"):
             try:
                 from services.agent import subagent_registry as _sreg  # noqa: PLC0415
+
                 _sreg.set_status(
                     node_id,
                     child_status,
@@ -1077,301 +1241,230 @@ class MissionDispatch:
                 pass
 
     def _run_subagent_turn(self, node: dict, brief: str) -> dict:
-        """Run one bounded synchronous sub-agent turn for an approved node.
+        """Run one persistent delegated role turn through Chudcode.
 
-        The turn IS the sub-agent's session: its replies land in the registry
-        transcript, and steering queued from the GUI (``subagent_steer``, a
-        different process) is consumed at each of its model-call boundaries by
-        ``agent_turn.run_turn(subagent_id=...)``.
+        The delegation tree remains Chudware's authority for depth, credits,
+        approvals, lineage and terminal state.  Chudcode owns the online model
+        loop, provider construction, retry and persistent child transcript.
+        Only an explicit ``options.offline`` request reaches the deterministic
+        local loop, through ``chudcode_roles.run_role_turn``'s offline-safe gate.
         """
-        node_id = str(node.get("id", ""))
-        role = str(node.get("role", "subagent"))
+        node_id = str(node.get("id") or "")
+        role = str(node.get("role") or "subagent")
         try:
-            from services.agent import agent_turn as _at
             from services.agent import subagent_registry as _sreg
+            from services.agent.chudcode_roles import run_role_turn
+
             try:
-                _sreg.append_transcript(node_id, "system",
-                                        f"Sub-agent {role!r} started. Brief: {brief}"[:800])
-            except Exception:  # noqa: BLE001
+                _sreg.append_transcript(
+                    node_id,
+                    "system",
+                    f"Sub-agent {role!r} started. Brief: {brief}"[:800],
+                )
+            except Exception:  # noqa: BLE001 - registry mirroring is best-effort
                 pass
-            # Workstream 5 fix: sub-agents no longer run BARE. When the role has
-            # a card (services/agent/roles/<role>.yaml) it gets the card's
-            # system_prompt + tool allowlist, real tool schemas rendered against
-            # THIS dispatch layer, this MissionDispatch as its mission-scoped
-            # resolver, and a budget-derived soft warning threshold. Unknown roles keep
-            # the old bare behavior (no card = no constraints to apply).
+
             card = None
             try:
                 from services.agent.roles import load_role as _load_role  # noqa: PLC0415
+
                 card = _load_role(role)
-            except Exception:  # noqa: BLE001 — unknown role → bare sub-agent
+            except Exception:  # noqa: BLE001 - run_role_turn returns invalid_role
                 card = None
-            system_prompt = None
-            if card is not None:
-                # WI-16: append per-capability SOFT phrasing at assembly time.
-                try:
-                    from services.agent.prompt_tiers import (  # noqa: PLC0415
-                        assemble_system_for_capability,
-                        letter_from_capability,
-                    )
-                    from services.agent.capability import resolve_capability  # noqa: PLC0415
-                    _tier = ""
-                    try:
-                        from services.agent.tiers import detect_tier_from_env  # noqa: PLC0415
-                        _tier = detect_tier_from_env() or ""
-                    except Exception:  # noqa: BLE001
-                        _tier = ""
-                    _cap = resolve_capability(_tier) if _tier else None
-                    system_prompt = assemble_system_for_capability(
-                        card.system_prompt, letter_from_capability(_cap))
-                except Exception:  # noqa: BLE001
-                    system_prompt = card.system_prompt
-            allowed = card.concrete_tools if card is not None else None
-            if allowed is not None:
-                # T-file-floor: every DAG-node/subagent gets file-handling by
-                # default even when the role card narrows the list.
-                try:
-                    from services.agent.copilot_mode_tools import (  # noqa: PLC0415
-                        SUBAGENT_DEFAULT_TOOLS,
-                    )
-                    allowed = sorted(set(allowed) | SUBAGENT_DEFAULT_TOOLS)
-                except Exception:  # noqa: BLE001 — floor union is best-effort
-                    pass
-                # Settings → AI → Tools "Send bug reports": nodes may file too.
-                try:
-                    from services.agent.config import bugreport_floor  # noqa: PLC0415
-                    allowed = sorted(set(allowed) | bugreport_floor())
-                except Exception:  # noqa: BLE001 — floor union is best-effort
-                    pass
-            # Always expose coordination board tools to sub-agents so they can
-            # claim/release resources and post progress without clobbering peers.
-            _COORD_TOOLS = (
-                "coordinate_claim", "coordinate_release",
-                "coordinate_progress", "coordinate_board",
-            )
-            if allowed is None:
-                allowed = list(_COORD_TOOLS)
-            else:
-                allowed = list(allowed)
-                for t in _COORD_TOOLS:
-                    if t not in allowed:
-                        allowed.append(t)
-            # Corporate org tools + preamble when this run has an active chart.
+
+            # Finalize one effective tool scope before Chudcode renders schemas
+            # and registers host dispatch.  None is never used here: delegated
+            # children are deliberately restricted to their role + shared floor.
+            allowed = list(getattr(card, "concrete_tools", None) or [])
+            try:
+                from services.agent.copilot_mode_tools import (  # noqa: PLC0415
+                    SUBAGENT_DEFAULT_TOOLS,
+                )
+
+                allowed = sorted(set(allowed) | set(SUBAGENT_DEFAULT_TOOLS))
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                from services.agent.config import bugreport_floor  # noqa: PLC0415
+
+                allowed = sorted(set(allowed) | set(bugreport_floor()))
+            except Exception:  # noqa: BLE001
+                pass
+            for tool in (
+                "coordinate_claim",
+                "coordinate_release",
+                "coordinate_progress",
+                "coordinate_board",
+            ):
+                if tool not in allowed:
+                    allowed.append(tool)
+
+            # Corporate seats retain their scoped channel/meeting tools and
+            # identity.  The mission-scoped dispatcher remains the governance
+            # authority when Chudcode calls those host tools.
             org = getattr(self, "org_chart", None)
-            corp_agent = (
+            corporate_agent = (
                 str(node.get("corporate_agent_id") or "")
-                or str(node.get("id") or "")
+                or node_id
                 or str(getattr(self, "corporate_agent_id", None) or "")
             )
             if org is not None and getattr(org, "active", False):
                 try:
-                    # Prefer an already-seated corporate id on the node.
-                    seat = None
-                    if corp_agent:
-                        seat = org.seat_for(corp_agent)
+                    seat = org.seat_for(corporate_agent) if corporate_agent else None
                     if seat is None:
-                        # Map role → first matching seat (head/worker)
-                        for s in org.seats.values():
-                            if s.role == role and s.rank != "director":
-                                seat = s
-                                corp_agent = s.agent_id
+                        for candidate in org.seats.values():
+                            if candidate.role == role and candidate.rank != "director":
+                                seat = candidate
+                                corporate_agent = candidate.agent_id
                                 break
                     if seat is not None:
-                        for t in org.tools_for(seat.agent_id):
-                            if t not in allowed:
-                                allowed.append(t)
-                        corp_pre = org.preamble_for(seat.agent_id)
-                        if corp_pre:
-                            if system_prompt:
-                                system_prompt = (
-                                    system_prompt.rstrip() + "\n\n" + corp_pre
-                                )
-                            else:
-                                system_prompt = corp_pre
-                        # Stash so corporate_* tools know who is calling.
+                        for tool in org.tools_for(seat.agent_id):
+                            if tool not in allowed:
+                                allowed.append(tool)
                         self.corporate_agent_id = seat.agent_id
-                        if isinstance(node, dict):
-                            node["corporate_agent_id"] = seat.agent_id
-                            node["corporate_rank"] = seat.rank
-                            node["corporate_dept"] = seat.dept_id
-                except Exception:  # noqa: BLE001
-                    pass
-            # Inject a live board snapshot into the system preamble so the child
-            # sees existing claims before it starts editing.
-            board = getattr(self, "coordination_board", None)
-            if board is not None:
-                try:
-                    preamble = board.preamble_text()
-                    if preamble:
-                        if system_prompt:
-                            system_prompt = system_prompt.rstrip() + "\n\n" + preamble
-                        else:
-                            system_prompt = preamble
-                except Exception:  # noqa: BLE001
+                        node["corporate_agent_id"] = seat.agent_id
+                        node["corporate_rank"] = seat.rank
+                        node["corporate_dept"] = seat.dept_id
+                except Exception:  # noqa: BLE001 - inactive org must not block work
                     pass
 
-            # mega-6: if a geometry role card somehow lost mutators, re-seed them
-            # so the first mutating call is always enableable.
-            if allowed is not None:
-                _need = ("new_part", "add_features")
-                if role in (
-                    "feature_modeler", "geometry_designer", "sketcher",
-                    "assembly_fit_engineer",
-                ) or any(t in allowed for t in _need):
-                    for t in _need:
-                        if t not in allowed:
-                            allowed = list(allowed) + [t]
-            tools_text = None
+            if role in (
+                "feature_modeler",
+                "geometry_designer",
+                "sketcher",
+                "assembly_fit_engineer",
+            ) or any(tool in allowed for tool in ("new_part", "add_features")):
+                for tool in ("new_part", "add_features"):
+                    if tool not in allowed:
+                        allowed.append(tool)
+            try:
+                from services.agent.copilot_mode_tools import (  # noqa: PLC0415
+                    apply_meta_tool_floor,
+                    apply_mode_tools,
+                )
+
+                mode_allowed = apply_mode_tools(
+                    getattr(self, "mode", None),
+                    allowed,
+                    plan_only=bool(getattr(self, "plan_only", False)),
+                    subagent=True,
+                )
+                if mode_allowed is not None:
+                    allowed = list(mode_allowed)
+                    try:
+                        from services.agent.config import bugreport_floor  # noqa: PLC0415
+
+                        allowed = sorted(set(allowed) | set(bugreport_floor()))
+                    except Exception:  # noqa: BLE001
+                        pass
+                floored = apply_meta_tool_floor(
+                    allowed, advisor=bool(getattr(self, "advisor", True))
+                )
+                if floored is not None:
+                    allowed = list(floored)
+            except Exception:  # noqa: BLE001
+                pass
+            allowed = list(dict.fromkeys(allowed))
+
             granted = 0
             try:
-                granted = int((node.get("budget") or {}).get("tokens_granted", 0))
+                granted = int((node.get("budget") or {}).get("tokens_granted") or 0)
             except (TypeError, ValueError):
                 granted = 0
-            derived = (granted // 2000) if granted > 0 else 10
-            max_calls = max(4, min(12, derived))
-            # WI-4 capability phase caps tune the derived soft threshold.
-            _cap = self.capability
-            if _cap is None and self.tier:
-                try:
-                    from services.agent.scaffolds import coerce_profile  # noqa: PLC0415
-                    _cap = coerce_profile(tier=self.tier)
-                except Exception:  # noqa: BLE001
-                    _cap = None
-            _phase = self.phase or str(node.get("phase") or node.get("stage") or "") or None
-            # Producer roles need room for their whole mandated chain. Use the
-            # shared role/tool/phase-aware helper so this delegate path and the
-            # compiled-DAG path cannot drift on role-specific floors.
-            from services.agent import tool_budget as _tb  # noqa: PLC0415
-            _is_build = _tb.is_producer_role(role, allowed, _phase)
-            max_calls = _tb.floor_for(
-                role, allowed, _phase, base=max_calls)
-            if _cap is not None:
-                try:
-                    from services.agent import scaffolds as _sc  # noqa: PLC0415
-                    max_calls, _ = _sc.apply_phase_cap(
-                        _cap, _phase, max_calls,
-                        ledger=self.ledger, actor=role,
-                    )
-                    if max_calls is None:
-                        max_calls = max(4, min(12, derived))
-                    # Re-assert the shared role-specific floor after phase caps.
-                    if _is_build:
-                        max_calls = _tb.floor_for(
-                            role, allowed, _phase, base=max_calls)
-                except Exception:  # noqa: BLE001
-                    pass
-            # Settings override is intentionally last: max_calls is now a SOFT
-            # convergence warning, so a user's explicit threshold must not be
-            # silently raised by producer floors or token-grant derivation.
-            # Shared helper — node_runner (the compiled-DAG lane) applies the
-            # SAME one, because this slider being read here and nowhere else is
-            # what made it govern only half the dispatch surface.
-            max_calls = configured_subagent_tool_budget(max_calls)
-            # WS2/WS4 + mega-5: always attempt per-spawn model assignment with
-            # depth-aware min_rank. resolve_for_node returns None when ai_roles
-            # is unset (legacy path) — fall through to resolve_role_model so
-            # mega/gym missions still emit assignment audit rows and respect
-            # decreasing difficulty on deeper spawns.
-            provider = self.provider
             try:
+                requested_grant = int(node.get("budget_requested") or 0)
+            except (TypeError, ValueError):
+                requested_grant = 0
+            if requested_grant > 0 and (granted <= 0 or requested_grant < granted):
+                granted = requested_grant
+            derived_calls = max(4, min(12, granted // 2000 if granted > 0 else 10))
+            phase = (
+                self.phase or str(node.get("phase") or node.get("stage") or "") or None
+            )
+            try:
+                from services.agent import tool_budget as _tb  # noqa: PLC0415
+
+                derived_calls = _tb.floor_for(role, allowed, phase, base=derived_calls)
+            except Exception:  # noqa: BLE001
+                pass
+            max_calls = configured_subagent_tool_budget(derived_calls)
+
+            options = dict(getattr(self, "execution_options", None) or {})
+            options.update(dict(getattr(self, "options", None) or {}))
+            settings_value = options.get("settings")
+            settings = dict(settings_value) if isinstance(settings_value, dict) else {}
+            depth = 0
+            try:
+                depth = int(node.get("depth") or 0)
+            except (TypeError, ValueError):
+                depth = 0
+            policy = getattr(self, "_last_spawn_policy", None) or {}
+            min_rank = policy.get("min_rank")
+            try:
+                min_rank_i = int(min_rank) if min_rank is not None else None
+            except (TypeError, ValueError):
+                min_rank_i = None
+            risk = "low" if str(node.get("kind") or "") == "ponder" else None
+
+            # CAD still chooses the governed provider/model/effort assignment,
+            # but online code passes identifiers to Chudcode rather than
+            # constructing a Python provider.
+            assignment = None
+            cfg: dict[str, Any] = {}
+            harness_role = "task"
+            try:
+                from services.agent import config as agent_config  # noqa: PLC0415
                 from services.agent.role_models import (  # noqa: PLC0415
+                    clamp_subagent_effort,
                     cost_tier_for,
+                    harness_role_for_mission_role,
                     resolve_for_node,
                     resolve_role_model,
+                    resolve_role_thinking,
+                    role_for_copilot_mode,
                 )
-                from services.agent import config as agent_config  # noqa: PLC0415
-                from services.agent import agent_events as _ae  # noqa: PLC0415
-                depth = 0
-                try:
-                    depth = int((node.get("depth") if isinstance(node, dict)
-                                 else getattr(node, "depth", 0)) or 0)
-                except (TypeError, ValueError):
-                    depth = 0
-                policy = getattr(self, "_last_spawn_policy", None) or {}
-                risk = "low" if str(node.get("kind") or "") == "ponder" else None
-                ctx = {
+
+                mode = getattr(self, "mode", None) or options.get("mode") or "agent"
+                harness_role = (
+                    role_for_copilot_mode(mode)
+                    if mode in ("plan", "edit")
+                    else harness_role_for_mission_role(role)
+                )
+                cfg = dict(agent_config.load_config() or {})
+                context = {
                     "task_class": self.task_class,
                     "depth": depth,
                     "risk": risk,
-                    "node_inputs": {"task_class": self.task_class, "depth": depth},
+                    "node_inputs": {
+                        "task_class": self.task_class,
+                        "depth": depth,
+                    },
                 }
-                # Harness role for model resolve:
-                #  - leaf workers stay on "task" (cheap) under services/agent/swarm
-                #  - plan mode → planning; edit → task
-                #  - node role overrides for orchestrator/advisor seats
-                # Top-level turns use role_for_copilot_mode at the entry path;
-                # do NOT upgrade every subagent to "default" in agent mode.
-                harness_role = "task"
-                try:
-                    from services.agent.role_models import (  # noqa: PLC0415
-                        harness_role_for_mission_role,
-                        role_for_copilot_mode,
-                    )
-                    _m = (
-                        getattr(self, "mode", None)
-                        or (self.options or {}).get("mode")
-                        or "agent"
-                    )
-                    if _m in ("plan", "edit"):
-                        harness_role = role_for_copilot_mode(_m)
-                    else:
-                        harness_role = harness_role_for_mission_role(role)
-                except Exception:  # noqa: BLE001
-                    pass
-                cfg = dict(agent_config.load_config() or {})
-                min_rank = policy.get("min_rank")
-                try:
-                    min_rank_i = int(min_rank) if min_rank is not None else None
-                except (TypeError, ValueError):
-                    min_rank_i = None
-                assignment = resolve_for_node(harness_role, ctx, cfg=cfg)
+                assignment = resolve_for_node(harness_role, context, cfg=cfg)
                 if assignment is None or min_rank_i is not None:
-                    # Prefer depth-aware resolve; also covers missing ai_roles.
-                    try:
-                        assignment = resolve_role_model(
-                            harness_role,
-                            cfg,
-                            task_class=self.task_class,
-                            node_depth=depth,
-                            risk=risk,
-                            min_rank=min_rank_i,
-                        )
-                    except Exception:  # noqa: BLE001
-                        if assignment is None:
-                            raise
+                    depth_assignment = resolve_role_model(
+                        harness_role,
+                        cfg,
+                        task_class=self.task_class,
+                        node_depth=depth,
+                        risk=risk,
+                        min_rank=min_rank_i,
+                    )
+                    if depth_assignment is not None:
+                        assignment = depth_assignment
                 if assignment is not None:
-                    cfg_pick = dict(cfg)
-                    cfg_pick["model"] = assignment.model
                     rank = int(assignment.rank or (min_rank_i or 3))
-                    # Per-role thinking: concrete level wins; Auto → dispatch
-                    # complexity heuristics (rank/task_class). Dispatcher may
-                    # also pass an explicit effort on the node.
-                    dispatch_effort = None
-                    if isinstance(node, dict):
-                        dispatch_effort = (
-                            node.get("thinking")
-                            or node.get("reasoning_effort")
-                            or node.get("effort")
-                            or (node.get("role_model") or {}).get("reasoning_effort")
-                        )
-                    else:
-                        dispatch_effort = (
-                            getattr(node, "effort", None)
-                            or getattr(node, "thinking", None)
-                            or getattr(node, "reasoning_effort", None)
-                        )
+                    dispatch_effort = (
+                        node.get("thinking")
+                        or node.get("reasoning_effort")
+                        or node.get("effort")
+                        or (node.get("role_model") or {}).get("reasoning_effort")
+                    )
                     try:
-                        from services.agent.role_models import (  # noqa: PLC0415
-                            resolve_role_thinking,
-                        )
                         resolved_effort = resolve_role_thinking(
                             harness_role,
                             cfg,
-                            request=str(
-                                (node.get("brief") if isinstance(node, dict) else None)
-                                or (node.get("request") if isinstance(node, dict) else None)
-                                or ""
-                            ),
+                            request=brief,
                             task_class=self.task_class,
                             node_depth=depth,
                             risk=risk,
@@ -1381,377 +1474,293 @@ class MissionDispatch:
                             ),
                             rank=rank,
                         )
-                        if resolved_effort:
-                            cfg_pick["reasoning_effort"] = resolved_effort
-                    except Exception:  # noqa: BLE001 — keep rank heuristic
-                        if rank <= 2:
-                            cfg_pick["reasoning_effort"] = "low"
-                        elif rank <= 3:
-                            cfg_pick["reasoning_effort"] = "medium"
-                    # Ceiling: a sub-agent NEVER runs above "high". cfg_pick is
-                    # a copy of the user's global config, so a Settings-level
-                    # max/xhigh rode straight into the child whenever the
-                    # resolver above returned None or raised past the rank arms.
+                    except Exception:  # noqa: BLE001 - assignment itself remains valid
+                        resolved_effort = (
+                            "low" if rank <= 2 else "medium" if rank <= 3 else None
+                        )
+                    if resolved_effort:
+                        settings["reasoning_effort"] = clamp_subagent_effort(
+                            resolved_effort
+                        )
+                    if not assignment.is_session_default:
+                        if assignment.provider:
+                            settings["provider"] = assignment.provider
+                        if assignment.model:
+                            settings["model"] = assignment.model
+                    node["role_model"] = {
+                        **assignment.to_dict(),
+                        "min_rank": min_rank_i,
+                        "cost_tier": cost_tier_for(
+                            assignment.provider, assignment.model
+                        ),
+                        "reasoning_effort": settings.get("reasoning_effort"),
+                    }
+            except Exception:  # noqa: BLE001 - assignment fallback stays in Chudcode
+                assignment = None
+
+            if assignment is not None:
+                try:
+                    from services.agent import agent_events as _ae  # noqa: PLC0415
+                    from services.agent.role_models import cost_tier_for  # noqa: PLC0415
+
+                    emit_min = min_rank_i if min_rank_i is not None else assignment.rank
+                    event_kind, event_payload = _ae.model_assignment_event(
+                        node_id or role,
+                        depth=depth,
+                        task_class=self.task_class,
+                        min_rank=(int(emit_min) if emit_min is not None else None),
+                        picked_model=assignment.model,
+                        picked_provider=assignment.provider,
+                        cost_tier=cost_tier_for(assignment.provider, assignment.model),
+                        mode=assignment.mode,
+                        rank=assignment.rank,
+                        reason=assignment.reason,
+                        subagent_id=node_id or None,
+                        role=role,
+                        span_id=node_id or None,
+                        parent_id=node.get("parent"),
+                        actor=role,
+                    )
+                    _ae.emit_event(
+                        event_kind,
+                        event_payload,
+                        live=self.on_event,
+                        journal=None,
+                    )
+                    turn_ledger = self._ledger()
+                    if turn_ledger is not None:
+                        turn_ledger.append(
+                            "agent",
+                            "note",
+                            {
+                                "event": "model_assignment",
+                                **{
+                                    key: event_payload.get(key)
+                                    for key in (
+                                        "depth",
+                                        "task_class",
+                                        "min_rank",
+                                        "picked_model",
+                                        "picked_provider",
+                                        "cost_tier",
+                                        "mode",
+                                        "rank",
+                                        "reason",
+                                        "role",
+                                        "subagent_id",
+                                    )
+                                },
+                            },
+                        )
+                except Exception:  # noqa: BLE001 - telemetry never blocks dispatch
+                    pass
+            if not settings.get("reasoning_effort"):
+                raw_effort = cfg.get("reasoning_effort") or cfg.get("thinking")
+                if raw_effort:
                     try:
                         from services.agent.role_models import (  # noqa: PLC0415
                             clamp_subagent_effort,
                         )
-                        _raw_eff = cfg_pick.get("reasoning_effort")
-                        if _raw_eff:
-                            cfg_pick["reasoning_effort"] = clamp_subagent_effort(_raw_eff)
-                    except Exception:  # noqa: BLE001 — ceiling is best-effort
-                        pass
-                    if assignment.provider == "ollama":
-                        ocfg = dict(cfg_pick.get("ollama") or {})
-                        ocfg.setdefault(
-                            "base_url", "http://127.0.0.1:11434/v1")
-                        cfg_pick["ollama"] = ocfg
-                        oai = dict(cfg_pick.get("openai") or {})
-                        oai["base_url"] = ocfg.get("base_url") or (
-                            "http://127.0.0.1:11434/v1")
-                        oai.setdefault("api_key", "ollama")
-                        cfg_pick["openai"] = oai
-                    try:
-                        if assignment.is_session_default:
-                            # Role follows the chat composer: keep the mission's own
-                            # provider. There is nothing to build — provider/model are
-                            # empty by construction for this mode.
-                            provider = self.provider
-                        else:
-                            prov_name = assignment.provider
-                            if prov_name == "ollama":
-                                prov_name = "openai"
-                                cfg_pick.setdefault("api_key", "ollama")
-                            provider = agent_config.get_provider(
-                                name=prov_name, cfg=cfg_pick,
-                                **({"actor": self.chudware_actor}
-                                   if self.chudware_actor is not None else {}))
-                    except Exception:  # noqa: BLE001 — keep mission provider
-                        provider = self.provider
-                    if isinstance(node, dict):
-                        node["role_model"] = {
-                            **assignment.to_dict(),
-                            "min_rank": min_rank_i,
-                            "cost_tier": cost_tier_for(
-                                assignment.provider, assignment.model),
-                            "reasoning_effort": cfg_pick.get(
-                                "reasoning_effort"),
-                        }
-                    # Emit assignment audit even when provider rebuild falls back.
-                    try:
-                        emit_min = min_rank_i if min_rank_i is not None else assignment.rank
-                        _k, _p = _ae.model_assignment_event(
-                            node_id or role,
-                            depth=depth,
-                            task_class=self.task_class,
-                            min_rank=int(emit_min) if emit_min is not None else None,
-                            picked_model=assignment.model,
-                            picked_provider=assignment.provider,
-                            cost_tier=cost_tier_for(
-                                assignment.provider, assignment.model),
-                            mode=assignment.mode,
-                            rank=assignment.rank,
-                            reason=assignment.reason,
-                            subagent_id=node_id or None,
-                            role=role,
-                            span_id=node_id or None,
-                            parent_id=(node.get("parent")
-                                       if isinstance(node, dict) else None),
-                            actor=role,
-                        )
-                        _ae.emit_event(
-                            _k, _p, live=self.on_event, journal=None)
-                        if self.ledger is not None:
-                            try:
-                                self.ledger.append("agent", "note", {
-                                    "event": "model_assignment",
-                                    **{k: _p.get(k) for k in (
-                                        "depth", "task_class", "min_rank",
-                                        "picked_model", "picked_provider",
-                                        "cost_tier", "mode", "rank", "reason",
-                                        "role", "subagent_id",
-                                    )},
-                                })
-                            except Exception:  # noqa: BLE001
-                                pass
-                    except Exception:  # noqa: BLE001 — never block on telemetry
-                        pass
-            except Exception:  # noqa: BLE001 — never block subagent on role_models
-                provider = self.provider
-            # Clamp the FINAL provider, not only cfg_pick. Session-default roles
-            # and every provider-construction fallback reuse the ambient parent
-            # object, whose already-bound effort may exceed the child ceiling.
-            # The helper rebinds a shallow copy, leaving self.provider untouched.
-            try:
-                from services.agent.role_models import (  # noqa: PLC0415
-                    clamp_provider_effort,
-                )
-                provider = clamp_provider_effort(provider)
-            except Exception:  # noqa: BLE001 — helper itself is fail-safe
-                pass
-            # Mode → tools: intersect role allowlist with copilot mode policy.
-            # apply_mode_tools unions SHARED_DEFAULT_TOOLS (advise, ask_user,
-            # doc lifecycle, enable_tools / list_tool_categories, …).
-            try:
-                from services.agent.copilot_mode_tools import (  # noqa: PLC0415
-                    apply_mode_tools,
-                )
-                mode_allowed = apply_mode_tools(
-                    getattr(self, "mode", None),
-                    allowed,
-                    plan_only=bool(getattr(self, "plan_only", False)),
-                    subagent=True,
-                )
-                if mode_allowed is not None:
-                    allowed = list(mode_allowed)
-                    # Settings → AI → Tools "Send bug reports": keep the tool
-                    # through mode narrowing (a report never mutates the doc).
-                    try:
-                        from services.agent.config import bugreport_floor  # noqa: PLC0415
-                        allowed = sorted(set(allowed) | bugreport_floor())
-                    except Exception:  # noqa: BLE001 — floor union is best-effort
-                        pass
-            except Exception:  # noqa: BLE001 — mode gate is best-effort
-                pass
-            # Restricted allowlists (mode or role card): ensure the category
-            # escape hatches are VISIBLE, not merely callable. Shared helper —
-            # node_runner (the compiled-DAG lane) calls the same one, because
-            # this floor existing only here is what confined graph nodes to
-            # their 14 card tools.
-            try:
-                from services.agent.copilot_mode_tools import (  # noqa: PLC0415
-                    apply_meta_tool_floor,
-                )
-                _floored = apply_meta_tool_floor(
-                    allowed, advisor=bool(getattr(self, "advisor", True)))
-                if _floored is not None:
-                    allowed = _floored
-            except Exception:  # noqa: BLE001
-                pass
-            # Render once more after every policy/meta floor has settled. The
-            # prior ordering made enable_tools/list_tool_categories/advise
-            # callable but invisible in the model's [TOOLS] block.
-            if allowed:
-                try:
-                    from services.agent.tool_schemas import render_tools_block  # noqa: PLC0415
-                    tools_text, _meta = render_tools_block(
-                        allowed, resolver=_at.resolver_for(self), tier=self.tier)
-                except Exception:  # noqa: BLE001 — schema render is best-effort
-                    pass
-            # Set only when a transient provider fault cost this spawn its one
-            # retry. Reported on EVERY exit path, success included — a parent
-            # that cannot see the first attempt failed cannot judge the run.
-            provider_retry: dict | None = None
-            # Mark the node this turn IS, so a nested delegate() from inside it
-            # attaches to this node instead of the tree root. Saved/restored so
-            # sibling and deeper spawns nest correctly.
-            _prev_node = getattr(self, "_current_node_id", None)
-            self._current_node_id = node_id or _prev_node
-            try:
-                from types import SimpleNamespace as _SimpleNamespace  # noqa: PLC0415
-                from services.mcp import org_tools as _org_tools  # noqa: PLC0415
 
-                _turn_ledger = self._ledger()
-                _org_tools.bind_mission_context(_SimpleNamespace(
-                    provider=provider,
-                    ledger=_turn_ledger,
-                    dissents_registry=getattr(self, "dissents_registry", None),
-                    stage=_phase,
-                    tier=self.tier,
-                    providers=getattr(self, "providers", None),
-                    org_state=getattr(self, "org_state", None),
-                ))
-                try:
-                    def _attempt() -> Any:
-                        return _at.run_turn(
-                            brief, provider, name=role, actor=role,
-                            credit_actor=self.chudware_actor,
-                            system_prompt=system_prompt,
-                            allowed_tools=allowed,
-                            tools_text=tools_text,
-                            mission_dispatch=self,
-                            ledger=_turn_ledger, max_tool_calls=max_calls,
-                            # The delegate path missed the 2026-07-28 parent-lane fix:
-                            # falling through to agent_turn's 2048 default truncated
-                            # feature_modeler twice before its first tool call.
-                            max_tokens=LINEAR_ROLE_MAX_OUTPUT_TOKENS,
-                            max_total_tokens=granted or None,
-                            on_event=self.on_event, run_id=self.run_id,
-                            node_id=node_id, subagent_id=node_id,
-                            capability=_cap, tier=self.tier, phase=_phase,
-                            task_class=self.task_class)
+                        settings["reasoning_effort"] = clamp_subagent_effort(raw_effort)
+                    except Exception:  # noqa: BLE001
+                        pass
 
-                    result = _attempt()
-                    # Transient provider faults get the SAME bounded one-shot
-                    # recovery the compiled-DAG lane has always had
-                    # (node_runner._map_verdict upgrades ESCALATE → RETRY on this
-                    # flag, within DEFAULT_RETRY_BUDGET=1). Without it a 429, a
-                    # 5xx, a truncated reply or a mid-stream disconnect ended a
-                    # `delegate` as a FLAT TERMINAL FAILURE while the
-                    # architecturally identical graph node silently recovered.
-                    for _attempt_i in range(1, SUBAGENT_RETRYABLE_ATTEMPTS):
-                        if not retryable_child_failure(result):
-                            break
-                        provider_retry = {
-                            "attempts": _attempt_i + 1,
-                            "first_stop_reason": str(result.stop_reason or ""),
-                            "first_error": str(
-                                (result.result or {}).get("error")
-                                or (result.result or {}).get("error_detail")
-                                or ""
-                            )[:400],
-                        }
-                        logger.warning(
-                            "Retrying delegation node %s (role %s) once: first "
-                            "attempt failed with a retryable provider fault "
-                            "stop_reason=%s",
-                            node_id, role, provider_retry["first_stop_reason"],
-                        )
-                        if _turn_ledger is not None:
-                            try:
-                                _turn_ledger.append("agent", "note", {
-                                    "event": "subagent_retryable_retry",
-                                    "subagent_id": node_id,
-                                    "role": role,
-                                    **provider_retry,
-                                })
-                            except Exception:  # noqa: BLE001 — audit is best-effort
-                                pass
-                        try:
-                            _sreg.append_transcript(
-                                node_id, "system",
-                                "Transient provider fault "
-                                f"({provider_retry['first_stop_reason']}); "
-                                "retrying this sub-agent turn once.")
-                        except Exception:  # noqa: BLE001
-                            pass
-                        result = _attempt()
-                finally:
-                    _org_tools.bind_mission_context(None)
-            finally:
-                self._current_node_id = _prev_node
-            # mega-6: prefer real provider usage tokens over the tool-count estimate.
-            # Join must never surface handoff=null when the child produced calls or
-            # a partial finish (mega-5: executed=true, spent=0, handoff=null).
-            res_dict = result.result if isinstance(result.result, dict) else {}
-            n_tool = 0
-            try:
-                n_tool = int(res_dict.get("tool_calls")
-                             or len(res_dict.get("calls") or [])
-                             or 0)
-            except (TypeError, ValueError):
-                n_tool = 0
-            usage = res_dict.get("usage") if isinstance(res_dict.get("usage"), dict) else {}
-            real_tokens = 0
-            try:
-                real_tokens = int(
-                    res_dict.get("tokens_used")
-                    or usage.get("total_tokens")
-                    or 0
+            options.update(
+                {
+                    "mission_dispatch": self,
+                    "ledger": self._ledger(),
+                    "autonomy": self.autonomy,
+                    "doc_id": self.doc_id,
+                    "node_id": node_id,
+                    "subagent_id": node_id,
+                    "phase": phase,
+                    "task_class": self.task_class,
+                    "mode": getattr(self, "mode", None),
+                    "plan_only": bool(getattr(self, "plan_only", False)),
+                    "advisor": bool(getattr(self, "advisor", True)),
+                    "allowed_tools": allowed,
+                    "max_tool_calls": max_calls,
+                    "settings": settings,
+                }
+            )
+            if options.get("offline") is True:
+                options["offline_provider"] = (
+                    options.get("offline_provider") or self.provider
                 )
-            except (TypeError, ValueError):
-                real_tokens = 0
-            tokens_used_estimate = real_tokens <= 0
-            if real_tokens > 0:
-                tokens = real_tokens
-            elif n_tool > 0 or result.success:
-                # ~1k turn overhead + ~200/call — floor, never fabricated usage.
-                tokens = 1000 + 200 * max(n_tool, 1 if result.success else 0)
             else:
-                tokens = 0
+                # A caller-supplied provider belongs only to the explicit local
+                # fallback.  Never leak it into the online Chudcode service.
+                options.pop("offline_provider", None)
 
-            handoff = res_dict.get("handoff")
-            if not isinstance(handoff, dict) or not handoff:
-                # Synthesise join handoff from calls so parent is not blind.
-                calls = res_dict.get("calls") if isinstance(res_dict.get("calls"), list) else []
-                if calls or result.success:
+            parent_session = str(
+                options.get("session_id")
+                or options.get("chudcode_session_id")
+                or self.run_id
+                or f"mission-{node_id}"
+            )
+            previous_node = getattr(self, "_current_node_id", None)
+            self._current_node_id = node_id or previous_node
+            try:
+                turn = run_role_turn(
+                    brief,
+                    role,
+                    session_id=parent_session,
+                    run_id=self.run_id or None,
+                    parent_id=node_id or previous_node or parent_session,
+                    on_event=self.on_event,
+                    options=options,
+                    tier=self.tier,
+                    capability=self.capability,
+                    max_tokens=LINEAR_ROLE_MAX_OUTPUT_TOKENS,
+                    max_total_tokens=granted or None,
+                    actor=self.chudware_actor,
+                    close_session=False,
+                )
+            finally:
+                self._current_node_id = previous_node
+
+            if not isinstance(turn, dict):
+                turn = {
+                    "success": False,
+                    "stop_reason": "provider_error",
+                    "result": {
+                        "error": "Chudcode delegated role returned a non-object result"
+                    },
+                    "tokens_used": 0,
+                    "provider_usage_recorded": False,
+                }
+            success = turn.get("success") is True
+            stop_reason = str(turn.get("stop_reason") or "")
+            cancelled = bool(turn.get("cancelled")) or stop_reason in (
+                "cancelled",
+                "terminated_by_user",
+            )
+            payload = turn.get("result")
+            payload_dict = payload if isinstance(payload, dict) else {}
+            handoff = (
+                payload_dict.get("handoff")
+                if isinstance(payload_dict.get("handoff"), dict)
+                else None
+            )
+            if handoff is None and isinstance(payload, str) and payload.strip():
+                handoff = {
+                    "status": "done" if success else "blocked",
+                    "summary": payload.strip()[:600],
+                    "outputs": {
+                        "session_id": turn.get("session_id"),
+                        "stop_reason": stop_reason,
+                    },
+                }
+            if handoff is None and payload_dict:
+                calls = (
+                    payload_dict.get("calls")
+                    if isinstance(payload_dict.get("calls"), list)
+                    else []
+                )
+                if calls or success:
                     handoff = {
-                        "status": "done" if result.success else "blocked",
+                        "status": "done" if success else "blocked",
                         "summary": (
-                            f"subagent {role} finished "
-                            f"stop_reason={result.stop_reason} "
-                            f"tool_calls={n_tool}"
+                            f"subagent {role} finished stop_reason={stop_reason} "
+                            f"tool_calls={len(calls)}"
                         )[:600],
                         "outputs": {
-                            "tool_calls": n_tool,
+                            "tool_calls": len(calls),
                             "calls": [
-                                {"tool": c.get("tool"), "ok": c.get("ok")}
-                                for c in calls[:20]
-                                if isinstance(c, dict)
+                                {
+                                    "tool": call.get("tool"),
+                                    "ok": call.get("ok"),
+                                }
+                                for call in calls[:20]
+                                if isinstance(call, dict)
                             ],
-                            "stop_reason": result.stop_reason,
-                            "reasoning_summary": (
-                                "Join synthesised handoff from child result "
-                                "(child omitted formal envelope; mega-6)."
-                            ),
+                            "stop_reason": stop_reason,
                         },
                     }
-                else:
-                    handoff = None
 
-            role_model = None
-            if isinstance(node, dict):
-                role_model = node.get("role_model")
-            _trailer: dict = {}
-            if role_model is not None:
-                _trailer["role_model"] = role_model
-            if provider_retry is not None:
-                _trailer["provider_retry"] = provider_retry
-            if result.stop_reason == "terminated_by_user":
-                out = {"ok": False, "subagent_status": "terminated",
-                        "stop_reason": result.stop_reason,
-                        "result": result.result, "tokens_used": tokens,
-                        "tokens_used_estimate": tokens_used_estimate,
-                        "handoff": handoff,
-                        "provider_usage_recorded": bool(
-                            res_dict.get("provider_usage_recorded"))}
-                out.update(_trailer)
-                return out
-            if result.success:
-                out = {"ok": True, "subagent_status": "done",
-                        "handoff": handoff,
-                        "result": result.result,
-                        "tokens_used": tokens,
-                        "tokens_used_estimate": tokens_used_estimate,
-                        "provider_usage_recorded": bool(
-                            res_dict.get("provider_usage_recorded"))}
-                out.update(_trailer)
-                return out
-            child_status = (
-                result.stop_reason
-                if result.stop_reason in ("blocked", "escalated")
-                else "failed"
-            )
-            out = {"ok": False, "subagent_status": child_status,
-                    "stop_reason": result.stop_reason, "result": result.result,
-                    "handoff": handoff,
-                    "tokens_used": tokens,
-                    "tokens_used_estimate": tokens_used_estimate,
-                    "provider_usage_recorded": bool(
-                        res_dict.get("provider_usage_recorded"))}
-            out.update(_trailer)
-            return out
-        except Exception as exc:  # noqa: BLE001 — execution error is data
-            failed_tokens = 0
             try:
-                from services.agent.providers import token_usage as _token_usage  # noqa: PLC0415
-                failed_tokens = int(
-                    (_token_usage.get_turn_usage() or {}).get("total_tokens") or 0)
-            except Exception:  # noqa: BLE001
-                failed_tokens = 0
+                tokens = int(turn.get("tokens_used") or 0)
+            except (TypeError, ValueError):
+                tokens = 0
+            tokens_used_estimate = tokens <= 0
+            if tokens <= 0 and success:
+                tokens = 1000
+
+            transcript_text = ""
+            if isinstance(payload, str):
+                transcript_text = payload
+            elif handoff is not None:
+                transcript_text = str(handoff.get("summary") or "")
+            if transcript_text:
+                try:
+                    _sreg.append_transcript(node_id, "subagent", transcript_text[:4000])
+                except Exception:  # noqa: BLE001
+                    pass
+
+            common = {
+                "stop_reason": stop_reason,
+                "result": payload,
+                "handoff": handoff,
+                "tokens_used": tokens,
+                "tokens_used_estimate": tokens_used_estimate,
+                "provider_usage_recorded": bool(turn.get("provider_usage_recorded")),
+                "session_id": turn.get("session_id"),
+                "chudcode_session_id": turn.get("chudcode_session_id"),
+                "chudcode_session_file": turn.get("chudcode_session_file"),
+                "allowed_tools": turn.get("allowed_tools") or allowed,
+            }
+            if node.get("role_model") is not None:
+                common["role_model"] = node["role_model"]
+
+            if cancelled:
+                return {
+                    "ok": False,
+                    "subagent_status": "cancelled",
+                    **common,
+                }
+            if success:
+                return {
+                    "ok": True,
+                    "subagent_status": "done",
+                    **common,
+                }
+            nested_error = (
+                str(payload_dict.get("error") or payload_dict.get("error_detail") or "")
+                if payload_dict
+                else ""
+            )
+            child_status = (
+                stop_reason if stop_reason in ("blocked", "escalated") else "failed"
+            )
+            return {
+                "ok": False,
+                "subagent_status": child_status,
+                "error": nested_error or "Chudcode delegated role turn failed",
+                **common,
+            }
+        except Exception as exc:  # noqa: BLE001 - execution error is result data
             return {
                 "ok": False,
                 "subagent_status": "failed",
                 "error": f"sub-agent execution failed: {exc}",
-                "tokens_used": failed_tokens,
-                "tokens_used_estimate": failed_tokens <= 0,
+                "tokens_used": 0,
+                "tokens_used_estimate": True,
             }
 
     # ------------------------------------------------------------------ parts
-    def part_search(self, query: str = "", domain: str = "", limit: int = 20,
-                    category_id: str = "", facets: dict | str | None = None,
-                    price_max: float = 0.0, vendors: str = "",
-                    in_stock: bool = False, **_ignored: Any) -> dict:
+    def part_search(
+        self,
+        query: str = "",
+        domain: str = "",
+        limit: int = 20,
+        category_id: str = "",
+        facets: dict | str | None = None,
+        price_max: float = 0.0,
+        vendors: str = "",
+        in_stock: bool = False,
+        **_ignored: Any,
+    ) -> dict:
         """Search the standard-parts library with taxonomy routing + facet filters.
 
         query: free text ("M8 socket head", "bearing 6205"); category_id: a
@@ -1765,16 +1774,31 @@ class MissionDispatch:
             return {"ok": False, "error": "part_search needs a query string"}
         try:
             from services.mcp.parts_tools import search_parts_v2  # noqa: PLC0415
-            return search_parts_v2(query, domain=domain, limit=limit,
-                                   category_id=category_id, facets=facets,
-                                   price_max=price_max, vendors=vendors,
-                                   in_stock=in_stock)
-        except Exception as exc:  # noqa: BLE001 — error is data for the model
-            return {"ok": False, "error": f"part_search failed: {exc}",
-                    "hint": "Check that services/parts (the parts hub) is importable."}
 
-    def parts_taxonomy(self, node_id: str = "", depth: int = 2,
-                       include_facets: bool = True, **_ignored: Any) -> dict:
+            return search_parts_v2(
+                query,
+                domain=domain,
+                limit=limit,
+                category_id=category_id,
+                facets=facets,
+                price_max=price_max,
+                vendors=vendors,
+                in_stock=in_stock,
+            )
+        except Exception as exc:  # noqa: BLE001 — error is data for the model
+            return {
+                "ok": False,
+                "error": f"part_search failed: {exc}",
+                "hint": "Check that services/parts (the parts hub) is importable.",
+            }
+
+    def parts_taxonomy(
+        self,
+        node_id: str = "",
+        depth: int = 2,
+        include_facets: bool = True,
+        **_ignored: Any,
+    ) -> dict:
         """Browse the parts category taxonomy; a node's EFFECTIVE facets tell you
         which facet keys part_search(facets=...) accepts there.
 
@@ -1783,6 +1807,7 @@ class MissionDispatch:
         """
         try:
             from services.mcp.parts_tools import taxonomy_browse  # noqa: PLC0415
+
             return taxonomy_browse(node_id, depth, include_facets)
         except Exception as exc:  # noqa: BLE001
             return {"ok": False, "error": f"parts_taxonomy failed: {exc}"}
@@ -1797,16 +1822,21 @@ class MissionDispatch:
             return {"ok": False, "error": "part_get needs a part_id"}
         try:
             from services.parts import get as _get  # noqa: PLC0415
+
             rec = _get(part_id)
             if rec is None:
-                return {"ok": False, "error": f"part_id not found: {part_id!r}",
-                        "hint": "Use part_search to discover valid part_ids."}
+                return {
+                    "ok": False,
+                    "error": f"part_id not found: {part_id!r}",
+                    "hint": "Use part_search to discover valid part_ids.",
+                }
             return {"ok": True, "part": rec}
         except Exception as exc:  # noqa: BLE001
             return {"ok": False, "error": f"part_get failed: {exc}"}
 
-    def part_source(self, need: str = "", constraints: str = "",
-                    limit: int = 5, **_ignored: Any) -> dict:
+    def part_source(
+        self, need: str = "", constraints: str = "", limit: int = 5, **_ignored: Any
+    ) -> dict:
         """Source candidate parts for a plain-language need — deterministic
         taxonomy match + faceted search + scored candidates with artifact plans.
 
@@ -1817,12 +1847,20 @@ class MissionDispatch:
         """
         try:
             from services.mcp.parts_tools import part_source_impl  # noqa: PLC0415
+
             return part_source_impl(need, constraints, limit)
         except Exception as exc:  # noqa: BLE001
             return {"ok": False, "error": f"part_source failed: {exc}"}
 
-    def match_model(self, part_id: str = "", title: str = "", mpn: str = "",
-                    brand: str = "", limit: int = 8, **_ignored: Any) -> dict:
+    def match_model(
+        self,
+        part_id: str = "",
+        title: str = "",
+        mpn: str = "",
+        brand: str = "",
+        limit: int = 8,
+        **_ignored: Any,
+    ) -> dict:
         """Match a discrete manufactured product (MPN/brand identity, no 3D model,
         not standard hardware, not raw stock) to a CAD model in a source repo —
         fired when a part_source candidate's artifact_plan.how == "find_model".
@@ -1835,13 +1873,20 @@ class MissionDispatch:
         """
         try:
             from services.mcp.parts_tools import match_model_impl  # noqa: PLC0415
+
             return match_model_impl(part_id, title, mpn, brand, limit)
         except Exception as exc:  # noqa: BLE001
             return {"ok": False, "error": f"match_model failed: {exc}"}
 
-    def reverse_engineer_product(self, part_id: str = "", url: str = "",
-                                 title: str = "", mpn: str = "", brand: str = "",
-                                 **_ignored: Any) -> dict:
+    def reverse_engineer_product(
+        self,
+        part_id: str = "",
+        url: str = "",
+        title: str = "",
+        mpn: str = "",
+        brand: str = "",
+        **_ignored: Any,
+    ) -> dict:
         """Reverse-engineer hand-off (contracts/sourcing.md §2b): harvest ALL of a
         product's photos + datasheets off its page and seed a reverse-engineering
         session pre-populated with them (GUI opens the RE tab loaded). Call this
@@ -1853,6 +1898,7 @@ class MissionDispatch:
         """
         try:
             from services.mcp.parts_tools import reverse_engineer_product_impl  # noqa: PLC0415
+
             return reverse_engineer_product_impl(part_id, url, title, mpn, brand)
         except Exception as exc:  # noqa: BLE001
             return {"ok": False, "error": f"reverse_engineer_product failed: {exc}"}
@@ -1865,12 +1911,12 @@ class MissionDispatch:
         """
         try:
             from services.mcp.parts_tools import vendors_health_impl  # noqa: PLC0415
+
             return vendors_health_impl(sites)
         except Exception as exc:  # noqa: BLE001
             return {"ok": False, "error": f"vendors_health failed: {exc}"}
 
-    def scrape_enqueue(self, site: str = "", query: str = "",
-                       **_ignored: Any) -> dict:
+    def scrape_enqueue(self, site: str = "", query: str = "", **_ignored: Any) -> dict:
         """Enqueue a background vendor search + CAD-artifact download; returns a
         job id to poll with scrape_queue_status.
 
@@ -1882,17 +1928,28 @@ class MissionDispatch:
             return {"ok": False, "error": "scrape_enqueue needs site and query"}
         try:
             from services.browser.queue import enqueue, ensure_worker_started  # noqa: PLC0415
+
             ensure_worker_started()
             out = enqueue(site.strip().lower(), query.strip())
         except Exception as exc:  # noqa: BLE001
-            return {"ok": False, "error": f"scrape_enqueue failed: {exc}",
-                    "hint": "services/browser must be available and the site logged in."}
+            return {
+                "ok": False,
+                "error": f"scrape_enqueue failed: {exc}",
+                "hint": "services/browser must be available and the site logged in.",
+            }
         # Provenance: record the acquisition on the mission ledger (kind=artifact).
         if self.ledger is not None and isinstance(out, dict) and out.get("ok", True):
             try:
-                self.ledger.append("agent", "artifact", {
-                    "event": "scrape_enqueued", "site": site, "query": query,
-                    "job_id": out.get("id", "")})
+                self.ledger.append(
+                    "agent",
+                    "artifact",
+                    {
+                        "event": "scrape_enqueued",
+                        "site": site,
+                        "query": query,
+                        "job_id": out.get("id", ""),
+                    },
+                )
             except Exception:  # noqa: BLE001 — provenance is best-effort
                 pass
         return out if isinstance(out, dict) else {"ok": True, "result": out}
@@ -1903,6 +1960,7 @@ class MissionDispatch:
         """
         try:
             from services.browser.queue import queue_status  # noqa: PLC0415
+
             out = queue_status()
             return out if isinstance(out, dict) else {"ok": True, "jobs": out}
         except Exception as exc:  # noqa: BLE001
@@ -1916,29 +1974,46 @@ class MissionDispatch:
         """
         path = str(artifact_path or "").strip()
         if not path:
-            return {"ok": False,
-                    "error": "import_artifact needs the artifact_path of a done job"}
+            return {
+                "ok": False,
+                "error": "import_artifact needs the artifact_path of a done job",
+            }
         import os  # noqa: PLC0415
+
         if not os.path.isfile(path):
-            return {"ok": False, "error": f"file not found: {path}",
-                    "hint": "Take artifact_path from scrape_queue_status on a done job."}
+            return {
+                "ok": False,
+                "error": f"file not found: {path}",
+                "hint": "Take artifact_path from scrape_queue_status on a done job.",
+            }
         try:
             from services.mcp import core_bridge as cb  # noqa: PLC0415 — ported to core (T-RF19)
+
             out = cb.call("part_import_file", {"path": path})
         except Exception as exc:  # noqa: BLE001
-            return {"ok": False, "error": f"import_artifact failed: {exc}",
-                    "hint": "Ensure the native core (CHUDWARE_LIBCHUDWARE) is available."}
+            return {
+                "ok": False,
+                "error": f"import_artifact failed: {exc}",
+                "hint": "Ensure the native core (CHUDWARE_LIBCHUDWARE) is available.",
+            }
         if self.ledger is not None and isinstance(out, dict) and out.get("ok"):
             try:
-                self.ledger.append("agent", "artifact", {
-                    "event": "artifact_imported", "path": path,
-                    "doc_id": out.get("doc_id", "")})
+                self.ledger.append(
+                    "agent",
+                    "artifact",
+                    {
+                        "event": "artifact_imported",
+                        "path": path,
+                        "doc_id": out.get("doc_id", ""),
+                    },
+                )
             except Exception:  # noqa: BLE001
                 pass
         return out
 
-    def cam_tool_import(self, part_id: str = "", number: int = 0,
-                        material: str = "", **_ignored: Any) -> dict:
+    def cam_tool_import(
+        self, part_id: str = "", number: int = 0, material: str = "", **_ignored: Any
+    ) -> dict:
         """Import a cutting-tool part record (end mill / drill from the library)
         into the current CAM job's tool library; number 0 = next free.
 
@@ -1947,10 +2022,10 @@ class MissionDispatch:
         """
         try:
             from services.mcp.parts_tools import cam_tool_import_impl  # noqa: PLC0415
+
             return cam_tool_import_impl(part_id, number, material)
         except Exception as exc:  # noqa: BLE001
             return {"ok": False, "error": f"cam_tool_import failed: {exc}"}
-
 
     # ---------------------------------------------------------- coordination
     def _coord_agent_id(self, agent_id: str | None = None) -> str:
@@ -1985,8 +2060,10 @@ class MissionDispatch:
         if err is not None:
             return err
         aid = self._coord_agent_id(agent_id)
-        res = resources if isinstance(resources, list) else (
-            [resources] if resources else []
+        res = (
+            resources
+            if isinstance(resources, list)
+            else ([resources] if resources else [])
         )
         out = board.register_claim(aid, res, intent)
         # Surface conflicts as spawn-side warnings without blocking siblings.
@@ -2009,8 +2086,10 @@ class MissionDispatch:
         if err is not None:
             return err
         aid = self._coord_agent_id(agent_id)
-        res = resources if isinstance(resources, list) else (
-            [resources] if resources else None
+        res = (
+            resources
+            if isinstance(resources, list)
+            else ([resources] if resources else None)
         )
         return board.release_claim(aid, res, claim_ids=claim_ids)
 
@@ -2076,6 +2155,7 @@ class MissionDispatch:
         try:
             from services.agent.corporate import build_corporate_org  # noqa: PLC0415
             from services.agent import config as agent_config  # noqa: PLC0415
+
             cfg = agent_config.load_config()
             goals = mission_goals
             if not goals and isinstance(self.graph, dict):
@@ -2094,33 +2174,34 @@ class MissionDispatch:
                 mission_goals=list(goals or []) or None,
                 force=force,
                 on_event=self.on_event,
-                provider=self.provider,
                 seat_heads=bool(seat_heads),
                 delegate_fn=_delegate if self.delegation_tree is not None else None,
             )
             if result.get("active") and result.get("chart"):
                 from services.agent.corporate import get_org_chart  # noqa: PLC0415
+
                 self.org_chart = get_org_chart(
                     self.run_id,
                     create=False,
                     on_event=self.on_event,
-                    provider=self.provider,
                 )
                 if self.org_chart is not None:
                     if self.org_chart.on_event is None:
                         self.org_chart.on_event = self.on_event
-                    if self.org_chart.provider is None:
-                        self.org_chart.provider = self.provider
                     if not self.corporate_agent_id:
                         self.corporate_agent_id = self.org_chart.director_id
             if self.ledger is not None:
                 try:
-                    self.ledger.append("agent", "artifact", {
-                        "event": "corporate_org",
-                        "active": bool(result.get("active")),
-                        "reason": result.get("reason"),
-                        "departments_found": result.get("departments_found"),
-                    })
+                    self.ledger.append(
+                        "agent",
+                        "artifact",
+                        {
+                            "event": "corporate_org",
+                            "active": bool(result.get("active")),
+                            "reason": result.get("reason"),
+                            "departments_found": result.get("departments_found"),
+                        },
+                    )
                 except Exception:  # noqa: BLE001
                     pass
             return result
@@ -2143,6 +2224,7 @@ class MissionDispatch:
         try:
             from services.agent.corporate import auto_activate_corporate  # noqa: PLC0415
             from services.agent import config as agent_config  # noqa: PLC0415
+
             cfg = agent_config.load_config()
             goals = mission_goals
             if not goals and isinstance(self.graph, dict):
@@ -2172,17 +2254,16 @@ class MissionDispatch:
                     board=self.coordination_board,
                     mission_goals=list(goals or []) or None,
                     on_event=self.on_event,
-                    provider=self.provider,
                     delegate_fn=_delegate if self.delegation_tree is not None else None,
                     seat_heads=True,
                 )
             if result.get("active"):
                 from services.agent.corporate import get_org_chart  # noqa: PLC0415
+
                 self.org_chart = get_org_chart(
                     self.run_id,
                     create=False,
                     on_event=self.on_event,
-                    provider=self.provider,
                 )
                 if self.org_chart is not None and not self.corporate_agent_id:
                     self.corporate_agent_id = self.org_chart.director_id
@@ -2199,6 +2280,7 @@ class MissionDispatch:
         """Tear down the corporate org at run finish (success or failure)."""
         try:
             from services.agent.corporate import wind_down_corporate  # noqa: PLC0415
+
             out = wind_down_corporate(
                 self.run_id,
                 success=bool(success),
@@ -2379,12 +2461,10 @@ class MissionDispatch:
         )
 
 
-
-# 2048 output tokens (agent_turn's `completion_cap` default) truncated the live
-# 2026-07-28 general-lane turn mid-`mission_start` directive: the reply was cut
-# off inside a string, parsed as no-directive, and the run reported success with
-# zero geometry. This lane is the UNIVERSAL online entry and its directives carry
-# whole project briefs, so it needs real headroom, not a DAG node's.
+# Explicit offline role turns still need enough output room for a complete
+# terminal directive; the local legacy loop's default 2048-token completion cap
+# can truncate one mid-envelope. Online turns use Chudcode and do not enter this
+# loop.
 LINEAR_ROLE_MAX_OUTPUT_TOKENS = 8192
 
 
@@ -2397,10 +2477,12 @@ def linear_role_allowed_tools(card: Any) -> list[str]:
     allowed = set(card.concrete_tools) | MAIN_CHAT_DEFAULT_TOOLS
     try:
         from services.agent.config import bugreport_floor  # noqa: PLC0415
+
         allowed |= set(bugreport_floor())
     except Exception:  # noqa: BLE001 — floor union is best-effort
         pass
     return sorted(allowed)
+
 
 def effective_role_system_prompt(card: Any) -> str:
     """Apply the Settings global system-prompt override to a role card.
@@ -2412,6 +2494,7 @@ def effective_role_system_prompt(card: Any) -> str:
     """
     try:
         from services.agent.config import load_config  # noqa: PLC0415
+
         override = str((load_config() or {}).get("system_prompt") or "").strip()
         if override:
             return override
@@ -2421,7 +2504,9 @@ def effective_role_system_prompt(card: Any) -> str:
 
 
 def _apply_session_preferences(
-    role: str, allowed: list[str], system_prompt: str,
+    role: str,
+    allowed: list[str],
+    system_prompt: str,
 ) -> tuple[list[str], str]:
     """Fold the Settings → AI → Harness preference knobs into the role card.
 
@@ -2574,12 +2659,15 @@ def _tool_render_ident(fn: Any) -> tuple[str, str] | None:
     if fn is None:
         return None
     target = getattr(fn, "__func__", fn)
-    return (str(getattr(target, "__module__", "")),
-            str(getattr(target, "__qualname__", None) or repr(target)))
+    return (
+        str(getattr(target, "__module__", "")),
+        str(getattr(target, "__qualname__", None) or repr(target)),
+    )
 
 
 def _tools_render_idents(
-    allowed: list[str], resolver: Callable[[str], Any],
+    allowed: list[str],
+    resolver: Callable[[str], Any],
 ) -> tuple[tuple[str, str] | None, ...]:
     """Per-tool render identity under *resolver*, in allowlist order."""
     out: list[tuple[str, str] | None] = []
@@ -2640,6 +2728,7 @@ def linear_role_prompt(
 
     if card is None:
         from services.agent.roles import load_role  # noqa: PLC0415
+
         card = load_role(role)
     # Main chat gets both halves of the derived fs/shell floor. Rare CAD
     # families remain behind enable_tools; previews call the same helper.
@@ -2651,15 +2740,16 @@ def linear_role_prompt(
             assemble_system_for_capability,
             letter_from_capability,
         )
+
         system_prompt = assemble_system_for_capability(
-            base_system_prompt, letter_from_capability(capability))
+            base_system_prompt, letter_from_capability(capability)
+        )
     except Exception:  # noqa: BLE001
         system_prompt = base_system_prompt
     # Preferences BEFORE the tools render: a dropped tool must also vanish from
     # the schema block, or the model is shown a tool every call to which will be
     # refused.
-    allowed, system_prompt = _apply_session_preferences(
-        role, allowed, system_prompt)
+    allowed, system_prompt = _apply_session_preferences(role, allowed, system_prompt)
 
     static = None
     try:
@@ -2669,8 +2759,10 @@ def linear_role_prompt(
         # the slot every time a file there changes. This is also the key
         # ``prompt_cache.warm()`` fills at worker start.
         static = _pcache.get(role=role, capability=capability)
-        if any(w.split(":", 1)[0] in _PROMPT_CACHE_COMPOSE_WARNINGS
-               for w in static.warnings):
+        if any(
+            w.split(":", 1)[0] in _PROMPT_CACHE_COMPOSE_WARNINGS
+            for w in static.warnings
+        ):
             static = None
     except Exception:  # noqa: BLE001 — the cache is an optimisation, never fatal
         static = None
@@ -2678,12 +2770,14 @@ def linear_role_prompt(
     slot = _tool_schemas.tier_tools_slot(tier)
     idents = _tools_render_idents(allowed, resolver)
 
-    if (static is not None and static.tools_text
-            and static.role_system == system_prompt
-            and list(static.allowed) == allowed
-            and slot == _tool_schemas.tier_tools_slot(None)
-            and idents == _tools_render_idents(allowed,
-                                               _at.resolver_for(None))):
+    if (
+        static is not None
+        and static.tools_text
+        and static.role_system == system_prompt
+        and list(static.allowed) == allowed
+        and slot == _tool_schemas.tier_tools_slot(None)
+        and idents == _tools_render_idents(allowed, _at.resolver_for(None))
+    ):
         return system_prompt, allowed, static.tools_text
 
     if static is not None:
@@ -2705,7 +2799,8 @@ def linear_role_prompt(
 
     try:
         tools_text, _meta = _tool_schemas.render_tools_block(
-            allowed, resolver=resolver, tier=tier)
+            allowed, resolver=resolver, tier=tier
+        )
     except Exception:  # noqa: BLE001 — schema render is best-effort
         return system_prompt, allowed, None
 
@@ -2736,16 +2831,13 @@ def run_linear_role_turn(
     attachments: list[dict] | None = None,
     chudware_actor: Any | None = None,
 ) -> dict[str, Any]:
-    """Run ONE bounded ``agent_turn.run_turn`` against *role*'s card.
+    """Run one bounded explicit-offline legacy role turn.
 
-    This is the real single-turn entry used by the worker RPC: no manifest or
-    DAG compilation, just the named role's card and its effective tool floor,
-    streamed through *on_event* so the GUI chat renders it.
-
-    A delegation tree IS bound (see below): the role cards used on this path
-    advertise ``delegate`` in their allowlist and their prompts tell the model to
-    use it, so leaving the tree unbound made an advertised tool fail every single
-    time with "no delegation tree bound to this mission".
+    Online role execution goes through
+    :func:`services.agent.chudcode_roles.run_role_turn`. This local loop remains
+    only for deterministic/loopback providers after that helper has enforced
+    offline safety. It preserves the CAD role card, governed tool scope, ledger,
+    events and delegation tree for offline modeling.
     """
     from services.agent import agent_turn as _at
     from services.agent.roles import load_role
@@ -2761,6 +2853,7 @@ def run_linear_role_turn(
     if mission_dispatch is None and tool_dispatch is None:
         try:
             import uuid as _uuid  # noqa: PLC0415
+
             _rid = run_id or f"linear-{_uuid.uuid4().hex[:8]}"
             # Bind a real delegation tree so `delegate` — which every role card on
             # this path advertises — actually spawns and RUNS a sub-agent instead of
@@ -2772,14 +2865,22 @@ def run_linear_role_turn(
                 from services.agent.delegation import (  # noqa: PLC0415
                     DelegationTree as _DelegationTree,
                 )
+
                 tree = _DelegationTree(
-                    run_id=_rid, ledger=ledger, tier=tier, on_event=on_event)
+                    run_id=_rid, ledger=ledger, tier=tier, on_event=on_event
+                )
             except Exception:  # noqa: BLE001 — degrade to the old no-delegation turn
                 tree = None
             mission_dispatch = MissionDispatch(
-                run_id=_rid, ledger=ledger, provider=provider, on_event=on_event,
-                delegation_tree=tree, chudware_actor=chudware_actor,
-                capability=capability, tier=tier)
+                run_id=_rid,
+                ledger=ledger,
+                provider=provider,
+                on_event=on_event,
+                delegation_tree=tree,
+                chudware_actor=chudware_actor,
+                capability=capability,
+                tier=tier,
+            )
         except Exception:  # noqa: BLE001 — dispatcher is best-effort
             mission_dispatch = None
 
@@ -2802,6 +2903,29 @@ def run_linear_role_turn(
         capability=capability,
         tier=tier or getattr(mission_dispatch, "tier", None),
     )
+    explicit_allowed = isinstance(options, dict) and "allowed_tools" in options
+    if explicit_allowed:
+        raw_allowed = options.get("allowed_tools")
+        allowed = (
+            None
+            if raw_allowed is None
+            else [str(tool).strip() for tool in raw_allowed if str(tool).strip()]
+        )
+        if allowed is None:
+            tools_text = None
+        else:
+            try:
+                from services.agent.tool_schemas import (  # noqa: PLC0415
+                    render_tools_block,
+                )
+
+                tools_text, _ = render_tools_block(
+                    allowed,
+                    resolver=_at.resolver_for(mission_dispatch),
+                    tier=tier or getattr(mission_dispatch, "tier", None),
+                )
+            except Exception:  # noqa: BLE001
+                tools_text = None
 
     # The process-global org MCP closures need the same run-scoped provider and
     # ledger that agent_turn receives. Bind only for the duration of this turn;
@@ -2809,30 +2933,47 @@ def run_linear_role_turn(
     from types import SimpleNamespace as _SimpleNamespace  # noqa: PLC0415
     from services.mcp import org_tools as _org_tools  # noqa: PLC0415
 
-    _org_tools.bind_mission_context(_SimpleNamespace(
-        provider=provider,
-        ledger=ledger,
-        dissents_registry=getattr(mission_dispatch, "dissents_registry", None),
-        stage=getattr(mission_dispatch, "phase", None),
-        tier=tier or getattr(mission_dispatch, "tier", None),
-        providers=getattr(mission_dispatch, "providers", None),
-        org_state=getattr(mission_dispatch, "org_state", None),
-    ))
+    _org_tools.bind_mission_context(
+        _SimpleNamespace(
+            provider=provider,
+            ledger=ledger,
+            dissents_registry=getattr(mission_dispatch, "dissents_registry", None),
+            stage=getattr(mission_dispatch, "phase", None),
+            tier=tier or getattr(mission_dispatch, "tier", None),
+            providers=getattr(mission_dispatch, "providers", None),
+            org_state=getattr(mission_dispatch, "org_state", None),
+        )
+    )
     try:
         result = _at.run_turn(
-            request, provider, name=role, actor=role,
+            request,
+            provider,
+            name=role,
+            actor=role,
             credit_actor=chudware_actor,
             system_prompt=system_prompt,
             allowed_tools=allowed,
             tools_text=tools_text,
-            max_tokens=(max_tokens if max_tokens is not None
-                        else LINEAR_ROLE_MAX_OUTPUT_TOKENS),
+            max_tokens=(
+                max_tokens if max_tokens is not None else LINEAR_ROLE_MAX_OUTPUT_TOKENS
+            ),
             max_total_tokens=max_total_tokens,
+            max_tool_calls=(
+                options.get("max_tool_calls") if isinstance(options, dict) else None
+            ),
             ledger=ledger,
             mission_dispatch=mission_dispatch,
             tool_dispatch=tool_dispatch,
             on_event=on_event,
             run_id=run_id,
+            node_id=(options.get("node_id") if isinstance(options, dict) else None),
+            subagent_id=(
+                options.get("subagent_id") if isinstance(options, dict) else None
+            ),
+            phase=(options.get("phase") if isinstance(options, dict) else None),
+            task_class=(
+                options.get("task_class") if isinstance(options, dict) else None
+            ),
             capability=capability,
             tier=tier or getattr(mission_dispatch, "tier", None),
             options=options,
@@ -2843,7 +2984,7 @@ def run_linear_role_turn(
             # harness do it on first reach instead of spending two billed
             # completions per pack. Curated roles (sourcing, DAG nodes, subagents)
             # leave this off, so their allow-list stays a hard boundary.
-            auto_enable_packs=(role == "general_agent"),
+            auto_enable_packs=(role == "general_agent" and not explicit_allowed),
         )
     finally:
         _org_tools.bind_mission_context(None)
@@ -2862,6 +3003,7 @@ def run_linear_role_turn(
     _swept: dict[str, Any] = {"saved": [], "errors": []}
     try:
         from services.mcp.cad_common import save_touched_docs  # noqa: PLC0415
+
         _swept = save_touched_docs()
         if (
             _swept.get("saved")
@@ -2869,12 +3011,16 @@ def run_linear_role_turn(
             or _swept.get("persistence_failure")
         ) and ledger is not None:
             try:
-                ledger.append(role, "terminal_autosave", {
-                    "run_id": run_id,
-                    "saved": _swept.get("saved") or [],
-                    "errors": _swept.get("errors") or [],
-                    "persistence_failure": _swept.get("persistence_failure"),
-                })
+                ledger.append(
+                    role,
+                    "terminal_autosave",
+                    {
+                        "run_id": run_id,
+                        "saved": _swept.get("saved") or [],
+                        "errors": _swept.get("errors") or [],
+                        "persistence_failure": _swept.get("persistence_failure"),
+                    },
+                )
             except Exception:  # noqa: BLE001
                 pass
     except Exception as exc:  # noqa: BLE001
@@ -2883,14 +3029,19 @@ def run_linear_role_turn(
     # entry only — never raises into the turn path.
     try:
         from services.agent.autolearn import maybe_capture_after_turn  # noqa: PLC0415
+
         _calls = 0
-        _res = result.result if isinstance(getattr(result, "result", None), dict) else {}
+        _res = (
+            result.result if isinstance(getattr(result, "result", None), dict) else {}
+        )
         if isinstance(_res, dict):
             _calls = int(_res.get("tool_calls") or 0)
             if not _calls and isinstance(_res.get("calls"), list):
                 _calls = len(_res["calls"])
         maybe_capture_after_turn(
-            request=request, result=result, tool_calls=_calls,
+            request=request,
+            result=result,
+            tool_calls=_calls,
         )
     except Exception:  # noqa: BLE001
         pass
@@ -2917,7 +3068,8 @@ def run_linear_role_turn(
                     "tool_calls": n_tool,
                     "calls": [
                         {"tool": c.get("tool"), "ok": c.get("ok")}
-                        for c in calls[:20] if isinstance(c, dict)
+                        for c in calls[:20]
+                        if isinstance(c, dict)
                     ],
                     "stop_reason": result.stop_reason,
                     "reasoning_summary": (
@@ -2930,7 +3082,8 @@ def run_linear_role_turn(
     persistence_failure = _swept.get("persistence_failure")
     if isinstance(persistence_failure, dict):
         failure_reason = str(
-            persistence_failure.get("reason") or "document_persistence_failed")
+            persistence_failure.get("reason") or "document_persistence_failed"
+        )
         if failure_reason not in persistence_errors:
             persistence_errors.append(failure_reason)
     if persistence_errors:
@@ -2969,5 +3122,3 @@ def run_linear_role_turn(
         "role": role,
         "allowed_tools": allowed,
     }
-
-

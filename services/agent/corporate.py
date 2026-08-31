@@ -31,6 +31,7 @@ This module is complementary to ``org.py`` (aicad.org/1 deliverable
 clustering). Corporate mode is the *subagent orchestration* layer for the
 copilot; org.py remains the mission-pipeline department runtime.
 """
+
 from __future__ import annotations
 
 import json
@@ -43,6 +44,8 @@ import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Iterable, Optional
+
+from services.agent.chudcode_roles import run_role_turn
 
 from services.agent.config import (
     corporate_mode_enabled,
@@ -258,6 +261,7 @@ def emit_corporate_event(
         return body
     try:
         from services.agent import agent_events as _ae  # noqa: PLC0415
+
         _ae.emit_event("corporate", body, live=on_event, journal=None)
     except Exception:  # noqa: BLE001 — never block org on telemetry
         try:
@@ -265,8 +269,10 @@ def emit_corporate_event(
             n = 1
             try:
                 import inspect  # noqa: PLC0415
+
                 n = sum(
-                    1 for p in inspect.signature(on_event).parameters.values()
+                    1
+                    for p in inspect.signature(on_event).parameters.values()
                     if p.default is p.empty
                     and p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)
                 )
@@ -303,6 +309,7 @@ def effective_corporate_depth_cap(
 # ---------------------------------------------------------------------------
 # Classification helpers
 # ---------------------------------------------------------------------------
+
 
 def _kw_match(blob: str, keywords: tuple[str, ...]) -> bool:
     """True if any *keywords* starts a word in *blob* (word-boundary, not a raw
@@ -427,7 +434,9 @@ def derive_departments(
         non_general = [d for d in ranked if d != "general"]
         if len(non_general) >= max_d:
             keep = non_general[:max_d]
-            overflow = non_general[max_d:] + (["general"] if "general" in ranked else [])
+            overflow = non_general[max_d:] + (
+                ["general"] if "general" in ranked else []
+            )
         else:
             keep = non_general + (["general"] if "general" in ranked else [])
             keep = keep[:max_d]
@@ -449,12 +458,14 @@ def derive_departments(
     for did in keep:
         if did not in buckets:
             continue
-        depts.append({
-            "id": did,
-            "name": _dept_display_name(did),
-            "tasks": list(buckets[did]),
-            "roles": sorted(role_sets.get(did, set())),
-        })
+        depts.append(
+            {
+                "id": did,
+                "name": _dept_display_name(did),
+                "tasks": list(buckets[did]),
+                "roles": sorted(role_sets.get(did, set())),
+            }
+        )
     return depts
 
 
@@ -488,9 +499,11 @@ should_activate_corporate = should_use_corporate
 # Data classes
 # ---------------------------------------------------------------------------
 
+
 @dataclass
 class Seat:
     """One agent seat on the corporate org chart."""
+
     agent_id: str
     rank: str  # director | head | team_lead | worker
     dept_id: str | None = None  # None for director
@@ -514,6 +527,7 @@ class Seat:
 @dataclass
 class ChannelMessage:
     """One message on a corporate channel."""
+
     id: str
     channel: str
     from_agent: str
@@ -537,6 +551,7 @@ class ChannelMessage:
 @dataclass
 class MeetingDigest:
     """Structured department status digest posted to the heads channel."""
+
     dept_id: str
     head_id: str
     done: list[str] = field(default_factory=list)
@@ -565,6 +580,7 @@ class MeetingDigest:
 @dataclass
 class DirectorReview:
     """Director's response to a meeting digest (template-first, LLM optional)."""
+
     digest_dept: str
     aligned: bool
     needs_llm: bool
@@ -587,6 +603,7 @@ class DirectorReview:
 # ---------------------------------------------------------------------------
 # OrgChart
 # ---------------------------------------------------------------------------
+
 
 class CorporateError(ValueError):
     """Corporate org rule violation (routing, depth, config)."""
@@ -613,7 +630,6 @@ class OrgChart:
         director_review: bool | None = None,
         max_subagent_depth: int | None = None,
         on_event: Callable[..., None] | None = None,
-        provider: Any | None = None,
         runs_dir: Path | None = None,
     ) -> None:
         self.run_id = run_id or f"r_{uuid.uuid4().hex[:8]}"
@@ -649,7 +665,6 @@ class OrgChart:
         ]
         self.board = board  # optional CoordinationBoard for progress mirror
         self.on_event = on_event  # live agent event sink
-        self.provider = provider  # optional provider for LLM director steering
         self._runs_dir = runs_dir
         self._lock = threading.RLock()
         self._events: list[dict[str, Any]] = []  # ordered corporate event log
@@ -780,7 +795,8 @@ class OrgChart:
 
     def workers_in_dept(self, dept_id: str) -> list[Seat]:
         return [
-            s for s in self.seats.values()
+            s
+            for s in self.seats.values()
             if s.dept_id == dept_id and s.rank in (RANK_WORKER, RANK_TEAM_LEAD)
         ]
 
@@ -889,15 +905,14 @@ class OrgChart:
 
             # Auto team-lead when over threshold
             auto_lead: dict[str, Any] | None = None
-            if (
-                self.team_leads_enabled
-                and not as_team_lead
-                and rank == RANK_WORKER
-            ):
-                n_workers = len([
-                    s for s in self.seats.values()
-                    if s.dept_id == dept_id and s.rank == RANK_WORKER
-                ])
+            if self.team_leads_enabled and not as_team_lead and rank == RANK_WORKER:
+                n_workers = len(
+                    [
+                        s
+                        for s in self.seats.values()
+                        if s.dept_id == dept_id and s.rank == RANK_WORKER
+                    ]
+                )
                 has_lead = any(
                     s.rank == RANK_TEAM_LEAD and s.dept_id == dept_id
                     for s in self.seats.values()
@@ -905,8 +920,11 @@ class OrgChart:
                 if n_workers > _TEAM_LEAD_THRESHOLD and not has_lead:
                     # Promote the first worker to team lead (deterministic: sorted id)
                     workers = sorted(
-                        (s for s in self.seats.values()
-                         if s.dept_id == dept_id and s.rank == RANK_WORKER),
+                        (
+                            s
+                            for s in self.seats.values()
+                            if s.dept_id == dept_id and s.rank == RANK_WORKER
+                        ),
                         key=lambda s: s.agent_id,
                     )
                     if workers:
@@ -1046,7 +1064,11 @@ class OrgChart:
 
             # Explicit worker → director rejection (even if they invent a channel)
             if seat.rank in (RANK_WORKER, RANK_TEAM_LEAD):
-                if ch == CHANNEL_HEADS or ch == self.director_id or ch.startswith("director"):
+                if (
+                    ch == CHANNEL_HEADS
+                    or ch == self.director_id
+                    or ch.startswith("director")
+                ):
                     return self._reject_route(
                         agent=agent,
                         channel=ch,
@@ -1063,7 +1085,9 @@ class OrgChart:
                     )
                 # Also reject any meta that targets the director
                 if meta and str(meta.get("to") or meta.get("to_agent") or "") in (
-                    self.director_id, RANK_DIRECTOR, "director",
+                    self.director_id,
+                    RANK_DIRECTOR,
+                    "director",
                 ):
                     return self._reject_route(
                         agent=agent,
@@ -1115,7 +1139,11 @@ class OrgChart:
             self.messages.append(msg)
 
             # Mirror progress notes onto the coordination board when present
-            if self.board is not None and kind_s in ("progress", "question", "blockage"):
+            if self.board is not None and kind_s in (
+                "progress",
+                "question",
+                "blockage",
+            ):
                 try:
                     self.board.post_progress(agent, f"[{ch}] {text[:400]}")
                 except Exception:  # noqa: BLE001
@@ -1206,11 +1234,13 @@ class OrgChart:
             meeting: dict[str, Any] | None = None
             if blocked:
                 meeting = self._hold_meeting_unlocked(
-                    did, trigger=MEETING_TRIGGER_BLOCKAGE,
+                    did,
+                    trigger=MEETING_TRIGGER_BLOCKAGE,
                 )
             elif count >= self.meeting_cadence:
                 meeting = self._hold_meeting_unlocked(
-                    did, trigger=MEETING_TRIGGER_COMPLETION,
+                    did,
+                    trigger=MEETING_TRIGGER_COMPLETION,
                 )
 
             out: dict[str, Any] = {
@@ -1228,7 +1258,6 @@ class OrgChart:
             if post_result is not None:
                 out["post"] = post_result
             return out
-
 
     def hold_meeting(
         self,
@@ -1270,7 +1299,9 @@ class OrgChart:
         if done is None or in_progress is None or blocked is None or risks is None:
             auto = self._auto_digest_fields(did)
             done = done if done is not None else auto["done"]
-            in_progress = in_progress if in_progress is not None else auto["in_progress"]
+            in_progress = (
+                in_progress if in_progress is not None else auto["in_progress"]
+            )
             blocked = blocked if blocked is not None else auto["blocked"]
             risks = risks if risks is not None else auto["risks"]
 
@@ -1348,9 +1379,7 @@ class OrgChart:
                         "needs_llm": rev.needs_llm,
                         "aligned": rev.aligned,
                         "notes": list(rev.notes),
-                        "llm_refined": any(
-                            "llm steering" in n for n in rev.notes
-                        ),
+                        "llm_refined": any("llm steering" in n for n in rev.notes),
                     },
                 )
                 # Auto-relay blockage steering to dept workers (cheap).
@@ -1427,7 +1456,8 @@ class OrgChart:
             for g in self.mission_goals:
                 # Simple keyword presence: first 3 significant tokens of the goal
                 tokens = [
-                    t for t in re.findall(r"[a-z0-9]{4,}", g.lower())
+                    t
+                    for t in re.findall(r"[a-z0-9]{4,}", g.lower())
                     if t not in ("with", "from", "that", "this", "into", "using")
                 ][:3]
                 if tokens and not any(t in blob for t in tokens):
@@ -1444,7 +1474,11 @@ class OrgChart:
                     aligned = False
                     needs_llm = True
 
-        if not digest.done and not digest.in_progress and digest.trigger == MEETING_TRIGGER_BLOCKAGE:
+        if (
+            not digest.done
+            and not digest.in_progress
+            and digest.trigger == MEETING_TRIGGER_BLOCKAGE
+        ):
             aligned = False
             needs_llm = True
             notes.append("blockage meeting with no active work — investigate")
@@ -1455,14 +1489,10 @@ class OrgChart:
                 f"STEERING for dept={digest.dept_id}:",
             ]
             if digest.blocked:
-                parts.append(
-                    "Prioritize unblocking: "
-                    + "; ".join(digest.blocked[:3])
-                )
+                parts.append("Prioritize unblocking: " + "; ".join(digest.blocked[:3]))
             if digest.risks:
                 parts.append(
-                    "Address risks via dept channel: "
-                    + "; ".join(digest.risks[:2])
+                    "Address risks via dept channel: " + "; ".join(digest.risks[:2])
                 )
             if self.mission_goals:
                 parts.append(
@@ -1492,47 +1522,47 @@ class OrgChart:
         digest: MeetingDigest,
         review: DirectorReview,
     ) -> str | None:
-        """One short model call to refine template steering (blockage/misalign only).
+        """Refine template steering through one bounded Chudcode advisor turn.
 
-        Falls back to None on any failure so the template note stays in force.
-        Resolves an advisor/director-style role via role_models, then makes ONE
-        complete() call (bound provider, or a light provider from the assignment).
+        Any configuration, cancellation, provider, or parsing failure returns
+        ``None`` so the deterministic director steering remains authoritative.
         """
         try:
-            from services.agent.role_models import resolve_role_model  # noqa: PLC0415
             from services.agent import config as agent_config  # noqa: PLC0415
+            from services.agent.role_models import (  # noqa: PLC0415
+                clamp_subagent_effort,
+                resolve_role_model,
+                resolve_role_thinking,
+            )
 
-            assignment = None
-            for role_try in ("advisor", "orchestrator", "department_manager"):
-                try:
-                    assignment = resolve_role_model(
-                        role_try,
-                        self._cfg,
-                        task_class="analysis",
-                        node_depth=0,
-                    )
-                    break
-                except Exception:  # noqa: BLE001
-                    continue
-
-            provider = self.provider
-            # Prefer a role-resolved light provider when the mission provider is unset.
-            if provider is None and assignment is not None:
-                try:
-                    cfg_pick = dict(self._cfg or agent_config.load_config() or {})
-                    prov_name = assignment.provider
-                    if prov_name == "ollama":
-                        prov_name = "openai"
-                        cfg_pick.setdefault("api_key", "ollama")
-                    provider = agent_config.get_provider(
-                        name=prov_name, cfg=cfg_pick)
-                except Exception:  # noqa: BLE001
-                    provider = None
-            if provider is None:
-                return None
+            cfg = (
+                dict(self._cfg)
+                if isinstance(self._cfg, dict)
+                else dict(agent_config.load_config() or {})
+            )
+            assignment = resolve_role_model(
+                "advisor",
+                cfg,
+                task_class="analysis",
+                node_depth=0,
+            )
+            ambient_effort = cfg.get("reasoning_effort") or cfg.get("thinking")
+            effort = resolve_role_thinking(
+                "advisor",
+                cfg,
+                task_class="analysis",
+                dispatch_effort=clamp_subagent_effort(ambient_effort),
+                rank=getattr(assignment, "rank", None),
+            )
+            settings = {
+                "provider": str(getattr(assignment, "provider", "") or ""),
+                "model": str(getattr(assignment, "model", "") or ""),
+            }
+            if effort:
+                settings["reasoning_effort"] = effort
 
             goals = "; ".join(self.mission_goals[:5]) or "(none)"
-            dig_txt = (
+            digest_text = (
                 f"dept={digest.dept_id} trigger={digest.trigger}\n"
                 f"done={digest.done[:6]}\n"
                 f"in_progress={digest.in_progress[:6]}\n"
@@ -1540,37 +1570,59 @@ class OrgChart:
                 f"risks={digest.risks[:6]}\n"
                 f"notes={list(review.notes)[:6]}"
             )
-            role_label = (
-                getattr(assignment, "role", None) or "advisor"
-            )
-            system = (
-                f"You are a company {role_label} writing ONE short steering note "
-                "(≤120 words) for a department head. Be concrete: unblock first, "
-                "then re-align to mission goals. No preamble, no markdown."
-            )
-            user = (
+            request = (
+                "COMPANY DIRECTOR COMPLETION CONTRACT\n"
+                "Write ONE short steering note (at most 120 words) for a "
+                "department head. Be concrete: unblock first, then re-align to "
+                "mission goals. No preamble, no markdown, and no tool calls.\n\n"
                 f"Mission goals: {goals}\n\n"
-                f"Meeting digest:\n{dig_txt}\n\n"
+                f"Meeting digest:\n{digest_text}\n\n"
                 f"Template steering (refine or keep):\n{review.steering}"
             )
-            text = provider.complete(
-                system,
-                [{"role": "user", "content": user}],
+            options: dict[str, Any] = {
+                "config": cfg,
+                "settings": settings,
+                "allowed_tools": [],
+            }
+            if agent_config.offline_enabled(cfg):
+                options["offline"] = True
+            turn = run_role_turn(
+                request,
+                "advisor",
+                session_id=self.run_id,
+                run_id=self.run_id,
+                parent_id=(
+                    f"{self.director_id}:meeting:{len(self.digests)}:{digest.dept_id}"
+                ),
+                on_event=self.on_event,
+                options=options,
                 max_tokens=400,
+                max_total_tokens=400,
+                close_session=True,
             )
+            if (
+                not isinstance(turn, dict)
+                or not turn.get("success")
+                or turn.get("cancelled")
+            ):
+                return None
+            text = turn.get("result")
+            if isinstance(text, dict):
+                text = next(
+                    (
+                        text.get(key)
+                        for key in ("text", "result", "message", "content")
+                        if isinstance(text.get(key), str)
+                    ),
+                    "",
+                )
             out = str(text or "").strip()
             if not out:
                 return None
             if len(out) > 1200:
                 out = out[:1199].rstrip() + "…"
-            # Stash assignment on the review notes path via a side channel
-            # (caller appends llm note). Store last assignment for events.
-            self._last_steering_assignment = (
-                assignment.to_dict() if assignment is not None
-                and hasattr(assignment, "to_dict") else None
-            )
             return out
-        except Exception:  # noqa: BLE001 — template stays
+        except Exception:  # noqa: BLE001 — deterministic template stays
             return None
 
     # -- live head hire -------------------------------------------------------
@@ -1608,6 +1660,7 @@ class OrgChart:
                         resolve_role_model,
                         resolve_role_thinking,
                     )
+
                     assignment = resolve_role_model(
                         seat.role or head_role,
                         self._cfg,
@@ -1616,12 +1669,15 @@ class OrgChart:
                         else None,
                         node_depth=1,
                     )
-                    thinking = resolve_role_thinking(
-                        seat.role or head_role, self._cfg
-                    )
+                    thinking = resolve_role_thinking(seat.role or head_role, self._cfg)
                     model_info = {
-                        **(assignment.to_dict() if hasattr(assignment, "to_dict") else {}),
-                        "thinking": thinking if not isinstance(thinking, dict)
+                        **(
+                            assignment.to_dict()
+                            if hasattr(assignment, "to_dict")
+                            else {}
+                        ),
+                        "thinking": thinking
+                        if not isinstance(thinking, dict)
                         else thinking,
                     }
                 except Exception:  # noqa: BLE001
@@ -1673,11 +1729,13 @@ class OrgChart:
                         "live": node_out is not None,
                     },
                 )
-                hired.append({
-                    "seat": seat.to_dict(),
-                    "delegation": node_out,
-                    "model": model_info,
-                })
+                hired.append(
+                    {
+                        "seat": seat.to_dict(),
+                        "delegation": node_out,
+                        "model": model_info,
+                    }
+                )
         return {
             "ok": True,
             "hired": hired,
@@ -1777,8 +1835,13 @@ class OrgChart:
                 # Patch path into last wind_down event + artifact before write
                 artifact_path = str(path)
                 wind_payload["artifact_path"] = artifact_path
-                if self._events and self._events[-1].get("corp_event") == CORP_EVENT_WIND_DOWN:
-                    self._events[-1].setdefault("payload", {})["artifact_path"] = artifact_path
+                if (
+                    self._events
+                    and self._events[-1].get("corp_event") == CORP_EVENT_WIND_DOWN
+                ):
+                    self._events[-1].setdefault("payload", {})["artifact_path"] = (
+                        artifact_path
+                    )
                     artifact["events"] = list(self._events)
                 tmp.write_text(json.dumps(artifact, indent=2), encoding="utf-8")
                 tmp.replace(path)
@@ -1995,7 +2058,6 @@ def get_org_chart(
     board: Any | None = None,
     mission_goals: list[str] | None = None,
     on_event: Callable[..., None] | None = None,
-    provider: Any | None = None,
     runs_dir: Path | None = None,
 ) -> OrgChart | None:
     """Return the shared OrgChart for *run_id* (create on demand)."""
@@ -2013,8 +2075,6 @@ def get_org_chart(
                 ]
             if on_event is not None and chart.on_event is None:
                 chart.on_event = on_event
-            if provider is not None and chart.provider is None:
-                chart.provider = provider
             if runs_dir is not None and chart._runs_dir is None:
                 chart._runs_dir = runs_dir
             return chart
@@ -2026,7 +2086,6 @@ def get_org_chart(
             board=board,
             mission_goals=mission_goals,
             on_event=on_event,
-            provider=provider,
             runs_dir=runs_dir,
         )
         _CHARTS[rid] = chart
@@ -2054,7 +2113,6 @@ def build_corporate_org(
     mission_goals: list[str] | None = None,
     force: bool | None = None,
     on_event: Callable[..., None] | None = None,
-    provider: Any | None = None,
     runs_dir: Path | None = None,
     seat_heads: bool = False,
     delegate_fn: Callable[..., Any] | None = None,
@@ -2095,7 +2153,6 @@ def build_corporate_org(
         board=board,
         mission_goals=mission_goals,
         on_event=on_event,
-        provider=provider,
         runs_dir=runs_dir,
     )
     assert chart is not None
@@ -2121,7 +2178,6 @@ def auto_activate_corporate(
     board: Any | None = None,
     mission_goals: list[str] | None = None,
     on_event: Callable[..., None] | None = None,
-    provider: Any | None = None,
     runs_dir: Path | None = None,
     delegate_fn: Callable[..., Any] | None = None,
     seat_heads: bool = True,
@@ -2142,7 +2198,6 @@ def auto_activate_corporate(
         mission_goals=mission_goals,
         force=force,  # None → respect corporate_mode; True → swarm force
         on_event=on_event,
-        provider=provider,
         runs_dir=runs_dir,
         seat_heads=seat_heads,
         delegate_fn=delegate_fn,

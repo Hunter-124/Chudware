@@ -30,21 +30,24 @@ Event emission:
   Only the 8 frozen §11 event types are used (dag.node.started,
   dag.node.done, dag.node.failed, dag.node.paused).  No new event types.
 """
+
 from __future__ import annotations
 
-from contextlib import contextmanager
-import logging
+import hashlib
 import os
 import time
-from typing import Any, Callable, Iterator, Optional
+from typing import Any, Callable, Optional
 
-_LOG = logging.getLogger(__name__)
 
 # Advisory engine / foreman (T-W5, Pillar 20): after a node step, the foreman runs
 # the stage battery over the node's doc (if it carries one) and the advisory block
 # is attached to output_state["advisory"] for injection into the next node's
 # context pack.  Gated by CHUDWARE_ADVISOR (default on); best-effort.
-_ADVISOR_ENABLED = os.environ.get("CHUDWARE_ADVISOR", "1") not in ("0", "false", "False")
+_ADVISOR_ENABLED = os.environ.get("CHUDWARE_ADVISOR", "1") not in (
+    "0",
+    "false",
+    "False",
+)
 
 # node_type → advisory stage (the stage whose battery the foreman runs post-step).
 _NODE_TYPE_STAGE: dict[str, str] = {
@@ -75,14 +78,25 @@ _DONE_REASONS = frozenset(["confirmed", "stabilized"])
 # tool_budget.completion_cap_for_subagent) can genuinely fit the directive. It
 # used to arrive as ``no_code`` and escalate immediately, attributing a provider
 # output cap to model inaction.
-_RETRY_REASONS = frozenset([
-    "max_iters", "phase_step_cap", "guardrail_blocked", "blocked",
-    "context_overflow", "reply_truncated",
-])
+_RETRY_REASONS = frozenset(
+    [
+        "max_iters",
+        "phase_step_cap",
+        "guardrail_blocked",
+        "blocked",
+        "context_overflow",
+        "reply_truncated",
+    ]
+)
 # stop_reason values that map to escalate (failed build / no model output / auth)
-_ESCALATE_REASONS = frozenset([
-    "failed", "no_code", "provider_auth", "escalated",
-])
+_ESCALATE_REASONS = frozenset(
+    [
+        "failed",
+        "no_code",
+        "provider_auth",
+        "escalated",
+    ]
+)
 
 # ---------------------------------------------------------------------------
 # Agent function type
@@ -101,73 +115,47 @@ EmitFn = Optional[Callable[[str, dict[str, Any]], None]]
 
 
 # ---------------------------------------------------------------------------
-# Default agent function (wraps services/agent/loop.run)
+# Default Chudcode role-turn function
 # ---------------------------------------------------------------------------
 
-class _StubAgentResult:
-    """Minimal AgentRun-like object returned by the T-A1 stub path."""
-    def __init__(self) -> None:
-        self.stop_reason = "confirmed"
-        self.success = True
-        self.final_code = None
-        self.result = None
 
+def make_default_agent_fn(
+    ledger=None,
+    mission_dispatch=None,
+    provider=None,
+    delegation_tree=None,
+    on_event=None,
+) -> "Callable[[str, dict[str, Any]], Any]":
+    """Return the default Chudcode-backed DAG agent function with run state bound.
 
-def make_default_agent_fn(ledger=None,
-                          mission_dispatch=None,
-                          provider=None,
-                          delegation_tree=None,
-                          on_event=None) -> "Callable[[str, dict[str, Any]], Any]":
-    """Return the default tool-executing agent_fn with *ledger* bound (T-W30).
+    The ledger, mission dispatcher, delegation tree, and event sink stay attached
+    to every node so tool calls and handoffs retain their existing run lineage.
+    ``provider`` is retained only for an explicitly offline node; online nodes
+    never construct or invoke a Python provider.
 
-    The mission pipeline (loop.run_mission) uses this to thread its run ledger
-    into every node's agent turn, so each turn's tool calls / handoffs land as
-    ``agent_turn`` events — the inspectability half of the execution-reality
-    contract.  A standalone DAG run (no ledger) gets the same behaviour minus
-    the events.
-
-    *provider* (optional): when given, EVERY node run through the returned
-    agent_fn uses this exact provider instance instead of re-resolving one from
-    ambient config. This is the fix for the historical mission-tier leak:
-    ``loop.run_mission(request, provider, ...)`` already resolves the provider
-    the mission should run on (e.g. a gym cell's bundled local-tier model), but
-    previously only used it for INTAKE — every internal DAG node independently
-    called the bare ``config.get_provider()`` here and silently fell through to
-    the ambient config.json / ``CHUDWARE_PROVIDER`` default (typically a cloud
-    provider), regardless of the tier the mission was started with.
-    ``loop.run_mission`` now passes its own *provider* through to this
-    constructor so internal nodes stay on it. Callers that build a graph
-    without an in-hand Provider object (mission_start/dag_run over MCP) can
-    instead record a ``tier`` on the node/graph inputs — see
-    ``_resolve_provider`` below, which falls back to
-    ``services.agent.tiers.provider_for_tier`` for that path.
-
-    T-W32: when a *ledger* is bound and no explicit *mission_dispatch* is given,
-    a run-scoped :class:`services.agent.mission_dispatch.MissionDispatch` is built
-    from it, so run-scoped tools (ledger_get/ledger_note, dag_plan, ask_user,
-    delegate, part_search) resolve against THIS run instead of erroring out of
-    the process-wide registry.  Best-effort: a failure to build the dispatcher
-    never blocks node execution (turns just lack the mission layer)."""
-    # Phase 4 (M11): *delegation_tree* + *on_event* thread the mission's live
-    # delegation layer into the dispatch, so a node agent that calls ``delegate``
-    # actually spawns a registry-listed sub-agent (streaming ``agent.spawn`` live
-    # through *on_event*) and — when *provider* is bound — RUNS it synchronously
-    # with GUI steering consumed at its turn boundaries.
+    When a ledger is bound and no dispatcher is supplied, this creates the same
+    run-scoped mission tool surface used by nested roles.
+    """
+    # Thread the mission's live delegation layer into the Chudcode host-tool
+    # dispatcher. Provider execution itself belongs to Chudcode.
     if mission_dispatch is None and ledger is not None:
         try:
             from services.agent.mission_dispatch import MissionDispatch  # noqa: PLC0415
             from services.agent.corporate import get_org_chart  # noqa: PLC0415
+
             rid = getattr(ledger, "run_id", "") or ""
             org = get_org_chart(rid, create=False) if rid else None
             if org is not None:
                 if on_event is not None and org.on_event is None:
                     org.on_event = on_event
-                if provider is not None and org.provider is None:
-                    org.provider = provider
             mission_dispatch = MissionDispatch(
-                run_id=rid, ledger=ledger,
-                delegation_tree=delegation_tree, provider=provider,
-                on_event=on_event, org_chart=org)
+                run_id=rid,
+                ledger=ledger,
+                delegation_tree=delegation_tree,
+                provider=None,
+                on_event=on_event,
+                org_chart=org,
+            )
             # Live-hire heads once a real dispatch+tree exists (gap 2).
             if (
                 org is not None
@@ -176,10 +164,10 @@ def make_default_agent_fn(ledger=None,
             ):
                 try:
                     forming = [
-                        s for s in org.seats.values()
-                        if s.rank == "head" and (
-                            s.status == "forming" or not s.delegation_node
-                        )
+                        s
+                        for s in org.seats.values()
+                        if s.rank == "head"
+                        and (s.status == "forming" or not s.delegation_node)
                     ]
                     if forming:
                         org.seat_heads(delegate_fn=mission_dispatch.delegate)
@@ -189,758 +177,295 @@ def make_default_agent_fn(ledger=None,
             mission_dispatch = None
 
     def _agent_fn(request: str, context_pack: dict[str, Any]) -> Any:
-        return _default_agent_fn(request, context_pack, ledger=ledger,
-                                 mission_dispatch=mission_dispatch,
-                                 provider=provider)
+        return _default_agent_fn(
+            request,
+            context_pack,
+            ledger=ledger,
+            mission_dispatch=mission_dispatch,
+            provider=provider,
+        )
+
     return _agent_fn
 
 
-def _resolve_provider(context_pack: dict[str, Any], provider=None):
-    """Resolve the provider for one node's agent turn.
-
-    Priority (highest first) — mega-5 SuperGrok quota fix:
-      1. Difficulty-aware auto / ai_roles pick via ``role_models`` (full enabled
-         provider set). Leaf / low min_rank work must NOT inherit the mission's
-         frontier xAI binding.
-      2. *provider* injected by the caller — fallback when auto-pick fails
-         (keeps gym local-tier missions from crashing; never overrides a
-         successful cheaper auto pick).
-      3. A ``tier`` recorded on this node / context pack via
-         ``services.agent.tiers.provider_for_tier``.
-      4. Ambient ``config.get_provider()`` default.
-    """
-    from services.agent.role_models import clamp_provider_effort  # noqa: PLC0415
+def _resolve_role_settings(
+    context_pack: dict[str, Any],
+    *,
+    injected: Any = None,
+    ledger: Any = None,
+) -> dict[str, Any]:
+    """Resolve CAD role/model governance without constructing a provider."""
+    from services.agent import config as agent_config  # noqa: PLC0415
+    from services.agent import role_models  # noqa: PLC0415
+    from services.agent.agent_events import emit_event  # noqa: PLC0415
 
     node_inputs = context_pack.get("node_inputs") or {}
-
-    def _ambient():
-        """The provider this node gets when no role-specific pick applies:
-        caller-injected → node tier → ambient config default."""
-        if provider is not None:
-            return clamp_provider_effort(provider)
-        tier = node_inputs.get("tier") or context_pack.get("tier")
-        if tier:
-            from services.agent.tiers import provider_for_tier  # noqa: PLC0415
-            return clamp_provider_effort(provider_for_tier(tier))
-        from services.agent import config  # noqa: PLC0415
-        return clamp_provider_effort(config.get_provider())
-    # WS2/WS4 + mega-5: difficulty-aware pick first (even without ai_roles).
-    try:
-        from services.agent.role_models import (  # noqa: PLC0415
-            cost_tier_for,
-            harness_role_for_mission_role,
-            min_rank_for_difficulty,
-            resolve_for_node,
-            resolve_role_model,
-        )
-        from services.agent import config as agent_config  # noqa: PLC0415
-        role = (
-            context_pack.get("role_id")
-            or node_inputs.get("role")
-            or context_pack.get("role")
-            or "default"
-        )
-        harness_role = harness_role_for_mission_role(str(role))
-
-        try:
-            depth = int(
-                context_pack.get("depth")
-                or node_inputs.get("depth")
-                or 0
-            )
-        except (TypeError, ValueError):
-            depth = 0
-        task_class = (
-            context_pack.get("task_class")
-            or node_inputs.get("task_class")
-            or context_pack.get("taskClass")
-        )
-        risk = context_pack.get("risk") or node_inputs.get("risk")
-        min_rank = min_rank_for_difficulty(
-            task_class=str(task_class) if task_class else None,
-            node_depth=depth,
-            risk=str(risk) if risk else None,
-        )
-        cfg = dict(agent_config.load_config() or {})
-        assignment = resolve_for_node(harness_role, context_pack, cfg=cfg)
-        if assignment is None or (
-            assignment.mode == "fixed"
-            and str(assignment.provider).startswith("xai")
-            and min_rank < 5
-            and depth > 0
-        ):
-            try:
-                assignment = resolve_role_model(
-                    harness_role,
-                    cfg,
-                    task_class=str(task_class) if task_class else None,
-                    node_depth=depth,
-                    risk=str(risk) if risk else None,
-                    min_rank=min_rank,
-                )
-            except Exception:  # noqa: BLE001
-                if assignment is None:
-                    raise
-        if assignment is not None:
-            cfg_pick = dict(cfg)
-            cfg_pick["model"] = assignment.model
-            # Cap reasoning effort for non-frontier ranks (quota + cost) unless
-            # the role has a concrete thinking level or dispatcher set effort.
-            rank = int(assignment.rank or min_rank or 3)
-            dispatch_effort = (
-                context_pack.get("thinking")
-                or context_pack.get("reasoning_effort")
-                or node_inputs.get("thinking")
-                or node_inputs.get("reasoning_effort")
-            )
-            try:
-                from services.agent.role_models import (  # noqa: PLC0415
-                    resolve_role_thinking,
-                )
-                resolved_effort = resolve_role_thinking(
-                    harness_role,
-                    cfg,
-                    request=str(
-                        context_pack.get("request")
-                        or node_inputs.get("request")
-                        or node_inputs.get("brief")
-                        or ""
-                    ),
-                    task_class=str(task_class) if task_class else None,
-                    node_depth=depth,
-                    risk=str(risk) if risk else None,
-                    min_rank=min_rank,
-                    dispatch_effort=(
-                        str(dispatch_effort) if dispatch_effort else None
-                    ),
-                    rank=rank,
-                )
-                if resolved_effort:
-                    cfg_pick["reasoning_effort"] = resolved_effort
-            except Exception:  # noqa: BLE001 — legacy rank heuristic
-                if rank <= 2:
-                    cfg_pick["reasoning_effort"] = "low"
-                elif rank <= 3:
-                    cfg_pick["reasoning_effort"] = "medium"
-            # Retries are cheaper: drop one effort band (only when not pinned
-            # to a concrete role thinking level).
-            try:
-                from services.agent.role_models import get_role_thinking  # noqa: PLC0415
-                role_think = get_role_thinking(harness_role, cfg)
-            except Exception:  # noqa: BLE001
-                role_think = "auto"
-            try:
-                retry_rem = int(context_pack.get("retry_remaining") or 0)
-            except (TypeError, ValueError):
-                retry_rem = 0
-            # Heuristic: if already retried (retry_remaining small relative to
-            # typical budget 2+), force low effort — unless role pins thinking.
-            if role_think == "auto" and (
-                retry_rem == 1 or context_pack.get("retry_cheap")
-            ):
-                cfg_pick["reasoning_effort"] = "low"
-            # Ceiling: a DAG node/sub-agent NEVER runs above "high". cfg_pick
-            # inherits the user's global config, so a Settings-level max/xhigh
-            # leaked in whenever the resolver returned None.
-            try:
-                from services.agent.role_models import (  # noqa: PLC0415
-                    clamp_subagent_effort,
-                )
-                _raw_eff = cfg_pick.get("reasoning_effort")
-                if _raw_eff:
-                    cfg_pick["reasoning_effort"] = clamp_subagent_effort(_raw_eff)
-            except Exception:  # noqa: BLE001 — ceiling is best-effort
-                pass
-            if assignment.provider == "ollama":
-                # OpenAI-compatible local Ollama endpoint.
-                ocfg = dict(cfg_pick.get("ollama") or {})
-                ocfg.setdefault("base_url", "http://127.0.0.1:11434/v1")
-                cfg_pick["ollama"] = ocfg
-                oai = dict(cfg_pick.get("openai") or {})
-                oai["base_url"] = ocfg.get("base_url") or "http://127.0.0.1:11434/v1"
-                oai.setdefault("api_key", "ollama")
-                cfg_pick["openai"] = oai
-            try:
-                context_pack["role_model"] = {
-                    **assignment.to_dict(),
-                    "min_rank": min_rank,
-                    "cost_tier": cost_tier_for(
-                        assignment.provider, assignment.model),
-                    "depth": depth,
-                    "task_class": task_class or "unknown",
-                    "reasoning_effort": cfg_pick.get("reasoning_effort"),
-                }
-            except Exception:  # noqa: BLE001
-                pass
-            # mega-6: emit model_assignment for EVERY DAG node resolve, not only
-            # delegate spawns — live mega-6 had 0 assignment rows despite auto_pick.
-            try:
-                from services.agent import agent_events as _ae  # noqa: PLC0415
-                node_id = str(
-                    context_pack.get("node_id")
-                    or node_inputs.get("id")
-                    or role_s
-                    or "node"
-                )
-                _k, _p = _ae.model_assignment_event(
-                    node_id,
-                    depth=depth,
-                    task_class=str(task_class) if task_class else "unknown",
-                    min_rank=min_rank,
-                    picked_model=assignment.model,
-                    picked_provider=assignment.provider,
-                    cost_tier=cost_tier_for(
-                        assignment.provider, assignment.model),
-                    mode=assignment.mode,
-                    rank=assignment.rank,
-                    reason=assignment.reason,
-                    role=str(role),
-                    actor=str(
-                        context_pack.get("node_name")
-                        or context_pack.get("role_id")
-                        or role
-                    ),
-                )
-                sink = context_pack.get("_event_sink")
-                _ae.emit_event(_k, _p, live=sink, journal=None)
-                ledger = context_pack.get("ledger")
-                if ledger is not None:
-                    try:
-                        ledger.append(
-                            str(context_pack.get("node_name") or role or "agent"),
-                            "note",
-                            {
-                                "event": "model_assignment",
-                                **{k: _p.get(k) for k in (
-                                    "depth", "task_class", "min_rank",
-                                    "picked_model", "picked_provider",
-                                    "cost_tier", "mode", "rank", "reason",
-                                    "role",
-                                )},
-                            },
-                        )
-                    except Exception:  # noqa: BLE001
-                        pass
-            except Exception:  # noqa: BLE001 — never block on telemetry
-                pass
-            if assignment.is_session_default:
-                # Role follows the chat composer: provider/model are empty by
-                # construction, so there is nothing to build. Use whatever the
-                # mission was launched with.
-                return _ambient()
-            prov_name = assignment.provider
-            if prov_name == "ollama":
-                prov_name = "openai"
-                cfg_pick.setdefault(
-                    "api_key",
-                    (cfg_pick.get("openai") or {}).get("api_key") or "ollama",
-                )
-            try:
-                return clamp_provider_effort(
-                    agent_config.get_provider(name=prov_name, cfg=cfg_pick)
-                )
-            except Exception as exc:  # noqa: BLE001 — try degrade chain
-                # mega-6: local leaf may need pull / not running — never block.
-                # Prefer openrouter free when keyed, else fall through to injected.
-                try:
-                    from services.agent.providers import token_usage as _tu  # noqa: PLC0415
-                    _ = _tu  # silence unused when import works
-                except Exception:  # noqa: BLE001
-                    pass
-                err_s = f"{type(exc).__name__}: {exc}".lower()
-                local_fail = (
-                    assignment.provider in ("ollama", "llamacpp", "lmstudio", "openai")
-                    or "connection" in err_s
-                    or "not found" in err_s
-                    or "model" in err_s and "load" in err_s
-                )
-                if local_fail:
-                    or_cfg = dict(cfg.get("openrouter") or {})
-                    or_key = (
-                        or_cfg.get("api_key")
-                        or cfg.get("openrouter_api_key")
-                        or cfg.get("api_key")
-                    )
-                    import os as _os  # noqa: PLC0415
-                    or_key = or_key or _os.environ.get("OPENROUTER_API_KEY")
-                    if or_key:
-                        # mega-25 rebind: mistralai/mistral-small:free is dead
-                        # (404 no endpoints). Prefer paid deepseek mid, then
-                        # free models that still resolve (mega-24 hold).
-                        for mid in (
-                            "deepseek/deepseek-chat-v3.1",
-                            "google/gemma-3-27b-it:free",
-                            "nvidia/nemotron-ultra:free",
-                        ):
-                            try:
-                                cfg_or = dict(cfg)
-                                cfg_or["api_key"] = or_key
-                                cfg_or["model"] = mid
-                                cfg_or["openrouter"] = {
-                                    **or_cfg, "api_key": or_key,
-                                }
-                                prov = agent_config.get_provider(
-                                    name="openrouter", cfg=cfg_or)
-                                try:
-                                    context_pack["role_model"] = {
-                                        **(context_pack.get("role_model") or {}),
-                                        "provider": "openrouter",
-                                        "model": mid,
-                                        "degraded_from": assignment.provider,
-                                        "degrade_reason": str(exc)[:200],
-                                    }
-                                except Exception:  # noqa: BLE001
-                                    pass
-                                return clamp_provider_effort(prov)
-                            except Exception:  # noqa: BLE001
-                                continue
-                # fall through to injected / tier / ambient
-    except Exception:  # noqa: BLE001 — never block node on role_models
-        pass
-
-    return _ambient()
-
-
-def _default_agent_fn(request: str, context_pack: dict[str, Any], *,
-                      ledger=None, mission_dispatch=None, provider=None) -> Any:
-    """Run a real tool-executing agent turn for this DAG node (T-W30).
-
-    Resolves the provider via ``_resolve_provider`` (an injected provider, else a
-    node/graph-recorded tier via ``tiers.provider_for_tier``, else the ambient
-    ``config.get_provider`` seam — honours ``CHUDWARE_PROVIDER`` / routing.yaml /
-    the local llama.cpp default), then runs a bounded tool-calling turn
-    (``agent_turn.run_turn``): the model proposes MCP tool calls, they are
-    dispatched against the live engine, results are fed back, and a structured
-    handoff is returned.  The node's ``allowed_tools`` scope the callable tools.
-
-    mega-8 (advisor Q3): cheap local/tiny leaves skip the multi-turn tool loop
-    and take a one-shot structured envelope fill-in. On schema fail → count
-    leaf_miss and fall through to the existing frontier degrade / tool-loop path.
-
-    Fail-closed on genuine unavailability (no provider constructible — e.g. no model
-    server and no API key): return a NON-success stub so the node ESCALATES rather
-    than silently reporting a fabricated success.  A raised exception is surfaced by
-    ``run()`` as an escalate verdict."""
-    from services.agent import agent_turn  # noqa: PLC0415
-
-    node_name = context_pack.get("node_name", "dag_node")
-    # mega-6: make ledger available to _resolve_provider for model_assignment notes.
-    if ledger is not None and context_pack.get("ledger") is None:
-        try:
-            context_pack["ledger"] = ledger
-        except Exception:  # noqa: BLE001
-            pass
-    # mega-8: seed run_id from the bound ledger when the pack is missing it
-    # (graph_loader historically assembled packs without state.run_id).
-    if ledger is not None and not context_pack.get("run_id"):
-        try:
-            rid = getattr(ledger, "run_id", None)
-            if rid:
-                context_pack = dict(context_pack)
-                context_pack["run_id"] = rid
-        except Exception:  # noqa: BLE001
-            pass
-    try:
-        resolved_provider = _resolve_provider(context_pack, provider)
-    except Exception as exc:  # noqa: BLE001 — no constructible provider
-        # Do NOT return a confirmed stub: that is the fabrication bug. Signal a
-        # non-success so the node escalates and the failure is visible.
-        return _UnavailableAgentResult(f"no provider available: {exc}")
-
-    # mega-8: cheap-leaf one-shot envelope (advisor Q3 primary). Local/tiny
-    # models on leaf task classes do NOT enter the multi-turn tool loop.
-    oneshot = _maybe_run_cheap_leaf_oneshot(
-        request, context_pack, resolved_provider,
-        ledger=ledger, node_name=node_name,
+    role = str(
+        context_pack.get("role_id")
+        or context_pack.get("role")
+        or node_inputs.get("role")
+        or "general_agent"
     )
-    if oneshot is not None:
-        return oneshot
-    # On oneshot miss: fall through to tool-loop on a frontier/mid provider
-    # (existing degrade path) rather than re-looping the same tiny model.
-    if context_pack.get("leaf_oneshot_miss"):
-        upgraded = _frontier_fallback_provider(context_pack, provider)
-        if upgraded is not None:
-            resolved_provider = upgraded
+    harness_role = role_models.harness_role_for_mission_role(role)
+    task_class = context_pack.get("task_class") or node_inputs.get("task_class")
+    risk = context_pack.get("risk") or node_inputs.get("risk")
+    try:
+        depth = int(context_pack.get("depth") or node_inputs.get("depth") or 0)
+    except (TypeError, ValueError):
+        depth = 0
+    try:
+        cfg = dict(agent_config.load_config() or {})
+    except Exception:  # noqa: BLE001 — Chudcode still receives explicit settings
+        cfg = {}
 
-    allowed_tools = context_pack.get("allowed_tools")
-    # A compiled DAG node is a child lane. Apply its own fs floor before
-    # budgeting and schema rendering; agent_turn receives the same identity and
-    # reapplies the policy defensively.
-    try:
-        from services.agent.copilot_mode_tools import apply_mode_tools  # noqa: PLC0415
-        _mode = (
-            context_pack.get("mode")
-            or getattr(mission_dispatch, "mode", None)
-        )
-        _plan_only = (
-            context_pack.get("plan_only")
-            if "plan_only" in context_pack
-            else getattr(mission_dispatch, "plan_only", None)
-        )
-        allowed_tools = apply_mode_tools(
-            _mode, allowed_tools,
-            plan_only=bool(_plan_only) if _plan_only is not None else None,
-            subagent=True,
-        )
-    except Exception:  # noqa: BLE001 — policy assembly is best-effort
-        pass
-    # SAME floor the delegate lane applies (copilot_mode_tools.apply_meta_tool_floor):
-    # a restricted node must SEE enable_tools / list_tool_categories, not merely
-    # be able to call them. agent_turn adds them to its dispatch gate either
-    # way, so skipping this did not make them uncallable — it made them
-    # invisible, and every compiled DAG node ran confined to its 14 card tools
-    # while the delegate path expanded freely. Must run BEFORE render_tools_block.
-    try:
-        from services.agent.copilot_mode_tools import (  # noqa: PLC0415
-            apply_meta_tool_floor,
-        )
-        _floored = apply_meta_tool_floor(
-            allowed_tools,
-            advisor=(context_pack.get("advisor")
-                     if "advisor" in context_pack
-                     else getattr(mission_dispatch, "advisor", None)),
-        )
-        if _floored is not None:
-            allowed_tools = _floored
-    except Exception:  # noqa: BLE001 — the floor never blocks a node
-        pass
-    # Per-node tool budget: context pack value, else an env cap (lets a bench cap the
-    # turn length for a time-boxed real run), else the agent_turn default.
-    max_tools = context_pack.get("max_tools_per_turn")
-    if max_tools is None:
-        env_cap = os.environ.get("CHUDWARE_AGENT_MAX_TOOL_CALLS")
-        if env_cap:
-            try:
-                max_tools = int(env_cap)
-            except ValueError:
-                max_tools = None
-    # ...then the producer floor. `max_tools_per_turn` has no writer anywhere in
-    # the tree, so before this every graph node — model3d, cam_programmer,
-    # ecad_engineer alike — fell through to agent_turn's flat, role-blind
-    # default of 16, and the BUILD floor applied on the delegate path never
-    # reached graph execution at all. Same helper both paths (tool_budget).
-    if not os.environ.get("CHUDWARE_AGENT_MAX_TOOL_CALLS"):
+    existing = context_pack.get("role_model")
+    row = dict(existing) if isinstance(existing, dict) else {}
+    assignment = None
+    if not (row.get("provider") and row.get("model")):
         try:
-            from services.agent import tool_budget as _tb  # noqa: PLC0415
-            max_tools = _tb.floor_for(
-                context_pack.get("role_id") or node_name,
-                allowed_tools,
-                str(context_pack.get("phase") or "") or None,
-                base=max_tools,
-            )
-        except Exception:  # noqa: BLE001 — floor is best-effort, never blocks
-            pass
-    # ...then the Settings → AI "sub-agent tool-call budget" slider
-    # (agent.subagent_tool_call_budget), through the SAME helper and in the SAME
-    # last position as MissionDispatch._run_subagent_turn. This lane never read
-    # that config key at all, so the one GUI slider governed the `delegate` lane
-    # and had ZERO effect on every compiled-DAG (mission_start) role while
-    # presenting itself as uniform. It stays a SOFT convergence threshold: the
-    # hard runaway ceiling remains agent_turn's alone.
-    #
-    # Deliberately NOT gated on CHUDWARE_AGENT_MAX_TOOL_CALLS: the delegate lane
-    # does not read that env var, so gating here would leave the two lanes
-    # disagreeing on exactly the state this fix exists to unify. An explicit
-    # user setting outranks a bench cap; the slider defaults to 0 (derive
-    # automatically), so an unconfigured bench box is untouched.
-    try:
-        from services.agent.mission_dispatch import (  # noqa: PLC0415
-            configured_subagent_tool_budget,
-        )
-        max_tools = configured_subagent_tool_budget(max_tools)
-    except Exception:  # noqa: BLE001 — automatic derivation is the fallback
-        pass
+            assignment = role_models.resolve_for_node(role, context_pack, cfg=cfg)
+            if assignment is None:
+                assignment = role_models.resolve_role_model(
+                    harness_role,
+                    cfg,
+                    task_class=str(task_class) if task_class else None,
+                    node_depth=depth,
+                    risk=str(risk) if risk else None,
+                )
+        except Exception:  # noqa: BLE001 — use session/injected identifiers
+            assignment = None
 
-    # T-W32: render the §9.1 tools slot — trimmed schemas for EXACTLY the node's
-    # allowed tools, within the tier's budgets.tools, resolved through the SAME
-    # mission-first resolver the dispatcher uses.  Measured cost is logged to the
-    # ledger (one tools_slot event per node turn) — recorded, never invented.
-    profile = _tier_profile(context_pack)
+    injected_provider = str(
+        getattr(injected, "name", None) or getattr(injected, "provider", None) or ""
+    ).strip()
+    injected_model = str(getattr(injected, "model", None) or "").strip()
+    if assignment is not None:
+        try:
+            row.update(assignment.to_dict())
+        except Exception:  # noqa: BLE001
+            pass
+        if getattr(assignment, "provider", None):
+            row["provider"] = str(assignment.provider)
+        if getattr(assignment, "model", None):
+            row["model"] = str(assignment.model)
+    if not row.get("provider"):
+        row["provider"] = injected_provider or str(cfg.get("provider") or "")
+    if not row.get("model"):
+        row["model"] = injected_model or str(cfg.get("model") or "")
+
+    min_rank = role_models.min_rank_for_difficulty(
+        task_class=str(task_class) if task_class else None,
+        node_depth=depth,
+        risk=str(risk) if risk else None,
+    )
+    row["min_rank"] = min_rank
+    if row.get("provider"):
+        row["cost_tier"] = role_models.cost_tier_for(
+            str(row["provider"]), str(row.get("model") or "")
+        )
+    effort = (
+        getattr(injected, "reasoning_effort", None)
+        if assignment is None and injected is not None
+        else None
+    )
+    if effort is None:
+        try:
+            effort = role_models.resolve_role_thinking(
+                harness_role,
+                cfg,
+                task_class=str(task_class) if task_class else None,
+                node_depth=depth,
+                risk=str(risk) if risk else None,
+                min_rank=min_rank,
+                rank=getattr(assignment, "rank", None),
+            )
+        except Exception:  # noqa: BLE001
+            effort = None
+    if context_pack.get("retry_cheap"):
+        effort = "low"
+    if effort is None:
+        effort = getattr(injected, "reasoning_effort", None) or cfg.get(
+            "reasoning_effort"
+        )
+    effort = role_models.clamp_subagent_effort(effort)
+    if effort is not None:
+        row["reasoning_effort"] = effort
+
+    context_pack["role_model"] = row
+    event = {"event": "model_assignment", **row}
+    actor = str(context_pack.get("node_name") or context_pack.get("node_id") or role)
+    target_ledger = ledger or context_pack.get("ledger")
+    if target_ledger is not None:
+        try:
+            target_ledger.append(actor, "agent_turn", event)
+        except Exception:  # noqa: BLE001
+            pass
+    emit_event(
+        "agent.model_assignment",
+        event,
+        live=context_pack.get("_event_sink"),
+        journal=None,
+    )
+    return {
+        key: row[key]
+        for key in ("provider", "model", "reasoning_effort")
+        if row.get(key) not in (None, "")
+    }
+
+
+def _default_agent_fn(
+    request: str,
+    context_pack: dict[str, Any],
+    *,
+    ledger=None,
+    mission_dispatch=None,
+    provider=None,
+) -> Any:
+    """Run one DAG node through the shared Chudcode role-turn service.
+
+    A node is a persistent child lane keyed by its parent session/run and node
+    identity.  Only an explicitly offline node may reuse the deterministic local
+    provider loop; an injected legacy provider is ignored for online execution.
+    """
+    from services.agent.chudcode_roles import run_role_turn  # noqa: PLC0415
     from services.agent.tool_budget import (  # noqa: PLC0415
         completion_cap_for_subagent,
     )
-    completion_cap = completion_cap_for_subagent(profile)
-    tools_text = None
-    if allowed_tools:
-        try:
-            from services.agent.tool_schemas import render_tools_block  # noqa: PLC0415
-            tools_text, meta = render_tools_block(
-                list(allowed_tools),
-                resolver=agent_turn.resolver_for(mission_dispatch),
-                budget_tokens=(profile.budgets.tools if profile else None),
-                trim=(profile.tool_schema_trim if profile else True))
-            if ledger is not None and tools_text:
-                try:
-                    ledger.append(node_name, "agent_turn", {
-                        "event": "tools_slot",
-                        "tier": profile.name if profile else None, **meta})
-                except Exception:  # noqa: BLE001 — logging is best-effort
-                    pass
-        except Exception:  # noqa: BLE001 — schema rendering must never block a node
-            tools_text = None
 
-    return agent_turn.run_turn(
-        request=request, provider=resolved_provider, name=node_name,
-        allowed_tools=allowed_tools,
-        system_prompt=context_pack.get("role_system_prompt"),
-        max_tool_calls=max_tools,
-        max_tokens=completion_cap,
-        ledger=ledger, actor=node_name,
-        mission_dispatch=mission_dispatch, tools_text=tools_text,
-        # M20: thread the live event sink + span context so agent_turn emits
-        # `agent.tool_call` (target + latency) to BOTH the GUI stream and the
-        # per-run events.jsonl. run()/context_pack.assemble() seed these keys;
-        # absent → emission is a no-op (back-compat with standalone DAG runs).
-        on_event=context_pack.get("_event_sink"),
-        run_id=context_pack.get("run_id"),
-        node_id=context_pack.get("node_id"),
-        subagent_id=context_pack.get("node_id") or node_name,
-        capability=_capability_profile(profile),
-        tier=(profile.name if profile else None),
-        phase=context_pack.get("phase"),
-        task_class=context_pack.get("task_class"),
-    )
-
-
-def _maybe_run_cheap_leaf_oneshot(
-    request: str,
-    context_pack: dict[str, Any],
-    provider: Any,
-    *,
-    ledger=None,
-    node_name: str = "dag_node",
-) -> Any | None:
-    """One-shot structured envelope for genuinely no-tool cheap leaves.
-
-    Returns a TurnResult-like object on success, or None to fall through to the
-    multi-turn tool loop / frontier degrade path. Any non-empty effective
-    allowlist requires execution: a no-tool envelope cannot satisfy a role card
-    that grants named build, inspection, or verification tools. Schema failure
-    increments ``leaf_miss`` telemetry.
-    """
-    try:
-        from services.agent.role_models import (  # noqa: PLC0415
-            is_cheap_leaf_provider,
-            is_leaf_task_class,
-            parse_leaf_envelope_text,
-            record_leaf_miss,
-            validate_leaf_envelope,
-        )
-    except Exception:  # noqa: BLE001
-        return None
-
-    if context_pack.get("allowed_tools"):
-        return None
     node_inputs = context_pack.get("node_inputs") or {}
-    task_class = (
-        context_pack.get("task_class")
-        or node_inputs.get("task_class")
-        or ""
+    node_id = str(
+        context_pack.get("node_id")
+        or node_inputs.get("node_id")
+        or context_pack.get("node_name")
+        or "dag-node"
     )
-    if not is_leaf_task_class(str(task_class) if task_class else None):
-        return None
-
-    # Prefer role_model stamp from _resolve_provider; fall back to provider attrs.
-    rm = context_pack.get("role_model") or {}
-    prov_name = str(rm.get("provider") or getattr(provider, "name", "") or "")
-    model_name = str(rm.get("model") or getattr(provider, "model", "") or "")
-    # openai-compat ollama is stamped as openai after resolve — recover.
-    if prov_name == "openai" and (
-        "11434" in str(getattr(provider, "base_url", "") or "")
-        or "ollama" in model_name.lower()
-        or (rm.get("degraded_from") in (None, "") and model_name.endswith(":latest"))
-    ):
-        # Keep cheap if original assignment was ollama.
-        if str(rm.get("provider") or "") == "ollama" or "ollama" in model_name.lower():
-            prov_name = "ollama"
-    if rm.get("provider") == "ollama":
-        prov_name = "ollama"
-    if not is_cheap_leaf_provider(prov_name, model_name):
-        # Also accept cost_tier stamp ≤ 1 from assignment telemetry.
-        try:
-            ct = int(rm.get("cost_tier")) if rm.get("cost_tier") is not None else None
-        except (TypeError, ValueError):
-            ct = None
-        if ct is None or ct > 1:
-            return None
-
-    # Force-disable via env for tests / emergency.
-    if os.environ.get("CHUDWARE_LEAF_ONESHOT", "1") in ("0", "false", "False"):
-        return None
-
-    system = (
-        "You are a leaf worker filling a fixed JSON envelope. "
-        "Reply with ONE JSON object only (no tools, no prose). Schema:\n"
-        "{\n"
-        '  "goal": string,           // required: what this leaf achieves\n'
-        '  "ops": [object, ...],     // optional: concrete actions/ops\n'
-        '  "no_op": boolean,         // true only when nothing to do\n'
-        '  "reason": string,         // required when no_op=true\n'
-        '  "artifacts": [object, ...] // optional outputs\n'
-        "}\n"
-        "Rules: either non-empty ops[] OR (no_op=true AND non-empty reason). "
-        "Do not invent tool calls. Do not wrap in markdown unless needed."
+    run_id = str(context_pack.get("run_id") or node_inputs.get("run_id") or "")
+    session_root = str(
+        context_pack.get("session_id")
+        or context_pack.get("parent_session_id")
+        or run_id
+        or f"dag:{node_id}"
     )
-    if context_pack.get("role_system_prompt"):
-        system = (
-            str(context_pack["role_system_prompt"])[:1200]
-            + "\n\n---\nLEAF ONE-SHOT MODE (mandatory):\n"
-            + system
-        )
-    user_msg = (
-        f"Node request:\n{request}\n\n"
-        f"task_class={task_class}. Fill the leaf envelope JSON now."
+    parent_id = str(
+        context_pack.get("parent_id") or f"{run_id or session_root}:{node_id}"
     )
-    # Prefer agent_turn list-of-parts form so Anthropic-shaped providers work;
-    # OpenAI/ollama also accept plain strings after the mega-8 provider fix.
-    messages = [{"role": "user", "content": [{"type": "text", "text": user_msg}]}]
-    try:
-        reply = provider.complete(system, messages, max_tokens=800)
-    except Exception as exc:  # noqa: BLE001 — degrade to tool-loop / frontier
-        record_leaf_miss(1)
-        if ledger is not None:
-            try:
-                ledger.append(node_name, "agent_turn", {
-                    "event": "leaf_oneshot_miss",
-                    "error": str(exc)[:200],
-                    "task_class": task_class,
-                    "provider": prov_name,
-                    "model": model_name,
-                })
-            except Exception:  # noqa: BLE001
-                pass
-        # Signal caller to fall through; also stash so degrade path can fire.
-        context_pack["leaf_oneshot_miss"] = True
-        context_pack["leaf_oneshot_error"] = str(exc)[:200]
-        return None
-
-    env, errs = parse_leaf_envelope_text(str(reply or ""))
-    if env is None or errs:
-        # Double-check if reply was already a dict-like via validate.
-        if env is None:
-            record_leaf_miss(1)
-            if ledger is not None:
-                try:
-                    ledger.append(node_name, "agent_turn", {
-                        "event": "leaf_oneshot_miss",
-                        "errors": list(errs or [])[:8],
-                        "task_class": task_class,
-                        "provider": prov_name,
-                        "model": model_name,
-                        "reply_head": str(reply or "")[:240],
-                    })
-                except Exception:  # noqa: BLE001
-                    pass
-            context_pack["leaf_oneshot_miss"] = True
-            context_pack["leaf_oneshot_errors"] = list(errs or [])[:8]
-            return None
-
-    # Valid envelope → confirmed leaf handoff (no multi-turn tools).
-    handoff = {
-        "status": "done" if not env.get("no_op") else "done",
-        "summary": (
-            env.get("goal")
-            or ("no_op: " + str(env.get("reason") or ""))
-        )[:600],
-        "outputs": {
-            "leaf_envelope": env,
-            "one_shot": True,
-            "ops": env.get("ops") or [],
-            "no_op": bool(env.get("no_op")),
-            "reason": env.get("reason"),
-            "artifacts": env.get("artifacts") or [],
-            "reasoning_summary": (
-                "Cheap-leaf one-shot envelope (mega-8); no multi-turn tool loop."
-            ),
-        },
+    role = str(
+        context_pack.get("role_id")
+        or context_pack.get("role")
+        or node_inputs.get("role")
+        or "general_agent"
+    )
+    profile = _tier_profile(context_pack)
+    tier = (
+        context_pack.get("tier")
+        or node_inputs.get("tier")
+        or (profile.name if profile is not None else None)
+    )
+    capability = _capability_profile(profile)
+    offline = context_pack.get("offline") is True or node_inputs.get("offline") is True
+    role_run_id = (
+        "dag-node-"
+        + hashlib.sha256(
+            f"{run_id or session_root}|{node_id}".encode("utf-8")
+        ).hexdigest()[:24]
+    )
+    options: dict[str, Any] = {
+        "ledger": ledger,
+        "mission_dispatch": mission_dispatch,
+        "allowed_tools": context_pack.get("allowed_tools"),
+        "autonomy": context_pack.get("autonomy") or node_inputs.get("autonomy"),
+        "doc_id": node_inputs.get("doc_id") or context_pack.get("doc_id"),
+        "phase": context_pack.get("phase"),
+        "task_class": context_pack.get("task_class") or node_inputs.get("task_class"),
+        "node_id": node_id,
+        "subagent_id": node_id,
+        "mode": context_pack.get("mode"),
+        "plan_only": context_pack.get("plan_only"),
+        "workspace_dir": (
+            context_pack.get("workspace_dir")
+            or node_inputs.get("workspace_dir")
+            or node_inputs.get("project_dir")
+        ),
+        "project_dir": (
+            context_pack.get("project_dir")
+            or node_inputs.get("project_dir")
+            or node_inputs.get("workspace_dir")
+        ),
+        "categories": (
+            context_pack.get("categories")
+            or context_pack.get("enabled_categories")
+            or ()
+        ),
+        "offline": offline,
     }
-    if ledger is not None:
-        try:
-            ledger.append(node_name, "agent_turn", {
-                "event": "leaf_oneshot_ok",
-                "task_class": task_class,
-                "provider": prov_name,
-                "model": model_name,
-                "no_op": bool(env.get("no_op")),
-                "n_ops": len(env.get("ops") or []),
-            })
-        except Exception:  # noqa: BLE001
-            pass
-    return _LeafOneshotResult(handoff, env)
+    options["settings"] = _resolve_role_settings(
+        context_pack,
+        injected=provider,
+        ledger=ledger,
+    )
+    if offline and provider is not None:
+        options["offline_provider"] = provider
+
+    turn = run_role_turn(
+        request,
+        role,
+        session_id=session_root,
+        run_id=role_run_id,
+        parent_id=parent_id,
+        on_event=context_pack.get("_event_sink"),
+        options=options,
+        tier=tier,
+        capability=capability,
+        max_tokens=completion_cap_for_subagent(profile),
+        actor=context_pack.get("actor") or role,
+        close_session=False,
+    )
+    return _RoleTurnAgentResult(turn)
 
 
+class _RoleTurnAgentResult:
+    """AgentResult-compatible view over the shared role-turn result contract."""
 
-def _frontier_fallback_provider(context_pack: dict[str, Any], injected=None):
-    """After a cheap-leaf oneshot miss, pick a non-local provider for tool-loop.
-
-    Order: openrouter paid mid / free (if keyed) → injected mission provider
-    (if non-cheap) → None (keep current; ambient tool-loop still runs).
-
-    mega-25 rebind: never use mistralai/mistral-small:free (404 no endpoints
-    thrash on INTAKE/DELIVER after leaf_oneshot_miss).
-    """
-    try:
-        from services.agent import config as agent_config  # noqa: PLC0415
-        from services.agent.role_models import is_cheap_leaf_provider  # noqa: PLC0415
-        import os as _os  # noqa: PLC0415
-        cfg = dict(agent_config.load_config() or {})
-        or_cfg = dict(cfg.get("openrouter") or {})
-        or_key = (
-            or_cfg.get("api_key")
-            or cfg.get("openrouter_api_key")
-            or _os.environ.get("OPENROUTER_API_KEY")
+    def __init__(self, turn: Any) -> None:
+        payload = (
+            dict(turn)
+            if isinstance(turn, dict)
+            else {
+                "success": False,
+                "stop_reason": "provider_error",
+                "result": {"error": "Chudcode role turn returned a non-object result"},
+            }
         )
-        if or_key:
-            for mid in (
-                "deepseek/deepseek-chat-v3.1",
-                "google/gemma-3-27b-it:free",
-                "nvidia/nemotron-ultra:free",
-            ):
-                try:
-                    cfg_or = dict(cfg)
-                    cfg_or["api_key"] = or_key
-                    cfg_or["model"] = mid
-                    cfg_or["openrouter"] = {**or_cfg, "api_key": or_key}
-                    prov = agent_config.get_provider(
-                        name="openrouter", cfg=cfg_or)
-                    try:
-                        context_pack["role_model"] = {
-                            **(context_pack.get("role_model") or {}),
-                            "provider": "openrouter",
-                            "model": mid,
-                            "degraded_from": (
-                                context_pack.get("role_model") or {}
-                            ).get("provider"),
-                            "degrade_reason": "leaf_oneshot_miss",
-                        }
-                    except Exception:  # noqa: BLE001
-                        pass
-                    return prov
-                except Exception:  # noqa: BLE001
-                    continue
-        if injected is not None:
-            p_name = str(getattr(injected, "name", "") or "")
-            p_model = str(getattr(injected, "model", "") or "")
-            if not is_cheap_leaf_provider(p_name, p_model):
-                return injected
-    except Exception:  # noqa: BLE001
-        return None
-    return None
-
-class _LeafOneshotResult:
-    """TurnResult duck-type for a successful cheap-leaf one-shot."""
-
-    def __init__(self, handoff: dict[str, Any], envelope: dict[str, Any]) -> None:
-        self.success = True
-        self.stop_reason = "confirmed"
-        self.final_code = None
-        self.result = {
-            "handoff": handoff,
-            "leaf_envelope": envelope,
-            "one_shot": True,
-            "calls": [],
-            "tool_calls": 0,
-        }
+        self.success = bool(payload.get("success"))
+        self.stop_reason = str(payload.get("stop_reason") or "provider_error")
+        self.final_code = payload.get("final_code")
+        raw_result = payload.get("result")
+        if isinstance(raw_result, dict):
+            result = dict(raw_result)
+        else:
+            result = {
+                "handoff": {
+                    "status": "done" if self.success else "failed",
+                    "summary": str(raw_result or payload.get("error") or ""),
+                }
+            }
+        result.setdefault("success", self.success)
+        result.setdefault("stop_reason", self.stop_reason)
+        for key in (
+            "run_id",
+            "session_id",
+            "parent_id",
+            "chudcode_session_id",
+            "chudcode_session_file",
+            "usage",
+            "cancelled",
+            "offline",
+            "calls",
+            "tool_calls",
+        ):
+            if key in payload:
+                result[key] = payload[key]
+        self.result = result
 
 
 def _tier_profile(context_pack: dict[str, Any] | None = None):
@@ -957,12 +482,11 @@ def _tier_profile(context_pack: dict[str, Any] | None = None):
             effort_tier_for,
             load_tier,
         )
+
         pack = context_pack or {}
         node_inputs = pack.get("node_inputs") or {}
         tier_name = (
-            pack.get("tier")
-            or node_inputs.get("tier")
-            or detect_tier_from_env()
+            pack.get("tier") or node_inputs.get("tier") or detect_tier_from_env()
         )
         if not tier_name:
             return None
@@ -976,24 +500,16 @@ def _capability_profile(profile: Any | None) -> Any | None:
         return None
     try:
         from services.agent.capability import resolve_capability  # noqa: PLC0415
+
         return resolve_capability(profile.name)
     except Exception:  # noqa: BLE001 — capability scaffolds are best-effort
         return None
 
 
-class _UnavailableAgentResult:
-    """Returned when no provider can be constructed — a NON-success result so the
-    node escalates (never a fabricated ``confirmed`` success)."""
-    def __init__(self, reason: str) -> None:
-        self.stop_reason = "failed"
-        self.success = False
-        self.final_code = None
-        self.result = {"error": reason}
-
-
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
+
 
 def run(
     node: dict[str, Any],
@@ -1035,9 +551,8 @@ def run(
     # discipline elsewhere in this pipeline.
     role_card = _resolve_role_card(node)
     if role_card is not None:
-        # The registry policy is process-global. It is applied only around the
-        # agent call below and restored by _scoped_role_tool_policy; restoration
-        # failure is a node failure, never silent best-effort cleanup.
+        # Chudcode receives the role/tool scope in-band; never mutate the
+        # process-global registry around a concurrent node turn.
         context_pack = dict(context_pack)
         context_pack["role_id"] = role_card.id
         # WI-16: append per-capability SOFT phrasing (A mandatory / B suggestive /
@@ -1048,13 +563,15 @@ def run(
                 letter_from_capability,
             )
             from services.agent.capability import resolve_capability  # noqa: PLC0415
+
             _prof = _tier_profile(context_pack)
             _tier_name = _prof.name if _prof is not None else ""
             _cap = resolve_capability(_tier_name) if _tier_name else None
             _letter = letter_from_capability(_cap)
             context_pack["capability_letter"] = _letter
             context_pack["role_system_prompt"] = assemble_system_for_capability(
-                role_card.system_prompt, _letter)
+                role_card.system_prompt, _letter
+            )
         except Exception:  # noqa: BLE001 — never block node on soft phrasing
             context_pack["role_system_prompt"] = role_card.system_prompt
         # The node's tools: allowlist and the card's allowlist should agree; the card
@@ -1079,11 +596,8 @@ def run(
     # Resolve agent callable.
     _agent_fn = agent_fn or _default_agent_fn
 
-    # M20: seed the agent-execution event sink + span context into context_pack so
-    # the agent turn can emit `agent.tool_call` (etc.) through the SAME §11 `emit`
-    # callback the DAG lifecycle events use. run_id may already be on the pack
-    # (mission path); node_id/node_name come from the node here. Best-effort — a
-    # None emit leaves the keys harmless (agent_turn no-ops emission).
+    # Seed the Chudcode event sink + span context through the same callback used
+    # by DAG lifecycle events. A None sink is harmless.
     if emit is not None:
         context_pack = dict(context_pack)
         context_pack.setdefault("_event_sink", emit)
@@ -1091,51 +605,33 @@ def run(
         context_pack.setdefault("node_name", node_name)
 
     # Emit node.started (§11).
-    _emit(emit, "dag.node.started", {
-        "node_id": node_id,
-        "node_type": node_type,
-        "node_name": node_name,
-    })
+    _emit(
+        emit,
+        "dag.node.started",
+        {
+            "node_id": node_id,
+            "node_type": node_type,
+            "node_name": node_name,
+        },
+    )
 
     t0 = time.monotonic()
     agent_error: Exception | None = None
-    policy_error: _ToolPolicyScopeError | None = None
     try:
-        with _scoped_role_tool_policy(role_card):
-            try:
-                agent_result = _agent_fn(request, context_pack)
-            except Exception as exc:  # noqa: BLE001
-                agent_error = exc
-    except _ToolPolicyScopeError as exc:
-        policy_error = exc
-
-    if policy_error is not None:
-        elapsed_ms = (time.monotonic() - t0) * 1000.0
-        error = str(policy_error)
-        if agent_error is not None:
-            error = f"{error}; agent also raised: {agent_error}"
-        _emit(emit, "dag.node.failed", {
-            "node_id": node_id,
-            "error": error,
-        })
-        return VERDICT_ESCALATE, {
-            "status": "failed",
-            "summary": f"Tool policy scope failed: {error}",
-            "data": {
-                "stop_reason": "tool_policy_restore_failed",
-                "error": error,
-                "elapsed_ms": round(elapsed_ms, 1),
-            },
-            "retry_remaining": retry_remaining,
-            "doc_id": node_inputs.get("doc_id"),
-        }
+        agent_result = _agent_fn(request, context_pack)
+    except Exception as exc:  # noqa: BLE001
+        agent_error = exc
 
     if agent_error is not None:
         # Unrecoverable agent error → escalate immediately.
-        _emit(emit, "dag.node.failed", {
-            "node_id": node_id,
-            "error": str(agent_error),
-        })
+        _emit(
+            emit,
+            "dag.node.failed",
+            {
+                "node_id": node_id,
+                "error": str(agent_error),
+            },
+        )
         output_state = {
             "status": "failed",
             "summary": f"Agent raised exception: {agent_error}",
@@ -1161,6 +657,7 @@ def run(
         from services.agent.mission_dispatch import (  # noqa: PLC0415
             retryable_child_failure,
         )
+
         _retryable = retryable_child_failure(agent_result)
     except Exception:  # noqa: BLE001 — an unclassifiable failure escalates
         _retryable = False
@@ -1178,7 +675,9 @@ def run(
     # satisfy. Only when depth < max_spawn_depth.
     if verdict == VERDICT_DONE:
         blocked, gate_info = _multi_domain_delegate_gate(
-            node, context_pack, agent_result,
+            node,
+            context_pack,
+            agent_result,
         )
         if blocked:
             verdict = VERDICT_RETRY
@@ -1200,7 +699,6 @@ def run(
                 context_pack["delegate_gate"] = gate_info
             except Exception:  # noqa: BLE001
                 pass
-
 
     # Consume retry budget when the verdict is retry.
     new_retry_remaining = retry_remaining
@@ -1249,11 +747,8 @@ def run(
     if adv_block:
         output_state["advisory"] = adv_block
 
-    # Overseer stage-exit audit (T-W13, §11): on a node completing DONE, trigger a
-    # budgeted overseer audit of the plan/reasoning so far.  Real trigger call site
-    # — but it fires ONLY when the context pack carries a run_id AND an overseer
-    # provider map (so it no-ops in the common/test path and never regresses the
-    # DAG suite).  See the run_id/ledger-glue NOTE above: same missing thread.
+    # Every completed run-scoped node gets a one-shot Chudcode overseer audit.
+    # The audit itself remains best-effort and cannot break node completion.
     if verdict == VERDICT_DONE:
         ov_out = _run_overseer_stage_exit(node, context_pack)
         if ov_out:
@@ -1261,25 +756,37 @@ def run(
 
     # Emit appropriate §11 completion event.
     if verdict == VERDICT_DONE:
-        _emit(emit, "dag.node.done", {
-            "node_id": node_id,
-            "output": output_state,
-        })
+        _emit(
+            emit,
+            "dag.node.done",
+            {
+                "node_id": node_id,
+                "output": output_state,
+            },
+        )
     elif verdict == VERDICT_RETRY:
         # Still has budget — will be re-routed; emit paused so mission-control
         # UI can show the node as waiting to retry.
-        _emit(emit, "dag.node.paused", {
-            "node_id": node_id,
-            "reason": f"retry (budget remaining: {new_retry_remaining})",
-        })
+        _emit(
+            emit,
+            "dag.node.paused",
+            {
+                "node_id": node_id,
+                "reason": f"retry (budget remaining: {new_retry_remaining})",
+            },
+        )
     else:  # escalate
         error = f"escalated: {stop_reason}"
         if retry_budget_exhausted:
             error += " (retry budget exhausted)"
-        _emit(emit, "dag.node.failed", {
-            "node_id": node_id,
-            "error": error,
-        })
+        _emit(
+            emit,
+            "dag.node.failed",
+            {
+                "node_id": node_id,
+                "error": error,
+            },
+        )
 
     return verdict, output_state
 
@@ -1287,6 +794,7 @@ def run(
 # ---------------------------------------------------------------------------
 # Role card application (T-W7)
 # ---------------------------------------------------------------------------
+
 
 def _resolve_role_card(node: dict[str, Any]) -> Any:
     """Return the RoleCard for ``node['role']`` if the node names one, else None.
@@ -1304,76 +812,16 @@ def _resolve_role_card(node: dict[str, Any]) -> Any:
         return None
     try:
         from services.agent import roles  # noqa: PLC0415
+
         return roles.load_role(str(role_id))
     except Exception:  # noqa: BLE001
         return None
 
 
-def _apply_role_tool_policy(role_card: Any) -> None:
-    """Bind the role card's tool allowlist into the MCP tool_registry (the ONE
-    dispatch enforcement point). Best-effort — a missing registry never breaks the
-    run."""
-    try:
-        from services.mcp import tool_registry as reg  # noqa: PLC0415
-        role_card.apply_tool_policy(reg)
-    except Exception:  # noqa: BLE001
-        pass
-
-
-class _ToolPolicyScopeError(RuntimeError):
-    """The process-global registry policy could not be safely scoped."""
-
-
-@contextmanager
-def _scoped_role_tool_policy(role_card: Any) -> Iterator[None]:
-    """Apply one role policy and make restoration failure fatal and observable."""
-    if role_card is None:
-        yield
-        return
-    try:
-        restore = _snapshot_tool_policy()
-    except Exception as exc:  # noqa: BLE001
-        _LOG.exception("Failed to snapshot process-global tool policy")
-        raise _ToolPolicyScopeError(
-            f"tool policy snapshot failed: {exc}"
-        ) from exc
-
-    _apply_role_tool_policy(role_card)
-    try:
-        yield
-    finally:
-        try:
-            restore()
-        except Exception as exc:  # noqa: BLE001
-            _LOG.exception("Failed to restore process-global tool policy")
-            raise _ToolPolicyScopeError(
-                f"tool policy restoration failed: {exc}"
-            ) from exc
-
-
-def _snapshot_tool_policy() -> Callable[[], None]:
-    """Capture the process-global tool registry policy for exact restoration."""
-    from services.mcp import tool_registry as reg  # noqa: PLC0415
-    prev_allow = set(reg._ACTIVE_ALLOW) if reg._ACTIVE_ALLOW is not None else None
-    prev_deny = (
-        set(reg._ACTIVE_DENY_RISK)
-        if reg._ACTIVE_DENY_RISK is not None
-        else None
-    )
-    prev_set = bool(reg._POLICY_SET)
-
-    def _restore() -> None:
-        if prev_set:
-            reg.set_policy(allow=prev_allow, deny_risk=prev_deny)
-        else:
-            reg.reset_policy()
-
-    return _restore
-
-
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
+
 
 def _build_request(
     node_type: str,
@@ -1416,21 +864,17 @@ def _build_request(
             domain_tags_from_context,
             is_multi_domain_plan_or_build,
         )
-        role_id = (
-            context_pack.get("role_id")
-            or node_inputs.get("role")
-            or ""
-        )
+
+        role_id = context_pack.get("role_id") or node_inputs.get("role") or ""
         tags = domain_tags_from_context(context_pack, node_inputs)
         if is_multi_domain_plan_or_build(
             role_id=str(role_id) if role_id else None,
             node_type=str(node_type or ""),
             domain_tags=tags,
             task_class=str(
-                context_pack.get("task_class")
-                or node_inputs.get("task_class")
-                or ""
-            ) or None,
+                context_pack.get("task_class") or node_inputs.get("task_class") or ""
+            )
+            or None,
         ):
             parts.append(
                 "\n[CAPABILITY / DELEGATION GATE] Multi-domain PLAN/BUILD: "
@@ -1514,6 +958,7 @@ def _extract_doc_id_from_agent_result(agent_result_dict: Any) -> str | None:
             if isinstance(res, str):
                 try:
                     import json as _json  # noqa: PLC0415
+
                     res = _json.loads(res)
                 except Exception:  # noqa: BLE001
                     res = None
@@ -1534,8 +979,20 @@ def _compact_agent_result(agent_result_dict: Any) -> Any:
         return agent_result_dict
     out: dict[str, Any] = {}
     for k in (
-        "stop_reason", "one_shot", "leaf_envelope", "delegate_gate",
-        "typed_refusal", "success", "auto_complete",
+        "stop_reason",
+        "one_shot",
+        "leaf_envelope",
+        "delegate_gate",
+        "typed_refusal",
+        "success",
+        "auto_complete",
+        "cancelled",
+        "offline",
+        "run_id",
+        "session_id",
+        "parent_id",
+        "chudcode_session_id",
+        "chudcode_session_file",
     ):
         if k in agent_result_dict:
             out[k] = agent_result_dict[k]
@@ -1549,9 +1006,16 @@ def _compact_agent_result(agent_result_dict: Any) -> Any:
         if isinstance(outs, dict):
             slim = {}
             _KEEP_OUT = (
-                "typed_refusal", "leaf_envelope", "one_shot",
-                "auto_complete", "productive_tools", "wrote_ledger",
-                "no_op", "reason", "doc_id", "checks_run",
+                "typed_refusal",
+                "leaf_envelope",
+                "one_shot",
+                "auto_complete",
+                "productive_tools",
+                "wrote_ledger",
+                "no_op",
+                "reason",
+                "doc_id",
+                "checks_run",
             )
             for ok, ov in outs.items():
                 if ok not in _KEEP_OUT:
@@ -1581,16 +1045,19 @@ def _compact_agent_result(agent_result_dict: Any) -> Any:
     # Cap overall JSON size hard (checkpoint + emit paths share this).
     try:
         import json as _json  # noqa: PLC0415
+
         blob = _json.dumps(out, default=str)
         if len(blob) > 8000:
             out = {
                 "stop_reason": out.get("stop_reason"),
                 "handoff": {
                     "status": (out.get("handoff") or {}).get("status")
-                    if isinstance(out.get("handoff"), dict) else None,
+                    if isinstance(out.get("handoff"), dict)
+                    else None,
                     "summary": str(
                         (out.get("handoff") or {}).get("summary")
-                        if isinstance(out.get("handoff"), dict) else ""
+                        if isinstance(out.get("handoff"), dict)
+                        else ""
                     )[:300],
                 },
                 "tool_calls": out.get("tool_calls"),
@@ -1619,8 +1086,8 @@ def _verdict_to_node_status(verdict: str) -> str:
     if verdict == VERDICT_DONE:
         return "done"
     if verdict == VERDICT_RETRY:
-        return "running"   # will be re-queued
-    return "failed"        # escalate
+        return "running"  # will be re-queued
+    return "failed"  # escalate
 
 
 def _build_summary(
@@ -1649,6 +1116,7 @@ def _run_advisory(node_type: str, doc_id: str | None, seq: int = 0) -> str:
         return ""
     try:
         from services.agent.advisor import adapters, engine, render
+
         obs = adapters.observe_doc(doc_id, stage, seq=seq)
         if not obs.findings:
             return ""
@@ -1658,35 +1126,46 @@ def _run_advisory(node_type: str, doc_id: str | None, seq: int = 0) -> str:
         return ""
 
 
-def _run_overseer_stage_exit(node: dict[str, Any],
-                             context_pack: dict[str, Any]) -> dict | None:
-    """Trigger a stage-exit overseer audit for a completed node (T-W13, §11).
+def _run_overseer_stage_exit(
+    node: dict[str, Any], context_pack: dict[str, Any]
+) -> dict | None:
+    """Run the one-shot Chudcode overseer audit for a completed node.
 
-    Fires only when the context pack supplies a ``run_id`` AND an ``overseer_providers``
-    map (the resolved provider seam, §14).  Absent either, returns ``None`` — the
-    overseer needs the run's ledger + build graph, and there is no provider registry
-    threaded through the DAG runner yet (same missing glue the foreman NOTE above
-    flags; full ledger threading tracked for T-W19 glue).  Best-effort: never raises.
+    The run id is the persistence/checkpoint root; the node id becomes the audit
+    lineage parent. A missing run id remains the only no-op case.
     """
     if not _ADVISOR_ENABLED:
         return None
     run_id = context_pack.get("run_id")
-    providers = context_pack.get("overseer_providers")
-    if not run_id or not providers:
+    if not run_id:
         return None
     node_type = node.get("type", "")
     stage = _NODE_TYPE_STAGE.get(node_type, node_type)
     try:
         from services.agent.advisor.overseer_tools import audit_now
+
+        offline = (
+            context_pack.get("offline") is True
+            or (context_pack.get("node_inputs") or {}).get("offline") is True
+        )
         return audit_now(
             run_id,
-            {"stage": stage, "buildgraph_nodes": [node.get("id")] if node.get("id") else []},
+            {
+                "stage": stage,
+                "buildgraph_nodes": [node.get("id")] if node.get("id") else [],
+            },
             trigger="stage_exit",
-            providers=providers,
+            providers=context_pack.get("overseer_providers") if offline else None,
+            session_id=str(context_pack.get("session_id") or run_id),
+            on_event=context_pack.get("_event_sink"),
+            options={
+                "workspace_dir": context_pack.get("workspace_dir"),
+                "project_dir": context_pack.get("project_dir"),
+            },
+            offline=offline,
         )
     except Exception:  # noqa: BLE001 — a broken auditor never breaks node execution
         return None
-
 
 
 # ---------------------------------------------------------------------------
@@ -1718,20 +1197,18 @@ def _multi_domain_delegate_gate(
 
     node_inputs = context_pack.get("node_inputs") or node.get("inputs") or {}
     role_id = (
-        context_pack.get("role_id")
-        or node.get("role")
-        or node_inputs.get("role")
-        or ""
+        context_pack.get("role_id") or node.get("role") or node_inputs.get("role") or ""
     )
-    task_class = (
-        context_pack.get("task_class")
-        or node_inputs.get("task_class")
-    )
+    task_class = context_pack.get("task_class") or node_inputs.get("task_class")
     tags = domain_tags_from_context(context_pack, node_inputs)
     # If the pack already stamped domain_tags, prefer those.
     if context_pack.get("domain_tags"):
         try:
-            tags = [str(t).strip().lower() for t in context_pack["domain_tags"] if str(t).strip()]
+            tags = [
+                str(t).strip().lower()
+                for t in context_pack["domain_tags"]
+                if str(t).strip()
+            ]
         except Exception:  # noqa: BLE001
             pass
 
@@ -1741,23 +1218,21 @@ def _multi_domain_delegate_gate(
         domain_tags=tags,
         task_class=str(task_class) if task_class else None,
     )
-    info.update({
-        "gated": applies,
-        "role_id": role_id,
-        "task_class": task_class,
-        "domain_tags": tags,
-        "n_domains": len(tags),
-    })
+    info.update(
+        {
+            "gated": applies,
+            "role_id": role_id,
+            "task_class": task_class,
+            "domain_tags": tags,
+            "n_domains": len(tags),
+        }
+    )
     if not applies:
         return False, info
 
     # Depth check: only enforce when depth < max.
     try:
-        depth = int(
-            context_pack.get("depth")
-            or node_inputs.get("depth")
-            or 0
-        )
+        depth = int(context_pack.get("depth") or node_inputs.get("depth") or 0)
     except (TypeError, ValueError):
         depth = 0
     letter = context_pack.get("capability_letter")
@@ -1778,7 +1253,10 @@ def _multi_domain_delegate_gate(
     # with multi task_class; gate applies as long as applies=True above).
     # Explicit: if tags < 2 AND not a coordinating plan role, skip.
     plan_roles = {
-        "orchestrator", "department_manager", "layout_engineer", "planning",
+        "orchestrator",
+        "department_manager",
+        "layout_engineer",
+        "planning",
     }
     if len(tags) < 2 and str(role_id).lower() not in plan_roles:
         info["reason"] = "single_domain"
@@ -1815,12 +1293,19 @@ def _multi_domain_delegate_gate(
         if not isinstance(calls, list):
             calls = getattr(agent_result, "calls", None) or []
         _READ = {
-            "ledger_get", "part_search", "parts_taxonomy", "part_source",
-            "describe_part", "describe_scene", "describe_project",
-            "workspace_status", "buildgraph_status",
+            "ledger_get",
+            "part_search",
+            "parts_taxonomy",
+            "part_source",
+            "describe_part",
+            "describe_scene",
+            "describe_project",
+            "workspace_status",
+            "buildgraph_status",
         }
         ok_tools = [
-            c.get("tool") for c in calls
+            c.get("tool")
+            for c in calls
             if isinstance(c, dict) and c.get("ok") is not False and c.get("tool")
         ]
         n_read = sum(1 for t in ok_tools if t in _READ)
@@ -1834,8 +1319,13 @@ def _multi_domain_delegate_gate(
                 "plan-read thrash without delegate; staying flat with "
                 "synthesised typed refusal"
             ),
-            "domains_considered": list(tags) if tags else [
-                "plan", "geometry", "assembly", "ecad",
+            "domains_considered": list(tags)
+            if tags
+            else [
+                "plan",
+                "geometry",
+                "assembly",
+                "ecad",
             ],
             "why_flat": (
                 "Node only performed plan-read tools (ledger_get/describe/…); "
@@ -1883,6 +1373,7 @@ def _agent_had_delegate_call(result: dict[str, Any], agent_result: Any) -> bool:
         if c.get("tool") == "delegate" and c.get("ok") is not False:
             return True
     return False
+
 
 def _emit(emit: EmitFn, event_type: str, payload: dict[str, Any]) -> None:
     if emit is None:

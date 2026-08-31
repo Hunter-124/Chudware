@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import threading
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any
@@ -268,13 +269,35 @@ def _assemble_role_runtime(
             chudware_actor=actor,
         )
     resolver = agent_turn.resolver_for(mission_dispatch)
-    system_prompt, allowed_tools, _tools_text = linear_role_prompt(
+    system_prompt, role_allowed_tools, _tools_text = linear_role_prompt(
         role,
         resolver=resolver,
         card=card,
         capability=capability,
         tier=tier,
     )
+    # Nested callers may narrow a role card without mutating the process-global
+    # registry.  Preserve the allowlist tri-state all the way into
+    # chudcode_tools: absent uses the role policy, None is open, and an explicit
+    # empty list is restricted to the normal mode/meta/category floors.
+    if "allowed_tools" in options:
+        raw_allowed = options.get("allowed_tools")
+        allowed_tools = (
+            None
+            if raw_allowed is None
+            else [
+                _text(value)
+                for value in (
+                    raw_allowed
+                    if isinstance(raw_allowed, Sequence)
+                    and not isinstance(raw_allowed, (str, bytes))
+                    else ()
+                )
+                if _text(value)
+            ]
+        )
+    else:
+        allowed_tools = list(role_allowed_tools)
     categories_value = options.get("categories", options.get("enabled_categories", ()))
     categories = [
         _text(value)
@@ -314,7 +337,7 @@ def _assemble_role_runtime(
     host_tools = build_host_tools(tool_context)
     return (
         system_prompt,
-        list(allowed_tools),
+        [] if allowed_tools is None else list(allowed_tools),
         host_tools,
         mission_dispatch,
         tool_context,
@@ -389,6 +412,79 @@ def _add_usage(total: dict[str, Any], payload: Mapping[str, Any]) -> None:
     )
 
 
+def _bounded_tool_calls(records: Any) -> tuple[list[dict[str, Any]], int]:
+    """Return the checkpoint-safe subset of ordered host-tool records."""
+    if not isinstance(records, list):
+        return [], 0
+    from services.agent.agent_turn import scrub_secrets
+
+    secret_markers = (
+        "api_key",
+        "api-key",
+        "apikey",
+        "token",
+        "authorization",
+        "credential",
+        "password",
+        "secret",
+        "cookie",
+    )
+
+    def clean(value: Any, depth: int = 0) -> Any:
+        if depth >= 4:
+            return "[truncated]"
+        if value is None or isinstance(value, (bool, int)):
+            return value
+        if isinstance(value, float):
+            return value if math.isfinite(value) else None
+        if isinstance(value, str):
+            text = scrub_secrets(value)
+            return text if len(text) <= 1000 else text[:1000] + "…"
+        if isinstance(value, Mapping):
+            out: dict[str, Any] = {}
+            for key, item in list(value.items())[:40]:
+                name = str(key)
+                lowered = name.lower()
+                out[name] = (
+                    "[redacted]"
+                    if any(marker in lowered for marker in secret_markers)
+                    else clean(item, depth + 1)
+                )
+            return out
+        if isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
+            return [clean(item, depth + 1) for item in list(value)[:40]]
+        return clean(str(value), depth + 1)
+
+    def fit(value: Any) -> Any:
+        safe = clean(value)
+        encoded = json.dumps(safe, ensure_ascii=False, default=str)
+        if len(encoded) <= 2000:
+            return safe
+        if isinstance(safe, dict):
+            slim = {
+                key: safe[key]
+                for key in ("ok", "status", "doc_id", "reason", "error", "name", "path")
+                if key in safe
+            }
+            if slim:
+                return slim
+        return scrub_secrets(encoded[:1999]) + "…"
+
+    bounded: list[dict[str, Any]] = []
+    for record in records[:40]:
+        if not isinstance(record, Mapping):
+            continue
+        bounded.append(
+            {
+                "tool": scrub_secrets(str(record.get("tool") or ""))[:160],
+                "args": fit(record.get("args")),
+                "ok": bool(record.get("ok")),
+                "result": fit(record.get("result")),
+            }
+        )
+    return bounded, len(records)
+
+
 def _record_provider_usage(payload: Mapping[str, Any], actor: Any) -> None:
     from services.agent.providers import token_usage
 
@@ -407,8 +503,9 @@ def _record_provider_usage(payload: Mapping[str, Any], actor: Any) -> None:
 def _emit(
     on_event: Callable[..., None] | None, kind: str, payload: dict[str, Any]
 ) -> None:
-    if on_event is not None:
-        on_event(kind, payload)
+    from services.agent.agent_events import emit_event
+
+    emit_event(kind, payload, live=on_event, journal=None)
 
 
 def _terminal_text(host_result: Mapping[str, Any]) -> str:
@@ -766,6 +863,7 @@ def run_role_turn(
                 allowed_tools=allowed_tools,
             )
         cancelled = bool(host_result.get("cancelled"))
+        calls, tool_calls = _bounded_tool_calls(tool_context.get("tool_calls"))
         result = {
             "success": not cancelled,
             "stop_reason": "cancelled" if cancelled else "completed",
@@ -786,6 +884,8 @@ def run_role_turn(
             "usage": usage,
             "tokens_used": int(usage["total_tokens"]),
             "provider_usage_recorded": bool(usage["calls"]),
+            "calls": calls,
+            "tool_calls": tool_calls,
             "offline": False,
         }
         return result

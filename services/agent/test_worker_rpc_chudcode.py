@@ -34,6 +34,7 @@ class _FakeHost:
         self.memory_calls: list[tuple[str, dict]] = []
         self.transient_calls: list[tuple[str, dict]] = []
         self.session_calls: list[tuple[str, str, dict]] = []
+        self.stt_states: dict[str, str] = {}
         self.shutdown_count = 0
 
     def run_turn(self, params, emit):
@@ -170,10 +171,29 @@ class _FakeHost:
                     }
                 )
             return {"providerId": payload["providerId"]}
-        if command in {"validate_api_key", "set_api_key"}:
+        if command == "validate_api_key" and payload.get("providerId") == "bad":
+            return {
+                "ok": False,
+                "reason": f"provider rejected {payload['apiKey']}",
+                "apiKey": payload["apiKey"],
+            }
+        if command == "validate_api_key":
             return {
                 "providerId": payload["providerId"],
                 "valid": True,
+                "apiKey": payload["apiKey"],
+            }
+        if command == "set_api_key":
+            return {
+                "provider": {
+                    "providerId": payload["providerId"],
+                    "name": payload["providerId"].title(),
+                    "authenticated": True,
+                    "hasApiKey": True,
+                    "hasOAuth": False,
+                    "origin": "api_key",
+                    "accounts": [],
+                },
                 "apiKey": payload["apiKey"],
             }
         return {
@@ -187,6 +207,43 @@ class _FakeHost:
         self.session_calls.append((session_id, command, payload))
         if session_id not in self.sessions:
             return {"ok": False, "reason": "session_not_live"}
+        if command == "stt_status":
+            if session_id == "unavailable":
+                return {
+                    "ok": True,
+                    "available": False,
+                    "state": "idle",
+                    "model": "whisper-small",
+                    "error": "microphone unavailable",
+                    "privateDevice": "/dev/secret",
+                }
+            return {
+                "ok": True,
+                "available": True,
+                "state": self.stt_states.get(session_id, "idle"),
+                "model": "whisper-small",
+                "progress": 125,
+                "privateDevice": "/dev/secret",
+            }
+        if command == "stt_start":
+            self.stt_states[session_id] = "recording"
+            return {
+                "ok": True,
+                "state": "recording",
+                "model": "whisper-small",
+                "privateDevice": "/dev/secret",
+            }
+        if command == "stt_stop":
+            self.stt_states[session_id] = "idle"
+            return {
+                "ok": True,
+                "state": "idle",
+                "text": "make the bore wider",
+                "segments": [{"secret": "must-not-escape"}],
+            }
+        if command == "stt_cancel":
+            self.stt_states[session_id] = "idle"
+            return {"ok": True, "state": "idle", "cancelToken": "must-not-escape"}
         if command == "get_session_stats":
             return {
                 "ok": True,
@@ -458,6 +515,12 @@ def test_cancel_steer_status_and_auth_memory_proxies(online_lane):
         result = worker_rpc.WORKER_METHODS[method](payload, lambda event: None)
         assert result["ok"] is True
         assert "never-return-this" not in repr(result)
+    rejected = worker_rpc.WORKER_METHODS["chudcode_validate_key"](
+        {"providerId": "bad", "apiKey": "super-secret-key"}, lambda event: None
+    )
+    assert rejected["ok"] is False
+    assert "super-secret-key" not in repr(rejected)
+    assert "<redacted>" in rejected["reason"]
     memory_cases = {
         "memory_remember": (
             "memory_remember",
@@ -491,6 +554,10 @@ def test_registers_exact_shared_chudcode_worker_methods():
         "chudcode_set_auto_compaction",
         "chudcode_set_auto_retry",
         "chudcode_tool_state",
+        "chudcode_stt_status",
+        "chudcode_stt_start",
+        "chudcode_stt_stop",
+        "chudcode_stt_cancel",
     }
     assert expected <= worker_rpc.WORKER_METHODS.keys()
 
@@ -574,6 +641,7 @@ def test_live_session_management_is_isolated_bounded_and_capability_honest(onlin
     }
     assert auto_compact["ok"] is True
     assert auto_retry["ok"] is True
+
     by_name = {tool["name"]: tool for tool in tools["tools"]}
     assert by_name["browser"]["available"] is True
     assert by_name["browser"]["loadMode"] == "discoverable"
@@ -587,6 +655,84 @@ def test_live_session_management_is_isolated_bounded_and_capability_honest(onlin
         "compact",
         {"customInstructions": "Keep decisions"},
     ) in online_lane.host.session_calls
+
+
+def test_live_stt_worker_methods_are_bounded_isolated_and_cancellable(online_lane):
+    online_lane.host.sessions.update(
+        {"voice-a": object(), "voice-b": object(), "unavailable": object()}
+    )
+    emit = lambda _event: None
+
+    started = worker_rpc.WORKER_METHODS["chudcode_stt_start"](
+        {"session_id": "voice-a"}, emit
+    )
+    status_a = worker_rpc.WORKER_METHODS["chudcode_stt_status"](
+        {"session_id": "voice-a"}, emit
+    )
+    status_b = worker_rpc.WORKER_METHODS["chudcode_stt_status"](
+        {"session_id": "voice-b"}, emit
+    )
+    stopped = worker_rpc.WORKER_METHODS["chudcode_stt_stop"](
+        {"session_id": "voice-a"}, emit
+    )
+    cancelled = worker_rpc.WORKER_METHODS["chudcode_stt_cancel"](
+        {"session_id": "voice-b"}, emit
+    )
+    unavailable = worker_rpc.WORKER_METHODS["chudcode_stt_status"](
+        {"session_id": "unavailable"}, emit
+    )
+    missing = worker_rpc.WORKER_METHODS["chudcode_stt_status"](
+        {"session_id": "missing"}, emit
+    )
+    unknown = worker_rpc.WORKER_METHODS["chudcode_stt_cancel"](
+        {"session_id": "voice-b", "device": "wrong-layer"}, emit
+    )
+
+    assert started == {
+        "ok": True,
+        "available": True,
+        "state": "recording",
+        "model": "whisper-small",
+        "progress": 100,
+    }
+    assert status_a["state"] == "recording"
+    assert status_a["progress"] == 100
+    assert status_b["state"] == "idle"
+    assert set(status_b) == {"ok", "available", "state", "model", "progress"}
+    assert stopped == {
+        "ok": True,
+        "available": True,
+        "state": "idle",
+        "text": "make the bore wider",
+    }
+    assert cancelled == {
+        "ok": True,
+        "available": True,
+        "state": "idle",
+    }
+    assert unavailable == {
+        "ok": True,
+        "available": False,
+        "state": "idle",
+        "model": "whisper-small",
+        "error": "microphone unavailable",
+    }
+    assert missing == {"ok": False, "reason": "session_not_live"}
+    assert unknown == {
+        "ok": False,
+        "reason": "chudcode_stt_cancel has unknown params",
+    }
+    assert online_lane.host.stt_states == {"voice-a": "idle", "voice-b": "idle"}
+    assert (
+        "voice-a",
+        "stt_start",
+        {},
+    ) in online_lane.host.session_calls
+    assert (
+        "voice-b",
+        "stt_start",
+        {},
+    ) not in online_lane.host.session_calls
 
 
 def test_legacy_session_adapters_never_rewrite_online_chudcode_history(monkeypatch):

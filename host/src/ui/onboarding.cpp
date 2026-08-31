@@ -18,6 +18,7 @@
 #include "web_capabilities.h"
 #include "metrics.h"
 #include "widgets/kit.h"
+#include "chudcode_descriptors.h"
 
 namespace ui {
 namespace {
@@ -222,12 +223,12 @@ void beginValidatedKeySave(AppState& st) {
     s_wizard.keyError = false;
     s_wizard.keyStatus = "Checking with " + std::string(kKeyProviders[s_wizard.keyProvider].label) + "\xe2\x80\xa6";
     const auto generation = ++s_wizard.keyGeneration;
-    st.rpc.call("agent_provider_validate_key",
-                nlohmann::json{{"provider", provider}, {"apiKey", key}},
+    st.rpc.call(kChudcodeValidateKeyMethod,
+                nlohmann::json{{"providerId", provider}, {"apiKey", key}},
                 [&st, provider, key, generation](const core::RpcResult& validation) {
         if (generation != s_wizard.keyGeneration) return;
-        const bool valid = validation.ok && validation.result.is_object() &&
-                           validation.result.value("ok", false);
+        const bool valid = validation.ok &&
+                           chudcodeKeyValidationAccepted(validation.result, provider);
         if (!valid) {
             s_wizard.keyBusy = false;
             s_wizard.keyError = true;
@@ -235,13 +236,12 @@ void beginValidatedKeySave(AppState& st) {
                 validation, "The provider rejected the key without returning an explanation.");
             return;
         }
-        st.rpc.call("agent_provider_set_key",
-                    nlohmann::json{{"provider", provider}, {"apiKey", key}},
-                    [generation](const core::RpcResult& saved) {
+        st.rpc.call(kChudcodeSetKeyMethod,
+                    nlohmann::json{{"providerId", provider}, {"apiKey", key}},
+                    [provider, generation](const core::RpcResult& saved) {
             if (generation != s_wizard.keyGeneration) return;
             s_wizard.keyBusy = false;
-            const bool ok = saved.ok && saved.result.is_object() &&
-                            saved.result.value("ok", true);
+            const bool ok = saved.ok && chudcodeKeySaveAccepted(saved.result, provider);
             if (!ok) {
                 s_wizard.keyError = true;
                 s_wizard.keyStatus = rpcError(

@@ -17,6 +17,13 @@
 
 namespace ui {
 
+inline constexpr char kChudcodeSttStatusMethod[] = "chudcode_stt_status";
+inline constexpr char kChudcodeSttStartMethod[] = "chudcode_stt_start";
+inline constexpr char kChudcodeSttStopMethod[] = "chudcode_stt_stop";
+inline constexpr char kChudcodeSttCancelMethod[] = "chudcode_stt_cancel";
+inline constexpr char kChudcodeValidateKeyMethod[] = "chudcode_validate_key";
+inline constexpr char kChudcodeSetKeyMethod[] = "chudcode_set_key";
+
 // One sanitized provider descriptor (chudcode_provider_list providers[] entry, and the
 // scalar half of a chudcode_auth_state response).
 struct ChudcodeProviderDesc {
@@ -54,6 +61,27 @@ struct ChudcodeLoginEvent {
 };
 // Returns false for frames that carry nothing this UI can use (no kind, no url, no text).
 bool parseChudcodeLoginEvent(const nlohmann::json& ev, ChudcodeLoginEvent& out);
+
+// Sanitized response shared by chudcode_stt_status/start/stop/cancel. State uses
+// Chudcode's native idle|recording|transcribing vocabulary; progress is -1 when absent.
+struct ChudcodeSttResult {
+    bool available = false;
+    std::string state;
+    std::string model;
+    int progress = -1;
+    std::string error;
+    std::string text;
+};
+bool parseChudcodeSttResult(const nlohmann::json& r, ChudcodeSttResult& out);
+
+// Insert committed/partial speech after the prompt that existed when recording began.
+std::string composeChudcodeTranscript(const std::string& base, const std::string& committed,
+                                     const std::string& partial);
+
+// Provider-bound acknowledgement checks used by onboarding. A stale or cross-provider
+// response cannot validate/save the currently selected provider.
+bool chudcodeKeyValidationAccepted(const nlohmann::json& r, const std::string& providerId);
+bool chudcodeKeySaveAccepted(const nlohmann::json& r, const std::string& providerId);
 
 // chudcode_session_stats — authoritative per-session accounting from the Chudcode host.
 struct ChudcodeSessionModelRow {

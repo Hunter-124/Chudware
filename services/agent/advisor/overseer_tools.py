@@ -7,27 +7,18 @@ server is OPTIONAL (parked to T-W20); :func:`register_overseer_tools` is provide
 a free mirror of ``buildgraph.mcp_tools.register_buildgraph_tools`` but is NOT wired
 into ``services/mcp/server.py`` here (MCP freshness is out of scope per the pivot).
 
-Both functions:
-  * load the run's ledger (state = the change-request scope surface) and its active
-    build-graph sidecar (the plan slice);
-  * build an :class:`~services.agent.advisor.overseer.Overseer` with a provider
-    resolved via the routing seam (§14; ``strongest`` until T-W14);
-  * return JSON-serializable dicts.
-
-Offline: when no provider is configured the audit degrades to ``skipped`` (for
-``audit_now``) or an un-audited deterministic change plan (for ``change_request``) —
-the deterministic mapping is useful on its own.
+Both functions load the run ledger and active build graph, then execute the
+``overseer`` role through Chudcode.  A caller may request the deterministic local
+fallback only with ``offline=True`` and an offline-safe provider.
 """
+
 from __future__ import annotations
 
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Optional
 
 from services.agent.ledger import Ledger, ledger_render
-from .overseer import (
-    AuditScope, EvidenceBudget, Overseer, resolve_overseer_provider,
-)
+from .overseer import AuditScope, EvidenceBudget, Overseer, resolve_overseer_provider
 from . import change_request as _cr
 
 _CR_LEDGER_BUDGET = 2000  # tokens rendered into the change-request self-audit
@@ -36,6 +27,7 @@ _CR_LEDGER_BUDGET = 2000  # tokens rendered into the change-request self-audit
 # ---------------------------------------------------------------------------
 # Run-state loading (ledger + buildgraph sidecar)
 # ---------------------------------------------------------------------------
+
 
 def _load_buildgraph(run_id: str, runs_dir: Optional[Path]) -> dict | None:
     """Load the active build graph for *run_id* from its sidecar (T-W15).
@@ -54,100 +46,19 @@ def _load_buildgraph(run_id: str, runs_dir: Optional[Path]) -> dict | None:
     return data.get("graph")
 
 
-# ProviderResolver: called with nothing, returns {name: provider} available now.
-# Injected so this module never reaches into GUI settings directly (testable).
+# Retained as an injected test/offline seam. Online execution never resolves or
+# invokes these provider objects.
 ProviderMap = dict[str, Any]
-@dataclass(frozen=True)
-class _ProviderResolution:
-    providers: ProviderMap
-    status: str
-    error: str = ""
-    policy_refusal: bool = False
 
 
-def _is_credential_fault(exc: BaseException) -> bool:
-    text = str(exc).lower()
-    return any(marker in text for marker in (
-        "credential unavailable",
-        "credential missing",
-        "requires an api key",
-        "missing api key",
-        "missing access_token",
-        "authentication credential",
-    ))
-
-
-def _default_providers() -> _ProviderResolution:
-    """Resolve and type provider construction instead of collapsing every fault."""
-    try:
-        from services.agent import config as agent_config
-    except Exception as exc:  # noqa: BLE001
-        return _ProviderResolution({}, "provider_error", str(exc))
-
-    try:
-        provider = agent_config.get_provider(role="overseer")
-    except agent_config.OfflineModeError as exc:
-        return _ProviderResolution(
-            {}, "offline_policy", str(exc), policy_refusal=True,
-        )
-    except Exception as exc:  # noqa: BLE001
-        if _is_credential_fault(exc):
-            return _ProviderResolution({}, "credential_unavailable", str(exc))
-        return _ProviderResolution({}, "provider_error", str(exc))
-
-    if provider is None:
-        return _ProviderResolution({}, "unprovisioned")
-
-    from services.agent.role_models import clamp_provider_effort
-    provider = clamp_provider_effort(provider)
-    name = getattr(provider, "name", "") or "resolved"
-    return _ProviderResolution({name: provider}, "ready")
-
-
-def _resolve_provider_input(providers: ProviderMap | None) -> _ProviderResolution:
-    if providers is None:
-        return _default_providers()
-    if not providers or not any(provider is not None for provider in providers.values()):
-        return _ProviderResolution({}, "unprovisioned")
-    return _ProviderResolution(dict(providers), "ready")
-
-
-def _nonexecuted_audit(scope: AuditScope, resolution: _ProviderResolution) -> dict:
-    skipped = (
-        "no provider configured for overseer (routing seam)"
-        if resolution.status == "unprovisioned"
-        else ""
-    )
-    outcome_kind = (
-        "policy_refusal" if resolution.policy_refusal
-        else "guard_block" if resolution.status == "unprovisioned"
-        else "internal_error"
-    )
-    return {
-        "ok": False,
-        "executed": False,
-        "policy_refusal": resolution.policy_refusal,
-        "outcome_kind": outcome_kind,
-        "status": resolution.status,
-        "reason": resolution.error,
-        "skipped": skipped,
-        "error": "" if resolution.policy_refusal else resolution.error,
-        "audit": {},
-        "advisory": {
-            "schema": "aicad.advisory/1",
-            "seq": 0,
-            "stage": scope.stage,
-            "items": [],
-            "user_override": False,
-        },
-        "escalated": False,
-        "escalation_text": "",
-    }
+def _offline_provider(providers: ProviderMap | None) -> Any | None:
+    return resolve_overseer_provider(dict(providers or {}))
 
 
 # ---------------------------------------------------------------------------
 # audit_now(run_id, scope?)
 # ---------------------------------------------------------------------------
+
 
 def audit_now(
     run_id: str,
@@ -158,6 +69,10 @@ def audit_now(
     runs_dir: Optional[Path] = None,
     ledger_path: Optional[Path] = None,
     budget: EvidenceBudget | None = None,
+    session_id: str = "",
+    on_event: Callable[..., None] | None = None,
+    options: dict[str, Any] | None = None,
+    offline: bool = False,
 ) -> dict:
     """Run an on-demand overseer audit over *run_id*'s current evidence.
 
@@ -166,8 +81,6 @@ def audit_now(
     """
     ledger = Ledger.load(run_id, ledger_path)
     graph = _load_buildgraph(run_id, runs_dir)
-    resolution = _resolve_provider_input(providers)
-    provider = resolve_overseer_provider(resolution.providers)
     budget = budget or EvidenceBudget()
     sc = AuditScope(
         run_id=run_id,
@@ -175,13 +88,17 @@ def audit_now(
         roles=list((scope or {}).get("roles", [])),
         buildgraph_nodes=list((scope or {}).get("buildgraph_nodes", [])),
     )
-    if resolution.status != "ready" or provider is None:
-        if provider is None and resolution.status == "ready":
-            resolution = _ProviderResolution({}, "unprovisioned")
-        return _nonexecuted_audit(sc, resolution)
     ledger_text = ledger_render(ledger, budget.ledger)
 
-    o = Overseer(provider=provider, ledger=ledger, budget=budget)
+    o = Overseer(
+        provider=_offline_provider(providers) if offline else None,
+        ledger=ledger,
+        budget=budget,
+        session_id=session_id or run_id,
+        on_event=on_event,
+        options=options,
+        offline=offline,
+    )
     res = o.audit(trigger, sc, ledger_text=ledger_text, buildgraph=graph)
     executed = bool(res.audit) and not res.error and not res.skipped
     return {
@@ -207,6 +124,7 @@ def audit_now(
 # change_request(text)
 # ---------------------------------------------------------------------------
 
+
 def change_request(
     text: str,
     run_id: str,
@@ -215,6 +133,10 @@ def change_request(
     providers: ProviderMap | None = None,
     runs_dir: Optional[Path] = None,
     ledger_path: Optional[Path] = None,
+    session_id: str = "",
+    on_event: Callable[..., None] | None = None,
+    options: dict[str, Any] | None = None,
+    offline: bool = False,
 ) -> dict:
     """Map a user change-request onto the run's ledger, plan it, audit it, recommend.
 
@@ -224,15 +146,24 @@ def change_request(
     """
     ledger = Ledger.load(run_id, ledger_path)
     graph = _load_buildgraph(run_id, runs_dir)
-    resolution = _resolve_provider_input(providers)
-    provider = resolve_overseer_provider(resolution.providers)
-    overseer = Overseer(provider=provider, ledger=ledger) if provider is not None else None
+    overseer = Overseer(
+        provider=_offline_provider(providers) if offline else None,
+        ledger=ledger,
+        session_id=session_id or run_id,
+        on_event=on_event,
+        options=options,
+        offline=offline,
+    )
 
     result = _cr.route_change_request(
-        text, ledger.state,
-        overseer=overseer, ledger=ledger,
+        text,
+        ledger.state,
+        overseer=overseer,
+        ledger=ledger,
         ledger_text=ledger_render(ledger, _CR_LEDGER_BUDGET),
-        buildgraph=graph, run_id=run_id, stage=stage,
+        buildgraph=graph,
+        run_id=run_id,
+        stage=stage,
     )
     return {
         "ok": True,
@@ -243,11 +174,9 @@ def change_request(
         "dispatch": result.dispatch,
         "needs_user_confirm": result.needs_user_confirm,
         "user_summary": result.user_summary,
-        "audit_status": (
-            "executed" if result.audit else resolution.status
-        ),
-        "audit_error": resolution.error,
-        "audit_policy_refusal": resolution.policy_refusal,
+        "audit_status": "executed" if result.audit else "skipped",
+        "audit_error": "",
+        "audit_policy_refusal": False,
     }
 
 
@@ -256,8 +185,10 @@ def change_request(
 # external MCP surface polish).  Present so the tools are one call from exposure.
 # ---------------------------------------------------------------------------
 
-def register_overseer_tools(mcp, *, providers: ProviderMap | None = None,
-                            runs_dir: Optional[Path] = None) -> None:
+
+def register_overseer_tools(
+    mcp, *, providers: ProviderMap | None = None, runs_dir: Optional[Path] = None
+) -> None:
     """Register ``audit_now`` and ``change_request`` MCP tools onto *mcp*.
 
     Not called from server.py in T-W13 (in-app pivot).  A future MCP-freshness task
@@ -266,18 +197,23 @@ def register_overseer_tools(mcp, *, providers: ProviderMap | None = None,
     import json as _json
 
     @mcp.tool()
-    def audit_now_tool(run_id: str, stage: str = "", roles: str = "",
-                       buildgraph_nodes: str = "") -> str:
+    def audit_now_tool(
+        run_id: str, stage: str = "", roles: str = "", buildgraph_nodes: str = ""
+    ) -> str:
         scope = {
             "stage": stage,
             "roles": [r for r in roles.split(",") if r],
             "buildgraph_nodes": [n for n in buildgraph_nodes.split(",") if n],
         }
-        return _json.dumps(audit_now(run_id, scope, providers=providers,
-                                     runs_dir=runs_dir), indent=2)
+        return _json.dumps(
+            audit_now(run_id, scope, providers=providers, runs_dir=runs_dir), indent=2
+        )
 
     @mcp.tool()
     def change_request_tool(text: str, run_id: str, stage: str = "fix") -> str:
-        return _json.dumps(change_request(text, run_id, stage=stage,
-                                          providers=providers, runs_dir=runs_dir),
-                           indent=2)
+        return _json.dumps(
+            change_request(
+                text, run_id, stage=stage, providers=providers, runs_dir=runs_dir
+            ),
+            indent=2,
+        )

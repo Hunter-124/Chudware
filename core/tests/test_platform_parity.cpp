@@ -35,7 +35,7 @@
 #include "doc/document.h"
 #include "doc/stepplus.h"
 #include "mate/mate.h"
-#ifdef CHUDWARE_WITH_NETGEN
+#ifdef CHUDWARE_WITH_POLYMESH
 #include "sim/fea_run.h"
 #endif
 
@@ -211,24 +211,24 @@ void exercise_assembly(const json& fixture, const std::string& doc_name) {
         throw std::runtime_error(doc_name + ": assembly fixture must contain exactly three mates");
 }
 
-#ifdef CHUDWARE_WITH_NETGEN
-void exercise_netgen(const json& fixture, const TopoDS_Shape& shape, const std::string& doc_name) {
+#ifdef CHUDWARE_WITH_POLYMESH
+void exercise_fea(const json& fixture, const TopoDS_Shape& shape, const std::string& doc_name) {
     if (!fixture.contains("fea")) return;
     const fs::path path = fs::temp_directory_path() /
                           ("chudware-platform-parity-" + doc_name + ".step");
     STEPControl_Writer writer;
     if (writer.Transfer(shape, STEPControl_AsIs) != IFSelect_RetDone ||
         writer.Write(path.string().c_str()) != IFSelect_RetDone)
-        throw std::runtime_error(doc_name + ": cannot write STEP input for Netgen");
+        throw std::runtime_error(doc_name + ": cannot write STEP input for FEA");
     json study = fixture.at("fea");
     study["step_path"] = path.string();
     const json solved = chudware::sim::fea_run_static(study);
     std::error_code ignored;
     fs::remove(path, ignored);
     if (!solved.value("ok", false))
-        throw std::runtime_error(doc_name + ": Netgen FEA solve failed: " + solved.dump());
+        throw std::runtime_error(doc_name + ": Polyhedral-FEA solve failed: " + solved.dump());
     if (solved.value("n_nodes", 0) <= 0 || solved.value("n_elems", 0) <= 0)
-        throw std::runtime_error(doc_name + ": Netgen returned an empty FEA mesh");
+        throw std::runtime_error(doc_name + ": FEA returned an empty mesh");
 }
 #endif
 
@@ -248,8 +248,8 @@ json build_document(const fs::path& fixture_path) {
 
     exercise_assembly(fixture, doc_name);
     const TopoDS_Compound shape = compound_of(compiled.shapes);
-#ifdef CHUDWARE_WITH_NETGEN
-    exercise_netgen(fixture, shape, doc_name);
+#ifdef CHUDWARE_WITH_POLYMESH
+    exercise_fea(fixture, shape, doc_name);
 #endif
 
     const double density = fixture.value("density_kg_mm3", 1.0);
@@ -298,9 +298,9 @@ TEST_CASE("canonical platform parity corpus builds") {
 }
 
 int main(int argc, char** argv) {
-#ifndef CHUDWARE_WITH_NETGEN
-    std::cout << "SKIP: test_platform_parity requires CHUDWARE_WITH_NETGEN=ON "
-                 "because netgen_fea_bracket is a required canonical document\n";
+#ifndef CHUDWARE_WITH_POLYMESH
+    std::cout << "SKIP: test_platform_parity requires CHUDWARE_WITH_POLYMESH=ON "
+                 "because the FEA bracket is a required canonical document\n";
     return 77;
 #else
     if (argc == 3 && std::string(argv[1]) == "--parity-dump")

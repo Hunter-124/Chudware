@@ -200,9 +200,8 @@ Production is **continuous**: it tracks canonical `master`, not tags.
   `native-build` only reports success when all four legs pass; `linux-gate` is
   the only workflow that concludes at all, and it carries a standing backlog of
   roughly fifty failures unrelated to shipping a web bundle — agent
-  tool-guidance curation, MCP suites, and env-optional dependencies (Netgen,
-  torch, DVC) that CI does not provision. Blocking on a workflow that cannot
-  conclude does not make anything safer; it stops production tracking master,
+  tool-guidance curation, MCP suites, torch, and DVC. Blocking on a workflow
+  that cannot conclude does not make anything safer; it stops production tracking master,
   silently, behind a tree that looks green. That is exactly how production came
   to serve a bundle linked 2026-08-07 for fifteen days. All three states are
   read and reported into the run log and summary; none of them vetoes a release.

@@ -1,13 +1,8 @@
-// Shared element-sizing brain for every mesher backend.
+// Chudware's user-facing element-sizing and memory-governor policy.
 //
-// "Fineness 0.5" must mean the same element size whichever backend runs, and the
-// host-memory governor must clamp both — otherwise switching mesher silently changes the
-// physics (a coarser mesh reads a lower stress) or lets a 12 GB solve start on a laptop.
-// So the sizing decision lives here, once, and both mesher.cpp (Netgen) and
-// polymesh_backend.cpp consume it.
-//
-// This header names OCCT types, unlike the backend-free sim/mesher.h; it is internal to
-// the mesher targets and is not part of the FEA solver seam.
+// Polyhedral-FEA owns geometry classification and volume filling; this seam
+// translates the product fineness control into a bounded millimetre size band
+// before meshing begins.
 #pragma once
 
 #include <string>

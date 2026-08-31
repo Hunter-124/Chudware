@@ -1155,10 +1155,10 @@ def _static_ctx(tmp_path) -> dict:
     return {"analysis": "fea_static", "doc": "doc-1", "material": _MATERIAL,
             "material_arg": "steel", "fixtures": ["bottom"],
             "loads": [{"face": "top", "force": [0.0, 0.0, -200.0]}],
-            "mesh_fineness": 0.5, "mesher_backend": "netgen", "step_path": str(step),
+            "mesh_fineness": 0.5, "step_path": str(step),
             "study": {"step_path": str(step), "material": _MATERIAL,
-                      "fixtures": [{"nodes": [0, 1, 2]}], "mesh_order": 2, "fineness": 0.5,
-                      "mesher_backend": "netgen",
+                      "fixtures": [{"nodes": [0, 1, 2]}], "mesh_order": 2,
+                      "fineness": 0.5,
                       "loads": [{"type": "force", "vector": [0.0, 0.0, -200.0],
                                  "faces": [{"nodes": [3, 4, 5]}]}]}}
 
@@ -1226,9 +1226,9 @@ def test_modal_widening_lives_in_the_stage_so_both_paths_solve_the_same_physics(
     step.write_text("ISO-10303-21;", encoding="utf-8")
     ctx = {"analysis": "fea_modal", "doc": "doc-2", "material": _MATERIAL,
            "material_arg": "steel", "fixtures": [], "fixture_sets": [], "free_free": True,
-           "mesh_fineness": 0.5, "mesher_backend": "netgen", "step_path": str(step),
+           "mesh_fineness": 0.5, "step_path": str(step),
            "study": {"step_path": str(step), "material": _MATERIAL, "fixtures": [],
-                     "mesh_order": 2, "fineness": 0.5, "mesher_backend": "netgen"}}
+                     "mesh_order": 1, "fineness": 0.5}}
     monkeypatch.setattr(sim_tools, "_build_modal_study", lambda *a, **kw: dict(ctx))
     monkeypatch.setattr(sim_tools, "_autosave_all_open", lambda: None)
 
@@ -1340,7 +1340,6 @@ def _adaptive_raw(target_met: bool) -> dict:
             "eta_target": 0.05,
             "eta_target_met": target_met,
             "stop_reason": stop,
-            "mesher_backend": "polymesh",
         },
     }
 
@@ -1361,7 +1360,6 @@ def test_reconnected_adaptive_job_uses_adaptive_collector_and_keeps_convergence_
     assert out["global_eta"] == 0.03 and out["eta_target"] == 0.05
     assert out["passes_run"] == 2 and len(out["passes"]) == 2
     assert out["stop_reason"] == "eta_target_met"
-    assert out["adapt"]["mesher_backend"] == "polymesh"
     assert "final refined mesh" in out["resolution_note"]
     assert len(persisted) == 1 and persisted[0]["type"] == "fea_adaptive", persisted
     assert persisted[0]["adapt"] == out["adapt"]

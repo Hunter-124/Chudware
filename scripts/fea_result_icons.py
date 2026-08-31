@@ -12,7 +12,7 @@ use, all raw core-bridge method names):
 
     doc_new -> doc_apply_ops(add_feature box) -> doc_export_step
             -> doc_query/doc_face_points (resolve clamp + load facesets)
-            -> sim_run_static  (Netgen tet10 solve; needs the occt build .so)
+            -> sim_run_static  (Polyhedral-FEA tet10 solve)
 
 ``sim_run_static`` returns the full field (per-node von_mises / displacement) AND an
 ``overlay_aicm`` file: the surface tessellation with per-surface-vertex von_mises
@@ -46,10 +46,7 @@ sys.path.insert(0, str(REPO))
 
 
 def _resolve_libchudware() -> None:
-    """Point core_bridge at a FEA-capable libchudware.so. The plain build-linux .so
-    does NOT carry the Netgen FEA RPCs ("unknown method: sim_run_static"), so we
-    prefer build-occt-linux. Worktrees carry no build dir -> fall back to the main
-    checkout via the git common dir (same probe as cam_toolpath_icons.py)."""
+    """Point core_bridge at a FEA-capable libchudware.so, preferring the full OCCT build."""
     import subprocess
     if os.environ.get("CHUDWARE_LIBCHUDWARE"):
         return
@@ -63,7 +60,7 @@ def _resolve_libchudware() -> None:
     except Exception:
         pass
     for root in roots:
-        # occt build FIRST — it is the one with CHUDWARE_WITH_NETGEN / the FEA plugin.
+        # Prefer the full OCCT/Polyhedral-FEA build.
         for rel in ("core/build-occt-linux/bin/libchudware.so",
                     "host/build-occt-linux/bin/libchudware.so"):
             p = root / rel
@@ -306,7 +303,7 @@ def main() -> int:
 
     if not os.environ.get("CHUDWARE_LIBCHUDWARE"):
         print("[fea_icons] FAILED: no FEA-capable libchudware.so found "
-              "(need core/build-occt-linux/bin/libchudware.so with CHUDWARE_WITH_NETGEN)")
+              "(need a CHUDWARE_WITH_POLYMESH build)")
         return 1
 
     parsed, summary, stats = solve_cantilever(cb)

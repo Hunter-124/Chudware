@@ -120,7 +120,7 @@ def run(quick: bool = False) -> list[dict]:
         if "unknown method" in str(exc):
             return [_case("engine_load", status="skip", total_s=time.time() - t0,
                           detail="libchudware.so lacks sim_run_modal "
-                                 "(no CHUDWARE_WITH_NETGEN FEA plugin)")]
+                                 "(Polyhedral-FEA not built)")]
         # anything else falls through — an empty study is expected to error
 
     fineness = 0.3 if quick else 0.5

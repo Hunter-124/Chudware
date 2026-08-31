@@ -42,8 +42,7 @@ from services.sim.fea_thermal_transient import (  # noqa: E402
     FluxLoad, Schedule, box_mesh, solve_transient)
 
 # ---------------------------------------------------------------------------
-# Engine availability probe (once per module) — mirrors test_fea_live_bridge's
-# honest-skip convention: the plain core build lacks the Netgen FEA RPC family.
+# Engine availability probe mirrors test_fea_live_bridge's honest-skip convention.
 # ---------------------------------------------------------------------------
 _SKIP_REASON = ""
 try:

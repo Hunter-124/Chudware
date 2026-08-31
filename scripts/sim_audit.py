@@ -428,8 +428,7 @@ def audit_ecad_sim() -> None:
 
 # ===========================================================================
 # FAMILY 5: FEA static + modal (C++ core via core_bridge)
-# The full core/build-occt-linux library carries the Netgen-backed solve RPCs;
-# a smaller library may legitimately SKIP them but must never receive PASS.
+# The full build carries Polyhedral-FEA; deliberately slim builds skip.
 # ===========================================================================
 
 def _load_core_bridge():
@@ -437,8 +436,7 @@ def _load_core_bridge():
     lib_path = os.environ.get("CHUDWARE_LIBCHUDWARE", "")
     if not lib_path or not os.path.exists(lib_path):
         return None, ("CHUDWARE_LIBCHUDWARE not set or .so not found — export "
-                      "CHUDWARE_LIBCHUDWARE=core/build-occt-linux/bin/libchudware.so "
-                      "(use build-linux when no Netgen FEA solve is needed)")
+                      "CHUDWARE_LIBCHUDWARE=core/build-occt-linux/bin/libchudware.so")
     # A standalone audit should exercise the explicitly selected library, not an
     # unrelated already-running daemon. An explicit caller override still wins.
     os.environ.setdefault("CHUDWARE_ENGINE_DAEMON", "0")
@@ -546,13 +544,11 @@ def audit_fea() -> None:
         except CoreError as exc:
             if "unknown method" in str(exc):
                 _skip("run_fea_static",
-                      "loaded libchudware lacks sim_run_static; use the "
-                      "CHUDWARE_WITH_NETGEN build at "
-                      "core/build-occt-linux/bin/libchudware.so")
+                      "loaded libchudware lacks sim_run_static; use a "
+                      "CHUDWARE_WITH_POLYMESH build")
                 _skip("run_fea_modal",
-                      "loaded libchudware lacks sim_run_modal; use the "
-                      "CHUDWARE_WITH_NETGEN build at "
-                      "core/build-occt-linux/bin/libchudware.so")
+                      "loaded libchudware lacks sim_run_modal; use a "
+                      "CHUDWARE_WITH_POLYMESH build")
                 return
             raise
         if not res.get("ok"):
@@ -583,9 +579,8 @@ def audit_fea() -> None:
         except CoreError as exc:
             if "unknown method" in str(exc):
                 _skip("run_fea_modal",
-                      "loaded libchudware lacks sim_run_modal; use the "
-                      "CHUDWARE_WITH_NETGEN build at "
-                      "core/build-occt-linux/bin/libchudware.so")
+                      "loaded libchudware lacks sim_run_modal; use a "
+                      "CHUDWARE_WITH_POLYMESH build")
             else:
                 _record("run_fea_modal", "BROKEN", f"CoreError: {exc}")
         except Exception as exc:  # noqa: BLE001
@@ -723,7 +718,7 @@ def audit_fatigue() -> None:
         traceback.print_exc()
         return
 
-    # --- Live engine cross-check (needs the netgen .so + a prior static solve) --
+    # --- Live engine cross-check (needs an FEA-capable .so + prior static solve) ---
     cb, reason = _load_core_bridge()
     if cb is None:
         _skip("run_fea_fatigue [live]", reason)
@@ -762,7 +757,7 @@ def audit_fatigue() -> None:
     except CoreError as exc:
         if "unknown method" in str(exc):
             _skip("run_fea_fatigue [live]",
-                  "this .so lacks sim_run_fatigue (needs CHUDWARE_WITH_NETGEN build)")
+                  "this .so lacks sim_run_fatigue (Polyhedral-FEA not built)")
         else:
             _record("run_fea_fatigue [live]", "BROKEN", f"CoreError: {exc}")
     except Exception as exc:  # noqa: BLE001
@@ -871,7 +866,7 @@ def audit_thermal() -> None:
     except CoreError as exc:
         if "unknown method" in str(exc):
             _skip("sim_run_thermal [live]",
-                  "this .so lacks sim_run_thermal (needs CHUDWARE_WITH_NETGEN build)")
+                  "this .so lacks sim_run_thermal (Polyhedral-FEA not built)")
         else:
             _record("sim_run_thermal [live]", "BROKEN", f"CoreError: {exc}")
     except Exception as exc:  # noqa: BLE001

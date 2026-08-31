@@ -1607,3 +1607,19 @@ proved core and host builds before its fixed 600-second deadline expired in the 
 WASM step. The GUI profile panel remains deliberately deferred by T-X5; the board's `done`
 transition is also human-only, so the card records completed DoD while retaining its
 machine-enforced pre-merge status.
+
+## 2026-08-30 — Polyhedral-FEA sole-mesher cutover
+
+Polyhedral-FEA is now the only in-process FEA volume mesher. The cutover removed Netgen
+provisioning/runtime staging, the custom structured-hex generator, backend selection,
+Netgen-only mesh controls, cross-backend tests, component-cache machinery, and stale agent/UI
+guidance. `sim/mesher.{h,cpp}` is the narrow graded-tet/tet10 adapter; sizing and quality live
+in focused `mesh_size_band.cpp` and `mesh_quality.cpp` units, while Chudware keeps its existing
+static/modal/thermal/fatigue solvers and overlay contract. Coarse/draft meshes skip the extra
+feature-grading pass to remain interactive; medium/fine retain it, and adaptive studies still
+drive the Polyhedral-FEA size field and ZZ recovery. The build now enables the pinned BSD-3
+source by default with OCCT, rejects removed wire keys instead of silently aliasing them, and
+cleans stale Netgen cache variables and packaged libraries. Verification: both consumed core
+trees and the desktop host build; `mesh`, `mesh_quality`, `mesher_advanced`, and `sim_cache`
+ctests pass; focused MCP simulation tests pass 9/9, argument reconciliation 83/83, and the
+live Simulation mesh panel shows only Polyhedral-FEA fineness/order/size/adaptive controls.

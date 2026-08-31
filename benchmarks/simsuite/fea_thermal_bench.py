@@ -16,13 +16,10 @@ the seam behind cad_tools.run_fea_thermal's transient branch):
                             SAME mesh/steps — differential, ref = oracle value
   steady_ccx_bar            CalculiX *HEAT TRANSFER STEADY STATE box bar (the
                             run_fea_thermal steady backend) → mid-plane mean
-  transient_realmesh_cool   (full mode only) doc box → STEP → Netgen tet mesh →
-                            lumped cooling on the REAL mesh path. Uses
-                            target_size_mm=5 so element size > the fixed
-                            doc_face_points perp_tol (1.5 mm): finer meshes let
-                            subsurface nodes into the facesets and the node-set
-                            surface enumeration then inflates the film area
-                            (known issue, see the fea_thermal findings).
+  transient_realmesh_cool   (full mode only) doc box → STEP → Polyhedral-FEA mesh →
+                            lumped cooling on the real mesh path. target_size_mm=5 keeps
+                            element size above the 1.5 mm face-point tolerance; finer
+                            meshes currently admit subsurface nodes and inflate film area.
 
 Inline cases use the oracle's deterministic Kuhn box mesh (no mesher), with
 facesets passed as exact node coordinates, one boundary plane per faceset (a
@@ -298,7 +295,7 @@ def run(quick: bool = False) -> list:
                                "t_amb_c": Tamb2} for fp in fps],
                     "transient": {"t_end_s": tau2, "dt_s": tau2 / 400.0,
                                   "t_init_c": T02}}})
-                c["solve_s"] = time.time() - ts   # includes Netgen meshing (in-RPC)
+                c["solve_s"] = time.time() - ts   # includes meshing
                 if not res.get("ok"):
                     c.update(status="fail", detail=res.get("error", ""),
                              total_s=time.time() - t0)

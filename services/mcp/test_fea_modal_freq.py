@@ -29,7 +29,7 @@ TOLERANCE (modal vs Euler-Bernoulli): 5 %.
   beam), mode mis-ordering (adjacent analytic modes differ by 3x / 2.1x), and any
   unit slip (>= 1000x).
 
-Skips honestly when the loaded libchudware.so lacks the Netgen FEA RPCs.
+Skips honestly when the loaded libchudware.so lacks the FEA RPCs.
 
 Run:  CHUDWARE_ENGINE_DAEMON=0 .venv-mcp/bin/python -X utf8 -m pytest \
           services/mcp/test_fea_modal_freq.py -v
@@ -104,7 +104,7 @@ def _engine():
     except CoreError as exc:
         if "unknown method" in str(exc):
             pytest.skip("loaded libchudware.so lacks sim_run_modal "
-                        "(no CHUDWARE_WITH_NETGEN FEA plugin)")
+                        "(Polyhedral-FEA not built)")
         raise
     _CACHE["cb"] = cb
     return cb

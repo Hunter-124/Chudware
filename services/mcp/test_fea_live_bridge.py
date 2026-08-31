@@ -1,8 +1,7 @@
 """T-SIM4 live FEA bridge integration test — cantilever static + modal vs beam theory.
 
-Drives the REAL engine exactly like a user session would, on the RAW core bridge
-(no full MCP server needed — the CHUDWARE_WITH_NETGEN build registers
-``sim_run_static``/``sim_run_modal`` directly in core/api/libchudware.cpp):
+Drives the real Polyhedral-FEA-enabled engine exactly like a user session would, on the
+raw core bridge (no full MCP server needed).
 
   1. engine doc-load contract: ``doc_new`` + ``eq_set`` + ``add_feature``
      (box driven through an equation global, so the eq path is exercised),
@@ -25,14 +24,10 @@ Assertions are BEAM-THEORY ANCHORS with physical-sanity bounds, not exact floats
     Table 8.1: β₁L = 1.87510). A square section must also give a near-degenerate
     second mode (two orthogonal bending planes).
 
-Solver selection (no all-skip trap): the gate auto-points CHUDWARE_LIBCHUDWARE at the
-plain core/build-linux .so, which does NOT carry the Netgen FEA RPCs ("unknown
-method: sim_run_static"). This test therefore probes candidates in order —
-$CHUDWARE_LIBCHUDWARE first, then core/build-occt-linux/bin/libchudware.so — and runs
-against the first one that exposes the FEA RPCs, so it EXECUTES in the local
-gate where the occt build exists. It skips honestly (with the probed reasons)
-only when no candidate .so has the FEA plugin. Each candidate is probed in a
-fresh subprocess because core_bridge binds one .so per process.
+Solver selection probes the configured library first, then the full OCCT build, and runs
+against the first candidate exposing the FEA RPC family. It skips only when none does.
+Each candidate is probed in a fresh subprocess because core_bridge binds one library per
+process.
 
 Run directly:  CHUDWARE_LIBCHUDWARE=core/build-occt-linux/bin/libchudware.so \
                python -m pytest services/mcp/test_fea_live_bridge.py -v
@@ -91,12 +86,12 @@ def _drive(so_path: str, out_path: str) -> None:
     def _emit(payload: dict) -> None:
         Path(out_path).write_text(json.dumps(payload))
 
-    # Probe: does this build carry the Netgen FEA RPCs at all?
+    # Probe whether this build carries the FEA RPCs.
     try:
         cb.call("sim_run_static", {"study": {}})
     except CoreError as exc:
         if "unknown method" in str(exc):
-            _emit({"skipped": f"build lacks sim_run_static (no CHUDWARE_WITH_NETGEN): "
+            _emit({"skipped": f"build lacks sim_run_static (no Polyhedral-FEA): "
                               f"{so_path}"})
             return
         raise
@@ -238,7 +233,7 @@ def _live_results():
         _CACHE["results"] = payload
         return payload
 
-    pytest.skip("no candidate .so exposes the Netgen FEA RPCs — " + " | ".join(reasons))
+    pytest.skip("no candidate .so exposes the FEA RPCs — " + " | ".join(reasons))
     return None  # unreachable
 
 

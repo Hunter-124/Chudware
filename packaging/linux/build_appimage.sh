@@ -258,12 +258,9 @@ audit_production_payload() {
 
 # Learned mesh-advisor runtime (the polymesh ONNX advisor).
 #
-# core/sim/polymesh_backend.cpp resolves the model package relative to ITS OWN module —
-# libchudware.so — so the package belongs in usr/lib beside the engine, never in usr/bin
-# beside the GUI: the GUI dlopen's the engine and the two live in different directories
-# here. Only the four artifacts the advisor actually opens are carried; the rest of
-# bench/advisor is campaign evidence (the cross-validation dumps alone are ~90 MB, plus an
-# 8 MB dashboard) with no runtime role.
+# core/sim/mesher.cpp resolves the package relative to libchudware.so, so it belongs in
+# usr/lib beside the engine. Only the four runtime artifacts are carried; campaign evidence
+# and dashboards stay out of the AppImage.
 #
 # The engine's own DT_NEEDED entries decide whether any of this ships. An engine configured
 # without the advisor links no ONNX Runtime and needs no package, so such a build stages
@@ -418,16 +415,11 @@ if [ "$WITH_LIBCHUDWARE" = "1" ]; then
         exit 1
     }
     cp "$LIBCHUDWARE" "$APPDIR/usr/lib/libchudware.so"
-        # Sibling runtime .so deps that live next to the occt engine (Netgen mesher,
-        # lib3mf export) — libchudware.so resolves them via its RUNPATH/LD_LIBRARY_PATH,
-        # so they must ride along or FEA meshing breaks on a clean machine. (The full
-        # OCCT 7.9 closure is bundled by the excludelist walk just below.)
+        # Optional lib3mf runtime lives beside the engine and must ride along when present.
         LIBDIR="$(dirname "$LIBCHUDWARE")"
-        for sib in libnglib.so libngcore.so lib3mf.so; do
-            if [ -f "$LIBDIR/$sib" ]; then
-                cp "$LIBDIR/$sib" "$APPDIR/usr/lib/$sib"
-            fi
-        done
+        if [ -f "$LIBDIR/lib3mf.so" ]; then
+            cp "$LIBDIR/lib3mf.so" "$APPDIR/usr/lib/lib3mf.so"
+        fi
         echo "==> bundled libchudware.so + siblings from $LIBDIR (real engine, not demo mode)"
 
         # Advisor model package + ONNX Runtime, beside the engine that resolves them. Runs
@@ -441,8 +433,8 @@ if [ "$WITH_LIBCHUDWARE" = "1" ]; then
         # cannot open a document on a machine without OCCT 7.9 installed (verified: the
         # libTK* deps resolve to /lib64 on the build host but are "not found" in a clean
         # fedora:rawhide container). ldd emits the FULL flattened transitive closure, so
-        # seeding with libchudware.so (+ the mesh/export siblings and chudware-hostd, which
-        # dlopens the engine) captures OCCT and everything OCCT itself pulls. We copy
+        # seeding with libchudware.so, its optional siblings, and chudware-hostd captures
+        # OCCT and everything OCCT itself pulls. We copy
         # every resolved dep whose basename is NOT on the AppImage excludelist — glibc,
         # libstdc++/libgcc_s, the GL/X11 graphics-driver stack, and freetype/fontconfig/
         # harfbuzz stay host-provided (they interoperate with the host's fonts/drivers).

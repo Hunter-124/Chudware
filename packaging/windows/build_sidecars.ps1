@@ -184,12 +184,8 @@ function Assert-SourceFreePayload([string]$RootPath) {
 
 # Learned mesh-advisor runtime (the polymesh ONNX advisor).
 #
-# core/sim/polymesh_backend.cpp resolves the model package relative to ITS OWN module —
-# libchudware.dll — and the Windows payload is flat, so the package belongs in the GUI
-# runtime root that services/installer/build_release.py copies verbatim into the payload,
-# right beside the engine. Only the four artifacts the advisor opens are carried; the rest
-# of the model's bench/advisor directory is campaign evidence (cross-validation dumps and a
-# dashboard, tens of MB) with no runtime role.
+# core/sim/mesher.cpp resolves the package relative to libchudware.dll. The flat Windows
+# payload therefore keeps the four runtime artifacts beside the engine.
 #
 # The engine's own import table decides whether anything ships. An engine configured
 # without the advisor imports no onnxruntime.dll and needs no package, so such a build

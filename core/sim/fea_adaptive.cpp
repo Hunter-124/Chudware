@@ -16,7 +16,6 @@
 #include "sim/fea_run.h"
 #include "sim/mesher.h"
 #include "sim/overlay.h"
-#include "sim/polymesh_backend.h"
 
 namespace chudware::sim {
 
@@ -37,20 +36,12 @@ constexpr double kDefaultEtaTarget = 0.05;
 MeshOptions mesh_options_from_study(const json& study) {
     MeshOptions options;
     options.fineness = study.value("fineness", 0.5);
-    options.density = study.value("density", -1.0);
     options.order = study.value("mesh_order", study.value("order", 1));
     options.target_size_mm = study.value("target_size_mm", 0.0);
     options.min_size_mm = study.value("min_size_mm", 0.0);
     options.max_size_mm = study.value("max_size_mm", 0.0);
-    // The learned advisor is opt-in per study and is read from the SAME two keys
-    // fea_run.cpp's STEP route reads. Dropping them here is what previously made an
-    // opted-in adaptive study the one route that could never reach the advisor.
     options.learned_advisor = study.value("learned_advisor", false);
     options.advisor_max_dof = study.value("advisor_max_dof", uint32_t{0});
-    // An adaptive run resolves its own element size every pass, so the Netgen-only shape
-    // controls are not merely unused, they would be misleading if echoed.
-    options.curvature = false;
-    options.backend = MesherBackend::Polymesh;
     return options;
 }
 
@@ -58,21 +49,6 @@ MeshOptions mesh_options_from_study(const json& study) {
 
 json fea_run_adaptive(const json& study) {
     try {
-        if (!mesher_backend_available(MesherBackend::Polymesh))
-            return json{{"ok", false},
-                        {"error", "fea_adaptive: adaptive refinement needs the polymesh "
-                                  "backend, which this build was configured without "
-                                  "(CHUDWARE_WITH_POLYMESH)"}};
-
-#ifndef CHUDWARE_WITH_POLYMESH
-        // The availability check above already answered, but the
-        // PolymeshAdaptiveMesher definitions are compiled OUT of this build —
-        // every reference below must be compiled away or the link fails.
-        return json{{"ok", false},
-                    {"error", "fea_adaptive: adaptive refinement needs the polymesh "
-                              "backend, which this build was configured without "
-                              "(CHUDWARE_WITH_POLYMESH)"}};
-#else
         const std::string step_path = study.value("step_path", std::string());
         if (step_path.empty())
             return json{{"ok", false},
@@ -93,18 +69,17 @@ json fea_run_adaptive(const json& study) {
 
         const MeshOptions options = mesh_options_from_study(study);
         std::string error;
-        std::unique_ptr<PolymeshAdaptiveMesher> mesher =
-            PolymeshAdaptiveMesher::open(step_path, options, error);
+        std::unique_ptr<AdaptiveMesher> mesher =
+            AdaptiveMesher::open(step_path, options, error);
         if (!mesher)
             return json{{"ok", false}, {"error", "fea_adaptive: " + error}};
 
-        // The per-pass study: same everything, minus the geometry source, plus the mesh
-        // this pass produced. Dropping step_path is what makes fea_run_static take the
-        // inline route instead of re-meshing with Netgen behind our back.
+        // Each pass uses the ordinary inline-mesh solve route so boundary conditions,
+        // materials, cancellation, and result formatting remain shared with static FEA.
         json pass_study = study;
         pass_study.erase("step_path");
         pass_study.erase("adapt");
-        // The advisor already ran, on the geometry, in PolymeshAdaptiveMesher::open. Left in
+        // The advisor already ran, on the geometry, in AdaptiveMesher::open. Left in
         // place these two keys make fea_run_static's inline route report the envelope it
         // owes an inline study — "advisor unavailable: learned advising requires STEP
         // geometry" — which for THIS study would be a false statement about a decision that
@@ -196,11 +171,10 @@ json fea_run_adaptive(const json& study) {
                                {"global_eta", global_eta},
                                {"eta_target", eta_target},
                                {"eta_target_met", target_met},
-                               {"stop_reason", stop_reason},
-                               {"mesher_backend", mesher_backend_name(MesherBackend::Polymesh)}};
+                               {"stop_reason", stop_reason}};
         // The envelope the advisor actually produced for THIS geometry, in the same shape
         // every other study route reports it. mesh.advisor is the value
-        // PolymeshAdaptiveMesher::mesh attached on the final pass; it is absent exactly
+        // AdaptiveMesher::mesh attached on the final pass; it is absent exactly
         // when the study never opted in.
         if (mesh.advisor) result["advisor"] = detail::mesh_advisor_json(*mesh.advisor);
         // A result that missed its accuracy target must SAY so where a reader will see it,
@@ -235,7 +209,6 @@ json fea_run_adaptive(const json& study) {
             }
         }
         return result;
-#endif  // CHUDWARE_WITH_POLYMESH
     } catch (const json::exception& e) {
         return json{{"ok", false},
                     {"error", std::string("fea_adaptive: invalid study JSON: ") + e.what()}};

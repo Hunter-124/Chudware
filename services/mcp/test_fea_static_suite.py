@@ -10,19 +10,16 @@ Coverage:
     L-bracket / shelled box / revolve / multi-feature / loft / sweep) builds
     through engine ops AND meshes without failure, with sane quality metrics;
   * analytic accuracy anchors — Euler-Bernoulli cantilever deflection (Roark 8th
-    T8.1-1a), Peterson/Kirsch stress concentration at a hole, Lamé thick-wall
-    radial displacement + hoop-stress bracket (Timoshenko & Goodier §28);
-  * element-order hierarchy (tet10 beats tet4 on bending; structured hex8 beats
-    tet4) — the accuracy/speed frontier's sanity backbone;
+    T8.1-1a), Peterson/Kirsch stress concentration, and Lamé thick-wall response;
+  * element-order hierarchy (tet10 beats tet4 on bending);
   * pressure-load/force-load consistency — regression witness for the core
     defect FIXED 2026-07-12 (core/sim/fea_run.cpp accumulate_face_weights used
     unoriented fan normals; now flipped outward vs element centroid). PASSES
     against a fixed .so; the dynamic xfail remains as a regression tripwire —
     do not delete it.
 
-Skips honestly (with the probe reason) when the staged libchudware.so lacks the
-Netgen FEA RPCs. Meshes are kept coarse — the whole module is a smoke-priced
-suite, the timing baseline lives in benchmarks/simsuite/.
+Skips honestly when the staged libchudware.so lacks the FEA RPCs. Meshes are kept coarse;
+the timing baseline lives in benchmarks/simsuite/.
 """
 from __future__ import annotations
 
@@ -82,10 +79,9 @@ def test_geometry_builds_and_meshes(geom):
 
 # --------------------------------------------------------- analytic anchors
 
-def _cantilever(order, fineness, structured=False):
-    return _cached(("cant", order, fineness, structured),
-                   lambda: fsc.case_cantilever("t", order=order, fineness=fineness,
-                                               structured=structured))
+def _cantilever(order, fineness):
+    return _cached(("cant", order, fineness),
+                   lambda: fsc.case_cantilever("t", order=order, fineness=fineness))
 
 
 def test_cantilever_tet10_matches_euler_bernoulli():
@@ -110,13 +106,6 @@ def test_cantilever_order_hierarchy_tet10_beats_tet4():
     assert c4["metric"] < c4["ref"], f"tet4 coarser than ref? {c4}"
 
 
-def test_cantilever_hex_mesh_supported_and_beats_tet4():
-    """structured=true on a box must actually produce hex8 (not silently fall back)
-    and improve on shear-locked tet4 at the same fineness (measured 30 % vs 60 %)."""
-    ch = _cantilever(1, 0.3, structured=True)
-    c4 = _cantilever(1, 0.3)
-    assert ch["quality"]["mesh_type"] == "hex8", ch["quality"]
-    assert ch["rel_err"] < c4["rel_err"], (ch["rel_err"], c4["rel_err"])
 
 
 def test_plate_hole_stress_concentration_bracket():
@@ -125,9 +114,8 @@ def test_plate_hole_stress_concentration_bracket():
     low on tet10), so the bracket is [0.65, 1.35]×ref — it still catches the real
     failure modes: no concentration at all (ratio ~0.4), double-counted loads, or
     a runaway singularity."""
-    c = _cached(("plate", 2, 0.3, 24.0),
-                lambda: fsc.case_plate_hole("t", order=2, fineness=0.3,
-                                            curv_elems_per_circle=24.0))
+    c = _cached(("plate", 2, 0.3),
+                lambda: fsc.case_plate_hole("t", order=2, fineness=0.3))
     assert c["status"] == "ok", c
     ratio = c["metric"] / c["ref"]
     assert 0.65 < ratio < 1.35, f"hole peak vm {c['metric']:.2f} vs Ktn ref " \

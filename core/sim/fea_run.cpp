@@ -303,84 +303,79 @@ bool faceset_normal(const json& fs, std::array<double, 3>& face_normal, double& 
     return true;
 }
 
-// Resolve the mesh: inline points/tets if present, else mesh the STEP file.
-// Returns true on success (fills points/tets), false with `err` set otherwise.
-// nodes_per_elem is set to 4 (tet4) or 10 (tet10): for an inline mesh it is taken
-// from study["nodes_per_elem"] (default 4); for a STEP mesh it follows the chosen
-// mesh_order (study["mesh_order"], default 1).
-bool resolve_mesh(const json& study, std::vector<double>& points, std::vector<int>& tets,
-                  int& nodes_per_elem, std::string& mesh_type_used, std::string& note,
-                  std::optional<MeshAdvisor>& advisor, std::string& err) {
-    nodes_per_elem = 4;
-    mesh_type_used.clear();
-    note.clear();
-    advisor.reset();
-    // A present step_path ALWAYS re-meshes with the current options. Inline points/tets
-    // are only used as a fallback when there is no step_path, so a cached/stale inline
-    // mesh can never silently override the GUI mesh controls.
-    const bool has_step = study.contains("step_path") && study["step_path"].is_string() &&
-                          !study["step_path"].get<std::string>().empty();
-    if (!has_step && study.contains("points") && study["points"].is_array() &&
-        study.contains("tets") && study["tets"].is_array()) {
-        points = json_doubles(study["points"]);
-        tets = json_ints(study["tets"]);
-        if (points.empty() || tets.empty()) {
-            err = "inline mesh has empty points/tets";
-            return false;
-        }
-        nodes_per_elem = study.value("nodes_per_elem", 4);
-        if (study.value("learned_advisor", false)) {
-            MeshAdvisor unavailable;
-            unavailable.order = nodes_per_elem == 10 ? 2 : 1;
-            unavailable.mesher = "inline";
-            unavailable.model_revision = "not-loaded";
-            unavailable.note =
-                "advisor unavailable: learned advising requires STEP geometry; "
-                "configured inline mesh retained";
-            advisor = std::move(unavailable);
-        }
-        return true;
+// Resolve the mesh: inline points/tets if present, otherwise mesh the STEP
+// file.
+bool resolve_mesh(const json &study, std::vector<double> &points,
+                  std::vector<int> &tets, int &nodes_per_elem,
+                  std::string &mesh_type_used, std::string &note,
+                  std::optional<MeshAdvisor> &advisor, std::string &err) {
+  nodes_per_elem = 4;
+  mesh_type_used.clear();
+  note.clear();
+  advisor.reset();
+  const bool has_step = study.contains("step_path") &&
+                        study["step_path"].is_string() &&
+                        !study["step_path"].get<std::string>().empty();
+  if (has_step) {
+    static constexpr const char *kRemovedMeshOptions[] = {
+        "density",         "curvature",        "curv_elems_per_circle",
+        "optimize",        "mesher_backend",   "structured",
+        "mesh_type",       "auto_type",        "quad_surface",
+        "fallback_to_tet", "thin_wall_layers", "algorithm3d"};
+    for (const char *key : kRemovedMeshOptions) {
+      if (study.contains(key)) {
+        err = std::string("mesh option '") + key +
+              "' was removed with the Polyhedral-FEA cutover";
+        return false;
+      }
     }
-    if (has_step) {
-        std::string step_path = study["step_path"].get<std::string>();
-        MeshOptions opts;
-        // fineness is the primary control; `density` is read as a legacy alias (the
-        // mesher maps a >=0 density onto fineness with the same higher=finer sense).
-        opts.fineness = study.value("fineness", 0.5);
-        opts.density = study.value("density", -1.0);
-        opts.order = study.value("mesh_order", study.value("order", 1));
-        opts.curvature = study.value("curvature", true);
-        opts.curv_elems_per_circle = study.value("curv_elems_per_circle", 12.0);
-        opts.target_size_mm = study.value("target_size_mm", 0.0);
-        opts.min_size_mm = study.value("min_size_mm", 0.0);
-        opts.max_size_mm = study.value("max_size_mm", 0.0);
-        opts.optimize = study.value("optimize", true);
-        opts.backend =
-            mesher_backend_from_string(study.value("mesher_backend", std::string("netgen")));
-        opts.structured = study.value("structured", study.value("mesh_type", std::string()) == "hex");
-        // Exotic-type + auto-pick controls (Simple/Advanced mode). Defaults preserve existing
-        // behavior: auto_type off; structured-hex falls back to tet on a non-box part.
-        opts.auto_type = study.value("auto_type", false);
-        opts.quad_surface = study.value("quad_surface", false);
-        opts.fallback_to_tet = study.value("fallback_to_tet", true);
-        opts.thin_wall_layers = study.value("thin_wall_layers", 4.0);
-        opts.learned_advisor = study.value("learned_advisor", false);
-        opts.advisor_max_dof = study.value("advisor_max_dof", uint32_t{0});
-        MeshOut m = mesh_step_cached(step_path, opts);
-        if (!m.ok) {
-            err = "mesh failed: " + m.error;
-            return false;
-        }
-        points = m.points;
-        tets = m.tets;
-        nodes_per_elem = m.nodes_per_elem;
-        mesh_type_used = m.mesh_type_used;
-        note = m.note;
-        advisor = m.advisor;
-        return true;
+  }
+  if (!has_step && study.contains("points") && study["points"].is_array() &&
+      study.contains("tets") && study["tets"].is_array()) {
+    points = json_doubles(study["points"]);
+    tets = json_ints(study["tets"]);
+    if (points.empty() || tets.empty()) {
+      err = "inline mesh has empty points/tets";
+      return false;
     }
-    err = "study must have inline points/tets or a step_path";
-    return false;
+    nodes_per_elem = study.value("nodes_per_elem", 4);
+    if (study.value("learned_advisor", false)) {
+      MeshAdvisor unavailable;
+      unavailable.order = nodes_per_elem == 10 ? 2 : 1;
+      unavailable.mesher = "inline";
+      unavailable.model_revision = "not-loaded";
+      unavailable.note =
+          "advisor unavailable: learned advising requires STEP geometry; "
+          "configured inline mesh retained";
+      advisor = std::move(unavailable);
+    }
+    return true;
+  }
+  if (has_step) {
+    MeshOptions options;
+    options.fineness = study.value("fineness", 0.5);
+    options.order = study.value("mesh_order", study.value("order", 1));
+    options.target_size_mm = study.value("target_size_mm", 0.0);
+    options.min_size_mm = study.value("min_size_mm", 0.0);
+    options.max_size_mm = study.value("max_size_mm", 0.0);
+    options.learned_advisor = study.value("learned_advisor", false);
+    options.advisor_max_dof = study.value("advisor_max_dof", uint32_t{0});
+    const auto mesh =
+        mesh_step_cached(study["step_path"].get<std::string>(), options);
+    if (!mesh->ok) {
+      err = "mesh failed: " + mesh->error;
+      return false;
+    }
+    points = mesh->points;
+    tets = mesh->tets;
+    nodes_per_elem = mesh->nodes_per_elem;
+    mesh_type_used = mesh->mesh_type_used;
+    note = mesh->note;
+    advisor = mesh->advisor;
+    return true;
+  }
+  err = "study must have inline points/tets or a step_path";
+  return false;
 }
 
 // ── Work-equivalent (consistent) surface-load distribution ───────────────────────
@@ -2366,211 +2361,176 @@ nlohmann::json fea_run_thermal(const nlohmann::json& study) {
     }
 }
 
-// ── Mesh cache (public) ──────────────────────────────────────────────────────────
-// Memoize mesh_step keyed on STEP file CONTENTS + every MeshOptions field. Re-running a
-// study that changed only loads/material/fixtures reuses the mesh (the mesher is the #1 FEA
-// cost). Content-keyed (not path) because the caller may write a fresh temp STEP each solve.
-// P4: the cache stores shared_ptr<const MeshOut>, so a HIT hands back the resident mesh
-// without deep-copying megabytes of points/tets (the old map<key, MeshOut> copied the whole
-// mesh on every hit). LRU eviction just drops the cache's reference — an outstanding caller
-// keeps its mesh alive via its own shared_ptr.
-// Residency is also bounded by a byte budget derived from the resource governor (not only
-// entry count): fine assembly meshes are MBs each and a fixed kCap of 8 can still OOM a
-// low-end box.
+// Memoize mesh_step by STEP contents plus every MeshOptions field. Cache hits
+// return an immutable resident mesh without copying its point/connectivity
+// arrays. Residency is also bounded by a byte budget derived from the resource
+// governor (not only entry count): fine assembly meshes are MBs each and a
+// fixed kCap of 8 can still OOM a low-end box.
 namespace {
-size_t mesh_out_bytes(const MeshOut& m) {
-    size_t bytes =
-        m.points.size() * sizeof(double) + m.tets.size() * sizeof(int) +
-        m.aspect_hist.size() * sizeof(int) + m.mesh_type_used.size() + m.note.size() +
-        m.error.size() + 256;
-    if (m.advisor)
-        bytes += sizeof(MeshAdvisor) + m.advisor->mesher.size() +
-                 m.advisor->model_revision.size() + m.advisor->note.size();
-    return bytes;
+size_t mesh_out_bytes(const MeshOut &mesh) {
+  size_t bytes =
+      mesh.points.size() * sizeof(double) + mesh.tets.size() * sizeof(int) +
+      mesh.aspect_hist.size() * sizeof(int) + mesh.mesh_type_used.size() +
+      mesh.note.size() + mesh.error.size() + 256;
+  if (mesh.advisor)
+    bytes += sizeof(MeshAdvisor) + mesh.advisor->mesher.size() +
+             mesh.advisor->model_revision.size() + mesh.advisor->note.size();
+  return bytes;
 }
 uint64_t mesh_cache_budget_bytes() {
-    const uint64_t host = chudware::governor::budget_bytes();
-    if (host == UINT64_MAX) return 512ull * 1024ull * 1024ull;  // 512 MiB when governor off
-    // Cap mesh-cache residency at 12.5% of the study budget, floored at 64 MiB so a
-    // small machine still keeps a couple of warm meshes.
-    const uint64_t frac = host / 8;
-    return std::max<uint64_t>(64ull * 1024ull * 1024ull, frac);
+  const uint64_t host = chudware::governor::budget_bytes();
+  if (host == UINT64_MAX)
+    return 512ull * 1024ull * 1024ull; // 512 MiB when governor off
+  // Cap mesh-cache residency at 12.5% of the study budget, floored at 64 MiB so
+  // a small machine still keeps a couple of warm meshes.
+  const uint64_t frac = host / 8;
+  return std::max<uint64_t>(64ull * 1024ull * 1024ull, frac);
 }
-}  // namespace
+} // namespace
 
-// Process-wide mesh-cache counters (whole-STEP + per-solid). Shared with mesher.cpp
-// via mesh_cache_note_generation / mesh_cache_stats. File-scope (not anonymous) so the
-// public mesh_cache_* API can touch them.
+// Process-wide whole-STEP mesh-cache counters.
 namespace mesh_cache_detail {
 
-inline uint64_t fnv1a(const void* p, size_t n, uint64_t h = 1469598103934665603ull) {
-    const auto* b = static_cast<const unsigned char*>(p);
-    for (size_t i = 0; i < n; ++i) { h ^= b[i]; h *= 1099511628211ull; }
-    return h;
+inline uint64_t fnv1a(const void *p, size_t n,
+                      uint64_t h = 1469598103934665603ull) {
+  const auto *b = static_cast<const unsigned char *>(p);
+  for (size_t i = 0; i < n; ++i) {
+    h ^= b[i];
+    h *= 1099511628211ull;
+  }
+  return h;
 }
-inline uint64_t mesh_opts_key(const MeshOptions& o, uint64_t h) {
-    static_assert(sizeof(MeshOptions) == 80,
-                  "MeshOptions size changed — a field was added/removed. Update mesh_opts_key "
-                  "to hash the new field(s), then update this expected size. The mesh cache "
-                  "MUST fold in every field or it can return a stale mesh for changed settings.");
-    h = fnv1a(&o.fineness, sizeof o.fineness, h);
-    h = fnv1a(&o.density, sizeof o.density, h);
-    h = fnv1a(&o.order, sizeof o.order, h);
-    h = fnv1a(&o.curvature, sizeof o.curvature, h);
-    h = fnv1a(&o.curv_elems_per_circle, sizeof o.curv_elems_per_circle, h);
-    h = fnv1a(&o.target_size_mm, sizeof o.target_size_mm, h);
-    h = fnv1a(&o.min_size_mm, sizeof o.min_size_mm, h);
-    h = fnv1a(&o.max_size_mm, sizeof o.max_size_mm, h);
-    h = fnv1a(&o.optimize, sizeof o.optimize, h);
-    h = fnv1a(&o.backend, sizeof o.backend, h);
-    h = fnv1a(&o.structured, sizeof o.structured, h);
-    h = fnv1a(&o.auto_type, sizeof o.auto_type, h);
-    h = fnv1a(&o.quad_surface, sizeof o.quad_surface, h);
-    h = fnv1a(&o.fallback_to_tet, sizeof o.fallback_to_tet, h);
-    h = fnv1a(&o.thin_wall_layers, sizeof o.thin_wall_layers, h);
-    h = fnv1a(&o.learned_advisor, sizeof o.learned_advisor, h);
-    h = fnv1a(&o.advisor_max_dof, sizeof o.advisor_max_dof, h);
-    return h;
+inline uint64_t mesh_opts_key(const MeshOptions &options, uint64_t hash) {
+  hash = fnv1a(&options.fineness, sizeof options.fineness, hash);
+  hash = fnv1a(&options.order, sizeof options.order, hash);
+  hash = fnv1a(&options.target_size_mm, sizeof options.target_size_mm, hash);
+  hash = fnv1a(&options.min_size_mm, sizeof options.min_size_mm, hash);
+  hash = fnv1a(&options.max_size_mm, sizeof options.max_size_mm, hash);
+  hash = fnv1a(&options.learned_advisor, sizeof options.learned_advisor, hash);
+  hash = fnv1a(&options.advisor_max_dof, sizeof options.advisor_max_dof, hash);
+  return hash;
 }
 struct MeshCacheCounters {
-    std::mutex mtx;
-    MeshCacheStats s;
+  std::mutex mtx;
+  MeshCacheStats s;
 };
-inline MeshCacheCounters& mesh_cache_counters() {
-    static MeshCacheCounters c;
-    return c;
+inline MeshCacheCounters &mesh_cache_counters() {
+  static MeshCacheCounters c;
+  return c;
 }
-}  // namespace mesh_cache_detail
-using mesh_cache_detail::mesh_cache_counters;
+} // namespace mesh_cache_detail
 using mesh_cache_detail::fnv1a;
+using mesh_cache_detail::mesh_cache_counters;
 using mesh_cache_detail::mesh_opts_key;
 
 MeshCacheStats mesh_cache_stats() {
-    auto& c = mesh_cache_counters();
-    std::lock_guard<std::mutex> lk(c.mtx);
-    return c.s;
+  auto &c = mesh_cache_counters();
+  std::lock_guard<std::mutex> lk(c.mtx);
+  return c.s;
 }
 
 void mesh_cache_reset_stats() {
-    auto& c = mesh_cache_counters();
-    std::lock_guard<std::mutex> lk(c.mtx);
-    c.s = MeshCacheStats{};
+  auto &c = mesh_cache_counters();
+  std::lock_guard<std::mutex> lk(c.mtx);
+  c.s = MeshCacheStats{};
 }
 
 void mesh_cache_note_generation() {
-    auto& c = mesh_cache_counters();
-    std::lock_guard<std::mutex> lk(c.mtx);
-    ++c.s.generations;
+  auto &c = mesh_cache_counters();
+  std::lock_guard<std::mutex> lk(c.mtx);
+  ++c.s.generations;
 }
 
-// Internal hooks used by the per-solid component cache in mesher.cpp (same counters).
-void mesh_cache_note_component_hit() {
-    auto& c = mesh_cache_counters();
-    std::lock_guard<std::mutex> lk(c.mtx);
-    ++c.s.hits;
-    ++c.s.component_hits;
-}
-void mesh_cache_note_component_miss() {
-    auto& c = mesh_cache_counters();
-    std::lock_guard<std::mutex> lk(c.mtx);
-    ++c.s.misses;
-    ++c.s.component_misses;
-}
 void mesh_cache_set_resident(uint64_t bytes, uint64_t budget) {
-    auto& c = mesh_cache_counters();
-    std::lock_guard<std::mutex> lk(c.mtx);
-    c.s.resident_bytes = bytes;
-    c.s.budget_bytes = budget;
+  auto &c = mesh_cache_counters();
+  std::lock_guard<std::mutex> lk(c.mtx);
+  c.s.resident_bytes = bytes;
+  c.s.budget_bytes = budget;
 }
 
-std::shared_ptr<const MeshOut> mesh_step_cached_ptr(const std::string& step_path,
-                                                    const MeshOptions& options) {
-    std::string option_error;
-    if (!validate_mesh_options(options, option_error)) {
-        MeshOut invalid;
-        invalid.nodes_per_elem =
-            options.structured ? 8 : (options.order == 2 ? 10 : 4);
-        invalid.error = option_error;
-        return std::make_shared<const MeshOut>(std::move(invalid));
+std::shared_ptr<const MeshOut> mesh_step_cached(const std::string &step_path,
+                                                const MeshOptions &options) {
+  std::string option_error;
+  if (!validate_mesh_options(options, option_error)) {
+    MeshOut invalid;
+    invalid.nodes_per_elem = options.order == 2 ? 10 : 4;
+    invalid.error = option_error;
+    return std::make_shared<const MeshOut>(std::move(invalid));
+  }
+  // Hash the STEP bytes (one block read — not the old istreambuf char-at-a-time
+  // slurp). On any read failure, skip the cache and mesh directly.
+  std::string bytes;
+  {
+    std::ifstream f(step_path, std::ios::binary | std::ios::ate);
+    if (f) {
+      const std::streamsize n = f.tellg();
+      if (n > 0) {
+        bytes.resize(static_cast<size_t>(n));
+        f.seekg(0);
+        if (!f.read(&bytes[0], n))
+          bytes.clear();
+      }
     }
-    // Hash the STEP bytes (one block read — not the old istreambuf char-at-a-time slurp).
-    // On any read failure, skip the cache and mesh directly.
-    std::string bytes;
-    {
-        std::ifstream f(step_path, std::ios::binary | std::ios::ate);
-        if (f) {
-            const std::streamsize n = f.tellg();
-            if (n > 0) {
-                bytes.resize(static_cast<size_t>(n));
-                f.seekg(0);
-                if (!f.read(&bytes[0], n)) bytes.clear();
-            }
-        }
-    }
-    if (bytes.empty())
-        return std::make_shared<const MeshOut>(mesh_step(step_path, options));
-    uint64_t key = fnv1a(bytes.data(), bytes.size());
-    key = mesh_opts_key(options, key);
+  }
+  if (bytes.empty())
+    return std::make_shared<const MeshOut>(mesh_step(step_path, options));
+  uint64_t key = fnv1a(bytes.data(), bytes.size());
+  key = mesh_opts_key(options, key);
 
-    static std::mutex mtx;
-    static std::unordered_map<uint64_t, std::shared_ptr<const MeshOut>> cache;
-    static std::list<uint64_t> lru;   // most-recent at front
-    static uint64_t resident = 0;
-    constexpr size_t kCap = 16;       // soft entry cap; byte budget is the hard bound
-    {
-        std::lock_guard<std::mutex> lk(mtx);
-        auto it = cache.find(key);
-        if (it != cache.end()) {      // HIT: identical geometry + options — no copy
-            lru.remove(key);
-            lru.push_front(key);
-            {
-                auto& c = mesh_cache_counters();
-                std::lock_guard<std::mutex> ck(c.mtx);
-                ++c.s.hits;
-                c.s.resident_bytes = resident;
-                c.s.budget_bytes = mesh_cache_budget_bytes();
-            }
-            return it->second;
-        }
-    }
-    // MISS: mesh OUTSIDE the lock (mesh_step self-serializes), then store.
-    {
-        auto& c = mesh_cache_counters();
+  static std::mutex mtx;
+  static std::unordered_map<uint64_t, std::shared_ptr<const MeshOut>> cache;
+  static std::list<uint64_t> lru; // most-recent at front
+  static uint64_t resident = 0;
+  constexpr size_t kCap = 16; // soft entry cap; byte budget is the hard bound
+  {
+    std::lock_guard<std::mutex> lk(mtx);
+    auto it = cache.find(key);
+    if (it != cache.end()) { // HIT: identical geometry + options — no copy
+      lru.remove(key);
+      lru.push_front(key);
+      {
+        auto &c = mesh_cache_counters();
         std::lock_guard<std::mutex> ck(c.mtx);
-        ++c.s.misses;
+        ++c.s.hits;
+        c.s.resident_bytes = resident;
+        c.s.budget_bytes = mesh_cache_budget_bytes();
+      }
+      return it->second;
     }
-    auto m = std::make_shared<const MeshOut>(mesh_step(step_path, options));
-    if (m->ok) {
-        const uint64_t need = static_cast<uint64_t>(mesh_out_bytes(*m));
-        const uint64_t budget = mesh_cache_budget_bytes();
-        std::lock_guard<std::mutex> lk(mtx);
-        // Evict LRU until the new mesh fits (or the cache is empty).
-        while ((!lru.empty()) &&
-               (lru.size() >= kCap || resident + need > budget)) {
-            auto bit = cache.find(lru.back());
-            if (bit != cache.end()) {
-                resident -= static_cast<uint64_t>(mesh_out_bytes(*bit->second));
-                cache.erase(bit);
-            }
-            lru.pop_back();
-        }
-        // Insert even if need > budget (keep the single most-recent mesh).
-        if (cache.find(key) == cache.end()) {
-            cache[key] = m;
-            lru.push_front(key);
-            resident += need;
-        } else {
-            // Concurrent store of the same key: prefer the existing entry.
-            lru.remove(key);
-            lru.push_front(key);
-        }
-        mesh_cache_set_resident(resident, budget);
+  }
+  // MISS: mesh OUTSIDE the lock (mesh_step self-serializes), then store.
+  {
+    auto &c = mesh_cache_counters();
+    std::lock_guard<std::mutex> ck(c.mtx);
+    ++c.s.misses;
+  }
+  auto m = std::make_shared<const MeshOut>(mesh_step(step_path, options));
+  if (m->ok) {
+    const uint64_t need = static_cast<uint64_t>(mesh_out_bytes(*m));
+    const uint64_t budget = mesh_cache_budget_bytes();
+    std::lock_guard<std::mutex> lk(mtx);
+    // Evict LRU until the new mesh fits (or the cache is empty).
+    while ((!lru.empty()) && (lru.size() >= kCap || resident + need > budget)) {
+      auto bit = cache.find(lru.back());
+      if (bit != cache.end()) {
+        resident -= static_cast<uint64_t>(mesh_out_bytes(*bit->second));
+        cache.erase(bit);
+      }
+      lru.pop_back();
     }
-    return m;
-}
-
-MeshOut mesh_step_cached(const std::string& step_path, const MeshOptions& options) {
-    return *mesh_step_cached_ptr(step_path, options);  // legacy by-value form (one copy)
+    // Insert even if need > budget (keep the single most-recent mesh).
+    if (cache.find(key) == cache.end()) {
+      cache[key] = m;
+      lru.push_front(key);
+      resident += need;
+    } else {
+      // Concurrent store of the same key: prefer the existing entry.
+      lru.remove(key);
+      lru.push_front(key);
+    }
+    mesh_cache_set_resident(resident, budget);
+  }
+  return m;
 }
 
 }  // namespace chudware::sim

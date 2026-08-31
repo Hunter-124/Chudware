@@ -159,8 +159,8 @@ MCP tools, NOT through the worker socket. ECAD is pure Python until 3D (board_to
 - Run: `python -m pytest services/mcp/test_autosave_recovery.py -v` — autosave recovery.
 - Environment: `$CHUDWARE_LIBCHUDWARE=/path/to/libchudware.so` (Linux) or `$CHUDWARE_DIST=dist/Chudware`
   (Windows); core_bridge.py L75–92 lists candidates.
-- Gotcha: server.py `_install_clean_stdout()` redirects fd 1 to a log file — native C++ prints
-  (OCCT, Netgen, gmsh) corrupt the JSON-RPC channel; set $TEMP to see logs.
+- Gotcha: server.py `_install_clean_stdout()` redirects fd 1 to a log file — native C++
+  dependency output would otherwise corrupt the JSON-RPC channel.
 - Gotcha: `_warm_core()` pre-loads libchudware.so + ECAD deps in a background thread to avoid
   transport timeouts on the first tool call; the thread also runs ECAD autosave recovery.
 

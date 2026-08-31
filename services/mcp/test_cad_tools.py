@@ -75,15 +75,11 @@ _SIM_AVAILABLE: bool | None = None
 
 
 def _require_sim() -> None:
-    """Skip (not fail) when the loaded engine has no Netgen FEA solver compiled in.
+    """Skip when the loaded engine was built without OCCT/Polyhedral-FEA.
 
-    On Linux ``CHUDWARE_WITH_NETGEN`` defaults OFF, so a slim ``build-linux`` libchudware links +
-    loads fine but dispatches ``sim_run_static``/``sim_run_modal`` to "unknown method" — the
-    FEA/CFD-mesher RPCs are #ifdef-compiled-out. That's a build-config state, not a solver
-    regression, so the Netgen-dependent tests must SKIP with a clear reason rather than
-    hard-fail. The gate itself points CHUDWARE_LIBCHUDWARE at the full ``build-occt-linux`` engine
-    (see scripts/gate.sh), so this skip only fires on a genuinely sim-less checkout — it is a
-    net *under* the gate, never the sole path to green. Mirrors test_fea_live_bridge.py.
+    An unknown-method response is a build-configuration state rather than a solver
+    regression. The main gate selects the full build; this remains a defensive skip for
+    deliberately slim local builds.
     """
     global _SIM_AVAILABLE
     if _SIM_AVAILABLE is None:
@@ -96,7 +92,7 @@ def _require_sim() -> None:
             _SIM_AVAILABLE = "unknown method" not in str(exc).lower()
     if not _SIM_AVAILABLE:
         pytest.skip(
-            "engine has no FEA solver (sim-less build: CHUDWARE_WITH_NETGEN=OFF); "
+            "engine has no FEA solver; rebuild with CHUDWARE_WITH_POLYMESH=ON or "
             "point CHUDWARE_LIBCHUDWARE at core/build-occt-linux/bin/libchudware.so"
         )
 

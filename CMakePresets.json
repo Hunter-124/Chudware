@@ -8,8 +8,8 @@
   "configurePresets": [
     {
       "name": "linux-core",
-      "displayName": "Linux core (libchudware, Ninja, OCCT + Netgen)",
-      "description": "Configure the pure-C++ core libchudware with the OCCT geometry kernel and Netgen mesher (core/).",
+      "displayName": "Linux core (libchudware, Ninja, OCCT + Polyhedral-FEA)",
+      "description": "Configure the pure-C++ core with the OCCT geometry kernel and Polyhedral-FEA mesher.",
       "generator": "Ninja",
       "binaryDir": "${sourceDir}/build/linux-core",
       "cacheVariables": {
@@ -17,7 +17,7 @@
         "CHUDWARE_LTO": "ON",
         "CHUDWARE_BUILD_CORE": "ON",
         "CHUDWARE_WITH_OCCT": "ON",
-        "CHUDWARE_WITH_NETGEN": "ON"
+        "CHUDWARE_WITH_POLYMESH": "ON"
       }
     },
     {
@@ -41,14 +41,15 @@
     {
       "name": "windows-occt",
       "displayName": "Windows core + OCCT (libchudware, Ninja + MSVC, OCCT on)",
-      "description": "Configure the C++ core with the OCCT geometry kernel + Netgen mesher on MSVC. First configure auto-downloads OCCT 7.9.3 (~250 MB) and builds Netgen once (cached under third_party/). Run from an 'x64 Native Tools Command Prompt for VS 2022'. Verified on Win11 + MSVC 14.44: clean build, 48/49 ctest. See docs/BUILD_WINDOWS.md.",
+      "description": "Configure the C++ core with OCCT and Polyhedral-FEA on MSVC. The first configure downloads OCCT and the pinned BSD-3-Clause mesher source. Run from an x64 Native Tools Command Prompt for VS 2022.",
       "generator": "Ninja",
       "binaryDir": "${sourceDir}/build/windows-occt",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Release",
         "CHUDWARE_LTO": "ON",
         "CHUDWARE_BUILD_CORE": "ON",
-        "CHUDWARE_WITH_OCCT": "ON"
+        "CHUDWARE_WITH_OCCT": "ON",
+        "CHUDWARE_WITH_POLYMESH": "ON"
       },
       "condition": {
         "type": "equals",
@@ -58,8 +59,8 @@
     },
     {
       "name": "macos-arm64",
-      "displayName": "macOS arm64 core (libchudware, Ninja + AppleClang, OCCT + Netgen)",
-      "description": "Configure the C++ core with the OCCT geometry kernel and Netgen mesher on macOS. Needs only the Xcode Command Line Tools (no full Xcode) plus Homebrew ninja/cmake/opencascade. Netgen is built once from the pinned LGPL source into NETGEN_ROOT so it receives the required safety patch and remains ABI-matched to Homebrew OCCT. CMAKE_PREFIX_PATH points at the /opt/homebrew Homebrew prefix because Homebrew is not on CMake's default search path, so ProvisionOCCT's find_package(OpenCASCADE REQUIRED) cannot see it otherwise. CEF is off on macOS: no CEF binary distribution is vendored for Darwin, so the embedded-browser widgets are compiled out. Requires CMake >= 3.24 (the file-level cmakeMinimumRequired) — core/CMakeLists.txt's $<LINK_GROUP:RESCAN,...> only emits the correct ld64 flags from 3.24 on.",
+      "displayName": "macOS arm64 core (libchudware, Ninja + AppleClang, OCCT + Polyhedral-FEA)",
+      "description": "Configure the C++ core with Homebrew OpenCASCADE and the pinned Polyhedral-FEA source. CEF is disabled because no Darwin CEF distribution is vendored.",
       "generator": "Ninja",
       "binaryDir": "${sourceDir}/build/macos-arm64",
       "cacheVariables": {
@@ -69,7 +70,7 @@
         "CMAKE_PREFIX_PATH": "/opt/homebrew",
         "CHUDWARE_BUILD_CORE": "ON",
         "CHUDWARE_WITH_OCCT": "ON",
-        "CHUDWARE_WITH_NETGEN": "ON",
+        "CHUDWARE_WITH_POLYMESH": "ON",
         "CHUDWARE_ENABLE_CEF": "OFF"
       },
       "condition": {
@@ -80,8 +81,8 @@
     },
     {
       "name": "macos-x86_64",
-      "displayName": "macOS x86_64 core (libchudware, Ninja + AppleClang, OCCT + Netgen)",
-      "description": "Configure the C++ core with the OCCT geometry kernel and Netgen mesher on macOS. Needs only the Xcode Command Line Tools (no full Xcode) plus Homebrew ninja/cmake/opencascade. Netgen is built once from the pinned LGPL source into NETGEN_ROOT so it receives the required safety patch and remains ABI-matched to Homebrew OCCT. CMAKE_PREFIX_PATH points at the /usr/local Homebrew prefix because Homebrew is not on CMake's default search path, so ProvisionOCCT's find_package(OpenCASCADE REQUIRED) cannot see it otherwise. CEF is off on macOS: no CEF binary distribution is vendored for Darwin, so the embedded-browser widgets are compiled out. Requires CMake >= 3.24 (the file-level cmakeMinimumRequired) — core/CMakeLists.txt's $<LINK_GROUP:RESCAN,...> only emits the correct ld64 flags from 3.24 on.",
+      "displayName": "macOS x86_64 core (libchudware, Ninja + AppleClang, OCCT + Polyhedral-FEA)",
+      "description": "Configure the C++ core with Homebrew OpenCASCADE and the pinned Polyhedral-FEA source. CEF is disabled because no Darwin CEF distribution is vendored.",
       "generator": "Ninja",
       "binaryDir": "${sourceDir}/build/macos-x86_64",
       "cacheVariables": {
@@ -91,7 +92,7 @@
         "CMAKE_PREFIX_PATH": "/usr/local",
         "CHUDWARE_BUILD_CORE": "ON",
         "CHUDWARE_WITH_OCCT": "ON",
-        "CHUDWARE_WITH_NETGEN": "ON",
+        "CHUDWARE_WITH_POLYMESH": "ON",
         "CHUDWARE_ENABLE_CEF": "OFF"
       },
       "condition": {

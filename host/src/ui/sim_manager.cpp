@@ -339,28 +339,17 @@ static void drawStudyTypeBanner(StudyType t, const char *desc) {
   ImGui::Spacing();
 }
 
-// allowHex=false forces tetrahedral (e.g. modal studies have no hex8 mass
-// matrix).
 static void addMeshParams(nlohmann::json &j, const Study &s, int meshOrder,
-                          bool allowHex = true, bool allowAdvisor = false) {
-  j["fineness"] = s.meshFineness; // primary control (0=coarse..1=fine)
-  const bool hex = allowHex && s.meshHex;
-  j["structured"] = hex;
-  j["mesh_type"] = hex ? "hex" : "tet";
+                          bool allowAdvisor = false) {
+  j["fineness"] = s.meshFineness;
   j["mesh_order"] = meshOrder;
-  j["order"] =
-      meshOrder; // direct sim_mesh accepts both; keep it self-describing.
-  j["curvature"] = s.meshCurvature;
-  j["curv_elems_per_circle"] = s.meshCurvPerCircle;
+  j["order"] = meshOrder;
   if (s.meshTargetMm > 0.0f)
     j["target_size_mm"] = s.meshTargetMm;
   if (s.meshMinMm > 0.0f)
     j["min_size_mm"] = s.meshMinMm;
-  j["mesher_backend"] = s.meshBackend;
-  j["optimize"] = s.meshOptimize;
   if (allowAdvisor) {
-    j["learned_advisor"] =
-        s.meshBackend == "polymesh" && s.learnedAdvisor;
+    j["learned_advisor"] = s.learnedAdvisor;
     j["advisor_max_dof"] =
         static_cast<std::uint32_t>(std::max(0, s.advisorMaxDof));
   }
@@ -1182,16 +1171,10 @@ nlohmann::json SimManager::studyToJson(const Study &s) {
       {"fixtures", fixtures},
       {"loads", loads},
       {"mesh_fineness", s.meshFineness},
-      {"mesh_hex", s.meshHex},
-      {"mesh_curvature", s.meshCurvature},
-      {"mesh_curv_per_circle", s.meshCurvPerCircle},
       {"mesh_order", s.meshOrder},
       {"mesh_target_mm", s.meshTargetMm},
       {"mesh_min_mm", s.meshMinMm},
-      {"mesher_backend", s.meshBackend},
-      {"mesh_optimize", s.meshOptimize},
-      {"learned_advisor",
-       s.meshBackend == "polymesh" && s.learnedAdvisor},
+      {"learned_advisor", s.learnedAdvisor},
       {"advisor_max_dof", std::max(0, s.advisorMaxDof)},
       {"adapt_enabled", s.adaptEnabled},
       {"adapt_max_passes", std::clamp(s.adaptMaxPasses, 1, 6)},
@@ -1282,19 +1265,11 @@ Study SimManager::studyFromJson(const nlohmann::json &j) {
   s.type = studyTypeFromKey(j.value("type", std::string("static")));
   s.name = j.value("name", std::string("Study"));
   s.materialKey = j.value("material", std::string());
-  // Back-compat: old studies persisted "mesh_density" (same higher=finer sense
-  // as fineness).
-  s.meshFineness = j.value("mesh_fineness", j.value("mesh_density", 0.5f));
-  s.meshHex = j.value("mesh_hex", false);
-  s.meshCurvature = j.value("mesh_curvature", true);
-  s.meshCurvPerCircle = j.value("mesh_curv_per_circle", 12.0f);
+  s.meshFineness = j.value("mesh_fineness", 0.5f);
   s.meshOrder = j.value("mesh_order", 2);
   s.meshTargetMm = j.value("mesh_target_mm", 0.0f);
   s.meshMinMm = j.value("mesh_min_mm", 0.0f);
-  s.meshBackend = j.value("mesher_backend", std::string("netgen"));
-  s.meshOptimize = j.value("mesh_optimize", true);
-  s.learnedAdvisor =
-      s.meshBackend == "polymesh" && j.value("learned_advisor", false);
+  s.learnedAdvisor = j.value("learned_advisor", false);
   s.advisorMaxDof = std::max(0, j.value("advisor_max_dof", 0));
   s.adaptEnabled = j.value("adapt_enabled", false);
   s.adaptMaxPasses =
@@ -2828,7 +2803,7 @@ void SimManager::previewMesh(AppState &st, Study &s) {
             break;
           }
         if (sp)
-          addMeshParams(params, *sp, meshOrder, /*allowHex=*/true,
+          addMeshParams(params, *sp, meshOrder,
                         supportsLearnedAdvisor(sp->type));
         else
           params["order"] = meshOrder;
@@ -2877,8 +2852,6 @@ void SimManager::previewMesh(AppState &st, Study &s) {
               s->meshHasQuality = s->nElems > 0;
               s->meshTypeUsed =
                   res.value("mesh_type_used", std::string());
-              s->meshBackendUsed =
-                  res.value("mesher_backend", std::string());
               s->meshNote = res.value("note", std::string());
               clearMeshPreview();
               meshPreviewStudyId_ = s->id;
@@ -3094,14 +3067,10 @@ std::string SimManager::advisorStatusLine() const {
     out += "available, not applied";
   else
     out += "unavailable";
-  // Chudware's solve path is tet-only, so a polyhedral/VEM mesher recommendation was never
-  // executed no matter what the state token above says. The Results-panel disclosure spells this
-  // out; the always-visible line has to as well, or "applied" reads as if that mesher had run.
-  if (!a.mesher.empty() && advisorMesherIsPolyhedral(a.mesher)) {
+  // Chudware's solve path is fixed-stride tet-only, so a hybrid/VEM family
+  // recommendation is reported as advice rather than claimed as executed.
+  if (!a.mesher.empty() && advisorMesherIsPolyhedral(a.mesher))
     out += " | " + a.mesher + " mesher advice NOT executed (tet-only solve)";
-    if (!s.meshBackendUsed.empty())
-      out += "; meshed with " + s.meshBackendUsed;
-  }
   if (SimAdvisor::has(a.oodDistance) && a.oodDistance > 1.0)
     out += " | out of distribution";
   return out;
@@ -4259,14 +4228,9 @@ void SimManager::runStaticOrModal(AppState &st, Study &s) {
   prep->nModes = s.nModes;
   prep->requestedStepPath =
       staticModalStepPath(docId, s.id, reservationToken);
-  prep->meshOptions.meshHex = s.meshHex;
   prep->meshOptions.meshFineness = s.meshFineness;
-  prep->meshOptions.meshCurvature = s.meshCurvature;
-  prep->meshOptions.meshCurvPerCircle = s.meshCurvPerCircle;
   prep->meshOptions.meshTargetMm = s.meshTargetMm;
   prep->meshOptions.meshMinMm = s.meshMinMm;
-  prep->meshOptions.meshBackend = s.meshBackend;
-  prep->meshOptions.meshOptimize = s.meshOptimize;
   prep->meshOptions.learnedAdvisor = s.learnedAdvisor;
   prep->meshOptions.advisorMaxDof = s.advisorMaxDof;
   prep->meshOptions.adaptEnabled = s.adaptEnabled;
@@ -4462,7 +4426,6 @@ void SimManager::finishStaticModalPrep(
                 prep->type == StudyType::Static
                     ? prep->meshOptions.meshOrder
                     : 1,
-                prep->type == StudyType::Static,
                 supportsLearnedAdvisor(prep->type));
 
   std::string note;
@@ -6453,244 +6416,105 @@ void SimManager::drawMeshForm(AppState &st, Study &s) {
   ImGui::TextUnformatted("Mesh");
   ImGui::PopFont();
   ImGui::TextWrapped(
-      "The mesh the solve runs on. Finer captures stress concentrations "
-      "better but takes longer.");
+      "Polyhedral-FEA fills the part with graded tetrahedra. Finer meshes "
+      "capture stress concentrations better but take longer.");
   ImGui::Spacing();
 
-  // --- Mesh type: tetrahedral (general) vs structured hexahedral (prismatic)
-  // ------
-  const bool modal = (s.type == StudyType::Modal);
-  // Data hygiene: a modal study should carry no loads (the eigenvalue solve
-  // ignores them and the tree hides them). If a study accumulated loads before
-  // becoming modal — e.g. copied from a static template — drop them once so
-  // future JSON readers don't see inert load entries.
+  const bool modal = s.type == StudyType::Modal;
   if (modal && !s.loads.empty()) {
     s.loads.clear();
     persist(st, s);
   }
-  ImGui::TextUnformatted("Mesh type");
-  // Binary choice — radio rows read instantly and skip the combo popup in the
-  // narrow pane.
-  static const char *kType[2] = {"Tetrahedral (any shape)",
-                                 "Hexahedral (box / prismatic only)"};
-  if (modal)
-    ImGui::BeginDisabled(); // modal has no hex8 mass matrix
-  int ti = (s.meshHex && !modal) ? 1 : 0;
-  for (int i = 0; i < 2; ++i)
-    if (ImGui::RadioButton(kType[i], ti == i) && ti != i) {
-      s.meshHex = (i == 1);
-      persist(st, s);
-      clearMeshPreview();
-    }
-  if (modal)
-    ImGui::EndDisabled();
-  simTip("Tetrahedral fills any geometry but its element pattern is irregular "
-         "(normal for "
-         "unstructured meshing). Hexahedral lays down a perfectly regular, "
-         "symmetric grid — "
-         "but only works on a box / rectangular prism (other shapes fall back "
-         "with a note). "
-         "Frequency studies are tetrahedral only.");
-  ImGui::Spacing();
-  const bool hexMesh = s.meshHex && !modal;
 
-  // --- Mesh fineness (primary control)
-  // -------------------------------------------
   ImGui::TextUnformatted("Mesh fineness");
   ImGui::SetNextItemWidth(-FLT_MIN);
-  // Show a Coarse..Fine word instead of a bare number so the control reads like
-  // SW.
   const char *fineWord = s.meshFineness < 0.2f   ? "Coarse"
                          : s.meshFineness < 0.4f ? "Coarse-medium"
                          : s.meshFineness < 0.6f ? "Medium"
                          : s.meshFineness < 0.8f ? "Fine-medium"
                                                  : "Fine";
-  if (ImGui::SliderFloat("##fineness", &s.meshFineness, 0.0f, 1.0f, fineWord)) {
-  }
+  ImGui::SliderFloat("##fineness", &s.meshFineness, 0.0f, 1.0f, fineWord);
   if (ImGui::IsItemDeactivatedAfterEdit()) {
     persist(st, s);
     clearMeshPreview();
   }
-  simTip("Base element size, derived from the part's overall size. Left = "
-         "coarse/fast, "
-         "right = fine/slow & more accurate.");
+  simTip("Base element size derived from the part's bounding box. Left is "
+         "coarse and fast; right is fine and more accurate.");
   ImGui::Spacing();
 
-  if (hexMesh) {
-    // Structured hex: only fineness (grid density) applies; the tet-only
-    // controls (curvature/order/optimize/algorithm) are hidden.
-    ImGui::TextDisabled(
-        "Regular hex8 grid. Element size from fineness; the part must be a\n"
-        "box / rectangular prism (otherwise switch to Tetrahedral).");
-    ImGui::Spacing();
-  } else {
-
-    // --- Curvature-adaptive refinement
-    // ---------------------------------------------
-    if (ImGui::Checkbox("Refine curved features (holes, fillets)",
-                        &s.meshCurvature)) {
+  ImGui::TextUnformatted("Element order");
+  static const char *kOrder[2] = {"Draft - linear (tet4)",
+                                  "High quality - quadratic (tet10)"};
+  int orderIndex = !modal && s.meshOrder == 2 ? 1 : 0;
+  if (modal)
+    ImGui::BeginDisabled();
+  for (int i = 0; i < 2; ++i)
+    if (ImGui::RadioButton(kOrder[i], orderIndex == i) && orderIndex != i) {
+      s.meshOrder = i ? 2 : 1;
       persist(st, s);
       clearMeshPreview();
     }
-    simTip("Automatically uses smaller elements around curvature so stress "
-           "concentrations "
-           "at holes and fillets are resolved. Strongly recommended for "
-           "accurate FEA.");
-    ImGui::Spacing();
+  if (modal)
+    ImGui::EndDisabled();
+  simTip("Quadratic elements capture bending and curved boundaries more "
+         "accurately. Modal studies use linear elements.");
+  if (modal)
+    ImGui::TextDisabled("Frequency studies always use 1st-order elements.");
+  ImGui::Spacing();
 
-    // --- Element order
-    // ------------------------------------------------------------- Linear
-    // (tet4) shear-locks and makes bending look straight; quadratic (tet10)
-    // captures it. Static defaults to High quality; modal always runs
-    // 1st-order.
-    ImGui::TextUnformatted("Element order");
-    static const char *kOrder[2] = {"Draft - linear (1st order, fast)",
-                                    "High quality - quadratic (2nd order)"};
-    // Modal always runs 1st-order linear tets (runStaticOrModal forces
-    // order=1); show + lock Draft.
-    int oi = (!modal && s.meshOrder == 2) ? 1 : 0;
-    if (modal)
-      ImGui::BeginDisabled();
-    for (int i = 0; i < 2; ++i)
-      if (ImGui::RadioButton(kOrder[i], oi == i) && oi != i) {
-        s.meshOrder = i ? 2 : 1;
-        persist(st, s);
-        clearMeshPreview();
-      }
-    if (modal)
-      ImGui::EndDisabled();
-    simTip("2nd-order (quadratic) elements capture bending and curved geometry "
-           "far more "
-           "accurately. Linear elements are overly stiff (shear-locking) and "
-           "make a bent "
-           "part look almost straight. Use High quality for structural "
-           "accuracy; Draft for a "
-           "fast first look. (Frequency studies always use 1st-order.)");
-    if (modal)
-      ImGui::TextDisabled("Frequency studies always use 1st-order elements.");
-    ImGui::Spacing();
-
-    // --- Optimize
-    // ------------------------------------------------------------------
-    if (modal)
-      ImGui::BeginDisabled();
-    if (ImGui::Checkbox("Optimize element quality (Netgen)", &s.meshOptimize)) {
+  if (ImGui::CollapsingHeader("Advanced")) {
+    ImGui::Indent();
+    bool edited = false;
+    ImGui::TextUnformatted("Element size override (mm, 0 = auto)");
+    float target = s.meshTargetMm;
+    float minimum = s.meshMinMm;
+    ImGui::SetNextItemWidth(-FLT_MIN);
+    ImGui::InputFloat("##target_size", &target, 0.0f, 0.0f, "%.4g");
+    edited = edited || ImGui::IsItemDeactivatedAfterEdit();
+    simTip("Explicit target edge length in millimetres. Overrides fineness.");
+    ImGui::SetNextItemWidth(-FLT_MIN);
+    ImGui::InputFloat("##min_size", &minimum, 0.0f, 0.0f, "%.4g");
+    edited = edited || ImGui::IsItemDeactivatedAfterEdit();
+    simTip("Minimum edge length in millimetres for graded refinement.");
+    if (edited) {
+      s.meshTargetMm = std::max(0.0f, target);
+      s.meshMinMm = std::max(0.0f, minimum);
       persist(st, s);
       clearMeshPreview();
     }
-    if (modal)
-      ImGui::EndDisabled();
-    simTip("Run Netgen's surface + volume optimizers after generation to "
-           "improve poorly-shaped "
-           "tetrahedra. Recommended; adds a little meshing time.");
-    if (modal)
-      ImGui::TextDisabled(
-          "Mesh quality settings are fixed for frequency studies.");
-    ImGui::Spacing();
 
-    // --- Advanced (collapsed)
-    // ------------------------------------------------------
-    if (ImGui::CollapsingHeader("Advanced")) {
-      ImGui::Indent();
-      bool edited = false;
-      if (s.meshCurvature) {
-        ImGui::TextUnformatted("Curvature refinement (elements per circle)");
-        ImGui::SetNextItemWidth(-FLT_MIN);
-        if (ImGui::SliderFloat("##curvper", &s.meshCurvPerCircle, 6.0f, 24.0f,
-                               "%.0f")) {
-        }
-        edited = edited || ImGui::IsItemDeactivatedAfterEdit();
-        simTip("Target number of elements around a full circle of curvature. "
-               "Higher = "
-               "rounder holes/fillets but more elements.");
-        ImGui::Spacing();
-      }
-      ImGui::TextUnformatted("Element size override (mm, 0 = auto)");
-      float target = s.meshTargetMm, minSize = s.meshMinMm;
-      ImGui::SetNextItemWidth(-FLT_MIN);
-
-      if (ImGui::InputFloat("##target_size", &target, 0.0f, 0.0f, "%.4g")) {
-      }
-      edited = edited || ImGui::IsItemDeactivatedAfterEdit();
-      simTip(
-          "Explicit target element size in mm. Overrides fineness when > 0.");
-      ImGui::SetNextItemWidth(-FLT_MIN);
-      if (ImGui::InputFloat("##min_size", &minSize, 0.0f, 0.0f, "%.4g")) {
-      }
-      edited = edited || ImGui::IsItemDeactivatedAfterEdit();
-      simTip("Minimum element size in mm (floor for curvature refinement). 0 = "
-             "auto.");
-      if (edited) {
-        s.meshTargetMm = std::max(0.0f, target);
-        s.meshMinMm = std::max(0.0f, minSize);
-        persist(st, s);
-        clearMeshPreview();
-      }
+    if (supportsLearnedAdvisor(s.type)) {
       ImGui::Spacing();
-      ImGui::TextUnformatted("Mesher backend");
-      static const char *kBackend[2] = {"Netgen (default)",
-                                        "Polymesh (second opinion)"};
-      int backendIndex = s.meshBackend == "polymesh" ? 1 : 0;
-      ImGui::SetNextItemWidth(-FLT_MIN);
-      if (ImGui::BeginCombo("##mesherbackend", kBackend[backendIndex])) {
-        for (int i = 0; i < 2; ++i)
-          if (ImGui::Selectable(kBackend[i], backendIndex == i)) {
-            s.meshBackend = i ? "polymesh" : "netgen";
-            if (s.meshBackend != "polymesh")
-              s.learnedAdvisor = false;
-            persist(st, s);
-            clearMeshPreview();
-          }
-        ImGui::EndCombo();
+      if (ImGui::Checkbox("Use learned mesh advisor", &s.learnedAdvisor)) {
+        persist(st, s);
+        clearMeshPreview();
       }
-      simTip("Netgen is the default and the only backend with curvature "
-             "refinement, structured hex and quad surfaces. Polymesh is an "
-             "independent graded Cartesian tet fill: use it to check whether a "
-             "stress result depends on the mesh rather than the part, and note "
-             "that adaptive refinement always uses it. It is not a fallback for "
-             "geometry Netgen refuses, and it stair-cases the boundary.");
-      if (s.meshBackend == "polymesh" && supportsLearnedAdvisor(s.type)) {
-        ImGui::Spacing();
-        if (ImGui::Checkbox("Use learned mesh advisor", &s.learnedAdvisor)) {
+      simTip(
+          "Uses Polyhedral-FEA's optional learned sizing and order advice. "
+          "Chudware still enforces resource, mesh-quality, and solver gates.");
+      if (s.learnedAdvisor) {
+        ImGui::TextUnformatted("Advisor DOF budget (0 = unset)");
+        int maximumDof = s.advisorMaxDof;
+        ImGui::SetNextItemWidth(-FLT_MIN);
+        ImGui::InputInt("##advisormaxdof", &maximumDof, 1000, 10000);
+        if (ImGui::IsItemDeactivatedAfterEdit()) {
+          s.advisorMaxDof = std::max(0, maximumDof);
           persist(st, s);
           clearMeshPreview();
         }
-        simTip("Opt in to the upstream learned advisor for mesh setup. Its "
-               "recommendation is advisory only: Chudware still enforces the "
-               "tetrahedral boundary, resource limits, mesher checks, solver "
-               "health checks, and convergence gates. Default runs do not use "
-               "the model.");
-        if (s.learnedAdvisor) {
-          ImGui::TextUnformatted("Advisor DOF budget (0 = unset)");
-          int maxDof = s.advisorMaxDof;
-          ImGui::SetNextItemWidth(-FLT_MIN);
-          if (ImGui::InputInt("##advisormaxdof", &maxDof, 1000, 10000)) {
-          }
-          if (ImGui::IsItemDeactivatedAfterEdit()) {
-            s.advisorMaxDof = std::max(0, maxDof);
-            persist(st, s);
-            clearMeshPreview();
-          }
-          simTip("Optional maximum degrees of freedom the advisor may choose. "
-                 "Zero leaves the budget unset; deterministic resource gates "
-                 "still apply.");
-          kit::dimText("Advice does not replace the selected mesher or solver.");
-        }
       }
-      ImGui::Unindent();
     }
-    ImGui::Spacing();
-  } // end !hexMesh tet-only controls
+    ImGui::Unindent();
+  }
+  ImGui::Spacing();
+
   if (s.type == StudyType::Static) {
     if (ImGui::Checkbox("Adaptive refinement", &s.adaptEnabled)) {
       persist(st, s);
       clearMeshPreview();
     }
-    simTip("Re-meshes and re-solves up to the pass limit, each pass finer and "
-           "graded toward where the discretization error is largest, stopping "
-           "when the error indicator reaches the target. The indicator is a "
-           "dimensionless relative measure; smaller is better. It is not a "
-           "percentage stress error.");
+    simTip("Re-meshes and re-solves toward the largest recovered "
+           "discretization error until the target or pass limit is reached.");
     if (s.adaptEnabled) {
       ImGui::Indent();
       ImGui::TextUnformatted("Maximum passes");
@@ -6703,9 +6527,7 @@ void SimManager::drawMeshForm(AppState &st, Study &s) {
       ImGui::TextUnformatted("Error indicator target");
       ImGui::SetNextItemWidth(-FLT_MIN);
       float etaTarget = s.adaptEtaTarget;
-      if (ImGui::InputFloat("##adaptetatarget", &etaTarget, 0.005f, 0.01f,
-                            "%.4g")) {
-      }
+      ImGui::InputFloat("##adaptetatarget", &etaTarget, 0.005f, 0.01f, "%.4g");
       if (ImGui::IsItemDeactivatedAfterEdit()) {
         s.adaptEtaTarget = std::max(0.0f, etaTarget);
         persist(st, s);
@@ -6715,7 +6537,6 @@ void SimManager::drawMeshForm(AppState &st, Study &s) {
     }
     ImGui::Spacing();
   }
-
   bool busy = st.simClient && st.simClient->busy();
   if (busy)
     ImGui::BeginDisabled();
@@ -6733,8 +6554,7 @@ void SimManager::drawMeshForm(AppState &st, Study &s) {
     ImGui::Text("Elements: %d", s.nElems);
     if (!s.meshTypeUsed.empty())
       ImGui::Text("Mesh type: %s", s.meshTypeUsed.c_str());
-    if (!s.meshBackendUsed.empty())
-      ImGui::TextDisabled("Backend: %s", s.meshBackendUsed.c_str());
+    ImGui::TextDisabled("Mesher: Polyhedral-FEA");
     if (!s.meshNote.empty())
       ImGui::TextWrapped("%s", s.meshNote.c_str());
     if (!meshPreviewSegs_.empty() && meshPreviewStudyId_ == s.id) {
@@ -6744,8 +6564,7 @@ void SimManager::drawMeshForm(AppState &st, Study &s) {
       // mesh that something is. The solve itself uses the FULL mesh.
       if (meshPreviewEdgesShown_ < meshPreviewEdgesTotal_ ||
           meshPreviewCoarse_) {
-        ImGui::PushStyleColor(ImGuiCol_Text,
-                              simRole(ui::palette.statusWarn));
+        ImGui::PushStyleColor(ImGuiCol_Text, simRole(ui::palette.statusWarn));
         ImGui::TextWrapped(
             "Showing %s of %s edges%s.",
             groupedCount((uint64_t)meshPreviewEdgesShown_).c_str(),
@@ -7711,12 +7530,11 @@ void SimManager::drawFlowForm(AppState &st, Study &s) {
   (void)S;
 }
 
-// ---- optional core-advisor disclosure -----------------------------------------------------
-// Draws nothing at all when the result carried no "advisor" object, so every pre-advisor solver
-// route renders exactly as before. When one IS present this reports what the advisor recommended
-// and whether it was honoured — it never asserts anything about which solver ran. Chudware's
-// solve path is tet-only, so a polyhedral/VEM recommendation is spelled out as advice that was
-// NOT executed rather than quietly displayed as if it had been.
+// ---- optional core-advisor disclosure
+// ----------------------------------------------------- Draws nothing when the
+// result carried no advisor object. Recommendations that do not fit Chudware's
+// fixed-stride tet solve contract are reported as advice, never as executed
+// setup.
 static void drawAdvisorDisclosure(AppState &st, const Study &s) {
   const SimAdvisor &a = s.advisor;
   if (!a.present)
@@ -7725,14 +7543,14 @@ static void drawAdvisorDisclosure(AppState &st, const Study &s) {
   if (!ImGui::TreeNodeEx("Setup advisor", ImGuiTreeNodeFlags_DefaultOpen))
     return;
   const char *state = a.budgetRefusal ? "Refused - predicted cost over budget"
-                      : a.vetoed      ? "Vetoed - recommendation rejected by a guard"
-                      : a.applied     ? "Applied - shaped this run's setup"
-                      : a.available   ? "Available - not applied to this run"
-                                      : "Unavailable - no recommendation produced";
+                      : a.vetoed ? "Vetoed - recommendation rejected by a guard"
+                      : a.applied ? "Applied - shaped this run's setup"
+                      : a.available
+                          ? "Available - not applied to this run"
+                          : "Unavailable - no recommendation produced";
   const bool warn = a.budgetRefusal || a.vetoed || !a.available;
-  ImGui::PushStyleColor(ImGuiCol_Text,
-                        simRole(warn ? ui::palette.statusWarn
-                                     : ui::palette.statusOk));
+  ImGui::PushStyleColor(ImGuiCol_Text, simRole(warn ? ui::palette.statusWarn
+                                                    : ui::palette.statusOk));
   ImGui::TextWrapped("%s", state);
   ImGui::PopStyleColor();
   simTip("The advisor only proposes mesh sizing, element order and adaptation. "
@@ -7742,14 +7560,9 @@ static void drawAdvisorDisclosure(AppState &st, const Study &s) {
     ImGui::Text("Recommended mesher: %s", a.mesher.c_str());
     if (advisorMesherIsPolyhedral(a.mesher)) {
       ImGui::PushStyleColor(ImGuiCol_Text, simRole(ui::palette.statusWarn));
-      const std::string ranWith =
-          s.meshBackendUsed.empty()
-              ? std::string()
-              : "; the run meshed with " + s.meshBackendUsed;
       ImGui::TextWrapped(
-          "Chudware solves tetrahedral meshes only. This polyhedral/VEM "
-          "recommendation was NOT executed%s.",
-          ranWith.c_str());
+          "Chudware currently solves fixed-stride tetrahedral meshes. This "
+          "hybrid/VEM family recommendation was not executed.");
       ImGui::PopStyleColor();
     }
   }
@@ -10189,8 +10002,7 @@ void SimManager::runThermalFea(AppState &st, Study &s) {
       tr["dt_s"] = s.thermDtS;
     study["transient"] = tr;
   }
-  addMeshParams(study, s, /*order=*/1, /*allowHex=*/false,
-                /*allowAdvisor=*/true);
+  addMeshParams(study, s, /*order=*/1, /*allowAdvisor=*/true);
 
   std::string note;
   if (sim->launch("sim_run_thermal", {{"study", study}}, note,

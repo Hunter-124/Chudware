@@ -76,56 +76,43 @@ struct ResolvedMesh {
     bool ok = false;
 };
 
-ResolvedMesh resolve_mesh_for_overlay(const json& study) {
-    ResolvedMesh rm;
-    const bool has_step =
-        study.contains("step_path") && study["step_path"].is_string() &&
-        !study["step_path"].get<std::string>().empty();
-    if (!has_step && study.contains("points") && study["points"].is_array() &&
-        !study["points"].empty()) {
-        for (const auto& p : study["points"]) {
-            if (p.is_array()) {
-                for (const auto& c : p) rm.points.push_back(c.get<double>());
-            } else if (p.is_number()) {
-                rm.points.push_back(p.get<double>());
-            }
-        }
-        rm.tets = json_ints(study.value("tets", json::array()));
-        rm.nodes_per_elem = study.value("nodes_per_elem", 4);
-        rm.ok = !rm.points.empty() && !rm.tets.empty();
-        return rm;
+ResolvedMesh resolve_mesh_for_overlay(const json &study) {
+  ResolvedMesh rm;
+  const bool has_step = study.contains("step_path") &&
+                        study["step_path"].is_string() &&
+                        !study["step_path"].get<std::string>().empty();
+  if (!has_step && study.contains("points") && study["points"].is_array() &&
+      !study["points"].empty()) {
+    for (const auto &p : study["points"]) {
+      if (p.is_array()) {
+        for (const auto &c : p)
+          rm.points.push_back(c.get<double>());
+      } else if (p.is_number()) {
+        rm.points.push_back(p.get<double>());
+      }
     }
-    if (has_step) {
-        MeshOptions opts;
-        opts.fineness = study.value("fineness", 0.5);
-        opts.density = study.value("density", -1.0);
-        opts.order = study.value("mesh_order", study.value("order", 1));
-        opts.curvature = study.value("curvature", true);
-        opts.curv_elems_per_circle =
-            study.value("curv_elems_per_circle", 12.0);
-        opts.target_size_mm = study.value("target_size_mm", 0.0);
-        opts.min_size_mm = study.value("min_size_mm", 0.0);
-        opts.max_size_mm = study.value("max_size_mm", 0.0);
-        opts.optimize = study.value("optimize", true);
-        opts.backend =
-            mesher_backend_from_string(study.value("mesher_backend", std::string("netgen")));
-        opts.structured =
-            study.value("structured",
-                        study.value("mesh_type", std::string()) == "hex");
-        opts.auto_type = study.value("auto_type", false);
-        opts.quad_surface = study.value("quad_surface", false);
-        opts.fallback_to_tet = study.value("fallback_to_tet", true);
-        opts.thin_wall_layers = study.value("thin_wall_layers", 4.0);
-        MeshOut m =
-            mesh_step_cached(study["step_path"].get<std::string>(), opts);
-        if (m.ok) {
-            rm.points = m.points;
-            rm.tets = m.tets;
-            rm.nodes_per_elem = m.nodes_per_elem;
-            rm.ok = true;
-        }
-    }
+    rm.tets = json_ints(study.value("tets", json::array()));
+    rm.nodes_per_elem = study.value("nodes_per_elem", 4);
+    rm.ok = !rm.points.empty() && !rm.tets.empty();
     return rm;
+  }
+  if (has_step) {
+    MeshOptions options;
+    options.fineness = study.value("fineness", 0.5);
+    options.order = study.value("mesh_order", study.value("order", 1));
+    options.target_size_mm = study.value("target_size_mm", 0.0);
+    options.min_size_mm = study.value("min_size_mm", 0.0);
+    options.max_size_mm = study.value("max_size_mm", 0.0);
+    const auto mesh =
+        mesh_step_cached(study["step_path"].get<std::string>(), options);
+    if (mesh->ok) {
+      rm.points = mesh->points;
+      rm.tets = mesh->tets;
+      rm.nodes_per_elem = mesh->nodes_per_elem;
+      rm.ok = true;
+    }
+  }
+  return rm;
 }
 
 class FatigueJobScope {

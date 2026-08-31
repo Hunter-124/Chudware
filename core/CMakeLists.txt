@@ -476,10 +476,8 @@ set_target_properties(test_firmware PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 add_test(NAME firmware COMMAND test_firmware)
 # RUN_SERIAL + a generous TIMEOUT. The live legs launch real renode/qemu processes whose
-# cold start is CPU-bound (~10-20 s on an idle box). Under `ctest -j6` the Netgen mesher
-# suites (mesher_autopick alone is ~100 s of saturated cores) starved renode past its
-# 15/20 s per-run budget, so `firmware` failed only in PARALLEL runs and passed in
-# isolation — a pure machine-load artifact, not a firmware defect.
+# cold start is CPU-bound; running them beside the CPU-heavy mesher suites starves their
+# per-run deadline even though both pass independently — a machine-load artifact.
 #
 # Both halves were measured over 3 consecutive `ctest -j6` runs each:
 #   90 s budgets only (no RUN_SERIAL) -> 1 of 3 runs still FAILED, ~178 s per run.
@@ -1119,103 +1117,49 @@ set_target_properties(rpc_cli PROPERTIES
 if(CHUDWARE_WITH_OCCT)
   include(ProvisionOCCT)
 
-  # --- Heavy from-source third-party sub-deps (opt-in per platform) -----------
-  # On Windows each of these auto-provisions (builds from source / fetches a wheel-
-  # matched binary). Off-Windows they used to default hard OFF, which is wrong for a
-  # tree that has ALREADY provisioned one: the artifacts sit in third_party/ and cost
-  # nothing to link, so a present dependency now defaults ON (see _def_* below).
-  # Nothing provisioned and not Windows -> OFF, so a fresh checkout never pays an
-  # unasked from-source build; opt in with -DCHUDWARE_WITH_<DEP>=ON.
-  # The dependent code is #ifdef-guarded either way (doc/formats.cpp for
-  # LIB3MF/OPENNURBS, libchudware.cpp + the chudware_mesh target for NETGEN).
-
-  # Provisioned-artifact probes — "is this dependency already built in-tree?"
-  file(GLOB _have_netgen
-       "${CMAKE_CURRENT_SOURCE_DIR}/../third_party/netgen/install/lib/libnglib.so"
-       "${CMAKE_CURRENT_SOURCE_DIR}/../third_party/netgen/install/lib64/libnglib.so"
-       "${CMAKE_CURRENT_SOURCE_DIR}/../third_party/netgen/install/lib/nglib.lib")
+  # --- Optional third-party sub-dependencies ---------------------------------
   file(GLOB _have_lib3mf
        "${CMAKE_CURRENT_SOURCE_DIR}/../third_party/lib3mf/*/lib/lib3mf.so"
        "${CMAKE_CURRENT_SOURCE_DIR}/../third_party/lib3mf/*/lib/lib3mf.lib")
   file(GLOB _have_opennurbs
        "${CMAKE_CURRENT_SOURCE_DIR}/../third_party/opennurbs/*/lib/*opennurbs*")
-  file(GLOB _have_polymesh
-       "${CMAKE_CURRENT_SOURCE_DIR}/../third_party/polymesh/src/CMakeLists.txt")
 
-  # --- One-time migration of pre-rebrand caches (605645b7) --------------------
-  # The Billet / AI-CAD -> Chudware rename renamed AICAD_WITH_* to CHUDWARE_WITH_*.
-  # CMake does NOT rename cache entries: every existing build tree kept its ON value
-  # under the now-DEAD AICAD_WITH_* name while the renamed option silently took its
-  # off-Windows OFF default. Whole features were compiled out of libchudware with no
-  # error and no warning — the FEA surface (sim_mesh / sim_run_static / sim_run_modal
-  # / sim_run_fatigue / sim_run_thermal) simply became "unknown method" at runtime.
-  #
-  # Adopt the legacy value once, but only auto-enable when the dependency is actually
-  # provisioned, so the migration can never turn a working configure into a surprise
-  # third-party build. A legacy ON we cannot honor warns loudly instead of vanishing.
-  # The dead entry is dropped either way, so this never re-fires.
-  foreach(_f NETGEN LIB3MF OPENNURBS)
+  # One-time migration of pre-rebrand caches for the remaining optional format
+  # dependencies. Netgen is gone; clear both historical cache spellings so they
+  # cannot silently influence a later configure.
+  foreach(_f LIB3MF OPENNURBS)
     if(DEFINED AICAD_WITH_${_f})
-      string(TOLOWER "${_f}" _fl)
-      set(_want "${AICAD_WITH_${_f}}")
-      if(_want AND NOT WIN32 AND NOT _have_${_fl})
-        message(WARNING
-          "[chudware] pre-rebrand cache had AICAD_WITH_${_f}=ON, but nothing is "
-          "provisioned under third_party/${_fl}. Leaving CHUDWARE_WITH_${_f} at its "
-          "default; pass -DCHUDWARE_WITH_${_f}=ON to build it from source.")
-      else()
-        set(CHUDWARE_WITH_${_f} "${_want}" CACHE BOOL
-            "migrated from AICAD_WITH_${_f}" FORCE)
-        message(STATUS
-          "[chudware] migrated AICAD_WITH_${_f}=${_want} -> CHUDWARE_WITH_${_f}")
-      endif()
-      unset(AICAD_WITH_${_f} CACHE)  # drop the dead pre-rebrand entry
+      set(CHUDWARE_WITH_${_f} "${AICAD_WITH_${_f}}" CACHE BOOL
+          "migrated from AICAD_WITH_${_f}" FORCE)
+      unset(AICAD_WITH_${_f} CACHE)
     endif()
+  endforeach()
+  unset(AICAD_WITH_NETGEN CACHE)
+  unset(CHUDWARE_WITH_NETGEN CACHE)
+  foreach(_dead NETGEN_DLLS NETGEN_IMPORT_LIB NETGEN_INCLUDE_DIRS NETGEN_ROOT
+                NETGEN_VERSION NETGEN_ZLIB_DLL)
+    unset(${_dead} CACHE)
   endforeach()
 
   if(WIN32)
-    set(_aicad_subdep_default ON)
+    set(_subdep_default ON)
   else()
-    set(_aicad_subdep_default OFF)
+    set(_subdep_default OFF)
   endif()
-  set(_def_netgen    ${_aicad_subdep_default})
-  set(_def_lib3mf    ${_aicad_subdep_default})
-  set(_def_opennurbs ${_aicad_subdep_default})
-  set(_def_polymesh  ${_aicad_subdep_default})
-  if(_have_netgen)
-    set(_def_netgen ON)
-  endif()
+  set(_def_lib3mf ${_subdep_default})
+  set(_def_opennurbs ${_subdep_default})
   if(_have_lib3mf)
     set(_def_lib3mf ON)
   endif()
   if(_have_opennurbs)
     set(_def_opennurbs ON)
   endif()
-  if(_have_polymesh)
-    set(_def_polymesh ON)
-  endif()
-  option(CHUDWARE_WITH_NETGEN    "Netgen/nglib FEA tet mesher (sim/mesher.cpp, fea_run)" ${_def_netgen})
-  option(CHUDWARE_WITH_LIB3MF    "lib3mf 3MF reader/writer (doc/formats.cpp)"            ${_def_lib3mf})
-  option(CHUDWARE_WITH_OPENNURBS "openNURBS Rhino .3dm reader/writer (doc/formats.cpp)"  ${_def_opennurbs})
-  option(CHUDWARE_WITH_POLYMESH  "Polyhedral-FEA graded-tet mesher backend (sim/polymesh_backend.cpp)" ${_def_polymesh})
-
-  # --- P50: Netgen / nglib tet mesher (LGPL-2.1 — commercial-safe) -----------
-  # BUILD Netgen from source against OUR OCCT (no prebuilt SDK exists); see
-  # ProvisionNetgen.cmake. nglib.h lives ONLY in mesher.cpp (mesher.h is backend-
-  # free); chudware_mesh links nglib's import lib and nglib.dll + ngcore.dll are staged
-  # next to libchudware.dll. This replaced gmsh (GPL-2+, no linking exception) — the #1
-  # commercialization blocker. MUST come AFTER ProvisionOCCT (shares its OCCT + zlib).
-  if(CHUDWARE_WITH_NETGEN)
-    include(ProvisionNetgen)
-    # ELF runtime-path: nglib lives in the Netgen install lib dir (out of the loader's default
-    # search). Bake that dir into the BUILD_RPATH of every target defined below (libchudware + the
-    # FEA-mesh tests) so they resolve libnglib.so; libnglib itself has $ORIGIN rpath so it then
-    # finds its sibling libngcore.so. No-op on Windows (DLLs are co-located/staged instead).
-    if(NOT WIN32)
-      get_filename_component(_ng_libdir "${NETGEN_IMPORT_LIB}" DIRECTORY)
-      list(APPEND CMAKE_BUILD_RPATH "$ORIGIN" "${_ng_libdir}")
-    endif()
-  endif()
+  option(CHUDWARE_WITH_LIB3MF
+    "lib3mf 3MF reader/writer (doc/formats.cpp)" ${_def_lib3mf})
+  option(CHUDWARE_WITH_OPENNURBS
+    "openNURBS Rhino .3dm reader/writer (doc/formats.cpp)" ${_def_opennurbs})
+  option(CHUDWARE_WITH_POLYMESH
+    "Polyhedral-FEA volume meshing and adaptive refinement" ON)
 
   # --- P55r: lib3mf 3MF reader/writer (BSD — clean to link/distribute) -------
   # Provision the SAME lib3mf 2.5.0 the Python oracle (engine/doc/formats.py)
@@ -1238,130 +1182,36 @@ if(CHUDWARE_WITH_OCCT)
     include(ProvisionOpenNURBS)
   endif()
 
-  # --- Polyhedral-FEA (`polymesh`) second mesher backend — BSD-3, static ------
-  # A graded Cartesian tet fill: an INDEPENDENT second discretization for checking whether
-  # a stress result is a property of the part or of the mesh, and the only backend that
-  # accepts a size field, so adaptive refinement (sim/fea_adaptive.cpp) requires it. It is
-  # not a robustness fallback — measured, it meshes no part that Netgen refuses. It plugs in
-  # behind the SAME chudware::sim::MeshOut contract (sim/polymesh_backend.cpp), so no
-  # solver, overlay, RPC or viewport path knows which mesher ran.
-  #
-  # It lives in the chudware_mesh target, which exists only under CHUDWARE_WITH_NETGEN:
-  # mesh_step's multi-solid/auto-pick dispatch is still Netgen's. Say so rather than
-  # compiling a backend nothing can reach.
-  if(CHUDWARE_WITH_POLYMESH AND NOT CHUDWARE_WITH_NETGEN)
-    message(WARNING
-      "[polymesh] CHUDWARE_WITH_POLYMESH needs CHUDWARE_WITH_NETGEN (the mesher target "
-      "and its mesh_step dispatch live there) — disabling the polymesh backend.")
-    set(CHUDWARE_WITH_POLYMESH OFF CACHE BOOL "" FORCE)
-  endif()
+  # --- Polyhedral-FEA: the sole FEA volume mesher -----------------------------
   if(CHUDWARE_WITH_POLYMESH)
     include(ProvisionPolymesh)
-  endif()
 
-  # P50b: sim/fea_run.cpp (the combined mesh+resolve+solve glue) joins the mesher
-  # target — it is the only sim source that needs the mesher, and adding it here
-  # keeps the mesher-backend confinement intact (fea_run.h itself is nglib-free).
-  # chudware_mesh gains a PUBLIC dep on chudware_sim so fea_run.cpp can call the FEA solvers.
-  # Gated on CHUDWARE_WITH_NETGEN: the mesher (mesher.cpp) is the only nglib consumer.
-  # Compile the polymesh-facing backend as its own object target so polymesh's include
-  # directories are visible to exactly one translation unit. chudware_mesh receives only
-  # the object and a link-only dependency; mesher.h and every other core TU remain free of
-  # advisor/pipeline headers.
-  if(CHUDWARE_WITH_POLYMESH)
-    add_library(chudware_polymesh_backend OBJECT sim/polymesh_backend.cpp)
-    # OCCT headers: this TU takes the loaded B-rep as a TopoDS_Shape (and
-    # sim/mesh_size_band.h declares resolve_size_band over one). Nothing propagates them
-    # here — polymesh_geom keeps its own OCCT include dir SYSTEM PRIVATE, and
-    # chudware_geom_occt, whose PUBLIC includes serve every other OCCT TU in this file, is
-    # declared further down — so use the same find_package variable those targets do
-    # rather than a literal path. OCCT *symbols* need no link line here: an OBJECT library
-    # has no link step, and the chudware_mesh archive that owns these objects already links
-    # chudware_geom_occt (which carries the TK* toolkits).
-    target_include_directories(chudware_polymesh_backend PRIVATE
-      ${CMAKE_CURRENT_SOURCE_DIR}
-      ${OpenCASCADE_INCLUDE_DIR})
-    target_compile_definitions(chudware_polymesh_backend PRIVATE CHUDWARE_WITH_POLYMESH)
-    # polymesh::pipeline is the single source of everything this TU includes for the MESHER
-    # itself: its PUBLIC geom/mesh/fea/adapt chain carries those include dirs,
-    # Eigen3::Eigen, the POLYMESH_WITH_OCC define and (when polymesh found it)
-    # OpenMP::OpenMP_CXX. PRIVATE keeps all of it on this one target.
-    #
-    # The learned advisor is a SEPARATE axis. polymesh::advisor exists only where upstream
-    # pins a prebuilt ONNX Runtime — Windows x64 and non-Apple 64-bit Unix
-    # (POLYMESH_ADVISOR_ENABLED, see cmake/ProvisionPolymesh.cmake). On macOS or any other
-    # pointer width the target is never declared, so linking it unconditionally turned
-    # "no learned advice here" into a configure failure for the whole mesher. The tet fill
-    # and the adaptive loop have no advisor dependency, so build them and say so at
-    # runtime instead.
+    add_library(chudware_mesh STATIC
+      sim/mesher.cpp
+      sim/mesh_quality.cpp
+      sim/mesh_size_band.cpp
+      sim/fea_run.cpp
+      sim/fea_fatigue.cpp
+      sim/fea_adaptive.cpp)
+    target_include_directories(chudware_mesh
+      PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}
+      PRIVATE ${OpenCASCADE_INCLUDE_DIR})
+    target_compile_definitions(chudware_mesh PRIVATE CHUDWARE_WITH_POLYMESH)
+    target_compile_features(chudware_mesh PRIVATE cxx_std_20)
+    target_link_libraries(chudware_mesh
+      PUBLIC chudware_sim nlohmann_json::nlohmann_json)
     if(POLYMESH_ADVISOR_ENABLED)
-      # polymesh::advisor PUBLIC-links polymesh::pipeline, so this is a superset of the
-      # advisor-off link and adds only the advisor's own include dir.
-      target_link_libraries(chudware_polymesh_backend PRIVATE polymesh::advisor)
-      # CHUDWARE_WITH_POLYMESH_ADVISOR is the one macro that admits <advisor/advisor.hpp>,
-      # pm::advisor::Advisor and the model-directory lookup into this TU. The three paths
-      # below are that lookup's inputs and mean nothing without it, so they are defined in
-      # the same branch — an advisor-less build carries no advisor artifact paths at all.
-      #
-      # Runtime resolution, not a build-machine path: the backend looks at
-      # CHUDWARE_POLYMESH_ADVISOR_DIR, then at <its own module dir>/<PACKAGE_DIR> (what
-      # chudware_polymesh_stage_runtime stages), and only then at the source checkout —
-      # which exists solely on a machine that has one. Baking the source dir in as the
-      # ONLY lookup left the advisor dead in every packaged install.
-      target_compile_definitions(chudware_polymesh_backend PRIVATE
+      target_link_libraries(chudware_mesh PRIVATE polymesh::advisor ${CMAKE_DL_LIBS})
+      target_compile_definitions(chudware_mesh PRIVATE
         CHUDWARE_WITH_POLYMESH_ADVISOR
         "CHUDWARE_POLYMESH_ADVISOR_SOURCE_DIR=\"${POLYMESH_ADVISOR_SOURCE_DIR}\""
         "CHUDWARE_POLYMESH_ADVISOR_PACKAGE_DIR=\"${POLYMESH_ADVISOR_PACKAGE_DIR}\""
         "CHUDWARE_POLYMESH_MODEL_REVISION=\"${POLYMESH_MODEL_REVISION}\"")
     else()
-      target_link_libraries(chudware_polymesh_backend PRIVATE polymesh::pipeline)
+      target_link_libraries(chudware_mesh PRIVATE polymesh::pipeline)
     endif()
-    target_compile_features(chudware_polymesh_backend PRIVATE cxx_std_20)
-    set_property(TARGET chudware_polymesh_backend PROPERTY
-      MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL")
-    set(_chudware_polymesh_backend_source
-      $<TARGET_OBJECTS:chudware_polymesh_backend>)
-  else()
-    set(_chudware_polymesh_backend_source sim/polymesh_backend.cpp)
-  endif()
-  if(CHUDWARE_WITH_NETGEN)
-    add_library(chudware_mesh STATIC sim/mesher.cpp sim/hex_mesher.cpp sim/fea_run.cpp
-                                     sim/fea_fatigue.cpp
-                                     ${_chudware_polymesh_backend_source}
-                                     sim/fea_adaptive.cpp)
-    target_include_directories(chudware_mesh PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
-    target_include_directories(chudware_mesh PRIVATE ${NETGEN_INCLUDE_DIRS})
-    # nglib's import lib is PUBLIC so it propagates onto the final link line of the
-    # `chudware` DLL that consumes this static lib (a STATIC lib's link deps aren't pulled
-    # in transitively otherwise). nglib.h decorates its prototypes dllimport on WIN32.
-    target_link_libraries(chudware_mesh PUBLIC ${NETGEN_IMPORT_LIB} chudware_sim nlohmann_json::nlohmann_json)
     set_property(TARGET chudware_mesh PROPERTY
       MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL")
-    if(CHUDWARE_WITH_POLYMESH)
-      # An OBJECT library has no link step, so the polymesh symbols those objects
-      # reference resolve on every consumer's link line — hence a LINK_ONLY dependency
-      # here (this archive itself compiles no polymesh header). Same pair of targets the
-      # object library picked: the advisor superset where it exists, the pipeline chain
-      # the mesher always needs otherwise.
-      if(POLYMESH_ADVISOR_ENABLED)
-        # ${CMAKE_DL_LIBS}: only the advisor path locates its staged model package beside
-        # its own module with dladdr, which lives in libdl on glibc < 2.34 (empty string
-        # on newer glibc and on Windows). A STATIC library's PRIVATE deps still reach
-        # every consumer's link line, so this covers libchudware and the tests.
-        target_link_libraries(chudware_mesh PRIVATE
-          "$<LINK_ONLY:polymesh::advisor>" ${CMAKE_DL_LIBS})
-      else()
-        target_link_libraries(chudware_mesh PRIVATE "$<LINK_ONLY:polymesh::pipeline>")
-      endif()
-      # sim/fea_adaptive.cpp is compiled HERE, not in the object target, and #ifdefs its
-      # entire real path on CHUDWARE_WITH_POLYMESH — without the define an ENABLED build
-      # answers every adaptive study with "this build was configured without polymesh".
-      # It costs this archive no polymesh headers: the PolymeshAdaptiveMesher it drives is
-      # declared in the advisor-free sim/polymesh_backend.h and defined (PImpl) in the
-      # object target. PRIVATE — no consumer of chudware_mesh reads the macro.
-      target_compile_definitions(chudware_mesh PRIVATE CHUDWARE_WITH_POLYMESH)
-      # Only chudware_polymesh_backend opts into polymesh's C++20 language level.
-    endif()
   endif()
   # Smoke test: box -> volume (BRepGProp) -> tessellation (BRepMesh). Proves the
   # auto-provisioned kernel is found, linked, and runnable end to end.
@@ -1449,144 +1299,83 @@ if(CHUDWARE_WITH_OCCT)
     # whole OCCT bin dir).
     TKRWMesh TKDEOBJ TKDEGLTF TKXCAF TKLCAF TKCDF TKBin TKBinL TKBinXCAF)
 
-  # --- Netgen-mesher-dependent wiring + tests (gated on CHUDWARE_WITH_NETGEN) ----
-  if(CHUDWARE_WITH_NETGEN)
-  # sim/fea_fatigue.cpp (in chudware_mesh, defined above) calls fatigue_overlay from
-  # sim/overlay.cpp (in chudware_geom_occt). Wire that dep here — AFTER chudware_geom_occt
-  # exists — so the fatigue solver can package its display overlay. PRIVATE: only
-  # fea_fatigue.cpp's TU needs it; consumers of chudware_mesh link chudware_geom_occt on
-  # their own (the final chudware DLL already does).
-  target_link_libraries(chudware_mesh PRIVATE chudware_geom_occt)
-
-  # Fatigue solver smoke test: inline 6-tet cube under tension -> fea_run_fatigue.
-  # No STEP path -> no overlay, so it needs no OCCT DLL PATH munging, but it still
-  # links the OCCT-gated targets (this whole block is CHUDWARE_WITH_OCCT-only).
-  add_executable(test_fatigue tests/test_fatigue.cpp)
-  target_include_directories(test_fatigue PRIVATE ${doctest_SOURCE_DIR})
-  target_link_libraries(test_fatigue PRIVATE chudware_mesh chudware_geom_occt)
-  set_target_properties(test_fatigue PROPERTIES
-    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
-  add_test(NAME fatigue COMMAND test_fatigue)
-  # Netgen + OCCT DLLs must be on PATH for the static solve (fea_run_static meshes only
-  # when a STEP path is present — the inline-mesh test does not — but chudware_mesh pulls
-  # the nglib import lib, and chudware_geom_occt pulls OCCT, so stage both dirs to be safe).
-  set(_fatigue_envmod "PATH=path_list_prepend:${OCCT_DLL_DIR}")
-  foreach(_b ${OCCT_3RDPARTY_BINS})
-    list(APPEND _fatigue_envmod "PATH=path_list_prepend:${_b}")
-  endforeach()
-  list(APPEND _fatigue_envmod "PATH=path_list_prepend:${NETGEN_ROOT}/install/bin")
-  # ONNX Runtime on PATH only where the advisor is actually part of the build:
-  # POLYMESH_ONNXRUNTIME_RUNTIME is set by polymesh's advisor subdirectory, which returns
-  # early when POLYMESH_WITH_ADVISOR is OFF, so on a 32-bit Windows host this would
-  # otherwise prepend an empty directory.
-  if(CHUDWARE_WITH_POLYMESH AND POLYMESH_ADVISOR_ENABLED AND WIN32)
-    get_filename_component(_polymesh_ort_bin
-      "${POLYMESH_ONNXRUNTIME_RUNTIME}" DIRECTORY)
-    list(APPEND _fatigue_envmod
-      "PATH=path_list_prepend:${_polymesh_ort_bin}")
-  endif()
-  get_filename_component(_ng_zlib_bin "${NETGEN_ZLIB_DLL}" DIRECTORY)
-  list(APPEND _fatigue_envmod "PATH=path_list_prepend:${_ng_zlib_bin}")
-  set_tests_properties(fatigue PROPERTIES ENVIRONMENT_MODIFICATION "${_fatigue_envmod}")
-
-  # Netgen mesher end-to-end: build a cantilever OCCT solid -> STEP -> mesh_step (tet4/tet10)
-  # -> fea_run_static, asserting quality + convergence toward the Euler-Bernoulli deflection
-  # (Bug F7 guard). Exercises the REAL nglib mesh path, so it needs OCCT + Netgen DLLs (the
-  # same _fatigue_envmod PATH prepend).
-  add_executable(test_netgen_mesh tests/test_netgen_mesh.cpp)
-  target_include_directories(test_netgen_mesh PRIVATE
-    ${doctest_SOURCE_DIR} ${OpenCASCADE_INCLUDE_DIR})
-  target_link_libraries(test_netgen_mesh PRIVATE chudware_mesh chudware_geom_occt)
-  set_target_properties(test_netgen_mesh PROPERTIES
-    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
-  add_test(NAME netgen_mesh COMMAND test_netgen_mesh)
-  set_tests_properties(netgen_mesh PROPERTIES ENVIRONMENT_MODIFICATION "${_fatigue_envmod}")
-
-  # Cross-backend interchangeability: the same cantilever meshed by BOTH backends must
-  # honor one MeshOut contract and solve to the same tip deflection. Also the only guard
-  # on the tet10 mid-edge slot permutation between the two node orderings, which is a
-  # silent-wrong-answer bug, not a crash. Runs (and passes trivially) in a build without
-  # polymesh — the cases self-skip via mesher_backend_available.
-  add_executable(test_polymesh_backend tests/test_polymesh_backend.cpp)
-  target_include_directories(test_polymesh_backend PRIVATE
-    ${doctest_SOURCE_DIR} ${OpenCASCADE_INCLUDE_DIR})
-  target_link_libraries(test_polymesh_backend PRIVATE chudware_mesh chudware_geom_occt)
-  set_target_properties(test_polymesh_backend PROPERTIES
-    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+  # --- Polyhedral-FEA wiring and focused mesh tests ---------------------------
   if(CHUDWARE_WITH_POLYMESH)
-    # Where the advisor is buildable this test binary links polymesh::advisor, so it needs
-    # the ONNX Runtime beside it and is the one place a STAGED (not source-tree) advisor
-    # lookup gets exercised by ctest. Same output dir as libchudware, and
-    # copy_if_different, so the copies coalesce. On an advisor-less platform the staging
-    # helper is a documented no-op, so the predicate is not repeated here.
-    chudware_polymesh_stage_runtime(test_polymesh_backend)
+    target_link_libraries(chudware_mesh PRIVATE chudware_geom_occt)
+
+    set(_fea_envmod "PATH=path_list_prepend:${OCCT_DLL_DIR}")
+    foreach(_b ${OCCT_3RDPARTY_BINS})
+      list(APPEND _fea_envmod "PATH=path_list_prepend:${_b}")
+    endforeach()
+    if(POLYMESH_ADVISOR_ENABLED AND WIN32)
+      get_filename_component(_polymesh_ort_bin
+        "${POLYMESH_ONNXRUNTIME_RUNTIME}" DIRECTORY)
+      list(APPEND _fea_envmod
+        "PATH=path_list_prepend:${_polymesh_ort_bin}")
+    endif()
+
+    add_executable(test_fatigue tests/test_fatigue.cpp)
+    target_include_directories(test_fatigue PRIVATE ${doctest_SOURCE_DIR})
+    target_link_libraries(test_fatigue PRIVATE chudware_mesh chudware_geom_occt)
+    set_target_properties(test_fatigue PROPERTIES
+      RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+    add_test(NAME fatigue COMMAND test_fatigue)
+    set_tests_properties(fatigue PROPERTIES
+      ENVIRONMENT_MODIFICATION "${_fea_envmod}")
+
+    # End-to-end STEP -> tet4/tet10 -> static/adaptive solve coverage.
+    add_executable(test_mesh tests/test_mesh.cpp)
+    target_include_directories(test_mesh PRIVATE
+      ${doctest_SOURCE_DIR} ${OpenCASCADE_INCLUDE_DIR})
+    target_link_libraries(test_mesh PRIVATE chudware_mesh chudware_geom_occt)
+    set_target_properties(test_mesh PROPERTIES
+      RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+    chudware_polymesh_stage_runtime(test_mesh)
+    add_test(NAME mesh COMMAND test_mesh)
+    set_tests_properties(mesh PROPERTIES RUN_SERIAL TRUE
+      ENVIRONMENT_MODIFICATION "${_fea_envmod}")
+
+    add_executable(fea_profile tools/fea_profile.cpp)
+    target_include_directories(fea_profile PRIVATE ${OpenCASCADE_INCLUDE_DIR})
+    target_link_libraries(fea_profile PRIVATE
+      chudware_mesh chudware_geom_occt chudware_prof)
+    set_target_properties(fea_profile PROPERTIES
+      RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+
+    add_executable(test_mesh_quality tests/test_mesh_quality.cpp)
+    target_include_directories(test_mesh_quality PRIVATE
+      ${doctest_SOURCE_DIR} ${OpenCASCADE_INCLUDE_DIR})
+    target_link_libraries(test_mesh_quality PRIVATE
+      chudware_mesh chudware_geom_occt)
+    set_target_properties(test_mesh_quality PROPERTIES
+      RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+    add_test(NAME mesh_quality COMMAND test_mesh_quality)
+    set_tests_properties(mesh_quality PROPERTIES
+      ENVIRONMENT_MODIFICATION "${_fea_envmod}")
+
+    add_executable(test_mesher_advanced tests/test_mesher_advanced.cpp)
+    target_include_directories(test_mesher_advanced PRIVATE
+      ${doctest_SOURCE_DIR} ${OpenCASCADE_INCLUDE_DIR})
+    target_link_libraries(test_mesher_advanced PRIVATE
+      chudware_mesh chudware_geom_occt)
+    set_target_properties(test_mesher_advanced PROPERTIES
+      RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+    add_test(NAME mesher_advanced COMMAND test_mesher_advanced)
+    set_tests_properties(mesher_advanced PROPERTIES RUN_SERIAL TRUE
+      ENVIRONMENT_MODIFICATION "${_fea_envmod}")
+
+    add_executable(test_sim_cache tests/test_sim_cache.cpp)
+    target_include_directories(test_sim_cache PRIVATE
+      ${doctest_SOURCE_DIR} ${OpenCASCADE_INCLUDE_DIR})
+    target_link_libraries(test_sim_cache PRIVATE
+      chudware_mesh chudware_doc chudware_geom_occt chudware_sim
+      chudware_sketch chudware_geom chudware_util)
+    set_target_properties(test_sim_cache PROPERTIES
+      RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+    add_test(NAME sim_cache COMMAND test_sim_cache)
+    set_tests_properties(sim_cache PROPERTIES
+      ENVIRONMENT_MODIFICATION "${_fea_envmod}")
   endif()
-  add_test(NAME polymesh_backend COMMAND test_polymesh_backend)
-  set_tests_properties(polymesh_backend PROPERTIES RUN_SERIAL TRUE
-    ENVIRONMENT_MODIFICATION "${_fatigue_envmod}")
-
-  # fea_profile: standalone profiling harness for the static-stress solve (NOT a ctest — a
-  # manual perf tool). Meshes a beam -> fea_run_static under the in-process sampling profiler
-  # + CHUDWARE_FEA_PROFILE phase timers, sweeping fineness. Same OCCT/Netgen DLL deps as above.
-  add_executable(fea_profile tools/fea_profile.cpp)
-  target_include_directories(fea_profile PRIVATE ${OpenCASCADE_INCLUDE_DIR})
-  target_link_libraries(fea_profile PRIVATE chudware_mesh chudware_geom_occt chudware_prof)
-  set_target_properties(fea_profile PROPERTIES
-    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
-
-  # Mesher auto-pick + exotic-type regression: structured-hex fallback to tet on non-box,
-  # auto_type hex/tet selection, thin-wall layering, quad_surface, detect_box_geometry.
-  add_executable(test_mesher_autopick tests/test_mesher_autopick.cpp)
-  target_include_directories(test_mesher_autopick PRIVATE
-    ${doctest_SOURCE_DIR} ${OpenCASCADE_INCLUDE_DIR})
-  target_link_libraries(test_mesher_autopick PRIVATE chudware_mesh chudware_geom_occt)
-  set_target_properties(test_mesher_autopick PROPERTIES
-    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
-  add_test(NAME mesher_autopick COMMAND test_mesher_autopick)
-  set_tests_properties(mesher_autopick PROPERTIES ENVIRONMENT_MODIFICATION "${_fatigue_envmod}")
-
-  # Mesh-quality (evenness) regression: cylinder -> STEP -> mesh_step, assert an EVEN tet mesh
-  # (bounded aspect_max, jacobian_min>0, low pct_poor, healthy curvature resolution).
-  add_executable(test_mesh_quality tests/test_mesh_quality.cpp)
-  target_include_directories(test_mesh_quality PRIVATE
-    ${doctest_SOURCE_DIR} ${OpenCASCADE_INCLUDE_DIR})
-  target_link_libraries(test_mesh_quality PRIVATE chudware_mesh chudware_geom_occt)
-  set_target_properties(test_mesh_quality PROPERTIES
-    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
-  add_test(NAME mesh_quality COMMAND test_mesh_quality)
-  set_tests_properties(mesh_quality PROPERTIES ENVIRONMENT_MODIFICATION "${_fatigue_envmod}")
-
-  # Advanced multi-feature parts (boss+pocket+chamfer, hole array, stepped fillet) built via
-  # OCCT B-rep -> STEP -> mesh_step (tet10) + fea_run_static: asserts mesh-quality invariants
-  # (no inverted/degenerate elements, positive volumes), a finite plausible static solve
-  # (nonzero disp+stress, finite FoS), and a generous per-part wall-clock ceiling ("optimized
-  # enough to run"). Same OCCT + Netgen DLL PATH prepend as the other mesher tests.
-  add_executable(test_mesher_advanced tests/test_mesher_advanced.cpp)
-  target_include_directories(test_mesher_advanced PRIVATE
-    ${doctest_SOURCE_DIR} ${OpenCASCADE_INCLUDE_DIR})
-  target_link_libraries(test_mesher_advanced PRIVATE chudware_mesh chudware_geom_occt)
-  set_target_properties(test_mesher_advanced PROPERTIES
-    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
-  add_test(NAME mesher_advanced COMMAND test_mesher_advanced)
-  # RUN_SERIAL: mesher_advanced takes ~56 s standalone and FAILS under `ctest -j6`
-  # contention (REFACTOR_LOG.md:7003-7004) — the Netgen legs are CPU-bound and lose
-  # their budget to the parallel load, exactly like the `firmware` suite above. The
-  # timeout stays at ctest's default; serialization alone is what makes it pass.
-  set_tests_properties(mesher_advanced PROPERTIES
-    RUN_SERIAL TRUE
-    ENVIRONMENT_MODIFICATION "${_fatigue_envmod}")
-
-  # Durable sim solve-state cache: FEA static HIT/MISS + .step+ studies/*.npz round-trip
-  # + SPICE/CFD result cache invalidation. Needs the real mesh path (chudware_mesh) + stepplus
-  # (chudware_doc) so it links the OCCT+Netgen targets like test_fatigue (same _fatigue_envmod).
-  add_executable(test_sim_cache tests/test_sim_cache.cpp)
-  target_include_directories(test_sim_cache PRIVATE ${doctest_SOURCE_DIR} ${OpenCASCADE_INCLUDE_DIR})
-  target_link_libraries(test_sim_cache PRIVATE chudware_mesh chudware_doc chudware_geom_occt chudware_sim chudware_sketch chudware_geom chudware_util)
-  set_target_properties(test_sim_cache PROPERTIES
-    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
-  add_test(NAME sim_cache COMMAND test_sim_cache)
-  set_tests_properties(sim_cache PROPERTIES ENVIRONMENT_MODIFICATION "${_fatigue_envmod}")
-  endif()  # CHUDWARE_WITH_NETGEN
 
   # FEA boundary-surface extractor: fea_surface_body (the result-plot display surface,
   # so a bent beam renders curved). No STEP/mesher — builds structured tet meshes in
@@ -1602,10 +1391,9 @@ if(CHUDWARE_WITH_OCCT)
     ENVIRONMENT_MODIFICATION "${_occt_envmod}")
 
   # T-SIM2: regenerator for the committed result-contour AICM fixture used by the
-  # CHUDWARE_SHOT=fea_overlay headless scenario. Builds a structured cantilever tet mesh in code
-  # (Netgen-free — the mesher is the only unavailable piece in CI), runs the real fea_static_solve,
-  # and skins + field-maps it via static_overlay (in chudware_geom_occt). Not a ctest (it writes a
-  # file); run by hand to refresh contracts/fixtures/sim2_cantilever_result.aicm.
+  # CHUDWARE_SHOT=fea_overlay headless scenario. Builds a structured cantilever tet mesh in
+  # code, runs the real solver, and skins/maps it through the production overlay path.
+  # Run by hand to refresh contracts/fixtures/sim2_cantilever_result.aicm.
   add_executable(gen_sim2_result_fixture tests/gen_sim2_result_fixture.cpp)
   target_include_directories(gen_sim2_result_fixture PRIVATE ${OpenCASCADE_INCLUDE_DIR})
   target_link_libraries(gen_sim2_result_fixture PRIVATE chudware_geom_occt chudware_sim)
@@ -1724,12 +1512,14 @@ if(CHUDWARE_WITH_OCCT)
     ${OpenCASCADE_INCLUDE_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}/../ui/viewport/render)
   target_link_libraries(test_import_roundtrip PRIVATE
-    chudware_doc chudware_geom_occt chudware_sketch chudware_geom chudware_util chudware_mesh)
+    chudware_doc chudware_geom_occt chudware_sketch chudware_geom chudware_util)
   target_sources(test_import_roundtrip PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/../ui/viewport/render/aicm_loader.cpp)
   set_target_properties(test_import_roundtrip PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
   if(CHUDWARE_WITH_POLYMESH)
+    target_link_libraries(test_import_roundtrip PRIVATE chudware_mesh)
+    target_compile_definitions(test_import_roundtrip PRIVATE CHUDWARE_WITH_POLYMESH)
     chudware_polymesh_stage_runtime(test_import_roundtrip)
   endif()
   add_test(NAME import_roundtrip COMMAND test_import_roundtrip)
@@ -2284,13 +2074,9 @@ if(CHUDWARE_WITH_OCCT)
   set_tests_properties(surfacing PROPERTIES ENVIRONMENT_MODIFICATION "${_occt_envmod}")
 
   # --- libchudware: the C ABI SHARED library (the host-integration seam) ---------
-  # api/libchudware.{h,cpp} exposes a flat C ABI (chudware_call/chudware_free/chudware_abi_version)
-  # over chudware::doc::compile_document so the host can load this lib at runtime
-  # (LoadLibrary on Windows / dlopen on Linux) and route ported methods to the in-process
-  # C++ core (the strangler seam; see docs/REFACTOR_LOG.md). chudware_doc (STATIC) drags in
-  # the whole OCCT geom kernel transitively. The Netgen FEA-mesh RPCs in libchudware.cpp are
-  # compiled out unless CHUDWARE_WITH_NETGEN, so the lib builds without the mesher (geometry,
-  # sketch, features, STEP/IGES/STL still work — those need only OCCT).
+  # api/libchudware.{h,cpp} exposes a flat C ABI over the in-process kernel. The shared
+  # library owns the native dispatcher and links the FEA mesh layer when Polyhedral-FEA is
+  # enabled; geometry, sketch, and document RPCs remain buildable without it.
   # Build id (git describe) shared by libchudware (chudware_build_id export) and
   # chudware-hostd, so a matched-build engine + daemon report the SAME id (version
   # drain-replace). Seeded at configure time so the header always exists, then
@@ -2320,9 +2106,9 @@ if(CHUDWARE_WITH_OCCT)
   add_dependencies(chudware chudware_version_info)
   target_compile_definitions(chudware PRIVATE CHUDWARE_BUILD_DLL)
   target_link_libraries(chudware PRIVATE chudware_doc chudware_sim chudware_ecad chudware_cam chudware_agent chudware_parts chudware_sourcing chudware_firmware chudware_structural chudware_prof chudware_tolerance chudware_mechanical chudware_materials chudware_dfm chudware_piping chudware_hydraulic)
-  if(CHUDWARE_WITH_NETGEN)
+  if(CHUDWARE_WITH_POLYMESH)
     target_link_libraries(chudware PRIVATE chudware_mesh)
-    target_compile_definitions(chudware PRIVATE CHUDWARE_WITH_NETGEN)  # enable the mesh RPCs in libchudware.cpp
+    target_compile_definitions(chudware PRIVATE CHUDWARE_WITH_POLYMESH)
   endif()
   # Ship a usable PDB next to libchudware.dll WITHOUT dropping optimization, so the sampling
   # profiler resolves OUR frames to real names (OCCT stays module-level — no OCCT PDBs).
@@ -2349,9 +2135,6 @@ if(CHUDWARE_WITH_OCCT)
   # Stage the OCCT toolkit + 3rdparty DLLs next to libchudware (no-op on non-Windows: the
   # system loader resolves the .so dependencies).
   chudware_occt_copy_dlls(chudware)
-  if(CHUDWARE_WITH_NETGEN)
-    chudware_netgen_copy_dlls(chudware)  # nglib.dll + ngcore.dll + zlib.dll (chudware_mesh runtime deps)
-  endif()
   if(CHUDWARE_WITH_POLYMESH)
     # ONNX Runtime + the advisor model package beside libchudware. Upstream's own
     # polymesh_stage_onnxruntime stages nothing on Linux and no model anywhere, so a
@@ -2499,8 +2282,7 @@ if(TARGET test_nsolve)
 
   # Release cross-platform parity corpus: compile the same 12 canonical documents on every
   # native architecture, then emit a JSON dump for scripts/platform_parity.py. The target
-  # remains registered without Netgen and returns CTest's named skip code (77), because the
-  # required FEA fixture must never silently disappear from a supposedly complete dump.
+  # remains registered without the FEA mesher and returns CTest's named skip code (77).
   if(CHUDWARE_WITH_OCCT)
     add_executable(test_platform_parity tests/test_platform_parity.cpp)
     target_compile_features(test_platform_parity PRIVATE cxx_std_20)
@@ -2514,18 +2296,18 @@ if(TARGET test_nsolve)
       ${CMAKE_CURRENT_SOURCE_DIR}/../ui/viewport/render/aicm_loader.cpp)
     target_compile_definitions(test_platform_parity PRIVATE
       CHUDWARE_PLATFORM_PARITY_CORPUS="${CMAKE_CURRENT_SOURCE_DIR}/../corpora/platform_parity")
-    if(CHUDWARE_WITH_NETGEN)
+    if(CHUDWARE_WITH_POLYMESH)
       target_link_libraries(test_platform_parity PRIVATE chudware_mesh)
-      target_compile_definitions(test_platform_parity PRIVATE CHUDWARE_WITH_NETGEN)
+      target_compile_definitions(test_platform_parity PRIVATE CHUDWARE_WITH_POLYMESH)
     endif()
     set_target_properties(test_platform_parity PROPERTIES
       RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
     add_test(NAME platform_parity COMMAND test_platform_parity)
-    if(CHUDWARE_WITH_NETGEN)
+    if(CHUDWARE_WITH_POLYMESH)
       set_tests_properties(platform_parity PROPERTIES
         RUN_SERIAL TRUE
         SKIP_RETURN_CODE 77
-        ENVIRONMENT_MODIFICATION "${_fatigue_envmod}")
+        ENVIRONMENT_MODIFICATION "${_fea_envmod}")
     else()
       set_tests_properties(platform_parity PROPERTIES
         SKIP_RETURN_CODE 77

@@ -1163,7 +1163,6 @@ def _polymesh_static_case(case: str) -> dict:
         "loads": [{"face": {"of": "face", "side": "right"}, "force": load}],
         "material": _VV_STEEL,
         "mesh_fineness": 0.6,
-        "mesher_backend": "polymesh",
         "doc_id": doc,
     })
     got = result.get("summary", {}).get("max_disp_mm") if result.get("ok") else None
@@ -1172,8 +1171,8 @@ def _polymesh_static_case(case: str) -> dict:
         "got": got,
         "ref": ref,
         "error": result.get("error"),
-        "note": (f"{note}; mesher=polymesh, element=tet10, "
-                 "solver=Chudware core tet FEA (not a VEM/polyhedral solve)"),
+        "note": (f"{note}; mesher=Polyhedral-FEA, element=tet10, "
+                 "solver=Chudware core tet FEA"),
     }
 
 

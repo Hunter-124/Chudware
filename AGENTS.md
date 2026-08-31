@@ -138,8 +138,8 @@ Other entry points:
 - `./build.sh` — thin wrapper: builds core → `libchudware.so`, then the host GUI
   → `host/build-linux/bin/Chudware`. (`build.bat` on Windows.)
 - Core presets (`CMakePresets.json`): `linux-core`, `windows-core` (MSVC,
-  OCCT off, self-contained), `windows-occt` (auto-downloads OCCT 7.9.3 +
-  Netgen, cached under `third_party/`). See `docs/reference/BUILD_WINDOWS.md`.
+  OCCT off, self-contained), `windows-occt` (OCCT + Polyhedral-FEA).
+  See `docs/reference/BUILD_WINDOWS.md`.
 - Host GUI has its own CMakeLists: `cmake -S host -B host/build-linux
   -G Ninja -DCMAKE_BUILD_TYPE=Release && ninja -C host/build-linux Chudware`.
   CEF (embedded vendor sign-in browser) defaults ON and needs the SDK under

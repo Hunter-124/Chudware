@@ -188,8 +188,7 @@ _SIM_AVAILABLE: bool | None = None
 
 
 def _require_sim() -> None:
-    """Skip (not fail) when the loaded engine has no Netgen FEA solver compiled in —
-    same net as test_cad_tools.py::_require_sim."""
+    """Skip when the loaded engine was built without the FEA mesher."""
     global _SIM_AVAILABLE
     if _SIM_AVAILABLE is None:
         try:
@@ -198,7 +197,7 @@ def _require_sim() -> None:
         except cb.CoreError as exc:
             _SIM_AVAILABLE = "unknown method" not in str(exc).lower()
     if not _SIM_AVAILABLE:
-        pytest.skip("engine has no FEA solver (sim-less build: CHUDWARE_WITH_NETGEN=OFF)")
+        pytest.skip("engine has no FEA solver (CHUDWARE_WITH_POLYMESH=OFF)")
 
 
 def _call(name: str, args: dict):

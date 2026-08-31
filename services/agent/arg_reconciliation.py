@@ -48,24 +48,6 @@ _N_MODES_SPELLINGS: dict[str, str] = {
 }
 
 
-# Model-facing spellings of the FEA mesher selector. Like `_N_MODES_SPELLINGS`, this
-# table maps only names denoting the SAME semantic slot; unlike `mesh_size_mm`, none
-# carries a quantity or unit that would be lost by reconciliation.
-_MESHER_BACKEND_SPELLINGS: dict[str, str] = {
-    "mesher": "mesherbackend",
-    "meshbackend": "mesherbackend",
-    "meshingbackend": "mesherbackend",
-    "backend": "mesherbackend",
-}
-
-_MESHER_BACKEND_VALUES: dict[str, str] = {
-    "netgen": "netgen",
-    "nglib": "netgen",
-    "polymesh": "polymesh",
-    "poly": "polymesh",
-    "polyhedral": "polymesh",
-    "polyhedralfea": "polymesh",
-}
 
 
 # Synonyms that are only unambiguous for ONE tool. "type" is far too generic
@@ -172,10 +154,6 @@ TOOL_ARG_SYNONYMS: dict[str, dict[str, str]] = {
     "run_fea_frequency_response": _N_MODES_SPELLINGS,
     # run_fea_buckling(fixtures, load, material, n_modes=4, doc_id) — cad_sim_tools.py:1327.
     "run_fea_buckling": _N_MODES_SPELLINGS,
-    "run_fea_static": _MESHER_BACKEND_SPELLINGS,
-    "run_fea_fatigue": _MESHER_BACKEND_SPELLINGS,
-    "run_fea_thermal": _MESHER_BACKEND_SPELLINGS,
-    "sim_run": _MESHER_BACKEND_SPELLINGS,
 
     # make_drawing(doc_id, views, sections, sheet, hole_callouts, model_items, title,
     # source_doc, template) — cad_drawing_tools.py:407, signature read 2026-07-29 AFTER
@@ -309,8 +287,6 @@ def synonyms_for(tool: str) -> dict[str, str]:
     """The global synonym table plus *tool*'s own overrides, merged."""
     merged = dict(ARG_SYNONYMS)
     merged.update(TOOL_ARG_SYNONYMS.get(tool) or {})
-    if tool == "run_fea_modal":
-        merged.update(_MESHER_BACKEND_SPELLINGS)
     return merged
 
 def norm_arg(name: str) -> str:
@@ -368,14 +344,8 @@ def annotation_admits(ann: str, value: Any) -> bool:
 def bind_value(target: str, ann: str, value: Any) -> Any:
     """Return the value that should actually be bound to *target*.
 
-    JSON-document parameters accept decoded model output. The mesher selector also
-    canonicalizes a closed set of names for the same two backends; an unknown value
-    remains untouched so the tool's own validator refuses it with the legal vocabulary.
+    JSON-document parameters accept decoded model output.
     """
-    if norm_arg(target) == "mesherbackend" and isinstance(value, str):
-        canonical = _MESHER_BACKEND_VALUES.get(norm_arg(value))
-        if canonical is not None:
-            return canonical
     if isinstance(value, (list, dict)) and str(target).endswith("_json"):
         a = str(ann or "").lower()
         if ("str" in a or "string" in a) and "dict" not in a and "list" not in a:

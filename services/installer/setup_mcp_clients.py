@@ -76,7 +76,7 @@ def _env(repo: str, profile: str) -> dict:
     env = {} if compiled else {"PYTHONPATH": repo}
     # Always pin the profile explicitly so clients don't inherit a stale shell default.
     env["CHUDWARE_MCP_PROFILE"] = profile
-    # Prefer the staged full engine (OCCT + Netgen) when present so MCP and GUI share one.
+    # Prefer the staged full OCCT/Polyhedral-FEA engine so MCP and GUI share one instance.
     for rel in (
         Path("dist") / "Chudware" / "libchudware.dll",
         Path("build") / "windows-occt" / "bin" / "libchudware.dll",

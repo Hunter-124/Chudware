@@ -1741,25 +1741,15 @@ bool WorkerClient::callImpl(const std::string &method, const json &params,
       err = result.value("message", std::string("cpp-sim error"));
       return true;
     }
-    // The core returned a BARE {"error": "unknown method: <m>"} (rc!=0, no
-    // structured envelope). For the FEA methods that means the engine was built
-    // WITHOUT the Netgen mesher (core/CMakeLists.txt CHUDWARE_WITH_NETGEN gates
-    // the whole sim_mesh / sim_run_* block out of libchudware.cpp) — and there is
-    // NO Python implementation of these to fall through to: services/sim has no
-    // sim_mesh, so the Python leg answers "unknown method" as well. Reporting the
-    // raw dispatcher string is what made this look like a routing bug for so long;
-    // name the actual cause instead so the next person fixes the BUILD.
-    //
-    // (This is exactly how the surface vanished: the Billet/AI-CAD -> Chudware
-    // rename in 605645b7 renamed AICAD_WITH_NETGEN, existing CMake caches kept
-    // their ON value under the dead old name, and the renamed option silently took
-    // its off-Windows OFF default. core/CMakeLists.txt now migrates such caches.)
+    // The core returned a bare unknown-method error. FEA methods have no Python
+    // fallback, so translate the dispatcher detail into the build option that
+    // restores the capability.
     if (cppResult.is_object()) {
       const std::string cppErr = cppResult.value("error", std::string());
       if (cppErr.rfind("unknown method", 0) == 0) {
         err = "This engine build has no FEA mesher, so '" + method +
-              "' is unavailable. Rebuild the core with -DCHUDWARE_WITH_NETGEN=ON "
-              "(Netgen auto-provisions into third_party/netgen).";
+              "' is unavailable. Rebuild the core with "
+              "-DCHUDWARE_WITH_POLYMESH=ON.";
         if (errorSink_)
           errorSink_(method, err);
         return false;

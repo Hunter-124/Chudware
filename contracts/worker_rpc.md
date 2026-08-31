@@ -794,3 +794,23 @@ it never falls back to a named/ISO view:
 | `camera_clip_range_invalid` | clip range does not satisfy `0 < near < far` |
 | `camera_image_size_invalid` | a supplied image dimension is not an integer |
 | `camera_focus_conflict` | authoritative camera and legacy auto-fit focus are both present |
+
+## 18. Polyhedral-FEA mesher cutover (append-only, 2026-08-30)
+
+Polyhedral-FEA is the sole in-process FEA volume mesher. `sim_mesh` accepts:
+
+```text
+{step_path, fineness?, order?|mesh_order?, target_size_mm?, min_size_mm?,
+ max_size_mm?, learned_advisor?, advisor_max_dof?}
+```
+
+It returns the existing flat tet4/tet10 `points`/`tets` envelope and quality fields.
+`sim_run_static`, `sim_run_modal`, `sim_run_thermal`, and `sim_run_fatigue` use the same
+mesh controls when their study carries `step_path`.
+
+The former Netgen/structured-mesh controls are removed rather than aliased:
+`density`, `curvature`, `curv_elems_per_circle`, `optimize`, `mesher_backend`,
+`structured`, `mesh_type`, `auto_type`, `quad_surface`, `fallback_to_tet`,
+`thin_wall_layers`, and `algorithm3d`. A STEP-backed request containing one of these keys
+returns `ok:false` with a message naming the removed key; it is never silently ignored or
+mapped to the Polyhedral-FEA path.

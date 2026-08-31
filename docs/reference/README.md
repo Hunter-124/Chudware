@@ -56,8 +56,8 @@ referenced — lives here:
   SolidWorks 2015+ saved-display triangle strips import as explicitly labelled
   tessellation-fidelity bodies; assemblies preserve component instance paths and composed
   transforms. Imported bodies are baked into `.step+`, remain editable as native import
-  features, export normally, and feed the Netgen or Polyhedral-FEA mesher. Parasolid
-  `.x_t`/`.x_b` still needs SolidWorks/NX conversion because it has no saved-display lane.
+  features, export normally, and feed Polyhedral-FEA. Parasolid `.x_t`/`.x_b`
+  still needs SolidWorks/NX conversion because it has no saved-display lane.
 - **`work/backlog/T-BL02.md`** — the format-interop backlog task tracking what
   lands next (Parasolid payload extraction, CATIA V5, Inventor, Altium
   clean-room parsers, and the DWG/Revit ODA-membership decision). This directory

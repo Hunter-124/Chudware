@@ -18,7 +18,7 @@ core/
     doc/      document model, sessions, formats/import/export, validation, picks, drawings
     api/      libchudware.{h,cpp}: the C ABI surface every client binds to
   Simulation
-    sim/      FEA/CFD runs, mesher, polymesh backend, SPICE, fatigue/adaptive studies
+    sim/      FEA/CFD runs, Polyhedral-FEA bridge, SPICE, fatigue/adaptive studies
     twin/     digital-twin runtime (wide-math state propagation)
   Manufacturing & domain engines
     cam/      toolpaths, operations, posts, stock simulation
@@ -43,7 +43,7 @@ core/
     security/ integrity, runtime guard, containment, event queue
     manufacturing/ authorization arbiter, gates, leases, journal
     prof/     profiling: phase timers, tree, sampler
-    cmake/    Provision*.cmake auto-provisioners (OCCT, Netgen, OpenNURBS, lib3mf, …)
+    cmake/    Provision*.cmake auto-provisioners (OCCT, Polyhedral-FEA, OpenNURBS, lib3mf, …)
     data/     bundled data (materials)
     third_party/ vendored sources (rhino3dm-src)
     docs/     design docs (wave2_occt_plan.md, kicad_reference.md)

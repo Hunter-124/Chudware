@@ -164,3 +164,10 @@ row in the same change" rule.
 | package | license | role | posture |
 |---|---|---|---|
 | **playwright** | **Apache-2.0** | `services/browser/session.py` — drives a persistent-profile Chromium context so a user can sign into a parts/document source site once and have the copilot reuse that session for headless fetches | ok — in-process, permissive. OSS-first pick over Selenium (weaker native async/persistent-context support) and Puppeteer (Node-only, would require a second runtime). The Chromium **binary** itself (`playwright install chromium`) is a separate one-time download into Playwright's own cache dir, not vendored in this repo and not part of `requirements.txt`. See `services/browser/README.md`. This is the mechanism, not the policy — per-source TOS/licensing posture for what gets fetched through it is tracked separately in `contracts/license_debt.md`, not here. |
+
+## FEA mesher cutover (2026-08-30)
+
+| package | license | role | posture |
+|---|---|---|---|
+| **Polyhedral-FEA** (`Hunter-124/Polyhedral-FEA`, pinned commit `955457901e5fe9ba7d46c4cafee710000df9f4bd`) | **BSD-3-Clause** | sole in-process STEP/BREP volume mesher, quadratic boundary projection, adaptive ZZ recovery, optional learned mesh advice | ok — statically linked from pinned source, shares Chudware's Eigen/OpenCASCADE targets, permissive attribution posture |
+| ~~Netgen / nglib~~ | ~~LGPL-2.1~~ | ~~legacy FEA tet mesher~~ | **REMOVED** — no source provisioner, link dependency, runtime DLL staging, backend selector, or production callsite remains |

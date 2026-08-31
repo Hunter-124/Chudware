@@ -69,9 +69,9 @@ std::vector<int> nodes_in_faceset_surface(const std::vector<double>& points,
                                           const FacesetSurface& surface, double perp_tol_mm);
 
 // Combined static run. `study` carries:
-//   step_path (string)  -> mesh via mesher::mesh_step(step_path, density)
-//   OR  points[n*3] + tets[m*4] inline (the deterministic parity-gate path)
-//   density (float, default 0.5)
+//   step_path (string) -> Polyhedral-FEA mesh
+//   OR points[n*3] + tets[m*K] inline
+//   fineness (0..1), mesh_order (1=tet4, 2=tet10)
 //   material: {E_mpa, nu, yield_mpa, density_g_cm3}
 //   fixtures: [{points:[[x,y,z]...], tol_mm}]
 //   loads:    [{faces:{points,tol_mm}, type:"force"|"pressure",

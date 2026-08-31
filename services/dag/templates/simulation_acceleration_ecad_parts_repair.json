@@ -103,26 +103,6 @@
       "autonomy": "auto"
     },
     {
-      "id": "n_sim_component_mesh_cache",
-      "type": "structural",
-      "name": "Cache unchanged component meshes",
-      "inputs": {
-        "request": "Extend the existing content-addressed mesh cache into a governor-bounded component/solid mesh cache so small assembly geometry changes remesh only changed solids. Use full geometry content plus every MeshOptions field in the key; never key by path or bounding box. Preserve Netgen serialization and current assembly bond behavior.",
-        "write_set": ["core/sim/mesher.cpp", "core/sim/mesher.h", "core/tests/test_sim.cpp"],
-        "acceptance": [
-          "A repeat unchanged assembly solve performs zero Netgen generation work.",
-          "Changing one solid produces one component cache miss while unchanged solids hit.",
-          "Mesh quality, connectivity, node ordering, and tet4 parity do not regress.",
-          "Cache residency obeys a byte budget derived from the resource governor."
-        ]
-      },
-      "tools": null,
-      "end_condition": "Assembly mesh reuse is content-safe, memory-bounded, observable, and covered by focused tests.",
-      "verify": null,
-      "on_fail": "pause",
-      "autonomy": "auto"
-    },
-    {
       "id": "n_sim_factor_cache",
       "type": "structural",
       "name": "Reuse prepared static systems",
@@ -454,7 +434,6 @@
     {"from": "n_repro_ecad", "to": "n_gate_baseline"},
     {"from": "n_repro_parts", "to": "n_gate_baseline"},
 
-    {"from": "n_gate_baseline", "to": "n_sim_component_mesh_cache"},
     {"from": "n_gate_baseline", "to": "n_sim_factor_cache"},
     {"from": "n_gate_baseline", "to": "n_sim_faceset_index"},
     {"from": "n_gate_baseline", "to": "n_sim_cuda_lbm"},
@@ -467,7 +446,6 @@
     {"from": "n_gate_baseline", "to": "n_parts_local_federation"},
     {"from": "n_gate_baseline", "to": "n_parts_place_health"},
 
-    {"from": "n_sim_component_mesh_cache", "to": "n_verify_sim"},
     {"from": "n_sim_factor_cache", "to": "n_verify_sim"},
     {"from": "n_sim_faceset_index", "to": "n_verify_sim"},
     {"from": "n_sim_cuda_lbm", "to": "n_verify_sim"},

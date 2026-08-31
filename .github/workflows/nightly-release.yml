@@ -1521,8 +1521,8 @@ jobs:
     needs: plan
     if: needs.plan.outputs.skip != 'true'
     runs-on: [self-hosted, macOS, "${{ matrix.runner_arch }}", cloudcastle-ci, "${{ matrix.runner_label }}"]
-    # Longer than the other two legs: the macOS core carries OCCT plus a
-    # source-built Netgen, and the two Nuitka sidecars are compiled per arch.
+    # Longer than the other two legs: the macOS core carries OCCT/Polyhedral-FEA,
+    # and the two Nuitka sidecars are compiled per architecture.
     timeout-minutes: 420
     strategy:
       # macbook-air-m2 (cc-mac-arm) is a laptop and is regularly asleep. GitHub

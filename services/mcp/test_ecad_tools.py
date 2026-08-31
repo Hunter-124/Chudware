@@ -1755,7 +1755,7 @@ def test_fin16_live_solve() -> None:
     doc_id = _fin16_demo_board(tools, name="fin16_live")
     r = _call(tools, "ecad_thermal_handoff", doc_id=doc_id, mesh_fineness=0.25)
     if not r.get("ok") or not r.get("solved"):
-        # A Netgen-less build degrades to an envelope-only result — honest skip.
+        # An FEA-disabled build degrades to an envelope-only result.
         why = r.get("error_solve") or r.get("error")
         assert "unavailable" in str(why) or r.get("simhandoff"), r
         print(f"  FIN16: solver leg unavailable ({str(why)[:80]}) — live solve SKIPPED")
@@ -1970,7 +1970,7 @@ def test_fin17_heatsink_select() -> None:
               dry_run=not live)
     assert h["ok"], h.get("error")
     if live and not h.get("solved"):
-        live = False   # Netgen-less build: envelope-only result, network mode below
+        live = False   # FEA-disabled build: envelope-only result
 
     r = _call(tools, "heatsink_select", component_ref="U1", tj_target_c=85.0)
     _assert_context(r, "heatsink_select")

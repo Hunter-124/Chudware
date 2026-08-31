@@ -55,15 +55,12 @@ cmake --build --preset windows-occt
 ctest --test-dir build/windows-occt --output-on-failure
 ```
 
-The **first** configure downloads OCCT 7.9.3 (~250 MB) and builds Netgen once (cached under
-`third_party/`, a few minutes). Verified on Win11 + MSVC 14.44: **clean build, 48/49 ctest**
-(only `freecad_parity` fails — the same MSVC-vs-GCC solver-convergence diff as the OCCT-free build).
+The first configure downloads OCCT 7.9.3 and the pinned BSD-3-Clause
+Polyhedral-FEA source under `third_party/`.
 
-Windows-specific fixes this required:
-- `core/CMakeLists.txt` defines `NOMINMAX` for MSVC — `<windows.h>` (pulled in by OCCT headers)
-  otherwise defines `min`/`max` macros that clobber `std::min`/`std::max`.
-- `ProvisionNetgen.cmake` picks the install target by generator (Ninja uses `install`, not the
-  Visual Studio `INSTALL`).
+Windows-specific fixes this requires:
+- `core/CMakeLists.txt` defines `NOMINMAX` for MSVC because OCCT pulls in
+  `<windows.h>`, whose macros otherwise clobber `std::min`/`std::max`.
 
 ## 3. Python runtime + tests
 
@@ -106,9 +103,9 @@ runner. Full release packaging still uses the `windows-occt` preset.
   inner quotes (`/FI${path}`) so Ninja quotes the whole `/FI<path>` token, which `cl` unwraps.
 - **Engine resolution.** `CHUDWARE_DEFAULT_LIBCHUDWARE` is the runtime fallback when
   `CHUDWARE_LIBCHUDWARE` is unset and no `libchudware.dll` sits next to the exe; it must point at the
-  Ninja preset output `build/windows-occt/bin/libchudware.dll`. `cpp_core`'s `SetDllDirectoryW` then
-  puts that directory on the process search path so the ~100 sibling OCCT/Netgen `TK*.dll`
-  **transitive** deps also load — no manual DLL staging needed. To use a different build, set
+  Ninja preset output `build/windows-occt/bin/libchudware.dll`. `cpp_core` adds that
+  directory to the DLL search path so OCCT and the optional advisor runtime load without
+  manual staging. To use a different build, set
   `CHUDWARE_LIBCHUDWARE=<absolute path to libchudware.dll>`.
 - **Worker fallback.** `AppState::tryStartWorker()` tries the managed worker
   first on every desktop platform. If that is unavailable, Windows now follows

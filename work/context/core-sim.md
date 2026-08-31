@@ -9,7 +9,7 @@ Contracts: contracts/mesh_format.md (AICM carries FEA results + CFD streamlines)
 - core/sim/fea_fatigue.cpp — fatigue analysis
 - core/sim/lbm.cpp — Lattice-Boltzmann CFD flow (the only C++ CFD path)
 - core/sim/flow_run.cpp — CFD run driver
-- core/sim/mesher.cpp, core/sim/hex_mesher.cpp — FEA/CFD meshing (tet/hex)
+- core/sim/mesher.cpp, mesh_size_band.cpp, mesh_quality.cpp — Polyhedral-FEA tet meshing
 - core/sim/spice.cpp — SPICE engine (35/35 device parity, epic complete)
 - core/sim/netlist.cpp — netlist / symbolic circuit sim (SymbolSim ~L904; 10/10 netlist parity)
 - core/sim/overlay.cpp — result overlay, feeds AICM mesh chunks for viewport display
@@ -28,7 +28,7 @@ run_cfd_flow / run_cfd_accurate / ecad_simulate. CFD-accurate (OpenFOAM) is stil
 ## Debugging playbook
 - Build core: `cmake -S core -B core/build-occt -DCHUDWARE_WITH_OCCT=ON && cmake --build core/build-occt`
 - Sim tests: `ctest --test-dir core/build-occt -R "sim|modal|tet10|spice_netlist|fatigue|studies" --output-on-failure`
-- Other targets: `netgen_mesh`, `mesher_autopick`, `mesh_quality`, `overlay_surface` (fatigue/studies are OCCT-gated)
+- Other targets: `mesh`, `mesh_quality`, `mesher_advanced`, `overlay_surface`
 - Python side (needs runtime venv): `<venv>/python -X utf8 -m pytest services/sim -q` (SKIP if venv absent — AGENTS.md)
 - Gotcha: docs/REFACTOR_LOG.md has NO sim entries yet — sim work is not logged there; check core/tests/ directly
 - Gotcha: differential-oracle rule (README): never weaken an assertion; match Python unless Python is provably buggy

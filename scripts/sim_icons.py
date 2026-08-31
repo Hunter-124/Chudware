@@ -17,9 +17,7 @@ Icon families (contracts/icons.md, Simulation tab + extended + mesh types):
         -> modal solve; surface deformed by the 1st mode shape (no colormap deform ->
            mode-amplitude colored) so the tile reads "resonant deflection".
   mesh, mesh_tet, mesh_auto
-        -> the solved surface tessellation drawn as WIREFRAME triangles over a faint fill,
-           i.e. a real FE mesh. (Netgen is tet-only; mesh_hex has no producible hex mesh
-           headless and is left to its line-art placeholder -- documented below.)
+        -> the solved surface tessellation drawn as WIREFRAME triangles over a faint fill.
   fixture, load_force, load_pressure
         -> SETUP glyphs (no solve): a real beam with the resolved clamp face hatched
            (fixture) or the resolved load face carrying force arrows (load_force) / inward
@@ -597,12 +595,10 @@ MESH_TILES = ["mesh", "mesh_tet", "mesh_auto"]
 MODAL_TILES = ["study_modal"]
 SETUP_TILES = ["fixture", "load_force", "load_pressure"]
 FLOW_TILES = ["study_flow", "flow_arrow"]
-# Icons that intentionally keep their line-art placeholder on this build (see report):
-#   mesh_hex   : Netgen is tet-only; no hex mesh is producible headless.
-#   study_modal: the modal OVERLAY ships zeroed mode-shape amplitude/DISP; the real
-#                mode_shapes are on the unindexed volume mesh (no honest surface map here).
-#   study_flow / flow_arrow: sim_run_flow needs a fluid domain around the part (an external
-#                flow volume), which this beam-only setup doesn't provide headless.
+# Icons that intentionally keep their line-art placeholder on this build:
+#   mesh_hex: the production solve contract is tetrahedral.
+#   study_modal: mode_shapes are on the unindexed volume mesh.
+#   study_flow / flow_arrow: this beam-only setup has no external fluid domain.
 NOT_PRODUCED = ["mesh_hex", "study_modal", "study_flow", "flow_arrow"]
 
 
@@ -614,7 +610,7 @@ def render_all() -> list[str]:
 
     if not os.environ.get("CHUDWARE_LIBCHUDWARE"):
         print("[sim_icons] FAILED: no FEA-capable libchudware.so "
-              "(need core/build-occt-linux/bin/libchudware.so with CHUDWARE_WITH_NETGEN)")
+              "(need a CHUDWARE_WITH_POLYMESH build)")
         return []
 
     # --- static-backed families (proven on this box) ---
@@ -695,7 +691,7 @@ def render_all() -> list[str]:
             print(f"    - {f}")
     if NOT_PRODUCED:
         print(f"[sim_icons] intentionally line-art only: {', '.join(NOT_PRODUCED)} "
-              "(Netgen is tet-only; no hex mesh headless)")
+              "(the production solve contract is tetrahedral)")
     return produced
 
 

@@ -1456,53 +1456,6 @@ def postcheck(
         and (mesh_stable or anchor_consistent)
     )
 
-    # Postcheck is the existing post-failure advisory seam. The other backend is offered as
-    # a SECOND ATTEMPT WITH DIFFERENT FAILURE MODES, not as a robustness upgrade: a
-    # measured comparison over five awkward solids found no case where polymesh meshed a
-    # part Netgen refused, and one where polymesh's own watertightness guard rejected a
-    # part Netgen meshed. Promising robustness here would spend a tool call on a promise
-    # the data does not support, so the finding says exactly what is known.
-    requested_mesher = str(
-        study.get("mesher_backend") or results.get("mesher_backend") or "netgen"
-    ).strip().lower()
-    failure_stage = str(
-        study.get("failure_stage") or results.get("failure_stage")
-        or study.get("stage") or results.get("stage") or ""
-    ).strip().lower()
-    mesh_failed = (
-        not solver_completed
-        and requested_mesher == "netgen"
-        and failure_stage in ("mesh", "meshing")
-    )
-    if mesh_failed:
-        items.append({
-            "schema": "aicad.advisory/1",
-            "check": "sim_mesh",
-            "severity": "action",
-            "finding": (
-                "Netgen failed during the mesh stage. The geometry is the first suspect: "
-                "check for non-manifold contact, zero-thickness walls or a body that is "
-                'not a closed solid. One retry with mesher_backend="polymesh" is '
-                "reasonable because its Cartesian fill fails on a different set of "
-                "topology, but it is not a robustness upgrade and it is not more likely "
-                "than not to succeed here."
-            ),
-            "refs": {},
-            "numbers": {},
-            "candidate_fixes": [{
-                "action": "retry_with_polymesh",
-                "params": {"mesher_backend": "polymesh"},
-                "basis": "The Netgen mesh stage failed before a solved result existed.",
-                "predicted_effect": (
-                    "A second meshing attempt with different failure modes; it may fail too."
-                ),
-                "confidence": "heuristic",
-            }],
-            "helper_tools": ["run_fea_static", "run_fea_modal", "run_fea_fatigue",
-                             "run_fea_thermal"],
-            "source": {"kind": "heuristic",
-                       "detail": "sim_advisor.postcheck mesh-stage failure"},
-        })
 
     # --- Unit-correct static margin verdict ---
     if vm is not None and yield_mpa is not None:

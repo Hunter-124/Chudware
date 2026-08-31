@@ -33,9 +33,8 @@ namespace chudware::sim {
 //           global_eta, eta_target, eta_target_met, passes_run, stop_reason}
 // so the convergence history is inspectable, not just the final number.
 //
-// Adaptive runs require the polymesh backend (the Netgen route exposes no size field); the
-// study's mesher_backend is forced to polymesh and that is stated in the result notes.
-// Never throws: any failure returns {ok:false, error}.
+// Polyhedral-FEA supplies the size field and recovery machinery. Never throws:
+// any failure returns {ok:false, error}.
 nlohmann::json fea_run_adaptive(const nlohmann::json& study);
 
 }  // namespace chudware::sim

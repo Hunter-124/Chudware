@@ -10,11 +10,8 @@ in-app agent drives it through the host; here we drive it from Python so an MCP 
 Loading mirrors the proven probe loaders (``tools/vocab_battery.py``,
 ``tools/mesh_quality_verify.py``) and the host's own resolver (``cpp_core.cpp``): locate
 the library (``$CHUDWARE_LIBCHUDWARE`` explicit path → ``$CHUDWARE_DIST`` dir → the platform's
-known build/stage dirs), put its directory on the native dep search path (so the
-transitive OCCT / Netgen / lib3mf deps resolve — on Linux the .so's ``$ORIGIN`` RUNPATH
-already handles its siblings), point ``CHUDWARE_PROMPTS_DIR`` at the prompts (so
-plain-English geometry queries + cheatsheets behave exactly like the engine), then
-``CDLL`` the library and bind the two C-ABI entry points.
+known build/stage dirs), put its directory on the native dependency search path, point
+``CHUDWARE_PROMPTS_DIR`` at the prompts, then ``CDLL`` the library and bind the C ABI.
 
 Public surface:
     call(method, params) -> dict     one RPC; raises CoreError on a hard failure
@@ -134,22 +131,14 @@ def _lib_candidates() -> list[Path]:
     out.append(dist_dir() / name)  # honours $CHUDWARE_DIST; Windows stage default
     root = _repo_root()
     if sys.platform == "win32":
-        # Full engine first (OCCT + Netgen) — same precedence as Linux build-occt-linux.
-        # Ninja preset: build/windows-occt/bin; VS multi-config: core/build-occt/bin/Release.
+        # Full OCCT/FEA engine first, then the self-contained OCCT-off beachhead.
         out.append(root / "build" / "windows-occt" / "bin" / name)
         out.append(root / "core" / "build-occt" / "bin" / "Release" / name)
         out.append(root / "host" / "build-win" / "bin" / name)
-        # Slim beachhead last (no OCCT/Netgen) — only if nothing better exists.
         out.append(root / "build" / "windows-core" / "bin" / name)
     else:
-        # No dist stage off-Windows: the .so is produced in a build dir (and copied next
-        # to the host exe). Its $ORIGIN RUNPATH resolves the sibling Netgen/lib3mf deps.
-        # build-occt-linux is the FULL engine (OCCT + Netgen) the desktop app loads — it
-        # carries the FEA/CFD sim RPCs (sim_run_static etc., gated behind #ifdef
-        # CHUDWARE_WITH_NETGEN in libchudware.cpp). It MUST come before the slim "build-linux"
-        # beachhead, which is OCCT/Netgen-free and silently lacks every sim + geometry RPC
-        # the MCP exposes (loading it makes run_fea_static report "solver unavailable" even
-        # though the UI works). See _warn_if_sim_missing below.
+        # Prefer the full OCCT/Polyhedral-FEA engine. The host copy is last because the
+        # canonical core build trees carry the authoritative engine artifact.
         out.append(root / "core" / "build-occt-linux" / "bin" / name)
         # core/build-linux is the standard cmake --build target used by gate.sh and CI.
         # Added here to fix the "all-skip" incident where CHUDWARE_LIBCHUDWARE was required
@@ -217,8 +206,8 @@ def _load() -> ctypes.CDLL:
             pass  # the guard must never block a legacy load
         lib_path = _resolve_lib()
         lib_dir = lib_path.parent
-        # The library's transitive deps (OCCT, Netgen, lib3mf, ...) live alongside it; put
-        # the dir on the native search path before loading.
+        # Optional native dependencies live alongside the library; put that directory on
+        # the platform loader path before loading.
         if sys.platform == "win32":
             # add_dll_directory is the Windows-correct way (PATH is not consulted for deps
             # of a DLL loaded by absolute path on modern Windows).
@@ -249,12 +238,7 @@ def _load() -> ctypes.CDLL:
 
 
 def _warn_if_sim_missing(dll: ctypes.CDLL, lib_path: Path) -> None:
-    """The MCP exposes OCCT/Netgen-dependent tools (run_fea_static/modal, CAD geometry).
-    A slim OCCT-free ``build-linux`` .so links + loads fine but silently lacks every sim
-    RPC, so the FEA tools report "solver unavailable" while the desktop app (which loads
-    the full ``build-occt-linux`` engine) works. Probe the FFI dispatcher once at load and
-    warn LOUDLY rather than let that misconfiguration masquerade as a solver bug.
-    """
+    """Warn when an OCCT/Polyhedral-FEA-disabled engine was selected."""
     try:
         out = ctypes.c_char_p()
         rc = dll.chudware_call(b"sim_run_static", b"{}", ctypes.byref(out))
@@ -266,10 +250,9 @@ def _warn_if_sim_missing(dll: ctypes.CDLL, lib_path: Path) -> None:
         if rc != 0 and "unknown method" in raw:
             sys.stderr.write(
                 "[core_bridge] WARNING: loaded a sim-less libchudware "
-                f"({lib_path}) — FEA/CFD RPCs (sim_run_static) are NOT compiled in. "
-                "This is the slim OCCT/Netgen-free build; the MCP will report the FEA "
-                "solver as unavailable. Stage the full build-occt-linux engine into "
-                "dist/Chudware (or set CHUDWARE_LIBCHUDWARE to it) and restart the server.\n"
+                f"({lib_path}) — FEA RPCs are not compiled in. Rebuild with "
+                "CHUDWARE_WITH_OCCT=ON and CHUDWARE_WITH_POLYMESH=ON, then restart "
+                "the server.\n"
             )
             sys.stderr.flush()
     except Exception:

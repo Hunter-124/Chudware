@@ -518,14 +518,8 @@ stage_pytest() {
         return 0
     fi
 
-    # --- wire the engine .so if not already set ---
-    # PREFER the full build-occt-linux engine over the slim build-linux one: on Linux
-    # CHUDWARE_WITH_NETGEN defaults OFF (core/CMakeLists.txt), so the gate's own core-build
-    # stage (which passes only -DCHUDWARE_WITH_OCCT=ON) produces a *sim-less* build-linux .so
-    # whose FEA/CFD dispatch (sim_run_static/sim_run_modal) is compiled out — the FEA tests
-    # then fail with "unknown method: sim_run_static". The 26 MB build-occt-linux engine is
-    # the one that actually ships (dist/Chudware) and the only one with the Netgen mesher, so
-    # test against THAT when present. Mirrors the chudware-hostd candidate order above.
+    # Prefer the full OCCT/Polyhedral-FEA build, then the standard build tree. Tests probe
+    # the selected dispatcher and skip honestly only when the mesher was deliberately disabled.
     local so_path=""
     for cand in "$REPO/core/build-occt-linux/bin/libchudware.so" "$REPO/core/build-linux/bin/libchudware.so"; do
         [ -f "$cand" ] && { so_path="$cand"; break; }

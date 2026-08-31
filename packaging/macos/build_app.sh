@@ -240,13 +240,8 @@ audit_production_payload() {
 
 # Learned mesh-advisor runtime (the polymesh ONNX advisor).
 #
-# core/sim/polymesh_backend.cpp resolves the model package relative to ITS OWN module —
-# libchudware.dylib — so the package rides in Contents/Frameworks beside the engine rather
-# than in Resources behind CHUDWARE_POLYMESH_ADVISOR_DIR: that override deliberately
-# reports its model revision as "override:<path>", which would turn a shipped release into
-# one that cannot name the model it recommended from. Only the four artifacts the advisor
-# opens are carried; the rest of bench/advisor is campaign evidence (cross-validation dumps
-# and a dashboard, tens of MB) with no runtime role.
+# core/sim/mesher.cpp resolves the package relative to libchudware.dylib, so it belongs in
+# Contents/Frameworks beside the engine. Only the four runtime artifacts are carried.
 #
 # The engine's own load commands decide whether anything ships. polymesh pins no prebuilt
 # ONNX Runtime archive for macOS today, so an engine built here links none and needs no

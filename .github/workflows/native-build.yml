@@ -57,8 +57,7 @@ jobs:
             runner_arch: X64
             runner_label: cc-win-package
             # windows-core, not windows-occt: OCCT off is the self-contained
-            # fast build. The OCCT-on Windows tree downloads ~250 MB and builds
-            # Netgen, which belongs in packaging, not in a per-push compile gate.
+            # fast per-push compile gate; the full geometry/FEA package builds separately.
             preset: windows-core
             build_host: true
             host_build_dir: host/build-windows
@@ -257,33 +256,6 @@ jobs:
           # `git describe --tags`; a shallow clone without tags yields 0.0.0.
           fetch-depth: 0
 
-      # third_party/ is gitignored, and actions/checkout's default clean runs
-      # `git clean -ffdx`, which deletes it on every run. Netgen is provisioned
-      # by building it from source (core/cmake/ProvisionNetgen.cmake), so
-      # leaving it in the workspace would mean recompiling a third-party mesher
-      # on every push to master, on every platform. NETGEN_ROOT is a CACHE PATH
-      # precisely so it can live somewhere the clean cannot reach; a
-      # runner-local directory costs $0, unlike actions/cache round-trips.
-      # The first run on a fresh endpoint still pays the full Netgen build.
-      - name: Resolve the persistent provisioning cache (POSIX)
-        if: runner.os != 'Windows'
-        shell: bash
-        run: |
-          set -euo pipefail
-          root="$HOME/.cache/chudware-ci/netgen/${{ matrix.preset }}"
-          mkdir -p "${root}"
-          echo "NETGEN_ROOT=${root}" >> "$GITHUB_ENV"
-          echo "netgen-root=${root}"
-
-      - name: Resolve the persistent provisioning cache (Windows)
-        if: runner.os == 'Windows'
-        shell: powershell
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $root = Join-Path $env:USERPROFILE '.cache\chudware-ci\netgen\${{ matrix.preset }}'
-          New-Item -ItemType Directory -Force -Path $root | Out-Null
-          "NETGEN_ROOT=$root" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-          Write-Host "netgen-root=$root"
 
       # `shell:` must name a literal interpreter — actionlint rejects an
       # expression there, and on these Windows hosts `bash` resolves to an
@@ -296,7 +268,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          cmake --preset ${{ matrix.preset }} -DNETGEN_ROOT="${{ env.NETGEN_ROOT }}"
+          cmake --preset ${{ matrix.preset }}
           cmake --build --preset ${{ matrix.preset }}
 
       - name: Configure and build core (${{ matrix.preset }}) (Windows)
@@ -309,7 +281,7 @@ jobs:
           # $ErrorActionPreference does not apply to native exit codes, so each
           # cmake invocation is checked; otherwise a failed configure would run
           # the build and report the build's status.
-          cmake --preset ${{ matrix.preset }} "-DNETGEN_ROOT=$env:NETGEN_ROOT"
+          cmake --preset ${{ matrix.preset }}
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cmake --build --preset ${{ matrix.preset }}
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

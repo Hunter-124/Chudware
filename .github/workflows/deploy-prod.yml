@@ -244,8 +244,7 @@ jobs:
           #   linux-gate   the only workflow that concludes at all, and it is
           #                red on a standing backlog (~50 failures) that has
           #                nothing to do with shipping a web bundle: agent
-          #                tool-guidance curation, MCP suites, and env-optional
-          #                dependencies (Netgen, torch, DVC) absent from CI.
+          #                tool-guidance curation, MCP suites, torch, and DVC.
           #
           # Blocking on a workflow that cannot conclude does not make anything
           # safer, it just stops production tracking master -- silently, behind

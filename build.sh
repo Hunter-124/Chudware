@@ -25,9 +25,8 @@
 #    ./build.sh wasm       Emscripten WASM host (full app); stages to
 #                          ~/chudware-web/app/. Requires emsdk (~/.emsdk).
 #                          Linux-only (GNU sed / sha1sum).
-#    ./build.sh stage      Deploy the built engine (libchudware.$SHLIB_EXT + Netgen/lib3mf
-#                          sibling shared libs + the mesh-advisor ONNX Runtime and model
-#                          package when the engine links them) AND the chudware-hostd
+#    ./build.sh stage      Deploy libchudware, its optional lib3mf/advisor runtime,
+#                          and chudware-hostd
 #                          daemon from core/build-occt-$PLATFORM_SUFFIX/bin into
 #                          services/dist/Chudware/ — the dist dir core_bridge/daemon_bridge
 #                          resolve first. This replaces the old doc'd manual cp+mv;
@@ -137,15 +136,9 @@ chudware_read_version() {
     return 0
 }
 
-# `--preset $CORE_PRESET` writes to build/$CORE_PRESET/ (CMakePresets.json binaryDir), which is NOT
-# where anything READS the engine from: scripts/gate.sh prefers core/build-occt-linux/bin then
-# core/build-linux/bin, and the GUI dlopens host/build-$PLATFORM_SUFFIX/bin. Those trees are also
-# configured differently — the preset build is ~0.8 MB smaller because CHUDWARE_WITH_NETGEN is off,
-# so copying it over a full engine would silently DELETE the FEA/CFD mesher (gate.sh:450-456
-# documents that exact trap). So we do not stage it; we REPORT, because the silent version of this
-# cost a full day of measurements on 2026-07-29: `./build.sh core` printed DONE while every
-# consumer kept loading a two-day-old engine, and six live agent sweeps were scored against stale
-# code before anyone noticed.
+# `--preset $CORE_PRESET` writes to build/$CORE_PRESET/, which is not where consumers
+# load the engine. Rebuild the consumed trees directly and report any stale binary rather
+# than printing success for an artifact nothing uses.
 # Uses `find -newer -print -quit` per consumer rather than sorting every source: piping find into
 # `xargs ls -t | head -1` makes xargs die of SIGPIPE, and under this script's `set -o pipefail`
 # that aborted the whole build with exit 125 (caught 2026-07-29 — `./build.sh all` silently stopped
@@ -226,14 +219,8 @@ report_engine_staleness() {
     fi
     return 0
 }
-# `./build.sh core` must mean "the engine everything READS is now current". It used to mean
-# "configure and build build/linux-core", a tree no consumer opens — so it printed DONE (core) and
-# changed nothing observable. Repointing the preset's binaryDir at a consumed tree is NOT the fix:
-# the preset configures CHUDWARE_WITH_NETGEN=OFF, so reconfiguring core/build-linux with it would
-# silently DELETE the FEA/CFD mesher from a full engine (the ~0.8 MB difference gate.sh:450-456
-# documents). Instead we rebuild each consumed tree IN PLACE with its own cache, which preserves
-# whatever options that tree was configured with, and then gate on the staleness check so a future
-# rename cannot quietly reintroduce the split.
+# `./build.sh core` means every consumed native engine is current. Rebuild each configured
+# consumed tree in place so its platform-specific dependency paths remain intact.
 build_core() {
     local rc=0 built=0 tree tlist
     for tree in "$CORE_OCCT_BUILD" "$CORE_SLIM_BUILD"; do
@@ -386,12 +373,8 @@ build_wasm() {
 }
 
 
-# Full-engine OCCT tree (the engine + chudware-hostd) — the binaries the LIVE
-# daemon actually serves. Not covered by `core` (slim preset tree) or
-# `app`: engine-behavior changes MUST rebuild this (then restart/drain hostd)
-# or the running daemon keeps executing old code — mega-8 F7/F8 root cause.
-# The tree is configured once by hand (OCCT/Netgen cache); this only runs the
-# incremental build.
+# Full-engine OCCT tree (the engine + chudware-hostd) served by the live daemon.
+# The tree is configured once; this function performs the incremental build.
 build_daemon() {
     if [ ! -f "$CORE_OCCT_BUILD/CMakeCache.txt" ]; then
         echo "[build] ERROR: ${CORE_OCCT_BUILD#"$ROOT"/} is not configured (OCCT tree; see docs/HOSTD.md)"
@@ -404,14 +387,9 @@ build_daemon() {
 # Advisor closure of an already-located engine: the ONNX Runtime that engine links plus the
 # exact four artifacts pm::advisor::Advisor opens.
 #
-# core/sim/polymesh_backend.cpp resolves the model package relative to the ENGINE's OWN
-# module directory, so every directory this script copies the engine into needs the package
-# too. Copying the engine alone is the silent failure this exists to prevent: the advisor
-# finds no package, reports itself unavailable, and every study quietly falls back to the
-# heuristic mesher choice while the engine beside it looks perfectly current.
-#
-# Only those four files are copied. The rest of the model's bench/advisor directory is
-# campaign evidence — the cross-validation dumps alone are ~90 MB — with no runtime role.
+# core/sim/mesher.cpp resolves the package relative to the engine module. Copying the
+# engine without its package would leave advice unavailable while the binary appears current.
+# Only the four runtime files are copied; the research campaign corpus stays out of packages.
 #
 # An engine configured without the advisor links no ONNX Runtime, so this is a no-op for it
 # and slim builds keep staging exactly as before. An engine that DOES link it but has no
@@ -585,7 +563,7 @@ stage_dist() {
         src="$CORE_OCCT_BUILD/bin"
     elif [ -f "$CORE_SLIM_BUILD/bin/$LIBCHUDWARE" ]; then
         src="$CORE_SLIM_BUILD/bin"
-        echo "[stage] WARNING: staging the SLIM ${CORE_SLIM_BUILD#"$ROOT"/} engine (no OCCT/Netgen —"
+        echo "[stage] WARNING: staging the SLIM ${CORE_SLIM_BUILD#"$ROOT"/} engine (no OCCT —"
         echo "[stage]          FEA/CFD RPCs unavailable). Build ${CORE_OCCT_BUILD#"$ROOT"/} for the full engine."
     else
         echo "[stage] ERROR: no built $LIBCHUDWARE (run ./build.sh core first)"
@@ -615,8 +593,8 @@ stage_dist() {
     # is copied. Staging without one of them used to print a WARNING and return 0 —
     # the worst outcome available: dist/ ends up half-updated (a fresh engine next
     # to a four-day-old daemon) and the caller, a release script or a CI job, reads
-    # success. Missing either is now a hard failure with nothing written. The
-    # Netgen/lib3mf siblings stay optional: a slim engine legitimately has none.
+    # success. Missing either is a hard failure with nothing written. Optional lib3mf
+    # remains best-effort because a slim engine legitimately has none.
     local staged=0 f tmp
     for f in "$LIBCHUDWARE" chudware-hostd; do
         if [ ! -e "$src/$f" ]; then
@@ -626,8 +604,7 @@ stage_dist() {
             return 1
         fi
     done
-    for f in "$LIBCHUDWARE" "libngcore.$SHLIB_EXT" "libnglib.$SHLIB_EXT" \
-             "lib3mf.$SHLIB_EXT" chudware-hostd; do
+    for f in "$LIBCHUDWARE" "lib3mf.$SHLIB_EXT" chudware-hostd; do
         [ -e "$src/$f" ] || continue
         tmp="$dst/.$f.staging.$$"
         cp "$src/$f" "$tmp"

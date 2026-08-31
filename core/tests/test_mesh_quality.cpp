@@ -1,12 +1,6 @@
-// test_mesh_quality — proves the Netgen/nglib tet mesher (sim/mesher.cpp) produces an EVEN,
-// well-graded mesh on a curved body. The user report was "extremely rough / uneven mesh for
-// cylinders"; this pins the fix (lower grading, stronger curvature refinement, more optimizer
-// passes) with measurable thresholds so a regression that re-roughens a cylinder fails here.
-//
-// Same harness pattern as test_netgen_mesh / test_mesher_autopick: build a REAL OCCT solid
-// (BRepPrimAPI_MakeCylinder), write it to STEP, drive mesh_step, and assert on the quality
-// metrics MeshOut already reports (aspect_min/avg/max, jacobian_min, pct_poor) plus a derived
-// circumferential-resolution count taken from the node cloud.
+// Polyhedral-FEA quality regression on a curved STEP body. It pins positive
+// Jacobians, bounded shape metrics, and meaningful circumferential resolution
+// at product defaults.
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include <doctest/doctest.h>
 
@@ -67,76 +61,58 @@ int circumferential_sectors(const std::vector<double>& pts, double r, int n_sect
 }  // namespace
 
 // ── Headline: a cylinder meshes EVENLY at the product-default settings ─────────────────────
-TEST_CASE("cylinder meshes evenly with healthy curvature resolution") {
-    const std::string step = write_cylinder(R, H, "chudware_mq_cyl.step");
+TEST_CASE("cylinder meshes evenly with healthy boundary resolution") {
+  const std::string step = write_cylinder(R, H, "chudware_mq_cyl.step");
 
-    MeshOptions o;
-    o.fineness = 0.5;     // the product default
-    o.order = 1;
-    o.curvature = true;   // default curv_elems_per_circle (20) -> smooth, even wall
-    o.optimize = true;    // surface + volume optimizers on (the quality passes)
-    MeshOut m = mesh_step(step, o);
-    REQUIRE_MESSAGE(m.ok, m.error);
-    CHECK(m.nodes_per_elem == 4);
+  MeshOptions o;
+  o.fineness = 0.5;
+  o.order = 1;
+  MeshOut m = mesh_step(step, o);
+  REQUIRE_MESSAGE(m.ok, m.error);
+  CHECK(m.nodes_per_elem == 4);
 
-    // A non-trivial tet count — a "rough" few-element mesh would be orders smaller (a ~20x40
-    // cylinder at 1.4mm elements is tens of thousands of tets; 500 is a floor with huge margin).
-    CHECK(m.n_elems > 500);
-    CHECK(m.n_nodes > 0);
-    CHECK(m.tets.size() == static_cast<size_t>(m.n_elems) * 4);
+  // A non-trivial tet count — a "rough" few-element mesh would be orders
+  // smaller (a ~20x40 cylinder at 1.4mm elements is tens of thousands of tets;
+  // 500 is a floor with huge margin).
+  CHECK(m.n_elems > 500);
+  CHECK(m.n_nodes > 0);
+  CHECK(m.tets.size() == static_cast<size_t>(m.n_elems) * 4);
 
-    // No inverted / degenerate elements; real positive volumes everywhere.
-    CHECK(m.jacobian_min > 0.0);
-    CHECK(m.min_tet_volume_mm3 > 0.0);
+  // No inverted / degenerate elements; real positive volumes everywhere.
+  CHECK(m.jacobian_min > 0.0);
+  CHECK(m.min_tet_volume_mm3 > 0.0);
 
-    // EVENNESS — the metrics the grading / curvature / optimizer changes drive:
-    //  • aspect_avg near 1 => the BULK of elements are well-shaped (even);
-    //  • aspect_max bounded => no gross slivers survive the optimizer;
-    //  • pct_poor low => almost nothing above the SolidWorks-style poor threshold (aspect>10).
-    CHECK(std::isfinite(m.aspect_max));
-    CHECK(m.aspect_avg >= 1.0);
-    CHECK(m.aspect_avg < 4.0);
-    CHECK(m.aspect_max < 20.0);
-    CHECK(m.pct_poor < 5.0);
+  CHECK(std::isfinite(m.aspect_max));
+  CHECK(m.aspect_avg >= 1.0);
+  CHECK(m.aspect_avg < 4.0);
+  CHECK(m.aspect_max < 20.0);
+  CHECK(m.pct_poor < 5.0);
 
-    // Curvature resolution: the wall is sampled at many distinct angles (smooth), not a coarse
-    // polygon. r=10 at fineness 0.5 yields ~40 segments around; require >=24 of 36 sectors
-    // populated (~every 15deg) — comfortably past a faceted 8/12-gon, well within ~40 actual.
-    const int sectors = circumferential_sectors(m.points, R, 36);
-    MESSAGE("circumferential sectors filled (of 36) = " << sectors);
-    CHECK(sectors >= 24);
+  const int sectors = circumferential_sectors(m.points, R, 36);
+  MESSAGE("circumferential sectors filled (of 36) = " << sectors);
+  CHECK(sectors >= 24);
 }
 
-// ── Curvature refinement actually ENGAGES (the elementspercurve conversion is live) ─────────
-TEST_CASE("curvature refinement increases circumferential resolution") {
-    const std::string step = write_cylinder(R, H, "chudware_mq_cyl_curv.step");
+TEST_CASE("finer sizing increases curved-boundary resolution") {
+  const std::string step = write_cylinder(R, H, "chudware_mq_cyl_fine.step");
 
-    // At a COARSE base size the curvature control is the binding size constraint, so raising
-    // curv_elems_per_circle MUST put more elements around the wall. This proves the curvature
-    // path engages end-to-end (curv_elems_per_circle -> Netgen elementspercurve -> finer wall).
-    MeshOptions lo;
-    lo.fineness = 0.0;    // coarse base => curvature, not the base size, governs the wall
-    lo.order = 1;
-    lo.curvature = true;
-    lo.curv_elems_per_circle = 6.0;
+  MeshOptions coarse;
+  coarse.fineness = 0.0;
+  coarse.order = 1;
+  MeshOptions fine = coarse;
+  fine.fineness = 0.8;
 
-    MeshOptions hi = lo;
-    hi.curv_elems_per_circle = 30.0;
+  MeshOut coarse_mesh = mesh_step(step, coarse);
+  MeshOut fine_mesh = mesh_step(step, fine);
+  REQUIRE_MESSAGE(coarse_mesh.ok, coarse_mesh.error);
+  REQUIRE_MESSAGE(fine_mesh.ok, fine_mesh.error);
 
-    MeshOut m_lo = mesh_step(step, lo);
-    MeshOut m_hi = mesh_step(step, hi);
-    REQUIRE_MESSAGE(m_lo.ok, m_lo.error);
-    REQUIRE_MESSAGE(m_hi.ok, m_hi.error);
-
-    const int s_lo = circumferential_sectors(m_lo.points, R, 72);
-    const int s_hi = circumferential_sectors(m_hi.points, R, 72);
-    MESSAGE("coarse-curvature sectors = " << s_lo << ", fine-curvature sectors = " << s_hi);
-    CHECK(s_hi > s_lo);                 // finer curvature -> more positions around the wall
-    CHECK(m_hi.n_elems > m_lo.n_elems); // ...and more elements overall
-
-    // Both remain valid regardless of the curvature setting (no inverted tets).
-    CHECK(m_lo.jacobian_min > 0.0);
-    CHECK(m_hi.jacobian_min > 0.0);
+  const int coarse_sectors = circumferential_sectors(coarse_mesh.points, R, 72);
+  const int fine_sectors = circumferential_sectors(fine_mesh.points, R, 72);
+  CHECK(fine_sectors > coarse_sectors);
+  CHECK(fine_mesh.n_elems > coarse_mesh.n_elems);
+  CHECK(coarse_mesh.jacobian_min > 0.0);
+  CHECK(fine_mesh.jacobian_min > 0.0);
 }
 
 TEST_CASE("invalid mesh controls fail before STEP parsing") {

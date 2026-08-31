@@ -1,30 +1,15 @@
-// test_mesher_advanced — end-to-end mesher + FEA-static workout on ADVANCED, multi-feature
-// OCCT solids (not just a plain box/cantilever). It guards two things the simpler mesher
-// tests (test_netgen_mesh / test_mesh_quality — single box/cylinder) do NOT cover:
+// Polyhedral-FEA regression on multi-feature OCCT solids. The simpler mesh
+// tests cover a box and cylinder; these cases cover pockets, hole arrays,
+// fillets, and chamfers.
 //
-//   1. The Netgen tet10 mesher stays HEALTHY on parts with real stress-raising geometry —
-//      pockets, hole arrays, fillets and chamfers — where poor elements legitimately cluster
-//      at concentrations. We assert only the load-bearing quality invariants (no inverted or
-//      degenerate elements, positive volumes, finite aspect, non-empty mesh); we deliberately
-//      do NOT tighten pct_poor / aspect on curved geometry (those flake at concentrations).
+// Each case asserts positive, non-degenerate connectivity; a finite non-zero
+// static result; and a generous wall-clock ceiling that catches accidental mesh
+// explosions without turning normal machine contention into a flaky test.
 //
-//   2. The full mesh -> fea_run_static pipeline COMPLETES with a finite, physically-plausible
-//      result on each part (nonzero max displacement + von Mises => the boundary conditions
-//      actually bit, finite FoS), mirroring test_sim.cpp's static-solve assertions but on real
-//      B-rep solids rather than hand-built structured tet grids.
-//
-//   3. Each part meshes + solves within a GENEROUS wall-clock ceiling. This is the "well
-//      optimized enough to run on these machines" guard: a future -O0 regression, an
-//      accidental fineness blow-up, or a pathological mesh explosion trips the ceiling. The
-//      bound is intentionally loose (machine-independent) so it never flakes on a busy box.
-//
-// GEOMETRY NOTE: the parts here are built directly through OCCT's B-rep modelling API
-// (BRepPrimAPI / BRepAlgoAPI boolean / BRepFilletAPI), written to STEP, and fed to the same
-// mesh_step + fea_run_static path the live FEA uses — exactly like test_netgen_mesh.cpp. This
-// keeps the test self-contained (no doc/feature-tree dependency). Every part is designed with
-// a FLAT fixture face at z=0 and a FLAT load face at a known plane so the point-grid + tol_mm
-// boundary-condition resolution in fea_run_static reliably lands on real nodes (a point grid
-// over a curved/filleted face would not, and the solve would silently apply no BC).
+// The parts are built directly with OCCT, written to STEP, and fed through the
+// same mesh_step + fea_run_static path as the desktop application. Each has
+// flat, known fixture and load faces so boundary-condition sampling reliably
+// lands on mesh nodes.
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include <doctest/doctest.h>
 

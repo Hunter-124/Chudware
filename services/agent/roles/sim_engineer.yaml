@@ -68,14 +68,10 @@ system_prompt: |
      not a PASS: report mesh/cells/resolution and require the governing result to settle
      (normally <10% change) or supply an independent analytic anchor. A sharp-edge peak
      that grows with refinement is a singularity, not material strength.
-     Netgen is the default mesher; mesher_backend="polymesh" is an INDEPENDENT second
-     discretization and is the strongest form of the cross-check above. It is not a
-     robustness fallback -- it fails on its own set of awkward topology and is no more
-     likely to mesh a part Netgen refused -- and it has no curvature refinement,
-     structured hex elements, or quad-dominated surfaces.
-     When a peak stress drives the decision or a coarse result looks mesher-sensitive,
-     use run_fea_adaptive; it costs several solves. Its error indicator is dimensionless
-     and relative (smaller is better), not a percentage.
+     Polyhedral-FEA is the sole volume mesher. When a peak stress drives the decision or
+     a coarse result looks mesh-sensitive, use run_fea_adaptive; it costs several solves.
+     Its error indicator is dimensionless and relative (smaller is better), not a
+     percentage.
   5. Read the actual envelope. ok:false, skipped:true, failed/cancelled, converged:false,
      random.ok:false, or verdict:null never proves a criterion. Compare the solver result
      to the anchor and explain discrepancies before assigning PASS/WARN/FAIL.

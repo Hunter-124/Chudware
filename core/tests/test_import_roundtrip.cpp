@@ -29,7 +29,9 @@
 
 #include "doc/formats.h"
 #include "doc/session.h"
+#ifdef CHUDWARE_WITH_POLYMESH
 #include "sim/mesher.h"
+#endif
 
 using nlohmann::json;
 namespace fs = std::filesystem;
@@ -296,23 +298,25 @@ TEST_CASE("modern SolidWorks part becomes native geometry and meshes with Polyhe
     json reopened = doc_open(native.string(), false);
     CHECK(body_count(reopened) == 1);
 
-    const fs::path step = tmp("portable_part.step");
-    std::vector<TopoDS_Shape> shapes = {bodies.front().second};
-    export_bodies(shapes, step.string(), "step");
-    if (chudware::sim::mesher_backend_available(chudware::sim::MesherBackend::Polymesh)) {
-        chudware::sim::MeshOptions options;
-        options.backend = chudware::sim::MesherBackend::Polymesh;
-        options.fineness = 0.4;
-        options.order = 1;
-        const chudware::sim::MeshOut mesh = chudware::sim::mesh_step(step.string(), options);
-        REQUIRE_MESSAGE(mesh.ok, mesh.error);
-        CHECK(mesh.n_elems > 0);
-        CHECK(mesh.n_nodes > 0);
-        CHECK(mesh.mesh_type_used == "tet4-polymesh");
-    }
+#ifdef CHUDWARE_WITH_POLYMESH
+  const fs::path step = tmp("portable_part.step");
+  std::vector<TopoDS_Shape> shapes = {bodies.front().second};
+  export_bodies(shapes, step.string(), "step");
+  chudware::sim::MeshOptions options;
+  options.fineness = 0.4;
+  options.order = 1;
+  const chudware::sim::MeshOut mesh =
+      chudware::sim::mesh_step(step.string(), options);
+  REQUIRE_MESSAGE(mesh.ok, mesh.error);
+  CHECK(mesh.n_elems > 0);
+  CHECK(mesh.n_nodes > 0);
+  CHECK(mesh.mesh_type_used == "tet4");
+#endif
 
-    fs::remove(native);
-    fs::remove(step);
+  fs::remove(native);
+#ifdef CHUDWARE_WITH_POLYMESH
+  fs::remove(step);
+#endif
 }
 
 TEST_CASE("modern SolidWorks assembly preserves instances and transforms") {

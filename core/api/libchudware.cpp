@@ -88,19 +88,27 @@
 #include "cam/extract.h"
 #include "geom/aicm.h"
 #include "geom/ecad_3d.h"
-#ifdef CHUDWARE_WITH_NETGEN
+#include "parts/parts.h"
+#include "prof/phases.h"
+#include "prof/sampler.h"
+#include "sim/flow_run.h"
+#ifdef CHUDWARE_WITH_POLYMESH
 #include "sim/fea_adaptive.h"
 #include "sim/fea_fatigue.h"
-#endif
-#include "sim/fea_modal.h"
-#ifdef CHUDWARE_WITH_NETGEN
 #include "sim/fea_run.h"
-#endif
-#include "sim/fea_static.h"
-#include "sim/lbm.h"
-#ifdef CHUDWARE_WITH_NETGEN
 #include "sim/mesher.h"
 #endif
+#include "dfm/process_profiles.h"
+#include "ecad/container.h"
+#include "firmware/firmware_rpc.h"
+#include "hydraulic/hydraulic.h"
+#include "materials/materials.h"
+#include "mechanical/mechanical.h"
+#include "parts/place.h"
+#include "piping/piping.h"
+#include "sim/fea_modal.h"
+#include "sim/fea_static.h"
+#include "sim/lbm.h"
 #include "sim/netlist.h"
 #include "sim/numpy_rng.h"
 #include "sim/overlay.h"
@@ -2876,72 +2884,59 @@ static int chudware_call_inner(const char* method, const char* params_json, char
                              {"backend_fallback", r.backend_fallback}},
                         out_json, 0);
         }
-#ifdef CHUDWARE_WITH_NETGEN  // Netgen/nglib FEA-mesh RPCs (mesh + meshing FEA runs)
-        if (m == "sim_mesh") {
-            // Curvature-adaptive tet mesher (wraps Netgen / nglib). Params:
-            //   {"step_path", "fineness"(0..1)|"density"(legacy), "order"|"mesh_order",
-            //    "curvature"(bool), "curv_elems_per_circle", "target_size_mm",
-            //    "min_size_mm", "max_size_mm", "optimize"(bool),
-            //    "mesher_backend"("netgen"|"polymesh"), "structured"|"mesh_type"=="hex",
-            //    "auto_type"(bool, Simple-mode geometry pick), "quad_surface"(bool,
-            //    quad-dominated surface), "fallback_to_tet"(bool, default true),
-            //    "thin_wall_layers"(double)}.
-            // Returns points[n*3], tets[m*K] (0-based), counts, quality metrics (aspect
-            // min/avg/max, jacobian_min, pct_poor, aspect_hist), plus mesh_type_used + note
-            // (the element type actually produced and any auto-pick/fallback decision) for the GUI.
-            std::string step_path = params.contains("step_path") && params["step_path"].is_string()
-                                        ? params["step_path"].get<std::string>()
-                                        : std::string();
-            if (step_path.empty())
-                return emit_error("sim_mesh: 'step_path' (string) is required", out_json);
-            chudware::sim::MeshOptions opts;
-            opts.fineness = params.value("fineness", 0.5);
-            opts.density = params.value("density", -1.0);  // legacy alias
-            opts.order = params.value("order", params.value("mesh_order", 1));
-            opts.curvature = params.value("curvature", true);
-            opts.curv_elems_per_circle = params.value("curv_elems_per_circle", 12.0);
-            opts.target_size_mm = params.value("target_size_mm", 0.0);
-            opts.min_size_mm = params.value("min_size_mm", 0.0);
-            opts.max_size_mm = params.value("max_size_mm", 0.0);
-            opts.optimize = params.value("optimize", true);
-            opts.backend = chudware::sim::mesher_backend_from_string(
-                params.value("mesher_backend", std::string("netgen")));
-            if (!chudware::sim::mesher_backend_available(opts.backend))
-                return emit(json{{"ok", false},
-                                 {"error", "sim_mesh: mesher_backend 'polymesh' is not "
-                                           "available in this build"}},
-                            out_json, 0);
-            opts.structured = params.value(
-                "structured", params.value("mesh_type", std::string()) == "hex");
-            opts.auto_type = params.value("auto_type", false);
-            opts.quad_surface = params.value("quad_surface", false);
-            opts.fallback_to_tet = params.value("fallback_to_tet", true);
-            opts.thin_wall_layers = params.value("thin_wall_layers", 4.0);
-            // P4: content+options-keyed cache — an unchanged geometry re-mesh (e.g. the GUI
-            // re-requesting the preview mesh after a solve) is a hit instead of a Netgen run.
-            auto rp = chudware::sim::mesh_step_cached_ptr(step_path, opts);
-            const chudware::sim::MeshOut& r = *rp;
-            if (!r.ok) return emit(json{{"ok", false}, {"error", r.error}}, out_json, 0);
-            return emit(json{{"ok", true},
-                             {"points", r.points},
-                             {"tets", r.tets},
-                             {"char_len_mm", r.char_len_mm},
-                             {"n_nodes", r.n_nodes},
-                             {"n_elems", r.n_elems},
-                             {"nodes_per_elem", r.nodes_per_elem},
-                             {"min_tet_volume_mm3", r.min_tet_volume_mm3},
-                             {"max_tet_edge_ratio", r.max_tet_edge_ratio},
-                             {"aspect_min", r.aspect_min},
-                             {"aspect_avg", r.aspect_avg},
-                             {"aspect_max", r.aspect_max},
-                             {"jacobian_min", r.jacobian_min},
-                             {"pct_poor", r.pct_poor},
-                             {"aspect_hist", r.aspect_hist},
-                             {"mesh_type_used", r.mesh_type_used},
-                             {"note", r.note},
-                             {"mesher_backend", chudware::sim::mesher_backend_name(opts.backend)}},
-                        out_json, 0);
-        }
+#ifdef CHUDWARE_WITH_POLYMESH  // Polyhedral-FEA mesh and meshing-study RPCs
+    if (m == "sim_mesh") {
+      // Params: {step_path, fineness?, order|mesh_order?, target_size_mm?,
+      // min_size_mm?, max_size_mm?, learned_advisor?, advisor_max_dof?}.
+      // Returns normalized tet4/tet10 connectivity plus quality metrics.
+      std::string step_path =
+          params.contains("step_path") && params["step_path"].is_string()
+              ? params["step_path"].get<std::string>()
+              : std::string();
+      if (step_path.empty())
+        return emit_error("sim_mesh: 'step_path' (string) is required",
+                          out_json);
+      static constexpr const char *kRemovedMeshOptions[] = {
+          "density",         "curvature",        "curv_elems_per_circle",
+          "optimize",        "mesher_backend",   "structured",
+          "mesh_type",       "auto_type",        "quad_surface",
+          "fallback_to_tet", "thin_wall_layers", "algorithm3d"};
+      for (const char *key : kRemovedMeshOptions)
+        if (params.contains(key))
+          return emit_error(std::string("sim_mesh: option '") + key +
+                                "' was removed with the Polyhedral-FEA cutover",
+                            out_json);
+      chudware::sim::MeshOptions options;
+      options.fineness = params.value("fineness", 0.5);
+      options.order = params.value("order", params.value("mesh_order", 1));
+      options.target_size_mm = params.value("target_size_mm", 0.0);
+      options.min_size_mm = params.value("min_size_mm", 0.0);
+      options.max_size_mm = params.value("max_size_mm", 0.0);
+      options.learned_advisor = params.value("learned_advisor", false);
+      options.advisor_max_dof = params.value("advisor_max_dof", uint32_t{0});
+      const auto mesh = chudware::sim::mesh_step_cached(step_path, options);
+      const chudware::sim::MeshOut &r = *mesh;
+      if (!r.ok)
+        return emit(json{{"ok", false}, {"error", r.error}}, out_json, 0);
+      return emit(json{{"ok", true},
+                       {"points", r.points},
+                       {"tets", r.tets},
+                       {"char_len_mm", r.char_len_mm},
+                       {"n_nodes", r.n_nodes},
+                       {"n_elems", r.n_elems},
+                       {"nodes_per_elem", r.nodes_per_elem},
+                       {"min_tet_volume_mm3", r.min_tet_volume_mm3},
+                       {"max_tet_edge_ratio", r.max_tet_edge_ratio},
+                       {"aspect_min", r.aspect_min},
+                       {"aspect_avg", r.aspect_avg},
+                       {"aspect_max", r.aspect_max},
+                       {"jacobian_min", r.jacobian_min},
+                       {"pct_poor", r.pct_poor},
+                       {"aspect_hist", r.aspect_hist},
+                       {"mesh_type_used", r.mesh_type_used},
+                       {"note", r.note}},
+                  out_json, 0);
+    }
         if (m == "sim_run_static") {
             // P50b: combined mesh + BC-resolve + linear-static solve (the glue on
             // top of sim_mesh + sim_fea_static). Params: {"study": {...}} where the
@@ -2964,25 +2959,15 @@ static int chudware_call_inner(const char* method, const char* params_json, char
                     std::vector<double> vol;
                     std::vector<int> tets;
                     int npe = 4;
-                    chudware::sim::MeshOptions opts;
-                    opts.fineness = study.value("fineness", 0.5);
-                    opts.density = study.value("density", -1.0);  // legacy alias
-                    opts.order = study.value("mesh_order", study.value("order", 1));
-                    opts.curvature = study.value("curvature", true);
-                    opts.curv_elems_per_circle = study.value("curv_elems_per_circle", 12.0);
-                    opts.target_size_mm = study.value("target_size_mm", 0.0);
-                    opts.min_size_mm = study.value("min_size_mm", 0.0);
-                    opts.max_size_mm = study.value("max_size_mm", 0.0);
-                    opts.optimize = study.value("optimize", true);
-                    opts.backend = chudware::sim::mesher_backend_from_string(
-                        study.value("mesher_backend", std::string("netgen")));
-                    opts.structured = study.value(
-                        "structured", study.value("mesh_type", std::string()) == "hex");
-                    opts.auto_type = study.value("auto_type", false);
-                    opts.quad_surface = study.value("quad_surface", false);
-                    opts.fallback_to_tet = study.value("fallback_to_tet", true);
-                    opts.thin_wall_layers = study.value("thin_wall_layers", 4.0);
-                    auto mo = chudware::sim::mesh_step_cached_ptr(step_path, opts);
+          chudware::sim::MeshOptions options;
+          options.fineness = study.value("fineness", 0.5);
+          options.order = study.value("mesh_order", study.value("order", 1));
+          options.target_size_mm = study.value("target_size_mm", 0.0);
+          options.min_size_mm = study.value("min_size_mm", 0.0);
+          options.max_size_mm = study.value("max_size_mm", 0.0);
+          options.learned_advisor = study.value("learned_advisor", false);
+          options.advisor_max_dof = study.value("advisor_max_dof", uint32_t{0});
+          auto mo = chudware::sim::mesh_step_cached(step_path, options);
                     if (mo->ok) {
                         vol = mo->points;
                         tets = mo->tets;
@@ -3059,25 +3044,15 @@ static int chudware_call_inner(const char* method, const char* params_json, char
                     std::vector<double> vol;
                     std::vector<int> tets;
                     int npe = 4;
-                    chudware::sim::MeshOptions opts;
-                    opts.fineness = study.value("fineness", 0.5);
-                    opts.density = study.value("density", -1.0);  // legacy alias
-                    opts.order = study.value("mesh_order", 2);
-                    opts.curvature = study.value("curvature", true);
-                    opts.curv_elems_per_circle = study.value("curv_elems_per_circle", 12.0);
-                    opts.target_size_mm = study.value("target_size_mm", 0.0);
-                    opts.min_size_mm = study.value("min_size_mm", 0.0);
-                    opts.max_size_mm = study.value("max_size_mm", 0.0);
-                    opts.optimize = study.value("optimize", true);
-                    opts.backend = chudware::sim::mesher_backend_from_string(
-                        study.value("mesher_backend", std::string("netgen")));
-                    opts.structured = study.value(
-                        "structured", study.value("mesh_type", std::string()) == "hex");
-                    opts.auto_type = study.value("auto_type", false);
-                    opts.quad_surface = study.value("quad_surface", false);
-                    opts.fallback_to_tet = study.value("fallback_to_tet", true);
-                    opts.thin_wall_layers = study.value("thin_wall_layers", 4.0);
-                    auto mo = chudware::sim::mesh_step_cached_ptr(step_path, opts);
+          chudware::sim::MeshOptions options;
+          options.fineness = study.value("fineness", 0.5);
+          options.order = study.value("mesh_order", 2);
+          options.target_size_mm = study.value("target_size_mm", 0.0);
+          options.min_size_mm = study.value("min_size_mm", 0.0);
+          options.max_size_mm = study.value("max_size_mm", 0.0);
+          options.learned_advisor = study.value("learned_advisor", false);
+          options.advisor_max_dof = study.value("advisor_max_dof", uint32_t{0});
+          auto mo = chudware::sim::mesh_step_cached(step_path, options);
                     if (mo->ok) {
                         vol = mo->points;
                         tets = mo->tets;
@@ -3128,7 +3103,7 @@ static int chudware_call_inner(const char* method, const char* params_json, char
             std::vector<uint8_t> bytes = aicm::disp_chunk(body_id, scale_hint, vec);
             return emit(json{{"hex", to_hex(bytes)}}, out_json, 0);
         }
-#endif  // CHUDWARE_WITH_NETGEN
+#endif  // CHUDWARE_WITH_POLYMESH
         if (m == "sim_map_to_surface") {
             // DIAGNOSTIC (map value-parity): nearest-volume-node mapping. Accepts
             // {surf:[[x,y,z]...], vol:[[x,y,z]...], values:[...]| [[...]...], dim?}.

@@ -21,8 +21,7 @@ Cases (same in quick and full mode; the instrumented solves are already coarse):
         a bounded ring, so this must stay ~sub-millisecond engine-side).
 
 Solver lib: whatever services.mcp.core_bridge resolves ($CHUDWARE_LIBCHUDWARE ->
-core/build-occt-linux fallback). A lib without the prof_phases RPC (not yet rebuilt
-with core/prof/phases.cpp) or without sim_run_static (no CHUDWARE_WITH_NETGEN) produces
+core/build-occt-linux fallback). A library without the profiler or FEA RPCs produces
 clean, reasoned skips.
 
 No analytic references: every metric here is a structural/timing regression, so
@@ -74,7 +73,7 @@ _CASE_IDS = ["phases_fea_static", "phases_fea_modal", "phases_mesh_cache",
 
 
 def _capabilities() -> tuple[bool, str]:
-    """(ok, reason): needs the prof_phases RPC AND the Netgen FEA RPCs."""
+    """(ok, reason): needs both prof_phases and the FEA RPCs."""
     cb = _cb()
     try:
         if not cb.available():
@@ -89,7 +88,7 @@ def _capabilities() -> tuple[bool, str]:
         cb.call("sim_run_static", {"study": {}})
     except Exception as exc:  # noqa: BLE001
         if "unknown method" in str(exc):
-            return False, f"libchudware.so lacks sim_run_static (no CHUDWARE_WITH_NETGEN): {exc}"
+            return False, f"libchudware.so lacks sim_run_static (no Polyhedral-FEA): {exc}"
         return False, f"engine probe failed: {exc}"
     return True, ""
 

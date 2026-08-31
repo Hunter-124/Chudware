@@ -51,7 +51,7 @@ def _guard(fn, case_id: str) -> dict:
 
 def run(quick: bool = False) -> list[dict]:
     ok, reason = fsc.solver_available()
-    quick_ids = ["cantilever_tet10_f0.25", "plate_hole_tet10_curv12",
+    quick_ids = ["cantilever_tet10_f0.25", "plate_hole_tet10_f0.25",
                  "annulus_lame_tet10_f0.25", "lbracket_fillet_tet4_f0.25"]
     if not ok:
         ids = quick_ids if quick else quick_ids + ["(full set)"]
@@ -63,8 +63,7 @@ def run(quick: bool = False) -> list[dict]:
         cases.append(_guard(lambda: fsc.case_cantilever(
             "cantilever_tet10_f0.25", order=2, fineness=0.25), quick_ids[0]))
         cases.append(_guard(lambda: fsc.case_plate_hole(
-            "plate_hole_tet10_curv12", order=2, fineness=0.25,
-            curv_elems_per_circle=12.0), quick_ids[1]))
+            "plate_hole_tet10_f0.25", order=2, fineness=0.25), quick_ids[1]))
         cases.append(_guard(lambda: fsc.case_annulus_lame(
             "annulus_lame_tet10_f0.25", order=2, fineness=0.25), quick_ids[2]))
         cases.append(_guard(lambda: fsc.case_regression(
@@ -74,22 +73,18 @@ def run(quick: bool = False) -> list[dict]:
 
     # ---- full mode -------------------------------------------------------
     # Element-order / fineness frontier on the analytic cantilever.
-    for order, fin, structured in [(1, 0.3, False), (1, 0.5, False),
-                                   (2, 0.25, False), (2, 0.4, False), (2, 0.55, False),
-                                   (1, 0.3, True), (1, 0.5, True)]:
-        kind = "hex8" if structured else ("tet10" if order == 2 else "tet4")
-        cid = f"cantilever_{kind}_f{fin}"
-        cases.append(_guard(lambda o=order, f=fin, s=structured, c=cid:
-                            fsc.case_cantilever(c, order=o, fineness=f, structured=s),
-                            cid))
-
-    # Plate with hole: order + curvature refinement.
-    for order, fin, curv in [(1, 0.3, 12.0), (2, 0.25, 12.0), (2, 0.3, 24.0)]:
+    for order, fin in [(1, 0.3), (1, 0.5), (2, 0.25), (2, 0.4), (2, 0.55)]:
         kind = "tet10" if order == 2 else "tet4"
-        cid = f"plate_hole_{kind}_curv{curv:.0f}"
-        cases.append(_guard(lambda o=order, f=fin, cv=curv, c=cid:
-                            fsc.case_plate_hole(c, order=o, fineness=f,
-                                                curv_elems_per_circle=cv), cid))
+        cid = f"cantilever_{kind}_f{fin}"
+        cases.append(_guard(lambda o=order, f=fin, c=cid:
+                            fsc.case_cantilever(c, order=o, fineness=f), cid))
+
+    # Plate with hole: element order + fineness.
+    for order, fin in [(1, 0.3), (2, 0.25), (2, 0.4)]:
+        kind = "tet10" if order == 2 else "tet4"
+        cid = f"plate_hole_{kind}_f{fin}"
+        cases.append(_guard(lambda o=order, f=fin, c=cid:
+                            fsc.case_plate_hole(c, order=o, fineness=f), cid))
 
     # Lamé annulus: order + fineness (keep <=0.4 — solve grows ~cubically).
     for order, fin in [(1, 0.3), (2, 0.25), (2, 0.4)]:

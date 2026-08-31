@@ -1,10 +1,7 @@
 """fea_static simsuite — shared geometry + study case library.
 
-Builds a diverse fleet of parts through REAL engine ops (services.mcp.core_bridge,
-in-process, CHUDWARE_ENGINE_DAEMON=0), meshes them via ``sim_mesh`` (tet4 / tet10 /
-structured hex8) and solves linear statics via ``sim_run_static`` with an INLINE
-mesh (so the mesh-quality metrics, the solved nodal fields and the timings all
-refer to one and the same mesh).
+Builds parts through the real engine, meshes them through Polyhedral-FEA, and solves
+linear statics with the returned inline tet4/tet10 mesh.
 
 Used by two consumers:
   * benchmarks/simsuite/fea_static_bench.py  (the simsuite bench module)
@@ -61,7 +58,7 @@ def _cb():
 
 
 def solver_available() -> tuple[bool, str]:
-    """True when the staged .so answers sim_run_static (Netgen FEA plugin built in)."""
+    """True when the staged .so answers sim_run_static."""
     try:
         cb = _cb()
         if not cb.available():
@@ -69,7 +66,7 @@ def solver_available() -> tuple[bool, str]:
         r = cb.call("sim_run_static", {"study": {}})
     except Exception as exc:  # noqa: BLE001 — CoreError('unknown method') or load fail
         if "unknown method" in str(exc):
-            return False, f"staged libchudware.so lacks sim_run_static (no CHUDWARE_WITH_NETGEN): {exc}"
+            return False, f"staged libchudware.so lacks sim_run_static (no Polyhedral-FEA): {exc}"
         return False, f"engine probe failed: {exc}"
     # A reachable solver rejects the empty study IN-BAND (ok:false), never rc!=0.
     if isinstance(r, dict) and r.get("ok") is False:
@@ -137,9 +134,9 @@ def close_doc(doc: str) -> None:
         pass
 
 
-def mesh_step(step_path: str, order: int = 1, fineness: float = 0.25, **opts) -> dict:
+def mesh_step(step_path: str, order: int = 1, fineness: float = 0.25) -> dict:
     m = _cb().call("sim_mesh", {"step_path": step_path, "fineness": fineness,
-                                "order": order, **opts})
+                                "order": order})
     if not m.get("ok"):
         raise RuntimeError(f"sim_mesh failed: {m.get('error')}")
     return m
@@ -407,7 +404,7 @@ def _case(case_id, setup_s, mesh_s, solve_s, metric, ref, detail="", extra=None)
     return out
 
 
-def case_cantilever(case_id, order=2, fineness=0.25, structured=False):
+def case_cantilever(case_id, order=2, fineness=0.25):
     """Cantilever tip deflection δ = P·L³/(3·E·I) — Roark 8th, Table 8.1 case 1a
     (Euler-Bernoulli; ±shear compliance at L/H=20 is well under the bounds used)."""
     L, B, H, P = 1000.0, 50.0, 50.0, 1000.0
@@ -420,7 +417,7 @@ def case_cantilever(case_id, order=2, fineness=0.25, structured=False):
     load = plane_faceset([L / 2, 0, 0], [1, 0, 0])
     setup_s = time.time() - t0
     t0 = time.time()
-    m = mesh_step(step, order=order, fineness=fineness, structured=structured)
+    m = mesh_step(step, order=order, fineness=fineness)
     mesh_s = time.time() - t0
     t0 = time.time()
     r = static_solve(m, [fix], [{"faces": load, "type": "force", "vector": [0, 0, -P]}])
@@ -434,7 +431,7 @@ def case_cantilever(case_id, order=2, fineness=0.25, structured=False):
                  extra={"quality": _quality(m)})
 
 
-def case_plate_hole(case_id, order=2, fineness=0.3, curv_elems_per_circle=24.0):
+def case_plate_hole(case_id, order=2, fineness=0.3):
     """Peak stress at a central hole in a finite-width strip under tension.
     σ_peak = Ktn·σ_net with Ktn = 2 + (1 − d/W)³ (Peterson/Heywood finite-width
     fit; → Kirsch Kt=3 as d/W→0), σ_net = σ_gross·W/(W−d). Metric = peak nodal
@@ -449,8 +446,7 @@ def case_plate_hole(case_id, order=2, fineness=0.3, curv_elems_per_circle=24.0):
     load = plane_faceset([L / 2, 0, 0], [1, 0, 0])
     setup_s = time.time() - t0
     t0 = time.time()
-    m = mesh_step(step, order=order, fineness=fineness,
-                  curv_elems_per_circle=curv_elems_per_circle)
+    m = mesh_step(step, order=order, fineness=fineness)
     mesh_s = time.time() - t0
     F = sigma * W * T
     t0 = time.time()
@@ -464,8 +460,7 @@ def case_plate_hole(case_id, order=2, fineness=0.3, curv_elems_per_circle=24.0):
                 if math.hypot(pts[3 * i], pts[3 * i + 1]) < d / 2 + 0.7), default=None)
     return _case(case_id, setup_s, mesh_s, solve_s, peak, ref,
                  detail=f"peak vm MPa at hole; Ktn={ktn:.3f} {m['mesh_type_used']} "
-                        f"n={m['n_nodes']} curv={curv_elems_per_circle:.0f} "
-                        f"(Peterson Ktn=2+(1-d/W)³, Kirsch limit 3)",
+                        f"n={m['n_nodes']} (Peterson Ktn=2+(1-d/W)³, Kirsch limit 3)",
                  extra={"quality": _quality(m)})
 
 

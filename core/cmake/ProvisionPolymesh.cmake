@@ -1,10 +1,8 @@
 # ProvisionPolymesh.cmake — make the Polyhedral-FEA (`polymesh`) mesher + adaptive
 # FEA stack available as in-tree static libraries.
 #
-# Unlike OCCT / Netgen / lib3mf, polymesh ships NO install(), no export set and no
-# package config: it is consumed by add_subdirectory only. It is also header+source
-# pure C++20 with no runtime shared library, so there is nothing to install or stage —
-# we clone a pinned commit under third_party/polymesh/src and add it to the build.
+# Polyhedral-FEA has no install/export set; Chudware consumes its static libraries through
+# add_subdirectory and stages only the optional learned-advisor runtime.
 #
 # Dependency sharing is the whole reason this file exists rather than a bare
 # add_subdirectory: polymesh's own top level would `find_package(Eigen3)` and pick up
@@ -15,9 +13,7 @@
 # Eigen3::Eigen / nlohmann_json::nlohmann_json — which core/CMakeLists.txt does before
 # including this module. Keep that ordering.
 #
-# LICENSE NOTE: polymesh is BSD-3-Clause — the most permissive dependency in the tree.
-# It links statically with no obligation beyond attribution, unlike Netgen (LGPL-2.1,
-# dynamic-link-only) and CalculiX (GPL-2.0, subprocess-only).
+# LICENSE: BSD-3-Clause, statically linked.
 
 # The source commit is immutable and identical in the public upstream and the internal
 # maintenance mirror. Keep the public repository as the credential-free default so CAD CI
@@ -193,11 +189,13 @@ set(POLYMESH_BUILD_TESTS  OFF CACHE BOOL "" FORCE)
 set(POLYMESH_WITH_GUI     OFF CACHE BOOL "" FORCE)
 set(POLYMESH_WITH_ADVISOR ${POLYMESH_ADVISOR_ENABLED} CACHE BOOL "" FORCE)
 set(POLYMESH_WITH_CUDA    OFF CACHE BOOL "" FORCE)
+# Chudware consumes the graded-tet family only; the restricted CVT/Geogram kernel cannot
+# cross the fixed-stride tet contract and is intentionally not built.
+set(POLYMESH_WITH_GEOGRAM OFF CACHE BOOL "" FORCE)
 # polymesh compiles itself -Werror under -Wconversion. That is its own CI's business;
 # a dependency must never be able to fail OUR build on a new compiler's new warning.
 set(POLYMESH_WERROR       OFF CACHE BOOL "" FORCE)
-# STEP/BREP reading is the entire point of the integration: the mesher consumes the
-# same STEP file the Netgen path does, through the same OCCT this build already links.
+# STEP/BREP support uses the same OpenCASCADE build as Chudware.
 set(POLYMESH_WITH_OCC     ON  CACHE BOOL "" FORCE)
 if(DEFINED OpenCASCADE_DIR)
   set(OpenCASCADE_DIR "${OpenCASCADE_DIR}" CACHE PATH "" FORCE)
@@ -212,10 +210,8 @@ endif()
 # chudware_polymesh_stage_runtime below is called from core/CMakeLists.txt.
 set(POLYMESH_ADVISOR_MODEL_FILES "model.onnx;normalization.json;clamps.json;ood.json"
     CACHE INTERNAL "Advisor artifacts required at runtime")
-# Source-tree home of those files: the DEVELOPER fallback compiled into
-# sim/polymesh_backend.cpp. It resolves on a machine that has this checkout and nowhere
-# else, which is precisely its intended reach — a packaged install never finds it and
-# uses the staged package instead.
+# Developer fallback model directory compiled into sim/mesher.cpp. Packaged installs use
+# the staged package beside libchudware instead.
 set(POLYMESH_ADVISOR_SOURCE_DIR "${_pm_src}/bench/advisor"
     CACHE INTERNAL "Advisor model source directory (developer fallback)")
 # Name of the staged package directory, resolved at runtime relative to the module that
@@ -325,11 +321,8 @@ endif()
 # link — an absolute path to a directory a release does not contain. Copying it next to
 # the consumer and adding $ORIGIN makes the same binary start from a staged tree.
 #
-# The model package rides along in a `polymesh-advisor` subdirectory, which
-# sim/polymesh_backend.cpp resolves relative to its own module (never the executable: the
-# engine is dlopen'd, and a packaged layout keeps the daemon in bin/ and the engine in
-# lib/). Call this for every target that links polymesh::advisor, directly or through
-# chudware_mesh.
+# The model package rides in `polymesh-advisor` beside the engine; sim/mesher.cpp resolves
+# it relative to its own module. Call this for every target that links the advisor.
 function(chudware_polymesh_stage_runtime target)
   if(NOT POLYMESH_ADVISOR_ENABLED)
     # No prebuilt ONNX Runtime is pinned for this platform, so ${target} links no advisor
@@ -359,9 +352,7 @@ function(chudware_polymesh_stage_runtime target)
       VERBATIM)
   endforeach()
   if(NOT WIN32)
-    # The staged runtime sits next to the consumer, so $ORIGIN is the entire answer for
-    # both the build tree and an installed layout. APPEND: Netgen and OCCT contribute
-    # their own entries, and INSTALL_RPATH is set independently of the build one.
+    # The staged runtime sits next to the consumer, so $ORIGIN covers build and install.
     set_property(TARGET ${target} APPEND PROPERTY BUILD_RPATH "$ORIGIN")
     set_property(TARGET ${target} APPEND PROPERTY INSTALL_RPATH "$ORIGIN")
   endif()

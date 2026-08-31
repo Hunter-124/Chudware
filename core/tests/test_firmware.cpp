@@ -878,14 +878,10 @@ TEST_CASE("fw_sim_run LIVE: QEMU semihosting path (honest skip without tools)") 
     // cortex-m4 → canonical cortex-m (generic platform). With NO assertions
     // the T-FIN2 gate has nothing to refuse, so the run takes the preferred
     // Renode backend even on the generic platform (same as the oracle).
-    // Budget note (ctest -j6 flake, fixed 2026-07-28): renode is a .NET emulator whose
-    // COLD START dominates this leg (~10-20 s on an idle box). Under parallel ctest the
-    // Netgen mesher suites saturate every core and a 15 s budget expired, so run_renode
-    // returned passed=false with a null trace_path and this case failed ~1 run in 1 —
-    // a machine-load artifact, not a firmware defect. The budget is now generous enough
-    // to absorb heavy contention while still failing a genuinely hung emulator, and the
-    // ctest target carries RUN_SERIAL (core/CMakeLists.txt) so it no longer competes.
-    //
+  // Budget note: Renode cold start is CPU-bound. Under parallel ctest the
+  // mesher suites can starve the emulator, so this target keeps its measured
+  // RUN_SERIAL budget.
+  //
     // Re-measured 2026-07-29. Raising the budget is NOT the fix: at 180 s the leg still
     // reported "timeout: renode exceeded 180s" under `ctest -j6` (burning 360 s across both
     // live legs) while the same binary passed 1/1 with the box idle. RUN_SERIAL serialises

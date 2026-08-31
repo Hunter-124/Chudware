@@ -1,12 +1,9 @@
 // gen_sim2_result_fixture — regenerate the committed T-SIM2 result-contour AICM fixture.
 //
-// The CHUDWARE_SHOT=fea_overlay headless scenario (ui/imgui/src/ui/scenarios.cpp) renders a
-// color-mapped FEA contour from a precomputed result AICM. That AICM is produced HERE, by the
-// REAL solver + overlay pipeline, WITHOUT the Netgen tet mesher (which is not provisionable in
-// every environment): a structured cantilever tet mesh is hand-built in code (mesher substitute,
-// mirroring core/tests/test_sim.cpp::make_box_tet4), run through fea_static_solve, and skinned +
-// field-mapped by static_overlay — exercising the same surface extraction + T-SIM2 size cap the
-// live path uses. Only meshing is substituted; solver + skinning + AICM are real.
+// The CHUDWARE_SHOT=fea_overlay headless scenario renders a color-mapped FEA
+// contour from a precomputed result AICM. This generator uses a deterministic
+// structured cantilever mesh, the real solver, and the production
+// surface-extraction/overlay pipeline.
 //
 // Usage (default writes next to the repo fixture):
 //   gen_sim2_result_fixture [out.aicm]

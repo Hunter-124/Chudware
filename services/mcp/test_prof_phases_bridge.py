@@ -3,8 +3,7 @@
 Drives the REAL engine in-process on the raw core bridge (no MCP server), the same
 bootstrap as test_fea_live_bridge.py: probe candidate .so paths in a fresh subprocess
 each (core_bridge binds one .so per process) and run against the first that exposes
-BOTH prof_phases (core built with prof/phases.cpp) and sim_run_static (CHUDWARE_WITH_NETGEN).
-It skips honestly, with the probed reasons, when no candidate has the phase timers —
+BOTH prof_phases and sim_run_static. It skips honestly when no candidate has both.
 e.g. before the core rebuild that ships them.
 
 Asserts, after one small box-cantilever sim_run_static + sim_run_modal:

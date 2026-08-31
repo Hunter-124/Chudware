@@ -144,10 +144,8 @@ outliving its binaries:
 ## Installer integration
 
 - **AppImage** (`packaging/linux/build_appimage.sh`): stages
-  `usr/bin/chudware-hostd` and the full-FEA `usr/lib/libchudware.so` (+ its Netgen/
-  lib3mf sibling .so files) from `core/build-occt-linux` by default
-  (`--no-libchudware` to opt out; slim `core/build-linux` is a loud-warning
-  fallback). AppRun exports `CHUDWARE_HOSTD_BIN` + `CHUDWARE_INSTANCE_KEY` as above.
+  `usr/bin/chudware-hostd`, the full-FEA `usr/lib/libchudware.so`, optional lib3mf,
+  and the Polyhedral-FEA advisor package from `core/build-occt-linux`.
   The full OCCT 7.9 closure (34 `libTK*.so.7.9` + TBB + the engine's non-system
   dep tail) is bundled into `usr/lib` via an ldd walk filtered by the AppImage
   excludelist, so the target machine needs **no** OCCT install (verified: the
@@ -166,10 +164,10 @@ outliving its binaries:
   `docs/reference/PACKAGING_WINDOWS.md` manual checklist.
 - **Upgrades**: installers stop the daemon before replacing binaries; deploys
   must always be temp-file + RENAME, never `cp` over a live .so (SIGBUS).
-- **Dev tree (Linux)**: `./build.sh stage` deploys `libchudware.so` (+ Netgen/
-  lib3mf siblings) AND `chudware-hostd` from `core/build-occt-linux/bin` into
-  `services/dist/Chudware/` (the `$CHUDWARE_DIST` dir both `core_bridge` and
-  `daemon_bridge.resolve_hostd_bin` try first), each file via copy-to-temp +
+- **Dev tree (Linux)**: `./build.sh stage` deploys `libchudware.so`, optional lib3mf/
+  advisor artifacts, and `chudware-hostd` from `core/build-occt-linux/bin` into
+  `services/dist/Chudware/`, the directory that `core_bridge` and
+  `daemon_bridge.resolve_hostd_bin` try first. Each file uses copy-to-temp plus
   atomic rename. Always stage the pair together: the daemon instance key is
   the fnv of the hostd binary's realpath, so a dist libchudware.so with only a
   build-dir hostd silently splits clients across two engines. On Windows,

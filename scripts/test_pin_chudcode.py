@@ -80,7 +80,7 @@ def test_checked_in_lock_declares_every_required_release_input() -> None:
     assert lock["rpc_protocol"] == 2
     assert lock["version"] == "0.2.0"
     assert lock["engine_version"] == "18.0.8"
-    assert lock["notices"]["repository_commit"] == "7c9cdb983ab6272d25c98de763f9246be3d5becb"
+    assert lock["notices"]["repository_commit"] == "e3d8790f50d33a86ef7b295eeeda504fd6399835"
     assert lock["notices"]["files"] == {
         "CHUDCODE-NOTICE": {
             "sha256": "58a54468725d1d3b02a5afa38da728dfe8a147e1e669d0842096091dfe12e82d",

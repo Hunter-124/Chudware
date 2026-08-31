@@ -2402,11 +2402,10 @@ void drawModelDropdown(AppState& st, bool busy) {
     drawSessionCostStrip(st);
 
     if (picked) {
-        // CRITICAL: persist the pick to config.json NOW. The in-app run (agent_run_v2) resolves its
-        // provider from config.json in the C++ core — NOT from in-memory st.settings — so a pick that
-        // only updates st.settings would leave the run using the STALE persisted provider. That's the
-        // bug where selecting a local model (gemma) still routed to the previously-saved cloud
-        // endpoint and 403'd. Saving here keeps config.json == what the picker shows before any run.
+        // Persist the descriptor immediately so the next `agent_admin_turn` has matching endpoint
+        // details; composer also pins provider/model/effort in that request. This keeps config.json
+        // and the picker aligned instead of letting a stale saved cloud endpoint outlive a new local
+        // selection.
         saveSettings(st.settings);
         ImGui::CloseCurrentPopup();
     }

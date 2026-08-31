@@ -1,21 +1,28 @@
 #include "worker_client.h"
 
 #if defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <winsock2.h>
+#include <ws2tcpip.h>
 #include <windows.h>
 #elif !defined(__EMSCRIPTEN__)
 #include <fcntl.h>
 #include <poll.h>
 #include <signal.h>
+#include <sys/socket.h>
+#include <sys/un.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
 #include <cerrno>
-#include <chrono>
-#include <cstring>
 #include <filesystem>
 #include <thread>
 #include <vector>
 #endif
+#include <chrono>
+#include <cstring>
 
 #include "../ipc/ipc_client.h"
 #include <cstdio> // T-G9 parity trace (CHUDWARE_RPC_TRACE) file append
@@ -767,8 +774,434 @@ bool sameCanonicalPath(const std::string &left, const std::string &right) {
   const auto canonicalRight = std::filesystem::weakly_canonical(right, rightEc);
   return !leftEc && !rightEc && canonicalLeft == canonicalRight;
 }
+#if !defined(__EMSCRIPTEN__)
+#ifdef _WIN32
+using WorkerControlSocket = SOCKET;
+constexpr WorkerControlSocket kInvalidWorkerControlSocket = INVALID_SOCKET;
+void closeWorkerControlSocket(WorkerControlSocket socket) {
+  if (socket != kInvalidWorkerControlSocket)
+    closesocket(socket);
+}
+int workerControlSocketError() { return WSAGetLastError(); }
+bool workerControlConnectPending(int error) {
+  return error == WSAEWOULDBLOCK || error == WSAEINPROGRESS ||
+         error == WSAEINVAL;
+}
+bool workerControlWouldBlock(int error) {
+  return error == WSAEWOULDBLOCK;
+}
+bool workerControlInterrupted(int error) { return error == WSAEINTR; }
+bool setWorkerControlNonblocking(WorkerControlSocket socket) {
+  u_long enabled = 1;
+  return ioctlsocket(socket, FIONBIO, &enabled) == 0;
+}
+bool ensureWorkerControlSockets(std::string &err) {
+  struct WinsockLifetime {
+    bool ready = false;
+    WinsockLifetime() {
+      WSADATA data{};
+      ready = WSAStartup(MAKEWORD(2, 2), &data) == 0;
+    }
+    ~WinsockLifetime() {
+      if (ready)
+        WSACleanup();
+    }
+  };
+  static WinsockLifetime lifetime;
+  if (!lifetime.ready)
+    err = "worker control socket initialization failed";
+  return lifetime.ready;
+}
+#else
+using WorkerControlSocket = int;
+constexpr WorkerControlSocket kInvalidWorkerControlSocket = -1;
+void closeWorkerControlSocket(WorkerControlSocket socket) {
+  if (socket != kInvalidWorkerControlSocket)
+    ::close(socket);
+}
+int workerControlSocketError() { return errno; }
+bool workerControlConnectPending(int error) {
+  return error == EINPROGRESS || error == EAGAIN || error == EWOULDBLOCK;
+}
+bool workerControlWouldBlock(int error) {
+  return error == EAGAIN || error == EWOULDBLOCK;
+}
+bool workerControlInterrupted(int error) { return error == EINTR; }
+bool setWorkerControlNonblocking(WorkerControlSocket socket) {
+  const int flags = fcntl(socket, F_GETFL, 0);
+  const int descriptorFlags = fcntl(socket, F_GETFD, 0);
+  return flags >= 0 && descriptorFlags >= 0 &&
+         fcntl(socket, F_SETFL, flags | O_NONBLOCK) == 0 &&
+         fcntl(socket, F_SETFD, descriptorFlags | FD_CLOEXEC) == 0;
+}
+bool ensureWorkerControlSockets(std::string &) { return true; }
 #endif
+
+class WorkerControlSocketHandle {
+public:
+  explicit WorkerControlSocketHandle(WorkerControlSocket socket)
+      : socket_(socket) {}
+  ~WorkerControlSocketHandle() { closeWorkerControlSocket(socket_); }
+  WorkerControlSocketHandle(const WorkerControlSocketHandle &) = delete;
+  WorkerControlSocketHandle &
+  operator=(const WorkerControlSocketHandle &) = delete;
+  WorkerControlSocket get() const { return socket_; }
+  WorkerControlSocket release() {
+    const WorkerControlSocket released = socket_;
+    socket_ = kInvalidWorkerControlSocket;
+    return released;
+  }
+
+private:
+  WorkerControlSocket socket_;
+};
+
+using WorkerControlDeadline = std::chrono::steady_clock::time_point;
+int workerControlRemainingMs(const WorkerControlDeadline &deadline) {
+  const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+                             deadline - std::chrono::steady_clock::now())
+                             .count();
+  if (remaining <= 0)
+    return 0;
+  return remaining > 0x7fffffff ? 0x7fffffff : static_cast<int>(remaining);
+}
+
+bool waitWorkerControlSocket(WorkerControlSocket socket, bool writable,
+                             const WorkerControlDeadline &deadline,
+                             std::string &err) {
+  for (;;) {
+    const int timeoutMs = workerControlRemainingMs(deadline);
+    if (timeoutMs <= 0) {
+      err = "worker control request timed out";
+      return false;
+    }
+#ifdef _WIN32
+    fd_set set;
+    FD_ZERO(&set);
+    FD_SET(socket, &set);
+    timeval timeout{};
+    timeout.tv_sec = timeoutMs / 1000;
+    timeout.tv_usec = (timeoutMs % 1000) * 1000;
+    const int ready =
+        select(0, writable ? nullptr : &set, writable ? &set : nullptr, nullptr,
+               &timeout);
+#else
+    pollfd descriptor{};
+    descriptor.fd = socket;
+    descriptor.events = writable ? POLLOUT : POLLIN;
+    const int ready = ::poll(&descriptor, 1, timeoutMs);
+#endif
+    if (ready > 0)
+      return true;
+    if (ready == 0) {
+      err = "worker control request timed out";
+      return false;
+    }
+    if (!workerControlInterrupted(workerControlSocketError())) {
+      err = "worker control socket wait failed";
+      return false;
+    }
+  }
+}
+
+bool connectWorkerControlSocket(
+    const chudware::worker::detail::ControlInfo &info,
+    const WorkerControlDeadline &deadline, WorkerControlSocket &connected,
+    std::string &err) {
+  if (!ensureWorkerControlSockets(err))
+    return false;
+#ifdef _WIN32
+  if (info.transport != chudware::worker::detail::ControlTransport::Tcp) {
+    err = "worker control transport is unavailable";
+    return false;
+  }
+  const auto colon = info.endpoint.rfind(':');
+  const unsigned short port = static_cast<unsigned short>(
+      std::strtoul(info.endpoint.c_str() + colon + 1, nullptr, 10));
+  WorkerControlSocket socket = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+#else
+  if (info.transport != chudware::worker::detail::ControlTransport::Unix) {
+    err = "worker control transport is unavailable";
+    return false;
+  }
+#if defined(SOCK_CLOEXEC)
+  WorkerControlSocket socket = ::socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+#else
+  WorkerControlSocket socket = ::socket(AF_UNIX, SOCK_STREAM, 0);
+#endif
+#endif
+  if (socket == kInvalidWorkerControlSocket) {
+    err = "worker control socket creation failed";
+    return false;
+  }
+  WorkerControlSocketHandle guard(socket);
+#if defined(__APPLE__)
+  int noSigPipe = 1;
+  if (setsockopt(socket, SOL_SOCKET, SO_NOSIGPIPE, &noSigPipe,
+                 sizeof(noSigPipe)) != 0) {
+    err = "worker control socket setup failed";
+    return false;
+  }
+#endif
+  if (!setWorkerControlNonblocking(socket)) {
+    err = "worker control socket setup failed";
+    return false;
+  }
+#ifdef _WIN32
+  sockaddr_in address{};
+  address.sin_family = AF_INET;
+  address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  address.sin_port = htons(port);
+  const int status =
+      ::connect(socket, reinterpret_cast<sockaddr *>(&address), sizeof(address));
+#else
+  sockaddr_un address{};
+  address.sun_family = AF_UNIX;
+  std::memcpy(address.sun_path, info.endpoint.c_str(), info.endpoint.size() + 1);
+  const int status =
+      ::connect(socket, reinterpret_cast<sockaddr *>(&address), sizeof(address));
+#endif
+  if (status != 0) {
+    const int connectError = workerControlSocketError();
+    if (!workerControlConnectPending(connectError) ||
+        !waitWorkerControlSocket(socket, true, deadline, err))
+      return false;
+    int completionError = 0;
+#ifdef _WIN32
+    int completionSize = sizeof(completionError);
+#else
+    socklen_t completionSize = sizeof(completionError);
+#endif
+    if (getsockopt(socket, SOL_SOCKET, SO_ERROR,
+                   reinterpret_cast<char *>(&completionError),
+                   &completionSize) != 0 ||
+        completionError != 0) {
+      err = "worker control connection failed";
+      return false;
+    }
+  }
+  connected = guard.release();
+  return true;
+}
+
+bool exchangeWorkerControl(
+    const chudware::worker::detail::ControlInfo &info, std::string &request,
+    std::string &response, std::string &err) {
+  const auto deadline = std::chrono::steady_clock::now() +
+                        std::chrono::milliseconds(
+                            chudware::worker::detail::kControlTimeoutMs);
+  WorkerControlSocket socket = kInvalidWorkerControlSocket;
+  if (!connectWorkerControlSocket(info, deadline, socket, err))
+    return false;
+  WorkerControlSocketHandle guard(socket);
+  std::size_t sent = 0;
+  while (sent < request.size()) {
+    if (!waitWorkerControlSocket(socket, true, deadline, err))
+      return false;
+#ifdef _WIN32
+    const int wrote =
+        ::send(socket, request.data() + sent,
+               static_cast<int>(request.size() - sent), 0);
+#else
+#ifdef MSG_NOSIGNAL
+    const ssize_t wrote =
+        ::send(socket, request.data() + sent, request.size() - sent,
+               MSG_NOSIGNAL);
+#else
+    const ssize_t wrote =
+        ::send(socket, request.data() + sent, request.size() - sent, 0);
+#endif
+#endif
+    if (wrote > 0) {
+      sent += static_cast<std::size_t>(wrote);
+      continue;
+    }
+    const int sendError = workerControlSocketError();
+    if (workerControlInterrupted(sendError) ||
+        workerControlWouldBlock(sendError))
+      continue;
+    err = "worker control send failed";
+    return false;
+  }
+  chudware::worker::detail::secureClear(request);
+
+  response.clear();
+  char chunk[4096];
+  for (;;) {
+    if (!waitWorkerControlSocket(socket, false, deadline, err))
+      return false;
+#ifdef _WIN32
+    const int received = ::recv(socket, chunk, sizeof(chunk), 0);
+#else
+    const ssize_t received = ::recv(socket, chunk, sizeof(chunk), 0);
+#endif
+    if (received > 0) {
+      const char *newline = static_cast<const char *>(
+          std::memchr(chunk, '\n', static_cast<std::size_t>(received)));
+      const std::size_t count =
+          newline ? static_cast<std::size_t>(newline - chunk)
+                  : static_cast<std::size_t>(received);
+      if (response.size() + count >
+          chudware::worker::detail::kControlResponseLimit) {
+        err = "worker control response exceeded limit";
+        return false;
+      }
+      response.append(chunk, count);
+      if (newline)
+        return true;
+      continue;
+    }
+    if (received == 0) {
+      err = "worker control connection closed";
+      return false;
+    }
+    const int receiveError = workerControlSocketError();
+    if (workerControlInterrupted(receiveError) ||
+        workerControlWouldBlock(receiveError))
+      continue;
+    err = "worker control receive failed";
+    return false;
+  }
+}
+#endif
+
+#endif
+class ActiveWorkerRunMarker {
+public:
+  ActiveWorkerRunMarker(std::mutex &mutex, std::string &activeRunId,
+                        std::string runId, bool engaged)
+      : mutex_(mutex), activeRunId_(activeRunId), runId_(std::move(runId)),
+        engaged_(engaged) {
+    if (engaged_) {
+      std::lock_guard<std::mutex> lock(mutex_);
+      activeRunId_ = runId_;
+    }
+  }
+  ~ActiveWorkerRunMarker() {
+    if (engaged_) {
+      std::lock_guard<std::mutex> lock(mutex_);
+      if (activeRunId_ == runId_)
+        activeRunId_.clear();
+    }
+  }
+  ActiveWorkerRunMarker(const ActiveWorkerRunMarker &) = delete;
+  ActiveWorkerRunMarker &operator=(const ActiveWorkerRunMarker &) = delete;
+
+private:
+  std::mutex &mutex_;
+  std::string &activeRunId_;
+  std::string runId_;
+  bool engaged_;
+};
+
 } // namespace
+void WorkerClient::clearWorkerControlInfo() {
+  std::lock_guard<std::mutex> lock(workerControlMtx_);
+  chudware::worker::detail::secureClear(workerControl_.token);
+  workerControl_ = {};
+}
+
+void WorkerClient::clearWorkerControlState() {
+  std::lock_guard<std::mutex> lock(workerControlMtx_);
+  chudware::worker::detail::secureClear(workerControl_.token);
+  workerControl_ = {};
+  activeWorkerRunId_.clear();
+}
+
+bool WorkerClient::installWorkerControlInfo(json &info, std::string &err) {
+  WorkerControlInfo parsed;
+#ifdef _WIN32
+  constexpr bool windows = true;
+#else
+  constexpr bool windows = false;
+#endif
+  if (!chudware::worker::detail::parseControlInfo(info, windows, parsed, err)) {
+    auto token = info.is_object() ? info.find("token") : info.end();
+    if (info.is_object() && token != info.end() && token->is_string())
+      chudware::worker::detail::secureClear(
+          token->get_ref<std::string &>());
+    return false;
+  }
+  std::lock_guard<std::mutex> lock(workerControlMtx_);
+  chudware::worker::detail::secureClear(workerControl_.token);
+  workerControl_ = std::move(parsed);
+  return true;
+}
+
+bool WorkerClient::ensureWorkerControlInfo(std::string &err) {
+  {
+    std::lock_guard<std::mutex> lock(workerControlMtx_);
+    if (workerControl_.transport !=
+            chudware::worker::detail::ControlTransport::None &&
+        !workerControl_.endpoint.empty() && !workerControl_.token.empty())
+      return true;
+  }
+  json info;
+  if (!callWorkerPipe("worker_control_info", json::object(), info, err, 5000,
+                      {}))
+    return false;
+  if (!installWorkerControlInfo(info, err)) {
+    clearWorkerControlInfo();
+    return false;
+  }
+  return true;
+}
+
+bool WorkerClient::callWorkerControl(const std::string &action,
+                                     const std::string &runId,
+                                     const json &params, bool &matched,
+                                     json &result, std::string &err) {
+  matched = false;
+  WorkerControlInfo info;
+  {
+    std::lock_guard<std::mutex> lock(workerControlMtx_);
+    if (!chudware::worker::detail::matchesActiveRun(activeWorkerRunId_, runId))
+      return false;
+    matched = true;
+    if (workerControl_.transport ==
+            chudware::worker::detail::ControlTransport::None ||
+        workerControl_.endpoint.empty() || workerControl_.token.empty()) {
+      err = "worker control endpoint unavailable for active run";
+      return false;
+    }
+    info = workerControl_;
+  }
+
+  std::string request;
+  struct SecretGuard {
+    std::string &token;
+    std::string &frame;
+    ~SecretGuard() {
+      chudware::worker::detail::secureClear(token);
+      chudware::worker::detail::secureClear(frame);
+    }
+  } secrets{info.token, request};
+  if (!chudware::worker::detail::buildControlFrame(info.token, action, params,
+                                                   request, err))
+    return false;
+#ifdef __EMSCRIPTEN__
+  err = "worker control transport is unavailable";
+  return false;
+#else
+  std::string response;
+  if (exchangeWorkerControl(info, request, response, err) &&
+      chudware::worker::detail::parseControlResponse(response, info.token,
+                                                     result, err))
+    return true;
+
+  // A failed private connection is stale for this worker generation. Keep the
+  // active run marker until its terminal stdio response so a second Stop never
+  // falls through to a concurrent read of that stream.
+  std::lock_guard<std::mutex> lock(workerControlMtx_);
+  if (workerControl_.endpoint == info.endpoint &&
+      workerControl_.token == info.token) {
+    chudware::worker::detail::secureClear(workerControl_.token);
+    workerControl_ = {};
+  }
+  return false;
+#endif
+}
+
 
 WorkerClient::~WorkerClient() { stop(); }
 
@@ -790,6 +1223,7 @@ bool allowWorkerSpawn(std::string& err) {
 }
 }  // namespace
 bool WorkerClient::start(std::string &err, const std::string &module) {
+  clearWorkerControlState();
 #ifdef __EMSCRIPTEN__
   (void)module;
   err = "WASM: Python worker not available (daemon mode only)";
@@ -964,6 +1398,7 @@ bool WorkerClient::start(std::string &err, const std::string &module) {
 }
 
 void WorkerClient::stop() {
+  clearWorkerControlState();
 #ifdef __EMSCRIPTEN__
   running_ = false;
   return;
@@ -1021,6 +1456,7 @@ void WorkerClient::stop() {
 }
 
 bool WorkerClient::terminatePoisonedWorker(std::string &err) {
+  clearWorkerControlState();
   bool terminated = true;
 #ifdef __EMSCRIPTEN__
   running_ = false;
@@ -1405,14 +1841,25 @@ bool WorkerClient::call(const std::string &method, const json &params,
 
 bool WorkerClient::callAgentCancel(const std::string &runId, json &result,
                                    std::string &err) {
-  return call("agent_cancel", json{{"run_id", runId}}, result, err, 5000);
+  const json params{{"run_id", runId}};
+  bool matched = false;
+  if (callWorkerControl("cancel", runId, params, matched, result, err))
+    return true;
+  if (matched)
+    return false;
+  return call("agent_cancel", params, result, err, 5000);
 }
 
 bool WorkerClient::callAgentSteer(const std::string &runId,
                                   const std::string &text, json &result,
                                   std::string &err) {
-  return call("agent_steer", json{{"run_id", runId}, {"text", text}}, result,
-              err, 5000);
+  const json params{{"run_id", runId}, {"text", text}};
+  bool matched = false;
+  if (callWorkerControl("steer", runId, params, matched, result, err))
+    return true;
+  if (matched)
+    return false;
+  return call("agent_steer", params, result, err, 5000);
 }
 
 bool WorkerClient::callViaSideClient(const std::string &method,
@@ -1479,8 +1926,9 @@ bool WorkerClient::callImpl(const std::string &method, const json &params,
   const bool bypassCallMutex = isAgentControl || isCppSimCancel;
   // The long streaming runs keep full serialization: two runs must never
   // overlap (they would interleave ops on the same doc in the daemon).
-  const bool isLongRun =
-      (method == "agent_run_v2" || method == "agent_mission_v1");
+  const bool isLongRun = (method == "agent_run_v2" ||
+                          method == "agent_mission_v1" ||
+                          method == "agent_admin_turn");
   std::unique_lock<std::mutex> lk(callMtx_, std::defer_lock);
   if (isCppSimCancel && engine::daemonMode()) {
     // The shared EngineClient serializes socket calls internally, so it is
@@ -1919,6 +2367,37 @@ bool WorkerClient::callImpl(const std::string &method, const json &params,
   const bool routeViaEngine = engine::daemonMode();
 #endif
   if (routeViaEngine) {
+    std::string workerRunId;
+    bool workerAgentRun = false;
+#if !defined(__EMSCRIPTEN__)
+    workerAgentRun = method == "agent_admin_turn";
+    if (workerAgentRun) {
+      workerRunId = params.is_object()
+                        ? params.value("run_id", std::string())
+                        : std::string();
+      if (workerRunId.empty()) {
+        err = "agent_admin_turn requires a non-empty run_id";
+        return false;
+      }
+      // hostd may have restarted its worker since the preceding run. Refresh
+      // through WorkerBridge before every daemon-backed long call; the private
+      // endpoint itself is then used directly for mid-call control.
+      clearWorkerControlInfo();
+      json info;
+      std::string controlErr;
+      if (!engine::call("worker_control_info", json::object(), info,
+                        controlErr, 5000) ||
+          !installWorkerControlInfo(info, controlErr)) {
+        err = controlErr.empty() ? "worker control info unavailable"
+                                 : controlErr;
+        clearWorkerControlInfo();
+        return false;
+      }
+    }
+#endif
+    ActiveWorkerRunMarker activeWorkerRun(
+        workerControlMtx_, activeWorkerRunId_, std::move(workerRunId),
+        workerAgentRun);
     std::string cerr;
     if (engine::call(method, params, result, cerr, timeoutMs, onEvent))
       return true;
@@ -1944,6 +2423,18 @@ bool WorkerClient::callImpl(const std::string &method, const json &params,
       errorSink_(method, err);
     return false;
   }
+#if defined(__EMSCRIPTEN__)
+  err = "local worker pipe is unavailable";
+  return false;
+#else
+  return callWorkerPipe(method, params, result, err, timeoutMs, onEvent);
+#endif
+}
+
+bool WorkerClient::callWorkerPipe(const std::string &method,
+                                  const json &params, json &result,
+                                  std::string &err, int timeoutMs,
+                                  const EventFn &onEvent) {
 #if !defined(__EMSCRIPTEN__)
   // Reap a worker child that died since start() (import crash, kill, OOM, …).
   // Without this, running_ stays true and every pipe write fails EPIPE —
@@ -1965,6 +2456,7 @@ bool WorkerClient::callImpl(const std::string &method, const json &params,
         childStdoutRd_ = nullptr;
       }
       running_ = false;
+      clearWorkerControlState();
     }
   }
 #else
@@ -1982,6 +2474,7 @@ bool WorkerClient::callImpl(const std::string &method, const json &params,
         childStdoutRd_ = -1;
       }
       running_ = false;
+      clearWorkerControlState();
     }
   }
 #endif
@@ -2000,6 +2493,22 @@ bool WorkerClient::callImpl(const std::string &method, const json &params,
       errorSink_(method, err); // W1-B: surface transport failures
     return false;
   }
+  const bool workerAgentRun = method == "agent_admin_turn";
+  std::string workerRunId;
+  if (workerAgentRun) {
+    workerRunId = params.is_object()
+                      ? params.value("run_id", std::string())
+                      : std::string();
+    if (workerRunId.empty()) {
+      err = "agent_admin_turn requires a non-empty run_id";
+      return false;
+    }
+    if (!ensureWorkerControlInfo(err))
+      return false;
+  }
+  ActiveWorkerRunMarker activeWorkerRun(
+      workerControlMtx_, activeWorkerRunId_, std::move(workerRunId),
+      workerAgentRun);
   int id = nextId_++;
   json req = {{"id", id}, {"method", method}, {"params", params}};
   std::string line = req.dump() + "\n";
@@ -2012,6 +2521,7 @@ bool WorkerClient::callImpl(const std::string &method, const json &params,
       (ssize_t)line.size()) {
 #endif
     err = "write failed";
+    clearWorkerControlInfo();
     if (errorSink_)
       errorSink_(method, err); // W1-B
     return false;
@@ -2020,6 +2530,7 @@ bool WorkerClient::callImpl(const std::string &method, const json &params,
     std::string resp;
     const ReadLineResult readStatus = readLine(resp, timeoutMs);
     if (readStatus != ReadLineResult::Line) {
+      clearWorkerControlInfo();
       if (abort_.load()) { // C39: teardown abort, not a worker failure
         err = "aborted";
         return false;
@@ -2104,5 +2615,13 @@ bool WorkerClient::callImpl(const std::string &method, const json &params,
       return false;
     }
   }
+#else
+  (void)method;
+  (void)params;
+  (void)result;
+  (void)timeoutMs;
+  (void)onEvent;
+  err = "local worker pipe is unavailable";
+  return false;
 #endif // !__EMSCRIPTEN__
 }

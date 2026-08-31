@@ -1,0 +1,362 @@
+"""Focused hostd tests for long-lived worker streaming and authenticated control."""
+
+from __future__ import annotations
+
+import json
+import os
+import shutil
+import signal
+import sys
+import tempfile
+import textwrap
+import threading
+import time
+import uuid
+from pathlib import Path
+
+import pytest
+
+from services.mcp import daemon_bridge
+from services.mcp.daemon_bridge import DaemonClient
+
+HOSTD = daemon_bridge.resolve_hostd_bin()
+TOKEN = "a" * 64
+
+pytestmark = pytest.mark.skipif(HOSTD is None, reason="chudware-hostd not built")
+
+
+_FAKE_WORKER = r"""
+import json
+import os
+import socket
+import sys
+import threading
+import time
+from pathlib import Path
+
+TOKEN = "a" * 64
+mode = os.environ.get("CHUDWARE_TEST_WORKER_MODE", "normal")
+control_dir = Path(os.environ["CHUDWARE_TEST_CONTROL_DIR"])
+control_dir.mkdir(parents=True, exist_ok=True)
+socket_path = control_dir / ("control-%d.sock" % os.getpid())
+counter_path = Path(os.environ["CHUDWARE_TEST_WORKER_COUNTER"])
+info_counter_path = Path(os.environ["CHUDWARE_TEST_INFO_COUNTER"])
+with counter_path.open("a", encoding="utf-8") as counter:
+    counter.write("%d\n" % os.getpid())
+
+listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+listener.bind(str(socket_path))
+os.chmod(socket_path, 0o600)
+listener.listen(4)
+listener.settimeout(0.1)
+condition = threading.Condition()
+active = {}
+stopping = threading.Event()
+
+
+def send(conn, payload):
+    encoded = (json.dumps(payload, separators=(",", ":")) + "\n").encode()
+    if hasattr(conn, "sendall"):
+        conn.sendall(encoded)
+    else:
+        conn.write(encoded)
+        conn.flush()
+
+def control_client(conn):
+    try:
+        conn.settimeout(2.0)
+        data = b""
+        while b"\n" not in data and len(data) <= 65536:
+            chunk = conn.recv(4096)
+            if not chunk:
+                return
+            data += chunk
+        request = json.loads(data.split(b"\n", 1)[0])
+        if request.get("token") != TOKEN:
+            send(conn, {"ok": False, "error": {"code": "unauthorized", "message": "unauthorized"}})
+            return
+        action = request.get("action")
+        params = request.get("params") or {}
+        with condition:
+            matched = bool(active) and params.get("run_id") == active.get("run_id")
+            if action == "cancel":
+                if matched:
+                    active["cancelled"] = True
+                    condition.notify_all()
+                result = {"cancelled": matched}
+            elif action == "steer":
+                if matched:
+                    active["steer"] = params.get("text", "")
+                    condition.notify_all()
+                result = {"steered": matched}
+            elif action == "status":
+                result = {"active": matched}
+            else:
+                send(conn, {"ok": False, "error": {"code": "invalid_action", "message": "unsupported"}})
+                return
+        send(conn, {"ok": True, "result": result})
+    finally:
+        conn.close()
+
+
+def accept_controls():
+    while not stopping.is_set():
+        try:
+            conn, _ = listener.accept()
+        except TimeoutError:
+            continue
+        except OSError:
+            return
+        threading.Thread(target=control_client, args=(conn,), daemon=True).start()
+
+
+threading.Thread(target=accept_controls, daemon=True).start()
+for raw in sys.stdin:
+    request = json.loads(raw)
+    rid = request.get("id")
+    method = request.get("method")
+    params = request.get("params") or {}
+    if method == "shutdown":
+        send(sys.stdout.buffer, {"id": rid, "ok": True, "result": {"bye": True}})
+        break
+    if method == "worker_control_info":
+        with info_counter_path.open("a", encoding="utf-8") as info_counter:
+            info_counter.write("%d\n" % os.getpid())
+        send(sys.stdout.buffer, {"id": rid, "ok": True, "result": {
+            "transport": "unix", "endpoint": str(socket_path), "token": TOKEN}})
+        continue
+    if method == "agent_admin_turn":
+        run_id = params.get("run_id", "")
+        with condition:
+            active.clear()
+            active["run_id"] = run_id
+        active_path = Path(os.environ["CHUDWARE_TEST_ACTIVE_PATH"])
+        active_path.write_text(run_id, encoding="utf-8")
+        send(sys.stdout.buffer, {"id": rid + 999, "event": "wrong", "data": {
+            "kind": "wrong_request", "run_id": run_id}})
+        send(sys.stdout.buffer, {"id": rid, "event": "run_started", "data": {
+            "kind": "run_started", "run_id": run_id, "source": "fake-worker"}})
+        send(sys.stdout.buffer, {"id": rid, "event": "agent.tool_call", "data": {
+            "kind": "agent.tool_call", "run_id": run_id, "tool_name": "fake_tool"}})
+        if mode == "die":
+            os._exit(23)
+        with condition:
+            condition.wait_for(
+                lambda: active.get("cancelled") or "steer" in active,
+                timeout=10.0,
+            )
+            if active.get("cancelled"):
+                landed = "cancel"
+            elif "steer" in active:
+                landed = "steer:" + active["steer"]
+            else:
+                landed = "timeout"
+            active.clear()
+        active_path.unlink(missing_ok=True)
+        send(sys.stdout.buffer, {"id": rid, "ok": True, "result": {
+            "done": True,
+            "control": landed,
+            "events": [{"kind": "must_not_replay"}],
+        }})
+        continue
+    if method == "worker_probe":
+        send(sys.stdout.buffer, {"id": rid, "ok": True, "result": {
+            "worker": "reached", "value": params.get("value")}})
+        continue
+    send(sys.stdout.buffer, {"id": rid, "ok": False,
+                             "error": "unknown method: " + str(method)})
+
+stopping.set()
+listener.close()
+socket_path.unlink(missing_ok=True)
+"""
+
+
+@pytest.fixture()
+def worker_daemon(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    key = "pytest-worker-" + uuid.uuid4().hex[:8]
+    worker = tmp_path / "fake-worker"
+    worker.write_text(
+        "#!" + sys.executable + "\n" + textwrap.dedent(_FAKE_WORKER),
+        encoding="utf-8",
+    )
+    data_home = Path(
+        os.environ.get("XDG_DATA_HOME") or (Path.home() / ".local" / "share")
+    )
+    log_path = data_home / "Chudware" / "logs" / "hostd.log"
+    worker.chmod(0o700)
+    counter = tmp_path / "worker-pids"
+    info_counter = tmp_path / "worker-control-info"
+    active = tmp_path / "active-run"
+    control_dir = Path(tempfile.mkdtemp(prefix="cw-control-"))
+    monkeypatch.setenv("CHUDWARE_INSTANCE_KEY", key)
+    monkeypatch.setenv("CHUDWARE_WORKER_BIN", str(worker))
+    monkeypatch.setenv("CHUDWARE_TEST_CONTROL_DIR", str(control_dir))
+    monkeypatch.setenv("CHUDWARE_TEST_WORKER_COUNTER", str(counter))
+    monkeypatch.setenv("CHUDWARE_TEST_INFO_COUNTER", str(info_counter))
+    monkeypatch.setenv("CHUDWARE_TEST_ACTIVE_PATH", str(active))
+    monkeypatch.setenv("CHUDWARE_HOSTD_LINGER_SECS", "10")
+    monkeypatch.delenv("CHUDWARE_HOSTD_SOCKET", raising=False)
+    pids: list[int] = []
+    yield {
+        "pids": pids,
+        "counter": counter,
+        "info_counter": info_counter,
+        "active": active,
+        "log_path": log_path,
+    }
+    for pid in pids:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+    shutil.rmtree(control_dir, ignore_errors=True)
+
+
+def _pid(client: DaemonClient) -> int:
+    return client.call("daemon_status")["pid"]
+
+
+def _wait_for(path: Path, timeout: float = 5.0) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if path.exists():
+            return
+        time.sleep(0.01)
+    raise AssertionError(f"timed out waiting for {path.name}")
+
+
+def _worker_count(path: Path) -> int:
+    if not path.exists():
+        return 0
+    return len(path.read_text(encoding="utf-8").splitlines())
+
+
+@pytest.mark.parametrize(
+    ("method", "params", "result_key", "terminal"),
+    [
+        ("agent_cancel", {}, "cancelled", "cancel"),
+        (
+            "agent_steer",
+            {"text": "use the rear face"},
+            "steered",
+            "steer:use the rear face",
+        ),
+    ],
+)
+def test_worker_progress_is_request_scoped_and_live_control_lands(
+    worker_daemon, method, params, result_key, terminal
+):
+    requester, observer, controller = DaemonClient(), DaemonClient(), DaemonClient()
+    requester.connect()
+    worker_daemon["pids"].append(_pid(requester))
+    observer.connect()
+    controller.connect()
+    run_id = "worker-run-1"
+    outcome: dict = {}
+
+    thread = threading.Thread(
+        target=lambda: outcome.update(
+            result=requester.call(
+                "agent_admin_turn", {"run_id": run_id, "request": "work"}
+            )
+        ),
+        daemon=True,
+    )
+    thread.start()
+    _wait_for(worker_daemon["active"])
+    active_status = controller.call("daemon_status")
+    assert active_status.get("inflight", 0) >= 1
+
+    # An exact active-run match is required. The mismatch stays on the existing
+    # core path and cannot disturb the worker turn.
+    wrong = controller.call(method, {"run_id": "another-run", **params})
+    assert wrong.get(result_key) is False
+    assert thread.is_alive()
+
+    controlled = controller.call(method, {"run_id": run_id, **params})
+    assert controlled.get(result_key) is True
+    thread.join(timeout=5.0)
+    assert not thread.is_alive()
+    assert outcome["result"]["control"] == terminal
+    assert "events" not in outcome["result"]
+
+    requester_events = requester.poll_events()
+    worker_events = [
+        event.get("data", {})
+        for event in requester_events
+        if event.get("event") == "agent.event"
+    ]
+    assert [event.get("kind") for event in worker_events] == [
+        "run_started",
+        "agent.tool_call",
+    ]
+    assert all(event.get("run_id") == run_id for event in worker_events)
+    observer.call("ping")
+    assert not any(
+        event.get("event") == "agent.event" for event in observer.poll_events()
+    )
+
+    status = controller.call("daemon_status")
+    visible = json.dumps(
+        {
+            "status": status,
+            "control": controlled,
+            "requester_events": requester_events,
+        }
+    )
+    assert TOKEN not in visible
+    log_path = worker_daemon["log_path"]
+    if log_path.exists():
+        assert TOKEN not in log_path.read_text(encoding="utf-8", errors="replace")
+
+
+def test_unknown_method_worker_fallback_contract_is_unchanged(worker_daemon):
+    client = DaemonClient()
+    client.connect()
+    worker_daemon["pids"].append(_pid(client))
+
+    assert client.call("worker_probe", {"value": 17}) == {
+        "worker": "reached",
+        "value": 17,
+    }
+    missing = client.call("definitely_missing_worker_method", {})
+    assert missing.get("_is_error") is True
+    assert missing.get("code") == "worker_error"
+    assert missing.get("message") == "unknown method: definitely_missing_worker_method"
+
+
+def test_worker_death_restarts_once_then_invalidates_control_state(
+    worker_daemon, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.setenv("CHUDWARE_TEST_WORKER_MODE", "die")
+    client = DaemonClient()
+    client.connect()
+    worker_daemon["pids"].append(_pid(client))
+
+    failed = client.call("agent_admin_turn", {"run_id": "dead-run", "request": "work"})
+    assert failed.get("_is_error") is True
+    assert _worker_count(worker_daemon["counter"]) == 2
+
+    # Both dead children have been reaped and their cached endpoint/token/run
+    # state cleared. An inactive cancel remains a core call and must not spawn a
+    # third worker merely to discover that nothing is active.
+    cancelled = client.call("agent_cancel", {"run_id": "dead-run"})
+    assert cancelled.get("cancelled") is False
+    assert _worker_count(worker_daemon["info_counter"]) == 2
+    time.sleep(0.1)
+    assert _worker_count(worker_daemon["counter"]) == 2
+
+
+def test_inactive_control_does_not_construct_worker(worker_daemon):
+    client = DaemonClient()
+    client.connect()
+    worker_daemon["pids"].append(_pid(client))
+
+    cancelled = client.call("agent_cancel", {"run_id": "never-started"})
+    steered = client.call(
+        "agent_steer", {"run_id": "never-started", "text": "new direction"}
+    )
+    assert cancelled.get("cancelled") is False
+    assert steered.get("steered") is False
+    assert _worker_count(worker_daemon["counter"]) == 0

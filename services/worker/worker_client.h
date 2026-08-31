@@ -2,11 +2,213 @@
 // JSON-RPC. Windows pipes; one synchronous request/response per call.
 #pragma once
 #include <atomic>
+#include <cstddef>
 #include <functional>
 #include <mutex>
 #include <string>
+#include <utility>
 
 #include <nlohmann/json.hpp>
+
+namespace chudware::worker::detail {
+
+constexpr std::size_t kControlRequestLimit = 64 * 1024;
+constexpr std::size_t kControlResponseLimit = 256 * 1024;
+constexpr int kControlTimeoutMs = 2500;
+
+enum class ControlTransport { None, Unix, Tcp };
+struct ControlInfo {
+    ControlTransport transport = ControlTransport::None;
+    std::string endpoint;
+    std::string token;
+};
+
+inline void secureClear(std::string& value) noexcept {
+    volatile char* bytes = value.empty() ? nullptr : &value[0];
+    for (std::size_t i = 0; i < value.size(); ++i)
+        bytes[i] = 0;
+    value.clear();
+}
+
+inline bool matchesActiveRun(const std::string& activeRunId,
+                             const std::string& requestedRunId) {
+    return !requestedRunId.empty() && activeRunId == requestedRunId;
+}
+
+inline bool parseControlInfo(nlohmann::json& value, bool windows,
+                             ControlInfo& out, std::string& err) {
+    if (!value.is_object()) {
+        err = "worker control info must be an object";
+        return false;
+    }
+    auto transportIt = value.find("transport");
+    auto endpointIt = value.find("endpoint");
+    auto tokenIt = value.find("token");
+    if (transportIt == value.end() || !transportIt->is_string() ||
+        endpointIt == value.end() || !endpointIt->is_string() ||
+        tokenIt == value.end() || !tokenIt->is_string()) {
+        err = "worker control info is incomplete";
+        return false;
+    }
+    const std::string& transport = transportIt->get_ref<const std::string&>();
+    const std::string& endpoint = endpointIt->get_ref<const std::string&>();
+    std::string& token = tokenIt->get_ref<std::string&>();
+    if (token.size() != 64) {
+        err = "worker control token is invalid";
+        return false;
+    }
+    for (char ch : token) {
+        if (!((ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f'))) {
+            err = "worker control token is invalid";
+            return false;
+        }
+    }
+    for (unsigned char ch : endpoint) {
+        if (ch < 0x20 || ch == 0x7f) {
+            err = "worker control endpoint is invalid";
+            return false;
+        }
+    }
+    ControlInfo parsed;
+    if (windows) {
+        constexpr const char* prefix = "127.0.0.1:";
+        if (transport != "tcp" || endpoint.rfind(prefix, 0) != 0 ||
+            endpoint.size() <= 10) {
+            err = "worker control TCP endpoint is invalid";
+            return false;
+        }
+        unsigned int port = 0;
+        for (std::size_t i = 10; i < endpoint.size(); ++i) {
+            const char ch = endpoint[i];
+            if (ch < '0' || ch > '9') {
+                err = "worker control TCP endpoint is invalid";
+                return false;
+            }
+            port = port * 10U + static_cast<unsigned int>(ch - '0');
+            if (port > 65535U) {
+                err = "worker control TCP endpoint is invalid";
+                return false;
+            }
+        }
+        if (port == 0) {
+            err = "worker control TCP endpoint is invalid";
+            return false;
+        }
+        parsed.transport = ControlTransport::Tcp;
+    } else {
+        // 103 bytes fits the smallest sockaddr_un::sun_path supported by the
+        // desktop targets, including its terminating NUL.
+        if (transport != "unix" || endpoint.empty() || endpoint.front() != '/' ||
+            endpoint.size() > 103) {
+            err = "worker control Unix endpoint is invalid";
+            return false;
+        }
+        parsed.transport = ControlTransport::Unix;
+    }
+    parsed.endpoint = endpoint;
+    parsed.token = std::move(token);
+    secureClear(out.token);
+    out = std::move(parsed);
+    return true;
+}
+
+inline std::string sanitizeControlError(std::string message,
+                                        const std::string& token) {
+    if (!token.empty()) {
+        for (std::size_t pos = message.find(token); pos != std::string::npos;
+             pos = message.find(token, pos + 10))
+            message.replace(pos, token.size(), "<redacted>");
+    }
+    if (message.size() > 512)
+        message.resize(512);
+    for (char& ch : message) {
+        const unsigned char byte = static_cast<unsigned char>(ch);
+        if (byte < 0x20 || byte == 0x7f)
+            ch = ' ';
+    }
+    return message;
+}
+
+inline bool buildControlFrame(const std::string& token,
+                              const std::string& action,
+                              const nlohmann::json& params,
+                              std::string& frame, std::string& err) {
+    if (action != "cancel" && action != "steer" && action != "status") {
+        err = "unsupported worker control action";
+        return false;
+    }
+    if (!params.is_object()) {
+        err = "worker control params must be an object";
+        return false;
+    }
+    std::string paramsText;
+    try {
+        paramsText = params.dump();
+    } catch (...) {
+        err = "worker control params are not serializable";
+        return false;
+    }
+    frame.clear();
+    frame.reserve(token.size() + action.size() + paramsText.size() + 40);
+    frame = "{\"token\":\"";
+    frame += token;
+    frame += "\",\"action\":\"";
+    frame += action;
+    frame += "\",\"params\":";
+    frame += paramsText;
+    frame += "}\n";
+    if (frame.size() > kControlRequestLimit) {
+        secureClear(frame);
+        err = "worker control request exceeded limit";
+        return false;
+    }
+    return true;
+}
+
+inline bool parseControlResponse(const std::string& frame,
+                                 const std::string& token,
+                                 nlohmann::json& result, std::string& err) {
+    if (frame.size() > kControlResponseLimit) {
+        err = "worker control response exceeded limit";
+        return false;
+    }
+    nlohmann::json response;
+    try {
+        response = nlohmann::json::parse(frame);
+    } catch (...) {
+        err = "worker control returned malformed JSON";
+        return false;
+    }
+    if (!response.is_object()) {
+        err = "worker control returned malformed response";
+        return false;
+    }
+    auto okIt = response.find("ok");
+    if (okIt == response.end() || !okIt->is_boolean()) {
+        err = "worker control returned malformed response";
+        return false;
+    }
+    if (okIt->get<bool>()) {
+        auto it = response.find("result");
+        if (it == response.end() || !it->is_object()) {
+            err = "worker control returned malformed result";
+            return false;
+        }
+        result = *it;
+        return true;
+    }
+    auto errorIt = response.find("error");
+    std::string message = "worker control request failed";
+    if (errorIt != response.end() && errorIt->is_object()) {
+        auto messageIt = errorIt->find("message");
+        if (messageIt != errorIt->end() && messageIt->is_string())
+            message = messageIt->get<std::string>();
+    }
+    err = sanitizeControlError(std::move(message), token);
+    return false;
+}
+
+} // namespace chudware::worker::detail
 
 class WorkerClient {
 public:
@@ -91,6 +293,23 @@ private:
     bool callViaSideClient(const std::string& method, const nlohmann::json& params,
                            nlohmann::json& result, std::string& err, int timeoutMs,
                            const EventFn& onEvent);
+    // Local-worker pipe body. callImpl owns callMtx_ before entering this path;
+    // keeping the pipe exchange separate lets agent_admin_turn synchronously
+    // obtain worker_control_info on the same serialized stream before its long
+    // request starts.
+    bool callWorkerPipe(const std::string& method, const nlohmann::json& params,
+                        nlohmann::json& result, std::string& err, int timeoutMs,
+                        const EventFn& onEvent);
+
+    using WorkerControlInfo = chudware::worker::detail::ControlInfo;
+    bool ensureWorkerControlInfo(std::string& err);
+    bool installWorkerControlInfo(nlohmann::json& info, std::string& err);
+    bool callWorkerControl(const std::string& action, const std::string& runId,
+                           const nlohmann::json& params, bool& matched,
+                           nlohmann::json& result, std::string& err);
+    void clearWorkerControlInfo();
+    void clearWorkerControlState();
+
 
     enum class ReadLineResult { Line, Timeout, Closed };
     ReadLineResult readLine(std::string& line, int timeoutMs);
@@ -114,4 +333,9 @@ private:
     std::mutex callMtx_;             // serialize concurrent call()s
     ErrorSink errorSink_;            // W1-B: transport-error notification (optional)
     std::atomic<bool> abort_{false}; // C39: teardown abort (one-way; see abortPending)
+    // Independent from callMtx_: cancel/steer must snapshot the authenticated
+    // endpoint while the long stdio request owns callMtx_ and reads stdout.
+    std::mutex workerControlMtx_;
+    WorkerControlInfo workerControl_;
+    std::string activeWorkerRunId_;
 };

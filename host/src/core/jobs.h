@@ -10,11 +10,12 @@
 class WorkerClient;
 struct JobState;
 
-// --- C22b: launch agent_run_v2 on a background thread ---
-// Streams orchestrator events (run_started / stage_started / agent_call / agent_output /
-// stage_result / run_finished) through job->events with kind prefixed "orch_" so the
-// main-thread drain can route them to the Agent Workflow DAG store + the conversation's
-// inline activity timeline, separately from legacy iteration events.
+// Online launches call the long-lived services worker's `agent_admin_turn`. Explicit offline
+// launches alone retain the native core methods. Both paths stream orchestrator events
+// (run_started / stage_started / agent_call / agent_output / stage_result / run_finished)
+// through job->events with kind prefixed "orch_" so the main-thread drain can route them to
+// the Agent Workflow DAG store + the conversation's inline activity timeline.
+//
 // `job` is the run slot BOUND to `convId` (see AppState::runFor/activeRun) — JobState is
 // non-copyable, so it is always passed/held by shared_ptr; the detached worker thread captures
 // it by value so the JobState outlives the run even if AppState::runs rehashes. Refuses (no-op)
@@ -23,23 +24,31 @@ struct JobState;
 // event and the final result route back to the owning conversation, never by scanning whichever
 // conversation happens to be on screen.
 // `cam` (set when the copilot is launched from the Manufacture workspace) routes generic
-// "make a program"-style requests to the core's CAM fast-path on the current part.
-// `extra` (O1/M23 + mode overhaul): additional top-level params merged into the RPC payload —
-// the GUI threads the model picker's provider/model/reasoning_effort override, composer
-// attachments, and an `options` object (mode/plan_only/approved_plan/execute_as/
-// corporate_force/scope/advisor) which is deep-merged under params["options"]. Empty object
-// = no extra fields.
+// "make a program"-style requests to the current part's CAM tools.
+// `extra` carries the model picker's provider/model/reasoning_effort override, attachments,
+// actor fields, and an `options` object. Online routing preserves that object and flattens its
+// worker-facing fields (history/session/workspace/mode/context) into `agent_admin_turn`.
+struct AgentJobRpcRoute {
+    std::string method;
+    nlohmann::json params = nlohmann::json::object();
+    bool online = true;
+};
+
+AgentJobRpcRoute buildAgentJobRpcRoute(const std::string& request, const std::string& docId,
+                                      const std::string& convId, bool cam,
+                                      const nlohmann::json& extra, bool mission);
+nlohmann::json normalizeAgentAdminTurnResult(const nlohmann::json& result, bool mission);
+void consumeAgentJobEvent(const std::shared_ptr<JobState>& job, const nlohmann::json& data,
+                          bool mission);
 void launchAgentRunV2(WorkerClient& w, std::shared_ptr<JobState> job,
                       const std::string& convId, const std::string& docKey,
                       const std::string& request, const std::string& docId, bool cam = false,
                       const nlohmann::json& extra = nlohmann::json::object());
 
-// --- Mission orchestrator launcher ---
-// Runs agent_mission_v1 on a background thread: the core decomposes the request into an ordered
-// capability chain (design/assembly -> CFD -> verdict), threads the working doc forward, and
-// returns {..., verdict, tasks, created_doc?, asm_path?}. Streams the same "orch_"-prefixed events
-// as launchAgentRunV2 (plus mission_* kinds) and stashes the verdict into job->missionVerdict.
-// See launchAgentRunV2 above for the job/convId/docKey binding contract.
+// Mission launcher. Online missions use the same `agent_admin_turn` entry as normal runs, with
+// mode=swarm and corporate_force=true; explicit offline missions retain the native
+// `agent_mission_v1` path. Mission-specific verdict/task fields are still stashed onto
+// JobState for the existing main-thread drain.
 void launchMissionRun(WorkerClient& w, std::shared_ptr<JobState> job,
                       const std::string& convId, const std::string& docKey,
                       const std::string& request, const std::string& docId,

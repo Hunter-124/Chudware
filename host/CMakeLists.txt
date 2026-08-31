@@ -626,6 +626,42 @@ add_test(NAME test_img_tex
   WORKING_DIRECTORY "${CMAKE_BINARY_DIR}")
 # --- end RE-08 ---
 
+# Authenticated private worker-control framing/endpoint codec (GL-free).
+add_executable(test_worker_control tests/test_worker_control.cpp)
+target_include_directories(test_worker_control PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/../services/worker)
+target_link_libraries(test_worker_control PRIVATE nlohmann_json::nlohmann_json)
+set_target_properties(test_worker_control PROPERTIES
+  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+add_test(NAME test_worker_control COMMAND test_worker_control)
+
+# Online agent_admin_turn routing/result/event contract. jobs.cpp also owns the
+# detached launchers; function sections let this GL-free target retain only the
+# pure routing helpers under test without linking the desktop/worker runtime.
+add_executable(test_agent_job_routing
+  tests/test_agent_job_routing.cpp
+  src/core/jobs.cpp)
+target_include_directories(test_agent_job_routing PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/src
+  ${CMAKE_CURRENT_SOURCE_DIR}/../core
+  ${CMAKE_CURRENT_SOURCE_DIR}/../services/worker
+  ${CMAKE_CURRENT_SOURCE_DIR}/../extern/glad/include
+  ${imgui_SOURCE_DIR})
+target_link_libraries(test_agent_job_routing PRIVATE nlohmann_json::nlohmann_json)
+if(MSVC)
+  target_compile_options(test_agent_job_routing PRIVATE /Gy)
+  target_link_options(test_agent_job_routing PRIVATE /OPT:REF)
+elseif(APPLE)
+  target_compile_options(test_agent_job_routing PRIVATE -ffunction-sections -fdata-sections)
+  target_link_options(test_agent_job_routing PRIVATE -Wl,-dead_strip)
+else()
+  target_compile_options(test_agent_job_routing PRIVATE -ffunction-sections -fdata-sections)
+  target_link_options(test_agent_job_routing PRIVATE -Wl,--gc-sections)
+endif()
+set_target_properties(test_agent_job_routing PROPERTIES
+  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+add_test(NAME test_agent_job_routing COMMAND test_agent_job_routing)
+
 add_executable(test_entitlement_commands
   tests/test_entitlement_commands.cpp
   src/ui/ribbon_def.cpp)

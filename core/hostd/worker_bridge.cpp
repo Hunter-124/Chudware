@@ -17,7 +17,7 @@ std::atomic<bool> WorkerBridge::created_{false};
 
 WorkerBridge& WorkerBridge::instance() {
     static WorkerBridge inst;
-    created_.store(true, std::memory_order_relaxed);
+    created_.store(true, std::memory_order_release);
     return inst;
 }
 
@@ -30,7 +30,16 @@ void WorkerBridge::shutdownIfCreated() {
 }
 
 bool WorkerBridge::call(const std::string& /*method*/, const nlohmann::json& /*params*/,
-                        nlohmann::json& /*result*/, std::string& err, int /*timeoutMs*/) {
+                        nlohmann::json& /*result*/, std::string& err, int /*timeoutMs*/,
+                        const EventFn& /*onEvent*/) {
+    err = "worker bridge unavailable on Windows";
+    return false;
+}
+
+bool WorkerBridge::controlActiveRun(const std::string& /*action*/,
+                                    const nlohmann::json& /*params*/, bool& matched,
+                                    nlohmann::json& /*result*/, std::string& err) {
+    matched = false;
     err = "worker bridge unavailable on Windows";
     return false;
 }
@@ -38,15 +47,18 @@ bool WorkerBridge::call(const std::string& /*method*/, const nlohmann::json& /*p
 }  // namespace hostd
 
 #else  // !_WIN32
-
+#include <algorithm>
 #include <chrono>
 #include <filesystem>
+#include <stdexcept>
 #include <thread>
 
 #include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
 #include <signal.h>
+#include <sys/socket.h>
+#include <sys/un.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -102,13 +114,229 @@ bool sameCanonicalPath(const std::string& left, const std::string& right) {
     const auto canonicalRight = std::filesystem::weakly_canonical(right, rightEc);
     return !leftEc && !rightEc && canonicalLeft == canonicalRight;
 }
+
+constexpr size_t kControlRequestLimit = 64 * 1024;
+constexpr size_t kControlResponseLimit = 256 * 1024;
+constexpr auto kControlTimeout = std::chrono::milliseconds(2500);
+
+void wipeString(std::string& value) {
+    volatile char* p = value.empty() ? nullptr : value.data();
+    for (size_t i = 0; i < value.size(); ++i) p[i] = 0;
+    value.clear();
+}
+
+bool validControlToken(const std::string& token) {
+    return token.size() == 64 &&
+           std::all_of(token.begin(), token.end(), [](unsigned char c) {
+               return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f');
+           });
+}
+
+struct SensitiveLine {
+    std::string value;
+    ~SensitiveLine() { wipeString(value); }
+};
+
+bool validControlInfo(const std::string& transport, const std::string& endpoint,
+                      const std::string& token) {
+    if (!validControlToken(token) || transport != "unix" || endpoint.empty() ||
+        endpoint.front() != '/' || endpoint.size() > 103)
+        return false;
+    return std::none_of(endpoint.begin(), endpoint.end(), [](unsigned char c) {
+        return c < 0x20 || c == 0x7f;
+    });
+}
+
+int remainingMs(const std::chrono::steady_clock::time_point deadline) {
+    const auto left = std::chrono::duration_cast<std::chrono::milliseconds>(
+                          deadline - std::chrono::steady_clock::now())
+                          .count();
+    if (left <= 0) return 0;
+    return static_cast<int>(std::min<long long>(left, 2500));
+}
+
+bool waitSocket(int fd, short events,
+                const std::chrono::steady_clock::time_point deadline) {
+    for (;;) {
+        const int timeout = remainingMs(deadline);
+        if (timeout <= 0) return false;
+        pollfd pfd{fd, events, 0};
+        const int rc = ::poll(&pfd, 1, timeout);
+        if (rc > 0) return (pfd.revents & events) != 0;
+        if (rc == 0) return false;
+        if (errno != EINTR) return false;
+    }
+}
+
+bool sendControlRequest(const std::string& transport, const std::string& endpoint,
+                        const std::string& token, const std::string& action,
+                        const json& params, json& result, std::string& err) {
+    result = json::object();
+    err.clear();
+    if (!validControlInfo(transport, endpoint, token) ||
+        (action != "cancel" && action != "steer" && action != "status") ||
+        !params.is_object()) {
+        err = "worker control information is invalid";
+        return false;
+    }
+    SensitiveLine request;
+    std::string paramsText;
+    try {
+        paramsText = params.dump();
+        request.value.reserve(token.size() + action.size() + paramsText.size() + 40);
+        request.value = "{\"token\":\"";
+        request.value += token;
+        request.value += "\",\"action\":\"";
+        request.value += action;
+        request.value += "\",\"params\":";
+        request.value += paramsText;
+        request.value += "}\n";
+    } catch (...) {
+        err = "worker control params are not serializable";
+        return false;
+    }
+    if (request.value.size() > kControlRequestLimit) {
+        err = "worker control request exceeded limit";
+        return false;
+    }
+
+    const int fd = ::socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0) {
+        err = "worker control socket failed";
+        return false;
+    }
+    fcntl(fd, F_SETFD, FD_CLOEXEC);
+    const int flags = fcntl(fd, F_GETFL, 0);
+    if (flags < 0 || fcntl(fd, F_SETFL, flags | O_NONBLOCK) != 0) {
+        ::close(fd);
+        err = "worker control socket setup failed";
+        return false;
+    }
+
+    const auto deadline = std::chrono::steady_clock::now() + kControlTimeout;
+    sockaddr_un address{};
+    address.sun_family = AF_UNIX;
+    std::memcpy(address.sun_path, endpoint.data(), endpoint.size());
+    address.sun_path[endpoint.size()] = '\0';
+    const int connected =
+        ::connect(fd, reinterpret_cast<const sockaddr*>(&address), sizeof(address));
+    if (connected != 0) {
+        if (errno != EINPROGRESS || !waitSocket(fd, POLLOUT, deadline)) {
+            ::close(fd);
+            err = "worker control connect failed";
+            return false;
+        }
+        int socketError = 0;
+        socklen_t errorSize = sizeof(socketError);
+        if (::getsockopt(fd, SOL_SOCKET, SO_ERROR, &socketError, &errorSize) != 0 ||
+            socketError != 0) {
+            ::close(fd);
+            err = "worker control connect failed";
+            return false;
+        }
+    }
+
+    size_t sent = 0;
+    while (sent < request.value.size()) {
+        if (!waitSocket(fd, POLLOUT, deadline)) {
+            ::close(fd);
+            err = "worker control send timed out";
+            return false;
+        }
+#ifdef MSG_NOSIGNAL
+        const ssize_t count =
+            ::send(fd, request.value.data() + sent, request.value.size() - sent,
+                   MSG_NOSIGNAL);
+#else
+        const ssize_t count =
+            ::send(fd, request.value.data() + sent, request.value.size() - sent, 0);
+#endif
+        if (count > 0) {
+            sent += static_cast<size_t>(count);
+            continue;
+        }
+        if (count < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR))
+            continue;
+        ::close(fd);
+        err = "worker control send failed";
+        return false;
+    }
+
+    std::string response;
+    for (;;) {
+        const size_t newline = response.find('\n');
+        if (newline != std::string::npos) {
+            if (newline > kControlResponseLimit) {
+                ::close(fd);
+                err = "worker control response exceeded limit";
+                return false;
+            }
+            response.resize(newline);
+            break;
+        }
+        if (response.size() > kControlResponseLimit) {
+            ::close(fd);
+            err = "worker control response exceeded limit";
+            return false;
+        }
+        if (!waitSocket(fd, POLLIN, deadline)) {
+            ::close(fd);
+            err = "worker control response timed out";
+            return false;
+        }
+        char chunk[4096];
+        const ssize_t count = ::recv(fd, chunk, sizeof(chunk), 0);
+        if (count > 0) {
+            response.append(chunk, static_cast<size_t>(count));
+            continue;
+        }
+        if (count < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR))
+            continue;
+        ::close(fd);
+        err = "worker control response closed";
+        return false;
+    }
+    ::close(fd);
+
+    if (response.find(token) != std::string::npos) {
+        err = "worker control response exposed authentication material";
+        return false;
+    }
+    json decoded;
+    try {
+        decoded = json::parse(response);
+    } catch (...) {
+        err = "worker control response was invalid";
+        return false;
+    }
+    if (!decoded.is_object()) {
+        err = "worker control response was invalid";
+        return false;
+    }
+    const auto ok = decoded.find("ok");
+    if (ok == decoded.end() || !ok->is_boolean()) {
+        err = "worker control response was invalid";
+        return false;
+    }
+    if (!ok->get<bool>()) {
+        err = "worker control request failed";
+        return false;
+    }
+    const auto it = decoded.find("result");
+    if (it == decoded.end() || !it->is_object()) {
+        err = "worker control response was invalid";
+        return false;
+    }
+    result = *it;
+    return true;
+}
 }  // namespace
 
 std::atomic<bool> WorkerBridge::created_{false};
 
 WorkerBridge& WorkerBridge::instance() {
     static WorkerBridge inst;
-    created_.store(true, std::memory_order_relaxed);
+    created_.store(true, std::memory_order_release);
     return inst;
 }
 
@@ -118,8 +346,62 @@ void WorkerBridge::shutdownIfCreated() {
 
 WorkerBridge::~WorkerBridge() { stop(); }
 
+void WorkerBridge::clearActiveRun() {
+    std::lock_guard<std::mutex> lk(controlMtx_);
+    wipeString(activeWorkerRunId_);
+}
+
+void WorkerBridge::clearControlState() {
+    std::lock_guard<std::mutex> lk(controlMtx_);
+    wipeString(control_.token);
+    wipeString(control_.endpoint);
+    wipeString(control_.transport);
+    wipeString(activeWorkerRunId_);
+}
+
+bool WorkerBridge::controlActiveRun(const std::string& action, const json& params,
+                                    bool& matched, json& result, std::string& err) {
+    matched = false;
+    if (!created_.load(std::memory_order_acquire)) {
+        err.clear();
+        return false;
+    }
+    return instance().controlActiveRunImpl(action, params, matched, result, err);
+}
+
+bool WorkerBridge::controlActiveRunImpl(const std::string& action, const json& params,
+                                        bool& matched, json& result, std::string& err) {
+    matched = false;
+    result = json::object();
+    err.clear();
+    if (!params.is_object()) return false;
+    const auto runIt = params.find("run_id");
+    if (runIt == params.end() || !runIt->is_string()) return false;
+    const std::string runId = runIt->get<std::string>();
+    if (runId.empty()) return false;
+
+    std::lock_guard<std::mutex> lk(controlMtx_);
+    if (activeWorkerRunId_ != runId) return false;
+    matched = true;
+    if (control_.token.empty()) {
+        err = "worker control endpoint unavailable for active run";
+        return false;
+    }
+    if (sendControlRequest(control_.transport, control_.endpoint, control_.token,
+                           action, params, result, err))
+        return true;
+
+    // An endpoint/protocol failure invalidates the credential cache, but the
+    // run remains active until its stdio call returns or child teardown.
+    wipeString(control_.token);
+    wipeString(control_.endpoint);
+    wipeString(control_.transport);
+    return false;
+}
+
 void WorkerBridge::stop() {
     std::lock_guard<std::mutex> lk(mtx_);
+    clearControlState();
     if (!running_ && process_ < 0 && childStdinWr_ < 0 && childStdoutRd_ < 0) return;
     // Soft shutdown request, then reap (mirrors worker_client.cpp stop()).
     if (childStdinWr_ >= 0) {
@@ -180,6 +462,7 @@ void WorkerBridge::reap() {
     }
     readBuf_.clear();
     running_ = false;
+    clearControlState();
 }
 
 namespace {
@@ -382,15 +665,66 @@ bool WorkerBridge::readLine(std::string& line, int timeoutMs) {
         if (got > 0) {
             readBuf_.append(chunk, (size_t)got);
         } else if (got == 0) {
+            ::close(childStdoutRd_);
+            childStdoutRd_ = -1;
             return false;  // EOF
         } else if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
+            ::close(childStdoutRd_);
+            childStdoutRd_ = -1;
             return false;
         }
     }
 }
 
+bool WorkerBridge::fetchControlInfo(std::string& err) {
+    {
+        std::lock_guard<std::mutex> lk(controlMtx_);
+        if (!control_.token.empty()) return true;
+    }
+
+    json info;
+    std::string infoErr;
+    if (!callOnce("worker_control_info", json::object(), info, infoErr, 5000, {})) {
+        err = infoErr.empty() ? "worker control information unavailable" : infoErr;
+        return false;
+    }
+
+    const auto wipeInfoToken = [&info] {
+        if (!info.is_object()) return;
+        const auto token = info.find("token");
+        if (token != info.end() && token->is_string())
+            wipeString(token->get_ref<std::string&>());
+    };
+    ControlInfo next;
+    try {
+        if (!info.is_object()) throw std::runtime_error("invalid");
+        next.transport = info.at("transport").get<std::string>();
+        next.endpoint = info.at("endpoint").get<std::string>();
+        next.token = info.at("token").get<std::string>();
+    } catch (...) {
+        wipeInfoToken();
+        wipeString(next.token);
+        err = "worker control information is invalid";
+        return false;
+    }
+    wipeInfoToken();
+    if (!validControlInfo(next.transport, next.endpoint, next.token)) {
+        wipeString(next.token);
+        wipeString(next.endpoint);
+        wipeString(next.transport);
+        err = "worker control information is invalid";
+        return false;
+    }
+    {
+        std::lock_guard<std::mutex> lk(controlMtx_);
+        wipeString(control_.token);
+        control_ = std::move(next);
+    }
+    return true;
+}
+
 bool WorkerBridge::callOnce(const std::string& method, const json& params, json& result,
-                            std::string& err, int timeoutMs) {
+                            std::string& err, int timeoutMs, const EventFn& onEvent) {
     if (!running_) {
         if (!spawn(err)) return false;
     }
@@ -439,8 +773,18 @@ bool WorkerBridge::callOnce(const std::string& method, const json& params, json&
         }
         if (rid != id) continue;
 
-        // Streamed progress notification (no "ok"): ignore and keep waiting.
-        if (j.contains("event") && !j.contains("ok")) continue;
+        // Matching streamed progress is delivered once, before the terminal response.
+        if (j.contains("event") && j.contains("data") && !j.contains("ok")) {
+            if (onEvent) {
+                try {
+                    onEvent(j["data"]);
+                } catch (...) {
+                    // Event delivery is transparency only; it must not poison the
+                    // worker transport or turn an eventual success into failure.
+                }
+            }
+            continue;
+        }
 
         if (j.value("ok", false)) {
             result = j.value("result", json::object());
@@ -463,7 +807,7 @@ bool WorkerBridge::callOnce(const std::string& method, const json& params, json&
 }
 
 bool WorkerBridge::call(const std::string& method, const json& params, json& result,
-                        std::string& err, int timeoutMs) {
+                        std::string& err, int timeoutMs, const EventFn& onEvent) {
     // Serialize the single stdio channel. Only this mutex is held — never a
     // Server-wide lock — so other client threads keep dispatching engine RPCs.
     std::lock_guard<std::mutex> lk(mtx_);
@@ -471,16 +815,52 @@ bool WorkerBridge::call(const std::string& method, const json& params, json& res
     err.clear();
     if (timeoutMs <= 0) timeoutMs = 120000;
 
+    const bool longAgentTurn = method == "agent_admin_turn";
+    std::string runId;
+    if (longAgentTurn && params.is_object()) {
+        const auto runIt = params.find("run_id");
+        if (runIt != params.end() && runIt->is_string()) runId = runIt->get<std::string>();
+    }
+    if (longAgentTurn && runId.empty()) {
+        err = "agent_admin_turn requires a non-empty run_id";
+        return false;
+    }
+
     // Child died (write fail/EOF) → reap + respawn once, then fail.
     // Timeouts and method-level errors do NOT respawn.
     for (int attempt = 0; attempt < 2; ++attempt) {
         std::string attemptErr;
-        if (callOnce(method, params, result, attemptErr, timeoutMs)) return true;
+        result = json::object();
 
+        // The authenticated side channel must be known before an online turn
+        // starts. Otherwise stdio would be occupied by an uncancellable call.
+        if (longAgentTurn && !fetchControlInfo(attemptErr)) {
+            const bool childDead =
+                attemptErr == "write failed" || attemptErr == "closed waiting for response";
+            if (!childDead) {
+                err = std::move(attemptErr);
+                return false;
+            }
+            log().line("worker_bridge: child lost before %s; %s", method.c_str(),
+                       attempt == 0 ? "respawning once" : "giving up");
+            reap();
+            err = std::move(attemptErr);
+            if (attempt == 1) return false;
+            continue;
+        }
+
+        if (longAgentTurn) {
+            std::lock_guard<std::mutex> controlLock(controlMtx_);
+            activeWorkerRunId_ = runId;
+        }
+        const bool ok =
+            callOnce(method, params, result, attemptErr, timeoutMs, onEvent);
+        clearActiveRun();
         const bool childDead =
             attemptErr == "write failed" || attemptErr == "closed waiting for response";
-        // Method-level errors (ok:false with structured code) are final.
         const bool methodError = result.is_object() && result.contains("code");
+        if (ok) return true;
+
         if (methodError || !childDead) {
             err = std::move(attemptErr);
             return false;
@@ -490,7 +870,7 @@ bool WorkerBridge::call(const std::string& method, const json& params, json& res
         reap();
         err = std::move(attemptErr);
         if (attempt == 1) return false;
-        // loop: respawn inside next callOnce
+        // loop: respawn inside fetchControlInfo/callOnce
     }
     return false;
 }

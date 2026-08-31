@@ -865,6 +865,26 @@ json Server::dispatch(ClientConn& c, const std::string& method, const json& para
             return result;
     }
 
+    // An online worker turn occupies its stdio channel for the full run. Route
+    // matching cancel/steer through the worker's authenticated side channel
+    // first; when no such worker run is active, preserve the core control path.
+    if (method == "agent_cancel" || method == "agent_steer") {
+        json controlResult;
+        std::string controlErr;
+        bool workerRunMatched = false;
+        const char* action = method == "agent_cancel" ? "cancel" : "steer";
+        if (WorkerBridge::controlActiveRun(action, params, workerRunMatched,
+                                           controlResult, controlErr))
+            return controlResult;
+        if (workerRunMatched) {
+            isError = true;
+            return json{{"code", "worker_control_error"},
+                        {"message", controlErr.empty()
+                                        ? std::string("worker control request failed")
+                                        : controlErr}};
+        }
+    }
+
     // Engine passthrough.
     const int st = status_.engineState.load();
     if (st == 0) {
@@ -914,7 +934,6 @@ json Server::dispatch(ClientConn& c, const std::string& method, const json& para
     if (publishDocsThis)
         core::cpp_core().setDocPublishSink(&Server::docPublishThunk, &dctx);
     const bool engineOk = core::cpp_core().call(method, p, result, err);
-    endInflight(c.id);
     if (!engineOk) {
         // Engine-unknown only: forward to the lazily-spawned Python worker
         // (plm_*, git_*, ai_roles_*, provider accounts, …). Known-method
@@ -929,9 +948,27 @@ json Server::dispatch(ClientConn& c, const std::string& method, const json& para
         if (unknown) {
             json wresult;
             std::string werr;
-            if (WorkerBridge::instance().call(method, p, wresult, werr)) {
-                // Worker success: return result verbatim. No registry postCall —
-                // these methods are not engine doc ops.
+            WorkerBridge::EventFn workerEvent;
+            if (streamThis) {
+                const int requester = c.id;
+                workerEvent = [this, requester](const json& data) {
+                    const std::string encoded = data.dump();
+                    sendAgentEvent(requester, encoded.c_str());
+                };
+            }
+            // jobs.cpp gives online turns a 15-minute ceiling. The daemon
+            // transport cannot carry that client-side timeout through, so keep
+            // the same bound here instead of truncating a live turn at 120 s.
+            const int workerTimeoutMs =
+                method == "agent_admin_turn" ? 900000 : 120000;
+            const bool workerOk =
+                WorkerBridge::instance().call(method, p, wresult, werr,
+                                              workerTimeoutMs, workerEvent);
+            endInflight(c.id);
+            if (workerOk) {
+                // Worker success: return result verbatim except any legacy
+                // batched event copy; matching progress already streamed live.
+                if (streamThis && wresult.is_object()) wresult.erase("events");
                 return wresult;
             }
             isError = true;
@@ -947,6 +984,7 @@ json Server::dispatch(ClientConn& c, const std::string& method, const json& para
             return json{{"code", "worker_error"},
                         {"message", !werr.empty() ? werr : std::string("worker bridge failed")}};
         }
+        endInflight(c.id);
         isError = true;
         // Normalize: clients (CoreError mapping) rely on a "message" field. Keep
         // whatever in-band payload the engine produced ({"error":...}, OpError
@@ -960,6 +998,7 @@ json Server::dispatch(ClientConn& c, const std::string& method, const json& para
         if (!e.contains("code")) e["code"] = "engine_error";
         return e;
     }
+    endInflight(c.id);
     // Live-streamed above (streamThis) -> the batched result["events"] copy is now redundant.
     // Drop it so a streaming client (which renders the live agent.event push) never double-
     // renders the run. (Same-build deploy: every client understands the push.)

@@ -217,11 +217,10 @@ bool drawChatInput(const char* id, std::vector<char>& buf, const char* placehold
 namespace ui {
 
 // ---- O1: model picker → RPC payload threading --------------------------------------------------
-// Canonical provider NAME for the core's resolve_provider(name, cfg, env) from the GUI enum.
-// PROV_LOCAL resolves as an "openai" descriptor — the base_url (persisted to config.json by
-// saveSettings immediately before every send) discriminates local vs cloud. PROV_CLOUDCOMPAT is
-// a SHARED slot serving many services; this returns only its generic fallback, and
-// agentProviderOverride refines it to the real service via ui::cloudServiceKey(base_url).
+// Canonical provider name sent to the long-lived worker from the GUI enum. PROV_LOCAL uses the
+// OpenAI-compatible wire family — base_url (persisted before every send) discriminates local from
+// cloud. PROV_CLOUDCOMPAT is a shared slot serving many services; agentProviderOverride refines
+// it to the selected service via ui::cloudServiceKey(base_url).
 static const char* providerWireName(int provider) {
     switch (provider) {
         case ui::PROV_ANTHROPIC:   return "anthropic";
@@ -232,27 +231,22 @@ static const char* providerWireName(int provider) {
         case ui::PROV_GEMINI:      return "gemini";
         case ui::PROV_XAI:         return "xai";  // saveSettings rewrites to xai-sub when no key
         case ui::PROV_CURSOR:      return "cursor";
-        // Kimi Code — OMP-bridge provider id. The old "kimi-sub" spelling is a PYTHON
-        // subscription-provider id (services/agent/providers/kimi_sub_provider.py): the C++
-        // resolve_provider has no branch for it and it is absent from kOmpBridgeProviders, so
-        // every send from this slot died on "Unknown provider: 'kimi-sub'".
+        // Kimi Code uses the worker-facing "kimi-code" provider id; the older "kimi-sub"
+        // spelling belongs to the retired Python subscription-provider path.
         case ui::PROV_KIMISUB:     return "kimi-code";
-        // ZenMux — OMP-bridge provider id, routed through the bun bridge (core/agent/providers.cpp
-        // is_omp_bridge_provider) using its own auth db, not a config.json key. Default provider.
+        // ZenMux keeps its catalog provider id when sent to the long-lived worker.
         case ui::PROV_ZENMUX:      return "zenmux";
-        // Free AI (FreeLLMAPI) — native wire "freellmapi" (core/agent/providers.cpp +
-        // config.cpp), own config namespace, always cloud-classified.
+        // Free AI (FreeLLMAPI) keeps its own worker provider namespace.
         case ui::PROV_FREELLMAPI:  return "freellmapi";
     }
     return "";
 }
 
-// The explicit provider/model/effort override the GUI now attaches to EVERY agent-turn RPC
-// (agent_run_v2 / agent_ask_v2 / agent_clarify_v1 / agent_mission_v1). Without it the core
-// resolves from ambient config.json + process env, so an CHUDWARE_PROVIDER env var (or a config
-// edited behind the GUI's back) silently beat the picker (tracker O1). saveSettings still runs
-// before each send so descriptor details (base_url / api_key / model_path) match the picker;
-// these fields pin name + model + effort explicitly on top of that.
+// The GUI pins provider/model/effort on every agent-turn request. Online design and mission
+// launches are centralized through jobs.cpp's `agent_admin_turn` route; explicit offline mode
+// alone retains the native core method. saveSettings still runs before each send so descriptor
+// details (base_url / api_key / model_path) match the picker, while these fields pin the selected
+// provider, model, and effort into the worker request.
 // Effort ladder for the picker's current model, OMP bridge catalog first (dynamic — K3 is
 // low|high|max, current Claude low|medium|high|xhigh|max, per the vendored OMP catalog),
 // the static family ladders in model_registry.h otherwise. Returns the rung count.
@@ -828,9 +822,8 @@ void launchDesignRun(AppState& st, const std::string& request,
         return;
     }
     st.clearViewportForNewDoc();
-    // O1: pin the picker's provider/model/effort explicitly in the RPC payload (beats an
-    // ambient CHUDWARE_PROVIDER env override in the core's resolve_provider). Merge call-site
-    // extras (attachments / context_refs) on top.
+    // Pin the picker's provider/model/effort explicitly in the worker payload so ambient provider
+    // configuration cannot beat the visible selection. Merge attachments/context refs on top.
     nlohmann::json payload = agentProviderOverride(st.settings);
     if (extra.is_object()) {
         for (auto it = extra.begin(); it != extra.end(); ++it)
@@ -848,10 +841,8 @@ void launchDesignRun(AppState& st, const std::string& request,
         attachAgentConversationOptions(st, opts);
         payload["options"] = std::move(opts);
     }
-    // T-RF5: single agent entry — every Design send goes to agent_run_v2. (The legacy
-    // Python agent_design loop is gone. A cursor pick now reaches the core's
-    // resolve_provider, which returns a classified pre-run refusal: Cursor has no C++
-    // chat completions transport — the chat paints that as a normal failure card.)
+    // Single online agent entry: jobs.cpp flattens this payload into `agent_admin_turn`; only an
+    // explicit offline request retains the native `agent_run_v2` modeling fallback.
     st.addLog("[..] designing (v2): " + request);
     st.status = "Designing...";  st.statusKind = 0;
     st.agentV2Running = true;
@@ -860,11 +851,10 @@ void launchDesignRun(AppState& st, const std::string& request,
                      st.docMirror.docId(), st.ribbonTab == AppState::RT_Manufacture, payload);
 }
 
-// Launch the MISSION orchestrator for a multi-capability request (e.g. "model X, then run CFD and
-// prove it's good"). Mirrors launchDesignRun's doc-prep + mutex + activity reset, but routes to
-// agent_mission_v1 so the run decomposes into a task chain (design/assembly -> sim -> verdict).
-// Shares the same fresh-part policy: a new build starts on a clean part doc; an existing model is
-// kept (a mission that only analyzes the open part should not wipe it).
+// Launch a mission for a multi-capability request (e.g. "model X, then run CFD and prove it's
+// good"). Mirrors launchDesignRun's doc-prep + activity reset; jobs.cpp routes online work through
+// `agent_admin_turn` with swarm/corporate_force fields and reserves `agent_mission_v1` for an
+// explicit offline request. The fresh-part policy remains unchanged.
 // `extra` is merged on top of the provider override (attachments / context_refs / …).
 void launchMissionRunChat(AppState& st, const std::string& request, bool needFreshDoc,
                                  nlohmann::json extra) {
@@ -1814,17 +1804,14 @@ void submitTurn(AppState& st, const std::string& text) {
 #ifndef __EMSCRIPTEN__
     if (!st.verifyEntitlementForAi()) return;
 #endif
-    // Persist the active provider/model to config.json BEFORE launching any run. The C++ core
-    // resolves the provider from config.json (not in-memory st.settings), so this guarantees the
-    // run uses exactly what the picker shows — closing the window where a freshly-picked local
-    // model still ran against a stale, previously-saved cloud endpoint (the 403 "model_failed").
-    // (O1 additionally pins provider/model/effort EXPLICITLY in each RPC payload below, so an
-    // CHUDWARE_PROVIDER env var can no longer silently override the picker.)
+    // Persist the selected descriptor before launching, then pin provider/model/effort explicitly
+    // in the request below. The long-lived worker therefore receives exactly what the picker
+    // shows instead of re-resolving a stale endpoint or an ambient CHUDWARE_PROVIDER override.
     saveSettings(st.settings);
     // M23: fold pending attachments into THIS turn. `sendText` (what the model receives) gets
     // inlined text-file content / explicit paths appended; the chat shows a compact marker.
-    // Wave4: context_refs ride as structured payload AND are inlined into sendText (C++ agent_run
-    // only reads request text — same honesty pattern as attachments).
+    // Wave4: context_refs ride as structured payload and are also inlined into sendText so both
+    // the online host-tool lane and explicit offline core fallback receive resolvable context.
     std::string sendText = text;
     const nlohmann::json attachments = consumeAttachments(st, sendText);
     const nlohmann::json contextRefs = consumeContextRefs(st, sendText);
@@ -2392,8 +2379,8 @@ void submitTurn(AppState& st, const std::string& text) {
 // ---- runtime-not-ready banner (kept from the old Design body) ----
 void drawRuntimeBanner(AppState& st) {
     if (st.workerStarted) return;
-    // The in-process C++ core (libchudware) is a complete backend on its own (doc/agent/sim route
-    // through it), so don't nag about the Python runtime when it's loaded.
+    // The in-process core remains sufficient for documents, simulation, and the explicit offline
+    // modeling fallback, so a loaded core does not need the Python-runtime setup banner.
     if (core::cpp_core().available()) return;
     const auto& pal = ui::palette;
     ImGui::PushStyleColor(ImGuiCol_ChildBg,

@@ -1,4 +1,6 @@
 // Chudware worker job launcher (extracted from gui_app.cpp).
+#include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <memory>
 #include <mutex>
@@ -30,11 +32,203 @@ static void failJobFromEscapedException(const std::shared_ptr<JobState>& job, co
     job->running = false;
 }
 
-// --- C22b: agent_run_v2 launcher ---
-// Runs agent_run_v2 on a background thread. Orchestrator events arrive via the EventFn
-// callback with kind = "run_started" / "stage_started" / etc.  We push them into
-// job->events with an "orch_" prefix (kind field) so the main thread drain can distinguish
-// them from legacy iteration events and route them to the Agent Workflow DAG store.
+namespace {
+
+bool explicitOffline(const nlohmann::json& extra, const nlohmann::json& options) {
+    auto enabled = [](const nlohmann::json& value, const char* key) {
+        return value.is_object() && value.contains(key) && value[key].is_boolean() &&
+               value[key].get<bool>();
+    };
+    if (enabled(extra, "offline") || enabled(extra, "offline_mode") ||
+        enabled(options, "offline") || enabled(options, "offline_mode"))
+        return true;
+    const auto modeIsOffline = [](const nlohmann::json& value) {
+        return value.is_object() && value.contains("mode") && value["mode"].is_string() &&
+               value["mode"].get<std::string>() == "offline";
+    };
+    return modeIsOffline(extra) || modeIsOffline(options);
+}
+
+std::string nextAgentRunId() {
+    static std::atomic<unsigned long long> sequence{0};
+    const auto micros = std::chrono::duration_cast<std::chrono::microseconds>(
+                            std::chrono::system_clock::now().time_since_epoch())
+                            .count();
+    return "gui-" + std::to_string(micros) + "-" +
+           std::to_string(sequence.fetch_add(1, std::memory_order_relaxed));
+}
+
+std::string jsonString(const nlohmann::json& value, const char* key) {
+    if (!value.is_object() || !value.contains(key) || !value[key].is_string()) return {};
+    return value[key].get<std::string>();
+}
+
+}  // namespace
+
+AgentJobRpcRoute buildAgentJobRpcRoute(const std::string& request, const std::string& docId,
+                                      const std::string& convId, bool cam,
+                                      const nlohmann::json& extra, bool mission) {
+    nlohmann::json options = nlohmann::json::object();
+    options["advisor"] = true;
+    if (!mission) options["cam"] = cam;
+    if (extra.is_object() && extra.contains("options") && extra["options"].is_object()) {
+        for (auto it = extra["options"].begin(); it != extra["options"].end(); ++it)
+            options[it.key()] = it.value();
+    }
+
+    AgentJobRpcRoute route;
+    route.online = !explicitOffline(extra, options);
+    route.method = route.online ? "agent_admin_turn"
+                                : (mission ? "agent_mission_v1" : "agent_run_v2");
+    route.params = {{"request", request}, {"doc_id", docId}, {"options", options}};
+    if (extra.is_object()) {
+        for (auto it = extra.begin(); it != extra.end(); ++it) {
+            if (it.key() != "options" && !route.params.contains(it.key()))
+                route.params[it.key()] = it.value();
+        }
+    }
+    if (!route.online) return route;
+
+    // agent_admin_turn consumes these values at the top level. Keep the options object too:
+    // host-tool context and the explicit offline core fallback still use its full shape.
+    for (auto it = options.begin(); it != options.end(); ++it)
+        if (!route.params.contains(it.key())) route.params[it.key()] = it.value();
+    route.params["mode"] = mission ? "swarm" : "agent";
+    route.params["options"]["mode"] = route.params["mode"];
+    if (mission) {
+        route.params["corporate_force"] = true;
+        route.params["options"]["corporate_force"] = true;
+    }
+
+    std::string runId = jsonString(route.params, "run_id");
+    if (runId.empty()) runId = nextAgentRunId();
+    route.params["run_id"] = runId;
+
+    std::string sessionId = jsonString(route.params, "session_id");
+    if (sessionId.empty()) sessionId = convId;
+    if (sessionId.empty()) sessionId = runId;
+    route.params["session_id"] = sessionId;
+    return route;
+}
+
+nlohmann::json normalizeAgentAdminTurnResult(const nlohmann::json& result, bool mission) {
+    if (!result.is_object()) return result;
+    nlohmann::json mapped = result;
+    const bool accepted = result.contains("ok") && result["ok"].is_boolean() &&
+                          result["ok"].get<bool>();
+    if (!accepted) {
+        const std::string reason = result.value("reason", std::string());
+        if (!reason.empty()) {
+            mapped["error"] = reason;
+            mapped["error_detail"] = reason;
+        }
+        if (!mapped.contains("stop_reason")) mapped["stop_reason"] = "provider_error";
+        return mapped;
+    }
+    if (!result.contains("turn") || !result["turn"].is_object()) return mapped;
+
+    const nlohmann::json& turn = result["turn"];
+    const bool cancelled = turn.value("cancelled", false) ||
+                           turn.value("stop_reason", std::string()) == "cancelled";
+    const bool success = turn.value("success", !cancelled);
+    mapped["status"] = cancelled ? "cancelled" : (success ? "done" : "failed");
+    mapped["stop_reason"] =
+        turn.value("stop_reason", std::string(success ? "completed" : "provider_error"));
+    const std::string runId = turn.value("run_id", std::string());
+    if (!runId.empty()) mapped["run_id"] = runId;
+    const std::string text = turn.value("result", std::string());
+    if (mission) {
+        mapped["verdict"] = text;
+    } else {
+        mapped["lane"] = "general";
+        mapped["summary"] = text;
+    }
+    return mapped;
+}
+
+void consumeAgentJobEvent(const std::shared_ptr<JobState>& job, const nlohmann::json& data,
+                          bool mission) {
+    AgentEvent event;
+    const std::string kind = jstr(data, "kind");
+    event.kind = "orch_" + kind;
+    event.text = data.dump();
+    {
+        std::string runId = jstr(data, "run_id");
+        if (!runId.empty()) {
+            std::lock_guard<std::mutex> lock(job->mtx);
+            if (job->runId.empty()) job->runId = std::move(runId);
+        }
+    }
+
+    const std::string stage = jstr(data, "stage");
+    const std::string role = jstr(data, "role");
+    if (kind == "stage_started") {
+        event.notes = stage + " > " + role + " attempt " +
+                      std::to_string(jint(data, "attempt") + 1) + "...";
+    } else if (mission && kind == "mission_task_started") {
+        event.notes = jstr(data, "title");
+    } else if (kind == "run_finished" || (mission && kind == "mission_finished")) {
+        event.notes = "run " + jstr(data, "status");
+        std::string stopReason = jstr(data, "stop_reason");
+        std::string detail = jstr(data, "error_detail");
+        if (detail.empty()) detail = jstr(data, "error");
+        const std::string human = jstr(data, "error_human");
+        if (detail.empty()) detail = human;
+        if (!stopReason.empty() || !detail.empty() || !human.empty()) {
+            std::lock_guard<std::mutex> lock(job->mtx);
+            if (!stopReason.empty() && job->stopReason.empty())
+                job->stopReason = std::move(stopReason);
+            if (!detail.empty() && job->errorDetail.empty()) job->errorDetail = std::move(detail);
+            if (!human.empty() && job->errorHuman.empty()) job->errorHuman = human;
+        }
+    } else if (!mission && kind == "provider_call") {
+        const std::string provider = jstr(data, "provider");
+        const std::string model = jstr(data, "model");
+        const int http = jint(data, "http_status");
+        const int latency = jint(data, "latency_ms");
+        char buffer[160];
+        if (http > 0)
+            std::snprintf(buffer, sizeof(buffer), "%s · %s HTTP %d %dms", provider.c_str(),
+                          model.c_str(), http, latency);
+        else
+            std::snprintf(buffer, sizeof(buffer), "%s · %s transport %dms", provider.c_str(),
+                          model.c_str(), latency);
+        event.notes = buffer;
+    } else if (mission && kind == "swarm_wave") {
+        const int wave = jint(data, "wave");
+        const int total = jint(data, "total_waves");
+        char buffer[64];
+        if (total > 0)
+            std::snprintf(buffer, sizeof(buffer), "Wave %d/%d", wave, total);
+        else
+            std::snprintf(buffer, sizeof(buffer), "Wave %d", wave);
+        event.notes = buffer;
+    } else if (mission && kind == "firm_bids") {
+        event.notes = "Collecting firm bids...";
+    } else if (mission && kind == "firm_award") {
+        const std::string firm = jstr(data, "firm");
+        event.notes = firm.empty() ? "Firm awarded" : ("Awarded " + firm);
+    } else if (mission && kind == "firm_team") {
+        event.notes = "Assembling firm team...";
+    } else if (mission && kind == "advisor") {
+        event.notes = stage.empty() ? "Advisor" : ("Advisor \xc2\xb7 " + stage);
+    } else if (mission && kind == "sub_run") {
+        const std::string purpose = jstr(data, "purpose");
+        const std::string status = jstr(data, "status");
+        if (!purpose.empty() && !status.empty())
+            event.notes = purpose + " (" + status + ")";
+        else if (!purpose.empty())
+            event.notes = purpose;
+        else
+            event.notes = "Sub-run";
+    }
+
+    std::lock_guard<std::mutex> lock(job->evMtx);
+    job->events.push_back(std::move(event));
+}
+
+// Online agent launcher. `buildAgentJobRpcRoute` selects the long-lived worker entry or the
+// explicit offline core fallback; both keep the established streamed-event and JobState drain.
 void launchAgentRunV2(WorkerClient& w, std::shared_ptr<JobState> job,
                       const std::string& convId, const std::string& docKey,
                       const std::string& request, const std::string& docId, bool cam,
@@ -66,99 +260,26 @@ void launchAgentRunV2(WorkerClient& w, std::shared_ptr<JobState> job,
         job->docKey = docKey;
     }
     { std::lock_guard<std::mutex> lk(job->evMtx); job->events.clear(); }
+    AgentJobRpcRoute route =
+        buildAgentJobRpcRoute(request, docId, convId, cam, extra, /*mission=*/false);
+    if (route.online) {
+        std::lock_guard<std::mutex> lock(job->mtx);
+        job->runId = route.params.value("run_id", std::string());
+    }
 
     // Capture the shared_ptr BY VALUE (not &job) so the JobState outlives this run even if
     // AppState::runs rehashes the map from another launch on the GL thread meanwhile.
-    std::thread([&w, job, request, docId, cam, extra]() {
+    std::thread([&w, job, route = std::move(route)]() mutable {
         nlohmann::json result;
         std::string err;
         try {
 
-        // The onEvent callback is called on the worker thread for each streamed event.
-        // We package it as an AgentEvent with kind = "orch_<original_kind>" so the GL thread
-        // drain (in app.cpp) can identify and route it to the Agent Workflow DAG store.
-        WorkerClient::EventFn onEvent = [&job](const nlohmann::json& d) {
-            AgentEvent e;
-            // The worker emits events.md §3 kinds; we prefix them "orch_" for routing.
-            std::string origKind = jstr(d, "kind");
-            e.kind = "orch_" + origKind;
-            // Carry the full event data in the "text" field as JSON for the panel to parse.
-            e.text = d.dump();
-            // Capture run_id early so Stop can agent_cancel before the RPC returns.
-            {
-                std::string rid = jstr(d, "run_id");
-                if (!rid.empty()) {
-                    std::lock_guard<std::mutex> jlk(job->mtx);
-                    if (job->runId.empty()) job->runId = std::move(rid);
-                }
-            }
-            // Also expose a human-readable phase hint in notes.
-            std::string stage = jstr(d, "stage");
-            std::string role  = jstr(d, "role");
-            if (origKind == "stage_started")
-                e.notes = stage + " > " + role + " attempt " +
-                          std::to_string(jint(d, "attempt") + 1) + "...";
-            else if (origKind == "run_finished") {
-                e.notes = "run " + jstr(d, "status");
-                // Early-stop fields on the stream (provider_error etc.) — stash onto the
-                // job so the GL drain can fill the chat card even if the RPC result shape
-                // is thin ({ok:false,error} without stop_reason).
-                std::string sr = jstr(d, "stop_reason");
-                std::string ed = jstr(d, "error_detail");
-                if (ed.empty()) ed = jstr(d, "error");
-                // error_human is the actionable one-liner, NOT a stand-in for the raw detail —
-                // keep both so the card can headline the guidance and still show the body.
-                const std::string eh = jstr(d, "error_human");
-                if (ed.empty()) ed = eh;
-                if (!sr.empty() || !ed.empty() || !eh.empty()) {
-                    std::lock_guard<std::mutex> jlk(job->mtx);
-                    if (!sr.empty() && job->stopReason.empty()) job->stopReason = sr;
-                    if (!ed.empty() && job->errorDetail.empty()) job->errorDetail = ed;
-                    if (!eh.empty() && job->errorHuman.empty()) job->errorHuman = eh;
-                }
-            } else if (origKind == "provider_call") {
-                // Compact live status: "xai · grok-4.5 HTTP 200 412ms"
-                std::string prov = jstr(d, "provider");
-                std::string model = jstr(d, "model");
-                int http = jint(d, "http_status");
-                int lat = jint(d, "latency_ms");
-                char buf[160];
-                if (http > 0)
-                    std::snprintf(buf, sizeof(buf), "%s · %s HTTP %d %dms",
-                                  prov.c_str(), model.c_str(), http, lat);
-                else
-                    std::snprintf(buf, sizeof(buf), "%s · %s transport %dms",
-                                  prov.c_str(), model.c_str(), lat);
-                e.notes = buf;
-            }
-            std::lock_guard<std::mutex> lk(job->evMtx);
-            job->events.push_back(std::move(e));
+        WorkerClient::EventFn onEvent = [&job](const nlohmann::json& data) {
+            consumeAgentJobEvent(job, data, /*mission=*/false);
         };
-
-        // (T-RF4: subscription token refresh moved INTO the C++ core —
-        // agent/auth.cpp refreshes at resolve_provider time; no Python RPC here.)
-
-        // options.cam (true when launched from the Manufacture workspace) lets the core's
-        // CAM fast-path treat a generic "make a program" as a CAM request on the current part.
-        // Mode overhaul: merge extra["options"] (mode/plan_only/approved_plan/execute_as/
-        // corporate_force/scope/advisor) under params["options"] so host routing stamps reach core.
-        nlohmann::json opts = nlohmann::json::object();
-        opts["cam"] = cam;
-        opts["advisor"] = true;  // default-on; extra may override
-        if (extra.is_object() && extra.contains("options") && extra["options"].is_object()) {
-            for (auto it = extra["options"].begin(); it != extra["options"].end(); ++it)
-                opts[it.key()] = it.value();
-        }
-        nlohmann::json params = {{"request", request}, {"doc_id", docId},
-                                 {"options", std::move(opts)}};
-        // O1/M23: merge the GUI's extra fields (provider/model/reasoning_effort override,
-        // attachments) as top-level params. Core keys above always win. Skip "options" —
-        // already folded into params["options"].
-        if (extra.is_object())
-            for (auto it = extra.begin(); it != extra.end(); ++it)
-                if (it.key() != "options" && !params.contains(it.key()))
-                    params[it.key()] = it.value();
-        bool ok = w.call("agent_run_v2", params, result, err, 900000, onEvent);
+        const bool ok =
+            w.call(route.method, route.params, result, err, 900000, onEvent);
+        if (ok && route.online) result = normalizeAgentAdminTurnResult(result, /*mission=*/false);
         // Transport loss (timeout/closed) orphans the daemon-side run: hostd keeps
         // executing — and billing — with no client attached. A user resubmit then
         // burns quota twice. Best-effort auto-cancel the orphan BEFORE taking job->mtx:
@@ -186,15 +307,14 @@ void launchAgentRunV2(WorkerClient& w, std::shared_ptr<JobState> job,
             if (orphanCancelled)
                 job->errorDetail += " (orphaned run auto-cancelled after transport loss)";
         } else {
-            // agent_run_v2 returns {status, stop_reason, run_id, revision[, error_detail]}
-            // OR a pre-run refusal {ok:false, error} (provider resolution / offline).
-            // Without mapping the latter, stopReason stays empty → app.cpp "unknown reason".
+            // Online agent_admin_turn results are normalized above to the legacy JobState shape;
+            // explicit offline core results already use it. Both may return {ok:false,error}.
             const bool preRunFail = result.contains("ok") && result["ok"].is_boolean() &&
                                     !result["ok"].get<bool>();
             if (preRunFail) {
                 std::string detail = result.value("error_detail", std::string());
                 if (detail.empty()) detail = result.value("error", std::string());
-                if (detail.empty()) detail = err.empty() ? "agent_run_v2 failed" : err;
+                if (detail.empty()) detail = err.empty() ? (route.method + " failed") : err;
                 job->error = detail;
                 job->errorDetail = detail;
                 job->errorIsCad = false;
@@ -318,10 +438,8 @@ void launchAgentRunV2(WorkerClient& w, std::shared_ptr<JobState> job,
     }).detach();
 }
 
-// --- Mission orchestrator launcher (see jobs.h) ---
-// A near-clone of launchAgentRunV2: same background thread + "orch_"-prefixed event streaming,
-// but calls agent_mission_v1 and captures the verdict + any assembly tab to open. The mission
-// emits mission_* events (in addition to each sub-run's stage events) — the drain renders them.
+// Mission launcher: same online `agent_admin_turn` entry and event drain as a normal run, with
+// swarm/corporate_force routing. Explicit offline missions retain the native mission method.
 void launchMissionRun(WorkerClient& w, std::shared_ptr<JobState> job,
                       const std::string& convId, const std::string& docKey,
                       const std::string& request, const std::string& docId,
@@ -351,87 +469,25 @@ void launchMissionRun(WorkerClient& w, std::shared_ptr<JobState> job,
         job->docKey = docKey;
     }
     { std::lock_guard<std::mutex> lk(job->evMtx); job->events.clear(); }
+    AgentJobRpcRoute route =
+        buildAgentJobRpcRoute(request, docId, convId, /*cam=*/false, extra, /*mission=*/true);
+    if (route.online) {
+        std::lock_guard<std::mutex> lock(job->mtx);
+        job->runId = route.params.value("run_id", std::string());
+    }
 
     // Capture the shared_ptr BY VALUE (not &job) — see launchAgentRunV2 above.
-    std::thread([&w, job, request, docId, extra]() {
+    std::thread([&w, job, route = std::move(route)]() mutable {
         nlohmann::json result;
         std::string err;
         try {
 
-        // (T-RF4: subscription token refresh moved INTO the C++ core —
-        // agent/auth.cpp refreshes at resolve_provider time; no Python RPC here.)
-        WorkerClient::EventFn onEvent = [&job](const nlohmann::json& d) {
-            AgentEvent e;
-            std::string origKind = jstr(d, "kind");
-            e.kind = "orch_" + origKind;
-            e.text = d.dump();  // full event JSON for the panel/timeline to parse
-            {
-                std::string rid = jstr(d, "run_id");
-                if (!rid.empty()) {
-                    std::lock_guard<std::mutex> jlk(job->mtx);
-                    if (job->runId.empty()) job->runId = std::move(rid);
-                }
-            }
-            std::string stage = jstr(d, "stage");
-            std::string role  = jstr(d, "role");
-            if (origKind == "stage_started")
-                e.notes = stage + " > " + role + " attempt " +
-                          std::to_string(jint(d, "attempt") + 1) + "...";
-            else if (origKind == "mission_task_started")
-                e.notes = jstr(d, "title");
-            else if (origKind == "run_finished" || origKind == "mission_finished") {
-                e.notes = "run " + jstr(d, "status");
-                std::string sr = jstr(d, "stop_reason");
-                std::string ed = jstr(d, "error_detail");
-                if (ed.empty()) ed = jstr(d, "error");
-                if (!sr.empty() || !ed.empty()) {
-                    std::lock_guard<std::mutex> jlk(job->mtx);
-                    if (!sr.empty() && job->stopReason.empty()) job->stopReason = sr;
-                    if (!ed.empty() && job->errorDetail.empty()) job->errorDetail = ed;
-                }
-            } else if (origKind == "swarm_wave") {
-                int wave = jint(d, "wave");
-                int total = jint(d, "total_waves");
-                char buf[64];
-                if (total > 0) std::snprintf(buf, sizeof(buf), "Wave %d/%d", wave, total);
-                else std::snprintf(buf, sizeof(buf), "Wave %d", wave);
-                e.notes = buf;
-            } else if (origKind == "firm_bids") {
-                e.notes = "Collecting firm bids...";
-            } else if (origKind == "firm_award") {
-                std::string firm = jstr(d, "firm");
-                e.notes = firm.empty() ? "Firm awarded" : ("Awarded " + firm);
-            } else if (origKind == "firm_team") {
-                e.notes = "Assembling firm team...";
-            } else if (origKind == "advisor") {
-                std::string stg = jstr(d, "stage");
-                e.notes = stg.empty() ? "Advisor" : ("Advisor \xc2\xb7 " + stg);
-            } else if (origKind == "sub_run") {
-                std::string purpose = jstr(d, "purpose");
-                std::string stt = jstr(d, "status");
-                if (!purpose.empty() && !stt.empty()) e.notes = purpose + " (" + stt + ")";
-                else if (!purpose.empty()) e.notes = purpose;
-                else e.notes = "Sub-run";
-            }
-            // firm_comm: frequent — leave notes empty (card aggregates).
-            std::lock_guard<std::mutex> lk(job->evMtx);
-            job->events.push_back(std::move(e));
+        WorkerClient::EventFn onEvent = [&job](const nlohmann::json& data) {
+            consumeAgentJobEvent(job, data, /*mission=*/true);
         };
-
-        nlohmann::json params = {{"request", request}, {"doc_id", docId}};
-        // Mode overhaul: stamp mode/corporate_force/… under options (Swarm/mission path).
-        nlohmann::json opts = nlohmann::json::object();
-        opts["advisor"] = true;
-        if (extra.is_object() && extra.contains("options") && extra["options"].is_object()) {
-            for (auto it = extra["options"].begin(); it != extra["options"].end(); ++it)
-                opts[it.key()] = it.value();
-        }
-        params["options"] = std::move(opts);
-        if (extra.is_object())
-            for (auto it = extra.begin(); it != extra.end(); ++it)
-                if (it.key() != "options" && !params.contains(it.key()))
-                    params[it.key()] = it.value();
-        bool ok = w.call("agent_mission_v1", params, result, err, 900000, onEvent);
+        const bool ok =
+            w.call(route.method, route.params, result, err, 900000, onEvent);
+        if (ok && route.online) result = normalizeAgentAdminTurnResult(result, /*mission=*/true);
         std::lock_guard<std::mutex> lk(job->mtx);
         if (!ok) {
             job->error = err;
@@ -440,22 +496,22 @@ void launchMissionRun(WorkerClient& w, std::shared_ptr<JobState> job,
             if (job->stopReason.empty()) job->stopReason = "provider_error";
             if (job->errorDetail.empty()) job->errorDetail = err;
         } else {
-            // agent_mission_v1 returns {status, stop_reason, doc_id, verdict, tasks, ...}
-            // or {ok:false, error} on provider resolution failure.
-            // User-facing plan gate ONLY for awaiting_plan_approval / needs_user_decision /
-            // plan_only / status plan_ready — agent-decided plans advisor-approve in-core.
+            // Online agent_admin_turn results are normalized above to the legacy mission shape;
+            // explicit offline core results already use it. Both may return {ok:false,error}.
             const bool preRunFail = result.contains("ok") && result["ok"].is_boolean() &&
                                     !result["ok"].get<bool>();
             if (preRunFail) {
                 std::string detail = result.value("error_detail", std::string());
                 if (detail.empty()) detail = result.value("error", std::string());
-                if (detail.empty()) detail = err.empty() ? "agent_mission_v1 failed" : err;
+                if (detail.empty()) detail = err.empty() ? (route.method + " failed") : err;
                 job->error = detail;
                 job->errorDetail = detail;
                 job->errorIsCad = false;
                 job->converged = false;
                 job->stopReason = result.value("stop_reason", std::string("provider_error"));
             } else {
+                const std::string returnedRunId = result.value("run_id", std::string());
+                if (!returnedRunId.empty()) job->runId = returnedRunId;
                 const std::string status = result.value("status", std::string());
                 std::string sr = result.value("stop_reason", std::string());
                 const bool isPlanReady =

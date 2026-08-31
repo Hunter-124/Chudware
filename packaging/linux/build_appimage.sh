@@ -94,6 +94,8 @@ stage_chudcode() {
     }
     "$RELEASE_PYTHON" "$REPO/scripts/pin_chudcode.py" stage \
         --target linux-x86_64 --input "$CHUD_BIN" --output "$destination"
+    "$RELEASE_PYTHON" "$REPO/scripts/pin_chudcode.py" stage-notices \
+        --output-dir "$(dirname "$destination")"
     cp "$REPO/vendor/chudcode/CHUDCODE_ARTIFACT.lock" \
         "$(dirname "$destination")/CHUDCODE_ARTIFACT.lock"
 }

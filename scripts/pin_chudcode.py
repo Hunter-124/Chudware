@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Pin, verify, fetch, and stage compiled Chudcode release artifacts.
+"""Pin, verify, fetch, and stage compiled Chudcode release artifacts and notices.
 
-Release packaging calls ``stage`` with an explicit local input.  That path is
-strictly offline: only the explicit ``fetch`` subcommand performs network I/O.
+Release packaging calls ``stage`` and ``stage-notices`` with explicit local inputs.
+Those paths are strictly offline: only the explicit ``fetch`` subcommand performs
+network I/O.
 """
 from __future__ import annotations
 
@@ -26,6 +27,14 @@ REPO = Path(__file__).resolve().parent.parent
 DEFAULT_LOCK = REPO / "vendor" / "chudcode" / "CHUDCODE_ARTIFACT.lock"
 SCHEMA = "chudcode-artifact-lock-v1"
 RPC_PROTOCOL = 2
+NOTICE_FILES = {
+    "CHUDCODE-NOTICE": "NOTICE",
+    "CHUDCODE-THIRD-PARTY-NOTICES.txt": "THIRD-PARTY-NOTICES.txt",
+}
+LEGACY_NOTICE_NAMES = frozenset(
+    {"OMP-NOTICE", "OMP-THIRD-PARTY-NOTICES.txt"}
+)
+DEFAULT_NOTICE_DIR = DEFAULT_LOCK.parent
 SEMVER_RE = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?$")
 SUPPORTED_TARGETS = (
     "linux-x86_64",
@@ -100,7 +109,7 @@ def load_lock(path: Path = DEFAULT_LOCK, *, require_pinned: bool = True) -> dict
     if canonical != raw:
         raise ArtifactLockError(f"Chudcode artifact lock is not canonical JSON: {path}")
     if not isinstance(lock, dict) or set(lock) != {
-        "artifacts", "engine_version", "repository", "repository_commit",
+        "artifacts", "engine_version", "notices", "repository", "repository_commit",
         "rpc_protocol", "schema", "version",
     }:
         raise ArtifactLockError("Chudcode artifact lock has unexpected or missing top-level keys")
@@ -122,6 +131,25 @@ def load_lock(path: Path = DEFAULT_LOCK, *, require_pinned: bool = True) -> dict
     _require_string(lock["repository_commit"], "repository_commit", pattern="commit")
     if type(lock["rpc_protocol"]) is not int or lock["rpc_protocol"] != RPC_PROTOCOL:
         raise ArtifactLockError(f"rpc_protocol must be {RPC_PROTOCOL}")
+    notices = lock["notices"]
+    if not isinstance(notices, dict) or set(notices) != {"files", "repository_commit"}:
+        raise ArtifactLockError("notice provenance has unexpected or missing keys")
+    if notices["repository_commit"] != lock["repository_commit"]:
+        raise ArtifactLockError("notice provenance repository commit must match the artifact source commit")
+    notice_files = notices["files"]
+    if not isinstance(notice_files, dict) or set(notice_files) != set(NOTICE_FILES):
+        raise ArtifactLockError("notice provenance must define exactly every Chudcode notice")
+    for payload_name, source_name in NOTICE_FILES.items():
+        notice = notice_files[payload_name]
+        if not isinstance(notice, dict) or set(notice) != {"sha256", "source"}:
+            raise ArtifactLockError(f"notice {payload_name} has unexpected or missing keys")
+        if notice["source"] != source_name:
+            raise ArtifactLockError(
+                f"notice {payload_name} must record source filename {source_name}"
+            )
+        _require_string(
+            notice["sha256"], f"notice {payload_name} sha256", pattern="sha"
+        )
     artifacts = lock["artifacts"]
     if not isinstance(artifacts, dict) or tuple(sorted(artifacts)) != tuple(sorted(SUPPORTED_TARGETS)):
         raise ArtifactLockError("artifact lock must define exactly every supported platform target")
@@ -143,6 +171,93 @@ def load_lock(path: Path = DEFAULT_LOCK, *, require_pinned: bool = True) -> dict
             raise ArtifactLockError(f"artifact {target} URL must be an unauthenticated HTTPS URL")
         _require_string(artifact["sha256"], f"artifact {target} sha256", pattern="sha")
     return lock
+
+
+def verify_notices(
+    directory: Path | None = None,
+    *,
+    lock_path: Path | None = None,
+    require_pinned: bool = True,
+) -> dict[str, Any]:
+    directory = directory or DEFAULT_NOTICE_DIR
+    lock_path = lock_path or DEFAULT_LOCK
+    lock = load_lock(lock_path, require_pinned=require_pinned)
+    if not directory.is_dir() or directory.is_symlink():
+        raise ArtifactLockError(
+            f"Chudcode notice directory is missing or unsafe: {directory}"
+        )
+    for legacy_name in LEGACY_NOTICE_NAMES:
+        if (directory / legacy_name).exists():
+            raise ArtifactLockError(
+                f"stale OMP notice is forbidden in Chudcode notice directory: "
+                f"{directory / legacy_name}"
+            )
+    evidence: dict[str, str] = {}
+    for payload_name in NOTICE_FILES:
+        path = directory / payload_name
+        if not path.is_file() or path.is_symlink():
+            raise ArtifactLockError(
+                f"required Chudcode notice is missing or unsafe: {path}"
+            )
+        actual = _sha256(path)
+        expected = lock["notices"]["files"][payload_name]["sha256"]
+        if actual != expected:
+            raise ArtifactLockError(
+                f"Chudcode notice sha256 mismatch for {payload_name}: "
+                f"expected {expected}, found {actual}"
+            )
+        evidence[payload_name] = actual
+    return {
+        "directory": str(directory),
+        "notices": evidence,
+        "repository_commit": lock["notices"]["repository_commit"],
+    }
+
+
+def stage_notices(
+    destination: Path,
+    *,
+    source: Path | None = None,
+    lock_path: Path | None = None,
+) -> dict[str, Any]:
+    source = source or DEFAULT_NOTICE_DIR
+    lock_path = lock_path or DEFAULT_LOCK
+    evidence = verify_notices(source, lock_path=lock_path)
+    if destination.exists() and (
+        not destination.is_dir() or destination.is_symlink()
+    ):
+        raise ArtifactLockError(
+            f"Chudcode notice destination is not a safe directory: {destination}"
+        )
+    destination.mkdir(parents=True, exist_ok=True)
+    for legacy_name in LEGACY_NOTICE_NAMES:
+        if (destination / legacy_name).exists():
+            raise ArtifactLockError(
+                f"stale OMP notice is forbidden in Chudcode payload: "
+                f"{destination / legacy_name}"
+            )
+    temporaries: list[tuple[Path, Path]] = []
+    try:
+        for payload_name in NOTICE_FILES:
+            target = destination / payload_name
+            temporary = target.with_name(target.name + ".tmp")
+            temporary.unlink(missing_ok=True)
+            temporaries.append((temporary, target))
+            shutil.copy2(source / payload_name, temporary)
+            actual = _sha256(temporary)
+            expected = evidence["notices"][payload_name]
+            if actual != expected:
+                raise ArtifactLockError(
+                    f"staged Chudcode notice sha256 mismatch for {payload_name}: "
+                    f"expected {expected}, found {actual}"
+                )
+        for temporary, target in temporaries:
+            os.replace(temporary, target)
+    finally:
+        for temporary, _target_path in temporaries:
+            temporary.unlink(missing_ok=True)
+    evidence["staged"] = str(destination)
+    return evidence
 
 
 def _binary_target(path: Path) -> str:
@@ -209,8 +324,6 @@ def _verify_executable_version(
         ) from exc
     actual = completed.stdout.strip()
     expected = f"Chudcode v{lock['version']}"
-    if lock["engine_version"] is not None:
-        expected += f" (based on omp {lock['engine_version']})"
     if completed.returncode != 0 or actual != expected:
         raise ArtifactLockError(
             "Chudcode product version mismatch: "
@@ -339,9 +452,24 @@ def pin_lock(args: argparse.Namespace) -> dict[str, Any]:
         if parsed.scheme != "https" or not parsed.netloc or parsed.username or parsed.password:
             raise ArtifactLockError(f"artifact {target} URL must be an unauthenticated HTTPS URL")
         artifacts[target] = {"filename": CANONICAL_NAMES[target], "sha256": _sha256(path), "url": url}
+    notice_files: dict[str, dict[str, str]] = {}
+    for payload_name, source_name in NOTICE_FILES.items():
+        path = args.notice_dir / payload_name
+        if not path.is_file() or path.is_symlink():
+            raise ArtifactLockError(
+                f"required Chudcode notice pin input is missing or unsafe: {path}"
+            )
+        notice_files[payload_name] = {
+            "sha256": _sha256(path),
+            "source": source_name,
+        }
     lock = {
         "artifacts": artifacts,
         "engine_version": args.engine_version,
+        "notices": {
+            "files": notice_files,
+            "repository_commit": args.repository_commit,
+        },
         "repository": args.repository,
         "repository_commit": args.repository_commit,
         "rpc_protocol": args.rpc_protocol,
@@ -356,6 +484,7 @@ def pin_lock(args: argparse.Namespace) -> dict[str, Any]:
         stream.write(_canonical_json(lock))
     try:
         load_lock(temporary)
+        verify_notices(args.notice_dir, lock_path=temporary)
         current = host_target()
         verify_binary(Path(binaries[current]), current, lock_path=temporary)
         os.replace(temporary, args.lock)
@@ -379,6 +508,7 @@ def _parser() -> argparse.ArgumentParser:
     pin.add_argument("--rpc-protocol", type=int, choices=(RPC_PROTOCOL,), required=True)
     pin.add_argument("--repository", default="https://github.com/Hunter-124/chudcode.git")
     pin.add_argument("--repository-commit", required=True)
+    pin.add_argument("--notice-dir", type=Path, default=DEFAULT_NOTICE_DIR)
     pin.add_argument("--artifact", action="append", default=[], metavar="TARGET=PATH")
     pin.add_argument("--url", action="append", default=[], metavar="TARGET=HTTPS_URL")
     for name in ("verify", "stage", "fetch"):
@@ -391,7 +521,31 @@ def _parser() -> argparse.ArgumentParser:
         if name != "verify":
             command.add_argument("--output", type=Path, required=True)
     sub.add_parser("check-lock")
+    stage_notice_parser = sub.add_parser(
+        "stage-notices", help="verify and stage the two artifact-locked Chudcode notices"
+    )
+    stage_notice_parser.add_argument("--source-dir", type=Path, default=DEFAULT_NOTICE_DIR)
+    stage_notice_parser.add_argument("--output-dir", type=Path, required=True)
     return parser
+
+
+def _selected_target(args: argparse.Namespace) -> str:
+    has_target = args.target is not None
+    has_platform = args.platform is not None
+    has_arch = args.arch is not None
+    if has_target:
+        if has_platform or has_arch:
+            raise ArtifactLockError(
+                "--target cannot be combined with --platform or --arch"
+            )
+        return args.target
+    if has_platform != has_arch:
+        raise ArtifactLockError("--platform and --arch must be provided together")
+    if not has_platform:
+        raise ArtifactLockError(
+            "exactly one target selector is required: --target or --platform plus --arch"
+        )
+    return _target(args.platform, args.arch)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -402,9 +556,22 @@ def main(argv: list[str] | None = None) -> int:
             result = pin_lock(args)
         elif args.command == "check-lock":
             lock = load_lock(args.lock)
-            result = {"lock": str(args.lock), "version": lock["version"], "rpc_protocol": lock["rpc_protocol"], "targets": len(lock["artifacts"])}
+            notice_evidence = verify_notices(
+                args.lock.parent, lock_path=args.lock
+            )
+            result = {
+                "lock": str(args.lock),
+                "version": lock["version"],
+                "rpc_protocol": lock["rpc_protocol"],
+                "targets": len(lock["artifacts"]),
+                "notices": notice_evidence["notices"],
+            }
+        elif args.command == "stage-notices":
+            result = stage_notices(
+                args.output_dir, source=args.source_dir, lock_path=args.lock
+            )
         else:
-            target = args.target or (_target(args.platform, args.arch) if args.platform and args.arch else host_target())
+            target = _selected_target(args)
             if args.command == "verify":
                 result = verify_binary(args.input, target, lock_path=args.lock)
             elif args.command == "stage":

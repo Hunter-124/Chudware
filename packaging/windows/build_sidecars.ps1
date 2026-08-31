@@ -78,6 +78,14 @@ function Stage-Chudcode([string]$Destination) {
         "--input", $ChudBinary,
         "--output", $Destination
     )
+    $destinationDir = Split-Path -Parent $Destination
+    Invoke-Checked $Python @(
+        (Join-Path $Root "scripts\pin_chudcode.py"),
+        "stage-notices",
+        "--output-dir", $destinationDir
+    )
+    Copy-Item -LiteralPath (Join-Path $Root "vendor\chudcode\CHUDCODE_ARTIFACT.lock") `
+        -Destination (Join-Path $destinationDir "CHUDCODE_ARTIFACT.lock") -Force
 }
 
 function Generate-ProtectedAssets {

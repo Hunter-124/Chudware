@@ -171,3 +171,9 @@ row in the same change" rule.
 |---|---|---|---|
 | **Polyhedral-FEA** (`Hunter-124/Polyhedral-FEA`, pinned commit `955457901e5fe9ba7d46c4cafee710000df9f4bd`) | **BSD-3-Clause** | sole in-process STEP/BREP volume mesher, quadratic boundary projection, adaptive ZZ recovery, optional learned mesh advice | ok — statically linked from pinned source, shares Chudware's Eigen/OpenCASCADE targets, permissive attribution posture |
 | ~~Netgen / nglib~~ | ~~LGPL-2.1~~ | ~~legacy FEA tet mesher~~ | **REMOVED** — no source provisioner, link dependency, runtime DLL staging, backend selector, or production callsite remains |
+
+## Chudcode embedded agent runtime (2026-08-31)
+
+| package | license | role | posture |
+|---|---|---|---|
+| **Chudcode** (`Hunter-124/chudcode`, artifact-locked commit `7c9cdb983ab6272d25c98de763f9246be3d5becb`) | **MIT** | compiled protocol-v2 online agent runtime for providers, sessions, auth, memory, compaction, browser/computer, STT, and host-tool orchestration | ok — **subprocess/RPC-only** behind `vendor/chudcode/CHUDCODE_ARTIFACT.lock`; Chudware never imports or vendors the Chudcode engine source. The compiled binary's Bun-embedded runtime and all bundled third-party packages, fonts, stb/native-GUI code, and ASR components are covered by the shipped `CHUDCODE-NOTICE` and `CHUDCODE-THIRD-PARTY-NOTICES.txt`; their SHA-256 values are lock-validated and both files are required in every signed desktop/web payload. No OMP source/runtime boundary remains in Chudware. |

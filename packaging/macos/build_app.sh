@@ -74,6 +74,8 @@ stage_chudcode() {
     }
     "$RELEASE_PYTHON" "$REPO/scripts/pin_chudcode.py" stage \
         --target "macos-$ARCH" --input "$CHUD_BIN" --output "$destination"
+    "$RELEASE_PYTHON" "$REPO/scripts/pin_chudcode.py" stage-notices \
+        --output-dir "$(dirname "$destination")"
     cp "$REPO/vendor/chudcode/CHUDCODE_ARTIFACT.lock" \
         "$(dirname "$destination")/CHUDCODE_ARTIFACT.lock"
 }
@@ -456,7 +458,8 @@ for bundled_dylib in "$FRAMEWORKS"/*.dylib; do
     [ -f "$bundled_dylib" ] && printf '%s\n' "$bundled_dylib" >> "$QUEUE"
 done
 [ -n "$HOSTD" ] && printf '%s\n' "$MACOS/chudware-hostd" >> "$QUEUE"
-for sidecar in "$MACOS/chudware-worker" "$MACOS/chudware-mcp" "$MACOS/chud"; do
+# chud is already release-signed: never run install_name_tool over its load commands.
+for sidecar in "$MACOS/chudware-worker" "$MACOS/chudware-mcp"; do
     printf '%s\n' "$sidecar" >> "$QUEUE"
 done
 
@@ -557,7 +560,10 @@ done
 
 if [ -n "$SIGN_IDENTITY" ]; then
     echo "==> signing nested Mach-O payloads with identity: $SIGN_IDENTITY"
+    echo "==> verifying release-signed Chudcode artifact without re-signing it"
+    codesign --verify --strict --verbose=2 "$MACOS/chud"
     while IFS= read -r -d '' nested; do
+        [ "$nested" = "$MACOS/chud" ] && continue
         file -b "$nested" | grep -q 'Mach-O' || continue
         codesign --force --options runtime --timestamp --sign "$SIGN_IDENTITY" "$nested"
         codesign --verify --strict --verbose=2 "$nested"
@@ -595,11 +601,13 @@ if [ -n "$NOTARIZE_PROFILE" ]; then
         echo "error: CHUDWARE_NOTARIZE_PROFILE requires CHUDWARE_SIGN_IDENTITY" >&2
         exit 1
     }
+    codesign --verify --strict --verbose=2 "$MACOS/chud"
     echo "==> notarizing with keychain profile: $NOTARIZE_PROFILE"
     xcrun notarytool submit "$ZIP" --keychain-profile "$NOTARIZE_PROFILE" --wait
     xcrun stapler staple "$APP"
     xcrun stapler validate "$APP"
     codesign --verify --deep --strict --verbose=2 "$APP"
+    codesign --verify --strict --verbose=2 "$MACOS/chud"
     spctl --assess --type execute --verbose=2 "$APP"
     verify_manifest_rows_unchanged "$APP"
     archive_signed_bundle "$ZIP"

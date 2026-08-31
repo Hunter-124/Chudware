@@ -150,14 +150,16 @@ arithmetic says, and — unchanged from before — a *failed* promotion still
 leaves its partial tree behind for inspection.
 
 The set of `releases/*/deploy-manifest` files is the release index; there is no
-separate index file. Each is flat `key=value` (`schema=4`), and adds
+separate index file. Each is flat `key=value` (`schema=5`), and adds
 `release_id=` and `built_at_utc=` (strict `YYYY-MM-DDTHH:MM:SSZ`) to the
 existing `joint_sha256`, the `checkout_head` git rev it was built from, and the
-per-artifact digests. The verified `chud` binary and checked-in Chudcode
-artifact lock each have their own SHA-256 and participate in the joint hash.
-Advisor-enabled releases likewise hash the exact ONNX Runtime SONAME payload
-and four-file `polymesh-advisor/` package, so either model or agent-runtime
-changes produce a new joint release identifiable from disk alone.
+per-artifact digests. The verified `chud` binary, checked-in Chudcode artifact
+lock, `CHUDCODE-NOTICE`, and `CHUDCODE-THIRD-PARTY-NOTICES.txt` each have their
+own SHA-256 and participate in the joint hash. Rollback rechecks both the
+manifest digests and the notice hashes/provenance recorded in the lock before
+moving `current`. Advisor-enabled releases likewise hash the exact ONNX Runtime
+SONAME payload and four-file `polymesh-advisor/` package, so either model or
+agent-runtime changes produce a new joint release identifiable from disk alone.
 
 Release ids are `YYYYmmddTHHMMSSZ-<joint12>-<pid>`. The timestamp is UTC: it is
 what retention sorts on lexicographically, and a local-time stamp is

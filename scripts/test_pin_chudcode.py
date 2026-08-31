@@ -12,6 +12,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import pin_chudcode as pin  # noqa: E402
 
 
+NOTICE_BYTES = {
+    "CHUDCODE-NOTICE": b"Chudcode notice fixture\n",
+    "CHUDCODE-THIRD-PARTY-NOTICES.txt": b"Chudcode third-party fixture\n",
+}
+
+
 def _binary(target: str) -> bytes:
     if target.startswith("linux-"):
         machine = 62 if target.endswith("x86_64") else 183
@@ -42,9 +48,21 @@ def _lock(tmp_path: Path) -> tuple[Path, dict[str, Path]]:
             "sha256": hashlib.sha256(binary.read_bytes()).hexdigest(),
             "url": f"https://releases.example.invalid/v0.2.0/{target}/{pin.CANONICAL_NAMES[target]}",
         }
+    for name, content in NOTICE_BYTES.items():
+        (tmp_path / name).write_bytes(content)
     lock = {
         "artifacts": artifacts,
         "engine_version": "18.0.8",
+        "notices": {
+            "files": {
+                name: {
+                    "sha256": hashlib.sha256(content).hexdigest(),
+                    "source": pin.NOTICE_FILES[name],
+                }
+                for name, content in NOTICE_BYTES.items()
+            },
+            "repository_commit": "1" * 40,
+        },
         "repository": "https://github.com/Hunter-124/chudcode.git",
         "repository_commit": "1" * 40,
         "rpc_protocol": 2,
@@ -62,6 +80,21 @@ def test_checked_in_lock_declares_every_required_release_input() -> None:
     assert lock["rpc_protocol"] == 2
     assert lock["version"] == "0.2.0"
     assert lock["engine_version"] == "18.0.8"
+    assert lock["notices"]["repository_commit"] == "7c9cdb983ab6272d25c98de763f9246be3d5becb"
+    assert lock["notices"]["files"] == {
+        "CHUDCODE-NOTICE": {
+            "sha256": "58a54468725d1d3b02a5afa38da728dfe8a147e1e669d0842096091dfe12e82d",
+            "source": "NOTICE",
+        },
+        "CHUDCODE-THIRD-PARTY-NOTICES.txt": {
+            "sha256": "c1474c6cfedf5c67b229b4dee355a518293e019abf393f3e29cd33b075f09714",
+            "source": "THIRD-PARTY-NOTICES.txt",
+        },
+    }
+    evidence = pin.verify_notices(require_pinned=False)
+    assert evidence["notices"] == {
+        name: item["sha256"] for name, item in lock["notices"]["files"].items()
+    }
     with pytest.raises(pin.ArtifactLockError, match="not pinned"):
         pin.load_lock(pin.DEFAULT_LOCK)
 
@@ -73,7 +106,7 @@ def test_verified_stage_is_offline_and_uses_canonical_filename(
     monkeypatch.setattr(
         pin,
         "_verify_executable_version",
-        lambda *_args: "Chudcode v0.2.0 (based on omp 18.0.8)",
+        lambda *_args: "Chudcode v0.2.0",
     )
     destination = tmp_path / "payload" / "chud"
     evidence = pin.stage_binary(
@@ -84,6 +117,76 @@ def test_verified_stage_is_offline_and_uses_canonical_filename(
     assert evidence["version"] == "0.2.0"
     assert evidence["engine_version"] == "18.0.8"
     assert destination.stat().st_mode & 0o111
+
+
+
+def test_notice_staging_has_five_target_parity_and_no_stale_omp_notice(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    lock, binaries = _lock(tmp_path)
+    monkeypatch.setattr(
+        pin,
+        "_verify_executable_version",
+        lambda *_args: "Chudcode v0.2.0",
+    )
+    expected = pin.verify_notices(
+        tmp_path, lock_path=lock
+    )["notices"]
+    for target in pin.SUPPORTED_TARGETS:
+        payload = tmp_path / "payloads" / target
+        pin.stage_binary(
+            binaries[target],
+            payload / pin.CANONICAL_NAMES[target],
+            target,
+            lock_path=lock,
+        )
+        evidence = pin.stage_notices(
+            payload, source=tmp_path, lock_path=lock
+        )
+        assert evidence["notices"] == expected
+        assert {
+            path.name for path in payload.iterdir()
+        } == {
+            pin.CANONICAL_NAMES[target],
+            *pin.NOTICE_FILES,
+        }
+        assert not any(path.name.startswith("OMP") for path in payload.iterdir())
+
+
+def test_missing_tampered_and_mismatched_notice_provenance_fail_closed(
+    tmp_path: Path,
+) -> None:
+    lock, _ = _lock(tmp_path)
+    (tmp_path / "CHUDCODE-NOTICE").unlink()
+    with pytest.raises(pin.ArtifactLockError, match="missing or unsafe"):
+        pin.verify_notices(tmp_path, lock_path=lock)
+
+    (tmp_path / "CHUDCODE-NOTICE").write_bytes(
+        NOTICE_BYTES["CHUDCODE-NOTICE"] + b"tamper"
+    )
+    with pytest.raises(pin.ArtifactLockError, match="sha256 mismatch"):
+        pin.verify_notices(tmp_path, lock_path=lock)
+
+    parsed = json.loads(lock.read_text())
+    parsed["notices"]["repository_commit"] = "2" * 40
+    lock.write_bytes(pin._canonical_json(parsed))
+    with pytest.raises(pin.ArtifactLockError, match="repository commit"):
+        pin.load_lock(lock)
+
+
+def test_stale_omp_notices_fail_closed_in_source_and_payload(tmp_path: Path) -> None:
+    lock, _ = _lock(tmp_path)
+    stale_source = tmp_path / "OMP-NOTICE"
+    stale_source.write_bytes(b"obsolete attribution aggregate")
+    with pytest.raises(pin.ArtifactLockError, match="stale OMP notice"):
+        pin.verify_notices(tmp_path, lock_path=lock)
+    stale_source.unlink()
+
+    payload = tmp_path / "payload"
+    payload.mkdir()
+    (payload / "OMP-THIRD-PARTY-NOTICES.txt").write_bytes(b"obsolete")
+    with pytest.raises(pin.ArtifactLockError, match="stale OMP notice"):
+        pin.stage_notices(payload, source=tmp_path, lock_path=lock)
 
 
 def test_missing_tampered_and_wrong_target_binaries_fail_closed(tmp_path: Path) -> None:
@@ -132,12 +235,12 @@ def test_executable_version_separates_product_from_engine_provenance(
         pin.subprocess,
         "run",
         lambda *args, **kwargs: pin.subprocess.CompletedProcess(
-            args[0], 0, "Chudcode v0.2.0 (based on omp 18.0.8)\n", ""
+            args[0], 0, "Chudcode v0.2.0\n", ""
         ),
     )
     assert pin._verify_executable_version(
         binaries["linux-x86_64"], "linux-x86_64", lock
-    ) == "Chudcode v0.2.0 (based on omp 18.0.8)"
+    ) == "Chudcode v0.2.0"
 
     monkeypatch.setattr(
         pin.subprocess,
@@ -174,3 +277,27 @@ def test_executable_version_separates_product_from_engine_provenance(
     assert pin._verify_executable_version(
         binaries["linux-x86_64"], "linux-x86_64", lock
     ) == "Chudcode v0.2.0"
+
+
+def test_target_selector_requires_exactly_one_complete_mode() -> None:
+    assert pin._selected_target(
+        pin.argparse.Namespace(target="linux-x86_64", platform=None, arch=None)
+    ) == "linux-x86_64"
+    assert pin._selected_target(
+        pin.argparse.Namespace(target=None, platform="linux", arch="x86_64")
+    ) == "linux-x86_64"
+
+    invalid = (
+        pin.argparse.Namespace(target=None, platform=None, arch=None),
+        pin.argparse.Namespace(target=None, platform="linux", arch=None),
+        pin.argparse.Namespace(target=None, platform=None, arch="x86_64"),
+        pin.argparse.Namespace(
+            target="linux-x86_64", platform="linux", arch="x86_64"
+        ),
+        pin.argparse.Namespace(
+            target="linux-x86_64", platform="linux", arch=None
+        ),
+    )
+    for selector in invalid:
+        with pytest.raises(pin.ArtifactLockError):
+            pin._selected_target(selector)

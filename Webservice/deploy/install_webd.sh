@@ -161,8 +161,12 @@ if ! "$PYTHON" "$ROOT/scripts/pin_chudcode.py" stage \
     --target linux-x86_64 --input "$CHUD_INPUT" --output "$STAGE_BIN/chud"; then
   fatal "Chudcode artifact verification/staging failed"
 fi
+if ! "$PYTHON" "$ROOT/scripts/pin_chudcode.py" stage-notices \
+    --output-dir "$STAGE_ROOT"; then
+  fatal "Chudcode notice verification/staging failed"
+fi
 cp "$CHUD_LOCK" "$STAGE_ROOT/CHUDCODE_ARTIFACT.lock"
-echo "[webd] staged verified Chudcode binary"
+echo "[webd] staged verified Chudcode binary and notices"
 
 # Build WASM into the private release stage, never directly over the live app.
 EMSDK_DIR="${EMSDK:-$HOME/.emsdk}"
@@ -221,6 +225,8 @@ WASM_SHA="$(sha256sum "$STAGE_APP/Chudware.wasm" | cut -d' ' -f1)"
 JS_SHA="$(sha256sum "$STAGE_APP/Chudware.js" | cut -d' ' -f1)"
 CHUD_SHA="$(sha256sum "$STAGE_BIN/chud" | cut -d' ' -f1)"
 CHUD_LOCK_SHA="$(sha256sum "$STAGE_ROOT/CHUDCODE_ARTIFACT.lock" | cut -d' ' -f1)"
+CHUD_NOTICE_SHA="$(sha256sum "$STAGE_ROOT/CHUDCODE-NOTICE" | cut -d' ' -f1)"
+CHUD_THIRD_PARTY_NOTICES_SHA="$(sha256sum "$STAGE_ROOT/CHUDCODE-THIRD-PARTY-NOTICES.txt" | cut -d' ' -f1)"
 HOSTD_UNIT_SHA="$(sha256sum "$STAGE_ROOT/chudware-hostd.service" | cut -d' ' -f1)"
 GATEWAY_UNIT_SHA="$(sha256sum "$ROOT/Webservice/deploy/chudware-gateway.service" | cut -d' ' -f1)"
 STAGING_GATEWAY_UNIT_SHA="$(sha256sum "$ROOT/Webservice/deploy/chudware-gateway-staging.service" | cut -d' ' -f1)"
@@ -247,8 +253,9 @@ PY
 )"
 CHECKOUT_HEAD="$(git -C "$ROOT" rev-parse HEAD 2>/dev/null || printf 'unknown')"
 JOINT_SHA="$(printf '%s\n' "$HOSTD_SHA" "$LIB_SHA" "$ADVISOR_RUNTIME_SHA" \
-  "$WASM_SHA" "$JS_SHA" "$CHUD_SHA" "$CHUD_LOCK_SHA" "$HOSTD_UNIT_SHA" \
-  "$GATEWAY_UNIT_SHA" "$STAGING_GATEWAY_UNIT_SHA" "$PROMPTS_SHA" \
+  "$WASM_SHA" "$JS_SHA" "$CHUD_SHA" "$CHUD_LOCK_SHA" "$CHUD_NOTICE_SHA" \
+  "$CHUD_THIRD_PARTY_NOTICES_SHA" "$HOSTD_UNIT_SHA" "$GATEWAY_UNIT_SHA" \
+  "$STAGING_GATEWAY_UNIT_SHA" "$PROMPTS_SHA" \
   | sha256sum | cut -d' ' -f1)"
 # One clock read feeds both the release id and the manifest timestamp, so the two
 # can never straddle a second boundary and disagree. UTC rather than local time:
@@ -258,7 +265,7 @@ JOINT_SHA="$(printf '%s\n' "$HOSTD_SHA" "$LIB_SHA" "$ADVISOR_RUNTIME_SHA" \
 BUILT_AT_UTC="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 RELEASE_ID="${BUILT_AT_UTC//[:-]/}-${JOINT_SHA:0:12}-$$"
 cat > "$STAGE_ROOT/deploy-manifest" <<EOF
-schema=4
+schema=5
 release_id=$RELEASE_ID
 joint_sha256=$JOINT_SHA
 hostd_sha256=$HOSTD_SHA
@@ -268,6 +275,8 @@ wasm_sha256=$WASM_SHA
 javascript_sha256=$JS_SHA
 chud_sha256=$CHUD_SHA
 chudcode_artifact_lock_sha256=$CHUD_LOCK_SHA
+chudcode_notice_sha256=$CHUD_NOTICE_SHA
+chudcode_third_party_notices_sha256=$CHUD_THIRD_PARTY_NOTICES_SHA
 hostd_unit_sha256=$HOSTD_UNIT_SHA
 gateway_unit_sha256=$GATEWAY_UNIT_SHA
 staging_gateway_unit_sha256=$STAGING_GATEWAY_UNIT_SHA

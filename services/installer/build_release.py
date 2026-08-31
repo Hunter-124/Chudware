@@ -168,6 +168,7 @@ def stage_compiled_payload(
 
     try:
         pin_chudcode.stage_binary(chud_bin, dst / "chud.exe", "windows-x86_64")
+        pin_chudcode.stage_notices(dst)
     except pin_chudcode.ArtifactLockError as exc:
         raise RuntimeError(f"invalid Chudcode release artifact: {exc}") from exc
     shutil.copy2(pin_chudcode.DEFAULT_LOCK, dst / "CHUDCODE_ARTIFACT.lock")

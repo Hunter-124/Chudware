@@ -31,6 +31,13 @@ SCHEMA = "chudware-payload-v1"
 PRODUCT = "Chudware"
 KINDS = frozenset({"executable", "library", "worker", "policy", "resource"})
 _METADATA_NAMES = frozenset({MANIFEST_NAME, SIGNATURE_NAME})
+_CHUDCODE_RESOURCE_NAMES = frozenset(
+    {
+        "chudcode_artifact.lock",
+        "chudcode-notice",
+        "chudcode-third-party-notices.txt",
+    }
+)
 _KEY_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}\Z")
 _SOURCE_SUFFIXES = frozenset(
     {
@@ -235,6 +242,8 @@ def default_kind(relative: str) -> str:
         return "worker"
     if name in {"chud", "chud.exe"}:
         return "executable"
+    if name in _CHUDCODE_RESOURCE_NAMES:
+        return "resource"
     if suffix in {".dll", ".so", ".dylib"} or ".so." in name:
         return "library"
     if suffix in {".exe", ".ps1", ".bat", ".cmd"} or name in {"chudware", "appimage"}:

@@ -1,0 +1,19 @@
+Chudcode
+
+Copyright (c) 2026 Hunter and contributors.
+
+Chudcode includes and modifies software from Oh My Pi:
+https://github.com/can1357/oh-my-pi
+
+Copyright (c) 2025 Mario Zechner
+Copyright (c) 2025-2026 Can Bölük
+Copyright (c) 2026 Stencil Labs, Inc.
+
+Chudcode and the upstream Oh My Pi work are distributed under the MIT License
+included as LICENSE. Redistributions must retain that license and the copyright
+notices above.
+
+The standalone desktop archives combine the compiled Chudcode command-line
+agent, the Chudcode desktop launcher/server, the native Chudcode GUI, web and
+native GUI assets, icons, and fonts. THIRD-PARTY-NOTICES.txt identifies the
+third-party software and font licenses that accompany those archives.

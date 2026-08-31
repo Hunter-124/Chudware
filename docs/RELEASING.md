@@ -320,9 +320,9 @@ python3 scripts/pin_chudcode.py pin \
 ```
 
 The lock's `version` is the Chudcode product release. `engine_version` is
-optional provenance and, when present, requires the executable to report the
-exact documented suffix `Chudcode v0.2.0 (based on omp 18.0.8)`; the engine
-version is never accepted as the product version.
+optional source provenance only; it never changes executable identity.
+Every artifact must report exactly `Chudcode v0.2.0` from `--version`, and the
+engine provenance value is never accepted as or appended to the product version.
 
 The `stage` command used by packaging is offline and accepts only a local
 `CHUDWARE_CHUD_BIN`; it verifies the executable format/architecture, SHA-256,

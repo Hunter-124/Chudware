@@ -941,6 +941,10 @@ jobs:
       # the release token itself and publishes over TLS to the public origin.
       GATEWAY_TOKEN: ${{ secrets.CHUDWARE_GATEWAY_RELEASE_TOKEN }}
     steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+          fetch-depth: 0
       - name: Check runner capabilities and enter the MSVC environment
         # Windows PowerShell 5.1 - these hosts have no pwsh and their `bash` is an
         # empty WSL shim. ASCII only: 5.1 reads the runner's BOM-less UTF-8 script
@@ -1071,10 +1075,6 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           $compilerOutput | Select-Object -First 1
 
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-        with:
-          persist-credentials: false
-          fetch-depth: 0
 
       - name: Install the release Python requirements
         # The chudware-ci-tools python ships bare; embed_protected_assets and the
@@ -1557,6 +1557,12 @@ jobs:
       # the release token itself and publishes over TLS to the public origin.
       GATEWAY_TOKEN: ${{ secrets.CHUDWARE_GATEWAY_RELEASE_TOKEN }}
     steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+          # The version override replaces `git describe`, but packaging still
+          # reads tags for provenance and build_app.sh sources build.sh.
+          fetch-depth: 0
       - name: Check runner capabilities and select the release Python
         shell: bash
         run: |
@@ -1656,12 +1662,6 @@ jobs:
             echo "CHUDWARE_RELEASE_PYTHON=${release_python}"
           } >> "$GITHUB_ENV"
 
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-        with:
-          persist-credentials: false
-          # The version override replaces `git describe`, but packaging still
-          # reads tags for provenance and build_app.sh sources build.sh.
-          fetch-depth: 0
 
       - name: Open the authenticated channel to the gateway
         shell: bash

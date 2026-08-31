@@ -51,12 +51,30 @@ def _sidecars(tmp_path: Path) -> dict[str, Path]:
         }
         for target in pin_chudcode.SUPPORTED_TARGETS
     }
+    notice_bytes = {
+        "CHUDCODE-NOTICE": b"Chudcode notice\n",
+        "CHUDCODE-THIRD-PARTY-NOTICES.txt": b"third parties\n",
+    }
+    notice_dir = tmp_path / "notices"
+    notice_dir.mkdir()
+    for name, content in notice_bytes.items():
+        (notice_dir / name).write_bytes(content)
     lock = tmp_path / "CHUDCODE_ARTIFACT.lock"
     lock.write_bytes(
         pin_chudcode._canonical_json(
             {
                 "artifacts": artifacts,
                 "engine_version": "18.0.8",
+                "notices": {
+                    "files": {
+                        name: {
+                            "sha256": hashlib.sha256(content).hexdigest(),
+                            "source": pin_chudcode.NOTICE_FILES[name],
+                        }
+                        for name, content in notice_bytes.items()
+                    },
+                    "repository_commit": "1" * 40,
+                },
                 "repository": "https://github.com/Hunter-124/chudcode.git",
                 "repository_commit": "1" * 40,
                 "rpc_protocol": 2,
@@ -66,9 +84,8 @@ def _sidecars(tmp_path: Path) -> dict[str, Path]:
         )
     )
     pin_chudcode.DEFAULT_LOCK = lock
-    pin_chudcode._verify_executable_version = lambda *_args: (
-        "Chudcode v0.2.0 (based on omp 18.0.8)"
-    )
+    pin_chudcode.DEFAULT_NOTICE_DIR = notice_dir
+    pin_chudcode._verify_executable_version = lambda *_args: "Chudcode v0.2.0"
     result["chud_bin"] = chud
     return result
 
@@ -92,14 +109,24 @@ def test_windows_stage_and_manifest_own_complete_runtime_closure(
         "chudware-mcp.exe",
         "chud.exe",
         "CHUDCODE_ARTIFACT.lock",
+        "CHUDCODE-NOTICE",
+        "CHUDCODE-THIRD-PARTY-NOTICES.txt",
         "chudware-uninstall-helper.exe",
     }
     actual = {p.relative_to(dst).as_posix() for p in dst.rglob("*") if p.is_file()}
     assert actual == expected
-    manifest, _, _ = build_manifest(
+    manifest, canonical, _ = build_manifest(
         dst, version="1.2.3", platform="windows", arch="x86_64", key_id="release-v1"
     )
     assert {row["path"] for row in manifest["files"]} == expected
+    by_path = {row["path"]: row for row in manifest["files"]}
+    assert by_path["chud.exe"]["kind"] == "executable"
+    assert by_path["CHUDCODE_ARTIFACT.lock"]["kind"] == "resource"
+    assert by_path["CHUDCODE-NOTICE"]["kind"] == "resource"
+    assert by_path["CHUDCODE-THIRD-PARTY-NOTICES.txt"]["kind"] == "resource"
+    (dst / "CHUDCODE-NOTICE").write_bytes(b"tampered notice")
+    with pytest.raises(payload_manifest.PayloadManifestError, match="do not match"):
+        payload_manifest.verify_manifest_payload(dst, canonical)
 
 
 def test_windows_stage_requires_verified_chudcode_artifact(tmp_path: Path) -> None:

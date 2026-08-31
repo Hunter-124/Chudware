@@ -163,7 +163,9 @@ TARGET_JOINT="$(manifest_value "$TARGET_MANIFEST" joint_sha256)"
 # --------------------------------------------------------------------------
 # Prove the target is still a complete, loadable release before anything moves
 # --------------------------------------------------------------------------
-for f in bin/chudware-hostd bin/libchudware.so bin/chud CHUDCODE_ARTIFACT.lock app/index.html app/Chudware.js app/Chudware.wasm; do
+for f in bin/chudware-hostd bin/libchudware.so bin/chud CHUDCODE_ARTIFACT.lock \
+  CHUDCODE-NOTICE CHUDCODE-THIRD-PARTY-NOTICES.txt \
+  app/index.html app/Chudware.js app/Chudware.wasm; do
   [ -s "$TARGET_DIR/$f" ] || fatal "$TARGET_DIR/$f missing or empty; release $TARGET_ID is not restorable"
 done
 [ -x "$TARGET_DIR/bin/chudware-hostd" ] || fatal "$TARGET_DIR/bin/chudware-hostd is not executable"
@@ -179,12 +181,22 @@ fi
 command -v sha256sum >/dev/null 2>&1 || fatal "sha256sum is required"
 EXPECTED_CHUD_SHA="$(manifest_value "$TARGET_MANIFEST" chud_sha256)"
 EXPECTED_LOCK_SHA="$(manifest_value "$TARGET_MANIFEST" chudcode_artifact_lock_sha256)"
+EXPECTED_NOTICE_SHA="$(manifest_value "$TARGET_MANIFEST" chudcode_notice_sha256)"
+EXPECTED_THIRD_PARTY_NOTICES_SHA="$(manifest_value "$TARGET_MANIFEST" chudcode_third_party_notices_sha256)"
 [ -n "$EXPECTED_CHUD_SHA" ] && [ -n "$EXPECTED_LOCK_SHA" ] \
-  || fatal "$TARGET_ID predates Chudcode artifact evidence and cannot be restored"
+  && [ -n "$EXPECTED_NOTICE_SHA" ] && [ -n "$EXPECTED_THIRD_PARTY_NOTICES_SHA" ] \
+  || fatal "$TARGET_ID predates Chudcode artifact and notice evidence and cannot be restored"
 [ "$(sha256sum "$TARGET_DIR/bin/chud" | cut -d' ' -f1)" = "$EXPECTED_CHUD_SHA" ] \
   || fatal "$TARGET_ID Chudcode binary no longer matches its deploy manifest"
 [ "$(sha256sum "$TARGET_DIR/CHUDCODE_ARTIFACT.lock" | cut -d' ' -f1)" = "$EXPECTED_LOCK_SHA" ] \
   || fatal "$TARGET_ID Chudcode artifact lock no longer matches its deploy manifest"
+[ "$(sha256sum "$TARGET_DIR/CHUDCODE-NOTICE" | cut -d' ' -f1)" = "$EXPECTED_NOTICE_SHA" ] \
+  || fatal "$TARGET_ID Chudcode notice no longer matches its deploy manifest"
+[ "$(sha256sum "$TARGET_DIR/CHUDCODE-THIRD-PARTY-NOTICES.txt" | cut -d' ' -f1)" = "$EXPECTED_THIRD_PARTY_NOTICES_SHA" ] \
+  || fatal "$TARGET_ID Chudcode third-party notices no longer match its deploy manifest"
+"$PYTHON" "$ROOT/scripts/pin_chudcode.py" \
+  --lock "$TARGET_DIR/CHUDCODE_ARTIFACT.lock" check-lock >/dev/null \
+  || fatal "$TARGET_ID Chudcode notices do not satisfy their artifact lock"
 "$PYTHON" "$ROOT/scripts/pin_chudcode.py" \
   --lock "$TARGET_DIR/CHUDCODE_ARTIFACT.lock" verify \
   --target linux-x86_64 --input "$TARGET_DIR/bin/chud" >/dev/null \

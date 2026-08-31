@@ -861,6 +861,47 @@ double faceset_surface_distance(const FacesetSurface& s, const double* p) {
     return std::numeric_limits<double>::infinity();
 }
 
+bool faceset_surface_normal(const FacesetSurface& s, const double* p,
+                            double* normal) {
+    const double vx = p[0] - s.origin[0], vy = p[1] - s.origin[1],
+                 vz = p[2] - s.origin[2];
+    const double h = vx * s.axis[0] + vy * s.axis[1] + vz * s.axis[2];
+    const double rx = vx - h * s.axis[0], ry = vy - h * s.axis[1],
+                 rz = vz - h * s.axis[2];
+    const double radial = std::sqrt(rx * rx + ry * ry + rz * rz);
+    if (s.kind == FacesetSurface::kSphere) {
+        const double n = std::sqrt(vx * vx + vy * vy + vz * vz);
+        if (!(n > 1e-12)) return false;
+        normal[0] = vx / n; normal[1] = vy / n; normal[2] = vz / n;
+        return true;
+    }
+    if (!(radial > 1e-12)) return false;
+    const double ux = rx / radial, uy = ry / radial, uz = rz / radial;
+    if (s.kind == FacesetSurface::kCylinder) {
+        normal[0] = ux; normal[1] = uy; normal[2] = uz;
+        return true;
+    }
+    if (s.kind == FacesetSurface::kCone) {
+        normal[0] = std::cos(s.semi_angle) * ux -
+                    std::sin(s.semi_angle) * s.axis[0];
+        normal[1] = std::cos(s.semi_angle) * uy -
+                    std::sin(s.semi_angle) * s.axis[1];
+        normal[2] = std::cos(s.semi_angle) * uz -
+                    std::sin(s.semi_angle) * s.axis[2];
+        return true;
+    }
+    if (s.kind == FacesetSurface::kTorus) {
+        const double dr = radial - s.r1;
+        const double q = std::sqrt(dr * dr + h * h);
+        if (!(q > 1e-12)) return false;
+        normal[0] = (dr * ux + h * s.axis[0]) / q;
+        normal[1] = (dr * uy + h * s.axis[1]) / q;
+        normal[2] = (dr * uz + h * s.axis[2]) / q;
+        return true;
+    }
+    return false;
+}
+
 std::vector<int> nodes_in_faceset_surface(const std::vector<double>& points,
                                           const std::vector<double>& sample, double tol_mm,
                                           const FacesetSurface& surface, double perp_tol_mm) {
@@ -1012,6 +1053,94 @@ std::vector<int> faceset_membership(const nlohmann::json& fs,
             lru.pop_back();
         }
     }
+    return ids;
+}
+
+// Face selections describe the exterior skin. Analytic/planar tolerances are
+// deliberately wider than a fine volume-mesh layer, so applying them to every
+// volume node also captures near-surface interior nodes. Intersect the geometric
+// match with nodes that actually belong to an exterior element face.
+std::vector<int> boundary_faceset_membership(
+    const nlohmann::json& fs, const std::vector<double>& points,
+    const std::vector<int>& tets, int nodes_per_elem) {
+    std::vector<int> ids = faceset_membership(fs, points);
+    if (ids.empty() || tets.empty()) return ids;
+    const bool hex = nodes_per_elem == 8;
+    if (!hex && nodes_per_elem != 4 && nodes_per_elem != 10) return ids;
+    const int nfaces = hex ? 6 : 4;
+    const int corners_per_face = hex ? 4 : 3;
+    const size_t stride = static_cast<size_t>(nodes_per_elem);
+    std::map<std::array<int, 4>, int> owners;
+    auto key_for = [&](const int* element, const int* face) {
+        std::array<int, 4> key{-1, -1, -1, -1};
+        for (int i = 0; i < corners_per_face; ++i) key[i] = element[face[i]];
+        std::sort(key.begin(), key.begin() + corners_per_face);
+        return key;
+    };
+    for (size_t e = 0; e < tets.size() / stride; ++e) {
+        const int* element = &tets[e * stride];
+        for (int face = 0; face < nfaces; ++face) {
+            const int* table = hex ? kHexFaces[face] : kTetFaces[face].corner;
+            ++owners[key_for(element, table)];
+        }
+    }
+    FacesetSurface analytic_surface;
+    const bool has_analytic_surface = faceset_surface(fs, analytic_surface);
+    std::unordered_set<int> boundary;
+    for (size_t e = 0; e < tets.size() / stride; ++e) {
+        const int* element = &tets[e * stride];
+        for (int face = 0; face < nfaces; ++face) {
+            const int* table = hex ? kHexFaces[face] : kTetFaces[face].corner;
+            if (owners[key_for(element, table)] != 1) continue;
+            if (has_analytic_surface) {
+                double center[3] = {0.0, 0.0, 0.0};
+                for (int i = 0; i < corners_per_face; ++i) {
+                    const double* p =
+                        &points[static_cast<size_t>(element[table[i]]) * 3];
+                    for (int c = 0; c < 3; ++c) center[c] += p[c];
+                }
+                for (double& value : center) value /= corners_per_face;
+                const double* p0 =
+                    &points[static_cast<size_t>(element[table[0]]) * 3];
+                const double* p1 =
+                    &points[static_cast<size_t>(element[table[1]]) * 3];
+                const double* p2 =
+                    &points[static_cast<size_t>(element[table[2]]) * 3];
+                const double a[3] = {p1[0] - p0[0], p1[1] - p0[1],
+                                     p1[2] - p0[2]};
+                const double b[3] = {p2[0] - p0[0], p2[1] - p0[1],
+                                     p2[2] - p0[2]};
+                const double face_normal[3] = {
+                    a[1] * b[2] - a[2] * b[1],
+                    a[2] * b[0] - a[0] * b[2],
+                    a[0] * b[1] - a[1] * b[0]};
+                const double face_norm =
+                    std::sqrt(face_normal[0] * face_normal[0] +
+                              face_normal[1] * face_normal[1] +
+                              face_normal[2] * face_normal[2]);
+                double analytic_normal[3];
+                if (!(face_norm > 1e-12) ||
+                    !faceset_surface_normal(analytic_surface, center,
+                                            analytic_normal))
+                    continue;
+                const double alignment =
+                    std::fabs(face_normal[0] * analytic_normal[0] +
+                              face_normal[1] * analytic_normal[1] +
+                              face_normal[2] * analytic_normal[2]) /
+                    face_norm;
+                if (alignment < 0.5) continue;
+            }
+            for (int i = 0; i < corners_per_face; ++i)
+                boundary.insert(element[table[i]]);
+            if (nodes_per_elem == 10) {
+                const FaceTab& ft = kTetFaces[face];
+                for (int i = 0; i < 3; ++i) boundary.insert(element[ft.mid[i]]);
+            }
+        }
+    }
+    ids.erase(std::remove_if(ids.begin(), ids.end(),
+                             [&](int id) { return !boundary.count(id); }),
+              ids.end());
     return ids;
 }
 
@@ -1215,7 +1344,8 @@ static nlohmann::json fea_run_static_impl(
         for (const auto& load : study["loads"]) {
             const json faces = load.contains("faces") ? load["faces"] : json::object();
             const double tol = faces.value("tol_mm", 1.0);
-            std::vector<int> node_ids = faceset_membership(faces, points);
+            std::vector<int> node_ids =
+                boundary_faceset_membership(faces, points, tets, nodes_per_elem);
             if (node_ids.empty())
                 return json{{"ok", false},
                             {"error", "fea_static: load faces resolved to 0 mesh nodes "
@@ -1321,7 +1451,8 @@ static nlohmann::json fea_run_static_impl(
         std::unordered_set<int> seen;
         for (const auto& fx : study["fixtures"]) {
             const double tol = fx.value("tol_mm", 1.0);
-            std::vector<int> node_ids = faceset_membership(fx, points);
+            std::vector<int> node_ids =
+                boundary_faceset_membership(fx, points, tets, nodes_per_elem);
             if (node_ids.empty())
                 return json{{"ok", false},
                             {"error", "fea_static: fixture faces resolved to 0 mesh nodes "
@@ -1538,6 +1669,10 @@ static nlohmann::json fea_run_static_impl(
         return json{{"ok", false}, {"error", msg}, {"notes", notes}};
     }
     if (nodes_per_elem == 10) notes.push_back("second-order (tet10) elements");
+    if (!fixed_nodes.empty())
+        notes.push_back(
+            "von Mises/FoS summary excludes the two element rings adjacent to ideal "
+            "fixed constraints; full nodal fields remain available");
     // Post-processing (failure criteria + result packaging) — dtor fires at function exit,
     // BEFORE _study's (declared earlier), so the phase lands inside this study.
     chudware::prof::phases::PhaseScope _post("post");
@@ -1757,7 +1892,8 @@ nlohmann::json fea_run_modal(const nlohmann::json& study, int n_modes) {
         std::unordered_set<int> seen;
         for (size_t i = 0; i < study["fixtures"].size(); ++i) {
             const auto& fx = study["fixtures"][i];
-            const std::vector<int> ids = faceset_membership(fx, points);
+            const std::vector<int> ids =
+                boundary_faceset_membership(fx, points, tets, nodes_per_elem);
             if (ids.empty())
                 return json{{"ok", false},
                             {"error", "fea_modal: fixture " + std::to_string(i) +
@@ -1808,7 +1944,8 @@ namespace {
 // unique node ids; empty when the faceset resolves to nothing.
 std::vector<int> resolve_face_nodes(const json& faces, const std::vector<double>& points,
                                     const std::vector<int>& tets, int nodes_per_elem) {
-    std::vector<int> ids = faceset_membership(faces, points);
+    std::vector<int> ids =
+        boundary_faceset_membership(faces, points, tets, nodes_per_elem);
     if (ids.empty()) return ids;
     std::unordered_set<int> node_set(ids.begin(), ids.end());
     add_midside_face_nodes(tets, nodes_per_elem, node_set);

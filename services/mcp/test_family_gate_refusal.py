@@ -27,6 +27,7 @@ appears in the live catalog (str, dict, list, Any, Image).
 
 Run:  python3 -m pytest services/mcp/test_family_gate_refusal.py -q
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -35,6 +36,7 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 import unittest
 import unittest.mock
 
@@ -51,9 +53,13 @@ except Exception as exc:  # pragma: no cover — `mcp` SDK absent
 else:
     _SDK_ERROR = None
 
-_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
+_REPO_ROOT = os.path.dirname(
+    os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+)
 
-pytestmark = pytest.mark.skipif(FastMCP is None, reason=f"mcp SDK unavailable: {_SDK_ERROR}")
+pytestmark = pytest.mark.skipif(
+    FastMCP is None, reason=f"mcp SDK unavailable: {_SDK_ERROR}"
+)
 
 
 def _dispatch(mcp, name: str, args: dict):
@@ -194,7 +200,8 @@ class TestRealReverseEngineerRefusal(unittest.TestCase):
             side_effect=lambda fam, cfg=None: fam != "recon",
         ):
             _content, structured = _dispatch(
-                srv.mcp, "reverse_engineer", {"source": "/nonexistent.step"})
+                srv.mcp, "reverse_engineer", {"source": "/nonexistent.step"}
+            )
         payload = json.loads(structured["result"])
         self.assertFalse(payload["ok"], payload)
         self.assertEqual(payload["family"], "recon")
@@ -210,8 +217,13 @@ class TestSuiteIsHermetic(unittest.TestCase):
 
         # conftest._hermetic_config redirected it; the user's file is untouched.
         self.assertNotEqual(str(paths.CONFIG), str(paths.active_root() / "config.json"))
-        self.assertTrue(str(paths.CONFIG).startswith(("/tmp", "/var/tmp")),
-                        f"config not in a temp dir: {paths.CONFIG}")
+        temp_root = os.path.realpath(tempfile.gettempdir())
+        config_path = os.path.realpath(paths.CONFIG)
+        self.assertEqual(
+            os.path.commonpath((config_path, temp_root)),
+            temp_root,
+            f"config not in the configured temp dir: {paths.CONFIG}",
+        )
         self.assertEqual(agent_config.load_config(), {})
 
     def test_a_recon_test_passes_even_with_recon_disabled_on_disk(self):
@@ -220,18 +232,34 @@ class TestSuiteIsHermetic(unittest.TestCase):
         fixture this reproduced the developer-config leak exactly (4 failures in
         test_recon_tools.py); now the on-disk toggle is inert."""
         import tempfile
+
         with tempfile.TemporaryDirectory(prefix="chudware-hermetic-") as tmp:
             root = os.path.join(tmp, "Chudware")
             os.makedirs(root, exist_ok=True)
             with open(os.path.join(root, "config.json"), "w", encoding="utf-8") as fh:
                 json.dump({"agent": {"tool_families": {"recon": False}}}, fh)
             env = dict(os.environ, XDG_DATA_HOME=tmp)
-            env.pop("CHUDWARE_HOSTD_SOCKET", None)  # child spawns its own private daemon
+            env.pop(
+                "CHUDWARE_HOSTD_SOCKET", None
+            )  # child spawns its own private daemon
             proc = subprocess.run(
-                [sys.executable, "-X", "utf8", "-m", "pytest",
-                 "services/mcp/test_recon_tools.py::test_reverse_engineer_stl_smoke_is_honest",
-                 "-q", "-p", "no:randomly", "--no-header"],
-                cwd=_REPO_ROOT, env=env, capture_output=True, text=True, timeout=900,
+                [
+                    sys.executable,
+                    "-X",
+                    "utf8",
+                    "-m",
+                    "pytest",
+                    "services/mcp/test_recon_tools.py::test_reverse_engineer_stl_smoke_is_honest",
+                    "-q",
+                    "-p",
+                    "no:randomly",
+                    "--no-header",
+                ],
+                cwd=_REPO_ROOT,
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=900,
             )
         tail = proc.stdout[-4000:] + proc.stderr[-2000:]
         self.assertEqual(proc.returncode, 0, tail)

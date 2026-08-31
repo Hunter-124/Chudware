@@ -66,6 +66,14 @@ SizeBand resolve_size_band(const TopoDS_Shape &shape,
   double base = explicit_size ? options.target_size_mm : diagonal / divisor;
   if (!explicit_size && std::isfinite(minimum_side) && minimum_side < 1e29)
     base = std::min(base, minimum_side);
+  // min/max constrain the automatically resolved base; they are not
+  // advisor-only hints. Apply them before the governor safety check so a small
+  // load/contact patch can request enough surface resolution without replacing
+  // the user's fineness setting with an unrelated explicit target size.
+  if (options.max_size_mm > 0.0)
+    base = std::min(base, options.max_size_mm);
+  if (options.min_size_mm > 0.0)
+    base = std::max(base, options.min_size_mm);
 
   auto append_note = [&band](const char *text) {
     band.note = band.note.empty() ? std::string(text) : band.note + "; " + text;

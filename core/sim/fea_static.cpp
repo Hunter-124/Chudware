@@ -1189,18 +1189,57 @@ FeaStaticResult fea_static_solve(const std::vector<double>& points, const std::v
         res.max_shear[i] = (p1 - p3) * 0.5;
     }
 
-    // Summary (max von Mises, max disp, min factor of safety clipped to [0,15]).
+    // Stress immediately adjacent to an ideal fully-fixed boundary is a
+    // discretization singularity: its peak depends on Poisson ratio and mesh
+    // orientation and does not converge to a material-comparable design value.
+    // Keep the full nodal fields, but report extrema from nodes outside the
+    // two-element fixture patch. If the fixture consumes the whole mesh, fall
+    // back to the complete field rather than fabricating a zero-stress result.
+    std::vector<char> summary_node(static_cast<size_t>(n_nodes), 1);
+    if (!fixed_nodes.empty()) {
+        std::vector<char> excluded(static_cast<size_t>(n_nodes), 0);
+        for (int node : fixed_nodes) excluded[static_cast<size_t>(node)] = 1;
+        // Two element rings put the reported peak beyond the ideal clamp's
+        // Poisson-sensitive boundary layer while retaining the full field for
+        // callers that explicitly inspect the fixture neighbourhood.
+        for (int ring = 0; ring < 2; ++ring) {
+            std::vector<char> expanded = excluded;
+            for (int e = 0; e < n_tets; ++e) {
+                const int* element = &tets[static_cast<size_t>(e) * stride];
+                bool touches_excluded = false;
+                for (int j = 0; j < stride; ++j)
+                    touches_excluded = touches_excluded ||
+                                       excluded[static_cast<size_t>(element[j])];
+                if (touches_excluded)
+                    for (int j = 0; j < stride; ++j)
+                        expanded[static_cast<size_t>(element[j])] = 1;
+            }
+            excluded.swap(expanded);
+        }
+        for (int i = 0; i < n_nodes; ++i)
+            summary_node[static_cast<size_t>(i)] =
+                !excluded[static_cast<size_t>(i)];
+        if (std::none_of(summary_node.begin(), summary_node.end(),
+                         [](char selected) { return selected != 0; }))
+            std::fill(summary_node.begin(), summary_node.end(), 1);
+    }
+    // Summary (trusted max von Mises, global max displacement, factor of safety).
     double max_vm = 0.0, max_disp = 0.0;
-    for (double v : res.von_mises) max_vm = std::max(max_vm, v);
+    for (int i = 0; i < n_nodes; ++i)
+        if (summary_node[static_cast<size_t>(i)])
+            max_vm = std::max(max_vm, res.von_mises[static_cast<size_t>(i)]);
     for (double v : res.disp_magnitude) max_disp = std::max(max_disp, v);
     double min_fos = 15.0;
     bool any = false;
-    for (double v : res.von_mises)
+    for (int i = 0; i < n_nodes; ++i) {
+        if (!summary_node[static_cast<size_t>(i)]) continue;
+        const double v = res.von_mises[static_cast<size_t>(i)];
         if (v > 0.0) {
-            double fos = yield_mpa / v;
+            const double fos = yield_mpa / v;
             if (!any || fos < min_fos) min_fos = fos;
             any = true;
         }
+    }
     if (!any) min_fos = 15.0;
     min_fos = std::min(std::max(min_fos, 0.0), 15.0);
 
@@ -1213,6 +1252,7 @@ FeaStaticResult fea_static_solve(const std::vector<double>& points, const std::v
     bool first_p1 = true, first_p3 = true;
     for (int i = 0; i < n_nodes; ++i) {
         if (vm_count[i] <= 0) continue;
+        if (!summary_node[static_cast<size_t>(i)]) continue;
         const double p1 = res.principal1[i], p3 = res.principal3[i], sh = res.max_shear[i];
         if (first_p1 || p1 > max_p1) { max_p1 = p1; first_p1 = false; }
         if (first_p3 || p3 < min_p3) { min_p3 = p3; first_p3 = false; }

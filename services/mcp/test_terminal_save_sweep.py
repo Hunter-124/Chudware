@@ -19,6 +19,7 @@ and no file is written for a document that holds nothing.
 
 Run:  python3 -m pytest services/mcp/test_terminal_save_sweep.py -q -p no:randomly
 """
+
 from __future__ import annotations
 
 import sys
@@ -74,9 +75,18 @@ def sweep(monkeypatch, tmp_path):
 def test_an_unsaved_agent_part_is_written_to_the_project_folder(sweep, tmp_path):
     """The reported case: the doc has geometry and no file, so hostd would retire it."""
     fake = sweep(
-        [{"doc_id": "doc-cpp00000002", "name": "ruger_lcp_iwb_holster", "kind": "part",
-          "feature_count": 6, "revision": 3, "dirty": True, "path": "",
-          "origin_kind": "mcp"}],
+        [
+            {
+                "doc_id": "doc-cpp00000002",
+                "name": "ruger_lcp_iwb_holster",
+                "kind": "part",
+                "feature_count": 6,
+                "revision": 3,
+                "dirty": True,
+                "path": "",
+                "origin_kind": "mcp",
+            }
+        ],
         touched=["doc-cpp00000002"],
     )
     out = C.save_touched_docs()
@@ -94,24 +104,43 @@ def test_a_doc_already_in_a_real_clean_file_is_left_alone(sweep, tmp_path):
     that hostd would not retire must not be rewritten."""
     existing = tmp_path / "Projects" / "Testing" / "bracket.step+"
     fake = sweep(
-        [{"doc_id": "d1", "name": "bracket", "kind": "part", "feature_count": 4,
-          "dirty": False, "path": str(existing), "origin_kind": "mcp"}],
+        [
+            {
+                "doc_id": "d1",
+                "name": "bracket",
+                "kind": "part",
+                "feature_count": 4,
+                "dirty": False,
+                "path": str(existing),
+                "origin_kind": "mcp",
+            }
+        ],
         touched=["d1"],
     )
     out = C.save_touched_docs()
 
     assert fake.saves == []
     assert out["saved"] == []
-    assert out["skipped"] == [{"doc_id": "d1", "name": "bracket",
-                               "reason": "already_saved"}]
+    assert out["skipped"] == [
+        {"doc_id": "d1", "name": "bracket", "reason": "already_saved"}
+    ]
 
 
 def test_the_users_own_document_is_never_touched(sweep):
     """A dirty unsaved GUI document is exactly the work the recovery prompt exists to
     protect. Saving it over a guessed filename would be data loss dressed as tidying."""
     fake = sweep(
-        [{"doc_id": "d-gui", "name": "Part1", "kind": "part", "feature_count": 9,
-          "dirty": True, "path": "", "origin_kind": "gui"}],
+        [
+            {
+                "doc_id": "d-gui",
+                "name": "Part1",
+                "kind": "part",
+                "feature_count": 9,
+                "dirty": True,
+                "path": "",
+                "origin_kind": "gui",
+            }
+        ],
         touched=[],
     )
     out = C.save_touched_docs()
@@ -124,8 +153,17 @@ def test_a_touched_doc_that_the_gui_adopted_is_still_left_alone(sweep):
     """Adoption transfers ownership: once origin is gui the user's save decisions win,
     even for a document this worker created earlier in the run."""
     fake = sweep(
-        [{"doc_id": "d1", "name": "holster", "kind": "part", "feature_count": 5,
-          "dirty": True, "path": "", "origin_kind": "gui"}],
+        [
+            {
+                "doc_id": "d1",
+                "name": "holster",
+                "kind": "part",
+                "feature_count": 5,
+                "dirty": True,
+                "path": "",
+                "origin_kind": "gui",
+            }
+        ],
         touched=["d1"],
     )
     out = C.save_touched_docs()
@@ -138,8 +176,18 @@ def test_an_empty_doc_never_becomes_a_file(sweep):
     """hostd purges empty docs instead of retiring them, so there is nothing to rescue —
     and a stub .step+ in the user's project folder is exactly the clutter being fixed."""
     fake = sweep(
-        [{"doc_id": "d1", "name": "holster", "kind": "part", "feature_count": 0,
-          "empty": True, "dirty": False, "path": "", "origin_kind": "mcp"}],
+        [
+            {
+                "doc_id": "d1",
+                "name": "holster",
+                "kind": "part",
+                "feature_count": 0,
+                "empty": True,
+                "dirty": False,
+                "path": "",
+                "origin_kind": "mcp",
+            }
+        ],
         touched=["d1"],
     )
     out = C.save_touched_docs()
@@ -153,8 +201,17 @@ def test_a_crash_autosave_path_does_not_count_as_saved(sweep, tmp_path):
     recovery, not a file the user can find."""
     snap = C._autosave_dir() / "sess-holster.step+"
     fake = sweep(
-        [{"doc_id": "d1", "name": "holster", "kind": "part", "feature_count": 5,
-          "dirty": False, "path": str(snap), "origin_kind": "mcp"}],
+        [
+            {
+                "doc_id": "d1",
+                "name": "holster",
+                "kind": "part",
+                "feature_count": 5,
+                "dirty": False,
+                "path": str(snap),
+                "origin_kind": "mcp",
+            }
+        ],
         touched=["d1"],
     )
     out = C.save_touched_docs()
@@ -167,9 +224,18 @@ def test_an_assembly_is_swept_on_its_component_count(sweep):
     """An assembly's content is components, not features — reading only feature_count
     would silently skip every assembly the agent built."""
     fake = sweep(
-        [{"doc_id": "d1", "name": "motor_mount", "kind": "assembly",
-          "feature_count": 0, "component_count": 4, "dirty": True, "path": "",
-          "origin_kind": "mcp"}],
+        [
+            {
+                "doc_id": "d1",
+                "name": "motor_mount",
+                "kind": "assembly",
+                "feature_count": 0,
+                "component_count": 4,
+                "dirty": True,
+                "path": "",
+                "origin_kind": "mcp",
+            }
+        ],
         touched=["d1"],
     )
     out = C.save_touched_docs()
@@ -183,8 +249,17 @@ def test_an_agent_origin_doc_this_process_never_touched_is_still_swept(sweep):
     in this process's registry. origin_kind is the engine's own attribution and covers
     it — without this the very docs that flooded the prompt would be missed."""
     fake = sweep(
-        [{"doc_id": "d-earlier", "name": "holster", "kind": "part", "feature_count": 6,
-          "dirty": True, "path": "", "origin_kind": "agent"}],
+        [
+            {
+                "doc_id": "d-earlier",
+                "name": "holster",
+                "kind": "part",
+                "feature_count": 6,
+                "dirty": True,
+                "path": "",
+                "origin_kind": "agent",
+            }
+        ],
         touched=[],
     )
     out = C.save_touched_docs()
@@ -196,8 +271,17 @@ def test_a_touched_dirty_doc_without_a_project_folder_is_a_persistence_failure(s
     """A mutation with no durable destination is not a successful no-op. The geometry
     may still be live in hostd, but the caller must downgrade delivery until it is saved."""
     fake = sweep(
-        [{"doc_id": "d1", "name": "holster", "kind": "part", "feature_count": 6,
-          "dirty": True, "path": "", "origin_kind": "mcp"}],
+        [
+            {
+                "doc_id": "d1",
+                "name": "holster",
+                "kind": "part",
+                "feature_count": 6,
+                "dirty": True,
+                "path": "",
+                "origin_kind": "mcp",
+            }
+        ],
         touched=["d1"],
         project_dir=None,
     )
@@ -238,7 +322,8 @@ def test_note_touched_doc_keeps_build_order_and_dedupes(monkeypatch):
 
 
 def test_agent_admin_turn_rejects_explicit_invalid_workspace_before_provider(
-    monkeypatch, tmp_path,
+    monkeypatch,
+    tmp_path,
 ):
     """Bad durable-delivery plumbing is rejected before a completion can spend tokens."""
     from services.agent import config as agent_config
@@ -267,17 +352,15 @@ def test_agent_admin_turn_rejects_explicit_invalid_workspace_before_provider(
 def test_crash_save_runs_and_surfaces_all_finalization_faults(monkeypatch):
     """A usage-sink reset fault must not jump over the crash-path save. The original
     turn crash, reset fault, and persistence failure all remain visible to the caller."""
-    from services.agent import config as agent_config
-    from services.agent import mission_dispatch
     from services.agent import worker_rpc
     from services.agent.providers import token_usage
 
-    monkeypatch.setattr(agent_config, "get_provider", lambda *args, **kwargs: object())
     monkeypatch.setattr(
-        mission_dispatch,
-        "run_linear_role_turn",
+        worker_rpc,
+        "chudcode_agent_turn",
         lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("turn crashed")),
     )
+
     monkeypatch.setattr(
         token_usage,
         "reset_usage_sink",

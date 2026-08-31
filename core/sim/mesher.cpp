@@ -1,9 +1,12 @@
 // Polyhedral-FEA mesher and adaptive-refinement bridge for Chudware.
 #include "sim/mesher.h"
 
+#include "prof/phases.h"
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstdio>
+#include <chrono>
 #include <cstdlib>
 #include <filesystem>
 #include <limits>
@@ -13,6 +16,7 @@
 #include <stdexcept>
 #include <string>
 #include <system_error>
+#include <thread>
 #include <vector>
 
 // Module-path lookup for the staged advisor model directory — the one reason
@@ -33,6 +37,9 @@
 #endif // CHUDWARE_WITH_POLYMESH_ADVISOR
 
 #include <TopoDS_Shape.hxx>
+#include <BRepTools.hxx>
+#include <TopAbs_ShapeEnum.hxx>
+#include <TopExp_Explorer.hxx>
 
 #include "sim/mesh_size_band.h"
 #include "sim/solver_threads.h"
@@ -527,15 +534,18 @@ bool build_mesh(const LoadedModel &loaded, const MeshOptions &options, double h,
   // Graded tet is the one Polyhedral-FEA family that matches Chudware's
   // fixed-stride tet solve contract and accepts the spatial size field used by
   // adaptive refinement.
-  const pm::pipeline::VolumeMeshOutput volume = pm::pipeline::volume_mesh(
-      loaded.model, h, pm::pipeline::VolumeMesher::kGradedTet,
-      /*skin_layers=*/2,
-      // Coarse/draft must stay interactive; the graded skin remains active, while the
-      // extra sharp-edge/thickness pass starts at the product's medium setting.
-      /*feature_refine=*/options.fineness >= 0.5, /*refine_seeds=*/{},
-      /*seed_band=*/0.0,
-      /*element_tendency=*/0.0, resolved.element_ceiling, resolved.dof_ceiling,
-      /*auto_retry_budget=*/0, /*cancel_check=*/{}, size_field);
+  const pm::pipeline::VolumeMeshOutput volume = [&] {
+    chudware::prof::phases::PhaseScope phase("generate");
+    return pm::pipeline::volume_mesh(
+        loaded.model, h, pm::pipeline::VolumeMesher::kGradedTet,
+        /*skin_layers=*/2,
+        // Coarse/draft must stay interactive; the graded skin remains active, while the
+        // extra sharp-edge/thickness pass starts at the product's medium setting.
+        /*feature_refine=*/options.fineness >= 0.5, /*refine_seeds=*/{},
+        /*seed_band=*/0.0,
+        /*element_tendency=*/0.0, resolved.element_ceiling, resolved.dof_ceiling,
+        /*auto_retry_budget=*/0, /*cancel_check=*/{}, size_field);
+  }();
 
   nodal = volume.mesh;
   if (options.order == 2) {
@@ -555,6 +565,7 @@ bool build_mesh(const LoadedModel &loaded, const MeshOptions &options, double h,
   }
   nodal.compact_unused_nodes();
 
+  chudware::prof::phases::PhaseScope extract_phase("extract");
   const int stride = options.order == 2 ? 10 : 4;
   const pm::fea::ElementType want = options.order == 2
                                         ? pm::fea::ElementType::kTet10
@@ -617,6 +628,118 @@ bool build_mesh(const LoadedModel &loaded, const MeshOptions &options, double h,
   return true;
 }
 
+bool retryable_lattice_guard(const std::string &error) {
+  return error.find("geometry fill-stage guard failed") != std::string::npos;
+}
+
+bool mesh_loaded_model(const LoadedModel &loaded, const MeshOptions &options,
+                       MeshOut &out) {
+  const AdvisorPlan plan = make_advisor_plan(loaded, options);
+  auto attempt = [&](double h) {
+    out = MeshOut();
+    out.advisor = plan.result;
+    append_note(out.note, loaded.band.note);
+    if (out.advisor)
+      append_note(out.note, out.advisor->note);
+    pm::fea::NodalMesh nodal;
+    try {
+      return build_mesh(loaded, plan.options, h, {}, nodal, out);
+    } catch (const std::exception &e) {
+      out.ok = false;
+      out.error = e.what();
+      return false;
+    }
+  };
+  if (attempt(plan.h))
+    return true;
+  const std::string first_error = out.error;
+  if (!retryable_lattice_guard(first_error))
+    return false;
+
+  // Graded-tet boundary fitting is lattice-phase sensitive: a valid BRep can
+  // land exactly on a non-manifold/coincident skin at one bulk-cell pitch while
+  // a nearby pitch is watertight. One bounded deterministic 6.25% coarser retry
+  // changes the phase without weakening the geometry guard or exploding DOFs.
+  if (attempt(plan.h * 1.0625)) {
+    append_note(out.note,
+                "graded-tet lattice guard recovered on deterministic 17/16 "
+                "element-size retry");
+    return true;
+  }
+  out.error = first_error + "; deterministic 17/16 lattice retry also failed: " +
+              out.error;
+  return false;
+}
+
+std::vector<TopoDS_Shape> model_solids(const LoadedModel &loaded) {
+  std::vector<TopoDS_Shape> solids;
+  if (!loaded.model.cad || loaded.model.cad->shape_handle() == nullptr)
+    return solids;
+  const auto &shape =
+      *static_cast<const TopoDS_Shape *>(loaded.model.cad->shape_handle());
+  for (TopExp_Explorer it(shape, TopAbs_SOLID); it.More(); it.Next())
+    solids.push_back(it.Current());
+  return solids;
+}
+
+bool mesh_separate_solids(const std::vector<TopoDS_Shape> &solids,
+                          const MeshOptions &options, MeshOut &out) {
+  static std::atomic<uint64_t> sequence{0};
+  MeshOut combined;
+  combined.nodes_per_elem = options.order == 2 ? 10 : 4;
+  combined.mesh_type_used = options.order == 2 ? "tet10" : "tet4";
+  combined.char_len_mm = std::numeric_limits<double>::infinity();
+  for (size_t i = 0; i < solids.size(); ++i) {
+    const uint64_t ticket = sequence.fetch_add(1, std::memory_order_relaxed);
+    const auto stamp = std::chrono::steady_clock::now().time_since_epoch().count();
+    const std::filesystem::path path =
+        std::filesystem::temp_directory_path() /
+        ("chudware-mesh-solid-" + std::to_string(stamp) + "-" +
+         std::to_string(ticket) + "-" + std::to_string(i) + ".brep");
+    if (!BRepTools::Write(solids[i], path.string().c_str())) {
+      out.error = "failed to serialize solid " + std::to_string(i + 1) +
+                  " for separate-body meshing";
+      return false;
+    }
+    LoadedModel loaded;
+    std::string load_error;
+    const bool loaded_ok = load_model(path.string(), options, loaded, load_error);
+    std::error_code remove_error;
+    std::filesystem::remove(path, remove_error);
+    if (!loaded_ok) {
+      out.error = "solid " + std::to_string(i + 1) + ": " + load_error;
+      return false;
+    }
+    MeshOut part;
+    if (!mesh_loaded_model(loaded, options, part)) {
+      out.error = "solid " + std::to_string(i + 1) + ": " + part.error;
+      return false;
+    }
+    const int node_offset = static_cast<int>(combined.points.size() / 3);
+    combined.points.insert(combined.points.end(), part.points.begin(),
+                           part.points.end());
+    combined.tets.reserve(combined.tets.size() + part.tets.size());
+    for (int node : part.tets)
+      combined.tets.push_back(node + node_offset);
+    combined.n_nodes += part.n_nodes;
+    combined.n_elems += part.n_elems;
+    combined.char_len_mm = std::min(combined.char_len_mm, part.char_len_mm);
+    append_note(combined.note, part.note);
+    if (!combined.advisor && part.advisor)
+      combined.advisor = part.advisor;
+  }
+  append_note(combined.note, std::to_string(solids.size()) +
+                                 " separate solid bodies meshed independently");
+  if (!detail::fill_quality(combined)) {
+    out = std::move(combined);
+    out.ok = false;
+    return false;
+  }
+  combined.ok = true;
+  out = std::move(combined);
+  return true;
+}
+
 } // namespace
 
 MeshOut mesh_step(const std::string &step_path, const MeshOptions &options) {
@@ -627,19 +750,23 @@ MeshOut mesh_step(const std::string &step_path, const MeshOptions &options) {
   }
   init_polymesh_runtime();
 
+  chudware::prof::phases::StudyScope study_scope("mesh_tet");
   try {
     LoadedModel loaded;
-    if (!load_model(step_path, options, loaded, out.error)) {
-      out.ok = false;
-      return out;
+    {
+      chudware::prof::phases::PhaseScope phase("load_step");
+      if (!load_model(step_path, options, loaded, out.error)) {
+        out.ok = false;
+        return out;
+      }
     }
-    AdvisorPlan plan = make_advisor_plan(loaded, options);
-    out.advisor = plan.result;
-    append_note(out.note, loaded.band.note);
-    if (out.advisor)
-      append_note(out.note, out.advisor->note);
-    pm::fea::NodalMesh nodal;
-    build_mesh(loaded, plan.options, plan.h, {}, nodal, out);
+    const std::vector<TopoDS_Shape> solids = model_solids(loaded);
+    if (solids.size() > 1)
+      mesh_separate_solids(solids, options, out);
+    else
+      mesh_loaded_model(loaded, options, out);
+    if (!out.ok && !out.error.starts_with("polymesh mesher failed: "))
+      out.error = "polymesh mesher failed: " + out.error;
     return out;
   } catch (const std::exception &e) {
     out.ok = false;

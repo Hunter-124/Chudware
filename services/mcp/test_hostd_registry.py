@@ -5,6 +5,7 @@ Each test uses a scratch CHUDWARE_INSTANCE_KEY (its own daemon, its own
 hostd_autosave/<key> dir) so a live dev/installed daemon is never touched.
 Skips when no chudware-hostd binary is built (mirrors test_daemon_bridge.py).
 """
+
 from __future__ import annotations
 
 import json
@@ -24,10 +25,17 @@ HOSTD = daemon_bridge.resolve_hostd_bin()
 pytestmark = pytest.mark.skipif(HOSTD is None, reason="chudware-hostd not built")
 
 # A minimal valid mutating op (verified against the engine's add_feature schema).
-BOX_OPS = [{"op": "add_feature",
-            "feature": {"type": "box", "name": "b1",
-                        "params": {"length": 10, "width": 10, "height": 10},
-                        "refs": {}}}]
+BOX_OPS = [
+    {
+        "op": "add_feature",
+        "feature": {
+            "type": "box",
+            "name": "b1",
+            "params": {"length": 10, "width": 10, "height": 10},
+            "refs": {},
+        },
+    }
+]
 
 
 _BOX_N = [0]
@@ -37,11 +45,22 @@ def _box_ops(name: str) -> list:
     # Each box lands at a fresh offset so it's never swallowed by an earlier one
     # (a fully-buried boss gets rolled back and would NOT advance the revision).
     _BOX_N[0] += 1
-    return [{"op": "add_feature",
-             "feature": {"type": "box", "name": name,
-                         "params": {"length": 5, "width": 5, "height": 5,
-                                    "at": [20 * _BOX_N[0], 0, 0]},
-                         "refs": {}}}]
+    return [
+        {
+            "op": "add_feature",
+            "feature": {
+                "type": "box",
+                "name": name,
+                "params": {
+                    "length": 5,
+                    "width": 5,
+                    "height": 5,
+                    "at": [20 * _BOX_N[0], 0, 0],
+                },
+                "refs": {},
+            },
+        }
+    ]
 
 
 @pytest.fixture()
@@ -234,8 +253,18 @@ def test_doc_snapshot_served_immediately_after_mint(scratch_daemon):
     assert snap["doc_id"] == doc
     assert snap["revision"] == 0
     # Shape parity with a real doc.changed push — the host parses ONE schema.
-    for key in ("source_client", "source_kind", "method", "user",
-                "tree", "owner_map", "datums", "rebuild", "feature_status", "aicm_path"):
+    for key in (
+        "source_client",
+        "source_kind",
+        "method",
+        "user",
+        "tree",
+        "owner_map",
+        "datums",
+        "rebuild",
+        "feature_status",
+        "aicm_path",
+    ):
         assert key in snap, (key, sorted(snap))
     assert snap["method"] == "doc_new"
     # Empty part: a named tree with no features, and a bodiless-but-loadable AICM.
@@ -264,13 +293,15 @@ def test_doc_snapshot_mint_seed_yields_to_real_geometry(scratch_daemon):
     assert len(live["tree"]["features"]) == 1
     assert live["aicm_path"] != seed["aicm_path"]
 
+
 def _configure_full_mock_agent(monkeypatch, tmp_path) -> None:
     """Keep agent_run_v2 on the full in-process run.cpp path, never the micro lane."""
     monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path))
     cfg_dir = tmp_path / "Chudware"
     cfg_dir.mkdir(parents=True, exist_ok=True)
     (cfg_dir / "config.json").write_text(
-        json.dumps({"micro_mode": False}), encoding="utf-8")
+        json.dumps({"micro_mode": False}), encoding="utf-8"
+    )
 
 
 def _agent_assembly_provider(assembly_name: str) -> dict:
@@ -280,44 +311,61 @@ def _agent_assembly_provider(assembly_name: str) -> dict:
         "assembly": True,
         "name": assembly_name,
         "parts": [
-            {"name": assembly_name + "_A", "purpose": "probe child A",
-             "dimensions": {}, "features": ["box"],
-             "placement": {"pos": [0, 0, 0], "rot": [0, 0, 0]}},
-            {"name": assembly_name + "_B", "purpose": "probe child B",
-             "dimensions": {}, "features": ["box"],
-             "placement": {"pos": [20, 0, 0], "rot": [0, 0, 0]}},
+            {
+                "name": assembly_name + "_A",
+                "purpose": "probe child A",
+                "dimensions": {},
+                "features": ["box"],
+                "placement": {"pos": [0, 0, 0], "rot": [0, 0, 0]},
+            },
+            {
+                "name": assembly_name + "_B",
+                "purpose": "probe child B",
+                "dimensions": {},
+                "features": ["box"],
+                "placement": {"pos": [20, 0, 0], "rot": [0, 0, 0]},
+            },
         ],
     }
     return {
         "name": "mock",
         "replies": {
-            "intake": [json.dumps({
-                "object": "two-part assembly",
-                "key_dims": {"span": 40},
-                "features": ["two child parts"],
-            })],
+            "intake": [
+                json.dumps(
+                    {
+                        "object": "two-part assembly",
+                        "key_dims": {"span": 40},
+                        "features": ["two child parts"],
+                    }
+                )
+            ],
             "planner": [json.dumps(plan)],
             "modeler": ["not-json"],
         },
     }
 
 
-def _run_agent_assembly(runner: DaemonClient, assembly_name: str, *,
-                        internal: bool = False) -> dict:
-    seed = runner.call(
-        "doc_new", {"name": "RegistrySeed" + uuid.uuid4().hex[:8]})["doc_id"]
-    return runner.call("agent_run_v2", {
-        "request": "Build a two-part mechanical assembly with separate child parts",
-        "doc_id": seed,
-        "provider": _agent_assembly_provider(assembly_name),
-        "options": {
-            "offline": True,
-            "complexity": "complex",
-            "advisor": False,
-            "internal": internal,
-            "run_id": "registry-" + uuid.uuid4().hex[:8],
+def _run_agent_assembly(
+    runner: DaemonClient, assembly_name: str, *, internal: bool = False
+) -> dict:
+    seed = runner.call("doc_new", {"name": "RegistrySeed" + uuid.uuid4().hex[:8]})[
+        "doc_id"
+    ]
+    return runner.call(
+        "agent_run_v2",
+        {
+            "request": "Build a two-part mechanical assembly with separate child parts",
+            "doc_id": seed,
+            "provider": _agent_assembly_provider(assembly_name),
+            "options": {
+                "offline": True,
+                "complexity": "complex",
+                "advisor": False,
+                "internal": internal,
+                "run_id": "registry-" + uuid.uuid4().hex[:8],
+            },
         },
-    })
+    )
 
 
 def _agent_spectator(scratch_daemon) -> tuple[DaemonClient, DaemonClient]:
@@ -345,24 +393,31 @@ def test_inprocess_agent_mint_reaches_spectator(scratch_daemon, monkeypatch, tmp
     events = _drain_all(spectator)
 
     child = name + "_A"
-    opened_at = next(i for i, e in enumerate(events)
-                     if e.get("event") == "doc.opened" and
-                     e.get("data", {}).get("name") == child)
+    opened_at = next(
+        i
+        for i, e in enumerate(events)
+        if e.get("event") == "doc.opened" and e.get("data", {}).get("name") == child
+    )
     child_doc = events[opened_at]["data"]["doc_id"]
-    changed_at = [i for i, e in enumerate(events)
-                  if e.get("event") == "doc.changed" and
-                  e.get("data", {}).get("doc_id") == child_doc]
+    changed_at = [
+        i
+        for i, e in enumerate(events)
+        if e.get("event") == "doc.changed"
+        and e.get("data", {}).get("doc_id") == child_doc
+    ]
     assert not changed_at or opened_at < changed_at[0], events
     assert events[opened_at]["data"]["source_kind"] == "agent"
     assert events[opened_at]["data"]["revision"] == 0
     source_events = _drain_all(runner)
-    assert any(e.get("event") == "doc.opened" and
-               e.get("data", {}).get("doc_id") == child_doc
-               for e in source_events), source_events
+    assert any(
+        e.get("event") == "doc.opened" and e.get("data", {}).get("doc_id") == child_doc
+        for e in source_events
+    ), source_events
 
 
 def test_inprocess_agent_mint_seeds_revision_zero_snapshot(
-        scratch_daemon, monkeypatch, tmp_path):
+    scratch_daemon, monkeypatch, tmp_path
+):
     """The bare child remains spectatable at revision 0 without taking its engine lock."""
     _configure_full_mock_agent(monkeypatch, tmp_path)
     runner, spectator = _agent_spectator(scratch_daemon)
@@ -370,9 +425,12 @@ def test_inprocess_agent_mint_seeds_revision_zero_snapshot(
     _run_agent_assembly(runner, name)
     time.sleep(0.2)
     events = _drain_all(spectator)
-    opened = next(e for e in events
-                  if e.get("event") == "doc.opened" and
-                  e.get("data", {}).get("name") == name + "_A")
+    opened = next(
+        e
+        for e in events
+        if e.get("event") == "doc.opened"
+        and e.get("data", {}).get("name") == name + "_A"
+    )
 
     snap = spectator.call("doc_snapshot", {"doc_id": opened["data"]["doc_id"]})
     assert snap.get("has_snapshot") is True, snap
@@ -384,7 +442,8 @@ def test_inprocess_agent_mint_seeds_revision_zero_snapshot(
 
 
 def test_inprocess_agent_apply_publishes_each_feature_batch(
-        scratch_daemon, monkeypatch, tmp_path):
+    scratch_daemon, monkeypatch, tmp_path
+):
     """Two modeler commits are two live doc.changed pushes, not one terminal resync."""
     _configure_full_mock_agent(monkeypatch, tmp_path)
     runner, spectator = _agent_spectator(scratch_daemon)
@@ -392,52 +451,94 @@ def test_inprocess_agent_apply_publishes_each_feature_batch(
     time.sleep(0.1)
     _drain_all(spectator)  # discard the ordinary socket-level mint
 
-    first = [{"op": "add_feature", "feature": {
-        "type": "box", "name": "Base",
-        "params": {"length": 10, "width": 10, "height": 10}, "refs": {}}}]
-    second = [{"op": "add_feature", "feature": {
-        "type": "box", "name": "Second",
-        "params": {"length": 5, "width": 5, "height": 5, "at": [20, 0, 0]},
-        "refs": {}}}]
+    first = [
+        {
+            "op": "add_feature",
+            "feature": {
+                "type": "box",
+                "name": "Base",
+                "params": {"length": 10, "width": 10, "height": 10},
+                "refs": {},
+            },
+        }
+    ]
+    second = [
+        {
+            "op": "add_feature",
+            "feature": {
+                "type": "box",
+                "name": "Second",
+                "params": {"length": 5, "width": 5, "height": 5, "at": [20, 0, 0]},
+                "refs": {},
+            },
+        }
+    ]
     provider = {
         "name": "mock",
         "replies": {
-            "intake": [json.dumps({
-                "object": "two-box probe", "key_dims": {"size": 10},
-                "features": ["base", "second box"]})],
-            "planner": [json.dumps({
-                "parts": [{
-                    "name": "probe", "purpose": "registry publication",
-                    "dimensions": {"base": 10},
-                    "features": ["add the second box"],
-                }]
-            })],
+            "intake": [
+                json.dumps(
+                    {
+                        "object": "two-box probe",
+                        "key_dims": {"size": 10},
+                        "features": ["base", "second box"],
+                    }
+                )
+            ],
+            "planner": [
+                json.dumps(
+                    {
+                        "parts": [
+                            {
+                                "name": "probe",
+                                "purpose": "registry publication",
+                                "dimensions": {"base": 10},
+                                "features": ["add the second box"],
+                            }
+                        ]
+                    }
+                )
+            ],
             "modeler": [json.dumps(first), json.dumps(second)],
             "reviewer": [json.dumps({"done": True, "issues": []})],
-            "memory": [json.dumps({
-                "name": "Agent Batch Probe",
-                "summary": "two-box registry probe",
-                "decisions": [], "open_issues": [],
-            })],
+            "memory": [
+                json.dumps(
+                    {
+                        "name": "Agent Batch Probe",
+                        "summary": "two-box registry probe",
+                        "decisions": [],
+                        "open_issues": [],
+                    }
+                )
+            ],
         },
     }
-    result = runner.call("agent_run_design", {
-        "request": "Build a simple two-box probe",
-        "doc_id": doc,
-        "provider": provider,
-        "options": {
-            "offline": True, "complexity": "standard", "advisor": False,
-            "run_id": "registry-batches-" + uuid.uuid4().hex[:6],
+    result = runner.call(
+        "agent_run_design",
+        {
+            "request": "Build a simple two-box probe",
+            "doc_id": doc,
+            "provider": provider,
+            "options": {
+                "offline": True,
+                "complexity": "standard",
+                "advisor": False,
+                "run_id": "registry-batches-" + uuid.uuid4().hex[:6],
+            },
         },
-    })
+    )
     assert result.get("_is_error") is None, result
     time.sleep(0.2)
-    changed = [e for e in _drain_all(spectator)
-               if e.get("event") == "doc.changed" and
-               e.get("data", {}).get("doc_id") == doc]
+    changed = [
+        e
+        for e in _drain_all(spectator)
+        if e.get("event") == "doc.changed" and e.get("data", {}).get("doc_id") == doc
+    ]
     snap = spectator.call("doc_snapshot", {"doc_id": doc})
     assert [e["data"]["revision"] for e in changed] == [1, 2], {
-        "changed": changed, "result": result, "snapshot": snap,
+        "changed": changed,
+        "result": result,
+        "snapshot": snap,
         "tree": spectator.call("doc_tree", {"doc_id": doc}),
     }
     assert all(e["data"]["method"] == "doc_apply_ops" for e in changed)
@@ -445,26 +546,46 @@ def test_inprocess_agent_apply_publishes_each_feature_batch(
 
 
 def test_inprocess_internal_agent_docs_are_registered_but_silent(
-        scratch_daemon, monkeypatch, tmp_path):
+    scratch_daemon, monkeypatch, tmp_path
+):
     """The preflight-style internal flag keeps nested mints out of every subscriber feed."""
     _configure_full_mock_agent(monkeypatch, tmp_path)
     runner, spectator = _agent_spectator(scratch_daemon)
     name = "AgentShadow" + uuid.uuid4().hex[:6]
     result = _run_agent_assembly(runner, name, internal=True)
+    runner_events = _drain_all(runner)
+    child_run_prefix = str(result["run_id"]) + "-p"
+    internal_docs = {
+        e["data"]["doc_id"]
+        for e in runner_events
+        if e.get("event") == "agent.event"
+        and e.get("data", {}).get("kind") == "run_started"
+        and str(e["data"].get("run_id", "")).startswith(child_run_prefix)
+    }
+    assert len(internal_docs) == 2, runner_events
+
     time.sleep(0.2)
     events = _drain_all(spectator)
-    internal_doc = result["doc_id"]
-    assert not [e for e in events
-                if e.get("event") in {"doc.opened", "doc.changed"} and
-                (e.get("data", {}).get("doc_id") == internal_doc or
-                 str(e.get("data", {}).get("name", "")).startswith(name))], events
+    assert not [
+        e
+        for e in events
+        if e.get("event") in {"doc.opened", "doc.changed"}
+        and (
+            e.get("data", {}).get("doc_id") in internal_docs
+            or str(e.get("data", {}).get("name", "")).startswith(name)
+        )
+    ], events
 
     # Internal registration is observable by ABSENCE from doc_list: annotateDocList filters a
     # document only when DocRegistry::postCall recorded DocState::internal. If the nested hook is
-    # reverted, the engine still holds this assembly but the registry first sees it in the outer
-    # agent_run_v2 result as a normal doc, so it leaks into this list and the control fails.
+    # reverted, the engine still holds these child parts but the registry first sees them as
+    # normal docs, so they leak into this list and the control fails.
     listed = {d["doc_id"] for d in spectator.call("doc_list", {})["docs"]}
-    assert internal_doc not in listed, {"result": result, "listed": sorted(listed)}
+    assert internal_docs.isdisjoint(listed), {
+        "result": result,
+        "internal_docs": sorted(internal_docs),
+        "listed": sorted(listed),
+    }
 
 
 def test_doc_snapshot_skips_internal_doc(scratch_daemon):
@@ -476,7 +597,6 @@ def test_doc_snapshot_skips_internal_doc(scratch_daemon):
     b.connect()
     doc = a.call("doc_new", {"name": "shadow", "internal": True})["doc_id"]
     assert b.call("doc_snapshot", {"doc_id": doc}).get("has_snapshot") is False
-
 
 
 def test_doc_closed_event(scratch_daemon):
@@ -541,8 +661,11 @@ def test_disconnect_emits_last_writer_detached(scratch_daemon):
     a.close()
     time.sleep(0.4)
     closed = _events(b, "doc.closed")
-    assert any(e["data"].get("doc_id") == doc and
-               e["data"].get("reason") == "last_writer_detached" for e in closed), closed
+    assert any(
+        e["data"].get("doc_id") == doc
+        and e["data"].get("reason") == "last_writer_detached"
+        for e in closed
+    ), closed
 
 
 def test_doc_close_degrades_to_detach_with_other_writer(scratch_daemon):
@@ -559,13 +682,20 @@ def test_doc_close_degrades_to_detach_with_other_writer(scratch_daemon):
     # A closes while B still holds rw -> degrade to detach, doc survives for B.
     r = a.call("doc_close", {"doc_id": doc})
     assert r.get("detached") is True, r
-    assert b.call("doc_tree", {"doc_id": doc}).get("_is_error") is None, "doc must survive"
-    assert b.call("doc_apply_ops", {"doc_id": doc, "ops": BOX_OPS}).get("_is_error") is None
+    assert b.call("doc_tree", {"doc_id": doc}).get("_is_error") is None, (
+        "doc must survive"
+    )
+    assert (
+        b.call("doc_apply_ops", {"doc_id": doc, "ops": BOX_OPS}).get("_is_error")
+        is None
+    )
 
     # A can still FORCE the close even though B holds rw (explicit override).
     assert a.call("doc_close", {"doc_id": doc, "force": True}).get("_is_error") is None
     time.sleep(0.1)
-    assert all(e.get("doc_id") != doc for e in b.call("doc_list", {})["docs"]), "doc gone"
+    assert all(e.get("doc_id") != doc for e in b.call("doc_list", {})["docs"]), (
+        "doc gone"
+    )
 
 
 def test_gc_retires_only_undelivered_docs(scratch_daemon, monkeypatch, tmp_path):
@@ -601,7 +731,9 @@ def test_gc_retires_only_undelivered_docs(scratch_daemon, monkeypatch, tmp_path)
         if unsaved in ids:
             break
     assert unsaved in ids, "an unsaved abandoned doc MUST be retired for recovery"
-    assert saved not in ids, "a doc saved to a real file must NOT flood the recovery prompt"
+    assert saved not in ids, (
+        "a doc saved to a real file must NOT flood the recovery prompt"
+    )
 
 
 def test_gc_purges_internal_docs_instead_of_retiring_them(scratch_daemon, monkeypatch):
@@ -636,7 +768,9 @@ def test_gc_purges_internal_docs_instead_of_retiring_them(scratch_daemon, monkey
         if normal in ids:
             break
     assert normal in ids, "control: an unsaved abandoned doc MUST still be retired"
-    assert clone not in ids, "an internal preflight clone MUST be purged, never recovered"
+    assert clone not in ids, (
+        "an internal preflight clone MUST be purged, never recovered"
+    )
     names = {e.get("name") for e in keep.call("recovery_list").get("entries", [])}
     assert not any((n or "").endswith("_pf") for n in names), names
 
@@ -810,11 +944,15 @@ def test_attached_client_still_pins_the_daemon(scratch_daemon):
     scratch_daemon.append(pid)
     a.call("doc_new", {"name": "held-open"})  # implicit rw attach
     time.sleep(8)  # >2x the fixture's 3s linger
-    assert not _wait_daemon_gone(pid, timeout=0.1), "daemon dropped a client holding a doc"
+    assert not _wait_daemon_gone(pid, timeout=0.1), (
+        "daemon dropped a client holding a doc"
+    )
     assert a.call("daemon_status").get("pid") == pid
 
 
-def test_drain_exits_on_its_deadline_despite_a_stuck_client(scratch_daemon, monkeypatch):
+def test_drain_exits_on_its_deadline_despite_a_stuck_client(
+    scratch_daemon, monkeypatch
+):
     """`daemon_drain` is a STOP request and must terminate. A client that never disconnects
     used to veto it forever (the same 5.5 h tray icon); the drain now carries a deadline
     (CHUDWARE_HOSTD_DRAIN_GRACE_S) after which stragglers are dropped and the daemon exits."""
@@ -925,8 +1063,11 @@ def test_doc_gc_retires_abandoned_docs(scratch_daemon, monkeypatch):
     assert gone, "GC never closed the abandoned doc"
     # Subscribers heard about it...
     evts = _events(b, "doc.closed")
-    assert any(e.get("data", {}).get("doc_id") == doc and
-               e.get("data", {}).get("reason") == "gc" for e in evts), evts
+    assert any(
+        e.get("data", {}).get("doc_id") == doc
+        and e.get("data", {}).get("reason") == "gc"
+        for e in evts
+    ), evts
     # ...and the work is RETIRED, not lost: it waits in the recovery tier.
     entries = b.call("recovery_list", {}).get("entries") or []
     assert any(e.get("name") == "abandoned" for e in entries), entries
@@ -1032,7 +1173,6 @@ def test_agent_origin_survives_base_gc_grace(scratch_daemon, monkeypatch):
     assert doc not in ids, "agent-origin doc never GC'd after agent grace"
 
 
-
 def test_no_python_autosave_timer_in_daemon_mode(scratch_daemon, monkeypatch):
     monkeypatch.setenv("CHUDWARE_ENGINE_DAEMON", "1")
     from services.mcp import cad_tools
@@ -1054,14 +1194,16 @@ def test_instance_key_parity_with_cpp(tmp_path, monkeypatch):
     from it), so the path-derived key lands on a fresh socket."""
     monkeypatch.delenv("CHUDWARE_INSTANCE_KEY", raising=False)
     monkeypatch.delenv("CHUDWARE_HOSTD_SOCKET", raising=False)
-    monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
+    runtime_dir = tmp_path.parent / "hostd-runtime"
+    runtime_dir.mkdir(exist_ok=True)
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(runtime_dir))
     monkeypatch.setenv("CHUDWARE_HOSTD_LINGER_SECS", "3")
     c = DaemonClient()
     try:
         c.connect()  # spawns hostd; connect only succeeds if the keys agree
         assert c.server_info.get("state") in ("ready", "loading")
         sock = c._sock_path
-        assert sock and sock.startswith(str(tmp_path)) and os.path.exists(sock), sock
+        assert sock and sock.startswith(str(runtime_dir)) and os.path.exists(sock), sock
         pid = int(c.call("daemon_status", {})["pid"])
     finally:
         try:
@@ -1110,8 +1252,12 @@ def _abandoned_agent_doc(gui: DaemonClient, name: str) -> str:
     agent = DaemonClient()
     agent.connect()
     doc = agent.call("doc_new", {"name": name})["doc_id"]
-    assert agent.call("doc_apply_ops",
-                      {"doc_id": doc, "ops": _box_ops(name)}).get("_is_error") is None
+    assert (
+        agent.call("doc_apply_ops", {"doc_id": doc, "ops": _box_ops(name)}).get(
+            "_is_error"
+        )
+        is None
+    )
     # The GUI mirror is a read-only viewer, so the agent's rw is the last writer.
     assert gui.call("attach_doc", {"doc_id": doc, "mode": "ro"}).get("ok") is True
     agent.close()
@@ -1126,8 +1272,9 @@ def test_abandoned_agent_doc_stays_in_doc_list(scratch_daemon):
     gui = _gui_client(scratch_daemon)
     doc = _abandoned_agent_doc(gui, "survives-detach")
 
-    entry = next((e for e in gui.call("doc_list", {})["docs"]
-                  if e.get("doc_id") == doc), None)
+    entry = next(
+        (e for e in gui.call("doc_list", {})["docs"] if e.get("doc_id") == doc), None
+    )
     assert entry is not None, "hostd deleted an agent doc on last-writer detach"
     assert entry.get("name") == "survives-detach", entry
     assert entry.get("revision") == 1, entry
@@ -1178,5 +1325,6 @@ def test_explicit_doc_close_really_removes_the_doc(scratch_daemon):
     closed = [e for e in _events(gui, "doc.closed") if e["data"].get("doc_id") == doc]
     assert closed, "no doc.closed for an explicit close"
     assert closed[-1]["data"].get("reason") != "last_writer_detached", closed[-1]
-    assert all(e.get("doc_id") != doc for e in gui.call("doc_list", {})["docs"]), \
+    assert all(e.get("doc_id") != doc for e in gui.call("doc_list", {})["docs"]), (
         "explicitly closed doc must be gone"
+    )

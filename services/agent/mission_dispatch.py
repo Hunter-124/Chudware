@@ -187,6 +187,46 @@ def _actionable_delegate_failure(node: dict) -> dict:
     detail = str(
         nested.get("error_detail") or nested.get("error") or node.get("note") or ""
     ).strip()
+    runtime_unavailable = stop_reason == "provider_error" and detail.startswith(
+        (
+            "Chudcode RPC support is unavailable",
+            "Chudcode executable not found",
+        )
+    )
+    if runtime_unavailable:
+        role = str(node.get("role") or "sub-agent")
+        rest = {
+            key: value
+            for key, value in node.items()
+            if key
+            not in {
+                "ok",
+                "reason",
+                "error",
+                "status",
+                "executed",
+                "subagent_status",
+                "do_instead",
+            }
+        }
+        return {
+            "ok": False,
+            "reason": "delegation_unavailable",
+            "error": (
+                f"delegate cannot run {role!r}: {detail}. No child model attempt "
+                "was made. Do NOT retry delegate — do the work yourself with the "
+                "concrete tools this turn already has, and record unfinished work "
+                "with ledger_note(kind='handoff', ...)."
+            ),
+            "status": "unavailable",
+            "executed": False,
+            "subagent_status": "not_run",
+            "do_instead": [
+                "build/inspect directly with the modeling tools in your allowlist",
+                "ledger_note(kind='handoff', payload={...}) for work you cannot finish",
+            ],
+            **rest,
+        }
     if not error:
         role = str(node.get("role") or "sub-agent")
         if stop_reason:

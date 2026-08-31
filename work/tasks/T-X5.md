@@ -62,14 +62,14 @@ mission brief, "GUI panel is a LATER task").
 
 ## Definition of done
 
-- [ ] `browser_profiles("list")` returns every saved profile with an accurate
+- [x] `browser_profiles("list")` returns every saved profile with an accurate
       `status`
-- [ ] `browser_profiles("refresh", site)` re-opens a headed login window for
+- [x] `browser_profiles("refresh", site)` re-opens a headed login window for
       that site
-- [ ] `browser_profiles("delete", site)` removes the profile completely (dir +
+- [x] `browser_profiles("delete", site)` removes the profile completely (dir +
       metadata, no orphaned files)
-- [ ] Expiry detection reuses (not duplicates) T-X2's login-wall signal
-- [ ] JSON shape documented in the tool's docstring clearly enough that a
+- [x] Expiry detection reuses (not duplicates) T-X2's login-wall signal
+- [x] JSON shape documented in the tool's docstring clearly enough that a
       later GUI task can consume it without re-deriving it from code
 
 ## AI hints
@@ -81,3 +81,7 @@ mission brief, "GUI panel is a LATER task").
 ## Progress log
 - 2026-08-04 [audit] Reopened: audit found zero code and an empty progress log — this
   task was never started. Still wanted (account/profile management), just not now.
+- 2026-08-30 [implementation] Added the registered `browser_profiles` list/refresh/delete
+  control surface, fresh redirect-aware expiry probes using the shared login classifier,
+  complete locked deletion, sourcing-pack reachability, and focused regression coverage.
+  Implementation is verified and awaiting the board's human merge-time `done` transition.

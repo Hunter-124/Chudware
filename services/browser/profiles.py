@@ -57,6 +57,8 @@ def slug(site: str) -> str:
     s = re.sub(r"[^a-zA-Z0-9_.-]+", "-", str(site).strip()).strip("-").lower()
     if not s:
         raise ValueError("site must be a non-empty identifier")
+    if s in (".", ".."):
+        raise ValueError("site must not be a dot path")
     return s
 
 
@@ -68,8 +70,9 @@ def profile_dir(site: str) -> Path:
     (:data:`services.paths.BROWSER_PROFILES`) is created eagerly so metadata can
     be written even before a profile exists.
     """
+    site_slug = slug(site)
     paths.BROWSER_PROFILES.mkdir(parents=True, exist_ok=True)
-    return paths.BROWSER_PROFILES / slug(site)
+    return paths.BROWSER_PROFILES / site_slug
 
 
 def has_profile(site: str) -> bool:
@@ -116,6 +119,16 @@ def load_meta(site: str) -> dict[str, Any]:
     return data if isinstance(data, dict) else {}
 
 
+def _write_meta(site: str, meta: dict[str, Any]) -> dict[str, Any]:
+    """Replace one metadata sidecar after normalising its site identifier."""
+    data = dict(meta)
+    data["site"] = slug(site)
+    p = _meta_path(site)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps(data, indent=2, sort_keys=True), encoding="utf-8")
+    return data
+
+
 def save_meta(site: str, **fields: Any) -> dict[str, Any]:
     """Merge ``fields`` into ``site``'s metadata sidecar and persist it.
 
@@ -124,11 +137,7 @@ def save_meta(site: str, **fields: Any) -> dict[str, Any]:
     """
     meta = load_meta(site)
     meta.update(fields)
-    meta["site"] = slug(site)
-    p = _meta_path(site)
-    p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(json.dumps(meta, indent=2, sort_keys=True), encoding="utf-8")
-    return meta
+    return _write_meta(site, meta)
 
 
 def list_profiles() -> list[dict[str, Any]]:
@@ -146,17 +155,120 @@ def list_profiles() -> list[dict[str, Any]]:
     return out
 
 
+def check_profile_status(
+    site: str,
+    *,
+    _fetch: Any | None = None,
+    _probe_url: str | None = None,
+    _classify: Any | None = None,
+) -> str:
+    """Freshly classify a saved login as ``active``, ``expired``, or ``unknown``.
+
+    Only a profile with a prior live ``login_verified_ts`` is probed. The probe
+    and metadata commit share the same profile lock as login, fetch, and delete,
+    so a stale probe cannot recreate metadata after a successful deletion.
+    Production probes call the already-locked browser primitive directly; tests
+    can inject the same dict-returning ``_fetch`` seam.
+
+    A definitive login page expires the profile and removes its verification
+    stamp. Fetch errors, challenges, missing probe URLs, and inconclusive
+    classifications are ``unknown`` and deliberately retain that stamp so a
+    transient outage is never presented as an expired login.
+    """
+    site_slug = slug(site)
+    meta = load_meta(site_slug)
+    if not meta.get("login_verified_ts"):
+        return "expired" if meta.get("status") == "expired" else "unknown"
+
+    if _probe_url is None:
+        try:
+            from .embed import start_url_for_site  # lazy: profiles ↔ embed
+            probe_url = start_url_for_site(site_slug)
+        except Exception:  # noqa: BLE001 — optional adapter discovery
+            probe_url = None
+    else:
+        probe_url = _probe_url
+
+    lock = profile_lock(site_slug)
+    if not lock.acquire(blocking=False):
+        return "unknown"
+    try:
+        # Delete may have won the lock after the optimistic read above. Re-read
+        # under lock and never recreate a sidecar that no longer exists.
+        current = load_meta(site_slug)
+        if not current.get("login_verified_ts"):
+            return "expired" if current.get("status") == "expired" else "unknown"
+
+        def persist(status: str, *, clear_verified: bool = False) -> str:
+            if clear_verified:
+                current.pop("login_verified_ts", None)
+            current["status"] = status
+            _write_meta(site_slug, current)
+            return status
+
+        if not probe_url:
+            return persist("unknown")
+
+        if _fetch is None:
+            from . import ratelimit
+            from .session import DEFAULT_RENDER_SETTLE_S, _browser_fetch_locked
+
+            def fetch(url: str, locked_site: str, *, no_cache: bool) -> dict:
+                return _browser_fetch_locked(
+                    url,
+                    locked_site,
+                    render_settle=DEFAULT_RENDER_SETTLE_S,
+                    min_interval=ratelimit.DEFAULT_MIN_INTERVAL_S,
+                    no_cache=no_cache,
+                )
+        else:
+            fetch = _fetch
+        if _classify is None:
+            from .embed import classify_login_state  # lazy: profiles ↔ embed
+            classify = classify_login_state
+        else:
+            classify = _classify
+
+        try:
+            result = fetch(probe_url, site_slug, no_cache=True)
+        except Exception:  # noqa: BLE001 — status checks never break profile listing
+            return persist("unknown")
+        if not isinstance(result, dict) or not result.get("ok"):
+            return persist("unknown")
+
+        final_url = result.get("final_url") or result.get("url") or probe_url
+        try:
+            state = classify(site_slug, result.get("content"), final_url)
+        except Exception:  # noqa: BLE001 — adapter classifier is best-effort
+            state = "unknown"
+        if state == "logged_in":
+            return persist("active")
+        if state == "login_page":
+            return persist("expired", clear_verified=True)
+        return persist("unknown")
+    finally:
+        lock.release()
+
+
 def delete_profile(site: str) -> bool:
-    """Remove a site's profile directory and metadata sidecar. Returns True if anything existed."""
+    """Remove a site's profile, metadata, and transient cookie sidecar.
+
+    The caller owns :func:`profile_lock` while deleting when profile contention
+    is possible. Returns True when any of the three artifacts existed.
+    """
+    site_slug = slug(site)
     removed = False
-    d = profile_dir(site)
+    d = paths.BROWSER_PROFILES / site_slug
     if d.exists():
-        shutil.rmtree(d, ignore_errors=True)
+        shutil.rmtree(d)
         removed = True
-    m = _meta_path(site)
-    if m.exists():
-        m.unlink()
-        removed = True
+    for sidecar in (
+        paths.BROWSER_PROFILES / f"{site_slug}.json",
+        paths.BROWSER_PROFILES / f"{site_slug}.cookies.json",
+    ):
+        if sidecar.exists():
+            sidecar.unlink()
+            removed = True
     return removed
 
 

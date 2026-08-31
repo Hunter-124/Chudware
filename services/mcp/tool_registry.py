@@ -85,6 +85,9 @@ _RISK_OVERRIDES: dict[str, str] = {
     # matches no external prefix/suffix, so the WRITE default would let
     # offline/local-only policies run it. box_status stays read via "_status".
     "box_sync": RISK_EXTERNAL,
+    # browser_profiles is a mixed list/refresh/delete surface. Keep the whole
+    # tool behind write policy even though action="list" alone is read-only.
+    "browser_profiles": RISK_WRITE,
 }
 
 # Motion and safety classifications are explicit membership only. A newly added

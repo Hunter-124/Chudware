@@ -375,6 +375,7 @@ CATEGORY_PACKS: dict[str, list[str]] = {
         # neither tool was in any pack. advertised_tool_audit, 2026-07-30.
         "vendor_status",
         "vendor_login",
+        "browser_profiles",
         "request_quote",
         "list_spec_templates",
     ],

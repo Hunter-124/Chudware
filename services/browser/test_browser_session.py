@@ -414,6 +414,25 @@ def test_browser_fetch_returns_envelope_when_profile_exists(browser_mods):
     assert ratelimit.seconds_until_ready("grabcad", min_interval=1000.0) > 0.0
 
 
+def test_browser_fetch_preserves_backend_final_url_after_redirect(browser_mods):
+    profiles, _ratelimit, session = browser_mods
+    profiles.ensure_profile("vendor")
+    requested = "https://vendor.example/login"
+    redirected = "https://vendor.example/account"
+
+    result = session.browser_fetch(
+        requested,
+        "vendor",
+        _cef=_FakeCef(url=redirected),
+        min_interval=0.0,
+        no_cache=True,
+    )
+
+    assert result["ok"] is True
+    assert result["url"] == requested
+    assert result["final_url"] == redirected
+
+
 def test_browser_interact_returns_settled_dom(browser_mods):
     profiles, _ratelimit, session = browser_mods
     profiles.ensure_profile("mcmaster")

@@ -822,6 +822,7 @@ def _browser_fetch_locked(url: str, site: str, *, render_settle: float,
         return _cooldown_refusal(site, url, waited, "fetched")
     status: int | None = None
     content = ""
+    final_url = url
     t_backend = time.perf_counter() if timing is not None else 0.0
     try:
         try:
@@ -836,6 +837,7 @@ def _browser_fetch_locked(url: str, site: str, *, render_settle: float,
                 return fail("browser_fetch_failed",
                             f"{site}: headless fetch of {url} did not complete")
             content = r.get("html", "")
+            final_url = r.get("final_url") or url
         except Exception as exc:  # noqa: BLE001 — backend launch/connect/protocol
             return fail("browser_fetch_failed", str(exc))
     finally:
@@ -854,7 +856,7 @@ def _browser_fetch_locked(url: str, site: str, *, render_settle: float,
     # :mod:`.challenge`). With the consistent fingerprint most false flags don't
     # appear; a genuine one just yields no content for this URL.
     t_parse = time.perf_counter() if timing is not None else 0.0
-    challenge_kind = challenge.classify_challenge(content, url)
+    challenge_kind = challenge.classify_challenge(content, final_url)
     if timing is not None:
         timing["parse_ms"] = (time.perf_counter() - t_parse) * 1000.0
     if challenge_kind:
@@ -873,8 +875,9 @@ def _browser_fetch_locked(url: str, site: str, *, render_settle: float,
                             f"(browser_login('{site}')) usually helps")
 
     profiles.save_meta(site, last_used_ts=time.time())
-    payload = {"ok": True, "url": url, "status": status, "content": content,
-               "fetched_ts": now_ts(), "session_profile_used": profiles.slug(site)}
+    payload = {"ok": True, "url": url, "final_url": final_url, "status": status,
+               "content": content, "fetched_ts": now_ts(),
+               "session_profile_used": profiles.slug(site)}
     # Only this branch is cacheable — every fail(...) above (busy / fetch failed /
     # challenge / bot-walled / http_error) must be re-fetched next time.
     if not no_cache:

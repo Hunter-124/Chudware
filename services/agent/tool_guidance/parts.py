@@ -18,6 +18,16 @@ ENTRIES: dict[str, dict[str, Any]] = {
             "lines go to cam_cost_estimate, bought lines (with MPNs) to bom_price."
         ),
     },
+    "browser_profiles": {
+        "prompt_note": (
+            "Persistent vendor browser-profile manager. action='list' performs a "
+            "fresh no-cache login probe for every saved profile and reports only "
+            "active/expired/unknown; action='refresh' opens the headed human login "
+            "flow; action='delete' removes that site's local profile and refuses "
+            "while it is open. Never refresh-loop or delete without the user's request."
+        ),
+        "timeout_s": 360,
+    },
     "cam_cost_estimate": {
         "prompt_note": (
             "Runs cam_simulate internally for cycle time — the doc just needs "

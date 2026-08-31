@@ -369,8 +369,9 @@ class TestRegistration:
         for name in ("part_search", "parts_taxonomy", "part_source",
                      "vendors_health", "cam_tool_import", "part_get",
                      "part_place", "vendor_status", "vendor_login",
-                     "match_model", "reverse_engineer_product",
-                     "scrape_enqueue", "scrape_queue_status", "import_artifact",
+                     "browser_profiles", "match_model",
+                     "reverse_engineer_product", "scrape_enqueue",
+                     "scrape_queue_status", "import_artifact",
                      "vendor_part_register"):
             assert name in m.tools, name
         out = json.loads(m.tools["parts_taxonomy"]())
@@ -384,6 +385,157 @@ def registered_parts_tools():
     mcp = _FakeMCP()
     pt.register_parts_tools(mcp)
     return mcp.tools
+
+
+class TestBrowserProfiles:
+    def test_list_projects_frozen_shape_and_checks_every_profile(
+            self, monkeypatch, registered_parts_tools):
+        from services.browser import profiles
+
+        saved = [
+            {"site": "alpha", "created_ts": 1.0, "last_used_ts": 2.0,
+             "last_login_ts": 3.0, "login_verified_ts": 4.0, "extra": "omit"},
+            {"site": "beta", "created_ts": 5.0, "last_used_ts": 6.0,
+             "last_login_ts": None},
+        ]
+        checked = []
+        monkeypatch.setattr(profiles, "list_profiles", lambda: saved)
+        monkeypatch.setattr(
+            profiles, "check_profile_status",
+            lambda site: checked.append(site) or
+            {"alpha": "active", "beta": "expired"}[site])
+
+        out = json.loads(registered_parts_tools["browser_profiles"](action="list"))
+
+        assert set(out) == {"ok", "profiles"}
+        assert out == {
+            "ok": True,
+            "profiles": [
+                {"site": "alpha", "created_ts": 1.0, "last_used_ts": 2.0,
+                 "last_login_ts": 3.0, "status": "active"},
+                {"site": "beta", "created_ts": 5.0, "last_used_ts": 6.0,
+                 "last_login_ts": None, "status": "expired"},
+            ],
+        }
+        assert checked == ["alpha", "beta"]
+
+    def test_refresh_aliases_delegate_to_browser_login(
+            self, monkeypatch, registered_parts_tools):
+        from services.browser import session
+
+        seen = []
+        monkeypatch.setattr(
+            session, "browser_login",
+            lambda site: seen.append(site) or {
+                "ok": True, "site": site, "last_login_ts": 123.0,
+                "challenge_detected": False,
+            })
+
+        out = json.loads(registered_parts_tools["browser_profiles"](
+            operation="refresh", vendor="McMaster"))
+
+        assert seen == ["mcmaster"]
+        assert out["ok"] is True and out["site"] == "mcmaster"
+        assert out["last_login_ts"] == 123.0
+        assert len(out["interpreted"]) == 2
+
+    def test_busy_delete_refuses_without_mutation(
+            self, monkeypatch, registered_parts_tools):
+        from services.browser import profiles
+
+        deleted = []
+
+        class BusyLock:
+            def acquire(self, *, blocking):
+                assert blocking is False
+                return False
+
+            def release(self):
+                raise AssertionError("an unacquired lock must not be released")
+
+        monkeypatch.setattr(profiles, "profile_lock", lambda site: BusyLock())
+        monkeypatch.setattr(
+            profiles, "delete_profile", lambda site: deleted.append(site) or True)
+
+        out = json.loads(registered_parts_tools["browser_profiles"](
+            action="delete", site="alpha"))
+
+        assert out["ok"] is False and out["reason"] == "profile_busy"
+        assert deleted == []
+
+    def test_delete_holds_lock_and_returns_structured_result(
+            self, monkeypatch, registered_parts_tools):
+        from services.browser import profiles
+
+        events = []
+
+        class FreeLock:
+            def acquire(self, *, blocking):
+                events.append(("acquire", blocking))
+                return True
+
+            def release(self):
+                events.append(("release",))
+
+        monkeypatch.setattr(
+            profiles, "profile_lock",
+            lambda site: events.append(("lock", site)) or FreeLock())
+        monkeypatch.setattr(
+            profiles, "delete_profile",
+            lambda site: events.append(("delete", site)) or True)
+
+        out = json.loads(registered_parts_tools["browser_profiles"](
+            action="delete", site="Alpha"))
+
+        assert out == {"ok": True, "site": "alpha", "deleted": True}
+        assert events == [
+            ("lock", "alpha"), ("acquire", False),
+            ("delete", "alpha"), ("release",),
+        ]
+
+    @pytest.mark.parametrize("site", [".", ".."])
+    def test_dot_sites_are_rejected_before_profile_access(
+            self, monkeypatch, registered_parts_tools, site):
+        from services.browser import profiles
+
+        def touched(*_args, **_kwargs):
+            raise AssertionError("invalid site reached profile storage")
+
+        monkeypatch.setattr(profiles, "profile_lock", touched)
+        monkeypatch.setattr(profiles, "delete_profile", touched)
+
+        out = json.loads(registered_parts_tools["browser_profiles"](
+            action="delete", site=site))
+
+        assert out["ok"] is False and out["reason"] == "invalid_site"
+
+    @pytest.mark.parametrize(
+        ("kwargs", "message"),
+        [
+            ({}, "action"),
+            ({"action": "inspect"}, "action"),
+            ({"action": "refresh"}, "site"),
+            ({"action": "list", "site": "alpha"}, "does not accept a site"),
+        ],
+    )
+    def test_action_and_site_combinations_are_validated(
+            self, registered_parts_tools, kwargs, message):
+        out = json.loads(registered_parts_tools["browser_profiles"](**kwargs))
+
+        assert out["ok"] is False
+        assert message in out["reason"]
+
+    def test_mixed_action_surface_is_explicit_write_risk(self):
+        from services.mcp import tool_registry
+
+        assert (
+            tool_registry._RISK_OVERRIDES["browser_profiles"]
+            == tool_registry.RISK_WRITE
+        )
+        assert (
+            tool_registry.classify_risk("browser_profiles")
+            == tool_registry.RISK_WRITE
+        )
 
 
 def _queue_job(artifact_path: str, **spec_data) -> dict:

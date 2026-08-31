@@ -405,6 +405,11 @@ _LOGIN_ALIASES = {
     "sitekey": "site", "name": "site", "domain": "site",
 }
 
+_PROFILE_ALIASES = {
+    **_LOGIN_ALIASES,
+    "op": "action", "operation": "action",
+}
+
 _SCRAPE_ALIASES = {
     "vendor": "site", "source": "site", "adapter": "site", "sitekey": "site",
     "search": "query", "text": "query", "q": "query", "description": "query",
@@ -1893,8 +1898,8 @@ def register_parts_tools(mcp: FastMCP) -> None:
                 out["interpreted"] = _interpreted_notes(notes)
             return json.dumps(out, ensure_ascii=False)
 
-    # ---- Vendor-source tools (T-X2 / T-X7) ----
-    # These expose the services/browser acquisition layer to the GUI's vendor sources pane.
+    # ---- Vendor-source and browser-profile tools (T-X2 / T-X5 / T-X7) ----
+    # These expose the services/browser acquisition layer to parts sourcing clients.
 
     @mcp.tool()
     def vendor_status(**kwargs: _VarKw) -> str:
@@ -1991,6 +1996,106 @@ def register_parts_tools(mcp: FastMCP) -> None:
         except Exception as exc:  # noqa: BLE001
             return _err(f"vendor_login failed: {exc}",
                         f"Ensure Playwright is installed: pip install playwright && playwright install chromium")
+
+    @mcp.tool()
+    def browser_profiles(action: str = "", site: str = "",
+                         **kwargs: _VarKw) -> str:
+        """List, refresh, or delete persistent browser login profiles.
+
+        This mixed-action tool has a stable JSON surface:
+          list    -> {ok: true, profiles: [
+                       {site, created_ts, last_used_ts, last_login_ts,
+                        status: "active"|"expired"|"unknown"}]}
+          refresh -> the existing browser_login result
+                       {ok, site, last_login_ts, challenge_detected}
+          delete  -> {ok: true, site, deleted: bool}
+        Every failure is {ok: false, reason, hint}. ``refresh`` opens the same
+        headed login window as vendor_login and can block for up to 300 seconds.
+        ``delete`` refuses with reason=profile_busy while that profile is open.
+
+        action : exactly "list", "refresh", or "delete" (``op`` and
+                 ``operation`` are accepted aliases)
+        site   : required for refresh/delete; vendor/source/adapter/key/sitekey/
+                 name/domain are accepted aliases. list always returns all saved
+                 profiles and does not accept a site.
+        """
+        notes: list[str] = []
+        mapped, leftover = _absorb(
+            kwargs, ("action", "site"), _PROFILE_ALIASES, notes,
+            [name for name, value in (("action", action), ("site", site)) if value])
+        action = str(mapped.get("action", action) or "").strip().lower()
+        site = str(mapped.get("site", site) or "").strip().lower()
+
+        if leftover:
+            return json.dumps(_unknown_args_error(
+                "browser_profiles", leftover, ("action", "site"),
+                "action is list, refresh, or delete; site is required only for "
+                "refresh/delete. Example: browser_profiles(action='list')."),
+                ensure_ascii=False)
+        if action not in {"list", "refresh", "delete"}:
+            return _err(
+                "browser_profiles action must be 'list', 'refresh', or 'delete'.",
+                "Examples: browser_profiles(action='list'); "
+                "browser_profiles(action='refresh', site='mcmaster').")
+        # Reject the two path-self aliases before importing/calling any profile
+        # helper. In particular, profile_dir('.') must never resolve to the
+        # profiles root and turn delete into a recursive root removal.
+        if site in {".", ".."}:
+            return _err("invalid_site",
+                        "site cannot be '.' or '..'; use a saved profile site id.")
+        if action == "list" and site:
+            return _err("browser_profiles list does not accept a site.",
+                        "Call browser_profiles(action='list') to inspect all profiles.")
+        if action != "list" and not site:
+            return _err(f"browser_profiles {action} needs a site — none was given.",
+                        "Call browser_profiles(action='list') for saved site ids.")
+
+        try:
+            from services.browser import profiles as _profiles
+
+            if action == "list":
+                rows = []
+                for meta in _profiles.list_profiles():
+                    saved_site = str(meta.get("site") or "")
+                    try:
+                        status = _profiles.check_profile_status(saved_site)
+                    except Exception:  # noqa: BLE001 — one failed probe must not hide peers
+                        status = "unknown"
+                    if status not in {"active", "expired", "unknown"}:
+                        status = "unknown"
+                    rows.append({
+                        "site": saved_site,
+                        "created_ts": meta.get("created_ts"),
+                        "last_used_ts": meta.get("last_used_ts"),
+                        "last_login_ts": meta.get("last_login_ts"),
+                        "status": status,
+                    })
+                out = {"ok": True, "profiles": rows}
+            else:
+                # slug() validates/canonicalizes without touching the filesystem.
+                site = _profiles.slug(site)
+                if action == "refresh":
+                    from services.browser.session import browser_login as _login
+                    result = _login(site)
+                    if not isinstance(result, dict):
+                        return _err("browser_login returned an invalid result.")
+                    out = dict(result)
+                else:
+                    lock = _profiles.profile_lock(site)
+                    if not lock.acquire(blocking=False):
+                        return _err(
+                            "profile_busy",
+                            f"site profile '{site}' is open — close it and retry delete.")
+                    try:
+                        deleted = _profiles.delete_profile(site)
+                    finally:
+                        lock.release()
+                    out = {"ok": True, "site": site, "deleted": bool(deleted)}
+            if notes:
+                out["interpreted"] = _interpreted_notes(notes)
+            return json.dumps(out, ensure_ascii=False)
+        except Exception as exc:  # noqa: BLE001
+            return _err(f"browser_profiles failed: {exc}")
 
     # ---- Scrape/download queue tools (T-X4) ----
     # Background queue: search a vendor site + download the first CAD artifact found,

@@ -256,8 +256,8 @@ _TOOL_FAMILIES: dict[str, set[str]] = {
         "part_search", "part_get", "part_place",
         # Parts Library V2 (workstream 5)
         "parts_taxonomy", "part_source", "vendors_health", "cam_tool_import",
-        # vendor-source + scrape queue tools (T-X2/T-X4/T-X7)
-        "vendor_status", "vendor_login",
+        # vendor-source + profile manager + scrape queue tools (T-X2/T-X4/T-X5/T-X7)
+        "vendor_status", "vendor_login", "browser_profiles",
         "scrape_enqueue", "scrape_queue_status", "import_artifact",
     },
     "serving": {

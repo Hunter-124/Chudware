@@ -34,8 +34,8 @@ M8 = "fastener:ISO 4762:M8"
 WIDENED_TOOLS = (
     "part_search", "part_place", "part_get", "parts_taxonomy", "part_source",
     "match_model", "reverse_engineer_product", "vendors_health",
-    "cam_tool_import", "vendor_status", "vendor_login", "scrape_enqueue",
-    "scrape_queue_status", "import_artifact",
+    "cam_tool_import", "vendor_status", "vendor_login", "browser_profiles",
+    "scrape_enqueue", "scrape_queue_status", "import_artifact",
 )
 
 
@@ -394,6 +394,18 @@ def test_vendor_login_without_a_site_lists_real_keys():
     out = _call("vendor_login")
     assert out["ok"] is False
     assert "mcmaster" in out["hint"]
+
+
+def test_browser_profiles_accepts_action_and_site_aliases_before_validation():
+    out = _call("browser_profiles", operation="delete", vendor=".")
+    assert out["ok"] is False
+    assert out["reason"] == "invalid_site"
+
+
+def test_browser_profiles_is_reachable_through_sourcing_pack():
+    from services.agent.tool_categories import resolve_categories
+
+    assert "browser_profiles" in resolve_categories(["sourcing"])
 
 
 # --------------------------------------------------------------------------

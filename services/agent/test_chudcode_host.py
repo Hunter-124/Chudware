@@ -244,6 +244,27 @@ def test_cancel_and_steer_are_immediate_and_idempotent_during_terminal_wait():
         time.sleep(0.001)
     client = factory.clients[0]
     assert client.prompted.wait(1.0)
+    assert host.status(run_id="run-race") == {
+        "ok": True,
+        "run_id": "run-race",
+        "active": True,
+        "cancelled": False,
+        "started": True,
+        "session_id": "race",
+    }
+    assert host.status(session_id="race") == {
+        "ok": True,
+        "session_id": "race",
+        "live_session": True,
+        "active_runs": ["run-race"],
+    }
+    assert host.status() == {
+        "ok": True,
+        "sessions": 1,
+        "active_runs": 1,
+        "max_sessions": 8,
+        "shutdown": False,
+    }
 
     first_steer = host.steer("run-race", "Use the safer option")
     duplicate_steer = host.steer("run-race", "Use the safer option")
@@ -258,6 +279,14 @@ def test_cancel_and_steer_are_immediate_and_idempotent_during_terminal_wait():
     assert call_names(client).count("steer") == 1
     assert call_names(client).count("abort") == 1
     assert output["value"][0]["cancelled"] is True
+    assert host.status(run_id="run-race") == {
+        "ok": True,
+        "run_id": "run-race",
+        "active": False,
+        "cancelled": True,
+        "started": True,
+        "session_id": "race",
+    }
     assert host.cancel("run-race")["active"] is False
     assert host.steer("run-race", "too late")["steered"] is False
 
@@ -275,6 +304,7 @@ def test_forwards_events_attachments_callbacks_and_all_turn_settings(tmp_path):
         host,
         "configured",
         provider="openrouter",
+        system_prompt="CAD governance prompt",
         model="anthropic/claude-sonnet-4.6",
         thinking="high",
         steering_mode="all",
@@ -299,6 +329,7 @@ def test_forwards_events_attachments_callbacks_and_all_turn_settings(tmp_path):
     assert prompt_call["images"][0]["mimeType"] == "image/png"
     assert "spec: /project/spec.txt" in prompt_call["message"]
     assert registered == [client]
+    assert client.kwargs["append_system_prompt"] == "CAD governance prompt"
     assert call_names(client)[1:9] == [
         "set_model",
         "set_thinking_level",

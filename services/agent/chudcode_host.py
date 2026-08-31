@@ -232,6 +232,7 @@ class ChudcodeSessionHost:
                     "run_id": run_id,
                     "session_id": session_id,
                     "cancelled": run.cancel_requested,
+                    "started": run.started,
                 }
                 self._completed_runs[run_id] = completed
                 while len(self._completed_runs) > self._max_sessions * 8:
@@ -324,6 +325,60 @@ class ChudcodeSessionHost:
             "active": True,
             "queued": not send_now,
         }
+
+    def status(self, run_id=None, session_id=None) -> dict:
+        """Return a sanitized, mutation-free control-plane snapshot."""
+        run_key = _nonempty_string(run_id)
+        session_key = _nonempty_string(session_id)
+        with self._lock:
+            if run_key is not None:
+                active = self._runs.get(run_key)
+                if active is not None:
+                    return {
+                        "ok": True,
+                        "run_id": run_key,
+                        "active": True,
+                        "cancelled": active.cancel_requested,
+                        "started": active.started,
+                        "session_id": active.session_id,
+                    }
+                completed = self._completed_runs.get(run_key)
+                if completed is not None:
+                    return {
+                        "ok": True,
+                        "run_id": run_key,
+                        "active": False,
+                        "cancelled": bool(completed.get("cancelled")),
+                        "started": bool(completed.get("started")),
+                        "session_id": completed["session_id"],
+                    }
+                return {
+                    "ok": True,
+                    "run_id": run_key,
+                    "active": False,
+                    "cancelled": False,
+                    "started": False,
+                }
+            if session_key is not None:
+                session = self._sessions.get(session_key)
+                active_runs = sorted(
+                    run.run_id
+                    for run in self._runs.values()
+                    if run.session_id == session_key
+                )
+                return {
+                    "ok": True,
+                    "session_id": session_key,
+                    "live_session": session is not None and not session.closed,
+                    "active_runs": active_runs,
+                }
+            return {
+                "ok": True,
+                "sessions": len(self._sessions),
+                "active_runs": len(self._runs),
+                "max_sessions": self._max_sessions,
+                "shutdown": self._shutdown,
+            }
 
     def close_session(self, session_id):
         key = _nonempty_string(session_id)
@@ -466,6 +521,9 @@ class ChudcodeSessionHost:
         workspace = _nonempty_string(params.get("workspace_dir"))
         if workspace is not None:
             kwargs["cwd"] = workspace
+        system_prompt = _nonempty_string(params.get("system_prompt"))
+        if system_prompt is not None:
+            kwargs["append_system_prompt"] = system_prompt
         return factory(**kwargs)
 
     def _resolve_binary(self, *, required: bool) -> str | None:

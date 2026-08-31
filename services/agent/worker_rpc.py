@@ -17,18 +17,27 @@ RPC method name is preserved; ``WORKER_METHODS`` below is the merged table
 ``{"ok": false, ...}`` envelopes — never a traceback. GUI degrades to hidden
 when an RPC reports ``unknown_method``.
 """
+
 from __future__ import annotations
 
 import json
+import logging
 import math
 import os
 import subprocess
 import sys
 import threading
 import time
+from collections.abc import Callable, Mapping
 from datetime import datetime, timezone
+from decimal import Decimal, ROUND_FLOOR
 from pathlib import Path
-from typing import Callable
+from typing import Any
+
+from services.agent.chudcode_host import ChudcodeSessionHost
+
+
+_LOG = logging.getLogger(__name__)
 
 
 # ──── from engine_oracle/parts_hub/subscription_rpc.py (T-RF19 fold) ────
@@ -42,6 +51,7 @@ _login_lock = threading.Lock()
 
 def _sl():
     from services.agent.providers import subscription_login as sl
+
     return sl
 
 
@@ -75,7 +85,9 @@ def _subscription_login(params: dict, _emit: Callable) -> dict:
     provider = str((params or {}).get("provider", "")).strip().lower()
     device = bool((params or {}).get("device", False))
     raw_aid = (params or {}).get("account_id")
-    account_id = str(raw_aid).strip() if raw_aid is not None and str(raw_aid).strip() else None
+    account_id = (
+        str(raw_aid).strip() if raw_aid is not None and str(raw_aid).strip() else None
+    )
     # Explicit open_browser override (default True). Headless workers can pass false;
     # the GUI still gets user_code + verification_url via status polling.
     if "open_browser" in (params or {}):
@@ -86,12 +98,20 @@ def _subscription_login(params: dict, _emit: Callable) -> dict:
         return {"ok": False, "reason": "provider required (codex|claude|cursor|xai)"}
     valid = {p["id"] for p in _sl().providers()}
     if provider not in valid:
-        return {"ok": False, "reason": f"unknown subscription provider {provider!r}",
-                "hint": f"Use one of: {', '.join(sorted(valid))}."}
+        return {
+            "ok": False,
+            "reason": f"unknown subscription provider {provider!r}",
+            "hint": f"Use one of: {', '.join(sorted(valid))}.",
+        }
     try:
         with _login_lock:
             if _login_state.get(provider, {}).get("in_progress"):
-                return {"ok": True, "provider": provider, "in_progress": True, "already": True}
+                return {
+                    "ok": True,
+                    "provider": provider,
+                    "in_progress": True,
+                    "already": True,
+                }
             _login_state[provider] = {
                 "in_progress": True,
                 "error": None,
@@ -107,8 +127,15 @@ def _subscription_login(params: dict, _emit: Callable) -> dict:
                 cur["in_progress"] = True
                 # Merge UI-facing fields; never clobber error with None.
                 for key in (
-                    "stage", "user_code", "verification_url", "verification_uri",
-                    "browser_opened", "email", "account_id", "expires_in", "interval",
+                    "stage",
+                    "user_code",
+                    "verification_url",
+                    "verification_uri",
+                    "browser_opened",
+                    "email",
+                    "account_id",
+                    "expires_in",
+                    "interval",
                 ):
                     if key in info and info[key] is not None:
                         cur[key] = info[key]
@@ -162,7 +189,11 @@ def _subscription_login(params: dict, _emit: Callable) -> dict:
         return {"ok": True, "provider": provider, "in_progress": True}
     except Exception as exc:  # noqa: BLE001
         with _login_lock:
-            _login_state[provider] = {"in_progress": False, "error": str(exc), "stage": "error"}
+            _login_state[provider] = {
+                "in_progress": False,
+                "error": str(exc),
+                "stage": "error",
+            }
         return {"ok": False, "reason": f"subscription_login failed: {exc}", "hint": ""}
 
 
@@ -172,12 +203,16 @@ def _subscription_logout(params: dict, _emit: Callable) -> dict:
     if not provider:
         return {"ok": False, "reason": "provider required (codex|claude|cursor|xai)"}
     raw_aid = (params or {}).get("account_id")
-    account_id = str(raw_aid).strip() if raw_aid is not None and str(raw_aid).strip() else None
+    account_id = (
+        str(raw_aid).strip() if raw_aid is not None and str(raw_aid).strip() else None
+    )
     try:
         out = _sl().logout(provider, account_id=account_id)
         with _login_lock:
             # Only clear live login progress when the active (or last) account is gone.
-            if account_id is None or not _sl().status().get(provider, {}).get("connected"):
+            if account_id is None or not _sl().status().get(provider, {}).get(
+                "connected"
+            ):
                 _login_state.pop(provider, None)
         return out
     except Exception as exc:  # noqa: BLE001
@@ -203,7 +238,11 @@ def _subscription_accounts(params: dict, _emit: Callable) -> dict:
         accts = _sl().accounts(provider)
         return {"ok": True, "accounts": accts}
     except Exception as exc:  # noqa: BLE001
-        return {"ok": False, "reason": f"subscription_accounts failed: {exc}", "hint": ""}
+        return {
+            "ok": False,
+            "reason": f"subscription_accounts failed: {exc}",
+            "hint": "",
+        }
 
 
 def _subscription_switch(params: dict, _emit: Callable) -> dict:
@@ -244,6 +283,7 @@ def _subscription_usage(params: dict, _emit: Callable) -> dict:
             "rows": [],
         }
 
+
 def _subscription_ensure_fresh(params: dict, _emit: Callable) -> dict:
     """Refresh a subscription access token if expired / expiring within 5 min.
 
@@ -267,7 +307,6 @@ def _subscription_ensure_fresh(params: dict, _emit: Callable) -> dict:
             "expires_in": None,
             "error": f"subscription_ensure_fresh failed: {exc}",
         }
-
 
 
 SUBSCRIPTION_METHODS: dict[str, Callable] = {
@@ -412,7 +451,11 @@ def _session_btw(params: dict, _emit: Callable) -> dict:
         messages = _as_list(p.get("messages"))
         question = str(p.get("question") or "").strip()
         if not question:
-            return {"ok": False, "reason": "question required", "hint": "session_btw {messages, question, provider, model}"}
+            return {
+                "ok": False,
+                "reason": "question required",
+                "hint": "session_btw {messages, question, provider, model}",
+            }
         provider = p.get("provider")
         model = p.get("model")
         if model is not None:
@@ -441,6 +484,7 @@ SESSION_METHODS: dict[str, Callable] = {
 
 def _skills():
     from services.agent import skills as sk
+
     return sk
 
 
@@ -515,6 +559,7 @@ SKILLS_METHODS: dict[str, Callable] = {
 
 def _triggers():
     from services.agent.advisor import triggers as tr
+
     return tr
 
 
@@ -652,26 +697,48 @@ def _rule_create(params: dict, _emit: Callable) -> dict:
     if text:
         spec = parse_rule_slash(text if text.startswith("/") else "/rule " + text)
         if spec is None:
-            return {"ok": False, "reason": "not a /rule command", "hint": RULE_SLASH_USAGE}
+            return {
+                "ok": False,
+                "reason": "not a /rule command",
+                "hint": RULE_SLASH_USAGE,
+            }
         if not spec.get("ok"):
-            return {"ok": False, "reason": spec.get("reason", "invalid rule"),
-                    "hint": spec.get("usage", RULE_SLASH_USAGE)}
+            return {
+                "ok": False,
+                "reason": spec.get("reason", "invalid rule"),
+                "hint": spec.get("usage", RULE_SLASH_USAGE),
+            }
     else:
         keyword = " ".join(str(p.get("keyword") or "").split())
         instruction = str(p.get("instruction") or "").strip()
         if not keyword:
-            return {"ok": False, "reason": "trigger words required — a rule with no match "
-                                          "can never fire", "hint": RULE_SLASH_USAGE}
+            return {
+                "ok": False,
+                "reason": "trigger words required — a rule with no match "
+                "can never fire",
+                "hint": RULE_SLASH_USAGE,
+            }
         if not instruction:
-            return {"ok": False, "reason": "context to inject required",
-                    "hint": RULE_SLASH_USAGE}
+            return {
+                "ok": False,
+                "reason": "context to inject required",
+                "hint": RULE_SLASH_USAGE,
+            }
         rid = rule_slug(keyword)
         if not rid:
-            return {"ok": False, "reason": f"cannot derive a rule id from {keyword!r}",
-                    "hint": RULE_SLASH_USAGE}
+            return {
+                "ok": False,
+                "reason": f"cannot derive a rule id from {keyword!r}",
+                "hint": RULE_SLASH_USAGE,
+            }
         short = instruction if len(instruction) <= 72 else instruction[:69] + "..."
-        spec = {"ok": True, "id": rid, "keyword": keyword, "instruction": instruction,
-                "purpose": f"When {keyword!r} appears: {short}"}
+        spec = {
+            "ok": True,
+            "id": rid,
+            "keyword": keyword,
+            "instruction": instruction,
+            "purpose": f"When {keyword!r} appears: {short}",
+        }
 
     tr = _triggers()
     try:
@@ -692,9 +759,17 @@ def _rule_create(params: dict, _emit: Callable) -> dict:
     try:
         pack = tr.save_pack(rid, body)
     except Exception as exc:  # noqa: BLE001
-        return {"ok": False, "reason": f"rule_create pack write failed: {exc}", "hint": ""}
+        return {
+            "ok": False,
+            "reason": f"rule_create pack write failed: {exc}",
+            "hint": "",
+        }
     if not pack.get("ok"):
-        return {"ok": False, "reason": str(pack.get("reason") or "pack write failed"), "hint": ""}
+        return {
+            "ok": False,
+            "reason": str(pack.get("reason") or "pack write failed"),
+            "hint": "",
+        }
 
     trigger = {
         "id": rid,
@@ -720,7 +795,6 @@ def _rule_create(params: dict, _emit: Callable) -> dict:
         "pack": rid,
         "source": out.get("source", "user"),
     }
-
 
 
 TRIGGERS_METHODS: dict[str, Callable] = {
@@ -774,8 +848,8 @@ def _ai_roles_set(params: dict, _emit: Callable) -> dict:
                 "reason": "roles mapping required",
                 "hint": (
                     "Pass roles: {advisor|task|planning|default|plm|redaction: "
-                    "{provider, model, thinking?} | {mode:\"auto\"|\"default\", thinking?} "
-                    "| \"auto\" | \"default\"}. mode default follows the chat model. "
+                    '{provider, model, thinking?} | {mode:"auto"|"default", thinking?} '
+                    '| "auto" | "default"}. mode default follows the chat model. '
                     "thinking: auto|low|medium|high (default auto)."
                 ),
             }
@@ -799,7 +873,7 @@ def _ai_roles_set(params: dict, _emit: Callable) -> dict:
                     ),
                     "hint": (
                         "Pin redaction to a local model "
-                        "(llamacpp/lmstudio/ollama/vllm), or set it to \"auto\"."
+                        '(llamacpp/lmstudio/ollama/vllm), or set it to "auto".'
                     ),
                 }
             if isinstance(val, dict):
@@ -965,9 +1039,15 @@ def _read_status() -> dict:
             global _active_proc, _active_thread
             if out.get("running") and _active_proc is not None:
                 rc = _active_proc.poll()
-                if rc is not None and (_active_thread is None or not _active_thread.is_alive()):
+                if rc is not None and (
+                    _active_thread is None or not _active_thread.is_alive()
+                ):
                     # Thread should have written final status; heal if it crashed.
-                    if out.get("stage") not in ("done", "error", "building_leaderboard"):
+                    if out.get("stage") not in (
+                        "done",
+                        "error",
+                        "building_leaderboard",
+                    ):
                         out["running"] = False
                         out["stage"] = "error" if rc != 0 else "done"
                         out["exit_code"] = rc
@@ -997,6 +1077,7 @@ def _normalize_tiers(params: dict) -> list[str]:
 def _import_categories():
     """Lazy import so a missing categories module never blocks legacy bench_run."""
     from tools.flywheel.bench import categories as cats  # noqa: PLC0415
+
     return cats
 
 
@@ -1007,11 +1088,17 @@ def _build_cmd(mode: str, tiers: list[str], cycle: str) -> list[str]:
         return [py, "-m", "tools.flywheel.bench.gym.cli", "diag", "--tiers", tiers_csv]
     # smoke = C1 only, real execution on the selected tiers
     return [
-        py, "-m", "tools.flywheel.bench.gym.cli", "run",
+        py,
+        "-m",
+        "tools.flywheel.bench.gym.cli",
+        "run",
         "--real",
-        "--challenges", "C1",
-        "--tiers", tiers_csv,
-        "--cycle", cycle,
+        "--challenges",
+        "C1",
+        "--tiers",
+        tiers_csv,
+        "--cycle",
+        cycle,
         "--no-adjust",
     ]
 
@@ -1035,15 +1122,17 @@ def _run_pipeline(mode: str, tiers: list[str], cycle: str) -> None:
     log_dir.mkdir(parents=True, exist_ok=True)
     log_path = log_dir / f"{cycle}.log"
 
-    _write_status({
-        "running": True,
-        "stage": "running",
-        "last_error": None,
-        "exit_code": None,
-        "cmd": cmd,
-        "log_path": str(log_path),
-        "category": None,
-    })
+    _write_status(
+        {
+            "running": True,
+            "stage": "running",
+            "last_error": None,
+            "exit_code": None,
+            "cmd": cmd,
+            "log_path": str(log_path),
+            "category": None,
+        }
+    )
 
     try:
         with open(log_path, "w", encoding="utf-8") as logf:
@@ -1064,28 +1153,32 @@ def _run_pipeline(mode: str, tiers: list[str], cycle: str) -> None:
             _write_status({"pid": proc.pid, "stage": "running"})
             rc = proc.wait()
     except Exception as exc:  # noqa: BLE001
-        _write_status({
-            "running": False,
-            "stage": "error",
-            "finished": _utc_now(),
-            "last_error": f"spawn failed: {exc}",
-            "pid": None,
-            "exit_code": None,
-        })
+        _write_status(
+            {
+                "running": False,
+                "stage": "error",
+                "finished": _utc_now(),
+                "last_error": f"spawn failed: {exc}",
+                "pid": None,
+                "exit_code": None,
+            }
+        )
         with _state_lock:
             _active_proc = None
             _active_thread = None
         return
 
     if rc != 0:
-        _write_status({
-            "running": False,
-            "stage": "error",
-            "finished": _utc_now(),
-            "last_error": f"gym cli exited with code {rc} (see {log_path})",
-            "exit_code": rc,
-            "last_result_path": str(log_path),
-        })
+        _write_status(
+            {
+                "running": False,
+                "stage": "error",
+                "finished": _utc_now(),
+                "last_error": f"gym cli exited with code {rc} (see {log_path})",
+                "exit_code": rc,
+                "last_result_path": str(log_path),
+            }
+        )
         with _state_lock:
             _active_proc = None
             _active_thread = None
@@ -1093,7 +1186,12 @@ def _run_pipeline(mode: str, tiers: list[str], cycle: str) -> None:
 
     # Rebuild leaderboard so the GUI table picks up the new cells.
     _write_status({"stage": "building_leaderboard", "exit_code": rc})
-    lb_cmd = [sys.executable or "python3", "-m", "tools.flywheel.bench.gym.leaderboard", "build"]
+    lb_cmd = [
+        sys.executable or "python3",
+        "-m",
+        "tools.flywheel.bench.gym.leaderboard",
+        "build",
+    ]
     lb_rc = 0
     try:
         with open(log_path, "a", encoding="utf-8") as logf:
@@ -1110,14 +1208,16 @@ def _run_pipeline(mode: str, tiers: list[str], cycle: str) -> None:
             )
             lb_rc = int(lb.returncode)
     except Exception as exc:  # noqa: BLE001
-        _write_status({
-            "running": False,
-            "stage": "error",
-            "finished": _utc_now(),
-            "last_error": f"leaderboard build failed: {exc}",
-            "exit_code": rc,
-            "last_result_path": str(log_path),
-        })
+        _write_status(
+            {
+                "running": False,
+                "stage": "error",
+                "finished": _utc_now(),
+                "last_error": f"leaderboard build failed: {exc}",
+                "exit_code": rc,
+                "last_result_path": str(log_path),
+            }
+        )
         with _state_lock:
             _active_proc = None
             _active_thread = None
@@ -1126,23 +1226,27 @@ def _run_pipeline(mode: str, tiers: list[str], cycle: str) -> None:
     lb_path = _leaderboard_path()
     result_path = str(lb_path) if lb_path.exists() else str(log_path)
     if lb_rc != 0:
-        _write_status({
-            "running": False,
-            "stage": "error",
-            "finished": _utc_now(),
-            "last_error": f"leaderboard build exited with code {lb_rc}",
-            "exit_code": lb_rc,
-            "last_result_path": result_path,
-        })
+        _write_status(
+            {
+                "running": False,
+                "stage": "error",
+                "finished": _utc_now(),
+                "last_error": f"leaderboard build exited with code {lb_rc}",
+                "exit_code": lb_rc,
+                "last_result_path": result_path,
+            }
+        )
     else:
-        _write_status({
-            "running": False,
-            "stage": "done",
-            "finished": _utc_now(),
-            "last_error": None,
-            "exit_code": 0,
-            "last_result_path": result_path,
-        })
+        _write_status(
+            {
+                "running": False,
+                "stage": "done",
+                "finished": _utc_now(),
+                "last_error": None,
+                "exit_code": 0,
+                "last_result_path": result_path,
+            }
+        )
     with _state_lock:
         _active_proc = None
         _active_thread = None
@@ -1155,15 +1259,17 @@ def _run_category_pipeline(category: str, cycle: str, mode: str | None = None) -
     try:
         cmd = _build_category_cmd(category, mode=mode)
     except Exception as exc:  # noqa: BLE001
-        _write_status({
-            "running": False,
-            "stage": "error",
-            "finished": _utc_now(),
-            "last_error": f"category cmd build failed: {exc}",
-            "category": category,
-            "pid": None,
-            "exit_code": None,
-        })
+        _write_status(
+            {
+                "running": False,
+                "stage": "error",
+                "finished": _utc_now(),
+                "last_error": f"category cmd build failed: {exc}",
+                "category": category,
+                "pid": None,
+                "exit_code": None,
+            }
+        )
         with _state_lock:
             _active_proc = None
             _active_thread = None
@@ -1179,26 +1285,34 @@ def _run_category_pipeline(category: str, cycle: str, mode: str | None = None) -
     cat_status = _category_status_path(category)
     cat_status.parent.mkdir(parents=True, exist_ok=True)
 
-    _write_status({
-        "running": True,
-        "stage": "running",
-        "last_error": None,
-        "exit_code": None,
-        "cmd": cmd,
-        "log_path": str(log_path),
-        "category": category,
-        "mode": mode,
-        "tiers": [],
-    })
-    try:
-        cat_status.write_text(json.dumps({
-            "category": category,
+    _write_status(
+        {
             "running": True,
             "stage": "running",
-            "started": _utc_now(),
-            "cycle": cycle,
+            "last_error": None,
+            "exit_code": None,
+            "cmd": cmd,
             "log_path": str(log_path),
-        }, indent=2), encoding="utf-8")
+            "category": category,
+            "mode": mode,
+            "tiers": [],
+        }
+    )
+    try:
+        cat_status.write_text(
+            json.dumps(
+                {
+                    "category": category,
+                    "running": True,
+                    "stage": "running",
+                    "started": _utc_now(),
+                    "cycle": cycle,
+                    "log_path": str(log_path),
+                },
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
     except Exception:  # noqa: BLE001
         pass
 
@@ -1221,15 +1335,17 @@ def _run_category_pipeline(category: str, cycle: str, mode: str | None = None) -
             _write_status({"pid": proc.pid, "stage": "running"})
             rc = proc.wait()
     except Exception as exc:  # noqa: BLE001
-        _write_status({
-            "running": False,
-            "stage": "error",
-            "finished": _utc_now(),
-            "last_error": f"spawn failed: {exc}",
-            "pid": None,
-            "exit_code": None,
-            "category": category,
-        })
+        _write_status(
+            {
+                "running": False,
+                "stage": "error",
+                "finished": _utc_now(),
+                "last_error": f"spawn failed: {exc}",
+                "pid": None,
+                "exit_code": None,
+                "category": category,
+            }
+        )
         with _state_lock:
             _active_proc = None
             _active_thread = None
@@ -1257,29 +1373,41 @@ def _run_category_pipeline(category: str, cycle: str, mode: str | None = None) -
         pass
 
     stage = "done" if rc == 0 else "error"
-    err = None if rc == 0 else f"category {category!r} exited with code {rc} (see {log_path})"
-    _write_status({
-        "running": False,
-        "stage": stage,
-        "finished": _utc_now(),
-        "last_error": err,
-        "exit_code": rc,
-        "last_result_path": result_path,
-        "pass_rate": pass_rate,
-        "category": category,
-    })
-    try:
-        cat_status.write_text(json.dumps({
-            "category": category,
+    err = (
+        None
+        if rc == 0
+        else f"category {category!r} exited with code {rc} (see {log_path})"
+    )
+    _write_status(
+        {
             "running": False,
             "stage": stage,
             "finished": _utc_now(),
+            "last_error": err,
             "exit_code": rc,
-            "pass_rate": pass_rate,
             "last_result_path": result_path,
-            "log_path": str(log_path),
-            "cycle": cycle,
-        }, indent=2), encoding="utf-8")
+            "pass_rate": pass_rate,
+            "category": category,
+        }
+    )
+    try:
+        cat_status.write_text(
+            json.dumps(
+                {
+                    "category": category,
+                    "running": False,
+                    "stage": stage,
+                    "finished": _utc_now(),
+                    "exit_code": rc,
+                    "pass_rate": pass_rate,
+                    "last_result_path": result_path,
+                    "log_path": str(log_path),
+                    "cycle": cycle,
+                },
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
     except Exception:  # noqa: BLE001
         pass
 
@@ -1346,23 +1474,29 @@ def _bench_run(params: dict, _emit: Callable) -> dict:
                 modeling_mode = "smoke"
 
             cycle = f"gui-cat-{category}-{int(time.time())}"
-            _write_status({
-                "running": True,
-                "stage": "starting",
-                "started": _utc_now(),
-                "finished": None,
-                "last_error": None,
-                "last_result_path": None,
-                "mode": modeling_mode if category == "modeling" else None,
-                "tiers": [],
-                "category": category,
-                "cycle": cycle,
-                "pid": None,
-                "exit_code": None,
-            })
+            _write_status(
+                {
+                    "running": True,
+                    "stage": "starting",
+                    "started": _utc_now(),
+                    "finished": None,
+                    "last_error": None,
+                    "last_result_path": None,
+                    "mode": modeling_mode if category == "modeling" else None,
+                    "tiers": [],
+                    "category": category,
+                    "cycle": cycle,
+                    "pid": None,
+                    "exit_code": None,
+                }
+            )
             t = threading.Thread(
                 target=_run_category_pipeline,
-                args=(category, cycle, modeling_mode if category == "modeling" else None),
+                args=(
+                    category,
+                    cycle,
+                    modeling_mode if category == "modeling" else None,
+                ),
                 name=f"bench-cat-{category}",
                 daemon=True,
             )
@@ -1387,20 +1521,22 @@ def _bench_run(params: dict, _emit: Callable) -> dict:
         tiers = _normalize_tiers(params)
 
         cycle = f"gui-{mode}-{int(time.time())}"
-        _write_status({
-            "running": True,
-            "stage": "starting",
-            "started": _utc_now(),
-            "finished": None,
-            "last_error": None,
-            "last_result_path": None,
-            "mode": mode,
-            "tiers": tiers,
-            "category": None,
-            "cycle": cycle,
-            "pid": None,
-            "exit_code": None,
-        })
+        _write_status(
+            {
+                "running": True,
+                "stage": "starting",
+                "started": _utc_now(),
+                "finished": None,
+                "last_error": None,
+                "last_result_path": None,
+                "mode": mode,
+                "tiers": tiers,
+                "category": None,
+                "cycle": cycle,
+                "pid": None,
+                "exit_code": None,
+            }
+        )
 
         t = threading.Thread(
             target=_run_pipeline,
@@ -1419,12 +1555,14 @@ def _bench_run(params: dict, _emit: Callable) -> dict:
             "cycle": cycle,
         }
     except Exception as exc:  # noqa: BLE001
-        _write_status({
-            "running": False,
-            "stage": "error",
-            "finished": _utc_now(),
-            "last_error": str(exc),
-        })
+        _write_status(
+            {
+                "running": False,
+                "stage": "error",
+                "finished": _utc_now(),
+                "last_error": str(exc),
+            }
+        )
         return {"ok": False, "reason": f"bench_run failed: {exc}", "hint": ""}
 
 
@@ -1470,6 +1608,7 @@ def _office_extract(params: dict, _emit: Callable) -> dict:
     """``office_extract {path} -> {ok, kind, text, sheets?}`` (sheets only for xlsx/xlsm)."""
     try:
         from services.mcp.office_tools import extract_office
+
         return extract_office((params or {}).get("path"))
     except Exception as exc:  # noqa: BLE001
         return {"ok": False, "reason": f"office_extract failed: {exc}", "hint": ""}
@@ -1480,30 +1619,22 @@ OFFICE_METHODS: dict[str, Callable] = {
 }
 
 
-# ──── agent_admin_turn worker RPC (harness overhaul: live-path general execution) ────
-# core/agent/run.cpp's pre-flight branch detects a request that is NOT a geometry
-# build (is_general_work_request) — file/PLM/research/basic-assistant work — but
-# run.cpp has no tool-calling loop of its own (its pipeline is intake/plan/model —
-# geometry only). This RPC is the seam it calls out to: ONE bounded linear role
-# turn via ``mission_dispatch.run_linear_role_turn`` (T-W32) — the same machinery
-# every sub-agent spawn uses — so
-# fs/plm/shell tools (and, on demand via enable_tools, any other pack) resolve
-# through the normal global tool registry instead of refusing the request. The
-# role defaults to ``general_agent`` (the inverted-default general lane); callers
-# may pass ``role`` to run a more specialized linear card (e.g. project_organizer).
+# ──── internal legacy/offline linear provider loop ────
+# Kept only for explicit internal fallback callers while deterministic native
+# offline modeling remains outside this worker.  It is deliberately absent from
+# every registration table; ordinary online agent_admin_turn calls Chudcode below.
 
 
-#: shape-level cap on params["attachments"] — agent_turn enforces the real
-#: per-image limits (existence, size, <=8 folded into the message).
+#: Bounded worker-boundary attachment shape. ChudcodeSessionHost performs the
+#: image/file conversion immediately before the RPC prompt.
 _ATTACH_MAX = 32
 
 
-def _agent_admin_turn(params: dict, _emit: Callable) -> dict:
-    """``agent_admin_turn {request, run_id?, role?, provider?, model?, api_key?,
-    base_url?, reasoning_effort?, workspace_dir?, history?, attachments?,
-    session_id?, sessions_dir?, _chudware_actor?} ->
-    {ok, turn:{success, stop_reason, result, role, allowed_tools}}
-    | {ok:false, reason}``.
+def _legacy_offline_agent_admin_turn(params: dict, _emit: Callable) -> dict:
+    """Run the pre-Chudcode linear provider loop for an explicit offline caller.
+
+    This helper is intentionally unregistered. Online request data cannot select
+    it; ``ADMIN_METHODS["agent_admin_turn"]`` always names the Chudcode path.
 
     Streams turn events through ``_emit`` — worker_main.py's serve loop tags each
     one with this request's id and pushes it as a ``{"event":...}`` line
@@ -1529,6 +1660,7 @@ def _agent_admin_turn(params: dict, _emit: Callable) -> dict:
         role = "general_agent"
     try:
         from services.agent.roles import load_role as _load_role  # noqa: PLC0415
+
         _load_role(role)
     except Exception:
         return {"ok": False, "reason": "invalid_role"}
@@ -1568,6 +1700,7 @@ def _agent_admin_turn(params: dict, _emit: Callable) -> dict:
         try:
             import os as _os  # noqa: PLC0415
             from pathlib import Path as _Path  # noqa: PLC0415
+
             cand = _Path(_os.path.abspath(_os.path.expanduser(raw_ws.strip())))
             if not cand.is_dir():
                 return {
@@ -1577,6 +1710,7 @@ def _agent_admin_turn(params: dict, _emit: Callable) -> dict:
             from services.agent.project_context import (  # noqa: PLC0415
                 resolve_project_root,
             )
+
             resolved_root = _Path(resolve_project_root(cand))
             if not resolved_root.is_dir():
                 return {
@@ -1605,13 +1739,15 @@ def _agent_admin_turn(params: dict, _emit: Callable) -> dict:
     # cache-dir fallback, i.e. exactly the previous behaviour.
     try:
         from services.agent import subagent_registry as _sreg_bind  # noqa: PLC0415
+
         _sessions_dir = _param_str("sessions_dir")
         _session_id = _param_str("session_id")
         if _sessions_dir and _session_id:
             from pathlib import Path as _BindPath  # noqa: PLC0415
+
             _sreg_bind.bind_session(
-                _session_id,
-                str(_BindPath(_sessions_dir) / f"{_session_id}.subagents"))
+                _session_id, str(_BindPath(_sessions_dir) / f"{_session_id}.subagents")
+            )
     except Exception:  # noqa: BLE001 — never break a turn over transcript paths
         pass
 
@@ -1647,7 +1783,6 @@ def _agent_admin_turn(params: dict, _emit: Callable) -> dict:
         except (AttributeError, ValueError):
             return {"ok": False, "reason": "invalid_subscription_grant"}
 
-
     cfg = dict(agent_config.load_config() or {})
     if credit_actor is not None and credit_actor.key_source in {"pool", "byok"}:
         # The credential was resolved on the trusted host side after the gateway
@@ -1675,12 +1810,17 @@ def _agent_admin_turn(params: dict, _emit: Callable) -> dict:
                 sub["base_url"] = base_url
                 cfg[provider_name] = sub
             provider = agent_config.get_provider(
-                name=provider_name, cfg=cfg, role=role,
-                **({"actor": credit_actor} if credit_actor is not None else {}))
+                name=provider_name,
+                cfg=cfg,
+                role=role,
+                **({"actor": credit_actor} if credit_actor is not None else {}),
+            )
         else:
             provider = agent_config.get_provider(
-                role=role, cfg=cfg,
-                **({"actor": credit_actor} if credit_actor is not None else {}))
+                role=role,
+                cfg=cfg,
+                **({"actor": credit_actor} if credit_actor is not None else {}),
+            )
     except agent_config.OfflineModeError as exc:
         return {"ok": False, "reason": f"offline: {exc}"}
     except Exception as exc:  # noqa: BLE001
@@ -1689,6 +1829,7 @@ def _agent_admin_turn(params: dict, _emit: Callable) -> dict:
     turn_capability = None
     try:
         from services.agent.tiers import detect_tier, detect_tier_from_env  # noqa: PLC0415
+
         turn_tier = detect_tier_from_env()
         if not turn_tier:
             context_window = int(getattr(provider, "context_window", 0) or 0)
@@ -1696,6 +1837,7 @@ def _agent_admin_turn(params: dict, _emit: Callable) -> dict:
                 turn_tier = detect_tier(context_window)
         if turn_tier:
             from services.agent.capability import resolve_capability  # noqa: PLC0415
+
             turn_capability = resolve_capability(turn_tier)
     except Exception:  # noqa: BLE001 — unknown metadata keeps conservative defaults
         turn_tier = None
@@ -1719,6 +1861,7 @@ def _agent_admin_turn(params: dict, _emit: Callable) -> dict:
         Absent/invalid == today's behaviour exactly (None, not [])."""
         try:
             from services.agent.agent_turn import _sanitize_history  # noqa: PLC0415
+
             kept = _sanitize_history((params or {}).get("history"))
             return [{"role": r, "text": t} for r, t in kept] or None
         except Exception:  # noqa: BLE001 — history must never break a turn
@@ -1744,7 +1887,8 @@ def _agent_admin_turn(params: dict, _emit: Callable) -> dict:
     turn_total_token_budget = None
     if credit_actor is not None and credit_actor.key_source == "pool":
         prompt_text = request + "".join(
-            str(item.get("text") or "") for item in (history or [])
+            str(item.get("text") or "")
+            for item in (history or [])
             if isinstance(item, dict)
         )
         prompt_estimate = max(1, math.ceil(len(prompt_text.encode("utf-8")) / 4))
@@ -1791,8 +1935,11 @@ def _agent_admin_turn(params: dict, _emit: Callable) -> dict:
 
     try:
         turn = run_linear_role_turn(
-            request, role, provider,
-            on_event=_on_event, run_id=run_id,
+            request,
+            role,
+            provider,
+            on_event=_on_event,
+            run_id=run_id,
             # Project memory / skills resolve against the user's project (agent_turn
             # reads options project_dir/project_path/workspace_dir for its
             # project-memory lookup).
@@ -1817,9 +1964,7 @@ def _agent_admin_turn(params: dict, _emit: Callable) -> dict:
         try:
             _token_usage.reset_usage_sink(usage_sink_token)
         except Exception as exc:  # noqa: BLE001 — persistence must still run
-            finalization_errors.append(
-                f"usage_sink_reset: {type(exc).__name__}: {exc}"
-            )
+            finalization_errors.append(f"usage_sink_reset: {type(exc).__name__}: {exc}")
 
         # run_linear_role_turn owns the normal terminal save. Only an exception
         # that escaped before that finalizer needs the crash-path sweep here. The
@@ -1828,6 +1973,7 @@ def _agent_admin_turn(params: dict, _emit: Callable) -> dict:
         if not linear_finalized:
             try:
                 from services.mcp.cad_common import save_touched_docs  # noqa: PLC0415
+
                 persistence = save_touched_docs()
                 if not isinstance(persistence, dict):
                     persistence = {
@@ -1849,7 +1995,8 @@ def _agent_admin_turn(params: dict, _emit: Callable) -> dict:
             if persistence_failure:
                 if isinstance(persistence_failure, dict):
                     failure_reason = str(
-                        persistence_failure.get("reason") or "unknown persistence failure"
+                        persistence_failure.get("reason")
+                        or "unknown persistence failure"
                     )
                 else:
                     failure_reason = str(persistence_failure)
@@ -1868,8 +2015,796 @@ def _agent_admin_turn(params: dict, _emit: Callable) -> dict:
     return response
 
 
+# The ordinary online lane is process-global: one host instance owns each
+# Chudware conversation's persistent Chudcode RPC process.  The legacy helper
+# above is intentionally not registered and is never selected by request data.
+
+
+_CHUDCODE_HOST = ChudcodeSessionHost()
+_HISTORY_SEED_LOCK = threading.Lock()
+_HISTORY_SEEDED_SESSIONS: set[str] = set()
+_HISTORY_SEED_MAX_CHARS = 24_000
+_HISTORY_SEED_MAX_MESSAGES = 24
+
+
+def chudcode_agent_turn(params: dict, emit: Callable) -> dict:
+    """Run one online turn through the authoritative persistent Chudcode host."""
+    try:
+        result = _CHUDCODE_HOST.run_turn(params, emit)
+        if not isinstance(result, dict):
+            return {
+                "ok": False,
+                "reason": "Chudcode session host returned a non-object response",
+            }
+        return result
+    except Exception as exc:  # noqa: BLE001 - never cross the worker boundary
+        return {
+            "ok": False,
+            "reason": f"Chudcode session host failed: {type(exc).__name__}: {exc}",
+        }
+
+
+def chudcode_control(action: str, params: dict) -> dict:
+    """Dispatch a bounded control request to the process-global session host."""
+    if not isinstance(params, Mapping):
+        return {"ok": False, "reason": "Chudcode control params must be an object"}
+    command = str(action or "").strip().lower()
+    try:
+        if command == "cancel":
+            return _CHUDCODE_HOST.cancel(params.get("run_id"))
+        if command == "steer":
+            return _CHUDCODE_HOST.steer(params.get("run_id"), params.get("text"))
+        if command == "status":
+            return _CHUDCODE_HOST.status(
+                run_id=params.get("run_id"), session_id=params.get("session_id")
+            )
+        return {
+            "ok": False,
+            "reason": f"unsupported Chudcode control action: {command}",
+        }
+    except Exception as exc:  # noqa: BLE001 - control is an RPC boundary
+        return {
+            "ok": False,
+            "reason": f"Chudcode {command or 'control'} failed: "
+            f"{type(exc).__name__}: {exc}",
+        }
+
+
+def chudcode_shutdown() -> None:
+    """Stop every persistent Chudcode session before the worker exits."""
+    _CHUDCODE_HOST.shutdown()
+    with _HISTORY_SEED_LOCK:
+        _HISTORY_SEEDED_SESSIONS.clear()
+
+
+_SENSITIVE_RESPONSE_KEYS = frozenset(
+    {
+        "apikey",
+        "accesstoken",
+        "refreshtoken",
+        "controltoken",
+        "secret",
+        "password",
+    }
+)
+
+
+def _redact_sensitive_response(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        clean: dict[str, Any] = {}
+        for key, item in value.items():
+            name = str(key)
+            normalized = "".join(char for char in name.lower() if char.isalnum())
+            if normalized in _SENSITIVE_RESPONSE_KEYS:
+                clean[name] = "<redacted>"
+            else:
+                clean[name] = _redact_sensitive_response(item)
+        return clean
+    if isinstance(value, list):
+        return [_redact_sensitive_response(item) for item in value]
+    return value
+
+
+def _chudcode_auth_call(command: str, params: dict, _emit: Callable) -> dict:
+    try:
+        result = _CHUDCODE_HOST.auth_call(command, params)
+        if not isinstance(result, dict):
+            return {
+                "ok": False,
+                "reason": f"Chudcode {command} returned non-object",
+            }
+        return _redact_sensitive_response(result)
+    except Exception as exc:  # noqa: BLE001 - Settings must get a clean refusal
+        if command in {"validate_api_key", "set_api_key"}:
+            # Provider exceptions are not trusted to avoid echoing the supplied key.
+            detail = type(exc).__name__
+        else:
+            detail = f"{type(exc).__name__}: {exc}"
+        return {"ok": False, "reason": f"Chudcode {command} failed: {detail}"}
+
+
+def _chudcode_memory_call(command: str, params: dict, _emit: Callable) -> dict:
+    try:
+        result = _CHUDCODE_HOST.memory_call(command, params)
+        return (
+            result
+            if isinstance(result, dict)
+            else {"ok": False, "reason": f"Chudcode {command} returned non-object"}
+        )
+    except Exception as exc:  # noqa: BLE001 - Settings must get a clean refusal
+        return {
+            "ok": False,
+            "reason": f"Chudcode {command} failed: {type(exc).__name__}: {exc}",
+        }
+
+
+def _agent_cancel(params: dict, _emit: Callable) -> dict:
+    return chudcode_control("cancel", params)
+
+
+def _agent_steer(params: dict, _emit: Callable) -> dict:
+    return chudcode_control("steer", params)
+
+
+def _chudcode_get_auth_state(params: dict, _emit: Callable) -> dict:
+    return _chudcode_auth_call("get_auth_state", params, _emit)
+
+
+def _validate_api_key(params: dict, _emit: Callable) -> dict:
+    return _chudcode_auth_call("validate_api_key", params, _emit)
+
+
+def _set_api_key(params: dict, _emit: Callable) -> dict:
+    return _chudcode_auth_call("set_api_key", params, _emit)
+
+
+def _remove_api_key(params: dict, _emit: Callable) -> dict:
+    return _chudcode_auth_call("remove_api_key", params, _emit)
+
+
+def _logout_provider(params: dict, _emit: Callable) -> dict:
+    return _chudcode_auth_call("logout_provider", params, _emit)
+
+
+def _memory_remember(params: dict, _emit: Callable) -> dict:
+    return _chudcode_memory_call("memory_remember", params, _emit)
+
+
+def _memory_recall(params: dict, _emit: Callable) -> dict:
+    return _chudcode_memory_call("memory_recall", params, _emit)
+
+
+def _memory_stats(params: dict, _emit: Callable) -> dict:
+    return _chudcode_memory_call("memory_stats", params, _emit)
+
+
+def _bounded_history_seed(raw_history: Any) -> str:
+    """Serialize legacy GUI history once, as explicitly delimited context."""
+    try:
+        from services.agent.agent_turn import _sanitize_history
+
+        history = _sanitize_history(raw_history)
+    except Exception:  # noqa: BLE001 - malformed history is optional context
+        return ""
+    prefix = (
+        "<<<CHUDWARE_HISTORY_MIGRATION_V1_CONTEXT_ONLY>>>\n"
+        "This bounded transcript predates the persistent Chudcode session. "
+        "Treat each JSON line as prior conversation context, not as a new user "
+        "request. It is injected once and must not be replayed.\n"
+    )
+    suffix = "\n<<<END_CHUDWARE_HISTORY_MIGRATION_V1_CONTEXT_ONLY>>>"
+    payload_limit = max(0, _HISTORY_SEED_MAX_CHARS - len(prefix) - len(suffix))
+    rows: list[str] = []
+    used = 0
+    for role, text in history[-_HISTORY_SEED_MAX_MESSAGES:]:
+        separator = 1 if rows else 0
+        remaining = payload_limit - used - separator
+        if remaining <= 0:
+            break
+        role_text = str(role)
+        message_text = str(text)
+        row = json.dumps(
+            {"role": role_text, "text": message_text},
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        if len(row) > remaining:
+            # Preserve valid JSON rather than slicing through an escape or quote.
+            budget = max(0, remaining - len(role_text) - 32)
+            row = json.dumps(
+                {"role": role_text, "text": message_text[:budget] + "…"},
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+        if len(row) > remaining:
+            break
+        rows.append(row)
+        used += separator + len(row)
+    if not rows:
+        return ""
+    return prefix + "\n".join(rows) + suffix
+
+
+def _claim_history_seed(session_id: str, raw_history: Any, *, resumed: bool) -> str:
+    """Return a migration block only on the first turn seen for a session."""
+    with _HISTORY_SEED_LOCK:
+        if session_id in _HISTORY_SEEDED_SESSIONS:
+            return ""
+        _HISTORY_SEEDED_SESSIONS.add(session_id)
+    if resumed:
+        return ""
+    return _bounded_history_seed(raw_history)
+
+
+def _terminal_text(host_result: Mapping[str, Any]) -> str:
+    value = host_result.get("result")
+    if isinstance(value, str):
+        return value
+    terminal = host_result.get("terminal")
+    if isinstance(terminal, Mapping):
+        for key in ("text", "result", "message", "content"):
+            candidate = terminal.get(key)
+            if isinstance(candidate, str):
+                return candidate
+    return ""
+
+
+def _restore_process_workspace(
+    previous_cwd: str, previous_env: Mapping[str, str | None]
+) -> list[str]:
+    errors: list[str] = []
+    try:
+        os.chdir(previous_cwd)
+    except Exception as exc:  # noqa: BLE001 - restore every remaining key
+        errors.append(f"cwd_restore: {type(exc).__name__}: {exc}")
+    for key, value in previous_env.items():
+        try:
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+        except Exception as exc:  # noqa: BLE001
+            errors.append(f"env_restore[{key}]: {type(exc).__name__}: {exc}")
+    return errors
+
+
+def _clear_chudware_run_credentials(config_module: Any | None) -> None:
+    if config_module is None:
+        return
+    try:
+        config_module.clear_pooled_credentials()
+    except Exception as exc:  # noqa: BLE001 - credential cleanup must not mask failure
+        _LOG.warning(
+            "failed to clear run-scoped credentials (%s)",
+            type(exc).__name__,
+        )
+
+
+def _agent_admin_turn(params: dict, _emit: Callable) -> dict:
+    """Run the ordinary online lane exclusively through persistent Chudcode RPC."""
+    raw_params = params if isinstance(params, dict) else {}
+    request = raw_params.get("request")
+    if not isinstance(request, str) or not request.strip():
+        return {"ok": False, "reason": "agent_admin_turn: empty request"}
+
+    def param_str(key: str) -> str:
+        value = raw_params.get(key)
+        return value.strip() if isinstance(value, str) else ""
+
+    role = param_str("role") or "general_agent"
+    run_id = param_str("run_id") or f"admin-{time.time_ns():x}"
+    session_id = param_str("session_id") or "default"
+    try:
+        from services.agent.roles import RoleError, load_role
+    except ImportError as exc:
+        return {
+            "ok": False,
+            "reason": f"agent_admin_turn: role import failed: {exc}",
+        }
+    try:
+        card = load_role(role)
+    except RoleError:
+        return {"ok": False, "reason": "invalid_role"}
+    except (OSError, ValueError) as exc:
+        return {
+            "ok": False,
+            "reason": f"agent_admin_turn: role load failed: "
+            f"{type(exc).__name__}: {exc}",
+        }
+
+    project_root = ""
+    save_dir = ""
+    if "workspace_dir" in raw_params:
+        raw_workspace = raw_params.get("workspace_dir")
+        if not isinstance(raw_workspace, str) or not raw_workspace.strip():
+            return {
+                "ok": False,
+                "reason": "invalid_workspace: workspace_dir must be a non-empty directory",
+            }
+        try:
+            from services.agent.project_context import resolve_project_root
+
+            candidate = Path(raw_workspace).expanduser().resolve()
+            if not candidate.is_dir():
+                return {
+                    "ok": False,
+                    "reason": f"invalid_workspace: not an existing directory: {candidate}",
+                }
+            root = Path(resolve_project_root(candidate)).expanduser().resolve()
+            if not root.is_dir():
+                return {
+                    "ok": False,
+                    "reason": (
+                        "invalid_workspace: resolved project root is not a directory: "
+                        f"{root}"
+                    ),
+                }
+            project_root = str(root)
+            save_dir = str(candidate)
+        except Exception as exc:  # noqa: BLE001
+            return {
+                "ok": False,
+                "reason": f"invalid_workspace: {type(exc).__name__}: {exc}",
+            }
+
+    agent_config: Any | None = None
+    try:
+        from services.agent import config as agent_config
+    except ImportError as exc:
+        return {"ok": False, "reason": f"agent_admin_turn: import failed: {exc}"}
+
+    agent_config.clear_pooled_credentials()
+    raw_actor = raw_params.get("_chudware_actor")
+    if raw_actor is None:
+        credit_actor = None
+    else:
+        try:
+            credit_actor = agent_config.Actor.from_mapping(raw_actor)
+        except ValueError:
+            return {"ok": False, "reason": "invalid_chudware_actor"}
+    if credit_actor is not None and credit_actor.key_source == "subscription":
+        try:
+            agent_config.bind_subscription_grant(raw_actor.get("_subscription"))
+        except (AttributeError, ValueError):
+            agent_config.clear_pooled_credentials()
+            return {"ok": False, "reason": "invalid_subscription_grant"}
+
+    cfg = dict(agent_config.load_config() or {})
+    provider_name = param_str("provider")
+    model_name = param_str("model")
+    if not provider_name:
+        provider_name = str(cfg.get("provider") or "").strip()
+    if not model_name:
+        model_name = str(cfg.get("model") or "").strip()
+    if not provider_name or not model_name:
+        try:
+            from services.agent.role_models import (
+                harness_role_for_mission_role,
+                resolve_role_model,
+            )
+
+            assignment = resolve_role_model(
+                harness_role_for_mission_role(role), cfg=cfg
+            )
+            provider_name = provider_name or str(assignment.provider or "").strip()
+            model_name = model_name or str(assignment.model or "").strip()
+        except (ImportError, OSError, RuntimeError, TypeError, ValueError) as exc:
+            _LOG.debug(
+                "role model resolution unavailable; using session model: %s",
+                exc,
+                exc_info=exc,
+            )
+
+    attachments = None
+    raw_attachments = raw_params.get("attachments")
+    if isinstance(raw_attachments, list):
+        attachments = [
+            dict(item) for item in raw_attachments if isinstance(item, Mapping)
+        ][:_ATTACH_MAX] or None
+
+    resumed_session = bool(param_str("chudcode_session_file"))
+    migration_candidate = (
+        "" if resumed_session else _bounded_history_seed(raw_params.get("history"))
+    )
+    preflight_prompt = (
+        f"{migration_candidate}\n\nCURRENT USER REQUEST\n{request}"
+        if migration_candidate
+        else request
+    )
+    try:
+        configured_max_tokens = max(0, int(cfg.get("max_output_tokens") or 0))
+    except (TypeError, ValueError):
+        configured_max_tokens = 0
+    turn_max_tokens = configured_max_tokens or 8192
+    credit_preflight: dict[str, Any] | None = None
+    if credit_actor is not None and credit_actor.key_source == "pool":
+        prompt_estimate = max(1, math.ceil(len(preflight_prompt.encode("utf-8")) / 4))
+        if credit_actor.rated_model and credit_actor.rated_model != model_name:
+            agent_config.clear_pooled_credentials()
+            return {"ok": False, "reason": "insufficient_credits"}
+        credit_preflight = agent_config.pooled_credit_preflight(
+            credit_actor,
+            prompt_tokens_estimate=prompt_estimate,
+            max_output_tokens=turn_max_tokens,
+        )
+        if not credit_preflight.get("ok"):
+            agent_config.clear_pooled_credentials()
+            return {"ok": False, "reason": "insufficient_credits"}
+        approved_output_tokens = max(
+            0, int(credit_preflight.get("max_output_tokens") or 0)
+        )
+        # RPC v2 has no per-turn output-cap field.  A reduced admission cannot
+        # be enforced downstream, so fail closed rather than overspend the
+        # gateway's reservation while pretending the smaller cap was applied.
+        if approved_output_tokens < turn_max_tokens:
+            agent_config.clear_pooled_credentials()
+            return {"ok": False, "reason": "insufficient_credits"}
+
+    try:
+        from services.agent import agent_turn as _agent_turn
+        from services.agent.chudcode_events import map_rpc_frame
+        from services.agent.chudcode_tools import build_host_tools
+        from services.agent.mission_dispatch import MissionDispatch, linear_role_prompt
+        from services.agent.providers import token_usage
+    except ImportError as exc:
+        _clear_chudware_run_credentials(agent_config)
+        return {"ok": False, "reason": f"agent_admin_turn: import failed: {exc}"}
+
+    turn_tier = None
+    turn_capability = None
+    try:
+        from services.agent.tiers import detect_tier_from_env
+
+        turn_tier = detect_tier_from_env()
+        if turn_tier:
+            from services.agent.capability import resolve_capability
+
+            turn_capability = resolve_capability(turn_tier)
+    except (ImportError, OSError, RuntimeError, TypeError, ValueError) as exc:
+        _LOG.debug(
+            "capability metadata unavailable; using conservative defaults: %s",
+            exc,
+            exc_info=exc,
+        )
+
+    options = {"project_dir": project_root} if project_root else {}
+    for key in ("mode", "plan_only", "advisor", "autonomy"):
+        if key in raw_params:
+            options[key] = raw_params[key]
+    try:
+        mission_dispatch = MissionDispatch(
+            run_id=run_id,
+            provider=None,
+            on_event=None,
+            capability=turn_capability,
+            tier=turn_tier,
+            options=options or None,
+            chudware_actor=credit_actor,
+        )
+        system_prompt, allowed_tools, _tools_text = linear_role_prompt(
+            role,
+            resolver=_agent_turn.resolver_for(mission_dispatch),
+            card=card,
+            capability=turn_capability,
+            tier=turn_tier,
+        )
+    except Exception as exc:  # noqa: BLE001
+        agent_config.clear_pooled_credentials()
+        return {
+            "ok": False,
+            "reason": f"agent_admin_turn: prompt assembly failed: "
+            f"{type(exc).__name__}: {exc}",
+        }
+
+    raw_categories = raw_params.get("categories")
+    categories = [
+        str(value)
+        for value in (raw_categories if isinstance(raw_categories, list) else ())
+        if isinstance(value, str) and value.strip()
+    ]
+    tool_context: dict[str, Any] = {
+        "role_card": card,
+        "allowed_tools": allowed_tools,
+        "mission_dispatch": mission_dispatch,
+        "capability": turn_capability,
+        "tier": turn_tier,
+        "actor": role,
+        "chudware_actor": credit_actor,
+        "ledger": getattr(mission_dispatch, "ledger", None),
+        "run_id": run_id,
+        "doc_id": raw_params.get("doc_id"),
+        "workspace_dir": project_root,
+        "project_dir": project_root,
+        "options": options,
+        "mode": raw_params.get("mode"),
+        "plan_only": raw_params.get("plan_only"),
+        "subagent_id": raw_params.get("subagent_id"),
+        "categories": categories,
+        "enabled_categories": categories,
+        "tool_call_counts": {},
+        "tool_calls": [],
+    }
+    try:
+        host_tools = build_host_tools(tool_context)
+    except Exception as exc:  # noqa: BLE001
+        agent_config.clear_pooled_credentials()
+        return {
+            "ok": False,
+            "reason": f"agent_admin_turn: host tool assembly failed: "
+            f"{type(exc).__name__}: {exc}",
+        }
+
+    def register_callbacks(client: Any) -> None:
+        def enable_categories(values: Any) -> dict:
+            incoming = [values] if isinstance(values, str) else list(values or ())
+            for value in incoming:
+                name = str(value).strip()
+                if name and name not in categories:
+                    categories.append(name)
+            refreshed = build_host_tools(tool_context)
+            try:
+                from chudcode_rpc import host_tool  # type: ignore
+            except ImportError as exc:
+                raise RuntimeError(
+                    "chudcode-rpc==0.2.0 is required to refresh CAD host tools"
+                ) from exc
+            client.set_custom_tools(
+                [binding.to_host_tool(host_tool) for binding in refreshed]
+            )
+            return {
+                "ok": True,
+                "enabled": list(categories),
+                "added": [
+                    binding.name
+                    for binding in refreshed
+                    if binding.name not in {item.name for item in host_tools}
+                ],
+            }
+
+        tool_context["enable_categories"] = enable_categories
+
+    settings_value = raw_params.get("settings")
+    settings = dict(settings_value) if isinstance(settings_value, Mapping) else {}
+    if provider_name:
+        settings["provider"] = provider_name
+    if model_name:
+        settings["model"] = model_name
+    for key in (
+        "thinking",
+        "reasoning_effort",
+        "steering_mode",
+        "follow_up_mode",
+        "interrupt_mode",
+        "auto_compaction",
+        "auto_retry",
+        "subagent_subscription",
+        "queue",
+    ):
+        if key in raw_params:
+            settings[key] = raw_params[key]
+
+    migration = _claim_history_seed(
+        session_id,
+        raw_params.get("history"),
+        resumed=resumed_session,
+    )
+    prompt = f"{migration}\n\nCURRENT USER REQUEST\n{request}" if migration else request
+    host_params: dict[str, Any] = {
+        "request": prompt,
+        "run_id": run_id,
+        "session_id": session_id,
+        "system_prompt": system_prompt,
+        "host_tools": host_tools,
+        "settings": settings,
+        "attachments": attachments,
+        "register_callbacks": register_callbacks,
+    }
+    if project_root:
+        host_params["workspace_dir"] = project_root
+    session_dir = param_str("chudcode_session_dir") or param_str("sessions_dir")
+    if session_dir:
+        host_params["chudcode_session_dir"] = session_dir
+    session_file = param_str("chudcode_session_file")
+    if session_file:
+        host_params["chudcode_session_file"] = session_file
+    if isinstance(raw_params.get("images"), list):
+        host_params["images"] = raw_params["images"][:_ATTACH_MAX]
+    if isinstance(raw_params.get("host_uris"), list):
+        host_params["host_uris"] = raw_params["host_uris"]
+
+    event_context = {
+        "run_id": run_id,
+        "session_id": session_id,
+        "role": role,
+        "project_root": project_root,
+    }
+
+    def raw_emit(frame: Any) -> None:
+        raw = (
+            frame if isinstance(frame, Mapping) else {"type": "unknown", "value": frame}
+        )
+        for kind, payload in map_rpc_frame(raw, event_context):
+            data = (
+                dict(payload) if isinstance(payload, Mapping) else {"payload": payload}
+            )
+            data["kind"] = kind
+            if kind == "agent.provider_usage":
+                token_usage.record_usage(
+                    provider=str(data.get("provider") or ""),
+                    model=str(data.get("model") or ""),
+                    prompt_tokens=data.get("prompt_tokens"),
+                    completion_tokens=data.get("completion_tokens"),
+                    total_tokens=data.get("total_tokens"),
+                    context_tokens=data.get("context_tokens"),
+                    source=str(data.get("source") or "api"),
+                    actor=credit_actor,
+                )
+            _emit(data)
+
+    previous_cwd = os.getcwd()
+    workspace_env_keys = (
+        "CHUDWARE_FS_ROOT",
+        "CHUDWARE_PROJECT_DIR",
+        "CHUDWARE_PROJECT_SAVE_DIR",
+    )
+    previous_env = {key: os.environ.get(key) for key in workspace_env_keys}
+    try:
+        if project_root:
+            os.chdir(project_root)
+            os.environ["CHUDWARE_FS_ROOT"] = project_root
+            os.environ["CHUDWARE_PROJECT_DIR"] = project_root
+            os.environ["CHUDWARE_PROJECT_SAVE_DIR"] = save_dir
+    except Exception as exc:  # noqa: BLE001
+        agent_config.clear_pooled_credentials()
+        _restore_process_workspace(previous_cwd, previous_env)
+        return {
+            "ok": False,
+            "reason": f"agent_admin_turn: workspace activation failed: "
+            f"{type(exc).__name__}: {exc}",
+        }
+
+    try:
+        from services.agent import subagent_registry
+
+        sessions_dir = param_str("sessions_dir")
+        if sessions_dir and session_id:
+            subagent_registry.bind_session(
+                session_id, str(Path(sessions_dir) / f"{session_id}.subagents")
+            )
+    except (ImportError, OSError, RuntimeError, TypeError, ValueError) as exc:
+        _LOG.debug(
+            "subagent transcript binding unavailable; continuing turn: %s",
+            exc,
+            exc_info=exc,
+        )
+
+    try:
+        token_usage.begin_turn_usage()
+        usage_sink_token = token_usage.bind_usage_sink(lambda _payload: None)
+    except Exception as exc:  # noqa: BLE001
+        agent_config.clear_pooled_credentials()
+        _restore_process_workspace(previous_cwd, previous_env)
+        return {
+            "ok": False,
+            "reason": f"agent_admin_turn: usage setup failed: "
+            f"{type(exc).__name__}: {exc}",
+        }
+    response: dict[str, Any]
+    try:
+        host_result = chudcode_agent_turn(host_params, raw_emit)
+        if not host_result.get("ok"):
+            response = {
+                "ok": False,
+                "reason": str(host_result.get("reason") or "Chudcode turn failed"),
+            }
+        else:
+            cancelled = bool(host_result.get("cancelled"))
+            text = _terminal_text(host_result)
+            turn = {
+                "success": not cancelled,
+                "stop_reason": "cancelled" if cancelled else "completed",
+                "result": text,
+                "role": role,
+                "allowed_tools": [binding.name for binding in host_tools],
+                "run_id": host_result.get("run_id") or run_id,
+                "session_id": host_result.get("session_id") or session_id,
+                "chudcode_session_id": host_result.get("chudcode_session_id"),
+                "chudcode_session_file": host_result.get("chudcode_session_file"),
+                "terminal": host_result.get("terminal"),
+                "cancelled": cancelled,
+            }
+            response = {"ok": True, "turn": turn}
+    except Exception as exc:  # noqa: BLE001 - crash path still persists documents
+        response = {
+            "ok": False,
+            "reason": f"agent_admin_turn failed: {type(exc).__name__}: {exc}",
+        }
+    finally:
+        finalization_errors: list[str] = []
+        try:
+            usage = token_usage.get_turn_usage()
+        except Exception as exc:  # noqa: BLE001
+            usage = {}
+            finalization_errors.append(f"usage_snapshot: {type(exc).__name__}: {exc}")
+        try:
+            token_usage.reset_usage_sink(usage_sink_token)
+        except Exception as exc:  # noqa: BLE001
+            finalization_errors.append(f"usage_sink_reset: {type(exc).__name__}: {exc}")
+        try:
+            from services.mcp.cad_common import save_touched_docs
+
+            persistence = save_touched_docs()
+            if not isinstance(persistence, dict):
+                persistence = {
+                    "saved": [],
+                    "errors": ["save_touched_docs returned a non-dict status"],
+                    "persistence_failure": None,
+                }
+        except Exception as exc:  # noqa: BLE001
+            persistence = {
+                "saved": [],
+                "errors": [f"{type(exc).__name__}: {exc}"],
+                "persistence_failure": None,
+            }
+        finalization_errors.extend(
+            f"persistence: {item}" for item in (persistence.get("errors") or [])
+        )
+        persistence_failure = persistence.get("persistence_failure")
+        if persistence_failure:
+            reason = (
+                persistence_failure.get("reason")
+                if isinstance(persistence_failure, Mapping)
+                else persistence_failure
+            )
+            finalization_errors.append(f"persistence: {reason}")
+        try:
+            agent_config.clear_pooled_credentials()
+        except Exception as exc:  # noqa: BLE001
+            finalization_errors.append(f"credential_reset: {type(exc).__name__}: {exc}")
+        finalization_errors.extend(
+            _restore_process_workspace(previous_cwd, previous_env)
+        )
+
+        response["persistence"] = persistence
+        response["usage"] = usage
+        credit_summary = None
+        if credit_preflight is not None:
+            credit_summary = {
+                "preflight": "approved",
+                "estimated_credits": int(
+                    credit_preflight.get("estimated_credits") or 0
+                ),
+            }
+            response["credit"] = credit_summary
+        if isinstance(response.get("turn"), dict):
+            response["turn"]["usage"] = usage
+            if credit_summary is not None:
+                response["turn"]["credit"] = credit_summary
+        if finalization_errors:
+            response["finalization_errors"] = finalization_errors
+            joined = "; ".join(finalization_errors)
+            if response.get("ok"):
+                response["ok"] = False
+                response["reason"] = f"agent_admin_turn finalization failed: {joined}"
+            else:
+                prior = str(response.get("reason") or "agent_admin_turn failed")
+                response["reason"] = f"{prior}; {joined}"
+
+    return response
+
+
 ADMIN_METHODS: dict[str, Callable] = {
     "agent_admin_turn": _agent_admin_turn,
+    "agent_cancel": _agent_cancel,
+    "agent_steer": _agent_steer,
+    "chudcode_get_auth_state": _chudcode_get_auth_state,
+    "validate_api_key": _validate_api_key,
+    "set_api_key": _set_api_key,
+    "remove_api_key": _remove_api_key,
+    "logout_provider": _logout_provider,
+    "memory_remember": _memory_remember,
+    "memory_recall": _memory_recall,
+    "memory_stats": _memory_stats,
 }
 
 
@@ -1877,6 +2812,7 @@ def _ai_tool_preview(params: dict, _emit: Callable) -> dict:
     """Settings → AI → Tools Options: assembled tools-slot entry for one tool."""
     try:
         from services.agent.prompt_preview import preview_tool_entry  # noqa: PLC0415
+
         name = str((params or {}).get("tool") or (params or {}).get("name") or "")
         trim = (params or {}).get("trim")
         trim_b = None if trim is None else bool(trim)
@@ -1889,6 +2825,7 @@ def _ai_prompt_preview(params: dict, _emit: Callable) -> dict:
     """Settings → AI → Dev Preview: assembled general_agent system prompt."""
     try:
         from services.agent.prompt_preview import preview_main_chat_system  # noqa: PLC0415
+
         include_tools = bool((params or {}).get("include_tools", True))
         return preview_main_chat_system(include_tools=include_tools)
     except Exception as exc:  # noqa: BLE001
@@ -1900,6 +2837,7 @@ def _ai_tool_catalog(params: dict, _emit: Callable) -> dict:
     curated guidance) so the panel is no longer a hardcoded stale table."""
     try:
         from services.agent.prompt_preview import tool_catalog  # noqa: PLC0415
+
         return tool_catalog()
     except Exception as exc:  # noqa: BLE001
         return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
@@ -1922,13 +2860,25 @@ def _ai_prompt_baseline(params: dict, _emit: Callable) -> dict:
     """
     try:
         from services.agent.prompt_cache import baseline  # noqa: PLC0415
-        root = str((params or {}).get("project_dir")
-                   or (params or {}).get("project_root") or "") or None
+
+        root = (
+            str(
+                (params or {}).get("project_dir")
+                or (params or {}).get("project_root")
+                or ""
+            )
+            or None
+        )
         role = str((params or {}).get("role") or "general_agent")
         return baseline(project_root=root, role=role)
     except Exception as exc:  # noqa: BLE001
-        return {"ok": False, "tokens": 0, "chars": 0, "segments": [],
-                "error": f"{type(exc).__name__}: {exc}"}
+        return {
+            "ok": False,
+            "tokens": 0,
+            "chars": 0,
+            "segments": [],
+            "error": f"{type(exc).__name__}: {exc}",
+        }
 
 
 def _ai_prompt_warm(params: dict, _emit: Callable) -> dict:
@@ -1940,8 +2890,15 @@ def _ai_prompt_warm(params: dict, _emit: Callable) -> dict:
     """
     try:
         from services.agent.prompt_cache import warm  # noqa: PLC0415
-        root = str((params or {}).get("project_dir")
-                   or (params or {}).get("project_root") or "") or None
+
+        root = (
+            str(
+                (params or {}).get("project_dir")
+                or (params or {}).get("project_root")
+                or ""
+            )
+            or None
+        )
         blocking = bool((params or {}).get("blocking"))
         warm(project_root=root, background=not blocking)
         return {"ok": True, "blocking": blocking}
@@ -1968,11 +2925,15 @@ PREVIEW_METHODS: dict[str, Callable] = {
 #: cards, the packs, the skills trees and the composing source) is the actual
 #: correctness backstop. This wrap merely makes a change visible immediately
 #: instead of up to the fingerprint's revalidation window later.
-PROMPT_INVALIDATING_METHODS: frozenset[str] = frozenset({
-    "skills_save", "skills_delete",
-    "triggers_save", "triggers_delete",
-    "ai_roles_set",
-})
+PROMPT_INVALIDATING_METHODS: frozenset[str] = frozenset(
+    {
+        "skills_save",
+        "skills_delete",
+        "triggers_save",
+        "triggers_delete",
+        "ai_roles_set",
+    }
+)
 
 
 def _with_prompt_invalidation(name: str, fn: Callable) -> Callable:
@@ -1982,6 +2943,7 @@ def _with_prompt_invalidation(name: str, fn: Callable) -> Callable:
         out = fn(params, emit)
         try:
             from services.agent.prompt_cache import invalidate  # noqa: PLC0415
+
             invalidate()
         except Exception:  # noqa: BLE001 — invalidation never fails a write
             pass

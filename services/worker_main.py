@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """services/worker_main.py — the services-side stdio JSON-RPC worker (T-RF20/R5a).
 
 This is the Python worker that survives the engine_oracle/ deletion: every ENGINE method
@@ -8,7 +7,7 @@ what remains here are the services-side orchestration surfaces that legitimately
 Python:
 
   run_model (build123d script execution — needs an interpreter by nature),
-  list_editable_prompts / agent_cancel (no-op stub),
+  editable prompts, the persistent Chudcode agent host and its private control lane,
   vendor-parts registry, deliverables, parts hub FTS, agent GUI seams, reveng,
   dag steering, subagent RPC, PLM vault, EM (T-SIM11 hold), multi-physics seam.
 
@@ -19,16 +18,22 @@ the transition it may still spawn ``python -m engine.worker``, which forwards he
 
 Imports are services.* throughout (the engine_oracle fallback is gone with the oracle).
 """
+
 from __future__ import annotations
 
 import json
 import logging
+import signal
 import sys
+import threading
 import traceback
-from typing import Callable
+from collections.abc import Callable
 
 log = logging.getLogger("chudware.worker")
 EmitFn = Callable[[dict], None]
+
+_STDOUT_LOCK = threading.Lock()
+_CONTROL_SERVER = None
 
 from services import paths  # type: ignore  # re-homed from engine_oracle/paths.py
 
@@ -36,6 +41,7 @@ from services import paths  # type: ignore  # re-homed from engine_oracle/paths.
 def _ping(_params: dict, _emit_event: EmitFn) -> dict:
     try:
         import build123d
+
         ver = getattr(build123d, "__version__", "?")
     except Exception:  # noqa: BLE001
         ver = None
@@ -58,36 +64,32 @@ def _list_editable_prompts(_params: dict, _emit_event=None):
     """Settings → AI → Prompts: YAML mission roles + core .md prompts (merged)."""
     try:
         from services.agent.roles import list_editable_prompts
+
         return list_editable_prompts()
     except Exception as exc:  # noqa: BLE001
         return {"ok": False, "error": str(exc)}
 
 
-# Retained for agent_cancel; normally empty (the C++ core owns v2 run lifecycles).
-_RUNS: dict = {}
-
-
-def _agent_cancel(params: dict, _emit_event: EmitFn) -> dict:
-    """Best-effort cancel: flag the run if this process tracks it (it drives none)."""
-    run_id = params["run_id"]
-    control = _RUNS.get(run_id)
-    if control is None:
-        return {"cancelled": False, "reason": "unknown or finished run"}
-    control.cancelled = True
-    return {"cancelled": True}
+def _worker_control_info(_params: dict, _emit_event: EmitFn) -> dict:
+    server = _CONTROL_SERVER
+    if server is None:
+        raise RuntimeError("worker control server is not running")
+    return server.info()
 
 
 _METHODS = {
     "ping": _ping,
     "run_model": _run_model,
     "list_editable_prompts": _list_editable_prompts,
-    "agent_cancel": _agent_cancel,
+    "worker_control_info": _worker_control_info,
 }
 
 _STRUCTURED_ERROR_METHODS: set[str] = set()
 
 
-def _register(label: str, import_paths: list[str], attr: str, structured: bool = False) -> None:
+def _register(
+    label: str, import_paths: list[str], attr: str, structured: bool = False
+) -> None:
     """Register a WORKER_METHODS-style table from the first importable path (dual-path)."""
     import importlib
 
@@ -105,7 +107,9 @@ def _register(label: str, import_paths: list[str], attr: str, structured: bool =
 
 
 # ---- Supplier/vendor parts cache (registry only; insert runs in the C++ core) ----
-_register("vendor_parts", ["services.parts.vendor_parts"], "WORKER_METHODS", structured=True)
+_register(
+    "vendor_parts", ["services.parts.vendor_parts"], "WORKER_METHODS", structured=True
+)
 
 # ---- Deliverables ----
 _register("deliverables", ["services.deliverables.worker_rpc"], "WORKER_METHODS")
@@ -137,8 +141,12 @@ _register("multiphysics", ["services.sim.multiphysics_rpc"], "WORKER_METHODS")
 # ---- Manufacturing printer adapters (Moonraker / OctoPrint / PrusaLink) ----
 # HTTP+WebSocket clients live in Python; the hostd manufacturing lane stays the sole
 # owner of device claims, approval validation, durable seq and events.
-_register("mfg_printers", ["services.manufacturing.printers.worker_rpc"],
-          "WORKER_METHODS", structured=True)
+_register(
+    "mfg_printers",
+    ["services.manufacturing.printers.worker_rpc"],
+    "WORKER_METHODS",
+    structured=True,
+)
 
 
 def _emit(obj: dict) -> None:
@@ -150,8 +158,9 @@ def _emit(obj: dict) -> None:
         payload = json.dumps(obj)
     except TypeError:
         payload = json.dumps(obj, default=str)
-    sys.stdout.write(payload + "\n")
-    sys.stdout.flush()
+    with _STDOUT_LOCK:
+        sys.stdout.write(payload + "\n")
+        sys.stdout.flush()
 
 
 def _warm_prompt_cache() -> None:
@@ -164,54 +173,121 @@ def _warm_prompt_cache() -> None:
     failure here must never stop the worker from serving.
     """
     try:
-        from services.agent.prompt_cache import warm  # noqa: PLC0415
+        from services.agent.prompt_cache import warm
+
         warm(background=True)
     except Exception as exc:  # noqa: BLE001
         log.debug("prompt cache warm skipped: %s", exc)
 
 
+def _invoke_chudcode_control(action: str, params: dict) -> dict:
+    from services.agent.worker_rpc import chudcode_control
+
+    return chudcode_control(action, params)
+
+
+def _shutdown_chudcode() -> None:
+    try:
+        from services.agent.worker_rpc import chudcode_shutdown
+
+        chudcode_shutdown()
+    except Exception as exc:  # noqa: BLE001 — shutdown is best-effort
+        log.error("Chudcode shutdown failed: %s", type(exc).__name__)
+
+
 def serve() -> None:
-    log.info("worker ready (runtime=%s)", paths.RUNTIME)
-    _warm_prompt_cache()
-    for line in sys.stdin:
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            req = json.loads(line)
-        except Exception as e:  # noqa: BLE001
-            _emit({"id": None, "ok": False, "error": f"bad json: {e}"})
-            continue
-        rid = req.get("id")
-        method = req.get("method")
-        if method == "shutdown":
-            _emit({"id": rid, "ok": True, "result": {"bye": True}})
-            break
-        fn = _METHODS.get(method)
-        if fn is None:
-            _emit({"id": rid, "ok": False, "error": f"unknown method: {method}"})
-            continue
+    from services.agent.chudcode_control import ControlServer
 
-        # Per-request event sink: tags each progress notification with this request's id.
-        def emit_event(data: dict, _rid=rid) -> None:
-            _emit({"id": _rid, "event": data.get("kind", "event"), "data": data})
+    global _CONTROL_SERVER
+    control = ControlServer(_invoke_chudcode_control, paths.RUNTIME).start()
+    _CONTROL_SERVER = control
+    shutdown_lock = threading.RLock()
+    shutdown_complete = False
 
-        try:
-            result = fn(req.get("params") or {}, emit_event)
-            _emit({"id": rid, "ok": True, "result": result})
-        except Exception as e:  # noqa: BLE001
-            log.error("method %s failed: %s\n%s", method, e, traceback.format_exc())
-            if method in _STRUCTURED_ERROR_METHODS:
-                to_env = getattr(e, "to_envelope", None)
-                if callable(to_env):
-                    _emit({"id": rid, "ok": False, "error": to_env()})
+    def stop_services() -> None:
+        nonlocal shutdown_complete
+        with shutdown_lock:
+            if shutdown_complete:
+                return
+            shutdown_complete = True
+        control.stop()
+        _shutdown_chudcode()
+
+    old_handlers: dict[int, object] = {}
+    if threading.current_thread() is threading.main_thread():
+        handled_signals = [signal.SIGINT, signal.SIGTERM]
+        if hasattr(signal, "SIGHUP"):
+            handled_signals.append(signal.SIGHUP)
+
+        def on_signal(signum, _frame) -> None:
+            stop_services()
+            raise SystemExit(128 + signum)
+
+        for signum in handled_signals:
+            old_handlers[signum] = signal.getsignal(signum)
+            signal.signal(signum, on_signal)
+
+    try:
+        log.info("worker ready (runtime=%s)", paths.RUNTIME)
+        _warm_prompt_cache()
+        for line in sys.stdin:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                req = json.loads(line)
+            except Exception as e:  # noqa: BLE001
+                _emit({"id": None, "ok": False, "error": f"bad json: {e}"})
+                continue
+            rid = req.get("id")
+            method = req.get("method")
+            if method == "shutdown":
+                _emit({"id": rid, "ok": True, "result": {"bye": True}})
+                break
+            fn = _METHODS.get(method)
+            if fn is None:
+                _emit({"id": rid, "ok": False, "error": f"unknown method: {method}"})
+                continue
+
+            # Stdio dispatch deliberately remains serialized. The private control
+            # listener is the only concurrent path while an agent turn is blocked.
+            def emit_event(data: dict, _rid=rid) -> None:
+                _emit({"id": _rid, "event": data.get("kind", "event"), "data": data})
+
+            try:
+                result = fn(req.get("params") or {}, emit_event)
+                _emit({"id": rid, "ok": True, "result": result})
+            except Exception as e:  # noqa: BLE001
+                log.error("method %s failed: %s\n%s", method, e, traceback.format_exc())
+                if method in _STRUCTURED_ERROR_METHODS:
+                    to_env = getattr(e, "to_envelope", None)
+                    if callable(to_env):
+                        _emit({"id": rid, "ok": False, "error": to_env()})
+                    else:
+                        _emit(
+                            {
+                                "id": rid,
+                                "ok": False,
+                                "error": {
+                                    "code": "internal",
+                                    "message": f"{type(e).__name__}: {e}",
+                                    "detail": {"traceback": traceback.format_exc()},
+                                },
+                            }
+                        )
                 else:
-                    _emit({"id": rid, "ok": False, "error": {
-                        "code": "internal", "message": f"{type(e).__name__}: {e}",
-                        "detail": {"traceback": traceback.format_exc()}}})
-            else:
-                _emit({"id": rid, "ok": False,
-                       "error": f"{type(e).__name__}: {e}\n\n{traceback.format_exc()}"})
+                    _emit(
+                        {
+                            "id": rid,
+                            "ok": False,
+                            "error": f"{type(e).__name__}: {e}\n\n{traceback.format_exc()}",
+                        }
+                    )
+    finally:
+        _CONTROL_SERVER = None
+        stop_services()
+        for signum, old_handler in old_handlers.items():
+            signal.signal(signum, old_handler)
 
 
 if __name__ == "__main__":

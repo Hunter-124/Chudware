@@ -1,0 +1,443 @@
+from __future__ import annotations
+
+from types import SimpleNamespace
+
+import pytest
+
+from services.agent import chudcode_roles as roles
+from services.agent.roles import RoleError
+
+
+class _Binding:
+    def __init__(self, name: str):
+        self.name = name
+
+
+class _Host:
+    def __init__(self, *, cancelled: bool = False, fail: str = ""):
+        self.cancelled = cancelled
+        self.fail = fail
+        self.calls: list[dict] = []
+        self.closed: list[str] = []
+
+    def run_turn(self, params, emit):
+        self.calls.append(dict(params))
+        if self.fail:
+            return {"ok": False, "reason": self.fail, "cancelled": self.cancelled}
+        emit(
+            {
+                "type": "usage",
+                "usage": {
+                    "provider": "fixture-provider",
+                    "model": "fixture-model",
+                    "promptTokens": 11,
+                    "completionTokens": 7,
+                    "totalTokens": 18,
+                    "contextTokens": 15,
+                },
+            }
+        )
+        emit(
+            {
+                "type": "agent_end",
+                "isTerminal": True,
+                "status": "cancelled" if self.cancelled else "completed",
+                "text": "fixture answer",
+            }
+        )
+        return {
+            "ok": True,
+            "run_id": params["run_id"],
+            "session_id": params["session_id"],
+            "cancelled": self.cancelled,
+            "result": "fixture answer",
+            "terminal": {
+                "type": "agent_end",
+                "status": "cancelled" if self.cancelled else "completed",
+            },
+            "chudcode_session_id": "rpc-session",
+            "chudcode_session_file": "/tmp/rpc-session.jsonl",
+        }
+
+    def close_session(self, session_id):
+        self.closed.append(session_id)
+
+
+@pytest.fixture(autouse=True)
+def _reset_history_seed():
+    with roles._HISTORY_LOCK:
+        roles._HISTORY_SEEDED_SESSIONS.clear()
+    yield
+    with roles._HISTORY_LOCK:
+        roles._HISTORY_SEEDED_SESSIONS.clear()
+
+
+@pytest.fixture
+def online_runtime(monkeypatch):
+    card = SimpleNamespace(system_prompt="ROLE PROMPT", concrete_tools=["measure_part"])
+    monkeypatch.setattr(roles, "load_role", lambda _role: card)
+    monkeypatch.setattr(
+        roles, "_resolve_tier_capability", lambda tier, cap, _opts: (tier, cap)
+    )
+    monkeypatch.setattr(
+        roles,
+        "_settings_for_role",
+        lambda _role, _opts: {
+            "provider": "fixture-provider",
+            "model": "fixture-model",
+            "thinking": "low",
+        },
+    )
+
+    def assemble(
+        _card,
+        _role,
+        _run_id,
+        _parent_id,
+        _options,
+        _tier,
+        _capability,
+        _actor,
+        _on_event,
+    ):
+        context = {"categories": [], "enabled_categories": []}
+        tools = [_Binding("measure_part"), _Binding("render_part")]
+        return (
+            "RESOLVED ROLE PROMPT",
+            ["measure_part", "render_part"],
+            tools,
+            object(),
+            context,
+        )
+
+    monkeypatch.setattr(roles, "_assemble_role_runtime", assemble)
+    monkeypatch.setattr(roles, "_record_provider_usage", lambda _payload, _actor: None)
+    return card
+
+
+def test_online_role_prompt_tools_lineage_settings_history_attachments_and_result(
+    monkeypatch, online_runtime
+):
+    host = _Host()
+    monkeypatch.setattr(roles, "get_default_chudcode_host", lambda: host)
+    events: list[tuple[str, dict]] = []
+    actor = object()
+    recorded: list[tuple[dict, object]] = []
+    monkeypatch.setattr(
+        roles,
+        "_record_provider_usage",
+        lambda payload, value: recorded.append((dict(payload), value)),
+    )
+
+    result = roles.run_role_turn(
+        "inspect the bracket",
+        "reviewer",
+        session_id="conversation-7",
+        run_id="run-9",
+        parent_id="node-3",
+        on_event=lambda kind, payload: events.append((kind, payload)),
+        options={"workspace_dir": "/workspace"},
+        history=[
+            {"role": "user", "text": "make a bracket"},
+            {"role": "assistant", "text": "built it"},
+        ],
+        attachments=[{"path": "/tmp/view.png", "kind": "image"}],
+        max_tokens=4096,
+        max_total_tokens=16000,
+        actor=actor,
+    )
+
+    call = host.calls[0]
+    assert call["system_prompt"] == "RESOLVED ROLE PROMPT"
+    assert [item.name for item in call["host_tools"]] == [
+        "measure_part",
+        "render_part",
+    ]
+    assert call["settings"] == {
+        "provider": "fixture-provider",
+        "model": "fixture-model",
+        "thinking": "low",
+    }
+    assert call["attachments"] == [{"path": "/tmp/view.png", "kind": "image"}]
+    assert call["workspace_dir"] == "/workspace"
+    assert call["max_tokens"] == 4096
+    assert call["max_total_tokens"] == 16000
+    assert "CHUDWARE_HISTORY_MIGRATION" in call["request"]
+    assert "inspect the bracket" in call["request"]
+    assert call["session_id"].startswith("cad-role-")
+    assert result == {
+        "success": True,
+        "stop_reason": "completed",
+        "result": "fixture answer",
+        "role": "reviewer",
+        "allowed_tools": ["measure_part", "render_part"],
+        "run_id": "run-9",
+        "session_id": call["session_id"],
+        "parent_id": "node-3",
+        "chudcode_session_id": "rpc-session",
+        "chudcode_session_file": "/tmp/rpc-session.jsonl",
+        "terminal": {"type": "agent_end", "status": "completed"},
+        "cancelled": False,
+        "usage": {
+            "prompt_tokens": 11,
+            "completion_tokens": 7,
+            "total_tokens": 18,
+            "context_tokens": 15,
+            "calls": 1,
+            "providers": [
+                {
+                    "provider": "fixture-provider",
+                    "model": "fixture-model",
+                    "prompt_tokens": 11,
+                    "completion_tokens": 7,
+                    "total_tokens": 18,
+                    "context_tokens": 15,
+                }
+            ],
+        },
+        "tokens_used": 18,
+        "provider_usage_recorded": True,
+        "offline": False,
+    }
+    usage_event = next(
+        payload for kind, payload in events if kind == "agent.provider_usage"
+    )
+    assert usage_event["parent_id"] == "node-3"
+    assert usage_event["session_id"] == call["session_id"]
+    assert recorded and recorded[0][1] is actor
+
+
+def test_persistent_child_session_is_stable_and_history_is_seeded_once(
+    monkeypatch, online_runtime
+):
+    host = _Host()
+    monkeypatch.setattr(roles, "get_default_chudcode_host", lambda: host)
+    kwargs = {
+        "session_id": "conversation",
+        "run_id": "run",
+        "parent_id": "parent",
+        "history": [{"role": "user", "text": "prior"}],
+    }
+
+    first = roles.run_role_turn("first", "reviewer", **kwargs)
+    second = roles.run_role_turn("second", "reviewer", **kwargs)
+
+    assert first["session_id"] == second["session_id"]
+    assert "CHUDWARE_HISTORY_MIGRATION" in host.calls[0]["request"]
+    assert host.calls[1]["request"] == "second"
+    assert host.closed == []
+
+
+def test_distinct_parent_run_or_role_never_share_a_child_session(
+    monkeypatch, online_runtime
+):
+    host = _Host()
+    monkeypatch.setattr(roles, "get_default_chudcode_host", lambda: host)
+    ids = {
+        roles.run_role_turn(
+            "a", "reviewer", session_id="s", run_id="r1", parent_id="p1"
+        )["session_id"],
+        roles.run_role_turn(
+            "b", "reviewer", session_id="s", run_id="r2", parent_id="p1"
+        )["session_id"],
+        roles.run_role_turn(
+            "c", "reviewer", session_id="s", run_id="r1", parent_id="p2"
+        )["session_id"],
+        roles.run_role_turn("d", "fixer", session_id="s", run_id="r1", parent_id="p1")[
+            "session_id"
+        ],
+    }
+    assert len(ids) == 4
+
+
+def test_one_shot_session_closes_and_may_seed_history_again(
+    monkeypatch, online_runtime
+):
+    host = _Host()
+    monkeypatch.setattr(roles, "get_default_chudcode_host", lambda: host)
+    kwargs = {
+        "session_id": "conversation",
+        "run_id": "advisor-run",
+        "parent_id": "advisor-card",
+        "history": [{"role": "user", "text": "prior"}],
+        "close_session": True,
+    }
+
+    first = roles.run_role_turn("audit", "reviewer", **kwargs)
+    second = roles.run_role_turn("audit again", "reviewer", **kwargs)
+
+    assert host.closed == [first["session_id"], second["session_id"]]
+    assert first["session_id"] == second["session_id"]
+    assert all("CHUDWARE_HISTORY_MIGRATION" in call["request"] for call in host.calls)
+
+
+def test_cancelled_host_result_preserves_events_usage_and_compatibility(
+    monkeypatch, online_runtime
+):
+    host = _Host(cancelled=True)
+    monkeypatch.setattr(roles, "get_default_chudcode_host", lambda: host)
+    events: list[tuple[str, dict]] = []
+
+    result = roles.run_role_turn(
+        "stop now",
+        "reviewer",
+        session_id="conversation",
+        run_id="cancel-run",
+        on_event=lambda kind, payload: events.append((kind, payload)),
+    )
+
+    assert result["success"] is False
+    assert result["stop_reason"] == "cancelled"
+    assert result["cancelled"] is True
+    assert result["tokens_used"] == 18
+    finished = [payload for kind, payload in events if kind == "run_finished"]
+    assert finished and finished[-1]["status"] == "cancelled"
+
+
+def test_explicit_offline_uses_only_safe_local_role_loop(monkeypatch):
+    card = SimpleNamespace(system_prompt="offline role", concrete_tools=[])
+    monkeypatch.setattr(roles, "load_role", lambda _role: card)
+    monkeypatch.setattr(
+        roles, "_resolve_tier_capability", lambda tier, cap, _opts: (tier, cap)
+    )
+    monkeypatch.setattr(roles, "_settings_for_role", lambda _role, _opts: {})
+    provider = SimpleNamespace(name="mock", offline_safe=True)
+    monkeypatch.setattr(roles, "_offline_provider", lambda *_args: provider)
+    host_used = []
+    monkeypatch.setattr(
+        roles,
+        "get_default_chudcode_host",
+        lambda: host_used.append(True),
+    )
+    calls = []
+    from services.agent import mission_dispatch
+
+    def local_turn(request, role, received_provider, **kwargs):
+        calls.append((request, role, received_provider, kwargs))
+        return {
+            "success": True,
+            "stop_reason": "confirmed",
+            "result": {"handoff": {"status": "done"}},
+            "role": role,
+            "allowed_tools": ["measure_part"],
+        }
+
+    monkeypatch.setattr(mission_dispatch, "run_linear_role_turn", local_turn)
+
+    result = roles.run_role_turn(
+        "local audit",
+        "reviewer",
+        session_id="conversation",
+        run_id="offline-run",
+        parent_id="parent",
+        options={"offline": True, "offline_provider": provider},
+        history=[{"role": "user", "text": "prior"}],
+        attachments=[{"path": "/tmp/a.txt", "kind": "file"}],
+        max_tokens=2000,
+        max_total_tokens=8000,
+        actor="credit-actor",
+    )
+
+    assert not host_used
+    assert calls[0][2] is provider
+    assert calls[0][3]["history"] == [{"role": "user", "text": "prior"}]
+    assert calls[0][3]["attachments"] == [{"path": "/tmp/a.txt", "kind": "file"}]
+    assert calls[0][3]["max_tokens"] == 2000
+    assert calls[0][3]["max_total_tokens"] == 8000
+    assert calls[0][3]["chudware_actor"] == "credit-actor"
+    assert result["success"] is True
+    assert result["result"] == {"handoff": {"status": "done"}}
+    assert result["offline"] is True
+    assert result["parent_id"] == "parent"
+
+
+def test_offline_unsafe_provider_is_refused_without_running_loop(monkeypatch):
+    monkeypatch.setattr(
+        roles,
+        "load_role",
+        lambda _role: SimpleNamespace(system_prompt="role", concrete_tools=[]),
+    )
+    monkeypatch.setattr(
+        roles, "_resolve_tier_capability", lambda tier, cap, _opts: (tier, cap)
+    )
+    monkeypatch.setattr(roles, "_settings_for_role", lambda _role, _opts: {})
+    from services.agent import config, mission_dispatch
+
+    monkeypatch.setattr(config, "provider_offline_safe", lambda _provider: False)
+    monkeypatch.setattr(
+        mission_dispatch,
+        "run_linear_role_turn",
+        lambda *_args, **_kwargs: pytest.fail("unsafe provider reached local loop"),
+    )
+
+    result = roles.run_role_turn(
+        "audit",
+        "reviewer",
+        session_id="conversation",
+        options={
+            "offline": True,
+            "offline_provider": SimpleNamespace(name="cloud", offline_safe=False),
+        },
+    )
+
+    assert result["success"] is False
+    assert result["stop_reason"] == "offline_unavailable"
+
+
+def test_invalid_role_returns_compatible_failure(monkeypatch):
+    monkeypatch.setattr(
+        roles, "load_role", lambda _role: (_ for _ in ()).throw(RoleError("missing"))
+    )
+
+    result = roles.run_role_turn(
+        "audit", "not-a-role", session_id="conversation", run_id="run"
+    )
+
+    assert result["success"] is False
+    assert result["stop_reason"] == "invalid_role"
+    assert result["result"] == {"error": "invalid_role"}
+    assert result["role"] == "not-a-role"
+    assert result["allowed_tools"] == []
+
+
+def test_online_path_never_constructs_provider_or_calls_legacy_agent_turn(
+    monkeypatch, online_runtime
+):
+    host = _Host()
+    monkeypatch.setattr(roles, "get_default_chudcode_host", lambda: host)
+    from services.agent import agent_turn, config
+
+    monkeypatch.setattr(
+        config,
+        "get_provider",
+        lambda *_args, **_kwargs: pytest.fail("online path constructed a provider"),
+    )
+    monkeypatch.setattr(
+        agent_turn,
+        "run_turn",
+        lambda *_args, **_kwargs: pytest.fail("online path called legacy agent_turn"),
+    )
+
+    result = roles.run_role_turn(
+        "audit", "reviewer", session_id="conversation", run_id="online-run"
+    )
+
+    assert result["success"] is True
+    assert len(host.calls) == 1
+
+
+def test_host_failure_retains_nested_result_shape(monkeypatch, online_runtime):
+    host = _Host(fail="provider disconnected")
+    monkeypatch.setattr(roles, "get_default_chudcode_host", lambda: host)
+
+    result = roles.run_role_turn(
+        "audit", "reviewer", session_id="conversation", run_id="failed-run"
+    )
+
+    assert result["success"] is False
+    assert result["stop_reason"] == "provider_error"
+    assert result["result"] == {"error": "provider disconnected"}
+    assert result["role"] == "reviewer"
+    assert result["allowed_tools"] == ["measure_part", "render_part"]
+    assert result["tokens_used"] == 0
+    assert result["provider_usage_recorded"] is False

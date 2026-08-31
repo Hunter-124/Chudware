@@ -17,8 +17,8 @@
 namespace chudware::update {
 namespace {
 
-std::string windowsError(const char* prefix) {
-    return std::string(prefix) + " (Windows error " + std::to_string(GetLastError()) + ")";
+std::string windowsError(const char* prefix, DWORD code) {
+    return std::string(prefix) + " (Windows error " + std::to_string(code) + ")";
 }
 
 }  // namespace
@@ -36,7 +36,7 @@ ApplyResult applyPlatformArtifact(const std::filesystem::path& verifiedArtifact,
     }
     wchar_t tempRaw[MAX_PATH + 1]{};
     if (!GetTempPathW(MAX_PATH, tempRaw)) {
-        if (error) *error = windowsError("could not locate temporary directory");
+        if (error) *error = windowsError("could not locate temporary directory", GetLastError());
         return ApplyResult::Failed;
     }
     GUID guid{};
@@ -63,7 +63,7 @@ ApplyResult applyPlatformArtifact(const std::filesystem::path& verifiedArtifact,
     }
     const std::filesystem::path helper = helperDir / L"chudware-update-helper.exe";
     if (!CopyFileW(sourceHelper.c_str(), helper.c_str(), TRUE)) {
-        if (error) *error = windowsError("could not copy update helper");
+        if (error) *error = windowsError("could not copy update helper", GetLastError());
         std::filesystem::remove_all(helperDir, ec);
         return ApplyResult::Failed;
     }
@@ -77,10 +77,11 @@ ApplyResult applyPlatformArtifact(const std::filesystem::path& verifiedArtifact,
     if (!CreateProcessW(helper.c_str(), mutableCommand.data(), nullptr, nullptr, FALSE,
                         CREATE_NEW_PROCESS_GROUP | CREATE_BREAKAWAY_FROM_JOB,
                         nullptr, helperDir.c_str(), &startup, &process)) {
-        if (error) *error = windowsError("could not start verified update helper");
+        const DWORD createError = GetLastError();
+        if (error) *error = windowsError("could not start verified update helper", createError);
         std::filesystem::remove_all(helperDir, ec);
-        return GetLastError() == ERROR_ACCESS_DENIED ? ApplyResult::ManualDownload
-                                                     : ApplyResult::Failed;
+        return createError == ERROR_ACCESS_DENIED ? ApplyResult::ManualDownload
+                                                  : ApplyResult::Failed;
     }
     CloseHandle(process.hThread);
     CloseHandle(process.hProcess);

@@ -67,6 +67,51 @@ def test_dwg_converter_failure_is_clean(monkeypatch, tmp_path):
         import_path(str(p))
 
 
+def test_dwg2dxf_timeout_is_clean(monkeypatch, tmp_path):
+    observed = {}
+
+    def _hang(_argv, **kwargs):
+        observed["timeout"] = kwargs.get("timeout")
+        raise formats_dwg.subprocess.TimeoutExpired(_argv, kwargs["timeout"])
+
+    monkeypatch.setattr(formats_dwg, "_select_converter",
+                        lambda: formats_dwg._read_dwg_via_dwg2dxf)
+    monkeypatch.setattr(formats_dwg, "_dwg2dxf_path", lambda: "/fake/dwg2dxf")
+    monkeypatch.setattr(formats_dwg.subprocess, "run", _hang)
+    p = tmp_path / "hung.dwg"
+    p.write_bytes(b"stub")
+
+    with pytest.raises(ValueError, match=r"dwg2dxf timed out after 120s"):
+        import_path(str(p))
+    assert observed["timeout"] == 120
+
+
+def test_preferred_odafc_timeout_is_clean_and_restores_runner(monkeypatch, tmp_path):
+    from ezdxf.addons import odafc
+
+    observed = {}
+    original_runner = odafc._run_with_no_gui
+
+    def _hang(_argv, **kwargs):
+        observed["timeout"] = kwargs.get("timeout")
+        raise formats_dwg.subprocess.TimeoutExpired(_argv, kwargs["timeout"])
+
+    def _fake_readfile(_path):
+        return odafc._run_with_no_gui("Darwin", "/fake/ODAFileConverter", ["arg"])
+
+    monkeypatch.setattr(formats_dwg, "_select_converter",
+                        lambda: formats_dwg._read_dwg_via_odafc)
+    monkeypatch.setattr(odafc, "readfile", _fake_readfile)
+    monkeypatch.setattr(formats_dwg.subprocess, "run", _hang)
+    p = tmp_path / "hung-oda.dwg"
+    p.write_bytes(b"stub")
+
+    with pytest.raises(ValueError, match=r"ODA File Converter timed out after 120s"):
+        import_path(str(p))
+    assert observed["timeout"] == formats_dwg._CONVERTER_TIMEOUT_S
+    assert odafc._run_with_no_gui is original_runner
+
+
 @pytest.mark.skipif(not formats_dwg.converter_available(),
                     reason="no DWG→DXF converter (ODA File Converter / dwg2dxf) on this machine")
 def test_dwg_real_roundtrip(tmp_path):

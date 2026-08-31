@@ -1402,6 +1402,7 @@ def _fetch_image_bytes(image_url: str, part_id: str) -> bytes | None:
     site = ""
     if part_id.startswith("catalog:"):
         site = part_id[len("catalog:"):].split("::", 1)[0]
+    dest: str | None = None
     try:
         import tempfile
         from pathlib import Path as _Path
@@ -1411,11 +1412,15 @@ def _fetch_image_bytes(image_url: str, part_id: str) -> bytes | None:
         r = _cef_client().download(image_url, dest, profile=site)
         if isinstance(r, dict) and r.get("ok"):
             data = _Path(dest).read_bytes()
-            _Path(dest).unlink(missing_ok=True)
             return data or None
-        _Path(dest).unlink(missing_ok=True)
     except Exception:  # noqa: BLE001 — CEF unavailable / download failed; GUI shows a glyph
         pass
+    finally:
+        if dest is not None:
+            try:
+                _Path(dest).unlink(missing_ok=True)
+            except Exception:  # noqa: BLE001 — cleanup must not change fallback semantics
+                pass
     return None
 
 

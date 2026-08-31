@@ -85,9 +85,11 @@ ApplyResult applyPlatformArtifact(const std::filesystem::path& verifiedArtifact,
     if (!copyDurable(verifiedArtifact, replacement, error))
         return ApplyResult::ManualDownload;
     if (::rename(replacement.c_str(), installed.c_str()) != 0) {
-        if (error) *error = "atomic AppImage replacement failed: " + std::string(std::strerror(errno));
+        const int renameError = errno;
+        if (error) *error = "atomic AppImage replacement failed: " +
+                            std::string(std::strerror(renameError));
         std::filesystem::remove(replacement);
-        return errno == EACCES || errno == EPERM || errno == EROFS
+        return renameError == EACCES || renameError == EPERM || renameError == EROFS
             ? ApplyResult::ManualDownload : ApplyResult::Failed;
     }
     const int directory = ::open(installed.parent_path().c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);

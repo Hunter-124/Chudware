@@ -502,6 +502,53 @@ class TestFetchTuning:
                                       "catalog:x::p") is None
         assert seen == ["https://cdn.example.com/hot.png"], "403 must still try CEF"
 
+    @pytest.mark.parametrize(("failure", "expected"), [
+        ("construct", None),
+        ("download", None),
+        ("read", None),
+        ("success", PNG),
+    ])
+    def test_cef_temp_image_is_removed_on_every_exit(
+            self, raw, monkeypatch, tmp_path, failure, expected):
+        import pathlib
+        import tempfile
+
+        monkeypatch.setattr(raw, "_http_image_get", lambda *_: (None, 503))
+        created = []
+        real_named_temp = tempfile.NamedTemporaryFile
+
+        def _named_temp(*args, **kwargs):
+            kwargs["dir"] = tmp_path
+            temp = real_named_temp(*args, **kwargs)
+            created.append(pathlib.Path(temp.name))
+            return temp
+
+        class _Client:
+            def download(self, url, dest, profile=""):
+                if failure == "download":
+                    raise RuntimeError("download failed")
+                pathlib.Path(dest).write_bytes(PNG)
+                return {"ok": True}
+
+        def _client():
+            if failure == "construct":
+                raise RuntimeError("client construction failed")
+            return _Client()
+
+        monkeypatch.setattr(tempfile, "NamedTemporaryFile", _named_temp)
+        monkeypatch.setattr("services.browser.cef_client.client", _client)
+        if failure == "read":
+            def _read_failure(_path):
+                raise OSError("read failed")
+
+            monkeypatch.setattr(pathlib.Path, "read_bytes", _read_failure)
+
+        result = raw._fetch_image_bytes(
+            "https://cdn.example.com/hot.png", "catalog:x::p")
+
+        assert result == expected
+        assert created and not any(path.exists() for path in created)
+
     def test_hotlink_headers_are_preserved(self, raw, monkeypatch):
         """The Referer/User-Agent hotlink defeat is what makes vendor CDNs serve at all."""
         import urllib.request

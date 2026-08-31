@@ -1588,3 +1588,22 @@ cache until it can key on a resolved allowlist rather than role+capability; `zon
 its own net-class scan.
 
 
+## 2026-08-30 — profile control, path containment, and bounded failure cleanup
+
+Completed T-X5's `browser_profiles` list/refresh/delete seam across
+`services/browser/{profiles,session}.py`, `services/mcp/parts_tools.py`, and the sourcing
+tool catalog: list performs fresh redirect-aware status probes through the existing login
+classifier, refresh reuses the headed login flow, and delete is lock-aware and removes the
+profile, metadata, and transient cookie sidecar. The same pass closed two path-containment
+holes (`.`/`..` browser slugs and caller-supplied DAG run IDs across executor, journal,
+status, worker-RPC, and replan paths), bounded the external DWG converter, guaranteed CEF
+thumbnail temp cleanup, and preserved updater OS error codes across cleanup on Linux and
+Windows. Verification: `scripts/check.py` passed all 9 gates; the isolated final-tree
+browser/MCP/DAG/thumbnail sweep passed 300/300, and the isolated DWG suite passed
+6 / skipped 1 (including preferred ODA and fallback LibreDWG timeout regressions).
+Isolated `test_updater` + `test_updater_https`
+passed 2/2. The full gate
+proved core and host builds before its fixed 600-second deadline expired in the unrelated
+WASM step. The GUI profile panel remains deliberately deferred by T-X5; the board's `done`
+transition is also human-only, so the card records completed DoD while retaining its
+machine-enforced pre-merge status.

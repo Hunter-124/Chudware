@@ -19,11 +19,16 @@ not an error, it degrades to a clear "install a converter" message.
 
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 import tempfile
+import threading
 from pathlib import Path
 from typing import Any, Callable, Optional
+
+_CONVERTER_TIMEOUT_S = 120
+_ODA_RUN_LOCK = threading.Lock()
 
 # ---------------------------------------------------------------------------
 # Converter discovery — each returns an ezdxf ``Drawing`` for a .dwg, or None if unavailable.
@@ -48,10 +53,69 @@ def converter_available() -> bool:
     return _odafc_available() or _dwg2dxf_path() is not None
 
 
-def _read_dwg_via_odafc(path: Path):
-    """DWG → ezdxf ``Drawing`` via the ODA File Converter (ezdxf.addons.odafc)."""
+def _run_odafc_bounded(system: str, command: str, arguments: list[str]):
+    """ezdxf ODA runner with the same hard deadline as the LibreDWG path."""
     from ezdxf.addons import odafc
-    return odafc.readfile(str(path))
+
+    argv = [command, *arguments]
+    if system == "Linux":
+        with odafc._linux_dummy_display() as display:
+            env = os.environ.copy()
+            env["DISPLAY"] = display
+            return subprocess.run(
+                argv,
+                text=True,
+                capture_output=True,
+                env=env,
+                timeout=_CONVERTER_TIMEOUT_S,
+            )
+    if system == "Darwin":
+        return subprocess.run(
+            argv,
+            text=True,
+            capture_output=True,
+            timeout=_CONVERTER_TIMEOUT_S,
+        )
+    if system == "Windows":
+        startupinfo = subprocess.STARTUPINFO()
+        startupinfo.dwFlags = (
+            subprocess.CREATE_NEW_CONSOLE | subprocess.STARTF_USESHOWWINDOW
+        )
+        startupinfo.wShowWindow = subprocess.SW_HIDE
+        proc = subprocess.Popen(
+            argv,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            startupinfo=startupinfo,
+        )
+        try:
+            proc.wait(timeout=_CONVERTER_TIMEOUT_S)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+            raise
+        return proc
+    raise odafc.UnsupportedPlatform(f"Unsupported platform: {system}")
+
+
+def _read_dwg_via_odafc(path: Path):
+    """DWG → ezdxf ``Drawing`` via a deadline-bounded ODA File Converter."""
+    from ezdxf.addons import odafc
+
+    # ezdxf does not expose a timeout, but funnels every platform launch through
+    # this one runner. Serialize the temporary override so concurrent imports
+    # cannot restore each other's function or escape the deadline.
+    with _ODA_RUN_LOCK:
+        original_runner = odafc._run_with_no_gui
+        odafc._run_with_no_gui = _run_odafc_bounded
+        try:
+            return odafc.readfile(str(path))
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError(
+                f"ODA File Converter timed out after {_CONVERTER_TIMEOUT_S}s"
+            ) from exc
+        finally:
+            odafc._run_with_no_gui = original_runner
 
 
 def _read_dwg_via_dwg2dxf(path: Path):
@@ -64,8 +128,17 @@ def _read_dwg_via_dwg2dxf(path: Path):
     with tempfile.TemporaryDirectory() as td:
         out = Path(td) / (path.stem + ".dxf")
         # dwg2dxf writes DXF to -o <out>; keep it a plain subprocess (mere aggregation, GPL-safe).
-        proc = subprocess.run([exe, "-o", str(out), str(path)],
-                              capture_output=True, text=True)
+        try:
+            proc = subprocess.run(
+                [exe, "-o", str(out), str(path)],
+                capture_output=True,
+                text=True,
+                timeout=_CONVERTER_TIMEOUT_S,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError(
+                f"dwg2dxf timed out after {_CONVERTER_TIMEOUT_S}s"
+            ) from exc
         if proc.returncode != 0 or not out.exists():
             raise RuntimeError(
                 f"dwg2dxf failed (exit {proc.returncode}): {proc.stderr.strip() or proc.stdout.strip()}")

@@ -917,6 +917,7 @@ json Server::dispatch(ClientConn& c, const std::string& method, const json& para
     // document commits enter the shared registry and fan out to every subscribed GUI. Both
     // thread-local sinks fire synchronously on this dispatch thread and are cleared by RAII.
     const bool streamThis = method.rfind("agent_", 0) == 0 ||
+                            method.rfind("chudcode_", 0) == 0 ||
                             method == "session_btw" || method == "session_handoff";
     const bool publishDocsThis = method.rfind("agent_", 0) == 0;
     StreamCtx sctx{this, c.id};

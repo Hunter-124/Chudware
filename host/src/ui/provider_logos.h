@@ -2,8 +2,9 @@
 //
 // A provider's baseline "logo" is a rounded brand-colored badge with a short ASCII mark
 // (font-safe) — always available, offline, no committed assets. On top of that, when enabled,
-// providerLogosTick() fetches the provider's real brand favicon at runtime (via the bun
-// bridge), caches it in the user's appdata, and drawProviderLogo() renders that texture when
+// providerLogosTick() fetches the provider's real brand favicon at runtime (direct HTTPS to a
+// PNG-returning favicon resolver — a background non-agent fetch, no Chudcode/agent involvement),
+// caches it in the user's appdata, and drawProviderLogo() renders that texture when
 // ready — falling back to the badge until then / when disabled / for unknown domains.
 #pragma once
 
@@ -27,7 +28,7 @@ const char* providerBrandMark(const std::string& providerId);
 void drawProviderLogo(ImDrawList* dl, ImVec2 pos, float side, const std::string& providerId);
 
 // Per-frame driver (GL thread): for provider ids drawn since the previous tick, load a cached
-// favicon from appdata or kick a ONE-SHOT bridge fetch, then upload it as a GL texture.
+// favicon from appdata or kick a ONE-SHOT background fetch, then upload it as a GL texture.
 // Throttled to a few fetches per frame; no-op while disabled. Call once per frame from the
 // main loop AFTER the UI body — never from a conditionally-drawn panel, or every other call
 // site is starved of textures until the user happens to open that panel.

@@ -50,6 +50,9 @@ struct RpcResult {
 class AsyncRpc {
 public:
     using Done = std::function<void(const RpcResult&)>;
+    // Streamed mid-call progress (worker "event" frames). Delivered on the GL thread inside
+    // drain(), in arrival order, always before the owning call's Done. Copied per event.
+    using Event = std::function<void(const nlohmann::json&)>;
 
     explicit AsyncRpc(WorkerClient& w) : worker_(w) {}
     ~AsyncRpc() { shutdown(); }
@@ -57,6 +60,10 @@ public:
     // Queue a call. done runs inside a later drain() on the GL thread (or never, if
     // shutdown() drops it first). The dispatch thread starts lazily on the first call.
     void call(std::string method, nlohmann::json params, Done done, int timeoutMs = 120000);
+    // Same, with a mid-call event stream (e.g. chudcode_login's open_url). onEvent runs
+    // inside drain() on the GL thread like done — never on the dispatch thread.
+    void call(std::string method, nlohmann::json params, Done done, Event onEvent,
+              int timeoutMs = 120000);
 
     // Run the callbacks of every finished call. Once per frame, GL thread.
     void drain();
@@ -74,6 +81,7 @@ private:
         nlohmann::json params;
         int timeoutMs = 120000;
         Done done;
+        Event onEvent;
         RpcResult res;
     };
 
@@ -87,6 +95,9 @@ private:
     std::condition_variable cv_;
     std::deque<std::unique_ptr<Pending>> queue_;    // waiting to run (FIFO)
     std::vector<std::unique_ptr<Pending>> doneQ_;   // finished, awaiting drain()
+    // Streamed events awaiting drain() (Event copied per entry — the owning Pending may be
+    // drained in the same pass; the copy keeps delivery self-contained).
+    std::vector<std::pair<Event, nlohmann::json>> eventQ_;
     bool quit_ = false;
     std::atomic<int> pending_{0};                   // queued + executing + undrained
 };

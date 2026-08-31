@@ -47,6 +47,7 @@
 #include "widgets/interwebz.h"  // Skills/Rules two-column editors
 #include "ui/provider_logos.h"  // ui::drawProviderLogo/providerBrandColor (Providers list badges)
 #include "provider_usage.h"  // ui::UsageAccount/UsageWindow + THE subscription_* poller
+#include "chudcode_descriptors.h"  // ui::parseChudcode* — Chudcode worker payload parsing
 #include "metrics.h"  // ui::metrics::px/stroke — DPI-scaled Settings gutter + usage rings
 #include "tesseract.h"  // ui::drawTesseract + TesseractAnim — Appearance > Brand mark picker
 #include "../ui_theme.h"  // ui::busyLabel — the one inline "working" indicator
@@ -1135,40 +1136,32 @@ static void drawSubscriptionAccounts(AppState& st, float sc) {
     }
 }
 
-// ---- OMP provider manager (Settings → Providers) — S-UI-PROV ----------------------
+// ---- Chudcode provider manager (Settings → Providers) — S-UI-PROV -----------------
 // Two-pane provider sign-in/manager per docs/omp-integration/research/design-provider-signin-ui.md
-// §3.1, driven by the frozen libchudware C-ABI methods (docs/omp-integration/01-DECISIONS.md §Stable RPC quick reference),
-// which proxy the bun bridge auth_*/models_list methods. The UI holds no auth truth — it
-// renders the last agent_provider_list/agent_provider_state response and re-polls on open +
-// short TTL (mirrors drawSubscriptionAccounts above). Degrade: unknown_method (sibling slice
-// mid-flight / older core) temporarily falls back to the legacy sections and is re-probed
-// when this view is entered again and while a reconnected runtime may be coming back.
-struct OmpProviderRow {
-    std::string id;            // OMP registry id ("anthropic", "kimi-code", "moonshot", ...)
-    std::string label;
-    std::string state;         // signed_out|key_set|oauth_connected|error|disabled
-    std::string origin;        // runtime|config|oauth|api_key|env|fallback (empty = none)
-    std::string envVar;        // when origin == "env"
-    std::string error;         // last validate/login error text
-    std::string consoleUrl;    // vendor key console deep link
-    bool keyless = false;
-    bool hasApiKey = false;    // authKinds contains "api_key"
-    bool hasOAuth = false;     // authKinds contains "oauth"
-    int modelsAvailable = 0;
-};
+// §3.1, driven by the persistent Chudcode worker service (chudcode_provider_list /
+// chudcode_auth_state / chudcode_validate_key|set_key|remove_key|logout / chudcode_login).
+// The UI holds no auth truth — it renders the last sanitized descriptor snapshot and
+// re-polls on open + short TTL (mirrors drawSubscriptionAccounts above). Degrade:
+// unknown_method (worker slice mid-flight / older service) temporarily falls back to the
+// legacy sections and is re-probed when this view is entered again and while a reconnected
+// runtime may be coming back.
+// Field-for-field the sanitized descriptor the worker emits — parsing lives in
+// chudcode_descriptors.cpp so host/tests can exercise the REAL rules.
+using OmpProviderRow = ui::ChudcodeProviderDesc;
 struct OmpAccountRow {
     int credentialId = 0;
     std::string accountId;
     std::string email;
     std::string orgName;
 };
-// A credential the bridge itself has taken out of service (revoked token, refresh that came
-// back invalid_grant, key the provider now rejects). auth_state reports these per provider in
-// `disabled[]`; `id` is the credential rowid and is what agent_provider_remove_key wants as
-// its `account`, so the panel can actually clear the dead row instead of only re-polling it.
+// A credential the service itself has taken out of service (revoked token, refresh that came
+// back invalid_grant, key the provider now rejects). chudcode_auth_state reports these per
+// provider in `disabled[]`; `id` is the credential rowid and is what chudcode_remove_key
+// wants as its `accountId`, so the panel can actually clear the dead row instead of only
+// re-polling it.
 struct OmpDisabledRow {
-    std::string id;            // credential rowid, verbatim (auth_remove_key's `account`)
-    std::string cause;         // bridge's reason text — the only honest thing to show the user
+    std::string id;            // credential rowid, verbatim (chudcode_remove_key accountId)
+    std::string cause;         // service's reason text — the only honest thing to show the user
     std::string type;          // api_key | oauth
     std::string email;         // may be absent/null
     double disabledAtMs = 0.0; // 0 = bridge has no timestamp for this row (legacy); not 1970
@@ -1183,32 +1176,29 @@ struct OmpProvDetail {
     std::vector<std::string> usageNotes;
     std::vector<OmpDisabledRow> disabled;
 };
+// One-call Chudcode OAuth login: chudcode_login {providerId} runs the whole flow on the
+// worker. Progress arrives as STREAMED events (open_url / extension_ui_request) delivered
+// through AsyncRpc's event channel on the GL thread; the terminal Done carries the final
+// sanitized login state. There is no handle, no poll, and no manual code-paste method —
+// Cancel is a local abandon (generation bump ignores the eventual result; the worker-side
+// flow times out on its own).
 struct OmpOAuthFlow {
     bool active = false;
-    bool pollInFlight = false;
-    bool manualInFlight = false;
-    bool canSubmitManual = false;
     bool credentialSaved = false;
     bool externalOwner = false;    // onboarding/system-browser flow; independent of Settings modal
     bool browserOpenAttempted = false;
     bool browserOpened = false;
     uint64_t generation = 0;
     uint64_t beginRequest = 0;
-    uint64_t pollRequest = 0;
-    uint64_t manualRequest = 0;
-    std::string handle;
     std::string provider;
     std::string status;        // starting|awaiting_auth|connected|error|cancelled
     std::string url;
     std::string launchUrl;
     std::string instructions;
     std::string progress;
-    std::string interaction;   // browser|device|manual (unknown values remain display-safe)
+    std::string interaction;   // browser|device (unknown values remain display-safe)
     std::string error;
-    std::string manualError;   // UI/manual-RPC rejection; not cleared by poll snapshots
-    nlohmann::json identity;
-    double lastPoll = -1e9;
-    char codeBuf[512] = "";
+    std::string localError;    // UI-side failure (e.g. browser refused to open); never from RPC
 };
 struct OmpProvUi {
     bool available = true;
@@ -1219,7 +1209,7 @@ struct OmpProvUi {
     std::vector<OmpProviderRow> rows;
     std::string selectedId;
     std::string lastError;
-    // Set when the ONE bulk agent_provider_list call failed outright. rows/detail are then the
+    // Set when the ONE bulk chudcode_provider_list call failed outright. rows/detail are the
     // last known state (or empty on a cold first poll) — never "this account has no providers".
     bool listFailed = false;
     // A response that arrived but carried entries this UI could not read: the readable rows are
@@ -1370,7 +1360,7 @@ static void pollOmpProviderList(AppState& st, bool force) {
     const uint64_t viewGeneration = s_omp.viewGeneration;
     const uint64_t requestGeneration = nextOmpRequestGeneration();
     s_omp.listRequestGeneration = requestGeneration;
-    st.rpc.call("agent_provider_list", nlohmann::json::object(),
+    st.rpc.call("chudcode_provider_list", nlohmann::json::object(),
                 [&st, modalGeneration, viewGeneration,
                  requestGeneration](const core::RpcResult& r) {
         if (!ompViewCallbackCurrent(modalGeneration, viewGeneration) ||
@@ -1379,7 +1369,7 @@ static void pollOmpProviderList(AppState& st, bool force) {
         s_omp.listInFlight = false;
         if (ompRpcAbsent(r)) {
             s_omp.available = false;
-            s_omp.lastError = "Provider sign-in bridge unavailable in this runtime.";
+            s_omp.lastError = "Chudcode provider service unavailable in this runtime.";
             s_omp.listPartial.clear();
             return;
         }
@@ -1393,7 +1383,7 @@ static void pollOmpProviderList(AppState& st, bool force) {
             s_omp.listFailed = true;
             s_omp.listPartial.clear();
             s_omp.lastError =
-                "Could not read the provider list from the auth bridge (" + why +
+                "Could not read the provider list from the Chudcode service (" + why +
                 "). This is a failed service call, not an empty provider set" +
                 (s_omp.rows.empty() ? "." : " \xe2\x80\x94 the providers below are the last "
                                             "state this panel successfully read.");
@@ -1419,33 +1409,10 @@ static void pollOmpProviderList(AppState& st, bool force) {
         // trace. Count them and report the count instead; the readable rows stay fully live.
         int unreadable = 0;
         for (const auto& p : *arr) {
-            if (!p.is_object()) {
-                ++unreadable;
-                continue;
-            }
             OmpProviderRow row;
-            row.id = optionalJsonString(p, "id");
-            if (row.id.empty()) {
+            if (!ui::parseChudcodeProviderDesc(p, row)) {
                 ++unreadable;
                 continue;
-            }
-            row.label = optionalJsonString(p, "label");
-            if (row.label.empty()) row.label = row.id;
-            row.state = optionalJsonString(p, "state");
-            if (row.state.empty()) row.state = "signed_out";
-            row.origin = optionalJsonString(p, "origin");
-            row.envVar = optionalJsonString(p, "envVar");
-            row.error = optionalJsonString(p, "error");
-            row.consoleUrl = optionalJsonString(p, "consoleUrl");
-            row.keyless = optionalJsonBool(p, "keyless", false);
-            row.modelsAvailable = optionalJsonInt(p, "modelsAvailable", 0);
-            if (const auto* kinds = optionalJsonArr(p, "authKinds")) {
-                for (const auto& k : *kinds) {
-                    if (!k.is_string()) continue;
-                    const std::string ks = k.get<std::string>();
-                    if (ks == "api_key") row.hasApiKey = true;
-                    if (ks == "oauth") row.hasOAuth = true;
-                }
             }
             rows.push_back(std::move(row));
         }
@@ -1466,20 +1433,18 @@ static void pollOmpProviderList(AppState& st, bool force) {
             unreadable == 0
                 ? std::string()
                 : (std::to_string(unreadable) +
-                   (unreadable == 1 ? " provider entry in the bridge response could not be read"
-                                    : " provider entries in the bridge response could not be read") +
+                   (unreadable == 1 ? " provider entry in the service response could not be read"
+                                    : " provider entries in the service response could not be read") +
                    " and is not listed below; every provider shown is current.");
         // Sole writer of the signed-in bridge set, and it gates whether the copilot model
-        // picker offers this provider at all. Only a USABLE credential counts. This used to be
-        // `!= "signed_out"`, which was harmless while the bridge could never actually report
-        // "error" — now that a revoked credential surfaces as state:"error" (auth-context.ts
-        // computeAuthState, states: signed_out|key_set|oauth_connected|error|disabled), that
-        // test would advertise a provider whose every request is guaranteed to fail. A provider
-        // that still holds a working credential alongside a dead one reports key_set /
-        // oauth_connected and carries the dead row in disabled[], so nothing usable is lost.
+        // picker offers this provider at all. Only a USABLE credential counts
+        // (chudcodeProviderUsable — whitelist, never "anything but signed_out"): a provider
+        // whose only credential is revoked reports state:"error" and every request against it
+        // is guaranteed to fail, while one that still holds a working credential alongside a
+        // dead one reports key_set/oauth_connected and carries the dead row in disabled[].
         st.signedInBridgeProviders.clear();
         for (const auto& row : s_omp.rows)
-            if (row.state == "key_set" || row.state == "oauth_connected")
+            if (ui::chudcodeProviderUsable(row.state))
                 st.signedInBridgeProviders.insert(row.id);
         if (!selectedStillExists && !s_omp.rows.empty())
             selectOmpProvider(s_omp.rows.front().id);
@@ -1502,7 +1467,7 @@ static void fetchOmpProviderDetail(AppState& st, const std::string& id, bool for
     const uint64_t selectionGeneration = s_omp.selectionGeneration;
     const uint64_t requestGeneration = nextOmpRequestGeneration();
     s_omp.detailRequestGeneration = requestGeneration;
-    st.rpc.call("agent_provider_state", nlohmann::json{{"provider", id}},
+    st.rpc.call("chudcode_auth_state", nlohmann::json{{"providerId", id}},
                 [id, modalGeneration, viewGeneration, selectionGeneration,
                  requestGeneration](const core::RpcResult& r) {
         if (!ompSelectionCallbackCurrent(modalGeneration, viewGeneration,
@@ -1524,16 +1489,16 @@ static void fetchOmpProviderDetail(AppState& st, const std::string& id, bool for
         d.state = optionalJsonString(r.result, "state");
         d.origin = optionalJsonString(r.result, "origin");
         d.error = optionalJsonString(r.result, "error");
-        // auth_state's `disabled[]` — credentials the bridge has taken out of service. Filtered
-        // per provider by the bridge (confirmed against computeAuthState), so every row here
-        // belongs to `id`. `id` is a string per the wire contract; read it with the stamp helper
-        // so a numeric rowid is still carried through verbatim rather than silently dropped.
+        // auth_state's `disabled[]` — credentials the service has taken out of use. Filtered
+        // per provider by the worker, so every row here belongs to `id`. `id` is a string per
+        // the wire contract; read it with the stamp helper so a numeric rowid is still carried
+        // through verbatim rather than silently dropped.
         if (const auto* dis = optionalJsonArr(r.result, "disabled")) {
             for (const auto& x : *dis) {
                 if (!x.is_object()) continue;
                 OmpDisabledRow dr;
                 dr.id = optionalJsonStamp(x, "id");
-                // No rowid = nothing agent_provider_remove_key could address.
+                // No rowid = nothing chudcode_remove_key could address.
                 if (dr.id.empty()) continue;
                 dr.cause = optionalJsonString(x, "cause");
                 dr.type = optionalJsonString(x, "type");
@@ -1547,7 +1512,7 @@ static void fetchOmpProviderDetail(AppState& st, const std::string& id, bool for
             for (const auto& a : *accts) {
                 if (!a.is_object()) continue;
                 OmpAccountRow ac;
-                ac.credentialId = optionalJsonInt(a, "credentialId", 0);
+                ac.credentialId = optionalJsonInt(a, "credentialId", optionalJsonInt(a, "id", 0));
                 ac.accountId = optionalJsonString(a, "accountId");
                 ac.email = optionalJsonString(a, "email");
                 ac.orgName = optionalJsonString(a, "orgName");
@@ -1580,7 +1545,7 @@ static void fetchOmpProviderDetail(AppState& st, const std::string& id, bool for
             }
         }
         s_omp.detail = std::move(d);
-    }, 15000);   // auth_state fetches usage reports upstream (8s bridge-side cap)
+    }, 15000);   // auth_state may fetch usage reports upstream (bounded worker-side)
 }
 
 static void refreshOmpProvider(AppState& st) {
@@ -1590,26 +1555,15 @@ static void refreshOmpProvider(AppState& st) {
     fetchOmpProviderDetail(st, s_omp.selectedId, true);
 }
 
+// A login callback/event is current only while its flow generation is still live and its
+// owner surface still exists. externalOwner flows (onboarding) survive the Settings modal.
 static bool ompOAuthCallbackCurrent(uint64_t modalGeneration, uint64_t generation,
-                                    const std::string& provider,
-                                    const std::string& handle) {
+                                    const std::string& provider) {
     const OmpOAuthFlow& f = s_omp.oauth;
     const bool ownerCurrent =
         f.externalOwner ||
         (s_omp.modalOpen && s_omp.modalGeneration == modalGeneration);
-    return ownerCurrent && f.generation == generation && f.provider == provider &&
-           (handle.empty() || f.handle == handle);
-}
-
-static void cancelLateOmpOAuthHandle(AppState& st, const std::string& provider,
-                                     const std::string& handle, uint64_t generation) {
-    if (handle.empty()) return;
-    st.rpc.call("agent_provider_oauth_cancel", nlohmann::json{{"handle", handle}},
-                [provider, handle, generation](const core::RpcResult&) {
-        (void)provider;
-        (void)handle;
-        (void)generation;
-    });
+    return ownerCurrent && f.generation == generation && f.provider == provider;
 }
 
 static bool openOmpOAuthUrl(const OmpOAuthFlow& f);
@@ -1621,44 +1575,20 @@ static void openOmpOAuthInSystemBrowser(OmpOAuthFlow& f) {
     f.browserOpenAttempted = true;
     f.browserOpened = openOmpOAuthUrl(f);
     if (!f.browserOpened)
-        f.manualError = "The system browser could not be opened. Use the link below.";
-}
-
-// Snapshots are replaceable, not deltas: clearing a field is meaningful (in particular,
-// canSubmitManual=false must remove a paste editor from device-only flows).
-static void ompOAuthApplySnapshot(OmpOAuthFlow& f, const nlohmann::json& r) {
-    f.status = optionalJsonString(r, "status");
-    f.url = optionalJsonString(r, "url");
-    f.launchUrl = optionalJsonString(r, "launchUrl");
-    f.instructions = optionalJsonString(r, "instructions");
-    f.progress = optionalJsonString(r, "progress");
-    f.interaction = optionalJsonString(r, "interaction");
-    f.canSubmitManual = optionalJsonBool(r, "canSubmitManual", false);
-    f.error = optionalJsonString(r, "error");
-    f.credentialSaved = optionalJsonBool(r, "credential_saved", false);
-    auto identity = r.find("identity");
-    f.identity = identity == r.end() ? nlohmann::json() : *identity;
-}
-
-static void finishOmpOAuthSnapshot(AppState& st, OmpOAuthFlow& f) {
-    if (f.status == "connected" || f.credentialSaved) {
-        f.status = "connected";
-        f.active = false;
-        st.addLog("[ok] signed in to " + f.provider);
-        refreshOmpProvider(st);
-    } else if (f.status == "error" || f.status == "cancelled") {
-        f.active = false;
-    }
+        f.localError = "The system browser could not be opened. Use the link below.";
 }
 
 static void failOmpOAuth(OmpOAuthFlow& f, std::string error) {
     f.active = false;
-    f.pollInFlight = false;
-    f.manualInFlight = false;
     f.status = "error";
     f.error = error.empty() ? "Sign-in failed" : std::move(error);
 }
 
+// One streamed chudcode_login call runs the whole OAuth flow on the Chudcode worker: the
+// worker opens/settles the provider flow itself and streams open_url / instruction events
+// while this call is in flight; the terminal result is the final sanitized login state.
+// There is no handle to poll and no manual code RPC — the loopback/device exchange is
+// worker-side. Cancel is a local abandon (generation bump); the worker flow times out alone.
 static void beginOmpOAuth(AppState& st, const std::string& provider,
                           bool externalOwner = false) {
     OmpOAuthFlow& f = s_omp.oauth;
@@ -1672,141 +1602,77 @@ static void beginOmpOAuth(AppState& st, const std::string& provider,
     const uint64_t modalGeneration = s_omp.modalGeneration;
     const uint64_t generation = f.generation;
     const uint64_t requestGeneration = nextOmpRequestGeneration();
-    const std::string handle;
     f.beginRequest = requestGeneration;
-    st.rpc.call("agent_provider_begin_oauth", nlohmann::json{{"provider", provider}},
-                [&st, provider, handle, modalGeneration, generation,
-                 requestGeneration](const core::RpcResult& r) {
-        const std::string returnedHandle =
-            r.result.is_object() ? optionalJsonString(r.result, "handle") : std::string();
-        if (!ompOAuthCallbackCurrent(modalGeneration, generation, provider, handle) ||
-            s_omp.oauth.beginRequest != requestGeneration) {
-            cancelLateOmpOAuthHandle(st, provider, returnedHandle, generation);
-            return;
-        }
-        OmpOAuthFlow& f = s_omp.oauth;
-        if (!r.ok || !r.result.is_object() || !optionalJsonBool(r.result, "ok", true)) {
-            std::string error = !r.ok ? r.err : optionalJsonString(r.result, "error");
-            if (error.empty() && r.result.is_object())
-                error = optionalJsonString(r.result, "detail");
-            failOmpOAuth(f, error.empty() ? "sign-in failed to start" : error);
-            return;
-        }
-        const std::string returnedProvider = optionalJsonString(r.result, "provider");
-        if (returnedHandle.empty() || returnedProvider != provider) {
-            cancelLateOmpOAuthHandle(st, provider, returnedHandle, generation);
-            failOmpOAuth(f, "sign-in returned an invalid flow snapshot");
-            return;
-        }
-        f.handle = returnedHandle;
-        ompOAuthApplySnapshot(f, r.result);
-        openOmpOAuthInSystemBrowser(f);
-        if (f.status.empty()) {
-            failOmpOAuth(f, "sign-in returned an incomplete flow snapshot");
-            return;
-        }
-        finishOmpOAuthSnapshot(st, f);
-    }, 10000);
+    st.rpc.call(
+        "chudcode_login", nlohmann::json{{"providerId", provider}},
+        [&st, provider, modalGeneration, generation,
+         requestGeneration](const core::RpcResult& r) {
+            if (!ompOAuthCallbackCurrent(modalGeneration, generation, provider) ||
+                s_omp.oauth.beginRequest != requestGeneration)
+                return;   // superseded/cancelled — the late result is simply dropped
+            OmpOAuthFlow& f = s_omp.oauth;
+            if (!r.ok || !r.result.is_object() ||
+                !optionalJsonBool(r.result, "ok", false)) {
+                std::string error = !r.ok ? r.err : optionalJsonString(r.result, "error");
+                if (error.empty() && r.result.is_object())
+                    error = optionalJsonString(r.result, "reason");
+                if (error.empty() && r.result.is_object())
+                    error = optionalJsonString(r.result, "detail");
+                failOmpOAuth(f, error.empty() ? "sign-in failed" : error);
+                return;
+            }
+            // Terminal state: the worker only returns after the flow settled. A usable
+            // state (or an explicit connected marker) is success; anything else is the
+            // provider's refusal, reported verbatim.
+            const std::string state = optionalJsonString(r.result, "state");
+            const bool connected = ui::chudcodeProviderUsable(state) ||
+                                   optionalJsonBool(r.result, "connected", false) ||
+                                   optionalJsonBool(r.result, "credential_saved", false);
+            if (connected) {
+                f.status = "connected";
+                f.credentialSaved = true;
+                f.active = false;
+                st.addLog("[ok] signed in to " + f.provider);
+                refreshOmpProvider(st);
+            } else {
+                failOmpOAuth(f, optionalJsonString(r.result, "error"));
+            }
+        },
+        // Streamed mid-call progress (GL thread via AsyncRpc::drain): open_url hands the
+        // browser URL over; other kinds carry display text. Snapshot semantics per event.
+        [provider, modalGeneration, generation,
+         requestGeneration](const nlohmann::json& ev) {
+            if (!ompOAuthCallbackCurrent(modalGeneration, generation, provider) ||
+                s_omp.oauth.beginRequest != requestGeneration)
+                return;
+            ui::ChudcodeLoginEvent e;
+            if (!ui::parseChudcodeLoginEvent(ev, e)) return;
+            OmpOAuthFlow& f = s_omp.oauth;
+            if (e.kind == "open_url") {
+                f.url = e.url;
+                f.launchUrl = e.launchUrl;
+                if (!e.message.empty()) f.instructions = e.message;
+                if (!e.interaction.empty()) f.interaction = e.interaction;
+                f.status = "awaiting_auth";
+                openOmpOAuthInSystemBrowser(f);
+            } else if (!e.message.empty()) {
+                f.progress = e.message;
+                if (f.status == "starting") f.status = "awaiting_auth";
+            }
+        },
+        // The whole flow rides ONE call: give the user time to finish in the browser.
+        300000);
 }
 
-static void pollOmpOAuth(AppState& st) {
+static void cancelOmpOAuth(AppState&) {
     OmpOAuthFlow& f = s_omp.oauth;
-    if (!f.active || f.handle.empty() || f.pollInFlight) return;
-    if (f.status != "starting" && f.status != "awaiting_auth") return;
-    const double now = ImGui::GetTime();
-    if ((now - f.lastPoll) < 1.0) return;
-    f.lastPoll = now;
-    f.pollInFlight = true;
-    const std::string provider = f.provider;
-    const std::string handle = f.handle;
-    const uint64_t modalGeneration = s_omp.modalGeneration;
-    const uint64_t generation = f.generation;
-    const uint64_t requestGeneration = nextOmpRequestGeneration();
-    f.pollRequest = requestGeneration;
-    st.rpc.call("agent_provider_oauth_poll", nlohmann::json{{"handle", handle}},
-                [&st, provider, handle, modalGeneration, generation,
-                 requestGeneration](const core::RpcResult& r) {
-        if (!ompOAuthCallbackCurrent(modalGeneration, generation, provider, handle) ||
-            s_omp.oauth.pollRequest != requestGeneration)
-            return;
-        OmpOAuthFlow& f = s_omp.oauth;
-        f.pollInFlight = false;
-        if (!r.ok || !r.result.is_object() || !optionalJsonBool(r.result, "ok", true)) {
-            std::string error = !r.ok ? r.err : optionalJsonString(r.result, "error");
-            if (error.empty() && r.result.is_object())
-                error = optionalJsonString(r.result, "detail");
-            failOmpOAuth(f, error.empty() ? "sign-in status check failed" : error);
-            return;
-        }
-        const std::string returnedProvider = optionalJsonString(r.result, "provider");
-        const std::string returnedStatus = optionalJsonString(r.result, "status");
-        const bool providerMatches =
-            returnedProvider == provider ||
-            (returnedProvider.empty() && returnedStatus == "error");
-        if (!providerMatches || optionalJsonString(r.result, "handle") != handle) {
-            failOmpOAuth(f, "sign-in status returned the wrong flow");
-            return;
-        }
-        ompOAuthApplySnapshot(f, r.result);
-        openOmpOAuthInSystemBrowser(f);
-        if (f.status.empty()) {
-            failOmpOAuth(f, "sign-in status was incomplete");
-            return;
-        }
-        finishOmpOAuthSnapshot(st, f);
-    }, 10000);
-}
-
-static void submitOmpOAuthManual(AppState& st) {
-    OmpOAuthFlow& f = s_omp.oauth;
-    if (!f.active || !f.canSubmitManual || f.manualInFlight || f.handle.empty() ||
-        f.codeBuf[0] == 0)
-        return;
-    const std::string provider = f.provider;
-    const std::string handle = f.handle;
-    const std::string code = f.codeBuf;
-    const uint64_t modalGeneration = s_omp.modalGeneration;
-    const uint64_t generation = f.generation;
-    const uint64_t requestGeneration = nextOmpRequestGeneration();
-    f.manualRequest = requestGeneration;
-    f.manualInFlight = true;
-    f.manualError.clear();
-    st.rpc.call("agent_provider_oauth_manual",
-                nlohmann::json{{"handle", handle}, {"code", code}},
-                [provider, handle, modalGeneration, generation,
-                 requestGeneration](const core::RpcResult& r) {
-        if (!ompOAuthCallbackCurrent(modalGeneration, generation, provider, handle) ||
-            s_omp.oauth.manualRequest != requestGeneration)
-            return;
-        OmpOAuthFlow& f = s_omp.oauth;
-        f.manualInFlight = false;
-        if (!r.ok || !r.result.is_object() || !optionalJsonBool(r.result, "ok", false)) {
-            f.manualError = !r.ok ? r.err : optionalJsonString(r.result, "error");
-            if (f.manualError.empty() && r.result.is_object())
-                f.manualError = optionalJsonString(r.result, "detail");
-            if (f.manualError.empty())
-                f.manualError = "The provider rejected that value.";
-            return;
-        }
-        f.codeBuf[0] = 0;
-        f.manualError.clear();
-        f.lastPoll = -1e9;
-    });
-}
-
-static void cancelOmpOAuth(AppState& st) {
-    OmpOAuthFlow& f = s_omp.oauth;
-    const std::string provider = f.provider;
-    const std::string handle = f.handle;
-    const uint64_t generation = f.generation;
+    // Local abandon: bump the generation so the in-flight call's event/done callbacks are
+    // ignored. The worker-side flow is not addressable (no handle) and expires on its own.
     f.generation = ++s_omp.oauthGeneration;
     f.active = false;
-    f.pollInFlight = false;
-    f.manualInFlight = false;
     f.status = "cancelled";
     f.error.clear();
-    f.manualError.clear();
-    cancelLateOmpOAuthHandle(st, provider, handle, generation);
+    f.localError.clear();
 }
 
 static bool openOmpOAuthUrl(const OmpOAuthFlow& f) {
@@ -1885,20 +1751,20 @@ static bool modelMatches(const ui::BridgeModelMeta& m, const std::string& needle
            toLowerAscii(m.id).find(needleLower) != std::string::npos;
 }
 
-// Remove ONE credential row from the auth bridge (account = its rowid, as reported by
+// Remove ONE credential row from the Chudcode service (accountId = its rowid, as reported by
 // accounts[].credentialId or disabled[].id), or every credential for the provider when
-// account is empty. Reuses the frozen agent_provider_remove_key proxy — a disabled row is
-// removable through the exact same call as a live key, so no new method is involved.
+// accountId is empty. A disabled row is removable through the exact same chudcode_remove_key
+// call as a live key, so no extra method is involved.
 static void removeOmpCredential(AppState& st, const std::string& provider,
                                 const std::string& account) {
-    nlohmann::json params{{"provider", provider}};
-    if (!account.empty()) params["account"] = account;   // omitted = all rows for the provider
+    nlohmann::json params{{"providerId", provider}};
+    if (!account.empty()) params["accountId"] = account;  // omitted = all rows for the provider
     const uint64_t modalGeneration = s_omp.modalGeneration;
     const uint64_t viewGeneration = s_omp.viewGeneration;
     const uint64_t selectionGeneration = s_omp.selectionGeneration;
     const uint64_t requestGeneration = nextOmpRequestGeneration();
     s_omp.keyRequestGeneration = requestGeneration;
-    st.rpc.call("agent_provider_remove_key", std::move(params),
+    st.rpc.call("chudcode_remove_key", std::move(params),
                 [&st, provider, modalGeneration, viewGeneration, selectionGeneration,
                  requestGeneration](const core::RpcResult& r) {
         if (!ompSelectionCallbackCurrent(modalGeneration, viewGeneration,
@@ -1907,9 +1773,10 @@ static void removeOmpCredential(AppState& st, const std::string& provider,
             s_omp.keyFor != provider)
             return;
         if (!r.ok || !r.result.is_object() || !optionalJsonBool(r.result, "ok", true)) {
-            const std::string why = !r.ok ? r.err : optionalJsonString(r.result, "error");
-            s_omp.lastError = why.empty() ? "The auth bridge refused to remove that credential."
-                                          : why;
+            std::string why = !r.ok ? r.err : optionalJsonString(r.result, "error");
+            if (why.empty()) why = optionalJsonString(r.result, "reason");
+            s_omp.lastError =
+                why.empty() ? "The Chudcode service refused to remove that credential." : why;
         } else {
             s_omp.lastError.clear();
         }
@@ -2022,8 +1889,9 @@ static void drawOmpProviderDetail(AppState& st, float sc) {
             beginOmpOAuth(st, prov.id);
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip("Browser OAuth (PKCE loopback or device code, whichever the "
-                              "provider supports). Manual input appears only when the "
-                              "provider explicitly requests it.");
+                              "provider supports). The Chudcode service runs the whole "
+                              "exchange; this panel opens the approval URL and reports "
+                              "the final state.");
     };
 
     // ---- Sign-in + Usage sections: two columns on wide panes, stacked on narrow ones ----
@@ -2102,8 +1970,8 @@ static void drawOmpProviderDetail(AppState& st, float sc) {
             const uint64_t modalGeneration = s_omp.modalGeneration;
             const uint64_t viewGeneration = s_omp.viewGeneration;
             const uint64_t selectionGeneration = s_omp.selectionGeneration;
-            st.rpc.call("agent_provider_logout",
-                        nlohmann::json{{"provider", provider}},
+            st.rpc.call("chudcode_logout",
+                        nlohmann::json{{"providerId", provider}},
                         [&st, provider, modalGeneration, viewGeneration,
                          selectionGeneration](const core::RpcResult& r) {
                 if (!ompSelectionCallbackCurrent(modalGeneration, viewGeneration,
@@ -2195,24 +2063,11 @@ static void drawOmpProviderDetail(AppState& st, float sc) {
                     ImGui::SetClipboardText(visibleUrl.c_str());
                 ImGui::SameLine(0, 6.0f * sc);
                 if (ImGui::SmallButton("Open in browser") && !openOmpOAuthUrl(flow))
-                    flow.manualError = "This sign-in URL could not be opened safely.";
-            }
-            if (flow.canSubmitManual) {
-                ImGui::SetNextItemWidth(-1);
-                if (ImGui::InputTextWithHint("##omp_oauth_code",
-                                             "Paste code or redirect URL\xe2\x80\xa6",
-                                             flow.codeBuf, sizeof(flow.codeBuf)))
-                    flow.manualError.clear();
-                if (flow.manualInFlight) ImGui::BeginDisabled();
-                if (ImGui::SmallButton(flow.manualInFlight ? "Submitting\xe2\x80\xa6"
-                                                           : "Submit code"))
-                    submitOmpOAuthManual(st);
-                if (flow.manualInFlight) ImGui::EndDisabled();
-                ImGui::SameLine(0, 6.0f * sc);
+                    flow.localError = "This sign-in URL could not be opened safely.";
             }
             if (ImGui::SmallButton("Cancel")) cancelOmpOAuth(st);
             const std::string& visibleError =
-                !flow.manualError.empty() ? flow.manualError : flow.error;
+                !flow.localError.empty() ? flow.localError : flow.error;
             if (!visibleError.empty()) {
                 ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(pal.statusErr));
                 ImGui::TextWrapped("%s", visibleError.c_str());
@@ -2259,8 +2114,8 @@ static void drawOmpProviderDetail(AppState& st, float sc) {
             const uint64_t selectionGeneration = s_omp.selectionGeneration;
             const uint64_t requestGeneration = nextOmpRequestGeneration();
             s_omp.keyRequestGeneration = requestGeneration;
-            st.rpc.call("agent_provider_validate_key",
-                        nlohmann::json{{"provider", provider}, {"apiKey", key}},
+            st.rpc.call("chudcode_validate_key",
+                        nlohmann::json{{"providerId", provider}, {"apiKey", key}},
                         [&st, provider, key, modalGeneration, viewGeneration,
                          selectionGeneration, requestGeneration](const core::RpcResult& r) {
                 if (!ompSelectionCallbackCurrent(modalGeneration, viewGeneration,
@@ -2281,8 +2136,8 @@ static void drawOmpProviderDetail(AppState& st, float sc) {
                     if (s_omp.keyStatus.empty()) s_omp.keyStatus = "key rejected";
                     return;
                 }
-                st.rpc.call("agent_provider_set_key",
-                            nlohmann::json{{"provider", provider}, {"apiKey", key}},
+                st.rpc.call("chudcode_set_key",
+                            nlohmann::json{{"providerId", provider}, {"apiKey", key}},
                             [&st, provider, modalGeneration, viewGeneration,
                              selectionGeneration,
                              requestGeneration](const core::RpcResult& sr) {
@@ -2501,7 +2356,7 @@ static void drawOmpProviderDetail(AppState& st, float sc) {
 // Settings -> Providers in the browser.
 //
 // The OMP manager below it is the wrong model on web and cannot be made right: its credentials
-// live in the ONE shared daemon's bridge AuthStorage, and every agent_provider_* RPC it drives is
+// live in the ONE shared daemon's Chudcode auth store, and every chudcode_* auth RPC it drives is
 // refused for any account that is not an admin (Webservice/gateway/engine_bridge.py). A standard
 // web account therefore got an empty provider list, a refusal string, and an "Add API key" field
 // whose Validate & add could only fail — with no other way to give the app a credential.
@@ -2593,7 +2448,7 @@ static void drawOmpProviderManager(AppState& st) {
     const float sc = ui::uiScale;
     const auto& pal = ui::palette;
     if (ui::webProviderKeysAvailable()) {
-        // Not merely hidden: the polls below drive agent_provider_* every TTL tick, which a
+        // Not merely hidden: the polls below drive chudcode_* auth RPCs every TTL tick, which a
         // non-admin account cannot call at all and an admin should not be driving from a browser
         // into the operator's own credential store.
         drawWebAccountProviderManager(st);
@@ -2601,7 +2456,6 @@ static void drawOmpProviderManager(AppState& st) {
     }
     enterOmpProviderView();
     pollOmpProviderList(st, false);
-    pollOmpOAuth(st);
     ui::refreshBridgeModelCatalog(st, false);
 
     if (s_omp.oauth.active && s_omp.oauth.provider != s_omp.selectedId) {
@@ -2818,7 +2672,7 @@ static void drawOmpProviderManager(AppState& st) {
     ImGui::EndChild();
     ImGui::PopStyleVar();
 
-    // Footer: per-session cost strip (agent_cost_summary; hides itself when unavailable).
+    // Footer: per-session cost strip (chudcode_session_stats; hides itself when unavailable).
     ui::drawSessionCostStrip(st);
 }
 
@@ -4704,10 +4558,10 @@ static void drawMemoryLearningSection(AppState& st, float sc) {
     Settings& settings = st.settings;
 
     static bool s_loaded = false;
-    static int s_memBackend = 0;      // 0 sqlite | 1 mnemopi  (agent.memory_backend)
-    // Unified compaction control (was two combos: backend + strategy). Maps to
-    // agent.compaction_strategy + agent.compaction_backend together.
-    // 0 Off | 1 Snapcompact (builtin) | 2 Snapcompact (OMP) | 3 Shake | 4 Summary
+    // Unified compaction control. Maps to agent.compaction_strategy only — the retired OMP
+    // compaction backend and its agent.compaction_backend key were deleted with the config
+    // cutover; a legacy "omp" strategy value on disk loads as plain Snapcompact.
+    // 0 Off | 1 Snapcompact | 2 Shake | 3 Summary
     static int s_compMode = 0;
     static bool s_supersedeReads = true;  // agent.compaction.supersede_reads
     static bool s_dropUseless = true;     // agent.compaction.drop_useless
@@ -4719,22 +4573,16 @@ static void drawMemoryLearningSection(AppState& st, float sc) {
     static bool s_previews = true;    // ui::aiActiveWorkPreviews
     if (!s_loaded) {
         s_loaded = true;
-        s_memBackend = (loadAgentConfigString("memory_backend", "sqlite") == "mnemopi") ? 1 : 0;
         {
             const std::string cs = loadAgentConfigString("compaction_strategy", "off");
-            const bool omp = (loadAgentConfigString("compaction_backend", "builtin") == "omp");
-            if (cs == "off" || cs.empty())
-                s_compMode = 0;
-            else if (omp && (cs == "snapcompact" || cs == "omp"))
-                s_compMode = 2;
-            else if (cs == "snapcompact")
+            if (cs == "snapcompact" || cs == "omp")   // legacy "omp" strategy = snapcompact
                 s_compMode = 1;
             else if (cs == "shake")
-                s_compMode = 3;
+                s_compMode = 2;
             else if (cs == "summary")
-                s_compMode = 4;
+                s_compMode = 3;
             else
-                s_compMode = omp ? 2 : 0;
+                s_compMode = 0;
         }
         s_supersedeReads = loadAgentConfigNestedBool("compaction", "supersede_reads", true);
         s_dropUseless = loadAgentConfigNestedBool("compaction", "drop_useless", true);
@@ -4766,11 +4614,9 @@ static void drawMemoryLearningSection(AppState& st, float sc) {
                    "instead of manual picking.");
         return;
     }
-    static const char* kMemBackends[] = {"SQLite", "Mnemopi"};
     static const char* kCompModes[] = {
         "Off",
-        "Snapcompact (builtin)",
-        "Snapcompact (OMP)",
+        "Snapcompact",
         "Shake",
         "Summary",
     };
@@ -4778,16 +4624,13 @@ static void drawMemoryLearningSection(AppState& st, float sc) {
 
     auto saveCompMode = [&](int mode) {
         const char* strategy = "off";
-        const char* backend = "builtin";
         switch (mode) {
-        case 1: strategy = "snapcompact"; backend = "builtin"; break;
-        case 2: strategy = "snapcompact"; backend = "omp"; break;
-        case 3: strategy = "shake"; backend = "builtin"; break;
-        case 4: strategy = "summary"; backend = "builtin"; break;
-        default: strategy = "off"; backend = "builtin"; break;
+        case 1: strategy = "snapcompact"; break;
+        case 2: strategy = "shake"; break;
+        case 3: strategy = "summary"; break;
+        default: strategy = "off"; break;
         }
         saveAgentConfigValue("compaction_strategy", strategy);
-        saveAgentConfigValue("compaction_backend", backend);
     };
 
     if (ImGui::BeginTable("##memory_learning", 2,
@@ -4796,28 +4639,15 @@ static void drawMemoryLearningSection(AppState& st, float sc) {
         ImGui::TableNextColumn();
         {
             ImGui::AlignTextToFramePadding();
-            ImGui::TextUnformatted("Memory backend");
-            ImGui::SameLine();
-            helpMarker("Where project memory (decisions, notes, recall) is stored. "
-                       "SQLite = local .plm/memory.db (default). Mnemopi = OMP bridge "
-                       "memory. Saved to config.json agent.memory_backend.");
-            ImGui::SameLine();
-            ImGui::SetNextItemWidth(-1.0f);
-            if (settingsPopupRowCombo("##mem_backend", &s_memBackend, kMemBackends, 2))
-                saveAgentConfigValue("memory_backend", s_memBackend == 1 ? "mnemopi" : "sqlite");
-        }
-        ImGui::TableNextColumn();
-        {
-            ImGui::AlignTextToFramePadding();
             ImGui::TextUnformatted("Compaction");
             ImGui::SameLine();
             helpMarker("How long transcripts are compacted. Off = truncate only. "
-                       "Snapcompact = snapshot-style archive (builtin Python or OMP "
-                       "bridge). Shake = drop low-value turns. Summary = model-written "
-                       "recap. Writes agent.compaction_strategy + agent.compaction_backend.");
+                       "Snapcompact = snapshot-style archive. Shake = drop low-value "
+                       "turns. Summary = model-written recap. Writes "
+                       "agent.compaction_strategy.");
             ImGui::SameLine();
             ImGui::SetNextItemWidth(-1.0f);
-            if (settingsPopupRowCombo("##comp_mode", &s_compMode, kCompModes, 5))
+            if (settingsPopupRowCombo("##comp_mode", &s_compMode, kCompModes, 4))
                 saveCompMode(s_compMode);
         }
 
@@ -4858,11 +4688,85 @@ static void drawMemoryLearningSection(AppState& st, float sc) {
         ImGui::EndTable();
     }
 
-    // ---- OMP Auto-Learn (experimental) — matches OMP Memory tab knobs ----
+    // ---- Active-session controls (Chudcode) ------------------------------------------
+    // Real per-session switches on the persistent Chudcode host — not config keys. They
+    // apply to the ACTIVE chat session immediately (chudcode_set_auto_compaction /
+    // chudcode_set_auto_retry) and read honestly: with no active session there is nothing
+    // to switch, so the rows disable instead of pretending.
+    settingsSectionHeader("Active session (Chudcode)");
+    {
+        static std::string s_sessFor;       // session the cached toggle values belong to
+        static bool s_sessAutoCompaction = true;   // Chudcode defaults both on
+        static bool s_sessAutoRetry = true;
+        static bool s_sessInFlight = false;
+        static std::string s_sessStatus;
+        static bool s_sessStatusErr = false;
+        const std::string sess = st.activeConvId();
+        if (sess != s_sessFor) {
+            s_sessFor = sess;
+            s_sessAutoCompaction = true;
+            s_sessAutoRetry = true;
+            s_sessStatus.clear();
+            s_sessStatusErr = false;
+        }
+        if (sess.empty()) {
+            dimText("No active chat session \xe2\x80\x94 open the copilot to switch "
+                    "auto-compaction / auto-retry for a session.");
+        } else {
+            auto applySessionFlag = [&st, sess](const char* method, bool enabled,
+                                                bool* uiFlag, bool previous) {
+                s_sessInFlight = true;
+                s_sessStatus.clear();
+                st.rpc.call(method,
+                            nlohmann::json{{"session_id", sess}, {"enabled", enabled}},
+                            [sess, uiFlag, previous](const core::RpcResult& r) {
+                    s_sessInFlight = false;
+                    if (s_sessFor != sess) return;   // session switched mid-flight
+                    const bool ok = r.ok && r.result.is_object() &&
+                                    optionalJsonBool(r.result, "ok", false);
+                    if (!ok) {
+                        *uiFlag = previous;   // the switch did not happen — say so
+                        s_sessStatusErr = true;
+                        s_sessStatus = !r.ok ? r.err : optionalJsonString(r.result, "error");
+                        if (s_sessStatus.empty())
+                            s_sessStatus = optionalJsonString(r.result, "reason");
+                        if (s_sessStatus.empty())
+                            s_sessStatus = "The Chudcode service refused the change.";
+                        return;
+                    }
+                    s_sessStatusErr = false;
+                    s_sessStatus = "applied";
+                });
+            };
+            if (s_sessInFlight) ImGui::BeginDisabled();
+            if (ImGui::Checkbox("Auto-compaction", &s_sessAutoCompaction))
+                applySessionFlag("chudcode_set_auto_compaction", s_sessAutoCompaction,
+                                 &s_sessAutoCompaction, !s_sessAutoCompaction);
+            helpMarker("Chudcode compacts this session's transcript automatically as the "
+                       "context window fills. Applies to the active chat session now.");
+            ImGui::SameLine(0, 16.0f * sc);
+            if (ImGui::Checkbox("Auto-retry", &s_sessAutoRetry))
+                applySessionFlag("chudcode_set_auto_retry", s_sessAutoRetry,
+                                 &s_sessAutoRetry, !s_sessAutoRetry);
+            helpMarker("Chudcode retries transient provider failures (rate limits, "
+                       "disconnects) inside the turn. Applies to the active chat "
+                       "session now.");
+            if (s_sessInFlight) ImGui::EndDisabled();
+            if (!s_sessStatus.empty()) {
+                ImGui::SameLine(0, 10.0f * sc);
+                ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(
+                    s_sessStatusErr ? ui::palette.statusErr : ui::palette.textDim));
+                ImGui::TextUnformatted(s_sessStatus.c_str());
+                ImGui::PopStyleColor();
+            }
+        }
+    }
+
+    // ---- Auto-Learn (experimental) ----
     settingsSectionHeader("Auto-Learn (experimental)");
-    dimText("OMP sidecar: after substantive turns, capture lessons into project "
-            "memory. Standing guidance is prompt-cache neutral; auto-run capture "
-            "uses an extra private write when enabled.");
+    dimText("After substantive turns, capture lessons into project memory. Standing "
+            "guidance is prompt-cache neutral; auto-run capture uses an extra private "
+            "write when enabled.");
     if (ImGui::BeginTable("##autolearn", 2,
                           ImGuiTableFlags_SizingStretchSame |
                           ImGuiTableFlags_NoPadOuterX)) {
@@ -6234,7 +6138,7 @@ void beginExternalProviderSignIn(AppState& st, const std::string& provider) {
 }
 
 ExternalProviderSignInStatus pollExternalProviderSignIn(AppState& st) {
-    ::pollOmpOAuth(st);
+    (void)st;   // one-call chudcode_login: progress arrives via streamed events, no poll RPC
     const OmpOAuthFlow& f = s_omp.oauth;
     ExternalProviderSignInStatus out;
     out.active = f.active;
@@ -6245,7 +6149,7 @@ ExternalProviderSignInStatus pollExternalProviderSignIn(AppState& st) {
     out.progress = f.progress;
     out.instructions = f.instructions;
     out.url = !f.url.empty() ? f.url : f.launchUrl;
-    out.error = !f.manualError.empty() ? f.manualError : f.error;
+    out.error = !f.localError.empty() ? f.localError : f.error;
     return out;
 }
 
@@ -7828,6 +7732,122 @@ void drawSettingsModal(AppState& st, bool busy) {
                             }
                         }
 
+                        // ---- Chudcode built-in capabilities (browser / computer) --------
+                        // These tools execute inside the Chudcode service, not the CAD tool
+                        // registry: there is no second execution backend here and Chudware's
+                        // CEF stays the embedded/vendor browser. The rows render exactly the
+                        // sanitized names/load modes chudcode_tool_state reports for the
+                        // ACTIVE session, and say plainly when that state is unavailable
+                        // instead of implying capability.
+                        {
+                            static std::vector<ui::ChudcodeToolRow> s_ccTools;
+                            static bool s_ccLoaded = false;
+                            static bool s_ccInFlight = false;
+                            static bool s_ccUnavailable = false;
+                            static std::string s_ccError;
+                            static std::string s_ccFor;
+                            static double s_ccAt = -1e9;
+                            const std::string ccSess = st.activeConvId();
+                            if (ccSess != s_ccFor) {
+                                s_ccFor = ccSess;
+                                s_ccLoaded = false;
+                                s_ccUnavailable = false;
+                                s_ccError.clear();
+                                s_ccAt = -1e9;
+                            }
+                            const double ccNow = ImGui::GetTime();
+                            if (!ccSess.empty() && st.workerStarted && !s_ccInFlight &&
+                                (ccNow - s_ccAt) > (s_ccLoaded ? 60.0 : 15.0)) {
+                                s_ccAt = ccNow;
+                                s_ccInFlight = true;
+                                st.rpc.call("chudcode_tool_state",
+                                            nlohmann::json{{"session_id", ccSess}},
+                                            [ccSess](const core::RpcResult& r) {
+                                    s_ccInFlight = false;
+                                    if (s_ccFor != ccSess) return;
+                                    if (ompRpcAbsent(r)) {
+                                        s_ccUnavailable = true;
+                                        s_ccError = "Chudcode tool state is not served by "
+                                                    "this runtime.";
+                                        return;
+                                    }
+                                    std::vector<ui::ChudcodeToolRow> rows;
+                                    if (!r.ok ||
+                                        !ui::parseChudcodeToolState(r.result, rows)) {
+                                        // Soft fail: keep the last good rows; only report
+                                        // when we never had any.
+                                        if (!s_ccLoaded) {
+                                            s_ccError = !r.ok
+                                                ? (r.err.empty() ? "tool state call failed"
+                                                                 : r.err)
+                                                : optionalJsonString(r.result, "error");
+                                            if (s_ccError.empty())
+                                                s_ccError = optionalJsonString(r.result,
+                                                                               "reason");
+                                            if (s_ccError.empty())
+                                                s_ccError = "tool state call failed";
+                                        }
+                                        return;
+                                    }
+                                    s_ccUnavailable = false;
+                                    s_ccError.clear();
+                                    s_ccTools = std::move(rows);
+                                    s_ccLoaded = true;
+                                }, 15000);
+                            }
+                            settingsSectionHeader("Chudcode built-ins");
+                            dimText("Run inside the Chudcode service alongside the CAD "
+                                    "tools \xe2\x80\x94 browser/computer sessions live "
+                                    "there, not in Chudware's embedded CEF.");
+                            if (ccSess.empty()) {
+                                dimText("No active chat session \xe2\x80\x94 built-in "
+                                        "tool state appears once a copilot session "
+                                        "exists.");
+                            } else if (s_ccLoaded) {
+                                for (const auto& t : s_ccTools) {
+                                    ImGui::PushID(t.name.c_str());
+                                    const bool hi = t.name.find("browser") !=
+                                                        std::string::npos ||
+                                                    t.name.find("computer") !=
+                                                        std::string::npos;
+                                    ompStatusDotText(t.name.c_str(),
+                                                     t.available ? ui::palette.statusOk
+                                                                 : ui::palette.textDim,
+                                                     /*filled=*/t.available,
+                                                     hi ? ui::palette.text
+                                                        : ui::palette.textDim);
+                                    if (!t.loadMode.empty()) {
+                                        ImGui::SameLine(0, 8.0f * sc);
+                                        ImGui::PushStyleColor(ImGuiCol_Text,
+                                            ui::Palette::toU32(ui::palette.textDim));
+                                        ImGui::TextUnformatted(t.loadMode.c_str());
+                                        ImGui::PopStyleColor();
+                                    }
+                                    if (!t.available) {
+                                        ImGui::SameLine(0, 8.0f * sc);
+                                        ImGui::PushStyleColor(ImGuiCol_Text,
+                                            ui::Palette::toU32(ui::palette.textDim));
+                                        ImGui::TextUnformatted("unavailable");
+                                        ImGui::PopStyleColor();
+                                    }
+                                    if (!t.description.empty() &&
+                                        ImGui::IsItemHovered())
+                                        ImGui::SetTooltip("%s", t.description.c_str());
+                                    ImGui::PopID();
+                                }
+                                if (s_ccTools.empty())
+                                    dimText("The service reported no built-in tools for "
+                                            "this session.");
+                            } else if (!s_ccError.empty() || s_ccUnavailable) {
+                                ImGui::PushStyleColor(ImGuiCol_Text,
+                                    ui::Palette::toU32(ui::palette.statusWarn));
+                                ImGui::TextWrapped("%s", s_ccError.c_str());
+                                ImGui::PopStyleColor();
+                            } else {
+                                dimText("Reading built-in tool state\xe2\x80\xa6");
+                            }
+                        }
+
                         ImGui::Dummy(ImVec2(0, 8.0f * sc));
                         dimText("Per-tool rows: checkbox enables a tool globally (dimmed = off); "
                                 "Options overrides limits, included tool context, and AI usage "
@@ -8510,7 +8530,7 @@ void drawSettingsModal(AppState& st, bool busy) {
                 if (ui::drawFreeAiProviderCard(st)) saveSettings(st.settings);
                 settingsGlassSectionEnd();
                 if (!s_omp.available) {
-                    // Degrade path: the agent_provider_* C-ABI is absent in the current
+                    // Degrade path: the chudcode_* worker methods are absent in the current
                     // runtime — keep the legacy sections while the manager periodically
                     // re-probes for a reopened or reconnected bridge.
                     settingsGlassSectionBegin("##prov_provider", "Provider \x26 Model");

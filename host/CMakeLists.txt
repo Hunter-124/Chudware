@@ -177,6 +177,7 @@ set(CHUDWARE_CORE_SOURCES
   src/ui/onboarding.cpp       # first-run account/provider/test/workspace wizard
   src/ui/provider_logos.cpp             # provider brand color + badge (Settings -> Providers)
   src/ui/provider_usage.cpp             # shared subscription usage poll (Settings + composer rings)
+  src/ui/chudcode_descriptors.cpp       # Chudcode worker payload parsing (GL-free; unit-tested)
   src/ui/oauth_capture.cpp  # in-app xAI multi-account CEF OAuth (Settings → Accounts)
   src/ui/web_capabilities.cpp  # T-RF12: WASM-build gap table (ui::webBuild / ui::webGapReason)
   src/ui/web_provider_keys.cpp  # WASM-build per-account BYOK client (/api/providers/keys)
@@ -821,6 +822,44 @@ add_test(NAME test_conv_ids
   COMMAND test_conv_ids
   WORKING_DIRECTORY "${CMAKE_BINARY_DIR}")
 # --- end session-id allocation ---
+
+# --- Chudcode worker payload parsing: links the REAL chudcode_descriptors.cpp (no GL /
+# imgui / AppState). Guards the sanitized provider-descriptor spellings, the usable-state
+# whitelist, streamed chudcode_login open_url normalization, session-stats provenance
+# (hasCost vs fabricated $0), tool-state rows, and the /compact chat-replacement guard
+# (Chudcode online compaction omits messages — the visible chat must never be wiped).
+add_executable(test_chudcode_descriptors
+  src/ui/chudcode_descriptors.cpp
+  tests/test_chudcode_descriptors.cpp)
+target_include_directories(test_chudcode_descriptors PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(test_chudcode_descriptors PRIVATE nlohmann_json::nlohmann_json)
+set_target_properties(test_chudcode_descriptors PROPERTIES
+  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+add_test(NAME test_chudcode_descriptors
+  COMMAND test_chudcode_descriptors
+  WORKING_DIRECTORY "${CMAKE_BINARY_DIR}")
+# --- end Chudcode payload parsing ---
+
+# --- AsyncRpc streamed-event channel: links the REAL async_rpc.cpp against a stub
+# WorkerClient defined inside the test TU (call/abortPending/dtor only), so the queueing
+# rules are the shipped ones. Guards: the 4-arg call() stays event-free, streamed events
+# deliver ONLY inside drain() on the calling thread (in order, before their Done), and
+# shutdown() drops undelivered callbacks.
+add_executable(test_async_rpc
+  src/core/async_rpc.cpp
+  tests/test_async_rpc.cpp)
+target_include_directories(test_async_rpc PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(test_async_rpc PRIVATE nlohmann_json::nlohmann_json)
+find_package(Threads REQUIRED)
+target_link_libraries(test_async_rpc PRIVATE Threads::Threads)
+set_target_properties(test_async_rpc PROPERTIES
+  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+add_test(NAME test_async_rpc
+  COMMAND test_async_rpc
+  WORKING_DIRECTORY "${CMAKE_BINARY_DIR}")
+# --- end AsyncRpc streamed events ---
 
 # --- CEF metrics spool bound: links the REAL GL/CEF-free filesystem cleanup.
 # Exercises both exact Chromium spool directories without loading libcef or a GL context.

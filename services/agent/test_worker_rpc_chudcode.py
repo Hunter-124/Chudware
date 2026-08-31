@@ -32,6 +32,8 @@ class _FakeHost:
         self.status_calls: list[tuple[object, object]] = []
         self.auth_calls: list[tuple[str, dict]] = []
         self.memory_calls: list[tuple[str, dict]] = []
+        self.transient_calls: list[tuple[str, dict]] = []
+        self.session_calls: list[tuple[str, str, dict]] = []
         self.shutdown_count = 0
 
     def run_turn(self, params, emit):
@@ -97,6 +99,135 @@ class _FakeHost:
         self.memory_calls.append((command, params))
         return {"ok": True, "command": command, "params": params}
 
+    def transient_call(self, command, params=None, emit=None):
+        payload = dict(params or {})
+        self.transient_calls.append((command, payload))
+        if command == "get_login_providers":
+            return {
+                "providers": [
+                    {
+                        "id": "openai",
+                        "name": "OpenAI",
+                        "available": True,
+                        "authenticated": True,
+                        "accessToken": "must-not-escape",
+                    }
+                ]
+            }
+        if command == "get_available_models":
+            return {
+                "models": [
+                    {
+                        "id": f"model-{index}",
+                        "name": f"Model {index}",
+                        "provider": "openai" if index % 2 == 0 else "other",
+                        "contextWindow": 200_000,
+                        "maxTokens": 8_192,
+                        "reasoning": index % 2 == 0,
+                        "input": ["text", "image"],
+                        "cost": {
+                            "input": 1.0,
+                            "output": 2.0,
+                            "cacheRead": 0.1,
+                            "cacheWrite": 0.2,
+                        },
+                        "baseUrl": "https://secret.invalid",
+                        "headers": {"Authorization": "secret"},
+                    }
+                    for index in range(530)
+                ]
+            }
+        if command == "get_auth_state":
+            provider_id = payload.get("providerId") or "openai"
+            return {
+                "providers": [
+                    {
+                        "providerId": provider_id,
+                        "name": provider_id.title(),
+                        "authenticated": True,
+                        "hasApiKey": False,
+                        "hasOAuth": True,
+                        "origin": "oauth",
+                        "accounts": [
+                            {
+                                "accountId": "acct-1",
+                                "email": "user@example.com",
+                                "orgName": "Example",
+                                "refreshToken": "must-not-escape",
+                            }
+                        ],
+                    }
+                ]
+            }
+        if command == "login":
+            if emit is not None:
+                emit(
+                    {
+                        "type": "extension_ui_request",
+                        "method": "open_url",
+                        "kind": "open_url",
+                        "url": "https://login.example/authorize",
+                    }
+                )
+            return {"providerId": payload["providerId"]}
+        if command in {"validate_api_key", "set_api_key"}:
+            return {
+                "providerId": payload["providerId"],
+                "valid": True,
+                "apiKey": payload["apiKey"],
+            }
+        return {
+            "providerId": payload.get("providerId"),
+            "removed": True,
+            "loggedOut": True,
+        }
+
+    def session_call(self, session_id, command, params=None):
+        payload = dict(params or {})
+        self.session_calls.append((session_id, command, payload))
+        if session_id not in self.sessions:
+            return {"ok": False, "reason": "session_not_live"}
+        if command == "get_session_stats":
+            return {
+                "ok": True,
+                "sessionId": f"cc-{session_id}",
+                "userMessages": 2,
+                "assistantMessages": 2,
+                "toolCalls": 3,
+                "toolResults": 3,
+                "totalMessages": 7,
+                "tokens": {
+                    "input": 10,
+                    "output": 5,
+                    "cacheRead": 2,
+                    "cacheWrite": 1,
+                    "total": 18,
+                },
+                "premiumRequests": 1,
+                "cost": 0.25,
+                "sessionFile": "/private/session.jsonl",
+            }
+        if command == "compact":
+            return {
+                "ok": True,
+                "summary": "trimmed",
+                "shortSummary": "short",
+                "firstKeptEntryId": "entry-2",
+                "tokensBefore": 999,
+                "preserveData": {"secret": "must-not-escape"},
+            }
+        if command == "get_state":
+            return {
+                "ok": True,
+                "_hostToolNames": ["cad_tool"],
+                "dumpTools": [
+                    {"name": "read", "description": "Read files", "parameters": {}},
+                    {"name": "browser", "description": "Browse", "parameters": {}},
+                    {"name": "cad_tool", "description": "CAD", "parameters": {}},
+                ],
+            }
+        return {"ok": True, "enabled": payload["enabled"]}
+
     def shutdown(self):
         self.shutdown_count += 1
 
@@ -108,7 +239,7 @@ def online_lane(monkeypatch, tmp_path):
     tool_contexts: list[dict] = []
     prompt_calls: list[dict] = []
 
-    monkeypatch.setattr(worker_rpc, "_CHUDCODE_HOST", host)
+    monkeypatch.setattr(worker_rpc, "get_default_chudcode_host", lambda: host)
     with worker_rpc._HISTORY_SEED_LOCK:
         worker_rpc._HISTORY_SEEDED_SESSIONS.clear()
 
@@ -311,21 +442,21 @@ def test_cancel_steer_status_and_auth_memory_proxies(online_lane):
     assert online_lane.host.status_calls == [("run-z", None)]
 
     auth_cases = {
-        "chudcode_get_auth_state": ("get_auth_state", {"providerId": "openai"}),
-        "validate_api_key": (
-            "validate_api_key",
-            {"providerId": "openai", "apiKey": "never-return-this"},
-        ),
-        "set_api_key": (
-            "set_api_key",
-            {"providerId": "openai", "apiKey": "never-return-this"},
-        ),
-        "remove_api_key": ("remove_api_key", {"providerId": "openai"}),
-        "logout_provider": ("logout_provider", {"providerId": "openai"}),
+        "chudcode_auth_state": {"providerId": "openai"},
+        "chudcode_validate_key": {
+            "providerId": "openai",
+            "apiKey": "never-return-this",
+        },
+        "chudcode_set_key": {
+            "providerId": "openai",
+            "apiKey": "never-return-this",
+        },
+        "chudcode_remove_key": {"providerId": "openai"},
+        "chudcode_logout": {"providerId": "openai"},
     }
-    for method, (command, payload) in auth_cases.items():
+    for method, payload in auth_cases.items():
         result = worker_rpc.WORKER_METHODS[method](payload, lambda event: None)
-        assert result["command"] == command
+        assert result["ok"] is True
         assert "never-return-this" not in repr(result)
     memory_cases = {
         "memory_remember": (
@@ -343,6 +474,177 @@ def test_cancel_steer_status_and_auth_memory_proxies(online_lane):
         assert result["command"] == command
     worker_rpc.chudcode_shutdown()
     assert online_lane.host.shutdown_count == 1
+
+
+def test_registers_exact_shared_chudcode_worker_methods():
+    expected = {
+        "chudcode_provider_list",
+        "chudcode_auth_state",
+        "chudcode_validate_key",
+        "chudcode_set_key",
+        "chudcode_remove_key",
+        "chudcode_logout",
+        "chudcode_login",
+        "chudcode_models_list",
+        "chudcode_session_stats",
+        "chudcode_compact",
+        "chudcode_set_auto_compaction",
+        "chudcode_set_auto_retry",
+        "chudcode_tool_state",
+    }
+    assert expected <= worker_rpc.WORKER_METHODS.keys()
+
+
+def test_provider_auth_model_and_login_results_are_bounded_and_secret_free(online_lane):
+    emit: list[dict] = []
+    providers = worker_rpc.WORKER_METHODS["chudcode_provider_list"]({}, emit.append)
+    auth = worker_rpc.WORKER_METHODS["chudcode_auth_state"](
+        {"providerId": "openai"}, emit.append
+    )
+    models = worker_rpc.WORKER_METHODS["chudcode_models_list"](
+        {"providerId": "openai"}, emit.append
+    )
+    login = worker_rpc.WORKER_METHODS["chudcode_login"](
+        {"providerId": "openai"}, emit.append
+    )
+
+    assert providers["ok"] is True
+    assert providers["providers"][0]["state"] == "oauth_connected"
+    assert providers["providers"][0]["authKinds"] == ["oauth", "api_key"]
+    assert len(providers["providers"]) <= worker_rpc._CHUDCODE_MAX_PROVIDERS
+    assert auth["state"] == "oauth_connected"
+    assert auth["accounts"] == [
+        {"accountId": "acct-1", "email": "user@example.com", "orgName": "Example"}
+    ]
+    assert len(models["models"]) == 256
+    assert set(models["models"][0]) == {
+        "id",
+        "name",
+        "provider",
+        "contextWindow",
+        "maxTokens",
+        "reasoning",
+        "input",
+        "cost",
+    }
+    assert login["state"] == "oauth_connected"
+    assert emit == [
+        {
+            "type": "extension_ui_request",
+            "method": "open_url",
+            "kind": "open_url",
+            "url": "https://login.example/authorize",
+        }
+    ]
+    assert "must-not-escape" not in repr((providers, auth, models, login))
+
+
+def test_live_session_management_is_isolated_bounded_and_capability_honest(online_lane):
+    online_lane.host.sessions["live"] = object()
+    emit = lambda _event: None
+
+    stats = worker_rpc.WORKER_METHODS["chudcode_session_stats"](
+        {"session_id": "live"}, emit
+    )
+    compact = worker_rpc.WORKER_METHODS["chudcode_compact"](
+        {"session_id": "live", "instructions": "Keep decisions"}, emit
+    )
+    auto_compact = worker_rpc.WORKER_METHODS["chudcode_set_auto_compaction"](
+        {"session_id": "live", "enabled": False}, emit
+    )
+    auto_retry = worker_rpc.WORKER_METHODS["chudcode_set_auto_retry"](
+        {"session_id": "live", "enabled": True}, emit
+    )
+    tools = worker_rpc.WORKER_METHODS["chudcode_tool_state"](
+        {"session_id": "live"}, emit
+    )
+    missing = worker_rpc.WORKER_METHODS["chudcode_session_stats"](
+        {"session_id": "inactive"}, emit
+    )
+
+    assert stats["cost"] == 0.25
+    assert stats["tokens"]["total"] == 18
+    assert "sessionFile" not in stats
+    assert compact == {
+        "ok": True,
+        "summary": "trimmed",
+        "shortSummary": "short",
+        "firstKeptEntryId": "entry-2",
+        "tokensBefore": 999,
+    }
+    assert auto_compact["ok"] is True
+    assert auto_retry["ok"] is True
+    by_name = {tool["name"]: tool for tool in tools["tools"]}
+    assert by_name["browser"]["available"] is True
+    assert by_name["browser"]["loadMode"] == "discoverable"
+    assert by_name["computer"]["available"] is False
+    assert by_name["computer"]["loadMode"] == "essential"
+    assert "cad_tool" not in by_name
+    assert missing == {"ok": False, "reason": "session_not_live"}
+    assert set(online_lane.host.sessions) == {"live"}
+    assert (
+        "live",
+        "compact",
+        {"customInstructions": "Keep decisions"},
+    ) in online_lane.host.session_calls
+
+
+def test_legacy_session_adapters_never_rewrite_online_chudcode_history(monkeypatch):
+    compact_calls = []
+    shake_calls = []
+
+    def compact_session(messages, strategy, **kwargs):
+        compact_calls.append((messages, strategy, kwargs))
+        return {
+            "summary": "trimmed",
+            "shortSummary": "short",
+            "firstKeptEntryId": "entry-3",
+            "tokensBefore": 400,
+            "messages": [],
+            "kept_messages": [],
+        }
+
+    commands = SimpleNamespace(
+        _offline_enabled=lambda: False,
+        compact_session=compact_session,
+        shake_session=lambda *args, **kwargs: shake_calls.append((args, kwargs)),
+    )
+    monkeypatch.setattr(worker_rpc, "_cmds", lambda: commands)
+
+    compact = worker_rpc.SESSION_METHODS["session_compact"](
+        {
+            "session_id": "live",
+            "strategy": "off",
+            "messages": [{"role": "user", "content": "must survive"}],
+            "provider": "removed-provider",
+            "instructions": "Keep decisions",
+        },
+        lambda _event: None,
+    )
+    shake = worker_rpc.SESSION_METHODS["session_shake"](
+        {
+            "session_id": "live",
+            "messages": [{"role": "user", "content": "must survive"}],
+        },
+        lambda _event: None,
+    )
+
+    assert compact == {
+        "ok": True,
+        "summary": "trimmed",
+        "short_summary": "short",
+        "firstKeptEntryId": "entry-3",
+        "tokensBefore": 400,
+    }
+    assert compact_calls[0][1] == "chudcode"
+    assert compact_calls[0][2]["session_id"] == "live"
+    assert compact_calls[0][2]["instructions"] == "Keep decisions"
+    assert "provider" not in compact_calls[0][2]
+    assert "messages" not in compact
+    assert "kept_messages" not in compact
+    assert shake["ok"] is False
+    assert shake["owner"] == "chudcode"
+    assert shake_calls == []
 
 
 def test_online_registration_never_selects_legacy_provider_loop(

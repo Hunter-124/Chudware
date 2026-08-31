@@ -1,10 +1,10 @@
-"""Session command backends: /handoff, /btw, compact, shake.
+"""Session command backends for persistent Chudcode and explicit offline use.
 
-Host-facing pure transforms. The host passes its transcript as ``messages[]``;
-we return a result the host applies to its store. Inputs are never mutated.
-
-RPCs live in ``services.agent.worker_rpc`` (folded from engine_oracle/parts_hub/session_rpc.py, T-RF19) and call these functions.
+Online compaction and retry state are delegated to the live Chudcode session.
+Deterministic transcript transforms remain available only when a caller opts
+into standalone mode or Chudware is explicitly offline. Inputs are never mutated.
 """
+
 from __future__ import annotations
 
 import copy
@@ -117,6 +117,7 @@ def _handoff_user_prompt(focus: str | None = None) -> str:
 # Message helpers — never mutate caller input
 # ---------------------------------------------------------------------------
 
+
 def _snapshot_messages(messages: list | None) -> list[dict]:
     """Deep-copy messages so oneshots / engines cannot mutate the host store."""
     if not messages:
@@ -183,6 +184,7 @@ def _normalize_messages(messages: list | None) -> list[dict]:
 # Provider resolution (oneshot complete)
 # ---------------------------------------------------------------------------
 
+
 def _resolve_provider(provider: Any = None, model: str | None = None):
     """Return a Provider with ``.complete(system, messages, max_tokens=...)``.
 
@@ -204,8 +206,9 @@ def _resolve_provider(provider: Any = None, model: str | None = None):
     return agent_config.get_provider(name=name, cfg=cfg or None)
 
 
-def _complete(provider: Any, system: str, messages: list[dict],
-              *, max_tokens: int = 4096) -> str:
+def _complete(
+    provider: Any, system: str, messages: list[dict], *, max_tokens: int = 4096
+) -> str:
     """Oneshot completion; tool_choice is none by construction (no tools passed)."""
     text = provider.complete(system, messages, max_tokens=max_tokens)
     if isinstance(text, tuple):
@@ -213,9 +216,74 @@ def _complete(provider: Any, system: str, messages: list[dict],
     return (text or "").strip()
 
 
+class SessionCommandUnavailable(RuntimeError):
+    """A command requiring a live Chudcode session could not be served."""
+
+
+def _offline_enabled() -> bool:
+    try:
+        from services.agent.config import offline_enabled  # noqa: PLC0415
+
+        return offline_enabled()
+    except Exception:  # noqa: BLE001 - unreadable config is not an offline opt-in
+        return False
+
+
+def _local_compaction(standalone: bool) -> bool:
+    return bool(standalone) or _offline_enabled()
+
+
+def _chudcode_session_call(
+    session_id: str | None,
+    command: str,
+    params: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    key = str(session_id or "").strip()
+    if not key:
+        raise SessionCommandUnavailable(
+            f"{command} requires a live Chudcode session_id; "
+            "pass standalone=True only for explicit local/offline use"
+        )
+    try:
+        from services.agent.chudcode_host import (  # noqa: PLC0415
+            get_default_chudcode_host,
+        )
+
+        result = get_default_chudcode_host().session_call(key, command, params)
+    except Exception as exc:  # noqa: BLE001 - process boundary
+        raise SessionCommandUnavailable(
+            f"Chudcode session {command} unavailable: {exc}"
+        ) from exc
+    if not isinstance(result, dict):
+        raise SessionCommandUnavailable(
+            f"Chudcode session {command} returned a non-object response"
+        )
+    if result.get("ok") is False:
+        reason = str(result.get("reason") or result.get("error") or "request failed")
+        raise SessionCommandUnavailable(
+            f"Chudcode session {command} unavailable: {reason}"
+        )
+    return result
+
+
+def set_auto_compaction(session_id: str, enabled: bool) -> dict[str, Any]:
+    """Set Chudcode's per-session automatic compaction authority."""
+    return _chudcode_session_call(
+        session_id, "set_auto_compaction", {"enabled": bool(enabled)}
+    )
+
+
+def set_auto_retry(session_id: str, enabled: bool) -> dict[str, Any]:
+    """Set Chudcode's per-session retry/cache policy."""
+    return _chudcode_session_call(
+        session_id, "set_auto_retry", {"enabled": bool(enabled)}
+    )
+
+
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
+
 
 def handoff_document(
     messages: list,
@@ -265,22 +333,15 @@ def compact_session(
     supersede_reads: bool = True,
     drop_useless: bool = True,
     prior_archive: dict | None = None,
-    provider: dict | None = None,
     session_id: str | None = None,
+    instructions: str | None = None,
+    standalone: bool = False,
 ) -> dict:
-    """Thin wrapper over compaction engines.
+    """Compact one session without creating a second compaction authority.
 
-    ``strategy`` ∈ ``off`` | ``snapcompact`` | ``shake`` | ``summary``.
-    Returns ``{kept_messages, archive?, summary, short_summary}`` (plus
-    optional ``saved_tokens`` for shake).
-
-    ``provider`` (``{"provider": <name>, "model": <id>}`` — the host's active
-    provider override) resolves the snap-render spec: under the omp backend a
-    vision provider gets PNG snap frames, anything else stays text-only.
-    ``session_id`` anchors the re-snap chain across rounds (the snap store
-    tracks the session's latest snap). The rebuilt conversation — archive
-    message (reinject) + kept tail — is returned as ``messages`` so the caller
-    can apply it wholesale instead of silently dropping the archive.
+    A live online session delegates to Chudcode's ``compact`` command. Local
+    transcript rewriting is available only with ``standalone=True`` or when
+    Chudware is explicitly offline.
     """
     msgs = _snapshot_messages(messages)
     strat = (strategy or "off").strip().lower()
@@ -290,13 +351,16 @@ def compact_session(
             "summary": "",
             "short_summary": "",
         }
+    if not _local_compaction(standalone):
+        payload = {}
+        note = str(instructions or "").strip()
+        if note:
+            payload["customInstructions"] = note
+        return _chudcode_session_call(session_id, "compact", payload)
 
     comp = importlib.import_module("services.agent.compaction")
-
     if strat == "shake":
-        result = comp.shake_messages(
-            msgs, mode="elide", aggressive=False,
-        )
+        result = comp.shake_messages(msgs, mode="elide", aggressive=False)
         return {
             "kept_messages": result.get("messages", msgs),
             "summary": "",
@@ -304,27 +368,12 @@ def compact_session(
             "saved_tokens": int(result.get("saved_tokens") or 0),
         }
 
-    spec = None
-    if isinstance(provider, dict) and (provider.get("provider") or provider.get("model")):
-        try:
-            from services.agent.snap_spec import spec_for  # noqa: PLC0415
-            spec = spec_for(
-                str(provider.get("provider") or "") or None,
-                str(provider.get("model") or "") or None,
-                vision=provider.get("vision") if isinstance(provider.get("vision"), bool) else None,
-            )
-        except Exception:  # noqa: BLE001 — spec resolution must never break compaction
-            spec = None
-
-    # snapcompact + summary share the archive engine (summary text from archive)
     result = comp.snapcompact_archive(
         msgs,
         keep_recent_tokens=int(keep_recent_tokens),
         prior_archive=prior_archive,
         supersede_reads=bool(supersede_reads),
         drop_useless=bool(drop_useless),
-        provider=spec,
-        session_id=str(session_id) if session_id else None,
     )
     out: dict[str, Any] = {
         "kept_messages": result.get("kept_messages", msgs),
@@ -335,10 +384,7 @@ def compact_session(
         out["archive"] = result["archive"]
     if "cut_index" in result:
         out["cut_index"] = result["cut_index"]
-    try:
-        out["messages"] = comp.reinject_archive(result, provider=spec) + out["kept_messages"]
-    except Exception:  # noqa: BLE001 — fall back to the bare kept tail
-        pass
+    out["messages"] = comp.reinject_archive(result) + out["kept_messages"]
     return out
 
 
@@ -348,11 +394,13 @@ def shake_session(
     mode: str = "elide",
     aggressive: bool = False,
     keep_boundary_index: int | None = None,
+    standalone: bool = False,
 ) -> dict:
-    """Thin wrapper over ``compaction.shake_messages``.
-
-    Returns ``{messages, saved_tokens, notice}`` for the RPC layer.
-    """
+    """Mechanically elide a transcript only for explicit offline/standalone use."""
+    if not _local_compaction(standalone):
+        raise SessionCommandUnavailable(
+            "local session shake is unavailable for online Chudcode sessions"
+        )
     msgs = _snapshot_messages(messages)
     comp = importlib.import_module("services.agent.compaction")
 
@@ -382,8 +430,11 @@ def shake_session(
 
 
 __all__ = [
+    "SessionCommandUnavailable",
     "handoff_document",
     "btw_answer",
     "compact_session",
     "shake_session",
+    "set_auto_compaction",
+    "set_auto_retry",
 ]

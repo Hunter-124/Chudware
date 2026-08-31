@@ -3,6 +3,7 @@
 (The legacy loop.py overflow-helper tests that used to live here were removed in
 T-RF5 with the loop itself.)
 """
+
 from __future__ import annotations
 
 from services.agent import compaction as compact
@@ -262,31 +263,37 @@ def test_reinject_archive() -> None:
 
 def test_strategy_config_defaults() -> None:
     assert agent_config.get_compaction_strategy({}) == "off"
-    assert agent_config.get_compaction_strategy(
-        {"agent": {"compaction_strategy": "snapcompact"}}
-    ) == "snapcompact"
-    assert agent_config.get_compaction_strategy(
-        {"agent": {"compaction_strategy": "nope"}}
-    ) == "off"
+    assert (
+        agent_config.get_compaction_strategy(
+            {"agent": {"compaction_strategy": "snapcompact"}}
+        )
+        == "snapcompact"
+    )
+    assert (
+        agent_config.get_compaction_strategy({"agent": {"compaction_strategy": "nope"}})
+        == "off"
+    )
     cc = agent_config.get_compaction_config({})
     assert cc["supersede_reads"] is True
     assert cc["drop_useless"] is True
     assert cc["keep_recent_tokens"] == 20_000
-    assert agent_config.prewalk_enabled({}) is False
-    assert agent_config.get_prewalk_target({}) == "@smol"
-    assert agent_config.handoff_save_to_disk({}) is False
-    assert agent_config.prewalk_enabled({"agent": {"prewalk": True}}) is True
-    assert agent_config.get_prewalk_target(
-        {"agent": {"prewalk_target": "@fast"}}
-    ) == "@fast"
-    assert agent_config.handoff_save_to_disk(
-        {"agent": {"handoff_save_to_disk": True}}
-    ) is True
+    for removed in (
+        "memory_backend",
+        "compaction_backend",
+        "compaction_snap_frames",
+        "compaction_snap_dir",
+        "compaction_snap_max_frames",
+        "prewalk_enabled",
+        "get_prewalk_target",
+        "handoff_save_to_disk",
+    ):
+        assert not hasattr(agent_config, removed)
 
 
 # ---------------------------------------------------------------------------
 # revert-safety: compaction must never mutate persisted history
 # ---------------------------------------------------------------------------
+
 
 def test_rpc_wrappers_never_mutate_caller_messages() -> None:
     """Revert depends on the chat transcript surviving compaction untouched.
@@ -300,17 +307,20 @@ def test_rpc_wrappers_never_mutate_caller_messages() -> None:
     fat = "Z" * 6000
     msgs = [
         _user("build a bracket " + fat),
-        _assistant_call("c1", "add_features", {"ops": [{"op": "box"}]},
-                        intent="make box"),
+        _assistant_call(
+            "c1", "add_features", {"ops": [{"op": "box"}]}, intent="make box"
+        ),
         _tool("c1", "W" * 5000, name="add_features"),
         _assistant_text("done " + fat),
     ] * 4
     before = _copy.deepcopy(msgs)
 
-    out = sc.compact_session(msgs, "snapcompact", keep_recent_tokens=200)
+    out = sc.compact_session(
+        msgs, "snapcompact", keep_recent_tokens=200, standalone=True
+    )
     assert msgs == before  # caller's history untouched
     assert out["kept_messages"] is not msgs
 
-    out2 = sc.shake_session(msgs, mode="elide", aggressive=True)
+    out2 = sc.shake_session(msgs, mode="elide", aggressive=True, standalone=True)
     assert msgs == before  # in-place elision hit the copy, never the caller
     assert out2["messages"] is not msgs

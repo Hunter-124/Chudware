@@ -8,6 +8,7 @@
 
 #include "../web_capabilities.h"    // ui::webGapReason — subscription sign-in is not a web path
 #include "../web_provider_keys.h"   // per-account BYOK on web (/api/providers/keys)
+#include "../chudcode_descriptors.h" // ui::parseChudcode* — Chudcode worker payload parsing
 
 namespace ui {
 
@@ -44,7 +45,7 @@ bool anyProbeInFlight() {
 // "gemini" | "anthropic" and answers {"ok":false,"error":"unknown provider"} for anything else,
 // so the slots with no branch return nullptr and are NEVER probed: Cursor and Kimi Code are
 // subscription-proxied with no list endpoint here, and ZenMux is bridge-routed (its catalog
-// arrives via refreshBridgeModelCatalog / agent_models_list). Probing them would only paint a
+// arrives via refreshBridgeModelCatalog / chudcode_models_list). Probing them would only paint a
 // bogus "unknown provider" into providerModels and make the provider look broken.
 const char* listModelsWireProvider(int provider) {
     switch (provider) {
@@ -130,8 +131,8 @@ void refreshModelAvailability(AppState& st, bool force) {
 
     Settings& s = st.settings;
     // (1) The ACTIVE provider when it is a cloud one. Cloud lists are LIVE (the backend asks the
-    // provider's /v1/models, through the OMP bridge when the credential is an OAuth/subscription
-    // token), which is what makes a brand-new release appear in the picker with no code change.
+    // provider's /v1/models, through the Chudcode service when the credential is an
+    // OAuth/subscription token), which makes a brand-new release appear with no code change.
     // Send that provider's OWN credential, and its base_url only where one is meaningful: the
     // cloud-compat slot's URL picks the service (OpenRouter / DashScope / DeepSeek / Moonshot),
     // while Anthropic / OpenAI / Gemini / xAI each have a fixed endpoint the backend defaults to
@@ -263,7 +264,7 @@ static void drawWebProviderKeyForm(AppState& st) {
     const std::string provider = ui::webProviderKeyName(s.provider, s.baseUrl);
     if (provider.empty()) {
         dimText("There is no per-account credential for this provider in the browser: it is either "
-                "a subscription or OMP-bridge grant held by the shared engine, or a service the "
+                "a subscription or Chudcode-service grant held by the shared engine, or a service the "
                 "server has no validation endpoint for. Anthropic, OpenAI, Gemini, xAI, OpenRouter "
                 "and Moonshot take your own key \xe2\x80\x94 add it under Settings \xe2\x86\x92 "
                 "Providers.");
@@ -335,10 +336,10 @@ static void drawWebProviderKeyForm(AppState& st) {
 // Every provider card routes its credential copy through here, which is why the web path is
 // installed at this one seam: all of them gain the working form at once.
 //
-// Desktop: the AI tab never holds credentials. Settings -> Providers validates a key and the OMP
-// AuthStorage flow persists it, so this is the pointer to that tab.
+// Desktop: the AI tab never holds credentials. Settings -> Providers validates a key and the
+// Chudcode auth store persists it, so this is the pointer to that tab.
 //
-// Web: that tab cannot work. It drives agent_provider_* RPCs, which the gateway refuses for every
+// Web: that tab cannot work. It drives chudcode_* auth RPCs, which the gateway refuses for every
 // account that is not an admin (Webservice/gateway/engine_bridge.py), and a credential written
 // through it would land in the ONE shared daemon's auth db belonging to the operator rather than
 // to the signed-in account. The account-scoped endpoint is the browser's real path, so on web
@@ -358,7 +359,7 @@ static void drawValidatedCredentialHint(AppState& st, const char* detail) {
 // Free AI (FreeLLMAPI, github.com/tashfeenahmed/freellmapi) provider card — reused from BOTH
 // the classic Settings -> AI provider picker and the live Settings -> Providers tab. Endpoint
 // and model controls remain here; credentials never do. All keys are validated and stored by
-// the OMP AuthStorage flow in Settings -> Providers.
+// the Chudcode auth flow in Settings -> Providers.
 // Returns true when a non-credential field changed (caller saves).
 bool drawFreeAiProviderCard(AppState& st) {
     Settings& s = st.settings;
@@ -690,7 +691,7 @@ bool drawAiSettingsSection(AppState& st, bool busy, AiSettingsSection section) {
     ImGui::Dummy(ImVec2(0, 6 * S));
     if (s.provider == ui::PROV_CLOUDCOMPAT) {
         // Cloud OpenAI-compatible endpoint. Credentials are intentionally absent from this AI
-        // tab: Settings -> Providers validates them before the OMP AuthStorage persists them.
+        // tab: Settings -> Providers validates them before the Chudcode auth store persists them.
         const char* svc = ui::cloudServiceKey(s.baseUrl);
         const bool isOR = (std::strcmp(svc, "openrouter") == 0);
         const bool isMS = (std::strcmp(svc, "moonshot") == 0);
@@ -705,7 +706,7 @@ bool drawAiSettingsSection(AppState& st, bool busy, AiSettingsSection section) {
             changed = true;
         drawValidatedCredentialHint(
             st, bridgeAuth
-                    ? "This service uses the OMP bridge credential store. Add or replace its credential under Settings \xe2\x86\x92 Providers."
+                    ? "This service uses the Chudcode credential store. Add or replace its credential under Settings \xe2\x86\x92 Providers."
                     : "API keys are no longer pasted into the AI tab. Add one under Settings \xe2\x86\x92 Providers; it is saved only after the provider validates it.");
     } else if (s.provider == ui::PROV_FREELLMAPI) {
         if (drawFreeAiProviderCard(st)) changed = true;
@@ -869,9 +870,9 @@ bool drawAiSettingsSection(AppState& st, bool busy, AiSettingsSection section) {
     } else if (s.provider == ui::PROV_CURSOR || s.provider == ui::PROV_KIMISUB) {
         // Subscription-only providers: no API key field — the credential is an OAuth grant.
         if (s.provider == ui::PROV_KIMISUB) {
-            dimText("Kimi Code (OMP bridge). Sign in under Settings \xe2\x86\x92 Providers; the "
-                    "bridge resolves the credential from its own auth db — no Moonshot API key "
-                    "required for this path.");
+            dimText("Kimi Code (Chudcode service). Sign in under Settings \xe2\x86\x92 Providers; "
+                    "the service resolves the credential from its own auth store — no Moonshot "
+                    "API key required for this path.");
             ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(ui::palette.textDim));
             ImGui::TextUnformatted("Wire provider: kimi-code \xc2\xb7 model: k3 (default)");
             ImGui::PopStyleColor();
@@ -884,10 +885,10 @@ bool drawAiSettingsSection(AppState& st, bool busy, AiSettingsSection section) {
         }
         if (ImGui::Checkbox("Model supports vision (send screenshots)", &s.vision)) changed = true;
     } else if (s.provider == ui::PROV_ZENMUX) {
-        // OMP-bridge provider — the credential lives in the bridge's own auth db, wired up via
-        // Settings → Providers sign-in (drawOmpProviderManager), not a local config.json key.
-        dimText("ZenMux (OMP bridge). Sign in under Settings \xe2\x86\x92 Providers; no API key "
-                "field here — the bridge resolves the credential from its own auth db.");
+        // Chudcode-service provider — the credential lives in the service's own auth store,
+        // wired up via Settings → Providers sign-in (drawOmpProviderManager), not config.json.
+        dimText("ZenMux (Chudcode service). Sign in under Settings \xe2\x86\x92 Providers; no API "
+                "key field here — the service resolves the credential from its own auth store.");
         ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(ui::palette.textDim));
         ImGui::TextUnformatted("Wire provider: zenmux \xc2\xb7 model: x-ai/grok-4.5-free (default)");
         ImGui::PopStyleColor();
@@ -1426,7 +1427,7 @@ static void pollSubConnected(AppState& st) {
 bool providerUsable(AppState& st, int provider) {
     pollSubConnected(st);
     // A SUCCESSFUL live probe is proof of a working credential — and for a subscription/OAuth
-    // user it is the ONLY proof, because their token lives in the OMP bridge auth db rather than
+    // user it is the ONLY proof, because their token lives in the Chudcode auth store rather than
     // in a local key buffer or subscription_auth. agent_list_models reports ok=true in exactly
     // that case (see the anthropic branch in libchudware.cpp); keying availability off the local
     // key alone is what hid Anthropic from those users. Limited to providers whose list endpoint
@@ -1463,7 +1464,7 @@ bool providerUsable(AppState& st, int provider) {
         case ui::PROV_LLAMACPP:    return st.providerModels[ui::PROV_LLAMACPP].ok;
         case ui::PROV_CURSOR:      return s_subConn.cursor;
         case ui::PROV_KIMISUB:     return s_subConn.kimi;
-        // ZenMux — OMP-bridge credential lives in the bridge's own auth db (Settings → Providers),
+        // ZenMux — Chudcode-service credential lives in the service's auth store (Settings → Providers),
         // not a locally-polled subscription/key flag this file can cheaply check. Always offered;
         // an unsigned-in bridge surfaces a normal auth error from the backend on send, same class
         // as any other unconfigured provider.
@@ -1486,12 +1487,12 @@ bool moonshotKeyPresent(AppState& st) {
            ui::webProviderKeyPresent("moonshot");
 }
 
-// ============================ OMP bridge model catalog + session cost (S-UI-PROV) ===
-// Static OMP catalog (capabilities + $/Mtok cost) via the libchudware `agent_models_list` C-ABI
-// (bridge `models_list`), and the per-session cost strip via `agent_cost_summary` (a pure
-// calculator — the UI supplies the session's token events, the bridge prices them). Both
-// degrade permanently on unknown_method (sibling slice absent / older core) and quietly keep
-// the last good data on soft failures.
+// ============================ Chudcode model catalog + session cost (S-UI-PROV) ===
+// Static model catalog (capabilities + $/Mtok cost) via the Chudcode worker's
+// `chudcode_models_list`, and the per-session cost strip via `chudcode_session_stats`
+// (authoritative per-session accounting on the Chudcode host). Both degrade permanently on
+// unknown_method (sibling slice absent / older service) and quietly keep the last good data
+// on soft failures.
 
 namespace {
 
@@ -1624,11 +1625,11 @@ bool isDeprecatedModelId(const std::string& id) {
 void refreshBridgeModelCatalog(AppState& st, bool force) {
     if (!s_bridgeCatalogAvailable || s_bridgeCatalogInFlight) return;
     const double now = ImGui::GetTime();
-    // Catalog changes slowly (only on a bridge/OMP update) — 5-min TTL like the usage polls.
+    // Catalog changes slowly (only on a Chudcode update) — 5-min TTL like the usage polls.
     if (!force && (now - s_bridgeCatalogLastFetch) < 300.0) return;
     s_bridgeCatalogLastFetch = now;
     s_bridgeCatalogInFlight = true;
-    st.rpc.call("agent_models_list", nlohmann::json::object(),
+    st.rpc.call("chudcode_models_list", nlohmann::json::object(),
                 [](const core::RpcResult& r) {
         s_bridgeCatalogInFlight = false;
         if (bridgeRpcAbsent(r)) {
@@ -1706,7 +1707,7 @@ const ui::BridgeModelMeta* bridgeModelMeta(const std::string& providerId,
 
 const ui::BridgeModelMeta* bridgeModelMetaForCad(int cadProvider, const std::string& modelId,
                                                      const char* cloudBaseUrl) {
-    // CAD ProviderIndex -> OMP catalog provider id (the bridge-routed subset; local endpoints
+    // CAD ProviderIndex -> Chudcode catalog provider id (the service-routed subset; local endpoints
     // have no catalog rows and simply get no sublabel).
     std::string prov;
     switch (cadProvider) {
@@ -1739,7 +1740,7 @@ bool bridgeProviderIsLocalFree(const std::string& providerId) {
 }
 
 std::string bridgeModelSublabel(const ui::BridgeModelMeta& m) {
-    // "ctx 200k \xc2\xb7 $3/$15 \xc2\xb7 tools vision" — OMP model-browser.ts row format.
+    // "ctx 200k \xc2\xb7 $3/$15 \xc2\xb7 tools vision" — Chudcode model-browser row format.
     std::string out;
     if (m.contextWindow > 0) {
         char buf[24];
@@ -1770,7 +1771,7 @@ std::string bridgeModelSublabel(const ui::BridgeModelMeta& m) {
 }
 
 std::string bridgeModelCostDetail(const ui::BridgeModelMeta& m) {
-    // Tooltip line: full precision + cache pricing (OMP keeps cache cost off the row).
+    // Tooltip line: full precision + cache pricing (the catalog keeps cache cost off the row).
     std::string out;
     if (m.priced) {
         out = "in " + fmtUsd(m.costIn) + "/M \xc2\xb7 out " + fmtUsd(m.costOut) + "/M";
@@ -1779,7 +1780,7 @@ std::string bridgeModelCostDetail(const ui::BridgeModelMeta& m) {
     } else if (bridgeProviderIsLocalFree(m.provider)) {
         out = "runs locally \xe2\x80\x94 no per-token charge";
     } else {
-        out = "no price in the OMP catalog \xe2\x80\x94 spend can't be computed for this model";
+        out = "no price in the Chudcode catalog \xe2\x80\x94 spend can't be computed for this model";
     }
     if (m.maxTokens > 0) {
         char buf[24];
@@ -1797,16 +1798,15 @@ struct CostModelRow {
     std::string provider;
     std::string model;
     double usd = 0;
-    int tokensIn = 0, tokensOut = 0;
-    bool priced = false;   // bridge pricing provenance: false = no catalog price, NOT free
+    long long tokensIn = 0, tokensOut = 0;
+    bool priced = false;   // pricing provenance: false = no catalog price, NOT free
 };
 double s_costUsd = 0;
-int s_costTin = 0, s_costTout = 0;
+bool s_costHasUsd = false;         // the service reported a dollar figure at all
+long long s_costTin = 0, s_costTout = 0;
 std::vector<CostModelRow> s_costRows;
-// Pricing provenance of the aggregate, straight from cost_summary. These three range over the
-// models that actually MOVED tokens (pricedModels + unpricedModels.size() == totalModels), so
-// s_costUsd is a FLOOR whenever s_costUnpriced is non-empty: those models' tokens are counted
-// but add $0 to the dollars.
+// Provenance of the aggregate over the models that actually MOVED tokens: s_costUsd is a
+// FLOOR whenever s_costUnpriced is non-empty — those models' tokens are counted but add $0.
 int s_costPricedModels = 0;
 int s_costTotalModels = 0;
 std::vector<std::string> s_costUnpriced;   // "<provider>/<model>", displayed verbatim
@@ -1814,9 +1814,9 @@ bool s_costAvailable = true;   // false after unknown_method
 bool s_costInFlight = false;
 bool s_costHasData = false;
 double s_costLastFetch = -1e9;
-// Fingerprint of the events array last priced (turn count + total tokens) — events only grow
-// within a conversation, and a conversation switch changes the totals, so this refires exactly
-// when the visible session's completed turns change (plus a 30s refresh while open).
+// Session + completed-turn fingerprint last priced — a conversation switch or a finished
+// turn refires immediately; otherwise a 30s TTL refreshes while the strip is visible.
+std::string s_costSession;
 long long s_costFingerprint = -1;
 
 }  // namespace
@@ -1825,100 +1825,77 @@ void drawSessionCostStrip(AppState& st) {
     if (!s_costAvailable) return;
     const float sc = ui::uiScale;
 
-    // Rebuild the session's token events from completed assistant turns: ChatMsg.model is the
-    // model id at run start, and rowKind-0 activity rows carry per-stage tokens (the same sum
-    // the chat footer shows, chat_log.cpp). agent_cost_summary is a pure calculator, so the
-    // full event list is re-sent each poll — no accumulation state to drift.
-    nlohmann::json events = nlohmann::json::array();
+    // The Chudcode host owns the session's accounting: chudcode_session_stats prices the
+    // session it actually ran, so the UI no longer rebuilds token events and re-sends them
+    // to a bridge calculator. Refire on a conversation switch or when a turn completes
+    // (turn-count + local token fingerprint), plus a 30s TTL while the strip is visible.
+    const std::string sess = st.activeConvId();
+    if (sess.empty()) return;
     long long fp = 0;
     for (const auto& m : st.chat) {
-        if (m.fromUser || m.running || m.model.empty()) continue;
-        int tin = 0, tout = 0;
+        if (m.fromUser || m.running) continue;
+        long long tin = 0, tout = 0;
         for (const auto& a : m.activity) {
             if (a.rowKind != 0) continue;
             tin += a.tokensIn;
             tout += a.tokensOut;
         }
-        if (tin <= 0 && tout <= 0) continue;
-        // The bridge prices by (provider, model); recover the OMP provider id from the catalog.
-        const ui::BridgeModelMeta* meta = bridgeModelMeta("", m.model);
-        if (!meta || meta->provider.empty()) continue;
         fp += 1 + tin + tout;
-        events.push_back({{"provider", meta->provider},
-                          {"model", m.model},
-                          {"input", tin},
-                          {"output", tout}});
     }
     const double now = ImGui::GetTime();
-    if (!s_costInFlight && (fp != s_costFingerprint || (now - s_costLastFetch) > 30.0)) {
+    if (!s_costInFlight && (sess != s_costSession || fp != s_costFingerprint ||
+                            (now - s_costLastFetch) > 30.0)) {
+        if (sess != s_costSession) s_costHasData = false;   // never show another session's bill
+        s_costSession = sess;
         s_costFingerprint = fp;
         s_costLastFetch = now;
         s_costInFlight = true;
-        st.rpc.call("agent_cost_summary", nlohmann::json{{"events", events}},
-                    [](const core::RpcResult& r) {
+        st.rpc.call("chudcode_session_stats", nlohmann::json{{"session_id", sess}},
+                    [sess](const core::RpcResult& r) {
             s_costInFlight = false;
             if (bridgeRpcAbsent(r)) {
                 s_costAvailable = false;
                 s_costHasData = false;
                 return;
             }
-            if (!r.ok || !r.result.is_object() || !r.result.value("ok", true)) return;
-            const auto total = r.result.find("total");
-            if (total != r.result.end() && total->is_object()) {
-                s_costUsd = total->value("usd", 0.0);
-                const auto tok = total->find("tokens");
-                if (tok != total->end() && tok->is_object()) {
-                    s_costTin = tok->value("input", 0);
-                    s_costTout = tok->value("output", 0);
-                }
-            }
+            if (s_costSession != sess) return;   // conversation switched mid-flight
+            ui::ChudcodeSessionStats stats;
+            if (!r.ok || !ui::parseChudcodeSessionStats(r.result, stats))
+                return;   // soft fail — keep the last good data
+            s_costUsd = stats.usd;
+            s_costHasUsd = stats.hasCost;
+            s_costTin = stats.tokensIn;
+            s_costTout = stats.tokensOut;
             s_costRows.clear();
             s_costUnpriced.clear();
             s_costPricedModels = 0;
             s_costTotalModels = 0;
-            const auto pm = r.result.find("perModel");
-            if (pm != r.result.end() && pm->is_array()) {
-                for (const auto& row : *pm) {
-                    if (!row.is_object()) continue;
-                    CostModelRow cr;
-                    cr.provider = row.value("provider", std::string());
-                    cr.model = row.value("model", std::string());
-                    cr.usd = row.value("usd", 0.0);
-                    const auto tok = row.find("tokens");
-                    if (tok != row.end() && tok->is_object()) {
-                        cr.tokensIn = tok->value("input", 0);
-                        cr.tokensOut = tok->value("output", 0);
-                    }
-                    if (row.contains("priced") && row["priced"].is_boolean())
-                        cr.priced = row["priced"].get<bool>();
-                    else if (const ui::BridgeModelMeta* meta =
-                                 bridgeModelMeta(cr.provider, cr.model))
-                        cr.priced = meta->priced;   // bridge predating the field
-                    s_costRows.push_back(std::move(cr));
-                }
+            for (const auto& m : stats.models) {
+                CostModelRow cr;
+                cr.provider = m.provider;
+                cr.model = m.model;
+                cr.usd = m.usd;
+                cr.tokensIn = m.tokensIn;
+                cr.tokensOut = m.tokensOut;
+                cr.priced = m.priced;
+                if (!cr.priced)
+                    if (const ui::BridgeModelMeta* meta = bridgeModelMeta(cr.provider, cr.model))
+                        cr.priced = meta->priced;   // stats predating the field
+                s_costRows.push_back(std::move(cr));
             }
-            // Provenance counters come from the bridge: they range over the models that actually
-            // moved tokens, which is exactly the population the strip talks about, and
-            // pricedModels + unpricedModels.size() == totalModels. A bridge predating them is
-            // reconstructed from the rows over the same population, so an old bridge degrades to
-            // the same honest answer instead of implying a complete figure.
-            const auto tm = r.result.find("totalModels");
-            if (tm != r.result.end() && tm->is_number_integer()) {
-                s_costTotalModels = tm->get<int>();
-                s_costPricedModels = r.result.value("pricedModels", 0);
-                const auto up = r.result.find("unpricedModels");
-                if (up != r.result.end() && up->is_array())
-                    for (const auto& e : *up)
-                        if (e.is_string()) s_costUnpriced.push_back(e.get<std::string>());
-            } else {
-                for (const auto& row : s_costRows) {
-                    if (row.tokensIn <= 0 && row.tokensOut <= 0) continue;
-                    ++s_costTotalModels;
-                    if (row.priced) ++s_costPricedModels;
-                    else s_costUnpriced.push_back(row.provider + "/" + row.model);
-                }
+            // Provenance over the models that actually moved tokens — exactly the population
+            // the strip talks about. Reconstructed locally so an older service that omits the
+            // counters degrades to the same honest answer instead of implying completeness.
+            for (const auto& row : s_costRows) {
+                if (row.tokensIn <= 0 && row.tokensOut <= 0) continue;
+                ++s_costTotalModels;
+                if (row.priced) ++s_costPricedModels;
+                else s_costUnpriced.push_back(row.provider.empty()
+                                                  ? row.model
+                                                  : row.provider + "/" + row.model);
             }
-            s_costHasData = true;
+            // A session with no dollar figure and no tokens yet has nothing honest to show.
+            s_costHasData = stats.hasCost || s_costTin > 0 || s_costTout > 0;
         }, 15000);
     }
     if (!s_costHasData) return;
@@ -1936,7 +1913,9 @@ void drawSessionCostStrip(AppState& st) {
         std::snprintf(tokBuf, sizeof(tokBuf), "%.1fM tok", tokTotal / 1.0e6);
     else
         std::snprintf(tokBuf, sizeof(tokBuf), "%lldk tok", tokTotal / 1000);
-    if (incomplete)
+    if (!s_costHasUsd)
+        std::snprintf(line, sizeof(line), "Session %s \xc2\xb7 no cost reported", tokBuf);
+    else if (incomplete)
         std::snprintf(line, sizeof(line),
                       "Session >= %s \xc2\xb7 %s \xc2\xb7 %d of %d models priced",
                       fmtUsd(s_costUsd).c_str(), tokBuf, s_costPricedModels, s_costTotalModels);
@@ -1952,7 +1931,7 @@ void drawSessionCostStrip(AppState& st) {
         if (incomplete) {
             tip = "This is a FLOOR, not a bill: only " + std::to_string(s_costPricedModels) +
                   " of " + std::to_string(s_costTotalModels) +
-                  " models that spent tokens have a price in the OMP catalog.\n"
+                  " models that spent tokens have a price in the Chudcode catalog.\n"
                   "No price data for: ";
             const size_t kShow = 6;
             for (size_t i = 0; i < s_costUnpriced.size() && i < kShow; ++i) {
@@ -1963,12 +1942,14 @@ void drawSessionCostStrip(AppState& st) {
                 tip += ", +" + std::to_string(s_costUnpriced.size() - kShow) + " more";
             tip += ".\nTheir tokens are counted in the token total but add $0 to the dollar "
                    "figure, so real spend is higher by an unknown amount.\n"
-                   "The priced part is catalog pricing \xc3\x97 completed-turn tokens.\n"
+                   "The priced part is Chudcode session accounting.\n"
                    "Click for the per-model breakdown.";
-        } else {
-            tip = "OMP-observed spend (catalog pricing \xc3\x97 session tokens) \xe2\x80\x94 not "
-                  "a bill, but every model that spent tokens here has a catalog price.\n"
+        } else if (!s_costHasUsd) {
+            tip = "Chudcode reported this session's token movement but no dollar figure.\n"
                   "Click for the per-model breakdown.";
+        } else {
+            tip = "Chudcode session accounting \xe2\x80\x94 what this session's turns "
+                  "actually cost, not a bill.\nClick for the per-model breakdown.";
         }
         ImGui::SetTooltip("%s", tip.c_str());
     }
@@ -1986,7 +1967,7 @@ void drawSessionCostStrip(AppState& st) {
             ImGui::TextUnformatted(row.model.c_str());
             ImGui::SameLine(220.0f * sc);
             ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(ui::palette.textDim));
-            ImGui::Text("%d in / %d out", row.tokensIn, row.tokensOut);
+            ImGui::Text("%lld in / %lld out", row.tokensIn, row.tokensOut);
             ImGui::PopStyleColor();
             ImGui::SameLine(380.0f * sc);
             // An unpriced row's usd is 0 because nothing priced it, not because it was free:
@@ -2033,12 +2014,12 @@ static bool modelRow(AppState& st, int provider, const std::string& id, const st
     // The caller applies the pick AFTER this returns, so the glyphs below would otherwise
     // paint from pre-click state: the row you just clicked drew unchecked for a frame.
     if (clicked && usable) current = true;
-    // OMP catalog sublabel (ctx / cost / capabilities) for bridge-routed providers.
+    // Chudcode catalog sublabel (ctx / cost / capabilities) for service-routed providers.
     const ui::BridgeModelMeta* meta = bridgeModelMetaForCad(provider, id, st.settings.baseUrl);
     const std::string sublabel = meta ? bridgeModelSublabel(*meta) : std::string();
     if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
         // Full model name + provider for the composer overlay picker; cost detail (cache
-        // pricing, max output) rides the tooltip per the OMP model-browser convention.
+        // pricing, max output) rides the tooltip per the Chudcode model-browser convention.
         if (meta) {
             const std::string detail = bridgeModelCostDetail(*meta);
             if (!detail.empty())
@@ -2073,7 +2054,7 @@ static bool modelRow(AppState& st, int provider, const std::string& id, const st
         dl->AddText(ImVec2(mx.x - hw - 8 * sc, midY - fh * 0.5f),
                     ui::Palette::toU32(pal.accent), hint);
     } else if (!sublabel.empty()) {
-        // Right-aligned dim "ctx 200k \xc2\xb7 $3/$15 \xc2\xb7 tools vision" (OMP model-browser row).
+        // Right-aligned dim "ctx 200k \xc2\xb7 $3/$15 \xc2\xb7 tools vision" (Chudcode model row).
         const float sw = ImGui::CalcTextSize(sublabel.c_str()).x;
         if (mn.x + gut + lw + 8 * sc + 60.0f * sc < mx.x - sw - 8 * sc)
             dl->AddText(ImVec2(mx.x - sw - 8 * sc, midY - fh * 0.5f),
@@ -2086,8 +2067,8 @@ static bool modelRow(AppState& st, int provider, const std::string& id, const st
 // One-time model-picker default seeding: on first run keep only the top 3 models per provider
 // enabled (the rest go into hiddenModels) so a fresh install's composer picker isn't flooded.
 // Runs once — settings.modelDefaultsSeeded flips and the user's explicit choices win after that.
-// The ACTIVE model is never hidden. Bridge (OMP) seeding needs the async catalog; when it hasn't
-// arrived yet we still seed the builtin half so the picker is sane on builtin alone.
+// The ACTIVE model is never hidden. Chudcode catalog seeding needs the async catalog; when it
+// hasn't arrived yet we still seed the builtin half so the picker is sane on builtin alone.
 static void seedModelDefaultsOnce(AppState& st) {
     if (st.settings.modelDefaultsSeeded) return;
     const std::string active = st.settings.model;
@@ -2103,7 +2084,7 @@ static void seedModelDefaultsOnce(AppState& st) {
             hideUnlessActive(m.id);
         }
     }
-    // (b) Bridge (OMP) catalog, pre-sorted per provider (non-deprecated first, newest first):
+    // (b) Chudcode catalog, pre-sorted per provider (non-deprecated first, newest first):
     // the first 3 non-deprecated rows stay enabled; everything else — including ALL deprecated
     // rows — hides. Skipped while the catalog is empty (first async fetch not back yet).
     if (!ui::bridgeModelCatalog().empty()) {
@@ -2131,7 +2112,7 @@ struct DeadCredProvider {
 std::vector<DeadCredProvider> s_deadCredProviders;
 }  // namespace
 
-// Poll agent_provider_list so the composer knows which OMP providers are signed in WITHOUT the
+// Poll chudcode_provider_list so the composer knows which providers are signed in WITHOUT the
 // user having opened Settings -> Providers. Fills st.signedInBridgeProviders (same set the
 // Providers panel writes) so the dropdown mirrors the Providers tab. TTL'd; degrades silently.
 static void refreshSignedInProviders(AppState& st, bool force) {
@@ -2142,7 +2123,8 @@ static void refreshSignedInProviders(AppState& st, bool force) {
     if (!force && (now - s_lastPoll) < 5.0) return;
     s_lastPoll = now;
     s_inFlight = true;
-    st.rpc.call("agent_provider_list", nlohmann::json::object(), [&st](const core::RpcResult& r) {
+    st.rpc.call("chudcode_provider_list", nlohmann::json::object(),
+                [&st](const core::RpcResult& r) {
         s_inFlight = false;
         if (!r.ok || !r.result.is_object() || !r.result.value("ok", true)) return;
         const auto it = r.result.find("providers");
@@ -2150,22 +2132,18 @@ static void refreshSignedInProviders(AppState& st, bool force) {
         std::set<std::string> live;
         std::vector<DeadCredProvider> dead;
         for (const auto& p : *it) {
-            if (!p.is_object()) continue;
-            const std::string id = p.value("id", std::string());
-            const std::string state = p.value("state", std::string());
-            if (id.empty()) continue;
-            // WHITELIST, not "anything but signed_out". The bridge vocabulary is
-            // signed_out|key_set|oauth_connected|error|disabled (auth-context.ts:239), and a
-            // provider that still holds a working credential alongside a revoked one reports
-            // key_set/oauth_connected — so only these two mean "requests can succeed". `error`
-            // used to be structurally unreachable; treating it as signed-in would advertise a
-            // provider whose every call is guaranteed to fail.
-            if (state == "key_set" || state == "oauth_connected") {
-                live.insert(id);
-            } else if (state == "error") {
-                std::string cause = p.value("error", std::string());
+            ui::ChudcodeProviderDesc d;
+            if (!ui::parseChudcodeProviderDesc(p, d)) continue;
+            // WHITELIST, not "anything but signed_out" (chudcodeProviderUsable): a provider
+            // that still holds a working credential alongside a revoked one reports
+            // key_set/oauth_connected — only those mean "requests can succeed". Treating
+            // `error` as signed-in would advertise a provider whose every call fails.
+            if (ui::chudcodeProviderUsable(d.state)) {
+                live.insert(d.id);
+            } else if (d.state == "error") {
+                std::string cause = d.error;
                 if (cause.empty()) cause = "credential disabled";
-                dead.push_back({p.value("label", id), std::move(cause)});
+                dead.push_back({d.label, std::move(cause)});
             }
         }
         s_deadCredProviders = std::move(dead);
@@ -2182,7 +2160,7 @@ void drawModelDropdown(AppState& st, bool busy) {
     const float sc = ui::uiScale;
     static char s_modelSearch[64] = "";
     refreshModelAvailability(st, false);
-    refreshBridgeModelCatalog(st, false);  // OMP catalog sublabels (ctx/cost/capability chips)
+    refreshBridgeModelCatalog(st, false);  // Chudcode catalog sublabels (ctx/cost/capability chips)
     refreshSignedInProviders(st, false);  // mirror Settings->Providers signed-in set into the picker
     seedModelDefaultsOnce(st);             // first-run top-3-per-provider seeding; no-op after
 
@@ -2255,7 +2233,7 @@ void drawModelDropdown(AppState& st, bool busy) {
     };
 
     // Composer models = the user's SELECTED (checked = NOT hidden) catalog models for SIGNED-IN
-    // providers, sourced from the Settings -> Providers catalog (ui::bridgeModelCatalog()). Each OMP
+    // providers, sourced from the Settings -> Providers catalog (ui::bridgeModelCatalog()). Each
     // catalog provider id maps to a composer slot + base_url; providers with no working native
     // transport (e.g. Cursor) map to slot -1 and are excluded so they can't cause provider_error.
     struct Route { int slot; const char* baseUrl; };
@@ -2397,7 +2375,7 @@ void drawModelDropdown(AppState& st, bool busy) {
         ImGui::PopStyleColor();
     }
 
-    // Footer: per-session cost strip (agent_cost_summary; hidden while the bridge is absent).
+    // Footer: per-session cost strip (chudcode_session_stats; hidden while the service is absent).
     ImGui::Dummy(ImVec2(0, 2 * sc));
     drawSessionCostStrip(st);
 

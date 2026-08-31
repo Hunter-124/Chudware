@@ -8,6 +8,11 @@
 namespace core {
 
 void AsyncRpc::call(std::string method, nlohmann::json params, Done done, int timeoutMs) {
+    call(std::move(method), std::move(params), std::move(done), Event{}, timeoutMs);
+}
+
+void AsyncRpc::call(std::string method, nlohmann::json params, Done done, Event onEvent,
+                    int timeoutMs) {
     auto p = std::make_unique<Pending>();
     p->method = std::move(method);
     // `rpc.call("m", {}, cb)` looks like "no arguments" but nlohmann parses a bare `{}` as
@@ -21,6 +26,7 @@ void AsyncRpc::call(std::string method, nlohmann::json params, Done done, int ti
     p->params = params.is_null() ? nlohmann::json::object() : std::move(params);
     p->timeoutMs = timeoutMs;
     p->done = std::move(done);
+    p->onEvent = std::move(onEvent);
     {
         std::lock_guard<std::mutex> lk(mtx_);
         if (quit_) return;  // shutting down — drop silently (callbacks must not run after)
@@ -47,8 +53,19 @@ void AsyncRpc::threadMain() {
         }
         // The blocking round-trip happens here, off the GL thread. The errorSink (if any)
         // fires on THIS thread inside call() — it must stay thread-safe (it posts a toast,
-        // and AppState::toast locks).
-        p->res.ok = worker_.call(p->method, p->params, p->res.result, p->res.err, p->timeoutMs);
+        // and AppState::toast locks). Streamed event frames are queued under mtx_ and
+        // delivered on the GL thread by drain(); they never run here.
+        WorkerClient::EventFn ev;
+        if (p->onEvent) {
+            Pending* raw = p.get();   // alive until drained; events only fire mid-call
+            ev = [this, raw](const nlohmann::json& data) {
+                std::lock_guard<std::mutex> lk(mtx_);
+                if (quit_) return;
+                eventQ_.emplace_back(raw->onEvent, data);
+            };
+        }
+        p->res.ok = worker_.call(p->method, p->params, p->res.result, p->res.err, p->timeoutMs,
+                                 ev);
         {
             std::lock_guard<std::mutex> lk(mtx_);
             if (quit_) return;  // result no longer wanted; pending_ is moot past shutdown
@@ -58,11 +75,24 @@ void AsyncRpc::threadMain() {
 }
 
 void AsyncRpc::drain() {
+    std::vector<std::pair<Event, nlohmann::json>> events;
     std::vector<std::unique_ptr<Pending>> done;
     {
         std::lock_guard<std::mutex> lk(mtx_);
-        if (doneQ_.empty()) return;
+        if (doneQ_.empty() && eventQ_.empty()) return;
         done.swap(doneQ_);
+        events.swap(eventQ_);
+    }
+    // Events first: they were emitted before their call's terminal result, and the swap above
+    // is atomic with doneQ_, so an event can never arrive in a later drain than its Done.
+    for (auto& e : events) {
+        try {
+            if (e.first) e.first(e.second);
+        } catch (const std::exception& ex) {
+            std::fprintf(stderr, "[async_rpc] event callback threw: %s\n", ex.what());
+        } catch (...) {
+            std::fprintf(stderr, "[async_rpc] event callback threw (non-std)\n");
+        }
     }
     for (auto& p : done) {
         // A callback that throws (e.g. a json parse on an unexpected payload shape) must
@@ -86,6 +116,7 @@ void AsyncRpc::shutdown() {
         quit_ = true;
         queue_.clear();   // queued calls never run
         doneQ_.clear();   // undrained callbacks never run
+        eventQ_.clear();  // undelivered events never run
     }
     cv_.notify_one();
     // Unblock a round-trip the dispatch thread may be parked in (readLine poll loop).

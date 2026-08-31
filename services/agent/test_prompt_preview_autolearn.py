@@ -1,4 +1,5 @@
 """Tests for Settings → AI preview + Auto-Learn config/sidecar."""
+
 from __future__ import annotations
 
 import tempfile
@@ -29,6 +30,7 @@ class TestAutolearnConfig(unittest.TestCase):
         self.assertTrue(cfg.autolearn_auto_continue(c))
         self.assertEqual(cfg.autolearn_min_tool_calls(c), 3)
 
+
 class TestStandingGuidance(unittest.TestCase):
     def test_empty_when_disabled(self):
         from services.agent.autolearn import standing_guidance
@@ -48,7 +50,9 @@ class TestMaybeCapture(unittest.TestCase):
         from services.agent.autolearn import maybe_capture_after_turn
 
         out = maybe_capture_after_turn(
-            request="x", result=None, tool_calls=20,
+            request="x",
+            result=None,
+            tool_calls=20,
             cfg={"agent": {"autolearn_enabled": False}},
         )
         self.assertTrue(out["skipped"])
@@ -57,7 +61,9 @@ class TestMaybeCapture(unittest.TestCase):
         from services.agent.autolearn import maybe_capture_after_turn
 
         out = maybe_capture_after_turn(
-            request="x", result=None, tool_calls=1,
+            request="x",
+            result=None,
+            tool_calls=1,
             cfg={
                 "memory_enabled": True,
                 "agent": {
@@ -90,18 +96,18 @@ class TestMaybeCapture(unittest.TestCase):
                     "autolearn_auto_continue": True,
                     "autolearn_min_tool_calls": 5,
                     "memory_learn": True,
-                    "memory_backend": "sqlite",
                 },
             }
-            out = maybe_capture_after_turn(
-                request="make a flange",
-                result=_R(),
-                tool_calls=6,
-                project_root=str(root),
-                cfg=cfg,
-            )
-            self.assertTrue(out.get("ok"), out)
-            hits = pm.recall(root, "auto-learn flange", limit=5, token_budget=500)
+            with mock.patch.object(pm, "_offline_memory", return_value=True):
+                out = maybe_capture_after_turn(
+                    request="make a flange",
+                    result=_R(),
+                    tool_calls=6,
+                    project_root=str(root),
+                    cfg=cfg,
+                )
+                self.assertTrue(out.get("ok"), out)
+                hits = pm.recall(root, "auto-learn flange", limit=5, token_budget=500)
             self.assertTrue(
                 any("[auto-learn]" in (h.get("content") or "") for h in hits),
                 hits,
@@ -187,7 +193,6 @@ class TestPromptPreview(unittest.TestCase):
             out = preview_tool_entry("office_read_csv")
         self.assertTrue(out.get("ok"), out)
         self.assertIn("Effective defaults when omitted: limit=500.", out["entry"])
-
 
     def test_tool_catalog_covers_registry_and_guidance(self):
         from services.agent.prompt_preview import tool_catalog

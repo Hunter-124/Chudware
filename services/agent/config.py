@@ -14,6 +14,7 @@ state. config.json shape:
       "offline_mode": false             // legacy hard local-only (still honored)
     }
 """
+
 from __future__ import annotations
 
 import contextlib
@@ -119,7 +120,9 @@ def config_lock():
             if fcntl is None:
                 yield
                 return
-            with open(lock_p, "a+", encoding="utf-8", opener=lambda p, f: os.open(p, f, 0o600)) as lf:
+            with open(
+                lock_p, "a+", encoding="utf-8", opener=lambda p, f: os.open(p, f, 0o600)
+            ) as lf:
                 with contextlib.suppress(OSError):
                     os.chmod(lock_p, 0o600)
                 fcntl.flock(lf.fileno(), fcntl.LOCK_EX)
@@ -142,6 +145,7 @@ def read_config_uncached() -> dict:
         return json.loads(paths.CONFIG.read_text(encoding="utf-8"))
     except Exception:  # noqa: BLE001 — missing/corrupt config starts empty, as load_config does
         return {}
+
 
 def _deep_merge(base: dict, updates: dict) -> dict:
     """Recursively merge dict-valued keys of *updates* into *base* in place;
@@ -239,8 +243,16 @@ def workspace_dir(cfg: dict | None = None) -> "Path":
 # CAD/ECAD/doc extensions surfaced first in the working-directory roster so the
 # agent sees the parts before build detritus. Order = priority.
 _WORKSPACE_EXT_PRIORITY = (
-    ".step+", ".ecad+", ".step", ".stp", ".dxf", ".dwg", ".stl",
-    ".pdf", ".md", ".csv",
+    ".step+",
+    ".ecad+",
+    ".step",
+    ".stp",
+    ".dxf",
+    ".dwg",
+    ".stl",
+    ".pdf",
+    ".md",
+    ".csv",
 )
 
 
@@ -285,6 +297,7 @@ def list_workspace_files(root: "Path", limit: int = 200) -> list[str]:
         return ordered
     extra = len(ordered) - limit
     return ordered[:limit] + [f"… (+{extra} more)"]
+
 
 # --------------------------------------------------------------------------- agent nesting depth
 # GUI Settings → Permissions writes ``agent.max_subagent_depth`` (int, default 2,
@@ -354,6 +367,7 @@ def get_subagent_tool_call_budget(cfg: dict | None = None) -> int:
         return DEFAULT_SUBAGENT_TOOL_CALL_BUDGET
     return max(0, budget)
 
+
 # --------------------------------------------------------------------------- corporate org mode
 # GUI Settings → Agents writes ``agent.corporate_mode`` (bool) and
 # ``agent.corporate`` object. When on, complex missions organize as a company
@@ -421,6 +435,7 @@ def get_corporate_config(cfg: dict | None = None) -> dict:
         "meeting_cadence": _int("meeting_cadence", DEFAULT_CORPORATE_MEETING_CADENCE),
         "director_review": _bool("director_review", DEFAULT_CORPORATE_DIRECTOR_REVIEW),
     }
+
 
 # --------------------------------------------------------------------------- advisor (foreman)
 # GUI Settings / host options write ``agent.advisor`` (bool, default True).
@@ -510,9 +525,13 @@ def get_subagent_preference(cfg: dict | None = None) -> str:
     c = cfg if cfg is not None else load_config()
     agent = _agent_block(c if isinstance(c, dict) else None)
     if "subagent_preference" in agent:
-        return _parse_preference(agent.get("subagent_preference"), DEFAULT_SUBAGENT_PREFERENCE)
+        return _parse_preference(
+            agent.get("subagent_preference"), DEFAULT_SUBAGENT_PREFERENCE
+        )
     if isinstance(c, dict) and "subagent_preference" in c:
-        return _parse_preference(c.get("subagent_preference"), DEFAULT_SUBAGENT_PREFERENCE)
+        return _parse_preference(
+            c.get("subagent_preference"), DEFAULT_SUBAGENT_PREFERENCE
+        )
     return DEFAULT_SUBAGENT_PREFERENCE
 
 
@@ -522,13 +541,14 @@ def get_task_list_preference(cfg: dict | None = None) -> str:
     c = cfg if cfg is not None else load_config()
     agent = _agent_block(c if isinstance(c, dict) else None)
     if "task_list_preference" in agent:
-        return _parse_preference(agent.get("task_list_preference"), DEFAULT_TASK_LIST_PREFERENCE)
+        return _parse_preference(
+            agent.get("task_list_preference"), DEFAULT_TASK_LIST_PREFERENCE
+        )
     if isinstance(c, dict) and "task_list_preference" in c:
-        return _parse_preference(c.get("task_list_preference"), DEFAULT_TASK_LIST_PREFERENCE)
+        return _parse_preference(
+            c.get("task_list_preference"), DEFAULT_TASK_LIST_PREFERENCE
+        )
     return DEFAULT_TASK_LIST_PREFERENCE
-
-
-
 
 
 def get_advisor_preference(cfg: dict | None = None) -> str:
@@ -542,9 +562,13 @@ def get_advisor_preference(cfg: dict | None = None) -> str:
     c = cfg if cfg is not None else load_config()
     agent = _agent_block(c if isinstance(c, dict) else None)
     if "advisor_preference" in agent:
-        return _parse_preference(agent.get("advisor_preference"), DEFAULT_ADVISOR_PREFERENCE)
+        return _parse_preference(
+            agent.get("advisor_preference"), DEFAULT_ADVISOR_PREFERENCE
+        )
     if isinstance(c, dict) and "advisor_preference" in c:
-        return _parse_preference(c.get("advisor_preference"), DEFAULT_ADVISOR_PREFERENCE)
+        return _parse_preference(
+            c.get("advisor_preference"), DEFAULT_ADVISOR_PREFERENCE
+        )
     # Fall back to bool agent.advisor
     if not advisor_enabled(c if isinstance(c, dict) else None):
         return "off"
@@ -578,7 +602,6 @@ def proactive_advisor_enabled(cfg: dict | None = None) -> bool:
     return DEFAULT_PROACTIVE_ADVISOR
 
 
-
 # ---------------------------------------------------------------------------
 # Tool families (Settings → AI → Tools)
 # agent.tool_families: { "cad": true, "em": false, ... }
@@ -586,9 +609,27 @@ def proactive_advisor_enabled(cfg: dict | None = None) -> bool:
 # at the registry layer when set.
 # ---------------------------------------------------------------------------
 DEFAULT_TOOL_FAMILIES = (
-    "advisor", "cad", "cam", "ecad", "em", "files", "gsl", "intake", "ledger",
-    "manufacture", "mission", "office", "org", "parts", "plm", "recon", "research",
-    "reveng", "shell", "sim", "workspace",
+    "advisor",
+    "cad",
+    "cam",
+    "ecad",
+    "em",
+    "files",
+    "gsl",
+    "intake",
+    "ledger",
+    "manufacture",
+    "mission",
+    "office",
+    "org",
+    "parts",
+    "plm",
+    "recon",
+    "research",
+    "reveng",
+    "shell",
+    "sim",
+    "workspace",
 )
 
 # Families that resolve OFF unless config explicitly enables them (MFG-FAM-1).
@@ -607,8 +648,21 @@ DEFAULT_OFF_TOOL_FAMILIES = ("manufacture",)
 # (SHARED/AGENT floors in apply_tool_policy still apply).
 # ---------------------------------------------------------------------------
 HARNESS_ROLE_KEYS = (
-    "advisor", "task", "planning", "vision", "default", "plm", "redaction",
-    "sketch2d", "model3d", "memory", "cam", "sim", "ecad", "drawing", "reveng",
+    "advisor",
+    "task",
+    "planning",
+    "vision",
+    "default",
+    "plm",
+    "redaction",
+    "sketch2d",
+    "model3d",
+    "memory",
+    "cam",
+    "sim",
+    "ecad",
+    "drawing",
+    "reveng",
 )
 
 # Sensible default loadouts — lean specialists, broad "default" (main chat).
@@ -618,8 +672,21 @@ DEFAULT_ROLE_TOOLS: dict[str, tuple[str, ...]] = {
     "planning": ("mission", "advisor", "ledger", "research", "gsl", "workspace"),
     "vision": ("gsl", "cad"),
     "default": (
-        "cad", "files", "shell", "office", "plm", "research", "parts", "gsl",
-        "advisor", "workspace", "ledger", "sim", "cam", "ecad", "reveng",
+        "cad",
+        "files",
+        "shell",
+        "office",
+        "plm",
+        "research",
+        "parts",
+        "gsl",
+        "advisor",
+        "workspace",
+        "ledger",
+        "sim",
+        "cam",
+        "ecad",
+        "reveng",
         "mission",
     ),
     "plm": ("plm", "files", "office", "ledger"),
@@ -692,7 +759,11 @@ def get_role_tools(role: str, cfg: dict | None = None) -> list[str]:
         c = cfg if isinstance(cfg, dict) else load_config()
     except Exception:  # noqa: BLE001
         c = cfg if isinstance(cfg, dict) else {}
-    agent = c.get("agent") if isinstance(c, dict) and isinstance(c.get("agent"), dict) else {}
+    agent = (
+        c.get("agent")
+        if isinstance(c, dict) and isinstance(c.get("agent"), dict)
+        else {}
+    )
     raw_root = agent.get("role_tools") if isinstance(agent, dict) else None
     if not isinstance(raw_root, dict):
         return defaults
@@ -788,8 +859,13 @@ def auto_mission_routing(cfg: dict | None = None) -> bool:
 #                               tool_schema_trim dial (None = inherit tier)
 # ---------------------------------------------------------------------------
 TOOL_OPTION_KEYS = (
-    "enabled", "timeout_s", "max_calls_per_turn", "param_defaults", "prompt_note",
-    "description_override", "schema_trim",
+    "enabled",
+    "timeout_s",
+    "max_calls_per_turn",
+    "param_defaults",
+    "prompt_note",
+    "description_override",
+    "schema_trim",
 )
 
 _TOOL_OPTION_DEFAULTS: dict = {
@@ -844,7 +920,10 @@ def get_tool_options(cfg: dict | None, name: str) -> dict:
             out["param_defaults"] = dict(entry.get("param_defaults") or {})
         if "prompt_note" in entry and entry.get("prompt_note") is not None:
             out["prompt_note"] = str(entry.get("prompt_note") or "")
-        if "description_override" in entry and entry.get("description_override") is not None:
+        if (
+            "description_override" in entry
+            and entry.get("description_override") is not None
+        ):
             out["description_override"] = str(entry.get("description_override") or "")
         if "schema_trim" in entry:
             v = entry.get("schema_trim")
@@ -855,6 +934,7 @@ def get_tool_options(cfg: dict | None, name: str) -> dict:
 
     try:
         from services.agent.tool_guidance import guidance_for  # noqa: PLC0415
+
         _apply(guidance_for(name))
     except Exception:  # noqa: BLE001 — the curated layer is optional
         pass
@@ -862,7 +942,11 @@ def get_tool_options(cfg: dict | None, name: str) -> dict:
         c = cfg if isinstance(cfg, dict) else load_config()
     except Exception:  # noqa: BLE001
         c = cfg if isinstance(cfg, dict) else {}
-    agent = c.get("agent") if isinstance(c, dict) and isinstance(c.get("agent"), dict) else {}
+    agent = (
+        c.get("agent")
+        if isinstance(c, dict) and isinstance(c.get("agent"), dict)
+        else {}
+    )
     raw_root = agent.get("tool_options") if isinstance(agent, dict) else None
     if not isinstance(raw_root, dict):
         return out
@@ -881,6 +965,7 @@ def get_tool_options(cfg: dict | None, name: str) -> dict:
 # only fall back to them when the per-tool value is absent/0. Never throw:
 # any parse failure (bad env, missing/malformed config) yields the default.
 # ---------------------------------------------------------------------------
+
 
 def tool_timeout_s_default(cfg: dict | None = None) -> int:
     """Global default per-tool timeout in seconds (``agent.tool_timeout_s_default``).
@@ -924,8 +1009,9 @@ def tool_max_calls_default(cfg: dict | None = None) -> int:
         return 0
 
 
-def effective_tool_call_cap(tool: str, *, opts: dict | None = None,
-                            cfg: dict | None = None) -> int | None:
+def effective_tool_call_cap(
+    tool: str, *, opts: dict | None = None, cfg: dict | None = None
+) -> int | None:
     """The per-turn call cap that will ACTUALLY be enforced for *tool*.
 
     Per-tool ``agent.tool_options.<tool>.max_calls_per_turn`` wins; an unset/0
@@ -1022,8 +1108,14 @@ def get_tool_families(cfg: dict | None = None) -> dict[str, bool]:
     """
     c = cfg if isinstance(cfg, dict) else load_config()
     agent = c.get("agent") if isinstance(c.get("agent"), dict) else {}
-    raw = agent.get("tool_families") if isinstance(agent.get("tool_families"), dict) else {}
-    role_tools_raw = agent.get("role_tools") if isinstance(agent.get("role_tools"), dict) else None
+    raw = (
+        agent.get("tool_families")
+        if isinstance(agent.get("tool_families"), dict)
+        else {}
+    )
+    role_tools_raw = (
+        agent.get("role_tools") if isinstance(agent.get("role_tools"), dict) else None
+    )
 
     # Union of role assignments when role_tools is configured.
     role_union: set[str] | None = None
@@ -1087,105 +1179,20 @@ def get_memory_token_budget(cfg: dict | None = None) -> int:
     return max(50, min(4000, b))
 
 
-# --------------------------------------------------------------------------- memory & learning backends
-# GUI Settings → AI → Memory & Learning writes these under ``agent`` (omp port):
-#   agent.memory_backend      "sqlite" | "mnemopi"   (default "sqlite")
-#   agent.compaction_backend  "builtin" | "omp"      (default "builtin")
-#   agent.memory_learn        bool                   (default True)
-#   agent.autolearn_enabled / autolearn_auto_continue / autolearn_min_tool_calls
-#     — OMP Auto-Learn sidecar (Settings → AI → Harness → Memory & Learning)
-# Precedence is ENV > config.json > default: CHUDWARE_MEMORY_BACKEND /
-# CHUDWARE_COMPACTION_BACKEND still win when set (per-process override; the GUI
-# comboboxes write config.json only).
+# --------------------------------------------------------------------------- memory learning
+# Storage and compaction authority are owned by Chudcode for online sessions.
+# These switches only govern whether Chudware callers are allowed to write lessons.
 
-MEMORY_BACKEND_KEY = "memory_backend"
-COMPACTION_BACKEND_KEY = "compaction_backend"
 MEMORY_LEARN_KEY = "memory_learn"
 AUTOLEARN_ENABLED_KEY = "autolearn_enabled"
 AUTOLEARN_AUTO_CONTINUE_KEY = "autolearn_auto_continue"
 AUTOLEARN_MIN_TOOL_CALLS_KEY = "autolearn_min_tool_calls"
 
-DEFAULT_MEMORY_BACKEND: str = "sqlite"
-DEFAULT_COMPACTION_BACKEND: str = "builtin"
 DEFAULT_MEMORY_LEARN: bool = True
 DEFAULT_AUTOLEARN_ENABLED: bool = False
 DEFAULT_AUTOLEARN_AUTO_CONTINUE: bool = False
 DEFAULT_AUTOLEARN_MIN_TOOL_CALLS: int = 5
 
-_MEMORY_BACKEND_MNEMOPI = frozenset({"mnemopi", "omp", "bridge"})
-_COMPACTION_BACKEND_OMP = frozenset({"omp", "bridge", "mnemopi"})
-
-
-def memory_backend(cfg: dict | None = None) -> str:
-    """Return ``"sqlite"`` (default) or ``"mnemopi"``.
-
-    Precedence ENV > config.json > default (omp port): CHUDWARE_MEMORY_BACKEND
-    wins when set; else ``agent.memory_backend``; else the default.
-    """
-    env = (os.environ.get("CHUDWARE_MEMORY_BACKEND") or "").strip().lower()
-    if env:
-        return "mnemopi" if env in _MEMORY_BACKEND_MNEMOPI else DEFAULT_MEMORY_BACKEND
-    agent = _agent_block(cfg)
-    raw = agent.get(MEMORY_BACKEND_KEY)
-    if isinstance(raw, str) and raw.strip().lower() in _MEMORY_BACKEND_MNEMOPI:
-        return "mnemopi"
-    return DEFAULT_MEMORY_BACKEND
-
-
-def compaction_backend(cfg: dict | None = None) -> str:
-    """Return ``"builtin"`` (default) or ``"omp"``.
-
-    Precedence ENV > config.json > default (omp port): CHUDWARE_COMPACTION_BACKEND
-    wins when set; else ``agent.compaction_backend``; else the legacy nested
-    ``agent.compaction.backend``; else the default.
-    """
-    env = (os.environ.get("CHUDWARE_COMPACTION_BACKEND") or "").strip().lower()
-    if env:
-        return "omp" if env in _COMPACTION_BACKEND_OMP else DEFAULT_COMPACTION_BACKEND
-    agent = _agent_block(cfg)
-    raw = agent.get(COMPACTION_BACKEND_KEY)
-    if isinstance(raw, str):
-        s = raw.strip().lower()
-        if s in _COMPACTION_BACKEND_OMP:
-            return "omp"
-        if s in ("builtin", "local"):
-            return DEFAULT_COMPACTION_BACKEND
-    # Legacy nested key honored for back-compat (pre-flat-key configs).
-    comp = agent.get(COMPACTION_KEY)
-    backend = comp.get("backend") if isinstance(comp, dict) else None
-    if isinstance(backend, str) and backend.strip().lower() in _COMPACTION_BACKEND_OMP:
-        return "omp"
-    return DEFAULT_COMPACTION_BACKEND
-
-
-def _compaction_nested(cfg: dict | None) -> dict:
-    """The nested ``agent.compaction`` block ({} when absent/malformed)."""
-    comp = _agent_block(cfg).get(COMPACTION_KEY)
-    return comp if isinstance(comp, dict) else {}
-
-
-def compaction_snap_frames(cfg: dict | None = None) -> bool:
-    """``agent.compaction.snap_frames`` (bool, default True) — render archived
-    history to OMP snap PNG frames when the backend is ``omp`` and the active
-    provider has vision. Off = text-only archives even under the omp backend."""
-    raw = _compaction_nested(cfg).get("snap_frames")
-    return bool(raw) if isinstance(raw, bool) else True
-
-
-def compaction_snap_dir(cfg: dict | None = None) -> str | None:
-    """``agent.compaction.snap_dir`` (str, default None = snap_store.default_dir)."""
-    raw = _compaction_nested(cfg).get("snap_dir")
-    return raw.strip() if isinstance(raw, str) and raw.strip() else None
-
-
-def compaction_snap_max_frames(cfg: dict | None = None) -> int:
-    """``agent.compaction.snap_max_frames`` (int, default 80 = OMP's
-    MAX_FRAMES_DEFAULT). Upper bound on rendered frames per snap."""
-    try:
-        v = _compaction_nested(cfg).get("snap_max_frames")
-        return max(1, int(v)) if v is not None else 80
-    except (TypeError, ValueError):
-        return 80
 
 def memory_learn_enabled(cfg: dict | None = None) -> bool:
     """Return ``agent.memory_learn`` (bool, default True).
@@ -1197,7 +1204,7 @@ def memory_learn_enabled(cfg: dict | None = None) -> bool:
 
 
 def autolearn_enabled(cfg: dict | None = None) -> bool:
-    """Return ``agent.autolearn_enabled`` (OMP Auto-Learn master flag, default off)."""
+    """Return the project-memory Auto-Learn master flag (default off)."""
     agent = _agent_block(cfg)
     return bool(agent.get(AUTOLEARN_ENABLED_KEY, DEFAULT_AUTOLEARN_ENABLED))
 
@@ -1212,37 +1219,31 @@ def autolearn_min_tool_calls(cfg: dict | None = None) -> int:
     """Return ``agent.autolearn_min_tool_calls`` (default 5, clamped ≥ 1)."""
     agent = _agent_block(cfg)
     try:
-        n = int(agent.get(AUTOLEARN_MIN_TOOL_CALLS_KEY, DEFAULT_AUTOLEARN_MIN_TOOL_CALLS))
+        n = int(
+            agent.get(AUTOLEARN_MIN_TOOL_CALLS_KEY, DEFAULT_AUTOLEARN_MIN_TOOL_CALLS)
+        )
     except (TypeError, ValueError):
         n = DEFAULT_AUTOLEARN_MIN_TOOL_CALLS
     return max(1, n)
 
 
-# --------------------------------------------------------------------------- compaction / session cmds
-# Shared with host + session_cmds (omp port). Nested under ``agent`` unless noted.
+# --------------------------------------------------------------------------- offline compaction
+# These knobs are consumed only by explicit offline/standalone text compaction.
+# Online sessions delegate compaction, retry, and cache policy to Chudcode.
 #
-#   agent.compaction_strategy ∈ "off"|"snapcompact"|"shake"|"summary"  (default "off")
+#   agent.compaction_strategy ∈ "off"|"snapcompact"|"shake"|"summary"
 #   agent.compaction.supersede_reads bool (default true)
 #   agent.compaction.drop_useless bool (default true)
 #   agent.compaction.keep_recent_tokens int (default 20000)
-#   agent.prewalk bool (default false)
-#   agent.prewalk_target str (default "@smol")
-#   agent.handoff_save_to_disk bool (default false)
 
 COMPACTION_STRATEGY_KEY = "compaction_strategy"
 COMPACTION_KEY = "compaction"
-PREWALK_KEY = "prewalk"
-PREWALK_TARGET_KEY = "prewalk_target"
-HANDOFF_SAVE_TO_DISK_KEY = "handoff_save_to_disk"
 
 DEFAULT_COMPACTION_STRATEGY: str = "off"
 VALID_COMPACTION_STRATEGIES = frozenset({"off", "snapcompact", "shake", "summary"})
 DEFAULT_COMPACTION_SUPERSEDE_READS: bool = True
 DEFAULT_COMPACTION_DROP_USELESS: bool = True
 DEFAULT_COMPACTION_KEEP_RECENT_TOKENS: int = 20_000
-DEFAULT_PREWALK: bool = False
-DEFAULT_PREWALK_TARGET: str = "@smol"
-DEFAULT_HANDOFF_SAVE_TO_DISK: bool = False
 
 
 def _agent_block(cfg: dict | None = None) -> dict:
@@ -1295,27 +1296,6 @@ def get_compaction_config(cfg: dict | None = None) -> dict:
     }
 
 
-def prewalk_enabled(cfg: dict | None = None) -> bool:
-    """Return ``agent.prewalk`` (bool, default False)."""
-    agent = _agent_block(cfg)
-    return bool(agent.get(PREWALK_KEY, DEFAULT_PREWALK))
-
-
-def get_prewalk_target(cfg: dict | None = None) -> str:
-    """Return ``agent.prewalk_target`` (str, default ``\"@smol\"``)."""
-    agent = _agent_block(cfg)
-    raw = agent.get(PREWALK_TARGET_KEY, DEFAULT_PREWALK_TARGET)
-    if raw is None or str(raw).strip() == "":
-        return DEFAULT_PREWALK_TARGET
-    return str(raw).strip()
-
-
-def handoff_save_to_disk(cfg: dict | None = None) -> bool:
-    """Return ``agent.handoff_save_to_disk`` (bool, default False)."""
-    agent = _agent_block(cfg)
-    return bool(agent.get(HANDOFF_SAVE_TO_DISK_KEY, DEFAULT_HANDOFF_SAVE_TO_DISK))
-
-
 BUG_REPORTS_KEY = "bug_reports"
 DEFAULT_BUG_REPORTS = True
 
@@ -1339,10 +1319,6 @@ def bugreport_floor(cfg: dict | None = None) -> frozenset:
     return frozenset({"submit_bug_report"}) if bug_reports_enabled(cfg) else frozenset()
 
 
-
-
-
-
 DEFAULT_LOCAL_MODEL = "gemma-4-e4b"
 DEFAULT_LOCAL_BASE_URL = "http://localhost:1234/v1"
 
@@ -1361,6 +1337,7 @@ OFFLINE_SETTING = "offline_mode"
 def offline_enabled(cfg: dict | None = None) -> bool:
     cfg = cfg if cfg is not None else load_config()
     return bool(cfg.get(OFFLINE_SETTING, False))
+
 
 # --------------------------------------------------------------------------- compliance mode (WS3)
 # ITAR-class outbound redaction. config.json "compliance_mode":
@@ -1391,7 +1368,6 @@ def local_only_enabled(cfg: dict | None = None) -> bool:
     if offline_enabled(cfg):
         return True
     return compliance_mode(cfg) == "local_only"
-
 
 
 _VALID_CONSENT_TIERS = {"off", "meta", "full"}
@@ -1439,10 +1415,22 @@ def provider_offline_safe(provider: Provider) -> bool:
     name = getattr(provider, "name", "")
     if name in ("mock", "mock-roles", "base"):
         return True
-    if name in ("anthropic", "gemini", "openrouter", "xai",
-                "anthropic-sub", "codex-sub", "cursor-sub", "xai-sub", "kimi-sub",
-                "claude-cli", "codex-cli"):
-        return False  # always cloud (incl. subscription-auth + CLI-subscription providers)
+    if name in (
+        "anthropic",
+        "gemini",
+        "openrouter",
+        "xai",
+        "anthropic-sub",
+        "codex-sub",
+        "cursor-sub",
+        "xai-sub",
+        "kimi-sub",
+        "claude-cli",
+        "codex-cli",
+    ):
+        return (
+            False  # always cloud (incl. subscription-auth + CLI-subscription providers)
+        )
     base_url = getattr(provider, "base_url", None)
     if name == "openai":
         # No base_url means the real OpenAI cloud endpoint; otherwise check the host.
@@ -1533,8 +1521,9 @@ def _attach_catalog_meta(provider: Provider, caps: dict) -> Provider:
             from .providers import omp_bridge_provider as _obp  # noqa: PLC0415
 
             if isinstance(provider, _obp.OmpBridgeProvider):
-                real = _obp.catalog_caps(getattr(provider, "name", ""),
-                                         getattr(provider, "model", ""))
+                real = _obp.catalog_caps(
+                    getattr(provider, "name", ""), getattr(provider, "model", "")
+                )
                 if real:
                     caps = {**caps, **real, "auto_source": "models.dev"}
         except Exception:  # noqa: BLE001 — never break provider construction
@@ -1576,10 +1565,13 @@ class Actor:
         try:
             remaining = max(0, int(value.get("credits_remaining") or 0))
         except (TypeError, ValueError) as exc:
-            raise ValueError("_chudware_actor credits_remaining must be an integer") from exc
+            raise ValueError(
+                "_chudware_actor credits_remaining must be an integer"
+            ) from exc
         if not email or source not in {"byok", "pool", "subscription"}:
             raise ValueError(
-                "_chudware_actor requires email and key_source=byok|pool|subscription")
+                "_chudware_actor requires email and key_source=byok|pool|subscription"
+            )
         raw_rate = value.get("_rate")
         rated_model = ""
         prompt_rate = completion_rate = None
@@ -1591,9 +1583,7 @@ class Actor:
             except (KeyError, InvalidOperation, TypeError, ValueError):
                 prompt_rate = completion_rate = None
         try:
-            reservation_credits = max(
-                0, int(value.get("_reservation_credits") or 0)
-            )
+            reservation_credits = max(0, int(value.get("_reservation_credits") or 0))
         except (TypeError, ValueError):
             reservation_credits = 0
         return cls(
@@ -1639,8 +1629,9 @@ def pooled_credit_preflight(
     output_budget = max(Decimal(0), Decimal(available) - prompt_cost)
     if actor.completion_usd_per_mtok > 0:
         affordable = int(
-            (output_budget * Decimal(1000) / actor.completion_usd_per_mtok)
-            .to_integral_value(rounding=ROUND_FLOOR)
+            (
+                output_budget * Decimal(1000) / actor.completion_usd_per_mtok
+            ).to_integral_value(rounding=ROUND_FLOOR)
         )
         requested = min(requested, max(0, affordable))
     return {
@@ -1657,8 +1648,8 @@ _pooled_keys: contextvars.ContextVar[dict[str, str]] = contextvars.ContextVar(
 # lifetime as _pooled_keys: bound by worker_rpc after the actor is validated, zeroed
 # by clear_pooled_credentials() before the next rpc is accepted, so one web caller's
 # bearer can never carry a following caller's turn.
-_subscription_grant: contextvars.ContextVar[dict[str, str] | None] = contextvars.ContextVar(
-    "chudware_subscription_grant", default=None
+_subscription_grant: contextvars.ContextVar[dict[str, str] | None] = (
+    contextvars.ContextVar("chudware_subscription_grant", default=None)
 )
 
 # Gateway grant provider id (Webservice/gateway/provider_accounts.SUBSCRIPTION_PROVIDERS)
@@ -1695,7 +1686,8 @@ def bind_subscription_grant(value: object) -> dict[str, str]:
     token = value.get("access_token")
     if provider not in SUBSCRIPTION_GRANT_PROVIDERS:
         raise ValueError(
-            "subscription grant provider must be anthropic-sub|openai-codex")
+            "subscription grant provider must be anthropic-sub|openai-codex"
+        )
     if not isinstance(token, str) or not token.strip():
         raise ValueError("subscription grant requires a non-empty access_token")
     grant = {"provider": provider, "access_token": token}
@@ -1804,8 +1796,13 @@ def assert_offline_safe(provider: Provider, cfg: dict | None = None) -> None:
         )
 
 
-def get_provider(name: str | None = None, cfg: dict | None = None,
-                 role: str | None = None, *, actor: Actor | None = None) -> Provider:
+def get_provider(
+    name: str | None = None,
+    cfg: dict | None = None,
+    role: str | None = None,
+    *,
+    actor: Actor | None = None,
+) -> Provider:
     """Resolve the configured provider, enforcing offline/local-only at two points: cloud
     providers are refused by name BEFORE construction, and the resolved provider is re-checked
     against ``provider_offline_safe`` AFTER (catches the empty-name local default + edge cases).
@@ -1847,6 +1844,7 @@ def get_provider(name: str | None = None, cfg: dict | None = None,
     # provider that should have been refused.
     if compliance_mode(cfg) == "redact":
         from .redaction import wrap_provider
+
         provider = wrap_provider(provider, cfg=cfg)
     return provider
 
@@ -1929,7 +1927,9 @@ def _refuse_keyless_openrouter() -> None:
     )
 
 
-def _resolve_via_routing(role: str | None, cfg: dict) -> tuple[str, str | None, str | None] | None:
+def _resolve_via_routing(
+    role: str | None, cfg: dict
+) -> tuple[str, str | None, str | None] | None:
     """Resolve *role* against routing.yaml (contract §14). Returns
     ``(provider_name, model_id, base_url)`` or ``None`` when routing.yaml has no
     configured sources / can't resolve the role — the caller falls back to
@@ -1938,6 +1938,7 @@ def _resolve_via_routing(role: str | None, cfg: dict) -> tuple[str, str | None, 
     resolution."""
     try:
         from .routing import load_routing  # noqa: PLC0415 — avoid import cost/cycles
+
         # Re-parse routing.yaml from disk each call (not the process-lifetime cache
         # in get_routing_table()) — the file is user-editable and can also be mutated
         # at runtime by local_runtime.register_routing_source(), so a stale cache would
@@ -1977,7 +1978,9 @@ def _resolve_provider(name: str | None, cfg: dict, role: str | None = None) -> P
             cfg[sub_key] = dict(cfg.get(sub_key) or {})
             cfg[sub_key].setdefault("base_url", routed_base_url)
 
-    name = (name or os.environ.get("CHUDWARE_PROVIDER") or cfg.get("provider") or "").lower()
+    name = (
+        name or os.environ.get("CHUDWARE_PROVIDER") or cfg.get("provider") or ""
+    ).lower()
     # Pre-rename persisted ids (kimi-sub -> kimi-code) normalize before every lookup below,
     # exactly as core/agent/config.cpp's resolve_provider does on its side.
     name = _PROVIDER_ID_ALIASES.get(name, name)
@@ -1988,30 +1991,36 @@ def _resolve_provider(name: str | None, cfg: dict, role: str | None = None) -> P
     if offline and name == "gemini":
         raise OfflineModeError(
             f"offline mode is enabled (config '{OFFLINE_SETTING}': true): the Google Gemini "
-            f"cloud provider is refused. Use a local (loopback) model server instead.")
+            f"cloud provider is refused. Use a local (loopback) model server instead."
+        )
     if offline and name == "openrouter":
         raise OfflineModeError(
             f"offline mode is enabled (config '{OFFLINE_SETTING}': true): the OpenRouter "
-            f"cloud provider is refused. Use a local (loopback) model server instead.")
+            f"cloud provider is refused. Use a local (loopback) model server instead."
+        )
     if offline and name == "xai":
         raise OfflineModeError(
             f"offline mode is enabled (config '{OFFLINE_SETTING}': true): the xAI "
-            f"cloud provider is refused. Use a local (loopback) model server instead.")
+            f"cloud provider is refused. Use a local (loopback) model server instead."
+        )
     if offline and name == "moonshot":
         raise OfflineModeError(
             f"offline mode is enabled (config '{OFFLINE_SETTING}': true): the Moonshot (Kimi) "
-            f"cloud provider is refused. Use a local (loopback) model server instead.")
+            f"cloud provider is refused. Use a local (loopback) model server instead."
+        )
     if offline and name in ("anthropic", "openai") and name != "":
         if name == "anthropic":
             raise OfflineModeError(
                 f"offline mode is enabled (config '{OFFLINE_SETTING}': true): the Anthropic "
-                f"cloud provider is refused. Use a local (loopback) model server instead.")
+                f"cloud provider is refused. Use a local (loopback) model server instead."
+            )
         # openai: only allowed if a loopback base_url is configured.
         if not _host_is_loopback((cfg.get("openai", {}) or {}).get("base_url")):
             raise OfflineModeError(
                 f"offline mode is enabled (config '{OFFLINE_SETTING}': true): the OpenAI cloud "
                 f"provider is refused. Configure a local (loopback) base_url, or disable offline "
-                f"mode in Settings.")
+                f"mode in Settings."
+            )
     if offline and name in ("llamacpp", "llama.cpp", "llama-cpp"):
         lcfg = dict(cfg.get("llamacpp", {}) or {})
         host = str(lcfg.get("host") or "127.0.0.1")
@@ -2021,29 +2030,39 @@ def _resolve_provider(name: str | None, cfg: dict, role: str | None = None) -> P
             raise OfflineModeError(
                 f"offline mode is enabled (config '{OFFLINE_SETTING}': true): the managed "
                 f"llama.cpp endpoint {base_url!r} is not loopback, so it is refused before "
-                f"probing the server.")
+                f"probing the server."
+            )
     if offline and name == "vllm":
         vc = dict(cfg.get("vllm", {}) or {})
         base_url = vc.get("base_url") or "http://localhost:8000/v1"
         if not _host_is_loopback(base_url):
             raise OfflineModeError(
                 f"offline mode is enabled (config '{OFFLINE_SETTING}': true): the vLLM serving "
-                f"endpoint {base_url!r} is not loopback, so it is refused before construction.")
-    if offline and name in ("anthropic-sub", "codex-sub", "cursor-sub", "xai-sub",
-                            "claude-cli", "codex-cli"):
+                f"endpoint {base_url!r} is not loopback, so it is refused before construction."
+            )
+    if offline and name in (
+        "anthropic-sub",
+        "codex-sub",
+        "cursor-sub",
+        "xai-sub",
+        "claude-cli",
+        "codex-cli",
+    ):
         # Subscription-auth providers (§4.4) and CLI-subscription drivers always talk to
         # a vendor cloud endpoint (the CLI is just a local front-end).
         raise OfflineModeError(
             f"offline mode is enabled (config '{OFFLINE_SETTING}': true): the subscription "
             f"provider {name!r} uses a vendor cloud endpoint and is refused. Use a local "
-            f"(loopback) model server instead.")
+            f"(loopback) model server instead."
+        )
     if offline and name in OMP_BRIDGE_PROVIDER_IDS:
         # The OMP sidecar is a local process, but every id it serves is a vendor cloud
         # endpoint it calls on our behalf — refuse by name, before any child is spawned.
         raise OfflineModeError(
             f"offline mode is enabled (config '{OFFLINE_SETTING}': true): the cloud provider "
             f"{name!r} is routed through the OMP sidecar to a vendor API endpoint and is "
-            f"refused. Use a local (loopback) model server instead.")
+            f"refused. Use a local (loopback) model server instead."
+        )
 
     if not name:
         # Nothing configured: default to a local LM Studio (OpenAI-compatible) endpoint
@@ -2056,14 +2075,15 @@ def _resolve_provider(name: str | None, cfg: dict, role: str | None = None) -> P
         # Nested openai.vision wins when set; else catalog (local defaults conservative).
         vision = oai["vision"] if "vision" in oai else caps.get("vision", True)
         prov = OpenAIProvider(
-            api_key=cfg.get("api_key") or os.environ.get("OPENAI_API_KEY") or "lm-studio",
+            api_key=cfg.get("api_key")
+            or os.environ.get("OPENAI_API_KEY")
+            or "lm-studio",
             model=model,
             base_url=oai.get("base_url") or DEFAULT_LOCAL_BASE_URL,
             supports_vision=bool(vision),
             timeout=float(oai.get("timeout", 120.0)),
         )
         return _attach_catalog_meta(prov, caps)
-
 
     if name == "mock":
         # Deterministic mock provider for tests (no API key, no network). Scripted replies load
@@ -2083,6 +2103,7 @@ def _resolve_provider(name: str | None, cfg: dict, role: str | None = None) -> P
                 replies = data
         if by_role is not None:
             from .providers.mock_provider import RoleScriptedProvider
+
             return RoleScriptedProvider(by_role)
         return MockProvider(replies or [""])
 
@@ -2151,13 +2172,17 @@ def _resolve_provider(name: str | None, cfg: dict, role: str | None = None) -> P
     if name == "gemini":
         from .providers.gemini_provider import GeminiProvider, DEFAULT_MODEL
 
-        key = cfg.get("api_key") or os.environ.get("GEMINI_API_KEY") or os.environ.get(
-            "GOOGLE_API_KEY")
+        key = (
+            cfg.get("api_key")
+            or os.environ.get("GEMINI_API_KEY")
+            or os.environ.get("GOOGLE_API_KEY")
+        )
         model = cfg.get("model", DEFAULT_MODEL)
         caps = _catalog_caps("gemini", model, cfg)
         # Effort preference stays user-owned; option set is catalog-derived.
-        prov = GeminiProvider(api_key=key, model=model,
-                              reasoning_effort=cfg.get("reasoning_effort"))
+        prov = GeminiProvider(
+            api_key=key, model=model, reasoning_effort=cfg.get("reasoning_effort")
+        )
         return _attach_catalog_meta(prov, caps)
 
     if name == "openai":
@@ -2168,13 +2193,15 @@ def _resolve_provider(name: str | None, cfg: dict, role: str | None = None) -> P
         model = cfg.get("model", DEFAULT_MODEL)
         caps = _catalog_caps("openai", model, cfg)
         vision = oai["vision"] if "vision" in oai else caps.get("vision", True)
-        prov = OpenAIProvider(api_key=key, model=model,
-                              base_url=oai.get("base_url"),
-                              supports_vision=bool(vision),
-                              timeout=float(oai.get("timeout", 120.0)),
-                              reasoning_effort=cfg.get("reasoning_effort"))
+        prov = OpenAIProvider(
+            api_key=key,
+            model=model,
+            base_url=oai.get("base_url"),
+            supports_vision=bool(vision),
+            timeout=float(oai.get("timeout", 120.0)),
+            reasoning_effort=cfg.get("reasoning_effort"),
+        )
         return _attach_catalog_meta(prov, caps)
-
 
     if name == "xai":
         # Classic API-key path (console.x.ai). OpenAI-compatible at https://api.x.ai/v1.
@@ -2199,7 +2226,11 @@ def _resolve_provider(name: str | None, cfg: dict, role: str | None = None) -> P
         # Moonshot AI (Kimi K3) — OpenAI-compatible at https://api.moonshot.ai/v1.
         # Key precedence mirrors openrouter: cfg.moonshot.api_key / cfg.api_key /
         # keys.moonshot / MOONSHOT_API_KEY.
-        from .providers.moonshot_provider import MoonshotProvider, DEFAULT_MODEL, BASE_URL
+        from .providers.moonshot_provider import (
+            MoonshotProvider,
+            DEFAULT_MODEL,
+            BASE_URL,
+        )
 
         mc = cfg.get("moonshot", {}) or {}
         keys_map = cfg.get("keys") or {}
@@ -2212,10 +2243,15 @@ def _resolve_provider(name: str | None, cfg: dict, role: str | None = None) -> P
         if not key:
             raise ValueError(
                 "moonshot provider requires an API key "
-                "(config moonshot.api_key / keys.moonshot / MOONSHOT_API_KEY)")
+                "(config moonshot.api_key / keys.moonshot / MOONSHOT_API_KEY)"
+            )
         model = cfg.get("model", DEFAULT_MODEL)
         caps = _catalog_caps("moonshot", model, cfg)
-        vision = mc["vision"] if isinstance(mc, dict) and "vision" in mc else caps.get("vision", True)
+        vision = (
+            mc["vision"]
+            if isinstance(mc, dict) and "vision" in mc
+            else caps.get("vision", True)
+        )
         prov = MoonshotProvider(
             api_key=key,
             model=model,
@@ -2226,12 +2262,14 @@ def _resolve_provider(name: str | None, cfg: dict, role: str | None = None) -> P
         )
         return _attach_catalog_meta(prov, caps)
 
-
     if name == "anthropic-sub":
         # Subscription auth (§4.4): uses the user's Claude Pro/Max login, not an api_key.
         # access_token is the gateway's per-account bearer on a web turn and None on the
         # desktop, where the provider reads its own credential store exactly as before.
-        from .providers.anthropic_sub_provider import AnthropicSubProvider, DEFAULT_MODEL
+        from .providers.anthropic_sub_provider import (
+            AnthropicSubProvider,
+            DEFAULT_MODEL,
+        )
 
         return AnthropicSubProvider(
             model=cfg.get("model", DEFAULT_MODEL),
@@ -2292,8 +2330,11 @@ def _resolve_provider(name: str | None, cfg: dict, role: str | None = None) -> P
     if name == "vllm":
         # T-H9: per-task LoRA serving. OpenAI-compatible vLLM instance; the served LoRA is
         # picked by the `adapter` field. Enters as just another providers/1 adapter.
-        from .providers.vllm_provider import (VLLMProvider, DEFAULT_BASE_URL,
-                                              DEFAULT_MODEL as VLLM_DEFAULT_MODEL)
+        from .providers.vllm_provider import (
+            VLLMProvider,
+            DEFAULT_BASE_URL,
+            DEFAULT_MODEL as VLLM_DEFAULT_MODEL,
+        )
 
         vc = dict(cfg.get("vllm", {}) or {})
         model = vc.get("model") or cfg.get("model") or VLLM_DEFAULT_MODEL
@@ -2308,6 +2349,5 @@ def _resolve_provider(name: str | None, cfg: dict, role: str | None = None) -> P
             timeout=float(vc.get("timeout", 120.0)),
         )
         return _attach_catalog_meta(prov, caps)
-
 
     raise ValueError(f"Unknown provider: {name!r}")

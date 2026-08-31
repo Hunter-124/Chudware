@@ -33,8 +33,8 @@ struct UsageState {
     bool   accountsInFlight = false;
     bool   usageInFlight    = false;
     bool   rpcMissing       = false;   // unknown_method → stop polling, degrade quietly
-    std::map<std::string, BridgeUsage> bridge;   // omp sidecar windows, by bridge provider id
-    bool   bridgeRpcMissing = false;   // agent_provider_state absent → stop asking the sidecar
+    std::map<std::string, BridgeUsage> bridge;   // Chudcode service windows, by provider id
+    bool   bridgeRpcMissing = false;   // chudcode_auth_state absent → stop asking the service
     std::string lastError;
 };
 UsageState g;
@@ -135,9 +135,9 @@ void mergeUsageRows(const nlohmann::json& rows) {
     }
 }
 
-// `agent_provider_state`'s `usage.windows[]` → the same UsageWindow rows the subscription path
-// produces, so ONE renderer serves both sources. The bridge differs only in spelling: camelCase
-// keys, a "<provider>:<window>" id, and a numeric resetsAt.
+// `chudcode_auth_state`'s `usage.windows[]` → the same UsageWindow rows the subscription path
+// produces, so ONE renderer serves both sources. The service differs only in spelling:
+// camelCase keys, a "<provider>:<window>" id, and a numeric resetsAt.
 void parseBridgeWindows(const nlohmann::json& wins, std::vector<UsageWindow>& out) {
     out.clear();
     for (const auto& w : wins) {
@@ -217,7 +217,7 @@ void providerUsagePollBridge(AppState& st, const char* bridgeProviderId, bool fo
     if (slot.inFlight) return;
     slot.lastPoll = now;
     slot.inFlight = true;
-    st.rpc.call("agent_provider_state", nlohmann::json{{"provider", id}},
+    st.rpc.call("chudcode_auth_state", nlohmann::json{{"providerId", id}},
                 [id](const core::RpcResult& r) {
         BridgeUsage& s = g.bridge[id];   // std::map: the slot taken above is still this one
         s.inFlight = false;
@@ -238,7 +238,7 @@ void providerUsagePollBridge(AppState& st, const char* bridgeProviderId, bool fo
         const auto* wins = jarr(usage, "windows");
         if (!wins) return;   // no usage block, or notes only — keep the last good windows
         parseBridgeWindows(*wins, s.windows);
-    }, 15000);   // auth_state fetches the usage report upstream (8s bridge-side cap)
+    }, 15000);   // auth_state may fetch the usage report upstream (bounded worker-side)
 }
 
 void providerUsagePollAccounts(AppState& st, double ttlSec, bool force) {

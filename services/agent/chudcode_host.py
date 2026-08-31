@@ -15,6 +15,7 @@ import shutil
 import sys
 import threading
 import uuid
+from urllib.parse import urlsplit
 from collections import OrderedDict
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -23,6 +24,8 @@ from typing import Any
 
 _DEFAULT_MAX_SESSIONS = 8
 _MAX_MAX_SESSIONS = 32
+_MAX_OPEN_URL_CHARS = 16_384
+_MAX_UI_TEXT_CHARS = 4_096
 
 _LOG = logging.getLogger(__name__)
 
@@ -44,6 +47,20 @@ _MEMORY_SHAPES: dict[str, tuple[frozenset[str], frozenset[str]]] = {
     ),
     "memory_stats": (frozenset({"root"}), frozenset()),
 }
+_TRANSIENT_SHAPES: dict[str, tuple[frozenset[str], frozenset[str]]] = {
+    **_AUTH_SHAPES,
+    **_MEMORY_SHAPES,
+    "get_login_providers": (frozenset(), frozenset()),
+    "get_available_models": (frozenset(), frozenset()),
+    "login": (frozenset({"providerId"}), frozenset()),
+}
+_SESSION_SHAPES: dict[str, tuple[frozenset[str], frozenset[str]]] = {
+    "get_session_stats": (frozenset(), frozenset()),
+    "compact": (frozenset(), frozenset({"customInstructions"})),
+    "set_auto_compaction": (frozenset({"enabled"}), frozenset()),
+    "set_auto_retry": (frozenset({"enabled"}), frozenset()),
+    "get_state": (frozenset(), frozenset()),
+}
 
 
 @dataclass
@@ -54,6 +71,7 @@ class _Session:
     turn_lock: threading.Lock = field(default_factory=threading.Lock)
     active_turns: int = 0
     closed: bool = False
+    host_tool_names: set[str] = field(default_factory=set)
 
 
 @dataclass
@@ -84,6 +102,7 @@ class ChudcodeSessionHost:
         self._runs: dict[str, _Run] = {}
         self._completed_runs: OrderedDict[str, dict[str, Any]] = OrderedDict()
         self._lock = threading.RLock()
+        self._transient_clients: dict[int, Any] = {}
         self._shutdown = False
 
     def run_turn(self, params, emit) -> dict:
@@ -145,7 +164,7 @@ class ChudcodeSessionHost:
                         emit_errors.append(str(exc))
 
                 unsubscribe = _register_listener(session.client, forward)
-                self._configure_turn(session.client, params)
+                self._configure_turn(session, params)
                 message, images = _prompt_payload(
                     prompt, params.get("attachments"), params.get("images")
                 )
@@ -410,27 +429,95 @@ class ChudcodeSessionHost:
                 return
             self._shutdown = True
             sessions = tuple(self._sessions.values())
+            transient_clients = tuple(self._transient_clients.values())
             self._sessions.clear()
+            self._transient_clients.clear()
             for session in sessions:
                 session.closed = True
             for run in self._runs.values():
                 run.cancel_requested = True
         for session in sessions:
             _stop_client(session.client)
+        for client in transient_clients:
+            _stop_client(client)
+
+    def transient_call(self, command, params=None, emit=None) -> dict[str, Any]:
+        """Run a bounded service-level command without creating a saved session."""
+        command_name = _nonempty_string(command)
+        if command_name not in _TRANSIENT_SHAPES:
+            raise ValueError(
+                f"unsupported Chudcode transient command: {command_name!r}"
+            )
+        payload = _validated_payload(
+            command_name,
+            params if params is not None else {},
+            _TRANSIENT_SHAPES[command_name],
+        )
+        _validate_service_payload(command_name, payload)
+        if emit is not None and not callable(emit):
+            raise TypeError("Chudcode transient emit callback must be callable")
+        return self._transient_call(command_name, payload, emit=emit)
 
     def auth_call(self, command, params):
         command_name = _nonempty_string(command)
         if command_name not in _AUTH_SHAPES:
             raise ValueError(f"unsupported Chudcode auth command: {command_name!r}")
-        payload = _validated_payload(command_name, params, _AUTH_SHAPES[command_name])
-        return self._transient_call(command_name, payload)
+        return self.transient_call(command_name, params)
 
     def memory_call(self, command, params):
         command_name = _nonempty_string(command)
         if command_name not in _MEMORY_SHAPES:
             raise ValueError(f"unsupported Chudcode memory command: {command_name!r}")
-        payload = _validated_payload(command_name, params, _MEMORY_SHAPES[command_name])
-        return self._transient_call(command_name, payload)
+        return self.transient_call(command_name, params)
+
+    def session_call(self, session_id, command, params=None) -> dict[str, Any]:
+        """Call one named live session; status calls never create or resume sessions."""
+        session_key = _nonempty_string(session_id)
+        command_name = _nonempty_string(command)
+        if command_name not in _SESSION_SHAPES:
+            raise ValueError(f"unsupported Chudcode session command: {command_name!r}")
+        if session_key is None:
+            return {"ok": False, "reason": "session_not_live"}
+        payload = _validated_payload(
+            command_name,
+            params if params is not None else {},
+            _SESSION_SHAPES[command_name],
+        )
+        if command_name in {"set_auto_compaction", "set_auto_retry"} and not isinstance(
+            payload.get("enabled"), bool
+        ):
+            raise TypeError(f"{command_name} enabled must be a boolean")
+        if (
+            command_name == "compact"
+            and "customInstructions" in payload
+            and not isinstance(payload["customInstructions"], str)
+        ):
+            raise TypeError("compact customInstructions must be a string")
+        with self._lock:
+            session = self._sessions.get(session_key)
+            if session is None or session.closed:
+                return {"ok": False, "reason": "session_not_live"}
+            session.active_turns += 1
+            self._sessions.move_to_end(session_key)
+        try:
+            result = _invoke_session_canonical(session.client, command_name, payload)
+            normalized = _json_value(result)
+            if normalized is None:
+                normalized = {"ok": True}
+            if not isinstance(normalized, dict):
+                raise TypeError(
+                    f"Chudcode {command_name} returned a non-object response"
+                )
+            normalized.setdefault("ok", True)
+            if command_name in {"set_auto_compaction", "set_auto_retry"}:
+                normalized.setdefault("enabled", payload["enabled"])
+            if command_name == "get_state":
+                normalized["_hostToolNames"] = sorted(_session_host_tool_names(session))
+            return normalized
+        finally:
+            with self._lock:
+                if session.active_turns:
+                    session.active_turns -= 1
 
     def _get_or_create_session(
         self, session_id: str, params: Mapping[str, Any], resume_file: str | None
@@ -560,7 +647,8 @@ class ChudcodeSessionHost:
             "signed-payload-adjacent chud binary, or put chud on PATH in developer mode"
         )
 
-    def _configure_turn(self, client: Any, params: Mapping[str, Any]) -> None:
+    def _configure_turn(self, session: _Session, params: Mapping[str, Any]) -> None:
+        client = session.client
         settings_value = params.get("settings")
         settings = dict(settings_value) if isinstance(settings_value, Mapping) else {}
         for key in (
@@ -615,6 +703,14 @@ class ChudcodeSessionHost:
         if isinstance(host_tools, Sequence) and not isinstance(
             host_tools, (str, bytes)
         ):
+            session.host_tool_names = {
+                name
+                for name in (
+                    _nonempty_string(getattr(binding, "name", None))
+                    for binding in host_tools
+                )
+                if name is not None
+            }
             converted_tools = []
             for binding in host_tools:
                 converter = getattr(binding, "to_host_tool", None)
@@ -635,26 +731,62 @@ class ChudcodeSessionHost:
         if callable(registrar):
             registrar(client)
 
-    def _transient_call(self, command: str, payload: dict[str, Any]) -> dict[str, Any]:
+    def _transient_call(
+        self,
+        command: str,
+        payload: dict[str, Any],
+        *,
+        emit: Callable[[dict[str, Any]], None] | None = None,
+    ) -> dict[str, Any]:
         with self._lock:
             if self._shutdown:
                 raise RuntimeError("chudcode session host is shut down")
         client = self._make_client({}, no_session=True)
+        marker = id(client)
+        with self._lock:
+            if self._shutdown:
+                _stop_client(client)
+                raise RuntimeError("chudcode session host is shut down")
+            self._transient_clients[marker] = client
+        unsubscribe: Callable[[], None] | None = None
         try:
             _start_client(client)
+            if command == "login":
+                unsubscribe = _register_login_ui(client, emit)
             result = _invoke_canonical(client, command, payload)
             normalized = _json_value(result)
             if not isinstance(normalized, dict):
                 raise TypeError(f"Chudcode {command} returned a non-object response")
             return normalized
         finally:
-            _stop_client(client)
+            if unsubscribe is not None:
+                try:
+                    unsubscribe()
+                except Exception as exc:  # noqa: BLE001 - teardown must continue
+                    _LOG.debug(
+                        "Chudcode login UI teardown failed (%s)", type(exc).__name__
+                    )
+            with self._lock:
+                owned = self._transient_clients.pop(marker, None) is not None
+            if owned:
+                _stop_client(client)
 
 
 def _invoke_canonical(client: Any, command: str, payload: Mapping[str, Any]) -> Any:
     """Use secret-safe typed wrappers when available; fakes may expose raw RPC only."""
     method = getattr(client, command, None)
     if callable(method):
+        if command == "get_login_providers":
+            providers = method()
+            return (
+                providers
+                if isinstance(providers, Mapping)
+                else {"providers": providers}
+            )
+        if command == "get_available_models":
+            return {"models": method()}
+        if command == "login":
+            return method(payload["providerId"])
         if command == "get_auth_state":
             return method(payload.get("providerId"))
         if command in {"validate_api_key", "set_api_key"}:
@@ -680,6 +812,106 @@ def _invoke_canonical(client: Any, command: str, payload: Mapping[str, Any]) -> 
         if command == "memory_stats":
             return method(payload["root"])
     return client.request_raw(command, **payload)
+
+
+def _invoke_session_canonical(
+    client: Any, command: str, payload: Mapping[str, Any]
+) -> Any:
+    method = getattr(client, command, None)
+    if callable(method):
+        if command in {"get_session_stats", "get_state"}:
+            return method()
+        if command == "compact":
+            return method(payload.get("customInstructions"))
+        if command in {"set_auto_compaction", "set_auto_retry"}:
+            method(payload["enabled"])
+            return {"ok": True, "enabled": payload["enabled"]}
+    return client.request_raw(command, **payload)
+
+
+def _session_host_tool_names(session: _Session) -> set[str]:
+    names = set(session.host_tool_names)
+    for tool in getattr(session.client, "_custom_tools", ()):
+        name = _nonempty_string(getattr(tool, "name", None))
+        if name is not None:
+            names.add(name)
+    return names
+
+
+def _register_login_ui(
+    client: Any, emit: Callable[[dict[str, Any]], None] | None
+) -> Callable[[], None]:
+    register = getattr(client, "on_ui_request", None)
+    if not callable(register):
+        return lambda: None
+
+    def handle(request: Any) -> None:
+        frame = _json_value(request)
+        if not isinstance(frame, Mapping):
+            return
+        method = _nonempty_string(frame.get("method"))
+        if method == "open_url":
+            event = _safe_open_url_event(frame)
+            if event is not None and emit is not None:
+                try:
+                    emit(event)
+                except Exception as exc:  # noqa: BLE001 - UI forwarding is advisory
+                    _LOG.debug(
+                        "Chudcode login UI forwarding failed (%s)", type(exc).__name__
+                    )
+            return
+        request_id = _nonempty_string(frame.get("id"))
+        if method in {"select", "confirm", "input", "editor"} and request_id:
+            cancel = getattr(client, "cancel_ui_request", None)
+            if callable(cancel):
+                cancel(request_id)
+
+    unsubscribe = register(handle)
+    return unsubscribe if callable(unsubscribe) else (lambda: None)
+
+
+def _safe_open_url_event(frame: Mapping[str, Any]) -> dict[str, Any] | None:
+    url = _safe_web_url(frame.get("url"))
+    if url is None:
+        return None
+    event: dict[str, Any] = {
+        "type": "extension_ui_request",
+        "method": "open_url",
+        "kind": "open_url",
+        "url": url,
+    }
+    launch_url = _safe_web_url(frame.get("launchUrl") or frame.get("launch_url"))
+    if launch_url is not None:
+        event["launchUrl"] = launch_url
+    request_id = _bounded_string(frame.get("id"), 256)
+    if request_id is not None:
+        event["id"] = request_id
+    instructions = _bounded_string(frame.get("instructions"), _MAX_UI_TEXT_CHARS)
+    if instructions is not None:
+        event["instructions"] = instructions
+        event["message"] = instructions
+    return event
+
+
+def _safe_web_url(value: Any) -> str | None:
+    text = _bounded_string(value, _MAX_OPEN_URL_CHARS)
+    if text is None:
+        return None
+    if any(ord(char) < 0x20 or ord(char) == 0x7F for char in text):
+        return None
+    parsed = urlsplit(text)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        return None
+    if parsed.username is not None or parsed.password is not None:
+        return None
+    return text
+
+
+def _bounded_string(value: Any, limit: int) -> str | None:
+    if not isinstance(value, str):
+        return None
+    value = value.strip()
+    return value[:limit] if value else None
 
 
 def _session_limit_from_env() -> int:
@@ -784,6 +1016,15 @@ def _validated_payload(
             f"{command} has unknown params: {', '.join(sorted(map(str, unknown)))}"
         )
     return {str(key): value for key, value in params.items() if value is not None}
+
+
+def _validate_service_payload(command: str, payload: Mapping[str, Any]) -> None:
+    if "providerId" in payload and _nonempty_string(payload["providerId"]) is None:
+        raise TypeError(f"{command} providerId must be a non-empty string")
+    if "apiKey" in payload and _nonempty_string(payload["apiKey"]) is None:
+        raise TypeError(f"{command} apiKey must be a non-empty string")
+    if "accountId" in payload and _nonempty_string(payload["accountId"]) is None:
+        raise TypeError(f"{command} accountId must be a non-empty string")
 
 
 def _prompt_payload(
@@ -900,3 +1141,30 @@ def _safe_last_assistant_text(client: Any) -> str | None:
             type(exc).__name__,
         )
         return None
+
+
+_DEFAULT_CHUDCODE_HOST: ChudcodeSessionHost | None = None
+_DEFAULT_CHUDCODE_HOST_LOCK = threading.Lock()
+
+
+def get_default_chudcode_host() -> ChudcodeSessionHost:
+    """Return the worker process's single lazily-created Chudcode session pool."""
+    global _DEFAULT_CHUDCODE_HOST
+    host = _DEFAULT_CHUDCODE_HOST
+    if host is not None:
+        return host
+    with _DEFAULT_CHUDCODE_HOST_LOCK:
+        if _DEFAULT_CHUDCODE_HOST is None:
+            _DEFAULT_CHUDCODE_HOST = ChudcodeSessionHost()
+        return _DEFAULT_CHUDCODE_HOST
+
+
+def _set_default_chudcode_host_for_tests(
+    host: ChudcodeSessionHost | None,
+) -> ChudcodeSessionHost | None:
+    """Inject or clear the default host only from process-isolated tests."""
+    global _DEFAULT_CHUDCODE_HOST
+    with _DEFAULT_CHUDCODE_HOST_LOCK:
+        previous = _DEFAULT_CHUDCODE_HOST
+        _DEFAULT_CHUDCODE_HOST = host
+        return previous

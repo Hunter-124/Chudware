@@ -3,6 +3,7 @@
 Mock providers only — no live network. Compaction engines are mocked so this
 suite is independent of PyCompaction's file landing order.
 """
+
 from __future__ import annotations
 
 import copy
@@ -17,6 +18,7 @@ from unittest.mock import patch
 # Mock provider
 # ---------------------------------------------------------------------------
 
+
 class _MockProvider:
     name = "mock"
 
@@ -24,12 +26,16 @@ class _MockProvider:
         self.reply = reply
         self.calls: list[dict[str, Any]] = []
 
-    def complete(self, system: str, messages: list[dict], max_tokens: int = 8000) -> str:
-        self.calls.append({
-            "system": system,
-            "messages": copy.deepcopy(messages),
-            "max_tokens": max_tokens,
-        })
+    def complete(
+        self, system: str, messages: list[dict], max_tokens: int = 8000
+    ) -> str:
+        self.calls.append(
+            {
+                "system": system,
+                "messages": copy.deepcopy(messages),
+                "max_tokens": max_tokens,
+            }
+        )
         return self.reply
 
 
@@ -75,7 +81,10 @@ def _history() -> list[dict]:
             "role": "assistant",
             "content": [{"type": "text", "text": "I'll sketch a base plate first."}],
         },
-        {"role": "user", "content": [{"type": "text", "text": "Also add mounting holes"}]},
+        {
+            "role": "user",
+            "content": [{"type": "text", "text": "Also add mounting holes"}],
+        },
     ]
 
 
@@ -86,7 +95,9 @@ class TestHandoffDocument(unittest.TestCase):
         msgs = _history()
         msgs_before = copy.deepcopy(msgs)
         prov = _MockProvider(_SAMPLE_HANDOFF)
-        doc = sc.handoff_document(msgs, focus="RPC shapes", provider=prov, model="mock-1")
+        doc = sc.handoff_document(
+            msgs, focus="RPC shapes", provider=prov, model="mock-1"
+        )
         self.assertEqual(msgs, msgs_before, "handoff must not mutate input messages")
         self.assertIn("## Goal", doc)
         self.assertIn("## Constraints & Preferences", doc)
@@ -127,8 +138,10 @@ class TestBtwAnswer(unittest.TestCase):
         texts = [
             m["content"][0]["text"]
             for m in prov.calls[0]["messages"]
-            if m.get("content") and isinstance(m["content"], list)
-            and m["content"] and m["content"][0].get("type") == "text"
+            if m.get("content")
+            and isinstance(m["content"], list)
+            and m["content"]
+            and m["content"][0].get("type") == "text"
         ]
         self.assertTrue(any("side-channel" in t or "NOT available" in t for t in texts))
 
@@ -141,6 +154,18 @@ class TestBtwAnswer(unittest.TestCase):
         self.assertEqual(prov.calls, [])
 
 
+class _FakeChudcodeHost:
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, str, dict]] = []
+        self.result: dict = {"ok": True, "compacted": True}
+
+    def session_call(
+        self, session_id: str, command: str, params: dict | None = None
+    ) -> dict:
+        self.calls.append((session_id, command, dict(params or {})))
+        return dict(self.result)
+
+
 class TestCompactShakeDelegation(unittest.TestCase):
     def test_compact_off_passthrough(self) -> None:
         from services.agent import session_cmds as sc
@@ -148,111 +173,144 @@ class TestCompactShakeDelegation(unittest.TestCase):
         msgs = _history()
         out = sc.compact_session(msgs, strategy="off")
         self.assertEqual(out["kept_messages"], msgs)
-        self.assertEqual(out["summary"], "")
-        self.assertEqual(out["short_summary"], "")
-        # Deep copy, not same list object
         self.assertIsNot(out["kept_messages"], msgs)
 
-    def test_compact_snapcompact_shape(self) -> None:
+    def test_online_compact_uses_live_chudcode_once(self) -> None:
+        from services.agent import chudcode_host
         from services.agent import session_cmds as sc
 
-        fake_archive = {
-            "text": "¶user Build…",
-            "text_head": "¶user Build…",
-            "text_tail": "holes",
-            "truncated_chars": 12,
-            "total_chars": 80,
-        }
+        host = _FakeChudcodeHost()
+        messages = _history()
+        before = copy.deepcopy(messages)
+        with (
+            patch.object(
+                chudcode_host,
+                "get_default_chudcode_host",
+                return_value=host,
+                create=True,
+            ),
+            patch.object(
+                sc.importlib,
+                "import_module",
+                side_effect=AssertionError("online compact invoked local compaction"),
+            ),
+        ):
+            out = sc.compact_session(
+                messages,
+                strategy="snapcompact",
+                session_id="session-7",
+                instructions="preserve CAD decisions",
+            )
+
+        self.assertEqual(out, {"ok": True, "compacted": True})
+        self.assertEqual(
+            host.calls,
+            [
+                (
+                    "session-7",
+                    "compact",
+                    {"customInstructions": "preserve CAD decisions"},
+                )
+            ],
+        )
+        self.assertEqual(messages, before)
+
+    def test_online_compact_without_live_session_is_honest(self) -> None:
+        from services.agent import session_cmds as sc
+
+        with self.assertRaisesRegex(
+            sc.SessionCommandUnavailable, "requires a live Chudcode session_id"
+        ):
+            sc.compact_session(_history(), strategy="summary")
+
+    def test_online_compact_propagates_unavailable_result(self) -> None:
+        from services.agent import chudcode_host
+        from services.agent import session_cmds as sc
+
+        host = _FakeChudcodeHost()
+        host.result = {"ok": False, "reason": "session not live"}
+        with patch.object(
+            chudcode_host,
+            "get_default_chudcode_host",
+            return_value=host,
+            create=True,
+        ):
+            with self.assertRaisesRegex(
+                sc.SessionCommandUnavailable, "session not live"
+            ):
+                sc.compact_session(_history(), strategy="summary", session_id="closed")
+
+    def test_compaction_and_retry_toggles_use_chudcode(self) -> None:
+        from services.agent import chudcode_host
+        from services.agent import session_cmds as sc
+
+        host = _FakeChudcodeHost()
+        with patch.object(
+            chudcode_host,
+            "get_default_chudcode_host",
+            return_value=host,
+            create=True,
+        ):
+            sc.set_auto_compaction("s1", False)
+            sc.set_auto_retry("s1", True)
+        self.assertEqual(
+            host.calls,
+            [
+                ("s1", "set_auto_compaction", {"enabled": False}),
+                ("s1", "set_auto_retry", {"enabled": True}),
+            ],
+        )
+
+    def test_standalone_compaction_is_local_and_never_calls_host(self) -> None:
+        from services.agent import session_cmds as sc
+
         fake_result = {
-            "archive": fake_archive,
-            "summary": "Built bracket base; holes pending.",
-            "short_summary": "Bracket + holes",
-            "kept_messages": [{"role": "user", "content": [{"type": "text", "text": "holes"}]}],
+            "archive": {
+                "text": "old",
+                "text_head": "old",
+                "text_tail": "",
+                "truncated_chars": 0,
+                "total_chars": 3,
+            },
+            "summary": "sum",
+            "short_summary": "short",
+            "kept_messages": [],
             "cut_index": 2,
         }
         fake_mod = types.ModuleType("services.agent.compaction")
-        fake_mod.snapcompact_archive = lambda *a, **k: fake_result
-        fake_mod.shake_messages = lambda *a, **k: {
-            "messages": [], "saved_tokens": 0, "regions": [], "placeholders": 0,
-        }
-        with patch.dict(sys.modules, {
-            "services.agent.compaction": fake_mod,
-        }):
-            # Force re-import path: compact_session does lazy import each call
-            out = sc.compact_session(
-                _history(),
-                strategy="snapcompact",
-                keep_recent_tokens=5000,
-                supersede_reads=True,
-                drop_useless=True,
-            )
-        self.assertEqual(out["summary"], "Built bracket base; holes pending.")
-        self.assertEqual(out["short_summary"], "Bracket + holes")
-        self.assertEqual(out["archive"], fake_archive)
-        self.assertEqual(len(out["kept_messages"]), 1)
-        self.assertEqual(out["cut_index"], 2)
-
-    def test_compact_summary_uses_snapcompact_engine(self) -> None:
-        """summary strategy delegates to snapcompact_archive (text engines only)."""
-        from services.agent import session_cmds as sc
-
-        called = {}
-
-        def _snap(*a, **k):
-            called["kwargs"] = k
-            return {
-                "archive": {"text": "x", "text_head": "x", "text_tail": "x",
-                            "truncated_chars": 0, "total_chars": 1},
-                "summary": "sum",
-                "short_summary": "ss",
-                "kept_messages": [],
-                "cut_index": 0,
-            }
-
-        fake_mod = types.ModuleType("services.agent.compaction")
-        fake_mod.snapcompact_archive = _snap
-        fake_mod.shake_messages = lambda *a, **k: {
-            "messages": [], "saved_tokens": 0, "regions": [], "placeholders": 0,
-        }
-        with patch.dict(sys.modules, {
-            "services.agent.compaction": fake_mod,
-        }):
-            out = sc.compact_session(_history(), strategy="summary")
-        self.assertEqual(out["summary"], "sum")
-        self.assertIn("kwargs", called)
-
-    def test_shake_session_shape(self) -> None:
-        from services.agent import session_cmds as sc
-
-        shaken = [
-            {"role": "user", "content": [{"type": "text", "text": "hi"}]},
-            {
-                "role": "tool",
-                "content": [{
-                    "type": "text",
-                    "text": "[shaken ~120 tokens — recover: artifact://abc (region 0)]",
-                }],
-            },
+        fake_mod.snapcompact_archive = lambda *args, **kwargs: fake_result
+        fake_mod.reinject_archive = lambda result: [
+            {"role": "user", "content": "archive"}
         ]
-        fake_mod = types.ModuleType("services.agent.compaction")
-        fake_mod.shake_messages = lambda messages, **k: {
-            "messages": shaken,
-            "saved_tokens": 120,
-            "regions": [{"k": 0}],
-            "placeholders": 1,
+        fake_mod.shake_messages = lambda messages, **kwargs: {
+            "messages": messages,
+            "saved_tokens": 0,
+            "regions": [],
+            "placeholders": 0,
         }
-        fake_mod.snapcompact_archive = lambda *a, **k: {
-            "archive": {}, "summary": "", "short_summary": "",
-            "kept_messages": messages if False else [], "cut_index": 0,
-        }
-        with patch.dict(sys.modules, {
-            "services.agent.compaction": fake_mod,
-        }):
-            out = sc.shake_session(_history(), mode="elide", aggressive=True)
-        self.assertEqual(out["messages"], shaken)
-        self.assertEqual(out["saved_tokens"], 120)
-        self.assertIn("120", out["notice"])
-        self.assertEqual(out["placeholders"], 1)
+        with patch.dict(sys.modules, {"services.agent.compaction": fake_mod}):
+            out = sc.compact_session(
+                _history(), strategy="snapcompact", standalone=True
+            )
+        self.assertEqual(out["summary"], "sum")
+        self.assertEqual(out["messages"][0]["content"], "archive")
+
+    def test_online_shake_refuses_second_history_authority(self) -> None:
+        from services.agent import session_cmds as sc
+
+        with self.assertRaisesRegex(
+            sc.SessionCommandUnavailable, "unavailable for online Chudcode"
+        ):
+            sc.shake_session(_history())
+
+    def test_standalone_shake_never_mutates_input(self) -> None:
+        from services.agent import session_cmds as sc
+
+        messages = _history()
+        before = copy.deepcopy(messages)
+        out = sc.shake_session(messages, aggressive=True, standalone=True)
+        self.assertEqual(messages, before)
+        self.assertIn("notice", out)
 
 
 class TestSessionRpc(unittest.TestCase):
@@ -275,7 +333,8 @@ class TestSessionRpc(unittest.TestCase):
         # Patch get_provider path by injecting provider object via params
         # session_cmds accepts provider instance directly.
         with patch.object(
-            rpc._cmds(), "handoff_document",
+            rpc._cmds(),
+            "handoff_document",
             return_value=_SAMPLE_HANDOFF,
         ) as _hd:
             r = rpc.SESSION_METHODS["session_handoff"](
@@ -292,7 +351,8 @@ class TestSessionRpc(unittest.TestCase):
         self.assertIn("## Goal", r["document"])
 
         with patch.object(
-            rpc._cmds(), "btw_answer",
+            rpc._cmds(),
+            "btw_answer",
             return_value="brief answer",
         ):
             r2 = rpc.SESSION_METHODS["session_btw"](
@@ -316,38 +376,6 @@ class TestSessionRpc(unittest.TestCase):
         )
         self.assertFalse(r.get("ok"))
         self.assertIn("question", r.get("reason", "").lower())
-
-    def test_rpc_compact_off(self) -> None:
-        from services.agent import worker_rpc as rpc
-
-        r = rpc.SESSION_METHODS["session_compact"](
-            {"messages": _history(), "strategy": "off"},
-            lambda *a, **k: None,
-        )
-        self.assertTrue(r.get("ok"))
-        self.assertIn("kept_messages", r)
-        self.assertEqual(r["summary"], "")
-        self.assertEqual(len(r["kept_messages"]), 3)
-
-    def test_rpc_shake_shape(self) -> None:
-        from services.agent import worker_rpc as rpc
-
-        fake = {
-            "messages": _history(),
-            "saved_tokens": 0,
-            "notice": "Shake found nothing to elide.",
-            "regions": [],
-            "placeholders": 0,
-        }
-        with patch.object(rpc._cmds(), "shake_session", return_value=fake):
-            r = rpc.SESSION_METHODS["session_shake"](
-                {"messages": _history(), "mode": "elide", "aggressive": False},
-                lambda *a, **k: None,
-            )
-        self.assertTrue(r.get("ok"))
-        self.assertIn("messages", r)
-        self.assertIn("saved_tokens", r)
-        self.assertIn("notice", r)
 
 
 if __name__ == "__main__":

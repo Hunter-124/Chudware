@@ -34,7 +34,7 @@ from decimal import Decimal, ROUND_FLOOR
 from pathlib import Path
 from typing import Any
 
-from services.agent.chudcode_host import ChudcodeSessionHost
+from services.agent.chudcode_host import get_default_chudcode_host
 
 
 _LOG = logging.getLogger(__name__)
@@ -340,76 +340,91 @@ def _as_list(value) -> list:
 
 
 def _session_compact(params: dict, _emit: Callable) -> dict:
-    """``session_compact`` — snapcompact / shake / summary / off over host messages."""
+    """Route live compaction to Chudcode; local rewriting is explicit offline only."""
     try:
         p = params or {}
         messages = _as_list(p.get("messages"))
-        strategy = str(p.get("strategy") or "off")
+        requested_strategy = str(p.get("strategy") or "off")
         keep = p.get("keep_recent_tokens", 20000)
         try:
             keep_i = int(keep)
         except (TypeError, ValueError):
             keep_i = 20000
-        supersede = p.get("supersede_reads", True)
-        drop_useless = p.get("drop_useless", True)
         prior = p.get("prior_archive")
         if prior is not None and not isinstance(prior, dict):
             prior = None
-        provider = None
-        if p.get("provider") or p.get("model"):
-            provider = {
-                "provider": p.get("provider"),
-                "model": p.get("model"),
-            }
-            if isinstance(p.get("vision"), bool):
-                provider["vision"] = p["vision"]
-        result = _cmds().compact_session(
+        commands = _cmds()
+        explicit_local = bool(p.get("standalone") or p.get("offline"))
+        configured_offline = bool(
+            getattr(commands, "_offline_enabled", lambda: False)()
+        )
+        local = explicit_local or configured_offline
+        strategy = requested_strategy if local else "chudcode"
+        result = commands.compact_session(
             messages,
             strategy,
             keep_recent_tokens=keep_i,
-            supersede_reads=bool(supersede),
-            drop_useless=bool(drop_useless),
+            supersede_reads=bool(p.get("supersede_reads", True)),
+            drop_useless=bool(p.get("drop_useless", True)),
             prior_archive=prior,
-            provider=provider,
             session_id=str(p.get("session_id") or "") or None,
+            instructions=p.get("instructions"),
+            standalone=explicit_local,
         )
         out = {
             "ok": True,
-            "kept_messages": result.get("kept_messages") or [],
             "summary": result.get("summary") or "",
-            "short_summary": result.get("short_summary") or "",
+            "short_summary": result.get("short_summary")
+            or result.get("shortSummary")
+            or "",
         }
-        if result.get("messages") is not None:
-            out["messages"] = result["messages"]
-        if result.get("archive") is not None:
-            out["archive"] = result["archive"]
-        if "cut_index" in result:
-            out["cut_index"] = result["cut_index"]
-        if "saved_tokens" in result:
-            out["saved_tokens"] = result["saved_tokens"]
+        passthrough_keys = (
+            "archive",
+            "cut_index",
+            "saved_tokens",
+            "firstKeptEntryId",
+            "tokensBefore",
+        )
+        if local:
+            out["kept_messages"] = result.get("kept_messages") or []
+            if "messages" in result:
+                out["messages"] = result["messages"]
+        for key in passthrough_keys:
+            if key in result:
+                out[key] = result[key]
         return out
     except Exception as exc:  # noqa: BLE001
         return {"ok": False, "reason": f"session_compact failed: {exc}", "hint": ""}
 
 
 def _session_shake(params: dict, _emit: Callable) -> dict:
-    """``session_shake`` — mechanical elision of heavy tool/code content."""
+    """Keep transcript shaking local-only; Chudcode owns online history."""
     try:
         p = params or {}
-        messages = _as_list(p.get("messages"))
-        mode = str(p.get("mode") or "elide")
-        aggressive = bool(p.get("aggressive", False))
+        commands = _cmds()
+        explicit_local = bool(p.get("standalone") or p.get("offline"))
+        if (
+            not explicit_local
+            and not getattr(commands, "_offline_enabled", lambda: False)()
+        ):
+            return {
+                "ok": False,
+                "reason": "session_shake is unavailable for online Chudcode sessions",
+                "owner": "chudcode",
+                "hint": "use chudcode_compact for the named live session",
+            }
         keep_boundary = p.get("keep_boundary_index")
         if keep_boundary is not None:
             try:
                 keep_boundary = int(keep_boundary)
             except (TypeError, ValueError):
                 keep_boundary = None
-        result = _cmds().shake_session(
-            messages,
-            mode=mode,
-            aggressive=aggressive,
+        result = commands.shake_session(
+            _as_list(p.get("messages")),
+            mode=str(p.get("mode") or "elide"),
+            aggressive=bool(p.get("aggressive", False)),
             keep_boundary_index=keep_boundary,
+            standalone=explicit_local,
         )
         return {
             "ok": True,
@@ -2015,12 +2030,6 @@ def _legacy_offline_agent_admin_turn(params: dict, _emit: Callable) -> dict:
     return response
 
 
-# The ordinary online lane is process-global: one host instance owns each
-# Chudware conversation's persistent Chudcode RPC process.  The legacy helper
-# above is intentionally not registered and is never selected by request data.
-
-
-_CHUDCODE_HOST = ChudcodeSessionHost()
 _HISTORY_SEED_LOCK = threading.Lock()
 _HISTORY_SEEDED_SESSIONS: set[str] = set()
 _HISTORY_SEED_MAX_CHARS = 24_000
@@ -2030,7 +2039,7 @@ _HISTORY_SEED_MAX_MESSAGES = 24
 def chudcode_agent_turn(params: dict, emit: Callable) -> dict:
     """Run one online turn through the authoritative persistent Chudcode host."""
     try:
-        result = _CHUDCODE_HOST.run_turn(params, emit)
+        result = get_default_chudcode_host().run_turn(params, emit)
         if not isinstance(result, dict):
             return {
                 "ok": False,
@@ -2051,11 +2060,13 @@ def chudcode_control(action: str, params: dict) -> dict:
     command = str(action or "").strip().lower()
     try:
         if command == "cancel":
-            return _CHUDCODE_HOST.cancel(params.get("run_id"))
+            return get_default_chudcode_host().cancel(params.get("run_id"))
         if command == "steer":
-            return _CHUDCODE_HOST.steer(params.get("run_id"), params.get("text"))
+            return get_default_chudcode_host().steer(
+                params.get("run_id"), params.get("text")
+            )
         if command == "status":
-            return _CHUDCODE_HOST.status(
+            return get_default_chudcode_host().status(
                 run_id=params.get("run_id"), session_id=params.get("session_id")
             )
         return {
@@ -2072,7 +2083,7 @@ def chudcode_control(action: str, params: dict) -> dict:
 
 def chudcode_shutdown() -> None:
     """Stop every persistent Chudcode session before the worker exits."""
-    _CHUDCODE_HOST.shutdown()
+    get_default_chudcode_host().shutdown()
     with _HISTORY_SEED_LOCK:
         _HISTORY_SEEDED_SESSIONS.clear()
 
@@ -2105,37 +2116,471 @@ def _redact_sensitive_response(value: Any) -> Any:
     return value
 
 
-def _chudcode_auth_call(command: str, params: dict, _emit: Callable) -> dict:
+_CHUDCODE_MAX_PROVIDERS = 128
+_CHUDCODE_MAX_MODELS = 512
+_CHUDCODE_MAX_TOOLS = 256
+_CHUDCODE_ESSENTIAL_TOOLS = frozenset(
+    {
+        "read",
+        "write",
+        "bash",
+        "edit",
+        "glob",
+        "computer",
+        "eval",
+        "task",
+        "hub",
+        "learn",
+        "manage_skill",
+    }
+)
+
+
+def _bounded_text(value: Any, limit: int) -> str | None:
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    return text[:limit] if text else None
+
+
+def _has_unknown_params(params: Mapping[str, Any], allowed: frozenset[str]) -> bool:
+    return bool(set(params) - allowed)
+
+
+def _finite_number(value: Any, default: float = 0.0) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return default
     try:
-        result = _CHUDCODE_HOST.auth_call(command, params)
+        number = float(value)
+    except (OverflowError, ValueError):
+        return default
+    return number if math.isfinite(number) else default
+
+
+def _chudcode_transient_call(
+    command: str,
+    params: dict,
+    emit: Callable | None = None,
+    *,
+    secret_input: bool = False,
+) -> dict:
+    try:
+        result = get_default_chudcode_host().transient_call(command, params, emit=emit)
         if not isinstance(result, dict):
-            return {
-                "ok": False,
-                "reason": f"Chudcode {command} returned non-object",
-            }
-        return _redact_sensitive_response(result)
-    except Exception as exc:  # noqa: BLE001 - Settings must get a clean refusal
-        if command in {"validate_api_key", "set_api_key"}:
-            # Provider exceptions are not trusted to avoid echoing the supplied key.
-            detail = type(exc).__name__
-        else:
-            detail = f"{type(exc).__name__}: {exc}"
+            return {"ok": False, "reason": f"Chudcode {command} returned non-object"}
+        clean = _redact_sensitive_response(result)
+        clean.setdefault("ok", True)
+        return clean
+    except Exception as exc:  # noqa: BLE001 - worker methods return clean refusals
+        detail = type(exc).__name__ if secret_input else f"{type(exc).__name__}: {exc}"
         return {"ok": False, "reason": f"Chudcode {command} failed: {detail}"}
+
+
+def _chudcode_auth_call(command: str, params: dict, _emit: Callable) -> dict:
+    return _chudcode_transient_call(
+        command,
+        params,
+        secret_input=command in {"validate_api_key", "set_api_key"},
+    )
 
 
 def _chudcode_memory_call(command: str, params: dict, _emit: Callable) -> dict:
     try:
-        result = _CHUDCODE_HOST.memory_call(command, params)
-        return (
-            result
-            if isinstance(result, dict)
-            else {"ok": False, "reason": f"Chudcode {command} returned non-object"}
-        )
+        result = get_default_chudcode_host().memory_call(command, params)
+        if not isinstance(result, dict):
+            return {"ok": False, "reason": f"Chudcode {command} returned non-object"}
+        result.setdefault("ok", True)
+        return result
     except Exception as exc:  # noqa: BLE001 - Settings must get a clean refusal
         return {
             "ok": False,
             "reason": f"Chudcode {command} failed: {type(exc).__name__}: {exc}",
         }
+
+
+def _auth_provider(raw: Any) -> dict[str, Any] | None:
+    if not isinstance(raw, Mapping):
+        return None
+    provider_id = _bounded_text(raw.get("providerId") or raw.get("id"), 128)
+    if provider_id is None:
+        return None
+    authenticated = bool(raw.get("authenticated"))
+    has_key = bool(raw.get("hasApiKey"))
+    has_oauth = bool(raw.get("hasOAuth"))
+    state = (
+        "oauth_connected"
+        if authenticated and has_oauth
+        else "key_set"
+        if has_key
+        else "signed_out"
+    )
+    accounts: list[dict[str, Any]] = []
+    raw_accounts = raw.get("accounts")
+    if isinstance(raw_accounts, list):
+        for account in raw_accounts[:32]:
+            if not isinstance(account, Mapping):
+                continue
+            clean_account = {
+                key: text
+                for key, limit in (
+                    ("accountId", 256),
+                    ("email", 320),
+                    ("projectId", 256),
+                    ("orgId", 256),
+                    ("orgName", 256),
+                )
+                if (text := _bounded_text(account.get(key), limit)) is not None
+            }
+            if clean_account:
+                accounts.append(clean_account)
+    result: dict[str, Any] = {
+        "id": provider_id,
+        "name": _bounded_text(raw.get("name"), 256) or provider_id,
+        "state": state,
+        "authenticated": authenticated,
+        "hasApiKey": has_key,
+        "hasOAuth": has_oauth,
+        "accounts": accounts,
+        "disabled": [],
+        "usage": {"notes": [], "windows": []},
+    }
+    origin = _bounded_text(raw.get("origin"), 64)
+    if origin is not None:
+        result["origin"] = origin
+    return result
+
+
+def _auth_providers(result: Mapping[str, Any]) -> list[dict[str, Any]]:
+    raw = result.get("providers")
+    if not isinstance(raw, list):
+        provider = _auth_provider(result)
+        return [provider] if provider is not None else []
+    providers: list[dict[str, Any]] = []
+    for item in raw[:_CHUDCODE_MAX_PROVIDERS]:
+        provider = _auth_provider(item)
+        if provider is not None:
+            providers.append(provider)
+    return providers
+
+
+def _chudcode_provider_list(params: dict, _emit: Callable) -> dict:
+    if params:
+        return {"ok": False, "reason": "chudcode_provider_list takes no params"}
+    login = _chudcode_transient_call("get_login_providers", {})
+    models = _chudcode_transient_call("get_available_models", {})
+    auth = _chudcode_transient_call("get_auth_state", {})
+    failed = next((item for item in (login, models, auth) if not item.get("ok")), None)
+    if failed is not None:
+        return failed
+
+    auth_by_id = {item["id"]: item for item in _auth_providers(auth)}
+    descriptors: dict[str, dict[str, Any]] = {}
+    raw_login = login.get("providers")
+    if isinstance(raw_login, list):
+        for item in raw_login[:_CHUDCODE_MAX_PROVIDERS]:
+            if not isinstance(item, Mapping):
+                continue
+            provider_id = _bounded_text(item.get("id"), 128)
+            if provider_id is None:
+                continue
+            descriptors[provider_id] = {
+                "id": provider_id,
+                "name": _bounded_text(item.get("name"), 256) or provider_id,
+                "available": bool(item.get("available", True)),
+                "authenticated": bool(item.get("authenticated")),
+                "authKinds": ["oauth"],
+                "modelsAvailable": False,
+            }
+    raw_models = models.get("models")
+    if isinstance(raw_models, list):
+        for item in raw_models[:_CHUDCODE_MAX_MODELS]:
+            if not isinstance(item, Mapping):
+                continue
+            provider_id = _bounded_text(item.get("provider"), 128)
+            if provider_id is None:
+                continue
+            descriptor = descriptors.setdefault(
+                provider_id,
+                {
+                    "id": provider_id,
+                    "name": provider_id,
+                    "available": True,
+                    "authenticated": False,
+                    "authKinds": ["api_key"],
+                    "modelsAvailable": False,
+                },
+            )
+            descriptor["modelsAvailable"] = True
+            if "api_key" not in descriptor["authKinds"]:
+                descriptor["authKinds"].append("api_key")
+    for provider_id, descriptor in descriptors.items():
+        state = auth_by_id.get(provider_id)
+        if state is not None:
+            descriptor["state"] = state["state"]
+            descriptor["authenticated"] = state["authenticated"]
+            if "origin" in state:
+                descriptor["origin"] = state["origin"]
+        elif not descriptor["available"]:
+            descriptor["state"] = "disabled"
+        else:
+            descriptor["state"] = "signed_out"
+    providers = sorted(
+        descriptors.values(), key=lambda item: (item["name"].lower(), item["id"])
+    )
+    return {"ok": True, "providers": providers[:_CHUDCODE_MAX_PROVIDERS]}
+
+
+def _chudcode_auth_state(params: dict, _emit: Callable) -> dict:
+    if _has_unknown_params(params, frozenset({"providerId"})):
+        return {"ok": False, "reason": "chudcode_auth_state has unknown params"}
+    provider_id = _bounded_text(params.get("providerId"), 128)
+    if provider_id is None:
+        return {"ok": False, "reason": "providerId is required"}
+    raw = _chudcode_transient_call("get_auth_state", {"providerId": provider_id})
+    if not raw.get("ok"):
+        return raw
+    provider = next(
+        (item for item in _auth_providers(raw) if item["id"] == provider_id),
+        None,
+    )
+    if provider is None:
+        return {
+            "ok": True,
+            "id": provider_id,
+            "state": "signed_out",
+            "authenticated": False,
+            "accounts": [],
+            "disabled": [],
+            "usage": {"notes": [], "windows": []},
+        }
+    provider["ok"] = True
+    return provider
+
+
+def _chudcode_validate_key(params: dict, emit: Callable) -> dict:
+    return _chudcode_auth_call("validate_api_key", params, emit)
+
+
+def _chudcode_set_key(params: dict, emit: Callable) -> dict:
+    return _chudcode_auth_call("set_api_key", params, emit)
+
+
+def _chudcode_remove_key(params: dict, emit: Callable) -> dict:
+    return _chudcode_auth_call("remove_api_key", params, emit)
+
+
+def _chudcode_logout(params: dict, emit: Callable) -> dict:
+    return _chudcode_auth_call("logout_provider", params, emit)
+
+
+def _chudcode_login(params: dict, emit: Callable) -> dict:
+    if _has_unknown_params(params, frozenset({"providerId"})):
+        return {"ok": False, "reason": "chudcode_login has unknown params"}
+    provider_id = _bounded_text(params.get("providerId"), 128)
+    if provider_id is None:
+        return {"ok": False, "reason": "providerId is required"}
+    login = _chudcode_transient_call("login", {"providerId": provider_id}, emit=emit)
+    if not login.get("ok"):
+        return login
+    state = _chudcode_auth_state({"providerId": provider_id}, emit)
+    if state.get("ok") and state.get("state") == "signed_out":
+        state["state"] = "oauth_connected"
+        state["authenticated"] = True
+    return state
+
+
+def _sanitize_model(item: Any) -> dict[str, Any] | None:
+    if not isinstance(item, Mapping):
+        return None
+    model_id = _bounded_text(item.get("id"), 256)
+    provider = _bounded_text(item.get("provider"), 128)
+    if model_id is None or provider is None:
+        return None
+    inputs = item.get("input")
+    clean_inputs = (
+        [text for value in inputs[:8] if (text := _bounded_text(value, 32)) is not None]
+        if isinstance(inputs, list)
+        else []
+    )
+    raw_cost = item.get("cost")
+    cost = raw_cost if isinstance(raw_cost, Mapping) else {}
+    clean_cost = {
+        key: min(1_000_000_000.0, max(0.0, _finite_number(cost.get(source))))
+        for key, source in (
+            ("input", "input"),
+            ("output", "output"),
+            ("cacheRead", "cacheRead"),
+            ("cacheWrite", "cacheWrite"),
+        )
+    }
+    return {
+        "id": model_id,
+        "name": _bounded_text(item.get("name"), 256) or model_id,
+        "provider": provider,
+        "contextWindow": min(
+            1_000_000_000, max(0, int(_finite_number(item.get("contextWindow"))))
+        ),
+        "maxTokens": min(
+            1_000_000_000, max(0, int(_finite_number(item.get("maxTokens"))))
+        ),
+        "reasoning": bool(item.get("reasoning")),
+        "input": clean_inputs,
+        "cost": clean_cost,
+    }
+
+
+def _chudcode_models_list(params: dict, _emit: Callable) -> dict:
+    unknown = set(params) - {"providerId"}
+    if unknown:
+        return {"ok": False, "reason": "chudcode_models_list has unknown params"}
+    provider_id = _bounded_text(params.get("providerId"), 128)
+    raw = _chudcode_transient_call("get_available_models", {})
+    if not raw.get("ok"):
+        return raw
+    models: list[dict[str, Any]] = []
+    raw_models = raw.get("models")
+    if isinstance(raw_models, list):
+        for item in raw_models[:_CHUDCODE_MAX_MODELS]:
+            model = _sanitize_model(item)
+            if model is not None and (
+                provider_id is None or model["provider"] == provider_id
+            ):
+                models.append(model)
+    models.sort(key=lambda item: (item["provider"], item["name"].lower(), item["id"]))
+    return {"ok": True, "models": models[:_CHUDCODE_MAX_MODELS]}
+
+
+def _chudcode_session_call(
+    command: str, params: dict, payload: dict | None = None
+) -> dict:
+    session_id = _bounded_text(params.get("session_id"), 256)
+    if session_id is None:
+        return {"ok": False, "reason": "session_not_live"}
+    try:
+        return get_default_chudcode_host().session_call(session_id, command, payload)
+    except Exception as exc:  # noqa: BLE001 - worker boundary
+        return {
+            "ok": False,
+            "reason": f"Chudcode {command} failed: {type(exc).__name__}: {exc}",
+        }
+
+
+def _chudcode_session_stats(params: dict, _emit: Callable) -> dict:
+    if _has_unknown_params(params, frozenset({"session_id"})):
+        return {"ok": False, "reason": "chudcode_session_stats has unknown params"}
+    raw = _chudcode_session_call("get_session_stats", params)
+    if not raw.get("ok"):
+        return raw
+    tokens = raw.get("tokens") if isinstance(raw.get("tokens"), Mapping) else {}
+    return {
+        "ok": True,
+        "sessionId": _bounded_text(raw.get("sessionId"), 256),
+        "userMessages": max(0, int(_finite_number(raw.get("userMessages")))),
+        "assistantMessages": max(0, int(_finite_number(raw.get("assistantMessages")))),
+        "toolCalls": max(0, int(_finite_number(raw.get("toolCalls")))),
+        "toolResults": max(0, int(_finite_number(raw.get("toolResults")))),
+        "totalMessages": max(0, int(_finite_number(raw.get("totalMessages")))),
+        "tokens": {
+            key: max(0, int(_finite_number(tokens.get(key))))
+            for key in ("input", "output", "cacheRead", "cacheWrite", "total")
+        },
+        "premiumRequests": max(0, int(_finite_number(raw.get("premiumRequests")))),
+        "cost": max(0.0, _finite_number(raw.get("cost"))),
+    }
+
+
+def _chudcode_compact(params: dict, _emit: Callable) -> dict:
+    if _has_unknown_params(params, frozenset({"session_id", "instructions"})):
+        return {"ok": False, "reason": "chudcode_compact has unknown params"}
+    instructions = params.get("instructions")
+    if instructions is not None and not isinstance(instructions, str):
+        return {"ok": False, "reason": "instructions must be a string"}
+    payload = {"customInstructions": instructions} if instructions is not None else {}
+    raw = _chudcode_session_call("compact", params, payload)
+    if not raw.get("ok"):
+        return raw
+    return {
+        "ok": True,
+        "summary": _bounded_text(raw.get("summary"), 65_536) or "",
+        "shortSummary": _bounded_text(raw.get("shortSummary"), 4_096),
+        "firstKeptEntryId": _bounded_text(raw.get("firstKeptEntryId"), 256),
+        "tokensBefore": max(0, int(_finite_number(raw.get("tokensBefore")))),
+    }
+
+
+def _chudcode_set_auto_compaction(params: dict, _emit: Callable) -> dict:
+    if _has_unknown_params(params, frozenset({"session_id", "enabled"})):
+        return {
+            "ok": False,
+            "reason": "chudcode_set_auto_compaction has unknown params",
+        }
+    if not isinstance(params.get("enabled"), bool):
+        return {"ok": False, "reason": "enabled must be a boolean"}
+    result = _chudcode_session_call(
+        "set_auto_compaction", params, {"enabled": params["enabled"]}
+    )
+    return result if not result.get("ok") else {"ok": True}
+
+
+def _chudcode_set_auto_retry(params: dict, _emit: Callable) -> dict:
+    if _has_unknown_params(params, frozenset({"session_id", "enabled"})):
+        return {"ok": False, "reason": "chudcode_set_auto_retry has unknown params"}
+    if not isinstance(params.get("enabled"), bool):
+        return {"ok": False, "reason": "enabled must be a boolean"}
+    result = _chudcode_session_call(
+        "set_auto_retry", params, {"enabled": params["enabled"]}
+    )
+    return result if not result.get("ok") else {"ok": True}
+
+
+def _chudcode_tool_state(params: dict, _emit: Callable) -> dict:
+    if _has_unknown_params(params, frozenset({"session_id"})):
+        return {"ok": False, "reason": "chudcode_tool_state has unknown params"}
+    raw = _chudcode_session_call("get_state", params)
+    if not raw.get("ok"):
+        return raw
+    host_names = set(raw.get("_hostToolNames") or ())
+    tools: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    raw_tools = raw.get("dumpTools")
+    if isinstance(raw_tools, list):
+        for item in raw_tools[:_CHUDCODE_MAX_TOOLS]:
+            if not isinstance(item, Mapping):
+                continue
+            name = _bounded_text(item.get("name"), 128)
+            if name is None or name in host_names or name in seen:
+                continue
+            seen.add(name)
+            load_mode = _bounded_text(item.get("loadMode") or item.get("load"), 32)
+            tools.append(
+                {
+                    "name": name,
+                    "loadMode": load_mode
+                    or (
+                        "essential"
+                        if name in _CHUDCODE_ESSENTIAL_TOOLS
+                        else "discoverable"
+                    ),
+                    "description": _bounded_text(item.get("description"), 512) or "",
+                    "builtin": True,
+                    "available": True,
+                }
+            )
+    for capability in ("browser", "computer"):
+        if capability not in seen:
+            tools.append(
+                {
+                    "name": capability,
+                    "loadMode": "essential"
+                    if capability in _CHUDCODE_ESSENTIAL_TOOLS
+                    else "discoverable",
+                    "description": "",
+                    "builtin": True,
+                    "available": False,
+                }
+            )
+    tools.sort(key=lambda item: item["name"])
+    return {"ok": True, "tools": tools[:_CHUDCODE_MAX_TOOLS]}
 
 
 def _agent_cancel(params: dict, _emit: Callable) -> dict:
@@ -2144,26 +2589,6 @@ def _agent_cancel(params: dict, _emit: Callable) -> dict:
 
 def _agent_steer(params: dict, _emit: Callable) -> dict:
     return chudcode_control("steer", params)
-
-
-def _chudcode_get_auth_state(params: dict, _emit: Callable) -> dict:
-    return _chudcode_auth_call("get_auth_state", params, _emit)
-
-
-def _validate_api_key(params: dict, _emit: Callable) -> dict:
-    return _chudcode_auth_call("validate_api_key", params, _emit)
-
-
-def _set_api_key(params: dict, _emit: Callable) -> dict:
-    return _chudcode_auth_call("set_api_key", params, _emit)
-
-
-def _remove_api_key(params: dict, _emit: Callable) -> dict:
-    return _chudcode_auth_call("remove_api_key", params, _emit)
-
-
-def _logout_provider(params: dict, _emit: Callable) -> dict:
-    return _chudcode_auth_call("logout_provider", params, _emit)
 
 
 def _memory_remember(params: dict, _emit: Callable) -> dict:
@@ -2797,11 +3222,19 @@ ADMIN_METHODS: dict[str, Callable] = {
     "agent_admin_turn": _agent_admin_turn,
     "agent_cancel": _agent_cancel,
     "agent_steer": _agent_steer,
-    "chudcode_get_auth_state": _chudcode_get_auth_state,
-    "validate_api_key": _validate_api_key,
-    "set_api_key": _set_api_key,
-    "remove_api_key": _remove_api_key,
-    "logout_provider": _logout_provider,
+    "chudcode_provider_list": _chudcode_provider_list,
+    "chudcode_auth_state": _chudcode_auth_state,
+    "chudcode_validate_key": _chudcode_validate_key,
+    "chudcode_set_key": _chudcode_set_key,
+    "chudcode_remove_key": _chudcode_remove_key,
+    "chudcode_logout": _chudcode_logout,
+    "chudcode_login": _chudcode_login,
+    "chudcode_models_list": _chudcode_models_list,
+    "chudcode_session_stats": _chudcode_session_stats,
+    "chudcode_compact": _chudcode_compact,
+    "chudcode_set_auto_compaction": _chudcode_set_auto_compaction,
+    "chudcode_set_auto_retry": _chudcode_set_auto_retry,
+    "chudcode_tool_state": _chudcode_tool_state,
     "memory_remember": _memory_remember,
     "memory_recall": _memory_recall,
     "memory_stats": _memory_stats,

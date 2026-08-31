@@ -1,10 +1,10 @@
-"""Project-scoped agent memory — SQLite + FTS5 under each PLM project.
+"""Project-scoped memory backed by Chudcode online and SQLite offline.
 
-Store path: ``{project_root}/.plm/memory.db`` (auto-created). No external deps.
-
-Designed to be cheap on tokens: callers pass a token budget; ``recall`` returns
-only top-k hits that fit. Never dump the whole DB into the model context.
+Both authorities are rooted at ``{project_root}/.plm/memory.db``. Public recall
+always enforces the caller's result count and token budget, and metadata fields
+retain the same stable Chudware shape.
 """
+
 from __future__ import annotations
 
 import hashlib
@@ -13,7 +13,7 @@ import sqlite3
 import threading
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS memories (
@@ -113,43 +113,54 @@ def close_all() -> None:
         _conns.clear()
 
 
-# --------------------------------------------------------------------------- OMP bridge hybrid backend
-# Optional: recall/remember/stats can route through the OMP bridge's mnemopi-backed
-# memory_* RPCs (real reuse of vendor/omp/packages/mnemopi — see
-# docs/omp-integration/01-DECISIONS.md §Stable RPC quick reference + §Memory)
-# instead of the SQLite+FTS5 path below. Off by default (unchanged behavior); opt in
-# with env CHUDWARE_MEMORY_BACKEND=mnemopi or config.json agent.memory_backend="mnemopi".
-# Any bridge failure (bun/script missing, crash, timeout, RPC error) raises
-# omp_bridge.BridgeUnavailable, caught here to fall back to SQLite+FTS5 transparently.
-
-def _bridge():
-    from services.agent import omp_bridge  # noqa: PLC0415
-    return omp_bridge
+# --------------------------------------------------------------------------- Chudcode / offline backends
 
 
-def _memory_backend(cfg: dict | None = None) -> str:
-    """``"sqlite"`` (default) or ``"mnemopi"``.
+class ProjectMemoryUnavailable(RuntimeError):
+    """The online Chudcode memory service could not serve the request."""
 
-    Precedence ENV > config.json > default (omp port) — resolution lives in
-    services.agent.config.memory_backend; CHUDWARE_MEMORY_BACKEND still wins, and
-    config.json ``agent.memory_backend`` is honored when the env is unset.
-    """
+
+def _offline_memory(cfg: dict | None = None) -> bool:
+    """True only for the explicit offline mode that owns the SQLite fallback."""
     try:
-        from services.agent.config import memory_backend  # noqa: PLC0415
-        return memory_backend(cfg)
-    except Exception:  # noqa: BLE001 — bad/missing config never breaks memory
-        return "sqlite"
+        from services.agent.config import offline_enabled  # noqa: PLC0415
+
+        return offline_enabled(cfg)
+    except Exception:  # noqa: BLE001 - unreadable config is not an offline opt-in
+        return False
+
+
+def _default_host():
+    from services.agent.chudcode_host import get_default_chudcode_host  # noqa: PLC0415
+
+    return get_default_chudcode_host()
+
+
+def _memory_call(command: str, params: dict[str, Any]) -> dict[str, Any]:
+    """Call the process-global Chudcode service without silently changing authority."""
+    try:
+        result = _default_host().memory_call(command, params)
+    except Exception as exc:  # noqa: BLE001 - host/process boundary
+        raise ProjectMemoryUnavailable(
+            f"Chudcode project memory unavailable: {exc}"
+        ) from exc
+    if not isinstance(result, Mapping):
+        raise ProjectMemoryUnavailable(
+            f"Chudcode project memory returned a non-object for {command}"
+        )
+    out = dict(result)
+    if out.get("ok") is False:
+        reason = str(out.get("reason") or out.get("error") or "request failed")
+        raise ProjectMemoryUnavailable(f"Chudcode project memory unavailable: {reason}")
+    return out
+
+
+def _project_root(project_root: str | Path) -> str:
+    return str(Path(project_root).expanduser().resolve())
 
 
 def _stable_int_id(raw_id: Any) -> int:
-    """Deterministic non-negative int from a bridge-returned memory id.
-
-    mnemopi memory ids are opaque strings (vendor/omp/packages/mnemopi/src/
-    types.ts ``RecallResult.id``); this module's public API returns
-    ``int | None`` (SQLite ``rowid``), so bridge ids are hashed into a stable
-    surrogate int. Same string always hashes to the same int, so remember()'s
-    "identical content -> identical id" dedupe contract still holds.
-    """
+    """Map an opaque Chudcode memory id onto the public integer id shape."""
     if isinstance(raw_id, int):
         return raw_id
     if isinstance(raw_id, str) and raw_id.isdigit():
@@ -158,13 +169,22 @@ def _stable_int_id(raw_id: Any) -> int:
     return int.from_bytes(digest, "big")
 
 
-def _bridge_remember(bridge, project_root: str | Path, text: str, kind: str, source: str,
-                      importance: float) -> int | None:
-    """``remember`` via bridge ``memory_remember`` (mnemopi, real OMP reuse)."""
-    root = str(Path(project_root).expanduser().resolve())
-    result = bridge.call(
+def _host_remember(
+    project_root: str | Path,
+    text: str,
+    kind: str,
+    source: str,
+    importance: float,
+) -> int | None:
+    result = _memory_call(
         "memory_remember",
-        {"root": root, "content": text, "kind": kind, "source": source, "importance": importance},
+        {
+            "root": _project_root(project_root),
+            "content": text,
+            "kind": kind,
+            "source": source,
+            "importance": importance,
+        },
     )
     raw_id = result.get("id", result.get("value"))
     return None if raw_id is None else _stable_int_id(raw_id)
@@ -201,68 +221,75 @@ def _apply_token_budget(
     return out
 
 
-def _bridge_recall(bridge, project_root: str | Path, query: str, limit: int, token_budget: int,
-                    kind: str | None) -> list[dict[str, Any]]:
-    """``recall`` via bridge ``memory_recall``; maps mnemopi ``RecallResult`` fields
-    (vendor/omp/packages/mnemopi/src/types.ts) onto this module's hit shape.
-
-    ``tokenBudget`` is passed through as a hint, but mnemopi ranks by relevance
-    and may return more text than that, so the budget is re-enforced locally via
-    ``_apply_token_budget`` — same cap the SQLite path gets.
-    """
-    root = str(Path(project_root).expanduser().resolve())
-    params: dict[str, Any] = {"root": root, "query": query, "limit": limit, "tokenBudget": token_budget}
+def _host_recall(
+    project_root: str | Path,
+    query: str,
+    limit: int,
+    token_budget: int,
+    kind: str | None,
+) -> list[dict[str, Any]]:
+    """Recall ranked Chudcode memories and enforce Chudware's context budget."""
+    params: dict[str, Any] = {
+        "root": _project_root(project_root),
+        "query": query,
+        "limit": limit,
+        "tokenBudget": token_budget,
+    }
     if kind:
         params["kind"] = kind
-    result = bridge.call("memory_recall", params)
+    result = _memory_call("memory_recall", params)
     hits = result.get("hits", result.get("value"))
     if not isinstance(hits, list):
         return []
     out: list[dict[str, Any]] = []
-    for h in hits[:limit]:
-        if not isinstance(h, dict):
+    for hit in hits[:limit]:
+        if not isinstance(hit, Mapping):
             continue
-        content = str(h.get("content") or "")
+        content = str(hit.get("content") or "")
         try:
-            tok = int(h["tokens"]) if h.get("tokens") is not None else estimate_tokens(content)
-        except (TypeError, ValueError):
-            tok = estimate_tokens(content)
-        try:
-            importance = float(h.get("importance") or 0.5)
+            importance = float(hit.get("importance") or 0.5)
         except (TypeError, ValueError):
             importance = 0.5
         try:
-            score = float(h.get("score") or 0.0)
+            score = float(hit.get("score") or 0.0)
         except (TypeError, ValueError):
             score = 0.0
-        raw_id = h.get("id")
-        out.append({
-            "id": _stable_int_id(raw_id) if raw_id is not None else 0,
-            "content": content,
-            "kind": str(h.get("kind") or h.get("memory_type") or h.get("memoryType") or "note"),
-            "source": str(h.get("source") or ""),
-            "importance": importance,
-            "score": score,
-            "tokens": tok,
-        })
+        raw_id = hit.get("id")
+        out.append(
+            {
+                "id": _stable_int_id(raw_id) if raw_id is not None else 0,
+                "content": content,
+                "kind": str(
+                    hit.get("kind")
+                    or hit.get("memory_type")
+                    or hit.get("memoryType")
+                    or "note"
+                ),
+                "source": str(hit.get("source") or ""),
+                "importance": importance,
+                "score": score,
+                "tokens": estimate_tokens(content),
+            }
+        )
     return _apply_token_budget(out, limit, token_budget)
 
 
-def _bridge_stats(bridge, project_root: str | Path) -> dict[str, Any]:
-    """``stats`` via bridge ``memory_stats``."""
-    root = str(Path(project_root).expanduser().resolve())
-    result = bridge.call("memory_stats", {"root": root})
-    path = str(result.get("path") or result.get("database") or memory_db_path(project_root))
+def _host_stats(project_root: str | Path) -> dict[str, Any]:
+    result = _memory_call("memory_stats", {"root": _project_root(project_root)})
     try:
         count = int(result.get("count", result.get("total_memories", 0)) or 0)
     except (TypeError, ValueError):
         count = 0
-    exists = result.get("exists")
-    exists = bool(exists) if exists is not None else count > 0
-    out: dict[str, Any] = {"path": path, "count": count, "exists": exists}
+    exists_value = result.get("exists")
+    exists = bool(exists_value) if exists_value is not None else count > 0
+    out: dict[str, Any] = {
+        "path": str(memory_db_path(project_root)),
+        "count": count,
+        "exists": exists,
+    }
     if exists:
         kinds = result.get("kinds")
-        out["kinds"] = kinds if isinstance(kinds, dict) else {}
+        out["kinds"] = dict(kinds) if isinstance(kinds, Mapping) else {}
     return out
 
 
@@ -274,12 +301,10 @@ def remember(
     source: str = "",
     importance: float = 0.5,
 ) -> int | None:
-    """Insert a memory. Dedupes identical content (returns existing id). None if empty.
+    """Insert a project memory, returning a stable integer id (or None if empty).
 
-    Hybrid backend: routes through the OMP bridge (mnemopi) when
-    ``CHUDWARE_MEMORY_BACKEND=mnemopi`` / ``agent.memory_backend`` is set, falling
-    back to SQLite+FTS5 below when the bridge is unavailable. Same signature and
-    return shape either way.
+    Online calls have one authority: the process-global Chudcode service.
+    Explicit offline mode uses the deterministic project-local SQLite store.
     """
     text = _normalize_content(content)
     if not text:
@@ -294,12 +319,8 @@ def remember(
         imp = 0.5
     imp = max(0.0, min(1.0, imp))
 
-    if _memory_backend() == "mnemopi":
-        bridge = _bridge()
-        try:
-            return _bridge_remember(bridge, project_root, text, kind, source, imp)
-        except bridge.BridgeUnavailable:
-            pass  # OMP bridge unavailable — fall back to SQLite+FTS5 below
+    if not _offline_memory():
+        return _host_remember(project_root, text, kind, source, imp)
     now = time.time()
     h = _content_hash(text)
     conn = _connect(project_root)
@@ -361,12 +382,8 @@ def recall(
     except (TypeError, ValueError):
         token_budget = 400
 
-    if _memory_backend() == "mnemopi":
-        bridge = _bridge()
-        try:
-            return _bridge_recall(bridge, project_root, q, limit, token_budget, kind)
-        except bridge.BridgeUnavailable:
-            pass  # OMP bridge unavailable — fall back to SQLite+FTS5 below
+    if not _offline_memory():
+        return _host_recall(project_root, q, limit, token_budget, kind)
 
     path = memory_db_path(project_root)
     if not path.is_file():
@@ -432,7 +449,9 @@ def recall(
     return _apply_token_budget(candidates, limit, token_budget)
 
 
-def format_for_context(hits: list[dict[str, Any]], *, header: str = "Project memory") -> str:
+def format_for_context(
+    hits: list[dict[str, Any]], *, header: str = "Project memory"
+) -> str:
     """Render recall hits as a compact context block (empty string if none)."""
     if not hits:
         return ""
@@ -445,13 +464,9 @@ def format_for_context(hits: list[dict[str, Any]], *, header: str = "Project mem
 
 
 def stats(project_root: str | Path) -> dict[str, Any]:
-    """Return basic counts for Settings / debug."""
-    if _memory_backend() == "mnemopi":
-        bridge = _bridge()
-        try:
-            return _bridge_stats(bridge, project_root)
-        except bridge.BridgeUnavailable:
-            pass  # OMP bridge unavailable — fall back to SQLite+FTS5 below
+    """Return project-scoped counts from Chudcode or the explicit offline store."""
+    if not _offline_memory():
+        return _host_stats(project_root)
     path = memory_db_path(project_root)
     if not path.is_file():
         return {"path": str(path), "count": 0, "exists": False}

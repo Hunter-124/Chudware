@@ -12,6 +12,7 @@
 #include "ui/clipboard_image.h"          // image-kind probe / mime / clipboard->PNG capture
 #include "ui/copilot/image_lightbox.h"   // attachment thumbnail tile + full-size viewer
 #include "ui/copilot/context_estimate.h"  // transcript-size estimate behind the context meter
+#include "ui/chudcode_descriptors.h"      // ui::chudcodeCompactReplacement — compact-result guard
 #include <climits>                        // INT_MAX saturation in activityCharsOf()
 
 // ---- auto-growing, wrapping chat input -------------------------------------------------------
@@ -1579,10 +1580,10 @@ static bool tryHandleSlashCommand(AppState& st, const std::string& text) {
         params["keep_recent_tokens"] = keepRecent;
         params["supersede_reads"] = supersedeReads;
         params["drop_useless"] = dropUseless;
-        // Snap rendering is provider-shaped: tell the worker which provider/model
-        // this session runs on (agentProviderOverride pins both), and anchor the
-        // re-snap chain to the conversation so later rounds append and a provider
-        // switch re-renders from the stored OG source instead of losing history.
+        // Anchor the compaction to this conversation's session: the Chudcode host owns the
+        // service-side transcript, so session_id (= conversation id, same value
+        // agent_admin_turn rides) is what lets an online compact rewrite the session it
+        // actually belongs to. Provider/model overrides pin summary rendering.
         {
             nlohmann::json pov = agentProviderOverride(st.settings);
             for (auto& el : pov.items()) params[el.key()] = el.value();
@@ -1600,13 +1601,13 @@ static bool tryHandleSlashCommand(AppState& st, const std::string& text) {
                 st.toast(ui::ToastLevel::Error, "session_compact: bad result");
                 return;
             }
-            // Prefer the rebuilt conversation (archive message + kept tail) so the
-            // compacted history is reinjected instead of silently dropped; fall
-            // back to the bare kept tail for older workers.
-            if (r.result.contains("messages") && r.result["messages"].is_array())
-                applyWireMessagesToChat(st, r.result["messages"]);
-            else if (r.result.contains("kept_messages") && r.result["kept_messages"].is_array())
-                applyWireMessagesToChat(st, r.result["kept_messages"]);
+            // Replace the visible chat ONLY when the result carries an explicit nonempty
+            // replacement payload (ui::chudcodeCompactReplacement: rebuilt "messages"
+            // first, legacy bare "kept_messages" tail second). Chudcode online compaction
+            // rewrites the service-side session and returns NEITHER — the visible chat
+            // must stay intact then, and a present-but-empty array must never wipe it.
+            if (const nlohmann::json* repl = ui::chudcodeCompactReplacement(r.result))
+                applyWireMessagesToChat(st, *repl);
             std::string notice;
             if (r.result.contains("short_summary") && r.result["short_summary"].is_string())
                 notice = r.result["short_summary"].get<std::string>();
@@ -1644,8 +1645,10 @@ static bool tryHandleSlashCommand(AppState& st, const std::string& text) {
                 st.toast(ui::ToastLevel::Error, "session_shake: bad result");
                 return;
             }
-            if (r.result.contains("messages") && r.result["messages"].is_array())
-                applyWireMessagesToChat(st, r.result["messages"]);
+            // Same replacement guard as /compact: only a nonempty explicit payload may
+            // replace the visible transcript.
+            if (const nlohmann::json* repl = ui::chudcodeCompactReplacement(r.result))
+                applyWireMessagesToChat(st, *repl);
             std::string notice;
             if (r.result.contains("notice") && r.result["notice"].is_string())
                 notice = r.result["notice"].get<std::string>();

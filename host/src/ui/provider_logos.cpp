@@ -1,10 +1,10 @@
 // provider_logos.cpp — see provider_logos.h. Baseline implementation: a per-provider brand
 // color + ASCII mark table with a hashed fallback, and a rounded badge drawer. Extend the
-// table as new providers appear in the OMP catalog.
+// table as new providers appear in the Chudcode catalog.
 #include "provider_logos.h"
 
-#include <array>
 #include <cstdint>
+#include <thread>
 #include <unordered_map>
 
 #include "ui_theme.h"
@@ -16,6 +16,10 @@
 #include <system_error>
 
 #include <nlohmann/json.hpp>
+
+#ifndef __EMSCRIPTEN__
+#include "agent/http.h"  // chudware::agent::http_get — direct favicon fetch (native only)
+#endif
 
 #include "stb_image.h"
 #include "gl_compat.h"
@@ -144,10 +148,12 @@ const char* hashedMark(const std::string& id) {
     return "?";
 }
 
-// ---- runtime favicon layer: bridge fetch -> appdata cache -> GL texture ---------------------
-// id -> brand domain. Only ids with a real, stable website are listed; the favicon service the
-// bridge queries resolves the icon. Unknown / on-prem ids (ollama, lm-studio, llama.cpp, vllm)
-// are intentionally absent -> they keep the drawn badge. Approximate domains are fine: a wrong
+// ---- runtime favicon layer: direct fetch -> appdata cache -> GL texture ---------------------
+// id -> brand domain. Only ids with a real, stable website are listed; a PNG-returning favicon
+// resolver serves the icon (same two-endpoint recipe as the parts vendor logos — see
+// parts_widgets.cpp: s2 primary, gstatic faviconV2 alternate, because stb_image decodes
+// neither ICO nor SVG). Unknown / on-prem ids (ollama, lm-studio, llama.cpp, vllm) are
+// intentionally absent -> they keep the drawn badge. Approximate domains are fine: a wrong
 // or missing icon just falls back to the badge.
 const std::unordered_map<std::string, std::string>& domainTable() {
     static const std::unordered_map<std::string, std::string> t = {
@@ -195,23 +201,23 @@ std::string logoCachePath(const std::string& id) {
     return logoCacheDir() + "/" + logoSafeId(id) + ".png";
 }
 
-// Standard base64 decode (bridge returns unpadded-safe standard base64, no line breaks).
-std::string b64dec(const std::string& in) {
-    static const std::array<int, 256> rev = [] {
-        std::array<int, 256> r; r.fill(-1);
-        const char* tbl = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-        for (int i = 0; i < 64; ++i) r[(unsigned char)tbl[i]] = i;
-        return r;
-    }();
-    std::string out; out.reserve(in.size() * 3 / 4);
-    int val = 0, bits = -8;
-    for (unsigned char c : in) {
-        if (c == '=') break;
-        if (rev[c] < 0) continue;
-        val = (val << 6) + rev[c]; bits += 6;
-        if (bits >= 0) { out.push_back(char((val >> bits) & 0xFF)); bits -= 8; }
-    }
-    return out;
+// A body is only cached when it decodes as an image stb_image can read back: PNG or JPEG
+// magic. Google's s2 endpoint 404s WITH a valid generic-globe PNG body for unknown domains
+// (measured on the parts pipeline) — any icon beats a lettered tile, so a decodable 4xx body
+// still wins after the one gstatic retry.
+bool looksLikeImageBytes(const std::string& b) {
+    if (b.size() < 64) return false;
+    const unsigned char* p = (const unsigned char*)b.data();
+    const bool png = p[0] == 0x89 && p[1] == 'P' && p[2] == 'N' && p[3] == 'G';
+    const bool jpg = p[0] == 0xFF && p[1] == 0xD8 && p[2] == 0xFF;
+    return png || jpg;
+}
+std::string logoPrimaryUrl(const std::string& domain) {
+    return "https://www.google.com/s2/favicons?domain=" + domain + "&sz=64";
+}
+std::string logoAlternateUrl(const std::string& domain) {
+    return "https://t3.gstatic.com/faviconV2?client=SOCIAL&type=FAVICON"
+           "&fallback_opts=TYPE,SIZE,URL&url=https://" + domain + "&size=64";
 }
 
 bool logoEnabled() {
@@ -323,6 +329,7 @@ void setProviderLogosEnabled(bool on) {
 }
 
 void providerLogosTick(AppState& st) {
+    (void)st;   // fetches are direct HTTP on a detached thread; no RPC through AppState now
     if (!logoEnabled()) { g_logoReq.clear(); return; }
     int budget = 3;  // fetch kicks per frame (throttle a first-open burst)
     for (const std::string& id : g_logoReq) {
@@ -354,16 +361,29 @@ void providerLogosTick(AppState& st) {
         if (!lt.fetching && budget > 0) {
             lt.fetching = true; --budget;
             const std::string domain = dit->second;
-            st.rpc.call("agent_provider_logo",
-                        nlohmann::json{{"domain", domain}, {"size", 64}},
-                        [path](const core::RpcResult& r) {
-                // Off the GL thread: only touch disk (atomic tmp+rename). The next tick loads it.
-                if (!r.ok || !r.result.is_object()) return;
-                if (!r.result.value("ok", false)) return;
-                const std::string b64 = r.result.value("b64", std::string());
-                if (b64.empty()) return;
-                const std::string bytes = b64dec(b64);
-                if (bytes.size() < 64) return;
+#if defined(__EMSCRIPTEN__)
+            // No direct-fetch transport in the browser build — badges only. fetching stays
+            // set so the id is not re-kicked every frame.
+            (void)st;
+#else
+            // Background non-agent fetch on a detached thread (never the GL thread): the
+            // s2 favicon resolver first, then ONE gstatic faviconV2 retry — s2 404s with a
+            // valid generic-globe PNG for domains it lacks, while faviconV2 sometimes still
+            // has the real icon; any decodable icon beats a lettered tile. Only disk is
+            // touched off-thread (atomic tmp+rename); the next tick loads the cached file.
+            std::thread([domain, path]() {
+                const std::vector<std::pair<std::string, std::string>> hdrs;
+                std::string bytes;
+                auto fetch = [&hdrs](const std::string& url) -> std::string {
+                    chudware::agent::HttpResponse r =
+                        chudware::agent::http_get(url, hdrs, 8000);
+                    if (!r.error.empty()) return {};
+                    return looksLikeImageBytes(r.body) && r.status < 500 ? r.body
+                                                                        : std::string();
+                };
+                bytes = fetch(logoPrimaryUrl(domain));
+                if (bytes.empty()) bytes = fetch(logoAlternateUrl(domain));
+                if (bytes.empty()) return;
                 std::error_code ec2;
                 std::filesystem::create_directories(
                     std::filesystem::path(path).parent_path(), ec2);
@@ -371,7 +391,8 @@ void providerLogosTick(AppState& st) {
                 { std::ofstream o(tmp, std::ios::binary | std::ios::trunc);
                   if (!o) return; o.write(bytes.data(), (std::streamsize)bytes.size()); }
                 std::filesystem::rename(tmp, path, ec2);
-            });
+            }).detach();
+#endif
         }
     }
     g_logoReq.clear();

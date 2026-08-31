@@ -14,9 +14,9 @@
 // Consumers MUST hide their indicator when there is nothing to show — never render 0%.
 //
 // There are TWO upstream stores, not one. The `subscription_*` RPCs above read the Python
-// worker's account table; the omp bridge sidecar keeps its OWN credential store, and a Claude
+// worker's account table; the Chudcode service keeps its OWN credential store, and a Claude
 // Max / ZenMux / Kimi Code OAuth session signed in through Settings → Providers exists only
-// there. Those windows arrive via `agent_provider_state` and land in the SAME UsageWindow model
+// there. Those windows arrive via `chudcode_auth_state` and land in the SAME UsageWindow model
 // (see providerUsagePollBridge), so a consumer picks a source and draws identical rings.
 // -------------------------------------------------------------------------------------------------
 #include <map>
@@ -69,8 +69,8 @@ void providerUsagePollAccounts(AppState& st, double ttlSec, bool force);
 // Usage windows. TTL is fixed at 5 min per contracts/providers.md §4.5; `force` bypasses it.
 // No-op once the worker has reported the method as unknown.
 void providerUsagePollUsage(AppState& st, bool force);
-// Rate-limit windows the omp bridge reports for ONE bridge provider id ("anthropic", "zenmux",
-// "kimi-code"). Source RPC is `agent_provider_state`, the same call Settings → Providers makes;
+// Rate-limit windows the Chudcode service reports for ONE provider id ("anthropic", "zenmux",
+// "kimi-code"). Source RPC is `chudcode_auth_state`, the same call Settings → Providers makes;
 // results are cached per provider id. Same 5-min TTL, in-flight guard and unknown-method latch
 // as the polls above; a soft failure keeps the last good windows rather than blanking the rings.
 void providerUsagePollBridge(AppState& st, const char* bridgeProviderId, bool force);
@@ -108,7 +108,7 @@ const std::vector<UsageWindow>* bridgeProviderUsage(const std::string& bridgePro
 const float* usageStatusColor(const std::string& status, float frac);
 // "resets in 2h 14m" from a reset stamp; empty when absent or unparseable. Accepts BOTH wire
 // forms in use: ISO-8601 (Python `subscription_usage`) and a decimal count of milliseconds since
-// the epoch (omp bridge `agent_provider_state`, which sends resetsAt as a NUMBER).
+// the epoch (Chudcode `chudcode_auth_state`, which sends resetsAt as a NUMBER).
 std::string  usageResetCountdown(const std::string& stamp);
 // Very short window caption for a compact ring ("5H", "7D") derived from window/label.
 std::string  usageWindowShortLabel(const UsageWindow& w);

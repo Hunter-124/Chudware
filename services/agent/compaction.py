@@ -1,8 +1,8 @@
-"""Session compaction engines (omp snapcompact text-phase + shake).
+"""Deterministic local transcript compaction for offline/standalone consumers.
 
-Pure, deterministic helpers for transcript serialization, archival compaction
-(text edges; PNG frames deferred to a future vision phase), mechanical shake
-elision, and archive reinjection.  Consumed by session_cmds RPCs and tests.
+Online Chudcode sessions own their own history compaction. This module retains
+text archival, mechanical shake elision, and archive reinjection only for
+callers that explicitly cannot use a live Chudcode session.
 
 Message shape is OpenAI-style role+content dicts (not ChatMsg {u,t}):
 
@@ -12,19 +12,21 @@ Message shape is OpenAI-style role+content dicts (not ChatMsg {u,t}):
 * Tool results: role ``tool`` or ``toolResult`` with ``tool_call_id`` /
   ``toolCallId``, optional ``useless`` / ``is_error`` / ``pruned_at``.
 """
+
 from __future__ import annotations
 
 import copy
 import json
 import math
 import re
-from pathlib import Path
 from typing import Any, Iterable
 
 # --------------------------------------------------------------------------- constants
-CHARS_PER_TOKEN = 3.2  # conservative: code/JSON-heavy transcripts run ~3.0-3.3 chars/token,
-                       # not the naive 4 — underestimating lets true prompt tokens overflow
-                       # the context window while compaction thinks it's under budget.
+CHARS_PER_TOKEN = (
+    3.2  # conservative: code/JSON-heavy transcripts run ~3.0-3.3 chars/token,
+)
+# not the naive 4 — underestimating lets true prompt tokens overflow
+# the context window while compaction thinks it's under budget.
 
 TOOL_RESULT_MAX_CHARS = 2000
 TOOL_ARG_MAX_CHARS = 500
@@ -62,6 +64,7 @@ _INTENT_FIELDS = frozenset({"intent", "i"})
 
 # --------------------------------------------------------------------------- token / truncate helpers
 
+
 def count_tokens(text: str) -> int:
     """Conservative chars/token ceiling heuristic (see CHARS_PER_TOKEN)."""
     if not text:
@@ -69,7 +72,9 @@ def count_tokens(text: str) -> int:
     return math.ceil(len(text) / CHARS_PER_TOKEN)
 
 
-def truncate_middle(text: str, max_chars: int, head_ratio: float = TRUNCATE_HEAD_RATIO) -> str:
+def truncate_middle(
+    text: str, max_chars: int, head_ratio: float = TRUNCATE_HEAD_RATIO
+) -> str:
     """Keep head+tail of *text*, eliding the middle beyond *max_chars*."""
     if max_chars <= 0:
         return ""
@@ -92,6 +97,7 @@ def _json_dumps(value: Any) -> str:
 
 
 # --------------------------------------------------------------------------- message accessors
+
 
 def _role(msg: dict) -> str:
     return str(msg.get("role") or "")
@@ -199,12 +205,17 @@ def _iter_tool_calls(msg: dict) -> list[dict]:
                         args = {"_raw": args}
                 if not isinstance(args, dict):
                     args = {}
-                out.append({
-                    "id": str(block.get("id") or block.get("tool_call_id") or ""),
-                    "name": str(block.get("name") or block.get("tool") or ""),
-                    "arguments": args,
-                    "intent": block.get("intent") or args.get("intent") or args.get("i") or "",
-                })
+                out.append(
+                    {
+                        "id": str(block.get("id") or block.get("tool_call_id") or ""),
+                        "name": str(block.get("name") or block.get("tool") or ""),
+                        "arguments": args,
+                        "intent": block.get("intent")
+                        or args.get("intent")
+                        or args.get("i")
+                        or "",
+                    }
+                )
     tcs = msg.get("tool_calls")
     if isinstance(tcs, list):
         for tc in tcs:
@@ -222,12 +233,17 @@ def _iter_tool_calls(msg: dict) -> list[dict]:
                 args = raw_args
             else:
                 args = {}
-            out.append({
-                "id": str(tc.get("id") or ""),
-                "name": name,
-                "arguments": args,
-                "intent": tc.get("intent") or args.get("intent") or args.get("i") or "",
-            })
+            out.append(
+                {
+                    "id": str(tc.get("id") or ""),
+                    "name": name,
+                    "arguments": args,
+                    "intent": tc.get("intent")
+                    or args.get("intent")
+                    or args.get("i")
+                    or "",
+                }
+            )
     return out
 
 
@@ -261,7 +277,10 @@ def _base_read_path(path: str) -> str:
             r"|(?:L?\d+(?:(?:[-+]|\.\.)L?\d+|-|\.\.)?(?:,L?\d+(?:(?:[-+]|\.\.)L?\d+|-|\.\.)?)*:)?raw"
             r"|raw:(?:L?\d+(?:(?:[-+]|\.\.)L?\d+|-|\.\.)?(?:,L?\d+(?:(?:[-+]|\.\.)L?\d+|-|\.\.)?)*))",
             sel,
-        ) or re.fullmatch(r"(?i)raw|conflicts|L?\d+(?:[-+.]{1,2}L?\d+)?(?:,L?\d+(?:[-+.]{1,2}L?\d+)?)*", sel):
+        ) or re.fullmatch(
+            r"(?i)raw|conflicts|L?\d+(?:[-+.]{1,2}L?\d+)?(?:,L?\d+(?:[-+.]{1,2}L?\d+)?)*",
+            sel,
+        ):
             base = base[:colon]
             continue
         # compound range:raw already handled; stop on non-selector
@@ -270,6 +289,7 @@ def _base_read_path(path: str) -> str:
 
 
 # --------------------------------------------------------------------------- serialize_transcript
+
 
 def serialize_transcript(messages: list[dict], *, drop_useless: bool = True) -> str:
     """Dense ``¶user/¶think/¶ai/¶call`` transcript of *messages*.
@@ -321,7 +341,9 @@ def serialize_transcript(messages: list[dict], *, drop_useless: bool = True) -> 
             entries.append(
                 f"{key}={truncate_middle(_json_dumps(value), TOOL_ARG_MAX_CHARS, TRUNCATE_HEAD_RATIO)}"
             )
-        return truncate_middle(", ".join(entries), TOOL_CALL_MAX_CHARS, TRUNCATE_HEAD_RATIO)
+        return truncate_middle(
+            ", ".join(entries), TOOL_CALL_MAX_CHARS, TRUNCATE_HEAD_RATIO
+        )
 
     for msg in messages:
         role = _role(msg)
@@ -373,9 +395,16 @@ def serialize_transcript(messages: list[dict], *, drop_useless: bool = True) -> 
                                 args = {"_raw": args}
                         if not isinstance(args, dict):
                             args = {}
-                        intent = str(
-                            block.get("intent") or args.get("intent") or args.get("i") or ""
-                        ).replace("\n", " ").strip()
+                        intent = (
+                            str(
+                                block.get("intent")
+                                or args.get("intent")
+                                or args.get("i")
+                                or ""
+                            )
+                            .replace("\n", " ")
+                            .strip()
+                        )
                         name = str(block.get("name") or block.get("tool") or "tool")
                         first = f"{name}({format_args(args)})"
                         if intent:
@@ -412,7 +441,8 @@ def serialize_transcript(messages: list[dict], *, drop_useless: bool = True) -> 
                 part_ids = {
                     str(b.get("id") or "")
                     for b in (content if isinstance(content, list) else [])
-                    if isinstance(b, dict) and b.get("type") in ("toolCall", "tool_call")
+                    if isinstance(b, dict)
+                    and b.get("type") in ("toolCall", "tool_call")
                 }
                 for tc in _iter_tool_calls({"tool_calls": msg.get("tool_calls")}):
                     if tc["id"] and tc["id"] in part_ids:
@@ -441,6 +471,7 @@ def serialize_transcript(messages: list[dict], *, drop_useless: bool = True) -> 
 
 
 # --------------------------------------------------------------------------- cut / supersede
+
 
 def _valid_cut_index(messages: list[dict], index: int) -> int:
     """Never cut mid tool-result: advance to first non-tool-result at/after *index*."""
@@ -577,249 +608,8 @@ def _plan_text_archive(text: str, edge_chars: int = TEXT_EDGE_CHARS) -> dict[str
     }
 
 
-# --------------------------------------------------------------------------- OMP snap rendering
-# Optional: under the omp backend (env CHUDWARE_COMPACTION_BACKEND=omp / config.json
-# agent.compaction_backend="omp") the canonical local archive below is ADDITIONALLY
-# rendered to OMP snapcompact PNG frames via the bridge's ``snap_render`` RPC
-# (vendor/omp/bridge/src/snap-render.ts — foveated text-to-image frames in the active
-# provider's optimal shape; the local cut/serialization stays canonical either way).
-# The full OG source text round-trips through the bridge (``text`` in, ``text`` out)
-# and persists in the snap store (services/agent/snap_store.py), so the next round
-# re-renders with new history appended and a mid-session provider switch re-renders
-# the same source in the new provider's shape — the original contents are never lost.
-# Any bridge/store failure degrades to the text-only archive with a warning.
-
-def _compaction_backend(cfg: dict | None = None) -> str:
-    """``"local"`` (default) or ``"omp"``.
-
-    Precedence ENV > config.json > default (omp port) — resolution lives in
-    services.agent.config.compaction_backend (returns "builtin"/"omp"; "builtin"
-    maps to this module's "local"); CHUDWARE_COMPACTION_BACKEND still wins, and
-    config.json ``agent.compaction_backend`` is honored when the env is unset.
-    """
-    try:
-        from services.agent.config import compaction_backend  # noqa: PLC0415
-        return "omp" if compaction_backend(cfg) == "omp" else "local"
-    except Exception:  # noqa: BLE001 — bad/missing config never breaks compaction
-        return "local"
-
-
-# Machine-readable first line of every reinjected snap archive message — the
-# conversation itself is the re-snap chain record (see _snap_anchor).
-_SNAP_STAMP_RE = re.compile(
-    r"\[snap:([0-9a-f]{8,32})(?:\s+api=([\w.-]*))?(?:\s+model=([^\]]*))?\]")
-
-
-def _snap_stamp_line(snap: dict) -> str:
-    return f"[snap:{snap.get('snap_id')} api={snap.get('api') or ''} model={snap.get('model') or ''}]"
-
-
-def _snap_anchor(prior_archive: dict | None, messages: list) -> dict | None:
-    """Resolve the chain parent for the next snap render.
-
-    An explicit ``prior_archive["snap"]`` wins (Python-side callers that thread
-    the archive through); otherwise the NEWEST message carrying a snap stamp
-    line (reinject writes it). If the conversation no longer carries a stamped
-    archive message — the user deleted it, or this is a fresh session — the
-    chain deliberately starts fresh instead of appending history the
-    conversation has lost.
-    """
-    if isinstance(prior_archive, dict):
-        snap = prior_archive.get("snap")
-        if isinstance(snap, dict) and snap.get("snap_id"):
-            return snap
-    for msg in reversed(list(messages or [])):
-        if not isinstance(msg, dict):
-            continue
-        m = _SNAP_STAMP_RE.search(_message_text_blob(msg))
-        if m:
-            return {
-                "snap_id": m.group(1),
-                "api": m.group(2) or "",
-                "model": (m.group(3) or "").strip(),
-            }
-    return None
-
-
-def _snap_render_and_store(out: dict, *, serialized: str, prior_archive: dict | None,
-                           messages: list, provider: dict,
-                           session_id: str | None) -> None:
-    """Best-effort snap render of this round's archive.
-
-    Renders ``serialized`` (this round's newly discarded history) unfolded onto
-    the chain parent's OG source via the bridge ``snap_render`` RPC, persists
-    OG source + frames in the snap store, and attaches a small
-    ``archive["snap"]`` reference (no base64 on the RPC wire). Any failure
-    leaves ``archive["warning"]`` and the archive stays text-only.
-    """
-    archive = out.get("archive")
-    if not isinstance(archive, dict) or not isinstance(provider, dict):
-        return
-    if not provider.get("vision"):
-        return
-    if _compaction_backend() != "omp":
-        return
-    try:
-        from services.agent.config import (  # noqa: PLC0415
-            compaction_snap_frames, compaction_snap_max_frames)
-        if not compaction_snap_frames():
-            return
-        max_frames = compaction_snap_max_frames()
-    except Exception:  # noqa: BLE001 — config unreadable: defaults (on, 80)
-        max_frames = 80
-    api = str(provider.get("api") or "anthropic")
-    model = str(provider.get("model") or provider.get("model_id") or "")
-    try:
-        from services.agent import omp_bridge, snap_store  # noqa: PLC0415
-        anchor = _snap_anchor(prior_archive, messages)
-        prior_source = ""
-        if anchor:
-            prior_source = snap_store.source_of(str(anchor.get("snap_id"))) or ""
-        if not prior_source and isinstance(prior_archive, dict):
-            # Legacy text-only prior: seed the OG chain from its folded text.
-            prior_source = str(prior_archive.get("text") or "")
-            if not prior_source:
-                head = str(prior_archive.get("text_head") or "")
-                tail = str(prior_archive.get("text_tail") or "")
-                prior_source = "\n".join(p for p in (head, tail) if p)
-        if not serialized and not prior_source:
-            return  # nothing archived this round
-        resp = omp_bridge.call("snap_render", {
-            "text": serialized or "",
-            "priorText": prior_source,
-            "modelId": model,
-            "api": api,
-            "maxFrames": max_frames,
-        }, timeout=180)
-        og_source = str(resp.get("text") or "")
-        frames = [f for f in (resp.get("frames") or []) if isinstance(f, dict)]
-        meta = snap_store.put(
-            og_source, frames,
-            parent_id=str(anchor.get("snap_id")) if anchor else None,
-            model=model, api=api,
-            truncated_chars=int(resp.get("truncatedChars") or 0),
-        )
-        if not meta:
-            raise RuntimeError("snap store write failed")
-        snap_ref = {
-            "snap_id": meta["snap_id"],
-            "api": api,
-            "model": model,
-            "frame_count": len(frames),
-            "truncated_chars": int(resp.get("truncatedChars") or 0),
-            "checksum": str(resp.get("checksum") or ""),
-        }
-        if session_id:
-            snap_ref["session_id"] = str(session_id)
-        archive["snap"] = snap_ref
-        if frames:
-            out["short_summary"] = (
-                f'{out.get("short_summary") or ""} (+{len(frames)} snap frames)')
-    except Exception as exc:  # noqa: BLE001 — snap must never break compaction
-        archive["warning"] = f"snap render unavailable ({exc}); archive is text-only"
-
-
-def _budget_frames(frames: list, cap: int, byte_budget: int) -> list:
-    """Chronological edge-keeping frame budget: when over *cap*, drop MIDDLE
-    frames first (the foveal edges carry the densest context); then stop adding
-    frames once *byte_budget* of PNG bytes is exhausted."""
-    n = len(frames)
-    if n <= cap:
-        chosen = list(frames)
-    else:
-        head_n = max(1, cap // 2)
-        tail_n = cap - head_n
-        chosen = frames[:head_n] + frames[n - tail_n:]
-    out: list = []
-    total = 0
-    for fr in chosen:
-        size = 0
-        path = fr.get("path")
-        if path:
-            try:
-                size = Path(path).stat().st_size
-            except OSError:
-                size = 0
-        if out and total + size > byte_budget:
-            break
-        total += size
-        out.append(fr)
-    return out
-
-
-def _resnap_for_provider(meta: dict, *, api: str, model: str) -> dict | None:
-    """Re-render a snap's stored OG source in a different provider's shape
-    (mid-session provider switch). Returns the freshly stored meta (chained to
-    the old snap via parent_id), or None to keep the old-shape frames."""
-    try:
-        from services.agent import omp_bridge, snap_store  # noqa: PLC0415
-        from services.agent.config import compaction_snap_max_frames  # noqa: PLC0415
-        source = snap_store.source_of(str(meta.get("snap_id") or ""))
-        if not source:
-            return None
-        resp = omp_bridge.call("snap_render", {
-            "text": "",
-            "priorText": source,
-            "modelId": model,
-            "api": api,
-            "maxFrames": compaction_snap_max_frames(),
-        }, timeout=180)
-        new_meta = snap_store.put(
-            str(resp.get("text") or source),
-            [f for f in (resp.get("frames") or []) if isinstance(f, dict)],
-            parent_id=str(meta.get("snap_id") or "") or None,
-            model=model, api=api,
-            truncated_chars=int(resp.get("truncatedChars") or 0),
-        )
-        if not new_meta:
-            return None
-        return snap_store.get(str(new_meta["snap_id"]))
-    except Exception:  # noqa: BLE001 — keep the old-shape frames on any failure
-        return None
-
-
-def _snap_vision_parts(body: dict, provider: dict, text_content: str) -> list | None:
-    """Content-parts reinject for vision providers: the archive text part plus
-    the snap's PNG frame images, capped to the provider's image budget.
-
-    Re-renders from the stored OG source when the active provider differs from
-    the one that rendered the snap (provider switch) or when frame files are
-    missing. Returns None to fall back to the plain-text reinject.
-    """
-    snap = body.get("snap")
-    if not isinstance(snap, dict) or not snap.get("snap_id"):
-        return None
-    try:
-        from services.agent import snap_store, snap_spec  # noqa: PLC0415
-        from services.agent.providers.base import image_part  # noqa: PLC0415
-    except Exception:  # noqa: BLE001
-        return None
-    meta = snap_store.get(str(snap["snap_id"]))
-    if meta is None:
-        return None  # store lost/corrupt — the text reinject still carries history
-    api = str(provider.get("api") or "anthropic")
-    model = str(provider.get("model") or provider.get("model_id") or "")
-    if (str(meta.get("api") or "") != api) or (str(meta.get("model") or "") != model):
-        resnap = _resnap_for_provider(meta, api=api, model=model)
-        if resnap is not None:
-            meta = resnap
-    frames = [f for f in (meta.get("frames") or []) if isinstance(f, dict) and f.get("path")]
-    if not frames:
-        return None  # small archive: everything is in the text edges already
-    cap = snap_spec.FAMILY_IMAGE_BUDGETS.get(api, snap_spec.DEFAULT_IMAGE_BUDGET)
-    keep = _budget_frames(frames, int(cap), int(snap_spec.FRAME_BYTES_BUDGET))
-    omitted = len(frames) - len(keep)
-    text = text_content
-    if omitted > 0:
-        text += (f"\n\n({omitted} middle snap frame(s) omitted to fit the provider "
-                 "image budget; the full archive is preserved in the snap store.)")
-    parts = [{"type": "text", "text": text}]
-    for fr in keep:
-        parts.append(image_part(str(fr["path"]), "image/png"))
-    return parts if len(parts) > 1 else None
-
-
 # --------------------------------------------------------------------------- snapcompact_archive
+
 
 def snapcompact_archive(
     messages: list[dict],
@@ -827,36 +617,13 @@ def snapcompact_archive(
     prior_archive: dict | None = None,
     supersede_reads: bool = True,
     drop_useless: bool = True,
-    provider: dict | None = None,
-    session_id: str | None = None,
 ) -> dict[str, Any]:
-    """Text-phase snapcompact: archive discarded turns, keep recent tail.
+    """Local text compaction for explicit offline/standalone consumers.
 
-    Returns::
-
-        {
-          "archive": {text, text_head, text_tail, truncated_chars, total_chars,
-                      snap?, warning?},
-          "summary": <static reading guide>,
-          "short_summary": "Archived N chars of history (+M as text)",
-          "kept_messages": [...],
-          "cut_index": int,
-        }
-
-    No LLM call. Never cuts mid tool-result. Cumulative fold of
-    ``prior_archive["text"]``.
-
-    OMP snap rendering: when the omp backend is gated on (env
-    CHUDWARE_COMPACTION_BACKEND=omp / agent.compaction_backend="omp") AND
-    *provider* carries ``vision: true``, the archived source is additionally
-    rendered to OMP snapcompact PNG frames (provider-shaped via
-    ``provider["api"]``/``provider["model"]``), the full OG source + frames are
-    persisted in the snap store, and ``archive["snap"]`` carries a small
-    reference (snap_id/api/model/frame_count/checksum; no base64 here).
-    Re-snap chaining resolves via :func:`_snap_anchor` (explicit prior_archive
-    snap, else the stamped archive message in *messages*). Bridge/store
-    failure degrades to text-only with ``archive["warning"]`` — the canonical
-    local archive is produced identically either way.
+    No LLM or online bridge call is made. The archive preserves bounded text
+    edges, never cuts mid tool-result, and cumulatively folds
+    ``prior_archive["text"]``. Ordinary Chudcode sessions must use Chudcode's
+    ``compact`` session command instead of this function.
     """
     msgs = list(messages or [])
     if supersede_reads:
@@ -897,50 +664,33 @@ def snapcompact_archive(
 
     summary = STATIC_READING_GUIDE
     if layout["truncated_chars"]:
-        summary = (
-            STATIC_READING_GUIDE.replace(
-                "Reading HISTORY:\n",
-                f"Reading HISTORY:\n"
-                f"- About {layout['truncated_chars']:,} characters of older middle history "
-                f"were dropped to fit the archive budget.\n",
-            )
+        summary = STATIC_READING_GUIDE.replace(
+            "Reading HISTORY:\n",
+            f"Reading HISTORY:\n"
+            f"- About {layout['truncated_chars']:,} characters of older middle history "
+            f"were dropped to fit the archive budget.\n",
         )
 
-    out: dict[str, Any] = {
+    return {
         "archive": {
             "text": layout["text"],
             "text_head": layout["text_head"],
             "text_tail": layout["text_tail"],
             "truncated_chars": layout["truncated_chars"],
             "total_chars": layout["total_chars"],
-            # frames reserved for the snap store (paths, not base64, on this wire)
-            "frames": [],
         },
         "summary": summary,
         "short_summary": short,
         "kept_messages": kept_messages,
         "cut_index": cut_index,
     }
-    if provider is not None:
-        _snap_render_and_store(
-            out, serialized=serialized, prior_archive=prior_archive,
-            messages=messages, provider=provider, session_id=session_id,
-        )
-    return out
 
 
 # --------------------------------------------------------------------------- reinject_archive
 
-def reinject_archive(archive: dict, *, provider: dict | None = None) -> list[dict]:
-    """Build prepend messages (lead-in summary + archive text edges) for rebuild.
 
-    Default return is one plain-text user message. When the archive carries a
-    ``snap`` reference, a machine-readable ``[snap:<id> api=… model=…]`` stamp
-    line leads the text — the conversation itself is the re-snap chain record
-    (:func:`_snap_anchor` finds it next round). With a vision *provider* and a
-    snap present, the message becomes content parts: the same text plus the
-    snap's PNG frames (budget-capped, re-rendered from the stored OG source
-    when the provider changed — :func:`_snap_vision_parts`)."""
+def reinject_archive(archive: dict) -> list[dict]:
+    """Build one plain-text archive message for an offline transcript rebuild."""
     if not isinstance(archive, dict):
         return []
 
@@ -975,21 +725,11 @@ def reinject_archive(archive: dict, *, provider: dict | None = None) -> list[dic
     history = "\n".join(history_parts) if history_parts else full_text
     content = summary.rstrip() + "\n\n" + history if history else summary
 
-    snap = body.get("snap")
-    if isinstance(snap, dict) and snap.get("snap_id"):
-        content = _snap_stamp_line(snap) + "\n" + content
-
-    if provider and provider.get("vision") and isinstance(snap, dict):
-        try:
-            parts = _snap_vision_parts(body, provider, content)
-        except Exception:  # noqa: BLE001 — reinject must never lose the text
-            parts = None
-        if parts is not None:
-            return [{"role": "user", "content": parts}]
     return [{"role": "user", "content": content}]
 
 
 # --------------------------------------------------------------------------- shake adapter
+
 
 def _shake_images(messages: list[dict]) -> dict[str, Any]:
     """CAD content-shape adapter for `/shake images`.
@@ -1009,12 +749,12 @@ def _shake_images(messages: list[dict]) -> dict[str, Any]:
         dropped_tokens = 0
         for block in content:
             if isinstance(block, dict) and block.get("type") in (
-                    "image", "image_url", "input_image"):
+                "image",
+                "image_url",
+                "input_image",
+            ):
                 blob = str(
-                    block.get("path")
-                    or block.get("url")
-                    or block.get("data")
-                    or ""
+                    block.get("path") or block.get("url") or block.get("data") or ""
                 )
                 dropped_tokens += max(count_tokens(blob), 85)
             else:
@@ -1022,13 +762,15 @@ def _shake_images(messages: list[dict]) -> dict[str, Any]:
         if dropped_tokens:
             message["content"] = kept
             saved += dropped_tokens
-            regions.append({
-                "kind": "images",
-                "message_index": message_index,
-                "tokens": dropped_tokens,
-                "original_text": "",
-                "label": "images",
-            })
+            regions.append(
+                {
+                    "kind": "images",
+                    "message_index": message_index,
+                    "tokens": dropped_tokens,
+                    "original_text": "",
+                    "label": "images",
+                }
+            )
     placeholders = len(regions)
     return {
         "messages": msgs,
@@ -1037,7 +779,8 @@ def _shake_images(messages: list[dict]) -> dict[str, Any]:
         "placeholders": placeholders,
         "notice": (
             f"shook {placeholders} image region(s), ~{saved} tokens"
-            if placeholders else "no images to drop"
+            if placeholders
+            else "no images to drop"
         ),
     }
 
@@ -1049,35 +792,110 @@ def shake_messages(
     aggressive: bool = False,
     keep_boundary_index: int | None = None,
 ) -> dict[str, Any]:
-    """Shake a deep-copied transcript through private OMP's canonical algorithm.
-
-    CAD owns only JSON/OpenAI message conversion and the image-only product mode.
-    Region selection, protection, token thresholds, mutation ordering, and
-    placeholders are owned and tested once by ``pi-agent-core``.
-    """
+    """Mechanically elide heavy local transcript regions without online calls."""
     if mode == "images":
         return _shake_images(messages)
-    from services.agent import omp_bridge  # noqa: PLC0415
 
-    params: dict[str, Any] = {
-        "messages": copy.deepcopy(list(messages or [])),
-        "aggressive": bool(aggressive),
-    }
-    if keep_boundary_index is not None:
-        params["keepBoundaryIndex"] = int(keep_boundary_index)
-    response = omp_bridge.call("shake", params)
-    if not isinstance(response, dict):
-        raise omp_bridge.BridgeUnavailable("OMP shake returned a non-object result")
-    shaken = response.get("messages")
-    regions = response.get("regions")
-    if not isinstance(shaken, list) or not isinstance(regions, list):
-        raise omp_bridge.BridgeUnavailable("OMP shake result is missing messages/regions")
+    shaken = copy.deepcopy(list(messages or []))
+    calls = _collect_tool_calls_by_id(shaken)
+    regions: list[dict[str, Any]] = []
+    saved = 0
+    protect_tokens = 16_000
+    min_savings = 4_000
+    suffix_tokens = [0] * (len(shaken) + 1)
+    for index in range(len(shaken) - 1, -1, -1):
+        suffix_tokens[index] = suffix_tokens[index + 1] + estimate_message_tokens(
+            shaken[index]
+        )
+
+    def replace_region(
+        message: dict,
+        message_index: int,
+        original: str,
+        kind: str,
+        label: str,
+    ) -> None:
+        nonlocal saved
+        original_tokens = count_tokens(original)
+        region_index = len(regions)
+        placeholder = (
+            f"[shaken ~{original_tokens:,} tokens — {label} (region {region_index})]"
+        )
+        message["content"] = placeholder
+        saved += max(0, original_tokens - count_tokens(placeholder))
+        regions.append(
+            {
+                "kind": kind,
+                "message_index": message_index,
+                "tokens": original_tokens,
+                "original_text": original,
+                "label": label,
+                "placeholder": placeholder,
+            }
+        )
+
+    boundary = (
+        max(0, int(keep_boundary_index))
+        if keep_boundary_index is not None
+        else len(shaken)
+    )
+    for index, message in enumerate(shaken):
+        if index >= boundary:
+            continue
+        if _is_tool_result(message):
+            original = _text_from_content(message.get("content"))
+            call = calls.get(_tool_call_id(message), {})
+            name = _tool_name(message) or _tool_name(call)
+            args = call.get("arguments") or call.get("args") or {}
+            path = _read_path_from_args(args) if isinstance(args, dict) else None
+            if name == "read" and path and path.startswith("skill://"):
+                continue
+            tokens = count_tokens(original)
+            old_enough = suffix_tokens[index + 1] >= protect_tokens
+            if original and (aggressive or (old_enough and tokens >= min_savings)):
+                replace_region(message, index, original, "tool_result", name or "tool")
+            continue
+        if not aggressive:
+            continue
+        original = _text_from_content(message.get("content"))
+        fences = list(re.finditer(r"```[^\n]*\n.*?```", original, flags=re.DOTALL))
+        if not fences:
+            continue
+        rewritten = original
+        for match in reversed(fences):
+            fenced = match.group(0)
+            tokens = count_tokens(fenced)
+            region_index = len(regions)
+            placeholder = (
+                f"[shaken ~{tokens:,} tokens — code fence (region {region_index})]"
+            )
+            rewritten = (
+                rewritten[: match.start()] + placeholder + rewritten[match.end() :]
+            )
+            saved += max(0, tokens - count_tokens(placeholder))
+            regions.append(
+                {
+                    "kind": "code",
+                    "message_index": index,
+                    "tokens": tokens,
+                    "original_text": fenced,
+                    "label": "code fence",
+                    "placeholder": placeholder,
+                }
+            )
+        message["content"] = rewritten
+
+    placeholders = len(regions)
     return {
         "messages": shaken,
-        "saved_tokens": int(response.get("saved_tokens") or 0),
+        "saved_tokens": saved,
         "regions": regions,
-        "placeholders": int(response.get("placeholders") or 0),
-        "notice": str(response.get("notice") or ""),
+        "placeholders": placeholders,
+        "notice": (
+            f"shook {placeholders} region(s), ~{saved} tokens"
+            if placeholders
+            else "minSavings not reached; nothing to shake"
+        ),
     }
 
 

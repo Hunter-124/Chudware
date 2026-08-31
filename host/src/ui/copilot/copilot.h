@@ -47,11 +47,10 @@ enum class AiSettingsSection {
 };
 bool drawAiSettingsSection(AppState& state, bool busy, AiSettingsSection section);
 
-// Free AI (FreeLLMAPI) provider card — always reachable from Settings -> Providers regardless
-// of OMP bridge availability (that tab is otherwise entirely bridge-catalog driven and has no
-// row for a native, non-bridge provider). Renders active-editing or dormant-key-park UI
-// depending on whether Free AI is the current Settings::provider. Returns true if a field
-// changed (dormant-slot edits + the switch button persist immediately either way).
+// Free AI (FreeLLMAPI) provider card — always reachable from Settings -> Providers even when
+// the hosted catalog is unavailable. Renders active-editing or dormant-key-park UI depending
+// on whether Free AI is the current Settings::provider. Returns true if a field changed
+// (dormant-slot edits + the switch button persist immediately either way).
 bool drawFreeAiProviderCard(AppState& state);
 
 // Probe model availability (agent_list_models) into state.providerModels: always the LOCAL
@@ -70,33 +69,28 @@ bool providerUsable(AppState& state, int provider);
 // filtered to it. Cloud providers only; local/llama.cpp keep their own flat `models` path.
 std::vector<ModelInfo> providerPickerModels(AppState& state, int provider);
 
-// ---- OMP bridge-backed model catalog + session cost (S-UI-PROV) -------------------
-// Static OMP catalog metadata (capabilities + cost) for bridge-routed providers, fetched via
-// the libchudware `agent_models_list` C-ABI (bridge `models_list`). Distinct from the live
-// agent_list_models probe above: that one asks a keyed endpoint what it can serve right now;
-// this is the static catalog the model picker uses for ctx/cost/capability sublabels and the
-// Providers-tab Models section. Degrades silently (empty catalog) when the bridge method is
-// absent — every consumer must tolerate a nullptr/empty result.
+// ---- Chudcode model catalog + session cost ------------------------------------------
+// Cached catalog metadata (capabilities + cost) for online providers. Distinct from the
+// native agent_list_models probe above, which asks a keyed endpoint what it can serve now.
+// Consumers must tolerate an empty cache while Chudcode catalog data is unavailable.
 struct BridgeModelMeta {
-    std::string id;          // OMP catalog model id (e.g. "claude-opus-4-8")
+    std::string id;          // catalog model id (e.g. "claude-opus-4-8")
     std::string name;        // display name
-    std::string provider;    // OMP provider id ("anthropic", "kimi-code", "moonshot", ...)
+    std::string provider;    // provider id ("anthropic", "kimi-code", "moonshot", ...)
     bool vision = false;
     bool tools = false;
     bool reasoning = false;
-    std::vector<std::string> reasoningEfforts;  // OMP catalog effort ladder; empty = no dial
+    std::vector<std::string> reasoningEfforts;  // provider effort ladder; empty = no dial
     int contextWindow = 0;   // tokens; 0 = unknown
     int maxTokens = 0;       // max output tokens; 0 = unknown
-    // `priced` is the bridge's pricing PROVENANCE flag (models_list "priced"): true only when
-    // the OMP catalog carries a real non-zero price. `hasCost` merely means the row had a cost
-    // object at all — which is always, even when every field is zero. So !priced means "no
-    // price data", NOT "free": never render a dollar figure derived from an unpriced row.
+    // `priced` records pricing provenance: true only when the catalog carries a real non-zero
+    // price. `hasCost` merely means the row had a cost object, which may contain only zeroes.
+    // Thus !priced means "no price data", not "free".
     bool priced = false;
     bool hasCost = false;
     double costIn = 0, costOut = 0, costCacheRead = 0, costCacheWrite = 0;  // $/Mtok
-    // Release/lifecycle metadata (populated by refreshBridgeModelCatalog from the model id/name;
-    // the OMP catalog itself carries no date). Drives per-provider newest-first sort + the
-    // "older / deprecated" grouping in the Providers tab.
+    // Release/lifecycle metadata inferred from the model id/name. Drives per-provider
+    // newest-first sort and the "older / deprecated" grouping in the Providers tab.
     std::string releaseDate;    // "YYYY-MM-DD" inferred from the id/name; "" when unknown
     long releaseSort = 0;       // YYYYMMDD int key for sorting; 0 = unknown (sorts oldest)
     bool deprecated = false;    // superseded/legacy family (inferred) -> grouped, hidden by default
@@ -108,26 +102,20 @@ const std::vector<BridgeModelMeta>& bridgeModelCatalog();
 // Exact (provider, id) lookup; providerId empty = first catalog row with that id.
 const BridgeModelMeta* bridgeModelMeta(const std::string& providerId, const std::string& modelId);
 // CAD picker lookup: map a CAD ProviderIndex (+ cloud base_url for the shared cloud slot) to
-// the OMP provider id, then find the model; falls back to a global id match. nullptr = absent.
+// the provider id, then find the model; falls back to a global id match. nullptr = absent.
 const BridgeModelMeta* bridgeModelMetaForCad(int cadProvider, const std::string& modelId,
                                              const char* cloudBaseUrl);
-// True for OMP provider ids that are genuinely-local runtimes CAD talks to unauthenticated
-// (the bridge's KEYLESS_PROVIDERS set): their catalog rows carry no price because inference on
-// your own hardware really is $0, so "free" is the honest label there. Exact id match — the
-// hosted "ollama-cloud" subscription is NOT in this set. Everywhere else an absent price means
-// "no price data", and no dollar figure may be derived from it.
+// True for genuinely local provider ids whose inference runs on the user's hardware. Hosted
+// variants are excluded; elsewhere an absent price means "no price data", not "free".
 bool bridgeProviderIsLocalFree(const std::string& providerId);
-// OMP model-browser.ts display formats: "ctx 200k \xc2\xb7 $3/$15 \xc2\xb7 tools vision" row
-// sublabel, and the cache-pricing detail line for tooltips. Unpriced non-local rows render
-// "no price data" rather than a fabricated "free".
+// Catalog display formats: "ctx 200k · $3/$15 · tools vision" row sublabel and the
+// cache-pricing detail line for tooltips. Unpriced non-local rows render "no price data".
 std::string bridgeModelSublabel(const BridgeModelMeta& m);
 std::string bridgeModelCostDetail(const BridgeModelMeta& m);
-// Per-session cost strip (agent_cost_summary, a pure $/Mtok calculator fed with the session's
-// completed-turn token events): "Session $1.87 \xc2\xb7 142k tok" + click popover with the
-// per-model breakdown. When some model that spent tokens has no catalog price the total is
-// shown as a floor ("Session \xe2\x89\xa5 $1.87 \xc2\xb7 3 of 4 models priced") instead of a
-// complete figure. Hidden while the bridge method is unavailable. Emits into the CURRENT
-// window; drawn by the composer model dropdown footer and the Settings->Providers footer.
+// Per-session cost strip computed from completed-turn token events and cached pricing:
+// "Session $1.87 · 142k tok" plus a per-model breakdown. If some token-spending model has no
+// catalog price, the total is shown as a floor rather than a complete figure. Hidden until
+// catalog data is available.
 void drawSessionCostStrip(AppState& state);
 
 // Cloud OpenAI-compat / Moonshot key presence: local settings OR host-shared keys on web

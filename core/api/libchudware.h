@@ -74,13 +74,6 @@ CHUDWARE_API const char* chudware_abi_version(void);
 // Drives the version drain-replace staleness check (see docs/HOSTD.md).
 CHUDWARE_API const char* chudware_build_id(void);
 
-// Best-effort, idempotent shutdown of any long-lived sidecar processes this DLL owns
-// (currently the OmpBridgeClient bun bridge child; core/agent/omp_bridge_client.h). Safe to
-// call when no sidecar was ever spawned, and safe to call more than once. The host
-// (chudware-hostd) has no other way to reach OmpBridgeClient::shutdownIfCreated() — that
-// singleton lives entirely inside this DLL, reachable only through this flat C ABI (see
-// core/hostd/main.cpp's clean-shutdown tail).
-CHUDWARE_API void chudware_agent_sidecars_shutdown(void);
 
 // Live document publication for doc_new/doc_apply_ops calls made synchronously inside an opaque
 // agent RPC. Like chudware_set_event_sink, this callback is THREAD-LOCAL and valid only for the

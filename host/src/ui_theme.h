@@ -21,6 +21,26 @@ struct Fonts {
 // Canonical theme identifiers.
 enum class Theme { Dark, Light };
 
+// =========================================================================
+// Shared UI contract (chud-ui-shared-v1) — assets/ui-shared-manifest.json
+// =========================================================================
+// Chudware and Chudcode share a product-UI *vocabulary* — semantic role names, Tone/Density
+// naming, animation tokens, usage thresholds, and font provenance — never widget code. The
+// manifest is a byte-identical copy of the Chudcode original; scripts/verify-ui-shared.py
+// cross-checks it against these constants, ui/widgets/kit.h (Tone/Density), ui/anim.h
+// (duration tokens), ui/icons.h (cell sizes), and the vendored font bytes. Rename or retune
+// any of these only together with the manifest, or the verifier fails the drift exactly.
+// CAD-only roles (viewport*, sketch*, sim*, cam*, plane*, …) are deliberately outside the
+// shared vocabulary and stay product-owned.
+inline constexpr const char* kUiSharedSchema = "chud-ui-shared-v1";
+inline constexpr int kUiSharedContractVersion = 1;
+
+// Fraction-of-budget ladder shared by every "how much is used" readout (context-window
+// gauge, usage rings, plan progress arcs): Ok below warning, Warn in [warning, critical),
+// Err at or above critical. Values are the shared contract's usageThresholds.
+inline constexpr float kUsageWarnFrac = 0.50f;
+inline constexpr float kUsageCritFrac = 0.90f;
+
 // ~40 named palette roles — the ONLY way panels should reference colors.
 // All values are ImVec4-compatible floats (r,g,b,a in 0..1), or ImU32 for draw-list calls.
 // Panels use the float[4] fields; for draw-list IM_COL32 use palette.toU32(field).

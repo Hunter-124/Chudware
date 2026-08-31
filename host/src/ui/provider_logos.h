@@ -15,8 +15,8 @@ struct AppState;  // core/app_state.h (providerLogosTick needs st.rpc + appdata 
 
 namespace ui {
 
-// Brand accent color (RGB, 0..1, 3 floats) for an OMP provider id ("anthropic", "openai",
-// "google", "xai", "kimi-code", ...). Stable hashed fallback for unknown ids. Never null.
+// Brand accent color (RGB, 0..1) for a provider id. Stable hashed fallback for unknown ids.
+// Never null.
 const float* providerBrandColor(const std::string& providerId);
 
 // Short 1-2 char ASCII mark drawn inside the badge ("A" anthropic, "O" openai, "G" gemini,

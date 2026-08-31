@@ -382,6 +382,7 @@ static const char* kTools_org[] = {
 static const char* kTools_parts[] = {
     "bom_price",
     "bom_rollup",
+    "browser_profiles",
     "cam_cost_estimate",
     "cam_tool_import",
     "import_artifact",
@@ -598,6 +599,7 @@ static const ToolDesc kToolDescs[] = {
     {"bom_rollup", "Roll an assembly (+ any linked ECAD board) up into a unified made/bought BOM."},
     {"box_status", "Box.com mirror status: whether mirroring is enabled/connected, the connected account, pending spooled projects, and — when ``path`` (or the …"},
     {"box_sync", "Mirror the project's saved files up to the configured Box.com folder now (uploads new/changed files; never downloads). Requires Box …"},
+    {"browser_profiles", "List, refresh, or delete persistent browser login profiles."},
     {"buildgraph_plan", "Consume a BUILD PLAN, a dag/1 mission, or a plain description of the build, and return an aicad.buildgraph/1 graph."},
     {"buildgraph_status", "Return the current node statuses of a buildgraph run."},
     {"cad_graph", "Traverse the CAD project graph — dimensional links + assembly structure."},
@@ -1088,6 +1090,7 @@ static const ToolGuidance kToolGuidance[] = {
     {"bom_rollup", "Cheap local classification pass — run it before any pricing: made lines go to cam_cost_estimate, bought lines (with MPNs) to bom_price.", 0, 0, ""},
     {"box_status", "Box.com mirror health: enabled/connected, the connected account, pending spooled projects, and the project's last sync/error. Call before box_sync to diagnose auth or backlog.", 0, 0, ""},
     {"box_sync", "Uploads the project's saved files to the configured Box.com folder NOW (new/changed only, never downloads). Saves already mirror automatically when Box is enabled — reach for this only when the user asks to push or box_status shows pending/errors.", 0, 0, ""},
+    {"browser_profiles", "Persistent vendor browser-profile manager. action='list' performs a fresh no-cache login probe for every saved profile and reports only active/expired/unknown; action='refresh' opens the headed human login flow; action='delete' removes that site's local profile and refuses while it is open. Never refresh-loop or delete without the user's request.", 360, 0, ""},
     {"buildgraph_plan", "Prefer this over dag_plan when the build steps are already known — deterministic, LLM-free; check advisories + interpreted first.", 0, 0, ""},
     {"buildgraph_status", "Poll with the run_id from buildgraph_plan; an unknown id returns known_run_ids — pick from that list, never invent one.", 0, 0, ""},
     {"cad_graph", "blast before editing a shared dimension (what breaks downstream), tree for assembly structure; project_dir is the shared working folder.", 0, 0, ""},

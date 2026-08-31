@@ -19,6 +19,7 @@ Test coverage:
 
 Offline discipline: mock providers, no network, no LLM, no all-skip.
 """
+
 from __future__ import annotations
 
 from contextlib import nullcontext
@@ -75,6 +76,7 @@ def tearDownModule() -> None:
 # Helpers
 # ---------------------------------------------------------------------------
 
+
 def _make_routing(
     sources: list[dict] | None = None,
     assignments: dict | None = None,
@@ -83,7 +85,8 @@ def _make_routing(
     cfg: dict = {
         "schema": "aicad.routing/1",
         "sources": sources or [],
-        "assignments": assignments or {
+        "assignments": assignments
+        or {
             "overseer": ["strongest"],
             "orchestrator": ["strongest"],
             "sketcher": ["cheap_local", "strong"],
@@ -94,19 +97,32 @@ def _make_routing(
 
 
 def _two_source_routing() -> RoutingTable:
-    return _make_routing(sources=[
-        {"id": "cloud_api", "kind": "anthropic",
-         "models": [{"id": "claude-sonnet-4-6", "tier": "frontier"}]},
-        {"id": "local_lms", "kind": "lmstudio",
-         "models": [{"id": "qwen3-4b", "tier": "cheap_local"}]},
-    ])
+    return _make_routing(
+        sources=[
+            {
+                "id": "cloud_api",
+                "kind": "anthropic",
+                "models": [{"id": "claude-sonnet-4-6", "tier": "frontier"}],
+            },
+            {
+                "id": "local_lms",
+                "kind": "lmstudio",
+                "models": [{"id": "qwen3-4b", "tier": "cheap_local"}],
+            },
+        ]
+    )
 
 
 def _single_source_routing() -> RoutingTable:
-    return _make_routing(sources=[
-        {"id": "cloud_api", "kind": "anthropic",
-         "models": [{"id": "claude-sonnet-4-6", "tier": "frontier"}]},
-    ])
+    return _make_routing(
+        sources=[
+            {
+                "id": "cloud_api",
+                "kind": "anthropic",
+                "models": [{"id": "claude-sonnet-4-6", "tier": "frontier"}],
+            },
+        ]
+    )
 
 
 class _MockLedger:
@@ -139,6 +155,7 @@ class _MockLedger:
 # Routing tests
 # ---------------------------------------------------------------------------
 
+
 class TestRoutingParse(unittest.TestCase):
     """Parsing + validation of routing.yaml shapes."""
 
@@ -152,13 +169,21 @@ class TestRoutingParse(unittest.TestCase):
 
     def test_unknown_kind_raises(self):
         with self.assertRaises(RoutingError):
-            _make_routing(sources=[{"id": "x", "kind": "unknown_provider",
-                                    "models": []}])
+            _make_routing(
+                sources=[{"id": "x", "kind": "unknown_provider", "models": []}]
+            )
 
     def test_unknown_tier_raises(self):
         with self.assertRaises(RoutingError):
-            _make_routing(sources=[{"id": "x", "kind": "anthropic",
-                                    "models": [{"id": "m", "tier": "ultra"}]}])
+            _make_routing(
+                sources=[
+                    {
+                        "id": "x",
+                        "kind": "anthropic",
+                        "models": [{"id": "m", "tier": "ultra"}],
+                    }
+                ]
+            )
 
     def test_unknown_preference_raises(self):
         with self.assertRaises(RoutingError):
@@ -166,8 +191,13 @@ class TestRoutingParse(unittest.TestCase):
 
     def test_explicit_pref_accepted(self):
         rt = _make_routing(
-            sources=[{"id": "cloud_api", "kind": "anthropic",
-                      "models": [{"id": "m1", "tier": "frontier"}]}],
+            sources=[
+                {
+                    "id": "cloud_api",
+                    "kind": "anthropic",
+                    "models": [{"id": "m1", "tier": "frontier"}],
+                }
+            ],
             assignments={"overseer": ["explicit:cloud_api/m1"]},
         )
         res = rt.resolve("overseer")
@@ -176,8 +206,13 @@ class TestRoutingParse(unittest.TestCase):
 
     def test_explicit_pref_offline_returns_none(self):
         rt = _make_routing(
-            sources=[{"id": "cloud_api", "kind": "anthropic",
-                      "models": [{"id": "m1", "tier": "frontier"}]}],
+            sources=[
+                {
+                    "id": "cloud_api",
+                    "kind": "anthropic",
+                    "models": [{"id": "m1", "tier": "frontier"}],
+                }
+            ],
             assignments={"overseer": ["explicit:cloud_api/m1"]},
         )
         res = rt.resolve("overseer", availability={"cloud_api": False})
@@ -206,7 +241,9 @@ class TestRoutingResolution(unittest.TestCase):
     def test_fallthrough_when_local_offline(self):
         """sketcher prefers cheap_local then strong; local offline → picks frontier."""
         rt = _two_source_routing()
-        res = rt.resolve("sketcher", availability={"cloud_api": True, "local_lms": False})
+        res = rt.resolve(
+            "sketcher", availability={"cloud_api": True, "local_lms": False}
+        )
         self.assertIsNotNone(res)
         # Falls through to cloud_api (frontier tier, the strong fallback).
         self.assertEqual(res.source_id, "cloud_api")
@@ -214,7 +251,9 @@ class TestRoutingResolution(unittest.TestCase):
 
     def test_fallthrough_event_flagged(self):
         rt = _two_source_routing()
-        res = rt.resolve("sketcher", availability={"cloud_api": True, "local_lms": False})
+        res = rt.resolve(
+            "sketcher", availability={"cloud_api": True, "local_lms": False}
+        )
         self.assertTrue(res.fallthrough)
 
     def test_no_sources_returns_none(self):
@@ -227,7 +266,9 @@ class TestRoutingResolution(unittest.TestCase):
         rt = _single_source_routing()
         for role in ("overseer", "orchestrator", "sketcher", "cam_programmer"):
             res = rt.resolve(role)
-            self.assertIsNotNone(res, f"role {role!r} should resolve with single source")
+            self.assertIsNotNone(
+                res, f"role {role!r} should resolve with single source"
+            )
             self.assertEqual(res.source_id, "cloud_api")
 
     def test_unknown_role_falls_to_default(self):
@@ -249,8 +290,9 @@ class TestRoutingResolution(unittest.TestCase):
 
     def test_all_offline_returns_none(self):
         rt = _two_source_routing()
-        res = rt.resolve("overseer",
-                         availability={"cloud_api": False, "local_lms": False})
+        res = rt.resolve(
+            "overseer", availability={"cloud_api": False, "local_lms": False}
+        )
         self.assertIsNone(res)
 
 
@@ -270,7 +312,7 @@ class TestResolveAssignments(unittest.TestCase):
         for role, res in assignments.items():
             self.assertTrue(
                 res is None or isinstance(res, Resolution),
-                f"role {role!r}: expected Resolution or None, got {type(res)}"
+                f"role {role!r}: expected Resolution or None, got {type(res)}",
             )
 
     def test_no_sources_all_none(self):
@@ -280,11 +322,10 @@ class TestResolveAssignments(unittest.TestCase):
             self.assertIsNone(res, f"role {role!r} should be None with no sources")
 
 
-
-
 # ---------------------------------------------------------------------------
 # Delegation tree tests
 # ---------------------------------------------------------------------------
+
 
 class TestDelegationTreeBasics(unittest.TestCase):
     """DelegationTree initialisation + node structure."""
@@ -340,7 +381,9 @@ class TestDelegationAutoApproval(unittest.TestCase):
 
     def test_depth1_worker_auto_approved(self):
         node = self.tree.request_delegation(
-            "sketcher", "Draw the base sketch", 2000,
+            "sketcher",
+            "Draw the base sketch",
+            2000,
             kind="worker",
         )
         self.assertEqual(node.status, "approved")
@@ -349,29 +392,37 @@ class TestDelegationAutoApproval(unittest.TestCase):
 
     def test_deep_worker_auto_approved_without_human_involvement(self):
         d1 = self.tree.request_delegation(
-            "orchestrator", "Plan phase", 5000, kind="worker",
+            "orchestrator",
+            "Plan phase",
+            5000,
+            kind="worker",
         )
         d2 = self.tree.request_delegation(
-            "sketcher", "Sketch sub-task", 1000,
-            parent_id=d1.id, kind="worker",
+            "sketcher",
+            "Sketch sub-task",
+            1000,
+            parent_id=d1.id,
+            kind="worker",
         )
         self.assertEqual(d2.depth, 2)
         self.assertEqual(d2.status, "approved")
         self.assertTrue(d2.approved_ts)
 
     def test_depth2_ponder_auto_approved(self):
-        d1 = self.tree.request_delegation("orchestrator", "Plan phase", 5000, kind="worker")
-        d2 = self.tree.request_delegation(
-            "sketcher", "Which datum scheme is best?", 800,
-            parent_id=d1.id, kind="ponder",
+        d1 = self.tree.request_delegation(
+            "orchestrator", "Plan phase", 5000, kind="worker"
         )
-        self.assertEqual(d2.status, "approved",
-                         "ponder must be auto-approved at any depth")
+        d2 = self.tree.request_delegation(
+            "sketcher",
+            "Which datum scheme is best?",
+            800,
+            parent_id=d1.id,
+            kind="ponder",
+        )
+        self.assertEqual(
+            d2.status, "approved", "ponder must be auto-approved at any depth"
+        )
         self.assertTrue(d2.approved_ts)
-
-
-
-
 
     def test_invalid_kind_raises(self):
         with self.assertRaises(DelegationError):
@@ -398,25 +449,29 @@ class TestDelegationAutoApproval(unittest.TestCase):
         # Spawn through the soft limit — all should succeed (ponder = auto-approved).
         for depth in range(1, 6):
             node = tree.request_delegation(
-                "sketcher", f"Depth {depth}", 500,
-                parent_id=parent_id, kind="ponder",
+                "sketcher",
+                f"Depth {depth}",
+                500,
+                parent_id=parent_id,
+                kind="ponder",
             )
             self.assertIsNotNone(node, f"spawn at depth {depth} must succeed")
-            self.assertEqual(node.status, "approved",
-                             f"ponder at depth {depth} must be approved")
+            self.assertEqual(
+                node.status, "approved", f"ponder at depth {depth} must be approved"
+            )
             parent_id = node.id
         # A depth_warning event must have been emitted when depth >= soft_depth_limit.
         warn_events = ledger.events_of_kind("delegation_depth_warning")
-        self.assertGreater(len(warn_events), 0,
-                           "delegation_depth_warning event must fire at soft limit")
+        self.assertGreater(
+            len(warn_events),
+            0,
+            "delegation_depth_warning event must fire at soft limit",
+        )
         # No DelegationError must have been raised (test would have failed above).
 
     def test_depth_cap_constant_still_exported(self):
         """DEPTH_CAP is kept as a module constant for backward-compat with artifact readers."""
         self.assertEqual(DEPTH_CAP, 3)  # value must not change
-
-
-
 
 
 class TestBudgetInheritanceRevocation(unittest.TestCase):
@@ -457,11 +512,13 @@ class TestBudgetInheritanceRevocation(unittest.TestCase):
         # Exhaust root (1000 granted − 1000 spent = 0 remaining).
         self.tree.accrue(d1.id, 1000)
         # Root should be revoked.
-        self.assertEqual(root.status, "revoked",
-                         "root should be revoked when budget hits 0")
+        self.assertEqual(
+            root.status, "revoked", "root should be revoked when budget hits 0"
+        )
         # Child should also be revoked.
-        self.assertEqual(d1.status, "revoked",
-                         "child should cascade-revoke when root is revoked")
+        self.assertEqual(
+            d1.status, "revoked", "child should cascade-revoke when root is revoked"
+        )
 
     def test_revocation_event_emitted(self):
         d1 = self._start_d1(budget=400)
@@ -503,8 +560,9 @@ class TestBudgetInheritanceRevocation(unittest.TestCase):
     def test_cascade_revoke(self):
         """Revoking a node also revokes all its active descendants."""
         d1 = self.tree.request_delegation("orchestrator", "Phase", 800, kind="worker")
-        d2 = self.tree.request_delegation("sketcher", "Ponder", 200,
-                                          parent_id=d1.id, kind="ponder")
+        d2 = self.tree.request_delegation(
+            "sketcher", "Ponder", 200, parent_id=d1.id, kind="ponder"
+        )
         self.assertEqual(d2.status, "approved")
         self.tree.revoke(d1.id, reason="cascade test")
         self.assertEqual(d1.status, "revoked")
@@ -527,15 +585,21 @@ class TestNodeIdentities(unittest.TestCase):
     """Each node gets a unique dg_ id — no shared mutable default."""
 
     def test_each_request_unique_id(self):
-        tree = DelegationTree(run_id="r_ids", orchestrator_budget=50_000,
-                              routing=_two_source_routing())
+        tree = DelegationTree(
+            run_id="r_ids", orchestrator_budget=50_000, routing=_two_source_routing()
+        )
         ids = set()
         for i in range(10):
             node = tree.request_delegation(
-                "sketcher", f"Task {i}", 200, kind="ponder",
+                "sketcher",
+                f"Task {i}",
+                200,
+                kind="ponder",
             )
-            self.assertTrue(node.id.startswith("dg_"),
-                            f"node id must start with dg_, got {node.id!r}")
+            self.assertTrue(
+                node.id.startswith("dg_"),
+                f"node id must start with dg_, got {node.id!r}",
+            )
             ids.add(node.id)
         # All 10 must be distinct.
         self.assertEqual(len(ids), 10, "node ids must be unique across requests")
@@ -593,15 +657,23 @@ class TestDelegateTool(unittest.TestCase):
             max_subagent_depth=8,
         )
         parent_id = tree.root_id
-        for depth in range(1, DEPTH_CAP + 2):   # one past the old hard cap
+        for depth in range(1, DEPTH_CAP + 2):  # one past the old hard cap
             result = delegate(
-                "sketcher", f"Depth {depth}", 100,
-                tree=tree, parent_id=parent_id, kind="ponder",
+                "sketcher",
+                f"Depth {depth}",
+                100,
+                tree=tree,
+                parent_id=parent_id,
+                kind="ponder",
             )
-            self.assertNotIn("error", result,
-                             f"spawn at depth {depth} must not return error dict")
-            self.assertEqual(result["status"], "approved",
-                             f"ponder at depth {depth} must be approved")
+            self.assertNotIn(
+                "error", result, f"spawn at depth {depth} must not return error dict"
+            )
+            self.assertEqual(
+                result["status"],
+                "approved",
+                f"ponder at depth {depth} must be approved",
+            )
             parent_id = result["id"]
         # Warning events must exist for depths >= soft_depth_limit.
         warn_events = ledger.events_of_kind("delegation_depth_warning")
@@ -616,13 +688,15 @@ class TestDelegateTool(unittest.TestCase):
             delegation_tree=self.tree,
             provider=object(),
         )
-        mission._run_subagent = MagicMock(return_value={
-            "ok": True,
-            "subagent_status": "done",
-            "handoff": {"status": "done", "summary": "cube built"},
-            "result": {"calls": [{"tool": "new_part", "ok": True}]},
-            "tokens_used": 100,
-        })
+        mission._run_subagent = MagicMock(
+            return_value={
+                "ok": True,
+                "subagent_status": "done",
+                "handoff": {"status": "done", "summary": "cube built"},
+                "result": {"calls": [{"tool": "new_part", "ok": True}]},
+                "tokens_used": 100,
+            }
+        )
         result = _dispatch_tool(
             "delegate",
             {
@@ -649,18 +723,20 @@ class TestDelegateTool(unittest.TestCase):
             delegation_tree=self.tree,
             provider=object(),
         )
-        mission._run_subagent = MagicMock(return_value={
-            "ok": False,
-            "subagent_status": "failed",
-            "stop_reason": "provider_error",
-            "result": {
-                "error": "provider error: endpoint returned no completion",
-                "error_detail": (
-                    "kimi-code: BridgeUnavailable: endpoint returned no completion"
-                ),
+        mission._run_subagent = MagicMock(
+            return_value={
+                "ok": False,
+                "subagent_status": "failed",
                 "stop_reason": "provider_error",
-            },
-        })
+                "result": {
+                    "error": "provider error: endpoint returned no completion",
+                    "error_detail": (
+                        "kimi-code: RuntimeError: endpoint returned no completion"
+                    ),
+                    "stop_reason": "provider_error",
+                },
+            }
+        )
         result = _dispatch_tool(
             "delegate",
             {
@@ -679,7 +755,12 @@ class TestDelegateTool(unittest.TestCase):
         self.assertIn(result["error"], str(result)[:999])
 
         _, event = tool_call_event(
-            "parent", "delegate", {}, result, ok=False, latency_ms=1.0,
+            "parent",
+            "delegate",
+            {},
+            result,
+            ok=False,
+            latency_ms=1.0,
         )
         self.assertEqual(event["error_preview"], result["error"])
 
@@ -698,7 +779,9 @@ class TestDelegateTerminalTransitions(unittest.TestCase):
             routing=_two_source_routing(),
         )
         self.node = self.tree.request_delegation(
-            "sketcher", "Build the delegated profile", 500,
+            "sketcher",
+            "Build the delegated profile",
+            500,
         )
         self.mission = MissionDispatch(
             run_id="r_delegate_terminal",
@@ -722,7 +805,8 @@ class TestDelegateTerminalTransitions(unittest.TestCase):
         self.assertIn("provider exploded", result["error"])
         self.assertEqual(self.tree._nodes[self.node.id].status, "failed")
         terminal = [
-            event for event in self.ledger.events_of_kind("delegation")
+            event
+            for event in self.ledger.events_of_kind("delegation")
             if event["payload"].get("node_id") == self.node.id
             and event["payload"].get("status") in ("done", "failed")
         ]
@@ -744,7 +828,8 @@ class TestDelegateTerminalTransitions(unittest.TestCase):
             self.assertLogs("services.agent.delegation", level="ERROR"),
         ):
             result = self.mission._run_subagent(
-                self.node.to_dict(), "delegate brief",
+                self.node.to_dict(),
+                "delegate brief",
             )
 
         self.assertIs(result["ok"], False)
@@ -773,7 +858,8 @@ class TestDelegateTerminalTransitions(unittest.TestCase):
         self.assertEqual(node.status, "done")
         self.assertEqual(node.budget.tokens_spent, 125)
         terminal = [
-            event for event in self.ledger.events_of_kind("delegation")
+            event
+            for event in self.ledger.events_of_kind("delegation")
             if event["payload"].get("node_id") == self.node.id
             and event["payload"].get("status") in ("done", "failed")
         ]
@@ -789,12 +875,15 @@ class TestDelegateTerminalTransitions(unittest.TestCase):
         with (
             patch("services.mcp.cad_common.doc_scope", return_value=nullcontext()),
             patch.object(
-                self.mission, "_run_subagent_turn", return_value=outcome,
+                self.mission,
+                "_run_subagent_turn",
+                return_value=outcome,
             ),
             patch("services.agent.subagent_registry.set_status") as set_status,
         ):
             result = self.mission._run_subagent(
-                self.node.to_dict(), "delegate brief",
+                self.node.to_dict(),
+                "delegate brief",
             )
 
         self.assertIs(result, outcome)
@@ -825,18 +914,38 @@ class TestArtifactShape(unittest.TestCase):
         self.assertIn("killed", art)
         self.assertFalse(art["killed"])
         meter = art["budget_meter"]
-        for key in ("tokens_granted", "tokens_spent", "tokens_remaining",
-                    "agents_spawned", "max_agents", "soft_depth_limit",
-                    "max_subagent_depth", "killed"):
+        for key in (
+            "tokens_granted",
+            "tokens_spent",
+            "tokens_remaining",
+            "agents_spawned",
+            "max_agents",
+            "soft_depth_limit",
+            "max_subagent_depth",
+            "killed",
+        ):
             self.assertIn(key, meter, f"budget_meter missing field {key!r}")
 
     def test_node_dict_has_required_fields(self):
-        tree = DelegationTree(run_id="r_fields", orchestrator_budget=5000,
-                              routing=_two_source_routing())
+        tree = DelegationTree(
+            run_id="r_fields", orchestrator_budget=5000, routing=_two_source_routing()
+        )
         node = tree.request_delegation("sketcher", "Brief", 500, kind="ponder")
         d = node.to_dict()
-        for key in ("id", "parent", "role", "brief", "requested_by", "kind",
-                    "depth", "approved_ts", "model", "budget", "docs", "status"):
+        for key in (
+            "id",
+            "parent",
+            "role",
+            "brief",
+            "requested_by",
+            "kind",
+            "depth",
+            "approved_ts",
+            "model",
+            "budget",
+            "docs",
+            "status",
+        ):
             self.assertIn(key, d, f"missing required field {key!r} in node dict")
 
 
@@ -846,9 +955,13 @@ class TestDocLeaseShape(unittest.TestCase):
     def test_doc_leases_stored(self):
         tree = DelegationTree(run_id="r_docs", orchestrator_budget=5000)
         node = tree.request_delegation(
-            "sketcher", "Need doc access", 500,
-            docs=[{"doc_id": "doc_abc", "lease": "read"},
-                  {"doc_id": "doc_xyz", "lease": "write"}],
+            "sketcher",
+            "Need doc access",
+            500,
+            docs=[
+                {"doc_id": "doc_abc", "lease": "read"},
+                {"doc_id": "doc_xyz", "lease": "write"},
+            ],
         )
         self.assertEqual(len(node.docs), 2)
         self.assertEqual(node.docs[0].doc_id, "doc_abc")
@@ -858,7 +971,9 @@ class TestDocLeaseShape(unittest.TestCase):
     def test_doc_leases_in_artifact(self):
         tree = DelegationTree(run_id="r_docs2", orchestrator_budget=5000)
         node = tree.request_delegation(
-            "sketcher", "Doc access", 200,
+            "sketcher",
+            "Doc access",
+            200,
             docs=[{"doc_id": "doc_123", "lease": "read"}],
         )
         art = tree.to_artifact()
@@ -872,6 +987,7 @@ class TestOverseerProviderResolution(unittest.TestCase):
 
     def test_routing_preferred_over_fallback(self):
         from services.agent.advisor.overseer import resolve_overseer_provider
+
         # Build a routing table with only a 'cloud_api' source (anthropic tier).
         routing = _two_source_routing()
         available = {
@@ -884,17 +1000,20 @@ class TestOverseerProviderResolution(unittest.TestCase):
 
     def test_fallback_when_no_routing(self):
         from services.agent.advisor.overseer import resolve_overseer_provider
+
         available = {"anthropic": MagicMock(name="anthropic_prov")}
         prov = resolve_overseer_provider(available, routing=None)
         self.assertIs(prov, available["anthropic"])
 
     def test_none_when_empty_available(self):
         from services.agent.advisor.overseer import resolve_overseer_provider
+
         prov = resolve_overseer_provider({}, routing=None)
         self.assertIsNone(prov)
 
     def test_single_source_collapse(self):
         from services.agent.advisor.overseer import resolve_overseer_provider
+
         # No routing, only one provider — collapse onto it.
         mock_prov = MagicMock(name="only_prov")
         prov = resolve_overseer_provider({"only": mock_prov}, routing=None)
@@ -905,12 +1024,17 @@ class TestOverseerProviderResolution(unittest.TestCase):
 # T-DP9: Budget meter tests
 # ---------------------------------------------------------------------------
 
+
 class TestBudgetMeter(unittest.TestCase):
     """BudgetMeter: tree-wide token+agent tracking (T-DP9)."""
 
     def test_initial_meter_state(self):
-        tree = DelegationTree(run_id="r_meter1", orchestrator_budget=10_000,
-                              soft_depth_limit=8, max_agents=64)
+        tree = DelegationTree(
+            run_id="r_meter1",
+            orchestrator_budget=10_000,
+            soft_depth_limit=8,
+            max_agents=64,
+        )
         m = tree.budget_meter
         self.assertEqual(m.tokens_granted, 10_000)
         self.assertEqual(m.tokens_spent, 0)
@@ -925,8 +1049,9 @@ class TestBudgetMeter(unittest.TestCase):
 
     def test_meter_syncs_on_accrue(self):
         """budget_meter.tokens_spent mirrors root's spent counter after accrue."""
-        tree = DelegationTree(run_id="r_meter3", orchestrator_budget=10_000,
-                              routing=_two_source_routing())
+        tree = DelegationTree(
+            run_id="r_meter3", orchestrator_budget=10_000, routing=_two_source_routing()
+        )
         node = tree.request_delegation("sketcher", "task", 2000, kind="worker")
         tree.start(node.id)
         tree.accrue(node.id, 300)
@@ -935,8 +1060,9 @@ class TestBudgetMeter(unittest.TestCase):
 
     def test_meter_agent_count_increments(self):
         """agents_spawned increments with every new non-root delegation."""
-        tree = DelegationTree(run_id="r_meter4", orchestrator_budget=50_000,
-                              routing=_two_source_routing())
+        tree = DelegationTree(
+            run_id="r_meter4", orchestrator_budget=50_000, routing=_two_source_routing()
+        )
         self.assertEqual(tree.budget_meter.agents_spawned, 0)
         tree.request_delegation("sketcher", "task 1", 500, kind="ponder")
         self.assertEqual(tree.budget_meter.agents_spawned, 1)
@@ -946,7 +1072,9 @@ class TestBudgetMeter(unittest.TestCase):
     def test_meter_in_artifact(self):
         """budget_meter is present in every artifact flush."""
         ledger = _MockLedger()
-        tree = DelegationTree(run_id="r_meter5", orchestrator_budget=1000, ledger=ledger)
+        tree = DelegationTree(
+            run_id="r_meter5", orchestrator_budget=1000, ledger=ledger
+        )
         tree.request_delegation("sketcher", "brief", 200, kind="ponder")
         arts = [a for a in ledger.artifacts if a["kind"] == "delegation"]
         self.assertGreater(len(arts), 0)
@@ -955,8 +1083,13 @@ class TestBudgetMeter(unittest.TestCase):
         self.assertEqual(art["budget_meter"]["agents_spawned"], 1)
 
     def test_budget_meter_to_dict_fields(self):
-        m = BudgetMeter(tokens_granted=1000, tokens_spent=200, agents_spawned=3,
-                        max_agents=10, soft_depth_limit=5)
+        m = BudgetMeter(
+            tokens_granted=1000,
+            tokens_spent=200,
+            agents_spawned=3,
+            max_agents=10,
+            soft_depth_limit=5,
+        )
         d = m.to_dict()
         self.assertEqual(d["tokens_granted"], 1000)
         self.assertEqual(d["tokens_spent"], 200)
@@ -987,13 +1120,18 @@ class TestBudgetMeter(unittest.TestCase):
 # T-DP9: Kill-switch tests
 # ---------------------------------------------------------------------------
 
+
 class TestKillSwitch(unittest.TestCase):
     """kill(): halt the whole tree, set killed=True, reject subsequent spawns (T-DP9)."""
 
     def _tree_with_active_nodes(self) -> tuple[DelegationTree, Any, Any]:
         ledger = _MockLedger()
-        tree = DelegationTree(run_id="r_kill1", orchestrator_budget=50_000,
-                              ledger=ledger, routing=_two_source_routing())
+        tree = DelegationTree(
+            run_id="r_kill1",
+            orchestrator_budget=50_000,
+            ledger=ledger,
+            routing=_two_source_routing(),
+        )
         d1 = tree.request_delegation("sketcher", "task a", 1000, kind="ponder")
         d2 = tree.request_delegation("sketcher", "task b", 500, kind="ponder")
         return tree, d1, d2
@@ -1022,8 +1160,12 @@ class TestKillSwitch(unittest.TestCase):
 
     def test_kill_emits_delegation_killed_event(self):
         ledger = _MockLedger()
-        tree = DelegationTree(run_id="r_kill2", orchestrator_budget=5000, ledger=ledger,
-                              routing=_two_source_routing())
+        tree = DelegationTree(
+            run_id="r_kill2",
+            orchestrator_budget=5000,
+            ledger=ledger,
+            routing=_two_source_routing(),
+        )
         tree.request_delegation("sketcher", "task", 500, kind="ponder")
         tree.kill()
         killed_events = ledger.events_of_kind("delegation_killed")
@@ -1059,12 +1201,17 @@ class TestKillSwitch(unittest.TestCase):
     def test_kill_revokes_deep_approved_nodes(self):
         """Approved nodes at multiple depths are revoked by kill()."""
         ledger = _MockLedger()
-        tree = DelegationTree(run_id="r_kill4", orchestrator_budget=50_000,
-                              ledger=ledger, routing=_two_source_routing(),
-                              max_subagent_depth=8)
+        tree = DelegationTree(
+            run_id="r_kill4",
+            orchestrator_budget=50_000,
+            ledger=ledger,
+            routing=_two_source_routing(),
+            max_subagent_depth=8,
+        )
         d1 = tree.request_delegation("orchestrator", "phase", 5000, kind="worker")
-        d2 = tree.request_delegation("sketcher", "sub-task", 1000,
-                                     parent_id=d1.id, kind="worker")
+        d2 = tree.request_delegation(
+            "sketcher", "sub-task", 1000, parent_id=d1.id, kind="worker"
+        )
         self.assertEqual(d1.status, "approved")
         self.assertEqual(d2.status, "approved")
         tree.kill()
@@ -1076,19 +1223,28 @@ class TestKillSwitch(unittest.TestCase):
 # T-DP9: Soft-limit advisory event tests
 # ---------------------------------------------------------------------------
 
+
 class TestSoftLimitAdvisory(unittest.TestCase):
     """Soft depth + agent count limits emit advisory events, not errors (T-DP9)."""
 
     def test_depth_warning_event_at_soft_limit(self):
         ledger = _MockLedger()
-        tree = DelegationTree(run_id="r_soft1", orchestrator_budget=100_000,
-                              ledger=ledger, routing=_two_source_routing(),
-                              soft_depth_limit=3, max_subagent_depth=8)
+        tree = DelegationTree(
+            run_id="r_soft1",
+            orchestrator_budget=100_000,
+            ledger=ledger,
+            routing=_two_source_routing(),
+            soft_depth_limit=3,
+            max_subagent_depth=8,
+        )
         parent_id = tree.root_id
         for depth in range(1, 5):  # spawn to depth 4, past limit of 3
             node = tree.request_delegation(
-                "sketcher", f"Depth {depth}", 200,
-                parent_id=parent_id, kind="ponder",
+                "sketcher",
+                f"Depth {depth}",
+                200,
+                parent_id=parent_id,
+                kind="ponder",
             )
             parent_id = node.id
         warn_events = ledger.events_of_kind("delegation_depth_warning")
@@ -1103,21 +1259,31 @@ class TestSoftLimitAdvisory(unittest.TestCase):
 
     def test_no_depth_warning_below_soft_limit(self):
         ledger = _MockLedger()
-        tree = DelegationTree(run_id="r_soft2", orchestrator_budget=100_000,
-                              ledger=ledger, routing=_two_source_routing(),
-                              soft_depth_limit=5, max_subagent_depth=8)
+        tree = DelegationTree(
+            run_id="r_soft2",
+            orchestrator_budget=100_000,
+            ledger=ledger,
+            routing=_two_source_routing(),
+            soft_depth_limit=5,
+            max_subagent_depth=8,
+        )
         # Spawn only 2 deep — no warning expected.
         d1 = tree.request_delegation("sketcher", "depth 1", 500, kind="ponder")
-        tree.request_delegation("sketcher", "depth 2", 200,
-                                parent_id=d1.id, kind="ponder")
+        tree.request_delegation(
+            "sketcher", "depth 2", 200, parent_id=d1.id, kind="ponder"
+        )
         warn_events = ledger.events_of_kind("delegation_depth_warning")
         self.assertEqual(len(warn_events), 0)
 
     def test_agent_limit_warning_at_max_agents(self):
         ledger = _MockLedger()
-        tree = DelegationTree(run_id="r_soft3", orchestrator_budget=100_000,
-                              ledger=ledger, routing=_two_source_routing(),
-                              max_agents=3)
+        tree = DelegationTree(
+            run_id="r_soft3",
+            orchestrator_budget=100_000,
+            ledger=ledger,
+            routing=_two_source_routing(),
+            max_agents=3,
+        )
         # Spawn exactly max_agents nodes.
         for i in range(3):
             tree.request_delegation("sketcher", f"agent {i}", 200, kind="ponder")
@@ -1130,9 +1296,13 @@ class TestSoftLimitAdvisory(unittest.TestCase):
 
     def test_no_agent_warning_below_max(self):
         ledger = _MockLedger()
-        tree = DelegationTree(run_id="r_soft4", orchestrator_budget=100_000,
-                              ledger=ledger, routing=_two_source_routing(),
-                              max_agents=10)
+        tree = DelegationTree(
+            run_id="r_soft4",
+            orchestrator_budget=100_000,
+            ledger=ledger,
+            routing=_two_source_routing(),
+            max_agents=10,
+        )
         for i in range(5):
             tree.request_delegation("sketcher", f"agent {i}", 200, kind="ponder")
         warn_events = ledger.events_of_kind("delegation_agent_limit_warning")
@@ -1141,10 +1311,15 @@ class TestSoftLimitAdvisory(unittest.TestCase):
     def test_advisory_events_do_not_prevent_spawn(self):
         """Soft-limit warnings must not stop the spawn from completing."""
         ledger = _MockLedger()
-        tree = DelegationTree(run_id="r_soft5", orchestrator_budget=100_000,
-                              ledger=ledger, routing=_two_source_routing(),
-                              soft_depth_limit=1, max_agents=1,
-                              max_subagent_depth=8)
+        tree = DelegationTree(
+            run_id="r_soft5",
+            orchestrator_budget=100_000,
+            ledger=ledger,
+            routing=_two_source_routing(),
+            soft_depth_limit=1,
+            max_agents=1,
+            max_subagent_depth=8,
+        )
         # Both limits hit immediately — spawn must still succeed.
         node = tree.request_delegation("sketcher", "first task", 500, kind="ponder")
         self.assertEqual(node.status, "approved")
@@ -1156,6 +1331,7 @@ class TestSoftLimitAdvisory(unittest.TestCase):
 # ---------------------------------------------------------------------------
 # T-DP9: Routing delegation config tests
 # ---------------------------------------------------------------------------
+
 
 class TestRoutingDelegationConfig(unittest.TestCase):
     """delegation: block in routing.yaml / load_routing dict drives RoutingTable (T-DP9)."""
@@ -1178,22 +1354,22 @@ class TestRoutingDelegationConfig(unittest.TestCase):
             "assignments": {"default": ["strongest"]},
         }
         rt = load_routing(cfg)
-        self.assertEqual(rt.soft_depth_limit, 8)   # DEFAULT_SOFT_DEPTH_LIMIT
-        self.assertEqual(rt.max_agents, 64)         # DEFAULT_MAX_AGENTS
+        self.assertEqual(rt.soft_depth_limit, 8)  # DEFAULT_SOFT_DEPTH_LIMIT
+        self.assertEqual(rt.max_agents, 64)  # DEFAULT_MAX_AGENTS
 
     def test_routing_yaml_has_delegation_block(self):
         """The canonical routing.yaml on disk must have a delegation: block (T-DP9)."""
-        rt = load_routing()   # reads the real routing.yaml next to the module
+        rt = load_routing()  # reads the real routing.yaml next to the module
         self.assertIsInstance(rt.soft_depth_limit, int)
         self.assertGreater(rt.soft_depth_limit, 0)
         self.assertIsInstance(rt.max_agents, int)
         self.assertGreater(rt.max_agents, 0)
 
 
-
 # ---------------------------------------------------------------------------
 # agent.max_subagent_depth hard nesting cap
 # ---------------------------------------------------------------------------
+
 
 class TestMaxSubagentDepth(unittest.TestCase):
     """Hard nesting depth (agent.max_subagent_depth) refuses past the limit."""
@@ -1210,12 +1386,20 @@ class TestMaxSubagentDepth(unittest.TestCase):
         d1 = tree.request_delegation("sketcher", "depth 1", 500, kind="ponder")
         self.assertEqual(d1.depth, 1)
         d2 = tree.request_delegation(
-            "sketcher", "depth 2", 200, parent_id=d1.id, kind="ponder",
+            "sketcher",
+            "depth 2",
+            200,
+            parent_id=d1.id,
+            kind="ponder",
         )
         self.assertEqual(d2.depth, 2)
         with self.assertRaises(DelegationError) as ctx:
             tree.request_delegation(
-                "sketcher", "depth 3", 100, parent_id=d2.id, kind="ponder",
+                "sketcher",
+                "depth 3",
+                100,
+                parent_id=d2.id,
+                kind="ponder",
             )
         msg = str(ctx.exception)
         self.assertIn("max subagent nesting depth (2) reached", msg)
@@ -1242,8 +1426,12 @@ class TestMaxSubagentDepth(unittest.TestCase):
         r1 = delegate("sketcher", "ok", 200, tree=tree, kind="ponder")
         self.assertNotIn("error", r1)
         r2 = delegate(
-            "sketcher", "too deep", 100,
-            tree=tree, parent_id=r1["id"], kind="ponder",
+            "sketcher",
+            "too deep",
+            100,
+            tree=tree,
+            parent_id=r1["id"],
+            kind="ponder",
         )
         self.assertIn("error", r2)
         self.assertEqual(r2["status"], "failed")
@@ -1269,6 +1457,7 @@ class TestMaxSubagentDepth(unittest.TestCase):
 # Coordination board
 # ---------------------------------------------------------------------------
 
+
 class TestCoordinationBoard(unittest.TestCase):
     """Claim conflict detection, release frees, progress notes."""
 
@@ -1277,18 +1466,23 @@ class TestCoordinationBoard(unittest.TestCase):
             CoordinationBoard,
             clear_boards,
         )
+
         clear_boards()
         self.board = CoordinationBoard(
-            "r_coord_test", persist=False,
+            "r_coord_test",
+            persist=False,
         )
 
     def tearDown(self):
         from services.agent.coordination import clear_boards
+
         clear_boards()
 
     def test_claim_success(self):
         out = self.board.register_claim(
-            "agent_a", ["doc_1", "feature_x"], "editing boss",
+            "agent_a",
+            ["doc_1", "feature_x"],
+            "editing boss",
         )
         self.assertTrue(out["ok"])
         self.assertEqual(out["status"], "claimed")
@@ -1297,7 +1491,9 @@ class TestCoordinationBoard(unittest.TestCase):
     def test_claim_conflict_detection(self):
         self.board.register_claim("agent_a", ["doc_1"], "first claim")
         out = self.board.register_claim(
-            "agent_b", ["doc_1", "doc_2"], "second claim",
+            "agent_b",
+            ["doc_1", "doc_2"],
+            "second claim",
         )
         self.assertFalse(out["ok"])
         self.assertEqual(out["status"], "CONFLICT")
@@ -1344,6 +1540,7 @@ class TestCoordinationBoard(unittest.TestCase):
 
     def test_get_board_registry(self):
         from services.agent.coordination import get_board, drop_board
+
         b1 = get_board("r_shared", persist=False)
         b2 = get_board("r_shared", persist=False)
         self.assertIs(b1, b2)
@@ -1357,6 +1554,7 @@ class TestCoordinationBoard(unittest.TestCase):
         self.assertIn("doc_z", text)
         self.assertIn("agent_a", text)
         self.assertIn("coordinate_claim", text)
+
 
 if __name__ == "__main__":
     unittest.main()

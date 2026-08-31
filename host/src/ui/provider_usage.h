@@ -93,15 +93,14 @@ const char* subscriptionProviderForCad(int cadProvider);
 // connected account that reports usage). nullptr when nothing applicable is signed in.
 const std::vector<UsageWindow>* activeAccountUsage(const std::string& subProviderId);
 
-// The omp bridge provider id backing a CAD ProviderIndex, or nullptr when that provider is not
-// bridge-routed and so has no sidecar-side windows. Callers then fall back to
-// subscriptionProviderForCad() + activeAccountUsage().
+// The Chudcode usage provider id backing a CAD ProviderIndex, or nullptr when usage windows
+// do not apply. Callers then fall back to subscriptionProviderForCad() +
+// activeAccountUsage().
 const char* bridgeProviderForCad(int cadProvider);
 
-// Bridge-reported windows for a bridge provider id. nullptr until a poll succeeds AND reports at
-// least one window — never a pointer to an empty vector, so nullptr always means "show nothing".
+// Chudcode-reported windows for a provider id. nullptr until a poll succeeds and reports at
+// least one window, so nullptr always means "show nothing".
 const std::vector<UsageWindow>* bridgeProviderUsage(const std::string& bridgeProviderId);
-
 // ---- shared presentation -------------------------------------------------------------------
 // Palette role for a window's status; unknown/empty derives from the fraction using the same
 // thresholds as the composer's context meter, so bars and rings agree on when amber turns red.

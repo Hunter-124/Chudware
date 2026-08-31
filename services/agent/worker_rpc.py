@@ -1641,403 +1641,9 @@ OFFICE_METHODS: dict[str, Callable] = {
     "office_extract": _office_extract,
 }
 
-
-# ──── internal legacy/offline linear provider loop ────
-# Kept only for explicit internal fallback callers while deterministic native
-# offline modeling remains outside this worker.  It is deliberately absent from
-# every registration table; ordinary online agent_admin_turn calls Chudcode below.
-
-
 #: Bounded worker-boundary attachment shape. ChudcodeSessionHost performs the
 #: image/file conversion immediately before the RPC prompt.
 _ATTACH_MAX = 32
-
-
-def _legacy_offline_agent_admin_turn(params: dict, _emit: Callable) -> dict:
-    """Run the pre-Chudcode linear provider loop for an explicit offline caller.
-
-    This helper is intentionally unregistered. Online request data cannot select
-    it; ``ADMIN_METHODS["agent_admin_turn"]`` always names the Chudcode path.
-
-    Streams turn events through ``_emit`` — worker_main.py's serve loop tags each
-    one with this request's id and pushes it as a ``{"event":...}`` line
-    interleaved with the final response, so a live caller (core/agent/run.cpp's
-    pre-flight branch) relays them onto its own run-event stream exactly like the
-    provider_call / stage_* events any other run emits. Never raises: a
-    worker-unreachable/offline caller MUST get a clean ``ok:false`` to fall back
-    on, not a crash.
-
-    C4 — the provider descriptor: the GUI/C++ side has ALREADY resolved which
-    provider this turn should use (the one the user picked in the composer). When
-    ``provider`` is supplied we honour it by overlaying the descriptor onto
-    ``load_config()`` and resolving by name, instead of re-deriving the provider
-    from config.json's flat ``provider`` field and silently running something else.
-    With no ``provider`` the legacy ``get_provider(role=role)`` path is unchanged.
-    """
-    request = (params or {}).get("request", "")
-    if not isinstance(request, str) or not request.strip():
-        return {"ok": False, "reason": "agent_admin_turn: empty request"}
-    run_id = (params or {}).get("run_id") or None
-    role = (params or {}).get("role") or "general_agent"
-    if not isinstance(role, str) or not role.strip():
-        role = "general_agent"
-    try:
-        from services.agent.roles import load_role as _load_role  # noqa: PLC0415
-
-        _load_role(role)
-    except Exception:
-        return {"ok": False, "reason": "invalid_role"}
-
-    def _param_str(key: str) -> str:
-        value = (params or {}).get(key)
-        return value.strip() if isinstance(value, str) else ""
-
-    provider_name = _param_str("provider")
-
-    # Workspace plumbing (T: project-folder awareness). run.cpp's general lane passes
-    # ``workspace_dir`` = agent_workspace_dir(options), which prefers options.save_dir —
-    # the open DOCUMENT's folder. That is right for saving a part next to its siblings
-    # but WRONG as a jail root: with a document open under
-    # <project>/CAD & Design Geometry/, a live run was refused a run_shell in the
-    # sibling <project>/CDR/ folder ("outside_workspace_root"). So the two concepts are
-    # resolved separately:
-    #   * CHUDWARE_FS_ROOT / CHUDWARE_PROJECT_DIR — the PROJECT root (outermost folder
-    #     carrying .plm/.aicadvault/.chudware), so the agent can work across the whole
-    #     project the user opened, and project_context lists all of it, not one subtree.
-    #   * CHUDWARE_PROJECT_SAVE_DIR — the folder the host actually asked us to save in,
-    #     left exactly as passed so deliverables still land beside the open document.
-    # chdir targets the project root. The worker is a fresh fork per turn
-    # (run.cpp call_admin_worker_turn), so no restore is needed. An ABSENT workspace
-    # retains the actor-free/no-project path; an explicitly supplied workspace must
-    # resolve completely before provider construction, because silently continuing
-    # without a save root turns a successful model mutation into memory-only work.
-    project_root = ""
-    raw_params = params or {}
-    if "workspace_dir" in raw_params:
-        raw_ws = raw_params.get("workspace_dir")
-        if not isinstance(raw_ws, str) or not raw_ws.strip():
-            return {
-                "ok": False,
-                "reason": "invalid_workspace: workspace_dir must be a non-empty directory",
-            }
-        try:
-            import os as _os  # noqa: PLC0415
-            from pathlib import Path as _Path  # noqa: PLC0415
-
-            cand = _Path(_os.path.abspath(_os.path.expanduser(raw_ws.strip())))
-            if not cand.is_dir():
-                return {
-                    "ok": False,
-                    "reason": f"invalid_workspace: not an existing directory: {cand}",
-                }
-            from services.agent.project_context import (  # noqa: PLC0415
-                resolve_project_root,
-            )
-
-            resolved_root = _Path(resolve_project_root(cand))
-            if not resolved_root.is_dir():
-                return {
-                    "ok": False,
-                    "reason": (
-                        "invalid_workspace: resolved project root is not a directory: "
-                        f"{resolved_root}"
-                    ),
-                }
-            _os.chdir(resolved_root)
-            project_root = str(resolved_root)
-            _os.environ["CHUDWARE_FS_ROOT"] = project_root
-            _os.environ["CHUDWARE_PROJECT_DIR"] = project_root
-            _os.environ["CHUDWARE_PROJECT_SAVE_DIR"] = str(cand)
-        except Exception as exc:  # noqa: BLE001
-            return {
-                "ok": False,
-                "reason": f"invalid_workspace: {type(exc).__name__}: {exc}",
-            }
-
-    # Sub-agent raw transcripts belong to the conversation that spawned them, so
-    # they fork and prune with it instead of piling up in a global cache. The GUI
-    # owns the Sessions directory layout and passes both keys down (composer.cpp
-    # -> run.cpp); binding them here means session identity never has to thread
-    # through delegation/mission_dispatch. Absent keys == the registry's own
-    # cache-dir fallback, i.e. exactly the previous behaviour.
-    try:
-        from services.agent import subagent_registry as _sreg_bind  # noqa: PLC0415
-
-        _sessions_dir = _param_str("sessions_dir")
-        _session_id = _param_str("session_id")
-        if _sessions_dir and _session_id:
-            from pathlib import Path as _BindPath  # noqa: PLC0415
-
-            _sreg_bind.bind_session(
-                _session_id, str(_BindPath(_sessions_dir) / f"{_session_id}.subagents")
-            )
-    except Exception:  # noqa: BLE001 — never break a turn over transcript paths
-        pass
-
-    try:
-        from services.agent import config as agent_config  # noqa: PLC0415
-        from services.agent.mission_dispatch import run_linear_role_turn  # noqa: PLC0415
-    except Exception as exc:  # noqa: BLE001
-        return {"ok": False, "reason": f"agent_admin_turn: import failed: {exc}"}
-    agent_config.clear_pooled_credentials()
-    raw_actor = (params or {}).get("_chudware_actor")
-    if raw_actor is None:
-        # Named, legitimate actor-free path: the desktop/CLI invokes its own
-        # local hostd with a user-owned credential (BYOK). A web request can
-        # never land here actor-free because engine_bridge injects on every
-        # agent RPC and run.cpp forwards it verbatim.
-        credit_actor = None
-    else:
-        try:
-            credit_actor = agent_config.Actor.from_mapping(raw_actor)
-        except ValueError:
-            return {"ok": False, "reason": "invalid_chudware_actor"}
-    if credit_actor is not None and credit_actor.key_source == "subscription":
-        # The gateway decrypted this account's own subscription grant and injected
-        # it INSIDE the actor, which is the one object hostd forwards verbatim
-        # (core/agent/run.cpp:825) — so the grant cannot be separated in transit
-        # from the key_source decision that authorises it, and no hostd change is
-        # needed to carry it. It binds run-scoped, is never written to the desktop
-        # credential store, and a malformed grant refuses the turn: falling through
-        # would silently spend the machine owner's own Claude/ChatGPT subscription
-        # on a web caller's request.
-        try:
-            agent_config.bind_subscription_grant(raw_actor.get("_subscription"))
-        except (AttributeError, ValueError):
-            return {"ok": False, "reason": "invalid_subscription_grant"}
-
-    cfg = dict(agent_config.load_config() or {})
-    if credit_actor is not None and credit_actor.key_source in {"pool", "byok"}:
-        # The credential was resolved on the trusted host side after the gateway
-        # stripped browser credentials. Bind it to the run-scoped slot so neither
-        # metered pool nor account BYOK can fall through to desktop config.json.
-        cfg["_chudware_pool_api_key"] = _param_str("api_key")
-    try:
-        if provider_name:
-            # Shallow overlay — load_config() hands back a process-cached dict, so
-            # never mutate it in place. base_url lands on BOTH the flat key and the
-            # per-provider sub-dict, because that is where every native branch in
-            # config.py._resolve_provider actually reads it from (cfg[name].base_url).
-            provider_name = provider_name.lower()
-            cfg = dict(cfg)
-            cfg["provider"] = provider_name
-            for key in ("model", "api_key", "reasoning_effort"):
-                value = _param_str(key)
-                if value:
-                    cfg[key] = value
-            base_url = _param_str("base_url")
-            if base_url:
-                cfg["base_url"] = base_url
-                sub = cfg.get(provider_name)
-                sub = dict(sub) if isinstance(sub, dict) else {}
-                sub["base_url"] = base_url
-                cfg[provider_name] = sub
-            provider = agent_config.get_provider(
-                name=provider_name,
-                cfg=cfg,
-                role=role,
-                **({"actor": credit_actor} if credit_actor is not None else {}),
-            )
-        else:
-            provider = agent_config.get_provider(
-                role=role,
-                cfg=cfg,
-                **({"actor": credit_actor} if credit_actor is not None else {}),
-            )
-    except agent_config.OfflineModeError as exc:
-        return {"ok": False, "reason": f"offline: {exc}"}
-    except Exception as exc:  # noqa: BLE001
-        return {"ok": False, "reason": f"agent_admin_turn: no provider: {exc}"}
-    turn_tier = None
-    turn_capability = None
-    try:
-        from services.agent.tiers import detect_tier, detect_tier_from_env  # noqa: PLC0415
-
-        turn_tier = detect_tier_from_env()
-        if not turn_tier:
-            context_window = int(getattr(provider, "context_window", 0) or 0)
-            if context_window > 0:
-                turn_tier = detect_tier(context_window)
-        if turn_tier:
-            from services.agent.capability import resolve_capability  # noqa: PLC0415
-
-            turn_capability = resolve_capability(turn_tier)
-    except Exception:  # noqa: BLE001 — unknown metadata keeps conservative defaults
-        turn_tier = None
-        turn_capability = None
-    try:
-        configured_max_tokens = int(cfg.get("max_output_tokens") or 0)
-    except (TypeError, ValueError):
-        configured_max_tokens = 0
-    if configured_max_tokens < 0:
-        configured_max_tokens = 0
-
-    def _on_event(kind: str, payload) -> None:
-        data = dict(payload) if isinstance(payload, dict) else {"payload": payload}
-        data["kind"] = kind
-        _emit(data)
-
-    def _history() -> list[dict] | None:
-        """params["history"] — the GUI session transcript, oldest first, as
-        {"role": "user"|"assistant", "text": str}. Validated and capped here
-        (agent_turn.run_turn re-applies the same contract defensively).
-        Absent/invalid == today's behaviour exactly (None, not [])."""
-        try:
-            from services.agent.agent_turn import _sanitize_history  # noqa: PLC0415
-
-            kept = _sanitize_history((params or {}).get("history"))
-            return [{"role": r, "text": t} for r, t in kept] or None
-        except Exception:  # noqa: BLE001 — history must never break a turn
-            return None
-
-    def _attachments() -> list[dict] | None:
-        """params["attachments"] — the GUI composer's attachment list, entries
-        shaped {"path", "name", "kind": "image"|"file", "mime"?}. Only the shape
-        is checked here (a list of dicts); agent_turn validates each entry's
-        path/size before it becomes an image part. Absent/invalid == today's
-        behaviour exactly (None, not [])."""
-        try:
-            raw = (params or {}).get("attachments")
-            if not isinstance(raw, list):
-                return None
-            kept = [a for a in raw if isinstance(a, dict)][:_ATTACH_MAX]
-            return kept or None
-        except Exception:  # noqa: BLE001 — attachments must never break a turn
-            return None
-
-    history = _history()
-    turn_max_tokens = configured_max_tokens or 8192
-    turn_total_token_budget = None
-    if credit_actor is not None and credit_actor.key_source == "pool":
-        prompt_text = request + "".join(
-            str(item.get("text") or "")
-            for item in (history or [])
-            if isinstance(item, dict)
-        )
-        prompt_estimate = max(1, math.ceil(len(prompt_text.encode("utf-8")) / 4))
-        actual_model = str(getattr(provider, "model", None) or cfg.get("model") or "")
-        if credit_actor.rated_model and credit_actor.rated_model != actual_model:
-            return {"ok": False, "reason": "insufficient_credits"}
-        check = agent_config.pooled_credit_preflight(
-            credit_actor,
-            prompt_tokens_estimate=prompt_estimate,
-            max_output_tokens=turn_max_tokens,
-        )
-        if not check.get("ok"):
-            return {"ok": False, "reason": "insufficient_credits"}
-        turn_max_tokens = max(0, int(check.get("max_output_tokens") or 0))
-        # The gateway reserved a bounded amount for this whole turn, not for
-        # every completion the loop might make. Convert that reservation into a
-        # conservative aggregate token ceiling using the more expensive rate.
-        max_rate = max(
-            credit_actor.prompt_usd_per_mtok or 0,
-            credit_actor.completion_usd_per_mtok or 0,
-        )
-        if max_rate > 0 and credit_actor.reservation_credits > 0:
-            turn_total_token_budget = max(
-                1,
-                int(
-                    (
-                        Decimal(credit_actor.reservation_credits)
-                        * Decimal(1000)
-                        / max_rate
-                    ).to_integral_value(rounding=ROUND_FLOOR)
-                ),
-            )
-
-    from services.agent import agent_events as _agent_events  # noqa: PLC0415
-    from services.agent.providers import token_usage as _token_usage  # noqa: PLC0415
-
-    def _usage_event(payload: dict) -> None:
-        kind, data = _agent_events.provider_usage_event(**payload)
-        _on_event(kind, data)
-
-    usage_sink_token = _token_usage.bind_usage_sink(_usage_event)
-    linear_finalized = False
-    response: dict
-
-    try:
-        turn = run_linear_role_turn(
-            request,
-            role,
-            provider,
-            on_event=_on_event,
-            run_id=run_id,
-            # Project memory / skills resolve against the user's project (agent_turn
-            # reads options project_dir/project_path/workspace_dir for its
-            # project-memory lookup).
-            options={"project_dir": project_root} if project_root else None,
-            tier=turn_tier,
-            capability=turn_capability,
-            max_tokens=turn_max_tokens,
-            max_total_tokens=turn_total_token_budget,
-            history=history,
-            attachments=_attachments(),
-            chudware_actor=credit_actor,
-        )
-        linear_finalized = True
-        response = {"ok": True, "turn": turn}
-    except Exception as exc:  # noqa: BLE001 — never raise across the worker seam
-        response = {
-            "ok": False,
-            "reason": f"agent_admin_turn failed: {type(exc).__name__}: {exc}",
-        }
-    finally:
-        finalization_errors: list[str] = []
-        try:
-            _token_usage.reset_usage_sink(usage_sink_token)
-        except Exception as exc:  # noqa: BLE001 — persistence must still run
-            finalization_errors.append(f"usage_sink_reset: {type(exc).__name__}: {exc}")
-
-        # run_linear_role_turn owns the normal terminal save. Only an exception
-        # that escaped before that finalizer needs the crash-path sweep here. The
-        # reset and sweep are independently guarded: a usage-context fault must
-        # never prevent already-built geometry from reaching durable storage.
-        if not linear_finalized:
-            try:
-                from services.mcp.cad_common import save_touched_docs  # noqa: PLC0415
-
-                persistence = save_touched_docs()
-                if not isinstance(persistence, dict):
-                    persistence = {
-                        "saved": [],
-                        "errors": ["save_touched_docs returned a non-dict status"],
-                        "persistence_failure": None,
-                    }
-            except Exception as exc:  # noqa: BLE001
-                persistence = {
-                    "saved": [],
-                    "errors": [f"{type(exc).__name__}: {exc}"],
-                    "persistence_failure": None,
-                }
-            response["persistence"] = persistence
-            finalization_errors.extend(
-                f"persistence: {item}" for item in (persistence.get("errors") or [])
-            )
-            persistence_failure = persistence.get("persistence_failure")
-            if persistence_failure:
-                if isinstance(persistence_failure, dict):
-                    failure_reason = str(
-                        persistence_failure.get("reason")
-                        or "unknown persistence failure"
-                    )
-                else:
-                    failure_reason = str(persistence_failure)
-                finalization_errors.append(f"persistence: {failure_reason}")
-
-        if finalization_errors:
-            response["finalization_errors"] = finalization_errors
-            joined = "; ".join(finalization_errors)
-            if response.get("ok"):
-                response["ok"] = False
-                response["reason"] = f"agent_admin_turn finalization failed: {joined}"
-            else:
-                prior_reason = response.get("reason", "agent_admin_turn failed")
-                response["reason"] = f"{prior_reason}; {joined}"
-
-    return response
-
-
 _HISTORY_SEED_LOCK = threading.Lock()
 _HISTORY_SEEDED_SESSIONS: set[str] = set()
 _HISTORY_SEED_MAX_CHARS = 24_000
@@ -2513,6 +2119,148 @@ def _chudcode_session_call(
         }
 
 
+def _chudcode_export_session(params: dict, _emit: Callable) -> dict:
+    if _has_unknown_params(params, frozenset({"session_id", "output_path"})):
+        return {"ok": False, "reason": "chudcode_export_session has unknown params"}
+    session_id = _bounded_text(params.get("session_id"), 256)
+    if session_id is None:
+        return {"ok": False, "reason": "session_not_live"}
+    output_path = params.get("output_path")
+    if output_path is not None:
+        output_path = _bounded_text(output_path, 4_096)
+        if output_path is None:
+            return {"ok": False, "reason": "output_path must be a non-empty string"}
+    try:
+        raw = get_default_chudcode_host().export_session(session_id, output_path)
+        if not isinstance(raw, Mapping):
+            return {
+                "ok": False,
+                "reason": "Chudcode export_session returned non-object",
+            }
+        if not raw.get("ok"):
+            return {
+                "ok": False,
+                "reason": _bounded_text(raw.get("reason"), 4_096)
+                or "Chudcode export_session failed",
+            }
+        path = _bounded_text(raw.get("path"), 4_096)
+        if path is None:
+            return {
+                "ok": False,
+                "reason": "Chudcode export_session returned no path",
+            }
+        return {"ok": True, "path": path}
+    except Exception as exc:  # noqa: BLE001 - worker boundary
+        return {
+            "ok": False,
+            "reason": f"Chudcode export_session failed: {type(exc).__name__}",
+        }
+
+
+def _chudcode_branch_session(params: dict, _emit: Callable) -> dict:
+    if _has_unknown_params(params, frozenset({"session_id", "entry_id"})):
+        return {"ok": False, "reason": "chudcode_branch_session has unknown params"}
+    session_id = _bounded_text(params.get("session_id"), 256)
+    if session_id is None:
+        return {"ok": False, "reason": "session_not_live"}
+    entry_id = _bounded_text(params.get("entry_id"), 256)
+    if entry_id is None:
+        return {"ok": False, "reason": "entry_id is required"}
+    try:
+        raw = get_default_chudcode_host().branch_session(session_id, entry_id)
+        if not isinstance(raw, Mapping):
+            return {
+                "ok": False,
+                "reason": "Chudcode branch_session returned non-object",
+            }
+        if not raw.get("ok"):
+            return {
+                "ok": False,
+                "reason": _bounded_text(raw.get("reason"), 4_096)
+                or "Chudcode branch_session failed",
+            }
+        child_id = _bounded_text(raw.get("chudcode_session_id"), 256)
+        child_file = _bounded_text(raw.get("chudcode_session_file"), 4_096)
+        if child_id is None or child_file is None:
+            return {
+                "ok": False,
+                "reason": "Chudcode branch_session returned no child metadata",
+            }
+        return {
+            "ok": True,
+            "chudcode_session_id": child_id,
+            "chudcode_session_file": child_file,
+        }
+    except Exception as exc:  # noqa: BLE001 - worker boundary
+        return {
+            "ok": False,
+            "reason": f"Chudcode branch_session failed: {type(exc).__name__}",
+        }
+
+
+def _chudcode_repair_session(params: dict, _emit: Callable) -> dict:
+    if _has_unknown_params(params, frozenset({"session_id", "repair"})):
+        return {"ok": False, "reason": "chudcode_repair_session has unknown params"}
+    session_id = _bounded_text(params.get("session_id"), 256)
+    if session_id is None:
+        return {"ok": False, "reason": "session_not_live"}
+    repair = params.get("repair", False)
+    if not isinstance(repair, bool):
+        return {"ok": False, "reason": "repair must be a boolean"}
+    try:
+        raw = get_default_chudcode_host().repair_session(session_id, repair)
+        if not isinstance(raw, Mapping):
+            return {
+                "ok": False,
+                "reason": "Chudcode repair_session returned non-object",
+            }
+        clean = _redact_sensitive_response(raw)
+        if not clean.get("ok"):
+            return {
+                "ok": False,
+                "reason": _bounded_text(clean.get("reason"), 4_096)
+                or "Chudcode repair_session failed",
+            }
+        allowed = {
+            "ok",
+            "mode",
+            "status",
+            "changed",
+            "finding_count",
+            "repairable_finding_count",
+            "remaining_finding_count",
+            "counts",
+            "findings",
+            "backup_path",
+            "chudcode_session_id",
+            "chudcode_session_file",
+        }
+        return {str(key): value for key, value in clean.items() if key in allowed}
+    except Exception as exc:  # noqa: BLE001 - worker boundary
+        return {
+            "ok": False,
+            "reason": f"Chudcode repair_session failed: {type(exc).__name__}",
+        }
+
+
+def _chudcode_close_session(params: dict, _emit: Callable) -> dict:
+    if _has_unknown_params(params, frozenset({"session_id"})):
+        return {"ok": False, "reason": "chudcode_close_session has unknown params"}
+    session_id = _bounded_text(params.get("session_id"), 256)
+    if session_id is None:
+        return {"ok": False, "reason": "session_id is required"}
+    try:
+        get_default_chudcode_host().close_session(session_id)
+        with _HISTORY_SEED_LOCK:
+            _HISTORY_SEEDED_SESSIONS.discard(session_id)
+        return {"ok": True}
+    except Exception as exc:  # noqa: BLE001 - worker boundary
+        return {
+            "ok": False,
+            "reason": f"Chudcode close_session failed: {type(exc).__name__}",
+        }
+
+
 def _chudcode_session_stats(params: dict, _emit: Callable) -> dict:
     if _has_unknown_params(params, frozenset({"session_id"})):
         return {"ok": False, "reason": "chudcode_session_stats has unknown params"}
@@ -2909,7 +2657,6 @@ def _agent_admin_turn(params: dict, _emit: Callable) -> dict:
         try:
             agent_config.bind_subscription_grant(raw_actor.get("_subscription"))
         except (AttributeError, ValueError):
-            agent_config.clear_pooled_credentials()
             return {"ok": False, "reason": "invalid_subscription_grant"}
 
     cfg = dict(agent_config.load_config() or {})
@@ -3349,6 +3096,10 @@ ADMIN_METHODS: dict[str, Callable] = {
     "chudcode_login": _chudcode_login,
     "chudcode_models_list": _chudcode_models_list,
     "chudcode_session_stats": _chudcode_session_stats,
+    "chudcode_export_session": _chudcode_export_session,
+    "chudcode_branch_session": _chudcode_branch_session,
+    "chudcode_repair_session": _chudcode_repair_session,
+    "chudcode_close_session": _chudcode_close_session,
     "chudcode_compact": _chudcode_compact,
     "chudcode_set_auto_compaction": _chudcode_set_auto_compaction,
     "chudcode_set_auto_retry": _chudcode_set_auto_retry,

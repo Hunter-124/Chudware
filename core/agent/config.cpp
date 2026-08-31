@@ -12,7 +12,6 @@
 
 #include "agent/paths.h"
 #include "agent/auth.h"  // T-RF4: in-process subscription token refresh
-#include "agent/providers.h"  // is_omp_bridge_provider() (S-CORE: bridge-routed provider ids)
 #include "agent/state.h"  // kContextTokenCap (the lean input-cap ceiling for big windows)
 
 namespace chudware {
@@ -333,17 +332,6 @@ json resolve_provider(const std::optional<std::string>& name_arg, json cfg,
         if (pv && !pv->empty()) name_opt = pv;
     }
     std::string name = lower(name_opt.value_or(""));
-    // Compatibility normalization for persisted config.json values: builds before the GUI
-    // moved the Kimi subscription slot onto the bridge wrote provider "kimi-sub", an id no
-    // branch below and no entry in is_omp_bridge_provider()'s set ever accepted — it fell
-    // straight through to "Unknown provider" and bricked the slot. The live wire id is the
-    // bridge's "kimi-code" (host/src/ui/copilot/composer.cpp emits that now); rewrite the
-    // stale value here so a config.json written by an older build still resolves. Runs before
-    // the auth::ensure_fresh_for_run gate on purpose: subscription_auth["kimi-sub"] is the
-    // PYTHON KimiSubProvider's credential (services/agent/providers/kimi_sub_provider.py) and
-    // is unusable from C++, while kimi-code's OAuth token lives in — and is refreshed by —
-    // the bridge's own AuthStorage.
-    if (name == "kimi-sub") name = "kimi-code";
 
     auto refusal = [](const std::string& msg) {
         return json{{"error", msg}};
@@ -473,10 +461,9 @@ json resolve_provider(const std::optional<std::string>& name_arg, json cfg,
     } else if (name == "anthropic" || name == "anthropic-sub") {
         // Credential precedence, highest first: an explicit config.json/env API key, then the
         // active Claude subscription OAuth token from config.json's subscription_auth store
-        // (already refreshed in-process by auth::ensure_fresh_for_run above, T-RF4).
+        // (already refreshed in-process by auth::ensure_fresh_for_run above).
         // "anthropic-sub" is subscription-only: cfg.api_key is shared across providers and can
-        // still hold an OpenAI/xAI key left over from a provider switch, so it is never read
-        // for that id.
+        // still hold a key left over from a provider switch, so it is never read for that id.
         const bool sub_only = (name == "anthropic-sub");
         std::string key;
         bool oauth = sub_only;
@@ -492,25 +479,10 @@ json resolve_provider(const std::optional<std::string>& name_arg, json cfg,
             key = subscription_access_token(cfg, "anthropic-sub");
             if (!key.empty()) oauth = true;
         }
-        // An empty key is NOT "signed out". Settings → Providers signs in through the bun
-        // sidecar, and that OAuth credential lives ONLY in the bridge's own AuthStorage
-        // (omp-bridge-auth.db) — config.json never sees it. Both anthropic ids are
-        // bridge-routed (is_omp_bridge_provider), and providers.cpp omits `apiKey` from the
-        // `complete` params when the descriptor's key is null, which is exactly what makes
-        // handleComplete() fall back to AuthStorage.getApiKey() (vendor/omp/bridge/src/
-        // bridge.ts:142-154,176-181). So a null key here means "let the bridge use its own
-        // credential"; refusing would lock out every Settings → Providers sign-in.
-        //
-        // Deliberately NO auth_state probe to confirm the bridge actually holds one:
-        // resolve_provider also runs on status/probe paths, where a round-trip would lazily
-        // spawn the bun child just to phrase a nicer refusal. is_omp_bridge_provider is a
-        // static set lookup, so resolve() stays a pure config read — and a bridge that is
-        // ALSO signed out fails the call itself ("No API key for provider: anthropic"). The
-        // refusal below therefore only fires if the bridge stops covering these ids.
-        if (key.empty() && !is_omp_bridge_provider(name))
+        if (key.empty())
             return refusal(
-                "Claude subscription not signed in. Open Settings → AI → Accounts and "
-                "sign in with Claude (Pro/Max).");
+                "Claude is not configured for native local execution. Use "
+                "agent_admin_turn/Chudcode for online providers.");
         // Global cfg.model may be a Grok id when the active provider is xAI — never send
         // a non-Claude model id to the Anthropic Messages API.
         std::string model = py_or(cfg_str(cfg, "model"), "claude-opus-4-8");
@@ -525,9 +497,7 @@ json resolve_provider(const std::optional<std::string>& name_arg, json cfg,
             {"model", model},
             {"base_url", nullptr},
             {"supports_vision", true},
-            // Null (not "") when unset — mirrors Python and keeps providers.cpp from sending
-            // an empty apiKey that would suppress the bridge's AuthStorage lookup.
-            {"api_key", key.empty() ? json(nullptr) : json(key)},
+            {"api_key", key},
         };
         if (oauth) desc["auth_mode"] = "oauth";
     } else if (name == "gemini") {
@@ -623,13 +593,9 @@ json resolve_provider(const std::optional<std::string>& name_arg, json cfg,
             {"api_key", key},
         };
     } else if (name == "cursor" || name == "cursor-sub") {
-        // Cursor auth is stored (subscription_auth.cursor) but there is NO REST
-        // completions transport in C++ or Python — Cursor's agent backend is
-        // Connect-RPC/protobuf over HTTP/2. Route via a different provider.
         return refusal(
-            "Cursor has no C++ chat completions transport (its agent API is Connect-RPC/"
-            "protobuf, not REST). Cursor Design runs route through the Python worker — "
-            "this refusal firing means that routing was bypassed or the worker is down.");
+            "Cursor has no native local completions transport. Use "
+            "agent_admin_turn/Chudcode for online providers.");
     } else if (name == "llamacpp" || name == "llama.cpp" || name == "llama-cpp") {
         desc = json{
             {"name", "llamacpp"},
@@ -637,38 +603,6 @@ json resolve_provider(const std::optional<std::string>& name_arg, json cfg,
             {"base_url", kDefaultLocalBaseUrl},
             {"supports_vision", false},
             {"api_key", nullptr},
-        };
-    } else if (is_omp_bridge_provider(name)) {
-        // OMP-bridge-backed provider (docs/omp-integration/research/verify-host-provider-seam.md):
-        // no native C++ completions transport — providers.cpp::complete() forwards this id
-        // verbatim to the bun sidecar's `complete` op (core/agent/omp_bridge_client.h). Just
-        // carry name/model/api_key/base_url/reasoning_effort through; reasoning_effort +
-        // context_window are applied by the shared tail below like every other branch.
-        // Key precedence mirrors the native branches: explicit cfg.api_key -> cfg.keys.<name>
-        // -> OMP_<NAME>_API_KEY env (dashes -> underscores, uppercased). None of them holding a
-        // key is the NORMAL case for an OAuth sign-in (auth_begin_oauth): that credential lives
-        // only in the bridge's own AuthStorage, never in config.json. api_key then stays null,
-        // providers.cpp omits `apiKey` from the `complete` params, and handleComplete() resolves
-        // it via resolveAuthApiKey() -> AuthStorage.getApiKey(provider) (vendor/omp/bridge/src/
-        // bridge.ts:142-154,176-181), refreshing the OAuth token on the way out. So a null key
-        // here means "use the bridge's own credential", NOT "no credential".
-        std::string key = py_or(cfg_str(cfg, "api_key"), std::string());
-        if (key.empty() && cfg.contains("keys") && cfg["keys"].is_object() &&
-            cfg["keys"].contains(name) && cfg["keys"][name].is_string())
-            key = cfg["keys"][name].get<std::string>();
-        if (key.empty()) {
-            std::string env_name = "OMP_";
-            for (char c : name) env_name += (c == '-' ? '_' : (char)std::toupper((unsigned char)c));
-            env_name += "_API_KEY";
-            key = env_get(env, env_name.c_str()).value_or("");
-        }
-        std::optional<std::string> base = cfg_str(cfg, "base_url");
-        desc = json{
-            {"name", name},
-            {"model", py_or(cfg_str(cfg, "model"), std::string())},
-            {"base_url", base ? json(*base) : json(nullptr)},
-            {"supports_vision", cfg.value("supports_vision", false)},
-            {"api_key", key.empty() ? json(nullptr) : json(key)},
         };
     } else {
         return refusal(std::string("Unknown provider: '") + name + "'");

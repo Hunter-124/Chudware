@@ -12,16 +12,22 @@ Covers the T-DP5 DoD:
 Offline discipline: a canned provider returns fixed audit JSON — real code paths
 (assemble → provider → parse → validate → route → ledger), no all-skip.
 """
+
 from __future__ import annotations
 
 import json
 
 import pytest
 
+from services.agent.advisor import overseer as ov
 from services.agent.advisor import change_request as cr
 from services.agent.advisor import reroute
 from services.agent.advisor.overseer import (
-    AuditScope, EvidenceBudget, Overseer, assemble_evidence, render_master_intent,
+    AuditScope,
+    EvidenceBudget,
+    Overseer,
+    assemble_evidence,
+    render_master_intent,
     validate_audit,
 )
 from services.agent.advisor.reroute import Reentry, route_audit, route_verdict
@@ -31,6 +37,7 @@ from services.agent.ledger import Ledger
 # ---------------------------------------------------------------------------
 # Canned provider (offline)
 # ---------------------------------------------------------------------------
+
 
 class _CannedProvider:
     name = "mock"
@@ -48,65 +55,115 @@ class _CannedProvider:
         return r
 
 
+@pytest.fixture(autouse=True)
+def _offline_role_turn_fixture(monkeypatch):
+    """Drive canned audit replies through the Chudcode role-turn contract."""
+
+    def fake_run_role_turn(request, role, **kwargs):
+        provider = (kwargs.get("options") or {}).get("offline_provider")
+        if provider is None:
+            return {
+                "success": False,
+                "stop_reason": "provider_error",
+                "result": {"error": "missing canned provider"},
+            }
+        reply = provider.complete(
+            "audit.",
+            [{"role": "user", "content": request}],
+            max_tokens=kwargs.get("max_tokens"),
+        )
+        return {
+            "success": True,
+            "stop_reason": "completed",
+            "result": reply,
+            "tokens_used": 0,
+        }
+
+    monkeypatch.setattr(ov, "run_role_turn", fake_run_role_turn)
+
+
 def _geometry_error_audit() -> str:
     """A verdict whose evidence cites a geometry_spec event (seq 5)."""
-    return json.dumps({
-        "schema": "aicad.audit/1",
-        "trigger": "stage_exit",
-        "verdicts": [{
-            "class": "cot_error",
-            "finding": "bore Ø 20.02 was recalled, not computed — no fit_calc provenance",
-            "evidence": {"ledger_events": [5]},
-            "required_action": {"kind": "edit", "detail": "recompute the bore from fit_calc",
-                                "dispatch_role": "geometry_designer"},
-            "severity": "action",
-        }],
-        "model": {"provider": "mock", "id": "canned"},
-        "tokens": 90,
-    })
+    return json.dumps(
+        {
+            "schema": "aicad.audit/1",
+            "trigger": "stage_exit",
+            "verdicts": [
+                {
+                    "class": "cot_error",
+                    "finding": "bore Ø 20.02 was recalled, not computed — no fit_calc provenance",
+                    "evidence": {"ledger_events": [5]},
+                    "required_action": {
+                        "kind": "edit",
+                        "detail": "recompute the bore from fit_calc",
+                        "dispatch_role": "geometry_designer",
+                    },
+                    "severity": "action",
+                }
+            ],
+            "model": {"provider": "mock", "id": "canned"},
+            "tokens": 90,
+        }
+    )
 
 
 def _drift_audit() -> str:
     """A spec_drift verdict citing a geometry_spec event — the drift re-grounds there."""
-    return json.dumps({
-        "schema": "aicad.audit/1",
-        "trigger": "stage_exit",
-        "verdicts": [{
-            "class": "spec_drift",
-            "finding": "geometry made a 40mm plate but the brief calls for a 25mm bracket",
-            "evidence": {"ledger_events": [5]},
-            "required_action": {"kind": "edit", "detail": "re-size to the briefed 25mm envelope",
-                                "dispatch_role": "geometry_designer"},
-            "severity": "blocker",
-        }],
-        "model": {"provider": "mock", "id": "canned"},
-        "tokens": 88,
-    })
+    return json.dumps(
+        {
+            "schema": "aicad.audit/1",
+            "trigger": "stage_exit",
+            "verdicts": [
+                {
+                    "class": "spec_drift",
+                    "finding": "geometry made a 40mm plate but the brief calls for a 25mm bracket",
+                    "evidence": {"ledger_events": [5]},
+                    "required_action": {
+                        "kind": "edit",
+                        "detail": "re-size to the briefed 25mm envelope",
+                        "dispatch_role": "geometry_designer",
+                    },
+                    "severity": "blocker",
+                }
+            ],
+            "model": {"provider": "mock", "id": "canned"},
+            "tokens": 88,
+        }
+    )
 
 
 # ---------------------------------------------------------------------------
 # Fixtures — a ledger carrying a brief + a geometry_spec
 # ---------------------------------------------------------------------------
 
+
 def _dp_ledger(tmp_path) -> Ledger:
     """A ledger with a brief (master intent) + a DP artifact chain to seq 5."""
     lg = Ledger("run_dp", tmp_path / "ledger.json")
-    lg.set_brief("intake", "25mm mounting bracket",
-                 "aluminium bracket, mounts a sensor to a 25mm chassis rail",
-                 ["fits the 25mm rail", "bore takes an M6 fastener"])   # seq 0
+    lg.set_brief(
+        "intake",
+        "25mm mounting bracket",
+        "aluminium bracket, mounts a sensor to a 25mm chassis rail",
+        ["fits the 25mm rail", "bore takes an M6 fastener"],
+    )  # seq 0
     lg.add_requirement("intake", "R1", "mount to the 25mm chassis rail")  # seq 1
-    lg.add_feature("feature_architect", "FT1", "mount to rail", "R1")     # seq 2
-    lg.add_feature("feature_architect", "FT2", "fasten sensor", "R1")     # seq 3
-    lg.add_linkage("linkage_planner", "LINK_MAIN")                        # seq 4
-    lg.add_geometry_spec("geometry_designer", "G1", ["FT1"],
-                         [{"op": "extrude"}],
-                         provenance="fit_calc(H7/g6) → 20.02 [iso286.json]")  # seq 5
+    lg.add_feature("feature_architect", "FT1", "mount to rail", "R1")  # seq 2
+    lg.add_feature("feature_architect", "FT2", "fasten sensor", "R1")  # seq 3
+    lg.add_linkage("linkage_planner", "LINK_MAIN")  # seq 4
+    lg.add_geometry_spec(
+        "geometry_designer",
+        "G1",
+        ["FT1"],
+        [{"op": "extrude"}],
+        provenance="fit_calc(H7/g6) → 20.02 [iso286.json]",
+    )  # seq 5
     return lg
 
 
 # ---------------------------------------------------------------------------
 # 1. The frozen kind → stage table
 # ---------------------------------------------------------------------------
+
 
 def test_kind_to_stage_table_matches_contract():
     assert reroute.stage_for_kind("feature") == ("decompose", "feature_architect")
@@ -119,6 +176,7 @@ def test_kind_to_stage_table_matches_contract():
 # ---------------------------------------------------------------------------
 # 2. A geometry error routes to GEOMETRY / geometry_designer — NOT a restart
 # ---------------------------------------------------------------------------
+
 
 def test_geometry_error_routes_to_geometry_stage(tmp_path):
     lg = _dp_ledger(tmp_path)
@@ -135,9 +193,11 @@ def test_earliest_owning_stage_wins_when_multiple_kinds_cited(tmp_path):
     the deepest-upstream rung (DECOMPOSE) — fix the root, not the symptom."""
     lg = _dp_ledger(tmp_path)
     verdict = {
-        "class": "plan_gap", "finding": "feature never realized",
+        "class": "plan_gap",
+        "finding": "feature never realized",
         "evidence": {"ledger_events": [2, 5]},
-        "required_action": {"kind": "edit"}, "severity": "action",
+        "required_action": {"kind": "edit"},
+        "severity": "action",
     }
     re = route_verdict(verdict, ledger=lg)
     assert re.stage == "decompose" and re.role == "feature_architect"
@@ -146,11 +206,17 @@ def test_earliest_owning_stage_wins_when_multiple_kinds_cited(tmp_path):
 def test_class_fallback_when_no_evidence_kind():
     """No resolvable evidence kind ⇒ class fallback picks an owning stage — but only
     inside the design pipeline, so the DP context is signalled via ``dp_active``."""
-    re = route_verdict({
-        "class": "missed_requirement", "finding": "R3 has no feature",
-        "evidence": {"ledger_events": []}, "required_action": {"kind": "replan"},
-        "severity": "blocker",
-    }, ledger=None, dp_active=True)
+    re = route_verdict(
+        {
+            "class": "missed_requirement",
+            "finding": "R3 has no feature",
+            "evidence": {"ledger_events": []},
+            "required_action": {"kind": "replan"},
+            "severity": "blocker",
+        },
+        ledger=None,
+        dp_active=True,
+    )
     assert re is not None and re.stage == "decompose"
 
 
@@ -161,22 +227,32 @@ def test_class_fallback_gated_off_for_legacy_audit(tmp_path):
     lg = Ledger("run_legacy", tmp_path / "ledger.json")
     lg.add_requirement("intake", "R1", "some legacy requirement")  # no DP artifact
     assert reroute._ledger_has_dp_artifacts(lg) is False
-    re = route_verdict({
-        "class": "wrong_order", "finding": "operations sequenced out of order",
-        "evidence": {"ledger_events": []}, "required_action": {"kind": "replan"},
-        "severity": "action",
-    }, ledger=lg)
+    re = route_verdict(
+        {
+            "class": "wrong_order",
+            "finding": "operations sequenced out of order",
+            "evidence": {"ledger_events": []},
+            "required_action": {"kind": "replan"},
+            "severity": "action",
+        },
+        ledger=lg,
+    )
     assert re is None, "a legacy (non-DP) audit must not route to a DP stage"
 
 
 def test_ok_verdict_gets_no_reentry():
-    assert route_verdict({"class": "ok", "finding": "holds",
-                          "evidence": {}, "severity": "info"}) is None
+    assert (
+        route_verdict(
+            {"class": "ok", "finding": "holds", "evidence": {}, "severity": "info"}
+        )
+        is None
+    )
 
 
 # ---------------------------------------------------------------------------
 # 3. The overseer emits an audit event carrying targeted_reentry
 # ---------------------------------------------------------------------------
+
 
 def test_overseer_audit_event_carries_targeted_reentry(tmp_path):
     lg = _dp_ledger(tmp_path)
@@ -203,7 +279,9 @@ def test_overseer_audit_event_carries_targeted_reentry(tmp_path):
 def test_route_audit_leaves_ok_verdict_reentry_none():
     audit = {
         "scope": {"stage": "geometry"},
-        "verdicts": [{"class": "ok", "finding": "", "evidence": {}, "severity": "info"}],
+        "verdicts": [
+            {"class": "ok", "finding": "", "evidence": {}, "severity": "info"}
+        ],
     }
     route_audit(audit, ledger=None)
     assert audit["verdicts"][0]["targeted_reentry"] is None
@@ -213,10 +291,14 @@ def test_route_audit_leaves_ok_verdict_reentry_none():
 # 4. Master-intent re-grounding
 # ---------------------------------------------------------------------------
 
+
 def test_master_intent_renders_brief_and_requirements():
     txt = render_master_intent(
-        {"title": "25mm bracket", "summary": "mounts a sensor",
-         "success_criteria": ["fits the rail"]},
+        {
+            "title": "25mm bracket",
+            "summary": "mounts a sensor",
+            "success_criteria": ["fits the rail"],
+        },
         [{"req_id": "R1", "text": "mount to rail"}],
     )
     assert "MASTER-INTENT" in txt
@@ -226,8 +308,10 @@ def test_master_intent_renders_brief_and_requirements():
 def test_master_intent_survives_a_tiny_budget():
     """Drift happens on small contexts — the pinned intent must NOT be truncated
     even when the ledger_text budget is nearly zero."""
-    intent = render_master_intent({"title": "25mm bracket", "summary": "x"},
-                                  [{"req_id": "R1", "text": "mount to the rail"}])
+    intent = render_master_intent(
+        {"title": "25mm bracket", "summary": "x"},
+        [{"req_id": "R1", "text": "mount to the rail"}],
+    )
     # A tiny ledger budget: ledger_text is (nearly) dropped, but master_intent rides
     # its own un-budgeted block.
     ev = assemble_evidence(
@@ -264,11 +348,17 @@ def test_drifted_geometry_output_is_caught_and_rerouted(tmp_path):
 # 5. User-change → stage+feature re-entry
 # ---------------------------------------------------------------------------
 
+
 def _wall_ledger_state() -> dict:
     return {
         "dimensions": [
-            {"id": "DIM3", "name": "wall_thickness", "value": 2.0, "unit": "mm",
-             "refs": {"features": ["G4"], "parts": ["housing"]}},
+            {
+                "id": "DIM3",
+                "name": "wall_thickness",
+                "value": 2.0,
+                "unit": "mm",
+                "refs": {"features": ["G4"], "parts": ["housing"]},
+            },
         ],
         "requirements": [],
         "artifacts": [],
@@ -276,7 +366,7 @@ def _wall_ledger_state() -> dict:
 
 
 def test_user_change_maps_to_geometry_stage_and_feature():
-    """"make the wall thicker" resolves to a GEOMETRY-stage re-entry on the wall's
+    """ "make the wall thicker" resolves to a GEOMETRY-stage re-entry on the wall's
     dimension — a stage+feature target, not a blind re-model."""
     aff = cr.map_affected_set("make the wall thicker", _wall_ledger_state())
     plan = cr.draft_change_plan("make the wall thicker", _wall_ledger_state())
@@ -295,12 +385,17 @@ def test_route_change_request_end_to_end_carries_stage_reentry(tmp_path):
     the dispatch rows in the returned plan."""
     lg = Ledger("run_chg", tmp_path / "ledger.json")
     res = cr.route_change_request(
-        "make the wall thicker", _wall_ledger_state(),
-        overseer=None, ledger=lg, run_id="run_chg", stage="fix",
+        "make the wall thicker",
+        _wall_ledger_state(),
+        overseer=None,
+        ledger=lg,
+        run_id="run_chg",
+        stage="fix",
     )
     dispatch = res.plan["dispatch"]
-    assert dispatch and any(r.get("stage_reentry", {}).get("stage") == "geometry"
-                            for r in dispatch)
+    assert dispatch and any(
+        r.get("stage_reentry", {}).get("stage") == "geometry" for r in dispatch
+    )
 
 
 def test_feature_change_maps_to_decompose():
@@ -318,54 +413,75 @@ def test_empty_affected_set_yields_no_stage_reentry():
 #    (P1 fix: overseer._fingerprint / _check_repeat_blockers)
 # ---------------------------------------------------------------------------
 
+
 def _geometry_action_audit(finding: str) -> str:
     """A non-blocker (severity=action) verdict citing the same geometry_spec
     (seq 5) as ``_geometry_error_audit`` — same targeted_reentry, reworded
     finding, non-blocker severity: exactly the case the old prose+blocker-only
     fingerprint let loop forever."""
-    return json.dumps({
-        "schema": "aicad.audit/1",
-        "trigger": "stage_exit",
-        "verdicts": [{
-            "class": "cot_error",
-            "finding": finding,
-            "evidence": {"ledger_events": [5]},
-            "required_action": {"kind": "edit", "detail": "recompute the bore from fit_calc",
-                                "dispatch_role": "geometry_designer"},
-            "severity": "action",
-        }],
-        "model": {"provider": "mock", "id": "canned"},
-        "tokens": 90,
-    })
+    return json.dumps(
+        {
+            "schema": "aicad.audit/1",
+            "trigger": "stage_exit",
+            "verdicts": [
+                {
+                    "class": "cot_error",
+                    "finding": finding,
+                    "evidence": {"ledger_events": [5]},
+                    "required_action": {
+                        "kind": "edit",
+                        "detail": "recompute the bore from fit_calc",
+                        "dispatch_role": "geometry_designer",
+                    },
+                    "severity": "action",
+                }
+            ],
+            "model": {"provider": "mock", "id": "canned"},
+            "tokens": 90,
+        }
+    )
 
 
 def _feature_action_audit(finding: str) -> str:
     """A non-blocker verdict citing the feature artifact (seq 2) — a DIFFERENT
     targeted_reentry (decompose/feature_architect) than the geometry ones."""
-    return json.dumps({
-        "schema": "aicad.audit/1",
-        "trigger": "stage_exit",
-        "verdicts": [{
-            "class": "cot_error",
-            "finding": finding,
-            "evidence": {"ledger_events": [2]},
-            "required_action": {"kind": "edit", "detail": "revisit feature FT1",
-                                "dispatch_role": "feature_architect"},
-            "severity": "action",
-        }],
-        "model": {"provider": "mock", "id": "canned"},
-        "tokens": 80,
-    })
+    return json.dumps(
+        {
+            "schema": "aicad.audit/1",
+            "trigger": "stage_exit",
+            "verdicts": [
+                {
+                    "class": "cot_error",
+                    "finding": finding,
+                    "evidence": {"ledger_events": [2]},
+                    "required_action": {
+                        "kind": "edit",
+                        "detail": "revisit feature FT1",
+                        "dispatch_role": "feature_architect",
+                    },
+                    "severity": "action",
+                }
+            ],
+            "model": {"provider": "mock", "id": "canned"},
+            "tokens": 80,
+        }
+    )
 
 
-def test_repeat_misroute_escalates_on_reentry_fingerprint_despite_reworded_prose(tmp_path):
+def test_repeat_misroute_escalates_on_reentry_fingerprint_despite_reworded_prose(
+    tmp_path,
+):
     """A correction that keeps getting routed to the same DP stage must escalate
     even when the LLM rewords the finding and never assigns severity=blocker."""
     lg = _dp_ledger(tmp_path)
-    prov = _CannedProvider([
-        _geometry_action_audit("bore Ø 20.02 was recalled, not computed"),
-        _geometry_action_audit("the bore diameter still has no fit_calc provenance"),
-    ])
+    prov = _CannedProvider(
+        [
+            _geometry_action_audit("bore Ø 20.02 was recalled, not computed"),
+            _geometry_action_audit(
+                "the bore diameter still has no fit_calc provenance"
+            ),
+        ]
+    )
     o = Overseer(provider=prov, role_card={"system_prompt": "audit."}, ledger=lg)
 
     r1 = o.audit("stage_exit", AuditScope(run_id="run_dp", stage="buildpath"))
@@ -373,9 +489,11 @@ def test_repeat_misroute_escalates_on_reentry_fingerprint_despite_reworded_prose
     assert not r1.escalated, "first non-blocker misroute must not escalate"
 
     r2 = o.audit("stage_exit", AuditScope(run_id="run_dp", stage="assembly"))
-    assert r2.escalated, ("a second reworded finding routed to the SAME geometry "
-                          "stage must escalate — the fingerprint is the deterministic "
-                          "reentry, not prose, and severity=='action' still counts")
+    assert r2.escalated, (
+        "a second reworded finding routed to the SAME geometry "
+        "stage must escalate — the fingerprint is the deterministic "
+        "reentry, not prose, and severity=='action' still counts"
+    )
     assert "human" in r2.escalation_text.lower()
 
 
@@ -383,12 +501,16 @@ def test_repeat_misroute_does_not_escalate_across_different_reentry_targets(tmp_
     """Same finding text, but each verdict routes to a DIFFERENT owning stage — the
     reentry-based fingerprint must NOT collapse these into one repeat count."""
     lg = _dp_ledger(tmp_path)
-    prov = _CannedProvider([
-        _geometry_action_audit("something is off"),
-        _feature_action_audit("something is off"),
-    ])
+    prov = _CannedProvider(
+        [
+            _geometry_action_audit("something is off"),
+            _feature_action_audit("something is off"),
+        ]
+    )
     o = Overseer(provider=prov, role_card={"system_prompt": "audit."}, ledger=lg)
     r1 = o.audit("stage_exit", AuditScope(run_id="run_dp", stage="buildpath"))
     assert not r1.escalated
     r2 = o.audit("stage_exit", AuditScope(run_id="run_dp", stage="assembly"))
-    assert not r2.escalated, "different targeted_reentry stages must not count as the same repeat"
+    assert not r2.escalated, (
+        "different targeted_reentry stages must not count as the same repeat"
+    )

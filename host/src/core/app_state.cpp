@@ -408,7 +408,7 @@ void loadSettings(Settings& s) {
         else if (prov == "xai" || prov == "xai-sub") s.provider = 6;  // PROV_XAI
         else if (prov == "cursor" || prov == "cursor-sub") s.provider = 7;  // PROV_CURSOR
         else if (prov == "kimi-sub") s.provider = 8;  // PROV_KIMISUB (Kimi Code subscription OAuth)
-        else if (prov == "zenmux") s.provider = 9;  // PROV_ZENMUX (OMP bridge — default provider)
+        else if (prov == "zenmux") s.provider = 9;  // PROV_ZENMUX (Chudcode — default provider)
         else if (prov == "freellmapi") s.provider = 10;  // PROV_FREELLMAPI (Free AI, native wire)
         else if (prov == "moonshot") {
             // First-class Moonshot (Kimi) wire provider — GUI still uses the cloud-compat slot
@@ -476,9 +476,9 @@ void loadSettings(Settings& s) {
         // Owner directive 2026-07-23: xAI/grok-4.5 was the default chat provider (and the target
         // of the Cursor migration just above), but most installs are NOT signed into xAI — no
         // console.x.ai API key and no completed SuperGrok/X Premium+ OAuth — so every fresh chat
-        // opened straight to "xAI not configured". ZenMux's free x-ai/grok-4.5-free tier (an
-        // OMP-bridge provider — its credential lives in the bridge's own auth db, not this
-        // config.json) is now the default; OpenRouter's ":free" models are the documented backup.
+        // opened straight to "xAI not configured". ZenMux's free x-ai/grok-4.5-free tier,
+        // authenticated through Chudcode rather than config.json, is now the default;
+        // OpenRouter's ":free" models are the documented backup.
         // Migrate a saved xAI/grok-4.5 chat provider — whether the user's own prior pick or the
         // Cursor migration above — to ZenMux, but ONLY when the user has no xAI credential of
         // their own: a deliberately-signed-in xAI user keeps xAI. One-time on load, persisted on
@@ -922,20 +922,17 @@ static void applyGuiOwnedSettings(nlohmann::json& j, const Settings& s) {
         j["openai"] = {{"base_url", s.baseUrl}, {"vision", s.vision}};
     } else if (s.provider == 5) {
         // Shared cloud slot, discriminated by base_url: ui::cloudServiceKey() names the service
-        // and ui::cloudServiceWireName() gives the provider name resolve_provider expects —
-        // native "moonshot" / generic "openai", or an OMP bridge id (openrouter, deepseek,
+        // and ui::cloudServiceWireName() gives the provider name Chudcode expects — native
+        // "moonshot" / generic "openai", or a hosted catalog id (openrouter, deepseek,
         // alibaba-coding-plan, amazon-bedrock, azure, google-antigravity, aimlapi). Persisting
-        // the CLASSIFIED name keeps config.json agreeing with the per-send override
-        // agentProviderOverride pins, so an ambient re-resolution can't silently route the pick
-        // through a different transport. Every service here is a cloud endpoint, so the offline
-        // (ITAR) guard still refuses them while local stays allowed.
+        // the classified name keeps config.json aligned with the per-send override. Every
+        // service here is a cloud endpoint, so explicit offline mode routes away from it.
         const char* svc = ui::cloudServiceKey(s.baseUrl);
         const bool isMoonshot = std::strcmp(svc, "moonshot") == 0;
         j["provider"] = ui::cloudServiceWireName(svc);
         j["model"] = s.model[0] ? s.model : (isMoonshot ? "kimi-k3" : "qwen-max");
-        // Bridge-catalog services keep their credential in the bridge's own AuthStorage (Settings
-        // → Providers sign-in). Handing them the SHARED slot's unrelated key would win over that
-        // lookup in resolve_provider and break the sign-in, so omit api_key entirely for them.
+        // Hosted services keep credentials in Chudcode's auth store. Do not attach the shared
+        // cloud-slot key unless this service explicitly uses a local key.
         if (ui::cloudServiceUsesLocalKey(svc))
             j["api_key"] = isMoonshot ? s.moonshotKey : s.cloudKey;
         j["openai"] = {{"base_url", s.baseUrl[0] ? s.baseUrl
@@ -961,10 +958,8 @@ static void applyGuiOwnedSettings(nlohmann::json& j, const Settings& s) {
         j["provider"] = "kimi-sub";
         j["model"] = s.model[0] ? s.model : "k3";
     } else if (s.provider == 9) {
-        // ZenMux — OMP-bridge provider (core/agent/providers.cpp kOmpBridgeProviders). No local
-        // api_key: the completion routes through the bun bridge, which resolves the credential
-        // from its own auth db (Settings → Providers sign-in). Default provider (owner directive
-        // 2026-07-23) — free x-ai/grok-4.5-free tier.
+        // ZenMux authentication and completions are owned by Chudcode. No local api_key is
+        // serialized here. Default provider: free x-ai/grok-4.5-free tier.
         j["provider"] = "zenmux";
         j["model"] = s.model[0] ? s.model : "x-ai/grok-4.5-free";
     } else if (s.provider == 10) {
@@ -1432,9 +1427,8 @@ void AppState::pushRecentProject(const std::string& path) {
 // Canonical text for an engine-transport outage. Every worker RPC that fails while the daemon
 // is down reports its own method ("Worker error (skills_list): not connected to hostd ..."),
 // and the app's error sink dedupes on method+error for 60s — so ONE dead socket produced one
-// toast PER METHOD. Observed 2026-08-27: eight simultaneous cards (doc_new, skills_list,
-// fw_projects, agent_list_models, agent_models_list, agent_provider_state, subscription_usage,
-// plus a direct "New part failed" from the doc-tabs call site).
+// toast PER METHOD. Observed 2026-08-27: simultaneous cards for unrelated startup probes plus
+// a direct "New part failed" from the doc-tabs call site.
 //
 // The method name is deliberately dropped. Which RPC happened to be in flight is not the
 // user's problem and is not actionable; the daemon being down is. Method-level detail stays in

@@ -61,7 +61,6 @@
 #include "agent/paths.h"
 #include "agent/ops_emit.h"
 #include "agent/providers.h"
-#include "agent/omp_bridge_client.h"
 #include "agent/http.h"
 #include "agent/roles.h"
 #include "sim/flow_run.h"
@@ -172,38 +171,6 @@ int emit_error(const std::string& msg, char** out_json) {
     return emit(json{{"error", msg}}, out_json, 1);
 }
 
-// Proxy one of the twelve agent_provider_*/agent_models_list/agent_cost_summary C-ABI methods
-// straight to the OMP bun bridge (RPC CONTRACT, docs/omp-integration/01-DECISIONS.md §Stable RPC quick reference). Params pass through
-// verbatim — the C-ABI method's param shape IS the bridge method's param shape for all twelve
-// (see the frozen contract comment at each call site below). On ok:false, the bridge's
-// structured {message,status?} error (result, when supplied) takes precedence over the raw
-// transport `err` string so the host sees the same detail bridge.ts callers get; secrets are
-// never part of that error payload (OMP's auth handlers never echo key material back).
-json omp_bridge_proxy(const char* bridge_method, const json& bridge_params) {
-    json result;
-    std::string err;
-    const bool ok = chudware::agent::OmpBridgeClient::instance().call(bridge_method, bridge_params,
-                                                                    result, err);
-    if (!ok) {
-        std::string msg = (result.is_object() && result.contains("message") &&
-                           result["message"].is_string())
-                              ? result["message"].get<std::string>()
-                              : err;
-        json out = json{{"ok", false},
-                        {"error", msg.empty() ? std::string("omp-bridge transport error") : msg}};
-        if (result.is_object() && result.contains("status") && result["status"].is_number())
-            out["status"] = result["status"];
-        return out;
-    }
-    // `ok` here means "the bridge answered" — but several handlers ALSO return a payload-level
-    // verdict under the same key (auth_validate_key {ok,detail}, auth_oauth_manual, provider_logo),
-    // and stamping ok:true over it told the GUI a rejected API key had validated, which then
-    // saved it as a live credential. Only synthesize the flag when the handler didn't state one.
-    json out = result.is_object() ? result : json::object();
-    const auto it = out.find("ok");
-    if (it == out.end() || !it->is_boolean()) out["ok"] = true;
-    return out;
-}
 
 // --- sampling-profiler scoping ------------------------------------------------------
 // The profiler samples only the thread that is registered as the "work thread" (see
@@ -470,6 +437,22 @@ static nlohmann::json apply_model_overrides(nlohmann::json desc, const nlohmann:
     return desc;
 }
 
+// Native top-level execution must derive safety from the actual provider identity and endpoint,
+// never from a caller-supplied offline_safe=true assertion. Experimental review calls obey the
+// same rule so a local command model cannot smuggle a cloud review stage into the fallback.
+bool native_provider_offline_safe(const json& provider) {
+    if (!provider.is_object()) return false;
+    json probe = provider;
+    probe.erase("offline_safe");
+    if (!chudware::agent::provider_offline_safe(probe)) return false;
+    auto review = provider.find("review_provider");
+    if (review == provider.end() || review->is_null()) return true;
+    if (!review->is_object()) return false;
+    json review_probe = *review;
+    review_probe.erase("offline_safe");
+    return chudware::agent::provider_offline_safe(review_probe);
+}
+
 // P54b host-ergonomics: resolve the assist provider from the ambient config.json when
 // the caller did not pass one (the host sends bare {question|params, doc_id}). Returns
 // the descriptor to feed make_assist_provider. On a config-provider refusal/resolution
@@ -601,16 +584,6 @@ CHUDWARE_API const char* chudware_build_id(void) { return CHUDWARE_HOSTD_BUILD_I
 
 CHUDWARE_API void chudware_free(char* s) { std::free(s); }
 
-// See core/api/libchudware.h — hostd's clean-shutdown tail (core/hostd/main.cpp) has no other
-// way to reach the OmpBridgeClient singleton, which lives entirely inside this DLL.
-// shutdownIfCreated() is itself idempotent and never spawns a bridge just to stop it.
-CHUDWARE_API void chudware_agent_sidecars_shutdown(void) {
-    try {
-        chudware::agent::OmpBridgeClient::shutdownIfCreated();
-    } catch (...) {
-        // Never throw across the C ABI boundary.
-    }
-}
 
 // Live event streaming: bridge the flat C callback to the core's thread-local run-event sink
 // (agent::set_stream_event_sink). Called on the host/daemon dispatch thread right before an
@@ -1664,71 +1637,25 @@ static int chudware_call_inner(const char* method, const char* params_json, char
                             out_json, 0);
             }
             if (provider == "anthropic") {
-                // Anthropic DOES publish a list endpoint (GET /v1/models) — the old
-                // "no keyless list endpoint" note here was simply wrong, which is why this
-                // branch reported exactly one hardcoded id and new Claude releases never
-                // showed up in the picker. Three tiers, best first:
-                //   1. the OMP bun bridge (models_list) — the ONLY path that works for
-                //      subscription/OAuth users, whose token lives in the bridge auth db and
-                //      never reaches this RPC as `api_key`. Its rows carry `source`:
-                //      "live" (discovered from the provider now) or "bundled" (catalog only).
-                //   2. a direct GET /v1/models with the raw api_key, when the bridge had no
-                //      LIVE list to give but the caller passed a key.
-                //   3. a static set of known ids, so the picker is never empty offline.
-                // Ordering is preserved from whichever tier answered (newest model first).
+                // Pure native probe: use Anthropic's published list endpoint when the caller
+                // supplied a raw API key. Without one, retain a static picker fallback but mark
+                // the provider unavailable; subscription/OAuth discovery belongs to Chudcode.
                 auto str_of = [](const json& o, const char* k) -> std::string {
                     if (!o.is_object()) return {};
                     auto it = o.find(k);
                     return it != o.end() && it->is_string() ? it->get<std::string>() : std::string();
                 };
-                bool live = false;                     // a live endpoint actually answered
-                bool credentialed = !api_key.empty();  // drives `ok` (provider selectable)
                 std::string err;
-                // --- tier 1: bridge ---
-                json bridge = omp_bridge_proxy("models_list", json{{"provider", "anthropic"}});
-                const bool bridge_ok = bridge.is_object() && bridge.value("ok", false);
-                if (bridge_ok && bridge.contains("models") && bridge["models"].is_array()) {
-                    const bool bridge_live = str_of(bridge, "source") == "live";
-                    for (const auto& e : bridge["models"]) {
-                        std::string id = str_of(e, "id");
-                        if (id.empty()) continue;
-                        json meta = heuristic_meta(id);
-                        std::string name = str_of(e, "name");
-                        if (!name.empty()) meta["label"] = name;
-                        if (e.contains("contextWindow") && e["contextWindow"].is_number())
-                            meta["context"] = static_cast<int>(e["contextWindow"].get<double>());
-                        if (e.contains("maxTokens") && e["maxTokens"].is_number())
-                            meta["max_output"] = static_cast<int>(e["maxTokens"].get<double>());
-                        if (e.contains("vision") && e["vision"].is_boolean())
-                            meta["vision"] = e["vision"].get<bool>();
-                        if (e.contains("supportsTools") && e["supportsTools"].is_boolean())
-                            meta["tools"] = e["supportsTools"].get<bool>();
-                        meta["auto_source"] = str_of(e, "source") == "live" ? "live" : "bundled";
-                        push_row(id, std::move(meta));
-                    }
-                    live = bridge_live && !models.empty();
-                    credentialed = credentialed || live;
-                } else if (!bridge_ok) {
-                    err = str_of(bridge, "error");
-                }
-                // --- tier 2: direct probe with a raw key (only when the bridge had no live list;
-                // a successful probe REPLACES the bridge's bundled rows, a failed one keeps them) ---
-                if (!live && !api_key.empty()) {
+                if (!api_key.empty()) {
                     std::vector<std::pair<std::string, std::string>> hdrs = {
                         {"x-api-key", api_key}, {"anthropic-version", "2023-06-01"}};
                     chudware::agent::HttpResponse hr = chudware::agent::http_get(
                         "https://api.anthropic.com/v1/models?limit=1000", hdrs);
                     if (hr.error.empty() && hr.status >= 200 && hr.status < 300) {
                         json parsed = json::parse(hr.body, nullptr, false);
-                        const json* data = nullptr;
-                        if (parsed.is_object()) {
-                            auto it = parsed.find("data");
-                            if (it != parsed.end() && it->is_array() && !it->empty()) data = &*it;
-                        }
-                        if (data) {
-                            models = json::array();
-                            model_rows = json::array();
-                            for (const auto& d : *data) {
+                        if (parsed.is_object() && parsed.contains("data") &&
+                            parsed["data"].is_array()) {
+                            for (const auto& d : parsed["data"]) {
                                 std::string id = str_of(d, "id");
                                 if (id.empty()) continue;
                                 json meta = heuristic_meta(id);
@@ -1737,15 +1664,11 @@ static int chudware_call_inner(const char* method, const char* params_json, char
                                 meta["auto_source"] = "live";
                                 push_row(id, std::move(meta));
                             }
-                            live = !models.empty();
-                            credentialed = credentialed || live;
                         }
-                    } else if (err.empty()) {
+                    } else {
                         err = hr.error.empty() ? ("HTTP " + std::to_string(hr.status)) : hr.error;
                     }
                 }
-                // --- tier 3: static set (mirrors host/src/ui/model_registry.h builtinModels();
-                // both are FALLBACKS — the live list above is the source of truth) ---
                 if (models.empty()) {
                     static const std::pair<const char*, const char*> kStatic[] = {
                         {"claude-opus-5", "Claude Opus 5"},
@@ -1763,140 +1686,17 @@ static int chudware_call_inner(const char* method, const char* params_json, char
                         push_row(sm.first, std::move(meta));
                     }
                 }
-                // Availability: a raw api_key OR a live list proves a credential. Without either
-                // (offline subscription user), ask the bridge whether it HOLDS an Anthropic
-                // credential — OAuth/subscription tokens live in its auth db and never appear as
-                // `api_key` here, and keying availability off api_key alone is exactly what hid
-                // Anthropic from those users' pickers. auth_list_providers is a local read.
-                if (!credentialed) {
-                    json provs = omp_bridge_proxy("auth_list_providers", json::object());
-                    if (provs.is_object() && provs.value("ok", false) &&
-                        provs.contains("providers") && provs["providers"].is_array())
-                        for (const auto& p : provs["providers"]) {
-                            if (str_of(p, "id") != "anthropic") continue;
-                            std::string st = str_of(p, "state");
-                            if (st == "oauth_connected" || st == "key_set") credentialed = true;
-                        }
-                }
-                json out = json::object();
-                out["ok"] = credentialed;
-                out["models"] = std::move(models);
-                out["model_rows"] = std::move(model_rows);
-                if (!credentialed)
-                    out["error"] = err.empty() ? std::string("no Anthropic credential") : err;
+                json out = {{"ok", !api_key.empty() && err.empty()},
+                            {"models", std::move(models)},
+                            {"model_rows", std::move(model_rows)}};
+                if (api_key.empty())
+                    out["error"] = "no Anthropic API key";
+                else if (!err.empty())
+                    out["error"] = err;
                 return emit(std::move(out), out_json, 0);
             }
             return emit(json{{"ok", false}, {"models", models}, {"model_rows", model_rows},
                              {"error", "unknown provider"}},
-                        out_json, 0);
-        }
-        // --- S-CORE: 12 libchudware proxies for the bridge auth/model/cost surface (frozen RPC
-        // CONTRACT in docs/omp-integration/01-DECISIONS.md — every param name below is copied verbatim into
-        // the bridge call; see omp_bridge_proxy() above and vendor/omp/bridge/src/{auth-context,
-        // oauth-flow,models}.ts for the handlers each one reaches). ---
-        if (m == "agent_provider_list") {
-            // {} -> {ok, providers:[...]} (bridge auth_list_providers; takes no params).
-            return emit(omp_bridge_proxy("auth_list_providers", json::object()), out_json, 0);
-        }
-        if (m == "agent_provider_state") {
-            // {provider?} -> {ok, ...} one provider's sign-in state + usage window, or every
-            // provider's when provider is omitted.
-            return emit(omp_bridge_proxy("auth_state", params), out_json, 0);
-        }
-        if (m == "agent_provider_validate_key") {
-            // {provider, apiKey} -> {ok, detail?} via OMP's cheap-request key validators. No
-            // key is persisted here (that's agent_provider_set_key).
-            if (jstr(params, "provider").empty() || jstr(params, "apiKey").empty())
-                return emit_error(
-                    "agent_provider_validate_key: provider and apiKey are required", out_json);
-            return emit(omp_bridge_proxy("auth_validate_key", params), out_json, 0);
-        }
-        if (m == "agent_provider_set_key") {
-            // {provider, apiKey} -> {ok} persists an api_key credential in the bridge's own
-            // AuthStorage (SQLite). The key never round-trips back out to the UI.
-            if (jstr(params, "provider").empty() || jstr(params, "apiKey").empty())
-                return emit_error(
-                    "agent_provider_set_key: provider and apiKey are required", out_json);
-            return emit(omp_bridge_proxy("auth_set_key", params), out_json, 0);
-        }
-        if (m == "agent_provider_remove_key") {
-            // {provider, account?} -> {ok} removes one credential row (account = its numeric
-            // id) or every credential for the provider when account is omitted.
-            if (jstr(params, "provider").empty())
-                return emit_error("agent_provider_remove_key: provider is required", out_json);
-            return emit(omp_bridge_proxy("auth_remove_key", params), out_json, 0);
-        }
-        if (m == "agent_provider_begin_oauth") {
-            // {provider} -> {ok, url?, handle?, ...} starts AuthStorage.login and returns the
-            // launch URL + a poll handle for agent_provider_oauth_poll.
-            if (jstr(params, "provider").empty())
-                return emit_error("agent_provider_begin_oauth: provider is required", out_json);
-            return emit(omp_bridge_proxy("auth_begin_oauth", params), out_json, 0);
-        }
-        if (m == "agent_provider_oauth_poll") {
-            // {handle} -> {ok, ...} current flow snapshot for a handle from begin_oauth.
-            if (jstr(params, "handle").empty())
-                return emit_error("agent_provider_oauth_poll: handle is required", out_json);
-            return emit(omp_bridge_proxy("auth_oauth_poll", params), out_json, 0);
-        }
-        if (m == "agent_provider_oauth_manual") {
-            // {handle, code} -> {ok} feeds a pasted device code / redirect URL into the
-            // in-flight manual-code wait for that handle.
-            if (jstr(params, "handle").empty() || jstr(params, "code").empty())
-                return emit_error(
-                    "agent_provider_oauth_manual: handle and code are required", out_json);
-            return emit(omp_bridge_proxy("auth_oauth_manual", params), out_json, 0);
-        }
-        if (m == "agent_provider_oauth_cancel") {
-            // {handle} -> {ok} aborts the in-flight OAuth flow for a handle from begin_oauth.
-            if (jstr(params, "handle").empty())
-                return emit_error("agent_provider_oauth_cancel: handle is required", out_json);
-            return emit(omp_bridge_proxy("auth_oauth_cancel", params), out_json, 0);
-        }
-        if (m == "agent_provider_logout") {
-            // {provider, account?} -> {ok} same removal semantics as agent_provider_remove_key,
-            // named for the sign-out action in the provider panel.
-            if (jstr(params, "provider").empty())
-                return emit_error("agent_provider_logout: provider is required", out_json);
-            return emit(omp_bridge_proxy("auth_logout", params), out_json, 0);
-        }
-        if (m == "agent_provider_logo") {
-            // {domain, size?} -> {ok, b64, mime} the provider's brand favicon (fetched by the
-            // bridge from a favicon service). Functional display of the connected service;
-            // the host caches it locally and gates the call behind a user setting.
-            if (jstr(params, "domain").empty())
-                return emit_error("agent_provider_logo: domain is required", out_json);
-            return emit(omp_bridge_proxy("provider_logo", params), out_json, 0);
-        }
-        if (m == "agent_models_list") {
-            // {provider?} -> {ok, ...} every bundled OMP catalog model for one provider, or
-            // every provider's when omitted. Distinct from the native agent_list_models above
-            // (which LIVE-probes a keyed endpoint): this is the static OMP-catalog listing
-            // (capabilities + cost) used by the model picker for bridge-routed providers.
-            return emit(omp_bridge_proxy("models_list", params), out_json, 0);
-        }
-        if (m == "agent_cost_summary") {
-            // {events?:[{provider,model,input,output,cacheRead?,cacheWrite?}]} -> {ok, ...} a
-            // pure $/Mtok calculator (catalog pricing x caller-supplied token counts); no
-            // persistence, no network.
-            return emit(omp_bridge_proxy("cost_summary", params), out_json, 0);
-        }
-        // OMP ASR sidecar (vendor/omp/bridge/src/stt) — pi-natives AudioCapture + Whisper.
-        // Copilot composer drives these via st.rpc; missing deps return available:false.
-        if (m == "agent_stt_status") {
-            return emit(omp_bridge_proxy("stt_status", params.is_object() ? params : json::object()),
-                        out_json, 0);
-        }
-        if (m == "agent_stt_start") {
-            return emit(omp_bridge_proxy("stt_start", params.is_object() ? params : json::object()),
-                        out_json, 0);
-        }
-        if (m == "agent_stt_stop") {
-            return emit(omp_bridge_proxy("stt_stop", params.is_object() ? params : json::object()),
-                        out_json, 0);
-        }
-        if (m == "agent_stt_cancel") {
-            return emit(omp_bridge_proxy("stt_cancel", params.is_object() ? params : json::object()),
                         out_json, 0);
         }
         if (m == "agent_cap_raw") {
@@ -2162,16 +1962,10 @@ static int chudware_call_inner(const char* method, const char* params_json, char
             return emit(chudware::agent::steer_run(run_id, text), out_json, 0);
         }
         if (m == "agent_run") {
-            // HOST-ERGONOMIC entry: {request, doc_id, options?, provider?}.
-            // The host sends just {request, doc_id}; the core resolves everything:
-            //   1) provider — if params.provider is absent/empty, resolve from the
-            //      ambient config.json (load_config) via resolve_provider, honoring
-            //      offline mode (resolve_provider returns {error} on a refusal). An
-            //      explicit provider descriptor (the gates' mock) is passed through.
-            //   2) micro-vs-design — should_engage(resolved-provider-cfg, cfg) picks
-            //      run_micro_design vs run_design.
-            // Returns the RunResult + events:[...], OR {ok:false, error} on a provider
-            // refusal/resolution failure (no run started).
+            // Native fallback entry: {request, doc_id, options?, provider?}. It is intentionally
+            // limited to deterministic offline-safe providers. Online execution belongs to
+            // agent_admin_turn/Chudcode; this path retains local modeling and no-network
+            // drawing/CAM fast paths.
             std::string request = jstr(params, "request");
             std::string doc_id = jstr(params, "doc_id");
             json options = params.contains("options") ? params["options"] : json::object();
@@ -2203,6 +1997,52 @@ static int chudware_call_inner(const char* method, const char* params_json, char
             if (options.value("mode", std::string()) == "swarm" &&
                 !options.value("corporate_force", false))
                 options["corporate_force"] = true;
+
+            // Resolve and reject before any fast path so an online provider can never be
+            // accepted by native agent_run, even when the request itself is deterministic.
+            json provider;
+            const bool explicit_provider = params.contains("provider") &&
+                                           params["provider"].is_object() &&
+                                           !params["provider"].empty();
+            json cfg = chudware::agent::load_config();
+            json native_cfg = cfg;
+            native_cfg["offline_mode"] = true;
+            if (explicit_provider) {
+                provider = params["provider"];
+            } else {
+                std::optional<std::string> pname;
+                if (params.contains("provider") && params["provider"].is_string() &&
+                    !params["provider"].get<std::string>().empty())
+                    pname = params["provider"].get<std::string>();
+                json resolved = apply_model_overrides(
+                    chudware::agent::resolve_provider(pname, native_cfg, json::object()), params);
+                if (resolved.is_object() && resolved.contains("error")) {
+                    const std::string detail =
+                        jstr(resolved, "error", "provider resolution failed");
+                    const std::string error =
+                        "Native agent_run could not resolve an offline-safe local provider: " +
+                        detail + ". Use agent_admin_turn/Chudcode for online providers.";
+                    return emit(json{{"ok", false},
+                                     {"status", "failed"},
+                                     {"stop_reason", "provider_error"},
+                                     {"error_detail", error},
+                                     {"error", error}},
+                                out_json, 0);
+                }
+                provider =
+                    chudware::agent::apply_experimental(resolved, native_cfg, json::object());
+            }
+            if (!native_provider_offline_safe(provider)) {
+                const std::string error =
+                    "Native agent_run supports only deterministic offline-safe local providers; "
+                    "use agent_admin_turn/Chudcode for online providers.";
+                return emit(json{{"ok", false},
+                                 {"status", "failed"},
+                                 {"stop_reason", "provider_error"},
+                                 {"error_detail", error},
+                                 {"error", error}},
+                            out_json, 0);
+            }
 
             // ---- W17 drawing-intent fast-path ----
             // "make a drawing / blueprint of this part" doesn't need the modeler: build the 2D
@@ -2331,38 +2171,6 @@ static int chudware_call_inner(const char* method, const char* params_json, char
                 }
             }
 
-            // ---- provider resolution ----
-            json provider;
-            const bool explicit_provider = params.contains("provider") &&
-                                           params["provider"].is_object() &&
-                                           !params["provider"].empty();
-            json cfg = chudware::agent::load_config();
-            if (explicit_provider) {
-                provider = params["provider"];  // pass-through (gate mock / host override)
-            } else {
-                // Resolve from config.json over the live process env (the same inputs
-                // the Python agent uses). resolve_provider applies the offline guard.
-                // O1: params.provider as a NAME string (the GUI picker) pins the provider
-                // explicitly — it beats an ambient CHUDWARE_PROVIDER env var; params.model /
-                // params.reasoning_effort then refine the descriptor.
-                std::optional<std::string> pname;
-                if (params.contains("provider") && params["provider"].is_string() &&
-                    !params["provider"].get<std::string>().empty())
-                    pname = params["provider"].get<std::string>();
-                json resolved = apply_model_overrides(
-                    chudware::agent::resolve_provider(pname, cfg, json::object()), params);
-                if (resolved.is_object() && resolved.contains("error")) {
-                    return emit(json{{"ok", false},
-                                     {"status", "failed"},
-                                     {"stop_reason", "provider_error"},
-                                     {"error_detail", jstr(resolved, "error", "provider resolution failed")},
-                                     {"error", jstr(resolved, "error", "provider resolution failed")}},
-                                out_json, 0);
-                }
-                // Attach the experimental knobs (separate vision review provider + cad-sequence
-                // mode) from config.json "experimental". No-op when the block is absent.
-                provider = chudware::agent::apply_experimental(resolved, cfg, json::object());
-            }
 
             // ---- micro vs design ----
             // should_engage reads provider.{name,base_url,context_tokens} + cfg
@@ -2417,6 +2225,8 @@ static int chudware_call_inner(const char* method, const char* params_json, char
                                            params["provider"].is_object() &&
                                            !params["provider"].empty();
             json cfg = chudware::agent::load_config();
+            json native_cfg = cfg;
+            native_cfg["offline_mode"] = true;
             if (explicit_provider) {
                 provider = params["provider"];
             } else {
@@ -2426,15 +2236,34 @@ static int chudware_call_inner(const char* method, const char* params_json, char
                     !params["provider"].get<std::string>().empty())
                     pname = params["provider"].get<std::string>();
                 json resolved = apply_model_overrides(
-                    chudware::agent::resolve_provider(pname, cfg, json::object()), params);
-                if (resolved.is_object() && resolved.contains("error"))
+                    chudware::agent::resolve_provider(pname, native_cfg, json::object()), params);
+                if (resolved.is_object() && resolved.contains("error")) {
+                    const std::string detail =
+                        jstr(resolved, "error", "provider resolution failed");
+                    const std::string error =
+                        "Native agent_mission_v1 could not resolve an offline-safe local "
+                        "provider: " + detail +
+                        ". Use agent_admin_turn/Chudcode for online providers.";
                     return emit(json{{"ok", false},
                                      {"status", "failed"},
                                      {"stop_reason", "provider_error"},
-                                     {"error_detail", jstr(resolved, "error", "provider resolution failed")},
-                                     {"error", jstr(resolved, "error", "provider resolution failed")}},
+                                     {"error_detail", error},
+                                     {"error", error}},
                                 out_json, 0);
-                provider = chudware::agent::apply_experimental(resolved, cfg, json::object());
+                }
+                provider =
+                    chudware::agent::apply_experimental(resolved, native_cfg, json::object());
+            }
+            if (!native_provider_offline_safe(provider)) {
+                const std::string error =
+                    "Native agent_mission_v1 supports only deterministic offline-safe local "
+                    "providers; use agent_admin_turn/Chudcode for online providers.";
+                return emit(json{{"ok", false},
+                                 {"status", "failed"},
+                                 {"stop_reason", "provider_error"},
+                                 {"error_detail", error},
+                                 {"error", error}},
+                            out_json, 0);
             }
 
             auto captured = std::make_shared<json>(json::array());

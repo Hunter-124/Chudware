@@ -11,6 +11,7 @@ text/thinking fragments into while a completion streams. Display-only — the
 provider's final result still carries the full text. Unset means no streaming,
 zero overhead.
 """
+
 from __future__ import annotations
 
 import threading
@@ -53,6 +54,7 @@ def provider_delta_sink() -> Any:
     """This thread's installed provider delta sink, or None."""
     return getattr(_tls, "delta_sink", None)
 
+
 def set_last_stop_reason(reason: Any) -> None:
     """Record why the provider stopped generating, for the call just completed.
 
@@ -61,27 +63,25 @@ def set_last_stop_reason(reason: Any) -> None:
     there is nowhere in the return value to put this without changing every
     provider's signature. Mirrors the delta-sink seam above.
 
-    Why it matters: a reply cut off at the token cap parses as a SHORTER valid
+    Why it matters: a reply cut off at the token cap parses as a shorter valid
     reply. Live 2026-07-28 a general-lane turn was truncated mid-directive, read
-    as "no directive", and reported success with ZERO geometry. Detection was
-    textual (`agent_turn._looks_truncated`) precisely because no finish reason
-    reached it — the docstring there says so. The bridge has had the real signal
-    all along: measured 2026-07-30, `complete` returns stopReason "length" when
-    the cap is hit and "stop" otherwise.
+    as "no directive", and reported success with zero geometry. Providers that
+    expose a finish reason must preserve it here so the loop can distinguish
+    ``length`` from an ordinary ``stop``.
     """
     _tls.last_stop_reason = reason
 
 
 def take_last_stop_reason() -> Any:
-    """The stop reason for the last provider call on this thread, CONSUMING it.
+    """Consume the stop reason for the last provider call on this thread.
 
-    One-shot by design: a provider that does not report one (every non-bridge
-    provider today) must yield None here rather than the value some earlier call
-    left behind, or the caller would act on a stale signal.
+    A provider that reports no reason must yield None rather than a stale value
+    from an earlier call.
     """
     reason = getattr(_tls, "last_stop_reason", None)
     _tls.last_stop_reason = None
     return reason
+
 
 class ProviderDeltaGuard:
     """Install-and-restore guard mirroring C++'s ProviderDeltaGuard.
@@ -131,14 +131,19 @@ class Provider:
     """A vision+text chat completion backend."""
 
     name = "base"
-    supports_vision = True  # if False, the loop sends stats-only feedback (no screenshot)
+    supports_vision = (
+        True  # if False, the loop sends stats-only feedback (no screenshot)
+    )
 
-    def complete(self, system: str, messages: list[dict], max_tokens: int = 8000) -> str:
+    def complete(
+        self, system: str, messages: list[dict], max_tokens: int = 8000
+    ) -> str:
         """Return the assistant's text reply for (system, messages)."""
         raise NotImplementedError
 
-    def complete_ex(self, system: str, messages: list[dict],
-                    max_tokens: int = 8000) -> tuple[str, str]:
+    def complete_ex(
+        self, system: str, messages: list[dict], max_tokens: int = 8000
+    ) -> tuple[str, str]:
         """Return (reply_text, thinking_text).
 
         ``thinking_text`` is the model's extended-reasoning trace when the backend exposes

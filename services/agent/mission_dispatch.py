@@ -3025,8 +3025,8 @@ def run_linear_role_turn(
                 pass
     except Exception as exc:  # noqa: BLE001
         _swept = {"saved": [], "errors": [f"{type(exc).__name__}: {exc}"]}
-    # OMP Auto-Learn capture-at-stop (agent.autolearn_*). Main-chat / linear
-    # entry only — never raises into the turn path.
+    # Auto-Learn capture-at-stop (agent.autolearn_*). Main-chat / linear entry
+    # only — never raises into the turn path.
     try:
         from services.agent.autolearn import maybe_capture_after_turn  # noqa: PLC0415
 

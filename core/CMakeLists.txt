@@ -788,7 +788,6 @@ target_include_directories(chudware_aicm PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 # it builds in both configs. Dynamic CRT to match chudware_miniz / the DLL heap.
 add_library(chudware_agent STATIC
   agent/http.cpp
-  agent/omp_bridge_client.cpp
   agent/auth.cpp
   agent/providers.cpp
   agent/paths.cpp
@@ -817,7 +816,7 @@ if(NOT CHUDWARE_DEVELOPER_BUILD)
 endif()
 
 # chudware_util: platform_paths (executablePath) + parent_death (fork/exec child
-# hardening) for omp_bridge_client.cpp and run.cpp's worker spawn.
+# hardening) for run.cpp's worker spawn.
 target_link_libraries(chudware_agent PUBLIC nlohmann_json::nlohmann_json chudware_util)
 if(WIN32)
   target_link_libraries(chudware_agent PUBLIC winhttp bcrypt)

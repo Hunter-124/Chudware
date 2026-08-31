@@ -14,6 +14,7 @@ Grounded in mega-24 a3 fingerprints (reports/runs/mega-24/):
               re-opt when DRC reports clearance-class errors, then honest
               FAIL (errors==0 or residual naming clearance).
 """
+
 from __future__ import annotations
 
 import json
@@ -98,55 +99,82 @@ def test_y25_forced_simulate_args_carry_schematic_doc():
     sch, brd = "sch_aaaa1111", "brd_bbbb2222"
     calls = [
         {
-            "tool": "ecad_new_schematic", "ok": True,
+            "tool": "ecad_new_schematic",
+            "ok": True,
             "result": {"ok": True, "doc_id": sch, "kind": "sch"},
         },
         {
-            "tool": "ecad_place_symbol", "ok": True,
+            "tool": "ecad_place_symbol",
+            "ok": True,
             "args": {"libid": "Device:R", "ref": "R1", "doc_id": sch},
             "result": {
-                "ok": True, "doc_id": sch, "ref": "R1",
+                "ok": True,
+                "doc_id": sch,
+                "ref": "R1",
                 "pins": [
-                    {"ref": "R1", "pin": "1", "name": "1", "type": "passive",
-                     "x": 0.0, "y": 0.0},
-                    {"ref": "R1", "pin": "2", "name": "2", "type": "passive",
-                     "x": 2.54, "y": 0.0},
+                    {
+                        "ref": "R1",
+                        "pin": "1",
+                        "name": "1",
+                        "type": "passive",
+                        "x": 0.0,
+                        "y": 0.0,
+                    },
+                    {
+                        "ref": "R1",
+                        "pin": "2",
+                        "name": "2",
+                        "type": "passive",
+                        "x": 2.54,
+                        "y": 0.0,
+                    },
                 ],
             },
         },
         {
-            "tool": "ecad_add_power", "ok": True,
+            "tool": "ecad_add_power",
+            "ok": True,
             "args": {"net": "3V3", "x": 0.0, "y": 0.0, "doc_id": sch},
             "result": {"ok": True, "net": "3V3", "net_size": 1, "doc_id": sch},
         },
         {
-            "tool": "ecad_wire", "ok": True,
+            "tool": "ecad_wire",
+            "ok": True,
             "args": {
-                "from_ref": "R1", "from_pin": "1",
-                "to_ref": "R1", "to_pin": "2", "doc_id": sch,
+                "from_ref": "R1",
+                "from_pin": "1",
+                "to_ref": "R1",
+                "to_pin": "2",
+                "doc_id": sch,
             },
             "result": {"ok": True, "net_size": 2, "doc_id": sch},
         },
         {
-            "tool": "board_from_schematic", "ok": True,
+            "tool": "board_from_schematic",
+            "ok": True,
             "args": {"doc_id": sch, "sch_doc_id": sch},
             "result": {
-                "ok": True, "doc_id": brd, "board_doc_id": brd,
+                "ok": True,
+                "doc_id": brd,
+                "board_doc_id": brd,
                 "sch_doc_id": sch,
             },
         },
         {
-            "tool": "ecad_optimize_traces", "ok": True,
+            "tool": "ecad_optimize_traces",
+            "ok": True,
             "args": {"doc_id": brd},
             "result": {"ok": True, "doc_id": brd, "corners_rounded": 0},
         },
         {
-            "tool": "ecad_run_drc", "ok": True,
+            "tool": "ecad_run_drc",
+            "ok": True,
             "args": {"doc_id": brd},
             "result": {"ok": True, "doc_id": brd, "errors": 0},
         },
         {
-            "tool": "ecad_run_erc", "ok": True,
+            "tool": "ecad_run_erc",
+            "ok": True,
             "args": {"doc_id": sch},
             "result": {"ok": True, "doc_id": sch, "errors": 0},
         },
@@ -166,13 +194,17 @@ def test_y25_forced_dispatch_rewrites_simulate_to_schematic():
     sch, brd = "sch_y25", "brd_y25"
     calls = [
         {
-            "tool": "ecad_new_schematic", "ok": True,
+            "tool": "ecad_new_schematic",
+            "ok": True,
             "result": {"ok": True, "doc_id": sch, "kind": "sch"},
         },
         {
-            "tool": "board_from_schematic", "ok": True,
+            "tool": "board_from_schematic",
+            "ok": True,
             "result": {
-                "ok": True, "doc_id": brd, "board_doc_id": brd,
+                "ok": True,
+                "doc_id": brd,
+                "board_doc_id": brd,
                 "sch_doc_id": sch,
             },
         },
@@ -190,8 +222,11 @@ def test_y25_forced_dispatch_rewrites_simulate_to_schematic():
                     "error": f"doc '{did}' is a pcb, not a schematic",
                 }
             return {
-                "ok": True, "analysis": "op", "device_count": 2,
-                "nodes": ["3V3", "GND"], "op": {"V(3V3)": 3.3},
+                "ok": True,
+                "analysis": "op",
+                "device_count": 2,
+                "nodes": ["3V3", "GND"],
+                "op": {"V(3V3)": 3.3},
                 "doc_id": did,
             }
         return {"ok": True}
@@ -249,7 +284,8 @@ def _clearance_drc_result(doc_id: str = "767f0f0fa678", errors: int = 6) -> dict
                 "severity": "error",
                 "message": "clearance 0.1296mm < required 0.2mm",
             }
-        ] * min(errors, 3),
+        ]
+        * min(errors, 3),
         "by_rule": [{"rule": "clearance", "count": errors}],
         "source": "live",
     }
@@ -260,7 +296,8 @@ def test_z25_clearance_detection_from_mega24_shape():
 
     calls = [
         {
-            "tool": "ecad_run_drc", "ok": True,
+            "tool": "ecad_run_drc",
+            "ok": True,
             "args": {"doc_id": "767f0f0fa678"},
             "result": _clearance_drc_result(),
         },
@@ -268,7 +305,8 @@ def test_z25_clearance_detection_from_mega24_shape():
     assert _ecad_last_drc_has_clearance(calls) is True
     clean = [
         {
-            "tool": "ecad_run_drc", "ok": True,
+            "tool": "ecad_run_drc",
+            "ok": True,
             "result": {"ok": True, "errors": 0, "verdict": "Clean board"},
         },
     ]
@@ -281,19 +319,24 @@ def test_z25_optimize_args_carry_min_clearance_intent():
     brd = "brd_z25"
     calls = [
         {
-            "tool": "board_from_schematic", "ok": True,
+            "tool": "board_from_schematic",
+            "ok": True,
             "result": {
-                "ok": True, "doc_id": brd, "board_doc_id": brd,
+                "ok": True,
+                "doc_id": brd,
+                "board_doc_id": brd,
                 "sch_doc_id": "sch_z25",
             },
         },
         {
-            "tool": "ecad_optimize_traces", "ok": True,
+            "tool": "ecad_optimize_traces",
+            "ok": True,
             "args": {"doc_id": brd},
             "result": {"ok": True, "doc_id": brd},
         },
         {
-            "tool": "ecad_run_drc", "ok": True,
+            "tool": "ecad_run_drc",
+            "ok": True,
             "args": {"doc_id": brd},
             "result": _clearance_drc_result(brd),
         },
@@ -318,55 +361,88 @@ def test_z25_cascade_clearance_reroute_once_then_stop():
 
     brd, sch = "brd_z25c", "sch_z25c"
     allow = {
-        "ecad_new_schematic", "ecad_place_symbol", "ecad_wire",
-        "ecad_add_power", "board_from_schematic", "ecad_optimize_traces",
-        "ecad_autoroute", "ecad_run_drc", "ecad_run_erc", "ecad_simulate",
+        "ecad_new_schematic",
+        "ecad_place_symbol",
+        "ecad_wire",
+        "ecad_add_power",
+        "board_from_schematic",
+        "ecad_optimize_traces",
+        "ecad_autoroute",
+        "ecad_run_drc",
+        "ecad_run_erc",
+        "ecad_simulate",
     }
     base = [
         {
-            "tool": "ecad_new_schematic", "ok": True,
+            "tool": "ecad_new_schematic",
+            "ok": True,
             "result": {"ok": True, "doc_id": sch, "kind": "sch"},
         },
         {
-            "tool": "ecad_place_symbol", "ok": True,
+            "tool": "ecad_place_symbol",
+            "ok": True,
             "args": {"libid": "Device:R", "ref": "R1", "doc_id": sch},
             "result": {
-                "ok": True, "doc_id": sch, "ref": "R1",
+                "ok": True,
+                "doc_id": sch,
+                "ref": "R1",
                 "pins": [
-                    {"ref": "R1", "pin": "1", "name": "1", "type": "passive",
-                     "x": 0.0, "y": 0.0},
-                    {"ref": "R1", "pin": "2", "name": "2", "type": "passive",
-                     "x": 2.54, "y": 0.0},
+                    {
+                        "ref": "R1",
+                        "pin": "1",
+                        "name": "1",
+                        "type": "passive",
+                        "x": 0.0,
+                        "y": 0.0,
+                    },
+                    {
+                        "ref": "R1",
+                        "pin": "2",
+                        "name": "2",
+                        "type": "passive",
+                        "x": 2.54,
+                        "y": 0.0,
+                    },
                 ],
             },
         },
         {
-            "tool": "ecad_add_power", "ok": True,
+            "tool": "ecad_add_power",
+            "ok": True,
             "args": {"net": "3V3", "x": 0.0, "y": 0.0, "doc_id": sch},
             "result": {"ok": True, "net": "3V3", "net_size": 1},
         },
         {
-            "tool": "ecad_wire", "ok": True,
+            "tool": "ecad_wire",
+            "ok": True,
             "args": {
-                "from_ref": "R1", "from_pin": "1",
-                "to_ref": "R1", "to_pin": "2", "doc_id": sch,
+                "from_ref": "R1",
+                "from_pin": "1",
+                "to_ref": "R1",
+                "to_pin": "2",
+                "doc_id": sch,
             },
             "result": {"ok": True, "net_size": 2},
         },
         {
-            "tool": "board_from_schematic", "ok": True,
+            "tool": "board_from_schematic",
+            "ok": True,
             "result": {
-                "ok": True, "doc_id": brd, "board_doc_id": brd,
+                "ok": True,
+                "doc_id": brd,
+                "board_doc_id": brd,
                 "sch_doc_id": sch,
             },
         },
         {
-            "tool": "ecad_optimize_traces", "ok": True,
+            "tool": "ecad_optimize_traces",
+            "ok": True,
             "args": {"doc_id": brd},
             "result": {"ok": True, "doc_id": brd, "corners_rounded": 0},
         },
         {
-            "tool": "ecad_run_drc", "ok": True,
+            "tool": "ecad_run_drc",
+            "ok": True,
             "args": {"doc_id": brd},
             "result": _clearance_drc_result(brd),
         },
@@ -398,7 +474,9 @@ def test_z25_cascade_clearance_reroute_once_then_stop():
         if tool == "ecad_simulate":
             assert a.get("doc_id") == sch, a
             return {
-                "ok": True, "op": {"V(3V3)": 3.3}, "nodes": ["3V3", "GND"],
+                "ok": True,
+                "op": {"V(3V3)": 3.3},
+                "nodes": ["3V3", "GND"],
                 "doc_id": sch,
             }
         return {"ok": True}
@@ -434,13 +512,17 @@ def test_z25_optimize_dispatch_strips_meta_keeps_board_doc():
     brd, sch = "brd_strip", "sch_strip"
     calls = [
         {
-            "tool": "ecad_new_schematic", "ok": True,
+            "tool": "ecad_new_schematic",
+            "ok": True,
             "result": {"ok": True, "doc_id": sch},
         },
         {
-            "tool": "board_from_schematic", "ok": True,
+            "tool": "board_from_schematic",
+            "ok": True,
             "result": {
-                "ok": True, "doc_id": brd, "board_doc_id": brd,
+                "ok": True,
+                "doc_id": brd,
+                "board_doc_id": brd,
                 "sch_doc_id": sch,
             },
         },
@@ -485,13 +567,17 @@ def test_b20_drc_still_targets_board():
 
     calls = [
         {
-            "tool": "ecad_new_schematic", "ok": True,
+            "tool": "ecad_new_schematic",
+            "ok": True,
             "result": {"doc_id": "sch1", "kind": "sch"},
         },
         {
-            "tool": "board_from_schematic", "ok": True,
+            "tool": "board_from_schematic",
+            "ok": True,
             "result": {
-                "doc_id": "brd1", "board_doc_id": "brd1", "sch_doc_id": "sch1",
+                "doc_id": "brd1",
+                "board_doc_id": "brd1",
+                "sch_doc_id": "sch1",
             },
         },
     ]
@@ -513,7 +599,8 @@ def test_s23_t23_contracts_still_hold():
 
     # T23: measure_between finite 0.0 still scores 1.0.
     score, _ = bat._extract_score(
-        "measure_between", "scalar",
+        "measure_between",
+        "scalar",
         json.dumps({"ok": True, "distance": 0.0, "unit": "mm"}),
     )
     assert score == 1.0
@@ -535,18 +622,38 @@ def test_end_of_turn_ecad_force_from_orphan_power_seed():
         if tool == "ecad_place_symbol":
             ref = a.get("ref") or "R1"
             return {
-                "ok": True, "doc_id": sch, "ref": ref,
-                "libid": a.get("libid") or "Device:R", "value": "1k",
+                "ok": True,
+                "doc_id": sch,
+                "ref": ref,
+                "libid": a.get("libid") or "Device:R",
+                "value": "1k",
                 "pins": [
-                    {"ref": ref, "pin": "1", "name": "1", "type": "passive",
-                     "x": float(a.get("x") or 20), "y": float(a.get("y") or 0)},
-                    {"ref": ref, "pin": "2", "name": "2", "type": "passive",
-                     "x": float(a.get("x") or 20) + 2.54, "y": float(a.get("y") or 0)},
+                    {
+                        "ref": ref,
+                        "pin": "1",
+                        "name": "1",
+                        "type": "passive",
+                        "x": float(a.get("x") or 20),
+                        "y": float(a.get("y") or 0),
+                    },
+                    {
+                        "ref": ref,
+                        "pin": "2",
+                        "name": "2",
+                        "type": "passive",
+                        "x": float(a.get("x") or 20) + 2.54,
+                        "y": float(a.get("y") or 0),
+                    },
                 ],
             }
         if tool == "ecad_add_power":
-            return {"ok": True, "doc_id": sch, "net": a.get("net"), "net_size": 1,
-                    "pos": [a.get("x"), a.get("y")]}
+            return {
+                "ok": True,
+                "doc_id": sch,
+                "net": a.get("net"),
+                "net_size": 1,
+                "pos": [a.get("x"), a.get("y")],
+            }
         if tool == "ecad_wire":
             return {"ok": True, "doc_id": sch, "net_size": 2}
         if tool == "board_from_schematic":
@@ -562,63 +669,115 @@ def test_end_of_turn_ecad_force_from_orphan_power_seed():
             return {"ok": True, "doc_id": sch, "errors": 0}
         if tool == "ecad_simulate":
             assert a.get("doc_id") == sch, a
-            return {"ok": True, "doc_id": sch, "op": {"V(3V3)": 3.3},
-                    "nodes": ["3V3", "GND"]}
+            return {
+                "ok": True,
+                "doc_id": sch,
+                "op": {"V(3V3)": 3.3},
+                "nodes": ["3V3", "GND"],
+            }
         if tool == "ecad_autoroute":
             return {"ok": True, "doc_id": brd}
         return {"ok": True}
 
     seed = [
-        {"tool": "ecad_new_schematic", "ok": True,
-         "result": {"ok": True, "doc_id": sch, "kind": "sch"}},
-        {"tool": "ecad_place_symbol", "ok": True,
-         "args": {"libid": "MCU:Generic_QFP48", "ref": "U1", "doc_id": sch},
-         "result": {
-             "ok": True, "doc_id": sch, "ref": "U1",
-             "libid": "MCU:Generic_QFP48",
-             "pins": [
-                 {"ref": "U1", "pin": "1", "name": "VDD", "type": "power_in",
-                  "x": 0.0, "y": 0.0},
-                 {"ref": "U1", "pin": "2", "name": "GND", "type": "power_in",
-                  "x": 0.0, "y": 2.54},
-             ],
-         }},
-        {"tool": "ecad_add_power", "ok": True,
-         "args": {"net": "GND", "x": 20.0, "y": 90.0, "doc_id": sch},
-         "result": {"ok": True, "net": "GND", "net_size": 0, "pos": [20.0, 90.0]}},
-        {"tool": "ecad_add_power", "ok": True,
-         "args": {"net": "3V3", "x": 20.0, "y": 20.0, "doc_id": sch},
-         "result": {"ok": True, "net": "3V3", "net_size": 0, "pos": [20.0, 20.0]}},
+        {
+            "tool": "ecad_new_schematic",
+            "ok": True,
+            "result": {"ok": True, "doc_id": sch, "kind": "sch"},
+        },
+        {
+            "tool": "ecad_place_symbol",
+            "ok": True,
+            "args": {"libid": "MCU:Generic_QFP48", "ref": "U1", "doc_id": sch},
+            "result": {
+                "ok": True,
+                "doc_id": sch,
+                "ref": "U1",
+                "libid": "MCU:Generic_QFP48",
+                "pins": [
+                    {
+                        "ref": "U1",
+                        "pin": "1",
+                        "name": "VDD",
+                        "type": "power_in",
+                        "x": 0.0,
+                        "y": 0.0,
+                    },
+                    {
+                        "ref": "U1",
+                        "pin": "2",
+                        "name": "GND",
+                        "type": "power_in",
+                        "x": 0.0,
+                        "y": 2.54,
+                    },
+                ],
+            },
+        },
+        {
+            "tool": "ecad_add_power",
+            "ok": True,
+            "args": {"net": "GND", "x": 20.0, "y": 90.0, "doc_id": sch},
+            "result": {"ok": True, "net": "GND", "net_size": 0, "pos": [20.0, 90.0]},
+        },
+        {
+            "tool": "ecad_add_power",
+            "ok": True,
+            "args": {"net": "3V3", "x": 20.0, "y": 20.0, "doc_id": sch},
+            "result": {"ok": True, "net": "3V3", "net_size": 0, "pos": [20.0, 20.0]},
+        },
     ]
     allow = {
-        "ecad_new_schematic", "ecad_place_symbol", "ecad_add_power", "ecad_wire",
-        "ecad_run_erc", "ecad_simulate", "board_from_schematic",
-        "ecad_optimize_traces", "ecad_run_drc", "ecad_autoroute",
+        "ecad_new_schematic",
+        "ecad_place_symbol",
+        "ecad_add_power",
+        "ecad_wire",
+        "ecad_run_erc",
+        "ecad_simulate",
+        "board_from_schematic",
+        "ecad_optimize_traces",
+        "ecad_run_drc",
+        "ecad_autoroute",
     }
     assert _ecad_chain_need(seed, allow) is not None
     new_calls, made = _ecad_force_chain_cascade(
-        calls=list(seed), allow=allow, dispatch=dispatch,
-        ledger=None, actor="BUILD DL3", messages=[],
-        tool_calls_made=16, budget=16,
-        reason="end_of_turn_ecad_force", max_steps=14,
+        calls=list(seed),
+        allow=allow,
+        dispatch=dispatch,
+        ledger=None,
+        actor="BUILD DL3",
+        messages=[],
+        tool_calls_made=16,
+        budget=16,
+        reason="end_of_turn_ecad_force",
+        max_steps=14,
     )
     assert made > 16  # cascade extended past exhausted budget
-    assert any(c.get("ok") and c.get("tool") == "board_from_schematic" for c in new_calls)
+    assert any(
+        c.get("ok") and c.get("tool") == "board_from_schematic" for c in new_calls
+    )
     assert any(c.get("ok") and c.get("tool") == "ecad_run_drc" for c in new_calls)
     for c in new_calls:
         if c.get("tool") == "ecad_simulate" and c.get("ok"):
             assert (c.get("args") or {}).get("doc_id") == sch
 
 
-def test_no_dead_mistral_in_frontier_fallback_source():
-    """Leaf oneshot miss must not hardcode mistralai/mistral-small:free."""
-    from pathlib import Path
-    # services/agent/test → parents[1]=services; node_runner is services/dag
-    src = Path(__file__).resolve().parents[2] / "services" / "dag" / "node_runner.py"
-    body = src.read_text(encoding="utf-8")
-    assign_lines = [
-        ln for ln in body.splitlines()
-        if "cfg_or" in ln and "model" in ln and ("=" in ln)
-    ]
-    assert not any("mistral-small:free" in ln for ln in assign_lines), assign_lines
-    assert "deepseek/deepseek-chat-v3.1" in body
+def test_chudcode_role_settings_preserve_resolved_model_without_private_fallback():
+    """DAG execution forwards the governed assignment; Chudcode owns fallback."""
+    from services.dag import node_runner as nr
+
+    pack = {
+        "role_id": "reviewer",
+        "node_inputs": {"role": "reviewer"},
+        "role_model": {
+            "provider": "openrouter",
+            "model": "google/gemma-3-27b-it:free",
+            "reasoning_effort": "low",
+        },
+    }
+    settings = nr._resolve_role_settings(pack)
+    assert settings == {
+        "provider": "openrouter",
+        "model": "google/gemma-3-27b-it:free",
+        "reasoning_effort": "low",
+    }

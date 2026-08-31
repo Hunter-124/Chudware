@@ -1526,7 +1526,7 @@ bool bridgeRpcAbsent(const core::RpcResult& r) {
     return false;
 }
 
-// "$3" / "$1.5" / "$18.75" — OMP formatCostPair trims to meaningful digits (model-browser.ts:271).
+// "$3" / "$1.5" / "$18.75", trimmed to meaningful digits.
 std::string fmtUsd(double v) {
     char buf[32];
     std::snprintf(buf, sizeof(buf), "$%.4g", v);
@@ -1544,11 +1544,8 @@ std::string toLowerCopy(const std::string& s) {
 // Infer a release date embedded in a model id/name, e.g.:
 //   "claude-3-5-sonnet-20241022" -> 2024-10-22 (bare YYYYMMDD token)
 //   "gpt-4o-2024-08-06"          -> 2024-08-06 (YYYY-MM-DD token)
-// Deliberately conservative: only an unambiguous 8-digit YYYYMMDD run or a hyphenated
-// YYYY-MM-DD run is accepted (both self-contained — no external "year context" needed, so
-// the "-MMDD suffix + surrounding year" case never arises in practice for the ids OMP emits;
-// skip rather than guess when nothing unambiguous is found). Sets outIso="" / outSort=0 on
-// failure.
+// Deliberately conservative: accept only an unambiguous YYYYMMDD run or hyphenated YYYY-MM-DD.
+// Skip rather than guess when nothing self-contained is found.
 void inferReleaseDate(const std::string& id, const std::string& name, std::string& outIso,
                       long& outSort) {
     outIso.clear();
@@ -1727,7 +1724,7 @@ const ui::BridgeModelMeta* bridgeModelMetaForCad(int cadProvider, const std::str
     }
     if (!prov.empty())
         if (const ui::BridgeModelMeta* m = bridgeModelMeta(prov, modelId)) return m;
-    // Fallback: bare id match (covers cloud-slot services whose OMP id differs from ours).
+    // Fallback: bare id match covers cloud-slot services whose provider id differs from ours.
     return bridgeModelMeta("", modelId);
 }
 
@@ -2251,9 +2248,8 @@ void drawModelDropdown(AppState& st, bool busy) {
             return {ui::PROV_CLOUDCOMPAT, "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"};
         // Bridge-only catalog providers: no native C++ transport and no dedicated ProviderIndex,
         // so they ride the SHARED cloud slot. The URL here is a DISCRIMINATOR, not an endpoint —
-        // ui::cloudServiceKey() maps it back to the bridge id that agentProviderOverride pins,
-        // and the bun bridge supplies the real endpoint + credential from its own AuthStorage
-        // (saveSettings omits the cloud slot's api_key for these; see cloudServiceUsesLocalKey).
+        // ui::cloudServiceKey() maps it back to the hosted provider id pinned by
+        // agentProviderOverride; Chudcode supplies the real endpoint and credential.
         if (p == "amazon-bedrock")
             return {ui::PROV_CLOUDCOMPAT, "https://bedrock-runtime.amazonaws.com"};
         if (p == "azure") return {ui::PROV_CLOUDCOMPAT, "https://api.openai.azure.com"};

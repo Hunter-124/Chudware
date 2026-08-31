@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import json
 import sys
 import threading
 import time
 import textwrap
+from pathlib import Path
 
 import pytest
+from services.agent import chudcode_host as chudcode_host_module
 
 from services.agent.chudcode_host import (
     ChudcodeSessionHost,
@@ -24,6 +27,8 @@ class FakeClient:
         self.ui_listeners = []
         self._custom_tools = ()
         self.calls = []
+        self.model_prompt_count = 0
+        self.doctor_summaries = []
         self.prompted = threading.Event()
         self.release = threading.Event()
         self.block = factory.block
@@ -67,6 +72,7 @@ class FakeClient:
         return unsubscribe
 
     def prompt(self, message, *, images=None):
+        self.model_prompt_count += 1
         self.calls.append(("prompt", {"message": message, "images": images}))
         self.prompted.set()
         if not self.block:
@@ -124,6 +130,43 @@ class FakeClient:
 
     def request_raw(self, command, **payload):
         self.calls.append((command, payload))
+        if command == "prompt" and str(payload.get("message", "")).startswith(
+            "/session doctor"
+        ):
+            repair = "--repair" in payload["message"]
+            summary = (
+                self.doctor_summaries.pop(0)
+                if self.doctor_summaries
+                else {
+                    "version": 1,
+                    "mode": "repair" if repair else "dry-run",
+                    "status": "healthy",
+                    "sessionFile": self.session_file,
+                    "outputPath": self.session_file,
+                    "backupPath": None,
+                    "changed": False,
+                    "findingCount": 0,
+                    "repairableFindingCount": 0,
+                    "remainingFindingCount": 0,
+                    "counts": {},
+                    "findings": [],
+                }
+            )
+            for listener in tuple(self.listeners):
+                listener(
+                    {
+                        "type": "command_output",
+                        "text": json.dumps(summary),
+                    }
+                )
+                listener(
+                    {
+                        "type": "prompt_result",
+                        "id": "doctor",
+                        "agentInvoked": False,
+                    }
+                )
+            return {"agentInvoked": False}
         return {"command": command, **payload}
 
     def get_state(self):
@@ -138,6 +181,26 @@ class FakeClient:
 
     def get_last_assistant_text(self):
         return "done"
+
+    def export_html(self, output_path=None):
+        path = Path(output_path)
+        path.write_text("<html><body>transcript</body></html>", encoding="utf-8")
+        self.calls.append(("export_html", {"outputPath": str(path)}))
+        return path
+
+    def branch(self, entry_id):
+        self.calls.append(("branch", {"entryId": entry_id}))
+        self.session_id = f"{self.session_id}-child"
+        root = Path(self.kwargs.get("cwd") or self.kwargs.get("session_dir") or "/tmp")
+        child = root / "sessions" / f"{self.session_id}.jsonl"
+        child.parent.mkdir(parents=True, exist_ok=True)
+        child.write_text("{}\n", encoding="utf-8")
+        self.session_file = str(child)
+        return {"text": "branched", "cancelled": False}
+
+    def get_messages(self):
+        self.calls.append(("get_messages", {}))
+        return ({"role": "user", "content": "Do the work", "timestamp": 1},)
 
     def get_login_providers(self):
         self.calls.append(("get_login_providers", {}))
@@ -628,6 +691,201 @@ def test_live_session_calls_are_isolated_and_never_create_for_status():
     assert "handoff" in call_names(factory.clients[0])
     assert "compact" not in call_names(factory.clients[0])
     assert "compact" in call_names(factory.clients[1])
+
+
+def test_recovery_methods_refuse_inactive_sessions_without_creating_processes():
+    factory = FakeFactory()
+    host = ChudcodeSessionHost(client_factory=factory)
+
+    assert host.export_session("missing") == {
+        "ok": False,
+        "reason": "session_not_live",
+    }
+    assert host.branch_session("missing", "entry-1") == {
+        "ok": False,
+        "reason": "session_not_live",
+    }
+    assert host.repair_session("missing", False) == {
+        "ok": False,
+        "reason": "session_not_live",
+    }
+    assert host.session_call("missing", "get_messages") == {
+        "ok": False,
+        "reason": "session_not_live",
+    }
+    assert host.close_session("missing") == {"ok": True}
+    assert factory.clients == []
+
+
+def test_export_is_project_contained_and_atomically_published(monkeypatch, tmp_path):
+    project = tmp_path / "project"
+    project.mkdir()
+    factory = FakeFactory()
+    host = ChudcodeSessionHost(client_factory=factory)
+    run(host, "export/session", "export-run", workspace_dir=str(project))
+    replace_calls = []
+    real_replace = chudcode_host_module.os.replace
+
+    def record_replace(source, target):
+        replace_calls.append((Path(source), Path(target)))
+        real_replace(source, target)
+
+    monkeypatch.setattr(chudcode_host_module.os, "replace", record_replace)
+    default = host.export_session("export/session")
+    custom = host.export_session("export/session", "exports/custom.html")
+    outside = host.export_session("export/session", "../outside.html")
+
+    assert default == {
+        "ok": True,
+        "path": str(project / "chat-exports" / "export-session.html"),
+    }
+    assert Path(default["path"]).read_text(encoding="utf-8").startswith("<html>")
+    assert custom == {
+        "ok": True,
+        "path": str(project / "exports" / "custom.html"),
+    }
+    assert outside == {
+        "ok": False,
+        "reason": "export path must stay inside the project",
+    }
+    assert len(replace_calls) == 2
+    assert all(source.parent == target.parent for source, target in replace_calls)
+    assert not list(project.rglob("*.chudcode-export.tmp"))
+
+
+def test_branch_retires_mutated_runtime_and_parent_and_child_resume_independently(
+    tmp_path,
+):
+    project = tmp_path / "project"
+    project.mkdir()
+    parent_file = project / "parent.jsonl"
+    parent_file.write_text("{}\n", encoding="utf-8")
+    factory = FakeFactory()
+    host = ChudcodeSessionHost(client_factory=factory)
+    run(
+        host,
+        "parent",
+        "parent-run",
+        workspace_dir=str(project),
+        chudcode_session_file=str(parent_file),
+    )
+
+    child = host.branch_session("parent", "entry-7")
+
+    assert child["ok"] is True
+    assert child["chudcode_session_id"].endswith("-child")
+    assert child["chudcode_session_file"] != str(parent_file)
+    assert Path(child["chudcode_session_file"]).is_file()
+    assert factory.clients[0].stop_count == 1
+    assert host.status(session_id="parent")["live_session"] is False
+
+    parent, _ = run(
+        host,
+        "parent",
+        "parent-resume",
+        workspace_dir=str(project),
+        chudcode_session_file=str(parent_file),
+    )
+    fork, _ = run(
+        host,
+        "fork",
+        "fork-resume",
+        workspace_dir=str(project),
+        chudcode_session_file=child["chudcode_session_file"],
+    )
+    messages = host.session_call("fork", "get_messages")
+    assert parent["chudcode_session_file"] == str(parent_file)
+    assert fork["chudcode_session_file"] == child["chudcode_session_file"]
+    assert messages["messages"][0]["role"] == "user"
+
+    assert host.close_session("parent") == {"ok": True}
+    assert host.close_session("parent") == {"ok": True}
+    assert parent_file.is_file()
+    assert host.status(session_id="parent")["live_session"] is False
+
+
+def test_doctor_is_local_bounded_secret_safe_and_preserves_repair_backup(tmp_path):
+    project = tmp_path / "project"
+    project.mkdir()
+    backup = project / "session.jsonl.doctor-test.bak"
+    backup.write_text("original\n", encoding="utf-8")
+    factory = FakeFactory()
+    host = ChudcodeSessionHost(client_factory=factory)
+    run(host, "doctor", "doctor-run", workspace_dir=str(project))
+    client = factory.clients[0]
+    oversized_findings = [
+        {
+            "code": "orphaned_tool_call",
+            "message": "apiKey=super-secret-value " + ("x" * 5_000),
+            "repairable": True,
+            "entryId": f"entry-{index}",
+            "path": "refreshToken=also-secret",
+            "apiKey": "must-not-escape",
+        }
+        for index in range(200)
+    ]
+    base = {
+        "version": 1,
+        "mode": "dry-run",
+        "status": "issues",
+        "sessionFile": client.session_file,
+        "outputPath": client.session_file,
+        "backupPath": None,
+        "changed": False,
+        "findingCount": 200,
+        "repairableFindingCount": 200,
+        "remainingFindingCount": 200,
+        "counts": {"orphanedToolCalls": 200},
+        "findings": oversized_findings,
+        "accessToken": "must-not-escape",
+    }
+    repaired = {
+        **base,
+        "mode": "repair",
+        "status": "repaired",
+        "backupPath": str(backup),
+        "changed": True,
+        "remainingFindingCount": 0,
+        "findings": [],
+    }
+    idempotent = {
+        **repaired,
+        "status": "healthy",
+        "backupPath": None,
+        "changed": False,
+        "findingCount": 0,
+        "repairableFindingCount": 0,
+    }
+    client.doctor_summaries.extend((base, repaired, idempotent))
+    model_calls = client.model_prompt_count
+
+    dry_run = host.repair_session("doctor", False)
+    first_repair = host.repair_session("doctor", True)
+    second_repair = host.repair_session("doctor", True)
+
+    assert dry_run["status"] == "issues"
+    assert len(dry_run["findings"]) == 128
+    assert len(dry_run["findings"][0]["message"]) <= 4_096
+    assert "super-secret-value" not in repr(dry_run)
+    assert "also-secret" not in repr(dry_run)
+    assert "must-not-escape" not in repr(dry_run)
+    assert first_repair["status"] == "repaired"
+    assert first_repair["changed"] is True
+    assert first_repair["backup_path"] == str(backup)
+    assert second_repair["status"] == "healthy"
+    assert second_repair["changed"] is False
+    assert second_repair["backup_path"] is None
+    assert client.model_prompt_count == model_calls
+    doctor_calls = [
+        payload["message"]
+        for name, payload in client.calls
+        if name == "prompt" and payload["message"].startswith("/session doctor")
+    ]
+    assert doctor_calls == [
+        "/session doctor",
+        "/session doctor --repair",
+        "/session doctor --repair",
+    ]
 
 
 def test_live_stt_calls_preserve_state_progress_cancel_and_session_isolation():

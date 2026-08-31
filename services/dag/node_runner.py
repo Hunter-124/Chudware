@@ -263,11 +263,9 @@ def _resolve_role_settings(
         row["cost_tier"] = role_models.cost_tier_for(
             str(row["provider"]), str(row.get("model") or "")
         )
-    effort = (
-        getattr(injected, "reasoning_effort", None)
-        if assignment is None and injected is not None
-        else None
-    )
+    effort = row.get("reasoning_effort")
+    if effort is None and assignment is None and injected is not None:
+        effort = getattr(injected, "reasoning_effort", None)
     if effort is None:
         try:
             effort = role_models.resolve_role_thinking(

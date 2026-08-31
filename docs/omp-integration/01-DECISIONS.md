@@ -109,3 +109,91 @@ the "Open decisions" section of `00-OPTIONS-AND-DECISIONS.md`. Implementation fo
 4. **Memory hybrid** (mnemopi behind project_memory API).
 5. **Snapcompact** image tier + safety revamp.
 6. **Firmware** glue breadth + unified IDE UI.
+
+---
+
+## 2026-08-31 — Superseding architecture: Chudcode RPC is the only online runtime
+
+**Status:** this section supersedes every decision and implementation instruction above,
+including the frozen RPC quick reference and implementation order. It also supersedes the
+operational conclusions in `00-OPTIONS-AND-DECISIONS.md`. Those documents and the `research/`
+dossiers remain checked in only as dated provenance for why the boundary moved; they are not
+current runbooks. Do not implement from an earlier section.
+
+### Ownership boundary
+
+- **Chudcode owns universal online agent behavior:** top-level and nested provider execution,
+  provider authentication, model catalog/selection, durable session history and branching,
+  memory, compaction, retry and prompt-cache behavior, browser/computer tools, and speech to
+  text. Chudware calls the compiled service through protocol-v2 `chudcode --mode rpc`; ACP is
+  generic editor interoperability, not the embedding protocol.
+- **Chudware owns product and CAD behavior:** CAD tool schemas and dispatch, document and
+  workspace authority, roles, councils, mission/DAG policy, delegation governance, approvals,
+  guardrails, PLM, event presentation, and product documentation. CAD tools are registered
+  in-band as Chudcode host tools and remain subject to the same live registry, allowlist,
+  guardrail, cancellation, and audit path as every other Chudware call.
+- The deleted OMP provider loop, Bun adapter, private Python provider loop, and vendored source
+  tree are not compatibility surfaces. There is no second online provider path and no source
+  checkout or package installation at runtime.
+- Native C++ provider code remains only for the explicitly offline, local, modeling-safe
+  fallback. General work without an online provider fails honestly; it never falls through to
+  a hidden network loop.
+
+### Authoritative runtime topology
+
+`core/agent/run.cpp` sends every online top-level run to the long-lived services worker's
+`agent_admin_turn`. `services/worker_main.py` owns one process-global
+`ChudcodeSessionHost`; that host owns one persistent `chudcode_rpc.RpcClient` process per
+Chudware conversation. `services/agent/worker_rpc.py` assembles the CAD role prompt and
+run-scoped host tools, then the session host configures and prompts Chudcode. Nested agents and
+their provider calls remain inside that Chudcode session.
+
+The services worker's stdio protocol stays serialized for ordinary calls and streamed events.
+Cancel, steer, and status use the worker's separate authenticated control server
+(`worker_control_info`): a private Unix socket on POSIX or random loopback TCP on Windows.
+This lane must remain usable while the stdio `agent_admin_turn` is blocked. Worker shutdown
+stops the control server and disposes every live and transient Chudcode client.
+
+One Chudware `session_id` maps to one live RPC process. A persisted
+`chudcode_session_file` may seed that process once and cannot be changed while it is live.
+Session capacity is bounded; only the least-recently-used idle session may be evicted. Explicit
+close is idempotent, aborts any active run, disposes the process, and preserves the persisted
+session file.
+
+Recovery stays on that live service boundary: `chudcode_export_session` delegates to
+Chudcode's HTML export (defaulting to the project `chat-exports` directory);
+`chudcode_branch_session` branches at a real entry id; `chudcode_repair_session` returns a
+bounded doctor summary and invokes Chudcode's backup-producing `/session doctor --repair`
+workflow only when requested; `chudcode_close_session` disposes runtime state without deleting
+the persisted file. Never repair or branch by rewriting session JSONL in Chudware.
+
+### Tool and event invariants
+
+- Build host tools from the effective live CAD registry for the turn. `None`, `[]`, and a
+  non-empty allowlist remain distinct; mode/category/meta floors and mutation verification are
+  resolved before advertising schemas. Never advertise an unbound or async-only CAD tool.
+- Chudcode builtin names stay Chudcode-owned unless a CAD registry entry explicitly claims the
+  name. CAD policy refusal and guardrail responses stay machine-readable. Tool exceptions
+  propagate as tool errors; they are never converted into fabricated successful results.
+- Streamed deltas are the only source of visible assistant text. Completed message envelopes
+  are lifecycle records and must not replay final text. Preserve tool-call IDs across
+  start/progress/end, render only terminal tool events as `agent.tool_call`, and map unknown
+  frames deterministically with bounded data rather than dropping or inventing semantics.
+- A turn succeeds only after a terminal `agent_end`. Event-forwarding failure makes the result
+  fail; ending idle without the terminal frame is a protocol error. Cancel before prompt is a
+  valid terminal cancellation; cancel after prompt calls `abort()` once. Duplicate steering
+  text is idempotent, and steering received before prompt start is queued.
+
+### Distribution and shared product vocabulary
+
+`vendor/chudcode/CHUDCODE_ARTIFACT.lock` is the sole release identity: schema
+`chudcode-artifact-lock-v1`, Chudcode product version, repository commit, RPC protocol, and
+SHA-256/immutable URL for every supported platform. Packaging stages an already-built,
+target-matched binary offline and puts canonical `chud`/`chud.exe` beside the services worker.
+A null artifact pin is an intentional fail-closed release state.
+
+UI sharing is specification sharing, not linked widget code. Chudcode's
+`assets/ui-shared-manifest.json` and Chudware's checked-in copy use
+`chud-ui-shared-v1` and must be byte-identical. They define common palette, tone/status names,
+usage thresholds, font provenance, and small icon vocabulary; each product keeps an independent
+native implementation, and Chudware remains authoritative for runtime state and CAD-specific UI.

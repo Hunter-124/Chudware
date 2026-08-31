@@ -1,9 +1,10 @@
 """Provider conformance to contracts/providers.md (neutral schema + offline-safety).
 
-No network: SDK-backed adapters (openai/anthropic/openrouter) are importorskip'd; the
-dependency-free gemini adapter and the neutral helpers/classification always run.
+No network: SDK-backed adapters are importorskip'd; the dependency-free Gemini
+adapter and the neutral helpers/classification always run.
 Lives under agent/ (gate runs `pytest engine/doc services/agent`).
 """
+
 from __future__ import annotations
 
 import types
@@ -16,7 +17,9 @@ from services.agent.providers import base
 
 def _png(tmp_path):
     p = tmp_path / "shot.png"
-    p.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 16)  # header + filler; adapters just b64 it
+    p.write_bytes(
+        b"\x89PNG\r\n\x1a\n" + b"\x00" * 16
+    )  # header + filler; adapters just b64 it
     return str(p)
 
 
@@ -25,7 +28,10 @@ def test_neutral_part_and_message_helpers():
     assert base.text_part("hi") == {"type": "text", "text": "hi"}
     # T-F5: image parts carry a mime slot (photo ingestion); png is the default.
     assert base.image_part("/x/y.png") == {
-        "type": "image", "path": "/x/y.png", "mime": "image/png"}
+        "type": "image",
+        "path": "/x/y.png",
+        "mime": "image/png",
+    }
     msg = base.user([base.text_part("q")])
     assert msg == {"role": "user", "content": [{"type": "text", "text": "q"}]}
     assert base.assistant([])["role"] == "assistant"
@@ -51,9 +57,19 @@ def test_offline_safe_classification():
     assert config.provider_offline_safe(_stub("gemini")) is False
     # openrouter is cloud -> never offline-safe (contract §5)
     assert config.provider_offline_safe(_stub("openrouter")) is False
-    assert config.provider_offline_safe(_stub("openai", base_url="http://127.0.0.1:1234/v1")) is True
+    assert (
+        config.provider_offline_safe(
+            _stub("openai", base_url="http://127.0.0.1:1234/v1")
+        )
+        is True
+    )
     assert config.provider_offline_safe(_stub("openai", base_url=None)) is False
-    assert config.provider_offline_safe(_stub("llamacpp", base_url="http://localhost:1234/v1")) is True
+    assert (
+        config.provider_offline_safe(
+            _stub("llamacpp", base_url="http://localhost:1234/v1")
+        )
+        is True
+    )
 
 
 def test_assert_offline_safe_refuses_openrouter_when_offline():
@@ -83,27 +99,9 @@ def test_openai_wire_shape(tmp_path):
     o = OpenAIProvider(api_key="k", base_url="http://127.0.0.1:1234/v1")
     assert o._content(base.text_part("hi")) == {"type": "text", "text": "hi"}
     img = o._content(base.image_part(_png(tmp_path)))
-    assert img["type"] == "image_url" and img["image_url"]["url"].startswith("data:image/png;base64,")
+    assert img["type"] == "image_url" and img["image_url"]["url"].startswith(
+        "data:image/png;base64,"
+    )
     # text-only message collapses to a plain string (broad compatibility)
     m = o._message("user", [base.text_part("a"), base.text_part("b")])
     assert m == {"role": "user", "content": "a\n\nb"}
-
-
-def test_openrouter_resolves_to_private_omp_bridge():
-    """OMP owns OpenRouter transport semantics; no second Python adapter exists."""
-    from services.agent.providers.omp_bridge_provider import OmpBridgeProvider
-
-    provider = config.get_provider(
-        name="openrouter",
-        cfg={
-            "provider": "openrouter",
-            "model": "openai/gpt-4o",
-            "api_key": "sk-or-x",
-        },
-    )
-
-    assert isinstance(provider, OmpBridgeProvider)
-    assert provider.name == "openrouter"
-    assert provider.wire_provider == "openrouter"
-    assert provider.model == "openai/gpt-4o"
-    assert provider.api_key == "sk-or-x"

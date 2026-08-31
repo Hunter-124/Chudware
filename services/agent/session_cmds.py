@@ -12,7 +12,7 @@ import importlib
 from typing import Any
 
 # ---------------------------------------------------------------------------
-# Handoff prompt — structure LITERALLY from omp handoff-document.md
+# Handoff prompt
 # ---------------------------------------------------------------------------
 
 _HANDOFF_SYSTEM = (
@@ -69,7 +69,7 @@ Use exactly this structure:
 """
 
 # ---------------------------------------------------------------------------
-# /btw side-channel prompts — from omp btw-user.md + side-channel-no-tools.md
+# /btw side-channel prompts
 # ---------------------------------------------------------------------------
 
 _BTW_NO_TOOLS_REMINDER = (

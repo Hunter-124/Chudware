@@ -32,11 +32,12 @@ inline float rowRoundDp()  { return ui::metrics::cpMenuRowRound()  / ui::uiScale
 inline float chipRoundDp() { return ui::metrics::cpMenuChipRound() / ui::uiScale; }
 
 // Arc tone for a "share of a budget" ring — the SAME ladder the Copilot composer's
-// context-window meter uses (<50% ok, <85% warn, else err) so one colour means one thing.
+// context-window meter uses (ui::kUsageWarnFrac / kUsageCritFrac, the chud-ui-shared-v1
+// usage thresholds) so one colour means one thing.
 inline ImU32 fracArcCol(float frac) {
-    return frac < 0.50f ? Palette::toU32(palette.statusOk)
-         : frac < 0.85f ? Palette::toU32(palette.statusWarn)
-                        : Palette::toU32(palette.statusErr);
+    return frac < kUsageWarnFrac ? Palette::toU32(palette.statusOk)
+         : frac < kUsageCritFrac ? Palette::toU32(palette.statusWarn)
+                                 : Palette::toU32(palette.statusErr);
 }
 
 // One observed agent operation (from agent.tool_call). `target` is the human-readable

@@ -113,8 +113,7 @@ std::string humanize_provider_error(const std::string& raw);
 // content_policy_violation, Gemini PROHIBITED_CONTENT). Downstream classification matches
 // on this constant, never on vendor prose: a refusal must fail its stage on the FIRST
 // attempt, because re-asking the same vendor the same question is paid-for and certain to
-// refuse again — and "connection refused" must never be mistaken for one. Mirrors
-// services/agent/omp_bridge.ProviderRefused on the Python lane.
+// refuse again — and "connection refused" must never be mistaken for one.
 inline constexpr const char* kProviderRefusedMarker = "declined by content policy";
 
 // True when *raw* (a complete().error or "provider error: …" reason) carries the marker above.
@@ -188,17 +187,11 @@ std::string redaction_rehydrate_text(const std::string& text, const RedactionMap
 json redaction_scrub_messages(const json& messages, RedactionMap& map);
 
 // --- high-level dispatch ----------------------------------------------------
-// complete(): pick anthropic vs openai/llamacpp vs the OMP bridge, build the request,
-// http_post (or bridge call), parse. provider is
-// "anthropic"|"anthropic-sub"|"openai"|"llamacpp"|"xai"|"xai-sub"|"moonshot"|"gemini"|"mock",
-// or any id in is_omp_bridge_provider()'s set (routed to core/agent/omp_bridge_client.h — see
-// providers.cpp). cfg may carry {api_key, model, base_url}. On a transport/HTTP error, .error
-// is set.
-// Provider ids that route through the bun OMP bridge (vendor/omp/bridge/src/bridge.ts)
-// instead of a native libcurl/WinHTTP branch below. Empty until the orchestrator wires real
-// catalog ids (see providers.cpp for the TODO + wiring point); public so callers other than
-// complete() (e.g. a future host-side provider picker) can ask the same question.
-bool is_omp_bridge_provider(const std::string& provider);
+// complete(): pick the native provider transport, build the request, http_post,
+// and parse. provider is
+// "anthropic"|"anthropic-sub"|"openai"|"llamacpp"|"xai"|"xai-sub"|"moonshot"|
+// "freellmapi"|"gemini"|"mock". cfg may carry {api_key, model, base_url}. On a
+// transport/HTTP error, .error is set.
 struct CompleteResult {
     std::string text;
     std::string thinking;
@@ -212,11 +205,8 @@ struct CompleteResult {
     std::string model;
     std::string request_id;
     std::string error_excerpt;  // ≤200 chars of raw failure body/message
-    // Token/cost accounting (docs/omp-integration/01-DECISIONS.md "Cost + cache"). Populated
-    // only by the OMP bridge branch today from the bun sidecar's `complete` result.usage
-    // (pi-ai's Usage shape: {input,output,cacheRead,cacheWrite,totalTokens,cost:{...}});
-    // null/absent for native libcurl branches (not threaded there yet). Callers MUST check
-    // is_null() before reading fields.
+    // Reserved token accounting payload. Native transports currently leave it null;
+    // callers must check is_null() before reading fields.
     json usage = nullptr;
 };
 // Optional live sink for per-provider-call debug events (kind "provider_call").

@@ -8,11 +8,13 @@ from __future__ import annotations
 
 import base64
 import dataclasses
+import json
 import logging
 import mimetypes
 import os
 import shutil
 import sys
+import re
 import threading
 import uuid
 from urllib.parse import urlsplit
@@ -26,6 +28,9 @@ _DEFAULT_MAX_SESSIONS = 8
 _MAX_MAX_SESSIONS = 32
 _MAX_OPEN_URL_CHARS = 16_384
 _MAX_UI_TEXT_CHARS = 4_096
+_MAX_DOCTOR_OUTPUT_CHARS = 2_097_152
+_MAX_DOCTOR_FINDINGS = 128
+_MAX_DOCTOR_MESSAGE_CHARS = 4_096
 
 _LOG = logging.getLogger(__name__)
 
@@ -61,6 +66,9 @@ _SESSION_SHAPES: dict[str, tuple[frozenset[str], frozenset[str]]] = {
     "set_auto_compaction": (frozenset({"enabled"}), frozenset()),
     "set_auto_retry": (frozenset({"enabled"}), frozenset()),
     "get_state": (frozenset(), frozenset()),
+    "get_messages": (frozenset(), frozenset()),
+    "export_html": (frozenset(), frozenset({"outputPath"})),
+    "branch": (frozenset({"entryId"}), frozenset()),
     "stt_status": (frozenset(), frozenset()),
     "stt_start": (frozenset(), frozenset()),
     "stt_stop": (frozenset(), frozenset()),
@@ -73,6 +81,7 @@ class _Session:
     session_id: str
     client: Any
     resume_file: str | None
+    workspace_dir: str | None
     turn_lock: threading.Lock = field(default_factory=threading.Lock)
     active_turns: int = 0
     closed: bool = False
@@ -404,14 +413,15 @@ class ChudcodeSessionHost:
                 "shutdown": self._shutdown,
             }
 
-    def close_session(self, session_id):
+    def close_session(self, session_id) -> dict[str, Any]:
+        """Dispose a live process without deleting or rewriting its session file."""
         key = _nonempty_string(session_id)
         if key is None:
-            return
+            return {"ok": True}
         with self._lock:
             session = self._sessions.pop(key, None)
             if session is None or session.closed:
-                return
+                return {"ok": True}
             session.closed = True
             runs = [run for run in self._runs.values() if run.session_id == key]
             for run in runs:
@@ -427,6 +437,148 @@ class ChudcodeSessionHost:
                         type(exc).__name__,
                     )
         _stop_client(session.client)
+        return {"ok": True}
+
+    def export_session(self, session_id, output_path=None) -> dict[str, Any]:
+        """Export one live transcript through Chudcode and atomically publish it."""
+        session = self._claim_live_session(session_id)
+        if session is None:
+            return {"ok": False, "reason": "session_not_live"}
+        temporary: Path | None = None
+        try:
+            with session.turn_lock:
+                if session.closed:
+                    return {"ok": False, "reason": "session_not_live"}
+                try:
+                    target = _project_export_path(
+                        session.workspace_dir, session.session_id, output_path
+                    )
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                except (OSError, TypeError, ValueError) as exc:
+                    return {"ok": False, "reason": str(exc)}
+                temporary = target.parent / (
+                    f".{target.name}.{uuid.uuid4().hex}.chudcode-export.tmp"
+                )
+                try:
+                    raw = _invoke_session_canonical(
+                        session.client,
+                        "export_html",
+                        {"outputPath": str(temporary)},
+                    )
+                    normalized = _json_value(raw)
+                    exported_value = (
+                        normalized.get("path")
+                        if isinstance(normalized, Mapping)
+                        else None
+                    )
+                    exported = (
+                        Path(exported_value).expanduser()
+                        if isinstance(exported_value, str)
+                        else None
+                    )
+                    if exported is None or not exported.is_file():
+                        raise RuntimeError(
+                            "Chudcode export_html did not create the requested file"
+                        )
+                    if (
+                        exported.is_symlink()
+                        or exported.absolute() != temporary.absolute()
+                        or exported.resolve().parent != target.parent.resolve()
+                    ):
+                        raise RuntimeError(
+                            "Chudcode export_html returned an unexpected output path"
+                        )
+                    os.replace(exported, target)
+                    temporary = None
+                    return {"ok": True, "path": str(target)}
+                except (OSError, RuntimeError, TypeError, ValueError) as exc:
+                    return {"ok": False, "reason": str(exc)}
+        finally:
+            if temporary is not None:
+                try:
+                    temporary.unlink(missing_ok=True)
+                except OSError:
+                    pass
+            self._release_live_session(session)
+
+    def branch_session(self, session_id, entry_id) -> dict[str, Any]:
+        """Create a persisted child, capture its identity, then retire the mutated process."""
+        key = _nonempty_string(session_id)
+        branch_entry = _nonempty_string(entry_id)
+        if key is None:
+            return {"ok": False, "reason": "session_not_live"}
+        if branch_entry is None:
+            return {"ok": False, "reason": "entry_id is required"}
+        session = self._claim_live_session(key)
+        if session is None:
+            return {"ok": False, "reason": "session_not_live"}
+        dispose = False
+        try:
+            with session.turn_lock:
+                if session.closed:
+                    return {"ok": False, "reason": "session_not_live"}
+                raw = _invoke_session_canonical(
+                    session.client, "branch", {"entryId": branch_entry}
+                )
+                dispose = True
+                normalized = _json_value(raw)
+                if not isinstance(normalized, Mapping):
+                    raise TypeError("Chudcode branch returned a non-object response")
+                if normalized.get("cancelled"):
+                    dispose = False
+                    return {"ok": False, "reason": "branch_cancelled"}
+                state = _safe_client_state(session.client)
+                child_id = _nonempty_string(
+                    state.get("sessionId") or state.get("session_id")
+                )
+                child_file = _nonempty_string(
+                    state.get("sessionFile") or state.get("session_file")
+                )
+                if child_id is None or child_file is None:
+                    raise RuntimeError(
+                        "Chudcode branch returned no child session metadata"
+                    )
+                return {
+                    "ok": True,
+                    "chudcode_session_id": child_id,
+                    "chudcode_session_file": child_file,
+                }
+        except (OSError, RuntimeError, TypeError, ValueError) as exc:
+            return {"ok": False, "reason": str(exc)}
+        finally:
+            self._release_live_session(session)
+            if dispose:
+                self.close_session(key)
+
+    def repair_session(self, session_id, repair=False) -> dict[str, Any]:
+        """Run Chudcode's local-only session doctor in an existing RPC process."""
+        if not isinstance(repair, bool):
+            return {"ok": False, "reason": "repair must be a boolean"}
+        session = self._claim_live_session(session_id)
+        if session is None:
+            return {"ok": False, "reason": "session_not_live"}
+        try:
+            with session.turn_lock:
+                if session.closed:
+                    return {"ok": False, "reason": "session_not_live"}
+                try:
+                    summary = _run_session_doctor(session.client, repair)
+                except (OSError, RuntimeError, TypeError, ValueError) as exc:
+                    return {"ok": False, "reason": _sanitize_doctor_text(str(exc))}
+                state = _safe_client_state(session.client)
+                child_id = _nonempty_string(
+                    state.get("sessionId") or state.get("session_id")
+                )
+                child_file = _nonempty_string(
+                    state.get("sessionFile") or state.get("session_file")
+                )
+                if child_id is not None:
+                    summary["chudcode_session_id"] = child_id[:256]
+                if child_file is not None:
+                    summary["chudcode_session_file"] = child_file[:4_096]
+                return summary
+        finally:
+            self._release_live_session(session)
 
     def shutdown(self):
         with self._lock:
@@ -476,13 +628,10 @@ class ChudcodeSessionHost:
         return self.transient_call(command_name, params)
 
     def session_call(self, session_id, command, params=None) -> dict[str, Any]:
-        """Call one named live session; status calls never create or resume sessions."""
-        session_key = _nonempty_string(session_id)
+        """Call one named live session; these calls never create or resume sessions."""
         command_name = _nonempty_string(command)
         if command_name not in _SESSION_SHAPES:
             raise ValueError(f"unsupported Chudcode session command: {command_name!r}")
-        if session_key is None:
-            return {"ok": False, "reason": "session_not_live"}
         payload = _validated_payload(
             command_name,
             params if params is not None else {},
@@ -498,35 +647,74 @@ class ChudcodeSessionHost:
             and not isinstance(payload["customInstructions"], str)
         ):
             raise TypeError(f"{command_name} customInstructions must be a string")
-        with self._lock:
-            session = self._sessions.get(session_key)
-            if session is None or session.closed:
-                return {"ok": False, "reason": "session_not_live"}
-            session.active_turns += 1
-            self._sessions.move_to_end(session_key)
+        if command_name == "export_html" and (
+            "outputPath" in payload and _nonempty_string(payload["outputPath"]) is None
+        ):
+            raise TypeError("export_html outputPath must be a non-empty string")
+        if (
+            command_name == "branch"
+            and _nonempty_string(payload.get("entryId")) is None
+        ):
+            raise TypeError("branch entryId must be a non-empty string")
+        if command_name == "export_html":
+            return self.export_session(session_id, payload.get("outputPath"))
+        if command_name == "branch":
+            return self.branch_session(session_id, payload["entryId"])
+
+        session = self._claim_live_session(session_id)
+        if session is None:
+            return {"ok": False, "reason": "session_not_live"}
         try:
-            result = _invoke_session_canonical(session.client, command_name, payload)
-            normalized = _json_value(result)
-            if normalized is None:
-                normalized = {"ok": True}
-            if not isinstance(normalized, dict):
-                raise TypeError(
-                    f"Chudcode {command_name} returned a non-object response"
+            with session.turn_lock:
+                if session.closed:
+                    return {"ok": False, "reason": "session_not_live"}
+                result = _invoke_session_canonical(
+                    session.client, command_name, payload
                 )
-            normalized.setdefault("ok", True)
-            if command_name in {"set_auto_compaction", "set_auto_retry"}:
-                normalized.setdefault("enabled", payload["enabled"])
-            if command_name == "get_state":
-                normalized["_hostToolNames"] = sorted(_session_host_tool_names(session))
-            return normalized
+                normalized = _json_value(result)
+                if normalized is None:
+                    normalized = {"ok": True}
+                if not isinstance(normalized, dict):
+                    raise TypeError(
+                        f"Chudcode {command_name} returned a non-object response"
+                    )
+                normalized.setdefault("ok", True)
+                if command_name in {"set_auto_compaction", "set_auto_retry"}:
+                    normalized.setdefault("enabled", payload["enabled"])
+                if command_name == "get_state":
+                    normalized["_hostToolNames"] = sorted(
+                        _session_host_tool_names(session)
+                    )
+                return normalized
         finally:
-            with self._lock:
-                if session.active_turns:
-                    session.active_turns -= 1
+            self._release_live_session(session)
+
+    def _claim_live_session(self, session_id) -> _Session | None:
+        key = _nonempty_string(session_id)
+        if key is None:
+            return None
+        with self._lock:
+            session = self._sessions.get(key)
+            if session is None or session.closed:
+                return None
+            session.active_turns += 1
+            self._sessions.move_to_end(key)
+            return session
+
+    def _release_live_session(self, session: _Session) -> None:
+        with self._lock:
+            if session.active_turns:
+                session.active_turns -= 1
 
     def _get_or_create_session(
         self, session_id: str, params: Mapping[str, Any], resume_file: str | None
     ) -> _Session:
+        workspace = _nonempty_string(params.get("workspace_dir"))
+        workspace_dir = (
+            str(Path(workspace).expanduser().resolve())
+            if workspace is not None
+            else None
+        )
         with self._lock:
             existing = self._sessions.get(session_id)
             if existing is not None:
@@ -538,6 +726,8 @@ class ChudcodeSessionHost:
                     raise RuntimeError(
                         "cannot change chudcode_session_file on a live Chudware session"
                     )
+                if existing.workspace_dir is None and workspace_dir is not None:
+                    existing.workspace_dir = workspace_dir
                 self._sessions.move_to_end(session_id)
                 existing.active_turns += 1
                 return existing
@@ -558,7 +748,13 @@ class ChudcodeSessionHost:
             except (OSError, RuntimeError, ValueError):
                 _stop_client(client)
                 raise
-            session = _Session(session_id, client, resume_file, active_turns=1)
+            session = _Session(
+                session_id,
+                client,
+                resume_file,
+                workspace_dir,
+                active_turns=1,
+            )
             self._sessions[session_id] = session
             return session
 
@@ -777,6 +973,193 @@ class ChudcodeSessionHost:
                 _stop_client(client)
 
 
+def _project_export_path(
+    workspace_dir: str | None, session_id: str, output_path: Any
+) -> Path:
+    if workspace_dir is None:
+        raise ValueError("project_root_unavailable")
+    root = Path(workspace_dir).expanduser().resolve()
+    if not root.is_dir():
+        raise ValueError("project_root_unavailable")
+    if output_path is None:
+        basename = re.sub(r"[^A-Za-z0-9._-]+", "-", session_id).strip(".-")
+        requested = root / "chat-exports" / f"{basename or 'session'}.html"
+    else:
+        if not isinstance(output_path, (str, os.PathLike)):
+            raise TypeError("output_path must be a path string")
+        requested = Path(output_path).expanduser()
+        if not requested.is_absolute():
+            requested = root / requested
+    target = requested.resolve()
+    if target == root:
+        raise ValueError("export path must name a file inside the project")
+    try:
+        target.relative_to(root)
+    except ValueError as exc:
+        raise ValueError("export path must stay inside the project") from exc
+    return target
+
+
+_DOCTOR_STATUSES = frozenset({"healthy", "issues", "repaired", "repaired_with_issues"})
+_DOCTOR_COUNT_KEYS = {
+    "malformedRecords": "malformed_records",
+    "malformedEntries": "malformed_entries",
+    "duplicateEntryIds": "duplicate_entry_ids",
+    "orphanedEntries": "orphaned_entries",
+    "malformedToolCalls": "malformed_tool_calls",
+    "orphanedToolCalls": "orphaned_tool_calls",
+    "orphanedToolResults": "orphaned_tool_results",
+    "malformedImages": "malformed_images",
+    "malformedBlobRefs": "malformed_blob_refs",
+    "missingBlobs": "missing_blobs",
+    "invalidCompactions": "invalid_compactions",
+    "truncatedCompactionImages": "truncated_compaction_images",
+}
+_DOCTOR_SECRET_ASSIGNMENT = re.compile(
+    r"(?i)\b(api[\s_-]*key|access[\s_-]*token|refresh[\s_-]*token|"
+    r"control[\s_-]*token|password|secret)\b(\s*[:=]\s*)"
+    r"(?:\"[^\"]*\"|'[^']*'|[^\s,;}]+)"
+)
+_DOCTOR_TOKEN_LITERAL = re.compile(
+    r"(?i)\b(?:sk|ghp|github_pat|xox[baprs])-[-A-Za-z0-9_]{8,}\b"
+)
+
+
+def _sanitize_doctor_text(value: Any, limit: int = _MAX_DOCTOR_MESSAGE_CHARS) -> str:
+    text = value if isinstance(value, str) else str(value)
+    text = _DOCTOR_SECRET_ASSIGNMENT.sub(r"\1\2<redacted>", text)
+    text = _DOCTOR_TOKEN_LITERAL.sub("<redacted>", text)
+    return text[:limit]
+
+
+def _bounded_doctor_count(value: Any) -> int:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return 0
+    try:
+        count = int(value)
+    except (OverflowError, ValueError):
+        return 0
+    return min(1_000_000, max(0, count))
+
+
+def _sanitize_doctor_summary(raw: Mapping[str, Any], *, repair: bool) -> dict[str, Any]:
+    status = _nonempty_string(raw.get("status"))
+    if status not in _DOCTOR_STATUSES:
+        raise ValueError("Chudcode session doctor returned an invalid status")
+    raw_findings = raw.get("findings")
+    if not isinstance(raw_findings, list):
+        raise ValueError("Chudcode session doctor returned invalid findings")
+    findings: list[dict[str, Any]] = []
+    for value in raw_findings[:_MAX_DOCTOR_FINDINGS]:
+        if not isinstance(value, Mapping):
+            continue
+        code = _bounded_string(value.get("code"), 64)
+        message = _bounded_string(value.get("message"), _MAX_DOCTOR_MESSAGE_CHARS)
+        if code is None or message is None:
+            continue
+        finding: dict[str, Any] = {
+            "code": re.sub(r"[^a-z0-9_]+", "_", code.lower())[:64],
+            "message": _sanitize_doctor_text(message),
+            "repairable": bool(value.get("repairable")),
+        }
+        entry_id = _bounded_string(value.get("entryId"), 256)
+        if entry_id is not None:
+            finding["entry_id"] = _sanitize_doctor_text(entry_id, 256)
+        finding_path = _bounded_string(value.get("path"), 1_024)
+        if finding_path is not None:
+            finding["path"] = _sanitize_doctor_text(finding_path, 1_024)
+        findings.append(finding)
+
+    raw_counts = raw.get("counts")
+    counts_source = raw_counts if isinstance(raw_counts, Mapping) else {}
+    counts = {
+        output_key: _bounded_doctor_count(counts_source.get(source_key))
+        for source_key, output_key in _DOCTOR_COUNT_KEYS.items()
+    }
+    finding_count = _bounded_doctor_count(raw.get("findingCount"))
+    finding_count = max(finding_count, len(raw_findings))
+    result: dict[str, Any] = {
+        "ok": True,
+        "mode": "repair" if repair else "dry-run",
+        "status": status,
+        "changed": bool(raw.get("changed")),
+        "finding_count": min(1_000_000, finding_count),
+        "repairable_finding_count": _bounded_doctor_count(
+            raw.get("repairableFindingCount")
+        ),
+        "remaining_finding_count": _bounded_doctor_count(
+            raw.get("remainingFindingCount")
+        ),
+        "counts": counts,
+        "findings": findings,
+        "backup_path": _bounded_string(raw.get("backupPath"), 4_096),
+    }
+    session_file = _bounded_string(raw.get("sessionFile"), 4_096)
+    if session_file is not None:
+        result["chudcode_session_file"] = session_file
+    return result
+
+
+def _run_session_doctor(client: Any, repair: bool) -> dict[str, Any]:
+    outputs: list[str] = []
+    prompt_results: list[dict[str, Any]] = []
+    completed = threading.Event()
+    retained_chars = 0
+
+    def capture(event: Any) -> None:
+        nonlocal retained_chars
+        frame = _json_value(event)
+        if not isinstance(frame, Mapping):
+            return
+        frame_type = frame.get("type")
+        if frame_type == "command_output":
+            text = frame.get("text")
+            if isinstance(text, str) and retained_chars < _MAX_DOCTOR_OUTPUT_CHARS:
+                retained = text[: _MAX_DOCTOR_OUTPUT_CHARS - retained_chars]
+                outputs.append(retained)
+                retained_chars += len(retained)
+        elif frame_type == "prompt_result":
+            prompt_results.append(dict(frame))
+            completed.set()
+
+    unsubscribe = _register_listener(client, capture)
+    try:
+        command = "/session doctor --repair" if repair else "/session doctor"
+        response = client.request_raw("prompt", message=command)
+        normalized_response = _json_value(response)
+        response_invoked = (
+            normalized_response.get("agentInvoked")
+            if isinstance(normalized_response, Mapping)
+            else None
+        )
+        if response_invoked is True:
+            raise RuntimeError("Chudcode session doctor unexpectedly invoked a model")
+        if response_invoked is not False and not prompt_results:
+            completed.wait(5.0)
+        if prompt_results and prompt_results[-1].get("agentInvoked") is not False:
+            raise RuntimeError("Chudcode session doctor unexpectedly invoked a model")
+        if response_invoked is not False and not prompt_results:
+            raise RuntimeError(
+                "Chudcode session doctor did not report local completion"
+            )
+    finally:
+        try:
+            unsubscribe()
+        except Exception as exc:  # noqa: BLE001 - doctor completion already decided
+            _LOG.debug(
+                "Chudcode doctor listener teardown failed (%s)", type(exc).__name__
+            )
+
+    for text in reversed(outputs):
+        try:
+            value = json.loads(text)
+        except (TypeError, ValueError):
+            continue
+        if isinstance(value, Mapping):
+            return _sanitize_doctor_summary(value, repair=repair)
+    raise RuntimeError("Chudcode session doctor returned no valid summary")
+
+
 def _invoke_canonical(client: Any, command: str, payload: Mapping[str, Any]) -> Any:
     """Use secret-safe typed wrappers when available; fakes may expose raw RPC only."""
     method = getattr(client, command, None)
@@ -827,17 +1210,23 @@ def _invoke_session_canonical(
         if command in {
             "get_session_stats",
             "get_state",
+            "get_messages",
             "stt_status",
             "stt_start",
             "stt_stop",
             "stt_cancel",
         }:
-            return method()
+            result = method()
+            return {"messages": result} if command == "get_messages" else result
         if command in {"compact", "handoff"}:
             return method(payload.get("customInstructions"))
         if command in {"set_auto_compaction", "set_auto_retry"}:
             method(payload["enabled"])
             return {"ok": True, "enabled": payload["enabled"]}
+        if command == "export_html":
+            return {"path": str(method(payload.get("outputPath")))}
+        if command == "branch":
+            return method(payload["entryId"])
     return client.request_raw(command, **payload)
 
 

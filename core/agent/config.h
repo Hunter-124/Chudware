@@ -102,7 +102,7 @@ struct CallBudget {
 };
 CallBudget fit_call_budget(const json& provider_cfg, int desired_output);
 
-// --- agent.prewalk (omp-style strong-plan / cheap-implement handoff) ----------
+// --- agent.prewalk strong-plan / cheap-implement handoff ---------------------
 // Nested under config.json "agent": { "prewalk": bool, "prewalk_target": str }.
 // Defaults: prewalk=false, prewalk_target="@smol". Off = today's single-provider
 // behavior (byte-identical). When armed, planning stages keep the strong model;

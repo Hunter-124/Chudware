@@ -13,10 +13,9 @@ several in one cycle (real hardware) to find the best local-model config:
   python3 -m tools.flywheel.bench.gym.cli run --real \\
       --tiers local-24k,local-24k-gemma3-qat,local-24k-gemma4-e4b
 
-Multi-provider paid tiers (leaderboard path): ``openrouter:<model-id>`` resolves
-to OpenRouterProvider with that model (OPENROUTER_API_KEY / config). ``xai:<model-id>``
-resolves to the SuperGrok subscription provider when signed in, else the xAI API-key
-provider (XAI_API_KEY). Example:
+Paid tiers carry provider/model identifiers into Chudcode. Chudcode owns the
+OpenRouter/xAI transport and authenticated account selection; the gym never
+constructs a Python cloud adapter. Example:
 
   python3 -m tools.flywheel.bench.gym.cli run --real \\
       --tiers openrouter:anthropic/claude-opus-4,xai:grok-4-5 --challenges C1
@@ -26,12 +25,8 @@ Diagnostic suites (leaderboard axes — never folded into primary pass rate):
   python3 -m tools.flywheel.bench.gym.cli diag --tiers xai:grok-4-5
   python -m tools.flywheel.bench.gym.leaderboard build
 
-No "council" (multi-model debate/judge) tier exists yet: services/agent/councils.py's
-council_convene() supports diverse-model seats, but it is wired only into the ladder's
-fix-stage (services/agent/regen_diagnosis.py), not into a role-based seam that
-loop.run_mission()/the gym's single-provider cells can reach — see the runner.py
-docstring above ``_provider_for_tier`` for the full trace. Building that seam is out of
-scope here; a stub council tier would only produce meaningless benchmark data.
+No synthetic "council" tier exists: council composition remains CAD role
+orchestration, not a provider transport or benchmark tier.
 
 The ``run`` command executes the matrix, writes the per-cycle markdown+JSON report under
 ``reports/``, then runs the ASSESS-ADJUST-RERUN step: it applies the in-scope
@@ -39,6 +34,7 @@ The ``run`` command executes the matrix, writes the per-cycle markdown+JSON repo
 honestly (see ``adjust_and_rerun``). Prompt-wording findings are filed in the report's
 ``lead_findings`` for the lead, never applied.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -49,7 +45,10 @@ from pathlib import Path
 
 from . import report as report_mod
 from .runner import (
-    InfrastructureUnavailable, UnknownChallengeError, REPORTS_DIR, run_cycle,
+    InfrastructureUnavailable,
+    UnknownChallengeError,
+    REPORTS_DIR,
+    run_cycle,
 )
 
 
@@ -58,10 +57,13 @@ def _apply_council_threshold_dial(new_threshold: int) -> dict:
     council feature threshold (env-config, no prompt change). Returns the change record."""
     old = os.environ.get("CHUDWARE_COUNCIL_FEATURE_THRESHOLD", "5")
     os.environ["CHUDWARE_COUNCIL_FEATURE_THRESHOLD"] = str(new_threshold)
-    return {"knob": "CHUDWARE_COUNCIL_FEATURE_THRESHOLD", "from": old,
-            "to": str(new_threshold),
-            "change": f"lower council feature threshold {old} -> {new_threshold} "
-                      "(more parts get the four-seat review before build)"}
+    return {
+        "knob": "CHUDWARE_COUNCIL_FEATURE_THRESHOLD",
+        "from": old,
+        "to": str(new_threshold),
+        "change": f"lower council feature threshold {old} -> {new_threshold} "
+        "(more parts get the four-seat review before build)",
+    }
 
 
 def adjust_and_rerun(cycle_result, *, challenge_ids, tiers) -> tuple[list[dict], dict]:
@@ -86,6 +88,7 @@ def adjust_and_rerun(cycle_result, *, challenge_ids, tiers) -> tuple[list[dict],
     # deterministic measurement of its effect).
     from .challenges import load_challenge
     from .taxonomy import classify_ledger
+
     tight_grind = 0
     for c in cycle_result.cells:
         rd = Path(c.run_dir)
@@ -97,17 +100,23 @@ def adjust_and_rerun(cycle_result, *, challenge_ids, tiers) -> tuple[list[dict],
         recls = classify_ledger(lg, manifest=man, graded=c.graded, grind_threshold=2)
         tight_grind += sum(1 for x in recls if x.failure_class == "grind")
     tight_tax = {"grind": tight_grind}
-    applied.append({"knob": "gym.grind_threshold", "from": 3, "to": 2,
-                    "change": "tighten anti-grind sensitivity 3 -> 2 attempts"})
+    applied.append(
+        {
+            "knob": "gym.grind_threshold",
+            "from": 3,
+            "to": 2,
+            "change": "tighten anti-grind sensitivity 3 -> 2 attempts",
+        }
+    )
     deltas["grind_threshold_3_to_2"] = {
         "grind_before": base_tax.get("grind", 0),
         "grind_after": tight_tax.get("grind", 0),
         "delta": tight_tax.get("grind", 0) - base_tax.get("grind", 0),
         "measurable": True,
         "note": "deterministic reclassification of identical ledgers — a real delta. "
-                "The +delta is C3/seed3's 2-attempt n_verify_DL1 node, which fires grind "
-                "only once the threshold drops to 2: the assess-adjust-rerun loop actually "
-                "reclassifying a cell.",
+        "The +delta is C3/seed3's 2-attempt n_verify_DL1 node, which fires grind "
+        "only once the threshold drops to 2: the assess-adjust-rerun loop actually "
+        "reclassifying a cell.",
     }
 
     # 2) council feature threshold 5 -> 3 (config env applied; behavioural delta pending).
@@ -116,8 +125,8 @@ def adjust_and_rerun(cycle_result, *, challenge_ids, tiers) -> tuple[list[dict],
     deltas["council_threshold_5_to_3"] = {
         "measurable": False,
         "note": "applied to an in-process os.environ var ONLY (evaporates at process "
-                "exit; persists to no config file) — pass-rate delta needs a real model "
-                "in BUILD (mock replay does not convene councils) — pending-provision",
+        "exit; persists to no config file) — pass-rate delta needs a real model "
+        "in BUILD (mock replay does not convene councils) — pending-provision",
     }
     return applied, deltas
 
@@ -135,8 +144,13 @@ def cmd_run(args) -> int:
 
     cycle = args.cycle
     try:
-        cr = run_cycle(cycle=cycle, tiers=tiers, challenge_ids=challenge_ids,
-                       real=args.real, divisions=divisions)
+        cr = run_cycle(
+            cycle=cycle,
+            tiers=tiers,
+            challenge_ids=challenge_ids,
+            real=args.real,
+            divisions=divisions,
+        )
     except InfrastructureUnavailable as exc:
         print(f"gym {cycle}: status={exc.status}: {exc}", file=sys.stderr)
         return 2
@@ -152,17 +166,22 @@ def cmd_run(args) -> int:
     # The assess-adjust-rerun dials are mock-replay measurements; skip them for a
     # real run (the cells already executed genuinely; reclassifying is meaningless).
     if not args.no_adjust and not args.real:
-        applied, deltas = adjust_and_rerun(cr, challenge_ids=challenge_ids, tiers=cr.tiers)
+        applied, deltas = adjust_and_rerun(
+            cr, challenge_ids=challenge_ids, tiers=cr.tiers
+        )
 
     rep = report_mod.build_report(cr, applied_dials=applied, deltas=deltas)
     md, js = report_mod.write_report(rep, REPORTS_DIR)
 
     # DoD step 6: wire the cycle into Pillar 16 telemetry (training signal).
     from .telemetry import write_cycle_telemetry
+
     tel = write_cycle_telemetry(rep, REPORTS_DIR / "runs" / cycle)
 
-    print(f"gym {cycle}: mode={rep['execution_mode']} cells={rep['n_cells']} "
-          f"overall_pass={rep['pass_rates']['overall']:.3f}")
+    print(
+        f"gym {cycle}: mode={rep['execution_mode']} cells={rep['n_cells']} "
+        f"overall_pass={rep['pass_rates']['overall']:.3f}"
+    )
     print(f"  taxonomy: {rep['taxonomy']['counts']}")
     print(f"  report:   {md}")
     print(f"            {js}")
@@ -174,19 +193,27 @@ def cmd_diag(args) -> int:
     """Run diagnostic suites (tool_validity / vision_fix / feature_id / vc_hygiene)."""
     from .diag import run_diag, write_diag_results
 
-    tiers = [t.strip() for t in args.tiers.split(",") if t.strip()] if args.tiers else ["local-24k"]
+    tiers = (
+        [t.strip() for t in args.tiers.split(",") if t.strip()]
+        if args.tiers
+        else ["local-24k"]
+    )
     axes = [a.strip() for a in args.axes.split(",") if a.strip()] if args.axes else None
     results = run_diag(tiers, seed=args.seed, axes=axes)
     path = write_diag_results(results)
-    print(f"diag: tiers={results['tiers']} axes={results['axes']} mock={results['mock']}")
+    print(
+        f"diag: tiers={results['tiers']} axes={results['axes']} mock={results['mock']}"
+    )
     rows = results.get("results") or []
     for row in rows:
         mid = (row.get("model") or {}).get("id", row.get("tier"))
         if row.get("error"):
             print(f"  {mid}: ERROR {row['error']}")
             continue
-        scores = {ax: (payload.get("score") if isinstance(payload, dict) else None)
-                  for ax, payload in (row.get("axes") or {}).items()}
+        scores = {
+            ax: (payload.get("score") if isinstance(payload, dict) else None)
+            for ax, payload in (row.get("axes") or {}).items()
+        }
         print(f"  {mid}: {scores}")
     print(f"  wrote: {path}")
     if not rows or all(row.get("error") for row in rows):
@@ -200,30 +227,47 @@ def main(argv=None) -> int:
     sub = ap.add_subparsers(dest="cmd", required=True)
     r = sub.add_parser("run", help="run the challenge matrix + report")
     r.add_argument("--cycle", default="cycle-1")
-    r.add_argument("--tiers", default=None,
-                   help="comma list, e.g. local-24k,frontier-200k,openrouter:anthropic/claude-opus-4,xai:grok-4-5 "
-                        "— local tokenmaxxing tiers: local-24k (qwen3-4b), "
-                        "local-24k-gemma3-qat (gemma3-4b-qat, full GBNF), "
-                        "local-24k-gemma4-e4b (gemma4-e4b, GBNF backup); "
-                        "paid: openrouter:<model-id> (OPENROUTER_API_KEY), xai:<model-id> (OAuth or XAI_API_KEY)")
+    r.add_argument(
+        "--tiers",
+        default=None,
+        help="comma list, e.g. local-24k,frontier-200k,openrouter:anthropic/claude-opus-4,xai:grok-4-5 "
+        "— local tokenmaxxing tiers: local-24k (qwen3-4b), "
+        "local-24k-gemma3-qat (gemma3-4b-qat, full GBNF), "
+        "local-24k-gemma4-e4b (gemma4-e4b, GBNF backup); "
+        "paid: openrouter:<model-id> (OPENROUTER_API_KEY), xai:<model-id> (OAuth or XAI_API_KEY)",
+    )
     r.add_argument("--challenges", default=None, help="comma list, e.g. C1,C3")
-    r.add_argument("--division", default=None,
-                   help="comma list of divisions to schedule: local,open "
-                        "(default: derive per tier — local tiers→local, frontier→open)")
+    r.add_argument(
+        "--division",
+        default=None,
+        help="comma list of divisions to schedule: local,open "
+        "(default: derive per tier — local tiers→local, frontier→open)",
+    )
     r.add_argument("--smoke", action="store_true", help="C1 only, local tier, seed 1")
-    r.add_argument("--real", action="store_true",
-                   help="REAL execution: execute_dag=True + real agent_fn + resolved "
-                        "provider (honoured per-cell only when the probe reports "
-                        "real-runnable). T-W30.")
-    r.add_argument("--no-adjust", action="store_true", help="skip the assess-adjust-rerun step")
+    r.add_argument(
+        "--real",
+        action="store_true",
+        help="REAL execution: execute_dag=True through Chudcode, or an "
+        "explicit offline local provider, when the probe reports "
+        "real-runnable. T-W30.",
+    )
+    r.add_argument(
+        "--no-adjust", action="store_true", help="skip the assess-adjust-rerun step"
+    )
     r.set_defaults(func=cmd_run)
 
     d = sub.add_parser("diag", help="run diagnostic suites (leaderboard axes)")
-    d.add_argument("--tiers", default="local-24k",
-                   help="comma list of tiers, e.g. local-24k,openrouter:anthropic/claude-opus-4,xai:grok-4-5")
-    d.add_argument("--axes", default=None,
-                   help="comma list of axes (default: all four): "
-                        "tool_validity,vision_fix,feature_id,vc_hygiene")
+    d.add_argument(
+        "--tiers",
+        default="local-24k",
+        help="comma list of tiers, e.g. local-24k,openrouter:anthropic/claude-opus-4,xai:grok-4-5",
+    )
+    d.add_argument(
+        "--axes",
+        default=None,
+        help="comma list of axes (default: all four): "
+        "tool_validity,vision_fix,feature_id,vc_hygiene",
+    )
     d.add_argument("--seed", type=int, default=1, help="fixed seed (default 1)")
     d.set_defaults(func=cmd_diag)
 
@@ -231,10 +275,10 @@ def main(argv=None) -> int:
     return args.func(args)
 
 
-
 if __name__ == "__main__":
     # T-DP19: re-exec into the mcp-venv when this interpreter lacks the DAG deps, so
     # `--real` cells execute past PLAN instead of dying on the langgraph import.
     from tools.flywheel.bench.gym.runner import ensure_capable_interpreter
+
     ensure_capable_interpreter("tools.flywheel.bench.gym.cli")
     sys.exit(main())

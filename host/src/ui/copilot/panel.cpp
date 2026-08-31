@@ -25,6 +25,7 @@
 #include "core/engine_events.h"  // core::mirrorRecoveredDocs — Reopen a dismissed live agent doc
 #include "ui/ai/ai_prefs.h"      // ui::chatShowRenders — Artifacts render-thumbnail display pref
 #include "gl_compat.h"           // glDeleteTextures — LRU eviction of render thumbnails
+#include "ui/chudcode_session_actions.h"  // Chudcode session recovery (export/branch/repair/close)
 #include <string_view>
 
 namespace ui {
@@ -431,6 +432,364 @@ static bool hasProjectArtifact(const std::vector<ChatMsg>& msgs,
     return false;
 }
 
+// ---- Chudcode session recovery card (Sessions rows -> Manage) --------------------------------
+// Per-session export / diagnose / repair / branch / runtime-close against the exact worker
+// methods chudcode_export_session / chudcode_repair_session / chudcode_branch_session /
+// chudcode_close_session. ONE card is open at a time; every async completion is generation-
+// guarded so a card switched mid-flight never adopts a stale response.
+namespace {
+
+struct CcManageUi {
+    std::string convId;          // session the card is open for; empty = closed
+    uint64_t gen = 0;            // bumped on open/close — stale RPC completions drop
+    bool exportBusy = false, doctorBusy = false, closeBusy = false, branchBusy = false;
+    bool repairMode = false;     // the in-flight doctor call is a repair, not a dry-run
+    bool confirmRepair = false;  // inline confirm armed (explicit in-app confirmation)
+    std::string err;             // last action failure (inlineStatus)
+    std::string exportPath;      // last successful export destination
+    bool haveDoctor = false;
+    ui::ChudcodeDoctorSummary doctor;  // last diagnose/repair summary
+    std::string backupPath;      // backup written by the last repair
+
+    // Reset every field EXCEPT the generation, which must only ever advance — a reset that
+    // zeroed it would let a pre-reset RPC completion match a post-reset card again.
+    void reset() {
+        const uint64_t g = gen + 1;
+        *this = CcManageUi{};
+        gen = g;
+    }
+    void open(std::string id) {
+        reset();
+        convId = std::move(id);
+    }
+    void close() { reset(); }
+};
+CcManageUi s_ccm;
+
+constexpr const char* kCcNotLiveHint =
+    "Session runtime is not active \xe2\x80\x94 send a message in this session to resume it, "
+    "then retry.";
+
+// Shared refusal triage for every recovery completion. Returns true when the response was
+// consumed as a failure (latched-absent / transport / clean not-live refusal).
+bool ccConsumeFailure(const std::string& convId, const core::RpcResult& r, const char* what) {
+    if (chudcodeSessionRpcAbsent(r.ok, r.err, r.result)) {
+        chudcodeSessionServiceAvailable() = false;  // older service — whole surface off
+        return true;
+    }
+    if (!r.ok) {
+        s_ccm.err = std::string(what) + " failed: " + (r.err.empty() ? "worker error" : r.err);
+        return true;
+    }
+    if (chudcodeSessionNotLive(r.result)) {
+        // Clean refusal, not an error: the runtime is gone (restart / closed). Record the
+        // truth so the buttons disable with the resume hint instead of retrying.
+        chudcodeSessionLinkEnsure(convId).runtimeLive = false;
+        s_ccm.err = kCcNotLiveHint;
+        return true;
+    }
+    return false;
+}
+
+void ccStartExport(AppState& st, const std::string& convId, const std::string& outputPath) {
+    s_ccm.exportBusy = true;
+    s_ccm.err.clear();
+    const uint64_t gen = s_ccm.gen;
+    AppState* stp = &st;
+    st.rpc.call(kChudcodeExportSessionMethod,
+                chudcodeExportSessionParams(convId, outputPath),
+                [stp, gen, convId](const core::RpcResult& r) {
+        if (s_ccm.gen != gen) return;
+        s_ccm.exportBusy = false;
+        if (ccConsumeFailure(convId, r, "Export")) return;
+        ChudcodeExportResult res;
+        if (!parseChudcodeExportResult(r.result, res)) {
+            s_ccm.err = chudcodeActionError(r.result, "Export failed.");
+            return;
+        }
+        s_ccm.exportPath = res.path;
+        stp->toast(ui::ToastLevel::Success, "Transcript exported \xc2\xb7 " + res.path);
+        chatArtifactOpenSmart(*stp, res.path);  // export SHOWS its destination and OPENS it
+    }, 120000);
+}
+
+// One completion shape for Diagnose (repair=false, read-only) and Repair (repair=true,
+// backup-first): both return the bounded doctor summary; only repair may carry backup_path.
+void ccStartDoctor(AppState& st, const std::string& convId, bool repair) {
+    s_ccm.doctorBusy = true;
+    s_ccm.repairMode = repair;
+    s_ccm.confirmRepair = false;
+    s_ccm.err.clear();
+    const uint64_t gen = s_ccm.gen;
+    AppState* stp = &st;
+    st.rpc.call(kChudcodeRepairSessionMethod,
+                chudcodeRepairSessionParams(convId, repair),
+                [stp, gen, convId, repair](const core::RpcResult& r) {
+        if (s_ccm.gen != gen) return;
+        s_ccm.doctorBusy = false;
+        if (ccConsumeFailure(convId, r, repair ? "Repair" : "Diagnose")) return;
+        ChudcodeDoctorSummary summary;
+        if (!parseChudcodeDoctorSummary(r.result, summary)) {
+            s_ccm.err = chudcodeActionError(
+                r.result, repair ? "Repair returned no summary." : "Diagnose returned no summary.");
+            return;
+        }
+        s_ccm.haveDoctor = true;
+        s_ccm.doctor = summary;
+        if (!summary.backupPath.empty()) s_ccm.backupPath = summary.backupPath;
+        // Health (and any reported id/file) persists with the conversation.
+        applyChudcodeDoctor(chudcodeSessionLinkEnsure(convId), summary);
+        markChatHistoryDirty();
+        if (repair)
+            stp->toast(summary.changed ? ui::ToastLevel::Success : ui::ToastLevel::Info,
+                       summary.changed
+                           ? "Session file repaired \xe2\x80\x94 backup kept."
+                           : "Nothing to repair \xe2\x80\x94 session file left untouched.");
+    }, 120000);
+}
+
+void ccStartClose(AppState& st, const std::string& convId) {
+    s_ccm.closeBusy = true;
+    s_ccm.err.clear();
+    const uint64_t gen = s_ccm.gen;
+    AppState* stp = &st;
+    st.rpc.call(kChudcodeCloseSessionMethod, chudcodeCloseSessionParams(convId),
+                [stp, gen, convId](const core::RpcResult& r) {
+        if (s_ccm.gen != gen) return;
+        s_ccm.closeBusy = false;
+        if (chudcodeSessionRpcAbsent(r.ok, r.err, r.result)) {
+            chudcodeSessionServiceAvailable() = false;
+            return;
+        }
+        if (!r.ok) {
+            s_ccm.err = "Close failed: " + (r.err.empty() ? std::string("worker error") : r.err);
+            return;
+        }
+        if (!parseChudcodeCloseResult(r.result)) {
+            s_ccm.err = chudcodeActionError(r.result, "Close failed.");
+            return;
+        }
+        // Idempotent by contract: the runtime is gone either way; the persisted file stays.
+        chudcodeSessionLinkEnsure(convId).runtimeLive = false;
+        stp->toast(ui::ToastLevel::Info,
+                   "Runtime closed \xe2\x80\x94 transcript kept. Sending a message resumes it.");
+    }, 30000);
+}
+
+void ccStartBranch(AppState& st, const std::string& convId, const std::string& entryId) {
+    s_ccm.branchBusy = true;
+    s_ccm.err.clear();
+    const uint64_t gen = s_ccm.gen;
+    AppState* stp = &st;
+    st.rpc.call(kChudcodeBranchSessionMethod,
+                chudcodeBranchSessionParams(convId, entryId),
+                [stp, gen, convId](const core::RpcResult& r) {
+        if (s_ccm.gen == gen) s_ccm.branchBusy = false;
+        if (s_ccm.gen == gen && ccConsumeFailure(convId, r, "Branch")) return;
+        ChudcodeBranchResult br;
+        if (!parseChudcodeBranchResult(r.result, br)) {
+            if (s_ccm.gen == gen)
+                s_ccm.err = chudcodeActionError(r.result, "Branch failed.");
+            return;
+        }
+        AppState& st2 = *stp;
+        int idx = -1;
+        for (int i = 0; i < (int)st2.conversations.size(); ++i)
+            if (st2.conversations[i].id == convId) { idx = i; break; }
+        if (idx < 0) {
+            st2.toast(ui::ToastLevel::Warn,
+                      "Branch succeeded but the source session is gone \xe2\x80\x94 not mapped.");
+            return;
+        }
+        // Chudware lineage: the fork copies the transcript, revert branches and raw logs.
+        const int forkIdx = forkConversation(st2, idx);
+        if (forkIdx < 0) {
+            st2.toast(ui::ToastLevel::Error, "Branch succeeded but forking the session failed.");
+            return;
+        }
+        // The service branched the runtime in place, captured the child and disposed the
+        // runtime (backend contract). The ORIGINAL resumes later from its own persisted
+        // file; the FORK owns the returned child session id/file and resumes from those.
+        chudcodeSessionLinkEnsure(convId).runtimeLive = false;
+        ChudcodeSessionLink forkLink;
+        forkLink.sessionId = br.sessionId;
+        forkLink.sessionFile = br.sessionFile;
+        chudcodeSessionLinkSet(st2.conversations[forkIdx].id, std::move(forkLink));
+        markChatHistoryDirty();
+        st2.toast(ui::ToastLevel::Success,
+                  "Branched into \"" + st2.conversations[forkIdx].title +
+                      "\" \xe2\x80\x94 its next message resumes from the branch point.");
+        s_ccm.close();  // forkConversation switched to the new chat; the card follows
+    }, 60000);
+}
+
+// The expanded recovery card, drawn directly under its session row.
+void drawChudcodeManageCard(AppState& st, const Conversation& c, bool running) {
+    const std::string& convId = c.id;
+    const ChudcodeSessionLink* link = chudcodeSessionLink(convId);
+    const bool serviceOk = chudcodeSessionServiceAvailable();
+    const bool live = link && link->runtimeLive;
+    const bool busy = s_ccm.exportBusy || s_ccm.doctorBusy || s_ccm.closeBusy || s_ccm.branchBusy;
+    // One disabled-reason string per state — kit buttons show it as the tooltip, so the
+    // action is never hidden, only explained.
+    const char* whyNot = !serviceOk
+                             ? "The AI service does not offer session recovery (older service)."
+                         : running
+                             ? "A run is in progress on this session \xe2\x80\x94 wait for it to finish."
+                         : !live ? kCcNotLiveHint
+                         : busy  ? "Another recovery action is still running."
+                                 : nullptr;
+    const bool actionable = whyNot == nullptr;
+
+    ImGui::PushID(convId.c_str());
+    if (ui::kit::cardBegin("ccm_card", "Session recovery", "history")) {
+        if (!serviceOk) {
+            ui::kit::blockedState("Session recovery unavailable",
+                                  "The AI service does not provide session recovery methods.",
+                                  "Update the service, then reopen this panel.");
+        } else {
+            // ---- state row: runtime + persisted health --------------------------------------
+            ui::kit::chip(live ? "runtime active" : "runtime inactive",
+                          live ? ui::kit::Tone::Ok : ui::kit::Tone::Neutral, /*dot=*/true,
+                          live ? "This app process holds the live service-side session."
+                               : "No live runtime \xe2\x80\x94 sending a message resumes the "
+                                 "persisted session.");
+            ImGui::SameLine(0.0f, ui::metrics::U(1.0f));
+            const std::string health = link ? link->health : std::string();
+            const int hc = chudcodeHealthClass(health);
+            ui::kit::chip(chudcodeHealthLabel(health),
+                          hc == 0 ? ui::kit::Tone::Ok
+                                  : hc == 1 ? ui::kit::Tone::Warn : ui::kit::Tone::Neutral,
+                          /*dot=*/true, "Last session-file health verdict (persisted).");
+            if (link && !link->sessionId.empty())
+                ui::kit::keyValueRow("Chudcode session", link->sessionId.c_str(),
+                                     ui::kit::Tone::Neutral, /*copyable=*/true);
+            if (link && !link->sessionFile.empty())
+                ui::kit::keyValueRow("Session file", link->sessionFile.c_str(),
+                                     ui::kit::Tone::Neutral, /*copyable=*/true);
+            if (!link || (link->sessionId.empty() && link->sessionFile.empty()))
+                ui::kit::dimText("No Chudcode session recorded yet \xe2\x80\x94 send a message "
+                                 "in this session first.");
+
+            // ---- actions --------------------------------------------------------------------
+            // Export goes to the project chat-exports folder unless a destination is chosen.
+            if (ui::kit::secondaryButton(s_ccm.exportBusy ? "Exporting\xe2\x80\xa6" : "Export HTML",
+                                         actionable, whyNot))
+                ccStartExport(st, convId, std::string());
+            ImGui::SameLine(0.0f, ui::metrics::U(1.0f));
+            if (ui::kit::secondaryButton("Export to\xe2\x80\xa6", actionable, whyNot)) {
+                const std::string chosen = ui::saveFileDialog(
+                    "HTML (*.html)\0*.html\0All files (*.*)\0*.*\0", "html", c.title.c_str());
+                if (!chosen.empty()) ccStartExport(st, convId, chosen);
+            }
+            if (ImGui::IsItemHovered() && actionable)
+                ImGui::SetTooltip("Default destination: the project's chat-exports folder.");
+            ImGui::SameLine(0.0f, ui::metrics::U(1.0f));
+            if (ui::kit::secondaryButton(
+                    s_ccm.doctorBusy && !s_ccm.repairMode ? "Diagnosing\xe2\x80\xa6" : "Diagnose",
+                    actionable, whyNot))
+                ccStartDoctor(st, convId, /*repair=*/false);
+            if (ImGui::IsItemHovered() && actionable)
+                ImGui::SetTooltip("Read-only session-file check \xe2\x80\x94 changes nothing.");
+            ImGui::SameLine(0.0f, ui::metrics::U(1.0f));
+            if (ui::kit::secondaryButton(
+                    s_ccm.doctorBusy && s_ccm.repairMode ? "Repairing\xe2\x80\xa6" : "Repair\xe2\x80\xa6",
+                    actionable, whyNot))
+                s_ccm.confirmRepair = !s_ccm.confirmRepair;
+            ImGui::SameLine(0.0f, ui::metrics::U(1.0f));
+            if (ui::kit::secondaryButton(s_ccm.closeBusy ? "Closing\xe2\x80\xa6" : "Close runtime",
+                                         serviceOk && live && !running && !busy,
+                                         !live ? "No live runtime to close \xe2\x80\x94 already inactive."
+                                               : whyNot))
+                ccStartClose(st, convId);
+            if (ImGui::IsItemHovered() && live && !running)
+                ImGui::SetTooltip("Stops the service-side process only. The transcript and the "
+                                  "persisted session file are kept \xe2\x80\x94 unlike Delete.");
+
+            // Explicit in-app confirmation before anything rewrites the session file.
+            if (s_ccm.confirmRepair) {
+                ui::kit::dimText("Repair rewrites the session file after saving a backup. "
+                                 "Findings that would require inventing data are left untouched.");
+                if (ui::kit::dangerButton("Repair now", actionable, whyNot))
+                    ccStartDoctor(st, convId, /*repair=*/true);
+                ImGui::SameLine(0.0f, ui::metrics::U(1.0f));
+                if (ui::kit::secondaryButton("Cancel")) s_ccm.confirmRepair = false;
+            }
+
+            if (!s_ccm.err.empty()) ui::kit::inlineStatus(s_ccm.err.c_str(), ui::kit::Tone::Err);
+
+            // ---- last export ----------------------------------------------------------------
+            if (!s_ccm.exportPath.empty()) {
+                ui::kit::keyValueRow("Exported to", s_ccm.exportPath.c_str(),
+                                     ui::kit::Tone::Ok, /*copyable=*/true);
+                if (ui::haveOsFileManager() && ui::kit::secondaryButton("Show in folder"))
+                    ui::revealInFileManager(s_ccm.exportPath);
+            }
+
+            // ---- doctor summary -------------------------------------------------------------
+            if (s_ccm.haveDoctor) {
+                const ChudcodeDoctorSummary& d = s_ccm.doctor;
+                const int hcd = chudcodeHealthClass(d.status);
+                ui::kit::sectionHeader(d.mode == "repair" ? "Repair result" : "Diagnosis",
+                                       nullptr, nullptr, -1, false);
+                ui::kit::chip(chudcodeHealthLabel(d.status),
+                              hcd == 0 ? ui::kit::Tone::Ok
+                                       : hcd == 1 ? ui::kit::Tone::Warn : ui::kit::Tone::Neutral,
+                              /*dot=*/true);
+                if (d.findingCount > 0) {
+                    char line[128];
+                    std::snprintf(line, sizeof(line), "%d finding%s \xc2\xb7 %d repairable%s",
+                                  d.findingCount, d.findingCount == 1 ? "" : "s",
+                                  d.repairableFindingCount < 0 ? 0 : d.repairableFindingCount,
+                                  d.remainingFindingCount > 0 ? " \xc2\xb7 issues remain" : "");
+                    ui::kit::dimText(line);
+                }
+                if (!s_ccm.backupPath.empty()) {
+                    ui::kit::keyValueRow("Backup", s_ccm.backupPath.c_str(),
+                                         ui::kit::Tone::Neutral, /*copyable=*/true);
+                    if (ui::haveOsFileManager() && ui::kit::secondaryButton("Show backup"))
+                        ui::revealInFileManager(s_ccm.backupPath);
+                }
+                for (int fi = 0; fi < (int)d.findings.size(); ++fi) {
+                    const ChudcodeDoctorFinding& f = d.findings[fi];
+                    ImGui::PushID(fi);
+                    ui::kit::chip(f.code.empty() ? "finding" : f.code.c_str(),
+                                  f.repairable ? ui::kit::Tone::Warn : ui::kit::Tone::Err,
+                                  /*dot=*/false,
+                                  f.repairable ? "Repair can fix this finding."
+                                               : "Not automatically repairable.");
+                    if (!f.entryId.empty()) {
+                        // A finding anchored on a Chudcode DAG entry is a branch point: fork
+                        // this conversation and continue from just before the damage.
+                        ImGui::SameLine(0.0f, ui::metrics::U(1.0f));
+                        if (ui::kit::secondaryButton(
+                                s_ccm.branchBusy ? "Branching\xe2\x80\xa6" : "Branch here",
+                                actionable && !s_ccm.branchBusy, whyNot))
+                            ccStartBranch(st, convId, f.entryId);
+                        if (ImGui::IsItemHovered() && actionable)
+                            ImGui::SetTooltip("Fork this session and continue from entry %s "
+                                              "(the original keeps its full history).",
+                                              f.entryId.c_str());
+                    }
+                    if (!f.message.empty()) ui::kit::dimText(f.message.c_str());
+                    ImGui::PopID();
+                }
+                if (hcd == 1 && !d.findings.empty() &&
+                    std::none_of(d.findings.begin(), d.findings.end(),
+                                 [](const ChudcodeDoctorFinding& f) { return !f.entryId.empty(); }))
+                    ui::kit::dimText("No finding is anchored on a session entry \xe2\x80\x94 "
+                                     "branching is unavailable for this damage.");
+            }
+        }
+    }
+    ui::kit::cardEnd();
+    ImGui::PopID();
+    ui::kit::gapRow();
+}
+
+}  // namespace
+
+
 // Sessions list — replaces the chat log while open so users can jump between sessions easily.
 void drawSessionsPanel(AppState& st, bool busy) {
     (void)busy;  // runs are per-conversation; this panel never locks on the viewed run
@@ -525,6 +884,7 @@ void drawSessionsPanel(AppState& st, bool busy) {
         const char* archLabel = c.archived ? "Restore" : "Archive";
         const float archBtnW = ImGui::CalcTextSize(archLabel).x + 16.0f * sc;
         const float forkBtnW = ImGui::CalcTextSize("Fork").x + 16.0f * sc;
+        const float manageBtnW = ImGui::CalcTextSize("Manage").x + 16.0f * sc;
         const float actionGap = 4.0f * sc;
         // Action-zone geometry must be computed ONCE and shared by the title clip and the
         // buttons below: the reserve used to assume the trash button was trashSz wide, but
@@ -534,8 +894,8 @@ void drawSessionsPanel(AppState& st, bool busy) {
         const float delBtnW = delImg + style.FramePadding.x * 2.0f;
         const float delBtnH = delImg + style.FramePadding.y * 2.0f;
         const float rightMargin = 4.0f * sc;
-        const float actionsW = delBtnW + archBtnW + forkBtnW +
-                               actionGap * 2.0f + rightMargin;
+        const float actionsW = delBtnW + archBtnW + forkBtnW + manageBtnW +
+                               actionGap * 3.0f + rightMargin;
 
         ImGui::PushID(i);
         const ImVec2 rowMin = ImGui::GetCursorScreenPos();
@@ -698,6 +1058,7 @@ void drawSessionsPanel(AppState& st, bool busy) {
         bool doDel = false;
         bool doArchiveToggle = false;
         bool doFork = false;
+        bool doManage = false;
         if (rowHot) {
             const float delX = rowMax.x - delBtnW - rightMargin;
             ImGui::SetCursorScreenPos(ImVec2(delX, rowMin.y + (rowH - delBtnH) * 0.5f));
@@ -725,10 +1086,25 @@ void drawSessionsPanel(AppState& st, bool busy) {
             doFork = ImGui::Button("Fork", ImVec2(forkBtnW, delBtnH));
             if (ImGui::IsItemHovered())
                 ImGui::SetTooltip("Fork this session into a new idle copy");
+
+            const float mgX = forkX - manageBtnW - actionGap;
+            ImGui::SetCursorScreenPos(ImVec2(mgX, rowMin.y + (rowH - delBtnH) * 0.5f));
+            doManage = ImGui::Button("Manage", ImVec2(manageBtnW, delBtnH));
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip(s_ccm.convId == c.id
+                    ? "Hide session recovery"
+                    : "Session recovery: export, diagnose/repair, branch, close runtime");
         }
 
         ImGui::SetCursorScreenPos(ImVec2(rowMin.x, rowMax.y + rowGap));
         ImGui::PopID();
+        // Toggle + draw the recovery card directly under its own row (persists while the
+        // pointer leaves the row — only the toggle button is hover-gated, not the card).
+        if (doManage) {
+            if (s_ccm.convId == c.id) s_ccm.close();
+            else s_ccm.open(c.id);
+        }
+        if (s_ccm.convId == c.id) drawChudcodeManageCard(st, c, running);
         if (doDel) { closeConversation(st, i); break; }
         if (doFork) { forkConversation(st, i); break; }
         if (doArchiveToggle) { archiveConversation(st, i, !c.archived); break; }

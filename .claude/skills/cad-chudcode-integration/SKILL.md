@@ -1,0 +1,170 @@
+---
+name: cad-chudcode-integration
+description: "Extend or debug Chudware's compiled Chudcode RPC integration: persistent sessions, host tools, control, auth, memory, events, recovery, and release artifacts"
+---
+
+# Chudware ↔ Chudcode integration
+
+Use this skill for online agent execution, provider/auth/model settings, session persistence or
+recovery, memory, compaction/retry, browser/computer, STT, streamed events, host-tool dispatch,
+or the embedded Chudcode release artifact.
+
+Read `.claude/skills/chudware-dev/SKILL.md` first for the repository map and global lifecycle
+rules. Contracts are append-only. The frozen material under `docs/omp-integration/` is dated
+provenance; only its 2026-08-31 superseding section is operational.
+
+## Authority boundary
+
+- Chudcode owns every online top-level and nested provider call, auth, model catalog/selection,
+  persistent session history, branching, memory, compaction, retry/cache behavior,
+  browser/computer tools, and STT.
+- Chudware owns CAD tools and schemas, documents/workspaces, roles, councils, mission/DAG
+  policy, delegation governance, approvals, guardrails, PLM, event presentation, and the
+  offline-safe native local-modeling fallback.
+- `chudcode --mode rpc` protocol v2 is the sole embedding protocol. Do not introduce another
+  online provider loop, an external MCP hop, or a runtime source/package install.
+
+## Current topology
+
+```text
+host GUI / hostd
+  -> core/agent/run.cpp
+  -> persistent services worker (core/hostd/worker_bridge.cpp)
+  -> services/worker_main.py::agent_admin_turn
+  -> services/agent/worker_rpc.py::_agent_admin_turn
+  -> services/agent/chudcode_host.py::ChudcodeSessionHost
+  -> chudcode_rpc.RpcClient
+  -> compiled chud --mode rpc
+```
+
+`services/worker_main.py` is long-lived. Its process-global `ChudcodeSessionHost` owns one
+persistent RPC process per Chudware conversation. `worker_rpc._agent_admin_turn` assembles the
+CAD role prompt, workspace, effective host-tool set, callbacks, and event context before it
+hands the turn to that host. Nested provider execution stays in Chudcode.
+
+Ordinary calls and event notifications use the services worker's newline-delimited stdio
+protocol. Stop/steer/status cannot wait behind a blocked turn, so `worker_main` also starts
+`services/agent/chudcode_control.py::ControlServer`. `worker_control_info` returns its private
+authenticated endpoint: mode-0600 Unix socket on POSIX, random loopback TCP on Windows. Never
+log the token or move control back onto the serialized stdio lane.
+
+## Files by responsibility
+
+| File | Responsibility |
+|---|---|
+| `services/agent/chudcode_host.py` | Persistent/transient RPC clients, session LRU, turn configuration, cancel/steer/status, typed auth/memory/session calls, attachments |
+| `services/agent/chudcode_control.py` | Bounded authenticated control server and platform endpoint |
+| `services/agent/chudcode_tools.py` | Live CAD registry → run-scoped Chudcode host-tool definitions and guarded dispatch |
+| `services/agent/chudcode_events.py` | Deterministic bounded RPC-frame → Chudware feed-event mapping |
+| `services/agent/chudcode_roles.py` | CAD role/prompt conversion at the Chudcode boundary |
+| `services/agent/worker_rpc.py` | Public worker methods, online turn assembly, settings/auth/memory/session seams |
+| `services/worker_main.py` | Persistent worker entrypoint, control-server lifetime, global Chudcode shutdown |
+| `services/worker/worker_client.cpp` | Native worker transport, online/offline route split, control-lane client |
+| `core/agent/run.cpp` | Native top-level entry and online handoff; offline-safe fallback only |
+| `vendor/chudcode/CHUDCODE_ARTIFACT.lock` | Compiled release identity for all supported targets |
+| `scripts/pin_chudcode.py` | Pin/check/verify/stage/fetch the compiled artifact |
+| `assets/ui-shared-manifest.json` | Checked-in `chud-ui-shared-v1` vocabulary copied byte-for-byte from Chudcode |
+
+## Session and lifecycle rules
+
+- Chudware `session_id` is the live host key. A `chudcode_session_file` can seed a new live
+  process and cannot change while that process is live.
+- Capacity is bounded by `CHUDWARE_CHUDCODE_MAX_SESSIONS` (default 8, maximum 32). Evict only
+  the least-recently-used idle session; if all are active, refuse the new session.
+- `run_id` is unique while active. Cancel before prompt returns a valid cancelled result;
+  cancel after prompt sends `abort()` once. Duplicate cancel and identical steer are
+  idempotent. Pre-start steering queues until immediately after `prompt()`.
+- A turn must observe terminal `agent_end` after `wait_for_idle`; idle without it is a protocol
+  error. Event-forwarding errors fail the result rather than hiding a broken UI boundary.
+- `chudcode_close_session {session_id}` is idempotent: mark active runs cancelled, abort live
+  work, dispose the process, and preserve persisted history.
+- On worker exit, stop the control server before disposing all saved-session and transient
+  clients. Do not leave an RPC process detached from the worker that owns it.
+
+## Recovery/export worker methods
+
+- `chudcode_export_session {session_id,output_path?}` calls live Chudcode HTML export and
+  returns `{ok,path}`. Without `output_path`, use the project's `chat-exports` directory.
+- `chudcode_branch_session {session_id,entry_id}` creates a real branch at the specified entry
+  and returns `{ok,chudcode_session_id,chudcode_session_file}`.
+- `chudcode_repair_session {session_id,repair:false}` returns a bounded doctor summary.
+  `repair:true` invokes Chudcode `/session doctor --repair`, including its backup workflow.
+- `chudcode_close_session {session_id}` disposes runtime state without deleting the persisted
+  file.
+
+Never hand-edit session JSONL, invent an entry id, or report a repair that did not come from the
+runtime's doctor command.
+
+## Host-tool rules
+
+1. Build tools from the live CAD MCP/mission registries with
+   `chudcode_tools.build_host_tools`; it is an adapter, not another catalog.
+2. Preserve allowlist tri-state: `None` unrestricted, `[]` restricted to live floors,
+   non-empty list ordinarily restricted. Apply mode/category/meta/bug-report floors and add
+   `verify_battery` when mutating tools are present before rendering schemas.
+3. Advertise and dispatch the same effective set. Skip unbound and async-only entries.
+   Chudcode builtin names remain Chudcode-owned unless a CAD registry entry explicitly claims
+   ownership.
+4. Dispatch through CAD policy, cancellation, mission/run resolver, scaffold/guardrail checks,
+   and `agent_turn._dispatch_tool` accounting/loop guard. Preserve document/run/actor context
+   injection and progress/cancel callbacks.
+5. Return policy and guardrail refusals in their machine-readable failure shapes. Let tool
+   exceptions propagate as tool errors. Normalize successful values to finite JSON-safe data;
+   never fabricate success.
+
+## Event rules
+
+`chudcode_events.map_rpc_frame` is the only translation authority.
+
+- Only streamed deltas produce visible assistant text. Final message envelopes are lifecycle
+  records; replaying their content double-renders text.
+- Preserve `text`/`thinking` channels. Empty text flushes are not thinking boundaries.
+- Start/progress tool events map to status. A terminal result/cancel maps once to
+  `agent.tool_call`, keyed by the real tool-call id. A synchronous host call already carrying
+  a result is terminal.
+- Preserve correlation (`run_id`, `session_id`, node/span/parent/subagent ids), but synthesize
+  only deterministic digest ids when the source omitted one.
+- Unknown frames remain visible as bounded deterministic `sub_run` rows. Never drop them or
+  guess a stronger semantic event.
+- Provider usage maps to both `agent.provider_usage` and `agent.context`; todos, retry,
+  compaction, fallback, spawn/subagent, and terminal events retain their existing feed shapes.
+
+## Auth, memory, and settings
+
+Use `ChudcodeSessionHost.transient_call` for service-level auth/model/memory operations; those
+clients run with `no_session=True` and are always disposed after the call. Use `session_call`
+only for an already-live session: stats/state, compact/handoff, auto-compaction/auto-retry, and
+STT. A status/settings request must not silently create or resume a conversation.
+
+Secrets stay in typed `chudcode_rpc` wrappers. UI responses may expose state, account labels,
+usage, and model metadata, never credential bytes. Login UI requests are bounded and allow only
+safe web URLs before they enter Chudware's `extension_ui_request` event.
+
+## Binary and release workflow
+
+Runtime binary lookup order is explicit constructor hint, `CHUDWARE_CHUDCODE_BIN`, canonical
+`chud`/`chud.exe` beside the packaged Python executable, then developer `PATH`. Production must
+use the signed-payload-adjacent binary.
+
+`vendor/chudcode/CHUDCODE_ARTIFACT.lock` uses schema `chudcode-artifact-lock-v1` and records
+Chudcode product version, repository commit, RPC protocol 2, and URL/SHA-256 for exactly
+`linux-x86_64`, `linux-aarch64`, `macos-x86_64`, `macos-arm64`, and `windows-x86_64`. Null URL
+and digest fields intentionally make packaging fail closed.
+
+```bash
+python3 scripts/pin_chudcode.py check-lock
+python3 scripts/pin_chudcode.py verify --target linux-x86_64 --input /secure/chud-linux-x86_64
+python3 scripts/pin_chudcode.py stage --target linux-x86_64 \
+  --input /secure/chud-linux-x86_64 --output /tmp/chud
+```
+
+`stage` is offline, verifies target/digest/version before and after copy, and publishes only the
+canonical filename atomically. Only explicit `fetch` performs network I/O. Pin all five targets
+atomically; partial lock updates are invalid.
+
+## Shared UI vocabulary
+
+CAD's `assets/ui-shared-manifest.json` must be byte-identical to Chudcode's file and declare
+`chud-ui-shared-v1`. It shares palette tokens, tone/status vocabulary, usage thresholds, font
+provenance, and small product icons. It does not share runtime state or widget code: Chudware
+keeps an independent C++ implementation and remains authoritative for CAD-specific UI state.

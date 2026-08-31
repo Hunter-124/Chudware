@@ -788,12 +788,10 @@ std::string fmtTokens(int n) {
 // first hit wins:
 //   1. settings.contextWindow — the user's explicit override in AI settings. Beats everything;
 //      a local endpoint no catalog knows about is exactly why the override exists.
-//   2. The OMP bridge model catalog row for the SELECTED (provider, model): the real window the
-//      provider reports, so a probed model shows its true capacity instead of a guess.
-//   3. ui::defaultContextWindowForModel() WITH that catalog row folded into a ModelInfo probe.
-//      Its substring guess table (…"claude" -> 200k… default 8192) is now the last resort only,
-//      reached when the catalog has no usable row at all: cold cache, managed llama.cpp, or an
-//      id the sidecar never listed.
+//   2. Cached model catalog metadata for the selected (provider, model): the real window the
+//      provider reports, so a known model shows its capacity instead of a guess.
+//   3. ui::defaultContextWindowForModel() with that catalog row folded into a ModelInfo probe.
+//      Its substring guess table is the last resort when the catalog has no usable row.
 // This is no longer a plain mirror of core default_context_window: the most authoritative value
 // of all is st.lastContextWindow (what the server reported for the model that ACTUALLY ran),
 // which outranks every branch here. The composer's context meter applies it — this function only
@@ -825,7 +823,7 @@ int effectiveContextWindow(const Settings& s) {
             if (bm->contextWindow > 0) win = bm->contextWindow;
             probe  = modelInfoFromProbe(s.provider, model, bm->name, bm->contextWindow,
                                         bm->maxTokens, bm->vision, bm->tools,
-                                        bm->reasoningEfforts, "omp");
+                                        bm->reasoningEfforts, "catalog");
             probeP = &probe;
         }
         // The probe carries that same catalog window, so this only differs from `win` when the

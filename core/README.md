@@ -35,7 +35,7 @@ core/
     sourcing/ vendor registry, spec match, quotes, costing, BOM
     firmware/ MCU emulator, sensor models, toolchains, co-verify
   Agent, daemon & device
-    agent/    copilot runtime: roles, providers, auth, OMP bridge client
+    agent/    copilot runtime: roles, local providers, auth, orchestration
     hostd/    chudware-hostd daemon: server, doc registry, worker bridge, mfg lane
     device/   machine transports: GRBL protocol/adapter, emulator, capability
   Infrastructure

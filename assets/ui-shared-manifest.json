@@ -1,0 +1,204 @@
+{
+  "schema": "chud-ui-shared-v1",
+  "contractVersion": 1,
+  "scope": "Names, thresholds, and asset provenance shared by Chudcode and Chudware; implementations and color values remain product-owned.",
+  "semanticRoles": [
+    "windowBg",
+    "panelBg",
+    "headerBg",
+    "popupBg",
+    "statusBg",
+    "border",
+    "borderStrong",
+    "shadow",
+    "text",
+    "textDim",
+    "textDisabled",
+    "textOnAccent",
+    "button",
+    "buttonHovered",
+    "buttonActive",
+    "frameBg",
+    "frameHovered",
+    "frameActive",
+    "accent",
+    "accentDim",
+    "secondary",
+    "secondaryDim",
+    "accentSoft",
+    "accentMid",
+    "accentSelection",
+    "accentHover",
+    "accentOverlayBorder",
+    "accentChip",
+    "accentTreeHover",
+    "codeBg",
+    "proseBg",
+    "proseText",
+    "statusOk",
+    "statusWarn",
+    "statusErr",
+    "statusInfo",
+    "statusPending",
+    "statusOkWash",
+    "statusWarnWash",
+    "statusErrWash",
+    "statusInfoWash",
+    "statusPendingWash",
+    "graphNeutral",
+    "graphAccent",
+    "graphOk",
+    "graphWarn",
+    "graphErr",
+    "graphInfo",
+    "glassBg",
+    "glassBorder",
+    "glassHighlight",
+    "glassShadow",
+    "glassText",
+    "glassTextDim",
+    "glassRow",
+    "glassCard",
+    "glassSelectionGlow",
+    "gaugeTrack",
+    "gaugeFill",
+    "gaugeSecondary",
+    "gaugeOverflow",
+    "scrollPillTrack",
+    "scrollPillThumb",
+    "scrollPillHovered",
+    "scrollPillActive",
+    "tabStripBg",
+    "tabBg",
+    "tabHovered",
+    "tabActive",
+    "tabUnderline",
+    "rule",
+    "disabledWash",
+    "focusRing",
+    "usageTrack",
+    "usageOk",
+    "usageWarn",
+    "usageErr",
+    "usageUnknown",
+    "attachmentBg",
+    "attachmentBorder",
+    "attachmentHovered",
+    "attachmentSelected",
+    "dagEdge",
+    "dagEdgeActive",
+    "dagNodeBg",
+    "dagNodeHovered"
+  ],
+  "surfaceRoleSemantics": {
+    "usageTrack": "Unused context capacity.",
+    "usageOk": "Known usage below the warning threshold.",
+    "usageWarn": "Known usage at or above warning and below critical.",
+    "usageErr": "Known usage at or above critical.",
+    "usageUnknown": "Usage absent or not authoritative; never represents zero.",
+    "attachmentBg": "Attachment preview body surface.",
+    "attachmentBorder": "Attachment preview resting outline.",
+    "attachmentHovered": "Attachment preview transient hover surface.",
+    "attachmentSelected": "Attachment preview persistent selection state.",
+    "dagEdge": "Resting session-DAG relationship.",
+    "dagEdgeActive": "Selected or live session-DAG relationship.",
+    "dagNodeBg": "Resting session-DAG node surface.",
+    "dagNodeHovered": "Session-DAG node hover surface."
+  },
+  "tones": [
+    "Neutral",
+    "Accent",
+    "Ok",
+    "Warn",
+    "Err",
+    "Info"
+  ],
+  "densities": [
+    "Compact",
+    "Cozy",
+    "Roomy"
+  ],
+  "animationSeconds": {
+    "instant": 0.08,
+    "fast": 0.14,
+    "base": 0.22,
+    "slow": 0.38,
+    "stagger": 0.02,
+    "breathe": 2.4,
+    "march": 1.1,
+    "maxDeltaTime": 0.05
+  },
+  "usageThresholds": {
+    "warning": 0.5,
+    "critical": 0.9
+  },
+  "iconPipeline": {
+    "version": "chudcode-icons-v1",
+    "manifest": "gui/assets/icons/atlas.json",
+    "generator": "gui/scripts/make_icons.py",
+    "cellSizes": [
+      20,
+      32
+    ],
+    "license": "LicenseRef-Chud-In-House"
+  },
+  "fonts": {
+    "license": {
+      "spdx": "OFL-1.1",
+      "text": "gui/assets/fonts/OFL.txt"
+    },
+    "provenance": {
+      "Rubik": "Copyright 2015 The Rubik Project Authors (https://github.com/googlefonts/rubik); shared product bytes frozen by SHA-256.",
+      "JetBrains Mono": "Copyright 2020 The JetBrains Mono Project Authors (https://github.com/JetBrains/JetBrainsMono); shared product bytes frozen by SHA-256."
+    },
+    "files": [
+      {
+        "file": "Rubik-Regular.ttf",
+        "path": "gui/assets/fonts/Rubik-Regular.ttf",
+        "family": "Rubik",
+        "weight": 400,
+        "sha256": "f143dbaec0821f3a8f090cdf47228198c7ca569d311458e4901ce6a9fc918304"
+      },
+      {
+        "file": "Rubik-Medium.ttf",
+        "path": "gui/assets/fonts/Rubik-Medium.ttf",
+        "family": "Rubik",
+        "weight": 500,
+        "sha256": "72e2efa7755011d26bf5af8ced5a83e7fdb5a12b363b313f3ab9ae2979a8e26d"
+      },
+      {
+        "file": "Rubik-SemiBold.ttf",
+        "path": "gui/assets/fonts/Rubik-SemiBold.ttf",
+        "family": "Rubik",
+        "weight": 600,
+        "sha256": "cd2f09dfa112936487d6d1f70b4b8e6697d2875625e2f55e00c4d63a12c54ab8"
+      },
+      {
+        "file": "Rubik-Bold.ttf",
+        "path": "gui/assets/fonts/Rubik-Bold.ttf",
+        "family": "Rubik",
+        "weight": 700,
+        "sha256": "5bad3810660eac7e3ad47f22cc835f083a5926d308aa04b5bb9c3371bcb4fa45"
+      },
+      {
+        "file": "JetBrainsMono-Regular.ttf",
+        "path": "gui/assets/fonts/JetBrainsMono-Regular.ttf",
+        "family": "JetBrains Mono",
+        "weight": 400,
+        "sha256": "e6fd0d7e91550b3ed2b735d4312474362c4716edc4fc0577a0f61ed782d5aed1"
+      },
+      {
+        "file": "JetBrainsMono-Medium.ttf",
+        "path": "gui/assets/fonts/JetBrainsMono-Medium.ttf",
+        "family": "JetBrains Mono",
+        "weight": 500,
+        "sha256": "d16e6dc99672734698d629705f617c79f6eb6040f5113efe3a145204dc988109"
+      }
+    ]
+  },
+  "chudcodeImplementation": {
+    "themeHeader": "gui/src/theme/theme.h",
+    "animationHeader": "gui/src/theme/anim.h",
+    "kitHeader": "gui/src/widgets/kit.h"
+  }
+}

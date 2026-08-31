@@ -1,7 +1,7 @@
 """Mega-6 live harness-fix regressions (Fixer6 = StaticOwl).
 
 Watch-list from mega-5 findings + mega-6 attempt-1 openrouter auth wipe:
-  1. keyless openrouter never auto_picked / never constructed
+  1. keyless openrouter never auto_picked
   2. child join handoff not null when child had tools / success
   3. provider token usage recorded into turn result + ledger
   4. BUILD geometry roles keep new_part/add_features + tool floor ≥8
@@ -10,11 +10,8 @@ Watch-list from mega-5 findings + mega-6 attempt-1 openrouter auth wipe:
 
 from __future__ import annotations
 
-import pytest
-
-
 # ---------------------------------------------------------------------------
-# 1. Keyless openrouter must not be offered or constructed
+# 1. Keyless openrouter must not be offered
 # ---------------------------------------------------------------------------
 
 
@@ -61,14 +58,6 @@ def test_auto_pick_depth0_without_openrouter_key_picks_xai(monkeypatch):
     )
     assert a.provider != "openrouter", a
     assert a.provider == "xai-sub", a
-
-
-def test_openrouter_construction_requires_key(monkeypatch):
-    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
-    from services.agent import config as agent_config
-
-    with pytest.raises(ValueError, match="API key"):
-        agent_config.get_provider(name="openrouter", cfg={"model": "x"})
 
 
 def test_openrouter_enabled_when_key_present(monkeypatch):

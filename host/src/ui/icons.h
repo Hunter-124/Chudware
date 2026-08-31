@@ -10,6 +10,13 @@
 
 namespace ui {
 
+// Shared UI contract (chud-ui-shared-v1): both products bake their (product-specific) icon
+// pipelines onto the same two cell sizes, so cross-product widget specs can talk about
+// "small"/"large" icons and mean the same pixels. scripts/verify-ui-shared.py checks these
+// against the manifest's iconPipeline.cellSizes and every atlas.json cell key.
+inline constexpr int kIconCellSmall = 20;
+inline constexpr int kIconCellLarge = 32;
+
 struct IconUV {
     ImTextureID texId;
     ImVec2      uv0;
@@ -25,9 +32,9 @@ void loadIcons(const std::string& assetsDir);
 // Release GL textures.  Call before ImGui/GL teardown.
 void freeIcons();
 
-// Query an icon.  size should be 32 or 20.
+// Query an icon.  size should be kIconCellLarge (32) or kIconCellSmall (20).
 // Returns a placeholder (magenta) and emits one stderr warning if name is unknown.
-IconUV getIcon(const char* name, int size = 32);
+IconUV getIcon(const char* name, int size = kIconCellLarge);
 
 // Maps a referenced icon name to an existing atlas glyph when it has no dedicated cell (single
 // source of truth for icon fallbacks; see icons.cpp). Returns `name` unchanged if not aliased.

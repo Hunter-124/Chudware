@@ -10,6 +10,7 @@
                                  // agent-execution DAG with the active session's artifacts.
 
 #include "conv_ids.h"  // session-id allocation (GL-free TU, unit-tested in host/tests)
+#include "ui/chudcode_session_actions.h"  // per-conversation Chudcode session link (GL-free TU)
 #include <algorithm>
 #include <cctype>
 #include <filesystem>
@@ -891,6 +892,7 @@ void persistChatHistory(AppState& st) {
             writtenIds.insert(st.conversations[i].id);
             st.addLog("[chat] duplicate session id '" + clashed + "' re-keyed to '" +
                       st.conversations[i].id + "' (transcript kept)");
+            chudcodeSessionLinkRekey(clashed, st.conversations[i].id);
         }
         if (i == st.activeConv) activeId = st.conversations[i].id;
         // One serializer, used for the live transcript AND for any revert branches parked
@@ -1041,6 +1043,8 @@ void persistChatHistory(AppState& st) {
             convObj["doc"] = st.conversations[i].docLink;
         convObj["scope"] = st.conversations[i].scopeClass;  // rail color-code (-1 = unassessed)
         if (st.conversations[i].archived) convObj["archived"] = true;
+        // Chudcode runtime link (id/file/health) — metadata only, never a second transcript.
+        chudcodeLinkPersist(st.conversations[i].id, convObj);
         // Every session owns its agent-execution DAG (the live store is conversation-keyed) —
         // save each one as a session artifact so the workflow trace survives a reopen.
         nlohmann::json dag = ui::agentDagToJson(st.conversations[i].id);
@@ -1345,6 +1349,9 @@ static bool parseChatSessionJson(AppState& st, const nlohmann::json& jc,
         // A session reverted all the way back still holds its branches — that is user
         // history, and dropping it here would make the revert unrecoverable.
         if (c.msgs.empty() && c.queuedPrompts.empty() && c.branches.empty()) return false;
+        // Chudcode runtime link (id/file/health): restore into the conversation-keyed
+        // registry only for sessions that are actually kept.
+        chudcodeLinkRestore(c.id, jc);
         st.conversations.push_back(std::move(c));
     }
     return true;
@@ -1373,6 +1380,8 @@ void loadChatHistory(AppState& st) {
     for (auto& c : st.conversations) freeChatTextures(c.msgs);
     st.conversations.clear();
     st.activeConv = -1;
+    // The Chudcode link registry mirrors the resident set — rebuild it with the store.
+    chudcodeSessionLinksClear();
 
     bool migratedLegacy = false;
     bool recoveredOrphan = false;
@@ -1697,6 +1706,58 @@ static void relinkSavedDocSessions(AppState& st) {
     if (relinked) markChatHistoryDirty();
 }
 
+// ---- Chudcode session recovery: service latch + post-turn metadata/health capture ----------
+// One latch for the whole surface: flipped false on the first unknown-method response so an
+// older worker (slice not deployed) disables every recovery control instead of retrying
+// forever. Shared with the Sessions panel via copilot_internal.h.
+bool& chudcodeSessionServiceAvailable() {
+    static bool s_available = true;
+    return s_available;
+}
+
+// When the ACTIVE conversation's turn finishes, capture the Chudcode runtime metadata
+// (chudcode_session_id / chudcode_session_file) and a health verdict with ONE read-only
+// doctor dry-run, then stamp them into the conversation's persisted link. This is what makes
+// resume-after-restart work without the user ever opening the Sessions panel: the resume key
+// reaches disk as soon as a turn has run. Never fires for background (parked) runs — their
+// link updates the next time they are viewed and finish a turn.
+static void pollChudcodeSessionHealth(AppState& st) {
+    if (!chudcodeSessionServiceAvailable()) return;
+    static bool s_inFlight = false;
+    static std::string s_runningConv;   // active conv observed running (transition source)
+    const std::string convId = activeConversationId(st);
+    if (activeConversationRunning(st)) {
+        s_runningConv = convId;
+        return;
+    }
+    // Only the run we watched START on this same conversation counts as "finished" here —
+    // switching from a running session to an idle one must not diagnose the idle one.
+    if (s_inFlight || s_runningConv.empty() || s_runningConv != convId) return;
+    s_runningConv.clear();
+    const ChudcodeSessionLink* link = chudcodeSessionLink(convId);
+    if (!link || !link->runtimeLive) return;   // no service-side runtime to describe
+    s_inFlight = true;
+    st.rpc.call(kChudcodeRepairSessionMethod,
+                chudcodeRepairSessionParams(convId, /*repair=*/false),
+                [&st, convId](const core::RpcResult& r) {
+        s_inFlight = false;
+        if (chudcodeSessionRpcAbsent(r.ok, r.err, r.result)) {
+            chudcodeSessionServiceAvailable() = false;
+            return;
+        }
+        if (!r.ok) return;   // transport hiccup — next finished turn retries
+        if (chudcodeSessionNotLive(r.result)) {
+            chudcodeSessionLinkEnsure(convId).runtimeLive = false;
+            return;
+        }
+        ChudcodeDoctorSummary summary;
+        if (!parseChudcodeDoctorSummary(r.result, summary)) return;
+        applyChudcodeDoctor(chudcodeSessionLinkEnsure(convId), summary);
+        markChatHistoryDirty();   // resume key + health reach disk on the debounced flush
+    }, 30000);
+}
+
+
 // Per-frame chat/doc sync (called each frame). Sessions are document-independent now: a
 // document switch NEVER loads/parks/replaces the session set — it only refreshes
 // st.chatDocKey (the current document's key, for run launches + prompt drafts), runs the
@@ -1714,6 +1775,7 @@ void syncChatToDoc(AppState& st) {
     }
     st.chatDocKey = convDocKey(st);
     ensureConversations(st);
+    pollChudcodeSessionHealth(st);
 }
 
 static void clearComposerState(AppState& st) {
@@ -1868,6 +1930,18 @@ void closeConversation(AppState& st, int idx) {
             }
         } catch (...) {
         }
+    }
+    // Hard delete disposes the Chudcode runtime too (idempotent, best-effort) and drops the
+    // link — unlike archive and unlike "Close runtime", which both keep it. The persisted
+    // Chudcode session file is the service's own store; deleting a Chudware conversation
+    // never reaches into it.
+    {
+        const std::string closedId = st.conversations[idx].id;
+        const ChudcodeSessionLink* link = chudcodeSessionLink(closedId);
+        if (link && link->runtimeLive && chudcodeSessionServiceAvailable())
+            st.rpc.call(kChudcodeCloseSessionMethod, chudcodeCloseSessionParams(closedId),
+                        [](const core::RpcResult&) {}, 15000);
+        chudcodeSessionLinkErase(closedId);
     }
     st.conversations.erase(st.conversations.begin() + idx);
     if (!closingActive) {

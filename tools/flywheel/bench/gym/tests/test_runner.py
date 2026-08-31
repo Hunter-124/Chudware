@@ -4,6 +4,7 @@ Runs cells into a TMP runs_dir (never the committed reports/ tree) and asserts t
 harness produces replayable run dirs, an independent grading, a classification pass, and
 a real mission INTAKE.
 """
+
 from __future__ import annotations
 
 import json
@@ -17,35 +18,99 @@ from tools.flywheel.bench.gym.challenges import load_challenge
 from tools.flywheel.bench.gym import cli as cli_mod
 from tools.flywheel.bench.gym import runner as runner_mod
 from tools.flywheel.bench.gym.runner import (
-    CycleResult, ExecProbe, InfrastructureUnavailable, UnknownChallengeError,
-    execution_probe, run_cell, run_cycle,
+    CycleResult,
+    ExecProbe,
+    InfrastructureUnavailable,
+    UnknownChallengeError,
+    execution_probe,
+    run_cell,
+    run_cycle,
 )
 from tools.flywheel.bench.gym import report as report_mod
 from tools.flywheel.bench.gym.taxonomy import TAXONOMY
 
 
-def test_probe_reports_real_agent_fn_when_wired():
-    """T-W30 regression: the execution probe must report real_agent_fn=True now that
-    node_runner._default_agent_fn is the real tool-executing turn (config provider
-    seam + agent_turn), NOT the historical silent stub that imported a non-existent
-    services.agent.providers.anthropic module. This test FAILS if the stub returns."""
+def test_probe_reports_chudcode_agent_fn_when_wired():
+    """The real-execution probe recognizes the Chudcode-backed DAG node runner."""
     probe = execution_probe()
-    assert probe.real_agent_fn is True, (
-        "node_runner._default_agent_fn is not the real tool-executing turn "
-        "(regressed to the silent stub?)")
+    assert probe.real_agent_fn is True
 
 
-def test_default_agent_fn_is_not_the_silent_stub():
-    """Directly assert the node_runner default no longer imports the wrong provider
-    module and no longer returns a hardcoded confirmed stub."""
+def test_default_agent_fn_uses_chudcode_without_provider_construction():
     import inspect
     from services.dag import node_runner
+
     src = inspect.getsource(node_runner._default_agent_fn)
-    assert "providers.anthropic " not in src and "providers.anthropic\n" not in src, \
-        "still importing the non-existent providers.anthropic module"
-    assert "agent_turn" in src, "default agent_fn must run the tool-calling turn"
-    assert "get_provider" in src, \
-        "default agent_fn must resolve the provider via the config seam"
+    assert "run_role_turn" in src
+    assert "get_provider" not in src
+    assert "providers.anthropic" not in src
+
+
+def test_paid_gym_route_never_constructs_python_provider(monkeypatch):
+    from services.agent import config as agent_config
+
+    monkeypatch.delenv("CHUDWARE_PROVIDER", raising=False)
+    monkeypatch.setattr(runner_mod, "_load_benchmark_config", lambda: {})
+    monkeypatch.setattr(
+        agent_config,
+        "get_provider",
+        lambda *_args, **_kwargs: pytest.fail("online route constructed provider"),
+    )
+
+    route = runner_mod._tier_execution("openrouter:openai/gpt-5.6")
+
+    assert route == {
+        "offline": False,
+        "provider": None,
+        "settings": {"provider": "openrouter", "model": "openai/gpt-5.6"},
+    }
+
+
+def test_local_gym_route_marks_injected_provider_offline(monkeypatch):
+    provider = SimpleNamespace(name="mock", model="fixture")
+    monkeypatch.delenv("CHUDWARE_PROVIDER", raising=False)
+    monkeypatch.setattr(runner_mod, "_load_benchmark_config", lambda: {})
+    monkeypatch.setattr(
+        runner_mod,
+        "_offline_provider_for_tier",
+        lambda tier, cfg: provider,
+    )
+
+    route = runner_mod._tier_execution("local-24k")
+
+    assert route["offline"] is True
+    assert route["provider"] is provider
+    assert route["settings"] == {"provider": "mock", "model": "fixture"}
+
+
+def test_benchmark_agent_fn_scopes_online_and_offline_nodes():
+    seen = []
+
+    def base(request, context):
+        seen.append((request, context))
+        return context
+
+    original = {"node_id": "n1"}
+    online = runner_mod._benchmark_agent_fn(
+        base, {"provider": "openrouter", "model": "openai/gpt-5.6"}, False
+    )
+    online("paid", original)
+    offline = runner_mod._benchmark_agent_fn(
+        base, {"provider": "mock", "model": "fixture"}, True
+    )
+    offline("local", original)
+
+    assert original == {"node_id": "n1"}
+    assert seen[0][1]["role_model"] == {
+        "provider": "openrouter",
+        "model": "openai/gpt-5.6",
+    }
+    assert "offline" not in seen[0][1]
+    assert seen[1][1]["role_model"] == {
+        "provider": "mock",
+        "model": "fixture",
+    }
+    assert seen[1][1]["offline"] is True
 
 
 def test_single_cell_produces_replayable_run_dir(tmp_path):
@@ -54,8 +119,13 @@ def test_single_cell_produces_replayable_run_dir(tmp_path):
     cell = run_cell(ch, "local-24k", 1, cycle="t", probe=probe, runs_dir=tmp_path)
     rd = Path(cell.run_dir)
     assert rd.exists() and tmp_path in rd.parents, "run dir must be under the tmp root"
-    for f in ("ledger.json", "graded.json", "classifications.json", "mission.json",
-              "cell.json"):
+    for f in (
+        "ledger.json",
+        "graded.json",
+        "classifications.json",
+        "mission.json",
+        "cell.json",
+    ):
         assert (rd / f).exists(), f"missing replay artifact {f}"
     mission = json.loads((rd / "mission.json").read_text())
     assert mission.get("status") in {"running", "done", "blocked"}, mission
@@ -74,16 +144,22 @@ def test_cell_rerun_is_deterministic(tmp_path):
     c2 = run_cell(ch, "local-24k", 2, cycle="t", probe=probe, runs_dir=tmp_path)
     n2 = len(json.loads((Path(c2.run_dir) / "ledger.json").read_text())["events"])
     assert n1 == n2, f"re-run doubled events: {n1} -> {n2}"
-    assert [x.failure_class for x in c1.classifications] == \
-           [x.failure_class for x in c2.classifications], "re-run changed classification"
+    assert [x.failure_class for x in c1.classifications] == [
+        x.failure_class for x in c2.classifications
+    ], "re-run changed classification"
 
 
 def test_probe_reports_mode_honestly():
     p = execution_probe()
     assert p.mode in {"real", "mock"}
     d = p.to_dict()
-    assert set(d) >= {"mode", "real_agent_fn", "frontier_key", "local_model",
-                      "core_available"}
+    assert set(d) >= {
+        "mode",
+        "real_agent_fn",
+        "frontier_key",
+        "local_model",
+        "core_available",
+    }
 
 
 def test_full_matrix_all_classes_fire(tmp_path):
@@ -98,9 +174,15 @@ def test_full_matrix_all_classes_fire(tmp_path):
     # stay fixed. C9-C15 add their own designed tool_misuse seeds, so scope to C1-C8.
     legacy = {f"C{i}" for i in range(1, 9)}
     legacy_misuse = sum(
-        1 for c in cr.cells if c.challenge in legacy
-        for x in c.classifications if x.failure_class == "tool_misuse")
-    assert legacy_misuse == 4, f"C1-C8 tool_misuse should be 4 on 1 tier, got {legacy_misuse}"
+        1
+        for c in cr.cells
+        if c.challenge in legacy
+        for x in c.classifications
+        if x.failure_class == "tool_misuse"
+    )
+    assert legacy_misuse == 4, (
+        f"C1-C8 tool_misuse should be 4 on 1 tier, got {legacy_misuse}"
+    )
 
 
 def test_grind_dial_delta_is_real(tmp_path):
@@ -108,36 +190,58 @@ def test_grind_dial_delta_is_real(tmp_path):
     delta: tightening grind_threshold 3->2 promotes the 2-attempt grind seed (C4 seed3
     variant) that would not fire at 3. Proves the loop actually changes a cell."""
     from tools.flywheel.bench.gym.challenges import load_challenges
+
     # count grind at threshold 3 vs 2 over the same ledgers.
     cr = run_cycle(cycle="t", tiers=["local-24k"], runs_dir=tmp_path)
     from tools.flywheel.bench.gym.taxonomy import classify_ledger
+
     g3 = g2 = 0
     for c in cr.cells:
         lg = json.loads((Path(c.run_dir) / "ledger.json").read_text())
         man = load_challenge(c.challenge).manifest
-        g3 += sum(1 for x in classify_ledger(lg, manifest=man, graded=c.graded,
-                                             grind_threshold=3) if x.failure_class == "grind")
-        g2 += sum(1 for x in classify_ledger(lg, manifest=man, graded=c.graded,
-                                             grind_threshold=2) if x.failure_class == "grind")
+        g3 += sum(
+            1
+            for x in classify_ledger(
+                lg, manifest=man, graded=c.graded, grind_threshold=3
+            )
+            if x.failure_class == "grind"
+        )
+        g2 += sum(
+            1
+            for x in classify_ledger(
+                lg, manifest=man, graded=c.graded, grind_threshold=2
+            )
+            if x.failure_class == "grind"
+        )
     assert g2 > g3, f"grind 3->2 must promote at least one cell: g3={g3} g2={g2}"
 
 
 def test_capable_probe_does_not_promote_explicit_mock_to_real(tmp_path):
     probe = ExecProbe(
-        core_available=True, frontier_key=True, local_model=True,
-        real_agent_fn=True, dag_deps=True,
+        core_available=True,
+        frontier_key=True,
+        local_model=True,
+        real_agent_fn=True,
+        dag_deps=True,
     )
     cell = run_cell(
-        load_challenge("C1"), "local-24k", 1,
-        cycle="intent", probe=probe, runs_dir=tmp_path, real=False,
+        load_challenge("C1"),
+        "local-24k",
+        1,
+        cycle="intent",
+        probe=probe,
+        runs_dir=tmp_path,
+        real=False,
     )
     report = report_mod.build_report(
-        CycleResult(cycle="intent", tiers=["local-24k"], probe=probe, cells=[cell]))
+        CycleResult(cycle="intent", tiers=["local-24k"], probe=probe, cells=[cell])
+    )
     assert probe.mode == "real"
     assert cell.mode == "mock"
     assert report["execution_mode"] == "mock"
 
     from tools.flywheel.bench.gym.telemetry import write_cycle_telemetry
+
     events_path = write_cycle_telemetry(report, tmp_path / "telemetry")
     events = [json.loads(line) for line in events_path.read_text().splitlines()]
     cell_event = next(event for event in events if event.get("type") == "gym.cell")
@@ -147,14 +251,20 @@ def test_capable_probe_does_not_promote_explicit_mock_to_real(tmp_path):
 
 def test_requested_real_refuses_before_any_cell_is_graded(tmp_path, monkeypatch):
     incapable = ExecProbe(
-        core_available=False, frontier_key=False, local_model=False,
-        real_agent_fn=True, dag_deps=True,
+        core_available=False,
+        frontier_key=False,
+        local_model=False,
+        real_agent_fn=True,
+        dag_deps=True,
     )
     monkeypatch.setattr(runner_mod, "execution_probe", lambda: incapable)
     with pytest.raises(InfrastructureUnavailable) as caught:
         run_cycle(
-            cycle="refused", tiers=["local-24k"], challenge_ids=["C1"],
-            runs_dir=tmp_path, real=True,
+            cycle="refused",
+            tiers=["local-24k"],
+            challenge_ids=["C1"],
+            runs_dir=tmp_path,
+            real=True,
         )
     assert caught.value.status == "infrastructure_unavailable"
     assert list(tmp_path.rglob("graded.json")) == []
@@ -162,7 +272,8 @@ def test_requested_real_refuses_before_any_cell_is_graded(tmp_path, monkeypatch)
 
 def test_unknown_challenge_is_rejected(tmp_path, monkeypatch):
     monkeypatch.setattr(
-        runner_mod, "execution_probe",
+        runner_mod,
+        "execution_probe",
         lambda: ExecProbe(False, False, False, True, True),
     )
     with pytest.raises(UnknownChallengeError) as caught:
@@ -187,8 +298,12 @@ def test_execution_probe_recognizes_xai_environment_credential(monkeypatch):
     from services.agent import config as agent_config
 
     for key in (
-        "ANTHROPIC_API_KEY", "OPENAI_API_KEY", "OPENROUTER_API_KEY",
-        "GEMINI_API_KEY", "GOOGLE_API_KEY", "MOONSHOT_API_KEY",
+        "ANTHROPIC_API_KEY",
+        "OPENAI_API_KEY",
+        "OPENROUTER_API_KEY",
+        "GEMINI_API_KEY",
+        "GOOGLE_API_KEY",
+        "MOONSHOT_API_KEY",
         "CHUDWARE_PROVIDER",
     ):
         monkeypatch.delenv(key, raising=False)
@@ -203,7 +318,8 @@ def test_execution_probe_recognizes_xai_environment_credential(monkeypatch):
     assert probe.can_run_real is True
     monkeypatch.delenv("XAI_API_KEY")
     monkeypatch.setattr(
-        agent_config, "load_config",
+        agent_config,
+        "load_config",
         lambda: {"keys": {"anthropic": "stored-config-key"}},
     )
     assert runner_mod._frontier_credentials_present() is True
@@ -211,8 +327,13 @@ def test_execution_probe_recognizes_xai_environment_credential(monkeypatch):
 
 def _run_args(**overrides):
     values = {
-        "tiers": "local-24k", "challenges": "C1", "division": "local",
-        "smoke": False, "cycle": "cli", "real": False, "no_adjust": True,
+        "tiers": "local-24k",
+        "challenges": "C1",
+        "division": "local",
+        "smoke": False,
+        "cycle": "cli",
+        "real": False,
+        "no_adjust": True,
     }
     values.update(overrides)
     return SimpleNamespace(**values)
@@ -220,14 +341,18 @@ def _run_args(**overrides):
 
 def test_cli_returns_nonzero_for_refused_real(monkeypatch, capsys):
     exc = InfrastructureUnavailable(["core library unavailable"])
-    monkeypatch.setattr(cli_mod, "run_cycle", lambda **_kwargs: (_ for _ in ()).throw(exc))
+    monkeypatch.setattr(
+        cli_mod, "run_cycle", lambda **_kwargs: (_ for _ in ()).throw(exc)
+    )
     assert cli_mod.cmd_run(_run_args(real=True)) != 0
     assert "status=infrastructure_unavailable" in capsys.readouterr().err
 
 
 def test_cli_returns_nonzero_for_unknown_challenge(monkeypatch, capsys):
     exc = UnknownChallengeError(["C999"])
-    monkeypatch.setattr(cli_mod, "run_cycle", lambda **_kwargs: (_ for _ in ()).throw(exc))
+    monkeypatch.setattr(
+        cli_mod, "run_cycle", lambda **_kwargs: (_ for _ in ()).throw(exc)
+    )
     assert cli_mod.cmd_run(_run_args(challenges="C999")) != 0
     assert "status=unknown_challenge" in capsys.readouterr().err
 
@@ -240,15 +365,21 @@ def test_cli_returns_nonzero_for_zero_cell_run(monkeypatch, capsys):
     assert "status=zero_cells" in capsys.readouterr().err
 
 
-def test_cli_returns_nonzero_when_every_diag_provider_errors(tmp_path, monkeypatch, capsys):
+def test_cli_returns_nonzero_when_every_diag_provider_errors(
+    tmp_path, monkeypatch, capsys
+):
     from tools.flywheel.bench.gym import diag
 
     result = {
-        "tiers": ["xai:grok-4-5"], "axes": ["tool_validity"], "mock": False,
+        "tiers": ["xai:grok-4-5"],
+        "axes": ["tool_validity"],
+        "mock": False,
         "results": [{"tier": "xai:grok-4-5", "error": "provider unavailable"}],
     }
     monkeypatch.setattr(diag, "run_diag", lambda *_args, **_kwargs: result)
-    monkeypatch.setattr(diag, "write_diag_results", lambda _result: tmp_path / "diag.json")
+    monkeypatch.setattr(
+        diag, "write_diag_results", lambda _result: tmp_path / "diag.json"
+    )
     args = SimpleNamespace(tiers="xai:grok-4-5", axes=None, seed=1)
     assert cli_mod.cmd_diag(args) != 0
     assert "status=all_provider_error" in capsys.readouterr().err
@@ -256,6 +387,7 @@ def test_cli_returns_nonzero_when_every_diag_provider_errors(tmp_path, monkeypat
 
 def main() -> None:
     import inspect
+
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):
             sig = inspect.signature(fn)

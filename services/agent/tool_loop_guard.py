@@ -1,11 +1,8 @@
 """tool_loop_guard.py — cross-call repeated-tool-call detection.
 
-Ported (same algorithm, re-authored for our Python dispatch path) from OMP's
-``ToolCallLoopGuard`` (vendor/omp/packages/ai/src/utils/tool-call-loop-guard.ts) — a
-vendored utility that was never actually wired into anything in the vendored copy
-(omp's own agent/CLI harness that would have consumed it isn't part of what we vendor;
-we only pull in its provider/auth/memory/compaction *library* layer). The detector
-itself is small, dependency-free, and worth having on our own Python agent loop.
+The detector is small and dependency-free. It tracks repeated canonical tool
+calls across one deterministic Python agent turn and stops only a genuinely
+stuck same-tool/same-arguments streak.
 
 Distinct from — and complementary to — the existing ``max_calls_per_turn`` hard cap
 in agent_turn.py's ``_dispatch_tool``: that cap counts calls to a tool NAME regardless
@@ -31,6 +28,7 @@ repeats are let through rather than silently swallowing the real error message. 
 higher bound still applies so a model that keeps failing validation is eventually cut
 off (see ``ToolCallLoopGuard.check``).
 """
+
 from __future__ import annotations
 
 import json
@@ -48,13 +46,31 @@ ARGUMENT_SUMMARY_LIMIT = 400
 # of each definition.  Re-run that sweep when poll tools are added.  req_status
 # is deliberately excluded: despite its name, it MUTATES a requirement and
 # takes a required new_status argument.
-DEFAULT_EXEMPT_TOOLS: frozenset[str] = frozenset({
-    "box_status", "buildgraph_status", "dag_status", "ecad_status", "em_status",
-    "fw_status", "get_job", "intake_status", "ledger_events", "ledger_get",
-    "mission_status", "plm_status", "reveng_gate_status", "reveng_status",
-    "scrape_queue_status", "serving_status", "sim_jobs", "sim_status",
-    "vendor_status", "workspace_doc_events", "workspace_status",
-})
+DEFAULT_EXEMPT_TOOLS: frozenset[str] = frozenset(
+    {
+        "box_status",
+        "buildgraph_status",
+        "dag_status",
+        "ecad_status",
+        "em_status",
+        "fw_status",
+        "get_job",
+        "intake_status",
+        "ledger_events",
+        "ledger_get",
+        "mission_status",
+        "plm_status",
+        "reveng_gate_status",
+        "reveng_status",
+        "scrape_queue_status",
+        "serving_status",
+        "sim_jobs",
+        "sim_status",
+        "vendor_status",
+        "workspace_doc_events",
+        "workspace_status",
+    }
+)
 
 # Extra consecutive identical calls tolerated when the immediately-preceding
 # identical call failed before reaching the tool body (see note_outcome). Keeps
@@ -71,10 +87,15 @@ DEFAULT_VALIDATION_RETRY_ALLOWANCE = 2
 # asking anything, same as a binding failure from the guard's point of view.
 # Callers that dispatch through their own resolver (not ``_dispatch_tool``)
 # can reuse this set to feed ``note_outcome`` the same way.
-VALIDATION_FAILURE_STATUSES: frozenset[str] = frozenset({
-    "unknown_tool", "known_but_unbound", "unknown_argument",
-    "missing_argument", "bad_arguments",
-})
+VALIDATION_FAILURE_STATUSES: frozenset[str] = frozenset(
+    {
+        "unknown_tool",
+        "known_but_unbound",
+        "unknown_argument",
+        "missing_argument",
+        "bad_arguments",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -92,8 +113,7 @@ def _canonicalize(value: Any) -> Any:
     if isinstance(value, list):
         return [_canonicalize(v) for v in value]
     if isinstance(value, dict):
-        return {k: _canonicalize(value[k]) for k in sorted(value)
-                if k != "__intent"}
+        return {k: _canonicalize(value[k]) for k in sorted(value) if k != "__intent"}
     return value
 
 
@@ -123,11 +143,16 @@ class ToolCallLoopGuard:
     still eventually cut off.
     """
 
-    def __init__(self, threshold: int = DEFAULT_THRESHOLD,
-                 exempt_tools: frozenset[str] = DEFAULT_EXEMPT_TOOLS,
-                 validation_retry_allowance: int = DEFAULT_VALIDATION_RETRY_ALLOWANCE) -> None:
+    def __init__(
+        self,
+        threshold: int = DEFAULT_THRESHOLD,
+        exempt_tools: frozenset[str] = DEFAULT_EXEMPT_TOOLS,
+        validation_retry_allowance: int = DEFAULT_VALIDATION_RETRY_ALLOWANCE,
+    ) -> None:
         self._threshold = max(1, int(threshold))
-        self._validation_threshold = self._threshold + max(0, int(validation_retry_allowance))
+        self._validation_threshold = self._threshold + max(
+            0, int(validation_retry_allowance)
+        )
         self._exempt = frozenset(exempt_tools)
         self._last_key: str | None = None
         self._count = 0
@@ -147,18 +172,23 @@ class ToolCallLoopGuard:
             self._last_key = key
             self._count = 1
             self._last_failed_before_body = False
-        threshold = (self._validation_threshold if self._last_failed_before_body
-                     else self._threshold)
+        threshold = (
+            self._validation_threshold
+            if self._last_failed_before_body
+            else self._threshold
+        )
         if self._count < threshold:
             return None
         return RepeatedToolCallDetection(
-            tool=tool, count=self._count,
+            tool=tool,
+            count=self._count,
             arguments_summary=_summarize(canonical, ARGUMENT_SUMMARY_LIMIT),
             after_validation_failure=self._last_failed_before_body,
         )
 
-    def note_outcome(self, tool: str, args: dict | None, *,
-                      failed_before_body: bool) -> None:
+    def note_outcome(
+        self, tool: str, args: dict | None, *, failed_before_body: bool
+    ) -> None:
         """Record the outcome of the call ``check`` most recently allowed
         through for this (tool, args): did it fail before the tool's real code
         ran (argument validation / binding), or did it actually execute
@@ -181,7 +211,8 @@ class ToolCallLoopGuard:
             " The arguments were EMPTY. If the tool requires fields, re-read its "
             "schema and supply them; otherwise use the prior result or continue "
             "with what you already know."
-            if empty_args else ""
+            if empty_args
+            else ""
         )
         remedies = (
             "Use the prior result, change a real argument, call a different tool "

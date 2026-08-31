@@ -42,7 +42,7 @@ MIDDLE_OMIT_MARKER = (
 )
 
 
-# Static reading guide (omp snapcompact-summary.md text-phase subset; no frames).
+# Static reading guide for the deterministic text-only archive.
 STATIC_READING_GUIDE = """\
 You are resuming a prior conversation. Its earlier turns were archived to reclaim context and are reproduced under HISTORY below, oldest to newest. Read HISTORY in full, then continue from the live conversation that follows it.
 
@@ -734,9 +734,9 @@ def reinject_archive(archive: dict) -> list[dict]:
 def _shake_images(messages: list[dict]) -> dict[str, Any]:
     """CAD content-shape adapter for `/shake images`.
 
-    Image stripping is product-side because OMP's universal shake intentionally
-    selects textual context regions only. No token-selection or text-mutation
-    algorithm lives here.
+    Image stripping is product-side because the authoritative online compactor
+    intentionally selects textual context regions only. No token-selection or
+    text-mutation algorithm lives here.
     """
     msgs = copy.deepcopy(list(messages or []))
     saved = 0

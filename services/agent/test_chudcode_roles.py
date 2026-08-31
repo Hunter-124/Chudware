@@ -402,7 +402,7 @@ def test_invalid_role_returns_compatible_failure(monkeypatch):
     assert result["allowed_tools"] == []
 
 
-def test_online_path_never_constructs_provider_or_calls_legacy_agent_turn(
+def test_online_path_never_constructs_provider_or_calls_deterministic_loop(
     monkeypatch, online_runtime
 ):
     host = _Host()
@@ -417,7 +417,9 @@ def test_online_path_never_constructs_provider_or_calls_legacy_agent_turn(
     monkeypatch.setattr(
         agent_turn,
         "run_turn",
-        lambda *_args, **_kwargs: pytest.fail("online path called legacy agent_turn"),
+        lambda *_args, **_kwargs: pytest.fail(
+            "online path called deterministic agent_turn"
+        ),
     )
 
     result = roles.run_role_turn(

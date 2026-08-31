@@ -1,4 +1,5 @@
-"""Tests for tool_loop_guard.ToolCallLoopGuard (ported from OMP's TS loop guard)."""
+"""Tests for tool_loop_guard.ToolCallLoopGuard."""
+
 from __future__ import annotations
 
 from services.agent.tool_loop_guard import ToolCallLoopGuard
@@ -59,10 +60,7 @@ class TestToolCallLoopGuard:
         guard = ToolCallLoopGuard(threshold=3)
         base = {"agent": "a1", "scope": ["part"], "__intent": "scratch"}
         for intent in ("inspect", "edit", "release"):
-            assert guard.check(
-                "coordinate_claim", {**base, "intent": intent}
-            ) is None
-
+            assert guard.check("coordinate_claim", {**base, "intent": intent}) is None
 
     def test_message_mentions_tool_and_count(self):
         g = ToolCallLoopGuard(threshold=2)
@@ -113,9 +111,9 @@ class TestValidationFailureGrace:
         very next identical attempt was refused by the guard before the model
         ever saw the real teaching error. That must no longer happen."""
         g = ToolCallLoopGuard(threshold=3)
-        assert g.check("ask_user", {}) is None                       # call #1
-        g.note_outcome("ask_user", {}, failed_before_body=True)      # failed validation
-        assert g.check("ask_user", {}) is None                       # call #2 - below threshold anyway
+        assert g.check("ask_user", {}) is None  # call #1
+        g.note_outcome("ask_user", {}, failed_before_body=True)  # failed validation
+        assert g.check("ask_user", {}) is None  # call #2 - below threshold anyway
         g.note_outcome("ask_user", {}, failed_before_body=True)
         # call #3 would trip a plain threshold=3 guard; it must not here.
         assert g.check("ask_user", {}) is None
@@ -142,7 +140,9 @@ class TestValidationFailureGrace:
             if detection is not None:
                 break
             g.note_outcome("ask_user", {}, failed_before_body=True)
-        assert detection is not None, "a model stuck failing validation must still be cut off"
+        assert detection is not None, (
+            "a model stuck failing validation must still be cut off"
+        )
         assert detection.count == 5  # threshold(3) + allowance(2)
         assert detection.after_validation_failure is True
 
@@ -192,26 +192,48 @@ class TestExemptToolsMatchDocstring:
         import inspect
 
         import services.agent.tool_loop_guard as mod
+
         src = inspect.getsource(mod)
         for name in mod.DEFAULT_EXEMPT_TOOLS:
-            assert name in src, f"{name} is exempt but not documented anywhere in the module"
+            assert name in src, (
+                f"{name} is exempt but not documented anywhere in the module"
+            )
 
     def test_docstring_explicitly_excludes_verify_battery(self):
         import services.agent.tool_loop_guard as mod
+
         assert "verify_battery" not in mod.DEFAULT_EXEMPT_TOOLS
         assert "verify_battery" in (mod.__doc__ or "")
         assert "NOT" in (mod.__doc__ or "")
 
     def test_swept_poller_set_is_pinned(self):
         import services.agent.tool_loop_guard as mod
-        assert mod.DEFAULT_EXEMPT_TOOLS == frozenset({
-            "box_status", "buildgraph_status", "dag_status", "ecad_status",
-            "em_status", "fw_status", "get_job", "intake_status",
-            "ledger_events", "ledger_get", "mission_status", "plm_status",
-            "reveng_gate_status", "reveng_status", "scrape_queue_status",
-            "serving_status", "sim_jobs", "sim_status", "vendor_status",
-            "workspace_doc_events", "workspace_status",
-        })
+
+        assert mod.DEFAULT_EXEMPT_TOOLS == frozenset(
+            {
+                "box_status",
+                "buildgraph_status",
+                "dag_status",
+                "ecad_status",
+                "em_status",
+                "fw_status",
+                "get_job",
+                "intake_status",
+                "ledger_events",
+                "ledger_get",
+                "mission_status",
+                "plm_status",
+                "reveng_gate_status",
+                "reveng_status",
+                "scrape_queue_status",
+                "serving_status",
+                "sim_jobs",
+                "sim_status",
+                "vendor_status",
+                "workspace_doc_events",
+                "workspace_status",
+            }
+        )
         assert "req_status" not in mod.DEFAULT_EXEMPT_TOOLS
 
 
@@ -225,26 +247,30 @@ class TestAskUserEmptyArgs:
 
     def test_empty_call_is_actionable_and_forbids_retry(self):
         from services.agent.agent_turn import _ask_user_sync
+
         r = _ask_user_sync()
         assert r["ok"] is False and r["status"] == "bad_arguments"
         assert "do NOT retry" in r["error"]
-        assert "final message" in r["error"]      # the way out of needing the tool
-        assert r["example"]                        # a copy-pasteable shape
+        assert "final message" in r["error"]  # the way out of needing the tool
+        assert r["example"]  # a copy-pasteable shape
 
     def test_question_under_an_alias_key_is_accepted(self):
         """Models put the question under whatever key they like; those used to
         land in **_ignored and the call looked argument-less."""
         from services.agent.agent_turn import _ask_user_sync
+
         for alias in ("message", "query", "prompt", "text", "q"):
             r = _ask_user_sync(**{alias: "Which material?"})
             assert r.get("ok") is True, f"{alias} not accepted"
 
     def test_blank_prompt_is_rejected_not_silently_asked(self):
         from services.agent.agent_turn import _ask_user_sync
+
         assert _ask_user_sync(questions=[{"id": "q1", "prompt": "   "}])["ok"] is False
 
     def test_mission_dispatch_ask_user_matches(self):
         from services.agent.mission_dispatch import MissionDispatch
+
         md = MissionDispatch.__new__(MissionDispatch)
         md.run_id, md.ledger, md.autonomy = "r1", None, None
         r = md.ask_user()
@@ -271,9 +297,7 @@ class TestDispatchToolLoopGuardWiring:
             r = _dispatch_tool("ask_user", {}, _call_counts=counts, _loop_guard=guard)
             assert r["ok"] is False and r["status"] == "bad_arguments"
             assert "do NOT retry" in r["error"]
-        refusal = _dispatch_tool(
-            "ask_user", {}, _call_counts=counts, _loop_guard=guard
-        )
+        refusal = _dispatch_tool("ask_user", {}, _call_counts=counts, _loop_guard=guard)
         assert refusal == {
             "ok": False,
             "status": "loop_guard_refused",
@@ -285,8 +309,9 @@ class TestDispatchToolLoopGuardWiring:
         assert "argument validation" in refusal["error"]
         assert "replan" not in refusal["error"]
 
-    def test_repeated_identical_success_still_trips_at_threshold(self, tmp_path,
-                                                                 monkeypatch):
+    def test_repeated_identical_success_still_trips_at_threshold(
+        self, tmp_path, monkeypatch
+    ):
         """A tool that succeeds identically N times in a row (nothing wrong
         with its arguments) gets NO grace — that is the real waste this guard
         exists to stop.
@@ -303,12 +328,15 @@ class TestDispatchToolLoopGuardWiring:
         guard = ToolCallLoopGuard(threshold=3)
         counts: dict = {}
         for _ in range(2):
-            r = _dispatch_tool("fs_list", {"path": "."},
-                               _call_counts=counts, _loop_guard=guard)
+            r = _dispatch_tool(
+                "fs_list", {"path": "."}, _call_counts=counts, _loop_guard=guard
+            )
             assert r.get("ok") is True and "status" not in r, r
         refusal = _dispatch_tool(
-            "fs_list", {"path": "."},
-            _call_counts=counts, _loop_guard=guard,
+            "fs_list",
+            {"path": "."},
+            _call_counts=counts,
+            _loop_guard=guard,
         )
         assert refusal["ok"] is False
         assert refusal["status"] == "loop_guard_refused"

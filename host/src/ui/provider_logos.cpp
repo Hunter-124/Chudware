@@ -34,10 +34,8 @@ struct Brand {
     const char* mark;
 };
 
-// Brand colors are approximate accents chosen to read on the frosted-glass panels — not exact
-// trademark values. Keyed by the exact OMP provider id (auth_list_providers `id`, not label) —
-// sibling plan/region variants of one brand (e.g. the xiaomi-token-plan-* trio) get their own
-// entries so every row the bridge can return has an explicit, distinct badge.
+// Brand colors are approximate accents chosen to read on frosted-glass panels, not exact
+// trademark values. Keyed by provider id; sibling plan/region variants retain distinct badges.
 const std::unordered_map<std::string, Brand>& brandTable() {
     static const std::unordered_map<std::string, Brand> t = {
         // -- Anthropic / OpenAI / Google / xAI (+ their auth/device/cloud variants) --

@@ -14,6 +14,7 @@ docstrings and tests only). A ``_drive`` helper here monkeypatched that deleted 
 and was itself never called — removed 2026-08-05 so this file's coverage claim matches
 what it actually asserts.
 """
+
 from __future__ import annotations
 
 import pytest
@@ -96,11 +97,13 @@ def test_typed_refusal_schema_strict():
 
     # Missing keys.
     assert validate_typed_refusal({"reason": "x", "why_flat": "y"})
-    assert validate_typed_refusal({
-        "reason": "x",
-        "domains_considered": [],
-        "why_flat": "y",
-    })
+    assert validate_typed_refusal(
+        {
+            "reason": "x",
+            "domains_considered": [],
+            "why_flat": "y",
+        }
+    )
     assert validate_typed_refusal("not an object")
 
 
@@ -177,6 +180,7 @@ def test_multi_domain_request_includes_typed_refusal_scaffold():
     assert "typed_refusal" in req
     assert "domains_considered" in req
     assert "delegate" in req.lower()
+
 
 def test_typed_refusal_gate_skips_specify_workers():
     """Live mega-8: n_spec_* are type=design + multi_feature/assembly — must NOT gate."""
@@ -398,13 +402,24 @@ def test_leaf_envelope_validates():
     # Missing goal / neither ops nor no_op.
     assert validate_leaf_envelope({"ops": [{"a": 1}]})
     assert validate_leaf_envelope({"goal": "x"})
-    assert validate_leaf_envelope({
-        "goal": "x", "no_op": True,  # missing reason
-    })
+    assert validate_leaf_envelope(
+        {
+            "goal": "x",
+            "no_op": True,  # missing reason
+        }
+    )
     # mega-24: no_op=true WITH ops is salvaged to ops-only (prefer ops).
-    assert validate_leaf_envelope({
-        "goal": "x", "no_op": True, "reason": "r", "ops": [{"a": 1}],
-    }) == []
+    assert (
+        validate_leaf_envelope(
+            {
+                "goal": "x",
+                "no_op": True,
+                "reason": "r",
+                "ops": [{"a": 1}],
+            }
+        )
+        == []
+    )
 
     text = '```json\n{"goal":"g","no_op":true,"reason":"already done"}\n```'
     env, errs = parse_leaf_envelope_text(text)
@@ -416,13 +431,13 @@ def test_leaf_envelope_salvages_truncated_ops_json():
     """Live mega-8: ollama DL5 returned truncated ops[] with trailing commas."""
     from services.agent.role_models import parse_leaf_envelope_text
 
-    blob = '''{
+    blob = """{
   "goal": "Design a model rocket plane with flight computer",
   "ops": [
     {
       "type": "fit_calc",
     
-'''
+"""
     env, errs = parse_leaf_envelope_text(blob)
     assert env is not None, errs
     assert env["goal"].startswith("Design a model rocket")
@@ -436,26 +451,25 @@ def test_leaf_envelope_salvages_truncated_ops_json():
     assert env2["no_op"] is True
 
 
-def test_reviewer_leaf_never_uses_no_tool_oneshot(monkeypatch):
+def test_reviewer_leaf_runs_through_chudcode_with_verification_tools(monkeypatch):
+    from services.agent import chudcode_roles
     from services.dag import node_runner as nr
 
-    monkeypatch.setenv("CHUDWARE_LEAF_ONESHOT", "1")
+    calls = []
 
-    class _Prov:
-        name = "ollama"
-        model = "llama3.2:latest"
+    def role_turn(request, role, **kwargs):
+        calls.append((request, role, kwargs))
+        assert "verify_battery" in kwargs["options"]["allowed_tools"]
+        return {
+            "success": True,
+            "stop_reason": "completed",
+            "result": "verified with tools",
+            "calls": [{"tool": "verify_battery", "ok": True, "result": {"ok": True}}],
+            "tool_calls": 1,
+        }
 
-        def __init__(self):
-            self.calls = 0
-
-        def complete(self, system, messages, max_tokens=800):
-            self.calls += 1
-            return (
-                '{"goal":"verify leaf","no_op":true,'
-                '"reason":"nothing to check"}'
-            )
-
-    provider = _Prov()
+    monkeypatch.setattr(chudcode_roles, "run_role_turn", role_turn)
+    monkeypatch.setattr(nr, "_ADVISOR_ENABLED", False)
     node = {
         "id": "n_verify_DL1",
         "type": "verify",
@@ -474,54 +488,32 @@ def test_reviewer_leaf_never_uses_no_tool_oneshot(monkeypatch):
         "retry_remaining": 1,
         "node_name": "VERIFY DL1",
     }
+    verdict, out = nr.run(node, pack)
 
-    monkeypatch.setattr(nr, "_resolve_provider", lambda cp, p=None: provider)
-    called = {"turn": 0}
-
-    class _ToolLoopResult:
-        success = True
-        stop_reason = "confirmed"
-        final_code = None
-        result = {
-            "handoff": {"status": "done", "summary": "verified with tools"},
-            "calls": [{"tool": "verify_battery", "ok": True}],
-        }
-
-    def _tool_loop(*args, **kwargs):
-        called["turn"] += 1
-        assert "verify_battery" in kwargs["allowed_tools"]
-        return _ToolLoopResult()
-
-    monkeypatch.setattr("services.agent.agent_turn.run_turn", _tool_loop)
-    verdict, out = nr.run(node, pack, agent_fn=None)
-
-    assert called["turn"] == 1
-    assert provider.calls == 0
+    assert len(calls) == 1
+    assert calls[0][1] == "reviewer"
     assert verdict == nr.VERDICT_DONE, (verdict, out)
     assert not (out["data"].get("agent_result") or {}).get("one_shot")
 
 
-def test_leaf_oneshot_miss_increments_and_falls_back(monkeypatch):
+def test_leaf_chudcode_failure_uses_shared_dag_retry_contract(monkeypatch):
+    from services.agent import chudcode_roles
     from services.agent import role_models as rm
     from services.dag import node_runner as nr
 
     rm.reset_leaf_miss_count()
-    monkeypatch.setenv("CHUDWARE_LEAF_ONESHOT", "1")
-    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    calls = []
 
-    class _BadProv:
-        name = "ollama"
-        model = "llama3.2:latest"
+    def role_turn(request, role, **kwargs):
+        calls.append((request, role, kwargs))
+        return {
+            "success": False,
+            "stop_reason": "provider_error",
+            "result": {"retryable": True, "error": "transient local model failure"},
+        }
 
-        def complete(self, system, messages, max_tokens=800):
-            return "sorry I cannot fill forms, just prose forever"
-
-    class _FallbackResult:
-        success = True
-        stop_reason = "confirmed"
-        final_code = None
-        result = {"handoff": {"status": "done"}, "calls": [], "fallback": True}
-
+    monkeypatch.setattr(chudcode_roles, "run_role_turn", role_turn)
+    monkeypatch.setattr(nr, "_ADVISOR_ENABLED", False)
     node = {
         "id": "n_intake",
         "type": "plan",
@@ -537,41 +529,16 @@ def test_leaf_oneshot_miss_increments_and_falls_back(monkeypatch):
             "model": "llama3.2:latest",
             "cost_tier": 0,
         },
-        "retry_remaining": 1,
+        "retry_remaining": 2,
         "node_name": "INTAKE",
     }
-
-    monkeypatch.setattr(nr, "_resolve_provider", lambda cp, p=None: _BadProv())
-
-    # Patch at the module attribute the oneshot uses AND the tool-loop entry.
-    import services.agent.agent_turn as at
-
-    def _turn(*args, **kwargs):
-        return _FallbackResult()
-
-    monkeypatch.setattr(at, "run_turn", _turn)
-    monkeypatch.setattr(nr, "_frontier_fallback_provider", lambda cp, inj=None: _BadProv())
-
-    # Drive the oneshot + fallback path directly for the miss counter, then
-    # confirm run() still produces a terminal verdict after miss.
     miss_before = rm.leaf_miss_count()
-    oneshot = nr._maybe_run_cheap_leaf_oneshot(
-        "confirm intake", pack, _BadProv(), node_name="INTAKE",
-    )
-    assert oneshot is None
-    assert rm.leaf_miss_count() > miss_before
-    assert pack.get("leaf_oneshot_miss") is True
+    verdict, out = nr.run(node, pack)
 
-    # Full node run after miss: tool loop (stubbed) must confirm.
-    # Seed miss flag so frontier fallback path is exercised.
-    pack["leaf_oneshot_miss"] = True
-    # Force oneshot to return None immediately on second call.
-    monkeypatch.setattr(
-        nr, "_maybe_run_cheap_leaf_oneshot",
-        lambda *a, **k: None,
-    )
-    verdict, out = nr.run(node, pack, agent_fn=None)
-    assert verdict == nr.VERDICT_DONE, (verdict, out)
+    assert verdict == nr.VERDICT_RETRY, (verdict, out)
+    assert out["retry_remaining"] == 1
+    assert len(calls) == 1
+    assert rm.leaf_miss_count() == miss_before
 
 
 def test_openai_provider_accepts_string_content():
@@ -584,36 +551,45 @@ def test_openai_provider_accepts_string_content():
     m = p._message("user", "fill the leaf envelope")
     assert m == {"role": "user", "content": "fill the leaf envelope"}
     # List-of-parts still collapses to string for text-only.
-    m2 = p._message("user", [{"type": "text", "text": "a"}, {"type": "text", "text": "b"}])
+    m2 = p._message(
+        "user", [{"type": "text", "text": "a"}, {"type": "text", "text": "b"}]
+    )
     assert m2 == {"role": "user", "content": "a\n\nb"}
 
 
-def test_leaf_oneshot_messages_use_parts_form():
-    """Oneshot must not pass bare strings that Anthropic-shaped providers reject."""
+def test_leaf_request_is_forwarded_to_chudcode_role_seam(monkeypatch):
+    from services.agent import chudcode_roles
     from services.dag import node_runner as nr
-    from services.agent import role_models as rm
 
-    rm.reset_leaf_miss_count()
     seen = {}
 
-    class _Prov:
-        name = "ollama"
-        model = "llama3.2:latest"
+    def role_turn(request, role, **kwargs):
+        seen.update({"request": request, "role": role, "kwargs": kwargs})
+        return {
+            "success": True,
+            "stop_reason": "completed",
+            "result": "leaf complete",
+        }
 
-        def complete(self, system, messages, max_tokens=800):
-            seen["messages"] = messages
-            return '{"goal":"g","no_op":true,"reason":"nothing"}'
-
-    pack = {
-        "node_inputs": {"task_class": "leaf"},
-        "task_class": "leaf",
-        "role_model": {"provider": "ollama", "model": "llama3.2:latest", "cost_tier": 0},
-    }
-    out = nr._maybe_run_cheap_leaf_oneshot("do leaf", pack, _Prov(), node_name="n")
-    assert out is not None
-    msgs = seen["messages"]
-    assert isinstance(msgs[0]["content"], list), msgs
-    assert msgs[0]["content"][0]["type"] == "text"
+    monkeypatch.setattr(chudcode_roles, "run_role_turn", role_turn)
+    result = nr._default_agent_fn(
+        "do leaf",
+        {
+            "node_id": "n",
+            "node_inputs": {"role": "intake_analyst", "task_class": "leaf"},
+            "task_class": "leaf",
+            "role_model": {
+                "provider": "ollama",
+                "model": "llama3.2:latest",
+                "cost_tier": 0,
+            },
+            "allowed_tools": [],
+        },
+    )
+    assert result.success is True
+    assert seen["request"] == "do leaf"
+    assert seen["role"] == "intake_analyst"
+    assert seen["kwargs"]["options"]["settings"]["provider"] == "ollama"
 
 
 def test_context_pack_and_graph_seed_run_id():
@@ -624,8 +600,11 @@ def test_context_pack_and_graph_seed_run_id():
         "id": "n_build_DL1",
         "type": "design",
         "name": "BUILD",
-        "inputs": {"role": "feature_modeler", "task_class": "multi_feature_part",
-                   "run_id": "from-inputs"},
+        "inputs": {
+            "role": "feature_modeler",
+            "task_class": "multi_feature_part",
+            "run_id": "from-inputs",
+        },
     }
     pack = assemble(node, {"retry_remaining": 1})
     assert pack.get("run_id") == "from-inputs"

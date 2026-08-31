@@ -17,6 +17,7 @@ A context pack is a compact dict containing ONLY what the node needs:
 Deliberately excludes full conversation history. The agent only sees what's
 in the context pack — history isolation is the whole point.
 """
+
 from __future__ import annotations
 
 from typing import Any, Callable, Optional
@@ -55,6 +56,7 @@ def set_describe_part_fn(fn: Callable[[str], str]) -> None:
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
+
 
 def assemble(
     node: dict[str, Any],
@@ -97,11 +99,7 @@ def assemble(
 
     # End condition hint (passed to the agent system prompt).
     end_condition: Optional[str] = node.get("end_condition")
-    phase = (
-        node.get("phase")
-        or node_inputs.get("phase")
-        or node_inputs.get("stage")
-    )
+    phase = node.get("phase") or node_inputs.get("phase") or node_inputs.get("stage")
 
     # GSL part description — only fetched when the node specifies a doc_id and
     # a describe function is available.
@@ -127,8 +125,8 @@ def assemble(
         "phase": phase,
         "part_description": part_description,
     }
-    # mega-7: promote difficulty routing fields to the pack root so
-    # node_runner._resolve_provider / role_models see them without digging.
+    # Promote difficulty routing fields so node_runner._resolve_role_settings
+    # and role_models see them without digging.
     for key in ("task_class", "depth", "risk", "role", "domain_tags", "run_id"):
         if key in node_inputs and node_inputs[key] is not None:
             pack[key] = node_inputs[key]

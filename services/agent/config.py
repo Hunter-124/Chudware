@@ -31,7 +31,6 @@ from urllib.parse import urlparse
 from services import paths
 
 from . import model_catalog
-from ._omp_bridge_provider_ids import OMP_BRIDGE_PROVIDER_IDS
 from .providers.base import Provider
 
 
@@ -1042,7 +1041,7 @@ def effective_tool_call_cap(
 def tool_loop_guard_enabled(cfg: dict | None = None) -> bool:
     """Repeated-identical-tool-call detector kill-switch (``agent.tool_loop_guard_enabled``).
 
-    Default True (ported from OMP's ToolCallLoopGuard — see tool_loop_guard.py).
+    Default True (see tool_loop_guard.py).
     Precedence: env ``CHUDWARE_TOOL_LOOP_GUARD`` > config.json > default (True).
     """
     try:
@@ -1508,26 +1507,6 @@ def _window_source_from_caps(caps: dict) -> str:
 
 def _attach_catalog_meta(provider: Provider, caps: dict) -> Provider:
     """Stamp resolved catalog fields onto the provider for downstream consumers."""
-    # A GUESS is the one thing worth replacing. When model_catalog admits it only
-    # had a heuristic (no user override, no curated row, no live probe) and the
-    # provider is served by the OMP sidecar, the sidecar's own curated row is
-    # strictly better information and is exactly what the GUI already trusts.
-    # Live 2026-07-29: kimi-code/k3 resolved to the LOCAL default context=8192
-    # (real 1,048,576), max_output=0 (real 131,072), vision=False (k3 takes
-    # images), so the context meter measured a 1M window against an 8192 ruler.
-    # Never touches "user"/"catalog"/"probe" — an override must stay an override.
-    if _window_source_from_caps(caps) == "heuristic":
-        try:
-            from .providers import omp_bridge_provider as _obp  # noqa: PLC0415
-
-            if isinstance(provider, _obp.OmpBridgeProvider):
-                real = _obp.catalog_caps(
-                    getattr(provider, "name", ""), getattr(provider, "model", "")
-                )
-                if real:
-                    caps = {**caps, **real, "auto_source": "models.dev"}
-        except Exception:  # noqa: BLE001 — never break provider construction
-            pass
     try:
         provider.context_window = int(caps.get("context") or 0) or None  # type: ignore[attr-defined]
         provider.max_output_tokens = int(caps.get("max_output") or 0) or None  # type: ignore[attr-defined]
@@ -1653,9 +1632,7 @@ _subscription_grant: contextvars.ContextVar[dict[str, str] | None] = (
 )
 
 # Gateway grant provider id (Webservice/gateway/provider_accounts.SUBSCRIPTION_PROVIDERS)
-# -> the config `provider` name _resolve_provider selects the sub-provider class by.
-# "openai-codex" is also an OMP-sidecar id, so it must normalize to the native
-# "codex-sub" adapter that can carry an explicit bearer.
+# to the native sub-provider class that can carry the explicit bearer.
 SUBSCRIPTION_GRANT_PROVIDERS = {
     "anthropic-sub": "anthropic-sub",
     "openai-codex": "codex-sub",
@@ -1876,56 +1853,6 @@ _PROVIDER_BASE_URL_CFG_KEY = {
     "openrouter": "openrouter",
 }
 
-# Persisted provider ids that were renamed to a bridge id. _resolve_provider normalizes the
-# name through this table, but a config written before the rename still files the nested
-# section and the keys map under the OLD id — so per-provider lookups try both, newest first.
-# core/agent/config.cpp performs the same kimi-sub -> kimi-code rename on its side.
-_PROVIDER_ID_ALIASES = {"kimi-sub": "kimi-code"}
-
-
-def _provider_cfg_names(name: str) -> tuple[str, ...]:
-    """Config ids *name*'s settings may be filed under: the current id, then pre-rename aliases."""
-    return (name, *(old for old, new in _PROVIDER_ID_ALIASES.items() if new == name))
-
-
-def _provider_cfg_section(cfg: dict, name: str) -> dict:
-    """Nested per-provider config block for *name* as a plain copy (empty dict when unset)."""
-    for key in _provider_cfg_names(name):
-        section = cfg.get(key)
-        if isinstance(section, dict):
-            return dict(section)
-    return {}
-
-
-def _openrouter_api_key(cfg: dict) -> str | None:
-    """Every place an OpenRouter credential may live, newest-wins order.
-
-    OpenRouter has exactly ONE credential form in CAD: an API key. The blessed PKCE
-    login (providers/oauth_pkce.py) mints a key and stores it like any other, so unlike
-    Claude Pro/Kimi-For-Coding there is no OAuth-only sign-in that could authenticate a
-    keyless client. Single source of truth for both the native adapter branch and the
-    OMP-bridge branch's keyless refusal below.
-    """
-    oc = cfg.get("openrouter")
-    keys_map = cfg.get("keys")
-    return (
-        (oc.get("api_key") if isinstance(oc, dict) else None)
-        or cfg.get("api_key")
-        or cfg.get("openrouter_api_key")
-        or (keys_map.get("openrouter") if isinstance(keys_map, dict) else None)
-        or os.environ.get("OPENROUTER_API_KEY")
-    )
-
-
-def _refuse_keyless_openrouter() -> None:
-    """mega-6: never construct a keyless OpenRouter client — complete would 401 as
-    provider_auth and kill every depth-0 auto_pick free leaf."""
-    raise ValueError(
-        "openrouter provider requires an API key "
-        "(config openrouter.api_key / keys.openrouter / OPENROUTER_API_KEY); "
-        "auto_pick must skip keyless openrouter"
-    )
-
 
 def _resolve_via_routing(
     role: str | None, cfg: dict
@@ -1981,9 +1908,6 @@ def _resolve_provider(name: str | None, cfg: dict, role: str | None = None) -> P
     name = (
         name or os.environ.get("CHUDWARE_PROVIDER") or cfg.get("provider") or ""
     ).lower()
-    # Pre-rename persisted ids (kimi-sub -> kimi-code) normalize before every lookup below,
-    # exactly as core/agent/config.cpp's resolve_provider does on its side.
-    name = _PROVIDER_ID_ALIASES.get(name, name)
     offline = offline_enabled(cfg) or compliance_mode(cfg) == "local_only"
 
     # Offline mode: refuse cloud providers OUTRIGHT before constructing them (no client, no key
@@ -2055,14 +1979,6 @@ def _resolve_provider(name: str | None, cfg: dict, role: str | None = None) -> P
             f"provider {name!r} uses a vendor cloud endpoint and is refused. Use a local "
             f"(loopback) model server instead."
         )
-    if offline and name in OMP_BRIDGE_PROVIDER_IDS:
-        # The OMP sidecar is a local process, but every id it serves is a vendor cloud
-        # endpoint it calls on our behalf — refuse by name, before any child is spawned.
-        raise OfflineModeError(
-            f"offline mode is enabled (config '{OFFLINE_SETTING}': true): the cloud provider "
-            f"{name!r} is routed through the OMP sidecar to a vendor API endpoint and is "
-            f"refused. Use a local (loopback) model server instead."
-        )
 
     if not name:
         # Nothing configured: default to a local LM Studio (OpenAI-compatible) endpoint
@@ -2106,58 +2022,6 @@ def _resolve_provider(name: str | None, cfg: dict, role: str | None = None) -> P
 
             return RoleScriptedProvider(by_role)
         return MockProvider(replies or [""])
-
-    if name in OMP_BRIDGE_PROVIDER_IDS and not cfg.get(_SUBSCRIPTION_TOKEN_CFG_KEY):
-        # Cloud providers served by the OMP bun sidecar instead of a raw vendor SDK: the
-        # sidecar owns CAD's shared credential store, so an OAuth-only subscription (Claude
-        # Pro/Max, Kimi For Coding, …) completes here with no api_key at all, and no pip
-        # package has to be installed for the provider to work. Deliberately ahead of the
-        # native cloud branches below so a bridge id wins over a same-named SDK adapter.
-        # One exception, and it is a tenancy boundary, not a preference: an injected web
-        # subscription grant (_subscription_provider_config) must reach the native
-        # sub-provider that carries an explicit per-account bearer. "anthropic-sub" is also
-        # a bridge id, and the sidecar would resolve it from ITS OWN AuthStorage — i.e. the
-        # host operator's login — silently spending the wrong subscription.
-        from .providers.omp_bridge_provider import OmpBridgeProvider
-
-        aliases = _provider_cfg_names(name)
-        pc = _provider_cfg_section(cfg, name)
-        keys_map = cfg.get("keys") if isinstance(cfg.get("keys"), dict) else {}
-        # cfg["api_key"] is the flat single-provider slot the native branches read; it belongs
-        # to whoever cfg["provider"] names, and handing another provider's key to the sidecar
-        # would suppress its AuthStorage (OAuth) lookup entirely. Vendor env vars are left to
-        # the sidecar, which consults them itself.
-        flat_provider = str(cfg.get("provider") or "").lower()
-        flat_key = cfg.get("api_key") if flat_provider in ("", *aliases) else None
-        key = (
-            pc.get("api_key")
-            or flat_key
-            or next((keys_map[k] for k in aliases if keys_map.get(k)), None)
-        )
-        if name == "openrouter":
-            # mega-6, re-armed: openrouter joined OMP_BRIDGE_PROVIDER_IDS, which shadows the
-            # native branch below and with it the keyless refusal. The sidecar's "no apiKey
-            # -> resolve from AuthStorage" fallback only rescues OAuth subscriptions;
-            # OpenRouter has no OAuth-only form (see _openrouter_api_key), so a keyless
-            # construction here is a guaranteed 401 deferred to request time.
-            # The legacy flat slot is forwarded too, so the credential we actually send and
-            # the guard agree. Env stays the sidecar's own job.
-            key = key or cfg.get("openrouter_api_key")
-            if not _openrouter_api_key(cfg):
-                _refuse_keyless_openrouter()
-        model = cfg.get("model") or pc.get("model") or ""
-        caps = _catalog_caps(name, model, cfg)
-        vision = pc["vision"] if "vision" in pc else caps.get("vision", True)
-        prov = OmpBridgeProvider(
-            provider=name,
-            model=model,
-            api_key=key,
-            base_url=pc.get("base_url"),
-            reasoning_effort=cfg.get("reasoning_effort"),
-            supports_vision=bool(vision),
-            timeout=pc.get("timeout"),
-        )
-        return _attach_catalog_meta(prov, caps)
 
     if name == "anthropic":
         from .providers.anthropic_provider import AnthropicProvider, DEFAULT_MODEL

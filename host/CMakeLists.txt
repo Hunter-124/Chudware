@@ -178,6 +178,7 @@ set(CHUDWARE_CORE_SOURCES
   src/ui/provider_logos.cpp             # provider brand color + badge (Settings -> Providers)
   src/ui/provider_usage.cpp             # shared subscription usage poll (Settings + composer rings)
   src/ui/chudcode_descriptors.cpp       # Chudcode worker payload parsing (GL-free; unit-tested)
+  src/ui/chudcode_session_actions.cpp   # Chudcode session recovery actions + link (GL-free; unit-tested)
   src/ui/oauth_capture.cpp  # in-app xAI multi-account CEF OAuth (Settings → Accounts)
   src/ui/web_capabilities.cpp  # T-RF12: WASM-build gap table (ui::webBuild / ui::webGapReason)
   src/ui/web_provider_keys.cpp  # WASM-build per-account BYOK client (/api/providers/keys)
@@ -840,6 +841,24 @@ add_test(NAME test_chudcode_descriptors
   COMMAND test_chudcode_descriptors
   WORKING_DIRECTORY "${CMAKE_BINARY_DIR}")
 # --- end Chudcode payload parsing ---
+
+# --- Chudcode session recovery: links the REAL chudcode_session_actions.cpp (no GL /
+# imgui / AppState). Guards the four contract-frozen worker methods (export / branch /
+# repair / close): request params, tolerant response parsers, refusal + session_not_live
+# triage, and the per-conversation link's JSON round-trip (id/file/health only — the link
+# must never duplicate a transcript).
+add_executable(test_chudcode_session_actions
+  src/ui/chudcode_session_actions.cpp
+  tests/test_chudcode_session_actions.cpp)
+target_include_directories(test_chudcode_session_actions PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(test_chudcode_session_actions PRIVATE nlohmann_json::nlohmann_json)
+set_target_properties(test_chudcode_session_actions PROPERTIES
+  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+add_test(NAME test_chudcode_session_actions
+  COMMAND test_chudcode_session_actions
+  WORKING_DIRECTORY "${CMAKE_BINARY_DIR}")
+# --- end Chudcode session recovery ---
 
 # --- AsyncRpc streamed-event channel: links the REAL async_rpc.cpp against a stub
 # WorkerClient defined inside the test TU (call/abortPending/dtor only), so the queueing

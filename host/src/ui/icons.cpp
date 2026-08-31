@@ -218,7 +218,7 @@ void loadIcons(const std::string& assetsDir) {
             for (const auto& n : jroot["accent_tinted"]) {
                 if (!n.is_string()) continue;
                 const std::string base = n.get<std::string>();
-                for (int size : {32, 20}) {
+                for (int size : {kIconCellLarge, kIconCellSmall}) {
                     const std::string key = base + "@" + std::to_string(size);
                     if (!cells.contains(key)) continue;
                     const auto& cell = cells.at(key);
@@ -351,7 +351,7 @@ IconUV getIcon(const char* name, int size) {
     auto it = gAtlas.cells.find(key);
     if (it == gAtlas.cells.end()) {
         // Try the other size as a fallback before giving up.
-        int altSize = (size == 32) ? 20 : 32;
+        int altSize = (size == kIconCellLarge) ? kIconCellSmall : kIconCellLarge;
         char altKey[128];
         std::snprintf(altKey, sizeof(altKey), "%s@%d", name, altSize);
         it = gAtlas.cells.find(altKey);
@@ -571,7 +571,7 @@ void drawIconGlass(ImDrawList* dl, const char* name, ImVec2 center, float sizePx
 
     // Fallback: no SDF glyph (multi-color raster icon) — plain atlas draw, no halo. Cell-size
     // pick mirrors the v2 icons::pickCellSize convention (ui/imgui/src/theme/icons.cpp).
-    const int cellSize = (sizePx >= 24.f) ? 32 : 20;
+    const int cellSize = (sizePx >= 24.f) ? kIconCellLarge : kIconCellSmall;
     const IconUV ic = getIcon(name, cellSize);
     const float r = sizePx * 0.5f;
     dl->AddImage(ic.texId, ImVec2(center.x - r, center.y - r), ImVec2(center.x + r, center.y + r),

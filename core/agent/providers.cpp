@@ -22,7 +22,6 @@
 
 #include "agent/config.h"  // compliance_mode / provider_offline_safe / host_is_loopback (WS3)
 #include "agent/http.h"
-#include "agent/omp_bridge_client.h"
 
 namespace chudware {
 namespace agent {
@@ -543,8 +542,8 @@ BuiltRequest anthropic_build_request(const std::string& model, const std::string
         {"anthropic-version", "2023-06-01"},
         {"content-type", "application/json"},
     };
-    // omp: output_config.effort requires the effort-2025-11-24 beta header;
-    // without it some endpoints 400 the field even on adaptive-capable models.
+    // Anthropic requires the effort-2025-11-24 beta header with output_config.effort;
+    // without it some endpoints reject the field even on adaptive-capable models.
     if (send_effort) {
         r.headers.push_back({"anthropic-beta", "effort-2025-11-24"});
     }
@@ -1089,9 +1088,6 @@ std::string humanize_provider_error(const std::string& raw) {
         return "The model provider returned an error. See details below.";
 
     // Resolution / config
-    // "no api key" is the bun bridge's own phrasing (omp MissingApiKeyError -> "No API key for
-    // provider: <id>") for a provider whose credential lives in neither CAD's config nor the
-    // bridge's AuthStorage.
     if (has("not signed in") || has("not configured") || has("missing api_key") ||
         has("no api key") || has("missing access_token"))
         return "Provider not signed in. Open Settings → AI → Accounts.";
@@ -1105,61 +1101,7 @@ std::string humanize_provider_error(const std::string& raw) {
     return s.empty() ? "The model provider failed." : s;
 }
 
-namespace {
-// --------------------------------------------------------------------------- omp bridge
-// Build the bridge's messages[] wire shape from CAD's existing base.py-mirrored part
-// representation (text_part/image_part/user_message above). CAD's parts already carry
-// {type:"text",text} / {type:"image",path}, which is the exact CadPart shape
-// vendor/omp/bridge/src/bridge.ts's readPart/convertPart expects — this only re-validates and
-// filters to the two part kinds the bridge accepts, mirroring anthropic_block/openai_content/
-// gemini_part's same-shaped per-provider builders above (each is also a pure part -> wire-part
-// function).
-json omp_bridge_part(const json& part) {
-    if (pstr(part, "type") == "image") {
-        json p = json{{"type", "image"}, {"path", pstr(part, "path")}};
-        // Pass inline base64 data straight through when the caller supplied it instead of a
-        // path (image_part() above only ever builds path-based parts today; kept so a future
-        // caller can hand the bridge already-loaded bytes without a round-trip through disk).
-        if (part.contains("data") && part["data"].is_string()) p["data"] = part["data"];
-        if (part.contains("mime") && part["mime"].is_string()) p["mime"] = part["mime"];
-        return p;
-    }
-    return json{{"type", "text"}, {"text", pstr(part, "text")}};
-}
 
-json omp_bridge_messages(const json& messages) {
-    json out = json::array();
-    for (const auto& m : messages) {
-        std::string role = m.value("role", std::string("user"));
-        if (role != "assistant") role = "user";  // bridge.ts normalizes the same way
-        json content = json::array();
-        if (m.contains("content") && m["content"].is_array())
-            for (const auto& p : m["content"]) content.push_back(omp_bridge_part(p));
-        out.push_back(json{{"role", role}, {"content", content}});
-    }
-    return out;
-}
-
-}  // namespace
-
-namespace {
-// Provider ids routed through the OMP bun bridge (core/agent/omp_bridge_client.h,
-// vendor/omp/bridge/src/bridge.ts) instead of a native libcurl/WinHTTP branch below.
-// Generated at vendor time from OMP's bundled catalog, excluding CAD's native transports
-// (openai, google, xai, xai-oauth, moonshot, cursor) and adding the auth-only bridge alias
-// anthropic-sub. Keeping the generated ids compiled in avoids file parsing or spawning Bun
-// while static provider configuration is resolved.
-const std::unordered_set<std::string>& omp_bridge_provider_ids() {
-    static const std::unordered_set<std::string> kOmpBridgeProviders = {
-#include "omp_bridge_provider_ids.inc"
-    };
-    return kOmpBridgeProviders;
-}
-}  // namespace
-
-bool is_omp_bridge_provider(const std::string& provider) {
-    return omp_bridge_provider_ids().count(provider) != 0;
-}
 
 // --------------------------------------------------------------------------- redaction (WS3)
 // Native C++ port of services/agent/redaction.py. compliance_mode=redact wraps cloud-bound
@@ -1757,109 +1699,6 @@ CompleteResult complete(const std::string& provider, const json& cfg, const std:
     std::string api_key = str_or(cfg, "api_key");
     std::string base_url = str_or(cfg, "base_url");
 
-    // OMP bridge — providers routed to the bun sidecar (core/agent/omp_bridge_client.h)
-    // instead of a native branch below. See is_omp_bridge_provider()'s TODO for how the
-    // provider set gets populated; this branch is additive and never shadows a native
-    // provider id. Contract keys threaded through: name (== provider), model, max_tokens,
-    // reasoning_effort — no temperature (docs/omp-integration/01-DECISIONS.md).
-    if (is_omp_bridge_provider(provider)) {
-        std::string model = str_or(cfg, "model");
-        std::string effort = str_or(cfg, "reasoning_effort");
-        // anthropic-sub is CAD's OAuth-subscription id; OMP's catalog has a single
-        // top-level "anthropic" key and auto-detects OAuth vs API-key from the token
-        // shape (isAnthropicOAuthToken), so both CAD ids must speak as "anthropic".
-        const std::string wire_provider =
-            (provider == "anthropic-sub") ? std::string("anthropic") : provider;
-        json params = {
-            {"provider", wire_provider},
-            {"model", model},
-            {"system", eff_system},
-            {"messages", omp_bridge_messages(eff_messages)},
-            {"maxTokens", max_tokens},
-        };
-        if (!api_key.empty()) params["apiKey"] = api_key;
-        if (!base_url.empty()) params["baseUrl"] = base_url;
-        if (!effort.empty()) params["reasoningEffort"] = effort;
-        // Stream ONLY when this run actually has a live sink to feed: the SAME one the native
-        // openai branch feeds (SseAccum::feed -> the run's g_provider_delta_emitter), so the GUI
-        // cannot tell a bridge delta from a native one. With no emitter installed there is
-        // nothing to show, and asking for `stream` would just make the sidecar write
-        // notification lines for the reader thread to parse and drop.
-        //
-        // Both the emitter and the cancel flag are thread_locals of THIS thread while the sink
-        // runs on the bridge client's reader thread, so bind them here instead of re-reading
-        // them over there. call() guarantees the sink is dead before it returns, which is what
-        // makes the reference capture and the raw flag pointer safe.
-        auto& delta_emit = g_provider_delta_emitter;
-        const std::atomic<bool>* cancel = g_provider_cancel;
-        OmpBridgeClient::OnEvent on_delta;
-        if (delta_emit) {
-            // bridge.ts then writes one {"id",event:"delta",data:{text|thinking}} line per
-            // fragment ahead of its unchanged final response line.
-            params["stream"] = true;
-            on_delta = [&delta_emit, cancel](const json& data, const std::string& event) {
-                if (event != "delta" || !delta_emit) return;
-                // Stop feeding the GUI the instant Stop is pressed; the client's own wait loop
-                // notices the same flag and abandons the call within its next 50 ms tick.
-                if (cancel && cancel->load(std::memory_order_acquire)) return;
-                for (const char* k : {"text", "thinking"}) {
-                    const auto it = data.find(k);
-                    if (it == data.end() || !it->is_string()) continue;
-                    const std::string c = it->get<std::string>();
-                    if (!c.empty()) delta_emit(c, k);
-                }
-            };
-        }
-
-        json result;
-        std::string bridge_err;
-        // 300 s: bridge.ts streams fragments as they arrive but writes its response line only
-        // once the completion has FULLY resolved, so this still has to tolerate a slow
-        // reasoning-model turn, not just RPC round-trip latency.
-        const bool ok = OmpBridgeClient::instance().call("complete", params, result, bridge_err,
-                                                          /*timeoutMs=*/300000, on_delta);
-        res.model = model;
-        res.endpoint = "omp-bridge:" + provider;
-        if (!ok) {
-            res.error = "omp-bridge " + provider + ": " +
-                        (bridge_err.empty() ? std::string("transport error") : bridge_err);
-            res.error_excerpt = truncate_excerpt(res.error);
-            return finish(std::move(res));
-        }
-        res.text = result.value("text", std::string());
-        res.thinking = result.value("thinking", std::string());
-        if (result.contains("usage") && !result["usage"].is_null())
-            res.usage = result["usage"];
-        if (result.value("stopReason", std::string()) == "error") {
-            std::string em = result.value("errorMessage", std::string("provider error"));
-            if (result.contains("errorStatus") && result["errorStatus"].is_number())
-                res.http_status = result["errorStatus"].get<int>();
-            // bridge.ts forwards the vendor's structured stopDetails. type=="refusal" means
-            // the request was SERVICED and declined, which is a different fact from a broken
-            // endpoint: the stage must fail on this attempt instead of paying to re-ask.
-            const json* sd = result.contains("stopDetails") && result["stopDetails"].is_object()
-                                 ? &result["stopDetails"]
-                                 : nullptr;
-            const bool refused = sd && sd->value("type", std::string()) == "refusal";
-            if (refused) {
-                const std::string category = sd->value("category", std::string());
-                res.error = provider + " " + kProviderRefusedMarker +
-                            (category.empty() ? std::string() : " (" + category + ")") + ": " + em;
-            } else {
-                res.error = "omp-bridge " + provider + ": " + em;
-            }
-            res.error_excerpt = truncate_excerpt(refused ? res.error : em);
-            return finish(std::move(res));
-        }
-        if (res.text.empty() && res.thinking.empty()) {
-            res.error = "omp-bridge " + provider + ": endpoint returned no completion";
-            res.error_excerpt = truncate_excerpt(res.error);
-            return finish(std::move(res));
-        }
-        // (usage threaded above from bridge.ts collapse()'s result.usage; cost accounting on
-        // top of it — 01-DECISIONS.md "Cost + cache" — is a later phase.)
-        return finish(std::move(res));
-    }
 
     // OpenAI-compatible family: openai / llamacpp / xai / xai-sub / moonshot / freellmapi.
     // chudware's Python XAISubProvider posts to /v1/chat/completions with Bearer

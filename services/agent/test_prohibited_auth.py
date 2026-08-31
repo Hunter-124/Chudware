@@ -9,6 +9,7 @@ Claude/Gemini. The BLESSED session login for non-subscription use is OpenRouter 
 
 Runs with no network/secrets; scans the working tree under the repo root.
 """
+
 from __future__ import annotations
 
 import re
@@ -41,9 +42,10 @@ ALLOWLIST = {
     "services/agent/providers/codex_sub_provider.py",
     "services/agent/providers/anthropic_sub_provider.py",
     "services/agent/providers/cursor_sub_provider.py",
-    # Vendored OMP provider registry: subscription-auth (Claude OAuth) is a
-    # sanctioned sign-in path through the OMP sidecar (§4.4).
-    "vendor/omp/packages/ai/src/registry/oauth/anthropic.ts",
+    # Multi-tenant web implementation of the owner-authorized §4.4 Anthropic
+    # flow; credentials are tenant-scoped in PostgreSQL rather than desktop config.
+    "Webservice/gateway/provider_accounts.py",
+    "Webservice/gateway/tests/test_provider_accounts.py",
 }
 SCAN_EXT = {".py", ".cpp", ".h", ".hpp", ".ps1", ".js", ".ts", ".json", ".toml", ".cfg"}
 
@@ -73,15 +75,20 @@ def _require_plausible_scan(files: list[str]) -> list[str]:
 
 def _tracked_files() -> list[str]:
     try:
-        out = subprocess.run(["git", "-C", str(REPO), "ls-files"],
-                             capture_output=True, text=True, check=True).stdout
+        out = subprocess.run(
+            ["git", "-C", str(REPO), "ls-files"],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout
     except (OSError, subprocess.CalledProcessError) as exc:
         raise AssertionError(
             f"cannot scan repo, guard did not run: `git ls-files` failed under {REPO} "
             f"({exc}). The consumer-OAuth prohibition was NOT checked."
         ) from exc
     return _require_plausible_scan(
-        [f for f in out.splitlines() if Path(f).suffix in SCAN_EXT])
+        [f for f in out.splitlines() if Path(f).suffix in SCAN_EXT]
+    )
 
 
 def _scan_files(
@@ -104,9 +111,7 @@ def _scan_files(
                 continue
             line_number = text.count("\n", 0, match.start()) + 1
             source_line = text.splitlines()[line_number - 1].strip()
-            hits.append(
-                f"{rel}:{line_number}: {source_line} [matches {pat.pattern!r}]"
-            )
+            hits.append(f"{rel}:{line_number}: {source_line} [matches {pat.pattern!r}]")
     return hits
 
 
@@ -122,6 +127,7 @@ def test_no_consumer_oauth_token_reuse():
         "contracts/providers.md, and only then add a narrowly scoped ALLOWLIST entry.\n"
         "Findings:\n  " + "\n  ".join(hits)
     )
+
 
 def test_scan_guard_refuses_to_pass_on_a_vacuous_file_list():
     """A scan that saw nothing must fail loudly, never silently pass.
@@ -144,9 +150,9 @@ def test_scan_sentinel_is_actually_tracked():
     violation = "https://claude." + "ai/oauth/authorize"
     hits = _scan_files([SCAN_SENTINEL], injected_text={SCAN_SENTINEL: violation})
     expected_pattern = r"claude\.ai/(?:oauth|api/auth)"
-    assert hits == [
-        f"{SCAN_SENTINEL}:1: {violation} [matches {expected_pattern!r}]"
-    ], "consumer-OAuth scanner is disabled or no longer examines tracked source text"
+    assert hits == [f"{SCAN_SENTINEL}:1: {violation} [matches {expected_pattern!r}]"], (
+        "consumer-OAuth scanner is disabled or no longer examines tracked source text"
+    )
 
 
 def test_openrouter_pkce_is_present_as_the_blessed_path():

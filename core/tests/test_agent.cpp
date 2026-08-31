@@ -258,8 +258,8 @@ TEST_CASE("a vendor content refusal is not a transport failure") {
     CHECK(human.find("Could not reach") == std::string::npos);
 
     // The converse: an actual connection failure is never read as a policy decision.
-    CHECK_FALSE(is_provider_refusal("omp-bridge ollama: connection refused"));
-    CHECK(humanize_provider_error("omp-bridge ollama: connection refused to 127.0.0.1")
+    CHECK_FALSE(is_provider_refusal("ollama: connection refused"));
+    CHECK(humanize_provider_error("ollama: connection refused to 127.0.0.1")
               .find("Could not reach") != std::string::npos);
 }
 

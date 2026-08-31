@@ -1623,3 +1623,51 @@ cleans stale Netgen cache variables and packaged libraries. Verification: both c
 trees and the desktop host build; `mesh`, `mesh_quality`, `mesher_advanced`, and `sim_cache`
 ctests pass; focused MCP simulation tests pass 9/9, argument reconciliation 83/83, and the
 live Simulation mesh panel shows only Polyhedral-FEA fineness/order/size/adaptive controls.
+
+## 2026-08-31 — Chudcode RPC became the sole online agent runtime
+
+**Superseding boundary.** Chudcode now owns every online top-level and nested provider call,
+provider auth and models, persistent sessions and branching, memory, compaction/retry/cache,
+browser/computer, and STT. Chudware retains CAD tools and schemas, documents/workspaces,
+roles, councils, mission/DAG policy, delegation governance, approvals, guardrails, PLM,
+event presentation, and the explicit offline-safe native local-modeling fallback. Every
+earlier entry in this log that describes the OMP adapter, vendored packages, or a private
+Python/C++ online provider loop is dated implementation history and is superseded by this
+entry; none is an operational runbook.
+
+**Clean cutover.** The vendored OMP source and its lock/updater, the Bun adapter and both
+private clients, and the duplicate online provider implementations were deleted rather than
+retained as fallback aliases. The operational skill is now
+`.claude/skills/cad-chudcode-integration/SKILL.md`; the retired skill name/path has no alias.
+The frozen research and RPC text under `docs/omp-integration/` remains only as explicit
+provenance, with its 2026-08-31 section naming the replacement authority.
+
+**Runtime and control topology.** Online `core/agent/run.cpp` calls the persistent services
+worker's `agent_admin_turn`; `services/agent/worker_rpc.py` assembles CAD role/governance
+context and run-scoped host tools, and process-global `ChudcodeSessionHost` owns one
+protocol-v2 `chudcode_rpc.RpcClient` process per Chudware conversation. Nested provider work
+stays inside that Chudcode session. The serialized worker stdio lane carries turns and
+streamed events; authenticated `worker_control_info` exposes a separate private Unix-socket
+or random-loopback-TCP lane so cancel/steer/status remain available while a turn blocks.
+Worker shutdown closes control first, then every saved-session and transient client.
+
+**Hard-won session/event/tool rules.** A persisted session file seeds a live conversation
+once and cannot change in place; LRU capacity evicts idle sessions only; close is idempotent,
+aborts active work, and preserves history. A turn requires terminal `agent_end`, streamed
+deltas are the only visible assistant text, and final message envelopes are lifecycle-only.
+Tool start/progress is status; terminal result/cancel becomes one correlated
+`agent.tool_call`; unknown frames remain bounded deterministic rows. Host-tool schemas and
+dispatch derive from the same effective CAD registry/allowlist, skip unbound tools, preserve
+Chudcode builtin ownership, and still cross CAD policy, cancellation, scaffold, guardrail,
+and loop-accounting chokepoints. Tool exceptions remain errors, never fabricated success.
+
+**Distribution and UI contract.** `vendor/chudcode/CHUDCODE_ARTIFACT.lock` is the sole
+compiled-runtime identity and pins product version, repository commit, RPC protocol, and
+immutable target digest/URL; null pins fail packaging closed, and staging is offline.
+`assets/ui-shared-manifest.json` uses `chud-ui-shared-v1` and is byte-identical to Chudcode's
+copy. It shares palette, tone/status names, usage thresholds, font provenance, and small icon
+vocabulary—not widgets or runtime authority—so both native products keep independent
+implementations and Chudware stays authoritative for CAD state.
+
+Documentation/skill-only verification was deliberately limited to repository reference
+audits, per this coordinated wave's instruction to skip gates and formatters.

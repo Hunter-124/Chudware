@@ -13,6 +13,7 @@
 #include "ui/copilot/image_lightbox.h"   // attachment thumbnail tile + full-size viewer
 #include "ui/copilot/context_estimate.h"  // transcript-size estimate behind the context meter
 #include "ui/chudcode_descriptors.h"      // ui::chudcodeCompactReplacement — compact-result guard
+#include "ui/chudcode_session_actions.h"  // per-conversation Chudcode session link (resume key)
 #include <climits>                        // INT_MAX saturation in activityCharsOf()
 
 // ---- auto-growing, wrapping chat input -------------------------------------------------------
@@ -248,9 +249,8 @@ static const char* providerWireName(int provider) {
 // alone retains the native core method. saveSettings still runs before each send so descriptor
 // details (base_url / api_key / model_path) match the picker, while these fields pin the selected
 // provider, model, and effort into the worker request.
-// Effort ladder for the picker's current model, OMP bridge catalog first (dynamic — K3 is
-// low|high|max, current Claude low|medium|high|xhigh|max, per the vendored OMP catalog),
-// the static family ladders in model_registry.h otherwise. Returns the rung count.
+// Effort ladder for the picker's current model, Chudcode catalog first and the static family
+// ladders in model_registry.h otherwise. Returns the rung count.
 static int composerEffortLadder(const Settings& s, const char** outLabels,
                                 const char** outValues, int maxN) {
     ui::ModelInfo probe;
@@ -259,7 +259,7 @@ static int composerEffortLadder(const Settings& s, const char** outLabels,
         bm && !bm->reasoningEfforts.empty()) {
         probe = ui::modelInfoFromProbe(s.provider, s.model, bm->name, bm->contextWindow,
                                        bm->maxTokens, bm->vision, bm->tools,
-                                       bm->reasoningEfforts, "omp");
+                                       bm->reasoningEfforts, "catalog");
         probeP = &probe;
     }
     return ui::reasoningEffortOptions(s.provider, s.model, outLabels, outValues, maxN, probeP);
@@ -270,11 +270,8 @@ nlohmann::json agentProviderOverride(const Settings& s) {
     const char* name = providerWireName(s.provider);
     std::string wire = name ? name : "";
     // The cloud-compat slot is shared by every base_url-keyed service (OpenRouter / DashScope /
-    // DeepSeek / Moonshot, plus the bridge-catalog ids that have no native transport at all).
-    // Pin the REAL provider name so resolve_provider lands on that service's descriptor — its
-    // OMP bridge id, or the first-class native "moonshot" branch for Kimi presets (kimi-k3 alias
-    // normalize, 1M context window, reasoning_effort=max) — instead of the generic openai one.
-    // saveSettings writes the same classified name + the matching credential to config.json.
+    // DeepSeek / Moonshot and other hosted provider ids). Pin the real provider name so
+    // Chudcode resolves the intended service rather than generic OpenAI compatibility.
     if (s.provider == ui::PROV_CLOUDCOMPAT)
         wire = ui::cloudServiceWireName(ui::cloudServiceKey(s.baseUrl));
     if (!wire.empty()) j["provider"] = wire;
@@ -793,6 +790,13 @@ static void attachAgentConversationOptions(AppState& st, nlohmann::json& opts) {
     opts["sessions_dir"] = chatSessionsDir();
     if (nlohmann::json hist = chatHistoryForAgent(st); !hist.empty())
         opts["history"] = std::move(hist);
+    // Chudcode session continuity: a conversation whose persisted link carries a session
+    // file resumes THAT service-side session (branch fork, closed runtime, app restart)
+    // instead of minting a fresh one. Launching also marks the runtime live — this turn
+    // creates or reattaches it — which is what arms the Sessions panel's recovery actions.
+    ChudcodeSessionLink& ccLink = chudcodeSessionLinkEnsure(st.activeConvId());
+    if (!ccLink.sessionFile.empty()) opts["chudcode_session_file"] = ccLink.sessionFile;
+    ccLink.runtimeLive = true;
 }
 
 // `extra` is merged on top of the provider override (attachments / context_refs / …).
@@ -2427,10 +2431,8 @@ static const char* composerProviderName(int provider) {
     return kProvNames[(provider >= 0 && provider < ui::PROV_COUNT) ? provider : ui::PROV_GEMINI];
 }
 
-// OMP provider id for the brand mark. This is the id space the Settings -> Providers rows hand
-// to drawProviderLogo, so the chip shows the IDENTICAL art. The resolve_provider wire name is a
-// DIFFERENT space ("kimi-sub" has no brand row; local endpoints resolve as "openai") and would
-// give a hashed badge or, worse, brand a loopback runtime as OpenAI.
+// Provider id for the brand mark. This is the id space the Settings -> Providers rows hand to
+// drawProviderLogo, so the chip shows the same art. It differs from local runtime wire names.
 static std::string composerProviderLogoId(const Settings& s) {
     switch (s.provider) {
         case ui::PROV_ANTHROPIC:   return "anthropic";
@@ -2445,12 +2447,10 @@ static std::string composerProviderLogoId(const Settings& s) {
     }
 }
 
-// The model's REAL display name ("Claude Sonnet 5"). Resolution order, best label first:
-//   1. the OMP bridge catalog (live, covers models the static table has never heard of),
-//   2. the static builtinModels() table (works offline / before the bridge catalog lands —
-//      without it the chip fell straight through to the bare id, which is exactly the
-//      "claude-sonnet-5" wire string the chip exists to replace),
-//   3. shortModelName, 4. the raw id.
+// The model's real display name ("Claude Sonnet 5"). Resolution order:
+//   1. cached Chudcode catalog metadata,
+//   2. static builtinModels() fallback,
+//   3. shortModelName, then the raw id.
 // Never carries the provider — the brand mark says that.
 static std::string composerModelName(const Settings& s) {
     if (!s.model[0]) return "default";
@@ -2502,18 +2502,13 @@ static bool ctxWindowSourceTrusted() {
 //      is a real answer ("user"/"catalog"/"probe"). A sourced server value describes the model
 //      that ACTUALLY ran, which Settings cannot know: the picker may have been changed
 //      mid-session, and an auto-route may have run a different model entirely.
-//   3. effectiveContextWindow() — the curated OMP catalog row for the SELECTED model, then an id
+//   3. effectiveContextWindow() — curated catalog metadata for the selected model, then an id
 //      estimate (ui_common.cpp).
 //   4. st.lastContextWindow even when its source is heuristic/unstated — better than nothing,
 //      but only once 3 has produced nothing at all.
 //
-// Why a heuristic server value must LOSE to the catalog, measured on this box 2026-07-28 and not
-// to be "simplified" back: services/agent/model_catalog.resolve_capabilities("anthropic",
-// "claude-opus-5") returns context=200000 with auto_source="heuristic" — a hardcoded
-// per-PROVIDER default, not a fact about that model — while the live OMP catalog row for the
-// same id reports contextWindow=1000000. Ranking the server unconditionally above the catalog
-// (as this function did before) made the first provider call DOWNGRADE a correct 1.0M readout to
-// a wrong 200k, i.e. the meter got worse the moment it had data.
+// A heuristic provider default must lose to model-specific catalog metadata. Otherwise the
+// first provider call can downgrade a correct model window to a generic family estimate.
 // 0 = genuinely unknown, never a real capacity.
 static int contextMeterWindow(const AppState& st) {
     if (st.settings.contextWindow > 0) return st.settings.contextWindow;
@@ -2733,9 +2728,9 @@ static void drawContextMeter(AppState& st, float roomForMeter) {
     if (showRing) {
         const ImVec2 p = ImGui::GetCursorScreenPos();
         // Same thresholds usageStatusColor() uses, so every gauge agrees on when amber turns red.
-        const float* role = frac < 0.5f  ? pal.statusOk
-                          : frac < 0.85f ? pal.statusWarn
-                                         : pal.statusErr;
+        const float* role = frac < ui::kUsageWarnFrac ? pal.statusOk
+                          : frac < ui::kUsageCritFrac ? pal.statusWarn
+                                                      : pal.statusErr;
         const ImU32 convCol = ImGui::ColorConvertFloat4ToU32(semanticOnGlass(role, surf));
         ImVec4 baseC = ImGui::ColorConvertU32ToFloat4(convCol);
         baseC.w *= 0.42f;    // same hue, clearly recessive: one gauge, two readable layers
@@ -2841,9 +2836,9 @@ static void drawContextMeter(AppState& st, float roomForMeter) {
         ImGui::PopTextWrapPos();
         if (win > 0 && used > 0) {
             const float barW = ui::metrics::px(400), barH = ui::metrics::px(9);
-            const float* role = frac < 0.5f  ? pal.statusOk
-                              : frac < 0.85f ? pal.statusWarn
-                                             : pal.statusErr;
+            const float* role = frac < ui::kUsageWarnFrac ? pal.statusOk
+                              : frac < ui::kUsageCritFrac ? pal.statusWarn
+                                                          : pal.statusErr;
             const ImU32 convCol = ImGui::ColorConvertFloat4ToU32(semanticOnGlass(role, surf));
             ImVec4 dim = ImGui::ColorConvertU32ToFloat4(convCol);
             dim.w *= 0.42f;
@@ -2944,11 +2939,8 @@ static float measureContextMeter(AppState& st, float roomForMeter) {
 // misleading empty ring. `draw == false` measures only (emits no ImGui items) so the caller can
 // right-align the usage cluster and the context gauge as one block.
 //
-// Two upstream stores can answer, and the omp bridge is asked FIRST: a Claude Max / ZenMux /
-// Kimi Code session signs in through the sidecar's own credential store, so the bridge is the
-// only source that knows about it — and it is the one Settings → Providers already agrees with.
-// The Python subscription poller serves everything else (xAI, Cursor) and remains the fallback
-// for a bridge provider that has not answered yet.
+// Chudcode is authoritative for online account usage (Claude Max, ZenMux, Kimi Code, xAI,
+// Cursor). Providers without usage windows simply contribute no rings.
 //
 // `budget` is the width the rings may consume. Indicators are dropped from the END until the
 // set fits, rather than all-or-nothing: a 340dp column only clears ~90dp next to the context
@@ -3080,15 +3072,11 @@ static void drawComposerPrelude(AppState& st, bool busy) {
     // being MANAGED here, the rings just need the active account's windows to stay roughly fresh.
     ui::providerUsagePollAccounts(st, 60.0, false);
     ui::providerUsagePollUsage(st, false);
-    // Bridge-owned providers (Claude Max / ZenMux / Kimi Code) keep their windows in the omp
-    // sidecar's credential store, which the two subscription RPCs above cannot see. Only the
-    // ACTIVE provider is polled, on the same 5-min TTL — one RPC per provider per five minutes.
+    // Chudcode owns online account usage. Poll only the active provider on the existing
+    // five-minute TTL.
     if (const char* bridgeUsageId = ui::bridgeProviderForCad(st.settings.provider))
         ui::providerUsagePollBridge(st, bridgeUsageId, false);
-    // The model chip's human name ("Claude Opus 5") comes from the OMP catalog. Until now the
-    // catalog was only fetched by the Settings/Providers UI and the model dropdown, so a user who
-    // never opened either saw the raw id in the chip — the exact thing the chip stopped showing.
-    // Same 5-min TTL + in-flight guard, so this is one RPC per session in practice.
+    // Refresh cached model names on the same TTL so the chip does not fall back to raw ids.
     ui::refreshBridgeModelCatalog(st, false);
 
     // Compact frame height matching the toolbar chips (model / thinking / New).

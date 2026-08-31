@@ -4,8 +4,8 @@
 // observed spend + tokens, a per-model breakdown, and a per-session breakdown so the user can
 // see where the tokens (and dollars) went. Pure client-side aggregation over st.chat /
 // st.conversations[].msgs (the same completed-turn ActivityItem token counts the per-session
-// cost strip uses) priced with the cached OMP bridge model catalog (ui::bridgeModelMeta) —
-// no extra RPC, no fake numbers: sessions/models with no priced turns simply don't appear.
+// cost strip uses), priced with cached Chudcode model metadata (ui::bridgeModelMeta). No extra
+// RPC and no fake numbers: sessions/models with no priced turns simply do not appear.
 #pragma once
 
 struct AppState;

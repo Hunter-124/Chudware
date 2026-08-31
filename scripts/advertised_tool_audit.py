@@ -165,6 +165,11 @@ NON_TOOL_MENTIONS: dict[str, tuple[str, tuple[str, ...]]] = {
         "engine.worker RPC method named in a host-facing worker_rpc error hint",
         ("services/agent/worker_rpc.py",),
     ),
+    "chudcode_compact": (
+        "private services-worker RPC method named in a session-command routing hint; "
+        "Chudcode owns the model-callable compact command",
+        ("services/agent/worker_rpc.py",),
+    ),
     "subscription_accounts": (
         "engine.worker RPC method named in a host-facing provider-login hint",
         ("services/agent/providers/subscription_login.py",),

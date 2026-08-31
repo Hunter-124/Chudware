@@ -50,11 +50,12 @@ void secHeader(const char* label) {
 }
 
 // Arc tone for a "share of a budget" ring — the SAME ladder the Copilot composer's
-// context-window meter uses (<50% ok, <85% warn, else err) so one colour means one thing.
+// context-window meter uses (ui::kUsageWarnFrac / kUsageCritFrac, the chud-ui-shared-v1
+// usage thresholds) so one colour means one thing.
 ImU32 fracArcCol(float frac) {
-    return frac < 0.50f ? Palette::toU32(palette.statusOk)
-         : frac < 0.85f ? Palette::toU32(palette.statusWarn)
-                        : Palette::toU32(palette.statusErr);
+    return frac < kUsageWarnFrac ? Palette::toU32(palette.statusOk)
+         : frac < kUsageCritFrac ? Palette::toU32(palette.statusWarn)
+                                 : Palette::toU32(palette.statusErr);
 }
 
 // Compact "how full is this" badge: the shared circular gauge (ui::drawFractionRing) plus the
@@ -79,9 +80,8 @@ struct ModelSpend {
     std::string provider, model;
     double usd = 0;
     long long tin = 0, tout = 0;
-    // `priced` = the OMP catalog carries a real price for this model, so `usd` is a computed
-    // figure. `localFree` = a local runtime, where $0 is the true price. Neither one true means
-    // "no price data": `usd` stays 0 and must never be shown as money.
+    // `priced` means the catalog carries a real price, so `usd` is computed. `localFree`
+    // means inference runs locally and $0 is real. Otherwise the price is unknown.
     bool priced = false;
     bool localFree = false;
 };
@@ -109,10 +109,9 @@ void drawMetricsView(AppState& st) {
         adaptivePanel(panelId("ai_ws_view_glass"), paneRect, GlassGroup::Global);
 
     // ---- aggregate every completed, model-stamped assistant turn across every session —
-    // active (st.chat) + parked (Conversation::msgs) — pricing with the cached OMP bridge
-    // catalog. Same $/Mtok formula the per-session cost strip's agent_cost_summary RPC uses (a
-    // pure linear calculator), computed client-side so Metrics needs zero extra round-trips and
-    // works even when the bridge RPC path is unavailable.
+    // active (st.chat) + parked (Conversation::msgs) — pricing with cached Chudcode model
+    // metadata. The same $/Mtok formula used by the per-session strip is computed client-side,
+    // so Metrics needs no extra round-trip and remains available while catalog refresh is down.
     // Pricing provenance is carried through with the money, exactly like the cost strip: a model
     // the catalog has no price for adds tokens but NO dollars, so every total it touches is a
     // floor and is labelled one. `hasCost` cannot make that distinction (`cost` is an object
@@ -166,8 +165,7 @@ void drawMetricsView(AppState& st) {
         ImGui::Dummy(ImVec2(0, avail * 0.35f));
         const char* msg = "No token usage yet";
         const char* sub = "Tokens and spend show up here once an assistant turn completes. "
-                          "Models the OMP catalog has no price for still report their tokens — "
-                          "they just can't report dollars.";
+                          "Models without catalog pricing still report tokens, but not dollars.";
         float mw = ImGui::CalcTextSize(msg).x;
         ImGui::SetCursorPosX(ImGui::GetCursorPosX() +
                              (ImGui::GetContentRegionAvail().x - mw) * 0.5f);
@@ -332,8 +330,8 @@ void drawMetricsView(AppState& st) {
         ImGui::TextWrapped(
             "Spend is catalog pricing \xc3\x97 tokens from completed turns \xe2\x80\x94 not a "
             "bill, and here not even a complete estimate: %d of %d models that spent tokens have "
-            "no price in the OMP catalog, so every \">=\" figure above is a floor. Those models' "
-            "tokens are counted; their dollars are unknown, not zero.",
+            "no catalog price, so every \">=\" figure above is a floor. Those models' tokens "
+            "are counted; their dollars are unknown, not zero.",
             (int)models.size() - knownPriceModels, (int)models.size());
     else
         ImGui::TextWrapped("Spend is catalog pricing \xc3\x97 tokens from completed turns "

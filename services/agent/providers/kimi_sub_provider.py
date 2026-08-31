@@ -8,14 +8,14 @@ billing runs through the subscription. Tokens are stored in config.json (via
 single refresh writer.
 
 Completions use the Anthropic-compatible endpoint at
-``https://api.kimi.com/coding/v1/messages`` (ported from omp's
-``providers/kimi.ts`` + ``openai-anthropic-shim.ts``): Bearer access token,
+``https://api.kimi.com/coding/v1/messages``: Bearer access token,
 ``anthropic-version`` header, the X-Msh-* Kimi CLI device headers, a required
 ``max_tokens``, and adaptive thinking. Usage probes hit
 ``GET /coding/v1/usages`` (see :mod:`usage`).
 
 Cloud provider: NEVER offline-safe.
 """
+
 from __future__ import annotations
 
 import base64
@@ -62,6 +62,7 @@ def wire_model(model: str | None) -> str:
     m = (model or DEFAULT_MODEL).strip()
     return _WIRE_ALIASES.get(m, DEFAULT_MODEL)
 
+
 CLIENT_ID = "17e5f671-d194-4dfb-9706-5516cb48c098"
 DEFAULT_OAUTH_HOST = "https://auth.kimi.com"
 DEFAULT_BASE_URL = "https://api.kimi.com/coding/v1"
@@ -100,7 +101,9 @@ def _sanitize_header(value: str, fallback: str = "") -> str:
 
 def _device_model() -> str:
     system = platform.system()
-    label = {"Darwin": "macOS", "Windows": "Windows", "Linux": "Linux"}.get(system, system)
+    label = {"Darwin": "macOS", "Windows": "Windows", "Linux": "Linux"}.get(
+        system, system
+    )
     return _sanitize_header(
         " ".join(p for p in (label, platform.release(), platform.machine()) if p),
         "unknown",
@@ -184,6 +187,7 @@ class KimiSubProvider(Provider):
         device-code UX works unchanged), optionally opens a browser, then polls
         the token endpoint until approved, denied, or expired.
         """
+
         def _progress(payload: dict) -> None:
             if progress is None:
                 return
@@ -213,7 +217,10 @@ class KimiSubProvider(Provider):
 
         log.info(
             "kimi oauth: device code issued (user_code=%s url=%s expires_in=%s interval=%s)",
-            user_code, verification_url, expires_in, interval,
+            user_code,
+            verification_url,
+            expires_in,
+            interval,
         )
         print(
             f"Go to {verification_url} and approve access"
@@ -227,15 +234,17 @@ class KimiSubProvider(Provider):
             browser_opened = open_verification_url(verification_url)
             log.info("kimi oauth: browser_opened=%s", browser_opened)
 
-        _progress({
-            "stage": "awaiting_approval",
-            "user_code": user_code,
-            "verification_url": verification_url,
-            "verification_uri": verification_uri,
-            "browser_opened": browser_opened,
-            "expires_in": expires_in,
-            "interval": interval,
-        })
+        _progress(
+            {
+                "stage": "awaiting_approval",
+                "user_code": user_code,
+                "verification_url": verification_url,
+                "verification_uri": verification_uri,
+                "browser_opened": browser_opened,
+                "expires_in": expires_in,
+                "interval": interval,
+            }
+        )
 
         try:
             payload = self._poll_for_token(
@@ -257,16 +266,19 @@ class KimiSubProvider(Provider):
 
         log.info(
             "kimi oauth: login ok (email=%s account_id=%s)",
-            cred.get("email"), cred.get("account_id"),
+            cred.get("email"),
+            cred.get("account_id"),
         )
-        _progress({
-            "stage": "connected",
-            "user_code": user_code,
-            "verification_url": verification_url,
-            "browser_opened": browser_opened,
-            "email": cred.get("email"),
-            "account_id": cred.get("account_id"),
-        })
+        _progress(
+            {
+                "stage": "connected",
+                "user_code": user_code,
+                "verification_url": verification_url,
+                "browser_opened": browser_opened,
+                "email": cred.get("email"),
+                "account_id": cred.get("account_id"),
+            }
+        )
         return cred
 
     def _request_device_authorization(self) -> dict:
@@ -282,7 +294,9 @@ class KimiSubProvider(Provider):
             raise RuntimeError(
                 f"Kimi device authorization failed (HTTP {exc.code}): {body}"
             ) from exc
-        if not all(payload.get(k) for k in ("user_code", "device_code", "verification_uri")):
+        if not all(
+            payload.get(k) for k in ("user_code", "device_code", "verification_uri")
+        ):
             raise RuntimeError(
                 "Kimi device authorization response missing required fields"
             )
@@ -342,7 +356,9 @@ class KimiSubProvider(Provider):
         )
 
     @staticmethod
-    def _parse_token_payload(payload: dict, refresh_fallback: str | None = None) -> dict:
+    def _parse_token_payload(
+        payload: dict, refresh_fallback: str | None = None
+    ) -> dict:
         access = payload.get("access_token")
         expires_in = payload.get("expires_in")
         if not access or not isinstance(expires_in, (int, float)):
@@ -368,7 +384,10 @@ class KimiSubProvider(Provider):
         else:
             email = ""
         cred["account_id"] = (
-            claims.get("sub") or claims.get("account_id") or claims.get("user_id") or None
+            claims.get("sub")
+            or claims.get("account_id")
+            or claims.get("user_id")
+            or None
         )
         cred["email"] = email or None
         # Preserve identity/usage metadata across refresh.
@@ -450,7 +469,9 @@ class KimiSubProvider(Provider):
     def _post_once(self, body: dict) -> dict:
         url = f"{_base_url()}/messages"
         data = json.dumps(body).encode("utf-8")
-        req = urllib.request.Request(url, data=data, headers=self._headers(), method="POST")
+        req = urllib.request.Request(
+            url, data=data, headers=self._headers(), method="POST"
+        )
         try:
             with urllib.request.urlopen(req, timeout=900) as resp:
                 return json.loads(resp.read().decode("utf-8"))
@@ -509,7 +530,8 @@ class KimiSubProvider(Provider):
                 model=str(self.model or ""),
                 prompt_tokens=u.get("input_tokens"),
                 completion_tokens=u.get("output_tokens"),
-                total_tokens=(u.get("input_tokens") or 0) + (u.get("output_tokens") or 0)
+                total_tokens=(u.get("input_tokens") or 0)
+                + (u.get("output_tokens") or 0)
                 if isinstance(u, dict)
                 else None,
                 source="api",

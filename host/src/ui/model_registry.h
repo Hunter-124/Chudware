@@ -27,14 +27,10 @@ enum ProviderIndex {
                           // so the offline (ITAR) guard REFUSES it while local stays allowed.
     PROV_XAI = 6,         // xAI Grok — API key (console.x.ai) and/or SuperGrok OAuth (xai-sub)
     PROV_CURSOR = 7,      // Cursor (Composer + proxied Anthropic/OpenAI models)
-    PROV_KIMISUB = 8,     // Kimi Code — OMP-bridge provider (wire "kimi-code"); the credential
-                          // lives in the bridge's auth db (Settings → Providers sign-in). The
-                          // Python "kimi-sub" subscription provider is a separate id/namespace.
-    PROV_ZENMUX = 9,      // ZenMux — OMP-bridge provider (core/agent/providers.cpp
-                          // kOmpBridgeProviders); credentials live in the bridge's own auth db
-                          // (Settings → Providers sign-in), not a local config.json key. Default
-                          // chat/agent provider (owner directive 2026-07-23: free x-ai/grok-4.5-free
-                          // tier works out of the box without an xAI sign-in).
+    PROV_KIMISUB = 8,     // Kimi Code — online auth/execution through Chudcode.
+    PROV_ZENMUX = 9,      // ZenMux — online auth/execution through Chudcode. Default provider
+                          // (owner directive 2026-07-23: free x-ai/grok-4.5-free tier works
+                          // without an xAI sign-in).
     PROV_FREELLMAPI = 10, // Free AI (FreeLLMAPI, github.com/tashfeenahmed/freellmapi) — a
                           // self-hosted OpenAI-compatible router stacking ~28 providers' free
                           // tiers behind one endpoint + one unified key. Own native wire
@@ -117,13 +113,10 @@ inline bool baseUrlIsLoopback(const std::string& base_url) {
            base_url.find("[::1]") != std::string::npos;
 }
 
-// Map a cloud base URL to its service category key (OpenRouter / Alibaba / DeepSeek / generic).
-// Bridge-catalog services with no native OpenAI-compatible transport (Bedrock / Azure /
-// Antigravity / AIMLAPI) ride this same slot, so their URL is purely a service DISCRIMINATOR:
-// the completion goes through the bun bridge, which supplies the real endpoint AND the
-// credential from its own AuthStorage. Those keys are spelled as the OMP bridge provider id
-// (core/agent/providers.cpp omp_bridge_provider_ids) so the picker badge, the logo lookup
-// (provider_logos.cpp) and cloudServiceWireName() below all agree on one spelling.
+// Map a cloud base URL to its service category key. Hosted services without a native
+// OpenAI-compatible transport use the URL only as a service discriminator; Chudcode owns
+// their real endpoint and credential. The same key drives picker badges, logos, and
+// cloudServiceWireName() below.
 inline const char* cloudServiceKey(const std::string& base_url) {
     if (base_url.find("openrouter.ai") != std::string::npos) return "openrouter";
     if (base_url.find("aliyuncs.com") != std::string::npos) return "alibaba";
@@ -136,12 +129,10 @@ inline const char* cloudServiceKey(const std::string& base_url) {
     return "cloud";
 }
 
-// Cloud-slot service key -> the wire provider NAME the core's resolve_provider(name, cfg, env)
-// expects. "alibaba" is the picker/category identity; its resolve_provider id is the bridge
-// catalog's "alibaba-coding-plan". "moonshot" keeps its first-class NATIVE branch
-// (core/agent/config.cpp), and an unclassified cloud endpoint stays the generic OpenAI-compatible
-// descriptor keyed by base_url. Everything else is already an OMP bridge id. Exhaustive over
-// cloudServiceKey()'s range — literals only, so the result never dangles.
+// Cloud-slot service key -> the wire provider name Chudcode expects. "alibaba" is the picker
+// category and maps to "alibaba-coding-plan"; "moonshot" keeps its native diagnostic identity,
+// while an unclassified endpoint stays generic OpenAI-compatible. Exhaustive over
+// cloudServiceKey()'s range; literals only, so the result never dangles.
 inline const char* cloudServiceWireName(const std::string& key) {
     if (key == "openrouter") return "openrouter";
     if (key == "alibaba") return "alibaba-coding-plan";
@@ -154,11 +145,9 @@ inline const char* cloudServiceWireName(const std::string& key) {
     return "openai";
 }
 
-// True when the cloud slot's OWN api-key field holds this service's credential. False for the
-// bridge-catalog services signed in under Settings -> Providers: their credential lives in the
-// bridge's AuthStorage, and forwarding an unrelated key from the SHARED cloud slot would defeat
-// the bridge's own lookup (vendor/omp/bridge/src/bridge.ts handleComplete falls back to
-// authStorage.getApiKey only when no apiKey is passed).
+// True when the cloud slot's own api-key field holds this service's credential. False for
+// services authenticated through Chudcode, where forwarding an unrelated key from the shared
+// slot would override the intended account.
 inline bool cloudServiceUsesLocalKey(const std::string& key) {
     return key != "amazon-bedrock" && key != "azure" && key != "google-antigravity" &&
            key != "aimlapi";
@@ -199,8 +188,8 @@ inline const char* providerLabelForEndpoint(int provider, const char* base_url) 
 // (a local endpoint can serve any GGUF), so they are NOT listed here — the probe fills them.
 inline const std::vector<ModelInfo>& builtinModels() {
     static const std::vector<ModelInfo> kModels = {
-        // ZenMux — OMP-bridge provider; owner directive 2026-07-23 default. Free x-ai/grok-4.5-free
-        // tier needs only a ZenMux sign-in (Settings → Providers), not an xAI credential.
+        // ZenMux; owner directive 2026-07-23 default. Free x-ai/grok-4.5-free tier needs only a
+        // ZenMux sign-in through Chudcode, not an xAI credential.
         {PROV_ZENMUX, "x-ai/grok-4.5-free", "Grok 4.5 (default, free via ZenMux)", true, true},
         {PROV_ZENMUX, "moonshotai/kimi-k3", "Kimi K3 (via ZenMux)", true, true},
         {PROV_ZENMUX, "moonshotai/kimi-k3-free", "Kimi K3 (free via ZenMux)", true, true},
@@ -208,11 +197,9 @@ inline const std::vector<ModelInfo>& builtinModels() {
         {PROV_GEMINI, "gemini-2.5-pro", "Gemini 2.5 Pro", true, true},
         {PROV_GEMINI, "gemini-2.5-flash", "Gemini 2.5 Flash", true, true},
         {PROV_GEMINI, "gemini-2.0-flash", "Gemini 2.0 Flash", true, false},
-        // Anthropic — FALLBACK ONLY, in live-API order (newest first). The real list comes from
-        // the agent_list_models probe (libchudware.cpp), which asks the OMP bridge / Anthropic's
-        // GET /v1/models and wins whenever it answers; these rows are what the picker shows
-        // before/without a successful probe. Do NOT treat this as the source of truth — a new
-        // Claude release needs no edit here to appear, only a reachable credential.
+        // Anthropic fallback rows in live-API order (newest first). Chudcode catalog metadata
+        // wins when available; the native agent_list_models probe can also refresh API-key
+        // accounts directly. These rows keep the picker usable before either source answers.
         {PROV_ANTHROPIC, "claude-opus-5", "Claude Opus 5", true, true},
         {PROV_ANTHROPIC, "claude-sonnet-5", "Claude Sonnet 5", true, true},
         {PROV_ANTHROPIC, "claude-fable-5", "Claude Fable 5", true, true},
@@ -228,10 +215,8 @@ inline const std::vector<ModelInfo>& builtinModels() {
         // (ERROR_BAD_MODEL_NAME), and composer-1/1.5 are sunset — every pick failed.
         {PROV_CURSOR, "composer-2.5", "Cursor Composer 2.5", true, true},
         {PROV_CURSOR, "composer-2", "Cursor Composer 2", true, true},
-        // Kimi Code (wire provider "kimi-code", routed through the OMP bridge) — the ids
-        // here ARE the endpoint's wire ids (no alias layer). K3 is the CAD-modeling
-        // priority model (1M ctx); K3-256k caps the window for cheaper turns; K2.7
-        // Coding is the lighter secondary.
+        // Kimi Code wire ids. K3 is the CAD-modeling priority model (1M context); K3-256k
+        // caps the window for cheaper turns; K2.7 Coding is the lighter secondary.
         {PROV_KIMISUB, "k3", "Kimi K3 (1M)", true, true},
         {PROV_KIMISUB, "k3-256k", "Kimi K3-256k (256K)", true, true},
         {PROV_KIMISUB, "kimi-for-coding", "Kimi K2.7 Coding (262K)", true, true},
@@ -452,7 +437,7 @@ inline int reasoningEffortOptions(int provider, const std::string& id,
     struct Opt { const char* label; const char* value; };
     static const Opt kGemini[] = {{"Off", "off"}, {"Low", "low"}, {"Medium", "medium"},
                                   {"High", "high"}, {"Max", "max"}};
-    // Current Claude scale (claude-opus-5/4-8 etc., OMP catalog anthropic-adaptive).
+    // Current Claude scale (claude-opus-5/4-8 etc.).
     static const Opt kAnthropic[] = {{"Low", "low"}, {"Medium", "medium"}, {"High", "high"},
                                      {"Xhigh", "xhigh"}, {"Max", "max"}};
     // Kimi K3's mandatory wire scale — there is NO off/medium rung (a medium pick 400s).

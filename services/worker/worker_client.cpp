@@ -453,19 +453,12 @@ bool routeDocToCpp(const std::string &method, const json &params) {
     return true;
   return false;
 }
-// --- C++ AGENT routing (opt-in, default OFF) --------------------------------
-// Route the in-app AI-agent RPCs (agent_run_v2 / agent_ask_v2 /
-// agent_pm_assist_v1 / get_prompts_v2) to the pure-C++ core (libchudware) instead
-// of the Python worker. This MIRRORS the doc_* seam and is unconditional since
-// R5a (T-RF21). (agent_design was deleted in T-RF5 — the v2 run is the only
-// agent path.) The C++ agent drives a C++-backed ("doc-cpp") doc session, so we
-// only route when the active doc is C++-backed; a Python doc (e.g. an assembly)
-// falls through to Python.
+// --- Native offline-agent routing ------------------------------------------------
+// Online turns use agent_admin_turn/Chudcode. These methods retain deterministic native
+// fallback behavior for C++ documents, plus read-only probes and control calls.
 bool cppAgentFlag() {
-  // R5a (T-RF21): the CHUDWARE_CPP_AGENT escape hatch is removed — the C++ agent
-  // is the only agent backend. The agent still drives the SAME doc session it
-  // edits (C++ agent <-> doc-cpp), so it follows the (unconditional) doc
-  // engine.
+  // Native fallback edits the same C++ document session, so availability follows the
+  // unconditional C++ document engine.
   return cppDocsFlag();
 }
 
@@ -1964,10 +1957,8 @@ bool WorkerClient::callImpl(const std::string &method, const json &params,
     err = "aborted";
     return false;
   }
-  // C++ AGENT routing (opt-in via CHUDWARE_CPP_AGENT, default OFF). Translate the
-  // in-app agent RPCs to the libchudware agent methods and run them in-process.
-  // Default OFF => routeAgentToCpp() returns false and this whole block is
-  // skipped (today's behavior).
+  // Native agent fallback. Online top-level turns arrive as agent_admin_turn and do not enter
+  // this block; libchudware restricts agent_run_v2 to offline-safe local providers.
   if (routeAgentToCpp(method, params)) {
     std::string cerr;
     json cppResult;
@@ -2281,26 +2272,17 @@ bool WorkerClient::callImpl(const std::string &method, const json &params,
       errorSink_(method, err);
     return false;
   }
-  // OMP provider bridge (agent_provider_*, agent_models_list, agent_cost_summary,
-  // agent_cap_raw) + ASR sidecar (agent_stt_*): these are served ONLY by the C++
-  // core (libchudware.cpp proxies them to the bun OMP bridge / catalog; hostd
-  // dispatches them in daemon mode). The Python worker never registered them, so
-  // without this they fall through to the pipe path below and die with "worker
-  // not started" whenever no Python child is up (the common Linux in-process /
-  // daemon case — the exact providers-menu bug). Route like cam_*/fw_*:
-  // structured error envelopes round-trip in `result`; hard failures surface via
-  // errorSink. Never fall back to Python.
-  if (method.rfind("agent_provider_", 0) == 0 || method.rfind("agent_stt_", 0) == 0 ||
-      method == "agent_models_list" || method == "agent_cost_summary" ||
-      method == "agent_cap_raw") {
+  // agent_cap_raw remains a pure native helper. It has no Python registration,
+  // so route it directly to the loaded core and never fall back to the pipe.
+  if (method == "agent_cap_raw") {
     std::string cerr;
     if (engine::call(method, params, result, cerr, timeoutMs))
-      return true; // handled (rc==0)
+      return true;
     if (result.is_object() && result.contains("code")) {
-      err = result.value("message", std::string("omp-bridge error"));
-      return true; // structured error round-tripped
+      err = result.value("message", std::string("agent_cap_raw error"));
+      return true;
     }
-    err = cerr.empty() ? ("omp-bridge (" + method + ") failed") : cerr;
+    err = cerr.empty() ? "agent_cap_raw failed" : cerr;
     if (errorSink_)
       errorSink_(method, err);
     return false;

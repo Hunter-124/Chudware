@@ -31,12 +31,13 @@ namespace {
 inline float rowRoundDp() { return ui::metrics::cpMenuRowRound() / ui::uiScale; }
 
 // Arc tone for a "how far along is this" ring — the SAME ladder the Copilot composer's
-// context-window meter uses (<50% ok, <85% warn, else err), applied to the REMAINING share
-// so a nearly-finished plan reads green and a barely-started one reads hot.
+// context-window meter uses (ui::kUsageWarnFrac / kUsageCritFrac, the chud-ui-shared-v1
+// usage thresholds), applied to the REMAINING share so a nearly-finished plan reads green
+// and a barely-started one reads hot.
 inline ImU32 fracArcCol(float remaining) {
-    return remaining < 0.50f ? Palette::toU32(palette.statusOk)
-         : remaining < 0.85f ? Palette::toU32(palette.statusWarn)
-                             : Palette::toU32(palette.statusErr);
+    return remaining < kUsageWarnFrac ? Palette::toU32(palette.statusOk)
+         : remaining < kUsageCritFrac ? Palette::toU32(palette.statusWarn)
+                                      : Palette::toU32(palette.statusErr);
 }
 
 // ---- plan snapshot (de)serialization --------------------------------------------

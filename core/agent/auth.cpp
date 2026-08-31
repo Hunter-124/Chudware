@@ -788,7 +788,7 @@ RefreshOutcome refresh_kimi(const json& cred) {
     // Kimi omits refresh_token on refresh responses — keep the old one.
     std::string new_rt = str_field(resp, "refresh_token");
     if (new_rt.empty()) new_rt = rt;
-    // Skew subtracted at store time (omp parseTokenPayload).
+    // Skew is subtracted at store time.
     long long exp = now_ms() +
                     static_cast<long long>(num_field(resp, "expires_in", 3600.0)) * 1000 -
                     kEnsureFreshSkewMs;

@@ -87,13 +87,10 @@ enum class CopilotMode : int {
 
 struct Settings {
     int provider = 9;  // 0=Anthropic 1=OpenAI 2=Local OpenAI-compat 3=managed llama.cpp 4=Gemini
-                       // 5=Cloud OpenAI-compat 6=xAI 7=Cursor 8=Kimi Code 9=ZenMux (OMP bridge)
-                       // 10=Free AI (FreeLLMAPI, native "freellmapi" wire — always cloud-classified).
-                       // Default ZenMux x-ai/grok-4.5-free (owner directive 2026-07-23: xAI/grok-4.5
-                       // required an xAI sign-in most installs don't have — every fresh chat opened
-                       // to "xAI not configured". ZenMux's free tier works out of the box off a
-                       // ZenMux sign-in via the OMP bridge (Settings → Providers); OpenRouter's
-                       // ":free" models are the documented backup when ZenMux itself is unusable).
+                       // 5=Cloud OpenAI-compat 6=xAI 7=Cursor 8=Kimi Code 9=ZenMux (Chudcode)
+                       // 10=Free AI (FreeLLMAPI, always cloud-classified).
+                       // Default ZenMux x-ai/grok-4.5-free; online auth and execution are owned
+                       // by Chudcode, while explicit offline mode retains only local providers.
     char model[512] = "x-ai/grok-4.5-free";  // frontier-free default; auto-pick still routes cheap
                                              // work down
     char apiKey[256] = "";        // active-provider key (local OpenAI-compat optional key)
@@ -1518,10 +1515,9 @@ struct AppState {
     // ---- model picker availability (filled by the agent_list_models probe) ----
     ProviderModels providerModels[ui::PROV_COUNT];  // indexed by ui::ProviderIndex
     std::atomic<bool> modelProbeInFlight{false};
-    // Bridge (OMP) provider ids currently signed in (state != signed_out), populated by the
-    // Settings->Providers poll (settings_modal.cpp pollOmpProviderList). Read by the composer
-    // model dropdown so ONLY signed-in bridge providers' catalog models appear (no clutter from
-    // providers the user hasn't authed). Runtime-only (not persisted).
+    // Provider ids currently signed in through Chudcode, populated by the Settings poll.
+    // The composer uses this to hide catalog rows for accounts the user has not connected.
+    // Runtime-only (not persisted).
     std::set<std::string> signedInBridgeProviders;
 
     std::vector<char> chatInput{std::vector<char>(2048, 0)};

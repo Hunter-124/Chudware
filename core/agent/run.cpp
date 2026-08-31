@@ -565,9 +565,9 @@ struct ProviderDeltaGuard {
 // core/hostd/worker_bridge.cpp already owns a persistent worker bridge, but it lives in the
 // hostd executable, which dlopens this agent code as a shared library (never the other way
 // around), so nothing in core/agent can reach that singleton across the link boundary. This
-// is a minimal, single-shot client for the one method the admin branch needs, mirroring the
-// fork/pipe/PDEATHSIG idiom used by OmpBridgeClient and hostd's WorkerBridge. Packaged builds
-// require CHUDWARE_WORKER_BIN; developer builds retain Python source execution. POSIX only;
+// is a minimal, single-shot client for the one method the admin branch needs, mirroring
+// hostd's WorkerBridge fork/pipe/PDEATHSIG idiom. Packaged builds require
+// CHUDWARE_WORKER_BIN; developer builds retain Python source execution. POSIX only;
 // Windows reports unavailable so the caller falls back to the existing blocked response.
 #if !defined(_WIN32)
 bool admin_worker_file_exists(const std::string& p) {

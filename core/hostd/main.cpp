@@ -622,18 +622,9 @@ int main(int argc, char** argv) {
     // recovery is crash-only. A hard kill skips this and leaves the dir as the crash signal.
     autosave.stop();
     loader.join();
-    // Deterministic sidecar reap on an explicit drain/--stop (or ordinary idle-exit), instead
-    // of relying on static-destructor order at process exit:
-    //  - WorkerBridge is compiled directly into chudware-hostd (hostd/worker_bridge.cpp), so
-    //    its singleton lives in this process's own image — safe to stop here.
-    //  - OmpBridgeClient (core/agent/omp_bridge_client.{h,cpp}) lives inside libchudware.so,
-    //    which chudware-hostd only reaches via dlopen + the flat C-ABI
-    //    (services/worker/cpp_core.cpp, core/api/libchudware.h). chudware_agent_sidecars_shutdown
-    //    is the exported entry point that reaches it from this process's own linked code;
-    //    guarded on available() so a never-loaded/failed-load engine is skipped rather than
-    //    lazily loaded just to shut sidecars down.
+    // Deterministically reap the directly-owned worker child on explicit drain/--stop
+    // (or ordinary idle-exit), rather than relying on static-destructor order.
     hostd::WorkerBridge::shutdownIfCreated();
-    if (core::cpp_core().available()) core::cpp_core().shutdownSidecars();
     // T-PERF10 drain-window: hand the sock path to SingleInstance BEFORE the
     // Server dtor closes the listen fd, so unlink happens only at flock release
     // (instance is destroyed after server, so order is: close fd → release flock

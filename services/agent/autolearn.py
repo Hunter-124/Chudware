@@ -1,20 +1,14 @@
-"""OMP Auto-Learn sidecar — standing guidance + optional post-stop capture.
+"""Auto-Learn standing guidance and optional post-stop capture.
 
-Mirrors vendor OMP ``autolearn/controller.ts`` + settings keys:
+The implementation maps the persisted ``agent.autolearn_*`` settings onto CAD's
+ledger and project-memory surfaces. It never introduces a second online agent
+or memory backend:
 
-  * ``autolearn.enabled``      → ``agent.autolearn_enabled``
-  * ``autolearn.autoContinue`` → ``agent.autolearn_auto_continue``
-  * ``autolearn.minToolCalls`` → ``agent.autolearn_min_tool_calls``
-
-CAD adaptations (no ``manage_skill`` / ``learn`` MCP tools in our registry):
-
-  * Standing guidance points at ``ledger_note`` + project memory (written when
-    ``agent.memory_learn`` is on) instead of OMP managed-skills.
-  * Auto-run capture at stop writes a compact "lesson" note via
-    ``project_memory.remember`` when a memory backend is available; never
-    raises into the turn path. When memory is disabled / backend unavailable,
-    the capture is a no-op (graceful degrade).
+* Standing guidance points at ``ledger_note`` plus project memory when enabled.
+* Post-turn capture writes one compact lesson through ``project_memory.remember``.
+* A disabled or unavailable memory backend degrades to a no-op.
 """
+
 from __future__ import annotations
 
 import logging
@@ -22,8 +16,7 @@ from typing import Any
 
 log = logging.getLogger("chudware.autolearn")
 
-# Standing system-prompt guidance (adapted from OMP autolearn-guidance.md +
-# autolearn-guidance-learn.md for CAD's ledger / project_memory surface).
+# Standing system-prompt guidance for CAD's ledger/project-memory surface.
 _GUIDANCE = """## Auto-Learn (experimental)
 
 You can grow durable project memory as you work.
@@ -40,6 +33,7 @@ def standing_guidance(cfg: dict | None = None) -> str:
     """Return standing Auto-Learn system guidance, or ``\"\"`` when disabled."""
     try:
         from services.agent.config import autolearn_enabled  # noqa: PLC0415
+
         if not autolearn_enabled(cfg):
             return ""
     except Exception:  # noqa: BLE001
@@ -55,7 +49,7 @@ def maybe_capture_after_turn(
     project_root: str | None = None,
     cfg: dict | None = None,
 ) -> dict[str, Any]:
-    """Post-stop Auto-Learn capture (OMP ``autolearn.autoContinue``).
+    """Capture one durable project lesson after a qualifying turn.
 
     When enabled and *tool_calls* ≥ min threshold, write one project-memory
     note summarizing that the turn produced reusable work. Returns a small
@@ -71,6 +65,7 @@ def maybe_capture_after_turn(
             memory_learn_enabled,
             workspace_dir,
         )
+
         if not autolearn_enabled(cfg):
             return out
         if not autolearn_auto_continue(cfg):
@@ -113,7 +108,9 @@ def maybe_capture_after_turn(
             f"{_CAPTURE_SUMMARY_PREFIX} After {tool_calls} tool call(s) "
             f"(stop={stop or 'n/a'}): {summary or req_snip or 'turn completed'}."
         )
-        mid = _pm.remember(root, body, kind="auto_learn", source="autolearn", importance=0.4)
+        mid = _pm.remember(
+            root, body, kind="auto_learn", source="autolearn", importance=0.4
+        )
         out = {"ok": True, "skipped": False, "memory_id": mid, "tool_calls": tool_calls}
         return out
     except Exception as exc:  # noqa: BLE001 — never break the turn

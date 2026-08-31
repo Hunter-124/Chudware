@@ -1,11 +1,9 @@
 // ui::webProviderKey* — the WASM build's per-account AI-provider credential client.
 //
-// Why this exists at all: on the desktop, "provider login" writes a credential into the
-// machine's own store (config.json keys.*, subscription_auth, or the OMP bridge auth db) and
-// the agent worker reads it back from the same process. The web build has neither. Its engine
-// worker is ONE chudware-hostd shared by every tenant, so a credential written there belongs
-// to the operator and to everybody else at once, and Settings -> Providers' OMP flow
-// (agent_provider_* RPCs) is refused server-side for any account that is not an admin.
+// Why this exists at all: desktop provider login writes credentials into machine-local stores
+// consumed by Chudcode. The web build has no per-user machine store: its engine worker is one
+// chudware-hostd shared by every tenant, so a credential written there would belong to the
+// operator and every tenant at once. The web flow therefore never writes host-local auth.
 //
 // The gateway's answer is a per-account credential store: POST/GET/DELETE
 // /api/providers/keys (Webservice/gateway/provider_keys.py). A key posted there is validated
@@ -39,12 +37,10 @@ bool webProviderKeysAvailable();
 // The /api/providers/keys provider name for an AI-tab selection, or "" when this slot has no
 // per-account key path.
 //
-// The name MUST equal the wire provider the composer sends with an agent turn, because that is
-// the string engine_bridge.py resolves the stored credential by. Empty for the subscription and
-// OMP-bridge slots (cursor / kimi-code / zenmux), for local endpoints, and for the cloud-slot
-// services the gateway has no validation endpoint for (deepseek, alibaba, bedrock, azure,
-// antigravity, aimlapi, and an unclassified endpoint) — drawing a key field for those would
-// promise a store that will reject the write.
+// The name must equal the wire provider sent with an agent turn, because engine_bridge.py uses
+// it to resolve the stored credential. Empty for subscription/hosted-account slots, local
+// endpoints, and services without a gateway validation endpoint; drawing a key field for those
+// would promise a store that rejects the write.
 std::string webProviderKeyName(int provider, const char* baseUrl);
 
 // This account's validated credentials, refreshed lazily in the background. The first call

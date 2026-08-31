@@ -25,8 +25,7 @@ namespace ui {
 void drawSettingsModal(AppState& state, bool busy);
 
 // Shared external-browser OAuth seam used by Settings -> Providers and first-run onboarding.
-// `beginExternalProviderSignIn` starts the OMP AuthStorage flow; `pollExternalProviderSignIn`
-// advances it and returns the provider's real progress/error. No embedded webview is involved.
+// Chudcode owns the flow; polling returns its progress/error. No embedded webview is involved.
 struct ExternalProviderSignInStatus {
     bool active = false;
     bool connected = false;

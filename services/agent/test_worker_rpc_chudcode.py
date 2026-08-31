@@ -34,6 +34,7 @@ class _FakeHost:
         self.memory_calls: list[tuple[str, dict]] = []
         self.transient_calls: list[tuple[str, dict]] = []
         self.session_calls: list[tuple[str, str, dict]] = []
+        self.recovery_calls: list[tuple] = []
         self.stt_states: dict[str, str] = {}
         self.shutdown_count = 0
 
@@ -285,6 +286,53 @@ class _FakeHost:
             }
         return {"ok": True, "enabled": payload["enabled"]}
 
+    def export_session(self, session_id, output_path=None):
+        self.recovery_calls.append(("export", session_id, output_path))
+        if session_id not in self.sessions:
+            return {"ok": False, "reason": "session_not_live"}
+        return {
+            "ok": True,
+            "path": output_path or f"/project/chat-exports/{session_id}.html",
+            "accessToken": "must-not-escape",
+        }
+
+    def branch_session(self, session_id, entry_id):
+        self.recovery_calls.append(("branch", session_id, entry_id))
+        if session_id not in self.sessions:
+            return {"ok": False, "reason": "session_not_live"}
+        self.sessions.pop(session_id)
+        return {
+            "ok": True,
+            "chudcode_session_id": f"cc-{session_id}-child",
+            "chudcode_session_file": f"/sessions/{session_id}-child.jsonl",
+            "secret": "must-not-escape",
+        }
+
+    def repair_session(self, session_id, repair=False):
+        self.recovery_calls.append(("repair", session_id, repair))
+        if session_id not in self.sessions:
+            return {"ok": False, "reason": "session_not_live"}
+        return {
+            "ok": True,
+            "mode": "repair" if repair else "dry-run",
+            "status": "healthy",
+            "changed": False,
+            "finding_count": 0,
+            "repairable_finding_count": 0,
+            "remaining_finding_count": 0,
+            "counts": {},
+            "findings": [],
+            "backup_path": None,
+            "chudcode_session_id": f"cc-{session_id}",
+            "chudcode_session_file": f"/sessions/{session_id}.jsonl",
+            "apiKey": "must-not-escape",
+        }
+
+    def close_session(self, session_id):
+        self.recovery_calls.append(("close", session_id))
+        self.sessions.pop(session_id, None)
+        return {"ok": True}
+
     def shutdown(self):
         self.shutdown_count += 1
 
@@ -461,6 +509,60 @@ def test_credit_denial_never_reaches_chudcode(online_lane, monkeypatch):
     assert online_lane.host.turns == []
 
 
+def test_subscription_grant_is_bound_for_one_chudcode_turn_only(
+    online_lane, monkeypatch
+):
+    clears: list[str] = []
+    bound: list[dict] = []
+
+    monkeypatch.setattr(
+        config, "clear_pooled_credentials", lambda: clears.append("clear")
+    )
+
+    def bind(grant):
+        if not isinstance(grant, dict) or not grant.get("access_token"):
+            raise ValueError("invalid grant")
+        bound.append(dict(grant))
+
+    monkeypatch.setattr(config, "bind_subscription_grant", bind)
+    actor = {
+        "email": "tenant-a@example.test",
+        "plan": "studio",
+        "credits_remaining": 0,
+        "key_source": "subscription",
+        "_subscription": {
+            "provider": "anthropic-sub",
+            "access_token": "tenant-a-bearer",
+        },
+    }
+
+    first = worker_rpc._agent_admin_turn(
+        _params(online_lane, run_id="tenant-a", _chudware_actor=actor),
+        lambda event: None,
+    )
+    assert first["ok"] is True
+    assert bound == [actor["_subscription"]]
+    assert clears == ["clear", "clear"]
+    assert len(online_lane.host.turns) == 1
+
+    second = worker_rpc._agent_admin_turn(
+        _params(
+            online_lane,
+            run_id="tenant-b",
+            _chudware_actor={
+                **actor,
+                "email": "tenant-b@example.test",
+                "_subscription": None,
+            },
+        ),
+        lambda event: None,
+    )
+    assert second == {"ok": False, "reason": "invalid_subscription_grant"}
+    assert bound == [actor["_subscription"]]
+    assert clears == ["clear", "clear", "clear"]
+    assert len(online_lane.host.turns) == 1
+
+
 @pytest.mark.parametrize(
     ("mode", "expected_ok", "expected_stop"),
     [
@@ -550,6 +652,10 @@ def test_registers_exact_shared_chudcode_worker_methods():
         "chudcode_login",
         "chudcode_models_list",
         "chudcode_session_stats",
+        "chudcode_export_session",
+        "chudcode_branch_session",
+        "chudcode_repair_session",
+        "chudcode_close_session",
         "chudcode_compact",
         "chudcode_set_auto_compaction",
         "chudcode_set_auto_retry",
@@ -655,6 +761,61 @@ def test_live_session_management_is_isolated_bounded_and_capability_honest(onlin
         "compact",
         {"customInstructions": "Keep decisions"},
     ) in online_lane.host.session_calls
+
+
+def test_recovery_worker_methods_are_exact_secret_free_and_never_activate_sessions(
+    online_lane,
+):
+    online_lane.host.sessions.update({"live": object(), "close-me": object()})
+    emit = lambda _event: None
+
+    exported = worker_rpc.WORKER_METHODS["chudcode_export_session"](
+        {"session_id": "live"}, emit
+    )
+    diagnosed = worker_rpc.WORKER_METHODS["chudcode_repair_session"](
+        {"session_id": "live", "repair": False}, emit
+    )
+    branched = worker_rpc.WORKER_METHODS["chudcode_branch_session"](
+        {"session_id": "live", "entry_id": "entry-3"}, emit
+    )
+    closed = worker_rpc.WORKER_METHODS["chudcode_close_session"](
+        {"session_id": "close-me"}, emit
+    )
+    closed_again = worker_rpc.WORKER_METHODS["chudcode_close_session"](
+        {"session_id": "close-me"}, emit
+    )
+    inactive = worker_rpc.WORKER_METHODS["chudcode_export_session"](
+        {"session_id": "inactive"}, emit
+    )
+
+    assert exported == {
+        "ok": True,
+        "path": "/project/chat-exports/live.html",
+    }
+    assert diagnosed == {
+        "ok": True,
+        "mode": "dry-run",
+        "status": "healthy",
+        "changed": False,
+        "finding_count": 0,
+        "repairable_finding_count": 0,
+        "remaining_finding_count": 0,
+        "counts": {},
+        "findings": [],
+        "backup_path": None,
+        "chudcode_session_id": "cc-live",
+        "chudcode_session_file": "/sessions/live.jsonl",
+    }
+    assert branched == {
+        "ok": True,
+        "chudcode_session_id": "cc-live-child",
+        "chudcode_session_file": "/sessions/live-child.jsonl",
+    }
+    assert closed == {"ok": True}
+    assert closed_again == {"ok": True}
+    assert inactive == {"ok": False, "reason": "session_not_live"}
+    assert "must-not-escape" not in repr((exported, diagnosed, branched))
+    assert set(online_lane.host.sessions) == set()
 
 
 def test_live_stt_worker_methods_are_bounded_isolated_and_cancellable(online_lane):
@@ -793,15 +954,12 @@ def test_legacy_session_adapters_never_rewrite_online_chudcode_history(monkeypat
     assert shake_calls == []
 
 
-def test_online_registration_never_selects_legacy_provider_loop(
-    online_lane, monkeypatch
-):
+def test_online_registration_uses_only_chudcode(online_lane, monkeypatch):
 
     def forbidden(*args, **kwargs):
-        raise AssertionError("legacy provider loop selected")
+        raise AssertionError("deterministic Python provider loop selected")
 
     monkeypatch.setattr(mission_dispatch, "run_linear_role_turn", forbidden)
-    monkeypatch.setattr(worker_rpc, "_legacy_offline_agent_admin_turn", forbidden)
 
     result = worker_rpc.WORKER_METHODS["agent_admin_turn"](
         _params(online_lane, run_id="clean-cutover"), lambda event: None

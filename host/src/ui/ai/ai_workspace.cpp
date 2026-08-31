@@ -9,12 +9,9 @@
 //
 // v3 (Hunter's UI directive): the main conversation owns the left; EVERYTHING else lives in
 // the right utility panel, switched by a vertical nav menu (Agent Hub | Session Plan |
-// Activity | Sessions | Insights | Options). No permanent
-// sessions rail, no bottom options strip. "Agent Hub" (OMP-style) lists every registered
-// sub-agent as
-// role-color-coded rows; clicking a row POPS UP a floating, role-themed chat window for that
-// sub-agent (several can be open at once) — the main chat is never replaced. New live
-// sub-agents auto-pop their chat (agent.ui_follow_active_session).
+// Activity | Sessions | Insights | Options). No permanent sessions rail or bottom options
+// strip. Agent Hub lists every registered sub-agent as role-colored rows; clicking one opens
+// a floating role-themed chat without replacing the main conversation.
 //
 // The conversation window renders the SAME state and send path as the docked Copilot
 // (st.chat / st.conversations / st.prompt) via the ui/copilot/copilot.h reuse hooks — single
@@ -1309,10 +1306,8 @@ static void drawAgentDagCanvas(AppState& st, AgentDagStore& dag, int verbosity) 
 }
 
 // ---- Agent Hub rows -------------------------------------------------------------
-// The sub-agent registry (s_sub.sessions, populated by pollSubagentList) rendered as
-// OMP-style rows: role-color wash + left bar, status glyph, role, right-aligned
-// model · age meta, and a dim brief line. Full visibility: EVERY registered agent shows,
-// live ones sorted first. Click pops that sub-agent's role-themed chat window (v3).
+// Render every registered sub-agent with a role wash, status glyph, model/age metadata, and
+// brief. Live sessions sort first; clicking opens the role-themed chat.
 static void drawAgentHubRows(AppState& st, const AdaptiveSurface& surf, float listH) {
     const float S = ui::uiScale;
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,
@@ -1431,7 +1426,7 @@ static void drawAgentHubRows(AppState& st, const AdaptiveSurface& surf, float li
     ImGui::EndChild();
 }
 
-// The Agent Hub view: OMP-style roster header + rows + the live execution DAG below.
+// The Agent Hub view: roster header, rows, and live execution DAG.
 // Honors agent.ui_verbosity:
 //   0 = node titles only · 1 = + detail lines · 2 = + actor/latency, counts, full text.
 static void drawAgentHubView(AppState& st) {
@@ -1452,7 +1447,7 @@ static void drawAgentHubView(AppState& st) {
     const AdaptiveSurface& surf =
         adaptivePanel(panelId("ai_ws_view_glass"), wRect, GlassGroup::Global);
 
-    // OMP-grammar header: "Agent Hub — N active · M parked" + live trace counts (verbosity 2).
+    // Header: "Agent Hub — N active · M parked" plus live trace counts at full verbosity.
     int live = 0;
     for (const auto& s : s_sub.sessions)
         if (s.status == "running" || s.status == "pending" ||

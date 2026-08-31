@@ -656,10 +656,8 @@ static const nlohmann::json* optionalJsonArr(const nlohmann::json& obj, const ch
     if (it == obj.end() || !it->is_array()) return nullptr;
     return &(*it);
 }
-// A rate-limit reset stamp: ISO-8601 from the Python worker, but the omp bridge sends it as a
-// NUMBER of milliseconds since the epoch. optionalJsonString() saw the number, returned empty,
-// and the countdown never rendered. ui::usageResetCountdown() reads both forms, so keep the ms
-// value verbatim as its decimal digits.
+// A rate-limit reset stamp may be ISO-8601 or a numeric epoch in milliseconds.
+// ui::usageResetCountdown() reads both forms, so keep numeric values as decimal digits.
 static std::string optionalJsonStamp(const nlohmann::json& obj, const char* key) {
     auto it = obj.find(key);
     if (it == obj.end()) return {};
@@ -1136,15 +1134,11 @@ static void drawSubscriptionAccounts(AppState& st, float sc) {
     }
 }
 
-// ---- Chudcode provider manager (Settings → Providers) — S-UI-PROV -----------------
-// Two-pane provider sign-in/manager per docs/omp-integration/research/design-provider-signin-ui.md
-// §3.1, driven by the persistent Chudcode worker service (chudcode_provider_list /
-// chudcode_auth_state / chudcode_validate_key|set_key|remove_key|logout / chudcode_login).
-// The UI holds no auth truth — it renders the last sanitized descriptor snapshot and
-// re-polls on open + short TTL (mirrors drawSubscriptionAccounts above). Degrade:
-// unknown_method (worker slice mid-flight / older service) temporarily falls back to the
-// legacy sections and is re-probed when this view is entered again and while a reconnected
-// runtime may be coming back.
+// ---- Chudcode provider manager (Settings → Providers) -------------------------------
+// Two-pane sign-in manager driven by the persistent Chudcode worker service
+// (chudcode_provider_list / chudcode_auth_state / chudcode_validate_key|set_key|remove_key|
+// logout / chudcode_login). The UI holds no auth truth: it renders the latest sanitized
+// descriptor snapshot and re-polls on open and on a short TTL.
 // Field-for-field the sanitized descriptor the worker emits — parsing lives in
 // chudcode_descriptors.cpp so host/tests can exercise the REAL rules.
 using OmpProviderRow = ui::ChudcodeProviderDesc;
@@ -2217,7 +2211,7 @@ static void drawOmpProviderDetail(AppState& st, float sc) {
         }
     }
 
-    // ---- Models section (OMP catalog: capability chips + ctx + $in/$out per Mtok) ----
+    // ---- Models section (catalog capability chips + ctx + $in/$out per Mtok) ----
     {
         int count = 0;
         for (const auto& m : ui::bridgeModelCatalog())
@@ -2353,13 +2347,8 @@ static void drawOmpProviderDetail(AppState& st, float sc) {
     ImGui::PopID();
 }
 
-// Settings -> Providers in the browser.
-//
-// The OMP manager below it is the wrong model on web and cannot be made right: its credentials
-// live in the ONE shared daemon's Chudcode auth store, and every chudcode_* auth RPC it drives is
-// refused for any account that is not an admin (Webservice/gateway/engine_bridge.py). A standard
-// web account therefore got an empty provider list, a refusal string, and an "Add API key" field
-// whose Validate & add could only fail — with no other way to give the app a credential.
+// Settings -> Providers in the browser cannot use a machine-global Chudcode auth store shared
+// by every tenant. Standard web accounts use the gateway's per-account credential store below.
 //
 // This is that way: the gateway's account-scoped store (POST/GET/DELETE /api/providers/keys),
 // which validates a key with the provider, seals it to the account, and resolves it server-side
@@ -2931,11 +2920,9 @@ static void pollBenchCategories(AppState& st, bool force) {
     });
 }
 
-// Wire provider name used by role/ranking RPCs (matches routing / config conventions).
-// PROV_CLOUDCOMPAT is a single slot hosting many services discriminated by base_url, so the
-// preset's own base_url picks the wire id (moonshot stays native; every other preset resolves
-// to its real OMP-bridge id) exactly the way composer.cpp::agentProviderOverride does. Emitting
-// a blanket "openrouter" here assigned roles to a provider the user never picked.
+// Wire provider name used by role/ranking RPCs. PROV_CLOUDCOMPAT is a single slot hosting
+// services discriminated by base_url, so the preset selects its real provider id exactly as
+// composer.cpp::agentProviderOverride does.
 static const char* roleProviderWire(int prov, const std::string& model = {}) {
     if (prov == ui::PROV_CLOUDCOMPAT) {
         for (const auto& p : ui::cloudPresets())
@@ -4446,8 +4433,8 @@ static void drawVisionRoutingSection(AppState& st, float sc) {
         std::memset(settings.expVisionKey, 0, sizeof(settings.expVisionKey));
         std::strncpy(settings.expVisionKey, src, sizeof(settings.expVisionKey) - 1);
     }
-    // Model id + endpoint side by side. Credential entry is intentionally absent: this AI tab
-    // never persists provider keys; Settings -> Providers owns validated AuthStorage writes.
+    // Model id + endpoint side by side. Credential entry is intentionally absent: provider
+    // credentials are managed by Chudcode under Settings -> Providers.
     ImGui::PushStyleVar(ImGuiStyleVar_CellPadding, ImVec2(4.0f * sc, 1.5f * sc));
     if (ImGui::BeginTable("##expvis_fields", 2,
                           ImGuiTableFlags_SizingStretchSame |
@@ -4558,9 +4545,7 @@ static void drawMemoryLearningSection(AppState& st, float sc) {
     Settings& settings = st.settings;
 
     static bool s_loaded = false;
-    // Unified compaction control. Maps to agent.compaction_strategy only — the retired OMP
-    // compaction backend and its agent.compaction_backend key were deleted with the config
-    // cutover; a legacy "omp" strategy value on disk loads as plain Snapcompact.
+    // Unified compaction control maps only to agent.compaction_strategy.
     // 0 Off | 1 Snapcompact | 2 Shake | 3 Summary
     static int s_compMode = 0;
     static bool s_supersedeReads = true;  // agent.compaction.supersede_reads
@@ -4575,7 +4560,7 @@ static void drawMemoryLearningSection(AppState& st, float sc) {
         s_loaded = true;
         {
             const std::string cs = loadAgentConfigString("compaction_strategy", "off");
-            if (cs == "snapcompact" || cs == "omp")   // legacy "omp" strategy = snapcompact
+            if (cs == "snapcompact")
                 s_compMode = 1;
             else if (cs == "shake")
                 s_compMode = 2;
@@ -8500,7 +8485,7 @@ void drawSettingsModal(AppState& st, bool busy) {
                 ImGui::EndTabItem();
             }
 
-// ---- Providers tab: OMP two-pane provider manager (legacy sections as the degrade path) ----
+// ---- Providers tab: Chudcode two-pane provider manager -----------------------------
             const char* providersTabLabel = s_omp.oauth.active
                                                 ? "Providers (sign-in active)###Providers"
                                                 : "Providers###Providers";

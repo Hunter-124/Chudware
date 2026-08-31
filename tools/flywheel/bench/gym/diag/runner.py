@@ -1,4 +1,5 @@
 """Run all diagnostic axes for one or more tiers and persist results."""
+
 from __future__ import annotations
 
 import json
@@ -19,15 +20,19 @@ REPORTS_DIR = _HERE.parent / "reports"
 DIAG_DIR = REPORTS_DIR / "diag"
 
 
-def _provider_for_tier(tier: str):
-    """Resolve provider the same way gym cells do."""
-    from tools.flywheel.bench.gym.runner import _provider_for_tier as gym_provider
-    return gym_provider(tier)
+def _completion_target_for_tier(tier: str):
+    """Resolve an offline provider or a Chudcode-backed completion adapter."""
+    from tools.flywheel.bench.gym.runner import _completion_provider_for_tier
+
+    return _completion_provider_for_tier(tier)
 
 
 def _model_meta(tier: str, provider: Any) -> dict[str, Any]:
     from services.agent.tiers import (
-        LOCAL_TIER_MODELS, parse_openrouter_tier, parse_xai_tier, load_local_models,
+        LOCAL_TIER_MODELS,
+        parse_openrouter_tier,
+        parse_xai_tier,
+        load_local_models,
     )
 
     or_model = parse_openrouter_tier(tier)
@@ -81,8 +86,8 @@ def run_diag(
 ) -> dict[str, Any]:
     """Run diagnostic suites for each tier.
 
-    *provider_factory(tier) -> Provider* is injectable for tests (mock provider).
-    Returns a results dict ready for write_diag_results / leaderboard aggregation.
+    ``provider_factory`` remains injectable for deterministic tests. The default
+    uses local providers only for explicit offline tiers and Chudcode otherwise.
     """
     wanted = list(axes) if axes else list(DIAG_AXES)
     runners = {
@@ -91,7 +96,7 @@ def run_diag(
         "feature_id": run_feature_id,
         "vc_hygiene": run_vc_hygiene,
     }
-    factory = provider_factory or _provider_for_tier
+    factory = provider_factory or _completion_target_for_tier
     per_tier: list[dict[str, Any]] = []
     any_mock = False
 
@@ -100,13 +105,20 @@ def run_diag(
         try:
             provider = factory(tier)
         except Exception as exc:  # noqa: BLE001 — fail closed per tier
-            per_tier.append({
-                "tier": tier,
-                "error": f"{type(exc).__name__}: {exc}",
-                "axes": {},
-                "model": {"id": tier, "label": tier, "provider": "error",
-                          "kind": "local", "tier": tier},
-            })
+            per_tier.append(
+                {
+                    "tier": tier,
+                    "error": f"{type(exc).__name__}: {exc}",
+                    "axes": {},
+                    "model": {
+                        "id": tier,
+                        "label": tier,
+                        "provider": "error",
+                        "kind": "local",
+                        "tier": tier,
+                    },
+                }
+            )
             continue
 
         pname = getattr(provider, "name", "") or ""
@@ -121,13 +133,15 @@ def run_diag(
                 continue
             axis_results[axis] = fn(provider, seed=seed)
 
-        per_tier.append({
-            "tier": tier,
-            "model": meta,
-            "axes": axis_results,
-            "elapsed_s": round(time.time() - t0, 3),
-            "supports_vision": bool(getattr(provider, "supports_vision", True)),
-        })
+        per_tier.append(
+            {
+                "tier": tier,
+                "model": meta,
+                "axes": axis_results,
+                "elapsed_s": round(time.time() - t0, 3),
+                "supports_vision": bool(getattr(provider, "supports_vision", True)),
+            }
+        )
 
     return {
         "schema": "aicad.diag/1",

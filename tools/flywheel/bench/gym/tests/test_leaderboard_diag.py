@@ -1,7 +1,8 @@
-"""Tests for openrouter tier parsing, diag graders, and leaderboard aggregator.
+"""Tests for benchmark tier routing, diagnostic graders and leaderboard output.
 
-Pure-python with a mock provider — no network, no engine.
+Pure Python with fake/local providers; online routes are asserted without network.
 """
+
 from __future__ import annotations
 
 import json
@@ -14,7 +15,10 @@ from services.agent.tiers import (
     parse_openrouter_tier,
     parse_xai_tier,
     effort_tier_for,
-    provider_for_tier,
+)
+from tools.flywheel.bench.gym.runner import (
+    _ChudcodeCompletionProvider,
+    _tier_execution,
 )
 from tools.flywheel.bench.gym.diag.tool_validity import (
     grade_tool_validity,
@@ -44,12 +48,18 @@ from tools.flywheel.bench.gym.leaderboard import (
 # Tier parsing
 # ---------------------------------------------------------------------------
 
+
 class TestOpenRouterTier:
     def test_parse_openrouter_tier_valid(self):
-        assert parse_openrouter_tier("openrouter:anthropic/claude-opus-4") == \
-            "anthropic/claude-opus-4"
+        assert (
+            parse_openrouter_tier("openrouter:anthropic/claude-opus-4")
+            == "anthropic/claude-opus-4"
+        )
         assert parse_openrouter_tier("openrouter:openai/gpt-4o") == "openai/gpt-4o"
-        assert parse_openrouter_tier("openrouter: google/gemma-2-9b ") == "google/gemma-2-9b"
+        assert (
+            parse_openrouter_tier("openrouter: google/gemma-2-9b ")
+            == "google/gemma-2-9b"
+        )
 
     def test_parse_openrouter_tier_rejects_non(self):
         assert parse_openrouter_tier("local-24k") is None
@@ -63,20 +73,26 @@ class TestOpenRouterTier:
         assert effort_tier_for("local-24k") == "local-24k"
         assert effort_tier_for("mid") == "mid"
 
-    def test_provider_for_tier_openrouter(self, monkeypatch):
+    def test_openrouter_tier_routes_identifiers_to_chudcode(self, monkeypatch):
         monkeypatch.delenv("CHUDWARE_PROVIDER", raising=False)
-        monkeypatch.setenv("OPENROUTER_API_KEY", "test-key-not-real")
-        prov = provider_for_tier("openrouter:anthropic/claude-opus-4", cfg={})
-        assert prov.name == "openrouter"
-        assert getattr(prov, "model", None) == "anthropic/claude-opus-4" or \
-            getattr(prov, "_model", None) == "anthropic/claude-opus-4" or \
-            "claude-opus-4" in str(getattr(prov, "model", getattr(prov, "_model", "")))
 
-    def test_provider_for_tier_env_override_wins(self, monkeypatch):
+        route = _tier_execution("openrouter:anthropic/claude-opus-4")
+
+        assert route["offline"] is False
+        assert route["provider"] is None
+        assert route["settings"] == {
+            "provider": "openrouter",
+            "model": "anthropic/claude-opus-4",
+        }
+
+    def test_deterministic_env_override_stays_offline(self, monkeypatch):
         monkeypatch.setenv("CHUDWARE_PROVIDER", "mock")
         monkeypatch.setenv("CHUDWARE_MOCK_REPLIES", "")
-        prov = provider_for_tier("openrouter:anthropic/claude-opus-4")
-        assert prov.name in ("mock", "mock-roles")
+
+        route = _tier_execution("openrouter:anthropic/claude-opus-4")
+
+        assert route["offline"] is True
+        assert route["provider"].name in ("mock", "mock-roles")
 
     def test_model_id_for_tier(self):
         m = model_id_for_tier("openrouter:anthropic/claude-opus-4")
@@ -105,16 +121,52 @@ class TestXaiTier:
         assert effort_tier_for("xai:grok-4.5") == "frontier"
         assert effort_tier_for("xai:grok-4-5") == "frontier"
 
-    def test_provider_for_tier_xai_api_key(self, monkeypatch):
+    def test_xai_tier_routes_identifiers_to_chudcode(self, monkeypatch):
         monkeypatch.delenv("CHUDWARE_PROVIDER", raising=False)
-        monkeypatch.setenv("XAI_API_KEY", "test-key-not-real")
-        # Ensure no subscription credential shadows the API-key path.
-        from services.agent.providers import sub_auth
-        monkeypatch.setattr(sub_auth, "load_credential", lambda _pid: None)
-        prov = provider_for_tier("xai:grok-4-5", cfg={})
-        assert prov.name in ("xai", "xai-sub")
-        assert getattr(prov, "model", None) in ("grok-4.5", "grok-4-5") or \
-            "grok-4" in str(getattr(prov, "model", ""))
+
+        route = _tier_execution("xai:grok-4-5")
+
+        assert route["offline"] is False
+        assert route["provider"] is None
+        assert route["settings"] == {"provider": "xai", "model": "grok-4-5"}
+
+    def test_online_completion_adapter_uses_shared_chudcode_host(self, monkeypatch):
+        from services.agent import chudcode_host
+
+        class Host:
+            def __init__(self):
+                self.turns = []
+                self.closed = []
+
+            def run_turn(self, params, emit):
+                self.turns.append(dict(params))
+                emit({"type": "assistant_delta", "text": "ignored"})
+                return {"ok": True, "result": "diagnostic answer"}
+
+            def close_session(self, session_id):
+                self.closed.append(session_id)
+
+        host = Host()
+        monkeypatch.setattr(chudcode_host, "get_default_chudcode_host", lambda: host)
+        provider = _ChudcodeCompletionProvider({"provider": "xai", "model": "grok-4-5"})
+
+        reply = provider.complete(
+            "Return JSON only.",
+            [{"role": "user", "content": [{"type": "text", "text": "hello"}]}],
+            max_tokens=321,
+        )
+
+        assert reply == "diagnostic answer"
+        assert len(host.turns) == 1
+        assert host.turns[0]["system_prompt"] == "Return JSON only."
+        assert host.turns[0]["request"] == "USER: hello"
+        assert host.turns[0]["host_tools"] == []
+        assert host.turns[0]["settings"] == {
+            "provider": "xai",
+            "model": "grok-4-5",
+        }
+        assert host.turns[0]["max_tokens"] == 321
+        assert host.closed == [host.turns[0]["session_id"]]
 
     def test_model_id_for_tier_xai(self):
         m = model_id_for_tier("xai:grok-4-5")
@@ -126,6 +178,7 @@ class TestXaiTier:
 # ---------------------------------------------------------------------------
 # tool_validity grader
 # ---------------------------------------------------------------------------
+
 
 class TestToolValidityGrader:
     def test_good_fenced_tool_call(self):
@@ -197,6 +250,7 @@ class TestToolValidityGrader:
 # vision_fix grader
 # ---------------------------------------------------------------------------
 
+
 class TestVisionFixGrader:
     def _task(self, wrong: bool = True):
         return {
@@ -243,6 +297,7 @@ class TestVisionFixGrader:
 # feature_id grader
 # ---------------------------------------------------------------------------
 
+
 class TestFeatureIdGrader:
     def test_good_exact_name(self):
         task = {
@@ -267,8 +322,9 @@ class TestFeatureIdGrader:
 
     def test_run_with_mock(self):
         # One correct reply reused (MockProvider clamps at last) — score > 0 for bore-ish.
-        prov = MockProvider(["Bore_H7", "Fillet_Rim", "BoltCircle_4xM6",
-                             "Extrude_Boss", "Pocket_Cut"])
+        prov = MockProvider(
+            ["Bore_H7", "Fillet_Rim", "BoltCircle_4xM6", "Extrude_Boss", "Pocket_Cut"]
+        )
         out = run_feature_id(prov, seed=1)
         assert out["axis"] == "feature_id"
         assert out["n_tasks"] == 5
@@ -280,6 +336,7 @@ class TestFeatureIdGrader:
 # vc_hygiene grader
 # ---------------------------------------------------------------------------
 
+
 class TestVcHygieneGrader:
     def test_extract_sequence_fenced(self):
         text = (
@@ -290,7 +347,9 @@ class TestVcHygieneGrader:
         assert seq == ["checkpoint", "delete_feature"]
 
     def test_extract_sequence_array(self):
-        text = '[{"tool": "checkpoint", "args": {}}, {"tool": "edit_feature", "args": {}}]'
+        text = (
+            '[{"tool": "checkpoint", "args": {}}, {"tool": "edit_feature", "args": {}}]'
+        )
         seq = extract_tool_sequence(text)
         assert seq[0] == "checkpoint"
         assert seq[1] == "edit_feature"
@@ -333,6 +392,7 @@ class TestVcHygieneGrader:
 # ---------------------------------------------------------------------------
 # diag runner + leaderboard aggregator
 # ---------------------------------------------------------------------------
+
 
 class TestDiagRunnerAndLeaderboard:
     def _mock_factory(self, tier: str):
@@ -381,8 +441,9 @@ class TestDiagRunnerAndLeaderboard:
         assert local["axes"]["vision_fix"]["score"] is None
         assert local["axes"]["vision_fix"]["skipped"] is True
         # openrouter: vision scored
-        paid = next(r for r in results["results"]
-                    if r["tier"].startswith("openrouter:"))
+        paid = next(
+            r for r in results["results"] if r["tier"].startswith("openrouter:")
+        )
         assert paid["axes"]["vision_fix"]["score"] is not None
         assert paid["model"]["id"] == "anthropic/claude-opus-4"
         assert paid["model"]["kind"] == "paid"
@@ -396,22 +457,37 @@ class TestDiagRunnerAndLeaderboard:
         # Minimal synthetic cells + diag.
         cells = [
             {
-                "challenge": "C1", "tier": "local-24k", "model": "qwen3-4b",
-                "mode": "mock", "seed": 1, "cycle": "cycle-1",
+                "challenge": "C1",
+                "tier": "local-24k",
+                "model": "qwen3-4b",
+                "mode": "mock",
+                "seed": 1,
+                "cycle": "cycle-1",
                 "passed": False,
                 "classifications": [{"failure_class": "incoherent_geometry"}],
                 "ledger_path": "",
             },
             {
-                "challenge": "C1", "tier": "local-24k", "model": "qwen3-4b",
-                "mode": "mock", "seed": 2, "cycle": "cycle-1",
-                "passed": True, "classifications": [], "ledger_path": "",
+                "challenge": "C1",
+                "tier": "local-24k",
+                "model": "qwen3-4b",
+                "mode": "mock",
+                "seed": 2,
+                "cycle": "cycle-1",
+                "passed": True,
+                "classifications": [],
+                "ledger_path": "",
             },
             {
-                "challenge": "C1", "tier": "openrouter:anthropic/claude-opus-4",
-                "model": "anthropic/claude-opus-4", "mode": "mock",
-                "seed": 1, "cycle": "cycle-1",
-                "passed": True, "classifications": [], "ledger_path": "",
+                "challenge": "C1",
+                "tier": "openrouter:anthropic/claude-opus-4",
+                "model": "anthropic/claude-opus-4",
+                "mode": "mock",
+                "seed": 1,
+                "cycle": "cycle-1",
+                "passed": True,
+                "classifications": [],
+                "ledger_path": "",
             },
         ]
         diag = run_diag(
@@ -421,12 +497,14 @@ class TestDiagRunnerAndLeaderboard:
         )
         doc = aggregate(
             cells=cells,
-            cycle_reports=[{
-                "cycle": "cycle-1",
-                "tiers": ["local-24k", "openrouter:anthropic/claude-opus-4"],
-                "execution_mode": "mock",
-                "pass_rates": {"overall": 0.5},
-            }],
+            cycle_reports=[
+                {
+                    "cycle": "cycle-1",
+                    "tiers": ["local-24k", "openrouter:anthropic/claude-opus-4"],
+                    "execution_mode": "mock",
+                    "pass_rates": {"overall": 0.5},
+                }
+            ],
             diag=diag,
             force_mock=True,
         )
@@ -443,10 +521,15 @@ class TestDiagRunnerAndLeaderboard:
             assert isinstance(m["primary"]["pass_rate"], float)
             assert isinstance(m["primary"]["cells_total"], int)
             assert set(m["axes"]) >= {
-                "tool_validity", "vision_fix", "feature_id", "vc_hygiene"
+                "tool_validity",
+                "vision_fix",
+                "feature_id",
+                "vc_hygiene",
             }
             assert set(m["cost"]) >= {
-                "usd_per_task_med", "latency_s_med", "tokens_per_task_med"
+                "usd_per_task_med",
+                "latency_s_med",
+                "tokens_per_task_med",
             }
             assert isinstance(m["per_challenge"], list)
             assert isinstance(m["failure_taxonomy"], dict)
@@ -464,14 +547,28 @@ class TestDiagRunnerAndLeaderboard:
     def test_real_scores_exclude_historical_mock_cells(self):
         cells = [
             {
-                "challenge": "C1", "tier": "local-24k", "model": "qwen3-4b",
-                "seed": 1, "cycle": "old", "division": "local", "mode": "mock",
-                "passed": True, "classifications": [], "ledger_path": "",
+                "challenge": "C1",
+                "tier": "local-24k",
+                "model": "qwen3-4b",
+                "seed": 1,
+                "cycle": "old",
+                "division": "local",
+                "mode": "mock",
+                "passed": True,
+                "classifications": [],
+                "ledger_path": "",
             },
             {
-                "challenge": "C1", "tier": "local-24k", "model": "qwen3-4b",
-                "seed": 1, "cycle": "current", "division": "local", "mode": "real",
-                "passed": False, "classifications": [], "ledger_path": "",
+                "challenge": "C1",
+                "tier": "local-24k",
+                "model": "qwen3-4b",
+                "seed": 1,
+                "cycle": "current",
+                "division": "local",
+                "mode": "real",
+                "passed": False,
+                "classifications": [],
+                "ledger_path": "",
             },
         ]
         doc = aggregate(
@@ -484,17 +581,28 @@ class TestDiagRunnerAndLeaderboard:
         )
         model = next(row for row in doc["models"] if row["id"] == "qwen3-4b")
         assert model["primary"] == {
-            "pass_rate": 0.0, "cells_total": 1, "cells_passed": 0,
+            "pass_rate": 0.0,
+            "cells_total": 1,
+            "cells_passed": 0,
         }
         assert not doc["task_suite"].endswith("-MOCK")
 
     def test_real_report_without_real_cells_cannot_clear_mock_badge(self):
         doc = aggregate(
-            cells=[{
-                "challenge": "C1", "tier": "local-24k", "model": "qwen3-4b",
-                "seed": 1, "cycle": "old", "division": "local", "mode": "mock",
-                "passed": True, "classifications": [], "ledger_path": "",
-            }],
+            cells=[
+                {
+                    "challenge": "C1",
+                    "tier": "local-24k",
+                    "model": "qwen3-4b",
+                    "seed": 1,
+                    "cycle": "old",
+                    "division": "local",
+                    "mode": "mock",
+                    "passed": True,
+                    "classifications": [],
+                    "ledger_path": "",
+                }
+            ],
             cycle_reports=[
                 {"cycle": "old", "execution_mode": "mock", "tiers": ["local-24k"]},
                 {"cycle": "current", "execution_mode": "real", "tiers": ["local-24k"]},
@@ -504,23 +612,28 @@ class TestDiagRunnerAndLeaderboard:
         assert doc["task_suite"].endswith("-MOCK")
 
     def test_discover_cells_uses_exact_persisted_identity(self, tmp_path):
-        run_dir = tmp_path / "runs" / "current" / \
-            "C1_open_openrouter-anthropic-model_s1"
+        run_dir = (
+            tmp_path / "runs" / "current" / "C1_open_openrouter-anthropic-model_s1"
+        )
         run_dir.mkdir(parents=True)
         exact_tier = "openrouter:anthropic/model"
-        (run_dir / "cell.json").write_text(json.dumps({
-            "challenge": "C1",
-            "tier": exact_tier,
-            "model": "anthropic/model",
-            "seed": 1,
-            "division": "open",
-            "cycle": "current",
-            "mode": "real",
-            "run_id": "gym_C1_open_openrouter:anthropic/model_s1",
-            "passed": False,
-            "graded": {"passed": False, "criteria": []},
-            "classifications": [],
-        }))
+        (run_dir / "cell.json").write_text(
+            json.dumps(
+                {
+                    "challenge": "C1",
+                    "tier": exact_tier,
+                    "model": "anthropic/model",
+                    "seed": 1,
+                    "division": "open",
+                    "cycle": "current",
+                    "mode": "real",
+                    "run_id": "gym_C1_open_openrouter:anthropic/model_s1",
+                    "passed": False,
+                    "graded": {"passed": False, "criteria": []},
+                    "classifications": [],
+                }
+            )
+        )
         cells = discover_cells(tmp_path, cycles={"current"})
         assert len(cells) == 1
         assert cells[0]["tier"] == exact_tier
@@ -558,6 +671,7 @@ class TestDiagRunnerAndLeaderboard:
 # ---------------------------------------------------------------------------
 # Transport-error honesty (retry / exclude / null axis)
 # ---------------------------------------------------------------------------
+
 
 class _RateLimitError(Exception):
     """Mimic openai.RateLimitError by name for is_transport_error."""
@@ -641,11 +755,15 @@ class TestTransportRetryHelper:
         assert is_transport_error(_RateLimitError("Error code: 429 - rate limit"))
         assert is_transport_error(TimeoutError("timed out"))
         assert is_transport_error(ConnectionError("connection refused"))
+
         # Non-transport capability error
         class NotFoundError(Exception):
             pass
+
         assert not is_transport_error(
-            NotFoundError("Error code: 404 - No endpoints found that support image input")
+            NotFoundError(
+                "Error code: 404 - No endpoints found that support image input"
+            )
         )
 
     def test_retry_then_succeed(self):
@@ -784,31 +902,33 @@ class TestTransportAxisScoring:
         from tools.flywheel.bench.gym.leaderboard import _axis_scores_for_model
 
         diag = {
-            "results": [{
-                "tier": "openrouter:google/gemma-4-31b-it:free",
-                "model": {
-                    "id": "google/gemma-4-31b-it:free",
-                    "label": "Gemma",
-                    "provider": "openrouter",
-                    "kind": "paid",
-                },
-                "axes": {
-                    "tool_validity": {
-                        "axis": "tool_validity",
-                        "score": None,
-                        "n_errors": 5,
-                        "errors": {
-                            "n_errors": 5,
-                            "first_detail": "provider error (transport exhausted…)",
-                            "axis_null_reason": "5/5 tasks transport-errored (>50%)",
-                        },
-                        "skipped": False,
+            "results": [
+                {
+                    "tier": "openrouter:google/gemma-4-31b-it:free",
+                    "model": {
+                        "id": "google/gemma-4-31b-it:free",
+                        "label": "Gemma",
+                        "provider": "openrouter",
+                        "kind": "paid",
                     },
-                    "vision_fix": {"score": 0.0, "skipped": False},
-                    "feature_id": {"score": None, "skipped": True},
-                    "vc_hygiene": {"score": 0.8, "skipped": False},
-                },
-            }],
+                    "axes": {
+                        "tool_validity": {
+                            "axis": "tool_validity",
+                            "score": None,
+                            "n_errors": 5,
+                            "errors": {
+                                "n_errors": 5,
+                                "first_detail": "provider error (transport exhausted…)",
+                                "axis_null_reason": "5/5 tasks transport-errored (>50%)",
+                            },
+                            "skipped": False,
+                        },
+                        "vision_fix": {"score": 0.0, "skipped": False},
+                        "feature_id": {"score": None, "skipped": True},
+                        "vc_hygiene": {"score": 0.8, "skipped": False},
+                    },
+                }
+            ],
         }
         axes = _axis_scores_for_model(
             diag,

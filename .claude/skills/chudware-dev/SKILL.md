@@ -8,6 +8,9 @@ description: Generalist skill for ANY change to the Chudware program in this rep
 How to work in this repo, regardless of which part you're changing. GUI-heavy batches:
 hand off to `.claude/skills/gui-orchestrator/SKILL.md` (it has the panel-level map and
 specialist worker skills). Everything else: this file is your base.
+For the compiled online-agent boundary, read
+`.claude/skills/cad-chudcode-integration/SKILL.md` before touching sessions, providers,
+auth/models, memory, host tools, events, recovery, or release artifacts.
 
 ## Hunter's working preferences (apply to every task)
 
@@ -36,7 +39,7 @@ The repo has a knowledge graph at `graphify-out/` (skill: `.claude/skills/graphi
 - `graphify-out/GRAPH_REPORT.md` / `graphify-out/wiki/index.md` — broad architecture only
 - After meaningful structural changes: `graphify update .` (AST-only, free)
 
-## Repo map (verified against master, 2026-08-27)
+## Repo map (verified against master, 2026-08-31)
 
 **Current GUI ownership:** `host/` is the sole GUI target; `ui/imgui/` and `ui/abstract/` are gone, and T-G11's deletion of `host/` was reversed.
 
@@ -49,7 +52,7 @@ The repo has a knowledge graph at `graphify-out/` (skill: `.claude/skills/graphi
 | `core/print/**` | Additive-print model |
 | `host/` | **The production GUI** — C++ GLFW/ImGui desktop app. `host/src/app.cpp` frame loop, `host/src/ui/` panels (52k LOC), `host/src/core/app_state.h` central data model. Details: the gui-* skills |
 | `ui/viewport/` | AICM mesh loader (`render/aicm_loader.*`) consumed by `core/`; the host renderer lives under `host/src/render/` |
-| `services/agent/` | Built-in AI agent loop (Python): agent_turn, councils, delegation, events |
+| `services/agent/` | Chudcode RPC host/adapters plus CAD-owned roles, councils, missions, governance, tool registry projection, and event mapping |
 | `services/mcp/` | MCP server exposing the engine to external agents (Claude Code etc.) |
 | `services/worker/` | Engine routing seam: WorkerClient / DocMirror / bootstrap |
 | `services/installer/` | Provisioning, MCP self-registration, packaging |
@@ -66,7 +69,7 @@ The repo has a knowledge graph at `graphify-out/` (skill: `.claude/skills/graphi
 | `Webservice/` | chudware-web: browser-native `host/` WASM GUI backed by one shared hostd — `gateway/` (FastAPI portal+auth+engine bridge+chat), `deploy/` (systemd user units, cf_provision.py, RUNBOOK.md), `DESIGN.md`. T-R7 PLM remote subset lives in `services/plm/remote.py`. Secrets NEVER committed (`Cloudflare-info.txt` gitignored) |
 | `scratch/` | Throwaway output — never commit anything load-bearing here |
 
-Env/naming compat: `CHUDWARE_*` env vars canonical, `CHUDWARE_*` honored; MCP id `chudware`
+Env/naming: `CHUDWARE_*` env vars are canonical; MCP id is `chudware`
 
 ## Commands
 
@@ -214,19 +217,25 @@ judgment).
   set for the mission lane — keep the two in lockstep. Every extra mint costs a tab, a
   project `.step+`, its own AI-VC chain (keyed by `doc_id`), its own auto-registered vault
   item (`services/plm/vault.py` rglobs the project on save), and a recovery row.
-- **The main chat has NO tool-call budget** (2026-08-05). It had one — 30 — and it killed a
-  finished build one dispatch before the `plm_checkpoint` the model had composed, then
-  reported the forced stop as `stop_reason=confirmed`. `agent_turn`'s enforcement site
-  branches on `subagent_id is None`: main chat gets only a runaway backstop, subagents get a
-  ONE-SHOT injected soft warning plus a separate hard ceiling. The threshold is
-  config.json `agent.subagent_tool_call_budget` (`0` = derive from the token grant), read by
-  `config.get_subagent_tool_call_budget()`, set by a Settings slider. Do NOT reintroduce a
-  main-chat cap, and do NOT let a forced stop claim success.
-- **Delegated subagents need an explicit `max_tokens`.** `agent_turn`'s default completion
-  cap is 2048; `_run_subagent_turn` omitted the kwarg and every delegate silently inherited
-  it, so a `feature_modeler` burned a 60,000-token grant on two `reply_truncated` turns with
-  zero tool calls. It now passes `LINEAR_ROLE_MAX_OUTPUT_TOKENS` like the parent lane.
-  `services/dag/node_runner.py` still reaches the 2048 default when no tier profile exists.
+- **Chudcode is the only online agent/provider runtime (2026-08-31).** Every online
+  top-level `core/agent/run.cpp` request becomes services-worker `agent_admin_turn`;
+  `worker_rpc._agent_admin_turn` assembles the CAD role prompt and run-scoped host tools,
+  then `ChudcodeSessionHost` drives the persistent protocol-v2 RPC session. Chudcode owns
+  nested agents, providers, auth, models, session history, memory, compaction/retry/cache,
+  browser/computer, and STT. Native C++ provider execution is only the explicit offline-safe
+  local modeling fallback. Never add a second online provider loop or an external MCP hop.
+- **One conversation owns one persistent Chudcode process.** A session may be seeded once
+  from `chudcode_session_file`; changing that file while the session is live is an error.
+  Session count is bounded (`CHUDWARE_CHUDCODE_MAX_SESSIONS`, 8 default/32 hard max), and
+  LRU eviction may dispose only an idle session. `chudcode_close_session` is idempotent:
+  abort active work, dispose the process, preserve the persisted file. Worker shutdown
+  disposes every saved-session and transient client.
+- **Control cannot share the blocked stdio lane.** `services/worker_main.py` starts the
+  authenticated `chudcode_control.ControlServer` and exposes its endpoint/token only through
+  `worker_control_info`. Cancel, steer, and status use that private Unix socket (POSIX) or
+  random loopback TCP endpoint (Windows), so Stop remains live during a synchronous
+  `agent_admin_turn`. Never log or echo the token; malformed, oversized, repeated-auth, and
+  oversized-response paths stay bounded.
 - **`plm_item_add` is for NON-design files only.** `.step+`/`.ecad+` are auto-registered by
   `vault._explode_project_into_shadow` on every save/checkpoint, so `Vault.add_item` can
   never succeed on one — that rejection now runs FIRST and points at `plm_checkpoint`. Its
@@ -240,23 +249,21 @@ judgment).
   `Server::dispatch` for `agent_*`), which drives the same `registry_.postCall` a socket
   `doc_new` would. Add a publish call beside any NEW direct doc op you introduce there, or
   it is invisible again. `internal:true` must keep propagating (preflight shadow clone).
-- **The delta coalescer exists TWICE and drifted into the same bug.**
-  `agent_turn._AssistantDeltaCoalescer` and `core/agent/run.cpp`'s `DeltaCoalescer` both
-  buffer `text`/`thinking`. Each MUST flush the active channel before switching and drain
-  the active channel first, and `run_turn` must flush before every non-delta event —
-  otherwise a tail crosses a channel switch and glues onto the next completion's opening
-  (live seams: `batch them.The user`, `saved file.The harness`). Change one, change the
-  other; the comments name each other for that reason. GUI side: `feed.cpp` must NOT treat
-  a hidden text-channel flush as a visible thinking boundary, or one reasoning stream
-  renders as several boxes.
-- **Streamed deltas are a recovery source, not just display.** A provider can emit hundreds
-  of deltas and then an EMPTY final envelope (or no final response line at all). The
-  resample used to inspect only the final result, so paid output was discarded and the turn
-  died `provider_error`. `omp_bridge_provider.complete_ex` now retains per-attempt fragments
-  and recovers streamed text or a fenced directive before spending another completion — but
-  it still forwards each fragment to the display sink exactly once. NEVER concatenate deltas
-  into the displayed reply; that contract is unchanged and text double-prints if you break
-  it. An empty `length` reply with `reasoningEffort` set retries once WITHOUT the effort.
+- **Chudcode event mapping is single-display and terminal-strict.**
+  `services/agent/chudcode_events.py` is the only RPC-frame → Chudware-feed mapper.
+  Streamed deltas are the only visible assistant text; message-complete envelopes are
+  lifecycle records and must never replay final text. Preserve `text` versus `thinking`
+  channel order, and do not treat an empty text flush as a thinking boundary.
+- **Tool events correlate by the Chudcode call id.** Start/progress map to status only;
+  terminal result/cancel maps once to `agent.tool_call`, carrying bounded previews, digests,
+  outcome and usage. A synchronous `host_tool_call` with a result is already terminal.
+  Unknown frames become deterministic bounded `sub_run` rows rather than being dropped or
+  guessed. Provider usage emits both `agent.provider_usage` and `agent.context`.
+- **A turn is not complete merely because the process is idle.** `run_turn` requires a
+  terminal `agent_end`; ending without it is a protocol error. Event-forwarding failure
+  fails the turn. Cancel before prompt is a valid cancellation; cancel after prompt calls
+  `abort()` at most once. Identical steering is idempotent, and steering received before
+  prompt start queues for immediate delivery after the prompt.
 - **`plm_*` tools default their `path` to the resolved project root** (2026-08-05):
   `CHUDWARE_PROJECT_DIR` → `CHUDWARE_FS_ROOT` → `project_context.resolve_project_root()`,
   explicit argument still wins, `project_root_unavailable` when nothing resolves. Three
@@ -267,43 +274,38 @@ judgment).
   fallback survives ONLY for headless external MCP clients with no project. A
   `chudware_mcp_*` basename is also dropped by the artifact allowlist as internal scratch,
   so a scratch save is invisible in the GUI as well as misplaced.
-- **A failed `delegate` must lead with its cause.** The ledger clips tool results at ~999
-  characters; a failed child's `ok`/`reason`/`error` are emitted FIRST so the reason
-  survives that clip and reaches the model and the GUI card. Before this, a child that died
-  on a provider fault surfaced as its own brief echoed back.
-- **config.json keys:** `saveSettings` merge-overlays `keys`/`experimental` — never
-  full-replace them (harness `keys.openrouter` must survive a GUI save).
-- **agent_turn edits:** standing mega-24 offline planning-node repro gate
-  (`FINAL_OFFLINE_OK` / `services/agent/test_mega24_fixes.py`) plus mega regression suites
-  before any live mission spend.
-- **Tool floors (2026-08-07):** preserve allowlist tri-state: `None` means open,
-  while explicit `[]` means restricted to that lane's floor. Main linear chat uses
-  derived `MAIN_CHAT_DEFAULT_TOOLS` (agent fs/shell/fetch + child fs read/glob/grep);
-  DAG nodes and delegated children use only `SUBAGENT_DEFAULT_TOOLS` and always pass
-  a `subagent_id`. Finalize this effective set BEFORE schema rendering, then pass the
-  same set to dispatch. Rare CAD families stay behind
-  `enable_tools(categories=[...])`/`list_tool_categories`; never teach positional
-  `enable_tools([...])` or bloat the floors.
-- **Routing / execution structure (model-driven 2026-07):** there is NO
-  deterministic keyword/regex classifier deciding execution structure. The
-  `general_agent` role (`roles/general_agent.yaml`) is the UNIVERSAL entry: every
-  request runs ONE free linear turn, and the MODEL decides whether to finish
-  inline, `delegate` a scoped build, or `mission_start` the full build swarm. It
-  starts with the derived main-chat floor + `enable_tools`/`list_tool_categories` +
-  `delegate`/`mission_start`, so it sees the tool CATEGORY packs (workspaces) and
-  pulls modeling/sketch/sim/… on demand (verified:
-  `enable_tools(categories=["modeling"])` unlocks `new_part` mid-turn) — never a
-  multi-step plan forced onto basic work.
-  Python path: `worker_rpc._agent_admin_turn` calls
-  `mission_dispatch.run_linear_role_turn` with `general_agent` by default;
-  `workflow_router.route`/`classify_task`/`structure_for_class` survive ONLY as
-  advisory Routing-card telemetry (`agent.classification`), never a gate. C++ live
-  path (the single in-app agent entry per `loop.py`): `run.cpp`'s pre-flight hands
-  every ONLINE top-level run to the `general_agent` turn via the `agent_admin_turn`
-  worker RPC (pass `role` to override, e.g. project_organizer). OFFLINE is the lone
-  exception — it keeps the deterministic split (`domain.is_general_work_request`):
-  general work blocked (no provider), offline-safe local modeling falls through to
-  the C++ pipeline. Explicit mission mode (`run_mission`) still runs the swarm.
+- **Nested agents remain inside Chudcode.** CAD owns the role/council/mission/governance
+  context and the host-tool surface, but does not run a nested provider loop. Session,
+  subagent, retry, compaction, todo, and usage events are mapped back into the existing
+  Chudware feed contract; do not synthesize success when Chudcode reports failure.
+- **Session recovery is a service boundary, not file surgery.**
+  `chudcode_export_session`, `chudcode_branch_session`, `chudcode_repair_session`, and
+  `chudcode_close_session` call the live runtime. Export uses Chudcode HTML export;
+  branch uses a real entry id; doctor is bounded and `repair:true` uses Chudcode's
+  backup-producing repair workflow. Never hand-edit persisted session JSONL.
+- **Tool floors stay CAD-authoritative.** Preserve allowlist tri-state: `None` is
+  unrestricted, explicit `[]` is restricted to live floors, and a non-empty list is an
+  ordinary restriction. Resolve role/mode/category/meta floors and the mutation
+  `verify_battery` floor before schema rendering, then advertise and dispatch the exact same
+  effective set. `enable_tools` accepts named `categories`; rare CAD families stay lazy.
+- **Host-tool registration is an adapter, never a second catalog.**
+  `chudcode_tools.build_host_tools` derives names, descriptions, schemas, load mode and
+  handlers from the live MCP/mission registries. Do not advertise unbound or async-only
+  entries. Chudcode builtin names (`read`, `edit`, `bash`, `browser`, `computer`, `task`,
+  etc.) remain Chudcode-owned unless a CAD entry explicitly claims ownership.
+- **Every host call still crosses CAD's chokepoints.** Before execution:
+  policy refusal → cancellation → mission/run dispatcher → scaffold and guardrail checks →
+  `agent_turn._dispatch_tool` loop guard/accounting. Preserve document context injection,
+  progress and cancellation callbacks, JSON-safe results, and machine-readable refusal
+  shapes. Tool exceptions propagate as Chudcode tool errors; never turn them into a
+  successful result.
+- **Routing remains model-driven, execution is now service-owned.** The `general_agent` role
+  is the universal online entry and the model decides whether to finish inline, use CAD host
+  tools, or spawn nested Chudcode work. `workflow_router` classification is advisory
+  telemetry only. The offline exception is deterministic: general work refuses without an
+  online provider, while offline-safe local modeling may use the native C++ pipeline.
+  Explicit Chudware mission/DAG policy remains CAD-owned but its provider calls run through
+  Chudcode.
 - **Prompt override isolation (2026-08-07):** native/core C++ prompts consume
   `appdata/prompts/<id>.md`; YAML mission roles consume
   `appdata/prompts/<id>.mission.md`. Settings catalogs both as `core:<id>` and
@@ -311,10 +313,11 @@ judgment).
   incompatible output contracts. The top-level `system_prompt` setting intentionally
   replaces role prose but still receives harness base, capability, tools, skills, and
   runtime output enforcement.
-- **Sidecar shutdown:** OMP bun bridge + python worker bridge spawn with
-  setpgid+PDEATHSIG+close_range; hostd's clean-shutdown tail calls
-  `WorkerBridge::shutdownIfCreated()` and the `chudware_agent_sidecars_shutdown` C-ABI
-  (dlsym, missing-symbol tolerant). Keep new sidecars on this pattern.
+- **Shutdown follows ownership.** `core/hostd/worker_bridge.cpp` owns the persistent
+  services worker. Its clean-shutdown path stops that worker; `worker_main.stop_services`
+  first closes the private control server, then `chudcode_shutdown()` disposes all live and
+  transient RPC clients. Keep process-tree termination bounded and never leave a session
+  process detached from its owning worker.
 
 ## Commit / push template
 

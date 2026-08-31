@@ -186,8 +186,7 @@ static const char* planRomanNumeral(int n) {
     return nullptr;
 }
 
-// (The old omp-style text glyphs here — ○ ✓ → — are gone: the UI font lacks those codepoints
-// and rendered them as literal "?". Rows use the vector drawStatusGlyph instead.)
+// Old text status glyphs are absent from the UI font; rows use drawStatusGlyph vectors.
 
 static void planDrawShapeChip(const char* label, const ImVec4& accent) {
     if (!label || !*label) return;
@@ -418,8 +417,7 @@ static void planDrawTodosTree(const PlanState& plan,
                 ImGui::Dummy(ImVec2(8.0f * sc, 0));
                 ImGui::SameLine(0, 0);
             }
-            // Same vector status glyph the action cards / tiles use — the old omp-style text
-            // glyphs (○ ✓ →) are missing from the UI font and rendered as literal "?".
+            // Use the same vector status glyph as action cards and tiles.
             drawStatusGlyph(st, ImGui::GetTextLineHeight());
             ImGui::SameLine(0, 6.0f * sc);
             ImGui::PushStyleColor(ImGuiCol_Text, surf.textPrimary);

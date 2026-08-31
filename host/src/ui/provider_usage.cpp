@@ -60,9 +60,8 @@ nlohmann::json jobj(const nlohmann::json& obj, const char* key) {
     auto it = obj.find(key);
     return (it != obj.end() && it->is_object()) ? *it : nlohmann::json::object();
 }
-// A reset timestamp is ISO-8601 from the Python worker and a NUMBER of milliseconds since the
-// epoch from the omp bridge. Keep the wire value verbatim either way — the ms form is stored as
-// its decimal digits, and usageResetCountdown() tells the two apart.
+// A reset timestamp may be ISO-8601 or a numeric epoch in milliseconds. Keep the wire value
+// verbatim; usageResetCountdown() handles both forms.
 std::string jstamp(const nlohmann::json& obj, const char* key) {
     auto it = obj.find(key);
     if (it == obj.end()) return {};
@@ -378,9 +377,10 @@ const float* usageStatusColor(const std::string& status, float frac) {
     if (status == "blocked") return ui::palette.statusErr;
     if (status == "warn")    return ui::palette.statusWarn;
     if (status == "ok")      return ui::palette.statusOk;
-    // unknown / empty: derive from the fraction (same thresholds as the context meter).
-    if (frac >= 0.95f) return ui::palette.statusErr;
-    if (frac >= 0.75f) return ui::palette.statusWarn;
+    // unknown / empty: derive from the fraction — the chud-ui-shared-v1 usage thresholds
+    // (ui::kUsageWarnFrac / kUsageCritFrac), same ladder as the context meter.
+    if (frac >= ui::kUsageCritFrac) return ui::palette.statusErr;
+    if (frac >= ui::kUsageWarnFrac) return ui::palette.statusWarn;
     return ui::palette.statusOk;
 }
 
@@ -388,7 +388,7 @@ std::string usageResetCountdown(const std::string& stamp) {
     if (stamp.empty()) return {};
     long long delta = 0;
     if (stamp.find_first_not_of("0123456789") == std::string::npos) {
-        // omp bridge form: milliseconds since the epoch, sent as a JSON number.
+        // Numeric form: milliseconds since the epoch.
         const long long ms = std::strtoll(stamp.c_str(), nullptr, 10);
         if (ms <= 0) return {};
         delta = ms / 1000 - (long long)std::time(nullptr);

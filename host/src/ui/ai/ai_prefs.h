@@ -1,7 +1,7 @@
 // AI workspace UI preferences — config.json-backed knobs for the command-center views.
 // Persisted under agent.ui_* (same load-modify-write pattern as agent.max_subagent_depth).
-// Defaults favor FULL visibility (user directive: everything visible while the OMP/agent
-// integrations are being validated; dial back later via Settings or the workspace gear).
+// Defaults favor full visibility while agent integrations are being validated; users can dial
+// them back via Settings or the workspace gear.
 #pragma once
 
 namespace ui {

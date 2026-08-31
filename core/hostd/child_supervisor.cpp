@@ -32,11 +32,10 @@ static long long monoMs() {
         .count();
 }
 
-// pipe2(O_CLOEXEC) is Linux-only. Darwin has to set the flag after the fact, so
-// there is a window in which a concurrent fork+exec elsewhere in the daemon
-// (worker_bridge, omp bridge) could inherit these ends; a leaked read end would
-// keep the pipe open past exec and turn "exec failed?" into a blocking read. The
-// atomic form is therefore kept wherever the kernel offers it, and the exec-report
+// pipe2(O_CLOEXEC) is Linux-only. Darwin has to set the flag after the fact, so a concurrent
+// fork+exec elsewhere in the daemon could inherit these ends. A leaked read end would keep the
+// pipe open past exec and turn "exec failed?" into a blocking read. The atomic form is therefore
+// kept wherever the kernel offers it, and the exec-report
 // read below is the only consumer, bounded by the child's own exit either way.
 static bool cloexecPipe(int fds[2]) {
 #if defined(__linux__)

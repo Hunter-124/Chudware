@@ -49,25 +49,6 @@ jobs:
     runs-on: [self-hosted, Windows, X64, cloudcastle-ci, "${{ inputs.runner_label }}"]
     timeout-minutes: 60
     steps:
-      - name: Install Bun into the CI tools dir
-        shell: powershell
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $toolsBin = Join-Path $env:USERPROFILE 'chudware-ci-tools\bin'
-          New-Item -ItemType Directory -Force $toolsBin | Out-Null
-          $bunExe = Join-Path $toolsBin 'bun.exe'
-          if (Test-Path $bunExe) {
-            Write-Host "bun already present: $(& $bunExe --version)"
-          } else {
-            Write-Host "installing bun..."
-            powershell -NoProfile -ExecutionPolicy Bypass -Command "irm bun.sh/install.ps1 | iex"
-            $installed = Join-Path $env:USERPROFILE '.bun\bin\bun.exe'
-            if (-not (Test-Path $installed)) { throw "bun install completed but $installed is missing" }
-            Copy-Item $installed $bunExe
-            $bunx = Join-Path $env:USERPROFILE '.bun\bin\bunx.exe'
-            if (Test-Path $bunx) { Copy-Item $bunx (Join-Path $toolsBin 'bunx.exe') }
-            Write-Host "bun $(& $bunExe --version) installed to $toolsBin"
-          }
 
       - name: Unpack Inno Setup 6 (no admin needed)
         shell: powershell
@@ -109,16 +90,13 @@ jobs:
         shell: powershell
         run: |
           $tools = Join-Path $env:USERPROFILE 'chudware-ci-tools'
-          $bunExe = Join-Path $tools 'bin\bun.exe'
           $iscc = Join-Path $tools 'innosetup\ISCC.exe'
           $vswhere = Join-Path ([Environment]::GetFolderPath('ProgramFilesX86')) 'Microsoft Visual Studio\Installer\vswhere.exe'
-          if (Test-Path $bunExe) { $bunVer = & $bunExe --version } else { $bunVer = 'MISSING' }
           $hasIscc = Test-Path $iscc
           if (Test-Path $vswhere) { $vsName = (& $vswhere -latest -property displayName) -join ', ' } else { $vsName = 'MISSING' }
-          Write-Host "bun: $bunVer"
           Write-Host "Inno Setup 6 (portable): $hasIscc"
           Write-Host "Visual Studio: $vsName"
-          if ($bunVer -eq 'MISSING' -or -not $hasIscc -or $vsName -eq 'MISSING') { exit 1 }
+          if (-not $hasIscc -or $vsName -eq 'MISSING') { exit 1 }
 
   provision-macos:
     name: Provision macOS packaging runner
@@ -141,35 +119,6 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Install Bun
-        shell: bash
-        run: |
-          set -euo pipefail
-          for dir in /opt/homebrew/bin /usr/local/bin "${HOME}/.bun/bin"; do
-            if [ -d "${dir}" ]; then PATH="${dir}:${PATH}"; fi
-          done
-          export PATH
-
-          if command -v bun >/dev/null 2>&1; then
-            echo "bun already present: $(command -v bun) $(bun --version)"
-            exit 0
-          fi
-          echo 'installing bun...'
-          curl -fsSL https://bun.sh/install.sh | bash
-          bun_exe="${HOME}/.bun/bin/bun"
-          [ -x "${bun_exe}" ] || {
-            echo "::error::bun install completed but ${bun_exe} is missing"; exit 1; }
-          echo "bun $("${bun_exe}" --version) installed to ${bun_exe}"
-
-          # A symlink is a convenience, not a requirement: /usr/local/bin is
-          # root-owned on a stock Mac and the nightly puts ~/.bun/bin on PATH
-          # itself. Say which of the two happened rather than failing.
-          if [ -w /usr/local/bin ]; then
-            ln -sf "${bun_exe}" /usr/local/bin/bun
-            echo "linked ${bun_exe} into /usr/local/bin"
-          else
-            echo "::notice::/usr/local/bin is not writable by $(whoami); bun stays at ${bun_exe}, which macos-beta prepends to PATH itself"
-          fi
 
       - name: Install the Homebrew formulae the release build needs
         shell: bash
@@ -269,7 +218,7 @@ jobs:
         shell: bash
         run: |
           set -uo pipefail
-          for dir in /opt/homebrew/bin /usr/local/bin "${HOME}/.bun/bin"; do
+          for dir in /opt/homebrew/bin /usr/local/bin; do
             if [ -d "${dir}" ]; then PATH="${dir}:${PATH}"; fi
           done
           export PATH
@@ -283,7 +232,7 @@ jobs:
           }
 
           sw_vers
-          for tool in cmake ninja ctest git curl tar zip rsync scp ssh bun \
+          for tool in cmake ninja ctest git curl tar zip rsync scp ssh \
             clang xcrun xcode-select ditto otool install_name_tool plutil codesign; do
             if command -v "${tool}" >/dev/null 2>&1; then
               report "${tool}" "$(command -v "${tool}")"
@@ -428,7 +377,7 @@ jobs:
           # absent: without this line a runner that lost them would publish the AppImage
           # and quietly stop publishing .deb and .rpm, and nothing would go red. Caught
           # at provision time instead of at 3am in a release job.
-          for tool in cmake ninja ctest bun xvfb-run rsync strip rpmbuild xz; do
+          for tool in cmake ninja ctest xvfb-run rsync strip rpmbuild xz; do
             if command -v "${tool}" >/dev/null 2>&1; then
               printf '%-22s %s\n' "${tool}" "$(command -v "${tool}")"
             else

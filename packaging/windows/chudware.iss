@@ -97,12 +97,12 @@ RestartApplications=no
 ; never executed by the packaged installer. Explicit protected rows make ISCC fail closed when a
 ; compiled sidecar or signed manifest is absent.
 Source: "{#PayloadDir}\*"; DestDir: "{app}"; \
-    Excludes: "chudware-worker.exe,chudware-mcp.exe,chudware-omp-bridge.exe,chudware-uninstall-helper.exe,payload-manifest.v1.json,payload-manifest.v1.sig,install.ps1{#AdvisorExcludes}"; \
+    Excludes: "chudware-worker.exe,chudware-mcp.exe,chud.exe,chudware-uninstall-helper.exe,payload-manifest.v1.json,payload-manifest.v1.sig,install.ps1{#AdvisorExcludes}"; \
     Flags: recursesubdirs createallsubdirs ignoreversion
 ; packaging/windows/build_sidecars.ps1 creates these before the manifest is hashed.
 Source: "{#PayloadDir}\chudware-worker.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#PayloadDir}\chudware-mcp.exe"; DestDir: "{app}"; Flags: ignoreversion
-Source: "{#PayloadDir}\chudware-omp-bridge.exe"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#PayloadDir}\chud.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#PayloadDir}\chudware-uninstall-helper.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#PayloadDir}\payload-manifest.v1.json"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#PayloadDir}\payload-manifest.v1.sig"; DestDir: "{app}"; Flags: ignoreversion

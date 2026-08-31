@@ -14,6 +14,7 @@ KEY_ID="${CHUDWARE_RELEASE_KEY_ID:-}"
 FINALIZE_SIGNATURE=""
 RELEASE_PUBLIC_KEY="${CHUDWARE_RELEASE_PUBLIC_KEY:-}"
 RELEASE_PYTHON="${CHUDWARE_RELEASE_PYTHON:-python3}"
+CHUD_BIN="${CHUDWARE_CHUD_BIN:-}"
 
 while [ "$#" -gt 0 ]; do
     case "$1" in
@@ -22,6 +23,9 @@ while [ "$#" -gt 0 ]; do
             OUT="$2"
             shift 2
             ;;
+        --chud-bin)
+            [ "$#" -ge 2 ] || { echo "error: --chud-bin requires a file" >&2; exit 2; }
+            CHUD_BIN="$2"; shift 2 ;;
         --keep-app) KEEP_APP=1; shift ;;
         --prepare-signing)
             [ -z "$MODE" ] || { echo "error: choose exactly one signing mode" >&2; exit 2; }
@@ -43,6 +47,7 @@ done
 [ -n "$MODE" ] || { echo "error: --prepare-signing or --finalize-signing is required" >&2; exit 2; }
 if [ "$MODE" = prepare ]; then
     [ -n "$KEY_ID" ] || { echo "error: --key-id is required with --prepare-signing" >&2; exit 2; }
+    [ -n "$CHUD_BIN" ] || { echo "error: --chud-bin or CHUDWARE_CHUD_BIN is required" >&2; exit 2; }
 else
     [ -f "$FINALIZE_SIGNATURE" ] && [ -s "$FINALIZE_SIGNATURE" ] || {
         echo "error: --finalize-signing must name a detached signature" >&2; exit 2;
@@ -61,30 +66,16 @@ require_production_cache() {
     }
 }
 
-build_omp_bridge() {
+stage_chudcode() {
     local destination="$1"
-    command -v bun >/dev/null 2>&1 || { echo "error: Bun is required to compile chudware-omp-bridge" >&2; exit 1; }
-    echo "==> installing locked vendored OMP workspace"
-    (cd "$REPO/vendor/omp" && bun install --frozen-lockfile)
-    echo "==> compiling chudware-omp-bridge"
-    # onnxruntime-node requires `../bin/napi-v6/${process.platform}/${process.arch}/
-    # onnxruntime_binding.node`, and 1.26.0 ships no darwin/x64 prebuild at all
-    # (upstream dropped Intel macOS), so on that one target the specifier cannot
-    # resolve and the bundle fails. --allow-unresolved does not help: it matches
-    # module specifiers, not relative paths. Leaving the module external on
-    # darwin/x64 keeps it bundled everywhere it actually works; ONNX-backed
-    # features are simply unavailable on Intel macOS.
-    local externals=""
-    if [ "$ARCH" = "x86_64" ]; then externals="--external=onnxruntime-node"; fi
-    (cd "$REPO/vendor/omp" && bun build --compile --sourcemap=none --packages=bundle \
-        ${externals} \
-        --allow-unresolved='' --allow-unresolved='@img/sharp-*/versions' --allow-unresolved='@img/sharp-libvips-*/lib' --allow-unresolved='@img/sharp-libvips-*/package' --allow-unresolved='@img/sharp-libvips-*/versions' --allow-unresolved='@img/sharp-libvips-dev-*/include' --allow-unresolved='@img/sharp-libvips-dev-*/lib' \
-        --no-compile-autoload-dotenv --no-compile-autoload-bunfig \
-        --no-compile-autoload-package-json bridge/src/bridge.ts --outfile "$destination")
-    # bun --compile writes <entry>.js.map beside the outfile even under
-    # --sourcemap=none; the staging guard rightly rejects debug artifacts.
-    rm -f "$(dirname "$destination")/bridge.js.map"
-    [ -x "$destination" ] || { echo "error: Bun did not produce $destination" >&2; exit 1; }
+    [ -n "$CHUD_BIN" ] || {
+        echo "error: --chud-bin or CHUDWARE_CHUD_BIN is required" >&2
+        exit 1
+    }
+    "$RELEASE_PYTHON" "$REPO/scripts/pin_chudcode.py" stage \
+        --target "macos-$ARCH" --input "$CHUD_BIN" --output "$destination"
+    cp "$REPO/vendor/chudcode/CHUDCODE_ARTIFACT.lock" \
+        "$(dirname "$destination")/CHUDCODE_ARTIFACT.lock"
 }
 
 generate_protected_assets() {
@@ -411,7 +402,7 @@ require_production_cache "$HOSTD_BUILD" "chudware-hostd"
 cp "$HOSTD" "$MACOS/chudware-hostd"
 chmod +x "$MACOS/chudware-hostd"
 
-# Protected services and the OMP bridge are compiled sidecars. No repository Python,
+# Protected services and Chudcode are compiled sidecars. No repository Python,
 # TypeScript, generated compiler source, source maps, or provisioning wheelhouse enters the app.
 [ -f "$REPO/services/compiled_entry.py" ] || {
     echo "error: services/compiled_entry.py is required for release sidecars" >&2
@@ -420,7 +411,7 @@ chmod +x "$MACOS/chudware-hostd"
 generate_protected_assets
 build_python_sidecar worker_main "$MACOS/chudware-worker"
 build_python_sidecar mcp.server "$MACOS/chudware-mcp"
-build_omp_bridge "$MACOS/chudware-omp-bridge"
+stage_chudcode "$MACOS/chud"
 
 
 # Resolve @rpath/@loader_path entries when deciding whether a dependency belongs in the
@@ -465,7 +456,7 @@ for bundled_dylib in "$FRAMEWORKS"/*.dylib; do
     [ -f "$bundled_dylib" ] && printf '%s\n' "$bundled_dylib" >> "$QUEUE"
 done
 [ -n "$HOSTD" ] && printf '%s\n' "$MACOS/chudware-hostd" >> "$QUEUE"
-for sidecar in "$MACOS/chudware-worker" "$MACOS/chudware-mcp" "$MACOS/chudware-omp-bridge"; do
+for sidecar in "$MACOS/chudware-worker" "$MACOS/chudware-mcp" "$MACOS/chud"; do
     printf '%s\n' "$sidecar" >> "$QUEUE"
 done
 
@@ -536,6 +527,7 @@ APPLESCRIPT
 fi
 export CHUDWARE_LIBCHUDWARE="$HERE/../Frameworks/libchudware.dylib"
 if [ -x "$HERE/chudware-hostd" ]; then export CHUDWARE_HOSTD_BIN="$HERE/chudware-hostd"; fi
+if [ -x "$HERE/chud" ]; then export CHUDWARE_CHUDCODE_BIN="$HERE/chud"; fi
 exec "$HERE/Chudware-bin" "$@"
 LAUNCHER
 sed -i '' "s/@CHUDWARE_VERSION@/$VERSION/g" "$MACOS/Chudware"
@@ -545,7 +537,7 @@ chmod +x "$MACOS/Chudware"
 
 # Fail before signing if any non-system dependency still resolves outside the bundle.
 for executable in "$MACOS/Chudware-bin" "$MACOS/chudware-hostd" \
-    "$MACOS/chudware-worker" "$MACOS/chudware-mcp" "$MACOS/chudware-omp-bridge" \
+    "$MACOS/chudware-worker" "$MACOS/chudware-mcp" "$MACOS/chud" \
     "$FRAMEWORKS"/*.dylib; do
     [ -f "$executable" ] || continue
     while IFS= read -r dependency; do

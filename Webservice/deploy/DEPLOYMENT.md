@@ -122,10 +122,10 @@ parses `CHUDWARE_DB_URL` and refuses a staging deploy unless the database name
 is exactly `chudware_staging` (and likewise requires `chudware_prod` for
 production).
 
-The production path continues to treat the native daemon, OMP/Bun provider
-dependencies, and WASM bundle as one immutable release under
-`~/chudware-web/releases/`; `~/chudware-web/current` moves only after every
-artifact is built and validated. Staging's default path is gateway-only so a
+The production path treats the native daemon, artifact-locked Chudcode binary,
+and WASM bundle as one immutable release under `~/chudware-web/releases/`;
+`~/chudware-web/current` moves only after every artifact is built and validated.
+Staging's default path is gateway-only so a
 green master deployment cannot bounce the production desktop engine.
 
 Before a shared-daemon production restart, `install_webd.sh` reads the
@@ -150,13 +150,14 @@ arithmetic says, and — unchanged from before — a *failed* promotion still
 leaves its partial tree behind for inspection.
 
 The set of `releases/*/deploy-manifest` files is the release index; there is no
-separate index file. Each is flat `key=value` (`schema=3`), and adds
+separate index file. Each is flat `key=value` (`schema=4`), and adds
 `release_id=` and `built_at_utc=` (strict `YYYY-MM-DDTHH:MM:SSZ`) to the
 existing `joint_sha256`, the `checkout_head` git rev it was built from, and the
-per-artifact digests. Advisor-enabled releases also hash the exact ONNX Runtime
-SONAME payload and four-file `polymesh-advisor/` package, so model-only changes
-produce a new joint release and a rollback target can be identified from disk
-alone.
+per-artifact digests. The verified `chud` binary and checked-in Chudcode
+artifact lock each have their own SHA-256 and participate in the joint hash.
+Advisor-enabled releases likewise hash the exact ONNX Runtime SONAME payload
+and four-file `polymesh-advisor/` package, so either model or agent-runtime
+changes produce a new joint release identifiable from disk alone.
 
 Release ids are `YYYYmmddTHHMMSSZ-<joint12>-<pid>`. The timestamp is UTC: it is
 what retention sorts on lexicographically, and a local-time stamp is

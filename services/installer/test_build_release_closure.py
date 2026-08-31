@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from services.installer import build_release, payload_manifest
+from scripts import pin_chudcode
 from services.installer.payload_manifest import build_manifest
 
 
@@ -30,14 +31,51 @@ def _runtime(tmp_path: Path) -> Path:
 
 def _sidecars(tmp_path: Path) -> dict[str, Path]:
     result = {}
-    for arg in ("hostd_bin", "worker_bin", "mcp_bin", "omp_bridge_bin", "uninstall_helper_bin"):
+    for arg in ("hostd_bin", "worker_bin", "mcp_bin", "uninstall_helper_bin"):
         path = tmp_path / f"{arg}.exe"
         path.write_bytes(arg.encode())
         result[arg] = path
+    chud = tmp_path / "input-chud.exe"
+    image = bytearray(256)
+    image[:2] = b"MZ"
+    image[0x3C:0x40] = (128).to_bytes(4, "little")
+    image[128:132] = b"PE\0\0"
+    image[132:134] = (0x8664).to_bytes(2, "little")
+    chud.write_bytes(image)
+    digest = hashlib.sha256(image).hexdigest()
+    artifacts = {
+        target: {
+            "filename": pin_chudcode.CANONICAL_NAMES[target],
+            "sha256": digest,
+            "url": f"https://release.invalid/{target}/{pin_chudcode.CANONICAL_NAMES[target]}",
+        }
+        for target in pin_chudcode.SUPPORTED_TARGETS
+    }
+    lock = tmp_path / "CHUDCODE_ARTIFACT.lock"
+    lock.write_bytes(
+        pin_chudcode._canonical_json(
+            {
+                "artifacts": artifacts,
+                "engine_version": "18.0.8",
+                "repository": "https://github.com/Hunter-124/chudcode.git",
+                "repository_commit": "1" * 40,
+                "rpc_protocol": 2,
+                "schema": pin_chudcode.SCHEMA,
+                "version": "0.2.0",
+            }
+        )
+    )
+    pin_chudcode.DEFAULT_LOCK = lock
+    pin_chudcode._verify_executable_version = lambda *_args: (
+        "Chudcode v0.2.0 (based on omp 18.0.8)"
+    )
+    result["chud_bin"] = chud
     return result
 
 
-def test_windows_stage_and_manifest_own_complete_runtime_closure(tmp_path: Path) -> None:
+def test_windows_stage_and_manifest_own_complete_runtime_closure(
+    tmp_path: Path,
+) -> None:
     runtime = _runtime(tmp_path)
     dst = tmp_path / "payload"
     dst.mkdir()
@@ -52,7 +90,8 @@ def test_windows_stage_and_manifest_own_complete_runtime_closure(tmp_path: Path)
         "chudware-hostd.exe",
         "chudware-worker.exe",
         "chudware-mcp.exe",
-        "chudware-omp-bridge.exe",
+        "chud.exe",
+        "CHUDCODE_ARTIFACT.lock",
         "chudware-uninstall-helper.exe",
     }
     actual = {p.relative_to(dst).as_posix() for p in dst.rglob("*") if p.is_file()}
@@ -63,12 +102,29 @@ def test_windows_stage_and_manifest_own_complete_runtime_closure(tmp_path: Path)
     assert {row["path"] for row in manifest["files"]} == expected
 
 
-@pytest.mark.parametrize("missing", ["libcef.dll", "chudware_cef_helper.exe", "assets", "locales"])
-def test_windows_stage_fails_closed_on_missing_runtime_closure(tmp_path: Path, missing: str) -> None:
+def test_windows_stage_requires_verified_chudcode_artifact(tmp_path: Path) -> None:
+    runtime = _runtime(tmp_path)
+    sidecars = _sidecars(tmp_path)
+    sidecars["chud_bin"] = None
+    dst = tmp_path / "payload"
+    dst.mkdir()
+    with pytest.raises(RuntimeError, match="required compiled Chudcode artifact"):
+        build_release.stage_compiled_payload(
+            dst, host_bin=runtime / "chudware.exe", **sidecars
+        )
+
+
+@pytest.mark.parametrize(
+    "missing", ["libcef.dll", "chudware_cef_helper.exe", "assets", "locales"]
+)
+def test_windows_stage_fails_closed_on_missing_runtime_closure(
+    tmp_path: Path, missing: str
+) -> None:
     runtime = _runtime(tmp_path)
     target = runtime / missing
     if target.is_dir():
         import shutil
+
         shutil.rmtree(target)
     else:
         target.unlink()
@@ -81,8 +137,12 @@ def test_windows_stage_fails_closed_on_missing_runtime_closure(tmp_path: Path, m
     assert not (dst / "payload-manifest.v1.json").exists()
 
 
-@pytest.mark.parametrize("relative", ["debug.pdb", "source.cpp", ".git/config", "assets/test_fixture.dat"])
-def test_windows_stage_excludes_debug_source_and_repo_metadata(tmp_path: Path, relative: str) -> None:
+@pytest.mark.parametrize(
+    "relative", ["debug.pdb", "source.cpp", ".git/config", "assets/test_fixture.dat"]
+)
+def test_windows_stage_excludes_debug_source_and_repo_metadata(
+    tmp_path: Path, relative: str
+) -> None:
     runtime = _runtime(tmp_path)
     forbidden = runtime / relative
     forbidden.parent.mkdir(parents=True, exist_ok=True)
@@ -131,8 +191,11 @@ def _restat(result: os.stat_result, **overrides: int) -> os.stat_result:
     """Rebuild a stat_result, keeping the nanosecond fields intact."""
     fields = list(result)
     named = {
-        "st_atime": result.st_atime, "st_mtime": result.st_mtime, "st_ctime": result.st_ctime,
-        "st_atime_ns": result.st_atime_ns, "st_mtime_ns": result.st_mtime_ns,
+        "st_atime": result.st_atime,
+        "st_mtime": result.st_mtime,
+        "st_ctime": result.st_ctime,
+        "st_atime_ns": result.st_atime_ns,
+        "st_mtime_ns": result.st_mtime_ns,
         "st_ctime_ns": result.st_ctime_ns,
     }
     for name, value in overrides.items():
@@ -174,7 +237,9 @@ def test_snapshot_tolerates_the_windows_cross_api_file_id(
     monkeypatch.setattr(
         payload_manifest, "_CROSS_FLAVOUR_IGNORED", ("dev", "ino", "ctime_ns", "mode")
     )
-    snapshot = payload_manifest._snapshot_file(root, "FreeImage.dll", "library", attempts=1)
+    snapshot = payload_manifest._snapshot_file(
+        root, "FreeImage.dll", "library", attempts=1
+    )
     assert snapshot.sha256 == hashlib.sha256(b"dll bytes").hexdigest()
 
     monkeypatch.setattr(payload_manifest, "_CROSS_FLAVOUR_IGNORED", ())

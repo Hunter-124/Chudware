@@ -6,8 +6,8 @@
 #  ~/chudware-web/releases instead of deleting the one it supersedes; this
 #  script moves `current` back onto one of them and restarts hostd through the
 #  same drain-then-restart-then-prove-ready sequence a forward promotion uses.
-#  Nothing is re-hashed and nothing is rebuilt: the target was already validated
-#  when it was promoted, and its deploy-manifest still records what it is.
+#  The target is not rebuilt; its artifact lock, compiled Chudcode binary, and
+#  recorded digests are re-verified before the live paths move.
 # ===========================================================================
 set -euo pipefail
 
@@ -155,20 +155,40 @@ if [ "$TARGET_ID" = "$CURRENT_ID" ]; then
 fi
 
 TARGET_DIR="$RELEASES/$TARGET_ID"
-TARGET_JOINT="$(manifest_value "$TARGET_DIR/deploy-manifest" joint_sha256)"
+TARGET_MANIFEST="$TARGET_DIR/deploy-manifest"
+TARGET_JOINT="$(manifest_value "$TARGET_MANIFEST" joint_sha256)"
 [ -n "$TARGET_JOINT" ] \
-  || fatal "$TARGET_DIR/deploy-manifest has no joint_sha256; refusing to restore a tree of unknown identity"
+  || fatal "$TARGET_MANIFEST has no joint_sha256; refusing to restore a tree of unknown identity"
 
 # --------------------------------------------------------------------------
 # Prove the target is still a complete, loadable release before anything moves
 # --------------------------------------------------------------------------
-for f in bin/chudware-hostd bin/libchudware.so app/index.html app/Chudware.js app/Chudware.wasm; do
+for f in bin/chudware-hostd bin/libchudware.so bin/chud CHUDCODE_ARTIFACT.lock app/index.html app/Chudware.js app/Chudware.wasm; do
   [ -s "$TARGET_DIR/$f" ] || fatal "$TARGET_DIR/$f missing or empty; release $TARGET_ID is not restorable"
 done
 [ -x "$TARGET_DIR/bin/chudware-hostd" ] || fatal "$TARGET_DIR/bin/chudware-hostd is not executable"
+[ -x "$TARGET_DIR/bin/chud" ] || fatal "$TARGET_DIR/bin/chud is not executable"
 [ -f "$TARGET_DIR/chudware-hostd.service" ] \
   || fatal "$TARGET_DIR/chudware-hostd.service missing; release $TARGET_ID predates unit capture and cannot be restored coherently"
 [ -d "$TARGET_DIR/agent/prompts" ] || fatal "$TARGET_DIR/agent/prompts missing; agent roles would be unusable"
+PYTHON="$ROOT/Webservice/gateway/.venv/bin/python"
+if [ ! -x "$PYTHON" ]; then
+  PYTHON="$(command -v python3 || true)"
+fi
+[ -n "$PYTHON" ] && [ -x "$PYTHON" ] || fatal "python3 is required for artifact and drain validation"
+command -v sha256sum >/dev/null 2>&1 || fatal "sha256sum is required"
+EXPECTED_CHUD_SHA="$(manifest_value "$TARGET_MANIFEST" chud_sha256)"
+EXPECTED_LOCK_SHA="$(manifest_value "$TARGET_MANIFEST" chudcode_artifact_lock_sha256)"
+[ -n "$EXPECTED_CHUD_SHA" ] && [ -n "$EXPECTED_LOCK_SHA" ] \
+  || fatal "$TARGET_ID predates Chudcode artifact evidence and cannot be restored"
+[ "$(sha256sum "$TARGET_DIR/bin/chud" | cut -d' ' -f1)" = "$EXPECTED_CHUD_SHA" ] \
+  || fatal "$TARGET_ID Chudcode binary no longer matches its deploy manifest"
+[ "$(sha256sum "$TARGET_DIR/CHUDCODE_ARTIFACT.lock" | cut -d' ' -f1)" = "$EXPECTED_LOCK_SHA" ] \
+  || fatal "$TARGET_ID Chudcode artifact lock no longer matches its deploy manifest"
+"$PYTHON" "$ROOT/scripts/pin_chudcode.py" \
+  --lock "$TARGET_DIR/CHUDCODE_ARTIFACT.lock" verify \
+  --target linux-x86_64 --input "$TARGET_DIR/bin/chud" >/dev/null \
+  || fatal "$TARGET_ID Chudcode binary does not satisfy its artifact lock"
 # Same pre-flight install_webd.sh runs against its stage: a release whose daemon
 # can no longer load its own library (a half-deleted tree, a bad restore) must be
 # rejected while `current` still points at something that works.
@@ -196,11 +216,6 @@ echo "[rollback] restoring $TARGET_ID (joint sha ${TARGET_JOINT:0:12}) over ${CU
 # duplicated rather than shared because these two scripts have no common library
 # and a rollback must not depend on the repo checkout still matching the release
 # it is restoring; if you change the drain there, change it here.
-PYTHON="$ROOT/Webservice/gateway/.venv/bin/python"
-if [ ! -x "$PYTHON" ]; then
-  PYTHON="$(command -v python3 || true)"
-fi
-[ -n "$PYTHON" ] && [ -x "$PYTHON" ] || fatal "python3 is required for drain health validation"
 command -v curl >/dev/null 2>&1 || fatal "curl is required"
 command -v systemctl >/dev/null 2>&1 || fatal "systemctl is required"
 

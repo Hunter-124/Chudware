@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # packaging/linux/build_appimage.sh — assemble a self-contained AppImage for the Chudware
 # host GUI (binary named chudware).
-# Protected Python services and the OMP TypeScript bridge are compiled into adjacent
-# sidecars. The AppImage contains no repository-source runtime or provisioning wheelhouse.
+# Protected Python services and the compiled Chudcode RPC binary are adjacent sidecars.
+# The AppImage contains no repository-source runtime or provisioning wheelhouse.
 # Requires production builds and generated protected assets:
 #   python3 packaging/embed_protected_assets.py --source-root . \
 #     --output-dir host/build-linux/generated/protected-assets
@@ -20,6 +20,7 @@
 #   --hostd-bin FILE    explicit production host daemon (required for prepare)
 #   --libchudware-bin FILE  explicit production engine library (required unless demo mode)
 #   --protected-assets-dir DIR  generated protected tables (required for prepare)
+#   --chud-bin FILE     verified pinned Chudcode release binary (or CHUDWARE_CHUD_BIN)
 #   --prepare-signing   stage immutable AppDir, write canonical manifest/preimage, then exit
 #   --key-id ID         release key id recorded in the prepared manifest
 #   --finalize-signing SIG  verify/embed detached signature and archive the retained AppDir
@@ -40,6 +41,7 @@ PROTECTED_ASSETS_OUT=""
 BIN=""
 HOSTD=""
 LIBCHUDWARE=""
+CHUD_BIN="${CHUDWARE_CHUD_BIN:-}"
 APPIMAGETOOL_VERSION="1.9.1"
 APPIMAGETOOL_SHA256="ed4ce84f0d9caff66f50bcca6ff6f35aae54ce8135408b3fa33abfc3cb384eb0"
 
@@ -49,6 +51,7 @@ while [ $# -gt 0 ]; do
         --host-bin) BIN="$2"; shift 2 ;;
         --hostd-bin) HOSTD="$2"; shift 2 ;;
         --libchudware-bin) LIBCHUDWARE="$2"; shift 2 ;;
+        --chud-bin) CHUD_BIN="$2"; shift 2 ;;
         --protected-assets-dir) PROTECTED_ASSETS_OUT="$2"; shift 2 ;;
         --with-libchudware) WITH_LIBCHUDWARE=1; shift ;;   # legacy no-op (now the default)
         --no-libchudware) WITH_LIBCHUDWARE=0; shift ;;
@@ -64,6 +67,7 @@ done
 [ -n "$MODE" ] || { echo "error: --prepare-signing or --finalize-signing is required" >&2; exit 2; }
 if [ "$MODE" = prepare ]; then
     [ -n "$KEY_ID" ] || { echo "error: --key-id is required with --prepare-signing" >&2; exit 2; }
+    [ -n "$CHUD_BIN" ] || { echo "error: --chud-bin or CHUDWARE_CHUD_BIN is required" >&2; exit 2; }
 else
     [ -f "$FINALIZE_SIGNATURE" ] && [ -s "$FINALIZE_SIGNATURE" ] || {
         echo "error: --finalize-signing must name a detached signature" >&2; exit 2;
@@ -82,19 +86,16 @@ require_production_cache() {
     }
 }
 
-build_omp_bridge() {
+stage_chudcode() {
     local destination="$1"
-    command -v bun >/dev/null 2>&1 || { echo "error: Bun is required to compile chudware-omp-bridge" >&2; exit 1; }
-    echo "==> installing locked vendored OMP workspace"
-    (cd "$REPO/vendor/omp" && bun install --frozen-lockfile)
-    (cd "$REPO/vendor/omp" && bun build --compile --sourcemap=none --packages=bundle \
-        --allow-unresolved='' --allow-unresolved='@img/sharp-*/versions' --allow-unresolved='@img/sharp-libvips-*/lib' --allow-unresolved='@img/sharp-libvips-*/package' --allow-unresolved='@img/sharp-libvips-*/versions' --allow-unresolved='@img/sharp-libvips-dev-*/include' --allow-unresolved='@img/sharp-libvips-dev-*/lib' \
-        --no-compile-autoload-dotenv --no-compile-autoload-bunfig \
-        --no-compile-autoload-package-json bridge/src/bridge.ts --outfile "$destination")
-    # bun --compile writes <entry>.js.map beside the outfile even under
-    # --sourcemap=none; the staging guard rightly rejects debug artifacts.
-    rm -f "$(dirname "$destination")/bridge.js.map"
-    [ -x "$destination" ] || { echo "error: Bun did not produce $destination" >&2; exit 1; }
+    [ -n "$CHUD_BIN" ] || {
+        echo "error: --chud-bin or CHUDWARE_CHUD_BIN is required" >&2
+        exit 1
+    }
+    "$RELEASE_PYTHON" "$REPO/scripts/pin_chudcode.py" stage \
+        --target linux-x86_64 --input "$CHUD_BIN" --output "$destination"
+    cp "$REPO/vendor/chudcode/CHUDCODE_ARTIFACT.lock" \
+        "$(dirname "$destination")/CHUDCODE_ARTIFACT.lock"
 }
 
 generate_protected_assets() {
@@ -537,8 +538,8 @@ except BaseException as e:
         fi
 fi
 
-# Protected Python and TypeScript are compiled into adjacent production sidecars. Packaged
-# builds never provision from repository source and never fall back to source entrypoints.
+# Protected Python services and Chudcode are compiled sidecars. Packaged builds never
+# provision from repository source and never fall back to source entrypoints.
 [ -f "$REPO/services/compiled_entry.py" ] || {
     echo "error: services/compiled_entry.py is required for release sidecars" >&2
     exit 1
@@ -546,7 +547,7 @@ fi
 generate_protected_assets
 build_python_sidecar worker_main "$APPDIR/usr/bin/chudware-worker"
 build_python_sidecar mcp.server "$APPDIR/usr/bin/chudware-mcp"
-build_omp_bridge "$APPDIR/usr/bin/chudware-omp-bridge"
+stage_chudcode "$APPDIR/usr/bin/chud"
 
 
 cp "$REPO/LICENSE-EULA.txt" "$APPDIR/usr/bin/LICENSE-EULA.txt"
@@ -577,6 +578,9 @@ fi
 # mount. Respect pre-set env so tests/dev can override.
 if [ -x "$HERE/usr/bin/chudware-hostd" ] && [ -z "${CHUDWARE_HOSTD_BIN:-}" ]; then
     export CHUDWARE_HOSTD_BIN="$HERE/usr/bin/chudware-hostd"
+fi
+if [ -x "$HERE/usr/bin/chud" ] && [ -z "${CHUDWARE_CHUDCODE_BIN:-}" ]; then
+    export CHUDWARE_CHUDCODE_BIN="$HERE/usr/bin/chud"
 fi
 if [ -z "${CHUDWARE_INSTANCE_KEY:-}" ]; then
     export CHUDWARE_INSTANCE_KEY="$(printf %s "${APPIMAGE:-$HERE}" | sha256sum | cut -c1-12)"

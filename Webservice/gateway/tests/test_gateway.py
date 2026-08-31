@@ -15,7 +15,9 @@ if str(GATEWAY_DIR.parent) not in sys.path:
 
 # Force dev mode BEFORE importing app
 os.environ["CHUDWARE_WEB_DEV"] = "1"
-os.environ.setdefault("CHUDWARE_WEB_DATA_ROOT", str(Path.home() / "chudware-web-data-test"))
+os.environ.setdefault(
+    "CHUDWARE_WEB_DATA_ROOT", str(Path.home() / "chudware-web-data-test")
+)
 
 from fastapi.testclient import TestClient  # noqa: E402
 
@@ -34,9 +36,7 @@ def _seed(email: str, display: str, *, admin: bool = False) -> None:
     accounts.set_status(email, "active", decided_by="test")
     if admin:
         with db.tx() as cur:
-            cur.execute(
-                "UPDATE accounts SET role = 'admin' WHERE email = %s", (email,)
-            )
+            cur.execute("UPDATE accounts SET role = 'admin' WHERE email = %s", (email,))
 
 
 @pytest.fixture(autouse=True)
@@ -144,7 +144,10 @@ def test_portal_index(client):
     r = client.get("/", headers=_auth("demo@example.com"))
     assert r.status_code == 200
     # static index from PortalChat
-    assert "html" in r.headers.get("content-type", "").lower() or b"html" in r.content[:200].lower()
+    assert (
+        "html" in r.headers.get("content-type", "").lower()
+        or b"html" in r.content[:200].lower()
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -162,7 +165,9 @@ def test_ai_provider_vars_parse(monkeypatch, tmp_path):
         "BROKEN LINE\n"
         "ANTHROPIC_API_KEY=sk-ant-456\n"
     )
-    monkeypatch.setattr(type(settings), "ai_providers_env", property(lambda self: env_file))
+    monkeypatch.setattr(
+        type(settings), "ai_providers_env", property(lambda self: env_file)
+    )
     assert settings.ai_provider_vars() == {
         "OPENROUTER_API_KEY": "sk-or-123",
         "ANTHROPIC_API_KEY": "sk-ant-456",
@@ -176,8 +181,15 @@ def test_ai_provider_vars_parse(monkeypatch, tmp_path):
 
 def test_team_domain_normalization(monkeypatch):
     from gateway.config import _normalize_team_domain
-    assert _normalize_team_domain("bruh.cloudflareaccess.com") == "https://bruh.cloudflareaccess.com"
-    assert _normalize_team_domain("https://bruh.cloudflareaccess.com/") == "https://bruh.cloudflareaccess.com"
+
+    assert (
+        _normalize_team_domain("bruh.cloudflareaccess.com")
+        == "https://bruh.cloudflareaccess.com"
+    )
+    assert (
+        _normalize_team_domain("https://bruh.cloudflareaccess.com/")
+        == "https://bruh.cloudflareaccess.com"
+    )
     assert _normalize_team_domain("") == ""
 
 
@@ -190,10 +202,19 @@ def test_admin_browse_lists_project_roots(client, monkeypatch, tmp_path):
     (proj / "notes.txt").write_bytes(b"x")
 
     # browse: admin only, lists dirs + CAD parts only
-    assert client.get("/api/admin/browse", headers=_auth("demo@example.com"),
-                      params={"path": str(proj)}).status_code == 403
-    r = client.get("/api/admin/browse", headers=_auth("boss@example.com"),
-                   params={"path": str(proj)})
+    assert (
+        client.get(
+            "/api/admin/browse",
+            headers=_auth("demo@example.com"),
+            params={"path": str(proj)},
+        ).status_code
+        == 403
+    )
+    r = client.get(
+        "/api/admin/browse",
+        headers=_auth("boss@example.com"),
+        params={"path": str(proj)},
+    )
     assert r.status_code == 200, r.text
     body = r.json()
     assert body["dirs"] == ["sub"] and body["parts"] == ["Frame.step+"]
@@ -202,7 +223,10 @@ def test_admin_browse_lists_project_roots(client, monkeypatch, tmp_path):
 # ---------------------------------------------------------------- admin ops
 def test_admin_ops(client):
     # ops: admin-gated, reports host health for the dashboard
-    assert client.get("/api/admin/ops", headers=_auth("demo@example.com")).status_code == 403
+    assert (
+        client.get("/api/admin/ops", headers=_auth("demo@example.com")).status_code
+        == 403
+    )
     r = client.get("/api/admin/ops", headers=_auth("boss@example.com"))
     assert r.status_code == 200
     body = r.json()
@@ -219,12 +243,24 @@ def test_security_headers(client):
 
 def test_admin_refuse_new_toggle(client):
     flag = settings.refuse_new_flag
-    assert client.put("/api/admin/refuse-new", headers=_auth("demo@example.com"),
-                      json={"on": True}).status_code == 403
-    r = client.put("/api/admin/refuse-new", headers=_auth("boss@example.com"), json={"on": True})
+    assert (
+        client.put(
+            "/api/admin/refuse-new",
+            headers=_auth("demo@example.com"),
+            json={"on": True},
+        ).status_code
+        == 403
+    )
+    r = client.put(
+        "/api/admin/refuse-new", headers=_auth("boss@example.com"), json={"on": True}
+    )
     assert r.status_code == 200 and r.json()["refuse_new"] is True and flag.exists()
-    r3 = client.put("/api/admin/refuse-new", headers=_auth("boss@example.com"), json={"on": False})
-    assert r3.status_code == 200 and r3.json()["refuse_new"] is False and not flag.exists()
+    r3 = client.put(
+        "/api/admin/refuse-new", headers=_auth("boss@example.com"), json={"on": False}
+    )
+    assert (
+        r3.status_code == 200 and r3.json()["refuse_new"] is False and not flag.exists()
+    )
     ops = client.get("/api/admin/ops", headers=_auth("boss@example.com")).json()
     assert ops["refuse_new"] is False and "units" in ops["host"]
 
@@ -232,7 +268,7 @@ def test_admin_refuse_new_toggle(client):
 # ------------------------------------------------------ shared admin terminal
 @pytest.fixture
 def _tmux_env(monkeypatch):
-    """Isolated tmux socket + no-op omp; skip when tmux is unavailable."""
+    """Isolated tmux socket + no-op Chudcode command; skip when tmux is unavailable."""
     import gateway.terminal as term
 
     if term._TMUX is None:
@@ -241,12 +277,13 @@ def _tmux_env(monkeypatch):
     # enabled deployment.
     monkeypatch.setattr(settings, "terminal_enabled", True)
     monkeypatch.setattr(term, "_SOCKET", "chudware-pytest")
-    monkeypatch.setenv("CHUDWARE_OMP_CMD", "true")
+    monkeypatch.setenv("CHUDWARE_CHUD_CMD", "true")
     # Start the tmux server directly (no systemd user scope) so the test is
     # hermetic on boxes without a user systemd bus.
     real_which = term.shutil.which
     monkeypatch.setattr(
-        term.shutil, "which",
+        term.shutil,
+        "which",
         lambda n: None if n == "systemd-run" else real_which(n),
     )
     term._run_tmux("kill-server")
@@ -256,42 +293,65 @@ def _tmux_env(monkeypatch):
 
 def test_terminal_sessions_shared_lifecycle(client, _tmux_env):
     # admin-gated
-    assert client.get("/api/admin/terminal/sessions",
-                      headers=_auth("demo@example.com")).status_code == 403
+    assert (
+        client.get(
+            "/api/admin/terminal/sessions", headers=_auth("demo@example.com")
+        ).status_code
+        == 403
+    )
 
-    body = client.get("/api/admin/terminal/sessions",
-                      headers=_auth("boss@example.com")).json()
+    body = client.get(
+        "/api/admin/terminal/sessions", headers=_auth("boss@example.com")
+    ).json()
     assert body["tmux"] is True and body["sessions"] == []
 
     # create a named shared session
-    r = client.post("/api/admin/terminal/sessions",
-                    headers=_auth("boss@example.com"), json={"name": "Work 1!"})
+    r = client.post(
+        "/api/admin/terminal/sessions",
+        headers=_auth("boss@example.com"),
+        json={"name": "Work 1!"},
+    )
     assert r.status_code == 200, r.text
     assert r.json()["name"] == "work-1"  # slugged
 
     # it now shows up in the owner's list (saved with zero clients attached)
-    sessions = client.get("/api/admin/terminal/sessions",
-                          headers=_auth("boss@example.com")).json()["sessions"]
+    sessions = client.get(
+        "/api/admin/terminal/sessions", headers=_auth("boss@example.com")
+    ).json()["sessions"]
     names = {s["name"]: s for s in sessions}
     assert "work-1" in names and names["work-1"]["clients"] == 0
 
     # non-admins cannot create or kill
-    assert client.post("/api/admin/terminal/sessions",
-                       headers=_auth("demo@example.com"), json={}).status_code == 403
-    assert client.delete("/api/admin/terminal/sessions/work-1",
-                         headers=_auth("demo@example.com")).status_code == 403
+    assert (
+        client.post(
+            "/api/admin/terminal/sessions", headers=_auth("demo@example.com"), json={}
+        ).status_code
+        == 403
+    )
+    assert (
+        client.delete(
+            "/api/admin/terminal/sessions/work-1", headers=_auth("demo@example.com")
+        ).status_code
+        == 403
+    )
 
     # auto-named create when no name given
-    auto = client.post("/api/admin/terminal/sessions",
-                       headers=_auth("boss@example.com"), json={}).json()["name"]
+    auto = client.post(
+        "/api/admin/terminal/sessions", headers=_auth("boss@example.com"), json={}
+    ).json()["name"]
     assert auto and auto != "work-1"
 
     # explicit kill removes it
-    r = client.delete("/api/admin/terminal/sessions/work-1",
-                      headers=_auth("boss@example.com"))
+    r = client.delete(
+        "/api/admin/terminal/sessions/work-1", headers=_auth("boss@example.com")
+    )
     assert r.status_code == 200 and r.json()["ok"] is True
-    left = {s["name"] for s in client.get("/api/admin/terminal/sessions",
-            headers=_auth("boss@example.com")).json()["sessions"]}
+    left = {
+        s["name"]
+        for s in client.get(
+            "/api/admin/terminal/sessions", headers=_auth("boss@example.com")
+        ).json()["sessions"]
+    }
     assert "work-1" not in left and auto in left
 
 
@@ -333,7 +393,9 @@ def test_releases_upload_list_download_delete(client, tmp_path, monkeypatch):
     r = client.post(
         "/api/admin/releases/upload",
         headers=admin,
-        files={"file": ("Chudware-Setup-1.0.0.exe", payload, "application/octet-stream")},
+        files={
+            "file": ("Chudware-Setup-1.0.0.exe", payload, "application/octet-stream")
+        },
     )
     assert r.status_code == 200, r.text
     meta = r.json()
@@ -351,9 +413,7 @@ def test_releases_upload_list_download_delete(client, tmp_path, monkeypatch):
     assert r3.status_code == 200
     assert r3.content == payload
 
-    r4 = client.delete(
-        "/api/admin/releases/Chudware-Setup-1.0.0.exe", headers=admin
-    )
+    r4 = client.delete("/api/admin/releases/Chudware-Setup-1.0.0.exe", headers=admin)
     assert r4.status_code == 200
     assert r4.json() == {"ok": True}
 

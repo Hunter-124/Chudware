@@ -5,7 +5,7 @@ set -euo pipefail
 LOGDIR="${CHUDWARE_WEB_DATA:-$HOME/chudware-web-data}/logs"
 mkdir -p "$LOGDIR"
 
-REPO="${CHUDWARE_OMP_DIR:-$HOME/Repositories/CAD}"
+REPO="${CHUDWARE_REPO_DIR:-$HOME/Repositories/CAD}"
 cd "$REPO"
 
 STATUS="$LOGDIR/deploy-status.json"

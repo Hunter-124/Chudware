@@ -61,14 +61,6 @@ scratch/
 /runs/
 /*.step+
 
-# Vendored OMP (oh-my-pi) bun workspace — SOURCE under vendor/omp/ IS tracked (deterministic,
-# re-pulled by scripts/vendor_omp.py); installed deps + native binaries are not.
-vendor/omp/node_modules/
-vendor/omp/**/node_modules/
-# Per-machine provisioning state written by OmpBridgeClient::ensureBridgeDeps: the fingerprint
-# of the bun.lock node_modules was installed from, plus its cross-process install lock.
-vendor/omp/.chudware-bridge-deps
-vendor/omp/.chudware-bridge-install.lock
 
 # Marketing site (Astro). SOURCE under Webservice/public-site/src, public/ and the
 # pinned package.json + package-lock.json ARE tracked — the lockfile is what makes
@@ -151,7 +143,6 @@ reports/runs/
 **/reports/runs/
 signal-desktop*
 services/corpora/
-.omp/
 repomix-output.*
 
 # Per-project agent memory (mnemopi SQLite) — runtime state, created on demand.

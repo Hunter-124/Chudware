@@ -10,6 +10,7 @@ archived or passed to Inno Setup.
 Developer provisioning remains available through ``services.installer.provision`` and
 is not copied into customer releases.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -47,11 +48,31 @@ UNINSTALL_HELPER_EXE = HOST_EXE.parent / "chudware-uninstall-helper.exe"
 # CMake stages the complete GUI runtime next to chudware.exe. Release packaging copies
 # that verified tree rather than maintaining a brittle executable/resource allowlist.
 FORBIDDEN_RUNTIME_SUFFIXES = {
-    ".c", ".cc", ".cpp", ".cxx", ".h", ".hh", ".hpp", ".inl",
-    ".py", ".pyc", ".pyo", ".ts", ".tsx", ".js", ".jsx", ".map", ".pdb",
+    ".c",
+    ".cc",
+    ".cpp",
+    ".cxx",
+    ".h",
+    ".hh",
+    ".hpp",
+    ".inl",
+    ".py",
+    ".pyc",
+    ".pyo",
+    ".ts",
+    ".tsx",
+    ".js",
+    ".jsx",
+    ".map",
+    ".pdb",
 }
 FORBIDDEN_RUNTIME_DIRS = {
-    ".git", ".github", ".svn", "__pycache__", "node_modules", "CMakeFiles",
+    ".git",
+    ".github",
+    ".svn",
+    "__pycache__",
+    "node_modules",
+    "CMakeFiles",
 }
 REQUIRED_WINDOWS_RUNTIME = (
     "chudware.exe",
@@ -78,6 +99,7 @@ VERSION_HEADER_CANDIDATES = (
 ISS_SCRIPT = REPO / "packaging" / "windows" / "chudware.iss"
 VERSION_RE = re.compile(r'^#define CHUDWARE_VERSION\s+"([^"]+)"$', re.MULTILINE)
 
+
 def _copy_required(source: Path | None, destination: Path, label: str) -> None:
     if source is None or not source.is_file() or source.is_symlink():
         raise RuntimeError(f"required compiled {label} not found or unsafe: {source}")
@@ -86,7 +108,10 @@ def _copy_required(source: Path | None, destination: Path, label: str) -> None:
 
 
 def _runtime_file_allowed(relative: Path) -> bool:
-    if any(part in FORBIDDEN_RUNTIME_DIRS or part.endswith(".dSYM") for part in relative.parts):
+    if any(
+        part in FORBIDDEN_RUNTIME_DIRS or part.endswith(".dSYM")
+        for part in relative.parts
+    ):
         return False
     name = relative.name.lower()
     return (
@@ -103,17 +128,26 @@ def stage_compiled_payload(
     hostd_bin: Path,
     worker_bin: Path,
     mcp_bin: Path,
-    omp_bridge_bin: Path,
+    chud_bin: Path | None,
     uninstall_helper_bin: Path,
 ) -> None:
     """Stage the complete CMake-produced GUI runtime plus protected sidecars."""
     runtime_root = host_bin.parent
-    missing = [name for name in REQUIRED_WINDOWS_RUNTIME if not (runtime_root / name).is_file()]
+    missing = [
+        name for name in REQUIRED_WINDOWS_RUNTIME if not (runtime_root / name).is_file()
+    ]
     locales = runtime_root / "locales"
     assets = runtime_root / "assets"
-    if missing or not assets.is_dir() or not locales.is_dir() or not any(locales.glob("*.pak")):
+    if (
+        missing
+        or not assets.is_dir()
+        or not locales.is_dir()
+        or not any(locales.glob("*.pak"))
+    ):
         details = ", ".join(missing) or "assets/locales closure"
-        raise RuntimeError(f"incomplete Windows GUI runtime beside {host_bin}: {details}")
+        raise RuntimeError(
+            f"incomplete Windows GUI runtime beside {host_bin}: {details}"
+        )
     for source in sorted(runtime_root.rglob("*")):
         relative = source.relative_to(runtime_root)
         if source.is_symlink():
@@ -128,8 +162,19 @@ def stage_compiled_payload(
     _copy_required(hostd_bin, dst / "chudware-hostd.exe", "host daemon")
     _copy_required(worker_bin, dst / "chudware-worker.exe", "worker")
     _copy_required(mcp_bin, dst / "chudware-mcp.exe", "MCP server")
-    _copy_required(omp_bridge_bin, dst / "chudware-omp-bridge.exe", "OMP bridge")
-    _copy_required(uninstall_helper_bin, dst / "chudware-uninstall-helper.exe", "uninstall helper")
+    if chud_bin is None:
+        raise RuntimeError("required compiled Chudcode artifact not found")
+    from scripts import pin_chudcode
+
+    try:
+        pin_chudcode.stage_binary(chud_bin, dst / "chud.exe", "windows-x86_64")
+    except pin_chudcode.ArtifactLockError as exc:
+        raise RuntimeError(f"invalid Chudcode release artifact: {exc}") from exc
+    shutil.copy2(pin_chudcode.DEFAULT_LOCK, dst / "CHUDCODE_ARTIFACT.lock")
+    _copy_required(
+        uninstall_helper_bin, dst / "chudware-uninstall-helper.exe", "uninstall helper"
+    )
+
 
 def build(
     out: Path,
@@ -145,7 +190,7 @@ def build(
     hostd_bin: Path | None,
     worker_bin: Path | None,
     mcp_bin: Path | None,
-    omp_bridge_bin: Path | None,
+    chud_bin: Path | None,
     uninstall_helper_bin: Path | None,
     platform: str = "windows",
     arch: str = "x86_64",
@@ -159,10 +204,14 @@ def build(
     """
     if prepare_signing:
         if payload_signature is not None or make_zip:
-            raise RuntimeError("--prepare-signing cannot be combined with a signature or --zip")
+            raise RuntimeError(
+                "--prepare-signing cannot be combined with a signature or --zip"
+            )
         preimage_path = out / "payload-manifest.v1.preimage"
         if preimage_path.exists():
-            raise RuntimeError(f"refusing to replace existing signing preimage: {preimage_path}")
+            raise RuntimeError(
+                f"refusing to replace existing signing preimage: {preimage_path}"
+            )
     elif payload_signature is None or release_public_key is None:
         raise RuntimeError(
             "customer payload finalization requires --payload-signature and --release-public-key"
@@ -180,7 +229,7 @@ def build(
         worker_bin=worker_bin,
         uninstall_helper_bin=uninstall_helper_bin,
         mcp_bin=mcp_bin,
-        omp_bridge_bin=omp_bridge_bin,
+        chud_bin=chud_bin,
     )
     shutil.copy2(REPO / "services" / "installer" / "install.ps1", dst / "install.ps1")
 
@@ -218,7 +267,9 @@ def build(
     )
     on_disk_manifest, on_disk_json = read_manifest(dst)
     if on_disk_json != canonical_json or on_disk_manifest["key_id"] != key_id:
-        raise PayloadManifestError("payload manifest changed during signature finalization")
+        raise PayloadManifestError(
+            "payload manifest changed during signature finalization"
+        )
     verify_signature(
         key_id=key_id,
         canonical_json=canonical_json,
@@ -245,7 +296,9 @@ def finalize_prepared_payload(
     dst = out / "Chudware"
     manifest_path = dst / MANIFEST_NAME
     if (dst / SIGNATURE_NAME).exists():
-        raise RuntimeError(f"prepared payload is already finalized: {dst / SIGNATURE_NAME}")
+        raise RuntimeError(
+            f"prepared payload is already finalized: {dst / SIGNATURE_NAME}"
+        )
     manifest, canonical_json = read_manifest(dst)
     manifest, snapshots = verify_manifest_payload(dst, canonical_json)
     key_id = str(manifest["key_id"])
@@ -258,7 +311,9 @@ def finalize_prepared_payload(
     )
     on_disk_manifest, on_disk_json = read_manifest(dst)
     if on_disk_json != canonical_json or on_disk_manifest["key_id"] != key_id:
-        raise PayloadManifestError("payload manifest changed during signature finalization")
+        raise PayloadManifestError(
+            "payload manifest changed during signature finalization"
+        )
     verify_signature(
         key_id=key_id,
         canonical_json=canonical_json,
@@ -285,11 +340,20 @@ def write_artifact_signing_request(
     """Emit the identity-bound offline artifact-signing request after creation."""
     digest = hashlib.sha256(artifact.read_bytes()).hexdigest()
     request = artifact.with_name(artifact.name + ".artifact-signing-request.bin")
-    request.write_bytes(b"\0".join((
-        b"chudware-artifact-v1", key_id.encode("ascii"), version.encode("ascii"),
-        platform.encode("ascii"), arch.encode("ascii"), digest.encode("ascii"),
-    )))
+    request.write_bytes(
+        b"\0".join(
+            (
+                b"chudware-artifact-v1",
+                key_id.encode("ascii"),
+                version.encode("ascii"),
+                platform.encode("ascii"),
+                arch.encode("ascii"),
+                digest.encode("ascii"),
+            )
+        )
+    )
     return request
+
 
 def read_built_version() -> str:
     """Read the exact CHUDWARE_VERSION compiled into the staged Windows binary."""
@@ -307,7 +371,9 @@ def read_built_version() -> str:
     )
 
 
-def find_tool(env_name: str, executable: str, candidates: tuple[Path, ...] = ()) -> str | None:
+def find_tool(
+    env_name: str, executable: str, candidates: tuple[Path, ...] = ()
+) -> str | None:
     configured = os.environ.get(env_name)
     if configured:
         return configured
@@ -321,12 +387,19 @@ def sign_installer(installer: Path) -> None:
     identity = os.environ.get("CHUDWARE_SIGN_IDENTITY", "")
     notarize_profile = os.environ.get("CHUDWARE_NOTARIZE_PROFILE", "")
     if not identity:
-        print("WARNING: unsigned build — SmartScreen/Gatekeeper will warn users", file=sys.stderr)
+        print(
+            "WARNING: unsigned build — SmartScreen/Gatekeeper will warn users",
+            file=sys.stderr,
+        )
         return
     if notarize_profile:
-        print("note: CHUDWARE_NOTARIZE_PROFILE is macOS-only and is ignored on Windows",
-              file=sys.stderr)
-    program_files_x86 = Path(os.environ.get("ProgramFiles(x86)", r"C:\\Program Files (x86)"))
+        print(
+            "note: CHUDWARE_NOTARIZE_PROFILE is macOS-only and is ignored on Windows",
+            file=sys.stderr,
+        )
+    program_files_x86 = Path(
+        os.environ.get("ProgramFiles(x86)", r"C:\\Program Files (x86)")
+    )
     signtool = find_tool(
         "SIGNTOOL",
         "signtool.exe",
@@ -339,16 +412,29 @@ def sign_installer(installer: Path) -> None:
         )
     subprocess.run(
         [
-            signtool, "sign", "/n", identity, "/fd", "SHA256",
-            "/tr", "http://timestamp.digicert.com", "/td", "SHA256", str(installer),
+            signtool,
+            "sign",
+            "/n",
+            identity,
+            "/fd",
+            "SHA256",
+            "/tr",
+            "http://timestamp.digicert.com",
+            "/td",
+            "SHA256",
+            str(installer),
         ],
         check=True,
     )
     subprocess.run([signtool, "verify", "/pa", "/v", str(installer)], check=True)
 
-def compile_installer(out: Path, payload: Path, version: str,
-                      release_public_key: str) -> Path:
-    program_files_x86 = Path(os.environ.get("ProgramFiles(x86)", r"C:\\Program Files (x86)"))
+
+def compile_installer(
+    out: Path, payload: Path, version: str, release_public_key: str
+) -> Path:
+    program_files_x86 = Path(
+        os.environ.get("ProgramFiles(x86)", r"C:\\Program Files (x86)")
+    )
     iscc = find_tool(
         "ISCC",
         "ISCC.exe",
@@ -359,7 +445,9 @@ def compile_installer(out: Path, payload: Path, version: str,
             "ISCC.exe was not found; install Inno Setup 6 or set ISCC to its full path"
         )
     if not (payload / "chudware.exe").is_file():
-        raise RuntimeError("staged payload has no chudware.exe; build the Windows host first")
+        raise RuntimeError(
+            "staged payload has no chudware.exe; build the Windows host first"
+        )
     manifest_path = payload / MANIFEST_NAME
     signature_path = payload / SIGNATURE_NAME
     manifest, canonical_json = read_manifest(payload)
@@ -370,8 +458,11 @@ def compile_installer(out: Path, payload: Path, version: str,
         public_key=release_public_key,
     )
     manifest, payload_snapshot = verify_manifest_payload(payload, canonical_json)
-    helper_rows = [row for row in manifest["files"]
-                   if row["path"] == "chudware-uninstall-helper.exe"]
+    helper_rows = [
+        row
+        for row in manifest["files"]
+        if row["path"] == "chudware-uninstall-helper.exe"
+    ]
     if len(helper_rows) != 1 or helper_rows[0]["kind"] != "executable":
         raise RuntimeError(
             "signed payload manifest must own exactly one executable "
@@ -405,42 +496,86 @@ def compile_installer(out: Path, payload: Path, version: str,
 
 
 def main(argv: list[str]) -> int:
-    ap = argparse.ArgumentParser(description="Assemble the signed Chudware Windows installer.")
+    ap = argparse.ArgumentParser(
+        description="Assemble the signed Chudware Windows installer."
+    )
     ap.add_argument("--out", type=Path, default=REPO / "dist")
-    ap.add_argument("--zip", action="store_true",
-                    help="also retain a deterministic zip of the authenticated payload")
-    ap.add_argument("--payload-only", action="store_true",
-                    help="stage/finalize the payload without invoking Inno Setup")
+    ap.add_argument(
+        "--zip",
+        action="store_true",
+        help="also retain a deterministic zip of the authenticated payload",
+    )
+    ap.add_argument(
+        "--payload-only",
+        action="store_true",
+        help="stage/finalize the payload without invoking Inno Setup",
+    )
     phase = ap.add_mutually_exclusive_group()
-    phase.add_argument("--prepare-signing", action="store_true",
-                       help="stage payload and emit its exact signing preimage")
-    phase.add_argument("--finalize-signing", type=Path, metavar="SIG",
-                       help="finalize an existing prepared payload with an offline signature")
-    ap.add_argument("--payload-signature", type=Path, metavar="SIG",
-                    help="one-pass finalization with a signature for this deterministic payload")
-    ap.add_argument("--release-public-key", default=os.environ.get("CHUDWARE_RELEASE_PUBLIC_KEY"),
-                    help="Ed25519 public key PEM path or canonical base64")
-    ap.add_argument("--key-id", default=os.environ.get("CHUDWARE_RELEASE_KEY_ID", "release-v1"))
-    ap.add_argument("--created-at", help="canonical UTC timestamp; defaults reproducibly from inputs")
+    phase.add_argument(
+        "--prepare-signing",
+        action="store_true",
+        help="stage payload and emit its exact signing preimage",
+    )
+    phase.add_argument(
+        "--finalize-signing",
+        type=Path,
+        metavar="SIG",
+        help="finalize an existing prepared payload with an offline signature",
+    )
+    ap.add_argument(
+        "--payload-signature",
+        type=Path,
+        metavar="SIG",
+        help="one-pass finalization with a signature for this deterministic payload",
+    )
+    ap.add_argument(
+        "--release-public-key",
+        default=os.environ.get("CHUDWARE_RELEASE_PUBLIC_KEY"),
+        help="Ed25519 public key PEM path or canonical base64",
+    )
+    ap.add_argument(
+        "--key-id", default=os.environ.get("CHUDWARE_RELEASE_KEY_ID", "release-v1")
+    )
+    ap.add_argument(
+        "--created-at",
+        help="canonical UTC timestamp; defaults reproducibly from inputs",
+    )
     ap.add_argument("--version", help="override version-header discovery")
     ap.add_argument("--host-bin", type=Path, default=HOST_EXE)
     ap.add_argument("--uninstall-helper-bin", type=Path, default=UNINSTALL_HELPER_EXE)
-    ap.add_argument("--hostd-bin", type=Path,
-                    default=next((path for path in HOSTD_EXE_CANDIDATES if path.is_file()), None))
-    ap.add_argument("--worker-bin", type=Path,
-                    default=Path(os.environ["CHUDWARE_WORKER_BIN"])
-                    if os.environ.get("CHUDWARE_WORKER_BIN") else None)
-    ap.add_argument("--mcp-bin", type=Path,
-                    default=Path(os.environ["CHUDWARE_MCP_BIN"])
-                    if os.environ.get("CHUDWARE_MCP_BIN") else None)
-    ap.add_argument("--omp-bridge-bin", type=Path,
-                    default=Path(os.environ["CHUDWARE_OMP_BRIDGE_BIN"])
-                    if os.environ.get("CHUDWARE_OMP_BRIDGE_BIN") else None)
+    ap.add_argument(
+        "--hostd-bin",
+        type=Path,
+        default=next((path for path in HOSTD_EXE_CANDIDATES if path.is_file()), None),
+    )
+    ap.add_argument(
+        "--worker-bin",
+        type=Path,
+        default=Path(os.environ["CHUDWARE_WORKER_BIN"])
+        if os.environ.get("CHUDWARE_WORKER_BIN")
+        else None,
+    )
+    ap.add_argument(
+        "--mcp-bin",
+        type=Path,
+        default=Path(os.environ["CHUDWARE_MCP_BIN"])
+        if os.environ.get("CHUDWARE_MCP_BIN")
+        else None,
+    )
+    ap.add_argument(
+        "--chud-bin",
+        type=Path,
+        default=Path(os.environ["CHUDWARE_CHUD_BIN"])
+        if os.environ.get("CHUDWARE_CHUD_BIN")
+        else None,
+    )
     args = ap.parse_args(argv)
     try:
         if args.finalize_signing is not None:
             if args.payload_signature is not None:
-                raise RuntimeError("--finalize-signing and --payload-signature are mutually exclusive")
+                raise RuntimeError(
+                    "--finalize-signing and --payload-signature are mutually exclusive"
+                )
             if not args.release_public_key:
                 raise RuntimeError("--finalize-signing requires --release-public-key")
             res = finalize_prepared_payload(
@@ -452,7 +587,9 @@ def main(argv: list[str]) -> int:
             version = str(res["version"])
         else:
             if not args.key_id:
-                raise RuntimeError("staging requires --key-id (or CHUDWARE_RELEASE_KEY_ID)")
+                raise RuntimeError(
+                    "staging requires --key-id (or CHUDWARE_RELEASE_KEY_ID)"
+                )
             if args.prepare_signing and not args.payload_only:
                 raise RuntimeError("--prepare-signing requires --payload-only")
             version = args.version or read_built_version()
@@ -469,7 +606,7 @@ def main(argv: list[str]) -> int:
                 hostd_bin=args.hostd_bin,
                 worker_bin=args.worker_bin,
                 mcp_bin=args.mcp_bin,
-                omp_bridge_bin=args.omp_bridge_bin,
+                chud_bin=args.chud_bin,
                 uninstall_helper_bin=args.uninstall_helper_bin,
             )
             res["version"] = version
@@ -483,7 +620,12 @@ def main(argv: list[str]) -> int:
                     installer, str(res["key_id"]), args.version, "windows", "x86_64"
                 )
             )
-    except (OSError, RuntimeError, PayloadManifestError, subprocess.CalledProcessError) as exc:
+    except (
+        OSError,
+        RuntimeError,
+        PayloadManifestError,
+        subprocess.CalledProcessError,
+    ) as exc:
         print(f"build_release: error: {exc}", file=sys.stderr)
         return 1
     print(json.dumps(res, indent=2))

@@ -14,7 +14,7 @@
  *   Ctrl+Alt+W  — detach focused window / active tab
  * All other keys (Ctrl+C/D, arrows, Tab, F-keys, Alt-combos, etc.) pass through.
  * Alt+Arrow is re-encoded to \x1b[1;3<A-D> before send: xterm.js otherwise
- * remaps it to Ctrl+Arrow (non-Mac) / word-nav (Mac), hiding omp's Alt chords.
+ * remaps it to Ctrl+Arrow (non-Mac) / word-nav (Mac), hiding Chudcode's Alt chords.
  */
 (function () {
   "use strict";
@@ -857,7 +857,7 @@
 
   // Canonical modified cursor-key sequence (\x1b[1;<mod><final>). Used to bypass
   // xterm.js's non-Mac Alt+Arrow -> Ctrl+Arrow remap (and its Mac word-nav
-  // remap) so omp's Alt-based shortcuts reach the PTY as the real Alt chord.
+  // remap) so Chudcode's Alt-based shortcuts reach the PTY as the real Alt chord.
   function modifiedArrowSeq(ev) {
     var final = ARROW_FINAL[ev.key];
     if (!final) return null;
@@ -869,7 +869,7 @@
   // Touch-swipe scrolling. xterm's screen layer sits on top of the scrollable
   // viewport and swallows touch events, so mobile swipes never scroll natively.
   // Translate a one-finger vertical drag into scrollback movement (normal
-  // buffer) or SGR wheel reports (when the app has mouse tracking on, e.g. omp
+  // buffer) or SGR wheel reports (when Chudcode has mouse tracking enabled
   // on the alternate screen), giving a real swipe-to-scroll on phones.
   function cellHeight(term) {
     try {
@@ -1034,7 +1034,7 @@
         }
         return false;
       }
-      // Rescue Alt+Arrow from xterm's remap so omp gets the true Alt chord.
+      // Rescue Alt+Arrow from xterm's remap so Chudcode gets the true Alt chord.
       if (ev.altKey && !ev.metaKey) {
         var seq = modifiedArrowSeq(ev);
         if (seq) {

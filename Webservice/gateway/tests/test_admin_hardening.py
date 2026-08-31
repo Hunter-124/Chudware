@@ -21,7 +21,9 @@ if str(GATEWAY_DIR.parent) not in sys.path:
 
 # Dev auth BEFORE importing the app, so X-Dev-User is accepted.
 os.environ["CHUDWARE_WEB_DEV"] = "1"
-os.environ.setdefault("CHUDWARE_WEB_DATA_ROOT", str(Path.home() / "chudware-web-data-test"))
+os.environ.setdefault(
+    "CHUDWARE_WEB_DATA_ROOT", str(Path.home() / "chudware-web-data-test")
+)
 
 from fastapi import HTTPException  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
@@ -111,9 +113,9 @@ def _fake_session(sid, label, owner, shared=False):
 
 
 def test_can_access_defaults_deny_cross_admin():
-    mine = _fake_session("id-a", "omp-1", ADMIN_EMAIL)
-    shared = _fake_session("id-b", "omp-2", OTHER_ADMIN, shared=True)
-    legacy = _fake_session("omp-9", "omp-9", "")  # pre-ownership session
+    mine = _fake_session("id-a", "chud-1", ADMIN_EMAIL)
+    shared = _fake_session("id-b", "chud-2", OTHER_ADMIN, shared=True)
+    legacy = _fake_session("legacy-9", "legacy-9", "")  # pre-ownership session
     assert terminal_mod._can_access(mine, ADMIN_EMAIL)
     assert not terminal_mod._can_access(mine, OTHER_ADMIN)
     assert terminal_mod._can_access(shared, ADMIN_EMAIL)
@@ -126,18 +128,18 @@ def test_resolve_session_rejects_cross_admin_by_id_or_label(client, monkeypatch)
     monkeypatch.setattr(
         terminal_mod,
         "_list_sessions",
-        lambda: [_fake_session("secretid123", "omp-1", OTHER_ADMIN)],
+        lambda: [_fake_session("secretid123", "chud-1", OTHER_ADMIN)],
     )
     assert terminal_mod._resolve_session("secretid123", ADMIN_EMAIL) is None
-    assert terminal_mod._resolve_session("omp-1", ADMIN_EMAIL) is None
+    assert terminal_mod._resolve_session("chud-1", ADMIN_EMAIL) is None
     # ...while the owner and shared opt-in still resolve.
-    assert terminal_mod._resolve_session("omp-1", OTHER_ADMIN)["id"] == "secretid123"
+    assert terminal_mod._resolve_session("chud-1", OTHER_ADMIN)["id"] == "secretid123"
     monkeypatch.setattr(
         terminal_mod,
         "_list_sessions",
-        lambda: [_fake_session("secretid123", "omp-1", OTHER_ADMIN, shared=True)],
+        lambda: [_fake_session("secretid123", "chud-1", OTHER_ADMIN, shared=True)],
     )
-    assert terminal_mod._resolve_session("omp-1", ADMIN_EMAIL)["id"] == "secretid123"
+    assert terminal_mod._resolve_session("chud-1", ADMIN_EMAIL)["id"] == "secretid123"
 
 
 def test_mint_session_id_is_unguessable_and_tmux_safe():
@@ -156,9 +158,9 @@ def test_session_list_filtered_per_admin(client, monkeypatch):
         terminal_mod,
         "_list_sessions",
         lambda: [
-            _fake_session("id-mine", "omp-1", ADMIN_EMAIL),
-            _fake_session("id-theirs", "omp-2", OTHER_ADMIN),
-            _fake_session("id-shared", "omp-3", OTHER_ADMIN, shared=True),
+            _fake_session("id-mine", "chud-1", ADMIN_EMAIL),
+            _fake_session("id-theirs", "chud-2", OTHER_ADMIN),
+            _fake_session("id-shared", "chud-3", OTHER_ADMIN, shared=True),
         ],
     )
     r = client.get("/api/admin/terminal/sessions", headers=ADMIN)
@@ -175,8 +177,8 @@ def test_create_enforces_session_cap(client, monkeypatch):
         terminal_mod,
         "_list_sessions",
         lambda: [
-            _fake_session("id-mine", "omp-1", ADMIN_EMAIL),
-            _fake_session("id-theirs", "omp-2", OTHER_ADMIN),
+            _fake_session("id-mine", "chud-1", ADMIN_EMAIL),
+            _fake_session("id-theirs", "chud-2", OTHER_ADMIN),
         ],
     )
     r = client.post("/api/admin/terminal/sessions", headers=ADMIN, json={})
@@ -189,9 +191,9 @@ def test_delete_cross_admin_is_404(client, monkeypatch):
     monkeypatch.setattr(
         terminal_mod,
         "_list_sessions",
-        lambda: [_fake_session("secretid123", "omp-1", OTHER_ADMIN)],
+        lambda: [_fake_session("secretid123", "chud-1", OTHER_ADMIN)],
     )
-    for name in ("secretid123", "omp-1"):
+    for name in ("secretid123", "chud-1"):
         r = client.delete(f"/api/admin/terminal/sessions/{name}", headers=ADMIN)
         assert r.status_code == 404, (name, r.status_code, r.text)
 
@@ -252,7 +254,9 @@ def test_admin_browse_lists_inside_root(client, _roots):
 
 # --- journal redaction -------------------------------------------------------
 def test_redact_secrets_strips_credentials():
-    jwt = "eyJhbGciOiJIUzI1NiJ9.eyJlbWFpbCI6ImFAYi5jIn0.SflKxwRJSMeKKF2QT4fwpMeJf36POk6y"
+    jwt = (
+        "eyJhbGciOiJIUzI1NiJ9.eyJlbWFpbCI6ImFAYi5jIn0.SflKxwRJSMeKKF2QT4fwpMeJf36POk6y"
+    )
     raw = (
         f"2026-07-28 INFO auth ok Authorization: Bearer {jwt}\n"
         "2026-07-28 INFO tunnel cred cfat_Vm90aGVyX3Rva2VuXzEyMzQ1 installed\n"
@@ -287,8 +291,16 @@ def test_redact_secrets_leaves_ordinary_lines_intact():
 
 # --- release names -----------------------------------------------------------
 def test_safe_name_rejects_header_and_path_tricks():
-    for bad in ('bad";name.zip', "a/b", ".hidden", "a\\b", "semi;colon.zip",
-                "new\nline.zip", "..", ""):
+    for bad in (
+        'bad";name.zip',
+        "a/b",
+        ".hidden",
+        "a\\b",
+        "semi;colon.zip",
+        "new\nline.zip",
+        "..",
+        "",
+    ):
         with pytest.raises(HTTPException) as exc:
             _safe_name(bad)
         assert exc.value.status_code == 400, bad

@@ -231,7 +231,8 @@ fails at its capability check with an explicit message otherwise):
 * `cmake`, `ninja`, `ctest`, `python3`, `curl`, `tar`, `file`, `ldd`,
   `sha256sum`, `strip`, `rsync`
 * `xvfb-run` for the headless screenshot
-* `bun` for the compiled OMP bridge sidecar
+* `CHUDWARE_CHUD_BIN` naming the local Linux x86_64 `chud` artifact pinned by
+  `vendor/chudcode/CHUDCODE_ARTIFACT.lock`
 * Nuitka and the rest of `packaging/requirements-release.txt` in the release
   Python (the AppImage compiles the Python sidecars)
 * write access to `<releases_dir>/incoming`
@@ -239,20 +240,22 @@ fails at its capability check with an explicit message otherwise):
 **`cc-win-package`:**
 
 * Visual Studio with the x64 C++ toolset (`vcvars64.bat` or the DevShell module)
-* `cmake`, `ninja`, `ctest`, `git`, `python`, `bun`, `curl` on `PATH`
+* `cmake`, `ninja`, `ctest`, `git`, `python`, `curl` on `PATH`
   (`%USERPROFILE%\chudware-ci-tools\{bin,python}` is added automatically, as in
   `native-build.yml`)
 * **Inno Setup 6** — `ISCC.exe` in `%USERPROFILE%\chudware-ci-tools\innosetup`
   (portable unpack; the runner service account cannot run Inno's installer),
   `%ProgramFiles(x86)%\Inno Setup 6`, on `PATH`, or named by the `ISCC`
-  environment variable. `runner-provision.yml` (Actions -> run) installs bun
-  and Inno into exactly these locations.
+  environment variable. `runner-provision.yml` (Actions -> run) installs Inno
+  into exactly these locations.
 * Nuitka and `packaging/requirements-release.txt` for the compiled sidecars.
   Nuitka's onefile mode on Windows needs Dependency Walker and asks for it
   interactively, which a CI shell answers "no"; `build_sidecars.ps1` passes
   `--assume-yes-for-downloads`, so the first release build fetches it into
   `%LOCALAPPDATA%\Nuitka` and later builds reuse the cache. That runner
   therefore needs outbound HTTPS beyond app.chudware.com on its first build.
+* `CHUDWARE_CHUD_BIN` naming the local Windows x86_64 `chud.exe` artifact
+  pinned by `vendor/chudcode/CHUDCODE_ARTIFACT.lock`
 * `CHUDWARE_SIGN_IDENTITY` if you want Authenticode on the installer; without it
   the installer is unsigned and SmartScreen will warn (see `docs/SIGNING.md`)
 * outbound HTTPS to `app.chudware.com`. This runner cannot reach the gateway's
@@ -266,8 +269,8 @@ fails at its capability check with an explicit message otherwise):
   step uses `xcodebuild`, and the capability check asserts the compiler rather
   than the IDE.
 * `cmake`, `ninja`, `ctest`, `python3`, `git`, `curl`, `tar`, `zip`, `rsync`,
-  `bun`, plus the Command Line Tools' `ditto`, `otool`, `install_name_tool`,
-  `plutil` and `codesign`
+  plus the Command Line Tools' `ditto`, `otool`, `install_name_tool`, `plutil`
+  and `codesign`
 * Homebrew, with `opencascade` installed: off Windows `ProvisionOCCT.cmake`
   downloads nothing and the `macos-*` presets `find_package` OCCT through the
   brew prefix (`/opt/homebrew` on arm64, `/usr/local` on Intel)
@@ -277,15 +280,15 @@ fails at its capability check with an explicit message otherwise):
   capability: `~/chudware-ci-tools/release-python/bin/python3` first, then
   `python3.14`..`python3` from `PATH`, and the first one that imports both
   `cryptography` and `nuitka` wins.
-* `bun` for the compiled OMP bridge sidecar. `~/.bun/bin`, `/opt/homebrew/bin`
-  and `/usr/local/bin` are prepended to `PATH` by the job itself, since the
-  runner service starts with a minimal `PATH`.
+* `CHUDWARE_CHUD_BIN` naming the local `chud` artifact for that Mac's
+  architecture, pinned by `vendor/chudcode/CHUDCODE_ARTIFACT.lock`. Release
+  packaging verifies and copies it without a source checkout or network fetch.
 * outbound HTTPS to `app.chudware.com`, for the same reason as the Windows
   builder: neither Mac can route to `192.168.0.183`.
 
 `runner-provision.yml` covers both Macs: dispatch it with `runner_label` set to
-`cc-mac-intel` or `cc-mac-arm` and it installs bun, the brew formulae
-(`cmake ninja python@3.13 opencascade`), and the release-Python venv at
+`cc-mac-intel` or `cc-mac-arm` and it installs the brew formulae
+(`cmake ninja python@3.13 opencascade`) and the release-Python venv at
 `~/chudware-ci-tools/release-python`, then prints a capability report that exits
 non-zero on any `MISSING`. Homebrew itself is the one thing it will not install:
 that installer needs an interactive sudo, so it fails with an explicit
@@ -298,6 +301,69 @@ Windows steps are Windows PowerShell 5.1 with ASCII-only bodies. `bash` on those
 hosts is an empty WSL shim that exits 0 without running anything, and PowerShell
 5.1 misreads non-ASCII in the runner's BOM-less script; `scripts/verify-ci-workflows.py`
 enforces both rules.
+
+## Chudcode artifact pin
+
+`vendor/chudcode/CHUDCODE_ARTIFACT.lock` is the release authority for the
+compiled RPC service. A lock with `null` artifact URL/hash fields declares
+unpublished required inputs and deliberately makes every package/deploy path
+fail closed. Once all five platform artifacts exist, replace it atomically with:
+
+```bash
+python3 scripts/pin_chudcode.py pin \
+  --version 0.2.0 --engine-version 18.0.8 --rpc-protocol 2 --repository-commit COMMIT \
+  --artifact linux-x86_64=/secure/chud-linux-x86_64 --url linux-x86_64=https://... \
+  --artifact linux-aarch64=/secure/chud-linux-aarch64 --url linux-aarch64=https://... \
+  --artifact macos-x86_64=/secure/chud-macos-x86_64 --url macos-x86_64=https://... \
+  --artifact macos-arm64=/secure/chud-macos-arm64 --url macos-arm64=https://... \
+  --artifact windows-x86_64=/secure/chud-windows-x86_64.exe --url windows-x86_64=https://...
+```
+
+The lock's `version` is the Chudcode product release. `engine_version` is
+optional provenance and, when present, requires the executable to report the
+exact documented suffix `Chudcode v0.2.0 (based on omp 18.0.8)`; the engine
+version is never accepted as the product version.
+
+The `stage` command used by packaging is offline and accepts only a local
+`CHUDWARE_CHUD_BIN`; it verifies the executable format/architecture, SHA-256,
+and `--version` product identity before copying it as canonical `chud` or
+`chud.exe`. Network retrieval is available only through an explicit `fetch`
+invocation.
+
+### Artifact-lock operating rules
+
+The lock is the complete identity of the embedded online runtime, not a source-vendoring
+hint. It records schema `chudcode-artifact-lock-v1`, the Chudcode product version, repository
+commit, RPC protocol 2, and exactly five immutable platform rows. Each row pairs the canonical
+filename with an unauthenticated HTTPS URL and SHA-256.
+
+`pin` validates every executable format, executes the host-target binary for product-version
+identity, writes canonical JSON to a temporary file, and replaces the lock only after those
+checks pass. All five `--artifact` and `--url` pairs are mandatory, so a partial platform
+update is intentionally impossible. Useful focused checks are:
+
+```bash
+python3 scripts/pin_chudcode.py check-lock
+python3 scripts/pin_chudcode.py verify --target linux-x86_64 --input /secure/chud-linux-x86_64
+python3 scripts/pin_chudcode.py stage --target linux-x86_64 \
+  --input /secure/chud-linux-x86_64 --output /tmp/chud
+```
+
+`stage` re-verifies before and after copying and atomically publishes only canonical
+`chud`/`chud.exe`. It never downloads. `fetch` is the only networked command and must be an
+explicit pre-packaging step; redirects are refused so the lock continues to name immutable
+bytes.
+
+The packaged services worker resolves the signed-payload-adjacent canonical binary. Developer
+runs may override it with `CHUDWARE_CHUDCODE_BIN`; release jobs use `CHUDWARE_CHUD_BIN` only
+as the local staging input. Do not add a package-manager install, source checkout, or second
+provider runtime to a release image.
+
+The release also carries CAD's checked-in `assets/ui-shared-manifest.json` from the same
+Chudcode release line. Its bytes must match Chudcode's file and its schema must be
+`chud-ui-shared-v1`; packaging must copy the checked-in bytes rather than regenerate them.
+This manifest is a shared palette/tone/status/usage/font/icon vocabulary, not executable
+widget code or runtime state.
 
 ## Versioning
 

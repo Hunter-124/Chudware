@@ -13,14 +13,12 @@ Two scopes share one table:
   admin can create one; the row keeps the linking admin's email for
   attribution, not for entitlement.
 
-Why the flows are reimplemented here rather than driven through the OMP bun
-bridge: the bridge keeps every in-flight login in one process's heap
-(``vendor/omp/bridge/src/oauth-flow.ts`` ``flows`` map) against a single
-process-wide credential store, and it binds a loopback callback port. None of
-that survives a multi-worker web service with one credential set per customer.
-The wire protocol below is the same one the desktop already speaks
-(``services/agent/providers/{anthropic,codex}_sub_provider.py``); only the
-transport and the storage differ.
+Why these flows remain web-service-local rather than using the packaged desktop
+Chudcode credential store: every login and grant is tenant-scoped here, while a
+single desktop service has one process-wide credential store and loopback
+callback lifecycle. Sharing that store across web workers would cross account
+boundaries. The wire protocol matches the vendors' first-party clients; only
+the multi-tenant transport and storage differ.
 
 Neither flow can use a redirect back to this origin, because the registered
 redirect URIs belong to the vendors' own first-party clients. Claude therefore
@@ -53,6 +51,7 @@ try:
     from .auth import get_current_user
     from .db import tx
     from .limits import RateLimiter
+
     # Deliberately the same key material as BYOK: one operator secret to
     # manage, one failure mode to reason about. Only the AAD domain differs,
     # so a key envelope can never be replayed across the two tables.
@@ -225,7 +224,9 @@ def _storage_available() -> None:
     try:
         _key_bytes()
     except RuntimeError:
-        raise HTTPException(503, "subscription account storage is unavailable") from None
+        raise HTTPException(
+            503, "subscription account storage is unavailable"
+        ) from None
 
 
 # ---------------------------------------------------------------------------
@@ -295,7 +296,9 @@ def parse_pasted_code(raw: str) -> tuple[str, str]:
         error = (query.get("error") or [""])[0]
         if error:
             description = (query.get("error_description") or [""])[0]
-            raise SubscriptionAuthError(description.strip() or f"Sign-in was refused: {error}")
+            raise SubscriptionAuthError(
+                description.strip() or f"Sign-in was refused: {error}"
+            )
         code = (query.get("code") or [""])[0]
         state = (query.get("state") or [""])[0]
         if not code:
@@ -367,11 +370,15 @@ def _anthropic_exchange(code: str, state: str, verifier: str) -> dict[str, Any]:
     payload = response.json()
     account = payload.get("account") if isinstance(payload.get("account"), dict) else {}
     organization = (
-        payload.get("organization") if isinstance(payload.get("organization"), dict) else {}
+        payload.get("organization")
+        if isinstance(payload.get("organization"), dict)
+        else {}
     )
     return {
         "tokens": _token_payload(payload),
-        "account_key": str(account.get("uuid") or account.get("email_address") or "default"),
+        "account_key": str(
+            account.get("uuid") or account.get("email_address") or "default"
+        ),
         "label": str(account.get("email_address") or organization.get("name") or ""),
         "plan": str(organization.get("name") or ""),
     }
@@ -395,7 +402,9 @@ def _anthropic_refresh(refresh_token: str) -> dict[str, Any]:
 
 
 def _codex_begin_device() -> dict[str, Any]:
-    response = _post(CODEX_DEVICE_USERCODE_URL, json_body={"client_id": CODEX_CLIENT_ID})
+    response = _post(
+        CODEX_DEVICE_USERCODE_URL, json_body={"client_id": CODEX_CLIENT_ID}
+    )
     if response.status_code >= 400:
         raise SubscriptionAuthError(
             _upstream_detail(response, "ChatGPT would not start a sign-in")
@@ -480,7 +489,9 @@ def _codex_refresh(refresh_token: str) -> dict[str, Any]:
     return _token_payload(response.json(), fallback_refresh=refresh_token)
 
 
-def _token_payload(payload: dict[str, Any], fallback_refresh: str = "") -> dict[str, Any]:
+def _token_payload(
+    payload: dict[str, Any], fallback_refresh: str = ""
+) -> dict[str, Any]:
     access = str(payload.get("access_token") or "")
     if not access:
         raise SubscriptionAuthError("The provider returned no access token.")
@@ -540,7 +551,9 @@ def _claim_flow(email: str, provider: str, flow_id: str) -> dict[str, Any]:
         if row is None:
             raise HTTPException(410, "this sign-in has expired - start it again")
         if row["expires_at"] <= datetime.now(timezone.utc):
-            cur.execute("DELETE FROM provider_oauth_flows WHERE flow_id = %s", (flow_id,))
+            cur.execute(
+                "DELETE FROM provider_oauth_flows WHERE flow_id = %s", (flow_id,)
+            )
             raise HTTPException(410, "this sign-in has expired - start it again")
         return {
             "scope": row["scope"],
@@ -570,7 +583,9 @@ def _row_metadata(row: Any) -> dict[str, Any]:
         "created_at": _timestamp(row["created_at"]),
         "last_used_at": _timestamp(row["last_used_at"]),
         "expires_at": _timestamp(expires_at),
-        "expired": bool(expires_at is not None and expires_at <= datetime.now(timezone.utc)),
+        "expired": bool(
+            expires_at is not None and expires_at <= datetime.now(timezone.utc)
+        ),
     }
 
 
@@ -640,7 +655,9 @@ def _persist_account(
         return _row_metadata(cur.fetchone())
 
 
-def delete_account(email: str, provider: str, account_key: str, *, is_admin: bool) -> bool:
+def delete_account(
+    email: str, provider: str, account_key: str, *, is_admin: bool
+) -> bool:
     """Unlink. A non-admin can only ever remove their own personal link."""
     with tx() as cur:
         if is_admin:
@@ -828,7 +845,9 @@ async def api_list_accounts(request: Request) -> dict[str, Any]:
 
 
 @router.post("/accounts/{provider}/begin")
-async def api_begin(provider: str, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+async def api_begin(
+    provider: str, request: Request, body: dict[str, Any]
+) -> dict[str, Any]:
     user = get_current_user(request)
     normalized = _provider(provider)
     scope = _scope((body or {}).get("scope"))
@@ -872,7 +891,9 @@ async def api_begin(provider: str, request: Request, body: dict[str, Any]) -> di
 
 
 @router.post("/accounts/{provider}/complete")
-async def api_complete(provider: str, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+async def api_complete(
+    provider: str, request: Request, body: dict[str, Any]
+) -> dict[str, Any]:
     user = get_current_user(request)
     normalized = _provider(provider)
     payload = body or {}
@@ -894,7 +915,9 @@ async def api_complete(provider: str, request: Request, body: dict[str, Any]) ->
             if not isinstance(raw_code, str) or not raw_code.strip():
                 raise SubscriptionAuthError("Paste the address you were redirected to.")
             if len(raw_code.encode("utf-8")) > _MAX_CODE_BYTES:
-                raise SubscriptionAuthError("That value is too long to be a redirect address.")
+                raise SubscriptionAuthError(
+                    "That value is too long to be a redirect address."
+                )
             code, pasted_state = parse_pasted_code(raw_code)
             state = pasted_state or secret["state"]
             if pasted_state and pasted_state != secret["state"]:
@@ -907,7 +930,10 @@ async def api_complete(provider: str, request: Request, body: dict[str, Any]) ->
                 _codex_poll_device, secret["device_auth_id"], secret["user_code"]
             )
             if connected is None:
-                return {"status": "pending", "detail": "Waiting for you to approve the code."}
+                return {
+                    "status": "pending",
+                    "detail": "Waiting for you to approve the code.",
+                }
     except SubscriptionAuthError as exc:
         # A failed paste is recoverable — the operator can paste again — but a
         # spent authorization code is not, so the flow dies either way and the

@@ -237,7 +237,7 @@ jobs:
           set -euo pipefail
 
           missing=()
-          for tool in cmake ninja ctest python3 curl tar file ldd sha256sum strip rsync xvfb-run bun patchelf; do
+          for tool in cmake ninja ctest python3 curl tar file ldd sha256sum strip rsync xvfb-run patchelf; do
             command -v "${tool}" >/dev/null 2>&1 || missing+=("${tool}")
           done
           # The AppImage compiles the Python sidecars with Nuitka, which the
@@ -249,6 +249,10 @@ jobs:
             echo "release python: $("${release_python}" --version) with nuitka"
           else
             missing+=("release-python-with-packaging/requirements-release.txt")
+          fi
+          if [ -z "${CHUDWARE_CHUD_BIN:-}" ] || ! "${release_python}" scripts/pin_chudcode.py \
+              verify --target linux-x86_64 --input "${CHUDWARE_CHUD_BIN:-/missing}"; then
+            missing+=("verified-CHUDWARE_CHUD_BIN")
           fi
           if [ "${#missing[@]}" -ne 0 ]; then
             echo "::error::runner ${RUNNER_NAME:-unknown} is missing required tools: ${missing[*]}. Run runner-provision (provision-linux) against this label and re-dispatch."
@@ -425,19 +429,20 @@ jobs:
             --protected-assets-dir "${HOST_BUILD_DIR}/generated/protected-assets" \
             --host-bin "${HOST_BUILD_DIR}/bin/chudware" \
             --hostd-bin "build/${CORE_PRESET}/bin/chudware-hostd" \
-            --libchudware-bin "build/${CORE_PRESET}/bin/libchudware.so"
+            --libchudware-bin "build/${CORE_PRESET}/bin/libchudware.so" \
+            --chud-bin "${CHUDWARE_CHUD_BIN}"
 
           # The finalizer re-verifies the prepared tree against exactly these
           # locked inputs and commands, so record them the way release.yml does.
           printf '%s\n' 'ctest core' 'ctest host' > "${out}/test-commands.txt"
-          mkdir -p "${out}/packaging" "${out}/vendor/omp"
+          mkdir -p "${out}/packaging" "${out}/vendor/chudcode"
           cp CMakePresets.json "${out}/CMakePresets.json"
           cp packaging/requirements-release.txt "${out}/packaging/requirements-release.txt"
-          cp vendor/omp/bun.lock "${out}/vendor/omp/bun.lock"
+          cp vendor/chudcode/CHUDCODE_ARTIFACT.lock "${out}/vendor/chudcode/CHUDCODE_ARTIFACT.lock"
           python3 - "${out}" <<'PY'
           import hashlib, json, os, pathlib, sys
           root = pathlib.Path(sys.argv[1])
-          names = ('CMakePresets.json', 'packaging/requirements-release.txt', 'vendor/omp/bun.lock')
+          names = ('CMakePresets.json', 'packaging/requirements-release.txt', 'vendor/chudcode/CHUDCODE_ARTIFACT.lock')
           handoff = {
               'schema': 'chudware-offline-handoff-v1',
               'commit': os.environ['RELEASE_COMMIT'],
@@ -490,7 +495,7 @@ jobs:
             --version "${RELEASE_VERSION}" --commit "${RELEASE_COMMIT}" --channel beta \
             --locked-input CMakePresets.json \
             --locked-input packaging/requirements-release.txt \
-            --locked-input vendor/omp/bun.lock \
+            --locked-input vendor/chudcode/CHUDCODE_ARTIFACT.lock \
             --command 'ctest core' --command 'ctest host' \
             --out "${final}" || status=$?
 
@@ -954,12 +959,18 @@ jobs:
           }
           # curl.exe, not ssh/scp: this runner reaches the gateway over TLS on
           # the public origin because the two LANs do not route to each other.
-          foreach ($tool in @('cmake', 'ninja', 'ctest', 'git', 'python', 'bun', 'curl')) {
+          foreach ($tool in @('cmake', 'ninja', 'ctest', 'git', 'python', 'curl')) {
             if (-not (Get-Command $tool -ErrorAction SilentlyContinue)) {
               Write-Host "::error::runner $env:RUNNER_NAME is missing required tool: $tool"
               exit 1
             }
           }
+          if (-not $env:CHUDWARE_CHUD_BIN) {
+            Write-Host '::error::CHUDWARE_CHUD_BIN is required'
+            exit 1
+          }
+          & python scripts\pin_chudcode.py verify --target windows-x86_64 --input $env:CHUDWARE_CHUD_BIN
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
           # Inno Setup is REQUIRED: the product ships an .exe installer, and a zip
           # is not a substitute. Fail here rather than after an hour of building.
@@ -1243,7 +1254,7 @@ jobs:
             --host-bin $hostBin --hostd-bin $hostdBin `
             --worker-bin "$sidecars/chudware-worker.exe" `
             --mcp-bin "$sidecars/chudware-mcp.exe" `
-            --omp-bridge-bin "$sidecars/chudware-omp-bridge.exe" `
+            --chud-bin "$sidecars/chud.exe" `
             --uninstall-helper-bin "$env:HOST_BUILD_DIR/bin/chudware-uninstall-helper.exe"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           # build_release names the preimage payload-manifest.v1.preimage (the
@@ -1338,7 +1349,7 @@ jobs:
           & python packaging\generate_release_evidence.py $env:ARTIFACT --artifact-sha256 $sha `
             --version $env:RELEASE_VERSION --platform windows --arch x86_64 --commit $env:RELEASE_COMMIT `
             --locked-input CMakePresets.json --locked-input packaging/requirements-release.txt `
-            --locked-input vendor/omp/bun.lock --command 'ctest core' --command 'ctest host' `
+            --locked-input vendor/chudcode/CHUDCODE_ARTIFACT.lock --command 'ctest core' --command 'ctest host' `
             --passed --out $evidence
           if ($LASTEXITCODE -ne 0) { $ok = $false }
 
@@ -1391,7 +1402,7 @@ jobs:
                 --platform windows --arch x86_64 --commit $env:RELEASE_COMMIT `
                 --locked-input CMakePresets.json `
                 --locked-input packaging/requirements-release.txt `
-                --locked-input vendor/omp/bun.lock `
+                --locked-input vendor/chudcode/CHUDCODE_ARTIFACT.lock `
                 --command 'ctest core' --command 'ctest host' --passed --out $msiEvidence
               $msiEvidenceOk = $LASTEXITCODE -eq 0
               if ($msiEvidenceOk) {
@@ -1553,10 +1564,9 @@ jobs:
           echo "runner=${RUNNER_NAME:-unknown} $(uname -s) $(uname -m)"
           sw_vers
 
-          # The runner service starts with a minimal PATH: Homebrew and a bun
-          # installed under $HOME are invisible until this job puts them there
-          # itself, exactly as the Windows leg prepends its chudware-ci-tools dir.
-          for dir in /opt/homebrew/bin /usr/local/bin "${HOME}/.bun/bin"; do
+          # The runner service starts with a minimal PATH. Add the Homebrew roots
+          # explicitly, exactly as the Windows leg prepends its release tools.
+          for dir in /opt/homebrew/bin /usr/local/bin; do
             if [ -d "${dir}" ]; then
               case ":${PATH}:" in
                 *":${dir}:"*) ;;
@@ -1571,7 +1581,7 @@ jobs:
           missing=""
           # curl, not ssh/scp: this runner reaches the gateway over TLS on the
           # public origin because the two LANs do not route to each other.
-          for tool in cmake ninja ctest python3 git curl tar zip rsync bun \
+          for tool in cmake ninja ctest python3 git curl tar zip rsync \
             clang xcrun xcode-select ditto otool install_name_tool plutil codesign; do
             command -v "${tool}" >/dev/null 2>&1 || missing="${missing} ${tool}"
           done
@@ -1633,6 +1643,11 @@ jobs:
           # `uname -m`, so the two must agree before anything is built.
           if [ "$(uname -m)" != "${RELEASE_ARCH}" ]; then
             echo "::error::this runner is $(uname -m) but the matrix row is ${RELEASE_ARCH}; the runner labels and the matrix disagree"
+            exit 1
+          fi
+          if ! "${release_python}" scripts/pin_chudcode.py verify \
+              --target "macos-${RELEASE_ARCH}" --input "${CHUDWARE_CHUD_BIN:-/missing}"; then
+            echo "::error::CHUDWARE_CHUD_BIN is missing or does not match the pinned ${RELEASE_ARCH} artifact"
             exit 1
           fi
 
@@ -1834,7 +1849,7 @@ jobs:
           rm -rf "${out}"
           mkdir -p "${out}"
           packaging/macos/build_app.sh --prepare-signing \
-            --key-id "${CHUDWARE_RELEASE_KEY_ID}" --out "${out}"
+            --key-id "${CHUDWARE_RELEASE_KEY_ID}" --chud-bin "${CHUDWARE_CHUD_BIN}" --out "${out}"
 
           request="$(find "${out}" -type f -name '*payload-signing-request.bin' -print -quit)"
           test -s "${request}" || { echo '::error::payload signing request missing'; exit 1; }
@@ -1906,7 +1921,7 @@ jobs:
             --artifact-sha256 "${sha}" --version "${RELEASE_VERSION}" \
             --platform "${RELEASE_PLATFORM}" --arch "${RELEASE_ARCH}" --commit "${RELEASE_COMMIT}" \
             --locked-input CMakePresets.json --locked-input packaging/requirements-release.txt \
-            --locked-input vendor/omp/bun.lock --command 'ctest core' --command 'ctest host' \
+            --locked-input vendor/chudcode/CHUDCODE_ARTIFACT.lock --command 'ctest core' --command 'ctest host' \
             --passed --out "${evidence}" || status=$?
 
           if [ "${status}" -eq 0 ]; then
@@ -1992,7 +2007,7 @@ jobs:
           checked=0
           for binary in "${app}/Contents/MacOS/Chudware-bin" "${app}/Contents/MacOS/chudware-hostd" \
             "${app}/Contents/MacOS/chudware-worker" "${app}/Contents/MacOS/chudware-mcp" \
-            "${app}/Contents/MacOS/chudware-omp-bridge" "${app}/Contents/Frameworks"/*.dylib; do
+            "${app}/Contents/MacOS/chud" "${app}/Contents/Frameworks"/*.dylib; do
             [ -f "${binary}" ] || continue
             checked=$((checked + 1))
             outside="$(otool -L "${binary}" | sed -n '2,$p' | awk '{print $1}' \

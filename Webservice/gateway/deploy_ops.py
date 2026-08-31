@@ -62,7 +62,7 @@ def _log_path(kind: str) -> Path:
 
 
 def _repo_dir() -> Path:
-    env = (os.environ.get("CHUDWARE_OMP_DIR") or "").strip()
+    env = (os.environ.get("CHUDWARE_REPO_DIR") or "").strip()
     if env:
         return Path(env).expanduser().resolve()
     return Path(__file__).resolve().parents[2]
@@ -128,8 +128,11 @@ def _read_status() -> dict[str, Any]:
     out["started_at"] = started if isinstance(started, (int, float)) else None
     last = raw.get("last")
     out["last"] = last if isinstance(last, dict) else None
-    if out["running"] and (time.time() - (out["started_at"] or 0)) > _STALE_GRACE_S \
-            and _lock_is_free():
+    if (
+        out["running"]
+        and (time.time() - (out["started_at"] or 0)) > _STALE_GRACE_S
+        and _lock_is_free()
+    ):
         return _clear_stale(out)
     return out
 
@@ -159,7 +162,9 @@ def _write_status_starting(kind: str) -> None:
             pass
 
 
-def _launch_detached(argv: list[str], *, delay: float = 0, logfile: Path | None = None) -> None:
+def _launch_detached(
+    argv: list[str], *, delay: float = 0, logfile: Path | None = None
+) -> None:
     """Fire-and-forget: return immediately; child runs outside this process tree.
 
     Prefer a transient ``systemd-run --user`` *service* (NOT ``--scope``): a
@@ -190,8 +195,13 @@ def _launch_detached(argv: list[str], *, delay: float = 0, logfile: Path | None 
             if key.startswith("CHUDWARE_") and val:
                 setenv[key] = val
         setenv["CHUDWARE_WEB_DATA"] = str(settings.data_root)
-        cmd = [sd, "--user", "--collect", "--quiet",
-               f"--working-directory={_repo_dir()}"]
+        cmd = [
+            sd,
+            "--user",
+            "--collect",
+            "--quiet",
+            f"--working-directory={_repo_dir()}",
+        ]
         for key, val in setenv.items():
             cmd.append(f"--setenv={key}={val}")
         if delay_s > 0:
@@ -226,7 +236,14 @@ def _launch_detached(argv: list[str], *, delay: float = 0, logfile: Path | None 
 
     if sleep_delay > 0:
         # bash -c 'sleep N; exec "$@"' _ arg0 arg1 ...
-        inner = ["bash", "-c", 'sleep "$1"; shift; exec "$@"', "_", str(sleep_delay), *argv]
+        inner = [
+            "bash",
+            "-c",
+            'sleep "$1"; shift; exec "$@"',
+            "_",
+            str(sleep_delay),
+            *argv,
+        ]
     else:
         inner = list(argv)
 
@@ -322,7 +339,9 @@ async def deploy_redeploy(request: Request) -> JSONResponse:
 
     script = _scripts_dir() / "redeploy.sh"
     if not script.is_file():
-        raise HTTPException(status_code=500, detail=f"missing redeploy script: {script}")
+        raise HTTPException(
+            status_code=500, detail=f"missing redeploy script: {script}"
+        )
 
     _write_status_starting("redeploy")
     # delay=2 so the 202 response flushes before chudware-gateway is restarted.

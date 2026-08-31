@@ -184,7 +184,7 @@ if [[ "$ENVIRONMENT" = prod && "$CONTINUOUS" = 0 && "$DO_PULL" = 1 && ! "$RELEAS
 fi
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-REPO="${CHUDWARE_OMP_DIR:-$REPO}"
+REPO="${CHUDWARE_REPO_DIR:-$REPO}"
 cd "$REPO"
 REMOTE="${CHUDWARE_UPDATE_REMOTE:-origin}"
 REF="${CHUDWARE_UPDATE_BRANCH:-master}"

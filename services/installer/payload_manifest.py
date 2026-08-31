@@ -5,6 +5,7 @@ consumes :func:`payload_signature_preimage`; finalization verifies a detached si
 against the explicitly supplied release public key before placing its canonical base64
 sidecar beside the manifest.
 """
+
 from __future__ import annotations
 
 import base64
@@ -31,15 +32,39 @@ PRODUCT = "Chudware"
 KINDS = frozenset({"executable", "library", "worker", "policy", "resource"})
 _METADATA_NAMES = frozenset({MANIFEST_NAME, SIGNATURE_NAME})
 _KEY_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}\Z")
-_SOURCE_SUFFIXES = frozenset({
-    ".py", ".pyc", ".pyo", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs",
-    ".map", ".pdb", ".dwo", ".dwp", ".dbg", ".sym", ".debug",
-})
+_SOURCE_SUFFIXES = frozenset(
+    {
+        ".py",
+        ".pyc",
+        ".pyo",
+        ".ts",
+        ".tsx",
+        ".js",
+        ".jsx",
+        ".mjs",
+        ".cjs",
+        ".map",
+        ".pdb",
+        ".dwo",
+        ".dwp",
+        ".dbg",
+        ".sym",
+        ".debug",
+    }
+)
 _SOURCE_SUFFIXES_FOLDED = frozenset(item.casefold() for item in _SOURCE_SUFFIXES)
-_REPOSITORY_PARTS = frozenset({
-    ".git", ".github", ".gitlab", ".svn", ".hg",
-    ".gitignore", ".gitattributes", ".gitmodules",
-})
+_REPOSITORY_PARTS = frozenset(
+    {
+        ".git",
+        ".github",
+        ".gitlab",
+        ".svn",
+        ".hg",
+        ".gitignore",
+        ".gitattributes",
+        ".gitmodules",
+    }
+)
 _TEST_PARTS = frozenset({"test", "tests", "testing", "__tests__"})
 
 
@@ -86,7 +111,9 @@ def normalize_payload_path(value: str | os.PathLike[str]) -> str:
     if posix.is_absolute() or windows.is_absolute() or windows.drive:
         raise PayloadManifestError(f"absolute payload path is forbidden: {raw!r}")
     if any(part == ".." for part in posix.parts):
-        raise PayloadManifestError(f"parent traversal is forbidden in payload path: {raw!r}")
+        raise PayloadManifestError(
+            f"parent traversal is forbidden in payload path: {raw!r}"
+        )
     normalized = posix.as_posix()
     if normalized in {"", "."}:
         raise PayloadManifestError(f"invalid payload path: {raw!r}")
@@ -95,7 +122,9 @@ def normalize_payload_path(value: str | os.PathLike[str]) -> str:
 
 def _is_link_or_reparse(info: os.stat_result) -> bool:
     # FILE_ATTRIBUTE_REPARSE_POINT (0x400) covers Windows junctions as well as symlinks.
-    return stat.S_ISLNK(info.st_mode) or bool(getattr(info, "st_file_attributes", 0) & 0x400)
+    return stat.S_ISLNK(info.st_mode) or bool(
+        getattr(info, "st_file_attributes", 0) & 0x400
+    )
 
 
 def _root(root: Path) -> Path:
@@ -104,7 +133,9 @@ def _root(root: Path) -> Path:
     except FileNotFoundError as exc:
         raise PayloadManifestError(f"payload root does not exist: {root}") from exc
     if _is_link_or_reparse(root_lstat) or not stat.S_ISDIR(root_lstat.st_mode):
-        raise PayloadManifestError(f"payload root must be a real directory, not a symlink: {root}")
+        raise PayloadManifestError(
+            f"payload root must be a real directory, not a symlink: {root}"
+        )
     return root.resolve(strict=True)
 
 
@@ -118,9 +149,13 @@ def _checked_file(root: Path, relative: str) -> Path:
         except FileNotFoundError as exc:
             raise PayloadManifestError(f"manifest path is missing: {relative}") from exc
         if _is_link_or_reparse(info):
-            raise PayloadManifestError(f"symlink is forbidden in payload path: {relative}")
+            raise PayloadManifestError(
+                f"symlink is forbidden in payload path: {relative}"
+            )
         if index != len(parts) - 1 and not stat.S_ISDIR(info.st_mode):
-            raise PayloadManifestError(f"non-directory payload path component: {relative}")
+            raise PayloadManifestError(
+                f"non-directory payload path component: {relative}"
+            )
     if not stat.S_ISREG(info.st_mode):
         raise PayloadManifestError(f"payload entry is not a regular file: {relative}")
     return current
@@ -132,19 +167,27 @@ def discover_payload_files(root: Path, *, exclude_metadata: bool = True) -> list
 
     def visit(directory: Path, prefix: str) -> None:
         with os.scandir(directory) as entries:
-            ordered = sorted(entries, key=lambda entry: unicodedata.normalize("NFC", entry.name))
+            ordered = sorted(
+                entries, key=lambda entry: unicodedata.normalize("NFC", entry.name)
+            )
         for entry in ordered:
-            relative = normalize_payload_path(f"{prefix}/{entry.name}" if prefix else entry.name)
+            relative = normalize_payload_path(
+                f"{prefix}/{entry.name}" if prefix else entry.name
+            )
             info = entry.stat(follow_symlinks=False)
             if _is_link_or_reparse(info):
-                raise PayloadManifestError(f"symlink is forbidden in payload: {relative}")
+                raise PayloadManifestError(
+                    f"symlink is forbidden in payload: {relative}"
+                )
             if stat.S_ISDIR(info.st_mode):
                 visit(Path(entry.path), relative)
             elif stat.S_ISREG(info.st_mode):
                 if not exclude_metadata or relative not in _METADATA_NAMES:
                     found.append(relative)
             else:
-                raise PayloadManifestError(f"special file is forbidden in payload: {relative}")
+                raise PayloadManifestError(
+                    f"special file is forbidden in payload: {relative}"
+                )
 
     visit(root, "")
     return found
@@ -156,13 +199,25 @@ def reject_forbidden_customer_files(root: Path) -> None:
         folded_parts = tuple(part.casefold() for part in parts)
         suffix = Path(parts[-1]).suffix.casefold()
         if any(part in _REPOSITORY_PARTS for part in folded_parts):
-            raise PayloadManifestError(f"repository metadata is forbidden in customer payload: {relative}")
-        if any(part in _TEST_PARTS or part.startswith("test_") for part in folded_parts):
-            raise PayloadManifestError(f"test content is forbidden in customer payload: {relative}")
-        if suffix in _SOURCE_SUFFIXES_FOLDED or any(part.endswith(".dsym") for part in folded_parts):
-            raise PayloadManifestError(f"source/debug artifact is forbidden in customer payload: {relative}")
+            raise PayloadManifestError(
+                f"repository metadata is forbidden in customer payload: {relative}"
+            )
+        if any(
+            part in _TEST_PARTS or part.startswith("test_") for part in folded_parts
+        ):
+            raise PayloadManifestError(
+                f"test content is forbidden in customer payload: {relative}"
+            )
+        if suffix in _SOURCE_SUFFIXES_FOLDED or any(
+            part.endswith(".dsym") for part in folded_parts
+        ):
+            raise PayloadManifestError(
+                f"source/debug artifact is forbidden in customer payload: {relative}"
+            )
         if any(part in {"prompts", "roles", "cheatsheets"} for part in folded_parts):
-            raise PayloadManifestError(f"built-in prompt/role source is forbidden in customer payload: {relative}")
+            raise PayloadManifestError(
+                f"built-in prompt/role source is forbidden in customer payload: {relative}"
+            )
 
 
 def default_kind(relative: str) -> str:
@@ -170,16 +225,23 @@ def default_kind(relative: str) -> str:
     name = path.name.casefold()
     suffix = path.suffix.casefold()
     if name in {
-        "chudware-hostd", "chudware-hostd.exe", "chudware-worker", "chudware-worker.exe",
-        "chudware-mcp", "chudware-mcp.exe", "chudware-omp-bridge",
-        "chudware-omp-bridge.exe",
+        "chudware-hostd",
+        "chudware-hostd.exe",
+        "chudware-worker",
+        "chudware-worker.exe",
+        "chudware-mcp",
+        "chudware-mcp.exe",
     }:
         return "worker"
+    if name in {"chud", "chud.exe"}:
+        return "executable"
     if suffix in {".dll", ".so", ".dylib"} or ".so." in name:
         return "library"
     if suffix in {".exe", ".ps1", ".bat", ".cmd"} or name in {"chudware", "appimage"}:
         return "executable"
-    if name.startswith("security-policy") or "policy" in (part.casefold() for part in path.parts[:-1]):
+    if name.startswith("security-policy") or "policy" in (
+        part.casefold() for part in path.parts[:-1]
+    ):
         return "policy"
     return "resource"
 
@@ -242,13 +304,17 @@ def _read_regular_file(path: Path, label: str) -> bytes:
         flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
         descriptor = os.open(path, flags)
     except OSError as exc:
-        raise PayloadManifestError(f"cannot safely open {label}: {path}: {exc}") from exc
+        raise PayloadManifestError(
+            f"cannot safely open {label}: {path}: {exc}"
+        ) from exc
     content = bytearray()
     try:
         opened = os.fstat(descriptor)
         mismatch = _same_open_identity(before, opened)
         if mismatch:
-            raise PayloadManifestError(f"{label} changed while opening: {path} ({mismatch})")
+            raise PayloadManifestError(
+                f"{label} changed while opening: {path} ({mismatch})"
+            )
         while chunk := os.read(descriptor, 1024 * 1024):
             content.extend(chunk)
         after = os.fstat(descriptor)
@@ -257,11 +323,15 @@ def _read_regular_file(path: Path, label: str) -> bytes:
     final = path.lstat()
     mismatch = _identity_mismatch(opened, after) or _same_open_identity(final, after)
     if mismatch:
-        raise PayloadManifestError(f"{label} changed while reading: {path} ({mismatch})")
+        raise PayloadManifestError(
+            f"{label} changed while reading: {path} ({mismatch})"
+        )
     return bytes(content)
 
 
-def _snapshot_file(root: Path, relative: str, kind: str, *, attempts: int = 4) -> FileSnapshot:
+def _snapshot_file(
+    root: Path, relative: str, kind: str, *, attempts: int = 4
+) -> FileSnapshot:
     """Snapshot one payload file, retrying a transient metadata change.
 
     Every attempt is self-consistent on its own: the descriptor is proven to be
@@ -295,7 +365,9 @@ def _snapshot_file_once(root: Path, relative: str, kind: str) -> FileSnapshot:
     try:
         descriptor = os.open(path, flags)
     except OSError as exc:
-        raise PayloadManifestError(f"cannot safely open payload file: {relative}: {exc}") from exc
+        raise PayloadManifestError(
+            f"cannot safely open payload file: {relative}: {exc}"
+        ) from exc
     digest = hashlib.sha256()
     try:
         opened = os.fstat(descriptor)
@@ -312,7 +384,9 @@ def _snapshot_file_once(root: Path, relative: str, kind: str) -> FileSnapshot:
     final = path.lstat()
     mismatch = _identity_mismatch(opened, after) or _same_open_identity(final, after)
     if mismatch:
-        raise PayloadManifestError(f"payload file changed while hashing: {relative} ({mismatch})")
+        raise PayloadManifestError(
+            f"payload file changed while hashing: {relative} ({mismatch})"
+        )
     return FileSnapshot(
         path=relative,
         size=after.st_size,
@@ -366,11 +440,15 @@ def verify_snapshot(
         if actual != set(expected):
             missing = sorted(set(expected) - actual)
             added = sorted(actual - set(expected))
-            raise PayloadManifestError(f"payload file set changed; missing={missing}, added={added}")
+            raise PayloadManifestError(
+                f"payload file set changed; missing={missing}, added={added}"
+            )
     for relative, original in expected.items():
         current = _snapshot_file(root, relative, original.kind)
         if current != original:
-            raise PayloadManifestError(f"payload file changed after manifest hashing: {relative}")
+            raise PayloadManifestError(
+                f"payload file changed after manifest hashing: {relative}"
+            )
 
 
 def _created_at(value: str | None, snapshots: Sequence[FileSnapshot]) -> str:
@@ -380,14 +458,25 @@ def _created_at(value: str | None, snapshots: Sequence[FileSnapshot]) -> str:
             try:
                 epoch = int(source_epoch)
             except ValueError as exc:
-                raise PayloadManifestError("SOURCE_DATE_EPOCH must be an integer") from exc
+                raise PayloadManifestError(
+                    "SOURCE_DATE_EPOCH must be an integer"
+                ) from exc
         else:
-            epoch = max((snapshot.mtime_ns // 1_000_000_000 for snapshot in snapshots), default=0)
-        value = datetime.fromtimestamp(epoch, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            epoch = max(
+                (snapshot.mtime_ns // 1_000_000_000 for snapshot in snapshots),
+                default=0,
+            )
+        value = datetime.fromtimestamp(epoch, tz=timezone.utc).strftime(
+            "%Y-%m-%dT%H:%M:%SZ"
+        )
     try:
-        parsed = datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+        parsed = datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ").replace(
+            tzinfo=timezone.utc
+        )
     except ValueError as exc:
-        raise PayloadManifestError("created_at must use canonical UTC seconds: YYYY-MM-DDTHH:MM:SSZ") from exc
+        raise PayloadManifestError(
+            "created_at must use canonical UTC seconds: YYYY-MM-DDTHH:MM:SSZ"
+        ) from exc
     if parsed.strftime("%Y-%m-%dT%H:%M:%SZ") != value:
         raise PayloadManifestError("created_at is not canonical")
     return value
@@ -425,7 +514,16 @@ def build_manifest(
 
 
 def canonical_manifest_bytes(manifest: Mapping[str, object]) -> bytes:
-    expected = {"schema", "product", "version", "platform", "arch", "created_at", "key_id", "files"}
+    expected = {
+        "schema",
+        "product",
+        "version",
+        "platform",
+        "arch",
+        "created_at",
+        "key_id",
+        "files",
+    }
     if set(manifest) != expected:
         raise PayloadManifestError(f"manifest keys must be exactly {sorted(expected)}")
     if manifest["schema"] != SCHEMA or manifest["product"] != PRODUCT:
@@ -444,24 +542,44 @@ def canonical_manifest_bytes(manifest: Mapping[str, object]) -> bytes:
         raise PayloadManifestError("manifest files must be a list")
     paths: list[str] = []
     for row in files:
-        if not isinstance(row, dict) or set(row) != {"path", "size", "sha256", "mode", "kind"}:
+        if not isinstance(row, dict) or set(row) != {
+            "path",
+            "size",
+            "sha256",
+            "mode",
+            "kind",
+        }:
             raise PayloadManifestError("manifest file rows have an invalid schema")
         if not isinstance(row["path"], str):
             raise PayloadManifestError("manifest file path must be a string")
         relative = normalize_payload_path(row["path"])
-        if relative != row["path"] or not isinstance(row["kind"], str) or row["kind"] not in KINDS:
-            raise PayloadManifestError(f"manifest file row is not canonical: {relative}")
+        if (
+            relative != row["path"]
+            or not isinstance(row["kind"], str)
+            or row["kind"] not in KINDS
+        ):
+            raise PayloadManifestError(
+                f"manifest file row is not canonical: {relative}"
+            )
         if type(row["size"]) is not int or row["size"] < 0:
             raise PayloadManifestError(f"invalid size for manifest file: {relative}")
         if type(row["mode"]) is not int or not 0 <= row["mode"] <= 0o7777:
             raise PayloadManifestError(f"invalid mode for manifest file: {relative}")
-        if not isinstance(row["sha256"], str) or not re.fullmatch(r"[0-9a-f]{64}", row["sha256"]):
+        if not isinstance(row["sha256"], str) or not re.fullmatch(
+            r"[0-9a-f]{64}", row["sha256"]
+        ):
             raise PayloadManifestError(f"invalid SHA-256 for manifest file: {relative}")
         paths.append(relative)
     if paths != sorted(paths) or len({path.casefold() for path in paths}) != len(paths):
-        raise PayloadManifestError("manifest file paths must be sorted and normalized-unique")
+        raise PayloadManifestError(
+            "manifest file paths must be sorted and normalized-unique"
+        )
     return json.dumps(
-        manifest, ensure_ascii=False, allow_nan=False, sort_keys=True, separators=(",", ":")
+        manifest,
+        ensure_ascii=False,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
     ).encode("utf-8")
 
 
@@ -473,7 +591,9 @@ def payload_signature_preimage(key_id: str, canonical_json: bytes) -> bytes:
 def write_manifest(root: Path, canonical_json: bytes) -> Path:
     parsed = json.loads(canonical_json.decode("utf-8"))
     if canonical_manifest_bytes(parsed) != canonical_json:
-        raise PayloadManifestError("refusing to write non-canonical payload manifest bytes")
+        raise PayloadManifestError(
+            "refusing to write non-canonical payload manifest bytes"
+        )
     target = _root(root) / MANIFEST_NAME
     _atomic_write(target, canonical_json)
     return target
@@ -502,13 +622,17 @@ def read_signature(path: Path) -> bytes:
     else:
         encoded = text
     if not encoded or encoded.strip() != encoded or "\n" in encoded or "\r" in encoded:
-        raise PayloadManifestError("payload signature sidecar must contain one canonical base64 line")
+        raise PayloadManifestError(
+            "payload signature sidecar must contain one canonical base64 line"
+        )
     try:
         signature = base64.b64decode(encoded, validate=True)
     except (ValueError, binascii.Error) as exc:
         raise PayloadManifestError("payload signature is not standard base64") from exc
     if len(signature) != 64 or base64.b64encode(signature).decode("ascii") != encoded:
-        raise PayloadManifestError("payload signature must be one canonical Ed25519 signature")
+        raise PayloadManifestError(
+            "payload signature must be one canonical Ed25519 signature"
+        )
     return signature
 
 
@@ -547,9 +671,15 @@ def _load_public_key(value: str):
         ) from exc
     candidate = Path(value)
     try:
-        data = _read_regular_file(candidate, "release public key") if candidate.is_file() else value.encode("ascii")
+        data = (
+            _read_regular_file(candidate, "release public key")
+            if candidate.is_file()
+            else value.encode("ascii")
+        )
     except (OSError, UnicodeError) as exc:
-        raise PayloadManifestError("release public key must be a readable PEM file or canonical base64") from exc
+        raise PayloadManifestError(
+            "release public key must be a readable PEM file or canonical base64"
+        ) from exc
     if data.startswith(b"-----BEGIN"):
         try:
             key = serialization.load_pem_public_key(data)
@@ -562,9 +692,13 @@ def _load_public_key(value: str):
         encoded = data.decode("ascii").strip()
         raw = base64.b64decode(encoded, validate=True)
     except (UnicodeError, ValueError, binascii.Error) as exc:
-        raise PayloadManifestError("release public key is not canonical base64") from exc
+        raise PayloadManifestError(
+            "release public key is not canonical base64"
+        ) from exc
     if len(raw) != 32 or base64.b64encode(raw).decode("ascii") != encoded:
-        raise PayloadManifestError("release public key must encode exactly 32 Ed25519 bytes")
+        raise PayloadManifestError(
+            "release public key must encode exactly 32 Ed25519 bytes"
+        )
     return Ed25519PublicKey.from_public_bytes(raw)
 
 
@@ -582,7 +716,9 @@ def verify_signature(
     except PayloadManifestError:
         raise
     except Exception as exc:
-        raise PayloadManifestError("payload signature does not verify for manifest/key_id") from exc
+        raise PayloadManifestError(
+            "payload signature does not verify for manifest/key_id"
+        ) from exc
     return signature
 
 
@@ -612,7 +748,9 @@ def write_signing_preimage(path: Path, key_id: str, canonical_json: bytes) -> Pa
 
 def _atomic_write(target: Path, content: bytes) -> None:
     target.parent.mkdir(parents=True, exist_ok=True)
-    descriptor, temporary_name = tempfile.mkstemp(prefix=target.name + ".", dir=target.parent)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=target.name + ".", dir=target.parent
+    )
     temporary = Path(temporary_name)
     try:
         with os.fdopen(descriptor, "wb") as stream:
@@ -632,12 +770,18 @@ def create_verified_zip(root: Path, destination: Path) -> Path:
     snapshot_by_path = {snapshot.path: snapshot for snapshot in snapshots}
     destination.parent.mkdir(parents=True, exist_ok=True)
     if destination.exists():
-        raise PayloadManifestError(f"refusing to replace existing archive: {destination}")
+        raise PayloadManifestError(
+            f"refusing to replace existing archive: {destination}"
+        )
     temporary = destination.with_name(destination.name + ".tmp")
     if temporary.exists():
-        raise PayloadManifestError(f"stale temporary archive must be removed explicitly: {temporary}")
+        raise PayloadManifestError(
+            f"stale temporary archive must be removed explicitly: {temporary}"
+        )
     try:
-        with zipfile.ZipFile(temporary, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as archive:
+        with zipfile.ZipFile(
+            temporary, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9
+        ) as archive:
             for relative in sorted(snapshot_by_path):
                 snapshot = snapshot_by_path[relative]
                 source = _checked_file(root, relative)
@@ -648,7 +792,11 @@ def create_verified_zip(root: Path, destination: Path) -> Path:
                 )
                 info.create_system = 3
                 info.external_attr = (stat.S_IFREG | snapshot.mode) << 16
-                flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+                flags = (
+                    os.O_RDONLY
+                    | getattr(os, "O_BINARY", 0)
+                    | getattr(os, "O_NOFOLLOW", 0)
+                )
                 descriptor = os.open(source, flags)
                 digest = hashlib.sha256()
                 try:
@@ -665,8 +813,12 @@ def create_verified_zip(root: Path, destination: Path) -> Path:
                     or after.st_size != snapshot.size
                     or digest.hexdigest() != snapshot.sha256
                 ):
-                    raise PayloadManifestError(f"payload mutated during archive creation: {relative}")
-        verify_snapshot(root, snapshots, require_exact_files=True, exclude_metadata=False)
+                    raise PayloadManifestError(
+                        f"payload mutated during archive creation: {relative}"
+                    )
+        verify_snapshot(
+            root, snapshots, require_exact_files=True, exclude_metadata=False
+        )
         os.replace(temporary, destination)
     except Exception:
         temporary.unlink(missing_ok=True)

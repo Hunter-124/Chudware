@@ -1,7 +1,7 @@
 # Build protected production sidecars into a builder-owned output directory. Configure host and
 # hostd with -DCHUDWARE_DEVELOPER_BUILD=OFF first, and generate protected assets under
 # host/build-win/generated/protected-assets. Pass outputs via --worker-bin/--mcp-bin/
-# --omp-bridge-bin before hashing the immutable Windows payload.
+# --chud-bin before hashing the immutable Windows payload.
 param(
     [Parameter(Mandatory = $true)]
     [string]$OutputDir,
@@ -10,7 +10,8 @@ param(
     [string]$HostdBinary = "",
     # Engine library whose advisor closure is carried into the GUI runtime root. Defaults to
     # the first libchudware.dll found beside the host/hostd binaries or in the core build trees.
-    [string]$EngineBinary = ""
+    [string]$EngineBinary = "",
+    [string]$ChudBinary = $env:CHUDWARE_CHUD_BIN
 )
 
 $ErrorActionPreference = "Stop"
@@ -66,30 +67,17 @@ function Get-VerifiedBinaryBuildDir([string]$Binary, [string]$Label) {
     return $buildDir
 }
 
-function Build-OmpBridge([string]$Destination) {
-    $bun = (Get-Command bun.exe -ErrorAction Stop).Source
-    $workspace = Join-Path $Root "vendor\omp"
-    Push-Location $workspace
-    try {
-        Write-Host "==> installing locked vendored OMP workspace"
-        Invoke-Checked $bun @("install", "--frozen-lockfile")
-        Write-Host "==> compiling chudware-omp-bridge.exe"
-        Invoke-Checked $bun @(
-            "build", "--compile", "--sourcemap=none", "--packages=bundle",
-            "--allow-unresolved=", "--allow-unresolved=@img/sharp-*/versions", "--allow-unresolved=@img/sharp-libvips-*/lib", "--allow-unresolved=@img/sharp-libvips-*/package", "--allow-unresolved=@img/sharp-libvips-*/versions", "--allow-unresolved=@img/sharp-libvips-dev-*/include", "--allow-unresolved=@img/sharp-libvips-dev-*/lib",
-            "--no-compile-autoload-dotenv", "--no-compile-autoload-bunfig",
-            "--no-compile-autoload-package-json", "--windows-hide-console",
-            "bridge/src/bridge.ts", "--outfile", $Destination
-        )
-        # bun --compile writes bridge.js.map beside the outfile even under
-        # --sourcemap=none; the payload guard rejects debug artifacts.
-        Remove-Item -Force -ErrorAction SilentlyContinue (Join-Path (Split-Path $destination) "bridge.js.map")
-    } finally {
-        Pop-Location
+function Stage-Chudcode([string]$Destination) {
+    if (-not $ChudBinary) {
+        throw "CHUDWARE_CHUD_BIN or -ChudBinary is required"
     }
-    if (-not (Test-Path -LiteralPath $Destination -PathType Leaf)) {
-        throw "Bun did not produce $Destination"
-    }
+    Invoke-Checked $Python @(
+        (Join-Path $Root "scripts\pin_chudcode.py"),
+        "stage",
+        "--target", "windows-x86_64",
+        "--input", $ChudBinary,
+        "--output", $Destination
+    )
 }
 
 function Generate-ProtectedAssets {
@@ -276,7 +264,7 @@ Stage-AdvisorRuntime $Engine (Split-Path -Parent ([IO.Path]::GetFullPath($HostBi
 Generate-ProtectedAssets
 Build-PythonSidecar "worker_main" "chudware-worker"
 Build-PythonSidecar "mcp.server" "chudware-mcp"
-Build-OmpBridge (Join-Path $OutputDir "chudware-omp-bridge.exe")
+Stage-Chudcode (Join-Path $OutputDir "chud.exe")
 Assert-SourceFreePayload $OutputDir
 
 Write-Host "==> built compiled release sidecars in $OutputDir"

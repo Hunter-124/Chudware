@@ -150,22 +150,19 @@ then
   fatal "$PROMPTS_SRC contains no role prompts"
 fi
 
-# Provider/auth RPCs require the vendored Bun workspace. Missing Bun, lockfile,
-# bridge source, install failure, or an absent node_modules tree is deployment-fatal.
-VENDOR_OMP="$ROOT/vendor/omp"
-[ -f "$VENDOR_OMP/package.json" ] || fatal "$VENDOR_OMP/package.json missing"
-[ -f "$VENDOR_OMP/bun.lock" ] || fatal "$VENDOR_OMP/bun.lock missing"
-[ -f "$VENDOR_OMP/bridge/src/bridge.ts" ] || fatal "$VENDOR_OMP/bridge/src/bridge.ts missing"
-BUN="${CHUDWARE_BUN:-$HOME/.bun/bin/bun}"
-if [ ! -x "$BUN" ]; then
-  BUN="$(command -v bun || true)"
+# Chudcode is a pinned compiled release input. Deployment never installs a source
+# checkout or reaches the network: the caller supplies a local binary and the checked-in
+# lock verifies both its target and sha256 before it enters the immutable release.
+CHUD_INPUT="${CHUDWARE_CHUD_BIN:-}"
+[ -n "$CHUD_INPUT" ] || fatal "CHUDWARE_CHUD_BIN is required"
+CHUD_LOCK="$ROOT/vendor/chudcode/CHUDCODE_ARTIFACT.lock"
+[ -f "$CHUD_LOCK" ] || fatal "$CHUD_LOCK missing"
+if ! "$PYTHON" "$ROOT/scripts/pin_chudcode.py" stage \
+    --target linux-x86_64 --input "$CHUD_INPUT" --output "$STAGE_BIN/chud"; then
+  fatal "Chudcode artifact verification/staging failed"
 fi
-[ -n "$BUN" ] && [ -x "$BUN" ] || fatal "bun not found; provider/auth RPC dependencies cannot be provisioned"
-if ! (cd "$VENDOR_OMP" && "$BUN" install --frozen-lockfile); then
-  fatal "bun install --frozen-lockfile failed in $VENDOR_OMP"
-fi
-[ -d "$VENDOR_OMP/node_modules" ] || fatal "$VENDOR_OMP/node_modules missing after bun install"
-echo "[webd] provider/auth dependencies provisioned"
+cp "$CHUD_LOCK" "$STAGE_ROOT/CHUDCODE_ARTIFACT.lock"
+echo "[webd] staged verified Chudcode binary"
 
 # Build WASM into the private release stage, never directly over the live app.
 EMSDK_DIR="${EMSDK:-$HOME/.emsdk}"
@@ -222,39 +219,8 @@ PY
 )"
 WASM_SHA="$(sha256sum "$STAGE_APP/Chudware.wasm" | cut -d' ' -f1)"
 JS_SHA="$(sha256sum "$STAGE_APP/Chudware.js" | cut -d' ' -f1)"
-PROVIDER_SHA="$("$PYTHON" - "$VENDOR_OMP" <<'PY'
-from hashlib import sha256
-from pathlib import Path
-import sys
-root = Path(sys.argv[1])
-inputs = [
-    root / "package.json",
-    root / "bun.lock",
-    root / "bunfig.toml",
-    root / "OMP_VENDOR.lock",
-    root / "bridge",
-    root / "packages",
-    root / "patches",
-]
-files = []
-for item in inputs:
-    if item.is_file():
-        files.append(item)
-    elif item.is_dir():
-        files.extend(
-            path for path in item.rglob("*")
-            if path.is_file()
-            and not {"node_modules", "dist", "build", ".cache", ".turbo", ".git"}.intersection(path.parts)
-        )
-h = sha256()
-for path in sorted(files):
-    h.update(path.relative_to(root).as_posix().encode())
-    h.update(b"\0")
-    h.update(path.read_bytes())
-    h.update(b"\0")
-print(h.hexdigest())
-PY
-)"
+CHUD_SHA="$(sha256sum "$STAGE_BIN/chud" | cut -d' ' -f1)"
+CHUD_LOCK_SHA="$(sha256sum "$STAGE_ROOT/CHUDCODE_ARTIFACT.lock" | cut -d' ' -f1)"
 HOSTD_UNIT_SHA="$(sha256sum "$STAGE_ROOT/chudware-hostd.service" | cut -d' ' -f1)"
 GATEWAY_UNIT_SHA="$(sha256sum "$ROOT/Webservice/deploy/chudware-gateway.service" | cut -d' ' -f1)"
 STAGING_GATEWAY_UNIT_SHA="$(sha256sum "$ROOT/Webservice/deploy/chudware-gateway-staging.service" | cut -d' ' -f1)"
@@ -281,8 +247,9 @@ PY
 )"
 CHECKOUT_HEAD="$(git -C "$ROOT" rev-parse HEAD 2>/dev/null || printf 'unknown')"
 JOINT_SHA="$(printf '%s\n' "$HOSTD_SHA" "$LIB_SHA" "$ADVISOR_RUNTIME_SHA" \
-  "$WASM_SHA" "$JS_SHA" "$PROVIDER_SHA" "$HOSTD_UNIT_SHA" "$GATEWAY_UNIT_SHA" \
-  "$STAGING_GATEWAY_UNIT_SHA" "$PROMPTS_SHA" | sha256sum | cut -d' ' -f1)"
+  "$WASM_SHA" "$JS_SHA" "$CHUD_SHA" "$CHUD_LOCK_SHA" "$HOSTD_UNIT_SHA" \
+  "$GATEWAY_UNIT_SHA" "$STAGING_GATEWAY_UNIT_SHA" "$PROMPTS_SHA" \
+  | sha256sum | cut -d' ' -f1)"
 # One clock read feeds both the release id and the manifest timestamp, so the two
 # can never straddle a second boundary and disagree. UTC rather than local time:
 # release retention and rollback order trees by their lexicographic directory
@@ -291,7 +258,7 @@ JOINT_SHA="$(printf '%s\n' "$HOSTD_SHA" "$LIB_SHA" "$ADVISOR_RUNTIME_SHA" \
 BUILT_AT_UTC="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 RELEASE_ID="${BUILT_AT_UTC//[:-]/}-${JOINT_SHA:0:12}-$$"
 cat > "$STAGE_ROOT/deploy-manifest" <<EOF
-schema=3
+schema=4
 release_id=$RELEASE_ID
 joint_sha256=$JOINT_SHA
 hostd_sha256=$HOSTD_SHA
@@ -299,7 +266,8 @@ libchudware_sha256=$LIB_SHA
 advisor_runtime_sha256=$ADVISOR_RUNTIME_SHA
 wasm_sha256=$WASM_SHA
 javascript_sha256=$JS_SHA
-provider_runtime_sha256=$PROVIDER_SHA
+chud_sha256=$CHUD_SHA
+chudcode_artifact_lock_sha256=$CHUD_LOCK_SHA
 hostd_unit_sha256=$HOSTD_UNIT_SHA
 gateway_unit_sha256=$GATEWAY_UNIT_SHA
 staging_gateway_unit_sha256=$STAGING_GATEWAY_UNIT_SHA
@@ -524,12 +492,14 @@ cat > "$DST/.webd.env.staging.$$" <<EOF
 # written by install_webd.sh $(date -Is) — read by the gateway (config.py)
 CHUDWARE_WEBD_SOCKET=$SOCK
 CHUDWARE_WORKSPACE_ROOT=$WORKSPACE_ROOT
+CHUDWARE_CHUDCODE_BIN=$BIN/chud
 EOF
 mv -f "$DST/.webd.env.staging.$$" "$DST/webd.env"
 cat > "$DST/.chudware-shared.sh.staging.$$" <<EOF
 #!/usr/bin/env bash
 export CHUDWARE_INSTANCE_KEY=$KEY
 export CHUDWARE_HOSTD_BIN="$BIN/chudware-hostd"
+export CHUDWARE_CHUDCODE_BIN="$BIN/chud"
 export CHUDWARE_ENGINE_DAEMON=1
 exec "\${CHUDWARE_BIN:-$ROOT/host/build-linux/bin/chudware}" "\$@"
 EOF

@@ -30,6 +30,9 @@ vtk==9.6.2
 opencv-python-headless==5.0.0.93
 # interfaces
 mcp==1.27.2
+# Persistent online-agent embedding.  The wheel owns protocol/process mechanics; the
+# separately signed payload supplies the adjacent compiled ``chud`` executable.
+chudcode-rpc==0.2.0       # MIT — typed RPC v2 client; compiled chud ships separately
 # built-in agent provider adapters
 anthropic==0.107.1
 openai==2.41.0

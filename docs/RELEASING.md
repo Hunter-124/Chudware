@@ -311,7 +311,7 @@ fail closed. Once all five platform artifacts exist, replace it atomically with:
 
 ```bash
 python3 scripts/pin_chudcode.py pin \
-  --version 0.2.0 --engine-version 18.0.8 --rpc-protocol 2 --repository-commit COMMIT \
+  --version 0.3.0 --engine-version 18.0.8 --rpc-protocol 2 --repository-commit COMMIT \
   --artifact linux-x86_64=/secure/chud-linux-x86_64 --url linux-x86_64=https://... \
   --artifact linux-aarch64=/secure/chud-linux-aarch64 --url linux-aarch64=https://... \
   --artifact macos-x86_64=/secure/chud-macos-x86_64 --url macos-x86_64=https://... \
@@ -321,8 +321,21 @@ python3 scripts/pin_chudcode.py pin \
 
 The lock's `version` is the Chudcode product release. `engine_version` is
 optional source provenance only; it never changes executable identity.
-Every artifact must report exactly `Chudcode v0.2.0` from `--version`, and the
+Every artifact must report exactly `Chudcode v0.3.0` from `--version`, and the
 engine provenance value is never accepted as or appended to the product version.
+
+### Current pin status (2026-08-31)
+
+Chudcode `v0.3.0` is published at
+`https://github.com/Hunter-124/chudcode/releases/tag/chudcode-v0.3.0` with real
+`chudcode-linux-x64`, `chudcode-linux-arm64`, and `chudcode-darwin-x64` CLI
+artifacts plus the Linux and macOS x64 desktop archives. `macos-arm64` is built
+from the same commit on an Intel Mac host, and `windows-x86_64` has no artifact:
+`napi-build` needs a Windows `libnode.dll` import library, so the natives addon
+cannot be produced by the zig-based Linux cross-build, and no Windows host with
+MSVC plus Rust is available. Because `pin` requires all five targets at once,
+the lock stays fully `null` and every packaging path stays fail-closed until a
+genuine Windows x86_64 `chud.exe` exists. Do not hand-fake that row.
 
 The `stage` command used by packaging is offline and accepts only a local
 `CHUDWARE_CHUD_BIN`; it verifies the executable format/architecture, SHA-256,

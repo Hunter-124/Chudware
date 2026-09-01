@@ -327,15 +327,28 @@ engine provenance value is never accepted as or appended to the product version.
 ### Current pin status (2026-08-31)
 
 Chudcode `v0.3.0` is published at
-`https://github.com/Hunter-124/chudcode/releases/tag/chudcode-v0.3.0` with real
-`chudcode-linux-x64`, `chudcode-linux-arm64`, and `chudcode-darwin-x64` CLI
-artifacts plus the Linux and macOS x64 desktop archives. `macos-arm64` is built
-from the same commit on an Intel Mac host, and `windows-x86_64` has no artifact:
-`napi-build` needs a Windows `libnode.dll` import library, so the natives addon
-cannot be produced by the zig-based Linux cross-build, and no Windows host with
-MSVC plus Rust is available. Because `pin` requires all five targets at once,
-the lock stays fully `null` and every packaging path stays fail-closed until a
-genuine Windows x86_64 `chud.exe` exists. Do not hand-fake that row.
+`https://github.com/Hunter-124/chudcode/releases/tag/chudcode-v0.3.0` from commit
+`9fab19a6af`, carrying real `chudcode-linux-x64`, `chudcode-linux-arm64`,
+`chudcode-darwin-x64`, and `chudcode-darwin-arm64` CLI artifacts, the Linux and
+macOS x64 desktop archives, and `SHA256SUMS.txt`. Four of the five lock targets
+therefore have genuine binaries; the published `chudcode-linux-x64` was
+re-downloaded and matched its build hash while reporting `Chudcode v0.3.0`.
+
+Two prerequisites remain before `pin` can run:
+
+1. **`windows-x86_64` has no artifact.** `napi-build` requires a Windows
+   `libnode.dll` import library, so the natives addon cannot come from the
+   zig-based Linux cross-build; GitHub Actions is budget-blocked
+   (`The job was not started because an Actions budget is preventing further
+   use`); and no fleet Windows host carries MSVC plus Rust. Build it on a real
+   Windows toolchain — never hand-fake the row.
+2. **The Chudcode repository is private,** so release asset URLs need
+   authentication. Offline `stage` with a local `CHUDWARE_CHUD_BIN` is
+   unaffected, but the optional `fetch` path needs either a public release or a
+   credentialed mirror before those URLs count as unauthenticated.
+
+`pin` requires all five targets at once, so the lock stays fully `null` and every
+packaging and deployment path stays fail-closed until both are resolved.
 
 The `stage` command used by packaging is offline and accepts only a local
 `CHUDWARE_CHUD_BIN`; it verifies the executable format/architecture, SHA-256,

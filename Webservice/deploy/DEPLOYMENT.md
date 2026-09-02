@@ -40,18 +40,24 @@ curl -X GET "https://api.cloudflare.com/client/v4/accounts/9a800a5f674233fe127cd
 - DNS: `app.chudware.com` is a PROXIED CNAME → `<tunnel-id>.cfargotunnel.com`;
   the apex and `www` are Cloudflare Pages custom domains.
 
-Ingress table (all → local services on `127.0.0.1`):
+Ingress table — the tunnel is healthy on 4 connections and carries exactly these
+rules, verified 2026-09-02:
 
 | Hostname | Service |
 | --- | --- |
 | `app.chudware.com` | `http://127.0.0.1:8300` (FastAPI gateway) |
+| `scootware.us` | `http://127.0.0.1:8320` — an unrelated project sharing this tunnel |
+| `www.scootware.us` | `http://127.0.0.1:8320` — same. Not Chudware; do not remove |
 | *(catch-all)* | `http_status:404` |
 
-### Staging ingress
+### Staging is loopback-only
 
-`staging.chudware.com` is a separate tunnel ingress to
-`http://127.0.0.1:8310`. It must never be routed to port 8300. The staging
-gateway uses `~/chudware-web-staging`, PostgreSQL database
+`chudware-gateway-staging.service` runs as a systemd user unit on the host and
+listens on `http://127.0.0.1:8310`, but it is **not publicly routed**:
+`staging.chudware.com` is absent from the tunnel ingress above and has no DNS
+record in the `chudware.com` zone. Reach it over loopback or an SSH tunnel. If a
+public staging hostname is added back, it must never be routed to port 8300. The
+staging gateway uses `~/chudware-web-staging`, PostgreSQL database
 `chudware_staging`, console-only mail, and Stripe test credentials (or no
 Stripe credentials). Its unit refuses to start if an `sk_live_` Stripe secret
 is present.
@@ -66,9 +72,12 @@ engine, but never mutable gateway state or database credentials.
   row carries `role = 'admin'`. `cf_provision.py` provisions no Access application.
 - The legacy self-hosted app "Billet Web"
   (ID `a5c88ac6-8364-4fa1-9610-c2ab5dcf9fa8`, `self_hosted_domains =
-  [app.chudware.com/admin*]`) must be **deleted by hand in Zero Trust**. While it
-  lives, Cloudflare answers `/admin` with its own login page instead of the
-  gateway's `/signin` — which is the reason it is being removed.
+  [app.chudware.com/admin*]`) **has been deleted.** Verified 2026-09-02: account
+  `9a800a5f674233fe127cdb44b395ebfa` holds no Access application over any
+  `chudware.com` host — the ten that remain are "Kinocasino …" apps scoped to
+  `scootware.us`. Nothing shows a Cloudflare login page in front of `/admin` any
+  more; an anonymous HTML navigation there gets the gateway's own
+  `303 → /signin?next=%2Fadmin`.
 - Cloudflare Access remains a *fallback* credential the gateway accepts from a
   caller with **no** session: set `CHUDWARE_WEB_CF_TEAM_DOMAIN` and
   `CHUDWARE_WEB_CF_AUD` by hand if you want that, and nothing provisions them.

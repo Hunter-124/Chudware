@@ -31,10 +31,15 @@ flowchart LR
    Google/GitHub OAuth lands on the same account rows. A login writes a server-side session
    row and sets the `chudware_sid` cookie; the gateway resolves that cookie to an account and
    reads status/role/plan from the account store on every request — never from the client.
-   Cloudflare Tunnel is still the only ingress, and Cloudflare Access is kept in front of
-   `/admin`: when an Access credential is present the gateway MUST verify
-   `Cf-Access-Jwt-Assertion` (iss/aud/exp vs team JWKS, 6-week key rotation) instead of the
-   cookie. `CHUDWARE_WEB_DEV=1` bypass for local testing only.
+   Cloudflare Tunnel is still the only ingress to the gateway, and it reaches the gateway
+   at exactly one hostname, `app.chudware.com` (the apex and `www` are a Cloudflare Pages
+   static site with no origin route). Cloudflare Access is **no longer in front of
+   anything**, including `/admin`: `_authenticate` tries the `chudware_sid` cookie first,
+   and the Access branch is only the fallback for a caller with no session. It remains a
+   supported deployment mode — when an Access credential is present the gateway MUST
+   verify `Cf-Access-Jwt-Assertion` (iss/aud/exp vs team JWKS, 6-week key rotation)
+   instead of the cookie — but no Access application exists over `app.chudware.com` today.
+   `CHUDWARE_WEB_DEV=1` bypass for local testing only.
 3. **PLM**: NO shared working-tree mount. Central bare folder remotes
    `~/chudware-web-data/plm/<project>.git`; per-account private clone under that
    account's workspace root.
@@ -78,6 +83,8 @@ No Prometheus in v1.
 ## Security notes
 - **ROTATE the Cloudflare API token + R2 keys** from `Cloudflare-info.txt` — they were pushed
   to the public GitHub repo (untracked in ac1b912f, but history retains them).
-- Gateway binds 127.0.0.1 only; the tunnel is the sole ingress; JWT verified on every request.
+- Gateway binds 127.0.0.1 only; the tunnel is the sole ingress; every request is
+  authorized server-side — the `chudware_sid` session row first, an Access JWT only in
+  the fallback mode nothing uses today.
 - The shared daemon is the blast radius: every `/engine` hardening rule in §4 is
   load-bearing, not defense in depth.

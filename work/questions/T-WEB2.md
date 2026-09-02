@@ -1,8 +1,11 @@
 # T-WEB2 — chudware-web finish-line consult (auth keys + PLM bootstrap + v1 DoD)
 
 Driver: web-service session. Hunter delegated decisions to the advisor.
-Context: T-WEB1 shipped and is live (cad.scootware.us behind CF Access; per-user
-containers; chat; AI agent w/ remote providers). Hunter's directive: "handle
+Context (as of this consult, 2026-07-14): T-WEB1 shipped and was live on the
+since-retired `cad` hostname on `scootware.us`, behind CF Access; per-user
+containers; chat; AI agent w/ remote providers. That hostname no longer exists in
+DNS or the tunnel; the service now runs at `app.chudware.com` with no Cloudflare
+Access application in front of it at all. Hunter's directive: "handle
 authentication however you see fit — restrict to a few people, not random
 webscrapers, protected by cryptography/keys."
 

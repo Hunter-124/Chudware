@@ -3,9 +3,11 @@
 Host: Fedora 44. Production gateway: `127.0.0.1:8300`, data
 `~/chudware-web-data/`. Staging gateway: `127.0.0.1:8310`, data
 `~/chudware-web-staging/`.
-Public portal: `https://app.chudware.com` through the tunnel. The marketing site
-at `https://chudware.com` and `https://www.chudware.com` is Cloudflare Pages.
-Staging ingress is `https://staging.chudware.com`.
+Public portal: `https://app.chudware.com` through the tunnel — the only hostname that
+serves the gateway. The marketing site at `https://chudware.com` and
+`https://www.chudware.com` is Cloudflare Pages and is **not** tunnel ingress, so curling
+the apex exercises Pages and tells you nothing about the gateway. Staging has no tunnel
+ingress today: it is reachable on loopback `127.0.0.1:8310` only.
 
 Setting up external credentials for the first time (OAuth clients, Stripe, mail,
 session secret, first admin) is a separate walkthrough:
@@ -28,6 +30,10 @@ deployment that already has them.
 2. **R2 Access Key ID + Secret**
    - Dashboard → R2 → Manage R2 API Tokens → revoke the leaked pair.
    - Create a new R2 token if you still need object storage; put keys in the same secrets dir / env — not the repo.
+   - Nothing consumes them today in any case: R2 is not enabled on the account at all
+     (error 10042 from `GET /accounts/<id>/r2/buckets`), so both the monitor's status
+     publish and the backup's off-box copy stay switched off until a human enables R2
+     in the dashboard (§b manual steps, §f).
 
 3. **Tunnel token**
    - Remotely-managed tunnel token lives only in `~/chudware-web-data/cloudflared.env`
@@ -130,13 +136,14 @@ Do **not** hand-create these if provision already ran:
 | Zero Trust org | exists |
 | Team domain | `https://bruh234324.cloudflareaccess.com` |
 | One-Time PIN IdP | already enabled |
-| Zone | `chudware.com` active |
-| Tunnel | `chudware-web` (remotely-managed) |
-| Production ingress | `app.chudware.com` → `http://127.0.0.1:8300` |
-| Staging ingress | `staging.chudware.com` → `http://127.0.0.1:8310` |
-| Catch-all ingress | `http_status:404` — no apex, www, `cad.scootware.us`, or `sso.chudware.com` origin route |
-| Pages DNS | `chudware.com`, `www.chudware.com` → `chudware-site.pages.dev` |
-| Access application | **none.** `/admin` is gated by the gateway itself; provisioning neither creates nor rewrites an Access app, so there is no gateway AUD to keep unique |
+| Zone | `chudware.com` active (Cloudflare Registrar, `boyd`/`emily.ns.cloudflare.com`) |
+| Tunnel | `chudware-web`, id `95256541-2ebf-4101-92a1-daecd240c087` (remotely-managed) |
+| Production ingress | `app.chudware.com` → `http://127.0.0.1:8300` — the only hostname that reaches the gateway |
+| Staging ingress | **not live.** `cf_provision.py` still writes a `staging.chudware.com` rule, but the tunnel measured 2026-09-02 carries none; staging is loopback `127.0.0.1:8310` only |
+| Foreign ingress | `scootware.us`, `www.scootware.us` → `http://127.0.0.1:8320` — an unrelated project sharing this tunnel. Not Chudware, not a stray rule; leave them alone |
+| Catch-all ingress | `http_status:404` — no apex, `www`, or `sso.chudware.com` origin route |
+| Pages DNS | `chudware.com`, `www.chudware.com` → `chudware-site.pages.dev`, proxied. The apex is Pages, **not** the gateway: it answers 200 with the marketing site |
+| Access application | **none, and none exists in the account.** `/admin` is gated by the gateway itself; provisioning neither creates nor rewrites an Access app, so there is no gateway AUD to keep unique |
 
 `cf_provision.py` is **driver-owned** and lands beside these deploy files — DeployOps does
 not implement it. It writes the gateway's Cloudflare values into
@@ -151,13 +158,26 @@ sudo Webservice/deploy/harden_host.sh --apply tunnel
 
 The operator door for `/admin` is the account store: a `chudware_sid` session whose
 `accounts` row carries `role = 'admin'`, granted only by
-`python -m authn grant-admin` (§c). Cloudflare Access is a *fallback* credential the
-gateway still accepts from a caller with **no** session — set
+`python -m authn grant-admin` (§c). The gateway's own self-serve sign-in is the entire
+front door: `GET /` with an HTML `Accept` 303s to `/signin`, `/signin` and `/signup`
+answer 200, and `/api/auth/oauth/{google,github,microsoft}/start` 302 with
+`redirect_uri=https://app.chudware.com/api/auth/oauth/<provider>/callback`.
+`auth.py::AuthMiddleware._authenticate` tries the `chudware_sid` cookie **first**;
+Cloudflare Access is only the fallback it reaches for when a caller has no session.
+That fallback is still supported code and a legitimate deployment mode — set
 `CHUDWARE_WEB_CF_TEAM_DOMAIN` + `CHUDWARE_WEB_CF_AUD` by hand if you want it, and the
 gateway verifies `Cf-Access-Jwt-Assertion` against team JWKS
 (`…/cdn-cgi/access/certs`) with `iss` = team domain and `aud` = `CHUDWARE_WEB_CF_AUD`.
 JWKS rotates ~every 6 weeks (previous key valid ~7 days) — always fetch remotely,
-match `kid`. Leaving both unset is the supported configuration.
+match `kid`. It is **unused here:** no Access application sits in front of
+`app.chudware.com`, and both variables were removed from `gateway.env` on
+2026-09-02, so an unauthenticated API call now answers the honest
+`{"error":"not signed in"}`. Leaving both unset is the supported configuration.
+Leaving them *set* with no Access app in front only costs you that message —
+the misleading `{"error":"missing Cf-Access-Jwt-Assertion"}` — because the
+Access branch is entered before the honest one. It is no longer a fault: a
+leftover `CF_Authorization` cookie presented to a gateway with Access
+unconfigured used to reach a 500, and now reaches the same 401.
 
 ### Required cutover order — do not invert
 
@@ -175,10 +195,10 @@ order:
    then check that this account reaches `/admin` while a `role = 'user'` account
    receives 403 there.
 4. Only after steps 1–3 pass, run `python3 Webservice/deploy/cf_provision.py`. It
-   changes ingress/DNS/Pages only — it no longer touches Access at all, so the
-   leftover `app.chudware.com/admin*` application must be deleted by hand in the
-   Zero Trust dashboard, otherwise Cloudflare keeps showing its own login page in
-   front of the gateway's.
+   changes ingress/DNS/Pages only — it no longer touches Access at all. The leftover
+   `app.chudware.com/admin*` application that used to need deleting by hand **is gone**:
+   as of 2026-09-02 the account holds no Access application over any `chudware.com`
+   host, so Cloudflare no longer shows its own login page in front of the gateway's.
 5. From an incognito browser, re-check public marketing pages at the apex,
    session-cookie login at `app.chudware.com`, an anonymous `GET /admin`
    redirecting to `/signin?next=%2Fadmin` (not to `cloudflareaccess.com`),
@@ -191,11 +211,18 @@ Cloudflare.
 ### Hunter remaining manual steps
 
 1. **Rotate leaked API token + R2 keys** (§a) — do this before relying on any old token in scripts.
-2. **Delete the `app.chudware.com/admin*` Access application** in Zero Trust →
-   Access → Applications. `cf_provision.py` deliberately stopped managing it, so
-   nothing in this repo will remove it for you, and while it exists Cloudflare
-   answers `/admin` with its own login page instead of the gateway's.
-3. **Grant the admin role** to each operator address, which is now the *whole*
+2. ~~**Delete the `app.chudware.com/admin*` Access application**~~ — **done.** Verified
+   2026-09-02: the account contains no Access application over a `chudware.com` host at
+   all (the ones that remain belong to an unrelated project on `scootware.us`), so
+   nothing fronts `/admin` but the gateway's own sign-in. `cf_provision.py` deliberately
+   does not manage Access, so nothing here recreates it either.
+3. **Enable R2 in the Cloudflare dashboard.** R2 is not enabled on this account:
+   `GET /accounts/9a800a5f674233fe127cdb44b395ebfa/r2/buckets` answers error 10042,
+   "Please enable R2 through the Cloudflare Dashboard". Until a human does that, bucket
+   `chudware-releases` does not exist, the monitor's public `status.json` publish stays
+   switched off (§f), and `backup.sh` keeps local copies only. This is the one item in
+   this list no script can do for you.
+4. **Grant the admin role** to each operator address, which is now the *whole*
    `/admin` allowlist — there is no second list to keep in sync:
    ```bash
    cd Webservice/gateway && .venv/bin/python -m authn grant-admin --email <addr>
@@ -343,9 +370,9 @@ with no session simply gets `/signin`.
 
 ### 401 or a Cloudflare login page at `/admin` while signed in
 
-- A Cloudflare login page means the old `app.chudware.com/admin*` Access application
-  still exists; delete it in Zero Trust (§b manual steps). The gateway no longer
-  provisions it, so nothing here removes it for you.
+- A Cloudflare login page means someone recreated a self-hosted Access application over
+  `app.chudware.com`; there is none in the account today (§b). Delete it in Zero Trust.
+  The gateway does not provision Access, so nothing here removes it for you.
 - A 403 status page means the session is fine and the account's `role` is not `admin`:
   run `python -m authn grant-admin --email <addr>` and reload.
 
@@ -445,18 +472,28 @@ The ports bind loopback only; do not add them to the Cloudflare tunnel.
 
 Every normal monitor sample also writes a non-sensitive public status object
 to R2 (`s3://chudware-releases/status.json` by default; override with
-`CHUDWARE_STATUS_BUCKET` / `CHUDWARE_STATUS_KEY`). Configure the monitor unit
-with `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`, and `R2_ENDPOINT`; the object
-must be routed to the Pages `https://chudware.com/status.json` path. Until R2
-is enabled (Cloudflare currently returns error 10042), the sampler still
-appends its local JSONL record but exits 2 and names every missing credential
-on stderr rather than pretending the public snapshot was updated. `--dry-run`
+`CHUDWARE_STATUS_BUCKET` / `CHUDWARE_STATUS_KEY`); the object must be routed to the
+Pages `https://chudware.com/status.json` path. **That publisher is optional and is off
+today.** R2 is not enabled on the Cloudflare account — `GET
+/accounts/9a800a5f674233fe127cdb44b395ebfa/r2/buckets` answers error 10042, "Please
+enable R2 through the Cloudflare Dashboard" — so there is no bucket to write to until a
+human enables it. Configuring the monitor unit with `R2_ACCESS_KEY_ID`,
+`R2_SECRET_ACCESS_KEY` and `R2_ENDPOINT` is what switches the publish on; the presence
+of all three *is* the switch, there is no separate opt-in flag. With none of them set
+the sampler still appends its local JSONL record, records
+`status_publish = {"ok": false, "skipped": "r2_not_configured", …}` naming the missing
+variables and error 10042, prints one `monitor: status publish skipped (optional)` line
+on stderr, and **exits 0** — an unconfigured optional publisher must not hold
+`chudware-monitor.service` in `failed`, which is exactly what it did continuously from
+2026-08-24. A *partially* configured or configured-but-broken publisher is still a hard
+failure: loud stderr, `status_publish = {"ok": false, "error": …}`, exit 2. `--dry-run`
 prints the exact public body without touching R2.
 
 `.github/workflows/prod-external-watch.yml` runs every five minutes on
 `cloudcastle-server` (`cc-artifact-host`), never on the production host. It
 checks both `https://app.chudware.com/healthz` and the operational Pages status
-blob. Failures (including DNS, TLS, timeout, malformed or degraded JSON) are
+blob — that second check cannot pass until R2 is enabled and a first status object is
+actually published. Failures (including DNS, TLS, timeout, malformed or degraded JSON) are
 persisted on that runner; only the third consecutive failure opens the exact
 `[prod-watch] Chudware production surface unavailable` issue and sends mail.
 Later failures deduplicate against that open issue and send no more mail. The

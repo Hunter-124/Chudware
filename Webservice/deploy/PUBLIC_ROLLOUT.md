@@ -80,6 +80,21 @@ the Cloudflare Access edge into the gateway itself (`gateway/authn.py`,
   only a fallback credential the gateway accepts from a caller with no session, and
   there is no domain auto-approval knob anywhere — the only paths to `active` are
   email verification and an admin approval.
+- **The Access application itself is now deleted** (verified 2026-09-02). The
+  self-hosted app "Billet Web" — id `a5c88ac6-8364-4fa1-9610-c2ab5dcf9fa8`, the one
+  every hostname used to share so that a single `CHUDWARE_WEB_CF_AUD` validated all of
+  them — no longer exists in the account, and the only Access applications left belong
+  to an unrelated project on `scootware.us`. There is therefore no Access layer in front
+  of the gateway at any path, and no shared AUD to keep unique any more. The code path
+  stays supported for a deployment that wants it, but both
+  `CHUDWARE_WEB_CF_TEAM_DOMAIN` and `CHUDWARE_WEB_CF_AUD` were removed from
+  `gateway.env` on 2026-09-02, because leaving them set with no Access app in
+  front made `auth.py::AuthMiddleware._authenticate` answer an unauthenticated
+  API call with the misleading `{"error":"missing Cf-Access-Jwt-Assertion"}`
+  instead of `not signed in`. Worse, a browser still presenting the deleted
+  app's `CF_Authorization` cookie reached a "CF Access not configured" branch
+  that returned **500**; `_authenticate` now decides whether Access is
+  configured before it looks at any token, so that request is a plain 401.
 
 Admin API: `GET /api/admin/accounts`, `.../approve|deny|suspend|plan`,
 `GET /api/admin/accounts/pending-count`. Self-service: `GET /api/me/account`.
@@ -152,6 +167,21 @@ app.chudware.com                -> cloudflared tunnel -> 127.0.0.1:8300
 app.chudware.com/admin          -> same gateway; chudware_sid + accounts.role='admin'
 ```
 
+The tunnel is `chudware-web`, id `95256541-2ebf-4101-92a1-daecd240c087`. Verified
+2026-09-02 it is healthy on 4 connections and carries exactly three rules plus the
+catch-all:
+
+```text
+app.chudware.com  -> http://127.0.0.1:8300   Chudware gateway
+scootware.us      -> http://127.0.0.1:8320   unrelated project sharing this tunnel
+www.scootware.us  -> http://127.0.0.1:8320   same — not Chudware, not a stray rule
+<catch-all>       -> http_status:404
+```
+
+There is no apex, `www`, or staging rule: `https://chudware.com/` answers 200 from
+Pages, and `https://app.chudware.com/` 303-redirects an HTML request to `/signin`.
+Checking the gateway by curling the apex measures Pages and nothing else.
+
 What was applied, in the order it has to happen:
 
 1. `app.chudware.com` created as a proxied CNAME to
@@ -175,8 +205,9 @@ What was applied, in the order it has to happen:
    2026-08-19:** that scoping is what made an operator meet Cloudflare's login
    page instead of the gateway's, and any browser holding a stale
    `CF_Authorization` cookie was 401'd while carrying a valid session.
-   `cf_provision.py` no longer provisions Access; delete the leftover
-   `app.chudware.com/admin*` application in Zero Trust.
+   `cf_provision.py` no longer provisions Access, and the leftover
+   `app.chudware.com/admin*` application has since been **deleted** — verified
+   2026-09-02, the account holds no Access application over any `chudware.com` host.
 
 Verified from outside the LAN, anonymously, 28/28 checks: every marketing route
 200 with no Access redirect; `/signin`, `/signup` and `/healthz` 200 on the app
@@ -200,7 +231,8 @@ chasing a security regression that is not there.
   `/api/billing/webhook` is in `PUBLIC_PATHS` so it is not gated by the app.
   No `/admin` Access scope exists to sit outside of any more, so no edge bypass is
   required at all.
-- **`cad.scootware.us`** is already gone from Access and the tunnel ingress.
+- **The retired `cad` hostname on `scootware.us`** is fully gone: no Access
+  application, no tunnel ingress, and no DNS record left in that zone.
 - **Watch the queue.** Every registration is created `pending`; only email
   verification (which starts the trial) or an admin approval makes it `active`.
   `GET /api/admin/accounts/pending-count`.
@@ -261,8 +293,10 @@ account queue, per-account workspace isolation, the admin terminal (REST +
 WebSocket + reattach), and the `/app` WASM client booting with a strict CSP.
 
 The marketing site is live at **https://chudware-site.pages.dev** (Cloudflare
-Pages project `chudware-site`). No DNS was changed — `chudware.com` still goes
-to the gateway behind Access. The apex cutover is §5.
+Pages project `chudware-site`). No DNS had been changed *at that date* —
+`chudware.com` still went to the gateway behind Access. **Superseded by §5:** the apex
+and `www` are proxied CNAMEs to the Pages project now, carry no Access wall, and have no
+route to the origin at all; the gateway is reachable only at `app.chudware.com`.
 
 #### Provider-key sharing boundary
 
@@ -514,13 +548,22 @@ Found, NOT fixed — each is a real gap:
   anywhere), and there is no oauth2-proxy unit. The deploy runbook's
   "verify the authenticated surface with `curl -u email:$SECRET`" recipe
   therefore cannot work — it returns `401 missing Cf-Access-Jwt-Assertion` for
-  every path and reads as a catastrophic failure. Use
-  `python -m authn ops-session` (§8) instead, and fix the runbook.
-- **`chudware-monitor.service` is failing every 2 minutes**, exiting 2 with
-  `status publish requires R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, R2_ENDPOINT`.
-  That is the RAM/disk/GPU/session reaper. It is not cosmetic: this host shares
-  `/` with a self-hosted Actions runner whose cache filled the disk on
-  2026-08-10 and took Stalwart's RocksDB down with `No space left on device`.
+  every path and reads as a catastrophic failure. Re-confirmed dead 2026-09-02.
+  Mint a real session row instead — `python -m authn ops-session` (§8), or
+  `authn.create_session("<email>", ttl=datetime.timedelta(minutes=15))` from the gateway
+  venv with `~/chudware-web-data/gateway.env` sourced — and send it as the
+  `chudware_sid` cookie. The runbook recipe is gone and `verify_public.sh` replaced it.
+- ~~**`chudware-monitor.service` is failing every 2 minutes**~~ — **fixed.** It exited 2
+  with `status publish requires R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, R2_ENDPOINT` and
+  so sat in `failed` continuously from 2026-08-24, taking the RAM/disk/GPU/session
+  reaper down with it. The status publish is an *optional* publisher now: with none of
+  the three R2 variables set the sampler prints one skip line, records the skip in its
+  JSONL sample, and exits 0; partially configured or genuinely broken still exits 2. R2
+  itself is **still not enabled on the account** — `GET /accounts/<id>/r2/buckets`
+  answers error 10042 — so the publish stays off until a human enables R2 in the
+  dashboard. Keeping the sampler alive is not cosmetic: this host shares `/` with a
+  self-hosted Actions runner whose cache filled the disk on 2026-08-10 and took
+  Stalwart's RocksDB down with `No space left on device`.
 - **The Cloudflare API token and R2 keys in `Webservice/Cloudflare-info.txt` are
   compromised** — the file says so itself; they were committed in `84963165`
   and are still the live credentials. Rotate them.

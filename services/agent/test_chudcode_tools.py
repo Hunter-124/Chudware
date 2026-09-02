@@ -183,6 +183,25 @@ class HostToolDefinitionTests(unittest.TestCase):
         context["policy_registry"] = _Policy({"cnc_execute"})
         self.assertEqual([item.name for item in build_host_tools(context)], ["alpha"])
 
+    def test_every_binding_carries_a_description_including_the_meta_floor(self):
+        """Chudcode rejects a whole set_host_tools call over one empty description, so an
+        undocumented tool takes the entire turn down with
+        `provider_error - set_host_tools: Host tool "..." must provide a non-empty
+        description` before any tool runs. enable_tools/list_tool_categories are the
+        exposure: they have no registry entry, so their description can only come from the
+        handler docstring, and they are on the meta floor of every restricted mode."""
+        entries = OrderedDict((("alpha", _entry(_alpha, "ordinary")),))
+        bindings = build_host_tools(
+            _context(entries, mode="agent", allowed_tools=["alpha"])
+        )
+        names = [binding.name for binding in bindings]
+        self.assertIn("enable_tools", names)
+        self.assertIn("list_tool_categories", names)
+        self.assertEqual(
+            [binding.name for binding in bindings if not binding.description.strip()],
+            [],
+        )
+
 
 class HostToolDispatchTests(unittest.TestCase):
     def _binding(self, name="alpha", handler=_alpha, **context):

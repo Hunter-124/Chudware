@@ -32,6 +32,11 @@ _MAX_DOCTOR_OUTPUT_CHARS = 2_097_152
 _MAX_DOCTOR_FINDINGS = 128
 _MAX_DOCTOR_MESSAGE_CHARS = 4_096
 
+# Mirrors kAbsoluteCap in core/agent/run.cpp. The live per-turn controls are that file's
+# 5-minute idle timeout and the Stop button; this is only a backstop so a stream that dies
+# without a terminal agent_end cannot block a worker thread forever.
+_TURN_ABSOLUTE_CAP_SECONDS = 2 * 60 * 60.0
+
 _LOG = logging.getLogger(__name__)
 
 _AUTH_SHAPES: dict[str, tuple[frozenset[str], frozenset[str]]] = {
@@ -200,9 +205,21 @@ class ChudcodeSessionHost:
 
                 for text in pending_steers:
                     session.client.steer(text)
+                # `wait_for_idle(timeout=None)` inherits the RPC client's own 60s default,
+                # which is a short-wait default and not a turn budget: nothing in CAD ever
+                # set `timeout`, so EVERY online turn was killed at 60 seconds with
+                # `provider_error - Timed out waiting for agent_end` and an empty stderr,
+                # mid-build, while the agent was still healthy and working. Live policy
+                # belongs to the transport that owns cancellation: core/agent/run.cpp gives
+                # the worker a 5-minute idle timeout and a 2-hour absolute cap, and the Stop
+                # button is polled every 200ms. This bound only exists so a stream that
+                # stops without a terminal frame cannot wait forever, so it matches that
+                # absolute cap instead of pre-empting it.
                 timeout = params.get("timeout")
                 session.client.wait_for_idle(
-                    timeout=float(timeout) if timeout is not None else None
+                    timeout=float(timeout)
+                    if timeout is not None
+                    else _TURN_ABSOLUTE_CAP_SECONDS
                 )
 
                 terminal = next(

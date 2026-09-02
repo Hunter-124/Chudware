@@ -497,9 +497,22 @@ def _meta_handler(name: str) -> Callable[..., Any] | None:
     # These two calls are turn-loop primitives rather than MCP registrations.
     # Giving them real callables lets the host schema path treat them exactly
     # like the rest of the effective surface without inventing registry entries.
+    #
+    # The docstrings are load-bearing: with no registry entry to read a
+    # description from, _entry_description falls back to inspect.getdoc, and
+    # Chudcode rejects a whole set_host_tools call that carries a tool with an
+    # empty description. Both names sit on the shared floor of every mode, so an
+    # undocumented handler here failed EVERY turn with
+    # `provider_error - set_host_tools: Host tool "enable_tools" must provide a
+    # non-empty description` before a single tool ran.
     if name == "list_tool_categories":
 
         def list_tool_categories() -> dict[str, Any]:
+            """List the CAD tool category packs available to this turn.
+
+            Returns each pack's name, what it covers, and the tools it would add,
+            so a category can be chosen before calling enable_tools.
+            """
             from services.agent.agent_turn import _tool_category_catalog_result
 
             return _tool_category_catalog_result()
@@ -508,6 +521,12 @@ def _meta_handler(name: str) -> Callable[..., Any] | None:
     if name == "enable_tools":
 
         def enable_tools(categories: list[str]) -> dict[str, Any]:
+            """Add CAD tool category packs to this turn's callable tool set.
+
+            Most modeling, sketch, simulation and export tools are not loaded up
+            front. Enable the packs the task needs (see list_tool_categories),
+            then call the tools they add.
+            """
             from services.agent.tool_categories import resolve_categories
 
             return {

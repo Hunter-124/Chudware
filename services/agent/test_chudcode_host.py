@@ -14,6 +14,7 @@ from services.agent import chudcode_host as chudcode_host_module
 
 from services.agent.chudcode_host import (
     ChudcodeSessionHost,
+    _TURN_ABSOLUTE_CAP_SECONDS,
     _WIRE_NAME_OVERRIDES,
     _camel,
     _set_default_chudcode_host_for_tests,
@@ -46,6 +47,7 @@ class FakeClient:
         self.stt_available = True
         self.stt_state = "idle"
         self.stt_progress = None
+        self.idle_timeouts: list[float | None] = []
 
     def start(self):
         self.started = True
@@ -83,7 +85,10 @@ class FakeClient:
             self.release.set()
 
     def wait_for_idle(self, timeout=None):
-        if not self.release.wait(timeout if timeout is not None else 2.0):
+        # Record what the host asked for, but never actually sleep on it: the production
+        # budget is hours, and this double only needs the release latch.
+        self.idle_timeouts.append(timeout)
+        if not self.release.wait(2.0):
             raise TimeoutError("fake terminal wait timed out")
         for event in self.events:
             for listener in tuple(self.listeners):
@@ -953,6 +958,24 @@ def test_shutdown_cancels_an_inflight_transient_login_once():
     assert not thread.is_alive()
     assert factory.clients[0].stop_count == 1
     assert "result" in outcome
+
+
+def test_turn_budget_is_explicit_and_not_the_rpc_client_short_wait_default():
+    """Passing no timeout inherits chudcode-rpc's 60s `_wait_for_agent_end` default, which
+    killed every real modeling turn mid-build with `Timed out waiting for agent_end` and an
+    empty stderr. The host must name its own budget; a caller-supplied timeout still wins."""
+    factory = FakeFactory()
+    host = ChudcodeSessionHost(client_factory=factory)
+    try:
+        result, _events = run(host, "budget")
+        assert result["ok"] is True
+        assert factory.clients[0].idle_timeouts == [_TURN_ABSOLUTE_CAP_SECONDS]
+        assert _TURN_ABSOLUTE_CAP_SECONDS > 60.0
+
+        run(host, "budget", run_id="run-budget-2", timeout=12)
+        assert factory.clients[0].idle_timeouts[-1] == 12.0
+    finally:
+        host.shutdown()
 
 
 def test_default_host_accessor_is_lazy_and_process_global():

@@ -32,6 +32,11 @@ opencv-python-headless==5.0.0.93
 mcp==1.27.2
 # Persistent online-agent embedding.  The wheel owns protocol/process mechanics; the
 # separately signed payload supplies the adjacent compiled ``chud`` executable.
+# NOT on PyPI — the Chudcode repository is private (docs/RELEASING.md). Build it from the
+# checkout named by vendor/chudcode/CHUDCODE_ARTIFACT.lock:
+#   pip install <chudcode-checkout>/python/chudcode-rpc
+# Without it every chudcode_* worker RPC refuses and Settings -> Providers reports a failed
+# service call rather than an empty provider set.
 chudcode-rpc==0.2.0       # MIT — typed RPC v2 client; compiled chud ships separately
 # built-in agent provider adapters
 anthropic==0.107.1

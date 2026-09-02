@@ -1485,7 +1485,19 @@ def _prompt_payload(
     return prompt, images
 
 
+# Chudcode's RPC wire names are lowerCamelCase of the client's snake_case dataclass fields,
+# EXCEPT where the name carries an internal acronym: the protocol spells `has_oauth` as
+# `hasOAuth`, which naive per-piece capitalization renders `hasOauth`. That one character cost
+# every OAuth-connected provider its `oauth_connected` state (the GUI read `hasOAuth`, got
+# nothing, and reported anthropic/kimi-code/openai-codex as signed out). Overrides are keyed by
+# field name, and test_chudcode_host asserts every protocol field resolves to a real wire key.
+_WIRE_NAME_OVERRIDES = {"has_oauth": "hasOAuth"}
+
+
 def _camel(name: str) -> str:
+    override = _WIRE_NAME_OVERRIDES.get(name)
+    if override is not None:
+        return override
     head, *tail = name.split("_")
     return head + "".join(piece[:1].upper() + piece[1:] for piece in tail)
 

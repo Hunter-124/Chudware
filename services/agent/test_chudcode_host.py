@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import ast
+import inspect
 import json
 import sys
 import threading
@@ -12,6 +14,8 @@ from services.agent import chudcode_host as chudcode_host_module
 
 from services.agent.chudcode_host import (
     ChudcodeSessionHost,
+    _WIRE_NAME_OVERRIDES,
+    _camel,
     _set_default_chudcode_host_for_tests,
     get_default_chudcode_host,
 )
@@ -994,15 +998,22 @@ def test_real_rpc_client_protocol_covers_transient_and_live_session_calls(tmp_pa
                     "maxTokens": 8192,
                 }
 
-            print(json.dumps({"type": "ready", "protocolVersion": 2}), flush=True)
+            # The client only upgrades to v2 when ready advertises the version set AND the
+            # exact frame limits it compiled against, then confirms with negotiate_protocol.
+            print(json.dumps({"type": "ready", "protocolVersion": 1, "supportedProtocolVersions": [1, 2], "maxFrameBytes": 1024 * 1024, "maxReassembledFrameBytes": 64 * 1024 * 1024}), flush=True)
             for line in sys.stdin:
                 command = json.loads(line)
                 kind = command["type"]
                 request_id = command.get("id")
+                if kind == "negotiate_protocol":
+                    respond(request_id, kind, {"protocolVersion": 2})
+                    continue
                 if kind == "get_login_providers":
                     respond(request_id, kind, {"providers": [{"id": "openai", "name": "OpenAI", "available": True, "authenticated": False}]})
                 elif kind == "get_available_models":
                     respond(request_id, kind, {"models": [model()]})
+                elif kind == "get_auth_state":
+                    respond(request_id, kind, {"providers": [{"providerId": "anthropic", "name": "Anthropic", "authenticated": True, "hasApiKey": False, "hasOAuth": True, "accounts": [], "origin": "oauth"}]})
                 elif kind == "login":
                     print(json.dumps({"type": "extension_ui_request", "id": "oauth", "method": "open_url", "url": "https://login.example/authorize"}), flush=True)
                     respond(request_id, kind, {"providerId": command["providerId"]})
@@ -1069,6 +1080,11 @@ def test_real_rpc_client_protocol_covers_transient_and_live_session_calls(tmp_pa
 
     assert host.transient_call("get_login_providers")["providers"][0]["id"] == "openai"
     assert host.transient_call("get_available_models")["models"][0]["id"] == "model-1"
+    # The acronym must survive dataclass parse -> re-serialization: `hasOauth` reads as False
+    # downstream and demotes an OAuth-connected provider to "signed out".
+    auth = host.transient_call("get_auth_state")["providers"][0]
+    assert auth["hasOAuth"] is True
+    assert "hasOauth" not in auth
     assert host.transient_call(
         "login", {"providerId": "openai"}, emit=emitted.append
     ) == {"providerId": "openai"}
@@ -1086,3 +1102,34 @@ def test_real_rpc_client_protocol_covers_transient_and_live_session_calls(tmp_pa
     assert host.session_call("live", "stt_cancel")["state"] == "idle"
     assert emitted[0]["kind"] == "open_url"
     host.shutdown()
+
+
+def test_dataclass_wire_names_match_every_protocol_key():
+    """`_camel` reconstructs Chudcode wire JSON from the client's snake_case dataclasses, so a
+    field whose real wire key carries an internal acronym (`has_oauth` -> `hasOAuth`) silently
+    disappears from the GUI payload. Pair every `field=_require_x(payload, "wireKey")` in the
+    installed protocol module and assert the reconstruction is exact, so the next such field
+    fails here instead of reporting an authenticated provider as signed out."""
+    protocol = pytest.importorskip("chudcode_rpc.protocol")
+    tree = ast.parse(inspect.getsource(protocol))
+    pairs = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        for keyword in node.keywords:
+            if keyword.arg is None or not isinstance(keyword.value, ast.Call):
+                continue
+            args = keyword.value.args
+            if len(args) < 2:
+                continue
+            reader, key = args[0], args[1]
+            if not isinstance(reader, ast.Name) or reader.id != "payload":
+                continue
+            if isinstance(key, ast.Constant) and isinstance(key.value, str):
+                pairs.add((keyword.arg, key.value))
+
+    assert ("has_oauth", "hasOAuth") in pairs, "protocol no longer parses hasOAuth"
+    mismatched = sorted((field, wire) for field, wire in pairs if _camel(field) != wire)
+    assert not mismatched, f"_camel does not reproduce the wire keys: {mismatched}"
+    stale = sorted(set(_WIRE_NAME_OVERRIDES) - {field for field, _ in pairs})
+    assert not stale, f"overrides for fields the protocol no longer has: {stale}"

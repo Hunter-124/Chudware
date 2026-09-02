@@ -504,17 +504,23 @@ class AuthMiddleware:
                             )
                     raise
 
-        token = headers.get("cf-access-jwt-assertion") or cookies.get("CF_Authorization")
-        if not token:
-            # Distinguish "this deployment expects an Access assertion and got
-            # none" from "you are simply not signed in", which is what a
-            # self-serve visitor actually is.
-            if self.cfg.cf_team_domain and self.cfg.cf_aud:
-                raise AuthError("missing Cf-Access-Jwt-Assertion", status=401)
+        # Cloudflare Access is an OPTIONAL second credential, so decide whether
+        # it is even configured before looking at what the caller sent. With no
+        # team domain and no audience there is nothing to verify a token
+        # against, and the caller is simply not signed in.
+        #
+        # The order matters because a `CF_Authorization` cookie outlives the
+        # Access application that minted it — browsers kept presenting ours for
+        # weeks after that app was deleted. Testing the token first meant such a
+        # cookie reached a "CF Access not configured" branch that answered 500,
+        # letting a stale client-side cookie turn every page of a self-serve
+        # deployment into a server error.
+        if not (self.cfg.cf_team_domain and self.cfg.cf_aud):
             raise AuthError("not signed in", status=401)
 
-        if not self.cfg.cf_team_domain or not self.cfg.cf_aud:
-            raise AuthError("CF Access not configured", status=500)
+        token = headers.get("cf-access-jwt-assertion") or cookies.get("CF_Authorization")
+        if not token:
+            raise AuthError("missing Cf-Access-Jwt-Assertion", status=401)
 
         if self._jwks is None:
             self._jwks = JWKSCache(self.cfg.cf_jwks_url)

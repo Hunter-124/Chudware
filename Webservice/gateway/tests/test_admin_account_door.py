@@ -13,9 +13,12 @@ Nothing pinned the precedence, which is why it could be written that way at
 all. These tests pin it: the session cookie decides first, Access is only a
 fallback for a caller that has no session, and the fallback is not a bypass.
 
-Cloudflare Access is CONFIGURED throughout (``cf_team_domain`` + ``cf_aud``) so
-that every "an assertion rides along" case exercises the real branch ordering
-rather than passing because the edge path was unreachable.
+Cloudflare Access is CONFIGURED for the ``client`` fixture (``cf_team_domain`` +
+``cf_aud``) so that every "an assertion rides along" case exercises the real
+branch ordering rather than passing because the edge path was unreachable.
+``self_serve_client`` is the opposite deployment — no Access at all, which is
+what production became once the Access application was deleted — and pins that
+a leftover edge cookie is answered as "not signed in" rather than as a fault.
 """
 
 from __future__ import annotations
@@ -82,6 +85,39 @@ def client(pg):
     inner.add_middleware(auth.AuthMiddleware, cfg=cfg)
     with TestClient(inner, base_url="https://testserver") as c:
         yield c
+
+
+@pytest.fixture()
+def self_serve_client(pg):
+    """A self-serve deployment: session secret only, no Cloudflare Access.
+
+    This is production. The Access application in front of the gateway was
+    deleted, so ``cf_team_domain``/``cf_aud`` describe an edge that no longer
+    exists — while browsers that once completed Access keep presenting the
+    ``CF_Authorization`` cookie it minted.
+    """
+    import copy  # noqa: PLC0415
+
+    import auth  # noqa: PLC0415
+    from config import settings  # noqa: PLC0415
+
+    cfg = copy.copy(settings)
+    cfg.dev_mode = False
+    cfg.session_secret = "test-session-secret"
+    cfg.cf_team_domain = ""
+    cfg.cf_aud = ""
+
+    inner = FastAPI()
+
+    @inner.get("/admin")
+    async def admin(request: Request):
+        user = auth.get_current_user(request)
+        return {"email": user.email, "role": user.role}
+
+    inner.add_middleware(auth.AuthMiddleware, cfg=cfg)
+    with TestClient(inner, base_url="https://testserver") as c:
+        yield c
+
 
 
 def _session_for(email: str, *, role: str = "user") -> str:
@@ -197,3 +233,40 @@ def test_suspending_an_admin_ends_its_session_even_with_an_assertion(client):
 
     assert r.status_code == 403
     assert authn.lookup_session(sid) is None
+
+
+def test_stale_access_cookie_is_not_a_fault_without_access(self_serve_client):
+    """A cookie the caller cannot stop sending must never be a 5xx.
+
+    ``CF_Authorization`` outlives the Access application that minted it. The
+    token branch used to be entered before the "is Access even configured"
+    check, so this exact request answered 500 — a stale client-side cookie
+    turning every page of a self-serve deployment into a server error.
+    """
+    r = self_serve_client.get("/admin", cookies={"CF_Authorization": STALE_CF_TOKEN})
+
+    assert r.status_code == 401
+    assert r.json()["error"] == "not signed in"
+
+
+def test_stale_access_header_is_not_a_fault_without_access(self_serve_client):
+    """Same for the header form: nothing to verify it against is not a fault."""
+    r = self_serve_client.get(
+        "/admin", headers={"Cf-Access-Jwt-Assertion": STALE_CF_TOKEN}
+    )
+
+    assert r.status_code == 401
+    assert r.json()["error"] == "not signed in"
+
+
+def test_a_live_session_still_wins_without_access(self_serve_client):
+    """The front door is unaffected by removing the edge."""
+    sid = _session_for("haedmonds69@gmail.com", role="admin")
+
+    r = self_serve_client.get(
+        "/admin",
+        cookies={_session_cookie(): sid, "CF_Authorization": STALE_CF_TOKEN},
+    )
+
+    assert r.status_code == 200
+    assert r.json() == {"email": "haedmonds69@gmail.com", "role": "admin"}

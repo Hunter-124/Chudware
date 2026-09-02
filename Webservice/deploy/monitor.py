@@ -242,17 +242,32 @@ def public_status(record: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+# Raised ONLY when the R2 status publisher was never switched on at all (none of
+# the three variables set — the current state, since R2 itself is not enabled on
+# the Cloudflare account). It must NOT fail the unit: chudware-monitor.service is
+# a Type=oneshot driven by a two-minute timer, so one non-zero exit pins it in
+# `failed` indefinitely, and a permanently red unit is indistinguishable from a
+# real host-monitor outage — which is the actual thing the timer exists to
+# surface (disk pressure, a dead gateway, leaked sessions). A half-configured
+# publisher or a failed upload is a genuine fault and stays a loud RuntimeError.
+class StatusPublishUnconfigured(RuntimeError):
+    """The optional R2 status publisher is switched off, not broken."""
+
+
 def publish_status(record: dict[str, Any]) -> dict[str, Any]:
     """Publish the Pages status JSON through R2's S3-compatible API."""
     required = ("R2_ACCESS_KEY_ID", "R2_SECRET_ACCESS_KEY", "R2_ENDPOINT")
     missing = [name for name in required if not (os.environ.get(name) or "").strip()]
     if missing:
-        raise RuntimeError(
+        detail = (
             "status publish requires "
             + ", ".join(missing)
             + "; add them to the chudware-monitor service environment "
             "(R2 is not enabled until Cloudflare error 10042 is resolved)"
         )
+        if len(missing) == len(required):
+            raise StatusPublishUnconfigured(detail)
+        raise RuntimeError(detail)
     if boto3 is None:
         raise RuntimeError(
             "status publish requires boto3; install it for /usr/bin/python3 "
@@ -483,6 +498,15 @@ def main(argv: list[str] | None = None) -> int:
     publish_failed = False
     try:
         record["status_publish"] = publish_status(record)
+    except StatusPublishUnconfigured as exc:
+        # Deliberately off, so the sample still lands and the unit stays green;
+        # one line on stderr keeps it visible in `journalctl -u chudware-monitor`.
+        record["status_publish"] = {
+            "ok": False,
+            "skipped": "r2_not_configured",
+            "detail": str(exc),
+        }
+        print(f"monitor: status publish skipped (optional): {exc}", file=sys.stderr)
     except Exception as exc:  # noqa: BLE001 — preserve the local sampler record
         publish_failed = True
         record["status_publish"] = {"ok": False, "error": str(exc)}

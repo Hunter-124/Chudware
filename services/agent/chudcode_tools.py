@@ -260,7 +260,32 @@ def _effective_names(context: Any, available: Sequence[str]) -> list[str]:
             _debug_fallback("mutation verification floor", exc)
 
     if names is None and not restricted:
-        return _ordered_unique(available)
+        # Unrestricted: the whole live registry. `enable_tools` and
+        # `list_tool_categories` are turn-loop primitives, not registry entries, so an
+        # unrestricted surface is the ONE case that loses them -- the meta floor above is
+        # guarded on `names is not None`. That is backwards: they are the model's on-ramp
+        # for managing a large tool surface, and a roleless `agent` turn (allowed_tools
+        # explicitly None, which is what agent_admin_turn sends) is exactly where the
+        # surface is largest. Live symptom: the model reasoned "I'll enable the modeling
+        # and sketch tool categories", found no such tool, and fell back to `bash` and
+        # `write` for the rest of the turn without ever touching CAD geometry.
+        unrestricted = _ordered_unique(available)
+        try:
+            from services.agent.copilot_mode_tools import apply_meta_tool_floor
+
+            floored = apply_meta_tool_floor(unrestricted)
+            if floored is not None:
+                # Append only what the floor ADDS. Live registry order is this list's
+                # contract (it is the order the model sees), and the floor helper returns
+                # its own ordering, so adopting it wholesale would reshuffle the catalog.
+                present = set(unrestricted)
+                unrestricted = [
+                    *unrestricted,
+                    *(name for name in floored if name not in present),
+                ]
+        except Exception as exc:  # noqa: BLE001 - optional mode floor
+            _debug_fallback("meta-tool floor", exc)
+        return unrestricted
     return _ordered_unique(names or ())
 
 

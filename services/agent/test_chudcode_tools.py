@@ -57,6 +57,10 @@ def _entry(fn, description, schema=None, load_mode="always", cad_owned=False):
     )
 
 
+# Turn-loop primitives the adapter floors onto every surface, restricted or not.
+_META_FLOOR = frozenset({"enable_tools", "list_tool_categories"})
+
+
 def _context(entries, **extra):
     context = {
         "tool_entries": entries,
@@ -88,7 +92,12 @@ class HostToolDefinitionTests(unittest.TestCase):
         )
         bindings = build_host_tools(_context(entries, allowed_tools=None))
 
-        self.assertEqual([binding.name for binding in bindings], list(entries))
+        # Registry order is preserved as the leading prefix; the meta floor follows it.
+        names = [binding.name for binding in bindings]
+        self.assertEqual(names[: len(entries)], list(entries))
+        self.assertEqual(
+            sorted(names[len(entries) :]), ["enable_tools", "list_tool_categories"]
+        )
         self.assertEqual(bindings[0].description, entries["alpha"].description)
         self.assertEqual(bindings[0].input_schema, alpha_schema)
         self.assertEqual(bindings[0].load_mode, "deferred")
@@ -170,7 +179,11 @@ class HostToolDefinitionTests(unittest.TestCase):
         context = _context(entries, allowed_tools=None)
         context.pop("chudcode_builtin_names")
         names = [binding.name for binding in build_host_tools(context)]
-        self.assertEqual(names, ["write", "cad_unique"])
+        # The meta floor rides along on every surface; the collision verdict is about
+        # `read` (dropped, unowned) versus `write` (kept, explicitly cad_owned).
+        self.assertEqual(
+            [name for name in names if name not in _META_FLOOR], ["write", "cad_unique"]
+        )
 
     def test_effective_policy_removes_manufacturing_execution_tools(self):
         entries = OrderedDict(
@@ -181,7 +194,14 @@ class HostToolDefinitionTests(unittest.TestCase):
         )
         context = _context(entries, allowed_tools=None)
         context["policy_registry"] = _Policy({"cnc_execute"})
-        self.assertEqual([item.name for item in build_host_tools(context)], ["alpha"])
+        self.assertEqual(
+            [
+                item.name
+                for item in build_host_tools(context)
+                if item.name not in _META_FLOOR
+            ],
+            ["alpha"],
+        )
 
     def test_every_binding_carries_a_description_including_the_meta_floor(self):
         """Chudcode rejects a whole set_host_tools call over one empty description, so an
@@ -201,6 +221,28 @@ class HostToolDefinitionTests(unittest.TestCase):
             [binding.name for binding in bindings if not binding.description.strip()],
             [],
         )
+
+    def test_unrestricted_surface_still_carries_the_meta_tool_floor(self):
+        """`allowed_tools=None` is what agent_admin_turn sends for an ordinary agent turn.
+        The meta floor was guarded on a restriction existing, so the ONE case with the
+        largest tool surface was also the only one without `enable_tools` /
+        `list_tool_categories` -- they are turn-loop primitives, not registry entries, so
+        the unrestricted registry passthrough cannot supply them. The model then reasoned
+        about enabling tool categories, found no such tool, and spent the turn in `bash`
+        and `write` instead of CAD geometry."""
+        entries = OrderedDict(
+            (("alpha", _entry(_alpha, "ordinary")), ("beta", _entry(_beta, "ordinary")))
+        )
+        names = [
+            binding.name
+            for binding in build_host_tools(
+                _context(entries, mode="agent", allowed_tools=None)
+            )
+        ]
+        self.assertIn("alpha", names)
+        self.assertIn("beta", names)
+        self.assertIn("enable_tools", names)
+        self.assertIn("list_tool_categories", names)
 
 
 class HostToolDispatchTests(unittest.TestCase):

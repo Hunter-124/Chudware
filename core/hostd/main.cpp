@@ -416,15 +416,15 @@ static int controlCommand(const char* method,
 }
 
 int main(int argc, char** argv) {
-    const std::filesystem::path executable = selfPath();
-    const auto integrity = chudware::security::verifyInstalledPayload(
-        executable, chudware::security::VerifyMode::Startup);
-    if (!integrity.ok) {
-        std::fprintf(stderr, "chudware-hostd: installed payload integrity failed (%s): %s\n",
-                     chudware::security::integrityReasonName(integrity.reason),
-                     integrity.detail.c_str());
-        return chudware::security::kIntegrityFailureExitCode;
-    }
+    // Argv dispatch comes BEFORE payload verification, deliberately. The control
+    // verbs below either print a compile-time constant or talk to an already-running
+    // daemon over the control socket; none of them dlopens a byte of the signed
+    // payload, so hashing ~800 MB of it first bought nothing and cost ~2.7 s EACH.
+    // That was not a one-off: services/ipc/ipc_client.cpp diskBuildId() execs
+    // `chudware-hostd --version` on every connect to compare build ids, so a single
+    // GUI launch paid this toll repeatedly before the tray icon could appear.
+    // The gate that matters guards the daemon path below — the one that loads
+    // libchudware — and it still runs unconditionally there.
     std::string mode = argc > 1 ? argv[1] : "";
     if (mode == "--version") {
         // ONE line, "chudware-hostd <build-id>", and it must stay that way: two
@@ -461,6 +461,16 @@ int main(int argc, char** argv) {
         std::fprintf(stderr,
                      "usage: chudware-hostd [--foreground|--status|--stop [--force]|--version]\n");
         return 2;
+    }
+
+    const std::filesystem::path executable = selfPath();
+    const auto integrity = chudware::security::verifyInstalledPayload(
+        executable, chudware::security::VerifyMode::Startup);
+    if (!integrity.ok) {
+        std::fprintf(stderr, "chudware-hostd: installed payload integrity failed (%s): %s\n",
+                     chudware::security::integrityReasonName(integrity.reason),
+                     integrity.detail.c_str());
+        return chudware::security::kIntegrityFailureExitCode;
     }
 
     const std::string self = selfPath();

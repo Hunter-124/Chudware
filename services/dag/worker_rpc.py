@@ -20,8 +20,22 @@ import json
 from pathlib import Path
 from typing import Callable
 
-from services.dag.executor import default_runs_dir as _runs_dir
 from services.dag.run_ids import validate_run_id
+
+
+def _runs_dir() -> Path:
+    """Resolve the default runs dir, importing the executor only when asked.
+
+    ``services.dag.executor`` drags in langgraph -> langchain_core -> langsmith ->
+    pydantic_core: 352 ms of the services worker's 457 ms import, for this one
+    symbol. hostd spawns the worker lazily on the first engine-unknown RPC and
+    serves it behind a single process-wide mutex, so that import lands squarely in
+    front of the first Settings/PLM call the GUI makes after connecting. Keep this
+    import inside the function.
+    """
+    from services.dag.executor import default_runs_dir
+
+    return default_runs_dir()
 
 
 def _dag_status(params: dict, _emit: Callable) -> dict:

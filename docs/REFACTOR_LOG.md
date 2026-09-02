@@ -1671,3 +1671,55 @@ implementations and Chudware stays authoritative for CAD state.
 
 Documentation/skill-only verification was deliberately limited to repository reference
 audits, per this coordinated wave's instruction to skip gates and formatters.
+
+## Cold-start latency: payload verification was the whole bill (2026-09-02)
+
+**Symptom.** On a packaged install the tray icon took ~20 s to appear and the app another
+~6 s to connect. Reproduced against `/opt/chudware` (0.1.2-beta.41): window at 3.0 s,
+`hostd-<key>.sock` at 19.9 s, tray at 20.0 s, `[engine] daemon mode: connected` at 25.9 s,
+with `eu-stack` showing the GUI main thread parked in `__pthread_once_slow` — i.e. inside
+`services/worker/engine_backend.cpp`'s `initOnce` — for the whole 3–20 s window.
+
+**Cause.** `verifyInstalledManifestEntry` / `verifyInstalledManifestHeld` asked for
+`VerifyMode::Startup`, which hashes every executable/library/worker/policy row plus 1-in-16
+resources — 835 MB of the 922 MB manifest — merely to authenticate the manifest before
+checking ONE named row. `resolveHostdBin()` (`services/ipc/ipc_discovery.cpp:113`) calls it
+on every invocation, and `EngineClient::connectInner`/`connectOrSpawn` call *that* four times
+per connect; `diskBuildId()` then execs `chudware-hostd --version`, whose `main()` ran the
+same 835 MB pass before argv was even parsed. One launch paid the full-payload hash ~8 times
+at ~2.7 s each. Scalar SHA-256 at ~310 MB/s, single-threaded, with `libcef.so` alone at
+437 MB.
+
+**Fix.** Four independent changes, all in the verifier and its callers:
+`VerifyMode::ManifestOnly` (signature + schema + path-safety, hashes nothing) for the
+single-row verifiers; argv dispatch moved ahead of the payload gate in `core/hostd/main.cpp`
+and `host/src/main.cpp` (`--version`/`--status`/`--stop` load no payload — the gate still runs
+unconditionally for every path that starts the app or the daemon); the per-file hashing fanned
+out across cores with verdicts written by index so the reported first failure stays
+manifest-ordered; and `Sha256` given a bulk-block `append` plus an x86-64 SHA-NI compression
+path behind `__builtin_cpu_supports`, with the portable scalar path retained.
+
+**Measured** against the real signed payload: `Startup` 2700 ms -> 296 ms (9.1x),
+`verifyInstalledManifestEntry` 2700 ms -> 6 ms (450x), `ManifestOnly` 3.6 ms. All 411 signed
+rows still verify; tamper detection and deterministic first-failure ordering re-checked by
+byte-flipping one and then two library rows in a copied payload. Repo (developer) build headed
+launch for comparison: window 0.32 s, socket 0.95 s, tray 1.26 s, main thread never blocked.
+
+**Also.** `services/dag/worker_rpc.py` imported `services.dag.executor` at module scope for
+one symbol, dragging langgraph -> langchain_core -> langsmith -> pydantic_core into the
+services worker: 352 ms of its 457 ms import, paid behind `WorkerBridge`'s single
+process-wide mutex on the first engine-unknown RPC after the GUI connects. Now imported
+inside `_runs_dir()`; worker import 457 ms -> 86 ms, and a cold worker-routed `dag_status`
+round-trip through a real daemon is 0.47 s.
+
+**Gotchas / deferred.** `VerifyMode::ProtectedOperation` also hashes 817 MB and runs before
+every protected child spawn (`worker_client.cpp:1204`, `worker_bridge.cpp:471`,
+`child_supervisor.cpp:279`, `core/agent/run.cpp:667`); it is now ~300 ms rather than ~2.6 s,
+but it is still paid per spawn — deliberately, since caching a verdict across spawns is
+exactly the tampering window it exists to close. Untouched and still true: `initOnce` and
+`waitEngineReady` (300 s deadline, 100 ms poll) run synchronously on the GL thread with no
+event pump, so a genuinely slow engine load still freezes the window rather than showing
+progress; and `Server::Server` -> `mfg::tryLane()` replays `journal.jsonl` twice before
+`trayStart`/`accept` (357 KB, ~20 ms today, but append-only with no compaction). Pre-existing
+and unrelated: the `test_aicm_cpp` target does not compile (`host/src/render/ref_datum_geom.h`
+includes a `vec_math.h` that does not exist, from 369d56676).

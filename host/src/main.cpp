@@ -561,30 +561,14 @@ int main(int argc, char** argv) {
         std::fflush(nullptr);
         std::_Exit(0);
     }
-#ifdef _WIN32
-    {
-        std::string recoveryError;
-        if (!chudware::update::recoverPendingWindowsUpdate(executable, &recoveryError)) {
-            std::fprintf(stderr, "chudware: update recovery failed: %s\n", recoveryError.c_str());
-            std::fflush(nullptr);
-            std::_Exit(79);
-        }
-    }
-#endif
-    {
-        const auto verified = chudware::security::verifyInstalledPayload(
-            executable, chudware::security::VerifyMode::Startup);
-        if (!verified.ok) {
-            std::fprintf(stderr, "chudware: installed payload integrity failed (%s): %s\n",
-                         chudware::security::integrityReasonName(verified.reason),
-                         verified.detail.c_str());
-            std::fflush(nullptr);
-            std::_Exit(chudware::security::kIntegrityFailureExitCode);
-        }
-    }
     // `chudware --version` — first thing checked, before CEF stashes argv and long
     // before GLFW/X11 or the single-instance lock. Support triage and the installer
     // must be able to read the version out of a binary that cannot start a GUI.
+    //
+    // It also precedes the payload-integrity gate below, deliberately: this prints a
+    // compile-time constant and loads nothing from the signed payload, so hashing
+    // ~800 MB of it first only made a version query take ~2.7 s. The gate still runs
+    // unconditionally for every path that actually starts the app.
     //
     // OUTPUT FORMAT IS A CONTRACT: exactly ONE line on stdout,
     // "chudware <semver> (<sha>, <date>)", nothing before or after it. Packaging
@@ -608,6 +592,27 @@ int main(int argc, char** argv) {
             // file, taken no lock and touched no engine: nothing to unwind.
             std::fflush(nullptr);
             std::_Exit(0);
+        }
+    }
+#ifdef _WIN32
+    {
+        std::string recoveryError;
+        if (!chudware::update::recoverPendingWindowsUpdate(executable, &recoveryError)) {
+            std::fprintf(stderr, "chudware: update recovery failed: %s\n", recoveryError.c_str());
+            std::fflush(nullptr);
+            std::_Exit(79);
+        }
+    }
+#endif
+    {
+        const auto verified = chudware::security::verifyInstalledPayload(
+            executable, chudware::security::VerifyMode::Startup);
+        if (!verified.ok) {
+            std::fprintf(stderr, "chudware: installed payload integrity failed (%s): %s\n",
+                         chudware::security::integrityReasonName(verified.reason),
+                         verified.detail.c_str());
+            std::fflush(nullptr);
+            std::_Exit(chudware::security::kIntegrityFailureExitCode);
         }
     }
 #ifdef CHUDWARE_ENABLE_CEF

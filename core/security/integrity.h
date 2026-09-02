@@ -8,7 +8,13 @@
 
 namespace chudware::security {
 
-enum class VerifyMode { Startup, ProtectedOperation, Full };
+// Startup hashes every executable/library/worker/policy row plus 1-in-16 resources;
+// ProtectedOperation narrows to the caller's own executable; Full hashes everything.
+// ManifestOnly authenticates the signed manifest and hashes NO payload file — it is
+// for callers that then verify exactly one named row themselves (see
+// verifyInstalledManifestEntry). Re-using Startup there re-hashed the entire ~800 MB
+// payload per single-file check, which is what made cold start take ~20 s.
+enum class VerifyMode { Startup, ProtectedOperation, Full, ManifestOnly };
 
 enum class IntegrityReason {
     Ok,

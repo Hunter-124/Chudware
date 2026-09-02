@@ -1974,8 +1974,12 @@ void feedTurnActivity(ChatMsg& m, const std::string& kind, const nlohmann::json&
             if (structure.empty()) structure = jstr(data, "execution_style");
             if (!structure.empty()) m.planExecutionStyle = structure;
         }
+        // Upgradeable placeholders only. "Classifying request..." was a dead comparison:
+        // the sole producer is submitTurn (copilot/composer.cpp), which stamps
+        // "Classifying\xe2\x80\xa6" with a real ellipsis, so a design run's seed never
+        // matched and the routing card could never replace it.
         if (m.running && (m.liveStatus.empty() || m.liveStatus == "Routing\xe2\x80\xa6" ||
-                          m.liveStatus == "Classifying request...")) {
+                          m.liveStatus == "Classifying\xe2\x80\xa6")) {
             // Prefer a short live chrome once we know something concrete.
             if (!card->title.empty() && card->title != "task")
                 m.liveStatus = "Routing \xc2\xb7 " + card->title;

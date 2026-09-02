@@ -708,8 +708,19 @@ int main(int argc, char** argv) {
     if (!claimSingleInstance(argc, argv)) return 0;
     const bool updateShot =
         argc >= 2 && std::strcmp(argv[1], "--ui-screenshot") == 0;
+    // stop() on a never-started updater is a no-op (nothing to join), so the exit path below
+    // needs no matching condition.
     auto& desktopUpdater = chudware::update::globalUpdater();
-    if (!updateShot) {
+    // A build that did not come from a release point reports version 0.0.0 with
+    // CHUDWARE_BUILD_DIRTY=1 by construction (core/cmake/ChudwareVersion.cmake), and
+    // "nothing downstream may treat it as one" is that file's stated invariant. The updater
+    // broke it in both directions: 0.0.0 is below every published min_supported, so the
+    // retirement gate pinned a full-screen "mandatory update" modal over every source build
+    // with no way out, and the same check would then download a release AppImage and stage it
+    // over the developer tree. Release artifacts are stamped by the pipeline with dirty=0, so
+    // the gate still retires them exactly as before.
+    constexpr bool kReleaseIdentity = CHUDWARE_BUILD_DIRTY == 0;
+    if (!updateShot && kReleaseIdentity) {
         desktopUpdater.configure(CHUDWARE_VERSION, appdataAppDir(),
                                  chudware::platform::executablePath());
         const auto apply = desktopUpdater.applyStagedBeforeWindow();

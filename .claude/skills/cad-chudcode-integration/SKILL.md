@@ -121,6 +121,24 @@ runtime's doctor command.
 5. Return policy and guardrail refusals in their machine-readable failure shapes. Let tool
    exceptions propagate as tool errors. Normalize successful values to finite JSON-safe data;
    never fabricate success.
+6. **Every host-tool return value crosses the wire as `{content:[{type:"text",text}], details}`**
+   (`chudcode_tools.host_tool_result`, applied in `HostToolBinding.to_host_tool`, for results
+   AND progress updates). A `host_tool_result` whose `result` lacks `content` never resolves
+   inside Chudcode 0.3.0: `write xd://<tool>` hangs, `wait_for_idle` hangs with it, and the
+   GUI shows "Thinking…" until the 2-hour cap. Verified live for `{"ok":false,…}`,
+   `{"ok":true,…}` and `{"docs":[…]}`. CAD tools keep returning raw JSON objects; the
+   envelope is applied in exactly one place.
+7. The main chat MUST send `workspace_dir` (`composer.cpp attachAgentConversationOptions`,
+   from `st.workspaceDir`). It is the `fs_*` jail (`CHUDWARE_FS_ROOT`), the project-save
+   root and the Chudcode process cwd; without it every `fs_list/fs_glob/fs_read` refuses with
+   `workspace_root_unavailable` and Chudcode's own `read`/`glob` browse the worker's cwd (the
+   repo). The core's `agent_workspace_dir()` only runs on the offline lane.
+8. Transient commands (auth state, provider list, model catalog, memory, login) share ONE
+   long-lived no-session `chud --mode rpc` process (`ChudcodeSessionHost._service_client`,
+   warmed by `worker_main._warm_chudcode_service`). Spawning costs ~1.1 s and the GUI issues a
+   dozen of these at startup, so spawn-per-call was the "providers take 30 s" defect. Calls are
+   serialized on `_service_lock`; a dead process is replaced on the next call; `shutdown()`
+   stops it. Never reintroduce a per-call spawn.
 
 ## Event rules
 

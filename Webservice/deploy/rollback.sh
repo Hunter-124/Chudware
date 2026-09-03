@@ -133,80 +133,119 @@ if [ "$LIST" = 1 ]; then
 fi
 
 # --------------------------------------------------------------------------
-# Target selection
+# Host tooling (not release-specific — a missing python3 is an operator fault
+# and no amount of trying older releases fixes it)
 # --------------------------------------------------------------------------
-if [ -n "$TARGET_ID" ]; then
-  [ -d "$RELEASES/$TARGET_ID" ] || refuse "no retained release '$TARGET_ID'; run $0 --list"
-else
-  while IFS=$'\t' read -r _ name; do
-    if [ "$name" != "$CURRENT_ID" ]; then
-      TARGET_ID="$name"
-      break
-    fi
-  done < <(list_releases_newest_first)
-  # Not a failure: retention only starts accumulating history from the first
-  # promotion that runs with CHUDWARE_WEBD_KEEP_RELEASES, so a freshly deployed
-  # host legitimately has nothing behind its live release.
-  [ -n "$TARGET_ID" ] || refuse \
-    "no release to roll back to: $RELEASES holds no retained release other than the live one, so retention has not accumulated a previous release yet"
-fi
-if [ "$TARGET_ID" = "$CURRENT_ID" ]; then
-  refuse "release $TARGET_ID is already live; nothing to roll back"
-fi
-
-TARGET_DIR="$RELEASES/$TARGET_ID"
-TARGET_MANIFEST="$TARGET_DIR/deploy-manifest"
-TARGET_JOINT="$(manifest_value "$TARGET_MANIFEST" joint_sha256)"
-[ -n "$TARGET_JOINT" ] \
-  || fatal "$TARGET_MANIFEST has no joint_sha256; refusing to restore a tree of unknown identity"
-
-# --------------------------------------------------------------------------
-# Prove the target is still a complete, loadable release before anything moves
-# --------------------------------------------------------------------------
-for f in bin/chudware-hostd bin/libchudware.so bin/chud CHUDCODE_ARTIFACT.lock \
-  CHUDCODE-NOTICE CHUDCODE-THIRD-PARTY-NOTICES.txt \
-  app/index.html app/Chudware.js app/Chudware.wasm; do
-  [ -s "$TARGET_DIR/$f" ] || fatal "$TARGET_DIR/$f missing or empty; release $TARGET_ID is not restorable"
-done
-[ -x "$TARGET_DIR/bin/chudware-hostd" ] || fatal "$TARGET_DIR/bin/chudware-hostd is not executable"
-[ -x "$TARGET_DIR/bin/chud" ] || fatal "$TARGET_DIR/bin/chud is not executable"
-[ -f "$TARGET_DIR/chudware-hostd.service" ] \
-  || fatal "$TARGET_DIR/chudware-hostd.service missing; release $TARGET_ID predates unit capture and cannot be restored coherently"
-[ -d "$TARGET_DIR/agent/prompts" ] || fatal "$TARGET_DIR/agent/prompts missing; agent roles would be unusable"
 PYTHON="$ROOT/Webservice/gateway/.venv/bin/python"
 if [ ! -x "$PYTHON" ]; then
   PYTHON="$(command -v python3 || true)"
 fi
 [ -n "$PYTHON" ] && [ -x "$PYTHON" ] || fatal "python3 is required for artifact and drain validation"
 command -v sha256sum >/dev/null 2>&1 || fatal "sha256sum is required"
-EXPECTED_CHUD_SHA="$(manifest_value "$TARGET_MANIFEST" chud_sha256)"
-EXPECTED_LOCK_SHA="$(manifest_value "$TARGET_MANIFEST" chudcode_artifact_lock_sha256)"
-EXPECTED_NOTICE_SHA="$(manifest_value "$TARGET_MANIFEST" chudcode_notice_sha256)"
-EXPECTED_THIRD_PARTY_NOTICES_SHA="$(manifest_value "$TARGET_MANIFEST" chudcode_third_party_notices_sha256)"
-[ -n "$EXPECTED_CHUD_SHA" ] && [ -n "$EXPECTED_LOCK_SHA" ] \
-  && [ -n "$EXPECTED_NOTICE_SHA" ] && [ -n "$EXPECTED_THIRD_PARTY_NOTICES_SHA" ] \
-  || fatal "$TARGET_ID predates Chudcode artifact and notice evidence and cannot be restored"
-[ "$(sha256sum "$TARGET_DIR/bin/chud" | cut -d' ' -f1)" = "$EXPECTED_CHUD_SHA" ] \
-  || fatal "$TARGET_ID Chudcode binary no longer matches its deploy manifest"
-[ "$(sha256sum "$TARGET_DIR/CHUDCODE_ARTIFACT.lock" | cut -d' ' -f1)" = "$EXPECTED_LOCK_SHA" ] \
-  || fatal "$TARGET_ID Chudcode artifact lock no longer matches its deploy manifest"
-[ "$(sha256sum "$TARGET_DIR/CHUDCODE-NOTICE" | cut -d' ' -f1)" = "$EXPECTED_NOTICE_SHA" ] \
-  || fatal "$TARGET_ID Chudcode notice no longer matches its deploy manifest"
-[ "$(sha256sum "$TARGET_DIR/CHUDCODE-THIRD-PARTY-NOTICES.txt" | cut -d' ' -f1)" = "$EXPECTED_THIRD_PARTY_NOTICES_SHA" ] \
-  || fatal "$TARGET_ID Chudcode third-party notices no longer match its deploy manifest"
-"$PYTHON" "$ROOT/scripts/pin_chudcode.py" \
-  --lock "$TARGET_DIR/CHUDCODE_ARTIFACT.lock" check-lock >/dev/null \
-  || fatal "$TARGET_ID Chudcode notices do not satisfy their artifact lock"
-"$PYTHON" "$ROOT/scripts/pin_chudcode.py" \
-  --lock "$TARGET_DIR/CHUDCODE_ARTIFACT.lock" verify \
-  --target linux-x86_64 --input "$TARGET_DIR/bin/chud" >/dev/null \
-  || fatal "$TARGET_ID Chudcode binary does not satisfy its artifact lock"
-# Same pre-flight install_webd.sh runs against its stage: a release whose daemon
-# can no longer load its own library (a half-deleted tree, a bad restore) must be
-# rejected while `current` still points at something that works.
-LD_LIBRARY_PATH="$TARGET_DIR/bin${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
-  "$TARGET_DIR/bin/chudware-hostd" --version >/dev/null 2>&1 \
-  || fatal "$TARGET_ID: chudware-hostd cannot load its own engine set; refusing to promote a broken release"
+
+# --------------------------------------------------------------------------
+# Prove a candidate is still a complete, loadable release before anything moves
+# --------------------------------------------------------------------------
+# Returns 0 and sets TARGET_DIR/TARGET_JOINT, or prints why the
+# candidate is unusable and returns 1. It is a PREDICATE, not a fatal path, so
+# automatic selection can walk past a corrupt tree: on 2026-08-31 the newest
+# retained release on livingroom-pc had an empty bin/chud, so every rollback
+# attempt died on that one directory and reported "ROLLBACK ITSELF FAILED ...
+# Production needs hands-on recovery now" while older, perfectly restorable
+# releases sat untried next to it. A safety net that gives up on the first torn
+# tree is decoration.
+reject_candidate() {
+  echo "[rollback] candidate $1 unusable: $2" >&2
+  return 1
+}
+
+validate_release() {
+  local id="$1"
+  local dir="$RELEASES/$id"
+  local manifest="$dir/deploy-manifest"
+  local joint f
+  local chud_sha lock_sha notice_sha third_party_sha
+
+  joint="$(manifest_value "$manifest" joint_sha256)"
+  [ -n "$joint" ] \
+    || reject_candidate "$id" "$manifest has no joint_sha256; a tree of unknown identity" || return 1
+  for f in bin/chudware-hostd bin/libchudware.so bin/chud CHUDCODE_ARTIFACT.lock \
+    CHUDCODE-NOTICE CHUDCODE-THIRD-PARTY-NOTICES.txt \
+    app/index.html app/Chudware.js app/Chudware.wasm; do
+    [ -s "$dir/$f" ] || reject_candidate "$id" "$dir/$f missing or empty" || return 1
+  done
+  [ -x "$dir/bin/chudware-hostd" ] \
+    || reject_candidate "$id" "bin/chudware-hostd is not executable" || return 1
+  [ -x "$dir/bin/chud" ] || reject_candidate "$id" "bin/chud is not executable" || return 1
+  [ -f "$dir/chudware-hostd.service" ] \
+    || reject_candidate "$id" "chudware-hostd.service missing; predates unit capture and cannot be restored coherently" || return 1
+  [ -d "$dir/agent/prompts" ] \
+    || reject_candidate "$id" "agent/prompts missing; agent roles would be unusable" || return 1
+
+  chud_sha="$(manifest_value "$manifest" chud_sha256)"
+  lock_sha="$(manifest_value "$manifest" chudcode_artifact_lock_sha256)"
+  notice_sha="$(manifest_value "$manifest" chudcode_notice_sha256)"
+  third_party_sha="$(manifest_value "$manifest" chudcode_third_party_notices_sha256)"
+  [ -n "$chud_sha" ] && [ -n "$lock_sha" ] \
+    && [ -n "$notice_sha" ] && [ -n "$third_party_sha" ] \
+    || reject_candidate "$id" "predates Chudcode artifact and notice evidence" || return 1
+  [ "$(sha256sum "$dir/bin/chud" | cut -d' ' -f1)" = "$chud_sha" ] \
+    || reject_candidate "$id" "Chudcode binary no longer matches its deploy manifest" || return 1
+  [ "$(sha256sum "$dir/CHUDCODE_ARTIFACT.lock" | cut -d' ' -f1)" = "$lock_sha" ] \
+    || reject_candidate "$id" "Chudcode artifact lock no longer matches its deploy manifest" || return 1
+  [ "$(sha256sum "$dir/CHUDCODE-NOTICE" | cut -d' ' -f1)" = "$notice_sha" ] \
+    || reject_candidate "$id" "Chudcode notice no longer matches its deploy manifest" || return 1
+  [ "$(sha256sum "$dir/CHUDCODE-THIRD-PARTY-NOTICES.txt" | cut -d' ' -f1)" = "$third_party_sha" ] \
+    || reject_candidate "$id" "Chudcode third-party notices no longer match their deploy manifest" || return 1
+  "$PYTHON" "$ROOT/scripts/pin_chudcode.py" \
+    --lock "$dir/CHUDCODE_ARTIFACT.lock" check-lock >/dev/null 2>&1 \
+    || reject_candidate "$id" "Chudcode notices do not satisfy their artifact lock" || return 1
+  "$PYTHON" "$ROOT/scripts/pin_chudcode.py" \
+    --lock "$dir/CHUDCODE_ARTIFACT.lock" verify \
+    --target linux-x86_64 --input "$dir/bin/chud" >/dev/null 2>&1 \
+    || reject_candidate "$id" "Chudcode binary does not satisfy its artifact lock" || return 1
+  # Same pre-flight install_webd.sh runs against its stage: a release whose daemon
+  # can no longer load its own library (a half-deleted tree, a bad restore) must be
+  # rejected while `current` still points at something that works.
+  LD_LIBRARY_PATH="$dir/bin${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
+    "$dir/bin/chudware-hostd" --version >/dev/null 2>&1 \
+    || reject_candidate "$id" "chudware-hostd cannot load its own engine set" || return 1
+
+  TARGET_DIR="$dir"
+  TARGET_JOINT="$joint"
+  return 0
+}
+
+# --------------------------------------------------------------------------
+# Target selection
+# --------------------------------------------------------------------------
+TARGET_DIR=""
+TARGET_JOINT=""
+if [ -n "$TARGET_ID" ]; then
+  # An operator named this release. Do not silently restore a different one:
+  # report exactly why the requested tree is unusable and stop.
+  [ -d "$RELEASES/$TARGET_ID" ] || refuse "no retained release '$TARGET_ID'; run $0 --list"
+  [ "$TARGET_ID" != "$CURRENT_ID" ] || refuse "release $TARGET_ID is already live; nothing to roll back"
+  validate_release "$TARGET_ID" \
+    || fatal "release $TARGET_ID is not restorable (see the candidate line above); run $0 --list and pick another"
+else
+  skipped=0
+  while IFS=$'\t' read -r _ name; do
+    [ "$name" != "$CURRENT_ID" ] || continue
+    if validate_release "$name"; then
+      TARGET_ID="$name"
+      break
+    fi
+    skipped=$((skipped + 1))
+  done < <(list_releases_newest_first)
+  # Not a failure: retention only starts accumulating history from the first
+  # promotion that runs with CHUDWARE_WEBD_KEEP_RELEASES, so a freshly deployed
+  # host legitimately has nothing behind its live release.
+  [ -n "$TARGET_ID" ] || refuse \
+    "no restorable release to roll back to: $RELEASES holds no retained release other than the live one that passes validation (${skipped} candidate(s) rejected above)"
+  [ "$skipped" -eq 0 ] \
+    || echo "[rollback] selected $TARGET_ID after skipping ${skipped} unusable candidate(s)"
+fi
 
 [ ! -e "$DST/current" ] || [ -L "$DST/current" ] || fatal "$DST/current exists and is not a symlink"
 if [ -L "$BIN" ] && [ "$(readlink "$BIN")" != "current/bin" ]; then

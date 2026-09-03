@@ -70,6 +70,106 @@ def test_every_pre_mutation_check_refuses_instead_of_failing_part_way():
     assert "exit 4" in body
 
 
+def _release(root: Path, name: str, *, torn: bool = False) -> Path:
+    """A retained release tree that is structurally complete but not signed.
+
+    Validation rejects it long before the manifest digests matter, which is
+    exactly what these tests need: the point under test is WHICH candidate the
+    selector reaches, not whether a real release verifies.
+    """
+    d = root / name
+    (d / "bin").mkdir(parents=True)
+    (d / "app").mkdir(parents=True)
+    (d / "agent" / "prompts").mkdir(parents=True)
+    for rel in (
+        "bin/chudware-hostd",
+        "bin/libchudware.so",
+        "bin/chud",
+        "CHUDCODE_ARTIFACT.lock",
+        "CHUDCODE-NOTICE",
+        "CHUDCODE-THIRD-PARTY-NOTICES.txt",
+        "app/index.html",
+        "app/Chudware.js",
+        "app/Chudware.wasm",
+    ):
+        (d / rel).write_text("x")
+    (d / "chudware-hostd.service").write_text("[Unit]\n")
+    (d / "deploy-manifest").write_text("joint_sha256=deadbeef\n")
+    if torn:
+        # The shape that wedged production: the file is present but empty, so
+        # `test -s` fails and this tree can never be restored.
+        (d / "bin" / "chud").write_text("")
+    return d
+
+
+def _rollback(tmp_path: Path, *args: str) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        ["bash", str(REPO / "Webservice" / "deploy" / "rollback.sh"), *args],
+        capture_output=True,
+        text=True,
+        env=dict(os.environ, CHUDWARE_WEB_HOME=str(tmp_path / "chudware-web")),
+        cwd=str(REPO),
+        timeout=120,
+    )
+
+
+def test_automatic_rollback_walks_past_a_torn_release(tmp_path):
+    releases = tmp_path / "chudware-web" / "releases"
+    releases.mkdir(parents=True)
+    _release(releases, "20260901T120000Z-live-1")
+    _release(releases, "20260831T120000Z-torn-1", torn=True)
+    _release(releases, "20260830T120000Z-good-1")
+    (tmp_path / "chudware-web" / "current").symlink_to(
+        releases / "20260901T120000Z-live-1"
+    )
+
+    proc = _rollback(tmp_path)
+    out = proc.stdout + proc.stderr
+    # The torn tree is reported and skipped; selection reaches the older one and
+    # only then stops on that release's own (unsigned, synthetic) evidence.
+    assert "20260831T120000Z-torn-1 unusable" in out, out
+    assert "20260830T120000Z-good-1" in out, out
+    assert "not restorable" not in out, (
+        "the first torn candidate must not end the rollback: " + out
+    )
+
+
+def test_an_operator_named_release_still_fails_loudly(tmp_path):
+    releases = tmp_path / "chudware-web" / "releases"
+    releases.mkdir(parents=True)
+    _release(releases, "20260901T120000Z-live-1")
+    _release(releases, "20260831T120000Z-torn-1", torn=True)
+    _release(releases, "20260830T120000Z-good-1")
+    (tmp_path / "chudware-web" / "current").symlink_to(
+        releases / "20260901T120000Z-live-1"
+    )
+
+    proc = _rollback(tmp_path, "--to", "20260831T120000Z-torn-1")
+    out = proc.stdout + proc.stderr
+    assert proc.returncode == 1, out
+    assert "is not restorable" in out, out
+    # It must NOT quietly restore a different release than the one requested.
+    assert "20260830T120000Z-good-1" not in out, out
+
+
+def test_no_restorable_candidate_is_exit_2_not_a_broken_rollback(tmp_path):
+    releases = tmp_path / "chudware-web" / "releases"
+    releases.mkdir(parents=True)
+    _release(releases, "20260901T120000Z-live-1")
+    _release(releases, "20260831T120000Z-torn-1", torn=True)
+    (tmp_path / "chudware-web" / "current").symlink_to(
+        releases / "20260901T120000Z-live-1"
+    )
+
+    proc = _rollback(tmp_path)
+    out = proc.stdout + proc.stderr
+    # Exit 2 is the workflow's "COULD NOT ROLL BACK: nothing to fall back to",
+    # which is the truth here — not "ROLLBACK ITSELF FAILED".
+    assert proc.returncode == 2, out
+    assert "no restorable release to roll back to" in out, out
+    assert "1 candidate(s) rejected" in out, out
+
+
 def test_the_workflow_skips_the_rollback_for_a_refusal():
     body = WORKFLOW.read_text()
     assert re.search(r'"\$\{rc\}"\s+-eq\s+4', body), "exit 4 is not handled at all"

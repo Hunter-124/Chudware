@@ -3510,7 +3510,7 @@ static void drawModelRolesSection(AppState& st, float sc) {
                            "work/changes, and guides them through the visual modeling steps \xe2\x80\x94 while "
                            "offloading the bulk of vision work to cheaper models (e.g. Grok) to save premium-vision tokens.");
             } else if (std::strcmp(key, "default") == 0) {
-                helpMarker("Main copilot agent loop (agent / swarm / ask modes) when no more specific role applies.");
+                helpMarker("Main copilot agent loop (Agent / Plan / Ask modes) when no more specific role applies.");
             } else if (std::strcmp(key, "plm") == 0) {
                 helpMarker("Product lifecycle tasks \xe2\x80\x94 releases, document control, versioning, and PLM workflows.");
             } else if (std::strcmp(key, "redaction") == 0) {
@@ -3689,26 +3689,20 @@ static void drawModelRolesSection(AppState& st, float sc) {
 
 }
 
-// Copilot mode → default harness structure + one-line description. Single source of
-// truth for Settings → AI → Harness organization (index matches CopilotMode).
+// Copilot mode → tool policy + one-line description. Single source of truth for
+// Settings → AI → Harness organization (index matches CopilotMode).
 struct HarnessModeInfo {
-    const char* label;       // Agent | Plan | Swarm | Edit | Ask | Eng. Firm
-    const char* structure;   // default execution structure
+    const char* label;       // Agent | Plan | Ask
+    const char* structure;   // what one turn in this mode is
     const char* description; // one-line what it does
 };
 static const HarnessModeInfo kHarnessModes[] = {
-    {"Agent",    "auto",
-     "Solo for simple, plan/subagent for standard, DAG/company for complex."},
-    {"Plan",     "plan-only",
-     "Drafts a plan only; no mutation until you approve."},
-    {"Swarm",    "multi-agent parallel",
-     "Forces a multi-agent / corporate mission with parallel specialists."},
-    {"Edit",     "scoped single-doc edit",
-     "Changes the open part (scoped to selection when set)."},
+    {"Agent",    "one Chudcode agent turn",
+     "Full CAD tool loadout; the agent decides inline vs subagents vs mission."},
+    {"Plan",     "read-only planning",
+     "Inspect and draft a plan; no mutation."},
     {"Ask",      "read-only Q&A",
      "Questions about the part; nothing changes."},
-    {"Eng. Firm","multi-agent + contractor firms",
-     "Specialist roles + contractor firms bid on tasks under a $ budget."},
 };
 static constexpr int kHarnessModeCount =
     (int)(sizeof(kHarnessModes) / sizeof(kHarnessModes[0]));
@@ -3996,9 +3990,9 @@ static void drawEngFirmModelAssignments(AppState& st, float sc) {
 
 static void drawHarnessOrganizationSection(AppState& st, float sc) {
     // Mode chips in 2 columns (3 on wide panes): active mode accented, others secondary.
-    dimText("Composer mode picks the org structure. Switch mode from the copilot composer.");
-    int active = st.settings.copilotMode;
-    if (active < 0 || active >= kHarnessModeCount) active = 0;
+    dimText("Composer mode is a user choice (Agent / Plan / Ask); "
+            "switch it from the copilot composer.");
+    const int active = normalizeCopilotMode(st.settings.copilotMode);
 
     ImGui::Dummy(ImVec2(0, 2.0f * sc));
     ImGui::PushStyleVar(ImGuiStyleVar_CellPadding, ImVec2(4.0f * sc, 1.5f * sc));
@@ -4109,8 +4103,8 @@ bool drawHarnessSessionKnobs(AppState& st, float sc) {
                           ImGuiTableFlags_SizingStretchSame |
                           ImGuiTableFlags_NoPadOuterX)) {
         // Orchestration-topology flags: all ADVANCED. Each one changes how work is routed
-        // (advisor injects, company departments, auto-missions, tool-catalog breadth) and
-        // all four ship off/lean, which is the correct normal configuration.
+        // (advisor injects, company departments) and both ship off/lean, which is the
+        // correct normal configuration.
         if (adv) {
             ImGui::TableNextColumn();
             if (ImGui::Checkbox("Proactive advisor", &settings.proactiveAdvisor))
@@ -4122,26 +4116,10 @@ bool drawHarnessSessionKnobs(AppState& st, float sc) {
             ImGui::TableNextColumn();
             if (ImGui::Checkbox("Company structure auto-route", &settings.corporateMode))
                 changed = true;
-            helpMarker("When on, complex cross-discipline requests may route as "
-                       "company (director + departments). Default off — Agent will "
-                       "not auto-invoke company; use Swarm / Eng. Firm modes or "
-                       "turn this on when ready.");
-
-            ImGui::TableNextColumn();
-            if (ImGui::Checkbox("Auto-route missions", &settings.autoMissionRouting))
-                changed = true;
-            helpMarker("When on, Agent mode may auto-launch a mission (intake, "
-                       "breakdown, specialists) for build+analyze phrasing. "
-                       "Default off — the main chat stays on one direct agent "
-                       "turn with tools.");
-            ImGui::TableNextColumn();
-            if (ImGui::Checkbox("Full tool loadout (main chat)",
-                                &settings.directAgentFullTools))
-                changed = true;
-            helpMarker("When on, the main-chat agent gets the full MCP catalog "
-                       "(still respecting per-tool Options and role family "
-                       "assignments). When off, it starts lean and pulls packs "
-                       "via enable_tools. Saved as agent.direct_agent_full_tools.");
+            helpMarker("Applies to the explicit offline modeling fallback only: when on, a "
+                       "complex cross-discipline request may route as company (director + "
+                       "departments) there. Default off. The online agent turn organizes its "
+                       "own work regardless of this flag.");
         }
 
         ImGui::TableNextColumn();
@@ -5960,7 +5938,6 @@ const SettingsEntry kSettingsEntries[] = {
     { "Mode defaults",            "AI",           2 },
     { "Eng. Firm",                "AI",           2 },
     { "Eng. Firm model assignments", "AI",        2 },
-    { "Swarm",                    "AI",           2 },
     // Providers (tab 3) — provider/model, keys, Moonshot, accounts
     { "AI provider",              "Providers",    3 },
     { "Provider & Model",         "Providers",    3 },
@@ -7691,9 +7668,7 @@ void drawSettingsModal(AppState& st, bool busy) {
                             ImGui::SameLine(0.0f, 6.0f * sc);
                             ImGui::Text("Families for %s", kRoleLabels[s_roleToolsSel]);
                             helpMarker("Checked families become this role's default tool "
-                                       "surface (unioned onto the role card allowlist). "
-                                       "Main-chat Default also respects "
-                                       "\"Full tool loadout\" in Harness.");
+                                       "surface (unioned onto the role card allowlist).");
 
                             std::set<std::string>& assigned = s_roleTools[rk];
                             if (ImGui::BeginTable("##role_fam_assign", 3,

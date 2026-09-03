@@ -1723,3 +1723,46 @@ progress; and `Server::Server` -> `mfg::tryLane()` replays `journal.jsonl` twice
 `trayStart`/`accept` (357 KB, ~20 ms today, but append-only with no compaction). Pre-existing
 and unrelated: the `test_aicm_cpp` target does not compile (`host/src/render/ref_datum_geom.h`
 includes a `vec_math.h` that does not exist, from 369d56676).
+
+## 2026-09-03 — the classification layer is gone; the main chat is one agent with a visible catalog
+
+**What changed.** Every chat send is now ONE Chudcode `general_agent` turn and the model decides
+everything: the GUI composer (`host/src/ui/copilot/composer.cpp::submitTurn`) no longer keyword-
+classifies the request into `agent_ask_v2` (a native provider Q&A path), the `agent_simulate_v1`
+CFD hijack, an auto-mission, an Ask→Agent promotion, or an edit-in-place scope; it never creates
+or replaces a document (`launchDesignRun` used to mint a fresh part whenever the open one had
+features — the agent now chooses `new_part` vs. editing the active doc); and it no longer inlines
+a `[conversation so far]` transcript into every request (the persistent Chudcode session IS the
+conversation; `options.history` still seeds a fresh session once). Modes shrank to a user-picked
+Agent | Plan | Ask (`CopilotMode` 0/1/2; `normalizeCopilotMode` migrates persisted Swarm/Edit/
+Eng.Firm to Agent and legacy Ask=4 to Ask=2), and `jobs.cpp` no longer clobbers `options.mode`.
+The composer sends `options.scope = {doc_id, feature_ids, selection}` in EVERY mode while a doc is
+open; `worker_rpc._editor_context_block` renders it as an ACTIVE DOCUMENT block at the tail of the
+user message (Copilot's "current file"). The Routing card (rowKind 10), the `task_route` /
+`agent.classification` / `complexity` feed handling, the session `scopeClass` rail chip,
+`agent_events.classification_event`, and the `direct_agent_full_tools` / `auto_mission_routing`
+settings (C++ + Python) are deleted. On the Python side the main chat's surface is
+`tool_categories.MAIN_CHAT_CORE_TOOLS` (~62 tools, ~27k tokens of schema: documents, add_features,
+sketch checks, measure/inspect/render, mates, drawing, PLM, fs, research, ask_user/task_list/
+delegate/mission_start) plus a name-level MORE TOOLS menu of every other registered tool
+(`render_tool_menu`, ~2.3k tokens, grouped by `_MENU_GROUPS` over the live registry families)
+appended by `mission_dispatch._apply_session_preferences`. `enable_tools` takes exact names
+(`tools=[...]`) or menu groups (`categories=[...]`), resolves through `resolve_tool_requests`
+(group → legacy pack → `family:` → registry name, uncapped), and reports `unknown`; the single
+refresh callback lives in `chudcode_roles._register_category_refresh`. `chudcode_tools._effective_names`
+unions on-demand loads BEFORE the mode policy so Ask/Plan stay read-only whatever the model loads;
+Plan narrows the agent set (not the contract's broad PLAN_TOOLS) and now also drops
+`fs_write`/`fs_edit`/`run_shell`. `roles.RoleCard.apply_tool_policy` opens the dispatch gate for
+the main-chat harness role unconditionally. `general_agent.yaml` was rewritten for this surface.
+
+**Gotchas / deferred.** The full registry is ~460 tools / ~150k tokens of schema — the menu exists
+because advertising everything is not viable; do not "fix" a missing tool by adding it to the
+core, add it only if ordinary part work needs it every turn. `run_shell` deliberately stays off
+the core (security hardening 3aaee658) and is on the menu. The `contracts/copilot_modes.json`
+ask list is unchanged (parity matrix pinned in two languages), so Ask mode has no `render_part`;
+append there if that matters. The native offline pipeline in `core/agent/run.cpp` /
+`micro.cpp` still classifies complexity/domain for ITS OWN stage structure and still emits
+`agent.classification` — nothing in the GUI reads it any more. `prompt_preview` renders the main
+chat's tools uncapped (`budget_tokens=1_000_000, trim=False`) to mirror the native Chudcode tool
+definitions; the tiered text slot only applies to the offline loop. `onboarding.cpp` still uses
+`agent_ask_v2` as its provider connectivity probe — deliberate, it is not a chat path.

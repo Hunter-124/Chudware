@@ -428,16 +428,16 @@ class RoleCard:
 
         Settings → AI → Tools ``agent.role_tools``: family tokens for the mapped
         harness role are unioned in so the UI assignment actually reaches the
-        dispatch gate. When ``agent.direct_agent_full_tools`` is on and this is
-        the main-chat ``general_agent`` / ``default`` harness role, policy is
-        opened (``allow=None``) so the agent can use the full catalog.
+        dispatch gate. The main-chat ``general_agent`` / ``default`` harness role
+        is never gated here (``allow=None``): its advertised surface is the core
+        loadout plus whatever the model loads from the full menu, and a refusal
+        at dispatch for a tool the model was shown would be a harness lie.
         """
         from services.agent.copilot_mode_tools import (  # noqa: PLC0415
             AGENT_DEFAULT_TOOLS,
             SHARED_DEFAULT_TOOLS,
         )
         from services.agent.config import (  # noqa: PLC0415
-            direct_agent_full_tools,
             get_role_tools,
             harness_role_for_yaml,
         )
@@ -445,21 +445,6 @@ class RoleCard:
         harness = harness_role_for_yaml(self.id)
         role_fams = get_role_tools(harness)
         fam_tokens = [f"family:{f}" for f in role_fams if f]
-
-        # Main chat: open the gate so the agent can rip with every registered tool
-        # (per-tool enabled flags + legacy family kill-switches still apply).
-        if direct_agent_full_tools() and harness == "default":
-            registry.set_policy(allow=None)
-            tokens = list(dict.fromkeys([
-                *self.allow_tokens, *fam_tokens,
-                *SHARED_DEFAULT_TOOLS, *AGENT_DEFAULT_TOOLS,
-            ]))
-            try:
-                from services.agent.config import bugreport_floor  # noqa: PLC0415
-                tokens = list(dict.fromkeys([*tokens, *bugreport_floor()]))
-            except Exception:  # noqa: BLE001
-                pass
-            return tokens
 
         tokens = list(dict.fromkeys([
             *self.allow_tokens, *fam_tokens,
@@ -473,7 +458,9 @@ class RoleCard:
             tokens = list(dict.fromkeys([*tokens, *bugreport_floor()]))
         except Exception:  # noqa: BLE001 — floor union is best-effort
             pass
-        registry.set_policy(allow=tokens)
+        # Main chat: open the gate (per-tool enabled flags + legacy family
+        # kill-switches still apply).
+        registry.set_policy(allow=None if harness == "default" else tokens)
         return tokens
 
     def tools_for_mode(

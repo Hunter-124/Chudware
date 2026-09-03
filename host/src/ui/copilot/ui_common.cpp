@@ -297,27 +297,21 @@ ImVec4 semanticOnGlass(const float role[4], const ui::AdaptiveSurface& surf) {
     return semanticOnTone(role, surf.darkText);
 }
 
-// Per-message mode accent (CopilotMode 0..5). ONE source for both the border and the wash, so the
-// two can never drift: Agent=accent, Plan=amber, Swarm=info blue, Edit=green, Ask=neutral,
-// Eng.Firm=violet. Swarm and Eng.Firm have no chrome-domain role of their own; iterBuilt (the app's
-// secondary-emphasis blue) and sketchExternal (its only violet) are the closest existing ones.
+// Per-message mode accent (CopilotMode 0..2). ONE source for both the border and the wash, so
+// the two can never drift: Agent=accent, Plan=amber, Ask=neutral.
 static const float* modeRole(int mode) {
     const auto& pal = ui::palette;
     switch (mode) {
-        case 1:  return pal.statusWarn;
-        case 2:  return pal.iterBuilt;
-        case 3:  return pal.statusOk;
-        case 4:  return pal.textDim;
-        case 5:  return pal.sketchExternal;
-        case 0:
-        default: return pal.accent;
+        case (int)CopilotMode::Plan: return pal.statusWarn;
+        case (int)CopilotMode::Ask:  return pal.textDim;
+        default:                     return pal.accent;
     }
 }
 
-// mode < 0 or > 5 → 0 (no border).
+// mode outside 0..kCopilotModeCount-1 → 0 (no border).
 ImU32 modeBorderColor(int mode) {
-    if (mode < 0 || mode > 5) return 0;
-    static const float kAlpha[6] = {0.70f, 0.75f, 0.71f, 0.70f, 0.63f, 0.71f};
+    if (mode < 0 || mode >= kCopilotModeCount) return 0;
+    static const float kAlpha[kCopilotModeCount] = {0.70f, 0.75f, 0.63f};
     const float* r = modeRole(mode);
     return ImGui::ColorConvertFloat4ToU32(ImVec4(r[0], r[1], r[2], kAlpha[mode]));
 }

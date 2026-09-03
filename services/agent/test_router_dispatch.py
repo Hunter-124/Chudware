@@ -86,40 +86,44 @@ class TestLinearRoleTurn:
             assert t in allowed, f"{t} (subagent floor) missing"
         for t in ("delegate", "mission_start", "enable_tools"):
             assert t in allowed, f"{t} (escalation lever) missing"
-        # Geometry mutators are NOT in the base loadout — the model pulls them
-        # via enable_tools(['modeling']) only when it decides to build.
-        for t in ("new_part", "add_features", "asm_add_component", "asm_mate"):
-            assert t not in allowed, f"{t} must not be in the base general loadout"
+        # The broad CAD core is loaded up front — the model never has to
+        # enable_tools(['modeling']) before a fillet.
+        for t in ("new_part", "add_features", "asm_add_component", "asm_mate",
+                  "describe_part", "measure_part", "verify_battery"):
+            assert t in allowed, f"{t} must be in the main-chat core loadout"
 
-    def test_router_classification_emits_routing_card_telemetry(self):
-        from services.agent import agent_events
-        from services.agent.pipeline import workflow_router
-
-        route = workflow_router.route(_CLEANUP_REQUEST, "local-24k")
-        kind, payload = agent_events.classification_event(
-            "router-test",
-            task_class=route.task_class,
-            scaffold_level=route.scaffold_level,
-            tier="local-24k",
-            reason=route.reason,
-            request_snippet=_CLEANUP_REQUEST,
-            alternatives=route.alternatives,
+    def test_main_chat_prompt_lists_every_unloaded_tool_by_name(self):
+        """Nothing is hidden: every registered tool outside the core is in the
+        MORE TOOLS menu by exact name, and nothing loaded is repeated there."""
+        from services.agent.mission_dispatch import (
+            _apply_session_preferences,
+            effective_role_system_prompt,
+            linear_role_allowed_tools,
         )
-        events: list[tuple[str, dict]] = []
-        agent_events.emit_event(
-            kind,
-            payload,
-            live=lambda event_kind, event_payload: events.append(
-                (event_kind, event_payload)
-            ),
-            journal=None,
-        )
+        from services.agent.roles import load_role
+        from services.agent.tool_categories import _live_catalog
+        from services.mcp import tool_registry
 
-        assert len(events) == 1
-        event_kind, event_payload = events[0]
-        assert event_kind == "agent.classification"
-        assert event_payload["task_class"] == "project_admin"
-        assert event_payload["tier"] == "local-24k"
+        tool_registry.warm_catalog()
+        card = load_role("general_agent")
+        allowed, system = _apply_session_preferences(
+            "general_agent",
+            linear_role_allowed_tools(card),
+            effective_role_system_prompt(card),
+        )
+        assert "MORE TOOLS" in system
+        menu = system.split("MORE TOOLS", 1)[1]
+        listed = {
+            tok.strip()
+            for line in menu.splitlines()
+            if line.startswith("  ")
+            for tok in line.split(",")
+        }
+        registry = set(_live_catalog())
+        unloaded = registry - set(allowed)
+        assert unloaded, "registry must be warm for this test to mean anything"
+        assert unloaded <= listed, sorted(unloaded - listed)[:20]
+        assert not (listed & set(allowed)), sorted(listed & set(allowed))[:20]
 
     def test_main_chat_runs_past_old_thirty_call_limit(self):
         """The old linear budget killed a composed 31st dispatch. Main chat now

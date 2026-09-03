@@ -608,29 +608,6 @@ void finalizeThoughtBox(ActivityItem& a) {
     if (!a.userToggled) a.expanded = false;
 }
 
-// Find or create the single rowKind-10 routing card. The card starts PENDING
-// ("class:pending" — hidden by drawAgentTimeline): the first-turn classification telemetry is
-// advisory-only now that every request enters via the universal general_agent role, so the card
-// stays hidden until a REAL role change (agent.role) reveals it.
-//
-// It lands at its ARRIVAL POSITION and stays there. It used to be inserted at the front and
-// then re-pinned there by both the classification and agent.role handlers (erase + insert at
-// begin()), so a role adopted mid-turn slid the card above thinking and tool rows the user had
-// already read — the same out-of-order complaint the rowKind-18 plan marker was introduced to
-// fix. Routing telemetry is a turn-opening event, so in practice this IS the top of the turn.
-static ActivityItem* findOrCreateRoutingCard(ChatMsg& m) {
-    for (auto& a : m.activity)
-        if (a.rowKind == 10) return &a;
-    ActivityItem ni;
-    ni.rowKind = 10;
-    ni.stage   = "class:pending";
-    ni.title   = "task";
-    ni.status  = "done";
-    ni.detail  = "{}";
-    m.activity.push_back(std::move(ni));
-    return &m.activity.back();
-}
-
 // Finalize the live streamed-thinking box ("thought:stream") when a visible
 // timeline boundary arrives — a context chip, tool call, stage boundary, or
 // completed agent.thought block. A contentless channel flush is not a visible
@@ -677,107 +654,10 @@ static void separateLiveStreamThoughtParagraph(ChatMsg& m) {
     }
 }
 
-// Merge routing-related fields into the packed detail JSON + title/reason on the card.
-static void mergeRoutingFields(ActivityItem& card, const nlohmann::json& data, const std::string& kind) {
-    nlohmann::json meta = nlohmann::json::object();
-    if (!card.detail.empty()) {
-        try {
-            auto j = nlohmann::json::parse(card.detail, nullptr, false);
-            if (!j.is_discarded() && j.is_object()) meta = std::move(j);
-        } catch (...) {}
-    }
-    auto putStr = [&](const char* key, const std::string& v) {
-        if (!v.empty()) meta[key] = v;
-    };
-    auto putAny = [&](const char* key, const char* srcKey) {
-        if (!data.contains(srcKey) || data[srcKey].is_null()) return;
-        meta[key] = data[srcKey];
-    };
-
-    // Pass through alternatives arrays from any routing event (keys vary by producer).
-    auto putAlts = [&]() {
-        for (const char* k : {"alternatives", "alt_classes", "candidates"}) {
-            if (data.contains(k) && !data[k].is_null()) meta[k] = data[k];
-        }
-    };
-
-    if (kind == "agent.classification") {
-        std::string tc = jstr(data, "task_class");
-        if (!tc.empty()) card.title = tc;
-        std::string reason = jstr(data, "reason");
-        if (!reason.empty()) card.reason = reason;
-        putStr("picked_model", jstr(data, "picked_model"));
-        putStr("picked_provider", jstr(data, "picked_provider"));
-        putStr("request_snippet", jstr(data, "request_snippet"));
-        std::string sl = jstr(data, "scaffold_level");
-        if (!sl.empty()) meta["scaffold_level"] = sl;
-        else putAny("scaffold_level", "scaffold_level");
-        std::string tier = jstr(data, "tier");
-        if (!tier.empty()) meta["tier"] = tier;
-        else putAny("tier", "tier");
-        putAlts();
-    } else if (kind == "complexity") {
-        std::string level = jstr(data, "level");
-        if (!level.empty()) {
-            meta["scaffold_level"] = level;
-            meta["complexity"] = level;
-        }
-        std::string reason = jstr(data, "reason");
-        if (!reason.empty() && card.reason.empty()) card.reason = reason;
-        if (data.contains("skip_plan") && !data["skip_plan"].is_null())
-            meta["skip_plan"] = data["skip_plan"];
-        putAlts();
-    } else if (kind == "task_route") {
-        std::string domain = jstr(data, "domain");
-        if (!domain.empty()) {
-            card.title = domain;
-            meta["domain"] = domain;
-        }
-        std::string reason = jstr(data, "reason");
-        if (!reason.empty()) card.reason = reason;
-        std::string cx = jstr(data, "complexity");
-        if (!cx.empty()) {
-            meta["complexity"] = cx;
-            if (!meta.contains("scaffold_level")) meta["scaffold_level"] = cx;
-        }
-        putStr("structure", jstr(data, "structure"));
-        if (data.contains("tool_classes") && !data["tool_classes"].is_null())
-            meta["tool_classes"] = data["tool_classes"];
-        if (data.contains("context_sheets") && !data["context_sheets"].is_null())
-            meta["context_sheets"] = data["context_sheets"];
-        putAlts();
-    }
-    card.detail = meta.dump();
-    card.status = "done";
-}
-
-
 // Mid-turn chat_history flush (resume-safe). feedTurnActivity sets the dirty flag;
 // the GL draw path calls maybePersistChatHistoryDebounced with AppState.
 std::atomic<bool> s_chatHistoryDirty{false};
 double s_chatHistoryLastPersist = -1e9;
-
-// ---- session scope assessment handoff (conversations.cpp applies it) ----
-// feedTurnActivity folds the task_route/agent.classification/complexity events but only sees a
-// ChatMsg — the Conversation (scopeClass + title) needs AppState. Stash the latest routing
-// fields here; conversations.cpp's GL-draw-path hook (maybePersistChatHistoryDebounced)
-// consumes them and stamps the active session on its FIRST routing event.
-static bool        s_scopePending = false;
-static std::string s_scopeDomain, s_scopeComplexity, s_scopeStructure, s_scopeExecStyle,
-                   s_scopeSnippet;
-
-bool takePendingScopeAssessment(std::string& domain, std::string& complexity,
-                                std::string& structure, std::string& execStyle,
-                                std::string& snippet) {
-    if (!s_scopePending) return false;
-    domain     = std::move(s_scopeDomain);
-    complexity = std::move(s_scopeComplexity);
-    structure  = std::move(s_scopeStructure);
-    execStyle  = std::move(s_scopeExecStyle);
-    snippet    = std::move(s_scopeSnippet);
-    s_scopePending = false;
-    return true;
-}
 
 void markChatHistoryDirty() {
     s_chatHistoryDirty.store(true, std::memory_order_relaxed);
@@ -1239,9 +1119,9 @@ void feedTurnActivity(ChatMsg& m, const std::string& kind, const nlohmann::json&
         if (planHasRealContent())
             upsertDerivedItem(std::move(it));
 
-        // Delegation card (rowKind 19): transparency view of subagent dispatches,
-        // styled after the Routing card. One card per turn, upserted as spawns land;
-        // entries packed into detail JSON {"delegates":[{role,brief,spawn_kind}]}.
+        // Delegation card (rowKind 19): transparency view of subagent dispatches. One card
+        // per turn, upserted as spawns land; entries packed into detail JSON
+        // {"delegates":[{role,brief,spawn_kind}]}.
         ActivityItem* dc = nullptr;
         for (auto& a : m.activity)
             if (a.rowKind == 19) { dc = &a; break; }
@@ -1276,9 +1156,10 @@ void feedTurnActivity(ChatMsg& m, const std::string& kind, const nlohmann::json&
 
 
     if (kind == "run_started") {
-        // Instant chrome before classification lands (F3).
+        // Instant chrome for the first frame of a run; the live stream replaces it as
+        // thinking / tool rows / assistant deltas arrive.
         if (m.running && m.liveStatus.empty())
-            m.liveStatus = "Routing\xe2\x80\xa6";
+            m.liveStatus = "Working\xe2\x80\xa6";
     } else
     if (kind == "mission_started") {
         m.curMissionTask = -1;  // task rows arrive via mission_task_started
@@ -1936,79 +1817,6 @@ void feedTurnActivity(ChatMsg& m, const std::string& kind, const nlohmann::json&
             existing.expanded = false;
         }
         if (!existingCard) m.activity.push_back(std::move(scratch));
-    } else if (kind == "agent.classification" || kind == "complexity" || kind == "task_route") {
-        // Routing card UPSERT (F3): appears on the FIRST of these events and enriches as the
-        // rest land. Shared rowKind 10. The card stays PENDING (hidden) here — this telemetry
-        // is advisory since every request enters via the universal general_agent role; only a
-        // real role change (agent.role below) reveals it and pins it to the front.
-        ActivityItem* card = findOrCreateRoutingCard(m);
-        // No re-pin: the card renders where it arrived (see findOrCreateRoutingCard).
-        mergeRoutingFields(*card, data, kind);
-        // Session scope assessment handoff: conversations.cpp colors + names the session from
-        // these routing fields on the FIRST such event (see takePendingScopeAssessment).
-        s_scopeDomain.clear();
-        s_scopeComplexity.clear();
-        s_scopeStructure.clear();
-        s_scopeExecStyle.clear();
-        s_scopeSnippet.clear();
-        if (kind == "task_route") {
-            s_scopeDomain     = jstr(data, "domain");
-            s_scopeComplexity = jstr(data, "complexity");
-            s_scopeStructure  = jstr(data, "structure");
-            s_scopeExecStyle  = jstr(data, "execution_style");
-        } else if (kind == "agent.classification") {
-            s_scopeDomain     = jstr(data, "task_class");
-            s_scopeComplexity = jstr(data, "scaffold_level");
-            s_scopeSnippet    = jstr(data, "request_snippet");
-        } else {  // complexity
-            s_scopeComplexity = jstr(data, "level");
-            s_scopeStructure  = jstr(data, "structure");
-            s_scopeExecStyle  = jstr(data, "execution_style");
-        }
-        s_scopePending = true;
-        // task_route.structure is the decided execution style (solo/standard->edit,
-        // complex->swarm, or explicit mode). Stamp for the approve card if a user gate
-        // ever lands; agent-decided plans ignore it for UX (no card).
-        if (kind == "task_route") {
-            std::string structure = jstr(data, "structure");
-            if (structure.empty()) structure = jstr(data, "execution_style");
-            if (!structure.empty()) m.planExecutionStyle = structure;
-        }
-        // Upgradeable placeholders only. "Classifying request..." was a dead comparison:
-        // the sole producer is submitTurn (copilot/composer.cpp), which stamps
-        // "Classifying\xe2\x80\xa6" with a real ellipsis, so a design run's seed never
-        // matched and the routing card could never replace it.
-        if (m.running && (m.liveStatus.empty() || m.liveStatus == "Routing\xe2\x80\xa6" ||
-                          m.liveStatus == "Classifying\xe2\x80\xa6")) {
-            // Prefer a short live chrome once we know something concrete.
-            if (!card->title.empty() && card->title != "task")
-                m.liveStatus = "Routing \xc2\xb7 " + card->title;
-            else if (m.liveStatus.empty())
-                m.liveStatus = "Routing\xe2\x80\xa6";
-        }
-    } else if (kind == "agent.role") {
-        // REAL role change (adopt_role): reveal the hidden routing card with the new
-        // role and pin it to the front of the timeline.
-        ActivityItem* card = findOrCreateRoutingCard(m);
-        card->stage = "class:0";
-        std::string role = jstr(data, "role");
-        if (!role.empty()) card->title = role;
-        std::string reason = jstr(data, "reason");
-        if (reason.empty()) reason = jstr(data, "goal");
-        if (!reason.empty()) card->reason = reason;
-        std::string fromRole = jstr(data, "from_role");
-        if (!fromRole.empty()) {
-            try {
-                nlohmann::json meta = nlohmann::json::parse(card->detail, nullptr, false);
-                if (meta.is_discarded() || !meta.is_object()) meta = nlohmann::json::object();
-                meta["from_role"] = fromRole;
-                card->detail = meta.dump();
-            } catch (...) {}
-        }
-        card->status = "done";
-        // No re-pin: the card renders where it arrived (see findOrCreateRoutingCard).
-        if (m.running && !card->title.empty())
-            m.liveStatus = "Routing \xc2\xb7 " + card->title;
     } else if (kind == "provider_call") {
         // In-depth provider HTTP call log (InAppDiag / core agent). One row per attempt.
         // rowKind 9; fields packed into existing ActivityItem slots so we never touch
@@ -2374,11 +2182,6 @@ void feedTurnActivity(ChatMsg& m, const std::string& kind, const nlohmann::json&
             ni.status = "done";
             ni.expanded = false;  // collapsed-by-default informational
             ni.opsCount = 1;      // flag: plan-approval flavor for the drawer
-            // Also stamp execution_style if the advisor event carries it.
-            std::string es = jstr(data, "execution_style");
-            if (es.empty()) es = jstr(data, "structure");
-            if (!es.empty() && m.planExecutionStyle.empty() && !m.planApprovePending)
-                m.planExecutionStyle = es;
         } else {
             ni.title = stg.empty() ? "Advisor" : ("Advisor \xc2\xb7 " + stg);
             ni.reason = question;
@@ -2465,9 +2268,8 @@ void feedTurnActivity(ChatMsg& m, const std::string& kind, const nlohmann::json&
     // Resume-safe: mark history dirty on activity/text/plan changes; force on terminal events.
     if (m.running || kind == "run_finished" || kind == "mission_finished" ||
         kind == "agent.thought" || kind == "agent.thought.delta" || kind == "assistant_delta" ||
-        kind == "agent.tool_call" || kind == "agent.classification" || kind == "agent.role" ||
-        kind == "agent.spawn" || kind == "plan_state" ||
-        kind == "plan" || kind == "complexity" || kind == "task_route") {
+        kind == "agent.tool_call" || kind == "agent.role" ||
+        kind == "agent.spawn" || kind == "plan_state" || kind == "plan") {
         markChatHistoryDirty();
         if (kind == "run_finished" || kind == "mission_finished")
             s_chatHistoryLastPersist = -1e9;  // force next draw flush

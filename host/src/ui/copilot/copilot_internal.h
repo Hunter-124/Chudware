@@ -255,10 +255,12 @@ std::string chatTokCount(int n);
 
 // ---- run launch helpers (composer; shared with the clarify/plan-approve cards) ----
 nlohmann::json agentProviderOverride(const Settings& s);
-void launchDesignRun(AppState& st, const std::string& request,
+// Launch ONE Chudcode general_agent turn for `request` on the active conversation. Never creates
+// or replaces a document — whether to new_part or edit the active doc is the agent's decision.
+// `extra` is merged on top of the provider override (attachments / context_refs / options…);
+// extra.options.mode defaults to the composer's current mode name ("agent"|"plan"|"ask").
+void launchAgentTurn(AppState& st, const std::string& request,
                      nlohmann::json extra = nlohmann::json::object());
-void launchMissionRunChat(AppState& st, const std::string& request, bool needFreshDoc,
-                          nlohmann::json extra = nlohmann::json::object());
 
 // ---- cards (cards) ----
 void drawClarifyCard(AppState& st, ChatMsg& m, const ui::Fonts& fonts);
@@ -267,8 +269,6 @@ void drawCorpOrgCard(ActivityItem& a, const ui::Fonts& fonts);
 void drawCorpMeetingCard(ActivityItem& a, const ui::Fonts& fonts);
 void drawCorpSteeringCard(const ActivityItem& a, const ui::Fonts& fonts);
 void drawCorpMutedLine(const ActivityItem& a, const ui::Fonts& fonts);
-void drawClassificationCard(ActivityItem& a, const ui::Fonts& fonts,
-                            bool turnRunning = false);
 void drawDelegationCard(const ActivityItem& a, const ui::Fonts& fonts);
 void drawSwarmWaveCard(const ActivityItem& a, const ui::Fonts& fonts);
 void drawFirmBidsCard(const ActivityItem& a, const ui::Fonts& fonts);

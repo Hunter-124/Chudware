@@ -347,18 +347,29 @@ def _assemble_role_runtime(
 def _register_category_refresh(
     tool_context: dict[str, Any], initial_tools: Sequence[Any]
 ) -> Callable[[Any], None]:
+    """Bind the live ``enable_tools`` refresh onto a Chudcode client.
+
+    The ONE implementation for every online lane (main chat and role turns).
+    Tokens are groups, packs, ``family:`` or exact tool names; resolution is
+    :func:`tool_categories.resolve_tool_requests`, so the effective set the
+    model sees after the call is exactly what ``build_host_tools`` re-renders.
+    """
+
     def register(client: Any) -> None:
         initial_names = {
             _text(getattr(binding, "name", None)) for binding in initial_tools
         }
 
         def enable_categories(values: Any) -> dict[str, Any]:
+            from services.agent.tool_categories import resolve_tool_requests
+
             incoming = [values] if isinstance(values, str) else list(values or ())
             categories = tool_context["categories"]
             for value in incoming:
                 name = _text(value)
                 if name and name not in categories:
                     categories.append(name)
+            resolved, unknown = resolve_tool_requests(incoming)
             refreshed = build_host_tools(tool_context)
             try:
                 from chudcode_rpc import host_tool  # type: ignore
@@ -369,15 +380,21 @@ def _register_category_refresh(
             client.set_custom_tools(
                 [binding.to_host_tool(host_tool) for binding in refreshed]
             )
-            return {
+            live = {binding.name for binding in refreshed}
+            result: dict[str, Any] = {
                 "ok": True,
                 "enabled": list(categories),
-                "added": [
-                    binding.name
-                    for binding in refreshed
-                    if binding.name not in initial_names
-                ],
+                "added": sorted(live - initial_names),
+                "unknown": unknown,
             }
+            # A user-picked read-only mode (ask/plan) filters mutators out of
+            # every load. Say so, or the model reads a green result and calls a
+            # tool that was never advertised.
+            blocked = sorted(resolved - live)
+            if blocked:
+                result["blocked_by_mode"] = blocked
+                result["mode"] = _text(tool_context.get("mode")) or "agent"
+            return result
 
         tool_context["enable_categories"] = enable_categories
 

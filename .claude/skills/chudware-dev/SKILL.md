@@ -283,11 +283,22 @@ judgment).
   `chudcode_close_session` call the live runtime. Export uses Chudcode HTML export;
   branch uses a real entry id; doctor is bounded and `repair:true` uses Chudcode's
   backup-producing repair workflow. Never hand-edit persisted session JSONL.
+- **The main chat has a broad core plus a visible catalog (2026-09-03).** The online
+  `general_agent` lane advertises `tool_categories.MAIN_CHAT_CORE_TOOLS` (~62 tools, ~27k
+  tokens) with native schemas, and `mission_dispatch._apply_session_preferences` appends a
+  MORE TOOLS menu naming EVERY other registered tool by group (`render_tool_menu`, ~2.3k
+  tokens). Nothing is hidden and nothing is capped: `enable_tools(tools=[...])` /
+  `enable_tools(categories=[group])` resolve through `resolve_tool_requests` (group → pack →
+  `family:` → exact name) and report `unknown`. The full registry is ~460 tools / ~150k
+  tokens, so never "fix" reachability by widening the core — put a tool in the core only if
+  ordinary part work needs it every turn. `run_shell` stays on the menu, off the core.
 - **Tool floors stay CAD-authoritative.** Preserve allowlist tri-state: `None` is
   unrestricted, explicit `[]` is restricted to live floors, and a non-empty list is an
-  ordinary restriction. Resolve role/mode/category/meta floors and the mutation
-  `verify_battery` floor before schema rendering, then advertise and dispatch the exact same
-  effective set. `enable_tools` accepts named `categories`; rare CAD families stay lazy.
+  ordinary restriction. `chudcode_tools._effective_names` unions on-demand loads BEFORE the
+  mode policy so a user-picked Ask/Plan stays read-only whatever the model loads; Plan is
+  "the agent set minus mutators and fs_write/fs_edit/run_shell", not the contract's broad
+  PLAN_TOOLS. Then meta/bug-report/`verify_battery` floors, then advertise and dispatch the
+  exact same effective set.
 - **Host-tool registration is an adapter, never a second catalog.**
   `chudcode_tools.build_host_tools` derives names, descriptions, schemas, load mode and
   handlers from the live MCP/mission registries. Do not advertise unbound or async-only
@@ -299,13 +310,19 @@ judgment).
   progress and cancellation callbacks, JSON-safe results, and machine-readable refusal
   shapes. Tool exceptions propagate as Chudcode tool errors; never turn them into a
   successful result.
-- **Routing remains model-driven, execution is now service-owned.** The `general_agent` role
-  is the universal online entry and the model decides whether to finish inline, use CAD host
-  tools, or spawn nested Chudcode work. `workflow_router` classification is advisory
-  telemetry only. The offline exception is deterministic: general work refuses without an
-  online provider, while offline-safe local modeling may use the native C++ pipeline.
-  Explicit Chudware mission/DAG policy remains CAD-owned but its provider calls run through
-  Chudcode.
+- **There is no classification step (2026-09-03).** A chat send is ONE Chudcode
+  `general_agent` turn with the user-picked mode (Agent | Plan | Ask, `CopilotMode` 0/1/2)
+  and `options.scope = {doc_id, feature_ids, selection}` whenever a document is open (rendered
+  as the ACTIVE DOCUMENT block by `worker_rpc._editor_context_block`). The composer never
+  keyword-routes (no `agent_ask_v2`/`agent_simulate_v1`/auto-mission/edit-scope paths), never
+  creates or replaces a document (that is the agent's `new_part` decision), and never inlines
+  the transcript into the request (the persistent Chudcode session is the conversation;
+  `options.history` seeds a fresh one once). The GUI has no Routing card and no session
+  `scopeClass`; do not reintroduce `task_route`/`agent.classification` consumers. The offline
+  exception is deterministic: general work refuses without an online provider, while
+  offline-safe local modeling may use the native C++ pipeline (which keeps its own
+  complexity/domain classification for its stage structure). Explicit Chudware mission/DAG
+  policy remains CAD-owned but its provider calls run through Chudcode.
 - **Prompt override isolation (2026-08-07):** native/core C++ prompts consume
   `appdata/prompts/<id>.md`; YAML mission roles consume
   `appdata/prompts/<id>.mission.md`. Settings catalogs both as `core:<id>` and

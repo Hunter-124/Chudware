@@ -74,16 +74,26 @@ enum JobKind { JOB_BUILD, JOB_DESIGN, JOB_CHAT };
 enum class Units { MMGS = 0, IPS = 1 };
 
 // ---------------- settings (AI provider) -> %APPDATA%/Chudware/config.json ----------------
-// Copilot composer interaction mode (Agent | Plan | Swarm | Edit | Ask | Eng. Firm).
-// Integer values match Settings::copilotMode / AppState::aiInteraction for persistence.
+// Copilot composer interaction mode (Agent | Plan | Ask) — a USER choice, never inferred from
+// the request text. Every mode runs the same Chudcode general_agent turn; the mode only sets the
+// user-chosen tool policy (Ask read-only, Plan no mutators). Integer values match
+// Settings::copilotMode / AppState::aiInteraction / ChatMsg::copilotMode for persistence.
+// Legacy Swarm(2)/Edit(3)/EngFirm(5) values are migrated to Agent on load; legacy Ask(4) to Ask.
 enum class CopilotMode : int {
-    Agent   = 0,
-    Plan    = 1,
-    Swarm   = 2,
-    Edit    = 3,
-    Ask     = 4,
-    EngFirm = 5,  // engineering-firm org: roles, contractor firms, budget + token-bid dispatch
+    Agent = 0,
+    Plan  = 1,
+    Ask   = 2,
 };
+constexpr int kCopilotModeCount = 3;
+// Map a persisted mode integer from any build to the current enum (see the note above).
+inline int normalizeCopilotMode(int v) {
+    switch (v) {
+        case 1: return (int)CopilotMode::Plan;
+        case 2: return (int)CopilotMode::Ask;   // current Ask
+        case 4: return (int)CopilotMode::Ask;   // legacy Ask
+        default: return (int)CopilotMode::Agent;
+    }
+}
 
 struct Settings {
     int provider = 9;  // 0=Anthropic 1=OpenAI 2=Local OpenAI-compat 3=managed llama.cpp 4=Gemini
@@ -121,16 +131,11 @@ struct Settings {
     // Opt-in company structure auto-route (agent.corporate_mode). Default off —
     // Agent never auto-invokes company; enable in Settings → AI → Behavior when ready.
     bool corporateMode = false;
-    // Agent-mode auto-route to agent_mission_v1 on build+analyze phrasing (default off —
-    // main chat stays on the direct general_agent tool loop).
-    bool autoMissionRouting = false;
-    // Main-chat general_agent gets the full tool catalog (default on).
-    bool directAgentFullTools = true;
     bool memoryEnabled = true;   // project SQLite memory under .plm/memory.db
     int memoryTokenBudget = 400; // max tokens injected from project memory per turn
-    // Copilot composer mode: Agent | Plan | Swarm | Edit | Ask. Persisted as "copilot_mode".
+    // Copilot composer mode: Agent | Plan | Ask. Persisted as "copilot_mode" (name string).
     // Values match AppState::aiInteraction / CopilotMode.
-    int copilotMode = 0;         // 0=Agent 1=Plan 2=Swarm 3=Edit 4=Ask 5=EngFirm
+    int copilotMode = 0;
     // Box.com project mirror. GUI-owned fields overlay config.json "box" / "box.auth";
     // OAuth access/refresh tokens remain Python-owned and are never modeled here.
     bool boxEnabled = false;
@@ -707,15 +712,12 @@ struct ChatMsg {
     bool planApprovePending = false;
     std::string planApproveRequest;   // original user request to re-launch with approved_plan
     nlohmann::json planApproveExtras = nlohmann::json::object();  // attachments/context_refs
-    // Decided execution style from plan_ready / task_route ("edit"|"agent"|"swarm"|"eng_firm").
-    // Card highlights the matching Execute button as Recommended.
-    std::string planExecutionStyle;
     // Optional escalate/advisor reason shown on the approve card (needs_user_decision).
     std::string planApproveReason;
     // Mission status=="partial": warning-accent result card (not error). Geometry kept.
     bool resultPartial = false;
-    // Per-message copilot mode stamp (CopilotMode 0..5). -1 = unstamped / no mode border.
-    // Set at submitTurn from st.aiInteraction; auto-switch (Ask→Agent) updates the assistant.
+    // Per-message copilot mode stamp (CopilotMode 0..2). -1 = unstamped / no mode border.
+    // Set at submitTurn from st.aiInteraction; legacy persisted values pass normalizeCopilotMode.
     int copilotMode = -1;
     // Assistant turn: prompt-cache read tokens of the turn's LARGEST single completion
     // (agent.context events, feed.cpp). This is the figure shown in the bubble meta row,
@@ -780,10 +782,6 @@ struct Conversation {
     std::vector<ChatMsg> msgs;      // populated only while INACTIVE (active lives in AppState::chat)
     int lastContextTokens = 0;     // per-session context meter (input tokens from last model call)
     std::vector<std::string> queuedPrompts;  // queued while this session's turn was active
-    // Assessed work scope for this session, set once from the first task_route/complexity event
-    // the model emits (the model also (re)names the session then). Drives the rail color-code.
-    // -1 = unassessed, 0 = trivial, 1 = standard, 2 = complex, 3 = epic. See scopeClassColor().
-    int scopeClass = -1;
     // Archived sessions are hidden from the default Sessions list (Show archived toggle
     // reveals them) but keep their transcript/history — a soft "trash" before real deletion.
     bool archived = false;
@@ -792,9 +790,6 @@ struct Conversation {
     std::vector<ChatBranch> branches;
 };
 
-// Rail/tab color-code for a Conversation::scopeClass (RGBA 0..1). Unassessed (-1) returns a
-// neutral tone. Defined in ui/copilot/conversations.cpp.
-void scopeClassColor(int scopeClass, float out[4]);
 
 // A progress event streamed from the worker (parsed off the worker thread, applied on the
 // main/GL thread so texture uploads stay on the GL context). kind: "status" | "iteration".
@@ -1795,12 +1790,6 @@ struct AppState {
                                              // doc-mutation guards); NOT a concurrency lock. See
                                              // AppState::anyRunActive()/convRunning() for the real
                                              // per-conversation/global run-state checks.
-    // Chat-triggered accurate (OpenFOAM) CFD: launched on the SimClient channel (non-blocking) and
-    // fulfilled by ui::pollChatOpenFoam each frame (it can't use the serialised st.rpc for a
-    // minutes-long solve). chatCfdVel/Aoa carry the parsed condition for the result message.
-    bool chatCfdPending = false;
-    double chatCfdVel = 10.0;
-    double chatCfdAoa = 0.0;
     // Live context-meter telemetry. `lastContextTokens` is the most recent agent call's INPUT
     // token count (how full the model's context is right now); `lastContextWindow` is the
     // window the SERVER reported for the model that actually ran, which beats any client-side

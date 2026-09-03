@@ -933,53 +933,17 @@ void drawSessionsPanel(AppState& st, bool busy) {
         float wash = active ? 0.55f : (rowHot ? 0.44f : 0.34f);
         ui::glassRowBackground(dl, rowMin, rowMax, rowRndDp, (i % 2) == 1, active, wash);
 
-        // Scope color-code: once the model has assessed the session (first routing event),
-        // tint the row with a subtle wash + a tiny class chip on the title line.
-        // semanticOnGlass keeps the chip ink legible over dark + light glass. (The old 3px
-        // left-edge bar read as a stray vertical line above the rows — removed.)
-        float chipW = 0.0f;   // chip + its gap to the title — the title clip reserves this
-        if (c.scopeClass >= 0) {
-            float scopeRgba[4];
-            scopeClassColor(c.scopeClass, scopeRgba);
-            const ImVec4 scopeCol = semanticOnGlass(scopeRgba, surf);
-            ImVec4 washCol = scopeCol;
-            washCol.w = active ? 0.10f : 0.07f;
-            dl->AddRectFilled(rowMin, rowMax, ImGui::ColorConvertFloat4ToU32(washCol),
-                              rowRnd);
-
-            const char* scopeLbl = c.scopeClass == 0 ? "trivial" : c.scopeClass == 1 ? "standard"
-                                 : c.scopeClass == 2 ? "complex" : "epic";
-            const ImVec2 lsz = ImGui::CalcTextSize(scopeLbl);
-            // Right-aligned against whatever sits to its right this frame: the action
-            // buttons on hover/active rows, the row edge on idle ones.
-            const float cx1 = rowMax.x - actionsReserve - padX;
-            const float cx0 = cx1 - lsz.x - 8.0f * sc;
-            chipW = (cx1 - cx0) + 6.0f * sc;
-            const float cy0 = rowMin.y + padY + (titleH - lsz.y) * 0.5f - 1.0f * sc;
-            const float cy1 = cy0 + lsz.y + 2.0f * sc;
-            ImVec4 chipBg = scopeCol;
-            chipBg.w = 0.16f;
-            dl->AddRectFilled(ImVec2(cx0, cy0), ImVec2(cx1, cy1),
-                              ImGui::ColorConvertFloat4ToU32(chipBg),
-                              ui::metrics::cpMenuChipRound());
-            ImVec4 chipInk = scopeCol;
-            chipInk.w = 1.0f;
-            dl->AddText(ImVec2(cx0 + 4.0f * sc, cy0 + 1.0f * sc),
-                        ImGui::ColorConvertFloat4ToU32(chipInk), scopeLbl);
-        }
-
         // Titles and snippets are user text of arbitrary length and are painted straight onto
         // the draw list, which does NOT clip to the row — a long snippet used to run out past
         // the card, under the scrollbar and off the column edge. Clip both to the room they
-        // actually have (title also yields the action-button zone and the scope chip — an
-        // unreserved chip used to paint right over the title's tail) with a real ellipsis.
+        // actually have (title also yields the action-button zone) with a real ellipsis.
         const float titleY = rowMin.y + padY;
         // In-flight sessions get the animated tesseract icon at the row's left edge; text
         // indents past it only for those rows.
         const float runIndent = running ? drawSessionRunningIcon(dl, surf, rowMin, rowH, padX, sc)
                                         : 0.0f;
         const float textMaxW = std::max(ui::metrics::px(24.0f),
-                                        rowW - padX * 2.0f - actionsReserve - chipW - runIndent);
+                                        rowW - padX * 2.0f - actionsReserve - runIndent);
         const std::string titleShown = ui::kit::elide(title.c_str(), textMaxW);
         ImU32 ink = ImGui::ColorConvertFloat4ToU32(surf.textPrimary);
         dl->AddText(ImVec2(rowMin.x + padX + runIndent, titleY), ink, titleShown.c_str());

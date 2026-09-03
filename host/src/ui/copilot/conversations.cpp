@@ -15,34 +15,8 @@
 #include <cctype>
 #include <filesystem>
 
-// Defined in feed.cpp — consumes the routing fields stashed by feedTurnActivity's
-// task_route/agent.classification/complexity branch (feedTurnActivity only sees a ChatMsg;
-// the GL draw path applies the assessment to the active Conversation here).
-bool takePendingScopeAssessment(std::string& domain, std::string& complexity,
-                                std::string& structure, std::string& execStyle,
-                                std::string& snippet);
-
-// Rail/tab color-code for Conversation::scopeClass (declared in core/app_state.h).
-// -1 unassessed -> neutral dim, 0 trivial -> iterBuilt, 1 standard -> accent,
-// 2 complex -> amber warn, 3 epic -> red err. RGBA 0..1, alpha 1.
-void scopeClassColor(int scopeClass, float out[4]) {
-    const float* src = ui::palette.textDim;
-    switch (scopeClass) {
-        case 0:  src = ui::palette.iterBuilt;  break;
-        case 1:  src = ui::palette.accent;     break;
-        case 2:  src = ui::palette.statusWarn; break;
-        case 3:  src = ui::palette.statusErr;  break;
-        default: break;  // -1 (unassessed) + unknown -> neutral
-    }
-    out[0] = src[0];
-    out[1] = src[1];
-    out[2] = src[2];
-    out[3] = 1.0f;
-}
-
 // Resolve the live message vector for a conversation id — see core/app_state.h for the
-// contract. Global scope (not ui::) to match its app_state.h declaration, exactly like
-// scopeClassColor above.
+// contract. Global scope (not ui::) to match its app_state.h declaration.
 std::vector<ChatMsg>* conversationMsgs(AppState& st, const std::string& convId) {
     if (convId.empty()) return nullptr;
     if (st.activeConv >= 0 && st.activeConv < (int)st.conversations.size() &&
@@ -572,7 +546,6 @@ static nlohmann::json rawMessageToJson(const ChatMsg& m) {
         {"planApprovePending", m.planApprovePending},
         {"planApproveRequest", m.planApproveRequest},
         {"planApproveExtras", m.planApproveExtras},
-        {"planExecutionStyle", m.planExecutionStyle},
         {"planApproveReason", m.planApproveReason},
         {"resultPartial", m.resultPartial},
         {"copilotMode", m.copilotMode},
@@ -952,7 +925,7 @@ void persistChatHistory(AppState& st) {
             if (!m.fromUser && !m.activity.empty()) {
                 nlohmann::json act = nlohmann::json::array();
                 const int nAct = (int)m.activity.size();
-                // Keep all thought/tool/routing rows (rk 2/3/10) + last N stage rows so
+                // Keep all thought/tool/plan rows (rk 1/2/3/18) + last N stage rows so
                 // mid-turn kill/restart still has planning + tools visible.
                 std::vector<int> keepIdx;
                 keepIdx.reserve((size_t)nAct);
@@ -960,7 +933,7 @@ void persistChatHistory(AppState& st) {
                 const int kMaxStages = 80;
                 for (int ai = nAct - 1; ai >= 0; --ai) {
                     const auto& a = m.activity[(size_t)ai];
-                    const bool priority = (a.rowKind == 2 || a.rowKind == 3 || a.rowKind == 10 ||
+                    const bool priority = (a.rowKind == 2 || a.rowKind == 3 ||
                                            a.rowKind == 1 || a.rowKind == 18 ||
                                            a.stage == "__stop_meta__");
                     if (priority) {
@@ -1041,7 +1014,6 @@ void persistChatHistory(AppState& st) {
         // Optional document LINK (reference only — never an ownership key).
         if (!st.conversations[i].docLink.empty())
             convObj["doc"] = st.conversations[i].docLink;
-        convObj["scope"] = st.conversations[i].scopeClass;  // rail color-code (-1 = unassessed)
         if (st.conversations[i].archived) convObj["archived"] = true;
         // Chudcode runtime link (id/file/health) — metadata only, never a second transcript.
         chudcodeLinkPersist(st.conversations[i].id, convObj);
@@ -1113,60 +1085,8 @@ void persistChatHistory(AppState& st) {
     }
 }
 
-// Map routing labels (complexity / structure / execution_style) to a scope class:
-// simple/solo -> 0, standard -> 1, complex -> 2, epic/huge -> 3.
-static int scopeClassFromRouting(const std::string& complexity, const std::string& structure,
-                                 const std::string& execStyle) {
-    auto norm = [](std::string s) {
-        for (char& ch : s) ch = (char)std::tolower((unsigned char)ch);
-        return s;
-    };
-    const std::string vals[3] = {norm(complexity), norm(structure), norm(execStyle)};
-    auto anyIs = [&](std::initializer_list<const char*> keys) {
-        for (const auto& v : vals)
-            for (const char* k : keys)
-                if (v == k) return true;
-        return false;
-    };
-    if (anyIs({"epic", "huge", "company", "eng_firm"})) return 3;
-    if (anyIs({"complex", "dag", "swarm"})) return 2;
-    if (anyIs({"simple", "solo", "trivial"})) return 0;
-    // "standard", "subagent", "edit", or any assessed-but-unrecognized label.
-    return 1;
-}
-
-// Consume the routing assessment stashed by feed.cpp and stamp the ACTIVE conversation on
-// its FIRST routing event (scopeClass -1 -> class): sets the rail color-code class and, when
-// the title is still the default "Chat N", a concise model-derived name from the routing
-// domain (+ short snippet when the classifier provided one).
-static void applyPendingScopeAssessment(AppState& st) {
-    std::string domain, complexity, structure, execStyle, snippet;
-    if (!takePendingScopeAssessment(domain, complexity, structure, execStyle, snippet)) return;
-    if (st.activeConv < 0 || st.activeConv >= (int)st.conversations.size()) return;
-    Conversation& c = st.conversations[st.activeConv];
-    if (c.scopeClass >= 0) return;  // first assessment wins; later routing events enrich only
-    c.scopeClass = scopeClassFromRouting(complexity, structure, execStyle);
-    const bool defaultTitle = c.title.empty() || c.title == "Chat" ||
-        (c.title.rfind("Chat ", 0) == 0 &&
-         c.title.find_first_not_of("0123456789", 5) == std::string::npos);
-    if (defaultTitle) {
-        std::string name = domain;
-        if (!name.empty()) name[0] = (char)std::toupper((unsigned char)name[0]);
-        if (!snippet.empty()) {
-            std::string s = snippet;
-            const size_t nl = s.find('\n');
-            if (nl != std::string::npos) s = s.substr(0, nl);
-            if (s.size() > 48) s = s.substr(0, 45) + "...";
-            if (!s.empty()) name += (name.empty() ? std::string() : std::string(" - ")) + s;
-        }
-        if (!name.empty()) c.title = name;
-    }
-    markChatHistoryDirty();
-}
-
 // Debounced flush while a turn is running (min 1.0s). Force bypasses the timer.
 void maybePersistChatHistoryDebounced(AppState& st, bool force) {
-    applyPendingScopeAssessment(st);
     if (!force && !s_chatHistoryDirty.load(std::memory_order_relaxed)) return;
     const double now = ImGui::GetTime();
     if (!force && (now - s_chatHistoryLastPersist) < 1.0) return;
@@ -1180,42 +1100,6 @@ void maybePersistChatHistoryDebounced(AppState& st, bool force) {
     s_chatHistoryDirty.store(false, std::memory_order_relaxed);
     s_chatHistoryLastPersist = now;
     persistChatHistory(st);
-}
-
-
-void pollChatOpenFoam(AppState& st) {
-    if (!st.chatCfdPending || !st.simClient) return;
-    core::SimJobResult& job = st.simClient->job();
-    if (!job.ready.load()) return;                 // OpenFOAM still meshing/solving
-    if (job.ownerDocId != "__chat_cfd__") return;  // not the chat's job (a study's result)
-    st.chatCfdPending = false;
-    job.ready = false;                             // consume (SimManager ignored it — wrong owner)
-
-    ChatMsg* msg = nullptr;
-    for (auto it = st.chat.rbegin(); it != st.chat.rend(); ++it)
-        if (!it->fromUser && it->running) { msg = &*it; break; }
-
-    std::string answer, err;
-    if (!job.ok) {
-        err = job.error.empty() ? "OpenFOAM run failed" : job.error;
-    } else {
-        const double cd = job.result.value("cd", 0.0), cl = job.result.value("cl", 0.0);
-        const double drag = job.result.value("drag_n", 0.0), lift = job.result.value("lift_n", 0.0);
-        const double re = job.result.value("reynolds", 0.0);
-        char b[512];
-        std::snprintf(b, sizeof(b),
-            "Accurate OpenFOAM RANS (k-omega SST) at %.1f m/s, %.1f deg AoA (Re %.0f): drag %.3f N, "
-            "lift %.3f N, Cd %.3f, Cl %.3f. Validated solver — trust these as absolute coefficients.",
-            st.chatCfdVel, st.chatCfdAoa, re, drag, lift, cd, cl);
-        answer = b;
-    }
-    if (msg) {
-        msg->running = false; msg->liveStatus.clear();
-        if (!err.empty()) { msg->errKind = ERR_SYSTEM; msg->text = "The CFD sim failed: " + err; }
-        else msg->text = answer;
-    }
-    st.status = err.empty() ? "Ready." : "CFD failed.";
-    st.statusKind = err.empty() ? 0 : 2;
 }
 
 // Parse ONE persisted session object into the resident set (APPEND). docLink is the
@@ -1232,7 +1116,6 @@ static bool parseChatSessionJson(AppState& st, const nlohmann::json& jc,
         noteConvIdSeen(st, c.id);
         c.title = jc.value("title", std::string("Chat"));
         c.docLink = docLink;
-        c.scopeClass = jc.value("scope", -1);  // legacy sessions omit the key
         c.archived = jc.value("archived", false);
         // This session's own saved execution trace, straight into its conversation-keyed store
         // (no active/parked special case — switching sessions just reads the other tree).
@@ -1247,7 +1130,9 @@ static bool parseChatSessionJson(AppState& st, const nlohmann::json& jc,
             cm.text = m.value("t", std::string());
             cm.errKind = m.value("e", 0);
             if (!cm.fromUser) cm.model = m.value("m", std::string());
-            cm.copilotMode = m.value("cm", -1);  // -1 when absent (legacy sessions)
+            // Legacy per-message mode ints (Swarm/Edit/EngFirm) fold onto the Agent|Plan|Ask
+            // enum; -1 stays -1 (absent = no badge).
+            cm.copilotMode = m.contains("cm") ? normalizeCopilotMode(m.value("cm", -1)) : -1;
             cm.errorHuman = m.value("eh", std::string());
             cm.errorFull = m.value("ef", std::string());
             cm.ts = m.value("ts", 0.0);          // 0 = legacy (constructed with now) — no age label
@@ -2046,7 +1931,6 @@ int forkConversation(AppState& st, int idx) {
     }
     fork.title = std::move(title);
     fork.docLink = source.docLink;
-    fork.scopeClass = source.scopeClass;
     fork.archived = false;
     fork.msgs = idx == st.activeConv ? st.chat : source.msgs;
     for (auto& msg : fork.msgs) {

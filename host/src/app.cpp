@@ -4801,11 +4801,6 @@ int run_gui(const char *screenshotPath, const char *openPath) {
     if (!engine::daemonMode())
       ui::pollAiCadHandoff(st);
 
-    // If a chat-triggered accurate (OpenFOAM) CFD finished on the SimClient
-    // channel, post its Cd/Cl onto the running chat bubble. No-op unless a chat
-    // OpenFOAM run is pending.
-    ui::pollChatOpenFoam(st);
-
     // C48: click telemetry for interaction debugging — only when
     // CHUDWARE_DEBUG_INPUT is set (pairs with CHUDWARE_LOG_FILE). Logs what ImGui
     // thinks is under every click.
@@ -4911,12 +4906,10 @@ int run_gui(const char *screenshotPath, const char *openPath) {
             // Viewed doc only — the meter and the preview trackers describe
             // the document the user is looking at.
             //
-            // TWO reset points, because the two lanes start a run with
-            // different first events: run_started fires on the C++ agent lane,
-            // task_route is the first event of every live Python general-lane
-            // run (which never emits run_started at all). Both resets are
-            // idempotent; neither is redundant — deleting either leaves that
-            // lane showing the previous run's numbers.
+            // ONE reset point: run_started opens every run on both lanes (the
+            // live Python general lane emits it first, then thinking/tool rows
+            // and assistant deltas), so the meter can never show the previous
+            // run's numbers.
             //
             // agent.context also carries `window_source` ("user" | "catalog" |
             // "probe" | "heuristic" | ""), i.e. HOW the harness arrived at
@@ -4937,13 +4930,6 @@ int run_gui(const char *screenshotPath, const char *openPath) {
                 // Preview trackers ARE document state — they stay doc-scoped.
                 s_lastPreviewRev = 0;
                 s_lastPreviewDocId.clear();
-              }
-            } else if (orchKind == "task_route") {
-              // Live general lane's run start (see the two-reset note above).
-              if (isViewedConv) {
-                st.lastContextTokens = 0;
-                st.lastContextWindow = 0;
-                ui::setContextWindowSource(std::string());
               }
             } else if (orchKind == "agent.context") {
               if (isViewedConv) {
@@ -5714,15 +5700,10 @@ int run_gui(const char *screenshotPath, const char *openPath) {
                   }
                 }
               }
-              // Seed plan section + execution_style + escalate reason from
-              // payload.
+              // Seed plan section + escalate reason from payload.
               if (!job.planReadyJson.empty()) {
                 try {
                   auto stash = nlohmann::json::parse(job.planReadyJson);
-                  if (stash.contains("execution_style") &&
-                      stash["execution_style"].is_string())
-                    active->planExecutionStyle =
-                        stash["execution_style"].get<std::string>();
                   if (stash.contains("reason") && stash["reason"].is_string())
                     active->planApproveReason =
                         stash["reason"].get<std::string>();
@@ -5753,18 +5734,10 @@ int run_gui(const char *screenshotPath, const char *openPath) {
                 } catch (...) {
                 }
               }
-              if (active->planExecutionStyle.empty() &&
-                  !job.stopReason.empty()) {
-                // Soft default: manual Plan mode often resumes as agent.
-                if (job.stopReason == "plan_only" ||
-                    job.stopReason == "awaiting_plan_approval")
-                  active->planExecutionStyle = "agent";
-              }
             } else if (!job.planReady && active->planApprovePending) {
               // Run finished without a user gate — drop any leftover draft flag
               // (e.g. Plan mode that failed before plan_ready).
               active->planApprovePending = false;
-              active->planExecutionStyle.clear();
               active->planApproveReason.clear();
             }
             // Replace (never append) so a streamed waterfall isn't duplicated.

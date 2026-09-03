@@ -88,6 +88,30 @@ void testRunAndSessionIds() {
           "conversation id supplies missing session id");
 }
 
+// The composer's user-picked mode is authoritative for a normal (non-mission) turn: the route
+// must never re-derive it, and an absent/blank mode falls back to "agent".
+void testComposerModePreserved() {
+    for (const char* mode : {"plan", "ask", "agent"}) {
+        const AgentJobRpcRoute route = buildAgentJobRpcRoute(
+            "what is this", "doc", "conv", false, {{"options", {{"mode", mode}}}}, false);
+        check(route.params.value("mode", std::string()) == mode,
+              "composer mode preserved at top level");
+        check(route.params["options"].value("mode", std::string()) == mode,
+              "composer mode preserved in options");
+    }
+    const AgentJobRpcRoute blank = buildAgentJobRpcRoute(
+        "hi", "doc", "conv", false, {{"options", {{"mode", ""}}}}, false);
+    check(blank.params.value("mode", std::string()) == "agent", "blank mode defaults to agent");
+    check(blank.params["options"].value("mode", std::string()) == "agent",
+          "blank options mode defaults to agent");
+
+    // A mission still forces the swarm lane even when the composer picked plan.
+    const AgentJobRpcRoute mission = buildAgentJobRpcRoute(
+        "build and verify", "doc", "conv", false, {{"options", {{"mode", "plan"}}}}, true);
+    check(mission.params.value("mode", std::string()) == "swarm",
+          "mission overrides the composer mode");
+}
+
 void testOnlineMissionRoute() {
     const nlohmann::json extra = {
         {"provider", "anthropic"},
@@ -219,6 +243,7 @@ void testEventConsumption() {
 int main() {
     testOnlineNormalRoute();
     testRunAndSessionIds();
+    testComposerModePreserved();
     testOnlineMissionRoute();
     testExplicitOfflineFallbacks();
     testAdminResultMapping();

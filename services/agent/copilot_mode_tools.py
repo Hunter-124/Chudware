@@ -166,10 +166,14 @@ def apply_mode_tools(
         # enable_tools. Only the correct lane's fs/shell floor is automatic.
         return sorted(role_set | default_floor)
 
-    # Plan: open like agent minus geometry commit mutators (add_features etc.),
-    # then floor with SHARED_DEFAULT_TOOLS so make/save/open/close stay.
+    # Plan: open like agent minus geometry commit mutators (add_features etc.)
+    # AND the main-agent write floor (fs_write/fs_edit/run_shell) — a plan is
+    # read-only whatever the role card carried — then floor with
+    # SHARED_DEFAULT_TOOLS so make/save/open/close stay.
     if m == "plan":
-        _plan_deny = _MUTATING_TOOLS | {"new_assembly", "edit_feature"}
+        _plan_deny = _MUTATING_TOOLS | {
+            "new_assembly", "edit_feature", "fs_write", "fs_edit", "run_shell",
+        }
         # new_part / close_part / import_part live in SHARED_DEFAULT_TOOLS and
         # are re-added below (product: plan can build simple parts).
         if role_set:

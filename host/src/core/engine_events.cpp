@@ -377,8 +377,8 @@ void handleEvent(AppState& st, const json& evt) {
     // {"event":"agent.event","data":<ev>}. Route it into the OWNING run's event queue (matched
     // by run_id — every event carries one, including run_started) with the same "orch_" prefix
     // launchAgentRunV2's in-proc onEvent uses, so the app.cpp drain renders that conversation's
-    // timeline LIVE (classifier decision, stages, assistant_delta, model I/O) instead of a
-    // frozen "Classifying request…" box until the batched result.
+    // timeline LIVE (thinking bursts, tool-call rows, assistant_delta, stage rows) instead of
+    // a frozen "Thinking…" placeholder until the batched result.
     if (name == "agent.event") {
         JobState* job = runForEvent(st, d.value("run_id", std::string()));
         if (!job) return;  // unknown or ambiguous run — never guess a target conversation

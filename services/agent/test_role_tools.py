@@ -83,13 +83,5 @@ def test_tool_families_kill_switch_overrides_union():
     assert fams["office"] is True
 
 
-def test_direct_agent_full_tools_default_on():
-    assert cfg.direct_agent_full_tools({}) is True
-
-
-def test_auto_mission_routing_default_off():
-    assert cfg.auto_mission_routing({}) is False
-
-
 def test_plan_preference_default_off():
     assert cfg.get_plan_preference({}) == "off"

@@ -736,13 +736,6 @@ YAML_ROLE_TO_HARNESS: dict[str, str] = {
     "memory": "memory",
 }
 
-# Main-chat agent uses a full tool surface (no 14-tool cap / no lean packs) when
-# agent.direct_agent_full_tools is true (default). Settings → AI → Harness.
-DEFAULT_DIRECT_AGENT_FULL_TOOLS = True
-# Agent-mode auto-route to mission_start / agent_mission_v1 on build+analyze
-# phrasing. Default off — main chat stays on the direct general_agent turn.
-DEFAULT_AUTO_MISSION_ROUTING = False
-
 
 def get_role_tools(role: str, cfg: dict | None = None) -> list[str]:
     """Return the default tool-family list for a harness *role*.
@@ -802,40 +795,6 @@ def harness_role_for_yaml(role_id: str) -> str:
     if rid in HARNESS_ROLE_KEYS:
         return rid
     return YAML_ROLE_TO_HARNESS.get(rid, "default")
-
-
-def direct_agent_full_tools(cfg: dict | None = None) -> bool:
-    """When True, main-chat ``general_agent`` / ``default`` get an uncapped tool surface."""
-    try:
-        env = os.environ.get("CHUDWARE_DIRECT_AGENT_FULL_TOOLS")
-        if env is not None and str(env).strip() != "":
-            return str(env).strip().lower() not in ("0", "false", "no", "off")
-    except Exception:  # noqa: BLE001
-        pass
-    try:
-        agent = _agent_block(cfg)
-        if "direct_agent_full_tools" in agent:
-            return bool(agent.get("direct_agent_full_tools"))
-    except Exception:  # noqa: BLE001
-        pass
-    return DEFAULT_DIRECT_AGENT_FULL_TOOLS
-
-
-def auto_mission_routing(cfg: dict | None = None) -> bool:
-    """When True, Agent mode may auto-route build+analyze phrasing to a mission."""
-    try:
-        env = os.environ.get("CHUDWARE_AUTO_MISSION_ROUTING")
-        if env is not None and str(env).strip() != "":
-            return str(env).strip().lower() not in ("0", "false", "no", "off")
-    except Exception:  # noqa: BLE001
-        pass
-    try:
-        agent = _agent_block(cfg)
-        if "auto_mission_routing" in agent:
-            return bool(agent.get("auto_mission_routing"))
-    except Exception:  # noqa: BLE001
-        pass
-    return DEFAULT_AUTO_MISSION_ROUTING
 
 
 # ---------------------------------------------------------------------------

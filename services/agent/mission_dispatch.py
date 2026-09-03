@@ -2509,12 +2509,23 @@ LINEAR_ROLE_MAX_OUTPUT_TOKENS = 8192
 
 
 def linear_role_allowed_tools(card: Any) -> list[str]:
-    """Return the universal main-chat loadout used by live turns and previews."""
+    """Return the universal main-chat loadout used by live turns and previews.
+
+    The interactive lane is not a capped DAG-node role: it gets the broad
+    :data:`tool_categories.MAIN_CHAT_CORE_TOOLS` core with schemas up front, plus
+    the card's own seats, the contract fs floor and the bug-report floor. Every
+    other registered tool is listed by name in the prompt menu appended by
+    :func:`_apply_session_preferences` and loads on demand — nothing is hidden,
+    and ``run_shell`` deliberately stays off the automatic floor.
+    """
     from services.agent.copilot_mode_tools import (  # noqa: PLC0415
         MAIN_CHAT_DEFAULT_TOOLS,
     )
+    from services.agent.tool_categories import (  # noqa: PLC0415
+        MAIN_CHAT_CORE_TOOLS,
+    )
 
-    allowed = set(card.concrete_tools) | MAIN_CHAT_DEFAULT_TOOLS
+    allowed = set(MAIN_CHAT_CORE_TOOLS) | set(card.concrete_tools) | MAIN_CHAT_DEFAULT_TOOLS
     try:
         from services.agent.config import bugreport_floor  # noqa: PLC0415
 
@@ -2560,15 +2571,14 @@ def _apply_session_preferences(
     must never widen or narrow a curated role's scope.
 
     Returns the possibly-trimmed allow-set and the prompt with one compact
-    SESSION PREFERENCES block appended. Never raises into the turn path.
+    SESSION PREFERENCES block appended, followed by the main-chat TOOL MENU
+    (:func:`tool_categories.render_tool_menu`): every registered tool that is
+    NOT in the allow-set, by exact name, so the model can see and load any of
+    them. Never raises into the turn path.
 
     ``task_list`` is granted HERE rather than from a ``tool:`` seat in
-    general_agent.yaml: role cards are capped at ``MAX_TOOLS_PER_ROLE`` (14) and
-    explicit entries win seats before family expansions, so spending a seat on it
-    silently evicted ``plm_checkpoint`` off the tail of ``family: plm`` — the
-    model kept a planning tool and lost the ability to checkpoint the work it
-    planned. It is a harness surface (like enable_tools), not a CAD capability,
-    so it belongs on the lane floor where the cap does not apply.
+    general_agent.yaml: it is a harness surface (like enable_tools), not a CAD
+    capability, so it belongs on the lane floor with the rest of the core.
     """
     if role != "general_agent":
         return allowed, system_prompt
@@ -2657,6 +2667,14 @@ def _apply_session_preferences(
             + "\n\nSESSION PREFERENCES (override earlier role-card defaults)\n"
             + "\n".join(f"- {ln}" for ln in lines)
         )
+    try:
+        from services.agent.tool_categories import render_tool_menu  # noqa: PLC0415
+
+        menu = render_tool_menu(allowed)
+    except Exception:  # noqa: BLE001 — a cold registry simply renders no menu
+        menu = ""
+    if menu:
+        system_prompt = (system_prompt or "").rstrip() + "\n\n" + menu
     return allowed, system_prompt
 
 

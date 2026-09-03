@@ -1,8 +1,8 @@
 // Copilot composer (T-RF6 split of legacy_chat.cpp): the auto-growing wrapping chat input,
-// file attachments + context refs, design/mission run launch, the session slash commands
+// file attachments + context refs, the single agent-turn launch, the session slash commands
 // (/compact /shake /handoff /btw /prewalk /rule /skills /help), slash-menu autocomplete
 // (commands + skills), the submitTurn send path, and the composer chrome (runtime banner,
-// Agent/Plan/Swarm/Edit/Ask prelude + context/provider-limit gauge rings, graduated
+// Agent/Plan/Ask prelude + context/provider-limit gauge rings, graduated
 // segmented toolbar, in-box send/stop).
 
 #include "copilot_internal.h"
@@ -799,34 +799,22 @@ static void attachAgentConversationOptions(AppState& st, nlohmann::json& opts) {
     ccLink.runtimeLive = true;
 }
 
-// `extra` is merged on top of the provider override (attachments / context_refs / …).
-void launchDesignRun(AppState& st, const std::string& request,
-                            nlohmann::json extra) {
-    std::string err;
-    bool docOk = st.docMirror.hasDoc();
-    if (docOk) {
-        const nlohmann::json& tree = st.docMirror.tree();
-        bool hasFeatures = tree.is_object() && tree.contains("features") &&
-                           tree["features"].is_array() && !tree["features"].empty();
-        if (hasFeatures) docOk = st.docMirror.newPart(st.worker, err);
-    } else {
-        docOk = st.docMirror.newPart(st.worker, err);
+// Composer mode name for the worker payload ("agent"|"plan"|"ask"). Legacy persisted values
+// (Swarm/Edit/EngFirm) fold onto Agent through normalizeCopilotMode.
+static const char* copilotModeName(int mode) {
+    switch (normalizeCopilotMode(mode)) {
+        case (int)CopilotMode::Plan: return "plan";
+        case (int)CopilotMode::Ask:  return "ask";
+        default:                     return "agent";
     }
-    if (!docOk) {
-        st.addLog("[err] design: could not create a part document: " + err);
-        st.status = "Worker not ready";  st.statusKind = 2;
-        for (auto it = st.chat.rbegin(); it != st.chat.rend(); ++it)
-            if (!it->fromUser && (it->running || it->clarify.active)) {
-                it->running = false;
-                it->clarify = ClarifyState{};
-                it->errKind = ERR_SYSTEM;
-                it->text = "I couldn't open a new part document (worker not ready). "
-                           "Check the Console and try again.";
-                break;
-            }
-        return;
-    }
-    st.clearViewportForNewDoc();
+}
+
+// ONE Chudcode general_agent turn for `request` on the active conversation. It never creates or
+// replaces a document: whether to new_part or edit the open doc is the AGENT's decision, made
+// with the full CAD tool loadout, so the host must not pre-empt it with a blank part.
+// `extra` is merged on top of the provider override (attachments / context_refs / options…);
+// options.mode defaults to the composer's current mode name.
+void launchAgentTurn(AppState& st, const std::string& request, nlohmann::json extra) {
     // Pin the picker's provider/model/effort explicitly in the worker payload so ambient provider
     // configuration cannot beat the visible selection. Merge attachments/context refs on top.
     nlohmann::json payload = agentProviderOverride(st.settings);
@@ -834,89 +822,29 @@ void launchDesignRun(AppState& st, const std::string& request,
         for (auto it = extra.begin(); it != extra.end(); ++it)
             payload[it.key()] = it.value();
     }
-    // Mode overhaul: default options.mode=agent when caller didn't stamp one (Build-it path).
-    // corporate_mode mirrors Settings → AI → Behavior (default off — no auto company).
+    std::string modeName;
     {
         nlohmann::json opts = nlohmann::json::object();
         if (payload.contains("options") && payload["options"].is_object())
             opts = payload["options"];
-        if (!opts.contains("mode")) opts["mode"] = "agent";
+        if (!opts.contains("mode") || !opts["mode"].is_string() ||
+            opts["mode"].get<std::string>().empty())
+            opts["mode"] = copilotModeName(st.aiInteraction);
+        modeName = opts["mode"].get<std::string>();
         if (!opts.contains("advisor")) opts["advisor"] = true;
+        // corporate_mode mirrors Settings → AI → Behavior (default off — no auto company).
         opts["corporate_mode"] = st.settings.corporateMode;
         attachAgentConversationOptions(st, opts);
         payload["options"] = std::move(opts);
     }
     // Single online agent entry: jobs.cpp flattens this payload into `agent_admin_turn`; only an
     // explicit offline request retains the native `agent_run_v2` modeling fallback.
-    st.addLog("[..] designing (v2): " + request);
-    st.status = "Designing...";  st.statusKind = 0;
+    st.addLog("[..] agent turn (" + modeName + "): " + request);
     st.agentV2Running = true;
     st.agentV2 = true;
     launchAgentRunV2(st.worker, st.activeRun(), st.activeConvId(), st.chatDocKey, request,
-                     st.docMirror.docId(), st.ribbonTab == AppState::RT_Manufacture, payload);
-}
-
-// Launch a mission for a multi-capability request (e.g. "model X, then run CFD and prove it's
-// good"). Mirrors launchDesignRun's doc-prep + activity reset; jobs.cpp routes online work through
-// `agent_admin_turn` with swarm/corporate_force fields and reserves `agent_mission_v1` for an
-// explicit offline request. The fresh-part policy remains unchanged.
-// `extra` is merged on top of the provider override (attachments / context_refs / …).
-void launchMissionRunChat(AppState& st, const std::string& request, bool needFreshDoc,
-                                 nlohmann::json extra) {
-    std::string err;
-    bool docOk = st.docMirror.hasDoc();
-    if (needFreshDoc) {
-        if (docOk) {
-            const nlohmann::json& tree = st.docMirror.tree();
-            bool hasFeatures = tree.is_object() && tree.contains("features") &&
-                               tree["features"].is_array() && !tree["features"].empty();
-            if (hasFeatures) docOk = st.docMirror.newPart(st.worker, err);
-        } else {
-            docOk = st.docMirror.newPart(st.worker, err);
-        }
-    }
-    if (!docOk) {
-        st.addLog("[err] mission: could not create a part document: " + err);
-        st.status = "Worker not ready";  st.statusKind = 2;
-        for (auto it = st.chat.rbegin(); it != st.chat.rend(); ++it)
-            if (!it->fromUser && (it->running || it->clarify.active)) {
-                it->running = false;
-                it->clarify = ClarifyState{};
-                it->errKind = ERR_SYSTEM;
-                it->text = "I couldn't open a part document (worker not ready). "
-                           "Check the Console and try again.";
-                break;
-            }
-        return;
-    }
-    if (needFreshDoc) st.clearViewportForNewDoc();
-    st.addLog("[..] mission: " + request);
-    st.status = "Working on it...";  st.statusKind = 0;
-    st.agentV2Running = true;
-    st.agentV2 = true;
-    // O1: pin the picker's provider/model/effort explicitly in the RPC payload.
-    nlohmann::json payload = agentProviderOverride(st.settings);
-    if (extra.is_object()) {
-        for (auto it = extra.begin(); it != extra.end(); ++it)
-            payload[it.key()] = it.value();
-    }
-    // Mode overhaul: default mode=swarm when corporate_force, else agent, if unstamped.
-    // corporate_mode mirrors Settings → AI → Behavior (default off — no auto company).
-    {
-        nlohmann::json opts = nlohmann::json::object();
-        if (payload.contains("options") && payload["options"].is_object())
-            opts = payload["options"];
-        if (!opts.contains("mode")) {
-            if (opts.value("corporate_force", false)) opts["mode"] = "swarm";
-            else opts["mode"] = "agent";
-        }
-        if (!opts.contains("advisor")) opts["advisor"] = true;
-        opts["corporate_mode"] = st.settings.corporateMode;
-        attachAgentConversationOptions(st, opts);
-        payload["options"] = std::move(opts);
-    }
-    launchMissionRun(st.worker, st.activeRun(), st.activeConvId(), st.chatDocKey, request,
-                     st.docMirror.docId(), payload);
+                     st.docMirror.hasDoc() ? st.docMirror.docId() : std::string(),
+                     st.ribbonTab == AppState::RT_Manufacture, payload);
 }
 
 // The inline clarify card: build-critical questions (interaction contract kinds).
@@ -1780,27 +1708,11 @@ void drawBtwPanel(AppState& st) {
     s_btw.open = open;
 }
 
-// Launch the active turn for `text` according to the current CopilotMode
-// (Agent/Plan/Swarm/Edit/Ask). Pushes the user + live-assistant ChatMsgs.
-// Centralizes launch paths so the top input and per-turn follow-up share one code path.
-// Compact transcript of recent conversation turns for the agent run REQUEST (never shown in
-// the chat). Every launch path below is otherwise context-free: a follow-up like "continue"
-// reached intake with no idea what it was continuing and was rejected as unintelligible.
-// Keep it small — newest few finished messages, each truncated; the live bubble is skipped.
-static std::string buildTurnChatContext(const AppState& st, size_t maxMsgs = 8,
-                                        size_t maxCharsPerMsg = 280) {
-    std::vector<std::string> lines;
-    for (auto it = st.chat.rbegin(); it != st.chat.rend() && lines.size() < maxMsgs; ++it) {
-        if (it->running || it->text.empty()) continue;
-        std::string t = it->text;
-        if (t.size() > maxCharsPerMsg) t = t.substr(0, maxCharsPerMsg - 1) + "\xe2\x80\xa6";
-        lines.push_back(std::string(it->fromUser ? "User: " : "Assistant: ") + t);
-    }
-    std::string out;
-    for (auto it = lines.rbegin(); it != lines.rend(); ++it) { out += *it; out += '\n'; }
-    return out;
-}
-
+// Launch the active turn for `text`: ONE Chudcode general_agent turn in the mode the USER picked
+// in the composer (Agent | Plan | Ask). The host never inspects the request text — no intent
+// sniffing, no auto-routing, no mode promotion, no CFD hijack: the agent decides for itself
+// whether to answer inline, spawn subagents or run a mission, with the tool policy its mode
+// implies. Pushes the user + live-assistant ChatMsgs, then hands off to launchAgentTurn.
 void submitTurn(AppState& st, const std::string& text) {
     if (text.empty()) return;
     // A fresh turn always clears a lingering stop latch (e.g. worker never drained after cancel).
@@ -1811,6 +1723,18 @@ void submitTurn(AppState& st, const std::string& text) {
 #ifndef __EMSCRIPTEN__
     if (!st.verifyEntitlementForAi()) return;
 #endif
+    // ONE live run per conversation. The composer normally queues a send while a turn is in
+    // flight (drain at the top of drawComposer), so this only catches an out-of-band submit.
+    if (st.convRunning(st.activeConvId())) {
+        st.toast(ui::ToastLevel::Warn,
+                 "A run is still in progress - ask me again when it finishes.");
+        return;
+    }
+    // The composer mode is a user choice; normalize a legacy persisted value once, here, so the
+    // bubble stamps, the persisted setting and the worker payload all agree.
+    const int mode = normalizeCopilotMode(st.aiInteraction);
+    st.aiInteraction = mode;
+    st.settings.copilotMode = mode;
     // Persist the selected descriptor before launching, then pin provider/model/effort explicitly
     // in the request below. The long-lived worker therefore receives exactly what the picker
     // shows instead of re-resolving a stale endpoint or an ambient CHUDWARE_PROVIDER override.
@@ -1819,26 +1743,17 @@ void submitTurn(AppState& st, const std::string& text) {
     // inlined text-file content / explicit paths appended; the chat shows a compact marker.
     // Wave4: context_refs ride as structured payload and are also inlined into sendText so both
     // the online host-tool lane and explicit offline core fallback receive resolvable context.
+    // Nothing else is prepended: the persistent Chudcode session already holds the conversation
+    // (options.history only seeds a fresh one), so the request is the user's own words.
     std::string sendText = text;
     const nlohmann::json attachments = consumeAttachments(st, sendText);
     const nlohmann::json contextRefs = consumeContextRefs(st, sendText);
-    const nlohmann::json provOverride = agentProviderOverride(st.settings);
-    // Shared extras (attachments + context_refs) for every agent RPC path below.
-    nlohmann::json turnExtras = nlohmann::json::object();
-    if (!attachments.empty()) turnExtras["attachments"] = attachments;
-    if (!contextRefs.empty()) turnExtras["context_refs"] = contextRefs;
-    // Fold in recent conversation context so follow-ups ("continue", "make it bigger") make
-    // sense to intake/planning. Only the model payload changes — the visible bubble keeps the
-    // raw typed text.
-    {
-        const std::string ctx = buildTurnChatContext(st);
-        if (!ctx.empty())
-            sendText = "[conversation so far]\n" + ctx +
-                       "[/conversation]\nLatest user message: " + sendText;
-    }
+    nlohmann::json extra = nlohmann::json::object();
+    if (!attachments.empty()) extra["attachments"] = attachments;
+    if (!contextRefs.empty()) extra["context_refs"] = contextRefs;
     {
         ChatMsg u; u.fromUser = true; u.text = text;
-        u.copilotMode = st.aiInteraction;  // stamp composer mode for colored border
+        u.copilotMode = mode;  // stamp composer mode for colored border
         if (!attachments.empty()) {
             // Images get one line each so chat_log.cpp can lift them out and render the real
             // picture; the plain [attached:] roster lists ONLY the non-image files, and is
@@ -1868,10 +1783,11 @@ void submitTurn(AppState& st, const std::string& text) {
     {
         ChatMsg a;
         a.running = true;
-        a.copilotMode = st.aiInteraction;  // stamp; auto-switch may update to Agent
+        a.copilotMode = mode;
         if (st.settings.model[0]) a.model = st.settings.model;
-        // Instant classification chrome — don't wait for the first drained event frame.
-        a.liveStatus = "Routing request\xe2\x80\xa6";
+        // Instant chrome — don't wait for the first drained event frame. The agent is thinking;
+        // there is no host-side routing or classification step to narrate.
+        a.liveStatus = "Thinking\xe2\x80\xa6";
         st.chat.push_back(a);
         appendChatRawMessage(st, st.chat.back());
     }
@@ -1888,30 +1804,13 @@ void submitTurn(AppState& st, const std::string& text) {
     }
     ui::persistChatHistory(st);
 
-    // Sync persisted settings.copilotMode with live dropdown.
-    st.settings.copilotMode = st.aiInteraction;
-    const CopilotMode mode = (st.aiInteraction >= 0 && st.aiInteraction <= 5)
-                                 ? (CopilotMode)st.aiInteraction
-                                 : CopilotMode::Agent;
-    const bool editMode  = (mode == CopilotMode::Edit);
-    const bool askMode   = (mode == CopilotMode::Ask);
-    const bool planMode  = (mode == CopilotMode::Plan);
-    const bool swarmMode = (mode == CopilotMode::Swarm);
-    const bool agentMode = (mode == CopilotMode::Agent);
-    const bool engFirmMode = (mode == CopilotMode::EngFirm);
-    (void)agentMode;
-
-    auto withOptions = [&](nlohmann::json base, nlohmann::json opts) -> nlohmann::json {
-        if (!opts.is_object()) opts = nlohmann::json::object();
-        if (!opts.contains("advisor")) opts["advisor"] = true;
-        // Settings gate for company structure auto-route (core recommend_structure).
-        opts["corporate_mode"] = st.settings.corporateMode;
-        base["options"] = std::move(opts);
-        return base;
-    };
-    auto buildEditScope = [&]() -> nlohmann::json {
+    // The turn's "current editor context", sent in EVERY mode whenever a document is open (the
+    // CAD analogue of the active file in a code editor): the open doc, the feature the
+    // PropertyManager/tree has focused, and the viewport selection. Python renders it into the
+    // prompt; it is context, never an instruction to edit those entities.
+    auto buildTurnScope = [&]() -> nlohmann::json {
         nlohmann::json scope = nlohmann::json::object();
-        if (st.docMirror.hasDoc()) scope["doc_id"] = st.docMirror.docId();
+        scope["doc_id"] = st.docMirror.docId();
         nlohmann::json fids = nlohmann::json::array();
         if (st.propertyManager && st.propertyManager->active() &&
             !st.propertyManager->targetId().empty()) {
@@ -1934,453 +1833,18 @@ void submitTurn(AppState& st, const std::string& text) {
         return scope;
     };
 
-    std::string lo = text;
-    std::transform(lo.begin(), lo.end(), lo.begin(),
-                   [](unsigned char c) { return (char)std::tolower(c); });
-    auto has = [&](const char* k) { return lo.find(k) != std::string::npos; };
+    nlohmann::json opts = {{"mode", copilotModeName(mode)},
+                           {"advisor", true},
+                           {"corporate_mode", st.settings.corporateMode}};
+    if (st.docMirror.hasDoc()) opts["scope"] = buildTurnScope();
+    attachAgentConversationOptions(st, opts);
+    extra["options"] = std::move(opts);
 
-    // Shared intent classifiers (Agent auto-router + Ask promote-to-build).
-    // Eng. Firm is NEVER auto-invoked — only the explicit engFirmMode branch may set eng_firm.
-    const bool buildIntent = has("make ") || has("model ") || has("build ") || has("design ") ||
-                             has("create ") || has("generate ") || has("give me") || has("add ") ||
-                             has("cut ") || has("draw ");
-    const bool changeIntent = has("edit ") || has("change ") || has("modify ") || has("update ") ||
-                              has("fix ") || has("on this") || has("this part") || has("the part") ||
-                              // Bare continuation follow-ups — continue the work on the open part.
-                              has("continu") || has("go on") || has("keep going") ||
-                              has("proceed") || has("resume") || has("carry on") ||
-                              has("finish it") || has("keep building");
-    const bool questionIntent = !buildIntent && !changeIntent &&
-        (lo.find('?') != std::string::npos ||
-         lo.rfind("what ", 0) == 0 || lo.find(" what ") != std::string::npos ||
-         lo.rfind("how ", 0) == 0 || lo.find(" how ") != std::string::npos ||
-         lo.rfind("why ", 0) == 0 || lo.find(" why ") != std::string::npos ||
-         lo.rfind("which ", 0) == 0 || lo.find(" which ") != std::string::npos ||
-         has("is it") || has("should i") || has("can you tell") || has("explain "));
-
-    // MISSION intent: Agent mode only, and only when Settings → AI → Harness
-    // "Auto-route missions" is on. Default off — main chat stays on the direct
-    // general_agent tool loop (no intake/breakdown).
-    auto looksLikeMission = [&]() -> bool {
-        if (!st.settings.autoMissionRouting) return false;
-        if (!agentMode || st.convRunning(st.activeConvId())) return false;
-        bool buildVerb = has("make ") || has("model ") || has("build ") || has("design ") ||
-                         has("create ") || has("generate ") || has("give me");
-        bool analyzeVerb = has("cfd") || has("wind tunnel") || has("windtunnel") ||
-                           has("aerodynam") || has("simulat") || has("flow sim") || has("fea") ||
-                           has("stress") || has("downforce") ||
-                           ((has("drag") || has("lift")) && (has("air") || has("speed") ||
-                            has("wind") || has("m/s") || has("mph"))) ||
-                           has("prove") || has("validate") || has("verify it") ||
-                           has("is it a good") || has("good design") || has("analyze");
-        return buildVerb && analyzeVerb;
-    };
-    if (looksLikeMission()) {
-        nlohmann::json extras = withOptions(turnExtras, {{"mode", "agent"}, {"advisor", true}});
-        launchMissionRunChat(st, sendText, /*needFreshDoc=*/true, extras);
-        return;
-    }
-
-    // CFD/sim: Agent/Ask only — Plan/Swarm/Edit must not be hijacked.
-    auto looksLikeSim = [&]() -> bool {
-        if (!(agentMode || askMode)) return false;
-        if (!st.docMirror.hasDoc() || st.convRunning(st.activeConvId())) return false;
-        if (has("cfd") || has("wind tunnel") || has("windtunnel") || has("aerodynam") ||
-            has("drag") || has("downforce"))
-            return true;
-        return (has("simulate") || has("simulation") || has("flow") || has("lift")) &&
-               (has("air") || has("m/s") || has("mph") || has("km/h") || has("speed") ||
-                has("velocity") || has("wind"));
-    };
-    if (looksLikeSim()) {
-        st.addLog("[..] cfd: " + text);
-        st.status = "Running CFD...";  st.statusKind = 0;
-        nlohmann::json params = {{"doc_id", st.docMirror.docId()}, {"request", text}};
-        const bool wantAccurate = has("accurate") || has("openfoam") || has("open foam") ||
-                                  has("precise") || has("high-fidelity") || has("high fidelity") ||
-                                  has("rans") || has("validated");
-        bool ofAvail = false;
-        if (wantAccurate && st.simClient) {
-            nlohmann::json caps = st.simClient->caps();
-            if (caps.is_object()) ofAvail = caps.value("openfoam", false);
-        }
-        if (wantAccurate && ofAvail) params["solver"] = "openfoam";
-        if (wantAccurate && !ofAvail)
-            st.addLog("[cfd] accurate requested but OpenFOAM not provisioned — using LBM estimate");
-
-        st.rpc.call("agent_simulate_v1", params, [&st](const core::RpcResult& r) {
-            ChatMsg* msg = nullptr;
-            for (auto it = st.chat.rbegin(); it != st.chat.rend(); ++it)
-                if (!it->fromUser && it->running) { msg = &*it; break; }
-            std::string err;
-            if (!r.ok) err = r.err.empty() ? "worker call failed" : r.err;
-            else if (r.result.is_object() && r.result.contains("code"))
-                err = r.result.value("message", std::string("worker error"));
-
-            if (err.empty() && r.result.value("needs_openfoam", false) && st.simClient) {
-                const bool water = (r.result.value("fluid", std::string("air")) == "water");
-                nlohmann::json fparams = {
-                    {"stl_path", r.result.value("stl_path", std::string())},
-                    {"direction", {1.0, 0.0, 0.0}},
-                    {"speed_mps", r.result.value("velocity_ms", 10.0)},
-                    {"aoa_deg", r.result.value("aoa_deg", 0.0)},
-                    {"sideslip_deg", 0.0}, {"preset", "coarse"}, {"ref_area_mm2", 0.0},
-                    {"fluid", {{"name", water ? "water" : "air"},
-                               {"density_kgm3", water ? 1000.0 : 1.225},
-                               {"kinematic_visc_m2s", water ? 1.0e-6 : 1.5e-5}}},
-                    {"solver", "openfoam"},
-                };
-                std::string note;
-                if (st.simClient->launch("sim_run_flow", fparams, note, "__chat_cfd__")) {
-                    st.chatCfdVel = r.result.value("velocity_ms", 10.0);
-                    st.chatCfdAoa = r.result.value("aoa_deg", 0.0);
-                    st.chatCfdPending = true;
-                    if (msg) msg->liveStatus = "OpenFOAM RANS (a few minutes)...";
-                    st.status = "Running OpenFOAM...";  st.statusKind = 0;
-                    return;
-                }
-                err = note.empty() ? "could not launch OpenFOAM" : note;
-            }
-
-            if (msg) {
-                msg->running = false;
-                msg->liveStatus.clear();
-                if (!err.empty()) { msg->errKind = ERR_SYSTEM; msg->text = "The CFD sim failed: " + err; }
-                else {
-                    msg->text = r.result.value("answer", std::string());
-                    if (msg->text.empty()) msg->text = "(no result)";
-                }
-            }
-            st.status = err.empty() ? "Ready." : "CFD failed.";
-            st.statusKind = err.empty() ? 0 : 2;
-        }, 600000);
-        return;
-    }
-
-    // ---- mode branch table (Agent | Plan | Swarm | Edit | Ask) ----
-    if (editMode) {
-        if (!st.docMirror.hasDoc()) {
-            if (!st.chat.empty() && st.chat.back().running && !st.chat.back().fromUser) {
-                st.chat.back().running = false;
-                st.chat.back().text = "Edit mode needs an open part — open a document first.";
-            }
-            return;
-        }
-        st.addLog("[..] editing: " + text);
-        st.status = "Editing...";  st.statusKind = 0;
-        st.agentV2Running = true;
-        st.agentV2 = true;
-        nlohmann::json extra = provOverride;
-        for (auto it = turnExtras.begin(); it != turnExtras.end(); ++it)
-            extra[it.key()] = it.value();
-        nlohmann::json opts = {{"mode", "edit"}, {"advisor", true},
-                               {"corporate_mode", st.settings.corporateMode},
-                               {"scope", buildEditScope()}};
-        attachAgentConversationOptions(st, opts);
-        extra["options"] = std::move(opts);
-        launchAgentRunV2(st.worker, st.activeRun(), st.activeConvId(), st.chatDocKey, sendText,
-                         st.docMirror.docId(), st.ribbonTab == AppState::RT_Manufacture, extra);
-        return;
-    }
-
-    if (askMode) {
-        // Build/change intent in Ask → auto-promote to Agent (never dead-end with
-        // "switch modes"). Eng. Firm is NEVER auto-invoked from this path.
-        if (buildIntent || changeIntent) {
-            if (st.convRunning(st.activeConvId())) {
-                if (!st.chat.empty() && st.chat.back().running && !st.chat.back().fromUser) {
-                    st.chat.back().running = false;
-                    st.chat.back().text = "A design/edit run is still in progress - "
-                                          "ask me again when it finishes.";
-                }
-                return;
-            }
-            st.addLog("[..] ask→agent (build/change intent): " + text);
-            for (auto it = st.chat.rbegin(); it != st.chat.rend(); ++it) {
-                if (!it->fromUser && it->running) {
-                    it->copilotMode = (int)CopilotMode::Agent;  // border reflects effective mode
-                    it->liveStatus = "Auto-switched to Agent to build this";
-                    break;
-                }
-            }
-            // Route exactly like Agent default: edit-in-place if features+change, else design.
-            bool hasFeatures = false;
-            if (st.docMirror.hasDoc()) {
-                const nlohmann::json& tree = st.docMirror.tree();
-                hasFeatures = tree.is_object() && tree.contains("features") &&
-                              tree["features"].is_array() && !tree["features"].empty();
-            }
-            if (hasFeatures && changeIntent) {
-                st.addLog("[..] agent edit-in-place: " + text);
-                st.status = "Editing...";  st.statusKind = 0;
-                st.agentV2Running = true;
-                st.agentV2 = true;
-                nlohmann::json extra = provOverride;
-                for (auto it = turnExtras.begin(); it != turnExtras.end(); ++it)
-                    extra[it.key()] = it.value();
-                nlohmann::json opts = {{"mode", "agent"}, {"advisor", true},
-                                       {"corporate_mode", st.settings.corporateMode},
-                                       {"scope", buildEditScope()}};
-                attachAgentConversationOptions(st, opts);
-                extra["options"] = std::move(opts);
-                launchAgentRunV2(st.worker, st.activeRun(), st.activeConvId(), st.chatDocKey,
-                                 sendText, st.docMirror.docId(),
-                                 st.ribbonTab == AppState::RT_Manufacture, extra);
-                return;
-            }
-            nlohmann::json agentExtras =
-                withOptions(turnExtras, {{"mode", "agent"}, {"advisor", true}});
-            for (auto it = st.chat.rbegin(); it != st.chat.rend(); ++it)
-                if (!it->fromUser && it->running) { it->liveStatus = "Building..."; break; }
-            st.status = "Building...";  st.statusKind = 0;
-            launchDesignRun(st, sendText, agentExtras);
-            return;
-        }
-        // Genuine questions stay on agent_ask_v2.
-        if (st.convRunning(st.activeConvId())) {
-            if (!st.chat.empty() && st.chat.back().running && !st.chat.back().fromUser) {
-                st.chat.back().running = false;
-                st.chat.back().text = "A design/edit run is still in progress - "
-                                      "ask me again when it finishes.";
-            }
-            return;
-        }
-        st.addLog("[..] ask: " + text);
-        st.status = "Answering...";  st.statusKind = 0;
-        nlohmann::json params = {
-            {"doc_id", st.docMirror.hasDoc() ? st.docMirror.docId() : std::string()},
-            {"question", sendText},
-            {"options", {{"mode", "ask"}, {"advisor", true}}}};
-        for (auto it = provOverride.begin(); it != provOverride.end(); ++it)
-            params[it.key()] = it.value();
-        for (auto it = turnExtras.begin(); it != turnExtras.end(); ++it)
-            if (it.key() != "options") params[it.key()] = it.value();
-        st.rpc.call("agent_ask_v2", params, [&st](const core::RpcResult& r) {
-            ChatMsg* msg = nullptr;
-            for (auto it = st.chat.rbegin(); it != st.chat.rend(); ++it)
-                if (!it->fromUser && it->running) { msg = &*it; break; }
-            std::string err;
-            if (!r.ok)
-                err = r.err.empty() ? "worker call failed" : r.err;
-            else if (r.result.is_object() && r.result.contains("code"))
-                err = r.result.value("message", std::string("worker error"));
-            if (msg) {
-                msg->running = false;
-                msg->liveStatus.clear();
-                if (!err.empty()) {
-                    msg->errKind = ERR_SYSTEM;
-                    msg->text = "I couldn't answer that: " + err;
-                } else {
-                    msg->text = r.result.value("answer", std::string());
-                    if (msg->text.empty()) msg->text = "(no answer)";
-                }
-            }
-            if (!err.empty()) {
-                st.addLog("[err] ask: " + err);
-                st.status = "Ask failed.";  st.statusKind = 2;
-            } else {
-                st.status = "Ready.";  st.statusKind = 0;
-            }
-        }, 300000);
-        return;
-    }
-
-    if (swarmMode) {
-        st.addLog("[..] swarm: " + text);
-        // Agent-decided plan is advisor-approved in-core — no user approve card.
-        // liveStatus shows drafting then execution continues automatically.
-        for (auto it = st.chat.rbegin(); it != st.chat.rend(); ++it)
-            if (!it->fromUser && it->running) {
-                it->liveStatus = "Drafting plan for swarm execution\xe2\x80\xa6";
-                break;
-            }
-        st.status = "Drafting plan for swarm execution...";  st.statusKind = 0;
-        nlohmann::json extras = withOptions(turnExtras, {
-            {"mode", "swarm"},
-            {"corporate_force", true},
-            {"advisor", true}});
-        bool needFresh = true;
-        if (st.docMirror.hasDoc()) {
-            const nlohmann::json& tree = st.docMirror.tree();
-            bool hasFeatures = tree.is_object() && tree.contains("features") &&
-                               tree["features"].is_array() && !tree["features"].empty();
-            if (hasFeatures && (has("edit ") || has("change ") || has("modify ") ||
-                                has("update ") || has("fix ") || has("on this")))
-                needFresh = false;
-        }
-        launchMissionRunChat(st, sendText, needFresh, extras);
-        return;
-    }
-
-    if (engFirmMode) {
-        // USER-ONLY: Eng. Firm is never auto-invoked by Agent/Ask auto-routing.
-        // Agent-decided plan is advisor-approved in-core — no user approve card.
-        st.addLog("[..] eng.firm: " + text);
-        for (auto it = st.chat.rbegin(); it != st.chat.rend(); ++it)
-            if (!it->fromUser && it->running) {
-                it->liveStatus = "Drafting plan for eng. firm execution\xe2\x80\xa6";
-                break;
-            }
-        st.status = "Drafting plan for eng. firm execution...";  st.statusKind = 0;
-        nlohmann::json extras = withOptions(turnExtras, {
-            {"mode", "eng_firm"},
-            {"org", "eng_firm"},
-            {"corporate_force", true},
-            {"execute_as", "eng_firm"},
-            {"advisor", true}});
-        bool needFresh = true;
-        if (st.docMirror.hasDoc()) {
-            const nlohmann::json& tree = st.docMirror.tree();
-            bool hasFeatures = tree.is_object() && tree.contains("features") &&
-                               tree["features"].is_array() && !tree["features"].empty();
-            if (hasFeatures && changeIntent)
-                needFresh = false;
-        }
-        launchMissionRunChat(st, sendText, needFresh, extras);
-        return;
-    }
-
-    if (planMode) {
-        st.addLog("[..] plan: " + text);
-        st.status = "Planning...";  st.statusKind = 0;
-        st.agentV2Running = true;
-        st.agentV2 = true;
-        for (auto it = st.chat.rbegin(); it != st.chat.rend(); ++it)
-            if (!it->fromUser && it->running) {
-                it->planApprovePending = true;
-                it->planApproveRequest = sendText;
-                it->planApproveExtras = turnExtras;
-                it->liveStatus = "Drafting a plan...";
-                break;
-            }
-        nlohmann::json extra = provOverride;
-        for (auto it = turnExtras.begin(); it != turnExtras.end(); ++it)
-            extra[it.key()] = it.value();
-        extra["options"] = {{"mode", "plan"}, {"plan_only", true}, {"advisor", true},
-                            {"corporate_mode", st.settings.corporateMode}};
-        attachAgentConversationOptions(st, extra["options"]);
-        std::string err;
-        if (!st.docMirror.hasDoc()) {
-            if (!st.docMirror.newPart(st.worker, err)) {
-                st.addLog("[err] plan: could not create a part document: " + err);
-                st.status = "Worker not ready";  st.statusKind = 2;
-                for (auto it = st.chat.rbegin(); it != st.chat.rend(); ++it)
-                    if (!it->fromUser && it->running) {
-                        it->running = false;
-                        it->planApprovePending = false;
-                        it->errKind = ERR_SYSTEM;
-                        it->text = "I couldn't open a part document (worker not ready).";
-                        break;
-                    }
-                return;
-            }
-        }
-        launchAgentRunV2(st.worker, st.activeRun(), st.activeConvId(), st.chatDocKey, sendText,
-                         st.docMirror.docId(), st.ribbonTab == AppState::RT_Manufacture, extra);
-        return;
-    }
-
-    // Agent (default) — smart auto-router: pure questions → ask; edit-in-place when
-    // features+change; else design/clarify. Never sets mode/org eng_firm.
-    st.designStarted = true;
-    {
-        bool hasFeatures = false;
-        if (st.docMirror.hasDoc()) {
-            const nlohmann::json& tree = st.docMirror.tree();
-            hasFeatures = tree.is_object() && tree.contains("features") &&
-                          tree["features"].is_array() && !tree["features"].empty();
-        }
-        // Pure question (no build/change) → agent_ask_v2 so Agent auto-invokes Ask.
-        if (questionIntent && !(hasFeatures && changeIntent)) {
-            if (st.convRunning(st.activeConvId())) {
-                if (!st.chat.empty() && st.chat.back().running && !st.chat.back().fromUser) {
-                    st.chat.back().running = false;
-                    st.chat.back().text = "A design/edit run is still in progress - "
-                                          "ask me again when it finishes.";
-                }
-                return;
-            }
-            st.addLog("[..] agent→ask (question intent): " + text);
-            for (auto it = st.chat.rbegin(); it != st.chat.rend(); ++it) {
-                if (!it->fromUser && it->running) {
-                    // Keep Agent border (user picked Agent); liveStatus notes the ask path.
-                    it->liveStatus = "Answering...";
-                    break;
-                }
-            }
-            st.status = "Answering...";  st.statusKind = 0;
-            nlohmann::json params = {
-                {"doc_id", st.docMirror.hasDoc() ? st.docMirror.docId() : std::string()},
-                {"question", sendText},
-                {"options", {{"mode", "ask"}, {"advisor", true}}}};
-            for (auto it = provOverride.begin(); it != provOverride.end(); ++it)
-                params[it.key()] = it.value();
-            for (auto it = turnExtras.begin(); it != turnExtras.end(); ++it)
-                if (it.key() != "options") params[it.key()] = it.value();
-            st.rpc.call("agent_ask_v2", params, [&st](const core::RpcResult& r) {
-                ChatMsg* msg = nullptr;
-                for (auto it = st.chat.rbegin(); it != st.chat.rend(); ++it)
-                    if (!it->fromUser && it->running) { msg = &*it; break; }
-                std::string err;
-                if (!r.ok)
-                    err = r.err.empty() ? "worker call failed" : r.err;
-                else if (r.result.is_object() && r.result.contains("code"))
-                    err = r.result.value("message", std::string("worker error"));
-                if (msg) {
-                    msg->running = false;
-                    msg->liveStatus.clear();
-                    if (!err.empty()) {
-                        msg->errKind = ERR_SYSTEM;
-                        msg->text = "I couldn't answer that: " + err;
-                    } else {
-                        msg->text = r.result.value("answer", std::string());
-                        if (msg->text.empty()) msg->text = "(no answer)";
-                    }
-                }
-                if (!err.empty()) {
-                    st.addLog("[err] ask: " + err);
-                    st.status = "Ask failed.";  st.statusKind = 2;
-                } else {
-                    st.status = "Ready.";  st.statusKind = 0;
-                }
-            }, 300000);
-            return;
-        }
-        // Shared changeIntent (above) — edit-in-place when doc has features.
-        if (hasFeatures && changeIntent) {
-            st.addLog("[..] agent edit-in-place: " + text);
-            st.status = "Editing...";  st.statusKind = 0;
-            st.agentV2Running = true;
-            st.agentV2 = true;
-            nlohmann::json extra = provOverride;
-            for (auto it = turnExtras.begin(); it != turnExtras.end(); ++it)
-                extra[it.key()] = it.value();
-            nlohmann::json opts = {{"mode", "agent"}, {"advisor", true},
-                                   {"corporate_mode", st.settings.corporateMode},
-                                   {"scope", buildEditScope()}};
-            attachAgentConversationOptions(st, opts);
-            extra["options"] = std::move(opts);
-            launchAgentRunV2(st.worker, st.activeRun(), st.activeConvId(), st.chatDocKey, sendText,
-                             st.docMirror.docId(), st.ribbonTab == AppState::RT_Manufacture,
-                             extra);
-            return;
-        }
-    }
-    nlohmann::json agentExtras = withOptions(turnExtras, {{"mode", "agent"}, {"advisor", true}});
-    // Agent build → straight to the streaming design run. The old agent_clarify_v1
-    // pre-pass was a BLOCKING, non-streaming one-shot ("Working out what I need to build
-    // this...") that showed no progress and could stall up to a minute on a slow provider
-    // call. The design run's intake stage does the same spec parsing AND streams live
-    // (assistant_delta waterfall) + emits agent.classification (the Routing card) +
-    // plan_state, so the classifier is fully transparent. Supervised plan-approval
-    // remains available via the composer Plan mode.
-    for (auto it = st.chat.rbegin(); it != st.chat.rend(); ++it)
-        if (!it->fromUser && it->running) {
-            // Progressive chrome: Routing → Classifying as soon as the design path starts.
-            it->liveStatus = "Classifying\xe2\x80\xa6";
-            break;
-        }
-    launchDesignRun(st, sendText, agentExtras);
+    st.status = mode == (int)CopilotMode::Plan ? "Planning..."
+              : mode == (int)CopilotMode::Ask  ? "Answering..."
+                                               : "Working...";
+    st.statusKind = 0;
+    launchAgentTurn(st, sendText, std::move(extra));
 }
 
 // ---- runtime-not-ready banner (kept from the old Design body) ----
@@ -3010,17 +2474,15 @@ static float usageRingCluster(AppState& st, float budget, bool draw) {
 
 // One row in the drop-up mode menu: frosted glass base + per-mode coloredRowWash gradient
 // (same hues as modeBorderColor / modeAccentRgb). Every row is tinted; selected gets a
-// stronger fill + mode-colored glow outline; hover brightens. Returns true when clicked
-// and enabled. Header colors are pushed transparent by the caller so the wash is the
-// only row background.
-static bool modeMenuRow(const char* iconName, const char* label, bool selected,
-                        bool disabled, int uid) {
+// stronger fill + mode-colored glow outline; hover brightens. Returns true when clicked.
+// No mode is ever gated — all three run the same agent turn. Header colors are pushed
+// transparent by the caller so the wash is the only row background.
+static bool modeMenuRow(const char* iconName, const char* label, bool selected, int uid) {
     const auto& pal = ui::palette;
     const float sc = ui::uiScale;
     const float rowH = ImGui::GetFrameHeight() + 2.0f * sc;
     const float fh = ImGui::GetFontSize();
     ImGui::PushID(uid);
-    if (disabled) ImGui::BeginDisabled();
     const bool clicked = ImGui::Selectable("##moderow", selected,
                                            ImGuiSelectableFlags_AllowItemOverlap, ImVec2(0, rowH));
     const bool hov = ImGui::IsItemHovered();
@@ -3028,21 +2490,18 @@ static bool modeMenuRow(const char* iconName, const char* label, bool selected,
     const ImVec2 mn = ImGui::GetItemRectMin(), mx = ImGui::GetItemRectMax();
     // Logical dp rounding (helpers multiply by uiScale) — matches Layers/rail-tab pills.
     const float rnd = 4.0f;
-    const float washA = disabled ? 0.18f : (selected ? 0.42f : (hov ? 0.36f : 0.28f));
+    const float washA = selected ? 0.42f : (hov ? 0.36f : 0.28f);
     ui::glassRowBackground(dl, mn, mx, rnd,
                            /*stripe=*/false, /*selected=*/false, /*washAlpha=*/washA);
     float tint[3];
     modeAccentRgb(uid, tint);
     // Resting rows still show a clear mode tint; hover brightens; selected strongest + glow.
-    const float strength = disabled ? 0.10f
-                         : (selected ? 0.38f
-                         : (hov ? 0.28f : 0.18f));
-    ui::coloredRowWash(dl, mn, mx, rnd, tint, strength, /*selected=*/selected && !disabled);
+    const float strength = selected ? 0.38f : (hov ? 0.28f : 0.18f);
+    ui::coloredRowWash(dl, mn, mx, rnd, tint, strength, /*selected=*/selected);
     const float midY = (mn.y + mx.y) * 0.5f;
     const float pad = 8.0f * sc;
     const float isz = fh * 1.02f;
-    const ImU32 ink = ui::Palette::toU32(disabled ? pal.textDisabled
-                                                  : (selected ? pal.text : pal.textDim));
+    const ImU32 ink = ui::Palette::toU32(selected ? pal.text : pal.textDim);
     float textX = mn.x + pad;
     IconUV ic = ui::getIcon(iconName, 20);
     if (ic.valid) {
@@ -3050,22 +2509,19 @@ static bool modeMenuRow(const char* iconName, const char* label, bool selected,
         dl->AddImage(ic.texId, i0, ImVec2(i0.x + isz, i0.y + isz), ic.uv0, ic.uv1, ink);
         textX = i0.x + isz + 7.0f * sc;
     }
-    dl->AddText(ImVec2(textX, midY - fh * 0.5f),
-                ui::Palette::toU32(disabled ? pal.textDisabled : pal.text), label);
-    if (disabled) ImGui::EndDisabled();
+    dl->AddText(ImVec2(textX, midY - fh * 0.5f), ui::Palette::toU32(pal.text), label);
     ImGui::PopID();
-    return clicked && !disabled;
+    return clicked;
 }
 
 
-// Prelude row above the prompt: Agent/Plan/Swarm/Edit/Ask dropdown (left) + busy mark
+// Prelude row above the prompt: Agent/Plan/Ask dropdown (left) + busy mark
 // (inline, only while a run is active) + context meter (right).
 // Permissions live only in the Settings overlay (not the composer).
 static void drawComposerPrelude(AppState& st, bool busy) {
 
     const auto& pal = ui::palette;
     const float sc = ui::uiScale;
-    const bool hasDoc = st.docMirror.hasDoc();
     const ui::AdaptiveSurface& surf = chatSurf();
     // Subscription usage feeds the prelude's provider-limit rings. Both polls are TTL-gated and
     // cheap; the 60s accounts TTL is deliberately lazier than the Settings UI's 1.5s — nothing is
@@ -3100,20 +2556,17 @@ static void drawComposerPrelude(AppState& st, bool busy) {
     ImGui::PushStyleColor(ImGuiCol_PopupBg,
         ImVec4(pal.popupBg[0], pal.popupBg[1], pal.popupBg[2], pal.popupBg[3]));
 
-    // Agent / Plan / Swarm / Edit / Ask — drop-UP menu that propagates upward like the model
-    // picker, with an atlas icon + glass row styling per entry.
-    static const char* modes[]     = {"Agent", "Plan", "Swarm", "Edit", "Ask", "Eng. Firm"};
-    static const char* modeIcons[] = {"ai_panel", "plan_board", "team", "msg_edit", "ask",
-                                      "eng_firm"};
+    // Agent / Plan / Ask — drop-UP menu that propagates upward like the model picker, with an
+    // atlas icon + glass row styling per entry. The mode is a pure USER choice of tool policy:
+    // every entry runs the same single Chudcode general_agent turn.
+    static const char* modes[]     = {"Agent", "Plan", "Ask"};
+    static const char* modeIcons[] = {"ai_panel", "plan_board", "ask"};
     static const char* modeTips[]  = {
-        "Agent — full tools; auto-routes (may plan, swarm, or edit).",
-        "Plan — draft a plan only; approve before building.",
-        "Swarm — force multi-agent / corporate mission execution.",
-        "Edit — change the open part (scoped to selection when set).",
-        "Ask — questions about the part; nothing changes.",
-        "Eng. Firm — engineering firm: specialist roles + contractor firms bid on tasks "
-        "within a $ budget for the heaviest jobs."};
-    int mode = (st.aiInteraction >= 0 && st.aiInteraction <= 5) ? st.aiInteraction : 0;
+        "Agent — full CAD tool loadout; the agent decides how to do the work "
+        "(inline, subagents, or a mission).",
+        "Plan — read/inspect and draft a plan; no geometry or file mutation.",
+        "Ask — read-only questions about the part, project or CAD; nothing changes."};
+    const int mode = normalizeCopilotMode(st.aiInteraction);
     // Trigger chip: icon + longest label + up-caret. Custom-drawn (InvisibleButton + glass wash)
     // so the leading atlas icon sits inline, matching the composer's other chips.
     const float fh = ImGui::GetFontSize();
@@ -3177,16 +2630,15 @@ static void drawComposerPrelude(AppState& st, bool busy) {
     ImGui::PushStyleColor(ImGuiCol_HeaderActive, ImVec4(0, 0, 0, 0));
     if (ImGui::BeginPopup("##aimodemenu",
                           ImGuiWindowFlags_NoMove | ImGuiWindowFlags_AlwaysAutoResize)) {
-        for (int i = 0; i < 6; ++i) {
-            const bool needDoc = (i == (int)CopilotMode::Edit && !hasDoc);
-            if (modeMenuRow(modeIcons[i], modes[i], mode == i, needDoc, i)) {
+        for (int i = 0; i < kCopilotModeCount; ++i) {
+            if (modeMenuRow(modeIcons[i], modes[i], mode == i, i)) {
                 st.aiInteraction = i;
                 st.settings.copilotMode = i;
                 saveSettings(st.settings);  // survive restart without waiting for next send
                 ImGui::CloseCurrentPopup();
             }
-            if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
-                ImGui::SetTooltip("%s", needDoc ? "Edit — open a part first." : modeTips[i]);
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("%s", modeTips[i]);
         }
         ImGui::EndPopup();
     }
@@ -4223,24 +3675,17 @@ void drawComposer(AppState& st, bool busy, bool canRun) {
     // dropdown and context meter) — no reserved row above the input.
 
 
-    const bool hasDoc = st.docMirror.hasDoc();
-
-    // Keep mode valid + sync settings.copilotMode (persisted).
-    // Edit requires a doc — fall back to Agent when none is open.
-    if (st.aiInteraction == (int)CopilotMode::Edit && !hasDoc) {
-        st.aiInteraction = (int)CopilotMode::Agent;
-        st.settings.copilotMode = (int)CopilotMode::Agent;
-    }
-    if (st.aiInteraction < 0 || st.aiInteraction > 5) st.aiInteraction = 0;
-    // agentV2 flag: any mutating orchestrator mode (Agent/Plan/Swarm/Edit). Ask is one-shot.
-    st.agentV2 = (st.aiInteraction != (int)CopilotMode::Ask);
-    // One-shot: seed live mode from persisted settings after loadSettings.
+    // One-shot: seed live mode from persisted settings after loadSettings (legacy values fold
+    // onto Agent/Plan/Ask), then keep the live value normalized and mirrored into settings.
     static bool s_modeSeeded = false;
     if (!s_modeSeeded) {
         s_modeSeeded = true;
-        int cm = st.settings.copilotMode;
-        if (cm >= 0 && cm <= 4) st.aiInteraction = cm;
+        st.aiInteraction = normalizeCopilotMode(st.settings.copilotMode);
     }
+    st.aiInteraction = normalizeCopilotMode(st.aiInteraction);
+    st.settings.copilotMode = st.aiInteraction;
+    // Every mode is one streaming Chudcode agent turn — no one-shot RPC lane left.
+    st.agentV2 = true;
 
     // Esc: close slash autocomplete first, then staged edit restore, else disarm context pick.
     if (ImGui::IsKeyPressed(ImGuiKey_Escape, false)) {
@@ -4506,11 +3951,9 @@ void drawComposer(AppState& st, bool busy, bool canRun) {
     drawComposerPrelude(st, busy);
 
     const char* placeholder =
-        st.aiInteraction == (int)CopilotMode::Ask   ? "Ask about this part\xE2\x80\xA6"
-      : st.aiInteraction == (int)CopilotMode::Edit  ? "Describe a change to this part\xE2\x80\xA6"
-      : st.aiInteraction == (int)CopilotMode::Plan  ? "Describe what to plan\xE2\x80\xA6"
-      : st.aiInteraction == (int)CopilotMode::Swarm ? "Describe a multi-agent mission\xE2\x80\xA6"
-                                                    : "Describe what to build\xE2\x80\xA6";
+        st.aiInteraction == (int)CopilotMode::Ask  ? "Ask about this part\xE2\x80\xA6"
+      : st.aiInteraction == (int)CopilotMode::Plan ? "Describe what to plan\xE2\x80\xA6"
+                                                   : "Describe what to build or change\xE2\x80\xA6";
 
     ImDrawList* composerDl = ImGui::GetWindowDrawList();
     ImDrawListSplitter composerSplit;

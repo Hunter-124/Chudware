@@ -2279,7 +2279,6 @@ void drawAgentTimeline(AppState& st, ChatMsg& m, const ui::Fonts& fonts, float l
     for (size_t i = 0; i < m.activity.size(); ++i) {
         const ActivityItem& a = m.activity[i];
         if (a.stage == "__stop_meta__" || a.rowKind == 9) continue;
-        if (a.rowKind == 10 && a.stage == "class:pending") continue;
         if (isProseOutputRow(a) && !ui::streamTextVisible(a.detail)) continue;
         lastVisible = i;
     }
@@ -2314,10 +2313,7 @@ void drawAgentTimeline(AppState& st, ChatMsg& m, const ui::Fonts& fonts, float l
         ActivityItem& a = m.activity[i];
         // Hidden meta row carrying stop_reason / error_detail — never drawn as a card.
         // Provider-call rows (rowKind 9) aggregate into the collapsible Provider log.
-        // Pending routing rows (rowKind 10, "class:pending") stay hidden until a real
-        // role change (agent.role) reveals them — first-turn default routing shows no card.
         if (a.stage == "__stop_meta__" || a.rowKind == 9) continue;
-        if (a.rowKind == 10 && a.stage == "class:pending") continue;
         const bool liveFrontier = turnRunning && (i == lastVisible);
         // Deferred scroll-to-anchor: the receipt / cost strip requested this row LAST frame, when
         // the render-windowing cache may still have had the message collapsed to a spacer.
@@ -2408,8 +2404,6 @@ void drawAgentTimeline(AppState& st, ChatMsg& m, const ui::Fonts& fonts, float l
             drawToolCallRowImpl(st, m.activity[drawIdx], fonts, failCount,
                                 turnRunning && (frontIdx == lastVisible), rewindIdx,
                                 group.size() > 1 ? &group : nullptr, onSpine);
-        } else if (a.rowKind == 10) {
-            drawClassificationCard(a, fonts, turnRunning);
         } else if (a.rowKind == 19) {
             drawDelegationCard(a, fonts);
         } else if (a.rowKind == 4) {

@@ -566,6 +566,10 @@ def _directive_parse_error(reply: str) -> str:
 def _tool_category_catalog_result() -> dict:
     """The `list_tool_categories` payload — shared by the loop and the floor.
 
+    Live registry: every group with its EXACT tool names (the same names
+    ``enable_tools`` accepts, as a group or one at a time). Cold registry (unit
+    tests, early worker start): the curated pack names only.
+
     The meta tools are executed BY the turn loop, not bound in the tool
     registry, so dispatching them like a normal tool returns
     `known_but_unbound / harness_bug` (live 2026-07-27: the forced opener on
@@ -573,8 +577,20 @@ def _tool_category_catalog_result() -> dict:
     saw before answering in prose).
     """
     try:
-        from services.agent.tool_categories import category_catalog  # noqa: PLC0415
+        from services.agent.tool_categories import (  # noqa: PLC0415
+            category_catalog,
+            tool_menu_groups,
+        )
 
+        groups = tool_menu_groups()
+        if groups:
+            return {
+                "ok": True,
+                "categories": [
+                    {"name": n, "description": d, "tools": tools}
+                    for n, d, tools in groups
+                ],
+            }
         return {
             "ok": True,
             "categories": [
@@ -2725,9 +2741,11 @@ def _run_turn_impl(
         from services.agent.copilot_mode_tools import (  # noqa: PLC0415
             apply_meta_tool_floor,
         )
-        from services.agent.tool_categories import resolve_categories  # noqa: PLC0415
+        from services.agent.tool_categories import (  # noqa: PLC0415
+            resolve_tool_requests,
+        )
 
-        expanded = resolve_categories(cats)
+        expanded, _unknown = resolve_tool_requests(cats)
         candidate = set(allow) | set(expanded)
         floored = apply_meta_tool_floor(candidate)
         if floored is not None:
@@ -4217,6 +4235,8 @@ def _run_turn_impl(
             try:
                 from services.agent.tool_categories import (  # noqa: PLC0415
                     category_catalog,
+                    menu_group_names,
+                    resolve_tool_requests,
                 )
 
                 if tool == "list_tool_categories":
@@ -4227,26 +4247,30 @@ def _run_turn_impl(
                         "status": "bad_arguments",
                         "error": (
                             "enable_tools requires an object with "
-                            '{"categories": ["modeling"]}'
+                            '{"categories": ["modeling"]} and/or {"tools": ["name"]}'
                         ),
                     }
                 else:
-                    raw_cats = (
-                        args.get("categories")
-                        if "categories" in args
-                        else args.get("category") or args.get("names")
+                    cats: list[str] = []
+                    for key in ("categories", "category", "names", "tools", "tool"):
+                        raw_cats = args.get(key)
+                        if isinstance(raw_cats, str):
+                            raw_cats = [raw_cats]
+                        if not isinstance(raw_cats, (list, tuple, set)):
+                            continue
+                        cats.extend(
+                            str(category).strip()
+                            for category in raw_cats
+                            if str(category).strip()
+                        )
+                    cats = list(dict.fromkeys(cats))
+                    available = list(
+                        dict.fromkeys(
+                            [*menu_group_names(), *(n for n, _ in category_catalog())]
+                        )
                     )
-                    if isinstance(raw_cats, str):
-                        raw_cats = [raw_cats]
-                    if not isinstance(raw_cats, (list, tuple, set)):
-                        raw_cats = []
-                    cats = [
-                        str(category).strip().lower()
-                        for category in raw_cats
-                        if str(category).strip()
-                    ]
-                    available = [name for name, _ in category_catalog()]
-                    unknown = sorted(set(cats).difference(available))
+                    _resolved, unknown = resolve_tool_requests(cats)
+                    unknown = sorted(set(unknown))
                     if not cats:
                         meta_result = {
                             "ok": False,

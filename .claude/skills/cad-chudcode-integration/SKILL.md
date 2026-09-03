@@ -100,8 +100,18 @@ runtime's doctor command.
 1. Build tools from the live CAD MCP/mission registries with
    `chudcode_tools.build_host_tools`; it is an adapter, not another catalog.
 2. Preserve allowlist tri-state: `None` unrestricted, `[]` restricted to live floors,
-   non-empty list ordinarily restricted. Apply mode/category/meta/bug-report floors and add
-   `verify_battery` when mutating tools are present before rendering schemas.
+   non-empty list ordinarily restricted. Order in `_effective_names`: role/explicit allowlist
+   → union on-demand loads (`enable_tools` tokens via `tool_categories.resolve_tool_requests`)
+   → mode policy (so Ask/Plan stay read-only whatever was loaded) → meta/bug-report floors →
+   `verify_battery` when mutating tools are present → render schemas.
+2b. The main chat (`worker_rpc._agent_admin_turn`) advertises
+   `tool_categories.MAIN_CHAT_CORE_TOOLS` and its system prompt carries the MORE TOOLS menu
+   naming every other registered tool; `enable_tools(tools=[...])` and
+   `enable_tools(categories=[group])` load the rest mid-turn through the single refresh
+   callback `chudcode_roles._register_category_refresh` (which re-runs `build_host_tools` and
+   `set_custom_tools`, and reports `unknown` tokens). The composer's `scope`
+   (`{doc_id, feature_ids, selection}`) is rendered into the user message by
+   `worker_rpc._editor_context_block`.
 3. Advertise and dispatch the same effective set. Skip unbound and async-only entries.
    Chudcode builtin names remain Chudcode-owned unless a CAD registry entry explicitly claims
    ownership.

@@ -145,11 +145,6 @@ void persistChatHistory(AppState& state);
 // the docked Copilot column OR the AI-tab workspace (which does not draw that column).
 void maybePersistChatHistoryDebounced(AppState& state, bool force);
 
-// Per-frame: if a chat-triggered accurate (OpenFOAM) CFD launched on the SimClient channel has
-// finished, post its Cd/Cl result onto the running chat bubble. No-op when nothing is pending.
-// Call once per frame from the main loop (alongside pollAiCadHandoff).
-void pollChatOpenFoam(AppState& state);
-
 // ---- AI workspace hub reuse (host/src/ui/ai/ai_workspace.cpp) --------------------------
 // Thin exported wrappers over the pane's internals so the full-page AI workspace renders the
 // SAME sessions/messages/composer state (st.chat / st.conversations / st.prompt / send path)

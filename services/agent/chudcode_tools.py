@@ -190,6 +190,11 @@ def _effective_names(context: Any, available: Sequence[str]) -> list[str]:
     The three allowlist states remain distinct: ``None`` is unrestricted, ``[]``
     is restricted to the live meta/config floors, and a non-empty sequence is an
     ordinary restriction.
+
+    Order matters: on-demand loads (``enable_tools`` tokens in ``categories``)
+    are unioned BEFORE the mode policy runs, so a user-picked read-only mode
+    (ask/plan) stays read-only no matter what the model loads mid-turn. The
+    policy is a user choice; the loads are the model's.
     """
     role = _role_card(context)
     explicit = _ctx_present(context, "allowed_tools")
@@ -204,15 +209,27 @@ def _effective_names(context: Any, available: Sequence[str]) -> list[str]:
     else:
         names = None
 
+    categories = _ctx(context, "categories", _ctx(context, "enabled_categories", ()))
+    if categories:
+        from services.agent.tool_categories import META_TOOLS, resolve_tool_requests
+
+        expanded, _unknown = resolve_tool_requests(categories)
+        if names is None:
+            names = []
+            restricted = True
+        names = _ordered_unique([*names, *sorted(META_TOOLS), *sorted(expanded)])
+
     mode = _ctx(context, "mode", None)
     plan_only = _ctx(context, "plan_only", None)
     try:
         from services.agent.copilot_mode_tools import apply_mode_tools
 
-        role_input = None if mode == "plan" or plan_only else names
+        # Plan narrows the SAME set agent would get (minus mutators + the shared
+        # floor) rather than the contract's broad PLAN_TOOLS list, so the main
+        # chat's Plan mode is "Agent, read-only" and costs no extra context.
         narrowed = apply_mode_tools(
             mode,
-            role_input,
+            names,
             plan_only=plan_only,
             subagent=bool(
                 _ctx(context, "subagent_id", None) or _ctx(context, "subagent", False)
@@ -233,16 +250,6 @@ def _effective_names(context: Any, available: Sequence[str]) -> list[str]:
                 names = _ordered_unique(floored)
         except Exception as exc:  # noqa: BLE001 - optional mode floor
             _debug_fallback("meta-tool floor", exc)
-
-    categories = _ctx(context, "categories", _ctx(context, "enabled_categories", ()))
-    if categories:
-        from services.agent.tool_categories import META_TOOLS, resolve_categories
-
-        expanded = sorted(resolve_categories(categories))
-        if names is None:
-            names = []
-            restricted = True
-        names = _ordered_unique([*names, *sorted(META_TOOLS), *expanded])
 
     if names is not None:
         try:
@@ -533,10 +540,11 @@ def _meta_handler(name: str) -> Callable[..., Any] | None:
     if name == "list_tool_categories":
 
         def list_tool_categories() -> dict[str, Any]:
-            """List the CAD tool category packs available to this turn.
+            """List every registered CAD tool grouped by area.
 
-            Returns each pack's name, what it covers, and the tools it would add,
-            so a category can be chosen before calling enable_tools.
+            Returns each group's name, what it covers, and the exact tool names
+            in it. The same names are what enable_tools accepts, as a group or
+            one tool at a time.
             """
             from services.agent.agent_turn import _tool_category_catalog_result
 
@@ -545,19 +553,25 @@ def _meta_handler(name: str) -> Callable[..., Any] | None:
         return list_tool_categories
     if name == "enable_tools":
 
-        def enable_tools(categories: list[str]) -> dict[str, Any]:
-            """Add CAD tool category packs to this turn's callable tool set.
+        def enable_tools(
+            categories: list[str] | None = None, tools: list[str] | None = None
+        ) -> dict[str, Any]:
+            """Load more CAD tools into this turn's callable tool set.
 
-            Most modeling, sketch, simulation and export tools are not loaded up
-            front. Enable the packs the task needs (see list_tool_categories),
-            then call the tools they add.
+            `tools` takes exact tool names from the MORE TOOLS menu (or
+            list_tool_categories); `categories` takes whole group names. The
+            schemas arrive immediately and stay for the rest of the turn.
+            Unknown names are reported back, never silently dropped.
             """
-            from services.agent.tool_categories import resolve_categories
+            from services.agent.tool_categories import resolve_tool_requests
 
+            tokens = [*(categories or ()), *(tools or ())]
+            added, unknown = resolve_tool_requests(tokens)
             return {
                 "ok": True,
-                "enabled": _ordered_unique(categories),
-                "added": sorted(resolve_categories(categories)),
+                "enabled": _ordered_unique(tokens),
+                "added": sorted(added),
+                "unknown": unknown,
             }
 
         return enable_tools
@@ -700,6 +714,19 @@ def _call_run_dispatcher(
     return dispatcher(name, args, **kwargs)
 
 
+def _enable_tokens(args: Mapping[str, Any]) -> list[str]:
+    """Flatten an ``enable_tools`` call's ``categories``/``category``/``tools``
+    arguments into one ordered token list (groups, packs, ``family:``, names)."""
+    tokens: list[str] = []
+    for key in ("categories", "category", "tools", "tool"):
+        raw = args.get(key)
+        if raw is None:
+            continue
+        items = [raw] if isinstance(raw, str) else list(raw or ())
+        tokens.extend(str(item) for item in items if str(item or "").strip())
+    return _ordered_unique(tokens)
+
+
 def _dispatch_meta(binding: HostToolBinding, args: dict[str, Any]) -> Any:
     if binding.name == "list_tool_categories":
         from services.agent.agent_turn import _tool_category_catalog_result
@@ -707,17 +734,21 @@ def _dispatch_meta(binding: HostToolBinding, args: dict[str, Any]) -> Any:
         return _tool_category_catalog_result()
     if binding.name != "enable_tools":
         return _MISSING
-    raw = args.get("categories", args.get("category", ()))
-    categories = [raw] if isinstance(raw, str) else list(raw or ())
-    from services.agent.tool_categories import resolve_categories
-
-    added = sorted(resolve_categories(categories))
+    tokens = _enable_tokens(args)
     callback = _ctx(binding.context, "enable_categories", None)
     if callable(callback):
-        result = callback(categories)
+        result = callback(tokens)
         if result is not None:
             return result
-    return {"ok": True, "enabled": _ordered_unique(categories), "added": added}
+    from services.agent.tool_categories import resolve_tool_requests
+
+    added, unknown = resolve_tool_requests(tokens)
+    return {
+        "ok": True,
+        "enabled": tokens,
+        "added": sorted(added),
+        "unknown": unknown,
+    }
 
 
 def _guardrail_block(binding: HostToolBinding, args: dict[str, Any]) -> str | None:

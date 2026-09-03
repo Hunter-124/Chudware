@@ -2527,6 +2527,78 @@ def _claim_history_seed(session_id: str, raw_history: Any, *, resumed: bool) -> 
     return _bounded_history_seed(raw_history)
 
 
+_SCOPE_MAX_FEATURES = 32
+_SCOPE_MAX_SELECTORS = 16
+_SCOPE_MAX_SELECTOR_CHARS = 200
+
+
+def _editor_context_block(raw_params: Mapping[str, Any]) -> str:
+    """Render the GUI's live editor context (active doc + selection) for the model.
+
+    Copilot's "current file": the composer sends ``scope`` on every turn while a
+    document is open — ``{doc_id, feature_ids, selection}`` — and the model must
+    be TOLD it, not left to discover it, or a "make this 5 mm thicker" lands on
+    nothing. ``doc_id`` alone (no scope) still names the document. Bounded so a
+    thousand-face box-select cannot flood the prompt. Empty string when there is
+    no document.
+    """
+    scope = raw_params.get("scope")
+    scope = scope if isinstance(scope, Mapping) else {}
+    doc_id = _bounded_text(scope.get("doc_id"), 256) or _bounded_text(
+        raw_params.get("doc_id"), 256
+    )
+    if not doc_id:
+        return ""
+    lines = [
+        "ACTIVE DOCUMENT (what the user is looking at)",
+        f"- doc_id: {doc_id} — CAD tools that take doc_id default to this document.",
+    ]
+    raw_features = scope.get("feature_ids")
+    features = [
+        text
+        for text in (
+            _bounded_text(item, 128)
+            for item in (raw_features if isinstance(raw_features, list) else ())
+        )
+        if text
+    ]
+    if features:
+        shown = ", ".join(features[:_SCOPE_MAX_FEATURES])
+        more = len(features) - _SCOPE_MAX_FEATURES
+        lines.append(
+            f"- selected features: {shown}"
+            + (f" (+{more} more)" if more > 0 else "")
+        )
+    raw_selection = scope.get("selection")
+    selectors: list[str] = []
+    for item in raw_selection if isinstance(raw_selection, list) else ():
+        if isinstance(item, str):
+            text = item.strip()
+        else:
+            try:
+                text = json.dumps(item, separators=(",", ":"), sort_keys=True)
+            except (TypeError, ValueError):
+                continue
+        if not text:
+            continue
+        if len(text) > _SCOPE_MAX_SELECTOR_CHARS:
+            text = text[:_SCOPE_MAX_SELECTOR_CHARS] + "…"
+        selectors.append(text)
+    if selectors:
+        lines.append(
+            f"- selected geometry ({len(selectors)}): "
+            + "; ".join(selectors[:_SCOPE_MAX_SELECTORS])
+            + (
+                f" (+{len(selectors) - _SCOPE_MAX_SELECTORS} more)"
+                if len(selectors) > _SCOPE_MAX_SELECTORS
+                else ""
+            )
+        )
+    if not features and not selectors:
+        lines.append("- nothing selected")
+    return "\n".join(lines)
+
+
 def _terminal_text(host_result: Mapping[str, Any]) -> str:
     value = host_result.get("result")
     if isinstance(value, str):
@@ -2824,34 +2896,9 @@ def _agent_admin_turn(params: dict, _emit: Callable) -> dict:
             f"{type(exc).__name__}: {exc}",
         }
 
-    def register_callbacks(client: Any) -> None:
-        def enable_categories(values: Any) -> dict:
-            incoming = [values] if isinstance(values, str) else list(values or ())
-            for value in incoming:
-                name = str(value).strip()
-                if name and name not in categories:
-                    categories.append(name)
-            refreshed = build_host_tools(tool_context)
-            try:
-                from chudcode_rpc import host_tool  # type: ignore
-            except ImportError as exc:
-                raise RuntimeError(
-                    "chudcode-rpc==0.2.0 is required to refresh CAD host tools"
-                ) from exc
-            client.set_custom_tools(
-                [binding.to_host_tool(host_tool) for binding in refreshed]
-            )
-            return {
-                "ok": True,
-                "enabled": list(categories),
-                "added": [
-                    binding.name
-                    for binding in refreshed
-                    if binding.name not in {item.name for item in host_tools}
-                ],
-            }
+    from services.agent.chudcode_roles import _register_category_refresh
 
-        tool_context["enable_categories"] = enable_categories
+    register_callbacks = _register_category_refresh(tool_context, host_tools)
 
     settings_value = raw_params.get("settings")
     settings = dict(settings_value) if isinstance(settings_value, Mapping) else {}
@@ -2879,6 +2926,9 @@ def _agent_admin_turn(params: dict, _emit: Callable) -> dict:
         resumed=resumed_session,
     )
     prompt = f"{migration}\n\nCURRENT USER REQUEST\n{request}" if migration else request
+    editor = _editor_context_block(raw_params)
+    if editor:
+        prompt = f"{prompt}\n\n{editor}"
     host_params: dict[str, Any] = {
         "request": prompt,
         "run_id": run_id,

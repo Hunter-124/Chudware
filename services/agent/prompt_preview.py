@@ -259,8 +259,12 @@ def preview_main_chat_system(*, include_tools: bool = True) -> dict[str, Any]:
         if include_tools:
             try:
                 from services.agent.tool_schemas import render_tools_block  # noqa: PLC0415
+                # The online lane hands Chudcode every allowed tool as a native
+                # definition with its full description — no tier slot, no trim.
+                # The preview must show that surface, not a 2.5k-token text slot.
                 tools_text, tools_meta = render_tools_block(
                     allowed, resolver=_at.resolver_for(None),
+                    budget_tokens=1_000_000, trim=False,
                 )
                 meta["tools"] = tools_meta
             except Exception as exc:  # noqa: BLE001

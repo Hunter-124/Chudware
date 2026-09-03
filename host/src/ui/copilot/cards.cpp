@@ -1031,14 +1031,14 @@ void drawClarifyCard(AppState& st, ChatMsg& m, const ui::Fonts& fonts) {
         m.liveStatus = "Building...";
         nlohmann::json buildExtra = nlohmann::json::object();
         buildExtra["options"] = {{"mode", "agent"}, {"advisor", true}};
-        launchDesignRun(st, aug, buildExtra);
+        launchAgentTurn(st, aug, buildExtra);
     }
 }
 
 // User-facing plan approve gate — ONLY manual Plan mode (plan_only / awaiting_plan_approval)
 // or advisor escalate (needs_user_decision). Agent-decided plans never reach this card.
-// Question: "need edits, or start execution?" Edit plan prefills the composer; Execute-as
-// buttons stamp approved_plan + execute_as. Recommended button matches planExecutionStyle.
+// Question: "need edits, or start execution?" Edit plan prefills the composer for a revision
+// pass; Execute resumes the SAME conversation as ONE agent turn carrying the approved plan.
 void drawPlanApproveCard(AppState& st, ChatMsg& m, const ui::Fonts& fonts) {
     if (!m.planApprovePending || m.running) return;
     if (m.errKind != ERR_NONE) {
@@ -1048,16 +1048,6 @@ void drawPlanApproveCard(AppState& st, ChatMsg& m, const ui::Fonts& fonts) {
     const auto& pal = ui::palette;
     const ui::AdaptiveSurface& surf = chatSurf();
     const ImVec4 accentCol = semanticOnGlass(pal.accent, surf);
-
-    // Normalize recommended style from plan_ready / task_route.
-    std::string style = m.planExecutionStyle;
-    for (char& c : style) c = (char)std::tolower((unsigned char)c);
-    if (style == "solo" || style == "standard" || style == "edit-style") style = "edit";
-    if (style == "complex" || style == "multi" || style == "multi-part" || style == "swarm-style")
-        style = "swarm";
-    if (style == "engfirm" || style == "firm" || style == "engineering_firm") style = "eng_firm";
-    if (style != "edit" && style != "agent" && style != "swarm" && style != "eng_firm")
-        style = style.empty() ? "agent" : style;
 
     ImGui::Dummy(ImVec2(0, ui::metrics::cpMenuRowGap()));
     GlassBubble gb = beginGlassBubble(ImGui::GetContentRegionAvail().x, ui::GlassLevel::Thin, 10.0f);
@@ -1073,23 +1063,12 @@ void drawPlanApproveCard(AppState& st, ChatMsg& m, const ui::Fonts& fonts) {
                            : "Plan needs your decision");
     ImGui::PopFont();
 
-    // Planned-for style chip.
-    {
-        const char* styleLabel =
-            (style == "edit") ? "edit" :
-            (style == "swarm") ? "swarm" :
-            (style == "eng_firm") ? "eng. firm" : "agent";
-        char planned[96];
-        std::snprintf(planned, sizeof(planned), "Planned for %s execution", styleLabel);
-        dimText(planned);
-    }
     if (!m.planApproveReason.empty()) {
         ImGui::PushStyleColor(ImGuiCol_Text, surf.textSecondary);
         ImGui::TextWrapped("%s", m.planApproveReason.c_str());
         ImGui::PopStyleColor();
     } else {
-        dimText("Review the plan above. Edit it, or execute with the recommended style "
-                "(other styles still available).");
+        dimText("Review the plan above. Edit it, or execute it as it stands.");
     }
 
     auto planText = [&]() -> std::string {
@@ -1118,41 +1097,11 @@ void drawPlanApproveCard(AppState& st, ChatMsg& m, const ui::Fonts& fonts) {
         return out;
     };
 
-    // Button order: recommended first as primary when matching; others secondary.
-    auto styleBtn = [&](const char* label, const char* key, bool asPrimary) -> bool {
-        if (asPrimary) return primaryButton(label, ImVec2(-1, ui::metrics::copilotBtnH()));
-        return ImGui::Button(label, ImVec2(-1, 0));
-    };
-
     ImGui::Dummy(ImVec2(0, ui::metrics::cpMenuCtlGap()));
     // Edit plan — focuses composer with plan text for revision (resend as plan_only).
-    bool editPlan = ImGui::Button("Edit plan", ImVec2(-1, 0));
-
-    // Execute buttons: highlight recommended.
-    const bool recAgent   = (style == "agent" || style == "edit");
-    const bool recSwarm   = (style == "swarm");
-    const bool recEngFirm = (style == "eng_firm");
-
-    // Recommended first when not agent, so primary lands on the match.
-    bool asAgent = false, asSwarm = false, asEngFirm = false;
-    if (recEngFirm) {
-        asEngFirm = styleBtn("Execute as Eng. Firm  (Recommended)", "eng_firm", true);
-        asSwarm   = styleBtn("Execute as Swarm", "swarm", false);
-        asAgent   = styleBtn("Execute as Agent", "agent", false);
-    } else if (recSwarm) {
-        asSwarm   = styleBtn("Execute as Swarm  (Recommended)", "swarm", true);
-        asAgent   = styleBtn("Execute as Agent", "agent", false);
-        asEngFirm = styleBtn("Execute as Eng. Firm", "eng_firm", false);
-    } else {
-        // edit-style and agent both map to Execute as Agent (edit-style is single-agent execute).
-        const char* agentLbl = (style == "edit")
-            ? "Execute as Agent  (Recommended \xc2\xb7 edit-style)"
-            : "Execute as Agent  (Recommended)";
-        asAgent   = styleBtn(agentLbl, "agent", true);
-        asSwarm   = styleBtn("Execute as Swarm", "swarm", false);
-        asEngFirm = styleBtn("Execute as Eng. Firm", "eng_firm", false);
-    }
-    bool cancel = ImGui::Button("Cancel", ImVec2(-1, 0));
+    const bool editPlan = ImGui::Button("Edit plan", ImVec2(-1, 0));
+    const bool execute  = primaryButton("Execute", ImVec2(-1, ui::metrics::copilotBtnH()));
+    const bool cancel   = ImGui::Button("Cancel", ImVec2(-1, 0));
     ImGui::PopStyleColor();
     ImGui::EndChild();
     ImGui::PopStyleVar();   // ##plan_approve WindowPadding
@@ -1162,7 +1111,6 @@ void drawPlanApproveCard(AppState& st, ChatMsg& m, const ui::Fonts& fonts) {
         m.planApprovePending = false;
         m.planApproveRequest.clear();
         m.planApproveExtras = nlohmann::json::object();
-        m.planExecutionStyle.clear();
         m.planApproveReason.clear();
         if (m.text.empty()) m.text = "Plan cancelled.";
         st.status = "Ready."; st.statusKind = 0;
@@ -1188,7 +1136,7 @@ void drawPlanApproveCard(AppState& st, ChatMsg& m, const ui::Fonts& fonts) {
         return;
     }
 
-    if (!asAgent && !asSwarm && !asEngFirm) return;
+    if (!execute) return;
 
     const std::string approved = planText();
     const std::string req = m.planApproveRequest.empty() ? approved : m.planApproveRequest;
@@ -1197,43 +1145,19 @@ void drawPlanApproveCard(AppState& st, ChatMsg& m, const ui::Fonts& fonts) {
     nlohmann::json opts = nlohmann::json::object();
     opts["advisor"] = true;
     opts["approved_plan"] = approved;
+    // Approval always resumes as ONE agent turn: the agent decides for itself whether the
+    // approved plan wants subagents, so the host offers no execution styles.
+    opts["mode"] = "agent";
     opts["corporate_mode"] = st.settings.corporateMode;
-    if (asEngFirm) {
-        opts["mode"] = "eng_firm";
-        opts["execute_as"] = "eng_firm";
-        opts["org"] = "eng_firm";
-        opts["corporate_force"] = true;
-    } else if (asSwarm) {
-        opts["mode"] = "swarm";
-        opts["execute_as"] = "swarm";
-        opts["corporate_force"] = true;
-    } else {
-        // edit-style and agent both resume as single-agent execute.
-        opts["mode"] = (style == "edit") ? "edit" : "agent";
-        opts["execute_as"] = "agent";
-    }
     extras["options"] = std::move(opts);
-    nlohmann::json payload = agentProviderOverride(st.settings);
-    for (auto it = extras.begin(); it != extras.end(); ++it)
-        payload[it.key()] = it.value();
 
     m.planApprovePending = false;
-    m.planExecutionStyle.clear();
     m.planApproveReason.clear();
     m.running = true;
     if (st.settings.model[0]) m.model = st.settings.model;
-    if (asEngFirm) m.liveStatus = "Executing plan (eng. firm)...";
-    else if (asSwarm) m.liveStatus = "Executing plan (swarm)...";
-    else m.liveStatus = "Executing plan (agent)...";
+    m.liveStatus = "Executing plan...";
     st.status = m.liveStatus; st.statusKind = 0;
-    st.agentV2Running = true;
-    st.agentV2 = true;
-
-    if (asSwarm || asEngFirm) {
-        launchMissionRunChat(st, req, /*needFreshDoc=*/true, payload);
-    } else {
-        launchDesignRun(st, req, payload);
-    }
+    launchAgentTurn(st, req, extras);
 }
 
 // --- model-routing + context-meter helpers (transparency UI) -----------------------------------
@@ -1493,167 +1417,9 @@ void drawCorpMutedLine(const ActivityItem& a, const ui::Fonts& fonts) {
 }
 
 
-// The agent timeline: dispatch each activity row to a thinking block or an action card, computing
-// the thinking auto-collapse (a thinking row collapses once a later stage reaches a verdict).
-// Typed /2 transparency rows (M12-M14) dispatch by rowKind first, at their arrival position.
-// Routing / classification card — distinct glass card at the top of the activity timeline.
-// rowKind 10; title=task_class, reason=reason, detail=JSON of optional picked_model/etc.
-void drawClassificationCard(ActivityItem& a, const ui::Fonts& fonts,
-                                   bool turnRunning) {
-    const auto& pal = ui::palette;
-    const float sc = ui::uiScale;
-    const ui::AdaptiveSurface& surf = chatSurf();
-    ImGui::Dummy(ImVec2(0, ui::metrics::cpChatRowGap()));
-    GlassBubble gb = beginGlassBubble(ImGui::GetContentRegionAvail().x, ui::GlassLevel::Thin, 8.0f);
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,
-                        ImVec2(ui::metrics::cpChatCardPadX(), ui::metrics::cpChatCardPadY()));
-    ImGui::BeginChild("##classcard", ImVec2(0, 0),
-                      ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_AlwaysUseWindowPadding);
-
-    ui::IconUV iv = ui::getIcon("milestone_flag", 20);
-    if (iv.valid) {
-        float gz = ImGui::GetTextLineHeight() * 0.95f;
-        ImVec4 tint = semanticOnGlass(pal.accent, surf);
-        ImGui::Image(iv.texId, ImVec2(gz, gz), iv.uv0, iv.uv1, tint);
-        ImGui::SameLine(0, 6 * sc);
-    }
-    ImGui::PushFont(fonts.medium);
-    ImGui::TextColored(semanticOnGlass(pal.accent, surf), "Routing");
-    ImGui::PopFont();
-    ImGui::SameLine(0, 6 * sc);
-    ImGui::PushStyleColor(ImGuiCol_Text, surf.textPrimary);
-    ImGui::TextUnformatted(a.title.empty() ? "task" : a.title.c_str());
-    ImGui::PopStyleColor();
-
-    std::string model, provider, scaffold, tier, structure, domain;
-    std::vector<std::string> alts;
-    if (!a.detail.empty()) {
-        try {
-            auto j = nlohmann::json::parse(a.detail);
-            if (j.is_object()) {
-                if (j.contains("picked_model") && j["picked_model"].is_string())
-                    model = j["picked_model"].get<std::string>();
-                if (j.contains("picked_provider") && j["picked_provider"].is_string())
-                    provider = j["picked_provider"].get<std::string>();
-                if (j.contains("scaffold_level")) {
-                    if (j["scaffold_level"].is_string())
-                        scaffold = j["scaffold_level"].get<std::string>();
-                    else scaffold = j["scaffold_level"].dump();
-                } else if (j.contains("complexity")) {
-                    if (j["complexity"].is_string())
-                        scaffold = j["complexity"].get<std::string>();
-                    else scaffold = j["complexity"].dump();
-                }
-                if (j.contains("tier")) {
-                    if (j["tier"].is_string()) tier = j["tier"].get<std::string>();
-                    else tier = j["tier"].dump();
-                }
-                if (j.contains("structure") && j["structure"].is_string())
-                    structure = j["structure"].get<std::string>();
-                if (j.contains("domain") && j["domain"].is_string())
-                    domain = j["domain"].get<std::string>();
-                auto pullAlts = [&](const char* key) {
-                    if (!j.contains(key) || !j[key].is_array()) return;
-                    for (const auto& it : j[key]) {
-                        if (it.is_string()) alts.push_back(it.get<std::string>());
-                        else if (it.is_object()) {
-                            std::string tc;
-                            if (it.contains("task_class") && it["task_class"].is_string())
-                                tc = it["task_class"].get<std::string>();
-                            else if (it.contains("class") && it["class"].is_string())
-                                tc = it["class"].get<std::string>();
-                            else if (it.contains("name") && it["name"].is_string())
-                                tc = it["name"].get<std::string>();
-                            if (!tc.empty()) alts.push_back(std::move(tc));
-                        }
-                    }
-                };
-                pullAlts("alternatives");
-                pullAlts("alt_classes");
-                pullAlts("candidates");
-            }
-        } catch (...) {}
-    }
-    static const char* kFallbackClasses[] = {
-        "simple_part", "multi_feature_part", "assembly", "enclosure",
-        "cam_program", "modification", "analysis", "unknown"
-    };
-    if (alts.empty()) {
-        for (const char* c : kFallbackClasses) alts.push_back(c);
-    }
-
-    if (!model.empty() || !provider.empty()) {
-        std::string line;
-        if (!provider.empty() && !model.empty()) line = provider + " \xc2\xb7 " + shortModelName(model);
-        else if (!model.empty()) line = shortModelName(model);
-        else line = provider;
-        ImGui::PushStyleColor(ImGuiCol_Text, surf.textSecondary);
-        ImGui::TextWrapped("%s", line.c_str());
-        ImGui::PopStyleColor();
-    }
-    if (!scaffold.empty() || !tier.empty() || !structure.empty()) {
-        std::string meta;
-        if (!scaffold.empty()) meta = "scaffold " + scaffold;
-        if (!structure.empty()) {
-            if (!meta.empty()) meta += " \xc2\xb7 ";
-            meta += structure;
-        }
-        if (!tier.empty()) {
-            if (!meta.empty()) meta += " \xc2\xb7 ";
-            meta += "tier " + tier;
-        }
-        ImGui::PushStyleColor(ImGuiCol_Text, surf.textTertiary);
-        ImGui::TextUnformatted(meta.c_str());
-        ImGui::PopStyleColor();
-    }
-    if (!domain.empty() && domain != a.title) {
-        ImGui::PushStyleColor(ImGuiCol_Text, surf.textTertiary);
-        ImGui::TextUnformatted(("domain " + domain).c_str());
-        ImGui::PopStyleColor();
-    }
-    if (!a.reason.empty()) dimText(a.reason.c_str());
-
-    // Alts toggle on its OWN row (never SameLine after a wrapped reason — that
-    // jammed "(hide alts)" into the reason line and broke the card layout).
-    const bool forceOpen = turnRunning && !a.userToggled;
-    if (forceOpen) a.expanded = true;
-    const bool open = a.expanded || forceOpen;
-    ImGui::PushStyleColor(ImGuiCol_Text, surf.textTertiary);
-    ImGui::TextUnformatted(open ? "(hide alts)" : "(show alts)");
-    ImGui::PopStyleColor();
-    if (ImGui::IsItemHovered()) ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
-    if (ImGui::IsItemClicked()) { a.expanded = !open; a.userToggled = true; }
-    if (open && !alts.empty()) {
-        const std::string chosen = a.title;
-        for (const auto& alt : alts) {
-            const bool isChosen = (!chosen.empty() && alt == chosen);
-            // Text bullet prefix (not ImGui::Bullet+SameLine — the glyph overlapped
-            // the label inside the glass child, clipping into the first character).
-            const std::string line = "\xE2\x80\xA2  " + alt;  // "•  "
-            if (isChosen) {
-                ImGui::PushStyleColor(ImGuiCol_Text, semanticOnGlass(pal.accent, surf));
-                ImGui::Text("%s  \xe2\x9c\x93", line.c_str());
-                ImGui::PopStyleColor();
-            } else {
-                ImGui::PushStyleColor(ImGuiCol_Text, surf.textSecondary);
-                ImGui::TextUnformatted(line.c_str());
-                ImGui::PopStyleColor();
-            }
-        }
-    }
-
-    ImGui::EndChild();
-    ImGui::PopStyleVar();   // ##classcard WindowPadding
-    ImRect cardRect = endGlassBubble(gb);
-    {
-        const std::string copyTxt = chatActivityCopyText(a);
-        chatCopyContext(cardRect, "##class_copy", copyTxt);
-    }
-}
-
 // Delegation card — transparency view of subagent dispatches (rowKind 19).
 // title="N subagents"; detail JSON {"delegates":[{role,brief,spawn_kind}]} upserted by
-// feedTurnActivity as agent.spawn events land. Same glass style as the Routing card.
+// feedTurnActivity as agent.spawn events land.
 void drawDelegationCard(const ActivityItem& a, const ui::Fonts& fonts) {
     const auto& pal = ui::palette;
     const float sc = ui::uiScale;

@@ -1,9 +1,15 @@
-"""tool_categories.py — model-requestable tool category packs (anti-context-flood).
+"""tool_categories.py — the model-requestable tool surface (anti-context-flood).
 
-Restricted modes (ask/plan/edit) start with a shared floor of tools. The model can
-call ``enable_tools(categories=[...])`` mid-turn to pull additional concrete tools
-without stuffing the full catalog into the prompt. Category packs map a short name
-to concrete tool names and/or ``family:X`` tokens (resolved via tool_registry).
+Two layers:
+
+* :data:`CATEGORY_PACKS` — curated packs used by DAG-node / sub-agent roles
+  (``enable_tools(categories=[...])`` from a capped role card).
+* The main-chat surface — :data:`MAIN_CHAT_CORE_TOOLS` (always loaded) plus the
+  live, grouped, name-level menu of EVERYTHING else (:func:`render_tool_menu`),
+  resolvable by group or by exact name through :func:`resolve_tool_requests`.
+
+Family tokens resolve lazily against ``tool_registry.catalog()`` so this module
+stays import-cycle free.
 """
 from __future__ import annotations
 
@@ -734,3 +740,304 @@ def resolve_categories(
     room = max(0, limit - len(kept_explicit))
     kept_family = sorted(expanded.difference(kept_explicit))[:room]
     return set(kept_explicit) | set(kept_family)
+
+
+# --------------------------------------------------------------------------- main chat
+#
+# The interactive main chat (``general_agent``) is NOT a capped DAG-node role. It
+# runs with one Chudcode turn per message and the model decides everything —
+# inline work, a subagent, or a mission. Two things bound its surface:
+#
+#   * :data:`MAIN_CHAT_CORE_TOOLS` — always advertised with full schemas. Picked so
+#     ordinary part/assembly/drawing/PLM/file work never needs a load step.
+#   * :func:`render_tool_menu` — EVERY other registered tool, by exact name, grouped,
+#     rendered into the system prompt (names only, ~2k tokens). Nothing is hidden:
+#     the model loads any tool with ``enable_tools(tools=[...])`` or a whole group
+#     with ``enable_tools(categories=[...])`` and its schema arrives mid-turn.
+#
+# The full catalog (~460 tools) is ~150k tokens of schema, which is why the menu
+# carries names and the schemas load on demand.
+
+MAIN_CHAT_CORE_TOOLS: tuple[str, ...] = (
+    # conversation / harness
+    "ask_user",
+    "task_list",
+    "delegate",
+    "mission_start",
+    "enable_tools",
+    "list_tool_categories",
+    "design_recipe",
+    "cad_guide",
+    "advise",
+    # files (project jail)
+    "fs_read",
+    "fs_glob",
+    "fs_grep",
+    "fs_list",
+    "fs_write",
+    "fs_edit",
+    # documents
+    "new_part",
+    "new_assembly",
+    "list_parts",
+    "get_part",
+    "describe_part",
+    "describe_assembly",
+    "describe_project",
+    "workspace_status",
+    "save_part",
+    "export_part",
+    "close_part",
+    "import_part",
+    "set_material",
+    "undo",
+    "redo",
+    # modeling
+    "add_features",
+    "preflight_ops",
+    "verify_battery",
+    "regen_diagnose",
+    # sketch
+    "describe_sketch",
+    "check_sketch",
+    "render_sketch",
+    # measure / inspect
+    "measure_part",
+    "measure_between",
+    "query_geometry",
+    "wall_thickness",
+    "render_part",
+    "inspect_part",
+    "inspect_feature",
+    "check_geometry_health",
+    "check_interference",
+    # assembly
+    "asm_add_component",
+    "asm_mate",
+    "solve_mates",
+    # drawing
+    "make_drawing",
+    "export_drawing",
+    # plm
+    "plm_open",
+    "plm_save",
+    "plm_checkpoint",
+    "plm_item_add",
+    "plm_status",
+    "plm_history",
+    "plm_timeline",
+    "plm_rollback",
+    # research
+    "research_web_search",
+    "research_fetch_page",
+    "research_material_lookup",
+)
+
+
+class _MenuGroup:
+    """One menu group: claims registry tools by family, optionally narrowed by name.
+
+    ``patterns`` are matched against the tool name — a trailing ``_`` is a prefix
+    match, anything else is exact. The first group (in :data:`_MENU_GROUPS` order)
+    that claims a tool wins; a group with no patterns claims its families' remainder.
+    """
+
+    __slots__ = ("name", "families", "patterns", "description")
+
+    def __init__(
+        self,
+        name: str,
+        families: tuple[str, ...],
+        patterns: tuple[str, ...],
+        description: str,
+    ) -> None:
+        self.name = name
+        self.families = families
+        self.patterns = patterns
+        self.description = description
+
+    def claims(self, tool: str, family: str) -> bool:
+        if family not in self.families:
+            return False
+        if not self.patterns:
+            return True
+        return any(
+            tool.startswith(p) if p.endswith("_") else tool == p for p in self.patterns
+        )
+
+
+_MENU_GROUPS: tuple[_MenuGroup, ...] = (
+    _MenuGroup("harness", ("workspace", "shell"), (),
+               "Session helpers, task list, bug report, run_shell, live doc events"),
+    _MenuGroup("files", ("files",), (),
+               "Project-jailed file read/search/write/edit"),
+    _MenuGroup("sketch", ("cad", "gsl"),
+               ("sketch_", "sketch3d_", "check_sketch", "check_sketch3d", "render_sketch",
+                "render_sketch_ascii", "describe_sketch", "doc_sketch_contact_sheet",
+                "sketch_preview_text"),
+               "2D/3D sketches: constraints, health, previews, 3D paths and pipes"),
+    _MenuGroup("assembly", ("cad",),
+               ("asm_", "new_assembly", "solve_mates", "stackup_analyze", "interface_check",
+                "check_interference", "assembly_plan_review", "describe_assembly",
+                "list_world_bodies"),
+               "Components, mates, stackups and interface/fit checks"),
+    _MenuGroup("drawing", ("cad",),
+               ("add_balloon", "add_chamfer_dimension", "add_datum", "add_datum_target",
+                "add_detail_view", "add_dimension", "add_drawing_", "add_gdt",
+                "add_hole_callout", "add_ordinate_dimensions", "add_section_view",
+                "add_surface_finish", "add_weld_symbol", "audit_drawing", "drawing_bom",
+                "edit_drawing_annotation", "export_drawing", "list_drawing_sheets",
+                "make_drawing", "review_drawing", "set_active_drawing_sheet",
+                "set_titleblock", "set_view", "suggest_drawing_dimension_scheme",
+                "suggest_dimension_scheme"),
+               "2D drawings: views, dimensions, GD&T, tables, title block, PDF/DXF export"),
+    _MenuGroup("docs", ("cad",),
+               ("make_report", "make_presentation", "make_work_instruction",
+                "make_weldment_traveler", "make_workbook", "render_document"),
+               "Reports, work instructions, travelers, presentations, workbooks"),
+    _MenuGroup("mfgplan", ("cad",), ("mfg_plan_",),
+               "Manufacturing plan scratchpad: process, datums, critical dims, DfM"),
+    _MenuGroup("requirements", ("cad",), ("req_", "layout_plan", "layout_plan_report"),
+               "Requirements capture/verification and layout plans"),
+    _MenuGroup("measure", ("cad", "gsl"),
+               ("measure", "measure_", "query_", "wall_thickness", "hover", "is_watertight"),
+               "Mass properties, distances, wall thickness, geometry/adjacency queries"),
+    _MenuGroup("inspect", ("cad", "gsl"),
+               ("check_", "inspect_", "render_", "look_around", "contact_sheet",
+                "design_review", "design_audit", "draft_analysis", "verify_battery",
+                "doc_diff_tool", "engine_profile", "engine_profile_tree",
+                "assess_mesh_quality", "analyze_stl_geometry", "health_check",
+                "describe_", "apply_ascii_edits", "show_in_app", "get_job",
+                "list_artifacts"),
+               "Render/inspect views, health/DFM/overlap checks, describers, ASCII views"),
+    _MenuGroup("plm", ("cad",), ("plm_graph_",),
+               "Vault items, checkpoints/rollback, release, product graph, live collab, Box"),
+    _MenuGroup("plm", ("plm",), (), ""),
+    _MenuGroup("modeling", ("cad",), (),
+               "Part geometry beyond add_features: configurations, standard parts, regen repair, undo/redo"),
+    _MenuGroup("coordination", ("mission", "ledger", "org", "advisor"), (),
+               "Missions/DAG, ledger, org requests, advisory checks"),
+    _MenuGroup("intake", ("intake",), (),
+               "Photo intake of real parts: measure, confirm dims, fit coupons"),
+    _MenuGroup("research", ("research",), (),
+               "Web, materials, standards, threads, unit conversion, machining references"),
+    _MenuGroup("sourcing", ("parts",), (),
+               "Parts catalog search/place, BOM cost, vendors, quotes, scrape import"),
+    _MenuGroup("sim", ("sim",), (),
+               "FEA (static/modal/fatigue), CFD, motion, thermal, fluid/piping circuits"),
+    _MenuGroup("cam", ("cam",), (),
+               "CAM jobs, ops, toolpaths, post, feeds & speeds, cost"),
+    _MenuGroup("ecad", ("ecad", "em"), (),
+               "Schematic/PCB place-wire-board, ERC/DRC, simulation, antenna/EM, firmware"),
+    _MenuGroup("reveng", ("reveng", "recon"), (),
+               "Reverse engineering: scan/photo/datasheet intake, reconstruct, verify deviation"),
+    _MenuGroup("office", ("office",), (),
+               "PDF/DOCX/XLSX/PPTX/CSV read, extract, edit, convert"),
+    _MenuGroup("manufacture", ("manufacture",), (),
+               "Machine devices, runs, approvals and telemetry (default-off family)"),
+)
+
+
+def _live_catalog() -> dict[str, dict]:
+    try:
+        from services.mcp import tool_registry as _tr  # noqa: PLC0415 — lazy
+        _tr.warm_catalog()
+        return dict(_tr.catalog() or {})
+    except Exception:  # noqa: BLE001 — catalog optional at import/test time
+        return {}
+
+
+def tool_menu_groups() -> list[tuple[str, str, list[str]]]:
+    """``[(group, description, [tool, ...]), ...]`` over the LIVE registry.
+
+    Every registered tool lands in exactly one group (first :data:`_MENU_GROUPS`
+    rule that claims it wins; several rules may share a group name, the first
+    carries the description); a tool whose family no rule names lands in
+    ``other``. Group order is first-rule order; tool names are sorted within a group.
+    """
+    order: list[str] = []
+    descs: dict[str, str] = {}
+    buckets: dict[str, list[str]] = {}
+    for g in _MENU_GROUPS:
+        if g.name not in buckets:
+            order.append(g.name)
+            descs[g.name] = g.description
+            buckets[g.name] = []
+    other: list[str] = []
+    for tool, meta in _live_catalog().items():
+        family = str((meta or {}).get("family") or "")
+        for group in _MENU_GROUPS:
+            if group.claims(tool, family):
+                buckets[group.name].append(tool)
+                break
+        else:
+            other.append(tool)
+    out = [(name, descs[name], sorted(buckets[name])) for name in order if buckets[name]]
+    if other:
+        out.append(("other", "Tools outside every group above", sorted(other)))
+    return out
+
+
+def menu_group_names() -> list[str]:
+    return list(dict.fromkeys(g.name for g in _MENU_GROUPS))
+
+
+def render_tool_menu(loaded: Iterable[str] | None = None) -> str:
+    """The prompt block that makes the WHOLE catalog visible to the main chat.
+
+    *loaded* names are already advertised with schemas this turn and are left out
+    of the listing; a group with nothing left is omitted. Returns "" when the
+    registry is cold (unit tests) so the prompt simply has no menu.
+    """
+    skip = {str(t) for t in (loaded or ()) if t}
+    lines: list[str] = []
+    for name, desc, tools in tool_menu_groups():
+        rest = [t for t in tools if t not in skip]
+        if not rest:
+            continue
+        lines.append(f"- {name} ({len(rest)}) — {desc}:")
+        lines.append("  " + ", ".join(rest))
+    if not lines:
+        return ""
+    head = (
+        "MORE TOOLS (registered, not loaded yet). Load exact names with "
+        "enable_tools(tools=[...]) or a whole group with "
+        "enable_tools(categories=[<group>]); the schemas arrive for the rest of "
+        "the turn. Every tool below is available to you — nothing else exists."
+    )
+    return head + "\n" + "\n".join(lines)
+
+
+def resolve_tool_requests(tokens: Iterable[str] | None) -> tuple[set[str], list[str]]:
+    """Resolve ``enable_tools`` tokens to ``(tool_names, unknown_tokens)``.
+
+    Each token resolves, in order, as a live menu group (the menu is the truth
+    the model read), a legacy :data:`CATEGORY_PACKS` pack, a ``family:<name>``
+    registry family, or an exact registry tool name. Explicit requests are never
+    capped: the model saw the exact list it asked for. Non-registry meta names
+    (``delegate``) are accepted as-is so a mission-scoped tool is never "unknown".
+    """
+    catalog = _live_catalog()
+    groups = {name: set(items) for name, _desc, items in tool_menu_groups()}
+    out: set[str] = set()
+    unknown: list[str] = []
+    for raw in tokens or ():
+        token = str(raw or "").strip()
+        key = token.lower()
+        if not key:
+            continue
+        if key in groups:
+            out |= groups[key]
+        elif key in CATEGORY_PACKS:
+            out |= resolve_categories([key], cap=10_000)
+        elif key.startswith("family:"):
+            found = _expand_token(key)
+            if found:
+                out |= found
+            else:
+                unknown.append(token)
+        elif token in catalog or token in META_TOOLS or token == "delegate":
+            out.add(token)
+        else:
+            unknown.append(token)
+    return out, unknown

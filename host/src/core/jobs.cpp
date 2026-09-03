@@ -93,7 +93,11 @@ AgentJobRpcRoute buildAgentJobRpcRoute(const std::string& request, const std::st
     // host-tool context and the explicit offline core fallback still use its full shape.
     for (auto it = options.begin(); it != options.end(); ++it)
         if (!route.params.contains(it.key())) route.params[it.key()] = it.value();
-    route.params["mode"] = mission ? "swarm" : "agent";
+    // The composer's user-picked mode (options.mode: "agent"|"plan"|"ask") is authoritative —
+    // never re-derived from the request text. A mission run still forces the swarm lane.
+    const std::string optionMode = jsonString(options, "mode");
+    route.params["mode"] = mission ? std::string("swarm")
+                                   : (optionMode.empty() ? std::string("agent") : optionMode);
     route.params["options"]["mode"] = route.params["mode"];
     if (mission) {
         route.params["corporate_force"] = true;

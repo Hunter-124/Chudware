@@ -32,7 +32,7 @@
     {"kind": "agent.context_injected", "required_fields": ["node_id", "source", "label"], "optional": false, "emitter_note": "python"},
     {"kind": "agent.spawn", "required_fields": ["node_id", "subagent_id", "role", "spawn_kind", "brief", "budget_tokens"], "optional": false, "emitter_note": "python"},
     {"kind": "agent.advisor", "required_fields": ["node_id", "advisor_kind", "verdict_summary"], "optional": false, "emitter_note": "python"},
-    {"kind": "agent.classification", "required_fields": ["task_class", "scaffold_level", "tier", "reason", "request_snippet"], "optional": false, "emitter_note": "python (2026-07-17 additive)"},
+    {"kind": "agent.classification", "required_fields": ["task_class", "scaffold_level", "tier", "reason", "request_snippet"], "optional": true, "emitter_note": "core/agent/run.cpp + micro.cpp native OFFLINE pipeline only (outside scanned emitters); the Python builder and every GUI consumer were removed 2026-09-03 — the online lane has no classification step"},
     {"kind": "agent.role", "required_fields": ["node_id", "role", "goal", "from_role", "reason"], "optional": false, "emitter_note": "python (2026-07-27 additive; real adopt_role changes only)"},
     {"kind": "agent.model_assignment", "required_fields": ["depth", "task_class", "picked_model"], "optional": false, "emitter_note": "python (spawn model-assignment audit, watch-list additive)"},
     {"kind": "agent.provider_usage", "required_fields": ["provider", "model", "prompt_tokens", "completion_tokens", "total_tokens", "context_tokens", "source"], "optional": false, "emitter_note": "python provider usage sink; gateway-owned attribution"},

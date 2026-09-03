@@ -560,10 +560,6 @@ void loadSettings(Settings& s) {
                 s.proactiveAdvisor = ag.value("proactive_advisor", false);
             if (ag.contains("corporate_mode"))
                 s.corporateMode = ag.value("corporate_mode", false);
-            if (ag.contains("auto_mission_routing"))
-                s.autoMissionRouting = ag.value("auto_mission_routing", false);
-            if (ag.contains("direct_agent_full_tools"))
-                s.directAgentFullTools = ag.value("direct_agent_full_tools", true);
             if (ag.contains("memory_enabled"))
                 s.memoryEnabled = ag.value("memory_enabled", true);
             if (ag.contains("memory_token_budget")) {
@@ -571,10 +567,6 @@ void loadSettings(Settings& s) {
                 s.memoryTokenBudget = (b < 50) ? 50 : (b > 4000 ? 4000 : b);
             }
         }
-        if (j.contains("auto_mission_routing"))
-            s.autoMissionRouting = j.value("auto_mission_routing", false);
-        if (j.contains("direct_agent_full_tools"))
-            s.directAgentFullTools = j.value("direct_agent_full_tools", true);
         if (j.contains("proactive_advisor"))
             s.proactiveAdvisor = j.value("proactive_advisor", false);
         if (j.contains("corporate_mode"))
@@ -586,23 +578,20 @@ void loadSettings(Settings& s) {
             s.memoryTokenBudget = (b < 50) ? 50 : (b > 4000 ? 4000 : b);
         }
         {
-            // Accept string names or int 0..4; map legacy Design/Edit/Ask if present.
+            // Accept string names or a persisted int from any build; legacy swarm/edit/eng_firm
+            // collapse to Agent (those lanes are the model's own decision now, not a mode).
             int cm = 0;
             if (j.contains("copilot_mode")) {
                 const auto& v = j["copilot_mode"];
                 if (v.is_number_integer()) {
-                    cm = v.get<int>();
+                    cm = normalizeCopilotMode(v.get<int>());
                 } else if (v.is_string()) {
                     const std::string m = v.get<std::string>();
-                    if (m == "agent" || m == "design") cm = 0;
-                    else if (m == "plan") cm = 1;
-                    else if (m == "swarm") cm = 2;
-                    else if (m == "edit") cm = 3;
-                    else if (m == "ask" || m == "chat") cm = 4;
-                    else if (m == "eng_firm") cm = 5;
+                    if (m == "plan") cm = (int)CopilotMode::Plan;
+                    else if (m == "ask" || m == "chat") cm = (int)CopilotMode::Ask;
+                    else cm = (int)CopilotMode::Agent;
                 }
             }
-            if (cm < 0 || cm > 5) cm = 0;
             s.copilotMode = cm;
         }
         s.maxTokens = j.value("max_output_tokens", 0);
@@ -1025,8 +1014,6 @@ static void applyGuiOwnedSettings(nlohmann::json& j, const Settings& s) {
         j["advisor_preference"] = prefName(s.advisorPreference);
         j["proactive_advisor"] = s.proactiveAdvisor;
         j["corporate_mode"] = s.corporateMode;
-        j["auto_mission_routing"] = s.autoMissionRouting;
-        j["direct_agent_full_tools"] = s.directAgentFullTools;
         j["memory_enabled"] = s.memoryEnabled;
         j["memory_token_budget"] = s.memoryTokenBudget;
         // Merge-overlay into agent{} so Python config helpers see the same values.
@@ -1037,8 +1024,6 @@ static void applyGuiOwnedSettings(nlohmann::json& j, const Settings& s) {
         agent["advisor_preference"] = prefName(s.advisorPreference);
         agent["proactive_advisor"] = s.proactiveAdvisor;
         agent["corporate_mode"] = s.corporateMode;
-        agent["auto_mission_routing"] = s.autoMissionRouting;
-        agent["direct_agent_full_tools"] = s.directAgentFullTools;
         agent["subagent_preference"] = prefName(s.subagentPreference);
         agent["task_list_preference"] = prefName(s.taskListPreference);
         agent["memory_enabled"] = s.memoryEnabled;
@@ -1047,10 +1032,8 @@ static void applyGuiOwnedSettings(nlohmann::json& j, const Settings& s) {
         j.erase("role_adoption");
     }
     {
-        static const char* kModeNames[] = {"agent", "plan", "swarm", "edit", "ask", "eng_firm"};
-        int cm = s.copilotMode;
-        if (cm < 0 || cm > 5) cm = 0;
-        j["copilot_mode"] = kModeNames[cm];
+        static const char* kModeNames[kCopilotModeCount] = {"agent", "plan", "ask"};
+        j["copilot_mode"] = kModeNames[normalizeCopilotMode(s.copilotMode)];
     }
     if (s.maxTokens > 0) j["max_output_tokens"] = s.maxTokens;
     if (s.contextWindow > 0) j["context_window"] = s.contextWindow;

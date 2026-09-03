@@ -283,3 +283,18 @@ Mode→role: agent→default, plan→planning, swarm→default(+corporate), edit
   §AI) → `{ok, steered}`; cooperative like `agent_cancel` — never interrupts an in-flight
   provider HTTP call; unknown/finished run_id → `steered:false`. Consumers tolerate unknown
   kinds (conformance §5).
+
+## No online classification step (2026-09-03, superseding)
+- `agent.classification`, `task_route` and `complexity` are no longer produced by the ONLINE
+  lane and have no GUI consumer: the Routing card (rowKind 10), the session scope
+  color-code and `agent_events.classification_event` were removed. A chat send is one
+  Chudcode `general_agent` turn; the model decides inline/delegate/mission itself. The native
+  offline pipeline (`core/agent/run.cpp`, `micro.cpp`) may still emit `agent.classification`
+  for its own stage structure; consumers MUST tolerate it exactly as any unknown kind (§5).
+- Copilot modes are Agent | Plan | Ask only (`CopilotMode` 0/1/2). `swarm`/`edit`/`eng_firm`
+  remain valid `options.mode` values for programmatic callers (the mode contract is unchanged)
+  but the GUI never sends them; the plan-approve card resends `approved_plan` with
+  `mode=agent` only.
+- `options.scope {doc_id, feature_ids?, selection?}` is sent in EVERY mode whenever a document
+  is open. It is editor CONTEXT (rendered into the user message as ACTIVE DOCUMENT), not an
+  edit-targeting restriction.

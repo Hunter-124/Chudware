@@ -877,10 +877,10 @@ bool drawAiSettingsSection(AppState& st, bool busy, AiSettingsSection section) {
             ImGui::TextUnformatted("Wire provider: kimi-code \xc2\xb7 model: k3 (default)");
             ImGui::PopStyleColor();
         } else {
-            dimText("Cursor subscription (OAuth via subscription_auth). Sign in under Accounts; "
-                    "no API key field.");
+            dimText("Cursor (Chudcode service). Sign in under Settings \xe2\x86\x92 Providers; "
+                    "the service resolves the credential from its own auth store — no API key.");
             ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(ui::palette.textDim));
-            ImGui::TextUnformatted("Wire provider: cursor \xc2\xb7 model: composer-2.5");
+            ImGui::TextUnformatted("Wire provider: cursor \xc2\xb7 model: composer-2.5 (default)");
             ImGui::PopStyleColor();
         }
         if (ImGui::Checkbox("Model supports vision (send screenshots)", &s.vision)) changed = true;
@@ -1462,7 +1462,8 @@ bool providerUsable(AppState& st, int provider) {
             return st.settings.xaiKey[0] != 0 || s_subConn.xai || s_subConn.hostXaiKey;
         case ui::PROV_LOCAL:       return st.providerModels[ui::PROV_LOCAL].ok;
         case ui::PROV_LLAMACPP:    return st.providerModels[ui::PROV_LLAMACPP].ok;
-        case ui::PROV_CURSOR:      return s_subConn.cursor;
+        case ui::PROV_CURSOR:
+            return s_subConn.cursor || st.signedInBridgeProviders.count("cursor") != 0;
         case ui::PROV_KIMISUB:     return s_subConn.kimi;
         // ZenMux — Chudcode-service credential lives in the service's auth store (Settings → Providers),
         // not a locally-polled subscription/key flag this file can cheaply check. Always offered;
@@ -1714,6 +1715,7 @@ const ui::BridgeModelMeta* bridgeModelMetaForCad(int cadProvider, const std::str
         case ui::PROV_XAI:       prov = "xai"; break;
         case ui::PROV_GEMINI:    prov = "google"; break;
         case ui::PROV_ZENMUX:    prov = "zenmux"; break;
+        case ui::PROV_CURSOR:    prov = "cursor"; break;
         case ui::PROV_CLOUDCOMPAT: {
             // The shared cloud slot resolves by base_url (Moonshot is the prioritized one).
             const char* svc = ui::cloudServiceKey(cloudBaseUrl ? cloudBaseUrl : "");
@@ -2231,8 +2233,10 @@ void drawModelDropdown(AppState& st, bool busy) {
 
     // Composer models = the user's SELECTED (checked = NOT hidden) catalog models for SIGNED-IN
     // providers, sourced from the Settings -> Providers catalog (ui::bridgeModelCatalog()). Each
-    // catalog provider id maps to a composer slot + base_url; providers with no working native
-    // transport (e.g. Cursor) map to slot -1 and are excluded so they can't cause provider_error.
+    // catalog provider id maps to a composer slot + base_url. Every online send runs through
+    // Chudcode (agent_admin_turn), so a provider needs no native transport here — only a slot
+    // whose wire name Chudcode recognises. Unknown catalog providers map to slot -1 and are
+    // excluded so they can't cause provider_error.
     struct Route { int slot; const char* baseUrl; };
     auto routeFor = [](const std::string& p) -> Route {
         if (p == "anthropic") return {ui::PROV_ANTHROPIC, ""};
@@ -2241,6 +2245,7 @@ void drawModelDropdown(AppState& st, bool busy) {
         if (p == "xai") return {ui::PROV_XAI, "https://api.x.ai/v1"};
         if (p == "kimi-code") return {ui::PROV_KIMISUB, ""};
         if (p == "zenmux") return {ui::PROV_ZENMUX, ""};
+        if (p == "cursor") return {ui::PROV_CURSOR, ""};
         if (p == "moonshot") return {ui::PROV_CLOUDCOMPAT, "https://api.moonshot.ai/v1"};
         if (p == "openrouter") return {ui::PROV_CLOUDCOMPAT, "https://openrouter.ai/api/v1"};
         if (p == "deepseek") return {ui::PROV_CLOUDCOMPAT, "https://api.deepseek.com/v1"};
@@ -2255,14 +2260,15 @@ void drawModelDropdown(AppState& st, bool busy) {
         if (p == "azure") return {ui::PROV_CLOUDCOMPAT, "https://api.openai.azure.com"};
         if (p == "google-antigravity") return {ui::PROV_CLOUDCOMPAT, "https://antigravity.google"};
         if (p == "aimlapi") return {ui::PROV_CLOUDCOMPAT, "https://api.aimlapi.com/v1"};
-        return {-1, ""};  // cursor + any unrouted provider: no working composer transport -> excluded
+        if (p == "openai-codex") return {ui::PROV_CLOUDCOMPAT, "https://chatgpt.com/backend-api/codex"};
+        return {-1, ""};  // unrouted catalog provider: no composer slot -> excluded
     };
 
     const auto& catalog = ui::bridgeModelCatalog();
     if (!catalog.empty()) {
         for (const auto& m : catalog) {
             Route r = routeFor(m.provider);
-            if (r.slot < 0) continue;                                        // no transport (cursor/…)
+            if (r.slot < 0) continue;                                        // no composer slot
             if (st.signedInBridgeProviders.count(m.provider) == 0) continue; // provider not signed in
             std::string catk = (r.slot == ui::PROV_CLOUDCOMPAT) ? ui::cloudServiceKey(r.baseUrl)
                                                                 : ui::providerCatKey(r.slot);

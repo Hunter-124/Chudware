@@ -436,14 +436,6 @@ void loadSettings(Settings& s) {
         else if (s.provider == 8 && model == "kimi-k2.7") model = "kimi-for-coding";
         if (s.provider == 6 && model != "grok-4.5" && model.rfind("grok", 0) == 0)
             model = "grok-4.5";
-        // Cursor has NO chat-completions transport (its agent API is Connect-RPC/protobuf, not
-        // REST) in either the C++ core or the Python worker, so a saved CHAT provider of "cursor"
-        // makes the copilot refuse on open. Migrate the chat provider to xAI/grok — the migration
-        // just below then re-migrates that (along with any other saved xAI/grok-4.5 pick) to the
-        // ZenMux default when the user has no xAI credential of their own. Cursor stays usable for
-        // the design-agent path, which routes separately. One-time on load; persisted on the next
-        // settings write.
-        if (s.provider == 7) { s.provider = 6; model = "grok-4.5"; }
         if (prov == "moonshot") {
             // Moonshot direct API (provider 5). The official wire id for Kimi K2.7 is
             // `kimi-k2.7-code` — the bare `kimi-k2.7` 404s ("Not found the model kimi-k2.7").

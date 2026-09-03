@@ -126,6 +126,7 @@ inline const char* cloudServiceKey(const std::string& base_url) {
     if (base_url.find("azure.com") != std::string::npos) return "azure";
     if (base_url.find("antigravity.google") != std::string::npos) return "google-antigravity";
     if (base_url.find("aimlapi.com") != std::string::npos) return "aimlapi";
+    if (base_url.find("chatgpt.com") != std::string::npos) return "openai-codex";
     return "cloud";
 }
 
@@ -142,6 +143,7 @@ inline const char* cloudServiceWireName(const std::string& key) {
     if (key == "azure") return "azure";
     if (key == "google-antigravity") return "google-antigravity";
     if (key == "aimlapi") return "aimlapi";
+    if (key == "openai-codex") return "openai-codex";
     return "openai";
 }
 
@@ -150,7 +152,7 @@ inline const char* cloudServiceWireName(const std::string& key) {
 // slot would override the intended account.
 inline bool cloudServiceUsesLocalKey(const std::string& key) {
     return key != "amazon-bedrock" && key != "azure" && key != "google-antigravity" &&
-           key != "aimlapi";
+           key != "aimlapi" && key != "openai-codex";
 }
 
 inline const char* categoryLabel(const std::string& key) {
@@ -166,6 +168,7 @@ inline const char* categoryLabel(const std::string& key) {
     if (key == "azure") return "Azure OpenAI";
     if (key == "google-antigravity") return "Google Antigravity";
     if (key == "aimlapi") return "AI/ML API";
+    if (key == "openai-codex") return "OpenAI Codex (subscription)";
     if (key == "xai") return "xAI (Grok)";
     if (key == "cursor") return "Cursor";
     if (key == "kimi-code") return "Kimi Code (subscription)";

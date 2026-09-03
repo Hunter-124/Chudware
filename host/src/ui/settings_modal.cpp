@@ -2950,7 +2950,7 @@ static int roleProviderFromWire(const std::string& w) {
     if (w == "gemini") return ui::PROV_GEMINI;
     if (w == "openrouter" || w == "cloud" || w == "cloudcompat" || w == "moonshot" ||
         w == "deepseek" || w == "alibaba-coding-plan" || w == "amazon-bedrock" || w == "azure" ||
-        w == "google-antigravity" || w == "aimlapi")
+        w == "google-antigravity" || w == "aimlapi" || w == "openai-codex")
         return ui::PROV_CLOUDCOMPAT;
     if (w == "xai" || w == "xai-sub") return ui::PROV_XAI;
     if (w == "cursor" || w == "cursor-sub") return ui::PROV_CURSOR;

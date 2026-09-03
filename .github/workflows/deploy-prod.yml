@@ -574,8 +574,27 @@ jobs:
             exit 0
           fi
 
-          # Every other nonzero exit is a real failure: 1 is a deploy failure
-          # and 2 is a usage error (a wrong flag reaching this file).
+          if [ "${rc}" -eq 4 ]; then
+            # Refused BEFORE any mutation (dirty checkout, missing gateway.env,
+            # CHUDWARE_WEB_DEV left on, prod HEAD not a v* tag). Production is
+            # byte-for-byte what it was, so a rollback is not mitigation, it is
+            # damage: it would swap a healthy release out and, when the retained
+            # release turns out to be unrestorable, report "ROLLBACK ITSELF
+            # FAILED ... Production needs hands-on recovery now". That is exactly
+            # what happened for four days from 2026-08-31 while the real cause
+            # was one dirty file in the canonical checkout. Alert with the true
+            # reason, keep the run red, roll back NOTHING.
+            {
+              echo "deployed=false"
+              echo "refused=true"
+            } >> "$GITHUB_OUTPUT"
+            echo "::error title=Deploy refused::update.sh refused before touching production (exit 4); see the REFUSED line above. Production still serves the previous release untouched."
+            exit 4
+          fi
+
+          # Every other nonzero exit is a real failure: 1 is a part-way deploy
+          # failure that may have mutated production and 2 is a usage error (a
+          # wrong flag reaching this file).
           if [ "${rc}" -ne 0 ]; then
             echo "deployed=false" >> "$GITHUB_OUTPUT"
             echo "::error title=Deploy failed::update.sh prod --continuous exited ${rc}; rolling back"
@@ -660,6 +679,16 @@ jobs:
             failed_stage=verification
           fi
 
+          # A refusal (update.sh exit 4) never mutated production, so there is
+          # nothing to restore and rollback.sh must not run: swapping a healthy
+          # release out is the opposite of mitigation, and when the retained
+          # release cannot be restored the alert claims a production emergency
+          # that does not exist.
+          if [ "${{ steps.deploy.outputs.refused }}" = true ]; then
+            failed_stage="preflight"
+            rollback_rc=0
+            rollback_mode=skipped
+          else
           # Polite first. Bare rollback.sh mints an authenticated ops session and
           # waits for engine_bridges to drain to 0 before swapping, exactly like
           # install_webd.sh --restart, so no live modelling session is dropped.
@@ -682,9 +711,11 @@ jobs:
             rollback_mode=forced
             rollback_rc=0
             /home/liveuser/Repositories/CAD/Webservice/deploy/rollback.sh --force || rollback_rc=$?
-          fi
+          fi   # end: retry with --force
+          fi   # end: rollback attempted at all (skipped for a refusal)
 
           case "${rollback_rc}:${rollback_mode}" in
+            0:skipped) rollback_result="NOT ATTEMPTED — the updater refused before changing anything, so production still serves the release it was already serving. Fix the refusal reason named in the run log (a dirty canonical checkout at /home/liveuser/Repositories/CAD is the usual one) and push again; nothing on the box needs restoring." ;;
             0:drained) rollback_result="restored the previous retained release after a clean bridge drain" ;;
             0:forced) rollback_result="restored the previous retained release with --force, because the drain could not be proven (the gateway was unreachable). Any live engine bridges were dropped." ;;
             2:*) rollback_result="COULD NOT ROLL BACK: no retained release to fall back to (exit 2). Production is still running whatever the failed promotion left behind." ;;

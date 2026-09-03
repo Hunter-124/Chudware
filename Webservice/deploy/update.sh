@@ -51,6 +51,23 @@ Health-test overrides:
 EOF
 }
 
+# Exit codes are a contract with .github/workflows/deploy-prod.yml:
+#   0  deployed
+#   1  FAILED PART-WAY: production may have been mutated -> the caller must roll back
+#   2  usage error
+#   3  another deploy holds the host lock
+#   4  REFUSED BEFORE ANY MUTATION: production is exactly as it was -> do NOT roll back
+# Code 4 exists because a precondition refusal used to exit 1, and the workflow
+# then ran rollback.sh against a production it had never touched. The rollback
+# failed on its own unrelated grounds ("release ... is not restorable") and every
+# push for four days reported "ROLLBACK ITSELF FAILED ... Production needs
+# hands-on recovery now" when the only real problem was a dirty checkout.
+refuse() {
+  echo "REFUSED: $1" >&2
+  echo "         production was not touched by this run." >&2
+  exit 4
+}
+
 [[ $# -ge 1 ]] || { usage >&2; exit 2; }
 # Snapshot argv and our own bytes before anything consumes or replaces them.
 # `git pull` below can rewrite this very file while bash is still reading it;
@@ -508,16 +525,18 @@ PY
 echo "=== chudware $ENVIRONMENT deploy start $(date -Iseconds) repo=$REPO ==="
 echo "    pull=$DO_PULL ref=${REF:-current} host=$DO_HOST engine=$DO_ENGINE webd=$DO_WEBD gateway=$DO_GATEWAY"
 
+# Everything in this block runs BEFORE the first change to production, so each
+# rejection here is a refusal (exit 4), not a part-way failure (exit 1).
 if [[ "$DO_GATEWAY" = 1 ]]; then
   [[ -r "$GATEWAY_ENV" ]] \
-    || { echo "ERROR: gateway environment is unreadable: $GATEWAY_ENV" >&2; exit 1; }
+    || refuse "gateway environment is unreadable: $GATEWAY_ENV"
   DB_URL="$(env_value CHUDWARE_DB_URL)"
   [[ -n "$DB_URL" ]] \
-    || { echo "ERROR: CHUDWARE_DB_URL is missing from $GATEWAY_ENV" >&2; exit 1; }
+    || refuse "CHUDWARE_DB_URL is missing from $GATEWAY_ENV"
   DEV_MODE="$(env_value CHUDWARE_WEB_DEV)"
   case "$DEV_MODE" in
     ""|0|false|False|FALSE|no|No|NO|off|Off|OFF) ;;
-    *) echo "ERROR: CHUDWARE_WEB_DEV must be disabled for $ENVIRONMENT deployments" >&2; exit 1 ;;
+    *) refuse "CHUDWARE_WEB_DEV must be disabled for $ENVIRONMENT deployments" ;;
   esac
   assert_entitlement_credential
   assert_database_target
@@ -528,9 +547,8 @@ if [[ "$DO_PULL" = 1 ]]; then
   echo "=== [$(date -Iseconds)] git fetch/pull $REMOTE $REF ==="
   git fetch "$REMOTE" "$REF"
   if [[ -n "$(git status --porcelain)" ]]; then
-    echo "ERROR: working tree dirty — commit/stash before update.sh" >&2
-    git status -sb
-    exit 1
+    git status -sb >&2
+    refuse "working tree dirty at $REPO — commit/stash before update.sh"
   fi
   BEFORE="$(git rev-parse --short HEAD)"
   git pull --ff-only "$REMOTE" "$REF"
@@ -582,10 +600,9 @@ if [[ "$ENVIRONMENT" = prod ]]; then
   else
     HEAD_TAG="$(git describe --tags --exact-match HEAD 2>/dev/null || true)"
     [[ "$HEAD_TAG" =~ ^v[0-9] ]] \
-      || { echo "ERROR: production HEAD is not an exact v* release tag" >&2; exit 1; }
+      || refuse "production HEAD is not an exact v* release tag"
     if [[ -n "$RELEASE_TAG" && "$HEAD_TAG" != "$RELEASE_TAG" ]]; then
-      echo "ERROR: production HEAD tag $HEAD_TAG does not match requested $RELEASE_TAG" >&2
-      exit 1
+      refuse "production HEAD tag $HEAD_TAG does not match requested $RELEASE_TAG"
     fi
     RELEASE_ID="$HEAD_TAG"
     echo "    production release tag: $HEAD_TAG"

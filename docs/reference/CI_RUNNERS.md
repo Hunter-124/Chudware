@@ -76,6 +76,19 @@ leg at the generic `cloudcastle-ci` pool without also pinning a builder label.
 - **`livingroom-pc` is also the production host.** Keep heavy matrix legs on
   `hunter-workstation`; a release build that starves the box also starves
   paying customers.
+- **`livingroom-pc` cannot be woken remotely as currently cabled.** Measured
+  2026-09-03 from its own CloudCastle RMM inventory (`devices.inventory.wake`)
+  while it was offline: `wired_wol` is armed in the OS (`ethtool` reports
+  `wol g` on `eno1`) but blocked by `no_wired_link` — the machine runs on Wi-Fi
+  (`wlp2s0`, DHCP `192.168.1.78`), and a magic packet has nowhere to arrive on a
+  NIC with no carrier. `wifi_wol` is blocked by `driver_no_wowlan`, and the
+  `cloudcastle-wake.timer` RTC schedule reports `powers_on_from_off: false`, so
+  it resumes from sleep only. MACs: `eno1` `e4:54:e8:80:f2:57`, `wlp2s0`
+  `fa:bc:db:88:50:2d` (randomized by NetworkManager, so it is not a stable WoL
+  target either). **Connect `eno1` to the LAN** and the wake path becomes real —
+  `cloudcastle-wol.service` re-arms `wol g` on every boot — which is the only
+  change that makes `cc-linux-build` and production recoverable without hands
+  on the box.
 - **Builders need Python >= 3.11**, not merely "a python3". `fast-gate` runs
   `scripts/check.py`, whose `advertised_tool_audit` imports the real MCP tool
   catalog and therefore PyYAML, the MCP SDK, NumPy and SciPy at the pins in the

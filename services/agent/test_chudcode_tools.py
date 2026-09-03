@@ -312,6 +312,64 @@ class HostToolDispatchTests(unittest.TestCase):
             "details": {"step": 1},
         }])
 
+    def test_a_kwargs_catch_all_is_not_a_plumbing_channel(self):
+        """`add_features(ops=None, doc_id=None, background=False, **extra)` reads
+        every unrecognised keyword as USER INTENT — a feature param, a design-intent
+        note, or a hard error naming the real parameter set. Injecting run context
+        into that catch-all made the core modeling tool reject every call, so the
+        agent could not build geometry at all and fell back to writing STEP files by
+        hand. Only an explicitly declared parameter receives run context."""
+        seen = {}
+
+        def add_features(ops=None, doc_id=None, background=False, **extra):
+            seen["extra"] = dict(extra)
+            seen["doc_id"] = doc_id
+            return {"ok": True}
+
+        binding = self._binding(
+            name="add_features",
+            handler=add_features,
+            doc_id="doc-7",
+            actor="feature_modeler",
+            run_id="gui-1",
+            node_id="n1",
+            parent_id="p1",
+            subagent_id="s1",
+        )
+        result = dispatch_host_tool(
+            binding, {"ops": [{"op": "add_feature"}]}, lambda _p: None, lambda: False
+        )
+        self.assertEqual(result, {"ok": True})
+        # doc_id is declared, so it still arrives; nothing else leaks.
+        self.assertEqual(seen["doc_id"], "doc-7")
+        self.assertEqual(seen["extra"], {})
+
+    def test_a_declared_parameter_still_receives_run_context(self):
+        seen = {}
+
+        def wants_context(
+            ops=None, *, doc_id=None, actor=None, run_id=None, progress=None, cancel=None
+        ):
+            seen.update(
+                doc_id=doc_id, actor=actor, run_id=run_id,
+                progress=progress, cancel=cancel,
+            )
+            return {"ok": True}
+
+        cancel = lambda: False
+        binding = self._binding(
+            name="wants_context",
+            handler=wants_context,
+            doc_id="doc-9",
+            actor="feature_modeler",
+            run_id="gui-2",
+        )
+        dispatch_host_tool(binding, {}, None, cancel)
+        self.assertEqual(seen["doc_id"], "doc-9")
+        self.assertEqual(seen["actor"], "feature_modeler")
+        self.assertEqual(seen["run_id"], "gui-2")
+        self.assertIs(seen["cancel"], cancel)
+
     def test_tool_error_propagates_unchanged(self):
         error = RuntimeError("CAD rejected feature")
 

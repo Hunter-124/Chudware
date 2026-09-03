@@ -697,13 +697,33 @@ def _cancelled(cancel: Any) -> bool:
 
 
 def _accepts(fn: Callable[..., Any], name: str) -> bool:
+    """True only when *fn* DECLARES *name* as a keyword-passable parameter.
+
+    A ``**kwargs`` catch-all deliberately does NOT count. Several CAD tools —
+    ``add_features`` above all — end in ``**extra`` and treat every unrecognised
+    keyword as USER INTENT: a feature parameter, a design-intent note, or a hard
+    error naming the real parameter set. Letting a catch-all stand in for a
+    declaration meant the harness posted ``actor``, ``run_id``, ``node_id``,
+    ``parent_id``, ``subagent_id``, ``progress`` and ``cancel`` into that
+    channel, so THE core modeling tool rejected every call it was given. Live
+    2026-09-03, in the model's own words: "add_features consistently rejects the
+    harness-injected kwargs like actor, cancel, progress, and run_id ...
+    add_features is unusable through this device and I need to find an
+    alternative route to apply document operations" — after which it spent
+    thirteen minutes writing STEP files by hand through `eval`. A tool that
+    wants run context asks for it by name.
+    """
     try:
         sig = inspect.signature(fn)
     except (TypeError, ValueError) as exc:
         _debug_fallback(f"signature probe for {name}", exc)
         return False
-    return name in sig.parameters or any(
-        p.kind == p.VAR_KEYWORD for p in sig.parameters.values()
+    parameter = sig.parameters.get(name)
+    if parameter is None:
+        return False
+    return parameter.kind in (
+        parameter.POSITIONAL_OR_KEYWORD,
+        parameter.KEYWORD_ONLY,
     )
 
 

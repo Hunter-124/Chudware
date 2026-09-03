@@ -1117,13 +1117,38 @@ def map_rpc_frame(
         "extension_request",
         "elicitation_request",
     }:
+        # A UI request is only a question when its method is one of Chudcode's
+        # four INTERACTIVE methods (protocol.py INTERACTIVE_EXTENSION_UI_METHODS:
+        # select/confirm/input/editor). Every other method — notify, setStatus,
+        # setWidget, setTitle, set_editor_text, open_url — is PASSIVE: it carries
+        # information and expects no answer. Mapping the whole family to
+        # "waiting" parked a spinner row in the feed that NOTHING could ever
+        # resolve, because no terminal frame exists for a passive notice, so
+        # every turn that emitted one ended looking hung.
+        #
+        # The interactive four cannot be answered either, but for the opposite
+        # reason: chudcode_host._register_login_ui cancels them outright (the
+        # desktop app has no prompt surface to show), so the honest row is a
+        # declined request rather than a pending one.
+        method = _name(_str(data, "method"))
+        interactive = method in {"select", "confirm", "input", "editor"}
         work = dict(data)
         work.setdefault(
             "purpose",
-            _str(data, "title", "label", "prompt", "request", limit=240)
-            or "Extension UI request",
+            _str(data, "title", "label", "prompt", "message", "request", limit=240)
+            or ("Extension UI request" if interactive else "Extension notice"),
         )
-        result = _subrun(work, ctx, event, "waiting", "Extension UI request")
+        if interactive:
+            work.setdefault(
+                "detail", "declined: the desktop app has no interactive prompt"
+            )
+        result = _subrun(
+            work,
+            ctx,
+            event,
+            "fail" if interactive else "done",
+            "Extension UI request",
+        )
         result[1]["request"] = _bounded(data.get("request", data.get("ui", {})))
         return [result]
     if event in {"extension_error"}:

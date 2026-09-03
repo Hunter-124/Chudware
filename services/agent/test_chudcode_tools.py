@@ -106,6 +106,74 @@ class HostToolDefinitionTests(unittest.TestCase):
             ["name", "description", "input_schema", "load_mode"],
         )
 
+    def test_a_catch_all_is_never_advertised_as_a_tool_argument(self):
+        """A ``**kwargs`` catch-all is not a parameter a caller can name.
+
+        FastMCP derives ``inputSchema`` from the signature through Pydantic,
+        which models ``**extra: Any`` as a field named ``extra`` and — having no
+        default for it — marks that field REQUIRED. Chudcode validates every
+        host call against the advertised schema, so the real ``task_list`` tool
+        could not be called at all: every attempt came back ``Validation failed
+        for tool "task_list": - extra: is required`` and the live plan panel
+        published nothing. An optional catch-all is no better — it invites the
+        model to fill a field that lands in the tool's user-intent channel.
+        """
+
+        def planner(items=None, title=None, run_id="", **extra):
+            return {"ok": True, "items": items, "title": title}
+
+        pydantic_shaped = {
+            "type": "object",
+            "properties": {
+                "items": {"default": None, "title": "Items"},
+                "title": {"default": None, "title": "Title"},
+                "run_id": {"default": "", "title": "Run Id"},
+                "extra": {"title": "Extra"},
+            },
+            "required": ["extra"],
+        }
+        entries = OrderedDict(
+            (("task_list", _entry(planner, "Publish the plan", pydantic_shaped)),)
+        )
+        binding = build_host_tools(_context(entries, allowed_tools=None))[0]
+
+        self.assertEqual(binding.name, "task_list")
+        self.assertNotIn("extra", binding.input_schema["properties"])
+        self.assertNotIn("required", binding.input_schema)
+        # The real arguments survive untouched.
+        self.assertEqual(
+            sorted(binding.input_schema["properties"]), ["items", "run_id", "title"]
+        )
+
+    def test_a_genuinely_required_argument_still_survives_the_catch_all_strip(self):
+        def sized(width, depth=1, **extra):
+            return {"ok": True, "width": width, "depth": depth}
+
+        entries = OrderedDict(
+            (
+                (
+                    "sized",
+                    _entry(
+                        sized,
+                        "Sized",
+                        {
+                            "type": "object",
+                            "properties": {
+                                "width": {"type": "number"},
+                                "depth": {"type": "number", "default": 1},
+                                "extra": {"title": "Extra"},
+                            },
+                            "required": ["width", "extra"],
+                        },
+                    ),
+                ),
+            )
+        )
+        binding = build_host_tools(_context(entries, allowed_tools=None))[0]
+
+        self.assertEqual(binding.input_schema["required"], ["width"])
+        self.assertNotIn("extra", binding.input_schema["properties"])
+
     def test_restricted_subagent_preserves_explicit_empty_and_nonempty_states(self):
         entries = OrderedDict(
             (

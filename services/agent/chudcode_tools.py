@@ -482,6 +482,59 @@ def _schema_from_callable(fn: Any) -> dict[str, Any]:
     return out
 
 
+def _var_param_names(fn: Any) -> frozenset[str]:
+    """Names of *fn*'s ``*args`` / ``**kwargs`` catch-alls.
+
+    A catch-all is not a parameter a caller can name, so it must never appear in
+    the tool schema handed to the model.
+    """
+    try:
+        signature = inspect.signature(fn)
+    except (TypeError, ValueError) as exc:
+        _debug_fallback("catch-all probe", exc)
+        return frozenset()
+    return frozenset(
+        parameter.name
+        for parameter in signature.parameters.values()
+        if parameter.kind in (parameter.VAR_POSITIONAL, parameter.VAR_KEYWORD)
+    )
+
+
+def _without_catch_alls(schema: dict[str, Any], fn: Any) -> dict[str, Any]:
+    """Drop catch-all pseudo-properties from a registry-supplied tool schema.
+
+    FastMCP derives a tool's ``inputSchema`` from its signature through Pydantic,
+    which models a ``**extra: Any`` catch-all as a field named ``extra`` — and,
+    with no default to give it, marks that field REQUIRED. Chudcode validates
+    every host call against the schema it was given, so the advertised contract
+    made a satisfiable call impossible: ``task_list`` failed 100% of the time
+    with ``Validation failed for tool "task_list": - extra: is required``, and
+    the live plan panel therefore never published a single item. Thirty-four
+    further tools advertised the same phantom argument as optional, inviting the
+    model to fill it with junk that lands in the tool's user-intent channel.
+    """
+    names = _var_param_names(fn)
+    if not names:
+        return schema
+    out = dict(schema)
+    properties = out.get("properties")
+    if isinstance(properties, Mapping):
+        kept = {
+            key: value for key, value in properties.items() if key not in names
+        }
+        if len(kept) != len(properties):
+            out["properties"] = kept
+    required = out.get("required")
+    if isinstance(required, Sequence) and not isinstance(required, (str, bytes)):
+        kept_required = [item for item in required if item not in names]
+        if len(kept_required) != len(required):
+            if kept_required:
+                out["required"] = kept_required
+            else:
+                out.pop("required", None)
+    return out
+
+
 def _entry_schema(entry: Any, fn: Any) -> dict[str, Any]:
     schema = _entry_value(
         entry,
@@ -514,9 +567,9 @@ def _entry_schema(entry: Any, fn: Any) -> dict[str, Any]:
         except Exception as exc:  # noqa: BLE001 - supports Pydantic v1/v2 schema objects
             _debug_fallback("schema object conversion", exc)
             schema = None
-    return (
-        _json_safe(schema) if isinstance(schema, Mapping) else _schema_from_callable(fn)
-    )
+    if isinstance(schema, Mapping):
+        return _without_catch_alls(_json_safe(schema), fn)
+    return _schema_from_callable(fn)
 
 
 def _entry_description(entry: Any, fn: Any) -> str:

@@ -376,14 +376,58 @@ class ChudcodeEventMapperTests(unittest.TestCase):
             {
                 "type": "extension_ui_request",
                 "id": "ui-1",
+                "method": "select",
                 "title": "Choose face",
                 "request": {"choices": list(range(100))},
             }
         )
-        self.assertEqual((kind, request["status"]), ("sub_run", "waiting"))
+        self.assertEqual((kind, request["status"]), ("sub_run", "fail"))
         self.assertEqual(request["id"], "ui-1")
         self.assertLessEqual(len(request["request"]["choices"]), 33)
 
+    def test_a_ui_request_never_parks_an_unresolvable_waiting_row(self):
+        """No UI-request frame may leave a row nothing can ever resolve.
+
+        Passive methods carry information and get no terminal frame; the
+        interactive four are cancelled outright by chudcode_host. A "waiting"
+        row for either parks a spinner in the feed for the rest of the session,
+        which is what made a finished turn look hung.
+        """
+        for method in (
+            "notify",
+            "setStatus",
+            "setWidget",
+            "setTitle",
+            "set_editor_text",
+            "open_url",
+            "cancel",
+            "",
+        ):
+            kind, row = one(
+                {"type": "extension_ui_request", "id": "p", "method": method}
+            )
+            self.assertEqual((method, kind, row["status"]), (method, "sub_run", "done"))
+
+        for method in ("select", "confirm", "input", "editor"):
+            kind, row = one(
+                {"type": "extension_ui_request", "id": "i", "method": method}
+            )
+            self.assertEqual((method, kind, row["status"]), (method, "sub_run", "fail"))
+            self.assertIn("declined", row["detail"])
+
+    def test_a_passive_notice_keeps_its_message(self):
+        _, row = one(
+            {
+                "type": "extension_ui_request",
+                "id": "n",
+                "method": "notify",
+                "message": "Signed in as hunter",
+            }
+        )
+        self.assertEqual(row["purpose"], "Signed in as hunter")
+        self.assertEqual(row["status"], "done")
+
+    def test_command_output_and_error_frames(self):
         kind, output = one(
             {
                 "type": "command_output",

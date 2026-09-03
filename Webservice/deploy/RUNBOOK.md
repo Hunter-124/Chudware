@@ -615,6 +615,31 @@ bash Webservice/deploy/update.sh prod --tag v1.2.0 --pull-only
 bash Webservice/deploy/update.sh prod --tag v1.2.0 --web-only
 ```
 
+**`update.sh` exit codes are a contract with `deploy-prod.yml`.** `0` deployed,
+`1` failed part-way (production may have been mutated — the caller rolls back),
+`2` usage error, `3` another deploy holds the flock, and `4` **refused before
+any mutation**. A `4` prints `REFUSED: <reason>` plus "production was not
+touched by this run", and the workflow's alert then says the rollback was
+`NOT ATTEMPTED`. The refusal reasons are: a dirty canonical checkout, an
+unreadable `gateway.env`, a missing `CHUDWARE_DB_URL`, `CHUDWARE_WEB_DEV` left
+enabled, and (for a pinned deploy) prod HEAD not being an exact `v*` tag.
+
+Clearing a `[deploy-prod] Continuous deployment to production failed` alert that
+names the **preflight** stage is therefore a two-minute job on the box, and
+production needs nothing done to it:
+
+```bash
+ssh livingroom
+cd ~/Repositories/CAD && git status --porcelain   # what update.sh refused over
+git stash        # or commit/checkout the offending files
+```
+
+The next push to `master` promotes and auto-closes the issue. Before 2026-09-03
+this refusal exited `1`, so the workflow rolled back a production it had never
+touched and — when the retained release turned out to be torn — alarmed
+"ROLLBACK ITSELF FAILED … Production needs hands-on recovery now" for four days
+over one dirty file. If you see that wording now, it is real.
+
 Each gateway deploy takes `backups/pre-deploy-<environment>-<UTC>.dump`,
 migrates that environment's database, restarts its unit, and asserts both
 anonymous `/healthz` and authenticated `/api/me`. Logs and status live under
@@ -692,6 +717,12 @@ Without `--force` the restart waits for live `/engine` bridges to drain, up to
 `CHUDWARE_WEBD_RESTART_MAX_WAIT` (600s). Do not reach for `--force` because
 that wait feels slow; it exists so a rollback does not cut off connected
 users.
+
+`rollback.sh` with no `--to` walks the retained releases newest-first and picks
+the first one that passes validation, printing a `candidate <id> unusable: …`
+line for each it steps over. Exit 2 now means *no retained release validates*,
+not merely "the newest one is broken". With `--to <id>` it still fails loudly
+(exit 1) rather than restoring something you did not name.
 
 Confirm it took:
 

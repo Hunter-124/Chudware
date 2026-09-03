@@ -217,7 +217,6 @@ class ChudcodeSessionHost:
 
         session: _Session | None = None
         unsubscribe: Callable[[], None] | None = None
-        forwarded_ids: set[int] = set()
         emit_errors: list[str] = []
         frames: list[dict[str, Any]] = []
         try:
@@ -230,13 +229,13 @@ class ChudcodeSessionHost:
                     self._sessions.move_to_end(session_id)
 
                 def forward(event: Any) -> None:
-                    # A few test doubles dispatch the same object to both generic listener
-                    # families.  The real client uses on_notification, but identity dedupe
-                    # keeps injected adapters honest without suppressing distinct frames.
-                    marker = id(event)
-                    if marker in forwarded_ids:
-                        return
-                    forwarded_ids.add(marker)
+                    # Exactly one listener family is registered (see _register_listener),
+                    # so every delivered frame is distinct and is forwarded as-is. An
+                    # earlier identity dedupe keyed on id(event) dropped REAL frames:
+                    # the RPC client hands each notification as a short-lived dataclass,
+                    # CPython reuses the freed address, and any later frame landing on
+                    # a recycled id() vanished — in practice the 2nd..Nth tool call of a
+                    # parallel batch never reached the feed.
                     frame = _json_value(event)
                     if not isinstance(frame, dict):
                         frame = {"type": "unknown", "value": frame}

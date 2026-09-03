@@ -369,6 +369,48 @@ def test_reuses_one_live_client_per_session_and_isolates_other_sessions():
     assert factory.clients[0].stop_count == 0
 
 
+def test_frames_sharing_an_object_identity_are_all_forwarded():
+    # The real client hands each notification as a short-lived dataclass and
+    # CPython recycles freed addresses, so consecutive distinct frames routinely
+    # share id(). Identity is not a frame key: every one must reach the feed.
+    calls = ["measure_part", "verify_battery", "render_part"]
+
+    class RecyclingClient(FakeClient):
+        def wait_for_idle(self, timeout=None):
+            self.idle_timeouts.append(timeout)
+            slot = {}
+            for name in calls:
+                slot.clear()
+                slot.update(
+                    {
+                        "type": "tool_execution_end",
+                        "toolCallId": f"toolu_{name}",
+                        "toolName": name,
+                        "isError": False,
+                    }
+                )
+                for listener in tuple(self.listeners):
+                    listener(slot)
+            slot.clear()
+            slot.update({"type": "agent_end", "messages": [], "isTerminal": True})
+            for listener in tuple(self.listeners):
+                listener(slot)
+            return ()
+
+    factory = FakeFactory()
+    host = ChudcodeSessionHost(
+        client_factory=lambda **kw: factory.clients.append(RecyclingClient(factory, **kw))
+        or factory.clients[-1]
+    )
+
+    result, emitted = run(host, "s", "s1")
+
+    assert result["ok"]
+    ends = [f for f in emitted if f.get("type") == "tool_execution_end"]
+    assert [f["toolName"] for f in ends] == calls
+    assert [f["toolCallId"] for f in ends] == [f"toolu_{name}" for name in calls]
+
+
 def test_rejects_a_runtime_that_did_not_negotiate_protocol_v2():
     factory = FakeFactory(protocol_version=1)
     host = ChudcodeSessionHost(client_factory=factory)

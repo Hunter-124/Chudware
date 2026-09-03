@@ -514,7 +514,22 @@ static std::string chatSoftWrap(const std::string& in, float wrapW) {
     return out;
 }
 
-// Pull the active selection (UTF-8) from an InputText id, if any.
+// The soft-wrapped buffer chatDrawSelectableText hands InputText is SAME-LENGTH as the plain
+// text it was built from (rewrapCore only swaps ' ' <-> '\n'), so a selection's byte range
+// indexes the plain text directly. ImGui keeps InputTextState for exactly one item at a time,
+// so one record suffices: the plain text of whichever selectable currently owns that state.
+// Every copy path (native Ctrl+C, the context menu's "Copy") reads through here so the
+// clipboard never carries the wrapper's visual newlines.
+namespace {
+struct SelectablePlain {
+    ImGuiID     id = 0;
+    std::string plain;
+};
+SelectablePlain s_selPlain;
+}  // namespace
+
+// Pull the active selection (UTF-8) from an InputText id, if any — in PLAIN text when the
+// item is a soft-wrapped transcript body.
 std::string chatInputSelection(ImGuiID id) {
     if (id == 0) return {};
     ImGuiInputTextState* state = ImGui::GetInputTextState(id);
@@ -525,6 +540,8 @@ std::string chatInputSelection(ImGuiID id) {
     if (a < 0) a = 0;
     if (b > state->TextLen) b = state->TextLen;
     if (b <= a) return {};
+    if (s_selPlain.id == id && s_selPlain.plain.size() == (size_t)state->TextLen)
+        return s_selPlain.plain.substr((size_t)a, (size_t)(b - a));
     return std::string(state->TextA.Data + a, state->TextA.Data + b);
 }
 
@@ -663,15 +680,26 @@ ImGuiID chatDrawSelectableText(const char* id, const std::string& plain,
                               ImGuiInputTextFlags_NoHorizontalScroll);
 
     const ImGuiID itemId = ImGui::GetItemID();
-    // Ctrl+C toast — InputText already put the selection on the clipboard.
+    // This item owns ImGui's InputTextState (active, or the last one deactivated with a live
+    // selection): remember its plain text so selection copies map back through it.
+    if (ImGui::GetInputTextState(itemId)) {
+        if (s_selPlain.id != itemId || s_selPlain.plain != plain) {
+            s_selPlain.id = itemId;
+            s_selPlain.plain = plain;
+        }
+    }
+    // Ctrl+C — InputText already put the WRAPPED selection on the clipboard; replace it with
+    // the plain bytes and light the toast.
     if (ImGui::IsItemActive() || ImGui::IsItemFocused()) {
         const bool copyChord =
             (ImGui::GetIO().KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_C, false)) ||
             (ImGui::GetIO().KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_Insert, false));
         if (copyChord) {
-            ImGuiInputTextState* st = ImGui::GetInputTextState(itemId);
-            if (st && st->HasSelection())
+            const std::string sel = chatInputSelection(itemId);
+            if (!sel.empty()) {
+                ImGui::SetClipboardText(sel.c_str());
                 chatNotifyCopied();
+            }
         }
     }
     ImGui::PopStyleVar(3);

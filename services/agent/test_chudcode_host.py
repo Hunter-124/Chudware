@@ -557,6 +557,46 @@ def test_forwards_events_attachments_callbacks_and_all_turn_settings(tmp_path):
     assert "set_host_uris" in call_names(client)
 
 
+def test_wire_provider_aliases_map_onto_chudcode_ids():
+    factory = FakeFactory()
+    host = ChudcodeSessionHost(client_factory=factory)
+
+    result, _ = run(host, "alias", provider="gemini", model="gemini-2.5-pro")
+
+    assert result["ok"] is True
+    set_model = next(p for n, p in factory.clients[0].calls if n == "set_model")
+    assert set_model == {"provider": "google", "modelId": "gemini-2.5-pro"}
+
+
+def test_set_model_refusal_names_the_signed_out_provider_or_the_catalog():
+    class RejectingClient(FakeClient):
+        def set_model(self, provider, model_id):
+            super().set_model(provider, model_id)
+            raise RuntimeError(f"set_model: Model not found: {provider}/{model_id}")
+
+    class RejectingFactory(FakeFactory):
+        def __call__(self, **kwargs):
+            client = RejectingClient(self, **kwargs)
+            self.clients.append(client)
+            return client
+
+    # The double's catalog holds one anthropic model ("claude"), nothing for openai.
+    factory = RejectingFactory()
+    host = ChudcodeSessionHost(client_factory=factory)
+    signed_out, _ = run(host, "signed-out", provider="openai", model="gpt-5")
+    assert signed_out["ok"] is False
+    assert "openai is not signed in" in signed_out["reason"]
+    assert "Settings -> Providers" in signed_out["reason"]
+    assert "anthropic" in signed_out["reason"]  # what IS signed in
+
+    factory = RejectingFactory()
+    host = ChudcodeSessionHost(client_factory=factory)
+    stale, _ = run(host, "stale", provider="anthropic", model="claude-sonnet-5")
+    assert stale["ok"] is False
+    assert "claude-sonnet-5 is not in Chudcode's anthropic catalog" in stale["reason"]
+    assert "claude" in stale["reason"]
+
+
 def test_auth_and_memory_calls_use_only_canonical_command_shapes_and_stop_clients():
     factory = FakeFactory()
     host = ChudcodeSessionHost(client_factory=factory)

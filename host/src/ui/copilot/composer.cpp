@@ -70,6 +70,7 @@ using ui::copilot::noteEdit;
 struct ChatInputCb {
     float wrapW = 0.0f;
     bool  interceptHistory = false;  // slash menu open — eat Up/Down for menu nav
+    bool  rejectNewline = false;     // Enter is the SEND chord this frame — refuse its '\n'
     int*  navDelta = nullptr;        // -1 Up / +1 Down when interceptHistory
     WrapState* wrap = nullptr;       // hard-break bookkeeping for this input's buffer
 };
@@ -89,6 +90,15 @@ int  g_slashCaretToEnd = 0;
 namespace {
 int chatInputEditCallback(ImGuiInputTextCallbackData* data) {
     auto* cb = static_cast<ChatInputCb*>(data->UserData);
+    if (data->EventFlag == ImGuiInputTextFlags_CallbackCharFilter) {
+        // InputTextMultiline turns the Enter KEY into a '\n' character BEFORE anyone outside
+        // the widget can see the key, and the send path below only detects the key. So a bare
+        // Enter used to ship the message AND leave a '\n' in it at the caret — at the end it
+        // was trimmed away, mid-text it split a word ("for me4\n90", live 2026-09-03). The
+        // character filter is the one hook that runs before insertion: refuse the newline when
+        // the chord is a send. Pasted newlines arrive under Ctrl/Shift and pass through.
+        return (cb->rejectNewline && data->EventChar == '\n') ? 1 : 0;
+    }
     if (data->EventFlag == ImGuiInputTextFlags_CallbackAlways && g_slashCaretToEnd) {
         g_slashCaretToEnd = 0;
         data->CursorPos = data->BufTextLen;
@@ -156,14 +166,45 @@ bool drawChatInput(const char* id, std::vector<char>& buf, const char* placehold
     if (rows > maxLines) rows = maxLines;
     const float h = lineH * (float)rows + style.FramePadding.y * 2.0f;
 
+    // ONE spelling of the send chord, shared by the newline filter and the submit test below:
+    // Enter (either key) with no Shift/Alt/Super, and no Ctrl unless the slash menu is open
+    // (there CtrlEnterForNewLine makes Ctrl+Enter the break and bare Enter the pick).
+    const ImGuiIO& kio = ImGui::GetIO();
+    const bool sendChord = !kio.KeyShift && !kio.KeyAlt && !kio.KeySuper &&
+                           !(kio.KeyCtrl && g_slashMenuActive);
+    const bool enterHeld = ImGui::IsKeyPressed(ImGuiKey_Enter, true) ||
+                           ImGui::IsKeyPressed(ImGuiKey_KeypadEnter, true);
+
+    // Cut/copy leave the composer's VISUAL-wrap newlines on the clipboard. The selection has to
+    // be normalized from the pre-edit state (a cut deletes it inside the widget), so snapshot
+    // it before InputText runs and overwrite the native payload afterwards. Only when the
+    // widget was active last frame — that is when ImGui itself honours the chord.
+    std::string clipOverride;
+    if (s_activeLast[wid]) {
+        const bool copyChord = kio.KeyCtrl && (ImGui::IsKeyPressed(ImGuiKey_C, false) ||
+                                               ImGui::IsKeyPressed(ImGuiKey_Insert, false));
+        const bool cutChord = (kio.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_X, false)) ||
+                              (kio.KeyShift && ImGui::IsKeyPressed(ImGuiKey_Delete, false));
+        if (copyChord || cutChord) {
+            ImGuiInputTextState* state = ImGui::GetInputTextState(wid);
+            if (state && state->HasSelection() && state->TextA.Data)
+                clipOverride = normalizeComposerSelection(
+                    std::string_view(state->TextA.Data,
+                                     static_cast<std::size_t>(state->TextLen)),
+                    ws.hard, state->GetSelectionStart(), state->GetSelectionEnd());
+        }
+    }
+
     g_slashNavDelta = 0;
     ChatInputCb cb;
     cb.wrapW = wrapW;
     cb.interceptHistory = g_slashMenuActive;
+    cb.rejectNewline = enterHeld && sendChord && !g_slashMenuActive;
     cb.navDelta = &g_slashNavDelta;
     cb.wrap = &ws;
     ImGuiInputTextFlags flags = ImGuiInputTextFlags_CallbackEdit |
-                                ImGuiInputTextFlags_CallbackAlways;
+                                ImGuiInputTextFlags_CallbackAlways |
+                                ImGuiInputTextFlags_CallbackCharFilter;
     if (g_slashMenuActive) {
         // Enter accepts a slash pick (handled by the menu) — don't insert a newline into the token.
         flags |= ImGuiInputTextFlags_CallbackHistory | ImGuiInputTextFlags_CtrlEnterForNewLine;
@@ -171,37 +212,17 @@ bool drawChatInput(const char* id, std::vector<char>& buf, const char* placehold
     ImGui::InputTextMultiline(id, buf.data(), buf.size(),
         ImVec2(rightReserve > 0.0f ? -rightReserve : -1.0f, h),
         flags, chatInputEditCallback, &cb);
-    // InputText has already handled Ctrl+C/Ctrl+Insert. Its buffer contains visual-wrap
-    // newlines, so replace the native clipboard payload with the same byte range normalized
-    // against the composer's hard-break provenance.
-    if (ImGui::IsItemActive() || ImGui::IsItemFocused()) {
-        const bool copyChord =
-            (ImGui::GetIO().KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_C, false)) ||
-            (ImGui::GetIO().KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_Insert, false));
-        if (copyChord) {
-            const ImGuiID itemId = ImGui::GetItemID();
-            ImGuiInputTextState* state = ImGui::GetInputTextState(itemId);
-            if (state && state->HasSelection() && state->TextA.Data) {
-                const std::string selected = normalizeComposerSelection(
-                    std::string_view(state->TextA.Data,
-                                     static_cast<std::size_t>(state->TextLen)),
-                    ws.hard, state->GetSelectionStart(), state->GetSelectionEnd());
-                ImGui::SetClipboardText(selected.c_str());
-            }
-        }
-    }
+    if (!clipOverride.empty()) ImGui::SetClipboardText(clipOverride.c_str());
     s_activeLast[wid] = ImGui::IsItemActive();
     // A BARE Enter sends; so does Ctrl+Enter, which ImGui's multiline treats as "validate"
     // and never turns into a line break. Shift/Alt+Enter are newlines: the widget inserts one
     // itself, so counting them as a submit shipped the message AND left a stray break behind
     // (live 2026-07-28: Alt+Enter sent the prompt instead of breaking the line). Detect the
-    // KEY, not a trailing '\n', so a newline the rewrap just inserted is never read as submit.
-    const ImGuiIO& kio = ImGui::GetIO();
-    // In slash mode CtrlEnterForNewLine is set, so there Ctrl+Enter is a break, not a validate.
-    const bool sendChord = !kio.KeyShift && !kio.KeyAlt && !kio.KeySuper &&
-                           !(kio.KeyCtrl && g_slashMenuActive);
+    // KEY, not a trailing '\n' — the send chord's own '\n' never reaches the buffer (filter
+    // above), so the text ships exactly as typed.
     bool submit = ImGui::IsItemFocused() && sendChord &&
-                  ImGui::IsKeyPressed(ImGuiKey_Enter, false);
+                  (ImGui::IsKeyPressed(ImGuiKey_Enter, false) ||
+                   ImGui::IsKeyPressed(ImGuiKey_KeypadEnter, false));
     if (buf[0] == 0 && placeholder && placeholder[0]) {
         ImVec2 mn = ImGui::GetItemRectMin();
         // Honor a pushed TextDisabled (the glass composer pushes surf.textTertiary) so the hint

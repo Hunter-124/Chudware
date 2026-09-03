@@ -80,6 +80,63 @@ _SESSION_SHAPES: dict[str, tuple[frozenset[str], frozenset[str]]] = {
     "stt_cancel": (frozenset(), frozenset()),
 }
 
+# Chudware wire provider names -> Chudcode provider ids. The GUI (composer providerWireName)
+# and the native catalog spell a few providers differently from Chudcode's auth store, and
+# `set_model` on the wrong id is a guaranteed "Model not found" even when the user is signed
+# in. Chudcode-native ids pass through unchanged.
+_CHUDCODE_PROVIDER_ALIASES: dict[str, str] = {
+    "gemini": "google",
+    "google-gemini": "google",
+    "llamacpp": "llama.cpp",
+    "llama-cpp": "llama.cpp",
+    "lmstudio": "lm-studio",
+    "anthropic-sub": "anthropic",
+    "xai-sub": "xai",
+    "kimi-sub": "kimi-code",
+    "cursor-sub": "cursor",
+    "codex": "openai-codex",
+    "codex-sub": "openai-codex",
+}
+_MAX_MODEL_HINTS = 6
+
+
+def _describe_model_rejection(client: Any, provider: str, model: str, exc: Exception) -> str:
+    """Turn a bare ``set_model`` refusal into the user's next move.
+
+    Chudcode's catalog lists only providers that are signed in, so "Model not found" means
+    one of two very different things: the provider has no credential, or the id is not in
+    that provider's catalog. Live 2026-09-03: a persisted anthropic/claude-sonnet-5 pick
+    with Anthropic signed out surfaced as ``set_model: Model not found`` and nothing told
+    the user to sign in or pick another model.
+    """
+    try:
+        models = list(client.get_available_models())
+    except Exception:  # noqa: BLE001 - the catalog probe is best-effort
+        return f"set_model {provider}/{model}: {exc}"
+
+    def field_of(item: Any, name: str) -> str:
+        value = item.get(name) if isinstance(item, Mapping) else getattr(item, name, None)
+        return value if isinstance(value, str) else ""
+
+    signed_in = sorted({field_of(item, "provider") for item in models} - {""})
+    same_provider = [field_of(item, "id") for item in models if field_of(item, "provider") == provider]
+    if not same_provider:
+        others = (
+            f" Signed-in providers: {', '.join(signed_in)}."
+            if signed_in
+            else " No provider is signed in."
+        )
+        return (
+            f"{provider} is not signed in to Chudcode, so {provider}/{model} cannot run. "
+            f"Sign in under Settings -> Providers, or pick a model from a signed-in "
+            f"provider in the composer's model chip.{others}"
+        )
+    hints = ", ".join(sorted(m for m in same_provider if m)[:_MAX_MODEL_HINTS])
+    return (
+        f"{model} is not in Chudcode's {provider} catalog. Pick a listed {provider} model "
+        f"(e.g. {hints})."
+    )
+
 
 @dataclass
 class _Session:
@@ -893,8 +950,15 @@ class ChudcodeSessionHost:
         model = _nonempty_string(settings.get("model"))
         if model and not provider and "/" in model:
             provider, model = model.split("/", 1)
+        if provider:
+            provider = _CHUDCODE_PROVIDER_ALIASES.get(provider, provider)
         if provider and model:
-            client.set_model(provider, model)
+            try:
+                client.set_model(provider, model)
+            except Exception as exc:  # noqa: BLE001 - RpcCommandError or a test double's error
+                raise RuntimeError(
+                    _describe_model_rejection(client, provider, model, exc)
+                ) from exc
         thinking = _nonempty_string(settings.get("thinking")) or _nonempty_string(
             settings.get("reasoning_effort")
         )

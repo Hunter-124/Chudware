@@ -58,9 +58,15 @@ std::mutex g_runClientMtx;                          // guards g_runClient creati
 // reach engine::call directly when the C++ agent is OFF, but with it ON WorkerClient's
 // routeAgentToCpp translates them to the CORE names (agent_run / agent_mission_v1) before
 // engine::call — miss either and the run silently falls back to the shared client.
+// agent_admin_turn is the ONLINE lane every chat send takes (there is no other since
+// 2026-08-31) and it streams for as long as the model works, so it belongs here too:
+// WorkerClient::callImpl already classifies it as a long run for its own call mutex, and
+// omitting it here put multi-minute turns back on the shared GUI connection — exactly the
+// starvation this dedicated connection exists to prevent.
 bool isLongRunMethod(const std::string& method) {
     return method == "agent_run" || method == "agent_run_v2" ||
            method == "agent_mission" || method == "agent_mission_v1" ||
+           method == "agent_admin_turn" ||
            method == "sim_mesh" || method == "sim_run_static" ||
            method == "sim_run_modal" || method == "sim_run_fatigue" ||
            method == "sim_run_thermal" || method == "sim_run_flow";

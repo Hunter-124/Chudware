@@ -215,17 +215,16 @@ bool callAgentStreaming(const std::string &coreMethod, const json &p,
                         const WorkerClient::EventFn &onEvent,
                         bool &streamedLive) {
   if (engine::daemonMode()) {
-    // Daemon: hostd pushes {"event":"agent.event","data":<ev>}; engine::call
-    // fires our router LIVE (mid-call, on this worker thread) for each. `fired`
-    // tells us whether the daemon actually streamed (a same-build daemon does)
-    // so an OLD daemon that only returns the batched result["events"] still
-    // falls back to the caller's replay.
+    // Daemon: hostd pushes {"event":"agent.event","data":<ev>} and EngineClient
+    // hands our router the PAYLOAD (`data`) live, mid-call, on this worker
+    // thread. `fired` tells us whether the daemon actually streamed (a
+    // same-build daemon does) so an OLD daemon that only returns the batched
+    // result["events"] still falls back to the caller's replay.
     bool fired = false;
-    auto router = [&](const json &evt) {
-      if (onEvent && evt.is_object() && evt.contains("data") &&
-          evt["data"].is_object()) {
+    auto router = [&](const json &ev) {
+      if (onEvent && ev.is_object() && !ev.empty()) {
         fired = true;
-        onEvent(evt["data"]);
+        onEvent(ev);
       }
     };
     bool ok = engine::call(coreMethod, p, cppResult, cerr, timeoutMs, router);

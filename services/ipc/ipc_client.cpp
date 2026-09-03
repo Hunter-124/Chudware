@@ -278,8 +278,18 @@ bool EngineClient::readResponse(int id, json& out, std::string& err, int timeout
             // Live agent-event streaming: fire onEvent NOW (mid-call) for agent.event so a
             // blocking agent run streams instead of buffering until it returns. Other events
             // (doc.*) still queue for the GUI-thread drainEvents().
+            //
+            // The callback receives the event PAYLOAD (`data`), never the {"event","data"}
+            // envelope — the same shape WorkerClient's local-pipe path delivers, so a
+            // consumer keying on data["kind"]/data["run_id"] works over BOTH transports.
+            // Handing over the envelope instead cost the whole online chat lane its live
+            // rendering: every mapped kind read as "" and no bubble, tool row or delta ever
+            // appeared until the batched result landed minutes later.
             if (onEvent && msg.value("event", std::string()) == "agent.event") {
-                try { onEvent(msg); } catch (...) {}
+                const auto it = msg.find("data");
+                try {
+                    onEvent(it != msg.end() && it->is_object() ? *it : json::object());
+                } catch (...) {}
             } else {
                 events_.push_back(std::move(msg));
             }

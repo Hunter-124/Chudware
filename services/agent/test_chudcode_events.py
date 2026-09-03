@@ -480,6 +480,42 @@ class ChudcodeEventMapperTests(unittest.TestCase):
         self.assertEqual(mixed_kind, "sub_run")
         self.assertLessEqual(len(mixed["detail"]), 4096)
 
+    def test_content_block_boundaries_emit_no_row(self):
+        # Chudcode brackets every assistant content block with start/end frames and
+        # streams a tool call's arguments as toolcall_delta. All of that is already
+        # carried by the deltas and by tool_execution_*; mapping them to sub_run rows
+        # buried the reply under dozens of "Chudcode · toolcall delta" cards.
+        for frame in [
+            {"type": "text_start", "contentIndex": 0},
+            {"type": "text_end", "contentIndex": 0, "content": "the final answer"},
+            {"type": "thinking_start", "contentIndex": 1},
+            {"type": "thinking_end", "contentIndex": 1, "content": "private reasoning"},
+            {"type": "toolcall_start", "contentIndex": 2},
+            {"type": "toolcall_delta", "contentIndex": 2, "delta": '{"path":"a'},
+            {
+                "type": "toolcall_end",
+                "contentIndex": 2,
+                "toolCall": {"id": "call-1", "name": "read"},
+            },
+        ]:
+            self.assertEqual(map_rpc_frame(frame, CTX), [], frame["type"])
+        # A message_update wrapper carrying one of them is equally silent.
+        self.assertEqual(
+            map_rpc_frame(
+                {
+                    "type": "message_update",
+                    "assistantMessageEvent": {"type": "text_end", "content": "done"},
+                    "message": {"id": "m5", "role": "assistant"},
+                },
+                CTX,
+            ),
+            [],
+        )
+        # The deltas they bracket still render, and a genuinely unknown frame still
+        # falls back to a bounded sub_run row.
+        self.assertEqual(one({"type": "text_delta", "delta": "hi"})[0], "assistant_delta")
+        self.assertEqual(one({"type": "brand_new_frame"})[0], "sub_run")
+
     def test_raw_wrapper_tolerance_and_context_are_not_mutated(self):
         frame = {"method": "event", "params": {"type": "text_delta", "text": "x"}}
         frame_before = copy.deepcopy(frame)

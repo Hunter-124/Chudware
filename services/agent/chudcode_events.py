@@ -708,6 +708,25 @@ def map_rpc_frame(
             )
         ]
 
+    # Assistant content-block boundaries. Each is fully represented by the stream it
+    # brackets: text_*/thinking_* by their own deltas above, toolcall_* by the
+    # tool_execution_* lifecycle that actually runs the call. The *_end frames also
+    # carry the finished content/toolCall, which must never replay as visible text or
+    # as a second tool row. They are boundaries, not activity — emit no row.
+    # Until 2026-09-03 they fell through to _unknown() and every turn's live feed was
+    # dozens of "Chudcode · toolcall delta" / "Chudcode · text end" rows that pushed
+    # the actual answer out of view.
+    if event in {
+        "text_start",
+        "text_end",
+        "thinking_start",
+        "thinking_end",
+        "toolcall_start",
+        "toolcall_delta",
+        "toolcall_end",
+    }:
+        return []
+
     if event in {"agent_start", "agent_started", "run_start", "run_started"}:
         payload = _linked(link, status="running")
         model = _str(data, "model", "modelId", "model_id", limit=200)

@@ -283,6 +283,35 @@ class HostToolDispatchTests(unittest.TestCase):
         self.assertEqual(list(result), ["ok", "path"])
         self.assertEqual(result["path"], "part.step")
 
+    def test_host_tool_execute_wraps_every_result_in_the_content_envelope(self):
+        """A `host_tool_result` whose result lacks `content` never resolves inside
+        Chudcode (write xd://<tool> hangs until the turn cap), and CAD tools return
+        raw JSON objects — refusals included. The RPC-facing execute must always
+        hand back {content:[text], details:<raw>}; progress updates likewise."""
+        updates = []
+
+        class Ctx:
+            cancelled = False
+
+            def send_update(self, payload):
+                updates.append(payload)
+
+        def dispatcher(name, args, progress=None):
+            progress({"step": 1})
+            return {"ok": False, "reason": "workspace_root_unavailable"}
+
+        binding = self._binding(tool_dispatch=dispatcher)
+        captured = {}
+        tool = binding.to_host_tool(lambda **kw: captured.update(kw) or kw)
+        out = tool["execute"]({}, Ctx())
+        self.assertEqual(out["details"], {"ok": False, "reason": "workspace_root_unavailable"})
+        self.assertEqual(out["content"][0]["type"], "text")
+        self.assertIn('"workspace_root_unavailable"', out["content"][0]["text"])
+        self.assertEqual(updates, [{
+            "content": [{"type": "text", "text": '{\n  "step": 1\n}'}],
+            "details": {"step": 1},
+        }])
+
     def test_tool_error_propagates_unchanged(self):
         error = RuntimeError("CAD rejected feature")
 

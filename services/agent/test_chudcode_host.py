@@ -597,7 +597,10 @@ def test_set_model_refusal_names_the_signed_out_provider_or_the_catalog():
     assert "claude" in stale["reason"]
 
 
-def test_auth_and_memory_calls_use_only_canonical_command_shapes_and_stop_clients():
+def test_auth_and_memory_calls_use_only_canonical_command_shapes_on_one_shared_process():
+    """Transient commands share ONE no-session process for the host's lifetime:
+    spawning `chud --mode rpc` costs ~1.1 s and the GUI issues a dozen of these at
+    startup, so spawn-per-call was the "providers take 30 s to load" defect."""
     factory = FakeFactory()
     host = ChudcodeSessionHost(client_factory=factory)
 
@@ -620,9 +623,11 @@ def test_auth_and_memory_calls_use_only_canonical_command_shapes_and_stop_client
         "query": "material",
         "tokenBudget": 500,
     }
+    assert len(factory.clients) == 1
     assert factory.clients[0].kwargs["no_session"] is True
-    assert factory.clients[1].kwargs["no_session"] is True
-    assert [client.stop_count for client in factory.clients] == [1, 1]
+    assert factory.clients[0].stop_count == 0
+    host.shutdown()
+    assert factory.clients[0].stop_count == 1
     with pytest.raises(ValueError, match="unknown params"):
         host.auth_call("get_auth_state", {"provider_id": "anthropic"})
     with pytest.raises(ValueError, match="unsupported"):
@@ -702,8 +707,21 @@ def test_generic_transient_calls_bound_oauth_ui_and_cancel_interactive_requests(
             "message": "Continue in the browser",
         }
     ]
-    assert ("cancel_ui_request", {"id": "input"}) in factory.clients[2].calls
-    assert [client.stop_count for client in factory.clients] == [1, 1, 1]
+    assert ("cancel_ui_request", {"id": "input"}) in factory.clients[0].calls
+    assert len(factory.clients) == 1
+    assert factory.clients[0].stop_count == 0
+
+
+def test_dead_service_process_is_replaced_on_the_next_transient_call():
+    factory = FakeFactory()
+    host = ChudcodeSessionHost(client_factory=factory)
+    assert host.transient_call("get_login_providers")["providers"]
+    first = factory.clients[0]
+    first._closed_error = RuntimeError("process exited")
+    assert host.transient_call("get_login_providers")["providers"]
+    assert len(factory.clients) == 2
+    assert first.stop_count == 1
+    assert factory.clients[1].stop_count == 0
 
 
 def test_live_session_calls_are_isolated_and_never_create_for_status():

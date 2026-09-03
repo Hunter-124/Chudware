@@ -178,7 +178,14 @@ class ChudcodeSessionHost:
         self._runs: dict[str, _Run] = {}
         self._completed_runs: OrderedDict[str, dict[str, Any]] = OrderedDict()
         self._lock = threading.RLock()
-        self._transient_clients: dict[int, Any] = {}
+        # ONE long-lived no-session process serves every transient (auth / catalog /
+        # memory / login) command. Spawning `chud --mode rpc` costs ~1.1 s before the
+        # first request can be answered, and the GUI issues a dozen of these at startup
+        # (provider list = 3 commands, model catalog, auth state, STT status, usage),
+        # so spawn-per-call was what made "loading providers" take 30 s+. Calls are
+        # serialized on the process; a dead process is replaced on the next call.
+        self._service_client: Any = None
+        self._service_lock = threading.Lock()
         self._shutdown = False
 
     def run_turn(self, params, emit) -> dict:
@@ -660,17 +667,17 @@ class ChudcodeSessionHost:
                 return
             self._shutdown = True
             sessions = tuple(self._sessions.values())
-            transient_clients = tuple(self._transient_clients.values())
+            service_client = self._service_client
             self._sessions.clear()
-            self._transient_clients.clear()
+            self._service_client = None
             for session in sessions:
                 session.closed = True
             for run in self._runs.values():
                 run.cancel_requested = True
         for session in sessions:
             _stop_client(session.client)
-        for client in transient_clients:
-            _stop_client(client)
+        if service_client is not None:
+            _stop_client(service_client)
 
     def transient_call(self, command, params=None, emit=None) -> dict[str, Any]:
         """Run a bounded service-level command without creating a saved session."""
@@ -1013,6 +1020,40 @@ class ChudcodeSessionHost:
         if callable(registrar):
             registrar(client)
 
+    def _service_client_locked(self) -> Any:
+        """Return the live shared service process, spawning it when absent or dead.
+
+        Caller holds ``_service_lock``.
+        """
+        client = self._service_client
+        if client is not None and getattr(client, "_closed_error", None) is None:
+            return client
+        if client is not None:
+            _stop_client(client)
+            with self._lock:
+                if self._service_client is client:
+                    self._service_client = None
+        client = self._make_client({}, no_session=True)
+        _start_client(client)
+        with self._lock:
+            if self._shutdown:
+                _stop_client(client)
+                raise RuntimeError("chudcode session host is shut down")
+            self._service_client = client
+        return client
+
+    def warm_service(self) -> None:
+        """Spawn the shared service process ahead of the first transient call.
+
+        Best-effort and idempotent; the worker starts it on a background thread so
+        the GUI's first provider/catalog query does not pay the ~1.1 s spawn.
+        """
+        try:
+            with self._service_lock:
+                self._service_client_locked()
+        except Exception as exc:  # noqa: BLE001 - warm-up never fails the worker
+            _LOG.debug("Chudcode service warm-up skipped (%s)", type(exc).__name__)
+
     def _transient_call(
         self,
         command: str,
@@ -1023,35 +1064,34 @@ class ChudcodeSessionHost:
         with self._lock:
             if self._shutdown:
                 raise RuntimeError("chudcode session host is shut down")
-        client = self._make_client({}, no_session=True)
-        marker = id(client)
-        with self._lock:
-            if self._shutdown:
-                _stop_client(client)
-                raise RuntimeError("chudcode session host is shut down")
-            self._transient_clients[marker] = client
-        unsubscribe: Callable[[], None] | None = None
-        try:
-            _start_client(client)
-            if command == "login":
-                unsubscribe = _register_login_ui(client, emit)
-            result = _invoke_canonical(client, command, payload)
+        with self._service_lock:
+            client = self._service_client_locked()
+            unsubscribe: Callable[[], None] | None = None
+            try:
+                if command == "login":
+                    unsubscribe = _register_login_ui(client, emit)
+                result = _invoke_canonical(client, command, payload)
+            except Exception:
+                # The process died under this call (or shutdown stopped it): drop it so
+                # the next transient call spawns a fresh one instead of failing forever.
+                if getattr(client, "_closed_error", None) is not None:
+                    with self._lock:
+                        if self._service_client is client:
+                            self._service_client = None
+                    _stop_client(client)
+                raise
+            finally:
+                if unsubscribe is not None:
+                    try:
+                        unsubscribe()
+                    except Exception as exc:  # noqa: BLE001 - teardown must continue
+                        _LOG.debug(
+                            "Chudcode login UI teardown failed (%s)", type(exc).__name__
+                        )
             normalized = _json_value(result)
             if not isinstance(normalized, dict):
                 raise TypeError(f"Chudcode {command} returned a non-object response")
             return normalized
-        finally:
-            if unsubscribe is not None:
-                try:
-                    unsubscribe()
-                except Exception as exc:  # noqa: BLE001 - teardown must continue
-                    _LOG.debug(
-                        "Chudcode login UI teardown failed (%s)", type(exc).__name__
-                    )
-            with self._lock:
-                owned = self._transient_clients.pop(marker, None) is not None
-            if owned:
-                _stop_client(client)
 
 
 def _project_export_path(

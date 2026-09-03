@@ -14,6 +14,7 @@
 #include "ui/copilot/context_estimate.h"  // transcript-size estimate behind the context meter
 #include "ui/chudcode_descriptors.h"      // ui::chudcodeCompactReplacement — compact-result guard
 #include "ui/chudcode_session_actions.h"  // per-conversation Chudcode session link (resume key)
+#include "ui/file_explorer.h"             // ui::ensureWorkspaceDir — the fs_* jail every turn rides
 #include <climits>                        // INT_MAX saturation in activityCharsOf()
 
 // ---- auto-growing, wrapping chat input -------------------------------------------------------
@@ -806,9 +807,15 @@ static nlohmann::json chatHistoryForAgent(AppState& st) {
 
 // Attach the active conversation context shared by every agent-turn launch. The worker uses
 // session_id + sessions_dir to bind lossless sub-agent transcripts beside this chat session.
+// workspace_dir is the fs_* jail (CHUDWARE_FS_ROOT) and the project-save root: without it every
+// fs_list/fs_glob/fs_read in the main chat refuses with workspace_root_unavailable, so the agent
+// can never find the user's project files. The core's agent_workspace_dir() only runs on the
+// offline lane; the online route goes straight to the worker, so the GUI must send it.
 static void attachAgentConversationOptions(AppState& st, nlohmann::json& opts) {
     opts["session_id"] = st.activeConvId();
     opts["sessions_dir"] = chatSessionsDir();
+    ui::ensureWorkspaceDir(st);
+    if (!st.workspaceDir.empty()) opts["workspace_dir"] = st.workspaceDir;
     if (nlohmann::json hist = chatHistoryForAgent(st); !hist.empty())
         opts["history"] = std::move(hist);
     // Chudcode session continuity: a conversation whose persisted link carries a session

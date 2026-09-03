@@ -180,6 +180,24 @@ def _warm_prompt_cache() -> None:
         log.debug("prompt cache warm skipped: %s", exc)
 
 
+def _warm_chudcode_service() -> None:
+    """Spawn the shared Chudcode service process on a background thread.
+
+    Every transient command (provider list, auth state, model catalog, memory)
+    runs on one long-lived `chud --mode rpc` process; spawning it costs ~1.1 s,
+    which otherwise lands on the GUI's first provider query after connect.
+    """
+    def run() -> None:
+        try:
+            from services.agent.chudcode_host import get_default_chudcode_host
+
+            get_default_chudcode_host().warm_service()
+        except Exception as exc:  # noqa: BLE001
+            log.debug("chudcode service warm skipped: %s", exc)
+
+    threading.Thread(target=run, name="chudcode-service-warm", daemon=True).start()
+
+
 def _invoke_chudcode_control(action: str, params: dict) -> dict:
     from services.agent.worker_rpc import chudcode_control
 
@@ -230,6 +248,7 @@ def serve() -> None:
     try:
         log.info("worker ready (runtime=%s)", paths.RUNTIME)
         _warm_prompt_cache()
+        _warm_chudcode_service()
         for line in sys.stdin:
             line = line.strip()
             if not line:

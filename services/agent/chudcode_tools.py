@@ -89,9 +89,14 @@ class HostToolBinding:
             raise TypeError("host-tool factory must be callable")
 
         def execute(params: Mapping[str, Any] | None, host_context: Any) -> Any:
-            progress = getattr(host_context, "send_update", None)
+            send_update = getattr(host_context, "send_update", None)
+            progress = (
+                (lambda payload: send_update(host_tool_result(payload)))
+                if callable(send_update)
+                else None
+            )
             cancel = lambda: bool(getattr(host_context, "cancelled", False))
-            return dispatch_host_tool(self, params, progress, cancel)
+            return host_tool_result(dispatch_host_tool(self, params, progress, cancel))
 
         return factory(
             name=self.name,
@@ -106,6 +111,25 @@ class HostToolBinding:
     def definition(self) -> dict[str, Any]:
         return self.as_dict()
 
+
+def host_tool_result(result: Any) -> dict[str, Any]:
+    """Wrap a CAD tool's return value in the envelope Chudcode's RPC requires.
+
+    A ``host_tool_result`` whose ``result`` lacks ``content`` NEVER resolves inside
+    Chudcode: the ``write xd://<tool>`` dispatch waits forever, the worker's
+    ``wait_for_idle`` waits with it, and the GUI shows "Thinking..." until the 2-hour
+    cap (verified live with ``chud --mode rpc`` 0.3.0 for ``{"ok": false, ...}``,
+    ``{"ok": true, ...}`` and ``{"docs": [...]}``; a bare string or a
+    ``{"content": [...]}`` mapping completes immediately).  Every CAD tool returns a
+    raw JSON object, so this is the single place the envelope is applied: the model
+    reads the JSON as text and ``details`` keeps the structured result for the event
+    mapper.
+    """
+    if isinstance(result, str):
+        return {"content": [{"type": "text", "text": result}]}
+    safe = _json_safe(result)
+    text = json.dumps(safe, ensure_ascii=False, indent=2, default=str)
+    return {"content": [{"type": "text", "text": text}], "details": safe}
 
 # --------------------------------------------------------------------------- context
 

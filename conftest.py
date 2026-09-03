@@ -146,6 +146,30 @@ def _isolated_handoff_dir(tmp_path_factory):
         os.environ.pop("CHUDWARE_HANDOFF_DIR", None)
 
 
+# ---------------------------------------------------------------------------
+# Box mirror spool isolation. `Vault.save` calls box_mirror.on_vault_saved
+# unconditionally, and that hook reads the REAL config.json — so on a box where the
+# user has Box mirroring enabled, every vault-saving test enqueued its own throwaway
+# tmp project into ~/.local/share/Chudware/box_mirror/spool. 2646 entries had piled
+# up there (2633 from deleted `pytest-of-*` dirs), and since the agent turn's terminal
+# sweep drained that spool, EVERY chat message paid the drain's full 90s budget
+# re-walking dead entries — the "stuck on Thinking… for 120s" report.
+#
+# Worse in principle: a suite run was queueing uploads into the developer's real cloud
+# account. Session-scoped autouse, same shape as the registry/handoff guards above; an
+# explicitly pre-set CHUDWARE_BOX_MIRROR_DIR is honored.
+@_pytest.fixture(autouse=True, scope="session")
+def _isolated_box_mirror_spool(tmp_path_factory):
+    if os.environ.get("CHUDWARE_BOX_MIRROR_DIR"):
+        yield
+        return
+    d = tmp_path_factory.mktemp("box_mirror")
+    os.environ["CHUDWARE_BOX_MIRROR_DIR"] = str(d)
+    try:
+        yield
+    finally:
+        os.environ.pop("CHUDWARE_BOX_MIRROR_DIR", None)
+
 
 # ---------------------------------------------------------------------------
 # Engine isolation for test sessions. `services/mcp/core_bridge` defaults to daemon mode

@@ -105,6 +105,10 @@ def env(tmp_path, monkeypatch):
     """tmp config + appdata root + fake transport; project with mixed content."""
     monkeypatch.setattr(engine_paths, "CONFIG", tmp_path / "config.json")
     monkeypatch.setattr(engine_paths, "ROOT", tmp_path / "appdata")
+    # The root conftest sets CHUDWARE_BOX_MIRROR_DIR session-wide (spool isolation), and
+    # that override outranks the patched ROOT — give each test its own spool so pending
+    # counts and coalescing stay per-test.
+    monkeypatch.setenv("CHUDWARE_BOX_MIRROR_DIR", str(tmp_path / "appdata" / "box_mirror"))
     fake = FakeBox()
     monkeypatch.setattr(box_mirror, "_http", fake)
     project = tmp_path / "RoverProject"
@@ -264,6 +268,32 @@ def test_corrupt_spool_entry_is_quarantined_and_reported(env):
     quarantined = list((spool / "quarantine").glob("broken*.json"))
     assert len(quarantined) == 1
     assert quarantined[0].read_bytes() == payload
+
+
+def test_vanished_project_is_retired_not_retried_forever(env):
+    """A spooled project whose directory is gone can never be mirrored. Leaving the
+    entry queued made every drain re-read it and write a `last_error` state file for
+    it: 2646 entries (2633 of them deleted test dirs) ate the whole drain budget, so
+    real pending work was never reached and the spool only grew."""
+    _fake, project, tmp = env
+    _write_config(tmp, _enabled_cfg())
+    gone = tmp / "DeletedProject"
+    gone.mkdir()
+    assert box_mirror.enqueue_project(str(gone))
+    assert box_mirror.enqueue_project(str(project))
+    state = box_mirror._state_path(str(gone))
+    state.parent.mkdir(parents=True, exist_ok=True)
+    state.write_text('{"files": {}, "folders": {}}', encoding="utf-8")
+    gone.rmdir()
+
+    out = box_mirror.drain(block=True)
+
+    assert out["ok"] is True, out
+    assert out["retired"] == [str(gone)]
+    assert [p["project"] for p in out["projects"]] == [str(project)]
+    assert list(box_mirror._spool_dir().glob("*.json")) == []
+    assert not state.exists()
+    assert box_mirror.status()["pending"] == 0
 
 
 def test_async_drain_failure_is_visible_in_status(env, monkeypatch):

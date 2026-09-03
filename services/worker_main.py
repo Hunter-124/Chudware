@@ -198,6 +198,22 @@ def _warm_chudcode_service() -> None:
     threading.Thread(target=run, name="chudcode-service-warm", daemon=True).start()
 
 
+def _drain_box_mirror_on_exit() -> None:
+    """Flush whatever the background Box drain has not finished, briefly.
+
+    The turn path only STARTS a drain (see cad_common.save_touched_docs), so this is
+    where an in-flight mirror gets a last bounded window. The spool is durable: work
+    that does not fit stays queued for the next drain.
+    """
+    try:
+        from services.plm import box_mirror
+
+        if box_mirror.is_enabled() and box_mirror.status()["pending"]:
+            box_mirror.drain(block=True, budget_s=10.0)
+    except Exception as exc:  # noqa: BLE001 — shutdown is best-effort
+        log.debug("box mirror exit drain skipped: %s", exc)
+
+
 def _invoke_chudcode_control(action: str, params: dict) -> dict:
     from services.agent.worker_rpc import chudcode_control
 
@@ -230,6 +246,7 @@ def serve() -> None:
             shutdown_complete = True
         control.stop()
         _shutdown_chudcode()
+        _drain_box_mirror_on_exit()
 
     old_handlers: dict[int, object] = {}
     if threading.current_thread() is threading.main_thread():

@@ -402,7 +402,16 @@ def oauth_begin(timeout_s: float = 300.0) -> dict:
 # --------------------------------------------------------------------------- spool + state
 
 def _mirror_root() -> Path:
-    return paths.ROOT / "box_mirror"
+    """Spool + per-project state root.
+
+    ``CHUDWARE_BOX_MIRROR_DIR`` redirects it, which is what keeps a test run out of the
+    user's real spool: ``Vault.save`` fires ``on_vault_saved`` unconditionally, so with a
+    Box-enabled config every save in the suite enqueued its throwaway project. 2633 dead
+    ``pytest-of-*`` entries accumulated that way, and the drain re-walked all of them on
+    every turn. Same convention as CHUDWARE_SUBAGENTS_DIR / CHUDWARE_HANDOFF_DIR.
+    """
+    override = os.environ.get("CHUDWARE_BOX_MIRROR_DIR", "").strip()
+    return Path(override).expanduser() if override else paths.ROOT / "box_mirror"
 
 
 def _spool_dir() -> Path:
@@ -653,7 +662,7 @@ def _drain_once(budget_s: float) -> dict:
         if not box["enabled"]:
             return {"ok": True, "skipped": "disabled"}
         deadline = time.time() + budget_s
-        out: dict = {"ok": True, "projects": [], "errors": []}
+        out: dict = {"ok": True, "projects": [], "retired": [], "errors": []}
         for ent in sorted(_spool_dir().glob("*.json")):
             if time.time() > deadline:
                 out["ok"] = False
@@ -678,6 +687,19 @@ def _drain_once(budget_s: float) -> dict:
                     detail += (f"; quarantine failed: {type(quarantine_error).__name__}: "
                                f"{quarantine_error}")
                 out["errors"].append(f"spool_corrupt: {ent.name}: {detail}")
+                continue
+            # A project directory that is gone can NEVER be mirrored, so retire its entry
+            # instead of failing it forever. Without this a drain spent its whole budget
+            # re-reading dead entries and writing a `last_error` state file for each, so
+            # real pending work was never reached and the spool only grew (2646 entries
+            # observed, 2633 of them deleted test directories).
+            if not Path(project).is_dir():
+                with contextlib.suppress(OSError):
+                    if ent.stat().st_mtime_ns == stamp:
+                        ent.unlink()
+                with contextlib.suppress(OSError):
+                    _state_path(project).unlink()
+                out["retired"].append(project)
                 continue
             try:
                 summary = _mirror_project(project, box, deadline)

@@ -310,6 +310,31 @@ def test_a_doc_list_failure_is_reported_not_raised(sweep):
     assert out["errors"] and "daemon gone" in out["errors"][0]
 
 
+def test_the_box_mirror_is_started_never_awaited(sweep, monkeypatch):
+    """A cloud upload must never sit between the model's last word and the turn's
+    return. It used to: the sweep drained the Box spool with `block=True,
+    budget_s=90`, so with a backlogged spool every chat message stayed at
+    "Thinking…" for 90 s after the agent had finished (measured 5.5 s turn +
+    90.2 s drain). The persistent services worker keeps a daemon drain alive, and
+    worker_main drains what is left at shutdown."""
+    sweep([], touched=[])
+    from services.plm import box_mirror
+
+    calls: list = []
+    monkeypatch.setattr(box_mirror, "is_enabled", lambda *a, **k: True)
+    monkeypatch.setattr(box_mirror, "status", lambda *a, **k: {"pending": 7})
+    monkeypatch.setattr(
+        box_mirror,
+        "drain",
+        lambda **kw: calls.append(kw) or {"ok": True, "started": True},
+    )
+
+    out = C.save_touched_docs()
+
+    assert calls == [{"block": False}]
+    assert out["box"] == {"ok": True, "started": True}
+
+
 def test_note_touched_doc_keeps_build_order_and_dedupes(monkeypatch):
     monkeypatch.setattr(C, "_TOUCHED_DOCS", [])
     C.note_touched_doc("d2")

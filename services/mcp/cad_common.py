@@ -1714,13 +1714,18 @@ def save_touched_docs() -> dict:
         else:
             out["errors"].append(f"{did}: doc_save wrote nothing")
     try:
-        # Optional Box cloud mirror: this agent worker is a fresh fork per turn, so
-        # a background drain thread would die with it — drain the spool HERE, with a
-        # bounded budget, before the process exits. Anything unfinished stays
-        # spooled for the GUI worker / the next turn.
+        # Optional Box cloud mirror — STARTED, never awaited. This used to drain
+        # synchronously with a 90 s budget because "the agent worker is a fresh fork per
+        # turn, so a background drain thread would die with it". That premise is dead:
+        # hostd's worker_bridge owns ONE persistent services worker, so a daemon thread
+        # outlives the turn and worker_main.stop_services drains what is left on the way
+        # out. Blocking here put a network upload between the model's last word and the
+        # turn's return: with a backlogged spool every chat message sat at "Thinking…"
+        # for the full 90 s AFTER the agent had finished (measured: 5.5 s turn +
+        # 90.2 s drain). A cloud mirror is never on a user's critical path.
         from services.plm import box_mirror
         if box_mirror.is_enabled() and (out["saved"] or box_mirror.status()["pending"]):
-            out["box"] = box_mirror.drain(block=True, budget_s=90.0)
+            out["box"] = box_mirror.drain(block=False)
     except Exception:  # noqa: BLE001 — a terminal sweep never fails a turn
         pass
     return out

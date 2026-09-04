@@ -487,7 +487,13 @@ jobs:
           # failure there still leaves a complete, signed AppImage: a beta may ship
           # without an evidence bundle (promotion to stable may not), and that is a
           # loud warning rather than a silent omission.
+          # Captured to a file and echoed back, because GitHub's log storage has dropped
+          # this step's blob twice (BlobNotFound on download, and the runner's own page
+          # log holds only the command template) -- leaving a 45-minute build with an
+          # unreadable failure. The tail is reprinted inside the error path so the reason
+          # survives even when the streamed log does not.
           status=0
+          finalize_log="${RUNNER_TEMP}/finalize.log"
           "${CHUDWARE_RELEASE_PYTHON}" packaging/finalize_release.py "${RUNNER_TEMP}/prepared.tar" \
             --payload-signature "${RUNNER_TEMP}/payload.sig" \
             --release-public-key "${public_key_b64}" \
@@ -497,11 +503,23 @@ jobs:
             --locked-input packaging/requirements-release.txt \
             --locked-input vendor/chudcode/CHUDCODE_ARTIFACT.lock \
             --command 'ctest core' --command 'ctest host' \
-            --out "${final}" || status=$?
+            --out "${final}" > "${finalize_log}" 2>&1 || status=$?
+          cat "${finalize_log}"
 
           artifact="$(find "${final}" -type f -name "Chudware-${RELEASE_VERSION}-linux-x86_64.AppImage" -print -quit || true)"
           if [ -z "${artifact}" ]; then
-            echo "::error::finalize_release.py failed before producing the AppImage (exit ${status})"
+            echo "::group::finalize_release.py output (last 200 lines)"
+            tail -n 200 "${finalize_log}" || true
+            echo "::endgroup::"
+            # Step summaries are stored separately from job logs and have survived every
+            # blob loss so far, so the reason lands there too.
+            {
+              echo "### finalize_release.py failed (exit ${status})"
+              echo '```'
+              tail -n 60 "${finalize_log}" || true
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "::error::finalize_release.py failed before producing the AppImage (exit ${status}): $(tail -n 1 "${finalize_log}" 2>/dev/null)"
             exit 1
           fi
           evidence=1

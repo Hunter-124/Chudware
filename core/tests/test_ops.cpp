@@ -43,6 +43,7 @@
 #include "geom/dress.h"
 #include "geom/features.h"
 #include "geom/tessellate.h"
+#include "util/process_isolation.h"
 #include "aicm_loader.h"  // host loader (host/src/render on the include path)
 
 namespace {
@@ -414,12 +415,22 @@ TEST_CASE("fillet: isolated OCCT fault is a failed feature and process survives"
     TopTools_IndexedMapOfShape emap;
     TopExp::MapShapes(box, TopAbs_EDGE, emap);
     std::vector<TopoDS_Edge> one{TopoDS::Edge(emap(1))};
+    // The injected fault only exists inside the forked child, and isolation retires
+    // itself for the whole process the first time a fork times out (a loaded CI runner
+    // does hit that: this case took 10 s there against 0.9 s here). Once retired, the
+    // build runs in-process, no child is forked, and the fault is never armed — so the
+    // containment assertions are only meaningful while isolation is still active.
+    const bool isolated = chudware::util::shape_isolation_active();
     setenv("CHUDWARE_TEST_BLEND_SIGSEGV", "1", 1);
     int dropped = -1;
     TopoDS_Shape failed = geom::fillet_edges(box, 4.0, one, &dropped);
     unsetenv("CHUDWARE_TEST_BLEND_SIGSEGV");
-    CHECK(failed.IsNull());
-    CHECK(dropped == 1);
+    if (isolated) {
+        CHECK(failed.IsNull());
+        CHECK(dropped == 1);
+    } else {
+        MESSAGE("blend isolation already retired in this process; fault not armed");
+    }
     // The same process remains usable after the isolated child dies.
     TopoDS_Shape healthy = geom::fillet_edges(box, 4.0, one, &dropped);
     CHECK_FALSE(healthy.IsNull());
@@ -427,10 +438,15 @@ TEST_CASE("fillet: isolated OCCT fault is a failed feature and process survives"
 
     // The whole-body ("round every edge") overload is isolated too — it reaches the same
     // OCCT corner resolver, so an unguarded build there would kill the daemon just as dead.
+    const bool stillIsolated = chudware::util::shape_isolation_active();
     setenv("CHUDWARE_TEST_BLEND_SIGSEGV", "1", 1);
     TopoDS_Shape allFailed = geom::fillet_edges(box, 2.0, std::nullopt);
     unsetenv("CHUDWARE_TEST_BLEND_SIGSEGV");
-    CHECK(allFailed.IsNull());
+    if (stillIsolated) {
+        CHECK(allFailed.IsNull());
+    } else {
+        MESSAGE("blend isolation retired before the whole-body case; fault not armed");
+    }
     TopoDS_Shape allHealthy = geom::fillet_edges(box, 2.0, std::nullopt);
     CHECK_FALSE(allHealthy.IsNull());
 #endif

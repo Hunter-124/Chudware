@@ -47,6 +47,14 @@ namespace {
 bool g_fork_unusable = false;
 }  // namespace
 
+bool shape_isolation_active() {
+#if defined(__unix__) || defined(__APPLE__)
+    return !g_fork_unusable && shape_isolation_enabled();
+#else
+    return false;
+#endif
+}
+
 IsolatedShapeResult isolate_shape_build(const std::function<TopoDS_Shape()>& build,
                                         std::chrono::milliseconds timeout) {
 #if defined(__unix__) || defined(__APPLE__)

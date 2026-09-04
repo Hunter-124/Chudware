@@ -296,6 +296,36 @@ def test_vanished_project_is_retired_not_retried_forever(env):
     assert box_mirror.status()["pending"] == 0
 
 
+def test_orphan_state_files_are_swept_even_with_an_empty_spool(env):
+    """A state file outlives its spool entry, and nothing else can find it: the name is
+    a digest of the project path. 783 accumulated on this workstation (459 for deleted
+    pytest temp dirs) because retirement only ever ran while draining that project.
+    A state naming a LIVE project, and one naming nothing at all, must survive."""
+    _fake, project, tmp = env
+    _write_config(tmp, _enabled_cfg())
+    gone = tmp / "GoneProject"
+    gone.mkdir()
+    dead_state = box_mirror._state_path(str(gone))
+    dead_state.parent.mkdir(parents=True, exist_ok=True)
+    dead_state.write_text(
+        json.dumps({"project": str(gone), "files": {}, "folders": {}}), encoding="utf-8")
+    gone.rmdir()
+    live_state = box_mirror._state_path(str(project))
+    live_state.write_text(
+        json.dumps({"project": str(project), "files": {}, "folders": {}}), encoding="utf-8")
+    anonymous = box_mirror._mirror_root() / "state-deadbeefdeadbeef.json"
+    anonymous.write_text('{"files": {}, "folders": {}}', encoding="utf-8")
+    assert list(box_mirror._spool_dir().glob("*.json")) == []
+
+    out = box_mirror.drain(block=True)
+
+    assert out["ok"] is True, out
+    assert out["retired"] == [str(gone)]
+    assert not dead_state.exists()
+    assert live_state.exists()
+    assert anonymous.exists()
+
+
 def test_async_drain_failure_is_visible_in_status(env, monkeypatch):
     _fake, project, tmp = env
     _write_config(tmp, _enabled_cfg())

@@ -448,6 +448,36 @@ def _save_state(project: str, state: dict) -> None:
     os.replace(tmp, p)
 
 
+def _sweep_orphan_states(limit: int = 4096) -> list[str]:
+    """Retire ``state-*.json`` files whose project directory no longer exists.
+
+    A spool entry for a vanished project is retired by :func:`_drain_once`, which also
+    unlinks its state file. A project whose spool entry already drained leaves the state
+    file behind forever: nothing else keys off it, so nothing else can find it (the name
+    is a digest of the path). Those accumulated unbounded — 783 files, 459 of them for
+    deleted pytest temp directories, observed 2026-09-04.
+
+    Retiring a live project's state would only cost one full re-mirror, never data, so
+    the check is "directory is gone", the same predicate the spool drain uses.
+    """
+    retired: list[str] = []
+    for path in sorted(_mirror_root().glob("state-*.json"))[:limit]:
+        try:
+            state = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:  # noqa: BLE001 — leave anything unreadable for a human
+            continue
+        project = state.get("project") if isinstance(state, dict) else None
+        # Only a state that NAMES a vanished directory is provably dead. One that names
+        # nothing is not evidence of anything, so it is left alone rather than deleted
+        # on a guess (the spool drain retires those when it consumes their entry).
+        if not isinstance(project, str) or not project or Path(project).is_dir():
+            continue
+        with contextlib.suppress(OSError):
+            path.unlink()
+            retired.append(project)
+    return retired
+
+
 def _note_error(project: str, msg: str) -> None:
     with contextlib.suppress(Exception):
         st = _load_state(project)
@@ -663,6 +693,9 @@ def _drain_once(budget_s: float) -> dict:
             return {"ok": True, "skipped": "disabled"}
         deadline = time.time() + budget_s
         out: dict = {"ok": True, "projects": [], "retired": [], "errors": []}
+        # Cheap (one stat per file) and self-limiting: once swept, nothing regrows
+        # unless a project is deleted again.
+        out["retired"].extend(_sweep_orphan_states())
         for ent in sorted(_spool_dir().glob("*.json")):
             if time.time() > deadline:
                 out["ok"] = False

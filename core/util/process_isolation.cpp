@@ -77,6 +77,16 @@ IsolatedShapeResult isolate_shape_build(const std::function<TopoDS_Shape()>& bui
         return {};
     }
     if (pid == 0) {
+        // The child inherits every signal disposition of the host process, so a crash in
+        // OCCT would run the HOST's fatal handler inside the child: doctest prints "test
+        // case CRASHED" and mangles the harness (this test passed unoptimized and crashed
+        // the release LTO build), and a packaged app would run its crash reporter from a
+        // process whose only job is to die quietly. The contract here is "a signal means
+        // the geometry killed OCCT and the parent reports a failed feature", which needs
+        // the DEFAULT disposition: terminate, no handler.
+        for (const int sig : {SIGSEGV, SIGBUS, SIGFPE, SIGILL, SIGABRT, SIGTRAP}) {
+            ::signal(sig, SIG_DFL);
+        }
         bool ok = false;
         try {
             if (const char* fault = std::getenv("CHUDWARE_TEST_BLEND_SIGSEGV");

@@ -15,7 +15,10 @@
 #include <unordered_set>
 #include <vector>
 
-#include "vec_math.h"
+// Header-relative: this header is reached by targets that do NOT put host/src on the
+// include path (test_aicm pulls it in through renderer.h), and the release preset builds
+// that target — a bare "vec_math.h" failed only there.
+#include "../vec_math.h"
 
 namespace render {
 

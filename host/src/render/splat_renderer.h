@@ -17,7 +17,7 @@
 #include <vector>
 
 #include "../renderer.h"   // Renderer::CameraXform
-#include "vec_math.h"      // Vec3, Mat4 (host/src is on the include path in the ninja build)
+#include "../vec_math.h"   // Vec3, Mat4 — header-relative, not via a target's -I host/src
 
 namespace render {
 

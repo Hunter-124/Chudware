@@ -656,6 +656,11 @@ fi
 echo "==> building $OUTFILE"
 if ! ARCH=x86_64 VERSION="$VERSION" "$APPIMAGETOOL" "$APPDIR" "$OUTFILE" 2>"$OUT/appimagetool.log"; then
     echo "==> direct run failed, retrying with --appimage-extract-and-run (no-FUSE environments)"
+    # The first attempt gets as far as writing the AppImage (mksquashfs reaches 100%)
+    # before its FUSE mount fails, and mksquashfs will not write over that leftover:
+    # the retry died with "mksquashfs exited with code 1 / sfs_mksquashfs error", which
+    # is how the nightly Linux beta failed on 2026-09-04. Start the retry from nothing.
+    rm -f "$OUTFILE"
     ARCH=x86_64 VERSION="$VERSION" "$APPIMAGETOOL" --appimage-extract-and-run "$APPDIR" "$OUTFILE"
 fi
 # appimagetool rewrites files inside the AppDir as it packs (see

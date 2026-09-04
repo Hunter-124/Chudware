@@ -138,6 +138,11 @@ jobs:
       # assertion to the port this workflow believes in rather than to whatever
       # a future edit of that case statement defaults to.
       CHUDWARE_DEPLOY_HEALTH_BASE_URL: http://127.0.0.1:8300
+      # install_webd.sh stages the Chudcode runtime from this local file and
+      # verifies it against vendor/chudcode/CHUDCODE_ARTIFACT.lock (sha256 +
+      # `--version`). It lives outside the checkout, next to gateway.env, and
+      # is the chudcode-v0.3.0 linux-x64 release asset. Deployment never fetches.
+      CHUDWARE_CHUD_BIN: /home/liveuser/chudware-web-data/chud
       # The commit whose gates are being checked and which must still be
       # master's tip at deploy time. workflow_run carries it explicitly;
       # a manual dispatch uses the ref it was dispatched against.

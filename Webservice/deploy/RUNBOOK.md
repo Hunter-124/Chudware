@@ -615,6 +615,19 @@ bash Webservice/deploy/update.sh prod --tag v1.2.0 --pull-only
 bash Webservice/deploy/update.sh prod --tag v1.2.0 --web-only
 ```
 
+Two host prerequisites sit outside the checkout and are not installed by any
+script (added 2026-09-03, when their absence failed the first deploy after the
+Chudcode cutover with `[webd] ERROR: CHUDWARE_CHUD_BIN is required`):
+
+- `~/chudware-web-data/chud` — the `chudcode-linux-x64` asset of the Chudcode
+  release pinned in `vendor/chudcode/CHUDCODE_ARTIFACT.lock` (mode 755).
+  `deploy-prod.yml` exports it as `CHUDWARE_CHUD_BIN`; `install_webd.sh` stages
+  it into the release after `pin_chudcode.py stage` checks its sha256 and
+  `--version` against the lock. Repinning the lock means replacing this file.
+- `chudcode_rpc` importable by `/usr/bin/python3` as `liveuser` (the worker
+  runs on the system interpreter, not the gateway venv):
+  `python3 -m pip install --user <chudcode-checkout>/python/chudcode-rpc`.
+
 **`update.sh` exit codes are a contract with `deploy-prod.yml`.** `0` deployed,
 `1` failed part-way (production may have been mutated — the caller rolls back),
 `2` usage error, `3` another deploy holds the flock, and `4` **refused before

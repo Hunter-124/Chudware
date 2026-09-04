@@ -222,7 +222,8 @@ def stage_notices(
 ) -> dict[str, Any]:
     source = source or DEFAULT_NOTICE_DIR
     lock_path = lock_path or DEFAULT_LOCK
-    evidence = verify_notices(source, lock_path=lock_path)
+    # Notices are pinned by their own hashes; they do not wait on every binary target.
+    evidence = verify_notices(source, lock_path=lock_path, require_pinned=False)
     if destination.exists() and (
         not destination.is_dir() or destination.is_symlink()
     ):
@@ -332,10 +333,26 @@ def _verify_executable_version(
     return actual
 
 
+def _pinned_artifact(lock: dict[str, Any], target: str) -> dict[str, Any]:
+    """The artifact row for ``target``, refusing an unpinned one.
+
+    Verify/stage/fetch act on ONE target, so only that target's pin is load-bearing.
+    Demanding the whole lock be pinned (which check-lock still does) made staging
+    impossible on every platform until the last one was pinned: production went
+    unshippable waiting on a Windows artifact it never uses.
+    """
+    artifact = lock["artifacts"].get(target)
+    if artifact is None:
+        raise ArtifactLockError(f"unsupported Chudcode artifact target: {target}")
+    if artifact["url"] is None or artifact["sha256"] is None:
+        raise ArtifactLockError(f"artifact {target} is not pinned; run pin_chudcode.py pin")
+    return artifact
+
+
 def verify_binary(
     path: Path, target: str, *, lock_path: Path | None = None
 ) -> dict[str, Any]:
-    lock = load_lock(lock_path or DEFAULT_LOCK)
+    lock = load_lock(lock_path or DEFAULT_LOCK, require_pinned=False)
     if target not in SUPPORTED_TARGETS:
         raise ArtifactLockError(f"unsupported Chudcode artifact target: {target}")
     if not path.is_file() or path.is_symlink():
@@ -346,7 +363,7 @@ def verify_binary(
             f"wrong-target Chudcode binary: expected {target}, found {actual_target}"
         )
     actual_hash = _sha256(path)
-    expected = lock["artifacts"][target]["sha256"]
+    expected = _pinned_artifact(lock, target)["sha256"]
     if actual_hash != expected:
         raise ArtifactLockError(
             f"Chudcode binary sha256 mismatch for {target}: "
@@ -394,10 +411,8 @@ def fetch_artifact(
     destination: Path, target: str, *, lock_path: Path | None = None
 ) -> dict[str, Any]:
     lock_path = lock_path or DEFAULT_LOCK
-    lock = load_lock(lock_path)
-    artifact = lock["artifacts"].get(target)
-    if artifact is None:
-        raise ArtifactLockError(f"unsupported Chudcode artifact target: {target}")
+    lock = load_lock(lock_path, require_pinned=False)
+    artifact = _pinned_artifact(lock, target)
     destination.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.NamedTemporaryFile(
         prefix="chudcode-", delete=False, dir=destination.parent

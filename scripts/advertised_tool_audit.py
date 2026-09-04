@@ -428,6 +428,16 @@ def main() -> int:
     except Exception as exc:  # noqa: BLE001 — an unusable import is an ERROR, not a pass
         print(f"advertised_tool_audit: ERROR resolving the tool surface: {exc!r}")
         return 2
+    # A PARTIAL warm is the dangerous case, not an empty one: server.py registers each
+    # family in import order, so one missing optional dependency (langgraph, 2026-09-04)
+    # leaves every family declared after it unregistered while the catalog still clears
+    # the floor — and this audit then reports ~29 perfectly real tools as NO SUCH TOOL.
+    warm_error = getattr(registry, "warm_import_error", lambda: None)()
+    if warm_error is not None:
+        print("advertised_tool_audit: ERROR the tool baseline import did not complete, so "
+              f"the catalog ({len(catalog)} tools) is only a PREFIX of the real surface and "
+              f"every 'no such tool' finding would be false: {warm_error!r}")
+        return 2
     if len(catalog) < MIN_CATALOG:
         print(f"advertised_tool_audit: ERROR tool catalog holds only {len(catalog)} tools "
               f"(expected >= {MIN_CATALOG}) — the registry did not warm, so no finding "

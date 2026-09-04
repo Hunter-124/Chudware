@@ -423,9 +423,17 @@ void drawStatusBar(AppState& st, ImGuiViewport* vp, float statusH, bool busy,
     // DashScope) instead of reading "OpenRouter / Cloud API" for all of them.
     const char* provName =
         ui::providerLabelForEndpoint(st.settings.provider, st.settings.baseUrl);
+    // The old suffix read "[plan mode]" for every planPreference != 0, so an advisory
+    // "Option" (the model MAY plan; nothing is gated) looked like a hard plan gate.
+    // Name the actual preference instead — Settings -> AI -> Autonomy uses these words.
+    static const char* kPlanPrefLabels[] = {"Off", "Option", "Encourage", "Require"};
+    const int planPref = (st.settings.planPreference < 0 || st.settings.planPreference > 3)
+                             ? 0
+                             : st.settings.planPreference;
+    const std::string planTxt =
+        planPref == 0 ? std::string() : std::string("   [plan: ") + kPlanPrefLabels[planPref] + "]";
     std::string ptxt = std::string(provName) + "  /  " +
-                       (st.settings.model[0] ? st.settings.model : "default") +
-                       (st.settings.planMode ? "   [plan mode]" : "");
+                       (st.settings.model[0] ? st.settings.model : "default") + planTxt;
     // C24: the unit-system cluster mirrors SolidWorks — it shows MMGS / IPS and clicking it
     // toggles the active document unit system, reformatting every dimension display app-wide.
     const char* unitsTxt = st.ips() ? "IPS" : "MMGS";
@@ -494,8 +502,7 @@ void drawStatusBar(AppState& st, ImGuiViewport* vp, float statusH, bool busy,
     bool showWs = !wsTok.empty(), showVs = vsTxt[0] != 0, showUnits = true,
          showEdit = !editStr.empty(), showProv = true, showModel = true;
     // Provider without the model id: the shortest form that still names where completions go.
-    const std::string provShort =
-        std::string(provName) + (st.settings.planMode ? "   [plan mode]" : "");
+    const std::string provShort = std::string(provName) + planTxt;
     auto rebuild = [&]() {
         toks.clear();
         if (showWs)    toks.push_back({RTokKind::Ws,    wsTok,    wsTok});

@@ -237,6 +237,44 @@ class TestWarmClearCatalogSemantics(unittest.TestCase):
             self.assertEqual((_CATALOG_SNAPSHOT.get(name) or {}).get("family"), "org",
                              f"{name} is not catalog-tagged family 'org'")
 
+    def test_a_partial_baseline_import_is_reported_not_hidden(self):
+        """A failed baseline import must be VISIBLE, because the catalog it leaves is a
+        PREFIX of the real tool surface.
+
+        Regression (2026-09-04): server.py registers families in import order, so a
+        missing optional dependency (langgraph, imported mid-file for the dag family)
+        left 415 of 487 tools registered. warm_catalog() swallowed the exception and
+        scripts/advertised_tool_audit.py then reported 29 REAL tools as NO SUCH TOOL,
+        failing fast-gate on all three platforms. The audit must refuse to judge such a
+        catalog instead of inventing findings.
+        """
+        self.assertIsNone(reg.warm_import_error(),
+                          "this process imported server.py cleanly")
+        repo = pathlib.Path(__file__).resolve().parents[2]
+        program = (
+            "import sys\n"
+            "class Block:\n"
+            "    def find_module(self, name, path=None):\n"
+            "        return self.find_spec(name, path)\n"
+            "    def find_spec(self, name, path=None, target=None):\n"
+            "        if name == 'langgraph' or name.startswith('langgraph.'):\n"
+            "            raise ModuleNotFoundError(\"No module named 'langgraph'\")\n"
+            "        return None\n"
+            "sys.meta_path.insert(0, Block())\n"
+            "sys.argv = ['advertised_tool_audit.py']\n"
+            "import runpy\n"
+            "runpy.run_path('scripts/advertised_tool_audit.py', run_name='__main__')\n"
+        )
+        proc = subprocess.run(
+            [sys.executable, "-c", program], cwd=repo, capture_output=True, text=True,
+            timeout=300,
+        )
+        self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+        self.assertIn("PREFIX", proc.stdout)
+        self.assertIn("langgraph", proc.stdout)
+        self.assertNotIn("NO SUCH TOOL", proc.stdout,
+                         "a prefix catalog must produce no findings at all")
+
 
 if __name__ == "__main__":
     # Also runnable as: python -m services.mcp.test_registration_catalog

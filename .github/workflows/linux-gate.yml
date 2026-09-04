@@ -105,22 +105,23 @@ jobs:
           fetch-depth: 0
 
       # Eight check.py audits use only the standard library; advertised_tool_audit
-      # imports the live MCP registry and needs exactly these four packages. Keep
-      # this identical to fast-gate and read pins from the product requirements.
+      # imports the live MCP registry and needs exactly these six packages (langgraph
+      # gates every family services/mcp/server.py registers after services.dag).
+      # Keep this identical to fast-gate and read pins from the product requirements.
       - name: Provision the check.py import surface
         shell: bash
         run: |
           set -euo pipefail
 
           req="${RUNNER_TEMP}/check-requirements.txt"
-          grep -E '^(pyyaml|mcp|numpy|scipy)==' requirements.txt > "${req}"
+          grep -E '^(pyyaml|mcp|numpy|scipy)==|^(langgraph|langgraph-checkpoint-sqlite)>=' requirements.txt > "${req}"
           found="$(wc -l < "${req}" | tr -d ' ')"
-          if [ "${found}" -ne 4 ]; then
-            echo "::error::expected pinned pyyaml, mcp, numpy and scipy in requirements.txt, found ${found}"
+          if [ "${found}" -ne 6 ]; then
+            echo "::error::expected pinned pyyaml, mcp, numpy, scipy, langgraph and langgraph-checkpoint-sqlite in requirements.txt, found ${found}"
             exit 1
           fi
 
-          if python3 -c 'import yaml, mcp, numpy, scipy' 2>/dev/null; then
+          if python3 -c 'import yaml, mcp, numpy, scipy, langgraph, langgraph.checkpoint.sqlite' 2>/dev/null; then
             check_python="$(command -v python3)"
             echo "import surface already present in ${check_python}"
           else
@@ -128,7 +129,7 @@ jobs:
             python3 -m venv "${venv}"
             "${venv}/bin/python" -m pip install --quiet --disable-pip-version-check --upgrade pip
             "${venv}/bin/python" -m pip install --quiet --disable-pip-version-check -r "${req}"
-            "${venv}/bin/python" -c 'import yaml, mcp, numpy, scipy; print("import surface OK")'
+            "${venv}/bin/python" -c 'import yaml, mcp, numpy, scipy, langgraph, langgraph.checkpoint.sqlite; print("import surface OK")'
             check_python="${venv}/bin/python"
           fi
           echo "CHECK_PYTHON=${check_python}" >> "$GITHUB_ENV"

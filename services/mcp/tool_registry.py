@@ -142,6 +142,11 @@ _WARM_APPLIED = False
 # The import is attempted at most once per process; a failed import (no ``mcp`` SDK)
 # is deterministic and must not be retried on every family resolution.
 _WARM_IMPORT_TRIED = False
+# The exception that stopped the baseline import, if it did not complete. A partial
+# import registers every family DECLARED BEFORE the failing one and none after, so the
+# catalog looks plausible (415 of 487 tools) while ~70 real tools read as nonexistent.
+# Callers that must distinguish "no tools" from "some tools" ask for this.
+_WARM_IMPORT_ERROR: BaseException | None = None
 
 
 class _NullMCP:
@@ -192,7 +197,7 @@ def warm_catalog() -> None:
     Existing entries are never overwritten: a caller that deliberately retagged a
     tool keeps its tag.
     """
-    global _WARM_APPLIED, _WARM_IMPORT_TRIED
+    global _WARM_APPLIED, _WARM_IMPORT_TRIED, _WARM_IMPORT_ERROR
     if _WARM_APPLIED:
         return
     if _WARM_BASELINE is None and not _WARM_IMPORT_TRIED:
@@ -200,8 +205,8 @@ def warm_catalog() -> None:
         try:
             # side-effect: registers every family AND calls mark_warm_baseline().
             import services.mcp.server  # noqa: F401
-        except Exception:  # noqa: BLE001 — best-effort; a heavy/failed import must never break role loading
-            pass
+        except Exception as exc:  # noqa: BLE001 — best-effort; a heavy/failed import must never break role loading
+            _WARM_IMPORT_ERROR = exc
     if _WARM_BASELINE:
         for name, meta in _WARM_BASELINE.items():
             _CATALOG.setdefault(name, dict(meta))
@@ -216,6 +221,16 @@ def warm_catalog() -> None:
         except Exception:  # noqa: BLE001 — best-effort, same contract as above
             pass
     _WARM_APPLIED = True
+
+
+def warm_import_error() -> BaseException | None:
+    """Why the baseline ``services.mcp.server`` import did not complete, if it did not.
+
+    ``None`` after a clean warm (or before any warm attempt). Not-``None`` means the
+    catalog is a PREFIX of the real tool surface: trust it for "this tool exists", never
+    for "this tool does not".
+    """
+    return _WARM_IMPORT_ERROR
 
 
 def clear_catalog() -> None:

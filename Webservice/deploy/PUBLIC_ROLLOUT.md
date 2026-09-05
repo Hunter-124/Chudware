@@ -255,9 +255,11 @@ CHUDWARE_WEB_STRIPE_SUCCESS_URL=https://app.chudware.com/?billing=success
 CHUDWARE_WEB_STRIPE_CANCEL_URL=https://app.chudware.com/?billing=cancel
 ```
 
-`stripe` is not yet in `requirements.txt` — add it pinned when you enable
-billing. Until the key is set, the billing routes return 503 and the gateway
-boots normally.
+`stripe` is pinned in `requirements.txt` and installed in the production venv.
+Until the key is set, the billing routes return 503 and the gateway boots
+normally — but Stripe auto-disables a webhook endpoint that keeps getting 503,
+so never provision the endpoint before the keys are in `gateway.env`
+(`SETUP_CREDENTIALS.md` §6).
 
 Webhook hardening already in place: signature verified before parsing, 64 KiB
 body cap, event ids persisted so Stripe's at-least-once redelivery cannot

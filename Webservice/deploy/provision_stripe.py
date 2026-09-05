@@ -221,20 +221,18 @@ CATALOG_SPEC: dict[str, Any] = {
             },
         },
     },
+    # One gateway verifies one signing secret, so the production endpoint is
+    # live-only: a test-mode twin at the same URL fails signature checks the
+    # moment live keys land and Stripe disables it. Staging has no public
+    # ingress (loopback only, see RUNBOOK.md) — test-mode delivery uses
+    # ``stripe listen --forward-to`` against a local gateway instead.
     "webhooks": [
         {
             "name": "production",
             "url": "https://app.chudware.com/api/billing/webhook",
             "enabled_events": WEBHOOK_EVENTS,
-            "modes": ["test", "live"],
+            "modes": ["live"],
             "secret_env": "CHUDWARE_WEB_STRIPE_WEBHOOK_SECRET",
-        },
-        {
-            "name": "staging",
-            "url": "https://staging.chudware.com/api/billing/webhook",
-            "enabled_events": WEBHOOK_EVENTS,
-            "modes": ["test"],
-            "secret_env": "CHUDWARE_WEB_STRIPE_STAGING_WEBHOOK_SECRET",
         },
     ],
 }
@@ -972,9 +970,9 @@ def render_catalog_markdown(spec: Mapping[str, Any] = CATALOG_SPEC) -> str:
         [
             "",
             "Stripe returns a webhook signing secret only when the endpoint is created. Copy the",
-            "printed secret immediately into the matching `gateway.env`; a no-op rerun cannot",
-            "recover it. The staging endpoint is sandbox-only. The production URL exists in both",
-            "sandbox (launch smoke) and live mode, with different signing secrets.",
+            "printed secret immediately into the production `gateway.env`; a no-op rerun cannot",
+            "recover it. The endpoint is live-only: one gateway verifies one secret, and staging",
+            "has no public ingress. Sandbox delivery uses `stripe listen --forward-to` locally.",
             "",
             "## Sandbox provisioning checklist",
             "",
@@ -990,9 +988,9 @@ def render_catalog_markdown(spec: Mapping[str, Any] = CATALOG_SPEC) -> str:
             "python3 Webservice/deploy/provision_stripe.py --apply --expect-account \"$CHUDWARE_STRIPE_ACCOUNT\"",
             "```",
             "",
-            "4. Paste the emitted `CHUDWARE_STRIPE_PRICE_*` fragment and newly emitted webhook",
-            "   secret assignments into the sandbox `gateway.env`. Fill the sandbox ID columns",
-            "   above from the result table. Rerun `--apply`; every row must report `NO-OP`.",
+            "4. Paste the emitted `CHUDWARE_STRIPE_PRICE_*` fragment into the sandbox",
+            "   `gateway.env`. Fill the sandbox ID columns above from the result table. Rerun",
+            "   `--apply`; every row must report `NO-OP`.",
             "",
             "## Live provisioning checklist (phase-7 cutover only)",
             "",

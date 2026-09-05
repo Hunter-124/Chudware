@@ -44,13 +44,12 @@ Configuration IDs: sandbox `________________`; live `________________`.
 
 | Environment | URL | Stripe modes | Enabled events (exact) | Signing-secret env var | Sandbox `we_` id | Live `we_` id |
 |---|---|---|---|---|---|---|
-| production | `https://app.chudware.com/api/billing/webhook` | test, live | `checkout.session.completed`<br>`customer.subscription.updated`<br>`customer.subscription.deleted`<br>`invoice.paid`<br>`invoice.payment_failed`<br>`checkout.session.expired`<br>`payment_intent.payment_failed`<br>`charge.refunded`<br>`account.updated` | `CHUDWARE_WEB_STRIPE_WEBHOOK_SECRET` | — | — |
-| staging | `https://staging.chudware.com/api/billing/webhook` | test | `checkout.session.completed`<br>`customer.subscription.updated`<br>`customer.subscription.deleted`<br>`invoice.paid`<br>`invoice.payment_failed`<br>`checkout.session.expired`<br>`payment_intent.payment_failed`<br>`charge.refunded`<br>`account.updated` | `CHUDWARE_WEB_STRIPE_STAGING_WEBHOOK_SECRET` | — | — |
+| production | `https://app.chudware.com/api/billing/webhook` | live | `checkout.session.completed`<br>`customer.subscription.updated`<br>`customer.subscription.deleted`<br>`invoice.paid`<br>`invoice.payment_failed`<br>`checkout.session.expired`<br>`checkout.session.async_payment_succeeded`<br>`checkout.session.async_payment_failed`<br>`payment_intent.payment_failed`<br>`charge.refunded`<br>`account.updated` | `CHUDWARE_WEB_STRIPE_WEBHOOK_SECRET` | — | — |
 
 Stripe returns a webhook signing secret only when the endpoint is created. Copy the
-printed secret immediately into the matching `gateway.env`; a no-op rerun cannot
-recover it. The staging endpoint is sandbox-only. The production URL exists in both
-sandbox (launch smoke) and live mode, with different signing secrets.
+printed secret immediately into the production `gateway.env`; a no-op rerun cannot
+recover it. The endpoint is live-only: one gateway verifies one secret, and staging
+has no public ingress. Sandbox delivery uses `stripe listen --forward-to` locally.
 
 ## Sandbox provisioning checklist
 
@@ -66,9 +65,9 @@ python3 Webservice/deploy/provision_stripe.py --dry-run --expect-account "$CHUDW
 python3 Webservice/deploy/provision_stripe.py --apply --expect-account "$CHUDWARE_STRIPE_ACCOUNT"
 ```
 
-4. Paste the emitted `CHUDWARE_STRIPE_PRICE_*` fragment and newly emitted webhook
-   secret assignments into the sandbox `gateway.env`. Fill the sandbox ID columns
-   above from the result table. Rerun `--apply`; every row must report `NO-OP`.
+4. Paste the emitted `CHUDWARE_STRIPE_PRICE_*` fragment into the sandbox
+   `gateway.env`. Fill the sandbox ID columns above from the result table. Rerun
+   `--apply`; every row must report `NO-OP`.
 
 ## Live provisioning checklist (phase-7 cutover only)
 

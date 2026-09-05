@@ -230,13 +230,25 @@ prices are required together or the gateway refuses to boot.
 
 Do not create products by hand in the dashboard. `deploy/provision_stripe.py`
 owns the catalog declaratively and idempotently — four products, seven prices, a
-customer-portal configuration and the webhook endpoints (`STRIPE_CATALOG.md`).
+customer-portal configuration and the production webhook endpoint
+(`STRIPE_CATALOG.md`).
+
+The webhook endpoint is provisioned in **live mode only**. One gateway verifies
+one signing secret, so a test-mode endpoint at `app.chudware.com` is rejected
+with 400 the moment live keys land, and Stripe auto-disables any endpoint that
+keeps failing (it did exactly that on 2026-09-05, when the sandbox endpoints
+existed but `gateway.env` had no Stripe keys and every delivery got a 503).
+Staging has no public ingress, so it gets no endpoint either; test-mode
+delivery is `stripe listen --forward-to 127.0.0.1:8310/api/billing/webhook`
+against a local gateway, with the CLI's printed `whsec_` as that gateway's
+`CHUDWARE_WEB_STRIPE_WEBHOOK_SECRET`.
 
 1. Create the Chudware Stripe account; enable **Stripe Tax** (products carry the
    SaaS tax code `txcd_10103001`).
 2. Note the account id (`acct_…`, Settings → Account details) and the **test**
    secret key (Developers → API keys).
-3. Preview offline — `--dry-run` loads no secret and contacts nothing:
+3. Preview offline — `--dry-run` loads no secret and contacts nothing — then
+   apply the sandbox catalog (products, prices, portal; no webhook):
 
 ```bash
 export STRIPE_SECRET_KEY='sk_test_...'
@@ -245,18 +257,28 @@ python3 Webservice/deploy/provision_stripe.py --dry-run --expect-account "$CHUDW
 python3 Webservice/deploy/provision_stripe.py --apply   --expect-account "$CHUDWARE_STRIPE_ACCOUNT"
 ```
 
-4. Paste the emitted `CHUDWARE_STRIPE_PRICE_*` fragment **and the webhook signing
-   secret** into `gateway.env`. Stripe returns a signing secret only when the
-   endpoint is created — a no-op rerun cannot recover it. Rerun `--apply`; every
-   row must report `NO-OP`.
-5. Live mode is the phase-7 cutover only, and needs explicit `--live`
-   acknowledgement:
+4. Paste the emitted `CHUDWARE_STRIPE_PRICE_*` fragment into the staging
+   `gateway.env`. Rerun `--apply`; every row must report `NO-OP`.
+5. Going live needs the account activated (business details, bank account) and
+   explicit `--live` acknowledgement. This run also creates the production
+   webhook and prints its signing secret **once** — Stripe returns it only on
+   creation, a no-op rerun cannot recover it. Paste the price fragment **and**
+   the `CHUDWARE_WEB_STRIPE_WEBHOOK_SECRET` line into the production
+   `gateway.env` before anything else; a live endpoint whose gateway answers
+   503 gets disabled again.
 
 ```bash
 export STRIPE_SECRET_KEY='sk_live_...'
 python3 Webservice/deploy/provision_stripe.py --dry-run --live --expect-account "$CHUDWARE_STRIPE_ACCOUNT"
 python3 Webservice/deploy/provision_stripe.py --apply   --live --expect-account "$CHUDWARE_STRIPE_ACCOUNT"
 ```
+
+If the secret was lost, delete the endpoint in the dashboard (Developers →
+Webhooks) and rerun `--apply --live`: the provisioner recreates it and prints a
+fresh secret. Billing env is read per call, so no gateway restart is needed
+after editing `gateway.env`; confirm with
+`curl -X POST https://app.chudware.com/api/billing/webhook` → `400 missing
+Stripe-Signature header` (was `503 billing not configured`).
 
 Resulting env:
 

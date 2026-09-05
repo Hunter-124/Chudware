@@ -100,6 +100,9 @@ class FakeStripeTransport:
 
         if method == "GET" and path == "/v1/billing_portal/configurations":
             return {"data": list(copy.deepcopy(self.portal_configs).values()), "has_more": False}
+        if method == "GET" and path.startswith("/v1/billing_portal/configurations/"):
+            configuration_id = path.rsplit("/", 1)[1]
+            return copy.deepcopy(self.portal_configs[configuration_id])
         if method == "POST" and path == "/v1/billing_portal/configurations":
             configuration = copy.deepcopy(body)
             configuration["id"] = self._id("bpc")
@@ -151,17 +154,14 @@ def test_clean_account_creates_exact_catalog_and_second_run_is_noop():
     assert len(_post_paths(fake, "/v1/products")) == 4
     assert len(_post_paths(fake, "/v1/prices")) == 7
     assert len(_post_paths(fake, "/v1/billing_portal/configurations")) == 1
-    assert len(_post_paths(fake, "/v1/webhook_endpoints")) == 2
+    assert _post_paths(fake, "/v1/webhook_endpoints") == []
     assert len(fake.products) == 4
     assert len(fake.prices) == 7
-    assert first.write_count == 14
+    assert first.write_count == 12
     assert set(first.price_ids) == {
         price["lookup_key"] for price in ps.CATALOG_SPEC["prices"]
     }
-    assert first.webhook_secrets.keys() == {
-        "CHUDWARE_WEB_STRIPE_WEBHOOK_SECRET",
-        "CHUDWARE_WEB_STRIPE_STAGING_WEBHOOK_SECRET",
-    }
+    assert first.webhook_secrets == {}
 
     fake.requests.clear()
     second = ps.provision(fake, expect_account="acct_TEST")
@@ -237,13 +237,14 @@ def test_live_account_requires_explicit_live_flag_before_any_write():
     assert fake.writes == []
 
 
-def test_explicit_live_mode_omits_sandbox_only_staging_endpoint():
+def test_live_mode_creates_production_webhook_and_returns_its_secret():
     fake = FakeStripeTransport(livemode=True)
 
     result = ps.provision(fake, expect_account="acct_TEST", allow_live=True)
 
     assert set(result.webhook_ids) == {"production"}
     assert len(_post_paths(fake, "/v1/webhook_endpoints")) == 1
+    assert result.webhook_secrets.keys() == {"CHUDWARE_WEB_STRIPE_WEBHOOK_SECRET"}
 
 
 def test_dry_run_is_offline_and_emits_all_price_env_assignments():

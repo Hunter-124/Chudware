@@ -217,10 +217,33 @@ STARTTLS or delivery fails rather than sending the password in clear.
 `CHUDWARE_MAIL_FROM` must be on a domain verified with the chosen provider (SPF,
 DKIM, DMARC published) or every message is rejected or spam-filed.
 
-**This is sending only.** Nothing in this repository receives mail, so an
-address like `hunter@chudware.com` is not a mailbox you can read until you point
-the domain's MX records at a mail host (Fastmail, Google Workspace, Migadu,
-self-hosted Stalwart, …). Admin sign-in does **not** need one — see §7.
+**This is sending only.** Nothing in this repository receives mail; inbound
+`hunter@chudware.com` is a free Cloudflare Email Routing forward, provisioned
+by `deploy/cf_mail.py` — see **Mail** below. Admin sign-in does **not** need a
+mailbox at all — see §7.
+
+## Mail — inbound forwarding and the mail DNS records
+
+`deploy/cf_mail.py` owns chudware.com's mail plumbing idempotently, using the
+same token as `cf_provision.py` (`$CF_API_TOKEN`, else the gitignored
+`Webservice/Cloudflare-info.txt`; needs DNS Write + Email Routing Rules Write +
+Email Routing Addresses Write):
+
+```bash
+python3 Webservice/deploy/cf_mail.py status                 # routing state, destinations, rules, mail TXT
+python3 Webservice/deploy/cf_mail.py dns                    # upsert SPF + DMARC, prints CREATE/UPDATE/NO-OP
+python3 Webservice/deploy/cf_mail.py ensure --to you@gmail.com   # forward hunter@chudware.com there
+```
+
+`dns` publishes SPF `v=spf1 include:_spf.mx.cloudflare.net include:_spf.google.com ~all`
+(the Google include is for outbound through `smtp.gmail.com`) and `_dmarc`
+`v=DMARC1; p=none; rua=mailto:hunter@chudware.com`. The MX rows and the
+`cf2024-1._domainkey` DKIM TXT are Cloudflare-managed and read-only.
+
+**Human step:** `ensure` creates the destination address, and Cloudflare then
+emails a verification link to it. Until the mailbox owner clicks that link,
+`status` shows the destination `UNVERIFIED` and **forwarding silently does not
+deliver**. No catch-all rule is created, so only `hunter@chudware.com` routes.
 
 ## 6. Stripe billing — optional until you charge
 
@@ -275,8 +298,8 @@ python3 Webservice/deploy/provision_stripe.py --apply   --live --expect-account 
 
 If the secret was lost, delete the endpoint in the dashboard (Developers →
 Webhooks) and rerun `--apply --live`: the provisioner recreates it and prints a
-fresh secret. Billing env is read per call, so no gateway restart is needed
-after editing `gateway.env`; confirm with
+fresh secret. systemd loads `gateway.env` only at unit start, so
+`systemctl --user restart chudware-gateway` after editing it; confirm with
 `curl -X POST https://app.chudware.com/api/billing/webhook` → `400 missing
 Stripe-Signature header` (was `503 billing not configured`).
 

@@ -239,7 +239,8 @@ chasing a security regression that is not there.
 
 ## 6. Stripe setup
 
-Environment (read at call time; no restart needed to rotate):
+Environment (systemd reads `gateway.env` at unit start — `systemctl --user
+restart chudware-gateway` after editing; went live 2026-09-05):
 
 ```
 CHUDWARE_WEB_STRIPE_SECRET_KEY=sk_live_...

@@ -173,6 +173,18 @@ judgment).
 - **GUI reconnect:** status bar shows a sticky unreachable chip; `engine_events` reconnects
   with backoff and re-bootstraps doc tabs on `reconnectGeneration` bump
   (`CHUDWARE_SHOT=daemon_h2`). See gui-workspaces for the status-bar surface.
+- **A mission turn lives for hours; nothing in the lane may cap it silently (2026-09-05).**
+  `chudcode_host` builds `RpcClient(max_event_history=CHUDWARE_CHUDCODE_EVENT_HISTORY,
+  default 1e6)` — the package default of 10 000 frames killed a 65-minute turn with "Event
+  history limit was exceeded". A turn whose last real event is a failed provider retry
+  (`auto_retry_end success:false` with no assistant output after it) returns
+  `ok:false, stop_reason:"provider_error"` even though Chudcode emitted a terminal
+  `agent_end`; `scripts/run_mission.py` exits non-zero on it. Hunter's `chud config` carries
+  `retry.maxDelayMs=1800000, retry.maxRetries=4` so a 429 with a 17-minute retry-after is
+  waited out instead of ending the mission. Sim ladders from one call are sequential, and
+  the memory governor budgets `min(CHUDWARE_MEM_FRAC×total, avail−CHUDWARE_HEADROOM_GB)` at
+  solve time — an explicit `sizes_mm` leg is coarsened to that budget, so free RAM (close
+  builds/GUI) before a fine leg rather than raising the fraction.
 - **Chat sessions are keyed by project (2026-09-04).** `Conversation.projectDir` is stamped
   once at creation from `convProjectDir(st)` (= `st.workspaceDir`, else `plmProjectPath()`) —
   the same value the composer sends Chudcode as `workspace_dir`. `index.json` v3 keeps

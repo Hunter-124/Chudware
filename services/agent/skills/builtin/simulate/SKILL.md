@@ -45,9 +45,17 @@ closes a requirement:
    stated sizes, `monitor` on a NON-singular value; or `run_fea_adaptive` with
    `eta_target_met`. `converged:false` or a peak that grows with refinement is a
    singularity, not strength.
-2. **Check equilibrium.** Read `reactions.equilibrium_error_pct` before trusting any
-   stress, and `mesh_quality` (aspect_max, jacobian_min, pct_poor) before trusting the
-   mesh. Both ride beside `summary`, never inside it.
+2. **Check equilibrium AND connectivity.** Read `reactions.equilibrium_error_pct` before
+   trusting any stress, and `mesh_quality` (aspect_max, jacobian_min, pct_poor,
+   `connected_components` / `unfixed_components`, `thin_wall_ratio`) before trusting the
+   mesh. Both ride beside `summary`, never inside it. A static solve now REFUSES a mesh
+   whose components do not all reach a fixture — equilibrium cannot catch a mechanism,
+   because a mechanism carries no load and its residual is tiny BECAUSE the model is
+   broken (live: 9.6e6 mm of displacement at 0.00042% error). `thin_wall_ratio` under 1
+   means one element spans the wall and cannot bend: re-mesh with h <= wall thickness.
+   `plausibility.flag == "implausible"` means the peak displacement exceeded the part's
+   own bounding-box diagonal, so the small-strain assumption is gone, `warnings` says so,
+   and a convergence leg in that state is marked `implausible` and cannot converge.
 3. **Keep the field.** Pass `vtu_path=<absolute .vtu>` so displacement/von Mises are
    inspectable outside the tool; `provenance` records engine build, polymesh commit,
    solver, mesher and timestamp.

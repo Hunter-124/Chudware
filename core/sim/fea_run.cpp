@@ -88,6 +88,17 @@ struct MeshQualityFacts {
     // curvature). Always reported: it is a count, not a metric, and a nonzero
     // value is exactly why a thin-wall study can run at order 2 at all.
     int quadratic_fallback_elems = 0;
+    // Node-adjacency components over the elements (mesher.h MeshOut). 0 means
+    // the count was not available for this mesh.
+    int connected_components = 0;
+    // Components that reach NO fixture DOF, resolved by the static route once
+    // its fixtures are known: each one is free to translate and rotate, so the
+    // system is a mechanism and its "solution" is arbitrary. -1 means the route
+    // never resolved fixtures (a mesh-level report, modal, thermal), which is
+    // NOT the same statement as zero.
+    int unfixed_components = -1;
+    // Thinnest wall in element sizes (mesher.h MeshOut). 0 = unavailable.
+    double thin_wall_ratio = 0.0;
     std::string note;
 };
 
@@ -106,6 +117,18 @@ json mesh_quality_json(const MeshQualityFacts& quality, std::size_t n_nodes,
     for (std::size_t i = 0; i < std::size(kMetrics); ++i)
         out[kMetrics[i]] = quality.valid ? json(values[i]) : json(nullptr);
     out["quadratic_fallback_elems"] = quality.quadratic_fallback_elems;
+    // Connectivity and thin-wall facts are null when unavailable rather than a
+    // plausible-looking 1 / 0 the reader would take for a measurement.
+    out["connected_components"] = quality.connected_components > 0
+                                      ? json(quality.connected_components)
+                                      : json(nullptr);
+    out["thin_wall_ratio"] = quality.thin_wall_ratio > 0.0
+                                 ? json(quality.thin_wall_ratio)
+                                 : json(nullptr);
+    // Present only on a route that actually resolved fixtures; a modal or
+    // mesh-level report must not imply it checked.
+    if (quality.unfixed_components >= 0)
+        out["unfixed_components"] = quality.unfixed_components;
     if (!quality.note.empty()) out["note"] = quality.note;
     return out;
 }
@@ -518,6 +541,7 @@ bool resolve_mesh(const json &study, std::vector<double> &points,
         quality.pct_poor = probe.pct_poor;
         quality.min_tet_volume_mm3 = probe.min_tet_volume_mm3;
         quality.max_tet_edge_ratio = probe.max_tet_edge_ratio;
+        quality.connected_components = probe.connected_components;
       } else {
         quality.note = probe.error;
       }
@@ -559,6 +583,8 @@ bool resolve_mesh(const json &study, std::vector<double> &points,
     quality.quadratic_fallback_elems = mesh->quadratic_fallback_elems;
     quality.min_tet_volume_mm3 = mesh->min_tet_volume_mm3;
     quality.max_tet_edge_ratio = mesh->max_tet_edge_ratio;
+    quality.connected_components = mesh->connected_components;
+    quality.thin_wall_ratio = mesh->thin_wall_ratio;
     return true;
   }
   err = "study must have inline points/tets or a step_path";
@@ -1685,11 +1711,20 @@ static nlohmann::json fea_run_static_impl(
                     {"notes", notes}};
     }
 
-    // ── Explicit bonded gap ties (asm-fea) ───────────────────────────────────
-    // An imported assembly meshes as disconnected components. Never infer physical contact
-    // from proximity alone: only a positive study bond_gap_mm (or the legacy environment
-    // override) requests the bonded-contact idealization. Without it, every component must
-    // independently contain a fixture or setup fails honestly.
+    // ── Component connectivity vs fixtures: the MECHANISM gate ───────────────
+    // An imported assembly meshes as disconnected components, and so does a
+    // compound of two solids. Never infer physical contact from proximity alone:
+    // only a positive study bond_gap_mm (or the legacy environment override)
+    // requests the bonded-contact idealization.
+    //
+    // Whatever the ties, a component that reaches NO fixture is free to translate
+    // and rotate: the stiffness matrix is singular in those six directions and any
+    // number the solver prints for it is arbitrary. Live (ME490 front spine tube,
+    // O60 x 5.16 mm wall, tet10 at h = 16 mm): max displacement 9.6e6 mm at an
+    // equilibrium error of 0.00042% — the residual is tiny precisely BECAUSE the
+    // mechanism carries no load, so equilibrium can never catch this. Only
+    // connectivity can, and it is checked before the solve rather than explained
+    // afterwards.
     std::vector<BondSpring> bond_springs;
     {
         const int n_nodes_i = static_cast<int>(points.size() / 3);
@@ -1715,6 +1750,10 @@ static nlohmann::json fea_run_static_impl(
                       tets[static_cast<size_t>(e) * npe_i + k]);
         std::unordered_set<int> roots;
         for (int i = 0; i < n_nodes_i; ++i) roots.insert(find(i));
+        // The authoritative count for the result: this union-find covers every
+        // element stride the solver accepts (hex8 included), where the mesh-level
+        // metric from fill_quality is tet-only.
+        mesh_quality.connected_components = static_cast<int>(roots.size());
         if (roots.size() > 1) {
             double gap_mm = 0.0;
             if (study.contains("bond_gap_mm")) {
@@ -1812,40 +1851,53 @@ static nlohmann::json fea_run_static_impl(
                     "assembly mesh has " + std::to_string(roots.size()) +
                     " disconnected component(s); no bonded contact was requested");
             }
+        }
 
-            // Every component must have an explicit stiffness path to a fixture.
-            // Gap ties above are the only contact idealization requested by this
-            // study. Never invent longer bridges or ground floating parts: both
-            // change the model while presenting the result as a physical solve.
-            std::vector<int> super(comp);
-            std::function<int(int)> sfind = [&](int x) {
-                while (super[static_cast<size_t>(x)] != x) {
-                    super[static_cast<size_t>(x)] =
-                        super[static_cast<size_t>(super[static_cast<size_t>(x)])];
-                    x = super[static_cast<size_t>(x)];
-                }
-                return x;
-            };
-            for (const BondSpring& s : bond_springs) {
-                const int a = sfind(s.a), b = sfind(s.b);
-                if (a != b)
-                    super[static_cast<size_t>(std::max(a, b))] = std::min(a, b);
+        // Every component must have an explicit stiffness path to a fixture. The gap
+        // ties above are the only contact idealization this study requested; never
+        // invent longer bridges or ground a floating part, because both change the
+        // model while presenting the result as a physical solve.
+        std::vector<int> super(comp);
+        std::function<int(int)> sfind = [&](int x) {
+            while (super[static_cast<size_t>(x)] != x) {
+                super[static_cast<size_t>(x)] =
+                    super[static_cast<size_t>(super[static_cast<size_t>(x)])];
+                x = super[static_cast<size_t>(x)];
             }
-            std::unordered_set<int> anchored;
-            for (int nid : fixed_nodes) anchored.insert(sfind(nid));
-            std::unordered_set<int> floating;
-            for (int i = 0; i < n_nodes_i; ++i) {
-                const int root = sfind(i);
-                if (!anchored.count(root)) floating.insert(root);
-            }
-            if (!floating.empty())
-                return json{{"ok", false},
-                            {"error", "fea_static: " +
-                                          std::to_string(floating.size()) +
-                                          " disconnected component(s) have no fixture or "
-                                          "explicit bonded-contact path; set bond_gap_mm "
-                                          "only when that contact is physically intended"},
-                            {"notes", notes}};
+            return x;
+        };
+        for (const BondSpring& s : bond_springs) {
+            const int a = sfind(s.a), b = sfind(s.b);
+            if (a != b)
+                super[static_cast<size_t>(std::max(a, b))] = std::min(a, b);
+        }
+        std::unordered_set<int> anchored;
+        for (int nid : fixed_nodes) anchored.insert(sfind(nid));
+        std::unordered_set<int> floating;
+        for (int i = 0; i < n_nodes_i; ++i) {
+            const int root = sfind(i);
+            if (!anchored.count(root)) floating.insert(root);
+        }
+        mesh_quality.unfixed_components = static_cast<int>(floating.size());
+        if (!floating.empty()) {
+            std::string message =
+                "fea_static: mesh has " + std::to_string(floating.size()) +
+                " connected component(s) with no fixture: rigid-body motion — "
+                "refine the mesh (h <= wall thickness) or fix the island";
+            if (!bond_springs.empty())
+                message += ". " + std::to_string(bond_springs.size()) +
+                           " explicit bonded gap tie(s) were added and still did not "
+                           "reach a fixtured component; raise bond_gap_mm only when that "
+                           "contact is physically intended";
+            return json{
+                {"ok", false},
+                {"error", message},
+                {"mesh_quality",
+                 detail::mesh_quality_json(
+                     mesh_quality, points.size() / 3,
+                     tets.size() / static_cast<std::size_t>(nodes_per_elem),
+                     nodes_per_elem)},
+                {"notes", notes}};
         }
     }
 
@@ -1952,6 +2004,56 @@ static nlohmann::json fea_run_static_impl(
                             {"equilibrium_error_pct",
                              round_nd(r.equilibrium_error_pct, 6)}};
     out["provenance"] = detail::provenance_json("chudware/fea_static");
+
+    // ── Result plausibility: is this displacement even a small strain? ───────
+    // Linear-elastic FEA assumes displacements small against the part. A peak
+    // displacement past the whole bounding-box diagonal has left that regime, so
+    // the stiffness matrix it was computed with no longer describes the deformed
+    // body — the number is not a conservative estimate, it is meaningless. This
+    // does NOT refuse (a real 1.2x-diagonal deflection is worth diagnosing, and
+    // the fields are wanted for it), but it is stated where a reader cannot miss
+    // it, and the convergence ladder refuses to count such a leg.
+    {
+        double lo[3] = {0.0, 0.0, 0.0}, hi[3] = {0.0, 0.0, 0.0};
+        bool seeded = false;
+        for (std::size_t i = 0; i + 2 < points.size(); i += 3) {
+            if (!std::isfinite(points[i]) || !std::isfinite(points[i + 1]) ||
+                !std::isfinite(points[i + 2]))
+                continue;
+            for (int c = 0; c < 3; ++c) {
+                const double v = points[i + static_cast<std::size_t>(c)];
+                lo[c] = seeded ? std::min(lo[c], v) : v;
+                hi[c] = seeded ? std::max(hi[c], v) : v;
+            }
+            seeded = true;
+        }
+        double diag2 = 0.0;
+        for (int c = 0; c < 3; ++c) diag2 += (hi[c] - lo[c]) * (hi[c] - lo[c]);
+        const double bbox_diag = seeded ? std::sqrt(diag2) : 0.0;
+        const bool measurable = bbox_diag > 0.0 && std::isfinite(r.max_disp_mm);
+        const double ratio = measurable ? r.max_disp_mm / bbox_diag : 0.0;
+        const bool implausible = measurable && ratio > 1.0;
+        out["plausibility"] =
+            json{{"max_disp_over_bbox_diag",
+                  measurable ? json(round_nd(ratio, 6)) : json(nullptr)},
+                 {"bbox_diag_mm", measurable ? json(round_nd(bbox_diag, 6))
+                                             : json(nullptr)},
+                 {"flag", implausible ? "implausible" : "ok"}};
+        if (implausible) {
+            out["warnings"] = json::array(
+                {"displacement_implausible: max displacement " +
+                 std::to_string(r.max_disp_mm) + " mm is " +
+                 std::to_string(ratio) +
+                 "x the model bounding-box diagonal (" +
+                 std::to_string(bbox_diag) +
+                 " mm), so the linear-elastic small-strain assumption this solve "
+                 "is built on is broken and the result is not a deflection. The "
+                 "usual cause is a mechanism in the mesh — a thin wall meshed one "
+                 "element thick, or a region held by too few fixture nodes. Refine "
+                 "(h <= wall thickness), check mesh_quality.thin_wall_ratio, and "
+                 "confirm the fixture faces resolved."});
+        }
+    }
     {
         std::string vtu_path, vtu_error;
         if (!detail::write_result_vtu(study, points, tets, nodes_per_elem, out,

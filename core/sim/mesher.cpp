@@ -3,6 +3,7 @@
 
 #include "prof/phases.h"
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cmath>
 #include <cstdio>
@@ -17,6 +18,7 @@
 #include <string>
 #include <system_error>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 // Module-path lookup for the staged advisor model directory — the one reason
@@ -51,6 +53,7 @@
 #include <fea/nodal_mesh.hpp>
 #include <fea/p_elevate.hpp>
 #include <fea/zz.hpp>
+#include <geom/indicators.hpp>
 #include <pipeline/scene.hpp>
 
 // CHUDWARE_WITH_POLYMESH_ADVISOR is a SEPARATE axis from
@@ -529,6 +532,115 @@ bool default_feature_refine(const MeshOptions &options) {
   return options.fineness >= 0.5;
 }
 
+// The thinnest wall of the part, measured in element sizes: the minimum over
+// boundary elements of (local wall thickness / local element size).
+//
+// Why the number exists: a wall meshed ONE element thick has no interior node,
+// so the element cannot bend — the assembled system is a mechanism, and the
+// solver returns a "converged" displacement of nonsense magnitude rather than
+// an error (live, ME490 front spine: an O60 x 5.16 mm wall tube at h = 16 mm
+// reported max displacement 9.6e6 mm at an equilibrium error of 0.0004%). A
+// ratio below 1 says exactly that, before anyone reads a stress off it.
+//
+// The wall estimate is polymesh's inward-raycast per-vertex thickness over the
+// CAD tessellation (geom::estimate_local_thickness — uniform-grid accelerated
+// and OpenMP-parallel), and it runs once per mesh GENERATION because MeshOut is
+// cached, so a repeated solve pays nothing. Every surface vertex lies on the
+// boundary by construction, so pairing each one with the element size beside it
+// IS a boundary-element ratio; the pairing goes through an h-sized spatial hash
+// of element centroids instead of a nearest-node scan, so the cost is O(V + E).
+// The neighbourhood MINIMUM element size is used, which biases the ratio UP: a
+// graded mesh that already refined the wall is never accused of spanning it.
+//
+// Sampling limit, stated because the number is release evidence: the estimate
+// lives at tessellation VERTICES. A planar slab tessellated as two triangles per
+// face is therefore measured only at its corners, where the vertex normal runs
+// diagonally and the ray overshoots the wall (a 20 mm cube at h = 5 mm reads
+// ~12.7, not 4). Curved geometry — the thin-wall regime this metric exists for —
+// is densely tessellated, so its walls are sampled where they are actually thin
+// (an O60 x 5.16 mm tube whose wall carries 4 elements reads 4.1).
+//
+// Returns 0 when no usable pair exists (no tessellation, or an open shell whose
+// inward rays never reached an opposite wall).
+double thin_wall_ratio(const pm::pipeline::Model &model, const MeshOut &out,
+                       double h) {
+  const int stride = out.nodes_per_elem == 10 ? 10 : 4;
+  if (model.surface.vertices.empty() || out.points.empty() ||
+      out.tets.empty() ||
+      out.tets.size() % static_cast<size_t>(stride) != 0 || !(h > 0.0))
+    return 0.0;
+  std::vector<double> thickness;
+  try {
+    thickness = pm::geom::estimate_local_thickness(model.surface).thickness;
+  } catch (const std::exception &) {
+    // A surface the indicator rejects (non-manifold fan, degenerate triangle)
+    // yields NO estimate. Reporting one anyway would be the lie this metric
+    // exists to catch.
+    return 0.0;
+  }
+  if (thickness.size() != model.surface.vertices.size())
+    return 0.0;
+
+  auto cell_of = [h](double x, double y, double z) {
+    return std::array<long long, 3>{
+        static_cast<long long>(std::floor(x / h)),
+        static_cast<long long>(std::floor(y / h)),
+        static_cast<long long>(std::floor(z / h))};
+  };
+  auto key_of = [](const std::array<long long, 3> &cell) {
+    return (cell[0] * 73856093LL) ^ (cell[1] * 19349663LL) ^
+           (cell[2] * 83492791LL);
+  };
+  const size_t element_count = out.tets.size() / static_cast<size_t>(stride);
+  std::unordered_map<long long, double> smallest_near;
+  smallest_near.reserve(element_count);
+  for (size_t e = 0; e < element_count; ++e) {
+    const int *element = &out.tets[e * static_cast<size_t>(stride)];
+    double centroid[3] = {0.0, 0.0, 0.0};
+    double size = 0.0;
+    for (int a = 0; a < 4; ++a) {
+      const double *pa = &out.points[static_cast<size_t>(element[a]) * 3];
+      for (int c = 0; c < 3; ++c)
+        centroid[c] += pa[c] / 4.0;
+      for (int b = a + 1; b < 4; ++b) {
+        const double *pb = &out.points[static_cast<size_t>(element[b]) * 3];
+        const double dx = pa[0] - pb[0];
+        const double dy = pa[1] - pb[1];
+        const double dz = pa[2] - pb[2];
+        size = std::max(size, std::sqrt(dx * dx + dy * dy + dz * dz));
+      }
+    }
+    if (!std::isfinite(size) || !(size > 0.0))
+      continue;
+    const long long key = key_of(cell_of(centroid[0], centroid[1], centroid[2]));
+    const auto at = smallest_near.find(key);
+    if (at == smallest_near.end())
+      smallest_near.emplace(key, size);
+    else
+      at->second = std::min(at->second, size);
+  }
+
+  double ratio = std::numeric_limits<double>::infinity();
+  for (size_t v = 0; v < thickness.size(); ++v) {
+    if (!pm::geom::has_finite_thickness(thickness[v]))
+      continue;
+    const Eigen::Vector3d &p = model.surface.vertices[v];
+    const std::array<long long, 3> home = cell_of(p.x(), p.y(), p.z());
+    double local = std::numeric_limits<double>::infinity();
+    for (long long dx = -1; dx <= 1; ++dx)
+      for (long long dy = -1; dy <= 1; ++dy)
+        for (long long dz = -1; dz <= 1; ++dz) {
+          const auto at = smallest_near.find(
+              key_of({home[0] + dx, home[1] + dy, home[2] + dz}));
+          if (at != smallest_near.end())
+            local = std::min(local, at->second);
+        }
+    if (std::isfinite(local) && local > 0.0)
+      ratio = std::min(ratio, thickness[v] / local);
+  }
+  return std::isfinite(ratio) ? ratio : 0.0;
+}
+
 // Fill at coarse element size `h`, optionally under a spatial size field h(x),
 // promote to tet10 when asked, and normalize into MeshOut. `feature_refine` is
 // an explicit caller decision rather than a re-derivation of the fineness gate,
@@ -648,6 +760,14 @@ bool build_mesh(const LoadedModel &loaded, const MeshOptions &options, double h,
                     " tet10 element(s) kept straight mid-edge nodes (projected "
                     "mids folded them)");
   }
+  // Element sizes read off corner nodes only, so the mid-edge fallback above
+  // cannot move this number.
+  out.thin_wall_ratio = thin_wall_ratio(loaded.model, out, h);
+  if (out.thin_wall_ratio > 0.0 && out.thin_wall_ratio < 1.0)
+    append_note(out.note,
+                "thinnest wall spans under one element (thin_wall_ratio " +
+                    std::to_string(out.thin_wall_ratio) +
+                    "): a single element across a wall cannot bend");
   if (!detail::fill_quality(out)) {
     out.ok = false; // fill_quality set the diagnostic
     return false;

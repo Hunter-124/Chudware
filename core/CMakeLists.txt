@@ -1386,6 +1386,22 @@ if(CHUDWARE_WITH_OCCT)
     set_tests_properties(tet10_thin_wall PROPERTIES RUN_SERIAL TRUE
       ENVIRONMENT_MODIFICATION "${_fea_envmod}")
 
+    # Mechanism gate: a component that reaches no fixture is rigid-body free, and
+    # the equilibrium residual cannot see it (a mechanism carries no load, so the
+    # residual is tiny BECAUSE the model is broken). Two disjoint boxes in one
+    # compound must refuse; one box must solve and report plausible motion.
+    add_executable(test_mesh_mechanism tests/test_mesh_mechanism.cpp)
+    target_include_directories(test_mesh_mechanism PRIVATE
+      ${doctest_SOURCE_DIR} ${OpenCASCADE_INCLUDE_DIR})
+    target_link_libraries(test_mesh_mechanism PRIVATE
+      chudware_mesh chudware_geom_occt)
+    set_target_properties(test_mesh_mechanism PROPERTIES
+      RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+    chudware_polymesh_stage_runtime(test_mesh_mechanism)
+    add_test(NAME mesh_mechanism COMMAND test_mesh_mechanism)
+    set_tests_properties(mesh_mechanism PROPERTIES RUN_SERIAL TRUE
+      ENVIRONMENT_MODIFICATION "${_fea_envmod}")
+
     add_executable(test_sim_cache tests/test_sim_cache.cpp)
     target_include_directories(test_sim_cache PRIVATE
       ${doctest_SOURCE_DIR} ${OpenCASCADE_INCLUDE_DIR})

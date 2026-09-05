@@ -1490,15 +1490,28 @@ _FOS_CAP = 15.0
 
 
 # The release-evidence fields the engine attaches BESIDE `summary` (never inside it):
-#   mesh_quality  aspect/jacobian extremes, pct_poor, min tet volume, node/elem counts, order
+#   mesh_quality  aspect/jacobian extremes, pct_poor, min tet volume, node/elem counts,
+#                 order, connected_components / unfixed_components (the mechanism gate)
+#                 and thin_wall_ratio (wall thickness in element sizes)
 #   reactions     applied vs reaction force/moment plus equilibrium_error_pct (static family
 #                 only — a modal or thermal solve has no applied load to balance)
+#   plausibility  max_disp_over_bbox_diag + flag: an "implausible" flag means the peak
+#                 displacement exceeded the whole part, so the small-strain assumption the
+#                 solve is built on is broken and the number is not a deflection
+#   warnings      the engine's own top-level warning strings (displacement_implausible, …)
 #   provenance    engine_build_id / polymesh_commit / solver / mesher / timestamp_utc
 #   vtu_path      the .vtu the solve wrote, present only when the study requested one
 # They are forwarded VERBATIM into the reply and into the persisted study: an evidence packet
 # must show what the solver reported, not a value this file re-derived. A key the engine did
 # not send stays ABSENT rather than becoming a null the reader has to interpret.
-_EVIDENCE_KEYS = ("mesh_quality", "reactions", "provenance", "vtu_path")
+_EVIDENCE_KEYS = (
+    "mesh_quality",
+    "reactions",
+    "plausibility",
+    "warnings",
+    "provenance",
+    "vtu_path",
+)
 
 
 def _evidence_fields(res: dict) -> dict:
@@ -2594,6 +2607,15 @@ def _convergence_row(step: dict, out: dict, monitor: str, prev: Optional[float])
         row["equilibrium_error_pct"] = out["reactions"].get("equilibrium_error_pct")
     if out.get("vtu_path"):
         row["vtu_path"] = out["vtu_path"]
+    plausibility = out.get("plausibility")
+    if isinstance(plausibility, dict):
+        row["plausibility"] = plausibility
+        if plausibility.get("flag") == "implausible":
+            # A leg whose peak displacement exceeded the whole part did not solve the
+            # elastic problem this ladder is refining, so it is neither a reference for
+            # the next leg nor evidence of convergence. It keeps its row (and its
+            # numbers, for diagnosis) and is excluded from the arithmetic.
+            row["implausible"] = True
     governor = _coarsening_notes(out)
     if governor:
         # The engine's own admission that it did not mesh at the size we asked for. Without
@@ -2602,8 +2624,13 @@ def _convergence_row(step: dict, out: dict, monitor: str, prev: Optional[float])
     value = summary.get(monitor)
     row["monitored_value"] = value
     # A zero previous value has no percentage change (division by zero is not "0% drift"),
-    # so the delta is honestly absent and the tolerance check cannot pass on it.
-    if prev in (None, 0.0) or not isinstance(value, (int, float)):
+    # so the delta is honestly absent and the tolerance check cannot pass on it. An
+    # implausible leg has no comparable value at all.
+    if (
+        row.get("implausible")
+        or prev in (None, 0.0)
+        or not isinstance(value, (int, float))
+    ):
         row["delta_pct_vs_prev"] = None
     else:
         row["delta_pct_vs_prev"] = round(100.0 * (value - prev) / abs(prev), 3)
@@ -2617,11 +2644,13 @@ def _convergence_envelope(
     failed = [i for i, r in enumerate(rows) if r.get("error") and not r.get("skipped")]
     skipped = [i for i, r in enumerate(rows) if r.get("skipped")]
     degenerate = _degenerate_legs(rows)
+    implausible = [i for i, r in enumerate(rows) if r.get("implausible")]
     last_delta = rows[-1].get("delta_pct_vs_prev") if rows else None
     converged = (
         not failed
         and not skipped
         and not degenerate
+        and not implausible
         and len(rows) >= 2
         and isinstance(last_delta, (int, float))
         and abs(last_delta) < tol_pct
@@ -2676,6 +2705,20 @@ def _convergence_envelope(
         )
         if governor:
             out["mesh_governor_notes"] = governor
+    if implausible:
+        out["implausible_legs"] = implausible
+        out["note"] = (
+            f"IMPLAUSIBLE LEG(S) {implausible} — this is NOT a convergence statement. "
+            "Those legs' peak displacement exceeded the model's own bounding-box "
+            "diagonal, so the linear-elastic small-strain assumption the solve is built "
+            "on is broken and the number is not a deflection: the usual cause is a "
+            "mechanism in the mesh (a thin wall meshed one element thick, or a region "
+            "held by too few fixture nodes). They keep their rows for diagnosis but are "
+            "excluded from delta_pct_vs_prev and from converged. Read each leg's "
+            "plausibility.max_disp_over_bbox_diag and mesh_quality.thin_wall_ratio / "
+            "unfixed_components, refine so h <= the wall thickness, and confirm the "
+            "fixture faces resolved onto mesh nodes."
+        )
     if skipped:
         out["skipped_legs"] = skipped
     if failed:
@@ -2816,7 +2859,11 @@ class _ConvergenceLadder:
                     "expensive of the two. Pass continue_on_fail=True to solve the "
                     "remaining legs anyway."
                 )
-            if isinstance(row.get("monitored_value"), (int, float)):
+            # An implausible leg is not a reference either: the next leg's delta has to
+            # be measured against the last leg that actually solved the elastic problem.
+            if isinstance(row.get("monitored_value"), (int, float)) and not row.get(
+                "implausible"
+            ):
                 self.prev = float(row["monitored_value"])
             self.inflight = None
             self._record(row)
@@ -2943,7 +2990,9 @@ def _convergence_from_jobs(job_ids, monitor: str, tol_pct: float) -> dict:
     prev: Optional[float] = None
     for step, out in legs:
         row = _convergence_row(step, out, monitor, prev)
-        if isinstance(row.get("monitored_value"), (int, float)):
+        if isinstance(row.get("monitored_value"), (int, float)) and not row.get(
+            "implausible"
+        ):
             prev = float(row["monitored_value"])
         rows.append(row)
     return _convergence_envelope(doc_id, monitor, tol_pct, rows, [])
@@ -3015,9 +3064,19 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
         15.0 cap, reported in "fos_note" — a capped value means "at least this", not
         "exactly this".
         Release evidence rides BESIDE "summary": "mesh_quality" (aspect/jacobian extremes,
-        pct_poor, node/elem counts, order), "reactions" (applied vs reaction force/moment
-        plus equilibrium_error_pct — check it before trusting a stress), and "provenance"
+        pct_poor, node/elem counts, order, plus connected_components /
+        unfixed_components and thin_wall_ratio — the wall thickness in element sizes,
+        under 1 meaning one element spans the wall), "reactions" (applied vs reaction
+        force/moment plus equilibrium_error_pct — check it before trusting a stress),
+        "plausibility" ({max_disp_over_bbox_diag, bbox_diag_mm, flag}) and "provenance"
         (engine_build_id, polymesh_commit, solver, mesher, timestamp_utc).
+        A mesh whose components do not ALL reach a fixture is REFUSED, not solved: an
+        island free to translate and rotate has no unique answer, and the equilibrium
+        residual cannot see it (a mechanism carries no load, so the residual is tiny
+        BECAUSE the model is broken). When plausibility.flag is "implausible" the peak
+        displacement exceeded the part's own bounding-box diagonal — the small-strain
+        assumption is broken, "warnings" says so at the top level, and the numbers are
+        diagnostics rather than a deflection.
         Tip: query_geometry(...) first to confirm your fixture/load faces resolve.
         """
         try:
@@ -3187,14 +3246,20 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
         Returns {ok, monitor, tol_pct, converged, degenerate_ladder, final_delta_pct,
         n_meshes, resources, job_ids, table:[{size_mm|fineness, mesh_order, n_dof,
         n_nodes, n_elems, max_von_mises_mpa, max_disp_mm, min_fos, monitored_value,
-        delta_pct_vs_prev, mesh_quality, equilibrium_error_pct, mesh_governor_notes,
-        memory_budget}]}. `converged` is |the FINEST leg's delta| < tol_pct. A failed or
-        skipped leg keeps its row and forces ok:false — a table missing its finest mesh
-        would read as "converged at the coarse end".
+        delta_pct_vs_prev, mesh_quality, equilibrium_error_pct, plausibility,
+        implausible, mesh_governor_notes, memory_budget}]}. `converged` is |the FINEST
+        leg's delta| < tol_pct. A failed or skipped leg keeps its row and forces
+        ok:false — a table missing its finest mesh would read as "converged at the
+        coarse end".
         `degenerate_ladder:true` means two legs meshed the same (identical n_dof/n_elems,
         or under 5% DOF growth between consecutive legs); converged is then forced false
         and `note` carries the remedy, because a 0% delta between two copies of one mesh
         is not evidence.
+        A leg whose peak displacement exceeded the part's own bounding-box diagonal is
+        marked `implausible:true` and listed in `implausible_legs`: it left the
+        linear-elastic small-strain regime (usually a mechanism — a thin wall meshed one
+        element thick), so it carries no delta, never becomes the reference for the next
+        leg, and forces converged false.
         """
         try:
             tol_pct = _finite_float(tol_pct, "tol_pct")

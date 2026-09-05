@@ -185,6 +185,14 @@ json fea_run_adaptive(const json& study) {
         if (result.value("ok", false)) {
             if (result.contains("provenance") && result["provenance"].is_object())
                 result["provenance"]["solver"] = "chudware/fea_adaptive";
+            // Each pass solved an INLINE mesh, whose quality probe has no CAD
+            // tessellation to raycast, so the thin-wall witness has to come from the
+            // mesher that produced the final mesh. Same correction shape as the solver
+            // name above: an adaptive result must not under-report evidence an ordinary
+            // STEP study carries.
+            if (mesh.thin_wall_ratio > 0.0 && result.contains("mesh_quality") &&
+                result["mesh_quality"].is_object())
+                result["mesh_quality"]["thin_wall_ratio"] = mesh.thin_wall_ratio;
             std::string vtu_path, vtu_error;
             if (!detail::write_result_vtu(study, mesh.points, mesh.tets,
                                           mesh.nodes_per_elem, result, vtu_path,

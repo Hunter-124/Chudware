@@ -53,6 +53,20 @@ struct MeshOut {
   // detail::repair_folded_quadratic). 0 for tet4 and for a clean tet10 mesh.
   int quadratic_fallback_elems = 0;
 
+  // Node-adjacency connected components over the elements (union-find over
+  // every node of every element): 1 for one watertight solid, N for a compound
+  // or an imported assembly, where each island is its own stiffness system. A
+  // loaded island that reaches no fixture is a rigid-body mechanism, and a
+  // solve on one returns a meaningless "converged" answer. 0 = not computed
+  // (quality metrics unavailable — see fill_quality).
+  int connected_components = 0;
+  // The thinnest wall measured in element sizes: the minimum over boundary
+  // elements of (local wall-thickness estimate / local element size). Below 1
+  // one element spans the wall, which cannot represent bending — the regime
+  // that turns a thin tube into a mechanism. 0 = unavailable (inline mesh, no
+  // CAD tessellation, or an open shell the inward raycast never crossed).
+  double thin_wall_ratio = 0.0;
+
   double aspect_min = 0.0;
   double aspect_avg = 0.0;
   double aspect_max = 0.0;

@@ -1521,9 +1521,13 @@ class _LegStub:
     of instant completion.
     """
 
-    def __init__(self, monkeypatch, peaks: dict, fail: dict | None = None):
+    def __init__(self, monkeypatch, peaks: dict, fail: dict | None = None,
+                 implausible: set | None = None):
         self.peaks = peaks              # leg index -> monitored von Mises value
         self.fail = fail or {}          # leg index -> error string
+        # leg indices whose solve left the linear-elastic regime (the engine's
+        # plausibility flag), which the ladder must not count as convergence
+        self.implausible = implausible or set()
         self.events: list = []          # ("start"|"done", leg index)
         self.jobs: dict = {}            # job id -> {"index", "state", "polls"}
         monkeypatch.setattr(simjobs, "start", self._start)
@@ -1551,11 +1555,16 @@ class _LegStub:
         index = self.jobs[job_id]["index"]
         if index in self.fail:
             return {"ok": False, "doc_id": "doc-1", "error": self.fail[index]}
+        bad = index in self.implausible
         return {"ok": True, "doc_id": "doc-1", "n_dof": 3000 * (index + 1),
                 "n_nodes": 1000 * (index + 1), "n_elems": 900 * (index + 1),
                 "mesh": "tet10", "solver_notes": [_GOVERNOR_PLAN_NOTE],
+                "plausibility": {"max_disp_over_bbox_diag": 41.2 if bad else 0.0016,
+                                 "bbox_diag_mm": 408.9,
+                                 "flag": "implausible" if bad else "ok"},
                 "summary": {"max_von_mises_mpa": self.peaks[index],
-                            "max_disp_mm": 0.04, "min_fos": 12.0}}
+                            "max_disp_mm": 16847.0 if bad else 0.04,
+                            "min_fos": 12.0}}
 
     @property
     def starts(self) -> list:
@@ -1701,3 +1710,86 @@ def test_a_ladder_that_outruns_the_call_budget_keeps_solving_its_legs_in_order(
                            ("start", 2), ("done", 2)], stub.events
     assert [r["size_mm"] for r in snap["result"]["table"]] == [4, 2, 1]
     assert snap["result"]["job_ids"] == ["sim-leg0", "sim-leg1", "sim-leg2"], snap
+
+
+# ------------------------------------------- a mechanism does not converge, however smooth
+# Measured live (ME490 front spine tube, O60 x 5.16 mm wall, tet10 at h = 16 mm): the solve
+# returned ok with max displacement 9.6e6 mm at an equilibrium error of 0.00042%. The
+# residual is tiny precisely BECAUSE a mechanism carries no load, so equilibrium can never
+# catch it — and a ladder built on such a leg reports a tidy delta over nonsense.
+
+def test_an_implausible_leg_carries_no_delta_and_forces_converged_false(
+        ladder_setup, monkeypatch, tools):
+    """The middle leg left the small-strain regime: it must not be a reference either."""
+    _LegStub(monkeypatch, {0: 100.0, 1: 5000.0, 2: 105.0}, implausible={1})
+    out = json.loads(tools["run_fea_convergence"](
+        fixtures=["bottom"], loads=[{"face": "top", "force": [0, 0, -200]}],
+        sizes_mm=[4, 2, 1]))
+
+    table = out["table"]
+    assert [bool(r.get("implausible")) for r in table] == [False, True, False], table
+    # The flagged leg keeps its numbers for diagnosis but has no comparable delta.
+    assert table[1]["monitored_value"] == 5000.0, table[1]
+    assert table[1]["delta_pct_vs_prev"] is None, table[1]
+    assert table[1]["plausibility"]["flag"] == "implausible", table[1]
+    # The finest leg is measured against leg 0 (100 -> 105), never against the mechanism.
+    assert table[2]["delta_pct_vs_prev"] == 5.0, table[2]
+    assert out["implausible_legs"] == [1], out
+    assert out["converged"] is False, out
+    assert "IMPLAUSIBLE" in out["note"], out["note"]
+    assert "thin_wall_ratio" in out["note"], out["note"]
+
+
+def test_a_ladder_of_plausible_legs_still_converges_on_its_own_delta(
+        ladder_setup, monkeypatch, tools):
+    """The control: the plausibility block rides on every row and changes nothing."""
+    _LegStub(monkeypatch, {0: 100.0, 1: 104.0, 2: 105.0})
+    out = json.loads(tools["run_fea_convergence"](
+        fixtures=["bottom"], loads=[{"face": "top", "force": [0, 0, -200]}],
+        sizes_mm=[4, 2, 1]))
+
+    assert [r["plausibility"]["flag"] for r in out["table"]] == ["ok", "ok", "ok"]
+    assert all("implausible" not in r for r in out["table"]), out["table"]
+    assert "implausible_legs" not in out, out
+    assert out["converged"] is True, out
+
+
+def test_collect_static_forwards_the_engines_mechanism_and_plausibility_evidence(
+        monkeypatch):
+    """An evidence field the engine sent must reach the caller VERBATIM, reply and study."""
+    persisted: list = []
+    monkeypatch.setattr(sim_tools, "_persist_study",
+                        lambda doc, record: persisted.append(record) or "study-9")
+    quality = {"n_nodes": 100, "n_elems": 40, "order": 2, "aspect_max": 3.1,
+               "connected_components": 1, "unfixed_components": 0,
+               "thin_wall_ratio": 0.32}
+    plausibility = {"max_disp_over_bbox_diag": 41.2, "bbox_diag_mm": 408.9,
+                    "flag": "implausible"}
+    warning = ("displacement_implausible: max displacement 16847.000000 mm is 41.200000x "
+               "the model bounding-box diagonal (408.900000 mm)")
+    raw = {**_STATIC_RAW, "mesh_quality": quality, "plausibility": plausibility,
+           "warnings": [warning]}
+
+    out = sim_tools._collect_static(
+        {"doc": "doc-9", "material": _MATERIAL, "material_arg": "steel"}, raw, [])
+
+    # NOT refused: a real large deflection is worth diagnosing. But it is stated.
+    assert out["ok"] is True, out
+    assert out["plausibility"] == plausibility, out
+    assert out["warnings"] == [warning], out
+    assert out["mesh_quality"]["unfixed_components"] == 0, out["mesh_quality"]
+    assert out["mesh_quality"]["thin_wall_ratio"] == 0.32, out["mesh_quality"]
+    # The persisted study is the release artifact, so it carries the same evidence.
+    assert len(persisted) == 1
+    assert persisted[0]["plausibility"] == plausibility, persisted[0]
+    assert persisted[0]["warnings"] == [warning], persisted[0]
+
+
+def test_collect_static_omits_plausibility_when_the_engine_sent_none(monkeypatch):
+    """A key the engine did not send stays ABSENT, not a null the reader must interpret."""
+    monkeypatch.setattr(sim_tools, "_persist_study", lambda doc, record: "study-10")
+    out = sim_tools._collect_static(
+        {"doc": "doc-10", "material": _MATERIAL, "material_arg": "steel"},
+        dict(_STATIC_RAW), [])
+    assert out["ok"] is True, out
+    assert "plausibility" not in out and "warnings" not in out, out

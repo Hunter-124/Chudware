@@ -277,6 +277,22 @@ bool fill_quality(MeshOut &out) {
   size_t poor = 0;
   static constexpr int kEdges[6][2] = {{0, 1}, {0, 2}, {0, 3},
                                        {1, 2}, {1, 3}, {2, 3}};
+  // Node-adjacency components over the elements, folded into the pass that
+  // already validates every index. The metric rides WITH the mesh (the mesh
+  // cache included) so no solve route has to re-derive it, and the union rule
+  // is the one the static route uses when it decides whether every island
+  // reaches a fixture: every node of an element joins that element's set.
+  std::vector<int> parent(static_cast<size_t>(node_count));
+  for (int node = 0; node < node_count; ++node)
+    parent[static_cast<size_t>(node)] = node;
+  auto find = [&parent](int x) {
+    while (parent[static_cast<size_t>(x)] != x) {
+      parent[static_cast<size_t>(x)] =
+          parent[static_cast<size_t>(parent[static_cast<size_t>(x)])];
+      x = parent[static_cast<size_t>(x)];
+    }
+    return x;
+  };
 
   for (size_t index = 0; index < element_count; ++index) {
     const int *element = &out.tets[index * static_cast<size_t>(stride)];
@@ -286,6 +302,12 @@ bool fill_quality(MeshOut &out) {
                     " contains an invalid node index";
         return false;
       }
+    }
+    for (int node = 1; node < stride; ++node) {
+      const int a = find(element[0]);
+      const int b = find(element[node]);
+      if (a != b)
+        parent[static_cast<size_t>(std::max(a, b))] = std::min(a, b);
     }
     for (int a = 0; a < 4; ++a) {
       for (int b = a + 1; b < 4; ++b) {
@@ -347,6 +369,15 @@ bool fill_quality(MeshOut &out) {
         static_cast<int>((quality.aspect - 1.0) / (kPoorAspect - 1.0) * 10.0);
     out.aspect_hist[static_cast<size_t>(std::clamp(bucket, 0, 9))]++;
   }
+
+  // A node reachable from no element is its own component: it carries zero
+  // stiffness, so counting it is not pedantry — it is the same singular system
+  // a detached island is.
+  int components = 0;
+  for (int node = 0; node < node_count; ++node)
+    if (find(node) == node)
+      ++components;
+  out.connected_components = components;
 
   out.min_tet_volume_mm3 = minimum_volume;
   out.max_tet_edge_ratio = maximum_edge_ratio;

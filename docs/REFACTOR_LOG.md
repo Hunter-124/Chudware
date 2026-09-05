@@ -1840,3 +1840,47 @@ online lane has no first-turn flag (Chudcode owns history), and 3.4 kB of metada
 cheaper than a wasted turn. Chudcode's own skill discovery is still unconfigured — CAD does
 not publish anything into it, and `extensions`-style discovery paths on the spawn remain
 unused; `cad_skill` is deliberately the only bridge.
+
+## 2026-09-05 — a static solve refuses a mechanism, and says when its answer is implausible
+
+**Why.** Live (ME490 front spine tube, Ø60 x 5.16 mm wall, tet10 at h = 16 mm ≈ 3x the
+wall): `fea_static` returned `ok` with max displacement 9.6e6 mm and
+`equilibrium_error_pct` 0.00042. Nothing flagged it — the agent had to notice a nonsense
+number by eye. Equilibrium structurally CANNOT catch this: a mechanism carries no load, so
+the residual is tiny precisely BECAUSE the model is broken. The old connectivity guard only
+looked when the mesh already had more than one component, and no result said anything about
+the scale of its own displacement.
+
+**What changed.** (1) `detail::fill_quality` (`core/sim/mesh_quality.cpp`) folds a
+node-adjacency union-find into the pass that already validates every index, so
+`MeshOut::connected_components` rides WITH the mesh (cache included). (2) `core/sim/mesher.cpp`
+adds `MeshOut::thin_wall_ratio` — min over boundary elements of (polymesh
+`geom::estimate_local_thickness` at the nearest tessellation vertex / local element size),
+paired through an h-sized centroid hash, O(V+E), once per mesh generation; under 1 it also
+appends a mesh note. (3) `core/sim/fea_run.cpp`'s static route now computes
+`unfixed_components` for EVERY mesh (the old check was gated on `roots.size() > 1`) and
+REFUSES with `mesh_quality` attached rather than solving; the bond-gap guidance survives as
+a tail on that message. After a solve it reports `plausibility:{max_disp_over_bbox_diag,
+bbox_diag_mm, flag}` and, when the peak displacement exceeds the bounding-box diagonal, a
+top-level `warnings:["displacement_implausible: …"]` — it does NOT refuse, since a real
+large deflection is worth diagnosing. (4) `fea_adaptive` copies the final mesh's
+`thin_wall_ratio` onto the result (its passes solve inline meshes, which have no
+tessellation to raycast) — same correction shape as the existing `provenance.solver` patch.
+(5) `services/mcp/cad_sim_tools.py` forwards `plausibility`/`warnings` as evidence keys, and
+`_convergence_row` marks an implausible leg `implausible:true`, gives it no
+`delta_pct_vs_prev`, never lets it seed `prev`, and forces `converged:false` with
+`implausible_legs` + a remedy note. New ctest `mesh_mechanism`
+(`core/tests/test_mesh_mechanism.cpp`): two disjoint boxes in one compound refuse with
+`unfixed_components == 1`; one box solves with `connected_components == 1` and
+`plausibility.flag == "ok"`; a soft-modulus inline cube is flagged implausible without being
+refused.
+
+**Gotchas / deferred.** `thin_wall_ratio` is sampled at tessellation VERTICES, so a coarsely
+tessellated planar slab is measured only at its corners, where the vertex normal runs
+diagonally and overshoots (a 20 mm cube at h = 5 mm reads ~12.7, not 4); curved geometry —
+the regime the metric exists for — is densely tessellated and reads true (an Ø60 x 5.16 mm
+tube whose wall carries 4 elements reads 4.1). `unfixed_components` is counted AFTER explicit
+bonded gap ties, so a legitimately bonded assembly still reports 0 while
+`connected_components` stays >1. A study with no fixtures at all now refuses here instead of
+reaching the solver's singular-matrix error; the MCP layer already rejected `fixtures=[]`
+upstream, so no caller depended on that path.

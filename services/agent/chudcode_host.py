@@ -890,6 +890,13 @@ class ChudcodeSessionHost:
         kwargs: dict[str, Any] = {
             "no_session": no_session,
             "rpc_defaults": True,
+            # RpcClient defaults to 10_000 retained frames and raises "Event history
+            # limit was exceeded while waiting for agent_end" once a turn streams more
+            # than that — a 65-minute ME490 mission turn hit it and was killed mid-write.
+            # run_turn already keeps every frame of the turn in its own list, so the
+            # client's ring only needs to outlast the longest turn; a mission runs for
+            # hours and streams every text delta, so bound it generously.
+            "max_event_history": _event_history_limit_from_env(),
         }
         if binary is not None:
             kwargs["executable"] = binary
@@ -1442,6 +1449,18 @@ def _bounded_string(value: Any, limit: int) -> str | None:
         return None
     value = value.strip()
     return value[:limit] if value else None
+
+
+_DEFAULT_EVENT_HISTORY = 1_000_000
+
+
+def _event_history_limit_from_env() -> int:
+    raw = os.environ.get("CHUDWARE_CHUDCODE_EVENT_HISTORY", "")
+    try:
+        value = int(raw) if raw else _DEFAULT_EVENT_HISTORY
+    except ValueError:
+        value = _DEFAULT_EVENT_HISTORY
+    return max(10_000, value)
 
 
 def _session_limit_from_env() -> int:

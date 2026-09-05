@@ -83,6 +83,11 @@ struct MeshQualityFacts {
     double pct_poor = 0.0;
     double min_tet_volume_mm3 = 0.0;
     double max_tet_edge_ratio = 0.0;
+    // How many tet10 elements kept straight mid-edge nodes because projecting
+    // them onto the CAD boundary folded the element (thin walls / tight
+    // curvature). Always reported: it is a count, not a metric, and a nonzero
+    // value is exactly why a thin-wall study can run at order 2 at all.
+    int quadratic_fallback_elems = 0;
     std::string note;
 };
 
@@ -100,6 +105,7 @@ json mesh_quality_json(const MeshQualityFacts& quality, std::size_t n_nodes,
                              quality.max_tet_edge_ratio};
     for (std::size_t i = 0; i < std::size(kMetrics); ++i)
         out[kMetrics[i]] = quality.valid ? json(values[i]) : json(nullptr);
+    out["quadratic_fallback_elems"] = quality.quadratic_fallback_elems;
     if (!quality.note.empty()) out["note"] = quality.note;
     return out;
 }
@@ -550,6 +556,7 @@ bool resolve_mesh(const json &study, std::vector<double> &points,
     quality.aspect_max = mesh->aspect_max;
     quality.jacobian_min = mesh->jacobian_min;
     quality.pct_poor = mesh->pct_poor;
+    quality.quadratic_fallback_elems = mesh->quadratic_fallback_elems;
     quality.min_tet_volume_mm3 = mesh->min_tet_volume_mm3;
     quality.max_tet_edge_ratio = mesh->max_tet_edge_ratio;
     return true;
@@ -697,9 +704,16 @@ bool tri6_face_weights(const std::vector<double>& points, const int* el,
 // Returns the loaded boundary area. Handles tet4/tet10/hex8. Tet10 uses mapped tri6
 // quadrature so curved midside geometry contributes the correct scalar and vector surface
 // Jacobians; tet4/hex8 retain their linear equal-per-corner rule.
+//
+// A tet10 face whose projected mid nodes still fold it after the mesher's element-local
+// straight-edge fallback (detail::repair_folded_quadratic) is unusable: the surface
+// Jacobian reverses inside the face, so the integral is meaningless. That returns NaN and
+// fills `fold_detail` with the offending element index and its location, because "somewhere
+// in your mesh a face is folded" is not an actionable diagnostic on a 200k-element frame.
 double accumulate_face_weights(const std::vector<double>& points, const std::vector<int>& tets,
                                int nodes_per_elem, const std::unordered_set<int>& node_set,
-                               std::vector<double>& node_w, std::vector<double>& node_nw) {
+                               std::vector<double>& node_w, std::vector<double>& node_nw,
+                               std::string& fold_detail) {
     // P5: a boundary face needs ALL 3 (tet) / 4 (hex) corners in the set — under 3 nodes
     // no face can qualify, so the loaded area is exactly 0 and the whole element sweep is
     // a no-op. Exact short-circuit (the caller's w_sum fallback branch fires, as before);
@@ -743,8 +757,19 @@ double accumulate_face_weights(const std::vector<double>& points, const std::vec
                 double weights[6], normal_weights[6][3], curved_area = 0.0;
                 const FaceTab& ft = kTetFaces[f];
                 if (!tri6_face_weights(points, el, ft, weights, normal_weights,
-                                       curved_area))
+                                       curved_area)) {
+                    double centroid[3] = {0.0, 0.0, 0.0};
+                    for (int i = 0; i < 4; ++i)
+                        for (int c = 0; c < 3; ++c)
+                            centroid[c] +=
+                                points[static_cast<size_t>(el[i]) * 3 + c] / 4.0;
+                    char where[160];
+                    std::snprintf(where, sizeof(where),
+                                  " (element %zu, face %d, at (%.3f, %.3f, %.3f) mm)",
+                                  e, f, centroid[0], centroid[1], centroid[2]);
+                    fold_detail = where;
                     return std::numeric_limits<double>::quiet_NaN();
+                }
                 const int fn[6] = {cn[0], cn[1], cn[2], el[ft.mid[0]],
                                    el[ft.mid[1]], el[ft.mid[2]]};
                 for (int i = 0; i < 6; ++i) {
@@ -1560,12 +1585,14 @@ static nlohmann::json fea_run_static_impl(
             if (node_set.size() >= 3) {
                 node_w.assign(static_cast<size_t>(n_nodes), 0.0);
                 node_nw.assign(static_cast<size_t>(n_nodes) * 3, 0.0);
+                std::string fold_detail;
                 loaded_area = accumulate_face_weights(points, tets, nodes_per_elem,
-                                                      node_set, node_w, node_nw);
+                                                      node_set, node_w, node_nw,
+                                                      fold_detail);
                 if (!std::isfinite(loaded_area))
                     return json{{"ok", false},
                                 {"error", "fea_static: invalid or folded quadratic "
-                                          "boundary face"}};
+                                          "boundary face" + fold_detail}};
             }
             double w_sum = 0.0;
             if (!node_w.empty())

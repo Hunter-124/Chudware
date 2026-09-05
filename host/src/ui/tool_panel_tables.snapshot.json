@@ -86,6 +86,7 @@
    "fit_cylinder_axis",
    "get_job",
    "get_part",
+   "heal_body",
    "health_check",
    "import_part",
    "inspect_feature",
@@ -775,6 +776,7 @@
   "get_reveng_coverage": "Return measured capture coverage against the 11-shot orbit plan.",
   "get_reveng_deviation": "Compute mesh-vs-mesh (or mesh-vs-B-Rep tessellation) deviation (RE-16).",
   "get_reveng_session": "Return the full ``aicad.reveng_session/1`` manifest for *session_id*.",
+  "heal_body": "REPAIR a topologically broken solid with OCCT ShapeFix, as a RECORDED feature.",
   "heatsink_select": "Pick a heatsink for a hot component: candidates re-solved to a Tj target.",
   "hover": "Expand ONE face/edge by the stable `sid` describe_part / query_geometry handed you — its full semantic card (surf, side, signed normal …",
   "hydraulic_add_component": "Add an ISO 1219 hydraulic component to the active circuit document.",
@@ -1273,7 +1275,7 @@
    "prompt_note": "add_features already runs this per batch (overlap_warnings) — call to re-scan the whole tree or a features=[...] subset; bodies → check_interference."
   },
   "check_geometry_health": {
-   "prompt_note": "Is this solid actually sound? Reports watertight/manifold plus the COUNTS AND SIDS that justify it (free edges, non-manifold edges, shells, solids, sliver faces, orientation). Run it before an expensive FEA mesh, a CAM toolpath or a STEP/STL export. `self_intersection` is always checked:false — the kernel has no single-body test; use check_interference instead. `volume_mm3` is null for a body with no solid. repair/fill_holes/fix_normals/fix_winding are REFUSED: fix the feature that made the bad body, using the sids it just listed."
+   "prompt_note": "Is this solid actually sound? Reports watertight/manifold plus the COUNTS AND SIDS that justify it (free edges, non-manifold edges, shells, solids, sliver faces, orientation). Run it before an expensive FEA mesh, a CAM toolpath or a STEP/STL export. `self_intersection` is always checked:false — the kernel has no single-body test; use check_interference instead. `volume_mm3` is null for a body with no solid. repair/fill_holes/fix_normals/fix_winding are REFUSED here: for a body YOUR features made, fix the feature using the sids it just listed; for an IMPORTED body that arrived broken, call heal_body (a recorded ShapeFix repair)."
   },
   "check_interference": {
    "prompt_note": "Needs 2+ bodies — solve_mates first on an assembly so placements are real; overlap INSIDE one part's features → check_feature_overlap."
@@ -1751,6 +1753,9 @@
   },
   "get_reveng_session": {
    "prompt_note": "The polling read while a mission runs — session.run mirrors run progress. Find ids with list_reveng_sessions first."
+  },
+  "heal_body": {
+   "prompt_note": "The repair check_geometry_health refuses — use it ONLY on a body that arrived broken from an import (bad_orientation_of_subshape, not_closed, free_edge, negative volume). It appends a RECORDED `heal` feature (OCCT ShapeFix), so never 'repair' geometry with a BREP/STL round-trip or a self-boolean instead. `target` is a feature id/name or a 1-based body number; omit for a single-body part. Read `fixes` and `remaining_issues` — a partial repair says so, and raising tolerance_mm (0.01-0.1) is the retry. A defect your OWN features caused must be fixed at the feature; healing over it returns on the next parameter edit."
   },
   "health_check": {
    "prompt_note": "Alias of check_geometry_health for one body. For the whole-part review battery call design_review; for sketch state, sketch_health."

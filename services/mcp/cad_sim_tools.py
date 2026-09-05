@@ -28,6 +28,7 @@ from .cad_common import (
     _resolve_material_name,
     _resolve_material,
     _sid_match,
+    _start_job,
     collect_durable,
     register_durable_collector,
     solve_durable_or_handoff,
@@ -2298,21 +2299,130 @@ _LADDER_MIN_DOF_GROWTH_PCT = 5.0
 _COARSENED_MARKER = "auto-coarsened"
 
 
-def _coarsening_notes(out: dict) -> list:
-    """The engine notes saying the size governor overrode the discretization we asked for."""
+def _result_note_strings(out: dict, *, include_error: bool = False) -> list:
+    """Every free-text note a collected leg envelope carries, flattened into one list.
+
+    The engine's own words live in three different places depending on the solve
+    (`solver_notes`, `notes`, `mesh_quality.notes|note`), and a REFUSED solve says what
+    happened only in `error` — which is exactly where the resource governor's refusal
+    lands, so callers that need it ask for it explicitly.
+    """
     pools: list = [out.get("solver_notes"), out.get("notes")]
     quality = out.get("mesh_quality")
     if isinstance(quality, dict):
         pools.extend((quality.get("notes"), quality.get("note")))
+    if include_error:
+        pools.append(out.get("error"))
     found: list = []
     for pool in pools:
         items = [pool] if isinstance(pool, str) else pool
         if not isinstance(items, (list, tuple)):
             continue
-        for note in items:
-            if isinstance(note, str) and _COARSENED_MARKER in note and note not in found:
-                found.append(note)
+        found.extend(s for s in items if isinstance(s, str) and s)
     return found
+
+
+def _coarsening_notes(out: dict) -> list:
+    """The engine notes saying the size governor overrode the discretization we asked for."""
+    found: list = []
+    for note in _result_note_strings(out):
+        if _COARSENED_MARKER in note and note not in found:
+            found.append(note)
+    return found
+
+
+# ------------------------------------------------------------------ the MEMORY governor
+# A different governor from the mesh-size one above, and the one that killed a live study:
+# core/util/resource_governor budgets every solve a fraction of the RAM AVAILABLE at the
+# moment it starts (CHUDWARE_MEM_FRAC of TOTAL, then clamped to available minus
+# CHUDWARE_HEADROOM_GB, floored at min(3 GB, 40% of total)). It is recomputed per call, so
+# parallel solves shrink each other's budget — twelve legs launched at once were all
+# refused for want of memory while the same meshes solved fine one at a time. The number
+# is therefore evidence about the MACHINE at solve time and belongs on the row.
+
+#: The governor's decision text, as core/util/resource_governor.cpp formats it:
+#:   plan/admit report  "governor: plan what=fea_solver workers=6/6 reserve=0.10GB
+#:                       budget=9.42GB rss=1.20GB avail=13.60GB total=31.00GB ..."
+#:   admission refusal  "static FEA solve needs an estimated 20.5 GB but this machine's
+#:                       budget is 9.4 GB (31 GB RAM, 13.6 GB available) — ..."
+#: The refusal is the important one: it arrives as the failed leg's `error` and IS the
+#: explanation for a leg that solves alone and fails beside its siblings.
+_GB_NUM = r"([0-9]+(?:\.[0-9]+)?)"
+_GOV_FIELD_RES = {
+    "budget_gb": re.compile(r"\bbudget=" + _GB_NUM + "GB"),
+    "avail_gb": re.compile(r"\bavail=" + _GB_NUM + "GB"),
+    "total_gb": re.compile(r"\btotal=" + _GB_NUM + "GB"),
+}
+_GOV_WORKERS_RE = re.compile(r"\bworkers=([0-9]+)")
+_GOV_REFUSAL_RE = re.compile(
+    r"budget is " + _GB_NUM + r" GB \(" + _GB_NUM + r" GB RAM, " + _GB_NUM
+    + r" GB available\)"
+)
+_GOV_ESTIMATE_RE = re.compile(r"estimated " + _GB_NUM + r" GB")
+
+
+def _memory_budget(out: dict) -> dict:
+    """The memory governor's decision for one leg, in the governor's OWN numbers.
+
+    ``{budget_gb, avail_gb, total_gb, workers}`` (plus ``estimate_gb`` when the refusal
+    states what the solve wanted), taken from whatever the envelope exposes — the plan
+    line when the solver logged it, the refusal prose when the leg was turned away.
+    Returns ``{}`` when nothing in the envelope names a budget: an unreported decision
+    stays absent rather than becoming a number this file invented.
+    """
+    found: dict = {}
+    for text in _result_note_strings(out, include_error=True):
+        if "governor" not in text and "budget" not in text:
+            continue
+        refusal = _GOV_REFUSAL_RE.search(text)
+        if refusal:
+            found.setdefault("budget_gb", float(refusal.group(1)))
+            found.setdefault("total_gb", float(refusal.group(2)))
+            found.setdefault("avail_gb", float(refusal.group(3)))
+            estimate = _GOV_ESTIMATE_RE.search(text)
+            if estimate:
+                found.setdefault("estimate_gb", float(estimate.group(1)))
+        for name, pattern in _GOV_FIELD_RES.items():
+            hit = pattern.search(text)
+            if hit:
+                found.setdefault(name, float(hit.group(1)))
+        workers = _GOV_WORKERS_RE.search(text)
+        if workers:
+            found.setdefault("workers", int(workers.group(1)))
+    return found
+
+
+#: Said on every ladder reply, because the agent that starved this study believed the
+#: budget was a fixed ~70% of TOTAL RAM while the governor was reporting 9.4-13.6 GB.
+_RESOURCES_NOTE = (
+    "the engine's memory governor gives each solve a fraction of the RAM AVAILABLE when "
+    "that solve starts (CHUDWARE_MEM_FRAC of total, then clamped to available minus "
+    "CHUDWARE_HEADROOM_GB) — NOT a fixed share of total RAM. Concurrent studies therefore "
+    "shrink each other's budget until the fine meshes are refused outright, so the legs of "
+    "this ladder solve ONE AT A TIME and you should run ONE LADDER AT A TIME."
+)
+
+
+def _resources_line(rows: list) -> str:
+    """One line on what the machine granted this ladder, plus the rule it follows."""
+    for row in reversed(rows):
+        budget = row.get("memory_budget")
+        if not isinstance(budget, dict) or not budget:
+            continue
+        parts: list = []
+        for key, label in (
+            ("budget_gb", "budget"),
+            ("avail_gb", "available"),
+            ("total_gb", "total"),
+        ):
+            if key in budget:
+                parts.append(f"{label} {budget[key]:.2f} GB")
+        if "workers" in budget:
+            parts.append(f"workers {budget['workers']}")
+        if parts:
+            return "governor reported " + ", ".join(parts) + " — " + _RESOURCES_NOTE
+        break
+    return _RESOURCES_NOTE
 
 
 def _degenerate_legs(rows: list) -> list:
@@ -2425,6 +2535,31 @@ def _convergence_ladder(sizes_mm, fineness) -> tuple:
     return "fineness", vals
 
 
+def _leg_label(step: dict) -> str:
+    """How a ladder rung is named in prose: its stated size, else its fineness."""
+    size = step.get("target_size_mm")
+    if isinstance(size, (int, float)) and not isinstance(size, bool):
+        return f"size {size} mm"
+    return f"fineness {step.get('fineness')}"
+
+
+def _convergence_skipped_row(step: dict, reason: str) -> dict:
+    """A leg that was never solved because an earlier leg failed and stopped the ladder.
+
+    It keeps its row for the same reason a failed leg does: a table that simply ends at
+    the coarse end reads as "converged there".
+    """
+    return {
+        "size_mm": step.get("target_size_mm"),
+        "fineness": step.get("fineness"),
+        "mesh_order": step.get("mesh_order"),
+        "skipped": True,
+        "error": reason,
+        "monitored_value": None,
+        "delta_pct_vs_prev": None,
+    }
+
+
 def _convergence_row(step: dict, out: dict, monitor: str, prev: Optional[float]) -> dict:
     """One ladder row from a collected static envelope, plus its delta against the previous.
 
@@ -2436,6 +2571,11 @@ def _convergence_row(step: dict, out: dict, monitor: str, prev: Optional[float])
         "fineness": step.get("fineness"),
         "mesh_order": step.get("mesh_order"),
     }
+    budget = _memory_budget(out)
+    if budget:
+        # Attached BEFORE the failure return: on a refused leg the governor's budget is
+        # not a footnote, it is the reason the leg has no result.
+        row["memory_budget"] = budget
     if not out.get("ok"):
         row["error"] = out.get("error") or "leg failed"
         row["monitored_value"] = None
@@ -2474,18 +2614,20 @@ def _convergence_envelope(
     doc_id, monitor: str, tol_pct: float, rows: list, notes: list
 ) -> dict:
     """The convergence verdict over a finished ladder — never a PASS on a partial table."""
-    failed = [i for i, r in enumerate(rows) if r.get("error")]
+    failed = [i for i, r in enumerate(rows) if r.get("error") and not r.get("skipped")]
+    skipped = [i for i, r in enumerate(rows) if r.get("skipped")]
     degenerate = _degenerate_legs(rows)
     last_delta = rows[-1].get("delta_pct_vs_prev") if rows else None
     converged = (
         not failed
+        and not skipped
         and not degenerate
         and len(rows) >= 2
         and isinstance(last_delta, (int, float))
         and abs(last_delta) < tol_pct
     )
     out = {
-        "ok": not failed,
+        "ok": not failed and not skipped,
         "doc_id": doc_id,
         "monitor": monitor,
         "tol_pct": tol_pct,
@@ -2494,6 +2636,7 @@ def _convergence_envelope(
         "converged": converged,
         "degenerate_ladder": bool(degenerate),
         "final_delta_pct": last_delta,
+        "resources": _resources_line(rows),
         "note": (
             "converged is |delta of the FINEST leg| < tol_pct on the monitored value; "
             "a peak that keeps growing with refinement is a singularity, not strength."
@@ -2533,17 +2676,33 @@ def _convergence_envelope(
         )
         if governor:
             out["mesh_governor_notes"] = governor
+    if skipped:
+        out["skipped_legs"] = skipped
     if failed:
         out["error"] = (
             f"{len(failed)} of {len(rows)} convergence legs failed (rows "
-            f"{failed}); the table is retained for diagnosis and is NOT a convergence "
+            f"{failed})"
+            + (
+                f" and the {len(skipped)} finer leg(s) after the first failure (rows "
+                f"{skipped}) were never solved"
+                if skipped
+                else ""
+            )
+            + "; the table is retained for diagnosis and is NOT a convergence "
             "statement."
+        )
+    elif skipped:
+        out["error"] = (
+            f"{len(skipped)} of {len(rows)} convergence legs were skipped (rows "
+            f"{skipped}); a partial ladder is NOT a convergence statement."
         )
     return _interpreted(out, notes)
 
 
-def _convergence_leg_solve(payload: dict, meta: dict, deadline: float) -> tuple:
-    """Solve one ladder leg as a durable job, returning ``(job_id, envelope | None)``.
+def _convergence_leg_solve(
+    payload: dict, meta: dict, deadline: Optional[float], job_id: Optional[str] = None
+) -> tuple:
+    """Solve ONE ladder leg as a durable job, returning ``(job_id, envelope | None)``.
 
     Same three primitives `solve_durable_or_handoff` drives (start, status, collect), but
     the JOB ID comes back for EVERY leg and the whole ladder shares ONE transport deadline
@@ -2551,10 +2710,15 @@ def _convergence_leg_solve(payload: dict, meta: dict, deadline: float) -> tuple:
     carries no id, and without one a ladder whose tail overran could never be reassembled
     into a single table. `None` means "still running at the deadline" — the leg is left
     solving in its own process, exactly as a handoff does.
+
+    `job_id` re-attaches to a leg that is ALREADY solving (the synchronous call ran out of
+    transport budget in the middle of one), and `deadline=None` waits for the leg however
+    long it takes — what the background ladder driver does, because the next leg must not
+    start until this one is finished.
     """
-    jid = simjobs.start("fea_static", "core_rpc", payload, meta)["job_id"]
+    jid = job_id or simjobs.start("fea_static", "core_rpc", payload, meta)["job_id"]
     interval = 0.02
-    while time.time() < deadline:
+    while deadline is None or time.time() < deadline:
         st = simjobs.status(jid)
         state = st.get("state")
         if state == simjobs.DONE:
@@ -2566,13 +2730,172 @@ def _convergence_leg_solve(payload: dict, meta: dict, deadline: float) -> tuple:
                 "state": state,
                 "error": st.get("error") or f"solve {state}",
             }
+        if state == "unknown":
+            # The registry lost the job (pruned, or a spool wiped underneath us). An
+            # unbounded wait must never be a wait for something that cannot arrive.
+            return jid, {
+                "ok": False,
+                "job_id": jid,
+                "state": state,
+                "error": st.get("error") or f"job {jid} is no longer in the job registry",
+            }
         time.sleep(interval)
         interval = min(0.4, interval * 1.5)
     return jid, None
 
 
+class _ConvergenceLadder:
+    """The sequential driver for one mesh-convergence ladder.
+
+    The legs of a ladder are N static solves of ONE setup on ever finer meshes, and they
+    must NOT run at the same time. core/util/resource_governor grants each solve a
+    fraction of the RAM AVAILABLE when it starts, so simultaneous legs shrink each
+    other's budget: observed live, three legs times four ladders launched back-to-back
+    ran as twelve concurrent child processes and every one of them failed for want of
+    memory, while the same meshes solved cleanly one at a time on a quiet machine.
+
+    So exactly one leg is ever in flight, coarse to fine. `pump` is resumable: the
+    synchronous call pumps it under the transport budget, and when that budget runs out
+    the SAME object keeps pumping (deadline `None`) on the background thread, which is
+    why the tail of an overrunning ladder is still sequential.
+    """
+
+    def __init__(
+        self,
+        plan: list,
+        doc_id,
+        monitor: str,
+        tol_pct: float,
+        notes: list,
+        continue_on_fail: bool,
+    ) -> None:
+        self.plan = plan
+        self.doc_id = doc_id
+        self.monitor = monitor
+        self.tol_pct = tol_pct
+        self.notes = notes
+        self.continue_on_fail = continue_on_fail
+        self.rows: list = []
+        self.job_ids: list = []
+        self.prev: Optional[float] = None
+        self.index = 0
+        self.inflight: Optional[str] = None
+        self.stop_reason: Optional[str] = None
+        # Handed to the thread-job table by reference, so get_job() sees the ladder
+        # advance leg by leg instead of one opaque "running".
+        self.progress: dict = {
+            "legs_total": len(plan),
+            "legs_done": 0,
+            "sequential": True,
+            "leg_job_ids": self.job_ids,
+        }
+
+    def pump(self, deadline: Optional[float]) -> Optional[dict]:
+        """Solve the remaining legs IN ORDER; the envelope, or None at the deadline."""
+        while self.index < len(self.plan):
+            step, payload, meta = self.plan[self.index]
+            if self.stop_reason is not None:
+                self._record(_convergence_skipped_row(step, self.stop_reason))
+                continue
+            if self.inflight is None:
+                self.inflight = simjobs.start(
+                    "fea_static", "core_rpc", payload, meta
+                )["job_id"]
+                self.job_ids.append(self.inflight)
+                self.progress["current_leg"] = self.index
+                self.progress["current_job_id"] = self.inflight
+            _jid, out = _convergence_leg_solve(payload, meta, deadline, self.inflight)
+            if out is None:
+                return None  # this leg is still solving; the ladder resumes in background
+            row = _convergence_row(step, out, self.monitor, self.prev)
+            if row.get("error") and not self.continue_on_fail:
+                self.stop_reason = (
+                    f"not solved: leg {self.index} ({_leg_label(step)}) failed and stopped "
+                    f"the ladder — {row['error']}. A finer leg means nothing without the "
+                    "coarser one it is compared against, and its mesh is the more "
+                    "expensive of the two. Pass continue_on_fail=True to solve the "
+                    "remaining legs anyway."
+                )
+            if isinstance(row.get("monitored_value"), (int, float)):
+                self.prev = float(row["monitored_value"])
+            self.inflight = None
+            self._record(row)
+        return self.envelope()
+
+    def _record(self, row: dict) -> None:
+        self.rows.append(row)
+        self.index += 1
+        self.progress["legs_done"] = self.index
+
+    def envelope(self) -> dict:
+        """The finished ladder's verdict, with the leg jobs that produced it."""
+        out = _convergence_envelope(
+            self.doc_id, self.monitor, self.tol_pct, self.rows, self.notes
+        )
+        out["job_ids"] = list(self.job_ids)
+        return out
+
+
+def _convergence_handoff(run: _ConvergenceLadder) -> dict:
+    """Reply for a ladder that finishes in the background: ONE job, legs still in order.
+
+    The legs stay durable child processes (cancellable, restart-surviving), but they are
+    STARTED by this one driver job, so at most one of them exists at a time. The old
+    shape queued every leg at once and returned N job ids — which is exactly how a
+    three-leg study became three simultaneous solves competing for one memory budget.
+    """
+    # Snapshot what is already finished BEFORE the driver thread exists: once it runs it
+    # mutates `rows`/`job_ids` under us, and a reply whose leg list depends on thread
+    # timing is a reply the caller cannot reason about. The LIVE view is `progress`,
+    # which get_job reads by reference.
+    done = len(run.rows)
+    leg_ids = list(run.job_ids)
+    completed = list(run.rows)
+    resources = _resources_line(run.rows)
+    jid = _start_job("fea_convergence", lambda: run.pump(None), run.progress)
+    lead = (
+        f"the first {done} of {len(run.plan)} legs finished inside the call budget; the "
+        "rest continue in ONE background job"
+        if done
+        else f"the whole {len(run.plan)}-leg ladder runs in ONE background job"
+    )
+    return {
+        "ok": True,
+        "doc_id": run.doc_id,
+        "state": "running",
+        "job_id": jid,
+        "monitor": run.monitor,
+        "tol_pct": run.tol_pct,
+        "n_legs": len(run.plan),
+        "legs_done": done,
+        "sequential": True,
+        "leg_job_ids": leg_ids,
+        "completed_legs": completed,
+        "cancel_supported": True,
+        "resources": resources,
+        "note": (
+            f"{lead}. The legs solve STRICTLY ONE AT A TIME, coarse to fine — each is its "
+            "own durable child process, but the next one is not started until the current "
+            f"one is done. Poll get_job('{jid}'): while it runs, `progress` carries "
+            "legs_done / current_job_id / leg_job_ids; when it is done, `result` is the "
+            "WHOLE convergence table. sim_status/sim_cancel take the leg id in "
+            "progress.current_job_id, and cancelling that leg stops the ladder. If this "
+            "server restarts mid-ladder the driver is gone but the legs are not: "
+            "sim_jobs() lists them and run_fea_convergence(job_ids=[...]) rebuilds the "
+            "table from the ones that finished. Do not start another study while this "
+            f"runs: {_RESOURCES_NOTE}"
+        ),
+        "next_actions": [f"get_job('{jid}')"],
+    }
+
+
 def _convergence_from_jobs(job_ids, monitor: str, tol_pct: float) -> dict:
-    """Assemble the table from background legs started by an earlier call.
+    """Assemble the table from ladder legs that are already finished.
+
+    The normal path is `get_job(<ladder job id>)`, which returns the table the sequential
+    driver assembled. This is the recovery path: the leg ids are durable (they outlive the
+    driver, and a restarted server can still collect them), so a ladder whose driver died
+    can be reassembled from `progress.leg_job_ids`.
 
     Each leg is an ordinary durable `fea_static` job, so it collects through exactly the
     same COLLECT stage (and writes exactly one study into the document) as a synchronous
@@ -2805,6 +3128,7 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
         tol_pct: float = _CONVERGENCE_TOL_PCT,
         doc_id: Optional[str] = None,
         background: bool = False,
+        continue_on_fail: bool = False,
         job_ids: Optional[Union[list, str]] = None,
     ) -> str:
         """Mesh-convergence study: ONE static setup solved at N stated discretizations.
@@ -2837,22 +3161,36 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
                    diverges by construction and will never settle.
         tol_pct : convergence tolerance in percent of the previous leg's monitored value
                    (default 5).
-        background : if True, start every leg as its own durable job and return their
-                   job_ids immediately; assemble the table afterwards with
-                   run_fea_convergence(job_ids=[...]). A synchronous call that overruns the
-                   transport budget switches to exactly this shape by itself, so a long
-                   ladder is never lost.
-        job_ids : assemble the table from legs already started (ladder positions come from
-                   the jobs' own metadata, so the order you pass them in does not matter).
-                   fixtures/loads are NOT needed on this call — the setup is already baked
-                   into the jobs. They are required only when starting a new ladder.
+        background : if True, return immediately with the id of ONE background job that
+                   solves the ladder; poll get_job(job_id) and its `result` is the whole
+                   table. A synchronous call that overruns the transport budget switches
+                   to exactly this shape by itself, so a long ladder is never lost.
+        continue_on_fail : by default a failed leg STOPS the ladder and every finer leg is
+                   marked skipped ({"skipped": true}) with the reason — a finer leg is
+                   meaningless without the coarser one it is compared against, and its
+                   mesh is the more expensive of the two. Pass True to solve the rest
+                   anyway (e.g. when the coarse leg failed for a setup reason you have
+                   already ruled out for the finer ones).
+        job_ids : RECOVERY path — assemble the table from legs already finished (ladder
+                   positions come from the jobs' own metadata, so the order you pass them
+                   in does not matter). The leg ids are in the ladder job's
+                   progress.leg_job_ids. fixtures/loads are NOT needed on this call; they
+                   are required only when starting a new ladder.
+
+        THE LEGS ARE SEQUENTIAL and your studies should be too: the engine's memory
+        governor grants each solve a fraction of the RAM AVAILABLE when it starts (not a
+        fixed share of total RAM), so concurrent studies shrink each other's budget until
+        the fine meshes are refused outright. Run ONE ladder at a time; each leg row
+        carries the governor's own numbers in `memory_budget` when the engine reported
+        them, and the reply's `resources` line states the rule.
 
         Returns {ok, monitor, tol_pct, converged, degenerate_ladder, final_delta_pct,
-        n_meshes, table:[{size_mm|fineness, mesh_order, n_dof, n_nodes, n_elems,
-        max_von_mises_mpa, max_disp_mm, min_fos, monitored_value, delta_pct_vs_prev,
-        mesh_quality, equilibrium_error_pct, mesh_governor_notes}]}. `converged` is |the
-        FINEST leg's delta| < tol_pct. A failed leg keeps its row and forces ok:false — a
-        table missing its finest mesh would read as "converged at the coarse end".
+        n_meshes, resources, job_ids, table:[{size_mm|fineness, mesh_order, n_dof,
+        n_nodes, n_elems, max_von_mises_mpa, max_disp_mm, min_fos, monitored_value,
+        delta_pct_vs_prev, mesh_quality, equilibrium_error_pct, mesh_governor_notes,
+        memory_budget}]}. `converged` is |the FINEST leg's delta| < tol_pct. A failed or
+        skipped leg keeps its row and forces ok:false — a table missing its finest mesh
+        would read as "converged at the coarse end".
         `degenerate_ladder:true` means two legs meshed the same (identical n_dof/n_elems,
         or under 5% DOF growth between consecutive legs); converged is then forced false
         and `note` carries the remedy, because a 0% delta between two copies of one mesh
@@ -2897,11 +3235,7 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
                 bc_notes,
             )
             _autosave_all_open()  # R-1 guard: protect every open doc before the solve starts
-            rows: list = []
-            job_ids_out: list = []
-            pending: list = []
-            prev: Optional[float] = None
-            deadline = time.time() + _SYNC_SOLVE_BUDGET_S
+            plan: list = []
             for i, value in enumerate(ladder):
                 study = {**ctx["study"], "mesh_order": mesh_order, key: value}
                 step = {
@@ -2910,59 +3244,27 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
                     "target_size_mm": value if key == "target_size_mm" else None,
                     "fineness": study["fineness"],
                 }
-                leg_meta = _job_meta(
-                    {**ctx, "study": study}, bc_notes, {"convergence_step": step}
-                )
-                payload = {"method": "sim_run_static", "params": {"study": study}}
-                if background or pending:
-                    # Either the caller asked for jobs, or an earlier leg used up the
-                    # transport budget — then every REMAINING leg is queued too, so the
-                    # ladder is collectable as one table instead of half-solved.
-                    jid = simjobs.start("fea_static", "core_rpc", payload, leg_meta)[
-                        "job_id"
-                    ]
-                    job_ids_out.append(jid)
-                    pending.append(jid)
-                    continue
-                jid, out = _convergence_leg_solve(payload, leg_meta, deadline)
-                job_ids_out.append(jid)
-                if out is None:
-                    pending.append(jid)
-                    continue
-                row = _convergence_row(step, out, monitor, prev)
-                if isinstance(row.get("monitored_value"), (int, float)):
-                    prev = float(row["monitored_value"])
-                rows.append(row)
-            if pending:
-                return _dumps(
-                    {
-                        "ok": True,
-                        "doc_id": ctx["doc"],
-                        "state": "running",
-                        "job_ids": job_ids_out,
-                        "pending_job_ids": pending,
-                        "monitor": monitor,
-                        "tol_pct": tol_pct,
-                        "completed_legs": rows,
-                        "cancel_supported": True,
-                        "note": (
-                            f"{len(pending)} of {len(job_ids_out)} convergence legs are "
-                            "solving in SEPARATE processes; the jobs are persisted on disk "
-                            "and survive an MCP restart. Poll sim_status(job_id), then "
-                            "assemble the whole table with run_fea_convergence(job_ids="
-                            "[...]) using job_ids above — every leg, finished ones "
-                            "included; their envelopes are replayed, not re-solved."
+                plan.append(
+                    (
+                        step,
+                        {"method": "sim_run_static", "params": {"study": study}},
+                        _job_meta(
+                            {**ctx, "study": study}, bc_notes, {"convergence_step": step}
                         ),
-                        "next_actions": [
-                            f"sim_status('{pending[0]}')",
-                            f"run_fea_convergence(job_ids={job_ids_out!r}, "
-                            f"monitor='{monitor}')",
-                        ],
-                    }
+                    )
                 )
-            return _dumps(
-                _convergence_envelope(ctx["doc"], monitor, tol_pct, rows, bc_notes)
+            run = _ConvergenceLadder(
+                plan, ctx["doc"], monitor, tol_pct, bc_notes, bool(continue_on_fail)
             )
+            if background:
+                return _dumps(_convergence_handoff(run))
+            out = run.pump(time.time() + _SYNC_SOLVE_BUDGET_S)
+            if out is None:
+                # The ladder outran the transport budget in the middle of a leg. The REST
+                # of it still has to run one leg at a time, so the same driver finishes it
+                # on a background thread instead of queueing every remaining leg at once.
+                return _dumps(_convergence_handoff(run))
+            return _dumps(out)
         except _StudyRefusal as r:
             return _dumps(r.payload)
         except Exception as e:  # noqa: BLE001

@@ -427,3 +427,33 @@ That invalidation is narrowed to the components whose pose the document actually
 non-suppressed mate references; a mated, unfixed component keeps its warm seed, so its authored
 `transform` is an engine-level no-op (re-seeding a mate solve from an off-solution pose converges
 to a different pose rather than back onto the mate solution).
+
+## 9. `feature_status[].data` and the `heal` feature (append-only, 2026-09-05)
+
+`doc_apply_ops` → `rebuild.feature_status[]` gains one field:
+
+| field | type | meaning |
+|---|---|---|
+| `data` | object \| null | structured per-feature RESULT record; `null` for every feature that measures nothing |
+
+`data` is additive and nullable, so every existing reader is unaffected. It is NOT a second
+error channel: `ok`/`error`/`warning` keep their meanings, and `data` only carries measurements
+a caller would otherwise have to re-derive with a follow-up query.
+
+Its first producer is the new `heal` feature (`add_feature` with `feature.type = "heal"`, params
+in [feature_params.md](feature_params.md#heal)), which runs OCCT ShapeFix over a body and
+replaces it in place:
+
+```json
+{"id": "f3", "ok": true, "warning": null,
+ "data": {"fixed": true,
+          "before": {"valid": false, "issues": ["bad_orientation_of_subshape"]},
+          "after":  {"valid": true,  "issues": []},
+          "volume_before": 24000.0, "volume_after": 24000.0,
+          "tolerance": 1e-07, "fix_small_edges": false}}
+```
+
+A repair is only real if it is part of the feature tree: `heal` is recorded, re-runs on every
+rebuild, and its before/after BRepCheck verdict is the evidence. Repairing a body outside the
+tree (a BREP/STL round-trip, a boolean with itself) is not a repair — nothing downstream can
+tell what was changed, and the next rebuild loses it.

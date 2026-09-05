@@ -48,6 +48,10 @@ struct MeshOut {
   int nodes_per_elem = 4; // 4 (tet4) or 10 (tet10)
   double min_tet_volume_mm3 = 0.0;
   double max_tet_edge_ratio = 0.0;
+  // Elements whose projected tet10 mid-edge nodes folded the quadratic map and
+  // were reverted to their straight-edge midpoints (see
+  // detail::repair_folded_quadratic). 0 for tet4 and for a clean tet10 mesh.
+  int quadratic_fallback_elems = 0;
 
   double aspect_min = 0.0;
   double aspect_avg = 0.0;
@@ -103,6 +107,24 @@ void mesh_cache_note_generation();
 
 namespace detail {
 bool fill_quality(MeshOut &out);
+
+// Element-local straight-edge fallback for a promoted+projected tet10 mesh.
+//
+// Projecting free-surface mid-edge nodes onto the exact BRep is what lets a
+// quadratic element follow a bore or a fillet, but when the element size is
+// comparable to the wall thickness or the curvature radius the projection can
+// push a mid node far enough to FOLD the element: the quadratic Jacobian
+// changes sign inside it, or one of its tri6 faces reverses. Such a mesh is
+// refused downstream ("invalid or folded quadratic boundary face"), which used
+// to force the whole study back to tet4.
+//
+// This reverts the mid-edge nodes of ONLY the folded elements to the midpoint
+// of their straight chord — those elements lose the curved geometry, the rest
+// of the mesh keeps it. Reverting a shared mid node can in principle unfold one
+// neighbour and fold another, so the sweep repeats until it converges (bounded).
+// Returns the number of elements that took the fallback, and records it in
+// out.quadratic_fallback_elems. A no-op for tet4.
+int repair_folded_quadratic(MeshOut &out);
 } // namespace detail
 
 // Error-driven refinement wrapper. Chudware keeps its solver and uses

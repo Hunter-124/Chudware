@@ -1371,6 +1371,21 @@ if(CHUDWARE_WITH_OCCT)
     set_tests_properties(mesher_advanced PROPERTIES RUN_SERIAL TRUE
       ENVIRONMENT_MODIFICATION "${_fea_envmod}")
 
+    # Thin-wall tet10: mid-edge projection folds elements when the element size
+    # is comparable to the wall thickness, which used to refuse the whole study
+    # ("invalid or folded quadratic boundary face") and force it back to tet4.
+    add_executable(test_tet10_thin_wall tests/test_tet10_thin_wall.cpp)
+    target_include_directories(test_tet10_thin_wall PRIVATE
+      ${doctest_SOURCE_DIR} ${OpenCASCADE_INCLUDE_DIR})
+    target_link_libraries(test_tet10_thin_wall PRIVATE
+      chudware_mesh chudware_geom_occt)
+    set_target_properties(test_tet10_thin_wall PROPERTIES
+      RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+    chudware_polymesh_stage_runtime(test_tet10_thin_wall)
+    add_test(NAME tet10_thin_wall COMMAND test_tet10_thin_wall)
+    set_tests_properties(tet10_thin_wall PROPERTIES RUN_SERIAL TRUE
+      ENVIRONMENT_MODIFICATION "${_fea_envmod}")
+
     add_executable(test_sim_cache tests/test_sim_cache.cpp)
     target_include_directories(test_sim_cache PRIVATE
       ${doctest_SOURCE_DIR} ${OpenCASCADE_INCLUDE_DIR})

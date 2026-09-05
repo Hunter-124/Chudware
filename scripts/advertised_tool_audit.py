@@ -182,6 +182,10 @@ NON_TOOL_MENTIONS: dict[str, tuple[str, tuple[str, ...]]] = {
         "response field of check_geometry_health, not a tool",
         ("services/agent/tool_guidance/cad.py",),
     ),
+    "remaining_issues": (
+        "response field of heal_body (the defects ShapeFix did NOT clear), not a tool",
+        ("services/agent/tool_guidance/cad.py",),
+    ),
     "drill_min": ("ecad DRC rule key", ("*",)),
     "power_in": ("power_budget input key", ("*",)),
     "power_out": ("power_budget response field (paired with power_in)", ("*",)),

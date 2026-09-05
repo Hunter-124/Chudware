@@ -630,6 +630,24 @@ bool build_mesh(const LoadedModel &loaded, const MeshOptions &options, double h,
   out.nodes_per_elem = stride;
   out.mesh_type_used = stride == 10 ? "tet10" : "tet4";
   append_note(out.note, volume.mesher_note);
+  // Element-local straight-edge fallback for mid-edge projections that folded
+  // their element. On a thin wall (element size comparable to the wall
+  // thickness or the curvature radius) a handful of elements always fold, and
+  // before this every one of them cost the whole study its quadratic order.
+  // `nodal` is kept in sync: the adaptive driver solves against MeshOut but
+  // recovers/refines through the polymesh mesh, and the two must describe the
+  // same geometry.
+  if (stride == 10 && detail::repair_folded_quadratic(out) > 0) {
+    for (size_t i = 0; i < nodal.nodes.size(); ++i) {
+      nodal.nodes[i].x() = out.points[3 * i + 0];
+      nodal.nodes[i].y() = out.points[3 * i + 1];
+      nodal.nodes[i].z() = out.points[3 * i + 2];
+    }
+    append_note(out.note,
+                std::to_string(out.quadratic_fallback_elems) +
+                    " tet10 element(s) kept straight mid-edge nodes (projected "
+                    "mids folded them)");
+  }
   if (!detail::fill_quality(out)) {
     out.ok = false; // fill_quality set the diagnostic
     return false;
@@ -825,6 +843,7 @@ bool mesh_separate_solids(const std::vector<TopoDS_Shape> &solids,
       combined.tets.push_back(node + node_offset);
     combined.n_nodes += part.n_nodes;
     combined.n_elems += part.n_elems;
+    combined.quadratic_fallback_elems += part.quadratic_fallback_elems;
     combined.char_len_mm = std::min(combined.char_len_mm, part.char_len_mm);
     append_note(combined.note, part.note);
     if (!combined.advisor && part.advisor)

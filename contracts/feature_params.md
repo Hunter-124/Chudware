@@ -539,3 +539,36 @@ committed until OK; Cancel restores via worker undo of the preview op).
   with a warning — it is the way to place an at-origin component explicitly.
 - errors (contained): no `body` ref and no current body; a rotation with a zero-length axis; an
   empty result shape.
+
+## Geometry repair (append-only, 2026-09-05)
+
+### `heal`
+A RECORDED ShapeFix repair of a broken body. Exists because a topologically invalid solid — the
+motivating case was an imported STEP spine failing `check_geometry_health` with
+`bad_orientation_of_subshape` — previously had no op at all, so the only moves available were
+booleans, BREP round-trips and STL sewing: all wrong, all lossy, none recorded. The repair must
+be a feature so it re-runs on every rebuild and is auditable; **never analyze an unrecorded
+repair**.
+- params (both optional): `tolerance: dim` (mm, default `1e-7` = OCCT `Precision::Confusion`;
+  raise to `0.01`–`0.1` for a coarse import whose gaps are real) · `fix_small_edges: bool`
+  (false — also runs `ShapeFix_Wireframe` to drop tiny edges and close wire gaps; opt-in
+  because it REMOVES topology)
+- `body: str?` — a top-level feature id read by the compiler (not a ref slot), defaulting to the
+  current running body; sub-body ids (`"<fid>#k"`) work as for `transform`.
+- pipeline: `ShapeFix_Shape` (precision = `tolerance`, max tolerance = `max(100*tolerance, 0.01)`)
+  → optional `ShapeFix_Wireframe` → `ShapeFix_Solid` on each solid (the shell-orientation pass
+  that fixes `bad_orientation_of_subshape`; a compound of solids is rebuilt from the healed
+  members). `BRepCheck_Analyzer` runs before and after.
+- semantics: the healed body REPLACES the input (`copy:false` semantics, exactly like
+  `transform`) — the source id is consumed and superseded, so a later `transform`/`heal` composes
+  on the healed result. Leaving the broken original alive would keep exporting the broken one.
+- result record — `feature_status[].data`:
+  `{fixed: bool, before: {valid: bool, issues: [str]}, after: {valid: bool, issues: [str]},`
+  `volume_before: float, volume_after: float, tolerance: float, fix_small_edges: bool}`.
+  `issues[]` are BRepCheck status NAMES (`bad_orientation_of_subshape`, `not_closed`,
+  `free_edge`, …), de-duplicated in first-seen order; `fixed` is true only when the body was
+  invalid before and is valid after.
+- never regresses a body: if the input was already BRep-valid and ShapeFix made it worse, the
+  body is left UNCHANGED with a warning. A partial repair (invalid before AND after) succeeds
+  and warns, naming the residual issue count.
+- errors (contained): no `body` ref and no current body; `tolerance <= 0`; an empty result shape.

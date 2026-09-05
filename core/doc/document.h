@@ -58,6 +58,11 @@ struct FeatureStatus {
     // instead of recompiled (see CompileCache below). `ms` then reports the ORIGINAL compile
     // cost from the run that produced it, not this run's (near-zero) restore cost.
     bool reused = false;
+    // Structured per-feature RESULT record, surfaced as `feature_status[].data`. Null for
+    // every feature that has nothing measured to report; `heal` uses it to carry its
+    // before/after BRepCheck verdict + volumes, which is the evidence that makes a repair
+    // auditable instead of a claim.
+    nlohmann::json data = nullptr;
 };
 
 // Per-surviving-body geometry stats (in AICM body order). Additive surfacing gate

@@ -25,8 +25,24 @@ ENTRIES: dict[str, dict[str, Any]] = {
             "export. `self_intersection` is always checked:false — the "
             "kernel has no single-body test; use check_interference "
             "instead. `volume_mm3` is null for a body with no solid. "
-            "repair/fill_holes/fix_normals/fix_winding are REFUSED: fix the "
-            "feature that made the bad body, using the sids it just listed."
+            "repair/fill_holes/fix_normals/fix_winding are REFUSED here: for "
+            "a body YOUR features made, fix the feature using the sids it "
+            "just listed; for an IMPORTED body that arrived broken, call "
+            "heal_body (a recorded ShapeFix repair)."
+        ),
+    },
+    "heal_body": {
+        "prompt_note": (
+            "The repair check_geometry_health refuses — use it ONLY on a body "
+            "that arrived broken from an import (bad_orientation_of_subshape, "
+            "not_closed, free_edge, negative volume). It appends a RECORDED "
+            "`heal` feature (OCCT ShapeFix), so never 'repair' geometry with a "
+            "BREP/STL round-trip or a self-boolean instead. `target` is a "
+            "feature id/name or a 1-based body number; omit for a single-body "
+            "part. Read `fixes` and `remaining_issues` — a partial repair says "
+            "so, and raising tolerance_mm (0.01-0.1) is the retry. A defect your "
+            "OWN features caused must be fixed at the feature; healing over it "
+            "returns on the next parameter edit."
         ),
     },
     "design_audit": {

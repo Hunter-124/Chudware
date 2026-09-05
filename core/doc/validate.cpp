@@ -218,6 +218,10 @@ const std::map<string, FeatureSpec> FEATURE_TYPES = {
     // transform: move/rotate a body. No required params (translate and/or angle+rotate), no ref
     // slots — the optional target `body` is a top-level feature id read by the compiler, not a ref.
     {"transform", {{}, {}}},
+    // heal: ShapeFix repair of a broken/imported body. No required params (tolerance and
+    // fix_small_edges are optional), no ref slots — the optional target `body` is a
+    // top-level feature id read by the compiler, not a ref (same shape as transform).
+    {"heal", {{}, {}}},
     {"boolean", {{"op"}, {{"targets", RefForm::SelList, true},
                           {"tools", RefForm::SelList, false}}}},
     {"sm_base_flange", {{}, {{"profile", RefForm::SelList, true}}}},

@@ -28,6 +28,11 @@
 #include <nlohmann/json.hpp>
 
 #include <BRep_Tool.hxx>                                  // seam/degenerate edge test (S1/S2)
+#include <BRep_Builder.hxx>                                // heal: craft a reversed-face solid
+#include <BRepPrimAPI_MakeBox.hxx>                         // heal: the box to corrupt
+#include <BRepTools.hxx>                                   // heal: write the broken .brep
+#include <TopoDS_Shell.hxx>
+#include <TopoDS_Solid.hxx>
 #include <BRepBndLib.hxx>                                  // exact kernel bbox (axis cases)
 #include <Bnd_Box.hxx>
 #include <BRepCheck_Analyzer.hxx>                          // thread cut B-rep validity (case 12)
@@ -4592,4 +4597,152 @@ TEST_CASE("zero-volume boss: reports what was observed, not one asserted cause")
         // The decisive fact REPLACES the speculative list — no plane story here.
         CHECK(err.find("plane.top") == std::string::npos);
     }
+}
+
+// ===========================================================================
+// `heal` — the RECORDED ShapeFix repair (core/doc/document.cpp).
+//
+// The live defect: an imported STEP frame spine failed check_geometry_health with
+// bad_orientation_of_subshape, and because no repair op existed the agent tried
+// booleans, BREP round-trips and STL sewing in turn. Reproduced exactly here by
+// reversing ONE face inside a box's shell — the same BRepCheck verdict, on geometry
+// whose volume is known to the last decimal.
+//
+// The corruption is measurable in two independent ways, and the test pins both: the
+// reversal makes BRepCheck report the shape INVALID, and it makes OCCT's volume
+// integral read 16000 mm^3 instead of the true 24000 — i.e. any mass/CG/inertia
+// number quoted off the broken body is 33% wrong. A real repair must clear the
+// BRepCheck verdict AND restore the exact analytic volume; a "repair" that rebuilt,
+// sewed or dropped geometry would miss 24000.
+TEST_CASE("heal: ShapeFix repairs a reversed-face solid and records the evidence") {
+    using chudware::doc::doc_apply_ops;
+    using chudware::doc::doc_new;
+    namespace fs = std::filesystem;
+    auto dimv = [](double v) { return json{{"value", v}, {"expr", nullptr}}; };
+
+    const double LX = 20.0, LY = 30.0, LZ = 40.0;
+    const double NOMINAL = LX * LY * LZ;  // 24000 mm^3
+    auto volume_of = [](const TopoDS_Shape& s) {
+        GProp_GProps p;
+        BRepGProp::VolumeProperties(s, p);
+        return p.Mass();
+    };
+
+    // A fresh box with face #k of its shell stored REVERSED. Fresh every call: the
+    // builder edits the shared TShape, so reusing one box would stack corruptions.
+    auto broken_box = [&](int k) -> TopoDS_Shape {
+        TopoDS_Shape box = BRepPrimAPI_MakeBox(LX, LY, LZ).Shape();
+        TopExp_Explorer sh(box, TopAbs_SHELL);
+        REQUIRE(sh.More());
+        TopoDS_Shell shell = TopoDS::Shell(sh.Current());
+        // A shell owned by a solid is FROZEN; TopoDS_Builder raises TopoDS_FrozenShape
+        // on Add/Remove until the free flag is set.
+        shell.Free(Standard_True);
+        int i = 0;
+        for (TopExp_Explorer fe(shell, TopAbs_FACE); fe.More(); fe.Next(), ++i) {
+            if (i != k) continue;
+            const TopoDS_Face face = TopoDS::Face(fe.Current());
+            BRep_Builder bb;
+            bb.Remove(shell, face);
+            bb.Add(shell, face.Reversed());
+            return box;
+        }
+        return TopoDS_Shape();
+    };
+
+    // Reverse the first face. Every face of the box behaves identically (verified: each
+    // reversal costs exactly V/3 of the integral), so there is no special one to hunt for
+    // — but the reversal MUST actually break the shape, or the test would prove nothing.
+    const TopoDS_Shape broken = broken_box(0);
+    REQUIRE(!broken.IsNull());
+    REQUIRE_MESSAGE(!BRepCheck_Analyzer(broken).IsValid(),
+                    "reversing a face must make the solid BRep-invalid");
+    const double BROKEN_VOL = volume_of(broken);
+    REQUIRE_MESSAGE(std::abs(BROKEN_VOL - NOMINAL) > 1.0,
+                    "the reversed face must also corrupt the measured volume, got "
+                        << BROKEN_VOL);
+
+    const fs::path brep_path =
+        fs::temp_directory_path() / "chudware_heal_reversed_face.brep";
+    REQUIRE(BRepTools::Write(broken, brep_path.string().c_str()));
+
+    // --- the defect really survives the import, and heal clears it -------------
+    {
+        const std::string id = doc_new("part", "HealReversedFace").at("doc_id").get<std::string>();
+        json ops = json::array({
+            json{{"op", "add_feature"}, {"feature",
+                json{{"type", "import"}, {"name", "Spine"},
+                     {"params", {{"source_path", brep_path.string()}, {"format", "brep"}}}}}},
+            json{{"op", "add_feature"}, {"feature",
+                json{{"type", "heal"}, {"name", "Heal"}, {"params", json::object()}}}},
+        });
+        json resp = doc_apply_ops(id, -1, ops, false);
+        const json& rows = resp.at("rebuild").at("feature_status");
+        REQUIRE(rows.size() == 2);
+        REQUIRE_MESSAGE(rows[0].value("ok", false),
+                        "the broken .brep must import: " << status_err(rows[0]));
+        REQUIRE_MESSAGE(rows[1].value("ok", false),
+                        "heal must succeed: " << status_err(rows[1]));
+
+        const json data = rows[1].at("data");
+        REQUIRE_MESSAGE(data.is_object(), "heal must record its result: " << rows[1].dump());
+        MESSAGE("heal record -> " << data.dump());
+
+        // The defect arrived intact (nothing upstream quietly fixed it) and it is the
+        // orientation defect the live run hit, named, not a bare "invalid".
+        CHECK_FALSE(data.at("before").at("valid").get<bool>());
+        const json& before_issues = data.at("before").at("issues");
+        REQUIRE(before_issues.is_array());
+        CHECK(before_issues.size() >= 1);
+        bool named_orientation = false;
+        for (const json& s : before_issues)
+            if (s.get<std::string>().find("orientation") != std::string::npos)
+                named_orientation = true;
+        CHECK_MESSAGE(named_orientation,
+                      "before.issues must name the orientation defect: "
+                          << before_issues.dump());
+
+        // The repair itself.
+        CHECK(data.at("after").at("valid").get<bool>());
+        CHECK(data.at("after").at("issues").empty());
+        CHECK(data.at("fixed").get<bool>());
+        // The recorded volumes ARE the evidence: the broken body measured wrong, and the
+        // healed one is the exact analytic box (1e-6, not a loose epsilon — a repair that
+        // rebuilt/sewed/dropped geometry would not land on 24000).
+        CHECK(std::abs(data.at("volume_before").get<double>() - BROKEN_VOL) < 1e-6);
+        CHECK(std::abs(data.at("volume_after").get<double>() - NOMINAL) < 1e-6);
+
+        // The healed body REPLACED the input: one surviving body, still one solid.
+        json bbox = chudware::doc::doc_bbox(id);
+        CHECK(bbox.at("max")[0].get<double>() == doctest::Approx(LX));
+        CHECK(bbox.at("max")[2].get<double>() == doctest::Approx(LZ));
+    }
+
+    // --- control: heal on an ALREADY-VALID body claims no fix and changes nothing --
+    // Without this, a verdict hard-coded to "fixed" would pass the case above.
+    {
+        const std::string id = doc_new("part", "HealHealthyBox").at("doc_id").get<std::string>();
+        json ops = json::array({
+            json{{"op", "add_feature"}, {"feature",
+                json{{"type", "box"}, {"name", "Blk"},
+                     {"params", {{"length", dimv(LX)}, {"width", dimv(LY)},
+                                 {"height", dimv(LZ)}}}}}},
+            json{{"op", "add_feature"}, {"feature",
+                json{{"type", "heal"}, {"name", "Heal"}, {"params", json::object()}}}},
+        });
+        json resp = doc_apply_ops(id, -1, ops, false);
+        const json& rows = resp.at("rebuild").at("feature_status");
+        REQUIRE(rows.size() == 2);
+        REQUIRE_MESSAGE(rows[1].value("ok", false),
+                        "heal on a sound body must succeed: " << status_err(rows[1]));
+        const json data = rows[1].at("data");
+        REQUIRE(data.is_object());
+        CHECK(data.at("before").at("valid").get<bool>());
+        CHECK(data.at("after").at("valid").get<bool>());
+        CHECK_FALSE(data.at("fixed").get<bool>());  // nothing was wrong: nothing was "fixed"
+        CHECK(data.at("volume_after").get<double>() == doctest::Approx(NOMINAL));
+    }
+
+    std::error_code ec;
+    fs::remove(brep_path, ec);
 }

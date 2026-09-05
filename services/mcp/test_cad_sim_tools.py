@@ -1493,3 +1493,211 @@ def test_a_failed_durable_job_is_reported_as_an_error_not_an_empty_result(
     assert snapshot["status"] == "error", snapshot
     assert snapshot["error"] == "the solver process exited", snapshot
     assert "result" not in snapshot
+
+
+# ------------------------------------------------------- the convergence ladder is SEQUENTIAL
+# Measured live: a three-leg ladder started its legs as three simultaneous durable jobs, and
+# four ladders launched back-to-back put twelve solves on the machine at once. The memory
+# governor (core/util/resource_governor) budgets a fraction of the RAM AVAILABLE at solve
+# time, so the legs starved each other and every one of them failed — the same meshes solved
+# cleanly one at a time. These tests pin the ordering, not a timing.
+
+_GOVERNOR_PLAN_NOTE = (
+    "governor: plan what=fea_solver workers=6/6 reserve=0.10GB budget=9.42GB rss=1.20GB "
+    "avail=13.60GB total=31.00GB pressure=0.00 admitted=1 knobs=CHUDWARE_MEM_FRAC")
+
+_GOVERNOR_REFUSAL = (
+    "static FEA solve needs an estimated 20.5 GB but this machine's budget is 9.4 GB "
+    "(31 GB RAM, 13.6 GB available) — use a coarser mesh / fewer cells / first-order "
+    "elements, or raise CHUDWARE_MEM_FRAC / CHUDWARE_MEM_CAP_GB")
+
+
+class _LegStub:
+    """A fake durable-job backend that REFUSES to run two legs at once.
+
+    `start` asserts every previously started leg has already reached a terminal state, so
+    a ladder that queues its legs up front fails here instead of in a live study. Each leg
+    reports RUNNING for two polls before it settles, so "sequential" cannot be an artifact
+    of instant completion.
+    """
+
+    def __init__(self, monkeypatch, peaks: dict, fail: dict | None = None):
+        self.peaks = peaks              # leg index -> monitored von Mises value
+        self.fail = fail or {}          # leg index -> error string
+        self.events: list = []          # ("start"|"done", leg index)
+        self.jobs: dict = {}            # job id -> {"index", "state", "polls"}
+        monkeypatch.setattr(simjobs, "start", self._start)
+        monkeypatch.setattr(simjobs, "status", self._status)
+        monkeypatch.setattr(sim_tools, "collect_durable", self._collect)
+
+    def _start(self, kind, stage, payload, meta=None):
+        live = [j for j in self.jobs.values() if j["state"] not in simjobs.TERMINAL]
+        assert not live, f"a leg was started while {live} was still solving"
+        index = (meta or {})["convergence_step"]["index"]
+        job_id = f"sim-leg{index}"
+        self.jobs[job_id] = {"index": index, "state": simjobs.RUNNING, "polls": 0}
+        self.events.append(("start", index))
+        return {"job_id": job_id, "state": "running", "kind": kind, "stage": stage}
+
+    def _status(self, job_id):
+        job = self.jobs[job_id]
+        job["polls"] += 1
+        if job["polls"] > 2 and job["state"] == simjobs.RUNNING:
+            job["state"] = simjobs.DONE
+            self.events.append(("done", job["index"]))
+        return {"state": job["state"], "meta": {}}
+
+    def _collect(self, job_id, st=None):
+        index = self.jobs[job_id]["index"]
+        if index in self.fail:
+            return {"ok": False, "doc_id": "doc-1", "error": self.fail[index]}
+        return {"ok": True, "doc_id": "doc-1", "n_dof": 3000 * (index + 1),
+                "n_nodes": 1000 * (index + 1), "n_elems": 900 * (index + 1),
+                "mesh": "tet10", "solver_notes": [_GOVERNOR_PLAN_NOTE],
+                "summary": {"max_von_mises_mpa": self.peaks[index],
+                            "max_disp_mm": 0.04, "min_fos": 12.0}}
+
+    @property
+    def starts(self) -> list:
+        return [i for kind, i in self.events if kind == "start"]
+
+
+@pytest.fixture()
+def ladder_setup(tmp_path, monkeypatch):
+    """The convergence tool with its setup stage and autosave stubbed out."""
+    monkeypatch.setattr(sim_tools, "_build_static_study",
+                        lambda *a, **kw: _static_ctx(tmp_path))
+    monkeypatch.setattr(sim_tools, "_autosave_all_open", lambda: None)
+    return tmp_path
+
+
+def test_convergence_legs_solve_one_at_a_time_coarse_to_fine(
+        ladder_setup, monkeypatch, tools):
+    """Leg i+1 must not START until leg i is terminal — the whole point of the fix."""
+    stub = _LegStub(monkeypatch, {0: 100.0, 1: 104.0, 2: 105.0})
+    out = json.loads(tools["run_fea_convergence"](
+        fixtures=["bottom"], loads=[{"face": "top", "force": [0, 0, -200]}],
+        sizes_mm=[4, 2, 1]))
+
+    assert stub.events == [("start", 0), ("done", 0), ("start", 1), ("done", 1),
+                           ("start", 2), ("done", 2)], stub.events
+    assert [r["size_mm"] for r in out["table"]] == [4, 2, 1], out["table"]
+    assert out["ok"] is True and out["n_meshes"] == 3, out
+    assert out["converged"] is True, out            # last delta ~0.96% < 5%
+    assert out["job_ids"] == ["sim-leg0", "sim-leg1", "sim-leg2"], out
+
+
+def test_each_leg_row_carries_the_governors_own_memory_decision(
+        ladder_setup, monkeypatch, tools):
+    """The agent that starved this study believed the budget was ~70% of TOTAL RAM. The
+    governor's numbers are on the row, and the rule is in the reply."""
+    _LegStub(monkeypatch, {0: 100.0, 1: 104.0, 2: 105.0})
+    out = json.loads(tools["run_fea_convergence"](
+        fixtures=["bottom"], loads=[{"face": "top", "force": [0, 0, -200]}],
+        sizes_mm=[4, 2, 1]))
+
+    for row in out["table"]:
+        assert row["memory_budget"] == {"budget_gb": 9.42, "avail_gb": 13.6,
+                                        "total_gb": 31.0, "workers": 6}, row
+    assert "budget 9.42 GB" in out["resources"], out["resources"]
+    assert "available 13.60 GB" in out["resources"], out["resources"]
+    assert "RAM AVAILABLE" in out["resources"] and "ONE LADDER" in out["resources"]
+
+
+def test_a_failed_leg_stops_the_ladder_and_the_finer_legs_are_marked_skipped(
+        ladder_setup, monkeypatch, tools):
+    """A finer mesh is both unreadable without its coarser reference and the more
+    expensive solve, so a mid-ladder failure must not be followed by another attempt."""
+    stub = _LegStub(monkeypatch, {0: 100.0, 2: 105.0}, fail={1: _GOVERNOR_REFUSAL})
+    out = json.loads(tools["run_fea_convergence"](
+        fixtures=["bottom"], loads=[{"face": "top", "force": [0, 0, -200]}],
+        sizes_mm=[4, 2, 1]))
+
+    assert stub.starts == [0, 1], stub.events   # the 1 mm leg was never started
+    assert out["ok"] is False and out["converged"] is False, out
+    assert out["skipped_legs"] == [2], out
+    third = out["table"][2]
+    assert third["skipped"] is True and third["size_mm"] == 1, third
+    assert "stopped the ladder" in third["error"], third
+    assert "continue_on_fail=True" in third["error"], third
+    assert "rows [1]" in out["error"] and "rows [2]" in out["error"], out["error"]
+    # The refused leg's row explains itself with the governor's own arithmetic.
+    assert out["table"][1]["memory_budget"] == {
+        "budget_gb": 9.4, "total_gb": 31.0, "avail_gb": 13.6, "estimate_gb": 20.5}
+
+
+def test_continue_on_fail_solves_the_remaining_legs_after_a_failure(
+        ladder_setup, monkeypatch, tools):
+    stub = _LegStub(monkeypatch, {0: 100.0, 2: 105.0}, fail={1: _GOVERNOR_REFUSAL})
+    out = json.loads(tools["run_fea_convergence"](
+        fixtures=["bottom"], loads=[{"face": "top", "force": [0, 0, -200]}],
+        sizes_mm=[4, 2, 1], continue_on_fail=True))
+
+    assert stub.starts == [0, 1, 2], stub.events
+    assert out["ok"] is False and "skipped_legs" not in out, out
+    assert [bool(r.get("skipped")) for r in out["table"]] == [False, False, False], out
+    assert out["table"][2]["monitored_value"] == 105.0, out["table"][2]
+
+
+def test_background_ladder_is_one_job_whose_legs_still_run_in_order(
+        ladder_setup, monkeypatch, tools):
+    """background=True returns immediately, but the ladder is ONE driver job that starts
+    each leg only after the previous one finished — not N legs queued at once."""
+    stub = _LegStub(monkeypatch, {0: 100.0, 1: 104.0, 2: 105.0})
+    reply = json.loads(tools["run_fea_convergence"](
+        fixtures=["bottom"], loads=[{"face": "top", "force": [0, 0, -200]}],
+        sizes_mm=[4, 2, 1], background=True))
+
+    jid = reply["job_id"]
+    assert jid.startswith("job-") and reply["state"] == "running", reply
+    assert reply["n_legs"] == 3 and reply["sequential"] is True, reply
+    assert reply["legs_done"] == 0 and reply["leg_job_ids"] == [], reply
+    assert "ONE AT A TIME" in reply["note"], reply["note"]
+    assert f"get_job('{jid}')" in reply["next_actions"], reply
+
+    snap = _await_ladder_job(jid)
+    assert snap["status"] == "done", snap
+    assert snap["progress"]["legs_done"] == 3, snap["progress"]
+    assert snap["progress"]["leg_job_ids"] == ["sim-leg0", "sim-leg1", "sim-leg2"]
+    assert stub.events == [("start", 0), ("done", 0), ("start", 1), ("done", 1),
+                           ("start", 2), ("done", 2)], stub.events
+    table = snap["result"]["table"]
+    assert [r["size_mm"] for r in table] == [4, 2, 1], table
+    assert snap["result"]["converged"] is True, snap["result"]
+
+
+def _await_ladder_job(job_id: str, timeout_s: float = 30.0) -> dict:
+    """The finished record of a background ladder driver job."""
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        with cad_common._JOB_LOCK:
+            snap = dict(cad_common._JOBS[job_id])
+        if snap["status"] != "running":
+            return snap
+        time.sleep(0.05)
+    pytest.fail(f"the background ladder {job_id} never finished")
+
+
+def test_a_ladder_that_outruns_the_call_budget_keeps_solving_its_legs_in_order(
+        ladder_setup, monkeypatch, tools):
+    """The old handoff queued EVERY remaining leg as its own job the moment the sync
+    budget expired — three simultaneous solves from one call. Now the same sequential
+    driver finishes the ladder, re-attaching to the leg that was already in flight."""
+    monkeypatch.setattr(sim_tools, "_SYNC_SOLVE_BUDGET_S", 0.01)
+    stub = _LegStub(monkeypatch, {0: 100.0, 1: 104.0, 2: 105.0})
+    reply = json.loads(tools["run_fea_convergence"](
+        fixtures=["bottom"], loads=[{"face": "top", "force": [0, 0, -200]}],
+        sizes_mm=[4, 2, 1]))
+
+    # Handed off mid-leg: exactly ONE leg exists, and it is not re-queued.
+    assert reply["state"] == "running" and reply["legs_done"] == 0, reply
+    assert reply["leg_job_ids"] == ["sim-leg0"], reply
+    assert "rest continue in ONE background job" in reply["note"] or \
+           "runs in ONE background job" in reply["note"], reply["note"]
+
+    snap = _await_ladder_job(reply["job_id"])
+    assert snap["status"] == "done", snap
+    assert stub.events == [("start", 0), ("done", 0), ("start", 1), ("done", 1),
+                           ("start", 2), ("done", 2)], stub.events
+    assert [r["size_mm"] for r in snap["result"]["table"]] == [4, 2, 1]
+    assert snap["result"]["job_ids"] == ["sim-leg0", "sim-leg1", "sim-leg2"], snap

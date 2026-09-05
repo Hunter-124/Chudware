@@ -3952,6 +3952,9 @@ json ops_response(Session& s, const CompileResult& r, const json& id_map, bool w
                       {"reused", st.reused},  // served from the incremental-rebuild cache
                       {"error", st.ok ? json(nullptr) : json(st.error)},
                       {"warning", st.warning.empty() ? json(nullptr) : json(st.warning)},
+                      // Structured result record (heal's before/after verdict + volumes);
+                      // null for features that measure nothing.
+                      {"data", st.data},
                       {"dangling_refs", json::array()},
                       {"rolled_back", false}});
     }

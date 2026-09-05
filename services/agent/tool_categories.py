@@ -133,6 +133,10 @@ CATEGORY_PACKS: dict[str, list[str]] = {
         # Displaced from the capped `family:cad` expansion by the 2026-08-26
         # drawing-overhaul registrations — see the modeling pack note.
         "check_geometry_health",
+        # The repair half of the health pair: check_geometry_health diagnoses and refuses
+        # to fix, heal_body records the ShapeFix repair as a feature. Same pack, because a
+        # model that just got an unsound verdict needs the fix in the same breath.
+        "heal_body",
         # Named in prose, previously in no pack: doc_diff_tool is what the doc-compare
         # guidance points at, and the engine_profile pair is how a slow rebuild gets
         # diagnosed instead of guessed at.

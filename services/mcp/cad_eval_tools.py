@@ -32,12 +32,16 @@ from .cad_common import (
     _err,
     _ideal_views,
     _palette_caption_block,
+    _publish_current,
     _reading_from_measure,
     _render_view_png,
+    _resolve_feature_ref,
     _resolve_material,
     _resolve_measure_target,
     _resolve_one_selector,
+    _roster_text,
     _target_bbox,
+    _target_feature_roster,
     already_resolved_selector,
     is_geom_query,
     normalize_geom_query,
@@ -1905,12 +1909,15 @@ def register_cad_eval_tools(mcp: FastMCP) -> None:
                     "refused": (
                         f"{called_as}({'=True, '.join(asked_repair)}=True) — NOT done, and "
                         "nothing was changed. This is a parametric B-rep kernel, not a mesh "
-                        "repairer: there is no hole-filling / normal-flipping pass to run, "
-                        "and bolting one on would hide the real defect in your feature tree. "
-                        "Fix the FEATURE that produced the bad body — the findings above name "
-                        "the offending edge/face sids; hover(sid) or measure them, then edit "
-                        "(add_features op=edit_feature) or delete the feature responsible and "
-                        "re-run this check.")}
+                        "repairer: there is no hole-filling / normal-flipping pass to run "
+                        "HERE, and bolting one on would hide the real defect in your feature "
+                        "tree. Fix the FEATURE that produced the bad body — the findings "
+                        "above name the offending edge/face sids; hover(sid) or measure "
+                        "them, then edit (add_features op=edit_feature) or delete the "
+                        "feature responsible and re-run this check. The ONE exception is a "
+                        "body that arrived broken from an IMPORT (no feature of yours "
+                        "authored it): heal_body(doc_id) records an OCCT ShapeFix repair as "
+                        "a feature and reports what it cleared.")}
 
             heads = []
             if asked_repair:
@@ -1974,7 +1981,9 @@ def register_cad_eval_tools(mcp: FastMCP) -> None:
         repair / fill_holes / fix_normals / fix_winding : accepted so the trimesh-style call
           you were about to write does not die on an unknown argument — but they are REFUSED,
           not performed. This is a parametric B-rep kernel: the fix for a bad body is to fix
-          the FEATURE that produced it, which the findings point you at.
+          the FEATURE that produced it, which the findings point you at. For a body that
+          arrived broken from an IMPORT — no feature of yours authored it — call heal_body,
+          which records an OCCT ShapeFix repair as a feature.
 
         Aliases (same tool): is_watertight, assess_mesh_quality, analyze_stl_geometry,
         health_check, design_audit.
@@ -2007,3 +2016,223 @@ def register_cad_eval_tools(mcp: FastMCP) -> None:
             f"offending sids that justify it, plus volume sign. Identical arguments and "
             f"identical answer; call check_geometry_health directly if you prefer. Repair "
             f"arguments are refused, not performed."))(_make_alias(_alias_name))
+
+    # ------------------------------------------------------------------ solid repair
+    # check_geometry_health REFUSES repair, and that refusal is right for a defect the
+    # feature tree caused: fix the feature. But an IMPORTED body has no feature to fix —
+    # the defect arrived in the file. A live frame assembly's rear spine (imported STEP)
+    # failed health with bad_orientation_of_subshape, and with no repair op the agent
+    # burned a run on booleans, BREP round-trips and STL sewing. `heal_body` is that
+    # missing op: it appends a RECORDED `heal` feature (contracts/feature_params.md#heal),
+    # so the repair re-runs on every rebuild and its before/after verdict is auditable.
+
+    def _health_digest(doc_id: str) -> dict:
+        """The check_geometry_health verdict, trimmed to what a before/after diff needs."""
+        raw = _health_report(doc_id, None, None, False, False, False, False,
+                             "check_geometry_health")
+        rep = json.loads(raw)
+        if rep.get("ok") is not True:
+            return {"ok": False, "error": rep.get("error") or rep}
+        bodies = []
+        for b in rep.get("bodies") or []:
+            bodies.append({
+                "body_id": b.get("body_id"),
+                "sound": b.get("sound"),
+                "watertight": b.get("watertight"),
+                "brep_valid": b.get("brep_valid"),
+                "free_edges": (b.get("free_edges") or {}).get("count"),
+                "non_manifold_edges": (b.get("non_manifold_edges") or {}).get("count"),
+                "orientation_consistent": (b.get("orientation") or {}).get("consistent"),
+                "volume_mm3": b.get("volume_mm3"),
+                "findings": b.get("findings") or [],
+            })
+        vols = [b["volume_mm3"] for b in bodies if isinstance(b["volume_mm3"], (int, float))]
+        return {"ok": True, "summary": rep.get("summary"),
+                "watertight": rep.get("watertight"), "sound": rep.get("sound"),
+                "body_count": rep.get("body_count"), "bodies": bodies,
+                "volume_mm3": round(sum(vols), 6) if vols else None}
+
+    def _bbox_of(doc_id: str) -> Optional[dict]:
+        try:
+            bb = cb.call("doc_bbox", {"doc_id": doc_id}) or {}
+        except Exception:  # noqa: BLE001 — a bbox is evidence, not a precondition
+            return None
+        return {k: bb.get(k) for k in ("min", "max", "size") if bb.get(k) is not None} or None
+
+    def _vec_delta(a, b) -> Optional[list]:
+        if not (isinstance(a, list) and isinstance(b, list) and len(a) == len(b)):
+            return None
+        return [round(float(y) - float(x), 6) for x, y in zip(a, b)]
+
+    @mcp.tool()
+    def heal_body(target: Optional[Union[int, str]] = None,
+                  doc_id: Optional[str] = None,
+                  tolerance_mm: Optional[float] = None,
+                  fix_small_edges: bool = False) -> str:
+        """REPAIR a topologically broken solid with OCCT ShapeFix, as a RECORDED feature.
+
+        This is the answer to a `check_geometry_health` failure that your feature tree did NOT
+        cause — an imported STEP/IGES/mesh body that arrived invalid (`bad_orientation_of_
+        subshape`, `not_closed`, `free_edge`, a wrong-signed volume). For a defect your own
+        features caused, fix the feature instead: healing over it hides the real bug and the
+        next parameter edit brings it back.
+
+        It appends a `heal` feature to the tree (ShapeFix_Shape → optional ShapeFix_Wireframe →
+        ShapeFix_Solid), so the repair is part of the rebuild rather than a one-off mutation —
+        never "repair" a body outside the tree with a BREP/STL round-trip or a boolean against
+        itself; nothing downstream can then tell what changed, and the next rebuild loses it.
+
+        Returns, so you can judge the repair instead of trusting it:
+          fixed             was the body invalid before and valid after?
+          fixes             the BRepCheck defects that were CLEARED (what ShapeFix actually did)
+          remaining_issues  defects still present — a partial repair says so
+          before / after    full check_geometry_health digests (summary, per-body counts, volume)
+          volume_delta_mm3  total volume change. On an orientation-only repair the volume READING
+                            changes because the broken integral was wrong, not the geometry — a
+                            reversed face on a 24000 mm^3 box measures 16000.
+          bbox_before/after + bbox_delta   the envelope must not move; if it did, ShapeFix
+                            rebuilt geometry and you should verify the part, not ship it.
+
+        target          which body to heal: a feature id ("f3"), a feature NAME ("Spine"), or a
+                        1-based body number (1 = first body). Omit for the current running body
+                        (correct for a single-body part).
+        doc_id          the part (defaults to the active document).
+        tolerance_mm    ShapeFix precision. Default 1e-7 (OCCT's confusion tolerance) — raise to
+                        0.01–0.1 when the import's gaps are real and the default leaves defects.
+        fix_small_edges also drop tiny edges / close wire gaps (ShapeFix_Wireframe). Off by
+                        default: it REMOVES topology, so a body whose small edges are intended
+                        (a 0.05 mm fillet band) would lose them.
+        """
+        d = None
+        try:
+            d = _doc(doc_id)
+            if tolerance_mm is not None:
+                try:
+                    tolerance_mm = float(tolerance_mm)
+                except (TypeError, ValueError):
+                    raise ValueError(
+                        f"heal_body(tolerance_mm={tolerance_mm!r}): tolerance_mm is a length in "
+                        f"mm (e.g. 0.01). Omit it for the 1e-7 default.") from None
+                if not tolerance_mm > 0:
+                    raise ValueError(
+                        f"heal_body(tolerance_mm={tolerance_mm}): must be > 0.")
+
+            # --- resolve `target` to the feature id the `heal` op takes ----------------
+            body_fid = None
+            if target is not None and not (isinstance(target, str) and not target.strip()):
+                feats, owner_map = _target_feature_roster(d)
+                as_body_no = None
+                if isinstance(target, bool):
+                    raise ValueError("heal_body(target=True/False) is not a body — pass a "
+                                     "feature id, a feature name, or a 1-based body number.")
+                if isinstance(target, int):
+                    as_body_no = target
+                elif isinstance(target, str) and re.fullmatch(r"[bB]?\d+", target.strip()):
+                    as_body_no = int(target.strip().lstrip("bB"))
+                if as_body_no is not None:
+                    if as_body_no < 1:
+                        raise ValueError(
+                            f"heal_body(target={target!r}): body numbers are 1-BASED "
+                            f"(target=1 is the first body).")
+                    # The body's owner is the LAST feature owner_map credits with it — an
+                    # earlier feature on the same body was consumed by a later one, and
+                    # healing that stale id would resurrect it as a duplicate body.
+                    order = {str(f.get("id")): i for i, f in enumerate(feats)}
+                    owners = [fid for fid, om in (owner_map or {}).items()
+                              if as_body_no in [int(x) for x in (om.get("bodies") or [])]]
+                    owners.sort(key=lambda fid: order.get(fid, -1))
+                    if not owners:
+                        raise ValueError(
+                            f"heal_body(target={target!r}): no feature owns body "
+                            f"{as_body_no} in this document. Features: {_roster_text(feats)}. "
+                            f"check_geometry_health(doc_id) lists the real body numbers.")
+                    body_fid = owners[-1]
+                else:
+                    body_fid, _fname, _feats = _resolve_feature_ref(d, target, feats,
+                                                                    "heal_body target")
+
+            before = _health_digest(d)
+            if before.get("ok") is not True:
+                return _dumps({"ok": False, "doc_id": d,
+                               "error": "could not read health BEFORE healing; nothing was "
+                                        "changed",
+                               "detail": before.get("error")})
+            bbox_before = _bbox_of(d)
+
+            params: dict = {}
+            if body_fid:
+                params["body"] = body_fid
+            if tolerance_mm is not None:
+                params["tolerance"] = tolerance_mm
+            if fix_small_edges:
+                params["fix_small_edges"] = True
+            r = cb.call("doc_apply_ops", {"doc_id": d, "ops": [
+                {"op": "add_feature",
+                 "feature": {"type": "heal", "name": "Heal", "params": params}}]})
+            rows = (r.get("rebuild") or {}).get("feature_status") or []
+            row = rows[-1] if rows else {}
+            if not row.get("ok"):
+                return _dumps({
+                    "ok": False, "doc_id": d, "target": target,
+                    "error": row.get("error") or "the heal feature failed to build",
+                    "note": "a rejected batch is rolled back — the document is unchanged",
+                    "before": before})
+
+            feature_id = (r.get("id_map") or {}).get("$0") or row.get("id")
+            data = row.get("data") or {}
+            before_issues = list((data.get("before") or {}).get("issues") or [])
+            after_issues = list((data.get("after") or {}).get("issues") or [])
+            fixes = [i for i in before_issues if i not in after_issues]
+
+            after = _health_digest(d)
+            bbox_after = _bbox_of(d)
+            _publish_current(d)
+
+            vb, va = before.get("volume_mm3"), after.get("volume_mm3")
+            out = {
+                "ok": True, "doc_id": d, "feature_id": feature_id,
+                "target": target, "body_feature": body_fid,
+                "tolerance_mm": data.get("tolerance", tolerance_mm),
+                "fix_small_edges": bool(data.get("fix_small_edges", fix_small_edges)),
+                "fixed": bool(data.get("fixed")),
+                "fixes": fixes,
+                "remaining_issues": after_issues,
+                "brep_valid_before": (data.get("before") or {}).get("valid"),
+                "brep_valid_after": (data.get("after") or {}).get("valid"),
+                "body_volume_before_mm3": data.get("volume_before"),
+                "body_volume_after_mm3": data.get("volume_after"),
+                "before": before, "after": after,
+                "volume_delta_mm3": (round(va - vb, 6)
+                                     if isinstance(vb, (int, float))
+                                     and isinstance(va, (int, float)) else None),
+                "bbox_before": bbox_before, "bbox_after": bbox_after,
+            }
+            if row.get("warning"):
+                out["warning"] = row["warning"]
+            if bbox_before and bbox_after:
+                out["bbox_delta"] = {
+                    k: _vec_delta(bbox_before.get(k), bbox_after.get(k))
+                    for k in ("min", "max", "size")}
+
+            heads = []
+            if out["fixed"]:
+                heads.append("HEALED: " + (", ".join(fixes) if fixes else "BRep is now valid"))
+            elif before_issues and after_issues:
+                heads.append(
+                    f"PARTIAL: cleared {', '.join(fixes) if fixes else 'nothing'}; still "
+                    f"{', '.join(after_issues)}. Retry with a larger tolerance_mm, or fix the "
+                    f"import/feature that produced the body.")
+            elif not before_issues:
+                heads.append("NO DEFECT: the body was already BRep-valid — nothing to fix "
+                             "(the heal feature is recorded as a no-op)")
+            else:
+                heads.append("NOT HEALED: " + ", ".join(after_issues))
+            heads.append(f"health: {after.get('summary')}")
+            if out["volume_delta_mm3"]:
+                heads.append(
+                    f"volume reading {vb} -> {va} mm^3 (an orientation repair changes the "
+                    f"READING, because the broken integral was wrong)")
+            out["summary"] = ". ".join(h for h in heads if h)
+            return _dumps(out)
+        except Exception as e:  # noqa: BLE001
+            return _err(_teach_no_bodies(e, d, "heal_body()"))

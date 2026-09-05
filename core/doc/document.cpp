@@ -51,6 +51,9 @@
 #include <BRepBuilderAPI_Transform.hxx>
 #include <BRepBndLib.hxx>
 #include <BRepCheck_Analyzer.hxx>  // sweep self-intersection validity check (Bug B3)
+#include <BRepCheck_ListOfStatus.hxx>  // heal: name the statuses ShapeFix cleared
+#include <BRepCheck_Result.hxx>
+#include <BRepCheck_Status.hxx>
 #include <BRepGProp.hxx>
 #include <BRepExtrema_DistShapeShape.hxx>
 #include <BRepPrimAPI_MakeBox.hxx>
@@ -93,7 +96,9 @@
 #include <GeomAPI_ProjectPointOnCurve.hxx>
 #include <GeomLProp_SLProps.hxx>
 #include <ShapeAnalysis.hxx>  // FindBounds: free ends of an open profile wire (revolve auto-close)
-#include <ShapeFix_Solid.hxx>  // heal an inverted/negative-volume solid (Bug N2)
+#include <ShapeFix_Shape.hxx>  // the `heal` feature (ShapeFix repair of an imported body)
+#include <ShapeFix_Solid.hxx>  // heal an inverted/negative-volume solid (Bug N2) + `heal`
+#include <ShapeFix_Wireframe.hxx>  // `heal` fix_small_edges: drop tiny edges / close wire gaps
 
 #include "doc/formats.h"  // import_bodies / detect_format (the import feature)
 #include "doc/picks.h"
@@ -562,6 +567,126 @@ std::string req_str(const json& feat, const char* key) {
     if (it == feat.end() || !it->is_string())
         throw std::runtime_error(std::string("missing string ref '") + key + "'");
     return it->get<std::string>();
+}
+
+// The `heal` feature's evidence: every distinct non-OK BRepCheck status name on a shape,
+// so the recorded op result can say WHAT was wrong before and what (if anything) survived
+// the ShapeFix pass. The numeric enum is useless to a reading agent — the live defect that
+// motivated the op reported `bad_orientation_of_subshape`, and that string is the whole
+// diagnosis — so unnamed statuses fall back to "brep_check_<n>" rather than being dropped.
+// Deliberately duplicated in spirit (not code) by session.cpp::health_status_text, which is
+// a file-local static there and covers only the orientation subset eval_solid_health needs.
+const char* heal_status_name(BRepCheck_Status st) {
+    switch (st) {
+        case BRepCheck_NoError:                     return nullptr;
+        case BRepCheck_InvalidPointOnCurve:         return "invalid_point_on_curve";
+        case BRepCheck_InvalidPointOnCurveOnSurface: return "invalid_point_on_curve_on_surface";
+        case BRepCheck_InvalidPointOnSurface:       return "invalid_point_on_surface";
+        case BRepCheck_No3DCurve:                   return "no_3d_curve";
+        case BRepCheck_Multiple3DCurve:             return "multiple_3d_curve";
+        case BRepCheck_Invalid3DCurve:              return "invalid_3d_curve";
+        case BRepCheck_NoCurveOnSurface:            return "no_curve_on_surface";
+        case BRepCheck_InvalidCurveOnSurface:       return "invalid_curve_on_surface";
+        case BRepCheck_InvalidCurveOnClosedSurface: return "invalid_curve_on_closed_surface";
+        case BRepCheck_InvalidSameRangeFlag:        return "invalid_same_range_flag";
+        case BRepCheck_InvalidSameParameterFlag:    return "invalid_same_parameter_flag";
+        case BRepCheck_InvalidDegeneratedFlag:      return "invalid_degenerated_flag";
+        case BRepCheck_FreeEdge:                    return "free_edge";
+        case BRepCheck_InvalidMultiConnexity:       return "invalid_multi_connexity";
+        case BRepCheck_InvalidRange:                return "invalid_range";
+        case BRepCheck_EmptyWire:                   return "empty_wire";
+        case BRepCheck_RedundantEdge:               return "redundant_edge";
+        case BRepCheck_SelfIntersectingWire:        return "self_intersecting_wire";
+        case BRepCheck_NoSurface:                   return "no_surface";
+        case BRepCheck_InvalidWire:                 return "invalid_wire";
+        case BRepCheck_RedundantWire:               return "redundant_wire";
+        case BRepCheck_IntersectingWires:           return "intersecting_wires";
+        case BRepCheck_InvalidImbricationOfWires:   return "invalid_imbrication_of_wires";
+        case BRepCheck_EmptyShell:                  return "empty_shell";
+        case BRepCheck_RedundantFace:               return "redundant_face";
+        case BRepCheck_UnorientableShape:           return "unorientable_shape";
+        case BRepCheck_NotClosed:                   return "not_closed";
+        case BRepCheck_NotConnected:                return "not_connected";
+        case BRepCheck_SubshapeNotInShape:          return "subshape_not_in_shape";
+        case BRepCheck_BadOrientation:              return "bad_orientation";
+        case BRepCheck_BadOrientationOfSubshape:    return "bad_orientation_of_subshape";
+        case BRepCheck_InvalidPolygonOnTriangulation:
+            return "invalid_polygon_on_triangulation";
+        case BRepCheck_InvalidToleranceValue:       return "invalid_tolerance_value";
+        case BRepCheck_EnclosedRegion:              return "enclosed_region";
+        case BRepCheck_CheckFail:                   return "check_fail";
+        default:                                    return nullptr;
+    }
+}
+
+// Distinct BRepCheck issue names on `shape`, in first-seen order (deterministic across
+// rebuilds). Empty for a valid shape. Never throws — a kernel failure inside the analyzer
+// is reported as the single issue "check_fail", because "heal found nothing wrong" and
+// "the checker itself blew up" must not read the same.
+std::vector<std::string> heal_brep_issues(const TopoDS_Shape& shape) {
+    std::vector<std::string> out;
+    if (shape.IsNull()) return out;
+    auto note = [&out](const char* name, int raw) {
+        std::string s = name ? std::string(name)
+                             : ("brep_check_" + std::to_string(raw));
+        if (std::find(out.begin(), out.end(), s) == out.end()) out.push_back(std::move(s));
+    };
+    try {
+        BRepCheck_Analyzer analyzer(shape);
+        if (analyzer.IsValid()) return out;
+        // Walk every sub-shape the analyzer holds a result for, not just the root: a
+        // reversed face inside an otherwise-fine shell reports on the SHELL, and the root
+        // solid's own status list is empty.
+        TopTools_IndexedMapOfShape all;
+        TopExp::MapShapes(shape, all);
+        std::vector<TopoDS_Shape> targets;
+        targets.push_back(shape);
+        for (int i = 1; i <= all.Extent(); ++i) targets.push_back(all.FindKey(i));
+        for (const TopoDS_Shape& sub : targets) {
+            // Result() raises on a sub-shape the analyzer never recorded, so one bad
+            // lookup must not discard the findings already collected.
+            try {
+                const Handle(BRepCheck_Result)& res = analyzer.Result(sub);
+                if (res.IsNull()) continue;
+                // Two distinct status lists per result, and the interesting ones live in
+                // the SECOND. `Status()` holds defects of the sub-shape in isolation;
+                // defects of the sub-shape IN A CONTEXT — which is where a shell's
+                // `bad_orientation_of_subshape` inside its solid is filed — are only
+                // reachable through the context iterator. Reading `Status()` alone
+                // reported the motivating live defect as an unhelpful "check_fail".
+                for (BRepCheck_ListOfStatus::Iterator it(res->Status()); it.More(); it.Next())
+                    if (it.Value() != BRepCheck_NoError)
+                        note(heal_status_name(it.Value()), static_cast<int>(it.Value()));
+                for (res->InitContextIterator(); res->MoreShapeInContext();
+                     res->NextShapeInContext()) {
+                    for (BRepCheck_ListOfStatus::Iterator it(res->StatusOnShape());
+                         it.More(); it.Next())
+                        if (it.Value() != BRepCheck_NoError)
+                            note(heal_status_name(it.Value()), static_cast<int>(it.Value()));
+                }
+            } catch (const Standard_Failure&) {
+                continue;
+            }
+        }
+        // The analyzer said INVALID, so an empty list would be a lie about what it found.
+        if (out.empty()) note("check_fail", static_cast<int>(BRepCheck_CheckFail));
+    } catch (const Standard_Failure&) {
+        out.clear();
+        note("check_fail", static_cast<int>(BRepCheck_CheckFail));
+    }
+    return out;
+}
+
+// Enclosed volume of a shape, 0.0 for anything without a solid (an open shell body).
+double heal_volume(const TopoDS_Shape& shape) {
+    if (shape.IsNull()) return 0.0;
+    try {
+        GProp_GProps props;
+        BRepGProp::VolumeProperties(shape, props);
+        return props.Mass();
+    } catch (const Standard_Failure&) {
+        return 0.0;
+    }
 }
 
 
@@ -5355,6 +5480,167 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                 if (zero_motion)
                     st.warning = "transform recorded the body at its current pose "
                                  "(zero motion — no translate/rotate given)";
+                st.ok = true;
+
+            } else if (type == "heal") {
+                // REPAIR a topologically broken solid — the op that had no answer before.
+                // A live frame assembly's imported STEP spine failed health with
+                // `bad_orientation_of_subshape`, and because nothing in the tree could fix
+                // shape topology the agent tried booleans, BREP round-trips and STL sewing
+                // in turn (all wrong, all silently lossy). OCCT ships the right tool —
+                // ShapeFix_Shape (+ ShapeFix_Solid for the solid/shell orientation pass,
+                // ShapeFix_Wireframe for tiny-edge/wire-gap cleanup) — and this makes it a
+                // RECORDED feature so the repair is part of the rebuild, re-runs on every
+                // compile, and can be audited: an unrecorded repair is a claim, not a fix.
+                //
+                // Params:
+                //   tolerance        precision handed to ShapeFix (mm). Default 1e-7 —
+                //                    OCCT's Confusion; raise it (0.01-0.1) for a coarse
+                //                    imported mesh/STEP whose gaps are real.
+                //   fix_small_edges  also run ShapeFix_Wireframe (drop tiny edges, close
+                //                    wire gaps). Off by default: it REMOVES topology, so a
+                //                    body whose small edges are intentional (a 0.05 mm
+                //                    fillet band) must opt in.
+                // Ref: `body` targets an earlier feature id; default is the current running
+                // body. The healed body REPLACES the input (copy:false semantics, like
+                // `transform`) — a repair that left the broken original alive would keep
+                // exporting the broken one.
+                const std::string body_id = body_ref(feat);
+                if (body_id.empty())
+                    throw std::runtime_error(type + ": no body ref and no current body");
+                // Compose on the body's CURRENT descendant, same chase as `transform`: a
+                // prior in-place transform/heal leaves `body_id` pointing at a consumed
+                // shape, and healing the stale original would resurrect it as a duplicate.
+                std::string eff_id = body_id;
+                {
+                    std::set<std::string> guard;
+                    while (consumed.count(eff_id) && superseded_by.count(eff_id) &&
+                           guard.insert(eff_id).second)
+                        eff_id = superseded_by[eff_id];
+                }
+                const TopoDS_Shape& body = require_solid(results, eff_id, "body");
+
+                double tol = 1e-7;  // Precision::Confusion
+                if (feat.contains("tolerance") && !feat.at("tolerance").is_null())
+                    tol = num_or_expr(feat.at("tolerance"), env);
+                if (!(tol > 0.0))
+                    throw std::runtime_error(type + ": tolerance must be > 0");
+                const bool fix_small_edges = feat.value("fix_small_edges", false);
+
+                const std::vector<std::string> before_issues = heal_brep_issues(body);
+                const bool before_valid = before_issues.empty();
+                const double volume_before = heal_volume(body);
+
+                // --- the ShapeFix pass ------------------------------------------------
+                // MaxTolerance is what actually lets the fixer close a gap: with precision
+                // alone it refuses to move anything further than `tol`. 100x precision (at
+                // least 0.01 mm) is the OCCT-idiomatic headroom used by our own importer.
+                TopoDS_Shape out = body;
+                try {
+                    ShapeFix_Shape fixer(out);
+                    fixer.SetPrecision(tol);
+                    fixer.SetMaxTolerance(std::max(tol * 100.0, 1e-2));
+                    fixer.SetMinTolerance(tol);
+                    fixer.Perform();
+                    const TopoDS_Shape fixed = fixer.Shape();
+                    if (!fixed.IsNull()) out = fixed;
+                } catch (const Standard_Failure&) {
+                    out = body;  // a fixer crash leaves the body exactly as it came in
+                }
+                if (fix_small_edges) {
+                    try {
+                        ShapeFix_Wireframe wf(out);
+                        wf.SetPrecision(tol);
+                        wf.SetMaxTolerance(std::max(tol * 100.0, 1e-2));
+                        wf.ModeDropSmallEdges() = Standard_True;
+                        wf.FixSmallEdges();
+                        wf.FixWireGaps();
+                        const TopoDS_Shape wfixed = wf.Shape();
+                        if (!wfixed.IsNull()) out = wfixed;
+                    } catch (const Standard_Failure&) {
+                        // keep whatever ShapeFix_Shape produced
+                    }
+                }
+                // Solid/shell orientation is the class of defect that motivated the op, and
+                // ShapeFix_Shape's solid tool does not always reach it on an imported body —
+                // run the dedicated tool on each solid explicitly. A compound of solids is
+                // rebuilt from the healed members so a multi-lump import is fixed whole.
+                try {
+                    if (out.ShapeType() == TopAbs_SOLID) {
+                        ShapeFix_Solid sfx(TopoDS::Solid(out));
+                        sfx.SetPrecision(tol);
+                        sfx.Perform();
+                        const TopoDS_Shape sfixed = sfx.Solid();
+                        if (!sfixed.IsNull()) out = sfixed;
+                    } else {
+                        TopTools_IndexedMapOfShape smap;
+                        TopExp::MapShapes(out, TopAbs_SOLID, smap);
+                        if (smap.Extent() > 0) {
+                            BRep_Builder bb;
+                            TopoDS_Compound comp;
+                            bb.MakeCompound(comp);
+                            bool any = false;
+                            for (int si = 1; si <= smap.Extent(); ++si) {
+                                TopoDS_Shape member = smap.FindKey(si);
+                                ShapeFix_Solid sfx(TopoDS::Solid(member));
+                                sfx.SetPrecision(tol);
+                                sfx.Perform();
+                                const TopoDS_Shape sfixed = sfx.Solid();
+                                bb.Add(comp, sfixed.IsNull() ? member : sfixed);
+                                any = true;
+                            }
+                            if (any) out = comp;
+                        }
+                    }
+                } catch (const Standard_Failure&) {
+                    // keep the ShapeFix_Shape result
+                }
+                if (out.IsNull())
+                    throw std::runtime_error(type + ": ShapeFix produced an empty shape");
+
+                std::vector<std::string> after_issues = heal_brep_issues(out);
+                bool after_valid = after_issues.empty();
+                double volume_after = heal_volume(out);
+
+                // NEVER hand back a body that is worse than the one we were given. ShapeFix
+                // on an already-valid or near-valid shape can introduce its own damage, and
+                // silently degrading a good body would be the exact failure mode this op
+                // exists to prevent.
+                if (before_valid && !after_valid) {
+                    out = body;
+                    after_issues = before_issues;
+                    after_valid = before_valid;
+                    volume_after = volume_before;
+                    st.warning = "heal: the input was already BRep-valid and ShapeFix made it "
+                                 "worse; the body was left UNCHANGED";
+                } else if (!before_valid && !after_valid) {
+                    st.warning = "heal: ShapeFix did not clear every defect — still " +
+                                 std::to_string(after_issues.size()) + " issue kind(s) (" +
+                                 after_issues.front() + (after_issues.size() > 1 ? ", …" : "") +
+                                 "). Raise `tolerance`, or fix the feature/import that "
+                                 "produced the body.";
+                }
+
+                json before_j = json::array();
+                for (const std::string& s : before_issues) before_j.push_back(s);
+                json after_j = json::array();
+                for (const std::string& s : after_issues) after_j.push_back(s);
+                st.data = json{
+                    {"fixed", !before_valid && after_valid},
+                    {"before", {{"valid", before_valid}, {"issues", before_j}}},
+                    {"after", {{"valid", after_valid}, {"issues", after_j}}},
+                    {"volume_before", volume_before},
+                    {"volume_after", volume_after},
+                    {"tolerance", tol},
+                    {"fix_small_edges", fix_small_edges}};
+
+                consumed.insert(eff_id);        // the healed body REPLACES the input
+                superseded_by[eff_id] = id;     // a later transform/heal composes on `id`
+                source_of[id] = eff_id;
+                tool_body_of[id] = out;         // patternable/mirrorable downstream
+                feature_op_of[id] = "add";
+                results[id] = SolidResult{out};
+                solid_order.push_back(id);
                 st.ok = true;
 
             } else if (type == "hole") {

@@ -202,7 +202,17 @@ def apply_mode_tools(
 
 
 # Escape hatches a restricted lane must be able to SEE, not merely call.
-META_TOOL_FLOOR: tuple[str, ...] = ("enable_tools", "list_tool_categories")
+# ``cad_skill`` joined them when the [SKILLS] catalog started riding in EVERY
+# role prompt (``mission_dispatch.linear_role_prompt``): that catalog names each
+# pack and tells the model to fetch the body with ``cad_skill(name=...)``, so a
+# capped role that cannot see the verb is told to call a tool it has no way to
+# reach. It is risk-class read with two string params — the cheapest possible
+# floor entry.
+META_TOOL_FLOOR: tuple[str, ...] = (
+    "enable_tools",
+    "list_tool_categories",
+    "cad_skill",
+)
 
 # Polling dependencies named by the curated guidance for background-capable
 # tools.  The registry has no ``list_jobs`` sibling for ``get_job``; ``sim_jobs``

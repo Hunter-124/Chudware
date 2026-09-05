@@ -6396,6 +6396,25 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
         """
         return cad_guide_text(topic)
 
+    @mcp.tool()
+    def cad_skill(name: str, path: str | None = None) -> str:
+        """Load one CAD skill pack — the full procedure behind a name in the [SKILLS] catalog.
+
+        The catalog in your system prompt lists every pack by name and one-line
+        description; this returns the body: the numbered procedure, its failure modes
+        and its exact tool-call sequences (e.g. name="assembly-merge" for merging
+        independently-sourced CAD, name="simulate" for the FEA/CFD release-evidence
+        path). Pass path="<file>" for a resource file inside a pack's directory.
+        This is the ONLY way to fetch a Chudware skill: a skill:// URL is not a
+        Chudware path and resolves against an unrelated registry. An unknown name
+        returns the list of real names instead of an error.
+        """
+        # Lazy import: the skills catalog is agent-side and services/mcp must stay
+        # importable without it (packaged MCP-only builds).
+        from services.agent import skills as _agent_skills
+
+        return _agent_skills.skill_reference_text(name, path)
+
 
 
     # ---------------------------------------------------------------- diagnostics

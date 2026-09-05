@@ -1806,3 +1806,37 @@ proxies, not Polyhedral-FEA. The default role model `claude-fable-5-1` is reject
 installed chud (needs Claude Code ≥ 2.1.251); missions must pass `--model claude-opus-5`.
 `.venv-mcp` was missing `chudcode-rpc`, `python-docx`, `python-pptx`, `openpyxl`, `reportlab`,
 `pypdf` — installed by hand; provisioning should own that.
+
+## 2026-09-04 — CAD's skill packs are reachable online (`cad_skill`, catalog in every role prompt)
+
+**Why.** `services/agent/skills/**` was wired only into the offline loop
+(`agent_turn.run_turn` via `prompt_cache.static_segments`). Online — the only lane that
+runs today — role cards said "full procedure: skill://assembly-merge" to a model whose
+only `skill://` resolver is Chudcode's own foreign registry: live
+mission-18d24905b774203f answered `Unknown skill: assembly-merge` and the model said it
+would fall back to the role card's summary. `simulate` reached the model at all only
+because its SKILL.md had been pasted into `sim_engineer.yaml` by hand.
+
+**What changed.** (1) `mission_dispatch.linear_role_prompt` — the single composition point
+for the main chat (`worker_rpc._agent_admin_turn`) and delegated roles
+(`chudcode_roles._assemble_role_runtime`) — appends `skills.catalog_block()` (≤4 kB,
+metadata only). `prompt_cache` is still validated against the pre-catalog witness, so tool-
+schema cache hits survive; `agent_turn`'s own catalog emission now skips a copy already in
+the prompt. (2) New host tool `cad_skill(name, path=None)` (`cad_doc_tools`, family `cad`,
+`_READ_EXACT`) returns a pack body or one file inside it via
+`skills.skill_reference_text`; it is in `MAIN_CHAT_CORE_TOOLS` and in
+`copilot_mode_tools.META_TOOL_FLOOR`, because the catalog now rides in EVERY role prompt
+and a capped role must be able to see the verb it is told to call. (3) The catalog, the
+`format_skill_body` footer, `tool_guidance`, both role cards and every SKILL.md cross-link
+now say `cad_skill("<name>")`; the catalog explicitly forbids `read skill://`. The
+hand-duplicated release-evidence block in `sim_engineer.yaml` is one pointer line.
+(4) Trigger auto-injection reached the online lane: `chudcode_tools` prefixes a
+trigger-matched skill body (`triggers.tools`) to that tool's FIRST result text per session,
+bounded by `SKILL_BODY_CHAR_LIMIT`, leaving `details` untouched. (5) `compaction` protects a
+`cad_skill` result the same way it protected `read skill://`.
+
+**Gotchas / deferred.** The catalog is unconditional per turn, not once-per-session: the
+online lane has no first-turn flag (Chudcode owns history), and 3.4 kB of metadata is
+cheaper than a wasted turn. Chudcode's own skill discovery is still unconfigured — CAD does
+not publish anything into it, and `extensions`-style discovery paths on the spawn remain
+unused; `cad_skill` is deliberately the only bridge.

@@ -602,14 +602,17 @@ def catalog_block(*, project_root: Path | str | None = None) -> str:
     if not skills:
         return ""
     lines = [
-        "[SKILLS] Available specialized skill packs. Metadata only — full body "
-        "loads on activation (slash command, auto-trigger, or skill:// read):",
+        "[SKILLS] Available specialized skill packs. Metadata only — fetch a full "
+        "body with cad_skill(name=\"<name>\") the moment its topic comes up:",
     ]
     for s in skills:
         lines.append(s.meta_line())
     lines.append(
-        "Activate with /skill:<name> or /<name>, or read skill://<name>. "
-        "Auto-inject skills fire once per session when their triggers match."
+        "Fetch with cad_skill(name=\"<name>\"), or cad_skill(name=\"<name>\", "
+        "path=\"<file>\") for a file inside the pack. NEVER read a skill:// URL: "
+        "that scheme resolves against the runtime's own unrelated skill registry "
+        "and fails. Auto-inject packs also arrive once per session when their "
+        "trigger tools are first used."
     )
     block = "\n".join(lines)
     return _truncate_semantically(
@@ -648,7 +651,7 @@ def format_skill_body(
     and source footer. Paragraph and line boundaries are preferred over hard cuts.
     """
     header = f"[SKILL: {skill.name} ({skill.source})]"
-    footer = f"\n\n(Source: skill://{skill.name})"
+    footer = f'\n\n(Source: cad_skill(name="{skill.name}"))'
     payload = skill.body.rstrip()
     if args.strip():
         payload += f"\n\nUser args: {args.strip()}"
@@ -1219,6 +1222,53 @@ def resolve_skill_uri(
 def read_skill_uri(uri: str, *, project_root: Path | str | None = None) -> str:
     """Convenience: return file content or raise SkillResolveError."""
     return str(resolve_skill_uri(uri, project_root=project_root)["content"])
+
+
+def skill_reference_text(
+    name: str,
+    path: str | None = None,
+    *,
+    project_root: Path | str | None = None,
+) -> str:
+    """Model-facing text for one skill pack: its SKILL.md, or one file inside it.
+
+    This is what the ``cad_skill`` host tool returns, and it is the ONLY fetch
+    path that works on the online (Chudcode) lane: there the ``skill://`` scheme
+    is resolved by the runtime's own ``read`` builtin against its own unrelated
+    skill registry, which answers "Unknown skill" for every CAD pack. Never
+    raises — an unknown name comes back as the catalog of real names, because a
+    model that asked for the wrong pack needs the right one, not a tool error.
+    """
+    ref = (name or "").strip()
+    if ref.startswith("skill://"):
+        ref = ref[len("skill://"):]
+    ref = ref.strip("/")
+    rel = (path or "").strip().replace("\\", "/").lstrip("/")
+    if not ref:
+        avail = ", ".join(s.name for s in discover_skills(project_root=project_root))
+        return (
+            "[SKILL NOT LOADED]\ncad_skill needs a pack name.\n"
+            f"Available: {avail or 'none'}"
+        )
+    try:
+        resolved = resolve_skill_uri(
+            f"{ref}/{rel}" if rel else ref, project_root=project_root
+        )
+    except SkillResolveError as exc:
+        return f"[SKILL NOT LOADED]\n{exc}"
+    if not rel:
+        skill = get_skill(ref, project_root=project_root)
+        if skill is not None:
+            return format_skill_body(skill)
+    listing = " (directory listing)" if resolved.get("is_directory") else ""
+    header = f"[SKILL FILE: {ref}/{rel}{listing}]"
+    body = str(resolved.get("content") or "").rstrip()
+    return _truncate_semantically(
+        f"{header}\n{body}",
+        SKILL_BODY_CHAR_LIMIT,
+        f"\n\n[TRUNCATED: cad_skill capped at {SKILL_BODY_CHAR_LIMIT} characters "
+        "— request one file at a time with path=.]",
+    )
 
 
 # --------------------------------------------------------------------------- user-dir CRUD (RPC backing)

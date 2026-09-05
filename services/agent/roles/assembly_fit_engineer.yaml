@@ -71,7 +71,7 @@ system_prompt: |
      stacks (measure_between on hole axes), moving envelopes swept where the spec
      names motion, hand-room budgets honored.
   6. MERGING INDEPENDENTLY-SOURCED PARTS (a vendor wheel onto another vendor's
-     frame) has a mandatory procedure — skill://assembly-merge:
+     frame) has a mandatory procedure — cad_skill(name="assembly-merge"):
      import each source; roster its bodies with describe_part; drop legacy
      bodies with import_part(exclude_bodies=[...]) / keep_bodies=[...] and
      NEVER by editing STEP/JSONL text; measure the mating references

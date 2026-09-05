@@ -2809,6 +2809,29 @@ def linear_role_prompt(
     # refused.
     allowed, system_prompt = _apply_session_preferences(role, allowed, system_prompt)
 
+    # The skills catalog, for the ONLINE lane. Every online role prompt — main
+    # chat (`worker_rpc._agent_admin_turn`) and delegated roles
+    # (`chudcode_roles._assemble_role_runtime`) — is composed here, and nothing
+    # downstream of it consults `services.agent.skills`: the Chudcode-embedded
+    # model used to be told "full procedure: skill://assembly-merge" by role-card
+    # prose while the only skill:// resolver in reach was Chudcode's own, which
+    # answers "Unknown skill" for every CAD pack (live, mission-18d24905b774203f).
+    # One line per pack plus the cad_skill fetch instruction, capped at
+    # `skills.SKILL_CATALOG_CHAR_LIMIT` — metadata only, bodies load on demand.
+    #
+    # `cache_witness` is what `prompt_cache` composed (role prose + capability +
+    # preferences, no catalog): the entry must agree with THAT before its tool
+    # text is trusted, or appending here would invalidate every cache hit.
+    cache_witness = system_prompt
+    try:
+        from services.agent import skills as _skills  # noqa: PLC0415
+
+        _catalog = _skills.catalog_block()
+        if _catalog:
+            system_prompt = system_prompt.rstrip() + "\n\n" + _catalog
+    except Exception:  # noqa: BLE001 — a broken skills dir never fails a turn
+        pass
+
     static = None
     try:
         # No project_root: nothing this lane takes from the entry (role prose,
@@ -2831,7 +2854,7 @@ def linear_role_prompt(
     if (
         static is not None
         and static.tools_text
-        and static.role_system == system_prompt
+        and static.role_system == cache_witness
         and list(static.allowed) == allowed
         and slot == _tool_schemas.tier_tools_slot(None)
         and idents == _tools_render_idents(allowed, _at.resolver_for(None))

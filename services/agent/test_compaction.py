@@ -195,17 +195,22 @@ def test_shake_eligibility_and_placeholder() -> None:
     assert "artifact://" not in region.get("placeholder", "")
     assert region["original_text"] == "M" * 20_000
 
-    # skill:// read protected even aggressive
-    skill_chat = [
-        _assistant_call("s1", "read", {"path": "skill://edit-part"}),
-        _tool("s1", "SKILLDOC" * 2000, name="read"),
-        _user("go"),
-    ]
-    for i in range(50):
-        skill_chat.append(_user("pad " + "p" * 100))
-    sk = compact.shake_messages(skill_chat, aggressive=True)
-    assert sk["placeholders"] == 0
-    assert "SKILLDOC" in str(sk["messages"][1].get("content"))
+    # A fetched skill body is protected even aggressive, under either fetch
+    # verb: cad_skill (CAD's own packs) and the runtime's read skill://.
+    for call, result_name, args in (
+        ("s1", "cad_skill", {"name": "edit-part"}),
+        ("s1", "read", {"path": "skill://edit-part"}),
+    ):
+        skill_chat = [
+            _assistant_call(call, result_name, args),
+            _tool(call, "SKILLDOC" * 2000, name=result_name),
+            _user("go"),
+        ]
+        for i in range(50):
+            skill_chat.append(_user("pad " + "p" * 100))
+        sk = compact.shake_messages(skill_chat, aggressive=True)
+        assert sk["placeholders"] == 0, result_name
+        assert "SKILLDOC" in str(sk["messages"][1].get("content")), result_name
 
 
 def test_shake_aggressive_and_min_savings_noop() -> None:

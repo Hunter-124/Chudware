@@ -61,6 +61,7 @@
    "cad_graph",
    "cad_graph_link",
    "cad_guide",
+   "cad_skill",
    "check_feature_overlap",
    "check_geometry_health",
    "check_interference",
@@ -600,6 +601,7 @@
   "cad_graph": "Traverse the CAD project graph — dimensional links + assembly structure.",
   "cad_graph_link": "Author an AI link between two graph nodes (origin=\"ai\").",
   "cad_guide": "Return the engine's modeling/simulation knowledge so you can drive it well. CALL FIRST.",
+  "cad_skill": "Load one CAD skill pack — the full procedure behind a name in the [SKILLS] catalog.",
   "cam_add_operation": "Add a machining operation to a setup. type: face|contour2d|pocket2d|slot|chamfer2d| …",
   "cam_add_setup": "Add a machining setup (a stock + WCS + machine/platform). machine: mill3|mill4|mill5| router|lathe|millturn|laser|plasma|waterjet. …",
   "cam_add_tool": "Add (or replace by number) a tool in the library. type: endmill_flat|endmill_ball| …",
@@ -1177,6 +1179,9 @@
   "cad_guide": {
    "prompt_note": "Call FIRST in any modeling session — 'overview' for the op cheatsheet, a feature name ('hole', 'sweep') for its exact param shape."
   },
+  "cad_skill": {
+   "prompt_note": "Fetches a pack listed in the [SKILLS] catalog by name — the full procedure, not the one-line summary in your role card. Call it BEFORE the first tool of that workflow (cad_skill(name=\"assembly-merge\") before import_part on foreign CAD, cad_skill(name=\"simulate\") before an FEA release run). path=\"<file>\" reads a resource inside the pack."
+  },
   "cam_add_operation": {
    "prompt_note": "Get geometry from cam_extract first; omit rpm/feed in params to auto-resolve from material+tool. Call cam_generate after adding ops."
   },
@@ -1613,7 +1618,7 @@
    "prompt_note": "Call BEFORE any hole/bore sizing decision; if the fit class is unknown, resolve function first with recommend_fit. A bare diameter alone returns a teaching error naming both modes."
   },
   "fit_cylinder_axis": {
-   "prompt_note": "Least-squares bore/shaft axis around near=[x,y,z] — the way to find a hub bore or axle on a TESSELLATED import; judge rms_residual_mm against radius_mm before placing anything on the axis (skill://assembly-merge)."
+   "prompt_note": "Least-squares bore/shaft axis around near=[x,y,z] — the way to find a hub bore or axle on a TESSELLATED import; judge rms_residual_mm against radius_mm before placing anything on the axis (cad_skill(name=\"assembly-merge\"))."
   },
   "fit_report": {
    "prompt_note": "No args = document report (needs measurements recorded first); explicit bore/shaft args = ad-hoc one-off, same engine as fit_calc."

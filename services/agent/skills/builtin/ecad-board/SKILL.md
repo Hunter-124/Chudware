@@ -45,7 +45,7 @@ triggers:
 
 - `cad_guide('ecad')` when available; cheatsheet under agent prompts ECAD
 - Explicit full ASCII: `render_board_ascii` / compact auto-readback on board mutation tools
-- Mechanical mate workflow: `skill://edit-assembly`
+- Mechanical mate workflow: `cad_skill("edit-assembly")`
 
 - Schematic sheet ASCII: `render_schematic_ascii` (grid + cell index).
 - SPICE/sim plaintext: `render_sim_ascii`.

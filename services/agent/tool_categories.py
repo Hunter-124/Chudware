@@ -785,6 +785,13 @@ MAIN_CHAT_CORE_TOOLS: tuple[str, ...] = (
     "list_tool_categories",
     "design_recipe",
     "cad_guide",
+    # The fetch half of the [SKILLS] catalog every online role prompt now carries.
+    # The catalog names each pack in one line and instructs the model to call this
+    # for the body, so a turn that reaches assembly work or a simulation needs it
+    # THAT turn — an enable_tools round-trip to reach a read-only text lookup is
+    # exactly the wasted turn the catalog exists to prevent. Its schema is two
+    # string params, so it costs the prompt almost nothing.
+    "cad_skill",
     "advise",
     # files (project jail)
     "fs_read",

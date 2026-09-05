@@ -2874,6 +2874,9 @@ def _agent_admin_turn(params: dict, _emit: Callable) -> dict:
         "chudware_actor": credit_actor,
         "ledger": getattr(mission_dispatch, "ledger", None),
         "run_id": run_id,
+        # The skill-injection dedupe key: a trigger-matched skill body is
+        # prefixed to its tool's first result per CONVERSATION, not per turn.
+        "session_id": session_id,
         "doc_id": raw_params.get("doc_id"),
         "workspace_dir": project_root,
         "project_dir": project_root,

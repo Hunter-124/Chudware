@@ -34,5 +34,5 @@ Per-feature discipline for solid modeling.
 
 ## Deeper docs
 
-- Part workflow: `skill://edit-part`
+- Part workflow: `cad_skill("edit-part")`
 - `cad_guide()` op vocabulary

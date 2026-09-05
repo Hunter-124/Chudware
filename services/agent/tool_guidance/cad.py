@@ -208,6 +208,15 @@ ENTRIES: dict[str, dict[str, Any]] = {
             "feature name ('hole', 'sweep') for its exact param shape."
         ),
     },
+    "cad_skill": {
+        "prompt_note": (
+            "Fetches a pack listed in the [SKILLS] catalog by name — the full "
+            "procedure, not the one-line summary in your role card. Call it BEFORE "
+            "the first tool of that workflow (cad_skill(name=\"assembly-merge\") "
+            "before import_part on foreign CAD, cad_skill(name=\"simulate\") before "
+            "an FEA release run). path=\"<file>\" reads a resource inside the pack."
+        ),
+    },
     "check_feature_overlap": {
         "prompt_note": (
             "add_features already runs this per batch (overlap_warnings) — call to "
@@ -332,7 +341,8 @@ ENTRIES: dict[str, dict[str, Any]] = {
         "prompt_note": (
             "Least-squares bore/shaft axis around near=[x,y,z] — the way to find a hub "
             "bore or axle on a TESSELLATED import; judge rms_residual_mm against "
-            "radius_mm before placing anything on the axis (skill://assembly-merge)."
+            "radius_mm before placing anything on the axis "
+            "(cad_skill(name=\"assembly-merge\"))."
         ),
     },
     "get_job": {

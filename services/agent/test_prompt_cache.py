@@ -10,6 +10,7 @@ against the shared composition rather than merely checking internal consistency.
 from __future__ import annotations
 
 import json
+import re
 
 import pytest
 
@@ -69,9 +70,11 @@ def _old_inline(system_prompt, tools_text, allow, *, catalog, project_root,
 
 def _old_linear_inline(role, capability, tier, dispatcher):
     """The composition exactly as ``run_linear_role_turn`` wrote it inline before
-    the lane was routed through the cache. Kept verbatim as the reference the
-    routed path must reproduce byte for byte."""
+    the lane was routed through the cache, plus the skills catalog the lane now
+    appends so the online Chudcode turn can see its skill packs. Kept as the
+    reference the routed path must reproduce byte for byte."""
     from services.agent import mission_dispatch as md
+    from services.agent import skills as _skills
     from services.agent.prompt_tiers import (
         assemble_system_for_capability,
         letter_from_capability,
@@ -90,6 +93,9 @@ def _old_linear_inline(role, capability, tier, dispatcher):
         system_prompt = base_system_prompt
     allowed, system_prompt = md._apply_session_preferences(
         role, allowed, system_prompt)
+    catalog = _skills.catalog_block()
+    if catalog:
+        system_prompt = system_prompt.rstrip() + "\n\n" + catalog
     tools_text = None
     try:
         tools_text, _meta = render_tools_block(
@@ -287,6 +293,33 @@ def test_linear_lane_prompt_is_byte_identical_to_the_inline_composition(
     assert routed[0] == reference[0], "role prose drifted"
     assert routed[1] == reference[1], "the allowlist drifted"
     assert routed[2] == reference[2], "the tools block drifted"
+
+
+@pytest.mark.parametrize("role", ["general_agent", "sim_engineer"])
+def test_the_linear_lane_carries_the_skills_catalog_and_its_fetch_verb(
+        isolated_cache, linear_tools_memo, role):
+    """The ONLINE lane's only source of skill visibility.
+
+    ``worker_rpc._agent_admin_turn`` and ``chudcode_roles`` both compose their
+    system prompt here and hand it straight to Chudcode, which never consults
+    ``services.agent.skills``. Before this block, a role card's "full procedure:
+    skill://assembly-merge" reached a model whose only ``skill://`` resolver was
+    Chudcode's own foreign registry — live mission-18d24905b774203f answered
+    "Unknown skill: assembly-merge" and fell back to the card's summary.
+    """
+    from services.agent import mission_dispatch as md
+
+    system_prompt, allowed, _tools = md.linear_role_prompt(
+        role, resolver=at.resolver_for(None))
+
+    assert "[SKILLS]" in system_prompt, "the online lane lost the skills catalog"
+    assert "assembly-merge" in system_prompt and "simulate" in system_prompt
+    assert 'cad_skill(name="<name>")' in system_prompt
+    # The catalog's own warning names the scheme; a POINTER (skill://<name>) is
+    # what sent the model to Chudcode's `read` builtin.
+    assert not re.search(r"skill://[a-z0-9]", system_prompt), (
+        "a skill:// pointer resolves against Chudcode's own registry, not CAD's")
+    assert "cad_skill" in allowed, "the catalog names a tool the lane cannot call"
 
 
 def test_a_repeat_turn_reuses_the_tools_block_but_a_new_fingerprint_recomposes(

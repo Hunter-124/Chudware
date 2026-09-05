@@ -2460,7 +2460,10 @@ def _run_turn_impl(
         _sk_parts: list[str] = []
         if _first_catalog_turn:
             _cat = _skills.catalog_block()
-            if _cat:
+            # A role prompt composed by `mission_dispatch.linear_role_prompt`
+            # already carries the catalog (it is the online lane's only source of
+            # it); appending a second copy would spend the budget twice.
+            if _cat and _cat not in system:
                 _sk_parts.append(_cat)
         if request or _phase:
             _sk_parts.extend(

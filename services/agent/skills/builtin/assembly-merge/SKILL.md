@@ -79,5 +79,6 @@ a source file.
 
 ## Deeper docs
 
-- `skill://edit-assembly` (interface-first mating), `skill://source-parts` (catalog hardware)
+- `cad_skill("edit-assembly")` (interface-first mating), `cad_skill("source-parts")`
+  (catalog hardware)
 - `cad_guide('assembly')`, `cad_guide('verify')`

@@ -96,7 +96,10 @@ class HostToolBinding:
                 else None
             )
             cancel = lambda: bool(getattr(host_context, "cancelled", False))
-            return host_tool_result(dispatch_host_tool(self, params, progress, cancel))
+            result = host_tool_result(
+                dispatch_host_tool(self, params, progress, cancel)
+            )
+            return _with_skill_injection(self, result)
 
         return factory(
             name=self.name,
@@ -130,6 +133,58 @@ def host_tool_result(result: Any) -> dict[str, Any]:
     safe = _json_safe(result)
     text = json.dumps(safe, ensure_ascii=False, indent=2, default=str)
     return {"content": [{"type": "text", "text": text}], "details": safe}
+
+
+def _with_skill_injection(
+    binding: HostToolBinding, envelope: dict[str, Any]
+) -> dict[str, Any]:
+    """Prefix a trigger-matched skill body to this tool's FIRST result text.
+
+    The offline loop injects a skill's body when a turn is about to reach one of
+    its ``triggers.tools`` (``agent_turn`` calls ``skills.activate_for_prompt``
+    with ``tools_about_to_run``). Online, the model's turn is inside Chudcode and
+    the only CAD chokepoint left is this dispatch, so the body rides back on the
+    tool's own result — the first time that conversation touches the tool, once,
+    within ``skills.SKILL_BODY_CHAR_LIMIT``. ``details`` is untouched, so the
+    event mapper and every structured consumer see exactly the tool's own result.
+    """
+    content = envelope.get("content")
+    if not isinstance(content, list) or not content:
+        return envelope
+    first = content[0]
+    if not isinstance(first, dict) or first.get("type") != "text":
+        return envelope
+    try:
+        from services.agent import skills
+
+        bodies = skills.activate_for_prompt(
+            "",
+            session_id=str(
+                _ctx(binding.context, "session_id", None)
+                or _ctx(binding.context, "run_id", None)
+                or ""
+            )
+            or None,
+            project_root=_ctx(binding.context, "project_dir", None),
+            tools_about_to_run=[binding.name],
+            role=_ctx(binding.context, "actor", None),
+            _aggregate_char_limit=skills.SKILL_BODY_CHAR_LIMIT,
+        )
+    except Exception as exc:  # noqa: BLE001 — a broken skills dir never fails a call
+        _debug_fallback(f"skill injection for {binding.name}", exc)
+        return envelope
+    if not bodies:
+        return envelope
+    prefix = "\n\n".join(bodies)
+    merged = dict(envelope)
+    merged["content"] = [
+        {
+            **first,
+            "text": f"{prefix}\n\n[{binding.name} result]\n{first.get('text') or ''}",
+        },
+        *content[1:],
+    ]
+    return merged
 
 # --------------------------------------------------------------------------- context
 

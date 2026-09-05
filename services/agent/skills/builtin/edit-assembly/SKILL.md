@@ -39,4 +39,4 @@ triggers:
 ## Deeper docs
 
 - `cad_guide('assembly')`, `cad_guide('motion')`, `cad_guide('verify')`
-- Sourcing phrasing: `skill://source-parts`
+- Sourcing phrasing: `cad_skill("source-parts")`

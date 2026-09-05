@@ -39,6 +39,9 @@ _READ_PREFIXES = ("describe_", "query_", "measure_", "list_", "get_", "check_",
                   "wall_", "contact_")
 _READ_SUFFIXES = ("_status",)
 _READ_EXACT = {"hover", "cad_guide", "intake_status", "ecad_status", "cam_job_tree",
+              # cad_skill reads one SKILL.md out of the skills catalog — same
+              # zero-risk knowledge class as cad_guide, no document is touched.
+              "cad_skill",
               "cam_materials", "cam_op_types", "cam_tool_types", "cam_post_dialects",
               "list_parts", "list_configurations", "list_world_bodies",
               "list_standard_parts",

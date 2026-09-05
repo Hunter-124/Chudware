@@ -848,6 +848,12 @@ def shake_messages(
             name = _tool_name(message) or _tool_name(call)
             args = call.get("arguments") or call.get("args") or {}
             path = _read_path_from_args(args) if isinstance(args, dict) else None
+            # A loaded skill body is instructions the model is mid-way through
+            # following; shaking it leaves it obeying a procedure it can no
+            # longer read. `cad_skill` is CAD's fetch verb (online and offline),
+            # `read skill://` is the runtime's own skill loader.
+            if name == "cad_skill":
+                continue
             if name == "read" and path and path.startswith("skill://"):
                 continue
             tokens = count_tokens(original)

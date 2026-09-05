@@ -139,6 +139,17 @@ runtime's doctor command.
    dozen of these at startup, so spawn-per-call was the "providers take 30 s" defect. Calls are
    serialized on `_service_lock`; a dead process is replaced on the next call; `shutdown()`
    stops it. Never reintroduce a per-call spawn.
+9. **CAD's skill packs reach the model through `cad_skill`, never `skill://`.** The
+   `skill://` scheme is resolved by Chudcode's `read` builtin against Chudcode's OWN skill
+   registry, which contains nothing from this repo — a role card that printed
+   `skill://assembly-merge` cost a live mission a turn and got `Unknown skill`.
+   `mission_dispatch.linear_role_prompt` (the one composition point for the main chat AND
+   delegated roles) appends `skills.catalog_block()`; the fetch verb is the CAD host tool
+   `cad_skill(name, path=None)` (`cad_doc_tools`, `MAIN_CHAT_CORE_TOOLS` +
+   `copilot_mode_tools.META_TOOL_FLOOR`, so a capped role can still see it). Trigger-based
+   injection is `chudcode_tools._with_skill_injection`: a skill whose `triggers.tools` names
+   the dispatched tool rides back as a bounded prefix on that tool's FIRST result text per
+   session, with `details` untouched. Never re-copy a SKILL.md into a role card.
 
 ## Event rules
 

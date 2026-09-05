@@ -38,7 +38,8 @@ roles: []               # optional allowlist
 
 - Teach a **tool sequence**, not essays.
 - Always include **verify-before-done** and **interface-first mating** when relevant.
-- Keep body under ~150 lines; point to depth via `skill://name/path` or `cad_guide(...)`.
+- Keep body under ~150 lines; point to depth via `cad_skill("<name>", path="<file>")` or
+  `cad_guide(...)`.
 - Progressive disclosure: metadata always in context; full body only on activation.
 
 ## Save / test
@@ -46,7 +47,7 @@ roles: []               # optional allowlist
 1. Draft full `SKILL.md` text (frontmatter + body).
 2. Write `.chudware/skills/<name>/SKILL.md` under the active project with
    `fs_write`; do not claim access to the Settings-only user skill RPCs.
-3. Confirm `/skill:my-skill` activates and the catalog includes the metadata.
+3. Confirm `cad_skill("my-skill")` returns the body and the catalog includes the metadata.
 4. For auto skills: fire a keyword once, confirm no double-inject until compaction.
 
 ## Checklist
@@ -60,4 +61,4 @@ roles: []               # optional allowlist
 ## Deeper docs
 
 - Contract: `contracts/skills.md`
-- Resolver: `skill://skill-creator` (this file)
+- Fetch: `cad_skill("skill-creator")` (this file)

@@ -49,5 +49,5 @@ triggers:
 
 - `cad_guide('gsl')` for text-only geometry read
 - Explicit full ASCII: `render_sketch_ascii` / compact auto-readback on mutation tools
-- Feature build: `skill://edit-feature`
+- Feature build: `cad_skill("edit-feature")`
 - Targeted cell edits: `apply_ascii_edits(kind='sketch', sketch_id=..., edits=[...])` using `grid`/`index` from the ASCII render.

@@ -77,19 +77,14 @@ system_prompt: |
   5. Read the actual envelope. ok:false, skipped:true, failed/cancelled, converged:false,
      random.ok:false, or verdict:null never proves a criterion. Compare the solver result
      to the anchor and explain discrepancies before assigning PASS/WARN/FAIL.
-  6. RELEASE EVIDENCE (any result that closes a requirement). Converge with
-     run_fea_convergence(sizes_mm=[coarse,medium,fine], monitor=<non-singular
-     value>) or run_fea_adaptive with eta_target_met — never a single mesh. Then
-     read reactions.equilibrium_error_pct and mesh_quality (both sit BESIDE
-     summary, not inside it), pass vtu_path=<absolute .vtu> to keep the field,
-     and ship sim_evidence_packet(case_id, requirement_id, out_dir,
-     study_result=<the full result>, geometry_path, material_source,
-     load_rationale, notes). Its unsatisfied_checklist is the release gate:
-     locations, singularity assessment, explicit allowable and hand calculation
-     are yours to close. Cross-check the CRITICAL case with
-     polymesh_cli(action="solve"|"diag", ...) — frozen boxes, metres/pascals/
-     newtons — and explain differences instead of averaging them;
-     polymesh_cli_unavailable means the cross-check was not performed.
+  6. RELEASE EVIDENCE (any result that closes a requirement) has one canonical
+     procedure and this card is not it: call cad_skill(name="simulate") and work
+     its "Release evidence" section — convergence over three stated sizes (or
+     eta_target_met), reactions.equilibrium_error_pct and mesh_quality (both sit
+     BESIDE summary), vtu_path to keep the field, sim_evidence_packet as the
+     release gate, and the polymesh_cli cross-check of the critical case. It used
+     to be pasted here in full; two copies of an evidence rule drift, and the
+     pack is the one the simulate tools' own docs point at.
 
   SURFACE-SPECIFIC LIMITS
   - CFD: run_cfd_flow is directional LBM; require converged=true and

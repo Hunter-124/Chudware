@@ -402,3 +402,28 @@ Default tier: **`fine`**, overridable process-wide by `CHUDWARE_DISPLAY_QUALITY=
 
 Changing the tier invalidates the document's compile cache and its per-body mesh cache, so every
 body re-meshes at the new deflections. The RPC is `doc_set_display_quality` (worker_rpc §19).
+
+## 8. `asm_edit_component` transform semantics (append-only, 2026-09-04)
+
+Clarifies the `asm_edit_component` row of §Assembly. `transform` means one of two things,
+depending on who owns the component's pose:
+
+| component | `transform` is | after the rebuild |
+|---|---|---|
+| `fixed:true` | the **authored** pose | kept verbatim (a fixed frame contributes no solver variables) |
+| unfixed, no active mate references it | the **authored** pose | kept verbatim (nothing pulls it) |
+| unfixed, referenced by a non-suppressed mate | the mate solve's **seed** | replaced by the mate solution; free DOFs keep the seed |
+
+Every `doc_apply_ops` batch on an assembly re-solves the mates and writes the solved transforms
+back into `components[]`, so the third row is not an error path — it is the mate being
+authoritative. To move a mated component, drive its mate (`asm_edit_mate value`), or suppress /
+delete the mate, or set `fixed:true` in the same batch as the `transform`.
+
+An `asm_edit_component` carrying `transform` (or `fixed:true`) invalidates that component's
+warm-start entry, so the authored pose — not the previous solve — seeds the solve triggered by
+its own batch. Before this, such an edit was silently discarded while still reporting `ok`.
+That invalidation is narrowed to the components whose pose the document actually authors — a
+`fixed` component (already fixed, or promoted by the same op) and an unfixed component that no
+non-suppressed mate references; a mated, unfixed component keeps its warm seed, so its authored
+`transform` is an engine-level no-op (re-seeding a mate solve from an off-solution pose converges
+to a different pose rather than back onto the mate solution).

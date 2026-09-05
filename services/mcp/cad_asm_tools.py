@@ -36,6 +36,7 @@ from .cad_common import (
     note_touched_doc,
     placement_source_of,
     placement_warnings,
+    pose_to_transform16,
     require_list,
     sh,
 )
@@ -193,7 +194,6 @@ def register_cad_asm_tools(mcp: FastMCP) -> None:
         report `placement_unverified`. Never position a part by editing STEP/JSONL text.
         """
         try:
-            import math as _math
             import os as _os
             d = _doc(doc_id)
             p = _os.path.abspath(path)
@@ -206,21 +206,9 @@ def register_cad_asm_tools(mcp: FastMCP) -> None:
                 op["fixed"] = bool(fixed)
             if at is not None or rotate is not None:
                 # row-major 4x4: rotation about `rotate` by `angle` deg, then translate `at`.
-                t = [0.0, 0.0, 0.0] if at is None else [float(v) for v in at]
-                r3 = [[1, 0, 0], [0, 1, 0], [0, 0, 1]]
-                if rotate is not None and angle:
-                    ax = [float(v) for v in rotate]
-                    n = _math.sqrt(sum(v * v for v in ax)) or 1.0
-                    x, y, z = (v / n for v in ax)
-                    c, s = _math.cos(_math.radians(angle)), _math.sin(_math.radians(angle))
-                    C = 1 - c
-                    r3 = [[c + x * x * C, x * y * C - z * s, x * z * C + y * s],
-                          [y * x * C + z * s, c + y * y * C, y * z * C - x * s],
-                          [z * x * C - y * s, z * y * C + x * s, c + z * z * C]]
-                op["transform"] = [r3[0][0], r3[0][1], r3[0][2], t[0],
-                                   r3[1][0], r3[1][1], r3[1][2], t[1],
-                                   r3[2][0], r3[2][1], r3[2][2], t[2],
-                                   0.0, 0.0, 0.0, 1.0]
+                # Same helper add_features' asm_edit_component re-pose path uses, so an
+                # insert pose and a later re-pose can never disagree on the convention.
+                op["transform"] = pose_to_transform16(at, rotate, angle)
             r = cb.call("doc_apply_ops", {"doc_id": d, "base_revision": _asm_revision(d),
                                           "with_tess": False, "ops": [op]})
             kid = (r.get("id_map") or {}).get("$0")

@@ -124,3 +124,33 @@ TEST_CASE("redundant concentric is not over-defined") {
         if (s["status"].get<std::string>() == "redundant") any_redundant = true;
     CHECK(any_redundant);
 }
+
+// A FIXED component's pose is authored, never solved — so a stale warm-start entry
+// (the previous solve's params, which include every fixed component) must not override
+// the transform the document carries. Before this, re-posing the anchor was silently
+// discarded on the next solve. An unfixed component still warm-starts: that seed is the
+// solver's, which is why a mated component stays solver-owned.
+TEST_CASE("a fixed component's transform beats a stale warm entry") {
+    json components = json::array();
+    components.push_back({{"id", "k1"}, {"transform", xform({50, 0, 0}, {0, 0, 0})},
+                          {"fixed", true}});
+    components.push_back({{"id", "k2"}, {"transform", xform({0, 0, 0}, {0, 0, 0})},
+                          {"fixed", false}});
+
+    WarmMap warm;
+    warm["k1"] = {Vector3d(0, 0, 0), Vector3d(0, 0, 0)};   // stale: the pre-edit anchor pose
+    warm["k2"] = {Vector3d(0, 7, 0), Vector3d(0, 0, 0)};
+
+    MateSolveResult out = solve_mates(components, json::array(), ResolvedGeometry{}, warm);
+    REQUIRE(out.converged);
+
+    auto k1 = out.transforms.at("k1");
+    CHECK(std::abs(k1[3] - 50.0) < 1e-9);  // authored tx wins over warm's 0
+    CHECK(std::abs(k1[7]) < 1e-9);
+    CHECK(std::abs(k1[11]) < 1e-9);
+
+    // Control: the unfixed component is still seeded from warm (mate-owned pose), so with
+    // no mates to pull it, it stays at the warm y=7 rather than its authored origin.
+    auto k2 = out.transforms.at("k2");
+    CHECK(std::abs(k2[7] - 7.0) < 1e-9);
+}

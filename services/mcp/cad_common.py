@@ -93,6 +93,37 @@ _PLACEMENT_SOURCE: dict = {}
 _LAST_INTERFERENCE_REV: dict = {}
 
 
+def pose_to_transform16(at: Optional[list], axis: Optional[list],
+                        angle: float = 0.0) -> list:
+    """``at``/``rotate``+``angle`` -> the row-major 4x4 the ``asm_*`` ops carry.
+
+    The rotation (axis + degrees, Rodrigues) is applied FIRST, then the translation —
+    the convention ``asm_insert_component``/``asm_edit_component`` read. One home for the
+    math because both the insert tool (asm_add_component) and the re-pose path
+    (add_features' asm_edit_component) accept the same at/rotate dialect.
+    """
+    import math  # noqa: PLC0415 — tiny, and this is not a hot path
+    t = [0.0, 0.0, 0.0] if at is None else [float(v) for v in at]
+    while len(t) < 3:
+        t.append(0.0)
+    r3 = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
+    if axis is not None and angle:
+        ax = [float(v) for v in axis]
+        while len(ax) < 3:
+            ax.append(0.0)
+        n = math.sqrt(sum(v * v for v in ax[:3])) or 1.0
+        x, y, z = (v / n for v in ax[:3])
+        c, s = math.cos(math.radians(angle)), math.sin(math.radians(angle))
+        C = 1 - c
+        r3 = [[c + x * x * C, x * y * C - z * s, x * z * C + y * s],
+              [y * x * C + z * s, c + y * y * C, y * z * C - x * s],
+              [z * x * C - y * s, z * y * C + x * s, c + z * z * C]]
+    return [r3[0][0], r3[0][1], r3[0][2], t[0],
+            r3[1][0], r3[1][1], r3[1][2], t[1],
+            r3[2][0], r3[2][1], r3[2][2], t[2],
+            0.0, 0.0, 0.0, 1.0]
+
+
 def note_placement_source(doc_id: Optional[str], component: Optional[str],
                           source: str) -> None:
     """Record HOW a component was positioned ("transform" = a raw pose, "mate" = solved)."""

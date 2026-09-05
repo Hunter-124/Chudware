@@ -1254,7 +1254,12 @@ MateSolveResult solve_mates(const json& components, const json& mates,
         if (comp.value("suppressed", false)) continue;
         std::string cid = comp.at("id").get<std::string>();
         Vector3d t, w;
-        auto wit = warm.find(cid);
+        // A fixed component's pose is AUTHORED, never solved: it must come from
+        // `transform`, never from the warm map. `warm` carries the previous solve's params
+        // for every component (fixed included, see the fill below), so reading it here
+        // silently discards an authored re-pose of the anchor.
+        const bool fixed = comp.value("fixed", false);
+        auto wit = fixed ? warm.end() : warm.find(cid);
         if (wit != warm.end()) {
             t = wit->second.first;
             w = wit->second.second;
@@ -1269,7 +1274,7 @@ MateSolveResult solve_mates(const json& components, const json& mates,
         frame.id = cid;
         frame.t0 = t;
         frame.w0 = w;
-        frame.fixed = comp.value("fixed", false);
+        frame.fixed = fixed;
         frames[cid] = frame;
         frame_order.push_back(cid);
     }

@@ -4079,6 +4079,61 @@ void rebuild_assembly(Session& s) {
     s.asm_result = std::make_shared<AssemblyResult>(std::move(ares));
 }
 
+// Is `cid` bound by any mate the solve will actually see? Mirrors compile_assembly's
+// enumeration: non-suppressed mates only, and only the first two refs (the solver reads
+// no more than two per mate).
+bool component_is_mated(const json& doc, const std::string& cid) {
+    if (!doc.contains("mates") || !doc["mates"].is_array()) return false;
+    for (const json& mate : doc["mates"]) {
+        if (!mate.is_object() || mate.value("suppressed", false)) continue;
+        if (!mate.contains("refs") || !mate["refs"].is_array()) continue;
+        const json& refs = mate["refs"];
+        for (std::size_t i = 0; i < refs.size() && i < 2; ++i)
+            if (refs[i].is_object() && refs[i].value("component", std::string()) == cid)
+                return true;
+    }
+    return false;
+}
+
+bool component_is_fixed(const json& doc, const std::string& cid) {
+    if (!doc.contains("components") || !doc["components"].is_array()) return false;
+    for (const json& c : doc["components"])
+        if (c.is_object() && c.value("id", std::string()) == cid) return c.value("fixed", false);
+    return false;
+}
+
+// An `asm_edit_component` that writes `transform` (or promotes the component to `fixed`)
+// AUTHORS the pose. `s.asm_warm` holds the PREVIOUS solve's params for every component
+// (fixed ones included) and wins over `components[].transform` in mate::solve_mates, so a
+// stale warm entry silently discards the edit on the very rebuild the op triggers — an
+// insert only survived because its brand-new id was not in the map yet.
+//
+// The erase is deliberately NARROW: only a component whose pose it actually owns —
+// `fixed`, or referenced by no non-suppressed mate. A mated, unfixed component KEEPS its
+// warm seed: its transform is only a solver seed, and re-seeding the mate solve from an
+// authored (off-solution) pose is not a no-op in practice — it lands the Newton iteration
+// in a different, tilted minimum instead of snapping back to the previous solution. The
+// authored edit is therefore an engine-level no-op there, which matches the tool layer
+// (Python refuses it with `component_is_mated`).
+//
+// `doc_after` is the post-batch candidate document, so `fixed` and mate membership are
+// read as the imminent rebuild will see them (a mate added in this same batch counts).
+void invalidate_warm_for_authored_poses(Session& s, const json& doc_after, const json& ops) {
+    if (s.asm_warm.empty() || !ops.is_array()) return;
+    for (const json& op : ops) {
+        if (!op.is_object() || op.value("op", std::string()) != "asm_edit_component") continue;
+        const bool authored = (op.contains("transform") && !op["transform"].is_null()) ||
+                              (op.contains("fixed") && op["fixed"] == true);
+        if (!authored) continue;
+        const std::string kid = op.value("id", std::string());
+        if (kid.empty()) continue;
+        const bool fixed = (op.contains("fixed") && op["fixed"] == true) ||
+                           component_is_fixed(doc_after, kid);
+        if (!fixed && component_is_mated(doc_after, kid)) continue;  // solver owns the pose
+        s.asm_warm.erase(kid);
+    }
+}
+
 // Tessellate each component (world-placed + optional explode offset) as one AICM body
 // and write the AICM (port of session.py::_write_aicm_assembly). Returns (path, bodies-meta).
 // `blob_out` (optional) receives the raw AICM bytes so doc_save can persist them as the
@@ -4424,6 +4479,13 @@ json apply_ops_locked(Session& s, long base_revision, const json& ops, bool coal
         throw OpError("invalid_op", "resulting document failed validation: " + joined,
                       {{"index", -1}, {"reason", errs.front()}, {"all_errors", errs}});
     }
+
+    // The batch is validated and will be applied: drop the warm-start entry of every
+    // component whose pose this batch AUTHORS **and** owns (fixed, or bound by no
+    // non-suppressed mate), so the rebuild below (either branch) seeds mate::solve_mates
+    // from the authored transform instead of the last solve. `working` is the candidate
+    // doc, so a `fixed` promotion or a mate added in this same batch is already visible.
+    invalidate_warm_for_authored_poses(s, working, ops);
 
     // Read-only fast-path: a batch of only read-only ops (copy_feature) makes no document
     // change — it only returns its result through id_map ($bundle). Skip the undo snapshot,

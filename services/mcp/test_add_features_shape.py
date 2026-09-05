@@ -3963,3 +3963,104 @@ def test_delete_feature_keeps_reading_the_flat_spellings():
         [{"op": "edit_feature", "id": "f3", "params": {"radius": 5}}], quiet,
     ) == [{"op": "edit_feature", "id": "f3", "params": {"radius": 5}}]
     assert quiet == []
+
+
+# ------------------------------------------------------- asm_edit_component re-pose
+# Live session: "asm_edit_component no-ops on this document". Two silent-success paths
+# were behind it — the at/rotate pose dialect the op never reads, and a pose the
+# assembly rebuild re-solves away. Neither may ever report success again.
+
+def test_asm_edit_component_at_dialect_becomes_the_transform_the_op_reads():
+    notes: list = []
+    ops = M._normalize_asm_component_pose(
+        [{"op": "asm_edit_component", "id": "k2", "at": [0, 0, 20]}], notes)
+    assert ops[0]["transform"] == [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 20, 0, 0, 0, 1]
+    # …and the ignored keys are gone, not left beside it.
+    assert "at" not in ops[0]
+    assert notes
+
+
+def test_asm_edit_component_rotation_dialect_is_carried_into_the_matrix():
+    ops = M._normalize_asm_component_pose(
+        [{"op": "asm_edit_component", "id": "k2",
+          "rotate": [0, 0, 1], "angle": 90, "at": [5, 0, 0]}], [])
+    tf = ops[0]["transform"]
+    assert abs(tf[0]) < 1e-12 and abs(tf[1] + 1) < 1e-12  # cos90, -sin90
+    assert tf[3] == 5.0
+
+
+def test_an_explicit_transform_wins_over_pose_keys_beside_it():
+    ident = [1, 0, 0, 7, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1]
+    notes: list = []
+    ops = M._normalize_asm_component_pose(
+        [{"op": "asm_edit_component", "id": "k2", "transform": ident,
+          "at": [99, 0, 0]}], notes)
+    assert ops[0]["transform"] == ident and "at" not in ops[0]
+    assert notes
+
+
+def _asm_tree(monkeypatch, fixed: bool, mates: list) -> None:
+    monkeypatch.setattr(M.cb, "call", lambda *_a, **_k: {"tree": {
+        "components": [
+            {"id": "k1", "fixed": True,
+             "transform": [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1]},
+            {"id": "k2", "fixed": fixed,
+             "transform": [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1]}],
+        "mates": mates}})
+
+
+_T111 = [1, 0, 0, 111.0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1]
+_MATE_M1 = [{"id": "m1", "type": "coincident",
+             "refs": [{"component": "k1"}, {"component": "k2"}]}]
+
+
+def test_reposing_a_mated_component_is_refused_instead_of_silently_solved_away(monkeypatch):
+    _asm_tree(monkeypatch, fixed=False, mates=_MATE_M1)
+    out = M._asm_repose_refusal(
+        [{"op": "asm_edit_component", "id": "k2", "transform": _T111}], "doc-x")
+    assert out is not None
+    assert out["ok"] is False and out["reason"] == "component_is_mated"
+    assert out["applied"] is False
+    assert out["components"] == {"k2": ["m1"]}
+    # The refusal has to teach the ways the component CAN be moved.
+    assert "asm_edit_mate" in out["hint"] and "simulate_motion" in out["hint"]
+
+
+def test_a_suppressed_mate_does_not_own_the_pose(monkeypatch):
+    _asm_tree(monkeypatch, fixed=False,
+              mates=[{**_MATE_M1[0], "suppressed": True}])
+    assert M._asm_repose_refusal(
+        [{"op": "asm_edit_component", "id": "k2", "transform": _T111}], "doc-x") is None
+
+
+def test_grounding_the_component_in_the_same_batch_is_not_refused(monkeypatch):
+    _asm_tree(monkeypatch, fixed=False, mates=_MATE_M1)
+    assert M._asm_repose_refusal(
+        [{"op": "asm_edit_component", "id": "k2", "transform": _T111, "fixed": True}],
+        "doc-x") is None
+    # …and an already-grounded component was never solver-owned to begin with.
+    _asm_tree(monkeypatch, fixed=True, mates=_MATE_M1)
+    assert M._asm_repose_refusal(
+        [{"op": "asm_edit_component", "id": "k2", "transform": _T111}], "doc-x") is None
+
+
+def test_a_non_pose_component_edit_costs_no_probe_and_is_never_refused(monkeypatch):
+    def _boom(*_a, **_k):
+        raise AssertionError("no doc_tree probe for a batch with no transform edit")
+
+    monkeypatch.setattr(M.cb, "call", _boom)
+    assert M._asm_repose_refusal(
+        [{"op": "asm_edit_component", "id": "k2", "name": "Lid"}], "doc-x") is None
+
+
+def test_a_pose_the_rebuild_discarded_is_reported_not_claimed():
+    tree = {"components": [{"id": "k2",
+                            "transform": [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1]}]}
+    rejects = M._asm_transform_rejects(
+        [{"op": "asm_edit_component", "id": "k2", "transform": _T111}], tree)
+    assert [r["component"] for r in rejects] == ["k2"]
+    assert rejects[0]["actual"][3] == 0.0 and rejects[0]["requested"][3] == 111.0
+    # A pose the document really carries is not a reject.
+    assert M._asm_transform_rejects(
+        [{"op": "asm_edit_component", "id": "k2", "transform": _T111}],
+        {"components": [{"id": "k2", "transform": _T111}]}) == []

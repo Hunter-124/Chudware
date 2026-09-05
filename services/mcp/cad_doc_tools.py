@@ -54,6 +54,7 @@ from .cad_common import (
     normalize_geom_query,
     note_touched_doc,
     placement_warnings,
+    pose_to_transform16,
     cb,
     recover_autosaved,
     recover_skipped,
@@ -2756,6 +2757,167 @@ def _repair_merged_boolean_operands(ops: Any, doc_id: str, notes: list) -> Any:
         'merge:false before the boolean — a primitive built with the default mode:"boss" '
         "fuses into the running solid, so a boolean naming it has no second operand left")
     return fixes + list(ops)
+
+
+# ------------------------------------------------------------------ assembly re-pose
+# `asm_edit_component` writes ONLY transform / name / suppressed / fixed / hidden
+# (core/doc/session.cpp::op_asm_edit_component) and silently ignores every other key, so
+# the at/rotate pose dialect — which is asm_add_component's OWN public signature — applied
+# "ok" and moved nothing. Translate it into the matrix the op actually reads.
+_ASM_POSE_AT_KEYS = ("at", "position", "origin", "translate", "location", "xyz")
+_ASM_POSE_AXIS_KEYS = ("rotate", "axis", "rotation_axis", "about")
+_ASM_POSE_ANGLE_KEYS = ("angle", "degrees", "deg", "rotation_angle")
+
+
+def _asm_pose_vec(op: dict, keys: tuple) -> Optional[list]:
+    for k in keys:
+        v = op.get(k)
+        if isinstance(v, dict):
+            v = v.get("value")
+        if isinstance(v, (list, tuple)) and 2 <= len(v) <= 3 and all(_is_num(x) for x in v):
+            return [float(x) for x in v] + [0.0] * (3 - len(v))
+    return None
+
+
+def _normalize_asm_component_pose(ops: Any, notes: list) -> Any:
+    """`{"op":"asm_edit_component","id":"k2","at":[0,0,20]}` -> the `transform` matrix."""
+    if not isinstance(ops, list):
+        return ops
+    out: list = []
+    changed = False
+    for op in ops:
+        if not isinstance(op, dict) or _slug(op.get("op")) != "asm_edit_component":
+            out.append(op)
+            continue
+        at = _asm_pose_vec(op, _ASM_POSE_AT_KEYS)
+        axis = _asm_pose_vec(op, _ASM_POSE_AXIS_KEYS)
+        angle = next((float(v) for k in _ASM_POSE_ANGLE_KEYS
+                      if _is_num(v := op.get(k))), 0.0)
+        if at is None and axis is None:
+            out.append(op)
+            continue
+        fixed = dict(op)
+        for k in _ASM_POSE_AT_KEYS + _ASM_POSE_AXIS_KEYS + _ASM_POSE_ANGLE_KEYS:
+            fixed.pop(k, None)
+        if isinstance(op.get("transform"), (list, tuple)) and len(op["transform"]) == 16:
+            notes.append(
+                f"asm_edit_component '{op.get('id')}': kept the explicit 16-value transform "
+                f"and dropped the at/rotate keys beside it (the op reads only `transform`)")
+        else:
+            fixed["transform"] = pose_to_transform16(at, axis, angle)
+            notes.append(
+                f"asm_edit_component '{op.get('id')}': built its `transform` from "
+                f"at={at} rotate={axis} angle={angle} — the op reads a row-major 4x4 and "
+                f"IGNORES at/rotate, so that spelling used to apply cleanly and move nothing")
+        out.append(fixed)
+        changed = True
+    return out if changed else ops
+
+
+def _asm_transform_edits(ops: Any) -> dict:
+    """{component_id: requested row-major 4x4} for every asm_edit_component pose in a batch."""
+    edits: dict = {}
+    if not isinstance(ops, list):
+        return edits
+    for op in ops:
+        if not isinstance(op, dict) or _slug(op.get("op")) != "asm_edit_component":
+            continue
+        cid, tf = op.get("id"), op.get("transform")
+        if isinstance(cid, str) and cid and isinstance(tf, (list, tuple)) and len(tf) == 16 \
+                and all(_is_num(v) for v in tf):
+            edits[cid] = [float(v) for v in tf]
+    return edits
+
+
+def _asm_repose_refusal(ops: Any, doc_id: str) -> Optional[dict]:
+    """Refuse a transform edit the MATE SOLVER will immediately overwrite.
+
+    A component that is not `fixed` and is referenced by a live mate owes its pose to
+    ``mate::solve_mates``: the doc `transform` is only a solver SEED, and the rebuild that
+    every ``doc_apply_ops`` runs writes the solved pose straight back over it
+    (core/doc/session.cpp::rebuild_assembly). The op reports ok, the component never
+    moves — the exact "asm_edit_component no-ops on this document" a live session hit.
+    Say so, machine-readably, instead of succeeding at nothing.
+    """
+    edits = _asm_transform_edits(ops)
+    if not edits:
+        return None
+    try:
+        tree = (cb.call("doc_tree", {"doc_id": doc_id}) or {}).get("tree") or {}
+    except Exception:  # noqa: BLE001 — a probe failure must never block a valid batch
+        return None
+    comps = {c.get("id"): c for c in (tree.get("components") or []) if isinstance(c, dict)}
+    mated: dict = {}
+    for m in tree.get("mates") or []:
+        if not isinstance(m, dict) or m.get("suppressed"):
+            continue
+        for ref in m.get("refs") or []:
+            if isinstance(ref, dict) and isinstance(ref.get("component"), str):
+                mated.setdefault(ref["component"], []).append(m.get("id"))
+    # An op that grounds the component in the SAME breath is not blocked: a fixed frame's
+    # pose is authored, never solved (mate.cpp keeps t0/w0 for a fixed frame).
+    grounding = {op.get("id") for op in ops
+                 if isinstance(op, dict) and _slug(op.get("op")) == "asm_edit_component"
+                 and op.get("fixed") is True}
+    blocked = {cid: [m for m in mated[cid] if m]
+               for cid in edits
+               if cid in mated and cid not in grounding
+               and not (comps.get(cid) or {}).get("fixed", False)}
+    if not blocked:
+        return None
+    named = ", ".join(f"{cid} (mated by {', '.join(ms) or 'a mate'})"
+                      for cid, ms in sorted(blocked.items()))
+    first_mate = next((ms[0] for ms in blocked.values() if ms), "m1")
+    return {
+        "ok": False,
+        "reason": "component_is_mated",
+        "doc_id": doc_id,
+        "components": blocked,
+        "applied": False,
+        "error": (
+            f"asm_edit_component cannot re-pose {named}: a component that is not `fixed` "
+            f"and carries a mate owes its pose to the mate solver. Its `transform` is only "
+            f"a solver seed — the rebuild that follows the op writes the solved pose back "
+            f"over it, so the edit applies 'ok' and the component never moves. Nothing was "
+            f"changed."),
+        "hint": (
+            "to re-pose a MATED component, move the MATE, not the matrix: "
+            f'(1) drive it — add_features(ops=[{{"op":"asm_edit_mate","id":"{first_mate}",'
+            '"value":{"value":<mm|deg>}}]) then solve_mates(); '
+            f'(2) explore a range without mutating the doc — simulate_motion(mate="{first_mate}", '
+            "start=…, stop=…) returns a pose per step; "
+            "(3) really want a free pose? take the mate out of the network first "
+            f'(add_features(ops=[{{"op":"asm_edit_mate","id":"{first_mate}","suppressed":true}}]) '
+            f'or {{"op":"asm_delete_mate","id":"{first_mate}"}}) and send the transform after; '
+            'or ground the component in the same batch with "fixed": true, which makes its '
+            "transform authoritative."),
+    }
+
+
+def _asm_transform_rejects(ops: Any, tree: Any) -> list:
+    """Components whose requested pose is NOT what the doc carries after the apply.
+
+    The engine seeds each mate solve from ``Session::asm_warm`` (the previous solve's
+    params) and that map wins over ``components[].transform`` for EVERY component, fixed
+    ones included — so once any solve has run on the doc (i.e. after the first
+    ``doc_apply_ops``), an authored transform is discarded on the very rebuild the op
+    triggers. Verified against a private hostd. Never report success for that.
+    """
+    edits = _asm_transform_edits(ops)
+    if not edits or not isinstance(tree, dict):
+        return []
+    live = {c.get("id"): c.get("transform") for c in (tree.get("components") or [])
+            if isinstance(c, dict)}
+    rejects = []
+    for cid, want in edits.items():
+        got = live.get(cid)
+        if not isinstance(got, (list, tuple)) or len(got) != 16:
+            continue
+        if any(abs(float(a) - float(b)) > 1e-6 * max(1.0, abs(float(b)))
+               for a, b in zip(got, want)):
+            rejects.append({"component": cid, "requested": want,
+                            "actual": [float(v) for v in got]})
+    return rejects
 
 
 def _normalize_pattern_ops(ops: Any, notes: list) -> Any:
@@ -6936,6 +7098,22 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
           Live list: engine doc_list_ops (sourced from core/doc/op_registry — single source).
           Call cad_guide() for worked examples and full param shapes.
 
+        RE-POSING AN ASSEMBLY COMPONENT — asm_edit_component moves a component ONLY while
+        nothing else owns its pose. It carries `transform` (row-major 4x4; at/rotate/angle
+        are accepted here and converted for you), `name`, `fixed`, `suppressed`, `hidden`.
+          * MATED component (not `fixed`, referenced by a live mate): its pose belongs to
+            the mate solver, and the rebuild overwrites any transform you write. This call
+            REFUSES with {"ok":false,"reason":"component_is_mated"} instead of reporting a
+            move that did not happen. Move it by driving the mate —
+            {"op":"asm_edit_mate","id":"m1","value":{"value":<mm|deg>}} then solve_mates()
+            — or explore poses with simulate_motion (never mutates the doc). To pose it
+            freely, suppress/delete the mate first, or set "fixed":true in the same batch.
+          * ALREADY-PLACED component: the engine seeds each solve from the previous one, so
+            a fresh transform can be discarded even with no mates; this call reads the pose
+            back and returns {"ok":false,"reason":"transform_not_applied"} when that
+            happens. Place components at insert time (asm_add_component at/rotate) or move
+            them through mates.
+
         PRIMITIVE PLACEMENT + ORIENTATION (box/cylinder/sphere/cone/torus) — feature-level
         keys beside "type"/"name"/"params", all optional. An unrecognised key is REJECTED,
         never silently ignored, so use exactly these spellings:
@@ -7121,6 +7299,10 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
             # mirror the engine's own hoist (session.cpp:960-991) so every pass after this
             # one, including the pattern/ref-slot passes right below, sees it in params.
             ops = _hoist_feature_sibling_keys(ops, interpreted)
+            # asm_edit_component reads ONLY a 16-value `transform`, so the at/rotate pose
+            # dialect (asm_add_component's own signature) has to become that matrix here or
+            # the op applies "ok" and moves nothing.
+            ops = _normalize_asm_component_pose(ops, interpreted)
             # A pattern decides its own type from params.mode, so it must run BEFORE the
             # alias table maps the generic word "pattern" onto linear_pattern regardless.
             ops = _normalize_pattern_ops(ops, interpreted)
@@ -7177,6 +7359,14 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
             # merge:false on a new feature cannot reach — that needs an edit_feature.
             ops = _repair_merged_boolean_operands(ops, d, interpreted)
             interpreted = _interpreted_notes(interpreted)
+            # A transform edit on a component the mate solver owns is a guaranteed no-op
+            # (the rebuild re-solves and writes the solved pose back). Refuse before
+            # mutating anything, and name the ways to actually move it.
+            _repose_refusal = _asm_repose_refusal(ops, d)
+            if _repose_refusal is not None:
+                if interpreted:
+                    _repose_refusal["interpreted"] = interpreted
+                return _dumps(_repose_refusal)
 
             def _apply() -> dict:
                 # Transactional batch: snapshot first so a partial failure rolls the WHOLE batch
@@ -7230,6 +7420,40 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
                     feats.append(feature)
                 bodies = (r.get("tess") or {}).get("bodies", [])
                 ok = all(s.get("ok") for s in fs) if fs else True
+
+                # READBACK: the engine reports an asm_edit_component pose as applied even
+                # when the mate-solve warm start (Session::asm_warm) overwrote it on the
+                # rebuild this very call ran. `tree` IS the post-rebuild document, so the
+                # requested matrix is checkable for free — never report a pose as set when
+                # the document does not carry it.
+                if ok:
+                    rejected = _asm_transform_rejects(ops, tree)
+                    if rejected:
+                        _publish_current(d)
+                        return {
+                            "ok": False,
+                            "reason": "transform_not_applied",
+                            "doc_id": d,
+                            "revision": r.get("revision"),
+                            "components": rejected,
+                            "applied": False,
+                            "error": (
+                                "asm_edit_component accepted the pose and the engine's "
+                                "assembly rebuild discarded it: "
+                                + ", ".join(str(x["component"]) for x in rejected)
+                                + " still carries its previous transform (the mate solve is "
+                                "seeded from the last solve's warm state, which wins over an "
+                                "authored transform). Nothing moved."),
+                            "hint": (
+                                "place the component at insert time instead — "
+                                "asm_add_component(path=…, at=…, rotate=…, angle=…) is honored "
+                                "because the component is not in the warm state yet — or drive "
+                                "its pose through a mate (asm_mate value / "
+                                '{"op":"asm_edit_mate","id":…,"value":{"value":…}} + '
+                                "solve_mates), which is the supported way to move a placed "
+                                "component. Do not re-send the same transform: it will be "
+                                "discarded again."),
+                        }
 
                 if not ok and ckpt:
                     # Roll the tree back to the pre-batch revision; report WHY each feature failed.

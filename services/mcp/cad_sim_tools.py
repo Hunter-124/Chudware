@@ -2285,6 +2285,86 @@ _MONITORABLE = (
 )
 
 
+#: A ladder leg only means something if its MESH really changed. core/sim/mesh_size_band
+#: governs the requested size against an element budget ("auto-coarsened for interactivity"),
+#: so on a big part several `fineness` rungs can collapse onto ONE budget-limited mesh: three
+#: legs, identical n_dof, delta 0.0% — which the tolerance test then reads as convergence.
+#: Observed live on a 2.6 m tube frame: 394,896 DOF three times over, reported converged.
+#: Anything under this much DOF growth between consecutive legs is not a finer mesh.
+_LADDER_MIN_DOF_GROWTH_PCT = 5.0
+
+#: The substring the engine's mesh-size governor stamps into its notes when it overrides the
+#: requested characteristic size (core/sim/mesh_size_band.cpp).
+_COARSENED_MARKER = "auto-coarsened"
+
+
+def _coarsening_notes(out: dict) -> list:
+    """The engine notes saying the size governor overrode the discretization we asked for."""
+    pools: list = [out.get("solver_notes"), out.get("notes")]
+    quality = out.get("mesh_quality")
+    if isinstance(quality, dict):
+        pools.extend((quality.get("notes"), quality.get("note")))
+    found: list = []
+    for pool in pools:
+        items = [pool] if isinstance(pool, str) else pool
+        if not isinstance(items, (list, tuple)):
+            continue
+        for note in items:
+            if isinstance(note, str) and _COARSENED_MARKER in note and note not in found:
+                found.append(note)
+    return found
+
+
+def _degenerate_legs(rows: list) -> list:
+    """Ladder pairs that are the SAME discretization, so their delta is not a convergence.
+
+    Two shapes count: any two legs with an identical (n_dof, n_elems) mesh — the governor
+    handing back one budget-limited mesh for several rungs — and consecutive legs whose DOF
+    count barely moved, which is the same failure with rounding on top.
+    """
+    hits: list = []
+    seen: dict = {}
+    for i, row in enumerate(rows):
+        dof, elems = row.get("n_dof"), row.get("n_elems")
+        if not isinstance(dof, (int, float)) or isinstance(dof, bool) or dof <= 0:
+            continue
+        key = (dof, elems)
+        if key in seen:
+            hits.append(
+                {
+                    "legs": [seen[key], i],
+                    "n_dof": [dof, dof],
+                    "n_elems": [elems, elems],
+                    "dof_growth_pct": 0.0,
+                    "identical_mesh": True,
+                }
+            )
+        else:
+            seen[key] = i
+    for i in range(1, len(rows)):
+        prev, cur = rows[i - 1], rows[i]
+        a, b = prev.get("n_dof"), cur.get("n_dof")
+        if any(not isinstance(v, (int, float)) or isinstance(v, bool) for v in (a, b)):
+            continue
+        if a <= 0:
+            continue
+        growth = abs(float(b) - float(a)) / abs(float(a)) * 100.0
+        identical = a == b and prev.get("n_elems") == cur.get("n_elems")
+        if identical or growth >= _LADDER_MIN_DOF_GROWTH_PCT:
+            continue  # identical pairs are already recorded above; healthy growth is fine
+        hits.append(
+            {
+                "legs": [i - 1, i],
+                "n_dof": [a, b],
+                "n_elems": [prev.get("n_elems"), cur.get("n_elems")],
+                "dof_growth_pct": round(growth, 3),
+                "identical_mesh": False,
+            }
+        )
+    hits.sort(key=lambda h: (h["legs"][1], h["legs"][0]))
+    return hits
+
+
 def _convergence_ladder(sizes_mm, fineness) -> tuple:
     """The explicit coarse-to-fine discretization ladder: ("target_size_mm"|"fineness", [...]).
 
@@ -2374,6 +2454,11 @@ def _convergence_row(step: dict, out: dict, monitor: str, prev: Optional[float])
         row["equilibrium_error_pct"] = out["reactions"].get("equilibrium_error_pct")
     if out.get("vtu_path"):
         row["vtu_path"] = out["vtu_path"]
+    governor = _coarsening_notes(out)
+    if governor:
+        # The engine's own admission that it did not mesh at the size we asked for. Without
+        # it on the row, a collapsed ladder looks like a well-behaved one.
+        row["mesh_governor_notes"] = governor
     value = summary.get(monitor)
     row["monitored_value"] = value
     # A zero previous value has no percentage change (division by zero is not "0% drift"),
@@ -2390,9 +2475,11 @@ def _convergence_envelope(
 ) -> dict:
     """The convergence verdict over a finished ladder — never a PASS on a partial table."""
     failed = [i for i, r in enumerate(rows) if r.get("error")]
+    degenerate = _degenerate_legs(rows)
     last_delta = rows[-1].get("delta_pct_vs_prev") if rows else None
     converged = (
         not failed
+        and not degenerate
         and len(rows) >= 2
         and isinstance(last_delta, (int, float))
         and abs(last_delta) < tol_pct
@@ -2405,12 +2492,47 @@ def _convergence_envelope(
         "table": rows,
         "n_meshes": len(rows),
         "converged": converged,
+        "degenerate_ladder": bool(degenerate),
         "final_delta_pct": last_delta,
         "note": (
             "converged is |delta of the FINEST leg| < tol_pct on the monitored value; "
             "a peak that keeps growing with refinement is a singularity, not strength."
         ),
     }
+    if degenerate:
+        out["degenerate_legs"] = degenerate
+        governor = {
+            str(i): r["mesh_governor_notes"]
+            for i, r in enumerate(rows)
+            if r.get("mesh_governor_notes")
+        }
+        pairs = ", ".join(
+            f"legs {h['legs'][0]}&{h['legs'][1]} "
+            + (
+                f"identical ({h['n_dof'][0]} DOF, {h['n_elems'][0]} elems)"
+                if h["identical_mesh"]
+                else f"only {h['dof_growth_pct']}% DOF apart"
+            )
+            for h in degenerate
+        )
+        out["note"] = (
+            "DEGENERATE LADDER — this is NOT a convergence statement. The legs did not "
+            f"discretize differently: {pairs} (threshold: consecutive legs must differ by "
+            f"at least {_LADDER_MIN_DOF_GROWTH_PCT}% in n_dof). A near-zero "
+            "delta_pct_vs_prev between two copies of the same mesh says nothing about "
+            "mesh sensitivity, so converged is forced false. Cause: the mesh-size "
+            "governor (core/sim/mesh_size_band) clamps the requested size against an "
+            "element budget for interactivity, and on a large part several `fineness` "
+            "rungs land on the same budget-limited size. Remedy: re-run with explicit "
+            "sizes_mm=[...] (they map straight to study.target_size_mm and bypass the "
+            "fineness governor), e.g. sizes_mm=[8,5,3] for a large frame. If the "
+            "governor still coarsens — look for an 'auto-coarsened for interactivity' "
+            "note in each leg's mesh_quality/solver_notes — then its element budget is "
+            "capping the whole ladder and run_fea_adaptive (which refines against an "
+            "error indicator instead of a stated size) is the alternative evidence path."
+        )
+        if governor:
+            out["mesh_governor_notes"] = governor
     if failed:
         out["error"] = (
             f"{len(failed)} of {len(rows)} convergence legs failed (rows "
@@ -2695,9 +2817,16 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
                    resolved ONCE (one STEP export, one set of fixture/load point sets) and
                    reused by every leg, so the legs differ only in discretization.
         sizes_mm : coarse-to-fine characteristic element sizes in mm, strictly decreasing,
-                   e.g. [4, 2, 1]. This is the runbook spelling (`-h` in the polymesh CLI).
+                   e.g. [4, 2, 1]. This is the runbook spelling (`-h` in the polymesh CLI)
+                   and the RELEASE-GRADE one: each entry maps straight to
+                   study.target_size_mm and bypasses the mesh-fineness governor.
         fineness : the alternative spelling — a strictly increasing list on the 0..1
                    mesh_fineness scale, e.g. [0.25, 0.5, 0.75] or ["coarse","medium","fine"].
+                   A fineness ladder is SUBJECT TO the mesh-size governor
+                   (core/sim/mesh_size_band), which clamps the derived size against an
+                   element budget for interactivity: on a large part several rungs can
+                   collapse onto one identical mesh, and identical meshes cannot converge.
+                   Prefer sizes_mm for anything you intend to release.
                    Pass exactly one of sizes_mm / fineness; at least 2 entries either way.
         mesh_order : 1 (tet4) or 2 (tet10, default). Keep it constant across the ladder —
                    changing element order mid-study is a different discretization family.
@@ -2718,12 +2847,16 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
                    fixtures/loads are NOT needed on this call — the setup is already baked
                    into the jobs. They are required only when starting a new ladder.
 
-        Returns {ok, monitor, tol_pct, converged, final_delta_pct, n_meshes,
-        table:[{size_mm|fineness, mesh_order, n_dof, n_nodes, n_elems,
+        Returns {ok, monitor, tol_pct, converged, degenerate_ladder, final_delta_pct,
+        n_meshes, table:[{size_mm|fineness, mesh_order, n_dof, n_nodes, n_elems,
         max_von_mises_mpa, max_disp_mm, min_fos, monitored_value, delta_pct_vs_prev,
-        mesh_quality, equilibrium_error_pct}]}. `converged` is |the FINEST leg's delta| <
-        tol_pct. A failed leg keeps its row and forces ok:false — a table missing its
-        finest mesh would read as "converged at the coarse end".
+        mesh_quality, equilibrium_error_pct, mesh_governor_notes}]}. `converged` is |the
+        FINEST leg's delta| < tol_pct. A failed leg keeps its row and forces ok:false — a
+        table missing its finest mesh would read as "converged at the coarse end".
+        `degenerate_ladder:true` means two legs meshed the same (identical n_dof/n_elems,
+        or under 5% DOF growth between consecutive legs); converged is then forced false
+        and `note` carries the remedy, because a 0% delta between two copies of one mesh
+        is not evidence.
         """
         try:
             tol_pct = _finite_float(tol_pct, "tol_pct")

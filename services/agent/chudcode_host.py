@@ -301,8 +301,9 @@ class ChudcodeSessionHost:
                     )
 
                 state = _safe_client_state(session.client)
+                provider_failure = _unrecovered_provider_failure(frames)
                 result = {
-                    "ok": not emit_errors,
+                    "ok": not emit_errors and provider_failure is None,
                     "run_id": run_id,
                     "session_id": session_id,
                     "cancelled": run.cancel_requested,
@@ -316,6 +317,14 @@ class ChudcodeSessionHost:
                     result["chudcode_session_file"] = state.get(
                         "sessionFile"
                     ) or state.get("session_file")
+                if provider_failure is not None:
+                    # Chudcode still emits a terminal agent_end when its retry budget is
+                    # exhausted (429 with a retry-after past retry.maxDelayMs, auth revoked,
+                    # …); the process is idle and healthy but the turn delivered nothing.
+                    # A mission driver that trusts `terminal` alone reported OK/completed
+                    # on a 53-second turn with 77 bytes of text. The failure is the result.
+                    result["stop_reason"] = "provider_error"
+                    result["reason"] = provider_failure
                 if emit_errors:
                     result["reason"] = (
                         f"chudcode event forwarding failed: {emit_errors[0]}"
@@ -1659,6 +1668,38 @@ def _safe_client_state(client: Any) -> dict[str, Any]:
             type(exc).__name__,
         )
         return {}
+
+
+_RETRY_FAILED_FRAMES = frozenset({"auto_retry_end", "retry_end", "retry_failed"})
+_ASSISTANT_OUTPUT_FRAMES = frozenset({"message_end", "message_complete", "tool_execution_end"})
+
+
+def _unrecovered_provider_failure(frames: list[dict[str, Any]]) -> str | None:
+    """Return the provider error when a failed retry was the turn's last real event.
+
+    A retry that fails and is then followed by assistant output (a later message or
+    tool result) was recovered — a model fallback or a manual continue — and is not a
+    turn failure. Only a failed retry with nothing but lifecycle frames after it means
+    the turn produced no work past that point.
+    """
+    for frame in reversed(frames):
+        kind = frame.get("type")
+        if kind in _ASSISTANT_OUTPUT_FRAMES:
+            return None
+        if kind not in _RETRY_FAILED_FRAMES:
+            continue
+        if frame.get("success") is True:
+            return None
+        message = ""
+        for key in ("finalError", "final_error", "error", "errorMessage", "message", "reason"):
+            value = frame.get(key)
+            if isinstance(value, dict):
+                value = value.get("message") or value.get("error")
+            if isinstance(value, str) and value.strip():
+                message = value.strip()
+                break
+        return f"provider retry exhausted: {message or 'no error detail'}"[:1200]
+    return None
 
 
 def _safe_last_assistant_text(client: Any) -> str | None:

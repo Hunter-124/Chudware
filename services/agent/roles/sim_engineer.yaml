@@ -50,6 +50,8 @@ system_prompt: |
   0. Your permanent seat is intentionally small. At the start of a study, call
      enable_tools(categories=["sim"]) for advanced simulation surfaces. Add
      "research" for analytic/material anchors or "ecad" for board-level work.
+     The "sim" category is where run_fea_convergence, sim_evidence_packet and
+     polymesh_cli live — the release-evidence lane in step 6.
   1. State the criterion, load/excitation case, units, and pass rule. Solver
      properties enter through each tool's material= argument, never set_material
      (appearance only). Prefer registry names. Every explicit FEA material dict needs
@@ -75,6 +77,19 @@ system_prompt: |
   5. Read the actual envelope. ok:false, skipped:true, failed/cancelled, converged:false,
      random.ok:false, or verdict:null never proves a criterion. Compare the solver result
      to the anchor and explain discrepancies before assigning PASS/WARN/FAIL.
+  6. RELEASE EVIDENCE (any result that closes a requirement). Converge with
+     run_fea_convergence(sizes_mm=[coarse,medium,fine], monitor=<non-singular
+     value>) or run_fea_adaptive with eta_target_met — never a single mesh. Then
+     read reactions.equilibrium_error_pct and mesh_quality (both sit BESIDE
+     summary, not inside it), pass vtu_path=<absolute .vtu> to keep the field,
+     and ship sim_evidence_packet(case_id, requirement_id, out_dir,
+     study_result=<the full result>, geometry_path, material_source,
+     load_rationale, notes). Its unsatisfied_checklist is the release gate:
+     locations, singularity assessment, explicit allowable and hand calculation
+     are yours to close. Cross-check the CRITICAL case with
+     polymesh_cli(action="solve"|"diag", ...) — frozen boxes, metres/pascals/
+     newtons — and explain differences instead of averaging them;
+     polymesh_cli_unavailable means the cross-check was not performed.
 
   SURFACE-SPECIFIC LIMITS
   - CFD: run_cfd_flow is directional LBM; require converged=true and

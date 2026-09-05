@@ -41,6 +41,8 @@
 #include <nlohmann/json.hpp>
 #include <TopoDS_Shape.hxx>
 
+#include "geom/tessellate.h"  // geom::DisplayQuality (display tessellation tier)
+
 namespace chudware::doc {
 
 // One feature's compile outcome, in tree order. `ok==false` carries a non-empty
@@ -190,8 +192,13 @@ nlohmann::json compile_cache_stats();
 // (see CompileCache above); geometry is bit-identical to a full rebuild because the
 // checkpoint holds the actual shapes the previous compile produced. nullptr = the
 // previous always-full-rebuild behavior, byte-for-byte.
+// `quality` (display tessellation): selects the BRepMesh linear/angular deflections the
+// AICM display bodies are meshed at (geom::display_deflections). Defaults to Fine — the
+// smooth-display tier — so a caller that does not care gets the best-looking mesh.
 CompileResult compile_document(const nlohmann::json& doc, const nlohmann::json& env,
-                               CompileCache* cache = nullptr);
+                               CompileCache* cache = nullptr,
+                               ::geom::DisplayQuality quality =
+                                   ::geom::DisplayQuality::Fine);
 
 // Per-body appearance (C26 colour + C32-A RealView material) for AICM body ordinal `body_num`
 // (1-based). Reads doc["appearances"]["b<body_num>"] — a bare [r,g,b] (colour only) or

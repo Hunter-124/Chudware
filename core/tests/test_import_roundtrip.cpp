@@ -7,12 +7,15 @@
 //        "nothing happens when I open a .step" bug).
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include <doctest/doctest.h>
+#include <algorithm>
 #include <array>
+#include <map>
 
 #include <filesystem>
 #include <string>
 #include <fstream>
 #include <cstdint>
+#include <cmath>
 #include <cstring>
 #include <cstdlib>
 #ifndef _WIN32
@@ -23,9 +26,17 @@
 
 #include <BRepGProp.hxx>
 #include <BRepPrimAPI_MakeBox.hxx>
+#include <BRep_Tool.hxx>
 #include <GProp_GProps.hxx>
+#include <Poly_Triangulation.hxx>
+#include <TopExp_Explorer.hxx>
+#include <TopLoc_Location.hxx>
+#include <TopoDS.hxx>
+#include <TopoDS_Face.hxx>
 #include <TopoDS_Shape.hxx>
+#include <gp_Dir.hxx>
 #include <gp_Pnt.hxx>
+#include <gp_Vec.hxx>
 
 #include "doc/formats.h"
 #include "doc/session.h"
@@ -284,6 +295,39 @@ TEST_CASE("modern SolidWorks part becomes native geometry and meshes with Polyhe
     REQUIRE(bodies.size() == 1);
     CHECK(vol(bodies.front().second) == doctest::Approx(1000.0).epsilon(1e-5));
 
+    // The sewn B-rep must reach the display tessellator with a normal-bearing
+    // Poly_Triangulation (without it the box renders from recomputed flat normals, and a
+    // curved import renders as discrete facets). The normals are DERIVED from the soup, not
+    // read from the file: the fixture authors +Z on every face, which is wrong on four of
+    // the six, and a 40 deg crease angle keeps a box's faces flat. Composed with the face
+    // orientation exactly as core/geom/tessellate.cpp does, every normal must therefore
+    // point OUT of the 10 mm box — which is also the winding/orientation contract.
+    const gp_Pnt center(5.0, 5.0, 5.0);
+    int faces_with_normals = 0;
+    for (TopExp_Explorer fx(bodies.front().second, TopAbs_FACE); fx.More(); fx.Next()) {
+        const TopoDS_Face face = TopoDS::Face(fx.Current());
+        TopLoc_Location loc;
+        Handle(Poly_Triangulation) tri = BRep_Tool::Triangulation(face, loc);
+        REQUIRE(!tri.IsNull());
+        REQUIRE(tri->HasNormals());
+        ++faces_with_normals;
+        const double sign = (face.Orientation() == TopAbs_REVERSED) ? -1.0 : 1.0;
+        for (int ni = 1; ni <= tri->NbNodes(); ++ni) {
+            gp_Pnt node = tri->Node(ni);
+            gp_Dir nv = tri->Normal(ni);
+            if (!loc.IsIdentity()) {
+                node.Transform(loc.Transformation());
+                nv.Transform(loc.Transformation());
+            }
+            const gp_Vec outward(center, node);
+            CHECK(sign * gp_Vec(nv).Dot(outward) > 0.0);
+            // A box has only 90 deg creases: nothing smooths, so each normal is axis-aligned.
+            const double ax = std::abs(nv.X()), ay = std::abs(nv.Y()), az = std::abs(nv.Z());
+            CHECK(std::max({ax, ay, az}) == doctest::Approx(1.0).epsilon(1e-6));
+        }
+    }
+    CHECK(faces_with_normals == 12);  // six quads, two triangles each
+
     json imported = doc_import_file(source.string(), "", false, "sldprt");
     REQUIRE(body_count(imported) == 1);
     CHECK(imported.value("import_fidelity", std::string()) == "saved_display_tessellation");
@@ -338,4 +382,102 @@ TEST_CASE("modern SolidWorks assembly preserves instances and transforms") {
           json::array({"Tetra-1", "Tetra-2"}));
     CHECK(center_x[1] - center_x[0] == doctest::Approx(20.0).epsilon(1e-9));
     fs::remove(source);
+}
+
+// A faceted cylinder wound INSIDE-OUT — exactly the shape a SolidWorks saved-display import
+// arrived in (signed volume -374963 mm³ on a 375017 mm³ spacer, so eval_mass was 28% wrong).
+// mesh_to_shape must hand back a solid with POSITIVE volume, and it must give the curved
+// wall smooth per-vertex normals while keeping the 90 deg wall/cap crease flat.
+TEST_CASE("mesh_to_shape re-orients an inverted soup and smooths its curved wall") {
+    using chudware::doc::MeshData;
+    using chudware::doc::mesh_to_shape;
+
+    constexpr int kSides = 48;
+    constexpr double kR = 10.0, kH = 20.0, kPi = 3.14159265358979323846;
+    MeshData mesh;
+    // Rim vertices (bottom 0..N-1, top N..2N-1) plus the two cap centres.
+    for (int ring = 0; ring < 2; ++ring)
+        for (int i = 0; i < kSides; ++i) {
+            const double a = 2.0 * kPi * i / kSides;
+            mesh.verts.insert(mesh.verts.end(),
+                              {kR * std::cos(a), kR * std::sin(a), ring ? kH : 0.0});
+        }
+    const std::uint32_t c_bot = 2 * kSides, c_top = 2 * kSides + 1;
+    mesh.verts.insert(mesh.verts.end(), {0.0, 0.0, 0.0});
+    mesh.verts.insert(mesh.verts.end(), {0.0, 0.0, kH});
+    // INWARD winding throughout (the outward version of each triangle has b/c swapped).
+    for (int i = 0; i < kSides; ++i) {
+        const std::uint32_t b0 = i, b1 = (i + 1) % kSides;
+        const std::uint32_t t0 = kSides + b0, t1 = kSides + b1;
+        mesh.tris.insert(mesh.tris.end(), {b0, t0, b1});
+        mesh.tris.insert(mesh.tris.end(), {b1, t0, t1});
+        mesh.tris.insert(mesh.tris.end(), {c_bot, b0, b1});
+        mesh.tris.insert(mesh.tris.end(), {c_top, t1, t0});
+    }
+
+    const TopoDS_Shape shape = mesh_to_shape(mesh);
+    REQUIRE(!shape.IsNull());
+    const double expect = 0.5 * kSides * std::sin(2.0 * kPi / kSides) * kR * kR * kH;
+    CHECK(vol(shape) == doctest::Approx(expect).epsilon(1e-6));  // POSITIVE: re-oriented
+
+    // Normals, composed with the face orientation the way core/geom/tessellate.cpp does.
+    // Wall faces: horizontal, radial to within one facet pitch, CONTINUOUS across the facet
+    // boundary (one normal per rim position, shared by both adjacent facets — that C0
+    // normal field IS smooth shading) and genuinely averaged rather than flat. Cap faces:
+    // the 90 deg crease kept them purely axial, so a box-like edge stays sharp.
+    const double pitch = 2.0 * kPi / kSides;
+    using PosKey = std::array<long long, 3>;
+    std::map<PosKey, gp_Vec> wall_normal;  // welded wall position -> its one shared normal
+    int wall_faces = 0, cap_faces = 0;
+    double max_tilt = 0.0;  // biggest angle between a node normal and its own facet normal
+    for (TopExp_Explorer fx(shape, TopAbs_FACE); fx.More(); fx.Next()) {
+        const TopoDS_Face face = TopoDS::Face(fx.Current());
+        TopLoc_Location loc;
+        Handle(Poly_Triangulation) tri = BRep_Tool::Triangulation(face, loc);
+        REQUIRE(!tri.IsNull());
+        REQUIRE(tri->HasNormals());
+        REQUIRE(tri->NbNodes() == 3);
+        const double sign = (face.Orientation() == TopAbs_REVERSED) ? -1.0 : 1.0;
+        gp_Pnt p[3];
+        gp_Vec n[3];
+        for (int ni = 0; ni < 3; ++ni) {
+            p[ni] = tri->Node(ni + 1);
+            gp_Dir nv = tri->Normal(ni + 1);
+            if (!loc.IsIdentity()) {
+                p[ni].Transform(loc.Transformation());
+                nv.Transform(loc.Transformation());
+            }
+            n[ni] = gp_Vec(sign * nv.X(), sign * nv.Y(), sign * nv.Z());
+            // Outward: away from the body centre.
+            CHECK(n[ni].Dot(gp_Vec(gp_Pnt(0.0, 0.0, kH / 2.0), p[ni])) > 1e-9);
+        }
+        // The facet's own flat normal, under the same winding the tessellator emits.
+        gp_Vec flat = gp_Vec(p[0], p[1]).Crossed(gp_Vec(p[0], p[2])) * sign;
+        flat.Normalize();
+        for (int ni = 0; ni < 3; ++ni)
+            max_tilt = std::max(max_tilt, n[ni].Angle(flat));
+        const bool wall = std::abs(n[0].Z()) < 1e-6 && std::abs(n[1].Z()) < 1e-6 &&
+                          std::abs(n[2].Z()) < 1e-6;
+        if (!wall) {
+            for (int ni = 0; ni < 3; ++ni)
+                CHECK(std::abs(n[ni].Z()) == doctest::Approx(1.0).epsilon(1e-6));
+            ++cap_faces;
+            continue;
+        }
+        ++wall_faces;
+        for (int ni = 0; ni < 3; ++ni) {
+            const double r = std::hypot(p[ni].X(), p[ni].Y());
+            CHECK(r == doctest::Approx(kR).epsilon(1e-9));
+            CHECK(n[ni].Dot(gp_Vec(p[ni].X() / r, p[ni].Y() / r, 0.0)) > std::cos(pitch));
+            const PosKey key{std::llround(p[ni].X() * 1e6), std::llround(p[ni].Y() * 1e6),
+                             std::llround(p[ni].Z() * 1e6)};
+            const auto seen = wall_normal.emplace(key, n[ni]);
+            if (!seen.second) CHECK(seen.first->second.Angle(n[ni]) < 1e-6);
+        }
+    }
+    CHECK(wall_faces == 2 * kSides);
+    CHECK(cap_faces == 2 * kSides);
+    // Both rim rings, each welded position carrying exactly ONE normal.
+    CHECK(static_cast<int>(wall_normal.size()) == 2 * kSides);
+    CHECK(max_tilt > 0.1 * pitch);
 }

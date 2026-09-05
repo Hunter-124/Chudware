@@ -1313,7 +1313,8 @@ void apply_doc_appearance(const json& doc, uint32_t body_num,
     }
 }
 
-CompileResult compile_document(const json& doc, const json& env_json, CompileCache* cache) {
+CompileResult compile_document(const json& doc, const json& env_json, CompileCache* cache,
+                               ::geom::DisplayQuality quality) {
     CompileResult result;
     const EnvMap env = parse_env(env_json);
 
@@ -1953,6 +1954,9 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
         uint64_t h = cc_fnv1a(env_json.is_object() && !env_json.empty() ? env_json.dump()
                                                                         : std::string());
         h = cc_fnv1a(result.active_configuration, h);
+        // Display quality bakes into the AICM this result carries, so it belongs in the
+        // chain seed: switching quality is a cache MISS (full and prefix) and re-meshes.
+        h = cc_fnv1a(::geom::display_quality_name(quality), h);
         chain.push_back(h);
         for (std::size_t i = 0; i < n_features; ++i)
             chain.push_back(cc_fnv1a(features[i].dump(), chain.back()));
@@ -3337,6 +3341,12 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                 // its OWN body ("<id>#k"), so a multi-body STEP keeps its bodies separate
                 // (Bug N-5) instead of being merged into one compound.
                 std::vector<TopoDS_Shape> solids;
+                // Body-name roster, parallel to `solids` ("" where the source names
+                // nothing). It is what keep_bodies/exclude_bodies match strings against,
+                // and what an unknown-name error lists back to the caller. Until now
+                // `embedded_body_names` (written by doc_import_file) was never read by the
+                // compiler at all.
+                std::vector<std::string> body_names;
                 std::string src_desc;
                 const std::string embedded = str_field(feat, "embedded_brep", "");
                 if (!embedded.empty()) {
@@ -3373,11 +3383,106 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                                                  "': " + oe.what());
                     }
                     for (auto& [name, shp] : imported)
-                        if (!shp.IsNull()) solids.push_back(shp);
+                        if (!shp.IsNull()) {
+                            solids.push_back(shp);
+                            body_names.push_back(name);
+                        }
                 }
                 if (solids.empty())
                     throw std::runtime_error("import: no usable bodies in '" + src_desc + "'");
-                // Register each solid as a separate body (id = "<fid>" then "<fid>#k").
+                if (body_names.empty()) {
+                    if (auto nit = feat.find("embedded_body_names");
+                        nit != feat.end() && nit->is_array())
+                        for (const auto& nv : *nit)
+                            body_names.push_back(nv.is_string() ? nv.get<std::string>()
+                                                                : std::string());
+                }
+                body_names.resize(solids.size());
+
+                // --- keep_bodies / exclude_bodies: sub-select which of a multi-body
+                // import actually becomes a body. Merging independently sourced CAD means
+                // importing a vendor STEP that carries the whole assembly when only one
+                // part of it is wanted; without this the extra bodies land in the document
+                // and every mass/interference number afterwards is wrong. Entries are
+                // 1-based ordinals (matching the "<fid>#k" body order) or body-name
+                // strings matched against the roster above. An unknown entry is a COMPILE
+                // ERROR listing the roster — a silently ignored filter is how the wrong
+                // body ships. Dropped bodies are never registered, so a downstream
+                // reference to one fails through the normal require_solid path.
+                {
+                    auto roster = [&]() {
+                        std::ostringstream os;
+                        for (std::size_t k = 0; k < solids.size(); ++k) {
+                            if (k) os << ", ";
+                            os << (k + 1);
+                            if (!body_names[k].empty()) os << ":\"" << body_names[k] << "\"";
+                        }
+                        return os.str();
+                    };
+                    std::vector<char> keep(solids.size(), 1);
+                    auto apply_list = [&](const json& list, const char* pname, char on) {
+                        for (const auto& e : list) {
+                            if (e.is_number_integer()) {
+                                const long long ord = e.get<long long>();
+                                if (ord < 1 || ord > static_cast<long long>(solids.size()))
+                                    throw std::runtime_error(
+                                        std::string("import: ") + pname + " has no body " +
+                                        std::to_string(ord) + " — ordinals are 1-based and '" +
+                                        src_desc + "' has " + std::to_string(solids.size()) +
+                                        " bodies: " + roster());
+                                keep[static_cast<std::size_t>(ord) - 1] = on;
+                            } else if (e.is_string()) {
+                                const std::string want = e.get<std::string>();
+                                bool hit = false;
+                                for (std::size_t k = 0; k < solids.size(); ++k)
+                                    if (body_names[k] == want) {
+                                        keep[k] = on;
+                                        hit = true;
+                                    }
+                                if (!hit)
+                                    throw std::runtime_error(
+                                        std::string("import: ") + pname + " names no body '" +
+                                        want + "' — '" + src_desc + "' has " +
+                                        std::to_string(solids.size()) + " bodies: " + roster());
+                            } else {
+                                throw std::runtime_error(
+                                    std::string("import: ") + pname +
+                                    " entries must be a 1-based body ordinal (int) or a body "
+                                    "name (string); bodies here: " + roster());
+                            }
+                        }
+                    };
+                    auto kit = feat.find("keep_bodies");
+                    if (kit != feat.end() && kit->is_array()) {
+                        if (kit->empty())
+                            throw std::runtime_error(
+                                "import: keep_bodies is empty — omit it to keep every body. "
+                                "Bodies here: " + roster());
+                        std::fill(keep.begin(), keep.end(), 0);
+                        apply_list(*kit, "keep_bodies", 1);
+                    }
+                    auto xit = feat.find("exclude_bodies");
+                    if (xit != feat.end() && xit->is_array())
+                        apply_list(*xit, "exclude_bodies", 0);
+
+                    if (std::find(keep.begin(), keep.end(), 1) == keep.end())
+                        throw std::runtime_error(
+                            "import: keep_bodies/exclude_bodies dropped every body of '" +
+                            src_desc + "' — an import must yield at least one body. Bodies "
+                            "here: " + roster());
+                    std::vector<TopoDS_Shape> kept;
+                    std::vector<std::string> kept_names;
+                    for (std::size_t k = 0; k < solids.size(); ++k)
+                        if (keep[k]) {
+                            kept.push_back(solids[k]);
+                            kept_names.push_back(body_names[k]);
+                        }
+                    solids = std::move(kept);
+                    body_names = std::move(kept_names);
+                }
+
+                // Register each surviving solid as a separate body (id = "<fid>" then
+                // "<fid>#k"), renumbered over the KEPT set.
                 for (std::size_t k = 0; k < solids.size(); ++k) {
                     std::string pid = (k == 0) ? id : id + "#" + std::to_string(k);
                     results[pid] = SolidResult{solids[k]};
@@ -7676,9 +7781,10 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
     CompileCache* bc = (use_cache && tess_cache_on) ? cache : nullptr;
     std::map<std::tuple<const void*, bool, uint64_t>,
              std::shared_ptr<const CachedBody>> new_body_cache;
-    // Bit-exact hash of a body's baked appearance (color+metal+rough) so a set_appearance
-    // change is a cache miss but geometry-identical bodies with identical appearance hit.
-    auto appearance_hash = [](const float col[3], float metal, float rough) -> uint64_t {
+    // Bit-exact hash of a body's baked appearance (color+metal+rough) PLUS the display
+    // quality tier, so a set_appearance change or a display-quality change is a cache
+    // miss while geometry-identical bodies with identical appearance+quality still hit.
+    auto appearance_hash = [quality](const float col[3], float metal, float rough) -> uint64_t {
         uint64_t h = 1469598103934665603ULL;
         const float vals[5] = {col[0], col[1], col[2], metal, rough};
         for (float f : vals) {
@@ -7686,6 +7792,7 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
             std::memcpy(&bits, &f, sizeof(bits));
             h = (h ^ bits) * 1099511628211ULL;
         }
+        h = (h ^ static_cast<uint64_t>(quality)) * 1099511628211ULL;
         return h;
     };
     for (const std::string& sid : solid_order) {
@@ -7739,16 +7846,18 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
             }
 
             // Fresh tessellate + stats.
-            // T-PERF7(b) size-relative linear deflection — the shared helper
-            // ::geom::auto_linear_deflection computes clamp(bbox_diag * 6e-4,
-            // 0.02 mm, 1.0 mm), so a ~50 mm part keeps the historical 0.05 mm
-            // quality while multi-metre parts stop meshing at millions of tris.
-            // Passing 0.0 (the auto sentinel) lets tessellate_body pick it; every
-            // default-parameter caller gets the same policy.
-            // Angular deflection stays 0.35 rad (tessellate_body clamps for display).
+            // Display-quality tier (`quality`, default Fine) picks BOTH BRepMesh
+            // tolerances: lin = clamp(bbox_diag * rel, floor, ceil) mm and ang in
+            // radians (see geom::display_deflections for the per-tier numbers). This
+            // replaced a hardcoded lin=auto / ang=0.35 rad, which faceted imported
+            // real B-rep visibly — a 2.6 m frame meshed at a 1.0 mm chord with ~18
+            // segments per circle. The tier is folded into the body-cache key above,
+            // so re-compiling at a new quality re-meshes instead of reusing.
             g_cc_bodies_tessellated.fetch_add(1, std::memory_order_relaxed);
+            const ::geom::DisplayDeflections defl =
+                ::geom::display_deflections(quality, shape);
             aicm::AicmBody b = ::geom::tessellate_body(shape, body_num, sid, bcolor,
-                                                       /*lin_deflection=*/0.0, 0.35,
+                                                       defl.lin, defl.ang,
                                                        bmetal, brough);
             result.shapes.push_back(shape);  // AICM order: shapes[i] <-> body ordinal i+1
             ++body_num;

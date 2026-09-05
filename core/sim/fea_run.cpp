@@ -10,6 +10,9 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
+#include <ctime>
+#include <filesystem>
 #include <fstream>
 #include <functional>
 #include <map>
@@ -19,6 +22,7 @@
 #include <list>
 #include <mutex>
 #include <string>
+#include <system_error>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -29,7 +33,9 @@
 #include "sim/mesher.h"
 #include "sim/sim_cache.h"
 #include "sim/sim_cancel.h"
+#include "sim/vtu_writer.h"
 #include "util/resource_governor.h"
+#include "version_info.h"  // CMake-configured CHUDWARE_HOSTD_BUILD_ID (engine build id)
 
 using nlohmann::json;
 
@@ -57,6 +63,143 @@ json mesh_advisor_json(const MeshAdvisor& advisor) {
                 {"ood_distance", advisor.ood_distance},
                 {"model_revision", advisor.model_revision},
                 {"note", advisor.note}};
+}
+
+// ── Run evidence: mesh quality, provenance, and the optional .vtu artifact ───────
+// Every solve route reports the same three objects, assembled here so a static, an
+// adaptive, a modal and a thermal result cannot describe their mesh or their build
+// in three different dialects.
+
+// Quality metrics of the mesh a study actually solved, carried out of resolve_mesh.
+// `valid` is false when the metrics do not apply (non-tetrahedral inline mesh) or
+// could not be computed, in which case `note` says why and the metric values are
+// reported as null rather than as a plausible-looking zero.
+struct MeshQualityFacts {
+    bool valid = false;
+    double aspect_min = 0.0;
+    double aspect_avg = 0.0;
+    double aspect_max = 0.0;
+    double jacobian_min = 0.0;
+    double pct_poor = 0.0;
+    double min_tet_volume_mm3 = 0.0;
+    double max_tet_edge_ratio = 0.0;
+    std::string note;
+};
+
+json mesh_quality_json(const MeshQualityFacts& quality, std::size_t n_nodes,
+                       std::size_t n_elems, int nodes_per_elem) {
+    json out = {{"n_nodes", n_nodes},
+                {"n_elems", n_elems},
+                {"order", nodes_per_elem == 10 ? 2 : 1}};
+    static constexpr const char* kMetrics[] = {
+        "aspect_min", "aspect_avg", "aspect_max", "jacobian_min",
+        "pct_poor",   "min_tet_volume_mm3",       "max_tet_edge_ratio"};
+    const double values[] = {quality.aspect_min,        quality.aspect_avg,
+                             quality.aspect_max,        quality.jacobian_min,
+                             quality.pct_poor,          quality.min_tet_volume_mm3,
+                             quality.max_tet_edge_ratio};
+    for (std::size_t i = 0; i < std::size(kMetrics); ++i)
+        out[kMetrics[i]] = quality.valid ? json(values[i]) : json(nullptr);
+    if (!quality.note.empty()) out["note"] = quality.note;
+    return out;
+}
+
+std::string utc_now_iso8601() {
+    const std::time_t now = std::time(nullptr);
+    std::tm parts{};
+#if defined(_WIN32)
+    gmtime_s(&parts, &now);
+#else
+    gmtime_r(&now, &parts);
+#endif
+    char buf[32] = {0};
+    if (std::strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%SZ", &parts) == 0)
+        return std::string();
+    return std::string(buf);
+}
+
+// Which engine, which mesher, which commit, when — the reproducibility half of a
+// result. `solver` is the canonical route name ("chudware/fea_static", …).
+json provenance_json(const char* solver) {
+    return json{{"engine_build_id", CHUDWARE_HOSTD_BUILD_ID},
+                {"polymesh_commit", CHUDWARE_POLYMESH_COMMIT},
+                {"solver", solver},
+                {"mesher", "polyhedral-fea/graded-tet"},
+                {"timestamp_utc", utc_now_iso8601()}};
+}
+
+bool vtu_evidence_missing(const nlohmann::json& study) {
+    if (!study.is_object() || !study.contains("vtu_path") ||
+        !study["vtu_path"].is_string())
+        return false;
+    const std::string path = study["vtu_path"].get<std::string>();
+    if (path.empty()) return false;
+    std::error_code ec;
+    const bool present = std::filesystem::exists(std::filesystem::path(path), ec);
+    return ec ? true : !present;
+}
+
+bool write_result_vtu(const nlohmann::json& study, const std::vector<double>& points,
+                      const std::vector<int>& tets, int nodes_per_elem,
+                      const nlohmann::json& result, std::string& path_out,
+                      std::string& error) {
+    path_out.clear();
+    error.clear();
+    if (!study.is_object() || !study.contains("vtu_path")) return true;
+    const json& requested = study["vtu_path"];
+    if (!requested.is_string() || requested.get<std::string>().empty()) {
+        error = "vtu_path must be a non-empty absolute path";
+        return false;
+    }
+    const std::string path = requested.get<std::string>();
+    if (!std::filesystem::path(path).is_absolute()) {
+        error = "vtu_path must be an absolute path, got '" + path + "'";
+        return false;
+    }
+    const std::size_t n_nodes = points.size() / 3;
+    auto nodal = [&](const char* key) {
+        std::vector<double> values;
+        if (result.contains(key) && result[key].is_array()) {
+            values.reserve(result[key].size());
+            for (const auto& x : result[key])
+                values.push_back(x.is_number() ? x.get<double>() : 0.0);
+        }
+        return values;
+    };
+    std::vector<VtuPointField> fields;
+    {
+        std::vector<double> disp = nodal("displacement");
+        if (disp.size() == n_nodes * 3)
+            fields.push_back(VtuPointField{"displacement", 3, std::move(disp)});
+    }
+    for (const char* scalar : {"von_mises", "temperature"}) {
+        std::vector<double> values = nodal(scalar);
+        if (values.size() == n_nodes)
+            fields.push_back(VtuPointField{scalar, 1, std::move(values)});
+    }
+    // Modal: mode_shapes is flat n_modes*n*3, so each eigenvector becomes its own
+    // 3-vector field and a reader can animate one mode at a time.
+    {
+        const std::vector<double> shapes = nodal("mode_shapes");
+        const std::size_t per_mode = n_nodes * 3;
+        if (per_mode > 0 && !shapes.empty() && shapes.size() % per_mode == 0) {
+            const std::size_t n_modes = shapes.size() / per_mode;
+            for (std::size_t m = 0; m < n_modes; ++m)
+                fields.push_back(VtuPointField{
+                    "mode_" + std::to_string(m + 1), 3,
+                    std::vector<double>(shapes.begin() + static_cast<std::ptrdiff_t>(m * per_mode),
+                                        shapes.begin() +
+                                            static_cast<std::ptrdiff_t>((m + 1) * per_mode))});
+        }
+    }
+    if (fields.empty()) {
+        error = "vtu_path was requested but the result carries no nodal field "
+                "matching the solved mesh";
+        return false;
+    }
+    if (!write_vtu(path, points, tets, nodes_per_elem, fields, error)) return false;
+    path_out = path;
+    return true;
 }
 }  // namespace detail
 
@@ -304,15 +447,18 @@ bool faceset_normal(const json& fs, std::array<double, 3>& face_normal, double& 
 }
 
 // Resolve the mesh: inline points/tets if present, otherwise mesh the STEP
-// file.
+// file. `quality` reports the metrics of whichever mesh was resolved, so every
+// study result can describe the discretization it actually solved.
 bool resolve_mesh(const json &study, std::vector<double> &points,
                   std::vector<int> &tets, int &nodes_per_elem,
                   std::string &mesh_type_used, std::string &note,
-                  std::optional<MeshAdvisor> &advisor, std::string &err) {
+                  std::optional<MeshAdvisor> &advisor,
+                  detail::MeshQualityFacts &quality, std::string &err) {
   nodes_per_elem = 4;
   mesh_type_used.clear();
   note.clear();
   advisor.reset();
+  quality = detail::MeshQualityFacts{};
   const bool has_step = study.contains("step_path") &&
                         study["step_path"].is_string() &&
                         !study["step_path"].get<std::string>().empty();
@@ -349,6 +495,32 @@ bool resolve_mesh(const json &study, std::vector<double> &points,
           "configured inline mesh retained";
       advisor = std::move(unavailable);
     }
+    // Inline meshes report the SAME metrics a meshed study does: fill_quality only
+    // reads points/tets/nodes_per_elem, so the arrays are moved into a probe and
+    // straight back out rather than copied.
+    if (nodes_per_elem == 4 || nodes_per_elem == 10) {
+      MeshOut probe;
+      probe.points = std::move(points);
+      probe.tets = std::move(tets);
+      probe.nodes_per_elem = nodes_per_elem;
+      if (detail::fill_quality(probe)) {
+        quality.valid = true;
+        quality.aspect_min = probe.aspect_min;
+        quality.aspect_avg = probe.aspect_avg;
+        quality.aspect_max = probe.aspect_max;
+        quality.jacobian_min = probe.jacobian_min;
+        quality.pct_poor = probe.pct_poor;
+        quality.min_tet_volume_mm3 = probe.min_tet_volume_mm3;
+        quality.max_tet_edge_ratio = probe.max_tet_edge_ratio;
+      } else {
+        quality.note = probe.error;
+      }
+      points = std::move(probe.points);
+      tets = std::move(probe.tets);
+    } else {
+      quality.note = "tetrahedral quality metrics do not apply to a " +
+                     std::to_string(nodes_per_elem) + "-node element mesh";
+    }
     return true;
   }
   if (has_step) {
@@ -372,6 +544,14 @@ bool resolve_mesh(const json &study, std::vector<double> &points,
     mesh_type_used = mesh->mesh_type_used;
     note = mesh->note;
     advisor = mesh->advisor;
+    quality.valid = true;
+    quality.aspect_min = mesh->aspect_min;
+    quality.aspect_avg = mesh->aspect_avg;
+    quality.aspect_max = mesh->aspect_max;
+    quality.jacobian_min = mesh->jacobian_min;
+    quality.pct_poor = mesh->pct_poor;
+    quality.min_tet_volume_mm3 = mesh->min_tet_volume_mm3;
+    quality.max_tet_edge_ratio = mesh->max_tet_edge_ratio;
     return true;
   }
   err = "study must have inline points/tets or a step_path";
@@ -1268,7 +1448,9 @@ static nlohmann::json fea_run_static_impl(
             chudware::sim::cache::Kind::FeaStatic, cache_study);
     {
         auto hit = chudware::sim::cache::lookup(chudware::sim::cache::Kind::FeaStatic, input_hash);
-        if (hit.hit) {
+        // A hit whose promised .vtu evidence file no longer exists re-solves: the
+        // file IS the request, so echoing a path the filesystem lost would be a lie.
+        if (hit.hit && !detail::vtu_evidence_missing(study)) {
             if (job.cancelled())
                 return json{{"ok", false}, {"error", "fea_static: cancelled"}};
             json out = hit.result;
@@ -1296,11 +1478,12 @@ static nlohmann::json fea_run_static_impl(
     int nodes_per_elem = 4;
     std::string mesh_type_used, mesh_note;
     std::optional<MeshAdvisor> mesh_advisor;
+    detail::MeshQualityFacts mesh_quality;
     std::string err;
     {
         chudware::prof::phases::PhaseScope _p("mesh");
         if (!resolve_mesh(study, points, tets, nodes_per_elem, mesh_type_used,
-                          mesh_note, mesh_advisor, err))
+                          mesh_note, mesh_advisor, mesh_quality, err))
             return json{{"ok", false}, {"error", err}};
     }
     if (job.cancelled())
@@ -1732,6 +1915,25 @@ static nlohmann::json fea_run_static_impl(
                   {"max_abs_principal_mpa", round_nd(max_abs_principal, 4)}}},
                 {"solver_notes", notes}};
     if (mesh_advisor) out["advisor"] = detail::mesh_advisor_json(*mesh_advisor);
+    out["mesh_quality"] = detail::mesh_quality_json(
+        mesh_quality, static_cast<std::size_t>(r.n_nodes),
+        static_cast<std::size_t>(r.n_elems), nodes_per_elem);
+    out["reactions"] = json{{"applied_force_n", r.applied_force_n},
+                            {"reaction_force_n", r.reaction_force_n},
+                            {"applied_moment_nmm", r.applied_moment_nmm},
+                            {"reaction_moment_nmm", r.reaction_moment_nmm},
+                            {"equilibrium_error_pct",
+                             round_nd(r.equilibrium_error_pct, 6)}};
+    out["provenance"] = detail::provenance_json("chudware/fea_static");
+    {
+        std::string vtu_path, vtu_error;
+        if (!detail::write_result_vtu(study, points, tets, nodes_per_elem, out,
+                                      vtu_path, vtu_error))
+            return json{{"ok", false},
+                        {"error", "fea_static: " + vtu_error},
+                        {"solver_notes", notes}};
+        if (!vtu_path.empty()) out["vtu_path"] = vtu_path;
+    }
     if (job.cancelled())
         return json{{"ok", false}, {"error", "fea_static: cancelled"}};
     chudware::sim::cache::store(chudware::sim::cache::Kind::FeaStatic, input_hash, out);
@@ -1831,7 +2033,8 @@ nlohmann::json fea_run_modal(const nlohmann::json& study, int n_modes) {
         chudware::sim::cache::hash_fea_study(chudware::sim::cache::Kind::FeaModal, modal_key);
     {
         auto hit = chudware::sim::cache::lookup(chudware::sim::cache::Kind::FeaModal, input_hash);
-        if (hit.hit) {
+        // See fea_run_static: a promised .vtu that no longer exists is a miss.
+        if (hit.hit && !detail::vtu_evidence_missing(study)) {
             if (job.cancelled())
                 return json{{"ok", false}, {"error", "fea_modal: cancelled"}};
             json out = hit.result;
@@ -1849,6 +2052,7 @@ nlohmann::json fea_run_modal(const nlohmann::json& study, int n_modes) {
     int nodes_per_elem = 4;
     std::string mesh_type_used, mesh_note;
     std::optional<MeshAdvisor> mesh_advisor;
+    detail::MeshQualityFacts mesh_quality;
     std::string err;
     std::vector<std::string> notes;
     // STEP modal meshes default to tet10 for bending accuracy. Inline meshes keep
@@ -1862,7 +2066,7 @@ nlohmann::json fea_run_modal(const nlohmann::json& study, int n_modes) {
     {
         chudware::prof::phases::PhaseScope _p("mesh");
         if (!resolve_mesh(modal_study, points, tets, nodes_per_elem,
-                          mesh_type_used, mesh_note, mesh_advisor, err))
+                          mesh_type_used, mesh_note, mesh_advisor, mesh_quality, err))
             return json{{"ok", false}, {"error", err}};
     }
     if (job.cancelled())
@@ -1922,6 +2126,19 @@ nlohmann::json fea_run_modal(const nlohmann::json& study, int n_modes) {
                 {"mesh_type_used", mesh_type_used},
                 {"solver_notes", notes}};
     if (mesh_advisor) out["advisor"] = detail::mesh_advisor_json(*mesh_advisor);
+    out["mesh_quality"] = detail::mesh_quality_json(
+        mesh_quality, points.size() / 3,
+        tets.size() / static_cast<std::size_t>(nodes_per_elem), nodes_per_elem);
+    out["provenance"] = detail::provenance_json("chudware/fea_modal");
+    {
+        std::string vtu_path, vtu_error;
+        if (!detail::write_result_vtu(study, points, tets, nodes_per_elem, out,
+                                      vtu_path, vtu_error))
+            return json{{"ok", false},
+                        {"error", "fea_modal: " + vtu_error},
+                        {"solver_notes", notes}};
+        if (!vtu_path.empty()) out["vtu_path"] = vtu_path;
+    }
     if (job.cancelled())
         return json{{"ok", false}, {"error", "fea_modal: cancelled"}};
     chudware::sim::cache::store(chudware::sim::cache::Kind::FeaModal, input_hash, out);
@@ -2091,7 +2308,8 @@ nlohmann::json fea_run_thermal(const nlohmann::json& study) {
             chudware::sim::cache::Kind::FeaThermal, cache_study);
     {
         auto hit = chudware::sim::cache::lookup(chudware::sim::cache::Kind::FeaThermal, input_hash);
-        if (hit.hit) {
+        // See fea_run_static: a promised .vtu that no longer exists is a miss.
+        if (hit.hit && !detail::vtu_evidence_missing(study)) {
             if (job.cancelled())
                 return json{{"ok", false}, {"error", "fea_thermal: cancelled"}};
             json out = hit.result;
@@ -2109,11 +2327,12 @@ nlohmann::json fea_run_thermal(const nlohmann::json& study) {
     int nodes_per_elem = 4;
     std::string mesh_type_used, mesh_note;
     std::optional<MeshAdvisor> mesh_advisor;
+    detail::MeshQualityFacts mesh_quality;
     std::string err;
     {
         chudware::prof::phases::PhaseScope _p("mesh");
         if (!resolve_mesh(study, points, tets, nodes_per_elem, mesh_type_used,
-                          mesh_note, mesh_advisor, err))
+                          mesh_note, mesh_advisor, mesh_quality, err))
             return json{{"ok", false}, {"error", err}};
     }
     if (job.cancelled())
@@ -2428,6 +2647,21 @@ nlohmann::json fea_run_thermal(const nlohmann::json& study) {
                     {"flux_summary", flux_summary},
                     {"solver_notes", notes}};
         if (mesh_advisor) out["advisor"] = detail::mesh_advisor_json(*mesh_advisor);
+        out["mesh_quality"] = detail::mesh_quality_json(
+            mesh_quality, static_cast<std::size_t>(r.n_nodes),
+            static_cast<std::size_t>(r.n_elems), nodes_per_elem);
+        out["provenance"] = detail::provenance_json("chudware/fea_thermal");
+        {
+            // The .vtu carries the FINAL temperature field (the "temperature" key
+            // above); per-frame files would need one path per frame.
+            std::string vtu_path, vtu_error;
+            if (!detail::write_result_vtu(study, points, tets, nodes_per_elem, out,
+                                          vtu_path, vtu_error))
+                return json{{"ok", false},
+                            {"error", "fea_thermal: " + vtu_error},
+                            {"solver_notes", notes}};
+            if (!vtu_path.empty()) out["vtu_path"] = vtu_path;
+        }
         if (job.cancelled())
             return json{{"ok", false}, {"error", "fea_thermal: cancelled"}};
         chudware::sim::cache::store(chudware::sim::cache::Kind::FeaThermal, input_hash, out);
@@ -2484,6 +2718,19 @@ nlohmann::json fea_run_thermal(const nlohmann::json& study) {
                 {"flux_summary", flux_summary},
                 {"solver_notes", notes}};
     if (mesh_advisor) out["advisor"] = detail::mesh_advisor_json(*mesh_advisor);
+    out["mesh_quality"] = detail::mesh_quality_json(
+        mesh_quality, static_cast<std::size_t>(r.n_nodes),
+        static_cast<std::size_t>(r.n_elems), nodes_per_elem);
+    out["provenance"] = detail::provenance_json("chudware/fea_thermal");
+    {
+        std::string vtu_path, vtu_error;
+        if (!detail::write_result_vtu(study, points, tets, nodes_per_elem, out,
+                                      vtu_path, vtu_error))
+            return json{{"ok", false},
+                        {"error", "fea_thermal: " + vtu_error},
+                        {"solver_notes", notes}};
+        if (!vtu_path.empty()) out["vtu_path"] = vtu_path;
+    }
     if (job.cancelled())
         return json{{"ok", false}, {"error", "fea_thermal: cancelled"}};
     chudware::sim::cache::store(chudware::sim::cache::Kind::FeaThermal, input_hash, out);

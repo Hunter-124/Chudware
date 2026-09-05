@@ -43,6 +43,7 @@
 #include <set>
 #include <sstream>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <map>
 #include <vector>
@@ -412,6 +413,14 @@ void        savePromptDraft(AppState& st, bool force = false);
 void        clearPromptDraft(AppState& st);
 std::string convDocKey(AppState& st);
 std::string newConvId(AppState& st);
+// Project scoping (conversations). Every session records the project/workspace folder it was
+// created under (Conversation::projectDir) so the Sessions list can filter on stored truth.
+// lexicalPath/comparablePath are the ONE normalization used for every path comparison in the
+// copilot (project keys AND artifact paths).
+std::filesystem::path lexicalPath(std::string_view raw);
+std::string comparablePath(const std::filesystem::path& path);
+std::string convProjectKey(std::string_view rawDir);   // comparable key for a project folder
+std::string convProjectDir(AppState& st);              // project folder for a NEW session
 void        ensureConversations(AppState& st);
 void        maybePersistChatHistoryDebounced(AppState& st, bool force);
 void        loadChatHistory(AppState& st);

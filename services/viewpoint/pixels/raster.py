@@ -1,7 +1,7 @@
 """Small deterministic rasterizer using the exact viewpoint perspective camera model.
 
 The projection, six-plane clipping, half-pixel edge test, reciprocal-depth z buffer,
-lighting and clean-shot colours intentionally mirror ``core/doc/session.cpp``'s
+Gouraud lighting and clean-shot colours intentionally mirror ``core/doc/session.cpp``'s
 ``render_view_to_rgb``.  This is the fast corpus renderer; it never sees feature or oracle data.
 """
 from __future__ import annotations
@@ -18,7 +18,7 @@ import numpy as np
 
 from services.viewpoint.geometry import CameraPose, Mesh
 
-RASTERIZER_VERSION = "viewpoint-pixel-raster/1.1.0; engine-perspective-v1; cuda-batch-v1"
+RASTERIZER_VERSION = "viewpoint-pixel-raster/1.2.0; engine-perspective-v1; cuda-batch-v1"
 _BACKGROUND = np.asarray((245, 245, 245), dtype=np.uint8)
 _BASE_COLOR = np.asarray((0.62, 0.70, 0.82), dtype=np.float64)
 _LIGHT = np.asarray((0.4, 0.5, 1.0), dtype=np.float64)
@@ -53,8 +53,70 @@ def _clip_polygon(polygon: list[np.ndarray], signed_distance) -> list[np.ndarray
     return output
 
 
+def _shading(mesh: Mesh, triangle_vertices: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Per-triangle-corner diffuse terms plus the usable-triangle mask.
+
+    The engine (``render_view_to_rgb``) shades Gouraud from the body's per-vertex ``nrm``
+    whenever the tessellated body carries them.  A corpus mesh reaches the engine through the
+    mesh-import lane, whose ``compute_mesh_smooth_normals`` (``core/doc/formats.cpp``) is
+    reproduced here exactly: positions are welded into 1e-6 mm buckets, and corner ``k`` of
+    triangle ``t`` takes the area-weighted sum (a raw cross product is already twice the
+    area times the unit normal) of the triangles incident to that welded position whose unit
+    normal is within the 40 degree crease angle of ``t``'s own — so a tessellated cylinder
+    band shades smoothly while a hard edge keeps a distinct normal per side.  The engine
+    stores those corner normals as float32; a corner whose sum cancels, and a degenerate
+    triangle, keep the flat geometric term.
+    """
+    if len(mesh.triangles) == 0:
+        return np.empty((0, 3), np.float64), np.empty(0, bool)
+    raw_normals = np.cross(triangle_vertices[:, 1] - triangle_vertices[:, 0], triangle_vertices[:, 2] - triangle_vertices[:, 0])
+    lengths = np.linalg.norm(raw_normals, axis=1)
+    # The mesh-import lane drops a triangle whose cross product is shorter than 1e-12, so
+    # such a triangle never reaches the engine's renderer at all.
+    valid = lengths > 1e-12
+    unit_normals = np.zeros_like(raw_normals)
+    usable = lengths > 1e-30
+    unit_normals[usable] = raw_normals[usable] / lengths[usable, None]
+
+    scaled = mesh.vertices * 1e6
+    keys = np.where(scaled >= 0.0, np.floor(scaled + 0.5), np.ceil(scaled - 0.5)).astype(np.int64)
+    _, welded = np.unique(keys, axis=0, return_inverse=True)
+    welded = welded.reshape(len(mesh.vertices))
+    corner_position = welded[mesh.triangles]
+
+    # CSR adjacency: the triangles incident to each welded position.
+    triangle_of_corner = np.repeat(np.arange(len(mesh.triangles), dtype=np.int64), 3)
+    order = np.argsort(corner_position.ravel(), kind="stable")
+    incident = triangle_of_corner[order]
+    counts = np.bincount(corner_position.ravel(), minlength=int(welded.max()) + 1)
+    offsets = np.concatenate((np.zeros(1, np.int64), np.cumsum(counts)))
+
+    # Expand every (triangle, corner) into its incident-triangle candidates.
+    flat_positions = corner_position.ravel()
+    candidate_counts = counts[flat_positions]
+    owner = np.repeat(np.arange(len(flat_positions), dtype=np.int64), candidate_counts)
+    starts = offsets[flat_positions]
+    within = np.arange(len(owner), dtype=np.int64) - np.repeat(np.cumsum(candidate_counts) - candidate_counts, candidate_counts)
+    neighbour = incident[starts[owner] + within]
+    owner_triangle = triangle_of_corner[owner]
+    cosine = np.einsum("ij,ij->i", unit_normals[owner_triangle], unit_normals[neighbour])
+    keep = cosine >= np.cos(np.deg2rad(40.0))
+    accumulated = np.zeros((len(flat_positions), 3), np.float64)
+    np.add.at(accumulated, owner[keep], raw_normals[neighbour[keep]])
+
+    accumulated_lengths = np.linalg.norm(accumulated, axis=1)
+    smooth = (accumulated_lengths > 1e-30) & np.repeat(usable, 3)
+    normals = np.repeat(unit_normals, 3, axis=0)
+    # The engine keeps these corner normals as float32 and re-normalizes them as a gp_Dir.
+    single = (accumulated[smooth] / accumulated_lengths[smooth, None]).astype(np.float32).astype(np.float64)
+    normals[smooth] = single / np.linalg.norm(single, axis=1)[:, None]
+    luminance = 0.35 + 0.65 * np.maximum(0.0, np.abs(normals @ _LIGHT))
+    return luminance.reshape(len(mesh.triangles), 3), valid
+
+
 def _camera_triangle(
     vertices: np.ndarray,
+    luminance: np.ndarray,
     camera: CameraPose,
     *,
     right: np.ndarray | None = None,
@@ -63,14 +125,18 @@ def _camera_triangle(
     tan_x: float | None = None,
     tan_y: float | None = None,
 ) -> list[np.ndarray]:
-    """Clip one triangle after reusing the camera basis computed by its caller."""
+    """Clip one triangle after reusing the camera basis computed by its caller.
+
+    Each polygon vertex is ``(camera_x, camera_y, camera_depth, diffuse_term)``; the diffuse
+    term rides through clipping exactly like the engine's ``ProjectedVertex::lam``.
+    """
     right = camera.right if right is None else right
     true_up = camera.true_up if true_up is None else true_up
     forward = camera.forward if forward is None else forward
     relative = vertices - camera.position
     polygon = [
-        np.asarray((float(point @ right), float(point @ true_up), float(point @ forward)))
-        for point in relative
+        np.asarray((float(point @ right), float(point @ true_up), float(point @ forward), float(lam)))
+        for point, lam in zip(relative, luminance)
     ]
     tan_y = float(np.tan(np.deg2rad(camera.vertical_fov_deg) * 0.5)) if tan_y is None else tan_y
     tan_x = tan_y * camera.image_width_px / camera.image_height_px if tan_x is None else tan_x
@@ -110,15 +176,9 @@ def rasterize(mesh: Mesh, camera: CameraPose, *, resolution: tuple[int, int]) ->
     forward = camera.forward
 
     triangle_vertices = mesh.vertices[mesh.triangles]
-    raw_normals = np.cross(triangle_vertices[:, 1] - triangle_vertices[:, 0], triangle_vertices[:, 2] - triangle_vertices[:, 0])
-    lengths = np.linalg.norm(raw_normals, axis=1)
-    valid_normals = lengths > 1e-12
-    normals = np.zeros_like(raw_normals)
-    normals[valid_normals] = raw_normals[valid_normals] / lengths[valid_normals, None]
-    luminance = 0.35 + 0.65 * np.maximum(0.0, np.abs(normals @ _LIGHT))
-    colors = np.minimum(255.0, _BASE_COLOR[None, :] * 255.0 * luminance[:, None]).astype(np.uint8)
+    luminance, valid_normals = _shading(mesh, triangle_vertices)
 
-    def paint(p0: np.ndarray, p1: np.ndarray, p2: np.ndarray, color: np.ndarray) -> None:
+    def paint(p0: np.ndarray, p1: np.ndarray, p2: np.ndarray) -> None:
         projected = []
         for p in (p0, p1, p2):
             projected.append(np.asarray((p[0] * scale / p[2] + width * 0.5, height * 0.5 - p[1] * scale / p[2])))
@@ -145,14 +205,18 @@ def rasterize(mesh: Mesh, camera: CameraPose, *, resolution: tuple[int, int]) ->
         if not np.any(update):
             return
         zslice[update] = candidate[update]
+        # Gouraud: the diffuse term is interpolated per pixel, the base colour stays flat.
+        lam = a0 * p0[3] + a1 * p1[3] + a2 * p2[3]
+        shaded = np.minimum(255.0, _BASE_COLOR[None, None, :] * 255.0 * lam[:, :, None]).astype(np.uint8)
         target = rgb[min_y : max_y + 1, min_x : max_x + 1]
-        target[update] = color
+        target[update] = shaded[update]
 
-    for triangle, color, normal_ok in zip(triangle_vertices, colors, valid_normals):
+    for triangle, triangle_luminance, normal_ok in zip(triangle_vertices, luminance, valid_normals):
         if not normal_ok:
             continue
         polygon = _camera_triangle(
             triangle,
+            triangle_luminance,
             camera,
             right=right,
             true_up=true_up,
@@ -161,7 +225,7 @@ def rasterize(mesh: Mesh, camera: CameraPose, *, resolution: tuple[int, int]) ->
             tan_y=tan_y,
         )
         for index in range(1, len(polygon) - 1):
-            paint(polygon[0], polygon[index], polygon[index + 1], color)
+            paint(polygon[0], polygon[index], polygon[index + 1])
 
     mask = np.isfinite(reciprocal_depth)
     depth = np.zeros((height, width), dtype=np.float32)
@@ -174,21 +238,22 @@ def rasterize(mesh: Mesh, camera: CameraPose, *, resolution: tuple[int, int]) ->
 def _prepared_triangles(
     camera: CameraPose,
     triangle_vertices: np.ndarray,
-    colors: np.ndarray,
+    luminance: np.ndarray,
     valid_normals: np.ndarray,
-) -> tuple[np.ndarray, np.ndarray, float]:
+) -> tuple[np.ndarray, float]:
+    """Clipped ``(x, y, depth, diffuse)`` triangles for one candidate camera."""
     tan_y = float(np.tan(np.deg2rad(camera.vertical_fov_deg) * 0.5))
     tan_x = tan_y * camera.image_width_px / camera.image_height_px
     right = camera.right
     true_up = camera.true_up
     forward = camera.forward
     clipped: list[np.ndarray] = []
-    clipped_colors: list[np.ndarray] = []
-    for triangle, color, normal_ok in zip(triangle_vertices, colors, valid_normals):
+    for triangle, triangle_luminance, normal_ok in zip(triangle_vertices, luminance, valid_normals):
         if not normal_ok:
             continue
         polygon = _camera_triangle(
             triangle,
+            triangle_luminance,
             camera,
             right=right,
             true_up=true_up,
@@ -198,10 +263,9 @@ def _prepared_triangles(
         )
         for index in range(1, len(polygon) - 1):
             clipped.append(np.stack((polygon[0], polygon[index], polygon[index + 1])))
-            clipped_colors.append(color)
     if not clipped:
-        return np.empty((0, 3, 3), np.float64), np.empty((0, 3), np.uint8), (camera.image_height_px * 0.5) / tan_y
-    return np.stack(clipped), np.stack(clipped_colors), (camera.image_height_px * 0.5) / tan_y
+        return np.empty((0, 3, 4), np.float64), (camera.image_height_px * 0.5) / tan_y
+    return np.stack(clipped), (camera.image_height_px * 0.5) / tan_y
 
 
 def _rasterize_many_cuda(
@@ -219,32 +283,24 @@ def _rasterize_many_cuda(
         if abs(width / height - camera.image_width_px / camera.image_height_px) > 1e-9:
             raise ValueError("resolution must preserve every camera aspect ratio")
     triangle_vertices = mesh.vertices[mesh.triangles]
-    raw_normals = np.cross(triangle_vertices[:, 1] - triangle_vertices[:, 0], triangle_vertices[:, 2] - triangle_vertices[:, 0])
-    lengths = np.linalg.norm(raw_normals, axis=1)
-    valid_normals = lengths > 1e-12
-    normals = np.zeros_like(raw_normals)
-    normals[valid_normals] = raw_normals[valid_normals] / lengths[valid_normals, None]
-    luminance = 0.35 + 0.65 * np.maximum(0.0, np.abs(normals @ _LIGHT))
-    colors = np.minimum(255.0, _BASE_COLOR[None, :] * 255.0 * luminance[:, None]).astype(np.uint8)
-    prepared = [_prepared_triangles(camera, triangle_vertices, colors, valid_normals) for camera in cameras]
+    luminance, valid_normals = _shading(mesh, triangle_vertices)
+    prepared = [_prepared_triangles(camera, triangle_vertices, luminance, valid_normals) for camera in cameras]
     max_triangles = max((len(item[0]) for item in prepared), default=0)
     batch = len(cameras)
     if batch == 0:
         return ()
-    vertices = np.zeros((batch, max_triangles, 3, 3), np.float64)
-    triangle_colors = np.zeros((batch, max_triangles, 3), np.uint8)
+    vertices = np.zeros((batch, max_triangles, 3, 4), np.float64)
     valid = np.zeros((batch, max_triangles), bool)
     scales = np.empty(batch, np.float64)
-    for index, (candidate_vertices, candidate_colors, camera_scale) in enumerate(prepared):
+    for index, (candidate_vertices, camera_scale) in enumerate(prepared):
         count = len(candidate_vertices)
         vertices[index, :count] = candidate_vertices
-        triangle_colors[index, :count] = candidate_colors
         valid[index, :count] = True
         scales[index] = camera_scale * height / cameras[index].image_height_px
 
     device = torch.device("cuda")
     vertex_tensor = torch.from_numpy(vertices).to(device=device)
-    color_tensor = torch.from_numpy(triangle_colors).to(device=device)
+    base_color = torch.as_tensor(_BASE_COLOR, dtype=torch.float64, device=device)
     valid_tensor = torch.from_numpy(valid).to(device=device)
     scale_tensor = torch.from_numpy(scales).to(device=device)[:, None, None]
     reciprocal_depth = torch.full((batch, height, width), -torch.inf, dtype=torch.float64, device=device)
@@ -252,7 +308,6 @@ def _rasterize_many_cuda(
     rgb[...] = torch.as_tensor(_BACKGROUND, dtype=torch.uint8, device=device)
     fx = (torch.arange(width, dtype=torch.float64, device=device) + 0.5)[None, None, None, :]
     fy = (torch.arange(height, dtype=torch.float64, device=device) + 0.5)[None, None, :, None]
-    batch_indices = torch.arange(batch, device=device)[:, None, None]
     triangle_chunk = 32
     for start in range(0, max_triangles, triangle_chunk):
         stop = min(start + triangle_chunk, max_triangles)
@@ -270,11 +325,15 @@ def _rasterize_many_cuda(
         inside = (a0 >= 0.0) & (a1 >= 0.0) & (a2 >= 0.0)
         inside &= valid_tensor[:, start:stop, None, None] & (torch.abs(area4) >= 1.0e-9)
         candidate = a0 / z[:, :, 0, None, None] + a1 / z[:, :, 1, None, None] + a2 / z[:, :, 2, None, None]
+        lam = points[..., 3]
+        # Gouraud: the per-pixel diffuse term of whichever triangle wins this chunk's depth test.
+        pixel_lam = a0 * lam[:, :, 0, None, None] + a1 * lam[:, :, 1, None, None] + a2 * lam[:, :, 2, None, None]
         candidate = torch.where(inside, candidate, -torch.inf)
         chunk_depth, winner = torch.max(candidate, dim=1)
         update = chunk_depth > reciprocal_depth
         reciprocal_depth = torch.where(update, chunk_depth, reciprocal_depth)
-        winner_color = color_tensor[:, start:stop][batch_indices, winner]
+        winner_lam = torch.gather(pixel_lam, 1, winner[:, None]).squeeze(1)
+        winner_color = torch.clamp(base_color * 255.0 * winner_lam[..., None], max=255.0).to(torch.uint8)
         rgb = torch.where(update[..., None], winner_color, rgb)
 
     mask = torch.isfinite(reciprocal_depth)

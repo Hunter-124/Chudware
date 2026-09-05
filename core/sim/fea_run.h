@@ -16,6 +16,7 @@
 // confines nglib.h to its own TU), so it stays includable in any link config.
 #pragma once
 
+#include <string>
 #include <vector>
 
 #include <nlohmann/json.hpp>
@@ -88,6 +89,22 @@ namespace detail {
 // cancellable while the static wrapper runs.
 nlohmann::json fea_run_static_with_cancel_token(
     const nlohmann::json& study, const SimCancelToken& token);
+
+// Write the optional `vtu_path` evidence file for a finished study. `result` is the
+// study result JSON: point data is taken from whichever of displacement (3-vec, mm),
+// von_mises (MPa), temperature (°C) and mode_shapes (flat n_modes*n*3) it carries, so
+// static, adaptive, modal and thermal runs all produce the same kind of file.
+// Returns true when the study asked for no file OR the file was written (path_out set);
+// false with `error` when the request is malformed or the write failed. Never throws.
+bool write_result_vtu(const nlohmann::json& study, const std::vector<double>& points,
+                      const std::vector<int>& tets, int nodes_per_elem,
+                      const nlohmann::json& result, std::string& path_out,
+                      std::string& error);
+
+// True when the study requests a `vtu_path` whose file is absent. A cached result may
+// echo a path the filesystem no longer keeps; the evidence file IS the request, so the
+// solve routes treat that as a cache miss instead of promising a missing file.
+bool vtu_evidence_missing(const nlohmann::json& study);
 }  // namespace detail
 
 // Combined modal run. `study` carries the same mesh + material + fixtures

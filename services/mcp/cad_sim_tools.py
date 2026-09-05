@@ -6,7 +6,9 @@ from mcp.server.fastmcp import FastMCP  # noqa: F401 — register signature
 from typing import Optional
 from typing import Union
 import math
+import os
 import re
+import time
 
 from .cad_common import (
     CoreError,
@@ -31,6 +33,7 @@ from .cad_common import (
     solve_durable_or_handoff,
     _tmp,
     _SID_RE,
+    _SYNC_SOLVE_BUDGET_S,
     cb,
 )
 from services.sim import jobs as simjobs
@@ -1158,6 +1161,24 @@ def _reject_fully_constrained_loads(
             )
 
 
+def _norm_vtu_path(vtu_path) -> Optional[str]:
+    """Validate an optional VTU output request before any solve starts.
+
+    The engine creates the parent directories and fails the whole run on a write error
+    rather than reporting a partial success, so the only thing to check here is that the
+    caller really gave an absolute path — a relative one would land in whatever directory
+    the engine process happens to sit in, which is not a releasable artifact path.
+    """
+    if vtu_path is None:
+        return None
+    if not isinstance(vtu_path, str) or not vtu_path.strip():
+        raise ValueError("vtu_path must be a non-empty absolute filesystem path.")
+    vtu_path = vtu_path.strip()
+    if not os.path.isabs(vtu_path):
+        raise ValueError(f"vtu_path must be ABSOLUTE, got {vtu_path!r}.")
+    return vtu_path
+
+
 def _build_static_study(
     fixtures,
     loads,
@@ -1167,6 +1188,7 @@ def _build_static_study(
     advisor_max_dof,
     doc_id,
     notes: list,
+    vtu_path: Optional[str] = None,
 ) -> dict:
     """SETUP stage for run_fea_static / sim_run(analysis="fea_static")."""
     d = _doc(doc_id)
@@ -1186,6 +1208,7 @@ def _build_static_study(
     fixtures = _norm_bc_list(fixtures, "fixtures", unwrap_query=True, notes=notes)
     loads = _norm_bc_list(loads, "loads", notes=notes)
     mesh_fineness = _norm_fineness(mesh_fineness)
+    vtu_path = _norm_vtu_path(vtu_path)
     mat = _resolve_study_material(material, "static")
     advisor = _advisor_params(learned_advisor, advisor_max_dof)
     # fixtures=[] and "fixtures that resolved to nothing" are DIFFERENT mistakes, and the
@@ -1230,6 +1253,8 @@ def _build_static_study(
         "mesh_order": 2,
         "fineness": mesh_fineness,
     }
+    if vtu_path:
+        study["vtu_path"] = vtu_path
     study.update(advisor)
     return {
         "analysis": "fea_static",
@@ -1240,6 +1265,7 @@ def _build_static_study(
         "fixtures": fixtures,
         "loads": loads,
         "mesh_fineness": mesh_fineness,
+        "vtu_path": vtu_path,
         **advisor,
         "step_path": step,
     }
@@ -1256,6 +1282,7 @@ def _build_adaptive_study(
     advisor_max_dof,
     doc_id,
     notes: list,
+    vtu_path: Optional[str] = None,
 ) -> dict:
     """SETUP stage for run_fea_adaptive / sim_run_adaptive."""
     if isinstance(max_passes, bool) or not isinstance(max_passes, int):
@@ -1274,6 +1301,7 @@ def _build_adaptive_study(
         advisor_max_dof,
         doc_id,
         notes,
+        vtu_path=vtu_path,
     )
     ctx["study"]["adapt"] = {"max_passes": max_passes, "eta_target": eta_target}
     # _build_static_study supplies its own analysis tag. Override it before _job_meta()
@@ -1392,6 +1420,7 @@ def _build_modal_study(
     advisor_max_dof,
     doc_id,
     notes: list,
+    vtu_path: Optional[str] = None,
 ) -> dict:
     """SETUP stage for run_fea_modal / sim_run(analysis="fea_modal")."""
     d = _doc(doc_id)
@@ -1401,6 +1430,7 @@ def _build_modal_study(
     )
     fixtures = _norm_bc_list(fixtures, "fixtures", unwrap_query=True, notes=notes)
     mesh_fineness = _norm_fineness(mesh_fineness)
+    vtu_path = _norm_vtu_path(vtu_path)
     mat = _resolve_study_material(material, "modal")
     advisor = _advisor_params(learned_advisor, advisor_max_dof)
     fixture_sets: list = []
@@ -1434,6 +1464,8 @@ def _build_modal_study(
         "mesh_order": 2,
         "fineness": mesh_fineness,
     }
+    if vtu_path:
+        study["vtu_path"] = vtu_path
     study.update(advisor)
     return {
         "analysis": "fea_modal",
@@ -1445,6 +1477,7 @@ def _build_modal_study(
         "fixture_sets": fixture_sets,
         "free_free": not fixture_sets,
         "mesh_fineness": mesh_fineness,
+        "vtu_path": vtu_path,
         **advisor,
         "step_path": step,
     }
@@ -1453,6 +1486,25 @@ def _build_modal_study(
 # core/sim/fea_static.cpp clamps yield/stress into [0, 15]; 15 therefore means "saturated",
 # not "15x margin", and an unloaded study used to report exactly that (see _build_load_specs).
 _FOS_CAP = 15.0
+
+
+# The release-evidence fields the engine attaches BESIDE `summary` (never inside it):
+#   mesh_quality  aspect/jacobian extremes, pct_poor, min tet volume, node/elem counts, order
+#   reactions     applied vs reaction force/moment plus equilibrium_error_pct (static family
+#                 only — a modal or thermal solve has no applied load to balance)
+#   provenance    engine_build_id / polymesh_commit / solver / mesher / timestamp_utc
+#   vtu_path      the .vtu the solve wrote, present only when the study requested one
+# They are forwarded VERBATIM into the reply and into the persisted study: an evidence packet
+# must show what the solver reported, not a value this file re-derived. A key the engine did
+# not send stays ABSENT rather than becoming a null the reader has to interpret.
+_EVIDENCE_KEYS = ("mesh_quality", "reactions", "provenance", "vtu_path")
+
+
+def _evidence_fields(res: dict) -> dict:
+    """The engine's mesh-quality / equilibrium / provenance / VTU record, as sent."""
+    if not isinstance(res, dict):
+        return {}
+    return {k: res[k] for k in _EVIDENCE_KEYS if res.get(k) is not None}
 
 
 def _collect_static(
@@ -1513,6 +1565,7 @@ def _collect_static(
     summary = {**summary, **values}
     advisor = res.get("advisor")
     advisor_record = {"advisor": advisor} if isinstance(advisor, dict) else {}
+    evidence = _evidence_fields(res)
     # Persist setup+results into the doc so they save inside the .step+.
     study_record = {
         "type": study_type,
@@ -1531,6 +1584,7 @@ def _collect_static(
         "mesh": res.get("mesh_type_used"),
         "solver_notes": res.get("solver_notes", []),
         **advisor_record,
+        **evidence,
     }
     if study_extra:
         study_record.update(study_extra)
@@ -1550,6 +1604,7 @@ def _collect_static(
         "n_nodes": counts["n_nodes"],
         "mesh": res.get("mesh_type_used"),
         "saved_to_study": bool(sid),
+        **evidence,
     }
     if res.get("solver_notes"):
         out["solver_notes"] = res["solver_notes"]
@@ -1645,6 +1700,9 @@ def _collect_modal(
         }
         if isinstance(diagnostics.get("advisor"), dict):
             modal_meta["advisor"] = diagnostics["advisor"]
+        # mesh_quality / provenance / vtu_path ride the same diagnostics payload; a modal
+        # solve carries no `reactions` (there is no applied load to balance).
+        modal_meta.update(_evidence_fields(diagnostics))
     sid = _persist_study(
         d,
         {
@@ -2199,6 +2257,253 @@ def _run_solve(
     return solve_durable_or_handoff(kind, stage, payload, meta)
 
 
+# ------------------------------------------------------------------ mesh convergence (ladder)
+# The simulation runbook's release gate: "Mesh at three successively finer characteristic
+# sizes. Do not accept a single-mesh peak", then "compare monitored non-singular stress and
+# displacement values between meshes. State the convergence metric and tolerance BEFORE
+# choosing the final mesh." That is a study of N static solves on ONE setup, so the ladder is
+# built here from a single resolved static context: same STEP export, same resolved fixture /
+# load point sets, only the discretization changes. Re-running run_fea_static per size would
+# re-export and re-resolve every leg, and nothing would guarantee the legs share a setup.
+
+#: Default convergence tolerance, in percent of the previous leg's monitored value. 5% is
+#: tighter than the <10% settle rule the sim skill states for a two-mesh check, because a
+#: three-point ladder can see the trend and a released number should not sit on the edge.
+_CONVERGENCE_TOL_PCT = 5.0
+
+#: The `summary` scalars a caller may monitor. A convergence study is only meaningful on a
+#: value that converges: peak-stress family, displacement, or the factor of safety derived
+#: from them. Anything else in `summary` (or a typo) is refused rather than tabulated.
+_MONITORABLE = (
+    "max_von_mises_mpa",
+    "max_disp_mm",
+    "min_fos",
+    "max_tresca_mpa",
+    "max_rankine_mpa",
+    "max_principal_mpa",
+    "min_principal_mpa",
+)
+
+
+def _convergence_ladder(sizes_mm, fineness) -> tuple:
+    """The explicit coarse-to-fine discretization ladder: ("target_size_mm"|"fineness", [...]).
+
+    Both spellings are EXPLICIT lists — the point of the study is that the caller states the
+    ladder before seeing any result, so there is no implicit default ladder here. Refusing a
+    non-monotone list is not pedantry: `delta_pct_vs_prev` is only a convergence statement
+    when each leg really is finer than the one before it.
+    """
+    if sizes_mm is not None and fineness is not None:
+        raise ValueError(
+            "pass sizes_mm (characteristic element size in mm) OR fineness (the 0..1 "
+            "mesh_fineness scale), not both — they are two spellings of one ladder."
+        )
+    if sizes_mm is not None:
+        raw = require_list(
+            sizes_mm,
+            "sizes_mm",
+            "a coarse-to-fine list of at least 2 characteristic element sizes in mm, "
+            "e.g. [4, 2, 1]",
+        )
+        sizes = [_finite_float(v, f"sizes_mm[{i}]") for i, v in enumerate(raw)]
+        if any(s <= 0.0 for s in sizes):
+            raise ValueError("every sizes_mm entry must be > 0 mm.")
+        if len(sizes) < 2:
+            raise ValueError(
+                "a convergence study needs at least 2 meshes — one mesh has nothing to "
+                "converge against. The runbook asks for three successively finer sizes."
+            )
+        if any(b >= a for a, b in zip(sizes, sizes[1:])):
+            raise ValueError(
+                "sizes_mm must be strictly DECREASING (coarse first), e.g. [4, 2, 1]: "
+                "each leg has to be finer than the previous one."
+            )
+        return "target_size_mm", sizes
+    if fineness is None:
+        raise ValueError(
+            "run_fea_convergence needs an explicit ladder: sizes_mm=[4,2,1] "
+            "(characteristic element size in mm) or fineness=[0.25,0.5,0.75] "
+            '(the mesh_fineness scale, preset words accepted).'
+        )
+    raw = require_list(
+        fineness,
+        "fineness",
+        'a coarse-to-fine list of at least 2 mesh_fineness values, e.g. '
+        '[0.25, 0.5, 0.75] or ["coarse","medium","fine"]',
+    )
+    vals = [_norm_fineness(v, f"fineness[{i}]") for i, v in enumerate(raw)]
+    if len(vals) < 2:
+        raise ValueError(
+            "a convergence study needs at least 2 meshes — one mesh has nothing to "
+            "converge against. The runbook asks for three successively finer meshes."
+        )
+    if any(b <= a for a, b in zip(vals, vals[1:])):
+        raise ValueError(
+            "fineness must be strictly INCREASING (coarse first), e.g. [0.25,0.5,0.75]: "
+            "each leg has to be finer than the previous one."
+        )
+    return "fineness", vals
+
+
+def _convergence_row(step: dict, out: dict, monitor: str, prev: Optional[float]) -> dict:
+    """One ladder row from a collected static envelope, plus its delta against the previous.
+
+    A leg that failed keeps its row (with `error`) instead of vanishing: a table missing its
+    finest mesh silently reads as "converged at the coarse end".
+    """
+    row = {
+        "size_mm": step.get("target_size_mm"),
+        "fineness": step.get("fineness"),
+        "mesh_order": step.get("mesh_order"),
+    }
+    if not out.get("ok"):
+        row["error"] = out.get("error") or "leg failed"
+        row["monitored_value"] = None
+        row["delta_pct_vs_prev"] = None
+        return row
+    summary = out.get("summary") or {}
+    row["n_dof"] = out.get("n_dof")
+    row["n_nodes"] = out.get("n_nodes")
+    row["n_elems"] = out.get("n_elems")
+    row["max_von_mises_mpa"] = summary.get("max_von_mises_mpa")
+    row["max_disp_mm"] = summary.get("max_disp_mm")
+    row["min_fos"] = summary.get("min_fos")
+    if isinstance(out.get("mesh_quality"), dict):
+        row["mesh_quality"] = out["mesh_quality"]
+    if isinstance(out.get("reactions"), dict):
+        row["equilibrium_error_pct"] = out["reactions"].get("equilibrium_error_pct")
+    if out.get("vtu_path"):
+        row["vtu_path"] = out["vtu_path"]
+    value = summary.get(monitor)
+    row["monitored_value"] = value
+    # A zero previous value has no percentage change (division by zero is not "0% drift"),
+    # so the delta is honestly absent and the tolerance check cannot pass on it.
+    if prev in (None, 0.0) or not isinstance(value, (int, float)):
+        row["delta_pct_vs_prev"] = None
+    else:
+        row["delta_pct_vs_prev"] = round(100.0 * (value - prev) / abs(prev), 3)
+    return row
+
+
+def _convergence_envelope(
+    doc_id, monitor: str, tol_pct: float, rows: list, notes: list
+) -> dict:
+    """The convergence verdict over a finished ladder — never a PASS on a partial table."""
+    failed = [i for i, r in enumerate(rows) if r.get("error")]
+    last_delta = rows[-1].get("delta_pct_vs_prev") if rows else None
+    converged = (
+        not failed
+        and len(rows) >= 2
+        and isinstance(last_delta, (int, float))
+        and abs(last_delta) < tol_pct
+    )
+    out = {
+        "ok": not failed,
+        "doc_id": doc_id,
+        "monitor": monitor,
+        "tol_pct": tol_pct,
+        "table": rows,
+        "n_meshes": len(rows),
+        "converged": converged,
+        "final_delta_pct": last_delta,
+        "note": (
+            "converged is |delta of the FINEST leg| < tol_pct on the monitored value; "
+            "a peak that keeps growing with refinement is a singularity, not strength."
+        ),
+    }
+    if failed:
+        out["error"] = (
+            f"{len(failed)} of {len(rows)} convergence legs failed (rows "
+            f"{failed}); the table is retained for diagnosis and is NOT a convergence "
+            "statement."
+        )
+    return _interpreted(out, notes)
+
+
+def _convergence_leg_solve(payload: dict, meta: dict, deadline: float) -> tuple:
+    """Solve one ladder leg as a durable job, returning ``(job_id, envelope | None)``.
+
+    Same three primitives `solve_durable_or_handoff` drives (start, status, collect), but
+    the JOB ID comes back for EVERY leg and the whole ladder shares ONE transport deadline
+    instead of taking the sync budget N times over. Both matter: a collected envelope
+    carries no id, and without one a ladder whose tail overran could never be reassembled
+    into a single table. `None` means "still running at the deadline" — the leg is left
+    solving in its own process, exactly as a handoff does.
+    """
+    jid = simjobs.start("fea_static", "core_rpc", payload, meta)["job_id"]
+    interval = 0.02
+    while time.time() < deadline:
+        st = simjobs.status(jid)
+        state = st.get("state")
+        if state == simjobs.DONE:
+            return jid, collect_durable(jid, st)
+        if state in (simjobs.FAILED, simjobs.CANCELLED):
+            return jid, {
+                "ok": False,
+                "job_id": jid,
+                "state": state,
+                "error": st.get("error") or f"solve {state}",
+            }
+        time.sleep(interval)
+        interval = min(0.4, interval * 1.5)
+    return jid, None
+
+
+def _convergence_from_jobs(job_ids, monitor: str, tol_pct: float) -> dict:
+    """Assemble the table from background legs started by an earlier call.
+
+    Each leg is an ordinary durable `fea_static` job, so it collects through exactly the
+    same COLLECT stage (and writes exactly one study into the document) as a synchronous
+    leg. The ladder position rides in the job's own metadata, so the table cannot be
+    mislabelled by the caller re-ordering the ids.
+    """
+    ids = require_list(
+        job_ids, "job_ids", "the list of job ids run_fea_convergence(background=True) returned"
+    )
+    if len(ids) < 2:
+        raise ValueError(
+            "a convergence study needs at least 2 legs; pass every job id the "
+            "background call returned."
+        )
+    legs: list = []
+    pending: list = []
+    doc_id = None
+    for jid in ids:
+        st = simjobs.status(str(jid))
+        meta = st.get("meta") or {}
+        step = meta.get("convergence_step")
+        if not isinstance(step, dict):
+            raise ValueError(
+                f"job {jid!r} is not a run_fea_convergence leg (no convergence_step "
+                "metadata); it cannot be placed on the ladder."
+            )
+        doc_id = doc_id or meta.get("doc")
+        if st.get("state") != simjobs.DONE:
+            pending.append({"job_id": jid, "state": st.get("state"), **step})
+            continue
+        legs.append((step, collect_durable(str(jid), st)))
+    if pending:
+        return {
+            "ok": False,
+            "doc_id": doc_id,
+            "reason": "convergence_legs_pending",
+            "pending": pending,
+            "error": (
+                f"{len(pending)} of {len(ids)} legs have not finished; a partial ladder is "
+                "not a convergence statement. Poll sim_status(job_id) and call again."
+            ),
+        }
+    legs.sort(key=lambda pair: int(pair[0].get("index", 0)))
+    rows: list = []
+    prev: Optional[float] = None
+    for step, out in legs:
+        row = _convergence_row(step, out, monitor, prev)
+        if isinstance(row.get("monitored_value"), (int, float)):
+            prev = float(row["monitored_value"])
+        rows.append(row)
+    return _convergence_envelope(doc_id, monitor, tol_pct, rows, [])
+
+
 def _backend_missing(exc: Exception, method: str) -> bool:
     """True when a job refused to start because the C++ solver isn't in this build.
 
@@ -2226,6 +2531,7 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
         learned_advisor: bool = False,
         advisor_max_dof: int = 0,
         doc_id: Optional[str] = None,
+        vtu_path: Optional[str] = None,
         background: bool = False,
     ) -> str:
         """Linear-static stress FEA on the current part. Returns max stress, displacement, and FoS.
@@ -2251,6 +2557,11 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
                      poll get_job(job_id). Use it for fine meshes that may exceed the call
                      timeout. The job is persisted on disk, so it survives an MCP restart
                      and can be collected in a later turn; sim_cancel(job_id) kills it.
+        vtu_path : optional ABSOLUTE path for a VTK XML UnstructuredGrid (.vtu, ASCII) the
+                   solver writes after the solve — point data displacement (mm, 3-vector)
+                   and von_mises (MPa) on the solved tet4/tet10 mesh, for ParaView or an
+                   independent cross-check. Echoed back as "vtu_path"; a write failure
+                   fails the whole run rather than reporting a partial success.
 
         Returns {ok, doc_id, material, n_nodes, n_elems, mesh, summary:{...}} — the
         scalars live under "summary", NOT at the top level: summary.min_fos,
@@ -2258,6 +2569,10 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
         variants). min_fos = yield / max stress; > 1 holds. min_fos saturates at a
         15.0 cap, reported in "fos_note" — a capped value means "at least this", not
         "exactly this".
+        Release evidence rides BESIDE "summary": "mesh_quality" (aspect/jacobian extremes,
+        pct_poor, node/elem counts, order), "reactions" (applied vs reaction force/moment
+        plus equilibrium_error_pct — check it before trusting a stress), and "provenance"
+        (engine_build_id, polymesh_commit, solver, mesher, timestamp_utc).
         Tip: query_geometry(...) first to confirm your fixture/load faces resolve.
         """
         try:
@@ -2271,6 +2586,7 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
                 advisor_max_dof,
                 doc_id,
                 bc_notes,
+                vtu_path=vtu_path,
             )
             _autosave_all_open()  # R-1 guard: protect every open doc before the solve starts
             return _dumps(
@@ -2299,6 +2615,7 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
         learned_advisor: bool = False,
         advisor_max_dof: int = 0,
         doc_id: Optional[str] = None,
+        vtu_path: Optional[str] = None,
         background: bool = False,
     ) -> str:
         """Adaptive linear-static stress FEA for decision-driving peak stresses.
@@ -2318,6 +2635,10 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
         advisor_max_dof : optional non-negative advisor budget; 0 leaves it unset.
         background : if True, return a job_id immediately; poll get_job(job_id). The job
                      runs in its own process and survives an MCP restart.
+        vtu_path : optional ABSOLUTE .vtu path for the FINAL adapted mesh (ASCII VTK XML
+                   UnstructuredGrid; point data displacement in mm and von_mises in MPa).
+        The reply carries "mesh_quality", "reactions" (with equilibrium_error_pct) and
+        "provenance" beside "summary", as run_fea_static does.
         """
         try:
             bc_notes: list = []
@@ -2332,6 +2653,7 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
                 advisor_max_dof,
                 doc_id,
                 bc_notes,
+                vtu_path=vtu_path,
             )
             _autosave_all_open()
             return _dumps(
@@ -2350,6 +2672,170 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
             return _err(e)
 
     @mcp.tool()
+    def run_fea_convergence(
+        fixtures: Optional[Union[list, str]] = None,
+        loads: Optional[Union[list, str]] = None,
+        material: Union[str, dict] = "steel",
+        sizes_mm: Optional[Union[list, str]] = None,
+        fineness: Optional[Union[list, str]] = None,
+        mesh_order: int = 2,
+        monitor: Optional[str] = None,
+        tol_pct: float = _CONVERGENCE_TOL_PCT,
+        doc_id: Optional[str] = None,
+        background: bool = False,
+        job_ids: Optional[Union[list, str]] = None,
+    ) -> str:
+        """Mesh-convergence study: ONE static setup solved at N stated discretizations.
+
+        This is the release gate a single mesh cannot pass — a coarse mesh under-reports
+        peak stress, which reads as a passing factor of safety. State the ladder BEFORE
+        you solve, then report the table.
+
+        fixtures / loads / material : exactly the run_fea_static dialect. The setup is
+                   resolved ONCE (one STEP export, one set of fixture/load point sets) and
+                   reused by every leg, so the legs differ only in discretization.
+        sizes_mm : coarse-to-fine characteristic element sizes in mm, strictly decreasing,
+                   e.g. [4, 2, 1]. This is the runbook spelling (`-h` in the polymesh CLI).
+        fineness : the alternative spelling — a strictly increasing list on the 0..1
+                   mesh_fineness scale, e.g. [0.25, 0.5, 0.75] or ["coarse","medium","fine"].
+                   Pass exactly one of sizes_mm / fineness; at least 2 entries either way.
+        mesh_order : 1 (tet4) or 2 (tet10, default). Keep it constant across the ladder —
+                   changing element order mid-study is a different discretization family.
+        monitor : which `summary` scalar the convergence is judged on; default
+                   "max_von_mises_mpa". Also accepted: max_disp_mm, min_fos,
+                   max_tresca_mpa, max_rankine_mpa, max_principal_mpa, min_principal_mpa.
+                   Monitor a NON-singular location's driver: a re-entrant corner peak
+                   diverges by construction and will never settle.
+        tol_pct : convergence tolerance in percent of the previous leg's monitored value
+                   (default 5).
+        background : if True, start every leg as its own durable job and return their
+                   job_ids immediately; assemble the table afterwards with
+                   run_fea_convergence(job_ids=[...]). A synchronous call that overruns the
+                   transport budget switches to exactly this shape by itself, so a long
+                   ladder is never lost.
+        job_ids : assemble the table from legs already started (ladder positions come from
+                   the jobs' own metadata, so the order you pass them in does not matter).
+                   fixtures/loads are NOT needed on this call — the setup is already baked
+                   into the jobs. They are required only when starting a new ladder.
+
+        Returns {ok, monitor, tol_pct, converged, final_delta_pct, n_meshes,
+        table:[{size_mm|fineness, mesh_order, n_dof, n_nodes, n_elems,
+        max_von_mises_mpa, max_disp_mm, min_fos, monitored_value, delta_pct_vs_prev,
+        mesh_quality, equilibrium_error_pct}]}. `converged` is |the FINEST leg's delta| <
+        tol_pct. A failed leg keeps its row and forces ok:false — a table missing its
+        finest mesh would read as "converged at the coarse end".
+        """
+        try:
+            tol_pct = _finite_float(tol_pct, "tol_pct")
+            if tol_pct <= 0.0:
+                raise ValueError("tol_pct must be > 0.")
+            if monitor is None:
+                monitor = "max_von_mises_mpa"
+            if monitor not in _MONITORABLE:
+                raise ValueError(
+                    f"monitor={monitor!r} is not a convergence-monitorable summary "
+                    f"scalar; choose one of {list(_MONITORABLE)}."
+                )
+            if job_ids is not None:
+                return _dumps(_convergence_from_jobs(job_ids, monitor, tol_pct))
+            if fixtures is None or loads is None:
+                missing = [
+                    n for n, v in (("fixtures", fixtures), ("loads", loads)) if v is None
+                ]
+                raise ValueError(
+                    f"{' and '.join(missing)} required to START a convergence ladder. "
+                    "Pass the run_fea_static dialect, or pass job_ids=[...] to assemble "
+                    "the table from legs that are already running."
+                )
+            if isinstance(mesh_order, bool) or mesh_order not in (1, 2):
+                raise ValueError("mesh_order must be 1 (tet4) or 2 (tet10).")
+            key, ladder = _convergence_ladder(sizes_mm, fineness)
+            bc_notes: list = []
+            # The base context resolves the setup; the first leg's own fineness overwrites
+            # the placeholder below, so nothing is solved at an unstated discretization.
+            ctx = _build_static_study(
+                fixtures,
+                loads,
+                material,
+                ladder[0] if key == "fineness" else 0.5,
+                False,
+                0,
+                doc_id,
+                bc_notes,
+            )
+            _autosave_all_open()  # R-1 guard: protect every open doc before the solve starts
+            rows: list = []
+            job_ids_out: list = []
+            pending: list = []
+            prev: Optional[float] = None
+            deadline = time.time() + _SYNC_SOLVE_BUDGET_S
+            for i, value in enumerate(ladder):
+                study = {**ctx["study"], "mesh_order": mesh_order, key: value}
+                step = {
+                    "index": i,
+                    "mesh_order": mesh_order,
+                    "target_size_mm": value if key == "target_size_mm" else None,
+                    "fineness": study["fineness"],
+                }
+                leg_meta = _job_meta(
+                    {**ctx, "study": study}, bc_notes, {"convergence_step": step}
+                )
+                payload = {"method": "sim_run_static", "params": {"study": study}}
+                if background or pending:
+                    # Either the caller asked for jobs, or an earlier leg used up the
+                    # transport budget — then every REMAINING leg is queued too, so the
+                    # ladder is collectable as one table instead of half-solved.
+                    jid = simjobs.start("fea_static", "core_rpc", payload, leg_meta)[
+                        "job_id"
+                    ]
+                    job_ids_out.append(jid)
+                    pending.append(jid)
+                    continue
+                jid, out = _convergence_leg_solve(payload, leg_meta, deadline)
+                job_ids_out.append(jid)
+                if out is None:
+                    pending.append(jid)
+                    continue
+                row = _convergence_row(step, out, monitor, prev)
+                if isinstance(row.get("monitored_value"), (int, float)):
+                    prev = float(row["monitored_value"])
+                rows.append(row)
+            if pending:
+                return _dumps(
+                    {
+                        "ok": True,
+                        "doc_id": ctx["doc"],
+                        "state": "running",
+                        "job_ids": job_ids_out,
+                        "pending_job_ids": pending,
+                        "monitor": monitor,
+                        "tol_pct": tol_pct,
+                        "completed_legs": rows,
+                        "cancel_supported": True,
+                        "note": (
+                            f"{len(pending)} of {len(job_ids_out)} convergence legs are "
+                            "solving in SEPARATE processes; the jobs are persisted on disk "
+                            "and survive an MCP restart. Poll sim_status(job_id), then "
+                            "assemble the whole table with run_fea_convergence(job_ids="
+                            "[...]) using job_ids above — every leg, finished ones "
+                            "included; their envelopes are replayed, not re-solved."
+                        ),
+                        "next_actions": [
+                            f"sim_status('{pending[0]}')",
+                            f"run_fea_convergence(job_ids={job_ids_out!r}, "
+                            f"monitor='{monitor}')",
+                        ],
+                    }
+                )
+            return _dumps(
+                _convergence_envelope(ctx["doc"], monitor, tol_pct, rows, bc_notes)
+            )
+        except _StudyRefusal as r:
+            return _dumps(r.payload)
+        except Exception as e:  # noqa: BLE001
+            return _err(e)
+
+    @mcp.tool()
     def run_fea_modal(
         fixtures: Union[list, str],
         material: Union[str, dict] = "steel",
@@ -2358,6 +2844,7 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
         learned_advisor: bool = False,
         advisor_max_dof: int = 0,
         doc_id: Optional[str] = None,
+        vtu_path: Optional[str] = None,
         background: bool = False,
     ) -> str:
         """Modal FEA — the natural frequencies (Hz) of the held part. Returns the first n_modes.
@@ -2373,6 +2860,9 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
         advisor_max_dof : optional non-negative advisor budget; 0 leaves it unset.
         background : if True, return a job_id and solve in a separate process — poll
                      get_job(job_id). The job survives an MCP restart.
+        vtu_path : optional ABSOLUTE .vtu path; the modal write carries the mode shapes as
+                   point data. A modal reply has "mesh_quality" and "provenance" but no
+                   "reactions" — there is no applied load to balance.
         """
         try:
             n_modes = _positive_int(n_modes, "n_modes")
@@ -2385,6 +2875,7 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
                 advisor_max_dof,
                 doc_id,
                 bc_notes,
+                vtu_path=vtu_path,
             )
             ctx["n_modes"] = n_modes
             # Free-free (no fixtures): the 0 Hz rigid-body cluster is 6-fold degenerate.
@@ -3393,6 +3884,7 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
         learned_advisor: bool = False,
         advisor_max_dof: int = 0,
         doc_id: Optional[str] = None,
+        vtu_path: Optional[str] = None,
     ) -> str:
         """Thermal (heat-conduction) FEA — steady-state via CalculiX, TRANSIENT via the
         C++ core solver on the real part mesh.
@@ -3437,6 +3929,11 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
                           real-mesh route only. It does not promote the static-trained
                           model as a thermal optimizer.
         advisor_max_dof : optional non-negative advisor budget; 0 leaves it unset.
+        vtu_path : TRANSIENT ONLY — optional ABSOLUTE .vtu path (ASCII VTK XML
+                   UnstructuredGrid) with the nodal temperature field as point data. The
+                   steady route is a CalculiX box proxy, not the part mesh, so it refuses
+                   this rather than writing a .vtu of a proxy. A transient reply also
+                   carries "mesh_quality" and "provenance" beside "summary".
         """
         try:
             bc_notes: list = []
@@ -3464,12 +3961,19 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
             hot_faces = _norm_bc_list(hot_faces, "hot_faces", notes=bc_notes)
             cold_faces = _norm_bc_list(cold_faces, "cold_faces", notes=bc_notes)
             mesh_fineness = _norm_fineness(mesh_fineness)
+            vtu_path = _norm_vtu_path(vtu_path)
             advisor = _advisor_params(learned_advisor, advisor_max_dof)
             if learned_advisor and transient is None:
                 raise ValueError(
                     "learned_advisor is available only on the transient real-mesh "
                     "thermal route; the steady route is a CalculiX box proxy and "
                     "does not run the selected mesher."
+                )
+            if vtu_path and transient is None:
+                raise ValueError(
+                    "vtu_path is available only on the transient real-mesh thermal "
+                    "route; the steady route solves a CalculiX box proxy, so its field "
+                    "is not the part's mesh and must not be released as one."
                 )
             material = coerce_json_or_repr(material)
             if conductivity_w_mk is not None:
@@ -3662,6 +4166,8 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
                         "capacitance": capacitance,
                     },
                 }
+                if vtu_path:
+                    study["vtu_path"] = vtu_path
                 study.update(advisor)
                 res = cb.call("sim_run_thermal", {"study": study})
                 if not res.get("ok"):
@@ -3705,6 +4211,7 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
                     "note": "summary.max_temp_c is the PEAK over the whole run "
                     "(max-temp envelope), at summary.max_temp_time_s; "
                     "per-frame nodal fields persisted in the doc study.",
+                    **_evidence_fields(res),
                 }
                 advisor_record = (
                     {"advisor": res["advisor"]}
@@ -3722,6 +4229,7 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
                         "transient": study["transient"],
                         **advisor,
                         **advisor_record,
+                        **_evidence_fields(res),
                         "results": {
                             "summary": summary,
                             "frames": frames,

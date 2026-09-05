@@ -69,6 +69,10 @@ std::string dwg_to_temp_dxf(const std::string& path);
 // A raw triangle-soup mesh (the C++ analogue of engine/doc/mesh_body.py::MeshBody used
 // only internally by the mesh readers/writers — the public body model stays TopoDS).
 // `verts` is N*3 doubles (x,y,z row-major); `tris` is M*3 0-based vertex indices.
+// Shading normals are NOT carried here: the mesh lane derives smooth per-vertex normals
+// from the triangle soup itself (mesh_to_shape, 40 deg crease angle), because the only
+// authored normals any reader ever recovered — SolidWorks' saved display strips — measured
+// wrong on real parts.
 struct MeshData {
     std::vector<double> verts;     // 3*N
     std::vector<uint32_t> tris;    // 3*M (0-based)

@@ -1020,6 +1020,132 @@ FeaStaticResult fea_static_solve(const std::vector<double>& points, const std::v
         res.disp_magnitude[i] = std::sqrt(x * x + y * y + z * z);
     }
 
+    // ── Support reactions (equilibrium evidence) ─────────────────────────────
+    // R_d = (K u)_d - f_d on each constrained DOF. Only elements incident to a
+    // fixed node contribute stiffness there, so K u is re-formed on that boundary
+    // layer alone — a fraction of one assembly — instead of retaining the full
+    // stiffness matrix (the assembled system is the REDUCED free-free block and
+    // has no constrained rows to read). Internal forces self-equilibrate and the
+    // free equations are satisfied exactly, so R + F is zero in exact arithmetic:
+    // the reported error is the residual of the factorization, not a physical
+    // imbalance. Parity-safe — nothing here touches res.displacement/von_mises.
+    {
+        std::vector<char> fixed_dof(static_cast<std::size_t>(n_dof), 0);
+        std::vector<char> fixed_node(static_cast<std::size_t>(n_nodes), 0);
+        for (int nid : fixed_nodes) {
+            if (nid < 0 || nid >= n_nodes) continue;
+            fixed_node[static_cast<std::size_t>(nid)] = 1;
+            for (int k = 0; k < 3; ++k) fixed_dof[static_cast<std::size_t>(nid) * 3 + k] = 1;
+        }
+        std::vector<double> f_int(static_cast<std::size_t>(n_dof), 0.0);
+        const HexGauss8 hg;
+        for (int e = 0; e < n_tets; ++e) {
+            const int* tn = &tets[static_cast<std::size_t>(e) * stride];
+            bool touches_fixed = false;
+            for (int j = 0; j < stride; ++j)
+                touches_fixed = touches_fixed || fixed_node[static_cast<std::size_t>(tn[j])];
+            if (!touches_fixed) continue;
+            auto scatter = [&](int nodes, const double* fe) {
+                for (int j = 0; j < nodes; ++j)
+                    for (int k = 0; k < 3; ++k) {
+                        const std::size_t d = static_cast<std::size_t>(tn[j]) * 3 + k;
+                        if (fixed_dof[d]) f_int[d] += fe[j * 3 + k];
+                    }
+            };
+            if (hex8) {
+                std::array<Eigen::Vector3d, 8> ep;
+                for (int j = 0; j < 8; ++j) ep[j] = node_pt(tn[j]);
+                Eigen::Matrix<double, 24, 1> ue, fe;
+                for (int j = 0; j < 8; ++j)
+                    for (int k = 0; k < 3; ++k) ue(j * 3 + k) = u_full[tn[j] * 3 + k];
+                fe.setZero();
+                for (int g = 0; g < 8; ++g) {
+                    Eigen::Matrix<double, 6, 24> B;
+                    double detJ;
+                    if (!hex8_B_at(ep, hg.pt[g][0], hg.pt[g][1], hg.pt[g][2], B, detJ)) continue;
+                    fe += B.transpose() * (C * (B * ue)) * (std::abs(detJ) * hg.w[g]);
+                }
+                scatter(8, fe.data());
+            } else if (tet10) {
+                std::array<Eigen::Vector3d, 10> ep;
+                for (int j = 0; j < 10; ++j) ep[j] = node_pt(tn[j]);
+                Eigen::Matrix<double, 30, 1> ue, fe;
+                for (int j = 0; j < 10; ++j)
+                    for (int k = 0; k < 3; ++k) ue(j * 3 + k) = u_full[tn[j] * 3 + k];
+                fe.setZero();
+                for (int g = 0; g < 4; ++g) {
+                    Eigen::Matrix<double, 6, 30> B;
+                    Eigen::Matrix<double, 10, 3> dNxyz;
+                    double detJ;
+                    if (!tet10_B_at(ep, gauss.pt[g][0], gauss.pt[g][1], gauss.pt[g][2], B,
+                                    detJ, dNxyz))
+                        continue;
+                    fe += B.transpose() * (C * (B * ue)) * (std::abs(detJ) * gauss.w[g]);
+                }
+                scatter(10, fe.data());
+            } else {
+                std::array<Eigen::Vector3d, 4> ep;
+                for (int j = 0; j < 4; ++j) ep[j] = node_pt(tn[j]);
+                Eigen::Matrix<double, 6, 12> B;
+                double vol;
+                if (!tet4_B(ep, B, vol)) continue;
+                Eigen::Matrix<double, 12, 1> ue;
+                for (int j = 0; j < 4; ++j)
+                    for (int k = 0; k < 3; ++k) ue(j * 3 + k) = u_full[tn[j] * 3 + k];
+                const Eigen::Matrix<double, 12, 1> fe =
+                    B.transpose() * (C * (B * ue)) * vol;
+                scatter(4, fe.data());
+            }
+        }
+        // Penalty ties carry load too: their internal force at a fixed DOF is part
+        // of that support's reaction.
+        for (const BondSpring& s : bond_springs) {
+            if (s.a < 0 || s.a >= n_nodes || s.b < 0 || s.b >= n_nodes || s.a == s.b) continue;
+            if (!(std::isfinite(s.k) && s.k > 0.0)) continue;
+            for (int d = 0; d < 3; ++d) {
+                const std::size_t da = static_cast<std::size_t>(s.a) * 3 + d;
+                const std::size_t db = static_cast<std::size_t>(s.b) * 3 + d;
+                const double stretch = s.k * (u_full[da] - u_full[db]);
+                if (fixed_dof[da]) f_int[da] += stretch;
+                if (fixed_dof[db]) f_int[db] -= stretch;
+            }
+        }
+        double reaction[3] = {0.0, 0.0, 0.0}, applied[3] = {0.0, 0.0, 0.0};
+        double m_reaction[3] = {0.0, 0.0, 0.0}, m_applied[3] = {0.0, 0.0, 0.0};
+        auto add_moment = [](double* into, const double* r, const double* f) {
+            into[0] += r[1] * f[2] - r[2] * f[1];
+            into[1] += r[2] * f[0] - r[0] * f[2];
+            into[2] += r[0] * f[1] - r[1] * f[0];
+        };
+        for (int i = 0; i < n_nodes; ++i) {
+            const double* r = &points[static_cast<std::size_t>(i) * 3];
+            double node_reaction[3], node_applied[3];
+            for (int k = 0; k < 3; ++k) {
+                const std::size_t d = static_cast<std::size_t>(i) * 3 + k;
+                node_applied[k] = nodal_forces[d];
+                node_reaction[k] = fixed_dof[d] ? f_int[d] - nodal_forces[d] : 0.0;
+                reaction[k] += node_reaction[k];
+                applied[k] += node_applied[k];
+            }
+            add_moment(m_reaction, r, node_reaction);
+            add_moment(m_applied, r, node_applied);
+        }
+        double imbalance2 = 0.0, applied2 = 0.0;
+        for (int k = 0; k < 3; ++k) {
+            res.reaction_force_n[static_cast<std::size_t>(k)] = reaction[k];
+            res.applied_force_n[static_cast<std::size_t>(k)] = applied[k];
+            res.reaction_moment_nmm[static_cast<std::size_t>(k)] = m_reaction[k];
+            res.applied_moment_nmm[static_cast<std::size_t>(k)] = m_applied[k];
+            const double sum = reaction[k] + applied[k];
+            imbalance2 += sum * sum;
+            applied2 += applied[k] * applied[k];
+        }
+        res.equilibrium_error_pct =
+            std::sqrt(imbalance2) / std::max(std::sqrt(applied2), 1e-9) * 100.0;
+        prof.mark("reactions");
+    }
+    if (cancelled()) return cancel_result();
+
     // Per-element von Mises -> node-averaged (mean of neighbouring elements).
     // Additive (parity-safe): in the SAME loop, accumulate the full symmetric stress
     // tensor (sx,sy,sz,txy,tyz,txz) per node with the SAME vm_count divisor, so the

@@ -156,6 +156,10 @@ struct Settings {
     Units units = Units::MMGS;   // document display/input unit system — persisted to config.json
     bool orthographic = true;    // viewport projection: true=orthographic (CAD default), false=perspective
                                  // — persisted to config.json as "orthographic"
+    // Display tessellation tier for every open document: "draft" | "standard" | "fine".
+    // Persisted to config.json as "display_quality"; a change pushes
+    // doc_set_display_quality to every open part/assembly doc (contracts/doc_ops.md §7).
+    std::string displayQuality = "fine";
     // Sketcher drag snap-and-relate: while dragging a sketch entity/point, snap to the origin,
     // keypoints, midpoints, rims, and alignment guides; auto-add the previewed relation on drop.
     // Settings → Modeling. Serialized "sketch_drag_snap_relations".
@@ -779,6 +783,12 @@ struct Conversation {
     std::string docLink;           // OPTIONAL document reference ("file:<path>" | "doc:<id>") —
                                    // metadata only (Sessions row badge); the session exists
                                    // independently of the document.
+    // The project/workspace folder this session was CREATED under — the same value the
+    // composer sends Chudcode as workspace_dir (st.workspaceDir when set, else
+    // plmProjectPath()). Persisted as "project"; the Sessions list filters on it instead of
+    // guessing from produced artifacts. Empty = unscoped (legacy session with nothing to
+    // recover a folder from) and therefore always listed.
+    std::string projectDir;
     std::vector<ChatMsg> msgs;      // populated only while INACTIVE (active lives in AppState::chat)
     int lastContextTokens = 0;     // per-session context meter (input tokens from last model call)
     std::vector<std::string> queuedPrompts;  // queued while this session's turn was active

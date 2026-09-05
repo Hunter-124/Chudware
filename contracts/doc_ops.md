@@ -379,3 +379,26 @@ Engine method `{doc_id}` → `{ok:true, doc_id}`: empties undo_stack + redo_stac
 `{"code":"undo_denied","message":"agents use doc_checkpoint/doc_revert or PLM rollback"}`
 unless `CHUDWARE_UNDO_AGENTS=1`. Added to the error envelope vocabulary of §5.
 
+
+## 7. Display tessellation quality (append-only, 2026-09-04)
+
+Every open document carries a **display quality** tier that selects the BRepMesh deflections its
+AICM display bodies are meshed at. It is a **view** setting: it never enters the document JSON,
+never bumps the revision, never dirties the doc, and is never undoable — the same class as the
+assembly explode state (§ `doc_set_explode_state`).
+
+| tier | linear deflection (mm) | angular deflection (rad) |
+|---|---|---|
+| `draft` | `clamp(bbox_diag * 6.0e-4, 0.02, 1.0)` | `0.35` |
+| `standard` | `clamp(bbox_diag * 3.0e-4, 0.01, 0.5)` | `0.20` |
+| `fine` | `clamp(bbox_diag * 1.5e-4, 0.005, 0.25)` | `0.10` |
+
+A shape with no measurable bounding box falls back to `0.05` / `0.025` / `0.0125` mm respectively.
+The tessellator's existing display clamp still caps angular deflection at `0.20` rad, so `draft`
+and `standard` differ in chord tolerance only.
+
+Default tier: **`fine`**, overridable process-wide by `CHUDWARE_DISPLAY_QUALITY=draft|standard|fine`
+(an unrecognised value falls back to `fine`), so headless renders and the GUI agree.
+
+Changing the tier invalidates the document's compile cache and its per-body mesh cache, so every
+body re-meshes at the new deflections. The RPC is `doc_set_display_quality` (worker_rpc §19).

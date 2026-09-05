@@ -103,6 +103,7 @@ CATEGORY_PACKS: dict[str, list[str]] = {
     "measure": [
         "measure_part",
         "measure_between",
+        "fit_cylinder_axis",
         "measure_from_photo",
         "query_geometry",
         "query_adjacency",
@@ -207,6 +208,15 @@ CATEGORY_PACKS: dict[str, list[str]] = {
         "bearing_life",
         "gear_check",
         "motion_fea_handoff",
+        "motion_fea_handoff_sweep",
+        # Release evidence (2026-09-04): the three-mesh convergence ladder the runbook
+        # requires instead of a single-mesh peak, the packet that ships inputs/result/
+        # convergence/hashes/provenance/checklist as one directory, and the independent
+        # Polyhedral-FEA CLI cross-check lane. Advertised here only — the main-chat core
+        # stays as-is, since ordinary part work does not release an FEA case every turn.
+        "run_fea_convergence",
+        "sim_evidence_packet",
+        "polymesh_cli",
         "family:em",
     ],
     "cam": [
@@ -330,10 +340,17 @@ CATEGORY_PACKS: dict[str, list[str]] = {
         "solve_mates",
         "describe_assembly",
         "check_interference",
+        "fit_cylinder_axis",
         "stackup_analyze",
         "fit_calc",
         "fit_report",
         "recommend_fit",
+        # Mechanism evidence over a mated assembly (cad_motion_tools): the swept
+        # envelope/solid and the closed-form Ackermann turning radius. Both compose
+        # simulate_motion, so they belong wherever the assembly itself is reachable.
+        "sweep_envelope",
+        "steering_turning_radius",
+        "motion_fea_handoff_sweep",
     ],
     # Photo intake / first-try fit. The `intake` registry family had no pack and no
     # role loadout, so four of its eleven tools were reachable by NO route while the
@@ -900,7 +917,8 @@ _MENU_GROUPS: tuple[_MenuGroup, ...] = (
     _MenuGroup("requirements", ("cad",), ("req_", "layout_plan", "layout_plan_report"),
                "Requirements capture/verification and layout plans"),
     _MenuGroup("measure", ("cad", "gsl"),
-               ("measure", "measure_", "query_", "wall_thickness", "hover", "is_watertight"),
+               ("measure", "measure_", "query_", "wall_thickness", "hover", "is_watertight",
+                "fit_cylinder_axis"),
                "Mass properties, distances, wall thickness, geometry/adjacency queries"),
     _MenuGroup("inspect", ("cad", "gsl"),
                ("check_", "inspect_", "render_", "look_around", "contact_sheet",

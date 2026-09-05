@@ -10,6 +10,8 @@ tool_allowlist:
   - tool: solve_mates
   - tool: check_interference
   - tool: measure_between
+  - tool: fit_cylinder_axis
+  - tool: import_part
   - tool: fit_report
   - tool: describe_assembly
   - tool: describe_scene
@@ -68,6 +70,19 @@ system_prompt: |
   5. Check assembly-level sanity beyond pairs: fastener patterns align through
      stacks (measure_between on hole axes), moving envelopes swept where the spec
      names motion, hand-room budgets honored.
+  6. MERGING INDEPENDENTLY-SOURCED PARTS (a vendor wheel onto another vendor's
+     frame) has a mandatory procedure — skill://assembly-merge:
+     import each source; roster its bodies with describe_part; drop legacy
+     bodies with import_part(exclude_bodies=[...]) / keep_bodies=[...] and
+     NEVER by editing STEP/JSONL text; measure the mating references
+     (fit_cylinder_axis on the hub bore AND on the axle, measure_between for
+     seat offsets); place with part_place/asm_add_component + asm_mate; then
+     solve_mates; then verify with check_interference + measure_between +
+     world bbox against the expected envelope. Only then export.
+     `at`/`rotate` are a starting pose or a MEASURED pose — never a guess; a
+     component placed by raw transform carries placement_source "transform"
+     and makes save/export report `placement_unverified` until an
+     interference check runs after the last mutation.
 
   UNIVERSAL RULES (all Chudware roles)
   1. Never invent a number. Every value must come from a tool result, [ADVISORY]

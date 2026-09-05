@@ -86,6 +86,9 @@ json fea_run_adaptive(const json& study) {
         // was made. The real envelope is attached to the result below.
         pass_study.erase("learned_advisor");
         pass_study.erase("advisor_max_dof");
+        // The evidence file describes the FINAL mesh, so intermediate passes must not
+        // each overwrite it with a coarser picture (and pay the write for nothing).
+        pass_study.erase("vtu_path");
 
         json result;
         json passes = json::array();
@@ -177,6 +180,18 @@ json fea_run_adaptive(const json& study) {
         // AdaptiveMesher::mesh attached on the final pass; it is absent exactly
         // when the study never opted in.
         if (mesh.advisor) result["advisor"] = detail::mesh_advisor_json(*mesh.advisor);
+        // Provenance: the same object every route reports, corrected to name THIS
+        // route — the passes ran through fea_run_static, which stamps its own name.
+        if (result.value("ok", false)) {
+            if (result.contains("provenance") && result["provenance"].is_object())
+                result["provenance"]["solver"] = "chudware/fea_adaptive";
+            std::string vtu_path, vtu_error;
+            if (!detail::write_result_vtu(study, mesh.points, mesh.tets,
+                                          mesh.nodes_per_elem, result, vtu_path,
+                                          vtu_error))
+                return json{{"ok", false}, {"error", "fea_adaptive: " + vtu_error}};
+            if (!vtu_path.empty()) result["vtu_path"] = vtu_path;
+        }
         // A result that missed its accuracy target must SAY so where a reader will see it,
         // not only in a nested block: an unconverged stress number that looks converged is
         // the exact failure this feature exists to prevent.

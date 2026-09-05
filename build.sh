@@ -35,6 +35,13 @@
 #    ./build.sh clean      Wipe host/build-$PLATFORM_SUFFIX (core kept — OCCT is
 #                          expensive to reconfigure), then run the default build.
 #
+#  Env:
+#    CHUDWARE_POLYMESH_ROOT=<checkout>
+#                          Build core against a live Polyhedral-FEA working tree
+#                          (default: the pinned third_party fetch). Forwarded as
+#                          -DPOLYMESH_SOURCE_DIR; the `polymesh` CLI is staged into
+#                          core/build-occt-$PLATFORM_SUFFIX/bin beside chudware-hostd.
+#
 #  Close any running Chudware / MCP server first if a link step reports the output
 #  is busy (both hold the engine).
 # ===========================================================================
@@ -203,12 +210,43 @@ report_engine_staleness() {
     fi
     return 0
 }
+# --- Polyhedral-FEA source selection ---------------------------------------
+# CHUDWARE_POLYMESH_ROOT=<checkout> builds core against a LIVE Polyhedral-FEA working tree
+# (the repository root, e.g. ~/Repositories/Polyhedral-FEA-private) instead of the pinned
+# third_party fetch. It is forwarded as -DPOLYMESH_SOURCE_DIR, and because the variable is
+# cached, an already-configured tree must be re-configured for the switch to take effect —
+# and re-configured again (with the flag absent, which clears it) to go back to the pin.
+# ProvisionPolymesh.cmake prints which source won on every configure.
+POLYMESH_SOURCE_ARG=""
+if [ -n "${CHUDWARE_POLYMESH_ROOT:-}" ]; then
+    [ -f "$CHUDWARE_POLYMESH_ROOT/CMakeLists.txt" ] || {
+        echo "[build] ERROR: CHUDWARE_POLYMESH_ROOT=$CHUDWARE_POLYMESH_ROOT has no CMakeLists.txt"
+        exit 1
+    }
+    POLYMESH_SOURCE_ARG="-DPOLYMESH_SOURCE_DIR=$CHUDWARE_POLYMESH_ROOT"
+    echo "[build] Polyhedral-FEA: LOCAL SOURCE $CHUDWARE_POLYMESH_ROOT"
+fi
+
+# Re-configure a consumed core tree in place so a POLYMESH_SOURCE_DIR change (in either
+# direction) reaches its cache. No-op-cheap when nothing changed; skipped entirely when the
+# override is unset AND the tree was never pointed at a local source.
+reconfigure_core_tree() {
+    local tree="$1"
+    if [ -z "$POLYMESH_SOURCE_ARG" ] &&
+       ! grep -q '^POLYMESH_SOURCE_DIR:PATH=.' "$tree/CMakeCache.txt" 2>/dev/null; then
+        return 0
+    fi
+    # An empty value CLEARS the cache entry, which is exactly how a tree returns to the pin.
+    cmake -S "$ROOT/core" -B "$tree" -DPOLYMESH_SOURCE_DIR="${CHUDWARE_POLYMESH_ROOT:-}"
+}
+
 # `./build.sh core` means every consumed native engine is current. Rebuild each configured
 # consumed tree in place so its platform-specific dependency paths remain intact.
 build_core() {
     local rc=0 built=0 tree tlist
     for tree in "$CORE_OCCT_BUILD" "$CORE_SLIM_BUILD"; do
         [ -f "$tree/build.ninja" ] || continue
+        reconfigure_core_tree "$tree" || rc=$?
         echo "[build] core engine -> ${tree#"$ROOT"/}/bin/$LIBCHUDWARE (consumed tree)"
         ninja -C "$tree" "bin/$LIBCHUDWARE" || rc=$?
         # ...and the DAEMON from the same tree. chudware-hostd is a separate binary
@@ -228,13 +266,23 @@ build_core() {
                 ninja -C "$tree" bin/chudware-hostd || rc=$?
                 ;;
         esac
+        # ...and the Polyhedral-FEA CLI (check|mesh|solve|diag|render), staged into the
+        # same bin/ dir. Only trees configured with OCCT + CHUDWARE_WITH_POLYMESH declare
+        # it, so the target probe above is the gate — a slim tree simply has no rule.
+        case "$tlist" in
+            *"bin/polymesh:"*)
+                echo "[build] polymesh CLI -> ${tree#"$ROOT"/}/bin/polymesh"
+                ninja -C "$tree" bin/polymesh || rc=$?
+                ;;
+        esac
         built=1
     done
     if [ "$built" -eq 0 ]; then
         echo "[build] no configured core tree found — configuring the $CORE_PRESET preset."
         echo "[build] NOTE: build/$CORE_PRESET is NOT read by gate.sh, the GUI, or"
         echo "[build]       CHUDWARE_LIBCHUDWARE. Run ./build.sh all for a tree they load."
-        cmake --preset "$CORE_PRESET" && cmake --build --preset "$CORE_PRESET" || rc=$?
+        cmake --preset "$CORE_PRESET" -DPOLYMESH_SOURCE_DIR="${CHUDWARE_POLYMESH_ROOT:-}" \
+            && cmake --build --preset "$CORE_PRESET" || rc=$?
         report_engine_staleness
         return $rc
     fi
@@ -588,7 +636,9 @@ stage_dist() {
             return 1
         fi
     done
-    for f in "$LIBCHUDWARE" "lib3mf.$SHLIB_EXT" chudware-hostd; do
+    # polymesh rides along when present: the MCP polymesh_cli lane resolves it beside
+    # whichever chudware-hostd is served, and dist/ is first in that search order.
+    for f in "$LIBCHUDWARE" "lib3mf.$SHLIB_EXT" chudware-hostd polymesh; do
         [ -e "$src/$f" ] || continue
         tmp="$dst/.$f.staging.$$"
         cp "$src/$f" "$tmp"

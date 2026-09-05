@@ -591,6 +591,10 @@ void loadSettings(Settings& s) {
         s.systemPrompt = j.value("system_prompt", "");
         s.theme = j.value("theme", "light");
         s.orthographic = j.value("orthographic", true);
+        s.displayQuality = j.value("display_quality", std::string("fine"));
+        if (s.displayQuality != "draft" && s.displayQuality != "standard" &&
+            s.displayQuality != "fine")
+            s.displayQuality = "fine";
         s.sketchDragSnapRelations = j.value("sketch_drag_snap_relations", true);
         s.units = (j.value("units", std::string("mmgs")) == "ips") ? Units::IPS : Units::MMGS;
         s.partsGridView = j.value("parts_grid_view", false);
@@ -1032,6 +1036,7 @@ static void applyGuiOwnedSettings(nlohmann::json& j, const Settings& s) {
     if (!s.systemPrompt.empty()) j["system_prompt"] = s.systemPrompt;
     j["theme"] = s.theme;
     j["orthographic"] = s.orthographic;
+    j["display_quality"] = s.displayQuality;
     j["sketch_drag_snap_relations"] = s.sketchDragSnapRelations;
     j["units"] = (s.units == Units::IPS) ? "ips" : "mmgs";
     j["parts_grid_view"] = s.partsGridView;

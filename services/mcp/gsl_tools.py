@@ -27,7 +27,8 @@ from pydantic import Field
 
 from services.mcp import core_bridge as cb
 from services.mcp.cad_common import (_NON_BODY_FEATURE_TYPES, _face_attribution,
-                                   _solid_feature_order, coerce_json_or_repr, require_list)
+                                   _solid_feature_order, coerce_json_or_repr,
+                                   placement_source_of, placement_warnings, require_list)
 from services.mcp.cad_tools import _doc, _dumps, _err
 from services.mcp.fit_narration import _format_fit  # single home (T-F8); loop.py shares it
 
@@ -274,6 +275,39 @@ def _feature_group_line(fg: dict) -> str:
 # `attributed_faces`, and `reattributed` the number of faces that changed hands.
 
 
+def _kept_import_bodies(names: list, keep, exclude) -> list:
+    """The SURVIVING bodies of an import feature as [(source_ordinal, name), ...].
+
+    Mirrors the compiler's sub-selection (core/doc/document.cpp import branch,
+    contracts/feature_params.md): entries are 1-based SOURCE ordinals or body-name strings
+    (a repeated name selects every match), `keep_bodies` restricts first and
+    `exclude_bodies` drops from whatever survived. Narrating the raw source roster instead
+    told the model about bodies the document does not have. An unresolvable entry is a
+    compile error, so a live doc can only carry resolvable ones — they are skipped here
+    rather than guessed at.
+    """
+    live = [True] * len(names)
+
+    def _apply(entries: list, on: bool) -> None:
+        for e in entries:
+            if isinstance(e, bool):
+                continue
+            if isinstance(e, int):
+                if 1 <= e <= len(names):
+                    live[e - 1] = on
+            elif isinstance(e, str):
+                for i, nm in enumerate(names):
+                    if nm == e:
+                        live[i] = on
+
+    if isinstance(keep, list) and keep:
+        live = [False] * len(names)
+        _apply(keep, True)
+    if isinstance(exclude, list):
+        _apply(exclude, False)
+    return [(i + 1, names[i]) for i in range(len(names)) if live[i]]
+
+
 def _digest(doc_id: str) -> dict:
     faces = cb.call("doc_query", {"doc_id": doc_id, "query": {"of": "face"}}).get("matches", [])
     edges = cb.call("doc_query", {"doc_id": doc_id, "query": {"of": "edge"}}).get("matches", [])
@@ -354,6 +388,29 @@ def _digest(doc_id: str) -> dict:
         # Honest bookkeeping: the raw owner_map count stays visible whenever we changed it.
         if attributed.get(fid, 0) != len(owned):
             entry["attributed_faces"] = attributed.get(fid, 0)
+        # A multi-body import is a ROSTER, not one opaque blob: the failed merge session
+        # could not tell which of a 760-body frame import was legacy geometry, so name every
+        # body with its 1-based ordinal. The roster is the POST-FILTER set — keep_bodies /
+        # exclude_bodies drop bodies at import time, and narrating the source list made the
+        # model address bodies this document never registered. Ordinals and refs follow the
+        # kept renumbering (first survivor is `<fid>`, the rest `<fid>#1`, `<fid>#2`, … —
+        # contracts/feature_params.md), which is what `<fid>#k` addressing takes; a re-import
+        # filter still speaks SOURCE ordinals, kept visible as `source_ordinal`.
+        if ft.get("type") == "import":
+            params = ft.get("params") if isinstance(ft.get("params"), dict) else ft
+            enames = params.get("embedded_body_names")
+            keep_sel, drop_sel = params.get("keep_bodies"), params.get("exclude_bodies")
+            filtered = isinstance(keep_sel, list) or isinstance(drop_sel, list)
+            if isinstance(enames, list) and (len(enames) > 1 or filtered):
+                kept = _kept_import_bodies(enames, keep_sel, drop_sel)
+                entry["body_count"] = len(kept)
+                if len(kept) != len(enames):
+                    entry["filtered_from"] = len(enames)
+                entry["bodies"] = [
+                    {"ordinal": j + 1, "name": nm,
+                     "ref": fid if j == 0 else f"{fid}#{j}",
+                     **({"source_ordinal": src} if src != j + 1 else {})}
+                    for j, (src, nm) in enumerate(kept)]
         if owned:
             anchor = _pick_anchor(fid, touches.get(fid, ()), rank, area_by_owner)
             placement = _feature_placement(owned, bbox, ft, anchor)
@@ -397,6 +454,22 @@ def _outline_text(d: dict) -> str:
         lines.append("Features (placement narrative, one line each):")
         for fg in d["feature_groups"]:
             lines.append(f'  - {_feature_group_line(fg)}')
+            if fg.get("bodies"):
+                kept = ("body" if fg["body_count"] == 1 else "bodies")
+                src = (f' (kept from {fg["filtered_from"]} in the source file by this '
+                       f'import\'s keep_bodies/exclude_bodies)' if fg.get("filtered_from")
+                       else '')
+                lines.append(f'      {fg["body_count"]} embedded {kept}{src} — address one '
+                             f'by its `ref` below, or drop/keep them at import time with '
+                             f'import_part(exclude_bodies=[...]) / keep_bodies=[...] '
+                             f'(SOURCE ordinals or names):')
+                for bd in fg["bodies"][:40]:
+                    srco = (f' [source #{bd["source_ordinal"]}]' if bd.get("source_ordinal")
+                            else '')
+                    lines.append(f'        {bd["ordinal"]}. {bd["name"]} -> {bd["ref"]}{srco}')
+                if fg["body_count"] > 40:
+                    lines.append(f'        … {fg["body_count"] - 40} more (full roster in '
+                                 f'`digest.feature_groups[].bodies`)')
         if d.get("reattributed_faces"):
             lines.append(f'    ({d["reattributed_faces"]} face(s) the kernel credited to a '
                          'boolean were re-credited to the earlier feature that authored the '
@@ -1112,7 +1185,10 @@ def _describe_assembly_text(doc_id: str) -> str:
             origin_txt = (f"origin [{_coord(bmin[0])}, {_coord(bmin[1])}, {_coord(bmin[2])}]")
         else:
             origin_txt = "origin ?"
-        lines.append(f"  {name}: {size_txt}, {origin_txt}  (source: asm_world_bodies)")
+        psrc = placement_source_of(doc_id, b.get("component"))
+        psrc_txt = f", placed by {psrc}" if psrc else ""
+        lines.append(f"  {name}: {size_txt}, {origin_txt}{psrc_txt}  "
+                     f"(source: asm_world_bodies)")
 
     # 3. Solve/DOF summary (best-effort — doc_solve_mates returns a status string)
     try:
@@ -1145,6 +1221,12 @@ def _describe_assembly_text(doc_id: str) -> str:
                          "(source: eval_interference)")
     except Exception:  # noqa: BLE001
         lines.append("\nFit/clearance: not available for this document")
+
+    # 5. Placement provenance: a transform-placed component nobody re-checked is the failure
+    #    mode this narration exists to catch (a merged wheel exported off-frame).
+    for w in placement_warnings(doc_id):
+        lines.append(f"\nWARNING {w} — re-run check_interference and confirm the mating "
+                     "references with measure_between / fit_cylinder_axis before exporting")
 
     lines.append("\n(Source: asm_world_bodies, eval_interference, doc_solve_mates — "
                  "numbers narrated, never recomputed)")

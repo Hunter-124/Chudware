@@ -6603,6 +6603,64 @@ void drawSettingsModal(AppState& st, bool busy) {
                 }
                 dimText("Changes how lengths display/parse everywhere (saved immediately).");
 
+                // Display tessellation quality (contracts/doc_ops.md §7). Saved immediately like
+                // Units above, then pushed to every open part/assembly doc so the viewport
+                // re-meshes at the new deflections without a reopen.
+                ImGui::Dummy(ImVec2(0, 6 * sc));
+                ImGui::TextUnformatted("Display quality");
+                helpMarker("How finely curved geometry is tessellated for DISPLAY. Fine (default) "
+                           "keeps tubes, wheels and fillets smooth on large imported parts; Draft "
+                           "trades smoothness for triangles on very heavy models. Geometry, mass "
+                           "properties and exports are unaffected. Saved immediately and applied "
+                           "to every open document.");
+                static const char* kDisplayQualityLabels[] = {"Draft", "Standard", "Fine"};
+                static const char* kDisplayQualityValues[] = {"draft", "standard", "fine"};
+                int dqSel = 2;
+                for (int i = 0; i < 3; ++i)
+                    if (settings.displayQuality == kDisplayQualityValues[i]) dqSel = i;
+                ImGui::SetNextItemWidth(220.0f * sc);
+                if (settingsPopupRowCombo("##display_quality", &dqSel,
+                                          kDisplayQualityLabels, 3)) {
+                    settings.displayQuality = kDisplayQualityValues[dqSel];
+                    saveSettings(settings);
+                    if (st.workerStarted) {
+                        for (const auto& tab : st.docTabs) {
+                            if (tab.docId.empty()) continue;
+                            if (tab.kind != AppState::DocTab::TabKind::Part &&
+                                tab.kind != AppState::DocTab::TabKind::Assembly)
+                                continue;
+                            const bool active =
+                                (st.activeTab >= 0 && st.activeTab < (int)st.docTabs.size() &&
+                                 st.docTabs[st.activeTab].docId == tab.docId);
+                            st.rpc.call("doc_set_display_quality",
+                                        nlohmann::json{{"doc_id", tab.docId},
+                                                       {"quality", settings.displayQuality}},
+                                        [&st, active](const core::RpcResult& r) {
+                                            if (!r.ok) {
+                                                st.addLog("[err] display quality: " + r.err);
+                                                return;
+                                            }
+                                            // Only the visible doc's mesh is loaded in the
+                                            // viewport; the others re-mesh on their next
+                                            // activation.
+                                            if (!active) return;
+                                            std::string aicm;
+                                            if (r.result.is_object() &&
+                                                r.result.contains("tess") &&
+                                                r.result["tess"].is_object())
+                                                aicm = r.result["tess"].value("aicm_path",
+                                                                              std::string());
+                                            if (!aicm.empty()) {
+                                                std::string le;
+                                                st.loadDocMesh(aicm, le);
+                                            }
+                                        }, /*timeoutMs=*/120000);
+                        }
+                    }
+                    st.addLog(std::string("[display] quality set to ") + settings.displayQuality);
+                }
+                dimText("Display-only mesh smoothness (saved immediately).");
+
                 // Configurations moved here from the left-pane strip (Graph took that slot).
                 settingsSectionHeader("Configurations");
                 if (st.configPanel) {

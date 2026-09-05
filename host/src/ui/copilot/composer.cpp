@@ -1665,6 +1665,7 @@ static bool tryHandleSlashCommand(AppState& st, const std::string& text) {
             Conversation c;
             c.id = newConvId(st);
             c.title = "Handoff";
+            c.projectDir = convProjectDir(st);  // project scope, captured once at creation
             st.conversations.push_back(std::move(c));
             st.activeConv = (int)st.conversations.size() - 1;
             st.chat.clear();

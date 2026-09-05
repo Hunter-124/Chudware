@@ -290,13 +290,22 @@ from services.mcp.cad_render_tools import register_cad_render_tools
 from services.mcp.cad_exchange_tools import register_cad_exchange_tools
 from services.mcp.cad_sim_tools import register_cad_sim_tools
 from services.mcp.cad_asm_tools import register_cad_asm_tools
+from services.mcp.cad_motion_tools import register_cad_motion_tools
 from services.mcp.cad_drawing_tools import register_cad_drawing_tools
 register_cad_doc_tools(_reg.view(mcp, "cad"))
 register_cad_eval_tools(_reg.view(mcp, "cad"))
 register_cad_render_tools(_reg.view(mcp, "cad"))
 register_cad_exchange_tools(_reg.view(mcp, "cad"))
 register_cad_sim_tools(_reg.view(mcp, "sim"))
+# Release-evidence packets (sim_evidence_packet) + the independent Polyhedral-FEA CLI
+# cross-check lane (polymesh_cli). Same "sim" family as the solves they document.
+from services.mcp.sim_evidence_tools import register_sim_evidence_tools
+register_sim_evidence_tools(_reg.view(mcp, "sim"))
 register_cad_asm_tools(_reg.view(mcp, "cad"))
+# Kinematic evidence (swept envelope/solid, Ackermann turning radius, batched motion->FEA).
+# Registered AFTER cad_asm_tools because it composes simulate_motion / motion_fea_handoff
+# out of this same registry; it is kinematics, so it registers straight into "sim".
+register_cad_motion_tools(_reg.view(mcp, "sim"))
 # cad_asm mixes assembly authoring (cad) with kinematics (sim): retag the two motion
 # tools post-registration so the Settings 'sim' family toggle governs them.
 for _n in ("simulate_motion", "motion_fea_handoff"):

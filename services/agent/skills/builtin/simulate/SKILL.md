@@ -4,7 +4,7 @@ description: Run FEA, thermal, vibration, CFD, motion, and EM studies with actua
 inject: auto
 triggers:
   keywords: [fea, cfd, simulate, simulation, stress, modal, thermal, vibration, wind tunnel, drag, motion, eigenmode, s-parameter, antenna, contact, load case, strong enough, will this hold, can this hold, factor of safety, deflection, buckling, von mises]
-  tools: [run_fea_static, run_fea_adaptive, run_fea_modal, run_fea_fatigue, run_fea_frequency_response, run_fea_thermal, run_fea_buckling, run_fea_contact, run_cfd_flow, run_cfd_accurate, simulate_motion, em_eigenmode, em_driven, em_timedomain, ecad_antenna_design, ecad_antenna_analyze]
+  tools: [run_fea_static, run_fea_adaptive, run_fea_modal, run_fea_fatigue, run_fea_frequency_response, run_fea_thermal, run_fea_buckling, run_fea_contact, run_fea_convergence, sim_evidence_packet, polymesh_cli, run_cfd_flow, run_cfd_accurate, simulate_motion, em_eigenmode, em_driven, em_timedomain, ecad_antenna_design, ecad_antenna_analyze]
   phases: [sim]
 ---
 
@@ -35,6 +35,31 @@ triggers:
    percentage.
 4. Read the envelope literally: `ok:false`, `skipped:true`, failed/cancelled,
    `converged:false`, `random.ok:false`, or `verdict:null` proves nothing.
+
+## Release evidence
+
+A number leaves this role as an evidence packet, not a chat message. For any result that
+closes a requirement:
+
+1. **Converge.** `run_fea_convergence(sizes_mm=[coarse,med,fine])` — one setup, three
+   stated sizes, `monitor` on a NON-singular value; or `run_fea_adaptive` with
+   `eta_target_met`. `converged:false` or a peak that grows with refinement is a
+   singularity, not strength.
+2. **Check equilibrium.** Read `reactions.equilibrium_error_pct` before trusting any
+   stress, and `mesh_quality` (aspect_max, jacobian_min, pct_poor) before trusting the
+   mesh. Both ride beside `summary`, never inside it.
+3. **Keep the field.** Pass `vtu_path=<absolute .vtu>` so displacement/von Mises are
+   inspectable outside the tool; `provenance` records engine build, polymesh commit,
+   solver, mesher and timestamp.
+4. **Package.** `sim_evidence_packet(case_id, requirement_id, out_dir, study_result=<the
+   full result>, geometry_path, material_source, load_rationale, notes)` writes
+   inputs/result/provenance/convergence/checklist plus geometry+VTU sha256. Its
+   `unsatisfied_checklist` is the release gate: locations, singularity assessment,
+   allowable and hand calculation are yours to close.
+5. **Cross-check the critical case.** `polymesh_cli(action="solve"|"diag", ...)` re-solves
+   it through the standalone Polyhedral-FEA binary with frozen boxes (METRES, pascals,
+   newtons). Explain any difference; never average the two. `polymesh_cli_unavailable`
+   means the cross-check was NOT performed — report it that way.
 
 ## Current surfaces
 
@@ -68,3 +93,26 @@ Static margin is `yield/SF - stress`. Exceeding that allowable means required ma
 is not met; it does not itself mean yielding. Stress at/above yield supports yielding,
 and fracture language requires stress at/above ultimate. Name convergence/anchor
 evidence for PASS and the proxy/backend/linear-model limits for every verdict.
+
+## Mechanism proof (kinematics)
+
+A moving assembly is proven by the sweep, never by one pose. `simulate_motion` reports
+`collisions:[{a,b,overlap_volume_mm3}]` on EVERY step (plus the unchanged
+`first_collision_step`/`first_collision_value`), so quote the offending pairs and their
+overlap volumes per step; "no interference" requires `check_interference=true` and an
+empty `collisions` list at every sample, not just before the first hit.
+
+- **Envelope:** `sweep_envelope(mate_id, start, stop, steps, components)` unions each
+  component's 8 transformed bbox corners over the sweep — the clearance number. Its
+  `fuse=True` mode builds the real swept solid (one `transform` copy per step fused into
+  `<component>_sweep`) and returns its volume/bbox; use it when a bbox over-reports.
+- **Turning radius:** `steering_turning_radius(steer_mate_id, start, stop, ...)` is
+  closed-form Ackermann off the measured wheel yaw at the sweep extremes. Read its
+  `assumptions` and `derived_from`: an unstated wheelbase/track is DERIVED from the
+  solved axle centres, so pass `wheelbase_mm`/`track_mm` when the geometry is not a
+  two-axle vehicle. Quote `centerline_radius_mm` with `outer_swept_radius_mm` — a
+  corridor claim is about the swept corner, not the centreline.
+- **Load case selection:** the worst joint reaction is not always the worst stress, so
+  `motion_fea_handoff_sweep(component, fixtures, positions|start/stop/steps, ...)`
+  batches the single-frame handoff across positions and names the governing one. Each
+  row is a real static solve; a row with `ok:false` proves nothing about that position.

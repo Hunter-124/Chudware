@@ -2772,7 +2772,9 @@ static int chudware_call_inner(const char* method, const char* params_json, char
             // study is the host's shape — step_path|points/tets, density, material,
             // fixtures:[{points,tol_mm}], loads:[{faces,type,vector|magnitude}].
             // Returns {ok, displacement, disp_magnitude, von_mises, n_dof, summary,
-            // solver_notes}. (overlay/npz are display-only and out of scope here.)
+            // solver_notes} plus mesh_quality, reactions and provenance, and — when the
+            // study carries an absolute "vtu_path" — a VTK UnstructuredGrid written
+            // there and echoed back as "vtu_path". (overlay/npz are display-only.)
             const json& study = params.contains("study") ? params["study"] : json::object();
             json res = chudware::sim::fea_run_static(study);
             // P55b: when the study carries a STEP path, ALSO package a display overlay
@@ -2827,7 +2829,8 @@ static int chudware_call_inner(const char* method, const char* params_json, char
             // plus an optional "adapt":{max_passes, eta_target}. Returns the final pass's
             // sim_run_static payload plus "adapt":{passes[], global_eta, eta_target,
             // eta_target_met, passes_run, stop_reason} and, unlike sim_run_static, an
-            // "overlay_aicm" already built on the FINAL refined mesh.
+            // "overlay_aicm" already built on the FINAL refined mesh. An optional
+            // study "vtu_path" is written from the FINAL pass only.
             const json& study = params.contains("study") ? params["study"] : json::object();
             return emit(chudware::sim::fea_run_adaptive(study), out_json, 0);
         }
@@ -2846,7 +2849,8 @@ static int chudware_call_inner(const char* method, const char* params_json, char
             // where the study is step_path|points/tets, material.k_w_mk, fixtures with
             // temp_c (Dirichlet), loads of type "flux"/"convection". Returns {ok,
             // temperature, n_nodes, n_dof, n_elems, summary:{max_temp_c,min_temp_c},
-            // flux_summary, solver_notes}. Transient is out of scope (steady-state only).
+            // flux_summary, solver_notes} plus mesh_quality/provenance, and an optional
+            // study "vtu_path" carrying the final temperature field.
             const json& study = params.contains("study") ? params["study"] : json::object();
             json res = chudware::sim::fea_run_thermal(study);
             return emit(std::move(res), out_json, 0);
@@ -2854,7 +2858,8 @@ static int chudware_call_inner(const char* method, const char* params_json, char
         if (m == "sim_run_modal") {
             // P50b: combined mesh + fixture-resolve + modal solve. Params:
             // {"study": {...}, "n_modes": <int, default 6>}. Returns {ok, freqs_hz,
-            // mode_shapes, n_modes, n_nodes, n_dof}.
+            // mode_shapes, n_modes, n_nodes, n_dof} plus mesh_quality/provenance, and an
+            // optional study "vtu_path" with one 3-vector field per mode.
             const json& study = params.contains("study") ? params["study"] : json::object();
             int n_modes = params.value("n_modes", 6);
             json res = chudware::sim::fea_run_modal(study, n_modes);
@@ -3043,6 +3048,11 @@ static int chudware_call_inner(const char* method, const char* params_json, char
                                 params.value("active", false),
                                 params.contains("factor") && params["factor"].is_number()
                                     ? params["factor"].get<double>() : 1.0),
+                            out_json, 0);
+            if (m == "doc_set_display_quality")
+                return emit(chudware::doc::doc_set_display_quality(
+                                params.value("doc_id", std::string()),
+                                params.value("quality", std::string("fine"))),
                             out_json, 0);
             if (m == "asm_world_bodies")
                 return emit(chudware::doc::doc_asm_world_bodies(
@@ -3416,6 +3426,28 @@ static int chudware_call_inner(const char* method, const char* params_json, char
                                 params.contains("density_g_cm3") && params["density_g_cm3"].is_number()
                                     ? params["density_g_cm3"].get<double>() : 7.85),
                             out_json, 0);
+            if (m == "eval_fit_cylinder") {
+                // Least-squares cylinder axis of the body's surface near a world point —
+                // the measured mating axis for independently sourced CAD. `near` is
+                // required (there is no sensible default point on an arbitrary body).
+                std::array<double, 3> near_pt{0.0, 0.0, 0.0};
+                if (!(params.contains("near") && params["near"].is_array() &&
+                      params["near"].size() == 3))
+                    throw chudware::doc::OpError(
+                        "invalid_op",
+                        "eval_fit_cylinder requires near:[x,y,z] — a world point on or "
+                        "near the cylindrical surface to fit");
+                for (int i = 0; i < 3; ++i) near_pt[i] = params["near"][i].get<double>();
+                return emit(chudware::doc::doc_fit_cylinder_axis(
+                                params.value("doc_id", std::string()),
+                                params.contains("body") && params["body"].is_number()
+                                    ? params["body"].get<int>() : 0,
+                                near_pt,
+                                params.contains("search_radius_mm") &&
+                                        params["search_radius_mm"].is_number()
+                                    ? params["search_radius_mm"].get<double>() : 5.0),
+                            out_json, 0);
+            }
             if (m == "doc_bbox")
                 return emit(chudware::doc::doc_bbox(params.value("doc_id", std::string())),
                             out_json, 0);
@@ -3532,10 +3564,14 @@ static int chudware_call_inner(const char* method, const char* params_json, char
                 return emit(chudware::doc::export_flat_dxf(doc_id, path, fmt), out_json, 0);
             }
             if (m == "import_file")
+                // Top-level keep_bodies / exclude_bodies (agent-side import_part) ride
+                // through as `params` itself: doc_import_file copies just those two keys
+                // onto the import feature.
                 return emit(chudware::doc::doc_import_file(params.value("path", std::string()),
                                                         params.value("into", std::string()),
                                                         params.value("as_solid", false),
-                                                        params.value("format", std::string())),
+                                                        params.value("format", std::string()),
+                                                        params),
                             out_json, 0);
             if (m == "mesh_read_raw")
                 return emit(chudware::doc::mesh_read_raw(params.value("path", std::string()),

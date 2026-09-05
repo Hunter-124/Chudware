@@ -125,6 +125,13 @@ nlohmann::json doc_solve_mates(const std::string& doc_id,
                                const nlohmann::json& drag = nlohmann::json(nullptr));
 // Toggle the exploded-view state and re-tessellate (no revision bump — view-only).
 nlohmann::json doc_set_explode_state(const std::string& doc_id, bool active, double factor);
+// Set this document's DISPLAY tessellation tier ("draft"|"standard"|"fine") and
+// re-tessellate (no revision bump — view-only, like doc_set_explode_state). Drops the
+// document's compile + per-body mesh caches so every body re-meshes at the new
+// deflections (geom::display_deflections). Returns the ops-response plus
+// {ok, quality, triangles}; OpError("invalid_op") on an unknown quality name.
+nlohmann::json doc_set_display_quality(const std::string& doc_id,
+                                       const std::string& quality);
 // World-placed component bodies (name + component + world bbox) for interference / BOM /
 // drawings (`explode` applies the explode offset when the explode view is active).
 nlohmann::json doc_asm_world_bodies(const std::string& doc_id, bool explode = false);
@@ -322,6 +329,17 @@ nlohmann::json doc_weld_cut_list(const std::string& doc_id);
 // {is_surface, area_mm2, ...} report. Throws OpError on no bodies / a bad body_id.
 nlohmann::json doc_eval_mass(const std::string& doc_id, int body_id, double density_g_cm3);
 
+// Evaluate — least-squares CYLINDER AXIS of the body's surface near a world point: the
+// mating primitive for merging independently sourced CAD, where the imported body has no
+// parametric feature whose axis could be read. Tessellation vertices within
+// search_radius_mm of `near` are fed to geom::fit_cylinder. body_id is 1-based; <= 0
+// selects the LAST body. Returns {axis_point[3], axis_dir[3] (unit), radius_mm,
+// rms_residual_mm, n_points_used}. Throws OpError on no bodies / a bad body_id / a
+// non-positive radius / fewer than 6 culled points / a fit that did not converge.
+nlohmann::json doc_fit_cylinder_axis(const std::string& doc_id, int body_id,
+                                     const std::array<double, 3>& near_pt,
+                                     double search_radius_mm);
+
 // doc_bbox: precise world AABB of the whole document. Returns {min[3], max[3], size[3],
 // center[3]} in mm. Throws OpError on no bodies / an empty box.
 nlohmann::json doc_bbox(const std::string& doc_id);
@@ -487,8 +505,14 @@ nlohmann::json doc_export_estimate(const std::string& doc_id, double lin_deflect
 // Import a neutral B-rep file (step/iges/brep) as a new `import` feature. With `into`
 // (a doc id) it appends to that session; otherwise it creates a new part session.
 // Returns the ops-response + "doc_id" (engine.doc.formats import_file).
+//
+// `body_select` may carry `keep_bodies` / `exclude_bodies` (arrays of 1-based body
+// ordinals or body-name strings); they are copied verbatim onto the import feature's
+// params, where the compiler's sub-selection filter reads them. Editing those params
+// later (edit_feature) re-filters on the next recompute.
 nlohmann::json doc_import_file(const std::string& path, const std::string& into,
-                               bool as_solid, const std::string& fmt);
+                               bool as_solid, const std::string& fmt,
+                               const nlohmann::json& body_select = nlohmann::json::object());
 
 // Insert a registered supplier/vendor CAD part as an `import` feature. Reads the Python-written
 // vendor registry index (%APPDATA%/Chudware/vendor_parts/index.json), resolves the cached CAD path +

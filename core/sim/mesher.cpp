@@ -520,13 +520,24 @@ AdvisorPlan make_advisor_plan(const LoadedModel &loaded,
 
 #endif // CHUDWARE_WITH_POLYMESH_ADVISOR
 
+// Whether a study's fineness asks for polymesh's extra sharp-edge/thickness
+// feature-refinement pass by default. Coarse/draft must stay interactive, so
+// the pass only starts at the product's medium setting — but polymesh REFUSES
+// to fill at all when a CAD feature is smaller than h and the pass is off, so
+// this is a default, not a policy: see mesh_loaded_model's recovery retry.
+bool default_feature_refine(const MeshOptions &options) {
+  return options.fineness >= 0.5;
+}
+
 // Fill at coarse element size `h`, optionally under a spatial size field h(x),
-// promote to tet10 when asked, and normalize into MeshOut. `nodal` keeps the
-// polymesh-side mesh, which the adaptive driver needs for error recovery (the
-// MeshOut node ORDER is identical, so a displacement vector indexed against one
-// is valid against the other).
+// promote to tet10 when asked, and normalize into MeshOut. `feature_refine` is
+// an explicit caller decision rather than a re-derivation of the fineness gate,
+// because the very same `h` can fill with the pass on and be refused with it
+// off. `nodal` keeps the polymesh-side mesh, which the adaptive driver needs
+// for error recovery (the MeshOut node ORDER is identical, so a displacement
+// vector indexed against one is valid against the other).
 bool build_mesh(const LoadedModel &loaded, const MeshOptions &options, double h,
-                const pm::mesh::SizeFieldFn &size_field,
+                bool feature_refine, const pm::mesh::SizeFieldFn &size_field,
                 pm::fea::NodalMesh &nodal, MeshOut &out) {
   const pm::pipeline::ResolvedMeshSize resolved =
       pm::pipeline::resolve_mesh_size(loaded.model, h);
@@ -539,9 +550,9 @@ bool build_mesh(const LoadedModel &loaded, const MeshOptions &options, double h,
     return pm::pipeline::volume_mesh(
         loaded.model, h, pm::pipeline::VolumeMesher::kGradedTet,
         /*skin_layers=*/2,
-        // Coarse/draft must stay interactive; the graded skin remains active, while the
-        // extra sharp-edge/thickness pass starts at the product's medium setting.
-        /*feature_refine=*/options.fineness >= 0.5, /*refine_seeds=*/{},
+        // The graded skin stays active regardless; the extra
+        // sharp-edge/thickness pass is the caller's choice.
+        feature_refine, /*refine_seeds=*/{},
         /*seed_band=*/0.0,
         /*element_tendency=*/0.0, resolved.element_ceiling, resolved.dof_ceiling,
         /*auto_retry_budget=*/0, /*cancel_check=*/{}, size_field);
@@ -632,10 +643,44 @@ bool retryable_lattice_guard(const std::string &error) {
   return error.find("geometry fill-stage guard failed") != std::string::npos;
 }
 
+// Polymesh refuses the whole fill (GeometryVolumeLimitError) when a CAD feature
+// is smaller than the element size and the feature-refinement pass is off:
+// "feature unresolved at h=<metres> m: CAD face <n> ...". Match the literal
+// prefix — it is the pipeline's own wording and carries no Chudware framing.
+bool feature_unresolved(const std::string &error) {
+  return error.find("feature unresolved at h=") != std::string::npos;
+}
+
+// The same refusal also names the element size that WOULD resolve the feature:
+// "... reduce -h to <= 1.56 m or raise --max-elems/--max-dof". Polyhedral-FEA
+// labels model units as metres in its diagnostics, but Chudware resolves the
+// size band in MILLIMETRES and feeds that straight into pm::pipeline::volume_mesh
+// (see build_mesh above and the size-band comment in load_model) with no unit
+// conversion anywhere, so the printed number is already a millimetre element
+// size directly comparable to `h`. Returns 0 when there is no usable hint.
+double feature_hint_size_mm(const std::string &error) {
+  static constexpr char kPrefix[] = "reduce -h to <= ";
+  const size_t at = error.find(kPrefix);
+  if (at == std::string::npos)
+    return 0.0;
+  const char *begin = error.c_str() + at + (sizeof(kPrefix) - 1);
+  char *end = nullptr;
+  const double value = std::strtod(begin, &end);
+  if (end == begin || !std::isfinite(value) || value <= 0.0)
+    return 0.0;
+  // Require the unit token the pipeline always emits, so a reworded upstream
+  // message degrades to "no hint" instead of a bogus element size.
+  while (*end == ' ')
+    ++end;
+  if (end[0] != 'm' || (end[1] != '\0' && end[1] != ' '))
+    return 0.0;
+  return value;
+}
+
 bool mesh_loaded_model(const LoadedModel &loaded, const MeshOptions &options,
                        MeshOut &out) {
   const AdvisorPlan plan = make_advisor_plan(loaded, options);
-  auto attempt = [&](double h) {
+  auto attempt = [&](double h, bool feature_refine) {
     out = MeshOut();
     out.advisor = plan.result;
     append_note(out.note, loaded.band.note);
@@ -643,16 +688,73 @@ bool mesh_loaded_model(const LoadedModel &loaded, const MeshOptions &options,
       append_note(out.note, out.advisor->note);
     pm::fea::NodalMesh nodal;
     try {
-      return build_mesh(loaded, plan.options, h, {}, nodal, out);
+      return build_mesh(loaded, plan.options, h, feature_refine, {}, nodal, out);
     } catch (const std::exception &e) {
       out.ok = false;
       out.error = e.what();
       return false;
     }
   };
-  if (attempt(plan.h))
+  // First attempt keeps the interactive default: draft/coarse skips the extra
+  // feature pass.
+  const bool feature_refine = default_feature_refine(plan.options);
+  if (attempt(plan.h, feature_refine))
     return true;
   const std::string first_error = out.error;
+
+  // A detail-dense model (thin ECAD boards, small bosses) can have features far
+  // below h, and polymesh then refuses outright rather than meshing over them.
+  // Coarsening cannot help (the governor re-coarsens anyway and the features
+  // stay unresolved), so the one lever is the pass we skipped. Retry ONCE at
+  // the SAME h with it on: bounded, deterministic, and it keeps a coarse study
+  // running instead of failing where a finer setting would have passed.
+  if (!feature_refine && feature_unresolved(first_error)) {
+    if (attempt(plan.h, /*feature_refine=*/true)) {
+      char text[192];
+      std::snprintf(text, sizeof(text),
+                    "feature refinement enabled after polymesh refused "
+                    "h=%.4g mm (fineness %.2f)",
+                    plan.h, plan.options.fineness);
+      append_note(out.note, text);
+      return true;
+    }
+    std::string chain = first_error +
+                        "; feature-refinement retry at the same element size "
+                        "also failed: " +
+                        out.error;
+
+    // Last bounded lever: polymesh stated the element size that resolves the
+    // feature, so honour it once instead of discarding it and failing a study
+    // that a finer setting would have meshed. Only ever DOWNWARD, and only
+    // once — the hint is a hard bound, not a search.
+    double suggested = feature_hint_size_mm(out.error);
+    if (suggested <= 0.0)
+      suggested = feature_hint_size_mm(first_error);
+    if (suggested > 0.0 && suggested < plan.h) {
+      // Land just under the stated bound: it is inclusive upstream but derived
+      // from the same rounded value it prints, so sitting exactly on it can
+      // still be refused.
+      const double hinted = std::min(suggested, 0.98 * suggested);
+      if (attempt(hinted, /*feature_refine=*/true)) {
+        char text[192];
+        std::snprintf(text, sizeof(text),
+                      "element size reduced %.4g->%.4g mm on polymesh's "
+                      "feature-resolution hint (fineness %.2f)",
+                      plan.h, hinted, plan.options.fineness);
+        append_note(out.note, text);
+        return true;
+      }
+      char tail[128];
+      std::snprintf(tail, sizeof(tail),
+                    "; feature-resolution hint retry at h=%.4g mm also failed: ",
+                    hinted);
+      out.error = chain + tail + out.error;
+      return false;
+    }
+    out.error = std::move(chain);
+    return false;
+  }
+
   if (!retryable_lattice_guard(first_error))
     return false;
 
@@ -660,7 +762,7 @@ bool mesh_loaded_model(const LoadedModel &loaded, const MeshOptions &options,
   // land exactly on a non-manifold/coincident skin at one bulk-cell pitch while
   // a nearby pitch is watertight. One bounded deterministic 6.25% coarser retry
   // changes the phase without weakening the geometry guard or exploding DOFs.
-  if (attempt(plan.h * 1.0625)) {
+  if (attempt(plan.h * 1.0625, feature_refine)) {
     append_note(out.note,
                 "graded-tet lattice guard recovered on deterministic 17/16 "
                 "element-size retry");
@@ -842,7 +944,8 @@ bool AdaptiveMesher::mesh(MeshOut &out, std::string &error) {
     out.advisor = impl_->advisor;
     if (out.advisor)
       append_note(out.note, out.advisor->note);
-    if (!build_mesh(impl_->loaded, impl_->options, impl_->h, impl_->size_field,
+    if (!build_mesh(impl_->loaded, impl_->options, impl_->h,
+                    default_feature_refine(impl_->options), impl_->size_field,
                     impl_->nodal, out)) {
       error = out.error;
       return false;

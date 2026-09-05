@@ -32,7 +32,10 @@ from .cad_common import (
     _version_series_base,
     cb,
     coerce_json_or_repr,
+    note_placement_source,
     note_touched_doc,
+    placement_source_of,
+    placement_warnings,
     require_list,
     sh,
 )
@@ -169,11 +172,25 @@ def register_cad_asm_tools(mcp: FastMCP) -> None:
         path  : the part file to place (.step+ preferred — editable; plain STEP accepted).
         name  : component display name (default: the file stem).
         fixed : ground this component (default: the FIRST component is fixed, later ones free).
-        at    : optional [x,y,z] mm initial translation (a starting pose for the solver, or
-                the final pose if you skip mates entirely).
-        rotate/angle : optional axis [ax,ay,az] + degrees initial rotation (applied before
-                `at`'s translation).
-        Returns the new component id ("k1", "k2", ...) for use in asm_mate refs.
+        at    : optional [x,y,z] mm translation — a STARTING POSE for the mate solver, or a
+                MEASURED pose when you are placing without mates.
+        rotate/angle : optional axis [ax,ay,az] + degrees rotation (applied BEFORE `at`'s
+                translation).
+        Returns the new component id ("k1", "k2", ...) for use in asm_mate refs, plus
+        `placement_source` ("transform" when you passed at/rotate, "mate" once a mate on this
+        component solves).
+
+        `at`/`rotate` ARE NOT A GUESS. For INDEPENDENTLY-SOURCED parts (a wheel from one
+        vendor onto a frame from another) a pose must come from ONE of:
+          * an asm_mate (concentric/coincident/distance) — the solver derives the pose; or
+          * a pose DERIVED FROM MEASURED REFERENCES: fit_cylinder_axis on each mating bore/
+            shaft (axis point + direction + radius) and/or measure_between for the offsets,
+            then the translation/rotation computed from those numbers.
+        Either way FINISH with verification before you deliver: check_interference (no
+        overlap, expected clearance) AND measure_between / list_world_bodies (the mating
+        features really are coaxial/seated where you intended). A transform-placed component
+        that nothing has re-checked since the last mutation makes save_part/export_part
+        report `placement_unverified`. Never position a part by editing STEP/JSONL text.
         """
         try:
             import math as _math
@@ -209,11 +226,24 @@ def register_cad_asm_tools(mcp: FastMCP) -> None:
             kid = (r.get("id_map") or {}).get("$0")
             comps = _asm_components(d)
             me = next((c for c in comps if c.get("id") == kid), {})
+            # Placement provenance: a raw at/rotate pose is only as good as the measurement
+            # behind it, so it is stamped "transform" and stays unverified until
+            # check_interference runs. An identity insert is "origin" (nothing was asserted
+            # about where it sits); asm_mate/solve_mates upgrade either to "mate".
+            src = "transform" if (at is not None or rotate is not None) else "origin"
+            note_placement_source(d, kid, src)
             _publish_current(d)
             _autosave(d)
-            return _dumps({"ok": True, "doc_id": d, "component": kid,
-                           "name": me.get("name"), "fixed": me.get("fixed"),
-                           "component_count": len(comps)})
+            out = {"ok": True, "doc_id": d, "component": kid,
+                   "name": me.get("name"), "fixed": me.get("fixed"),
+                   "component_count": len(comps),
+                   "placement_source": placement_source_of(d, kid)}
+            if src == "transform":
+                out["placement_note"] = (
+                    "placed by transform — derive at/rotate from measured references "
+                    "(fit_cylinder_axis / measure_between) or add an asm_mate, then verify "
+                    "with check_interference + measure_between before exporting")
+            return _dumps(out)
         except Exception as e:  # noqa: BLE001
             return _err(e)
 
@@ -331,7 +361,12 @@ def register_cad_asm_tools(mcp: FastMCP) -> None:
                                           "with_tess": False,
                                           "ops": [{"op": "asm_add_mate", "mate": mate}]})
             mate_id = (r.get("id_map") or {}).get("$0")
-            out: dict = {"ok": True, "doc_id": d, "mate": mate_id, "type": mate_type}
+            # Both mated components now owe their pose to the solver, not to a raw transform.
+            for ref in refs:
+                note_placement_source(d, ref.get("component"), "mate")
+            out: dict = {"ok": True, "doc_id": d, "mate": mate_id, "type": mate_type,
+                         "placement_source": {ref["component"]: placement_source_of(
+                             d, ref["component"]) for ref in refs}}
             if solve:
                 sr = cb.call("doc_solve_mates", {"doc_id": d})
                 out["solve_status"] = (sr.get("rebuild") or {}).get("doc_status")
@@ -357,6 +392,11 @@ def register_cad_asm_tools(mcp: FastMCP) -> None:
         try:
             d = _doc(doc_id)
             r = cb.call("doc_solve_mates", {"doc_id": d})
+            # Every component the mate network actually constrains is solver-placed now.
+            for m in ((cb.call("doc_tree", {"doc_id": d}).get("tree") or {}).get("mates") or []):
+                for ref in (m.get("refs") or []):
+                    if isinstance(ref, dict):
+                        note_placement_source(d, ref.get("component"), "mate")
             _publish_current(d)
             return _dumps({"ok": True, "doc_id": d, "revision": r.get("revision"),
                            "status": (r.get("rebuild") or {}).get("doc_status")})
@@ -1241,19 +1281,30 @@ def register_cad_asm_tools(mcp: FastMCP) -> None:
 
         Works on an ASSEMBLY doc (each placed component after mates are solved) AND on a
         multi-body PART — e.g. one assembled via import_part + transform (where the bodies are
-        already placed absolutely). Returns each body {name, component, bbox:{min,max,size}};
-        use it to see where every part sits in the shared frame, or pair with check_interference
-        to validate fit. explode=True applies the exploded-view offsets on an assembly (ignored
-        on a plain multi-body part).
+        already placed absolutely). Returns each body {name, component, bbox:{min,max,size},
+        placement_source}; use it to see where every part sits in the shared frame, or pair
+        with check_interference to validate fit. explode=True applies the exploded-view offsets
+        on an assembly (ignored on a plain multi-body part).
+
+        `placement_source` is "mate" (solver-derived pose), "transform" (a pose YOU asserted
+        via asm_add_component at/rotate — verify it with check_interference + measure_between),
+        "origin" (inserted at identity) or null (this process did not place it). Any
+        transform-placed component still carries `placement_warnings` here and on
+        save_part/export_part until check_interference runs again.
         """
         try:
             d = _doc(doc_id)
             r = cb.call("asm_world_bodies", {"doc_id": d, "explode": bool(explode)})
             bodies = r.get("bodies", [])
+            for b in bodies:
+                if isinstance(b, dict):
+                    b["placement_source"] = placement_source_of(d, b.get("component"))
+            warnings = placement_warnings(d)
+            out = {"ok": True, "doc_id": d, "body_count": len(bodies), "bodies": bodies}
             if r.get("multibody_part"):
-                return _dumps({"ok": True, "doc_id": d, "multibody_part": True,
-                               "body_count": len(bodies), "bodies": bodies})
-            return _dumps({"ok": True, "doc_id": d, "body_count": len(bodies),
-                           "bodies": bodies})
+                out["multibody_part"] = True
+            if warnings:
+                out["placement_warnings"] = warnings
+            return _dumps(out)
         except Exception as e:  # noqa: BLE001
             return _err(e)

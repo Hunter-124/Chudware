@@ -35,7 +35,10 @@ namespace fs = std::filesystem;
 namespace {
 
 constexpr const char* kBlobMagic = "AICRES1";
-constexpr const char* kCacheSchema = "chudware-simcache/2";
+// /3: FEA results gained mesh_quality, reactions, provenance and vtu_path. A /2
+// entry (memory, sidecar, or .step+ studies/<id>/results.npz) predates them, so
+// serving it would hand back a result with no evidence packet.
+constexpr const char* kCacheSchema = "chudware-simcache/3";
 constexpr size_t kMemCapEntries = 64;
 constexpr size_t kMaxSidecarOverhead = 4096;
 

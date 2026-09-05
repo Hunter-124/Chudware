@@ -2,8 +2,10 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <chrono>
 #include <cmath>
+#include <cstdlib>
 
 #include <BRepAdaptor_Curve.hxx>
 #include <BRepBndLib.hxx>
@@ -106,6 +108,26 @@ bool is_hidden_edge(const TopoDS_Edge& edge,
     return false;
 }
 
+// clamp(bbox_diag * rel, floor, ceil), falling back to `fallback` when the shape
+// has no measurable bbox. Shared by auto_linear_deflection and every display
+// quality tier, which differ only in the four constants.
+double bbox_relative_deflection(const TopoDS_Shape& shape, double rel, double floor_mm,
+                                double ceil_mm, double fallback) {
+    try {
+        Bnd_Box bb;
+        BRepBndLib::Add(shape, bb);
+        if (!bb.IsVoid()) {
+            double x0, y0, z0, x1, y1, z1;
+            bb.Get(x0, y0, z0, x1, y1, z1);
+            const double dx = x1 - x0, dy = y1 - y0, dz = z1 - z0;
+            const double diag = std::sqrt(dx * dx + dy * dy + dz * dz);
+            if (std::isfinite(diag) && diag > 0.0)
+                return std::min(ceil_mm, std::max(floor_mm, diag * rel));
+        }
+    } catch (...) { /* fall through to the fallback */ }
+    return fallback;
+}
+
 }  // namespace
 
 // Size-relative default linear deflection (T-PERF7b, perf audit §4 P2). A fixed
@@ -120,23 +142,52 @@ bool is_hidden_edge(const TopoDS_Edge& edge,
 //                            meshes at 1.0 mm, ~20x fewer curved-face tris)
 // Falls back to the historical 0.05 mm when the bbox is void/degenerate.
 double auto_linear_deflection(const TopoDS_Shape& shape) {
-    constexpr double kAutoRel = 6e-4;
-    constexpr double kAutoFloor = 0.02;    // mm
-    constexpr double kAutoCeil = 1.0;      // mm
-    constexpr double kLegacyDefault = 0.05;  // mm
-    try {
-        Bnd_Box bb;
-        BRepBndLib::Add(shape, bb);
-        if (!bb.IsVoid()) {
-            double x0, y0, z0, x1, y1, z1;
-            bb.Get(x0, y0, z0, x1, y1, z1);
-            const double dx = x1 - x0, dy = y1 - y0, dz = z1 - z0;
-            const double diag = std::sqrt(dx * dx + dy * dy + dz * dz);
-            if (std::isfinite(diag) && diag > 0.0)
-                return std::min(kAutoCeil, std::max(kAutoFloor, diag * kAutoRel));
+    return bbox_relative_deflection(shape, 6e-4, 0.02, 1.0, 0.05);
+}
+
+// ---- display quality tiers (see tessellate.h) ---------------------------------
+DisplayDeflections display_deflections(DisplayQuality q, const TopoDS_Shape& shape) {
+    switch (q) {
+        case DisplayQuality::Draft:
+            return {bbox_relative_deflection(shape, 6.0e-4, 0.02, 1.0, 0.05), 0.35};
+        case DisplayQuality::Standard:
+            return {bbox_relative_deflection(shape, 3.0e-4, 0.01, 0.5, 0.025), 0.20};
+        case DisplayQuality::Fine:
+        default:
+            return {bbox_relative_deflection(shape, 1.5e-4, 0.005, 0.25, 0.0125), 0.10};
+    }
+}
+
+const char* display_quality_name(DisplayQuality q) {
+    switch (q) {
+        case DisplayQuality::Draft: return "draft";
+        case DisplayQuality::Standard: return "standard";
+        case DisplayQuality::Fine:
+        default: return "fine";
+    }
+}
+
+bool display_quality_parse(const std::string& name, DisplayQuality& out) {
+    if (name == "draft") { out = DisplayQuality::Draft; return true; }
+    if (name == "standard") { out = DisplayQuality::Standard; return true; }
+    if (name == "fine") { out = DisplayQuality::Fine; return true; }
+    return false;
+}
+
+DisplayQuality default_display_quality() {
+    // Read once: every document in this process (headless render, hostd, GUI) must
+    // agree on the default, and the env cannot change under a running engine.
+    static const DisplayQuality q = []() {
+        DisplayQuality parsed = DisplayQuality::Fine;
+        const char* v = std::getenv("CHUDWARE_DISPLAY_QUALITY");
+        if (v && *v) {
+            std::string s(v);
+            for (char& c : s) c = static_cast<char>(std::tolower((unsigned char)c));
+            display_quality_parse(s, parsed);  // invalid name -> Fine
         }
-    } catch (...) { /* fall through to the legacy default */ }
-    return kLegacyDefault;
+        return parsed;
+    }();
+    return q;
 }
 
 aicm::AicmBody tessellate_body(const TopoDS_Shape& shape, uint32_t body_id,
@@ -204,7 +255,12 @@ aicm::AicmBody tessellate_body(const TopoDS_Shape& shape, uint32_t body_id,
             continue;
         }
 
-        BRepLib_ToolTriangulatedShape::ComputeNormals(face, tri);
+        // Authored per-vertex normals win. A face whose triangulation already carries
+        // normals came from a reader that recovered them (the SolidWorks saved-display
+        // lane, one planar face per triangle); ComputeNormals would overwrite them with the
+        // face's single flat normal and render the part as discrete facets. BRepMesh above
+        // is face-incremental, so an untouched face still has them here.
+        if (!tri->HasNormals()) BRepLib_ToolTriangulatedShape::ComputeNormals(face, tri);
         const bool is_reversed = (face.Orientation() == TopAbs_REVERSED);
         const gp_Trsf trsf = loc.Transformation();
         const bool is_identity = loc.IsIdentity();
@@ -218,6 +274,9 @@ aicm::AicmBody tessellate_body(const TopoDS_Shape& shape, uint32_t body_id,
             body.pos.push_back(static_cast<float>(nd.Z()));
 
             gp_Dir nv = tri->Normal(ni);
+            // Normals live in the triangulation's (i.e. the face location's) frame, exactly
+            // like the nodes above — rotate them into the body frame for a located face.
+            if (!is_identity) nv.Transform(trsf);
             const double s = is_reversed ? -1.0 : 1.0;
             body.nrm.push_back(static_cast<float>(s * nv.X()));
             body.nrm.push_back(static_cast<float>(s * nv.Y()));

@@ -13,6 +13,7 @@
 // kernel: assemble -> constrain -> solve -> recover stress.
 #pragma once
 
+#include <array>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -44,6 +45,19 @@ struct FeaStaticResult {
     int n_dof = 0;
     int n_nodes = 0;
     int n_elems = 0;
+
+    // Support reactions (the equilibrium half of a run's evidence packet).
+    // f_int = K u is re-formed on the elements that touch a constrained node, so
+    // reaction_force_n is the resultant the supports carry, applied_force_n the
+    // resultant the loads impose, the moments are taken about the global origin
+    // (N·mm, coordinates being mm), and equilibrium_error_pct is the residual
+    // |R+F| / max(|F|, 1e-9) * 100 — zero for an exactly solved linear system,
+    // so a non-trivial value is a solver/conditioning warning, not physics.
+    std::array<double, 3> applied_force_n{0.0, 0.0, 0.0};
+    std::array<double, 3> reaction_force_n{0.0, 0.0, 0.0};
+    std::array<double, 3> applied_moment_nmm{0.0, 0.0, 0.0};
+    std::array<double, 3> reaction_moment_nmm{0.0, 0.0, 0.0};
+    double equilibrium_error_pct = 0.0;
     bool ok = false;
     std::string error;  // non-empty when ok==false
 

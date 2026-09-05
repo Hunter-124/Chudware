@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from typing import Any
 
-# OUTER harness ceiling for the whole run_fea_* family: the deadline
+# OUTER harness ceiling for the run_fea_* family: the deadline
 # agent_turn._dispatch_tool enforces with ThreadPoolExecutor.result(timeout=...)
 # from the instant the tool is dispatched. It MUST stay strictly larger than the
 # INNER CalculiX subprocess clock (services.mcp.fea_advanced.HARNESS_CCX_TIMEOUT_S,
@@ -14,8 +14,25 @@ from typing import Any
 # and buried CalculiX's own actionable "ccx timed out ... try a coarser mesh"
 # result under the harness's "abandoned in the background, may still be running"
 # payload, which names no remedy. services/mcp/test_fea_ccx_advanced.py pins
-# this value against the fea_advanced constants so they cannot drift apart.
-_FEA_TIMEOUT_S = 420
+# these values against the fea_advanced constants so they cannot drift apart.
+_CCX_TIMEOUT_S = 300        # fea_advanced.HARNESS_CCX_TIMEOUT_S
+_CCX_SETUP_MARGIN_S = 120   # fea_advanced.CCX_SETUP_MARGIN_S
+
+#: run_fea_* tools that spend more than ONE inner CalculiX clock per dispatch.
+#: run_fea_convergence solves the simulation runbook's three-mesh ladder under a
+#: single dispatch; the setup (STEP export, fixture/load resolution) is resolved
+#: ONCE and reused by every leg, so only the solver term multiplies. The runbook
+#: nominal of 3 legs sizes the ceiling; a longer explicit ladder that overruns
+#: degrades to background job_ids by itself rather than being lost.
+FEA_SOLVER_LEGS: dict[str, int] = {"run_fea_convergence": 3}
+
+
+def fea_timeout_s(legs: int = 1) -> int:
+    """Outer ceiling for a run_fea_* entry that burns `legs` inner ccx clocks."""
+    return legs * _CCX_TIMEOUT_S + _CCX_SETUP_MARGIN_S
+
+
+_FEA_TIMEOUT_S = fea_timeout_s()
 
 ENTRIES: dict[str, dict[str, Any]] = {
     "sim_cancel": {
@@ -146,6 +163,53 @@ ENTRIES: dict[str, dict[str, Any]] = {
             "FEA solve."
         ),
         "timeout_s": 600,
+    },
+    "motion_fea_handoff_sweep": {
+        "prompt_note": (
+            "motion_fea_handoff at several mechanism positions in one call; "
+            "returns a per-position stress/reaction table plus the worst "
+            "position. Use background=True beyond a few positions."
+        ),
+        "timeout_s": 1800,
+    },
+    "sweep_envelope": {
+        "prompt_note": (
+            "Drive a mate through its range and return the union bbox the "
+            "listed components sweep; fuse=True also builds the swept solid. "
+            "This is the folded/deployed envelope evidence, not a clash check."
+        ),
+        "timeout_s": 600,
+    },
+    "steering_turning_radius": {
+        "prompt_note": (
+            "Closed-form Ackermann radii from a steer-mate sweep; pass "
+            "wheelbase_mm/track_mm when the axle heuristic refuses. Reports "
+            "the outer swept radius for the turn-envelope requirement."
+        ),
+    },
+    "run_fea_convergence": {
+        "prompt_note": (
+            "Same static study at 2+ explicit mesh sizes (sizes_mm or "
+            "fineness ladder); the table with delta_pct_vs_prev is the "
+            "convergence evidence a release needs. Never cite one mesh."
+        ),
+        "timeout_s": fea_timeout_s(FEA_SOLVER_LEGS["run_fea_convergence"]),
+    },
+    "sim_evidence_packet": {
+        "prompt_note": (
+            "Write the case folder (inputs/result/provenance/convergence/"
+            "checklist) for a finished study; unsatisfied_checklist names "
+            "what still needs a hand calc or judgement."
+        ),
+    },
+    "polymesh_cli": {
+        "prompt_note": (
+            "Independent Polyhedral-FEA CLI lane (check|mesh|solve|diag) on "
+            "an exported STEP with explicit fix/load boxes in metres; the "
+            "runbook's cross-check for the critical case, not a replacement "
+            "for run_fea_static."
+        ),
+        "timeout_s": 3600,
     },
     "piping_cfd_handoff": {
         "prompt_note": (

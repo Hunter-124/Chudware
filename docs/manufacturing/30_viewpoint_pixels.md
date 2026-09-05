@@ -50,7 +50,7 @@ in `PixelTargets`, never in model inputs.
 
 Generating tens of thousands of views by repeatedly importing a part and crossing the
 worker RPC would spend most of the budget on document/RPC lifecycle. The corpus therefore
-uses `viewpoint-pixel-raster/1.1.0; engine-perspective-v1; cuda-batch-v1`. CPU projection
+uses `viewpoint-pixel-raster/1.2.0; engine-perspective-v1; cuda-batch-v1`. CPU projection
 and six-plane clipping retain the exact scalar camera math, while the dominant
 reciprocal-depth test is batched over all 16 candidates in float64 on CUDA. Torch remains
 a lazy optional import: `auto` falls back to the exact scalar NumPy renderer when Torch or
@@ -58,9 +58,14 @@ CUDA is unavailable.
 
 The renderer mirrors `doc_render_view.camera_pose.v1`: the same perspective basis and
 focal scale, six clipping planes, half-pixel edge tests, reciprocal-depth z buffer,
-clean-shot material, world light, and background. A 12-part / 192-view scalar-versus-CUDA
-check found 192/192 byte-identical RGB frames, minimum foreground IoU 1.0, maximum RGB MAE
-0.0, and maximum absolute depth error 0.0.
+clean-shot material, world light, and background. Shading is Gouraud, like the engine's
+`render_view_to_rgb`: the diffuse term is computed per vertex, carried through clipping,
+and interpolated per pixel. The shading normals reproduce the mesh-import lane's
+`compute_mesh_smooth_normals` exactly — positions welded into 1e-6 mm buckets, an
+area-weighted sum over the incident triangles within a 40 degree crease angle, stored at
+float32 — because that is the body the engine actually renders for a corpus part. A
+12-part / 192-view scalar-versus-CUDA check found 192/192 byte-identical RGB frames,
+minimum foreground IoU 1.0, maximum RGB MAE 0.0, and maximum absolute depth error 0.0.
 
 `compare_with_engine` splits a generated mechanical part into connected triangle shells,
 imports every shell into the real engine, and renders the same pose through

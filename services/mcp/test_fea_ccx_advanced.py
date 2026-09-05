@@ -378,9 +378,9 @@ def test_ccx_timeout_clean_error():
 # pre-solve work), not the particular seconds.
 
 _RUN_FEA_TOOLS = (
-    "run_fea_adaptive", "run_fea_buckling", "run_fea_contact", "run_fea_fatigue",
-    "run_fea_frequency_response", "run_fea_modal", "run_fea_static",
-    "run_fea_thermal",
+    "run_fea_adaptive", "run_fea_buckling", "run_fea_contact",
+    "run_fea_convergence", "run_fea_fatigue", "run_fea_frequency_response",
+    "run_fea_modal", "run_fea_static", "run_fea_thermal",
 )
 
 
@@ -405,12 +405,19 @@ def test_every_run_fea_tool_outer_ceiling_exceeds_the_inner_ccx_clock():
     for tool in advertised:
         outer = sim_guidance.ENTRIES[tool].get("timeout_s")
         assert outer is not None, f"{tool} has no outer timeout_s"
-        assert float(outer) == fa.HARNESS_FEA_TIMEOUT_S, (
-            f"{tool} outer ceiling {outer}s is out of lockstep with "
-            f"fea_advanced.HARNESS_FEA_TIMEOUT_S={fa.HARNESS_FEA_TIMEOUT_S}s")
-        assert fa.HARNESS_CCX_TIMEOUT_S < float(outer), (
-            f"{tool}: inner ccx {fa.HARNESS_CCX_TIMEOUT_S}s is not inside outer "
-            f"{outer}s — CalculiX's own timeout diagnostic is unreachable")
+        # A multi-leg member (run_fea_convergence's mesh ladder) resolves its
+        # setup once and then burns one inner clock per leg, so the solver term
+        # scales and the margin does not. Single-solve members are legs=1, i.e.
+        # exactly HARNESS_FEA_TIMEOUT_S.
+        legs = sim_guidance.FEA_SOLVER_LEGS.get(tool, 1)
+        inner = legs * fa.HARNESS_CCX_TIMEOUT_S
+        assert float(outer) == inner + fa.CCX_SETUP_MARGIN_S, (
+            f"{tool} outer ceiling {outer}s is out of lockstep with {legs} x "
+            f"fea_advanced.HARNESS_CCX_TIMEOUT_S={fa.HARNESS_CCX_TIMEOUT_S}s + "
+            f"CCX_SETUP_MARGIN_S={fa.CCX_SETUP_MARGIN_S}s")
+        assert inner < float(outer), (
+            f"{tool}: {legs} inner ccx clock(s) totalling {inner}s are not inside "
+            f"outer {outer}s — CalculiX's own timeout diagnostic is unreachable")
 
 
 def test_mcp_ccx_call_sites_pass_the_harness_budget_explicitly():

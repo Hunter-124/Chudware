@@ -366,71 +366,6 @@ static float drawSessionRunningIcon(ImDrawList* dl, const ui::AdaptiveSurface& s
     return sz + 6.0f * sc;  // icon box + gap before the text
 }
 
-static std::filesystem::path lexicalPath(std::string_view raw) {
-    std::string path(raw);
-    std::replace(path.begin(), path.end(), '\\', '/');
-    return std::filesystem::path(path).lexically_normal();
-}
-
-static std::string comparablePath(const std::filesystem::path& path) {
-    std::string result = path.generic_string();
-    const std::string root = path.root_path().generic_string();
-    while (result.size() > root.size() && !result.empty() && result.back() == '/')
-        result.pop_back();
-#ifdef _WIN32
-    std::transform(result.begin(), result.end(), result.begin(), [](unsigned char c) {
-        return static_cast<char>(std::tolower(c));
-    });
-#endif
-    return result;
-}
-
-static bool artifactPathIsInProject(std::string_view rawPath,
-                                    const std::filesystem::path& projectRoot,
-                                    const std::string& projectKey) {
-    if (rawPath.empty() || projectKey.empty()) return false;
-    std::filesystem::path artifact = lexicalPath(rawPath);
-    if (!artifact.is_absolute()) artifact = (projectRoot / artifact).lexically_normal();
-    const std::string artifactKey = comparablePath(artifact);
-    if (artifactKey == projectKey) return true;
-    if (artifactKey.size() <= projectKey.size() ||
-        artifactKey.compare(0, projectKey.size(), projectKey) != 0)
-        return false;
-    return projectKey.back() == '/' || artifactKey[projectKey.size()] == '/';
-}
-
-static bool hasProjectArtifact(const std::vector<ChatMsg>& msgs,
-                               const std::filesystem::path& projectRoot,
-                               const std::string& projectKey) {
-    static constexpr std::string_view kMarker("\x1e" "ART\x1e");
-    for (const ChatMsg& msg : msgs) {
-        if (msg.fromUser) continue;
-        for (const auto& activity : msg.activity) {
-            const std::string_view detail(activity.detail);
-            const size_t marker = detail.find(kMarker);
-            if (marker == std::string_view::npos) continue;
-            std::string_view packed = detail.substr(marker + kMarker.size());
-            while (!packed.empty() && (packed.front() == '\r' || packed.front() == '\n'))
-                packed.remove_prefix(1);
-            while (!packed.empty()) {
-                const size_t newline = packed.find('\n');
-                std::string_view line = packed.substr(0, newline);
-                if (!line.empty() && line.back() == '\r') line.remove_suffix(1);
-                const size_t tab = line.find('\t');
-                if (tab != std::string_view::npos) {
-                    const std::string_view kind = line.substr(0, tab);
-                    const std::string_view path = line.substr(tab + 1);
-                    if ((kind == "file" || kind == "image" || kind == "mesh") &&
-                        artifactPathIsInProject(path, projectRoot, projectKey))
-                        return true;
-                }
-                if (newline == std::string_view::npos) break;
-                packed.remove_prefix(newline + 1);
-            }
-        }
-    }
-    return false;
-}
 
 // ---- Chudcode session recovery card (Sessions rows -> Manage) --------------------------------
 // Per-session export / diagnose / repair / branch / runtime-close against the exact worker
@@ -803,6 +738,9 @@ void drawSessionsPanel(AppState& st, bool busy) {
     // filter sits in the header's accessory slot — above the rule, next to the title cluster
     // — instead of a full body row between the button and the list.
     static bool s_showArchived = false;
+    // Project scope filter: the list shows this project's sessions (plus unscoped ones) by
+    // default; "All projects" drops the filter and reveals each row's project folder.
+    static bool s_allProjects = false;
     ui::cpMenuHeader(st.fonts, "Sessions", nullptr, [&]{
         // Checkbox ink must come from the glass surface like every other label in this menu:
         // the theme's default text tone is tuned for opaque panels and vanished against the
@@ -815,6 +753,16 @@ void drawSessionsPanel(AppState& st, bool busy) {
                 ? "Showing archived sessions only. Uncheck to return to your active list."
                 : "Archived sessions are hidden from this list \xe2\x80\x94 check to review or "
                   "restore them. Archiving keeps the full transcript (unlike Delete).");
+        ImGui::SameLine(0.0f, ui::metrics::U(1.0f));
+        ImGui::PushStyleColor(ImGuiCol_Text, surf.textPrimary);
+        ImGui::Checkbox("All projects", &s_allProjects);
+        ImGui::PopStyleColor();
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip(s_allProjects
+                ? "Showing sessions from every project \xe2\x80\x94 each row names its project "
+                  "folder. Uncheck to see only this project's sessions."
+                : "Only sessions started in this project (and sessions with no project) are "
+                  "listed \xe2\x80\x94 check to see every session on disk.");
     });
 
     // New-session is the one PRIMARY action in the copilot menus, so it uses the accent
@@ -849,19 +797,23 @@ void drawSessionsPanel(AppState& st, bool busy) {
     const float subH  = fh * 0.92f;
     const float rowH  = padY * 2.0f + titleH + 2.0f * sc + subH;
     const float trashSz = ImGui::GetFrameHeight();
-    const std::filesystem::path projectRoot = lexicalPath(st.plmProjectPath());
-    const std::string projectKey = comparablePath(projectRoot);
+    // Project scope comes from the session's OWN stored projectDir (captured at creation),
+    // never from a live scan of what it produced: a chat that wrote nothing under the folder
+    // — or ran while the project path differed — used to vanish from this list entirely.
+    const std::string projectKey = convProjectKey(convProjectDir(st));
     bool anyRowShown = false;
     // Newest sessions first: newConversation() appends, so the tail of st.conversations is the
     // most recent session — walk the vector back-to-front so it lands at the TOP of the list.
     for (int i = (int)st.conversations.size() - 1; i >= 0; --i) {
         Conversation& c = st.conversations[i];
         if (c.archived != s_showArchived) continue;
-        // A session belongs in this project-scoped list only when its own transcript has a
-        // produced file/image/mesh under the active project root. The active transcript lives
-        // in st.chat; parked conversations retain theirs in Conversation::msgs.
+        // Shown iff the session belongs to this project, or carries no project at all
+        // (unscoped: a legacy session with nothing to recover a folder from). The active
+        // transcript lives in st.chat; parked conversations retain theirs in Conversation::msgs.
+        const std::string convKey = convProjectKey(c.projectDir);
+        if (!s_allProjects && !convKey.empty() && !projectKey.empty() && convKey != projectKey)
+            continue;
         const std::vector<ChatMsg>& msgs = (i == st.activeConv) ? st.chat : c.msgs;
-        if (!hasProjectArtifact(msgs, projectRoot, projectKey)) continue;
         anyRowShown = true;
         // Fallback number is the conversation's own slot, not the display row — with the
         // newest-first order a row position changes every session, a slot number does not.
@@ -994,6 +946,27 @@ void drawSessionsPanel(AppState& st, bool busy) {
         dl->AddText(ImVec2(rowMin.x + padX + runIndent, titleY + titleH + 2.0f * sc),
                     ImGui::ColorConvertFloat4ToU32(surf.textSecondary),
                     ui::kit::elide(sub, subMaxW).c_str());
+        // "All projects" reveals which project each session belongs to: a dimmed column on
+        // the sub line, right of the message count. Unscoped sessions say so explicitly
+        // rather than looking like they belong to the current project.
+        if (s_allProjects) {
+            const float subW = ImGui::CalcTextSize(ui::kit::elide(sub, subMaxW).c_str()).x;
+            const float projX = rowMin.x + padX + runIndent + subW + 8.0f * sc;
+            const float projMaxW = subRight - projX;
+            if (projMaxW > ui::metrics::px(16.0f)) {
+                std::string projName = "no project";
+                if (!c.projectDir.empty()) {
+                    const std::filesystem::path p = lexicalPath(c.projectDir);
+                    projName = p.filename().empty() ? p.generic_string()
+                                                    : p.filename().generic_string();
+                }
+                ImVec4 projInk = surf.textTertiary;
+                projInk.w = 1.0f;
+                dl->AddText(ImVec2(projX, titleY + titleH + 2.0f * sc),
+                            ImGui::ColorConvertFloat4ToU32(projInk),
+                            ui::kit::elide(projName.c_str(), projMaxW).c_str());
+            }
+        }
 
         if (!badge.empty()) {
             const ImVec2 bsz = ImGui::CalcTextSize(badge.c_str());
@@ -1075,8 +1048,13 @@ void drawSessionsPanel(AppState& st, bool busy) {
     }
     if (!anyRowShown) {
         // Same tone and indent as every other "nothing here yet" line in the copilot menus.
-        ui::cpMenuHint(s_showArchived ? "No archived sessions match this project."
-                                      : "No sessions with artifacts in this project.");
+        if (s_showArchived)
+            ui::cpMenuHint(s_allProjects ? "No archived sessions."
+                                         : "No archived sessions in this project.");
+        else
+            ui::cpMenuHint(s_allProjects ? "No sessions yet."
+                                         : "No sessions in this project \xe2\x80\x94 check "
+                                           "\"All projects\" to see every session.");
     }
 
 }
@@ -2046,6 +2024,7 @@ void drawAIPanel(AppState& st, bool busy, bool canRun) {
             Conversation cx; cx.id = newConvId(st);
             cx.title = (st.conversations.size() == 1) ? "Bracket + FEA study"
                                                       : "Gearbox housing revision";
+            cx.projectDir = convProjectDir(st);  // demo rows must pass the project filter
             st.conversations.push_back(std::move(cx));
         }
         if (std::strcmp(cpView, "sessions") == 0)       cpSetTab(st, CpTab::Sessions);

@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
@@ -282,6 +283,13 @@ MeshData parse_face_tessellations(const Bytes& data, std::optional<std::uint32_t
             mesh.verts.push_back(static_cast<double>(read_f32(data, p + 4)) * 1000.0);
             mesh.verts.push_back(static_cast<double>(read_f32(data, p + 8)) * 1000.0);
         }
+
+        // The second array of the group is SolidWorks' per-vertex NORMAL array. It is
+        // deliberately NOT read: on real parts it is garbage (a turned spacer authored
+        // (0,0,±1) for all 2208 vertices; another part's signs disagreed with the triangle
+        // winding on 1040 of 1176 triangles), so shading it produced a worse picture than
+        // no normals at all. mesh_to_shape derives smooth normals from the triangle soup
+        // instead. The group's four-array stride is still what locates the positions.
 
         std::uint32_t cursor = 0;
         for (std::uint32_t strip = 0; strip < strip_count; ++strip) {

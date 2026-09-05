@@ -82,6 +82,9 @@ Env/naming: `CHUDWARE_*` env vars are canonical; MCP id is `chudware`
 scripts/gate.sh         # THE gate: check.py → core build+ctest → host build → pytest → shot smoke
 python3 scripts/check.py                          # fast stdlib gate (gui_lint, audits) — always runnable
 python3 work/tools/work.py ready|board            # task board
+CHUDWARE_POLYMESH_ROOT=~/Repositories/Polyhedral-FEA-private ./build.sh core   # build against Hunter's live Polyhedral-FEA tree (else pinned public fetch)
+./build.sh stage        # restage libchudware + chudware-hostd + polymesh CLI into services/dist (dist is FIRST in hostd lookup — stale dist = stale daemon)
+scripts/run_mission.py --workspace <project> --sessions-dir ~/Documents/Chudware/Sessions --prompt-file p.md --model claude-opus-5   # headless agent turn; --resume for follow-ups
 ```
 
 Gate semantics: OCCT-absent and runtime-venv-absent are **SKIPs, not failures** — the gate
@@ -170,6 +173,21 @@ judgment).
 - **GUI reconnect:** status bar shows a sticky unreachable chip; `engine_events` reconnects
   with backoff and re-bootstraps doc tabs on `reconnectGeneration` bump
   (`CHUDWARE_SHOT=daemon_h2`). See gui-workspaces for the status-bar surface.
+- **Chat sessions are keyed by project (2026-09-04).** `Conversation.projectDir` is stamped
+  once at creation from `convProjectDir(st)` (= `st.workspaceDir`, else `plmProjectPath()`) —
+  the same value the composer sends Chudcode as `workspace_dir`. `index.json` v3 keeps
+  `active_by_project`; the Sessions panel filters on the stored key (never on a live artifact
+  scan) and adopts headless Chudcode `*.jsonl` files found in the Sessions dir. Do not
+  re-derive project membership at draw time.
+- **Sim results are evidence-grade or they are not results.** `sim_run_static|adaptive|modal|
+  thermal` emit top-level `mesh_quality`, `reactions` (static/adaptive), `provenance`
+  (`engine_build_id`, `polymesh_commit`) and honour `study.vtu_path`; `sim_cache` schema `/3`.
+  `run_fea_convergence` → `sim_evidence_packet` → `polymesh_cli` (mm STEP ⇒ `--scale 0.001`)
+  is the release path in `simulate/SKILL.md`. Keep new fields TOP-LEVEL siblings of `summary`.
+- **Assembly merges go through `assembly-merge/SKILL.md`.** Import features take
+  `keep_bodies`/`exclude_bodies`; `fit_cylinder_axis` samples the true surface; components
+  carry `placement_source` and exports warn `placement_unverified` until `check_interference`
+  runs. Hand-editing STEP/JSONL text is a hard-rule violation for agents.
 - **Mission docs are never CLOSED, only SAVED** (2026-08-05). T-RF5 deleted
   `services/agent/loop.py`'s `_terminal_autosave_close_docs` and C++ never re-implemented
   it: `core/agent/run.cpp` only `doc_save`s the doc a DAG node is on, with zero

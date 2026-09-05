@@ -21,6 +21,41 @@ namespace geom {
 // Falls back to 0.05 mm when the shape has no measurable bbox.
 double auto_linear_deflection(const TopoDS_Shape& shape);
 
+// ---- display tessellation quality (viewport / render smoothness) --------------
+// One knob for "how smooth does the DISPLAY mesh look", used by the document
+// compile AICM build and every session tessellation path. Imported real B-rep
+// (frame tubes, 508 mm wheels) rendered visibly faceted at the historical
+// Draft numbers: a 2.6 m frame meshed at a 1.0 mm chord with ~0.35 rad angular
+// deflection (~18 segments per full circle). Finer tiers scale BOTH terms down.
+//
+//   tier     | lin = clamp(bbox_diag * rel, floor, ceil) mm      | ang (rad)
+//   ---------|--------------------------------------------------|----------
+//   Draft    | rel 6.0e-4, floor 0.02,  ceil 1.0                | 0.35
+//   Standard | rel 3.0e-4, floor 0.01,  ceil 0.5                | 0.20
+//   Fine     | rel 1.5e-4, floor 0.005, ceil 0.25               | 0.10
+//
+// Fine is the default (see default_display_quality). tessellate_body still
+// applies its kDisplayMaxAngularDeflection ceiling, so Draft's 0.35 rad is
+// bounded to that clamp and Draft/Standard differ in chord tolerance only.
+enum class DisplayQuality { Draft = 0, Standard = 1, Fine = 2 };
+
+// BRepMesh tolerances for one quality tier applied to one shape (mm, radians).
+struct DisplayDeflections {
+    double lin = 0.0;
+    double ang = 0.0;
+};
+DisplayDeflections display_deflections(DisplayQuality q, const TopoDS_Shape& shape);
+
+// Wire names: "draft" | "standard" | "fine". parse returns false (leaving `out`
+// untouched) for anything else, so an RPC can refuse instead of guessing.
+const char* display_quality_name(DisplayQuality q);
+bool display_quality_parse(const std::string& name, DisplayQuality& out);
+
+// Process default for a new document: `CHUDWARE_DISPLAY_QUALITY` (draft|standard|
+// fine) when set to a valid name, else Fine. Read once and cached, so headless
+// renders and the GUI in the same process agree.
+DisplayQuality default_display_quality();
+
 // Tessellate one OCCT shape into an AICM body.
 //   lin_deflection / ang_deflection : BRepMesh tolerances (mm, radians).
 //   lin_deflection <= 0 (the default) selects the size-relative auto value

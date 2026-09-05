@@ -53,6 +53,7 @@ from .cad_common import (
     is_geom_query,
     normalize_geom_query,
     note_touched_doc,
+    placement_warnings,
     cb,
     recover_autosaved,
     recover_skipped,
@@ -7807,6 +7808,13 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
                "bracket.step.step+". Returns the written path and bytes so you can confirm a
                real save, plus a note whenever the extension was rewritten.
 
+        On an assembly (or any doc with 2+ world bodies) the reply carries non-blocking
+        `warnings:["placement_unverified: N component(s) placed by transform with no
+        check_interference since last mutation"]`: the save happened, but N component poses
+        asserted via asm_add_component(at=/rotate=) have not been re-validated since the last
+        mutation. Run check_interference plus measure_between / list_world_bodies against the
+        expected envelope, then save again.
+
         Save every deliverable BEFORE your session ends: the user is never warned about your
         unsaved docs, so anything you don't save (and don't close_part(discard=True)) is only
         recoverable from a fallback crash-recovery tier — not a delivery mechanism.
@@ -7848,10 +7856,14 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
                    "bytes": (os.path.getsize(written) if ok else 0)}
             if note:
                 res["note"] = note
+            # Non-blocking placement provenance (assembly-merge discipline): a
+            # transform-placed component nobody re-checked is how a merge ships off-frame.
+            warnings = placement_warnings(d)
+            if warnings:
+                res["warnings"] = warnings
             return _dumps(res)
         except Exception as e:  # noqa: BLE001
             return _err(e)
-
 
 
     @mcp.tool()

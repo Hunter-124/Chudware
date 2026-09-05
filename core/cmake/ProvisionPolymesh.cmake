@@ -32,6 +32,21 @@ set(POLYMESH_REPOSITORY "https://github.com/Hunter-124/Polyhedral-FEA.git"
 # ${_pm_src}: it is the exhaustive set of paths the checkout below is allowed to discard.
 set(_pm_managed_patch_files "src/advisor/CMakeLists.txt")
 
+# --- local development source override ---------------------------------------
+# POLYMESH_SOURCE_DIR is a developer's live Polyhedral-FEA checkout (the repository root
+# itself, i.e. the directory holding the top-level CMakeLists.txt — NOT a POLYMESH_ROOT
+# whose src/ subdirectory is the checkout). build.sh forwards CHUDWARE_POLYMESH_ROOT here.
+# Nothing is fetched, no pin is enforced and no file in it is patched: the whole point is
+# that Chudware builds exactly what the developer has in the working tree.
+set(POLYMESH_SOURCE_DIR "" CACHE PATH
+    "Local Polyhedral-FEA checkout to build against (bypasses the pinned fetch)")
+set(_pm_local_source FALSE)
+if(POLYMESH_SOURCE_DIR)
+  get_filename_component(_pm_local_source_dir "${POLYMESH_SOURCE_DIR}" ABSOLUTE)
+  file(TO_CMAKE_PATH "${_pm_local_source_dir}" _pm_local_source_dir)
+  set(_pm_local_source TRUE)
+endif()
+
 # A caller-supplied root is a deliberate local-source override: never fetch into it, check
 # out another revision, or patch its files. The default third_party checkout is managed by
 # this module and is kept at POLYMESH_COMMIT even when an older provision already exists.
@@ -44,10 +59,19 @@ if(DEFINED POLYMESH_ROOT)
     set(_pm_root_is_override TRUE)
   endif()
 endif()
-set(POLYMESH_ROOT "${_pm_default_root}"
-    CACHE PATH "Polyhedral-FEA source root (auto-provisioned if missing)")
-file(TO_CMAKE_PATH "${POLYMESH_ROOT}" POLYMESH_ROOT)
-set(_pm_src "${POLYMESH_ROOT}/src")
+if(_pm_local_source)
+  # The override IS the checkout; POLYMESH_ROOT is reported for diagnostics only, and the
+  # fetch/patch machinery below is skipped exactly as it is for an explicit POLYMESH_ROOT.
+  set(POLYMESH_ROOT "${_pm_local_source_dir}"
+      CACHE PATH "Polyhedral-FEA source root (auto-provisioned if missing)" FORCE)
+  set(_pm_root_is_override TRUE)
+  set(_pm_src "${_pm_local_source_dir}")
+else()
+  set(POLYMESH_ROOT "${_pm_default_root}"
+      CACHE PATH "Polyhedral-FEA source root (auto-provisioned if missing)")
+  file(TO_CMAKE_PATH "${POLYMESH_ROOT}" POLYMESH_ROOT)
+  set(_pm_src "${POLYMESH_ROOT}/src")
+endif()
 
 if(NOT _pm_root_is_override)
   find_package(Git REQUIRED)
@@ -109,14 +133,40 @@ if(NOT _pm_root_is_override)
         "${POLYMESH_REPOSITORY} failed (${_pm_rc}); local changes were not removed")
     endif()
   endif()
+  message(STATUS
+    "Polyhedral-FEA: PINNED FETCH ${POLYMESH_REPOSITORY} @ ${POLYMESH_COMMIT}")
 elseif(NOT EXISTS "${_pm_src}/CMakeLists.txt")
   message(FATAL_ERROR
-    "[polymesh] explicit POLYMESH_ROOT has no src/CMakeLists.txt: ${POLYMESH_ROOT}")
+    "[polymesh] source override has no CMakeLists.txt: ${_pm_src}")
+elseif(_pm_local_source)
+  # Record what the working tree actually is. A checkout with no git metadata, or a
+  # rev-parse failure, is not an error — the developer may be building an export — but the
+  # commit we report must then say so rather than claim the pin.
+  find_package(Git QUIET)
+  set(_pm_local_sha "unknown")
+  if(GIT_EXECUTABLE)
+    execute_process(
+      COMMAND "${GIT_EXECUTABLE}" -C "${_pm_src}" rev-parse HEAD
+      RESULT_VARIABLE _pm_local_rc
+      OUTPUT_VARIABLE _pm_local_head
+      OUTPUT_STRIP_TRAILING_WHITESPACE
+      ERROR_QUIET)
+    if(_pm_local_rc EQUAL 0 AND _pm_local_head)
+      set(_pm_local_sha "${_pm_local_head}")
+    endif()
+  endif()
+  set(POLYMESH_COMMIT "${_pm_local_sha}"
+      CACHE STRING "Polyhedral-FEA commit to build" FORCE)
+  message(STATUS "==============================================================")
+  message(STATUS "Polyhedral-FEA: LOCAL SOURCE ${_pm_src} @ ${_pm_local_sha}")
+  message(STATUS "==============================================================")
 else()
   message(STATUS "[polymesh] using caller-supplied source override ${_pm_src}")
 endif()
 
-if(_pm_root_is_override)
+if(_pm_local_source)
+  set(POLYMESH_MODEL_REVISION "local:${POLYMESH_COMMIT}")
+elseif(_pm_root_is_override)
   set(POLYMESH_MODEL_REVISION "local-override")
 else()
   set(POLYMESH_MODEL_REVISION "${POLYMESH_COMMIT}")

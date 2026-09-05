@@ -136,6 +136,7 @@
 #include <TopAbs.hxx>
 #include <TopExp_Explorer.hxx>
 #include <TopLoc_Location.hxx>
+#include <TopTools_FormatVersion.hxx>
 #include <TopTools_HSequenceOfShape.hxx>
 #include <TopoDS.hxx>
 #include <TopoDS_Compound.hxx>
@@ -1727,6 +1728,253 @@ std::vector<std::pair<std::string, MeshData>> read_mesh_raw(const std::string& p
 
 // --------------------------------------------------------------------------- mesh_to_shape
 
+namespace {
+
+// Positional weld key for a triangle soup: 1e-6 mm buckets (tighter than the 1e-6 sew
+// tolerance is loose), so a vertex duplicated per strip/face still welds to one position.
+struct MeshWeldKey {
+    std::int64_t x, y, z;
+    bool operator==(const MeshWeldKey& o) const { return x == o.x && y == o.y && z == o.z; }
+};
+struct MeshWeldKeyHash {
+    std::size_t operator()(const MeshWeldKey& k) const {
+        std::size_t h = std::hash<std::int64_t>{}(k.x);
+        h ^= std::hash<std::int64_t>{}(k.y) + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
+        h ^= std::hash<std::int64_t>{}(k.z) + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
+        return h;
+    }
+};
+MeshWeldKey mesh_weld_key(double x, double y, double z) {
+    const double q = 1e6;  // 1e-6 mm buckets
+    return MeshWeldKey{static_cast<std::int64_t>(std::llround(x * q)),
+                       static_cast<std::int64_t>(std::llround(y * q)),
+                       static_cast<std::int64_t>(std::llround(z * q))};
+}
+
+// Smooth per-corner shading normals for a triangle soup, split across creases.
+//
+// The mesh lane sews one planar FACE per triangle, so the display tessellator
+// (core/geom/tessellate.cpp) would otherwise compute a single flat normal per triangle and
+// a curved import renders as discrete facets. Authored per-vertex normals are NOT used to
+// fix that: the SolidWorks saved-display normal arrays measured WRONG on real parts (a
+// turned spacer carried nothing but (0,0,±1) on all 2208 vertices; on another part the
+// authored sign disagreed with the triangle winding for 1040 of 1176 triangles), so they
+// are no longer parsed at all. These normals come from the geometry instead.
+//
+// Math. n_t = (p1-p0) x (p2-p0) is twice the triangle's area times its unit normal, so
+// summing raw cross products IS an area-weighted average. For corner k of triangle t the
+// sum runs over the triangles incident to that corner's WELDED position whose unit normal
+// lies within the crease angle (40 deg, i.e. dot >= cos 40 deg) of t's own unit normal —
+// a vertex on a hard edge therefore gets a different average per side (nothing smooths
+// across the crease) while a tessellated cylinder, fillet or tread band gets one
+// continuous normal field. Degenerate triangles have a zero normal, so they neither
+// contribute to nor receive a usable average.
+//
+// Normals follow the soup's OWN winding. The consumer flips a REVERSED face's normals and
+// its index order together, so the downstream orientation fix keeps the two consistent.
+struct MeshSmoothNormals {
+    std::unordered_map<MeshWeldKey, std::uint32_t, MeshWeldKeyHash> pos_id;  // weld key -> id
+    std::vector<std::uint32_t> vert_pos;  // per soup vertex: welded position id
+    std::vector<std::uint32_t> at_off;    // CSR offsets over positions, size npos+1
+    std::vector<std::uint32_t> at_tri;    // CSR payload: triangles incident to each position
+    std::vector<float> corner;            // 9 floats per triangle (3 corners x xyz)
+};
+
+MeshSmoothNormals compute_mesh_smooth_normals(const MeshData& mesh) {
+    MeshSmoothNormals sn;
+    const std::size_t nv = mesh.vertex_count();
+    const std::size_t nt = mesh.triangle_count();
+    if (nt == 0) return sn;
+
+    sn.vert_pos.resize(nv);
+    sn.pos_id.reserve(nv * 2);
+    std::uint32_t npos = 0;
+    for (std::size_t v = 0; v < nv; ++v) {
+        const auto ins = sn.pos_id.emplace(
+            mesh_weld_key(mesh.verts[3 * v], mesh.verts[3 * v + 1], mesh.verts[3 * v + 2]), npos);
+        if (ins.second) ++npos;
+        sn.vert_pos[v] = ins.first->second;
+    }
+
+    // CSR adjacency: which triangles touch each welded position.
+    sn.at_off.assign(static_cast<std::size_t>(npos) + 1, 0u);
+    for (std::size_t t = 0; t < nt; ++t)
+        for (int k = 0; k < 3; ++k) ++sn.at_off[sn.vert_pos[mesh.tris[3 * t + k]] + 1];
+    for (std::uint32_t p = 0; p < npos; ++p) sn.at_off[p + 1] += sn.at_off[p];
+    sn.at_tri.assign(sn.at_off.back(), 0u);
+    {
+        std::vector<std::uint32_t> cursor(sn.at_off.begin(), sn.at_off.end() - 1);
+        for (std::size_t t = 0; t < nt; ++t)
+            for (int k = 0; k < 3; ++k)
+                sn.at_tri[cursor[sn.vert_pos[mesh.tris[3 * t + k]]]++] =
+                    static_cast<std::uint32_t>(t);
+    }
+
+    // Area-weighted (raw cross product) and unit triangle normals.
+    std::vector<double> raw(nt * 3, 0.0), unit(nt * 3, 0.0);
+    for (std::size_t t = 0; t < nt; ++t) {
+        const std::uint32_t a = mesh.tris[3 * t], b = mesh.tris[3 * t + 1],
+                            c = mesh.tris[3 * t + 2];
+        const double ux = mesh.verts[3 * b] - mesh.verts[3 * a];
+        const double uy = mesh.verts[3 * b + 1] - mesh.verts[3 * a + 1];
+        const double uz = mesh.verts[3 * b + 2] - mesh.verts[3 * a + 2];
+        const double vx = mesh.verts[3 * c] - mesh.verts[3 * a];
+        const double vy = mesh.verts[3 * c + 1] - mesh.verts[3 * a + 1];
+        const double vz = mesh.verts[3 * c + 2] - mesh.verts[3 * a + 2];
+        const double nx = uy * vz - uz * vy;
+        const double ny = uz * vx - ux * vz;
+        const double nz = ux * vy - uy * vx;
+        raw[3 * t] = nx; raw[3 * t + 1] = ny; raw[3 * t + 2] = nz;
+        const double len = std::sqrt(nx * nx + ny * ny + nz * nz);
+        if (len > 1e-30) {
+            unit[3 * t] = nx / len; unit[3 * t + 1] = ny / len; unit[3 * t + 2] = nz / len;
+        }
+    }
+
+    const double kCosCrease = std::cos(40.0 * 3.14159265358979323846 / 180.0);
+    sn.corner.assign(nt * 9, 0.0f);
+    for (std::size_t t = 0; t < nt; ++t) {
+        const double rx = unit[3 * t], ry = unit[3 * t + 1], rz = unit[3 * t + 2];
+        if (rx == 0.0 && ry == 0.0 && rz == 0.0) continue;  // degenerate triangle
+        for (int k = 0; k < 3; ++k) {
+            double ax = 0.0, ay = 0.0, az = 0.0;
+            const std::uint32_t p = sn.vert_pos[mesh.tris[3 * t + k]];
+            for (std::uint32_t i = sn.at_off[p]; i < sn.at_off[p + 1]; ++i) {
+                const std::uint32_t j = sn.at_tri[i];
+                if (unit[3 * j] * rx + unit[3 * j + 1] * ry + unit[3 * j + 2] * rz < kCosCrease)
+                    continue;  // across a crease (or degenerate) — do not smooth into it
+                ax += raw[3 * j]; ay += raw[3 * j + 1]; az += raw[3 * j + 2];
+            }
+            double len = std::sqrt(ax * ax + ay * ay + az * az);
+            if (!(len > 1e-30)) { ax = rx; ay = ry; az = rz; len = 1.0; }  // fall back to flat
+            sn.corner[9 * t + 3 * k] = static_cast<float>(ax / len);
+            sn.corner[9 * t + 3 * k + 1] = static_cast<float>(ay / len);
+            sn.corner[9 * t + 3 * k + 2] = static_cast<float>(az / len);
+        }
+    }
+    return sn;
+}
+
+// Attach the computed smooth normals to a just-sewn triangle-soup shape.
+//
+// Runs AFTER sewing on purpose: BRepBuilderAPI_Sewing rebuilds faces, so a triangulation
+// attached before it would be dropped. Each sewn face IS one source triangle, so it is
+// identified by its three WELDED vertex positions — the unique soup triangle incident to
+// all three — and each face vertex then takes that triangle's per-corner normal. The
+// triangulation is written in the face's OWN frame (the location a sewn face may carry is
+// removed first) so BRep_Tool::Triangulation(face, loc) returns nodes consistent with `loc`.
+void attach_mesh_smooth_normals(const TopoDS_Shape& shape, const MeshData& mesh,
+                                const MeshSmoothNormals& sn) {
+    if (shape.IsNull() || sn.corner.empty()) return;
+    BRep_Builder builder;
+    for (TopExp_Explorer fx(shape, TopAbs_FACE); fx.More(); fx.Next()) {
+        const TopoDS_Face face = TopoDS::Face(fx.Current());
+        gp_Pnt pts[3];
+        std::uint32_t fpos[3] = {0, 0, 0};
+        int n = 0;
+        bool usable = true;
+        for (TopExp_Explorer vx(face, TopAbs_VERTEX); vx.More() && usable; vx.Next()) {
+            const gp_Pnt p = BRep_Tool::Pnt(TopoDS::Vertex(vx.Current()));
+            bool seen = false;  // a triangle's wire visits each vertex twice (two edges)
+            for (int i = 0; i < n; ++i)
+                if (pts[i].SquareDistance(p) < 1e-18) seen = true;
+            if (seen) continue;
+            if (n == 3) { usable = false; break; }  // not a plain triangle — leave it alone
+            const auto it = sn.pos_id.find(mesh_weld_key(p.X(), p.Y(), p.Z()));
+            if (it == sn.pos_id.end()) { usable = false; break; }
+            pts[n] = p;
+            fpos[n] = it->second;
+            ++n;
+        }
+        if (!usable || n != 3) continue;
+        if (fpos[0] == fpos[1] || fpos[1] == fpos[2] || fpos[0] == fpos[2]) continue;
+
+        std::size_t tri_idx = 0;
+        bool found = false;
+        for (std::uint32_t i = sn.at_off[fpos[0]]; i < sn.at_off[fpos[0] + 1] && !found; ++i) {
+            const std::uint32_t t = sn.at_tri[i];
+            const std::uint32_t q0 = sn.vert_pos[mesh.tris[3 * t]],
+                                q1 = sn.vert_pos[mesh.tris[3 * t + 1]],
+                                q2 = sn.vert_pos[mesh.tris[3 * t + 2]];
+            bool all = true;
+            for (int k = 0; k < 3; ++k)
+                if (fpos[k] != q0 && fpos[k] != q1 && fpos[k] != q2) all = false;
+            if (all) { tri_idx = t; found = true; }
+        }
+        if (!found) continue;
+        const std::uint32_t tq[3] = {sn.vert_pos[mesh.tris[3 * tri_idx]],
+                                     sn.vert_pos[mesh.tris[3 * tri_idx + 1]],
+                                     sn.vert_pos[mesh.tris[3 * tri_idx + 2]]};
+
+        // Nodes are emitted in the SOURCE TRIANGLE's corner order, NOT in the order the
+        // vertex explorer happens to walk the wire. That ordering IS the display winding:
+        // Poly_Triangle(1,2,3) over arbitrary nodes gave every face a coin-flip winding, so
+        // the AICM mesh was self-inconsistent (286 of 736 triangles wound against their own
+        // stored normal on a real SolidWorks spacer) and its signed volume came out
+        // -375019 mm³ against the B-rep's +481597 mm³. Composed with the face's orientation
+        // by core/geom/tessellate.cpp, the soup winding is the coherent one the sewer chose.
+        gp_Pnt node[3];
+        gp_Dir nrm[3];
+        bool complete = true;
+        for (int k = 0; k < 3 && complete; ++k) {
+            complete = false;
+            const float* c = &sn.corner[9 * tri_idx + 3 * k];
+            const double sq = (double)c[0] * c[0] + (double)c[1] * c[1] + (double)c[2] * c[2];
+            if (sq < 1e-12) break;  // no usable normal — let the tessellator compute one
+            for (int i = 0; i < 3; ++i) {
+                if (fpos[i] != tq[k]) continue;
+                node[k] = pts[i];
+                nrm[k] = gp_Dir(c[0], c[1], c[2]);
+                complete = true;
+                break;
+            }
+        }
+        if (!complete) continue;
+
+        Handle(Poly_Triangulation) tri =
+            new Poly_Triangulation(3, 1, /*hasUV=*/Standard_False, /*hasNormals=*/Standard_True);
+        const bool located = !face.Location().IsIdentity();
+        const gp_Trsf inv = face.Location().Transformation().Inverted();
+        for (int k = 0; k < 3; ++k) {
+            gp_Pnt p = node[k];
+            gp_Dir d = nrm[k];
+            if (located) {
+                p.Transform(inv);
+                d.Transform(inv);
+            }
+            tri->SetNode(k + 1, p);
+            tri->SetNormal(k + 1, d);
+        }
+        tri->SetTriangle(1, Poly_Triangle(1, 2, 3));
+        builder.UpdateFace(face, tri);
+    }
+}
+
+// Closed shell -> solid, mirroring the historical ShapeFix_Solid preference. Null on failure.
+TopoDS_Shape solid_from_closed_shell(const TopoDS_Shell& shell) {
+    try {
+        BRepBuilderAPI_MakeSolid ms(shell);
+        if (!ms.IsDone()) return TopoDS_Shape();
+        ShapeFix_Solid fix;
+        const TopoDS_Shape solid = fix.SolidFromShell(shell);
+        return solid.IsNull() ? TopoDS_Shape(ms.Solid()) : solid;
+    } catch (const Standard_Failure&) {
+        return TopoDS_Shape();
+    }
+}
+
+double shape_signed_volume(const TopoDS_Shape& s) {
+    try {
+        GProp_GProps props;
+        BRepGProp::VolumeProperties(s, props);
+        return props.Mass();
+    } catch (const Standard_Failure&) {
+        return 0.0;
+    }
+}
+
+}  // namespace
+
 TopoDS_Shape mesh_to_shape(const MeshData& mesh) {
     if (mesh.triangle_count() == 0) return TopoDS_Shape();
     // Build one triangular FACE per triangle (degenerate ones dropped), sew them into a
@@ -1767,20 +2015,27 @@ TopoDS_Shape mesh_to_shape(const MeshData& mesh) {
     TopoDS_Shape result = sewn;
     for (TopExp_Explorer ex(sewn, TopAbs_SHELL); ex.More(); ex.Next()) {
         TopoDS_Shell shell = TopoDS::Shell(ex.Current());
-        if (BRep_Tool::IsClosed(shell)) {
-            try {
-                BRepBuilderAPI_MakeSolid ms(shell);
-                if (ms.IsDone()) {
-                    ShapeFix_Solid fix;
-                    TopoDS_Shape solid = fix.SolidFromShell(shell);
-                    result = solid.IsNull() ? TopoDS_Shape(ms.Solid()) : solid;
-                }
-            } catch (const Standard_Failure&) {
-                result = sewn;
-            }
-            break;  // single closed shell is the common case
-        }
+        if (!BRep_Tool::IsClosed(shell)) continue;
+        const TopoDS_Shape solid = solid_from_closed_shell(shell);
+        if (solid.IsNull()) break;  // keep the sewn shell
+        result = solid;
+        // A triangle soup carries NO guarantee that its winding is outward, and neither
+        // sewing nor ShapeFix_Solid re-orients one: a SolidWorks saved-display import came
+        // through INSIDE-OUT (signed volume -374963 mm³ on a 375017 mm³ spacer, so
+        // eval_mass was ~28% wrong and the shading lit the far side). A closed solid must
+        // enclose POSITIVE volume, so when it does not, rebuild from the reversed shell —
+        // every face is then explored complemented, which flips winding and shading normals
+        // together (core/geom/tessellate.cpp).
+        if (shape_signed_volume(result) >= 0.0) break;
+        const TopoDS_Shape flipped =
+            solid_from_closed_shell(TopoDS::Shell(shell.Reversed()));
+        if (!flipped.IsNull() && shape_signed_volume(flipped) > 0.0) result = flipped;
+        break;  // single closed shell is the common case
     }
+    // Smooth shading for every mesh import (SolidWorks saved-display, STL, OBJ, PLY, 3MF,
+    // 3DM): one planar face per triangle otherwise renders as discrete facets. A 40 deg
+    // crease keeps genuinely flat geometry flat, so a boxy STL is unchanged.
+    attach_mesh_smooth_normals(result, mesh, compute_mesh_smooth_normals(mesh));
     return result;
 }
 
@@ -2036,6 +2291,14 @@ TopoDS_Shape place_solidworks_body(const TopoDS_Shape& shape,
         m[0], m[4], m[8], m[12] * 1000.0,
         m[1], m[5], m[9], m[13] * 1000.0,
         m[2], m[6], m[10], m[14] * 1000.0);
+    // Prefer a pure LOCATION for a rigid transform: BRepBuilderAPI_Transform's copy
+    // rebuilds every face, which throws away the Poly_Triangulation carrying the mesh
+    // lane's smooth normals (attach_mesh_smooth_normals) and would leave assembly instances
+    // faceted while an identity-placed part shaded smoothly. A located instance also shares
+    // one TShape across instances, which is what the shared-mesh cache above already
+    // assumes. Non-rigid (scaled) matrices still go through the copying transformer.
+    if (std::abs(trsf.ScaleFactor() - 1.0) < 1e-12)
+        return shape.Moved(TopLoc_Location(trsf));
     BRepBuilderAPI_Transform placed(shape, trsf, Standard_True);
     if (!placed.IsDone() || placed.Shape().IsNull())
         throw OpError("import_failed", "SolidWorks component transform failed");
@@ -2303,7 +2566,13 @@ std::string b64_decode(const std::string& in) {
 std::string shape_to_brep_b64(const TopoDS_Shape& shape) {
     if (shape.IsNull()) return std::string();
     std::ostringstream oss;
-    BRepTools::Write(shape, oss);
+    // Explicit flags, because the 2-argument alias writes triangulation but NOT normals
+    // (theWithNormals defaults to FALSE) — and the triangulation is what carries the
+    // SolidWorks per-vertex normals that make an imported part shade smoothly. Without
+    // normals here the smoothing survived the import but not a .step+ save/reopen, since
+    // the embedded blob is what document.cpp rebuilds the import feature from.
+    BRepTools::Write(shape, oss, /*theWithTriangles=*/Standard_True,
+                     /*theWithNormals=*/Standard_True, TopTools_FormatVersion_CURRENT);
     return b64_encode(oss.str());
 }
 

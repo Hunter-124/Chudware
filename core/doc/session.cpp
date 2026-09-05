@@ -127,6 +127,7 @@
 #include "parts/parts.h"
 #include "geom/aicm.h"
 #include "geom/booleans.h"  // fuse_many — doc_eval_compare's default whole-doc shape
+#include "geom/fit.h"       // least-squares cylinder fit (doc_fit_cylinder_axis)
 #include "geom/plane.h"
 #include "geom/profile.h"
 #include "geom/profile3d.h"   // sketch3d wires (doc_sketch3d_health chain report)
@@ -228,6 +229,12 @@ struct Session {
     chudware::mate::WarmMap asm_warm;
     bool explode_active = false;
     double explode_factor = 1.0;
+
+    // Display tessellation tier for THIS document's AICM meshes (geom::DisplayQuality).
+    // Defaults from CHUDWARE_DISPLAY_QUALITY / Fine so headless renders and the GUI agree.
+    // doc_set_display_quality changes it, drops the compile + per-body mesh caches and
+    // re-tessellates; it is a VIEW setting, so it never touches `doc` or the revision.
+    ::geom::DisplayQuality display_quality = ::geom::default_display_quality();
 
     bool is_assembly() const {
         return doc.is_object() && doc.value("schema", std::string()) == "aicad.asm/1";
@@ -1225,7 +1232,11 @@ json project_external_refs(const json& doc, const chudware::geom::SketchPlane& p
 // refresh compiles the doc it is HANDED (the session's live tree or apply_ops' working
 // tree of the same doc), and the cache is content-addressed by the env/config/feature
 // hash chain (document.cpp), so a diverged tree simply misses — never served stale.
-void refresh_sketch_external_refs(json& doc, CompileCache* cache = nullptr);
+// `quality` must match the owning session's display tier: it seeds the cache's hash
+// chain, so a mismatched pre-compile would miss the prefix checkpoints every time.
+void refresh_sketch_external_refs(json& doc, CompileCache* cache = nullptr,
+                                  ::geom::DisplayQuality quality =
+                                      ::geom::DisplayQuality::Fine);
 // sketch3d counterpart (external model references — vertex targets, doc_schema §3B):
 // re-resolve every sketch3d feature's params.external_refs vertex selectors against
 // the current model, writing back last_point + stale so compile_document's sketch3d
@@ -1233,7 +1244,9 @@ void refresh_sketch_external_refs(json& doc, CompileCache* cache = nullptr);
 // against the FINAL compiled body/bodies (same convention refresh_sketch_external_refs
 // uses for face/edge selectors) rather than the body-as-of-that-feature — a documented
 // v1 simplification. `cache` as above.
-void refresh_sketch3d_external_refs(json& doc, CompileCache* cache = nullptr);
+void refresh_sketch3d_external_refs(json& doc, CompileCache* cache = nullptr,
+                                    ::geom::DisplayQuality quality =
+                                        ::geom::DisplayQuality::Fine);
 void op_sketch_delete_entity(json& doc, const json& op, const json& id_map);
 
 // Sketch entities/constraints take PLAIN numbers, but models often wrap scalars as
@@ -3867,7 +3880,8 @@ bool inc_rebuild_enabled() {
 
 CompileResult compile_session(Session& s) {
     return compile_document(s.doc, env_from_doc(s.doc),
-                            inc_rebuild_enabled() ? s.compile_cache.get() : nullptr);
+                            inc_rebuild_enabled() ? s.compile_cache.get() : nullptr,
+                            s.display_quality);
 }
 
 const CompileResult& ensure_compiled(Session& s) {
@@ -4091,7 +4105,12 @@ std::pair<std::string, json> write_aicm_assembly(Session& s,
         // below (no unlock/relock gap) so two threads racing the SAME uncached TShape key
         // can never both miss and both pay for a duplicate tessellate_body pass — the loser
         // waits on the winner's shared_future instead of redoing the (expensive) mesh work.
-        static std::map<const void*, AsmTessEntry> s_asm_tess_cache;
+        // Keyed by (TShape, display quality): the same component meshed at a different
+        // display tier is a DIFFERENT mesh, so quality is part of the key rather than a
+        // reason to flush the cache.
+        using AsmTessKey = std::pair<const void*, int>;
+        static std::map<AsmTessKey, AsmTessEntry> s_asm_tess_cache;
+        const int qkey = static_cast<int>(s.display_quality);
         for (const AsmBodyOut& body : ares->bodies) {
             std::optional<Eigen::Vector3d> off;
             auto oit = offsets.find(body.component_id);
@@ -4101,7 +4120,7 @@ std::pair<std::string, json> write_aicm_assembly(Session& s,
             const bool rigid = std::abs(t.ScaleFactor() - 1.0) < 1e-12 && !t.IsNegative();
             aicm::AicmBody bt;
             if (rigid) {
-                const void* key = body.shape_local.TShape().get();
+                const AsmTessKey key{body.shape_local.TShape().get(), qkey};
                 std::shared_future<std::shared_ptr<const aicm::AicmBody>> fut;
                 std::shared_ptr<std::promise<std::shared_ptr<const aicm::AicmBody>>> mine;
                 {
@@ -4119,8 +4138,13 @@ std::pair<std::string, json> write_aicm_assembly(Session& s,
                     try {
                         // Tessellate at IDENTITY location so the mesh is reusable for every
                         // instance/placement of this component.
-                        mine->set_value(std::make_shared<const aicm::AicmBody>(::geom::tessellate_body(
-                            body.shape_local.Located(TopLoc_Location()), 0, std::string(), color)));
+                        const TopoDS_Shape local_shape =
+                            body.shape_local.Located(TopLoc_Location());
+                        const ::geom::DisplayDeflections d =
+                            ::geom::display_deflections(s.display_quality, local_shape);
+                        mine->set_value(std::make_shared<const aicm::AicmBody>(
+                            ::geom::tessellate_body(local_shape, 0, std::string(), color,
+                                                    d.lin, d.ang)));
                     } catch (...) {
                         mine->set_exception(std::current_exception());
                         // A failed tessellation is NOT cached — the next caller for this key retries.
@@ -4136,8 +4160,10 @@ std::pair<std::string, json> write_aicm_assembly(Session& s,
                 if (t.Form() != gp_Identity) ::geom::transform_body_rigid(bt, t);
             } else {
                 TopoDS_Shape world = placed_world_shape(body, off);
+                const ::geom::DisplayDeflections d =
+                    ::geom::display_deflections(s.display_quality, world);
                 bt = ::geom::tessellate_body(world, static_cast<uint32_t>(body.body_id),
-                                             body.name, color);
+                                             body.name, color, d.lin, d.ang);
             }
             tesses.push_back(std::move(bt));
             bodies_meta.push_back({{"body_id", body.body_id}, {"name", body.name},
@@ -4381,10 +4407,10 @@ json apply_ops_locked(Session& s, long base_revision, const json& ops, bool coal
         // instead of recompiling the whole tree on every external-ref-bearing batch.
         CompileCache* cache = inc_rebuild_enabled() ? s.compile_cache.get() : nullptr;
         try {
-            refresh_sketch_external_refs(working, cache);
+            refresh_sketch_external_refs(working, cache, s.display_quality);
         } catch (...) { /* keep last-good projections */ }
         try {
-            refresh_sketch3d_external_refs(working, cache);
+            refresh_sketch3d_external_refs(working, cache, s.display_quality);
         } catch (...) { /* keep last-good ground points */ }
     }
 
@@ -5283,10 +5309,10 @@ json doc_activate(const std::string& doc_id) {
         return ops_response(s, *s.compiled, json::object(), /*with_tess=*/true);
     CompileCache* cache = inc_rebuild_enabled() ? s.compile_cache.get() : nullptr;
     try {
-        refresh_sketch_external_refs(s.doc, cache);
+        refresh_sketch_external_refs(s.doc, cache, s.display_quality);
     } catch (...) { /* keep last-good projections */ }
     try {
-        refresh_sketch3d_external_refs(s.doc, cache);
+        refresh_sketch3d_external_refs(s.doc, cache, s.display_quality);
     } catch (...) { /* keep last-good ground points */ }
     CompileResult r = compile_session(s);
     return warm_and_respond(s, std::move(r), json::object(), /*with_tess=*/true);
@@ -5305,10 +5331,10 @@ json doc_rebuild(const std::string& doc_id) {
     // bump: re-projection is derived data; the compile below sees the refreshed tree.
     CompileCache* cache = inc_rebuild_enabled() ? s.compile_cache.get() : nullptr;
     try {
-        refresh_sketch_external_refs(s.doc, cache);
+        refresh_sketch_external_refs(s.doc, cache, s.display_quality);
     } catch (...) { /* keep last-good projections */ }
     try {
-        refresh_sketch3d_external_refs(s.doc, cache);
+        refresh_sketch3d_external_refs(s.doc, cache, s.display_quality);
     } catch (...) { /* keep last-good ground points */ }
     CompileResult r = compile_session(s);
     return warm_and_respond(s, std::move(r), json::object(), /*with_tess=*/true);
@@ -5368,6 +5394,67 @@ json doc_set_explode_state(const std::string& doc_id, bool active, double factor
     s.explode_factor = std::max(0.0, std::min(1.0, factor));
     if (!s.asm_result) rebuild_assembly(s);
     return ops_response_assembly(s, json::object());  // view-only: no revision bump
+}
+
+// Total display triangles currently attached to `shapes`. BRepMesh writes its
+// triangulation into the TShape, so right after a compile/tessellate this is a free
+// read of what the viewport will actually draw — no second meshing pass.
+static long long attached_triangle_count(const std::vector<TopoDS_Shape>& shapes) {
+    long long n = 0;
+    for (const TopoDS_Shape& sh : shapes) {
+        if (sh.IsNull()) continue;
+        for (TopExp_Explorer ex(sh, TopAbs_FACE); ex.More(); ex.Next()) {
+            TopLoc_Location loc;
+            Handle(Poly_Triangulation) tri =
+                BRep_Tool::Triangulation(TopoDS::Face(ex.Current()), loc);
+            if (!tri.IsNull()) n += tri->NbTriangles();
+        }
+    }
+    return n;
+}
+
+// Set this document's DISPLAY tessellation tier and re-tessellate (worker_rpc.md §19).
+// View-only, exactly like doc_set_explode_state: the feature tree and the revision are
+// untouched, nothing becomes dirty and nothing is undoable. The tier is part of the
+// compile-cache chain seed and of the per-body AICM cache key (document.cpp), so both
+// caches are dropped here and the compile below re-meshes every body at the new
+// deflections. Returns {ok, quality, triangles} plus the usual ops-response (so the
+// caller can reload the new mesh from tess.aicm_path).
+json doc_set_display_quality(const std::string& doc_id, const std::string& quality) {
+    DocLock lk;
+    Session& s = require_session(doc_id);
+    ::geom::DisplayQuality q = ::geom::DisplayQuality::Fine;
+    if (!::geom::display_quality_parse(quality, q))
+        throw OpError("invalid_op",
+                      "doc_set_display_quality: quality must be draft|standard|fine, got '" +
+                          quality + "'",
+                      {{"quality", quality}, {"reason", "bad quality"}});
+
+    s.display_quality = q;
+    // Same invalidation a recompute needs: drop the read-only compile result AND the
+    // incremental prefix/per-body mesh cache so nothing is served at the old tier.
+    s.compiled.reset();
+    s.compiled_rev = -1;
+    s.compile_cache = chudware::doc::make_compile_cache();
+
+    json resp;
+    long long tris = 0;
+    if (s.is_assembly()) {
+        rebuild_assembly(s);
+        resp = ops_response_assembly(s, json::object());
+        std::vector<TopoDS_Shape> shapes;
+        if (const AssemblyResult* ares = s.asm_result.get())
+            for (const AsmBodyOut& b : ares->bodies) shapes.push_back(b.shape_local);
+        tris = attached_triangle_count(shapes);
+    } else {
+        const CompileResult& r = ensure_compiled(s);
+        resp = ops_response(s, r, json::object(), /*with_tess=*/true);
+        tris = attached_triangle_count(r.shapes);
+    }
+    resp["ok"] = true;
+    resp["quality"] = ::geom::display_quality_name(q);
+    resp["triangles"] = tris;
+    return resp;  // view-only: no revision bump, no dirty flag
 }
 
 // ============================================================ simulation studies
@@ -6793,7 +6880,9 @@ bool render_view_to_rgb(const std::vector<aicm::AicmBody>& bodies,
     std::vector<unsigned char> img((size_t)W * H * 3, 245);  // light-grey background
     std::vector<double> zbuf((size_t)W * H, -1e30);
     long painted = 0;
-    struct ProjectedVertex { double pu, pv, pd; };
+    // `lam` is the vertex's diffuse term, carried through clipping so a body that ships
+    // per-vertex normals shades SMOOTHLY (Gouraud) instead of one flat tone per triangle.
+    struct ProjectedVertex { double pu, pv, pd, lam; };
     auto clip_halfspace = [](const std::vector<ProjectedVertex>& input,
                              const auto& signed_distance) {
         std::vector<ProjectedVertex> output;
@@ -6811,6 +6900,7 @@ bool render_view_to_rgb(const std::vector<aicm::AicmBody>& bodies,
                     previous.pu + t * (current.pu - previous.pu),
                     previous.pv + t * (current.pv - previous.pv),
                     previous.pd + t * (current.pd - previous.pd),
+                    previous.lam + t * (current.lam - previous.lam),
                 });
             }
             if (current_inside) output.push_back(current);
@@ -6823,8 +6913,8 @@ bool render_view_to_rgb(const std::vector<aicm::AicmBody>& bodies,
     // Projection/clipping feeds this one edge-function/depth/blend raster path for both camera
     // kinds. Perspective supplies reciprocal depth; orthographic supplies its legacy linear depth.
     auto raster_triangle = [&](const ProjectedVertex& p0, const ProjectedVertex& p1,
-                               const ProjectedVertex& p2, unsigned char R, unsigned char G,
-                               unsigned char B, unsigned char balpha) {
+                               const ProjectedVertex& p2, double cr, double cg, double cb,
+                               unsigned char balpha) {
         double su0, sv0, su1, sv1, su2, sv2;
         toScreen(p0.pu, p0.pv, p0.pd, su0, sv0);
         toScreen(p1.pu, p1.pv, p1.pd, su1, sv1);
@@ -6852,6 +6942,11 @@ bool render_view_to_rgb(const std::vector<aicm::AicmBody>& bodies,
                 size_t pi = (size_t)py * W + px;
                 if (depth > zbuf[pi]) {
                     zbuf[pi] = depth;
+                    // Gouraud: the diffuse term is interpolated, the base colour is flat.
+                    const double lam = a0 * p0.lam + a1 * p1.lam + a2 * p2.lam;
+                    const unsigned char R = (unsigned char)std::min(255.0, cr * 255 * lam);
+                    const unsigned char G = (unsigned char)std::min(255.0, cg * 255 * lam);
+                    const unsigned char B = (unsigned char)std::min(255.0, cb * 255 * lam);
                     if (balpha >= 255) {
                         img[pi * 3] = R; img[pi * 3 + 1] = G; img[pi * 3 + 2] = B;
                     } else {
@@ -6920,7 +7015,18 @@ bool render_view_to_rgb(const std::vector<aicm::AicmBody>& bodies,
             RV3 w1{b.pos[3 * i1], b.pos[3 * i1 + 1], b.pos[3 * i1 + 2]};
             RV3 w2{b.pos[3 * i2], b.pos[3 * i2 + 1], b.pos[3 * i2 + 2]};
             RV3 fn = rnorm(rcross(rsub(w1, w0), rsub(w2, w0)));
-            double lam = 0.35 + 0.65 * std::max(0.0, std::abs(rdot(fn, light)));
+            // Diffuse term per VERTEX when the body carries shading normals (`nrm`, filled by
+            // core/geom/tessellate.cpp — smooth across a tessellated cylinder/fillet/tread and
+            // split at creases), so a curved band reads as curved instead of as facets. Bodies
+            // without normals keep the flat geometric term byte-for-byte.
+            const bool smooth = b.nrm.size() == b.pos.size();
+            const auto vertex_lam = [&](uint32_t vi) {
+                const RV3 n = smooth ? rnorm(RV3{b.nrm[3 * vi], b.nrm[3 * vi + 1],
+                                                 b.nrm[3 * vi + 2]})
+                                     : fn;
+                return 0.35 + 0.65 * std::max(0.0, std::abs(rdot(n, light)));
+            };
+            const double lam0 = vertex_lam(i0), lam1 = vertex_lam(i1), lam2 = vertex_lam(i2);
             // Orientation colour-coding: blend a flat principal face toward its direction hue
             // (curved/oblique faces stay the neutral body colour) so the vision model can read
             // which way each face points at a glance.
@@ -6945,15 +7051,13 @@ bool render_view_to_rgb(const std::vector<aicm::AicmBody>& bodies,
                 cg = (1 - mix) * bg + mix * (tint[1] / 255.0);
                 cb = (1 - mix) * bb + mix * (tint[2] / 255.0);
             }
-            unsigned char R = (unsigned char)std::min(255.0, cr * 255 * lam);
-            unsigned char G = (unsigned char)std::min(255.0, cg * 255 * lam);
-            unsigned char B = (unsigned char)std::min(255.0, cb * 255 * lam);
             ProjectedVertex p0, p1, p2;
             proj(w0.x, w0.y, w0.z, p0.pu, p0.pv, p0.pd);
             proj(w1.x, w1.y, w1.z, p1.pu, p1.pv, p1.pd);
             proj(w2.x, w2.y, w2.z, p2.pu, p2.pv, p2.pd);
+            p0.lam = lam0; p1.lam = lam1; p2.lam = lam2;
             if (!perspective) {
-                raster_triangle(p0, p1, p2, R, G, B, balpha);
+                raster_triangle(p0, p1, p2, cr, cg, cb, balpha);
                 continue;
             }
             std::vector<ProjectedVertex> polygon{p0, p1, p2};
@@ -6978,7 +7082,7 @@ bool render_view_to_rgb(const std::vector<aicm::AicmBody>& bodies,
                 return p.pd * tan_y - p.pv;
             });
             for (size_t k = 1; k + 1 < polygon.size(); ++k)
-                raster_triangle(polygon[0], polygon[k], polygon[k + 1], R, G, B, balpha);
+                raster_triangle(polygon[0], polygon[k], polygon[k + 1], cr, cg, cb, balpha);
         }
     }
     const long paint_floor = (min_painted >= 0) ? (long)min_painted : (long)(W * H) / 400;
@@ -7095,8 +7199,11 @@ static std::vector<aicm::AicmBody> tessellate_session_bodies(Session& s) {
                 try {
                     TopoDS_Shape world = placed_world_shape(body, std::nullopt);
                     float color[3] = {body.color[0], body.color[1], body.color[2]};
+                    const ::geom::DisplayDeflections d =
+                        ::geom::display_deflections(s.display_quality, world);
                     bodies.push_back(::geom::tessellate_body(
-                        world, static_cast<uint32_t>(body.body_id), body.name, color));
+                        world, static_cast<uint32_t>(body.body_id), body.name, color,
+                        d.lin, d.ang));
                 } catch (...) {
                 }
             }
@@ -7112,9 +7219,10 @@ static std::vector<aicm::AicmBody> tessellate_session_bodies(Session& s) {
             float bcolor[3] = {color[0], color[1], color[2]};
             float bmetal = 0.0f, brough = 0.5f;
             apply_doc_appearance(s.doc, id, bcolor, bmetal, brough);
+            const ::geom::DisplayDeflections d =
+                ::geom::display_deflections(s.display_quality, shp);
             bodies.push_back(::geom::tessellate_body(shp, id, "b" + std::to_string(id), bcolor,
-                                                     /*lin_deflection=*/0.0 /*auto: size-relative*/,
-                                                     0.35, bmetal, brough));
+                                                     d.lin, d.ang, bmetal, brough));
             ++id;
         } catch (...) {
         }
@@ -10757,7 +10865,170 @@ std::vector<double> field_moller_trumbore_all(const std::vector<float>& pos,
     return dist;
 }
 
+// Sample the TRUE surface of every face whose triangulation touches the sphere
+// (`near`, `radius`), appending world-space points to `out`. Vertex-only sampling is not
+// enough: a cylindrical B-rep face tessellates as a strip of long triangles whose nodes
+// all sit on the two cap rings, so a sphere aimed at the mid-wall (exactly where the
+// docstring tells the agent to aim) contains ZERO nodes. Here each triangle is walked on a
+// barycentric grid of spacing <= radius/4, so any patch larger than the search sphere is
+// covered densely; and when the face carries UV nodes the barycentric weights are applied
+// to the (u,v) parameters and the point comes from Geom_Surface::Value — exact on an
+// analytic cylinder, not the chord of its tessellation. Faces without UV nodes (imported
+// SW/STL meshes) fall back to the planar barycentric point on the triangle itself.
+// Always contributes the 3 vertices + the centroid of a touching triangle, so a sparse
+// mesh still yields its own nodes. Stops at `cap` samples.
+void fit_sample_faces(const TopoDS_Shape& shape, const std::array<double, 3>& near_pt,
+                      double radius, std::size_t cap, std::vector<Eigen::Vector3d>& out) {
+    const double rad2 = radius * radius;
+    const double step = radius * 0.25;  // grid spacing <= search_radius/4
+
+    auto keep = [&](double x, double y, double z) {
+        const double dx = x - near_pt[0], dy = y - near_pt[1], dz = z - near_pt[2];
+        if (dx * dx + dy * dy + dz * dz <= rad2) out.emplace_back(x, y, z);
+    };
+
+    for (TopExp_Explorer ex(shape, TopAbs_FACE); ex.More() && out.size() < cap; ex.Next()) {
+        const TopoDS_Face face = TopoDS::Face(ex.Current());
+        TopLoc_Location loc;
+        Handle(Poly_Triangulation) tri = BRep_Tool::Triangulation(face, loc);
+        if (tri.IsNull()) {
+            try {
+                BRepMesh_IncrementalMesh(face, 0.5, Standard_False, 0.5, Standard_True).Perform();
+            } catch (const Standard_Failure&) {
+            }
+            tri = BRep_Tool::Triangulation(face, loc);
+            if (tri.IsNull()) continue;
+        }
+        const gp_Trsf trsf = loc.Transformation();
+        const bool identity = loc.IsIdentity();
+
+        // Parametric surface (same location as the triangulation, so one trsf serves both).
+        TopLoc_Location sloc;
+        Handle(Geom_Surface) surf;
+        bool use_uv = tri->HasUVNodes();
+        if (use_uv) {
+            surf = BRep_Tool::Surface(face, sloc);
+            use_uv = !surf.IsNull();
+        }
+
+        for (int t = 1; t <= tri->NbTriangles() && out.size() < cap; ++t) {
+            int i1 = 0, i2 = 0, i3 = 0;
+            tri->Triangle(t).Get(i1, i2, i3);
+            gp_Pnt p[3] = {tri->Node(i1), tri->Node(i2), tri->Node(i3)};
+            if (!identity)
+                for (gp_Pnt& q : p) q.Transform(trsf);
+
+            // Cheap reject: the whole triangle is out of reach when its nearest vertex is
+            // farther than radius + its own extent.
+            double vd[3], maxe = 0.0, mind = std::numeric_limits<double>::infinity();
+            for (int k = 0; k < 3; ++k) {
+                vd[k] = p[k].Distance(gp_Pnt(near_pt[0], near_pt[1], near_pt[2]));
+                mind = std::min(mind, vd[k]);
+                maxe = std::max(maxe, p[k].Distance(p[(k + 1) % 3]));
+            }
+            if (mind > radius + maxe) continue;
+
+            // Vertices + centroid always (sparse-mesh floor).
+            for (int k = 0; k < 3; ++k) keep(p[k].X(), p[k].Y(), p[k].Z());
+            keep((p[0].X() + p[1].X() + p[2].X()) / 3.0, (p[0].Y() + p[1].Y() + p[2].Y()) / 3.0,
+                 (p[0].Z() + p[1].Z() + p[2].Z()) / 3.0);
+
+            // Barycentric grid: n edge subdivisions gives (n+1)(n+2)/2 nodes at spacing
+            // maxe/n <= step.
+            int n = (step > 0.0) ? static_cast<int>(std::ceil(maxe / step)) : 1;
+            n = std::max(1, std::min(n, 48));
+            if (n < 2) continue;
+
+            gp_Pnt2d uv[3];
+            if (use_uv) {
+                uv[0] = tri->UVNode(i1);
+                uv[1] = tri->UVNode(i2);
+                uv[2] = tri->UVNode(i3);
+            }
+            const double inv_n = 1.0 / static_cast<double>(n);
+            for (int i = 0; i <= n && out.size() < cap; ++i) {
+                for (int j = 0; i + j <= n; ++j) {
+                    const double b1 = i * inv_n, b2 = j * inv_n, b0 = 1.0 - b1 - b2;
+                    if (use_uv) {
+                        const double u = b0 * uv[0].X() + b1 * uv[1].X() + b2 * uv[2].X();
+                        const double v = b0 * uv[0].Y() + b1 * uv[1].Y() + b2 * uv[2].Y();
+                        gp_Pnt sp;
+                        try {
+                            sp = surf->Value(u, v);
+                        } catch (const Standard_Failure&) {
+                            continue;
+                        }
+                        if (!identity) sp.Transform(trsf);
+                        keep(sp.X(), sp.Y(), sp.Z());
+                    } else {
+                        keep(b0 * p[0].X() + b1 * p[1].X() + b2 * p[2].X(),
+                             b0 * p[0].Y() + b1 * p[1].Y() + b2 * p[2].Y(),
+                             b0 * p[0].Z() + b1 * p[1].Z() + b2 * p[2].Z());
+                    }
+                }
+            }
+        }
+    }
+}
+
 }  // namespace
+
+// Evaluate — recover the AXIS of a cylindrical feature (a bore, a shaft, a hub) from the
+// body's own surface geometry, by least-squares fit. This is the mating primitive for
+// merging INDEPENDENTLY SOURCED CAD: an imported body has no parametric feature whose
+// axis could be read, so the axis has to be measured, and a measured axis is only usable
+// as evidence if it comes with a residual. `near` is a world point on/near the wanted
+// surface and `search_radius_mm` the cull radius around it; every surface SAMPLE (see
+// fit_sample_faces — a barycentric grid on the true surface, not just mesh vertices)
+// inside that sphere feeds geom::fit_cylinder.
+//
+// body_id is 1-based; <= 0 selects the LAST body (the eval_active_shape convention).
+// Returns {axis_point[3], axis_dir[3] (unit), radius_mm, rms_residual_mm, n_points_used}.
+// A cull that catches too few points, or a patch that is not a cylinder, is an OpError
+// rather than a plausible-looking fit — silently returning the best plane-through-noise is
+// exactly how a wheel ends up welded 3 mm off a hub.
+json doc_fit_cylinder_axis(const std::string& doc_id, int body_id,
+                           const std::array<double, 3>& near_pt, double search_radius_mm) {
+    DocLock lk;
+    Session& s = require_session(doc_id);
+    if (!(search_radius_mm > 0.0))
+        throw OpError("invalid_op",
+                      "search_radius_mm must be > 0 (it is the cull radius around `near`)",
+                      {{"reason", "bad search_radius_mm"}});
+    CompileResult r = compile_session(s);
+    const TopoDS_Shape& shape = field_active_shape(r, doc_id, body_id);
+    try {
+        BRepMesh_IncrementalMesh(shape, 0.1, Standard_False, 0.5, Standard_True).Perform();
+    } catch (const Standard_Failure&) {
+    }
+
+    std::vector<Eigen::Vector3d> pts;
+    fit_sample_faces(shape, near_pt, search_radius_mm, 20000, pts);
+    if (pts.size() < 6)
+        throw OpError("invalid_op",
+                      "only " + std::to_string(pts.size()) + " surface samples lie within " +
+                          "search_radius_mm=" + std::to_string(search_radius_mm) + " mm of [" +
+                          std::to_string(near_pt[0]) + "," + std::to_string(near_pt[1]) + "," +
+                          std::to_string(near_pt[2]) + "] — a cylinder fit needs at least 6. "
+                          "Grow search_radius_mm, or check that `near` is on the surface "
+                          "(use eval_measure / face_points to get a point on it).",
+                      {{"reason", "too few points in search radius"},
+                       {"n_points", static_cast<int>(pts.size())}});
+
+    const ::chudware::geom::FitCylinderResult fit = ::chudware::geom::fit_cylinder(pts);
+    if (!fit.ok)
+        throw OpError("invalid_op", "cylinder fit failed: " + fit.message,
+                      {{"reason", "cylinder fit failed"},
+                       {"n_points", static_cast<int>(pts.size())}});
+
+    return json{
+        {"axis_point", {fit.axis_point.x(), fit.axis_point.y(), fit.axis_point.z()}},
+        {"axis_dir", {fit.axis_dir.x(), fit.axis_dir.y(), fit.axis_dir.z()}},
+        {"radius_mm", fit.radius},
+        {"rms_residual_mm", fit.rms_residual},
+        {"n_points_used", static_cast<int>(fit.n_points)},
+    };
+}
 
 // engine/doc/evaluate.py::draft_field. Per-vertex draft angle = degrees(arcsin(clip(n·pull,
 // -1,1))) for the normalized vertex normal n and normalized pull. chunk name "draft". Beyond
@@ -11267,7 +11538,19 @@ static std::string unique_feature_name(const Session& s, const std::string& base
 }
 
 json doc_import_file(const std::string& path, const std::string& into, bool as_solid,
-                     const std::string& fmt) {
+                     const std::string& fmt, const json& body_select) {
+    // keep_bodies / exclude_bodies ride through onto the import feature's params, where
+    // the compiler's body sub-selection filter (core/doc/document.cpp import branch) reads
+    // them. Copied verbatim (arrays of 1-based ordinals or body-name strings) so a later
+    // edit_feature on the same params re-filters on the next recompute — the filter lives
+    // in the compiler, not here.
+    auto apply_body_select = [&body_select](json& params) {
+        if (!body_select.is_object()) return;
+        for (const char* key : {"keep_bodies", "exclude_bodies"}) {
+            auto it = body_select.find(key);
+            if (it != body_select.end() && it->is_array()) params[key] = *it;
+        }
+    };
     // A native .step+ is a DOCUMENT, not a neutral body file: reopen it as a part doc
     // instead of failing on the format sniffer (Bug N-4 — import_part rejected the very
     // extension save_part writes). Route BEFORE taking the lock (doc_open locks g_mtx).
@@ -11308,6 +11591,7 @@ json doc_import_file(const std::string& path, const std::string& into, bool as_s
         const std::string fname = unique_feature_name(s, stem);  // Issue 10
         json params = {{"source_path", path}, {"format", "step+"}, {"original_name", stem},
                        {"embedded_brep", blob}, {"embedded_bodies", n}};
+        apply_body_select(params);
         json ops = json::array({json{
             {"op", "add_feature"},
             {"feature", {{"type", "import"}, {"name", fname}, {"params", params},
@@ -11352,6 +11636,7 @@ json doc_import_file(const std::string& path, const std::string& into, bool as_s
         params["editable_as"] = "baked_brep";
     }
     if (as_solid) params["as_solid"] = true;
+    apply_body_select(params);
     // BAKE the geometry into the feature at import time so a saved .step+ no longer
     // depends on the source file surviving on disk (Bug N-8). We read the source ONCE
     // here, serialize all imported solids to a lossless BREP blob, and carry it in the
@@ -11674,6 +11959,10 @@ json doc_save(const std::string& doc_id, const std::string& path) {
                 json header = {{"engine", stepplus_cache_engine_key()},
                                {"doc_hash", stepplus_doc_hash(s.doc)},
                                {"solved", true},
+                               // cache.aicm is a DISPLAY mesh, so the tier it was meshed at
+                               // is part of its validity (contracts/doc_ops.md §7).
+                               {"display_quality",
+                                ::geom::display_quality_name(s.display_quality)},
                                {"response", cached}};
                 s.extra_entries["cache.json"] = header.dump();
                 s.extra_entries["cache.aicm"] =
@@ -11704,6 +11993,8 @@ json doc_save(const std::string& doc_id, const std::string& path) {
                 json header = {{"engine", stepplus_cache_engine_key()},
                                {"doc_hash", stepplus_doc_hash(s.doc)},
                                {"solved", true},
+                               {"display_quality",
+                                ::geom::display_quality_name(s.display_quality)},
                                {"components", asm_component_fingerprints(s.doc, base_dir)},
                                {"response", cached}};
                 if (!blob.empty()) {
@@ -11801,6 +12092,8 @@ json doc_open(const std::string& path, bool as_solid, bool detach_path) {
                         header.value("doc_hash", std::string()) ==
                             stepplus_doc_hash(stored.doc) &&
                         header.value("solved", false) &&
+                        header.value("display_quality", std::string()) ==
+                            ::geom::display_quality_name(stored.display_quality) &&
                         header.contains("response") && header["response"].is_object() &&
                         asm_fingerprints_match(stored.doc, base_dir,
                                                header.value("components", json()))) {
@@ -11839,7 +12132,10 @@ json doc_open(const std::string& path, bool as_solid, bool detach_path) {
             try {
                 json header = json::parse(cj->second);
                 if (header.value("engine", std::string()) == stepplus_cache_engine_key() &&
-                    header.value("doc_hash", std::string()) == stepplus_doc_hash(stored.doc) &&
+                    // cache.aicm was meshed at the saving session's display tier; a
+                    // different tier here must re-mesh instead of showing a stale mesh.
+                    header.value("display_quality", std::string()) ==
+                        ::geom::display_quality_name(stored.display_quality) &&
                     header.contains("response") && header["response"].is_object()) {
                     resp = header["response"];
                     // T-PERF10: re-materialize cached mesh via aicm-shm (same handoff as
@@ -13672,7 +13968,8 @@ void reconcile_external_ref_entities(json& params, json& xr, const json& new_ent
 // geometry only feeds downstream features, so one refresh pass converges in a single step
 // for the supported upstream-source cases; a pathological self-referential loop simply
 // settles on the next rebuild).
-void refresh_sketch_external_refs(json& doc, CompileCache* cache) {
+void refresh_sketch_external_refs(json& doc, CompileCache* cache,
+                                  ::geom::DisplayQuality quality) {
     if (!doc.contains("features") || !doc["features"].is_array()) return;
     bool any = false;
     for (const json& f : doc["features"]) {
@@ -13688,7 +13985,7 @@ void refresh_sketch_external_refs(json& doc, CompileCache* cache) {
     // body, same convention as sketch_convert creation / doc_sketch_project_entities) —
     // and every per-sketch plane resolution below (passed as `&pre`). Runs through the
     // session's incremental-rebuild cache when the caller supplied it.
-    CompileResult pre = compile_document(doc, env_from_doc(doc), cache);
+    CompileResult pre = compile_document(doc, env_from_doc(doc), cache, quality);
     IdGen gen(doc);
     for (json& f : doc["features"]) {
         if (!f.is_object() || f.value("type", std::string()) != "sketch") continue;
@@ -13763,7 +14060,8 @@ json* sketch3d_external_refs_slot(json& f) {
     return nullptr;
 }
 
-void refresh_sketch3d_external_refs(json& doc, CompileCache* cache) {
+void refresh_sketch3d_external_refs(json& doc, CompileCache* cache,
+                                    ::geom::DisplayQuality quality) {
     if (!doc.contains("features") || !doc["features"].is_array()) return;
     bool any = false;
     for (json& f : doc["features"]) {
@@ -13774,7 +14072,7 @@ void refresh_sketch3d_external_refs(json& doc, CompileCache* cache) {
     }
     if (!any) return;
 
-    CompileResult pre = compile_document(doc, env_from_doc(doc), cache);
+    CompileResult pre = compile_document(doc, env_from_doc(doc), cache, quality);
     if (pre.shapes.empty()) {
         // No body yet (e.g. sketch3d is the very first feature) — every vertex ref
         // goes stale, kept at its last-good point.
@@ -14749,6 +15047,17 @@ json doc_simulate_motion(const std::string& doc_id,
                     detail.push_back(pair);
             const bool collision = !detail.empty();
             frame["interference"] = collision;
+            // Per-step collision list (kinematic sweep evidence): every offending pair at
+            // THIS sample, not just the first colliding sample. Compact by construction —
+            // the report's overlap_mesh/bbox stay out of a trajectory that can hold
+            // hundreds of steps. A below-min-clearance pair is a zero-overlap collision.
+            json collisions = json::array();
+            for (const json& pair : detail)
+                collisions.push_back({{"a", pair.value("a", std::string())},
+                                      {"b", pair.value("b", std::string())},
+                                      {"overlap_volume_mm3",
+                                       pair.value("overlap_volume_mm3", 0.0)}});
+            frame["collisions"] = std::move(collisions);
             if (collision && !had_collision) {
                 had_collision = true;
                 first_collision_step = i;

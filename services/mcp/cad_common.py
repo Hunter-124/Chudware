@@ -78,6 +78,80 @@ _LAST_VOLUME: dict = {}
 # "edited since the last real save". close_part uses it to nudge the agent to save its work.
 _LAST_DELIVER_REV: dict = {}
 
+# Placement provenance (assembly-merge discipline). A component dropped at an `at`/`rotate`
+# pose is only as good as the measurement it came from: the failed merge session placed a
+# wheel by a guessed transform, never re-checked interference, and exported it off-frame.
+# _PLACEMENT_SOURCE[doc_id][component_id] = {"placement_source": "transform"|"mate",
+# "revision": <engine revision when it was placed>}; a mate always supersedes a transform
+# for the same component (solve_mates is the authority on where it ended up).
+_PLACEMENT_SOURCE: dict = {}
+
+# The engine revision at which each doc was last interference-checked (check_interference).
+# Compared against the doc's CURRENT revision — monotonic, bumped only by mutating ops — so
+# "placed by transform and nothing verified it since the last mutation" is decidable without
+# any extra engine state.
+_LAST_INTERFERENCE_REV: dict = {}
+
+
+def note_placement_source(doc_id: Optional[str], component: Optional[str],
+                          source: str) -> None:
+    """Record HOW a component was positioned ("transform" = a raw pose, "mate" = solved)."""
+    if not doc_id or not component:
+        return
+    rec = _PLACEMENT_SOURCE.setdefault(str(doc_id), {})
+    prev = rec.get(str(component))
+    if isinstance(prev, dict) and prev.get("placement_source") == "mate" and source != "mate":
+        return  # a mate owns the pose; a later starting-pose transform does not un-verify it
+    rec[str(component)] = {"placement_source": source, "revision": _doc_revision(str(doc_id))}
+
+
+def placement_source_of(doc_id: Optional[str], component: Optional[str]) -> Optional[str]:
+    """"transform" | "mate" for a component this process placed, else None (unknown/imported)."""
+    if not doc_id or not component:
+        return None
+    rec = (_PLACEMENT_SOURCE.get(str(doc_id)) or {}).get(str(component))
+    return rec.get("placement_source") if isinstance(rec, dict) else None
+
+
+def note_interference_check(doc_id: Optional[str]) -> None:
+    """Record that check_interference ran on this doc at its current revision."""
+    if not doc_id:
+        return
+    rev = _doc_revision(str(doc_id))
+    if rev is not None:
+        _LAST_INTERFERENCE_REV[str(doc_id)] = rev
+
+
+def placement_warnings(doc_id: Optional[str]) -> list:
+    """Non-blocking delivery warnings for transform-placed, unverified components.
+
+    Returns `["placement_unverified: N component(s) placed by transform with no
+    check_interference since last mutation"]` when this doc has transform-placed components
+    and the last check_interference predates the doc's current (mutation-bumped) revision.
+    Empty list when everything was mated, or verified after the last mutation.
+    """
+    if not doc_id:
+        return []
+    did = str(doc_id)
+    by_transform = [c for c, rec in (_PLACEMENT_SOURCE.get(did) or {}).items()
+                    if isinstance(rec, dict) and rec.get("placement_source") == "transform"]
+    if not by_transform:
+        return []
+    # Only a doc that really holds several placed things can be mis-placed relative to
+    # something: a single-body part has nothing to be off-frame from.
+    try:
+        bodies = cb.call("asm_world_bodies", {"doc_id": did}).get("bodies") or []
+    except Exception:  # noqa: BLE001 — never let a warning probe break a delivery
+        bodies = []
+    if len(bodies) < 2:
+        return []
+    cur = _doc_revision(did)
+    checked = _LAST_INTERFERENCE_REV.get(did)
+    if checked is not None and cur is not None and checked >= cur:
+        return []
+    return [f"placement_unverified: {len(by_transform)} component(s) placed by transform "
+            f"with no check_interference since last mutation"]
+
 
 def _doc_revision(doc_id: str) -> Optional[int]:
     """Current engine revision for a doc via the cheap doc_list (no geometry compute)."""

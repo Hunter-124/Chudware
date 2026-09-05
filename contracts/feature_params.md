@@ -502,3 +502,40 @@ pick count + kind chips, active well highlights, right-click → clear. `dim` fi
 suffixes (`25`, `1.5in`, `3/8in`) and `=expr` to bind an expression. Tab order = field order
 above. Live preview: PM edits issue transient rebuilds (same path as `edit_feature`, not
 committed until OK; Cancel restores via worker undo of the preview op).
+
+## Assembly-merge primitives (append-only, 2026-09-04)
+
+### `import` — body sub-selection (adds to the `import` params above)
+- params (both optional): `keep_bodies: [int|str]` · `exclude_bodies: [int|str]`
+- an entry is either a **1-based body ordinal** (matching the `<fid>`, `<fid>#1`, `<fid>#2`, …
+  body order of the import) or a **body-name string** matched against `embedded_body_names`
+  (written by `doc_import_file`; a name may repeat, and then every match is selected).
+- semantics: with `keep_bodies` present, ONLY the listed bodies survive; `exclude_bodies` is
+  applied afterwards and drops from whatever survived. Kept bodies are renumbered over the
+  surviving set, so the first survivor is `<fid>` and the rest `<fid>#k`.
+- dropped bodies are never registered: a downstream feature referencing one fails through the
+  ordinary missing-body path, not silently.
+- errors (compile): an unknown ordinal or name, a non-int/non-string entry, an empty
+  `keep_bodies`, or a filter that drops EVERY body. Each message lists the full roster
+  (`1:"Wheel", 2:"Hub", …`) — a silently ignored filter is how the wrong body ships.
+- wire-through: `import_file` accepts both as TOP-LEVEL RPC params and copies them onto the
+  feature; `edit_feature` on the same params re-filters on the next recompute (the filter is
+  in the compiler, not the import call).
+
+### `transform`
+- params: `translate: [x,y,z]` ([0,0,0]) · `angle: dim` (0, DEGREES) ·
+  `rotate: [x,y,z]` \| `axis: [x,y,z]` ([0,0,1]; `rotate` wins when both are given) ·
+  `pivot: [x,y,z]` ([0,0,0] — a WORLD point, not body-relative) · `copy: bool` (false)
+- `body: str?` — a top-level feature id read by the compiler (not a ref slot), defaulting to the
+  current running body. Sub-body addressing uses the import/split body ids: `"<fid>#k"`.
+  **One call moves ONE body** — placing N components takes N `transform` features.
+- order: **rotate about `pivot`, then translate** ("orient, then place"). A rigid move is
+  applied as a shared location (an instance), so N identical placed bodies still share one
+  underlying shape.
+- `copy:false` (default) moves the body IN PLACE and consumes the source; a later `transform`
+  on the same source id composes on the moved result. `copy:true` keeps the original and adds
+  the transformed duplicate as a NEW body (assembly instancing).
+- zero motion (no `translate`, no `angle`) SUCCEEDS and records the body at its current pose,
+  with a warning — it is the way to place an at-origin component explicitly.
+- errors (contained): no `body` ref and no current body; a rotation with a zero-length axis; an
+  empty result shape.

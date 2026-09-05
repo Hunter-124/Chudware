@@ -1191,11 +1191,18 @@ if(CHUDWARE_WITH_OCCT)
       sim/mesh_size_band.cpp
       sim/fea_run.cpp
       sim/fea_fatigue.cpp
-      sim/fea_adaptive.cpp)
+      sim/fea_adaptive.cpp
+      sim/vtu_writer.cpp)
     target_include_directories(chudware_mesh
       PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}
-      PRIVATE ${OpenCASCADE_INCLUDE_DIR})
-    target_compile_definitions(chudware_mesh PRIVATE CHUDWARE_WITH_POLYMESH)
+      # hostd_gen/version_info.h: CHUDWARE_HOSTD_BUILD_ID, the engine build id a
+      # study result stamps into its provenance (same value libchudware exports).
+      PRIVATE ${OpenCASCADE_INCLUDE_DIR} ${CMAKE_CURRENT_BINARY_DIR}/hostd_gen)
+    # chudware_version_info is defined further down; a forward dependency is fine and
+    # keeps a rebuilt mesh layer stamping the CURRENT build id rather than a stale one.
+    add_dependencies(chudware_mesh chudware_version_info)
+    target_compile_definitions(chudware_mesh PRIVATE CHUDWARE_WITH_POLYMESH
+      "CHUDWARE_POLYMESH_COMMIT=\"${POLYMESH_COMMIT}\"")
     target_compile_features(chudware_mesh PRIVATE cxx_std_20)
     target_link_libraries(chudware_mesh
       PUBLIC chudware_sim nlohmann_json::nlohmann_json)
@@ -1246,6 +1253,7 @@ if(CHUDWARE_WITH_OCCT)
     util/process_isolation.cpp
     geom/dress.cpp
     geom/transform.cpp
+    geom/fit.cpp
     geom/hole.cpp
     geom/sheetmetal.cpp
     geom/weldment.cpp
@@ -1949,6 +1957,20 @@ if(CHUDWARE_WITH_OCCT)
   # Same OCCT DLL PATH prepend so the test can load TKernel et al.
   set_tests_properties(mirror PROPERTIES ENVIRONMENT_MODIFICATION "${_occt_envmod}")
 
+  # --- geom/fit.cpp: least-squares cylinder fit (the mating-axis primitive behind
+  # eval_fit_cylinder). Pure Eigen — no OCCT geometry is built — but it links
+  # chudware_geom_occt because that is the library fit.cpp is compiled into.
+  add_executable(test_fit
+    tests/test_fit.cpp)
+  target_include_directories(test_fit PRIVATE
+    ${doctest_SOURCE_DIR})
+  target_link_libraries(test_fit PRIVATE chudware_geom_occt chudware_geom)
+  set_target_properties(test_fit PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+  add_test(NAME fit COMMAND test_fit)
+  # Same OCCT DLL PATH prepend so the test can load TKernel et al.
+  set_tests_properties(fit PROPERTIES ENVIRONMENT_MODIFICATION "${_occt_envmod}")
+
   # --- B5: ctest coverage for eval_interference's B4 params (include_coincident /
   # min_clearance_mm), doc_eval_feature_overlap (B2 intra-part tool-solid overlap: boss_
   # swallowed/cut_overlap/dead_features), and doc_eval_compare (C1 shape-vs-shape match_pct
@@ -2234,6 +2256,37 @@ if(CHUDWARE_WITH_OCCT)
   set_target_properties(chudware-hostd PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
   add_dependencies(chudware-hostd chudware)  # engine staged before the daemon can serve it
+
+  # --- polymesh: the Polyhedral-FEA command-line driver ----------------------
+  # ProvisionPolymesh adds the dependency EXCLUDE_FROM_ALL (Chudware consumes its static
+  # libraries), which also excluded the `polymesh` CLI declared by apps/cli — so the
+  # check|mesh|solve|diag|render driver, the only way to reproduce an FEA evidence packet
+  # outside the engine, was never built or staged. Un-exclude exactly that ONE target
+  # (apps/bench, apps/testlab, the GUI and polymesh's tests stay excluded/off) and put its
+  # binary in the same bin/ directory as chudware-hostd and libchudware, which is where
+  # every consumer already resolves engine artifacts. STEP input needs POLYMESH_WITH_OCC,
+  # so this whole block lives inside the OCCT + CHUDWARE_WITH_POLYMESH gate.
+  if(CHUDWARE_WITH_POLYMESH)
+    if(NOT TARGET polymesh)
+      message(FATAL_ERROR
+        "[polymesh] the apps/cli `polymesh` target is missing — the provisioned source no "
+        "longer declares it, so the staged CLI would silently disappear")
+    endif()
+    set_target_properties(polymesh PROPERTIES
+      EXCLUDE_FROM_ALL FALSE
+      RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+    # ONNX Runtime + advisor model already land in this same bin/ via libchudware's own
+    # staging (chudware_polymesh_stage_runtime(chudware)); POST_BUILD commands cannot be
+    # attached to a target created in another directory, so the CLI only needs $ORIGIN.
+    if(NOT WIN32)
+      set_property(TARGET polymesh APPEND PROPERTY BUILD_RPATH "$ORIGIN")
+      set_property(TARGET polymesh APPEND PROPERTY INSTALL_RPATH "$ORIGIN")
+    endif()
+    # build.sh builds named artifacts (bin/libchudware.so, bin/chudware-hostd) rather than
+    # `all`, so the CLI rides the engine target it is provisioned alongside — a core build
+    # can never leave a stale polymesh next to a fresh engine.
+    add_dependencies(chudware polymesh)
+  endif()
 endif()
 
 # === 3D assembly mate solver (C++ port of engine/doc/mate_solver.py) ==========

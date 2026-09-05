@@ -198,6 +198,32 @@ outliving its binaries:
   GUI does; set `CHUDWARE_LIBCHUDWARE` to a full `core/build-occt-linux` build (the
   slim build has no FEA — see memory of the MCP "FEA solver unavailable" trap).
 
+## The `polymesh` CLI beside the daemon
+
+Every OCCT core build with `CHUDWARE_WITH_POLYMESH=ON` also builds and stages the
+Polyhedral-FEA driver `polymesh` (`check|mesh|solve|diag|render`, plus
+`--fix-box`/`--load-box`) into the SAME `bin/` directory as `chudware-hostd` and
+`libchudware.so` — `core/build-occt-linux/bin/polymesh` on this box. That is deliberate:
+anything resolving the daemon binary can resolve the CLI beside it, and the ONNX Runtime
+plus the advisor model package are already staged in that directory, so the CLI's learned
+mesh advisor works without extra setup. The CLI is the reproducible mesh/solve path for an
+FEA evidence packet: the exact mesher and solver the engine links, driven from a shell.
+`./build.sh core` rebuilds it alongside the engine (it is a dependency of the `chudware`
+target); slim non-OCCT trees declare no such target and stage nothing. `polymesh-gui`,
+`apps/bench`, `apps/testlab` and Polyhedral-FEA's own tests are never built.
+
+By default the dependency is the pinned public fetch into `core/third_party/polymesh/src`.
+To build Chudware against a live Polyhedral-FEA working tree instead, export
+`CHUDWARE_POLYMESH_ROOT=<checkout>` (source of truth for development:
+`/home/hunter/Repositories/Polyhedral-FEA-private`). `build.sh` forwards it as
+`-DPOLYMESH_SOURCE_DIR`, re-configures each consumed core tree so the cached value flips,
+and `ProvisionPolymesh.cmake` neither fetches nor patches nor pin-checks that directory —
+it records `git -C <dir> rev-parse HEAD` as `POLYMESH_COMMIT` and prints
+`Polyhedral-FEA: LOCAL SOURCE <dir> @ <sha>`. Building with the variable unset clears the
+cache entry and returns to the pin, which prints
+`Polyhedral-FEA: PINNED FETCH <repo> @ <sha>`. Always read that line before trusting a
+mesh result: it is the only statement of which mesher source the engine actually contains.
+
 ## Related
 
 - Plan: `~/.claude/plans/plan-out-massive-changes-proud-snowflake.md` (Design A/B)

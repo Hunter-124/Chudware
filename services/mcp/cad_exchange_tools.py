@@ -19,6 +19,7 @@ from .cad_common import (
     _err,
     _publish_current,
     _sanitize_output_path,
+    placement_warnings,
     cb,
 )
 
@@ -40,6 +41,13 @@ def register_cad_exchange_tools(mcp: FastMCP) -> None:
         NOTE: plain STEP/STL/etc. carry geometry only — NO editable feature tree or simulation
         studies. To hand the user a part they can keep editing, use save_part() (native .step+).
         fmt="step+" here is accepted as an alias and routed to the native saver.
+
+        On an assembly (or any doc with 2+ world bodies) the reply carries non-blocking
+        `warnings:["placement_unverified: N component(s) placed by transform with no
+        check_interference since last mutation"]` — the export still happened, but N
+        component poses you asserted with asm_add_component(at=/rotate=) have not been
+        re-validated since the last mutation. Run check_interference (and measure_between /
+        list_world_bodies against the expected envelope) and export again.
         """
         try:
             d = _doc(doc_id)
@@ -71,9 +79,13 @@ def register_cad_exchange_tools(mcp: FastMCP) -> None:
                     rev = _doc_revision(d)
                     if rev is not None:
                         _LAST_DELIVER_REV[d] = rev  # delivered: quiet close_part until further edits
-                return _dumps({"ok": os.path.exists(written), "format": "step+",
-                               "native": True, "doc_id": d, "path": written,
-                               "exists": os.path.exists(written)})
+                res = {"ok": os.path.exists(written), "format": "step+",
+                       "native": True, "doc_id": d, "path": written,
+                       "exists": os.path.exists(written)}
+                warnings = placement_warnings(d)
+                if warnings:
+                    res["warnings"] = warnings
+                return _dumps(res)
             # K3: canonicalise caller-supplied path before passing to the engine (expanduser +
             # abspath — same reasoning as the step+ branch above).
             out = (_sanitize_output_path(os.path.expanduser(path)) if path
@@ -93,6 +105,11 @@ def register_cad_exchange_tools(mcp: FastMCP) -> None:
             for k in ("bytes", "solid_count", "valid_solids", "expected_solids", "validated"):
                 if k in r:
                     res[k] = r[k]
+            # Non-blocking placement provenance: a transform-placed component nobody
+            # re-checked is exactly how a merged wheel ships off-frame.
+            warnings = placement_warnings(d)
+            if warnings:
+                res["warnings"] = warnings
             return _dumps(res)
         except Exception as e:  # noqa: BLE001
             return _err(e)
@@ -101,7 +118,8 @@ def register_cad_exchange_tools(mcp: FastMCP) -> None:
 
     @mcp.tool()
     def import_part(path: str, into: Optional[str] = None, as_solid: bool = False,
-                    resolve_features: bool = True) -> str:
+                    resolve_features: bool = True, keep_bodies: Optional[list] = None,
+                    exclude_bodies: Optional[list] = None) -> str:
         """Import a CAD/mesh file (STEP/IGES/BREP/STL/3MF/OBJ/PLY/glTF/3DM/DXF/DWG/
         STEP+/DRAW+/…) as a body, or open a native standalone drawing.
         Lets you assemble components built or exported separately, or recover geometry from a file
@@ -131,6 +149,27 @@ def register_cad_exchange_tools(mcp: FastMCP) -> None:
 
         TIP: pair with the `transform` feature (in add_features) to POSITION each imported body
         into a shared coordinate frame — translate:[x,y,z] and/or angle:<deg> with rotate:[ax,ay,az].
+
+        MULTI-BODY SOURCES (a 760-body frame STEP, an 11-body wheel): the import lands as ONE
+        feature holding every body, and describe_part prints an indexed roster of them
+        (`embedded_body_names`) with the `ref` that addresses each: the first body is "<fid>"
+        and the rest are "<fid>#1", "<fid>#2", … over the bodies that survived any filter.
+        Select which ones come in AT IMPORT TIME — never by editing the source file:
+          keep_bodies=[...]     keep ONLY these bodies
+          exclude_bodies=[...]  drop these bodies (e.g. a legacy wheel that ships with a frame)
+        Both take 1-based ordinal ints and/or body-name strings matched against
+        `embedded_body_names` (import first with neither to read the roster, then re-import,
+        or drop them from the import feature's params with edit_feature).
+
+        POSITIONING an imported body uses the `transform` feature (add_features) and it moves
+        exactly ONE body per call: body:"f5#3" names the 4th body of import feature f5 (the
+        first is plain "f5"; omit `body` on a single-body part). The pivot is the ORIGIN
+        unless you give one, and the
+        order is ROTATE THEN TRANSLATE: angle:<deg> about rotate:[ax,ay,az] first, then
+        translate:[x,y,z]. To move a whole multi-body import you issue one transform per body
+        — or, better, place the parts as assembly COMPONENTS (asm_add_component + asm_mate),
+        where one pose moves the whole component and mates derive it for you.
+        NEVER hand-edit STEP/JSONL text to move geometry.
         """
         try:
             # Resolve the caller-supplied path ONCE against THIS process's cwd: the worker
@@ -298,8 +337,33 @@ def register_cad_exchange_tools(mcp: FastMCP) -> None:
             params: dict = {"path": path_abs, "as_solid": bool(as_solid)}
             if into:
                 params["into"] = into
+            # Body selection rides the import feature's params (contracts/feature_params.md):
+            # dropping a legacy body is an IMPORT-TIME choice, never a source-file edit.
+            if keep_bodies is not None:
+                params["keep_bodies"] = list(keep_bodies)
+            if exclude_bodies is not None:
+                params["exclude_bodies"] = list(exclude_bodies)
             r = cb.call("import_file", params)
             new_id = r.get("doc_id") or into
+            # An import feature that FAILS to compile (keep_bodies/exclude_bodies naming a
+            # body the source does not have, an unreadable source, a filter that dropped
+            # every body) still produces a DOCUMENT — an empty one. Reporting ok:true there
+            # sent the model on to model against nothing, so carry the engine's per-feature
+            # reasons the way add_features' fail_result does (cad_doc_tools.py).
+            fs = (r.get("rebuild") or {}).get("feature_status") or []
+            failed = [{"id": s.get("id"), "error": s.get("error")} for s in fs
+                      if isinstance(s, dict) and not s.get("ok")]
+            if failed:
+                if new_id:
+                    _publish_current(new_id)   # mirror the (empty) doc, don't claim a part
+                parts = []
+                for f in failed:
+                    why = str(f.get("error") or "").strip() or "no reason reported"
+                    parts.append(f'{f.get("id") or "?"}: {why}')
+                return _dumps({
+                    "ok": False, "doc_id": new_id, "imported_from": path, "into": into,
+                    "error": "import failed, nothing was imported — " + "; ".join(parts),
+                    "failed_features": failed, "feature_status": fs})
             if new_id and not into:
                 _CUR["doc_id"] = new_id
             if new_id:

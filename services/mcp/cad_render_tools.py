@@ -200,7 +200,8 @@ def register_cad_render_tools(mcp: FastMCP) -> None:
                     emphasize: Optional[Union[str, dict, list]] = None,
                     emphasis_mode: str = "emphasis",
                     highlight: Optional[Union[str, dict, list]] = None,
-                    annotate: bool = True) -> list:
+                    annotate: bool = True,
+                    display_quality: Optional[str] = None) -> list:
         """Render the current part to an ANNOTATED image and return it so you can SEE the result.
 
         The render is colour-coded and labelled exactly like the in-app vision reviewer: an XYZ
@@ -245,12 +246,27 @@ def register_cad_render_tools(mcp: FastMCP) -> None:
         you can SEE whether the op landed; pair with measure/inspect_feature and verify_battery
         before declaring done.
 
+        display_quality (optional): re-tessellate the document's DISPLAY mesh before rendering —
+          "draft", "standard" or "fine". Higher tiers use a finer chord/angular deflection, so
+          curved geometry (tubes, wheels, fillets) stops looking faceted at the cost of triangles.
+          The setting PERSISTS on the document (it is a view setting — no revision bump), so pass
+          it once and every later render/viewport draw uses it. Documents default to "fine"
+          (override the process default with CHUDWARE_DISPLAY_QUALITY).
+          Tiers only affect B-rep bodies, which are tessellated on demand: a mesh-derived
+          import (STL/OBJ, or a SolidWorks file opened from its saved display data) already
+          carries baked facets, so its density does not change however fine the tier.
+
         Returns [image, caption]: the PNG followed by a SELF-SUFFICIENT text caption — part name
         and bbox, the features visible in this view as id+name, what is highlighted and in what
         colour, the side-palette colour key, and an explicit note of what this camera CANNOT see
         plus the tool to call for it. A model that reads only the caption still knows the scene.
         """
         d = _doc(doc_id)
+        if display_quality is not None:
+            # Persists on the document (view setting, no revision bump) — nothing to restore.
+            # Let a bad tier name surface: the engine refuses instead of guessing.
+            cb.call("doc_set_display_quality",
+                    {"doc_id": d, "quality": str(display_quality).strip().lower()})
         view_name = view if isinstance(view, str) else ("iso" if view is None else "custom")
         # Durable, not scratch: this exact path is returned when annotate=False with nothing
         # emphasized, and by the drawing-render fallback below.

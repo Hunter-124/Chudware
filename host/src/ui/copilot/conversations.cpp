@@ -336,6 +336,157 @@ std::string convDocKey(AppState& st) {
     return d.empty() ? std::string("scratch") : ("doc:" + d);
 }
 
+// ---- project scoping -------------------------------------------------------------------------
+// ONE path normalization for the whole copilot (project keys here, artifact paths in the
+// Sessions panel): separators folded, lexically normalized, trailing slash dropped, and
+// case-folded on Windows.
+std::filesystem::path lexicalPath(std::string_view raw) {
+    std::string path(raw);
+    std::replace(path.begin(), path.end(), '\\', '/');
+    return std::filesystem::path(path).lexically_normal();
+}
+
+std::string comparablePath(const std::filesystem::path& path) {
+    std::string result = path.generic_string();
+    const std::string root = path.root_path().generic_string();
+    while (result.size() > root.size() && !result.empty() && result.back() == '/')
+        result.pop_back();
+#ifdef _WIN32
+    std::transform(result.begin(), result.end(), result.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+#endif
+    return result;
+}
+
+std::string convProjectKey(std::string_view rawDir) {
+    if (rawDir.empty()) return std::string();
+    return comparablePath(lexicalPath(rawDir));
+}
+
+// The project folder a session created RIGHT NOW belongs to. Deliberately the SAME
+// expression the composer sends Chudcode as workspace_dir (attachAgentConversationOptions):
+// st.workspaceDir when set, else the derived PLM project path. Anything else would scope a
+// session to a folder the agent never worked in.
+std::string convProjectDir(AppState& st) {
+    return st.workspaceDir.empty() ? st.plmProjectPath() : st.workspaceDir;
+}
+
+// Legacy fallback #1: the Chudcode session JSONL records the run's cwd on its session line
+// (line 2). Bounded read — a fixed head of the file, and only COMPLETE lines inside it are
+// parsed, so a multi-megabyte entry line can never be pulled into memory. A missing or
+// damaged file is simply no answer.
+static std::string chudcodeSessionCwd(const std::string& sessionFile) {
+    if (sessionFile.empty()) return std::string();
+    std::ifstream in(sessionFile, std::ios::binary);
+    if (!in) return std::string();
+    std::string head(64u * 1024u, '\0');
+    in.read(head.data(), (std::streamsize)head.size());
+    head.resize((size_t)in.gcount());
+    size_t pos = 0;
+    for (int i = 0; i < 4; ++i) {
+        const size_t nl = head.find('\n', pos);
+        if (nl == std::string::npos) break;   // truncated tail line: never parsed
+        const std::string line = head.substr(pos, nl - pos);
+        pos = nl + 1;
+        if (line.empty()) continue;
+        try {
+            const nlohmann::json j = nlohmann::json::parse(line);
+            if (!j.is_object() || !j.contains("cwd") || !j["cwd"].is_string()) continue;
+            std::string cwd = j["cwd"].get<std::string>();
+            if (!cwd.empty()) return cwd;
+        } catch (...) {
+            // Not JSON — keep scanning the remaining bounded lines.
+        }
+    }
+    return std::string();
+}
+
+// Companion to chudcodeSessionCwd: the same session line carries the Chudcode session id
+// ({"type":"session","version":3,"id":…,"cwd":…}). Same bounded-head discipline — only
+// COMPLETE lines inside a fixed head are parsed, so a huge entry line is never read in.
+// Empty means "not a Chudcode session file" (our own .raw.jsonl logs answer empty too).
+static std::string chudcodeSessionIdOf(const std::string& sessionFile) {
+    if (sessionFile.empty()) return std::string();
+    std::ifstream in(sessionFile, std::ios::binary);
+    if (!in) return std::string();
+    std::string head(64u * 1024u, '\0');
+    in.read(head.data(), (std::streamsize)head.size());
+    head.resize((size_t)in.gcount());
+    size_t pos = 0;
+    for (int i = 0; i < 4; ++i) {
+        const size_t nl = head.find('\n', pos);
+        if (nl == std::string::npos) break;   // truncated tail line: never parsed
+        const std::string line = head.substr(pos, nl - pos);
+        pos = nl + 1;
+        if (line.empty()) continue;
+        try {
+            const nlohmann::json j = nlohmann::json::parse(line);
+            if (!j.is_object() || j.value("type", std::string()) != "session") continue;
+            std::string id = j.value("id", std::string());
+            if (!id.empty()) return id;
+        } catch (...) {
+            // Not JSON — keep scanning the remaining bounded lines.
+        }
+    }
+    return std::string();
+}
+
+static bool artifactPathIsInProject(std::string_view rawPath,
+                                    const std::filesystem::path& projectRoot,
+                                    const std::string& projectKey) {
+    if (rawPath.empty() || projectKey.empty()) return false;
+    std::filesystem::path artifact = lexicalPath(rawPath);
+    if (!artifact.is_absolute()) artifact = (projectRoot / artifact).lexically_normal();
+    const std::string artifactKey = comparablePath(artifact);
+    if (artifactKey == projectKey) return true;
+    if (artifactKey.size() <= projectKey.size() ||
+        artifactKey.compare(0, projectKey.size(), projectKey) != 0)
+        return false;
+    return projectKey.back() == '/' || artifactKey[projectKey.size()] == '/';
+}
+
+// Legacy fallback #2: a session that never recorded a project may still have produced a
+// file/image/mesh under the CURRENT project root. Used ONCE, at load time, to fill
+// projectDir — never per frame (that heuristic used to hide sessions from the list).
+static bool hasProjectArtifact(const std::vector<ChatMsg>& msgs,
+                               const std::filesystem::path& projectRoot,
+                               const std::string& projectKey) {
+    static constexpr std::string_view kMarker("\x1e" "ART\x1e");
+    for (const ChatMsg& msg : msgs) {
+        if (msg.fromUser) continue;
+        for (const auto& activity : msg.activity) {
+            const std::string_view detail(activity.detail);
+            const size_t marker = detail.find(kMarker);
+            if (marker == std::string_view::npos) continue;
+            std::string_view packed = detail.substr(marker + kMarker.size());
+            while (!packed.empty() && (packed.front() == '\r' || packed.front() == '\n'))
+                packed.remove_prefix(1);
+            while (!packed.empty()) {
+                const size_t newline = packed.find('\n');
+                std::string_view line = packed.substr(0, newline);
+                if (!line.empty() && line.back() == '\r') line.remove_suffix(1);
+                const size_t tab = line.find('\t');
+                if (tab != std::string_view::npos) {
+                    const std::string_view kind = line.substr(0, tab);
+                    const std::string_view path = line.substr(tab + 1);
+                    if ((kind == "file" || kind == "image" || kind == "mesh") &&
+                        artifactPathIsInProject(path, projectRoot, projectKey))
+                        return true;
+                }
+                if (newline == std::string_view::npos) break;
+                packed.remove_prefix(newline + 1);
+            }
+        }
+    }
+    return false;
+}
+
+// Remembered active session PER PROJECT (index.json v3 "active_by_project"): opening the app
+// under project X must land on the chat that was last active THERE, not on whatever was last
+// active anywhere. Keyed by convProjectKey.
+static std::map<std::string, std::string> s_activeByProject;
+
 // Keep the id source ahead of an id we just took in from disk. st.convCounter starts at 0
 // EVERY launch, so without this a second run handed out c1, c2, c3… straight on top of the
 // c3/c7/c8 transcripts already on disk — and a colliding session was then silently dropped
@@ -372,6 +523,7 @@ void ensureConversations(AppState& st) {
     c.id = newConvId(st);
     c.title = "Chat 1";
     c.docLink = convDocKey(st);  // link to whatever document is current — reference only
+    c.projectDir = convProjectDir(st);  // project scope, captured once at creation
     st.conversations.push_back(std::move(c));
     st.activeConv = (int)st.conversations.size() - 1;  // st.chat remains the active buffer
 }
@@ -1014,6 +1166,9 @@ void persistChatHistory(AppState& st) {
         // Optional document LINK (reference only — never an ownership key).
         if (!st.conversations[i].docLink.empty())
             convObj["doc"] = st.conversations[i].docLink;
+        // Project scope, captured at creation — what the Sessions list filters on.
+        if (!st.conversations[i].projectDir.empty())
+            convObj["project"] = st.conversations[i].projectDir;
         if (st.conversations[i].archived) convObj["archived"] = true;
         // Chudcode runtime link (id/file/health) — metadata only, never a second transcript.
         chudcodeLinkPersist(st.conversations[i].id, convObj);
@@ -1034,7 +1189,17 @@ void persistChatHistory(AppState& st) {
         if (atomicWriteFileDurable(chatSessionFilePath(st.conversations[i].id), convObj.dump(1)))
             s_pruneableSessionStems.insert(chatSessionFileStem(st.conversations[i].id));
     }
-    nlohmann::json index = {{"version", 2}, {"active", activeId}, {"order", order}};
+    // Index v3: `order` + the global `active` (fallback when no project is resolvable) +
+    // `active_by_project`, so relaunching under a project lands on THAT project's last chat.
+    const std::string projectKey = convProjectKey(convProjectDir(st));
+    if (!projectKey.empty() && !activeId.empty()) s_activeByProject[projectKey] = activeId;
+    nlohmann::json activeByProject = nlohmann::json::object();
+    for (const auto& [key, id] : s_activeByProject)
+        if (!key.empty() && !id.empty()) activeByProject[key] = id;
+    nlohmann::json index = {{"version", 3},
+                            {"active", activeId},
+                            {"active_by_project", std::move(activeByProject)},
+                            {"order", order}};
     try {
         // Durable atomic write (tmp + fsync + rename + dir fsync) — a hard crash mid-run must
         // never be able to leave a truncated/empty transcript behind.
@@ -1117,6 +1282,9 @@ static bool parseChatSessionJson(AppState& st, const nlohmann::json& jc,
         c.title = jc.value("title", std::string("Chat"));
         c.docLink = docLink;
         c.archived = jc.value("archived", false);
+        // Project scope. Legacy sessions (written before the field existed) recover one
+        // below, once, after the transcript and the Chudcode link are known.
+        c.projectDir = jc.value("project", std::string());
         // This session's own saved execution trace, straight into its conversation-keyed store
         // (no active/parked special case — switching sessions just reads the other tree).
         if (jc.contains("agent_dag")) ui::agentDagFromJson(c.id, jc["agent_dag"]);
@@ -1237,8 +1405,124 @@ static bool parseChatSessionJson(AppState& st, const nlohmann::json& jc,
         // Chudcode runtime link (id/file/health): restore into the conversation-keyed
         // registry only for sessions that are actually kept.
         chudcodeLinkRestore(c.id, jc);
+        // Legacy project-scope recovery — ONCE, at load time, in priority order:
+        //   1) the Chudcode session JSONL's own `cwd` (exactly where that run worked), then
+        //   2) the old artifact heuristic against the CURRENT project root (a session that
+        //      produced a file under this project belongs to it).
+        // Neither answers -> projectDir stays empty, which means "unscoped": always listed.
+        // The next persist writes whatever was recovered, so this runs at most once per
+        // session for the life of the store.
+        if (c.projectDir.empty()) {
+            if (const ChudcodeSessionLink* link = chudcodeSessionLink(c.id))
+                c.projectDir = chudcodeSessionCwd(link->sessionFile);
+            if (c.projectDir.empty()) {
+                const std::string current = convProjectDir(st);
+                const std::filesystem::path root = lexicalPath(current);
+                if (hasProjectArtifact(c.msgs, root, comparablePath(root)))
+                    c.projectDir = current;
+            }
+            if (!c.projectDir.empty()) markChatHistoryDirty();
+        }
         st.conversations.push_back(std::move(c));
     }
+    return true;
+}
+
+// ---- headless Chudcode session adoption --------------------------------------------------
+// A mission launched WITHOUT the GUI (services/worker_main.py agent_admin_turn with
+// sessions_dir=<Documents>/Chudware/Sessions) writes only Chudcode's own
+// "<timestamp>_<uuid>.jsonl" into that folder — no <id>.json transcript at all, so the
+// orphan sweep above never saw it and the run was unreachable from the Sessions list.
+// Replay its VISIBLE transcript into a real conversation instead, linked to the session
+// file so the GUI can resume it (chudcode_session_file).
+//
+// Chudcode session JSONL (version 3) entry types, one JSON object per line:
+//   {"type":"session","version":3,"id":…,"cwd":…}   session identity + the run's project cwd
+//   {"type":"message","message":{"role":"user"|"assistant"|"toolResult","content":[…]}}
+//        content parts are {"type":"text","text":…} | {"type":"thinking",…} |
+//        {"type":"toolCall",…}; assistant messages also carry model/provider/usage
+//   {"type":"title"|"title_change"|"model_change"|"thinking_level_change"|
+//    "credential_pin"|"custom"|"custom_message"}   lifecycle / tool-execution / system records
+// Only user+assistant "text" parts are replayed. thinking, toolCall, toolResult and every
+// lifecycle record stay in the file — which is exactly what the leading note tells the user.
+static bool adoptChudcodeSessionJsonl(AppState& st, const std::filesystem::path& file,
+                                      const std::string& sessionId) {
+    static constexpr size_t kMaxReplayBytes = 2u * 1024u * 1024u;
+    static constexpr int    kMaxEntries = 400;
+    std::ifstream in(file, std::ios::binary);
+    if (!in) return false;
+
+    std::string cwd, firstUserText;
+    std::vector<ChatMsg> msgs;
+    size_t consumed = 0;
+    int entries = 0;
+    std::string line;
+    while (std::getline(in, line)) {
+        consumed += line.size() + 1;
+        if (consumed > kMaxReplayBytes || entries >= kMaxEntries) break;
+        if (line.empty()) continue;
+        nlohmann::json j;
+        try { j = nlohmann::json::parse(line); } catch (...) { continue; }
+        if (!j.is_object()) continue;
+        const std::string type = j.value("type", std::string());
+        if (type == "session") {
+            if (cwd.empty()) cwd = j.value("cwd", std::string());
+            continue;
+        }
+        if (type != "message") continue;   // lifecycle / tool / system record
+        const auto m = j.find("message");
+        if (m == j.end() || !m->is_object()) continue;
+        const std::string role = m->value("role", std::string());
+        if (role != "user" && role != "assistant") continue;   // toolResult stays in the file
+        const auto content = m->find("content");
+        if (content == m->end() || !content->is_array()) continue;
+        ++entries;
+        std::string text;
+        for (const auto& part : *content) {
+            if (!part.is_object() || part.value("type", std::string()) != "text") continue;
+            const std::string piece = part.value("text", std::string());
+            if (piece.empty()) continue;
+            if (!text.empty()) text += "\n\n";
+            text += piece;
+        }
+        if (text.empty()) continue;   // a pure thinking/tool-call turn has nothing to show
+        ChatMsg cm;
+        cm.fromUser = (role == "user");
+        if (!cm.fromUser) cm.model = m->value("model", std::string());
+        cm.text = std::move(text);
+        if (cm.fromUser && firstUserText.empty()) firstUserText = cm.text;
+        msgs.push_back(std::move(cm));
+    }
+
+    Conversation c;
+    c.id = newConvId(st);
+    noteConvIdSeen(st, c.id);
+    // The run's own cwd IS its project (same field the composer would have sent as
+    // workspace_dir), so the adopted session lists under that project and nowhere else.
+    c.projectDir = cwd;
+    // Title: the first prompt, one line, bounded — else the session file's own stem.
+    {
+        std::string t = firstUserText.substr(0, firstUserText.find('\n'));
+        size_t b = t.find_first_not_of(" \t\r");
+        size_t e = t.find_last_not_of(" \t\r");
+        t = (b == std::string::npos) ? std::string() : t.substr(b, e - b + 1);
+        if (t.size() > 60) t.resize(60);
+        c.title = t.empty() ? file.stem().string() : t;
+    }
+    ChatMsg note;
+    note.fromUser = false;
+    note.text = "Adopted from an external Chudcode session; tool activity lives in the "
+                "session file";
+    c.msgs.reserve(msgs.size() + 1);
+    c.msgs.push_back(std::move(note));
+    for (ChatMsg& m : msgs) c.msgs.push_back(std::move(m));
+
+    ChudcodeSessionLink link;
+    link.sessionId = sessionId;
+    link.sessionFile = file.string();
+    link.health = "healthy";
+    chudcodeSessionLinkSet(c.id, std::move(link));
+    st.conversations.push_back(std::move(c));
     return true;
 }
 
@@ -1277,7 +1561,10 @@ void loadChatHistory(AppState& st) {
         seen.insert(id);
         s_pruneableSessionStems.insert(chatSessionFileStem(id));
     };
-    // Per-session transcript store: index.json (order + active id) + <id>.json transcripts.
+    // Per-session transcript store: index.json (order + active ids) + <id>.json transcripts.
+    // The remembered per-project active map is rebuilt with the store.
+    s_activeByProject.clear();
+    const std::string projectKey = convProjectKey(convProjectDir(st));
     {
         nlohmann::json index = nlohmann::json::object();
         {
@@ -1285,7 +1572,20 @@ void loadChatHistory(AppState& st) {
             if (in) { try { in >> index; } catch (...) {} }
         }
         if (index.is_object() && index.contains("order") && index["order"].is_array()) {
+            // v3: per-project active pointer wins for the project we are opening under; the
+            // top-level `active` remains the fallback (and is all a v2 index carries).
             activeId = index.value("active", std::string());
+            if (index.contains("active_by_project") && index["active_by_project"].is_object()) {
+                for (auto it = index["active_by_project"].begin();
+                     it != index["active_by_project"].end(); ++it) {
+                    if (!it.value().is_string() || it.key().empty()) continue;
+                    s_activeByProject[it.key()] = it.value().get<std::string>();
+                }
+                auto mine = s_activeByProject.find(projectKey);
+                if (!projectKey.empty() && mine != s_activeByProject.end() &&
+                    !mine->second.empty())
+                    activeId = mine->second;
+            }
             bool droppedDup = false;
             for (const auto& jid : index["order"]) {
                 if (!jid.is_string()) continue;
@@ -1358,6 +1658,41 @@ void loadChatHistory(AppState& st) {
                     if (parseChatSessionJson(st, jc, it.key())) noteLoaded();
                     migratedLegacy = true;
                 }
+            }
+        }
+    }
+    // Headless-mission sweep: Chudcode session JSONLs in the Sessions dir that NO resident
+    // conversation links to (see adoptChudcodeSessionJsonl). Runs after the legacy import so
+    // adopting one can never suppress that migration. Bounded and never throwing: oversized
+    // files are skipped, a parse failure just means "no answer".
+    {
+        namespace fs = std::filesystem;
+        static constexpr std::uintmax_t kMaxJsonlBytes = 64ull * 1024ull * 1024ull;
+        std::set<std::string> linkedIds, linkedFiles;
+        for (const auto& c : st.conversations) {
+            const ChudcodeSessionLink* link = chudcodeSessionLink(c.id);
+            if (!link) continue;
+            if (!link->sessionId.empty()) linkedIds.insert(link->sessionId);
+            if (!link->sessionFile.empty())
+                linkedFiles.insert(comparablePath(lexicalPath(link->sessionFile)));
+        }
+        std::error_code ec;
+        for (const auto& de : fs::directory_iterator(chatSessionsDir(), ec)) {
+            if (!de.is_regular_file(ec)) continue;
+            const std::string name = de.path().filename().string();
+            if (name.size() < 7 || name.compare(name.size() - 6, 6, ".jsonl") != 0) continue;
+            // Our own per-conversation raw event log lives in this folder too.
+            if (name.size() >= 10 && name.compare(name.size() - 10, 10, ".raw.jsonl") == 0)
+                continue;
+            const std::uintmax_t bytes = de.file_size(ec);
+            if (ec || bytes == 0 || bytes > kMaxJsonlBytes) { ec.clear(); continue; }
+            if (linkedFiles.count(comparablePath(lexicalPath(de.path().string())))) continue;
+            const std::string sessionId = chudcodeSessionIdOf(de.path().string());
+            if (sessionId.empty() || linkedIds.count(sessionId)) continue;
+            if (adoptChudcodeSessionJsonl(st, de.path(), sessionId)) {
+                noteLoaded();
+                linkedIds.insert(sessionId);
+                recoveredOrphan = true;   // needs its own <id>.json + an index entry
             }
         }
     }
@@ -1643,6 +1978,35 @@ static void pollChudcodeSessionHealth(AppState& st) {
 }
 
 
+// A project switch at runtime (Explorer workspace root or "Open project folder…" changing
+// what convProjectDir resolves to) re-points the view at the session that was last active in
+// the project being ENTERED, and remembers where the user was in the one being LEFT. A
+// project we have no memory of keeps the current session — there is nothing better to show.
+// Gated on the key itself, so this costs one string compare per frame.
+static void followProjectActiveConversation(AppState& st) {
+    static bool s_seeded = false;
+    static std::string s_lastKey;
+    const std::string key = convProjectKey(convProjectDir(st));
+    if (!s_seeded) {  // first observation is the load's own selection, never a switch
+        s_seeded = true;
+        s_lastKey = key;
+        return;
+    }
+    if (key == s_lastKey) return;
+    if (!s_lastKey.empty() && st.activeConv >= 0 &&
+        st.activeConv < (int)st.conversations.size())
+        s_activeByProject[s_lastKey] = st.conversations[st.activeConv].id;
+    s_lastKey = key;
+    if (key.empty()) return;
+    const auto it = s_activeByProject.find(key);
+    if (it == s_activeByProject.end() || it->second.empty()) return;
+    for (int i = 0; i < (int)st.conversations.size(); ++i) {
+        if (st.conversations[i].id != it->second) continue;
+        if (i != st.activeConv) switchConversation(st, i);  // parks the outgoing session
+        return;
+    }
+}
+
 // Per-frame chat/doc sync (called each frame). Sessions are document-independent now: a
 // document switch NEVER loads/parks/replaces the session set — it only refreshes
 // st.chatDocKey (the current document's key, for run launches + prompt drafts), runs the
@@ -1660,6 +2024,7 @@ void syncChatToDoc(AppState& st) {
     }
     st.chatDocKey = convDocKey(st);
     ensureConversations(st);
+    followProjectActiveConversation(st);
     pollChudcodeSessionHealth(st);
 }
 
@@ -1752,6 +2117,7 @@ void newConversation(AppState& st) {
     c.id = newConvId(st);
     c.title = "Chat " + std::to_string((int)st.conversations.size() + 1);
     c.docLink = convDocKey(st);  // link to the current document — reference only
+    c.projectDir = convProjectDir(st);  // project scope, captured once at creation
     st.conversations.push_back(std::move(c));
     st.activeConv = (int)st.conversations.size() - 1;
     st.showSessionsPicker = false;
@@ -1931,6 +2297,7 @@ int forkConversation(AppState& st, int idx) {
     }
     fork.title = std::move(title);
     fork.docLink = source.docLink;
+    fork.projectDir = source.projectDir;  // a fork belongs to the same project as its source
     fork.archived = false;
     fork.msgs = idx == st.activeConv ? st.chat : source.msgs;
     for (auto& msg : fork.msgs) {

@@ -328,6 +328,13 @@ ENTRIES: dict[str, dict[str, Any]] = {
             "document and is NOT a standard STEP exchange file."
         ),
     },
+    "fit_cylinder_axis": {
+        "prompt_note": (
+            "Least-squares bore/shaft axis around near=[x,y,z] — the way to find a hub "
+            "bore or axle on a TESSELLATED import; judge rms_residual_mm against "
+            "radius_mm before placing anything on the axis (skill://assembly-merge)."
+        ),
+    },
     "get_job": {
         "prompt_note": (
             "Poll the job_id a backgrounded heavy call returned (add_features / "
@@ -343,7 +350,9 @@ ENTRIES: dict[str, dict[str, Any]] = {
     "import_part": {
         "prompt_note": (
             "into=doc_id adds to the current part; omit for a new doc. .sldprt rebuilds "
-            "the SW tree (needs local SolidWorks); mesh → as_solid=True to sew a solid."
+            "the SW tree (needs local SolidWorks); mesh → as_solid=True to sew a solid. "
+            "Multi-body source: describe_part rosters the bodies, keep_bodies/"
+            "exclude_bodies (ordinals or names) drop the ones you don't want."
         ),
         "timeout_s": 600,
     },

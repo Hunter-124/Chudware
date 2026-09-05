@@ -58,6 +58,14 @@ ctest --test-dir build/windows-occt --output-on-failure
 The first configure downloads OCCT 7.9.3 and the pinned BSD-3-Clause
 Polyhedral-FEA source under `third_party/`.
 
+That build also produces the Polyhedral-FEA driver `polymesh.exe` in the preset's `bin\`
+directory, beside `chudware.dll` and `chudware-hostd.exe` (see
+`docs/reference/HOSTD.md`). To build against a local Polyhedral-FEA checkout instead of the
+pin, add `-DPOLYMESH_SOURCE_DIR=<checkout>` to the configure line (the `build.sh`
+`CHUDWARE_POLYMESH_ROOT` env var is the POSIX front end for the same variable); the
+configure then prints `Polyhedral-FEA: LOCAL SOURCE <dir> @ <sha>` instead of
+`Polyhedral-FEA: PINNED FETCH …`.
+
 Windows-specific fixes this requires:
 - `core/CMakeLists.txt` defines `NOMINMAX` for MSVC because OCCT pulls in
   `<windows.h>`, whose macros otherwise clobber `std::min`/`std::max`.

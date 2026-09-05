@@ -814,3 +814,53 @@ The former Netgen/structured-mesh controls are removed rather than aliased:
 `thin_wall_layers`, and `algorithm3d`. A STEP-backed request containing one of these keys
 returns `ok:false` with a message naming the removed key; it is never silently ignored or
 mapped to the Polyhedral-FEA path.
+
+## 19. Display tessellation quality (append-only, 2026-09-04)
+
+| method | params → result |
+|---|---|
+| `doc_set_display_quality` | `{doc_id, quality: "draft"\|"standard"\|"fine"}` → ops-response (doc_ops §1) + `{ok:true, quality, triangles:int}` |
+
+`triangles` is the display-triangle total across the document's bodies after re-tessellation, so a
+caller can see what the tier cost. The response carries the usual `tess.aicm_path`, which is the
+mesh the client reloads; the document's revision does NOT change (view-only, like
+`doc_set_explode_state`).
+
+An unknown `quality` name is refused with `{"code":"invalid_op"}` — it is never silently mapped to
+a tier. Per-tier deflections, the `CHUDWARE_DISPLAY_QUALITY` default override, and the
+cache-invalidation rule are specified in doc_ops.md §7.
+
+## 20. Measured cylinder axis — `eval_fit_cylinder` (append-only, 2026-09-04)
+
+`eval_fit_cylinder {doc_id, body?, near:[x,y,z], search_radius_mm?}` → `{axis_point:[3],
+axis_dir:[3], radius_mm, rms_residual_mm, n_points_used}` · `body` is 1-based, `<=0`/absent
+selects the LAST body (the Evaluate-family convention shared with `eval_mass`/`eval_check`)
+· `near` is REQUIRED (a world point on or near the wanted cylindrical surface; absent →
+`{"code":"invalid_op"}`) · `search_radius_mm` defaults to 5.0 and must be > 0.
+
+Every display-tessellation vertex of the selected body within `search_radius_mm` of `near`
+is fed to a least-squares cylinder fit (`core/geom/fit.cpp`, PCA seed + Gauss-Newton refine
+of axis point/direction/radius). `axis_dir` is a unit vector whose SIGN is arbitrary;
+`axis_point` is the axis point nearest the sampled centroid (an axis point is only defined
+up to a slide along the axis). `rms_residual_mm` is the fit's own evidence — a merge of
+independently sourced CAD should gate on it, not on the axis alone.
+
+Fewer than 6 culled vertices, a non-positive `search_radius_mm`, or a non-convergent
+(degenerate/collinear) cloud return `{"code":"invalid_op"}` naming the point count. A
+plausible-looking fit is never synthesized from an under-determined cloud.
+
+## 21. Per-step motion collisions — `simulate_motion` (append-only, 2026-09-04)
+
+With `check_interference:true`, every entry of `simulate_motion`'s `trajectory` now carries
+`collisions: [{a, b, overlap_volume_mm3}]` beside its existing `interference: bool` — the
+offending pairs AT THAT SAMPLE, from the same `interference_report` the check already ran.
+Solid overlaps report their real common volume; a pair flagged only for violating
+`min_clearance_mm` reports `overlap_volume_mm3: 0.0`. The list is empty on a clean step and
+absent when `check_interference` is false.
+
+The report's `overlap_mesh`/`overlap_bbox` are deliberately NOT carried into the trajectory
+(a several-hundred-step sweep would carry a mesh per pair per step); they remain available
+from `eval_interference` at a chosen pose. The top-level `interference` block is unchanged —
+`first_collision_step`, `first_collision_value` and the full first-collision `detail` still
+describe the FIRST offending sample, so a caller that only wants the first hit is unaffected
+while a swept-clearance proof can now cite every step.

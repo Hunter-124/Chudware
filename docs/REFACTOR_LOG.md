@@ -1766,3 +1766,43 @@ append there if that matters. The native offline pipeline in `core/agent/run.cpp
 chat's tools uncapped (`budget_tokens=1_000_000, trim=False`) to mirror the native Chudcode tool
 definitions; the tiered text slot only applies to the offline loop. `onboarding.cpp` still uses
 `agent_ask_v2` as its provider connectivity probe — deliberate, it is not a chat path.
+
+## 2026-09-04 — ME490 harness: project-keyed sessions, evidence-grade FEA, assembly-merge primitives
+
+**Why.** A live ME-490 mission (Comet wheels onto the Crankers frame) hand-edited STEP text and
+placed the wheels off the frame, the chat "did not save" (it had — the Sessions list filtered it
+out), imported SolidWorks parts rendered as flat bricks, and no sim result carried mesh quality,
+reactions, provenance or a VTU.
+
+**What changed.** (1) `Conversation.projectDir` is stamped at creation from the same value the
+composer sends as `workspace_dir`; `index.json` v3 carries `active_by_project`; the Sessions
+panel filters by that stored key (an "All projects" toggle shows everything) and the GUI adopts
+headless Chudcode `*.jsonl` sessions it finds in the Sessions dir. (2) Display quality tiers
+(`geom::DisplayQuality` draft/standard/fine, default fine, `CHUDWARE_DISPLAY_QUALITY`, RPC
+`doc_set_display_quality`, `render_part(display_quality=)`, Settings → Document). (3) SolidWorks
+saved-display imports: shells are re-oriented outward, smooth per-vertex normals are computed
+(area-weighted, 40° crease) and attached, the engine renderer is Gouraud, and the viewpoint
+rasterizer mirrors it. (4) Every `sim_run_static|adaptive|modal|thermal` result carries
+`mesh_quality`, `reactions` (static/adaptive), `provenance` and honours `study.vtu_path`;
+`sim_cache` schema bumped to /3. New tools `run_fea_convergence`, `sim_evidence_packet`,
+`polymesh_cli` (model_units default mm → `--scale 0.001`), `fit_cylinder_axis`
+(surface-sampled, works on tessellated bores), `sweep_envelope`, `steering_turning_radius`,
+`motion_fea_handoff_sweep`; `simulate_motion` reports per-step `collisions`. (5) Import features
+accept `keep_bodies`/`exclude_bodies`; `import_part` surfaces feature failures; `describe_part`
+rosters bodies; `asm_add_component`/`list_world_bodies`/`export_part`/`save_part` carry
+`placement_source` and a `placement_unverified` warning until `check_interference` runs; new
+builtin skill `assembly-merge`. (6) `core/sim/mesher.cpp` retries a refused fill once with feature
+refinement and once at Polyhedral-FEA's own `reduce -h to <=` hint (fixed the fin25 thermal leg
+at fineness 0.3). (7) Build: `CHUDWARE_POLYMESH_ROOT=<checkout> ./build.sh core` builds against a
+local Polyhedral-FEA tree; the `polymesh` CLI is built and staged beside `chudware-hostd` (also
+into `services/dist`). Polyhedral-FEA-private gained `--scale` and `docs/cli.md`, and its Linux
+ONNX Runtime digest is pinned. `scripts/run_mission.py` drives a headless `agent_admin_turn`.
+
+**Gotchas / deferred.** `placement_source` is MCP-process state, not persisted on the component.
+The polymesh CLI's direct solver is hours at h ≤ 8 mm on a 100 mm part — use it as the coarse
+cross-check lane, not the primary solve. Display tiers are inert on mesh-derived imports (facet
+density is baked by SolidWorks). Buckling/contact/steady-thermal still run on CalculiX box
+proxies, not Polyhedral-FEA. The default role model `claude-fable-5-1` is rejected by the
+installed chud (needs Claude Code ≥ 2.1.251); missions must pass `--model claude-opus-5`.
+`.venv-mcp` was missing `chudcode-rpc`, `python-docx`, `python-pptx`, `openpyxl`, `reportlab`,
+`pypdf` — installed by hand; provisioning should own that.

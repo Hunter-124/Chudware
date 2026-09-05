@@ -290,6 +290,12 @@ def _mesh_from_face_stream(data: bytes, expected_faces: int | None = None):
     headers = _strip_headers(data)
     verts: list[list[float]] = []
     tris: list[tuple[int, int, int]] = []
+    # The second array of each group is SolidWorks' per-vertex NORMAL array. It is
+    # deliberately NOT read (mirrors core/doc/solidworks_tessellation.cpp): on real parts it
+    # is garbage — a turned spacer authored (0,0,±1) for every one of its 2208 vertices, and
+    # another part's signs disagreed with the triangle winding on 1040 of 1176 triangles.
+    # Smooth shading normals are derived from the triangle soup instead
+    # (MeshBody.vertex_normals / mesh_to_shape). The four-array stride still locates positions.
     for face in range(face_count):
         offset, count = arrays[face * 4]
         header = headers.get(offset)
@@ -427,6 +433,8 @@ def _portable_tessellations(path: str | os.PathLike) -> list[tuple[str, Any]]:
                 placed = hom @ world
                 used[full] = used.get(full, 0) + 1
                 name = full if used[full] == 1 else f"{full}-{used[full]}"
+                # No normals to carry: the placed instance derives its own smooth normals
+                # from the transformed triangle soup (MeshBody.vertex_normals).
                 mesh = MeshBody((placed[:, :3] * 1000.0).astype(np.float32),
                                 base.tris.copy(), name=name)
                 out.append((name, mesh))

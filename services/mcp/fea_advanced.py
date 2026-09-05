@@ -127,9 +127,15 @@ _CCX_NAMES = ("ccx", "ccx_2.20", "ccx_2.21", "ccx_2.19", "calculix")
 #       hands ``run_ccx``. It lands on exactly the 300 s that ``run_ccx``'s own
 #       public default already gave, so this change cannot shorten a solve that
 #       used to fit; it only stops the outer clock from stealing the diagnostic.
-#   HARNESS_FEA_TIMEOUT_S = 420 s — the OUTER ceiling every ``run_fea_*`` entry
-#       in services/agent/tool_guidance/sim.py carries.
-# The invariant to preserve is HARNESS_CCX_TIMEOUT_S < HARNESS_FEA_TIMEOUT_S;
+#   HARNESS_FEA_TIMEOUT_S = 420 s — the OUTER ceiling every SINGLE-SOLVE
+#       ``run_fea_*`` entry in services/agent/tool_guidance/sim.py carries. A
+#       multi-leg member (``run_fea_convergence`` solves the runbook's three-mesh
+#       ladder under ONE dispatch) resolves its setup once and then spends one
+#       inner clock per leg, so its ceiling is legs*HARNESS_CCX_TIMEOUT_S +
+#       CCX_SETUP_MARGIN_S — the margin is shared, only the solver term scales
+#       (sim.py's ``FEA_SOLVER_LEGS``/``fea_timeout_s``).
+# The invariant to preserve is that the inner clocks a tool may burn stay
+# strictly inside its outer ceiling by CCX_SETUP_MARGIN_S;
 # services/mcp/test_fea_ccx_advanced.py pins the guidance table and these
 # constants in lockstep so the two clocks cannot drift back to equality.
 HARNESS_FEA_TIMEOUT_S: float = 420.0

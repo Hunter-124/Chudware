@@ -22,6 +22,7 @@ from .cad_common import (
     _SID_RE,
     _annotate_render,
     _as_face_query,
+    _bbox_from_points,
     _between_from_batch,
     _build_emphasis_palette,
     _camera_dir_for_target,
@@ -40,6 +41,7 @@ from .cad_common import (
     already_resolved_selector,
     is_geom_query,
     normalize_geom_query,
+    note_interference_check,
     render_output_path,
     resolve_readback_selector,
     cb,
@@ -1227,6 +1229,151 @@ def register_cad_eval_tools(mcp: FastMCP) -> None:
             return _err(_teach_no_bodies(e, d, f"measure_between(a_query={a_query!r})"))
 
 
+    @mcp.tool()
+    def fit_cylinder_axis(near: Optional[list] = None,
+                          search_radius_mm: float = 10.0,
+                          target: Optional[str] = None,
+                          doc_id: Optional[str] = None,
+                          view: Optional[Union[str, dict]] = "auto",
+                          annotate: bool = True,
+                          **kwargs: Annotated[Any, Field(default=None)]) -> list:
+        """Least-squares CYLINDER AXIS from the geometry around a point — works on TESSELLATED
+        imports where there is no analytic cylindrical face to query.
+
+        This is how you find a hub bore, an axle, a bearing seat or a bolt shank on an
+        imported STEP/mesh body so a component can be placed on MEASURED references instead of
+        a guessed transform. Point it roughly at the feature and it fits the surrounding
+        points:
+          near             : [x,y,z] mm — a point on or near the cylindrical surface (required).
+          search_radius_mm : how far around `near` to gather points (default 10 mm). Too small
+                             starves the fit (n_points_used low), too large swallows
+                             neighbouring geometry (rms_residual_mm blows up).
+          target           : optional body name/id to restrict the fit to ONE body of a
+                             multi-body part (also accepted as body=).
+
+        Returns [image, caption]; the caption's `fit_cylinder_json` carries
+        {axis_point, axis_dir, radius_mm, rms_residual_mm, n_points_used}. TRUST THE RESIDUAL:
+        an rms_residual_mm that is a meaningful fraction of radius_mm means you did not fit a
+        cylinder (wrong point, too big a search radius, or a chamfer/fillet in the window) —
+        re-aim rather than place a part on it.
+
+        Merge recipe: fit_cylinder_axis on the bore, fit_cylinder_axis on the shaft/axle, then
+        rotate axis_dir → axis_dir and translate axis_point → axis_point (or feed the two axes
+        to an asm_mate "concentric"), and finish with check_interference + measure_between.
+        """
+        d = None
+        try:
+            extra = _extra_kwargs(dict(kwargs))
+            notes: list = []
+            near = _one_alias("fit_cylinder_axis", "near", extra,
+                              ("at", "point", "position", "location", "xyz"), near, notes)
+            search_radius_mm = _one_alias(
+                "fit_cylinder_axis", "search_radius_mm", extra,
+                ("search_radius", "radius_mm", "radius", "window_mm"),
+                search_radius_mm, notes)
+            target = _one_alias("fit_cylinder_axis", "target", extra,
+                                ("body", "body_name", "body_id", "part"), target, notes)
+            _reject_unknown("fit_cylinder_axis", extra,
+                            "it takes near=[x,y,z], search_radius_mm=, target= (a body), "
+                            "doc_id=, view= and annotate=.")
+            if isinstance(near, tuple):
+                near = list(near)
+            if not isinstance(near, list) or len(near) != 3:
+                raise ValueError(
+                    "fit_cylinder_axis(near=[x,y,z]) needs a 3-number point in mm on or near "
+                    "the cylindrical surface to fit — e.g. near=[120.0, 0.0, 42.5]. Get a "
+                    "starting point from describe_part's bores/sids, hover(sid), or "
+                    "list_world_bodies' bbox centre.")
+            near = [float(v) for v in near]
+            try:
+                search_radius_mm = float(search_radius_mm)
+            except (TypeError, ValueError):
+                raise ValueError(
+                    f"fit_cylinder_axis(search_radius_mm={search_radius_mm!r}): the search "
+                    "window is a NUMBER of millimetres, e.g. search_radius_mm=8.") from None
+            if search_radius_mm <= 0.0:
+                raise ValueError("fit_cylinder_axis(search_radius_mm=) must be > 0 mm.")
+            d = _doc(doc_id)
+            req: dict = {"doc_id": d, "near": near, "search_radius_mm": search_radius_mm}
+            if target:
+                req["body"] = str(target)
+            try:
+                res = cb.call("eval_fit_cylinder", req)
+            except CoreError as e:
+                taught = _teach_no_bodies(e, d, f"fit_cylinder_axis(near={near!r})")
+                if taught is not e:
+                    raise taught from None
+                raise ValueError(
+                    f"eval_fit_cylinder failed: {e}. Re-aim `near` at a point that really "
+                    f"lies on the bore/shaft wall (describe_part lists the bores; hover(sid) "
+                    f"gives a point on a face) and widen/narrow search_radius_mm.") from e
+            axis_point = res.get("axis_point")
+            axis_dir = res.get("axis_dir")
+            radius = res.get("radius_mm")
+            rms = res.get("rms_residual_mm")
+            n_pts = res.get("n_points_used")
+            structured = {"ok": res.get("ok", True), "doc_id": d, "near": near,
+                          "search_radius_mm": search_radius_mm, "target": target,
+                          "axis_point": axis_point, "axis_dir": axis_dir,
+                          "radius_mm": radius, "rms_residual_mm": rms,
+                          "n_points_used": n_pts}
+            if isinstance(rms, (int, float)) and isinstance(radius, (int, float)) and radius:
+                structured["residual_pct_of_radius"] = 100.0 * float(rms) / float(radius)
+                if structured["residual_pct_of_radius"] > 2.0:
+                    structured["fit_warning"] = (
+                        "rms_residual_mm is more than 2% of radius_mm — this window is "
+                        "probably not a single cylinder; re-aim `near` or shrink "
+                        "search_radius_mm before placing anything on this axis")
+            _interpreted(structured, notes)
+
+            # Same annotated-render shape as `measure`: frame the fitted window so the reading
+            # can be seen, not just trusted.
+            focus = None
+            if isinstance(axis_point, list) and len(axis_point) == 3:
+                pad = max(float(radius or 0.0), search_radius_mm)
+                focus = _bbox_from_points([[axis_point[i] - pad for i in range(3)],
+                                           [axis_point[i] + pad for i in range(3)]])
+            view_dir = _camera_dir_for_target([], view)
+            if isinstance(axis_dir, list) and len(axis_dir) == 3 and (view is None or
+                                                                      view == "auto"):
+                # Look ACROSS the axis (not down it) so the fitted barrel is visible.
+                ax = axis_dir
+                cand = (1.0, 0.0, 0.0) if abs(ax[0]) < 0.8 else (0.0, 0.0, 1.0)
+                view_dir = (ax[1] * cand[2] - ax[2] * cand[1],
+                            ax[2] * cand[0] - ax[0] * cand[2],
+                            ax[0] * cand[1] - ax[1] * cand[0])
+                if not any(view_dir):
+                    view_dir = _camera_dir_for_target([], "auto")
+            png_out = render_output_path(f"{d}-fitcyl", ".png")
+            png_out, frame, _r = _render_view_png(
+                d, view_dir, png_out, name="FIT CYLINDER", focus=focus,
+                W=_CLOSEUP_W, H=_CLOSEUP_H, annotate=bool(annotate))
+            png_out, _ann = _annotate_render(
+                png_out, d, view_dir, frame=frame, edges=True, callouts=False,
+                scale=True, out_png=render_output_path(f"{d}-fitcyl", ".png"))
+
+            def _f(v) -> str:
+                return f"{float(v):.6g}" if isinstance(v, (int, float)) else "?"
+
+            caption = (
+                f"FIT CYLINDER near {near} (window {_f(search_radius_mm)} mm"
+                f"{', body ' + str(target) if target else ''}):\n"
+                f"  radius = {_f(radius)} mm, diameter = "
+                f"{_f(radius * 2) if isinstance(radius, (int, float)) else '?'} mm\n"
+                f"  axis_point = {axis_point}, axis_dir = {axis_dir}\n"
+                f"  rms_residual = {_f(rms)} mm over {n_pts} point(s)"
+                + (f"\n  WARNING: {structured['fit_warning']}"
+                   if structured.get("fit_warning") else "")
+                + f" [fit_cylinder_json="
+                  f"{json.dumps(structured, separators=(',', ':'), default=str)}]")
+            return [Image(path=png_out), caption]
+        except Exception as e:  # noqa: BLE001
+            raise ValueError(
+                f"fit_cylinder_axis(near={near!r}) failed: "
+                f"{_teach_no_bodies(e, d, 'fit_cylinder_axis()')}") from e
+
+
+
 
     @mcp.tool()
     def check_interference(doc_id: Optional[str] = None,
@@ -1280,6 +1427,9 @@ def register_cad_eval_tools(mcp: FastMCP) -> None:
             d = _doc(doc_id)
             res = cb.call("eval_interference", {"doc_id": d, "include_coincident": include_coincident,
                                                 "min_clearance_mm": min_clearance_mm})
+            # This IS the verification step for transform-placed components: record that it
+            # ran at the doc's current revision so save_part/export_part stop warning.
+            note_interference_check(d)
             return _dumps(_interpreted({"ok": res.get("ok", True), "doc_id": d, **res}, notes))
         except Exception as e:  # noqa: BLE001
             return _err(_teach_no_bodies(e, d, "check_interference()"))

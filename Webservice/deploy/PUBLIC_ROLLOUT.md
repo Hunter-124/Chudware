@@ -224,13 +224,17 @@ chasing a security regression that is not there.
 
 ### Still open here
 
-- **Prices.** Every figure was placeholder filler, so the pricing page now
-  states commercial-preview status and publishes no numbers. Ratify the tier
-  shape before putting figures back.
-- **Stripe webhook bypass.** Not needed yet: Stripe is unconfigured, and
-  `/api/billing/webhook` is in `PUBLIC_PATHS` so it is not gated by the app.
-  No `/admin` Access scope exists to sit outside of any more, so no edge bypass is
-  required at all.
+- **Prices — RESOLVED 2026-09-05.** The live catalog in
+  `provision_stripe.py::CATALOG_SPEC` is ratified ($30/$150 monthly, 50%
+  `.edu`, credit packs $10/8k, $25/20k, $100/80k) and the public
+  `/pricing/` page, FAQ, and About copy now publish exactly those figures and
+  the `plans.py` entitlements (Desktop: native app + 5 GB; Studio: adds the
+  browser workspace + 100 GB; trial 14 days with both). Change a number in
+  one place and the other two are wrong — keep them in step.
+- **Stripe webhook bypass.** Still not needed: `/api/billing/webhook` is in
+  `PUBLIC_PATHS`, so it is not gated by the app, and no `/admin` Access scope
+  exists to sit outside of. The endpoint is live-mode only as of 2026-09-05;
+  see `SETUP_CREDENTIALS.md` §6 for why.
 - **The retired `cad` hostname on `scootware.us`** is fully gone: no Access
   application, no tunnel ingress, and no DNS record left in that zone.
 - **Watch the queue.** Every registration is created `pending`; only email

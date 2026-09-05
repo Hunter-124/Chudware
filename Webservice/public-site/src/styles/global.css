@@ -200,6 +200,9 @@
   .access-option .fact-list { margin-block: var(--s6); }
   .access-option .button { margin-top: auto; }
   .access-primary { border-color: var(--accent); }
+  .access-option .price { margin-top: var(--s4); display: flex; flex-wrap: wrap; align-items: baseline; gap: var(--s2); }
+  .price-amount { font-size: var(--step-3); font-weight: 600; letter-spacing: -.02em; color: var(--text); }
+  .price-period { color: var(--muted); }
   .access-contact { grid-column: 1 / -1; display: grid; grid-template-columns: .35fr 1fr .6fr auto; align-items: center; gap: var(--s5); background: transparent; }
   .access-contact h2, .access-contact > p:not(.eyebrow) { margin-top: 0; }
   .fact-list { display: grid; gap: var(--s3); list-style: none; color: var(--muted); }

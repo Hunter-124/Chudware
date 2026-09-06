@@ -2378,3 +2378,47 @@ the full-size mission geometry behind `CHUDWARE_ME490_SECTOR=1`.
 
 Green in core/build-Tet4Conn: mesh, mesh_quality, mesher_advanced, tet10_thin_wall,
 mesh_mechanism, mesh_sector, fea_contact (7/7, 488 s).
+
+## The site's live renders share one stage, and a heightfield is not a distance field (2026-09-06)
+
+**Symptom.** The landing page's "parametric rebuild" render showed with its upper-right half
+black. The fullscreen-triangle vertex shader in `Webservice/public-site/src/scripts/hero.ts`
+built `gl_Position = vec4(p - 1.0, …)` from `p ∈ {(0,0),(2,0),(0,2)}`, i.e. `(-1,-1),(1,-1),(-1,1)`:
+a triangle covering exactly half of clip space. The standard trick needs `p * 2.0 - 1.0` so the
+far vertices land at 3 and the hypotenuse clears the corner. It had been that way since the
+render was introduced; it only ever filled the lower-left half.
+
+**Change.** The WebGL2 driver (context, budgeted resize, parallax, visibility, context loss,
+clock) moved out of `hero.ts` into `scripts/stage.ts`; the shared GLSL (palette, primitives,
+tetra normal + curvature, shadow, AO, grid floor, tonemap, orbit camera) into
+`scripts/sdf-glsl.ts` as `glslPrelude({shadowStep, shadowSteps, normalEpsilon})`; and the
+boot/teardown/fallback logic into `scripts/showcase.ts`, which mounts every `[data-show]` root
+of the new generic `components/Showcase.astro` (`HeroCanvas.astro` is gone). Second showcase:
+`scripts/machining.ts` + `machining-timeline.ts` — a CAM job (Face1, Pocket1 ×2 stepdowns,
+Contour1 ×3 stepdowns, Drill1 ×4) whose toolpaths are generated on the CPU, fitted to the
+Operations table's time windows, and stamped into a 384×262 dexel heightfield (RGBA16F: height,
+programmed path, cutter-trail time) that the fragment shader raymarches as
+`stock ∩ {y < h(x,z)}` with the cutter/holder as SDFs in the same field. It sits on the landing
+page (flipped, after the modeling showcase) and on `/product/cam/`; the modeling showcase is
+also on `/product/modeling/`. The cam.png figure left the landing page; the "one project"
+section became a 3-column `.workflow-grid`. Phones: showcase panel rows in two columns,
+details wrap, subject framed 16–18 % closer under 520 CSS px, stages boot only within one
+viewport of the box.
+
+**Gotchas that cost time.** (1) `y − h(x,z)` climbs ~30× faster than distance at a wall, so
+the tetra curvature estimate is garbage there and the edge/crease shading striped every wall;
+`normalAndCurvature` now divides by the gradient magnitude and fades curvature out where it
+leaves 1 (an exact SDF is unaffected), and the machining shader draws its own rims from the
+field. (2) Stamping cutter discs binary produces toothed walls; each cell instead keeps up to
+4 nested (depth, max-coverage) levels and shows `top − Σ cover·Δdepth`, which is
+order-independent — an earlier base/floor/cover history made adjacent cells disagree by
+which pass reached them first. (3) Shadow steps must be capped below the thinnest wall for a
+heightfield (0.05 here vs 0.3 for the SDF). (4) An op-status change that keeps the same row
+index but flips active/inactive must still be reported. (5) Headless Chromium here is
+SwiftShader: use `prefers-reduced-motion: reduce` for full-resolution stills; the adaptive
+pixel budget otherwise drives the render to its floor. Verified in the production bundle on
+`/`, `/product/cam/`, `/product/modeling/` at 390 px and 1400 px, zero page errors. Deploy is
+`npx wrangler pages deploy dist --project-name chudware-site` from `Webservice/public-site`
+(not authenticated on this box). Product side needed nothing: `core/cam/stock_sim` + the host's
+CAM HUD already do dexel stock removal with playback (`host/src/ui/cam/cam_panel.cpp`,
+`host/src/ui/viewport_panel.cpp` aux mesh).

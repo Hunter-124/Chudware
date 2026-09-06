@@ -2,6 +2,8 @@
 import BaseLayout from '../../layouts/BaseLayout.astro';
 import '../../styles/product.css';
 import Icon from '../../components/Icon.astro';
+import Showcase from '../../components/Showcase.astro';
+import { MACHINING_OPS } from '../../scripts/machining-timeline';
 ---
 <BaseLayout title="CAM and manufacturing" description="Build machining jobs from the active part: stock, work coordinate system, tool library, process-ordered operations, toolpath simulation, and posted G-code for a specific machine.">
   <header class="page-hero">
@@ -32,6 +34,24 @@ import Icon from '../../components/Icon.astro';
       </figure>
     </div>
   </section>
+
+  <Showcase
+    kind="machining"
+    flip
+    panelTitle="Operations"
+    panelDoc="bracket_v4 · Setup1"
+    rows={MACHINING_OPS}
+    kernel="Dexel stock · 384 × 262"
+    activeVerb="Running"
+    doneText="Simulation complete"
+    image={{ src: '/images/cam.png', width: 1340, height: 838, alt: 'Chudware manufacturing workspace showing a CAM job, stock, tools, operations, and toolpath simulation' }}
+    caption="Live render · toolpaths generated on the fly and swept through a dexel stock model, the way the product's simulation checks a job before it posts."
+  >
+    <p class="eyebrow">Stock simulation</p>
+    <h2>See what the job leaves behind before the post runs.</h2>
+    <p class="lede">Simulation sweeps every cutting move through a dexel model of the stock and reports what was removed, what remains, and where a tool, holder, or rapid met material it should not have. Scrub the playback to any point in the cycle and the remaining stock is rebuilt for that moment.</p>
+    <p class="supporting-copy">Here the same idea runs in your browser: facing, a two-stepdown pocket, three contour stepdowns, and four through holes, with the programmed path and the cutter's trail drawn on the surface.</p>
+  </Showcase>
 
   <section class="section" aria-labelledby="setup-title">
     <div class="wrap">

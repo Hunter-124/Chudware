@@ -1,8 +1,10 @@
 ---
 import BaseLayout from '../layouts/BaseLayout.astro';
 import TesseractHero from '../components/TesseractHero.astro';
-import HeroCanvas from '../components/HeroCanvas.astro';
+import Showcase from '../components/Showcase.astro';
 import Icon from '../components/Icon.astro';
+import { HERO_STAGES } from '../scripts/hero-timeline';
+import { MACHINING_OPS } from '../scripts/machining-timeline';
 ---
 <BaseLayout title="Parametric CAD from sketch to shop floor" description="Chudware is a parametric CAD system for mechanical engineers: exact solid geometry, an editable feature tree, assemblies, CAM, PLM, and simulation, in a browser or as a native Windows, Linux, and macOS desktop application.">
   <TesseractHero>
@@ -53,12 +55,40 @@ import Icon from '../components/Icon.astro';
     </div>
   </section>
 
-  <HeroCanvas>
+  <Showcase
+    kind="hero"
+    panelTitle="FeatureManager"
+    panelDoc="bracket_v4.chud"
+    rows={HERO_STAGES}
+    kernel="Exact solids"
+    activeVerb="Rebuilding"
+    doneText="Rebuild complete"
+    image={{ src: '/images/modeling.png', width: 1340, height: 838, alt: 'The Chudware modeling workspace showing a shelled parametric enclosure beside its feature tree' }}
+    caption="Live render · the same ordered feature history the product replays, solved here as exact geometry rather than a stored picture of it."
+  >
     <p class="eyebrow">Live from the feature tree</p>
     <h2>A parametric rebuild, replayed in front of you.</h2>
     <p class="lede">Every Chudware model is an ordered feature history — sketches, extrusions, fillets, holes — that can be edited and rebuilt deterministically. Watch one re-execute: the same operation stream the FeatureManager drives in the product, rendered here as an exact boolean field.</p>
     <div class="actions"><a class="button button-secondary" href="/product/modeling/">How modeling works</a></div>
-  </HeroCanvas>
+  </Showcase>
+
+  <Showcase
+    kind="machining"
+    flip
+    panelTitle="Operations"
+    panelDoc="bracket_v4 · Setup1"
+    rows={MACHINING_OPS}
+    kernel="Dexel stock · 384 × 262"
+    activeVerb="Running"
+    doneText="Simulation complete"
+    image={{ src: '/images/cam.png', width: 1340, height: 838, alt: 'Chudware manufacturing workspace showing a CAM job, stock, tools, operations, and toolpath simulation' }}
+    caption="Live render · toolpaths generated on the fly and swept through a dexel stock model, the way the product's simulation checks a job before it posts."
+  >
+    <p class="eyebrow">Live from the CAM job</p>
+    <h2>Stock in, part out — simulated before a spindle turns.</h2>
+    <p class="lede">Every operation in the Manufacture workspace produces a real toolpath, and the stock simulation sweeps the cutter through a model of the billet to show exactly what remains. Watch a facing pass, a pocket, three contour stepdowns, and four drilled holes turn a block of 6061 into a bracket, with the programmed path and the cutter's trail drawn on the surface as it goes.</p>
+    <div class="actions"><a class="button button-secondary" href="/product/cam/">How CAM works</a></div>
+  </Showcase>
 
   <section class="section workbench-section">
     <div class="wrap">
@@ -67,17 +97,11 @@ import Icon from '../components/Icon.astro';
         <h2>Keep design intent attached as the work moves downstream.</h2>
         <p class="lede">The feature tree, manufacturing plan, product data, artifacts, and copilot activity live in one engineering environment instead of being handed between disconnected tools.</p>
       </header>
-      <div class="workbench">
-        <figure class="workbench-image">
-          <img src="/images/cam.png" width="1340" height="838" loading="lazy" alt="Chudware manufacturing workspace showing a CAM job, stock, tools, operations, and toolpath simulation" />
-          <figcaption>Captured from Chudware's real manufacturing workspace.</figcaption>
-        </figure>
-        <ol class="workflow-list">
-          <li><span><Icon name="overview" /></span><div><h3>Model with intent</h3><p>Constrained sketches and ordered features keep dimensions, references, and revisions explicit.</p></div></li>
-          <li><span><Icon name="package" /></span><div><h3>Carry geometry into production</h3><p>Build CAM operations and inspect simulation alongside the source design.</p></div></li>
-          <li><span><Icon name="archive" /></span><div><h3>Trace the product</h3><p>PLM connects project history and artifacts to the engineering work that produced them.</p></div></li>
-        </ol>
-      </div>
+      <ol class="workflow-grid">
+        <li><span><Icon name="overview" /></span><div><h3>Model with intent</h3><p>Constrained sketches and ordered features keep dimensions, references, and revisions explicit.</p></div></li>
+        <li><span><Icon name="package" /></span><div><h3>Carry geometry into production</h3><p>Build CAM operations and inspect simulation alongside the source design.</p></div></li>
+        <li><span><Icon name="archive" /></span><div><h3>Trace the product</h3><p>PLM connects project history and artifacts to the engineering work that produced them.</p></div></li>
+      </ol>
     </div>
   </section>
 

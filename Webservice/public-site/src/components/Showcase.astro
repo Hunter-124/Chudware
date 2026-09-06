@@ -1,0 +1,73 @@
+---
+/**
+ * A live showcase: a raymarched render docked above the instrument panel that
+ * drives it, beside a copy column that arrives through the default slot.
+ *
+ * `kind` selects the renderer in `scripts/showcase.ts`; `rows` is the same
+ * timeline table that renderer reads, so the panel and the animation cannot
+ * drift. The server renders the real product screenshot; only once WebGL2
+ * hands back a live context does the script swap it for the canvas.
+ */
+interface Row { readonly label: string; readonly detail: string }
+
+interface Props {
+  kind: 'hero' | 'machining';
+  panelTitle: string;
+  panelDoc: string;
+  rows: readonly Row[];
+  /** Panel foot, left: what the engine underneath is. */
+  kernel: string;
+  /** Status verb while a row is live ("Rebuilding", "Cutting"). */
+  activeVerb: string;
+  /** Status text once the run completes. */
+  doneText: string;
+  image: { src: string; width: number; height: number; alt: string };
+  caption: string;
+  /** Visual on the left, copy on the right. */
+  flip?: boolean;
+}
+
+const { kind, panelTitle, panelDoc, rows, kernel, activeVerb, doneText, image, caption, flip = false } = Astro.props;
+---
+
+<section class="section showcase">
+  <div class:list={['wrap', 'showcase-grid', { 'showcase-grid-flip': flip }]}>
+    <div class="section-heading showcase-copy"><slot /></div>
+    <div class="showcase-visual" data-show={kind} data-show-active={activeVerb} data-show-done={doneText}>
+      <div class="showcase-box">
+        <figure class="showcase-shot">
+          <img src={image.src} width={image.width} height={image.height} loading="lazy" alt={image.alt} />
+        </figure>
+
+        <div class="showcase-stage">
+          <canvas class="showcase-canvas" data-show-canvas aria-hidden="true" hidden></canvas>
+        </div>
+
+        <figure class="showcase-panel" data-show-panel hidden>
+          <figcaption class="showcase-panel-head">
+            <span class="showcase-panel-title">{panelTitle}</span>
+            <span class="showcase-panel-doc">{panelDoc}</span>
+          </figcaption>
+          <ol class="showcase-rows">
+            {rows.map((row) => (
+              <li class="showcase-row" data-show-row data-show-label={row.label} data-state="done">
+                <span class="showcase-row-mark" aria-hidden="true"></span>
+                <span class="showcase-row-body">
+                  <span class="showcase-row-label">{row.label}</span>
+                  <span class="showcase-row-detail">{row.detail}</span>
+                </span>
+              </li>
+            ))}
+          </ol>
+          <div class="showcase-panel-foot">
+            <span>{kernel}</span>
+            <span class="showcase-status" data-show-status>{doneText}</span>
+          </div>
+        </figure>
+      </div>
+      <p class="showcase-caption">{caption}</p>
+    </div>
+  </div>
+</section>
+
+<script src="../scripts/showcase.ts"></script>

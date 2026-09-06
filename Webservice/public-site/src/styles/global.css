@@ -167,15 +167,11 @@
   .capability-index li::before { content: "/"; margin-right: var(--s2); color: var(--accent); font-family: var(--mono); }
   .architecture-layout { display: grid; grid-template-columns: minmax(0, .9fr) minmax(0, 1.1fr); gap: clamp(2rem, 8vw, 7rem); align-items: center; }
   .architecture-copy { margin-bottom: 0; }
-  .workbench { display: grid; grid-template-columns: minmax(0, 1.45fr) minmax(18rem, .55fr); gap: var(--s7); align-items: start; }
-  .workbench-image { min-width: 0; padding: var(--s2); border: var(--border) solid var(--line-hi); border-radius: var(--radius); background: var(--surface); }
-  .workbench-image img { width: 100%; height: auto; border-radius: var(--radius-sm); background: var(--bg-deep); object-fit: contain; }
-  .workbench-image figcaption { padding: var(--s3) var(--s2) var(--s1); color: var(--faint); font: var(--step--1)/1.5 var(--mono); }
-  .workflow-list { list-style: none; border-top: var(--border) solid var(--line); }
-  .workflow-list li { display: grid; grid-template-columns: auto 1fr; gap: var(--s4); padding-block: var(--s5); border-bottom: var(--border) solid var(--line); }
-  .workflow-list li > span { color: var(--technical); font: var(--step--1)/1.5 var(--mono); }
-  .workflow-list p { margin-top: var(--s2); color: var(--muted); font-size: var(--step--1); }
-  .workflow-list li > span .icon { width: var(--s5); height: var(--s5); }
+  .workflow-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: var(--s5); list-style: none; }
+  .workflow-grid li { display: grid; min-width: 0; gap: var(--s4); align-content: start; padding: var(--s5) 0 0; border-top: var(--border-strong) solid var(--line-hi); }
+  .workflow-grid li > span { color: var(--technical); }
+  .workflow-grid li > span .icon { width: var(--s5); height: var(--s5); }
+  .workflow-grid p { margin-top: var(--s2); color: var(--muted); font-size: var(--step--1); }
   .copilot-section { background: var(--surface); }
   .tool-loop { list-style: none; border-top: var(--border) solid var(--line-hi); }
   .tool-loop li { display: grid; grid-template-columns: minmax(5rem, .4fr) 1fr; gap: var(--s4); padding-block: var(--s5); border-bottom: var(--border) solid var(--line-hi); }
@@ -270,6 +266,41 @@
   .status-list { display: grid; margin-top: var(--s5); list-style: none; }
   .status-list li { display: flex; justify-content: space-between; gap: var(--s4); min-height: calc(var(--touch) + var(--s3)); align-items: center; padding-inline: var(--s5); border-bottom: var(--border) solid var(--line); }
   .status-list strong { color: var(--technical-hi); }
+
+  /* Live showcases: a raymarched render framed above the instrument panel that
+     drives it. The screenshot establishes the render's exact aspect ratio, so
+     the stage never crops or stretches the captured product UI it replaces. */
+  .showcase-grid { display: grid; grid-template-columns: minmax(0, .8fr) minmax(0, 1.2fr); gap: clamp(2rem, 6vw, 5rem); align-items: center; }
+  .showcase-grid-flip { grid-template-columns: minmax(0, 1.2fr) minmax(0, .8fr); }
+  .showcase-grid-flip > .showcase-copy { order: 2; }
+  .showcase-copy { margin-bottom: 0; align-self: center; }
+  .showcase-visual { position: relative; min-width: 0; }
+  .showcase-box { position: relative; display: grid; grid-template-columns: minmax(0, 1fr); grid-template-rows: auto auto; border: var(--border) solid var(--line-hi); border-radius: var(--radius); background: var(--bg-deep); box-shadow: var(--shadow); overflow: hidden; }
+  .showcase-shot { grid-area: 1 / 1; z-index: 0; min-width: 0; margin: 0; height: auto; background: var(--bg-deep); }
+  .showcase-shot img { display: block; width: 100%; height: auto; background: var(--bg-deep); object-fit: contain; }
+  .showcase-stage { position: relative; z-index: 1; grid-area: 1 / 1; min-width: 0; pointer-events: none; contain: strict; }
+  .showcase-canvas { display: block; width: 100%; height: 100%; opacity: 0; transition: opacity 1.1s var(--ease); }
+  .showcase-canvas[data-ready] { opacity: 1; }
+  .showcase-panel { position: relative; z-index: 2; grid-area: 2 / 1; margin: 0; border-width: var(--border) 0 0; border-style: solid; border-color: var(--line); background: var(--surface); font-family: var(--mono); }
+  .showcase-panel-head { display: flex; justify-content: space-between; gap: var(--s4); padding: var(--s2) var(--s3); border-bottom: var(--border) solid var(--line); font-size: var(--step--1); }
+  .showcase-panel-title { color: var(--technical); letter-spacing: .1em; text-transform: uppercase; }
+  .showcase-panel-doc { min-width: 0; overflow-wrap: anywhere; color: var(--faint); }
+  .showcase-rows { display: grid; margin: 0; padding: var(--s2) 0; list-style: none; }
+  .showcase-row { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: var(--s2); align-items: center; padding: var(--s1) var(--s3); border-left: var(--border-strong) solid transparent; transition: background .3s var(--ease), border-color .3s var(--ease); }
+  .showcase-row-mark { width: var(--s3); height: var(--s3); border: var(--border) solid var(--line-hi); border-radius: var(--radius-sm); transition: background .3s var(--ease), border-color .3s var(--ease), transform .3s var(--ease); }
+  .showcase-row-body { display: grid; min-width: 0; }
+  .showcase-row-label { color: var(--muted); font-size: var(--step--1); transition: color .3s var(--ease); }
+  .showcase-row-detail { overflow: hidden; color: var(--faint); font-size: var(--step--2); white-space: nowrap; text-overflow: ellipsis; }
+  .showcase-row[data-state="done"] .showcase-row-mark { border-color: var(--technical); background: color-mix(in srgb, var(--technical) 45%, transparent); }
+  .showcase-row[data-state="done"] .showcase-row-label { color: var(--text); }
+  .showcase-row[data-state="building"] { border-left-color: var(--accent); background: var(--accent-wash); }
+  .showcase-row[data-state="building"] .showcase-row-mark { border-color: var(--accent); background: var(--accent); transform: scale(1.15); }
+  .showcase-row[data-state="building"] .showcase-row-label { color: var(--text); }
+  .showcase-row[data-state="building"] .showcase-row-detail { color: var(--accent-hi); }
+  .showcase-row[data-state="pending"] { opacity: .4; }
+  .showcase-panel-foot { display: flex; flex-wrap: wrap; justify-content: space-between; gap: var(--s2) var(--s4); padding: var(--s2) var(--s3); border-top: var(--border) solid var(--line); color: var(--faint); font-size: var(--step--2); }
+  .showcase-status { color: var(--technical-hi); }
+  .showcase-caption { margin-top: var(--s3); color: var(--faint); font: var(--step--1)/1.5 var(--mono); }
 }
 
 @layer responsive {
@@ -290,7 +321,8 @@
     .architecture-strip { grid-template-columns: repeat(2, 1fr); }
     .architecture-strip div:nth-child(2) { border-right: 0; }
     .architecture-strip div:nth-child(-n+2) { border-bottom: var(--border) solid var(--line); }
-    .workbench { grid-template-columns: 1fr; }
+    .workflow-grid { grid-template-columns: 1fr; gap: var(--s4); }
+    .workflow-grid li { grid-template-columns: auto minmax(0, 1fr); padding-top: var(--s4); }
     .source-band { grid-template-columns: 1fr 1fr; }
     .source-band .text-link { grid-column: 1 / -1; }
     .access-contact { grid-template-columns: 1fr 1fr; }
@@ -298,6 +330,8 @@
     .platform-grid { grid-template-columns: 1fr 1fr; }
     .docs-shell { grid-template-columns: 13.75rem minmax(0, 1fr); gap: var(--s6); }
     .section { padding-block: var(--s8); }
+    .showcase-grid, .showcase-grid-flip { grid-template-columns: 1fr; }
+    .showcase-grid-flip > .showcase-copy { order: 0; }
   }
 
   @media (max-width: 45rem) {
@@ -325,6 +359,11 @@
     .docs-nav { max-height: 60vh; overflow-y: auto; padding: 0 var(--s3) var(--s3); }
     .docs-article { max-width: none; }
     .prose table { display: block; overflow-x: auto; }
+    /* Two columns of rows halves the panel's height under a phone-width render,
+       so the render and the instrument that drives it share one screen. */
+    .showcase-rows { grid-template-columns: 1fr 1fr; align-items: start; }
+    .showcase-row { padding-inline: var(--s2); }
+    .showcase-row-detail { white-space: normal; }
   }
 
   @media (max-width: 26.25rem) {
@@ -347,7 +386,7 @@
     @supports (animation-timeline: view()) {
       /* `translate` composes with the static card styling and leaves layout
          geometry untouched once the reveal fills. */
-      .section-heading, .pricing-note, .workbench, .tool-loop, .gallery-card, .access-option { animation: enter linear both; animation-timeline: view(); animation-range: entry 0% entry 28%; }
+      .section-heading, .pricing-note, .workflow-grid, .showcase-box, .tool-loop, .gallery-card, .access-option { animation: enter linear both; animation-timeline: view(); animation-range: entry 0% entry 28%; }
       @keyframes enter { from { opacity: .35; translate: 0 var(--s4); } to { opacity: 1; translate: none; } }
     }
 

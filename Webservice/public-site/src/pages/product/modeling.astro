@@ -1,6 +1,8 @@
 ---
 import BaseLayout from '../../layouts/BaseLayout.astro';
 import '../../styles/product.css';
+import Showcase from '../../components/Showcase.astro';
+import { HERO_STAGES } from '../../scripts/hero-timeline';
 ---
 <BaseLayout title="Parametric modeling" description="Constraint sketching, driving dimensions, ordered features, and the Feature Manager, working on exact solid geometry rather than a mesh approximation.">
   <header class="page-hero">
@@ -31,6 +33,22 @@ import '../../styles/product.css';
       </figure>
     </div>
   </section>
+
+  <Showcase
+    kind="hero"
+    panelTitle="FeatureManager"
+    panelDoc="bracket_v4.chud"
+    rows={HERO_STAGES}
+    kernel="Exact solids"
+    activeVerb="Rebuilding"
+    doneText="Rebuild complete"
+    image={{ src: '/images/modeling.png', width: 1340, height: 838, alt: 'The Chudware modeling workspace showing a shelled parametric enclosure beside its feature tree' }}
+    caption="Live render · the same ordered feature history the product replays, solved here as exact geometry rather than a stored picture of it."
+  >
+    <p class="eyebrow">Rebuild, replayed</p>
+    <h2>Every feature re-executes in order, every time.</h2>
+    <p class="lede">Edit a sketch dimension and the extrude, the boss, the fillet, the holes and the pockets after it are recomputed from that change, in that order. The FeatureManager is not a list of what happened; it is the program that produces the part.</p>
+  </Showcase>
 
   <section class="section" aria-labelledby="sketch-title">
     <div class="wrap split product-split-diagram">

@@ -41,6 +41,39 @@ from .cad_common import (
     sh,
 )
 
+
+def _solve_report(rebuild: dict) -> dict:
+    """Read the mate solve's verdict out of a doc_apply_ops/doc_solve_mates rebuild.
+
+    Returns {converged, worst_mate, worst_residual, tolerance, mates_over_defined,
+    worst: [(id, type, status, residual) worst-first, <=5], message}. `message` is
+    empty when the solve converged; otherwise it NAMES the mate holding it back and by
+    how much, which is the one thing a caller needs to fix a diverging network — the
+    engine used to report `doc_status.mates == "ok"` for a solve that never converged.
+    """
+    rb = rebuild if isinstance(rebuild, dict) else {}
+    mates = [m for m in (rb.get("mates") or []) if isinstance(m, dict)]
+    ranked = sorted(mates, key=lambda m: -float(m.get("residual") or 0.0))[:5]
+    worst = [{"id": m.get("id"), "type": m.get("type"), "status": m.get("status"),
+              "residual": float(m.get("residual") or 0.0)} for m in ranked]
+    converged = bool(rb.get("converged", True))
+    worst_mate = rb.get("worst_mate") or (worst[0]["id"] if worst else None)
+    worst_res = float(rb.get("max_residual") or 0.0)
+    over = bool(rb.get("over_defined", False))
+    msg = ""
+    if not converged:
+        msg = (f"mate solve did not converge: worst mate '{worst_mate}' "
+               f"residual {worst_res:.6g} (tolerance {float(rb.get('tolerance') or 0.0):.3g}; "
+               "units are mm for positional rows, dimensionless for direction rows). "
+               "Components stay near their authored poses — the solver no longer moves "
+               "an assembly it cannot solve. Fix or suppress that mate (check its align "
+               "sense and that both refs are the intended faces/axes), then re-solve.")
+        if over:
+            msg += " The network is also OVER-DEFINED; drop the redundant mate first."
+    return {"converged": converged, "worst_mate": worst_mate,
+            "worst_residual": worst_res, "tolerance": rb.get("tolerance"),
+            "mates_over_defined": over, "worst": worst, "message": msg}
+
 def register_cad_asm_tools(mcp: FastMCP) -> None:
     """CAD assembly + motion MCP tools (T-RF8 split of cad_tools.py): new_assembly, asm_add_component, asm_mate, solve_mates, simulate_motion, motion_fea_handoff, list_world_bodies."""
 
@@ -357,7 +390,16 @@ def register_cad_asm_tools(mcp: FastMCP) -> None:
                              d, ref["component"]) for ref in refs}}
             if solve:
                 sr = cb.call("doc_solve_mates", {"doc_id": d})
-                out["solve_status"] = (sr.get("rebuild") or {}).get("doc_status")
+                rb = sr.get("rebuild") or {}
+                out["solve_status"] = rb.get("doc_status")
+                rep = _solve_report(rb)
+                out["converged"] = rep["converged"]
+                out["mate_residuals"] = rep["worst"]
+                if not rep["converged"]:
+                    # The mate landed in the doc; the NETWORK is what failed. Say which
+                    # mate, so the next call fixes that one instead of rebuilding blind.
+                    out["solve_error"] = rep["message"]
+                    out["worst_mate"] = rep["worst_mate"]
                 wb = cb.call("asm_world_bodies", {"doc_id": d})
                 out["world_bodies"] = wb.get("bodies")
             _publish_current(d)
@@ -376,6 +418,11 @@ def register_cad_asm_tools(mcp: FastMCP) -> None:
         on a single part it returns a clear "not an assembly" error. Solves the mate network and
         returns the rebuilt assembly state. Follow with list_world_bodies to read where each
         component landed.
+
+        A solve that does NOT converge returns ok=False with `worst_mate`, `max_residual` and
+        a `mate_residuals` table (worst five, mm for positional rows). The components stay
+        near their authored poses in that case — the solver will not scatter an assembly it
+        cannot solve — so fix or suppress the named mate and call again.
         """
         try:
             d = _doc(doc_id)
@@ -386,8 +433,17 @@ def register_cad_asm_tools(mcp: FastMCP) -> None:
                     if isinstance(ref, dict):
                         note_placement_source(d, ref.get("component"), "mate")
             _publish_current(d)
-            return _dumps({"ok": True, "doc_id": d, "revision": r.get("revision"),
-                           "status": (r.get("rebuild") or {}).get("doc_status")})
+            rb = r.get("rebuild") or {}
+            rep = _solve_report(rb)
+            out = {"ok": rep["converged"], "doc_id": d, "revision": r.get("revision"),
+                   "status": rb.get("doc_status"), "converged": rep["converged"],
+                   "dof": rb.get("dof"), "over_defined": rep["mates_over_defined"],
+                   "max_residual": rep["worst_residual"], "tolerance": rep["tolerance"],
+                   "mate_residuals": rep["worst"]}
+            if not rep["converged"]:
+                out["error"] = rep["message"]
+                out["worst_mate"] = rep["worst_mate"]
+            return _dumps(out)
         except Exception as e:  # noqa: BLE001
             return _err(e)
 

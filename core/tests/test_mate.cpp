@@ -154,3 +154,140 @@ TEST_CASE("a fixed component's transform beats a stale warm entry") {
     auto k2 = out.transforms.at("k2");
     CHECK(std::abs(k2[7] - 7.0) < 1e-9);
 }
+
+// ME 490 phase 5A: a 20-mate network over 9 components at rover scale (~2 m) "diverged",
+// components landing thousands of mm from where they were authored, and the reply said
+// only that the solve had not converged. The mechanism was the random-restart escape:
+// when ANY mate was unsatisfiable the escape perturbed the rotation of EVERY free
+// component in the document and kept whichever restart scored a hair lower, so corners
+// that were perfectly seated came back scrambled. Two independent chains hang off the
+// fixed frame here; the second one carries a bore conflict that no pose can satisfy.
+TEST_CASE("one unsatisfiable mate cannot move a different chain") {
+    const Vector3d axle_a(668.0, -625.5, 190.0);   // left corner, satisfiable
+    const Vector3d axle_b(-668.0, -625.5, 190.0);  // right corner, over-constrained
+    const Vector3d out_dir(0, -1, 0);
+
+    json components = json::array();
+    components.push_back({{"id", "frame"}, {"transform", ident16()}, {"fixed", true}});
+    // Components imported from one merged STEP share the assembly's coordinate frame, so
+    // their local geometry sits ~2 m from their own origin and the authored transform is a
+    // small measured correction.
+    components.push_back({{"id", "hub_a"}, {"transform", xform({0.4, -0.2, 0.1}, {0, 0, 0})},
+                          {"fixed", false}});
+    components.push_back({{"id", "hub_b"}, {"transform", xform({-0.3, 0.2, 0.1}, {0, 0, 0})},
+                          {"fixed", false}});
+
+    json mates = json::array();
+    auto add_mate = [&](const std::string& id, const std::string& type,
+                        const std::string& cid) {
+        mates.push_back({{"id", id}, {"type", type}, {"align", "aligned"},
+                         {"refs", {{{"component", "frame"}}, {{"component", cid}}}}});
+    };
+    add_mate("a_bore", "concentric", "hub_a");
+    add_mate("a_face", "coincident", "hub_a");
+    add_mate("b_bore", "concentric", "hub_b");
+    add_mate("b_face", "coincident", "hub_b");
+    add_mate("b_wrong_bore", "concentric", "hub_b");  // the mistake: a parallel bore 5 mm over
+
+    json input;
+    input["components"] = components;
+    input["mates"] = mates;
+    input["resolved_geometry"] = json::array({
+        geom_entry("a_bore", 0, "axis", axle_a, {0, 0, 1}, out_dir, 25.0),
+        geom_entry("a_bore", 1, "axis", axle_a, {0, 0, 1}, out_dir, 25.0),
+        geom_entry("a_face", 0, "plane", axle_a, out_dir, {0, 0, 1}, 0.0),
+        geom_entry("a_face", 1, "plane", axle_a, -out_dir, {0, 0, 1}, 0.0),
+        geom_entry("b_bore", 0, "axis", axle_b, {0, 0, 1}, out_dir, 25.0),
+        geom_entry("b_bore", 1, "axis", axle_b, {0, 0, 1}, out_dir, 25.0),
+        geom_entry("b_face", 0, "plane", axle_b, out_dir, {0, 0, 1}, 0.0),
+        geom_entry("b_face", 1, "plane", axle_b, -out_dir, {0, 0, 1}, 0.0),
+        geom_entry("b_wrong_bore", 0, "axis", axle_b + Vector3d(5.0, 0, 0), {0, 0, 1},
+                   out_dir, 25.0),
+        geom_entry("b_wrong_bore", 1, "axis", axle_b, {0, 0, 1}, out_dir, 25.0),
+    });
+
+    json out = solve_mates_json(input);
+    REQUIRE_FALSE(out["converged"].get<bool>());
+
+    // The report NAMES what is holding the solve back, worst first. The 5 mm bore
+    // conflict splits evenly, so BOTH of hub_b's bore mates carry ~2.5 mm and either
+    // may head the list; every other mate is seated to numerical zero.
+    REQUIRE(out["residuals"].size() == 5);
+    const std::string worst = out["worst_mate"].get<std::string>();
+    CHECK((worst == "b_bore" || worst == "b_wrong_bore"));
+    CHECK(out["residuals"][0]["mate_id"].get<std::string>() == worst);
+    CHECK(out["residuals"][0]["max_abs"].get<double>() == doctest::Approx(2.5).epsilon(0.01));
+    CHECK(out["residuals"][1]["max_abs"].get<double>() == doctest::Approx(2.5).epsilon(0.01));
+    CHECK(out["residuals"][2]["max_abs"].get<double>() < 1e-6);
+    for (size_t i = 1; i < out["residuals"].size(); ++i)
+        CHECK(out["residuals"][i]["max_abs"].get<double>()
+              <= out["residuals"][i - 1]["max_abs"].get<double>());
+    CHECK(out["over_defined"].get<bool>());
+    for (const auto& s : out["mate_status"])
+        if (s["mate_id"].get<std::string>() == "b_wrong_bore")
+            CHECK(s["status"].get<std::string>() == "conflicting");
+
+    // The satisfiable chain SEATS: hub_a takes up its own 0.46 mm of authored error and
+    // nothing more, and its two mates read zero. It used to come back from the restart
+    // escape rotated into a different branch, hundreds of mm away.
+    auto ta = out["transforms"]["hub_a"].get<std::vector<double>>();
+    CHECK(Vector3d(ta[3] - 0.4, ta[7] + 0.2, ta[11] - 0.1).norm() < 1.0);
+    for (const auto& r : out["residuals"])
+        if (r["mate_id"].get<std::string>()[0] == 'a')
+            CHECK(r["max_abs"].get<double>() < 1e-6);
+
+    // The failing chain settles on the least-squares compromise (half of the 5 mm bore
+    // offset) near its authored pose instead of being launched across the assembly.
+    auto tb = out["transforms"]["hub_b"].get<std::vector<double>>();
+    CHECK(Vector3d(tb[3] + 0.3, tb[7] - 0.2, tb[11] - 0.1).norm() < 10.0);
+}
+
+// The convergence threshold is quoted for a ~100 mm part. Held flat, it is a threshold on
+// an ABSOLUTE length while the achievable residual scales with the lever arms of the model
+// — so a large, perfectly seated assembly is reported as a failed solve and the caller
+// falls back to authored transforms for no reason. The threshold now scales with the
+// model's own size and is reported alongside the result.
+TEST_CASE("the convergence tolerance scales with the assembly") {
+    auto seat = [](double reach, Vector3d t_err, Vector3d w_err) {
+        const Vector3d axle(reach, 0.0, 0.0);
+        json components = json::array();
+        components.push_back({{"id", "frame"}, {"transform", ident16()}, {"fixed", true}});
+        components.push_back({{"id", "hub"}, {"transform", xform(t_err, w_err)},
+                              {"fixed", false}});
+        json mates = json::array();
+        mates.push_back({{"id", "bore"}, {"type", "concentric"}, {"align", "aligned"},
+                         {"refs", {{{"component", "frame"}}, {{"component", "hub"}}}}});
+        mates.push_back({{"id", "face"}, {"type", "coincident"}, {"align", "aligned"},
+                         {"refs", {{{"component", "frame"}}, {{"component", "hub"}}}}});
+        json input;
+        input["components"] = components;
+        input["mates"] = mates;
+        input["resolved_geometry"] = json::array({
+            geom_entry("bore", 0, "axis", axle, {0, 0, 1}, {0, 1, 0}, 20.0),
+            geom_entry("bore", 1, "axis", axle, {0, 0, 1}, {0, 1, 0}, 20.0),
+            geom_entry("face", 0, "plane", axle, {0, 1, 0}, {0, 0, 1}, 0.0),
+            geom_entry("face", 1, "plane", axle, {0, -1, 0}, {0, 0, 1}, 0.0),
+        });
+        return solve_mates_json(input);
+    };
+
+    // At or below the 100 mm reference the threshold is the caller's, unchanged.
+    json small = seat(60.0, {0.7, -0.4, 0.25}, {0, 0, 0});
+    CHECK(small["converged"].get<bool>());
+    CHECK(small["tolerance"].get<double>() == doctest::Approx(1e-9));
+
+    json rover = seat(2000.0, {0.7, -0.4, 0.25}, {0, 0, 0});
+    CHECK(rover["converged"].get<bool>());
+    CHECK(rover["tolerance"].get<double>() == doctest::Approx(2e-8));
+    CHECK(rover["max_residual"].get<double>() <= rover["tolerance"].get<double>());
+
+    // A 20 m assembly a tenth of a micro-radian off its seat: the mates are satisfiable
+    // and the solve settles at ~5e-8 mm — a thousandth of an atom across twenty metres —
+    // but it cannot reach 1e-9 mm, so the flat threshold called this seated assembly
+    // divergent and its caller fell back to authored transforms for nothing.
+    json big = seat(20000.0, {0, 0, 0}, {0, 0, 1e-7});
+    CHECK(big["converged"].get<bool>());
+    CHECK(big["tolerance"].get<double>() == doctest::Approx(2e-7));
+    CHECK(big["max_residual"].get<double>() > 1e-9);
+    CHECK(big["max_residual"].get<double>() <= big["tolerance"].get<double>());
+}

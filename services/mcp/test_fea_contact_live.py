@@ -39,13 +39,16 @@ FORCE_N = 4000.0
 # The packet is a contract: an agent reading `contact` must find exactly these keys.
 CONTACT_KEYS = {
     "enabled", "max_gap_mm", "penalty_scale", "penalty_stiffness_n_per_mm",
-    "max_iterations", "candidate_pairs", "active_pairs", "contact_iterations",
-    "converged", "tangential_stabilization", "tangential_force_fraction",
+    "interface_size_mm", "max_iterations", "candidate_pairs", "active_pairs",
+    "contact_iterations", "converged", "tangential_stabilization",
+    "tangential_force_fraction", "candidate_area_mm2", "contact_area_mm2",
+    "mean_contact_pressure_mpa", "contact_pressure_reliable", "resolution",
     "held_by_contact_only", "pairs",
 }
 PAIR_KEYS = {
     "bodies", "candidate_pairs", "active_pairs", "contact_force_n", "force_vector_n",
-    "max_contact_pressure_mpa", "max_penetration_mm",
+    "contact_area_mm2", "mean_contact_pressure_mpa", "max_contact_pressure_mpa",
+    "max_penetration_mm",
 }
 
 

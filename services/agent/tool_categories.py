@@ -223,6 +223,9 @@ CATEGORY_PACKS: dict[str, list[str]] = {
         # stays as-is, since ordinary part work does not release an FEA case every turn.
         "run_fea_convergence",
         "sim_evidence_packet",
+        # verify_packet is the read-back: a packet folder can only be cited once its
+        # files are proven to describe the same run (2026-09-06).
+        "verify_packet",
         "polymesh_cli",
         "family:em",
     ],

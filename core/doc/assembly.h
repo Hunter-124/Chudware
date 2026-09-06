@@ -64,6 +64,10 @@ struct AsmMateStatus {
     std::string type;
     std::string status;                      // ok|redundant|conflicting|suppressed|unresolved
     std::vector<std::string> dangling_refs;
+    // Largest absolute entry of this mate's residual at the solved pose (mm for the
+    // positional rows, dimensionless for the direction rows). 0 for a mate that
+    // contributed no rows (suppressed / unresolved).
+    double residual = 0.0;
 };
 
 // One RESOLVED mate reference: which component owns it + the local-frame geometry
@@ -84,6 +88,9 @@ struct AssemblyResult {
     int dof = 0;
     bool over_defined = false;
     bool converged = true;
+    double max_residual = 0.0;               // worst residual over every active mate
+    double tolerance = 0.0;                  // the size-scaled threshold `converged` used
+    std::string worst_mate;                  // mate id owning max_residual ("" if none)
     std::string dof_summary;
     std::map<std::string, std::vector<double>> transforms;  // component_id -> 16f (solved)
     chudware::mate::WarmMap warm;                               // component_id -> (t,w)

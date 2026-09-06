@@ -83,9 +83,22 @@ uint64_t free_envelope(const HostMem& m) {
 // refused with a message. We therefore walk our own cgroup path to the root and
 // take the smallest finite limit: memory.max is the hard kill line, memory.high a
 // soft throttle a solve must still not live above (it would thrash reclaim), so
-// the min of both is used. The limit is shared with every other process in that
-// cgroup, so what is actually claimable is limit - memory.current + our own RSS
-// (our RSS is already counted inside memory.current).
+// the smaller of the two is used — and each is honoured ONLY when it is finite
+// ("max"/absent must never win that comparison).
+//
+// The limit is shared with the other processes in that cgroup, so what is really
+// claimable is limit - (what they hold). What they hold is measured from
+// memory.stat `anon` + `shmem`, NEVER from memory.current: memory.current also
+// counts the PAGE CACHE and every other file-backed page charged to the cgroup,
+// which is reclaimable under pressure and is not what a solve competes for. That
+// distinction is not academic — a 10 GB `systemd-run --scope -p MemoryMax=10G`
+// holding the ME-490 mission driver, its python worker and chudware-hostd had
+// streamed STEP/VTU through the page cache until memory.current sat within a few
+// hundred MB of the limit, and `limit - (memory.current - own_rss)` collapsed the
+// whole budget to 0.4 GB. run_fea_static then refused a study the scope had 8+ GB
+// of anonymous room for, twice. Our own contribution is likewise our own ANON
+// RSS, not total RSS: total RSS counts our mapped binaries and file pages, which
+// are charged to `file`, so subtracting it from an anon figure over-credits us.
 
 // One cgroup control file as bytes; UINT64_MAX when absent, unparsable or "max".
 uint64_t cgroup_file_bytes(const std::string& path) {
@@ -102,45 +115,104 @@ uint64_t cgroup_file_bytes(const std::string& path) {
     return out;
 }
 
-// Bytes still claimable inside our own cgroup; UINT64_MAX when uncapped (no
-// cgroup v2, no finite limit anywhere on the path) so behaviour is unchanged.
-uint64_t cgroup_available_bytes() {
-#if defined(_WIN32) || defined(__APPLE__)
-    return UINT64_MAX;
-#else
-    std::string rel;
-    if (FILE* f = std::fopen("/proc/self/cgroup", "r")) {
-        char line[512];
-        while (std::fgets(line, sizeof line, f)) {
-            // Unified (v2) line only: "0::/user.slice/…"; v1 lines name controllers.
-            if (std::strncmp(line, "0::", 3) != 0) continue;
-            rel = line + 3;
-            while (!rel.empty() && (rel.back() == '\n' || rel.back() == '\r')) rel.pop_back();
-            break;
+// One key out of a flat "<key> <bytes>" file (memory.stat); 0 when absent.
+uint64_t cgroup_stat_bytes(const std::string& path, const char* key) {
+    uint64_t out = 0;
+    if (FILE* f = std::fopen(path.c_str(), "r")) {
+        char k[64] = {0};
+        unsigned long long v = 0;
+        while (std::fscanf(f, "%63s %llu", k, &v) == 2) {
+            if (std::strcmp(k, key) == 0) {
+                out = static_cast<uint64_t>(v);
+                break;
+            }
         }
         std::fclose(f);
     }
-    if (rel.empty() || rel[0] != '/') return UINT64_MAX;
-    const std::string root = "/sys/fs/cgroup";
-    uint64_t best = UINT64_MAX;
-    uint64_t best_current = 0;
+    return out;
+}
+
+// Our own ANONYMOUS resident set in bytes — what this process contributes to the
+// cgroup's `anon` counter, and therefore the only honest thing to add back when
+// subtracting "what the others hold". Falls back to total RSS when unknowable.
+uint64_t process_anon_rss_bytes() {
+#if defined(_WIN32) || defined(__APPLE__)
+    return process_rss_bytes();
+#else
+    if (FILE* f = std::fopen("/proc/self/status", "r")) {
+        char line[256];
+        while (std::fgets(line, sizeof line, f)) {
+            unsigned long long kb = 0;
+            if (std::sscanf(line, "RssAnon: %llu kB", &kb) == 1) {
+                std::fclose(f);
+                return kb * 1024ull;
+            }
+        }
+        std::fclose(f);
+    }
+    return process_rss_bytes();
+#endif
+}
+
+// Our cgroup's binding memory limit and what the OTHER processes in it hold.
+// limit == UINT64_MAX means uncapped (no cgroup v2, no finite limit on the path)
+// and the whole term is inert, so behaviour is unchanged off-cgroup.
+struct CgroupMem {
+    uint64_t limit = UINT64_MAX;
+    uint64_t others = 0;
+    bool capped() const { return limit != UINT64_MAX; }
+    uint64_t claimable() const { return (limit > others) ? (limit - others) : 0; }
+};
+
+CgroupMem cgroup_mem() {
+#if defined(_WIN32) || defined(__APPLE__)
+    return {};
+#else
+    // CHUDWARE_CGROUP_ROOT replaces /sys/fs/cgroup AND the /proc/self/cgroup
+    // lookup: the named directory is then treated as THE cgroup (leaf == root),
+    // so the ancestor walk starts and ends there. Tests fake the control files
+    // with it; it is also the way to replay a container's own view by hand.
+    const char* override_root = std::getenv("CHUDWARE_CGROUP_ROOT");
+    std::string root = "/sys/fs/cgroup";
+    std::string rel = "/";
+    if (override_root && override_root[0]) {
+        root = override_root;
+    } else {
+        rel.clear();
+        if (FILE* f = std::fopen("/proc/self/cgroup", "r")) {
+            char line[512];
+            while (std::fgets(line, sizeof line, f)) {
+                // Unified (v2) line only: "0::/user.slice/…"; v1 lines name controllers.
+                if (std::strncmp(line, "0::", 3) != 0) continue;
+                rel = line + 3;
+                while (!rel.empty() && (rel.back() == '\n' || rel.back() == '\r'))
+                    rel.pop_back();
+                break;
+            }
+            std::fclose(f);
+        }
+        if (rel.empty() || rel[0] != '/') return {};
+    }
+    CgroupMem out;
+    uint64_t usage = 0;  // anon + shmem of the cgroup that owns the binding limit
     for (;;) {
         const std::string dir = root + ((rel == "/") ? std::string() : rel);
-        const uint64_t lim = std::min(cgroup_file_bytes(dir + "/memory.max"),
-                                      cgroup_file_bytes(dir + "/memory.high"));
-        if (lim < best) {
-            best = lim;
-            const uint64_t cur = cgroup_file_bytes(dir + "/memory.current");
-            best_current = (cur == UINT64_MAX) ? 0 : cur;
+        uint64_t lim = cgroup_file_bytes(dir + "/memory.max");
+        const uint64_t high = cgroup_file_bytes(dir + "/memory.high");
+        if (high < lim) lim = high;  // both are UINT64_MAX when unset: stays inert
+        if (lim < out.limit) {
+            out.limit = lim;
+            const std::string stat = dir + "/memory.stat";
+            usage = cgroup_stat_bytes(stat, "anon") + cgroup_stat_bytes(stat, "shmem");
         }
         if (rel == "/") break;
         const std::size_t slash = rel.rfind('/');
         rel = (slash == 0) ? std::string("/") : rel.substr(0, slash);
     }
-    if (best == UINT64_MAX) return UINT64_MAX;
-    const uint64_t own = process_rss_bytes();
-    const uint64_t others = (best_current > own) ? (best_current - own) : 0;
-    return (best > others) ? (best - others) : 0;
+    if (!out.capped()) return {};
+    const uint64_t own = process_anon_rss_bytes();
+    out.others = (usage > own) ? (usage - own) : 0;
+    return out;
 #endif
 }
 
@@ -157,6 +229,8 @@ enum class Term { Frac, Cap, Free, Floor, Cgroup };
 struct BudgetCalc {
     uint64_t bytes = 0;
     Term binding = Term::Frac;
+    uint64_t cg_limit = UINT64_MAX;  // binding cgroup limit (UINT64_MAX = uncapped)
+    uint64_t cg_others = 0;          // anon+shmem held by the rest of that cgroup
 };
 
 BudgetCalc compute_budget(const HostMem& m) {
@@ -186,11 +260,25 @@ BudgetCalc compute_budget(const HostMem& m) {
         out.bytes = floor_b;
         out.binding = Term::Floor;
     }
-    // Hard cgroup cap (systemd MemoryMax / container limit): outranks the floor.
-    const uint64_t cg = cgroup_available_bytes();
-    if (cg < out.bytes) {
-        out.bytes = cg;
-        out.binding = Term::Cgroup;
+    // Hard cgroup cap (systemd MemoryMax / container limit): outranks the floor,
+    // because crossing it is a SIGKILL and not merely a slow box.
+    //
+    // The SUBTRACTION of what our cgroup siblings hold, however, is an estimate of
+    // a moving target, and it gets the same small-job floor the host terms get: a
+    // sibling's transient GB may not turn a 10 GB scope into a budget that refuses
+    // every real study. So the term is max(claimable, min(floor, limit)) — the
+    // floor still applies, but it can never lift the budget above the kill line
+    // itself, and a cgroup limit BELOW the floor (a deliberately tiny container)
+    // binds at that limit with no rescue.
+    const CgroupMem cg = cgroup_mem();
+    out.cg_limit = cg.limit;
+    out.cg_others = cg.others;
+    if (cg.capped()) {
+        const uint64_t cg_bytes = std::max(cg.claimable(), std::min(floor_b, cg.limit));
+        if (cg_bytes < out.bytes) {
+            out.bytes = cg_bytes;
+            out.binding = Term::Cgroup;
+        }
     }
     return out;
 }
@@ -198,9 +286,12 @@ BudgetCalc compute_budget(const HostMem& m) {
 // Which limit produced the budget, and the ONLY knob that moves it. Every branch
 // names the knob vocabulary (CHUDWARE_MEM_FRAC / CHUDWARE_MEM_CAP_GB /
 // CHUDWARE_HEADROOM_GB) so the message is actionable whichever term won —
-// including saying which knobs are useless right now.
-const char* binding_text(Term t) {
-    switch (t) {
+// including saying which knobs are useless right now. The cgroup branch also
+// names how much of the limit the OTHER processes in the cgroup hold: without
+// that number a 10 GB scope reporting a 0.4 GB budget looks like a governor bug
+// instead of what it is — the driver and the daemon sharing the same cap.
+std::string binding_text(const BudgetCalc& b) {
+    switch (b.binding) {
         case Term::Cap:
             return "binding limit: CHUDWARE_MEM_CAP_GB — raise it; CHUDWARE_MEM_FRAC "
                    "and CHUDWARE_HEADROOM_GB cannot help while the cap binds";
@@ -212,12 +303,19 @@ const char* binding_text(Term t) {
             return "binding limit: the small-job floor min(3 GB, 40% of RAM) — this "
                    "machine is too small for the study; CHUDWARE_MEM_FRAC and "
                    "CHUDWARE_MEM_CAP_GB cannot raise a floor";
-        case Term::Cgroup:
-            return "binding limit: cgroup memory.max — this process runs inside a "
-                   "memory-capped cgroup (systemd MemoryMax / container limit) minus "
-                   "what the rest of that cgroup already uses; raise the cgroup limit; "
-                   "CHUDWARE_MEM_FRAC, CHUDWARE_MEM_CAP_GB and CHUDWARE_HEADROOM_GB "
-                   "cannot raise it";
+        case Term::Cgroup: {
+            char buf[512];
+            std::snprintf(
+                buf, sizeof buf,
+                "binding limit: cgroup memory limit %.1f GB — this process runs inside "
+                "a memory-capped cgroup (systemd MemoryMax / container limit), and the "
+                "other processes sharing it hold %.1f GB of that limit (anonymous + "
+                "shmem), leaving %.1f GB for this solve; give the solve its own scope or "
+                "raise the cgroup limit; CHUDWARE_MEM_FRAC, CHUDWARE_MEM_CAP_GB and "
+                "CHUDWARE_HEADROOM_GB cannot raise it",
+                gb(b.cg_limit), gb(b.cg_others), gb(b.bytes));
+            return buf;
+        }
         case Term::Frac:
         default:
             return "binding limit: CHUDWARE_MEM_FRAC x total RAM — raise "
@@ -434,13 +532,13 @@ bool admit(uint64_t estimate_bytes, const char* what, std::string& why) {
         return true;
     }
     const HostMem m = host_mem();
-    char buf[512];
+    char buf[1024];
     std::snprintf(buf, sizeof buf,
                   "%s needs an estimated %.1f GB but this machine's budget is %.1f GB "
                   "(%.0f GB RAM, %.1f GB available; %s) — use a coarser mesh / fewer "
                   "cells / first-order elements, or change the binding limit",
                   what && what[0] ? what : "this study", gb(estimate_bytes), gb(budget),
-                  gb(m.total), gb(m.avail), binding_text(compute_budget(m).binding));
+                  gb(m.total), gb(m.avail), binding_text(compute_budget(m)).c_str());
     why = buf;
     store_report(buf);
     return false;
@@ -481,11 +579,12 @@ bool admit_fea(uint64_t n_elements, int nodes_per_element, int dof_per_node,
                const char* what, std::string& why) {
     const uint64_t est = fea_peak_bytes(n_elements, nodes_per_element, dof_per_node);
     if (admit(est, what, why)) return true;
-    char buf[768];
-    std::snprintf(buf, sizeof buf, "%s [estimate basis: %s]", why.c_str(),
-                  fea_calibration_basis());
-    why = buf;
-    store_report(buf);
+    // std::string, not a fixed buffer: the refusal already carries the binding-term
+    // explanation (the cgroup branch alone is ~400 chars) and must not be truncated.
+    why += " [estimate basis: ";
+    why += fea_calibration_basis();
+    why += "]";
+    store_report(why);
     return false;
 }
 

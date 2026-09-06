@@ -3,8 +3,10 @@
 #include "sim/fea_contact.h"
 
 #include <algorithm>
+#include <cstdio>
 #include <cmath>
 #include <map>
+#include <set>
 #include <unordered_map>
 #include <vector>
 
@@ -177,6 +179,14 @@ ContactCandidateSet fea_contact_candidates(const std::vector<double>& points,
         }
     }
     std::vector<std::vector<NodeDir>> node_dirs(static_cast<std::size_t>(n_nodes));
+    // Local SURFACE element size per node: the mean of the (corner) edge lengths of
+    // the boundary faces incident on it. This is the length that decides whether a
+    // clearance is resolved — not the study's background size, which on a locally
+    // refined interface is a different number entirely. For tet10 the mid-edge nodes
+    // inherit their face's corner-edge length: the ELEMENT edge is what resolves a
+    // feature, and a mid node placed on it does not make the element smaller.
+    std::vector<double> node_surface_h(static_cast<std::size_t>(n_nodes), 0.0);
+    std::vector<int> node_surface_faces(static_cast<std::size_t>(n_nodes), 0);
     for (int e = 0; e < n_el; ++e) {
         const int* el = &tets[static_cast<std::size_t>(e) * stride];
         for (int f = 0; f < n_faces; ++f) {
@@ -224,8 +234,19 @@ ContactCandidateSet fea_contact_candidates(const std::vector<double>& points,
                 n_fn = 6;
             }
             const double share = area / static_cast<double>(n_fn);
-            for (int i = 0; i < n_fn; ++i)
+            double edge_sum = 0.0;
+            for (int i = 0; i < fk; ++i) {
+                const double* pa = &points[static_cast<std::size_t>(cn[i]) * 3];
+                const double* pb = &points[static_cast<std::size_t>(cn[(i + 1) % fk]) * 3];
+                const double dx = pa[0] - pb[0], dy = pa[1] - pb[1], dz = pa[2] - pb[2];
+                edge_sum += std::sqrt(dx * dx + dy * dy + dz * dz);
+            }
+            const double face_h = edge_sum / static_cast<double>(fk);
+            for (int i = 0; i < n_fn; ++i) {
                 add_direction(node_dirs[static_cast<std::size_t>(fn[i])], normal, share);
+                node_surface_h[static_cast<std::size_t>(fn[i])] += face_h;
+                ++node_surface_faces[static_cast<std::size_t>(fn[i])];
+            }
         }
     }
     std::vector<int> surface;
@@ -361,7 +382,124 @@ ContactCandidateSet fea_contact_candidates(const std::vector<double>& points,
             out.springs.push_back(s);
         }
     }
+
+    // ── Interface resolution facts (see fea_contact.h ContactResolution) ────────
+    // Measured on the candidate set that was just built, so a locally refined
+    // interface reports its own refined size and gaps rather than the study's
+    // background numbers.
+    if (!out.springs.empty()) {
+        std::vector<double> h_at_pair;
+        std::vector<double> gaps;
+        h_at_pair.reserve(out.springs.size());
+        gaps.reserve(out.springs.size());
+        auto node_h = [&](int nid) {
+            const std::size_t at = static_cast<std::size_t>(nid);
+            return node_surface_faces[at] > 0
+                       ? node_surface_h[at] / static_cast<double>(node_surface_faces[at])
+                       : 0.0;
+        };
+        // Tributary area is a NODE property and the search pairs from both sides,
+        // so one node can appear in two pairs: count each node's area once (node
+        // `a` is always on the lower component ordinal, so this measures exactly
+        // one side of the interface).
+        std::set<int> area_counted;
+        for (const ContactSpring& s : out.springs) {
+            // The COARSER of the two sides governs: it is the side that decides how
+            // many pairs land in the closing zone.
+            h_at_pair.push_back(std::max(node_h(s.a), node_h(s.b)));
+            gaps.push_back(s.gap0_mm);
+            if (area_counted.insert(s.a).second) out.candidate_area_mm2 += s.area_mm2;
+        }
+        auto median_of = [](std::vector<double>& v) {
+            const std::size_t mid = v.size() / 2;
+            std::nth_element(v.begin(), v.begin() + static_cast<std::ptrdiff_t>(mid),
+                             v.end());
+            return v[mid];
+        };
+        out.min_gap0_mm = *std::min_element(gaps.begin(), gaps.end());
+        std::vector<double> gaps_copy = gaps;
+        out.median_gap0_mm = median_of(gaps_copy);
+        out.interface_h_mm = median_of(h_at_pair);
+        // "Can seat": within twice the closest approach. A pair whose initial gap is
+        // more than that needs the interface to deform by more than the clearance
+        // itself before it touches, which is outside small-deflection contact.
+        const double seat_limit = out.min_gap0_mm > 0.0 ? 2.0 * out.min_gap0_mm : 0.0;
+        for (double gap : gaps)
+            if (gap <= seat_limit) ++out.seatable_pairs;
+    }
     return out;
+}
+
+ContactResolution fea_contact_resolution(const ContactCandidateSet& candidates) {
+    ContactResolution out;
+    out.min_active_pairs = kContactMinActivePairs;
+    out.max_ratio = kContactMaxHOverGap;
+    out.candidate_pairs = static_cast<int>(candidates.springs.size());
+    out.seatable_pairs = candidates.seatable_pairs;
+    out.h_interface_mm = candidates.interface_h_mm;
+    // The clearance the discretization has to resolve is the interface's own closest
+    // approach. A set whose closest pair is TOUCHING or interfering (gap <= 0) has no
+    // clearance to resolve: the ratio is left at 0 and only the a-posteriori
+    // active-pair clause can refuse such an interface.
+    out.gap_mm = candidates.min_gap0_mm > 0.0 ? candidates.min_gap0_mm : 0.0;
+    out.ratio = out.gap_mm > 0.0 ? out.h_interface_mm / out.gap_mm : 0.0;
+    // The size that resolves this clearance: kMaxHOverGap elements' worth of it, and
+    // never coarser than half the size that failed (an interface that funnelled at a
+    // legal ratio still has to be refined to place more pairs).
+    const double from_gap = out.gap_mm > 0.0 ? kContactMaxHOverGap * out.gap_mm
+                                             : out.h_interface_mm * 0.5;
+    out.required_interface_size_mm =
+        out.h_interface_mm > 0.0 ? std::min(from_gap, out.h_interface_mm * 0.5)
+                                 : from_gap;
+    if (candidates.springs.empty()) return out;
+    if (out.ratio > kContactMaxHOverGap && out.seatable_pairs < kContactMinActivePairs) {
+        char text[640];
+        std::snprintf(
+            text, sizeof(text),
+            "the contact interface is not resolved by this mesh: the element size AT "
+            "the interface is %.4g mm against a %.4g mm clearance (ratio %.1f, limit "
+            "%.0f), and only %d of %d candidate pairs sit within twice the closest "
+            "approach — so any load would funnel through those few nodes and be "
+            "reported as a contact pressure. Set contact.interface_size_mm to %.3g "
+            "(mm) or finer: it refines the candidate faces LOCALLY, so the interface "
+            "is resolved without meshing the whole part that fine",
+            out.h_interface_mm, out.gap_mm, out.ratio, kContactMaxHOverGap,
+            out.seatable_pairs, out.candidate_pairs, out.required_interface_size_mm);
+        out.reason = text;
+        out.resolved = false;
+    }
+    return out;
+}
+
+void fea_contact_resolution_after_solve(ContactResolution& resolution,
+                                        int active_pairs, double contact_force_n,
+                                        double contact_area_mm2) {
+    resolution.active_pairs = active_pairs;
+    resolution.contact_area_mm2 = contact_area_mm2;
+    resolution.pressure_reliable = resolution.resolved &&
+                                   active_pairs >= resolution.min_active_pairs &&
+                                   contact_area_mm2 > 0.0;
+    if (!resolution.resolved) return;
+    // Load crossed the interface through too few pairs. This is the clause that
+    // catches the case the a-priori one cannot see: a geometry whose candidates look
+    // fine until the solve reveals that only a couple of them ever touch.
+    if (active_pairs < resolution.min_active_pairs && contact_force_n > 0.0) {
+        char text[640];
+        std::snprintf(
+            text, sizeof(text),
+            "the contact load crossed this interface through %d active pair(s) of %d "
+            "candidates, carrying %.4g N: fewer than %d pairs cannot represent a "
+            "distributed contact patch, so the reported pressure is a point-load "
+            "artefact of the %.4g mm interface element size (clearance %.4g mm). Set "
+            "contact.interface_size_mm to %.3g (mm) or finer — it refines the "
+            "candidate faces LOCALLY, not the whole part",
+            active_pairs, resolution.candidate_pairs, contact_force_n,
+            resolution.min_active_pairs, resolution.h_interface_mm, resolution.gap_mm,
+            resolution.required_interface_size_mm);
+        resolution.reason = text;
+        resolution.resolved = false;
+        resolution.pressure_reliable = false;
+    }
 }
 
 }  // namespace chudware::sim

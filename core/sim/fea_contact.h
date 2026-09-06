@@ -46,6 +46,26 @@ struct ContactCandidateSet {
     // pairing scale.
     double char_len_mm = 0.0;
     int surface_nodes = 0;
+    // ── Interface resolution facts, measured ON the candidate set ───────────────
+    // The element size AT THE INTERFACE, not the study's background size: the median
+    // over candidate pairs of the mean boundary-face edge length incident on the
+    // pair's own node. A locally refined interface reads its refined size here even
+    // though the bulk mesh is coarse, which is the whole point of the number.
+    double interface_h_mm = 0.0;
+    // The candidate set's own gaps (mm, signed as ContactSpring::gap0_mm):
+    // closest approach, and the median.
+    double min_gap0_mm = 0.0;
+    double median_gap0_mm = 0.0;
+    // Candidates whose initial gap is within twice the closest approach — the pairs
+    // that can plausibly SEAT under a small-deflection load. On a conforming
+    // interface this is every pair; where the clearance opens up faster than one
+    // element (a bore, a keyway flank, an angled seat) it is however many pairs the
+    // discretization happened to place in the closing zone, and a load funnelled
+    // through 1 of them is a point load wearing a contact-pressure label.
+    int seatable_pairs = 0;
+    // Total tributary area of the candidate pairs (mm^2) — the contact patch the
+    // pressure of an active subset is measured against.
+    double candidate_area_mm2 = 0.0;
     // Non-empty means the mesh could not be interpreted (bad stride, no boundary).
     std::string error;
 };
@@ -54,5 +74,66 @@ ContactCandidateSet fea_contact_candidates(const std::vector<double>& points,
                                            const std::vector<int>& tets,
                                            int nodes_per_elem, double E_mpa,
                                            const ContactCandidateOptions& options);
+
+// ── Is the interface RESOLVED, or is the answer a point load? ────────────────────
+// A contact study can converge, balance to 0.0% equilibrium error and report a
+// plausible displacement while being physically meaningless, and the live case that
+// forced this guard shows exactly how: the real FRAME-PEDAL-BRAKE keyway (0.350 mm
+// measured clearance) was auto-coarsened to h = 2.91 mm at the interface — 8x the
+// clearance — so of 848 candidate pairs exactly ONE ever sat inside the closing
+// zone. It carried the whole 2902 N through one node and reported 13,543 MPa of
+// "contact pressure": a point load on a mesh, not a seated joint. Every existing
+// check passed, because each of them is about the SOLVE and this defect is in the
+// DISCRETIZATION.
+//
+// Two independent statements make an interface unresolved, and either one refuses:
+//
+//   1. A PRIORI, from the candidate set alone: the interface element size is more
+//      than kMaxHOverGap x the clearance it has to resolve AND fewer than
+//      kMinActivePairs candidates sit within twice the closest approach. Both
+//      halves are required, and the second one is why: a CONFORMING interface
+//      (two flat faces across a uniform 0.05 mm gap, or a concentric pin in a
+//      0.1 mm bore) has h/gap of 19-133 and is perfectly resolved — every pair
+//      seats together and the pressure is the real patch pressure. What kills a
+//      study is a clearance that opens faster than one element, which shows up as
+//      a closing zone the mesh placed almost no pairs in.
+//   2. A POSTERIORI: load crossed the interface through fewer than
+//      kMinActivePairs pairs. Three pairs cannot carry a distributed pressure
+//      whatever the geometry looked like beforehand.
+//
+// The refusal names the element size that WOULD resolve it, which is what
+// contact.interface_size_mm applies as LOCAL refinement on the candidate faces.
+struct ContactResolution {
+    double h_interface_mm = 0.0;   // measured interface element size
+    double gap_mm = 0.0;           // the clearance it has to resolve
+    double ratio = 0.0;            // h_interface_mm / gap_mm (0 when gap is 0)
+    int candidate_pairs = 0;
+    int seatable_pairs = 0;
+    int active_pairs = -1;         // -1 until the solve has run
+    int min_active_pairs = 0;      // the threshold that was applied
+    double max_ratio = 0.0;        // the ratio threshold that was applied
+    double contact_area_mm2 = 0.0; // tributary area of the load-carrying pairs
+    // The element size at the interface that resolves the clearance. This is the
+    // number to pass as contact.interface_size_mm.
+    double required_interface_size_mm = 0.0;
+    bool resolved = true;
+    // force/area is a pressure only when a load-carrying patch of pairs exists.
+    bool pressure_reliable = false;
+    std::string reason;            // empty while resolved
+};
+
+inline constexpr double kContactMaxHOverGap = 4.0;
+inline constexpr int kContactMinActivePairs = 6;
+
+// A-priori resolution judgement on the candidate set (before any solve).
+ContactResolution fea_contact_resolution(const ContactCandidateSet& candidates);
+
+// Fold the solved active set into the judgement: `active_pairs` is the solver's own
+// active count, `contact_force_n` the total resultant it carried and
+// `contact_area_mm2` the tributary area of those active pairs. A refusal here is
+// the a-posteriori clause; it never overturns an a-priori one.
+void fea_contact_resolution_after_solve(ContactResolution& resolution,
+                                        int active_pairs, double contact_force_n,
+                                        double contact_area_mm2);
 
 }  // namespace chudware::sim

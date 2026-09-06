@@ -2148,3 +2148,122 @@ fixture" and `connected_components 3`; post-fix it solves at 1 / 0. That case do
 `max_von_mises_mpa` — on a 6-tet cube every node touches the fixture ring the stress summary
 excludes, so the reported peak is legitimately 0. Green: mesh_mechanism, fea_contact, sim,
 mesh_quality.
+
+## An evidence packet is never overwritten, and it is checkable before it is cited (2026-09-06)
+
+**What went wrong.** ME 490 phase 5B re-ran FRAME-PEDAL-BRAKE into
+`Engineering/Simulation_Output/FRAME-PEDAL-BRAKE/`, the folder that already held the
+released Phase-4 bonded packet, and `result.json` / `inputs.json` / `provenance.json` from
+that run were gone. The never-overwrite rule lived only in the project's Simulation
+Runbook, so the only thing enforcing it was the agent's memory — a tool that truncates a
+released artifact on a plain second call will eventually be called a second time.
+
+**Archive-then-write.** `cad_common.archive_before_write(targets, anchor=, hash_source=)`
+MOVES every existing target into `<anchor>/superseded_<YYYY-MM-DD>_<short-hash>/` before a
+writer runs (a rename — free even for a 27 MB `.vtu`), named by the sha256 of the file that
+identifies the old set, so two sets archived the same day never collide and re-archiving
+identical content is idempotent; it never deletes and never replaces a byte (a name clash
+inside an archive is suffixed). `sim_evidence_packet` archives the whole packet AS A SET
+(inputs/result/provenance/convergence/checklist/annotated_render — a folder mixing two runs'
+files is a collage, not evidence), records what it displaced in the new provenance.json's
+`superseded_from` (old result sha256, engine build, when it was written, plus `chained_from`
+so the lineage is walkable), and returns `archived_to`. Its new `overwrite=False` default is
+the only way to replace in place, and it still writes the `superseded_from` note. Solver
+`.vtu` outputs get the same protection through `cad_sim_tools._archive_existing_vtu`, called
+beside the STEP export in `_build_static_study` / `_build_modal_study` / the transient-thermal
+branch — i.e. only after every setup validation has passed, because a run about to be refused
+must not move a file. `_norm_vtu_path` is now pure validation for exactly that reason.
+
+**verify_packet(folder).** The read-back an agent needs before citing a packet: one geometry
+sha256 across inputs.json and provenance.json, one engine build id across result.json and
+provenance.json, a result.json that still hashes to what provenance.json AND convergence.md's
+new `result_sha256:` header cite, reduction fields present (`max_von_mises_reduction` /
+`max_von_mises_raw_mpa` / `min_fos_raw` — without them the reader cannot tell a fixture-masked
+peak from the field maximum), the recorded `.vtu` still intact, and all 16 runbook checklist
+items verbatim. Findings are split by severity because the remedies differ: `problems`
+(`reason:"packet_inconsistent"`) means the files contradict each other or required evidence is
+absent — do not cite; `unverifiable` (`reason:"packet_unverifiable"`) means the packet predates
+the hash stamp, so a single-file swap can neither be shown nor ruled out, and re-running
+`sim_evidence_packet` on the same `study_result` archives it and stamps the replacement. Open
+checklist items are reported and never fail the check — they are the human release gate.
+Measured on the mission's own folders: FRAME-PEDAL-BRAKE flags `convergence_evidence_present`
+(a contact result with no table and no adaptive metadata), WHEEL-RADIAL and FRAME-GLOBAL-3G
+flag `reduction_fields_present`, and all three are `unverifiable` on the hash stamp.
+
+**The cross-check lane had the same hole.** `polymesh_cli` writes `<case>_result.vtu` /
+`<case>_mesh.vtu` / `<case>_diag.json` + `<action>.log` into an out_dir the runbook points at
+the case's packet folder, and it truncated them on every re-run. It now takes the same
+`overwrite=False` and archives the previous run's artifacts AND its log together, after the
+binary has resolved and the argv validated so a refused call moves nothing. That also closed
+a second defect: `written = [p for p in outputs if is_file()]` accepted a LEFTOVER artifact
+from an earlier run, so a CLI that exited 0 without writing anything reported
+`ok:true` with a stale `.vtu` — the archive empties the path first, and the check now means
+what it says (`test_polymesh_cli_cannot_pass_on_a_leftover_artifact`).
+
+**Files.** `services/mcp/cad_common.py` (`archive_before_write`, `file_sha256`,
+`SUPERSEDED_PREFIX`), `services/mcp/sim_evidence_tools.py` (packet archiving + `verify_packet`
++ `result_sha256` in provenance.json and convergence.md), `services/mcp/cad_sim_tools.py`
+(`.vtu` guard), `services/agent/tool_categories.py` + `tool_guidance/sim.py` (advertise
+`verify_packet`), `services/agent/skills/builtin/simulate/SKILL.md` (steps 4-6),
+`services/mcp/test_sim_evidence_packet.py` (16 tests, pure filesystem — no engine, no solve).
+
+**Gotchas.** The packet resolves geometry/vtu/render hashes BEFORE archiving, and re-points a
+render that WAS the folder's own `annotated_render.*` into the archive it just moved to —
+otherwise handing a packet's own render back to the tool silently dropped the annotated view.
+Archives are flat-file only: a `geometry/` subdirectory in a packet folder is left alone.
+There is deliberately no in-place option for a `.vtu` (nothing can re-derive the old field, so
+replacing it is a deliberate `rm`), and the run says where the old one went through its notes.
+
+## A mate solve that fails must not move the assembly, and must name the mate (2026-09-06)
+
+**What went wrong.** ME 490 phase 5A tried to place the merged rover with mates and gave up:
+"a 20-mate network over 9 components diverged (components thrown thousands of mm; hub FR
+reached y ≈ 5900)", so both released assemblies are measured-transform placements and
+`placement_source` reads `transform`, not `mate`. The solver was not diverging. The escape
+hatch was. When the first LM pass misses, `mate::solve_mates` perturbs rotations and
+re-solves (the antipodal restart ported from the Python oracle) — and it perturbed EVERY free
+component in the document, then kept whichever restart scored a hair lower on the GLOBAL max
+residual. A four-corner rover is four independent chains off the fixed frame, so one
+unsatisfiable mate on one corner randomized the other three. Reproduced with a 9-component /
+20-mate rover fixture through `mate_cli`: a single 5 mm bore mis-pick on corner FR left
+`wheel_FL` **1465.40 mm**, `hub_FL` 194.92 mm and `hub_RL` 117.29 mm from their authored
+poses — at the *same* 2.5 mm residual the unperturbed solve already had. The restarts never
+improved anything; they only scattered the model.
+
+**What changed.** The restart is now an escape instead of a wrecking ball: it perturbs only
+components in a mate-connected group that actually holds an unsatisfied mate (union-find over
+the active mates), and it accepts a restart only if that restart CONVERGES or at least halves
+the residual. Same fixture after: every component within 7.89 mm of its authored pose, the
+untouched corners within 2.7 mm. `System::set_step_limits` (opt-in, empty by default — the
+sketch path and the differential harness keep their exact step sequence) adds a per-variable
+trust region that the mate path fills with a quarter of the assembly's size for translation
+and half a radian for rotation, scaling the whole LM step down by the smallest ratio so the
+direction is preserved. Without it a near-null direction on the normal equations — whose
+condition number is the SQUARE of the Jacobian's — buys a thousand-mm step for a hair of cost.
+
+**Now it says what failed.** `MateSolveResult` carries `residuals[]` (per mate: `max_abs`,
+`norm`, worst first), `worst_mate` and `tolerance`; `AssemblyResult`/`AsmMateStatus` carry
+them through, and the assembly ops-response gained `converged`, `max_residual`, `worst_mate`,
+`tolerance` and a per-mate `residual`. `doc_status.mates` can now read `"unsolved"`: it used
+to report `"ok"` for a solve that never converged, which is how a mission lost a day. The MCP
+`solve_mates` returns `ok:false` with `worst_mate` + a worst-five `mate_residuals` table, and
+`asm_mate(solve=True)` reports `converged` + `solve_error` while still confirming the mate
+landed.
+
+**Tolerance.** `tol` is quoted for a ~100 mm part and applied as `tol * max(1, L/100)`, L
+being the largest world coordinate the solve touches; `tolerance` reports what was used and
+nothing changes at or below 100 mm. Measured: at 2 m the LM reaches 1e-13 either way (the flat
+threshold was NOT the rover's problem), but a seated 20 m assembly a tenth of a micro-radian
+off settles at 5e-8 mm and the flat 1e-9 called it divergent.
+
+**Gotchas / deferred.** Jacobi-preconditioning the LM step (D A D, D = diag(A)^-1/2) was tried
+first to attack the same conditioning directly and REVERTED on evidence: it regressed
+`chain_coincident_4` in the mate corpus from converged to a 6.9e-3 crawl, because the min-norm
+cutoff in scaled coordinates retains near-null directions the unscaled cutoff drops. The 20 m
+regime still stalls around 1e-4 mm when the correction is large — a real conditioning limit,
+now at least reported instead of silently scattering the model. Pinned by `test_mate.cpp`'s
+"one unsatisfiable mate cannot move a different chain" (fails pre-fix: hub_a 84.07 mm,
+hub_b 184.58 mm off; passes at 0.46 / 2.41 mm) and "the convergence tolerance scales with the
+assembly", plus `test_insert_component.cpp`'s "an unsatisfiable mate network is reported,
+named and bounded". Green in core/build-fix2: mate, mate_corpus, insert_component,
+interference, simulate_motion, motion_dynamics, platform_parity (7/7).

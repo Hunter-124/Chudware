@@ -11,6 +11,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <functional>
+#include <set>
 #include <memory>
 #include <random>
 #include <stdexcept>
@@ -1180,7 +1181,55 @@ struct Builders {
     MateBuilder* builder;
     solver::ResidualFunc rfunc;
     int m;
+    std::string type;   // mate type, for the residual report
+    std::string cid_a;  // the two components this mate couples (for group scoping)
+    std::string cid_b;
 };
+
+// Largest absolute entry and 2-norm of one mate's residual block at configuration x.
+// Positional rows are mm, direction rows dimensionless — see MateResidual.
+void mate_residual_at(const Builders& b, const VectorXd& x, double& max_abs, double& norm) {
+    const std::vector<int>& idx = b.builder->idx();
+    VectorXd xsub(static_cast<int>(idx.size()));
+    for (size_t i = 0; i < idx.size(); ++i) xsub(static_cast<int>(i)) = x(idx[i]);
+    const VectorXd r = b.rfunc(xsub);
+    max_abs = r.size() ? r.cwiseAbs().maxCoeff() : 0.0;
+    norm = r.norm();
+}
+
+// Component ids belonging to a mate-connected group that holds at least one mate whose
+// residual exceeds `tol` at x. Components joined only by satisfied mates — and
+// components in a different chain entirely — are NOT in the set, so the random-restart
+// escape can only disturb the part of the assembly that is actually failing.
+std::set<std::string> failing_groups(const std::vector<Builders>& builders,
+                                     const std::vector<std::string>& frame_order,
+                                     const VectorXd& x, double tol) {
+    std::map<std::string, std::string> parent;  // union-find over component ids
+    for (const std::string& cid : frame_order) parent[cid] = cid;
+    std::function<std::string(const std::string&)> find =
+        [&](const std::string& a) -> std::string {
+            auto it = parent.find(a);
+            if (it == parent.end()) return a;
+            if (it->second == a) return a;
+            return it->second = find(it->second);
+        };
+    auto unite = [&](const std::string& a, const std::string& b) {
+        auto ra = find(a), rb = find(b);
+        if (parent.count(ra) && parent.count(rb) && ra != rb) parent[ra] = rb;
+    };
+    for (const Builders& b : builders) unite(b.cid_a, b.cid_b);
+
+    std::set<std::string> failing_roots;
+    for (const Builders& b : builders) {
+        double max_abs = 0.0, norm = 0.0;
+        mate_residual_at(b, x, max_abs, norm);
+        if (max_abs > tol) failing_roots.insert(find(b.cid_a));
+    }
+    std::set<std::string> out;
+    for (const std::string& cid : frame_order)
+        if (failing_roots.count(find(cid))) out.insert(cid);
+    return out;
+}
 
 void classify_mates(std::vector<Builders>& builders, const VectorXd& x, double tol,
                     std::vector<std::string>& redundant,
@@ -1354,6 +1403,9 @@ MateSolveResult solve_mates(const json& components, const json& mates,
         br.builder = bptr.get();
         br.rfunc = rfunc;
         br.m = m;
+        br.type = mtype;
+        br.cid_a = cid_a;
+        br.cid_b = cid_b;
         builders.push_back(br);
         builder_store.push_back(std::move(bptr));
         mate_records.push_back({mid, ""});
@@ -1368,13 +1420,52 @@ MateSolveResult solve_mates(const json& components, const json& mates,
         }
     }
 
+    // --- assembly scale -----------------------------------------------------
+    // The largest world coordinate the solve touches: seed translations plus the
+    // mate geometry's local points (which, for components imported from a shared
+    // STEP frame, ARE the assembly's coordinates). Everything scale-dependent below
+    // is derived from it, and it stays 100 mm for a table-top assembly so small
+    // models behave exactly as before.
+    double L = 0.0;
+    for (const auto& cid : frame_order)
+        L = std::max(L, frames[cid].t0.cwiseAbs().maxCoeff());
+    for (const auto& kv : resolved_geometry)
+        L = std::max(L, kv.second.point.cwiseAbs().maxCoeff());
+    const double scale = std::max(100.0, L);
+
+    // A picometre is not a reachable residual across a 2 m assembly: one residual
+    // evaluation of `n . (pb - pa)` at |p| ~ 2000 mm already carries ~1e-12 mm of
+    // cancellation noise, and the LM then reports a perfectly seated network as
+    // "did not converge". Widen the threshold with the model, never below `tol`.
+    const double eff_tol = tol * (scale / 100.0);
+
+    // Trust region: a single LM iteration may move a component by a quarter of the
+    // assembly (never less than 25 mm, so a small model can still be dragged across
+    // itself in a few iterations) and may turn it by half a radian. The step direction
+    // is untouched — only its length is bounded — so this costs iterations, never
+    // solutions, and it is what stops a near-null least-squares direction from
+    // launching a component thousands of mm on a step that lowers the cost by a hair.
+    if (system.n_vars() > 0) {
+        VectorXd limits = VectorXd::Zero(system.n_vars());
+        const double t_cap = std::max(25.0, 0.25 * scale);
+        for (const auto& cid : frame_order) {
+            const CompFrame& f = frames[cid];
+            if (f.fixed) continue;
+            for (int k = 0; k < 3; ++k) {
+                limits(f.t_idx[k]) = t_cap;
+                limits(f.w_idx[k]) = 0.5;
+            }
+        }
+        system.set_step_limits(limits);
+    }
+
     VectorXd x;
     bool res_converged = true;
     double max_res = 0.0;
     if (system.n_vars() == 0) {
         x = VectorXd::Zero(0);
     } else {
-        auto res = system.solve(std::nullopt, tol, max_iter, time_budget_ms);
+        auto res = system.solve(std::nullopt, eff_tol, max_iter, time_budget_ms);
         x = res.x;
         res_converged = res.converged;
         max_res = res.max_residual;
@@ -1387,26 +1478,38 @@ MateSolveResult solve_mates(const json& components, const json& mates,
             // reproduce that stream bit-for-bit — std::mt19937_64 is a DIFFERENT generator and
             // probes different points, so a coupled rotational chain that the oracle rescues
             // here would otherwise stall. chudware::sim::NumpyGenerator is the validated clone.
+            //
+            // TWO rules make this an escape instead of a wrecking ball. (1) SCOPE: only
+            // components in a mate-connected group that actually has an unsatisfied mate are
+            // perturbed. A four-corner rover is four independent chains off the fixed frame;
+            // one unsatisfiable mate on one corner used to randomize the rotation of every
+            // free component in the document. (2) ACCEPTANCE: a restart replaces the incumbent
+            // only when it converges or at least halves the residual. A basin escape improves
+            // by orders of magnitude; anything less is noise, and taking it swapped a pose
+            // seated on the authored transforms for a scrambled one at the SAME residual.
+            const std::set<std::string> failing = failing_groups(builders, frame_order, x, eff_tol);
             chudware::sim::NumpyGenerator rng(12345);
             VectorXd x0_base = system.init_vector();
             std::vector<int> w_indices;
             for (auto& cid : frame_order) {
                 CompFrame& f = frames[cid];
-                if (!f.fixed)
+                if (!f.fixed && failing.count(cid))
                     w_indices.insert(w_indices.end(), f.w_idx.begin(), f.w_idx.end());
             }
-            auto best = res;
-            for (int iter = 0; iter < 6; ++iter) {
-                VectorXd x0 = x0_base;
-                // numpy rng.normal(scale=0.6, size=N) = standard_normal() * 0.6, filled in order.
-                for (int wi : w_indices) x0(wi) += 0.6 * rng.standard_normal();
-                auto r2 = system.solve(x0, tol, max_iter);
-                if (r2.max_residual < best.max_residual) best = r2;
-                if (best.converged) break;
+            if (!w_indices.empty()) {
+                auto best = res;
+                for (int iter = 0; iter < 6; ++iter) {
+                    VectorXd x0 = x0_base;
+                    // numpy rng.normal(scale=0.6, size=N) = standard_normal() * 0.6, in order.
+                    for (int wi : w_indices) x0(wi) += 0.6 * rng.standard_normal();
+                    auto r2 = system.solve(x0, eff_tol, max_iter);
+                    if (r2.converged || r2.max_residual < 0.5 * best.max_residual) best = r2;
+                    if (best.converged) break;
+                }
+                x = best.x;
+                res_converged = best.converged;
+                max_res = best.max_residual;
             }
-            x = best.x;
-            res_converged = best.converged;
-            max_res = best.max_residual;
         }
     }
 
@@ -1430,7 +1533,7 @@ MateSolveResult solve_mates(const json& components, const json& mates,
     if (system.n_vars() > 0 && !active_tags.empty()) {
         auto analysis = system.analyze(x);
         dof = analysis.dof;
-        classify_mates(builders, x, tol, redundant, conflicting);
+        classify_mates(builders, x, eff_tol, redundant, conflicting);
     }
 
     auto in_set = [](const std::vector<std::string>& s, const std::string& v) {
@@ -1459,10 +1562,26 @@ MateSolveResult solve_mates(const json& components, const json& mates,
         out.mate_status.push_back({mid, mtype, status});
     }
 
+    // Per-mate residual report, worst first. This is the diagnosis a caller needs when
+    // `converged` is false: which mate is not satisfied, and by how much.
+    for (const Builders& b : builders) {
+        MateResidual mr;
+        mr.mate_id = b.mid;
+        mr.type = b.type;
+        mate_residual_at(b, x, mr.max_abs, mr.norm);
+        out.residuals.push_back(std::move(mr));
+    }
+    std::stable_sort(out.residuals.begin(), out.residuals.end(),
+                     [](const MateResidual& a, const MateResidual& b) {
+                         return a.max_abs > b.max_abs;
+                     });
+    if (!out.residuals.empty()) out.worst_mate = out.residuals.front().mate_id;
+
     out.over_defined = !conflicting.empty();
     out.dof = dof;
     out.converged = res_converged;
     out.max_residual = max_res;
+    out.tolerance = eff_tol;
     out.summary = dof_summary(dof, out.over_defined, n_comp, n_fixed);
     return out;
 }
@@ -1554,6 +1673,14 @@ json solve_mates_json(const json& input) {
     for (const auto& s : res.mate_status)
         statuses.push_back({{"mate_id", s.mate_id}, {"type", s.type}, {"status", s.status}});
     out["mate_status"] = statuses;
+
+    json residuals = json::array();
+    for (const auto& r : res.residuals)
+        residuals.push_back({{"mate_id", r.mate_id}, {"type", r.type},
+                             {"max_abs", r.max_abs}, {"norm", r.norm}});
+    out["residuals"] = residuals;
+    out["worst_mate"] = res.worst_mate;
+    out["tolerance"] = res.tolerance;
 
     out["dof"] = res.dof;
     out["converged"] = res.converged;

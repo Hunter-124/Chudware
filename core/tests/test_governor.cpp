@@ -9,10 +9,13 @@
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include <doctest/doctest.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <filesystem>
 #include <string>
+#include <system_error>
 #include <thread>
 
 #include "environment_test_support.h"
@@ -27,6 +30,44 @@ double wall_ms(const std::chrono::steady_clock::time_point& t0) {
                std::chrono::steady_clock::now() - t0)
         .count();
 }
+
+// A directory of fake cgroup v2 control files, handed to the governor through
+// CHUDWARE_CGROUP_ROOT (which also short-circuits the /proc/self/cgroup lookup,
+// so the fake dir is the whole hierarchy). Lets the cgroup budget term be pinned
+// on a box that is not itself in a capped cgroup, and vice versa.
+struct FakeCgroup {
+    std::filesystem::path dir;
+
+    explicit FakeCgroup(const char* name) {
+        dir = std::filesystem::temp_directory_path() / "chudware_governor_cgroup" / name;
+        std::error_code ec;
+        std::filesystem::remove_all(dir, ec);
+        std::filesystem::create_directories(dir, ec);
+    }
+    ~FakeCgroup() {
+        std::error_code ec;
+        std::filesystem::remove_all(dir, ec);
+    }
+    FakeCgroup(const FakeCgroup&) = delete;
+    FakeCgroup& operator=(const FakeCgroup&) = delete;
+
+    void put(const char* file, const char* text) const {
+        if (FILE* f = std::fopen((dir / file).string().c_str(), "w")) {
+            std::fputs(text, f);
+            std::fclose(f);
+        }
+    }
+    // Budget with this fake cgroup in force.
+    uint64_t budget() const {
+        chudware::test::setOrUnsetEnvironment("CHUDWARE_CGROUP_ROOT",
+                                              dir.string().c_str());
+        const uint64_t b = budget_bytes();
+        chudware::test::setOrUnsetEnvironment("CHUDWARE_CGROUP_ROOT", nullptr);
+        return b;
+    }
+};
+
+constexpr uint64_t kGiB = 1024ull * 1024ull * 1024ull;
 }  // namespace
 
 TEST_CASE("host_mem is sane") {
@@ -204,4 +245,103 @@ TEST_CASE("plan_for mid pressure scales workers between 1 and allotment") {
     std::printf("[governor] mid-pressure workers=%d/8 reserve=%.3fGB wall=%.3f ms\n",
                 p.workers, p.reserve_bytes / 1e9, wall_ms(t0));
     chudware::test::setOrUnsetEnvironment("CHUDWARE_SIM_THREADS", nullptr);
+}
+
+// ── The cgroup budget term ──────────────────────────────────────────────────────
+// Regression for the ME-490 phase-5A refusal: inside a
+// `systemd-run --scope -p MemoryMax=10G` holding the mission driver, its python
+// worker and chudware-hostd, the term was computed as
+// `limit - (memory.current - own_rss)`. memory.current also charges the PAGE
+// CACHE (that scope had streamed STEP/VTU files), so it sat within a few hundred
+// MB of the limit and the budget collapsed to 0.4 GB — run_fea_static refused a
+// study the scope had 8+ GB of anonymous room for, twice. The term now reads
+// memory.stat `anon` + `shmem`, credits our own ANON rss back, and keeps the
+// small-job floor unless the limit itself is below it.
+TEST_CASE("cgroup budget term counts anon usage, not page cache") {
+    const auto t0 = std::chrono::steady_clock::now();
+#if defined(_WIN32) || defined(__APPLE__)
+    std::printf("[governor] cgroup term: not a cgroup platform (SKIP) wall=%.3f ms\n",
+                wall_ms(t0));
+#else
+    chudware::test::setOrUnsetEnvironment("CHUDWARE_GOVERNOR", nullptr);
+    chudware::test::setOrUnsetEnvironment("CHUDWARE_MEM_CAP_GB", nullptr);
+    const HostMem m = host_mem();
+    if (m.total == 0) {
+        std::printf("[governor] cgroup term: platform unknown (SKIP) wall=%.3f ms\n",
+                    wall_ms(t0));
+        return;
+    }
+    // Open the host terms as wide as this machine allows, so whatever binds below
+    // them is the cgroup term and the pins do not depend on the box's free RAM.
+    chudware::test::setOrUnsetEnvironment("CHUDWARE_MEM_FRAC", "1.0");
+    chudware::test::setOrUnsetEnvironment("CHUDWARE_HEADROOM_GB", "0");
+    const uint64_t floor_b =
+        std::min(3 * kGiB, static_cast<uint64_t>(static_cast<double>(m.total) * 0.4));
+
+    // (a) No control files at all: uncapped, the baseline every case compares to.
+    const FakeCgroup none("uncapped");
+    const uint64_t base = none.budget();
+    CHECK(base > 0);
+
+    // (b) Files present but no finite limit: memory.high "max" must not win the
+    // min, and a huge memory.current/anon must not shrink anything.
+    const FakeCgroup nolimit("nolimit");
+    nolimit.put("memory.max", "max\n");
+    nolimit.put("memory.high", "max\n");
+    nolimit.put("memory.current", "9500000000\n");
+    nolimit.put("memory.stat", "anon 9000000000\nfile 400000000\nshmem 0\n");
+    CHECK(nolimit.budget() == base);
+
+    // (c) The mission's own shape: 10 GiB limit, siblings holding 1.2 GiB anon +
+    // 64 MiB shmem, and a memory.current pinned near the limit by the page cache.
+    // The budget must be ~8.74 GiB (limit - anon - shmem, plus our own anon rss
+    // credited back), never ~0.5 GiB, and never above the limit.
+    const FakeCgroup capped("capped10g");
+    capped.put("memory.max", "10737418240\n");
+    capped.put("memory.high", "max\n");
+    capped.put("memory.current", "10200547328\n");  // 9.5 GiB — mostly page cache
+    capped.put("memory.stat",
+               "anon 1288490188\nfile 8858370048\nkernel 53673984\nshmem 67108864\n"
+               "file_mapped 1048576\ninactive_anon 0\nactive_anon 1288490188\n");
+    const uint64_t claim_lo = 10 * kGiB - 1288490188ull - 67108864ull;  // ~8.74 GiB
+    const uint64_t claim_hi = claim_lo + 256ull * 1024 * 1024;  // + our own anon rss
+    const uint64_t got = capped.budget();
+    CHECK(got >= std::min(base, claim_lo));
+    CHECK(got <= std::min(base, claim_hi));
+    CHECK(got < 10 * kGiB);
+
+    // (d) Siblings really do own almost the whole limit: the subtraction is an
+    // estimate of a moving target, so it may not push the budget under the
+    // small-job floor — but it may not lift it above the kill line either.
+    const FakeCgroup squeezed("squeezed");
+    squeezed.put("memory.max", "4294967296\n");  // 4 GiB
+    squeezed.put("memory.stat", "anon 4187593113\nfile 0\nshmem 0\n");
+    CHECK(squeezed.budget() == std::min(base, std::min(floor_b, 4 * kGiB)));
+
+    // (e) A limit below the floor is the one case with no rescue: a 256 MiB
+    // container gets a 256 MiB budget, because crossing it is a SIGKILL.
+    const FakeCgroup tiny("tiny");
+    tiny.put("memory.max", "268435456\n");
+    CHECK(tiny.budget() == 268435456ull);
+
+    // (f) The refusal has to say how much of the limit the siblings hold —
+    // otherwise a 10 GB scope reporting a small budget reads as a governor bug.
+    if (got < base) {
+        chudware::test::setOrUnsetEnvironment("CHUDWARE_CGROUP_ROOT",
+                                              capped.dir.string().c_str());
+        std::string why;
+        CHECK_FALSE(admit(got * 2ull, "cgroup study", why));
+        chudware::test::setOrUnsetEnvironment("CHUDWARE_CGROUP_ROOT", nullptr);
+        CHECK(why.find("cgroup memory limit 10.0 GB") != std::string::npos);
+        CHECK(why.find("other processes sharing it hold") != std::string::npos);
+        std::printf("[governor] cgroup refusal: %s\n", why.c_str());
+    }
+
+    std::printf("[governor] cgroup base=%.2fGB capped10g=%.2fGB squeezed=%.2fGB "
+                "tiny=%.2fGB floor=%.2fGB wall=%.3f ms\n",
+                base / 1e9, got / 1e9, squeezed.budget() / 1e9, tiny.budget() / 1e9,
+                floor_b / 1e9, wall_ms(t0));
+    chudware::test::setOrUnsetEnvironment("CHUDWARE_MEM_FRAC", nullptr);
+    chudware::test::setOrUnsetEnvironment("CHUDWARE_HEADROOM_GB", nullptr);
+#endif
 }

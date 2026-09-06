@@ -492,6 +492,48 @@ bool faceset_normal(const json& fs, std::array<double, 3>& face_normal, double& 
     return true;
 }
 
+// The two numbers the MESH needs out of study.contact, read leniently: the
+// contact block's own strict validation runs later (it has to, because a
+// malformed block must refuse the STUDY, not the mesh), and this pass only ever
+// asks the mesher for MORE resolution. A block that is not an object, disabled,
+// or carries a non-positive size simply requests nothing.
+double contact_interface_size_mm(const json& study) {
+    if (!study.contains("contact") || !study["contact"].is_object()) return 0.0;
+    const json& c = study["contact"];
+    if (!c.value("enabled", true)) return 0.0;
+    const double size = c.value("interface_size_mm", 0.0);
+    return std::isfinite(size) && size > 0.0 ? size : 0.0;
+}
+
+double contact_max_gap_mm(const json& study) {
+    if (!study.contains("contact") || !study["contact"].is_object()) return 0.5;
+    const double gap = study["contact"].value("max_gap_mm", 0.5);
+    return std::isfinite(gap) && gap > 0.0 ? gap : 0.5;
+}
+
+// The contact.resolution block: the discretization facts a reader needs to know
+// whether "contact_force_n / contact_area_mm2" is a pressure or an artefact.
+// Same shape whether the study was refused before the solve (the a-priori
+// clause: this mesh cannot describe the interface) or after it (the load
+// crossed through too few pairs), so a caller parses one thing.
+json contact_resolution_json(const ContactResolution& r) {
+    json out{{"h_interface_mm", round_nd(r.h_interface_mm, 6)},
+             {"gap_mm", round_nd(r.gap_mm, 6)},
+             {"ratio", round_nd(r.ratio, 4)},
+             {"max_ratio", r.max_ratio},
+             {"candidate_pairs", r.candidate_pairs},
+             {"seatable_pairs", r.seatable_pairs},
+             {"min_active_pairs", r.min_active_pairs},
+             {"required_interface_size_mm", round_nd(r.required_interface_size_mm, 4)},
+             {"resolved", r.resolved}};
+    if (r.active_pairs >= 0) {
+        out["active_pairs"] = r.active_pairs;
+        out["contact_area_mm2"] = round_nd(r.contact_area_mm2, 6);
+    }
+    if (!r.reason.empty()) out["reason"] = r.reason;
+    return out;
+}
+
 // Resolve the mesh: inline points/tets if present, otherwise mesh the STEP
 // file. `quality` reports the metrics of whichever mesh was resolved, so every
 // study result can describe the discretization it actually solved.
@@ -583,11 +625,64 @@ bool resolve_mesh(const json &study, std::vector<double> &points,
     options.max_size_mm = study.value("max_size_mm", 0.0);
     options.learned_advisor = study.value("learned_advisor", false);
     options.advisor_max_dof = study.value("advisor_max_dof", uint32_t{0});
-    const auto mesh =
-        mesh_step_cached(study["step_path"].get<std::string>(), options);
+    const std::string step_path = study["step_path"].get<std::string>();
+    auto mesh = mesh_step_cached(step_path, options);
     if (!mesh->ok) {
       err = "mesh failed: " + mesh->error;
       return false;
+    }
+    // ── contact.interface_size_mm: LOCAL refinement of the contact faces ──────
+    // The candidate faces are only knowable from a mesh, so this is a two-pass
+    // operation: mesh once, find the pairs the study's own max_gap_mm produces,
+    // then re-mesh with those candidate nodes as local refinement seeds. It is
+    // the interface that gets refined, not the part — the whole reason the knob
+    // exists is that resolving a 0.35 mm clearance with a uniform element size
+    // costs a million elements.
+    if (const double interface_size = contact_interface_size_mm(study);
+        interface_size > 0.0) {
+      const ContactCandidateSet probe = fea_contact_candidates(
+          mesh->points, mesh->tets, mesh->nodes_per_elem, /*E_mpa=*/1.0,
+          ContactCandidateOptions{contact_max_gap_mm(study), 1.0, 0.35});
+      if (probe.error.empty() && !probe.springs.empty()) {
+        MeshOptions refined = options;
+        refined.local_refine.size_mm = interface_size;
+        // One coarse element of influence around each seed, and never less than
+        // the requested size: the coarse candidates are a node spacing apart,
+        // so a narrower band would refine dots instead of the interface.
+        refined.local_refine.band_mm =
+            std::max(mesh->char_len_mm, 2.0 * interface_size);
+        refined.local_refine.label = "contact interface";
+        // Seeds at the candidate NODES themselves — both endpoints, so both
+        // bodies' faces are refined — deduped onto a grid of the requested size
+        // so a dense candidate set cannot blow the seed count up. The midpoint of
+        // the pair was tried first and is worse: it lies in the clearance, i.e.
+        // outside both solids, and the fill carves those cells away.
+        std::set<std::array<long long, 3>> cells;
+        const double cell = std::max(interface_size, 1e-6);
+        auto seed_node = [&](int node) {
+            const double* p = &mesh->points[static_cast<size_t>(node) * 3];
+            const std::array<long long, 3> key{
+                static_cast<long long>(std::floor(p[0] / cell)),
+                static_cast<long long>(std::floor(p[1] / cell)),
+                static_cast<long long>(std::floor(p[2] / cell))};
+            if (!cells.insert(key).second) return;
+            for (int c = 0; c < 3; ++c)
+                refined.local_refine.points.push_back(p[c]);
+        };
+        for (const ContactSpring& s : probe.springs) {
+            seed_node(s.a);
+            seed_node(s.b);
+        }
+        const auto refined_mesh = mesh_step_cached(step_path, refined);
+        // A refinement contract that cannot be met is a REFUSAL, not a silent
+        // fallback to the coarse mesh the study asked to get away from.
+        if (!refined_mesh->ok) {
+          err = "mesh failed with contact.interface_size_mm = " +
+                std::to_string(interface_size) + " mm: " + refined_mesh->error;
+          return false;
+        }
+        mesh = refined_mesh;
+      }
     }
     points = mesh->points;
     tets = mesh->tets;
@@ -1766,13 +1861,16 @@ static nlohmann::json fea_run_static_impl(
     // connectivity can, and it is checked before the solve rather than explained
     // afterwards.
     // ── study.contact: real unilateral (frictionless) contact ────────────────
-    // {"enabled":true, "max_gap_mm":0.5, "max_iterations":25, "penalty_scale":1.0}
+    // {"enabled":true, "max_gap_mm":0.5, "max_iterations":25, "penalty_scale":1.0,
+    //  "interface_size_mm":0.35}
     // Contact and bond_gap_mm are two DIFFERENT idealizations of the same interface —
     // one carries tension, one cannot — so asking for both is a contradiction, not a
     // merge, and it is refused rather than silently resolved.
     bool contact_enabled = false;
     ContactCandidateOptions contact_opts;
     FeaContactOptions contact_solver_opts;
+    double contact_interface_size = 0.0;
+    ContactResolution contact_resolution;
     if (study.contains("contact") && !study["contact"].is_null()) {
         const json& c = study["contact"];
         if (!c.is_object())
@@ -1808,6 +1906,18 @@ static nlohmann::json fea_run_static_impl(
                     {"error", "fea_static: study.contact needs finite max_gap_mm > 0 "
                               "(mm), penalty_scale > 0, and max_iterations in 1..500"}};
             contact_solver_opts.max_iterations = static_cast<int>(iters);
+            // interface_size_mm is a MESH contract, applied back in resolve_mesh
+            // (local refinement on the candidate faces). It is validated here so
+            // a malformed value refuses the study instead of being ignored by a
+            // pass that only ever asks for more resolution.
+            contact_interface_size = number("interface_size_mm", 0.0, 1e-4, 1e4);
+            if (!std::isfinite(contact_interface_size))
+                return json{
+                    {"ok", false},
+                    {"error", "fea_static: study.contact.interface_size_mm must be a "
+                              "finite element size in mm (0.0001..10000) — it refines "
+                              "the contact faces locally so the clearance is resolved "
+                              "without meshing the whole part that fine"}};
         }
     }
     ContactCandidateSet contact_set;
@@ -1896,6 +2006,40 @@ static nlohmann::json fea_run_static_impl(
                                   " bodies in this mesh never come that close, or their "
                                   "facing surfaces are not opposed. Measure the real "
                                   "clearance and raise max_gap_mm to just above it."},
+                    {"notes", notes}};
+            // Is this mesh even capable of describing the interface? The a-priori
+            // clause (fea_contact.h ContactResolution) is decided here, BEFORE the
+            // active-set solve: a solve cannot rescue an interface the mesh cannot
+            // represent, and it would return a "converged" answer with a 0.0%
+            // equilibrium error to dress up the artefact. The refusal carries the
+            // discretization facts, which are the whole evidence for it.
+            contact_resolution = fea_contact_resolution(contact_set);
+            {
+                char text[288];
+                std::snprintf(text, sizeof(text),
+                              "contact interface element size %.4g mm against a %.4g mm "
+                              "closest approach (ratio %.1f); %d of %d candidate pair(s) "
+                              "sit within twice that clearance",
+                              contact_resolution.h_interface_mm,
+                              contact_resolution.gap_mm, contact_resolution.ratio,
+                              contact_resolution.seatable_pairs,
+                              contact_resolution.candidate_pairs);
+                notes.push_back(text);
+            }
+            if (!contact_resolution.resolved)
+                return json{
+                    {"ok", false},
+                    {"error", "fea_static: " + contact_resolution.reason},
+                    {"contact",
+                     json{{"enabled", true},
+                          {"max_gap_mm", contact_opts.max_gap_mm},
+                          {"interface_size_mm", contact_interface_size},
+                          {"candidate_pairs",
+                           static_cast<int>(contact_set.springs.size())},
+                          {"candidate_area_mm2",
+                           round_nd(contact_set.candidate_area_mm2, 6)},
+                          {"contact_pressure_reliable", false},
+                          {"resolution", contact_resolution_json(contact_resolution)}}},
                     {"notes", notes}};
             notes.push_back(
                 "unilateral contact: " + std::to_string(contact_set.springs.size()) +
@@ -2234,10 +2378,25 @@ static nlohmann::json fea_run_static_impl(
                                nodal_forces, nodes_per_elem, bond_springs, job.token());
     // The contact block is EVIDENCE, so it rides on the refusal too: a reader has to be
     // able to see how many pairs there were and how far the active set got.
+    //
+    // The active set is also what settles whether a PRESSURE was measured or
+    // invented: `contact_area_mm2` is the summed tributary area of the pairs that
+    // actually carried load, `mean_contact_pressure_mpa` is the resultant over it,
+    // and `contact_pressure_reliable` is false whenever that patch is too small a
+    // sample of the interface to be one (fea_contact.h ContactResolution). A single
+    // active pair produces a "pressure" of force/one node area — 13,543 MPa on the
+    // live keyway that motivated this — and no other field in the packet says so.
     auto contact_json = [&]() {
+        double total_force = 0.0;
+        double total_area = 0.0;
+        for (const FeaContactGroup& g : contact_report.groups) {
+            total_force += g.contact_force_n;
+            total_area += g.contact_area_mm2;
+        }
         json body = {{"enabled", true},
                      {"max_gap_mm", contact_opts.max_gap_mm},
                      {"penalty_scale", contact_opts.penalty_scale},
+                     {"interface_size_mm", contact_interface_size},
                      {"penalty_stiffness_n_per_mm",
                       round_nd(E_mpa * contact_set.char_len_mm * contact_opts.penalty_scale, 4)},
                      {"max_iterations", contact_solver_opts.max_iterations},
@@ -2248,6 +2407,12 @@ static nlohmann::json fea_run_static_impl(
                      {"tangential_stabilization", contact_report.tangential_stabilization},
                      {"tangential_force_fraction",
                       round_nd(contact_report.tangential_force_fraction, 6)},
+                     {"candidate_area_mm2", round_nd(contact_set.candidate_area_mm2, 6)},
+                     {"contact_area_mm2", round_nd(total_area, 6)},
+                     {"mean_contact_pressure_mpa",
+                      round_nd(total_area > 0.0 ? total_force / total_area : 0.0, 4)},
+                     {"contact_pressure_reliable", contact_resolution.pressure_reliable},
+                     {"resolution", contact_resolution_json(contact_resolution)},
                      {"held_by_contact_only", held_by_contact_only},
                      {"pairs", json::array()}};
         for (const FeaContactGroup& g : contact_report.groups) {
@@ -2263,11 +2428,28 @@ static nlohmann::json fea_run_static_impl(
                      {"force_vector_n",
                       json::array({round_nd(g.force_n[0], 4), round_nd(g.force_n[1], 4),
                                    round_nd(g.force_n[2], 4)})},
+                     {"contact_area_mm2", round_nd(g.contact_area_mm2, 6)},
+                     {"mean_contact_pressure_mpa",
+                      round_nd(g.contact_area_mm2 > 0.0
+                                   ? g.contact_force_n / g.contact_area_mm2
+                                   : 0.0,
+                               4)},
                      {"max_contact_pressure_mpa", round_nd(g.max_contact_pressure_mpa, 4)},
                      {"max_penetration_mm", round_nd(g.max_penetration_mm, 6)}});
         }
         return body;
     };
+    if (contact_enabled) {
+        double total_force = 0.0;
+        double total_area = 0.0;
+        for (const FeaContactGroup& g : contact_report.groups) {
+            total_force += g.contact_force_n;
+            total_area += g.contact_area_mm2;
+        }
+        fea_contact_resolution_after_solve(contact_resolution,
+                                           contact_report.active_pairs, total_force,
+                                           total_area);
+    }
     chudware::prof::phases::add("solve", std::chrono::duration<double, std::milli>(
                                           std::chrono::steady_clock::now() - t_solve0).count());
     if (fprof) {
@@ -2305,6 +2487,16 @@ static nlohmann::json fea_run_static_impl(
                           "chatter across the gap)."},
             {"contact", contact_json()},
             {"notes", notes}};
+    }
+    // The load crossed the interface through too few pairs to be a contact patch:
+    // a converged, equilibrium-clean, plausible-looking point load. This clause is
+    // the one the live keyway needed — 1 active pair of 848 carrying 2902 N — and
+    // it can only be checked here, after the active set is known.
+    if (contact_enabled && !contact_resolution.resolved) {
+        return json{{"ok", false},
+                    {"error", "fea_static: " + contact_resolution.reason},
+                    {"contact", contact_json()},
+                    {"notes", notes}};
     }
     if (nodes_per_elem == 10) notes.push_back("second-order (tet10) elements");
     // Which factorization actually ran, and whether this solve queued behind another
@@ -3419,6 +3611,18 @@ inline uint64_t mesh_opts_key(const MeshOptions &options, uint64_t hash) {
   hash = fnv1a(&options.max_size_mm, sizeof options.max_size_mm, hash);
   hash = fnv1a(&options.learned_advisor, sizeof options.learned_advisor, hash);
   hash = fnv1a(&options.advisor_max_dof, sizeof options.advisor_max_dof, hash);
+  // The local refinement contract is part of the mesh, so it is part of the
+  // key: the same STEP at the same fineness with a refined contact interface is
+  // a DIFFERENT mesh, and serving the coarse one from cache would hand back
+  // exactly the unresolved interface the request exists to avoid. The seed
+  // POINTS are hashed too — they are where the refinement went.
+  hash = fnv1a(&options.local_refine.size_mm, sizeof options.local_refine.size_mm,
+               hash);
+  hash = fnv1a(&options.local_refine.band_mm, sizeof options.local_refine.band_mm,
+               hash);
+  if (!options.local_refine.points.empty())
+    hash = fnv1a(options.local_refine.points.data(),
+                 options.local_refine.points.size() * sizeof(double), hash);
   return hash;
 }
 struct MeshCacheCounters {

@@ -106,6 +106,30 @@ struct MeshOut {
   std::string error;
 };
 
+// LOCAL element-size contract: refine to `size_mm` within `band_mm` of these world
+// points, leaving the background size alone. This exists because the two things a
+// study most often has to resolve — a contact clearance and a small hole — are
+// LOCAL, and resolving them by lowering the uniform size is what turns a 50k-element
+// plate into a 1.2M-element one (or into "mesh element ceiling exceeded"). The
+// mesher applies it as polymesh's own fine-cell seeds plus a graded size field, so
+// the fine cells land at the seeds and grade back out to the background size.
+//
+// It is a CONTRACT, like target_size_mm: the element-count governor never coarsens
+// it (see mesh_size_band.cpp — the governor moves the background size only), and a
+// fill that cannot deliver it fails the study rather than silently returning the
+// coarse mesh. What it CANNOT do is beat the fill's own lattice: polymesh's graded
+// tet places local children at h/2 and h/4 of the background cell, so a size below
+// background/4 lowers the background as far as 4x the requested local size and says
+// so in the mesh note.
+struct MeshLocalRefine {
+  std::vector<double> points; // n*3 flat, millimetres, world coordinates
+  double size_mm = 0.0;       // requested local element size, mm (0 = no request)
+  double band_mm = 0.0;       // influence radius around each point, mm
+  std::string label;          // what asked for it, quoted in the mesh note
+
+  bool active() const { return size_mm > 0.0 && !points.empty(); }
+};
+
 struct MeshOptions {
   // 0 = coarse, 1 = fine. Base size derives from the shape bounding-box
   // diagonal.
@@ -116,6 +140,7 @@ struct MeshOptions {
   double max_size_mm = 0.0;    // >0 overrides the automatic size-band ceiling
   bool learned_advisor = false;
   uint32_t advisor_max_dof = 0; // 0 disables the advisor's DOF budget
+  MeshLocalRefine local_refine;
 };
 
 bool validate_mesh_options(const MeshOptions &options, std::string &error);

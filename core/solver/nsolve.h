@@ -109,6 +109,20 @@ public:
     void set_interactive(bool on) { interactive_ = on; }
     bool interactive() const { return interactive_; }
 
+    // Per-variable trust region for the LM step (T-MATE1). `limits` must be either
+    // empty (the default — unlimited, every existing caller bit-identical) or one
+    // entry per variable giving the largest |dx_i| a single LM iteration may take;
+    // a non-positive entry means that variable is unlimited. When any component of
+    // a step exceeds its cap the WHOLE step is scaled down by the smallest ratio, so
+    // the descent direction is preserved and only the length is bounded.
+    //
+    // Why: on the normal equations a near-null direction is amplified by the SQUARE
+    // of the Jacobian's condition number, so an inconsistent or barely-resolvable
+    // constraint can produce a step of thousands of mm that still lowers the cost by
+    // a hair and is therefore accepted. The mate solver caps translation by a
+    // fraction of the assembly's size and rotation by a fraction of a turn.
+    void set_step_limits(const Eigen::VectorXd& limits) { step_limit_ = limits; }
+
     // Levenberg-Marquardt solve with adaptive damping. x0 empty uses the
     // registered initial guess; pass the previous solution to warm-start. tol is
     // the convergence threshold on the max absolute residual. time_budget_ms, if
@@ -172,12 +186,17 @@ private:
     Eigen::VectorXd solve_step(const Eigen::MatrixXd& A,
                                const Eigen::VectorXd& b) const;
 
+    // Scale `step` in place so no component exceeds step_limit_ (no-op when the
+    // limit vector is empty or the step already fits). Returns the applied scale.
+    double clamp_step(Eigen::VectorXd& step) const;
+
     std::vector<double> init_;
     std::vector<Block> blocks_;
     int n_rows_ = 0;
     bool has_soft_ = false;
     bool dirty_ = true;
     bool interactive_ = false;
+    Eigen::VectorXd step_limit_;  // per-variable trust region; empty = unlimited
 };
 
 }  // namespace chudware::solver

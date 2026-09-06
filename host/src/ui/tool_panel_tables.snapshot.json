@@ -552,7 +552,8 @@
    "struct_analyze",
    "struct_check",
    "struct_estimate",
-   "sweep_envelope"
+   "sweep_envelope",
+   "verify_packet"
   ],
   "workspace": [
    "delegate",
@@ -1057,6 +1058,7 @@
   "vendor_status": "Return the login status of all registered vendor source adapters.",
   "vendors_health": "Run a canary health check across the vendor source adapters.",
   "verify_battery": "Run deterministic checks on one explicit document.",
+  "verify_packet": "Check ONE evidence-packet folder for mutual consistency BEFORE citing it.",
   "wall_thickness": "How THIN is the thinnest wall? Inward ray-cast wall-thickness over the whole part.",
   "workspace_doc_events": "Return per-doc event stream entries starting at *since_seq*.",
   "workspace_status": "Return the full workspace snapshot for *run_id*."
@@ -2503,7 +2505,7 @@
    "prompt_note": "job_id from sim_run. Really terminates the solver process, not a flag flip; sim_status then reports cancelled. The last partial snapshot survives, so sim_results(partial=True) may still have something."
   },
   "sim_evidence_packet": {
-   "prompt_note": "Write the case folder (inputs/result/provenance/convergence/checklist) for a finished study; unsatisfied_checklist names what still needs a hand calc or judgement."
+   "prompt_note": "Write the case folder (inputs/result/provenance/convergence/checklist) for a finished study; unsatisfied_checklist names what still needs a hand calc or judgement. A re-run into the same folder ARCHIVES the previous packet (archived_to) instead of overwriting it; overwrite=True is the only way to replace."
   },
   "sim_jobs": {
    "prompt_note": "Lists recent background solves with their state — use it to recover a job_id from an earlier turn before assuming a solve was lost."
@@ -2649,6 +2651,9 @@
   },
   "verify_battery": {
    "prompt_note": "Geometry/check health for THIS doc only: PASS covers only keys present in scores. Skipped checks are unverified, and a part-doc pass does NOT verify drawings, assembly fits, loads, material intent, tolerances or manufacturability. Run those domain checks separately before claiming the design is finished."
+  },
+  "verify_packet": {
+   "prompt_note": "Read a packet folder back and check its files describe one run (same input hash, same engine build, result.json matching the hash convergence.md cites, reduction fields present). Run it before citing a packet; ok:false means do not cite it."
   },
   "wall_thickness": {
    "prompt_note": "Headline is min_thickness_mm vs your process floor (~1 mm injection, ~0.8 mm FDM); null means an open/sheet body — confirm a solid with measure_part."

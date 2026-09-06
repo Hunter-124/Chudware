@@ -7,10 +7,12 @@ from __future__ import annotations
 
 import contextlib
 import ast
+import hashlib
 import json
 import math
 import os
 import re
+import shutil
 import tempfile
 import time
 from pathlib import Path
@@ -1083,6 +1085,80 @@ def _sanitize_output_path(path: str) -> str:
     if not isinstance(path, str) or not path.strip():
         raise ValueError("output path must be a non-empty string")
     return os.path.abspath(os.path.expanduser(path))
+
+
+# --- never overwrite an artifact: archive the old set first -----------------------------
+# A released artifact is EVIDENCE, and evidence is not overwritable. On 2026-09-05 a
+# mission re-ran one load case into the folder that already held that case's packet, and
+# the previous run's result.json / inputs.json / provenance.json were simply gone: the
+# never-overwrite rule lived only in the project's runbook, so the only thing that could
+# enforce it was the agent's memory. It lives here now. Every writer of a packet file or
+# a solver .vtu calls `archive_before_write()` first, and any existing file is MOVED into
+# `<anchor>/superseded_<YYYY-MM-DD>_<short-hash>/` before the new bytes land — a rename,
+# so it is free even for a 27 MB .vtu, and the old bytes stay on disk under a name that
+# says what they are. The short hash comes from the file that IDENTIFIES the old set
+# (result.json for a packet, the .vtu itself), so two different sets archived on the same
+# day never collide and re-archiving the same content twice lands in the same directory.
+SUPERSEDED_PREFIX = "superseded_"
+
+
+def file_sha256(path: Union[str, Path]) -> Optional[str]:
+    """The sha256 hex digest of a real file, or None — a hash of nothing is not evidence."""
+    p = Path(path)
+    if not p.is_file():
+        return None
+    h = hashlib.sha256()
+    with p.open("rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def archive_before_write(
+    targets: Sequence[Union[str, Path]],
+    *,
+    anchor: Optional[Union[str, Path]] = None,
+    hash_source: Optional[Union[str, Path]] = None,
+) -> Optional[dict]:
+    """Move every EXISTING path in *targets* aside so a writer cannot destroy it.
+
+    targets : the files about to be written. Ones that do not exist are ignored.
+    anchor : directory the `superseded_*` folder is created in; defaults to the parent of
+             the first existing target (so a lone .vtu is archived beside itself).
+    hash_source : the file whose content names the archive; defaults to the first existing
+             target. A packet passes its result.json — the identity of the old result.
+
+    Returns None when there was nothing to protect, else
+    {archived_to, archived_files, archived_utc, hash_of, sha256}. A name collision inside
+    an existing archive directory is suffixed (`result.1.json`) rather than overwritten:
+    this function never deletes and never replaces a byte.
+    """
+    existing = [Path(t) for t in targets if t and Path(t).is_file()]
+    if not existing:
+        return None
+    base = Path(anchor) if anchor is not None else existing[0].parent
+    src = Path(hash_source) if hash_source is not None and Path(hash_source).is_file() \
+        else existing[0]
+    digest = file_sha256(src) or ""
+    stamp = time.strftime("%Y-%m-%d", time.gmtime())
+    dest = base / f"{SUPERSEDED_PREFIX}{stamp}_{digest[:8] or 'nohash'}"
+    dest.mkdir(parents=True, exist_ok=True)
+    moved: list = []
+    for p in existing:
+        target = dest / p.name
+        n = 1
+        while target.exists():
+            target = dest / f"{p.stem}.{n}{p.suffix}"
+            n += 1
+        shutil.move(str(p), str(target))
+        moved.append(target.name)
+    return {
+        "archived_to": str(dest.resolve()),
+        "archived_files": sorted(moved),
+        "archived_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "hash_of": src.name,
+        "sha256": digest or None,
+    }
 
 
 # --- live viewport handoff -------------------------------------------------------------

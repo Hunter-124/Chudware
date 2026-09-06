@@ -107,6 +107,44 @@ SizeBand resolve_size_band(const TopoDS_Shape &shape,
       memory_budget == UINT64_MAX ? 0.0
                                   : static_cast<double>(memory_budget) / 1073741824.0;
 
+  // ── The element CEILING is a memory number, not a constant ──────────────────
+  // polymesh's pre-flight guard refuses a fill past `element_ceiling`, and its
+  // own default is 589,824 elements (12 x 48k, kDefaultMaxMeshElems) with a
+  // 1.77M DOF twin. That constant is what a 31 GB machine hit while trying to
+  // resolve four O6.6 holes: the fill it refused needed 1.16M tet4, which is
+  // 0.8 GB of mesh — a rounding error against this box's study budget.
+  //
+  // So the ceiling is derived: study memory budget / the MEASURED mesh-stage
+  // cost per element. Peak RSS of this exact path (polymesh graded fill ->
+  // MeshOut normalization -> quality pass), 4-hole-plate probes 2026-09-06,
+  // Release, one run per row:
+  //
+  //   tet4   39,952 elems -> 0.081 GB   46,304 -> 0.087   160,734 -> 0.167
+  //          222,392 -> 0.201        => 706 B/element over a ~59 MB floor
+  //   tet10 116,800 elems (170,917 nodes) -> 0.160 GB => 966 B/element
+  //
+  // The constants below carry a ~2x safety factor over those slopes and ignore
+  // the fixed floor (it is noise at any element count that matters). Re-measure
+  // them, never scale them, if the fill or MeshOut representation changes.
+  //
+  // Two things stay true regardless of how big this number gets: the automatic
+  // element SIZE is still governed by the interactivity/memory budget above (a
+  // raised ceiling does not make the default mesh finer), and the SOLVE is
+  // gated separately by governor::fea_peak_bytes against the ACTUAL element
+  // count. The ceiling's job is to stop a runaway fill, and it is floored at
+  // polymesh's own default so no machine meshes less than it did before.
+  constexpr uint64_t kPolymeshDefaultElementCeiling = 589824;
+  constexpr uint64_t kMeshBytesPerElementTet4 = 1500;
+  constexpr uint64_t kMeshBytesPerElementTet10 = 2000;
+  const uint64_t mesh_bytes_per_element =
+      options.order == 2 ? kMeshBytesPerElementTet10 : kMeshBytesPerElementTet4;
+  band.element_ceiling =
+      memory_budget == UINT64_MAX
+          ? kPolymeshDefaultElementCeiling
+          : std::max(kPolymeshDefaultElementCeiling,
+                     memory_budget / mesh_bytes_per_element);
+  band.dof_ceiling = band.element_ceiling * 3;
+
   const double volume_estimate =
       solid_volume > 1e-9 ? solid_volume : dx * dy * dz;
   // Bounding-box surface area — an upper bound on the model's own area, so the
@@ -321,11 +359,37 @@ SizeBand resolve_size_band(const TopoDS_Shape &shape,
     }
   }
 
+  // Only SAY the ceiling was raised when the raise is load-bearing: a study whose
+  // own predicted count is nowhere near polymesh's default does not need the line.
+  if (band.element_ceiling > kPolymeshDefaultElementCeiling &&
+      predict_elements(base) > static_cast<double>(kPolymeshDefaultElementCeiling)) {
+    char text[320];
+    std::snprintf(text, sizeof(text),
+                  "mesh element ceiling raised to %.2fM %s from polymesh's 0.59M "
+                  "default: this machine's %.1f GB study budget affords it at %llu "
+                  "measured mesh bytes/element",
+                  static_cast<double>(band.element_ceiling) / 1e6, element_name,
+                  budget_gb,
+                  static_cast<unsigned long long>(mesh_bytes_per_element));
+    append_note(text);
+  }
   double minimum = options.min_size_mm > 0.0 ? options.min_size_mm : base * 0.5;
   double maximum = options.max_size_mm > 0.0 ? options.max_size_mm : base;
+  // A LOCAL refinement request is a contract (mesher.h MeshLocalRefine): the size
+  // band must not put a floor under it. min_len is what bounds the feature-hint
+  // ladder and the mesher's local sizing, so an interface refined to 0.35 mm inside
+  // a study whose base size is 2.9 mm needs the floor to follow it down.
+  if (options.local_refine.active())
+    minimum = std::min(minimum, options.local_refine.size_mm);
   if (maximum < minimum)
     std::swap(maximum, minimum);
-  minimum = std::max(minimum, diagonal * 1e-3);
+  // The 0.1%-of-diagonal sanity floor stands, except where a local refinement
+  // contract asks for less: on a 1 m part a 0.35 mm interface is legitimate.
+  const double absolute_floor =
+      options.local_refine.active()
+          ? std::min(diagonal * 1e-3, options.local_refine.size_mm)
+          : diagonal * 1e-3;
+  minimum = std::max(minimum, absolute_floor);
   maximum = std::max(maximum, minimum);
 
   band.base = base;

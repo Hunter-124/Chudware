@@ -31,12 +31,19 @@
 // `cgroup memory.max` is the CGROUP-AWARE term and the only HARD one: /proc/meminfo
 // describes the machine, but a process inside a memory-capped cgroup (systemd-run
 // -p MemoryMax=, a .service unit, a container) is SIGKILLed by the cgroup OOM
-// killer at its own limit while host RAM is still free. The term is
+// killer at its own limit while host RAM is still free. The limit is
 // min(memory.max, memory.high) over our own cgroup and every ancestor up to the
-// root, minus the usage of the OTHER processes sharing that cgroup
-// (memory.current - our RSS). Because it is a kill line, it is applied AFTER the
-// small-job floor: no knob and no floor may raise a budget above it. With no
-// cgroup v2 limit anywhere on the path the term is infinite and nothing changes.
+// root (each honoured only when finite), minus what the OTHER processes sharing
+// that cgroup hold — measured as memory.stat `anon` + `shmem` less our own anon
+// RSS, NEVER as memory.current, which also counts the reclaimable page cache and
+// would collapse the term to nothing after a big STEP/VTU read. Because the limit
+// is a kill line it is applied AFTER the small-job floor: no knob may raise a
+// budget above it. The sibling subtraction, being an estimate of a moving target,
+// does keep the floor — the term is max(claimable, min(floor, limit)) — so one
+// sibling's transient GB cannot refuse every study inside a roomy scope, while a
+// cgroup limit genuinely below the floor still binds. With no cgroup v2 limit
+// anywhere on the path the term is infinite and nothing changes. A refusal on
+// this term names the limit AND how much of it the siblings hold.
 //
 // Env knobs (all optional; shared naming with benchmarks/simsuite/resguard.py):
 //   CHUDWARE_GOVERNOR=0     disable every check (admit everything, full threads)
@@ -45,6 +52,10 @@
 //   CHUDWARE_HEADROOM_GB    RAM always left to the OS/GUI               (default 4)
 //   CHUDWARE_CPU_FRAC       fraction of logical cores for heavy ops     (default 0.75)
 //   CHUDWARE_SIM_THREADS   absolute solver thread cap (also set by the Python resguard)
+//   CHUDWARE_CGROUP_ROOT    replaces /sys/fs/cgroup AND the /proc/self/cgroup lookup;
+//                           the named directory IS the cgroup (leaf == root). Tests
+//                           fake memory.max/high/stat with it; also lets you replay a
+//                           container's own accounting by hand
 #pragma once
 
 #include <cstdint>
@@ -67,8 +78,8 @@ uint64_t process_rss_bytes();
 
 // The byte budget one study may claim right now: min(frac*total, cap,
 // avail-headroom), floored at min(3 GB, 40% of total) so a briefly-busy box
-// doesn't refuse tiny jobs, then clamped to the cgroup memory.max term (a hard
-// kill line the floor may not cross). UINT64_MAX when the governor is disabled.
+// doesn't refuse tiny jobs, then clamped to the cgroup term above (a hard kill
+// line no knob may cross). UINT64_MAX when the governor is disabled.
 uint64_t budget_bytes();
 
 // Admission check for a projected peak. Returns true when the job fits (or the

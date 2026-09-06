@@ -5,6 +5,7 @@
 // before meshing begins.
 #pragma once
 
+#include <cstdint>
 #include <string>
 
 #include <TopoDS_Shape.hxx>
@@ -29,6 +30,13 @@ struct SizeBand {
     double min_len = 0.0;   // size-band floor, mm
     double max_len = 0.0;   // size-band ceiling, mm
     double diag = 0.0;      // bounding-box diagonal, mm
+    // Hard element/DOF ceilings handed to polymesh's pre-flight guard (its
+    // "raise --max-elems/--max-dof" refusal). NOT a constant any more: it is
+    // this machine's study memory budget divided by the MEASURED mesh-stage
+    // cost per element, floored at polymesh's own default so no box meshes
+    // less than it used to. See resolve_size_band for the measurements.
+    uint64_t element_ceiling = 0;
+    uint64_t dof_ceiling = 0;
 };
 
 // fineness -> base element size off the bbox DIAGONAL, clamped by the part's smallest real

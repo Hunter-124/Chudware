@@ -199,7 +199,17 @@ ENTRIES: dict[str, dict[str, Any]] = {
         "prompt_note": (
             "Write the case folder (inputs/result/provenance/convergence/"
             "checklist) for a finished study; unsatisfied_checklist names "
-            "what still needs a hand calc or judgement."
+            "what still needs a hand calc or judgement. A re-run into the "
+            "same folder ARCHIVES the previous packet (archived_to) instead "
+            "of overwriting it; overwrite=True is the only way to replace."
+        ),
+    },
+    "verify_packet": {
+        "prompt_note": (
+            "Read a packet folder back and check its files describe one run "
+            "(same input hash, same engine build, result.json matching the "
+            "hash convergence.md cites, reduction fields present). Run it "
+            "before citing a packet; ok:false means do not cite it."
         ),
     },
     "polymesh_cli": {

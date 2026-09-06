@@ -181,12 +181,18 @@ struct ContactSpring {
 // (compression only, so it always opposes penetration); contact_force_n is its
 // magnitude. max_contact_pressure_mpa is the worst per-pair normal force divided by
 // that pair's tributary node area — it is 0.0 when no active pair carried an area.
+// contact_area_mm2 is the summed tributary area of the ACTIVE pairs: the contact
+// patch this resultant is spread over, so contact_force_n / contact_area_mm2 is a
+// mean contact pressure. It is 0.0 when nothing is pressed together, and a patch of
+// one or two pairs is a point load rather than a pressure — see ContactResolution in
+// fea_contact.h, which is what decides whether that division means anything.
 struct FeaContactGroup {
     int group = 0;
     int candidate_pairs = 0;
     int active_pairs = 0;
     std::array<double, 3> force_n{0.0, 0.0, 0.0};
     double contact_force_n = 0.0;
+    double contact_area_mm2 = 0.0;
     double max_contact_pressure_mpa = 0.0;
     double max_penetration_mm = 0.0;
 };

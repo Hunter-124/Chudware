@@ -4263,6 +4263,10 @@ json ops_response_assembly(Session& s, const json& id_map,
     json mates = json::array();
     int dof = 0;
     bool over_defined = false;
+    bool converged = true;
+    double max_residual = 0.0;
+    double tolerance = 0.0;
+    std::string worst_mate;
     std::string dof_summary;
     if (ares) {
         for (const AsmComponentStatus& cs : ares->component_status) {
@@ -4274,9 +4278,14 @@ json ops_response_assembly(Session& s, const json& id_map,
         }
         for (const AsmMateStatus& ms : ares->mate_status)
             mates.push_back({{"id", ms.id}, {"type", ms.type}, {"status", ms.status},
-                             {"dangling_refs", ms.dangling_refs}});
+                             {"dangling_refs", ms.dangling_refs},
+                             {"residual", ms.residual}});
         dof = ares->dof;
         over_defined = ares->over_defined;
+        converged = ares->converged;
+        max_residual = ares->max_residual;
+        tolerance = ares->tolerance;
+        worst_mate = ares->worst_mate;
         dof_summary = ares->dof_summary;
     }
 
@@ -4284,12 +4293,19 @@ json ops_response_assembly(Session& s, const json& id_map,
     json rebuild = {
         {"feature_status", feature_status},
         {"doc_status", {{"active_sketch", active_sketch_status},
-                        {"mates", over_defined ? "over" : "ok"},
+                        {"mates", over_defined ? "over" : (converged ? "ok" : "unsolved")},
                         {"active_configuration", config_active_name(s.doc)}}},
         {"components", components},
         {"mates", mates},
         {"dof", dof},
         {"over_defined", over_defined},
+        // The mate solve's own verdict, so a caller never has to infer a failed solve
+        // from the poses: `converged` plus the mate that owns the worst residual and
+        // the size-scaled threshold it was judged against (see mate::solve_mates).
+        {"converged", converged},
+        {"max_residual", max_residual},
+        {"worst_mate", worst_mate},
+        {"tolerance", tolerance},
         {"dof_summary", dof_summary},
     };
     return json{

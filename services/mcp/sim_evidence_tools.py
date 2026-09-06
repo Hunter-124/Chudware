@@ -1,15 +1,27 @@
 """Simulation EVIDENCE tools — the release packet and the independent-solver cross-check.
 
-Two tools, both about the same problem: a solved number is not a released number.
+Three tools, all about the same problem: a solved number is not a released number.
 
   sim_evidence_packet(...)  writes one self-contained directory per case (inputs, result,
                             convergence table, hashes, provenance, annotated render) and
                             pre-fills the runbook's evidence checklist, marking only the
                             items the packet itself proves.
+  verify_packet(folder)     reads a packet folder back and reports whether its files
+                            describe the SAME run (one geometry hash, one engine build,
+                            one result.json the convergence table and provenance both
+                            cite, reduction disclosure present) — the check to run before
+                            citing a packet.
   polymesh_cli(...)         drives the Polyhedral-FEA command-line binary directly — the
                             runbook's step 11 "cross-check the critical case in the other
                             solver with identical assumptions", outside the engine's own
                             in-process solver path.
+
+A packet is never overwritten. Writing into a folder that already holds one MOVES the
+existing set into `superseded_<date>_<short-hash>/` first and records what it displaced
+in the new provenance.json's `superseded_from`; `overwrite=True` is the only way to
+replace in place. The rule used to live only in the project's runbook, which meant the
+only thing enforcing it was the agent's memory — and on 2026-09-05 a re-run of one case
+destroyed the previous run's released packet.
 
 The checklist items are copied VERBATIM from the project's Simulation Runbook (EVIDENCE
 CHECKLIST FOR EVERY RELEASED RESULT). Editing their wording here silently un-couples the
@@ -31,13 +43,17 @@ import datetime
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 
 from .cad_common import (
+    archive_before_write,
     coerce_json_or_repr,
+    file_sha256,
     require_list,
     require_mapping,
+    SUPERSEDED_PREFIX,
     _dumps,
     _err,
 )
@@ -151,8 +167,15 @@ def _convergence_table(result: dict) -> list:
     return []
 
 
-def _convergence_md(case_id: str, result: dict, rows: list) -> str:
-    """The convergence table as markdown — the artifact a reviewer reads, not JSON."""
+def _convergence_md(
+    case_id: str, result: dict, rows: list, result_sha256: Optional[str] = None
+) -> str:
+    """The convergence table as markdown — the artifact a reviewer reads, not JSON.
+
+    The header cites the sha256 of the result.json this table was written beside, which
+    is what makes the two files checkable against each other: verify_packet re-hashes
+    result.json and refuses a packet where the table describes a different run.
+    """
     cols: list = []
     for row in rows:
         for key in row:
@@ -165,6 +188,9 @@ def _convergence_md(case_id: str, result: dict, rows: list) -> str:
         f"tol_pct: `{result.get('tol_pct')}`  "
         f"converged: `{result.get('converged')}`  "
         f"final_delta_pct: `{result.get('final_delta_pct')}`",
+        "",
+        f"result_sha256: `{result_sha256}`" if result_sha256 else
+        "result_sha256: `unrecorded`",
         "",
         "| " + " | ".join(cols) + " |",
         "| " + " | ".join("---" for _ in cols) + " |",
@@ -391,6 +417,305 @@ def _checklist_md(case_id: str, requirement_id: str, state: list) -> str:
     return "\n".join(lines)
 
 
+# ------------------------------------------------------------- never overwrite a packet
+
+#: Every file the packet writer may produce. An existing packet is archived as a SET: a
+#: folder whose result.json came from one run and whose checklist.md came from another is
+#: not evidence, it is a collage.
+_PACKET_FILES = (
+    "inputs.json",
+    "result.json",
+    "provenance.json",
+    "convergence.md",
+    "checklist.md",
+)
+
+#: The annotated render is copied in under whatever extension it arrived with.
+_PACKET_IMAGE_STEM = "annotated_render"
+
+
+def _packet_targets(packet: Path) -> list:
+    """Every path in this folder the writer is about to replace."""
+    out = [packet / name for name in _PACKET_FILES]
+    out.extend(sorted(packet.glob(f"{_PACKET_IMAGE_STEM}.*")))
+    return out
+
+
+def _prior_packet_identity(packet: Path) -> dict:
+    """What the packet ALREADY in this folder says about itself, read before it moves.
+
+    Recorded into the new provenance.json as `superseded_from`, so the replacement names
+    the run it displaced (result hash, engine build, when it was written) even after the
+    old bytes have moved into the archive directory. `chained_from` carries the previous
+    packet's own `superseded_from.archived_to`, which makes the lineage walkable back
+    through every re-run of the case.
+    """
+    out: dict = {}
+    result = packet / "result.json"
+    if result.is_file():
+        out["result_sha256"] = file_sha256(result)
+        prior, _ = _read_packet_json(result)
+        if isinstance(prior, dict):
+            prov = prior.get("provenance")
+            if isinstance(prov, dict):
+                out["engine_build_id"] = prov.get("engine_build_id")
+                out["solver_timestamp_utc"] = prov.get("timestamp_utc")
+    prov_file = packet / "provenance.json"
+    if prov_file.is_file():
+        prior_prov, _ = _read_packet_json(prov_file)
+        if isinstance(prior_prov, dict):
+            out["packet_written_utc"] = prior_prov.get("packet_written_utc")
+            chain = prior_prov.get("superseded_from")
+            if isinstance(chain, dict) and chain.get("archived_to"):
+                out["chained_from"] = chain["archived_to"]
+    return out
+
+
+def _supersede_packet(packet: Path, *, overwrite: bool) -> tuple:
+    """(archive | None, superseded_from | None) — protect an existing packet, or record
+    the deliberate in-place replacement of one.
+
+    With `overwrite=False` (the default) every existing packet file is MOVED into
+    `<packet>/superseded_<YYYY-MM-DD>_<short-hash of the old result.json>/` before a byte
+    is written. With `overwrite=True` nothing is archived — but the displaced run is
+    still named in `superseded_from`, because a released number whose inputs vanished
+    without trace is exactly what the never-overwrite rule exists to prevent.
+    """
+    targets = _packet_targets(packet)
+    if not any(p.is_file() for p in targets):
+        return None, None
+    prior = _prior_packet_identity(packet)
+    if overwrite:
+        return None, {
+            "mode": "overwrite_in_place",
+            "archived_to": None,
+            "replaced_utc": _utc_now(),
+            **prior,
+        }
+    archive = archive_before_write(
+        targets, anchor=packet, hash_source=packet / "result.json"
+    )
+    return archive, {"mode": "archived", **(archive or {}), **prior}
+
+
+# ------------------------------------------------------------------- packet verification
+
+#: convergence.md cites the sha256 of the result.json it was written beside. A packet
+#: whose result.json no longer hashes to that value has had one file replaced without the
+#: others — the shape of the 2026-09-05 overwrite, and unciteable either way.
+_CITED_HASH_RE = re.compile(r"result_sha256:\s*`?([0-9a-f]{64})`?", re.IGNORECASE)
+
+#: The reported peak is masked around ideal fixtures, so a packet that does not carry the
+#: disclosure cannot be read: the reader has no way to know whether the number they are
+#: about to cite is the field's maximum.
+_REDUCTION_FIELDS = (
+    "max_von_mises_reduction",
+    "max_von_mises_raw_mpa",
+    "min_fos_raw",
+)
+
+
+def _read_packet_json(path: Path) -> tuple:
+    """(obj | None, problem | None) — an unparseable packet file is a FINDING, not a raise."""
+    if not path.is_file():
+        return None, f"{path.name} is missing"
+    try:
+        return json.loads(path.read_text(encoding="utf-8")), None
+    except Exception as e:  # noqa: BLE001
+        return None, f"{path.name} does not parse as JSON: {e}"
+
+
+def _packet_checks(packet: Path) -> list:
+    """Every mutual-consistency check over one packet folder, as ordered rows.
+
+    Each row is {check, ok, detail, severity}. Nothing here re-solves or re-derives a
+    number: the checks compare what the packet's own files say about each other, which is
+    the only question a reader has before citing it.
+
+    `severity` separates the two ways a check can be not-ok, because they need different
+    responses. "mismatch" is a CONTRADICTION — two files describing different runs, or
+    required evidence absent; the packet is not citeable. "unrecorded" means the packet
+    simply predates the result-hash stamp (every packet written before 2026-09-06), so a
+    single-file swap can be neither shown nor ruled out; re-running sim_evidence_packet on
+    the same study_result archives it and re-stamps the replacement.
+    """
+    checks: list = []
+
+    def check(name: str, ok, detail: str, severity: str = "mismatch") -> None:
+        checks.append(
+            {
+                "check": name,
+                "ok": bool(ok),
+                "detail": detail,
+                "severity": "" if ok else severity,
+            }
+        )
+
+    result, r_err = _read_packet_json(packet / "result.json")
+    inputs, i_err = _read_packet_json(packet / "inputs.json")
+    prov, p_err = _read_packet_json(packet / "provenance.json")
+    problems = [e for e in (r_err, i_err, p_err) if e]
+    check(
+        "core_files_readable",
+        not problems,
+        "; ".join(problems) if problems else
+        "result.json, inputs.json and provenance.json all parse",
+    )
+    result = result if isinstance(result, dict) else {}
+    inputs = inputs if isinstance(inputs, dict) else {}
+    prov = prov if isinstance(prov, dict) else {}
+
+    checklist_md = packet / "checklist.md"
+    convergence_md = packet / "convergence.md"
+
+    case_ids = {
+        "inputs.json": inputs.get("case_id"),
+        "provenance.json": prov.get("case_id"),
+    }
+    named = {v for v in case_ids.values() if v}
+    check(
+        "case_id_agrees",
+        len(named) == 1 and all(case_ids.values()),
+        f"case ids: {case_ids}"
+        + (
+            ""
+            if len(named) == 1 and all(case_ids.values())
+            else " — the files describe different cases or one is unnamed"
+        ),
+    )
+
+    geo_in = inputs.get("geometry") if isinstance(inputs.get("geometry"), dict) else {}
+    geo_prov = (
+        prov.get("geometry_sha256") if isinstance(prov.get("geometry_sha256"), dict) else {}
+    )
+    in_hash = geo_in.get("sha256")
+    prov_hash = geo_prov.get("sha256")
+    check(
+        "input_hash_agrees",
+        bool(in_hash) and in_hash == prov_hash,
+        f"inputs.json geometry sha256={in_hash}, provenance.json={prov_hash}"
+        if in_hash or prov_hash
+        else "neither file records a geometry sha256 — the solved revision is unpinned, "
+        "so nothing in this packet can be tied to a geometry file",
+    )
+
+    res_build = (
+        result.get("provenance").get("engine_build_id")
+        if isinstance(result.get("provenance"), dict)
+        else None
+    )
+    prov_build = (
+        prov.get("solver_provenance").get("engine_build_id")
+        if isinstance(prov.get("solver_provenance"), dict)
+        else None
+    )
+    check(
+        "engine_build_id_agrees",
+        bool(res_build) and res_build == prov_build,
+        f"result.json engine_build_id={res_build!r}, "
+        f"provenance.json solver_provenance.engine_build_id={prov_build!r}",
+    )
+
+    actual = file_sha256(packet / "result.json")
+    cited_prov = prov.get("result_sha256")
+    check(
+        "provenance_cites_this_result",
+        bool(actual) and cited_prov == actual,
+        f"provenance.json result_sha256={cited_prov}, result.json hashes to {actual}"
+        if cited_prov
+        else "provenance.json records no result_sha256 — it predates the archive-then-"
+        "write guard, so it cannot prove it describes THIS result.json",
+        "mismatch" if cited_prov else "unrecorded",
+    )
+
+    rows = _convergence_table(result)
+    adapt = result.get("adapt") if isinstance(result.get("adapt"), dict) else {}
+    if convergence_md.is_file():
+        text = convergence_md.read_text(encoding="utf-8", errors="replace")
+        m = _CITED_HASH_RE.search(text)
+        cited = m.group(1).lower() if m else None
+        if cited is None:
+            detail = (
+                "convergence.md cites no result_sha256 — it cannot be tied to this "
+                "result.json"
+            )
+        elif cited == actual:
+            detail = f"convergence.md cites result_sha256={cited}, and result.json hashes to it"
+        else:
+            detail = (
+                f"convergence.md cites result_sha256={cited} but result.json hashes to "
+                f"{actual} — they are from DIFFERENT runs"
+            )
+        check(
+            "convergence_cites_this_result",
+            cited is not None and cited == actual,
+            detail,
+            "mismatch" if cited is not None else "unrecorded",
+        )
+    else:
+        check(
+            "convergence_evidence_present",
+            adapt.get("eta_target_met") is True,
+            "no convergence.md; result.json carries adaptive convergence "
+            f"(eta_target_met={adapt.get('eta_target_met')})"
+            if adapt
+            else "no convergence.md and no adaptive convergence metadata — the packet "
+            "cites a single mesh, which the runbook does not accept",
+        )
+    if rows and not convergence_md.is_file():
+        check(
+            "convergence_table_written",
+            False,
+            f"result.json carries {len(rows)} convergence rows but the packet has no "
+            "convergence.md — re-run sim_evidence_packet on this result",
+        )
+
+    summary = result.get("summary") if isinstance(result.get("summary"), dict) else {}
+    if "max_von_mises_mpa" in summary:
+        missing = [k for k in _REDUCTION_FIELDS if summary.get(k) is None]
+        check(
+            "reduction_fields_present",
+            not missing,
+            f"summary carries {[k for k in _REDUCTION_FIELDS if k not in missing]}"
+            if not missing
+            else f"summary is MISSING {missing} — whether max_von_mises_mpa is the "
+            "field's maximum or a fixture-masked value is unknown, so the number "
+            "cannot be released",
+        )
+
+    vtu = prov.get("vtu_sha256") if isinstance(prov.get("vtu_sha256"), dict) else {}
+    if vtu.get("path"):
+        vtu_now = file_sha256(vtu["path"])
+        check(
+            "vtu_matches_provenance",
+            bool(vtu_now) and vtu_now == vtu.get("sha256"),
+            f"{vtu['path']}: recorded {vtu.get('sha256')}, now {vtu_now}"
+            if vtu_now
+            else f"{vtu['path']} is gone — the field the packet's numbers came from is "
+            "no longer on disk",
+        )
+
+    if checklist_md.is_file():
+        text = checklist_md.read_text(encoding="utf-8", errors="replace")
+        absent = [item for item in _CHECKLIST if item not in text]
+        open_items = [
+            line.split("] ", 1)[1].strip()
+            for line in text.splitlines()
+            if line.startswith("- [ ] ")
+        ]
+        check(
+            "checklist_is_the_runbook_list",
+            not absent,
+            f"all {len(_CHECKLIST)} runbook items present; {len(open_items)} still open"
+            if not absent
+            else f"checklist.md does not carry {len(absent)} runbook item(s): {absent}",
+        )
+    else:
+        check("checklist_present", False, "checklist.md is missing")
+    return checks
+
+
+
 # --------------------------------------------------------------------------- polymesh CLI
 
 #: Wall-clock ceiling for one CLI invocation. A `solve --adapt` on a real frame is a
@@ -496,6 +821,7 @@ def register_sim_evidence_tools(mcp: FastMCP) -> None:
         material_source: str = "",
         load_rationale: str = "",
         notes: str = "",
+        overwrite: bool = False,
     ) -> str:
         """Write ONE released-result evidence packet and pre-fill the runbook checklist.
 
@@ -515,6 +841,17 @@ def register_sim_evidence_tools(mcp: FastMCP) -> None:
                    table) — a material with no source cannot be released.
         load_rationale : magnitude, direction, distribution and dynamic-factor justification.
         notes : limitations and what remains unverified.
+        overwrite : DANGEROUS, default False. A packet folder that already holds a packet
+                   is never written over: the existing inputs.json / result.json /
+                   provenance.json / convergence.md / checklist.md / annotated render are
+                   MOVED, as a set, into
+                   <packet>/superseded_<YYYY-MM-DD>_<short-hash of the old result.json>/
+                   before anything is written, the reply names that directory in
+                   `archived_to`, and the new provenance.json records what it displaced in
+                   `superseded_from` (old result sha256, engine build, when it was
+                   written, and the previous archive so the lineage is walkable). Pass
+                   True ONLY to replace a packet in place — nothing is archived then, and
+                   the displaced run survives only as the `superseded_from` note.
 
         The stress and FoS checklist items quote the result's OWN reduction disclosure
         (summary.max_von_mises_reduction / max_von_mises_raw_mpa / min_fos_raw): the
@@ -525,10 +862,13 @@ def register_sim_evidence_tools(mcp: FastMCP) -> None:
         predates the disclosure and is flagged as UNKNOWN rather than assumed unmasked.
 
         Writes inputs.json, result.json, provenance.json, checklist.md, convergence.md
-        (when the result carries a table) and a copy of the annotated render when the
-        result points at one. Returns {ok, packet_dir, files, unsatisfied_checklist,
-        checklist, geometry_sha256, vtu_sha256}. `unsatisfied_checklist` is the release
-        gate: it is non-empty until a human closes the judgement items.
+        (when the result carries a table; its header cites result.json's sha256, which is
+        what verify_packet checks the folder's mutual consistency against) and a copy of
+        the annotated render when the result points at one. Returns {ok, packet_dir,
+        files, unsatisfied_checklist, checklist, geometry_sha256, vtu_sha256,
+        result_sha256, archived_to, superseded_from}. `unsatisfied_checklist` is the
+        release gate: it is non-empty until a human closes the judgement items.
+        `archived_to` is non-null exactly when this call displaced an earlier packet.
         """
         try:
             if not isinstance(case_id, str) or not case_id.strip():
@@ -547,11 +887,26 @@ def register_sim_evidence_tools(mcp: FastMCP) -> None:
             packet = _require_abs_dir(out_dir, "out_dir") / case_id
             packet.mkdir(parents=True, exist_ok=True)
 
+            # Everything the packet points AT is resolved before anything moves: a
+            # geometry path, a .vtu or a render that lives in this folder would otherwise
+            # be hashed after the archive had already renamed it away.
             geometry = _sha256(geometry_path) if geometry_path else None
             vtu_path = result.get("vtu_path")
             vtu = _sha256(vtu_path) if isinstance(vtu_path, str) else None
             rows = _convergence_table(result)
             image = _find_image(result)
+
+            # Never overwrite: the previous packet moves aside, as a set, before the
+            # first byte of this one is written.
+            archive, superseded_from = _supersede_packet(packet, overwrite=bool(overwrite))
+            if image and not Path(image).is_file():
+                # The render WAS this folder's annotated_render.* — it went into the
+                # archive with the rest of the old set, so copy it from there instead of
+                # dropping the annotated view from the new packet.
+                moved = (
+                    Path(archive["archived_to"]) / Path(image).name if archive else None
+                )
+                image = str(moved) if moved and moved.is_file() else None
 
             files: list = []
 
@@ -580,6 +935,7 @@ def register_sim_evidence_tools(mcp: FastMCP) -> None:
                 ),
             )
             write("result.json", json.dumps(result, indent=2))
+            result_sha256 = file_sha256(packet / "result.json")
             write(
                 "provenance.json",
                 json.dumps(
@@ -591,12 +947,17 @@ def register_sim_evidence_tools(mcp: FastMCP) -> None:
                         "reactions": result.get("reactions"),
                         "geometry_sha256": geometry,
                         "vtu_sha256": vtu,
+                        "result_sha256": result_sha256,
+                        "superseded_from": superseded_from,
                     },
                     indent=2,
                 ),
             )
             if rows:
-                write("convergence.md", _convergence_md(case_id, result, rows))
+                write(
+                    "convergence.md",
+                    _convergence_md(case_id, result, rows, result_sha256),
+                )
             if image:
                 dest = packet / f"annotated_render{Path(image).suffix.lower()}"
                 shutil.copyfile(image, dest)
@@ -618,6 +979,24 @@ def register_sim_evidence_tools(mcp: FastMCP) -> None:
             write("checklist.md", _checklist_md(case_id, requirement_id, state))
 
             unsatisfied = [row["item"] for row in state if not row["auto_satisfied"]]
+            note = (
+                f"{len(unsatisfied)} of {len(state)} checklist items are NOT closed "
+                "by the packet itself — they are judgement calls (locations, "
+                "singularity assessment, allowable, hand calculation) and must be "
+                "written into checklist.md before release."
+            )
+            if archive:
+                note = (
+                    f"the packet already in this folder was moved to "
+                    f"{archive['archived_to']} before writing; provenance.json records it "
+                    f"as superseded_from. {note}"
+                )
+            elif superseded_from:
+                note = (
+                    "overwrite=True REPLACED the packet already in this folder in place; "
+                    "only provenance.json's superseded_from now names the displaced run. "
+                    + note
+                )
             return _dumps(
                 {
                     "ok": True,
@@ -627,14 +1006,138 @@ def register_sim_evidence_tools(mcp: FastMCP) -> None:
                     "unsatisfied_checklist": unsatisfied,
                     "geometry_sha256": geometry["sha256"] if geometry else None,
                     "vtu_sha256": vtu["sha256"] if vtu else None,
-                    "note": (
-                        f"{len(unsatisfied)} of {len(state)} checklist items are NOT closed "
-                        "by the packet itself — they are judgement calls (locations, "
-                        "singularity assessment, allowable, hand calculation) and must be "
-                        "written into checklist.md before release."
-                    ),
+                    "result_sha256": result_sha256,
+                    "archived_to": archive["archived_to"] if archive else None,
+                    "superseded_from": superseded_from,
+                    "note": note,
                 }
             )
+        except Exception as e:  # noqa: BLE001
+            return _err(e)
+
+    @mcp.tool()
+    def verify_packet(folder: str) -> str:
+        """Check ONE evidence-packet folder for mutual consistency BEFORE citing it.
+
+        A packet is a set of files that must describe the same run. This reads the folder
+        and reports whether they do — nothing is re-solved and no number is re-derived;
+        the only question answered is the one a reader has before quoting the packet.
+
+        folder : ABSOLUTE path to a packet directory (the `packet_dir` sim_evidence_packet
+                   returned, i.e. <out_dir>/<case_id>/).
+
+        Checks, each returned as {check, ok, detail, severity}:
+          core_files_readable         result/inputs/provenance present and parse
+          case_id_agrees              inputs.json and provenance.json name the same case
+          input_hash_agrees           the SAME geometry sha256 in both, and one exists
+          engine_build_id_agrees      result.json's provenance and provenance.json's
+                                      solver_provenance name the same engine build
+          provenance_cites_this_result / convergence_cites_this_result
+                                      provenance.json's result_sha256 and convergence.md's
+                                      cited result_sha256 both equal the CURRENT sha256 of
+                                      result.json — this is what catches a folder where one
+                                      file was replaced and the others were not
+          convergence_evidence_present  no table: adaptive convergence must be in the result
+          reduction_fields_present    summary carries max_von_mises_reduction /
+                                      max_von_mises_raw_mpa / min_fos_raw, so the reader
+                                      knows whether the reported peak is fixture-masked
+          vtu_matches_provenance      the recorded .vtu still exists and still hashes the same
+          checklist_is_the_runbook_list  all 16 runbook items are present verbatim
+
+        Returns {ok, consistent, packet_dir, files, checks, problems, unverifiable,
+        open_checklist_items, superseded_from, archives}. Two distinct failures:
+          `problems` (reason "packet_inconsistent") — files CONTRADICT each other or
+            required evidence is absent. Do not cite the packet.
+          `unverifiable` (reason "packet_unverifiable") — the packet predates the
+            result-hash stamp, so a single-file swap can neither be shown nor ruled out.
+            Re-run sim_evidence_packet on the same study_result: it archives this packet
+            and stamps the replacement.
+        `ok` is true only when neither list has entries. `consistent` is true when
+        `problems` is empty, whatever `unverifiable` says. Open checklist items are
+        reported but never fail the check — they are the human release gate, not a
+        consistency defect. `archives` lists the folder's superseded_* directories
+        (previous runs of this case) and `superseded_from` is what the current
+        provenance.json says it displaced.
+        """
+        try:
+            if not isinstance(folder, str) or not folder.strip():
+                raise ValueError("folder must be a non-empty absolute packet directory.")
+            packet = Path(folder.strip())
+            if not packet.is_absolute():
+                raise ValueError(f"folder must be ABSOLUTE, got {str(packet)!r}.")
+            if not packet.is_dir():
+                return _dumps(
+                    {
+                        "ok": False,
+                        "reason": "packet_not_found",
+                        "packet_dir": str(packet),
+                        "error": f"{str(packet)!r} is not a directory.",
+                    }
+                )
+            checks = _packet_checks(packet)
+            problems = [
+                f"{row['check']}: {row['detail']}"
+                for row in checks
+                if not row["ok"] and row["severity"] != "unrecorded"
+            ]
+            unverifiable = [
+                f"{row['check']}: {row['detail']}"
+                for row in checks
+                if not row["ok"] and row["severity"] == "unrecorded"
+            ]
+            prov, _ = _read_packet_json(packet / "provenance.json")
+            checklist = packet / "checklist.md"
+            open_items = (
+                [
+                    line.split("] ", 1)[1].strip()
+                    for line in checklist.read_text(
+                        encoding="utf-8", errors="replace"
+                    ).splitlines()
+                    if line.startswith("- [ ] ")
+                ]
+                if checklist.is_file()
+                else []
+            )
+            consistent = not problems
+            out = {
+                "ok": consistent and not unverifiable,
+                "consistent": consistent,
+                "packet_dir": str(packet.resolve()),
+                "files": sorted(p.name for p in packet.iterdir() if p.is_file()),
+                "checks": checks,
+                "problems": problems,
+                "unverifiable": unverifiable,
+                "open_checklist_items": open_items,
+                "superseded_from": (prov or {}).get("superseded_from")
+                if isinstance(prov, dict)
+                else None,
+                "archives": sorted(
+                    p.name
+                    for p in packet.iterdir()
+                    if p.is_dir() and p.name.startswith(SUPERSEDED_PREFIX)
+                ),
+            }
+            if problems:
+                out["reason"] = "packet_inconsistent"
+                out["note"] = (
+                    f"{len(problems)} consistency check(s) FAILED — do not cite this "
+                    "packet until they are resolved; a packet whose files describe "
+                    "different runs is not evidence."
+                )
+            elif unverifiable:
+                out["reason"] = "packet_unverifiable"
+                out["note"] = (
+                    f"nothing contradicts, but {len(unverifiable)} check(s) have nothing "
+                    "to compare against: this packet predates the result-hash stamp, so a "
+                    "swapped file cannot be ruled out. Re-run sim_evidence_packet with the "
+                    "same study_result — it archives this packet and stamps the new one."
+                )
+            elif open_items:
+                out["note"] = (
+                    f"the files agree, but {len(open_items)} checklist item(s) are still "
+                    "open (judgement calls) — those are the release gate, not this check."
+                )
+            return _dumps(out)
         except Exception as e:  # noqa: BLE001
             return _err(e)
 
@@ -658,6 +1161,7 @@ def register_sim_evidence_tools(mcp: FastMCP) -> None:
         model_units: str = "mm",
         extra_args: Optional[Union[list, str]] = None,
         timeout_s: float = _POLYMESH_TIMEOUT_S,
+        overwrite: bool = False,
     ) -> str:
         """Run the Polyhedral-FEA CLI directly — the runbook's INDEPENDENT cross-check lane.
 
@@ -696,11 +1200,19 @@ def register_sim_evidence_tools(mcp: FastMCP) -> None:
                    ceiling is 589824 elements, so raise this to mesh finer than that.
         extra_args : additional argv strings appended verbatim.
         timeout_s : wall-clock bound, default 3600.
+        overwrite : DANGEROUS, default False. The artifacts of a previous run of this
+                   action in the same out_dir (`<case>_result.vtu` / `<case>_mesh.vtu` /
+                   `<case>_diag.json` and `<action>.log`) are MOVED into
+                   `<out_dir>/superseded_<YYYY-MM-DD>_<short-hash>/` before the CLI is
+                   launched, and the reply names that directory in `archived_to`. A
+                   cross-check field is evidence too, and out_dir is usually the case's
+                   packet folder. Pass True only to overwrite them in place.
 
-        Returns {ok, argv, exit_code, outputs, json, log_path}. stdout+stderr always land in
-        <out_dir>/<action>.log. With no binary anywhere it refuses with
+        Returns {ok, argv, exit_code, outputs, json, log_path, archived_to}. stdout+stderr
+        always land in <out_dir>/<action>.log. With no binary anywhere it refuses with
         {ok:false, reason:"polymesh_cli_unavailable", searched:[...]} — an absent
-        cross-check solver is a SKIP to be reported, never a passed cross-check.
+        cross-check solver is a SKIP to be reported, never a passed cross-check. Nothing
+        is archived on that refusal: a run that never starts displaces nothing.
         """
         try:
             action = (action or "").strip().lower()
@@ -802,6 +1314,17 @@ def register_sim_evidence_tools(mcp: FastMCP) -> None:
             argv += extra
 
             log_path = out / f"{action}.log"
+            # A re-run of the cross-check must not truncate the previous one. Done after
+            # the binary resolved and the argv validated, so a refused call moves nothing.
+            archive = (
+                None
+                if overwrite
+                else archive_before_write(
+                    [*outputs, str(log_path)],
+                    anchor=out,
+                    hash_source=outputs[0] if outputs else None,
+                )
+            )
             timeout = _num(timeout_s, "timeout_s")
             try:
                 proc = subprocess.run(
@@ -844,6 +1367,7 @@ def register_sim_evidence_tools(mcp: FastMCP) -> None:
                 "exit_code": exit_code,
                 "outputs": written,
                 "log_path": str(log_path),
+                "archived_to": archive["archived_to"] if archive else None,
                 "tail": captured[-2000:],
             }
             if parsed is not None:

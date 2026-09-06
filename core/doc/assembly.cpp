@@ -715,12 +715,17 @@ AssemblyResult compile_assembly(const json& doc, const std::string& base_dir,
     } catch (...) {
     }
 
-    // mate status (merge dangling)
+    // mate status (merge dangling + the per-mate residual report)
+    std::map<std::string, double> mate_residual;
+    for (const chudware::mate::MateResidual& r : solve_res.residuals)
+        mate_residual[r.mate_id] = r.max_abs;
     for (const chudware::mate::MateStatus& m : solve_res.mate_status) {
         AsmMateStatus st;
         st.id = m.mate_id;
         st.type = m.type;
         st.status = m.status;
+        auto rit = mate_residual.find(m.mate_id);
+        if (rit != mate_residual.end()) st.residual = rit->second;
         auto dit = dangling.find(m.mate_id);
         if (dit != dangling.end()) {
             st.status = "unresolved";
@@ -732,6 +737,10 @@ AssemblyResult compile_assembly(const json& doc, const std::string& base_dir,
     res.dof = solve_res.dof;
     res.over_defined = solve_res.over_defined;
     res.converged = solve_res.converged;
+    res.max_residual = solve_res.residuals.empty() ? solve_res.max_residual
+                                                   : solve_res.residuals.front().max_abs;
+    res.tolerance = solve_res.tolerance;
+    res.worst_mate = solve_res.worst_mate;
     res.dof_summary = solve_res.summary;
     res.warm = solve_res.params;
     return res;

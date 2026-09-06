@@ -50,13 +50,32 @@ struct MateStatus {
     std::string status;
 };
 
+// Per-mate residual at the solved configuration. `max_abs` is the largest absolute
+// entry of the mate's residual block: mm for the positional rows (offset from the
+// axis / plane it asks for), dimensionless for the direction rows (sin of the angle
+// between the two axes/normals it asks to align). `norm` is the block's 2-norm.
+// Reported for every mate that produced residual rows, worst first, so a solve that
+// does not converge can NAME the mate that is holding it back instead of leaving the
+// caller to bisect a 20-mate network by hand.
+struct MateResidual {
+    std::string mate_id;
+    std::string type;
+    double max_abs = 0.0;
+    double norm = 0.0;
+};
+
 struct MateSolveResult {
     std::map<std::string, std::vector<double>> transforms;  // id -> 16-float row-major
     std::map<std::string, std::pair<Eigen::Vector3d, Eigen::Vector3d>> params;  // id -> (t,w)
     std::vector<MateStatus> mate_status;
+    std::vector<MateResidual> residuals;  // worst first; only mates with residual rows
+    std::string worst_mate;               // residuals.front().mate_id, or "" when empty
     int dof = 0;
     bool converged = false;
     double max_residual = 0.0;
+    // The convergence threshold actually applied: `tol` widened for assembly size
+    // (see solve_mates). Reported so a caller can say how close "not converged" was.
+    double tolerance = 0.0;
     bool over_defined = false;
     std::string summary;
 };
@@ -76,6 +95,21 @@ using ResolvedGeometry = std::map<std::pair<std::string, int>, MateGeom>;
 
 // Public solve. `components` and `mates` are doc-schema dicts; `resolved_geometry`
 // maps (mate_id, ref_index) -> MateGeom in the owning component's local frame.
+//
+// `tol` is quoted for a ~100 mm part. The solve measures the assembly's own size L
+// (largest world coordinate any seed pose or mate geometry reaches) and applies
+// `tol * max(1, L/100)` — an absolute picometre threshold is not reachable across a
+// 2 m rover, where a single residual evaluation already carries ~1e-12 mm of
+// cancellation noise. `MateSolveResult::tolerance` reports what was applied; nothing
+// changes for L <= 100 mm.
+//
+// The LM step is bounded by a trust region derived from the same L (translation) and
+// half a radian (rotation), and the random-restart escape used when the first solve
+// fails is scoped to the mate-connected group that actually failed and is accepted
+// only when it genuinely rescues the solve. Both exist because the least-squares step
+// on the normal equations can amplify a near-null direction without bound: before
+// them, ONE unsatisfiable mate on one corner of an assembly threw components on
+// unrelated, fully-satisfied corners hundreds to thousands of mm out of place.
 MateSolveResult solve_mates(const nlohmann::json& components,
                             const nlohmann::json& mates,
                             const ResolvedGeometry& resolved_geometry,

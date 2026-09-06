@@ -25,7 +25,10 @@
 //     "summary":      string,
 //     "transforms":   { component_id: [16 floats], ... },
 //     "params":       { component_id: {"t":[3], "w":[3]}, ... },
-//     "mate_status":  [ {mate_id, type, status}, ... ]
+//     "mate_status":  [ {mate_id, type, status}, ... ],
+//     "residuals":    [ {mate_id, type, max_abs, norm}, ... ]   worst first,
+//     "worst_mate":   string (id of the largest residual, "" if no active mate),
+//     "tolerance":    number (the size-scaled threshold `converged` was judged on)
 //   }
 //
 // nlohmann::json serializes doubles round-trip (shortest exact representation),

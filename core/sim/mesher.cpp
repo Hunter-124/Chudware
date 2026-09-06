@@ -668,6 +668,62 @@ std::string in_model_units(std::string diagnostic) {
   return diagnostic;
 }
 
+// ── Local element sizing: seeds + graded field ───────────────────────────────
+// polymesh takes two independent levers for "make it finer HERE": `refine_seeds`
+// + `seed_band` stamp fine CELLS around world points (mesh/cell_stamp.cpp), and
+// `size_field` biases the graded fill's child placement. Neither alone is
+// enough — the seed stamp is what guarantees the fine cells exist, and the field
+// is what grades them back out to the background size without a sliver ring — so
+// a local request drives both, exactly as the adaptive driver does for its
+// marked elements.
+//
+// The lattice has a floor: local children live at h/2 and h/4 of the background
+// cell, so a request below h/4 cannot be honoured locally. build_mesh does not
+// silently accept that; fill_with_recovery lowers the BACKGROUND size to 4x the
+// requested local size (still far coarser than meshing the whole part at the
+// local size) and says so.
+pm::mesh::SizeFieldFn local_size_field(const MeshOptions &options, double h,
+                                       const pm::mesh::SizeFieldFn &outer,
+                                       std::vector<Eigen::Vector3d> &seeds,
+                                       double &seed_band) {
+  seeds.clear();
+  seed_band = 0.0;
+  if (!options.local_refine.active())
+    return outer;
+  const MeshLocalRefine &request = options.local_refine;
+  const std::size_t count = request.points.size() / 3;
+  seeds.reserve(count);
+  for (std::size_t i = 0; i < count; ++i)
+    seeds.emplace_back(request.points[i * 3], request.points[i * 3 + 1],
+                       request.points[i * 3 + 2]);
+  // The band has to be at least the background cell it is carved out of, or the
+  // stamp lands inside one cell and changes nothing.
+  const double band = request.band_mm > 0.0 ? request.band_mm : 2.0 * request.size_mm;
+  seed_band = std::max(band, h);
+  // Never ask for less than the lattice can place; the caller is responsible for
+  // having lowered h far enough (see fill_with_recovery).
+  const double h_local = std::max(request.size_mm, h * 0.25);
+  const std::vector<pm::adapt::SizeSource> sources =
+      pm::adapt::point_size_sources(seeds, h_local);
+  // beta is the gradient limit: the requested size may grow beta mm per mm away
+  // from a seed. The adaptive driver uses 1.0, and that is TOO STEEP for a
+  // surface request, because the fill evaluates the field at CELL CENTRES: the
+  // centre of a fine cell touching the interface sits half a cell plus the
+  // clearance away from the seed, where a beta of 1.0 has already pushed the
+  // requested size back above the lattice's h/2 threshold — so it places an L1
+  // cell where an L2 was asked for. Measured on the seated-pad assembly probe
+  // (seat 8 x 8 mm, background 2.0 mm, requested 0.5 mm): beta 1.0 delivered an
+  // interface element size of 2.07 mm, beta 0.5 delivers the L2 cells.
+  pm::mesh::SizeFieldFn local =
+      pm::adapt::size_field_from_sources(sources, h_local, h, /*beta=*/0.5);
+  if (!outer)
+    return local;
+  // Two requests, one field: whichever asks for the smaller element wins.
+  return [local, outer](const Eigen::Vector3d &x) {
+    return std::min(local(x), outer(x));
+  };
+}
+
 // Fill at coarse element size `h`, optionally under a spatial size field h(x),
 // promote to tet10 when asked, and normalize into MeshOut. `feature_refine` is
 // an explicit caller decision rather than a re-derivation of the fineness gate,
@@ -678,8 +734,18 @@ std::string in_model_units(std::string diagnostic) {
 bool build_mesh(const LoadedModel &loaded, const MeshOptions &options, double h,
                 bool feature_refine, const pm::mesh::SizeFieldFn &size_field,
                 pm::fea::NodalMesh &nodal, MeshOut &out) {
-  const pm::pipeline::ResolvedMeshSize resolved =
-      pm::pipeline::resolve_mesh_size(loaded.model, h);
+  // The element/DOF ceilings are the size band's governor-derived numbers, not
+  // polymesh's 0.59M default: see mesh_size_band.cpp. 0 would select the
+  // default, so a band that failed to compute them still behaves as before.
+  const pm::pipeline::ResolvedMeshSize resolved = pm::pipeline::resolve_mesh_size(
+      loaded.model, h, /*sharp_angle_deg=*/30.0,
+      static_cast<std::size_t>(loaded.band.element_ceiling),
+      static_cast<std::size_t>(loaded.band.dof_ceiling));
+
+  std::vector<Eigen::Vector3d> refine_seeds;
+  double seed_band = 0.0;
+  const pm::mesh::SizeFieldFn effective_field =
+      local_size_field(options, h, size_field, refine_seeds, seed_band);
 
   // Graded tet is the one Polyhedral-FEA family that matches Chudware's
   // fixed-stride tet solve contract and accepts the spatial size field used by
@@ -691,10 +757,9 @@ bool build_mesh(const LoadedModel &loaded, const MeshOptions &options, double h,
         /*skin_layers=*/2,
         // The graded skin stays active regardless; the extra
         // sharp-edge/thickness pass is the caller's choice.
-        feature_refine, /*refine_seeds=*/{},
-        /*seed_band=*/0.0,
+        feature_refine, refine_seeds, seed_band,
         /*element_tendency=*/0.0, resolved.element_ceiling, resolved.dof_ceiling,
-        /*auto_retry_budget=*/0, /*cancel_check=*/{}, size_field);
+        /*auto_retry_budget=*/0, /*cancel_check=*/{}, effective_field);
   }();
 
   nodal = volume.mesh;
@@ -772,6 +837,18 @@ bool build_mesh(const LoadedModel &loaded, const MeshOptions &options, double h,
   // carries polymesh's own h_bulk/snap distances, and the product surfaces it
   // verbatim (see in_model_units).
   append_note(out.note, in_model_units(volume.mesher_note));
+  if (options.local_refine.active()) {
+    char text[320];
+    std::snprintf(text, sizeof(text),
+                  "local refinement applied for %s: %zu seed(s) at %.4g mm "
+                  "within %.4g mm, background element size %.4g mm",
+                  options.local_refine.label.empty()
+                      ? "a study request"
+                      : options.local_refine.label.c_str(),
+                  options.local_refine.points.size() / 3,
+                  std::max(options.local_refine.size_mm, h * 0.25), seed_band, h);
+    append_note(out.note, text);
+  }
   // Element-local straight-edge fallback for mid-edge projections that folded
   // their element. On a thin wall (element size comparable to the wall
   // thickness or the curvature radius) a handful of elements always fold, and
@@ -893,6 +970,58 @@ double feature_hint_size_mm(const std::string &error) {
 // Defined below, beside the per-solid meshing fallback that also needs it.
 std::vector<TopoDS_Shape> model_solids(const LoadedModel &loaded);
 
+// Seed points ON the CAD faces polymesh's feature-resolution guard is about to
+// refuse. The guard (pipeline/scene.cpp enforce_feature_resolution) calls a face
+// a FEATURE when it is non-planar OR its area is under h^2, and refuses the
+// whole fill when such a face has no aligned delivered boundary patch. The test
+// below is deliberately the same one: these are the faces that need boundary
+// patches, so these are the places to put fine cells.
+//
+// A non-planar face already carries an exact uv sample grid inside its trim
+// (CadFace::samples, evaluated on the BRep, not on a tessellation); a small
+// PLANAR face has none, so its bounding edges' polyline samples stand in. The
+// total is decimated to kMaxSeeds so a detail-dense board cannot turn the seed
+// stamp into the expensive part of the fill.
+std::vector<Eigen::Vector3d> feature_face_seeds(const LoadedModel &loaded,
+                                                double h) {
+  std::vector<Eigen::Vector3d> seeds;
+  if (!loaded.model.cad || loaded.model.cad->empty())
+    return seeds;
+  constexpr std::size_t kMaxSeeds = 20000;
+  try {
+    const pm::geom::CadTopology topology =
+        pm::geom::extract_topology(*loaded.model.cad, 8);
+    const double small_face_area = h * h;
+    for (const pm::geom::CadFace &face : topology.faces) {
+      const bool is_feature = face.kind != pm::geom::CadSurfaceKind::kPlane ||
+                              face.area <= small_face_area;
+      if (!is_feature)
+        continue;
+      if (!face.samples.empty()) {
+        seeds.insert(seeds.end(), face.samples.begin(), face.samples.end());
+        continue;
+      }
+      for (uint32_t edge_id : face.edge_ids)
+        if (edge_id < topology.edges.size()) {
+          const auto &samples = topology.edges[edge_id].samples;
+          seeds.insert(seeds.end(), samples.begin(), samples.end());
+        }
+    }
+  } catch (const std::exception &) {
+    // No topology, no seeds: the caller falls through to the uniform ladder.
+    seeds.clear();
+  }
+  if (seeds.size() > kMaxSeeds) {
+    const std::size_t stride = seeds.size() / kMaxSeeds + 1;
+    std::vector<Eigen::Vector3d> thinned;
+    thinned.reserve(seeds.size() / stride + 1);
+    for (std::size_t i = 0; i < seeds.size(); i += stride)
+      thinned.push_back(seeds[i]);
+    seeds.swap(thinned);
+  }
+  return seeds;
+}
+
 // The fill and its bounded recovery ladder, starting from `h_start` (0 = the
 // size the advisor/size band resolved). Split out so the caller can re-run the
 // WHOLE ladder at a different starting size: a recovery rung is what finally
@@ -901,21 +1030,45 @@ std::vector<TopoDS_Shape> model_solids(const LoadedModel &loaded);
 bool fill_with_recovery(const LoadedModel &loaded, const MeshOptions &options,
                         double h_start, MeshOut &out) {
   const AdvisorPlan plan = make_advisor_plan(loaded, options);
-  const double h_first = h_start > 0.0 ? h_start : plan.h;
-  auto attempt = [&](double h, bool feature_refine) {
+  double h_first = h_start > 0.0 ? h_start : plan.h;
+  // A LOCAL refinement contract the lattice cannot place: polymesh's graded tet
+  // puts local children at h/2 and h/4 of the background cell, so a request
+  // below background/4 needs the BACKGROUND lowered to 4x it. That is still the
+  // cheap option by a wide margin — 4x the local size everywhere instead of the
+  // local size everywhere — and it is stated in the mesh note rather than
+  // silently delivering a coarser interface than the study asked for.
+  std::string background_note;
+  if (plan.options.local_refine.active() &&
+      plan.options.local_refine.size_mm * 4.0 < h_first * (1.0 - 1e-9)) {
+    const double lowered = 4.0 * plan.options.local_refine.size_mm;
+    char text[288];
+    std::snprintf(text, sizeof(text),
+                  "background element size lowered %.4g->%.4g mm so the fill's "
+                  "graded lattice can place the requested %.4g mm local size "
+                  "(its finest local child is background/4)",
+                  h_first, lowered, plan.options.local_refine.size_mm);
+    background_note = text;
+    h_first = lowered;
+  }
+  auto attempt_with = [&](const MeshOptions &opts, double h,
+                          bool feature_refine) {
     out = MeshOut();
     out.advisor = plan.result;
     append_note(out.note, loaded.band.note);
     if (out.advisor)
       append_note(out.note, out.advisor->note);
+    append_note(out.note, background_note);
     pm::fea::NodalMesh nodal;
     try {
-      return build_mesh(loaded, plan.options, h, feature_refine, {}, nodal, out);
+      return build_mesh(loaded, opts, h, feature_refine, {}, nodal, out);
     } catch (const std::exception &e) {
       out.ok = false;
       out.error = in_model_units(e.what());
       return false;
     }
+  };
+  auto attempt = [&](double h, bool feature_refine) {
+    return attempt_with(plan.options, h, feature_refine);
   };
   // First attempt keeps the interactive default: draft/coarse skips the extra
   // feature pass.
@@ -980,6 +1133,70 @@ bool fill_with_recovery(const LoadedModel &loaded, const MeshOptions &options,
       chain += "; feature-refinement retry at the same element size also "
                "failed: " +
                out.error;
+    }
+
+    // NEXT rung, and the one that keeps a hole array from costing a million
+    // elements: refine the unresolved features LOCALLY and keep the background
+    // size. The guard polymesh just failed is about delivered boundary PATCHES
+    // on small/curved faces (enforce_feature_resolution), not about the bulk
+    // size, so fine cells stamped on exactly those faces satisfy it — while the
+    // uniform hint ladder below pays for the same resolution over the whole
+    // part. Measured cost of the uniform route on the live HINGE-LATCH-LOCAL
+    // part: four O6.6 holes forced h <= 0.779 mm, i.e. 1.16M tet4 against the
+    // element ceiling, for a plate that meshes in tens of thousands.
+    //
+    // Bounded: at most kLocalSteps rungs, each taking the size polymesh itself
+    // named, and skipped entirely when the study already carries a local
+    // refinement request of its own (the caller owns that contract) or when the
+    // BRep yields no feature faces to seed.
+    if (!options.local_refine.active()) {
+      constexpr int kLocalSteps = 2;
+      double local_hint = feature_hint_size_mm(out.error);
+      if (!(local_hint > 0.0))
+        local_hint = feature_hint_size_mm(first_error);
+      const std::vector<Eigen::Vector3d> seeds =
+          feature_face_seeds(loaded, h_first);
+      for (int step = 0; step < kLocalSteps && local_hint > 0.0 && !seeds.empty();
+           ++step) {
+        // Land just under the stated bound, and never below what the lattice
+        // can place at this background size.
+        const double wanted = std::max(0.98 * local_hint, h_first * 0.25);
+        MeshOptions local = plan.options;
+        local.local_refine.size_mm = wanted;
+        // One background cell of influence: the seeds sit ON the feature, and
+        // the fine cells have to reach the wall around it.
+        local.local_refine.band_mm = h_first;
+        local.local_refine.label = "unresolved CAD features";
+        local.local_refine.points.clear();
+        local.local_refine.points.reserve(seeds.size() * 3);
+        for (const Eigen::Vector3d &p : seeds) {
+          local.local_refine.points.push_back(p.x());
+          local.local_refine.points.push_back(p.y());
+          local.local_refine.points.push_back(p.z());
+        }
+        if (attempt_with(local, h_first, /*feature_refine=*/true)) {
+          char text[320];
+          std::snprintf(
+              text, sizeof(text),
+              "features resolved by LOCAL refinement at %.4g mm on %zu seed "
+              "point(s) of the small/curved CAD faces, background element size "
+              "kept at %.4g mm (%d elements)",
+              wanted, seeds.size(), h_first, out.n_elems);
+          append_note(out.note, text);
+          return true;
+        }
+        char tail[224];
+        std::snprintf(tail, sizeof(tail),
+                      "; local feature refinement at %.4g mm also failed: ",
+                      wanted);
+        chain += tail + out.error;
+        if (!feature_unresolved(out.error))
+          break;
+        const double next_hint = feature_hint_size_mm(out.error);
+        if (!(next_hint > 0.0) || !(next_hint < local_hint))
+          break;
+        local_hint = next_hint;
+      }
     }
 
     // Next lever: every refusal names the element size that resolves the

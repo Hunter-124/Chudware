@@ -540,6 +540,7 @@ static const char* kTools_sim[] = {
     "struct_check",
     "struct_estimate",
     "sweep_envelope",
+    "verify_packet",
 };
 static const char* kTools_workspace[] = {
     "delegate",
@@ -1069,6 +1070,7 @@ static const ToolDesc kToolDescs[] = {
     {"vendor_status", "Return the login status of all registered vendor source adapters."},
     {"vendors_health", "Run a canary health check across the vendor source adapters."},
     {"verify_battery", "Run deterministic checks on one explicit document."},
+    {"verify_packet", "Check ONE evidence-packet folder for mutual consistency BEFORE citing it."},
     {"wall_thickness", "How THIN is the thinnest wall? Inward ray-cast wall-thickness over the whole part."},
     {"workspace_doc_events", "Return per-doc event stream entries starting at *since_seq*."},
     {"workspace_status", "Return the full workspace snapshot for *run_id*."},
@@ -1527,7 +1529,7 @@ static const ToolGuidance kToolGuidance[] = {
     {"set_view", "Use review_drawing sheet mm to fix layout; x/y/scale move or resize, while show_hidden/orientation change the projection. Re-review and re-audit after.", 0, 0, ""},
     {"show_in_app", "Force-push the doc to the open desktop viewport; modeling tools already do this per change — a silent no-op when the app isn't running.", 0, 0, ""},
     {"sim_cancel", "job_id from sim_run. Really terminates the solver process, not a flag flip; sim_status then reports cancelled. The last partial snapshot survives, so sim_results(partial=True) may still have something.", 0, 0, ""},
-    {"sim_evidence_packet", "Write the case folder (inputs/result/provenance/convergence/checklist) for a finished study; unsatisfied_checklist names what still needs a hand calc or judgement.", 0, 0, ""},
+    {"sim_evidence_packet", "Write the case folder (inputs/result/provenance/convergence/checklist) for a finished study; unsatisfied_checklist names what still needs a hand calc or judgement. A re-run into the same folder ARCHIVES the previous packet (archived_to) instead of overwriting it; overwrite=True is the only way to replace.", 0, 0, ""},
     {"sim_jobs", "Lists recent background solves with their state — use it to recover a job_id from an earlier turn before assuming a solve was lost.", 0, 0, ""},
     {"sim_results", "job_id from sim_run, after sim_status says done. partial=True returns whatever converged so far, clearly labelled — never quote a partial as a converged answer. partial=False on an unfinished job is refused rather than returning half a result.", 0, 0, ""},
     {"sim_run", "Cancellable process job for analysis='fea_static' or 'fea_modal' ONLY. Static needs fixtures plus a non-zero loads list; modal takes the fixtures argument but fixtures=[] intentionally requests free-free modes and takes no loads. Poll sim_status, then sim_results; an unavailable/failed backend never becomes PASS.", 0, 0, ""},
@@ -1574,6 +1576,7 @@ static const ToolGuidance kToolGuidance[] = {
     {"vendor_status", "Fast local read (no network) of adapter keys + login state — check this before scrape_enqueue to pick an already-logged-in site.", 0, 0, ""},
     {"vendors_health", "Live network canary per adapter (blank sweeps all registered sites) — slow; prefer vendor_status for a quick answer. needs_human_login → run vendor_login(site).", 180, 0, ""},
     {"verify_battery", "Geometry/check health for THIS doc only: PASS covers only keys present in scores. Skipped checks are unverified, and a part-doc pass does NOT verify drawings, assembly fits, loads, material intent, tolerances or manufacturability. Run those domain checks separately before claiming the design is finished.", 0, 0, ""},
+    {"verify_packet", "Read a packet folder back and check its files describe one run (same input hash, same engine build, result.json matching the hash convergence.md cites, reduction fields present). Run it before citing a packet; ok:false means do not cite it.", 0, 0, ""},
     {"wall_thickness", "Headline is min_thickness_mm vs your process floor (~1 mm injection, ~0.8 mm FDM); null means an open/sheet body — confirm a solid with measure_part.", 0, 0, ""},
     {"workspace_doc_events", "Incremental per-doc event stream — pass the count of events you already have as since_seq.", 0, 0, ""},
     {"workspace_status", "One-call orient snapshot: open docs, owners, node statuses. Poll this before touching docs you did not create.", 0, 0, ""},

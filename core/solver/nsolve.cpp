@@ -320,6 +320,18 @@ Eigen::VectorXd System::solve_step(const Eigen::MatrixXd& A,
     return solve_pos_exact(A, b);
 }
 
+double System::clamp_step(Eigen::VectorXd& step) const {
+    if (step_limit_.size() != step.size()) return 1.0;
+    double scale = 1.0;
+    for (Eigen::Index i = 0; i < step.size(); ++i) {
+        const double cap = step_limit_(i);
+        const double mag = std::abs(step(i));
+        if (cap > 0.0 && mag > cap) scale = std::min(scale, cap / mag);
+    }
+    if (scale < 1.0) step *= scale;
+    return scale;
+}
+
 Result System::solve(const std::optional<Eigen::VectorXd>& x0, double tol,
                      int max_iter, std::optional<double> time_budget_ms) {
     if (dirty_) finalize_rows();
@@ -401,6 +413,7 @@ Eigen::VectorXd System::lm(const Eigen::VectorXd& x_in, const BlockSet& bs,
             Eigen::MatrixXd A = JtJ;
             A.diagonal() += lam * diag;
             step = solve_step(A, -g);
+            clamp_step(step);
 
             Eigen::VectorXd x_new = x + step;
             Eigen::VectorXd r_new = residual_of(bs, x_new);

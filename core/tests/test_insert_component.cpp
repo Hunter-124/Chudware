@@ -239,6 +239,13 @@ TEST_CASE("a mated component's transform edit stays solver-owned") {
     CHECK(rebuild.value("doc_status", json::object()).value("mates", std::string()) == "ok");
     REQUIRE(rebuild.value("mates", json::array()).size() == 1);
     for (const json& ms : rebuild["mates"]) CHECK(ms.value("status", std::string()) == "ok");
+    // …and it now carries the solve's own verdict plus a per-mate residual, which is what
+    // the agent-facing reply reads. Before this, an assembly rebuild reported nothing but
+    // ok/over — a solve that never converged still said `mates: "ok"`.
+    CHECK(rebuild.value("converged", false) == true);
+    CHECK(rebuild.value("max_residual", 1.0) <= rebuild.value("tolerance", 0.0));
+    CHECK(rebuild["mates"][0].contains("residual"));
+    CHECK(rebuild["mates"][0].value("residual", 1.0) <= rebuild.value("tolerance", 0.0));
     for (const json& cs : rebuild.value("components", json::array()))
         CHECK(cs.value("ok", false) == true);
 
@@ -248,6 +255,66 @@ TEST_CASE("a mated component's transform edit stays solver-owned") {
     CHECK(std::abs(after[11] - solved[11]) < 1e-4);
     CHECK(std::abs(after[11] - off[11]) > 1.0);
     for (int i = 0; i < 16; ++i) CHECK(std::abs(after[i] - solved[i]) < 1e-4);
+
+    fs::remove(pa);
+    fs::remove(pb);
+}
+
+// A network no pose can satisfy must SAY SO, and say which mate. The ME 490 phase-5A
+// mission spent a working session bisecting a 20-mate rover assembly by hand because the
+// rebuild reported only `mates: "ok"` / `"over"` and the poses had been scattered by the
+// solver's own restart escape, so there was nothing to read the failure off.
+TEST_CASE("an unsatisfiable mate network is reported, named and bounded") {
+    fs::path pa = tmp("conflict_a.step");
+    fs::path pb = tmp("conflict_b.step");
+    TwoComp asm_ = two_component_assembly(pa, pb, "mate_conflict_test");
+
+    auto face_refs = []() {
+        return json::array({
+            {{"component", ""}, {"selector", {{"kind", "face"},
+                                              {"centroid", json::array({5.0, 5.0, 10.0})}}}},
+            {{"component", ""}, {"selector", {{"kind", "face"},
+                                              {"centroid", json::array({45.0, 5.0, 10.0})}}}},
+        });
+    };
+    auto distance_mate = [&](double value) {
+        json refs = face_refs();
+        refs[0]["component"] = asm_.cid_a;
+        refs[1]["component"] = asm_.cid_b;
+        return json{{"op", "asm_add_mate"},
+                    {"mate", {{"type", "distance"},
+                              {"value", {{"value", value}, {"expr", nullptr}}},
+                              {"align", "aligned"},
+                              {"suppressed", false},
+                              {"refs", refs}}}};
+    };
+    // Two distances on the SAME face pair, 30 mm apart in what they demand.
+    json ops = json::array({distance_mate(30.0), distance_mate(60.0)});
+    json resp = doc::doc_apply_ops(asm_.doc_id, -1, ops, false);
+    REQUIRE(!resp.contains("code"));
+
+    const json rebuild = resp.value("rebuild", json::object());
+    CHECK(rebuild.value("converged", true) == false);
+    // The reply names the offender and quantifies it: the two demands split the difference,
+    // so each carries half of the 30 mm disagreement.
+    const std::string worst = rebuild.value("worst_mate", std::string());
+    CHECK(!worst.empty());
+    CHECK(rebuild.value("max_residual", 0.0) == doctest::Approx(15.0).epsilon(0.01));
+    REQUIRE(rebuild.value("mates", json::array()).size() == 2);
+    bool named = false;
+    for (const json& ms : rebuild["mates"]) {
+        CHECK(ms.value("residual", 0.0) == doctest::Approx(15.0).epsilon(0.01));
+        if (ms.value("id", std::string()) == worst) named = true;
+    }
+    CHECK(named);
+
+    // And the components are still where the document put them: the unsolvable network
+    // leaves the assembly readable instead of scattering it.
+    const std::vector<double> tb = comp_transform(asm_.doc_id, asm_.cid_b);
+    REQUIRE(tb.size() == 16);
+    CHECK(std::abs(tb[3]) < 50.0);
+    CHECK(std::abs(tb[7]) < 50.0);
+    CHECK(std::abs(tb[11]) < 50.0);
 
     fs::remove(pa);
     fs::remove(pb);

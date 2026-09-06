@@ -2004,6 +2004,15 @@ static FeaStaticResult solve_impl(const std::vector<double>& points,
     // a local contact pressure, not a resultant divided by a nominal patch.
     if (contact_mode && contact_report) {
         std::map<int, FeaContactGroup> by_group;
+        // Tributary area is a property of a NODE, not of a pair, and one node can
+        // appear in two pairs: the candidate search runs from both sides of the
+        // interface, so node A's best partner and node B's best partner are two
+        // different pairs that may share an endpoint. Summing per pair therefore
+        // double-counts the patch — measured 105 mm^2 for a 6 x 6 mm seat — so the
+        // area of each (group, node a) is added ONCE. Node `a` is always on the
+        // lower component ordinal (fea_contact.cpp orients every pair in a group
+        // the same way), so this sums exactly one side of the interface.
+        std::set<std::pair<int, int>> area_counted;
         double sum_normal = 0.0, sum_tangential = 0.0;
         int total_active = 0;
         for (std::size_t p = 0; p < pairs.size(); ++p) {
@@ -2036,9 +2045,12 @@ static FeaStaticResult solve_impl(const std::vector<double>& points,
             }
             sum_normal += std::abs(compression);
             sum_tangential += std::sqrt(t2);
-            if (cp.area > 0.0)
+            if (cp.area > 0.0) {
                 g.max_contact_pressure_mpa =
                     std::max(g.max_contact_pressure_mpa, compression / cp.area);
+                if (area_counted.emplace(cp.group, cp.a).second)
+                    g.contact_area_mm2 += cp.area;
+            }
             g.max_penetration_mm = std::max(g.max_penetration_mm, -gap);
         }
         contact_report->groups.clear();

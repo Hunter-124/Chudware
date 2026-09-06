@@ -4,7 +4,7 @@ description: Run FEA, thermal, vibration, CFD, motion, and EM studies with actua
 inject: auto
 triggers:
   keywords: [fea, cfd, simulate, simulation, stress, modal, thermal, vibration, wind tunnel, drag, motion, eigenmode, s-parameter, antenna, contact, load case, strong enough, will this hold, can this hold, factor of safety, deflection, buckling, von mises]
-  tools: [run_fea_static, run_fea_adaptive, run_fea_modal, run_fea_fatigue, run_fea_frequency_response, run_fea_thermal, run_fea_buckling, run_fea_contact, run_fea_convergence, sim_evidence_packet, polymesh_cli, run_cfd_flow, run_cfd_accurate, simulate_motion, em_eigenmode, em_driven, em_timedomain, ecad_antenna_design, ecad_antenna_analyze]
+  tools: [run_fea_static, run_fea_adaptive, run_fea_modal, run_fea_fatigue, run_fea_frequency_response, run_fea_thermal, run_fea_buckling, run_fea_contact, run_fea_convergence, sim_evidence_packet, verify_packet, polymesh_cli, run_cfd_flow, run_cfd_accurate, simulate_motion, em_eigenmode, em_driven, em_timedomain, ecad_antenna_design, ecad_antenna_analyze]
   phases: [sim]
 ---
 
@@ -63,11 +63,23 @@ closes a requirement:
    full result>, geometry_path, material_source, load_rationale, notes)` writes
    inputs/result/provenance/convergence/checklist plus geometry+VTU sha256. Its
    `unsatisfied_checklist` is the release gate: locations, singularity assessment,
-   allowable and hand calculation are yours to close.
-5. **Cross-check the critical case.** `polymesh_cli(action="solve"|"diag", ...)` re-solves
+   allowable and hand calculation are yours to close. A packet folder is NEVER
+   overwritten: re-running a case moves the previous packet into
+   `superseded_<date>_<hash>/` and the reply's `archived_to` says where (the new
+   provenance.json's `superseded_from` names what it displaced). `overwrite=True` is the
+   only way to replace in place, and it destroys the earlier evidence. An existing `.vtu`
+   is archived the same way before a solve writes over it.
+5. **Verify before you cite.** `verify_packet(folder=<packet_dir>)` checks the folder's
+   files describe ONE run: same geometry hash in inputs and provenance, same engine build
+   id, result.json still hashing to what provenance.json and convergence.md cite,
+   reduction fields present, recorded `.vtu` still intact. `ok:false` with
+   `reason:"packet_inconsistent"` means do not quote a number out of it.
+6. **Cross-check the critical case.** `polymesh_cli(action="solve"|"diag", ...)` re-solves
    it through the standalone Polyhedral-FEA binary with frozen boxes (METRES, pascals,
    newtons). Explain any difference; never average the two. `polymesh_cli_unavailable`
-   means the cross-check was NOT performed — report it that way.
+   means the cross-check was NOT performed — report it that way. Its artifacts follow the
+   same rule: a re-run archives the previous `_mesh.vtu` / `_result.vtu` / `_diag.json`
+   plus that action's log and reports `archived_to`.
 
 ## Current surfaces
 

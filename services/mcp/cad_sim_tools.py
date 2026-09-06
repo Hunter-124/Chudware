@@ -12,6 +12,7 @@ import time
 
 from .cad_common import (
     CoreError,
+    archive_before_write,
     coerce_json_or_repr,
     require_list,
     require_mapping,
@@ -1169,6 +1170,9 @@ def _norm_vtu_path(vtu_path) -> Optional[str]:
     rather than reporting a partial success, so the only thing to check here is that the
     caller really gave an absolute path — a relative one would land in whatever directory
     the engine process happens to sit in, which is not a releasable artifact path.
+
+    Pure: an existing file at that path is protected by `_archive_existing_vtu()`, which
+    a caller runs only once the whole setup has passed validation.
     """
     if vtu_path is None:
         return None
@@ -1178,6 +1182,28 @@ def _norm_vtu_path(vtu_path) -> Optional[str]:
     if not os.path.isabs(vtu_path):
         raise ValueError(f"vtu_path must be ABSOLUTE, got {vtu_path!r}.")
     return vtu_path
+
+
+def _archive_existing_vtu(vtu_path: Optional[str], notes: Optional[list] = None) -> None:
+    """Move any .vtu already at *vtu_path* aside instead of letting the solve truncate it.
+
+    That file is the FIELD an earlier released number came from, and the engine's writer
+    would simply overwrite it. It is renamed into `superseded_<YYYY-MM-DD>_<short-hash>/`
+    beside itself (free even for a 27 MB file) and the run SAYS so through `notes`. There
+    is no in-place option: nothing here can re-derive the old field, so replacing it is a
+    deliberate `rm` by the caller.
+
+    Call this only after every setup validation has passed — a run about to be refused
+    must not move a file. `_build_static_study` does it beside the STEP export, for the
+    same reason.
+    """
+    archived = archive_before_write([vtu_path]) if vtu_path else None
+    if archived and isinstance(notes, list):
+        notes.append(
+            f"the .vtu already at {vtu_path} was NOT overwritten: it was archived to "
+            f"{archived['archived_to']} (sha256 {(archived['sha256'] or '')[:12]}) "
+            "before this solve started."
+        )
 
 
 def _norm_abs_out_path(path, arg_name: str) -> Optional[str]:
@@ -1259,6 +1285,9 @@ def _build_static_study(
     # Export only after all setup validation and face resolution succeeds.
     step = _tmp(".step")
     cb.call("doc_export_step", {"doc_id": d, "path": step})
+    # Same rule as the export above: the previous .vtu is moved aside only once the
+    # setup is known good.
+    _archive_existing_vtu(vtu_path, notes)
 
     study = {
         "step_path": step,
@@ -1342,6 +1371,7 @@ def _build_contact_study(
     doc_id,
     notes: list,
     vtu_path: Optional[str] = None,
+    interface_size_mm: Optional[float] = None,
 ) -> dict:
     """SETUP stage for run_fea_contact.
 
@@ -1365,6 +1395,14 @@ def _build_contact_study(
         mesh_size_mm = _finite_float(mesh_size_mm, "mesh_size_mm")
         if mesh_size_mm <= 0.0:
             raise ValueError("mesh_size_mm must be finite and > 0 when given")
+    if interface_size_mm is not None:
+        interface_size_mm = _finite_float(interface_size_mm, "interface_size_mm")
+        if interface_size_mm <= 0.0:
+            raise ValueError(
+                "interface_size_mm must be finite and > 0 when given: it is the element "
+                "size the CONTACT FACES are refined to (locally), so pass a size that "
+                "resolves the measured clearance — about a quarter of it."
+            )
     ctx = _build_static_study(
         fixtures,
         require_list(
@@ -1390,6 +1428,9 @@ def _build_contact_study(
         "max_iterations": max_iterations,
         "penalty_scale": 1.0,
     }
+    if interface_size_mm is not None:
+        ctx["study"]["contact"]["interface_size_mm"] = interface_size_mm
+    ctx["interface_size_mm"] = interface_size_mm
     # _build_static_study tags itself "fea_static"; the durable collector dispatches on
     # this tag, so leaving it would collect a contact run through the static collector
     # and drop the contact verdict.
@@ -1542,6 +1583,7 @@ def _build_modal_study(
     # Export only after all supplied fixtures have resolved.
     step = _tmp(".step")
     cb.call("doc_export_step", {"doc_id": d, "path": step})
+    _archive_existing_vtu(vtu_path, notes)
     # Modal bending accuracy requires the same quadratic discretization as the
     # engine's direct STEP-backed modal path. A first-order graded-tet mesh
     # over-stiffens the first free-free elastic mode by ~40%.
@@ -4670,7 +4712,6 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
             hot_faces = _norm_bc_list(hot_faces, "hot_faces", notes=bc_notes)
             cold_faces = _norm_bc_list(cold_faces, "cold_faces", notes=bc_notes)
             mesh_fineness = _norm_fineness(mesh_fineness)
-            vtu_path = _norm_vtu_path(vtu_path)
             advisor = _advisor_params(learned_advisor, advisor_max_dof)
             if learned_advisor and transient is None:
                 raise ValueError(
@@ -4684,6 +4725,9 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
                     "route; the steady route solves a CalculiX box proxy, so its field "
                     "is not the part's mesh and must not be released as one."
                 )
+            # Validated (not yet archived) only AFTER the steady-route refusal above: a
+            # call that is about to be refused must not touch a file.
+            vtu_path = _norm_vtu_path(vtu_path)
             material = coerce_json_or_repr(material)
             if conductivity_w_mk is not None:
                 conductivity_w_mk = _finite_float(
@@ -4860,6 +4904,7 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
 
                 step = _tmp(".step")
                 cb.call("doc_export_step", {"doc_id": d, "path": step})
+                _archive_existing_vtu(vtu_path, bc_notes)
                 study = {
                     "step_path": step,
                     "material": {**mat, "k_w_mk": k_cond, "cp_j_kgk": cp},
@@ -5317,6 +5362,7 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
         max_gap_mm: float = 0.5,
         max_iterations: int = 25,
         mesh_size_mm: Optional[float] = None,
+        interface_size_mm: Optional[float] = None,
         mesh_order: int = 1,
         doc_id: Optional[str] = None,
         vtu_path: Optional[str] = None,
@@ -5359,10 +5405,35 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
                    that never touch.
         max_iterations : active-set iterations (default 25). A set that never settles is
                    REFUSED, not averaged.
-        mesh_size_mm : explicit element size in mm; omitted uses the medium fineness band.
+        mesh_size_mm : explicit BACKGROUND element size in mm; omitted uses the medium
+                   fineness band. Do NOT use this to resolve a clearance — that is what
+                   interface_size_mm is for, at a fraction of the element count.
+        interface_size_mm : element size the CONTACT FACES are refined to, in mm, applied
+                   as LOCAL refinement (fine cells seeded on the candidate faces, the rest
+                   of the part left at the background size) and never coarsened by the
+                   element-count governor. Pass about a quarter of the measured clearance:
+                   for a 0.35 mm keyway clearance, 0.09-0.14 mm. Resolving the same
+                   clearance with mesh_size_mm instead means meshing the WHOLE part that
+                   fine — the case that motivated this knob needed 1.16M elements that way.
         mesh_order : 1 = tet4 (default, fastest), 2 = tet10.
         vtu_path : optional ABSOLUTE .vtu path for the solved fields, as for
                    run_fea_static (displacement, von_mises and the summary_node mask).
+
+        THE INTERFACE RESOLUTION REFUSAL. A contact study can converge, balance to 0.0%
+        equilibrium error and look plausible while being a point-load artefact: the live
+        case was a 0.350 mm keyway meshed at 2.91 mm at the interface, which converged
+        with 1 of 848 candidate pairs active, 2902 N through that one node pair and
+        13,543 MPa of reported "contact pressure". So the run is REFUSED (ok:false) when
+        either
+          * the element size AT the interface is more than 4x the clearance AND fewer
+            than 6 candidate pairs sit within twice the closest approach, or
+          * the solved load crossed through fewer than 6 active pairs.
+        The refusal carries "contact":{... "resolution":{h_interface_mm, gap_mm, ratio,
+        max_ratio, candidate_pairs, seatable_pairs, min_active_pairs,
+        required_interface_size_mm, resolved, reason}} and names the interface_size_mm
+        that would resolve it. A conformal interface (two flat faces across a uniform
+        gap, a concentric pin in a bore) is NOT refused on the ratio alone — every pair
+        seats there and the patch pressure is real.
 
         Returns the run_fea_static envelope — summary (max_von_mises_mpa / max_disp_mm /
         min_fos, plus the reduction disclosure max_von_mises_reduction /
@@ -5371,16 +5442,26 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
         load path lands), mesh_quality, reactions (check equilibrium_error_pct first),
         plausibility, provenance, vtu_path — PLUS "contact":
           {candidate_pairs, active_pairs, contact_iterations, converged, max_gap_mm,
-           penalty_scale, penalty_stiffness_n_per_mm, max_iterations,
-           tangential_stabilization, tangential_force_fraction,
-           held_by_contact_only:[component ids held ONLY by contact], pairs:[
-             {bodies:[i,j], candidate_pairs, active_pairs, contact_force_n,
-              force_vector_n:[x,y,z], max_contact_pressure_mpa, max_penetration_mm}]}
+           interface_size_mm, penalty_scale, penalty_stiffness_n_per_mm, max_iterations,
+           tangential_stabilization, tangential_force_fraction, candidate_area_mm2,
+           contact_area_mm2, mean_contact_pressure_mpa, contact_pressure_reliable,
+           resolution:{...}, held_by_contact_only:[component ids held ONLY by contact],
+           pairs:[{bodies:[i,j], candidate_pairs, active_pairs, contact_force_n,
+              force_vector_n:[x,y,z], contact_area_mm2, mean_contact_pressure_mpa,
+              max_contact_pressure_mpa, max_penetration_mm}]}
+        contact_area_mm2 is the summed TRIBUTARY area of the pairs that carried load
+        (one side of the interface, each node counted once), so
+        contact_force_n / contact_area_mm2 is a mean patch pressure — reported as
+        mean_contact_pressure_mpa. contact_pressure_reliable says whether that division
+        means anything: it is true only when the interface passed the resolution guard
+        and at least 6 pairs with real tributary area carried the load. When it is false,
+        quote the resultant (contact_force_n) and not a pressure.
         force_vector_n is what the lower-numbered component pushes onto the higher one, so
         its direction says WHICH side is in contact. A load that pulls the bodies apart
         leaves nothing holding them: that is refused as a mechanism, not solved.
         Tip: query_geometry() first to confirm the fixture/load faces resolve, and
-        check_interference() to measure the clearance you are passing as max_gap_mm.
+        check_interference() to measure the clearance you are passing as max_gap_mm —
+        then pass a quarter of it as interface_size_mm.
         """
         try:
             bc_notes: list = []
@@ -5395,6 +5476,7 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
                 doc_id,
                 bc_notes,
                 vtu_path=vtu_path,
+                interface_size_mm=interface_size_mm,
             )
             _autosave_all_open()  # R-1 guard: protect every open doc before the solve starts
             return _dumps(

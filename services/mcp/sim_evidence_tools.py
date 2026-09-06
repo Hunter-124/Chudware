@@ -835,7 +835,11 @@ def register_sim_evidence_tools(mcp: FastMCP) -> None:
         study_result : the FULL result dict/JSON from run_fea_static / run_fea_adaptive /
                    run_fea_convergence / sim_results — pass it verbatim. Its "provenance",
                    "mesh_quality", "reactions", "vtu_path" and (for a convergence run)
-                   "table" are what the checklist is scored against.
+                   "table" plus "released_leg" are what the checklist is scored against.
+                   A convergence reply run with vtu_dir names the released leg's field in
+                   released_leg.vtu_path, and that is the .vtu this packet hashes — so a
+                   ladder no longer has to be re-solved once more just to have a field to
+                   release.
         geometry_path : the exact STEP/geometry revision that was solved; sha256'd here.
         material_source : where E/nu/density/yield came from (registry row, datasheet, MMPDS
                    table) — a material with no source cannot be released.
@@ -891,7 +895,16 @@ def register_sim_evidence_tools(mcp: FastMCP) -> None:
             # geometry path, a .vtu or a render that lives in this folder would otherwise
             # be hashed after the archive had already renamed it away.
             geometry = _sha256(geometry_path) if geometry_path else None
+            # A single solve names its field at the top level; a run_fea_convergence
+            # reply names the RELEASED leg's field under released_leg (the ladder as a
+            # whole has no single field, and the released number came from exactly one
+            # leg). Either way the packet records the field its numbers came from.
             vtu_path = result.get("vtu_path")
+            if not isinstance(vtu_path, str):
+                released = result.get("released_leg")
+                vtu_path = (
+                    released.get("vtu_path") if isinstance(released, dict) else None
+                )
             vtu = _sha256(vtu_path) if isinstance(vtu_path, str) else None
             rows = _convergence_table(result)
             image = _find_image(result)

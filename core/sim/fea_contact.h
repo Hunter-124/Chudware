@@ -22,6 +22,41 @@
 
 namespace chudware::sim {
 
+// ── The gap a contact study has to resolve is a property of the SURFACES ────────
+// Everything else in this file is mesh topology, and for a FLAT interface the mesh
+// gap and the real gap are the same number. On a CURVED fit they are not, and the
+// difference is not small. A candidate is formed between two boundary NODES, so the
+// gap it records is n̂·(p_b − p_a) = r_bore·cos(dtheta) − r_pin, where dtheta is
+// however far apart the two meshes happened to sample the arc — up to a whole
+// element of lateral offset, since that is the pairing tolerance. On the ME 490
+// hinge (pin r = 6.000 in a saddle r = 6.300, a 0.300 mm clearance) the closest
+// approach over 1899 candidate pairs read 0.03665 mm: linear facet sampling ate
+// 87.8 % of the real clearance. The h/gap guard below then demanded an interface
+// element size of 0.147 mm to resolve a gap that is really 0.300 mm wide, which no
+// mesher on the machine could deliver, and the study was refused at every setting.
+//
+// So the clearance is measured against the ANALYTIC CAD face instead: the signed
+// distance from the node to the other body's own surface, which is 0.300 mm at
+// every node of a nested pair of cylinders however coarsely they are faceted. The
+// facet value is kept beside it and the difference is reported (facet_error_mm) —
+// it is the one direct measurement of what the discretization is doing to this
+// interface, and it is what tells a reader whether the mesh describes the fit.
+struct ContactGapProbe {
+    virtual ~ContactGapProbe() = default;
+    // Analytic clearance at this candidate pair (mm, signed like
+    // ContactSpring::gap0_mm: positive = separated, negative = interpenetrating).
+    // The node ids are passed so an implementation can memoize per node — a node
+    // takes part in one or two pairs, and the underlying projection is the
+    // expensive part.
+    //
+    // false means neither end can be attributed to a CAD solid — a repaired or
+    // dissolved region, an inline mesh, a study with no STEP — which is the
+    // caller's cue to keep the facet measurement for that pair and count the
+    // nodes in `gap_fallback_nodes`.
+    virtual bool pair_gap_mm(int node_a, const double* pa, int node_b,
+                             const double* pb, double& gap_mm) const = 0;
+};
+
 struct ContactCandidateOptions {
     // Widest mesh gap still treated as a contact candidate (mm).
     double max_gap_mm = 0.5;
@@ -32,6 +67,9 @@ struct ContactCandidateOptions {
     // (where the two normals are only approximately anti-parallel) while rejecting
     // two surfaces that merely pass close by at an angle.
     double min_opposition = 0.35;
+    // The analytic-surface oracle (above). Null = measure the gaps on the mesh
+    // facets alone, which is all an inline mesh or a mesher-free unit test has.
+    const ContactGapProbe* gap_probe = nullptr;
 };
 
 struct ContactCandidateSet {
@@ -52,16 +90,62 @@ struct ContactCandidateSet {
     // pair's own node. A locally refined interface reads its refined size here even
     // though the bulk mesh is coarse, which is the whole point of the number.
     double interface_h_mm = 0.0;
-    // The candidate set's own gaps (mm, signed as ContactSpring::gap0_mm):
-    // closest approach, and the median.
+    // The candidate set's own gaps (mm, signed as ContactSpring::gap0_mm), measured
+    // BEFORE the penetration clamp below: closest approach, and the median. When a
+    // ContactGapProbe was supplied these are ANALYTIC gaps — the clearance of the
+    // CAD surfaces, which is the clearance the guard, the seat limit and the
+    // penetration accounting below all have to judge.
     double min_gap0_mm = 0.0;
     double median_gap0_mm = 0.0;
-    // Candidates whose initial gap is within twice the closest approach — the pairs
-    // that can plausibly SEAT under a small-deflection load. On a conforming
-    // interface this is every pair; where the clearance opens up faster than one
-    // element (a bore, a keyway flank, an angled seat) it is however many pairs the
-    // discretization happened to place in the closing zone, and a load funnelled
-    // through 1 of them is a point load wearing a contact-pressure label.
+    // The same two statistics measured on the MESH FACETS (n̂·(p_b − p_a)), always.
+    // With no probe they equal min_gap0_mm / median_gap0_mm exactly.
+    double min_gap_facet_mm = 0.0;
+    double median_gap_facet_mm = 0.0;
+    // min_gap0_mm − min_gap_facet_mm: how much of the real clearance the facet
+    // sampling of this interface consumed. 0 without a probe. It is a measurement,
+    // not a defect count — a coarse curved fit legitimately has a large one — but
+    // it is the number that says whether the mesh describes the fit at all (the
+    // ME 490 hinge: 0.2633 mm of a 0.300 mm clearance).
+    double facet_error_mm = 0.0;
+    // Pairs whose gap came from the probe, and the distinct NODES of the pairs that
+    // had to fall back to the facet value because neither end could be attributed
+    // to a CAD solid (mesh repair dissolved the region, or there is no CAD).
+    int gap_analytic_pairs = 0;
+    int gap_fallback_nodes = 0;
+    // Candidates the mesh found within max_gap_mm but whose ANALYTIC clearance is
+    // wider than it — the facet sampling had understated the gap. They are not
+    // candidates: max_gap_mm is the caller's statement of what counts as contact,
+    // so they are dropped and counted here rather than left to widen the median.
+    int gap_beyond_max_pairs = 0;
+    // Deepest initial PENETRATION that was clamped away (mm, positive). Left alone
+    // it is a preload of k*|gap0| — on the live keyway 11 such pairs carried 56 kN
+    // through a 0.019 mm^2 patch and reported 3.0e6 MPa of "contact pressure" for a
+    // 1500 N load. Every spring's gap0_mm is therefore clamped at 0 and the depth
+    // is reported here instead of being silently converted into force.
+    //
+    // What it MEANS depends on which measurement produced it. On the mesh facets a
+    // negative gap is discretization error, not a press fit: the bodies were placed
+    // touching (or curved, and sampled out of phase) and the projection put nodes
+    // through the partner face — the r 6.000 in r 6.300 case of test_fea_contact
+    // reads -0.247 mm on a fit that is 0.300 mm APART. Measured on the CAD faces it
+    // is real: the two solids interfere, which is a modelling defect the study
+    // cannot idealize away.
+    double initial_penetration_max_mm = 0.0;
+    // The gap below which a candidate SEATS (mm) — a length derived from the
+    // interface, never a multiple of the closest approach. It used to be
+    // 2*min_gap0_mm, which collapses to 0 the instant one node penetrates, so on a
+    // nominally-touching fit only the penetrating pairs could seat and the
+    // population was mesh luck (the live keyway seated 8, 12, 13 and then 2 pairs
+    // across otherwise identical runs). See kSeatFractionH.
+    double seat_limit_mm = 0.0;
+    // Candidates whose initial gap is at or below seat_limit_mm — the pairs the mesh
+    // cannot distinguish from touching, i.e. the geometric contact arc it resolved.
+    // They are the active set the solve STARTS from; the active-set loop then seats
+    // the rest as the bodies deform and releases any of these that ends tensile.
+    // Where the clearance opens up faster than the mesh can resolve (a bore, a
+    // keyway flank, an angled seat) this is however many pairs the discretization
+    // placed in the closing zone, and a load funnelled through 1 of them is a point
+    // load wearing a contact-pressure label.
     int seatable_pairs = 0;
     // Total tributary area of the candidate pairs (mm^2) — the contact patch the
     // pressure of an active subset is measured against.
@@ -93,9 +177,10 @@ ContactCandidateSet fea_contact_candidates(const std::vector<double>& points,
 //        * clearance (min gap > 0), criterion kCriterionClearance: the
 //          interface element size is more than kContactMaxHOverGap x the
 //          clearance AND fewer than kContactMinActivePairs candidates sit
-//          within twice the closest approach. Both halves are required, and the
-//          second one is why: a CONFORMING interface (two flat faces across a
-//          uniform 0.05 mm gap, or a concentric pin in a 0.1 mm bore) has h/gap
+//          within the seat limit (a LENGTH — see kSeatFractionH). Both halves
+//          are required, and the second one is why: a CONFORMING interface
+//          (two flat faces across a uniform 0.05 mm gap, or a concentric pin
+//          in a 0.1 mm bore) has h/gap
 //          of 19-133 and is perfectly resolved — every pair seats together and
 //          the pressure is the real patch pressure. What kills a study is a
 //          clearance that opens faster than one element, which shows up as a
@@ -116,10 +201,28 @@ ContactCandidateSet fea_contact_candidates(const std::vector<double>& points,
 // contact.interface_size_mm applies as LOCAL refinement on the candidate faces.
 struct ContactResolution {
     double h_interface_mm = 0.0;   // measured interface element size
-    double gap_mm = 0.0;           // the clearance it has to resolve (0 = touching)
+    // The clearance it has to resolve (0 = touching). ANALYTIC — the CAD surfaces'
+    // own clearance — whenever a ContactGapProbe was available (ContactGapProbe
+    // above). `gap_facet_mm` is the same closest approach measured on the mesh
+    // facets and `facet_error_mm` the difference: quoting both is what lets a
+    // reader tell a genuinely tight fit from a coarsely faceted one.
+    double gap_mm = 0.0;
+    double gap_facet_mm = 0.0;
+    double facet_error_mm = 0.0;
+    // False when no probe answered for any pair, i.e. gap_mm IS gap_facet_mm.
+    bool gap_analytic = false;
+    // Distinct nodes whose pair had no CAD face to measure against and kept the
+    // facet value (repaired/dissolved mesh regions).
+    int gap_fallback_nodes = 0;
     double ratio = 0.0;            // h_interface_mm / gap_mm (0 under kCriterionPatchArea)
     int candidate_pairs = 0;
     int seatable_pairs = 0;
+    // The length that decided `seatable_pairs` (mm) — see kSeatFractionH — and the
+    // deepest initial penetration the placement/facet error produced (mm, positive),
+    // which was clamped to a touching gap instead of becoming k*penetration of
+    // preload.
+    double seat_limit_mm = 0.0;
+    double initial_penetration_max_mm = 0.0;
     int active_pairs = -1;         // -1 until the solve has run
     int min_active_pairs = 0;      // the threshold that was applied
     double max_ratio = 0.0;        // the ratio threshold (0 under kCriterionPatchArea)
@@ -144,6 +247,24 @@ struct ContactResolution {
     // force/area is a pressure only when a load-carrying patch of pairs exists.
     bool pressure_reliable = false;
     std::string reason;            // empty while resolved
+    // ── Load path: does the load actually TRAVEL through this interface? ────────
+    // A resolved, well-seated patch can still be an answer to nothing. On the live
+    // keyway isolate both bodies were grounded (the fixture face-set captured the
+    // mating bore too), so 6 active pairs carried 9.9 N of a 1500 N applied load:
+    // a pressure, in the sense that force/area is a number, but not the seat
+    // pressure anybody asked for. `applied_load_n` is the resultant of the applied
+    // loads on the bodies that are held ONLY by contact, `carried_load_n` the total
+    // contact resultant across the active pairs, and `load_fraction` their quotient
+    // (0 when there is nothing to compare against). The interface is the load path
+    // only when that fraction reaches kMinLoadFraction.
+    double applied_load_n = 0.0;
+    double carried_load_n = 0.0;
+    double load_fraction = 0.0;
+    bool contact_carries_load = false;
+    // Why the load path is not proven — empty exactly when it is. Populated for
+    // both non-carrying shapes: the redundant interface (nothing is held by
+    // contact) and the under-carrying one (a fraction below kMinLoadFraction).
+    std::string load_path_note;
 };
 
 inline constexpr double kContactMaxHOverGap = 4.0;
@@ -152,9 +273,49 @@ inline constexpr int kContactMinActivePairs = 6;
 // h_interface <= sqrt(candidate_area) / 3, i.e. three elements across a square
 // patch of the same area. Below that a "pressure" is one or two nodes wide.
 inline constexpr double kContactMinPatchElems = 3.0;
+// ── The seat limit: a LENGTH, not a multiple of the closest approach ────────────
+// Which candidates can SEAT is the question that decides whether a contact study
+// has a patch or a point load, and it used to be answered with 2*min_gap0_mm — a
+// multiple of the interface's closest approach. On a nominally-touching fit that
+// closest approach is 0 or slightly negative (the bodies were placed touching and
+// the mesh puts a node or two through the partner face), the limit collapses to 0,
+// and only the pairs the discretization happened to push through could seat: the
+// live keyway seated 8, 12, 13 and then 2 pairs across otherwise identical runs of
+// the same request, and at 2 the study was refused as a point load.
+//
+// The limit is now a length the interface itself supplies:
+//
+//   seat_limit = max(kSeatFractionH * h_interface,
+//                    kSeatFractionGap * max_gap_mm, kSeatMinAbsMm)
+//
+// HALF the interface element size is the resolution statement: the elements that
+// bound the interface cannot describe a gap finer than that (on a curved fit the
+// facet chord error and the node-snap residual are of exactly that order), so a
+// candidate below it is indistinguishable from touching and seats. The max_gap
+// term is the floor for a mesh whose interface elements are finer than the
+// clearance the caller declared as contact, and the absolute term keeps a
+// degenerate interface from producing a zero-length limit.
+//
+// Measured on the FRAME-PEDAL-BRAKE keyway (h_interface 0.2535 mm, max_gap 0.4 mm):
+// 0.127 mm, i.e. the geometric arc of a 0.352 mm eccentric fit out to ~50 degrees
+// from the tangency line, thousands of pairs instead of a knife edge.
+inline constexpr double kSeatFractionH = 0.5;
+inline constexpr double kSeatFractionGap = 0.25;
+inline constexpr double kSeatMinAbsMm = 1e-4;
 // The two a-priori criteria, reported verbatim in the resolution block.
 inline constexpr const char* kCriterionClearance = "h_over_clearance";
 inline constexpr const char* kCriterionPatchArea = "elements_across_patch";
+// ── The load-path bar ──────────────────────────────────────────────────────────
+// Half the applied resultant. A contact interface that carries less than this of
+// what is applied to the body it is supposed to hold is a parallel stiffness path,
+// not the load path, and its "pressure" answers a different question than the one
+// asked. Half is deliberately generous: it admits the honest cases where a real
+// seat shares load with a second interface or a bolted tie, and still refuses the
+// 9.9-of-1500-N shape (fraction 0.0066) that a doubly-grounded fixture produces.
+inline constexpr double kMinLoadFraction = 0.5;
+// Below this the applied resultant on the contact-held bodies is treated as
+// absent rather than small: there is no load to trace, so no fraction to judge.
+inline constexpr double kLoadPathMinAppliedN = 1e-9;
 
 // A-priori resolution judgement on the candidate set (before any solve).
 ContactResolution fea_contact_resolution(const ContactCandidateSet& candidates);
@@ -166,5 +327,25 @@ ContactResolution fea_contact_resolution(const ContactCandidateSet& candidates);
 void fea_contact_resolution_after_solve(ContactResolution& resolution,
                                         int active_pairs, double contact_force_n,
                                         double contact_area_mm2);
+
+// Fold the LOAD PATH into the judgement — call this after
+// fea_contact_resolution_after_solve, which owns the patch clause.
+// `applied_load_n` is the resultant of the applied loads on the components held
+// ONLY by contact, `carried_load_n` the total contact resultant across the active
+// pairs, and `held_by_contact_only` false when every body is grounded on its own.
+//
+// Two non-carrying shapes, and they are not the same failure:
+//   * NOTHING IS HELD BY CONTACT. Every body reaches a fixture without the
+//     interface, so the interface is a REDUNDANT path. The study is not wrong —
+//     it is an answer about a parallel spring — so this does not refuse it; it
+//     sets contact_carries_load false, clears pressure_reliable, and says so in
+//     load_path_note.
+//   * THE LOAD DOES NOT CROSS. A body IS held only by contact, carries an applied
+//     resultant, and the interface picks up less than kMinLoadFraction of it. That
+//     is a broken model (over-constrained fixtures, or an interface that separated)
+//     dressed as a converged answer, so it REFUSES: resolved false with a reason.
+void fea_contact_resolution_load_path(ContactResolution& resolution,
+                                      double applied_load_n, double carried_load_n,
+                                      bool held_by_contact_only);
 
 }  // namespace chudware::sim

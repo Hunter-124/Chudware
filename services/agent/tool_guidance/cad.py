@@ -625,11 +625,16 @@ ENTRIES: dict[str, dict[str, Any]] = {
         "prompt_note": (
             "The moving deliverable — a .gif/.mp4 a review PLAYS, not a still: "
             "kind='turntable' orbits a part, 'explode' flies an assembly's components "
-            "apart (factor), 'motion' films simulate_motion's OWN solved mate sweep "
-            "(mate_id/start/stop) with collision samples marked, 'fea' warps a solved "
-            "vtu_path by field. save_path is a REQUIRED absolute .gif/.mp4 in the project; "
-            "frames/fps set duration and frames_dir collects the PNG sequence for a "
-            "multi-segment film. Needs ffmpeg; a single still is still render_part."
+            "apart (factor), 'motion' films a SOLVED trajectory, 'fea' warps a solved "
+            "vtu_path by field. A motion film takes exactly one drive: mate_id "
+            "(+start/stop) sweeps a dimensional mate, steer={'components':[...],"
+            "'axis':{'point':[..],'dir':[..]},'angle_deg':N} (+rear_steer) ramps a steer "
+            "sweep 0->angle for an assembly with no drivable mate — same spec as "
+            "steering_turning_radius — and poses=[{component:[16 numbers]},...] films an "
+            "explicit frame list; collision samples are marked. save_path is a REQUIRED "
+            "absolute .gif/.mp4 in the project; frames/fps set duration and frames_dir "
+            "collects the PNG sequence for a multi-segment film. Needs ffmpeg; a single "
+            "still is still render_part."
         ),
         "timeout_s": 900,
     },

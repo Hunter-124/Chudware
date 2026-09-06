@@ -16,11 +16,13 @@
 // confines nglib.h to its own TU), so it stays includable in any link config.
 #pragma once
 
+#include <memory>
 #include <string>
 #include <vector>
 
 #include <nlohmann/json.hpp>
 #include "sim/sim_cancel.h"
+#include "sim/fea_contact.h"
 
 namespace chudware::sim {
 
@@ -123,6 +125,23 @@ bool write_result_vtu(const nlohmann::json& study, const std::vector<double>& po
 // echo a path the filesystem no longer keeps; the evidence file IS the request, so the
 // solve routes treat that as a cache miss instead of promising a missing file.
 bool vtu_evidence_missing(const nlohmann::json& study);
+
+// ── The CAD-face gap oracle a contact study measures its clearance with ────────
+// Loads `geometry_path` (STEP or BREP — the same file the mesher meshed), explodes
+// it into solids, and answers ContactGapProbe::pair_gap_mm with the SIGNED distance
+// from each candidate node to the other body's own analytic faces. That is the
+// clearance a fit actually has; the node-to-node facet gap is the clearance the two
+// meshes happened to sample, and on a curved interface the two differ by most of
+// the fit (fea_contact.h ContactGapProbe has the ME 490 hinge numbers).
+//
+// `reach_mm` bounds the search: a face further than this from a node is not
+// consulted, and a node with no face inside it is reported as unmeasurable so the
+// caller can fall back to the facet value and count it.
+//
+// Returns nullptr when the file cannot be read or carries fewer than two solids —
+// there is no "other body" then — with `note` saying which. Never throws.
+std::unique_ptr<ContactGapProbe> make_cad_gap_probe(const std::string& geometry_path,
+                                                    double reach_mm, std::string& note);
 }  // namespace detail
 
 // Combined modal run. `study` carries the same mesh + material + fixtures

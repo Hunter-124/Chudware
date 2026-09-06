@@ -17,6 +17,16 @@
 // warm-start-relative mechanical coupling), so Python-oracle parity is not a
 // correctness requirement.
 //
+// An ANGLE mate is a signed angle about a reference axis. The axis may be authored on
+// the mate — `value: {"value": <deg>, "axis": [x,y,z]}`, in the FIRST ref's component
+// local frame (alias `reference_axis`) — and is otherwise derived once per mate from
+// the mate's own geometry and seed poses (mate.cpp::angle_reference_local). Author it
+// for any mate that sits at, or is driven through, 0 deg / 180 deg: there the
+// derivation has no relative rotation to read the joint axis off, and it falls back to
+// the geoms' companion vector (a plane's in-plane `direction`, an axis's `normal`).
+// The sign of a derived axis is canonical, so a driven sweep measures the same signed
+// angle on both sides of zero.
+//
 // Dict-in/dict-out via nlohmann::json keeps the document and harness seams
 // simple. OCCT-free (only solver/Eigen/json).
 #pragma once
@@ -56,7 +66,9 @@ struct MateStatus {
 // Per-mate residual at the solved configuration. `max_abs` is the largest absolute
 // entry of the mate's residual block: mm for the positional rows (offset from the
 // axis / plane it asks for), dimensionless for the direction rows (sin of the angle
-// between the two axes/normals it asks to align). `norm` is the block's 2-norm.
+// between the two axes/normals it asks to align), RADIANS for an angle mate (which is
+// a signed angle about its reference axis, not a dot product — see mate.cpp::angle).
+// `norm` is the block's 2-norm.
 // Reported for every mate that produced residual rows, worst first, so a solve that
 // does not converge can NAME the mate that is holding it back instead of leaving the
 // caller to bisect a 20-mate network by hand.

@@ -193,6 +193,379 @@ def _clash_row(hit: dict) -> dict:
     keep = ("a", "b", "volume", "volume_mm3", "overlap_volume_mm3", "distance",
             "overlap_bbox", "kind")
     return {k: hit[k] for k in keep if k in hit}
+# ----------------------------------------------------------------- steer drive
+# Module level, not nested in the registration closure: the steer pose driver is
+# reused verbatim by render_animation(kind='motion', steer=...) so a film and a
+# turning-radius study pose the same clone the same way. None of it touches `mcp`.
+
+
+def _components(doc_id: str) -> list:
+    tr = cb.call("doc_tree", {"doc_id": doc_id}).get("tree") or {}
+    comps = tr.get("components") if isinstance(tr, dict) else None
+    return [c for c in (comps or []) if isinstance(c, dict) and not c.get("suppressed")]
+
+
+def _resolve_components(doc_id: str, wanted) -> list:
+    """`wanted` (ids and/or names, or None = all) -> the component dicts, in doc order."""
+    comps = _components(doc_id)
+    if not comps:
+        raise ValueError("document has no components (open/build an assembly first)")
+    if wanted is None:
+        return comps
+    wanted = require_list(wanted, "components", 'a list of component ids or names')
+    out = []
+    for token in wanted:
+        key = str(token).strip()
+        hit = next((c for c in comps
+                    if c.get("id") == key or (c.get("name") or "") == key), None)
+        if hit is None:
+            known = ", ".join(f"{c.get('id')}({c.get('name')})" for c in comps)
+            raise ValueError(f"component '{key}' not found. Components: {known}")
+        if hit not in out:
+            out.append(hit)
+    return out
+
+
+def _xform_point(m: list, p) -> list:
+    """Row-major 4x4 (flat 16, the simulate_motion tool's public shape) applied to p."""
+    return [m[0] * p[0] + m[1] * p[1] + m[2] * p[2] + m[3],
+            m[4] * p[0] + m[5] * p[1] + m[6] * p[2] + m[7],
+            m[8] * p[0] + m[9] * p[1] + m[10] * p[2] + m[11]]
+
+
+def _finite16(m, label: str) -> list:
+    if not isinstance(m, list) or len(m) != 16:
+        raise ValueError(f"{label} is not a 4x4 transform")
+    out = [float(v) for v in m]
+    if not all(math.isfinite(v) for v in out):
+        raise ValueError(f"{label} is non-finite")
+    return out
+
+
+def _clone_detached(doc_id: str, tool: str) -> str:
+    """A DETACHED copy of `doc_id`, opened from the document's own file.
+
+    The steer drive AUTHORS component poses (`asm_edit_component` + `fixed`), which is
+    a real mutation — so it lands on a clone: the caller's document keeps its
+    revision, dirty flag, undo history and mate ownership. `detach_path=True` leaves
+    the clone unbound to the file, so nothing here can overwrite the source.
+    """
+    row = next((r for r in (cb.call("doc_list", {}) or {}).get("docs", [])
+                if isinstance(r, dict) and r.get("doc_id") == doc_id), {})
+    path = row.get("path")
+    if not path or not os.path.exists(str(path)):
+        raise ValueError(
+            f"{tool}(steer=...) drives a DETACHED CLONE of the assembly so your live "
+            "document is never re-posed, and a clone can only be opened from a file. "
+            f"Document {doc_id} has no saved file — call save_part(path=...) (or "
+            "save_assembly) first, then steer it.")
+    clone = (cb.call("doc_open", {"path": str(path), "detach_path": True})
+             or {}).get("doc_id")
+    if not clone:
+        raise ValueError(f"doc_open({path}) returned no doc_id; cannot steer a clone.")
+    return clone
+
+
+def _comp_transforms(doc_id: str) -> dict:
+    """{component_id: row-major 16} straight out of the document's SOLVED components."""
+    tr = cb.call("doc_tree", {"doc_id": doc_id}).get("tree") or {}
+    out: dict = {}
+    for c in (tr.get("components") or []):
+        if not isinstance(c, dict) or c.get("suppressed"):
+            continue
+        cid = str(c.get("id") or "")
+        if not cid:
+            continue
+        tf = c.get("transform")
+        out[cid] = (_finite16(tf, f"transform of '{cid}'")
+                    if isinstance(tf, list) and len(tf) == 16 else list(_IDENT16))
+    return out
+
+
+def _axis_from_mate(doc_id: str, mate_id: str, cid: str, xf: dict) -> dict:
+    """The WORLD axis a mate resolves to, for the steered component `cid`.
+
+    A concentric/coincident kingpin mate stores each ref as the geometry query that
+    matched it, and a cylindrical/circular match carries its own `axis` + `centroid`
+    in the component's LOCAL frame — the measured kingpin axis, already in the
+    document. Prefer the ref that belongs to `cid`; otherwise take the other side's
+    (a satisfied concentric mate puts both on the same world line) and say so.
+    """
+    tr = cb.call("doc_tree", {"doc_id": doc_id}).get("tree") or {}
+    mates = [m for m in (tr.get("mates") or []) if isinstance(m, dict)]
+    mate = next((m for m in mates if m.get("id") == mate_id), None)
+    if mate is None:
+        known = ", ".join(f"{m.get('id')}({m.get('type')})" for m in mates) or "none"
+        raise ValueError(f"steer mate_id '{mate_id}' is not a mate of this assembly. "
+                         f"Mates: {known}")
+    refs = [r for r in (mate.get("refs") or []) if isinstance(r, dict)]
+    axial = [r for r in refs
+             if isinstance((r.get("selector") or {}).get("axis"), list)
+             and isinstance((r.get("selector") or {}).get("centroid"), list)]
+    if not axial:
+        raise ValueError(
+            f"steer mate_id '{mate_id}' ({mate.get('type')}) resolves no AXIS: neither "
+            "reference is a cylindrical face or circular edge, so there is no kingpin "
+            "line to rotate about. Pass axis={'point':[x,y,z],'dir':[x,y,z]} (e.g. from "
+            "fit_cylinder_axis on the kingpin bore).")
+    ref = next((r for r in axial if r.get("component") == cid), axial[0])
+    owner = str(ref.get("component") or "")
+    m = xf.get(owner)
+    if m is None:
+        raise ValueError(f"steer mate_id '{mate_id}': its reference component "
+                         f"'{owner}' is not placed in this assembly.")
+    sel = ref["selector"]
+    pt = _xform_point(m, [float(v) for v in sel["centroid"]])
+    d = [float(v) for v in sel["axis"]]
+    dw = [m[0] * d[0] + m[1] * d[1] + m[2] * d[2],
+          m[4] * d[0] + m[5] * d[1] + m[6] * d[2],
+          m[8] * d[0] + m[9] * d[1] + m[10] * d[2]]
+    return {"point": pt, "dir": dw,
+            "source": f"mate '{mate_id}' ref on component '{owner}'"}
+
+
+def _axis_literal(raw, label: str) -> dict:
+    """{'point':[3],'dir':[3]} out of an explicit axis spec (dir aliases accepted)."""
+    v = coerce_json_or_repr(raw)
+    if not isinstance(v, dict):
+        raise ValueError(f"{label} must be an object "
+                         "{'point':[x,y,z],'dir':[x,y,z]}, got "
+                         f"{type(v).__name__}")
+    pt = next((v[k] for k in ("point", "origin", "at", "axis_point", "location")
+               if isinstance(v.get(k), (list, tuple))), None)
+    dr = next((v[k] for k in ("dir", "direction", "axis", "axis_dir", "normal")
+               if isinstance(v.get(k), (list, tuple))), None)
+    if pt is None or dr is None or len(pt) != 3 or len(dr) != 3:
+        raise ValueError(
+            f"{label} needs a 3-number `point` ON the axis and a 3-number `dir` ALONG "
+            f"it, e.g. {{'point':[520,-410,180],'dir':[0,0,1]}} — got keys "
+            f"{sorted(v)}. fit_cylinder_axis on the kingpin bore returns exactly "
+            "axis_point/axis_dir.")
+    p = [float(x) for x in pt]
+    d = [float(x) for x in dr]
+    if not all(math.isfinite(x) for x in p + d):
+        raise ValueError(f"{label} is non-finite")
+    if math.sqrt(sum(x * x for x in d)) <= 1e-12:
+        raise ValueError(f"{label} `dir` is a zero-length vector")
+    return {"point": p, "dir": d, "source": "explicit axis"}
+
+
+def _steer_drives(doc_id: str, spec, label: str, xf: dict) -> list:
+    """A `steer`/`rear_steer` spec -> [{component,name,angle_deg,axis,wheel}].
+
+    Refuses instead of guessing: an unknown key, a components/angles length mismatch,
+    or a missing axis is a teaching error, because every one of those silently steered
+    nothing in earlier hand-rolled attempts.
+    """
+    v = coerce_json_or_repr(spec)
+    if not isinstance(v, dict):
+        raise ValueError(
+            f"{label} must be an object, e.g. {label}={{'components':['FL','FR'], "
+            "'axis':{'point':[x,y,z],'dir':[0,0,1]}, 'angle_deg':30}} — got "
+            f"{type(v).__name__}.")
+    unknown = sorted(set(v) - _STEER_SPEC_KEYS)
+    if unknown:
+        raise ValueError(
+            f"{label}: unknown key(s) {unknown}. It takes components (or component), "
+            "axis (or mate_id), angle_deg (or angles_deg) and optional wheel/wheels.")
+    raw_comps = next((v[k] for k in ("components", "component", "comps", "comp")
+                      if v.get(k) is not None), None)
+    if raw_comps is None:
+        raise ValueError(f"{label}: name the component(s) to steer, e.g. "
+                         f"{label}={{'components':['upright_FL','upright_FR'], ...}}.")
+    if isinstance(raw_comps, str):
+        raw_comps = [raw_comps]
+    comps = _resolve_components(doc_id, raw_comps)
+    n = len(comps)
+
+    raw_ang = next((v[k] for k in ("angles_deg", "angle_deg", "angles", "angle",
+                                   "steer_deg") if v.get(k) is not None), None)
+    if raw_ang is None:
+        raise ValueError(f"{label}: give the steer angle — angle_deg=<deg> for every "
+                         "named component, or angles_deg=[...] one per component.")
+    raw_ang = coerce_json_or_repr(raw_ang)
+    if isinstance(raw_ang, (int, float)) and not isinstance(raw_ang, bool):
+        angles = [float(raw_ang)] * n
+    else:
+        angles = [float(a) for a in require_list(
+            raw_ang, f"{label}.angles_deg", "one angle in degrees per component")]
+        if len(angles) != n:
+            raise ValueError(
+                f"{label}: {len(angles)} angle(s) for {n} component(s). Give one "
+                "angles_deg entry per component (a true Ackermann pair steers the "
+                "inner wheel more), or a single angle_deg for parallel steer.")
+    for a in angles:
+        if not math.isfinite(a) or abs(a) > 90.0:
+            raise ValueError(f"{label}: steer angle {a} deg is not a finite angle in "
+                             "(-90, 90); a wheel cannot pass 90 deg of steer.")
+
+    raw_mate = next((v[k] for k in ("mate_ids", "mate_id", "mates", "mate")
+                     if v.get(k) is not None), None)
+    raw_axis = next((v[k] for k in ("axes", "axis", "kingpin_axes", "kingpin_axis")
+                     if v.get(k) is not None), None)
+    if raw_mate is None and raw_axis is None:
+        raise ValueError(
+            f"{label}: give the kingpin axis to rotate about — axis={{'point':[x,y,z],"
+            "'dir':[x,y,z]} (one axis, or a list/mapping one per component), or "
+            "mate_id='<concentric kingpin mate>' to take the axis the mate already "
+            "resolves.")
+    axes: list = []
+    for i, c in enumerate(comps):
+        cid, cname = c["id"], (c.get("name") or c["id"])
+        if raw_mate is not None:
+            mids = raw_mate if isinstance(raw_mate, list) else [raw_mate] * n
+            if len(mids) != n:
+                raise ValueError(f"{label}: {len(mids)} mate_ids for {n} components.")
+            axes.append(_axis_from_mate(doc_id, str(mids[i]), cid, xf))
+            continue
+        a = coerce_json_or_repr(raw_axis)
+        if isinstance(a, list):
+            if len(a) != n:
+                raise ValueError(f"{label}: {len(a)} axes for {n} components — give "
+                                 "one axis per component, or one shared axis.")
+            axes.append(_axis_literal(a[i], f"{label}.axis[{i}]"))
+        elif isinstance(a, dict) and not any(
+                k in a for k in ("point", "origin", "at", "axis_point", "location")):
+            hit = a.get(cid, a.get(cname))
+            if hit is None:
+                raise ValueError(
+                    f"{label}.axis is keyed by component but has no entry for "
+                    f"'{cname}' ({cid}); keys are {sorted(a)}.")
+            axes.append(_axis_literal(hit, f"{label}.axis['{cname}']"))
+        else:
+            axes.append(_axis_literal(a, f"{label}.axis"))
+
+    raw_wheel = next((v[k] for k in ("wheels", "wheel") if v.get(k) is not None), None)
+    wheels: list = [None] * n
+    if raw_wheel is not None:
+        if isinstance(raw_wheel, str):
+            raw_wheel = [raw_wheel] * n
+        picks = _resolve_components(doc_id, require_list(
+            raw_wheel, f"{label}.wheels", "one wheel component per steered component"))
+        if len(picks) != n:
+            raise ValueError(f"{label}: {len(picks)} wheel(s) for {n} component(s).")
+        wheels = [p["id"] for p in picks]
+
+    return [{"component": c["id"], "name": c.get("name") or c["id"],
+             "angle_deg": angles[i], "axis": axes[i], "wheel": wheels[i]}
+            for i, c in enumerate(comps)]
+
+
+def steer_pose_sweep(doc_id: str, steer, rear_steer, steps: int,
+                     check_interference: bool, tool: str) -> dict:
+    """Drive named components about their kingpin axes; return a simulate_motion-shaped
+    result so every consumer downstream is identical to the dimensional-mate path.
+
+    `steps` samples scale the requested angles from 0 (straight ahead) to 1 (full
+    lock), so a sweep exists even though the assembly owns no drivable mate. Each
+    sample AUTHORS the rotated pose on the clone: `asm_edit_component` carrying both
+    `transform` and `fixed:true`, because an unfixed mated component keeps its warm
+    seed and its authored transform is an engine-level no-op (contracts/doc_ops.md §8)
+    — the drive would report ok and move nothing. Grounding the driven upright is also
+    the physically right statement: the steering input owns that pose, and the mate
+    network re-solves the tie rods / hubs / wheels around it.
+
+    PUBLIC because `render_animation(kind='motion', steer=...)` films exactly this
+    trajectory: the film and a turning-radius study must pose the same clone the same
+    way, so there is one steer driver and no second interpretation of the spec.
+    """
+    clone = _clone_detached(doc_id, tool)
+    try:
+        base = _comp_transforms(clone)
+        names = {}
+        for c in _components(clone):
+            names[str(c.get("id"))] = c.get("name") or str(c.get("id"))
+        drives = _steer_drives(clone, steer, "steer", base)
+        for dr in drives:
+            dr["axle"] = "front"
+        if rear_steer is not None:
+            rear = _steer_drives(clone, rear_steer, "rear_steer", base)
+            for dr in rear:
+                dr["axle"] = "rear"
+            drives += rear
+        seen: set = set()
+        for d in drives:
+            if d["component"] in seen:
+                raise ValueError(
+                    f"component '{d['name']}' is driven twice (steer and rear_steer "
+                    "cannot both own the same component's pose).")
+            seen.add(d["component"])
+        missing = [d["name"] for d in drives if d["component"] not in base]
+        if missing:
+            raise ValueError(f"steered component(s) {missing} are not placed in this "
+                             "assembly.")
+
+        primary = max(drives, key=lambda d: abs(d["angle_deg"]))["angle_deg"]
+        trajectory = []
+        first_hit = None
+        interferences = []
+        for i in range(steps):
+            scale = i / (steps - 1) if steps > 1 else 1.0
+            ops = []
+            for d in drives:
+                r = _axis_rotation16(d["axis"]["point"], d["axis"]["dir"],
+                                     scale * d["angle_deg"])
+                ops.append({"op": "asm_edit_component", "id": d["component"],
+                            "transform": _mat_mul16(r, base[d["component"]]),
+                            "fixed": True})
+            cb.call("doc_apply_ops", {"doc_id": clone, "with_tess": False, "ops": ops})
+            sr = cb.call("doc_solve_mates", {"doc_id": clone}) or {}
+            rb = sr.get("rebuild") or {}
+            rep = _solve_report(rb)
+            xf = _comp_transforms(clone)
+            frame = {"i": i, "value": scale * primary, "scale": scale,
+                     "dof": rb.get("dof"), "converged": rep["converged"],
+                     "max_residual": rep["worst_residual"],
+                     "bodies": [{"component": cid, "name": names.get(cid, cid),
+                                 "transform": m} for cid, m in xf.items()]}
+            if not rep["converged"]:
+                frame["solve_error"] = rep["message"]
+            if check_interference:
+                ir = cb.call("eval_interference",
+                             {"doc_id": clone, "include_coincident": False,
+                              "min_clearance_mm": 0.0}) or {}
+                hits = [_clash_row(h) for h in (ir.get("interferences") or [])
+                        if isinstance(h, dict)]
+                frame["collisions"] = hits
+                if hits and first_hit is None:
+                    first_hit = {"step": i, "value": frame["value"],
+                                 "detail": hits[:8]}
+                    interferences = hits[:8]
+            trajectory.append(frame)
+
+        bad = [f["i"] for f in trajectory if not f["converged"]]
+        out = {
+            "ok": not bad,
+            "doc_id": doc_id,
+            "mate_id": None,
+            "driver": {"type": "steer", "unit": "deg", "start": 0.0, "stop": primary,
+                       "steps": steps, "samples": len(trajectory),
+                       "components": [d["name"] for d in drives],
+                       "angles_deg": [d["angle_deg"] for d in drives],
+                       "axes": [{"point": d["axis"]["point"], "dir": d["axis"]["dir"],
+                                 "source": d["axis"]["source"]} for d in drives]},
+            "trajectory": trajectory,
+            "steer_drives": drives,
+            "interference": {"checked": bool(check_interference),
+                             "first_collision_step":
+                                 first_hit["step"] if first_hit else None,
+                             "first_collision_value":
+                                 first_hit["value"] if first_hit else None,
+                             "detail": interferences},
+        }
+        if bad:
+            out["error"] = (
+                "the mate network did not converge around the steered pose at step(s) "
+                f"{bad}: " + str(next(f.get("solve_error") for f in trajectory
+                                      if not f["converged"])))
+        return out
+    finally:
+        try:
+            cb.call("doc_close", {"doc_id": clone})
+        except Exception:  # noqa: BLE001 — a clone we cannot close is not a result
+            pass
+
+
 
 
 def register_cad_motion_tools(mcp: FastMCP) -> None:
@@ -228,31 +601,6 @@ def register_cad_motion_tools(mcp: FastMCP) -> None:
 
     # ------------------------------------------------------------------ geometry helpers
 
-    def _components(doc_id: str) -> list:
-        tr = cb.call("doc_tree", {"doc_id": doc_id}).get("tree") or {}
-        comps = tr.get("components") if isinstance(tr, dict) else None
-        return [c for c in (comps or []) if isinstance(c, dict) and not c.get("suppressed")]
-
-    def _resolve_components(doc_id: str, wanted) -> list:
-        """`wanted` (ids and/or names, or None = all) -> the component dicts, in doc order."""
-        comps = _components(doc_id)
-        if not comps:
-            raise ValueError("document has no components (open/build an assembly first)")
-        if wanted is None:
-            return comps
-        wanted = require_list(wanted, "components", 'a list of component ids or names')
-        out = []
-        for token in wanted:
-            key = str(token).strip()
-            hit = next((c for c in comps
-                        if c.get("id") == key or (c.get("name") or "") == key), None)
-            if hit is None:
-                known = ", ".join(f"{c.get('id')}({c.get('name')})" for c in comps)
-                raise ValueError(f"component '{key}' not found. Components: {known}")
-            if hit not in out:
-                out.append(hit)
-        return out
-
     _LOCAL_BBOX: dict = {}
 
     def _local_bbox(source_path: str) -> dict:
@@ -281,12 +629,6 @@ def register_cad_motion_tools(mcp: FastMCP) -> None:
                              "its geometry cannot be swept")
         return path
 
-    def _xform_point(m: list, p) -> list:
-        """Row-major 4x4 (flat 16, the simulate_motion tool's public shape) applied to p."""
-        return [m[0] * p[0] + m[1] * p[1] + m[2] * p[2] + m[3],
-                m[4] * p[0] + m[5] * p[1] + m[6] * p[2] + m[7],
-                m[8] * p[0] + m[9] * p[1] + m[10] * p[2] + m[11]]
-
     def _corners(bbox: dict) -> list:
         lo, hi = bbox["min"], bbox["max"]
         return [[lo[0] if not i & 1 else hi[0],
@@ -299,14 +641,6 @@ def register_cad_motion_tools(mcp: FastMCP) -> None:
         return {"min": lo, "max": hi,
                 "size": [hi[a] - lo[a] for a in range(3)],
                 "center": [(hi[a] + lo[a]) / 2.0 for a in range(3)]}
-
-    def _finite16(m, label: str) -> list:
-        if not isinstance(m, list) or len(m) != 16:
-            raise ValueError(f"{label} is not a 4x4 transform")
-        out = [float(v) for v in m]
-        if not all(math.isfinite(v) for v in out):
-            raise ValueError(f"{label} is non-finite")
-        return out
 
     def _frame_transforms(frame: dict) -> dict:
         """{component_id: row-major 16} for the top-level components of one sweep frame."""
@@ -332,322 +666,6 @@ def register_cad_motion_tools(mcp: FastMCP) -> None:
         if not (out.get("trajectory") or []):
             raise ValueError("motion sweep returned no trajectory")
         return out
-
-    # ---------------------------------------------------- steer drive (no mate needed)
-
-    def _clone_detached(doc_id: str, tool: str) -> str:
-        """A DETACHED copy of `doc_id`, opened from the document's own file.
-
-        The steer drive AUTHORS component poses (`asm_edit_component` + `fixed`), which is
-        a real mutation — so it lands on a clone: the caller's document keeps its
-        revision, dirty flag, undo history and mate ownership. `detach_path=True` leaves
-        the clone unbound to the file, so nothing here can overwrite the source.
-        """
-        row = next((r for r in (cb.call("doc_list", {}) or {}).get("docs", [])
-                    if isinstance(r, dict) and r.get("doc_id") == doc_id), {})
-        path = row.get("path")
-        if not path or not os.path.exists(str(path)):
-            raise ValueError(
-                f"{tool}(steer=...) drives a DETACHED CLONE of the assembly so your live "
-                "document is never re-posed, and a clone can only be opened from a file. "
-                f"Document {doc_id} has no saved file — call save_part(path=...) (or "
-                "save_assembly) first, then steer it.")
-        clone = (cb.call("doc_open", {"path": str(path), "detach_path": True})
-                 or {}).get("doc_id")
-        if not clone:
-            raise ValueError(f"doc_open({path}) returned no doc_id; cannot steer a clone.")
-        return clone
-
-    def _comp_transforms(doc_id: str) -> dict:
-        """{component_id: row-major 16} straight out of the document's SOLVED components."""
-        tr = cb.call("doc_tree", {"doc_id": doc_id}).get("tree") or {}
-        out: dict = {}
-        for c in (tr.get("components") or []):
-            if not isinstance(c, dict) or c.get("suppressed"):
-                continue
-            cid = str(c.get("id") or "")
-            if not cid:
-                continue
-            tf = c.get("transform")
-            out[cid] = (_finite16(tf, f"transform of '{cid}'")
-                        if isinstance(tf, list) and len(tf) == 16 else list(_IDENT16))
-        return out
-
-    def _axis_from_mate(doc_id: str, mate_id: str, cid: str, xf: dict) -> dict:
-        """The WORLD axis a mate resolves to, for the steered component `cid`.
-
-        A concentric/coincident kingpin mate stores each ref as the geometry query that
-        matched it, and a cylindrical/circular match carries its own `axis` + `centroid`
-        in the component's LOCAL frame — the measured kingpin axis, already in the
-        document. Prefer the ref that belongs to `cid`; otherwise take the other side's
-        (a satisfied concentric mate puts both on the same world line) and say so.
-        """
-        tr = cb.call("doc_tree", {"doc_id": doc_id}).get("tree") or {}
-        mates = [m for m in (tr.get("mates") or []) if isinstance(m, dict)]
-        mate = next((m for m in mates if m.get("id") == mate_id), None)
-        if mate is None:
-            known = ", ".join(f"{m.get('id')}({m.get('type')})" for m in mates) or "none"
-            raise ValueError(f"steer mate_id '{mate_id}' is not a mate of this assembly. "
-                             f"Mates: {known}")
-        refs = [r for r in (mate.get("refs") or []) if isinstance(r, dict)]
-        axial = [r for r in refs
-                 if isinstance((r.get("selector") or {}).get("axis"), list)
-                 and isinstance((r.get("selector") or {}).get("centroid"), list)]
-        if not axial:
-            raise ValueError(
-                f"steer mate_id '{mate_id}' ({mate.get('type')}) resolves no AXIS: neither "
-                "reference is a cylindrical face or circular edge, so there is no kingpin "
-                "line to rotate about. Pass axis={'point':[x,y,z],'dir':[x,y,z]} (e.g. from "
-                "fit_cylinder_axis on the kingpin bore).")
-        ref = next((r for r in axial if r.get("component") == cid), axial[0])
-        owner = str(ref.get("component") or "")
-        m = xf.get(owner)
-        if m is None:
-            raise ValueError(f"steer mate_id '{mate_id}': its reference component "
-                             f"'{owner}' is not placed in this assembly.")
-        sel = ref["selector"]
-        pt = _xform_point(m, [float(v) for v in sel["centroid"]])
-        d = [float(v) for v in sel["axis"]]
-        dw = [m[0] * d[0] + m[1] * d[1] + m[2] * d[2],
-              m[4] * d[0] + m[5] * d[1] + m[6] * d[2],
-              m[8] * d[0] + m[9] * d[1] + m[10] * d[2]]
-        return {"point": pt, "dir": dw,
-                "source": f"mate '{mate_id}' ref on component '{owner}'"}
-
-    def _axis_literal(raw, label: str) -> dict:
-        """{'point':[3],'dir':[3]} out of an explicit axis spec (dir aliases accepted)."""
-        v = coerce_json_or_repr(raw)
-        if not isinstance(v, dict):
-            raise ValueError(f"{label} must be an object "
-                             "{'point':[x,y,z],'dir':[x,y,z]}, got "
-                             f"{type(v).__name__}")
-        pt = next((v[k] for k in ("point", "origin", "at", "axis_point", "location")
-                   if isinstance(v.get(k), (list, tuple))), None)
-        dr = next((v[k] for k in ("dir", "direction", "axis", "axis_dir", "normal")
-                   if isinstance(v.get(k), (list, tuple))), None)
-        if pt is None or dr is None or len(pt) != 3 or len(dr) != 3:
-            raise ValueError(
-                f"{label} needs a 3-number `point` ON the axis and a 3-number `dir` ALONG "
-                f"it, e.g. {{'point':[520,-410,180],'dir':[0,0,1]}} — got keys "
-                f"{sorted(v)}. fit_cylinder_axis on the kingpin bore returns exactly "
-                "axis_point/axis_dir.")
-        p = [float(x) for x in pt]
-        d = [float(x) for x in dr]
-        if not all(math.isfinite(x) for x in p + d):
-            raise ValueError(f"{label} is non-finite")
-        if math.sqrt(sum(x * x for x in d)) <= 1e-12:
-            raise ValueError(f"{label} `dir` is a zero-length vector")
-        return {"point": p, "dir": d, "source": "explicit axis"}
-
-    def _steer_drives(doc_id: str, spec, label: str, xf: dict) -> list:
-        """A `steer`/`rear_steer` spec -> [{component,name,angle_deg,axis,wheel}].
-
-        Refuses instead of guessing: an unknown key, a components/angles length mismatch,
-        or a missing axis is a teaching error, because every one of those silently steered
-        nothing in earlier hand-rolled attempts.
-        """
-        v = coerce_json_or_repr(spec)
-        if not isinstance(v, dict):
-            raise ValueError(
-                f"{label} must be an object, e.g. {label}={{'components':['FL','FR'], "
-                "'axis':{'point':[x,y,z],'dir':[0,0,1]}, 'angle_deg':30}} — got "
-                f"{type(v).__name__}.")
-        unknown = sorted(set(v) - _STEER_SPEC_KEYS)
-        if unknown:
-            raise ValueError(
-                f"{label}: unknown key(s) {unknown}. It takes components (or component), "
-                "axis (or mate_id), angle_deg (or angles_deg) and optional wheel/wheels.")
-        raw_comps = next((v[k] for k in ("components", "component", "comps", "comp")
-                          if v.get(k) is not None), None)
-        if raw_comps is None:
-            raise ValueError(f"{label}: name the component(s) to steer, e.g. "
-                             f"{label}={{'components':['upright_FL','upright_FR'], ...}}.")
-        if isinstance(raw_comps, str):
-            raw_comps = [raw_comps]
-        comps = _resolve_components(doc_id, raw_comps)
-        n = len(comps)
-
-        raw_ang = next((v[k] for k in ("angles_deg", "angle_deg", "angles", "angle",
-                                       "steer_deg") if v.get(k) is not None), None)
-        if raw_ang is None:
-            raise ValueError(f"{label}: give the steer angle — angle_deg=<deg> for every "
-                             "named component, or angles_deg=[...] one per component.")
-        raw_ang = coerce_json_or_repr(raw_ang)
-        if isinstance(raw_ang, (int, float)) and not isinstance(raw_ang, bool):
-            angles = [float(raw_ang)] * n
-        else:
-            angles = [float(a) for a in require_list(
-                raw_ang, f"{label}.angles_deg", "one angle in degrees per component")]
-            if len(angles) != n:
-                raise ValueError(
-                    f"{label}: {len(angles)} angle(s) for {n} component(s). Give one "
-                    "angles_deg entry per component (a true Ackermann pair steers the "
-                    "inner wheel more), or a single angle_deg for parallel steer.")
-        for a in angles:
-            if not math.isfinite(a) or abs(a) > 90.0:
-                raise ValueError(f"{label}: steer angle {a} deg is not a finite angle in "
-                                 "(-90, 90); a wheel cannot pass 90 deg of steer.")
-
-        raw_mate = next((v[k] for k in ("mate_ids", "mate_id", "mates", "mate")
-                         if v.get(k) is not None), None)
-        raw_axis = next((v[k] for k in ("axes", "axis", "kingpin_axes", "kingpin_axis")
-                         if v.get(k) is not None), None)
-        if raw_mate is None and raw_axis is None:
-            raise ValueError(
-                f"{label}: give the kingpin axis to rotate about — axis={{'point':[x,y,z],"
-                "'dir':[x,y,z]} (one axis, or a list/mapping one per component), or "
-                "mate_id='<concentric kingpin mate>' to take the axis the mate already "
-                "resolves.")
-        axes: list = []
-        for i, c in enumerate(comps):
-            cid, cname = c["id"], (c.get("name") or c["id"])
-            if raw_mate is not None:
-                mids = raw_mate if isinstance(raw_mate, list) else [raw_mate] * n
-                if len(mids) != n:
-                    raise ValueError(f"{label}: {len(mids)} mate_ids for {n} components.")
-                axes.append(_axis_from_mate(doc_id, str(mids[i]), cid, xf))
-                continue
-            a = coerce_json_or_repr(raw_axis)
-            if isinstance(a, list):
-                if len(a) != n:
-                    raise ValueError(f"{label}: {len(a)} axes for {n} components — give "
-                                     "one axis per component, or one shared axis.")
-                axes.append(_axis_literal(a[i], f"{label}.axis[{i}]"))
-            elif isinstance(a, dict) and not any(
-                    k in a for k in ("point", "origin", "at", "axis_point", "location")):
-                hit = a.get(cid, a.get(cname))
-                if hit is None:
-                    raise ValueError(
-                        f"{label}.axis is keyed by component but has no entry for "
-                        f"'{cname}' ({cid}); keys are {sorted(a)}.")
-                axes.append(_axis_literal(hit, f"{label}.axis['{cname}']"))
-            else:
-                axes.append(_axis_literal(a, f"{label}.axis"))
-
-        raw_wheel = next((v[k] for k in ("wheels", "wheel") if v.get(k) is not None), None)
-        wheels: list = [None] * n
-        if raw_wheel is not None:
-            if isinstance(raw_wheel, str):
-                raw_wheel = [raw_wheel] * n
-            picks = _resolve_components(doc_id, require_list(
-                raw_wheel, f"{label}.wheels", "one wheel component per steered component"))
-            if len(picks) != n:
-                raise ValueError(f"{label}: {len(picks)} wheel(s) for {n} component(s).")
-            wheels = [p["id"] for p in picks]
-
-        return [{"component": c["id"], "name": c.get("name") or c["id"],
-                 "angle_deg": angles[i], "axis": axes[i], "wheel": wheels[i]}
-                for i, c in enumerate(comps)]
-
-    def _steer_sweep(doc_id: str, steer, rear_steer, steps: int,
-                     check_interference: bool, tool: str) -> dict:
-        """Drive named components about their kingpin axes; return a simulate_motion-shaped
-        result so every consumer downstream is identical to the dimensional-mate path.
-
-        `steps` samples scale the requested angles from 0 (straight ahead) to 1 (full
-        lock), so a sweep exists even though the assembly owns no drivable mate. Each
-        sample AUTHORS the rotated pose on the clone: `asm_edit_component` carrying both
-        `transform` and `fixed:true`, because an unfixed mated component keeps its warm
-        seed and its authored transform is an engine-level no-op (contracts/doc_ops.md §8)
-        — the drive would report ok and move nothing. Grounding the driven upright is also
-        the physically right statement: the steering input owns that pose, and the mate
-        network re-solves the tie rods / hubs / wheels around it.
-        """
-        clone = _clone_detached(doc_id, tool)
-        try:
-            base = _comp_transforms(clone)
-            names = {}
-            for c in _components(clone):
-                names[str(c.get("id"))] = c.get("name") or str(c.get("id"))
-            drives = _steer_drives(clone, steer, "steer", base)
-            for dr in drives:
-                dr["axle"] = "front"
-            if rear_steer is not None:
-                rear = _steer_drives(clone, rear_steer, "rear_steer", base)
-                for dr in rear:
-                    dr["axle"] = "rear"
-                drives += rear
-            seen: set = set()
-            for d in drives:
-                if d["component"] in seen:
-                    raise ValueError(
-                        f"component '{d['name']}' is driven twice (steer and rear_steer "
-                        "cannot both own the same component's pose).")
-                seen.add(d["component"])
-            missing = [d["name"] for d in drives if d["component"] not in base]
-            if missing:
-                raise ValueError(f"steered component(s) {missing} are not placed in this "
-                                 "assembly.")
-
-            primary = max(drives, key=lambda d: abs(d["angle_deg"]))["angle_deg"]
-            trajectory = []
-            first_hit = None
-            interferences = []
-            for i in range(steps):
-                scale = i / (steps - 1) if steps > 1 else 1.0
-                ops = []
-                for d in drives:
-                    r = _axis_rotation16(d["axis"]["point"], d["axis"]["dir"],
-                                         scale * d["angle_deg"])
-                    ops.append({"op": "asm_edit_component", "id": d["component"],
-                                "transform": _mat_mul16(r, base[d["component"]]),
-                                "fixed": True})
-                cb.call("doc_apply_ops", {"doc_id": clone, "with_tess": False, "ops": ops})
-                sr = cb.call("doc_solve_mates", {"doc_id": clone}) or {}
-                rb = sr.get("rebuild") or {}
-                rep = _solve_report(rb)
-                xf = _comp_transforms(clone)
-                frame = {"i": i, "value": scale * primary, "scale": scale,
-                         "dof": rb.get("dof"), "converged": rep["converged"],
-                         "max_residual": rep["worst_residual"],
-                         "bodies": [{"component": cid, "name": names.get(cid, cid),
-                                     "transform": m} for cid, m in xf.items()]}
-                if not rep["converged"]:
-                    frame["solve_error"] = rep["message"]
-                if check_interference:
-                    ir = cb.call("eval_interference",
-                                 {"doc_id": clone, "include_coincident": False,
-                                  "min_clearance_mm": 0.0}) or {}
-                    hits = [_clash_row(h) for h in (ir.get("interferences") or [])
-                            if isinstance(h, dict)]
-                    frame["collisions"] = hits
-                    if hits and first_hit is None:
-                        first_hit = {"step": i, "value": frame["value"],
-                                     "detail": hits[:8]}
-                        interferences = hits[:8]
-                trajectory.append(frame)
-
-            bad = [f["i"] for f in trajectory if not f["converged"]]
-            out = {
-                "ok": not bad,
-                "doc_id": doc_id,
-                "mate_id": None,
-                "driver": {"type": "steer", "unit": "deg", "start": 0.0, "stop": primary,
-                           "steps": steps, "samples": len(trajectory),
-                           "components": [d["name"] for d in drives],
-                           "angles_deg": [d["angle_deg"] for d in drives],
-                           "axes": [{"point": d["axis"]["point"], "dir": d["axis"]["dir"],
-                                     "source": d["axis"]["source"]} for d in drives]},
-                "trajectory": trajectory,
-                "steer_drives": drives,
-                "interference": {"checked": bool(check_interference),
-                                 "first_collision_step":
-                                     first_hit["step"] if first_hit else None,
-                                 "first_collision_value":
-                                     first_hit["value"] if first_hit else None,
-                                 "detail": interferences},
-            }
-            if bad:
-                out["error"] = (
-                    "the mate network did not converge around the steered pose at step(s) "
-                    f"{bad}: " + str(next(f.get("solve_error") for f in trajectory
-                                          if not f["converged"])))
-            return out
-        finally:
-            try:
-                cb.call("doc_close", {"doc_id": clone})
-            except Exception:  # noqa: BLE001 — a clone we cannot close is not a result
-                pass
 
     # ------------------------------------------------------------------ swept solid
 
@@ -815,7 +833,7 @@ def register_cad_motion_tools(mcp: FastMCP) -> None:
                     raise ValueError(
                         "sweep_envelope: `steer` and the mate sweep (mate_id/start/stop) "
                         "are two different drives — pass one or the other.")
-                out = _steer_sweep(d, steer, rear_steer, steps, False, "sweep_envelope")
+                out = steer_pose_sweep(d, steer, rear_steer, steps, False, "sweep_envelope")
                 if not out.get("ok"):
                     raise ValueError("steer sweep did not converge: " +
                                      str(out.get("error") or "unknown"))
@@ -1019,7 +1037,7 @@ def register_cad_motion_tools(mcp: FastMCP) -> None:
                         "steering_turning_radius: `steer` drives the uprights directly and "
                         "`steer_mate_id`/start/stop sweeps a dimensional mate — pass one "
                         "or the other, not both.")
-                out = _steer_sweep(d, steer, rear_steer, steps, check_interference,
+                out = steer_pose_sweep(d, steer, rear_steer, steps, check_interference,
                                    "steering_turning_radius")
                 if not out.get("ok"):
                     raise ValueError("steer sweep did not converge: " +

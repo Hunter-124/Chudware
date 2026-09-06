@@ -199,7 +199,11 @@ ENTRIES: dict[str, dict[str, Any]] = {
         "prompt_note": (
             "Same static study at 2+ explicit mesh sizes (sizes_mm or "
             "fineness ladder); the table with delta_pct_vs_prev is the "
-            "convergence evidence a release needs. Never cite one mesh."
+            "convergence evidence a release needs. Never cite one mesh. "
+            "Pass vtu_dir=/abs/dir to get one .vtu per leg: the reply's "
+            "released_leg then names the finest solved leg's field, which "
+            "sim_evidence_packet hashes — without it the ladder has no "
+            "field and needs a fourth solve."
         ),
         "timeout_s": fea_timeout_s(FEA_SOLVER_LEGS["run_fea_convergence"]),
     },
@@ -364,7 +368,9 @@ ENTRIES: dict[str, dict[str, Any]] = {
             "refused and there is no gravity/self-weight term. An explicit material dict needs "
             "E_mpa, nu, and yield_mpa; named registry materials resolve them. set_material is "
             "appearance only. Repeat at a finer mesh and compare governing stress/deflection "
-            "(<10% change) before PASS."
+            "(<10% change) before PASS. mesh_size_mm=<mm> is the exact element size "
+            "(mutually exclusive with mesh_fineness) — use it with vtu_path to re-solve "
+            "one run_fea_convergence leg on its own mesh."
         ),
         "timeout_s": _FEA_TIMEOUT_S,
     },

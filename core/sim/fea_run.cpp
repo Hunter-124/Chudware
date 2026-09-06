@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cctype>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -27,8 +28,36 @@
 #include <unordered_set>
 #include <vector>
 
+// ── OCCT, for the analytic contact-gap measurement only ───────────────────────
+// detail::make_cad_gap_probe re-reads the study's own STEP/BREP so a candidate
+// pair's clearance can be measured against the CAD faces instead of the mesh
+// facets. Nothing else in this TU touches OCCT; the mesher owns the geometry
+// pipeline. NOMINMAX is set project-wide (core/CMakeLists.txt) so the OCCT ->
+// windows.h transitive include cannot clobber std::min/std::max below.
+#include <BRepBndLib.hxx>
+#include <BRepBuilderAPI_MakeVertex.hxx>
+#include <BRepClass3d_SolidClassifier.hxx>
+#include <BRepExtrema_DistShapeShape.hxx>
+#include <BRepTools.hxx>
+#include <BRep_Builder.hxx>
+#include <Bnd_Box.hxx>
+#include <Extrema_ExtFlag.hxx>
+#include <IFSelect_ReturnStatus.hxx>
+#include <Precision.hxx>
+#include <STEPControl_Reader.hxx>
+#include <Standard_Failure.hxx>
+#include <TopAbs_State.hxx>
+#include <TopExp_Explorer.hxx>
+#include <TopoDS.hxx>
+#include <TopoDS_Face.hxx>
+#include <TopoDS_Shape.hxx>
+#include <TopoDS_Solid.hxx>
+#include <TopoDS_Vertex.hxx>
+#include <gp_Pnt.hxx>
+
 #include "sim/fea_contact.h"
 #include "sim/fea_modal.h"
+#include "sim/fea_selection.h"
 #include "sim/fea_static.h"
 #include "sim/fea_thermal.h"
 #include "sim/mesher.h"
@@ -546,9 +575,29 @@ json contact_resolution_json(const ContactResolution& r) {
              {"criterion", r.criterion ? r.criterion : kCriterionClearance},
              {"candidate_pairs", r.candidate_pairs},
              {"seatable_pairs", r.seatable_pairs},
+             // The LENGTH that decided seatable_pairs: a candidate at or below it is
+             // a gap this mesh cannot tell from touching, so it starts the solve
+             // seated (fea_contact.h kSeatFractionH). initial_penetration_max_mm is
+             // how deep the placement/facet error pushed a node through the partner
+             // face; it was clamped to a touching gap rather than turned into force.
+             {"seat_limit_mm", round_nd(r.seat_limit_mm, 6)},
+             {"initial_penetration_max_mm", round_nd(r.initial_penetration_max_mm, 6)},
              {"min_active_pairs", r.min_active_pairs},
              {"candidate_area_mm2", round_nd(r.candidate_area_mm2, 6)},
              {"required_interface_size_mm", round_nd(r.required_interface_size_mm, 4)},
+             // Where gap_mm came from, and what the mesh alone would have said.
+             // On a curved fit those are different numbers and the difference is
+             // the whole reason the guard used to be unsatisfiable: the ME 490
+             // hinge's 0.300 mm saddle clearance read 0.03665 mm on the facets
+             // and demanded an interface size no mesher could deliver
+             // (fea_contact.h ContactGapProbe). `gap_source` is "cad_faces" when
+             // the analytic surfaces answered, "mesh_facets" when there was
+             // nothing to project onto; `gap_fallback_nodes` counts the nodes in
+             // repaired/dissolved regions that kept the facet value anyway.
+             {"gap_source", r.gap_analytic ? "cad_faces" : "mesh_facets"},
+             {"gap_facet_mm", round_nd(r.gap_facet_mm, 6)},
+             {"facet_error_mm", round_nd(r.facet_error_mm, 6)},
+             {"gap_fallback_nodes", r.gap_fallback_nodes},
              {"resolved", r.resolved}};
     if (r.criterion == kCriterionPatchArea) {
         out["max_h_interface_mm"] = round_nd(r.max_h_interface_mm, 4);
@@ -671,6 +720,12 @@ bool resolve_mesh(const json &study, std::vector<double> &points,
     // costs a million elements.
     if (const double interface_size = contact_interface_size_mm(study);
         interface_size > 0.0) {
+      // No gap probe here, deliberately: this pass wants SEED LOCATIONS, and the
+      // facet gap only ever understates a curved clearance, so a facet-measured
+      // set is a superset of the analytic one — every face the study will later
+      // judge is refined, plus a few that turn out to be further apart than
+      // max_gap_mm. Paying for a second CAD read to refine slightly fewer faces
+      // would be the wrong trade.
       const ContactCandidateSet probe = fea_contact_candidates(
           mesh->points, mesh->tets, mesh->nodes_per_elem, /*E_mpa=*/1.0,
           ContactCandidateOptions{contact_max_gap_mm(study), 1.0, 0.35});
@@ -738,18 +793,56 @@ bool resolve_mesh(const json &study, std::vector<double> &points,
                     refined_mesh->local_refine_element_ceiling),
                 refined_mesh->local_refine_elems_added,
                 refined_mesh->local_refine_waves, achieved, achieved);
-          else
-            std::snprintf(
-                text, sizeof(text),
-                "contact.interface_size_mm = %.4g mm was not delivered: after %d "
-                "bisection wave(s) the element size AT the interface is %.4g mm "
-                "(background %.4g mm, the fill's own graded floor %.4g mm). The "
-                "study is refused rather than solved on an interface coarser than "
-                "it asked for — pass %.4g mm or coarser, or re-isolate the bodies "
-                "so the interface carries fewer candidate faces",
-                interface_size, refined_mesh->local_refine_waves, achieved,
-                refined_mesh->char_len_mm, refined_mesh->char_len_mm * 0.25,
-                achieved);
+          else {
+            // ── The remedy has to be a LEGAL value, and it was not ───────────
+            // `interface_size_mm` becomes the h_min of the mesher's own graded
+            // size field, whose h_max is the background, so a request ABOVE the
+            // background is not a coarser request — it is an illegal one
+            // (`GradedSizing: need 0 < h_min <= h_max`, reproduced on the O-22
+            // hinge saddle at a 1.2 mm background). Advising "pass `achieved` or
+            // coarser" when `achieved` exceeded the background therefore closed
+            // the box: every request at or below the background was refused as
+            // undeliverable and every request above it mesh-FAILED, which is the
+            // "no legal value exists" that stopped CONTACT_BLOCKED_2026-09-06b.
+            // The field now clamps h_min to the background (mesher.cpp
+            // local_size_field), so a coarse request is legal and trivially met;
+            // this text must still only ever name a value inside (0, background].
+            const double background = refined_mesh->char_len_mm;
+            const double legal = std::min(achieved, background);
+            if (achieved <= background)
+              std::snprintf(
+                  text, sizeof(text),
+                  "contact.interface_size_mm = %.4g mm was not delivered: after "
+                  "%d bisection wave(s) the element size AT the interface is "
+                  "%.4g mm (background %.4g mm, the fill's own graded floor "
+                  "%.4g mm — bisection is what goes below that). The study is "
+                  "refused rather than solved on an interface coarser than it "
+                  "asked for. Legal remedies: pass interface_size_mm between "
+                  "%.4g mm and the %.4g mm background (it is the size field's "
+                  "h_min and must satisfy 0 < interface_size_mm <= "
+                  "mesh_size_mm), lower mesh_size_mm to about %.4g mm so the "
+                  "fill itself places the request, or re-isolate the bodies so "
+                  "the interface carries fewer candidate faces",
+                  interface_size, refined_mesh->local_refine_waves, achieved,
+                  background, background * 0.25, legal, background,
+                  4.0 * interface_size);
+            else
+              std::snprintf(
+                  text, sizeof(text),
+                  "contact.interface_size_mm = %.4g mm was not delivered: after "
+                  "%d bisection wave(s) the element size AT the interface is "
+                  "%.4g mm, which is COARSER than the %.4g mm background itself "
+                  "— the faces carrying this interface are stretched, not merely "
+                  "unrefined, so no interface_size_mm is deliverable here "
+                  "(the request is the size field's h_min and must satisfy "
+                  "0 < interface_size_mm <= mesh_size_mm, so nothing above the "
+                  "background is legal either). Legal remedies: lower "
+                  "mesh_size_mm to about %.4g mm so the fill places the request "
+                  "on its own lattice, or re-isolate the bodies so the interface "
+                  "carries fewer candidate faces",
+                  interface_size, refined_mesh->local_refine_waves, achieved,
+                  background, 4.0 * interface_size);
+          }
           err = text;
           // What the mesher itself hit, when it hit something nameable (a
           // bisection closure that could not conform, a wave that grew nothing):
@@ -1107,6 +1200,193 @@ void add_midside_face_nodes(const std::vector<int>& tets, int nodes_per_elem,
 
 }  // namespace
 
+namespace detail {
+
+namespace {
+
+// ── The CAD-face gap oracle (fea_run.h make_cad_gap_probe) ────────────────────
+// One solid per body, each with its faces and their bounding boxes. A query is
+//   1. which solid does this node belong to?  -> the one whose boundary is
+//      nearest it (a boundary node lies ON its own body's surface to within the
+//      mesher's snap residual, and a clearance fit puts the other body a whole
+//      clearance away, so the argmin is not close),
+//   2. how far is the node from the OTHER solid's boundary, signed?
+// Both are the same primitive, so one memo table serves both: a node takes part
+// in one or two pairs and each pair asks about two solids.
+class CadGapProbe final : public ContactGapProbe {
+public:
+    CadGapProbe(std::vector<TopoDS_Solid> solids, double reach_mm)
+        : reach_(reach_mm) {
+        bodies_.reserve(solids.size());
+        for (TopoDS_Solid& solid : solids) {
+            Body body;
+            for (TopExp_Explorer ex(solid, TopAbs_FACE); ex.More(); ex.Next()) {
+                Facet facet;
+                facet.face = TopoDS::Face(ex.Current());
+                BRepBndLib::Add(facet.face, facet.box);
+                facet.box.SetGap(facet.box.GetGap() + reach_);
+                body.faces.push_back(std::move(facet));
+            }
+            if (body.faces.empty()) continue;
+            // BRepClass3d_SolidClassifier is neither copyable nor movable (its
+            // solid explorer's copy ctor is private), so the body owns one.
+            body.classifier =
+                std::make_unique<BRepClass3d_SolidClassifier>(solid);
+            bodies_.push_back(std::move(body));
+        }
+    }
+
+    std::size_t bodies() const { return bodies_.size(); }
+
+    bool pair_gap_mm(int node_a, const double* pa, int node_b, const double* pb,
+                     double& gap_mm) const override {
+        const int own_a = owner(node_a, pa);
+        const int own_b = owner(node_b, pb);
+        if (own_a < 0 || own_b < 0 || own_a == own_b) return false;
+        double ga = 0.0, gb = 0.0;
+        const bool ok_a = signed_gap(node_a, pa, own_b, ga);
+        const bool ok_b = signed_gap(node_b, pb, own_a, gb);
+        if (ok_a && ok_b) {
+            // The CLOSEST of the two perpendicular measurements. Each is exact for
+            // a concentric fit; where the clearance varies along the interface the
+            // smaller one is the approach the contact will close first, which is
+            // the number the guard and the seat limit are about.
+            gap_mm = std::min(ga, gb);
+            return true;
+        }
+        if (ok_a) { gap_mm = ga; return true; }
+        if (ok_b) { gap_mm = gb; return true; }
+        return false;
+    }
+
+private:
+    struct Facet {
+        TopoDS_Face face;
+        Bnd_Box box;  // grown by reach_, so a hit means "worth measuring"
+    };
+    struct Body {
+        std::vector<Facet> faces;
+        // BRepClass3d_SolidClassifier gives the SIGN without needing a surface
+        // normal at the projection (which is undefined when the closest point
+        // lands on a seam edge or a vertex): inside the material is negative.
+        std::unique_ptr<BRepClass3d_SolidClassifier> classifier;
+    };
+
+    // Signed distance from `p` to body `b`, memoized per (node, body). false when
+    // no face of that body lies within reach_ of the point.
+    bool signed_gap(int node, const double* p, int b, double& out) const {
+        const long long key = static_cast<long long>(node) * 64LL + b;
+        std::lock_guard<std::mutex> lock(mu_);
+        auto it = memo_.find(key);
+        if (it == memo_.end()) it = memo_.emplace(key, measure(p, b)).first;
+        if (!std::isfinite(it->second)) return false;
+        out = it->second;
+        return true;
+    }
+
+    // Called under mu_.
+    double measure(const double* p, int b) const {
+        const gp_Pnt pnt(p[0], p[1], p[2]);
+        const Body& body = bodies_[static_cast<std::size_t>(b)];
+        const TopoDS_Vertex vertex = BRepBuilderAPI_MakeVertex(pnt);
+        double best = std::numeric_limits<double>::quiet_NaN();
+        for (const Facet& facet : body.faces) {
+            if (facet.box.IsOut(pnt)) continue;
+            BRepExtrema_DistShapeShape dss(vertex, facet.face,
+                                           Extrema_ExtFlag_MIN);
+            if (!dss.IsDone() || dss.NbSolution() < 1) continue;
+            const double d = dss.Value();
+            if (!std::isfinite(d) || d > reach_) continue;
+            if (!std::isfinite(best) || d < best) best = d;
+        }
+        if (!std::isfinite(best)) return best;
+        body.classifier->Perform(pnt, Precision::Confusion());
+        return body.classifier->State() == TopAbs_IN ? -best : best;
+    }
+
+    int owner(int node, const double* p) const {
+        int best = -1;
+        double best_d = std::numeric_limits<double>::infinity();
+        for (std::size_t b = 0; b < bodies_.size(); ++b) {
+            double d = 0.0;
+            if (!signed_gap(node, p, static_cast<int>(b), d)) continue;
+            if (std::abs(d) < best_d) {
+                best_d = std::abs(d);
+                best = static_cast<int>(b);
+            }
+        }
+        return best;
+    }
+
+    std::vector<Body> bodies_;
+    double reach_ = 0.0;
+    mutable std::mutex mu_;
+    mutable std::unordered_map<long long, double> memo_;
+};
+
+}  // namespace
+
+std::unique_ptr<ContactGapProbe> make_cad_gap_probe(const std::string& geometry_path,
+                                                    double reach_mm, std::string& note) {
+    note.clear();
+    if (geometry_path.empty() || !(reach_mm > 0.0)) {
+        note = "no geometry file to measure contact gaps against";
+        return nullptr;
+    }
+    TopoDS_Shape shape;
+    try {
+        const std::string lower = [&] {
+            std::string s = geometry_path;
+            for (char& c : s) c = static_cast<char>(std::tolower(c));
+            return s;
+        }();
+        const bool brep = lower.size() > 5 &&
+                          lower.compare(lower.size() - 5, 5, ".brep") == 0;
+        if (brep) {
+            BRep_Builder builder;
+            if (!BRepTools::Read(shape, geometry_path.c_str(), builder))
+                shape = TopoDS_Shape();
+        } else {
+            STEPControl_Reader reader;
+            if (reader.ReadFile(geometry_path.c_str()) == IFSelect_RetDone) {
+                reader.TransferRoots();
+                shape = reader.OneShape();
+            }
+        }
+    } catch (const Standard_Failure&) {
+        shape = TopoDS_Shape();
+    } catch (const std::exception&) {
+        shape = TopoDS_Shape();
+    }
+    if (shape.IsNull()) {
+        note = "contact gaps stayed on the mesh facets: the study geometry could not "
+               "be re-read for an analytic measurement";
+        return nullptr;
+    }
+    std::vector<TopoDS_Solid> solids;
+    for (TopExp_Explorer ex(shape, TopAbs_SOLID); ex.More(); ex.Next())
+        solids.push_back(TopoDS::Solid(ex.Current()));
+    if (solids.size() < 2) {
+        note = "contact gaps stayed on the mesh facets: the study geometry carries " +
+               std::to_string(solids.size()) +
+               " solid(s), so there is no second body's face to measure against";
+        return nullptr;
+    }
+    auto probe = std::make_unique<CadGapProbe>(std::move(solids), reach_mm);
+    if (probe->bodies() < 2) {
+        note = "contact gaps stayed on the mesh facets: fewer than two of the study "
+               "geometry's solids carry faces";
+        return nullptr;
+    }
+    note = "contact clearances measured on the CAD faces of " +
+           std::to_string(probe->bodies()) +
+           " solid(s), not on the mesh facets (a linear facet of a curved fit "
+           "understates the clearance by up to the whole of it)";
+    return probe;
+}
+
+}  // namespace detail
+
 std::vector<int> nodes_in_faceset(const std::vector<double>& points,
                                   const std::vector<double>& sample, double tol_mm,
                                   const double* face_normal, double perp_tol_mm) {
@@ -1414,6 +1694,24 @@ bool faceset_normal_local(const nlohmann::json& fs, std::array<double, 3>& face_
         return false;
     for (double& x : face_normal) x /= norm;
     return true;
+}
+
+// The label a refusal can hand back to the caller. A mesh ordinal is useless to
+// act on and, worse, MISLEADING: the MCP layer expands one face query into as
+// many facesets as it matched, so `fixtures[3]` in the study is not fixtures[3]
+// in the request. `selector` is the original query text stamped on the faceset by
+// cad_sim_tools, `sid` the face id; the positional form is the last resort for a
+// hand-written study.
+std::string selector_label(const nlohmann::json& fs, const char* arg,
+                           std::size_t ordinal) {
+    const std::string positional =
+        std::string(arg) + "[" + std::to_string(ordinal) + "]";
+    if (!fs.is_object()) return positional;
+    for (const char* key : {"selector", "sid"})
+        if (fs.contains(key) && fs[key].is_string() &&
+            !fs[key].get<std::string>().empty())
+            return fs[key].get<std::string>() + " (" + positional + ")";
+    return positional;
 }
 }  // namespace
 
@@ -1754,10 +2052,24 @@ static nlohmann::json fea_run_static_impl(
     if (!mesh_note.empty()) notes.push_back("mesh: " + mesh_note);
 
     const auto t_setup0 = std::chrono::steady_clock::now();  // BC/load resolution phase
+    // ── A selection that spans the contact interface (sim/fea_selection.h) ────
+    // The check needs each selector's OWN node set, which the union in
+    // `fixed_nodes` and the in-place force deposition below both destroy. Keeping
+    // them is only worth it when the study DECLARED contact: an oracle-style study
+    // carries hundreds of single-node loads, and none of them can span an
+    // interface that was never declared.
+    const bool contact_declared = study.contains("contact") &&
+                                  study["contact"].is_object() &&
+                                  study["contact"].value("enabled", true);
+    // Label + resolved nodes per load selector, in study order. Only populated
+    // while `contact_declared`.
+    std::vector<std::pair<std::string, std::vector<int>>> load_selections;
     // ── Force vector (replicate run_static's load loop EXACTLY) ──────────────
     std::vector<double> nodal_forces(static_cast<size_t>(n_dof), 0.0);
+    std::size_t loads_seen = 0;
     if (study.contains("loads") && study["loads"].is_array()) {
         for (const auto& load : study["loads"]) {
+            const std::size_t load_ordinal = loads_seen++;
             const json faces = load.contains("faces") ? load["faces"] : json::object();
             const double tol = faces.value("tol_mm", 1.0);
             const std::string type = load.value("type", std::string());
@@ -1797,6 +2109,9 @@ static nlohmann::json fea_run_static_impl(
             // pressure deposition loops below land on the SAME nodes the weights were put on.
             node_ids.assign(node_set.begin(), node_set.end());
             std::sort(node_ids.begin(), node_ids.end());
+            if (contact_declared)
+                load_selections.emplace_back(
+                    selector_label(faces, "loads", load_ordinal), node_ids);
             // P5: the consistent-weight arrays are only meaningful when the set can hold a
             // complete boundary face (>= 3 nodes) — oracle-style studies carry hundreds of
             // single-node loads, and zero-filling 4*n_nodes doubles per load was real time.
@@ -1889,17 +2204,20 @@ static nlohmann::json fea_run_static_impl(
     // fixture nearest an excluded stress peak (one entry per fixed node).
     std::unordered_map<int, std::size_t> fixture_of_node;
     std::vector<std::string> fixture_labels;
+    // Each fixture's OWN resolved nodes, in study order — the union above cannot
+    // answer "did THIS selector span the interface" (first fixture wins a shared
+    // node). Only populated while `contact_declared`.
+    std::vector<std::vector<int>> fixture_selections;
     if (study.contains("fixtures") && study["fixtures"].is_array()) {
         std::unordered_set<int> seen;
         for (const auto& fx : study["fixtures"]) {
             const double tol = fx.value("tol_mm", 1.0);
             const std::size_t ordinal = fixture_labels.size();
-            std::string label = "fixtures[" + std::to_string(ordinal) + "]";
-            if (fx.is_object() && fx.contains("sid") && fx["sid"].is_string())
-                label = fx["sid"].get<std::string>() + " (" + label + ")";
+            const std::string label = selector_label(fx, "fixtures", ordinal);
             fixture_labels.push_back(label);
             std::vector<int> node_ids =
                 boundary_faceset_membership(fx, points, tets, nodes_per_elem);
+            if (contact_declared) fixture_selections.push_back(node_ids);
             if (node_ids.empty())
                 return json{{"ok", false},
                             {"error", "fea_static: fixture faces resolved to 0 mesh nodes "
@@ -2070,8 +2388,56 @@ static nlohmann::json fea_run_static_impl(
                               "solid, so there is no interface to open or close — run the "
                               "ordinary static study."},
                     {"notes", notes}};
+            // ── The clearance a fit has is a CAD fact, so measure it on the CAD ──
+            // The pairing stays a mesh question; the GAP does not. A candidate is
+            // two boundary nodes, so its facet gap is r_bore*cos(dtheta) - r_pin
+            // for whatever dtheta the two meshes sampled — on the ME 490 hinge
+            // saddle that read 0.03665 mm of a real 0.300 mm clearance and made
+            // the resolution guard unsatisfiable at every mesh size
+            // (fea_contact.h ContactGapProbe). The probe outlives the candidate
+            // build below and nothing else reads it.
+            std::unique_ptr<ContactGapProbe> gap_probe;
+            if (const std::string geometry = study.value("step_path", std::string());
+                !geometry.empty()) {
+                // Search reach: the declared clearance twice over, plus one mesh
+                // cell, so a boundary node left off its own true surface by the
+                // fill's snap residual still finds the faces it sits between.
+                double h_sum = 0.0;
+                int h_n = 0;
+                const int n_elems = static_cast<int>(tets.size()) / nodes_per_elem;
+                const int h_step = std::max(1, n_elems / 1000);
+                for (int e = 0; e < n_elems; e += h_step) {
+                    const int a = tets[static_cast<size_t>(e) * nodes_per_elem];
+                    const int b = tets[static_cast<size_t>(e) * nodes_per_elem + 1];
+                    const double dx = points[static_cast<size_t>(a) * 3] -
+                                      points[static_cast<size_t>(b) * 3];
+                    const double dy = points[static_cast<size_t>(a) * 3 + 1] -
+                                      points[static_cast<size_t>(b) * 3 + 1];
+                    const double dz = points[static_cast<size_t>(a) * 3 + 2] -
+                                      points[static_cast<size_t>(b) * 3 + 2];
+                    h_sum += std::sqrt(dx * dx + dy * dy + dz * dz);
+                    ++h_n;
+                }
+                const double h_mesh = (h_n > 0 && h_sum > 0.0) ? h_sum / h_n : 1.0;
+                std::string probe_note;
+                gap_probe = detail::make_cad_gap_probe(
+                    geometry, 2.0 * contact_opts.max_gap_mm + h_mesh, probe_note);
+                if (!probe_note.empty()) notes.push_back("contact: " + probe_note);
+                contact_opts.gap_probe = gap_probe.get();
+            }
             contact_set = fea_contact_candidates(points, tets, nodes_per_elem, E_mpa,
                                                  contact_opts);
+            contact_opts.gap_probe = nullptr;  // consumed; nothing below reads it
+            if (contact_set.gap_beyond_max_pairs > 0)
+                notes.push_back(
+                    std::to_string(contact_set.gap_beyond_max_pairs) +
+                    " candidate pair(s) the mesh facets placed within max_gap_mm are "
+                    "further apart than that on the CAD faces and were dropped");
+            if (contact_set.gap_fallback_nodes > 0)
+                notes.push_back(
+                    std::to_string(contact_set.gap_fallback_nodes) +
+                    " interface node(s) had no CAD face to measure against (repaired "
+                    "or dissolved mesh region); their pairs kept the facet gap");
             if (!contact_set.error.empty())
                 return json{{"ok", false},
                             {"error", "fea_static: " + contact_set.error},
@@ -2086,6 +2452,58 @@ static nlohmann::json fea_run_static_impl(
                                   "facing surfaces are not opposed. Measure the real "
                                   "clearance and raise max_gap_mm to just above it."},
                     {"notes", notes}};
+            // ── A selection must not SPAN the interface (sim/fea_selection.h) ──
+            // Decided the moment both halves are known — the resolved BC nodes and
+            // the candidate set that says which bodies are in contact — and BEFORE
+            // the resolution guard, because this is an ill-posed STUDY and not an
+            // under-resolved mesh: refining the interface of a study whose fixture
+            // holds both sides of it just buys a finer non-answer.
+            for (std::size_t i = 0; i < fixture_selections.size(); ++i) {
+                // fixture_labels is pushed before fixture_selections in the same
+                // iteration, so the two are 1:1 — read once and use one value.
+                const std::string& label = fixture_labels[i];
+                const SelectionSpan span = selection_spans_contact(
+                    "fixture", label, fixture_selections[i], contact_set);
+                if (!span.spans) continue;
+                return json{
+                    {"ok", false},
+                    {"error", "fea_static: " + span.message},
+                    {"selection_spans_contact",
+                     json{{"kind", "fixture"},
+                          {"selector", label},
+                          {"bodies", json::array({span.body_a, span.body_b})},
+                          {"nodes_captured",
+                           json::array({span.captured_a, span.captured_b})},
+                          {"body_nodes",
+                           json::array({span.body_a_nodes, span.body_b_nodes})},
+                          {"median_gap_mm", round_nd(contact_set.median_gap0_mm, 6)},
+                          {"min_gap_mm", round_nd(contact_set.min_gap0_mm, 6)}}},
+                    {"notes", notes}};
+            }
+            for (const auto& sel : load_selections) {
+                const SelectionSpan span = selection_spans_contact(
+                    "load", sel.first, sel.second, contact_set);
+                if (!span.spans) continue;
+                return json{
+                    {"ok", false},
+                    {"error", "fea_static: " + span.message},
+                    {"selection_spans_contact",
+                     json{{"kind", "load"},
+                          {"selector", sel.first},
+                          {"bodies", json::array({span.body_a, span.body_b})},
+                          {"nodes_captured",
+                           json::array({span.captured_a, span.captured_b})},
+                          {"body_nodes",
+                           json::array({span.body_a_nodes, span.body_b_nodes})},
+                          {"median_gap_mm", round_nd(contact_set.median_gap0_mm, 6)},
+                          {"min_gap_mm", round_nd(contact_set.min_gap0_mm, 6)}}},
+                    {"notes", notes}};
+            }
+            // The active set STARTS at the pairs this mesh cannot tell from touching
+            // (fea_contact.h kSeatFractionH); the loop seats the rest as the bodies
+            // deform. Handing the solver every candidate instead made the seated
+            // population run-to-run mesh luck on a nominally-touching fit.
+            contact_solver_opts.seat_tolerance_mm = contact_set.seat_limit_mm;
             // Is this mesh even capable of describing the interface? The a-priori
             // clause (fea_contact.h ContactResolution) is decided here, BEFORE the
             // active-set solve: a solve cannot rescue an interface the mesh cannot
@@ -2094,30 +2512,53 @@ static nlohmann::json fea_run_static_impl(
             // discretization facts, which are the whole evidence for it.
             contact_resolution = fea_contact_resolution(contact_set);
             {
-                char text[352];
+                char text[448];
                 if (contact_resolution.criterion == kCriterionPatchArea)
                     std::snprintf(
                         text, sizeof(text),
                         "contact interface element size %.4g mm on a %.4g mm^2 "
                         "candidate patch (the faces TOUCH — no clearance to resolve, "
                         "so resolution is judged as %.0f elements across the patch, "
-                        "i.e. %.4g mm or finer); %d of %d candidate pair(s) are in "
-                        "contact",
+                        "i.e. %.4g mm or finer); %d of %d candidate pair(s) seat "
+                        "within the %.4g mm seat limit",
                         contact_resolution.h_interface_mm,
                         contact_resolution.candidate_area_mm2, kContactMinPatchElems,
                         contact_resolution.max_h_interface_mm,
                         contact_resolution.seatable_pairs,
-                        contact_resolution.candidate_pairs);
+                        contact_resolution.candidate_pairs,
+                        contact_resolution.seat_limit_mm);
                 else
                     std::snprintf(
                         text, sizeof(text),
                         "contact interface element size %.4g mm against a %.4g mm "
-                        "closest approach (ratio %.1f); %d of %d candidate pair(s) "
-                        "sit within twice that clearance",
+                        "closest approach on the %s (ratio %.1f; the mesh facets read "
+                        "%.4g mm); %d of %d candidate pair(s) seat within the %.4g mm "
+                        "seat limit",
                         contact_resolution.h_interface_mm, contact_resolution.gap_mm,
-                        contact_resolution.ratio, contact_resolution.seatable_pairs,
-                        contact_resolution.candidate_pairs);
+                        contact_resolution.gap_analytic ? "CAD faces" : "mesh facets",
+                        contact_resolution.ratio, contact_resolution.gap_facet_mm,
+                        contact_resolution.seatable_pairs,
+                        contact_resolution.candidate_pairs,
+                        contact_resolution.seat_limit_mm);
                 notes.push_back(text);
+            }
+            if (contact_set.initial_penetration_max_mm > 0.0) {
+                char pen[608];
+                std::snprintf(
+                    pen, sizeof(pen),
+                    "contact: candidate pairs sit up to %.4g mm INSIDE each other, "
+                    "measured on the %s — %s. It is CLAMPED to a touching gap, so no "
+                    "k*penetration preload enters the solve (unclamped it was 56 kN "
+                    "through 11 pairs on the case that found this, reported as "
+                    "3.0e6 MPa of contact pressure for a 1500 N load)",
+                    contact_set.initial_penetration_max_mm,
+                    contact_resolution.gap_analytic ? "CAD faces" : "mesh facets",
+                    contact_resolution.gap_analytic
+                        ? "so the two solids really do interfere, which is a "
+                          "modelling defect no contact idealization can absorb"
+                        : "which on a curved or nominally-touching fit is the "
+                          "discretization's own surface error, not a press fit");
+                notes.push_back(pen);
             }
             if (!contact_resolution.resolved)
                 return json{
@@ -2507,6 +2948,16 @@ static nlohmann::json fea_run_static_impl(
                      {"contact_pressure_reliable", contact_resolution.pressure_reliable},
                      {"resolution", contact_resolution_json(contact_resolution)},
                      {"held_by_contact_only", held_by_contact_only},
+                     {"contact_carries_load", contact_resolution.contact_carries_load},
+                     // The load path, as three numbers a reader can check: what was
+                     // applied to the bodies this interface is the only support for,
+                     // what crossed it, and their quotient. `note` is empty exactly
+                     // when the interface IS the load path.
+                     {"load_path",
+                      json{{"applied_n", round_nd(contact_resolution.applied_load_n, 4)},
+                           {"carried_n", round_nd(contact_resolution.carried_load_n, 4)},
+                           {"fraction", round_nd(contact_resolution.load_fraction, 6)},
+                           {"note", contact_resolution.load_path_note}}},
                      {"pairs", json::array()}};
         for (const FeaContactGroup& g : contact_report.groups) {
             const std::array<int, 2> comps =
@@ -2542,6 +2993,30 @@ static nlohmann::json fea_run_static_impl(
         fea_contact_resolution_after_solve(contact_resolution,
                                            contact_report.active_pairs, total_force,
                                            total_area);
+        // ── Is this contact the LOAD PATH, or just a parallel spring? ──────────
+        // A resolved, well-seated patch can still answer nothing. The live keyway
+        // isolate fixtured BOTH sides of a 0.35 mm radial clearance (one face set
+        // with a cylinder filter reached across it onto the mating bore), so six
+        // active pairs carried 9.9 N of a 1500 N applied load and the packet
+        // called that a contact pressure. The resultant to compare against is the
+        // one applied to the components held ONLY by contact — the bodies whose
+        // entire stiffness path to a fixture is this interface.
+        const std::unordered_set<int> held(held_by_contact_only.begin(),
+                                           held_by_contact_only.end());
+        std::array<double, 3> applied{0.0, 0.0, 0.0};
+        const size_t n_comp = contact_set.component.size();
+        for (size_t i = 0; i * 3 + 2 < nodal_forces.size(); ++i) {
+            const int comp_id = i < n_comp ? contact_set.component[i] : -1;
+            if (comp_id < 0 || held.find(comp_id) == held.end()) continue;
+            for (size_t d = 0; d < 3; ++d) applied[d] += nodal_forces[i * 3 + d];
+        }
+        const double applied_n = std::sqrt(applied[0] * applied[0] +
+                                           applied[1] * applied[1] +
+                                           applied[2] * applied[2]);
+        fea_contact_resolution_load_path(contact_resolution, applied_n, total_force,
+                                         !held_by_contact_only.empty());
+        if (!contact_resolution.load_path_note.empty())
+            notes.push_back("contact load path: " + contact_resolution.load_path_note);
     }
     chudware::prof::phases::add("solve", std::chrono::duration<double, std::milli>(
                                           std::chrono::steady_clock::now() - t_solve0).count());

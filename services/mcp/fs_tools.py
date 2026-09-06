@@ -113,6 +113,23 @@ def _inside_firmware_project(resolved: Path) -> bool:
         return False
 
 
+def _exists_or_unreachable(resolved: Path) -> bool:
+    """``resolved.exists()``, but a parent we may not stat through is "gone", not a crash.
+
+    ``Path.exists()`` only swallows ENOENT/ENOTDIR/EBADF/ELOOP; every other errno
+    propagates. A directory the caller cannot traverse (mode 0o000, a foreign-uid
+    tree, an autofs mount that refuses) therefore turned a routine miss into a
+    ``PermissionError`` escaping the tool boundary, where the whole fs_* contract is
+    "answer an envelope, never raise". Unreachable is indistinguishable from absent
+    from this side of the syscall, and both answers are ``not_found`` — the caller
+    cannot open it either way.
+    """
+    try:
+        return resolved.exists()
+    except OSError:
+        return False
+
+
 def _canonical_target(raw_path: str, *, allow_missing: bool = False,
                       read: bool = False) -> tuple[Optional[Path], Optional[dict]]:
     """Resolve *raw_path* once and enforce the mandatory root and secret denylist.
@@ -134,7 +151,7 @@ def _canonical_target(raw_path: str, *, allow_missing: bool = False,
         resolved = candidate.resolve(strict=False)
     except (OSError, RuntimeError) as exc:
         return None, _err("invalid_path", str(exc))
-    if not allow_missing and not resolved.exists():
+    if not allow_missing and not _exists_or_unreachable(resolved):
         return None, _err_not_found(str(candidate))
     inside_root = root is not None and (resolved == root or root in resolved.parents)
     if not inside_root and not (read and _inside_firmware_project(resolved)):

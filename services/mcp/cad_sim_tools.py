@@ -23,6 +23,7 @@ from .cad_common import (
     _doc,
     _dumps,
     _err,
+    _handoff_doc_name,
     _merge_face_sets,
     _persist_study,
     _resolve_face_points,
@@ -116,8 +117,11 @@ _BC_SHAPE_HELP = (
 #   magnitude_n -> magnitude  the `_n` is the UNIT the accepted shape already documents
 #                             ('"magnitude": <N>'), i.e. the SAME scalar in the SAME newtons.
 # Aliasing across a quantity/unit BOUNDARY is deliberately NOT done anywhere in this file —
-# see services/agent/arg_reconciliation.QUANTITY_MISMATCH for why (mesh_size_mm is refused, not
-# mapped onto the dimensionless mesh_fineness). Every rename here is echoed in the tool's
+# see services/agent/arg_reconciliation.QUANTITY_MISMATCH for why (a millimetre size is
+# never mapped onto the dimensionless mesh_fineness). run_fea_static and run_fea_contact
+# answer that mismatch the other way, by taking a REAL `mesh_size_mm` parameter (an exact
+# element size, mutually exclusive with the dial); the refusal still stands for every tool
+# that only has the dial. Every rename here is echoed in the tool's
 # `interpreted` channel, so the model can see what its key was read as.
 
 # A raw geometry query has no `face`/`faces` wrapper key and is passed through unchanged,
@@ -857,6 +861,79 @@ def _sim_face_points(doc_id: str, query) -> list:
     return _resolve_face_points(doc_id, query)
 
 
+def _selector_text(query) -> str:
+    """A short, quotable label for the face query one BC faceset came from.
+
+    Stamped onto every resolved faceset as `selector` so an engine refusal can name
+    something the caller can act on. A mesh ordinal cannot: one face query expands to
+    as many facesets as it matched, so `fixtures[3]` in the study is not fixtures[3]
+    in the request.
+    """
+    text = query.strip() if isinstance(query, str) else repr(query)
+    return text[:120]
+
+
+def _bc_facesets(study: dict):
+    """(kind, index, faceset) for every resolved BC faceset of a mechanical study."""
+    for i, fs in enumerate(study.get("fixtures") or []):
+        if isinstance(fs, dict):
+            yield "fixture", i, fs
+    for i, spec in enumerate(study.get("loads") or []):
+        fs = spec.get("faces") if isinstance(spec, dict) else None
+        if isinstance(fs, dict):
+            yield "load", i, fs
+
+
+def _warn_bc_filters_across_clearance(
+    study: dict, max_gap_mm: float, notes: list
+) -> None:
+    """Warn BEFORE a contact solve when a face filter reaches across the clearance.
+
+    A plane or cylinder/quadric faceset carries a TIGHT `perp_tol_mm` (doc_face_points
+    emits 1.5 mm) — the distance from the analytic surface within which a mesh node
+    counts as ON that face. Across a contact interface that tolerance competes with the
+    clearance the study exists to open and close: at perp_tol_mm 1.5 mm over a 0.35 mm
+    fit the filter resolves the MATING body's face too, and a fixture that holds BOTH
+    sides of an interface grounds the joint instead of loading it — the live keyway
+    isolate converged, with a 0% equilibrium error, carrying 9.9 N of a 1500 N load.
+
+    The engine refuses such a selection once it has the mesh (core/sim/fea_selection.h),
+    but this comparison needs neither a mesh nor a solve. A contact solve is minutes;
+    saying it here costs one float compare, so the caller is not told after the fact.
+    """
+    loose: list = []
+    for kind, index, fs in _bc_facesets(study):
+        perp = fs.get("perp_tol_mm")
+        if isinstance(perp, bool) or not isinstance(perp, (int, float)):
+            continue
+        if isinstance(fs.get("surface"), dict):
+            shape = "cylinder/quadric"
+        elif fs.get("face_normal"):
+            shape = "plane"
+        else:
+            continue  # pure-Euclidean faceset: perp_tol is not consulted at all
+        if float(perp) <= max_gap_mm:
+            continue
+        selector = fs.get("selector") or f"{kind}s[{index}]"
+        loose.append(f"{kind} {selector} ({shape} filter, perp_tol_mm {float(perp):g})")
+    if not loose:
+        return
+    notes.append(
+        "SELECTION WARNING (pre-solve): "
+        + "; ".join(loose)
+        + f" — that tolerance is WIDER than max_gap_mm={max_gap_mm:g}, so the filter "
+        "reaches across the very interface it is meant to sit on one side of and may "
+        "resolve the mating body's face as well. A fixture or load that lands on both "
+        "bodies of a contact pair grounds (or loads) the joint through the SELECTION "
+        "instead of through the contact: the study then converges, with a 0% "
+        "equilibrium error, on a non-answer — the live keyway isolate carried 9.9 N of "
+        "a 1500 N load that way. The engine REFUSES that selection naming both bodies "
+        "and the count captured on each; to avoid the round trip, select by body/face "
+        "id, or pick a face whose own clearance to the mating body exceeds the "
+        "tolerance."
+    )
+
+
 def _require_sim_geometry(doc_id: str) -> list:
     """Cheap setup gate shared by public solvers before export/meshing."""
     result = cb.call("asm_world_bodies", {"doc_id": doc_id, "explode": False})
@@ -1099,6 +1176,7 @@ def _build_load_specs(d: str, loads: list, analysis: str) -> list:
         # Merge multiple face-point sets for this load (keeps face_normal/surface
         # hints exactly when they stay valid — see _merge_face_sets).
         merged = _merge_face_sets(_sim_face_points(d, ld["face"]))
+        merged["selector"] = _selector_text(ld["face"])
         spec: dict = {"faces": merged}
         if "pressure" in ld:
             spec["type"] = "pressure"
@@ -1218,6 +1296,45 @@ def _norm_abs_out_path(path, arg_name: str) -> Optional[str]:
     return path
 
 
+# The `mesh_fineness` default every static-shaped entry point declares. An explicit
+# element size and a fineness dial are two answers to the same question, and only one of
+# them can be honoured, so the clash has to be detectable — which needs the default to be
+# a named constant rather than a literal repeated in five signatures.
+_DEFAULT_FINENESS = 0.5
+
+
+def _norm_mesh_size_mm(mesh_size_mm, mesh_fineness: float) -> Optional[float]:
+    """Validate an EXPLICIT characteristic element size (mm) for a static study.
+
+    `mesh_fineness` is a 0..1 dial the mesh-size governor reads as a suggestion; a size in
+    mm maps straight to `study.target_size_mm` and is the release-grade spelling (it is
+    what every `run_fea_convergence` leg sets, and the only way to RE-SOLVE a released
+    ladder leg at the exact size that produced the number being released).
+
+    They are mutually exclusive: a caller who states both has stated two different meshes,
+    and silently preferring one would attribute a field to a mesh nobody asked for — the
+    exact confusion this argument exists to end. `mesh_fineness` left at its default is
+    not a statement, so `mesh_size_mm` alone is never a clash.
+    """
+    if mesh_size_mm is None:
+        return None
+    size = _finite_float(mesh_size_mm, "mesh_size_mm")
+    if size <= 0.0:
+        raise ValueError(
+            "mesh_size_mm must be finite and > 0 when given: it is the characteristic "
+            "element size in millimetres, e.g. 6.0."
+        )
+    if mesh_fineness != _DEFAULT_FINENESS:
+        raise ValueError(
+            f"pass mesh_size_mm ({size:g} mm, an exact element size that maps to "
+            f"study.target_size_mm) OR mesh_fineness ({mesh_fineness}, the 0..1 dial the "
+            "mesh-size governor clamps against an element budget) — not both. They are "
+            "two different meshes, and a result has to name the one it was solved on. "
+            "Drop mesh_fineness to solve at the stated size."
+        )
+    return size
+
+
 def _build_static_study(
     fixtures,
     loads,
@@ -1229,6 +1346,7 @@ def _build_static_study(
     notes: list,
     vtu_path: Optional[str] = None,
     export_system_path: Optional[str] = None,
+    target_size_mm: Optional[float] = None,
 ) -> dict:
     """SETUP stage for run_fea_static / sim_run(analysis="fea_static")."""
     d = _doc(doc_id)
@@ -1248,6 +1366,7 @@ def _build_static_study(
     fixtures = _norm_bc_list(fixtures, "fixtures", unwrap_query=True, notes=notes)
     loads = _norm_bc_list(loads, "loads", notes=notes)
     mesh_fineness = _norm_fineness(mesh_fineness)
+    target_size_mm = _norm_mesh_size_mm(target_size_mm, mesh_fineness)
     vtu_path = _norm_vtu_path(vtu_path)
     export_system_path = _norm_abs_out_path(export_system_path, "export_system_path")
     mat = _resolve_study_material(material, "static")
@@ -1269,7 +1388,14 @@ def _build_static_study(
         )
     fixture_sets: list = []
     for q in fixtures:
-        fixture_sets.extend(_sim_face_points(d, q))
+        # One query can match several faces; each resolved faceset keeps the QUERY as
+        # its label so an engine refusal names what the caller wrote, not an ordinal
+        # into the expanded list.
+        label = _selector_text(q)
+        for fs in _sim_face_points(d, q):
+            if isinstance(fs, dict):
+                fs["selector"] = label
+            fixture_sets.append(fs)
     if not fixture_sets:
         raise _StudyRefusal(
             {
@@ -1297,6 +1423,11 @@ def _build_static_study(
         "mesh_order": 2,
         "fineness": mesh_fineness,
     }
+    if target_size_mm is not None:
+        # Exactly what a convergence leg sets, so a leg can be re-solved at its own size:
+        # `fineness` stays in the payload (the engine reads it only when no explicit size
+        # is present) and target_size_mm bypasses the mesh-size governor's band.
+        study["target_size_mm"] = target_size_mm
     if vtu_path:
         study["vtu_path"] = vtu_path
     if export_system_path:
@@ -1311,6 +1442,7 @@ def _build_static_study(
         "fixtures": fixtures,
         "loads": loads,
         "mesh_fineness": mesh_fineness,
+        "target_size_mm": target_size_mm,
         "vtu_path": vtu_path,
         "export_system_path": export_system_path,
         **advisor,
@@ -1431,6 +1563,10 @@ def _build_contact_study(
     if interface_size_mm is not None:
         ctx["study"]["contact"]["interface_size_mm"] = interface_size_mm
     ctx["interface_size_mm"] = interface_size_mm
+    # A face filter wider than the clearance is a defect the caller can fix from the
+    # reply, and the comparison needs neither a mesh nor a solve — so it is said now,
+    # not after minutes of meshing and an engine refusal.
+    _warn_bc_filters_across_clearance(ctx["study"], max_gap_mm, notes)
     # _build_static_study tags itself "fea_static"; the durable collector dispatches on
     # this tag, so leaving it would collect a contact run through the static collector
     # and drop the contact verdict.
@@ -1722,6 +1858,11 @@ def _collect_static(
         "fixtures": ctx.get("fixtures"),
         "loads": ctx.get("loads"),
         "mesh_fineness": ctx.get("mesh_fineness"),
+        # Absent unless the caller stated an exact size: a persisted study whose
+        # mesh_fineness is the untouched default must not read as "meshed at 0.5" when
+        # target_size_mm is what the mesher actually honoured.
+        **({"target_size_mm": ctx["target_size_mm"]}
+           if ctx.get("target_size_mm") is not None else {}),
         "learned_advisor": ctx.get("learned_advisor", False),
         "advisor_max_dof": ctx.get("advisor_max_dof", 0),
         "results": summary,
@@ -2754,6 +2895,27 @@ def _leg_label(step: dict) -> str:
     return f"fineness {step.get('fineness')}"
 
 
+def _leg_vtu_path(vtu_dir: str, doc_id, index: int, step: dict) -> str:
+    """Where leg *index* writes its field: ``<vtu_dir>/<doc>_leg<k>_h<size>_o<order>.vtu``.
+
+    The name has to survive being read months later beside the packet it belongs to, so it
+    carries the three things that make a ladder leg what it is — its position, its
+    discretization and its element order. A fineness rung has no size in mm, so it is
+    named `f<fineness>` instead of `h<size>`; nothing else changes.
+    """
+    base = (_handoff_doc_name(str(doc_id)) or "").strip() or str(doc_id or "part")
+    stem = re.sub(r"[^A-Za-z0-9._-]+", "_", base).strip("._-") or "part"
+    size = step.get("target_size_mm")
+    rung = (
+        f"h{size:g}"
+        if isinstance(size, (int, float)) and not isinstance(size, bool)
+        else f"f{step.get('fineness')}"
+    )
+    return os.path.join(
+        vtu_dir, f"{stem}_leg{index}_{rung}_o{step.get('mesh_order')}.vtu"
+    )
+
+
 def _convergence_skipped_row(step: dict, reason: str) -> dict:
     """A leg that was never solved because an earlier leg failed and stopped the ladder.
 
@@ -2811,8 +2973,12 @@ def _convergence_row(step: dict, out: dict, monitor: str, prev: Optional[float])
         row["mesh_quality"] = out["mesh_quality"]
     if isinstance(out.get("reactions"), dict):
         row["equilibrium_error_pct"] = out["reactions"].get("equilibrium_error_pct")
-    if out.get("vtu_path"):
-        row["vtu_path"] = out["vtu_path"]
+    # The solve echoes the .vtu it wrote; the step is the fallback for an engine build
+    # that writes the file without echoing the path, because a row that names no field
+    # cannot be released even when the field is on disk.
+    vtu = out.get("vtu_path") or step.get("vtu_path")
+    if vtu:
+        row["vtu_path"] = vtu
     plausibility = out.get("plausibility")
     if isinstance(plausibility, dict):
         row["plausibility"] = plausibility
@@ -2841,6 +3007,36 @@ def _convergence_row(step: dict, out: dict, monitor: str, prev: Optional[float])
     else:
         row["delta_pct_vs_prev"] = round(100.0 * (value - prev) / abs(prev), 3)
     return row
+
+
+def _released_leg(rows: list) -> Optional[dict]:
+    """The leg a release would quote: the FINEST one that actually solved.
+
+    A ladder's purpose is to justify one number, and that number comes from the finest
+    usable leg — not from the table as a whole. Naming it (with its .vtu, when the run
+    was given a `vtu_dir`) is what lets `sim_evidence_packet` hash the field the released
+    scalars came from instead of a packet claiming a convergence table with no field
+    behind it. A failed, skipped or implausible leg is not a candidate: it produced no
+    releasable number. This is NOT a verdict — `converged` is; a released leg exists even
+    on a ladder that has not converged, because the run still has a best available field.
+    """
+    for i in range(len(rows) - 1, -1, -1):
+        row = rows[i]
+        if row.get("error") or row.get("skipped") or row.get("implausible"):
+            continue
+        leg = {
+            "index": i,
+            "size_mm": row.get("size_mm"),
+            "fineness": row.get("fineness"),
+            "mesh_order": row.get("mesh_order"),
+            "n_dof": row.get("n_dof"),
+            "monitored_value": row.get("monitored_value"),
+            "delta_pct_vs_prev": row.get("delta_pct_vs_prev"),
+        }
+        if row.get("vtu_path"):
+            leg["vtu_path"] = row["vtu_path"]
+        return leg
+    return None
 
 
 def _convergence_envelope(
@@ -2877,6 +3073,9 @@ def _convergence_envelope(
             "a peak that keeps growing with refinement is a singularity, not strength."
         ),
     }
+    released = _released_leg(rows)
+    if released:
+        out["released_leg"] = released
     if degenerate:
         out["degenerate_legs"] = degenerate
         governor = {
@@ -3230,7 +3429,8 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
         fixtures: Union[list, str],
         loads: Union[list, str],
         material: Union[str, dict] = "steel",
-        mesh_fineness: Union[float, str] = 0.5,
+        mesh_fineness: Union[float, str] = _DEFAULT_FINENESS,
+        mesh_size_mm: Optional[float] = None,
         learned_advisor: bool = False,
         advisor_max_dof: int = 0,
         doc_id: Optional[str] = None,
@@ -3256,6 +3456,13 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
         mesh_fineness : 0..1 (default 0.5), or a preset word
                    ("coarse"=0.25, "medium"=0.5, "fine"=0.75, "finest"=1.0).
                    Second-order (tet10) elements are used for accuracy.
+        mesh_size_mm : the EXACT characteristic element size in mm, e.g. 6.0 — mutually
+                   exclusive with mesh_fineness (passing both is refused: they are two
+                   different meshes). It maps straight to study.target_size_mm and
+                   bypasses the mesh-fineness governor, so it is the release-grade
+                   spelling and the ONLY way to re-solve one run_fea_convergence leg on
+                   the mesh that produced its number — pass the leg's size_mm together
+                   with vtu_path to write that leg's field.
         learned_advisor : opt-in Polyhedral-FEA sizing/order advice; false by default.
         advisor_max_dof : optional non-negative advisor budget; 0 leaves it unset.
         background : if True, return a job_id immediately and solve in a separate process —
@@ -3333,6 +3540,7 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
                 bc_notes,
                 vtu_path=vtu_path,
                 export_system_path=export_system_path,
+                target_size_mm=mesh_size_mm,
             )
             _autosave_all_open()  # R-1 guard: protect every open doc before the solve starts
             return _dumps(
@@ -3432,6 +3640,7 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
         monitor: Optional[str] = None,
         tol_pct: float = _CONVERGENCE_TOL_PCT,
         doc_id: Optional[str] = None,
+        vtu_dir: Optional[str] = None,
         background: bool = False,
         continue_on_fail: bool = False,
         job_ids: Optional[Union[list, str]] = None,
@@ -3486,6 +3695,18 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
                    in does not matter). The leg ids are in the ladder job's
                    progress.leg_job_ids. fixtures/loads are NOT needed on this call; they
                    are required only when starting a new ladder.
+        vtu_dir : optional ABSOLUTE directory the legs write their FIELDS into — one .vtu
+                   per leg, named <doc>_leg<k>_h<size>_o<order>.vtu (a fineness rung is
+                   named f<fineness> instead). Each row then carries `vtu_path` and the
+                   reply's `released_leg` names the finest solved leg's file, which is the
+                   one a release quotes and the one sim_evidence_packet hashes: without
+                   this a converged ladder has a table and no field behind it, and the
+                   only recovery was a fourth solve. The write happens INSIDE the leg
+                   (still strictly one leg at a time, so peak memory is unchanged), and a
+                   .vtu already at a leg's path is ARCHIVED into
+                   superseded_<date>_<hash>/ rather than overwritten — same rule as
+                   run_fea_static's vtu_path. Absolute path required; the engine creates
+                   the directory.
 
         THE LEGS ARE SEQUENTIAL and your studies should be too: the engine's memory
         governor grants each solve a fraction of the RAM AVAILABLE when it starts (not a
@@ -3502,6 +3723,11 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
         leg's delta| < tol_pct. A failed or skipped leg keeps its row and forces
         ok:false — a table missing its finest mesh would read as "converged at the
         coarse end".
+        `released_leg` names the leg a release quotes — the FINEST one that actually
+        solved — with its index, size/fineness, mesh_order, n_dof, monitored_value and
+        (when `vtu_dir` was given) its `vtu_path`. It is not a verdict: it exists even on
+        a ladder that did not converge, and `converged` is still the statement to read.
+        Hand the whole reply to sim_evidence_packet, which hashes that leg's field.
         `degenerate_ladder:true` means two legs meshed the same (identical n_dof/n_elems,
         or under 5% DOF growth between consecutive legs); converged is then forced false
         and `note` carries the remedy, because a 0% delta between two copies of one mesh
@@ -3523,7 +3749,16 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
                     f"monitor={monitor!r} is not a convergence-monitorable summary "
                     f"scalar; choose one of {list(_MONITORABLE)}."
                 )
+            vtu_dir = _norm_abs_out_path(vtu_dir, "vtu_dir")
             if job_ids is not None:
+                if vtu_dir:
+                    raise ValueError(
+                        "vtu_dir cannot be honoured on the job_ids recovery path: the "
+                        "field is written BY the solve, and those legs have already run. "
+                        "A leg started with vtu_dir already carries its vtu_path on its "
+                        "row; otherwise re-solve just the leg you intend to release with "
+                        "run_fea_static(mesh_size_mm=<that row's size_mm>, vtu_path=...)."
+                    )
                 return _dumps(_convergence_from_jobs(job_ids, monitor, tol_pct))
             if fixtures is None or loads is None:
                 missing = [
@@ -3560,13 +3795,28 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
                     "target_size_mm": value if key == "target_size_mm" else None,
                     "fineness": study["fineness"],
                 }
+                # The leg's own discretization, so the study this leg persists names the
+                # mesh it was solved on rather than the base context's placeholder.
+                leg_ctx = {
+                    **ctx,
+                    "study": study,
+                    "target_size_mm": step["target_size_mm"],
+                }
+                if vtu_dir:
+                    # The setup is already validated and exported at this point, so a
+                    # field left by an earlier run may now be moved aside. The WRITE
+                    # itself happens inside the leg's own solve, which is still the only
+                    # thing running: peak memory is unchanged by asking for a field.
+                    leg_vtu = _leg_vtu_path(vtu_dir, ctx["doc"], i, step)
+                    _archive_existing_vtu(leg_vtu, bc_notes)
+                    study["vtu_path"] = leg_vtu
+                    step["vtu_path"] = leg_vtu
+                    leg_ctx["vtu_path"] = leg_vtu
                 plan.append(
                     (
                         step,
                         {"method": "sim_run_static", "params": {"study": study}},
-                        _job_meta(
-                            {**ctx, "study": study}, bc_notes, {"convergence_step": step}
-                        ),
+                        _job_meta(leg_ctx, bc_notes, {"convergence_step": step}),
                     )
                 )
             run = _ConvergenceLadder(
@@ -5436,19 +5686,59 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
             resolution.criterion, because it depends on whether there is a clearance at
             all: "h_over_clearance" (min gap > 0) refuses when the element size AT the
             interface is more than 4x the clearance AND fewer than 6 candidate pairs sit
-            within twice the closest approach; "elements_across_patch" (TOUCHING or
+            within the SEAT LIMIT; "elements_across_patch" (TOUCHING or
             coincident faces, min gap <= 0, where h/gap is undefined) refuses when fewer
             than 3 elements span the candidate patch (h_interface > max_h_interface_mm =
-            sqrt(candidate_area_mm2)/3) AND fewer than 6 pairs are in contact, or
+            sqrt(candidate_area_mm2)/3) AND fewer than 6 pairs seat, or
           * the solved load crossed through fewer than 6 active pairs.
         The refusal carries "contact":{... "resolution":{h_interface_mm, gap_mm,
-        criterion, candidate_pairs, seatable_pairs, min_active_pairs,
+        criterion, candidate_pairs, seatable_pairs, seat_limit_mm,
+        initial_penetration_max_mm, min_active_pairs,
         candidate_area_mm2, required_interface_size_mm, resolved, reason, plus
         ratio/max_ratio under h_over_clearance or max_h_interface_mm /
         min_elements_across_patch under elements_across_patch}} and names the
         interface_size_mm that would resolve it. A conformal interface (two flat faces
         across a uniform gap, a concentric pin in a bore) is NOT refused on the ratio
         alone — every pair seats there and the patch pressure is real.
+
+        WHAT SEATS. seat_limit_mm is a LENGTH the interface supplies —
+        max(0.5 x h_interface, 0.25 x max_gap_mm, 1e-4) — and seatable_pairs is how many
+        candidates start the solve inside it. Half the interface element size is the
+        resolution statement: the elements bounding the interface cannot describe a gap
+        finer than that, so a candidate below it is not distinguishable from touching and
+        the active-set loop begins there; every other candidate seats later if and only
+        if the deformation actually closes it, and a seated pair that ends in tension is
+        released. The limit used to be twice the CLOSEST APPROACH, which collapses to
+        zero the moment one node lands inside the partner face — on a nominally-touching
+        fit that made the seated population mesh luck (the same live request seated 8,
+        then 12, then 13, then 2 pairs). Initial PENETRATION is never force: a negative
+        mesh gap is placement/facet error, it is clamped to a touching gap, and its depth
+        is reported as resolution.initial_penetration_max_mm. If a run reports a large
+        initial_penetration_max_mm and few active pairs, the bodies were placed
+        interfering and what looked like contact pressure before was preload.
+
+        A SELECTION MAY NOT SPAN THE INTERFACE. No fixture and no load may resolve to
+        nodes on BOTH bodies of a contact pair. The tolerance that finds the nodes of a
+        face is routinely WIDER than the clearance a contact study exists to open and
+        close: a plane or cylinder/quadric faceset carries perp_tol_mm = 1.5 mm, so
+        aimed at one side of a 0.35 mm fit it reaches straight through and resolves the
+        mating body's face too. A fixture that holds both sides of an interface grounds
+        the joint through the SELECTION instead of through the contact, and then nothing
+        downstream can see it — the mechanism gate is satisfied (both bodies reach a
+        fixture), the interface is meshed fine, and the fixtures react everything, so
+        the run reports CONVERGED at a 0% equilibrium error while the contact carries
+        almost nothing (the live keyway isolate: 9.9 N of a 1500 N load, 6 active
+        pairs). So the run is REFUSED (ok:false) naming the offending selector, the two
+        bodies it captured, how many of its nodes landed on each, and the remedy:
+        "selection_spans_contact":{kind, selector, bodies:[i,j], nodes_captured:[a,b],
+        body_nodes:[a,b], median_gap_mm, min_gap_mm}. Fix it by tightening the face
+        filter's perp_tol_mm below the clearance, or by selecting by body/face id so
+        the selection cannot leave its own body. Two selectors, one per body, are fine
+        — that is a properly grounded assembly whose interface still transmits load;
+        what is refused is ONE selector holding both sides. When a filter's perp_tol_mm
+        is merely WIDER than max_gap_mm the reply carries a "SELECTION WARNING
+        (pre-solve)" note before the solve starts, so the mistake does not cost a
+        meshing round trip.
 
         Returns the run_fea_static envelope — summary (max_von_mises_mpa / max_disp_mm /
         min_fos, plus the reduction disclosure max_von_mises_reduction /
@@ -5461,6 +5751,7 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
            tangential_stabilization, tangential_force_fraction, candidate_area_mm2,
            contact_area_mm2, mean_contact_pressure_mpa, contact_pressure_reliable,
            resolution:{...}, held_by_contact_only:[component ids held ONLY by contact],
+           contact_carries_load, load_path:{applied_n, carried_n, fraction, note},
            pairs:[{bodies:[i,j], candidate_pairs, active_pairs, contact_force_n,
               force_vector_n:[x,y,z], contact_area_mm2, mean_contact_pressure_mpa,
               max_contact_pressure_mpa, max_penetration_mm}]}
@@ -5471,6 +5762,22 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
         means anything: it is true only when the interface passed the resolution guard
         and at least 6 pairs with real tributary area carried the load. When it is false,
         quote the resultant (contact_force_n) and not a pressure.
+        THE PRESSURE IS ALSO ONLY AN ANSWER WHEN THE CONTACT CARRIES THE LOAD.
+        load_path reports what the study actually routed through this interface:
+        applied_n is the resultant of the applied loads on the components held ONLY
+        by contact, carried_n the total contact_force_n across the active pairs, and
+        fraction their quotient. contact_carries_load — and therefore
+        contact_pressure_reliable — is true only when that fraction reaches 0.5.
+        Two ways it fails. If held_by_contact_only is EMPTY, every body is grounded
+        on its own, so the interface is a REDUNDANT parallel path: the study is not
+        refused, but contact_carries_load is false and force/area is the share this
+        stiffness path picked up, not a seat pressure (the usual cause is a fixture
+        face set that reached across the clearance onto the mating body — see the
+        selection rule above). If a body IS held only by contact and the interface
+        still takes less than half of what is applied to it, the study is REFUSED:
+        a converged solve that routes the load elsewhere answers a different
+        question. load_path.note carries the diagnosis in both cases and is empty
+        exactly when the interface is the load path.
         force_vector_n is what the lower-numbered component pushes onto the higher one, so
         its direction says WHICH side is in contact. A load that pulls the bodies apart
         leaves nothing holding them: that is refused as a mechanism, not solved.

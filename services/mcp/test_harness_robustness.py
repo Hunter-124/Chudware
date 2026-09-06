@@ -386,10 +386,25 @@ def test_delegate_refuses_to_report_execution_it_cannot_evidence(monkeypatch):
         "turn-closing fabrication the verdict exists to prevent")
 
 
-def test_delegate_without_provider_names_what_to_do_instead():
+def test_delegate_names_what_to_do_instead_when_no_tree_can_be_built(monkeypatch):
+    """The unavailable refusal must stay actionable.
+
+    A missing Python provider stopped being the trigger: Chudcode runs the child, so
+    `delegate` binds a governed tree on the spot (pinned by
+    `test_delegate_binds_a_tree_when_a_provider_is_available` above). The only
+    remaining `unavailable` state is a tree that cannot be CONSTRUCTED, and that is
+    the anti-fabrication path — it has to tell the model not to retry and what to do
+    instead, or the turn closes on sub-agent work that never happened.
+    """
+    from services.agent import delegation as _delegation
     from services.agent.mission_dispatch import MissionDispatch
 
-    md = MissionDispatch(run_id="r_no_provider")
+    def _no_tree(*_a, **_k):
+        raise RuntimeError("governed delegation tree unavailable")
+
+    monkeypatch.setattr(_delegation, "DelegationTree", _no_tree)
+
+    md = MissionDispatch(run_id="r_no_tree")
 
     out = md.delegate(role="layout_engineer", brief="lay out the board",
                       budget_tokens=4000)

@@ -663,9 +663,11 @@ def ch03() -> list:
             rec_path = WORK / f"{case}_showcase_solve.json"
             if not (vtu.exists() and rec_path.exists()):
                 raise SystemExit(
-                    f"{case}: no field to animate. The released packet has no VTU "
-                    f"(run_fea_convergence does not write one), so the showcase re-solves "
-                    f"the case with run_fea_static(vtu_path=...) into {vtu}. Run:\n"
+                    f"{case}: no field to animate. This packet was released before "
+                    f"run_fea_convergence could write fields (it now takes vtu_dir, and "
+                    f"its released_leg names the leg's .vtu), so the showcase re-solves "
+                    f"the released leg with run_fea_static(mesh_size_mm=<leg size>, "
+                    f"vtu_path=...) into {vtu}. Run:\n"
                     f"  .venv-mcp/bin/python /tmp/solve_cases.py {case}")
             rec = json.loads(rec_path.read_text())
         sc = rec["_showcase"]

@@ -2236,7 +2236,7 @@
    "prompt_note": "Second half of regen_diagnose: accept/edit/reject the fix card; 'edit' re-applies your edit_ops_json to the ORIGINAL broken document."
   },
   "render_animation": {
-   "prompt_note": "The moving deliverable — a .gif/.mp4 a review PLAYS, not a still: kind='turntable' orbits a part, 'explode' flies an assembly's components apart (factor), 'motion' films simulate_motion's OWN solved mate sweep (mate_id/start/stop) with collision samples marked, 'fea' warps a solved vtu_path by field. save_path is a REQUIRED absolute .gif/.mp4 in the project; frames/fps set duration and frames_dir collects the PNG sequence for a multi-segment film. Needs ffmpeg; a single still is still render_part.",
+   "prompt_note": "The moving deliverable — a .gif/.mp4 a review PLAYS, not a still: kind='turntable' orbits a part, 'explode' flies an assembly's components apart (factor), 'motion' films a SOLVED trajectory, 'fea' warps a solved vtu_path by field. A motion film takes exactly one drive: mate_id (+start/stop) sweeps a dimensional mate, steer={'components':[...],'axis':{'point':[..],'dir':[..]},'angle_deg':N} (+rear_steer) ramps a steer sweep 0->angle for an assembly with no drivable mate — same spec as steering_turning_radius — and poses=[{component:[16 numbers]},...] films an explicit frame list; collision samples are marked. save_path is a REQUIRED absolute .gif/.mp4 in the project; frames/fps set duration and frames_dir collects the PNG sequence for a multi-segment film. Needs ffmpeg; a single still is still render_part.",
    "timeout_s": 900
   },
   "render_ascii": {
@@ -2427,7 +2427,7 @@
    "timeout_s": 420
   },
   "run_fea_convergence": {
-   "prompt_note": "Same static study at 2+ explicit mesh sizes (sizes_mm or fineness ladder); the table with delta_pct_vs_prev is the convergence evidence a release needs. Never cite one mesh.",
+   "prompt_note": "Same static study at 2+ explicit mesh sizes (sizes_mm or fineness ladder); the table with delta_pct_vs_prev is the convergence evidence a release needs. Never cite one mesh. Pass vtu_dir=/abs/dir to get one .vtu per leg: the reply's released_leg then names the finest solved leg's field, which sim_evidence_packet hashes — without it the ladder has no field and needs a fourth solve.",
    "timeout_s": 1020
   },
   "run_fea_fatigue": {
@@ -2443,7 +2443,7 @@
    "timeout_s": 420
   },
   "run_fea_static": {
-   "prompt_note": "Real-part linear static FEA. Confirm face queries first. fixtures must react a non-zero load: force vectors/magnitude are N, pressure is MPa; zero loads are refused and there is no gravity/self-weight term. An explicit material dict needs E_mpa, nu, and yield_mpa; named registry materials resolve them. set_material is appearance only. Repeat at a finer mesh and compare governing stress/deflection (<10% change) before PASS.",
+   "prompt_note": "Real-part linear static FEA. Confirm face queries first. fixtures must react a non-zero load: force vectors/magnitude are N, pressure is MPa; zero loads are refused and there is no gravity/self-weight term. An explicit material dict needs E_mpa, nu, and yield_mpa; named registry materials resolve them. set_material is appearance only. Repeat at a finer mesh and compare governing stress/deflection (<10% change) before PASS. mesh_size_mm=<mm> is the exact element size (mutually exclusive with mesh_fineness) — use it with vtu_path to re-solve one run_fea_convergence leg on its own mesh.",
    "timeout_s": 420
   },
   "run_fea_thermal": {

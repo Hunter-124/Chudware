@@ -32,6 +32,15 @@ constexpr double kPi = 3.14159265358979323846;
 
 double deg2rad(double d) { return d * kPi / 180.0; }
 
+// Fold an angle difference into (-pi, pi]. An angle mate's residual is an ANGLE, so the
+// difference between the measured and the requested one has to be the SHORT way round:
+// without this, driving a mate from +179 deg to -179 deg is a 358 deg error instead of 2.
+double wrap_pi(double a) {
+    double r = std::fmod(a + kPi, 2.0 * kPi);
+    if (r < 0.0) r += 2.0 * kPi;
+    return r - kPi;
+}
+
 // --------------------------------------------------------------------------- rotation helpers
 
 Matrix3d skew(const Vector3d& v) {
@@ -102,6 +111,23 @@ void perp_basis(const Vector3d& axis, Vector3d& e1, Vector3d& e2) {
                                              : Vector3d(0.0, 1.0, 0.0);
     e1 = unit(a.cross(helper));
     e2 = unit(a.cross(e1));
+}
+
+// Pick one of the two directions along an axis, from the vector's own numbers. An axis
+// and its negation describe the same line, but they are OPPOSITE references for a signed
+// angle, so a derived reference axis has to land on the same one every time it is
+// derived — including from a seed a hair either side of 0 deg, where the natural
+// derivation (a cross product) flips. `g` is a generic direction: only an axis lying in
+// the one plane perpendicular to it is ambiguous, and that case falls back to making the
+// largest component positive.
+Vector3d canonical_sign(const Vector3d& v) {
+    static const Vector3d g = unit(Vector3d(5.0, 2.0, 1.0));
+    const double d = v.dot(g);
+    if (std::abs(d) > 1e-9) return (d < 0.0) ? Vector3d(-v) : v;
+    int k = 0;
+    for (int i = 1; i < 3; ++i)
+        if (std::abs(v[i]) > std::abs(v[k])) k = i;
+    return (v[k] < 0.0) ? Vector3d(-v) : v;
 }
 
 // Two scalars measuring the component of vec perpendicular to axis.
@@ -183,6 +209,12 @@ struct CompFrame {
     // rotation is the exp-map of their solved variables.
     Matrix3d R0 = Matrix3d::Identity();
     std::vector<double> tf0;
+    // The DOCUMENT's rotation for this component, independent of any warm start. A mate
+    // that has to derive geometry of its own (the angle mate's reference axis) derives it
+    // from this, so a driven sweep — which re-solves the same document warm-started from
+    // the previous frame — measures the same signed angle at every frame instead of one
+    // that drifts with the solver's own path.
+    Matrix3d R_auth = Matrix3d::Identity();
     std::vector<int> t_idx;   // 3 var indices (translation), empty if fixed
     std::vector<int> w_idx;   // 3 var indices (rotation vector), empty if fixed
 
@@ -346,6 +378,34 @@ private:
         return out;
     }
 
+    // A 3-vector mate parameter under any of `keys`, or nullopt when none is authored.
+    // Used for the angle mate's stored reference axis.
+    std::optional<Vector3d> param_vec3(std::initializer_list<const char*> keys) const {
+        if (!params_.is_object()) return std::nullopt;
+        for (const char* key : keys) {
+            if (!params_.contains(key)) continue;
+            const json& v = params_[key];
+            if (!v.is_array() || v.size() != 3)
+                throw std::runtime_error(std::string("mate parameter '") + key
+                                         + "' must be a 3-element vector");
+            Vector3d out;
+            for (int k = 0; k < 3; ++k) {
+                if (!v[k].is_number())
+                    throw std::runtime_error(std::string("mate parameter '") + key
+                                             + "' must be numeric");
+                out[k] = v[k].get<double>();
+                if (!std::isfinite(out[k]))
+                    throw std::runtime_error(std::string("mate parameter '") + key
+                                             + "' must be finite");
+            }
+            if (out.norm() < 1e-9)
+                throw std::runtime_error(std::string("mate parameter '") + key
+                                         + "' must not be the zero vector");
+            return unit(out);
+        }
+        return std::nullopt;
+    }
+
     Vector3d axis_world(const std::string& which) const {
         const MateGeom& g = (which == "a") ? ga_ : gb_;
         const CompFrame* f = frame_of(which);
@@ -495,27 +555,139 @@ private:
         return {rfunc, jfunc, 1};
     }
 
+    // An angle mate is a SIGNED angle about a reference axis, never a dot product.
+    //
+    // `da . db - cos(target)` has a derivative of -sin(theta) in the angle it is trying
+    // to control, so at 0 deg and at 180 deg its Jacobian row is exactly ZERO: the mate
+    // adds no rank (reported `redundant`, residual 0, the solver cannot drive it) and a
+    // mate authored a few degrees off zero has a first-order-flat residual the LM stalls
+    // on (ME 490 phase 5F: a steer joint stuck at 3.589e-03 across three passes). A dot
+    // product also cannot tell +30 deg from -30 deg, so a sweep folds at zero instead of
+    // passing through it.
+    //
+    // Instead: theta = atan2(ref . (da x db), da.db - (da.ref)(db.ref)) — the signed
+    // angle from da to db about `ref`, measured on the projections of both directions
+    // into the plane perpendicular to ref. Written this way it needs no explicit
+    // normalization: numerator and denominator are both bilinear in (da, db), so the
+    // quotient is exactly invariant to their lengths. d(theta) = 1 per radian of relative
+    // rotation about ref at EVERY angle, zero included, so the row always carries rank.
+    // `ref` is a direction attached to component A (see angle_reference_local) and is
+    // differentiated with the rest, so the mate is exact when A itself rotates.
     Built angle() {
         if (!std::isfinite(value_))
             throw std::runtime_error("angle value must be finite");
-        Vector3d da_l = ga_.dir_vector();
-        Vector3d db_l = gb_.dir_vector();
-        double target = std::cos(deg2rad(value_));
+        const Vector3d da_l = unit(ga_.dir_vector());
+        // `align: anti` measures to the opposite of b's direction, as it does for every
+        // other direction mate here: an anti target of A deg is the aligned A - 180 deg.
+        const Vector3d db_l = unit(Vector3d(sign_ * gb_.dir_vector()));
+        const double target = deg2rad(value_);
+        const Vector3d ref_l = angle_reference_local(da_l, db_l);
         auto self = this;
-        R rfunc = [=](const VectorXd& xs) {
-            Vector3d da, db; MatrixXd Jd;
-            self->wd("a", xs, da_l, da, Jd);
-            self->wd("b", xs, db_l, db, Jd);
-            VectorXd r(1); r(0) = da.dot(db) - target; return r;
-        };
-        J jfunc = [=](const VectorXd& xs) {
-            Vector3d da, db; MatrixXd Jda, Jdb;
+        // s = |pa||pb| sin(theta), c = |pa||pb| cos(theta) for the ref-perpendicular
+        // projections pa, pb of da, db. `ref` is normalized here (s is linear in it, c
+        // quadratic), which is exact: R is orthonormal for a free component, and a fixed
+        // one carries no Jacobian block at all.
+        auto measure = [=](const VectorXd& xs, Vector3d& da, Vector3d& db, Vector3d& ref,
+                           MatrixXd& Jda, MatrixXd& Jdb, MatrixXd& Jref,
+                           double& s, double& c) {
             self->wd("a", xs, da_l, da, Jda);
             self->wd("b", xs, db_l, db, Jdb);
-            return MatrixXd(self->place("a", (db.transpose() * Jda).eval())
-                            + self->place("b", (da.transpose() * Jdb).eval()));
+            self->wd("a", xs, ref_l, ref, Jref);
+            const double rn = ref.norm();
+            if (rn > 1e-12) { ref /= rn; Jref /= rn; }
+            s = ref.dot(da.cross(db));
+            c = da.dot(db) - da.dot(ref) * db.dot(ref);
+        };
+        R rfunc = [=](const VectorXd& xs) {
+            Vector3d da, db, ref; MatrixXd Jda, Jdb, Jref;
+            double s = 0.0, c = 0.0;
+            measure(xs, da, db, ref, Jda, Jdb, Jref, s, c);
+            VectorXd r(1);
+            r(0) = wrap_pi(std::atan2(s, c) - target);
+            return r;
+        };
+        J jfunc = [=](const VectorXd& xs) {
+            Vector3d da, db, ref; MatrixXd Jda, Jdb, Jref;
+            double s = 0.0, c = 0.0;
+            measure(xs, da, db, ref, Jda, Jdb, Jref, s, c);
+            // d(atan2(s,c)) = (c ds - s dc) / (s^2 + c^2). The denominator is
+            // |pa|^2|pb|^2 — it vanishes only if a direction turns onto the reference
+            // axis itself, which no angle about that axis can describe.
+            const double den = std::max(s * s + c * c, 1e-24);
+            const Vector3d pa = da - da.dot(ref) * ref;
+            const Vector3d pb = db - db.dot(ref) * ref;
+            const Vector3d g_da = (c * db.cross(ref) - s * pb) / den;
+            const Vector3d g_db = (c * ref.cross(da) - s * pa) / den;
+            const Vector3d g_ref =
+                (c * da.cross(db) - s * (db.dot(ref) * da + da.dot(ref) * db)) / den;
+            return MatrixXd(self->place("a", (g_da.transpose() * Jda).eval())
+                            + self->place("b", (g_db.transpose() * Jdb).eval())
+                            + self->place("a", (g_ref.transpose() * Jref).eval()));
         };
         return {rfunc, jfunc, 1};
+    }
+
+    // The angle mate's reference axis, expressed in component A's LOCAL frame (so it
+    // turns with A, the way a joint axis does). Priority:
+    //   1. authored on the mate as `value.axis` (alias `reference_axis`), in A's local
+    //      frame — the only way to NAME the joint axis, and what a mate driven through
+    //      0 deg should carry;
+    //   2. a third resolved geometry ref on the mate (ref_index 2), carried into A's
+    //      frame;
+    //   3. the cross product of the two directions at the components' AUTHORED poses —
+    //      the axis that actually carries a to b whenever the authored angle is neither
+    //      0 nor 180 deg;
+    //   4. the geoms' own companion vector: for a plane its `direction`, for an axis its
+    //      `normal`, a's first then b's. The document's selector resolver fills in only
+    //      the vector a mate measures, so unless the caller supplied one this is the
+    //      component's local +Z — a guess, which is why case 1 exists;
+    //   5. any perpendicular of da.
+    // Whatever it comes from, the result is made perpendicular to da (an axis with a
+    // component along da measures nothing) and, for the DERIVED cases 2-5, sign-
+    // canonicalized: a cross product flips as an assembly passes through 0 deg, and a
+    // reference that flips is a mate whose +30 deg silently becomes -30 deg mid-sweep.
+    //
+    // Nothing here reads the SOLVER's seed. A driven sweep re-solves the same document
+    // warm-started from the previous frame, so a reference derived from the warm pose
+    // would be re-derived per frame — and would change kind (case 3 -> case 4) exactly at
+    // the frame that lands on zero. Derived from the document, one sweep measures one
+    // signed angle throughout.
+    Vector3d angle_reference_local(const Vector3d& da_l, const Vector3d& db_l) const {
+        auto perp_to_da = [&](const Vector3d& v) {
+            return Vector3d(v - v.dot(da_l) * da_l);
+        };
+        const Matrix3d& Ra = fa_->R_auth;
+        const Matrix3d& Rb = fb_->R_auth;
+
+        if (auto authored = param_vec3({"axis", "reference_axis"})) {
+            const Vector3d p = perp_to_da(*authored);
+            if (p.norm() < 1e-6)
+                throw std::runtime_error(
+                    "angle reference axis is parallel to the mate's first direction: "
+                    "no angle can be measured about it");
+            return unit(p);
+        }
+
+        std::vector<Vector3d> candidates;
+        if (!extra_.empty()) {
+            const MateGeom& g = extra_.front();
+            const Matrix3d& Re = (extra_owners_.front() == "a") ? Ra : Rb;
+            candidates.push_back(Ra.transpose() * (Re * g.dir_vector()));
+        }
+        candidates.push_back(Ra.transpose() * (Ra * da_l).cross(Rb * db_l));
+        candidates.push_back(ga_.kind == "plane" ? ga_.direction : ga_.normal);
+        candidates.push_back(Ra.transpose()
+                             * (Rb * (gb_.kind == "plane" ? gb_.direction : gb_.normal)));
+        Vector3d e1, e2;
+        perp_basis(da_l, e1, e2);
+        candidates.push_back(e1);
+
+        for (const Vector3d& cand : candidates) {
+            const Vector3d p = perp_to_da(cand);
+            if (p.norm() < 1e-6) continue;
+            return canonical_sign(unit(p));
+        }
+        return canonical_sign(e1);
     }
 
     // ----- concentric -----------------------------------------------------
@@ -1332,7 +1504,15 @@ MateSolveResult solve_mates(const json& components, const json& mates,
         std::string cid = comp.at("id").get<std::string>();
         Vector3d t, w;
         Matrix3d R_authored = Matrix3d::Identity();
-        std::vector<double> tf;
+        // The document's own placement, read whatever the warm map says: it is the pose a
+        // fixed component is pinned at, and the frame every derived mate reference is
+        // expressed in.
+        std::vector<double> tf = comp.contains("transform") && !comp["transform"].is_null()
+            ? comp["transform"].get<std::vector<double>>()
+            : kIdentity16;
+        if (tf.size() != 16) tf = kIdentity16;
+        Vector3d t_auth, w_auth;
+        transform_to_params(tf, t_auth, w_auth, &R_authored);
         // A fixed component's pose is AUTHORED, never solved: it must come from
         // `transform`, never from the warm map. `warm` carries the previous solve's params
         // for every component (fixed included, see the fill below), so reading it here
@@ -1343,17 +1523,15 @@ MateSolveResult solve_mates(const json& components, const json& mates,
             t = wit->second.first;
             w = wit->second.second;
         } else {
-            tf = comp.contains("transform") && !comp["transform"].is_null()
-                ? comp["transform"].get<std::vector<double>>()
-                : kIdentity16;
-            if (tf.size() != 16) tf = kIdentity16;
-            transform_to_params(tf, t, w, &R_authored);
+            t = t_auth;
+            w = w_auth;
         }
         CompFrame frame;
         frame.id = cid;
         frame.t0 = t;
         frame.w0 = w;
         frame.fixed = fixed;
+        frame.R_auth = fixed ? R_authored : rodrigues_impl(w_auth);
         if (fixed) {
             // Hard constraint, carried by the document's own numbers: the residuals see the
             // authored rotation block and the result echoes the authored 16 doubles.

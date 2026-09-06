@@ -9,7 +9,9 @@
 #include "mate/mate.h"
 
 #include <cmath>
+#include <optional>
 #include <random>
+#include <string>
 
 using namespace chudware::mate;
 using nlohmann::json;
@@ -430,4 +432,274 @@ TEST_CASE("the convergence threshold is absolute in mm however big the assembly"
     json small = seat(60.0);
     CHECK(small["tolerance"].get<double>() == 1e-9);
     CHECK(small["converged"].get<bool>());
+}
+
+// ME 490 phase 5F item 5: the steer joint's angle mate could not be driven at all. At
+// exactly 0 deg it came back `status: redundant` with residual 0 — `da . db - cos(target)`
+// has derivative -sin(theta) in the angle it controls, so at 0 deg (and at 180 deg) its
+// Jacobian row is EXACTLY ZERO and the mate adds no rank: the solver cannot drive it.
+// Authored 10 deg off zero the same first-order-flat residual stalled the LM at 3.589e-03
+// across three passes, and simulate_motion refused the sweep ("contains unresolved or
+// non-converged frames"). A dot product also cannot tell +30 deg from -30 deg, so a sweep
+// folded at zero instead of passing through it. The residual is now the SIGNED angle about
+// the mate's reference axis — atan2(ref . (da x db), da.db - (da.ref)(db.ref)) — whose
+// derivative is 1 per radian of relative rotation at every angle, zero included.
+namespace {
+
+const double kRad2Deg = 180.0 / std::acos(-1.0);
+const double kDeg2Rad = std::acos(-1.0) / 180.0;
+
+MateGeom mgeom(const std::string& kind, Vector3d p, Vector3d n, Vector3d d) {
+    MateGeom g;
+    g.kind = kind;
+    g.point = p;
+    g.normal = n;
+    g.direction = d;
+    return g;
+}
+
+// A steer joint: a fixed post and a free upright pinned to spin about the post's +z by a
+// concentric + coincident pair (1 DOF on their own), with ONE angle mate as the driver.
+// Both angle refs are the components' local +x, so the upright's solved spin about z IS
+// the angle the mate asks for. `seed_deg` is the authored, pre-solve spin.
+struct SteerRig {
+    json components;
+    json mates;
+    ResolvedGeometry geom;
+};
+
+// `first_ref_moves` puts the FREE component first on every mate, so the angle mate's
+// reference axis (which is carried by its first component) is itself being solved for.
+SteerRig steer_rig(double seed_deg, double angle_deg, const std::string& align = "aligned",
+                   const json& value_extra = json::object(),
+                   bool first_ref_moves = false) {
+    SteerRig rig;
+    rig.components = json::array();
+    rig.components.push_back({{"id", "post"}, {"transform", ident16()}, {"fixed", true}});
+    rig.components.push_back({{"id", "upright"},
+                              {"transform", xform({0, 0, 0}, {0, 0, seed_deg * kDeg2Rad})},
+                              {"fixed", false}});
+    json value = {{"value", angle_deg}, {"expr", nullptr}};
+    for (auto it = value_extra.begin(); it != value_extra.end(); ++it)
+        value[it.key()] = it.value();
+    auto refs = first_ref_moves
+        ? json{{{"component", "upright"}}, {{"component", "post"}}}
+        : json{{{"component", "post"}}, {{"component", "upright"}}};
+    rig.mates = json::array();
+    rig.mates.push_back({{"id", "bore"}, {"type", "concentric"}, {"align", "aligned"},
+                         {"refs", refs}});
+    rig.mates.push_back({{"id", "seat"}, {"type", "coincident"}, {"align", "aligned"},
+                         {"refs", refs}});
+    rig.mates.push_back({{"id", "steer"}, {"type", "angle"}, {"align", align},
+                         {"refs", refs}, {"value", value}});
+    rig.geom[{"bore", 0}] = mgeom("axis", {0, 0, 0}, {0, 0, 1}, {0, 0, 1});
+    rig.geom[{"bore", 1}] = mgeom("axis", {0, 0, 0}, {0, 0, 1}, {0, 0, 1});
+    rig.geom[{"seat", 0}] = mgeom("plane", {0, 0, 0}, {0, 0, 1}, {1, 0, 0});
+    rig.geom[{"seat", 1}] = mgeom("plane", {0, 0, 0}, {0, 0, -1}, {1, 0, 0});
+    rig.geom[{"steer", 0}] = mgeom("axis", {0, 0, 0}, {0, 0, 1}, {1, 0, 0});
+    rig.geom[{"steer", 1}] = mgeom("axis", {0, 0, 0}, {0, 0, 1}, {1, 0, 0});
+    return rig;
+}
+
+// The upright's world spin about z, in degrees: the direction its local +x came out at.
+double spin_deg(const MateSolveResult& out) {
+    const std::vector<double>& M = out.transforms.at("upright");
+    return std::atan2(M[4], M[0]) * kRad2Deg;
+}
+
+std::string status_of(const MateSolveResult& out, const std::string& mid) {
+    for (const MateStatus& s : out.mate_status)
+        if (s.mate_id == mid) return s.status;
+    return "missing";
+}
+
+double residual_of(const MateSolveResult& out, const std::string& mid) {
+    for (const MateResidual& r : out.residuals)
+        if (r.mate_id == mid) return r.max_abs;
+    return -1.0;
+}
+
+}  // namespace
+
+TEST_CASE("an angle mate at 0 deg is a constraint the solver can drive") {
+    SteerRig rig = steer_rig(/*seed_deg=*/10.0, /*angle_deg=*/0.0);
+    MateSolveResult out = solve_mates(rig.components, rig.mates, rig.geom);
+
+    REQUIRE(out.converged);
+    CHECK(out.max_residual < 1e-9);
+    CHECK(residual_of(out, "steer") < 1e-9);
+    // The mate carries rank AT zero: it takes up the last DOF the hinge pair left, and it
+    // is not a mate the classifier can drop. Both were the defect.
+    CHECK(out.dof == 0);
+    CHECK(status_of(out, "steer") == "ok");
+    // A 1e-9 rad residual leaves up to 6e-8 deg of pose error; a millionth of a degree
+    // is a bound on the POSE, not a restatement of the residual check above.
+    CHECK(std::abs(spin_deg(out)) < 1e-6);
+}
+
+TEST_CASE("an angle mate authored 10 deg off a parallel seed converges") {
+    // The reported stall: the two references start exactly parallel (the singular
+    // configuration) and the mate asks for 10 deg. The old residual was 1 - cos(10 deg)
+    // = 1.5e-2 with a zero gradient, so the LM had no direction to move in.
+    SteerRig rig = steer_rig(/*seed_deg=*/0.0, /*angle_deg=*/10.0);
+    MateSolveResult out = solve_mates(rig.components, rig.mates, rig.geom);
+
+    REQUIRE(out.converged);
+    CHECK(out.max_residual < 1e-9);
+    CHECK(residual_of(out, "steer") < 1e-9);
+    CHECK(status_of(out, "steer") == "ok");
+    CHECK(std::abs(spin_deg(out) - 10.0) < 1e-6);
+}
+
+TEST_CASE("180 deg is not singular either") {
+    SteerRig rig = steer_rig(/*seed_deg=*/175.0, /*angle_deg=*/180.0);
+    MateSolveResult out = solve_mates(rig.components, rig.mates, rig.geom);
+
+    REQUIRE(out.converged);
+    CHECK(out.max_residual < 1e-9);
+    CHECK(out.dof == 0);
+    CHECK(status_of(out, "steer") == "ok");
+    CHECK(std::abs(std::abs(spin_deg(out)) - 180.0) < 1e-6);
+}
+
+// What simulate_motion does to a driven dimensional mate: re-solve the same document at
+// each sample, warm-starting from the previous frame. Every frame must SOLVE — a single
+// non-converged frame makes the whole study refuse.
+TEST_CASE("a driven angle mate sweeps through its whole range") {
+    auto sweep = [](double start, double stop, int steps) {
+        std::optional<WarmMap> warm;
+        for (int i = 0; i < steps; ++i) {
+            const double target =
+                start + (stop - start) * static_cast<double>(i) / (steps - 1);
+            SteerRig rig = steer_rig(/*seed_deg=*/0.0, target);
+            MateSolveResult out = solve_mates(rig.components, rig.mates, rig.geom, warm);
+            warm = out.params;
+
+            INFO("target = " << target << " deg");
+            REQUIRE(out.converged);
+            CHECK(out.max_residual < 1e-9);
+            CHECK(residual_of(out, "steer") < 1e-9);
+            CHECK(status_of(out, "steer") == "ok");
+            CHECK(out.dof == 0);
+            // The pose TRACKS the driver, with its sign: this is what a motion study
+            // renders, and what a dot-product residual could not express.
+            CHECK(std::abs(spin_deg(out) - target) < 1e-6);
+        }
+    };
+
+    SUBCASE("0 -> 60 deg in 5 deg steps") { sweep(0.0, 60.0, 13); }
+    // Straight THROUGH zero, from one side to the other. A dot-product residual is even
+    // in theta, so the negative half of this sweep came back as its own mirror image and
+    // the frames stopped moving at zero.
+    SUBCASE("-30 -> +30 deg through zero") { sweep(-30.0, 30.0, 13); }
+}
+
+// The reference axis a signed angle is measured about can be NAMED on the mate — which is
+// what an assembly whose angle mate sits at 0 deg needs, since a derivation has no relative
+// rotation there to read the joint axis off. Reversing it reverses the sign of the mate.
+TEST_CASE("an angle mate's reference axis can be authored") {
+    SteerRig up = steer_rig(0.0, 30.0, "aligned", {{"axis", {0, 0, 1}}});
+    MateSolveResult out_up = solve_mates(up.components, up.mates, up.geom);
+    REQUIRE(out_up.converged);
+    CHECK(std::abs(spin_deg(out_up) - 30.0) < 1e-6);
+
+    SteerRig down = steer_rig(0.0, 30.0, "aligned", {{"axis", {0, 0, -1}}});
+    MateSolveResult out_down = solve_mates(down.components, down.mates, down.geom);
+    REQUIRE(out_down.converged);
+    CHECK(std::abs(spin_deg(out_down) + 30.0) < 1e-6);
+
+    // An axis along the direction being measured describes no angle at all. Authored
+    // input is refused, not silently replaced by a derived axis.
+    SteerRig bad = steer_rig(0.0, 30.0, "aligned", {{"axis", {1, 0, 0}}});
+    MateSolveResult out_bad = solve_mates(bad.components, bad.mates, bad.geom);
+    CHECK(status_of(out_bad, "steer") == "unresolved");
+}
+
+// `align: anti` measures to the opposite of the second reference's direction, as it does
+// for every other direction mate in the solver: an anti target of A deg is the aligned
+// A - 180 deg. Before the reformulation an angle mate ignored `align` entirely.
+TEST_CASE("an anti-aligned angle mate measures to the reversed direction") {
+    SteerRig rig = steer_rig(/*seed_deg=*/10.0, /*angle_deg=*/180.0, "anti");
+    MateSolveResult out = solve_mates(rig.components, rig.mates, rig.geom);
+
+    REQUIRE(out.converged);
+    CHECK(out.max_residual < 1e-9);
+    CHECK(std::abs(spin_deg(out)) < 1e-6);
+}
+
+// Every case above pins the mate's FIRST component (the reference axis rides on it, so
+// its Jacobian block and the axis's own derivative are both zero there). With the moving
+// component first, all three blocks of the row — d/d(da), d/d(db) and d/d(ref) — are
+// live: an angle measured about an axis that is itself being solved for. The angle is
+// signed from the first reference to the second, so swapping them negates it.
+TEST_CASE("an angle mate is exact when its first reference is the one that moves") {
+    std::optional<WarmMap> warm;
+    for (double target : {-30.0, -15.0, 0.0, 15.0, 30.0}) {
+        SteerRig rig = steer_rig(/*seed_deg=*/0.0, target, "aligned", json::object(),
+                                 /*first_ref_moves=*/true);
+        MateSolveResult out = solve_mates(rig.components, rig.mates, rig.geom, warm);
+        warm = out.params;
+
+        INFO("target = " << target << " deg");
+        REQUIRE(out.converged);
+        CHECK(out.max_residual < 1e-9);
+        CHECK(residual_of(out, "steer") < 1e-9);
+        CHECK(out.dof == 0);
+        CHECK(status_of(out, "steer") == "ok");
+        CHECK(std::abs(spin_deg(out) + target) < 1e-6);
+    }
+}
+
+// The reference axis is derived from the DOCUMENT's poses, never from the solver's seed.
+// A driven sweep warm-starts each frame from the previous one, so a warm-derived axis is
+// re-derived per frame — and where the sweep passes through zero the two directions are
+// parallel, their cross product is gone, and the derivation silently falls back to a
+// different axis for that frame alone. Here the joint turns about +X while the fallback
+// guess is the component's local +Z: an axis that swaps mid-sweep does not just change
+// the sign, it asks for a rotation the hinge cannot make, and the frame fails to solve.
+TEST_CASE("a sweep through zero measures one axis, not one per frame") {
+    // Hinge about +X; the measured directions are the components' local +Y. The angle
+    // geoms carry the resolver's default companion (+Z), which is NOT the hinge axis, so
+    // only the authored 8 deg of relative rotation names +X.
+    auto hinge_rig = [](double target) {
+        SteerRig rig;
+        rig.components = json::array();
+        rig.components.push_back({{"id", "post"}, {"transform", ident16()}, {"fixed", true}});
+        rig.components.push_back({{"id", "upright"},
+                                  {"transform", xform({0, 0, 0}, {8.0 * kDeg2Rad, 0, 0})},
+                                  {"fixed", false}});
+        auto refs = json{{{"component", "post"}}, {{"component", "upright"}}};
+        rig.mates = json::array();
+        rig.mates.push_back({{"id", "bore"}, {"type", "concentric"}, {"align", "aligned"},
+                             {"refs", refs}});
+        rig.mates.push_back({{"id", "seat"}, {"type", "coincident"}, {"align", "aligned"},
+                             {"refs", refs}});
+        rig.mates.push_back({{"id", "steer"}, {"type", "angle"}, {"align", "aligned"},
+                             {"refs", refs},
+                             {"value", {{"value", target}, {"expr", nullptr}}}});
+        rig.geom[{"bore", 0}] = mgeom("axis", {0, 0, 0}, {0, 0, 1}, {1, 0, 0});
+        rig.geom[{"bore", 1}] = mgeom("axis", {0, 0, 0}, {0, 0, 1}, {1, 0, 0});
+        rig.geom[{"seat", 0}] = mgeom("plane", {0, 0, 0}, {1, 0, 0}, {0, 0, 1});
+        rig.geom[{"seat", 1}] = mgeom("plane", {0, 0, 0}, {-1, 0, 0}, {0, 0, 1});
+        rig.geom[{"steer", 0}] = mgeom("axis", {0, 0, 0}, {0, 0, 1}, {0, 1, 0});
+        rig.geom[{"steer", 1}] = mgeom("axis", {0, 0, 0}, {0, 0, 1}, {0, 1, 0});
+        return rig;
+    };
+
+    std::optional<WarmMap> warm;
+    for (int i = 0; i < 9; ++i) {
+        const double target = -20.0 + 5.0 * i;
+        SteerRig rig = hinge_rig(target);
+        MateSolveResult out = solve_mates(rig.components, rig.mates, rig.geom, warm);
+        warm = out.params;
+
+        INFO("target = " << target << " deg");
+        REQUIRE(out.converged);
+        CHECK(out.max_residual < 1e-9);
+        CHECK(status_of(out, "steer") == "ok");
+        CHECK(out.dof == 0);
+        // Spin about +X, read off the upright's local +Y.
+        const std::vector<double>& M = out.transforms.at("upright");
+        CHECK(std::abs(std::atan2(M[9], M[5]) * kRad2Deg - target) < 1e-6);
+    }
 }

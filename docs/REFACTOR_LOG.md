@@ -2422,3 +2422,330 @@ pixel budget otherwise drives the render to its floor. Verified in the productio
 (not authenticated on this box). Product side needed nothing: `core/cam/stock_sim` + the host's
 CAM HUD already do dexel stock removal with playback (`host/src/ui/cam/cam_panel.cpp`,
 `host/src/ui/viewport_panel.cpp` aux mesh).
+## A whole refinement wave is not the unit a fold should be judged on (2026-09-06)
+
+**What went wrong.** `contact.interface_size_mm = 0.35` on the FRAME-PEDAL-BRAKE keyway bore
+stalled at 2.434 mm after 7 Rivara LEB waves and the study refused. Three separate mistakes,
+each hiding the next. (1) The wave gate judged every cell of the whole refined mesh against
+`pm::mesh::validity::kCellShapeFloor` (0.02) — a SHIP-QUALITY target, not a validity bound —
+and discarded the entire wave when one cell missed it. Bisection legitimately produces cells
+under 0.02 on an anisotropic wedge and the fill itself ships some, so from wave 8 on every
+wave was vetoed, projected and plain-chord alike. Downstream needs far less: `mesh_quality`
+refuses a cell only when `|6V|` is under `64·eps·max(1, span³)` and the quadratic promotion
+needs a positive Jacobian. (2) The fold the gate was reacting to is a per-EDGE fact, not a
+per-wave one: `local_refine_tets` projects free-surface mid-edge nodes onto the CAD surface,
+and where the chord sag is large that "closest point" has stopped describing the curve the
+edge belongs to — through a thin wall, across a hole rim — so it drags the node through the
+material ("element 113043 is degenerate, inverted, or has a sign-changing Jacobian").
+(3) The delivered size was measured as the coarsest single boundary face in the core while
+the contact guard measures a MEDIAN of per-node mean boundary-edge length, so one stretched
+face could report a 70% miss on a mesh the guard was happy with.
+
+**What changed.** `local_refine.cpp` gates the projection on its own measured chord sag —
+`|projected − chord|` IS `L²κ/8`, no curvature estimate needed — and keeps it only while that
+sag is under a fifth of the child size being created; otherwise the node goes on the Euclidean
+chord and is counted in the new `LocalRefineStats::n_chord_mids`. `mesher.cpp` judges a wave
+on `kWaveDegenerateFloor` (1e-5 shape quality, nine orders above the downstream degeneracy
+test and comfortably positive for promotion) instead of the ship floor, counts what is left
+under 0.02 rather than refusing on it, and gained `smooth_nodes`: a bounded boundary-aware
+pass over an explicit movable set that makes two per-node decisions — a FIDELITY move
+(project onto the CAD surface, line-searched 1/½/¼ of the way, capped at the node's own
+shortest incident edge, accepted when the star stays positive and ends either healthy or no
+worse) and a QUALITY move (umbrella relaxation, tangential-and-reprojected on the boundary,
+accepted only on a strictly improving star). It runs on each wave's own new nodes, then once
+more at the end over the core's boundary nodes unioned with the corners of every sub-floor
+cell. `scan` now returns the 90th percentile of the per-node mean boundary-edge length —
+the guard's statistic, one percentile stricter — and `kLocalContractSlack` moved to
+`mesher.h` so `fea_run`'s refusal and the mesher's own last-resort re-fill cannot disagree.
+That re-fill (`deliver_contract_by_refill`) is the specified last resort before a refusal:
+when bisection still misses, the solid is re-filled at a 4×request background so the graded
+lattice places the request on its own children, guarded by polymesh's grid-cell-budget floor
+and an element-count prediction, keeping the bisected mesh unless the re-fill is strictly
+finer.
+
+**Measured, keyway isolate** (`keep_bodies [715,724]`, fixture F7b4f57, 1500 N −Z on F8fd7b4,
+`max_gap_mm` 0.4, order 1, in-process libchudware, `core/build-fix`, 12 G scope). The
+contact guard measures a delivered `h_interface_mm` of 0.2535 mm for a 0.35 mm request and
+0.3377 mm for a 0.5 mm request; pre-fix the same isolate refused at 2.434 mm. The 0.35 mm leg
+SOLVES — 11 active pairs, `contact_pressure_reliable:true`, 454376 tet4 / 101702 nodes,
+297 s, 0.77 GB peak RSS. The curvature gate declines ~520 projections per run on the post;
+the fidelity round moves ~11k nodes back onto the face and cuts the coarse fill's interface
+residual (its own note: `snap max|d| = 1.21 mm` at the governor's 13.94 mm background) to
+0.40 mm max / 4.7e-3 mm mean. The re-fill fallback was exercised end to end on this geometry
+while the measure was still a raw max: "bisection stalled at 0.6014 mm … RE-FILLED at a
+1.4 mm background … delivers 0.4469 mm in 2511712 element(s)".
+
+**Gotchas.** The fidelity round must run AFTER the waves, never before: on the coarse mesh a
+node's shortest incident edge is a whole background cell, and the same accept test that is
+conservative on a 0.3 mm star lets a coarse one move millimetres and distorts the faces the
+waves are about to bisect (measured: a pre-wave round left 0.484 mm residual and −0.248 mm
+closest approach against 0.034 mm / −0.0198 mm without it). And the re-fill fallback is only
+safe behind the percentile measure — with the old max-based one it fired on the keyway for a
+size bisection had already delivered and bought a 2.7M-element whole-solid re-fill, whose
+2.08M-DOF solve then wanted 60.7 GB. And the sag gate is OPT-IN
+(`local_refine_tets`' `max_sag_fraction`, 0.2 from Chudware, 0 by default): the Cartesian
+fills' own multi-level LEB has parent edges a whole lattice cell long, so the sag on a coarse
+curved wall is legitimately large, and gating it there cost `test_curved_mesh_quality`'s
+cylinder_prism 0.0350 mm of boundary residual against its 0.0128 mm bound.
+
+What is NOT fixed and is not a mesher matter: the two bodies as placed touch — median pair
+gap 0.352 mm (the nominal radial clearance) but closest approach at or below zero — so
+`fea_contact`'s `seat_limit = 2·min_gap0` collapses to 0 and only pairs at gap ≤ 0 can seat.
+That population is a knife edge whose size is mesh luck: across runs the 0.5 mm leg seated
+8, 12, 13 and then 2 pairs, and at 2 the study is (correctly) refused as a point-load
+artefact even though the SIZE was delivered at 0.3377 mm. The delivered size is now honest;
+the seating population needs a contact-model answer (a seat limit that is a length, not a
+multiple of a possibly-negative closest approach), not a finer mesh.
+
+**Files.** `core/sim/mesher.cpp`, `core/sim/mesher.h` (`kLocalContractSlack`),
+`core/sim/fea_run.cpp` (uses it), `core/tests/test_mesher_advanced.cpp` (the flat-pad case's
+refusal branch now accepts only an element-ceiling refusal, plus a new seated pin-in-bore
+case), and in Hunter's Polyhedral-FEA tree `src/mesh/src/local_refine.cpp` +
+`include/mesh/local_refine.hpp`.
+
+## An angle mate is a signed angle about an axis, not a dot product (2026-09-06)
+
+**What went wrong.** ME 490 phase 5F could not animate its steer joint. `core/mate/mate.cpp`'s
+`angle()` residual was `da . db - cos(target)`, whose derivative in the angle it controls is
+`-sin(theta)`: at 0 deg and at 180 deg the Jacobian row is EXACTLY ZERO, so the mate added no
+rank at all — reported `status: redundant` with residual 0, dof left over, and the solver
+literally could not drive it. Authored 10 deg off zero the same first-order-flat residual
+stalled the LM at 3.589e-03 across three passes and `simulate_motion` refused the sweep. And a
+dot product cannot tell +30 deg from -30 deg: measured end to end through the engine, a
+pre-fix sweep of `simulate_motion` from -30 deg to +60 deg went -30 -> 0 (stalling at
+-0.0024 deg where the driver asked for 0) and then FOLDED — driver +5 gave pose -5, driver
++60 gave pose -60, the whole positive half a mirror image of the negative one.
+
+**What changed.** The residual is now the SIGNED angle about a reference axis:
+`theta = atan2(ref . (da x db), da.db - (da.ref)(db.ref))`, the angle from `da` to `db`
+measured on their projections into the plane perpendicular to `ref`, wrapped into (-pi, pi]
+against the target. Numerator and denominator are both bilinear in (da, db), so the quotient
+needs no normalization and is exactly invariant to their lengths; `d(theta)` is 1 per radian of
+relative rotation at EVERY angle, zero included, so the row always carries rank. The analytic
+Jacobian carries all three blocks — `d/d(da)`, `d/d(db)` and `d/d(ref)` — because `ref` is a
+direction attached to the mate's FIRST component and turns with it. Residuals for an angle mate
+are now RADIANS (documented on `MateResidual`), and `align: "anti"` finally means something:
+it measures to the reversed second direction, so an anti target of A deg is the aligned
+A - 180 deg. `angle_limit` is untouched.
+
+**The reference axis.** Priority: (1) authored on the mate as
+`value: {"value": <deg>, "axis": [x,y,z]}` (alias `reference_axis`) in the FIRST ref's
+component-local frame; (2) a third resolved geometry ref; (3) the cross product of the two
+directions at the components' AUTHORED poses; (4) the geoms' companion vector (a plane's
+`direction`, an axis's `normal` — which the document's selector resolver leaves at the
+component's local +Z, so it is a guess); (5) any perpendicular of `da`. The derived cases are
+sign-canonicalized (`canonical_sign`), because a cross product flips as an assembly passes
+through 0 deg and a reference that flips is a mate whose +30 deg silently becomes -30 deg
+mid-sweep. **Nothing in the derivation reads the solver's seed** — `CompFrame::R_auth` carries
+the document's own rotation whatever the warm map says. That is load-bearing: a driven sweep
+re-solves the same document warm-started from the previous frame, so a warm-derived axis is
+re-derived per frame and changes KIND (case 3 -> case 4) exactly at the frame that lands on
+zero. Measured: on a hinge about +X whose fallback guess is +Z, the warm-derived version fails
+to converge on the frame right after 0 deg; document-derived, all nine frames solve. Author the
+axis for any mate that sits at, or is driven through, 0 deg / 180 deg — case 4 is a guess.
+
+**Measured.** `core/build-AngleMate`, all green: mate (16 cases / 348 assertions),
+mate_corpus, simulate_motion, motion_dynamics, insert_component, op_registry. New cases in
+`core/tests/test_mate.cpp`: a 0-deg mate that is `ok` with dof 0 and residual < 1e-9 (pre-fix:
+`redundant`, dof 1, pose 0.0024 deg off); the 10-deg-off-parallel-seed case converging to
+< 1e-9 and 10.000000 deg (pre-fix: -10 deg, the mirror branch); driven sweeps 0 -> 60 deg and
+-30 -> +30 deg through zero, every step converged with residual < 1e-9, no `redundant` status
+and the pose tracking the driver to < 1e-6 deg; 180 deg; an authored reference axis and its
+reversal; the anti convention; the moving-component-first case (the only one that exercises the
+`d/d(da)` and `d/d(ref)` blocks); and the off-Z hinge sweep above. End to end through
+`libchudware`, `simulate_motion` on the engine's own swinging-arm network sweeps -30 -> +60 deg
+with `ok: true`, all 19 frames converged and the pose equal to the driver at every one.
+
+**Files.** `core/mate/mate.cpp` (`wrap_pi`, `canonical_sign`, `CompFrame::R_auth`, the authored
+transform now always parsed in `solve_mates`, `MateBuilder::param_vec3`,
+`MateBuilder::angle_reference_local`, `MateBuilder::angle`), `core/mate/mate.h` (angle-mate
+authoring note + the radians unit on `MateResidual`), `core/tests/test_mate.cpp`.
+
+## Contact studies: the seat is a length, the load path is a verdict, a selector may not span the interface (2026-09-06)
+
+**What went wrong (ME 490 keyway).** Three defects hid behind one converged-looking contact packet.
+The seat limit was `2 * min_gap0`, so bodies placed touching (closest approach <= 0) seated only
+pairs at gap <= 0 and the seated set was run-to-run mesh luck (8/12/13/2 pairs on identical
+requests); the active set also started with EVERY candidate glued, so iteration 1 carried k*gap0
+of TENSILE preload (a measured 3.0e6 MPa "pressure" = 56 kN of penetration). A fixture cylinder
+filter with `perp_tol_mm 1.5` across a 0.35 mm clearance captured the MATING body's bore nodes as
+fixed too, grounding both bodies — the joint carried 0 N in either load direction and the study
+still converged with equilibrium error 2e-10 %. And `contact_pressure_reliable` was true with
+6 pairs carrying 9.9 N of a 1500 N load.
+
+**What changed.** `core/sim/fea_contact.*`: `seat_limit_mm = max(0.5*h_interface,
+0.25*max_gap_mm, 1e-4)`; negative initial gaps are clamped to 0 and reported as
+`initial_penetration_max_mm` (never turned into force); `FeaContactOptions::seat_tolerance_mm`
+starts the active set at the seated rung (closed, then seatable, then all) so the seated set is
+deterministic — the keyway now reproduces to the last digit on consecutive runs. A rejected
+alternative ("adjust to touch") is recorded at fea_contact.cpp:442 with its numbers: it makes the
+seated arc a function of element size. `contact.load_path{applied_n, carried_n, fraction, note}`
+and `contact_carries_load`: reliability now requires >= 50 % of the applied resultant on bodies
+held only by contact to cross the interface; a doubly-grounded interface reports
+`contact_carries_load:false` with a REDUNDANT-path note. New `core/sim/fea_selection.{h,cpp}`
+(chudware_sim, testable without OCCT): a fixture or load selector whose nodes land on BOTH bodies
+of a declared candidate pair group is refused before the solve with
+`selection_spans_contact{kind, selector, bodies, nodes_captured, body_nodes, median_gap_mm,
+min_gap_mm}`; facesets now carry the caller's `selector` text; the MCP layer warns pre-solve when a
+plane/cylinder filter's `perp_tol_mm` exceeds `max_gap_mm`. Also this wave: `run_fea_static`
+takes an exact `mesh_size_mm` (refused beside a non-default fineness), `run_fea_convergence`
+takes `vtu_dir` (one field per leg, `released_leg` named in the reply and hashed by
+`sim_evidence_packet`); `steering_turning_radius`/`sweep_envelope`/`render_animation(kind=motion)`
+accept `steer=` (uprights driven about a kingpin on a detached clone; ICR from posed axle lines,
+4WS via `rear_steer`) and `render_animation` a `poses=` frame list; the motion encoder's frame-hold
+path was materialising only rendered samples (3 of 8 frames) and now always writes the ordered
+sequence.
+
+**Measured.** ctest `fea_contact` 10 cases (seat determinism: seated arc 4.17/3.64/3.61 mm across
+three sizes, byte-identical across two runs; selector span refused at perp_tol 1.5, solves at 0.15
+with 1487.8 N through 12 pairs; load path 4000/4000 N fraction 1.000 vs 0/4000 doubly grounded);
+`mesher_advanced` and `mesh_mechanism` unchanged; `test_cad_motion_tools.py` 22 (Ackermann radius
+to 1e-9, 4WS exactly half); `test_animation_tools.py` 6; `test_fea_static_suite.py` +3 live
+(mesh_size_mm → same element count as `sim_mesh` at that size; two per-leg VTUs).
+
+## A contact clearance is a property of the surfaces, not of the facets (2026-09-06)
+
+**What went wrong.** ME 490 O-22 (HINGE-LATCH-LOCAL) was refused at every setting because the
+resolution guard measured the pin/saddle clearance on the MESH. A candidate pair is two boundary
+NODES, so the gap it records is `n̂·(p_b − p_a)` = `r_bore·cos(dtheta) − r_pin`, where `dtheta` is
+however far apart the two meshes happened to sample the arc — up to a whole element of lateral
+offset, because that IS the pairing tolerance. On a Ø12.000 pin in a Ø12.600 saddle
+(`check_interference`: 0.2999999510990425 mm) the 1899 candidates' closest approach read
+**0.03665 mm**: facet sampling ate **87.8 %** of the real clearance. The guard then correctly
+refused a ratio of 48.4 against its limit of 4 and prescribed an interface size of **0.147 mm**,
+which no fill on the machine can place at any background size — and the advice was illegal
+anyway (`GradedSizing: need 0 < h_min <= h_max`). The number the whole refusal chain rested on
+was simply not the clearance. On a coarser ring the same measurement flips SIGN: the new ctest's
+r 6.000-in-r 6.300 case reads **−0.247 mm** on a fit that is 0.300 mm apart, i.e. the facets
+report interference, the guard loses the clearance criterion altogether, and
+`initial_penetration_max_mm` reports 0.247 mm of discretization artefact as if it were geometry.
+
+**What changed.** `ContactCandidateOptions::gap_probe` (new `ContactGapProbe` interface in
+`core/sim/fea_contact.h`) measures each candidate's gap as the SIGNED distance from the node to
+the other body's own analytic face, taking the closer of the two perpendicular measurements. The
+PAIRING is unchanged — which nodes face each other across how much lateral offset is a mesh
+question — but the recorded `gap0_mm`, and therefore the h/gap guard, the seat limit and the
+penetration accounting, are the CAD's. The facet value is kept beside it: `min_gap_facet_mm` /
+`median_gap_facet_mm` / `facet_error_mm` on the candidate set, `gap_facet_mm` / `facet_error_mm` /
+`gap_source` / `gap_fallback_nodes` in the `contact.resolution` block and in both the note and the
+refusal text. A pair whose ANALYTIC gap exceeds `max_gap_mm` (the facets had understated it) is
+dropped and counted in `gap_beyond_max_pairs` — `max_gap_mm` is the caller's statement of what
+counts as contact. A node with no CAD attribution (repaired/dissolved region, inline mesh) keeps
+the facet gap and is counted in `gap_fallback_nodes`; nothing regresses without a probe, which is
+how `test_fea_contact`'s ten existing cases stayed bit-identical.
+`detail::make_cad_gap_probe` (`core/sim/fea_run.{h,cpp}`, the only OCCT in that TU) re-reads the
+study's own STEP/BREP, explodes it to solids, and answers with `BRepExtrema_DistShapeShape`
+against bbox-prefiltered faces plus `BRepClass3d_SolidClassifier` for the sign, memoized per
+(node, solid) — a node's own body is the solid whose boundary is nearest it, which is unambiguous
+because a boundary node lies ON its own surface and the partner is a whole clearance away. One
+guard-arithmetic fix rode along: `required_interface_size_mm` no longer takes `min(4*gap, h/2)`
+when the RATIO is the failing criterion. There `4*gap` is finer than `h` by construction and is
+exactly the size that makes the interface legal; halving `h` on top demanded twice the resolution
+the criterion needs (0.887 mm instead of 1.200 mm on the hinge). The `h/2` floor still applies
+where the geometric size would be COARSER than what the interface already has — an interface that
+funnelled at a legal ratio has to be refined to place more pairs.
+
+**Measured, hinge isolate** (`_src_C.step` bodies at volumes 79624.512 / 21488.494 mm³ — the
+evidence record's leaf-A plate and pin — re-exported as a two-solid STEP, meshed at an explicit
+1.2 mm tet4: 415916 elements / 82458 nodes, `core/build-fix`, 12 G scope). Facet-measured, the
+run reproduces the blocked report to every printed digit: 1899 candidate pairs, `h_interface`
+**1.774511 mm**, gap **0.0366475 mm**, ratio **48.4211**, required **0.146590 mm**. CAD-measured,
+the same mesh: gap **0.3000000 mm**, `gap_facet_mm` 0.0366475, `facet_error_mm` **0.2633525**
+(87.8 % — the report's own figure), ratio **5.9150**, required **1.200000 mm**, 1899 of 1899 pairs
+analytic, 0 fallback nodes, 0 dropped. End to end through `fea_run_static` on a synthetic
+r 6.000-in-r 6.300 fit at h = 1.5 mm: `gap_source: cad_faces`, gap 0.3 vs facets 0.171, ratio
+1.1147, **solves** — 201 active pairs, `contact_pressure_reliable: true`, 3996.68 N of 4000 N
+across the interface (fraction 0.99917), max displacement **0.329433 mm**, which is the 0.300 mm
+clearance plus 0.029 mm of squash: the solve recovers the analytic clearance as travel.
+
+**Files.** `core/sim/fea_contact.h` (`ContactGapProbe`, the facet-gap facts, the penetration
+semantics), `core/sim/fea_contact.cpp` (per-pair measurement, facet statistics, the refusal's
+clearance source, the required-size derivation), `core/sim/fea_run.h`
+(`detail::make_cad_gap_probe`), `core/sim/fea_run.cpp` (the probe, its attachment at candidate
+construction, `contact_resolution_json`'s four new fields, the two notes),
+`core/tests/test_fea_contact.cpp` (case (k), 11 cases / 315 assertions green).
+
+**Gotchas.** `fea_contact.cpp` is in `chudware_sim`, which is OCCT-FREE and is what
+`test_fea_contact` links — the probe is therefore an interface, the OCCT implementation lives in
+`chudware_mesh`, and the ctest supplies the closed-form nested-cylinder oracle instead.
+`BRepClass3d_SolidClassifier` is neither copyable nor movable (its solid explorer's copy ctor is
+private), so each body holds one by `unique_ptr`. The interface-refinement pre-pass
+(`contact.interface_size_mm`) deliberately keeps the facet measurement: it wants seed LOCATIONS,
+and since the facet gap only ever understates a curved clearance its candidate set is a superset
+of the analytic one. And the guard was never the conservative party here — the independent Hertz
+check in the blocked report needs h ≤ 0.136 mm for a 0.4082 mm patch, within 8 % of the 0.147 mm
+the facet-measured guard demanded; what was wrong was the clearance it was resolving, not the
+rule.
+
+## A local size request is the size field's h_min, so it may never exceed the background (2026-09-06)
+
+**What went wrong.** O-22's hinge saddle (`CONTACT_BLOCKED_2026-09-06b` §4) proved a box with no
+exit: at a 1.2 mm background every `contact.interface_size_mm` at or below 1.2 mm came back
+"not delivered", and the refusal's own advice — *"pass 2.874 mm or coarser"* — mesh-FAILED with
+`GradedSizing: need 0 < h_min <= h_max`. Reproduced exactly on a throwaway nested-cylinder
+saddle (r 6.000 in r 6.300, 62.28°, 144.03 mm): `REFINED MESH FAILED: solid 1: GradedSizing:
+need 0 < h_min <= h_max and beta > 0`. `local_size_field` passes the request straight in as the
+graded field's `h_min` against a `h_max` of the background, and a request coarser than the
+background is not a coarser request — it is an illegal one. It is also not an error condition:
+"no coarser than 2.9 mm" inside a 1.2 mm mesh is already true everywhere.
+
+**What changed.** `local_size_field` clamps the request into the field's own legal band at BOTH
+ends — `std::clamp(size_mm, h*0.25, h)` — so a coarse request collapses to the uniform
+background field, `deliver_local_contract` finds nothing to bisect, and the study runs (measured
+on the saddle: request 2.874 mm at a 1.2 mm background now meshes, 0 waves, delivered 0.979 mm,
+contract met). `fea_run.cpp`'s refusal was rewritten to name the binding limit and only ever
+quote a value inside `(0, background]`: it now states the background, the fill's own graded
+floor, that `interface_size_mm` IS the field's `h_min` and must satisfy
+`0 < interface_size_mm <= mesh_size_mm`, and offers the three legal remedies (a request in
+`[achieved, background]`, a `mesh_size_mm` of about 4x the request so the fill's own lattice
+places it, or a smaller isolate). The `achieved > background` case — stretched interface faces
+rather than merely unrefined ones — says so and does not pretend a legal request exists.
+
+**The wave loop stops when the CONTRACT is met, not when the last stretched edge is.**
+`deliver_local_contract`'s marks were a per-FACE maximum while the delivered size is the 90th
+percentile of the per-NODE mean boundary-edge length (the currency `fea_contact`'s guard reads).
+The two diverge exactly at the end: the fidelity round stretches individual faces by pulling one
+node back onto the CAD surface, and LEB closure leaves long diagonals, so the last waves chase
+edges the measure has already passed — and each of those waves DOUBLES the mesh. Marks are now
+every core face incident on a node whose own mean is still coarse, which is strictly
+conservative against the guard's median and makes the loop's termination test identical to the
+contract's. Measured on the pin-in-bore ctest: 11 waves → 6, delivered 0.264 → 0.304 mm for a
+0.35 mm request, and — the real surprise — active pairs 12 of 2402 → **1308 of 1647** on the
+flat pad and 16 → 82 on the bore, because a uniformly-sized interface seats where a
+differentially-refined one does not.
+
+**Cost.** `mesher_advanced`'s new bore case was over its own 90 s product bound (106.5 s). The
+profile put 52 % of it in polymesh's fill, run twice (coarse probe + refined), and the two
+hottest things in the fill were pure waste: `fea::element_jacobians_positive` ran the generic
+`eval_shape` Gauss loop with heap-allocated dynamic matrices for a tet4, whose isoparametric map
+is AFFINE and whose Jacobian determinant is exactly `6·V_signed` (one 3x3 determinant), and
+`tet4_aspect_quality`/`tet_shape_quality` took six square roots to find one longest edge they
+then cube. Both now have exact fast paths (`tet4_positive`, `mesh::max_edge_squared`) — same
+verdicts, byte-identical element counts and delivered sizes on the bore. Mesh wall time on that
+case: 55.1 s → 41.1 s; the whole ctest 106.5 s → **80.9 s**, and the hole-array bracket 88.6 s →
+25.6 s.
+
+**Gotchas.** `tet10_thin_wall` was red for MEMORY, not for a regression: polymesh's own curvature
+rule meshes the Ø60.325 x 4 mm tube at a 0.5x accuracy lattice (`h_bulk=2.857/h_L2~0.714` for a
+6 mm request), so 204 600 tet10 / 307 012 nodes is the intended mesh and its 921 k DOF solve
+needs 11.6 GB — under a `CHUDWARE_HEADROOM_GB=6` policy it wants ~17.6 GB free and fails the
+governor whenever a sibling agent holds RAM. Nothing in the product changed for it. And the
+"polymesh cell shape floor" the blocked report names no longer exists as a wave gate (BoreLEB
+replaced it with `kWaveDegenerateFloor`): the report was written against a staged build from
+before that landed, which is why its 2.874 mm pin and 0 waves do not reproduce.
+
+**Measured, throwaway saddle** (nested cylinders r 6.000 in r 6.300, 62.28° arc, 144.03 mm,
+coaxial 0.300 mm clearance, tet4, `interface_size_mm` 0.6 mm, `max_gap_mm` 0.35 mm):
+
+| background | delivered (90th pct) | guard median | LEB waves | elements |
+|---|---|---|---|---|
+| band default 4.279 mm | 0.575 mm | 0.5065 mm | 8 | 333 379 |
+| 5.611 mm | 0.586 mm | 0.5082 mm | 7 | 345 244 |
+| 1.200 mm | 0.569 mm | 0.4795 mm | 3 | 864 000 |
+
+Pre-fix the same interface reported 2.874 mm at every background with 0 waves.
+
+**Files.** `core/sim/mesher.cpp` (`local_size_field` clamp, `deliver_local_contract`'s `scan`
+marking on the measured statistic), `core/sim/fea_run.cpp` (the interface-contract refusal only),
+and in Hunter's Polyhedral-FEA tree `src/fea/src/element_validity.cpp`,
+`src/mesh/src/quality.cpp`, `src/mesh/include/mesh/cell_validity.hpp`.

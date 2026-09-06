@@ -24,10 +24,22 @@ the timing baseline lives in benchmarks/simsuite/.
 from __future__ import annotations
 
 import importlib.util
+import json
 import math
+import sys
+import time
 from pathlib import Path
 
 import pytest
+
+_ROOT = str(Path(__file__).resolve().parents[2])
+if _ROOT not in sys.path:
+    sys.path.insert(0, _ROOT)
+
+from services.mcp.cad_tools import register_cad_tools  # noqa: E402
+from services.mcp.sim_evidence_tools import (  # noqa: E402
+    register_sim_evidence_tools,
+)
 
 _CASES_PATH = (Path(__file__).resolve().parents[2]
                / "benchmarks" / "simsuite" / "fea_static_cases.py")
@@ -267,3 +279,163 @@ def test_native_curved_pressure_matches_lame():
     c = _cached(("lame_native",), lambda: fsc.case_annulus_lame_native("t"))
     assert c["status"] == "ok", c
     assert c["rel_err"] is not None and c["rel_err"] < 0.08, c
+
+
+# ------------------------- stated element size + released field (the MCP tool boundary)
+# The engine has honoured study.target_size_mm and study.vtu_path for a long time; what
+# no tool could ASK for was the combination. Measured twice in one ME 490 analysis
+# session (2026-09-06):
+#   * run_fea_static took only mesh_fineness, so the leg a ladder released could not be
+#     re-solved on ITS mesh — every .vtu written afterwards was attributed to a
+#     discretization nobody had solved; and
+#   * run_fea_convergence wrote no field at all, so a converged ladder had a table with
+#     nothing behind it and the packet's .vtu item could never close without a fourth
+#     solve.
+# These drive the real tools over the real engine and assert the mesh, the files and the
+# packet — not ok:true.
+
+_BOX = {"length": 80.0, "width": 40.0, "height": 20.0}
+_LOAD = [{"face": "top", "force": [0.0, 0.0, -800.0]}]
+
+
+class _CaptureMCP:
+    """FastMCP stand-in that just collects the @mcp.tool() registrations."""
+
+    def __init__(self) -> None:
+        self.tools: dict = {}
+
+    def tool(self, *args, **kwargs):
+        def dec(fn):
+            self.tools[kwargs.get("name", fn.__name__)] = fn
+            return fn
+        return dec
+
+
+@pytest.fixture(scope="module")
+def tools() -> dict:
+    m = _CaptureMCP()
+    register_cad_tools(m)
+    register_sim_evidence_tools(m)
+    return m.tools
+
+
+def _json(raw) -> dict:
+    assert isinstance(raw, str), f"a tool must return a JSON string, got {type(raw)}"
+    return json.loads(raw)
+
+
+def _box_doc(tools: dict, name: str) -> str:
+    r = _json(tools["new_part"](name=name))
+    assert r.get("ok"), r
+    doc = r["doc_id"]
+    rr = _json(tools["add_features"](doc_id=doc, ops=[
+        {"op": "add_feature",
+         "feature": {"type": "box", "name": "Blk", "params": _BOX}}]))
+    assert rr.get("ok"), rr
+    return doc
+
+
+def _finish(tools: dict, out: dict, key: str) -> dict:
+    """Resolve a reply that overran the transport budget and was handed to a job, so an
+    assertion here is about the solve and never a flake about a job id."""
+    jid = out.get("job_id")
+    if out.get(key) is not None or not jid:
+        return out
+    deadline = time.monotonic() + 600.0
+    while time.monotonic() < deadline:
+        job = _json(tools["get_job"](job_id=jid))
+        if job.get("status") in ("done", "completed", "error", "failed"):
+            result = job.get("result")
+            return result if isinstance(result, dict) else job
+        time.sleep(1.0)
+    raise AssertionError(f"backgrounded solve {jid} did not finish in 600 s")
+
+
+def _packet(tools: dict, out_dir, case: str, result: dict, geometry: str) -> dict:
+    return _json(tools["sim_evidence_packet"](
+        case_id=case, requirement_id="REQ-MESH", out_dir=str(out_dir),
+        study_result=result, geometry_path=geometry,
+        material_source="registry row: steel",
+        load_rationale="800 N down on the top face of a fully fixed base",
+        notes="mesh-plumbing regression case"))
+
+
+def test_stated_mesh_size_is_the_mesh_that_solved_and_its_field_reaches_the_packet(
+        tools, tmp_path):
+    """`mesh_size_mm` must reach study.target_size_mm, not be swallowed by the fineness
+    dial: the element count the solve reports has to equal an INDEPENDENT sim_mesh of the
+    same STEP at the same 6 mm (a fineness-derived mesh of this box is nowhere near it).
+    The requested .vtu must exist, and the packet must hash it — that pair is what lets a
+    released convergence leg be re-solved into a citable field."""
+    doc = _box_doc(tools, "explicit_mesh_size")
+    vtu = tmp_path / "released.vtu"
+    out = _finish(tools, _json(tools["run_fea_static"](
+        doc_id=doc, fixtures=["bottom"], loads=_LOAD, material="steel",
+        mesh_size_mm=6.0, vtu_path=str(vtu))), "summary")
+    assert out.get("ok"), out
+    assert out["vtu_path"] == str(vtu), out.get("vtu_path")
+    assert vtu.stat().st_size > 0, "the solve reported a vtu_path but wrote no field"
+
+    step = str(tmp_path / "box.step")
+    fsc._cb().call("doc_export_step", {"doc_id": doc, "path": step})
+    direct = fsc._cb().call("sim_mesh", {"step_path": step, "order": 2,
+                                        "fineness": 0.5, "target_size_mm": 6.0})
+    assert direct.get("ok"), direct
+
+    packet = _packet(tools, tmp_path / "packets", "BOX-MESH-6MM", out, step)
+    assert packet.get("ok"), packet
+    prov = json.loads(
+        (Path(packet["packet_dir"]) / "provenance.json").read_text(encoding="utf-8"))
+    assert prov["mesh_quality"]["n_elems"] == direct["n_elems"], (
+        f"solved {prov['mesh_quality']['n_elems']} elements, a direct 6 mm mesh has "
+        f"{direct['n_elems']} — the stated size did not reach the mesher")
+    assert packet["vtu_sha256"], packet
+
+
+def test_convergence_legs_write_one_field_each_and_the_reply_names_the_released_one(
+        tools, tmp_path):
+    """Every leg writes its OWN field into vtu_dir, named for its position, size and
+    element order; each row carries that path; the reply names the finest solved leg as
+    the released one, and handing the whole reply to sim_evidence_packet hashes exactly
+    that leg's file. Before this a ladder was a table with no field behind it."""
+    doc = _box_doc(tools, "convergence_fields")
+    vdir = tmp_path / "fields"
+    out = _finish(tools, _json(tools["run_fea_convergence"](
+        doc_id=doc, fixtures=["bottom"], loads=_LOAD, material="steel",
+        sizes_mm=[12.0, 8.0], vtu_dir=str(vdir))), "table")
+    rows = out.get("table")
+    assert isinstance(rows, list) and len(rows) == 2, out
+    for k, (row, size) in enumerate(zip(rows, (12.0, 8.0))):
+        assert not row.get("error") and not row.get("skipped"), row
+        path = Path(row["vtu_path"])
+        assert path.parent == vdir, path
+        assert path.name.endswith(f"_leg{k}_h{size:g}_o2.vtu"), path.name
+        assert path.stat().st_size > 0, f"leg {k} wrote no field"
+    assert len({Path(r["vtu_path"]).name.split("_leg")[0] for r in rows}) == 1, rows
+
+    released = out.get("released_leg")
+    assert released, out
+    assert released["index"] == 1, released
+    assert released["size_mm"] == 8.0, released
+    assert released["vtu_path"] == rows[1]["vtu_path"], released
+
+    packet = _packet(tools, tmp_path / "packets", "BOX-LADDER", out,
+                     str(next(vdir.glob("*.vtu"))))
+    assert packet.get("ok"), packet
+    assert packet["vtu_sha256"], "the packet ignored the released leg's field"
+    prov = json.loads(
+        (Path(packet["packet_dir"]) / "provenance.json").read_text(encoding="utf-8"))
+    assert prov["vtu_sha256"]["path"] == released["vtu_path"], prov["vtu_sha256"]
+
+
+def test_a_stated_size_and_the_fineness_dial_together_are_refused(tools):
+    """Two different meshes cannot both be honoured, and silently preferring one is how a
+    field gets attributed to a discretization nobody asked for. The default dial is NOT a
+    statement, though — mesh_size_mm alone solves (the test above)."""
+    doc = _box_doc(tools, "mesh_size_exclusive")
+    out = _json(tools["run_fea_static"](
+        doc_id=doc, fixtures=["bottom"], loads=_LOAD, material="steel",
+        mesh_size_mm=6.0, mesh_fineness=0.75))
+    assert out.get("ok") is False, out
+    assert "mesh_size_mm" in out["error"] and "mesh_fineness" in out["error"], out
+    assert "job_id" not in out, "a refused setup must not start a solve"

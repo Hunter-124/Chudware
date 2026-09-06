@@ -79,7 +79,9 @@ Env/naming: `CHUDWARE_*` env vars are canonical; MCP id is `chudware`
 ./build.sh all          # core, then GUI
 ./build.sh clean        # wipe host/build-linux (core kept — OCCT reconfig is expensive)
 ./host/build-linux/bin/chudware                     # run the app
-scripts/gate.sh         # THE gate: check.py → core build+ctest → host build → pytest → shot smoke
+CHUDWARE_HEADROOM_GB=2 CHUDWARE_MEM_FRAC=0.6 scripts/gate.sh   # THE gate: check.py → core build+ctest → host build → pytest → shot smoke
+#   ^ ctest tet10_thin_wall needs an 11.6 GB solve budget (budget = min(frac×total, avail−headroom));
+#     at the box default headroom 6 it is 4–20 % short whenever anything else holds RAM.
 python3 scripts/check.py                          # fast stdlib gate (gui_lint, audits) — always runnable
 python3 work/tools/work.py ready|board            # task board
 CHUDWARE_POLYMESH_ROOT=~/Repositories/Polyhedral-FEA-private ./build.sh core   # build against Hunter's live Polyhedral-FEA tree (else pinned public fetch)

@@ -138,3 +138,69 @@ def _no_publisher_outlives_its_test():
     from services.mcp import cad_common as _cad_common
 
     _cad_common.quiesce_publishes(10.0)
+
+
+_MCP_DIR = Path(__file__).resolve().parent
+
+
+def _still_inside_mcp(nextitem) -> bool:
+    if nextitem is None:
+        return False
+    try:
+        return Path(str(nextitem.path)).resolve().parent == _MCP_DIR
+    except Exception:  # noqa: BLE001 — an unresolvable next item means "we are leaving"
+        return False
+
+
+@pytest.hookimpl(trylast=True)
+def pytest_runtest_teardown(item, nextitem):
+    """Hand the NEXT package an empty engine document pool.
+
+    This suite mints documents by the thousand and deliberately leaves them open —
+    that is the shape of the tools it tests, and under the private daemon above the
+    documents die with the daemon, so it costs nothing. Under
+    ``CHUDWARE_ENGINE_DAEMON=0`` (in-process legacy, which is how the combined
+    ``pytest services/mcp services/agent services/dag`` run is invoked) there is no
+    daemon to die: the pool is a process global inside ``libchudware``, shared with
+    every suite that runs after this one.
+
+    ``cad_common.save_touched_docs()`` — the terminal sweep every linear role turn
+    runs — claims any open doc whose ``origin_kind`` is ``mcp``/``agent`` OR that is
+    listed in the module-global ``cad_common._TOUCHED_DOCS``. So an unsaved part left
+    behind here makes a LATER, unrelated turn report ``no_project_save_dir`` and come
+    back ``success=False, stop_reason="persistence_failed"`` with its handoff rewritten
+    to ``partial``. Measured with ``pytest -q services/mcp/test_cad_tools.py
+    services/agent/test_harness_integrity.py``: two green-in-isolation tests fail, and
+    the full combined run turns eight red across four ``services/agent`` files.
+
+    Same defect class, same remedy as
+    ``services/agent/test_arg_reconciliation.py::_discard_documents_minted_by_this_file``
+    — a minter cleans up after itself — hoisted to the package boundary because doing
+    it per test would break the ``_CUR``/resume continuity these tools are tested for.
+    ``trylast`` so function-scoped teardown (notably the publish quiesce above) has
+    already run and cannot re-touch a doc after the sweep.
+    """
+    if _still_inside_mcp(nextitem):
+        return
+    from services.mcp import cad_common as _cad_common
+    from services.mcp import core_bridge as _cb
+
+    try:
+        rows = (_cb.call("doc_list", {}) or {}).get("docs", []) or []
+    except Exception:  # noqa: BLE001 — no engine (or a torn-down daemon) is already clean
+        rows = []
+    for entry in rows:
+        if not isinstance(entry, dict):
+            continue
+        doc_id = entry.get("doc_id")
+        # `gui` docs are the user's own; the suite never minted one and must not
+        # close one even if a stray daemon put it in view.
+        if not doc_id or entry.get("origin_kind") == "gui":
+            continue
+        try:
+            _cb.call("doc_close", {"doc_id": doc_id})
+        except Exception:  # noqa: BLE001 — cleanup never fails a test
+            pass
+    _cad_common._TOUCHED_DOCS.clear()
+    _cad_common._PROCESS_DOCS.clear()
+    _cad_common._CUR["doc_id"] = None

@@ -237,6 +237,12 @@ DESCRIPTIVE_ARGS: frozenset[str] = frozenset({
 # density factor with no millimetre in it. mesh_size_mm=2.0 bound there would
 # mesh at fineness 2.0, not at a 2 mm element edge.
 #
+# `run_fea_static` and `run_fea_contact` have since grown a REAL `mesh_size_mm`
+# parameter (an exact element size that maps to study.target_size_mm), and the
+# exact-name match above binds it before this table is consulted — the refusal
+# now fires only for the tools that still take the dimensionless dial alone
+# (run_fea_modal / run_fea_adaptive / the CFD family), which is where it belongs.
+#
 # Keyed by NORMALISED supplied name -> (target parameter, what the supplied name
 # means and why it does not convert, a correct example argument). A note is only
 # emitted when *target* is genuinely a parameter of the tool being called, so

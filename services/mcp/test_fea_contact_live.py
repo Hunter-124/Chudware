@@ -43,7 +43,7 @@ CONTACT_KEYS = {
     "contact_iterations", "converged", "tangential_stabilization",
     "tangential_force_fraction", "candidate_area_mm2", "contact_area_mm2",
     "mean_contact_pressure_mpa", "contact_pressure_reliable", "resolution",
-    "held_by_contact_only", "pairs",
+    "held_by_contact_only", "contact_carries_load", "load_path", "pairs",
 }
 PAIR_KEYS = {
     "bodies", "candidate_pairs", "active_pairs", "contact_force_n", "force_vector_n",
@@ -116,6 +116,13 @@ def test_compression_closes_the_gap_and_carries_the_load_into_the_fixture(tools,
     assert len(contact["held_by_contact_only"]) == 1, contact
     # Frictionless: the tangential stabilizer must not be the load path.
     assert contact["tangential_force_fraction"] < 0.01, contact
+    # ... and the interface IS the load path: the whole applied resultant on the
+    # contact-held box crosses it, so the reported pressure is a seat pressure.
+    assert contact["contact_carries_load"] is True, contact
+    lp = contact["load_path"]
+    assert abs(lp["applied_n"] - FORCE_N) < 0.01 * FORCE_N, lp
+    assert abs(lp["fraction"] - 1.0) < 0.05, lp
+    assert lp["note"] == "", lp
 
     assert len(contact["pairs"]) == 1, contact["pairs"]
     pair = contact["pairs"][0]

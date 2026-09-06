@@ -1508,7 +1508,7 @@ static FeaStaticResult solve_impl(const std::vector<double>& points,
             // so the solved pair carries the normal force k·g: negative (compressive)
             // while penetrating, positive (tensile — not allowed) once separated.
             const int n_pairs = static_cast<int>(pairs.size());
-            contact_active.assign(static_cast<std::size_t>(n_pairs), 1);
+            contact_active.assign(static_cast<std::size_t>(n_pairs), 0);
 
             // Reachability skeleton: node connectivity through ELEMENTS and bond ties,
             // which never changes. Each iteration adds only its active contact pairs.
@@ -1534,6 +1534,87 @@ static FeaStaticResult solve_impl(const std::vector<double>& points,
                 for (int j = 1; j < stride; ++j) uf_unite(base_parent, tn[0], tn[j]);
             }
             for (const BondSpring& s : bond_springs) uf_unite(base_parent, s.a, s.b);
+
+            // ── Where the active set STARTS ───────────────────────────────────
+            // An active pair whose gap0 > 0 carries k·gap0 of TENSION on this
+            // iteration's right-hand side: that is how a part held only by contact
+            // travels into its seat, and it is also how a wide candidate set wrecks
+            // the loop. Starting EVERY candidate active put all 11989 pairs of the
+            // live keyway interface (gaps 0 … 0.4 mm) in tension at once, so the
+            // first iterate was thousands of open pairs being dragged shut rather
+            // than the 1500 N load pressing a seated arc, and which pairs survived
+            // the closure test afterwards was round-off luck: 8, then 12, then 13,
+            // then 2 pairs across otherwise identical runs of the same request.
+            //
+            // So the ladder, in order, taking the first rung that anchors every
+            // meshed component through contact (an unanchored component is the
+            // mechanism refusal below, and a rung that seats too few pairs to
+            // constrain a body's rotations is one the ladder should step past):
+            //
+            //   1. CLOSED pairs only, gap0 <= 0. Exactly the closure test the loop
+            //      itself applies (step 3), so the seed is the state the loop would
+            //      compute for a body already seated, and — because
+            //      fea_contact_candidates clamps initial penetration to 0 — it
+            //      carries no preload at all.
+            //   2. SEATABLE pairs, gap0 <= seat_tolerance_mm: the gaps the mesh
+            //      cannot tell from touching (fea_contact.h kSeatFractionH). This is
+            //      the rung for an interface that has to CLOSE — two flat faces
+            //      across a uniform air gap, a concentric pin in a clearance bore —
+            //      where the k·gap0 pull is the physics, not an artefact.
+            //   3. Every candidate: the caller supplied no seat tolerance, or the
+            //      seatable set still leaves a part floating, so there is nothing to
+            //      lose by handing the widest set to the loop.
+            auto seed_anchors_all = [&]() {
+                std::vector<int> parent = base_parent;
+                for (int p = 0; p < n_pairs; ++p)
+                    if (contact_active[static_cast<std::size_t>(p)])
+                        uf_unite(parent, pairs[static_cast<std::size_t>(p)].a,
+                                 pairs[static_cast<std::size_t>(p)].b);
+                std::set<int> anchored;
+                for (int nid : fixed_nodes) anchored.insert(uf_find(parent, nid));
+                for (int i = 0; i < n_nodes; ++i) {
+                    if (!meshed[static_cast<std::size_t>(i)]) continue;
+                    if (!anchored.count(uf_find(parent, i))) return false;
+                }
+                return true;
+            };
+            auto seed_within = [&](double tol) {
+                int n = 0;
+                for (int p = 0; p < n_pairs; ++p) {
+                    const char on =
+                        pairs[static_cast<std::size_t>(p)].gap0 <= tol ? 1 : 0;
+                    contact_active[static_cast<std::size_t>(p)] = on;
+                    n += on;
+                }
+                return n;
+            };
+            // Mirrors fea_contact.h's kContactMinActivePairs, which is the bar the
+            // study itself is judged on. Not included from there: this file is the
+            // pure kernel and fea_contact.h is built on top of it.
+            constexpr int kContactSeedMinPairs = 6;
+            const double seat_tol = contact_options.seat_tolerance_mm;
+            const char* seed_rung = "closed (gap0 <= 0)";
+            int n_seeded = seed_within(0.0);
+            // A seed too small to constrain a body's rotations is a mechanism the
+            // topological check above cannot see, so below that bar the ladder steps
+            // on to the seatable set.
+            if ((n_seeded < kContactSeedMinPairs || !seed_anchors_all()) &&
+                seat_tol > 0.0) {
+                const int n_seatable = seed_within(seat_tol);
+                if (n_seatable > n_seeded) {
+                    n_seeded = n_seatable;
+                    seed_rung = "seatable (gap0 <= seat tolerance)";
+                } else {
+                    n_seeded = seed_within(0.0);
+                }
+            }
+            if (!seed_anchors_all()) {
+                contact_active.assign(static_cast<std::size_t>(n_pairs), 1);
+                n_seeded = n_pairs;
+                seed_rung = "every candidate";
+            }
+            prof.note("contact seed: %d of %d pair(s) start active — %s", n_seeded,
+                      n_pairs, seed_rung);
 
             // The pattern already carries every CANDIDATE pair, so K's sparsity is
             // invariant across the loop: an iteration restores the element+bond values
@@ -1665,7 +1746,12 @@ static FeaStaticResult solve_impl(const std::vector<double>& points,
                 }
                 prof.mark("contact-iteration");
                 // (3) Gap per pair from this iterate, then the new active set:
-                // penetrating (g < 0) is active, separated (g >= 0) is not.
+                // penetrating (g < 0) is active, separated (g >= 0) is not. The
+                // tolerance is 0 and it is applied to EVERY pair, active or not —
+                // the same test as seed rung 1, so a pair seats the moment the
+                // deformation closes it and is released the moment it opens. No
+                // tolerance band is admissible here: a pair kept active at g > 0
+                // would carry k·g of tension across the interface.
                 for (int d = 0; d < n_dof; ++d)
                     u_iter[static_cast<std::size_t>(d)] =
                         reduced[d] >= 0 ? uf(reduced[d]) : 0.0;

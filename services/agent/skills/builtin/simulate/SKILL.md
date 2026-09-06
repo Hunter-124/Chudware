@@ -41,10 +41,13 @@ triggers:
 A number leaves this role as an evidence packet, not a chat message. For any result that
 closes a requirement:
 
-1. **Converge.** `run_fea_convergence(sizes_mm=[coarse,med,fine])` — one setup, three
-   stated sizes, `monitor` on a NON-singular value; or `run_fea_adaptive` with
-   `eta_target_met`. `converged:false` or a peak that grows with refinement is a
-   singularity, not strength.
+1. **Converge.** `run_fea_convergence(sizes_mm=[coarse,med,fine], vtu_dir=<absolute dir>)`
+   — one setup, three stated sizes, `monitor` on a NON-singular value; or
+   `run_fea_adaptive` with `eta_target_met`. `converged:false` or a peak that grows with
+   refinement is a singularity, not strength. `vtu_dir` gives every leg its own `.vtu`
+   (each row carries `vtu_path`) and the reply's `released_leg` names the finest solved
+   leg's file — pass that reply to `sim_evidence_packet` and the released field travels
+   with the numbers instead of needing a fourth solve.
 2. **Check equilibrium AND connectivity.** Read `reactions.equilibrium_error_pct` before
    trusting any stress, and `mesh_quality` (aspect_max, jacobian_min, pct_poor,
    `connected_components` / `unfixed_components`, `thin_wall_ratio`) before trusting the
@@ -56,9 +59,12 @@ closes a requirement:
    `plausibility.flag == "implausible"` means the peak displacement exceeded the part's
    own bounding-box diagonal, so the small-strain assumption is gone, `warnings` says so,
    and a convergence leg in that state is marked `implausible` and cannot converge.
-3. **Keep the field.** Pass `vtu_path=<absolute .vtu>` so displacement/von Mises are
-   inspectable outside the tool; `provenance` records engine build, polymesh commit,
-   solver, mesher and timestamp.
+3. **Keep the field.** `vtu_dir` on the ladder, or `vtu_path=<absolute .vtu>` on a single
+   solve, so displacement/von Mises are inspectable outside the tool; `provenance`
+   records engine build, polymesh commit, solver, mesher and timestamp. To re-solve ONE
+   released leg on its own mesh, use `run_fea_static(mesh_size_mm=<that row's size_mm>,
+   vtu_path=...)` — `mesh_size_mm` is the exact element size and is mutually exclusive
+   with `mesh_fineness`, so the field can never be attributed to a mesh nobody solved.
 4. **Package.** `sim_evidence_packet(case_id, requirement_id, out_dir, study_result=<the
    full result>, geometry_path, material_source, load_rationale, notes)` writes
    inputs/result/provenance/convergence/checklist plus geometry+VTU sha256. Its

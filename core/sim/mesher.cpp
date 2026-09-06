@@ -704,9 +704,20 @@ pm::mesh::SizeFieldFn local_size_field(const MeshOptions &options, double h,
   // stamp lands inside one cell and changes nothing.
   const double band = request.band_mm > 0.0 ? request.band_mm : 2.0 * request.size_mm;
   seed_band = std::max(band, h);
-  // Never ask for less than the lattice can place; the caller is responsible for
-  // having lowered h far enough (see fill_with_recovery).
-  const double h_local = std::max(request.size_mm, h * 0.25);
+  // Clamped into the field's own legal band, at BOTH ends.
+  //   * below: the lattice cannot place under h/4, and the caller is
+  //     responsible for having lowered h far enough (see fill_with_recovery);
+  //   * above: a GradedSizing is `clamp(min_i(h_i + beta*d), h_min, h_max)` and
+  //     its constructor REQUIRES 0 < h_min <= h_max, so a local request coarser
+  //     than the background threw `GradedSizing: need 0 < h_min <= h_max` and
+  //     failed the whole mesh. That is not an error condition: a request to be
+  //     no coarser than 2.9 mm inside a 1.2 mm background is already satisfied
+  //     everywhere, so it collapses to the uniform background field and
+  //     deliver_local_contract finds nothing to bisect. Without this clamp the
+  //     box has no exit — every interface size at or below the background is
+  //     refused as undeliverable and every size above it mesh-FAILS, which is
+  //     exactly what closed O-22 (CONTACT_BLOCKED_2026-09-06b §4, attempt 3).
+  const double h_local = std::clamp(request.size_mm, h * 0.25, h);
   const std::vector<pm::adapt::SizeSource> sources =
       pm::adapt::point_size_sources(seeds, h_local);
   // beta is the gradient limit: the requested size may grow beta mm per mm away
@@ -797,6 +808,17 @@ constexpr int kLebWaves = 18;
 // solver would have taken. Cells between this floor and 0.02 are COUNTED and
 // reported instead of being fatal.
 constexpr double kWaveDegenerateFloor = 1e-5;
+
+// Curvature gate on each new mid-edge node's projection onto the CAD surface,
+// as a fraction of the child edge being created (pm::mesh::local_refine_tets'
+// `max_sag_fraction`). Chudware's contract path refines an ALREADY-fine mesh
+// toward a sub-millimetre target and owns a smoothing pass over the declined
+// nodes, so it wants the gate; polymesh's own Cartesian fills pass 0 and keep
+// unconditional projection, because their parent edges are a whole lattice cell
+// and their snap passes own the residual (turning the gate on there cost
+// test_curved_mesh_quality's cylinder_prism 0.0350 mm of boundary residual
+// against a 0.0128 mm bound).
+constexpr double kMaxProjectionSagFraction = 0.2;
 
 // The longest edge of a tet4, mm — the element size LEB actually halves.
 double longest_edge_mm(const pm::fea::NodalMesh &mesh,
@@ -1133,20 +1155,48 @@ void deliver_local_contract(const LoadedModel &loaded, const MeshOptions &option
   // loop's own termination test identical to the contract's.
   static constexpr int kFaceCorners[4][3] = {
       {0, 1, 2}, {0, 1, 3}, {0, 2, 3}, {1, 2, 3}};
-  // Worst interface face size, and (optionally) the elements that own the
-  // interface faces coarser than the request, and (optionally) the boundary
-  // nodes inside the core, which is what the delivered SURFACE FIDELITY is
-  // measured over.
+  // Three jobs, one boundary pass:
+  //   * the DELIVERED size, in the same currency fea_contact's guard measures —
+  //     the guard's `interface_h_mm` is the MEDIAN over candidate pairs of the
+  //     mean boundary-face edge length incident on the pair's nodes, so this
+  //     returns the 90th percentile of that per-node mean over the core's
+  //     boundary nodes: strictly more conservative than the guard's median, and
+  //     immune to a single face the smoothing pass stretched. A raw MAX was
+  //     tried first and is not usable: pulling one fill node back onto the CAD
+  //     surface lengthens its incident faces, so the max reported 0.601 mm for
+  //     a keyway interface the guard measured at 0.251 mm, and the contract
+  //     "missed" by 70% on a mesh that was fine — which then bought a
+  //     2.7M-element whole-solid re-fill for nothing;
+  //   * the elements owning core faces the DELIVERED size is still failing on
+  //     (the marks) — in that same per-node currency, never a per-face maximum.
+  //     A max was tried and costs whole waves: the fidelity round stretches
+  //     individual faces by pulling one node back onto the CAD surface, and
+  //     LEB's own closure leaves long diagonals, so on the pin-in-bore ctest
+  //     the last three waves were chasing a handful of edges the measure had
+  //     already passed — 11 waves and a delivered 0.264 mm for a 0.35 mm
+  //     request, i.e. one whole extra halving of a mesh that was already
+  //     inside the contract (measured: 225 186 elements and 57 s of fill).
+  //     Marking every face incident on a node whose OWN mean is still coarse
+  //     is strictly conservative against the guard — the guard reads a MEDIAN
+  //     over pairs, this chases every node — and it makes the loop's
+  //     termination test identical to the contract's, which is the invariant
+  //     the two-statistic version silently broke.
+  //   * the core's boundary nodes, which the fidelity round slides onto the CAD
+  //     surface and the residual is sampled over.
+  // Boundary = a triangular face owned by exactly one element. The key packs
+  // the sorted node triple in base 1000033, so it is a bijection, not a hash.
+  struct BoundaryFace {
+    std::array<std::uint32_t, 3> tri{};
+    std::size_t owner = 0;
+    int uses = 0;
+  };
+  struct NodeEdges {
+    double sum = 0.0;
+    int count = 0;
+  };
   auto scan = [&](std::vector<std::size_t> *owners,
                   std::vector<std::uint32_t> *core_nodes = nullptr) {
-    // Boundary = a triangular face owned by exactly one element. The key packs
-    // the sorted node triple in base 1000033, so it is a bijection, not a hash.
-    struct Face {
-      std::array<std::uint32_t, 3> tri{};
-      std::size_t owner = 0;
-      int uses = 0;
-    };
-    std::unordered_map<std::uint64_t, Face> faces;
+    std::unordered_map<std::uint64_t, BoundaryFace> faces;
     faces.reserve(nodal.elements.size() * 2);
     for (std::size_t e = 0; e < nodal.elements.size(); ++e)
       for (const auto &corners : kFaceCorners) {
@@ -1159,39 +1209,110 @@ void deliver_local_contract(const LoadedModel &loaded, const MeshOptions &option
                                    tri[1]) * 1000033ull + tri[2];
         auto it = faces.find(key);
         if (it == faces.end())
-          faces.emplace(key, Face{tri, e, 1});
+          faces.emplace(key, BoundaryFace{tri, e, 1});
         else
           ++it->second.uses;
       }
-    double worst = 0.0;
+    // The core's own boundary faces, kept for the marking pass below: the
+    // per-node means that pass needs are only complete once every face has
+    // contributed its two incident edges.
+    std::vector<BoundaryFace> core_faces;
+    core_faces.reserve(faces.size() / 8 + 8);
+    std::unordered_map<std::uint32_t, NodeEdges> per_node;
+    per_node.reserve(faces.size() / 2 + 8);
     for (const auto &entry : faces) {
-      const Face &face = entry.second;
+      const BoundaryFace &face = entry.second;
       if (face.uses != 1) continue;
-      double edge = 0.0;
+      std::array<double, 3> length{};
+      std::array<double, 3> distance{};
       double nearest = std::numeric_limits<double>::infinity();
       for (int a = 0; a < 3; ++a) {
-        const Eigen::Vector3d &p = nodal.nodes[face.tri[static_cast<std::size_t>(a)]];
-        edge = std::max(
-            edge,
-            (p - nodal.nodes[face.tri[static_cast<std::size_t>((a + 1) % 3)]]).norm());
-        nearest = std::min(nearest, seed_distance(p));
+        const std::size_t at = static_cast<std::size_t>(a);
+        const Eigen::Vector3d &p = nodal.nodes[face.tri[at]];
+        length[at] =
+            (p - nodal.nodes[face.tri[static_cast<std::size_t>((a + 1) % 3)]]).norm();
+        distance[at] = seed_distance(p);
+        nearest = std::min(nearest, distance[at]);
       }
       // Inside the core — the same zone the request is flat over, so what is
       // measured is exactly what was asked for.
       if (nearest > core_mm) continue;
-      worst = std::max(worst, edge);
-      if (owners != nullptr && edge > request.size_mm * 1.02)
-        owners->push_back(face.owner);
+      core_faces.push_back(face);
       if (core_nodes != nullptr)
         core_nodes->insert(core_nodes->end(), face.tri.begin(), face.tri.end());
+      for (int a = 0; a < 3; ++a) {
+        const std::size_t at = static_cast<std::size_t>(a);
+        if (distance[at] > core_mm) continue;
+        // The two face edges incident on this vertex.
+        NodeEdges &node = per_node[face.tri[at]];
+        node.sum += length[at] + length[static_cast<std::size_t>((a + 2) % 3)];
+        node.count += 2;
+      }
     }
-    return worst;
+    // ── The marks, in the currency the contract is measured in ───────────────
+    // Every core face incident on a node whose own mean boundary-edge length is
+    // still coarser than the request. When no node is, `owners` comes back
+    // empty and the wave loop stops: the delivered size IS the request, and a
+    // further wave would only halve a mesh that already satisfies the contract.
+    const double landed = request.size_mm * 1.02;
+    if (owners != nullptr)
+      for (const BoundaryFace &face : core_faces)
+        for (const std::uint32_t node : face.tri) {
+          const auto it = per_node.find(node);
+          if (it == per_node.end() || it->second.count <= 0) continue;
+          if (it->second.sum / static_cast<double>(it->second.count) <= landed)
+            continue;
+          owners->push_back(face.owner);
+          break;
+        }
+    if (per_node.empty()) return 0.0;
+    std::vector<double> node_h;
+    node_h.reserve(per_node.size());
+    for (const auto &entry : per_node)
+      if (entry.second.count > 0)
+        node_h.push_back(entry.second.sum / static_cast<double>(entry.second.count));
+    if (node_h.empty()) return 0.0;
+    const std::size_t at = std::min(node_h.size() - 1, (node_h.size() * 9) / 10);
+    std::nth_element(node_h.begin(),
+                     node_h.begin() + static_cast<std::ptrdiff_t>(at),
+                     node_h.end());
+    return node_h[at];
+  };
+  // ── The fidelity round: put interface nodes back on the CAD surface ─────────
+  // The lattice fill snaps its boundary nodes toward the surface but leaves a
+  // residual — 1.21 mm max at the 13.94 mm background the governor picks for the
+  // live keyway isolate, per the fill's own note. Bisection inherits it exactly:
+  // each new mid-edge node is projected onto the surface while its parents stay
+  // where the lattice left them, so the refined bore alternates between
+  // on-surface nodes and off-surface ones. On a CLEARANCE FIT that is not
+  // cosmetic — it IS the clearance: on the keyway isolate the coarse mesh's
+  // closest approach across the 0.35 mm fit measured -0.2686 mm, a quarter
+  // millimetre of PHANTOM interference, all of it discretization, and the
+  // contact solve saw it as the real seating.
+  //
+  // It runs ONCE, after the last wave, and deliberately not before: on the
+  // coarse mesh a node's shortest incident edge is a whole background cell, so
+  // the same accept test that is conservative on a 0.3 mm star lets a coarse one
+  // move millimetres and distort the very faces the waves are about to bisect.
+  // Measured on the keyway isolate — a pre-wave round left the refined interface
+  // residual at 0.484 mm max / 3.5e-3 mm mean and the closest approach at
+  // -0.248 mm; this round alone leaves 0.034 mm max / 8.0e-5 mm mean and
+  // -0.0198 mm.
+  const auto fidelity_round = [&](std::vector<std::uint32_t> movable) {
+    std::vector<std::uint32_t> interface_nodes;
+    scan(nullptr, &interface_nodes);
+    movable.insert(movable.end(), interface_nodes.begin(), interface_nodes.end());
+    std::sort(movable.begin(), movable.end());
+    movable.erase(std::unique(movable.begin(), movable.end()), movable.end());
+    smooth_nodes(cad_surface, nodal, movable, contract.reprojected_nodes,
+                 contract.smoothed_nodes);
   };
   contract.achieved_mm = scan(nullptr);
   for (int wave = 0; wave < kLebWaves; ++wave) {
-    // Two mark sources, unioned: the owners of interface faces coarser than the
-    // request (the layer that carries the contract) and any element coarser than
-    // the graded field asks for at its centroid (the transition out to the
+    // Two mark sources, unioned: the owners of the interface faces the
+    // DELIVERED size is still failing on (the layer that carries the contract,
+    // marked in the contract's own per-node currency) and any element coarser
+    // than the graded field asks for at its centroid (the transition out to the
     // background, so the fine layer is not a cliff).
     std::vector<std::size_t> marks;
     std::vector<std::array<std::uint32_t, 4>> tets;
@@ -1236,7 +1357,8 @@ void deliver_local_contract(const LoadedModel &loaded, const MeshOptions &option
       try {
         refined = pm::mesh::local_refine_tets(
             nodal.nodes, std::move(wave_tets), marks, &attempt_stats,
-            attempt == 0 ? cad_surface : nullptr);
+            attempt == 0 ? cad_surface : nullptr, /*mirror=*/nullptr,
+            kMaxProjectionSagFraction);
       } catch (const std::exception &e) {
         wave_error = in_model_units(e.what());
         continue;
@@ -1293,32 +1415,16 @@ void deliver_local_contract(const LoadedModel &loaded, const MeshOptions &option
                  contract.smoothed_nodes);
     ++contract.waves;
   }
-  // ── One last round: the ORIGINAL interface nodes, and the slivers ───────────
-  // The per-wave rounds only move what that wave created, and neither of the
-  // two things left over is a new node:
-  //   * the fill's OWN boundary nodes at the interface carry the fill's own
-  //     snap residual — up to 1.21 mm off the CAD surface at a 13.94 mm
-  //     background on the live keyway isolate. Bisection inherits it: every
-  //     new mid-edge node is projected onto the surface while its parents stay
-  //     where the lattice snapped them, so the refined bore alternates between
-  //     on-surface nodes and off-surface ones. On a CLEARANCE FIT that is not
-  //     cosmetic — a 0.5 mm bulge in a 0.35 mm fit is the difference between a
-  //     seating patch and a few touching asperities — so the core's boundary
-  //     nodes get the same slide-onto-the-face treatment, once, at the end.
-  //   * a sliver left between a bisected cell and an original fill cell needs
-  //     the ORIGINAL node to move, and nothing has offered it the chance.
-  // Every move is still accepted only on a strictly improving star (or, for the
-  // boundary projection, on not trading a healthy star for a sick one).
-  if (contract.waves > 0) {
-    std::vector<std::uint32_t> movable;
-    scan(nullptr, &movable);
-    const std::vector<std::uint32_t> poor = nodes_of_poor_cells(nodal);
-    movable.insert(movable.end(), poor.begin(), poor.end());
-    std::sort(movable.begin(), movable.end());
-    movable.erase(std::unique(movable.begin(), movable.end()), movable.end());
-    smooth_nodes(cad_surface, nodal, movable, contract.reprojected_nodes,
-                 contract.smoothed_nodes);
-  }
+  // The per-wave rounds only move what THAT wave created. Two things are left:
+  // the interface nodes the FILL placed, which still carry its snap residual,
+  // and a sliver between a bisected cell and an original fill cell, which needs
+  // the ORIGINAL node to move and has had no chance to. One round covers both —
+  // the core's boundary nodes unioned with the corners of every cell still under
+  // the ship floor — and every move is accepted only on a strictly improving
+  // star (or, for the boundary projection, on not trading a healthy star for a
+  // sick one).
+  if (contract.waves > 0)
+    fidelity_round(nodes_of_poor_cells(nodal));
   contract.elems = nodal.elements.size();
   std::vector<std::uint32_t> core_nodes;
   contract.achieved_mm = scan(nullptr, &core_nodes);
@@ -1758,13 +1864,15 @@ bool build_mesh(const LoadedModel &loaded, const MeshOptions &options, double h,
     out.local_refine_ceiling_bound = contract.ceiling_bound;
     out.local_refine_element_ceiling = contract.element_ceiling;
     out.local_refine_limit = contract.note;
-    char text[544];
+    char text[608];
     std::snprintf(text, sizeof(text),
                   "local refinement for %s: %zu seed(s) requested %.4g mm, flat "
                   "within %.4g mm of them (seed stamp band %.4g mm, background "
                   "element size %.4g mm, the fill's own graded floor %.4g mm); %d "
-                  "LEB wave(s) added %d element(s) and the coarsest interface "
-                  "face measured there is %.4g mm",
+                  "LEB wave(s) added %d element(s) and the element size delivered "
+                  "there is %.4g mm (90th percentile of the mean boundary-face "
+                  "edge length per interface node — the contact guard's own "
+                  "statistic, one percentile stricter)",
                   options.local_refine.label.empty()
                       ? "a study request"
                       : options.local_refine.label.c_str(),

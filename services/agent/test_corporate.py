@@ -409,7 +409,26 @@ class TestMeetings:
         assert "post_error" in r
         assert r["post"]["ok"] is False
 
-    def test_director_review_on_blockage(self):
+    def test_director_review_on_blockage(self, monkeypatch):
+        """The DETERMINISTIC template review — so the advisor turn is stubbed off.
+
+        `hold_meeting` refines a needs_llm review through
+        `corporate._llm_director_steering`, and that helper reaches Chudcode for
+        real. Unstubbed, this test issued a live advisor turn on every run and
+        then asserted on template text the model's reply had already replaced —
+        so it failed wherever a model was reachable, and its verdict depended on
+        provider wording rather than on the reviewer. A refusal here is the
+        documented "any provider failure returns None so the deterministic
+        director steering remains authoritative" path; the refined-output
+        contract is pinned separately by TestLlmSteering.
+        """
+        from services.agent import corporate as corporate_module
+
+        monkeypatch.setattr(
+            corporate_module,
+            "run_role_turn",
+            lambda *args, **kwargs: {"success": False, "cancelled": False},
+        )
         chart = OrgChart(
             "r_rev",
             cfg=_cfg_on(director_review=True),

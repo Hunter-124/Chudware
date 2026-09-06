@@ -51,11 +51,18 @@ from .cad_common import (
     _doc,
     _err,
     _handoff_doc_name,
+    _normalize_optional_slot,
     _render_view_png,
     _vnorm,
     cb,
+    coerce_json_or_repr,
     render_output_path,
+    require_list,
 )
+# The one steer-pose driver. A steer film and a turning-radius study must pose the same
+# detached clone the same way, so the animation drives the motion tools' own helper
+# instead of re-deriving a rotation about a kingpin axis.
+from .cad_motion_tools import steer_pose_sweep
 # The save-path contract every render deliverable already obeys (absolute, inside a
 # configured project/workspace root, '..' collapsed first). Imported, never re-implemented:
 # an animation is a figure like any other, and a second interpretation of the same rule is
@@ -606,6 +613,9 @@ def register_cad_animation_tools(mcp: FastMCP) -> None:
                          start: Optional[float] = None,
                          stop: Optional[float] = None,
                          steps: Optional[int] = None,
+                         steer: Optional[dict] = None,
+                         rear_steer: Optional[dict] = None,
+                         poses: Optional[list] = None,
                          min_clearance_mm: float = 0.0,
                          vtu_path: Optional[str] = None,
                          field: str = "von_mises",
@@ -629,17 +639,36 @@ def register_cad_animation_tools(mcp: FastMCP) -> None:
                         poses are applied to a detached clone opened from the document's
                         file, so your document is never touched. `reverse=True` plays the
                         same move as an ASSEMBLE (parts fly in to their final transforms).
-          "motion"    — simulate_motion drives `mate_id` from `start` to `stop` in `steps`
-                        SOLVED samples (default: one per frame) and this renders ITS OWN
-                        trajectory — the engine's poses, never a second interpolation. Each
-                        sample is held on screen until the film is `frames` long, because a
-                        mate solve can refuse a very fine increment while a watchable shot
-                        still needs seconds of frames. Every sample from the sweep's
-                        `first_collision_step` onward is marked with a red border naming the
-                        colliding pair (doc_render_view tints by face direction and has no
-                        per-body colour override, so the film marks the SAMPLE and names the
-                        pair rather than implying a body-level result the engine did not
-                        report); the caption carries the step and driver value.
+          "motion"    — a SOLVED trajectory, filmed one frame per sample: the engine's own
+                        poses, never a second interpolation. Each sample is held on screen
+                        until the film is `frames` long, because a solve can refuse a very
+                        fine increment while a watchable shot still needs seconds of
+                        frames. Every sample from the sweep's `first_collision_step` onward
+                        is marked with a red border naming the colliding pair
+                        (doc_render_view tints by face direction and has no per-body colour
+                        override, so the film marks the SAMPLE and names the pair rather
+                        than implying a body-level result the engine did not report); the
+                        caption carries the step and driver value. THREE drives, exactly
+                        one per call:
+                          `mate_id` + `start`/`stop`/`steps` — simulate_motion sweeps a
+                            dimensional (angle/distance) mate.
+                          `steer` (+ optional `rear_steer`) — a STEER SWEEP for an assembly
+                            that owns no drivable mate: named components are rigidly
+                            rotated about a kingpin axis on a detached clone and the mate
+                            network re-solves around them, ramping from 0 (straight ahead)
+                            to the requested angle over `steps` samples. Same spec as
+                            `steering_turning_radius` / `sweep_envelope`, driven by the
+                            same helper:
+                              steer={"components":["upright_FL","upright_FR"],
+                                     "axis":{"point":[x,y,z],"dir":[0,0,1]},  # or mate_id
+                                     "angle_deg":30}     # or "angles_deg":[30,26.4]
+                            The caption reports `steer_range_deg` and each component's
+                            requested angle; solid overlap is checked at ZERO clearance at
+                            every sample (`min_clearance_mm` applies to the mate drive).
+                          `poses` — a fully explicit frame list,
+                            [{component: [16 numbers]}, ...], one object per frame, each
+                            an ABSOLUTE row-major 4x4 for that component. The escape hatch
+                            for a pose sequence you computed yourself; no solve is run.
           "fea"       — a solved .vtu: von Mises on the displacement-warped mesh over the
                         grey undeformed outline, warp ramping in. Pass `vtu_path` (from
                         run_fea_static(vtu_path=...)); no document is needed.
@@ -675,8 +704,9 @@ def register_cad_animation_tools(mcp: FastMCP) -> None:
         Returns [poster Image, caption]. The caption states the written path, bytes,
         sha256, frame count, fps, measured duration from ffprobe, the engine build id and
         polymesh commit burned into every frame's footer, and each kind's own measured
-        numbers (component offsets, sweep range and first collision, peak MPa and warp
-        factor). Numbers the engine did not report read "unknown" — never a guess.
+        numbers (component offsets, sweep range / `steer_range_deg` and first collision,
+        peak MPa and warp factor). Numbers the engine did not report read "unknown" —
+        never a guess.
         """
         work: Optional[str] = None
         clone: Optional[str] = None
@@ -685,6 +715,16 @@ def register_cad_animation_tools(mcp: FastMCP) -> None:
             if kind not in _KINDS:
                 raise ValueError(f"render_animation: kind must be one of {', '.join(_KINDS)}; "
                                  f"got {kind!r}.")
+            steer = _normalize_optional_slot(steer)
+            rear_steer = _normalize_optional_slot(rear_steer)
+            poses = _normalize_optional_slot(poses)
+            off_kind = [k for k, v in (("mate_id", mate_id), ("steer", steer),
+                                       ("rear_steer", rear_steer), ("poses", poses))
+                        if v is not None]
+            if kind != "motion" and off_kind:
+                raise ValueError(
+                    f"render_animation(kind={kind!r}): {', '.join(off_kind)} drive(s) "
+                    "belong to kind='motion' — they would be silently ignored here.")
             if not save_path:
                 raise ValueError(
                     "render_animation needs save_path — an ABSOLUTE .gif or .mp4 path under "
@@ -804,64 +844,174 @@ def register_cad_animation_tools(mcp: FastMCP) -> None:
                     dirs = [_dir_from_angles(az, el)] * frames
                 else:  # motion
                     # The SOLVER's sample count and the FILM's frame count are different
-                    # numbers: a mate solve can fail to converge at a very fine increment
-                    # (and each sample costs a mate solve), while a watchable shot needs
-                    # 2-4 s of frames. Render one frame per solved sample and hold each on
-                    # screen for as long as `frames` asks.
+                    # numbers: a solve can fail to converge at a very fine increment (and
+                    # each sample costs a solve), while a watchable shot needs 2-4 s of
+                    # frames. Render one frame per solved sample and hold each on screen
+                    # for as long as `frames` asks.
                     samples = max(2, int(steps)) if steps else frames
-                    sweep = json.loads(_motion_tool(mate_id, start, stop, samples,
-                                                    min_clearance_mm, d))
-                    if not sweep.get("ok"):
-                        raise ValueError("render_animation(kind='motion'): simulate_motion "
-                                         f"refused this sweep — {sweep.get('error')}")
-                    traj = sweep.get("trajectory") or []
-                    if len(traj) < 2:
-                        raise ValueError("simulate_motion returned fewer than 2 samples; "
-                                         "nothing to animate.")
+                    named = [k for k, v in (("mate_id", mate_id), ("steer", steer),
+                                            ("poses", poses)) if v is not None]
+                    if len(named) > 1:
+                        raise ValueError(
+                            "render_animation(kind='motion'): " + ", ".join(named) +
+                            " are DIFFERENT drives — pass exactly one. mate_id sweeps a "
+                            "dimensional mate, steer rotates named components about a "
+                            "kingpin axis, poses is an explicit per-frame transform list.")
+                    if steer is None and rear_steer is not None:
+                        raise ValueError(
+                            "render_animation: `rear_steer` is the 4WS companion to "
+                            "`steer` — pass `steer` too (or drive the rear axle with "
+                            "`steer` alone).")
+                    if not named:
+                        raise ValueError(
+                            "render_animation(kind='motion') needs a drive: mate_id (+ "
+                            "start/stop) for a dimensional mate, steer={'components':"
+                            "[...],'axis':{'point':[...],'dir':[...]},'angle_deg':...} for "
+                            "a steer sweep, or poses=[{component: [16 numbers]}, ...] for "
+                            "an explicit frame list.")
+
+                    # The component set and their poses are the same on the document and
+                    # on its clone, so the drive is resolved (and refused) against the
+                    # LIVE document first: a refusal must be the drive's own teaching
+                    # text, not "this document has no file to clone from".
+                    comps = _components(d)
+                    base = {c["id"]: list(c.get("transform")
+                                          or _translation((0, 0, 0))) for c in comps}
+
+                    if poses is not None:
+                        # The caller's own frame list: ABSOLUTE component transforms, taken
+                        # verbatim. No solve, no interpolation — the only thing checked is
+                        # that every component exists here and every matrix is a finite 4x4.
+                        rows = require_list(
+                            poses, "poses",
+                            "one {component: [16 numbers]} object per frame")
+                        by_key: dict = {}
+                        for c in comps:
+                            by_key[str(c["id"])] = str(c["id"])
+                            if c.get("name"):
+                                by_key[str(c["name"])] = str(c["id"])
+                        for k, row in enumerate(rows):
+                            row = coerce_json_or_repr(row)
+                            if not isinstance(row, dict) or not row:
+                                raise ValueError(
+                                    f"poses[{k}] must be a non-empty object "
+                                    "{component: [16 numbers]}; got "
+                                    f"{type(row).__name__}.")
+                            frame_poses: dict = {}
+                            for token, m in row.items():
+                                cid = by_key.get(str(token))
+                                if cid is None:
+                                    raise ValueError(
+                                        f"poses[{k}]: component '{token}' is not in "
+                                        f"{doc_name}. Components: "
+                                        + ", ".join(f"{c['id']}({c.get('name')})"
+                                                    for c in comps) + ".")
+                                mm = coerce_json_or_repr(m)
+                                if (not isinstance(mm, list) or len(mm) != 16
+                                        or not all(isinstance(v, (int, float))
+                                                   and math.isfinite(float(v))
+                                                   for v in mm)):
+                                    raise ValueError(
+                                        f"poses[{k}]['{token}'] is not a row-major 4x4: "
+                                        "give 16 finite numbers (the shape doc_tree and "
+                                        "simulate_motion already report).")
+                                frame_poses[cid] = [float(v) for v in mm]
+                            poses_per_frame.append(frame_poses)
+                        if len(poses_per_frame) < 2:
+                            raise ValueError(f"poses has {len(poses_per_frame)} frame(s); "
+                                             "an animation needs at least 2.")
+                        moved = sorted({cid for row in poses_per_frame for cid in row})
+                        measured = {"mate_id": None,
+                                    "driver": {"type": "poses", "unit": "transform",
+                                               "frames": len(poses_per_frame),
+                                               "components": moved},
+                                    "samples": len(poses_per_frame),
+                                    "posed_components": len(moved)}
+                        foot_right = (f"explicit poses | {len(poses_per_frame)} frames | "
+                                      f"{len(moved)} components")
+                    else:
+                        if steer is not None:
+                            # The motion tools' own steer driver, on its own detached
+                            # clone: the film and a turning-radius study cannot disagree.
+                            sweep = steer_pose_sweep(d, steer, rear_steer, samples,
+                                                     True, "render_animation")
+                            if not sweep.get("ok"):
+                                raise ValueError(
+                                    "render_animation(kind='motion', steer=...): the mate "
+                                    "network did not solve around the steered pose — "
+                                    f"{sweep.get('error')}")
+                        else:
+                            sweep = json.loads(_motion_tool(mate_id, start, stop, samples,
+                                                            min_clearance_mm, d))
+                            if not sweep.get("ok"):
+                                raise ValueError(
+                                    "render_animation(kind='motion'): simulate_motion "
+                                    f"refused this sweep — {sweep.get('error')}")
+                        traj = sweep.get("trajectory") or []
+                        if len(traj) < 2:
+                            raise ValueError("the sweep returned fewer than 2 samples; "
+                                             "nothing to animate.")
+                        first = {b.get("component"): list(b.get("transform") or [])
+                                 for b in (traj[0].get("bodies") or [])
+                                 if isinstance(b.get("transform"), list)}
+                        for fr in traj:
+                            frame_poses = {}
+                            for b in fr.get("bodies") or []:
+                                cid, tb = b.get("component"), b.get("transform")
+                                if (cid not in base or not isinstance(tb, list)
+                                        or len(tb) != 16):
+                                    continue
+                                t0 = first.get(cid)
+                                if not t0 or len(t0) != 16:
+                                    continue
+                                # delta = T_i * inv(T_0) is the rigid motion the solver
+                                # applied to this body between the first sample and this
+                                # one; composing it with the component's own pose is exact
+                                # even when a component carries several bodies.
+                                frame_poses[cid] = _mat_mul(
+                                    _mat_mul(tb, _rigid_inverse(t0)), base[cid])
+                            poses_per_frame.append(frame_poses)
+                        interf = sweep.get("interference") or {}
+                        driver = sweep.get("driver") or {}
+                        measured = {"mate_id": sweep.get("mate_id"),
+                                    "driver": driver,
+                                    "samples": len(traj),
+                                    "interference": {
+                                        "checked": interf.get("checked"),
+                                        "first_collision_step": interf.get(
+                                            "first_collision_step"),
+                                        "first_collision_value": interf.get(
+                                            "first_collision_value"),
+                                        "detail": interf.get("detail")},
+                                    "values": [fr.get("value") for fr in traj]}
+                        unit = driver.get("unit") or ""
+                        if steer is not None:
+                            lo = float(driver.get("start") or 0.0)
+                            hi = float(driver.get("stop") or 0.0)
+                            # The steer drive checks solid overlap at zero clearance (it is
+                            # the same eval_interference call steering_turning_radius
+                            # makes); min_clearance_mm belongs to the mate sweep.
+                            measured["min_clearance_mm"] = 0.0
+                            measured["steer_range_deg"] = [round(lo, 4), round(hi, 4)]
+                            measured["steer_components"] = driver.get("components")
+                            measured["steer_angles_deg"] = driver.get("angles_deg")
+                            measured["steer_axes"] = driver.get("axes")
+                            foot_right = ("steer "
+                                          + ", ".join(driver.get("components") or [])
+                                          + f" {lo:g}->{hi:g} {unit or 'deg'}")
+                        else:
+                            measured["min_clearance_mm"] = float(min_clearance_mm)
+                            foot_right = (f"mate {sweep.get('mate_id')} "
+                                          f"{traj[0].get('value')}->"
+                                          f"{traj[-1].get('value')} {unit}")
+
                     clone = _clone_detached(d, kind)
                     render_doc = clone
                     if display_quality:
                         cb.call("doc_set_display_quality",
                                 {"doc_id": clone, "quality": str(display_quality)})
-                    comps = _components(clone)
-                    base = {c["id"]: list(c.get("transform")
-                                          or _translation((0, 0, 0))) for c in comps}
-                    first = {b.get("component"): list(b.get("transform") or [])
-                             for b in (traj[0].get("bodies") or [])
-                             if isinstance(b.get("transform"), list)}
-                    for fr in traj:
-                        poses: dict = {}
-                        for b in fr.get("bodies") or []:
-                            cid, tb = b.get("component"), b.get("transform")
-                            if cid not in base or not isinstance(tb, list) or len(tb) != 16:
-                                continue
-                            t0 = first.get(cid)
-                            if not t0 or len(t0) != 16:
-                                continue
-                            # delta = T_i * inv(T_0) is the rigid motion the solver applied
-                            # to this body between the first sample and this one; composing
-                            # it with the component's own pose is exact even when a
-                            # component carries several bodies.
-                            poses[cid] = _mat_mul(_mat_mul(tb, _rigid_inverse(t0)), base[cid])
-                        poses_per_frame.append(poses)
-                    interf = sweep.get("interference") or {}
-                    collide_step = interf.get("first_collision_step")
-                    measured = {"mate_id": sweep.get("mate_id"),
-                                "driver": sweep.get("driver"),
-                                "samples": len(traj),
-                                "interference": {
-                                    "checked": interf.get("checked"),
-                                    "first_collision_step": collide_step,
-                                    "first_collision_value": interf.get(
-                                        "first_collision_value"),
-                                    "detail": interf.get("detail")},
-                                "min_clearance_mm": float(min_clearance_mm),
-                                "values": [fr.get("value") for fr in traj]}
                     az, el = _view_angles(view)
                     dirs = [_dir_from_angles(az, el)] * len(poses_per_frame)
-                    unit = ((sweep.get("driver") or {}).get("unit") or "")
-                    foot_right = (f"mate {sweep.get('mate_id')} "
-                                  f"{traj[0].get('value')}->{traj[-1].get('value')} {unit}")
 
                 # ---- the frames themselves: the engine's own renders, one per pose ----
                 paths = []
@@ -919,17 +1069,18 @@ def register_cad_animation_tools(mcp: FastMCP) -> None:
                     shutil.copyfile(card, dst)
                 ordered = [os.path.join(work, f"c{k:05d}.png")
                            for k in range(head)] + list(paths)
-            if head or frames_dir:
-                # One contiguously numbered sequence: what ffmpeg's image2 demuxer needs,
-                # and what a caller composing a multi-segment chapter out of several
-                # render_animation calls concatenates.
-                seq = os.path.join(work, "seq")
-                os.makedirs(seq, exist_ok=True)
-                for k, src in enumerate(ordered):
-                    shutil.copyfile(src, os.path.join(seq, f"f{k:05d}.png"))
-                pattern = os.path.join(seq, "f%05d.png")
-            else:
-                pattern = os.path.join(work, "f%05d.png")
+            # One contiguously numbered sequence, ALWAYS: what ffmpeg's image2 demuxer
+            # needs, and what a caller composing a multi-segment chapter out of several
+            # render_animation calls concatenates. It cannot be skipped when the film
+            # happens to have no title card — `ordered` also carries the HELD repeats of
+            # each solved sample, and pointing the demuxer at the rendered f%05d.png
+            # files instead silently encoded one frame per sample (a 3-sample steer sweep
+            # asked for 8 frames and played 3).
+            seq = os.path.join(work, "seq")
+            os.makedirs(seq, exist_ok=True)
+            for k, src in enumerate(ordered):
+                shutil.copyfile(src, os.path.join(seq, f"f{k:05d}.png"))
+            pattern = os.path.join(seq, "f%05d.png")
             total = len(ordered)
             exported = None
             if frames_dir:

@@ -143,6 +143,98 @@ def test_explode_refuses_a_part_that_has_no_components(tools, tmp_path, monkeypa
     assert "components" in payload["error"], payload
 
 
+@needs_engine
+@needs_ffmpeg
+def test_a_steer_sweep_films_the_solved_kingpin_rotation(tools, tmp_path, monkeypatch):
+    """A steering assembly owns NO dimensional mate — its wheels are posed concentric to
+    kingpin pins — so kind='motion' with `mate_id` has nothing to drive and a steer film
+    used to be hand-built frame by frame. `steer=` must drive it: the film carries the
+    requested frame count and the caption names the angle range it swept."""
+    monkeypatch.setenv("CHUDWARE_PROJECT_SAVE_DIR", str(tmp_path))
+
+    def _part(name: str, ops: list) -> str:
+        doc = json.loads(tools["new_part"](name=name))["doc_id"]
+        assert json.loads(tools["add_features"](doc_id=doc, ops=ops))["ok"]
+        path = str(tmp_path / f"{name}.step+")
+        assert json.loads(tools["save_part"](path=path, doc_id=doc))["ok"]
+        return path
+
+    # A Ø300 x 100 disc laid over so it spins about the vehicle's lateral axis, with a
+    # vertical kingpin bore through its centre — the same topology as a real upright.
+    wheel = _part("anim_steer_wheel", [
+        {"op": "add_feature", "feature": {"type": "cylinder", "name": "Disc",
+                                          "params": {"radius": 150, "height": 100}}},
+        {"op": "add_feature", "feature": {"type": "transform", "name": "LayOver",
+                                          "params": {"rotate": [1, 0, 0], "angle": 90}}},
+        {"op": "add_feature", "feature": {"type": "cylinder", "name": "KingpinBore",
+                                          "params": {"radius": 25, "height": 600,
+                                                     "mode": "cut"}}}])
+    pin = _part("anim_steer_pin", [
+        {"op": "add_feature", "feature": {"type": "cylinder", "name": "Pin",
+                                          "params": {"radius": 24, "height": 400}}}])
+
+    asm = json.loads(tools["new_assembly"](name="anim_steer_axle"))["doc_id"]
+    stations = {"L": 400.0, "R": -400.0}
+    for tag, y in stations.items():
+        p = json.loads(tools["asm_add_component"](doc_id=asm, path=pin, fixed=True,
+                                                  name=f"kingpin_{tag}", at=[0, y, 0]))
+        w = json.loads(tools["asm_add_component"](doc_id=asm, path=wheel,
+                                                  name=f"wheel_{tag}", at=[0, y, 0]))
+        assert p["ok"] and w["ok"], (p, w)
+        m = json.loads(tools["asm_mate"](
+            doc_id=asm, mate_type="concentric",
+            a={"component": p["component"], "query": {"of": "face", "surf": "round"}},
+            b={"component": w["component"], "query": {"of": "face", "surf": "round",
+                                                      "pick": "smallest"}}))
+        assert m["ok"] and m["converged"], m
+    tree = cb.call("doc_tree", {"doc_id": asm})["tree"]
+    assert not [m for m in tree.get("mates", [])
+                if m.get("type") in ("angle", "distance")], "no drivable mate must exist"
+    assert json.loads(tools["save_part"](path=str(tmp_path / "axle.step+"),
+                                         doc_id=asm))["ok"]
+
+    out = str(tmp_path / "steer.gif")
+    res = tools["render_animation"](
+        kind="motion", doc_id=asm, save_path=out, frames=8, fps=8, size=[320, 240],
+        steps=3,
+        steer={"components": ["wheel_L", "wheel_R"],
+               "axis": [{"point": [0, 400, 0], "dir": [0, 0, 1]},
+                        {"point": [0, -400, 0], "dir": [0, 0, 1]}],
+               "angle_deg": 30})
+    assert isinstance(res, list) and len(res) == 2, res
+    caption = res[1]
+    assert os.path.exists(out), caption
+
+    probe = _probe(out)
+    assert probe["frames"] == 8, (probe, caption)
+    measured = json.loads(caption.split("measured: ", 1)[1].split("  render wall time")[0])
+    # The caption names the range that was swept, and the poses are the solver's own
+    # samples held across the film — not 8 interpolations.
+    assert measured["steer_range_deg"] == [0.0, 30.0], measured
+    assert measured["steer_components"] == ["wheel_L", "wheel_R"], measured
+    assert measured["steer_angles_deg"] == [30.0, 30.0], measured
+    assert measured["samples"] == 3, measured
+    assert "3 rendered" in caption, caption
+    assert '"steer_range_deg": [0.0, 30.0]' in caption, caption
+
+    # The film is a clone's business: the live assembly is untouched.
+    after = cb.call("doc_tree", {"doc_id": asm})["tree"]
+    assert [c.get("transform") for c in after["components"]] == \
+        [c.get("transform") for c in tree["components"]]
+
+
+@needs_engine
+def test_a_non_motion_kind_refuses_a_steer_spec_instead_of_ignoring_it(tools, tmp_path,
+                                                                      monkeypatch):
+    monkeypatch.setenv("CHUDWARE_PROJECT_SAVE_DIR", str(tmp_path))
+    doc = json.loads(tools["new_part"](name="anim_steer_offkind"))["doc_id"]
+    res = tools["render_animation"](kind="turntable", doc_id=doc,
+                                    save_path=str(tmp_path / "t.gif"), frames=4, fps=4,
+                                    steer={"components": ["x"], "angle_deg": 10})
+    payload = json.loads(res[0])
+    assert payload["ok"] is False
+    assert "kind='motion'" in payload["error"], payload
+
 @needs_ffmpeg
 def test_fea_kind_animates_a_solved_field_into_a_playable_mp4(tmp_path, monkeypatch):
     """A tiny two-tet grid with a von Mises field and a displacement vector, written here as

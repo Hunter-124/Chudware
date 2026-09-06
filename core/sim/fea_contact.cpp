@@ -300,6 +300,11 @@ ContactCandidateSet fea_contact_candidates(const std::vector<double>& points,
         int dir = -1;
         double gap = 0.0;
     };
+    // The facet gap of every spring, kept in step with out.springs: the spring
+    // itself carries the gap the PHYSICS uses (analytic where the probe answered),
+    // and the facet value is what the resolution block quotes beside it.
+    std::vector<double> facet_gaps;
+    std::set<int> fallback_nodes;
     for (int i : surface) {
         const int ci = out.component[static_cast<std::size_t>(i)];
         const double pi[3] = {points[i * 3], points[i * 3 + 1], points[i * 3 + 2]};
@@ -355,6 +360,32 @@ ContactCandidateSet fea_contact_candidates(const std::vector<double>& points,
             const std::array<int, 2> dedupe{std::min(i, b.node), std::max(i, b.node)};
             if (!paired.emplace(dedupe, 1).second) continue;
             const int cj = out.component[static_cast<std::size_t>(b.node)];
+            // ── The gap the physics uses: the CAD surfaces', not the facets' ────
+            // The PAIRING stays a mesh question (which nodes face each other, and
+            // how far apart the mesh put them), because that is what the springs
+            // are built on. The GAP is a geometry question, and on a curved fit
+            // the node-to-node projection answers it wrongly by up to the whole
+            // clearance — see ContactGapProbe in fea_contact.h.
+            double gap_used = b.gap;
+            if (options.gap_probe != nullptr) {
+                double analytic = 0.0;
+                const double* pj = &points[static_cast<std::size_t>(b.node) * 3];
+                if (options.gap_probe->pair_gap_mm(i, pi, b.node, pj, analytic)) {
+                    gap_used = analytic;
+                    ++out.gap_analytic_pairs;
+                } else {
+                    fallback_nodes.insert(i);
+                    fallback_nodes.insert(b.node);
+                }
+            }
+            // max_gap_mm is the caller's statement of what counts as contact, and
+            // it was applied to a facet gap that had understated the clearance. A
+            // pair the true surfaces put further apart than that is not a
+            // candidate at all.
+            if (std::abs(gap_used) > options.max_gap_mm) {
+                ++out.gap_beyond_max_pairs;
+                continue;
+            }
             const std::array<int, 2> comps{std::min(ci, cj), std::max(ci, cj)};
             auto git = group_of.find(comps);
             if (git == group_of.end()) {
@@ -374,12 +405,13 @@ ContactCandidateSet fea_contact_candidates(const std::vector<double>& points,
             s.a = flip ? b.node : i;
             s.b = flip ? i : b.node;
             s.k = k_pair;
-            s.gap0_mm = b.gap;
+            s.gap0_mm = gap_used;
             for (int c = 0; c < 3; ++c)
                 s.normal[static_cast<std::size_t>(c)] = flip ? -dir.n[c] : dir.n[c];
             s.area_mm2 = dir.area;
             s.group = git->second;
             out.springs.push_back(s);
+            facet_gaps.push_back(b.gap);
         }
     }
 
@@ -420,13 +452,48 @@ ContactCandidateSet fea_contact_candidates(const std::vector<double>& points,
         std::vector<double> gaps_copy = gaps;
         out.median_gap0_mm = median_of(gaps_copy);
         out.interface_h_mm = median_of(h_at_pair);
-        // "Can seat": within twice the closest approach. A pair whose initial gap is
-        // more than that needs the interface to deform by more than the clearance
-        // itself before it touches, which is outside small-deflection contact.
-        const double seat_limit = out.min_gap0_mm > 0.0 ? 2.0 * out.min_gap0_mm : 0.0;
+        // The facet statistics, always measured, and their difference from the
+        // analytic ones: what the linear discretization of this interface did to
+        // the clearance the guard has to judge (ContactGapProbe in fea_contact.h).
+        out.min_gap_facet_mm = *std::min_element(facet_gaps.begin(), facet_gaps.end());
+        out.median_gap_facet_mm = median_of(facet_gaps);
+        out.facet_error_mm = out.min_gap0_mm - out.min_gap_facet_mm;
+        // A NEGATIVE mesh gap is placement/facet error, not a press fit: the bodies
+        // were placed touching and the discretization pushed nodes through the
+        // partner face. k*|gap0| of preload is what that becomes if it is left in the
+        // spring — 56 kN through 11 pairs on the live keyway, reported as 3.0e6 MPa
+        // for a 1500 N load. The depth is REPORTED instead, and it is also the one
+        // direct measurement of this interface's own surface error: two bodies placed
+        // touching have no negative true gap, so a penetration of 0.37 mm says the
+        // mesh's boundary is that far from the CAD surface here. The RAW closest
+        // approach stays in min_gap0_mm — it is what tells the resolution guard the
+        // faces touch.
+        out.initial_penetration_max_mm = std::max(0.0, -out.min_gap0_mm);
+        // "Can seat": the initial gap is at or below what this mesh can resolve AT
+        // this interface — a length the interface supplies, never a multiple of a
+        // closest approach that may be 0 or negative (see kSeatFractionH). These are
+        // the pairs the solve's active set STARTS from; the rest seat as the bodies
+        // deform, and any of these that ends tensile is released.
+        out.seat_limit_mm = std::max({kSeatFractionH * out.interface_h_mm,
+                                      kSeatFractionGap * options.max_gap_mm,
+                                      kSeatMinAbsMm});
+        // The penetration is CLAMPED and nothing else is: adjusting the positive gaps
+        // inside some tolerance to touching (the classic "adjust to touch") was tried
+        // and rejected here, because on a curved fit the seated arc it produces is
+        // 2*r*sqrt(2*tol/clearance) — it scales with the SQUARE ROOT of the
+        // tolerance, so any tolerance that tracks the mesh (a fraction of h, or the
+        // measured residual) makes the seated arc a function of the element size.
+        // Measured on the pin-in-bore ladder of test_fea_contact: 5.70 / 3.99 /
+        // 4.23 mm across three sizes with the adjustment, 4.17 / 3.64 / 3.61 mm
+        // without it. What seats past the touching pairs is DEFORMATION.
+        for (ContactSpring& s : out.springs)
+            if (s.gap0_mm < 0.0) s.gap0_mm = 0.0;
         for (double gap : gaps)
-            if (gap <= seat_limit) ++out.seatable_pairs;
+            if (gap <= out.seat_limit_mm) ++out.seatable_pairs;
     }
+    // Counted whether or not any candidate survived: a set emptied by the analytic
+    // measurement still has to say what it could not measure.
+    out.gap_fallback_nodes = static_cast<int>(fallback_nodes.size());
     return out;
 }
 
@@ -435,6 +502,8 @@ ContactResolution fea_contact_resolution(const ContactCandidateSet& candidates) 
     out.min_active_pairs = kContactMinActivePairs;
     out.candidate_pairs = static_cast<int>(candidates.springs.size());
     out.seatable_pairs = candidates.seatable_pairs;
+    out.seat_limit_mm = candidates.seat_limit_mm;
+    out.initial_penetration_max_mm = candidates.initial_penetration_max_mm;
     out.h_interface_mm = candidates.interface_h_mm;
     out.candidate_area_mm2 = candidates.candidate_area_mm2;
     // The clearance the discretization has to resolve is the interface's own closest
@@ -442,6 +511,10 @@ ContactResolution fea_contact_resolution(const ContactCandidateSet& candidates) 
     // clearance to resolve, so the ratio is undefined and the patch criterion applies
     // instead (fea_contact.h).
     out.gap_mm = candidates.min_gap0_mm > 0.0 ? candidates.min_gap0_mm : 0.0;
+    out.gap_facet_mm = candidates.min_gap_facet_mm;
+    out.facet_error_mm = candidates.facet_error_mm;
+    out.gap_analytic = candidates.gap_analytic_pairs > 0;
+    out.gap_fallback_nodes = candidates.gap_fallback_nodes;
     const bool touching = !(out.gap_mm > 0.0);
     out.criterion = touching ? kCriterionPatchArea : kCriterionClearance;
     if (touching) {
@@ -453,16 +526,34 @@ ContactResolution fea_contact_resolution(const ContactCandidateSet& candidates) 
         out.ratio = out.h_interface_mm / out.gap_mm;
         out.max_ratio = kContactMaxHOverGap;
     }
-    // The size that resolves this interface: kContactMaxHOverGap elements' worth of
-    // the clearance (or kContactMinPatchElems across the patch when the faces touch),
-    // and never coarser than half the size that failed — an interface that funnelled
-    // at a legal ratio still has to be refined to place more pairs.
+    // ── The size that resolves this interface ───────────────────────────────────
+    // From the GEOMETRY: kContactMaxHOverGap elements' worth of the clearance, or
+    // kContactMinPatchElems across the patch when the faces touch. The `h/2` term
+    // is a floor for the case where that geometric size is COARSER than the
+    // element size already at the interface — an interface that funnelled at a
+    // legal ratio has nothing to learn from "use 4 x the clearance", it has to be
+    // refined to place more pairs, so halving what it has is the only actionable
+    // advice.
+    //
+    // It does NOT apply when the geometric criterion is the one that failed. Then
+    // the geometric size is finer than h by construction (ratio > max_ratio means
+    // h > max_ratio*gap) and it is exactly the size that makes the interface
+    // legal; halving h on top asks for resolution the criterion does not need. On
+    // the ME 490 hinge that difference is the whole answer: a 0.300 mm clearance
+    // at h = 1.775 mm needs 1.200 mm, and h/2 = 0.887 mm would have been a demand
+    // for twice the resolution the physics asks for on a fit whose mesher is
+    // already at its cell-shape floor.
     const double from_geometry = touching ? out.max_h_interface_mm
                                           : kContactMaxHOverGap * out.gap_mm;
+    const bool geometry_failed =
+        !touching && out.ratio > kContactMaxHOverGap && from_geometry > 0.0;
     out.required_interface_size_mm =
-        out.h_interface_mm > 0.0 && from_geometry > 0.0
-            ? std::min(from_geometry, out.h_interface_mm * 0.5)
-            : (from_geometry > 0.0 ? from_geometry : out.h_interface_mm * 0.5);
+        geometry_failed
+            ? from_geometry
+            : (out.h_interface_mm > 0.0 && from_geometry > 0.0
+                   ? std::min(from_geometry, out.h_interface_mm * 0.5)
+                   : (from_geometry > 0.0 ? from_geometry
+                                          : out.h_interface_mm * 0.5));
     if (candidates.springs.empty()) return out;
     if (touching) {
         // No clearance: the patch decides. Both halves are required, same shape as
@@ -479,14 +570,14 @@ ContactResolution fea_contact_resolution(const ContactCandidateSet& candidates) 
                 "interface is judged on its patch — the element size AT the interface "
                 "is %.4g mm across a %.4g mm^2 candidate patch (%.4g mm wide), which "
                 "is fewer than %.0f elements across it, and only %d of %d candidate "
-                "pairs are in contact. So any load would funnel through those few "
-                "nodes and be reported as a contact pressure. Set "
+                "pairs sit within the %.4g mm seat limit. So any load would funnel "
+                "through those few nodes and be reported as a contact pressure. Set "
                 "contact.interface_size_mm to %.3g (mm) or finer: it refines the "
                 "candidate faces LOCALLY, so the interface is resolved without "
                 "meshing the whole part that fine",
                 out.h_interface_mm, out.candidate_area_mm2,
                 std::sqrt(out.candidate_area_mm2), kContactMinPatchElems,
-                out.seatable_pairs, out.candidate_pairs,
+                out.seatable_pairs, out.candidate_pairs, out.seat_limit_mm,
                 out.required_interface_size_mm);
             out.reason = text;
             out.resolved = false;
@@ -494,18 +585,36 @@ ContactResolution fea_contact_resolution(const ContactCandidateSet& candidates) 
         return out;
     }
     if (out.ratio > kContactMaxHOverGap && out.seatable_pairs < kContactMinActivePairs) {
-        char text[640];
+        // Which clearance is being judged is part of the evidence: an ANALYTIC
+        // measurement is the CAD surfaces' own clearance and does not move when
+        // the mesh does, so the refusal is a statement about the geometry. A
+        // facet-only one (no CAD to measure against) can be an artefact of where
+        // the two meshes sampled a curved fit, and the reader has to know that.
+        char source[224];
+        if (out.gap_analytic)
+            std::snprintf(source, sizeof(source),
+                          "%.4g mm clearance (measured on the CAD faces; the mesh's "
+                          "own facets read %.4g mm)",
+                          out.gap_mm, out.gap_facet_mm);
+        else
+            std::snprintf(source, sizeof(source),
+                          "%.4g mm clearance (measured on the mesh facets — no CAD "
+                          "face was available, so on a curved fit this can understate "
+                          "the real clearance)",
+                          out.gap_mm);
+        char text[832];
         std::snprintf(
             text, sizeof(text),
             "the contact interface is not resolved by this mesh: the element size AT "
-            "the interface is %.4g mm against a %.4g mm clearance (ratio %.1f, limit "
-            "%.0f), and only %d of %d candidate pairs sit within twice the closest "
-            "approach — so any load would funnel through those few nodes and be "
+            "the interface is %.4g mm against a %s (ratio %.1f, limit "
+            "%.0f), and only %d of %d candidate pairs sit within the %.4g mm seat "
+            "limit — so any load would funnel through those few nodes and be "
             "reported as a contact pressure. Set contact.interface_size_mm to %.3g "
             "(mm) or finer: it refines the candidate faces LOCALLY, so the interface "
             "is resolved without meshing the whole part that fine",
-            out.h_interface_mm, out.gap_mm, out.ratio, kContactMaxHOverGap,
-            out.seatable_pairs, out.candidate_pairs, out.required_interface_size_mm);
+            out.h_interface_mm, source, out.ratio, kContactMaxHOverGap,
+            out.seatable_pairs, out.candidate_pairs, out.seat_limit_mm,
+            out.required_interface_size_mm);
         out.reason = text;
         out.resolved = false;
     }
@@ -555,6 +664,70 @@ void fea_contact_resolution_after_solve(ContactResolution& resolution,
         resolution.reason = text;
         resolution.resolved = false;
         resolution.pressure_reliable = false;
+    }
+}
+
+void fea_contact_resolution_load_path(ContactResolution& resolution,
+                                      double applied_load_n, double carried_load_n,
+                                      bool held_by_contact_only) {
+    resolution.applied_load_n = applied_load_n;
+    resolution.carried_load_n = carried_load_n;
+    resolution.load_fraction = 0.0;
+    resolution.load_path_note.clear();
+    char text[768];
+    if (!held_by_contact_only) {
+        // Every body reaches a fixture without the interface. Whatever the pairs
+        // picked up is the share of a parallel stiffness path — the number the
+        // keyway isolate reported as a seat pressure while both bodies were
+        // grounded and the contact carried 0.7 % of the load.
+        resolution.contact_carries_load = false;
+        resolution.pressure_reliable = false;
+        std::snprintf(
+            text, sizeof(text),
+            "the contact is not the load path: every body in this study is grounded "
+            "independently of the interface, so it is a REDUNDANT parallel path and "
+            "the %.4g N it picked up is whatever share its stiffness took, not the "
+            "load. Quote that resultant as such and do not read force/area as a seat "
+            "pressure. To measure the seat, fixture only the bodies that are meant to "
+            "be held and let the contact carry the rest — check that the fixture face "
+            "set does not reach across the interface onto the mating body",
+            carried_load_n);
+        resolution.load_path_note = text;
+        return;
+    }
+    if (!(applied_load_n > kLoadPathMinAppliedN)) {
+        // A body IS held only by contact, but nothing external pulls on it: there is
+        // no load to trace across the interface, so there is no fraction to judge.
+        // Not a refusal, and not a proof either.
+        resolution.contact_carries_load = carried_load_n > 0.0;
+        std::snprintf(text, sizeof(text),
+                      "no external load is applied to the body(ies) held only by "
+                      "contact, so the %.4g N across the interface is not a traced "
+                      "load path — load_fraction is not defined for this study",
+                      carried_load_n);
+        resolution.load_path_note = text;
+        return;
+    }
+    resolution.load_fraction = carried_load_n / applied_load_n;
+    resolution.contact_carries_load = resolution.load_fraction >= kMinLoadFraction;
+    if (resolution.contact_carries_load) return;
+    std::snprintf(
+        text, sizeof(text),
+        "the contact did not carry the load: %.4g N of the %.4g N applied to the "
+        "body(ies) held only by this interface crossed it (%.3g %%, bar %.0f %%). A "
+        "converged solve that routes the load somewhere else answers a different "
+        "question than the one asked, and its force/area is not the seat pressure. "
+        "The usual cause is a fixture that also grounds the mating body — a face "
+        "set or filter that reached across the interface — which grounds both sides "
+        "and leaves the contact carrying nothing; the other is an interface that "
+        "separated under this load direction",
+        carried_load_n, applied_load_n, 100.0 * resolution.load_fraction,
+        100.0 * kMinLoadFraction);
+    resolution.load_path_note = text;
+    resolution.pressure_reliable = false;
+    if (resolution.resolved) {
+        resolution.reason = resolution.load_path_note;
+        resolution.resolved = false;
     }
 }
 

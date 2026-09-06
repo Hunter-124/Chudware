@@ -662,10 +662,15 @@ def test_run_shell_still_refuses_a_genuinely_unknown_argument():
         "command (required)", "cwd (optional)", "timeout_s (optional)"], err
 
 
-# --- run_fea_static(mesh_size_mm=...) -> REFUSE. `mesh_fineness` is a
+# --- mesh_size_mm on a DIAL-ONLY tool -> REFUSE. `mesh_fineness` is a
 #     DIMENSIONLESS 0..1 factor (cad_sim_tools.py:75-76, 284-285), so a
 #     millimetre count bound there would mesh at the wrong density and report
 #     success. Contract rule 1: a unit mismatch is never aliased.
+#     run_fea_static / run_fea_contact answer the mismatch the other way round —
+#     they take a REAL `mesh_size_mm` (an exact element size that maps to
+#     study.target_size_mm), and an exact name binds before this table is even
+#     consulted. So the refusal is asserted on run_fea_modal, which still has
+#     the dial alone, and the binding is asserted on run_fea_static.
 
 def test_mesh_fineness_really_is_dimensionless_not_a_length():
     """The evidence for the refusal, taken from the tool itself rather than from
@@ -679,10 +684,9 @@ def test_mesh_fineness_really_is_dimensionless_not_a_length():
     assert sig.parameters["mesh_fineness"].default == 0.5
 
 
-def test_run_fea_static_mesh_size_mm_is_refused_and_the_error_teaches_the_unit():
+def test_mesh_size_mm_is_refused_on_a_dial_only_tool_and_teaches_the_unit():
     kwargs, notes, err = _agent_reconcile(
-        "run_fea_static", doc_id="d1", fixtures=["bottom"],
-        loads=[{"face": "top", "pressure": 0.5}], mesh_size_mm=2.0)
+        "run_fea_modal", doc_id="d1", fixtures=["bottom"], mesh_size_mm=2.0)
     assert err is not None and err["status"] == "unknown_argument", (kwargs, notes)
     assert kwargs == {} and err["unknown_params"] == ["mesh_size_mm"], err
     # It must NOT have been quietly bound to the fineness knob.
@@ -698,10 +702,21 @@ def test_run_fea_static_mesh_size_mm_is_refused_and_the_error_teaches_the_unit()
     }], err["quantity_mismatch"]
 
 
-def test_run_fea_static_mesh_size_mm_teaches_the_same_thing_on_the_mcp_path():
-    payload = _server_call("run_fea_static", {
-        "fixtures": ["bottom"], "loads": [{"face": "top", "pressure": 0.5}],
-        "mesh_size_mm": 2.0})
+def test_mesh_size_mm_binds_to_the_real_parameter_where_the_tool_has_one():
+    """run_fea_static grew an exact element size (mm) so a released convergence leg can
+    be re-solved on its own mesh. The millimetre value must arrive AS mesh_size_mm — the
+    quantity-mismatch table must neither refuse it nor divert it to the dial."""
+    kwargs, notes, err = _agent_reconcile(
+        "run_fea_static", doc_id="d1", fixtures=["bottom"],
+        loads=[{"face": "top", "pressure": 0.5}], mesh_size_mm=2.0)
+    assert err is None, (err, notes)
+    assert kwargs["mesh_size_mm"] == 2.0, kwargs
+    assert "mesh_fineness" not in kwargs, kwargs
+
+
+def test_mesh_size_mm_teaches_the_same_thing_on_the_mcp_path():
+    payload = _server_call("run_fea_modal", {
+        "fixtures": ["bottom"], "mesh_size_mm": 2.0})
     assert payload["status"] == "unknown_argument", payload
     assert "mesh_fineness" in payload["error"] and "0..1" in payload["error"], payload
     assert payload["quantity_mismatch"][0]["parameter"] == "mesh_fineness", payload

@@ -2521,6 +2521,11 @@ add_test(NAME cam_processes COMMAND test_cam_processes)
 # by fea_static_solve_contact's active-set loop. Appended as target_sources so the
 # chudware_sim source list above is untouched.
 target_sources(chudware_sim PRIVATE sim/fea_contact.cpp)
+# sim/fea_selection.cpp is the BC-selection half: does one fixture/load selector's
+# resolved node set span a declared contact pair? It lives in chudware_sim (not with
+# its fea_run call site in chudware_mesh) so the contact gates can exercise the
+# refusal without OCCT or the mesher.
+target_sources(chudware_sim PRIVATE sim/fea_selection.cpp)
 
 # Contact gates (OCCT-/mesher-free inline structured meshes, so it links only
 # chudware_sim like test_tet10):
@@ -2529,7 +2534,10 @@ target_sources(chudware_sim PRIVATE sim/fea_contact.cpp)
 #   (b) the SAME model loaded the other way -> the active set empties and the run is
 #       REFUSED as a mechanism instead of reporting a rigid-body "solution";
 #   (c) a pin in a clearance bore loaded transversely -> contact is active on ONE side
-#       only and the reaction balances.
+#       only and the reaction balances;
+#   (d) a fixture whose cylinder filter reaches across the clearance and captures BOTH
+#       bores -> refused by selection_spans_contact naming both bodies; the same
+#       fixture at a tolerance below the clearance holds one body and solves.
 add_executable(test_fea_contact tests/test_fea_contact.cpp)
 target_include_directories(test_fea_contact PRIVATE ${doctest_SOURCE_DIR})
 target_link_libraries(test_fea_contact PRIVATE chudware_sim)

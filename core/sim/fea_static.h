@@ -159,6 +159,9 @@ struct BondSpring {
 // side. The active-set loop (fea_static_solve_contact) deactivates any pair whose
 // converged normal force turns TENSILE (gap > 0, i.e. the surfaces have separated) and
 // re-activates any pair whose gap has closed, so no pair ever pulls its partner back.
+// Where that loop STARTS is FeaContactOptions::seat_tolerance_mm: only pairs the mesh
+// cannot tell from touching begin active, so the first iterate is the applied load
+// acting on the seated arc instead of thousands of open pairs being dragged shut.
 //
 // A frictionless normal-only pair leaves the tangential rigid-body modes of a seated
 // part free (a box on a box can slide sideways under a purely vertical load), which is
@@ -215,6 +218,20 @@ struct FeaContactReport {
 struct FeaContactOptions {
     int max_iterations = 25;
     double tangential_stabilization = 1e-4;
+    // Where the active set STARTS: the widest initial gap (mm) a candidate may have
+    // and still begin the loop ACTIVE. Negative (the default) means the loop has no
+    // seat rule of its own and every candidate starts active.
+    //
+    // It matters because an active pair whose gap0 > 0 carries k·gap0 of TENSION on
+    // the first right-hand side — that is the mechanism by which a part held only by
+    // contact travels into its seat, and it is also how a wide candidate set
+    // destroys a solve: on the live keyway all 11989 candidates (gaps 0 … 0.4 mm)
+    // started active, the first iterate was dominated by thousands of pairs being
+    // dragged shut rather than by the 1500 N load, and the surviving active set was
+    // round-off luck — 8, then 12, then 13, then 2 pairs across identical runs.
+    // fea_run passes ContactCandidateSet::seat_limit_mm here (fea_contact.h), which
+    // is the gap the MESH cannot tell from touching.
+    double seat_tolerance_mm = -1.0;
 };
 
 // nodes_per_elem==4 uses the analytical tet4 strain-displacement operator UNCHANGED

@@ -22,6 +22,7 @@
 #include <vector>
 
 #include "sim/fea_contact.h"
+#include "sim/fea_selection.h"
 #include "sim/fea_static.h"
 
 using chudware::sim::ContactCandidateOptions;
@@ -30,6 +31,8 @@ using chudware::sim::fea_static_solve_contact;
 using chudware::sim::FeaContactOptions;
 using chudware::sim::FeaContactReport;
 using chudware::sim::FeaStaticResult;
+using chudware::sim::selection_spans_contact;
+using chudware::sim::SelectionSpan;
 
 namespace {
 
@@ -170,6 +173,41 @@ ActivePatch active_patch(const std::vector<chudware::sim::ContactSpring>& spring
         if (counted.insert(s.a).second) out.area_mm2 += s.area_mm2;
     }
     return out;
+}
+
+// A deterministic pseudo-random value in [0,1) from one integer — the mesher's node
+// placement is not random, but it IS arbitrary at this scale, and what varies
+// between two meshes of the same solid is exactly this: where on the true surface
+// each node landed.
+double hash01(unsigned x) {
+    x = x * 1664525u + 1013904223u;
+    x ^= x >> 16;
+    x *= 2246822519u;
+    x ^= x >> 13;
+    return static_cast<double>(x >> 8) / 16777216.0;
+}
+
+// Push one radial LAYER of the tube whose nodes start at `base` in or out by up to
+// `amp` mm, node by node. This is the mesher's own surface residual on a curved face
+// (measured 4.7e-3 mm mean / 0.40 mm max on the live keyway at h = 0.25 mm): it is
+// what makes the CLOSEST APPROACH of a nominally-touching fit a matter of luck, and
+// therefore what a seat rule keyed on the closest approach inherits.
+void jitter_layer(Mesh& m, int base, int nr, int nt, int nz, int layer, double amp,
+                  unsigned seed, double cx, double cy) {
+    const int NR = nr + 1;
+    for (int k = 0; k <= nz; ++k)
+        for (int it = 0; it < nt; ++it) {
+            const int nid = base + (k * nt + it) * NR + layer;
+            const std::size_t at = static_cast<std::size_t>(nid) * 3;
+            const double dx = m.points[at] - cx, dy = m.points[at + 1] - cy;
+            const double r = std::sqrt(dx * dx + dy * dy);
+            if (!(r > 0.0)) continue;
+            const double d =
+                amp * (2.0 * hash01(static_cast<unsigned>(nid) * 2654435761u + seed) -
+                       1.0);
+            m.points[at] = cx + dx * (r + d) / r;
+            m.points[at + 1] = cy + dy * (r + d) / r;
+        }
 }
 
 }  // namespace
@@ -606,4 +644,504 @@ TEST_CASE("contact: a touching seat coarser than its own patch is refused") {
                 res.h_interface_mm, res.candidate_area_mm2, res.max_h_interface_mm,
                 res.seatable_pairs, res.candidate_pairs,
                 res.required_interface_size_mm);
+}
+
+// ── (h) A nominally-touching fit seats the same arc at every mesh size ──────────
+// The defect this case exists for. The seat rule used to be "within TWICE the
+// closest approach", which on a fit whose bodies were placed TOUCHING collapses to
+// zero the instant one node lands inside the partner face — so only the pairs the
+// discretization pushed through could seat, and that population is mesh noise. On
+// the live FRAME-PEDAL-BRAKE keyway the same request seated 8, then 12, then 13,
+// then 2 pairs across otherwise identical runs, and at 2 the study was refused as a
+// point load.
+//
+// Here: a pin in a bore with 0.35 mm of radial clearance, PLACED TOUCHING on one
+// side (the pin axis offset by the whole clearance), meshed at three sizes with a
+// different node-placement residual on each. The physical answer does not depend on
+// the mesh, so the SEATED ARC must not either: active pairs x h, per axial ring of
+// nodes, is a length and it has to agree across the three meshes. The old rule
+// cannot do this — its seed is #(gap <= 0), printed below, which swings by a factor
+// of several between the same three meshes.
+TEST_CASE("contact: a touching pin in a bore seats the same arc at every mesh size") {
+    // Both bodies are thin rings, so the fit is COMPLIANT — which is the live
+    // regime: on the keyway the load closes 0.42 mm, several times the 0.127 mm the
+    // mesh can resolve, so the seated arc is decided by the LOAD and the geometry
+    // and not by which nodes happened to land inside the partner face. A solid
+    // thick-walled pin is the opposite case: 8 kN closes it by 2 um, an order below
+    // any mesh's own surface residual, and then no seat rule can produce a
+    // mesh-independent arc because the physics itself is below the noise floor.
+    const double clearance = 0.35, r_pin = 6.0, Lz = 4.0, F = 20000.0;
+    struct Leg {
+        int nt;
+        int nz;
+        unsigned seed;
+    };
+    // h at the interface 0.45 / 0.35 / 0.28 mm — 8 to 14 elements across the seated
+    // arc, so the arc is resolved on all three and what is being compared is the
+    // seat rule, not the element count. The fourth leg re-meshes the middle size
+    // with a different surface residual: that is the run-to-run case, where the
+    // geometry is identical and only the noise moved.
+    const Leg legs[4] = {{84, 9, 1u}, {108, 11, 8u}, {135, 14, 15u}, {108, 11, 23u}};
+    double arc_mm[4] = {0.0, 0.0, 0.0, 0.0};
+    int seatable[4] = {0, 0, 0, 0};
+    for (int L = 0; L < 4; ++L) {
+        const int nt = legs[L].nt, nz = legs[L].nz;
+        const double h_theta = 2.0 * M_PI * r_pin / nt;
+        // The wall is subdivided the same way on every leg: what varies between the
+        // three meshes is the size AT THE INTERFACE, which is what
+        // contact.interface_size_mm buys, not the bending stiffness of the rings.
+        const int nr = 3;
+        Mesh m;
+        // Pin (r 4.5 .. 6), axis offset +x by the whole clearance: it touches the
+        // bore at theta = 0 and opens to 2 x clearance at theta = pi.
+        add_tube(m, nr, nt, nz, 4.5, r_pin, 0.0, Lz, clearance, 0.0);
+        const int n_pin = static_cast<int>(m.points.size() / 3);
+        jitter_layer(m, 0, nr, nt, nz, /*layer=*/nr, 0.05 * h_theta, legs[L].seed,
+                     clearance, 0.0);
+        // Bore (r 6.35 .. 7.85), fixed on its outer wall.
+        add_tube(m, nr, nt, nz, r_pin + clearance, 7.85, 0.0, Lz, 0.0, 0.0);
+        jitter_layer(m, n_pin, nr, nt, nz, /*layer=*/0, 0.05 * h_theta,
+                     legs[L].seed + 977u, 0.0, 0.0);
+
+        const int n_nodes = static_cast<int>(m.points.size() / 3);
+        std::vector<double> forces(static_cast<std::size_t>(n_nodes) * 3, 0.0);
+        std::vector<int> fixed;
+        for (int i = n_pin; i < n_nodes; ++i) {
+            const double x = m.points[static_cast<std::size_t>(i) * 3];
+            const double y = m.points[static_cast<std::size_t>(i) * 3 + 1];
+            if (std::sqrt(x * x + y * y) > 7.84) fixed.push_back(i);
+        }
+        REQUIRE_FALSE(fixed.empty());
+        for (int i = 0; i < n_pin; ++i)
+            forces[static_cast<std::size_t>(i) * 3] = F / n_pin;
+
+        ContactCandidateOptions copt;
+        copt.max_gap_mm = 0.4;
+        auto cand = fea_contact_candidates(m.points, m.tets, 4, kE, copt);
+        REQUIRE(cand.error.empty());
+        REQUIRE(cand.n_components == 2);
+        // The mesh really is placed touching, and the residual really does put nodes
+        // through the partner face — which is why the closest approach is useless as
+        // a seat scale and is reported as a penetration depth instead.
+        CHECK(cand.min_gap0_mm <= 0.0);
+        CHECK(cand.initial_penetration_max_mm > 0.0);
+        // The seat limit is a length the interface supplies, and it does not depend
+        // on that penetration.
+        CHECK(cand.seat_limit_mm >= chudware::sim::kSeatFractionGap * copt.max_gap_mm);
+        CHECK(cand.seatable_pairs >= chudware::sim::kContactMinActivePairs);
+        seatable[L] = cand.seatable_pairs;
+        int old_rule_seed = 0;
+        for (const auto& s : cand.springs)
+            if (s.gap0_mm <= 0.0) ++old_rule_seed;
+
+        FeaContactOptions sopt;
+        sopt.seat_tolerance_mm = cand.seat_limit_mm;
+        FeaContactReport report;
+        FeaStaticResult r =
+            fea_static_solve_contact(m.points, m.tets, kE, kNu, kYield, fixed, forces, 4,
+                                     {}, cand.springs, sopt, report);
+        REQUIRE(r.ok);
+        // A distributed patch, not a point load, on every mesh — and the load really
+        // crosses the interface.
+        CHECK(report.active_pairs >= chudware::sim::kContactMinActivePairs);
+        CHECK(r.reaction_force_n[0] == doctest::Approx(-F).epsilon(0.02));
+        CHECK(r.equilibrium_error_pct < 1.0);
+        REQUIRE(report.groups.size() == 1);
+        const chudware::sim::FeaContactGroup& g = report.groups[0];
+        // Active pairs x h, per ring of axial nodes: the seated ARC in mm.
+        arc_mm[L] = report.active_pairs * h_theta / (nz + 1);
+        const double mean_p = g.contact_force_n / g.contact_area_mm2;
+        std::printf("(h) nt=%d h=%.3f mm: seat_limit=%.4f penetration=%.4f "
+                    "seatable=%d/%d active=%d arc=%.3f mm (area %.3f mm^2, %d pair(s) "
+                    "at gap<=0 — the old rule's whole seed) disp=%.4f mm iters=%d "
+                    "contact=%.1f N mean_p=%.1f MPa peak_p=%.1f MPa\n",
+                    nt, h_theta, cand.seat_limit_mm, cand.initial_penetration_max_mm,
+                    cand.seatable_pairs, static_cast<int>(cand.springs.size()),
+                    report.active_pairs, arc_mm[L], g.contact_area_mm2, old_rule_seed,
+                    r.max_disp_mm, report.contact_iterations, g.contact_force_n, mean_p,
+                    g.max_contact_pressure_mpa);
+    }
+    const double lo = std::min({arc_mm[0], arc_mm[1], arc_mm[2]});
+    const double hi = std::max({arc_mm[0], arc_mm[1], arc_mm[2]});
+    REQUIRE(lo > 0.0);
+    CHECK(hi / lo <= 1.25);
+    // Legs 1 and 3 are the SAME mesh size with a different surface residual — the
+    // run-to-run case the live keyway failed, where the same request seated 8, then
+    // 12, then 13, then 2 pairs. Neither the seatable population nor the seated arc
+    // may follow the noise.
+    CHECK(arc_mm[3] == doctest::Approx(arc_mm[1]).epsilon(0.15));
+    CHECK(seatable[3] == doctest::Approx(seatable[1]).epsilon(0.10));
+    std::printf("(h) seated arc across three meshes: %.3f / %.3f / %.3f mm — spread "
+                "%.1f%%; the middle size re-meshed with another residual: %.3f mm, "
+                "seatable %d vs %d\n",
+                arc_mm[0], arc_mm[1], arc_mm[2], 100.0 * (hi / lo - 1.0), arc_mm[3],
+                seatable[3], seatable[1]);
+}
+
+// ── (i) A fixture selection must not SPAN the contact interface ────────────────
+// The live defect (keyway isolate, 0.35 mm radial clearance): ONE fixture face-set
+// carrying a cylinder filter at the default perp_tol_mm = 1.5 mm was pointed at the
+// bore's inner face and resolved the MATING body's outer face as well, because the
+// tolerance that finds a face is four times the clearance the study exists to close.
+// Both bodies were grounded, the contact carried 9.9 N of a 1500 N load, and the
+// run reported CONVERGED with a 0.0% equilibrium error. Nothing downstream can see
+// it: the mechanism gate is satisfied (both components reach a fixture), the
+// interface is meshed fine, and the fixtures react everything, so equilibrium is
+// perfect. It is a defect in the SELECTION and it is refused there.
+TEST_CASE("contact: a fixture filter that captures both bores is refused") {
+    // Pin r 3..5, bore r 5.35..9 — the live 0.35 mm radial clearance. Node layers
+    // sit at r = 3, 4, 5 (pin) and r = 5.35, 7.175, 9 (bore).
+    const double clearance = 0.35, r_bore_id = 5.0 + clearance;
+    const int nt = 24, nz = 3, nr = 2;
+    Mesh m;
+    add_tube(m, nr, nt, nz, 3.0, 5.0, 0.0, 10.0, 0.0, 0.0);            // pin  -> body 0
+    const int n_pin = static_cast<int>(m.points.size() / 3);
+    add_tube(m, nr, nt, nz, r_bore_id, 9.0, 0.0, 10.0, 0.0, 0.0);      // bore -> body 1
+    const int n_nodes = static_cast<int>(m.points.size() / 3);
+
+    ContactCandidateOptions copt;
+    copt.max_gap_mm = 0.4;
+    auto cand = fea_contact_candidates(m.points, m.tets, 4, kE, copt);
+    REQUIRE(cand.error.empty());
+    REQUIRE(cand.n_components == 2);
+    REQUIRE_FALSE(cand.springs.empty());
+    REQUIRE(cand.group_components.size() == 1);
+
+    // The fixture: a CYLINDER filter on the bore's inner face. A node belongs when
+    // its distance to the r = 5.35 cylinder is within perp_tol_mm — exactly the test
+    // nodes_in_faceset_surface applies to a quadric faceset. perp_tol is the only
+    // thing that varies between the two legs.
+    auto cylinder_filter = [&](double perp_tol) {
+        std::vector<int> ids;
+        for (int i = 0; i < n_nodes; ++i) {
+            const double x = m.points[static_cast<std::size_t>(i) * 3];
+            const double y = m.points[static_cast<std::size_t>(i) * 3 + 1];
+            if (std::abs(std::sqrt(x * x + y * y) - r_bore_id) <= perp_tol)
+                ids.push_back(i);
+        }
+        return ids;
+    };
+    // The load: +x on the pin's own inner ring, which neither filter reaches.
+    const double F = 1500.0;
+    std::vector<int> pin_load;
+    for (int i = 0; i < n_pin; ++i) {
+        const double x = m.points[static_cast<std::size_t>(i) * 3];
+        const double y = m.points[static_cast<std::size_t>(i) * 3 + 1];
+        if (std::abs(std::sqrt(x * x + y * y) - 3.0) < 1e-9) pin_load.push_back(i);
+    }
+    REQUIRE_FALSE(pin_load.empty());
+    std::vector<double> forces(static_cast<std::size_t>(n_nodes) * 3, 0.0);
+    for (int nid : pin_load)
+        forces[static_cast<std::size_t>(nid) * 3] = F / pin_load.size();
+
+    auto carried = [](const FeaContactReport& rep) {
+        double sum = 0.0;
+        for (const auto& g : rep.groups)
+            sum += std::sqrt(g.force_n[0] * g.force_n[0] + g.force_n[1] * g.force_n[1] +
+                             g.force_n[2] * g.force_n[2]);
+        return sum;
+    };
+
+    // ── The loose leg: perp_tol 1.5 mm across a 0.35 mm clearance ──────────────
+    const std::vector<int> loose = cylinder_filter(1.5);
+    const SelectionSpan span =
+        selection_spans_contact("fixture", "F7b4f57 (fixtures[0])", loose, cand);
+    REQUIRE(span.spans);
+    // Both bodies are NAMED, with the count captured on each against the body's own
+    // size: the whole bore inner face (r = 5.35) plus two layers of the pin
+    // (r = 5 at 0.35 mm through the clearance, r = 4 at 1.35 mm).
+    CHECK(span.body_a == 0);
+    CHECK(span.body_b == 1);
+    CHECK(span.captured_a == 2 * (nz + 1) * nt);
+    CHECK(span.captured_b == (nz + 1) * nt);
+    CHECK(span.body_a_nodes == (nz + 1) * nt * (nr + 1));
+    CHECK(span.body_b_nodes == (nz + 1) * nt * (nr + 1));
+    CHECK(span.message.find("mesh body 0") != std::string::npos);
+    CHECK(span.message.find("mesh body 1") != std::string::npos);
+    CHECK(span.message.find("F7b4f57 (fixtures[0])") != std::string::npos);
+    CHECK(span.message.find("perp_tol_mm") != std::string::npos);
+
+    // And this is what the refusal buys: solved, that same study CONVERGES and the
+    // contact carries essentially nothing, because the fixture — not the joint —
+    // reacts the load on both sides of the interface.
+    FeaContactReport loose_rep;
+    FeaStaticResult loose_res =
+        fea_static_solve_contact(m.points, m.tets, kE, kNu, kYield, loose, forces, 4, {},
+                                 cand.springs, FeaContactOptions{}, loose_rep);
+    REQUIRE(loose_res.ok);
+    CHECK(loose_rep.converged);
+    CHECK(loose_res.equilibrium_error_pct < 1.0);
+    CHECK(carried(loose_rep) < 0.05 * F);
+
+    // ── The tightened leg: perp_tol below the clearance -> one body, and it solves ─
+    const std::vector<int> tight = cylinder_filter(0.15);
+    REQUIRE(tight.size() == static_cast<std::size_t>((nz + 1) * nt));
+    const SelectionSpan ok_span =
+        selection_spans_contact("fixture", "F7b4f57 (fixtures[0])", tight, cand);
+    CHECK_FALSE(ok_span.spans);
+    CHECK(ok_span.message.empty());
+
+    FeaContactReport tight_rep;
+    FeaStaticResult tight_res =
+        fea_static_solve_contact(m.points, m.tets, kE, kNu, kYield, tight, forces, 4, {},
+                                 cand.springs, FeaContactOptions{}, tight_rep);
+    REQUIRE(tight_res.ok);
+    CHECK(tight_rep.converged);
+    CHECK(tight_rep.active_pairs > 0);
+    CHECK(tight_rep.active_pairs < tight_rep.candidate_pairs);  // one side only
+    CHECK(tight_res.reaction_force_n[0] == doctest::Approx(-F).epsilon(0.01));
+    CHECK(tight_res.equilibrium_error_pct < 1.0);
+    // Now the joint IS the load path.
+    CHECK(carried(tight_rep) == doctest::Approx(F).epsilon(0.1));
+
+    std::printf("(i) perp_tol 1.5 mm over a %.2f mm clearance captured body 0 "
+                "(%d/%d nodes) AND body 1 (%d/%d) -> refused; solved anyway it "
+                "converges with %.1f N of %.0f N through the contact. perp_tol "
+                "0.15 mm captures one body and carries %.1f N.\n",
+                clearance, span.captured_a, span.body_a_nodes, span.captured_b,
+                span.body_b_nodes, carried(loose_rep), F, carried(tight_rep));
+}
+
+// ── (j) A pressure is only an answer when the contact carries the load ──────────
+// The second half of the keyway isolate's non-answer. Case (i) refuses the
+// FIXTURE SELECTION that grounds both bodies; this one is the a-posteriori guard
+// that catches every other way the load can miss the interface — the packet said
+// `contact_pressure_reliable: true` while 6 active pairs carried 9.9 N of a
+// 1500 N applied load, which is a quotient, not a seat pressure.
+//
+// Same conformal seated pad as (e), solved twice: once with the pad held ONLY by
+// the contact (the interface IS the load path, fraction ~ 1), once with the pad's
+// own seat face fixtured too, so both bodies are grounded independently and the
+// interface is a redundant parallel spring.
+TEST_CASE("contact: the load path decides whether the pressure is reliable") {
+    const double gap = 0.35, pad = 4.0;
+    Mesh m = seated_pad(/*plate_n=*/20, /*pad_n=*/8, gap, pad);
+    ContactCandidateOptions copt;
+    copt.max_gap_mm = 0.5;
+    auto cand = fea_contact_candidates(m.points, m.tets, 4, kE, copt);
+    REQUIRE(cand.error.empty());
+    REQUIRE_FALSE(cand.springs.empty());
+    const chudware::sim::ContactResolution res =
+        chudware::sim::fea_contact_resolution(cand);
+    REQUIRE(res.resolved);
+
+    const int n_nodes = static_cast<int>(m.points.size() / 3);
+    std::vector<double> forces(static_cast<std::size_t>(n_nodes) * 3, 0.0);
+    const std::vector<int> base = nodes_at_z(m, 0.0);
+    const std::vector<int> seat = nodes_at_z(m, 10.0 + gap);
+    const std::vector<int> top = nodes_at_z(m, 18.0 + gap);
+    REQUIRE_FALSE(base.empty());
+    REQUIRE_FALSE(seat.empty());
+    REQUIRE_FALSE(top.empty());
+    const double F = 4000.0;
+    for (int nid : top) forces[static_cast<std::size_t>(nid) * 3 + 2] = -F / top.size();
+
+    // ── The pad is held only by the seat: the contact is the load path ──────────
+    FeaContactReport held_rep;
+    FeaStaticResult held_r =
+        fea_static_solve_contact(m.points, m.tets, kE, kNu, kYield, base, forces, 4, {},
+                                 cand.springs, FeaContactOptions{}, held_rep);
+    REQUIRE(held_r.ok);
+    REQUIRE(held_rep.converged);
+    REQUIRE(held_rep.groups.size() == 1);
+    const double held_carried = held_rep.groups[0].contact_force_n;
+    chudware::sim::ContactResolution held_res = res;
+    chudware::sim::fea_contact_resolution_after_solve(
+        held_res, held_rep.active_pairs, held_carried,
+        held_rep.groups[0].contact_area_mm2);
+    REQUIRE(held_res.pressure_reliable);
+    chudware::sim::fea_contact_resolution_load_path(held_res, F, held_carried,
+                                                    /*held_by_contact_only=*/true);
+    CHECK(held_res.contact_carries_load);
+    CHECK(held_res.load_fraction == doctest::Approx(1.0).epsilon(0.05));
+    CHECK(held_res.applied_load_n == doctest::Approx(F));
+    CHECK(held_res.carried_load_n == doctest::Approx(held_carried));
+    CHECK(held_res.load_path_note.empty());
+    CHECK(held_res.resolved);
+    CHECK(held_res.pressure_reliable);  // a real seat pressure survives the guard
+
+    // ── Both bodies grounded: the same seat carries almost nothing ──────────────
+    // The fixture now also pins the pad's seat face, which is precisely what a
+    // face-set filter that reaches across the clearance does.
+    std::vector<int> both = base;
+    both.insert(both.end(), seat.begin(), seat.end());
+    FeaContactReport gnd_rep;
+    FeaStaticResult gnd_r =
+        fea_static_solve_contact(m.points, m.tets, kE, kNu, kYield, both, forces, 4, {},
+                                 cand.springs, FeaContactOptions{}, gnd_rep);
+    REQUIRE(gnd_r.ok);
+    REQUIRE(gnd_rep.converged);
+    double gnd_carried = 0.0, gnd_area = 0.0;
+    for (const chudware::sim::FeaContactGroup& g : gnd_rep.groups) {
+        gnd_carried += g.contact_force_n;
+        gnd_area += g.contact_area_mm2;
+    }
+    // Grounded on its own seat, the pad routes the load straight into the fixture:
+    // whatever the interface picked up is a rounding error on the applied load.
+    CHECK(gnd_carried < 0.05 * F);
+    chudware::sim::ContactResolution gnd_res = res;
+    chudware::sim::fea_contact_resolution_after_solve(gnd_res, gnd_rep.active_pairs,
+                                                      gnd_carried, gnd_area);
+    // held_by_contact_only is EMPTY here — every body reaches a fixture without
+    // the interface — so the packet must say the path is redundant rather than
+    // quote a pressure, and it must not refuse the study either.
+    chudware::sim::fea_contact_resolution_load_path(gnd_res, 0.0, gnd_carried,
+                                                    /*held_by_contact_only=*/false);
+    CHECK_FALSE(gnd_res.contact_carries_load);
+    CHECK_FALSE(gnd_res.pressure_reliable);
+    CHECK_FALSE(gnd_res.load_path_note.empty());
+    CHECK(gnd_res.load_path_note.find("REDUNDANT") != std::string::npos);
+    CHECK(gnd_res.resolved);  // a redundant path is not a broken model
+
+    // ── The live shape: held by contact, but the load went somewhere else ───────
+    // 9.9 N of 1500 N. Under the bar, so this one REFUSES: a converged solve that
+    // routes the load elsewhere is not an answer about this seat.
+    chudware::sim::ContactResolution miss = res;
+    chudware::sim::fea_contact_resolution_after_solve(
+        miss, held_rep.active_pairs, 9.9, held_rep.groups[0].contact_area_mm2);
+    REQUIRE(miss.pressure_reliable);
+    chudware::sim::fea_contact_resolution_load_path(miss, 1500.0, 9.9,
+                                                    /*held_by_contact_only=*/true);
+    CHECK_FALSE(miss.contact_carries_load);
+    CHECK_FALSE(miss.pressure_reliable);
+    CHECK_FALSE(miss.resolved);
+    CHECK(miss.load_fraction == doctest::Approx(9.9 / 1500.0).epsilon(1e-6));
+    CHECK(miss.load_fraction < chudware::sim::kMinLoadFraction);
+    CHECK(miss.reason == miss.load_path_note);
+
+    std::printf("(j) seated pad: pad held by contact -> %.1f N of %.0f N crosses "
+                "(fraction %.3f, %d active pairs) reliable=%d; both bodies grounded "
+                "-> %.2f N (%d active) carries_load=%d reliable=%d redundant note "
+                "%zu chars; 9.9 N of 1500 N -> fraction %.4f refused=%d\n",
+                held_carried, F, held_res.load_fraction, held_rep.active_pairs,
+                held_res.pressure_reliable ? 1 : 0, gnd_carried, gnd_rep.active_pairs,
+                gnd_res.contact_carries_load ? 1 : 0,
+                gnd_res.pressure_reliable ? 1 : 0, gnd_res.load_path_note.size(),
+                miss.load_fraction, miss.resolved ? 0 : 1);
+}
+
+// ── (k) The clearance is the SURFACES', not the facets' ─────────────────────────
+// The ME 490 hinge case. A Ø12.000 pin sits in a Ø12.600 saddle: a 0.300 mm radial
+// clearance, confirmed analytically by check_interference to 5e-8 mm. Meshed at
+// ~3 mm the interface reported a closest approach of 0.03665 mm and the resolution
+// guard — correctly, on that number — demanded an interface element size of
+// 0.147 mm, which no fill on the machine could deliver at any background size. The
+// clearance was never 0.03665 mm. A candidate pair is two boundary NODES, so what
+// it measures is n̂·(p_b − p_a): the two meshes sampled the arc at different
+// angular positions (13 divisions against 12 here, a real mesher's drift), and the
+// projection of that offset onto the facet normal eats the clearance — most of it,
+// or more, since the sign can flip and report a 0.300 mm gap as interpenetration.
+//
+// So the gap is measured on the analytic faces (ContactGapProbe): the signed
+// distance from each node to the OTHER body's own surface, which for nested
+// cylinders is r_bore − r_pin at every node however coarsely they are faceted. The
+// facet value is kept beside it, and the difference is reported.
+TEST_CASE("contact: a pin in a bore reports the CAD clearance, not the facet one") {
+    const double r_pin = 6.000, r_bore = 6.300, clearance = r_bore - r_pin;
+    // ~3 mm elements: 13 divisions of the pin's 37.70 mm circumference (2.90 mm),
+    // 12 of the bore's 39.58 mm (3.30 mm), 3 mm axially, one element radially. The
+    // two counts are deliberately DIFFERENT — coprime, so the relative angular
+    // phase drifts around the ring and the population contains every misalignment
+    // from perfectly aligned to half a facet, exactly as an unstructured mesh does.
+    Mesh m;
+    add_tube(m, 1, 13, 3, 3.0, r_pin, 0.0, 9.0, 0.0, 0.0);
+    const int n_pin = static_cast<int>(m.points.size() / 3);
+    add_tube(m, 1, 12, 3, r_bore, 9.3, 0.0, 9.0, 0.0, 0.0);
+
+    // The analytic oracle: two concentric cylinders, so the signed distance from a
+    // node to the other body's face is the surface-normal offset — the closed form
+    // of what BRepExtrema/GeomAPI_ProjectPointOnSurf computes on a real face
+    // (detail::make_cad_gap_probe in sim/fea_run.cpp does that on the study's own
+    // STEP; this test is OCCT-free by construction).
+    struct NestedCylinders : chudware::sim::ContactGapProbe {
+        double r_pin = 0.0, r_bore = 0.0;
+        static double radius(const double* p) {
+            return std::sqrt(p[0] * p[0] + p[1] * p[1]);
+        }
+        bool pair_gap_mm(int, const double* pa, int, const double* pb,
+                         double& gap_mm) const override {
+            const double mid = 0.5 * (r_pin + r_bore);
+            const bool a_on_pin = radius(pa) < mid;
+            if (a_on_pin == (radius(pb) < mid)) return false;  // same body: no CAD gap
+            const double* on_pin = a_on_pin ? pa : pb;
+            const double* on_bore = a_on_pin ? pb : pa;
+            gap_mm = std::min(r_bore - radius(on_pin), radius(on_bore) - r_pin);
+            return true;
+        }
+    };
+    NestedCylinders probe;
+    probe.r_pin = r_pin;
+    probe.r_bore = r_bore;
+
+    ContactCandidateOptions facet_opt;
+    facet_opt.max_gap_mm = 0.5;
+    ContactCandidateOptions cad_opt = facet_opt;
+    cad_opt.gap_probe = &probe;
+
+    const auto facet = fea_contact_candidates(m.points, m.tets, 4, kE, facet_opt);
+    const auto cad = fea_contact_candidates(m.points, m.tets, 4, kE, cad_opt);
+    REQUIRE(facet.error.empty());
+    REQUIRE(cad.error.empty());
+    REQUIRE(facet.n_components == 2);
+    REQUIRE_FALSE(cad.springs.empty());
+
+    // The CAD measurement recovers the real clearance at EVERY pair, so the closest
+    // approach and the median are both the fit's own 0.300 mm (the case asks for
+    // 0.300 +/- 0.005 mm, i.e. 1.67 % of it).
+    CHECK(cad.min_gap0_mm == doctest::Approx(clearance).epsilon(0.0167));
+    CHECK(cad.median_gap0_mm == doctest::Approx(clearance).epsilon(0.0167));
+    CHECK(cad.gap_analytic_pairs == static_cast<int>(cad.springs.size()));
+    CHECK(cad.gap_fallback_nodes == 0);
+    // The facets, on the same mesh, do not: their closest approach is a fraction of
+    // the clearance (and this is the number the old guard measured).
+    CHECK(cad.min_gap_facet_mm < 0.1 * clearance);
+    CHECK(cad.min_gap_facet_mm == doctest::Approx(facet.min_gap0_mm).epsilon(1e-9));
+    CHECK(cad.facet_error_mm ==
+          doctest::Approx(cad.min_gap0_mm - cad.min_gap_facet_mm).epsilon(1e-9));
+    // No probe at all: the set is measured on the facets and says so.
+    CHECK(facet.gap_analytic_pairs == 0);
+    CHECK(facet.min_gap_facet_mm == doctest::Approx(facet.min_gap0_mm).epsilon(1e-12));
+
+    // ── The guard now judges the clearance that exists ──────────────────────────
+    const auto cad_res = chudware::sim::fea_contact_resolution(cad);
+    const auto facet_res = chudware::sim::fea_contact_resolution(facet);
+    CHECK(cad_res.criterion == chudware::sim::kCriterionClearance);
+    CHECK(cad_res.gap_mm == doctest::Approx(clearance).epsilon(0.017));
+    CHECK(cad_res.gap_analytic);
+    CHECK(cad_res.ratio ==
+          doctest::Approx(cad_res.h_interface_mm / clearance).epsilon(0.02));
+    // ...and the size it prescribes is the geometric one — four elements across the
+    // clearance, a millimetre-class element — not a sub-tenth-of-a-millimetre one
+    // that no fill on the machine can place.
+    CHECK(cad_res.ratio > chudware::sim::kContactMaxHOverGap);
+    CHECK(cad_res.required_interface_size_mm ==
+          doctest::Approx(chudware::sim::kContactMaxHOverGap * clearance)
+              .epsilon(0.02));
+    CHECK(cad_res.required_interface_size_mm > 1.0);
+    // The seat limit and the penetration accounting read the same analytic gap.
+    // Two bodies 0.300 mm apart have no initial penetration, and the analytic
+    // measurement says so; the facets claim 0.247 mm of it, which is what used to
+    // be clamped away and reported as "this interface's own surface error".
+    CHECK(cad.initial_penetration_max_mm == 0.0);
+    CHECK(facet.initial_penetration_max_mm > 0.2);
+    CHECK(cad.seat_limit_mm ==
+          doctest::Approx(0.5 * cad.interface_h_mm).epsilon(1e-9));
+    // ── The pre-fix control, on the SAME mesh and the SAME geometry ─────────────
+    // Measured on the facets the fit does not merely look tight — it looks
+    // INTERFERING (closest approach −0.247 mm), so the guard loses the clearance
+    // criterion altogether and judges a patch that does not exist. That is the
+    // defect: not a conservative number, a wrong one.
+    CHECK(facet_res.criterion == chudware::sim::kCriterionPatchArea);
+    CHECK(facet_res.gap_mm == 0.0);
+    CHECK_FALSE(facet_res.gap_analytic);
+    CHECK(facet_res.ratio == 0.0);
+
+    std::printf("(k) pin r%.3f in bore r%.3f at ~3 mm: CAD gap %.6f mm (median "
+                "%.6f), facets %.6f mm, facet_error %.6f mm; h_interface %.4f mm, "
+                "ratio %.2f, required interface %.4f mm (facet-measured control: "
+                "gap %.6f, criterion %s, required %.4f mm)\n",
+                r_pin, r_bore, cad.min_gap0_mm, cad.median_gap0_mm,
+                cad.min_gap_facet_mm, cad.facet_error_mm, cad_res.h_interface_mm,
+                cad_res.ratio, cad_res.required_interface_size_mm, facet_res.gap_mm,
+                facet_res.criterion, facet_res.required_interface_size_mm);
 }

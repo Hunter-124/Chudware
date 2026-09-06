@@ -442,6 +442,55 @@ TEST_CASE("contact: interface_size_mm beats the fill's own size floor or refuses
     CHECK(contact.at("contact_area_mm2").get<double>() > 0.0);
 }
 
+// ── A COARSER-than-background interface request is legal, not a mesh failure ──
+// `interface_size_mm` becomes the h_min of the mesher's graded size field, whose
+// h_max is the background, and a GradedSizing REQUIRES 0 < h_min <= h_max. So a
+// request coarser than the background used to fail the whole mesh with
+// "GradedSizing: need 0 < h_min <= h_max" — while every request AT or below the
+// background that bisection could not reach was refused as undeliverable. That
+// pair closed the box on the O-22 hinge saddle
+// (CONTACT_BLOCKED_2026-09-06b §4: "No legal value exists"), because the
+// undeliverable refusal's own advice was a size above the background.
+//
+// "No coarser than 12 mm" inside an 8 mm mesh is already true everywhere, so the
+// request now clamps to the background (mesher.cpp local_size_field), no wave
+// runs, and the contract is met. Whatever the study then does, it may not fail
+// for a MESHING reason.
+TEST_CASE("contact: an interface_size_mm coarser than the background is legal") {
+    const double gap = 0.4, pad = 12.0, base_h = 24.0;
+    TopoDS_Shape base = BRepPrimAPI_MakeBox(gp_Pnt(0, 0, 0), 100, 50, base_h).Shape();
+    TopoDS_Shape block =
+        BRepPrimAPI_MakeBox(gp_Pnt(44, 19, base_h + gap), pad, pad, 20.0).Shape();
+    TopoDS_Compound assembly;
+    BRep_Builder builder;
+    builder.MakeCompound(assembly);
+    builder.Add(assembly, base);
+    builder.Add(assembly, block);
+    const std::string step = write_step(assembly, "contact_pad_coarse");
+
+    const double background = 8.0;
+    json fix = plane_grid_z(0, 100, 0, 50, 0.0);
+    json load = plane_grid_z(44, 56, 19, 31, base_h + gap + 20.0);
+    json study = make_study(step, 0.5, /*order=*/1, fix, load, /*F=*/4000.0);
+    study["target_size_mm"] = background;
+    study["contact"] = json{{"enabled", true},
+                            {"max_gap_mm", 0.5},
+                            {"max_iterations", 25},
+                            {"penalty_scale", 1.0},
+                            {"interface_size_mm", 1.5 * background}};
+    const json r = fea_run_static(study);
+    const std::string error = r.value("error", std::string());
+    MESSAGE("coarse interface request: ok=" << r.value("ok", false)
+                                            << " error=" << error);
+    // The three failures this case exists to forbid.
+    CHECK(error.find("GradedSizing") == std::string::npos);
+    CHECK(error.find("h_min") == std::string::npos);
+    CHECK(error.find("mesh failed") == std::string::npos);
+    // And the contract itself is met — a request the mesh already satisfies is
+    // never "not delivered".
+    CHECK(error.find("was not delivered") == std::string::npos);
+}
+
 // ── The same contract on a TIGHT CURVED BORE ─────────────────────────────────
 // A pin in a clearance-fit bore: the FRAME-PEDAL-BRAKE keyway (Ø12.7 hole,
 // Ø12.0 cross-bolt, 0.35 mm radial) at a size a ctest can afford. This is the
@@ -470,10 +519,17 @@ TEST_CASE("contact: a sub-mm interface on a tight curved bore is delivered") {
             gp_Ax2(gp_Pnt(bore_x, -1.0, bore_z), gp_Dir(0, 1, 0)), bore_r, wall + 2.0)
             .Shape();
     plate = BRepAlgoAPI_Cut(plate, bore).Shape();
+    // The pin SITS in the bore, tangent at the bottom, which is where a
+    // clearance-fit pin under load actually is (and where the live keyway's
+    // cross-bolt is): closest approach 0, so the guard judges the seating patch
+    // instead of a clearance nothing is resolving. Coaxial, the two surfaces are
+    // 0.35 mm apart everywhere and the "closest approach" a node pair reports
+    // shrinks with h, which no element size can ever resolve.
     const double pin_y0 = -5.0, pin_len = wall + 10.0;
+    const double pin_z = bore_z - (bore_r - pin_r);
     const TopoDS_Shape pin =
         BRepPrimAPI_MakeCylinder(
-            gp_Ax2(gp_Pnt(bore_x, pin_y0, bore_z), gp_Dir(0, 1, 0)), pin_r, pin_len)
+            gp_Ax2(gp_Pnt(bore_x, pin_y0, pin_z), gp_Dir(0, 1, 0)), pin_r, pin_len)
             .Shape();
     TopoDS_Compound assembly;
     BRep_Builder builder;
@@ -490,7 +546,7 @@ TEST_CASE("contact: a sub-mm interface on a tight curved bore is delivered") {
             for (int j = -2; j <= 2; ++j) {
                 const double dx = i * pin_r * 0.4, dz = j * pin_r * 0.4;
                 if (dx * dx + dz * dz > pin_r * pin_r * 0.81) continue;
-                fix.push_back({bore_x + dx, y, bore_z + dz});
+                fix.push_back({bore_x + dx, y, pin_z + dz});
             }
     // Load: press the far end of the plate down, so the top of the bore bears on
     // the pin.

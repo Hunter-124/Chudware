@@ -53,6 +53,30 @@ struct MeshOut {
   // detail::repair_folded_quadratic). 0 for tet4 and for a clean tet10 mesh.
   int quadratic_fallback_elems = 0;
 
+  // ── Hanging-element repair (detail::repair_lonely_nodes) ─────────────────
+  // A CORNER node referenced by exactly one element, or an element sharing two
+  // corners or fewer with the rest of the mesh, is a mechanism dressed as a mesh:
+  // the element can rotate about the node or edge it hangs from at zero strain
+  // energy, so the stiffness matrix stops being positive definite while every
+  // connectivity check still passes (the fragment DOES reach a fixture, through
+  // that one node). Measured on a real 316466-element wheel mesh: 51 such nodes,
+  // condition number 4e33, a fallback factorization returning a plausible-looking
+  // 0.032 mm where an independent SparseLU returned 5.2e10 mm.
+  //
+  // The repair dissolves those elements (see the .cpp for the exact rule) and
+  // reports what it did. lonely_nodes_remaining > 0 after the repair is a REFUSAL
+  // downstream, in the same class as a component that reaches no fixture — never a
+  // warning, because a warning has to be read.
+  int lonely_nodes_repaired = 0;
+  int lonely_nodes_remaining = 0;
+  int hanging_elems_dropped = 0;
+  // Raw count of corners referenced by exactly one element ("tips"). Ordinary in a
+  // healthy mesh — a tet apex nobody else uses is fully constrained by its own
+  // element — so this is informational only, NOT a defect count. It is what
+  // localizes a mechanism when one exists.
+  int single_element_nodes = 0;
+  double dropped_volume_mm3 = 0.0;
+
   // Node-adjacency connected components over the elements (union-find over
   // every node of every element): 1 for one watertight solid, N for a compound
   // or an imported assembly, where each island is its own stiffness system. A
@@ -139,6 +163,22 @@ bool fill_quality(MeshOut &out);
 // Returns the number of elements that took the fallback, and records it in
 // out.quadratic_fallback_elems. A no-op for tet4.
 int repair_folded_quadratic(MeshOut &out);
+
+// Dissolve HANGING elements: an element whose corners shared with the rest of the
+// mesh number two or fewer is free to rotate about that node or edge at zero strain
+// energy. Removing it removes the mechanism; the fragment carried no load path by
+// construction (nothing else touches its free corners), so the domain loses only a
+// sliver, which is reported as dropped_volume_mm3. Dropping one element can expose
+// another, so the sweep repeats until stable (bounded). Node numbering is preserved —
+// only the element list shrinks — so every caller's node indices stay valid.
+// Fills lonely_nodes_repaired / hanging_elems_dropped / dropped_volume_mm3 and
+// re-counts lonely_nodes_remaining. Returns the number of elements dropped.
+int repair_lonely_nodes(MeshOut &out);
+
+// Corner nodes referenced by exactly ONE element, in the mesh as it stands. Counted
+// on corners only: a tet10 mid-edge node legitimately belongs to a single element and
+// carries no rigid mode of its own. Also fills out.lonely_nodes_remaining.
+int count_lonely_nodes(MeshOut &out);
 } // namespace detail
 
 // Error-driven refinement wrapper. Chudware keeps its solver and uses

@@ -858,18 +858,14 @@ def _fea2_rect_section_case() -> dict:
 def _fea3_uniform_pressure_case() -> dict:
     """FEA3: cantilever tip deflection under a uniform top-face pressure (Roark UDL case).
 
-    T-BL20 FINDING: this case surfaced a real defect in the C++ pressure-load path
-    (core/sim/fea_run.cpp, the `type == "pressure"` branch of fea_run_static). Unlike
-    the "force" branch — which normalizes by w_sum so the resultant equals the given
-    force vector regardless of any mesh-area bookkeeping error — the pressure branch
-    deposits `pressure * node_nw` directly, with NO normalization against its own
-    computed `loaded_area`. Diagnostic: an axial pressure load and an axial force of
-    the analytically-equal total, applied to the IDENTICAL node set, should give the
-    same displacement; the force case matches Roark to <0.2%, the pressure case is
-    ~10x too large and does not converge as mesh_fineness changes. Filed as a follow-up
-    issue alongside this task. Recorded here as an executed FAIL on purpose — this is
-    exactly the kind of latent correctness risk T-BL20 exists to catch; do not loosen
-    the tolerance to hide it.
+    T-BL20 FINDING, now CLOSED: this case surfaced a real defect in the C++
+    pressure-load path (core/sim/fea_run.cpp, the `type == "pressure"` branch of
+    fea_run_static), which lumped the whole face load onto corner nodes and read ~10x
+    high, non-convergent with mesh density. The deposit is now the work-consistent
+    f_i = -p*integral(N_i n_outward)dA (tri6 quadrature on tet10), so the resultant is
+    p*A along the INWARD face normal and this row converges to Roark. The load is a
+    downward UDL because +p pushes INTO the top face: `pressure` is "MPa, inward"
+    (pressure-sign fix, 2026-09-05). Do not loosen the tolerance here.
     """
     L, b, h, p = 1000.0, 50.0, 50.0, 0.1  # MPa uniform top-face pressure
     E = _VV_STEEL["E_mpa"]
@@ -885,9 +881,7 @@ def _fea3_uniform_pressure_case() -> dict:
     got = r.get("summary", {}).get("max_disp_mm") if r.get("ok") else None
     return {"ok": r.get("ok", False), "got": got, "ref": ref, "error": r.get("error"),
             "note": f"{b:.0f}×{h:.0f}mm L={L:.0f}mm p={p}MPa uniform top pressure "
-                    f"(w={w:.1f}N/mm) — KNOWN BUG: pressure-load resultant is not "
-                    f"normalized to loaded_area (core/sim/fea_run.cpp), non-convergent "
-                    f"with mesh density; see filed issue"}
+                    f"(w={w:.1f}N/mm, downward: +p acts INWARD on the top face)"}
 
 
 # ===========================================================================
@@ -1459,7 +1453,13 @@ def bench_buckling_ccx() -> None:
 
 
 def bench_contact_ccx() -> None:
-    """T-BL04 contact: NLGEOM two-block contact load-transfer conservation via ccx."""
+    """T-BL04 contact: NLGEOM two-block contact load-transfer conservation via ccx.
+
+    This validates the box-proxy deck the frozen `sim_run_contact` worker RPC still
+    ships. The MCP tool run_fea_contact no longer runs ccx at all: it solves real
+    unilateral contact on the meshed document, and that claim is validated by the
+    engine's own `fea_contact` ctest (case (a): base reaction == applied load < 1%).
+    """
     print("\n--- [contact] CalculiX nonlinear contact ---")
     from services.mcp import fea_advanced as fa
     # Reference: static equilibrium — the vertical reaction at the fixed base must
@@ -2100,15 +2100,6 @@ class TestFull:
         err = _pct_err(res["got"], res["ref"])
         assert err < PRECISE, f"FEA2 δ err={err:.3f}% > {PRECISE}%"
 
-    @pytest.mark.xfail(
-        reason="T-BL20 / issue #9: pressure-load resultant in core/sim/fea_run.cpp is "
-               "not normalized to its own computed loaded_area (unlike the force path), "
-               "so it drifts with mesh density — confirmed ~10x error via an "
-               "axial-pressure-vs-axial-force diagnostic on the identical node set. "
-               "xfail (not skip/loosened tolerance) so this stays visible until fixed; "
-               "an XPASS here means the engine bug was fixed and this decorator should "
-               "come off.",
-        strict=False)
     def test_fea_static_uniform_pressure(self):
         """FEA3 (T-BL20): uniform pressure-load cantilever — ENGINEERING tier."""
         ready, reason = _fea_ready()
@@ -2119,7 +2110,7 @@ class TestFull:
             pytest.skip(f"engine build lacks sim_run_static: {res.get('error')}")
         assert res["ok"], res.get("error")
         err = _pct_err(res["got"], res["ref"])
-        assert err < ENGINEERING, f"FEA3 δ err={err:.3f}% > {ENGINEERING}% (known bug)"
+        assert err < ENGINEERING, f"FEA3 δ err={err:.3f}% > {ENGINEERING}%"
 
     def test_fea_modal_cantilever(self):
         """M1 (T-BL20): C++ modal FEA first bending mode vs Rao — PRECISE tier."""

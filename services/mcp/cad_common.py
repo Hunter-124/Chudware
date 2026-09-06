@@ -4859,17 +4859,54 @@ def _frame_from_rpc(resp: Optional[dict]) -> Optional[dict]:
         return None
 
 
+def render_background(background: Optional[Sequence]) -> Optional[list]:
+    """Normalize a caller's `background` into the engine's [r, g, b] 0-255 form, or None.
+
+    One place decides what a background argument means, because every render tool takes the
+    same one and the engine clamps rather than refuses: three numbers in 0-255 (rounded,
+    clamped), None/omitted meaning "keep the engine's flat 245 light grey". A hex string is
+    accepted too ("#101114") — the film/report callers already carry their palette that way.
+    Anything else is a caller error and is refused here rather than silently ignored."""
+    if background is None:
+        return None
+    if isinstance(background, str):
+        text = background.strip().lstrip("#")
+        if len(text) != 6:
+            raise ValueError(
+                f"background must be [r, g, b] (0-255) or a '#rrggbb' string; got "
+                f"{background!r}.")
+        try:
+            return [int(text[i:i + 2], 16) for i in (0, 2, 4)]
+        except ValueError:
+            raise ValueError(
+                f"background {background!r} is not a valid '#rrggbb' colour.") from None
+    try:
+        vals = [float(v) for v in background]
+    except (TypeError, ValueError):
+        raise ValueError(
+            f"background must be [r, g, b] (0-255) or a '#rrggbb' string; got "
+            f"{background!r}.") from None
+    if len(vals) != 3:
+        raise ValueError(
+            f"background needs exactly 3 components [r, g, b] (0-255); got {len(vals)}.")
+    return [max(0, min(255, int(round(v)))) for v in vals]
+
+
 def _render_view_png(doc_id: str, view_dir, out_png: str, *,
                      name: str = "VIEW", focus: Optional[dict] = None,
                      margin: float = _CLOSEUP_MARGIN, clip_near: bool = False,
                      W: int = _RENDER_W, H: int = _RENDER_H,
-                     annotate: bool = True) -> tuple:
+                     annotate: bool = True,
+                     background: Optional[Sequence] = None) -> tuple:
     """One engine render along `view_dir`, optionally FRAMED on a world AABB.
 
     `focus` is a bbox dict ({"min","max"} — what _target_bbox returns). With it the engine fits
     THAT box to the image, so the close-up is real pixels rather than a magnified patch;
     `clip_near` additionally cuts away whatever sits between the camera and the box, which is
     how a bore or a pocket gets seen into without a separate section operation.
+
+    `background` is an [r, g, b] 0-255 frame clear colour handed straight to the engine
+    (doc_render_view's `background`); None keeps the engine's flat 245 light grey.
 
     Returns (png_path, frame, resp). `frame` is the engine's own projection record — pass it
     straight to _annotate_render so the overlay lands on the right pixels. Raises ValueError
@@ -4880,8 +4917,12 @@ def _render_view_png(doc_id: str, view_dir, out_png: str, *,
         view["focus"] = {"min": [float(x) for x in _v3(focus["min"])],
                          "max": [float(x) for x in _v3(focus["max"])],
                          "margin": float(margin), "clip_near": bool(clip_near)}
-    r = cb.call("doc_render_view", {"doc_id": doc_id, "out_path": out_png,
-                                    "view": view, "annotate": bool(annotate)})
+    params = {"doc_id": doc_id, "out_path": out_png, "view": view,
+              "annotate": bool(annotate)}
+    bg = render_background(background)
+    if bg is not None:
+        params["background"] = bg
+    r = cb.call("doc_render_view", params)
     if not r.get("ok") or not os.path.exists(out_png):
         raise ValueError(
             f"Render failed: {r.get('reason', r.get('error', 'no bodies to render'))}")

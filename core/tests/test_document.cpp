@@ -31,6 +31,11 @@
 #include <BRep_Builder.hxx>                                // heal: craft a reversed-face solid
 #include <BRepPrimAPI_MakeBox.hxx>                         // heal: the box to corrupt
 #include <BRepTools.hxx>                                   // heal: write the broken .brep
+#include <TopoDS_Compound.hxx>                             // heal: two-lump refusal input
+#include <BRepBuilderAPI_MakePolygon.hxx>                  // self-intersection: bowtie wire
+#include <BRepBuilderAPI_MakeFace.hxx>                     // self-intersection: bowtie cap
+#include <BRepPrimAPI_MakePrism.hxx>                       // self-intersection: fold the cap
+#include <gp_Vec.hxx>
 #include <TopoDS_Shell.hxx>
 #include <TopoDS_Solid.hxx>
 #include <BRepBndLib.hxx>                                  // exact kernel bbox (axis cases)
@@ -4741,6 +4746,342 @@ TEST_CASE("heal: ShapeFix repairs a reversed-face solid and records the evidence
         CHECK(data.at("after").at("valid").get<bool>());
         CHECK_FALSE(data.at("fixed").get<bool>());  // nothing was wrong: nothing was "fixed"
         CHECK(data.at("volume_after").get<double>() == doctest::Approx(NOMINAL));
+    }
+
+    std::error_code ec;
+    fs::remove(brep_path, ec);
+}
+
+// ===========================================================================
+// `heal` escalation ladder — the part ShapeFix cannot do (core/doc/document.cpp).
+//
+// ShapeFix cleared the single-reversed-face box above, and on the live body it did
+// NOTHING: the CD-100 Stage 5 frame spine imported with 144 of its 344 edges traversed
+// the SAME way by both adjacent faces, and a five-point tolerance ladder (1e-7 … 0.1 mm)
+// either changed nothing or, at 0.1 mm, invented three new defect kinds. So the op takes
+// EXPLICIT escalations (`sew_tolerance_mm`, `fix_orientation`, `rebuild_solid`,
+// `unify_faces`), records exactly which ones ran, and REFUSES when the result costs
+// material. This case pins those three properties on geometry whose volume and area are
+// known analytically, plus the refusal — the guard is the only reason a caller can trust
+// a repair it cannot see.
+TEST_CASE("heal: the escalation options are explicit, recorded, and refuse a lossy repair") {
+    using chudware::doc::doc_apply_ops;
+    using chudware::doc::doc_new;
+    namespace fs = std::filesystem;
+
+    const double LX = 20.0, LY = 30.0, LZ = 40.0;
+    const double NOMINAL = LX * LY * LZ;                                    // 24000 mm^3
+    const double AREA = 2.0 * (LX * LY + LX * LZ + LY * LZ);                // 5200 mm^2
+
+    // A box with EVERY OTHER face of its shell stored reversed: three of the six faces
+    // disagree with their neighbours, so half of the box's 12 edges are traversed the
+    // same way by both adjacent faces — the live spine's defect, at a scale where the
+    // right answer is a known constant.
+    auto broken_box = [&]() -> TopoDS_Shape {
+        TopoDS_Shape box = BRepPrimAPI_MakeBox(LX, LY, LZ).Shape();
+        TopExp_Explorer sh(box, TopAbs_SHELL);
+        REQUIRE(sh.More());
+        TopoDS_Shell shell = TopoDS::Shell(sh.Current());
+        shell.Free(Standard_True);  // a solid-owned shell is frozen against Add/Remove
+        std::vector<TopoDS_Shape> flip;
+        int i = 0;
+        for (TopExp_Explorer fe(shell, TopAbs_FACE); fe.More(); fe.Next(), ++i)
+            if (i % 2 == 0) flip.push_back(fe.Current());
+        BRep_Builder bb;
+        for (const TopoDS_Shape& f : flip) {
+            bb.Remove(shell, f);
+            bb.Add(shell, f.Reversed());
+        }
+        return box;
+    };
+
+    const TopoDS_Shape broken = broken_box();
+    REQUIRE_MESSAGE(!BRepCheck_Analyzer(broken).IsValid(),
+                    "three reversed faces must make the solid BRep-invalid");
+    // Three mutually-adjacent reversed faces: their three shared edges agree again, the
+    // six edges they share with an unreversed neighbour do not.
+    const int BAD_EDGES = 6;
+    {
+        GProp_GProps p;
+        BRepGProp::VolumeProperties(broken, p);
+        REQUIRE_MESSAGE(std::abs(p.Mass() - NOMINAL) > 1.0,
+                        "the reversals must corrupt the volume READING, got " << p.Mass());
+    }
+    const fs::path broken_path =
+        fs::temp_directory_path() / "chudware_heal_ladder_broken.brep";
+    REQUIRE(BRepTools::Write(broken, broken_path.string().c_str()));
+
+    auto import_op = [](const fs::path& p) {
+        return json{{"op", "add_feature"},
+                    {"feature", json{{"type", "import"},
+                                     {"name", "Spine"},
+                                     {"params", {{"source_path", p.string()},
+                                                 {"format", "brep"}}}}}};
+    };
+    auto heal_op = [](const json& params) {
+        return json{{"op", "add_feature"},
+                    {"feature", json{{"type", "heal"}, {"name", "Heal"},
+                                     {"params", params}}}};
+    };
+
+    // --- fix_orientation: topology only, so not one surface may move ----------------
+    {
+        const std::string id =
+            doc_new("part", "HealOrient").at("doc_id").get<std::string>();
+        json resp = doc_apply_ops(id, -1, json::array({
+            import_op(broken_path),
+            heal_op(json{{"fix_orientation", true}, {"sew_tolerance_mm", 0.01}})}), false);
+        const json& rows = resp.at("rebuild").at("feature_status");
+        REQUIRE(rows.size() == 2);
+        REQUIRE_MESSAGE(rows[1].value("ok", false),
+                        "fix_orientation heal must succeed: " << status_err(rows[1]));
+        const json data = rows[1].at("data");
+        MESSAGE("fix_orientation record -> " << data.dump());
+
+        // The defect arrived and left.
+        CHECK(data.at("before").at("bad_edges").get<int>() == BAD_EDGES);
+        CHECK(data.at("after").at("bad_edges").get<int>() == 0);
+        CHECK(data.at("after").at("valid").get<bool>());
+        CHECK(data.at("fixed").get<bool>());
+
+        // Every option the caller passed, and every one it did not, is on the record —
+        // a repair nobody can see is only auditable if the recipe is written down.
+        CHECK(data.at("fix_orientation").get<bool>());
+        CHECK(data.at("sew_tolerance_mm").get<double>() == doctest::Approx(0.01));
+        CHECK_FALSE(data.at("rebuild_solid").get<bool>());
+        CHECK_FALSE(data.at("unify_faces").get<bool>());
+        CHECK_FALSE(data.at("fix_small_edges").get<bool>());
+        CHECK(data.at("max_volume_change_pct").get<double>() == doctest::Approx(0.5));
+        REQUIRE_MESSAGE(data.contains("orientation"),
+                        "fix_orientation must report its flood fill: " << data.dump());
+        CHECK(data.at("orientation").at("conflicts").get<int>() == 0);
+
+        // A flag-only repair rebuilds no geometry: the analytic area survives EXACTLY,
+        // and the healed reading is the true 24000 the broken integral missed.
+        CHECK(std::abs(data.at("after").at("area_mm2").get<double>() - AREA) < 1e-9);
+        CHECK(std::abs(data.at("volume_after").get<double>() - NOMINAL) < 1e-6);
+        // The budget is judged on orientation-normalized volume, so the broken input's
+        // wrong-signed reading cannot masquerade as drift (nor hide any).
+        CHECK_FALSE(data.at("volume_reading_trustworthy_before").get<bool>());
+        CHECK(std::abs(data.at("material_volume_before").get<double>() - NOMINAL) < 1e-6);
+        CHECK(std::abs(data.at("material_change_pct").get<double>()) < 1e-9);
+    }
+
+    // --- rebuild_solid + fuzzy + unify_faces: geometry re-derived, part unchanged ----
+    {
+        const std::string id =
+            doc_new("part", "HealRebuild").at("doc_id").get<std::string>();
+        json resp = doc_apply_ops(id, -1, json::array({
+            import_op(broken_path),
+            heal_op(json{{"rebuild_solid", true}, {"rebuild_fuzzy_mm", 0.01},
+                         {"unify_faces", true}})}), false);
+        const json& rows = resp.at("rebuild").at("feature_status");
+        REQUIRE(rows.size() == 2);
+        REQUIRE_MESSAGE(rows[1].value("ok", false),
+                        "rebuild_solid heal must succeed: " << status_err(rows[1]));
+        const json data = rows[1].at("data");
+        MESSAGE("rebuild_solid record -> " << data.dump());
+        CHECK(data.at("after").at("valid").get<bool>());
+        CHECK(std::abs(data.at("volume_after").get<double>() - NOMINAL) < 1e-6);
+        // One enclosed cell, nothing thrown away — and unify_faces put the box back to
+        // six faces instead of the split set an intersection leaves behind.
+        REQUIRE(data.contains("rebuild"));
+        CHECK(data.at("rebuild").at("lumps").get<int>() == 1);
+        CHECK(data.at("rebuild").at("discarded_volume_mm3").get<double>() ==
+              doctest::Approx(0.0));
+        CHECK(data.at("after").at("faces").get<int>() == 6);
+        CHECK(data.at("rebuild_fuzzy_mm").get<double>() == doctest::Approx(0.01));
+        // The narrowest face of the result, reported because a rebuild can hand back a
+        // VALID solid carrying a strip no mesher can resolve (body 47's came out 0.011 mm
+        // wide and polymesh refused the fill at every element size). On the box it is the
+        // 20x30 face's mean width, 2*600/100 = 12 mm exactly — the metric measures real
+        // width, not a face count.
+        CHECK(data.at("rebuild").at("narrowest_face_mm").get<double>() ==
+              doctest::Approx(12.0).epsilon(1e-9));
+    }
+
+    // --- the refusal: a repair that would cost material fails and changes nothing ---
+    // ONE solid whose two shells enclose DISJOINT regions — exactly what a rebuild
+    // silently reduces to its biggest lump. 1000 mm^3 of the 25000 is 4%, eight times the
+    // 0.5% budget, so the feature must FAIL and leave the imported body as it was.
+    {
+        BRep_Builder bb;
+        TopoDS_Solid two;
+        bb.MakeSolid(two);
+        for (const TopoDS_Shape& box :
+             {BRepPrimAPI_MakeBox(LX, LY, LZ).Shape(),
+              BRepPrimAPI_MakeBox(gp_Pnt(100.0, 0.0, 0.0), 10.0, 10.0, 10.0).Shape()}) {
+            TopExp_Explorer se(box, TopAbs_SHELL);
+            REQUIRE(se.More());
+            bb.Add(two, se.Current());
+        }
+        const fs::path two_path =
+            fs::temp_directory_path() / "chudware_heal_two_lumps.brep";
+        REQUIRE(BRepTools::Write(two, two_path.string().c_str()));
+
+        const std::string id =
+            doc_new("part", "HealRefuse").at("doc_id").get<std::string>();
+        json imported = doc_apply_ops(id, -1, json::array({import_op(two_path)}), false);
+        REQUIRE(imported.at("rebuild").at("feature_status")[0].value("ok", false));
+        const json bbox_before = chudware::doc::doc_bbox(id);
+
+        json resp = doc_apply_ops(id, -1,
+                                  json::array({heal_op(json{{"rebuild_solid", true}})}), false);
+        const json& rows = resp.at("rebuild").at("feature_status");
+        const json row = rows.back();
+        REQUIRE_FALSE_MESSAGE(row.value("ok", false),
+                              "heal must REFUSE to reduce the part to its biggest lump: "
+                                  << row.dump());
+        const std::string err = row.value("error", std::string());
+        CHECK_MESSAGE(err.find("REFUSED") != std::string::npos,
+                      "the refusal must say so: " << err);
+        CHECK_MESSAGE(err.find("budget") != std::string::npos,
+                      "the refusal must quote the budget it broke: " << err);
+        // …and the numbers the verdict was made on survive the failure, so the caller can
+        // judge it without re-running anything.
+        REQUIRE(row.at("data").is_object());
+        CHECK(row.at("data").at("rebuild").at("lumps").get<int>() == 2);
+        CHECK(row.at("data").at("rebuild").at("discarded_volume_mm3").get<double>() ==
+              doctest::Approx(1000.0));
+
+        // The body was left UNTOUCHED: the far lump is still in the document's envelope.
+        const json bbox_after = chudware::doc::doc_bbox(id);
+        CHECK(bbox_after.at("max")[0].get<double>() ==
+              doctest::Approx(bbox_before.at("max")[0].get<double>()));
+        CHECK(bbox_after.at("max")[0].get<double>() >= 109.0);
+
+        std::error_code ec2;
+        fs::remove(two_path, ec2);
+    }
+
+    std::error_code ec;
+    fs::remove(broken_path, ec);
+}
+
+// ===========================================================================
+// eval_solid_health `self_intersection` — the census field that used to be a
+// hard-coded {checked:false, "this engine has no such test"} disclaimer and is now a real
+// BOPAlgo_CheckerSI run (core/doc/session.cpp::doc_eval_solid_health).
+//
+// Two things have to be true at once and neither is provable from the other:
+//   * a clean solid must come back checked:true / self_intersecting:false — a check that
+//     silently declines, or that flags every body, is useless;
+//   * a solid whose own skin passes through itself must come back self_intersecting:true,
+//     even though its TOPOLOGY census is spotless: closed, manifold, zero free edges,
+//     positive volume. That gap is the entire reason the field exists — a watertight
+//     verdict is topological and cannot see a self-piercing skin.
+//
+// The fixture is a PRISM OVER AN ASYMMETRIC FIGURE-EIGHT PROFILE: the bowtie wire
+// (0,0)-(40,20)-(40,0)-(0,5) crosses itself at (8,4), so two of the four side faces of the
+// prism cross. Asymmetric on purpose: the symmetric bowtie's two lobes have equal and
+// opposite signed area, so its volume integrates to exactly 0 and the body would be
+// unsound for that reason alone. These lobes are 320 and 20 mm^2, giving +3000 mm^3.
+//
+// It is built with OCCT directly and imported as a .brep because no feature op will emit
+// one: extrude REJECTS a self-intersecting profile ("extrude produced a zero-volume solid
+// — the profile is self-intersecting"), sweep rejects a self-intersecting sweep, draft
+// refuses, and surf_thicken fails on a folded wall. The nearest public-API construction —
+// two crossing surf_planar panels knit into one body — is a SURFACE body; that case is
+// covered by services/mcp/test_geom_health.py.
+//
+// `sound` is asserted false here as a contract guard, NOT as an isolation of the new term:
+// every self-intersecting solid OCCT will build is also BRepCheck-invalid (the crossing
+// wire makes the cap face invalid), and probing revolve-across-axis, a tight pipe-shell
+// elbow and an over-offset thick solid produced no valid counter-example. So the term
+// cannot be isolated by any constructible fixture; what the assertion pins is that such a
+// body never reads as sound.
+TEST_CASE("eval_solid_health: self-intersection is really computed, and it costs soundness") {
+    using chudware::doc::doc_apply_ops;
+    using chudware::doc::doc_eval_solid_health;
+    using chudware::doc::doc_new;
+    namespace fs = std::filesystem;
+    auto dimv = [](double v) { return json{{"value", v}, {"expr", nullptr}}; };
+
+    // --- control: a plain box is CHECKED and clean ------------------------------
+    {
+        const std::string id =
+            doc_new("part", "SelfIntersectCleanBox").at("doc_id").get<std::string>();
+        json ops = json::array({
+            json{{"op", "add_feature"}, {"feature",
+                json{{"type", "box"}, {"name", "Blk"},
+                     {"params", {{"length", dimv(20.0)}, {"width", dimv(30.0)},
+                                 {"height", dimv(40.0)}}}}}},
+        });
+        json resp = doc_apply_ops(id, -1, ops, false);
+        REQUIRE_MESSAGE(resp.at("rebuild").at("feature_status")[0].value("ok", false),
+                        "the control box must build: "
+                            << status_err(resp.at("rebuild").at("feature_status")[0]));
+        const json health = doc_eval_solid_health(id, 0);
+        const json& si = health.at("bodies")[0].at("self_intersection");
+        MESSAGE("clean box self_intersection -> " << si.dump());
+        REQUIRE_MESSAGE(si.at("checked").get<bool>(),
+                        "the check must RUN on a plain box: " << si.dump());
+        CHECK_FALSE(si.at("self_intersecting").get<bool>());
+        CHECK(si.at("interference_count").get<int>() == 0);
+        CHECK(si.at("kinds").empty());
+        CHECK(si.at("elapsed_ms").get<double>() >= 0.0);
+        CHECK(health.at("bodies")[0].at("sound").get<bool>());
+        CHECK(health.at("all_sound").get<bool>());
+    }
+
+    // --- the figure-eight prism: two side faces cross ---------------------------
+    BRepBuilderAPI_MakePolygon bowtie;
+    bowtie.Add(gp_Pnt(0.0, 0.0, 0.0));
+    bowtie.Add(gp_Pnt(40.0, 20.0, 0.0));
+    bowtie.Add(gp_Pnt(40.0, 0.0, 0.0));
+    bowtie.Add(gp_Pnt(0.0, 5.0, 0.0));
+    bowtie.Close();
+    REQUIRE(bowtie.IsDone());
+    const TopoDS_Face cap = BRepBuilderAPI_MakeFace(bowtie.Wire()).Face();
+    REQUIRE(!cap.IsNull());
+    const TopoDS_Shape folded = BRepPrimAPI_MakePrism(cap, gp_Vec(0.0, 0.0, 10.0)).Shape();
+    REQUIRE(!folded.IsNull());
+    {
+        TopTools_IndexedMapOfShape somap;
+        TopExp::MapShapes(folded, TopAbs_SOLID, somap);
+        REQUIRE_MESSAGE(somap.Extent() == 1,
+                        "the fixture must be a SOLID, or the census below means nothing");
+        GProp_GProps vp;
+        BRepGProp::VolumeProperties(folded, vp);
+        REQUIRE_MESSAGE(vp.Mass() > 1.0,
+                        "the lobes must NOT cancel — signed volume was " << vp.Mass());
+    }
+
+    const fs::path brep_path =
+        fs::temp_directory_path() / "chudware_self_intersecting_prism.brep";
+    REQUIRE(BRepTools::Write(folded, brep_path.string().c_str()));
+
+    {
+        const std::string id =
+            doc_new("part", "SelfIntersectPrism").at("doc_id").get<std::string>();
+        json ops = json::array({
+            json{{"op", "add_feature"}, {"feature",
+                json{{"type", "import"}, {"name", "Folded"},
+                     {"params", {{"source_path", brep_path.string()},
+                                 {"format", "brep"}}}}}},
+        });
+        json resp = doc_apply_ops(id, -1, ops, false);
+        const json& rows = resp.at("rebuild").at("feature_status");
+        REQUIRE_MESSAGE(rows[0].value("ok", false),
+                        "the folded .brep must import: " << status_err(rows[0]));
+
+        const json health = doc_eval_solid_health(id, 0);
+        const json& body = health.at("bodies")[0];
+        const json& si = body.at("self_intersection");
+        MESSAGE("folded prism self_intersection -> " << si.dump());
+        REQUIRE_MESSAGE(si.at("checked").get<bool>(),
+                        "the check must RUN on the folded prism: " << si.dump());
+        CHECK(si.at("self_intersecting").get<bool>());
+        CHECK(si.at("interference_count").get<int>() >= 1);
+        CHECK_FALSE(si.at("kinds").empty());
+        // The topology census is spotless and the volume is positive: nothing in the
+        // watertight verdict could have caught this. Only the geometric check does.
+        CHECK(body.at("free_edges").at("count").get<int>() == 0);
+        CHECK(body.at("non_manifold_edges").at("count").get<int>() == 0);
+        CHECK(body.at("volume_positive").get<bool>());
+        CHECK(body.at("watertight").get<bool>());
+        CHECK_FALSE(body.at("sound").get<bool>());
+        CHECK_FALSE(health.at("all_sound").get<bool>());
     }
 
     std::error_code ec;

@@ -173,6 +173,15 @@ judgment).
 - **GUI reconnect:** status bar shows a sticky unreachable chip; `engine_events` reconnects
   with backoff and re-bootstraps doc tabs on `reconnectGeneration` bump
   (`CHUDWARE_SHOT=daemon_h2`). See gui-workspaces for the status-bar surface.
+- **NEVER run `ulimit -v/-m/-d` (or `prlimit` against a pid you did not spawn) in an agent bash
+  call (2026-09-05).** The agent host's bash tool is an in-process shell (`$$` is the omp pid),
+  so an address-space cap lands on the host itself — with its ~75 GB of virtual reservations every
+  later `mmap` fails with ENOMEM while RAM is free, and the host aborts (three crashes traced in
+  `docs/ops/HOST_CRASH_FORENSICS.md`). Cap memory ONLY by wrapping the native run:
+  `systemd-run --user --pipe --wait -q --collect -p MemoryMax=12G bash -c 'ulimit -c 0; …'`
+  (cgroup kill instead of abort; `ulimit -c 0` keeps the coredump pipeline out of it). Box policy:
+  `CHUDWARE_MEM_FRAC=0.5 CHUDWARE_HEADROOM_GB=6 CHUDWARE_SIM_THREADS=4`, one >4 GB run per agent,
+  announced on hub, aggregate under ~24 GB.
 - **A mission turn lives for hours; nothing in the lane may cap it silently (2026-09-05).**
   `chudcode_host` builds `RpcClient(max_event_history=CHUDWARE_CHUDCODE_EVENT_HISTORY,
   default 1e6)` — the package default of 10 000 frames killed a 65-minute turn with "Event

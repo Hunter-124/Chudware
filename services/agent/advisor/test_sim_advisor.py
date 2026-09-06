@@ -118,9 +118,9 @@ class TestBcLint:
         })
         assert any(issue["kind"] == "invalid_buckling_load" for issue in issues)
 
-    def test_contact_requires_positive_pressure(self):
-        issues = _surface_issues({"type": "fea_contact", "pressure_mpa": 0.0})
-        assert any(issue["kind"] == "invalid_contact_pressure" for issue in issues)
+    def test_contact_requires_a_positive_gap_window(self):
+        issues = _surface_issues({"type": "fea_contact", "max_gap_mm": 0.0})
+        assert any(issue["kind"] == "invalid_contact_gap" for issue in issues)
 
 
     def test_cfd_uses_velocity_not_structural_loads(self):

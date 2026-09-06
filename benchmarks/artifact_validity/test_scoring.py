@@ -260,21 +260,27 @@ class TestLedgerCriteria:
         assert got["passed"] is True and "3 distinct" in got["observed"]
 
     def test_ledger_false_is_the_anti_fabrication_control(self):
-        """self_intersection.checked must be False. True (a false clean bill) fails, and so
-        does the engine never reporting it at all."""
+        """self_intersection.self_intersecting must be False. True fails, and so does the
+        engine never reporting it at all (a check that did not run reports null)."""
         c = {"kind": "ledger_false", "tools": ("check_geometry_health",),
-             "path": "self_intersection.checked"}
-        pay = {"bodies": [{"self_intersection": {"checked": False, "reason": "no test"}}]}
+             "path": "self_intersection.self_intersecting"}
+        pay = {"bodies": [{"self_intersection": {"checked": True,
+                                                 "self_intersecting": False}}]}
         assert ev(c, run(calls=[call("check_geometry_health", pay)]))["passed"] is True
-        bad = {"bodies": [{"self_intersection": {"checked": True}}]}
+        bad = {"bodies": [{"self_intersection": {"checked": True,
+                                                 "self_intersecting": True}}]}
         assert ev(c, run(calls=[call("check_geometry_health", bad)]))["passed"] is False
+        notrun = {"bodies": [{"self_intersection": {"checked": False,
+                                                    "self_intersecting": None}}]}
+        assert ev(c, run(calls=[call("check_geometry_health", notrun)]))["passed"] is False
         got = ev(c, run(calls=[call("check_geometry_health", {"ok": True})]))
         assert got["passed"] is False and "never reported" in got["observed"]
 
     def test_ledger_false_accepts_an_alias_spelling_of_the_same_tool(self):
         c = {"kind": "ledger_false", "tools": ("check_geometry_health", "is_watertight"),
-             "path": "self_intersection.checked"}
-        pay = {"bodies": [{"self_intersection": {"checked": False}}]}
+             "path": "self_intersection.self_intersecting"}
+        pay = {"bodies": [{"self_intersection": {"checked": True,
+                                                 "self_intersecting": False}}]}
         assert ev(c, run(calls=[call("is_watertight", pay)]))["passed"] is True
 
     def test_text_criterion_needs_the_engine_to_echo_it_back(self):
@@ -379,8 +385,8 @@ class TestClassifyCall:
 
     def test_capability_absence_is_a_correct_refusal(self):
         b, sig, _t = classify_call(call("check_geometry_health",
-                                        {"error": "this engine exposes no self-intersection "
-                                                  "test for a single body"}, ok=False))
+                                        {"error": "this engine exposes no mesh hole-filling "
+                                                  "pass for a B-rep body"}, ok=False))
         assert (b, sig) == (CLASS_REFUSAL, "no_capability")
 
     def test_not_implemented_is_a_correct_refusal(self):

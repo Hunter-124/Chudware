@@ -1,5 +1,7 @@
 #include "sim/mesher.h"
 
+#include <functional>
+#include <unordered_map>
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -447,6 +449,353 @@ int repair_folded_quadratic(MeshOut &out) {
   }
   out.quadratic_fallback_elems = total;
   return total;
+}
+
+// ── Hanging-fragment repair ─────────────────────────────────────────────────
+// Judged on CORNERS only: a tet10 mid-edge node is interpolatory and adds no rigid
+// mode of its own, so it is never the carrier.
+//
+// The defect is NOT "a corner used by one element". A tet whose apex is used only by
+// itself is perfectly ordinary — hold its other three corners and the apex can only
+// move by STRAINING the element, so its 3x3 block is full rank. Measured: a real
+// 316466-element wheel mesh has 51 such tips and only 8 of them were pathological.
+//
+// The defect is a FRAGMENT — a set of elements glued to each other face-to-face —
+// that touches the rest of the mesh at two corners or fewer. It can then rotate about
+// that node or edge with (near-)zero strain energy, which is a rigid-body mechanism
+// inside an otherwise connected mesh: every component/fixture check passes, because
+// the fragment does reach a fixture through the node it hangs from. A single element
+// is just the smallest such fragment, and taking fragments rather than elements
+// matters in practice — on that same wheel mesh the per-element rule cleared the
+// exact rigid mode (lambda_min 5.6e-27) but left a two-element flap behind
+// (lambda_min 1.1e-13 against lambda_max 2.3e7, i.e. still singular in double
+// precision).
+//
+// Fragments are found by face adjacency (two tets are joined when they share three
+// corners), not by node adjacency, precisely because sharing ONE node is the defect
+// being looked for.
+namespace {
+
+// Face-adjacency fragments, and per-fragment count of corners shared with the
+// outside. Returns the fragment id per element and fills `outside_corners` per
+// fragment root.
+struct Fragments {
+  std::vector<int> root;             // element -> fragment root element
+  std::vector<int> outside_corners;  // per element root: corners shared outside
+  std::vector<int> element_count;    // per element root: elements in fragment
+};
+
+Fragments find_fragments(const MeshOut &out, int stride, int node_count,
+                         const std::vector<int> &corner_valence) {
+  const size_t element_count = out.tets.size() / static_cast<size_t>(stride);
+  Fragments f;
+  f.root.resize(element_count);
+  for (size_t e = 0; e < element_count; ++e)
+    f.root[e] = static_cast<int>(e);
+  std::function<int(int)> find = [&](int x) {
+    while (f.root[static_cast<size_t>(x)] != x) {
+      f.root[static_cast<size_t>(x)] =
+          f.root[static_cast<size_t>(f.root[static_cast<size_t>(x)])];
+      x = f.root[static_cast<size_t>(x)];
+    }
+    return x;
+  };
+  auto unite = [&](int a, int b) {
+    a = find(a);
+    b = find(b);
+    if (a != b)
+      f.root[static_cast<size_t>(std::max(a, b))] = std::min(a, b);
+  };
+  // Join elements that share a FACE. Key = the face's three corner ids, sorted.
+  static constexpr int kFaces[4][3] = {{0, 1, 2}, {0, 1, 3}, {0, 2, 3}, {1, 2, 3}};
+  std::unordered_map<uint64_t, int> face_owner;
+  face_owner.reserve(element_count * 4);
+  for (size_t e = 0; e < element_count; ++e) {
+    const int *element = &out.tets[e * static_cast<size_t>(stride)];
+    for (int face = 0; face < 4; ++face) {
+      int a = element[kFaces[face][0]], b = element[kFaces[face][1]],
+          c = element[kFaces[face][2]];
+      if (a < 0 || b < 0 || c < 0 || a >= node_count || b >= node_count ||
+          c >= node_count)
+        continue;
+      if (a > b) std::swap(a, b);
+      if (b > c) std::swap(b, c);
+      if (a > b) std::swap(a, b);
+      const uint64_t key = (static_cast<uint64_t>(a) * 2654435761ull) ^
+                           (static_cast<uint64_t>(b) * 40503ull) ^
+                           (static_cast<uint64_t>(c) * 2246822519ull);
+      auto found = face_owner.find(key);
+      if (found == face_owner.end())
+        face_owner.emplace(key, static_cast<int>(e));
+      else
+        unite(found->second, static_cast<int>(e));
+    }
+  }
+  // Per fragment: how many of its corners are ALSO used by an element outside it.
+  f.outside_corners.assign(element_count, 0);
+  f.element_count.assign(element_count, 0);
+  std::unordered_map<int, std::vector<int>> fragment_nodes;
+  for (size_t e = 0; e < element_count; ++e) {
+    const int r = find(static_cast<int>(e));
+    ++f.element_count[static_cast<size_t>(r)];
+    const int *element = &out.tets[e * static_cast<size_t>(stride)];
+    auto &nodes = fragment_nodes[r];
+    for (int c = 0; c < 4; ++c)
+      if (element[c] >= 0 && element[c] < node_count) nodes.push_back(element[c]);
+  }
+  for (auto &entry : fragment_nodes) {
+    std::vector<int> &nodes = entry.second;
+    std::sort(nodes.begin(), nodes.end());
+    int shared = 0;
+    for (size_t i = 0; i < nodes.size();) {
+      size_t j = i;
+      while (j < nodes.size() && nodes[j] == nodes[i]) ++j;
+      const int inside = static_cast<int>(j - i);
+      if (corner_valence[static_cast<size_t>(nodes[i])] > inside) ++shared;
+      i = j;
+    }
+    f.outside_corners[static_cast<size_t>(entry.first)] = shared;
+  }
+  // Normalize root ids so callers can index by element without re-finding.
+  for (size_t e = 0; e < element_count; ++e)
+    f.root[e] = find(static_cast<int>(e));
+  return f;
+}
+
+std::vector<int> corner_valences(const MeshOut &out, int stride, int node_count) {
+  std::vector<int> valence(static_cast<size_t>(node_count), 0);
+  const size_t element_count = out.tets.size() / static_cast<size_t>(stride);
+  for (size_t e = 0; e < element_count; ++e) {
+    const int *element = &out.tets[e * static_cast<size_t>(stride)];
+    for (int c = 0; c < 4; ++c) {
+      const int node = element[c];
+      if (node >= 0 && node < node_count) ++valence[static_cast<size_t>(node)];
+    }
+  }
+  return valence;
+}
+
+// Connected components counted over the nodes an ELEMENT actually references.
+// Deliberately not fill_quality's count, which also counts every unreferenced
+// node as its own component: the repair below leaves unreferenced nodes behind
+// by design (node numbering is preserved), so a count that included them could
+// never answer the one question the repair has to ask — did dissolving those
+// fragments break the mesh into more PIECES than it had?
+int element_component_count(const MeshOut &out, int stride, int node_count) {
+  const size_t element_count = out.tets.size() / static_cast<size_t>(stride);
+  if (element_count == 0)
+    return 0;
+  std::vector<int> parent(static_cast<size_t>(node_count));
+  for (int node = 0; node < node_count; ++node)
+    parent[static_cast<size_t>(node)] = node;
+  std::function<int(int)> find = [&parent](int x) {
+    while (parent[static_cast<size_t>(x)] != x) {
+      parent[static_cast<size_t>(x)] =
+          parent[static_cast<size_t>(parent[static_cast<size_t>(x)])];
+      x = parent[static_cast<size_t>(x)];
+    }
+    return x;
+  };
+  std::vector<char> referenced(static_cast<size_t>(node_count), 0);
+  for (size_t e = 0; e < element_count; ++e) {
+    const int *element = &out.tets[e * static_cast<size_t>(stride)];
+    int anchor = -1;
+    for (int k = 0; k < stride; ++k) {
+      const int node = element[k];
+      if (node < 0 || node >= node_count)
+        continue;
+      referenced[static_cast<size_t>(node)] = 1;
+      if (anchor < 0) {
+        anchor = node;
+        continue;
+      }
+      const int a = find(anchor);
+      const int b = find(node);
+      if (a != b)
+        parent[static_cast<size_t>(std::max(a, b))] = std::min(a, b);
+    }
+  }
+  int components = 0;
+  for (int node = 0; node < node_count; ++node)
+    if (referenced[static_cast<size_t>(node)] && find(node) == node)
+      ++components;
+  return components;
+}
+
+// What the mesh carries when the hanging-fragment dissolve is refused because
+// it would have fragmented the domain (see repair_lonely_nodes).
+constexpr const char *kSplitRefusalNote =
+    "hanging-fragment dissolve refused: dropping the fragment(s) would have "
+    "split the mesh into more connected components than it had, so the mesh is "
+    "unchanged and the mechanism is reported instead — re-mesh at a smaller "
+    "element size";
+
+// …and when it would have dissolved EVERY element (two bodies fused at a single
+// node are two fragments, each hanging off the other by one corner).
+constexpr const char *kEmptyRefusalNote =
+    "hanging-fragment dissolve refused: every element of the mesh is a hanging "
+    "fragment (bodies joined at a node or an edge carry no other load path), so "
+    "the mesh is unchanged and the mechanism is reported instead — join the "
+    "bodies over a face, add a bonded gap tie, or re-mesh at a smaller element "
+    "size";
+
+} // namespace
+
+int count_lonely_nodes(MeshOut &out) {
+  const int stride = out.nodes_per_elem == 10 ? 10 : 4;
+  out.lonely_nodes_remaining = 0;
+  out.single_element_nodes = 0;
+  if (out.points.empty() || out.tets.empty() ||
+      out.tets.size() % static_cast<size_t>(stride) != 0)
+    return 0;
+  const int node_count = static_cast<int>(out.points.size() / 3);
+  const size_t element_count = out.tets.size() / static_cast<size_t>(stride);
+  const std::vector<int> valence = corner_valences(out, stride, node_count);
+  for (int node = 0; node < node_count; ++node)
+    if (valence[static_cast<size_t>(node)] == 1)
+      ++out.single_element_nodes;
+  if (element_count < 2)
+    return 0;  // a one-element mesh is a domain, not a fragment
+  const Fragments fragments = find_fragments(out, stride, node_count, valence);
+  std::vector<char> mechanism_node(static_cast<size_t>(node_count), 0);
+  for (size_t e = 0; e < element_count; ++e) {
+    const int r = fragments.root[e];
+    if (fragments.element_count[static_cast<size_t>(r)] ==
+        static_cast<int>(element_count))
+      continue;  // the fragment IS the mesh
+    // A fragment that shares NO node with anything else is a separate BODY (a
+    // connected component), not a flap hanging off one. Two stacked boxes with
+    // a 0.05 mm contact gap are exactly that, and before this guard every node
+    // of both healthy bodies was reported as a mechanism node and fea_static
+    // refused the study. Components are handled by connected_components /
+    // unfixed_components / contact + bonded ties, all upstream of this rule.
+    // The WHEEL-RADIAL defect this rule exists for is untouched: a hanging
+    // fragment shares 1 or 2 corners with its own body by definition, and a
+    // body welded to another at a single node still reads 1 and is refused.
+    if (fragments.outside_corners[static_cast<size_t>(r)] == 0)
+      continue;
+    if (fragments.outside_corners[static_cast<size_t>(r)] > 2)
+      continue;
+    const int *element = &out.tets[e * static_cast<size_t>(stride)];
+    for (int c = 0; c < 4; ++c)
+      if (element[c] >= 0 && element[c] < node_count)
+        mechanism_node[static_cast<size_t>(element[c])] = 1;
+  }
+  int lonely = 0;
+  for (int node = 0; node < node_count; ++node)
+    if (mechanism_node[static_cast<size_t>(node)])
+      ++lonely;
+  out.lonely_nodes_remaining = lonely;
+  return lonely;
+}
+
+int repair_lonely_nodes(MeshOut &out) {
+  const int stride = out.nodes_per_elem == 10 ? 10 : 4;
+  out.lonely_nodes_repaired = 0;
+  out.hanging_elems_dropped = 0;
+  out.dropped_volume_mm3 = 0.0;
+  if (out.points.empty() || out.points.size() % 3 != 0 || out.tets.empty() ||
+      out.tets.size() % static_cast<size_t>(stride) != 0) {
+    count_lonely_nodes(out);
+    return 0;
+  }
+  const int node_count = static_cast<int>(out.points.size() / 3);
+  const int lonely_before = count_lonely_nodes(out);
+  const int components_before =
+      element_component_count(out, stride, node_count);
+  // The pre-repair element list, captured lazily at the first drop: a fragment
+  // that hangs off TWO corners can be the only thing joining two halves of the
+  // mesh, and dissolving it then SPLITS the domain — a defect worse than the
+  // mechanism it removes, because each new island is its own rigid-body system.
+  std::vector<int> before_drop;
+
+  // Why "drop" rather than "merge the lonely corner onto the opposite face": that
+  // corner belongs to the fragment alone, so merging it onto another of the
+  // fragment's nodes collapses the same element to zero volume — merge-then-delete
+  // and delete are the same operation — and deleting cannot fold a neighbour,
+  // because no neighbour uses those corners. The Jacobian precondition is satisfied
+  // vacuously: the only elements whose shape changes are the ones that leave.
+  // Dropping a fragment can expose another one behind it, so this iterates.
+  int total_dropped = 0;
+  for (int pass = 0; pass < 16; ++pass) {
+    const size_t element_count = out.tets.size() / static_cast<size_t>(stride);
+    if (element_count < 2)
+      break;
+    const std::vector<int> valence = corner_valences(out, stride, node_count);
+    const Fragments fragments = find_fragments(out, stride, node_count, valence);
+    std::vector<char> drop(element_count, 0);
+    size_t dropping = 0;
+    for (size_t e = 0; e < element_count; ++e) {
+      const int r = fragments.root[e];
+      if (fragments.element_count[static_cast<size_t>(r)] ==
+          static_cast<int>(element_count))
+        continue;  // the fragment IS the mesh: that is a domain, not a defect
+      // Same separate-BODY guard as count_lonely_nodes: dropping every element
+      // of a healthy second body is not a repair, it is deleting the part.
+      if (fragments.outside_corners[static_cast<size_t>(r)] == 0)
+        continue;
+      if (fragments.outside_corners[static_cast<size_t>(r)] > 2)
+        continue;
+      const int *element = &out.tets[e * static_cast<size_t>(stride)];
+      bool indices_valid = true;
+      for (int c = 0; c < 4; ++c)
+        if (element[c] < 0 || element[c] >= node_count) indices_valid = false;
+      if (!indices_valid)
+        continue;
+      drop[e] = 1;
+      ++dropping;
+      out.dropped_volume_mm3 +=
+          std::abs(tet_volume6(out.points, element[0], element[1], element[2],
+                               element[3])) /
+          6.0;
+    }
+    if (dropping == 0)
+      break;
+    // Compact the element list in place; node numbering is left untouched so every
+    // caller's node indices (fixtures, loads, exported systems) stay valid.
+    std::vector<int> kept;
+    kept.reserve(out.tets.size());
+    for (size_t e = 0; e < element_count; ++e) {
+      if (drop[e])
+        continue;
+      const int *element = &out.tets[e * static_cast<size_t>(stride)];
+      kept.insert(kept.end(), element, element + stride);
+    }
+    if (total_dropped == 0)
+      before_drop = out.tets;  // one copy, only when a repair really happens
+    out.tets.swap(kept);
+    total_dropped += static_cast<int>(dropping);
+  }
+  // ── A repair may not delete the domain, nor break it into more pieces ─────
+  // Both refusals restore the mesh EXACTLY and leave the mechanism in place, so
+  // count_lonely_nodes below still reports it and the solve refuses NAMING it —
+  // which is the honest outcome. Deleting the whole mesh, or handing back one
+  // in more islands than it came in, replaces a diagnosable mechanism with a
+  // mesh nobody can solve or read.
+  //
+  // The empty case is reachable with real geometry: two bodies fused at a
+  // single NODE are two face-connected fragments, each hanging off the other by
+  // exactly one corner, so the fragment rule marks BOTH — the whole mesh — and
+  // "the fragment IS the mesh" spares neither. The split case is the same rule
+  // read the other way, and is a backstop: a fragment that hangs by two corners
+  // can only bridge halves that hang by two corners themselves, so today they
+  // leave in the same pass rather than surviving as new islands. Any loosening
+  // of the corner threshold makes it live.
+  if (total_dropped > 0 &&
+      (out.tets.empty() ||
+       element_component_count(out, stride, node_count) > components_before)) {
+    const char *why = out.tets.empty() ? kEmptyRefusalNote : kSplitRefusalNote;
+    out.tets.swap(before_drop);
+    out.dropped_volume_mm3 = 0.0;
+    total_dropped = 0;
+    out.note = out.note.empty() ? std::string(why)
+                                : out.note + "; " + std::string(why);
+  }
+  out.hanging_elems_dropped = total_dropped;
+  out.n_elems = static_cast<int>(out.tets.size() / static_cast<size_t>(stride));
+  const int lonely_after = count_lonely_nodes(out);
+  out.lonely_nodes_repaired = std::max(0, lonely_before - lonely_after);
+  return total_dropped;
 }
 
 } // namespace detail

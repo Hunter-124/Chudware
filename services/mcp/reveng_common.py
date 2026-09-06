@@ -1264,9 +1264,14 @@ def _reserve_mission(session_id: str, run_id: str) -> Optional[str]:
 
 def _release_mission(session_id: str, run_id: str) -> None:
     with _MISSION_LOCK:
-        entry = _MISSION_THREADS.get(session_id)
-        if entry is not None and entry[0] == run_id:
-            _MISSION_THREADS.pop(session_id, None)
+        _drop_slot(session_id, run_id)
+
+
+def _drop_slot(session_id: str, run_id: str) -> None:
+    """Free *session_id*'s mission slot if *run_id* still owns it. Caller holds the lock."""
+    entry = _MISSION_THREADS.get(session_id)
+    if entry is not None and entry[0] == run_id:
+        _MISSION_THREADS.pop(session_id, None)
 
 
 def _busy_envelope(session_id: str, run_id: str) -> dict:
@@ -1287,10 +1292,19 @@ def _spawn_mission(session_id: str, run_id: str, invoke, rec: dict, graph: dict)
             result = invoke()
         except Exception as exc:  # noqa: BLE001 — a crashed mission must still be reported
             result = {"status": "failed", "error": f"{type(exc).__name__}: {exc}"}
-        try:
-            _apply_run_result(rec, result, graph)
-        finally:
-            _release_mission(session_id, run_id)
+        # Publishing the result and dropping the slot are ONE critical section: the
+        # instant a reader can see status "paused" it must be able to resolve that
+        # gate. Published-then-released, the two are a window in which the run record
+        # says "waiting for a human" while _reserve_mission still answers
+        # mission_already_running — so the GUI's (and the test's) poll-then-approve
+        # gets refused for a mission that is doing nothing but waiting for it. Every
+        # slot reader takes _MISSION_LOCK, so a resolve that arrives mid-publish now
+        # blocks on the lock instead of reading a stale claim.
+        with _MISSION_LOCK:
+            try:
+                _apply_run_result(rec, result, graph)
+            finally:
+                _drop_slot(session_id, run_id)
 
     thread = _threading.Thread(target=_body, name=f"reveng-{run_id}", daemon=True)
     with _MISSION_LOCK:

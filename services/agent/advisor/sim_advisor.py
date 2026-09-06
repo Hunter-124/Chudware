@@ -827,11 +827,15 @@ def _surface_issues(study: dict) -> list[dict]:
                 "tool": "run_fea_buckling",
             })
     if "contact" in kind and _finite_float(
-        study.get("pressure_mpa", 1.0), positive=True
+        study.get("max_gap_mm", 0.5), positive=True
     ) is None:
         issues.append({
-            "kind": "invalid_contact_pressure",
-            "detail": "run_fea_contact pressure_mpa must be finite and >0 MPa.",
+            "kind": "invalid_contact_gap",
+            "detail": (
+                "run_fea_contact max_gap_mm must be finite and >0 mm: it is the widest "
+                "mesh gap still treated as a contact candidate. Measure the real clearance "
+                "and pass just above it."
+            ),
             "tool": "run_fea_contact",
         })
     transient_thermal = thermal and (

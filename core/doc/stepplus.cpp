@@ -23,6 +23,13 @@
 
 #include <BinTools.hxx>
 #include <BinTools_FormatVersion.hxx>
+#include <DESTEP_Parameters.hxx>
+#include <IFSelect_ReturnStatus.hxx>
+#include <STEPControl_StepModelType.hxx>
+#include <STEPControl_Writer.hxx>
+#include <TopAbs.hxx>
+#include <TopExp_Explorer.hxx>
+#include <UnitsMethods_LengthUnit.hxx>
 
 #include <miniz.h>
 
@@ -249,6 +256,18 @@ std::string editable_container_save(const json& doc, const std::string& path,
     add("thumbnail.png", thumb, /*stored=*/true);
     add("meta.json", meta_json, /*stored=*/false);
     add("document.json", document, /*stored=*/false);
+    // geometry.step: the contracted AP214 snapshot of the last successful rebuild
+    // (contracts/stepplus.md §1). doc_save puts the bytes in `extra` after a fully-ok
+    // rebuild; we write it as an entry we OWN so it lands right after document.json and
+    // is never duplicated by the preserve loop below (is_known_entry skips it). Absent
+    // bytes mean "this document has never rebuilt successfully" — the only omission the
+    // contract allows. A .draw+ container does not own it, so there it stays an unknown
+    // forward-compatible entry and survives through the loop verbatim.
+    if (owns_geometry_step) {
+        const auto geom = extra.find("geometry.step");
+        if (geom != extra.end() && !geom->second.empty())
+            add("geometry.step", geom->second, /*stored=*/false);
+    }
     // Preserve unknown entries (forward-compat) — never clobber the entries we own.
     // cache.aicm (the persisted-geometry mesh blob) is written STORED, not deflated: it is
     // large binary that barely compresses, and STORED lets doc_open extract it raw with
@@ -480,6 +499,45 @@ std::vector<TopoDS_Shape> brep_cache_decode(const std::string& blob) {
         bodies.push_back(sh);
     }
     return bodies;
+}
+
+// --- geometry.step (contracts/stepplus.md §1) ---------------------------------------
+std::string stepplus_geometry_step_bytes(const std::vector<TopoDS_Shape>& bodies) {
+    if (bodies.empty()) return std::string();
+    try {
+        STEPControl_Writer writer;
+        // Pin the contracted schema + unit on the transfer instead of relying on the
+        // process-wide Interface_Static defaults: the container promises AP214 in mm, and a
+        // host that set write.step.schema for an interchange export must not be able to
+        // change what a NATIVE save embeds. Both values happen to be the DESTEP defaults.
+        DESTEP_Parameters params;
+        params.WriteSchema = DESTEP_Parameters::WriteMode_StepSchema_AP214IS;
+        params.WriteUnit = UnitsMethods_LengthUnit_Millimeter;
+        std::size_t transferred = 0;
+        for (const TopoDS_Shape& body : bodies) {
+            if (body.IsNull()) continue;
+            bool any_solid = false;
+            // One SOLID per transfer (mirrors export_bodies): a boolean-result body can be a
+            // compound of DISJOINT lumps, and transferring that compound AsIs emits a single
+            // malformed manifold_solid_brep that re-reads as one invalid solid.
+            for (TopExp_Explorer ex(body, TopAbs_SOLID); ex.More(); ex.Next()) {
+                if (writer.Transfer(ex.Current(), STEPControl_AsIs, params) != IFSelect_RetDone)
+                    return std::string();
+                any_solid = true;
+                ++transferred;
+            }
+            if (any_solid) continue;
+            if (writer.Transfer(body, STEPControl_AsIs, params) != IFSelect_RetDone)
+                return std::string();
+            ++transferred;
+        }
+        if (transferred == 0) return std::string();
+        std::ostringstream os(std::ios::binary);
+        if (writer.WriteStream(os) != IFSelect_RetDone) return std::string();
+        return os.str();
+    } catch (...) {
+        return std::string();  // honest drop: a writer problem never fails the save
+    }
 }
 
 std::string stepplus_cache_engine_key() {

@@ -45,7 +45,7 @@ _META = "meta.json"  # container-level meta (NOT the PLM meta.json — kept unde
 _KNOWN_CONTAINER_ENTRIES = {_DOCUMENT, _THUMBNAIL}
 
 # Derived / solved state stripped at the VAULT BOUNDARY — the "compiled binary"
-# half of the recipe/build-artifact split. Two rules:
+# half of the recipe/build-artifact split. Three rules:
 #
 #   1. ``cache.*``  — display/build acceleration embedded in the live .step+ by
 #      the engine (cache.brep, cache.aicm and the cache.json header, see
@@ -61,18 +61,30 @@ _KNOWN_CONTAINER_ENTRIES = {_DOCUMENT, _THUMBNAIL}
 #      refresh"): a missing results cache means "re-run the study", never data
 #      loss. Study DEFINITIONS (``studies/<id>.json``) are recipe and stay
 #      tracked, as does every other ``studies/`` entry.
+#   3. ``geometry.step`` — the AP214 snapshot of the last successful rebuild that
+#      ``doc_save`` embeds in every live container (core/doc/session.cpp via
+#      ``stepplus_geometry_step_bytes``, contracts/stepplus.md §1). It is derived
+#      and recomputable from document.json, and contracts/plm.md §5.4 pins it to
+#      RELEASE commits only — where ``Vault.release`` supplies its own frozen
+#      bytes through ``geometry_for``, so history never depends on the working
+#      file's copy. Preserving the live entry under ``extra/`` instead would put
+#      an O(geometry) STEP blob in every checkpoint, which is precisely what §5.4
+#      exists to prevent.
 #
-# Committing either would put an O(geometry) build artifact in every revision of
-# history, which is exactly what the recipe-is-the-source-code rule forbids.
+# Committing any of these would put an O(geometry) build artifact in every revision
+# of history, which is exactly what the recipe-is-the-source-code rule forbids.
 _DERIVED_CACHE_PREFIX = "cache."
 _STUDIES_PREFIX = "studies/"
 _STUDY_RESULT_BASENAME_PREFIX = "results."
+_DERIVED_GEOMETRY = "geometry.step"
 
 
 def is_derived_entry(name: str) -> bool:
     """True when a container entry is solved state, not recipe — stripped at the
     vault boundary and never committed to history."""
     if name.startswith(_DERIVED_CACHE_PREFIX):
+        return True
+    if name == _DERIVED_GEOMETRY:
         return True
     if name.startswith(_STUDIES_PREFIX):
         return name.rsplit("/", 1)[-1].startswith(_STUDY_RESULT_BASENAME_PREFIX)

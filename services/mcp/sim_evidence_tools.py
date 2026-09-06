@@ -205,6 +205,30 @@ def _checklist_state(
     )
     reactions = result.get("reactions") if isinstance(result.get("reactions"), dict) else {}
     adapt = result.get("adapt") if isinstance(result.get("adapt"), dict) else {}
+    # What the reported peak IS. The solver's summary max_von_mises_mpa skips the two
+    # element rings around ideal fixtures (a clamp singularity), so on a case whose
+    # fixture faces ARE the feature of interest the reported peak is not the peak
+    # there — one released packet quoted 105.98 MPa as "the peak at the keyway
+    # bolt-hole edge" while the same solve's field peaked at 402.93 MPa on that edge.
+    # Every stress/FoS item below therefore carries the reduction and its unmasked twin.
+    reduction = summary.get("max_von_mises_reduction")
+    raw_peak = summary.get("max_von_mises_raw_mpa")
+    if reduction is None:
+        reduction_note = (
+            "the result predates the reduction disclosure (no "
+            "summary.max_von_mises_reduction), so whether it is masked is UNKNOWN — "
+            "re-solve with the current engine before releasing this number"
+        )
+    elif reduction == "node_averaged":
+        reduction_note = "reduction=node_averaged over ALL nodes (nothing excluded)"
+    else:
+        reduction_note = (
+            f"reduction={reduction} — it EXCLUDES "
+            f"{summary.get('summary_nodes_excluded')} of "
+            f"{summary.get('summary_nodes_total')} nodes (two element rings around the "
+            f"fixtures); unmasked peak max_von_mises_raw_mpa={raw_peak} MPa, "
+            f"min_fos_raw={summary.get('min_fos_raw')}"
+        )
 
     def item(text: str, ok: bool, evidence: str) -> dict:
         return {"item": text, "auto_satisfied": bool(ok), "evidence": evidence}
@@ -304,20 +328,27 @@ def _checklist_state(
         item(
             _CHECKLIST[10],
             False,
-            f"max_von_mises_mpa={summary.get('max_von_mises_mpa')} is the peak, not a "
-            "non-singular monitored value — name the monitored location and its stress.",
+            f"max_von_mises_mpa={summary.get('max_von_mises_mpa')} is a REPORTED peak, "
+            f"not a non-singular monitored value ({reduction_note}) — name the monitored "
+            "location and its stress, and say which of the two peaks your monitored "
+            "value is being compared against.",
         ),
         item(
             _CHECKLIST[11],
             False,
             "a peak that keeps growing with refinement is a singularity: judge it against "
-            "convergence.md and record the assessment.",
+            f"convergence.md and record the assessment. {reduction_note} — the solver "
+            "already withheld the fixture-adjacent nodes from the reported peak, so this "
+            "assessment is about the peak that REMAINS, and any statement about stress AT "
+            "a fixture face must quote the unmasked value.",
         ),
         item(
             _CHECKLIST[12],
             False,
-            f"min_fos={summary.get('min_fos')} is reported against the solver's yield; "
-            "state the explicit allowable (yield/SF) you release against.",
+            f"min_fos={summary.get('min_fos')} is reported against the solver's yield and "
+            f"is derived from max_von_mises_mpa ({reduction_note}); state the explicit "
+            "allowable (yield/SF) you release against, and whether the released FoS is "
+            "the masked one (min_fos) or the unmasked one (min_fos_raw).",
         ),
         item(
             _CHECKLIST[13],
@@ -484,6 +515,14 @@ def register_sim_evidence_tools(mcp: FastMCP) -> None:
                    table) — a material with no source cannot be released.
         load_rationale : magnitude, direction, distribution and dynamic-factor justification.
         notes : limitations and what remains unverified.
+
+        The stress and FoS checklist items quote the result's OWN reduction disclosure
+        (summary.max_von_mises_reduction / max_von_mises_raw_mpa / min_fos_raw): the
+        solver's reported peak excludes two element rings around ideal fixtures, so a
+        case whose fixture faces are the feature of interest has a higher real peak in
+        its own .vtu, and the packet says so instead of letting the reader assume the
+        reported number is the field's maximum. A result carrying no reduction key
+        predates the disclosure and is flagged as UNKNOWN rather than assumed unmasked.
 
         Writes inputs.json, result.json, provenance.json, checklist.md, convergence.md
         (when the result carries a table) and a copy of the annotated render when the

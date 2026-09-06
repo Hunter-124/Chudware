@@ -733,6 +733,34 @@ class TestMissionGateTools(unittest.TestCase):
         status = self._call("reveng_gate_status", session_id=self.SESSION_ID)
         self.assertIn("dims", status["gate"]["pending"])
 
+    def test_a_paused_gate_is_resolvable_the_instant_it_is_observable(self):
+        """Approving must not be refused for a mission that is only waiting to be approved.
+
+        The mission thread used to publish the paused run record and THEN drop the
+        session's mission slot, so a caller that polled for "paused" and approved it
+        (exactly what the GUI and ``reveng_resolve_gate`` do) could land in between and
+        get ``mission_already_running`` for a run that was doing nothing but waiting for
+        that decision.  That window is microseconds wide on an idle box and is what made
+        ``test_approve_resumes_past_the_gate_to_the_next_one`` flake on a loaded one, so
+        this test widens it: with the publish stalled, the old ordering refuses every
+        time and the atomic publish-and-release serializes instead.
+        """
+        real_record = rc._record_session_run
+
+        def _stalled_record(rec):
+            time.sleep(0.15)
+            return real_record(rec)
+
+        with mock.patch.object(rc, "_record_session_run", _stalled_record):
+            self._launch()
+            self._wait_for("paused")
+            out = self._call("reveng_resolve_gate", session_id=self.SESSION_ID,
+                             decision="approve")
+            self.assertTrue(out["ok"], out)
+            self.assertEqual(out["status"], "running")
+            # Leave no mission thread running into tearDown's rmtree.
+            self._wait_for("paused")
+
     def test_decision_must_be_explicit(self):
         self._launch()
         self._wait_for("paused")

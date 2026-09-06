@@ -27,7 +27,7 @@ Mapping (check_type → MCP tool name, module_key for battery._get_fn):
   fatigue        → run_fea_fatigue        (cad)       [T-BL04] infinite-life gate
   thermal        → run_fea_thermal        (cad)       [T-BL04] ccx subprocess
   buckling       → run_fea_buckling       (cad)       [T-BL04] load-factor≥1 gate
-  contact        → run_fea_contact        (cad)       [T-BL04] ccx subprocess
+  contact        → run_fea_contact        (cad)       engine unilateral-contact gate
 
 [~] = backend may be absent on non-merged base branches; calls degrade to ESCALATE
       with reason "backend_unavailable" (never a silent pass).
@@ -142,10 +142,19 @@ def _check_buckling_default(r: dict) -> bool:
     return bool(factors) and min(factors) >= 1.0
 
 def _check_contact_default(r: dict) -> bool:
-    """Pass when the contact solve ran (returned a base reaction)."""
+    """Pass when a real contact solve converged with load actually crossing an interface.
+
+    run_fea_contact solves unilateral contact on the document's own bodies now, so the
+    gate is the contact block itself: the active set settled and at least one pair is
+    carrying compression. A run where every candidate separated is not a contact result.
+    """
     if not r.get("ok", False) or r.get("skipped"):
         return False
-    return r.get("base_reaction_n") is not None
+    contact = r.get("contact")
+    if not isinstance(contact, dict) or not contact.get("converged"):
+        return False
+    active = contact.get("active_pairs")
+    return isinstance(active, int) and active > 0
 
 
 def _check_reveng_deviation_default(r: dict) -> bool:

@@ -1180,6 +1180,18 @@ def _norm_vtu_path(vtu_path) -> Optional[str]:
     return vtu_path
 
 
+def _norm_abs_out_path(path, arg_name: str) -> Optional[str]:
+    """The same absolute-path contract as _norm_vtu_path, for any solver output file."""
+    if path is None:
+        return None
+    if not isinstance(path, str) or not path.strip():
+        raise ValueError(f"{arg_name} must be a non-empty absolute filesystem path.")
+    path = path.strip()
+    if not os.path.isabs(path):
+        raise ValueError(f"{arg_name} must be ABSOLUTE, got {path!r}.")
+    return path
+
+
 def _build_static_study(
     fixtures,
     loads,
@@ -1190,6 +1202,7 @@ def _build_static_study(
     doc_id,
     notes: list,
     vtu_path: Optional[str] = None,
+    export_system_path: Optional[str] = None,
 ) -> dict:
     """SETUP stage for run_fea_static / sim_run(analysis="fea_static")."""
     d = _doc(doc_id)
@@ -1210,6 +1223,7 @@ def _build_static_study(
     loads = _norm_bc_list(loads, "loads", notes=notes)
     mesh_fineness = _norm_fineness(mesh_fineness)
     vtu_path = _norm_vtu_path(vtu_path)
+    export_system_path = _norm_abs_out_path(export_system_path, "export_system_path")
     mat = _resolve_study_material(material, "static")
     advisor = _advisor_params(learned_advisor, advisor_max_dof)
     # fixtures=[] and "fixtures that resolved to nothing" are DIFFERENT mistakes, and the
@@ -1256,6 +1270,8 @@ def _build_static_study(
     }
     if vtu_path:
         study["vtu_path"] = vtu_path
+    if export_system_path:
+        study["export_system_path"] = export_system_path
     study.update(advisor)
     return {
         "analysis": "fea_static",
@@ -1267,6 +1283,7 @@ def _build_static_study(
         "loads": loads,
         "mesh_fineness": mesh_fineness,
         "vtu_path": vtu_path,
+        "export_system_path": export_system_path,
         **advisor,
         "step_path": step,
     }
@@ -1311,6 +1328,76 @@ def _build_adaptive_study(
     ctx["analysis"] = "fea_adaptive"
     ctx["max_passes"] = max_passes
     ctx["eta_target"] = eta_target
+    return ctx
+
+
+def _build_contact_study(
+    fixtures,
+    load,
+    material,
+    max_gap_mm,
+    max_iterations,
+    mesh_size_mm,
+    mesh_order,
+    doc_id,
+    notes: list,
+    vtu_path: Optional[str] = None,
+) -> dict:
+    """SETUP stage for run_fea_contact.
+
+    Same resolution as a static study — the fixture/load face queries, the STEP export,
+    the fully-constrained-load refusal — plus `study.contact`, which switches the engine
+    onto the unilateral active-set solve over the mesh's own body interfaces.
+    """
+    max_gap_mm = _finite_float(max_gap_mm, "max_gap_mm")
+    if max_gap_mm <= 0.0:
+        raise ValueError(
+            "max_gap_mm must be > 0: it is the widest mesh gap still treated as a "
+            "contact candidate. Measure the real clearance (check_interference / "
+            "measure) and pass just above it, e.g. 0.2 for a 0.1 mm slip fit."
+        )
+    max_iterations = _positive_int(max_iterations, "max_iterations")
+    if max_iterations > 500:
+        raise ValueError("max_iterations must be from 1 through 500")
+    if isinstance(mesh_order, bool) or mesh_order not in (1, 2):
+        raise ValueError("mesh_order must be 1 (tet4) or 2 (tet10).")
+    if mesh_size_mm is not None:
+        mesh_size_mm = _finite_float(mesh_size_mm, "mesh_size_mm")
+        if mesh_size_mm <= 0.0:
+            raise ValueError("mesh_size_mm must be finite and > 0 when given")
+    ctx = _build_static_study(
+        fixtures,
+        require_list(
+            load,
+            "load",
+            "a face query plus a force or pressure, e.g. "
+            '{"face":"top","force":[0,0,-500]}',
+        ),
+        material,
+        0.5,
+        False,
+        0,
+        doc_id,
+        notes,
+        vtu_path=vtu_path,
+    )
+    ctx["study"]["mesh_order"] = mesh_order
+    if mesh_size_mm is not None:
+        ctx["study"]["target_size_mm"] = mesh_size_mm
+    ctx["study"]["contact"] = {
+        "enabled": True,
+        "max_gap_mm": max_gap_mm,
+        "max_iterations": max_iterations,
+        "penalty_scale": 1.0,
+    }
+    # _build_static_study tags itself "fea_static"; the durable collector dispatches on
+    # this tag, so leaving it would collect a contact run through the static collector
+    # and drop the contact verdict.
+    ctx["analysis"] = "fea_contact"
+    ctx["max_gap_mm"] = max_gap_mm
+    ctx["max_iterations"] = max_iterations
+    ctx["mesh_size_mm"] = mesh_size_mm
+    ctx["mesh_order"] = mesh_order
     return ctx
 
 
@@ -1504,6 +1591,9 @@ _FOS_CAP = 15.0
 # They are forwarded VERBATIM into the reply and into the persisted study: an evidence packet
 # must show what the solver reported, not a value this file re-derived. A key the engine did
 # not send stays ABSENT rather than becoming a null the reader has to interpret.
+#   contact       the unilateral-contact block of a run_fea_contact solve: candidate vs
+#                 active pair counts, iterations, converged, per-body-pair resultant and
+#                 peak pressure, held_by_contact_only, and the tangential-stabilizer share
 _EVIDENCE_KEYS = (
     "mesh_quality",
     "reactions",
@@ -1511,6 +1601,7 @@ _EVIDENCE_KEYS = (
     "warnings",
     "provenance",
     "vtu_path",
+    "contact",
 )
 
 
@@ -1640,6 +1731,52 @@ def _collect_static(
             "process). The numbers above are unaffected."
         )
     return _interpreted(out, notes)
+
+
+def _collect_contact(ctx: dict, res: dict, notes: list) -> dict:
+    """COLLECT stage for a unilateral-contact solve.
+
+    The reply envelope is the static one (summary + mesh_quality + reactions +
+    provenance + vtu_path), and `contact` rides beside it through _EVIDENCE_KEYS. What
+    this adds is the refusal a static collector cannot make: a contact run whose reply
+    carries no contact block was not a contact solve, whatever else it computed.
+    """
+    if res.get("ok"):
+        contact = res.get("contact")
+        if not isinstance(contact, dict) or contact.get("candidate_pairs") is None:
+            return {
+                "ok": False,
+                "doc_id": ctx.get("doc"),
+                "error": "the solver reported success without a contact block, so there "
+                "is no evidence any interface was evaluated. Refusing to present it "
+                "as a contact result.",
+            }
+    out = _collect_static(
+        ctx, res, notes, study_type="fea_contact", study_name="Contact"
+    )
+    if not out.get("ok"):
+        # Forward the engine's contact evidence onto the refusal as well.
+        if isinstance(res.get("contact"), dict):
+            out["contact"] = res["contact"]
+        return out
+    contact = out.get("contact") or {}
+    active = contact.get("active_pairs")
+    if active == 0:
+        out["contact_note"] = (
+            "NO contact pair carried load: every candidate separated under this load, so "
+            "these numbers are the two bodies solved independently, not a contact result. "
+            "Check the load direction (a unilateral contact carries compression only) and "
+            "that max_gap_mm covers the real clearance."
+        )
+    elif contact.get("tangential_force_fraction", 0.0) > 0.05:
+        out["contact_note"] = (
+            "the frictionless tangential stabilizer is carrying "
+            f"{contact['tangential_force_fraction'] * 100:.1f}% of the contact resultant, "
+            "which means the seated part is only held sideways by that numerical spring. "
+            "Add the real tangential restraint (a fixture, or a second contact face) "
+            "before trusting the shear-driven stresses."
+        )
+    return out
 
 
 def _n_rigid_modes(freqs: list) -> int:
@@ -1815,6 +1952,11 @@ def _collect_job_static(st: dict, raw: dict) -> dict:
 def _collect_job_adaptive(st: dict, raw: dict) -> dict:
     meta, notes = _job_notes(st)
     return _collect_adaptive(meta, raw, notes)
+
+
+def _collect_job_contact(st: dict, raw: dict) -> dict:
+    meta, notes = _job_notes(st)
+    return _collect_contact(meta, raw, notes)
 
 
 def _collect_job_modal(st: dict, raw: dict) -> dict:
@@ -2216,6 +2358,7 @@ def _collect_job_openfoam(st: dict, raw: dict) -> dict:
 _JOB_COLLECTORS = {
     "fea_static": _collect_job_static,
     "fea_adaptive": _collect_job_adaptive,
+    "fea_contact": _collect_job_contact,
     "fea_modal": _collect_job_modal,
     "fea_fatigue": _collect_job_fatigue,
     "fea_frequency_response": _collect_job_frequency_response,
@@ -2307,9 +2450,20 @@ _MONITORABLE = (
 #: Anything under this much DOF growth between consecutive legs is not a finer mesh.
 _LADDER_MIN_DOF_GROWTH_PCT = 5.0
 
-#: The substring the engine's mesh-size governor stamps into its notes when it overrides the
-#: requested characteristic size (core/sim/mesh_size_band.cpp).
-_COARSENED_MARKER = "auto-coarsened"
+#: The substrings the engine's mesh-size governor stamps into its notes when its element
+#: budget decides the discretization instead of the requested size
+#: (core/sim/mesh_size_band.cpp). BOTH outcomes collapse a `fineness` ladder onto one mesh,
+#: so both have to be disclosed: the governor either raises the size ("auto-coarsened ...",
+#: for interactivity or by the memory governor) or, since 2026-09-05, refuses to raise it
+#: past the geometry floor of four elements across the part's smallest dimension and pins
+#: every rung at the same size instead ("element budget exceeded but NOT coarsened: ...").
+#: The floor note deliberately does NOT carry the "auto-coarsened" marker — nothing was
+#: coarsened — which is exactly why matching that one marker alone left a degenerate ladder
+#: with no engine words explaining itself.
+_COARSENED_MARKERS = (
+    "auto-coarsened",
+    "element budget exceeded but NOT coarsened",
+)
 
 
 def _result_note_strings(out: dict, *, include_error: bool = False) -> list:
@@ -2336,10 +2490,12 @@ def _result_note_strings(out: dict, *, include_error: bool = False) -> list:
 
 
 def _coarsening_notes(out: dict) -> list:
-    """The engine notes saying the size governor overrode the discretization we asked for."""
+    """The engine notes saying the size governor, not the request, set the discretization."""
     found: list = []
     for note in _result_note_strings(out):
-        if _COARSENED_MARKER in note and note not in found:
+        if note in found:
+            continue
+        if any(marker in note for marker in _COARSENED_MARKERS):
             found.append(note)
     return found
 
@@ -2601,6 +2757,14 @@ def _convergence_row(step: dict, out: dict, monitor: str, prev: Optional[float])
     row["max_von_mises_mpa"] = summary.get("max_von_mises_mpa")
     row["max_disp_mm"] = summary.get("max_disp_mm")
     row["min_fos"] = summary.get("min_fos")
+    # The ladder row is what a released packet quotes, and max_von_mises_mpa is a
+    # fixture-ring-MASKED reduction: carrying it without its reduction label and its
+    # unmasked twin is how a packet came to report 105.98 MPa as "the peak at the
+    # keyway bolt-hole edge" while the field peaked at 402.93 MPa there. Pass-through
+    # only — nothing is re-derived here.
+    for key in ("max_von_mises_reduction", "max_von_mises_raw_mpa", "min_fos_raw"):
+        if key in summary:
+            row[key] = summary.get(key)
     if isinstance(out.get("mesh_quality"), dict):
         row["mesh_quality"] = out["mesh_quality"]
     if isinstance(out.get("reactions"), dict):
@@ -2693,15 +2857,18 @@ def _convergence_envelope(
             f"at least {_LADDER_MIN_DOF_GROWTH_PCT}% in n_dof). A near-zero "
             "delta_pct_vs_prev between two copies of the same mesh says nothing about "
             "mesh sensitivity, so converged is forced false. Cause: the mesh-size "
-            "governor (core/sim/mesh_size_band) clamps the requested size against an "
-            "element budget for interactivity, and on a large part several `fineness` "
-            "rungs land on the same budget-limited size. Remedy: re-run with explicit "
-            "sizes_mm=[...] (they map straight to study.target_size_mm and bypass the "
-            "fineness governor), e.g. sizes_mm=[8,5,3] for a large frame. If the "
-            "governor still coarsens — look for an 'auto-coarsened for interactivity' "
-            "note in each leg's mesh_quality/solver_notes — then its element budget is "
-            "capping the whole ladder and run_fea_adaptive (which refines against an "
-            "error indicator instead of a stated size) is the alternative evidence path."
+            "governor (core/sim/mesh_size_band) decides the size against an element "
+            "budget rather than honouring the request, so on a large part several "
+            "`fineness` rungs land on one budget-limited size — and on a THIN part they "
+            "land on one geometry floor instead, because the governor will not coarsen "
+            "below four elements across the part's smallest dimension. Remedy: re-run "
+            "with explicit sizes_mm=[...] (they map straight to study.target_size_mm and "
+            "bypass the fineness governor), e.g. sizes_mm=[8,5,3] for a large frame. If "
+            "the governor is still the one choosing — this result's "
+            "mesh_governor_notes carries its exact words for every affected leg — then "
+            "its element budget is capping the whole ladder and run_fea_adaptive (which "
+            "refines against an error indicator instead of a stated size) is the "
+            "alternative evidence path."
         )
         if governor:
             out["mesh_governor_notes"] = governor
@@ -3026,6 +3193,7 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
         advisor_max_dof: int = 0,
         doc_id: Optional[str] = None,
         vtu_path: Optional[str] = None,
+        export_system_path: Optional[str] = None,
         background: bool = False,
     ) -> str:
         """Linear-static stress FEA on the current part. Returns max stress, displacement, and FoS.
@@ -3034,7 +3202,8 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
                    [{"of":"face","side":"bottom","pick":"largest"}].
         loads    : list of {face query + a force or pressure}, e.g.
                    [{"face":"top","force":[0,0,-500]}]   # newtons, world XYZ
-                   [{"face":"top","pressure":0.5}]       # MPa, inward
+                   [{"face":"top","pressure":0.5}]       # MPa, inward: +p PUSHES INTO the
+                   #   face, so +p on a bore is INTERNAL pressure; use -p for external
                    [{"face":"top","magnitude":500,"direction":[0,0,-1]}]  # polar form of the
                    #   force above — direction is normalized, so its length never scales the load
                    Plural "faces":[q1,q2] is accepted and applies the SAME load to each face.
@@ -3052,10 +3221,17 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
                      timeout. The job is persisted on disk, so it survives an MCP restart
                      and can be collected in a later turn; sim_cancel(job_id) kills it.
         vtu_path : optional ABSOLUTE path for a VTK XML UnstructuredGrid (.vtu, ASCII) the
-                   solver writes after the solve — point data displacement (mm, 3-vector)
-                   and von_mises (MPa) on the solved tet4/tet10 mesh, for ParaView or an
-                   independent cross-check. Echoed back as "vtu_path"; a write failure
-                   fails the whole run rather than reporting a partial success.
+                   solver writes after the solve — point data displacement (mm, 3-vector),
+                   von_mises (MPa) and summary_node (the 1/0 mask that selected the
+                   reported peak, see below) on the solved tet4/tet10 mesh, for ParaView
+                   or an independent cross-check. Echoed back as "vtu_path"; a write
+                   failure fails the whole run rather than reporting a partial success.
+        export_system_path : optional ABSOLUTE path for a JSON dump of the RESOLVED
+                   system, written immediately before the solve: {points [[x,y,z] mm],
+                   elems [[node ids]], nodes_per_elem, fixed_nodes [flat node-index list,
+                   each pinning all 3 DOFs], nodal_forces [[fx,fy,fz] N per node],
+                   E_mpa, nu, bond_springs, contact_springs}. For an independent
+                   cross-solve (CalculiX etc.); a write failure fails the run.
 
         Returns {ok, doc_id, material, n_nodes, n_elems, mesh, summary:{...}} — the
         scalars live under "summary", NOT at the top level: summary.min_fos,
@@ -3063,6 +3239,29 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
         variants). min_fos = yield / max stress; > 1 holds. min_fos saturates at a
         15.0 cap, reported in "fos_note" — a capped value means "at least this", not
         "exactly this".
+
+        summary.max_von_mises_mpa IS NOT THE FIELD'S PEAK. Stress at an ideal fully
+        fixed constraint is a discretization singularity, so the summary reduction
+        skips every node within two element rings of a fixed node; the same mask sets
+        min_fos and the principal/shear extrema. That decision is reported, never
+        implied:
+          summary.max_von_mises_reduction  "node_averaged_excluding_fixture_ring2",
+                                           or "node_averaged" when nothing was excluded
+          summary.max_von_mises_raw_mpa    the same reduction over ALL nodes
+          summary.min_fos_raw              yield / that raw peak
+          summary.summary_nodes_excluded / summary_nodes_total   how many nodes it dropped
+          summary.reduction_masked_keys / reduction_unmasked_keys which scalars in this
+                                           object share the mask — the Tresca/Rankine
+                                           pair does NOT, so max_tresca_mpa can exceed
+                                           max_von_mises_mpa by the singular factor
+        Quote max_von_mises_mpa (and the FoS from it) only WITH the reduction named; if
+        your fixture faces ARE the feature of interest — a bolt hole, a bearing seat —
+        the peak you care about is inside the excluded ring and max_von_mises_raw_mpa is
+        the number to look at, mesh-sensitivity caveat and all. The requested .vtu
+        carries von_mises with summary_node beside it, so both numbers are re-derivable
+        from the file: mask==1 gives max_von_mises_mpa, the whole array gives
+        max_von_mises_raw_mpa.
+
         Release evidence rides BESIDE "summary": "mesh_quality" (aspect/jacobian extremes,
         pct_poor, node/elem counts, order, plus connected_components /
         unfixed_components and thin_wall_ratio — the wall thickness in element sizes,
@@ -3091,6 +3290,7 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
                 doc_id,
                 bc_notes,
                 vtu_path=vtu_path,
+                export_system_path=export_system_path,
             )
             _autosave_all_open()  # R-1 guard: protect every open doc before the solve starts
             return _dumps(
@@ -3140,9 +3340,13 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
         background : if True, return a job_id immediately; poll get_job(job_id). The job
                      runs in its own process and survives an MCP restart.
         vtu_path : optional ABSOLUTE .vtu path for the FINAL adapted mesh (ASCII VTK XML
-                   UnstructuredGrid; point data displacement in mm and von_mises in MPa).
+                   UnstructuredGrid; point data displacement in mm, von_mises in MPa and
+                   the summary_node 1/0 reduction mask).
         The reply carries "mesh_quality", "reactions" (with equilibrium_error_pct) and
-        "provenance" beside "summary", as run_fea_static does.
+        "provenance" beside "summary", as run_fea_static does — including the reduction
+        disclosure (summary.max_von_mises_reduction / max_von_mises_raw_mpa /
+        min_fos_raw): each pass's peak is the fixture-ring-masked one, so an adaptive
+        study that refines toward a fixture never reports what it is refining.
         """
         try:
             bc_notes: list = []
@@ -3217,7 +3421,12 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
                    "max_von_mises_mpa". Also accepted: max_disp_mm, min_fos,
                    max_tresca_mpa, max_rankine_mpa, max_principal_mpa, min_principal_mpa.
                    Monitor a NON-singular location's driver: a re-entrant corner peak
-                   diverges by construction and will never settle.
+                   diverges by construction and will never settle. Note which of these
+                   the fixture-ring mask applies to (run_fea_static: masked =
+                   max_von_mises_mpa / min_fos / the principal pair; UNMASKED =
+                   max_disp_mm and the tresca/rankine pair) — a ladder that monitors a
+                   masked scalar is converging on a number the .vtu's peak will exceed,
+                   and each leg's summary names its own reduction.
         tol_pct : convergence tolerance in percent of the previous leg's monitored value
                    (default 5).
         background : if True, return immediately with the id of ONE background job that
@@ -5102,107 +5311,104 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
 
     @mcp.tool()
     def run_fea_contact(
-        pressure_mpa: float = 1.0,
+        fixtures: Union[list, str],
+        load: Union[list, str, dict],
         material: Union[str, dict] = "steel",
+        max_gap_mm: float = 0.5,
+        max_iterations: int = 25,
+        mesh_size_mm: Optional[float] = None,
+        mesh_order: int = 1,
         doc_id: Optional[str] = None,
+        vtu_path: Optional[str] = None,
     ) -> str:
-        """Nonlinear (large-deflection) contact FEA via CalculiX (ccx subprocess) — for
-        press-fits, snap-fits, stacked parts touching under load.
+        """Frictionless unilateral CONTACT FEA on the real meshed bodies of this document.
 
-        Solves a *STATIC, NLGEOM step with a *CONTACT PAIR transmitting load across a
-        touching interface. This ccx path uses a TWO-BLOCK PROXY (an upper block pressed
-        onto a lower fixed block) sized to the part bounding box — a validated
-        conservation demonstration that the contact interface transmits the applied load
-        into the fixed support (base reaction ≈ applied load).
+        What it solves: a small-deflection linear-elastic static problem in which the
+        interfaces BETWEEN separate bodies carry compression only. The mesher meshes every
+        body, the engine finds surface-node pairs that face each other across at most
+        max_gap_mm (normals taken from the mesh's own boundary faces, each pair keeping its
+        initial signed gap), and an ACTIVE-SET loop solves repeatedly: pairs whose gap
+        closed press, pairs that went into tension are released, until the set stops
+        changing. So a gap really closes, a seated face really lifts off, and load only
+        crosses where the parts touch.
 
-        pressure_mpa : downward pressure on the upper block's top face.
+        Use it for: a slip-fit pin in a clearance bore (which side of the bore takes the
+        load), a bolted or shimmed stack (how the clamp load splits between seats), a part
+        merely SEATED in a pocket or on a pad, and any assembly where run_fea_static would
+        have to pretend the joint is welded. For a welded/glued/press-fit joint that really
+        does carry tension, use run_fea_static with study bond_gap_mm instead — the two are
+        mutually exclusive and passing both is refused.
 
-        CalculiX GPL-2.0 → subprocess-only. Absent ccx ⇒ {ok:false, skipped:true}.
+        What it does NOT do: friction (the interface is frictionless; a small tangential
+        stabilizer removes the sliding nullspace and its share of the resultant is reported
+        as contact.tangential_force_fraction — if that is more than a few percent the model
+        needs a real tangential restraint), large sliding or large deflection (small-strain
+        only: the pairing is computed on the UNDEFORMED mesh), and bolt preload. Preload is
+        approximated by applying the clamp force as a face load on the clamped face — e.g.
+        load={"face":"top","force":[0,0,-5000]} for a 5 kN bolt — and reading the seat
+        reaction out of contact.pairs.
+
+        fixtures : list of face queries held fixed, in the run_fea_static dialect
+                   (["bottom"], [{"of":"face","side":"bottom","pick":"largest"}], face SIDs).
+        load     : ONE face query plus a force (N, world XYZ) or pressure (MPa), e.g.
+                   {"face":"top","force":[0,0,-500]}; a list is accepted.
+        material : a registry name ("steel","aluminum",...) or an explicit property dict.
+        max_gap_mm : widest mesh gap still treated as a contact candidate (default 0.5).
+                   Measure the real clearance first and pass just above it: too small finds
+                   no pair (refused, with the measured body count), too large pairs surfaces
+                   that never touch.
+        max_iterations : active-set iterations (default 25). A set that never settles is
+                   REFUSED, not averaged.
+        mesh_size_mm : explicit element size in mm; omitted uses the medium fineness band.
+        mesh_order : 1 = tet4 (default, fastest), 2 = tet10.
+        vtu_path : optional ABSOLUTE .vtu path for the solved fields, as for
+                   run_fea_static (displacement, von_mises and the summary_node mask).
+
+        Returns the run_fea_static envelope — summary (max_von_mises_mpa / max_disp_mm /
+        min_fos, plus the reduction disclosure max_von_mises_reduction /
+        max_von_mises_raw_mpa / min_fos_raw: the reported peak skips two element rings
+        around ideal fixtures, which on a contact study is usually exactly where the
+        load path lands), mesh_quality, reactions (check equilibrium_error_pct first),
+        plausibility, provenance, vtu_path — PLUS "contact":
+          {candidate_pairs, active_pairs, contact_iterations, converged, max_gap_mm,
+           penalty_scale, penalty_stiffness_n_per_mm, max_iterations,
+           tangential_stabilization, tangential_force_fraction,
+           held_by_contact_only:[component ids held ONLY by contact], pairs:[
+             {bodies:[i,j], candidate_pairs, active_pairs, contact_force_n,
+              force_vector_n:[x,y,z], max_contact_pressure_mpa, max_penetration_mm}]}
+        force_vector_n is what the lower-numbered component pushes onto the higher one, so
+        its direction says WHICH side is in contact. A load that pulls the bodies apart
+        leaves nothing holding them: that is refused as a mechanism, not solved.
+        Tip: query_geometry() first to confirm the fixture/load faces resolve, and
+        check_interference() to measure the clearance you are passing as max_gap_mm.
         """
         try:
-            pressure_mpa = _finite_float(pressure_mpa, "pressure_mpa")
-            if pressure_mpa <= 0.0:
-                raise ValueError(
-                    "pressure_mpa must be > 0; zero/negative pressure does not close and "
-                    "load the two-block contact proxy."
-                )
-            from . import fea_advanced as fa
-
-            if fa.ccx_path() is None:
-                return _dumps(fa._ccx_absent_result("nonlinear contact"))
-            d = _doc(doc_id)
-            mat = _resolve_study_material(material, "contact")
-            E = _finite_float(mat["E_mpa"], "material.E_mpa")
-            nu = _finite_float(mat["nu"], "material.nu")
-            L, b, h = _part_bbox_dims(d)
-            gen = fa.build_contact_block_inp(L, b, h, E, nu, pressure_mpa)
-            run = fa.run_ccx(
-                gen["inp"], job="contact", timeout=fa.HARNESS_CCX_TIMEOUT_S
+            bc_notes: list = []
+            ctx = _build_contact_study(
+                fixtures,
+                load,
+                material,
+                max_gap_mm,
+                max_iterations,
+                mesh_size_mm,
+                mesh_order,
+                doc_id,
+                bc_notes,
+                vtu_path=vtu_path,
             )
-            if run.get("skipped"):
-                return _dumps(run)
-            if not run.get("ok") or not run.get("dat_path"):
-                return _dumps(
-                    {
-                        "ok": False,
-                        "error": run.get("stderr", "")[-400:]
-                        or run.get("error", "ccx contact run failed"),
-                        "backend": run.get("backend"),
-                    }
+            _autosave_all_open()  # R-1 guard: protect every open doc before the solve starts
+            return _dumps(
+                _run_solve(
+                    "fea_contact",
+                    "core_rpc",
+                    {"method": "sim_run_static", "params": {"study": ctx["study"]}},
+                    _job_meta(ctx, bc_notes),
+                    background=False,
+                    doc_id=ctx["doc"],
                 )
-            rf = fa.parse_dat_nodal(
-                run["dat_path"], "RF", gen["base_nodes"], component=3
             )
-            if rf is None or not math.isfinite(rf):
-                return _dumps(
-                    {
-                        "ok": False,
-                        "doc_id": d,
-                        "backend": run["backend"],
-                        "error": "CalculiX completed but no finite base reaction "
-                        "could be parsed; contact transmission is unverified.",
-                    }
-                )
-            reaction = abs(rf * len(gen["base_nodes"]))
-            applied = gen["applied_load_n"]
-            balance_error = abs(reaction - applied) / applied * 100.0
-            if balance_error > 5.0:
-                return _dumps(
-                    {
-                        "ok": False,
-                        "doc_id": d,
-                        "backend": run["backend"],
-                        "applied_load_n": round(applied, 3),
-                        "base_reaction_n": round(reaction, 3),
-                        "equilibrium_error_pct": round(balance_error, 3),
-                        "error": "contact result failed the load-conservation check (>5%); "
-                        "refusing to present it as a converged contact solve.",
-                    }
-                )
-            out = {
-                "ok": True,
-                "doc_id": d,
-                "backend": run["backend"],
-                "solver": "CalculiX *STATIC,NLGEOM + *CONTACT PAIR (two-block proxy)",
-                "applied_load_n": round(applied, 3),
-                "base_reaction_n": round(reaction, 3),
-                "equilibrium_error_pct": round(balance_error, 3),
-                "capability": "two-block bounding-box proxy; actual CAD contact pairs are "
-                "not mapped by this backend",
-                "note": "box-proxy contact conservation check passed within 5%; "
-                "ccx GPL-2.0 subprocess.",
-            }
-            sid = _persist_study(
-                d,
-                {
-                    "type": "fea_contact",
-                    "name": f"Contact ({mat.get('name', material)})",
-                    "engine": "calculix",
-                    "results": out,
-                },
-            )
-            out["saved_to_study"] = bool(sid)
-            return _dumps(out)
+        except _StudyRefusal as r:
+            return _dumps(r.payload)
         except CoreError as e:
             return _err(e)
         except Exception as e:  # noqa: BLE001

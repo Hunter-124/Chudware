@@ -1255,14 +1255,117 @@ def _cload_sum(inp_text: str) -> float:
     return total
 
 
+def _two_box_contact_mesh(gap_mm: float) -> tuple:
+    """Two 20x20x10 mm boxes stacked along z with `gap_mm` of air between them.
+
+    Structured grid, 6 tets per cell (Freudenthal). One points/tets array holding TWO
+    disconnected components — exactly what an imported two-part assembly meshes to, and
+    the shape ``study.contact`` exists for.
+    """
+    points: list = []
+    tets: list = []
+
+    def add_box(z0: float) -> None:
+        nx = ny = 3
+        nz = 2
+        base = len(points) // 3
+        nnx, nny = nx + 1, ny + 1
+
+        def gid(i: int, j: int, k: int) -> int:
+            return base + (k * nny + j) * nnx + i
+
+        for k in range(nz + 1):
+            for j in range(nny):
+                for i in range(nnx):
+                    points.extend([20.0 * i / nx, 20.0 * j / ny, z0 + 10.0 * k / nz])
+        split = ((0, 1, 2, 6), (0, 2, 3, 6), (0, 3, 7, 6),
+                 (0, 7, 4, 6), (0, 4, 5, 6), (0, 5, 1, 6))
+        for k in range(nz):
+            for j in range(ny):
+                for i in range(nx):
+                    corner = (gid(i, j, k), gid(i + 1, j, k), gid(i + 1, j + 1, k),
+                              gid(i, j + 1, k), gid(i, j, k + 1), gid(i + 1, j, k + 1),
+                              gid(i + 1, j + 1, k + 1), gid(i, j + 1, k + 1))
+                    for cell in split:
+                        tets.extend(corner[v] for v in cell)
+
+    add_box(0.0)
+    add_box(10.0 + gap_mm)
+    return points, tets
+
+
+def _audit_contact_engine() -> None:
+    """fea_contact: real unilateral contact in the engine, not a ccx .inp proxy.
+
+    The claim under audit is the one a contact solve exists to make: a gap that CLOSES
+    transmits the whole applied load into the fixed support, and the active set says so.
+    Runs on an INLINE two-box mesh, so it needs no CAD and no external solver.
+    """
+    cb, reason = _load_core_bridge()
+    if cb is None:
+        _skip("fea_contact [engine]", reason)
+        return
+    gap_mm = 0.05
+    load_n = 4000.0
+    points, tets = _two_box_contact_mesh(gap_mm)
+    top_z = 20.0 + gap_mm
+    base_pts = [[x, y, 0.0] for x in (0.0, 20.0 / 3, 40.0 / 3, 20.0)
+                for y in (0.0, 20.0 / 3, 40.0 / 3, 20.0)]
+    top_pts = [[p[0], p[1], top_z] for p in base_pts]
+    study = {
+        "points": points,
+        "tets": tets,
+        "nodes_per_elem": 4,
+        "material": _AUDIT_STEEL,
+        "fixtures": [{"points": base_pts, "tol_mm": 0.5}],
+        "loads": [{"faces": {"points": top_pts, "tol_mm": 0.5}, "type": "force",
+                   "vector": [0.0, 0.0, -load_n]}],
+        "contact": {"enabled": True, "max_gap_mm": 0.5, "max_iterations": 25},
+    }
+    try:
+        res = cb.call("sim_run_static", {"study": study})
+    except CoreError as exc:
+        if "unknown method" in str(exc):
+            _skip("fea_contact [engine]",
+                  "loaded libchudware lacks sim_run_static; use a "
+                  "CHUDWARE_WITH_POLYMESH build")
+            return
+        _record("fea_contact [engine]", "BROKEN", f"engine call failed: {exc}")
+        return
+    except Exception as exc:  # noqa: BLE001
+        _record("fea_contact [engine]", "BROKEN", f"engine call failed: {exc}")
+        return
+    if not res.get("ok"):
+        _record("fea_contact [engine]", "BROKEN",
+                f"contact solve failed: {res.get('error')}")
+        return
+    contact = res.get("contact") or {}
+    reactions = res.get("reactions") or {}
+    reaction = (reactions.get("reaction_force_n") or [0.0, 0.0, 0.0])[2]
+    err = _pct_err(abs(reaction), load_n)
+    active = contact.get("active_pairs")
+    pairs = (contact.get("pairs") or [{}])[0]
+    note = (f"LIVE two-box contact (gap {gap_mm} mm, {load_n} N down): "
+            f"active_pairs={active}/{contact.get('candidate_pairs')} in "
+            f"{contact.get('contact_iterations')} iteration(s), converged="
+            f"{contact.get('converged')}, base Rz={reaction} N (err={err:.3f}%), "
+            f"interface force={pairs.get('contact_force_n')} N, "
+            f"peak pressure={pairs.get('max_contact_pressure_mpa')} MPa")
+    ok = (bool(contact.get("converged")) and isinstance(active, int) and active > 0
+          and err < 1.0)
+    _record("fea_contact [engine]", "VALIDATED" if ok else "BROKEN", note)
+
+
 def audit_advanced_fea() -> None:
     print("\n--- FAMILY: advanced FEA (buckling/contact, CalculiX capability) ---")
+    # Contact is an ENGINE capability now (no ccx, no .inp proxy), so it is audited
+    # before the CalculiX imports and never skipped because they failed.
+    _audit_contact_engine()
     try:
         from services.mcp import fea_advanced as fa
         from services.sim.multiphysics_rpc import WORKER_METHODS
     except Exception as exc:  # noqa: BLE001
-        for name in ("fea_buckling [input]", "fea_contact [input]",
-                     "fea_buckling [CalculiX]", "fea_contact [CalculiX]"):
+        for name in ("fea_buckling [input]", "fea_buckling [CalculiX]"):
             _record(name, "BROKEN", f"advanced FEA import failed: {exc}")
         return
 
@@ -1287,6 +1390,9 @@ def audit_advanced_fea() -> None:
         buckling = None
         _record("fea_buckling [input]", "BROKEN", f"generator failed: {exc}")
 
+    # The ccx two-block proxy is no longer what run_fea_contact does; it is what the
+    # frozen `sim_run_contact` worker RPC (GUI sim manager) still ships, so it is
+    # audited under that name.
     contact_length, contact_width, pressure = 40.0, 30.0, 1.25
     try:
         contact = fa.build_contact_block_inp(
@@ -1298,11 +1404,11 @@ def audit_advanced_fea() -> None:
                        and "*STEP, NLGEOM" in contact["inp"])
         note = (f"generated two-block contact load={abs(_cload_sum(contact['inp'])):.6f} N "
                 f"vs pA={expected_load:.6f} N (err={load_err:.6f}%)")
-        _record("fea_contact [input]",
+        _record("sim_run_contact [input]",
                 "VALIDATED" if load_err < 1e-6 and keywords_ok else "BROKEN", note)
     except Exception as exc:  # noqa: BLE001
         contact = None
-        _record("fea_contact [input]", "BROKEN", f"generator failed: {exc}")
+        _record("sim_run_contact [input]", "BROKEN", f"generator failed: {exc}")
 
     try:
         caps = WORKER_METHODS["sim_caps"]({}, lambda _: None)
@@ -1328,7 +1434,7 @@ def audit_advanced_fea() -> None:
         _skip("fea_buckling [CalculiX]",
               "CalculiX not found; generated input was audited but no eigenvalue solve ran",
               install=hint)
-        _skip("fea_contact [CalculiX]",
+        _skip("sim_run_contact [CalculiX]",
               "CalculiX not found; generated input was audited but no nonlinear solve ran",
               install=hint)
         return
@@ -1360,14 +1466,14 @@ def audit_advanced_fea() -> None:
 
     try:
         if contact is None:
-            _record("fea_contact [CalculiX]", "BROKEN",
+            _record("sim_run_contact [CalculiX]", "BROKEN",
                     "input generation failed; solver was not launched")
         else:
             run = fa.run_ccx(contact["inp"], job="sim_audit_contact", timeout=60.0)
             if run.get("workdir"):
                 workdirs.append(run["workdir"])
             if not run.get("ok") or not run.get("dat_path"):
-                _record("fea_contact [CalculiX]", "BROKEN",
+                _record("sim_run_contact [CalculiX]", "BROKEN",
                         f"ccx failed or emitted no .dat result: "
                         f"{run.get('error') or run.get('stderr') or run.get('stdout')}")
             else:
@@ -1377,12 +1483,12 @@ def audit_advanced_fea() -> None:
                             if average is not None else None)
                 expected = float(contact["applied_load_n"])
                 err = _pct_err(reaction, expected) if reaction is not None else math.inf
-                _record("fea_contact [CalculiX]",
+                _record("sim_run_contact [CalculiX]",
                         "VALIDATED" if reaction is not None and err < 5.0 else "BROKEN",
                         f"base reaction={reaction} N vs applied {expected:.6f} N "
                         f"(equilibrium err={err:.3f}%)")
     except Exception as exc:  # noqa: BLE001
-        _record("fea_contact [CalculiX]", "BROKEN", f"solver error: {exc}")
+        _record("sim_run_contact [CalculiX]", "BROKEN", f"solver error: {exc}")
     finally:
         for workdir in workdirs:
             shutil.rmtree(workdir, ignore_errors=True)

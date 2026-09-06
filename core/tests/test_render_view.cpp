@@ -512,3 +512,92 @@ TEST_CASE("doc_render_contact_sheet: tiles multiple labelled views into one PNG"
     CHECK(rs2.at("views").size() == 2);
     CHECK(is_png(read_bytes(ps2)));
 }
+
+// --- optional [r,g,b] background --------------------------------------------------------
+// The engine used to hard-code a 245 light-grey field, so anything wanting a dark plate had
+// to colour-key that constant back out of a finished frame. The parameter renders it.
+TEST_CASE("doc_render_view: background clears the frame and defaults to the 245 grey") {
+    const std::string id = make_box_doc();
+
+    // A corner pixel is background by construction: the camera fits the model to 85% of the
+    // frame, so no geometry can reach (0,0).
+    const std::string light = tmp_png("bg_default");
+    REQUIRE(chudware::doc::doc_render_view(id, light, "front").value("ok", false));
+    const Rgb lit = decode_png(light);
+    REQUIRE(lit.ok());
+    CHECK((int)lit.px[0] == 245);
+    CHECK((int)lit.px[1] == 245);
+    CHECK((int)lit.px[2] == 245);
+
+    const std::string dark = tmp_png("bg_black");
+    REQUIRE(chudware::doc::doc_render_view(id, dark, "front", /*annotate=*/true,
+                                          json::array({0, 0, 0}))
+                .value("ok", false));
+    const Rgb blk = decode_png(dark);
+    REQUIRE(blk.ok());
+    CHECK((int)blk.px[0] == 0);
+    CHECK((int)blk.px[1] == 0);
+    CHECK((int)blk.px[2] == 0);
+
+    // A non-grey triple lands per channel (the fast uniform-fill path must not flatten it),
+    // and out-of-range components clamp rather than wrap.
+    const std::string film = tmp_png("bg_film");
+    REQUIRE(chudware::doc::doc_render_view(id, film, "front", /*annotate=*/true,
+                                          json::array({16, 17, 300}))
+                .value("ok", false));
+    const Rgb fm = decode_png(film);
+    REQUIRE(fm.ok());
+    CHECK((int)fm.px[0] == 16);
+    CHECK((int)fm.px[1] == 17);
+    CHECK((int)fm.px[2] == 255);
+
+    // The geometry itself is untouched: only the cleared field changed, so the two renders
+    // differ on the background and agree on the shaded body.
+    REQUIRE(blk.w == lit.w);
+    REQUIRE(blk.h == lit.h);
+    long same_body = 0;
+    for (size_t i = 0; i + 2 < lit.px.size(); i += 3) {
+        const bool lit_bg = lit.px[i] == 245 && lit.px[i + 1] == 245 && lit.px[i + 2] == 245;
+        if (!lit_bg && lit.px[i] == blk.px[i] && lit.px[i + 1] == blk.px[i + 1] &&
+            lit.px[i + 2] == blk.px[i + 2])
+            ++same_body;
+    }
+    CHECK(same_body > (long)(lit.w * lit.h) / 20);  // the shaded part is pixel-identical
+
+    // A malformed value is ignored, not fatal: the render still succeeds on the default grey.
+    const std::string bad = tmp_png("bg_bad");
+    REQUIRE(chudware::doc::doc_render_view(id, bad, "front", /*annotate=*/true,
+                                          json::array({0, 0}))
+                .value("ok", false));
+    const Rgb bd = decode_png(bad);
+    REQUIRE(bd.ok());
+    CHECK((int)bd.px[0] == 245);
+}
+
+TEST_CASE("doc_render_contact_sheet: background applies to every tile") {
+    const std::string id = make_box_doc();
+    const std::string sheet = tmp_png("sheet_bg");
+    REQUIRE(chudware::doc::doc_render_contact_sheet(id, sheet, json::array({"front", "top"}),
+                                                    json::array({0, 0, 0}))
+                .value("ok", false));
+    const Rgb im = decode_png(sheet);
+    REQUIRE(im.ok());
+    // Tile 0's corner is (0,0); tile 1 starts at column TW+GAP = 384+4.
+    CHECK((int)im.px[0] == 0);
+    const size_t tile1 = (size_t)(384 + 4) * 3;
+    REQUIRE(tile1 + 2 < im.px.size());
+    CHECK((int)im.px[tile1] == 0);
+}
+
+TEST_CASE("doc_render_png: background clears the legacy iso render too") {
+    const std::string id = make_box_doc();
+    const std::string p = tmp_png("iso_bg");
+    REQUIRE(chudware::doc::doc_render_png(id, p, /*annotate=*/true,
+                                          json::array({10, 20, 30}))
+                .value("ok", false));
+    const Rgb im = decode_png(p);
+    REQUIRE(im.ok());
+    CHECK((int)im.px[0] == 10);
+    CHECK((int)im.px[1] == 20);
+    CHECK((int)im.px[2] == 30);
+}

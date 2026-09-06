@@ -107,6 +107,8 @@ def test_buckling_inp_and_euler_reference():
 
 
 def test_contact_inp_two_disjoint_blocks():
+    # The box-proxy deck the frozen `sim_run_contact` worker RPC still generates; the
+    # MCP run_fea_contact tool solves real contact in the engine instead.
     gen = fa.build_contact_block_inp(20.0, 20.0, 10.0, 200000.0, 0.29, 5.0,
                                      nx=3, ny=3, nz=2)
     t = gen["inp"]
@@ -304,8 +306,8 @@ def test_ccx_tools_skip_when_absent(monkeypatch):
                                               [{"face": "top", "force": [0, 0, -1]}],
                                               doc_id="nope"))
     assert r_bk.get("skipped") is True
-    r_ct = json.loads(fns["run_fea_contact"](1.0, doc_id="nope"))
-    assert r_ct.get("skipped") is True
+    # run_fea_contact no longer touches ccx at all — it solves in the engine, so it is
+    # deliberately NOT in this list.
 
 
 @pytest.mark.parametrize(
@@ -322,7 +324,9 @@ def test_ccx_tools_skip_when_absent(monkeypatch):
      ("run_fea_buckling",
       {"fixtures": ["bottom"], "load": [{"face": "top", "force": [0, 0, -1]}],
        "n_modes": 0, "doc_id": "nope"}, "positive integer"),
-     ("run_fea_contact", {"pressure_mpa": 0.0, "doc_id": "nope"}, "pressure_mpa"),
+     ("run_fea_contact",
+      {"fixtures": ["bottom"], "load": {"face": "top", "force": [0, 0, -1]},
+       "max_gap_mm": 0.0, "doc_id": "nope"}, "max_gap_mm"),
      ("run_cfd_flow", {"velocity": 0.0, "doc_id": "nope"}, "velocity"),
      ("run_cfd_flow", {"fluid": "steam", "doc_id": "nope"}, "fluid"),
      ("run_cfd_accurate", {"fluid": "steam", "doc_id": "nope"}, "fluid"),

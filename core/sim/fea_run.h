@@ -77,9 +77,23 @@ std::vector<int> nodes_in_faceset_surface(const std::vector<double>& points,
 //   fixtures: [{points:[[x,y,z]...], tol_mm}]
 //   loads:    [{faces:{points,tol_mm}, type:"force"|"pressure",
 //               vector:[x,y,z]|null, magnitude:<float>|null}]
-// Returns {ok, displacement, disp_magnitude, von_mises, n_dof,
-//          summary:{max_von_mises_mpa,max_disp_mm,min_fos}, solver_notes}.
+// Returns {ok, displacement, disp_magnitude, von_mises, summary_node, n_dof,
+//          summary:{max_von_mises_mpa,max_disp_mm,min_fos,...}, solver_notes}.
 // Summary scalars are rounded to match the oracle (vm .4, disp .6, fos .4).
+//
+// summary.max_von_mises_mpa is a MASKED reduction: stress at an ideal fixed
+// constraint is a discretization singularity, so nodes within two element rings
+// of a fixed node do not feed it (nor min_fos / the principal+shear extrema).
+// The mask is data, not a footnote — `summary_node` is the per-node 1/0 array
+// that reduction used, `summary.max_von_mises_reduction` names the reduction
+// ("node_averaged_excluding_fixture_ring2", or "node_averaged" when nothing was
+// excluded), `summary.max_von_mises_raw_mpa` / `min_fos_raw` are the same
+// reduction with no mask, and `summary.reduction_masked_keys` /
+// `reduction_unmasked_keys` say which scalars in that object share the mask
+// (Tresca/Rankine are unmasked). So
+//   max{von_mises[i] : summary_node[i]} == summary.max_von_mises_mpa
+//   max{von_mises[i]}                   == summary.max_von_mises_raw_mpa
+// hold for the reply and for the .vtu, which carries both arrays.
 // Never throws: a bad mesh / unsolvable model returns {ok:false, error}.
 nlohmann::json fea_run_static(const nlohmann::json& study);
 
@@ -92,8 +106,12 @@ nlohmann::json fea_run_static_with_cancel_token(
 
 // Write the optional `vtu_path` evidence file for a finished study. `result` is the
 // study result JSON: point data is taken from whichever of displacement (3-vec, mm),
-// von_mises (MPa), temperature (°C) and mode_shapes (flat n_modes*n*3) it carries, so
-// static, adaptive, modal and thermal runs all produce the same kind of file.
+// von_mises (MPa), summary_node (the 1/0 summary-reduction mask), temperature (°C)
+// and mode_shapes (flat n_modes*n*3) it carries, so static, adaptive, modal and
+// thermal runs all produce the same kind of file. Shipping von_mises WITH its mask
+// is what makes the file agree with the packet by construction rather than by
+// coincidence — masked max == summary.max_von_mises_mpa, unmasked max ==
+// summary.max_von_mises_raw_mpa.
 // Returns true when the study asked for no file OR the file was written (path_out set);
 // false with `error` when the request is malformed or the write failed. Never throws.
 bool write_result_vtu(const nlohmann::json& study, const std::vector<double>& points,

@@ -17,7 +17,8 @@
 #include <filesystem>
 #include <map>
 #include <fstream>
-#include <limits>
+#include <iterator>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -59,6 +60,59 @@ json cube_static_study(double force_z = 50000.0, double E = 200000.0) {
                        {"vector", {0.0, 0.0, force_z}},
                        {"faces", {{"points", {{0, 0, 1}, {1, 0, 1}, {1, 1, 1}, {0, 1, 1}}},
                                   {"tol_mm", 0.01}}}}};
+    return study;
+}
+
+// A cantilever beam big enough that the summary's two-element fixture ring does NOT
+// swallow the whole mesh (the cube above has exactly one element layer, so its ring
+// hits the documented whole-field fallback). 10x2x2 hex cells -> 6 Freudenthal tets
+// each; fixed at x=0, pushed at x=Lx, so the nodal stress peak is AT the clamp — the
+// node the summary reduction excludes.
+json beam_static_study(const std::string& vtu_path, double force_z = -1000.0) {
+    const int nx = 10, ny = 2, nz = 2;
+    const double Lx = 100.0, Ly = 10.0, Lz = 10.0;
+    const int NX = nx + 1, NY = ny + 1, NZ = nz + 1;
+    auto gid = [&](int i, int j, int k) { return (k * NY + j) * NX + i; };
+    std::vector<double> pts(static_cast<size_t>(NX) * NY * NZ * 3, 0.0);
+    for (int k = 0; k < NZ; ++k)
+        for (int j = 0; j < NY; ++j)
+            for (int i = 0; i < NX; ++i) {
+                const size_t id = static_cast<size_t>(gid(i, j, k));
+                pts[id * 3 + 0] = Lx * i / nx;
+                pts[id * 3 + 1] = Ly * j / ny;
+                pts[id * 3 + 2] = Lz * k / nz;
+            }
+    static const int TET[6][4] = {{0, 1, 2, 6}, {0, 2, 3, 6}, {0, 3, 7, 6},
+                                  {0, 7, 4, 6}, {0, 4, 5, 6}, {0, 5, 1, 6}};
+    std::vector<int> tets;
+    for (int k = 0; k < nz; ++k)
+        for (int j = 0; j < ny; ++j)
+            for (int i = 0; i < nx; ++i) {
+                const int c[8] = {gid(i, j, k),         gid(i + 1, j, k),
+                                  gid(i + 1, j + 1, k), gid(i, j + 1, k),
+                                  gid(i, j, k + 1),     gid(i + 1, j, k + 1),
+                                  gid(i + 1, j + 1, k + 1), gid(i, j + 1, k + 1)};
+                for (auto& tt : TET)
+                    for (int v = 0; v < 4; ++v) tets.push_back(c[tt[v]]);
+            }
+    json fixture_pts = json::array(), load_pts = json::array();
+    for (size_t id = 0; id * 3 + 2 < pts.size(); ++id) {
+        const double x = pts[id * 3], y = pts[id * 3 + 1], z = pts[id * 3 + 2];
+        if (x < 1e-9) fixture_pts.push_back(json::array({x, y, z}));
+        if (std::abs(x - Lx) < 1e-9) load_pts.push_back(json::array({x, y, z}));
+    }
+    json study;
+    study["points"] = pts;
+    study["tets"] = tets;
+    study["nodes_per_elem"] = 4;
+    study["material"] = {{"E_mpa", 200000.0}, {"nu", 0.3}, {"yield_mpa", 250.0}};
+    study["fixtures"] = json::array(
+        {json{{"points", fixture_pts}, {"tol_mm", 1e-6}, {"sid", "Ftestfix"}}});
+    study["loads"] = json::array(
+        {json{{"type", "force"},
+              {"vector", json::array({0.0, 0.0, force_z})},
+              {"faces", json{{"points", load_pts}, {"tol_mm", 1e-6}}}}});
+    if (!vtu_path.empty()) study["vtu_path"] = vtu_path;
     return study;
 }
 
@@ -251,6 +305,85 @@ TEST_CASE("sim_cache: FEA static HIT / MISS / wall-times") {
     CHECK(st.hits >= 1);
     CHECK(st.misses >= 1);
     CHECK(st.stores >= 1);
+}
+
+// A released packet reported summary.max_von_mises_mpa = 109.7 MPa while the .vtu the
+// SAME solve wrote peaked at 402.9 MPa. Both are the node-averaged nodal field: the
+// summary silently dropped the two element rings around the fixtures (a clamp
+// singularity) and the file carried the field without that mask, so the packet's FoS
+// and the field disagreed 3.7x with nothing in either artifact to explain it. The
+// reported peak is evidence only if the file it ships with can reproduce it.
+TEST_CASE("static evidence: the .vtu carries the mask that produced the reported peak") {
+    chudware::sim::cache::clear();
+    const fs::path vtu = tmp_path("reduction_evidence.vtu");
+    std::error_code ec;
+    fs::remove(vtu, ec);
+
+    const json study = beam_static_study(vtu.string());
+    const json result = chudware::sim::fea_run_static(study);
+    REQUIRE_MESSAGE(result.value("ok", false), result.value("error", std::string()));
+    REQUIRE(result.value("vtu_path", std::string()) == vtu.string());
+    REQUIRE(fs::exists(vtu));
+
+    std::ifstream in(vtu);
+    const std::string xml((std::istreambuf_iterator<char>(in)),
+                          std::istreambuf_iterator<char>());
+    auto array_named = [&xml](const std::string& name) {
+        std::vector<double> values;
+        const size_t at = xml.find("Name=\"" + name + "\"");
+        if (at == std::string::npos) return values;
+        const size_t open = xml.find('>', at);
+        const size_t close = xml.find("</DataArray>", open);
+        if (open == std::string::npos || close == std::string::npos) return values;
+        std::istringstream body(xml.substr(open + 1, close - open - 1));
+        double v = 0.0;
+        while (body >> v) values.push_back(v);
+        return values;
+    };
+    const std::vector<double> vm = array_named("von_mises");
+    const std::vector<double> mask = array_named("summary_node");
+    const size_t n_nodes = static_cast<size_t>(result.value("n_nodes", 0));
+    REQUIRE(n_nodes > 0);
+    REQUIRE(vm.size() == n_nodes);
+    REQUIRE(mask.size() == n_nodes);
+
+    double masked = 0.0, unmasked = 0.0;
+    int excluded = 0;
+    for (size_t i = 0; i < vm.size(); ++i) {
+        unmasked = std::max(unmasked, vm[i]);
+        if (mask[i] != 0.0)
+            masked = std::max(masked, vm[i]);
+        else
+            ++excluded;
+    }
+    const json summary = result.at("summary");
+    // Summary scalars are rounded to 4 decimals for display; 5e-4 IS that rounding
+    // step, so the identity below is exact up to how the number is printed.
+    CHECK(std::abs(summary.at("max_von_mises_mpa").get<double>() - masked) < 5e-4);
+    CHECK(std::abs(summary.at("max_von_mises_raw_mpa").get<double>() - unmasked) < 5e-4);
+    CHECK(summary.at("max_von_mises_reduction").get<std::string>() ==
+          "node_averaged_excluding_fixture_ring2");
+    CHECK(summary.at("summary_nodes_excluded").get<int>() == excluded);
+    CHECK(summary.at("summary_nodes_total").get<int>() == static_cast<int>(n_nodes));
+    CHECK(excluded > 0);
+    // This clamped beam's peak IS in the excluded ring — the disclosure exists for
+    // exactly this case, so both the FoS twin and the plain-words warning must fire.
+    CHECK(unmasked > masked);
+    CHECK(summary.at("min_fos_raw").get<double>() <
+          summary.at("min_fos").get<double>());
+    REQUIRE(result.contains("warnings"));
+    bool warned = false;
+    for (const auto& w : result["warnings"])
+        warned = warned || w.get<std::string>().find("peak excluded near fixtures") !=
+                               std::string::npos;
+    CHECK(warned);
+    // The named fixture is the one the peak sits next to, not a bare ordinal.
+    bool named = false;
+    for (const auto& note : result["solver_notes"])
+        named = named || note.get<std::string>().find("Ftestfix") != std::string::npos;
+    CHECK(named);
+
+    fs::remove(vtu, ec);
 }
 
 TEST_CASE("sim_cache: SPICE HIT / invalidate-on-input-change") {

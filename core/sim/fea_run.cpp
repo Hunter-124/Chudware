@@ -27,6 +27,7 @@
 #include <unordered_set>
 #include <vector>
 
+#include "sim/fea_contact.h"
 #include "sim/fea_modal.h"
 #include "sim/fea_static.h"
 #include "sim/fea_thermal.h"
@@ -97,6 +98,13 @@ struct MeshQualityFacts {
     // never resolved fixtures (a mesh-level report, modal, thermal), which is
     // NOT the same statement as zero.
     int unfixed_components = -1;
+    // Hanging-element repair (mesher.h MeshOut). A corner node referenced by ONE
+    // element is a rigid-body mechanism that every connectivity check passes, so
+    // the counts ride with every mesh: repaired is what the mesher dissolved,
+    // remaining is what it could not, and remaining > 0 is a refusal.
+    int lonely_nodes_repaired = 0;
+    int lonely_nodes_remaining = 0;
+    int hanging_elems_dropped = 0;
     // Thinnest wall in element sizes (mesher.h MeshOut). 0 = unavailable.
     double thin_wall_ratio = 0.0;
     std::string note;
@@ -116,6 +124,9 @@ json mesh_quality_json(const MeshQualityFacts& quality, std::size_t n_nodes,
                              quality.max_tet_edge_ratio};
     for (std::size_t i = 0; i < std::size(kMetrics); ++i)
         out[kMetrics[i]] = quality.valid ? json(values[i]) : json(nullptr);
+    out["lonely_nodes_repaired"] = quality.lonely_nodes_repaired;
+    out["lonely_nodes_remaining"] = quality.lonely_nodes_remaining;
+    out["hanging_elems_dropped"] = quality.hanging_elems_dropped;
     out["quadratic_fallback_elems"] = quality.quadratic_fallback_elems;
     // Connectivity and thin-wall facts are null when unavailable rather than a
     // plausible-looking 1 / 0 the reader would take for a measurement.
@@ -201,7 +212,13 @@ bool write_result_vtu(const nlohmann::json& study, const std::vector<double>& po
         if (disp.size() == n_nodes * 3)
             fields.push_back(VtuPointField{"displacement", 3, std::move(disp)});
     }
-    for (const char* scalar : {"von_mises", "temperature"}) {
+    // von_mises is the node-averaged nodal field the summary reduces; summary_node
+    // is the 1/0 mask that reduction uses (0 = inside the ideal-fixture ring the
+    // solver excludes as a clamp singularity). Both ride in the file, so
+    //   max{ von_mises[i] : summary_node[i] == 1 } == summary.max_von_mises_mpa
+    //   max{ von_mises[i] }                        == summary.max_von_mises_raw_mpa
+    // hold by construction and the field can never silently contradict the packet.
+    for (const char* scalar : {"von_mises", "summary_node", "temperature"}) {
         std::vector<double> values = nodal(scalar);
         if (values.size() == n_nodes)
             fields.push_back(VtuPointField{scalar, 1, std::move(values)});
@@ -542,6 +559,10 @@ bool resolve_mesh(const json &study, std::vector<double> &points,
         quality.min_tet_volume_mm3 = probe.min_tet_volume_mm3;
         quality.max_tet_edge_ratio = probe.max_tet_edge_ratio;
         quality.connected_components = probe.connected_components;
+        // An inline mesh is the caller's own array; it is COUNTED, never silently
+        // repaired, so a hanging fragment becomes a refusal naming it rather than
+        // an edit to a mesh someone else owns.
+        quality.lonely_nodes_remaining = detail::count_lonely_nodes(probe);
       } else {
         quality.note = probe.error;
       }
@@ -585,6 +606,9 @@ bool resolve_mesh(const json &study, std::vector<double> &points,
     quality.max_tet_edge_ratio = mesh->max_tet_edge_ratio;
     quality.connected_components = mesh->connected_components;
     quality.thin_wall_ratio = mesh->thin_wall_ratio;
+    quality.lonely_nodes_repaired = mesh->lonely_nodes_repaired;
+    quality.lonely_nodes_remaining = mesh->lonely_nodes_remaining;
+    quality.hanging_elems_dropped = mesh->hanging_elems_dropped;
     return true;
   }
   err = "study must have inline points/tets or a step_path";
@@ -603,8 +627,12 @@ bool resolve_mesh(const json &study, std::vector<double> &points,
 // and the area-weighted outward normal, then:
 //   • force  load: distribute the TOTAL force F by w_i / Σw (the resultant stays exactly
 //                  F, but the spatial distribution is correct so no spurious corner spike).
-//   • pressure load: add p · (∫ N_i dA) · n̂ per node (the textbook consistent pressure
-//                    load), the area-weighted form of the same weights.
+//   • pressure load: add −p · (∫ N_i n̂ dA) per node (the textbook consistent pressure
+//                    load), the area-weighted form of the same weights. The MINUS is the
+//                    convention: n̂ is the OUTWARD normal and a positive pressure PUSHES
+//                    INTO the surface, so +p on a bore is internal pressurisation
+//                    (documented as "MPa, inward" by run_fea_static / the resultant the
+//                    render annotation quotes).
 // For a LINEAR face (tet4 tri3 / hex8 quad) every node weight is A/n, so the tet4/hex8
 // behavior is byte-identical to the old equal split (parity preserved).
 struct FaceTab {
@@ -901,27 +929,6 @@ void add_midside_face_nodes(const std::vector<int>& tets, int nodes_per_elem,
             if (node_set.count(a) && node_set.count(b)) node_set.insert(el[ee[0]]);
         }
     }
-}
-
-// ── Governor admission: projected peak memory for a sparse FEA solve ─────────────
-// Triplet assembly storage is exact: (dof_per_node*npe)^2 entries/element × 16 B
-// (Eigen Triplet<double> = 8 B value + 2×4 B indices). The assembled CSC matrix is
-// bounded above by half the triplets (duplicates merge). Factor fill-in is the honest
-// unknown and the real killer — CHOLMOD's supernodal fill on bulky 3D solids was
-// MEASURED at multi-GB (see the CHOLMOD note in core/CMakeLists.txt) — so it enters
-// as a multiplier of K, env-tunable via CHUDWARE_FEA_FILL for hosts where the default
-// proves loose/tight. Result fields (~20 doubles/node) are minor but included.
-uint64_t fea_estimate_bytes(size_t n_elems, size_t n_nodes, int npe, int dof_per_node) {
-    const double band = static_cast<double>(dof_per_node * npe);
-    const double triplets = static_cast<double>(n_elems) * band * band * 16.0;
-    double fill = 6.0;
-    if (const char* e = std::getenv("CHUDWARE_FEA_FILL")) {
-        const double v = std::atof(e);
-        if (v > 0.0) fill = v;
-    }
-    const double K = triplets * 0.5;
-    const double fields = static_cast<double>(n_nodes) * 20.0 * 8.0;
-    return static_cast<uint64_t>(triplets + K + fill * K + fields);
 }
 
 }  // namespace
@@ -1553,13 +1560,14 @@ static nlohmann::json fea_run_static_impl(
 
     // Governor admission: refuse a solve that would blow past the host's memory
     // budget with a clear, actionable error instead of OOM-crashing the process
-    // (the GUI/MCP already render {"ok":false,"error"} gracefully).
+    // (the GUI/MCP already render {"ok":false,"error"} gracefully). The projected
+    // peak comes from governor::fea_peak_bytes — MEASURED peak RSS of this very
+    // path, safety-factored — so it is compared to the budget as-is.
     {
         std::string why;
         const size_t n_elems_est = tets.size() / static_cast<size_t>(nodes_per_elem);
-        if (!chudware::governor::admit(
-                fea_estimate_bytes(n_elems_est, static_cast<size_t>(n_nodes), nodes_per_elem, 3),
-                "static FEA solve", why))
+        if (!chudware::governor::admit_fea(n_elems_est, nodes_per_elem, 3,
+                                           "static FEA solve", why))
             return json{{"ok", false}, {"error", why}};
     }
 
@@ -1578,6 +1586,22 @@ static nlohmann::json fea_run_static_impl(
         for (const auto& load : study["loads"]) {
             const json faces = load.contains("faces") ? load["faces"] : json::object();
             const double tol = faces.value("tol_mm", 1.0);
+            const std::string type = load.value("type", std::string());
+            // A load that deposits nothing is a no-op, so it is decided BEFORE the
+            // selection is judged: refusing a whole study over a ZERO load's
+            // unresolvable faceset reports a fault where there is no load. Upstream
+            // validation already guarantees `vector`/`magnitude` exist and are finite
+            // here, and `have_nonzero_load` guarantees the study carries a real load.
+            // (Witness: a consistent-pressure oracle sums the traction over every
+            // element face and relies on interior faces cancelling identically —
+            // Zienkiewicz & Taylor §2 — so a coarse bore mesh yields a handful of
+            // O(1e-15) forces sitting on INTERIOR mid-side nodes, which
+            // boundary_faceset_membership correctly resolves to nothing. Ordering the
+            // refusal first killed the whole Lamé study over 32 numerically-zero
+            // loads out of 1208.)
+            if ((type == "force" && !nonzero3(load["vector"])) ||
+                (type == "pressure" && load["magnitude"].get<double>() == 0.0))
+                continue;
             std::vector<int> node_ids =
                 boundary_faceset_membership(faces, points, tets, nodes_per_elem);
             if (node_ids.empty())
@@ -1585,10 +1609,6 @@ static nlohmann::json fea_run_static_impl(
                             {"error", "fea_static: load faces resolved to 0 mesh nodes "
                                       "(tol=" +
                                           std::to_string(tol) + " mm)"}};
-            const std::string type = load.value("type", std::string());
-            if ((type == "force" && !nonzero3(load["vector"])) ||
-                (type == "pressure" && load["magnitude"].get<double>() == 0.0))
-                continue;
             // Consistent boundary-load weights w_i = ∫ N_i dA over the loaded faces.
             // Tet10 uses mapped tri6 quadrature; tet4/hex8 use A/n per corner. Shared by
             // force and pressure deposition.
@@ -1661,17 +1681,25 @@ static nlohmann::json fea_run_static_impl(
                         ? load["magnitude"].get<double>()
                         : 0.0;
                 if (loaded_area > 1e-12 && w_sum > 1e-12) {
-                    // Consistent pressure load: f_i = p · ∫ N_i n̂ dA, accumulated per node
+                    // Consistent pressure load: f_i = −p · ∫ N_i n̂ dA, accumulated per node
                     // with the PER-FACE outward normal (node_nw), so a curved loaded surface
-                    // gets the right directional load and the resultant spans p·A·n̂. The load
-                    // lands on the mid-side nodes for tet10 (the prior code lumped p·A onto
-                    // corner nodes only, which drove the δ/σ several-fold error).
+                    // gets the right directional load and the resultant spans p·A·(−n̂). The
+                    // load lands on the mid-side nodes for tet10 (the prior code lumped p·A
+                    // onto corner nodes only, which drove the δ/σ several-fold error).
+                    //
+                    // SIGN (V&V, 2026-09-05): the minus is the CONTRACT. `pressure` is
+                    // documented "MPa, inward" (cad_sim_tools.run_fea_static, cad_guide,
+                    // and cad_render_tools, which quotes p·A "N inward"), and a positive
+                    // pressure pushing into the surface is the universal engineering
+                    // convention. Depositing +p·n̂ made +20 MPa on a Lamé bore read
+                    // σ_hoop = −29.6 MPa (external pressurisation) against Lamé's +33.33,
+                    // i.e. every bore/vessel study needed a hand-flipped magnitude.
                     for (int nid : node_ids)
                         for (int c = 0; c < 3; ++c)
-                            nodal_forces[nid * 3 + c] +=
+                            nodal_forces[nid * 3 + c] -=
                                 pressure * node_nw[static_cast<size_t>(nid) * 3 + c];
                     notes.push_back("Pressure on loaded area " + std::to_string(loaded_area) +
-                                    " mm2 (work-consistent)");
+                                    " mm2 (work-consistent, +p acts inward)");
                 } else {
                     return json{{"ok", false},
                                 {"error", "fea_static: pressure selection contains no "
@@ -1683,10 +1711,19 @@ static nlohmann::json fea_run_static_impl(
 
     // ── Fixtures -> fixed nodes (union, sorted unique) ───────────────────────
     std::vector<int> fixed_nodes;
+    // Which fixture a fixed node came from, kept only so a diagnostic can NAME the
+    // fixture nearest an excluded stress peak (one entry per fixed node).
+    std::unordered_map<int, std::size_t> fixture_of_node;
+    std::vector<std::string> fixture_labels;
     if (study.contains("fixtures") && study["fixtures"].is_array()) {
         std::unordered_set<int> seen;
         for (const auto& fx : study["fixtures"]) {
             const double tol = fx.value("tol_mm", 1.0);
+            const std::size_t ordinal = fixture_labels.size();
+            std::string label = "fixtures[" + std::to_string(ordinal) + "]";
+            if (fx.is_object() && fx.contains("sid") && fx["sid"].is_string())
+                label = fx["sid"].get<std::string>() + " (" + label + ")";
+            fixture_labels.push_back(label);
             std::vector<int> node_ids =
                 boundary_faceset_membership(fx, points, tets, nodes_per_elem);
             if (node_ids.empty())
@@ -1695,7 +1732,10 @@ static nlohmann::json fea_run_static_impl(
                                       "(tol=" +
                                           std::to_string(tol) + " mm)"}};
             for (int nid : node_ids)
-                if (seen.insert(nid).second) fixed_nodes.push_back(nid);
+                if (seen.insert(nid).second) {
+                    fixed_nodes.push_back(nid);
+                    fixture_of_node.emplace(nid, ordinal);
+                }
         }
     }
     std::sort(fixed_nodes.begin(), fixed_nodes.end());
@@ -1725,6 +1765,53 @@ static nlohmann::json fea_run_static_impl(
     // mechanism carries no load, so equilibrium can never catch this. Only
     // connectivity can, and it is checked before the solve rather than explained
     // afterwards.
+    // ── study.contact: real unilateral (frictionless) contact ────────────────
+    // {"enabled":true, "max_gap_mm":0.5, "max_iterations":25, "penalty_scale":1.0}
+    // Contact and bond_gap_mm are two DIFFERENT idealizations of the same interface —
+    // one carries tension, one cannot — so asking for both is a contradiction, not a
+    // merge, and it is refused rather than silently resolved.
+    bool contact_enabled = false;
+    ContactCandidateOptions contact_opts;
+    FeaContactOptions contact_solver_opts;
+    if (study.contains("contact") && !study["contact"].is_null()) {
+        const json& c = study["contact"];
+        if (!c.is_object())
+            return json{{"ok", false},
+                        {"error", "fea_static: study.contact must be an object like "
+                                  "{\"enabled\":true,\"max_gap_mm\":0.5}"}};
+        contact_enabled = c.value("enabled", true);
+        if (contact_enabled) {
+            if (study.contains("bond_gap_mm"))
+                return json{
+                    {"ok", false},
+                    {"error", "fea_static: study.contact and study.bond_gap_mm are "
+                              "mutually exclusive — a bonded tie carries tension across "
+                              "the interface and a contact pair cannot. Pick one: "
+                              "bond_gap_mm for a welded/glued joint, contact for a "
+                              "seated or slip-fit one."}};
+            auto number = [&](const char* key, double fallback, double lo,
+                              double hi) -> double {
+                if (!c.contains(key) || c[key].is_null()) return fallback;
+                if (!c[key].is_number()) return std::numeric_limits<double>::quiet_NaN();
+                const double v = c[key].get<double>();
+                if (!std::isfinite(v) || v < lo || v > hi)
+                    return std::numeric_limits<double>::quiet_NaN();
+                return v;
+            };
+            contact_opts.max_gap_mm = number("max_gap_mm", 0.5, 1e-6, 1e4);
+            contact_opts.penalty_scale = number("penalty_scale", 1.0, 1e-6, 1e6);
+            const double iters = number("max_iterations", 25.0, 1.0, 500.0);
+            if (!std::isfinite(contact_opts.max_gap_mm) ||
+                !std::isfinite(contact_opts.penalty_scale) || !std::isfinite(iters))
+                return json{
+                    {"ok", false},
+                    {"error", "fea_static: study.contact needs finite max_gap_mm > 0 "
+                              "(mm), penalty_scale > 0, and max_iterations in 1..500"}};
+            contact_solver_opts.max_iterations = static_cast<int>(iters);
+        }
+    }
+    ContactCandidateSet contact_set;
+    std::vector<int> held_by_contact_only;
     std::vector<BondSpring> bond_springs;
     {
         const int n_nodes_i = static_cast<int>(points.size() / 3);
@@ -1748,13 +1835,79 @@ static nlohmann::json fea_run_static_impl(
             for (int k = 1; k < npe_i; ++k)
                 unite(tets[static_cast<size_t>(e) * npe_i],
                       tets[static_cast<size_t>(e) * npe_i + k]);
+        // ── Nodes no element references are not components of the DOMAIN ────
+        // The mesher's hanging-fragment dissolve deliberately leaves such nodes
+        // behind: node numbering must stay 1:1 with the polymesh mesh the
+        // adaptive route refines through, so only the element list shrinks.
+        // fea_static eliminates them exactly (their rows are identically zero,
+        // nothing couples them) and still REFUSES a load applied to one. So
+        // counting them here would refuse every repaired mesh as a mechanism —
+        // one dissolved tet10 orphans up to ten nodes, i.e. up to ten
+        // "connected component(s) with no fixture", on a mesh that is one solid
+        // body. Bond and contact springs cannot rescue such a node: both are
+        // built from the MESH's own boundary faces, so every endpoint is an
+        // element node by construction.
+        std::vector<char> referenced(static_cast<size_t>(n_nodes_i), 0);
+        for (int nid : tets)
+            if (nid >= 0 && nid < n_nodes_i)
+                referenced[static_cast<size_t>(nid)] = 1;
+        int unreferenced_nodes = 0;
+        for (int i = 0; i < n_nodes_i; ++i)
+            if (!referenced[static_cast<size_t>(i)]) ++unreferenced_nodes;
         std::unordered_set<int> roots;
-        for (int i = 0; i < n_nodes_i; ++i) roots.insert(find(i));
+        for (int i = 0; i < n_nodes_i; ++i)
+            if (referenced[static_cast<size_t>(i)]) roots.insert(find(i));
         // The authoritative count for the result: this union-find covers every
         // element stride the solver accepts (hex8 included), where the mesh-level
         // metric from fill_quality is tet-only.
         mesh_quality.connected_components = static_cast<int>(roots.size());
-        if (roots.size() > 1) {
+        if (unreferenced_nodes > 0)
+            notes.push_back(
+                std::to_string(unreferenced_nodes) +
+                " node(s) reference no element (left behind by mesh repair, which "
+                "preserves node numbering); they are not counted as mesh components "
+                "and the solver eliminates their zero rows");
+        if (contact_enabled) {
+            // Real contact on the meshed bodies: surface nodes of DIFFERENT components
+            // that face each other across at most max_gap_mm, normals taken from the
+            // MESH's own boundary faces (fea_contact.cpp), each pair remembering its
+            // initial signed gap. No pair is a tie: the solver decides per pair whether
+            // it is touching.
+            if (roots.size() < 2)
+                return json{
+                    {"ok", false},
+                    {"error", "fea_static: study.contact needs at least two disconnected "
+                              "mesh components (two bodies). This mesh is one connected "
+                              "solid, so there is no interface to open or close — run the "
+                              "ordinary static study."},
+                    {"notes", notes}};
+            contact_set = fea_contact_candidates(points, tets, nodes_per_elem, E_mpa,
+                                                 contact_opts);
+            if (!contact_set.error.empty())
+                return json{{"ok", false},
+                            {"error", "fea_static: " + contact_set.error},
+                            {"notes", notes}};
+            if (contact_set.springs.empty())
+                return json{
+                    {"ok", false},
+                    {"error", "fea_static: no contact pair was found within max_gap_mm = " +
+                                  std::to_string(contact_opts.max_gap_mm) +
+                                  " mm — the " + std::to_string(roots.size()) +
+                                  " bodies in this mesh never come that close, or their "
+                                  "facing surfaces are not opposed. Measure the real "
+                                  "clearance and raise max_gap_mm to just above it."},
+                    {"notes", notes}};
+            notes.push_back(
+                "unilateral contact: " + std::to_string(contact_set.springs.size()) +
+                " candidate pair(s) across " +
+                std::to_string(contact_set.group_components.size()) +
+                " body pair(s) (gap <= " + std::to_string(contact_opts.max_gap_mm) +
+                " mm), frictionless normal penalty, active set solved per iteration");
+            if (std::getenv("CHUDWARE_FEA_BOND_GAP_MM"))
+                notes.push_back(
+                    "CHUDWARE_FEA_BOND_GAP_MM is set but IGNORED: this study requested "
+                    "contact, which cannot carry the tension a bonded tie would");
+        } else if (roots.size() > 1) {
             double gap_mm = 0.0;
             if (study.contains("bond_gap_mm")) {
                 if (!study["bond_gap_mm"].is_number() ||
@@ -1871,10 +2024,43 @@ static nlohmann::json fea_run_static_impl(
             if (a != b)
                 super[static_cast<size_t>(std::max(a, b))] = std::min(a, b);
         }
+        // A component held ONLY by contact candidates is REACHABLE for this gate — the
+        // active-set solve is what decides whether those pairs are touching, and it
+        // refuses on its own if they all separate. But such a component is held by an
+        // idealization the reader must see, so it is named in the packet.
+        {
+            std::unordered_set<int> bond_anchored;
+            for (int nid : fixed_nodes) bond_anchored.insert(sfind(nid));
+            std::vector<int> pre_contact_root(static_cast<size_t>(n_nodes_i));
+            for (int i = 0; i < n_nodes_i; ++i) pre_contact_root[static_cast<size_t>(i)] = sfind(i);
+            for (const ContactSpring& s : contact_set.springs) {
+                const int a = sfind(s.a), b = sfind(s.b);
+                if (a != b)
+                    super[static_cast<size_t>(std::max(a, b))] = std::min(a, b);
+            }
+            if (!contact_set.springs.empty()) {
+                std::unordered_set<int> now_anchored;
+                for (int nid : fixed_nodes) now_anchored.insert(sfind(nid));
+                std::set<int> only;
+                for (int i = 0; i < n_nodes_i; ++i) {
+                    const int comp_id = i < static_cast<int>(contact_set.component.size())
+                                            ? contact_set.component[static_cast<size_t>(i)]
+                                            : -1;
+                    if (comp_id < 0) continue;
+                    if (bond_anchored.count(pre_contact_root[static_cast<size_t>(i)])) continue;
+                    if (now_anchored.count(sfind(i))) only.insert(comp_id);
+                }
+                held_by_contact_only.assign(only.begin(), only.end());
+            }
+        }
         std::unordered_set<int> anchored;
         for (int nid : fixed_nodes) anchored.insert(sfind(nid));
+        // Same `referenced` mask as the component count above: a node no element
+        // references is eliminated by fea_static (zero rows, never a rigid mode),
+        // so it is not a floating component either.
         std::unordered_set<int> floating;
         for (int i = 0; i < n_nodes_i; ++i) {
+            if (!referenced[static_cast<size_t>(i)]) continue;
             const int root = sfind(i);
             if (!anchored.count(root)) floating.insert(root);
         }
@@ -1889,6 +2075,11 @@ static nlohmann::json fea_run_static_impl(
                            " explicit bonded gap tie(s) were added and still did not "
                            "reach a fixtured component; raise bond_gap_mm only when that "
                            "contact is physically intended";
+            if (!contact_set.springs.empty())
+                message += ". " + std::to_string(contact_set.springs.size()) +
+                           " contact candidate pair(s) were found and still did not "
+                           "reach a fixtured component; raise contact.max_gap_mm only "
+                           "when that interface really is that close";
             return json{
                 {"ok", false},
                 {"error", message},
@@ -1900,15 +2091,183 @@ static nlohmann::json fea_run_static_impl(
                 {"notes", notes}};
         }
     }
+    // ── A hanging FRAGMENT is a REFUSAL, in the same class as an unfixtured
+    // component. `lonely_nodes_remaining` counts the nodes of element fragments —
+    // elements glued to each other face-to-face — that touch the rest of their own
+    // body at two corners or fewer: such a fragment rotates about that node or edge
+    // at zero strain energy, so the stiffness is singular while every connectivity
+    // check passes (the fragment does reach a fixture, through the one node it hangs
+    // from). It is deliberately NOT the raw count of nodes used by a single element
+    // (`single_element_nodes`) — a tet apex nobody else uses is fully constrained by
+    // its own element, and 45 of the 51 such tips on the measured wheel mesh were
+    // ordinary. That mesh: condition number 4e33 and a solve that returned a
+    // plausible-looking 0.032 mm with a zero equilibrium residual. The mesher
+    // dissolves these (mesh_quality.hanging_elems_dropped); anything left here is
+    // not solvable, and a warning would only be as good as someone reading it.
+    if (mesh_quality.lonely_nodes_remaining > 0) {
+        // Say which mesh the caller has to act on from what they SENT, not from
+        // whether the mesher happened to repair anything: a geometry mesh that
+        // needed no repair also reports zero drops, and calling it "inline" pointed
+        // the caller at arrays they never supplied.
+        const bool inline_mesh = study.contains("points") &&
+                                 study["points"].is_array() &&
+                                 study.contains("tets") && study["tets"].is_array();
+        std::string message =
+            "fea_static: mesh has " +
+            std::to_string(mesh_quality.lonely_nodes_remaining) +
+            " node(s) on element fragment(s) that touch the rest of the body at two "
+            "corners or fewer: such a fragment can rotate about that node or edge at "
+            "zero strain energy, so the stiffness matrix is singular and any "
+            "displacement or FoS from it is meaningless — including one that looks "
+            "plausible and reports a zero equilibrium residual.";
+        message += inline_mesh
+                       ? " This is an inline mesh, which is never edited here: remove "
+                         "the hanging elements from points/tets, or mesh from geometry "
+                         "and let the mesher dissolve them."
+                       : " The mesher dissolved " +
+                             std::to_string(mesh_quality.hanging_elems_dropped) +
+                             " hanging element(s) and these survived, which points at "
+                             "the geometry rather than the size: repair the sliver "
+                             "feature, or re-mesh with a size band that does not have "
+                             "to straddle it.";
+        return json{
+            {"ok", false},
+            {"error", message},
+            {"mesh_quality",
+             detail::mesh_quality_json(
+                 mesh_quality, points.size() / 3,
+                 tets.size() / static_cast<std::size_t>(nodes_per_elem),
+                 nodes_per_elem)},
+            {"notes", notes}};
+    }
 
     const auto t_solve0 = std::chrono::steady_clock::now();
     chudware::prof::phases::add("setup", std::chrono::duration<double, std::milli>(
                                           t_solve0 - t_setup0).count());
     if (job.cancelled())
         return json{{"ok", false}, {"error", "fea_static: cancelled"}};
+    // ── study.export_system_path: the resolved system, verbatim (V&V hook) ───
+    // Everything an independent solver needs to rebuild THIS system node-for-node,
+    // written immediately before the solve so it can never describe a different one.
+    // Lengths mm, forces N, modulus MPa, spring stiffness N/mm. fixed_nodes is a flat
+    // node-index list because that is the solver's only Dirichlet form: each entry pins
+    // all three translational DOFs to zero. A write failure fails the RUN — a V&V export
+    // that silently did not happen is worse than no export.
+    if (study.contains("export_system_path") && !study["export_system_path"].is_null()) {
+        if (!study["export_system_path"].is_string() ||
+            study["export_system_path"].get<std::string>().empty())
+            return json{{"ok", false},
+                        {"error", "fea_static: export_system_path must be a non-empty "
+                                  "string path"},
+                        {"notes", notes}};
+        const std::string path = study["export_system_path"].get<std::string>();
+        const int n_nodes_out = static_cast<int>(points.size() / 3);
+        json dump;
+        dump["nodes_per_elem"] = nodes_per_elem;
+        dump["E_mpa"] = E_mpa;
+        dump["nu"] = nu;
+        json pts = json::array();
+        json forces = json::array();
+        for (int i = 0; i < n_nodes_out; ++i) {
+            pts.push_back(json::array({points[static_cast<size_t>(i) * 3],
+                                       points[static_cast<size_t>(i) * 3 + 1],
+                                       points[static_cast<size_t>(i) * 3 + 2]}));
+            forces.push_back(json::array({nodal_forces[static_cast<size_t>(i) * 3],
+                                          nodal_forces[static_cast<size_t>(i) * 3 + 1],
+                                          nodal_forces[static_cast<size_t>(i) * 3 + 2]}));
+        }
+        dump["points"] = std::move(pts);
+        dump["nodal_forces"] = std::move(forces);
+        json elems = json::array();
+        for (size_t e = 0; e + nodes_per_elem <= tets.size();
+             e += static_cast<size_t>(nodes_per_elem)) {
+            json row = json::array();
+            for (int j = 0; j < nodes_per_elem; ++j) row.push_back(tets[e + j]);
+            elems.push_back(std::move(row));
+        }
+        dump["elems"] = std::move(elems);
+        dump["fixed_nodes"] = fixed_nodes;
+        json bonds = json::array();
+        for (const BondSpring& s : bond_springs)
+            bonds.push_back(json{{"a", s.a}, {"b", s.b}, {"k", s.k}});
+        dump["bond_springs"] = std::move(bonds);
+        json contacts = json::array();
+        for (const ContactSpring& s : contact_set.springs)
+            contacts.push_back(json{{"a", s.a},
+                                    {"b", s.b},
+                                    {"k", s.k},
+                                    {"gap0_mm", s.gap0_mm},
+                                    {"normal", s.normal},
+                                    {"area_mm2", s.area_mm2},
+                                    {"group", s.group}});
+        dump["contact_springs"] = std::move(contacts);
+        std::error_code ec;
+        const std::filesystem::path fs_path(path);
+        if (fs_path.has_parent_path())
+            std::filesystem::create_directories(fs_path.parent_path(), ec);
+        std::ofstream out_file(fs_path, std::ios::binary | std::ios::trunc);
+        if (!out_file) {
+            return json{{"ok", false},
+                        {"error", "fea_static: could not open export_system_path for "
+                                  "writing: " + path},
+                        {"notes", notes}};
+        }
+        out_file << dump.dump();
+        out_file.flush();
+        if (!out_file) {
+            return json{{"ok", false},
+                        {"error", "fea_static: failed while writing "
+                                  "export_system_path: " + path},
+                        {"notes", notes}};
+        }
+        notes.push_back("resolved system exported to " + path +
+                        " (mm / N / MPa; fixed_nodes pins all 3 DOFs per entry)");
+    }
+    FeaContactReport contact_report;
     FeaStaticResult r =
-        fea_static_solve(points, tets, E_mpa, nu, yield_mpa, fixed_nodes,
-                         nodal_forces, nodes_per_elem, bond_springs, job.token());
+        contact_enabled
+            ? fea_static_solve_contact(points, tets, E_mpa, nu, yield_mpa, fixed_nodes,
+                                       nodal_forces, nodes_per_elem, bond_springs,
+                                       contact_set.springs, contact_solver_opts,
+                                       contact_report, job.token())
+            : fea_static_solve(points, tets, E_mpa, nu, yield_mpa, fixed_nodes,
+                               nodal_forces, nodes_per_elem, bond_springs, job.token());
+    // The contact block is EVIDENCE, so it rides on the refusal too: a reader has to be
+    // able to see how many pairs there were and how far the active set got.
+    auto contact_json = [&]() {
+        json body = {{"enabled", true},
+                     {"max_gap_mm", contact_opts.max_gap_mm},
+                     {"penalty_scale", contact_opts.penalty_scale},
+                     {"penalty_stiffness_n_per_mm",
+                      round_nd(E_mpa * contact_set.char_len_mm * contact_opts.penalty_scale, 4)},
+                     {"max_iterations", contact_solver_opts.max_iterations},
+                     {"candidate_pairs", contact_report.candidate_pairs},
+                     {"active_pairs", contact_report.active_pairs},
+                     {"contact_iterations", contact_report.contact_iterations},
+                     {"converged", contact_report.converged},
+                     {"tangential_stabilization", contact_report.tangential_stabilization},
+                     {"tangential_force_fraction",
+                      round_nd(contact_report.tangential_force_fraction, 6)},
+                     {"held_by_contact_only", held_by_contact_only},
+                     {"pairs", json::array()}};
+        for (const FeaContactGroup& g : contact_report.groups) {
+            const std::array<int, 2> comps =
+                g.group >= 0 && g.group < static_cast<int>(contact_set.group_components.size())
+                    ? contact_set.group_components[static_cast<size_t>(g.group)]
+                    : std::array<int, 2>{-1, -1};
+            body["pairs"].push_back(
+                json{{"bodies", comps},
+                     {"candidate_pairs", g.candidate_pairs},
+                     {"active_pairs", g.active_pairs},
+                     {"contact_force_n", round_nd(g.contact_force_n, 4)},
+                     {"force_vector_n",
+                      json::array({round_nd(g.force_n[0], 4), round_nd(g.force_n[1], 4),
+                                   round_nd(g.force_n[2], 4)})},
+                     {"max_contact_pressure_mpa", round_nd(g.max_contact_pressure_mpa, 4)},
+                     {"max_penetration_mm", round_nd(g.max_penetration_mm, 6)}});
+        }
+        return body;
+    };
     chudware::prof::phases::add("solve", std::chrono::duration<double, std::milli>(
                                           std::chrono::steady_clock::now() - t_solve0).count());
     if (fprof) {
@@ -1928,13 +2287,106 @@ static nlohmann::json fea_run_static_impl(
                    " explicit bonded gap ties were added, but a loaded part may still not "
                    "reach any fixtured part. Increase bond_gap_mm only when the larger "
                    "bonded-contact region is physically intended.";
-        return json{{"ok", false}, {"error", msg}, {"notes", notes}};
+        json fail{{"ok", false}, {"error", msg}, {"notes", notes}};
+        if (contact_enabled) fail["contact"] = contact_json();
+        return fail;
+    }
+    // A non-converged active set is not a contact solution: the displacements belong to
+    // whichever set the loop happened to stop on, so the stresses are not the ones the
+    // touching state implies. Report the evidence, refuse the verdict.
+    if (contact_enabled && !contact_report.converged) {
+        return json{
+            {"ok", false},
+            {"error", "fea_static: the contact active set did not settle in " +
+                          std::to_string(contact_solver_opts.max_iterations) +
+                          " iteration(s) — pairs kept opening and closing, so no state "
+                          "is the solution. Raise contact.max_iterations, or reduce "
+                          "contact.penalty_scale (a very stiff penalty makes pairs "
+                          "chatter across the gap)."},
+            {"contact", contact_json()},
+            {"notes", notes}};
     }
     if (nodes_per_elem == 10) notes.push_back("second-order (tet10) elements");
+    // Which factorization actually ran, and whether this solve queued behind another
+    // one — both come from the kernel, so a packet never has to be guessed at from
+    // build flags or wall time.
+    if (!r.solver.empty()) notes.push_back("solver: " + r.solver);
+    if (r.solve_wait_ms > 0.0)
+        notes.push_back("resources: this solve waited " +
+                        std::to_string(static_cast<long long>(r.solve_wait_ms)) +
+                        " ms for the host's solve slot (another heavy solve held it)");
+    // A conditioning verdict outranks everything else in the note list: the numbers
+    // below it may be meaningless. It goes in FIRST so a reader cannot scroll past it.
+    if (!r.conditioning_warning.empty())
+        notes.insert(notes.begin(), "CONDITIONING WARNING: " + r.conditioning_warning);
+    // The note a reader sees first has to carry the two numbers, not just the
+    // policy: a note saying "excludes the fixture rings" did not stop a released
+    // packet from quoting the masked peak as the peak AT the fixture holes.
     if (!fixed_nodes.empty())
         notes.push_back(
-            "von Mises/FoS summary excludes the two element rings adjacent to ideal "
-            "fixed constraints; full nodal fields remain available");
+            "von Mises/FoS summary excludes the " +
+            std::to_string(r.summary_excluded_nodes) + " of " +
+            std::to_string(r.n_nodes) +
+            " nodes inside the two element rings adjacent to ideal fixed "
+            "constraints (summary.max_von_mises_reduction = "
+            "node_averaged_excluding_fixture_ring2): reported peak " +
+            std::to_string(r.max_von_mises_mpa) + " MPa, unmasked nodal peak " +
+            std::to_string(r.max_von_mises_raw_mpa) +
+            " MPa (summary.max_von_mises_raw_mpa). The full nodal field and the "
+            "summary_node mask that selects it ride in the result and in any .vtu");
+    // A ratio this large is no longer a boundary-layer detail: the number the packet
+    // reports and the number the field shows are different design conclusions, so it
+    // gets plain words, a location, and the fixture's own name. The threshold is a
+    // disclosure trigger, not a verdict — nothing is refused or clipped by it.
+    std::string excluded_peak_warning;
+    if (!fixed_nodes.empty() && r.max_von_mises_mpa > 0.0 &&
+        r.max_von_mises_raw_node >= 0 &&
+        r.max_von_mises_raw_mpa > 1.25 * r.max_von_mises_mpa) {
+        const std::size_t peak = static_cast<std::size_t>(r.max_von_mises_raw_node);
+        double best_d2 = -1.0;
+        int nearest = -1;
+        for (int nid : fixed_nodes) {
+            const std::size_t f = static_cast<std::size_t>(nid);
+            if (3 * f + 2 >= points.size() || 3 * peak + 2 >= points.size()) continue;
+            double d2 = 0.0;
+            for (int c = 0; c < 3; ++c) {
+                const double d = points[3 * peak + static_cast<std::size_t>(c)] -
+                                 points[3 * f + static_cast<std::size_t>(c)];
+                d2 += d * d;
+            }
+            if (nearest < 0 || d2 < best_d2) { best_d2 = d2; nearest = nid; }
+        }
+        const auto owner = nearest >= 0 ? fixture_of_node.find(nearest)
+                                        : fixture_of_node.end();
+        const std::string fixture_name =
+            owner != fixture_of_node.end() && owner->second < fixture_labels.size()
+                ? fixture_labels[owner->second]
+                : std::string("an ideal fixed constraint");
+        char at[96] = {0};
+        std::snprintf(at, sizeof(at), "(%.4g, %.4g, %.4g) mm",
+                      points[3 * peak], points[3 * peak + 1], points[3 * peak + 2]);
+        excluded_peak_warning =
+            "peak excluded near fixtures: the highest nodal von Mises in this solve is " +
+            std::to_string(r.max_von_mises_raw_mpa) + " MPa at node " +
+            std::to_string(r.max_von_mises_raw_node) + " " + at + ", " +
+            (nearest >= 0 ? std::to_string(std::sqrt(std::max(best_d2, 0.0))) : std::string("?")) +
+            " mm from fixture " + fixture_name +
+            " (fixtures[i] is the 0-based position in the study's fixtures list, i.e. "
+            "the face query you passed at that position), i.e. " +
+            std::to_string(r.max_von_mises_raw_mpa / r.max_von_mises_mpa) +
+            "x the reported summary.max_von_mises_mpa of " +
+            std::to_string(r.max_von_mises_mpa) +
+            " MPa. The reported peak SKIPS that node (two element rings around ideal "
+            "fixtures are a clamp singularity, not a material-comparable value). If the "
+            "fixture face IS the feature you are designing — a bolt hole, a bearing seat, "
+            "a keyway — then the peak you care about is the excluded one: use "
+            "summary.max_von_mises_raw_mpa (" +
+            std::to_string(r.max_von_mises_raw_mpa) + " MPa) and summary.min_fos_raw (" +
+            std::to_string(r.min_fos_raw) +
+            "), state that it is mesh-sensitive, and do not quote summary.min_fos as the "
+            "margin at the fixture.";
+        notes.push_back(excluded_peak_warning);
+    }
     // Post-processing (failure criteria + result packaging) — dtor fires at function exit,
     // BEFORE _study's (declared earlier), so the phase lands inside this study.
     chudware::prof::phases::PhaseScope _post("post");
@@ -1976,6 +2428,10 @@ static nlohmann::json fea_run_static_impl(
                 {"stress_xx", r.stress_xx},
                 {"stress_yy", r.stress_yy},
                 {"stress_zz", r.stress_zz},
+                // The per-node 1/0 selector the summary reduction used, shipped
+                // beside the field it selects (and written into the .vtu) so the
+                // reported peak is reproducible from the arrays in this reply.
+                {"summary_node", r.summary_node},
                 {"n_dof", r.n_dof},
                 {"n_nodes", r.n_nodes},
                 {"n_elems", r.n_elems},
@@ -1991,9 +2447,38 @@ static nlohmann::json fea_run_static_impl(
                   {"min_fos_tresca", round_nd(min_fos_tresca, 4)},
                   {"min_fos_rankine", round_nd(min_fos_rankine, 4)},
                   {"max_tresca_mpa", round_nd(max_tresca, 4)},
-                  {"max_abs_principal_mpa", round_nd(max_abs_principal, 4)}}},
+                  {"max_abs_principal_mpa", round_nd(max_abs_principal, 4)},
+                  // ── What these scalars are a reduction of (T-EV: the 3.7x gap) ──
+                  // max_von_mises_mpa and the FoS/principal/shear extrema beside it
+                  // are taken over the nodes OUTSIDE two element rings of an ideal
+                  // fixed constraint (a clamp singularity is mesh-dependent, not a
+                  // material-comparable design value). That is a decision, and a
+                  // reader holding the nodal field — or the .vtu — sees a higher
+                  // peak with no way to know why, so the decision is stated, the
+                  // unmasked reduction is reported beside it, and the per-key lists
+                  // say exactly which scalars in THIS object share the mask (the
+                  // Tresca/Rankine pair is unmasked, and sits right next to the
+                  // masked von Mises number).
+                  {"max_von_mises_reduction",
+                   r.summary_excluded_nodes > 0
+                       ? "node_averaged_excluding_fixture_ring2"
+                       : "node_averaged"},
+                  {"max_von_mises_raw_mpa", round_nd(r.max_von_mises_raw_mpa, 4)},
+                  {"min_fos_raw", round_nd(r.min_fos_raw, 4)},
+                  {"summary_nodes_total", r.n_nodes},
+                  {"summary_nodes_excluded", r.summary_excluded_nodes},
+                  {"reduction_masked_keys",
+                   json::array({"max_von_mises_mpa", "min_fos", "max_principal_mpa",
+                                "min_principal_mpa", "max_shear_mpa"})},
+                  {"reduction_unmasked_keys",
+                   json::array({"max_disp_mm", "max_von_mises_raw_mpa", "min_fos_raw",
+                                "max_tresca_mpa", "max_abs_principal_mpa",
+                                "min_fos_tresca", "min_fos_rankine"})}}},
                 {"solver_notes", notes}};
     if (mesh_advisor) out["advisor"] = detail::mesh_advisor_json(*mesh_advisor);
+    // Contact rides BESIDE summary/reactions/mesh_quality, like every other evidence
+    // block: the equilibrium check and the contact resultants have to be read together.
+    if (contact_enabled) out["contact"] = contact_json();
     out["mesh_quality"] = detail::mesh_quality_json(
         mesh_quality, static_cast<std::size_t>(r.n_nodes),
         static_cast<std::size_t>(r.n_elems), nodes_per_elem);
@@ -2003,7 +2488,13 @@ static nlohmann::json fea_run_static_impl(
                             {"reaction_moment_nmm", r.reaction_moment_nmm},
                             {"equilibrium_error_pct",
                              round_nd(r.equilibrium_error_pct, 6)}};
-    out["provenance"] = detail::provenance_json("chudware/fea_static");
+    {
+        // provenance.solver names the route AND the factorization that produced it.
+        const std::string solver_route =
+            r.solver.empty() ? std::string("chudware/fea_static")
+                             : "chudware/fea_static [" + r.solver + "]";
+        out["provenance"] = detail::provenance_json(solver_route.c_str());
+    }
 
     // ── Result plausibility: is this displacement even a small strain? ───────
     // Linear-elastic FEA assumes displacements small against the part. A peak
@@ -2053,6 +2544,13 @@ static nlohmann::json fea_run_static_impl(
                  "(h <= wall thickness), check mesh_quality.thin_wall_ratio, and "
                  "confirm the fixture faces resolved."});
         }
+    }
+    // Same text as the solver note, but in `warnings` too: an analyst reading a packet
+    // scans warnings, and the whole failure mode here was a disclosure nobody read.
+    if (!excluded_peak_warning.empty()) {
+        if (!out.contains("warnings") || !out["warnings"].is_array())
+            out["warnings"] = json::array();
+        out["warnings"].push_back(excluded_peak_warning);
     }
     {
         std::string vtu_path, vtu_error;
@@ -2204,12 +2702,13 @@ nlohmann::json fea_run_modal(const nlohmann::json& study, int n_modes) {
                                          : "modal uses 1st-order (tet4) elements");
     if (!mesh_note.empty()) notes.push_back("mesh: " + mesh_note);
 
-    // Governor admission (2x the static estimate: K + M plus eigensolver workspace).
+    // Governor admission: 2x the calibrated static peak (K + M plus eigensolver
+    // workspace), so this keeps admit() with an explicit estimate.
     {
         std::string why;
         const size_t ne = tets.size() / static_cast<size_t>(nodes_per_elem);
         if (!chudware::governor::admit(
-                2 * fea_estimate_bytes(ne, points.size() / 3, nodes_per_elem, 3),
+                2 * chudware::governor::fea_peak_bytes(ne, nodes_per_elem, 3),
                 "modal FEA solve", why))
             return json{{"ok", false}, {"error", why}};
     }
@@ -2475,9 +2974,8 @@ nlohmann::json fea_run_thermal(const nlohmann::json& study) {
     {
         std::string why;
         const size_t ne = tets.size() / static_cast<size_t>(nodes_per_elem);
-        if (!chudware::governor::admit(
-                fea_estimate_bytes(ne, points.size() / 3, nodes_per_elem, 1),
-                "thermal FEA solve", why))
+        if (!chudware::governor::admit_fea(ne, nodes_per_elem, 1, "thermal FEA solve",
+                                           why))
             return json{{"ok", false}, {"error", why}};
     }
 

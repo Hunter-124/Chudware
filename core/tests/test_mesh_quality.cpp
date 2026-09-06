@@ -135,3 +135,33 @@ TEST_CASE("invalid mesh controls fail before STEP parsing") {
     CHECK_FALSE(validate_mesh_options(options, error));
     CHECK(error.find("min_size_mm") != std::string::npos);
 }
+
+// ── The hanging-fragment dissolve may not delete the domain ────────────────────────────────
+// detail::repair_lonely_nodes drops face-connected fragments that touch the rest of the mesh
+// at two corners or fewer, because such a fragment rotates about that node or edge at zero
+// strain energy. Two bodies fused at a single NODE are two such fragments — each hangs off
+// the other by exactly one corner — and the "the fragment IS the mesh" carve-out spares
+// neither, so the unguarded rule marked EVERY element and returned an empty mesh: a
+// diagnosable mechanism traded for a mesh nobody can solve or read. The repair must refuse,
+// leave the mesh byte-identical, and report the mechanism it did not repair.
+TEST_CASE("the hanging-fragment dissolve refuses to delete the whole mesh") {
+    MeshOut mesh;
+    mesh.nodes_per_elem = 4;
+    // Two unit tets sharing exactly ONE node (index 3), and nothing else.
+    mesh.points = {0.0, 0.0, 0.0,  1.0, 0.0, 0.0,  0.0, 1.0, 0.0,  0.0, 0.0, 1.0,
+                   1.0, 0.0, 2.0,  0.0, 1.0, 2.0,  0.0, 0.0, 2.0};
+    mesh.tets = {0, 1, 2, 3,  3, 4, 5, 6};
+    mesh.n_nodes = 7;
+    mesh.n_elems = 2;
+    const std::vector<int> before = mesh.tets;
+
+    const int dropped = detail::repair_lonely_nodes(mesh);
+    CHECK(dropped == 0);
+    CHECK(mesh.tets == before);              // the mesh is returned untouched
+    CHECK(mesh.n_elems == 2);
+    CHECK(mesh.hanging_elems_dropped == 0);
+    CHECK(mesh.dropped_volume_mm3 == 0.0);
+    // …and the mechanism is REPORTED, which is what makes the solve refuse and name it.
+    CHECK(mesh.lonely_nodes_remaining > 0);
+    CHECK(mesh.note.find("dissolve refused") != std::string::npos);
+}

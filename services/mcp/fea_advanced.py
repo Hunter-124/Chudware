@@ -595,6 +595,13 @@ def build_contact_block_inp(L: float, b: float, h: float, E: float, nu: float,
     z=h. Clean-room Abaqus/CalculiX syntax. Returns
     {inp, top_nodes, base_nodes, applied_load_n}.
 
+    This is a BOX PROXY, not the caller's geometry. The MCP tool run_fea_contact no
+    longer uses it — that now solves real unilateral contact on the meshed document
+    through the engine (core/sim/fea_contact.cpp + fea_static_solve_contact). What
+    still needs this deck is the frozen `sim_run_contact` worker RPC
+    (services/sim/multiphysics_rpc.py, contracts/worker_rpc.md), whose parameters ARE
+    box dimensions and which the GUI sim manager calls.
+
     Validation (numeric, ENGINEERING tier): by static equilibrium the vertical
     reaction summed over the fixed base must equal the applied load
     (pressure*L*b) — a conservation check that any correct contact solve satisfies.

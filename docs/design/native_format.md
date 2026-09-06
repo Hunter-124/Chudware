@@ -39,7 +39,7 @@ This document extends what already ships. It does **not** invent a greenfield fo
 | `thumbnail.png` | yes | 256×256; **STORED, first entry** for shell previewers |
 | `meta.json` | yes | `{container, app_version, kind, created, modified, units, name}` — timestamps live here, **not** in `document.json` |
 | `document.json` | yes | Full `aicad.part/1` or `aicad.asm/1` (and, by schema, drawings/CAM when present) — **sole parametric source of truth** |
-| `geometry.step` | yes* | AP214 of last successful rebuild — *contracted*; C++ writer currently **defers** writing it (open tolerates absence; Python oracle same) |
+| `geometry.step` | yes* | AP214 (`AUTOMOTIVE_DESIGN`) of the last successful rebuild, mm — written by `doc_save` after a fully-ok rebuild (part: compiled bodies; assembly: flattened world-placed component bodies) via `stepplus_geometry_step_bytes`. Absent only when the document has never rebuilt successfully; open tolerates absence |
 | `parts/<uuid>.json` | asm only | Embedded component docs via `source.embedded` |
 | `drawings/<drawing_id>.json` | no | Live drawings whose **source** is this doc, collected on save (`drawings_for_source`) |
 | `studies/<id>.json` | no | Study definitions (also mirrored / primarily stored as top-level `studies[]` in the doc JSON) |
@@ -89,7 +89,7 @@ Canonical `document.json` rules (`doc_schema.md` Appendix A / T-H2):
 |---|---|
 | **Not one user mental model** | Drawings ride inside the source part’s ZIP; there is no first-class standalone `.step+` drawing file UX. Assemblies are multi-file by default (external component paths). |
 | **Sim results are second-class** | 20 MB drop-on-save; no section index for partial load of large result sets; study defs dual-homed (doc JSON vs `studies/*.json` entries). |
-| **geometry.step incomplete in C++** | Contract promises interchange + rebuild-failure fallback; writer path still deferred. |
+| **geometry.step fallback not wired into open** | The writer is live (`stepplus_geometry_step_bytes`, entry written right after `document.json`), but §2 step 3 — offering the embedded snapshot as a frozen `import` feature when a rebuild fails — is not implemented: `editable_container_open` treats `geometry.step` as an owned entry and drops it from `extra`, so the bytes never reach the loader |
 | **No section index** | Open always scans/extracts all non-owned entries into `extra_entries` (memory); no random-access “load only drawings” API. |
 | **ZIP is git-hostile** | Already solved *around* the file by PLM explode — but the working file itself remains a monolithic ZIP (diff noise, whole-file rewrite). |
 | **Assembly graph not self-describing for lazy load** | Component fingerprints live only in `cache.json` when cached; no formal `index.json` of external refs for partial project open. |
@@ -210,7 +210,7 @@ Roles (stable strings; unknown roles preserved):
 |---|---|---|
 | `cache.brep` | After fully-ok part rebuild | `engine` + `doc_hash` + `solved:true` |
 | `cache.aicm` | Same | Same |
-| `geometry.step` | After fully-ok rebuild (implement deferred path) | Same doc_hash optional sidecar note in `cache.json` |
+| `geometry.step` | After fully-ok rebuild (**live**; erase-first, same gate as `cache.*`) | Same doc_hash optional sidecar note in `cache.json` |
 | Tess in `ops_response` | Session only unless cached | — |
 
 Feature-tree vs replay tradeoff: **keep snapshot tree, not op log**, consistent with PLM plan (“Not op-log replay… snapshots are already cheap and semantic diff already exists”).
@@ -447,7 +447,7 @@ Release commit:
 | Read | v2 reader accepts `aicad.step+/1` and `/2`; missing `index.json` → synthesize from ZIP CD |
 | Write | Default write `aicad.step+/2` with `index.json`; still emit all v1 entries |
 | Preserve | Unknown entries; old files without cache still full-rebuild |
-| geometry.step | Implement writer; old files without it keep rebuild-or-fail behavior |
+| geometry.step | Writer live; old files without it keep rebuild-or-fail behavior |
 | Drawings | No change to embed paths; standalone drawing files opt-in |
 | PLM | Strip caches on explode (behavior fix, backward compatible restore: missing cache = rebuild) |
 
@@ -511,7 +511,7 @@ Writers MUST continue to preserve unknown entries (existing rule).
 
 ### Phase 1 — Correctness & vault hygiene (small, high leverage)
 
-1. Implement **`geometry.step` write** on fully-ok rebuild (close contract gap) in `stepplus_save` / `doc_save`.
+1. ~~Implement **`geometry.step` write** on fully-ok rebuild (close contract gap) in `stepplus_save` / `doc_save`.~~ **Done** — `stepplus_geometry_step_bytes` (AP214/mm) is written by `doc_save` behind the same fully-ok gate and erase-first discipline as `cache.*`; covered by `core/tests/test_export_assembly.cpp` (part volume parity, assembly flattening, and the never-rebuilt omission). Still open: the §2 step-3 *reader* fallback (see §1.6).
 2. **PLM explode**: drop `cache.json`, `cache.aicm`, `cache.brep`, and large `studies/*/results.*` from shadow commits (recomputable).
 3. Single-home studies: stop dual-writing defs if both `document.studies` and `studies/*.json` diverge; document the winner (`document.json`).
 4. Tests: open v1 file, save, open; PLM checkpoint size does not include AICM.

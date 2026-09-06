@@ -1884,3 +1884,267 @@ bonded gap ties, so a legitimately bonded assembly still reports 0 while
 `connected_components` stays >1. A study with no fixtures at all now refuses here instead of
 reaching the solver's singular-matrix error; the MCP layer already rejected `fixtures=[]`
 upstream, so no caller depended on that path.
+
+## 2026-09-05 — the static solver stops paying for memory it never needed
+
+**Why.** A 200k-element tet10 study was refused at an estimated 12.5 GB (O-04/O-21), and
+`ctest tet10_thin_wall` (204600 tet10 elements) refused at "needs an estimated 23.2 GB but
+this machine's budget is 15.4 GB". Two causes, both in `core/sim/fea_static.cpp`: the
+assembly staged a triplet list of `(3*npe)^2 * 16` bytes PER ELEMENT — 14.4 KB for one tet10,
+held resident all the way through the factorization — and tet4 was pinned to Eigen SparseLU
+"for byte-identity with the Python parity oracle", a harness that no longer exists in the
+tree, whose fill on a bulky 3D solid dominated the tet4 curve.
+
+**What changed.** Assembly is triplet-free: every fixed node pins all three of its DOFs, so
+the reduced system is a 3x3-BLOCK pattern over free-node adjacency (`BlockPattern`), built
+once from the element cliques plus every bond tie and every contact CANDIDATE, then filled by
+scattering element matrices straight into the compressed value array — 4.1 KB/element
+measured on tet10. Element matrices are computed in parallel one bounded chunk (~32 MB) at a
+time and scattered SERIALLY in element order, so a solve is bit-reproducible whatever the
+core count; stress recovery got the same chunking (8192 elements) instead of one
+`ElemStress` per element for the whole mesh. Both element orders now share ONE factorization
+ladder — CHOLMOD supernodal LLT, then `SimplicialLDLT(AMD)`, then SparseLU only for a
+non-positive pivot — and the chosen one is reported: `FeaStaticResult::solver` becomes the
+`solver: <label>` note and `provenance.solver` = `chudware/fea_static [CholmodSupernodalLLT]`.
+Because the contact pattern is iteration-invariant, the active-set loop now pays for ONE
+symbolic analysis and each iteration is a numeric refactorization (an inactive pair holds the
+value 0.0). A process-wide gate serializes solves past 20000 free DOFs — the governor only
+GRADES a job, it never serialized one — and the queueing time is reported as
+`solve_wait_ms` / a `resources:` note. The factor cache now sizes entries from the factor
+itself and trims to the governor's LIVE budget on every lookup.
+
+**Measured** (100 mm box, `CHUDWARE_SIM_THREADS=2`, one process per point, peak RSS, before
+-> after): tet4 20250 el 0.78 s/0.203 GB -> 0.14 s/0.102 GB; tet4 93750 el 19.9 s/1.555 GB ->
+0.98 s/0.471 GB; tet10 20250 el 2.82 s/1.229 GB -> 2.68 s/0.989 GB; tet10 48000 and 93750 el
+did not fit a 3 GB slice at all before and now run at 2.79 GB and 6.72 GB. Displacement and
+von Mises agree to all 9 printed digits across every solver variant. The governor's measured
+calibration was re-fitted on the same element counts (`core/util/resource_governor.cpp`,
+`kSparseLU`/`kCholesky` -> `kTet4`/`kTet10`): tet4 is 5.4x-7.4x cheaper than the old table,
+tet10 1.35x-1.65x, and `tet10_thin_wall` now PASSES in 139 s.
+
+**Gotchas / deferred.** Do NOT re-order the ladder on the "LDLT is lighter than an LU" rule
+of thumb: it is true against SparseLU (tet4 93750 el: 36.5 s/0.60 GB vs 20.5 s/1.37 GB) and
+irrelevant next to the supernodal factorization (0.9 s/0.47 GB), and on tet10 a scalar
+simplicial Cholesky is 53x SLOWER and heavier (160.8 s/1.52 GB vs 3.0 s/0.99 GB). The
+measured table lives beside the ladder; `CHUDWARE_FEA_SOLVER=ldlt|lu|cholmod` reproduces it.
+`mesh_size_band.cpp`'s `kTetPackingFactor = 6.0` predicted `6*V/h^3`, but polymesh's graded
+counts on that box scale as `N = 1.44e6 * h^-1.51` (surface-driven: `N*h^3/V` runs 122 at
+h = 20 mm down to 9 at h = 3.5 mm), so the prediction is now
+`max(6.0*V/h^3, 105*A/h^2)` with A the bbox area and the coarsening inverted with sqrt or
+cbrt depending on which term binds — both constants are measured, re-measure rather than
+scale them. CHOLMOD's factor size is an ESTIMATE (Eigen exposes no accessor), which is only
+used for cache accounting. METIS is absent on this box, so CHOLMOD's `metis`/`nesdis`
+ordering requests fall back to AMD; installing METIS should improve the tet10 curve further.
+
+## `heal` grows an escalation ladder, a material budget, and a meshability guard (2026-09-05)
+
+**Why.** The recorded `heal` feature was ShapeFix and nothing else, and on the live CD-100
+Stage 5 frame spine (body 47, `bad_orientation_of_subshape`) ShapeFix provably does nothing:
+144 of its 344 edges are traversed the SAME way by both adjacent faces, and a five-point
+tolerance ladder (1e-7 … 0.1 mm) either changed zero bytes or, at 0.1 mm, invented three new
+defect kinds. **Files:** `core/doc/document.cpp` (helpers `heal_area`, `heal_bad_edge_count`,
+`heal_flood_orientation`, `heal_rebuild_solid`, `heal_narrowest_face`; the `heal` op),
+`core/tests/test_document.cpp` (new ladder TEST_CASE beside the existing one),
+`services/mcp/cad_eval_tools.py::heal_body`, `services/agent/tool_guidance/cad.py` (+
+regenerated `host/src/ui/tool_panel_tables.*`), `contracts/feature_params.md` (appended).
+
+**What it does now.** Four opt-in, recorded rungs after ShapeFix — `sew_tolerance_mm`,
+`fix_orientation` (flood-fill the face-orientation graph; reports `faces_flipped` and
+`conflicts`), `rebuild_solid` (BOPAlgo_MakerVolume from the faces; reports lumps, kept and
+discarded volume) with `rebuild_fuzzy_mm`, and `unify_faces`. `conflicts > 0` is the machine-
+checkable statement "no flag repair can fix this body", and it is what routes body 47 to the
+rebuild. Body 47: `heal_body(rebuild_solid=True, rebuild_fuzzy_mm=0.05)` → `IsValid()` true,
+26 faces, 966555.83 mm^3 (-0.124% of the orientation-consistent pre-heal reading), envelope
+unmoved to 18 microns on an 887 mm part, and it MESHES at h = 8 mm (48032 nodes, 190386 tets,
+one component, mesh/CAD volume error 0.0013).
+
+**Two things worth keeping in mind.** (1) The volume budget is judged on ORIENTATION-
+NORMALIZED volume: a signed integral over a shell whose faces disagree is not a volume (one
+reversed face on a 24000 mm^3 box reads 16000), so each side carrying an orientation defect is
+re-measured after flood-orienting a COPY, and the budget applies to that. The previous code
+simply skipped the volume check when the input reading was untrustworthy — i.e. it was unarmed
+for the exact class of body the op exists for; body 47's raw -0.93% drift was unguarded.
+(2) A BRep-valid rebuild can still be unusable. At OCCT's own intersection tolerance the
+rebuild gives every pair of near-coincident input faces its own intersection line, and body
+47's came out valid carrying two 0.011 mm crescent faces; polymesh then refused the whole fill
+at h=8 mm and again at 4.8 (its "reduce -h" advice is a mechanical halving — no element size
+resolves an 11 micron strip). `rebuild.narrowest_face_mm` is now reported and a face narrower
+than 1e-4 of the body's diagonal raises a warning naming `rebuild_fuzzy_mm`; the fuzzy value
+also widens the envelope-movement budget to 10x itself, since the caller authorized merging at
+that distance. **Deferred:** nothing removes a razor strip after the fact — `ShapeFix_
+FixSmallFace` deletes it but leaves the solid invalid, so prevention (fuzzy) is the only path.
+
+## A mechanism can hide inside a connected mesh, so the mesher now dissolves it (2026-09-05)
+
+**How it surfaced.** After the solver ladder moved tet4 off SparseLU onto the SPD ladder,
+CHOLMOD started printing "matrix not positive definite" on the real ME-490 WHEEL-RADIAL leg
+(316466 tet4, 203163 DOF). The reduced stiffness of a well-posed linear-elastic model is SPD
+by construction, so that verdict is a statement about the MODEL — but SparseLU pivots and
+never comments on definiteness, so the defect had been invisible, not absent. An independent
+triplet+SparseLU re-assembly of the same exported system (`study.export_system_path`)
+confirmed the assembly was innocent: symmetric to 1.86e-9, every diagonal positive, one
+connected component containing the fixture, zero unreferenced nodes — and lambda_max/lambda_min
+= 2.25e7 / 5.6e-27, condition number 4e33, with the soft mode localized on three nodes that
+each touched a single tet. That independent SparseLU returned max_disp 5.2e10 mm where the
+kernel's LDLT rung returned a believable 0.032 mm: on a singular system, the pivoting solver
+is the one that silently produces garbage.
+
+**What the defect is, and what it is not.** It is NOT "a node used by one element" — a tet
+apex nobody else uses is fully constrained by its own element (hold the other three corners
+and the apex can only move by straining it). That mesh has 51 such tips and 45 of them are
+ordinary; refusing on raw valence-1 would have blocked a healthy mesh. The defect is a
+FRAGMENT — elements glued to each other face-to-face — touching the rest of the mesh at two
+corners or fewer, which can rotate about that node or edge at zero strain energy. Every
+connectivity check passes, because the fragment genuinely does reach a fixture, through the
+one node it hangs from. Fragment-level is load-bearing: dissolving single hanging ELEMENTS
+cleared the exact rigid mode (lambda_min 5.6e-27 -> 1.1e-13) and left a two-element flap that
+was still singular in double precision.
+
+**What changed.** `detail::repair_lonely_nodes` (core/sim/mesh_quality.cpp) groups elements by
+shared face, computes each fragment's corners shared with the outside, and drops fragments at
+or below two; it iterates, because dropping one exposes the next. The mesher calls it after the
+tet10 fold repair and before `fill_quality`, so the reported metrics describe the mesh that
+will be solved. Node numbering is deliberately NOT compacted — the adaptive driver requires
+`disp_mm.size() == nodal.nodes.size()*3` — so the repair leaves unreferenced nodes behind, and
+`fea_static` eliminates those (their rows are exactly zero, nothing couples them, so it is
+exact); a LOAD on such a node REFUSES rather than being dropped. `mesh_quality` carries
+`lonely_nodes_repaired` / `lonely_nodes_remaining` / `hanging_elems_dropped` /
+`single_element_nodes`, and `lonely_nodes_remaining > 0` refuses the solve in the same class as
+an unfixtured component — a warning would only be as good as someone reading it. The solver
+still reports `conditioning_warning` (first line of `solver_notes`) when a strict Cholesky
+refuses a matrix anyway, since an inline mesh is counted but never edited.
+
+**The number this corrected.** WHEEL-RADIAL h=12 now solves on CholmodSupernodalLLT with no
+warning and an equilibrium residual of 6.2e-11, and `max_disp` falls from 0.0322016 mm to
+0.00313464 mm — a factor of 10.3 — while max von Mises is UNCHANGED at 1.294 MPa. That is the
+signature of the mechanism: the fragment contributed displacement at zero strain. Repair cost
+on that mesh: 34 elements, 22.577 mm^3 = 0.0023% of the 973763 mm^3 solid, 88 mechanism nodes
+cleared, 0 remaining, 70 unreferenced nodes eliminated by the solver. Any released packet
+quoting a WHEEL-RADIAL displacement (or a stiffness derived from one) must be re-run;
+stress-based numbers appear unaffected. Green after the change: sim, tet10, fea_contact,
+sim_cache, mesh_mechanism, governor, mesh, mesh_quality, tet10_thin_wall.
+
+**Gotchas / deferred.** The fragment rule treats "the fragment IS the whole mesh" as a domain,
+not a defect, so a single-element mesh still solves. Near-degenerate slivers that share three
+or more corners are NOT dropped — they are legitimate topology and only ill-conditioned, so
+they remain the conditioning warning's job. And the min tet volume on that repaired mesh is
+still 0.0057 mm^3 against a 2.005 mm^3 median, which is worth a separate look at the mesher's
+sliver production rather than at the solver.
+
+## 2026-09-05 — tet10 nodal stress recovery: Gauss-point extrapolation (StressRecovery)
+
+**What was wrong.** `core/sim/fea_static.cpp` recovered a tet10's stress by AVERAGING its 4
+Gauss-point tensors into one element constant and then scattering that constant to all 10
+nodes — the tet4 recipe applied to a quadratic element. A tet10's stress varies over the
+element, so this smoothed the field twice and clipped every gradient. It made tet10 read
+LOWER than tet4 at a stress concentration: on the V&V plate-with-a-hole, rim SCF 1.47 / 1.76
+/ 2.44 where CalculiX C3D10, handed the IDENTICAL mesh and loads, recovered 2.23 / 2.58 /
+3.44. tet4 already matched C3D4 exactly (1.6153 both), which is what localised the defect to
+the quadratic path.
+
+**Fix.** The 4 Gauss-point tensors are extrapolated to the corner nodes with the standard
+map for this rule — `corner_i = sqrt(5) * (g[GP_AT_CORNER[i]] - b*sum(g))`, derived beside
+`TetGauss4` — and each mid-edge node takes the mean of its two corners. That is exactly
+CalculiX's C3D10 recovery, and after it Chudware reproduces ccx's own nodal stress to the
+6-significant-digit floor of ccx's ASCII output on every plate-hole mesh: 2.22806/2.57926/
+3.44426/3.16604 against 2.2280/2.5792/3.4442/3.1660. The plate-hole tet10 SCF row now PASSES
+(3.08792 against Kirsch 3.00 / Howland 3.03, 2.9% / 1.9%) and its error against the
+finite-width reference falls at every refinement. tet4 and hex8 branches are untouched and
+bit-identical; `ElemStress` grew from one 7-tuple to one PER NODE, so the chunk size is now
+`(4 MiB)/sizeof(ElemStress)` instead of a fixed 8192 — the buffer stays bounded and the
+serial in-order scatter (thread-count independence) is unchanged.
+
+**Files.** `core/sim/fea_static.cpp` (recovery + the extrapolation constants),
+`core/tests/test_sim.cpp` (new case: tet10 extreme-fibre nodal sigma_xx = M c/I; reads 301.4
+against 300, where the element-constant recovery read 247.7), `scripts/vv_fea_crosscheck.py`
+(the two PLATE-HOLE corroborated findings re-scoped and re-measured), `docs/vv/FEA_VV_REPORT.md`
++ `docs/vv/fea_vv_results.json` (PLATE-HOLE re-run spliced in; `reruns` records exactly what
+was replaced).
+
+**Gotchas / deferred.** Only PLATE-HOLE was re-run, so a tet10 nodal-STRESS column elsewhere
+in that report (Tier-2 `peak vM Chudware`, Tier 2b) still reflects the old recovery and will
+move UP on the next `--all` — expected movement, not a regression; displacements and reactions
+do not move at all. The re-run's finest tet10 leg is a different mesh from the old run's
+(81928 vs 73072 elements) because the memory envelope differed (`CHUDWARE_MEM_FRAC` 0.30 then
+0.50) and the old leg was governor-coarsened; the identical-mesh before/after/ccx triple for
+that leg was measured separately and is in the report. Mid-edge nodes are recovered as the
+mean of their corners (ccx's choice); a genuinely quadratic mid-edge recovery would need the
+element's full quadratic stress field and is not what the reference code does.
+
+## An element-size budget may not coarsen a mesh into debris (2026-09-05)
+
+**How it surfaced.** `ctest mesher_advanced`'s hole-array bracket (100 x 50 x 52 mm bbox over
+a 12 mm base plate with four Ø8 bores plus a 12 mm upstand) started failing at
+`check_static_ok`: `fea_static: mesh has 6 connected component(s) with no fixture`, with
+`connected_components 7, aspect_max 4063, jacobian_min 1.9e-4` and the note "auto-coarsened
+for interactivity: estimated 174k elements exceeds 31k budget". The new element-count model
+(`max(6·V/h³, 105·A/h²)`) predicted 174k elements at the honest h = 3.93 mm where polymesh
+actually delivers **21,764** — a 8.0x over-estimate on a plate-like part — and the geometry
+floor could not catch it because the floor is four elements across the smallest BBOX SIDE,
+which on this part is 50 mm (floor 12.5 mm, inert) while the governing section is the 12 mm
+plate. The hanging-fragment dissolve was innocent: `hanging_elems_dropped == 0` on that mesh.
+
+**What the coarsening actually bought.** Nothing, measured: h = 9.25 mm → 27,690 elements in
+7 components (aspect_max 4063); h = 6.00 mm → 76,562 in 38 components; h = 4.66 → 94,322 in
+1; the honest h = 3.93 → 21,764 in 1 (aspect_max 36.8). A fill asked for an element size its
+features cannot accept spends its budget on feature seeds instead ("232 feature, 240 seed" in
+polymesh's own note), so coarsening past the governing section is both more expensive and not
+a mesh. And polymesh SAYS SO: at 9.25 mm it refused with "feature unresolved at h=9.254", and
+it was Chudware's own recovery ladder that forced the size through by switching the
+feature-refinement pass on, producing the shredded mesh.
+
+**What changed.** `SizeBand::geometry_base` (`core/sim/mesh_size_band.{h,cpp}`) now records the
+size the geometry and the study's own controls asked for, before either element-count budget
+touched it. In `core/sim/mesher.cpp` the fill + recovery ladder became
+`fill_with_recovery(loaded, options, h_start, out)` so it can be re-run from a different
+starting size, and it grew a new FIRST recovery rung: when polymesh refuses the
+budget-coarsened size as unresolvable, the coarsening is WITHDRAWN (re-fill at
+`geometry_base`) before spending a feature-refinement pass on a size the fill already
+rejected. `mesh_loaded_model` is now a wrapper that also verifies the RESULT: a mesh that came
+back in more connected components than the shape has solids, on a study whose band was
+coarsened, is rebuilt once at `geometry_base` and the rebuild kept only if it is no more
+fragmented. Bracket: mesh 16.3 s / 21,764 elements / 1 component, mesh+solve 34.2 s against
+the test's 90 s ceiling (it was 50.7 s before the regression, 81.4 s with the verify-only
+version of this fix, and the solve now reads max_disp 0.001977 mm, max vM 41.2 MPa, FoS 6.07).
+
+**The dissolve got a guard of its own** (`core/sim/mesh_quality.cpp`): `repair_lonely_nodes`
+refuses a repair that would leave the mesh EMPTY or in more element-bearing components than it
+had, restoring the element list byte-for-byte and leaving `lonely_nodes_remaining > 0` so the
+solve refuses NAMING the mechanism. The empty case is reachable with real geometry — two
+bodies fused at a single NODE are two face-connected fragments, each hanging off the other by
+exactly one corner, and the "the fragment IS the mesh" carve-out spares neither, so the
+unguarded rule deleted the whole mesh. Pinned by `test_mesh_quality.cpp`'s "the
+hanging-fragment dissolve refuses to delete the whole mesh" (7/7 assertions fail without the
+guard). `element_component_count` counts components over element-REFERENCED nodes only,
+because the repair deliberately leaves unreferenced nodes behind.
+
+**Gotchas / deferred.** A geometry probe was tried FIRST and rejected on evidence: the
+smallest opposed-planar section reads 12 mm on the bracket (correct) but 1.6 mm on the fin25
+sensor board — its FR4 core, whose opposed 50 x 40 faces are both real — so a section-based
+floor of 0.4 mm sits below that study's 0.5 mm base size, withdraws the 0.5 → 0.65 mm
+coarsening the board depends on, and polymesh then refuses the fill outright ("mesh element
+ceiling 589824 exceeded"). A laminate layer cannot be told from a load-bearing web by geometry
+alone, which is why the coarsening is verified on the result instead. The element-count
+constants themselves are still fitted on a 100 mm box (`N·h²/A` measured 13-18 on these
+plate-like parts against the model's 105) — a real recalibration is a measurement campaign,
+not a scale factor. Green after the change: mesher_advanced (47.7 s), mesh, mesh_quality,
+mesh_mechanism, thermal, sim, tet10_thin_wall (126 s), and the fin25 golden demo run the
+gate's way (12 pass / 0 fail, board max 134.9014 °C — bit-identical to before).
+
+**Follow-up the same day: the rigid-body gate had to learn the same thing.**
+`fea_run.cpp`'s mechanism gate counted EVERY node in `points`, so the nodes the dissolve
+deliberately leaves unreferenced (node numbering stays 1:1 with the polymesh mesh the adaptive
+route refines through) each read as their own "connected component with no fixture" — up to
+ten per dissolved tet10 — and any mesh the repair touched was refused instead of solved, even
+though `fea_static` already eliminates those rows exactly (`fea_static.cpp` ~1340, zero rows,
+and a LOAD on one still refuses). There is now ONE `referenced` mask, built right after the
+component union-find, used by both `mesh_quality.connected_components` and the floating-
+component gate, plus a `solver_notes` line naming how many nodes were excluded. Bond and
+contact springs cannot rescue such a node — both are built from the mesh's own boundary faces,
+so every endpoint is an element node by construction. Pinned by `test_mesh_mechanism.cpp`'s
+"nodes left behind by mesh repair are not unfixtured components" (a 6-tet inline cube plus two
+unreferenced nodes): pre-fix it refuses with "mesh has 2 connected component(s) with no
+fixture" and `connected_components 3`; post-fix it solves at 1 / 0. That case does NOT assert
+`max_von_mises_mpa` — on a 6-tet cube every node touches the fixture ring the stress summary
+excludes, so the reported peak is legitimately 0. Green: mesh_mechanism, fea_contact, sim,
+mesh_quality.

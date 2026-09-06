@@ -19,6 +19,13 @@ struct SizeBand {
     std::string note;   // governor / interactivity coarsening message, if any
     double fineness = 0.5;
     double base = 0.0;      // target element size, mm
+    // The size the geometry and the study's own controls asked for, BEFORE the
+    // interactivity/memory element-count budget coarsened it (== base when
+    // nothing was coarsened). The mesher re-meshes here when a coarsened fill
+    // comes back in more connected components than the shape has solids: the
+    // element-count prediction over-estimates by 6-9x on plate-like parts, and
+    // a coarsening it justifies can fragment the mesh instead of cheapening it.
+    double geometry_base = 0.0;
     double min_len = 0.0;   // size-band floor, mm
     double max_len = 0.0;   // size-band ceiling, mm
     double diag = 0.0;      // bounding-box diagonal, mm

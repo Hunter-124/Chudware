@@ -47,9 +47,16 @@ run_fea_buckling(fixtures, load, material, n_modes) — linear (eigenvalue) BUCK
   Returns the critical load factors λ (applied load × λ = Pcr); λ<1 buckles below the load.
   Box-proxy Euler-column estimate for slender members. ccx subprocess; absent ⇒ {skipped:true}.
 
-run_fea_contact(pressure_mpa, material) — nonlinear large-deflection CONTACT FEA via CalculiX
-  (*STATIC,NLGEOM + *CONTACT PAIR). Two-block proxy demonstrating load transfer across a touching
-  interface (press/snap-fits). ccx subprocess; absent ⇒ {skipped:true}.
+run_fea_contact(fixtures, load, material, max_gap_mm, max_iterations, mesh_size_mm,
+  mesh_order) — FRICTIONLESS UNILATERAL CONTACT FEA on the document's own meshed bodies.
+  Surface pairs facing across <=max_gap_mm carry compression only; an active-set loop opens
+  and closes them until the set settles. For slip-fit pins, bolted/shimmed stacks, seated
+  parts. Returns the run_fea_static envelope plus "contact"
+  {candidate_pairs, active_pairs, contact_iterations, converged, held_by_contact_only,
+  pairs:[{bodies, contact_force_n, force_vector_n, max_contact_pressure_mpa, ...}]}.
+  No friction, no large sliding, no preload (apply the clamp force as a face load). A load
+  that pulls the parts apart is refused as a mechanism. In-house engine, no ccx. Bonded
+  (tension-carrying) joints: run_fea_static with study bond_gap_mm — mutually exclusive.
 
 run_fea_frequency_response(fixtures, excitation_dir, sweep_hz, zeta, base_accel_g,
   psd_breakpoints, vibration_spec, ...) — harmonic + random vibration response (T-BL17).

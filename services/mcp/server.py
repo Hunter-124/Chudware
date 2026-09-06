@@ -295,6 +295,9 @@ from services.mcp.cad_drawing_tools import register_cad_drawing_tools
 register_cad_doc_tools(_reg.view(mcp, "cad"))
 register_cad_eval_tools(_reg.view(mcp, "cad"))
 register_cad_render_tools(_reg.view(mcp, "cad"))
+# render_animation (turntable/explode/motion/fea films) — the render family's moving half;
+# same engine render helpers, same save-path containment, so it registers beside it.
+from services.mcp.cad_animation_tools import register_cad_animation_tools; register_cad_animation_tools(_reg.view(mcp, "cad"))
 register_cad_exchange_tools(_reg.view(mcp, "cad"))
 register_cad_sim_tools(_reg.view(mcp, "sim"))
 # Release-evidence packets (sim_evidence_packet) + the independent Polyhedral-FEA CLI

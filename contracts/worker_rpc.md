@@ -864,3 +864,25 @@ from `eval_interference` at a chosen pose. The top-level `interference` block is
 `first_collision_step`, `first_collision_value` and the full first-collision `detail` still
 describe the FIRST offending sample, so a caller that only wants the first hit is unaffected
 while a swept-clearance proof can now cite every step.
+## 22. Static summary reduction disclosure — `sim_run_static` (append-only, 2026-09-05)
+
+`summary.max_von_mises_mpa` / `summary.min_fos` are reduced over the node-averaged von Mises
+field with nodes inside a two-element ring around every fixed node EXCLUDED (the fixture
+singularity mask that has always applied). That decision is now disclosed: `summary` gains
+`max_von_mises_reduction` (the literal rule), `max_von_mises_raw_mpa` and `min_fos_raw` (the
+unmasked extrema), `summary_nodes_total`, `summary_nodes_excluded`, `reduction_masked_keys[]`
+and `reduction_unmasked_keys[]`. The reply carries a top-level `summary_node:[…]` per-node 1/0
+mask (length `n_nodes`), and the `.vtu` written for `study.vtu_path` carries the same mask as a
+`summary_node` point-data array beside the unmasked `von_mises` array, so a viewer and the
+packet agree by construction. When masked and raw peaks differ by more than 25 % a plain-language
+entry is appended to `warnings`. `run_fea_convergence` rows pass the same fields through.
+`sim_cache` schema bumps `/3 -> /4`; a `/3` entry reported the masked peak without disclosure.
+
+## 23. Load sign convention — `sim_run_static` study loads (append-only, 2026-09-05)
+
+A `pressure` load of magnitude `p` (MPa) is deposited work-consistently along the INWARD face
+normal: `+p` pushes into the face (internal pressure on a bore), `-p` pulls outward (external
+pressurisation / suction). Force loads are vectors in the global frame and carry no implied
+sign. Before this date the engine deposited `+p` along the OUTWARD normal, contradicting every
+tool docstring; the fix is in the engine and is pinned by ctest `fatigue` ("pressure load acts
+along the INWARD face normal"). `sim_run_adaptive` and `sim_run_fatigue` share the deposit.

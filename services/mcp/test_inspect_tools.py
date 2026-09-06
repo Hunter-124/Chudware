@@ -6,6 +6,7 @@ Run:  python3 -m pytest services/mcp/test_inspect_tools.py -q
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import os
@@ -888,3 +889,278 @@ class TestGuideMentions:
         assert "VERIFY LOOP" in desc
         assert "render_part" in desc or "render_views" in desc
 
+
+# --------------------------------------------------------------------------- save_path + study setup (O-16)
+
+
+def _box_faces():
+    """A 40x30x20 box's top, bottom and back faces, in doc_query enumeration order."""
+    top = {"kind": "face", "surf": "plane", "side": "top", "sid": "Ftop",
+           "centroid": [0.0, 0.0, 10.0], "normal": [0.0, 0.0, 1.0],
+           "axis": [0.0, 0.0, 1.0], "area_or_len": 1200.0, "radius": None}
+    bot = {"kind": "face", "surf": "plane", "side": "bottom", "sid": "Fbot",
+           "centroid": [0.0, 0.0, -10.0], "normal": [0.0, 0.0, -1.0],
+           "axis": [0.0, 0.0, -1.0], "area_or_len": 1200.0, "radius": None}
+    back = {"kind": "face", "surf": "plane", "side": "back", "sid": "Fback",
+            "centroid": [0.0, 15.0, 0.0], "normal": [0.0, 1.0, 0.0],
+            "axis": [0.0, 1.0, 0.0], "area_or_len": 800.0, "radius": None}
+    return top, bot, back
+
+
+def _box_mesh():
+    """A synthetic 40x30x20 box tessellation shaped like _doc_mesh's return value.
+
+    face_id 1/2/3 are the +Z (top), -Z (bottom) and +Y (back) faces, matching the
+    doc_query enumeration the fakes below serve, so sid -> topo -> mesh face joins the
+    same way it does against a live engine. Outward winding (back-faces are culled)."""
+    import numpy as np
+    x, y, z = 20.0, 15.0, 10.0
+    v = np.asarray([
+        [-x, -y, -z], [x, -y, -z], [x, y, -z], [-x, y, -z],
+        [-x, -y, z], [x, -y, z], [x, y, z], [-x, y, z],
+    ], dtype=np.float64)
+    quads = [
+        (1, [4, 5, 6, 7]),   # +Z top
+        (2, [0, 3, 2, 1]),   # -Z bottom
+        (3, [2, 3, 7, 6]),   # +Y back
+        (4, [0, 1, 5, 4]),   # -Y front
+        (5, [1, 2, 6, 5]),   # +X right
+        (6, [3, 0, 4, 7]),   # -X left
+    ]
+    tris, faces = [], []
+    for face_id, q in quads:
+        faces.append({"body": 1, "face_id": face_id, "first_tri": len(tris),
+                      "tri_count": 2, "surf_type": 0})
+        tris.append([q[0], q[1], q[2]])
+        tris.append([q[0], q[2], q[3]])
+    idx = np.asarray(tris, dtype=np.int64)
+    tri_face = np.full(idx.shape[0], -1, dtype=np.int32)
+    for fi, fr in enumerate(faces):
+        tri_face[fr["first_tri"]:fr["first_tri"] + fr["tri_count"]] = fi
+    return {"pos": v, "idx": idx, "tri_face": tri_face, "faces": faces,
+            "edges": [], "last_body": 1}
+
+
+class TestRenderSavePath:
+    """save_path writes the figure the model is looking at — the same bytes, at a path a
+    report can reference (O-16)."""
+
+    def _seams(self, monkeypatch, tmp_path):
+        calls: list[tuple[str, dict]] = []
+        top, bot, _back = _box_faces()
+
+        def fake_call(method, params):
+            calls.append((method, params))
+            if method == "doc_query":
+                return {"matches": [top, bot]}
+            if method == "doc_bbox":
+                return {"min": [-20, -15, -10], "max": [20, 15, 10],
+                        "center": [0, 0, 0], "size": [40, 30, 20]}
+            if method == "doc_face_points":
+                c = (params.get("selector") or {}).get("centroid") or [0, 0, 0]
+                return {"points": [[c[0] - 5, c[1] - 5, c[2]], [c[0] + 5, c[1] - 5, c[2]],
+                                   [c[0] - 5, c[1] + 5, c[2]], [c[0] + 5, c[1] + 5, c[2]]]}
+            if method in ("doc_render_view", "doc_render_png"):
+                _fake_png(params["out_path"])
+                return {"ok": True, "path": params["out_path"]}
+            if method == "doc_tree":
+                return {"owner_map": {}, "tree": {"features": [
+                    {"id": "f1", "name": "Box", "type": "box"}]}}
+            raise AssertionError(f"unexpected method {method}")
+
+        monkeypatch.setattr(ct.cb, "call", fake_call)
+        monkeypatch.setattr(ct_render, "_doc", lambda doc_id=None: doc_id or "doc-test")
+        monkeypatch.setenv("CHUDWARE_PROJECT_SAVE_DIR", str(tmp_path))
+        monkeypatch.delenv("CHUDWARE_RENDER_SAVE_ANYWHERE", raising=False)
+        return calls
+
+    def _tool(self, name):
+        from mcp.server.fastmcp import FastMCP
+        mcp = FastMCP("test-render-save")
+        ct.register_cad_tools(mcp)
+        mgr = getattr(mcp, "_tool_manager", None)
+        tools = getattr(mgr, "_tools", {}) if mgr else {}
+        assert name in tools, f"{name} not registered; tools={sorted(tools)}"
+        return tools[name].fn
+
+    def test_render_part_save_path_writes_the_inline_png(self, monkeypatch, tmp_path):
+        self._seams(monkeypatch, tmp_path)
+        out = tmp_path / "figures" / "iso.png"
+        img, caption = self._tool("render_part")(doc_id="doc-test", save_path=str(out))
+        assert out.exists(), "save_path did not write the file"
+        from PIL import Image as PILImage
+        with PILImage.open(out) as im:
+            assert im.format == "PNG" and im.size[0] > 0
+        inline = getattr(img, "path", img)
+        saved = out.read_bytes()
+        assert saved == open(inline, "rb").read(), (
+            "the saved file must be the inline image byte-for-byte")
+        assert f"saved: {out}" in caption
+        assert f"({len(saved)} B, sha256 " in caption
+        assert hashlib.sha256(saved).hexdigest()[:12] in caption
+
+    def test_save_path_must_be_absolute_and_inside_the_project(self, monkeypatch, tmp_path):
+        self._seams(monkeypatch, tmp_path)
+        render_part = self._tool("render_part")
+        with pytest.raises(ValueError, match="ABSOLUTE"):
+            render_part(doc_id="doc-test", save_path="figures/iso.png")
+        outside = tmp_path.parent / "elsewhere" / "iso.png"
+        with pytest.raises(ValueError, match="outside this session's project"):
+            render_part(doc_id="doc-test", save_path=str(outside))
+        # The traversal spelling of the same destination is refused too (the containment
+        # test runs on the canonicalised path, not the string).
+        with pytest.raises(ValueError, match="outside this session's project"):
+            render_part(doc_id="doc-test",
+                        save_path=str(tmp_path / ".." / "elsewhere" / "iso.png"))
+        monkeypatch.setenv("CHUDWARE_RENDER_SAVE_ANYWHERE", "1")
+        _img, caption = render_part(doc_id="doc-test", save_path=str(outside))
+        assert outside.exists() and f"saved: {outside}" in caption
+
+    def test_render_views_and_contact_sheet_save_the_finished_sheet(
+            self, monkeypatch, tmp_path):
+        self._seams(monkeypatch, tmp_path)
+        for tool, name in (("render_views", "views.png"), ("contact_sheet", "sheet.png")):
+            out = tmp_path / name
+            img, caption = self._tool(tool)(doc_id="doc-test", save_path=str(out))
+            assert out.exists(), f"{tool} ignored save_path"
+            assert out.read_bytes() == open(getattr(img, "path", img), "rb").read()
+            assert f"saved: {out}" in caption
+
+
+class TestRenderStudySetup:
+    """The FIXTURE/LOAD figure: the faces the solver would use, in two reserved colours,
+    with a legend a report can quote (O-16)."""
+
+    def _seams(self, monkeypatch, tmp_path):
+        calls: list[tuple[str, dict]] = []
+        top, bot, back = _box_faces()
+
+        def fake_call(method, params):
+            calls.append((method, params))
+            if method == "doc_query":
+                q = json.dumps(params.get("query") or {})
+                if (params.get("query") or {}).get("of") == "edge":
+                    return {"matches": []}
+                if "bottom" in q:
+                    return {"matches": [bot]}
+                if "top" in q:
+                    return {"matches": [top]}
+                if "back" in q:
+                    return {"matches": [back]}
+                return {"matches": [top, bot, back]}
+            if method == "doc_bbox":
+                return {"min": [-20, -15, -10], "max": [20, 15, 10],
+                        "center": [0, 0, 0], "size": [40, 30, 20]}
+            if method == "doc_face_points":
+                sel = params.get("selector") or {}
+                c = sel.get("centroid") or [0, 0, 0]
+                n = sel.get("normal") or [0, 0, 1]
+                # Sample IN the face plane: the two axes the normal does not own.
+                ax = [i for i in range(3) if abs(n[i]) < 0.5] or [0, 1]
+                pts = []
+                for du in (-5.0, 5.0):
+                    for dv in (-5.0, 5.0):
+                        p = list(c)
+                        p[ax[0]] += du
+                        p[ax[1]] += dv
+                        pts.append(p)
+                return {"points": pts, "tol_mm": 1.0, "face_normal": n}
+            if method == "asm_world_bodies":
+                return {"bodies": [{"bbox": {"min": [-20, -15, -10],
+                                             "max": [20, 15, 10]}}]}
+            if method == "doc_render_view":
+                _fake_png(params["out_path"])
+                return {"ok": True, "path": params["out_path"]}
+            if method == "doc_tree":
+                return {"owner_map": {}, "tree": {"features": [
+                    {"id": "f1", "name": "Box", "type": "box"}]}}
+            raise AssertionError(f"unexpected method {method}")
+
+        monkeypatch.setattr(ct.cb, "call", fake_call)
+        monkeypatch.setattr(ct_render, "_doc", lambda doc_id=None: doc_id or "doc-test")
+        # The tessellation is the engine's; the overlay only needs its shape.
+        monkeypatch.setattr(cc, "_doc_mesh", lambda doc_id: _box_mesh())
+        monkeypatch.setenv("CHUDWARE_PROJECT_SAVE_DIR", str(tmp_path))
+        monkeypatch.delenv("CHUDWARE_RENDER_SAVE_ANYWHERE", raising=False)
+        return calls
+
+    def _tool(self):
+        from mcp.server.fastmcp import FastMCP
+        mcp = FastMCP("test-study-setup")
+        ct.register_cad_tools(mcp)
+        tools = getattr(getattr(mcp, "_tool_manager", None), "_tools", {})
+        assert "render_study_setup" in tools, sorted(tools)
+        return tools["render_study_setup"].fn
+
+    def test_fixture_and_load_get_distinct_reserved_colours(self, monkeypatch, tmp_path):
+        """Fixture on the back face, load on the top: one camera sees both, and the two
+        groups must land on their OWN reserved colour."""
+        self._seams(monkeypatch, tmp_path)
+        out = tmp_path / "study-setup.png"
+        img, caption = self._tool()(
+            fixtures=["back"], load=[{"face": "top", "force": [0, 0, -500]}],
+            view="iso", doc_id="doc-test", save_path=str(out))
+
+        # Legend: both groups, their colours, their faces + areas, and the resultant.
+        assert "FIXTURE (magenta): Fback 800 mm2" in caption
+        assert "LOAD (violet): resultant 500 N" in caption
+        assert "[0.000, 0.000, -1.000]" in caption          # direction of the resultant
+        assert "Ftop 1200 mm2" in caption
+        assert ct_render._FIXTURE_COLOUR != ct_render._LOAD_COLOUR
+
+        # And the pixels agree: the fixture face is painted magenta (r > b > g), the load
+        # face violet (b > r > g). A regression that gave both groups one palette slot
+        # (or misordered the per-match entries) leaves one of these classes empty.
+        from PIL import Image as PILImage
+        with PILImage.open(getattr(img, "path", img)) as im:
+            colours = {c for _n, c in im.convert("RGB").getcolors(maxcolors=1 << 20)}
+        saturated = [c for c in colours if max(c) - min(c) > 80]
+        magenta = [c for c in saturated if c[0] > c[2] > c[1]]
+        violet = [c for c in saturated if c[2] > c[0] > c[1]]
+        assert magenta, f"no fixture-coloured pixels among {sorted(saturated)}"
+        assert violet, f"no load-coloured pixels among {sorted(saturated)}"
+        assert not set(magenta) & set(violet)
+        assert "Visible from this camera: Fback, Ftop" in caption
+
+        # Saved on request, byte-identical to the inline figure.
+        assert out.exists()
+        assert out.read_bytes() == open(getattr(img, "path", img), "rb").read()
+        assert f"saved: {out}" in caption
+
+    def test_a_bc_face_the_camera_cannot_see_is_reported_not_claimed(
+            self, monkeypatch, tmp_path):
+        """The canonical study — load on top, fixture on the bottom — has no single camera
+        that sees both. The caption must still name the fixture AND say it is not in
+        frame, because a reader who only sees the load face would otherwise assume it."""
+        self._seams(monkeypatch, tmp_path)
+        _img, caption = self._tool()(
+            fixtures=["bottom"], load=[{"face": "top", "force": [0, 0, -500]}],
+            view="iso", doc_id="doc-test")
+        assert "FIXTURE (magenta): Fbot 1200 mm2" in caption
+        assert "Visible from this camera: Ftop." in caption
+        assert "NOT visible from here: Fbot" in caption
+
+    def test_pressure_load_reports_the_derived_resultant(self, monkeypatch, tmp_path):
+        self._seams(monkeypatch, tmp_path)
+        _img, caption = self._tool()(
+            fixtures=["back"], load={"face": "top", "pressure": 0.5},
+            view="iso", doc_id="doc-test")
+        # 0.5 MPa over the 1200 mm2 top face = 600 N inward (-Z), stated as a number.
+        assert "pressure 0.5 MPa over 1200 mm2 = 600 N inward" in caption
+        assert "resultant 600 N" in caption
+        assert "[0.000, 0.000, -1.000]" in caption
+
+    def test_a_load_on_the_fixed_face_is_refused_like_the_solver_refuses_it(
+            self, monkeypatch, tmp_path):
+        self._seams(monkeypatch, tmp_path)
+        with pytest.raises(ValueError, match="entirely on a fully fixed face"):
+            self._tool()(fixtures=["top"],
+                         load=[{"face": "top", "force": [0, 0, -500]}],
+                         doc_id="doc-test")
+
+    def test_a_zero_load_is_refused_like_the_solver_refuses_it(self, monkeypatch, tmp_path):
+        self._seams(monkeypatch, tmp_path)
+        with pytest.raises(ValueError, match="no non-zero load"):
+            self._tool()(fixtures=["back"],
+                         load=[{"face": "top", "force": [0, 0, 0]}],
+                         doc_id="doc-test")

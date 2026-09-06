@@ -22,9 +22,11 @@ ENTRIES: dict[str, dict[str, Any]] = {
             "the COUNTS AND SIDS that justify it (free edges, non-manifold "
             "edges, shells, solids, sliver faces, orientation). Run it "
             "before an expensive FEA mesh, a CAM toolpath or a STEP/STL "
-            "export. `self_intersection` is always checked:false — the "
-            "kernel has no single-body test; use check_interference "
-            "instead. `volume_mm3` is null for a body with no solid. "
+            "export. `self_intersection` is a REAL kernel check now "
+            "(BOPAlgo_CheckerSI, 20 s per-body budget): a body it flags is "
+            "NOT sound; checked:false + a reason means it could not run. "
+            "Body-vs-body overlap is still check_interference. "
+            "`volume_mm3` is null for a body with no solid. "
             "repair/fill_holes/fix_normals/fix_winding are REFUSED here: for "
             "a body YOUR features made, fix the feature using the sids it "
             "just listed; for an IMPORTED body that arrived broken, call "
@@ -36,13 +38,23 @@ ENTRIES: dict[str, dict[str, Any]] = {
             "The repair check_geometry_health refuses — use it ONLY on a body "
             "that arrived broken from an import (bad_orientation_of_subshape, "
             "not_closed, free_edge, negative volume). It appends a RECORDED "
-            "`heal` feature (OCCT ShapeFix), so never 'repair' geometry with a "
-            "BREP/STL round-trip or a self-boolean instead. `target` is a "
-            "feature id/name or a 1-based body number; omit for a single-body "
-            "part. Read `fixes` and `remaining_issues` — a partial repair says "
-            "so, and raising tolerance_mm (0.01-0.1) is the retry. A defect your "
-            "OWN features caused must be fixed at the feature; healing over it "
-            "returns on the next parameter edit."
+            "`heal` feature, so never 'repair' geometry with a BREP/STL "
+            "round-trip or a self-boolean instead. `target` is a feature "
+            "id/name or a 1-based body number; omit for a single-body part. "
+            "A bare call runs ShapeFix and clears most imports; when it does "
+            "not, climb ONE rung per call and read the evidence: "
+            "sew_tolerance_mm (stored edge sharing is wrong), then "
+            "fix_orientation:true (flag-only, keeps every surface exactly), "
+            "then rebuild_solid:true (+unify_faces) which is REQUIRED when the "
+            "returned orientation.conflicts > 0 — that graph is self-"
+            "contradictory and no flag repair can satisfy it. Raise "
+            "tolerance_mm at most one decade at a time; above the part's real "
+            "feature size it merges geometry and gets REFUSED. A heal that "
+            "would cost more than max_volume_change_pct (0.5%) of the "
+            "material FAILS and leaves the body untouched — read "
+            "material_change_pct and bad_edges_before/after, not just `fixed`. "
+            "A defect your OWN features caused must be fixed at the feature; "
+            "healing over it returns on the next parameter edit."
         ),
     },
     "design_audit": {
@@ -609,6 +621,18 @@ ENTRIES: dict[str, dict[str, Any]] = {
             "re-applies your edit_ops_json to the ORIGINAL broken document."
         ),
     },
+    "render_animation": {
+        "prompt_note": (
+            "The moving deliverable — a .gif/.mp4 a review PLAYS, not a still: "
+            "kind='turntable' orbits a part, 'explode' flies an assembly's components "
+            "apart (factor), 'motion' films simulate_motion's OWN solved mate sweep "
+            "(mate_id/start/stop) with collision samples marked, 'fea' warps a solved "
+            "vtu_path by field. save_path is a REQUIRED absolute .gif/.mp4 in the project; "
+            "frames/fps set duration and frames_dir collects the PNG sequence for a "
+            "multi-segment film. Needs ffmpeg; a single still is still render_part."
+        ),
+        "timeout_s": 900,
+    },
     "render_document": {
         "prompt_note": (
             "Previews a saved artifact (pptx/docx/xlsx/pdf/…); office formats need "
@@ -626,6 +650,17 @@ ENTRIES: dict[str, dict[str, Any]] = {
         "prompt_note": (
             "Renders the SOLID context + sketch health caption — there is no isolated "
             "flat view; the sketch entities themselves → sketch_preview_text."
+        ),
+    },
+    "render_study_setup": {
+        "prompt_note": (
+            "The fixture/load FIGURE an FEA report needs beside its stress plot: fixtures "
+            "painted magenta, load faces violet, rest desaturated. fixtures/load are "
+            "EXACTLY run_fea_static's dialect and are resolved by the same gates, so pass "
+            "the identical arguments and draw this BEFORE the solve — a refusal here is "
+            "the setup error the solver would have raised. Omit view to let the occlusion "
+            "scorer pick the camera that sees the most of those faces; save_path also "
+            "writes the embeddable PNG."
         ),
     },
     "render_views": {

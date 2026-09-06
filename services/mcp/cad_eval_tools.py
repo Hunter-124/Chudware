@@ -1845,6 +1845,18 @@ def register_cad_eval_tools(mcp: FastMCP) -> None:
                         "BRepCheck reports the B-rep itself as INVALID (bad geometry/topology "
                         "on some sub-shape) — run check_geometry (eval_check) for the "
                         "per-status list.")
+                selfint = b.get("self_intersection") or {}
+                if selfint.get("self_intersecting"):
+                    findings.append(
+                        f"the body SELF-INTERSECTS — {selfint.get('interference_count')} "
+                        f"interference(s) "
+                        f"({', '.join(selfint.get('kinds') or []) or 'unclassified'}) found by "
+                        f"the kernel's self-intersection check. Its own skin passes through "
+                        f"itself, so volume/mass, meshing and every boolean against this body "
+                        f"are wrong even where the topology looks closed. Fix the feature "
+                        f"whose profile or path folds back on itself: a sweep round too tight "
+                        f"a corner, a thicken/offset larger than a local radius, a loft that "
+                        f"twists, or panels knit together that cross each other.")
                 if b.get("volume_mm3") is None:
                     findings.append(
                         f"volume was NOT computed — {b.get('volume_reason')}. Any mass, CG or "
@@ -1916,8 +1928,9 @@ def register_cad_eval_tools(mcp: FastMCP) -> None:
                         "them, then edit (add_features op=edit_feature) or delete the "
                         "feature responsible and re-run this check. The ONE exception is a "
                         "body that arrived broken from an IMPORT (no feature of yours "
-                        "authored it): heal_body(doc_id) records an OCCT ShapeFix repair as "
-                        "a feature and reports what it cleared.")}
+                        "authored it): heal_body(doc_id) records the repair as a feature, "
+                        "escalating from ShapeFix through re-sewing, orientation repair and "
+                        "a face-based solid rebuild, and reports what it cleared.")}
 
             heads = []
             if asked_repair:
@@ -1967,10 +1980,16 @@ def register_cad_eval_tools(mcp: FastMCP) -> None:
                                        reason when the body has no shell to orient)
           brep_valid                   BRepCheck_Analyzer verdict
           volume_mm3 / volume_positive a zero or NEGATIVE volume is the inverted-solid tell
-          self_intersection            ALWAYS {checked:false, reason} — this kernel exposes no
-                                       single-body self-intersection test. A watertight verdict
-                                       is topological and does NOT clear a body of self-
-                                       intersection. Use check_interference for body-vs-body.
+          self_intersection            {checked, self_intersecting, interference_count, kinds,
+                                       elapsed_ms} — a REAL kernel self-intersection run
+                                       (BOPAlgo_CheckerSI, level 9) under a 20 s per-body
+                                       budget. A body it flags is NOT sound: its skin passes
+                                       through itself, so mass, meshing and booleans are all
+                                       wrong however closed the topology looks. If the check
+                                       could not run (budget exceeded, OCCT failure) it
+                                       reports checked:false + reason and lands in
+                                       not_checked — never a passing verdict. Body-vs-body
+                                       overlap is still check_interference.
           findings                     one actionable sentence per defect, naming the sids
           verdict                      the one-line answer
         `not_checked` at the top level lists every check that did NOT run, so a passing
@@ -1983,7 +2002,8 @@ def register_cad_eval_tools(mcp: FastMCP) -> None:
           not performed. This is a parametric B-rep kernel: the fix for a bad body is to fix
           the FEATURE that produced it, which the findings point you at. For a body that
           arrived broken from an IMPORT — no feature of yours authored it — call heal_body,
-          which records an OCCT ShapeFix repair as a feature.
+          which records the repair as a feature (ShapeFix, then the opt-in sewing /
+          orientation / rebuild_solid rungs) and refuses one that would cost material.
 
         Aliases (same tool): is_watertight, assess_mesh_quality, analyze_stl_geometry,
         health_check, design_audit.
@@ -2068,8 +2088,14 @@ def register_cad_eval_tools(mcp: FastMCP) -> None:
     def heal_body(target: Optional[Union[int, str]] = None,
                   doc_id: Optional[str] = None,
                   tolerance_mm: Optional[float] = None,
-                  fix_small_edges: bool = False) -> str:
-        """REPAIR a topologically broken solid with OCCT ShapeFix, as a RECORDED feature.
+                  fix_small_edges: bool = False,
+                  sew_tolerance_mm: Optional[float] = None,
+                  fix_orientation: bool = False,
+                  rebuild_solid: bool = False,
+                  rebuild_fuzzy_mm: Optional[float] = None,
+                  unify_faces: bool = False,
+                  max_volume_change_pct: Optional[float] = None) -> str:
+        """REPAIR a topologically broken solid, as a RECORDED feature with an escalation ladder.
 
         This is the answer to a `check_geometry_health` failure that your feature tree did NOT
         cause — an imported STEP/IGES/mesh body that arrived invalid (`bad_orientation_of_
@@ -2077,21 +2103,62 @@ def register_cad_eval_tools(mcp: FastMCP) -> None:
         features caused, fix the feature instead: healing over it hides the real bug and the
         next parameter edit brings it back.
 
-        It appends a `heal` feature to the tree (ShapeFix_Shape → optional ShapeFix_Wireframe →
-        ShapeFix_Solid), so the repair is part of the rebuild rather than a one-off mutation —
-        never "repair" a body outside the tree with a BREP/STL round-trip or a boolean against
-        itself; nothing downstream can then tell what changed, and the next rebuild loses it.
+        It appends a `heal` feature to the tree, so the repair is part of the rebuild rather
+        than a one-off mutation — never "repair" a body outside the tree with a BREP/STL
+        round-trip or a boolean against itself; nothing downstream can then tell what changed,
+        and the next rebuild loses it.
+
+        THE LADDER — climb it in order, one rung per call, and read the returned evidence
+        before the next rung. Everything past the first rung is OPT-IN because each one is
+        more destructive than the last:
+          1. bare call            ShapeFix_Shape → ShapeFix_Solid (+ ShapeFix_Wireframe if
+                                  fix_small_edges). Clears most imports outright.
+          2. sew_tolerance_mm     re-derives edge sharing from GEOMETRY (BRepBuilderAPI_Sewing)
+                                  — for a body whose STORED sharing is wrong.
+          3. fix_orientation      flood-fills the face-orientation graph, then re-wraps the
+                                  shells outward. Purely topological: no surface is rebuilt, so
+                                  areas and analytic surface types survive exactly. The right
+                                  escalation for `bad_orientation_of_subshape`, and the whole
+                                  fix for a merely inside-out import.
+          4. rebuild_solid        re-derives the solid from its faces (BOPAlgo_MakerVolume), so
+                                  orientation comes from geometry, not stored flags. Needed when
+                                  the returned `orientation.conflicts` > 0 — the graph is self-
+                                  CONTRADICTORY and no flag repair can satisfy it. This is the
+                                  rung that fixed the live frame spine. Pair it with
+                                  unify_faces to merge the same-domain faces a rebuild splits,
+                                  and with rebuild_fuzzy_mm=0.05 so the rebuild does not leave
+                                  RAZOR STRIP faces: at OCCT's own tolerance every pair of
+                                  near-coincident input faces gets its own intersection line,
+                                  and the leftovers (0.011 mm wide on the live spine) make an
+                                  otherwise BRep-valid body unmeshable at ANY element size.
+                                  Read `rebuild.narrowest_face_mm` — under ~1e-4 of the part's
+                                  diagonal, `warning` says so and names the fix.
+        A rung that does not finish the job says so in `warning`, naming the next one.
 
         Returns, so you can judge the repair instead of trusting it:
           fixed             was the body invalid before and valid after?
-          fixes             the BRepCheck defects that were CLEARED (what ShapeFix actually did)
+          fixes             the BRepCheck defects that were CLEARED
           remaining_issues  defects still present — a partial repair says so
           before / after    full check_geometry_health digests (summary, per-body counts, volume)
-          volume_delta_mm3  total volume change. On an orientation-only repair the volume READING
-                            changes because the broken integral was wrong, not the geometry — a
-                            reversed face on a 24000 mm^3 box measures 16000.
-          bbox_before/after + bbox_delta   the envelope must not move; if it did, ShapeFix
+          bad_edges_before/after  edges traversed the SAME way by both adjacent faces: the
+                            defect itself, counted. 144 -> 0 is a repair; 144 -> 68 is not.
+          material_volume_before/after + material_change_pct   the verdict numbers. A signed
+                            volume integral over a shell whose faces disagree is not a volume (a
+                            reversed face on a 24000 mm^3 box reads 16000), so both sides are
+                            measured with their orientations flood-corrected first and the
+                            budget is applied to THAT. This is what the refusal is judged on.
+          volume_delta_mm3  raw reading change, for reference; on an orientation repair the
+                            READING moves because the broken integral was wrong.
+          orientation       {faces_flipped, conflicts} when fix_orientation ran
+          rebuild           {lumps, kept_volume_mm3, discarded_volume_mm3, discarded_pct,
+                            narrowest_face_mm} when rebuild_solid ran
+          bbox_before/after + bbox_delta   the envelope must not move; if it did, the repair
                             rebuilt geometry and you should verify the part, not ship it.
+
+        REFUSAL: the feature FAILS (and the batch rolls back, so the body is untouched) when the
+        result is worse than the input — more defect KINDS than it found, the envelope moved, or
+        material changed by more than max_volume_change_pct. The error carries every number the
+        verdict was made on. A heal that costs material is not a heal.
 
         target          which body to heal: a feature id ("f3"), a feature NAME ("Spine"), or a
                         1-based body number (1 = first body). Omit for the current running body
@@ -2099,23 +2166,59 @@ def register_cad_eval_tools(mcp: FastMCP) -> None:
         doc_id          the part (defaults to the active document).
         tolerance_mm    ShapeFix precision. Default 1e-7 (OCCT's confusion tolerance) — raise to
                         0.01–0.1 when the import's gaps are real and the default leaves defects.
+                        Above the part's real feature size it MERGES geometry instead of
+                        repairing it (0.1 mm on the live spine invented three new defect kinds
+                        and was refused), so raise it one decade at a time.
         fix_small_edges also drop tiny edges / close wire gaps (ShapeFix_Wireframe). Off by
                         default: it REMOVES topology, so a body whose small edges are intended
                         (a 0.05 mm fillet band) would lose them.
+        sew_tolerance_mm  rung 2: re-sew the faces at this tolerance (mm). Omit to skip sewing.
+        fix_orientation rung 3: flood-fill and repair the face-orientation graph.
+        rebuild_solid   rung 4: re-derive the solid from its faces. Reports the lumps it found
+                        and refuses if the discarded ones exceed the budget.
+        rebuild_fuzzy_mm  the rebuild's intersection merge distance (mm), e.g. 0.05. Omit for
+                        OCCT's own tolerance, which leaves razor strips on an import whose
+                        faces are near-coincident. It also widens the envelope-movement budget
+                        to 10x itself, since you authorized merging at that distance.
+        unify_faces     merge same-domain faces afterwards (use with rebuild_solid).
+        max_volume_change_pct  refusal budget on material change, default 0.5 (%).
         """
         d = None
         try:
             d = _doc(doc_id)
-            if tolerance_mm is not None:
+            def _positive_mm(name, value, hint):
+                if value is None:
+                    return None
                 try:
-                    tolerance_mm = float(tolerance_mm)
+                    value = float(value)
                 except (TypeError, ValueError):
                     raise ValueError(
-                        f"heal_body(tolerance_mm={tolerance_mm!r}): tolerance_mm is a length in "
-                        f"mm (e.g. 0.01). Omit it for the 1e-7 default.") from None
-                if not tolerance_mm > 0:
+                        f"heal_body({name}={value!r}): {name} is a length in mm "
+                        f"(e.g. 0.01). {hint}") from None
+                if not value > 0:
+                    raise ValueError(f"heal_body({name}={value}): must be > 0.")
+                return value
+
+            tolerance_mm = _positive_mm("tolerance_mm", tolerance_mm,
+                                        "Omit it for the 1e-7 default.")
+            sew_tolerance_mm = _positive_mm(
+                "sew_tolerance_mm", sew_tolerance_mm,
+                "Omit it to skip the sewing pass entirely.")
+            rebuild_fuzzy_mm = _positive_mm(
+                "rebuild_fuzzy_mm", rebuild_fuzzy_mm,
+                "Omit it for OCCT's own intersection tolerance.")
+            if max_volume_change_pct is not None:
+                try:
+                    max_volume_change_pct = float(max_volume_change_pct)
+                except (TypeError, ValueError):
                     raise ValueError(
-                        f"heal_body(tolerance_mm={tolerance_mm}): must be > 0.")
+                        f"heal_body(max_volume_change_pct={max_volume_change_pct!r}): a PERCENT "
+                        f"of the body's volume (0.5 = half a percent). Omit for the 0.5 "
+                        f"default.") from None
+                if max_volume_change_pct < 0:
+                    raise ValueError(
+                        f"heal_body(max_volume_change_pct={max_volume_change_pct}): must be "
+                        f">= 0 (0 refuses ANY material change).")
 
             # --- resolve `target` to the feature id the `heal` op takes ----------------
             body_fid = None
@@ -2166,17 +2269,34 @@ def register_cad_eval_tools(mcp: FastMCP) -> None:
                 params["tolerance"] = tolerance_mm
             if fix_small_edges:
                 params["fix_small_edges"] = True
+            if sew_tolerance_mm is not None:
+                params["sew_tolerance_mm"] = sew_tolerance_mm
+            if fix_orientation:
+                params["fix_orientation"] = True
+            if rebuild_solid:
+                params["rebuild_solid"] = True
+            if rebuild_fuzzy_mm is not None:
+                params["rebuild_fuzzy_mm"] = rebuild_fuzzy_mm
+            if unify_faces:
+                params["unify_faces"] = True
+            if max_volume_change_pct is not None:
+                params["max_volume_change_pct"] = max_volume_change_pct
             r = cb.call("doc_apply_ops", {"doc_id": d, "ops": [
                 {"op": "add_feature",
                  "feature": {"type": "heal", "name": "Heal", "params": params}}]})
             rows = (r.get("rebuild") or {}).get("feature_status") or []
             row = rows[-1] if rows else {}
             if not row.get("ok"):
-                return _dumps({
+                # A refusal is a RESULT, not a mystery: hand back the evidence the engine
+                # judged on so the caller can pick the next rung instead of guessing.
+                out = {
                     "ok": False, "doc_id": d, "target": target,
                     "error": row.get("error") or "the heal feature failed to build",
                     "note": "a rejected batch is rolled back — the document is unchanged",
-                    "before": before})
+                    "before": before}
+                if isinstance(row.get("data"), dict):
+                    out["heal_evidence"] = row["data"]
+                return _dumps(out)
 
             feature_id = (r.get("id_map") or {}).get("$0") or row.get("id")
             data = row.get("data") or {}
@@ -2201,6 +2321,18 @@ def register_cad_eval_tools(mcp: FastMCP) -> None:
                 "brep_valid_after": (data.get("after") or {}).get("valid"),
                 "body_volume_before_mm3": data.get("volume_before"),
                 "body_volume_after_mm3": data.get("volume_after"),
+                "bad_edges_before": (data.get("before") or {}).get("bad_edges"),
+                "bad_edges_after": (data.get("after") or {}).get("bad_edges"),
+                "material_volume_before_mm3": data.get("material_volume_before"),
+                "material_volume_after_mm3": data.get("material_volume_after"),
+                "material_change_pct": data.get("material_change_pct"),
+                "sew_tolerance_mm": data.get("sew_tolerance_mm"),
+                "fix_orientation": bool(data.get("fix_orientation", fix_orientation)),
+                "rebuild_solid": bool(data.get("rebuild_solid", rebuild_solid)),
+                "rebuild_fuzzy_mm": data.get("rebuild_fuzzy_mm"),
+                "rebuild": data.get("rebuild"),
+                "unify_faces": bool(data.get("unify_faces", unify_faces)),
+                "max_volume_change_pct": data.get("max_volume_change_pct"),
                 "before": before, "after": after,
                 "volume_delta_mm3": (round(va - vb, 6)
                                      if isinstance(vb, (int, float))
@@ -2217,11 +2349,23 @@ def register_cad_eval_tools(mcp: FastMCP) -> None:
             heads = []
             if out["fixed"]:
                 heads.append("HEALED: " + (", ".join(fixes) if fixes else "BRep is now valid"))
+                # A "HEALED" body that carries a razor strip is unmeshable, so the engine's
+                # note must reach the summary and not just the `warning` field.
+                if "razor face" in (row.get("warning") or ""):
+                    heads.append(row["warning"].split("heal:", 1)[-1].strip())
             elif before_issues and after_issues:
+                # The engine's own warning names the NEXT rung (it knows whether the
+                # orientation graph was self-contradictory); a generic "raise the tolerance"
+                # sent the live run round the ladder in the wrong order.
+                nxt = (row.get("warning") or "").split("Escalate:")[-1].strip()
+                if not nxt:
+                    nxt = ("try fix_orientation:true, then rebuild_solid:true" if not
+                           rebuild_solid else "fix the import that produced the body")
                 heads.append(
                     f"PARTIAL: cleared {', '.join(fixes) if fixes else 'nothing'}; still "
-                    f"{', '.join(after_issues)}. Retry with a larger tolerance_mm, or fix the "
-                    f"import/feature that produced the body.")
+                    f"{', '.join(after_issues)} "
+                    f"({out['bad_edges_before']} -> {out['bad_edges_after']} bad edges). "
+                    f"Next: {nxt}")
             elif not before_issues:
                 heads.append("NO DEFECT: the body was already BRep-valid — nothing to fix "
                              "(the heal feature is recorded as a no-op)")

@@ -195,6 +195,17 @@ def consistent_pressure_loads(mesh: dict, on_surface, p_mpa: float) -> list:
     tri3: each corner carries A/3. tri6 (tet10): corners 0, each mid-side A/3.
     Outward orientation is enforced per face against the owning tet's centroid —
     the missing step in the engine's native pressure path (see module docstring).
+
+    The integral runs over BOUNDARY faces only — a face owned by exactly one
+    element. It used to run over every element face and lean on interior faces
+    cancelling (each of the two owners contributes the opposite outward normal),
+    which is exact in real arithmetic and only ~1e-14 in doubles. On a coarse mesh
+    a tet can carry all four corners on the loaded surface, so those interior
+    faces put O(1e-14) N residues on INTERIOR mid-side nodes, and fea_static
+    rightly resolves such a load's faceset to no boundary node and refuses the
+    whole study (measured: 32 residues out of 1208 loads on the h=16 mm annulus,
+    largest 1.4e-14 N). A surface traction is a surface integral; taking it over
+    the actual boundary is both the definition and the fix.
     """
     pts, tets, npe = mesh["points"], mesh["tets"], mesh["nodes_per_elem"]
     if npe not in (4, 10):
@@ -209,6 +220,12 @@ def consistent_pressure_loads(mesh: dict, on_surface, p_mpa: float) -> list:
                     node_set.add(el[mid])
     fvec: dict[int, list] = {}
     stride = npe
+    owners: dict[tuple, int] = {}
+    for e in range(len(tets) // stride):
+        el = tets[e * stride:(e + 1) * stride]
+        for (corner, _mid) in _KTET_FACES:
+            key = tuple(sorted(el[c] for c in corner))
+            owners[key] = owners.get(key, 0) + 1
     for e in range(len(tets) // stride):
         el = tets[e * stride:(e + 1) * stride]
         corners = el[:4]
@@ -219,6 +236,8 @@ def consistent_pressure_loads(mesh: dict, on_surface, p_mpa: float) -> list:
             cn = [el[c] for c in corner]
             if not all(c in node_set for c in cn):
                 continue
+            if owners[tuple(sorted(cn))] != 1:
+                continue  # interior face: not part of the boundary integral
             p0 = pts[3 * cn[0]:3 * cn[0] + 3]
             pa = pts[3 * cn[1]:3 * cn[1] + 3]
             pb = pts[3 * cn[2]:3 * cn[2] + 3]

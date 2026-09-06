@@ -9,10 +9,10 @@
 //   open(path)              -> {doc, warnings, extra_entries}.
 //
 // compile_document is deterministic, so a JSON-only round-trip is FAITHFUL: open =
-// unzip + read document.json + rebuild. geometry.step (the frozen last-good rebuild,
-// for interchange + total-rebuild-failure fallback) is DEFERRED to a later increment
-// (it needs an OCCT STEPControl_Writer); plain open() here never produces it and
-// tolerates its absence, exactly like the Python oracle.
+// unzip + read document.json + rebuild. `geometry.step` (the AP214 snapshot of the last
+// successful rebuild — interchange for foreign CAD plus the total-rebuild-failure
+// fallback) is written by doc_save through stepplus_geometry_step_bytes below; open
+// still tolerates its absence (a document that has never rebuilt has none).
 #pragma once
 
 #include <map>
@@ -105,5 +105,17 @@ bool stepplus_get_study_result(const std::map<std::string, std::string>& extra,
 std::string brep_cache_encode(const std::vector<TopoDS_Shape>& bodies);
 // Throws OpError("io_error", ...) on a corrupt blob; callers treat that as a cache miss.
 std::vector<TopoDS_Shape> brep_cache_decode(const std::string& blob);
+
+// --- geometry.step (contracts/stepplus.md §1) ---------------------------------------
+// AP214 (AUTOMOTIVE_DESIGN, millimetre) STEP bytes for `bodies` — the container member any
+// other CAD opens, and the frozen fallback contracts/stepplus.md §2.3 offers as an `import`
+// feature when a rebuild fails. doc_save calls this after a fully-ok rebuild with the part's
+// compiled bodies, or an assembly's FLATTENED world-placed component bodies, and stores the
+// result as the `geometry.step` entry. Each solid is transferred on its own (an AsIs compound
+// transfer of disjoint lumps emits one malformed manifold_solid_brep — see export_bodies);
+// a body with no solid (open sheet/shell) is transferred as-is so surfaces still travel.
+// Returns "" when there is nothing to write or the OCCT writer refuses — an honest drop, so
+// a writer problem can never fail the save (the entry is then simply absent).
+std::string stepplus_geometry_step_bytes(const std::vector<TopoDS_Shape>& bodies);
 
 }  // namespace chudware::doc

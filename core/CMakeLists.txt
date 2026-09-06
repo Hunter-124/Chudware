@@ -2496,3 +2496,25 @@ target_compile_definitions(test_cam_processes PRIVATE
 set_target_properties(test_cam_processes PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 add_test(NAME cam_processes COMMAND test_cam_processes)
+
+# ── Unilateral (frictionless) contact FEA ───────────────────────────────────────
+# sim/fea_contact.cpp is the mesh-topology half of contact: boundary faces -> surface
+# normals/areas -> candidate pairs across a gap, consumed by fea_run's contact study and
+# by fea_static_solve_contact's active-set loop. Appended as target_sources so the
+# chudware_sim source list above is untouched.
+target_sources(chudware_sim PRIVATE sim/fea_contact.cpp)
+
+# Contact gates (OCCT-/mesher-free inline structured meshes, so it links only
+# chudware_sim like test_tet10):
+#   (a) two stacked boxes with a real gap, pressed together -> the gap closes, the base
+#       reaction equals the applied load, and the travel is gap + elastic compression;
+#   (b) the SAME model loaded the other way -> the active set empties and the run is
+#       REFUSED as a mechanism instead of reporting a rigid-body "solution";
+#   (c) a pin in a clearance bore loaded transversely -> contact is active on ONE side
+#       only and the reaction balances.
+add_executable(test_fea_contact tests/test_fea_contact.cpp)
+target_include_directories(test_fea_contact PRIVATE ${doctest_SOURCE_DIR})
+target_link_libraries(test_fea_contact PRIVATE chudware_sim)
+set_target_properties(test_fea_contact PROPERTIES
+  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+add_test(NAME fea_contact COMMAND test_fea_contact)

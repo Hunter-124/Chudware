@@ -14,6 +14,30 @@
 // thread pool (util/thread_pool.h) caps total workers to this budget so nested
 // solves never oversubscribe.
 //
+// The budget is a MINIMUM of four independent limits, and the binding one wins:
+//
+//   budget = min( max( floor, min( CHUDWARE_MEM_FRAC x total,
+//                                  CHUDWARE_MEM_CAP_GB,
+//                                  avail - CHUDWARE_HEADROOM_GB ) ),
+//                 cgroup memory.max )
+//
+// Consequence worth knowing before you turn a knob: on a busy box the third term
+// is usually the binding one, so RAISING CHUDWARE_MEM_FRAC ALONE CHANGES NOTHING
+// — it only relaxes a term that was not the minimum. When RAM is actually free
+// the lever is CHUDWARE_HEADROOM_GB (lower it), and the durable fix is to free
+// memory (close the GUI/builds) so `avail` itself rises. The floor
+// (min(3 GB, 40% of total)) keeps a briefly-busy box from refusing small jobs.
+//
+// `cgroup memory.max` is the CGROUP-AWARE term and the only HARD one: /proc/meminfo
+// describes the machine, but a process inside a memory-capped cgroup (systemd-run
+// -p MemoryMax=, a .service unit, a container) is SIGKILLed by the cgroup OOM
+// killer at its own limit while host RAM is still free. The term is
+// min(memory.max, memory.high) over our own cgroup and every ancestor up to the
+// root, minus the usage of the OTHER processes sharing that cgroup
+// (memory.current - our RSS). Because it is a kill line, it is applied AFTER the
+// small-job floor: no knob and no floor may raise a budget above it. With no
+// cgroup v2 limit anywhere on the path the term is infinite and nothing changes.
+//
 // Env knobs (all optional; shared naming with benchmarks/simsuite/resguard.py):
 //   CHUDWARE_GOVERNOR=0     disable every check (admit everything, full threads)
 //   CHUDWARE_MEM_FRAC       fraction of total RAM one study may claim   (default 0.5)
@@ -43,7 +67,8 @@ uint64_t process_rss_bytes();
 
 // The byte budget one study may claim right now: min(frac*total, cap,
 // avail-headroom), floored at min(3 GB, 40% of total) so a briefly-busy box
-// doesn't refuse tiny jobs. UINT64_MAX when the governor is disabled.
+// doesn't refuse tiny jobs, then clamped to the cgroup memory.max term (a hard
+// kill line the floor may not cross). UINT64_MAX when the governor is disabled.
 uint64_t budget_bytes();
 
 // Admission check for a projected peak. Returns true when the job fits (or the
@@ -51,6 +76,36 @@ uint64_t budget_bytes();
 // user-facing message with the numbers and the knobs that would change the
 // outcome — callers surface it verbatim as the study error.
 bool admit(uint64_t estimate_bytes, const char* what, std::string& why);
+
+// ── Calibrated FEA peak-memory model ────────────────────────────────────────────
+// Projected peak working set of ONE direct-solve FEA job (mesh residency +
+// triplet assembly + sparse factor fill + stress recovery + result packet), from
+// MEASURED peak RSS of the production path — not an analytic guess. The measured
+// table, the two solver families it covers and the safety factor are documented
+// at the top of resource_governor.cpp; fea_calibration_basis() is the one-line
+// summary meant for user-facing messages.
+//
+// The returned number ALREADY carries the safety factor, so callers compare it to
+// budget_bytes() directly. nodes_per_element selects the family (4 = tet4, which
+// is locked to Eigen SparseLU by the parity harness; >= 8 = tet10/hex8, which use
+// the CHOLMOD/LDLT Cholesky path and cost far less per DOF). dof_per_node is 3
+// for structural, 1 for thermal.
+uint64_t fea_peak_bytes(uint64_t n_elements, int nodes_per_element, int dof_per_node);
+
+// Inverse of fea_peak_bytes: the largest element count whose projected peak still
+// fits `budget` bytes. 0 when even one element does not fit. Meshers use this to
+// coarsen a study into the envelope instead of being refused after meshing.
+uint64_t fea_element_limit(uint64_t budget, int nodes_per_element, int dof_per_node);
+
+// One-line provenance for the numbers above, e.g. for a study note or refusal.
+const char* fea_calibration_basis();
+
+// Admission for a calibrated FEA solve: computes the estimate with
+// fea_peak_bytes() and applies the admit() rule, so the refusal names the
+// estimate, the calibration basis, the budget AND which of the three budget
+// terms is binding (the one knob that would actually change the outcome).
+bool admit_fea(uint64_t n_elements, int nodes_per_element, int dof_per_node,
+               const char* what, std::string& why);
 
 // Emergency signal for long-running loops: available RAM has dropped under
 // half the OS headroom. Callers should stop gracefully at their next

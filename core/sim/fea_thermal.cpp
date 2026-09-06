@@ -369,6 +369,29 @@ ThermalResult fea_thermal_solve(const std::vector<double>& points, const std::ve
         is_fixed[nid] = 1;
         pres_temp[nid] = fixed_temps[i];
     }
+
+    // ── Nodes no element references (same rule as the transient path and as fea_static;
+    // see the transient comment for the measured case). Zero rows make the conductivity
+    // matrix singular however it is factored, and elimination is exact because nothing
+    // couples such a node. A node outside the domain has no conducted temperature, so it
+    // carries the environment datum — the ambient of the first convection boundary, else
+    // the first prescribed temperature — and is left out of the reported extrema instead
+    // of pulling min_temp down to that datum.
+    std::vector<char> in_domain(static_cast<size_t>(n_nodes), 0);
+    for (int nid : tets)
+        if (nid >= 0 && nid < n_nodes) in_domain[static_cast<size_t>(nid)] = 1;
+    {
+        double datum = 0.0;
+        if (!convections.empty())
+            datum = convections.front().t_amb;
+        else if (!fixed_temps.empty())
+            datum = fixed_temps.front();
+        for (int i = 0; i < n_nodes; ++i) {
+            if (in_domain[static_cast<size_t>(i)] || is_fixed[i]) continue;
+            is_fixed[i] = 1;
+            pres_temp[i] = datum;
+        }
+    }
     std::vector<int> reduced(n_nodes, -1);
     int n_free = 0;
     for (int i = 0; i < n_nodes; ++i)
@@ -573,8 +596,19 @@ ThermalResult fea_thermal_solve(const std::vector<double>& points, const std::ve
     for (double v : res.temperature)
         if (!std::isfinite(v)) { res.error = "fea_thermal: solve produced a non-finite temperature"; return res; }
 
-    double mx = res.temperature[0], mn = res.temperature[0];
-    for (double v : res.temperature) { mx = std::max(mx, v); mn = std::min(mn, v); }
+    // Extrema over the DOMAIN only: an eliminated out-of-domain node carries the
+    // environment datum, not a solved temperature, and must not define min/max.
+    double mx = -std::numeric_limits<double>::infinity();
+    double mn = std::numeric_limits<double>::infinity();
+    for (int i = 0; i < n_nodes; ++i) {
+        if (!in_domain[static_cast<size_t>(i)]) continue;
+        mx = std::max(mx, res.temperature[static_cast<size_t>(i)]);
+        mn = std::min(mn, res.temperature[static_cast<size_t>(i)]);
+    }
+    if (!std::isfinite(mx)) {  // no element referenced any node — total, not reachable
+        mx = res.temperature[0];
+        mn = res.temperature[0];
+    }
     res.max_temp = mx;
     res.min_temp = mn;
     res.n_dof = n_free;
@@ -884,6 +918,30 @@ ThermalTransientResult fea_thermal_transient(
         }
         is_fixed[nid] = 1;
         pres_temp[nid] = fixed_temps[i];
+    }
+
+    // ── Nodes no element references. The mesher's hanging-fragment dissolve drops
+    // elements but deliberately keeps node numbering 1:1 with the polymesh mesh the
+    // adaptive route refines through (detail::repair_lonely_nodes), so a repaired mesh
+    // can carry a few nodes that belong to no element at all. Their rows in the
+    // iteration matrix are exactly zero, which makes it singular however it is factored:
+    // the fin25 sensor board arrived with 9 such nodes out of 50,550 and CHOLMOD, LDLT
+    // and SparseLU all failed in turn ("iteration-matrix factorization failed").
+    // Eliminating them is exact rather than an approximation — nothing couples them, so
+    // they cannot influence any other DOF — and it is the same rule fea_static already
+    // applies to the same meshes. They are outside the domain, so they simply keep their
+    // initial temperature instead of being handed an invented conducted one.
+    {
+        std::vector<char> referenced(static_cast<size_t>(n_nodes), 0);
+        for (int nid : tets)
+            if (nid >= 0 && nid < n_nodes) referenced[static_cast<size_t>(nid)] = 1;
+        for (int i = 0; i < n_nodes; ++i) {
+            if (referenced[static_cast<size_t>(i)] || is_fixed[i]) continue;
+            is_fixed[i] = 1;
+            pres_temp[i] = opts.init_temps.empty()
+                               ? opts.t_init
+                               : opts.init_temps[static_cast<size_t>(i)];
+        }
     }
     std::vector<int> reduced(n_nodes, -1);
     int n_free = 0;

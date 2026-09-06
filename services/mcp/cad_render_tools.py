@@ -5,6 +5,7 @@ from mcp.server.fastmcp import FastMCP  # noqa: F401 — register signature
 from mcp.server.fastmcp import Image
 from typing import Optional
 from typing import Union
+import hashlib
 import os
 import math
 
@@ -12,6 +13,9 @@ from .cad_common import (
     _CLOSEUP_H,
     _CLOSEUP_MARGIN,
     _CLOSEUP_W,
+    _CONTEXT_DESAT,
+    _EMPHASIS_GLOW,
+    _HIGHLIGHT_PALETTE,
     _annotate_render,
     _auto_section_for_target,
     _build_emphasis_palette,
@@ -24,18 +28,33 @@ from .cad_common import (
     _handoff_doc_name,
     _ideal_views,
     _inspect_caption,
+    _match_point_cloud,
     _normalize_view_list,
     _palette_caption_block,
     _render_annotation_caption,
     _render_view_png,
     _resolve_inspect_target,
+    _sanitize_output_path,
     _target_bbox,
     _target_is_internal,
     _tile_pngs_grid,
     _tmp,
     _vnorm,
     cb,
+    render_background,
     render_output_path,
+    require_list,
+)
+# The FEA setup resolver stack, reused verbatim by render_study_setup so a study FIGURE
+# and the study run_fea_static would solve can never diverge (no second interpretation of
+# the same face words, and the same refusals).
+from .cad_sim_tools import (
+    _BC_SHAPE_HELP,
+    _StudyRefusal,
+    _build_load_specs,
+    _norm_bc_list,
+    _reject_fully_constrained_loads,
+    _sim_face_points,
 )
 
 
@@ -54,7 +73,8 @@ def _annotated_view_tiles(d: str, view_list: list, highlight=None, annotate: boo
                           matches: Optional[list] = None,
                           emphasis_mode: Optional[str] = None,
                           margin: float = _CLOSEUP_MARGIN,
-                          clip_near: bool = False) -> tuple:
+                          clip_near: bool = False,
+                          background: Optional[list] = None) -> tuple:
     """Render each view on its own, overlay the mesh annotation, return (tiles, labels, infos).
 
     The native doc_render_contact_sheet RPC tiles inside the engine, so there is no per-tile
@@ -87,7 +107,7 @@ def _annotated_view_tiles(d: str, view_list: list, highlight=None, annotate: boo
                 focus=target_bb if focused else None, margin=margin,
                 clip_near=bool(clip_near) and focused,
                 W=_CLOSEUP_W if focused else 512, H=_CLOSEUP_H if focused else 400,
-                annotate=bool(annotate))
+                annotate=bool(annotate), background=background)
         except ValueError:
             continue
         info = None
@@ -106,7 +126,7 @@ def _closeup(d: str, matches: list, target_bb: dict, view_dir, *, label: str,
              stem: str, emphasis_mode: Optional[str] = "emphasis",
              margin: float = _CLOSEUP_MARGIN, clip_near: bool = False,
              annotate: bool = True, W: int = _CLOSEUP_W, H: int = _CLOSEUP_H,
-             highlight=None) -> tuple:
+             highlight=None, background: Optional[list] = None) -> tuple:
     """ONE idealized close-up: engine-framed render + exact-mask emphasis overlay.
 
     This is the single close-up implementation every inspect/render tool goes through. The
@@ -121,7 +141,7 @@ def _closeup(d: str, matches: list, target_bb: dict, view_dir, *, label: str,
     png = render_output_path(stem, ".png")
     png, frame, _r = _render_view_png(d, view_dir, png, name=label.upper()[:28],
                                       focus=target_bb, margin=margin, clip_near=clip_near,
-                                      W=W, H=H, annotate=annotate)
+                                      W=W, H=H, annotate=annotate, background=background)
     palette = (_build_emphasis_palette(matches or [], mode=emphasis_mode)
                if emphasis_mode else None)
     emphasis = ({"matches": list(matches or []), "mode": emphasis_mode, "label": label,
@@ -189,6 +209,208 @@ def _merge_annotation_infos(infos: list) -> Optional[dict]:
     return out
 
 
+# --------------------------------------------------------------------------- save_path
+# O-16: a render the model can SEE is not yet a figure it can PUT IN a document. The
+# tools keep returning the image inline (that is what the vision loop reads) and, when
+# `save_path` is given, ALSO write those exact bytes to the caller's own file so a report
+# can reference the PNG by path. The write is byte-identical to the inline image — the
+# caption carries the length and a sha256 prefix so a reader can prove it.
+_RENDER_SAVE_ANYWHERE = "CHUDWARE_RENDER_SAVE_ANYWHERE"
+# The workspace/project roots a figure may be written into, in the order project_context
+# resolves them for every plm_* tool. A render is a deliverable of the CURRENT project;
+# writing one into an arbitrary directory is how an agent scatters files a user never
+# finds (and is a path-traversal surface when the doc_id came from a remote client).
+_RENDER_SAVE_ROOT_VARS = ("CHUDWARE_PROJECT_SAVE_DIR", "CHUDWARE_PROJECT_DIR",
+                          "CHUDWARE_FS_ROOT")
+
+
+def _render_save_roots() -> list:
+    """[(env var, absolute root)] for every configured workspace/project directory."""
+    out: list = []
+    for var in _RENDER_SAVE_ROOT_VARS:
+        raw = (os.environ.get(var) or "").strip()
+        if raw:
+            out.append((var, os.path.abspath(os.path.expanduser(raw))))
+    return out
+
+
+def _render_save_target(save_path) -> Optional[str]:
+    """Validate `save_path` BEFORE any engine work and return the absolute file to write.
+
+    Returns None when the caller passed nothing. Refuses a relative path (the MCP server's
+    cwd is the daemon's, not the caller's, so a relative destination lands somewhere nobody
+    can point a report at) and any path outside a configured workspace/project root unless
+    CHUDWARE_RENDER_SAVE_ANYWHERE=1. Canonicalisation goes through the same
+    _sanitize_output_path every export_part / save_part destination uses, so '..' sequences
+    are collapsed before the containment test rather than after."""
+    if save_path is None:
+        return None
+    if not isinstance(save_path, str) or not save_path.strip():
+        raise ValueError("save_path must be a non-empty absolute path, e.g. "
+                         "'/home/you/project/figures/fixture-setup.png'")
+    expanded = os.path.expanduser(save_path.strip())
+    if not os.path.isabs(expanded):
+        raise ValueError(
+            f"save_path must be ABSOLUTE; got {save_path!r}. This server runs in its own "
+            "process (its cwd is the engine daemon's), so a relative path lands somewhere "
+            "you cannot reference. Pass the full path under your project folder.")
+    out = _sanitize_output_path(expanded)
+    if not out.lower().endswith(".png"):
+        out += ".png"
+    if (os.environ.get(_RENDER_SAVE_ANYWHERE) or "").strip().lower() in (
+            "1", "true", "yes", "on"):
+        return out
+    roots = _render_save_roots()
+    if not roots:
+        raise ValueError(
+            "save_path needs a project/workspace directory to save INTO, and none is "
+            f"configured ({' / '.join(_RENDER_SAVE_ROOT_VARS)} are all unset). Set one for "
+            f"this session, or set {_RENDER_SAVE_ANYWHERE}=1 to allow any absolute path.")
+    for _var, root in roots:
+        if out == root or out.startswith(root.rstrip(os.sep) + os.sep):
+            return out
+    raise ValueError(
+        f"save_path {out!r} is outside this session's project/workspace directory "
+        f"({', '.join(r for _v, r in roots)}). Save the figure under the project root so it "
+        f"ships with the deliverable, or set {_RENDER_SAVE_ANYWHERE}=1 to override.")
+
+
+def _render_save_note(png: str, target: Optional[str]) -> str:
+    """Copy the render at `png` to `target` and return the caption clause proving it.
+
+    Byte-for-byte: the saved file IS the inline image, so a figure embedded from the path
+    and the picture the model looked at can never diverge. Parent directories are created.
+    Returns "" when there is nothing to save."""
+    if not target:
+        return ""
+    parent = os.path.dirname(target)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    with open(png, "rb") as fh:
+        data = fh.read()
+    with open(target, "wb") as fh:
+        fh.write(data)
+    return (f"saved: {target} ({len(data)} B, "
+            f"sha256 {hashlib.sha256(data).hexdigest()[:12]})")
+
+
+def _with_save_note(result, note: str):
+    """Append the save clause to a [image, caption] pair (or pair a bare Image with it)."""
+    if not note:
+        return result
+    if isinstance(result, list):
+        if len(result) >= 2:
+            cap = str(result[1] or "").strip()
+            return [result[0], (cap + " " + note).strip() if cap else note]
+        if len(result) == 1:
+            return [result[0], note]
+        return [note]
+    return [result, note]
+
+
+# ------------------------------------------------------------------- study-setup figure
+# The FIXTURE/LOAD figure an evidence document needs. Every face selection goes through
+# cad_sim_tools' own resolver stack — _norm_bc_list, _sim_face_points, _build_load_specs,
+# _reject_fully_constrained_loads — i.e. exactly the calls run_fea_static makes, so this
+# figure is a picture of the study that WOULD solve rather than a second reading of the
+# same words, and a setup the solver refuses is refused here too. The painted faces are
+# additionally PROVEN to carry the solver's own node sets (_bc_group), because a figure
+# showing the wrong face is worse than no figure: it is false evidence.
+_FIXTURE_RGB, _FIXTURE_COLOUR = _HIGHLIGHT_PALETTE[0]   # magenta
+_LOAD_RGB, _LOAD_COLOUR = _HIGHLIGHT_PALETTE[1]         # violet
+
+
+def _bc_group(d: str, query, solver_sets: list, label: str) -> dict:
+    """Pair ONE boundary-condition query's SOLVER node sets with the faces to paint.
+
+    `solver_sets` are the doc_face_points sets cad_sim_tools already resolved for this
+    query — the authority on which nodes the solve drives. The paint and the legend need
+    sids and areas, which only the query MATCHES carry, so the two are cross-checked here:
+    every sampled solver node must lie on a face this figure will colour. A mismatch means
+    the picture and the study disagree, and we refuse instead of shipping it.
+    Returns {query, matches, sids, n_points}."""
+    solver_pts = {tuple(round(float(c), 6) for c in p[:3])
+                  for s in solver_sets for p in (s.get("points") or [])
+                  if isinstance(p, (list, tuple)) and len(p) >= 3}
+    rsl = _resolve_inspect_target(d, query)
+    matches = [m for m in (rsl.get("matches") or []) if m.get("kind") != "edge"]
+    if not matches:
+        raise ValueError(
+            f"{label} query {query!r} resolved to solver nodes but to no renderable FACE "
+            "— a study-setup figure can only colour faces. Name the face itself (a sid from "
+            "describe_part, or a query_geometry face query).")
+    painted_pts = {tuple(round(float(c), 6) for c in p[:3])
+                   for m in matches for p in _match_point_cloud(d, m)}
+    if not solver_pts <= painted_pts:
+        raise ValueError(
+            f"{label} query {query!r} does not colour what it solves: "
+            f"{len(solver_pts - painted_pts)} of {len(solver_pts)} solver sample points are "
+            f"not on the {len(matches)} face(s) this figure would colour "
+            f"({', '.join(str(m.get('sid')) for m in matches)}). Pass the face SID from "
+            "describe_part() so the figure and the study cannot disagree.")
+    return {
+        "query": query,
+        "matches": matches,
+        "sids": [str(m.get("sid")) for m in matches if m.get("sid")],
+        "n_points": len(solver_pts),
+    }
+
+
+def _sids_areas_text(groups: list) -> str:
+    """``Ftop 1200 mm2, Fbot 800 mm2`` across every group of one BC role."""
+    bits: list = []
+    for g in groups:
+        for m in g["matches"]:
+            sid = str(m.get("sid") or "unnamed face")
+            try:
+                area = float(m.get("area_or_len"))
+            except (TypeError, ValueError):
+                bits.append(sid)
+                continue
+            bits.append(f"{sid} {area:.4g} mm2")
+    return ", ".join(bits) if bits else "no sid"
+
+
+def _load_resultant(load_specs: list, groups: list) -> tuple:
+    """(resultant [Fx,Fy,Fz] N, per-load description) for the solver's own load payload.
+
+    A force load contributes its vector as given. A pressure load contributes
+    p[MPa] * area[mm2] = N along the INWARD face normal — what {"face": q, "pressure": p}
+    means to the solver — computed from the face's own area and outward normal so the
+    figure states a real number instead of "some pressure"."""
+    total = [0.0, 0.0, 0.0]
+    terms: list = []
+    for spec, g in zip(load_specs, groups):
+        if spec.get("type") == "force":
+            f = [float(c) for c in spec["vector"]]
+            for i in range(3):
+                total[i] += f[i]
+            terms.append(f"force [{f[0]:.4g}, {f[1]:.4g}, {f[2]:.4g}] N on "
+                         f"{', '.join(g['sids']) or 'the resolved face(s)'}")
+            continue
+        p = float(spec.get("magnitude") or 0.0)
+        area = 0.0
+        vec = [0.0, 0.0, 0.0]
+        for m in g["matches"]:
+            try:
+                a = float(m.get("area_or_len"))
+            except (TypeError, ValueError):
+                continue
+            n = m.get("normal") or m.get("axis")
+            if not isinstance(n, (list, tuple)) or len(n) < 3:
+                continue
+            u = _vnorm(n)
+            area += a
+            for i in range(3):
+                vec[i] -= p * a * u[i]  # pressure pushes INWARD, along -outward normal
+        for i in range(3):
+            total[i] += vec[i]
+        terms.append(f"pressure {p:.4g} MPa over {area:.4g} mm2 = "
+                     f"{math.sqrt(sum(c * c for c in vec)):.4g} N inward along the face "
+                     f"normal of {', '.join(g['sids']) or 'the resolved face(s)'}")
+    return total, terms
+
+
 def register_cad_render_tools(mcp: FastMCP) -> None:
     """CAD render + close-up inspection MCP tools (T-RF8 split of cad_tools.py): render_part, contact_sheet, render_views, inspect_part, look_around, inspect_feature."""
 
@@ -201,7 +423,9 @@ def register_cad_render_tools(mcp: FastMCP) -> None:
                     emphasis_mode: str = "emphasis",
                     highlight: Optional[Union[str, dict, list]] = None,
                     annotate: bool = True,
-                    display_quality: Optional[str] = None) -> list:
+                    display_quality: Optional[str] = None,
+                    background: Optional[Union[list, str]] = None,
+                    save_path: Optional[str] = None) -> list:
         """Render the current part to an ANNOTATED image and return it so you can SEE the result.
 
         The render is colour-coded and labelled exactly like the in-app vision reviewer: an XYZ
@@ -256,11 +480,34 @@ def register_cad_render_tools(mcp: FastMCP) -> None:
           import (STL/OBJ, or a SolidWorks file opened from its saved display data) already
           carries baked facets, so its density does not change however fine the tier.
 
+        background (optional): the frame's clear colour, [r, g, b] in 0-255 or "#rrggbb".
+          The engine renders straight onto it, so a dark plate for a slide, a poster or a
+          dark-mode page comes out of the renderer instead of being keyed out of the default
+          light grey afterwards. Shading, orientation tint, callouts, gizmo and scale bar are
+          unchanged (their text carries its own halo, so it stays readable on a dark field).
+          Omit for the engine's flat 245 light grey.
+
+        save_path (optional): ALSO write this render to your own absolute .png path (parent
+          directories are created; a missing ".png" suffix is added). The file contains
+          exactly the bytes of the image returned inline — the finished figure: the engine
+          render plus every overlay this call produced (tint/gizmo/labels unless
+          annotate=False, B-rep edge outline, highlight/emphasis paint, feature callouts,
+          scale bar). It is a flat RGB PNG with no layers, no alpha and no embedded
+          metadata, so it can be dropped straight into a report. The caption gains
+          `saved: <path> (<bytes> B, sha256 <first 12>)` so you can cite the file you
+          actually got. The path must be ABSOLUTE and inside the session's
+          project/workspace directory (CHUDWARE_PROJECT_SAVE_DIR / CHUDWARE_PROJECT_DIR /
+          CHUDWARE_FS_ROOT); set CHUDWARE_RENDER_SAVE_ANYWHERE=1 to lift that restriction.
+
         Returns [image, caption]: the PNG followed by a SELF-SUFFICIENT text caption — part name
         and bbox, the features visible in this view as id+name, what is highlighted and in what
         colour, the side-palette colour key, and an explicit note of what this camera CANNOT see
         plus the tool to call for it. A model that reads only the caption still knows the scene.
         """
+        # Validate the destination BEFORE any engine work: a refused path must not cost a
+        # render (and must be reported as the argument error it is, not as a render failure).
+        save_to = _render_save_target(save_path)
+        bg = render_background(background)
         d = _doc(doc_id)
         if display_quality is not None:
             # Persists on the document (view setting, no revision bump) — nothing to restore.
@@ -333,7 +580,8 @@ def register_cad_render_tools(mcp: FastMCP) -> None:
                 label=str(emp_resolved.get("label") if emp_resolved else "target"),
                 stem=_render_stem(d, view_name),
                 emphasis_mode=emphasis_mode or "emphasis",
-                clip_near=internal, annotate=bool(annotate), highlight=highlight)
+                clip_near=internal, annotate=bool(annotate), highlight=highlight,
+                background=bg)
             palette = ((ann_info.get("emphasis") or {}).get("palette")) if ann_info else None
             caption_extra = (
                 f" Emphasized {emp_resolved.get('label')!r}"
@@ -348,10 +596,13 @@ def register_cad_render_tools(mcp: FastMCP) -> None:
         else:
             if view_dir is not None:
                 png, frame, _r = _render_view_png(d, view_dir, png, name=str(view_name).upper(),
-                                                  annotate=bool(annotate))
+                                                  annotate=bool(annotate), background=bg)
             elif view is not None:
-                r = cb.call("doc_render_view", {"doc_id": d, "out_path": png, "view": view,
-                                                "annotate": bool(annotate)})
+                params = {"doc_id": d, "out_path": png, "view": view,
+                          "annotate": bool(annotate)}
+                if bg is not None:
+                    params["background"] = bg
+                r = cb.call("doc_render_view", params)
                 if not r.get("ok") or not os.path.exists(png):
                     raise ValueError(
                         f"Render failed: "
@@ -359,15 +610,18 @@ def register_cad_render_tools(mcp: FastMCP) -> None:
                 frame = _frame_from_rpc(r)
             else:
                 frame = None
-                r = cb.call("doc_render_png",
-                            {"doc_id": d, "out_path": png, "annotate": bool(annotate)})
+                params = {"doc_id": d, "out_path": png, "annotate": bool(annotate)}
+                if bg is not None:
+                    params["background"] = bg
+                r = cb.call("doc_render_png", params)
                 if not r.get("ok") or not os.path.exists(png):
                     try:
                         rd = cb.call("drawing_render_png", {"doc_id": d, "out_path": png})
                     except Exception:  # noqa: BLE001
                         rd = {"ok": False}
                     if rd.get("ok") and os.path.exists(png):
-                        return _captioned_render(png, d, [view_name])
+                        return _with_save_note(_captioned_render(png, d, [view_name]),
+                                               _render_save_note(png, save_to))
                     raise ValueError(f"Render failed: {r.get('reason', 'no bodies to render')}")
             # Mesh-accurate overlay: B-rep edges (hidden-line removed), explicit `highlight`
             # targets, feature callouts and a scale bar, reprojected through the SAME camera the
@@ -382,9 +636,10 @@ def register_cad_render_tools(mcp: FastMCP) -> None:
 
         result = _captioned_render(png, d, [view_name], annotations=ann_info,
                                    extra=caption_extra.strip())
+        note = _render_save_note(png, save_to)
         if isinstance(result, list) and len(result) == 2:
-            return result
-        return [result, caption_extra.strip()]
+            return _with_save_note(result, note)
+        return _with_save_note([result, caption_extra.strip()], note)
 
 
 
@@ -392,7 +647,9 @@ def register_cad_render_tools(mcp: FastMCP) -> None:
     def contact_sheet(doc_id: Optional[str] = None,
                       views: Optional[list] = None,
                       highlight: Optional[Union[str, dict, list]] = None,
-                      annotate: bool = True) -> list:
+                      annotate: bool = True,
+                      background: Optional[Union[list, str]] = None,
+                      save_path: Optional[str] = None) -> list:
         """Render SEVERAL labelled views tiled into ONE image — the fastest multi-angle self-check.
 
         Each tile is colour-coded, headed with its view name and the part's bounding-box
@@ -416,33 +673,50 @@ def register_cad_render_tools(mcp: FastMCP) -> None:
         VERIFY LOOP: use after mutations when a single iso is not enough to confirm a feature
         on a back/bottom face. Pair with verify_battery before declaring done.
 
+        background (optional): [r, g, b] 0-255 or "#rrggbb" — the clear colour every tile is
+        rendered onto (see render_part). The inter-tile gutters are already dark.
+
+        save_path (optional): ALSO write the finished SHEET to this absolute .png path —
+        the tiled multi-view image with its per-tile labels and overlays, byte-identical to
+        the image returned inline (one flat RGB PNG, not one file per tile). Same rules as
+        render_part: absolute, inside the project/workspace dir unless
+        CHUDWARE_RENDER_SAVE_ANYWHERE=1, and the caption gains
+        `saved: <path> (<bytes> B, sha256 <first 12>)`.
+
         Returns [image, caption]: the tiled PNG followed by a SELF-SUFFICIENT text caption —
         views, part name and bbox, features seen across the sheet, what is highlighted and in
         what colour, the side-palette colour key, and what no tile could see.
         """
+        save_to = _render_save_target(save_path)
+        bg = render_background(background)
         d = _doc(doc_id)
         view_list = views or ["front", "right", "top", "iso"]
         if not annotate and highlight is None:
             png = render_output_path(_render_stem(d, "contact-sheet"), ".png")
-            r = cb.call("doc_render_contact_sheet",
-                        {"doc_id": d, "out_path": png, "views": views or []})
+            params = {"doc_id": d, "out_path": png, "views": views or []}
+            if bg is not None:
+                params["background"] = bg
+            r = cb.call("doc_render_contact_sheet", params)
             if not r.get("ok") or not os.path.exists(png):
                 raise ValueError(
                     f"Contact sheet failed: "
                     f"{r.get('reason', r.get('error', 'no bodies to render'))}")
-            return _captioned_render(png, d, view_list)
+            return _with_save_note(_captioned_render(png, d, view_list),
+                                   _render_save_note(png, save_to))
 
         tiles, labels, infos = _annotated_view_tiles(d, view_list, highlight=highlight,
-                                                     annotate=annotate)
+                                                     annotate=annotate, background=bg)
         if not tiles:
             raise ValueError("Contact sheet failed: no bodies to render")
         out = render_output_path(_render_stem(d, "contact-sheet"), ".png")
         _tile_pngs_grid(tiles, out, labels=labels,
                         cols=max(1, int(math.ceil(math.sqrt(len(tiles))))))
-        return _captioned_render(out, d, labels,
-                                 annotations=_merge_annotation_infos(infos),
-                                 extra=f"Contact sheet, {len(tiles)} tiles: "
-                                       + ", ".join(labels) + ".")
+        return _with_save_note(
+            _captioned_render(out, d, labels,
+                              annotations=_merge_annotation_infos(infos),
+                              extra=f"Contact sheet, {len(tiles)} tiles: "
+                                    + ", ".join(labels) + "."),
+            _render_save_note(out, save_to))
 
 
 
@@ -451,7 +725,9 @@ def register_cad_render_tools(mcp: FastMCP) -> None:
                      views: Optional[list] = None,
                      target: Optional[Union[str, dict]] = None,
                      highlight: Optional[Union[str, dict, list]] = None,
-                     annotate: bool = True) -> list:
+                     annotate: bool = True,
+                     background: Optional[Union[list, str]] = None,
+                     save_path: Optional[str] = None) -> list:
         """Multi-view contact sheet — 6 orthographic + iso by default, each tile labelled.
 
         The VLM-standard multi-view set for manufacturing feature recognition (holes, bosses,
@@ -475,10 +751,22 @@ def register_cad_render_tools(mcp: FastMCP) -> None:
         VERIFY LOOP: call after mutations when you need full angular coverage; pair with
         inspect_feature for a single emphasized close-up and verify_battery before done.
 
+        background (optional): [r, g, b] 0-255 or "#rrggbb" — the clear colour every tile is
+        rendered onto (see render_part).
+
+        save_path (optional): ALSO write the finished GRID to this absolute .png path — the
+        6-ortho+iso (or target-framed) tiled image with its tile labels and overlays,
+        byte-identical to the image returned inline (one flat RGB PNG, not one file per
+        view). Same rules as render_part: absolute, inside the project/workspace dir unless
+        CHUDWARE_RENDER_SAVE_ANYWHERE=1, and the caption gains
+        `saved: <path> (<bytes> B, sha256 <first 12>)`.
+
         Returns [image, caption]. The caption is self-sufficient: resolved views, part name and
         bbox, the features seen across the sheet, what is highlighted and in what colour, the
         side-palette colour key, and what no view could see plus the tool to call for it.
         """
+        save_to = _render_save_target(save_path)
+        bg = render_background(background)
         d = _doc(doc_id)
         view_list = _normalize_view_list(views)
         if target is None:
@@ -486,27 +774,33 @@ def register_cad_render_tools(mcp: FastMCP) -> None:
             # so there is no per-tile image to draw edges or a highlight onto).
             if not annotate and highlight is None:
                 png = render_output_path(_render_stem(d, "views"), ".png")
-                r = cb.call("doc_render_contact_sheet",
-                            {"doc_id": d, "out_path": png, "views": view_list})
+                params = {"doc_id": d, "out_path": png, "views": view_list}
+                if bg is not None:
+                    params["background"] = bg
+                r = cb.call("doc_render_contact_sheet", params)
                 if not r.get("ok") or not os.path.exists(png):
                     raise ValueError(
                         f"render_views failed: {r.get('reason', r.get('error', 'no bodies'))}")
                 names = r.get("views") or [
                     (v if isinstance(v, str) else "custom") for v in view_list
                 ]
-                return _captioned_render(png, d, list(names),
-                                         extra=f"render_views grid ({len(names)} tiles: "
-                                               + ", ".join(str(n) for n in names) + ").")
+                return _with_save_note(
+                    _captioned_render(png, d, list(names),
+                                      extra=f"render_views grid ({len(names)} tiles: "
+                                            + ", ".join(str(n) for n in names) + ")."),
+                    _render_save_note(png, save_to))
             tiles, labels, infos = _annotated_view_tiles(d, view_list, highlight=highlight,
-                                                         annotate=annotate)
+                                                         annotate=annotate, background=bg)
             if not tiles:
                 raise ValueError("render_views failed: no bodies to render")
             out = render_output_path(_render_stem(d, "views"), ".png")
             _tile_pngs_grid(tiles, out, labels=labels, cols=3)
-            return _captioned_render(out, d, labels,
-                                     annotations=_merge_annotation_infos(infos),
-                                     extra=f"render_views grid ({len(tiles)} tiles: "
-                                           + ", ".join(labels) + ").")
+            return _with_save_note(
+                _captioned_render(out, d, labels,
+                                  annotations=_merge_annotation_infos(infos),
+                                  extra=f"render_views grid ({len(tiles)} tiles: "
+                                        + ", ".join(labels) + ")."),
+                _render_save_note(out, save_to))
 
         # Target-framed path: the ENGINE frames each tile on the target AABB (a real close-up
         # per view), and every tile carries the exact-mask emphasis so you can tell at a glance
@@ -522,7 +816,7 @@ def register_cad_render_tools(mcp: FastMCP) -> None:
             d, view_list, highlight=highlight, annotate=annotate,
             part_bb=part_bb, target_bb=target_bb, matches=matches,
             emphasis_mode="emphasis",
-            clip_near=_target_is_internal(matches, part_bb))
+            clip_near=_target_is_internal(matches, part_bb), background=bg)
         if not tile_paths:
             raise ValueError("render_views: every tile render failed")
         out = render_output_path(
@@ -543,7 +837,178 @@ def register_cad_render_tools(mcp: FastMCP) -> None:
         ann = _merge_annotation_infos(infos)
         if ann:
             caption += " " + _render_annotation_caption("target-framed grid", ann)
-        return [Image(path=out), caption]
+        return _with_save_note([Image(path=out), caption],
+                               _render_save_note(out, save_to))
+
+
+    @mcp.tool()
+    def render_study_setup(fixtures: list,
+                           load: Union[list, dict, str],
+                           view: Optional[Union[str, dict]] = None,
+                           doc_id: Optional[str] = None,
+                           save_path: Optional[str] = None) -> list:
+        """The FIXTURE/LOAD figure for an FEA evidence document — what is held, what pushes.
+
+        Renders the whole part with the study's boundary conditions painted on the actual
+        faces the solver would use: every FIXTURE face in ONE reserved colour (magenta),
+        every LOAD face in another (violet), the rest of the part desaturated so the two
+        groups read at a glance. This is the figure a report needs beside a stress plot: it
+        shows the reader WHICH faces the numbers assumed were bolted down and pushed on.
+
+        fixtures / load: EXACTLY the run_fea_static dialect, resolved by the same code —
+          fixtures = list of face queries held fully fixed, e.g. ["bottom"] or
+            [{"of":"face","side":"bottom","pick":"largest"}] or a face SID ("F58db6d");
+          load = the mechanical load(s): [{"face":"top","force":[0,0,-500]}] (newtons, world
+            XYZ), the polar form [{"face":"top","magnitude":500,"direction":[0,0,-1]}], or
+            [{"face":"top","pressure":0.5}] (MPa, inward along the face normal). A single
+            dict is accepted as a one-item list.
+          Because the resolution, the key normalization and the setup gates are the SAME
+          ones run_fea_static runs, a setup this tool draws is a setup that solves: an
+          unresolvable query, a zero load, or a load applied entirely on a fixed face is
+          refused here with the solver's own message. Draw the figure first, then run the
+          study with the identical arguments.
+
+        view (optional): a named view ("front"/"top"/"iso"/...) or a custom camera dict
+          ({"azimuth","elevation"} or {"dir":[x,y,z]}) — same vocabulary as render_part.
+          Omit it and the camera is chosen by the occlusion scorer as the one direction that
+          actually SEES the most of the fixture + load faces.
+
+        save_path (optional): ALSO write this figure to your own absolute .png path. The
+          file contains exactly the bytes returned inline — one flat RGB PNG of the shaded
+          part with the fixture/load paint, glow outlines, per-face labels, B-rep edge
+          outline, feature callouts and scale bar already burned in (no layers, no alpha,
+          no metadata), ready to embed in a report. Same rules as render_part: absolute,
+          inside the project/workspace dir unless CHUDWARE_RENDER_SAVE_ANYWHERE=1.
+
+        Returns [image, caption]. The caption carries the legend in words —
+        `FIXTURE (magenta): <sids + areas>` and `LOAD (violet): <resultant N, direction,
+        sids + areas>` — plus which of those faces this camera can actually see, so a
+        non-vision reader (and the document itself) can quote the setup without the picture.
+        """
+        save_to = _render_save_target(save_path)
+        d = _doc(doc_id)
+        notes: list = []
+        fix_queries = _norm_bc_list(
+            require_list(fixtures, "fixtures",
+                         'a list of face queries held fixed, e.g. ["bottom"]'),
+            "fixtures", unwrap_query=True, notes=notes)
+        load_entries = _norm_bc_list(
+            require_list(load, "load",
+                         'a list of {face query + force or pressure}, e.g. '
+                         '[{"face":"top","force":[0,0,-500]}]'),
+            "load", notes=notes)
+        if not fix_queries:
+            raise ValueError(
+                "render_study_setup needs at least one fixture face query — a study figure "
+                "with nothing held shows a part in free flight. Pass the mounted face, e.g. "
+                'fixtures=["bottom"].')
+        if not load_entries:
+            raise ValueError(
+                "render_study_setup needs the load — pass load=[{\"face\":\"top\","
+                "\"force\":[0,0,-500]}] (newtons) or [{\"face\":\"top\",\"pressure\":0.5}] "
+                "(MPa). " + _BC_SHAPE_HELP)
+        # The solver's own resolution + gates. _sim_face_points is the fixture loop of
+        # _build_static_study verbatim; _build_load_specs is the load side (it rejects a
+        # zero load); _reject_fully_constrained_loads rejects a load that sits entirely on a
+        # fixed face. A refusal is re-raised as the argument error it is.
+        try:
+            fixture_sets = [_sim_face_points(d, q) for q in fix_queries]
+            load_specs = _build_load_specs(d, load_entries, "study setup")
+            _reject_fully_constrained_loads([s for sets in fixture_sets for s in sets],
+                                            load_specs, "study setup")
+        except _StudyRefusal as refusal:
+            raise ValueError(refusal.payload.get("error", str(refusal))) from None
+        fix_groups = [_bc_group(d, q, sets, "fixture")
+                      for q, sets in zip(fix_queries, fixture_sets)]
+        load_groups = [_bc_group(d, e["face"], [spec["faces"]], "load")
+                       for e, spec in zip(load_entries, load_specs)]
+
+        fix_matches = [m for g in fix_groups for m in g["matches"]]
+        load_matches = [m for g in load_groups for m in g["matches"]]
+        both = ({s for g in fix_groups for s in g["sids"]}
+                & {s for g in load_groups for s in g["sids"]})
+        if both:
+            raise ValueError(
+                f"face(s) {', '.join(sorted(both))} are in BOTH the fixture and the load "
+                "set, so one colour would paint over the other and the figure would lie "
+                "about the setup. A fully fixed face cannot also carry a load — fix the "
+                "study, then draw it.")
+        all_matches = fix_matches + load_matches
+        # One palette entry per match, in the SAME order _annotate_render walks them, so a
+        # group's faces all land on that group's reserved colour.
+        palette = {
+            "mode": "study_setup",
+            "entries": [{"key": str(m.get("sid") or f"fixture{i}"), "sid": m.get("sid"),
+                         "rgb": list(_FIXTURE_RGB), "role": "fixture"}
+                        for i, m in enumerate(fix_matches)]
+                       + [{"key": str(m.get("sid") or f"load{i}"), "sid": m.get("sid"),
+                           "rgb": list(_LOAD_RGB), "role": "load"}
+                          for i, m in enumerate(load_matches)],
+            "legend": (f"FIXTURE={_FIXTURE_COLOUR} "
+                       f"#{_FIXTURE_RGB[0]:02X}{_FIXTURE_RGB[1]:02X}{_FIXTURE_RGB[2]:02X}, "
+                       f"LOAD={_LOAD_COLOUR} "
+                       f"#{_LOAD_RGB[0]:02X}{_LOAD_RGB[1]:02X}{_LOAD_RGB[2]:02X}"),
+            "context_desat": _CONTEXT_DESAT,
+            "glow_rgb": list(_EMPHASIS_GLOW),
+        }
+
+        target_bb = _target_bbox(d, all_matches)
+        if view is None:
+            pick = _ideal_views(d, all_matches, target_bb, n=1)[0]
+            view_dir = pick["dir"]
+            view_name = f"study-{pick.get('label') or 'auto'}"
+        else:
+            view_dir = _camera_dir_for_target(all_matches, view)
+            view_name = view if isinstance(view, str) else "custom"
+        # Whole part, NOT framed on the BCs: a setup figure has to show what is being held
+        # and pushed IN the part, otherwise the reader cannot tell which end is which.
+        stem = _render_stem(d, "study-setup")
+        png = render_output_path(stem, ".png")
+        png, frame, _r = _render_view_png(d, view_dir, png,
+                                          name=f"STUDY {str(view_name).upper()}"[:28],
+                                          annotate=True)
+        png, ann_info = _annotate_render(
+            png, d, view_dir, edges=True, callouts=True, scale=True, frame=frame,
+            emphasis={"matches": all_matches, "mode": "study_setup",
+                      "label": "FIXTURE+LOAD", "palette": palette},
+            out_png=render_output_path(stem, ".png"))
+
+        emp = (ann_info or {}).get("emphasis") or {}
+        visible = set(emp.get("visible_sids") or [])
+        resultant, terms = _load_resultant(load_specs, load_groups)
+        mag = math.sqrt(sum(c * c for c in resultant))
+        direction = (f"[{resultant[0] / mag:.3f}, {resultant[1] / mag:.3f}, "
+                     f"{resultant[2] / mag:.3f}]" if mag > 1e-12
+                     else "none (the load entries cancel to a zero resultant)")
+        fix_nodes = sum(g["n_points"] for g in fix_groups)
+        load_nodes = sum(g["n_points"] for g in load_groups)
+        legend = (
+            f"Study setup figure. FIXTURE ({_FIXTURE_COLOUR}): {_sids_areas_text(fix_groups)}"
+            f" — fully fixed, all DOF, {fix_nodes} solver sample node(s) across "
+            f"{len(fix_matches)} face(s). "
+            f"LOAD ({_LOAD_COLOUR}): resultant {mag:.4g} N, direction {direction}, "
+            f"vector [{resultant[0]:.4g}, {resultant[1]:.4g}, {resultant[2]:.4g}] N "
+            f"({'; '.join(terms)}); {_sids_areas_text(load_groups)}"
+            f" — {load_nodes} solver sample node(s) across {len(load_matches)} face(s)."
+        )
+        if not emp.get("target_px"):
+            legend += (" WARNING: the colour overlay could NOT be painted ("
+                       + str(emp.get("note") or (ann_info or {}).get("note")
+                             or "no tessellation")
+                       + ") — this image is the plain render, so read the sids above rather "
+                         "than the pixels.")
+        else:
+            hidden = [s for g in (fix_groups + load_groups) for s in g["sids"]
+                      if s not in visible]
+            legend += (f" Visible from this camera: {', '.join(sorted(visible)) or 'none'}."
+                       + (f" NOT visible from here: {', '.join(hidden)} — re-call with"
+                          f" view= another direction for a figure that shows them."
+                          if hidden else ""))
+        if notes:
+            legend += " Input normalization: " + " ".join(str(n) for n in notes)
+        return _with_save_note(
+            _captioned_render(png, d, [view_name], annotations=ann_info, extra=legend),
+            _render_save_note(png, save_to))
 
 
 

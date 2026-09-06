@@ -14,8 +14,11 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <cstdint>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
+#include <sstream>
 #include <map>
 #include <limits>
 #include <set>
@@ -854,4 +857,118 @@ TEST_CASE("run_wind_tunnel is cancellable through FlowParams.job_id (sim_cancel)
     auto after = sim_cancel("sim-test-wt-cancel");
     CHECK(after.value("ok", false));
     CHECK_FALSE(after.value("cancelled", true));
+}
+
+// ── The summary reduction is disclosed, and the .vtu can reproduce it ───────────
+// A released packet reported max_von_mises_mpa = 109.7 MPa while the .vtu written by
+// the SAME solve peaked at 403 MPa: both are the node-averaged field, but the summary
+// silently drops the two element rings around ideal fixtures (a clamp singularity).
+// The reported number is only evidence if the file says which nodes produced it, so
+// summary_node ships with von_mises and the two reductions are named.
+TEST_CASE("static summary discloses its reduction and the mask reproduces it") {
+    const double Lx = 100.0, Ly = 10.0, Lz = 10.0;
+    BoxMesh m = make_box_tet4(10, 2, 2, Lx, Ly, Lz);
+    const int n_nodes = static_cast<int>(m.points.size() / 3);
+    std::vector<int> fixed;
+    std::vector<double> forces(static_cast<size_t>(n_nodes) * 3, 0.0);
+    int loaded = 0;
+    for (int i = 0; i < n_nodes; ++i) {
+        if (m.points[static_cast<size_t>(i) * 3] < 1e-9) fixed.push_back(i);
+        if (std::abs(m.points[static_cast<size_t>(i) * 3] - Lx) < 1e-9) ++loaded;
+    }
+    for (int i = 0; i < n_nodes; ++i)
+        if (std::abs(m.points[static_cast<size_t>(i) * 3] - Lx) < 1e-9)
+            forces[static_cast<size_t>(i) * 3 + 2] = -1000.0 / loaded;
+    auto r = fea_static_solve(m.points, m.tets, 200000.0, 0.3, 250.0, fixed, forces, 4);
+    REQUIRE(r.ok);
+
+    // The mask is complete, and it really excluded something (this cantilever's
+    // nodal peak IS at the clamp — that is the whole point of the exclusion).
+    REQUIRE(r.summary_node.size() == static_cast<size_t>(n_nodes));
+    CHECK(r.summary_excluded_nodes > 0);
+    CHECK(r.summary_excluded_nodes < n_nodes);
+    CHECK(r.summary_excluded_nodes ==
+          static_cast<int>(std::count(r.summary_node.begin(), r.summary_node.end(),
+                                      std::uint8_t{0})));
+
+    // Both reductions are reproducible from the field + the mask, exactly.
+    double masked = 0.0, unmasked = 0.0;
+    for (int i = 0; i < n_nodes; ++i) {
+        const double v = r.von_mises[static_cast<size_t>(i)];
+        unmasked = std::max(unmasked, v);
+        if (r.summary_node[static_cast<size_t>(i)]) masked = std::max(masked, v);
+    }
+    CHECK(r.max_von_mises_mpa == doctest::Approx(masked).epsilon(1e-12));
+    CHECK(r.max_von_mises_raw_mpa == doctest::Approx(unmasked).epsilon(1e-12));
+    CHECK(r.max_von_mises_raw_mpa > r.max_von_mises_mpa);
+    CHECK(r.min_fos_raw < r.min_fos);
+    CHECK(r.min_fos_raw == doctest::Approx(250.0 / unmasked).epsilon(1e-12));
+}
+
+// The documented fallback: when the fixture rings would consume the whole mesh the
+// summary reverts to the complete field rather than reporting zero stress — and then
+// there is nothing to disclose, so the raw and reported numbers must coincide.
+TEST_CASE("summary falls back to the whole field when the fixture ring eats the mesh") {
+    std::vector<double> pts = {0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1};
+    std::vector<int> tets = {0, 1, 2, 3};
+    std::vector<int> fixed = {0, 1, 2};
+    std::vector<double> forces(12, 0.0);
+    forces[11] = -100.0;
+    auto r = fea_static_solve(pts, tets, 200000.0, 0.3, 250.0, fixed, forces, 4);
+    REQUIRE(r.ok);
+    CHECK(r.summary_excluded_nodes == 0);
+    CHECK(std::count(r.summary_node.begin(), r.summary_node.end(), std::uint8_t{1}) == 4);
+    CHECK(r.max_von_mises_raw_mpa == doctest::Approx(r.max_von_mises_mpa).epsilon(1e-12));
+    CHECK(r.min_fos_raw == doctest::Approx(r.min_fos).epsilon(1e-12));
+}
+
+// ── tet10 nodal stress recovery reaches the extreme fibre ───────────────────────
+// A quadratic element's stress varies over the element, so recovery must extrapolate
+// its 4 Gauss points to the nodes. Collapsing them to one element-constant tensor
+// first (what this solver used to do) clips every gradient: the recovery then reports,
+// at a surface node, the stress from roughly the element's centroid depth. Measured on
+// this cantilever, that read 247.7 MPa where the fibre carries 300 MPa — a 17%
+// under-read — and at a stress concentration it made tet10 read LOWER than tet4: the
+// V&V plate-with-a-hole recovered SCF 2.44 where CalculiX C3D10, handed the identical
+// mesh, recovered 3.44 (docs/vv/FEA_VV_REPORT.md, PLATE-HOLE).
+//
+// The contract: at a Saint-Venant station of a tip-loaded cantilever the nodal sigma_xx
+// on the extreme fibre is M(x)c/I. Beam theory is exact enough here (L/h = 10, station
+// at mid-span) that the gate can be tight, and it is two-sided so an extrapolation that
+// overshoots — a wrong Gauss-point-to-corner permutation scrambles the linear part and
+// lands well outside — fails just as loudly as one that under-reads.
+TEST_CASE("tet10 nodal stress recovery reports the extreme-fibre bending stress") {
+    const double Lx = 100.0, Ly = 10.0, Lz = 10.0;
+    const double E = 200000.0, nu = 0.30, Fz = -1000.0, station = 50.0;
+    BoxMesh m = promote_to_tet10(make_box_tet4(20, 4, 4, Lx, Ly, Lz));
+    const int nn = static_cast<int>(m.points.size() / 3);
+    std::vector<int> fixed, tip;
+    for (int nid = 0; nid < nn; ++nid) {
+        const double x = m.points[nid * 3 + 0];
+        if (std::abs(x) < 1e-9) fixed.push_back(nid);
+        if (std::abs(x - Lx) < 1e-9) tip.push_back(nid);
+    }
+    std::vector<double> forces(static_cast<size_t>(nn) * 3, 0.0);
+    for (int nid : tip) forces[nid * 3 + 2] += Fz / static_cast<double>(tip.size());
+    FeaStaticResult r = fea_static_solve(m.points, m.tets, E, nu, 250.0, fixed, forces, 10);
+    REQUIRE(r.ok);
+    REQUIRE(r.stress_xx.size() == static_cast<size_t>(nn));
+
+    // Tip load along -Z puts the +Z fibre in tension: sigma_xx = +M c / I.
+    const double I = Ly * Lz * Lz * Lz / 12.0;
+    const double analytic = std::abs(Fz) * (Lx - station) * (Lz / 2.0) / I;
+    double sum = 0.0;
+    int count = 0;
+    for (int nid = 0; nid < nn; ++nid) {
+        if (std::abs(m.points[nid * 3 + 0] - station) > 1e-9) continue;
+        if (std::abs(m.points[nid * 3 + 2] - Lz) > 1e-9) continue;
+        sum += r.stress_xx[static_cast<size_t>(nid)];
+        ++count;
+    }
+    REQUIRE(count >= 5);
+    const double fibre = sum / static_cast<double>(count);
+    MESSAGE("tet10 extreme-fibre sigma_xx=", fibre, " analytic=", analytic,
+            " ratio=", fibre / analytic, " over ", count, " nodes");
+    CHECK(fibre > 0.97 * analytic);
+    CHECK(fibre < 1.03 * analytic);
 }

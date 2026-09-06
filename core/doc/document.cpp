@@ -99,6 +99,12 @@
 #include <ShapeFix_Shape.hxx>  // the `heal` feature (ShapeFix repair of an imported body)
 #include <ShapeFix_Solid.hxx>  // heal an inverted/negative-volume solid (Bug N2) + `heal`
 #include <ShapeFix_Wireframe.hxx>  // `heal` fix_small_edges: drop tiny edges / close wire gaps
+#include <BOPAlgo_MakerVolume.hxx>  // `heal` rebuild_solid: re-derive the solid from its faces
+#include <BRepBuilderAPI_MakeSolid.hxx>  // `heal` sew/orientation: shell -> solid
+#include <BRepBuilderAPI_Sewing.hxx>  // `heal` sew_tolerance_mm: re-derive edge sharing
+#include <BRepLib.hxx>  // `heal` fix_orientation: BRepLib::OrientClosedSolid
+#include <ShapeUpgrade_UnifySameDomain.hxx>  // `heal` unify_faces: merge same-domain faces
+#include <TopTools_ListOfShape.hxx>  // BOPAlgo_MakerVolume arguments
 
 #include "doc/formats.h"  // import_bodies / detect_format (the import feature)
 #include "doc/picks.h"
@@ -687,6 +693,276 @@ double heal_volume(const TopoDS_Shape& shape) {
     } catch (const Standard_Failure&) {
         return 0.0;
     }
+}
+
+// Total surface area of a shape. Unlike the volume integral this is INDEPENDENT of
+// face orientation, which makes it the only trustworthy "did the heal rebuild
+// geometry?" witness on a body whose orientation flags are the defect.
+double heal_area(const TopoDS_Shape& shape) {
+    if (shape.IsNull()) return 0.0;
+    try {
+        GProp_GProps props;
+        BRepGProp::SurfaceProperties(shape, props);
+        return props.Mass();
+    } catch (const Standard_Failure&) {
+        return 0.0;
+    }
+}
+
+// Axis-aligned bounds as [minx,miny,minz,maxx,maxy,maxz]; all zeros for a null/void
+// shape. The envelope is what proves a repair did not MOVE the part.
+std::array<double, 6> heal_bbox(const TopoDS_Shape& shape) {
+    std::array<double, 6> out{0, 0, 0, 0, 0, 0};
+    if (shape.IsNull()) return out;
+    try {
+        Bnd_Box box;
+        BRepBndLib::Add(shape, box);
+        if (box.IsVoid()) return out;
+        box.Get(out[0], out[1], out[2], out[3], out[4], out[5]);
+    } catch (const Standard_Failure&) {
+    }
+    return out;
+}
+
+// Number of edges whose two adjacent faces traverse them in the SAME direction.
+//
+// This is exactly the test BRepCheck_Shell::Orientation applies to a shell inside a
+// solid, and therefore exactly what `bad_orientation_of_subshape` means: a closed
+// orientable shell must present every non-degenerate edge twice, once forward and
+// once reversed. 0 for a sound body (verified against MakeBox/MakeCylinder and a
+// boolean-cut tube); the live rover spine arrived with 144 of its 344 edges bad.
+// Reported alongside the issue names because "one issue kind" hides whether a repair
+// went from 144 bad edges to 68 or to 0.
+int heal_bad_edge_count(const TopoDS_Shape& shape) {
+    if (shape.IsNull()) return 0;
+    try {
+        TopTools_IndexedMapOfShape emap;
+        TopExp::MapShapes(shape, TopAbs_EDGE, emap);
+        // Per edge index: the traversal orientations it takes across all faces.
+        std::vector<std::array<TopAbs_Orientation, 2>> seen(
+            static_cast<std::size_t>(emap.Extent()) + 1,
+            {TopAbs_INTERNAL, TopAbs_INTERNAL});
+        std::vector<int> uses(static_cast<std::size_t>(emap.Extent()) + 1, 0);
+        for (TopExp_Explorer fe(shape, TopAbs_FACE); fe.More(); fe.Next()) {
+            // TopExp_Explorer composes parent orientations, so Orientation() already
+            // IS the sense in which the oriented face traverses the edge.
+            for (TopExp_Explorer ee(fe.Current(), TopAbs_EDGE); ee.More(); ee.Next()) {
+                const int i = emap.FindIndex(ee.Current());
+                if (i < 1) continue;
+                const std::size_t k = static_cast<std::size_t>(i);
+                if (uses[k] < 2) seen[k][uses[k]] = ee.Current().Orientation();
+                ++uses[k];
+            }
+        }
+        int bad = 0;
+        for (int i = 1; i <= emap.Extent(); ++i) {
+            const std::size_t k = static_cast<std::size_t>(i);
+            if (uses[k] != 2 || seen[k][0] != seen[k][1]) continue;
+            if (BRep_Tool::Degenerated(TopoDS::Edge(emap.FindKey(i)))) continue;
+            ++bad;
+        }
+        return bad;
+    } catch (const Standard_Failure&) {
+        return 0;
+    }
+}
+
+// Wrap closed shells as a solid, orienting each shell OUTWARD (positive enclosed
+// volume) first. BRepLib::OrientClosedSolid only flips the SOLID, which leaves the
+// shell's own flag — and therefore BRepCheck's shell-in-solid verdict — untouched;
+// reversing the shell is what actually fixes an inside-out body.
+TopoDS_Shape heal_solid_from_shells(const TopoDS_Shape& shape) {
+    BRepBuilderAPI_MakeSolid mk;
+    int n = 0;
+    for (TopExp_Explorer se(shape, TopAbs_SHELL); se.More(); se.Next()) {
+        TopoDS_Shell shell = TopoDS::Shell(se.Current());
+        GProp_GProps props;
+        BRepGProp::VolumeProperties(shell, props);
+        if (props.Mass() < 0.0) shell.Reverse();
+        mk.Add(shell);
+        ++n;
+    }
+    if (n == 0 || !mk.IsDone()) return TopoDS_Shape();
+    TopoDS_Solid solid = mk.Solid();
+    try {
+        BRepLib::OrientClosedSolid(solid);
+    } catch (const Standard_Failure&) {
+    }
+    return solid;
+}
+
+// Flood-fill the face-orientation graph of every shell: two faces sharing an edge
+// must traverse it in opposite senses, so flipping one face flips that constraint.
+// Returns the re-oriented shape and reports how many faces were flipped and how many
+// constraints could NOT be satisfied (`conflicts` > 0 means the input's edge sharing
+// is self-contradictory — flag repair alone cannot fix it, and rebuild_solid is the
+// next escalation). Purely topological: no surface is rebuilt, so areas and analytic
+// surface types are preserved exactly.
+TopoDS_Shape heal_flood_orientation(const TopoDS_Shape& shape, int& flipped,
+                                    int& conflicts) {
+    flipped = 0;
+    conflicts = 0;
+    std::vector<TopoDS_Shape> faces;
+    for (TopExp_Explorer fe(shape, TopAbs_FACE); fe.More(); fe.Next())
+        faces.push_back(fe.Current());
+    const int nf = static_cast<int>(faces.size());
+    if (nf == 0) return shape;
+
+    TopTools_IndexedMapOfShape emap;
+    TopExp::MapShapes(shape, TopAbs_EDGE, emap);
+    // Per edge: the (face, +1 forward / -1 reversed) uses, capped at two.
+    struct Use { int face = -1; int sense = 0; };
+    std::vector<std::array<Use, 2>> uses(static_cast<std::size_t>(emap.Extent()) + 1);
+    std::vector<int> count(static_cast<std::size_t>(emap.Extent()) + 1, 0);
+    for (int i = 0; i < nf; ++i)
+        for (TopExp_Explorer ee(faces[i], TopAbs_EDGE); ee.More(); ee.Next()) {
+            const int e = emap.FindIndex(ee.Current());
+            if (e < 1) continue;
+            if (BRep_Tool::Degenerated(TopoDS::Edge(emap.FindKey(e)))) continue;
+            const std::size_t k = static_cast<std::size_t>(e);
+            if (count[k] < 2)
+                uses[k][count[k]] = Use{i, ee.Current().Orientation() == TopAbs_FORWARD
+                                                ? 1 : -1};
+            ++count[k];
+        }
+    // flip[a] * flip[b] == need  for every manifold edge shared by two DISTINCT faces.
+    // A seam edge (same face twice) carries no constraint between faces.
+    std::vector<std::vector<std::pair<int, int>>> adj(static_cast<std::size_t>(nf));
+    for (int e = 1; e <= emap.Extent(); ++e) {
+        const std::size_t k = static_cast<std::size_t>(e);
+        if (count[k] != 2) continue;
+        const Use& a = uses[k][0];
+        const Use& b = uses[k][1];
+        if (a.face == b.face) continue;
+        const int need = -a.sense * b.sense;
+        adj[static_cast<std::size_t>(a.face)].push_back({b.face, need});
+        adj[static_cast<std::size_t>(b.face)].push_back({a.face, need});
+    }
+
+    std::vector<int> flip(static_cast<std::size_t>(nf), 0);
+    std::vector<int> queue;
+    for (int s = 0; s < nf; ++s) {
+        if (flip[static_cast<std::size_t>(s)] != 0) continue;
+        flip[static_cast<std::size_t>(s)] = 1;
+        queue.clear();
+        queue.push_back(s);
+        for (std::size_t qi = 0; qi < queue.size(); ++qi) {
+            const int u = queue[qi];
+            for (const auto& [v, need] : adj[static_cast<std::size_t>(u)]) {
+                const int want = need * flip[static_cast<std::size_t>(u)];
+                int& fv = flip[static_cast<std::size_t>(v)];
+                if (fv == 0) {
+                    fv = want;
+                    queue.push_back(v);
+                } else if (fv != want) {
+                    ++conflicts;
+                }
+            }
+        }
+    }
+    conflicts /= 2;  // every unsatisfiable constraint is met from both ends
+
+    // Rebuild each shell with the flood-filled orientations, then re-wrap as a solid.
+    BRep_Builder bb;
+    TopoDS_Compound comp;
+    bb.MakeCompound(comp);
+    int fi = 0;
+    int shells = 0;
+    for (TopExp_Explorer se(shape, TopAbs_SHELL); se.More(); se.Next()) {
+        TopoDS_Shell out;
+        bb.MakeShell(out);
+        for (TopExp_Explorer fe(se.Current(), TopAbs_FACE); fe.More(); fe.Next(), ++fi) {
+            const bool rev = flip[static_cast<std::size_t>(fi)] < 0;
+            if (rev) ++flipped;
+            bb.Add(out, rev ? faces[static_cast<std::size_t>(fi)].Reversed()
+                            : faces[static_cast<std::size_t>(fi)]);
+        }
+        out.Closed(BRep_Tool::IsClosed(out));
+        bb.Add(comp, out);
+        ++shells;
+    }
+    if (shells == 0) return shape;
+    const TopoDS_Shape solid = heal_solid_from_shells(comp);
+    return solid.IsNull() ? TopoDS_Shape(comp) : solid;
+}
+
+// Re-derive the solid from its FACES with BOPAlgo_MakerVolume: the faces are
+// intersected against each other and every enclosed cell is rebuilt with a
+// geometrically-derived orientation, so a body whose stored flags are
+// self-contradictory (see heal_flood_orientation's `conflicts`) is recovered.
+// Self-intersecting input splits into several cells; the principal (largest) lump is
+// the body and the rest are the artefacts the intersection exposed — both are
+// reported so the caller judges the loss instead of trusting it.
+//
+// `fuzzy` (mm, <= 0 = OCCT's own tolerance) is the intersection's merge distance and it
+// decides whether the result is MESHABLE. At the default tolerance every pair of
+// near-coincident faces in the input yields its own intersection line, so the rebuild
+// hands back razor strips: body 47 came out valid but carrying two crescent faces
+// 0.011 mm wide, and polymesh refused the whole fill ("CAD face 5 has no aligned
+// delivered boundary patch", the quoted distance being exactly that width) at h=8 mm and
+// again at 4.8 — no element size resolves an 11 micron strip. At fuzzy 0.05 mm the same
+// faces merge during the intersection and the strips are never created.
+TopoDS_Shape heal_rebuild_solid(const TopoDS_Shape& shape, int& lumps,
+                                double& kept_volume, double& discarded_volume,
+                                double fuzzy) {
+    lumps = 0;
+    kept_volume = 0.0;
+    discarded_volume = 0.0;
+    TopTools_ListOfShape args;
+    for (TopExp_Explorer fe(shape, TopAbs_FACE); fe.More(); fe.Next())
+        args.Append(fe.Current());
+    if (args.IsEmpty()) return TopoDS_Shape();
+    BOPAlgo_MakerVolume mv;
+    mv.SetArguments(args);
+    mv.SetIntersect(Standard_True);
+    mv.SetAvoidInternalShapes(Standard_True);
+    if (fuzzy > 0.0) mv.SetFuzzyValue(fuzzy);
+    mv.Perform();
+    if (mv.HasErrors()) return TopoDS_Shape();
+    const TopoDS_Shape cells = mv.Shape();
+    if (cells.IsNull()) return TopoDS_Shape();
+
+    TopoDS_Shape best;
+    double total = 0.0;
+    for (TopExp_Explorer se(cells, TopAbs_SOLID); se.More(); se.Next()) {
+        const double v = heal_volume(se.Current());
+        total += v;
+        ++lumps;
+        if (best.IsNull() || v > kept_volume) {
+            kept_volume = v;
+            best = se.Current();
+        }
+    }
+    if (best.IsNull()) return TopoDS_Shape();
+    discarded_volume = total - kept_volume;
+    return best;
+}
+
+// The width of the NARROWEST face of a shape (mm): min over faces of 2*area/perimeter,
+// the mean width of a strip. A rebuild can hand back a perfectly valid solid carrying a
+// face 0.011 mm across, which no volume mesher can resolve at any element size — the
+// number that predicts that is this one, so `heal` reports it instead of leaving the
+// caller to discover it in a mesher refusal.
+double heal_narrowest_face(const TopoDS_Shape& shape) {
+    double narrowest = 0.0;
+    if (shape.IsNull()) return narrowest;
+    try {
+        for (TopExp_Explorer fe(shape, TopAbs_FACE); fe.More(); fe.Next()) {
+            GProp_GProps ap;
+            BRepGProp::SurfaceProperties(fe.Current(), ap);
+            double perimeter = 0.0;
+            for (TopExp_Explorer ee(fe.Current(), TopAbs_EDGE); ee.More(); ee.Next()) {
+                GProp_GProps lp;
+                BRepGProp::LinearProperties(ee.Current(), lp);
+                perimeter += lp.Mass();
+            }
+            if (!(perimeter > 1e-12)) continue;
+            const double width = 2.0 * ap.Mass() / perimeter;
+            if (narrowest <= 0.0 || width < narrowest) narrowest = width;
+        }
+    } catch (const Standard_Failure&) {
+    }
+    return narrowest;
 }
 
 
@@ -5487,11 +5763,15 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                 // A live frame assembly's imported STEP spine failed health with
                 // `bad_orientation_of_subshape`, and because nothing in the tree could fix
                 // shape topology the agent tried booleans, BREP round-trips and STL sewing
-                // in turn (all wrong, all silently lossy). OCCT ships the right tool —
-                // ShapeFix_Shape (+ ShapeFix_Solid for the solid/shell orientation pass,
-                // ShapeFix_Wireframe for tiny-edge/wire-gap cleanup) — and this makes it a
-                // RECORDED feature so the repair is part of the rebuild, re-runs on every
-                // compile, and can be audited: an unrecorded repair is a claim, not a fix.
+                // in turn (all wrong, all silently lossy).
+                //
+                // ShapeFix is the first answer and often the only one needed, but it is NOT
+                // sufficient: the live rover spine (body 47 of CD-100 Stage 5) arrived with
+                // 144 of its 344 edges traversed the SAME way by both adjacent faces, and a
+                // five-point ShapeFix tolerance ladder (1e-7 … 0.1 mm) either did nothing or,
+                // at 0.1 mm, destroyed 99.21 mm^3 and invented three new defect kinds. So the
+                // op offers three escalating repairs beyond ShapeFix, each opt-in and each
+                // recorded, and REFUSES outright when the result is worse than the input.
                 //
                 // Params:
                 //   tolerance        precision handed to ShapeFix (mm). Default 1e-7 —
@@ -5501,6 +5781,37 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                 //                    wire gaps). Off by default: it REMOVES topology, so a
                 //                    body whose small edges are intentional (a 0.05 mm
                 //                    fillet band) must opt in.
+                //   sew_tolerance_mm re-sew the faces at this tolerance (BRepBuilderAPI_
+                //                    Sewing): edge sharing is re-derived from GEOMETRY, which
+                //                    fixes a body whose stored sharing is wrong. Null = off.
+                //   fix_orientation  flood-fill the face-orientation graph (every edge must be
+                //                    traversed oppositely by its two faces), then re-wrap the
+                //                    shells outward. Purely topological — no surface is
+                //                    rebuilt, so areas and analytic surface types survive
+                //                    exactly. This is the right first escalation and the whole
+                //                    fix for a merely inside-out import.
+                //   rebuild_solid    re-derive the solid from its faces with
+                //                    BOPAlgo_MakerVolume: the faces are intersected and every
+                //                    enclosed cell rebuilt with a geometrically-derived
+                //                    orientation. The escalation for a body whose edge sharing
+                //                    is self-CONTRADICTORY (fix_orientation reports
+                //                    `orientation.conflicts` > 0) — the case ShapeFix, sewing
+                //                    and flag repair all provably cannot reach. Self-
+                //                    intersecting input splits into cells; the principal lump
+                //                    is kept and the discarded ones are reported, budgeted by
+                //                    max_volume_change_pct.
+                //   rebuild_fuzzy_mm the rebuild's intersection merge distance (mm). Null =
+                //                    OCCT's own tolerance, which gives every pair of near-
+                //                    coincident input faces its own intersection line and so
+                //                    leaves RAZOR STRIP faces behind — valid geometry that no
+                //                    volume mesher can resolve (body 47's rebuild carried two
+                //                    0.011 mm crescents and polymesh refused the fill at every
+                //                    element size). 0.05 merges them during the intersection.
+                //                    Only meaningful with rebuild_solid.
+                //   unify_faces      ShapeUpgrade_UnifySameDomain: merge the same-domain faces
+                //                    a rebuild leaves split.
+                //   max_volume_change_pct
+                //                    refusal budget, default 0.5 (%). See the guard block.
                 // Ref: `body` targets an earlier feature id; default is the current running
                 // body. The healed body REPLACES the input (copy:false semantics, like
                 // `transform`) — a repair that left the broken original alive would keep
@@ -5526,10 +5837,77 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                 if (!(tol > 0.0))
                     throw std::runtime_error(type + ": tolerance must be > 0");
                 const bool fix_small_edges = feat.value("fix_small_edges", false);
+                const bool fix_orientation = feat.value("fix_orientation", false);
+                const bool rebuild_solid = feat.value("rebuild_solid", false);
+                const bool unify_faces = feat.value("unify_faces", false);
+                double sew_tol = 0.0;  // 0 = sewing off
+                if (feat.contains("sew_tolerance_mm") && !feat.at("sew_tolerance_mm").is_null()) {
+                    sew_tol = num_or_expr(feat.at("sew_tolerance_mm"), env);
+                    if (!(sew_tol > 0.0))
+                        throw std::runtime_error(type + ": sew_tolerance_mm must be > 0 "
+                                                        "(omit it to skip the sewing pass)");
+                }
+                double rebuild_fuzzy = 0.0;  // 0 = OCCT's own intersection tolerance
+                if (feat.contains("rebuild_fuzzy_mm") &&
+                    !feat.at("rebuild_fuzzy_mm").is_null()) {
+                    rebuild_fuzzy = num_or_expr(feat.at("rebuild_fuzzy_mm"), env);
+                    if (!(rebuild_fuzzy > 0.0))
+                        throw std::runtime_error(type + ": rebuild_fuzzy_mm must be > 0 "
+                                                        "(omit it for OCCT's own tolerance)");
+                }
+                double max_vol_pct = 0.5;
+                if (feat.contains("max_volume_change_pct") &&
+                    !feat.at("max_volume_change_pct").is_null()) {
+                    max_vol_pct = num_or_expr(feat.at("max_volume_change_pct"), env);
+                    if (!(max_vol_pct >= 0.0))
+                        throw std::runtime_error(type + ": max_volume_change_pct must be >= 0");
+                }
 
+                auto count_of = [](const TopoDS_Shape& s, TopAbs_ShapeEnum t) {
+                    TopTools_IndexedMapOfShape m;
+                    TopExp::MapShapes(s, t, m);
+                    return m.Extent();
+                };
                 const std::vector<std::string> before_issues = heal_brep_issues(body);
                 const bool before_valid = before_issues.empty();
                 const double volume_before = heal_volume(body);
+                const double area_before = heal_area(body);
+                const std::array<double, 6> bbox_before = heal_bbox(body);
+                const int bad_edges_before = heal_bad_edge_count(body);
+                const int faces_before = count_of(body, TopAbs_FACE);
+                const int solids_before_heal = count_of(body, TopAbs_SOLID);
+                // A signed volume integral over a shell whose faces disagree about which
+                // side is material is NOT a volume — reversing one face of a 24000 mm^3 box
+                // makes it read 16000. So the raw `volume_before` is only a trustworthy
+                // baseline when the input carries no orientation defect.
+                auto reading_trustworthy = [](const std::vector<std::string>& issues) {
+                    for (const std::string& s : issues)
+                        if (s.find("orientation") != std::string::npos ||
+                            s == "unorientable_shape")
+                            return false;
+                    return true;
+                };
+                const bool volume_reading_trustworthy = reading_trustworthy(before_issues);
+                // The budget still has to apply to that input — it is the whole reason this
+                // op exists — so an untrustworthy reading is NORMALIZED instead of excused:
+                // flood-orient a COPY (topology only, not one surface rebuilt) and integrate
+                // that. The result is the material the shape was MEANT to enclose, and it is
+                // computed the same way on both sides of the repair, so the comparison is
+                // like-for-like whether or not the defect survived. Excusing it instead left
+                // the live spine's -0.93% raw drift completely unguarded.
+                auto material_volume = [&](const TopoDS_Shape& s, bool trustworthy) {
+                    if (trustworthy) return heal_volume(s);
+                    try {
+                        int f = 0, c = 0;
+                        const TopoDS_Shape oriented = heal_flood_orientation(s, f, c);
+                        const double v = std::abs(heal_volume(oriented));
+                        if (v > 1e-12) return v;
+                    } catch (const Standard_Failure&) {
+                    }
+                    return heal_volume(s);
+                };
+                const double material_before =
+                    material_volume(body, volume_reading_trustworthy);
 
                 // --- the ShapeFix pass ------------------------------------------------
                 // MaxTolerance is what actually lets the fixer close a gap: with precision
@@ -5598,28 +5976,116 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                 if (out.IsNull())
                     throw std::runtime_error(type + ": ShapeFix produced an empty shape");
 
-                std::vector<std::string> after_issues = heal_brep_issues(out);
-                bool after_valid = after_issues.empty();
-                double volume_after = heal_volume(out);
-
-                // NEVER hand back a body that is worse than the one we were given. ShapeFix
-                // on an already-valid or near-valid shape can introduce its own damage, and
-                // silently degrading a good body would be the exact failure mode this op
-                // exists to prevent.
-                if (before_valid && !after_valid) {
-                    out = body;
-                    after_issues = before_issues;
-                    after_valid = before_valid;
-                    volume_after = volume_before;
-                    st.warning = "heal: the input was already BRep-valid and ShapeFix made it "
-                                 "worse; the body was left UNCHANGED";
-                } else if (!before_valid && !after_valid) {
-                    st.warning = "heal: ShapeFix did not clear every defect — still " +
-                                 std::to_string(after_issues.size()) + " issue kind(s) (" +
-                                 after_issues.front() + (after_issues.size() > 1 ? ", …" : "") +
-                                 "). Raise `tolerance`, or fix the feature/import that "
-                                 "produced the body.";
+                // --- escalation 1: re-sew ---------------------------------------------
+                // Adding every FACE (not Load()ing the shape) is what forces the sewer to
+                // re-derive edge sharing from geometry instead of preserving the stored one.
+                if (sew_tol > 0.0) {
+                    try {
+                        BRepBuilderAPI_Sewing sew(sew_tol);
+                        sew.SetNonManifoldMode(Standard_False);
+                        for (TopExp_Explorer fe(out, TopAbs_FACE); fe.More(); fe.Next())
+                            sew.Add(fe.Current());
+                        sew.Perform();
+                        const TopoDS_Shape sewn = sew.SewedShape();
+                        if (!sewn.IsNull()) {
+                            const TopoDS_Shape solid = heal_solid_from_shells(sewn);
+                            out = solid.IsNull() ? sewn : solid;
+                        }
+                    } catch (const Standard_Failure&) {
+                        // keep the ShapeFix result
+                    }
                 }
+
+                // --- escalation 2: topological face-orientation flood fill ------------
+                int orient_flipped = 0, orient_conflicts = 0;
+                if (fix_orientation) {
+                    try {
+                        const TopoDS_Shape fixed =
+                            heal_flood_orientation(out, orient_flipped, orient_conflicts);
+                        if (!fixed.IsNull()) out = fixed;
+                    } catch (const Standard_Failure&) {
+                        orient_flipped = 0;
+                        orient_conflicts = 0;
+                    }
+                }
+
+                // --- escalation 3: rebuild the solid from its faces -------------------
+                int rebuild_lumps = 0;
+                double rebuild_kept = 0.0, rebuild_discarded = 0.0;
+                if (rebuild_solid) {
+                    try {
+                        const TopoDS_Shape rebuilt = heal_rebuild_solid(
+                            out, rebuild_lumps, rebuild_kept, rebuild_discarded, rebuild_fuzzy);
+                        if (rebuilt.IsNull())
+                            throw std::runtime_error(
+                                type + ": rebuild_solid failed — BOPAlgo_MakerVolume could not "
+                                       "enclose a volume with this body's faces. The faces do "
+                                       "not bound a closed region; fix the import.");
+                        out = rebuilt;
+                    } catch (const Standard_Failure& ex) {
+                        throw std::runtime_error(type + ": rebuild_solid raised in the kernel: " +
+                                                 std::string(ex.GetMessageString() ?
+                                                             ex.GetMessageString() : "?"));
+                    }
+                }
+
+                if (unify_faces) {
+                    try {
+                        ShapeUpgrade_UnifySameDomain uni(out, Standard_True, Standard_True,
+                                                         Standard_True);
+                        uni.Build();
+                        const TopoDS_Shape unified = uni.Shape();
+                        if (!unified.IsNull()) out = unified;
+                    } catch (const Standard_Failure&) {
+                        // keep the un-unified result
+                    }
+                }
+                if (out.IsNull())
+                    throw std::runtime_error(type + ": the repair produced an empty shape");
+
+                const std::vector<std::string> after_issues = heal_brep_issues(out);
+                const bool after_valid = after_issues.empty();
+                const double volume_after = heal_volume(out);
+                const double area_after = heal_area(out);
+                const std::array<double, 6> bbox_after = heal_bbox(out);
+                const int bad_edges_after = heal_bad_edge_count(out);
+                const bool volume_reading_trustworthy_after = reading_trustworthy(after_issues);
+                const double material_after =
+                    material_volume(out, volume_reading_trustworthy_after);
+
+                double bbox_shift = 0.0;
+                for (int k = 0; k < 6; ++k)
+                    bbox_shift = std::max(bbox_shift, std::abs(bbox_after[k] - bbox_before[k]));
+                double diag = 0.0;
+                for (int k = 0; k < 3; ++k) {
+                    const double d = bbox_before[k + 3] - bbox_before[k];
+                    diag += d * d;
+                }
+                diag = std::sqrt(diag);
+                // "The envelope did not move": ten times the LARGEST merge distance the
+                // caller authorized (ShapeFix precision, sewing, the rebuild's fuzzy value),
+                // floored at 1e-6 mm and at 1e-5 of the part's own diagonal so a metre-scale
+                // body is not judged on a micron it never resolved. The fuzzy value belongs in
+                // there: asking the intersection to merge geometry within 0.05 mm authorizes
+                // movement on that scale, and leaving it out refused body 47's own fix over an
+                // 18 micron shift on an 887 mm part.
+                const double bbox_budget =
+                    std::max({1e-6, 10.0 * std::max({tol, sew_tol, rebuild_fuzzy}),
+                              1e-5 * diag});
+
+                auto pct = [](double from, double to) {
+                    return std::abs(from) > 1e-12 ? 100.0 * (to - from) / std::abs(from) : 0.0;
+                };
+                const double volume_change_pct = pct(volume_before, volume_after);
+                // The verdict number: material in vs material out, both normalized the same
+                // way, so a surviving orientation defect cannot fake a drift and a corrected
+                // reading cannot fake a loss.
+                const double material_change_pct = pct(material_before, material_after);
+                const double area_change_pct = pct(area_before, area_after);
+                const double discarded_pct =
+                    (rebuild_kept + rebuild_discarded) > 1e-12
+                        ? 100.0 * rebuild_discarded / (rebuild_kept + rebuild_discarded)
+                        : 0.0;
 
                 json before_j = json::array();
                 for (const std::string& s : before_issues) before_j.push_back(s);
@@ -5627,12 +6093,165 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                 for (const std::string& s : after_issues) after_j.push_back(s);
                 st.data = json{
                     {"fixed", !before_valid && after_valid},
-                    {"before", {{"valid", before_valid}, {"issues", before_j}}},
-                    {"after", {{"valid", after_valid}, {"issues", after_j}}},
+                    {"before", {{"valid", before_valid},
+                                {"issues", before_j},
+                                {"bad_edges", bad_edges_before},
+                                {"faces", faces_before},
+                                {"solids", solids_before_heal},
+                                {"area_mm2", area_before},
+                                {"bbox", json::array({bbox_before[0], bbox_before[1],
+                                                      bbox_before[2], bbox_before[3],
+                                                      bbox_before[4], bbox_before[5]})}}},
+                    {"after", {{"valid", after_valid},
+                               {"issues", after_j},
+                               {"bad_edges", bad_edges_after},
+                               {"faces", count_of(out, TopAbs_FACE)},
+                               {"solids", count_of(out, TopAbs_SOLID)},
+                               {"area_mm2", area_after},
+                               {"bbox", json::array({bbox_after[0], bbox_after[1],
+                                                     bbox_after[2], bbox_after[3],
+                                                     bbox_after[4], bbox_after[5]})}}},
                     {"volume_before", volume_before},
                     {"volume_after", volume_after},
+                    {"volume_change_pct", volume_change_pct},
+                    {"volume_reading_trustworthy_before", volume_reading_trustworthy},
+                    {"volume_reading_trustworthy_after", volume_reading_trustworthy_after},
+                    // Orientation-normalized volumes: what the budget is actually judged on.
+                    {"material_volume_before", material_before},
+                    {"material_volume_after", material_after},
+                    {"material_change_pct", material_change_pct},
+                    {"area_change_pct", area_change_pct},
+                    {"bbox_shift_mm", bbox_shift},
                     {"tolerance", tol},
-                    {"fix_small_edges", fix_small_edges}};
+                    {"fix_small_edges", fix_small_edges},
+                    {"sew_tolerance_mm", sew_tol > 0.0 ? json(sew_tol) : json(nullptr)},
+                    {"fix_orientation", fix_orientation},
+                    {"rebuild_solid", rebuild_solid},
+                    {"rebuild_fuzzy_mm",
+                     rebuild_fuzzy > 0.0 ? json(rebuild_fuzzy) : json(nullptr)},
+                    {"unify_faces", unify_faces},
+                    {"max_volume_change_pct", max_vol_pct}};
+                if (fix_orientation)
+                    st.data["orientation"] = json{{"faces_flipped", orient_flipped},
+                                                  {"conflicts", orient_conflicts}};
+                if (rebuild_solid)
+                    st.data["rebuild"] = json{{"lumps", rebuild_lumps},
+                                              {"kept_volume_mm3", rebuild_kept},
+                                              {"discarded_volume_mm3", rebuild_discarded},
+                                              {"discarded_pct", discarded_pct},
+                                              // The narrowest face left behind: a strip below
+                                              // the mesher's reach is what makes an otherwise
+                                              // valid rebuild unmeshable, so it is REPORTED.
+                                              {"narrowest_face_mm", heal_narrowest_face(out)}};
+
+                // --- the refusal guard -------------------------------------------------
+                // A heal that hands back something worse than it was given is the exact
+                // failure this op exists to prevent, so it FAILS the feature: the batch is
+                // rolled back and the document is untouched. `st.data` above survives the
+                // throw, so the caller still gets every number the verdict was made on.
+                auto refuse = [&](const std::string& why) {
+                    throw std::runtime_error(
+                        type + " REFUSED and the body was left untouched: " + why +
+                        " [before: valid=" + (before_valid ? "true" : "false") + ", " +
+                        std::to_string(before_issues.size()) + " issue kind(s), " +
+                        std::to_string(bad_edges_before) + " bad edges, volume " +
+                        std::to_string(volume_before) + " mm^3, area " +
+                        std::to_string(area_before) + " mm^2 | after: valid=" +
+                        (after_valid ? "true" : "false") + ", " +
+                        std::to_string(after_issues.size()) + " issue kind(s), " +
+                        std::to_string(bad_edges_after) + " bad edges, volume " +
+                        std::to_string(volume_after) + " mm^3, area " +
+                        std::to_string(area_after) + " mm^2]");
+                };
+                if (after_issues.size() > before_issues.size())
+                    refuse("the repair left MORE defect kinds than it found (" +
+                           std::to_string(before_issues.size()) + " -> " +
+                           std::to_string(after_issues.size()) + "; new: " +
+                           [&] {
+                               std::string s;
+                               for (const std::string& a : after_issues)
+                                   if (std::find(before_issues.begin(), before_issues.end(), a) ==
+                                       before_issues.end())
+                                       s += (s.empty() ? "" : ", ") + a;
+                               return s;
+                           }() +
+                           "). Lower `tolerance` — a tolerance above the part's real feature "
+                           "size merges geometry instead of repairing it");
+                if (bbox_shift > bbox_budget)
+                    refuse("the bounding box MOVED by " + std::to_string(bbox_shift) +
+                           " mm (budget " + std::to_string(bbox_budget) +
+                           " mm) — the repair rebuilt geometry rather than repairing "
+                           "topology, so the part is no longer the part");
+                if (discarded_pct > max_vol_pct)
+                    refuse("rebuild_solid would discard " +
+                           std::to_string(rebuild_discarded) + " mm^3 across " +
+                           std::to_string(rebuild_lumps > 0 ? rebuild_lumps - 1 : 0) +
+                           " secondary lump(s) = " + std::to_string(discarded_pct) +
+                           "% of the enclosed volume, over the " +
+                           std::to_string(max_vol_pct) + "% budget. The faces enclose "
+                           "genuinely disjoint regions; this body needs fixing upstream, "
+                           "not here");
+                if (std::abs(material_change_pct) > max_vol_pct)
+                    refuse("the enclosed MATERIAL changed by " +
+                           std::to_string(material_change_pct) + "% (" +
+                           std::to_string(material_before) + " -> " +
+                           std::to_string(material_after) + " mm^3, budget " +
+                           std::to_string(max_vol_pct) +
+                           "%) — that is lost or invented material, not a corrected volume "
+                           "reading" +
+                           (volume_reading_trustworthy
+                                ? std::string(" (the input's own reading was already "
+                                              "trustworthy: no orientation defect)")
+                                : std::string(" (both sides measured with their face "
+                                              "orientations flood-corrected first, so a "
+                                              "wrong-signed integral cannot explain it)")));
+                if (!volume_reading_trustworthy && rebuild_lumps <= 1 &&
+                    std::abs(area_change_pct) > max_vol_pct)
+                    refuse("the input's signed volume integral was not a volume (it carries an "
+                           "orientation defect), so the drift budget falls on surface AREA, "
+                           "which changed by " + std::to_string(area_change_pct) +
+                           "% (budget " + std::to_string(max_vol_pct) +
+                           "%) — an orientation repair must not touch a single surface");
+
+                if (!before_valid && !after_valid) {
+                    st.warning =
+                        "heal: the repair did not clear every defect — still " +
+                        std::to_string(after_issues.size()) + " issue kind(s) (" +
+                        after_issues.front() + (after_issues.size() > 1 ? ", …" : "") +
+                        "), " + std::to_string(bad_edges_after) + " badly-oriented edge(s) " +
+                        "(was " + std::to_string(bad_edges_before) + "). Escalate: " +
+                        (!fix_orientation ? "try fix_orientation:true"
+                                          : (orient_conflicts > 0 && !rebuild_solid
+                                                 ? "the face-orientation graph is self-"
+                                                   "contradictory (" +
+                                                       std::to_string(orient_conflicts) +
+                                                       " conflicts) — try rebuild_solid:true"
+                                                 : "or fix the import that produced the body"));
+                }
+                // A VALID body can still be unusable: at OCCT's own intersection tolerance
+                // the rebuild gives every pair of near-coincident input faces its own
+                // intersection line, and the leftovers are razor strips. Body 47's rebuild
+                // came out BRep-valid carrying two 0.011 mm crescents, and polymesh then
+                // refused the whole fill at 8 mm and again at 4.8 — the refusal names a face
+                // index and a distance, nothing a caller can act on. So the strip is called
+                // out HERE, where the fix is one parameter. Threshold: 1e-4 of the body's own
+                // diagonal (0.089 mm on the 887 mm spine, 0.005 mm on a 50 mm bracket) — a
+                // face that narrow is an artefact of the rebuild, never a designed feature.
+                if (rebuild_solid) {
+                    const double narrowest = st.data["rebuild"]["narrowest_face_mm"].get<double>();
+                    const double strip_floor = 1e-4 * diag;
+                    if (narrowest > 0.0 && narrowest < strip_floor) {
+                        const std::string note =
+                            "heal: the rebuild left a razor face " +
+                            std::to_string(narrowest) + " mm wide (under " +
+                            std::to_string(strip_floor) + " mm = 1e-4 of the body's " +
+                            std::to_string(diag) + " mm diagonal). The body is BRep-valid but "
+                            "no volume mesher can resolve a strip that narrow at any element "
+                            "size. Re-run with rebuild_fuzzy_mm around 0.05 so the "
+                            "near-coincident faces merge during the intersection instead.";
+                        st.warning = st.warning.empty() ? note : st.warning + " " + note;
+                    }
+                }
 
                 consumed.insert(eff_id);        // the healed body REPLACES the input
                 superseded_by[eff_id] = id;     // a later transform/heal composes on `id`

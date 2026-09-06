@@ -119,6 +119,14 @@ NON_TOOL_MENTIONS: dict[str, tuple[str, tuple[str, ...]]] = {
         "doc_checkpoint",
         ("services/mcp/cad_common.py",),
     ),
+    "fix_orientation": (
+        "heal_body ladder parameter (heal_body(fix_orientation=True)), not a tool",
+        ("services/agent/tool_guidance/cad.py", "services/mcp/cad_eval_tools.py"),
+    ),
+    "rebuild_solid": (
+        "heal_body ladder parameter (heal_body(rebuild_solid=True)), not a tool",
+        ("services/agent/tool_guidance/cad.py", "services/mcp/cad_eval_tools.py"),
+    ),
     "replace_run_text": (
         "office_edit_docx op= value, not a tool (office_edit_docx(ops=[{'op': "
         "'replace_run_text', ...}]))",

@@ -38,7 +38,13 @@ constexpr const char* kBlobMagic = "AICRES1";
 // /3: FEA results gained mesh_quality, reactions, provenance and vtu_path. A /2
 // entry (memory, sidecar, or .step+ studies/<id>/results.npz) predates them, so
 // serving it would hand back a result with no evidence packet.
-constexpr const char* kCacheSchema = "chudware-simcache/3";
+// /4: static results gained the summary reduction disclosure — summary.
+// max_von_mises_reduction / max_von_mises_raw_mpa / min_fos_raw / the masked-key
+// lists, and the per-node summary_node array that the .vtu now carries. A /3
+// entry reports a fixture-ring-masked peak as if it were the field's peak, and
+// its cached vtu_path names a file written without the mask, so serving one
+// would re-introduce exactly the 3.7x contradiction the disclosure closes.
+constexpr const char* kCacheSchema = "chudware-simcache/4";
 constexpr size_t kMemCapEntries = 64;
 constexpr size_t kMaxSidecarOverhead = 4096;
 

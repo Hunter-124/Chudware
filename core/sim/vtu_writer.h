@@ -7,6 +7,18 @@
 // no compression, no appended binary — so the file is diffable and parseable
 // without VTK itself.
 //
+// "The SAME nodal fields the result JSON summarised" is load-bearing and is more
+// than shipping the array: an FEA summary scalar may be a MASKED reduction of the
+// field (the static solver drops nodes inside two element rings of an ideal fixed
+// constraint, whose stress is a clamp singularity). A file carrying only the field
+// then peaks well above the reported peak — 403 MPa against a reported 110 on a
+// real released case — and nothing in the file explains it. So a static result's
+// point data carries `von_mises` AND the `summary_node` 1/0 mask that selected the
+// reported peak: threshold summary_node == 1 and the maximum of von_mises over what
+// remains IS summary.max_von_mises_mpa, while the unmasked maximum IS
+// summary.max_von_mises_raw_mpa. Any new masked/robust scalar must ship its
+// selector the same way.
+//
 // Cells are tetrahedra only: tet4 -> VTK_TETRA (10), tet10 ->
 // VTK_QUADRATIC_TETRA (24). Chudware's canonical mid-edge order is
 // {0,1},{1,2},{2,0},{3,0},{3,2},{3,1}; VTK's is {0,1},{1,2},{2,0},{0,3},{1,3},

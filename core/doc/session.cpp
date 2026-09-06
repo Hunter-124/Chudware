@@ -108,6 +108,15 @@
 #include <TopoDS_Edge.hxx>
 #include <TopoDS_Wire.hxx>  // section_props stores closed section loops by value
 #include <TopoDS_Vertex.hxx>
+// eval_solid_health self-intersection: the kernel's single-body self-interference algorithm
+// plus the progress-indicator seam that is OCCT's only way to hand it a time budget.
+#include <BOPAlgo_CheckerSI.hxx>
+#include <BOPDS_DS.hxx>
+#include <BOPDS_MapOfPair.hxx>
+#include <BOPDS_Pair.hxx>
+#include <Message_ProgressIndicator.hxx>
+#include <Message_ProgressRange.hxx>
+#include <Message_ProgressScope.hxx>
 
 #include <Eigen/Eigenvalues>
 
@@ -6836,6 +6845,11 @@ struct RenderFrame {
 //                    clipping away whatever sits in front of it (see RenderFocus).
 //   `out_frame`    — receives the resolved projection so an overlay reprojects through the exact
 //                    camera that produced these pixels.
+//   `background`   — RGB triple (0-255) the frame is cleared to. Null keeps the historical flat
+//                    245 light grey, so every legacy render stays byte-identical. The header,
+//                    callouts and gizmo all carry their own dark halo/disc, so they stay
+//                    readable over a dark field — a caller wanting a film-dark plate passes
+//                    the colour instead of colour-keying the grey out afterwards.
 bool render_view_to_rgb(const std::vector<aicm::AicmBody>& bodies,
                         const std::vector<RenderLabel>& labels, int W, int H, RV3 viewDir,
                         const std::string& header, std::vector<unsigned char>& outImg,
@@ -6845,7 +6859,8 @@ bool render_view_to_rgb(const std::vector<aicm::AicmBody>& bodies,
                         int min_painted = -1,
                         const RenderFocus* focus = nullptr,
                         RenderFrame* out_frame = nullptr,
-                        const PerspectiveCamera* perspective_camera = nullptr) {
+                        const PerspectiveCamera* perspective_camera = nullptr,
+                        const unsigned char* background = nullptr) {
     const bool perspective = perspective_camera != nullptr;
     // Camera framing reference: the drawn set unless the caller supplied a stable frame set.
     const std::vector<aicm::AicmBody>& frame_bodies =
@@ -6942,7 +6957,22 @@ bool render_view_to_rgb(const std::vector<aicm::AicmBody>& bodies,
             sy = H / 2.0 - (pv - cv) * scale;
         }
     };
-    std::vector<unsigned char> img((size_t)W * H * 3, 245);  // light-grey background
+    // Clear to the requested background (default: the historical flat 245 light grey). A grey
+    // triple still takes the single-value fill, so the common case allocates and writes once.
+    const unsigned char bg_rgb[3] = {background ? background[0] : (unsigned char)245,
+                                     background ? background[1] : (unsigned char)245,
+                                     background ? background[2] : (unsigned char)245};
+    std::vector<unsigned char> img;
+    if (bg_rgb[0] == bg_rgb[1] && bg_rgb[1] == bg_rgb[2]) {
+        img.assign((size_t)W * H * 3, bg_rgb[0]);
+    } else {
+        img.resize((size_t)W * H * 3);
+        for (size_t p = 0; p + 2 < img.size(); p += 3) {
+            img[p] = bg_rgb[0];
+            img[p + 1] = bg_rgb[1];
+            img[p + 2] = bg_rgb[2];
+        }
+    }
     std::vector<double> zbuf((size_t)W * H, -1e30);
     long painted = 0;
     // `lam` is the vertex's diffuse term, carried through clipping so a body that ships
@@ -7213,10 +7243,13 @@ bool render_view_to_rgb(const std::vector<aicm::AicmBody>& bodies,
 // Thin wrapper over render_view_to_rgb so there is exactly ONE renderer.
 bool render_iso_png(const std::vector<aicm::AicmBody>& bodies, const std::string& out_path,
                     const std::vector<RenderLabel>& labels = {},
-                    int W = 512, int H = 400, bool annotate = true) {
+                    int W = 512, int H = 400, bool annotate = true,
+                    const unsigned char* background = nullptr) {
     std::vector<unsigned char> img;
     if (!render_view_to_rgb(bodies, labels, W, H, rnorm({1.0, 1.0, 0.8}), std::string(), img,
-                            annotate))
+                            annotate, /*body_alpha=*/nullptr, /*frame_from=*/nullptr,
+                            /*min_painted=*/-1, /*focus=*/nullptr, /*out_frame=*/nullptr,
+                            /*perspective_camera=*/nullptr, background))
         return false;
     std::string png = encode_png_rgb(W, H, img);
     std::ofstream f(out_path, std::ios::binary | std::ios::trunc);
@@ -7244,6 +7277,20 @@ inline std::string bbox_dims_label(const std::vector<aicm::AicmBody>& bodies) {
         return std::to_string(tenths / 10) + "." + std::to_string(tenths % 10);
     };
     return fmt(hi.x - lo.x) + " X " + fmt(hi.y - lo.y) + " X " + fmt(hi.z - lo.z) + " MM";
+}
+
+// Parse an optional render background: a 3-element [r,g,b] array in 0-255 (clamped, rounded).
+// Anything else — null, absent, wrong length, non-numeric — means "keep the default grey", so
+// a malformed value never costs the caller its render. Returns false when nothing was set.
+bool parse_render_background(const nlohmann::json& spec, unsigned char out_rgb[3]) {
+    if (!spec.is_array() || spec.size() < 3) return false;
+    for (int i = 0; i < 3; ++i) {
+        if (!spec[i].is_number()) return false;
+        const double v = spec[i].get<double>();
+        const long q = std::lround(v);
+        out_rgb[i] = (unsigned char)(q < 0 ? 0 : (q > 255 ? 255 : q));
+    }
+    return true;
 }
 
 }  // namespace
@@ -7368,7 +7415,8 @@ static std::vector<RenderLabel> principal_face_labels(Session& s) {
     return labels;
 }
 
-json doc_render_png(const std::string& doc_id, const std::string& out_path, bool annotate) {
+json doc_render_png(const std::string& doc_id, const std::string& out_path, bool annotate,
+                    const nlohmann::json& background) {
     try {
         DocLock lk;
         Session& s = require_session(doc_id);
@@ -7378,7 +7426,10 @@ json doc_render_png(const std::string& doc_id, const std::string& out_path, bool
         // orientation tint (so the true material colour shows). Used for parts-library thumbnails.
         std::vector<RenderLabel> labels = annotate ? principal_face_labels(s)
                                                    : std::vector<RenderLabel>{};
-        bool ok = render_iso_png(bodies, out_path, labels, 512, 400, annotate);
+        unsigned char bg[3];
+        const bool has_bg = parse_render_background(background, bg);
+        bool ok = render_iso_png(bodies, out_path, labels, 512, 400, annotate,
+                                 has_bg ? bg : nullptr);
         return json{{"ok", ok}, {"path", ok ? out_path : std::string()}};
     } catch (const OpError& e) {
         // Bug K8 (P2): a CLOSED/missing doc made require_session throw unknown_doc, which the
@@ -7409,8 +7460,11 @@ json doc_render_png(const std::string& doc_id, const std::string& out_path, bool
 //            "margin":0.15, "clip_near":false
 // Exact cameras refuse `focus` because honoring both would silently reframe or clip the pose.
 // `annotate=false` drops orientation tint, face callouts, and the axis triad.
+// `background` is an optional [r,g,b] (0-255) the frame is cleared to; omitted/null keeps the
+// engine's flat 245 light grey, so every existing caller renders byte-identically.
 json doc_render_view(const std::string& doc_id, const std::string& out_path,
-                     const nlohmann::json& view, bool annotate) {
+                     const nlohmann::json& view, bool annotate,
+                     const nlohmann::json& background) {
     try {
         DocLock lk;
         Session& s = require_session(doc_id);
@@ -7525,10 +7579,13 @@ json doc_render_view(const std::string& doc_id, const std::string& out_path,
         RenderFrame frame;
         const PerspectiveCamera* camera = rv.camera ? &*rv.camera : nullptr;
         const int min_painted = (has_focus || camera) ? 1 : -1;
+        unsigned char bg[3];
+        const bool has_bg = parse_render_background(background, bg);
         bool ok = render_view_to_rgb(bodies, labels, W, H, rv.dir, header, img,
                                      annotate, /*body_alpha=*/nullptr,
                                      /*frame_from=*/nullptr, min_painted,
-                                     has_focus ? &fbox : nullptr, &frame, camera);
+                                     has_focus ? &fbox : nullptr, &frame, camera,
+                                     has_bg ? bg : nullptr);
         if (ok) {
             std::string png = encode_png_rgb(W, H, img);
             std::ofstream f(out_path, std::ios::binary | std::ios::trunc);
@@ -7596,8 +7653,11 @@ json doc_render_view(const std::string& doc_id, const std::string& out_path,
 // ideal multi-view self-check artifact. `views` is an array of specs (resolve_view_spec each);
 // defaults to the six standard ortho views + iso when empty/omitted. Each tile carries its own
 // header (view name + dims). Returns {ok, path, views:[names], cols, rows, tile:[w,h]}.
+// `background` is an optional [r,g,b] (0-255) applied to every tile AND to the empty-tile
+// fallback; the inter-tile gutters stay the fixed dark 30 grey that separates them.
 json doc_render_contact_sheet(const std::string& doc_id, const std::string& out_path,
-                              const nlohmann::json& views) {
+                              const nlohmann::json& views,
+                              const nlohmann::json& background) {
     try {
         DocLock lk;
         Session& s = require_session(doc_id);
@@ -7616,13 +7676,30 @@ json doc_render_contact_sheet(const std::string& doc_id, const std::string& out_
         const int TW = 384, TH = 300;  // per-tile size (contact-sheet tiles are a touch smaller)
         std::vector<std::vector<unsigned char>> tiles;
         std::vector<std::string> names;
+        unsigned char bg[3];
+        const bool has_bg = parse_render_background(background, bg);
         for (const auto& sp : specs) {
             ResolvedView rv = resolve_view_spec(sp);
             std::string header = rv.name + (dims.empty() ? "" : "  " + dims);
             std::vector<unsigned char> img;
-            if (!render_view_to_rgb(bodies, labels, TW, TH, rv.dir, header, img)) {
-                img.assign((size_t)TW * TH * 3, 245);  // blank tile rather than dropping the slot
-                blit_text(img, TW, TH, 6, 5, rv.name + " (EMPTY)", 2, 60, 60, 60);
+            if (!render_view_to_rgb(bodies, labels, TW, TH, rv.dir, header, img,
+                                    /*annotate=*/true, /*body_alpha=*/nullptr,
+                                    /*frame_from=*/nullptr, /*min_painted=*/-1,
+                                    /*focus=*/nullptr, /*out_frame=*/nullptr,
+                                    /*perspective_camera=*/nullptr,
+                                    has_bg ? bg : nullptr)) {
+                // blank tile rather than dropping the slot — in the caller's own background,
+                // with a label that contrasts against it.
+                img.resize((size_t)TW * TH * 3);
+                for (size_t p = 0; p + 2 < img.size(); p += 3) {
+                    img[p] = has_bg ? bg[0] : (unsigned char)245;
+                    img[p + 1] = has_bg ? bg[1] : (unsigned char)245;
+                    img[p + 2] = has_bg ? bg[2] : (unsigned char)245;
+                }
+                const bool dark_tile =
+                    has_bg && (bg[0] * 299 + bg[1] * 587 + bg[2] * 114) / 1000 < 128;
+                const unsigned char ink = dark_tile ? 220 : 60;
+                blit_text(img, TW, TH, 6, 5, rv.name + " (EMPTY)", 2, ink, ink, ink);
             }
             tiles.push_back(std::move(img));
             names.push_back(rv.name);
@@ -9484,6 +9561,69 @@ static const char* health_status_text(BRepCheck_Status st) {
     }
 }
 
+// ── eval_solid_health: the self-intersection time budget ─────────────────────────────────
+// BOPAlgo_CheckerSI pave-fills a body against ITSELF at full level, which is quadratic in
+// sub-shape count: on a pathological import it can grind for minutes, and a health check
+// that hangs is worse than one that declines. OCCT's only cancellation seam is a
+// Message_ProgressIndicator whose UserBreak() goes true, so that is what the budget is.
+//
+// MEASURED on OCCT 7.9.1: a break neither raises nor sets HasErrors() — Perform() just
+// returns with a TRUNCATED interference table (a figure-eight prism that reports 3
+// interferences reports 0 when broken). So the flag below is the ONLY evidence the run was
+// cut short, and without it a timeout would read back as "zero interferences": a fabricated
+// clean bill of health, which is precisely what this op exists to never emit. UserBreak may
+// be called concurrently by design, hence the atomic.
+class SelfIntersectBudget : public Message_ProgressIndicator {
+public:
+    explicit SelfIntersectBudget(double secs)
+        : deadline_(std::chrono::steady_clock::now()
+                    + std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                          std::chrono::duration<double>(secs))) {}
+    bool broke() const { return broke_.load(std::memory_order_relaxed); }
+
+protected:
+    Standard_Boolean UserBreak() override {
+        if (std::chrono::steady_clock::now() < deadline_) return Standard_False;
+        broke_.store(true, std::memory_order_relaxed);
+        return Standard_True;
+    }
+    void Show(const Message_ProgressScope&, const Standard_Boolean) override {}
+
+private:
+    std::chrono::steady_clock::time_point deadline_;
+    std::atomic<bool> broke_{false};
+};
+
+// Interference kinds are named the way OCCT names its own interference tables (V/V, V/E,
+// E/E, V/F, E/F, F/F, V/S, E/S, F/S, S/S) so a reader can map a reported kind straight onto
+// the algorithm's vocabulary. Lower dimension first.
+static const char* si_shape_kind(TopAbs_ShapeEnum t) {
+    switch (t) {
+        case TopAbs_VERTEX: return "vertex";
+        case TopAbs_EDGE:   return "edge";
+        case TopAbs_WIRE:   return "wire";
+        case TopAbs_FACE:   return "face";
+        case TopAbs_SHELL:  return "shell";
+        case TopAbs_SOLID:  return "solid";
+        default:            return "shape";
+    }
+}
+
+// DumpErrors writes one alert per line; a JSON reason wants one line.
+static std::string si_one_line(const std::string& in) {
+    std::string out;
+    out.reserve(in.size());
+    for (char c : in) {
+        if (c == '\n' || c == '\r' || c == '\t') {
+            if (!out.empty() && out.back() != ' ') out.push_back(' ');
+        } else {
+            out.push_back(c);
+        }
+    }
+    while (!out.empty() && out.back() == ' ') out.pop_back();
+    return out;
+}
+
 json doc_eval_solid_health(const std::string& doc_id, int body_id) {
     DocLock lk;
     Session& s = require_session(doc_id);
@@ -9505,6 +9645,7 @@ json doc_eval_solid_health(const std::string& doc_id, int body_id) {
 
     constexpr double TINY_EDGE_MM = 0.01;
     constexpr double SLIVER_AREA_MM2 = 0.01;
+    constexpr double SI_BUDGET_S = 20.0;  // wall-clock cap per body on the CheckerSI run
     auto round6 = [](double x) { return std::abs(x) < 1e-9 ? 0.0 : std::round(x * 1e6) / 1e6; };
 
     json bodies = json::array();
@@ -9633,21 +9774,97 @@ json doc_eval_solid_health(const std::string& doc_id, int body_id) {
                                  "no volume; an open shell has no inside to measure";
         b["area_mm2"] = round6(area);
 
-        // The kernel exposes no single-body self-intersection test, so this is REPORTED as
-        // not run. A watertight verdict is a TOPOLOGY verdict and says nothing about a
-        // self-piercing skin.
-        b["self_intersection"] = json{
-            {"checked", false},
-            {"reason", "not checked — this engine exposes no self-intersection test for a "
-                       "single body. The watertight verdict above is topological and does "
-                       "NOT clear this body of self-intersection. For body-vs-body overlap "
-                       "use interference_check; for feature-vs-feature use "
-                       "feature_overlap_check."}};
+        // Self-intersection — a real test, not a disclaimer. BOPAlgo_CheckerSI is the
+        // kernel's single-body self-interference algorithm (the one
+        // BOPAlgo_ArgumentAnalyzer's self-intersection mode drives): it pave-fills the body
+        // against itself at level 9 (V/V … S/S — every interference type) and lands each
+        // genuine self-interference in DS().Interferences(). Pairs touching a NEW
+        // (section-born) shape are dropped, exactly as ArgumentAnalyzer does: the vertices
+        // and edges the algorithm invents to DESCRIBE an intersection would otherwise be
+        // counted as further intersections. MEASURED on OCCT 7.9.1: a box, a cylinder and a
+        // fused pair of overlapping boxes all report 0 (adjacent faces meeting at a shared
+        // edge produce an F/F record but no interference), a figure-eight prism reports 3.
+        // A watertight verdict is still only a TOPOLOGY verdict — this is the geometric one.
+        bool si_checked = false;
+        bool si_self_intersecting = false;
+        {
+            const auto si_t0 = std::chrono::steady_clock::now();
+            Handle(SelfIntersectBudget) si_budget = new SelfIntersectBudget(SI_BUDGET_S);
+            std::string si_reason;
+            int si_count = 0;
+            std::set<std::string> si_kinds;
+            try {
+                BOPAlgo_CheckerSI ck;
+                TopTools_ListOfShape one;
+                one.Append(shape);
+                ck.SetArguments(one);
+                ck.SetLevelOfCheck(9);
+                ck.SetNonDestructive(Standard_True);
+                ck.SetRunParallel(Standard_False);
+                ck.Perform(si_budget->Start());
+                if (si_budget->broke()) {
+                    si_reason = "not checked — the self-intersection check hit its " +
+                                std::to_string(static_cast<int>(SI_BUDGET_S)) +
+                                " s per-body budget and was stopped, so its interference "
+                                "table is truncated and proves nothing either way. Split "
+                                "this body or simplify the feature that made it.";
+                } else if (ck.HasErrors()) {
+                    std::ostringstream es;
+                    ck.DumpErrors(es);
+                    si_reason = "not checked — BOPAlgo_CheckerSI failed on this body: " +
+                                si_one_line(es.str());
+                } else if (ck.PDS() == nullptr) {
+                    si_reason = "not checked — BOPAlgo_CheckerSI returned no data structure";
+                } else {
+                    const BOPDS_DS& ds = *ck.PDS();
+                    for (BOPDS_MapOfPair::Iterator it(ds.Interferences()); it.More();
+                         it.Next()) {
+                        Standard_Integer n1 = 0, n2 = 0;
+                        it.Value().Indices(n1, n2);
+                        if (ds.IsNewShape(n1) || ds.IsNewShape(n2)) continue;
+                        TopAbs_ShapeEnum t1 = ds.Shape(n1).ShapeType();
+                        TopAbs_ShapeEnum t2 = ds.Shape(n2).ShapeType();
+                        // TopAbs_ShapeEnum descends by dimension (SOLID 2 … VERTEX 7), so
+                        // the LARGER enum is the lower-dimensional shape and goes first.
+                        if (t1 < t2) std::swap(t1, t2);
+                        si_kinds.insert(std::string(si_shape_kind(t1)) + "_" +
+                                        si_shape_kind(t2));
+                        ++si_count;
+                    }
+                    si_checked = true;
+                    si_self_intersecting = si_count > 0;
+                }
+            } catch (const Standard_Failure& f) {
+                const char* m = f.GetMessageString();
+                si_reason = std::string("not checked — BOPAlgo_CheckerSI raised on this "
+                                        "body: ") +
+                            (m && *m ? m : f.DynamicType()->Name());
+            }
+            const double si_ms = std::chrono::duration<double, std::milli>(
+                                     std::chrono::steady_clock::now() - si_t0).count();
+            if (si_checked) {
+                json kinds = json::array();
+                for (const std::string& k : si_kinds) kinds.push_back(k);
+                b["self_intersection"] = json{{"checked", true},
+                                              {"self_intersecting", si_self_intersecting},
+                                              {"interference_count", si_count},
+                                              {"kinds", std::move(kinds)},
+                                              {"elapsed_ms", std::round(si_ms * 10.0) / 10.0}};
+            } else {
+                b["self_intersection"] = json{{"checked", false},
+                                              {"self_intersecting", nullptr},
+                                              {"reason", si_reason},
+                                              {"elapsed_ms", std::round(si_ms * 10.0) / 10.0}};
+            }
+        }
 
         const bool watertight =
             somap.Extent() >= 1 && free_sids.empty() && nm_sids.empty();
+        // A self-intersecting body is NOT sound: it will mesh, boolean and export wrong.
+        // A check that did not run cannot make a body unsound — that stays in not_checked.
         const bool sound = watertight && vol > 1e-9 && brep_checked && brep_valid &&
-                           (!orient_checked || orient_ok);
+                           (!orient_checked || orient_ok) &&
+                           !(si_checked && si_self_intersecting);
         b["watertight"] = watertight;
         b["is_watertight"] = watertight;  // trimesh spelling — the one models actually write
         b["sound"] = sound;
@@ -12005,9 +12222,16 @@ json doc_save(const std::string& doc_id, const std::string& path) {
     // DISPLAY-ONLY + SAFE: document.json (the parametric source of truth) is untouched; open uses
     // the cache ONLY when the doc hash + engine key still match, and the first edit recompiles
     // from features. Always erase first so a failed/again-uncached save never ships a stale cache.
+    //
+    // geometry.step (contracts/stepplus.md §1) rides the SAME gate and the same erase-first
+    // discipline: it is the AP214 snapshot of the last successful rebuild, so it is written only
+    // after a fully-ok rebuild of the tree we are about to write as document.json. Carrying an
+    // older snapshot forward instead would hand every foreign STEP reader geometry that
+    // disagrees with the document beside it — the one thing the member exists to prevent.
     s.extra_entries.erase("cache.json");
     s.extra_entries.erase("cache.aicm");
     s.extra_entries.erase("cache.brep");
+    s.extra_entries.erase("geometry.step");
     try {
         if (s.doc.is_object() && s.doc.value("schema", std::string()) == "aicad.part/1") {
             const CompileResult& cr = ensure_compiled(s);
@@ -12035,6 +12259,11 @@ json doc_save(const std::string& doc_id, const std::string& path) {
                 // Solved-bodies BREP (with triangulation): lets an assembly load this part as
                 // a component without re-running compile_document or BRepMesh.
                 s.extra_entries["cache.brep"] = brep_cache_encode(cr.shapes);
+                // geometry.step: the AP214 snapshot foreign CAD opens (contracts/stepplus.md
+                // §1). The bodies are the ones this fully-ok rebuild just produced.
+                std::string geometry_step = stepplus_geometry_step_bytes(cr.shapes);
+                if (!geometry_step.empty())
+                    s.extra_entries["geometry.step"] = std::move(geometry_step);
             }
         } else if (s.doc.is_object() && s.doc.value("schema", std::string()) == "aicad.asm/1") {
             // A cache-hit open leaves asm_result empty; rebuild here so a plain re-save
@@ -12049,6 +12278,13 @@ json doc_save(const std::string& doc_id, const std::string& path) {
             for (const AsmComponentStatus& cs : ar.component_status)
                 if (!cs.ok) { all_ok = false; break; }
             if (all_ok) {
+                // geometry.step for an assembly is the FLATTENED placed set: each component
+                // body in world coordinates, exactly as gather_export_shapes feeds every
+                // other writer (an assembly doc has no features of its own).
+                std::string geometry_step =
+                    stepplus_geometry_step_bytes(gather_export_shapes(s));
+                if (!geometry_step.empty())
+                    s.extra_entries["geometry.step"] = std::move(geometry_step);
                 std::vector<uint8_t> blob;
                 json cached = ops_response_assembly(s, json::object(), &blob);
                 if (cached.contains("tess") && cached["tess"].is_object())
@@ -12073,6 +12309,7 @@ json doc_save(const std::string& doc_id, const std::string& path) {
         s.extra_entries.erase("cache.json");  // never let cache generation break a save
         s.extra_entries.erase("cache.aicm");
         s.extra_entries.erase("cache.brep");
+        s.extra_entries.erase("geometry.step");
     }
 
     std::string out = stepplus_save(s.doc, target, s.extra_entries);

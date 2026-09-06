@@ -203,3 +203,49 @@ TEST_CASE("a displacement past the bounding-box diagonal is flagged implausible"
   MESSAGE("soft cube: " << plausibility.dump());
 }
 
+// ── A mesh the hanging-fragment dissolve repaired must SOLVE ───────────────────
+// detail::repair_lonely_nodes dissolves hanging fragments but deliberately does
+// NOT renumber nodes (the adaptive driver requires disp_mm.size() ==
+// nodes*3), so a repaired mesh carries nodes no element references — up to ten
+// per dissolved tet10. fea_static eliminates them exactly (their rows are zero)
+// and still refuses a LOAD applied to one, but the rigid-body gate used to count
+// every node, so each orphan read as its own "connected component with no
+// fixture": the repair the solver needs produced a refusal instead of a solve.
+// The gate must judge the DOMAIN — the nodes elements actually reference.
+TEST_CASE("nodes left behind by mesh repair are not unfixtured components") {
+  json study;
+  // 1 mm cube, Freudenthal 6-tet subdivision, PLUS two nodes (indices 8, 9)
+  // that no element references — exactly what dissolving a fragment leaves.
+  study["points"] = {0, 0, 0, 1, 0, 0, 1, 1, 0, 0, 1, 0,
+                     0, 0, 1, 1, 0, 1, 1, 1, 1, 0, 1, 1,
+                     5, 5, 5, 5, 5, 6};
+  study["tets"] = {0, 1, 2, 6, 0, 2, 3, 6, 0, 3, 7, 6,
+                   0, 7, 4, 6, 0, 4, 5, 6, 0, 5, 1, 6};
+  study["material"] = {{"E_mpa", 200000.0}, {"nu", 0.29}, {"yield_mpa", 250.0}};
+  study["fixtures"] = {
+      {{"points", {{0, 0, 0}, {1, 0, 0}, {1, 1, 0}, {0, 1, 0}}}, {"tol_mm", 0.01}}};
+  study["loads"] = {
+      {{"type", "force"},
+       {"vector", {0.0, 0.0, -500.0}},
+       {"faces",
+        {{"points", {{0, 0, 1}, {1, 0, 1}, {1, 1, 1}, {0, 1, 1}}}, {"tol_mm", 0.01}}}}};
+
+  const json result = fea_run_static(study);
+  REQUIRE_MESSAGE(result.value("ok", false), result.dump());
+  const json& quality = result.at("mesh_quality");
+  // The orphans are neither components of the domain nor mechanisms in it.
+  CHECK(quality.at("connected_components").get<int>() == 1);
+  CHECK(quality.at("unfixed_components").get<int>() == 0);
+  // The load bit: a real displacement field, not the arbitrary one a mechanism
+  // returns. (max_von_mises is NOT asserted: on a 6-tet cube every node touches
+  // the fixture ring the stress summary excludes, so the reported peak is 0.)
+  CHECK(result.at("summary").at("max_disp_mm").get<double>() > 0.0);
+  // …and the solve says out loud that it dropped them, rather than doing it quietly.
+  REQUIRE(result.contains("solver_notes"));
+  bool named = false;
+  for (const auto& note : result.at("solver_notes"))
+    if (note.get<std::string>().find("reference no element") != std::string::npos)
+      named = true;
+  CHECK(named);
+}
+

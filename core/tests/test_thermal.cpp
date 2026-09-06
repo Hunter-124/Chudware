@@ -626,3 +626,64 @@ TEST_CASE("thermal: a pre-cancelled token aborts before assembly") {
     CHECK_FALSE(result.ok);
     CHECK(result.error.find("cancelled") != std::string::npos);
 }
+
+// ── A mesh that carries nodes no element references must still solve. ───────────────────
+// The mesher's hanging-fragment dissolve drops elements but deliberately keeps node
+// numbering 1:1 with the polymesh mesh the adaptive route refines through, so a repaired
+// mesh reaches the solvers with a few nodes that belong to no element (fea_static
+// documents and eliminates exactly this). Their rows are identically zero, so the system
+// is singular however it is factored: the fin25 sensor board arrived with 9 such nodes
+// out of 50,550 and CHOLMOD, SimplicialLDLT and SparseLU all failed in turn
+// ("iteration-matrix factorization failed"). Both thermal entry points must eliminate
+// them, keep the physics of the remaining domain EXACT, and leave them out of the
+// reported extrema — an out-of-domain node holds the environment datum, not a solved
+// temperature, so it must not become the reported minimum.
+TEST_CASE("thermal: unreferenced nodes are eliminated, not left singular") {
+    const double L = 20.0, k = 0.05, T_hot = 150.0, T_amb = 25.0, h = 0.002;
+    Box m = box_mesh(L, 10.0, 10.0, 10, 2, 2);
+    const int domain_nodes = static_cast<int>(m.pts.size() / 3);
+    // Three nodes off the body, referenced by nothing — what mesh repair leaves behind.
+    for (int i = 0; i < 3; ++i) {
+        m.pts.push_back(100.0 + i);
+        m.pts.push_back(100.0);
+        m.pts.push_back(100.0);
+    }
+
+    chudware::sim::ThermalConvection cv;
+    cv.nodes = m.xL;
+    cv.h = h;
+    cv.t_amb = T_amb;
+
+    const auto steady = chudware::sim::fea_thermal_solve(
+        m.pts, m.tets, k, m.x0, uniform(m.x0.size(), T_hot), {}, 0.0, {cv}, 4);
+    REQUIRE_MESSAGE(steady.ok, steady.error);
+    const double q = (T_hot - T_amb) / (L / k + 1.0 / h);
+    const double T_L_exact = T_amb + q / h;
+    double sumT = 0.0;
+    for (int nid : m.xL) sumT += steady.temperature[nid];
+    const double T_L_fem = sumT / static_cast<double>(m.xL.size());
+    CHECK(T_L_fem == doctest::Approx(T_L_exact).epsilon(5e-3));
+    // The cold face is the coldest part of the DOMAIN; the eliminated nodes sit at the
+    // ambient datum below it and must not be reported as the field minimum.
+    CHECK(steady.min_temp == doctest::Approx(T_L_fem).epsilon(5e-3));
+    CHECK(steady.min_temp > T_amb);
+    CHECK(steady.max_temp == doctest::Approx(T_hot).epsilon(1e-9));
+    // Free DOFs exclude the eliminated nodes as well as the Dirichlet face.
+    CHECK(steady.n_dof == domain_nodes - static_cast<int>(m.x0.size()));
+
+    chudware::sim::ThermalTransientOptions opts;
+    opts.rho_cp = 0.004;
+    opts.dt = 0.5;
+    opts.t_end = 5.0;
+    opts.t_init = T_amb;
+    const auto transient = chudware::sim::fea_thermal_transient(
+        m.pts, m.tets, k, m.x0, uniform(m.x0.size(), T_hot), {}, {cv}, opts, 4);
+    REQUIRE_MESSAGE(transient.ok, transient.error);
+    CHECK(transient.n_dof == domain_nodes - static_cast<int>(m.x0.size()));
+    CHECK(transient.max_temp == doctest::Approx(T_hot).epsilon(1e-9));
+    // Heating from ambient: every domain node stays inside [ambient, hot].
+    for (int i = 0; i < domain_nodes; ++i) {
+        CHECK(transient.frames.back().temperature[i] >= T_amb - 1e-9);
+        CHECK(transient.frames.back().temperature[i] <= T_hot + 1e-9);
+    }
+}

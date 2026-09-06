@@ -10,8 +10,11 @@ entries, the manifest — plus the frozen ``geometry.step``, and ONLY in release
 commits (contract §2/§5).
 
 Never tracked (solved state, regenerable from the recipe): the engine's
-``cache.*`` display/build caches and cached simulation results
-(``studies/<id>/results.*``, contracts/stepplus.md §1).
+``cache.*`` display/build caches, cached simulation results
+(``studies/<id>/results.*``, contracts/stepplus.md §1), and the live container's
+own ``geometry.step`` — doc_save embeds an AP214 snapshot on every successful
+rebuild, and it is derived + recomputable, so history carries one only where
+``Vault.release`` freezes its own bytes (contract §5.4).
 """
 from __future__ import annotations
 
@@ -53,9 +56,11 @@ def _solved_extras() -> dict[str, bytes]:
         "cache.json": b'{"engine":"x","doc_hash":"y"}',
         "cache.aicm": b"AICM1" + b"\x00" * 4096,
         "cache.brep": b"BREP" + b"\x00" * 2048,
+        # the AP214 snapshot doc_save embeds on every successful rebuild: derived,
+        # recomputable, and release-only in history (contracts/plm.md §5.4)
+        "geometry.step": b"ISO-10303-21;\n" + b"L" * 4096,
         "studies/s1/results.npz": b"AICRES1" + b"\x00" * 8192,
         "studies/s1/results.external.json": b'{"schema":"aicad.sim_result_ref/1"}',
-        # recipe / non-result study entries stay
         "studies/s1.json": _STUDY_DEF,
         "studies/s1/overlay.aicm": b"AICM1overlay",
         "netlist.json": b'{"nets":[]}',
@@ -94,6 +99,7 @@ def test_explode_strips_caches_and_solved_study_results():
     names = set(ex.extras)
 
     assert not [n for n in names if n.startswith("cache.")]
+    assert "geometry.step" not in names
     assert "studies/s1/results.npz" not in names
     assert "studies/s1/results.external.json" not in names
 
@@ -104,12 +110,12 @@ def test_explode_strips_caches_and_solved_study_results():
 
 
 def test_is_derived_entry_predicate():
-    derived = ["cache.json", "cache.aicm", "cache.brep",
+    derived = ["cache.json", "cache.aicm", "cache.brep", "geometry.step",
                "studies/s1/results.npz", "studies/abc/results.external.json"]
     kept = ["document.json", "thumbnail.png", "meta.json", "index.json",
             "netlist.json", "studies/s1.json", "studies/s1/overlay.aicm",
             "studies/s1/summary.json", "ai/memory.json",
-            "drawings/d1.json", "geometry.step", "caches.json"]
+            "drawings/d1.json", "caches.json"]
     for n in derived:
         assert snapshot.is_derived_entry(n) is True, n
     for n in kept:
@@ -127,6 +133,7 @@ def test_reassemble_round_trips_the_recipe_without_solved_state():
     assert doc["features"] == _part()["features"]
     assert doc["studies"] == _part()["studies"]
     assert not [n for n in names if n.startswith("cache.")]
+    assert "geometry.step" not in names  # the engine re-embeds it on the next save
     assert not [n for n in names
                 if n.startswith("studies/") and n.rsplit("/", 1)[-1].startswith("results.")]
 

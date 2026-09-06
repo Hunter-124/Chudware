@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cctype>
 #include <cmath>
 #include <cstdio>
 #include <chrono>
@@ -641,6 +642,32 @@ double thin_wall_ratio(const pm::pipeline::Model &model, const MeshOut &out,
   return std::isfinite(ratio) ? ratio : 0.0;
 }
 
+// Polyhedral-FEA labels every length in its diagnostics " m", because ITS
+// contract is metres. Chudware never scales on this path: load_model hands
+// polymesh the STEP in the document's own units (millimetres), and the element
+// size resolve_size_band computes is millimetres too — there is no `--scale`
+// anywhere in the in-process mesher (only the out-of-process polymesh_cli
+// release path passes `--scale 0.001` for a mm STEP). So a refusal on a ~100 mm
+// board printed "feature unresolved at h=4.45857 m": the NUMBER is a
+// millimetre element size, the LABEL is wrong. Relabel where the upstream text
+// is captured, so every error and note the product surfaces reads in the units
+// the study is actually in.
+std::string in_model_units(std::string diagnostic) {
+  for (size_t at = diagnostic.find(" m"); at != std::string::npos;
+       at = diagnostic.find(" m", at + 2)) {
+    // Only unit tokens: a space-m that follows a number and is not already "mm"
+    // (and never a word like " mesh" or " max").
+    if (at == 0 ||
+        !std::isdigit(static_cast<unsigned char>(diagnostic[at - 1])))
+      continue;
+    const char next = at + 2 < diagnostic.size() ? diagnostic[at + 2] : '\0';
+    if (next == 'm' || (std::isalpha(static_cast<unsigned char>(next)) != 0))
+      continue;
+    diagnostic.insert(at + 2, 1, 'm');
+  }
+  return diagnostic;
+}
+
 // Fill at coarse element size `h`, optionally under a spatial size field h(x),
 // promote to tet10 when asked, and normalize into MeshOut. `feature_refine` is
 // an explicit caller decision rather than a re-derivation of the fineness gate,
@@ -741,7 +768,10 @@ bool build_mesh(const LoadedModel &loaded, const MeshOptions &options, double h,
   out.n_elems = static_cast<int>(nodal.elements.size());
   out.nodes_per_elem = stride;
   out.mesh_type_used = stride == 10 ? "tet10" : "tet4";
-  append_note(out.note, volume.mesher_note);
+  // Same metre/millimetre relabel as on the failure path: the mesher note
+  // carries polymesh's own h_bulk/snap distances, and the product surfaces it
+  // verbatim (see in_model_units).
+  append_note(out.note, in_model_units(volume.mesher_note));
   // Element-local straight-edge fallback for mid-edge projections that folded
   // their element. On a thin wall (element size comparable to the wall
   // thickness or the curvature radius) a handful of elements always fold, and
@@ -759,6 +789,49 @@ bool build_mesh(const LoadedModel &loaded, const MeshOptions &options, double h,
                 std::to_string(out.quadratic_fallback_elems) +
                     " tet10 element(s) kept straight mid-edge nodes (projected "
                     "mids folded them)");
+  }
+  // Hanging-element repair: a fragment attached to the body by one node (or one
+  // edge) is a mechanism the connectivity checks cannot see, because it DOES reach
+  // a fixture through that node. Runs after the fold repair so a straightened
+  // element is judged on its final shape, and before fill_quality so the reported
+  // metrics describe the mesh that will actually be solved.
+  const int elems_before_repair = out.n_elems;
+  if (detail::repair_lonely_nodes(out) > 0) {
+    append_note(out.note,
+                "dissolved " + std::to_string(out.hanging_elems_dropped) +
+                    " hanging element(s) attached to the body by two corners or "
+                    "fewer (they are rigid-body mechanisms, not stiffness), "
+                    "clearing " + std::to_string(out.lonely_nodes_repaired) +
+                    " single-element node(s) and " +
+                    std::to_string(out.dropped_volume_mm3) + " mm^3 of sliver");
+    // A dissolve is a REPAIR only while it stays a minority correction. Its
+    // premise is that a fragment reaching the body through one node or edge is a
+    // DEFECT — and a defect is rare: the wheel-radial case that motivated the
+    // rule dropped 2 elements, and the fin25 board drops 3 of 240,469 (0.001%).
+    // When the same rule fires on most of the fill the premise is simply false
+    // for that mesh, and "repairing" it means handing back a part that is no
+    // longer the part: measured on this board at h=1.54 mm the pass dissolved
+    // 52,013 of 52,045 elements and 3281.87 of 3282.13 mm^3 — 99.99% of the
+    // volume — and every quality metric of the surviving 32 elements still read
+    // clean. Refuse instead; the element size, not the mesh, is what is wrong,
+    // and the retry ladder in mesh_loaded_model can move on.
+    if (elems_before_repair > 0 &&
+        out.hanging_elems_dropped * 10 > elems_before_repair) {
+      char text[448];
+      std::snprintf(
+          text, sizeof(text),
+          "mesh at h=%.4g mm is mostly disconnected fragments: the "
+          "hanging-element repair would dissolve %d of %d elements (%.1f%% of "
+          "the fill, %.4g mm^3), which is a bad element size rather than a "
+          "repairable mesh — try a different fineness/target size",
+          h, out.hanging_elems_dropped, elems_before_repair,
+          100.0 * static_cast<double>(out.hanging_elems_dropped) /
+              static_cast<double>(elems_before_repair),
+          out.dropped_volume_mm3);
+      out.ok = false;
+      out.error = text;
+      return false;
+    }
   }
   // Element sizes read off corner nodes only, so the mid-edge fallback above
   // cannot move this number.
@@ -783,19 +856,18 @@ bool retryable_lattice_guard(const std::string &error) {
 
 // Polymesh refuses the whole fill (GeometryVolumeLimitError) when a CAD feature
 // is smaller than the element size and the feature-refinement pass is off:
-// "feature unresolved at h=<metres> m: CAD face <n> ...". Match the literal
+// "feature unresolved at h=<size>: CAD face <n> ...". Match the literal
 // prefix — it is the pipeline's own wording and carries no Chudware framing.
 bool feature_unresolved(const std::string &error) {
   return error.find("feature unresolved at h=") != std::string::npos;
 }
 
 // The same refusal also names the element size that WOULD resolve the feature:
-// "... reduce -h to <= 1.56 m or raise --max-elems/--max-dof". Polyhedral-FEA
-// labels model units as metres in its diagnostics, but Chudware resolves the
-// size band in MILLIMETRES and feeds that straight into pm::pipeline::volume_mesh
-// (see build_mesh above and the size-band comment in load_model) with no unit
-// conversion anywhere, so the printed number is already a millimetre element
-// size directly comparable to `h`. Returns 0 when there is no usable hint.
+// "... reduce -h to <= 2.68 mm or raise --max-elems/--max-dof". The number is a
+// millimetre element size directly comparable to `h` (see in_model_units), and
+// both the raw " m" spelling and the relabelled " mm" one are accepted so the
+// hint survives whichever side of the relabel it is read on. Returns 0 when
+// there is no usable hint.
 double feature_hint_size_mm(const std::string &error) {
   static constexpr char kPrefix[] = "reduce -h to <= ";
   const size_t at = error.find(kPrefix);
@@ -810,14 +882,26 @@ double feature_hint_size_mm(const std::string &error) {
   // message degrades to "no hint" instead of a bogus element size.
   while (*end == ' ')
     ++end;
-  if (end[0] != 'm' || (end[1] != '\0' && end[1] != ' '))
+  if (end[0] != 'm')
+    return 0.0;
+  const char *tail = end[1] == 'm' ? end + 2 : end + 1;
+  if (*tail != '\0' && *tail != ' ')
     return 0.0;
   return value;
 }
 
-bool mesh_loaded_model(const LoadedModel &loaded, const MeshOptions &options,
-                       MeshOut &out) {
+// Defined below, beside the per-solid meshing fallback that also needs it.
+std::vector<TopoDS_Shape> model_solids(const LoadedModel &loaded);
+
+// The fill and its bounded recovery ladder, starting from `h_start` (0 = the
+// size the advisor/size band resolved). Split out so the caller can re-run the
+// WHOLE ladder at a different starting size: a recovery rung is what finally
+// produces the mesh on a detail-dense part, so a check that only looked at the
+// first attempt's result would not see the mesh anyone solves.
+bool fill_with_recovery(const LoadedModel &loaded, const MeshOptions &options,
+                        double h_start, MeshOut &out) {
   const AdvisorPlan plan = make_advisor_plan(loaded, options);
+  const double h_first = h_start > 0.0 ? h_start : plan.h;
   auto attempt = [&](double h, bool feature_refine) {
     out = MeshOut();
     out.advisor = plan.result;
@@ -829,65 +913,127 @@ bool mesh_loaded_model(const LoadedModel &loaded, const MeshOptions &options,
       return build_mesh(loaded, plan.options, h, feature_refine, {}, nodal, out);
     } catch (const std::exception &e) {
       out.ok = false;
-      out.error = e.what();
+      out.error = in_model_units(e.what());
       return false;
     }
   };
   // First attempt keeps the interactive default: draft/coarse skips the extra
   // feature pass.
   const bool feature_refine = default_feature_refine(plan.options);
-  if (attempt(plan.h, feature_refine))
+  if (attempt(h_first, feature_refine))
     return true;
   const std::string first_error = out.error;
 
   // A detail-dense model (thin ECAD boards, small bosses) can have features far
-  // below h, and polymesh then refuses outright rather than meshing over them.
-  // Coarsening cannot help (the governor re-coarsens anyway and the features
-  // stay unresolved), so the one lever is the pass we skipped. Retry ONCE at
-  // the SAME h with it on: bounded, deterministic, and it keeps a coarse study
-  // running instead of failing where a finer setting would have passed.
-  if (!feature_refine && feature_unresolved(first_error)) {
-    if (attempt(plan.h, /*feature_refine=*/true)) {
-      char text[192];
-      std::snprintf(text, sizeof(text),
-                    "feature refinement enabled after polymesh refused "
-                    "h=%.4g mm (fineness %.2f)",
-                    plan.h, plan.options.fineness);
-      append_note(out.note, text);
-      return true;
-    }
-    std::string chain = first_error +
-                        "; feature-refinement retry at the same element size "
-                        "also failed: " +
-                        out.error;
-
-    // Last bounded lever: polymesh stated the element size that resolves the
-    // feature, so honour it once instead of discarding it and failing a study
-    // that a finer setting would have meshed. Only ever DOWNWARD, and only
-    // once — the hint is a hard bound, not a search.
-    double suggested = feature_hint_size_mm(out.error);
-    if (suggested <= 0.0)
-      suggested = feature_hint_size_mm(first_error);
-    if (suggested > 0.0 && suggested < plan.h) {
-      // Land just under the stated bound: it is inclusive upstream but derived
-      // from the same rounded value it prints, so sitting exactly on it can
-      // still be refused.
-      const double hinted = std::min(suggested, 0.98 * suggested);
-      if (attempt(hinted, /*feature_refine=*/true)) {
-        char text[192];
+  // below h, and polymesh then refuses outright rather than meshing over them
+  // ("feature unresolved at h=..."). Coarsening cannot help (the features stay
+  // unresolved and the governor re-coarsens anyway), so the levers are the
+  // feature-refinement pass and the size polymesh itself names. Run them as one
+  // bounded ladder — and run it whatever the first attempt's refinement setting
+  // was: a fine study starts with the pass already ON, and before this it got
+  // no recovery at all even though the hint was sitting in the message.
+  if (feature_unresolved(first_error)) {
+    std::string chain = first_error;
+    // FIRST rung: withdraw the size band's coarsening, if it made one. That
+    // coarsening is a PREDICTION (mesh_size_band.cpp over-estimates the element
+    // count by 6-9x on plate-like parts), and polymesh has just MEASURED that
+    // the coarsened size cannot resolve this part's features. Forcing it
+    // through with the refinement pass instead does "succeed", and on the
+    // hole-array bracket of test_mesher_advanced that success is 27,688
+    // elements in SEVEN connected components with aspect_max 4063 — a mesh
+    // fea_static refuses — where the geometry's own 3.93 mm returns 21,764 in
+    // ONE component. So the cheaper size is neither cheaper nor a mesh, and the
+    // budget it was defending is not even breached: the honest fill lands under
+    // the interactivity budget the prediction claimed it would blow by 5.6x.
+    //
+    // Only on the ORIGINAL call (h_start == 0): when the caller has already
+    // pinned a starting size, this rung would re-do its work.
+    if (h_start <= 0.0 && loaded.band.geometry_base > 0.0 &&
+        loaded.band.geometry_base < h_first * (1.0 - 1e-9)) {
+      if (attempt(loaded.band.geometry_base, feature_refine)) {
+        char text[256];
         std::snprintf(text, sizeof(text),
-                      "element size reduced %.4g->%.4g mm on polymesh's "
-                      "feature-resolution hint (fineness %.2f)",
-                      plan.h, hinted, plan.options.fineness);
+                      "auto-coarsening withdrawn: polymesh refused the "
+                      "budget-coarsened h=%.4g mm as unresolvable, so the mesh "
+                      "was built at the geometry's own %.4g mm (%d elements)",
+                      h_first, loaded.band.geometry_base, out.n_elems);
         append_note(out.note, text);
         return true;
       }
-      char tail[128];
+      chain += "; the geometry's own element size " +
+               std::to_string(loaded.band.geometry_base) +
+               " mm also failed: " + out.error;
+    }
+    if (!feature_refine) {
+      // Retry ONCE at the SAME h with the skipped pass on: bounded,
+      // deterministic, and it keeps a coarse study running instead of failing
+      // where a finer setting would have passed.
+      if (attempt(h_first, /*feature_refine=*/true)) {
+        char text[192];
+        std::snprintf(text, sizeof(text),
+                      "feature refinement enabled after polymesh refused "
+                      "h=%.4g mm (fineness %.2f)",
+                      h_first, plan.options.fineness);
+        append_note(out.note, text);
+        return true;
+      }
+      chain += "; feature-refinement retry at the same element size also "
+               "failed: " +
+               out.error;
+    }
+
+    // Next lever: every refusal names the element size that resolves the
+    // feature it tripped on ("reduce -h to <= ..."), and resolving that one can
+    // uncover a SMALLER feature with a new, smaller hint — measured on the
+    // fin25 board, 4.46 mm -> 2.68 mm -> 1.57 mm, one CAD face at a time. So
+    // the hint is a ladder, not a single bound. It is bounded twice over: at
+    // most kHintSteps rungs, and never below the study's own element-size band
+    // floor, because that floor is what keeps the descent inside the memory
+    // governor's approved 2:1 size band instead of trading a refusal for an
+    // OOM. Falling off the bottom is reported with the size polymesh asked for,
+    // so the caller can raise fineness or set min_size_mm deliberately.
+    constexpr int kHintSteps = 3;
+    const double floor_mm = loaded.band.min_len > 0.0 ? loaded.band.min_len : 0.0;
+    double h = h_first;
+    for (int step = 0; step < kHintSteps; ++step) {
+      double suggested = feature_hint_size_mm(out.error);
+      if (suggested <= 0.0)
+        suggested = feature_hint_size_mm(first_error);
+      if (!(suggested > 0.0) || !(suggested < h))
+        break;
+      // Land just under the stated bound: it is inclusive upstream but derived
+      // from the same rounded value it prints, so sitting exactly on it can
+      // still be refused.
+      const double hinted = 0.98 * suggested;
+      if (hinted < floor_mm) {
+        char tail[224];
+        std::snprintf(tail, sizeof(tail),
+                      "; polymesh needs an element size of %.4g mm to resolve "
+                      "this feature, below this study's element-size band floor "
+                      "of %.4g mm — raise fineness or set min_size_mm to mesh "
+                      "it",
+                      suggested, floor_mm);
+        chain += tail;
+        break;
+      }
+      if (attempt(hinted, /*feature_refine=*/true)) {
+        char text[224];
+        std::snprintf(text, sizeof(text),
+                      "element size reduced %.4g->%.4g mm over %d "
+                      "feature-resolution hint(s) from polymesh (fineness %.2f)",
+                      h_first, hinted, step + 1, plan.options.fineness);
+        append_note(out.note, text);
+        return true;
+      }
+      char tail[160];
       std::snprintf(tail, sizeof(tail),
                     "; feature-resolution hint retry at h=%.4g mm also failed: ",
                     hinted);
-      out.error = chain + tail + out.error;
-      return false;
+      chain += tail + out.error;
+      h = hinted;
+      // A different failure mode is not a sizing problem; stop guessing.
+      if (!feature_unresolved(out.error))
+        break;
     }
     out.error = std::move(chain);
     return false;
@@ -900,7 +1046,7 @@ bool mesh_loaded_model(const LoadedModel &loaded, const MeshOptions &options,
   // land exactly on a non-manifold/coincident skin at one bulk-cell pitch while
   // a nearby pitch is watertight. One bounded deterministic 6.25% coarser retry
   // changes the phase without weakening the geometry guard or exploding DOFs.
-  if (attempt(plan.h * 1.0625, feature_refine)) {
+  if (attempt(h_first * 1.0625, feature_refine)) {
     append_note(out.note,
                 "graded-tet lattice guard recovered on deterministic 17/16 "
                 "element-size retry");
@@ -909,6 +1055,69 @@ bool mesh_loaded_model(const LoadedModel &loaded, const MeshOptions &options,
   out.error = first_error + "; deterministic 17/16 lattice retry also failed: " +
               out.error;
   return false;
+}
+
+// ── Was the coarsening honest? ─────────────────────────────────────────────
+// resolve_size_band raises the element size when a PREDICTED element count
+// blows the interactivity/memory budget, and that prediction over-estimates by
+// 6-9x on plate-like parts (the measurements are beside the floor in
+// mesh_size_band.cpp). A coarsening it justifies can therefore buy nothing and
+// cost the mesh. Measured on the hole-array bracket of test_mesher_advanced
+// (100 x 50 x 52 mm bbox over a 12 mm plate, so the bbox-side floor is inert):
+// coarsened 3.93 -> 9.25 mm, the fill came back as 27,688 elements in SEVEN
+// connected components with aspect_max 4063 and fea_static refused it, where
+// the honest 3.93 mm gives 21,764 elements in ONE component — FEWER elements
+// and a mesh instead of debris, because a fill asked for an element size its
+// features cannot accept spends its budget on feature seeds instead.
+//
+// So the coarsening is verified on the RESULT rather than predicted from the
+// geometry: which thin section a fill can still resolve is not decidable from a
+// bounding box (nor from a section probe — mesh_size_band.cpp records why that
+// was rejected: it withdraws the coarsening the fin25 board depends on), but
+// "came back in more pieces than the shape has solids" is decidable, already
+// computed by fill_quality, and is exactly the defect that makes the mesh
+// unsolvable. A genuinely multi-solid compound reports its own solid count and
+// is untouched, and the rebuild is bounded: ONE re-run of the ladder, kept only
+// if it is no more fragmented than what it replaces.
+bool mesh_loaded_model(const LoadedModel &loaded, const MeshOptions &options,
+                       MeshOut &out) {
+  if (!fill_with_recovery(loaded, options, /*h_start=*/0.0, out))
+    return false;
+  const double honest = loaded.band.geometry_base;
+  if (out.connected_components <= 1 || !(honest > 0.0) ||
+      !(honest < loaded.band.base * (1.0 - 1e-9)))
+    return true;
+  const int expected =
+      static_cast<int>(std::max<std::size_t>(model_solids(loaded).size(), 1));
+  if (out.connected_components <= expected)
+    return true;
+
+  MeshOut coarse = std::move(out);
+  out = MeshOut();
+  char text[448];
+  if (fill_with_recovery(loaded, options, honest, out) &&
+      out.connected_components <= coarse.connected_components) {
+    std::snprintf(text, sizeof(text),
+                  "the auto-coarsened element size %.4g mm filled into %d "
+                  "connected component(s) for a %d-solid shape, so the mesh was "
+                  "rebuilt at the geometry's own element size %.4g mm: %d "
+                  "component(s), %d elements against %d",
+                  loaded.band.base, coarse.connected_components, expected,
+                  honest, out.connected_components, out.n_elems,
+                  coarse.n_elems);
+    append_note(out.note, text);
+    return true;
+  }
+  std::snprintf(text, sizeof(text),
+                "the auto-coarsened element size %.4g mm filled into %d "
+                "connected component(s) for a %d-solid shape and the rebuild at "
+                "%.4g mm did not improve on it — each island is its own "
+                "stiffness system, so set an explicit target_size_mm here",
+                loaded.band.base, coarse.connected_components, expected,
+                honest);
+  out = std::move(coarse);
+  append_note(out.note, text);
+  return true;
 }
 
 std::vector<TopoDS_Shape> model_solids(const LoadedModel &loaded) {
@@ -964,6 +1173,9 @@ bool mesh_separate_solids(const std::vector<TopoDS_Shape> &solids,
     combined.n_nodes += part.n_nodes;
     combined.n_elems += part.n_elems;
     combined.quadratic_fallback_elems += part.quadratic_fallback_elems;
+    combined.hanging_elems_dropped += part.hanging_elems_dropped;
+    combined.lonely_nodes_repaired += part.lonely_nodes_repaired;
+    combined.dropped_volume_mm3 += part.dropped_volume_mm3;
     combined.char_len_mm = std::min(combined.char_len_mm, part.char_len_mm);
     append_note(combined.note, part.note);
     if (!combined.advisor && part.advisor)
@@ -971,6 +1183,9 @@ bool mesh_separate_solids(const std::vector<TopoDS_Shape> &solids,
   }
   append_note(combined.note, std::to_string(solids.size()) +
                                  " separate solid bodies meshed independently");
+  // Each part was repaired on its own; the merge cannot create a new hanging
+  // element (parts share no nodes), so only the count needs refreshing.
+  detail::count_lonely_nodes(combined);
   if (!detail::fill_quality(combined)) {
     out = std::move(combined);
     out.ok = false;
@@ -1011,7 +1226,7 @@ MeshOut mesh_step(const std::string &step_path, const MeshOptions &options) {
     return out;
   } catch (const std::exception &e) {
     out.ok = false;
-    out.error = std::string("polymesh mesher failed: ") + e.what();
+    out.error = "polymesh mesher failed: " + in_model_units(e.what());
     return out;
   } catch (...) {
     out.ok = false;
@@ -1063,7 +1278,7 @@ AdaptiveMesher::open(const std::string &step_path, const MeshOptions &options,
     }
     return std::unique_ptr<AdaptiveMesher>(new AdaptiveMesher(std::move(impl)));
   } catch (const std::exception &e) {
-    error = std::string("polymesh adaptive open failed: ") + e.what();
+    error = "polymesh adaptive open failed: " + in_model_units(e.what());
     return nullptr;
   } catch (...) {
     error = "polymesh adaptive open failed with an unknown exception";
@@ -1091,7 +1306,7 @@ bool AdaptiveMesher::mesh(MeshOut &out, std::string &error) {
     }
     return true;
   } catch (const std::exception &e) {
-    error = std::string("polymesh adaptive mesh failed: ") + e.what();
+    error = "polymesh adaptive mesh failed: " + in_model_units(e.what());
     return false;
   } catch (...) {
     error = "polymesh adaptive mesh failed with an unknown exception";

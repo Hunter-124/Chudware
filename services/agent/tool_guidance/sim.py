@@ -299,10 +299,15 @@ ENTRIES: dict[str, dict[str, Any]] = {
     },
     "run_fea_contact": {
         "prompt_note": (
-            "CalculiX TWO-BLOCK PROXY proving contact load transfer, not the document's "
-            "actual contact pair. pressure_mpa must be finite and >0 MPa. Require "
-            "base_reaction_n≈applied_load_n; ok:false or skipped:true means no verified "
-            "contact result. Use run_fea_static for real-part stresses."
+            "REAL frictionless unilateral contact on the document's own meshed bodies: "
+            "surface pairs facing across <=max_gap_mm carry compression only, solved by an "
+            "active-set loop. Same fixtures/load dialect as run_fea_static, plus max_gap_mm "
+            "just above the measured clearance. Read contact.active_pairs (0 = nothing "
+            "touched), contact.converged, contact.pairs[].contact_force_n / "
+            "max_contact_pressure_mpa, and reactions.equilibrium_error_pct. No friction, no "
+            "large sliding, no preload — apply a clamp load as a face load instead. A load "
+            "that pulls the parts apart is refused as a mechanism. Bonded (tension-carrying) "
+            "joints use run_fea_static with bond_gap_mm; the two are mutually exclusive."
         ),
         "timeout_s": _FEA_TIMEOUT_S,
     },

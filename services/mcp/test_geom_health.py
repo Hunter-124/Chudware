@@ -86,6 +86,50 @@ PLANAR_FACE = OPEN_WALL[:5] + [
                               "centroid": [0, 0], "hint_index": 0}]}}},
 ]
 
+# Two flat panels that CROSS each other, sewn into ONE body. surf_planar on plane.top spans
+# x,y in [-20,20]; surf_planar on plane.front spans x,z in [-10,10]; they pass through each
+# other along y=0,z=0. surf_knit sews them into a single surface body, so the result is one
+# body whose own skin passes through itself — the case a watertight/manifold census is blind
+# to by construction. No feature op will emit a self-intersecting SOLID (extrude rejects a
+# self-intersecting profile, sweep rejects a self-intersecting sweep, surf_thicken fails on
+# a folded wall), so the solid case lives in core/tests/test_document.cpp.
+CROSSED_PANELS = [
+    {"op": "add_feature", "feature": {
+        "type": "sketch", "name": "Flat", "params": {"entities": [], "constraints": []},
+        "refs": {"plane": "plane.top"}}},
+    {"op": "sketch_add_entity", "sketch": "$0",
+     "entity": {"type": "line", "p1": [-20, -20], "p2": [20, -20]}},
+    {"op": "sketch_add_entity", "sketch": "$0",
+     "entity": {"type": "line", "p1": [20, -20], "p2": [20, 20]}},
+    {"op": "sketch_add_entity", "sketch": "$0",
+     "entity": {"type": "line", "p1": [20, 20], "p2": [-20, 20]}},
+    {"op": "sketch_add_entity", "sketch": "$0",
+     "entity": {"type": "line", "p1": [-20, 20], "p2": [-20, -20]}},
+    {"op": "add_feature", "feature": {
+        "type": "surf_planar", "name": "PanelA", "params": {},
+        "refs": {"profile": [{"kind": "region", "sketch": "$0",
+                              "centroid": [0, 0], "hint_index": 0}]}}},
+    {"op": "add_feature", "feature": {
+        "type": "sketch", "name": "Up", "params": {"entities": [], "constraints": []},
+        "refs": {"plane": "plane.front"}}},
+    {"op": "sketch_add_entity", "sketch": "$6",
+     "entity": {"type": "line", "p1": [-10, -10], "p2": [10, -10]}},
+    {"op": "sketch_add_entity", "sketch": "$6",
+     "entity": {"type": "line", "p1": [10, -10], "p2": [10, 10]}},
+    {"op": "sketch_add_entity", "sketch": "$6",
+     "entity": {"type": "line", "p1": [10, 10], "p2": [-10, 10]}},
+    {"op": "sketch_add_entity", "sketch": "$6",
+     "entity": {"type": "line", "p1": [-10, 10], "p2": [-10, -10]}},
+    {"op": "add_feature", "feature": {
+        "type": "surf_planar", "name": "PanelB", "params": {},
+        "refs": {"profile": [{"kind": "region", "sketch": "$6",
+                              "centroid": [0, 0], "hint_index": 0}]}}},
+    {"op": "add_feature", "feature": {
+        "type": "surf_knit", "name": "Knit", "params": {},
+        "refs": {"surfaces": [{"kind": "body", "owner_feature": "$5"},
+                              {"kind": "body", "owner_feature": "$11"}]}}},
+]
+
 
 @pytest.fixture(scope="module")
 def box() -> str:
@@ -95,6 +139,11 @@ def box() -> str:
 @pytest.fixture(scope="module")
 def open_wall() -> str:
     return _new_doc("health_open_wall", OPEN_WALL)
+
+
+@pytest.fixture(scope="module")
+def crossed_panels() -> str:
+    return _new_doc("health_crossed_panels", CROSSED_PANELS)
 
 
 # --------------------------------------------------------------------------
@@ -207,21 +256,50 @@ def test_the_good_and_the_bad_body_disagree_on_every_load_bearing_field(box, ope
 # --------------------------------------------------------------------------
 
 
-def test_self_intersection_is_reported_as_not_checked_never_as_passing(box):
-    """The engine has no single-body self-intersection test, so it must SAY so.
+def test_self_intersection_is_a_verdict_the_engine_actually_computed(box):
+    """The check RUNS, and on a clean box it answers `no`.
 
-    A watertight verdict is topological. If this ever silently became `true`/absent, an agent
-    would read a passing health check as a self-intersection clearance it never got.
+    This field was a hard-coded {checked:false, "this engine has no such test"} disclaimer.
+    It is now a BOPAlgo_CheckerSI run, so a plain box must come back with a real verdict —
+    and nothing may be advertised in the top-level not_checked list for it.
     """
     out = _call("check_geometry_health", doc_id=box)
     si = out["bodies"][0]["self_intersection"]
-    assert si["checked"] is False, si
-    assert "checked" in si and si.get("passed") is None and si.get("ok") is None, si
-    assert "not checked" in si["reason"], si
-    # And it is hoisted to the top level so a skim of a PASSING report still sees it.
-    assert out["watertight"] is True
-    assert any(x.startswith("self_intersection:") for x in out["not_checked"]), out
-    assert "NOT CHECKED" in out["summary"], out["summary"]
+    assert si["checked"] is True, si
+    assert si["self_intersecting"] is False, si
+    assert si["interference_count"] == 0, si
+    assert si["kinds"] == [], si
+    assert isinstance(si["elapsed_ms"], (int, float)) and si["elapsed_ms"] >= 0.0, si
+    assert not [x for x in out["not_checked"] if x.startswith("self_intersection")], out
+    assert out["watertight"] is True and out["sound"] is True, out
+
+
+def test_two_crossing_panels_knit_into_one_body_are_reported_self_intersecting(
+        crossed_panels):
+    """A body whose own skin passes through itself — and a census that can see it.
+
+    The counts a watertight verdict is built from cannot detect this: both panels are
+    perfectly valid faces and neither one is torn. The kernel check must find the
+    face/face interference, the body must not read as sound, and the report must carry an
+    actionable finding naming the defect (an interference_count with no sentence beside it
+    is not an answer an agent can act on).
+    """
+    out = _call("check_geometry_health", doc_id=crossed_panels)
+    assert out["body_count"] == 1, out
+    b = out["bodies"][0]
+    assert b["faces"] == 2, b                 # ONE body, two crossing panels
+    si = b["self_intersection"]
+    assert si["checked"] is True, si
+    assert si["self_intersecting"] is True, si
+    assert si["interference_count"] >= 1, si
+    assert "face_face" in si["kinds"], si
+    assert b["sound"] is False and out["sound"] is False, out
+    joined = " ".join(b["findings"])
+    assert "SELF-INTERSECTS" in joined, b["findings"]
+    assert str(si["interference_count"]) in joined, b["findings"]
+    assert "NOT SOUND" in b["verdict"], b
+    # The check RAN, so it must not ALSO be advertised as not-checked.
+    assert not [x for x in out["not_checked"] if x.startswith("self_intersection")], out
 
 
 def test_orientation_is_not_checked_when_there_is_no_shell_to_orient():
@@ -271,11 +349,25 @@ def test_no_repair_argument_means_no_repair_key(box):
 # the alias spellings models actually write
 # --------------------------------------------------------------------------
 
+def _same_answer(a: dict) -> dict:
+    """The payload minus its one non-deterministic field.
+
+    `self_intersection.elapsed_ms` is a wall-clock measurement of the BOPAlgo_CheckerSI run,
+    so two calls on the same body legitimately differ by a fraction of a millisecond. Every
+    other field is a verdict and must match exactly.
+    """
+    out = json.loads(json.dumps(a))
+    for b in out.get("bodies") or []:
+        (b.get("self_intersection") or {}).pop("elapsed_ms", None)
+    return out
+
+
 @pytest.mark.parametrize("alias", ALIASES)
 def test_each_alias_resolves_to_the_canonical_tool(box, alias):
     canonical = _call("check_geometry_health", doc_id=box)
     out = _call(alias, doc_id=box)
-    assert out == canonical, f"{alias} answered differently from check_geometry_health"
+    assert _same_answer(out) == _same_answer(canonical), \
+        f"{alias} answered differently from check_geometry_health"
 
 
 @pytest.mark.parametrize("alias", ALIASES + ("check_geometry_health",))
@@ -286,8 +378,8 @@ def test_every_spelling_is_registered_on_the_mcp_surface(alias):
 
 
 def test_body_id_is_accepted_as_a_spelling_of_body(box):
-    assert _call("check_geometry_health", doc_id=box, body=1) == \
-           _call("check_geometry_health", doc_id=box, body_id=1)
+    assert _same_answer(_call("check_geometry_health", doc_id=box, body=1)) == \
+           _same_answer(_call("check_geometry_health", doc_id=box, body_id=1))
 
 
 def test_an_out_of_range_body_is_an_error_not_a_verdict(box):

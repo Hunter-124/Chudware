@@ -236,8 +236,13 @@ std::vector<aicm::AicmBody> doc_tessellate_bodies(const std::string& doc_id);
 // annotate=false renders a CLEAN product shot (no face callouts / orientation triad / orientation
 // tint) so the true material colour shows — used for parts-library thumbnails. Default true keeps
 // the legacy annotated iso for the agent vision review.
+// `background`, when it is a 3-element [r,g,b] array in 0-255, is the colour the frame is
+// cleared to; omitted / null / malformed keeps the engine's flat 245 light grey, so an
+// existing caller's pixels are unchanged. Shading, tinting and overlays are untouched — this
+// replaces colour-keying the constant grey out of a finished frame.
 nlohmann::json doc_render_png(const std::string& doc_id, const std::string& out_path,
-                              bool annotate = true);
+                              bool annotate = true,
+                              const nlohmann::json& background = nlohmann::json());
 
 // doc_render_view: render ONE on-request view to a labelled PNG (task 03). `view` is a view spec:
 // a named view ("front"|"back"|"top"|"bottom"|"left"|"right"|"iso"), an {"azimuth","elevation"}
@@ -259,15 +264,19 @@ nlohmann::json doc_render_png(const std::string& doc_id, const std::string& out_
 // Fail-soft; never throws.
 // `annotate=false` suppresses the orientation tint, face callouts and axis triad for a clean
 // close-up (it was previously accepted by callers and silently ignored).
+// `background`: optional [r,g,b] 0-255 frame clear colour (see doc_render_png).
 nlohmann::json doc_render_view(const std::string& doc_id, const std::string& out_path,
-                               const nlohmann::json& view, bool annotate = true);
+                               const nlohmann::json& view, bool annotate = true,
+                               const nlohmann::json& background = nlohmann::json());
 
 // doc_render_contact_sheet: render SEVERAL views and tile them into one labelled PNG (task 03) —
 // the multi-view self-check artifact. `views` is an array of view specs (see doc_render_view);
 // empty/omitted defaults to front+right+top+iso. Each tile is headed with its view name + dims.
 // Returns {"ok", "path", "views":[names], "cols", "rows", "tile":[w,h]}. Fail-soft; never throws.
+// `background`: optional [r,g,b] 0-255, applied to every tile (gutters stay dark grey).
 nlohmann::json doc_render_contact_sheet(const std::string& doc_id, const std::string& out_path,
-                                        const nlohmann::json& views);
+                                        const nlohmann::json& views,
+                                        const nlohmann::json& background = nlohmann::json());
 
 // drawing_render_png: rasterize a 2D DRAWING document (its projected views) to a PNG at
 // `out_path` so the AI can SEE and self-review a drawing the same way it does a 3D part
@@ -355,10 +364,13 @@ nlohmann::json doc_eval_check(const std::string& doc_id, int body_id);
 // is_watertight, sound, faces, edges, vertices, shells, solids, free_edges:{count,sids},
 // non_manifold_edges:{count,sids}, tiny_edges:{count,sids}, sliver_faces:{count,sids},
 // seam_edges, degenerate_edges, orientation:{checked,consistent,…}, brep_valid, volume_mm3,
-// volume_positive, area_mm2, self_intersection:{checked:false,reason}}], body_count,
-// all_watertight, all_sound}. Free-edge counting is seam/degenerate-aware (same rule as
-// dress_is_closed_solid), so a cylinder's seam is NOT reported as a hole. Checks the kernel
-// cannot perform report checked:false with a reason — never a passing verdict. body_id is
+// volume_positive, area_mm2, self_intersection:{checked,self_intersecting,
+// interference_count,kinds,elapsed_ms}}], body_count, all_watertight, all_sound}.
+// Free-edge counting is seam/degenerate-aware (same rule as dress_is_closed_solid), so a
+// cylinder's seam is NOT reported as a hole. Self-intersection is a real BOPAlgo_CheckerSI
+// run at level 9 under a 20 s per-body wall-clock budget; a body it flags is NOT sound.
+// A check that could not run (timeout, OCCT failure) reports checked:false with a reason
+// and leaves `sound` alone — never a passing verdict for something not computed. body_id is
 // 1-based; <= 0 reports EVERY body. Throws OpError on no bodies / a bad body_id.
 nlohmann::json doc_eval_solid_health(const std::string& doc_id, int body_id);
 

@@ -243,6 +243,50 @@ TEST_CASE("fea_run_static applies tet10 end load through work-equivalent mid-sid
     CHECK(fine.max_disp == doctest::Approx(disp_nom).epsilon(0.15));
 }
 
+// Regression for the pressure SIGN convention (V&V finding, 2026-09-05). `pressure` is
+// documented "MPa, inward": a POSITIVE magnitude pushes INTO the loaded face, i.e. along
+// -n_outward. The solver used to deposit +p*integral(N_i n_outward)dA, so +p pulled the
+// loaded surface OUTWARD: a bore under +p was externally pressurised and the Lame hoop
+// stress came back at -29.6 MPa against the closed form's +33.33. Asserted on a flat
+// face, where n_outward is known: +p on the +Z face of a cube must impose a resultant of
+// p*A in -Z and push the loaded nodes DOWN. (The nodal DISTRIBUTION is deliberately not
+// compared against an equivalent force load: pressure deposits tributary weights
+// integral(N_i)dA while a tet4 force load splits equally over the picked nodes, so the
+// two agree on the resultant, not node for node.)
+TEST_CASE("pressure load acts along the INWARD face normal (sign convention)") {
+    const double p = 10.0;    // MPa on the +Z face of the unit cube
+    const double area = 1.0;  // mm2 -> p*area = 10 N total, inward = -Z
+    json study;
+    study["points"] = {0, 0, 0, 1, 0, 0, 1, 1, 0, 0, 1, 0,
+                       0, 0, 1, 1, 0, 1, 1, 1, 1, 0, 1, 1};
+    study["tets"] = {0, 1, 2, 6, 0, 2, 3, 6, 0, 3, 7, 6,
+                     0, 7, 4, 6, 0, 4, 5, 6, 0, 5, 1, 6};
+    study["material"] = {{"E_mpa", 200000.0}, {"nu", 0.29}, {"yield_mpa", 370.0}};
+    study["fixtures"] = {{{"points", {{0, 0, 0}, {1, 0, 0}, {1, 1, 0}, {0, 1, 0}}},
+                          {"tol_mm", 0.01}}};
+    study["loads"] = {{{"type", "pressure"},
+                       {"magnitude", p},
+                       {"faces", {{"points", {{0, 0, 1}, {1, 0, 1}, {1, 1, 1}, {0, 1, 1}}},
+                                  {"tol_mm", 0.01}}}}};
+
+    const json pressed = fea_run_static(study);
+    REQUIRE_MESSAGE(pressed.value("ok", false), pressed.dump());
+
+    // (1) The applied resultant is p*A along the INWARD normal of the loaded face.
+    const auto applied =
+        pressed.at("reactions").at("applied_force_n").get<std::vector<double>>();
+    REQUIRE(applied.size() == 3);
+    CHECK(applied[0] == doctest::Approx(0.0).epsilon(1e-9).scale(p * area));
+    CHECK(applied[1] == doctest::Approx(0.0).epsilon(1e-9).scale(p * area));
+    CHECK(applied[2] == doctest::Approx(-p * area).epsilon(1e-6));
+
+    // (2) +p COMPRESSES the part: every loaded (z=1) node moves in -Z.
+    const auto u = pressed.at("displacement").get<std::vector<double>>();
+    REQUIRE(u.size() == 24);
+    for (int nid : {4, 5, 6, 7})
+        CHECK(u[static_cast<size_t>(nid) * 3 + 2] < -1e-12);
+}
+
 TEST_CASE("public FEA run wrappers return JSON failures for malformed mesh setup") {
     json malformed_mesh = {
         {"points", {0.0, 0.0, 0.0, 1.0, 0.0, 0.0,

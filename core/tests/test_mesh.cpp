@@ -18,6 +18,7 @@
 
 #include "sim/fea_adaptive.h"
 #include "sim/fea_run.h"
+#include "sim/mesh_size_band.h"
 #include "sim/mesher.h"
 
 using namespace chudware::sim;
@@ -202,4 +203,39 @@ TEST_CASE("removed backend selectors are rejected before geometry access") {
       result.value("error", std::string())
               .find("removed with the Polyhedral-FEA cutover") != std::string::npos,
       result.dump());
+}
+
+// ── The element-count budget may never coarsen past the geometry's own floor. ──────
+// resolve_size_band predicts an element count for the chosen size and raises the size
+// when it blows the interactivity/memory budget. That prediction is fitted on a BULKY
+// part; on a slab it over-estimates by 7.5-9.4x (measured 2026-09-05), and coarsening on
+// it produced meshes that were not meshes: a 120x60x3 mm plate raised 3.01 -> 8.80 mm
+// (0.3 elements across the thickness, 32.7% poor elements), a D12 rod 2.84 -> 5.15 mm
+// (aspect_max 339), and the fin25 sensor board 2.60 -> 4.46 mm, which polymesh refused to
+// fill at all. The invariant is four elements across the thinnest bbox direction, and it
+// binds BOTH budget rungs — a recalibration of the element-count constants must not be
+// able to walk past it again.
+TEST_CASE("the element budget never coarsens past four elements across the thinnest side") {
+  const double thickness = 8.0;
+  const TopoDS_Shape plate =
+      BRepPrimAPI_MakeBox(gp_Pnt(0, 0, 0), 200.0, 200.0, thickness).Shape();
+  MeshOptions options;
+  options.fineness = 0.25;
+  const SizeBand slab = resolve_size_band(plate, options);
+  REQUIRE_MESSAGE(slab.ok, slab.error);
+  MESSAGE("slab band: base=" << slab.base << " note=" << slab.note);
+  // The automatic size already sits at the thinnest side; the budget wants ~20.8 mm and
+  // must not get it. Anything above the thickness cannot fit once across the plate.
+  CHECK(slab.base <= thickness * 1.001);
+  CHECK(slab.base > thickness * 0.5);
+
+  // Control: on a bulky part the floor is far away and coarsening still happens, so this
+  // is a cap on the budget, not a removal of it.
+  const TopoDS_Shape cube =
+      BRepPrimAPI_MakeBox(gp_Pnt(0, 0, 0), 100.0, 100.0, 100.0).Shape();
+  const SizeBand bulky = resolve_size_band(cube, options);
+  REQUIRE_MESSAGE(bulky.ok, bulky.error);
+  MESSAGE("bulky band: base=" << bulky.base << " note=" << bulky.note);
+  CHECK(bulky.base > 12.0);            // coarsened well past the 8.25 mm auto size
+  CHECK(bulky.base <= 25.0 * 1.001);   // and never past its own floor (100/4)
 }

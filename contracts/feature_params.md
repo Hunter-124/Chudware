@@ -572,3 +572,60 @@ repair**.
   body is left UNCHANGED with a warning. A partial repair (invalid before AND after) succeeds
   and warns, naming the residual issue count.
 - errors (contained): no `body` ref and no current body; `tolerance <= 0`; an empty result shape.
+
+### `heal` — escalation ladder and refusal (append-only, 2026-09-05)
+
+ShapeFix alone is not sufficient. The live CD-100 Stage 5 frame spine (body 47) imported with
+144 of its 344 edges traversed the SAME way by both adjacent faces; the five-point tolerance
+ladder above either changed nothing or, at `0.1`, destroyed 99 mm^3 and invented three new
+defect kinds. `heal` therefore takes four further OPT-IN repairs, each recorded, applied in this
+fixed order after the ShapeFix pass:
+- `sew_tolerance_mm: dim?` (null = off) — `BRepBuilderAPI_Sewing` over the FACES, so edge
+  sharing is re-derived from geometry instead of preserving the stored (wrong) one.
+- `fix_orientation: bool` (false) — flood-fill the face-orientation graph (every manifold edge
+  must be traversed oppositely by its two faces), then re-wrap each shell outward. Purely
+  topological: no surface is rebuilt, so area and analytic surface types survive exactly.
+  Records `orientation: {faces_flipped: int, conflicts: int}`; `conflicts > 0` means the input's
+  edge sharing is self-CONTRADICTORY and no flag repair can satisfy it.
+- `rebuild_solid: bool` (false) — re-derive the solid from its faces with `BOPAlgo_MakerVolume`
+  (intersect + rebuild every enclosed cell with a geometrically-derived orientation). The
+  `conflicts > 0` answer. Records `rebuild: {lumps: int, kept_volume_mm3, discarded_volume_mm3,
+  discarded_pct}`; the principal lump is kept.
+- `unify_faces: bool` (false) — `ShapeUpgrade_UnifySameDomain` over the result, to merge the
+  same-domain faces a rebuild leaves split.
+- `max_volume_change_pct: dim?` (0.5) — the refusal budget, in percent.
+
+The volume budget is judged on ORIENTATION-NORMALIZED volume, never on the raw integral: a
+signed integral over a shell whose faces disagree about which side is material is not a volume
+(one reversed face on a 24000 mm^3 box reads 16000). Each side whose BRepCheck issues include an
+orientation defect is therefore re-measured after a flood-orientation of a COPY (topology only),
+and the budget applies to that. Added to `feature_status[].data`:
+`{material_volume_before, material_volume_after, material_change_pct,
+volume_reading_trustworthy_before, volume_reading_trustworthy_after, volume_change_pct,
+area_mm2/bbox/bad_edges inside before|after, area_change_pct, bbox_shift_mm,
+sew_tolerance_mm, fix_orientation, rebuild_solid, unify_faces, max_volume_change_pct}`.
+
+REFUSAL supersedes the "left UNCHANGED with a warning" line above: a repair that hands back
+something worse FAILS the feature, so the batch rolls back and the document is untouched, while
+`data` survives the throw. The four refusals: more defect KINDS than were found; the bounding
+box moved by more than `max(1e-6 mm, 10*tolerance, 1e-5*diagonal)`; `rebuild_solid` would
+discard more than the budget in secondary lumps; normalized material changed by more than the
+budget. A repair that clears some but not all defects still succeeds and WARNS, naming the next
+rung to try.
+
+### `heal` — `rebuild_fuzzy_mm` and meshability evidence (append-only, 2026-09-05)
+
+- `rebuild_fuzzy_mm: dim?` (null = OCCT's own intersection tolerance) — the merge distance
+  `BOPAlgo_MakerVolume::SetFuzzyValue` uses during `rebuild_solid`. At the default tolerance
+  every pair of near-coincident input faces yields its own intersection line and the rebuild
+  leaves RAZOR STRIP faces: body 47's rebuild was BRep-valid carrying two 0.011 mm crescents,
+  and polymesh refused the entire fill at h = 8 mm and again at 4.8 mm (the quoted
+  CAD-to-mesh distance IS that width; its "reduce -h" hint halves forever). At 0.05 mm the
+  same faces merge during the intersection, the strips are never created, and the body meshes.
+- `rebuild.narrowest_face_mm` — min over faces of `2*area/perimeter` (a strip's mean width) on
+  the healed result, reported whenever `rebuild_solid` ran. A face narrower than `1e-4 *
+  bbox_diagonal` raises a WARNING on an otherwise successful heal, naming `rebuild_fuzzy_mm`:
+  the body is valid and no volume mesher can use it, which nothing else in the record says.
+- the envelope-movement budget becomes `max(1e-6 mm, 10*max(tolerance, sew_tolerance_mm,
+  rebuild_fuzzy_mm), 1e-5*diagonal)`. Authorizing a 0.05 mm merge authorizes movement on that
+  scale; without the fuzzy term the guard refused body 47's own fix over an 18 micron shift.

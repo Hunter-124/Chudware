@@ -3203,18 +3203,25 @@ static int chudware_call_inner(const char* method, const char* params_json, char
                 int rc = 0;
                 return emit(parts_make_impl(params, rc), out_json, rc);
             }
+            // `background` (optional [r,g,b] 0-255) rides all three render entries: the engine
+            // clears the frame to it instead of the constant 245 light grey. Absent/null keeps
+            // the legacy pixels exactly.
             if (m == "doc_render_png")
                 return emit(chudware::doc::doc_render_png(
                                 params.value("doc_id", std::string()),
                                 params.value("out_path", std::string()),
-                                params.value("annotate", true)),
+                                params.value("annotate", true),
+                                params.contains("background") ? params.at("background")
+                                                              : json(nullptr)),
                             out_json, 0);
             if (m == "doc_render_view")
                 return emit(chudware::doc::doc_render_view(
                                 params.value("doc_id", std::string()),
                                 params.value("out_path", std::string()),
                                 params.contains("view") ? params.at("view") : json(nullptr),
-                                params.value("annotate", true)),
+                                params.value("annotate", true),
+                                params.contains("background") ? params.at("background")
+                                                              : json(nullptr)),
                             out_json, 0);
             // PLM graphical revision diff — the whole params object goes through (doc_a/doc_b,
             // body_a/body_b, out_path, view, width/height, mode).
@@ -3224,7 +3231,9 @@ static int chudware_call_inner(const char* method, const char* params_json, char
                 return emit(chudware::doc::doc_render_contact_sheet(
                                 params.value("doc_id", std::string()),
                                 params.value("out_path", std::string()),
-                                params.contains("views") ? params.at("views") : json::array()),
+                                params.contains("views") ? params.at("views") : json::array(),
+                                params.contains("background") ? params.at("background")
+                                                              : json(nullptr)),
                             out_json, 0);
             if (m == "drawing_render_png")
                 return emit(chudware::doc::drawing_render_png(

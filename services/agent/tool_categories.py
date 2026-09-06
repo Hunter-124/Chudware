@@ -143,6 +143,9 @@ CATEGORY_PACKS: dict[str, list[str]] = {
         "doc_diff_tool",
         "engine_profile",
         "engine_profile_tree",
+        # The render family's moving half (2026-09-05): a turntable/explode/motion/fea
+        # film is a review artifact, so it belongs beside render_part/render_views.
+        "render_animation",
     ],
     "research": [
         "research_web_search",

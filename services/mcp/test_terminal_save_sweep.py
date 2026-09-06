@@ -23,6 +23,7 @@ Run:  python3 -m pytest services/mcp/test_terminal_save_sweep.py -q -p no:random
 from __future__ import annotations
 
 import sys
+import threading
 from pathlib import Path
 
 import pytest
@@ -35,13 +36,24 @@ from services.mcp import cad_common as C  # noqa: E402
 
 
 class _FakeEngine:
-    """doc_list from a fixed roster; doc_save records the call and writes the file."""
+    """doc_list from a fixed roster; doc_save records the call and writes the file.
 
-    def __init__(self, docs):
+    Thread-affine on purpose. This stands in for the engine only for the code under
+    test, which runs synchronously on the installing thread; a call arriving on any
+    other thread is somebody else's in-flight work — a deferred handoff publish armed
+    by an earlier test is the one measured in practice — and is passed through to the
+    real bridge instead of being recorded as a save the sweep made.
+    """
+
+    def __init__(self, docs, passthrough=None):
         self.docs = [dict(d) for d in docs]
         self.saves: list = []
+        self._owner = threading.current_thread()
+        self._passthrough = passthrough
 
     def call(self, method, params=None):
+        if threading.current_thread() is not self._owner:
+            return self._passthrough(method, params) if self._passthrough else {}
         p = params or {}
         if method == "doc_list":
             return {"docs": [dict(e) for e in self.docs]}
@@ -58,9 +70,13 @@ class _FakeEngine:
 def sweep(monkeypatch, tmp_path):
     """Install a fake engine + project save dir, and reset the touched-doc registry."""
     save_dir = tmp_path / "Projects" / "Testing"
+    # Let any trailing publish an earlier test armed finish against the REAL bridge
+    # before the fake goes in (cad_common.quiesce_publishes).
+    C.quiesce_publishes(10.0)
+    real_call = C.cb.call
 
     def _install(docs, *, touched=(), project_dir=save_dir):
-        fake = _FakeEngine(docs)
+        fake = _FakeEngine(docs, passthrough=real_call)
         monkeypatch.setattr(C.cb, "call", fake.call)
         monkeypatch.setattr(C, "_TOUCHED_DOCS", list(touched))
         if project_dir is None:

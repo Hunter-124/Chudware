@@ -175,6 +175,14 @@ struct CompFrame {
     Vector3d t0 = Vector3d::Zero();
     Vector3d w0 = Vector3d::Zero();
     bool fixed = false;
+    // A FIXED component's placement is authored, not solved: it is a hard constraint, so
+    // both of these are the document's own bytes rather than anything re-derived. `R0` is
+    // the transform's 3x3 block VERBATIM (a measured placement is orthonormal only to
+    // within the measurement, and re-projecting it moves the anchor's geometry), and
+    // `tf0` is the 16 doubles echoed back unchanged. Unused for free components, whose
+    // rotation is the exp-map of their solved variables.
+    Matrix3d R0 = Matrix3d::Identity();
+    std::vector<double> tf0;
     std::vector<int> t_idx;   // 3 var indices (translation), empty if fixed
     std::vector<int> w_idx;   // 3 var indices (rotation vector), empty if fixed
 
@@ -183,6 +191,10 @@ struct CompFrame {
         t_idx = sys.add_vars(3, {t0[0], t0[1], t0[2]});
         w_idx = sys.add_vars(3, {w0[0], w0[1], w0[2]});
     }
+
+    // Rotation matrix for a pose vector. A fixed component has no pose variables and no
+    // exp-map: its rotation is the authored block, whatever `w` says.
+    Matrix3d rot(const Vector3d& w) const { return fixed ? R0 : rodrigues_impl(w); }
 
     // Concatenated [tx,ty,tz, wx,wy,wz] global indices. Empty for fixed.
     std::vector<int> var_idx() const {
@@ -274,23 +286,33 @@ private:
     int icols() const { return static_cast<int>(idx_.size()); }
     MatrixXd empty_jac(int m) const { return MatrixXd::Zero(m, icols()); }
 
-    // world point + 3x6 jac wrt that component's vars
+    const CompFrame* frame_of(const std::string& which) const {
+        return (which == "a") ? fa_ : fb_;
+    }
+
+    // world point + 3x6 jac wrt that component's vars. A fixed component contributes a
+    // CONSTANT: its rotation is the authored block (not the exp-map of a pose vector it
+    // does not own) and its Jacobian block is dropped by `place`, so it stays zero here.
     void wp(const std::string& which, const VectorXd& xs, const Vector3d& p_local,
             Vector3d& wp_out, MatrixXd& J) const {
+        const CompFrame* f = frame_of(which);
         VectorXd x6 = (which == "a") ? xa(xs) : xb(xs);
         Vector3d w = x6.segment(3, 3);
-        wp_out = rodrigues_impl(w) * p_local + x6.head(3);
+        wp_out = f->rot(w) * p_local + x6.head(3);
         J = MatrixXd::Zero(3, 6);
+        if (f->fixed) return;
         J.block(0, 0, 3, 3) = Matrix3d::Identity();
         J.block(0, 3, 3, 3) = rot_jac(w, p_local);
     }
 
     void wd(const std::string& which, const VectorXd& xs, const Vector3d& d_local,
             Vector3d& wd_out, MatrixXd& J) const {
+        const CompFrame* f = frame_of(which);
         VectorXd x6 = (which == "a") ? xa(xs) : xb(xs);
         Vector3d w = x6.segment(3, 3);
-        wd_out = rodrigues_impl(w) * d_local;
+        wd_out = f->rot(w) * d_local;
         J = MatrixXd::Zero(3, 6);
+        if (f->fixed) return;
         J.block(0, 3, 3, 3) = rot_jac(w, d_local);
     }
 
@@ -326,8 +348,8 @@ private:
 
     Vector3d axis_world(const std::string& which) const {
         const MateGeom& g = (which == "a") ? ga_ : gb_;
-        const Vector3d& w0 = (which == "a") ? fa_->w0 : fb_->w0;
-        return unit(rodrigues_impl(w0) * g.dir_vector());
+        const CompFrame* f = frame_of(which);
+        return unit(f->rot(f->w0) * g.dir_vector());
     }
 
     using R = solver::ResidualFunc;
@@ -659,18 +681,18 @@ private:
 
     // ----- lock -----------------------------------------------------------
     Built lock() {
-        Matrix3d Ra0 = rodrigues_impl(fa_->w0);
+        Matrix3d Ra0 = fa_->rot(fa_->w0);
         Vector3d ta0 = fa_->t0;
-        Matrix3d Rb0 = rodrigues_impl(fb_->w0);
+        Matrix3d Rb0 = fb_->rot(fb_->w0);
         Vector3d tb0 = fb_->t0;
         Matrix3d relR0 = Ra0.transpose() * Rb0;
         Vector3d relt0 = Ra0.transpose() * (tb0 - ta0);
         auto self = this;
         R rfunc = [=](const VectorXd& xs) {
             VectorXd xav = self->xa(xs), xbv = self->xb(xs);
-            Matrix3d Ra = rodrigues_impl(xav.segment(3, 3));
+            Matrix3d Ra = self->fa_->rot(xav.segment(3, 3));
             Vector3d ta = xav.head(3);
-            Matrix3d Rb = rodrigues_impl(xbv.segment(3, 3));
+            Matrix3d Rb = self->fb_->rot(xbv.segment(3, 3));
             Vector3d tb = xbv.head(3);
             Matrix3d relR = Ra.transpose() * Rb;
             Vector3d relt = Ra.transpose() * (tb - ta);
@@ -685,7 +707,7 @@ private:
         J jfunc = [=](const VectorXd& xs) {
             VectorXd xav = self->xa(xs);
             MatrixXd Jm = self->empty_jac(6);
-            Matrix3d Ra = rodrigues_impl(xav.segment(3, 3));
+            Matrix3d Ra = self->fa_->rot(xav.segment(3, 3));
             if (self->fb_->var_size()) {
                 Jm.block(0, self->na_, 3, 3) = Ra.transpose();
                 Jm.block(3, self->na_ + 3, 3, 3) = Matrix3d::Identity();
@@ -1114,13 +1136,19 @@ private:
 
 const std::vector<double> kIdentity16 = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
 
-void transform_to_params(const std::vector<double>& transform, Vector3d& t, Vector3d& w) {
+// Split a 16-double row-major transform into the solver's pose parameters. `R_authored`,
+// when given, receives the 3x3 block VERBATIM — the caller that pins a fixed component
+// needs the document's own rotation, not the orthonormal projection the exp-map
+// parameterization requires.
+void transform_to_params(const std::vector<double>& transform, Vector3d& t, Vector3d& w,
+                         Matrix3d* R_authored = nullptr) {
     Eigen::Matrix4d M;
     for (int r = 0; r < 4; ++r)
         for (int c = 0; c < 4; ++c)
             M(r, c) = transform[r * 4 + c];
     Matrix3d Rm = M.block(0, 0, 3, 3);
     t = M.block(0, 3, 3, 1);
+    if (R_authored) *R_authored = Rm;
     // Orthonormalize defensively (SVD), matching numpy's U @ Vt with det fix.
     Eigen::JacobiSVD<Matrix3d> svd(Rm, Eigen::ComputeFullU | Eigen::ComputeFullV);
     Matrix3d U = svd.matrixU();
@@ -1303,6 +1331,8 @@ MateSolveResult solve_mates(const json& components, const json& mates,
         if (comp.value("suppressed", false)) continue;
         std::string cid = comp.at("id").get<std::string>();
         Vector3d t, w;
+        Matrix3d R_authored = Matrix3d::Identity();
+        std::vector<double> tf;
         // A fixed component's pose is AUTHORED, never solved: it must come from
         // `transform`, never from the warm map. `warm` carries the previous solve's params
         // for every component (fixed included, see the fill below), so reading it here
@@ -1313,17 +1343,23 @@ MateSolveResult solve_mates(const json& components, const json& mates,
             t = wit->second.first;
             w = wit->second.second;
         } else {
-            std::vector<double> tf = comp.contains("transform") && !comp["transform"].is_null()
+            tf = comp.contains("transform") && !comp["transform"].is_null()
                 ? comp["transform"].get<std::vector<double>>()
                 : kIdentity16;
             if (tf.size() != 16) tf = kIdentity16;
-            transform_to_params(tf, t, w);
+            transform_to_params(tf, t, w, &R_authored);
         }
         CompFrame frame;
         frame.id = cid;
         frame.t0 = t;
         frame.w0 = w;
         frame.fixed = fixed;
+        if (fixed) {
+            // Hard constraint, carried by the document's own numbers: the residuals see the
+            // authored rotation block and the result echoes the authored 16 doubles.
+            frame.R0 = R_authored;
+            frame.tf0 = tf;
+        }
         frames[cid] = frame;
         frame_order.push_back(cid);
     }
@@ -1436,8 +1472,14 @@ MateSolveResult solve_mates(const json& components, const json& mates,
     // A picometre is not a reachable residual across a 2 m assembly: one residual
     // evaluation of `n . (pb - pa)` at |p| ~ 2000 mm already carries ~1e-12 mm of
     // cancellation noise, and the LM then reports a perfectly seated network as
-    // "did not converge". Widen the threshold with the model, never below `tol`.
-    const double eff_tol = tol * (scale / 100.0);
+    // "did not converge". Widen the threshold with the model, never below `tol` —
+    // and never past kMaxAbsTolMm, because the positional rows are LENGTHS IN MM and
+    // no assembly size makes a nanometre of misplacement a converged mate. Without the
+    // ceiling the threshold grows without bound with the model, so a big enough
+    // assembly would accept a visible gap as "seated"; the ME 490 rover's own
+    // ~0.046 mm micro-pose is 46 000 times this ceiling.
+    constexpr double kMaxAbsTolMm = 1e-6;
+    const double eff_tol = std::min(tol * (scale / 100.0), std::max(tol, kMaxAbsTolMm));
 
     // Trust region: a single LM iteration may move a component by a quarter of the
     // assembly (never less than 25 mm, so a small model can still be dragged across
@@ -1516,14 +1558,17 @@ MateSolveResult solve_mates(const json& components, const json& mates,
     MateSolveResult out;
     for (auto& cid : frame_order) {
         CompFrame& frame = frames[cid];
-        Vector3d t, w;
         if (frame.fixed) {
-            t = frame.t0;
-            w = frame.w0;
-        } else {
-            t = Vector3d(x(frame.t_idx[0]), x(frame.t_idx[1]), x(frame.t_idx[2]));
-            w = Vector3d(x(frame.w_idx[0]), x(frame.w_idx[1]), x(frame.w_idx[2]));
+            // Bit-identical echo. Re-deriving the anchor's matrix from (t,w) put the
+            // grounded ME 490 rover frame ~0.046 mm off its authored placement — the
+            // exp-map round trip cannot represent a measured 3x3 block exactly, and a
+            // fixed component is a constraint, not a 6-variable pose with a stiff spring.
+            out.transforms[cid] = frame.tf0.size() == 16 ? frame.tf0 : kIdentity16;
+            out.params[cid] = {frame.t0, frame.w0};
+            continue;
         }
+        Vector3d t(x(frame.t_idx[0]), x(frame.t_idx[1]), x(frame.t_idx[2]));
+        Vector3d w(x(frame.w_idx[0]), x(frame.w_idx[1]), x(frame.w_idx[2]));
         out.transforms[cid] = params_to_transform(t, w);
         out.params[cid] = {t, w};
     }

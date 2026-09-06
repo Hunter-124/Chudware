@@ -176,15 +176,23 @@ ENTRIES: dict[str, dict[str, Any]] = {
         "prompt_note": (
             "Drive a mate through its range and return the union bbox the "
             "listed components sweep; fuse=True also builds the swept solid. "
-            "This is the folded/deployed envelope evidence, not a clash check."
+            "No dimensional mate (steering uprights on concentric kingpin "
+            "mates)? Pass steer={components,axis|mate_id,angle_deg} instead "
+            "and it sweeps 0..lock. This is the folded/deployed envelope "
+            "evidence, not a clash check."
         ),
         "timeout_s": 600,
     },
     "steering_turning_radius": {
         "prompt_note": (
-            "Closed-form Ackermann radii from a steer-mate sweep; pass "
-            "wheelbase_mm/track_mm when the axle heuristic refuses. Reports "
-            "the outer swept radius for the turn-envelope requirement."
+            "Turning radius from the posed wheel axle lines (ft and m), with "
+            "the closed-form Ackermann numbers beside it. An assembly whose "
+            "uprights are posed by concentric/coincident kingpin mates has NO "
+            "mate to drive: pass steer={components:[...], axis:{point,dir} or "
+            "mate_id, angle_deg or angles_deg:[...]} (plus rear_steer for "
+            "4WS) and it rotates them on a detached clone. Pass "
+            "wheelbase_mm/track_mm when the axle heuristic refuses; "
+            "check_interference=True names the first angle that clashes."
         ),
     },
     "run_fea_convergence": {

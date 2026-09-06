@@ -15,8 +15,10 @@
 //      chudware::mate::MateGeom (plane/axis/point/sphere) in the component's local frame.
 //
 //   3. Mate solve — chudware::mate::solve_mates over the shared numeric core places every
-//      floating component (fixed components pinned). Solved transforms + a per-mate
-//      status list + the DOF summary are reported.
+//      floating component. A fixed component is pinned as a hard constraint: its authored
+//      transform is what the mates are solved against and what comes back, bit-identical,
+//      so session.cpp's write-back of the solved poses cannot re-pose the anchor. Solved
+//      transforms + a per-mate status list + the DOF summary are reported.
 //
 //   4. Tessellation — each component contributes ONE AICM body (body_id = ordinal,
 //      name = component name, a distinct colour per ordinal), world-placed by the solved

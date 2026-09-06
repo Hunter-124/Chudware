@@ -89,6 +89,15 @@ struct MeshQualityFacts {
     // curvature). Always reported: it is a count, not a metric, and a nonzero
     // value is exactly why a thin-wall study can run at order 2 at all.
     int quadratic_fallback_elems = 0;
+    // Fill cells Chudware had to correct before the mesh could carry a solve
+    // (mesher.h MeshOut): `reoriented` were listed left-handed (node order
+    // only, no geometry change), `inflated` were shipped FLAT and were given
+    // volume by moving one node inside a hard bound. Both are counts, both ride
+    // with every mesh: a nonzero value is why an order-2 study on a sharp-edged
+    // part runs at all, and it is also the evidence that the delivered geometry
+    // is not byte-identical to the fill's.
+    int reoriented_elems = 0;
+    int degenerate_elems_inflated = 0;
     // Node-adjacency components over the elements (mesher.h MeshOut). 0 means
     // the count was not available for this mesh.
     int connected_components = 0;
@@ -128,6 +137,8 @@ json mesh_quality_json(const MeshQualityFacts& quality, std::size_t n_nodes,
     out["lonely_nodes_remaining"] = quality.lonely_nodes_remaining;
     out["hanging_elems_dropped"] = quality.hanging_elems_dropped;
     out["quadratic_fallback_elems"] = quality.quadratic_fallback_elems;
+    out["reoriented_elems"] = quality.reoriented_elems;
+    out["degenerate_elems_inflated"] = quality.degenerate_elems_inflated;
     // Connectivity and thin-wall facts are null when unavailable rather than a
     // plausible-looking 1 / 0 the reader would take for a measurement.
     out["connected_components"] = quality.connected_components > 0
@@ -505,6 +516,13 @@ double contact_interface_size_mm(const json& study) {
     return std::isfinite(size) && size > 0.0 ? size : 0.0;
 }
 
+// How far the DELIVERED interface size may sit above the requested one before
+// the study is refused. The number and its reasoning live in sim/mesher.h
+// (kLocalContractSlack), because the mesher's own last-resort re-fill decides
+// whether to spend a whole second fill on the same question and the two must
+// not disagree about whether a contract was met.
+constexpr double kInterfaceContractSlack = chudware::sim::kLocalContractSlack;
+
 double contact_max_gap_mm(const json& study) {
     if (!study.contains("contact") || !study["contact"].is_object()) return 0.5;
     const double gap = study["contact"].value("max_gap_mm", 0.5);
@@ -516,16 +534,29 @@ double contact_max_gap_mm(const json& study) {
 // Same shape whether the study was refused before the solve (the a-priori
 // clause: this mesh cannot describe the interface) or after it (the load
 // crossed through too few pairs), so a caller parses one thing.
+//
+// `criterion` says WHICH a-priori test was applied, and the numbers that follow
+// are the ones that test uses: a clearance carries ratio/max_ratio, two
+// TOUCHING faces have no clearance and carry the candidate patch area and the
+// coarsest element size that patch admits. Printing "clearance 0 mm" beside a
+// ratio of 0 read as a resolved interface however coarse the mesh was.
 json contact_resolution_json(const ContactResolution& r) {
     json out{{"h_interface_mm", round_nd(r.h_interface_mm, 6)},
              {"gap_mm", round_nd(r.gap_mm, 6)},
-             {"ratio", round_nd(r.ratio, 4)},
-             {"max_ratio", r.max_ratio},
+             {"criterion", r.criterion ? r.criterion : kCriterionClearance},
              {"candidate_pairs", r.candidate_pairs},
              {"seatable_pairs", r.seatable_pairs},
              {"min_active_pairs", r.min_active_pairs},
+             {"candidate_area_mm2", round_nd(r.candidate_area_mm2, 6)},
              {"required_interface_size_mm", round_nd(r.required_interface_size_mm, 4)},
              {"resolved", r.resolved}};
+    if (r.criterion == kCriterionPatchArea) {
+        out["max_h_interface_mm"] = round_nd(r.max_h_interface_mm, 4);
+        out["min_elements_across_patch"] = kContactMinPatchElems;
+    } else {
+        out["ratio"] = round_nd(r.ratio, 4);
+        out["max_ratio"] = r.max_ratio;
+    }
     if (r.active_pairs >= 0) {
         out["active_pairs"] = r.active_pairs;
         out["contact_area_mm2"] = round_nd(r.contact_area_mm2, 6);
@@ -681,6 +712,52 @@ bool resolve_mesh(const json &study, std::vector<double> &points,
                 std::to_string(interface_size) + " mm: " + refined_mesh->error;
           return false;
         }
+        // ── The contract is VERIFIED, not assumed ────────────────────────────
+        // Every lever that can raise a local size raises it silently: the
+        // lattice cannot place below background/4, polymesh floors the
+        // background at its own grid-cell budget, and the element ceiling stops
+        // the bisection waves. The live keyway asked for 0.35 mm and solved a
+        // 1.299 mm interface — converged, balanced, and physically meaningless.
+        // So the achieved size is measured on the mesh and a miss refuses,
+        // naming what bound and what IS achievable.
+        const double achieved = refined_mesh->local_refine_achieved_mm;
+        if (achieved > kInterfaceContractSlack * interface_size) {
+          char text[768];
+          if (refined_mesh->local_refine_ceiling_bound)
+            std::snprintf(
+                text, sizeof(text),
+                "contact.interface_size_mm = %.4g mm was not delivered: the local "
+                "refinement stopped at this machine's mesh element ceiling of %llu "
+                "elements (%d element(s) added over %d bisection wave(s)), so the "
+                "element size AT the interface is %.4g mm. Free memory (the ceiling "
+                "is the study memory budget divided by the measured mesh cost per "
+                "element) or isolate a smaller assembly — %.4g mm is what this "
+                "ceiling affords here",
+                interface_size,
+                static_cast<unsigned long long>(
+                    refined_mesh->local_refine_element_ceiling),
+                refined_mesh->local_refine_elems_added,
+                refined_mesh->local_refine_waves, achieved, achieved);
+          else
+            std::snprintf(
+                text, sizeof(text),
+                "contact.interface_size_mm = %.4g mm was not delivered: after %d "
+                "bisection wave(s) the element size AT the interface is %.4g mm "
+                "(background %.4g mm, the fill's own graded floor %.4g mm). The "
+                "study is refused rather than solved on an interface coarser than "
+                "it asked for — pass %.4g mm or coarser, or re-isolate the bodies "
+                "so the interface carries fewer candidate faces",
+                interface_size, refined_mesh->local_refine_waves, achieved,
+                refined_mesh->char_len_mm, refined_mesh->char_len_mm * 0.25,
+                achieved);
+          err = text;
+          // What the mesher itself hit, when it hit something nameable (a
+          // bisection closure that could not conform, a wave that grew nothing):
+          // the refusal is only actionable if it says so.
+          if (!refined_mesh->local_refine_limit.empty())
+            err += " — " + refined_mesh->local_refine_limit;
+          return false;
+        }
         mesh = refined_mesh;
       }
     }
@@ -697,6 +774,8 @@ bool resolve_mesh(const json &study, std::vector<double> &points,
     quality.jacobian_min = mesh->jacobian_min;
     quality.pct_poor = mesh->pct_poor;
     quality.quadratic_fallback_elems = mesh->quadratic_fallback_elems;
+    quality.reoriented_elems = mesh->reoriented_elems;
+    quality.degenerate_elems_inflated = mesh->degenerate_elems_repaired;
     quality.min_tet_volume_mm3 = mesh->min_tet_volume_mm3;
     quality.max_tet_edge_ratio = mesh->max_tet_edge_ratio;
     quality.connected_components = mesh->connected_components;
@@ -2015,15 +2094,29 @@ static nlohmann::json fea_run_static_impl(
             // discretization facts, which are the whole evidence for it.
             contact_resolution = fea_contact_resolution(contact_set);
             {
-                char text[288];
-                std::snprintf(text, sizeof(text),
-                              "contact interface element size %.4g mm against a %.4g mm "
-                              "closest approach (ratio %.1f); %d of %d candidate pair(s) "
-                              "sit within twice that clearance",
-                              contact_resolution.h_interface_mm,
-                              contact_resolution.gap_mm, contact_resolution.ratio,
-                              contact_resolution.seatable_pairs,
-                              contact_resolution.candidate_pairs);
+                char text[352];
+                if (contact_resolution.criterion == kCriterionPatchArea)
+                    std::snprintf(
+                        text, sizeof(text),
+                        "contact interface element size %.4g mm on a %.4g mm^2 "
+                        "candidate patch (the faces TOUCH — no clearance to resolve, "
+                        "so resolution is judged as %.0f elements across the patch, "
+                        "i.e. %.4g mm or finer); %d of %d candidate pair(s) are in "
+                        "contact",
+                        contact_resolution.h_interface_mm,
+                        contact_resolution.candidate_area_mm2, kContactMinPatchElems,
+                        contact_resolution.max_h_interface_mm,
+                        contact_resolution.seatable_pairs,
+                        contact_resolution.candidate_pairs);
+                else
+                    std::snprintf(
+                        text, sizeof(text),
+                        "contact interface element size %.4g mm against a %.4g mm "
+                        "closest approach (ratio %.1f); %d of %d candidate pair(s) "
+                        "sit within twice that clearance",
+                        contact_resolution.h_interface_mm, contact_resolution.gap_mm,
+                        contact_resolution.ratio, contact_resolution.seatable_pairs,
+                        contact_resolution.candidate_pairs);
                 notes.push_back(text);
             }
             if (!contact_resolution.resolved)

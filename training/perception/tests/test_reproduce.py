@@ -1,6 +1,7 @@
 import json
 
 import numpy as np
+import pytest
 
 from training.perception.baselines import fit_and_evaluate_baselines
 from training.perception.reproduce import ARTIFACT_FILES, reproduce, verify
@@ -30,6 +31,15 @@ def test_every_baseline_reports_horizons_calibration_and_events():
 
 
 def test_reproduction_bundle_verifies_exactly_and_names_complete_release(tmp_path):
+    # reproduce() fits the reference MLDP through torch autograd (see the same guard
+    # in test_train_eval.py): torch is a training-only optional dependency, absent
+    # from requirements.txt on purpose, so a service-venv-only box skips instead of
+    # reporting a missing optional dependency as a product failure.
+    pytest.importorskip(
+        "torch",
+        reason="the reproduction bundle trains the MLDP and needs the optional torch "
+        "dependency (pip install torch — training-only, not in requirements.txt)",
+    )
     destination = tmp_path / "release"
     result = reproduce(destination, seed=31, windows=48)
     verify(destination)

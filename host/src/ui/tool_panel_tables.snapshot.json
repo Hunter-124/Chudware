@@ -1040,7 +1040,7 @@
   "stackup_analyze": "1D tolerance stack-up analysis: worst-case and/or RSS over a dimension chain.",
   "stage_set": "Override the inferred process stage (contract §1: ``stage_set``).",
   "start_capture_session": "Start a local photo-capture server. Returns QR code URL + upload instructions.",
-  "steering_turning_radius": "ACKERMANN TURNING RADIUS of a steered vehicle, from its own solved geometry.",
+  "steering_turning_radius": "TURNING RADIUS of a steered vehicle, from its own solved geometry.",
   "stop_capture_session": "Stop the capture session and optionally run photogrammetry reconstruction.",
   "struct_analyze": "Run member-force and deflection analysis on a structural document.",
   "struct_check": "Return preliminary strength and serviceability utilization by member.",
@@ -2594,7 +2594,7 @@
    "prompt_note": "One session per port — a duplicate call fails and returns the live upload_url. scale_marker_mm is only recorded; real scale comes via reveng_set_scale."
   },
   "steering_turning_radius": {
-   "prompt_note": "Closed-form Ackermann radii from a steer-mate sweep; pass wheelbase_mm/track_mm when the axle heuristic refuses. Reports the outer swept radius for the turn-envelope requirement."
+   "prompt_note": "Turning radius from the posed wheel axle lines (ft and m), with the closed-form Ackermann numbers beside it. An assembly whose uprights are posed by concentric/coincident kingpin mates has NO mate to drive: pass steer={components:[...], axis:{point,dir} or mate_id, angle_deg or angles_deg:[...]} (plus rear_steer for 4WS) and it rotates them on a detached clone. Pass wheelbase_mm/track_mm when the axle heuristic refuses; check_interference=True names the first angle that clashes."
   },
   "stop_capture_session": {
    "prompt_note": "Needs MESHROOM_BIN or COLMAP_BIN set; takes minutes. Mesh is in reconstruction units, not mm — reveng_set_scale first, then reverse_engineer(source=mesh_path).",
@@ -2622,7 +2622,7 @@
    "prompt_note": "Plan explicit shop-drawing coverage from doc_id + process; it proposes a scheme but never supplies provenance or places annotations, so reconcile every row with the ledger before add_dimension/add_hole_callout."
   },
   "sweep_envelope": {
-   "prompt_note": "Drive a mate through its range and return the union bbox the listed components sweep; fuse=True also builds the swept solid. This is the folded/deployed envelope evidence, not a clash check.",
+   "prompt_note": "Drive a mate through its range and return the union bbox the listed components sweep; fuse=True also builds the swept solid. No dimensional mate (steering uprights on concentric kingpin mates)? Pass steer={components,axis|mate_id,angle_deg} instead and it sweeps 0..lock. This is the folded/deployed envelope evidence, not a clash check.",
    "timeout_s": 600
   },
   "tap_drill": {

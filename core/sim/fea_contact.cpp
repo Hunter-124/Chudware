@@ -433,25 +433,66 @@ ContactCandidateSet fea_contact_candidates(const std::vector<double>& points,
 ContactResolution fea_contact_resolution(const ContactCandidateSet& candidates) {
     ContactResolution out;
     out.min_active_pairs = kContactMinActivePairs;
-    out.max_ratio = kContactMaxHOverGap;
     out.candidate_pairs = static_cast<int>(candidates.springs.size());
     out.seatable_pairs = candidates.seatable_pairs;
     out.h_interface_mm = candidates.interface_h_mm;
+    out.candidate_area_mm2 = candidates.candidate_area_mm2;
     // The clearance the discretization has to resolve is the interface's own closest
     // approach. A set whose closest pair is TOUCHING or interfering (gap <= 0) has no
-    // clearance to resolve: the ratio is left at 0 and only the a-posteriori
-    // active-pair clause can refuse such an interface.
+    // clearance to resolve, so the ratio is undefined and the patch criterion applies
+    // instead (fea_contact.h).
     out.gap_mm = candidates.min_gap0_mm > 0.0 ? candidates.min_gap0_mm : 0.0;
-    out.ratio = out.gap_mm > 0.0 ? out.h_interface_mm / out.gap_mm : 0.0;
-    // The size that resolves this clearance: kMaxHOverGap elements' worth of it, and
-    // never coarser than half the size that failed (an interface that funnelled at a
-    // legal ratio still has to be refined to place more pairs).
-    const double from_gap = out.gap_mm > 0.0 ? kContactMaxHOverGap * out.gap_mm
-                                             : out.h_interface_mm * 0.5;
+    const bool touching = !(out.gap_mm > 0.0);
+    out.criterion = touching ? kCriterionPatchArea : kCriterionClearance;
+    if (touching) {
+        out.max_h_interface_mm = out.candidate_area_mm2 > 0.0
+                                     ? std::sqrt(out.candidate_area_mm2) /
+                                           kContactMinPatchElems
+                                     : 0.0;
+    } else {
+        out.ratio = out.h_interface_mm / out.gap_mm;
+        out.max_ratio = kContactMaxHOverGap;
+    }
+    // The size that resolves this interface: kContactMaxHOverGap elements' worth of
+    // the clearance (or kContactMinPatchElems across the patch when the faces touch),
+    // and never coarser than half the size that failed — an interface that funnelled
+    // at a legal ratio still has to be refined to place more pairs.
+    const double from_geometry = touching ? out.max_h_interface_mm
+                                          : kContactMaxHOverGap * out.gap_mm;
     out.required_interface_size_mm =
-        out.h_interface_mm > 0.0 ? std::min(from_gap, out.h_interface_mm * 0.5)
-                                 : from_gap;
+        out.h_interface_mm > 0.0 && from_geometry > 0.0
+            ? std::min(from_geometry, out.h_interface_mm * 0.5)
+            : (from_geometry > 0.0 ? from_geometry : out.h_interface_mm * 0.5);
     if (candidates.springs.empty()) return out;
+    if (touching) {
+        // No clearance: the patch decides. Both halves are required, same shape as
+        // the clearance clause — a small patch resolved by fine elements is a real
+        // seat, and a big patch with 3 pairs on it is not.
+        const bool too_coarse = out.max_h_interface_mm > 0.0 &&
+                                out.h_interface_mm > out.max_h_interface_mm;
+        if (too_coarse && out.seatable_pairs < kContactMinActivePairs) {
+            char text[704];
+            std::snprintf(
+                text, sizeof(text),
+                "the contact interface is not resolved by this mesh: the faces TOUCH "
+                "(closest approach 0 mm), so there is no clearance to resolve and the "
+                "interface is judged on its patch — the element size AT the interface "
+                "is %.4g mm across a %.4g mm^2 candidate patch (%.4g mm wide), which "
+                "is fewer than %.0f elements across it, and only %d of %d candidate "
+                "pairs are in contact. So any load would funnel through those few "
+                "nodes and be reported as a contact pressure. Set "
+                "contact.interface_size_mm to %.3g (mm) or finer: it refines the "
+                "candidate faces LOCALLY, so the interface is resolved without "
+                "meshing the whole part that fine",
+                out.h_interface_mm, out.candidate_area_mm2,
+                std::sqrt(out.candidate_area_mm2), kContactMinPatchElems,
+                out.seatable_pairs, out.candidate_pairs,
+                out.required_interface_size_mm);
+            out.reason = text;
+            out.resolved = false;
+        }
+        return out;
+    }
     if (out.ratio > kContactMaxHOverGap && out.seatable_pairs < kContactMinActivePairs) {
         char text[640];
         std::snprintf(
@@ -484,17 +525,32 @@ void fea_contact_resolution_after_solve(ContactResolution& resolution,
     // catches the case the a-priori one cannot see: a geometry whose candidates look
     // fine until the solve reveals that only a couple of them ever touch.
     if (active_pairs < resolution.min_active_pairs && contact_force_n > 0.0) {
-        char text[640];
+        char text[704];
+        // The interface facts to quote differ with the criterion: a clearance has a
+        // number to compare against, two touching faces do not (printing
+        // "clearance 0 mm" told a reader to resolve a gap that does not exist).
+        char interface_facts[288];
+        if (resolution.criterion == kCriterionPatchArea)
+            std::snprintf(interface_facts, sizeof(interface_facts),
+                          "%.4g mm interface element size on a %.4g mm^2 candidate "
+                          "patch (the faces touch, so there is no clearance to "
+                          "resolve: %.0f elements across the patch is the bar, i.e. "
+                          "%.3g mm or finer)",
+                          resolution.h_interface_mm, resolution.candidate_area_mm2,
+                          kContactMinPatchElems, resolution.max_h_interface_mm);
+        else
+            std::snprintf(interface_facts, sizeof(interface_facts),
+                          "%.4g mm interface element size (clearance %.4g mm)",
+                          resolution.h_interface_mm, resolution.gap_mm);
         std::snprintf(
             text, sizeof(text),
             "the contact load crossed this interface through %d active pair(s) of %d "
             "candidates, carrying %.4g N: fewer than %d pairs cannot represent a "
             "distributed contact patch, so the reported pressure is a point-load "
-            "artefact of the %.4g mm interface element size (clearance %.4g mm). Set "
-            "contact.interface_size_mm to %.3g (mm) or finer — it refines the "
-            "candidate faces LOCALLY, not the whole part",
+            "artefact of the %s. Set contact.interface_size_mm to %.3g (mm) or finer "
+            "— it refines the candidate faces LOCALLY, not the whole part",
             active_pairs, resolution.candidate_pairs, contact_force_n,
-            resolution.min_active_pairs, resolution.h_interface_mm, resolution.gap_mm,
+            resolution.min_active_pairs, interface_facts,
             resolution.required_interface_size_mm);
         resolution.reason = text;
         resolution.resolved = false;

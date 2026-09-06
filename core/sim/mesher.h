@@ -17,6 +17,17 @@
 
 namespace chudware::sim {
 
+// How far a DELIVERED local element size may sit above the requested one before
+// the request counts as unmet. A mesher never lands exactly on a requested size
+// (bisection halves elements, so the last wave overshoots downward), and the
+// contact guard's own measure is a median over candidate pairs rather than a
+// maximum, so a little slack is honest. 1.5x is not: at 2x the ratio the
+// resolution guard applies has already moved a whole factor, which is how a
+// 0.35 mm request solved a 1.299 mm interface. Shared, so the mesher's own
+// last-resort re-fill (fill_with_recovery) and fea_run's study refusal cannot
+// disagree about whether a contract was met.
+constexpr double kLocalContractSlack = 1.5;
+
 // Optional learned-advisor telemetry. Absence means the study did not request
 // advice; available=false means it requested advice but the model declined or
 // was unavailable.
@@ -97,6 +108,51 @@ struct MeshOut {
   double jacobian_min = 0.0;
   double pct_poor = 0.0;
   std::vector<int> aspect_hist;
+
+  // ── Local size-contract delivery (MeshLocalRefine) ───────────────────────
+  // What was asked for and what the mesh actually carries at the seeds. The
+  // seed stamp + graded field bottom out at background/4, and the background
+  // itself has a floor polymesh derives from its Cartesian grid budget, so a
+  // request below that is delivered by longest-edge bisection of the elements
+  // at the seeds — and the ACHIEVED size is measured, not assumed. A caller
+  // whose contract is hard (contact.interface_size_mm) refuses on
+  // `local_refine_achieved_mm`; `local_refine_ceiling_bound` says the element
+  // ceiling is what stopped it, which is a different refusal.
+  double local_refine_size_mm = 0.0;      // requested (0 = no request)
+  double local_refine_achieved_mm = 0.0;  // coarsest element left at the seeds
+  int local_refine_waves = 0;             // LEB waves spent
+  int local_refine_elems_added = 0;
+  bool local_refine_ceiling_bound = false;
+  uint64_t local_refine_element_ceiling = 0;
+  // What stopped the delivery short, when something did (a bisection closure
+  // that could not conform, a wave that grew nothing). Empty when the waves
+  // simply converged on the request.
+  std::string local_refine_limit;
+
+  // Fill cells whose node order was left-handed (negative signed volume) and
+  // was relabelled right-handed before promotion (see
+  // orient_tets_right_handed in mesher.cpp). Informational, not a defect
+  // count: node order carries no meaning in the tet4 contract (every consumer
+  // takes |det|), but pm::fea::promote_to_quadratic admits an element only on
+  // a POSITIVE tet10 Jacobian, so a left-handed cell used to be declined,
+  // left linear inside a quadratic mesh, and refused the whole order-2 study
+  // as "unsupported tet4 connectivity". A nonzero value here means polymesh's
+  // graded fill emitted inverted cells at this size (33 of 467162 on the
+  // ME 490 wheel-disc 90 deg sector at fineness 0.5) and Chudware absorbed
+  // them.
+  int reoriented_elems = 0;
+
+  // Cells the fill shipped FLAT (shape quality below a millionth of a regular
+  // tet, i.e. zero volume to machine precision) that Chudware inflated by
+  // moving one node within a hard bound, and how many no single-node move
+  // could save (see repair_degenerate_tets in mesher.cpp). polymesh's own ship
+  // gate can only relax INTERIOR nodes, so on a thin web — where every node of
+  // a boundary sliver is a boundary node — it ships the cell and reports it in
+  // its note. Such a cell has no positive tet10 Jacobian, so it used to cost
+  // the whole order-2 study; at order 1 it silently contributed noise
+  // stiffness. `degenerate_elems_remaining` > 0 is a refusal, never a warning.
+  int degenerate_elems_repaired = 0;
+  int degenerate_elems_remaining = 0;
 
   std::string mesh_type_used; // "tet4" or "tet10"
   std::string note;

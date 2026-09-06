@@ -476,13 +476,33 @@ int repair_folded_quadratic(MeshOut &out) {
 // being looked for.
 namespace {
 
-// Face-adjacency fragments, and per-fragment count of corners shared with the
-// outside. Returns the fragment id per element and fills `outside_corners` per
-// fragment root.
+// Face-adjacency fragments, per-fragment count of corners shared with the
+// outside, and which fragment IS the body it hangs from.
+//
+// `is_body` is the asymmetry the rule needs. "Touches the rest of the mesh at
+// two corners or fewer" is a symmetric measurement: a 1-element flap glued to
+// a 100k-element disc by one corner reads 1 — and so does the DISC, whose only
+// corners used outside itself are that flap's. Without this flag the whole
+// body was marked a hanging fragment, so `count_lonely_nodes` reported every
+// node in the part and `repair_lonely_nodes` tried to dissolve the entire
+// mesh (which its own empty-result guard then refused, leaving the study to be
+// refused for a mechanism that did not exist). Measured on the ME 490 wheel
+// sector at fineness 0.5: the fill hands over 102752 elements in exactly three
+// face-connected fragments — the body (102750) and two isolated tets — and the
+// study came back "mesh has 22026 node(s) on element fragment(s) that touch
+// the rest of the body at two corners or fewer", i.e. all of them.
+//
+// The body of a node-connected component is the fragment holding a strict
+// MAJORITY of that component's elements — a flap is a minority by definition.
+// When no fragment has one, there is no body: two bodies fused at a single
+// node are two fragments of equal size, neither is a flap of the other, and
+// both stay flagged so the mechanism is REPORTED rather than half the model
+// deleted (pinned by test_mesh_quality's "refuses to delete the whole mesh").
 struct Fragments {
   std::vector<int> root;             // element -> fragment root element
   std::vector<int> outside_corners;  // per element root: corners shared outside
   std::vector<int> element_count;    // per element root: elements in fragment
+  std::vector<char> is_body;         // per element root: the body, never a flap
 };
 
 Fragments find_fragments(const MeshOut &out, int stride, int node_count,
@@ -559,6 +579,64 @@ Fragments find_fragments(const MeshOut &out, int stride, int node_count,
   // Normalize root ids so callers can index by element without re-finding.
   for (size_t e = 0; e < element_count; ++e)
     f.root[e] = find(static_cast<int>(e));
+
+  // Which fragment is the body: the largest fragment of each NODE-connected
+  // component. A fragment is face-connected, hence entirely inside one
+  // component, so its root's component labels the whole fragment.
+  std::vector<int> body(element_count);
+  for (size_t e = 0; e < element_count; ++e)
+    body[e] = static_cast<int>(e);
+  std::function<int(int)> body_find = [&body](int x) {
+    while (body[static_cast<size_t>(x)] != x) {
+      body[static_cast<size_t>(x)] =
+          body[static_cast<size_t>(body[static_cast<size_t>(x)])];
+      x = body[static_cast<size_t>(x)];
+    }
+    return x;
+  };
+  std::vector<int> first_at_node(static_cast<size_t>(node_count), -1);
+  for (size_t e = 0; e < element_count; ++e) {
+    const int *element = &out.tets[e * static_cast<size_t>(stride)];
+    for (int c = 0; c < 4; ++c) {
+      const int node = element[c];
+      if (node < 0 || node >= node_count)
+        continue;
+      int &first = first_at_node[static_cast<size_t>(node)];
+      if (first < 0) {
+        first = static_cast<int>(e);
+        continue;
+      }
+      const int a = body_find(first);
+      const int b = body_find(static_cast<int>(e));
+      if (a != b)
+        body[static_cast<size_t>(std::max(a, b))] = std::min(a, b);
+    }
+  }
+  // Per component: its total element count, and its biggest fragment.
+  std::unordered_map<int, int> component_elems;
+  component_elems.reserve(element_count / 8 + 1);
+  for (size_t e = 0; e < element_count; ++e)
+    ++component_elems[body_find(static_cast<int>(e))];
+  std::unordered_map<int, std::pair<int, int>> biggest; // comp -> (size, root)
+  biggest.reserve(component_elems.size());
+  for (size_t e = 0; e < element_count; ++e) {
+    if (f.root[e] != static_cast<int>(e))
+      continue; // one visit per fragment, at its root
+    const int size = f.element_count[e];
+    const int component = body_find(static_cast<int>(e));
+    auto it = biggest.find(component);
+    if (it == biggest.end())
+      biggest.emplace(component, std::pair<int, int>{size, static_cast<int>(e)});
+    else if (size > it->second.first)
+      it->second = {size, static_cast<int>(e)};
+  }
+  f.is_body.assign(element_count, 0);
+  for (const auto &entry : biggest) {
+    // Strict majority, so a component split into equal halves has no body and
+    // neither half can be dissolved as the other's flap.
+    if (entry.second.first * 2 > component_elems[entry.first])
+      f.is_body[static_cast<size_t>(entry.second.second)] = 1;
+  }
   return f;
 }
 
@@ -660,9 +738,8 @@ int count_lonely_nodes(MeshOut &out) {
   std::vector<char> mechanism_node(static_cast<size_t>(node_count), 0);
   for (size_t e = 0; e < element_count; ++e) {
     const int r = fragments.root[e];
-    if (fragments.element_count[static_cast<size_t>(r)] ==
-        static_cast<int>(element_count))
-      continue;  // the fragment IS the mesh
+    if (fragments.is_body[static_cast<size_t>(r)])
+      continue;  // this fragment IS the body — see Fragments::is_body
     // A fragment that shares NO node with anything else is a separate BODY (a
     // connected component), not a flap hanging off one. Two stacked boxes with
     // a 0.05 mm contact gap are exactly that, and before this guard every node
@@ -727,9 +804,8 @@ int repair_lonely_nodes(MeshOut &out) {
     size_t dropping = 0;
     for (size_t e = 0; e < element_count; ++e) {
       const int r = fragments.root[e];
-      if (fragments.element_count[static_cast<size_t>(r)] ==
-          static_cast<int>(element_count))
-        continue;  // the fragment IS the mesh: that is a domain, not a defect
+      if (fragments.is_body[static_cast<size_t>(r)])
+        continue;  // the body is never a flap — see Fragments::is_body
       // Same separate-BODY guard as count_lonely_nodes: dropping every element
       // of a healthy second body is not a repair, it is deleting the part.
       if (fragments.outside_corners[static_cast<size_t>(r)] == 0)
@@ -773,14 +849,15 @@ int repair_lonely_nodes(MeshOut &out) {
   // in more islands than it came in, replaces a diagnosable mechanism with a
   // mesh nobody can solve or read.
   //
-  // The empty case is reachable with real geometry: two bodies fused at a
-  // single NODE are two face-connected fragments, each hanging off the other by
-  // exactly one corner, so the fragment rule marks BOTH — the whole mesh — and
-  // "the fragment IS the mesh" spares neither. The split case is the same rule
-  // read the other way, and is a backstop: a fragment that hangs by two corners
-  // can only bridge halves that hang by two corners themselves, so today they
-  // leave in the same pass rather than surviving as new islands. Any loosening
-  // of the corner threshold makes it live.
+  // Both stay as backstops after Fragments::is_body made the rule asymmetric.
+  // The empty case used to be routine — two bodies fused at a single NODE are
+  // two face-connected fragments, each hanging off the other by one corner, and
+  // the old "the fragment IS the mesh" spared neither — but the body of each
+  // component is now protected by construction, so it takes a mesh that is
+  // nothing BUT flaps to empty. The split case is a fragment that hangs by two
+  // corners and is the only bridge between halves that hang by two corners
+  // themselves; today they leave in the same pass rather than surviving as new
+  // islands. Any loosening of the corner threshold makes both live again.
   if (total_dropped > 0 &&
       (out.tets.empty() ||
        element_component_count(out, stride, node_count) > components_before)) {

@@ -4,7 +4,10 @@
 // the shared C++ numeric core. Each floating component is parameterized by 6
 // variables: translation t = (tx,ty,tz) in mm and an absolute rotation vector
 // w = (wx,wy,wz) using Rodrigues / exp-map coordinates. Fixed components are
-// pinned and contribute no variables.
+// pinned and contribute no variables: they are a HARD CONSTRAINT, so their
+// authored transform is used verbatim in the residuals (never re-derived through
+// the exp-map, which cannot represent a measured 3x3 block exactly) and echoed
+// back bit-identically.
 //
 // The residual/Jacobian structure originated in engine/doc/mate_solver.py and
 // covers coincident, parallel, perpendicular, concentric, distance, angle,
@@ -100,8 +103,10 @@ using ResolvedGeometry = std::map<std::pair<std::string, int>, MateGeom>;
 // (largest world coordinate any seed pose or mate geometry reaches) and applies
 // `tol * max(1, L/100)` — an absolute picometre threshold is not reachable across a
 // 2 m rover, where a single residual evaluation already carries ~1e-12 mm of
-// cancellation noise. `MateSolveResult::tolerance` reports what was applied; nothing
-// changes for L <= 100 mm.
+// cancellation noise. The widening is CAPPED at 1e-6 mm: the positional rows are
+// lengths in mm, so no assembly size may make a nanometre of misplacement count as a
+// seated mate. `MateSolveResult::tolerance` reports what was applied; nothing changes
+// for L <= 100 mm.
 //
 // The LM step is bounded by a trust region derived from the same L (translation) and
 // half a radian (rotation), and the random-restart escape used when the first solve

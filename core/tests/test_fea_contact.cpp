@@ -506,3 +506,104 @@ TEST_CASE("contact: interface_size_mm resolves the same seat into a real patch")
                 g.contact_force_n, g.contact_area_mm2, mean_pressure, seat_pressure,
                 g.max_contact_pressure_mpa, r.reaction_force_n[2]);
 }
+
+// ── (f) TOUCHING faces: the ratio is undefined, the patch decides ───────────────
+// Two coincident faces have no clearance, so h/gap is 0/0. That used to read as
+// a resolved interface — "clearance 0 mm", ratio 0, below every limit — however
+// coarse the mesh was, which is exactly how the live keyway shipped a 1.299 mm
+// interface with one active pair as a contact pressure. The judgement for a
+// touching interface is the PATCH: enough pairs in contact, and enough elements
+// across the candidate area.
+TEST_CASE("contact: touching faces are judged on the patch, not on a 0 mm clearance") {
+    Mesh m;
+    add_box(m, 6, 6, 2, 0.0, 0.0, 0.0, 20.0, 20.0, 10.0);   // 3.33 mm cells
+    add_box(m, 6, 6, 2, 0.0, 0.0, 10.0, 20.0, 20.0, 10.0);  // coincident at z=10
+    ContactCandidateOptions copt;
+    copt.max_gap_mm = 0.5;
+    auto cand = fea_contact_candidates(m.points, m.tets, 4, kE, copt);
+    REQUIRE(cand.error.empty());
+    REQUIRE_FALSE(cand.springs.empty());
+    // The interface really is coincident, so there is no clearance to resolve.
+    CHECK(cand.min_gap0_mm == doctest::Approx(0.0).epsilon(1e-12));
+
+    const chudware::sim::ContactResolution res =
+        chudware::sim::fea_contact_resolution(cand);
+    CHECK(res.criterion == chudware::sim::kCriterionPatchArea);
+    CHECK(res.gap_mm == 0.0);
+    CHECK(res.ratio == 0.0);      // undefined, and reported as such
+    CHECK(res.max_ratio == 0.0);  // the clearance limit does not apply
+    CHECK(res.candidate_area_mm2 > 300.0);  // the 20 x 20 mm face
+    // Three elements across the patch is the bar, and a 3.33 mm mesh on a 20 mm
+    // square face clears it with room to spare.
+    CHECK(res.max_h_interface_mm ==
+          doctest::Approx(std::sqrt(res.candidate_area_mm2) /
+                          chudware::sim::kContactMinPatchElems));
+    CHECK(res.h_interface_mm <= res.max_h_interface_mm);
+    CHECK(res.seatable_pairs >= chudware::sim::kContactMinActivePairs);
+    CHECK(res.resolved);
+    CHECK(res.reason.empty());
+
+    // And it solves as a seated joint: the whole load crosses a real patch.
+    const int n_nodes = static_cast<int>(m.points.size() / 3);
+    std::vector<double> forces(static_cast<std::size_t>(n_nodes) * 3, 0.0);
+    const std::vector<int> base = nodes_at_z(m, 0.0);
+    const std::vector<int> top = nodes_at_z(m, 20.0);
+    REQUIRE_FALSE(base.empty());
+    REQUIRE_FALSE(top.empty());
+    const double F = 5000.0;
+    for (int nid : top) forces[static_cast<std::size_t>(nid) * 3 + 2] = -F / top.size();
+    FeaContactReport report;
+    FeaStaticResult r = fea_static_solve_contact(m.points, m.tets, kE, kNu, kYield, base,
+                                                 forces, 4, {}, cand.springs,
+                                                 FeaContactOptions{}, report);
+    REQUIRE(r.ok);
+    CHECK(report.converged);
+    CHECK(report.active_pairs >= chudware::sim::kContactMinActivePairs);
+    CHECK(r.reaction_force_n[2] == doctest::Approx(F).epsilon(0.02));
+    REQUIRE(report.groups.size() == 1);
+    const chudware::sim::FeaContactGroup& g = report.groups[0];
+    chudware::sim::ContactResolution solved = res;
+    chudware::sim::fea_contact_resolution_after_solve(solved, report.active_pairs,
+                                                      g.contact_force_n,
+                                                      g.contact_area_mm2);
+    CHECK(solved.resolved);
+    CHECK(solved.pressure_reliable);
+    std::printf("(f) touching: h_iface=%.3f patch=%.1f mm^2 limit=%.3f seatable=%d/%d "
+                "-> resolved; solve: active=%d %.1f N over %.2f mm^2\n",
+                res.h_interface_mm, res.candidate_area_mm2, res.max_h_interface_mm,
+                res.seatable_pairs, res.candidate_pairs, report.active_pairs,
+                g.contact_force_n, g.contact_area_mm2);
+}
+
+// ── (g) …and a touching interface too coarse for its patch is still refused ─────
+// The other half of the patch rule: a 4 x 4 mm seat carried by the plate's own
+// 6.7 mm cells has fewer than three elements across it and fewer than six pairs
+// on it. The refusal must talk about the PATCH — telling a caller to resolve a
+// "0 mm clearance" is advice about a number that does not exist.
+TEST_CASE("contact: a touching seat coarser than its own patch is refused") {
+    const double pad = 4.0;
+    Mesh m = seated_pad(/*plate_n=*/3, /*pad_n=*/1, /*gap=*/0.0, pad);
+    ContactCandidateOptions copt;
+    copt.max_gap_mm = 0.5;
+    auto cand = fea_contact_candidates(m.points, m.tets, 4, kE, copt);
+    REQUIRE(cand.error.empty());
+    REQUIRE_FALSE(cand.springs.empty());
+
+    const chudware::sim::ContactResolution res =
+        chudware::sim::fea_contact_resolution(cand);
+    CHECK(res.criterion == chudware::sim::kCriterionPatchArea);
+    CHECK_FALSE(res.resolved);
+    CHECK(res.h_interface_mm > res.max_h_interface_mm);
+    CHECK(res.seatable_pairs < chudware::sim::kContactMinActivePairs);
+    CHECK(res.reason.find("TOUCH") != std::string::npos);
+    CHECK(res.reason.find("patch") != std::string::npos);
+    CHECK(res.reason.find("clearance 0") == std::string::npos);
+    // The size it names refines the patch to the bar it just failed.
+    CHECK(res.required_interface_size_mm > 0.0);
+    CHECK(res.required_interface_size_mm <= res.max_h_interface_mm + 1e-9);
+    std::printf("(g) touching+coarse: h_iface=%.3f patch=%.1f mm^2 limit=%.3f "
+                "seatable=%d/%d -> refused, asks for %.3f mm\n",
+                res.h_interface_mm, res.candidate_area_mm2, res.max_h_interface_mm,
+                res.seatable_pairs, res.candidate_pairs,
+                res.required_interface_size_mm);
+}

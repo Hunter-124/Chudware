@@ -126,12 +126,28 @@ empty `collisions` list at every sample, not just before the first hit.
   component's 8 transformed bbox corners over the sweep — the clearance number. Its
   `fuse=True` mode builds the real swept solid (one `transform` copy per step fused into
   `<component>_sweep`) and returns its volume/bbox; use it when a bbox over-reports.
-- **Turning radius:** `steering_turning_radius(steer_mate_id, start, stop, ...)` is
-  closed-form Ackermann off the measured wheel yaw at the sweep extremes. Read its
-  `assumptions` and `derived_from`: an unstated wheelbase/track is DERIVED from the
-  solved axle centres, so pass `wheelbase_mm`/`track_mm` when the geometry is not a
-  two-axle vehicle. Quote `centerline_radius_mm` with `outer_swept_radius_mm` — a
-  corridor claim is about the swept corner, not the centreline.
+- **No dimensional mate to drive:** a steering assembly poses its uprights with
+  concentric/coincident mates about measured kingpin axes and owns no angle/distance
+  mate, so `simulate_motion` has nothing to sweep. Both kinematic tools take a `steer`
+  spec instead — `steer={"components":["upright_FL","upright_FR"],
+  "axis":{"point":[x,y,z],"dir":[x,y,z]}, "angle_deg":30}` (or `"mate_id":"<the
+  concentric kingpin mate>"` to reuse the axis it already resolves, or
+  `"angles_deg":[inner,outer]` for a true Ackermann pair). The named components are
+  rotated rigidly about that axis on a DETACHED clone and the mate network is re-solved
+  around them, so the live document keeps its revision and its mate-owned poses.
+  `rear_steer` takes the same spec for 4WS; `steps` scales the angles 0 → full lock.
+- **Turning radius:** `steering_turning_radius(steer=… | steer_mate_id, …)` intersects
+  the POSED wheel axle lines — a rolling wheel turns about a point on its own axle line —
+  and reports `turning_radius_m`/`turning_radius_ft` plus per-wheel `steer_angle_deg`
+  and radius, inner/outer roles, and `turn_center_station_mm` (0 on the rear axle for
+  2WS, mid-wheelbase for equal-and-opposite 4WS). `axle_line_residual_mm` is the
+  Ackermann inconsistency: ~0 for a correct linkage, `(track/2)·sin(steer)` for parallel
+  steer. Read its `assumptions` and `derived_from`: an unstated wheelbase/track is
+  DERIVED from the solved axle centres, so pass `wheelbase_mm`/`track_mm` when the
+  geometry is not a two-axle vehicle. Quote the turning radius with
+  `outer_swept_radius_mm` — a corridor claim is about the swept corner, not the
+  centreline — and `check_interference=True` for the steering lock the geometry imposes
+  (`first_interference_deg`).
 - **Load case selection:** the worst joint reaction is not always the worst stress, so
   `motion_fea_handoff_sweep(component, fixtures, positions|start/stop/steps, ...)`
   batches the single-frame handoff across positions and names the governing one. Each

@@ -88,33 +88,57 @@ ContactCandidateSet fea_contact_candidates(const std::vector<double>& points,
 //
 // Two independent statements make an interface unresolved, and either one refuses:
 //
-//   1. A PRIORI, from the candidate set alone: the interface element size is more
-//      than kMaxHOverGap x the clearance it has to resolve AND fewer than
-//      kMinActivePairs candidates sit within twice the closest approach. Both
-//      halves are required, and the second one is why: a CONFORMING interface
-//      (two flat faces across a uniform 0.05 mm gap, or a concentric pin in a
-//      0.1 mm bore) has h/gap of 19-133 and is perfectly resolved — every pair
-//      seats together and the pressure is the real patch pressure. What kills a
-//      study is a clearance that opens faster than one element, which shows up as
-//      a closing zone the mesh placed almost no pairs in.
+//   1. A PRIORI, from the candidate set alone. WHICH statement depends on
+//      whether there is a clearance at all:
+//        * clearance (min gap > 0), criterion kCriterionClearance: the
+//          interface element size is more than kContactMaxHOverGap x the
+//          clearance AND fewer than kContactMinActivePairs candidates sit
+//          within twice the closest approach. Both halves are required, and the
+//          second one is why: a CONFORMING interface (two flat faces across a
+//          uniform 0.05 mm gap, or a concentric pin in a 0.1 mm bore) has h/gap
+//          of 19-133 and is perfectly resolved — every pair seats together and
+//          the pressure is the real patch pressure. What kills a study is a
+//          clearance that opens faster than one element, which shows up as a
+//          closing zone the mesh placed almost no pairs in.
+//        * TOUCHING or coincident faces (min gap <= 0), criterion
+//          kCriterionPatchArea: there is no clearance, so h/gap is undefined
+//          (it used to be reported as "clearance 0 mm" beside a ratio of 0,
+//          which reads as a resolved interface no matter how coarse the mesh
+//          is). The interface is judged on the PATCH instead: at least
+//          kContactMinActivePairs pairs actually in contact AND at least
+//          kContactMinPatchElems elements across the candidate patch,
+//          h_interface <= sqrt(candidate_area) / kContactMinPatchElems.
 //   2. A POSTERIORI: load crossed the interface through fewer than
-//      kMinActivePairs pairs. Three pairs cannot carry a distributed pressure
-//      whatever the geometry looked like beforehand.
+//      kContactMinActivePairs pairs. Three pairs cannot carry a distributed
+//      pressure whatever the geometry looked like beforehand.
 //
 // The refusal names the element size that WOULD resolve it, which is what
 // contact.interface_size_mm applies as LOCAL refinement on the candidate faces.
 struct ContactResolution {
     double h_interface_mm = 0.0;   // measured interface element size
-    double gap_mm = 0.0;           // the clearance it has to resolve
-    double ratio = 0.0;            // h_interface_mm / gap_mm (0 when gap is 0)
+    double gap_mm = 0.0;           // the clearance it has to resolve (0 = touching)
+    double ratio = 0.0;            // h_interface_mm / gap_mm (0 under kCriterionPatchArea)
     int candidate_pairs = 0;
     int seatable_pairs = 0;
     int active_pairs = -1;         // -1 until the solve has run
     int min_active_pairs = 0;      // the threshold that was applied
-    double max_ratio = 0.0;        // the ratio threshold that was applied
+    double max_ratio = 0.0;        // the ratio threshold (0 under kCriterionPatchArea)
     double contact_area_mm2 = 0.0; // tributary area of the load-carrying pairs
-    // The element size at the interface that resolves the clearance. This is the
-    // number to pass as contact.interface_size_mm.
+    // Tributary area of every candidate pair — the patch the interface has to
+    // resolve when there is no clearance to resolve (see `criterion`).
+    double candidate_area_mm2 = 0.0;
+    // The coarsest interface element size the PATCH criterion admits:
+    // sqrt(candidate_area_mm2) / kContactMinPatchElems. 0 under
+    // kCriterionClearance.
+    double max_h_interface_mm = 0.0;
+    // Which of the two a-priori criteria was applied. A clearance can only be
+    // judged against the element size that has to resolve it when there IS a
+    // clearance: two touching or coincident faces (gap <= 0) have none, the
+    // ratio is undefined, and the interface is judged on how many elements span
+    // the candidate patch instead.
+    const char* criterion = nullptr;
+    // The element size at the interface that resolves the clearance (or the
+    // patch). This is the number to pass as contact.interface_size_mm.
     double required_interface_size_mm = 0.0;
     bool resolved = true;
     // force/area is a pressure only when a load-carrying patch of pairs exists.
@@ -124,6 +148,13 @@ struct ContactResolution {
 
 inline constexpr double kContactMaxHOverGap = 4.0;
 inline constexpr int kContactMinActivePairs = 6;
+// Elements across the candidate patch required when the faces touch (gap <= 0):
+// h_interface <= sqrt(candidate_area) / 3, i.e. three elements across a square
+// patch of the same area. Below that a "pressure" is one or two nodes wide.
+inline constexpr double kContactMinPatchElems = 3.0;
+// The two a-priori criteria, reported verbatim in the resolution block.
+inline constexpr const char* kCriterionClearance = "h_over_clearance";
+inline constexpr const char* kCriterionPatchArea = "elements_across_patch";
 
 // A-priori resolution judgement on the candidate set (before any solve).
 ContactResolution fea_contact_resolution(const ContactCandidateSet& candidates);

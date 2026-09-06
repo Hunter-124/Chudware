@@ -2267,3 +2267,114 @@ hub_b 184.58 mm off; passes at 0.46 / 2.41 mm) and "the convergence tolerance sc
 assembly", plus `test_insert_component.cpp`'s "an unsatisfiable mate network is reported,
 named and bounded". Green in core/build-fix2: mate, mate_corpus, insert_component,
 interference, simulate_motion, motion_dynamics, platform_parity (7/7).
+
+## A grounded component is a constraint, not a pose with a stiff spring (2026-09-06)
+
+**What went wrong.** ME 490 phase 5D measured a 73.7 mm3 frame<->hub overlap at every
+corner of the mated rover that vanished when the same two solids were placed by transform,
+and traced it to the GROUNDED frame: `fixed:true`, yet its bbox moved ~0.046 mm through the
+mate solve. The frame never was an unknown — `CompFrame::alloc` has always skipped fixed
+components, so there was no penalty and no variable to blame. The re-pose came from the
+PARAMETERIZATION. Every component went `transform -> (t, exp-map w) -> transform`, and the
+exp-map needs an orthonormal rotation, so `transform_to_params` SVD-projects the 3x3 block.
+A merged import's placement is authored from MEASURED axes (`fit_cylinder_axis` on a faceted
+bore is good to ~1e-4 rad), so that block is rigid only to within the measurement and the
+projection is a real rotation of the anchor — ~5e-5 rad, which at the rover's 0.93 m corner
+radius is the reported 0.046 mm. Worse, the whole assembly was then seated against the
+PROJECTED frame while `check_interference` measured the authored one, and
+`session.cpp::rebuild_assembly` writes solved transforms back over the document, so every
+rebuild re-authored the anchor and a save captured the moved frame.
+
+**What changed.** A fixed component now carries the document's own numbers end to end:
+`CompFrame` keeps the authored 3x3 block (`R0`) and the authored 16 doubles (`tf0`),
+`CompFrame::rot` returns `R0` instead of `rodrigues(w)` for a fixed component (so the
+residuals are evaluated against the placement the document actually has — its Jacobian
+block was already dropped, being constant), and the result echoes `tf0` bit-identically
+instead of `params_to_transform(t0, w0)`. `transform_to_params` grew an optional
+`R_authored` out-param for exactly this. Free components are untouched: they are solved in
+exp-map coordinates and must be.
+
+**Tolerance.** The scale-widened threshold from earlier today is now CAPPED at 1e-6 mm
+(`kMaxAbsTolMm`): the positional rows are lengths in mm, and left proportional the
+threshold grows without bound with the model, so a big enough assembly would report a
+visible gap as a seated mate. Nothing at or below 100 mm changes, the 2 m (2e-8) and 20 m
+(2e-7) cases are unchanged, and a perfectly seated 400 m model still converges at 1e-6.
+
+**Files.** `core/mate/mate.cpp` (+`mate.h` docs), `core/doc/assembly.h` (pipeline note),
+`core/tests/test_mate.cpp` ("a grounded component is pinned, bit-for-bit"; "the convergence
+threshold is absolute in mm however big the assembly"), `core/tests/test_insert_component.cpp`
+("a grounded component's measured placement survives the rebuild unchanged").
+
+**Pre-fix values.** The solver test's anchor geometry moved 0.045758 mm and 0.045756 mm at
+the two corners (mission: ~0.046 mm), the authored shear 1.0e-4 coming back as +/-5e-05;
+the document-level test showed the same numbers written back over `components[].transform`
+on the rebuild the edit triggers. The tolerance test read 4e-6 mm at 400 m. Note doctest's
+`Approx` is useless at these magnitudes — its default scale of 1.0 makes every value below
+~1e-5 "equal" — so the new threshold checks are strict comparisons.
+
+Green in core/build-FixedPose: mate, mate_corpus, insert_component, interference,
+materials, simulate_motion, motion_dynamics (7/7).
+
+## A left-handed fill cell is not an unsupported element type (2026-09-06)
+
+**What went wrong.** ME 490 phase 5D tried to earn the R1 mass credit from a 90 deg cyclic
+sector of the Comet wheel disc (Ø508, 3.175 mm web, Ø25.4 bore, one lightening window) and
+`run_fea_static` refused it twice, at fineness 0.5 and 0.7, with *"polyfea: mesh contains
+unsupported tet4 connectivity; Chudware studies currently require tet4 or tet10"* — on a
+valid watertight solid whose volume checks against the exact quarter. The same string had
+already cost WHEEL-RADIAL its h=6 order-2 leg and the showcase run one of four wheel legs.
+Nothing about it was true: the fill produced tet4, the study asked for tet10.
+
+**Root cause, in three layers.** `build_mesh`'s fixed-stride extract refuses any cell whose
+type is not the one the order asked for, and reported the type it FOUND — so a tet4 left
+behind in a tet10 mesh printed as an "unsupported tet4". What left it behind is
+`pm::fea::promote_to_quadratic`: it admits an element only when the tet10 Jacobian is finite
+and POSITIVE at every Gauss point, and with mid-edge nodes at the straight chord midpoints
+that determinant IS 6·V_signed. polymesh's graded fill emits a few LEFT-HANDED cells where
+boundary snapping flips a lattice tet on a sharp wedge face — 33 of 467162 on the mission
+sector at fineness 0.5 — and every tet4 consumer in Chudware (`fea_static::tet4_B`,
+`fea_thermal::tet4_grad`, `fill_quality`) takes |det|, so order 1 never noticed while order 2
+lost the whole study. Behind that sat a second class the same predicate declines: cells the
+fill ships FLAT (shape quality 7e-17, signed volume 2e-15 mm3), which its own ship gate
+cannot fix because it may only relax INTERIOR nodes and in a thin web every node of a
+boundary sliver is a boundary node (its note says so: `ship_gate N non-integrable cells`).
+And behind THAT, once a mesh finally reached the solver, `fea_static` refused it for
+*"22026 node(s) on element fragment(s) that touch the rest of the body at two corners or
+fewer"* — all of them: "touches at two corners or fewer" is a SYMMETRIC measurement, and the
+only corners the 102750-element body shared outside itself were two isolated tets'.
+
+**What changed.** `mesher.cpp` gained `orient_tets_right_handed` (swap two corners of a
+left-handed tet4 — pure relabelling: same nodes, same region, same |volume|, and `faces` is
+empty for every FEM element type) and `repair_degenerate_tets` (a cell below 1e-6 of a
+regular tet's quality is given volume by moving ONE node along the exact gradient of its own
+signed volume, the smallest distance reaching 1e-4 quality, never more than 5% of h — the
+same fill's boundary snap already moves nodes by 0.18·h — accepted only if every cell in that
+node's star keeps a positive volume and the star's worst quality strictly improves). Both run
+after `deliver_local_contract` and before promotion, count into `MeshOut::reoriented_elems` /
+`degenerate_elems_repaired` / `degenerate_elems_remaining`, ride into `mesh_quality`
+(`reoriented_elems`, `degenerate_elems_inflated`) and say so in the mesh note. The extract
+refusal now separates an element FAMILY it cannot solve from a promotion that declined, and
+the declined case reports the worst cell's quality, signed volume and edge span. In
+`mesh_quality.cpp`, `Fragments` gained `is_body`: the body of a node-connected component is
+the fragment holding a strict MAJORITY of its elements, and a body is never a flap. The
+majority is strict on purpose — two bodies fused at a single node are two equal fragments,
+neither is the other's flap, and both stay flagged so the mechanism is reported instead of
+half the model deleted.
+
+**Measured.** Full-size mission sector, fineness 0.5, `core/build-Tet4Conn`: order 1 meshes
+467162 elements / 99742 nodes (33 relabelled, 14 inflated) and SOLVES; order 2 meshes
+467162 / 694445 (316 quadratic-fallback). Pre-fix, order 2 refused with the connectivity
+string and order 1 shipped 33 left-handed cells. The order-2 SOLVE of that part remains out
+of reach and is refused for the right reasons — 2.08M DOF needs an estimated 39.1 GB against
+a 12.0 GB study budget, and coarsening it (explicit 6 mm → governor 9.21 mm) fills a 3.175 mm
+web with 9 mm cells and hands back 3 components, 2 of them unfixtured.
+
+**Files.** `core/sim/mesher.cpp`, `core/sim/mesher.h`, `core/sim/mesh_quality.cpp`,
+`core/sim/fea_run.cpp` (two `MeshQualityFacts` counters), new `core/tests/test_mesh_sector.cpp`
++ its `core/CMakeLists.txt` block (`mesh_sector`). The new ctest carries the sector at quarter
+radii — same wedge, same 3.175 mm web, still 34 left-handed and 2 flat cells at fineness 0.5 —
+meshed AND solved at fineness 0.5 and at an explicit 4 mm, both orders (4 legs, 3m48s), plus
+the full-size mission geometry behind `CHUDWARE_ME490_SECTOR=1`.
+
+Green in core/build-Tet4Conn: mesh, mesh_quality, mesher_advanced, tet10_thin_wall,
+mesh_mechanism, mesh_sector, fea_contact (7/7, 488 s).

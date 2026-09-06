@@ -5410,11 +5410,18 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
                    interface_size_mm is for, at a fraction of the element count.
         interface_size_mm : element size the CONTACT FACES are refined to, in mm, applied
                    as LOCAL refinement (fine cells seeded on the candidate faces, the rest
-                   of the part left at the background size) and never coarsened by the
-                   element-count governor. Pass about a quarter of the measured clearance:
-                   for a 0.35 mm keyway clearance, 0.09-0.14 mm. Resolving the same
-                   clearance with mesh_size_mm instead means meshing the WHOLE part that
-                   fine — the case that motivated this knob needed 1.16M elements that way.
+                   of the part left at the background size). It is a HARD CONTRACT, like
+                   an explicit mesh_size_mm: no size floor may raise it silently — not the
+                   element-count governor, not the fill's own graded lattice (whose finest
+                   local cell is background/4), not polymesh's Cartesian grid-cell floor
+                   on the background itself. The mesh is bisected AT the interface until
+                   it is met, the delivered size is MEASURED, and a study that cannot
+                   reach it is REFUSED naming what bound (the element ceiling with its
+                   count, or the size that was achievable) instead of solving a coarser
+                   interface. Pass about a quarter of the measured clearance: for a
+                   0.35 mm keyway clearance, 0.09-0.14 mm. Resolving the same clearance
+                   with mesh_size_mm instead means meshing the WHOLE part that fine — the
+                   case that motivated this knob needed 1.16M elements that way.
         mesh_order : 1 = tet4 (default, fastest), 2 = tet10.
         vtu_path : optional ABSOLUTE .vtu path for the solved fields, as for
                    run_fea_static (displacement, von_mises and the summary_node mask).
@@ -5425,15 +5432,23 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
         with 1 of 848 candidate pairs active, 2902 N through that one node pair and
         13,543 MPa of reported "contact pressure". So the run is REFUSED (ok:false) when
         either
-          * the element size AT the interface is more than 4x the clearance AND fewer
-            than 6 candidate pairs sit within twice the closest approach, or
+          * the interface is not resolved a priori. WHICH test applies is reported as
+            resolution.criterion, because it depends on whether there is a clearance at
+            all: "h_over_clearance" (min gap > 0) refuses when the element size AT the
+            interface is more than 4x the clearance AND fewer than 6 candidate pairs sit
+            within twice the closest approach; "elements_across_patch" (TOUCHING or
+            coincident faces, min gap <= 0, where h/gap is undefined) refuses when fewer
+            than 3 elements span the candidate patch (h_interface > max_h_interface_mm =
+            sqrt(candidate_area_mm2)/3) AND fewer than 6 pairs are in contact, or
           * the solved load crossed through fewer than 6 active pairs.
-        The refusal carries "contact":{... "resolution":{h_interface_mm, gap_mm, ratio,
-        max_ratio, candidate_pairs, seatable_pairs, min_active_pairs,
-        required_interface_size_mm, resolved, reason}} and names the interface_size_mm
-        that would resolve it. A conformal interface (two flat faces across a uniform
-        gap, a concentric pin in a bore) is NOT refused on the ratio alone — every pair
-        seats there and the patch pressure is real.
+        The refusal carries "contact":{... "resolution":{h_interface_mm, gap_mm,
+        criterion, candidate_pairs, seatable_pairs, min_active_pairs,
+        candidate_area_mm2, required_interface_size_mm, resolved, reason, plus
+        ratio/max_ratio under h_over_clearance or max_h_interface_mm /
+        min_elements_across_patch under elements_across_patch}} and names the
+        interface_size_mm that would resolve it. A conformal interface (two flat faces
+        across a uniform gap, a concentric pin in a bore) is NOT refused on the ratio
+        alone — every pair seats there and the patch pressure is real.
 
         Returns the run_fea_static envelope — summary (max_von_mises_mpa / max_disp_mm /
         min_fos, plus the reduction disclosure max_von_mises_reduction /

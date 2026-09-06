@@ -55,6 +55,10 @@
 #include <fea/p_elevate.hpp>
 #include <fea/zz.hpp>
 #include <geom/indicators.hpp>
+#include <mesh/cell_validity.hpp>
+#include <mesh/grid_classify.hpp>
+#include <mesh/local_refine.hpp>
+#include <mesh/surface_project.hpp>
 #include <pipeline/scene.hpp>
 
 // CHUDWARE_WITH_POLYMESH_ADVISOR is a SEPARATE axis from
@@ -724,6 +728,831 @@ pm::mesh::SizeFieldFn local_size_field(const MeshOptions &options, double h,
   };
 }
 
+// ── Delivering a local size the LATTICE cannot place: Rivara LEB ─────────────
+// The seed stamp + size field above bottom out at h/4, and h itself has a hard
+// floor that has nothing to do with the study: polymesh sizes its Cartesian
+// classification grid at `2 * 1.05 * cbrt(bbox_volume / 512k cells)`
+// (mesh::min_h_for_cell_budget, kDefaultMaxGridCells), and raises h to it. On
+// the live FRAME-PEDAL-BRAKE keyway isolate (230 x 60 x 60 mm bbox) that floor
+// is 2.75 mm, so a 0.35 mm interface request came back as 1.299 mm — the fill
+// had lowered the background to 1.4 mm exactly as asked, and the grid budget
+// put it back to 2.747 mm with a 0.687 mm finest child. NO background size can
+// buy that interface: the request is below the floor's own L2.
+//
+// So the contract is delivered by conforming h-refinement of the elements that
+// are ALREADY there: longest-edge bisection with LEPP closure
+// (pm::mesh::local_refine_tets — tet4 only, no hanging nodes, no MPCs), driven
+// by a gradient-limited size field over the seeds that is FLAT within one seed
+// spacing of them and grades to the background outside. Each wave bisects every
+// element coarser than that field asks for anywhere it reaches, so the refined
+// region is a shell on the interface instead of a finer part: the alternative,
+// lowering the background to 4x the request, predicted 3.4M elements for the
+// same interface.
+//
+// Bounded three ways: at most kLebWaves waves, never past the size band's
+// element ceiling (the caller refuses with the count when that binds), and a
+// wave whose closure fails or grows nothing ends the loop with what it has. The
+// achieved size is MEASURED and reported, never assumed.
+struct LocalContract {
+  double requested_mm = 0.0;
+  double achieved_mm = 0.0;  // coarsest boundary face left inside the core
+  double core_mm = 0.0;      // width of the flat request zone (seed spacing)
+  int waves = 0;
+  int elems_added = 0;
+  std::size_t elems = 0;         // element count after refinement
+  std::size_t element_ceiling = 0;
+  bool ceiling_bound = false;    // stopped because the next wave breaks the ceiling
+  // Where the new mid-edge nodes ended up, and what the mesh cost for it.
+  std::size_t surface_mids = 0;  // projected onto the CAD surface
+  std::size_t chord_mids = 0;    // kept on the chord (curvature gate / fold)
+  int reprojected_nodes = 0;     // slid back onto the face by the smoothing pass
+  int smoothed_nodes = 0;        // moved by the quality (tangential/umbrella) pass
+  double worst_quality = 0.0;    // worst tet shape quality after the last wave
+  double max_residual_mm = 0.0;  // interface boundary node distance to the CAD
+  double mean_residual_mm = 0.0; // surface, sampled (fidelity, not cosmetics)
+  std::size_t below_shape_floor = 0;  // cells under polymesh's own 0.02 floor
+  std::string note;
+};
+
+// Waves are bounded by the element ceiling long before this in any real study;
+// the count only has to be high enough to cover the halvings a request needs
+// (log2(background / request) plus the grading), which on the live keyway
+// isolate is 0.35 mm out of a 3.45 mm background, i.e. 3.3 halvings of a mesh
+// whose interface starts at ~3 mm.
+constexpr int kLebWaves = 18;
+
+// A wave is DISCARDED when it leaves a cell this bad — the pipeline's own
+// degeneracy bound, not an aesthetic one. Downstream, mesh_quality refuses a
+// cell whose |6V| is under 64 eps max(1, span^3) and the quadratic promotion
+// needs a positive Jacobian; a shape quality of 1e-5 is ~9 orders above the
+// first and strictly positive for the second, and Tet4Conn's
+// repair_degenerate_tets picks up anything that still lands under 1e-6.
+//
+// It is deliberately NOT pm::mesh::validity::kCellShapeFloor (0.02). That floor
+// is a SHIP-QUALITY target, and judging a whole wave by it is what stalled the
+// live keyway at 2.434 mm: bisection legitimately produces cells under 0.02 on
+// an anisotropic wedge, and the fill itself ships some (33 left-handed and 2
+// flat cells on the ME 490 sector), so a single such cell — pre-existing or
+// new — vetoed every remaining wave and the study was refused on a mesh the
+// solver would have taken. Cells between this floor and 0.02 are COUNTED and
+// reported instead of being fatal.
+constexpr double kWaveDegenerateFloor = 1e-5;
+
+// The longest edge of a tet4, mm — the element size LEB actually halves.
+double longest_edge_mm(const pm::fea::NodalMesh &mesh,
+                       const pm::fea::NodalElement &element) {
+  double worst = 0.0;
+  for (int a = 0; a < 4; ++a)
+    for (int b = a + 1; b < 4; ++b) {
+      const double len = (mesh.nodes[element.nodes[static_cast<std::size_t>(a)]] -
+                          mesh.nodes[element.nodes[static_cast<std::size_t>(b)]])
+                             .norm();
+      worst = std::max(worst, len);
+    }
+  return worst;
+}
+
+// How densely the seed cloud samples the interface: the 90th percentile of the
+// nearest-neighbour distance over a bounded sample of seeds. It is the scale
+// below which the cloud says nothing about the surface it came from, so it is
+// the width of the flat core in deliver_local_contract, and the tolerance the
+// achieved size is measured with. Sampled (not exhaustive) because the seed set
+// runs to tens of thousands of points and an exact all-pairs pass would cost
+// more than the refinement it is sizing.
+double seed_spacing_mm(const std::vector<Eigen::Vector3d> &seeds) {
+  if (seeds.size() < 2) return 0.0;
+  constexpr std::size_t kSamples = 128;
+  const std::size_t stride = std::max<std::size_t>(1, seeds.size() / kSamples);
+  std::vector<double> nearest;
+  nearest.reserve(seeds.size() / stride + 1);
+  for (std::size_t i = 0; i < seeds.size(); i += stride) {
+    double best = std::numeric_limits<double>::infinity();
+    for (std::size_t j = 0; j < seeds.size(); ++j) {
+      if (j == i) continue;
+      best = std::min(best, (seeds[i] - seeds[j]).squaredNorm());
+    }
+    if (std::isfinite(best)) nearest.push_back(std::sqrt(best));
+  }
+  if (nearest.empty()) return 0.0;
+  const std::size_t at = (nearest.size() * 9) / 10;
+  std::nth_element(nearest.begin(),
+                   nearest.begin() + static_cast<std::ptrdiff_t>(
+                                         std::min(at, nearest.size() - 1)),
+                   nearest.end());
+  return nearest[std::min(at, nearest.size() - 1)];
+}
+
+// ── Recovering what the curvature gate gave up: post-wave smoothing ──────────
+// A bisection wave that declines a surface projection (local_refine.cpp's sag
+// gate) leaves the new mid-edge node on the chord — INSIDE the void of a bore,
+// so the wall bulges by that sag until something puts the node back. And a wave
+// that keeps a projection can still leave the star around it skewed. Both are
+// per-NODE facts, so they get a per-node decision here rather than the
+// per-wave, all-or-nothing verdict that stalled the live keyway.
+//
+// Two moves per node, in this order and for different reasons:
+//
+//   1. FIDELITY (boundary nodes only). Project the node onto the CAD surface.
+//      Travel is capped at kSnapMoveFrac of the node's own shortest incident
+//      edge — a bound in the mesh's local scale, not the background h, because
+//      by wave 8 the two differ by an order of magnitude. Accepted when every
+//      incident cell keeps a positive volume AND the star ends either healthy
+//      in absolute terms (>= the ship floor) or no worse than it started. This
+//      is a geometry move: it is NOT required to improve quality, only to not
+//      trade a healthy star for a sick one.
+//   2. QUALITY. Relax toward the umbrella centroid of the node's neighbours —
+//      the boundary neighbours only for a boundary node, so its travel stays
+//      tangential, followed by a re-projection onto the face; all neighbours
+//      for an interior node, which carries no geometry constraint. Accepted
+//      ONLY when the star's worst quality strictly improves.
+//
+// Bounded: kSmoothPasses sweeps over an explicit movable set — the nodes ONE
+// wave created, or (after the last wave) the nodes of the cells still under the
+// ship floor — never the whole mesh, and every candidate costs one
+// closest-point query.
+constexpr int kSmoothPasses = 2;
+constexpr double kSnapMoveFrac = 1.0;
+constexpr double kSmoothRelax = 0.6;
+
+void smooth_nodes(const pm::geom::TriSurface *surface, pm::fea::NodalMesh &nodal,
+                  const std::vector<std::uint32_t> &movable, int &reprojected,
+                  int &improved) {
+  if (movable.empty() || nodal.elements.empty())
+    return;
+  const std::size_t count = movable.size();
+  // Dense node -> slot map: one 4-byte cell per mesh node, O(1) lookup, and the
+  // movable set is a small fraction of a refined mesh.
+  std::vector<std::int32_t> slot_of(nodal.nodes.size(), -1);
+  for (std::size_t at = 0; at < count; ++at)
+    if (movable[at] < nodal.nodes.size())
+      slot_of[movable[at]] = static_cast<std::int32_t>(at);
+  std::vector<std::vector<std::uint32_t>> star(count);
+  std::vector<std::vector<std::uint32_t>> ring(count);
+  std::vector<std::vector<std::uint32_t>> boundary_ring(count);
+  std::vector<char> on_boundary(count, 0);
+  for (std::size_t e = 0; e < nodal.elements.size(); ++e) {
+    const pm::fea::NodalElement &element = nodal.elements[e];
+    if (element.type != pm::fea::ElementType::kTet4) continue;
+    for (int a = 0; a < 4; ++a) {
+      const std::int32_t at = slot_of[element.nodes[static_cast<std::size_t>(a)]];
+      if (at < 0) continue;
+      star[static_cast<std::size_t>(at)].push_back(static_cast<std::uint32_t>(e));
+      for (int b = 0; b < 4; ++b)
+        if (b != a)
+          ring[static_cast<std::size_t>(at)].push_back(
+              element.nodes[static_cast<std::size_t>(b)]);
+    }
+  }
+  // Boundary = a triangular face used by exactly one element (the same
+  // bijective key the contract's own scan uses).
+  static constexpr int kTriCorners[4][3] = {
+      {0, 1, 2}, {0, 1, 3}, {0, 2, 3}, {1, 2, 3}};
+  std::unordered_map<std::uint64_t, std::pair<std::array<std::uint32_t, 3>, int>>
+      faces;
+  faces.reserve(nodal.elements.size() * 2);
+  for (const pm::fea::NodalElement &element : nodal.elements)
+    for (const auto &corners : kTriCorners) {
+      std::array<std::uint32_t, 3> tri{
+          element.nodes[static_cast<std::size_t>(corners[0])],
+          element.nodes[static_cast<std::size_t>(corners[1])],
+          element.nodes[static_cast<std::size_t>(corners[2])]};
+      std::sort(tri.begin(), tri.end());
+      const std::uint64_t key =
+          (static_cast<std::uint64_t>(tri[0]) * 1000003ull + tri[1]) * 1000033ull +
+          tri[2];
+      auto it = faces.find(key);
+      if (it == faces.end())
+        faces.emplace(key, std::make_pair(tri, 1));
+      else
+        ++it->second.second;
+    }
+  for (const auto &entry : faces) {
+    if (entry.second.second != 1) continue;
+    const std::array<std::uint32_t, 3> &tri = entry.second.first;
+    for (int a = 0; a < 3; ++a) {
+      const std::int32_t at = slot_of[tri[static_cast<std::size_t>(a)]];
+      if (at < 0) continue;
+      on_boundary[static_cast<std::size_t>(at)] = 1;
+      for (int b = 0; b < 3; ++b)
+        if (b != a)
+          boundary_ring[static_cast<std::size_t>(at)].push_back(
+              tri[static_cast<std::size_t>(b)]);
+    }
+  }
+  const auto quality_of = [&](std::uint32_t e) {
+    const pm::fea::NodalElement &cell = nodal.elements[e];
+    return pm::mesh::validity::tet_shape_quality(
+        nodal.nodes[cell.nodes[0]], nodal.nodes[cell.nodes[1]],
+        nodal.nodes[cell.nodes[2]], nodal.nodes[cell.nodes[3]]);
+  };
+  const auto star_worst = [&](std::size_t at, bool &all_positive) {
+    double worst = std::numeric_limits<double>::infinity();
+    all_positive = true;
+    for (const std::uint32_t e : star[at]) {
+      const double quality = quality_of(e);
+      if (!std::isfinite(quality) || !(quality > 0.0)) all_positive = false;
+      worst = std::min(worst, quality);
+    }
+    return worst;
+  };
+  // Shortest incident edge: the scale this node's own neighbourhood works at.
+  const auto local_edge = [&](std::size_t at) {
+    double shortest = std::numeric_limits<double>::infinity();
+    for (const std::uint32_t other : ring[at])
+      shortest =
+          std::min(shortest, (nodal.nodes[movable[at]] - nodal.nodes[other]).norm());
+    return shortest;
+  };
+  const auto try_move = [&](std::size_t at, const Eigen::Vector3d &target,
+                            bool require_improvement) {
+    bool before_positive = true;
+    const double before = star_worst(at, before_positive);
+    const Eigen::Vector3d original = nodal.nodes[movable[at]];
+    nodal.nodes[movable[at]] = target;
+    bool after_positive = true;
+    const double after = star_worst(at, after_positive);
+    const bool keep =
+        after_positive &&
+        (require_improvement
+             ? after > before
+             : (after >= pm::mesh::validity::kCellShapeFloor ||
+                (before_positive ? after >= before : true)));
+    if (!keep) nodal.nodes[movable[at]] = original;
+    return keep;
+  };
+  const bool have_surface = surface != nullptr && !surface->triangles.empty();
+  for (int pass = 0; pass < kSmoothPasses; ++pass) {
+    for (std::size_t at = 0; at < count; ++at) {
+      if (star[at].empty()) continue;  // orphan midpoint; compacted later
+      const double scale = local_edge(at);
+      if (!(scale > 0.0) || !std::isfinite(scale)) continue;
+      // 1. Fidelity: put a boundary node back on the face it belongs to. The
+      // FULL projection is tried first and the step is halved twice on
+      // rejection — the residual is what the contact solve pays for, so give
+      // back as much of it as the star will take rather than a fixed fraction.
+      // The travel is still capped at the node's own shortest incident edge:
+      // beyond that a "closest point" is describing some other part of the
+      // surface, which is the fold the curvature gate exists to refuse.
+      if (on_boundary[at] != 0 && have_surface) {
+        const Eigen::Vector3d here = nodal.nodes[movable[at]];
+        const pm::mesh::ClosestPoint hit =
+            pm::mesh::closest_on_surface(*surface, here);
+        const Eigen::Vector3d step = hit.point - here;
+        const double travel = step.norm();
+        if (travel > 1e-12 * scale) {
+          const double capped = std::min(travel, kSnapMoveFrac * scale);
+          for (const double fraction : {1.0, 0.5, 0.25}) {
+            if (try_move(at, here + step * (capped * fraction / travel), false)) {
+              if (pass == 0) ++reprojected;
+              break;
+            }
+          }
+        }
+      }
+      // 2. Quality: umbrella relaxation, tangential on the boundary.
+      const std::vector<std::uint32_t> &neighbours =
+          on_boundary[at] != 0 ? boundary_ring[at] : ring[at];
+      if (neighbours.empty()) continue;
+      Eigen::Vector3d centroid = Eigen::Vector3d::Zero();
+      for (const std::uint32_t other : neighbours) centroid += nodal.nodes[other];
+      centroid /= static_cast<double>(neighbours.size());
+      Eigen::Vector3d target =
+          nodal.nodes[movable[at]] +
+          kSmoothRelax * (centroid - nodal.nodes[movable[at]]);
+      if (on_boundary[at] != 0 && have_surface)
+        target = pm::mesh::closest_on_surface(*surface, target).point;
+      if (try_move(at, target, true) && pass == 0) ++improved;
+    }
+  }
+}
+
+// The nodes of every tet4 still under polymesh's ship-quality floor. This is
+// the set the LAST smoothing round works on: a sliver's own corners are what
+// have to move to give it shape, and by then they are as likely to be original
+// fill nodes as nodes a wave created.
+std::vector<std::uint32_t> nodes_of_poor_cells(const pm::fea::NodalMesh &nodal) {
+  std::vector<std::uint32_t> nodes;
+  for (const pm::fea::NodalElement &element : nodal.elements) {
+    if (element.type != pm::fea::ElementType::kTet4) continue;
+    if (pm::mesh::validity::tet_shape_quality(
+            nodal.nodes[element.nodes[0]], nodal.nodes[element.nodes[1]],
+            nodal.nodes[element.nodes[2]], nodal.nodes[element.nodes[3]]) >=
+        pm::mesh::validity::kCellShapeFloor)
+      continue;
+    nodes.insert(nodes.end(), element.nodes.begin(), element.nodes.begin() + 4);
+  }
+  std::sort(nodes.begin(), nodes.end());
+  nodes.erase(std::unique(nodes.begin(), nodes.end()), nodes.end());
+  return nodes;
+}
+
+void deliver_local_contract(const LoadedModel &loaded, const MeshOptions &options,
+                            double h, pm::fea::NodalMesh &nodal,
+                            LocalContract &contract) {
+  const MeshLocalRefine &request = options.local_refine;
+  contract.requested_mm = request.size_mm;
+  contract.element_ceiling = static_cast<std::size_t>(loaded.band.element_ceiling);
+  contract.elems = nodal.elements.size();
+  if (!request.active() || nodal.elements.empty())
+    return;
+  for (const pm::fea::NodalElement &element : nodal.elements)
+    if (element.type != pm::fea::ElementType::kTet4 || element.nodes.size() != 4)
+      return;  // LEB is tet4-only; promotion has not happened yet, so this holds
+  // The tessellation the mid-edge projections and the smoothing pass answer
+  // against. Empty on an inline-mesh study, in which case both fall back to
+  // pure chord geometry.
+  const pm::geom::TriSurface *const cad_surface =
+      loaded.model.surface.triangles.empty() ? nullptr : &loaded.model.surface;
+  std::vector<Eigen::Vector3d> seeds;
+  seeds.reserve(request.points.size() / 3);
+  for (std::size_t i = 0; i + 2 < request.points.size(); i += 3)
+    seeds.emplace_back(request.points[i], request.points[i + 1],
+                       request.points[i + 2]);
+  // ONE distance oracle, TWO derived quantities. A GradedSizing evaluates to
+  // `h_min + beta * dist(x, nearest seed)` inside its clamp, so a field with a
+  // high enough ceiling hands back the distance to the seed cloud itself — no
+  // second spatial index to build or keep in step.
+  //
+  // kBeta is 1.0, the standard gradient limit, and NOT local_size_field's 0.5:
+  // that 0.5 exists because the FILL evaluates its field at cell CENTRES, half a
+  // cell away from the interface, where a steeper field has already given up on
+  // the fine cell. Bisection judges whole elements against their own vertices,
+  // so it has no such offset, and 1.0 halves the depth of the graded shell.
+  constexpr double kBeta = 1.0;
+  // ── The CORE: why the fine zone is a shell and not a distance-to-seed cone ──
+  // The seeds are the PREVIOUS mesh's interface nodes, so they sample the
+  // interface surface at that mesh's node spacing — 1.3 mm on the live keyway.
+  // A pure `size + beta*dist` field therefore only asks for the requested size
+  // exactly AT a seed: a point on the interface halfway between two seeds is
+  // allowed to be size + beta*(spacing/2) coarse, and the delivered interface
+  // settles a whole spacing above the request no matter how many waves run
+  // (measured: 11 waves, still 7 mm on a 0.5 mm request). So the request is FLAT
+  // out to the widest LATERAL gap in the cloud — spacing/sqrt(2) for a surface
+  // sampled on a grid of that spacing — and grades outward from there. The same
+  // zone is what the contract is measured over, so the two agree by
+  // construction, and its DEPTH is what the refinement costs: 0.7 x spacing, not
+  // a whole spacing, is the difference between a 38k-element shell and a 100k
+  // one on the same seat.
+  const double core_mm =
+      std::max(0.71 * seed_spacing_mm(seeds), 2.0 * request.size_mm);
+  contract.core_mm = core_mm;
+  const double reach_span = core_mm + h + 2.0 * request.size_mm;
+  const std::vector<pm::adapt::SizeSource> sources =
+      pm::adapt::point_size_sources(seeds, request.size_mm);
+  const pm::mesh::SizeFieldFn reach = pm::adapt::size_field_from_sources(
+      sources, request.size_mm, request.size_mm + kBeta * reach_span, kBeta);
+  auto seed_distance = [&](const Eigen::Vector3d &p) {
+    return (reach(p) - request.size_mm) / kBeta;  // saturates at reach_span
+  };
+  const double background = std::max(h, request.size_mm);
+  auto want = [&](const Eigen::Vector3d &p) {
+    const double outside = std::max(0.0, seed_distance(p) - core_mm);
+    return std::min(background, request.size_mm + kBeta * outside);
+  };
+  auto centroid_of = [&](const pm::fea::NodalElement &element) {
+    Eigen::Vector3d centroid = Eigen::Vector3d::Zero();
+    for (std::uint32_t n : element.nodes)
+      centroid += nodal.nodes[n];
+    return centroid / 4.0;
+  };
+  // What the contract is judged on, and what drives the marking: the BOUNDARY
+  // FACES inside the core. Faces, not elements — the contact guard's own
+  // interface size is the mean boundary-face edge length incident on a candidate
+  // node (fea_contact.cpp), so measuring anything else here would refuse studies
+  // the guard accepts and vice versa. Two element-based rules were tried first
+  // and both fail on a patch SMALLER than the background element, which is the
+  // normal case for a keyway or a pad:
+  //   * by centroid: a top-face triangle spanning a 12 mm seat on an 8 mm mesh
+  //     has one vertex in the core and its element's mass 10 mm away, so nothing
+  //     is ever marked and the interface stays at 8 mm (measured: 7.2 mm left
+  //     after the waves gave up);
+  //   * by closest vertex: the whole bulk tet is then asked to become 0.5 mm
+  //     because one corner touches the seat — measured, a 21.5 GB solve.
+  // Marking the OWNERS of coarse interface faces refines exactly the layer that
+  // carries the interface and lets LEPP closure grade the rest, and it makes the
+  // loop's own termination test identical to the contract's.
+  static constexpr int kFaceCorners[4][3] = {
+      {0, 1, 2}, {0, 1, 3}, {0, 2, 3}, {1, 2, 3}};
+  // Worst interface face size, and (optionally) the elements that own the
+  // interface faces coarser than the request, and (optionally) the boundary
+  // nodes inside the core, which is what the delivered SURFACE FIDELITY is
+  // measured over.
+  auto scan = [&](std::vector<std::size_t> *owners,
+                  std::vector<std::uint32_t> *core_nodes = nullptr) {
+    // Boundary = a triangular face owned by exactly one element. The key packs
+    // the sorted node triple in base 1000033, so it is a bijection, not a hash.
+    struct Face {
+      std::array<std::uint32_t, 3> tri{};
+      std::size_t owner = 0;
+      int uses = 0;
+    };
+    std::unordered_map<std::uint64_t, Face> faces;
+    faces.reserve(nodal.elements.size() * 2);
+    for (std::size_t e = 0; e < nodal.elements.size(); ++e)
+      for (const auto &corners : kFaceCorners) {
+        std::array<std::uint32_t, 3> tri{
+            nodal.elements[e].nodes[static_cast<std::size_t>(corners[0])],
+            nodal.elements[e].nodes[static_cast<std::size_t>(corners[1])],
+            nodal.elements[e].nodes[static_cast<std::size_t>(corners[2])]};
+        std::sort(tri.begin(), tri.end());
+        const std::uint64_t key = (static_cast<std::uint64_t>(tri[0]) * 1000003ull +
+                                   tri[1]) * 1000033ull + tri[2];
+        auto it = faces.find(key);
+        if (it == faces.end())
+          faces.emplace(key, Face{tri, e, 1});
+        else
+          ++it->second.uses;
+      }
+    double worst = 0.0;
+    for (const auto &entry : faces) {
+      const Face &face = entry.second;
+      if (face.uses != 1) continue;
+      double edge = 0.0;
+      double nearest = std::numeric_limits<double>::infinity();
+      for (int a = 0; a < 3; ++a) {
+        const Eigen::Vector3d &p = nodal.nodes[face.tri[static_cast<std::size_t>(a)]];
+        edge = std::max(
+            edge,
+            (p - nodal.nodes[face.tri[static_cast<std::size_t>((a + 1) % 3)]]).norm());
+        nearest = std::min(nearest, seed_distance(p));
+      }
+      // Inside the core — the same zone the request is flat over, so what is
+      // measured is exactly what was asked for.
+      if (nearest > core_mm) continue;
+      worst = std::max(worst, edge);
+      if (owners != nullptr && edge > request.size_mm * 1.02)
+        owners->push_back(face.owner);
+      if (core_nodes != nullptr)
+        core_nodes->insert(core_nodes->end(), face.tri.begin(), face.tri.end());
+    }
+    return worst;
+  };
+  contract.achieved_mm = scan(nullptr);
+  for (int wave = 0; wave < kLebWaves; ++wave) {
+    // Two mark sources, unioned: the owners of interface faces coarser than the
+    // request (the layer that carries the contract) and any element coarser than
+    // the graded field asks for at its centroid (the transition out to the
+    // background, so the fine layer is not a cliff).
+    std::vector<std::size_t> marks;
+    std::vector<std::array<std::uint32_t, 4>> tets;
+    tets.reserve(nodal.elements.size());
+    scan(&marks);
+    for (std::size_t e = 0; e < nodal.elements.size(); ++e) {
+      const pm::fea::NodalElement &element = nodal.elements[e];
+      tets.push_back({element.nodes[0], element.nodes[1], element.nodes[2],
+                      element.nodes[3]});
+      // 1.02: land just under the target rather than oscillating on it.
+      if (longest_edge_mm(nodal, element) > want(centroid_of(element)) * 1.02)
+        marks.push_back(e);
+    }
+    std::sort(marks.begin(), marks.end());
+    marks.erase(std::unique(marks.begin(), marks.end()), marks.end());
+    if (marks.empty())
+      break;
+    // A bisection wave at most DOUBLES the marked elements, so the next mesh is
+    // bounded before it is built. Refuse the wave rather than the machine.
+    if (contract.element_ceiling > 0 &&
+        nodal.elements.size() + marks.size() > contract.element_ceiling) {
+      contract.ceiling_bound = true;
+      break;
+    }
+    // ── A wave that DAMAGES the mesh is not applied ─────────────────────────
+    // "Damage" is measured against what the pipeline can actually solve
+    // (kWaveDegenerateFloor), not against the ship-quality floor. The
+    // projection of a mid-edge node onto the CAD surface can still fold a child
+    // — that is what killed the live keyway ("element 113043 is degenerate,
+    // inverted, or has a sign-changing Jacobian") — but the fold is now gated
+    // per EDGE inside local_refine_tets by the chord-sag test, so this is a
+    // backstop rather than the main defence, and the plain-chord retry stays.
+    const std::size_t before = nodal.elements.size();
+    const std::size_t nodes_before = nodal.nodes.size();
+    pm::mesh::TetFillOutput refined;
+    pm::mesh::LocalRefineStats stats;
+    std::string wave_error;
+    bool ok = false;
+    for (int attempt = 0; attempt < 2 && !ok; ++attempt) {
+      std::vector<std::array<std::uint32_t, 4>> wave_tets = tets;
+      pm::mesh::LocalRefineStats attempt_stats;
+      try {
+        refined = pm::mesh::local_refine_tets(
+            nodal.nodes, std::move(wave_tets), marks, &attempt_stats,
+            attempt == 0 ? cad_surface : nullptr);
+      } catch (const std::exception &e) {
+        wave_error = in_model_units(e.what());
+        continue;
+      }
+      ok = true;
+      double worst = std::numeric_limits<double>::infinity();
+      for (const auto &tet : refined.tets)
+        worst = std::min(worst, pm::mesh::validity::tet_shape_quality(
+                                    refined.nodes[tet[0]], refined.nodes[tet[1]],
+                                    refined.nodes[tet[2]], refined.nodes[tet[3]]));
+      if (!std::isfinite(worst) || worst < kWaveDegenerateFloor) {
+        ok = false;
+        char text[192];
+        std::snprintf(text, sizeof(text),
+                      "a bisected element came out degenerate (shape quality "
+                      "%.3g against a floor of %.3g)",
+                      worst, kWaveDegenerateFloor);
+        wave_error = text;
+        continue;
+      }
+      stats = attempt_stats;
+    }
+    if (!ok) {
+      contract.note = "local refinement stopped after " +
+                      std::to_string(contract.waves) + " LEB wave(s): " + wave_error;
+      break;
+    }
+    if (refined.tets.size() <= before) {
+      contract.note = "local refinement stopped after " +
+                      std::to_string(contract.waves) +
+                      " LEB wave(s): a bisection wave over " +
+                      std::to_string(marks.size()) +
+                      " marked element(s) grew the mesh by nothing";
+      break;
+    }
+    nodal.nodes = std::move(refined.nodes);
+    nodal.elements.clear();
+    nodal.elements.reserve(refined.tets.size());
+    for (const auto &tet : refined.tets)
+      nodal.elements.push_back(pm::fea::NodalElement{
+          pm::fea::ElementType::kTet4, {tet[0], tet[1], tet[2], tet[3]}});
+    contract.elems_added += static_cast<int>(refined.tets.size() - before);
+    contract.surface_mids += stats.n_surface_mids;
+    contract.chord_mids += stats.n_chord_mids;
+    // The wave's own nodes, straight away: a chord midpoint left in the void of
+    // a bore is a wall bulge, and the NEXT wave measures its faces against the
+    // request, so smoothing has to happen before that measurement, not once at
+    // the end.
+    std::vector<std::uint32_t> fresh;
+    fresh.reserve(nodal.nodes.size() - nodes_before);
+    for (std::size_t n = nodes_before; n < nodal.nodes.size(); ++n)
+      fresh.push_back(static_cast<std::uint32_t>(n));
+    smooth_nodes(cad_surface, nodal, fresh, contract.reprojected_nodes,
+                 contract.smoothed_nodes);
+    ++contract.waves;
+  }
+  // ── One last round: the ORIGINAL interface nodes, and the slivers ───────────
+  // The per-wave rounds only move what that wave created, and neither of the
+  // two things left over is a new node:
+  //   * the fill's OWN boundary nodes at the interface carry the fill's own
+  //     snap residual — up to 1.21 mm off the CAD surface at a 13.94 mm
+  //     background on the live keyway isolate. Bisection inherits it: every
+  //     new mid-edge node is projected onto the surface while its parents stay
+  //     where the lattice snapped them, so the refined bore alternates between
+  //     on-surface nodes and off-surface ones. On a CLEARANCE FIT that is not
+  //     cosmetic — a 0.5 mm bulge in a 0.35 mm fit is the difference between a
+  //     seating patch and a few touching asperities — so the core's boundary
+  //     nodes get the same slide-onto-the-face treatment, once, at the end.
+  //   * a sliver left between a bisected cell and an original fill cell needs
+  //     the ORIGINAL node to move, and nothing has offered it the chance.
+  // Every move is still accepted only on a strictly improving star (or, for the
+  // boundary projection, on not trading a healthy star for a sick one).
+  if (contract.waves > 0) {
+    std::vector<std::uint32_t> movable;
+    scan(nullptr, &movable);
+    const std::vector<std::uint32_t> poor = nodes_of_poor_cells(nodal);
+    movable.insert(movable.end(), poor.begin(), poor.end());
+    std::sort(movable.begin(), movable.end());
+    movable.erase(std::unique(movable.begin(), movable.end()), movable.end());
+    smooth_nodes(cad_surface, nodal, movable, contract.reprojected_nodes,
+                 contract.smoothed_nodes);
+  }
+  contract.elems = nodal.elements.size();
+  std::vector<std::uint32_t> core_nodes;
+  contract.achieved_mm = scan(nullptr, &core_nodes);
+  // ── Measured SURFACE FIDELITY at the interface ──────────────────────────────
+  // On a clearance fit the boundary residual is not cosmetic: a chord midpoint
+  // the curvature gate declined sits a chord sag INSIDE the void of the bore,
+  // and if the smoothing pass could not put it back, that bulge is subtracted
+  // from the clearance the contact solve is trying to resolve — a 0.1 mm
+  // residual on a 0.35 mm fit turns a seating patch into a handful of touching
+  // asperities. So it is measured and reported next to the delivered size.
+  // Sampled: closest_on_surface is brute force over the tessellation.
+  if (cad_surface != nullptr && !core_nodes.empty()) {
+    std::sort(core_nodes.begin(), core_nodes.end());
+    core_nodes.erase(std::unique(core_nodes.begin(), core_nodes.end()),
+                     core_nodes.end());
+    constexpr std::size_t kResidualSamples = 2048;
+    const std::size_t stride =
+        std::max<std::size_t>(1, core_nodes.size() / kResidualSamples);
+    double sum = 0.0;
+    std::size_t sampled = 0;
+    for (std::size_t i = 0; i < core_nodes.size(); i += stride) {
+      const double distance =
+          pm::mesh::closest_on_surface(*cad_surface, nodal.nodes[core_nodes[i]])
+              .distance;
+      if (!std::isfinite(distance)) continue;
+      contract.max_residual_mm = std::max(contract.max_residual_mm, distance);
+      sum += distance;
+      ++sampled;
+    }
+    if (sampled > 0) contract.mean_residual_mm = sum / static_cast<double>(sampled);
+  }
+  // What the refinement left behind, in the pipeline's own currency: the worst
+  // cell and how many sit under polymesh's ship floor. Reported, not fatal —
+  // the alternative (refusing the study) is what stalled the keyway at 2.434 mm.
+  double worst = std::numeric_limits<double>::infinity();
+  for (const pm::fea::NodalElement &element : nodal.elements) {
+    if (element.type != pm::fea::ElementType::kTet4) continue;
+    const double quality = pm::mesh::validity::tet_shape_quality(
+        nodal.nodes[element.nodes[0]], nodal.nodes[element.nodes[1]],
+        nodal.nodes[element.nodes[2]], nodal.nodes[element.nodes[3]]);
+    worst = std::min(worst, quality);
+    if (quality < pm::mesh::validity::kCellShapeFloor) ++contract.below_shape_floor;
+  }
+  contract.worst_quality = std::isfinite(worst) ? worst : 0.0;
+}
+
+// Relabel every left-handed tet4 cell so its node order is right-handed, and
+// report how many needed it.
+//
+// Chudware's tet4 contract carries no orientation: fea_static's tet4_B,
+// fea_thermal's tet4_grad and fill_quality all take |det|, so a cell whose
+// four nodes are listed left-handed (negative signed volume) solves and
+// measures exactly like its mirror. The quadratic PROMOTION is not
+// orientation-blind: pm::fea::promote_to_quadratic admits an element only if
+// the tet10 Jacobian determinant is finite and POSITIVE at every Gauss point,
+// and with mid-edge nodes at the straight chord midpoints that determinant IS
+// 6*V_signed. So it silently declined exactly the left-handed cells, left them
+// kTet4 inside an otherwise kTet10 mesh, and the fixed-stride extract below
+// then refused the entire study with "unsupported tet4 connectivity" — on a
+// perfectly valid solid. Measured on the ME 490 wheel-disc 90 deg cyclic
+// sector (phase 5D, R1 mass credit) at fineness 0.5: 33 left-handed cells out
+// of 467162, all against the wedge's sharp radial faces, where the graded
+// fill's boundary snapping flips a lattice tet. Order 1 never noticed; order 2
+// lost the study.
+//
+// Swapping two corners is a pure relabelling — same four nodes, same region,
+// same |volume|, and `faces` is empty for every FEM element type (it exists
+// only for kPolyVem), so nothing else indexes into the node list. A cell that
+// is FLAT rather than mirrored keeps a non-positive Jacobian either way; that
+// one is repair_degenerate_tets' job.
+int orient_tets_right_handed(pm::fea::NodalMesh &nodal) {
+  int flipped = 0;
+  for (pm::fea::NodalElement &element : nodal.elements) {
+    if (element.type != pm::fea::ElementType::kTet4 ||
+        element.nodes.size() != 4)
+      continue;
+    const double volume = pm::mesh::validity::tet_signed_volume(
+        nodal.nodes[element.nodes[0]], nodal.nodes[element.nodes[1]],
+        nodal.nodes[element.nodes[2]], nodal.nodes[element.nodes[3]]);
+    if (volume < 0.0) {
+      std::swap(element.nodes[1], element.nodes[2]);
+      ++flipped;
+    }
+  }
+  return flipped;
+}
+
+// Cells this sweep touches: flat to within a millionth of a regular tet of the
+// same edge span. polymesh's own ship floor is 0.02 (mesh::validity::
+// kCellShapeFloor), so nothing an ordinary "poor" mesh contains is in range —
+// only cells whose volume is numerical noise.
+inline constexpr double kDegenerateQuality = 1e-6;
+// What a repaired cell must reach: still four orders below the ship floor, and
+// nine orders above the rounding noise of the promotion's own determinant, so
+// its sign is no longer a coin flip.
+inline constexpr double kRepairedQuality = 1e-4;
+// Hard bound on how far one node may move, as a fraction of the background
+// element size. The same fill's boundary snap moves nodes by up to 0.18*h on
+// this geometry, so this is an order of magnitude inside the placement error
+// the mesh already carries.
+inline constexpr double kMaxRepairMoveFrac = 0.05;
+
+// Inflate the degenerate fill cells polymesh's ship gate could not fix.
+//
+// The ship gate (pipeline/scene.cpp, relax_cells_below_shape_floor) relaxes a
+// sub-floor cell by moving its INTERIOR nodes only — a boundary node carries
+// the exact-BRep placement. In a thin web every node of a boundary sliver IS a
+// boundary node, so the gate has nothing to move, ships the cell, and says so
+// in its note ("ship_gate N non-integrable cells (det J <= 0 at a quadrature
+// point)"). Measured on the ME 490 wheel-disc 90 deg sector at h_bulk
+// 8.898 mm: 29 of 152591 cells at shape quality 7e-17 and signed volume
+// 2e-15 mm3 — flat to machine precision, on the wedge's sharp radial faces,
+// in a fill whose own boundary snap already moved nodes by up to 1.59 mm.
+//
+// A zero-volume tet is not a mesh element: tet4_B inverts its coordinate
+// matrix, so at order 1 it contributes noise stiffness, and at order 2 it has
+// no positive Jacobian at all, which is what made promote_to_quadratic decline
+// it and cost the whole study its order (see build_mesh's refusal below).
+//
+// The repair is the ship gate's move, with its boundary restriction traded for
+// a hard displacement bound: give the cell volume by moving ONE of its nodes
+// along the gradient of its own signed volume (exact — the volume is linear in
+// each node coordinate), by the smallest distance that reaches
+// kRepairedQuality, never further than kMaxRepairMoveFrac * h; accept only if
+// every cell in that node's star keeps a positive volume and the star's worst
+// shape quality strictly improves. Returns the number of cells repaired and
+// reports what is left in `remaining` — a cell no single-node move can save is
+// a refusal, never a silent pass.
+int repair_degenerate_tets(pm::fea::NodalMesh &nodal, double h,
+                           int &remaining) {
+  remaining = 0;
+  const auto quality_of = [&nodal](const pm::fea::NodalElement &element) {
+    return pm::mesh::validity::tet_shape_quality(
+        nodal.nodes[element.nodes[0]], nodal.nodes[element.nodes[1]],
+        nodal.nodes[element.nodes[2]], nodal.nodes[element.nodes[3]]);
+  };
+  const auto is_tet4 = [](const pm::fea::NodalElement &element) {
+    return element.type == pm::fea::ElementType::kTet4 &&
+           element.nodes.size() == 4;
+  };
+
+  std::vector<size_t> bad;
+  for (size_t e = 0; e < nodal.elements.size(); ++e)
+    if (is_tet4(nodal.elements[e]) &&
+        quality_of(nodal.elements[e]) < kDegenerateQuality)
+      bad.push_back(e);
+  if (bad.empty())
+    return 0;
+
+  // Element star of every node a bad cell touches — the only nodes that can
+  // move, so the incidence lists are built for those alone.
+  std::unordered_map<uint32_t, std::vector<uint32_t>> star;
+  star.reserve(bad.size() * 8);
+  for (const size_t e : bad)
+    for (const uint32_t node : nodal.elements[e].nodes)
+      star.try_emplace(node);
+  for (size_t e = 0; e < nodal.elements.size(); ++e)
+    for (const uint32_t node : nodal.elements[e].nodes) {
+      const auto it = star.find(node);
+      if (it != star.end())
+        it->second.push_back(static_cast<uint32_t>(e));
+    }
+
+  const double max_move = kMaxRepairMoveFrac * h;
+  int repaired = 0;
+  for (const size_t e : bad) {
+    const pm::fea::NodalElement &cell = nodal.elements[e];
+    if (quality_of(cell) >= kDegenerateQuality) {
+      ++repaired; // an earlier node move already inflated this one
+      continue;
+    }
+    const double span = pm::mesh::validity::max_edge(
+        nodal.nodes[cell.nodes[0]], nodal.nodes[cell.nodes[1]],
+        nodal.nodes[cell.nodes[2]], nodal.nodes[cell.nodes[3]]);
+    if (!(span > 0.0))
+      continue; // four coincident nodes: no move can give this cell volume
+    // Volume the cell needs for kRepairedQuality at its own edge span.
+    const double want_volume =
+        kRepairedQuality * span * span * span / 8.485281374238570;
+    bool fixed = false;
+    for (int corner = 0; corner < 4 && !fixed; ++corner) {
+      const uint32_t node = cell.nodes[static_cast<size_t>(corner)];
+      const std::vector<uint32_t> &incident = star.at(node);
+      const Eigen::Vector3d original = nodal.nodes[node];
+      const auto cell_volume = [&] {
+        return pm::mesh::validity::tet_signed_volume(
+            nodal.nodes[cell.nodes[0]], nodal.nodes[cell.nodes[1]],
+            nodal.nodes[cell.nodes[2]], nodal.nodes[cell.nodes[3]]);
+      };
+      // The signed volume is linear in each node coordinate, so a unit step
+      // per axis IS the exact gradient.
+      const double base = cell_volume();
+      Eigen::Vector3d gradient;
+      for (int axis = 0; axis < 3; ++axis) {
+        nodal.nodes[node] = original;
+        nodal.nodes[node][axis] += 1.0;
+        gradient[axis] = cell_volume() - base;
+      }
+      nodal.nodes[node] = original;
+      const double slope = gradient.norm();
+      if (!(slope > 0.0))
+        continue;
+      const double distance = (want_volume - base) / slope;
+      if (!(distance > 0.0) || distance > max_move)
+        continue;
+      double worst_before = std::numeric_limits<double>::infinity();
+      for (const uint32_t other : incident)
+        if (is_tet4(nodal.elements[other]))
+          worst_before =
+              std::min(worst_before, quality_of(nodal.elements[other]));
+      nodal.nodes[node] = original + gradient.normalized() * distance;
+      double worst_after = std::numeric_limits<double>::infinity();
+      bool star_valid = true;
+      for (const uint32_t other : incident) {
+        if (!is_tet4(nodal.elements[other]))
+          continue;
+        const double quality = quality_of(nodal.elements[other]);
+        if (!std::isfinite(quality) || !(quality > 0.0))
+          star_valid = false;
+        worst_after = std::min(worst_after, quality);
+      }
+      if (star_valid && worst_after > worst_before) {
+        fixed = true;
+        ++repaired;
+      } else {
+        nodal.nodes[node] = original;
+      }
+    }
+    if (!fixed)
+      ++remaining;
+  }
+  return repaired;
+}
+
 // Fill at coarse element size `h`, optionally under a spatial size field h(x),
 // promote to tet10 when asked, and normalize into MeshOut. `feature_refine` is
 // an explicit caller decision rather than a re-derivation of the fineness gate,
@@ -763,6 +1592,17 @@ bool build_mesh(const LoadedModel &loaded, const MeshOptions &options, double h,
   }();
 
   nodal = volume.mesh;
+  // The local size contract, before any promotion: LEB is tet4-only, and a
+  // tet10 mesh promoted from bisected tet4 is the same mesh one order up.
+  LocalContract contract;
+  deliver_local_contract(loaded, options, h, nodal, contract);
+  // Right-handed before anything reads the sign: the quadratic promotion
+  // refuses a left-handed cell, and the fill emits a few on sharp edges.
+  out.reoriented_elems = orient_tets_right_handed(nodal);
+  // ...and non-degenerate before the promotion reads the determinant's sign:
+  // a cell the fill shipped flat has no positive Jacobian to promote.
+  out.degenerate_elems_repaired =
+      repair_degenerate_tets(nodal, h, out.degenerate_elems_remaining);
   if (options.order == 2) {
     nodal = pm::fea::promote_to_quadratic(nodal);
     // Project free-surface mids onto the exact BRep so quadratic elements
@@ -779,6 +1619,11 @@ bool build_mesh(const LoadedModel &loaded, const MeshOptions &options, double h,
     }
   }
   nodal.compact_unused_nodes();
+  // The fill's own note goes in BEFORE the refusal gates below, so a refused
+  // mesh still carries polymesh's ship-gate census (cells below the shape
+  // floor, non-integrable cells) instead of only Chudware's verdict. Same
+  // metre/millimetre relabel the success path uses (see in_model_units).
+  append_note(out.note, in_model_units(volume.mesher_note));
 
   chudware::prof::phases::PhaseScope extract_phase("extract");
   const int stride = options.order == 2 ? 10 : 4;
@@ -786,17 +1631,72 @@ bool build_mesh(const LoadedModel &loaded, const MeshOptions &options, double h,
                                         ? pm::fea::ElementType::kTet10
                                         : pm::fea::ElementType::kTet4;
   // A mixed cell here would be silently misread as a tet by every downstream
-  // reader (they index a flat array by a constant stride), so refuse instead of
-  // truncating.
+  // reader (they index a flat array by a constant stride), so refuse instead
+  // of truncating. Two unrelated failures wear that shape and get two
+  // different diagnostics: an element FAMILY Chudware cannot solve (hex,
+  // prism, pyramid, polyhedral), versus a LINEAR tet the quadratic promotion
+  // declined. The second used to be reported as the first, which is how a
+  // valid 90 deg wheel sector came back as "unsupported tet4 connectivity"
+  // (see orient_tets_right_handed): after the orientation relabel only a
+  // sliver whose signed volume is zero to tolerance can still be declined, and
+  // that is a degenerate-mesh refusal, not an unsupported one.
+  size_t declined = 0;
+  const pm::fea::ElementType *foreign = nullptr;
   for (const pm::fea::NodalElement &element : nodal.elements) {
-    if (element.type != want) {
-      out.ok = false;
-      out.error =
-          std::string("polyfea: mesh contains unsupported ") +
-          pm::fea::element_type_name(element.type) +
-          " connectivity; Chudware studies currently require tet4 or tet10";
-      return false;
+    if (element.type == want)
+      continue;
+    if (options.order == 2 && element.type == pm::fea::ElementType::kTet4)
+      ++declined;
+    else if (foreign == nullptr)
+      foreign = &element.type;
+  }
+  if (foreign != nullptr) {
+    out.ok = false;
+    out.error = std::string("polyfea: mesh contains unsupported ") +
+                pm::fea::element_type_name(*foreign) +
+                " connectivity; Chudware studies currently require tet4 or "
+                "tet10";
+    return false;
+  }
+  if (declined > 0) {
+    // Diagnose, don't guess: report the worst declined cell's signed volume,
+    // shape quality and edge span so the refusal says which defect it is.
+    double worst_quality = std::numeric_limits<double>::infinity();
+    double worst_volume = 0.0;
+    double worst_short = 0.0, worst_long = 0.0;
+    for (const pm::fea::NodalElement &element : nodal.elements) {
+      if (element.type != pm::fea::ElementType::kTet4 ||
+          element.nodes.size() != 4)
+        continue;
+      const Eigen::Vector3d &a = nodal.nodes[element.nodes[0]];
+      const Eigen::Vector3d &b = nodal.nodes[element.nodes[1]];
+      const Eigen::Vector3d &c = nodal.nodes[element.nodes[2]];
+      const Eigen::Vector3d &d = nodal.nodes[element.nodes[3]];
+      const double quality = pm::mesh::validity::tet_shape_quality(a, b, c, d);
+      if (quality >= worst_quality)
+        continue;
+      worst_quality = quality;
+      worst_volume = pm::mesh::validity::tet_signed_volume(a, b, c, d);
+      worst_long = pm::mesh::validity::max_edge(a, b, c, d);
+      worst_short = std::min({(a - b).norm(), (a - c).norm(), (a - d).norm(),
+                              (b - c).norm(), (b - d).norm(), (c - d).norm()});
     }
+    out.ok = false;
+    char text[576];
+    std::snprintf(text, sizeof(text),
+                  "polyfea: the quadratic promotion declined %zu of %zu "
+                  "element(s); worst declined cell: shape quality %.3g, signed "
+                  "volume %.3g mm3, edges %.4g..%.4g mm (the fill shipped %d "
+                  "flat cell(s); %d were inflated inside the %.3g mm repair "
+                  "bound, %d could not be)",
+                  declined, nodal.elements.size(), worst_quality, worst_volume,
+                  worst_short, worst_long,
+                  out.degenerate_elems_repaired +
+                      out.degenerate_elems_remaining,
+                  out.degenerate_elems_repaired,
+                  kMaxRepairMoveFrac * h, out.degenerate_elems_remaining);
+    out.error = text;
+    return false;
   }
   if (nodal.nodes.empty() || nodal.elements.empty()) {
     out.ok = false;
@@ -833,21 +1733,73 @@ bool build_mesh(const LoadedModel &loaded, const MeshOptions &options, double h,
   out.n_elems = static_cast<int>(nodal.elements.size());
   out.nodes_per_elem = stride;
   out.mesh_type_used = stride == 10 ? "tet10" : "tet4";
-  // Same metre/millimetre relabel as on the failure path: the mesher note
-  // carries polymesh's own h_bulk/snap distances, and the product surfaces it
-  // verbatim (see in_model_units).
-  append_note(out.note, in_model_units(volume.mesher_note));
-  if (options.local_refine.active()) {
-    char text[320];
+  if (out.reoriented_elems > 0)
+    append_note(out.note,
+                std::to_string(out.reoriented_elems) +
+                    " left-handed fill cell(s) relabelled right-handed (node "
+                    "order only; same nodes, same volume)");
+  if (out.degenerate_elems_repaired > 0) {
+    char text[288];
     std::snprintf(text, sizeof(text),
-                  "local refinement applied for %s: %zu seed(s) at %.4g mm "
-                  "within %.4g mm, background element size %.4g mm",
+                  "%d flat fill cell(s) inflated by one node each (within "
+                  "%.3g mm; the fill's ship gate cannot move boundary nodes)",
+                  out.degenerate_elems_repaired, kMaxRepairMoveFrac * h);
+    append_note(out.note, text);
+  }
+  if (options.local_refine.active()) {
+    // The MEASURED delivery, never the request: the seed stamp alone is capped
+    // at the lattice's h/4, so a note quoting max(request, h/4) as "applied"
+    // was how a 0.35 mm interface request came back as 1.299 mm without saying
+    // so (see deliver_local_contract).
+    out.local_refine_size_mm = options.local_refine.size_mm;
+    out.local_refine_achieved_mm = contract.achieved_mm;
+    out.local_refine_waves = contract.waves;
+    out.local_refine_elems_added = contract.elems_added;
+    out.local_refine_ceiling_bound = contract.ceiling_bound;
+    out.local_refine_element_ceiling = contract.element_ceiling;
+    out.local_refine_limit = contract.note;
+    char text[544];
+    std::snprintf(text, sizeof(text),
+                  "local refinement for %s: %zu seed(s) requested %.4g mm, flat "
+                  "within %.4g mm of them (seed stamp band %.4g mm, background "
+                  "element size %.4g mm, the fill's own graded floor %.4g mm); %d "
+                  "LEB wave(s) added %d element(s) and the coarsest interface "
+                  "face measured there is %.4g mm",
                   options.local_refine.label.empty()
                       ? "a study request"
                       : options.local_refine.label.c_str(),
                   options.local_refine.points.size() / 3,
-                  std::max(options.local_refine.size_mm, h * 0.25), seed_band, h);
+                  options.local_refine.size_mm, contract.core_mm, seed_band, h,
+                  h * 0.25, contract.waves, contract.elems_added,
+                  contract.achieved_mm);
     append_note(out.note, text);
+    if (contract.waves > 0) {
+      char placed[576];
+      std::snprintf(placed, sizeof(placed),
+                    "mid-edge nodes: %zu projected onto the CAD surface, %zu "
+                    "kept on the chord by the curvature gate; the post-wave "
+                    "smoothing pass slid %d back onto the face and improved %d "
+                    "more for shape (worst cell quality %.3g, %zu under the "
+                    "0.02 ship floor); interface boundary residual max %.4g mm, "
+                    "mean %.4g mm",
+                    contract.surface_mids, contract.chord_mids,
+                    contract.reprojected_nodes, contract.smoothed_nodes,
+                    contract.worst_quality, contract.below_shape_floor,
+                    contract.max_residual_mm, contract.mean_residual_mm);
+      append_note(out.note, placed);
+    }
+    if (!contract.note.empty())
+      append_note(out.note, contract.note);
+    if (contract.ceiling_bound) {
+      char capped[384];
+      std::snprintf(capped, sizeof(capped),
+                    "local refinement stopped at the mesh element ceiling: "
+                    "%zu element(s) against a ceiling of %zu, so the requested "
+                    "%.4g mm was not reached (%.4g mm achieved)",
+                    contract.elems, contract.element_ceiling,
+                    options.local_refine.size_mm, contract.achieved_mm);
+      append_note(out.note, capped);
+    }
   }
   // Element-local straight-edge fallback for mid-edge projections that folded
   // their element. On a thin wall (element size comparable to the wall
@@ -1022,6 +1974,109 @@ std::vector<Eigen::Vector3d> feature_face_seeds(const LoadedModel &loaded,
   return seeds;
 }
 
+// ── Last resort before the caller refuses: deliver the contract by RE-FILLING ─
+// Bisection (deliver_local_contract) delivers a local size by cutting up the
+// mesh the fill produced, and on a tight curved feature it can still stall
+// above the request — a wave whose children cannot be placed validly, or the
+// element ceiling. The other lever is the fill itself: the graded lattice puts
+// local children at h/2 and h/4 of the background cell, so a background of 4x
+// the request places the request WITHOUT bisecting anything, using the same
+// seed cloud and size field the request already carries (local_size_field).
+//
+// It is only worth a second full fill when it can actually win, so both bounds
+// are predicted first and the one that binds is named in the note:
+//   * polymesh raises any h to its own Cartesian grid-cell budget floor
+//     (mesh::min_h_for_cell_budget over the model bbox). On the 230 mm
+//     FRAME-PEDAL-BRAKE keyway isolate that floor is 2.75 mm and its finest
+//     child is 0.687 mm, so NO background delivers a 0.35 mm interface and the
+//     re-fill would spend millions of elements arriving at the same size.
+//   * the size band's element ceiling, predicted from the bbox at the re-fill
+//     size before anything is built.
+// The bisected mesh is kept unless the re-fill delivers a strictly finer
+// interface, so this can only improve the answer.
+template <typename AttemptWith>
+void deliver_contract_by_refill(const LoadedModel &loaded, const AdvisorPlan &plan,
+                                double h_first, bool feature_refine,
+                                AttemptWith &&attempt_with, MeshOut &out) {
+  const MeshLocalRefine &request = plan.options.local_refine;
+  if (!request.active() || !(request.size_mm > 0.0))
+    return;
+  if (!(out.local_refine_achieved_mm > kLocalContractSlack * request.size_mm))
+    return;  // bisection delivered it
+  const double grid_floor = pm::mesh::min_h_for_cell_budget(
+      loaded.model.bbox_min, loaded.model.bbox_max,
+      pm::mesh::kDefaultMaxGridCells, /*subdivision=*/1);
+  const double h_refill = std::max(4.0 * request.size_mm, grid_floor);
+  const double lattice_finest = 0.25 * h_refill;
+  char why[512];
+  if (lattice_finest > kLocalContractSlack * request.size_mm) {
+    std::snprintf(why, sizeof(why),
+                  "re-filling the whole solid to deliver %.4g mm was skipped: "
+                  "polymesh floors the background element size at %.4g mm on "
+                  "this bounding box (its Cartesian grid-cell budget), whose "
+                  "finest graded child is %.4g mm, so no background size can "
+                  "place the request and bisection's %.4g mm is the best "
+                  "available",
+                  request.size_mm, grid_floor, lattice_finest,
+                  out.local_refine_achieved_mm);
+    append_note(out.note, why);
+    return;
+  }
+  if (!(h_refill < h_first)) {
+    std::snprintf(why, sizeof(why),
+                  "re-filling to deliver %.4g mm was skipped: the background "
+                  "element size is already %.4g mm, at or under the %.4g mm the "
+                  "lattice would need",
+                  request.size_mm, h_first, h_refill);
+    append_note(out.note, why);
+    return;
+  }
+  const Eigen::Vector3d extent = loaded.model.bbox_max - loaded.model.bbox_min;
+  // Kuhn-split lattice: ~5.5 tets per interior cell. An OVER-estimate here is
+  // the right sign — this guard exists to keep a hopeless fill from being built.
+  const double predicted = 5.5 * std::abs(extent.x() * extent.y() * extent.z()) /
+                           (h_refill * h_refill * h_refill);
+  if (loaded.band.element_ceiling > 0 &&
+      predicted > static_cast<double>(loaded.band.element_ceiling)) {
+    std::snprintf(why, sizeof(why),
+                  "re-filling the whole solid at %.4g mm to deliver %.4g mm was "
+                  "skipped: it predicts %.3g elements against a ceiling of %llu, "
+                  "so bisection's %.4g mm is the best available",
+                  h_refill, request.size_mm, predicted,
+                  static_cast<unsigned long long>(loaded.band.element_ceiling),
+                  out.local_refine_achieved_mm);
+    append_note(out.note, why);
+    return;
+  }
+  MeshOut bisected = out;  // the mesh to fall back to
+  const bool refilled = attempt_with(plan.options, h_refill,
+                                     /*feature_refine=*/true);
+  if (!refilled ||
+      !(out.local_refine_achieved_mm < bisected.local_refine_achieved_mm)) {
+    const std::string refill_note =
+        refilled ? "delivered " + std::to_string(out.local_refine_achieved_mm) +
+                       " mm, no finer"
+                 : "failed: " + out.error;
+    out = std::move(bisected);
+    std::snprintf(why, sizeof(why),
+                  "re-filling the whole solid at %.4g mm to deliver %.4g mm was "
+                  "tried and discarded (%s); the bisected mesh at %.4g mm is "
+                  "kept",
+                  h_refill, request.size_mm, refill_note.c_str(),
+                  out.local_refine_achieved_mm);
+    append_note(out.note, why);
+    return;
+  }
+  std::snprintf(why, sizeof(why),
+                "bisection stalled at %.4g mm for a %.4g mm request, so the "
+                "solid was RE-FILLED at a %.4g mm background (the lattice places "
+                "the request on its own graded children) and delivers %.4g mm in "
+                "%d element(s)",
+                bisected.local_refine_achieved_mm, request.size_mm, h_refill,
+                out.local_refine_achieved_mm, out.n_elems);
+  append_note(out.note, why);
+}
+
 // The fill and its bounded recovery ladder, starting from `h_start` (0 = the
 // size the advisor/size band resolved). Split out so the caller can re-run the
 // WHOLE ladder at a different starting size: a recovery rung is what finally
@@ -1031,25 +2086,16 @@ bool fill_with_recovery(const LoadedModel &loaded, const MeshOptions &options,
                         double h_start, MeshOut &out) {
   const AdvisorPlan plan = make_advisor_plan(loaded, options);
   double h_first = h_start > 0.0 ? h_start : plan.h;
-  // A LOCAL refinement contract the lattice cannot place: polymesh's graded tet
-  // puts local children at h/2 and h/4 of the background cell, so a request
-  // below background/4 needs the BACKGROUND lowered to 4x it. That is still the
-  // cheap option by a wide margin — 4x the local size everywhere instead of the
-  // local size everywhere — and it is stated in the mesh note rather than
-  // silently delivering a coarser interface than the study asked for.
-  std::string background_note;
-  if (plan.options.local_refine.active() &&
-      plan.options.local_refine.size_mm * 4.0 < h_first * (1.0 - 1e-9)) {
-    const double lowered = 4.0 * plan.options.local_refine.size_mm;
-    char text[288];
-    std::snprintf(text, sizeof(text),
-                  "background element size lowered %.4g->%.4g mm so the fill's "
-                  "graded lattice can place the requested %.4g mm local size "
-                  "(its finest local child is background/4)",
-                  h_first, lowered, plan.options.local_refine.size_mm);
-    background_note = text;
-    h_first = lowered;
-  }
+  // A LOCAL refinement contract used to be delivered by LOWERING the background
+  // to 4x the request (the graded lattice puts local children at h/2 and h/4 of
+  // the background cell). That is gone, and had to be: polymesh raises h to its
+  // own Cartesian grid-cell budget floor, so on a 230 mm part the background
+  // came back at 2.75 mm however low it was asked to go, and a 0.35 mm interface
+  // silently became 1.299 mm. It was also the expensive answer — a background of
+  // 4x the local size is still the WHOLE part at 4x the local size (3.4M
+  // predicted elements on that keyway). The contract is delivered locally
+  // instead, by bisecting the elements at the seeds (deliver_local_contract),
+  // and what the mesh actually achieved is measured and reported.
   auto attempt_with = [&](const MeshOptions &opts, double h,
                           bool feature_refine) {
     out = MeshOut();
@@ -1057,7 +2103,6 @@ bool fill_with_recovery(const LoadedModel &loaded, const MeshOptions &options,
     append_note(out.note, loaded.band.note);
     if (out.advisor)
       append_note(out.note, out.advisor->note);
-    append_note(out.note, background_note);
     pm::fea::NodalMesh nodal;
     try {
       return build_mesh(loaded, opts, h, feature_refine, {}, nodal, out);
@@ -1073,8 +2118,11 @@ bool fill_with_recovery(const LoadedModel &loaded, const MeshOptions &options,
   // First attempt keeps the interactive default: draft/coarse skips the extra
   // feature pass.
   const bool feature_refine = default_feature_refine(plan.options);
-  if (attempt(h_first, feature_refine))
+  if (attempt(h_first, feature_refine)) {
+    deliver_contract_by_refill(loaded, plan, h_first, feature_refine,
+                               attempt_with, out);
     return true;
+  }
   const std::string first_error = out.error;
 
   // A detail-dense model (thin ECAD boards, small bosses) can have features far
@@ -1390,10 +2438,35 @@ bool mesh_separate_solids(const std::vector<TopoDS_Shape> &solids,
     combined.n_nodes += part.n_nodes;
     combined.n_elems += part.n_elems;
     combined.quadratic_fallback_elems += part.quadratic_fallback_elems;
+    combined.reoriented_elems += part.reoriented_elems;
+    combined.degenerate_elems_repaired += part.degenerate_elems_repaired;
+    combined.degenerate_elems_remaining += part.degenerate_elems_remaining;
     combined.hanging_elems_dropped += part.hanging_elems_dropped;
     combined.lonely_nodes_repaired += part.lonely_nodes_repaired;
     combined.dropped_volume_mm3 += part.dropped_volume_mm3;
     combined.char_len_mm = std::min(combined.char_len_mm, part.char_len_mm);
+    // The local size contract is a property of the WHOLE mesh a study solves,
+    // and every solid was meshed against the same seed set: the worst achieved
+    // size decides whether the contract was met, and a ceiling that bound on
+    // any one solid bound the study.
+    combined.local_refine_size_mm =
+        std::max(combined.local_refine_size_mm, part.local_refine_size_mm);
+    combined.local_refine_achieved_mm = std::max(combined.local_refine_achieved_mm,
+                                                 part.local_refine_achieved_mm);
+    combined.local_refine_waves =
+        std::max(combined.local_refine_waves, part.local_refine_waves);
+    combined.local_refine_elems_added += part.local_refine_elems_added;
+    combined.local_refine_ceiling_bound |= part.local_refine_ceiling_bound;
+    combined.local_refine_element_ceiling =
+        std::max(combined.local_refine_element_ceiling,
+                 part.local_refine_element_ceiling);
+    // The stop reason belongs to the mesh a study solves, not to one solid: the
+    // refusal that quotes it is about the whole interface.
+    if (!part.local_refine_limit.empty()) {
+      if (!combined.local_refine_limit.empty()) combined.local_refine_limit += "; ";
+      combined.local_refine_limit +=
+          "solid " + std::to_string(i + 1) + ": " + part.local_refine_limit;
+    }
     append_note(combined.note, part.note);
     if (!combined.advisor && part.advisor)
       combined.advisor = part.advisor;

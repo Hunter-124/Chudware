@@ -191,6 +191,48 @@ TEST_CASE("asm_edit_component transform survives the rebuild it triggers") {
     fs::remove(pb);
 }
 
+// ME 490 phase 5D item 4, at the document layer. `rebuild_assembly` writes the solved
+// transforms back over the doc, so whatever the mate solve returns for the GROUNDED
+// component is what a save captures. The solver used to hand back the anchor's matrix
+// re-derived from (t, exp-map w) — and a merged import's placement is authored from
+// MEASURED axes, so its 3x3 block is orthonormal only to within the measurement and the
+// round trip is a real re-pose: the rover's frame moved ~0.046 mm at its corners, which
+// is what put a 73.7 mm3 frame<->hub overlap into an assembly whose transform-placed
+// twin was clean. A fixed component's transform is a hard constraint; the rebuild must
+// be a byte-for-byte no-op on it.
+TEST_CASE("a grounded component's measured placement survives the rebuild unchanged") {
+    fs::path pa = tmp("anchor_a.step");
+    fs::path pb = tmp("anchor_b.step");
+    TwoComp asm_ = two_component_assembly(pa, pb, "anchor_pose_test");
+
+    // Authored from two measured axes 1e-4 rad off perpendicular, 0.6 m out.
+    const json measured = json::array({1.0,   1.0e-4, 0.0, 610.0,
+                                       0.0,   1.0,    0.0, -25.0,
+                                       0.0,   0.0,    1.0, 40.0,
+                                       0.0,   0.0,    0.0, 1.0});
+    json edit = json::array({
+        {{"op", "asm_edit_component"}, {"id", asm_.cid_a}, {"transform", measured}},
+    });
+    REQUIRE(!doc::doc_apply_ops(asm_.doc_id, -1, edit, false).contains("code"));
+
+    const std::vector<double> authored = measured.get<std::vector<double>>();
+    std::vector<double> ta = comp_transform(asm_.doc_id, asm_.cid_a);
+    REQUIRE(ta.size() == 16);
+    for (size_t i = 0; i < authored.size(); ++i) CHECK(ta[i] == authored[i]);
+
+    // And it stays put across further rebuilds, so a re-solve cannot walk the anchor.
+    json touch = json::array({
+        {{"op", "asm_edit_component"}, {"id", asm_.cid_b}, {"transform", pose_tx(60.0)}},
+    });
+    REQUIRE(!doc::doc_apply_ops(asm_.doc_id, -1, touch, false).contains("code"));
+    ta = comp_transform(asm_.doc_id, asm_.cid_a);
+    REQUIRE(ta.size() == 16);
+    for (size_t i = 0; i < authored.size(); ++i) CHECK(ta[i] == authored[i]);
+
+    fs::remove(pa);
+    fs::remove(pb);
+}
+
 // The other half of the contract: for a MATED, unfixed component the transform is only a
 // solver seed, so authoring it is an engine-level no-op — the component stays exactly on
 // the mate solution. The warm entry is deliberately NOT dropped here: re-seeding the mate

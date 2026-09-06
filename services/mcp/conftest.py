@@ -117,3 +117,24 @@ def _private_engine_daemon(_hermetic_config):
                 "(single shared document pool — expect order-dependent failures).",
                 allow_module_level=True)
         yield isolated
+
+
+@pytest.fixture(autouse=True)
+def _no_publisher_outlives_its_test():
+    """Stop deferred handoff publishes at the end of every test.
+
+    ``cad_common._publish_current`` coalesces an edit burst onto a daemon Timer named
+    ``chudware-publish-<doc_id>`` whose body is a WHOLE publish — a full ``doc_save``
+    plus the ``doc_list``/``doc_close`` calls behind the name lookup, the closed-doc
+    prune and the same-name supersede — and nothing cancels it when the test that
+    triggered it ends. Measured 2026-09-06 under ``pytest -q services/mcp``: a publish
+    armed by ``test_sketch3d_tools.py`` was still issuing engine calls inside
+    ``test_terminal_save_sweep.py``, whose bridge is a fake that records every
+    ``doc_save`` — so the terminal sweep was credited with a save it never made and a
+    DIFFERENT test of that file failed on each gate run. Bounded, so a wedged engine
+    call cannot hang the suite; the publish thread is a daemon either way.
+    """
+    yield
+    from services.mcp import cad_common as _cad_common
+
+    _cad_common.quiesce_publishes(10.0)

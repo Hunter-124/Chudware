@@ -1524,6 +1524,48 @@ def _unpublish(doc_id: str) -> None:
         pass
 
 
+def quiesce_publishes(timeout_s: float = 5.0) -> None:
+    """Cancel every armed trailing publish and wait out the ones already running.
+
+    Burst-coalescing arms a daemon Timer per doc (`chudware-publish-<doc_id>`) whose body
+    is a WHOLE publish: a full `doc_save` of the document plus the `doc_list`/`doc_close`
+    calls behind `_handoff_doc_name`, `_prune_closed_docs` and `_supersede_same_name`. The
+    only cancel in the code is `_unpublish`'s, which covers one doc on `close_part` — so
+    otherwise a trailing publish outlives whatever asked for it and keeps issuing engine
+    calls on its own thread, minutes later if the bridge is busy.
+
+    Two callers need it stopped on demand. `_cleanup_handoff_fragment` drops this
+    session's fragment and re-merges so survivors close our tabs at once; a publish still
+    in flight rewrites that fragment immediately afterwards and re-advertises a dead
+    publisher's documents. And a caller that installs its own engine stand-in (the test
+    suites' fake bridges) otherwise sees a foreign doc_save arrive in its own call log.
+
+    Bounded and best-effort: a wedged engine call must never hold up a shutdown path.
+    """
+    import threading as _t  # noqa: PLC0415 — see _publish_current
+
+    for st in list(_PUB_THROTTLE.values()):
+        timer = st.get("timer")
+        if timer is None:
+            continue
+        st["timer"] = None
+        try:
+            timer.cancel()
+        except Exception:  # noqa: BLE001
+            pass
+    deadline = time.monotonic() + max(0.0, timeout_s)
+    for thread in _t.enumerate():
+        if not thread.name.startswith("chudware-publish-"):
+            continue
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return
+        try:
+            thread.join(remaining)
+        except Exception:  # noqa: BLE001
+            pass
+
+
 # A per-process session id stamped onto every autosave. Recovery is scoped to the
 # SINGLE most-recent PRIOR session (the one that crashed), not the whole autosave
 # history, so a restart doesn't drag in 19 unrelated old docs (Bug S-1).
@@ -1559,8 +1601,13 @@ import atexit as _atexit  # noqa: E402
 @_atexit.register
 def _cleanup_handoff_fragment() -> None:
     """On clean shutdown drop our fragment and re-merge so survivors close our tabs at once
-    (rather than waiting for the PID probe on their next publish). Best-effort."""
+    (rather than waiting for the PID probe on their next publish). Best-effort.
+
+    Pending publishes are stopped FIRST: a trailing publish that fires after the unlink
+    rewrites `docs-<session>.json` and puts this dead publisher's documents back on the
+    survivors' list, which is exactly what the unlink exists to prevent."""
     try:
+        quiesce_publishes(2.0)
         d = _handoff_dir()
         (d / f"docs-{_SESSION_ID}.json").unlink(missing_ok=True)
         _merge_handoff_fragments(d)

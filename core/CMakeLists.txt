@@ -1402,6 +1402,24 @@ if(CHUDWARE_WITH_OCCT)
     set_tests_properties(mesh_mechanism PROPERTIES RUN_SERIAL TRUE
       ENVIRONMENT_MODIFICATION "${_fea_envmod}")
 
+    # Cyclic-sector gate: a 90 deg sector of the ME 490 wheel disc must mesh AND
+    # solve at tet4 and tet10, at an automatic size and at an explicit one. The
+    # live defect it pins: polymesh's graded fill emits left-handed tet4 cells on
+    # a sector's sharp wedge edges, promote_to_quadratic declines exactly those,
+    # and the extract stage then refused the whole study with "unsupported tet4
+    # connectivity" on a valid solid (phase 5D, R1 mass credit).
+    add_executable(test_mesh_sector tests/test_mesh_sector.cpp)
+    target_include_directories(test_mesh_sector PRIVATE
+      ${doctest_SOURCE_DIR} ${OpenCASCADE_INCLUDE_DIR})
+    target_link_libraries(test_mesh_sector PRIVATE
+      chudware_mesh chudware_geom_occt)
+    set_target_properties(test_mesh_sector PROPERTIES
+      RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+    chudware_polymesh_stage_runtime(test_mesh_sector)
+    add_test(NAME mesh_sector COMMAND test_mesh_sector)
+    set_tests_properties(mesh_sector PROPERTIES RUN_SERIAL TRUE
+      ENVIRONMENT_MODIFICATION "${_fea_envmod}")
+
     add_executable(test_sim_cache tests/test_sim_cache.cpp)
     target_include_directories(test_sim_cache PRIVATE
       ${doctest_SOURCE_DIR} ${OpenCASCADE_INCLUDE_DIR})

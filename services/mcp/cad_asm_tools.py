@@ -546,9 +546,17 @@ def register_cad_asm_tools(mcp: FastMCP) -> None:
                     mate = drivable[0]
                     mate_id = mate.get("id")
                 elif not drivable:
-                    raise ValueError("simulate_motion: no drivable (dimensional) mate found. "
-                                     "Drivable types: " + ", ".join(sorted(_DRIVABLE_MATE_TYPES))
-                                     + ". Add e.g. an angle mate to drive the joint.")
+                    raise ValueError(
+                        "simulate_motion: no drivable (dimensional) mate found. "
+                        "Drivable types: " + ", ".join(sorted(_DRIVABLE_MATE_TYPES))
+                        + ". Add e.g. an angle mate to drive the joint — or, when the "
+                        "components you want to move are positioned by concentric/"
+                        "coincident mates about a measured axis (a steering upright on "
+                        "its kingpin) and there is no dimension to add, drive them "
+                        "directly with steering_turning_radius(steer={'components':[...],"
+                        " 'axis':{'point':[x,y,z],'dir':[x,y,z]}, 'angle_deg':...}) or "
+                        "sweep_envelope(steer=...), which rotate the named components "
+                        "about that axis on a detached clone and re-solve the rest.")
                 else:
                     ids = ", ".join(f"{m.get('id')}({m.get('type')})" for m in drivable)
                     raise ValueError("simulate_motion: multiple drivable mates — pass mate_id. "

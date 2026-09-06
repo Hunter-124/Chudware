@@ -291,3 +291,143 @@ TEST_CASE("the convergence tolerance scales with the assembly") {
     CHECK(big["max_residual"].get<double>() > 1e-9);
     CHECK(big["max_residual"].get<double>() <= big["tolerance"].get<double>());
 }
+
+// ME 490 phase 5D item 4: the merged rover's GROUNDED frame (fixed:true) came back from the
+// mate solve ~0.046 mm off its authored placement, which showed up as a 73.7 mm3 frame<->hub
+// overlap per corner that vanished when the same two solids were placed by transform. A
+// fixed component is a HARD CONSTRAINT, not six variables with a stiff spring: it must be
+// echoed BIT-IDENTICALLY and the mates that touch it must be satisfied against the
+// placement the document actually carries.
+//
+// The mechanism was the pose parameterization. Every component went through
+// transform -> (t, exp-map w) -> transform, and a merged import's placement is authored
+// from MEASURED axes (fit_cylinder_axis on a faceted bore is good to ~1e-4 rad), so its
+// 3x3 block is orthonormal only to within the measurement. The SVD projection needed to
+// express it as a rotation vector is a real re-pose of the anchor, and the whole assembly
+// is then seated to the projected frame instead of the authored one.
+TEST_CASE("a grounded component is pinned, bit-for-bit") {
+    // The mission's own corners: the frame's local geometry sits ~0.93 m from its origin
+    // because every component was imported from one merged STEP.
+    const Vector3d axle_l(668.0, -625.5, 190.0);
+    const Vector3d axle_r(-668.0, -625.5, 190.0);
+    const Vector3d out_dir(0, -1, 0);
+
+    // Authored from two measured axes that are 1e-4 rad off perpendicular, with a measured
+    // translation correction. Rigid to within the measurement, and exactly where the
+    // document says the frame is.
+    const double skew = 1.0e-4;
+    Matrix3d Rm;
+    Rm.col(0) = Vector3d(1.0, 0.0, 0.0);
+    Rm.col(1) = Vector3d(skew, 1.0, 0.0).normalized();
+    Rm.col(2) = Rm.col(0).cross(Rm.col(1)).normalized();
+    const Vector3d frame_t(0.35, -0.20, 0.10);
+    std::vector<double> authored(16, 0.0);
+    authored[15] = 1.0;
+    for (int r = 0; r < 3; ++r) {
+        for (int c = 0; c < 3; ++c) authored[r * 4 + c] = Rm(r, c);
+        authored[r * 4 + 3] = frame_t[r];
+    }
+
+    json components = json::array();
+    components.push_back({{"id", "frame"}, {"transform", authored}, {"fixed", true}});
+    components.push_back({{"id", "hub_l"}, {"transform", xform({0.4, -0.2, 0.1}, {0, 0, 0})},
+                          {"fixed", false}});
+    components.push_back({{"id", "hub_r"}, {"transform", xform({-0.3, 0.2, 0.1}, {0, 0, 0})},
+                          {"fixed", false}});
+
+    json mates = json::array();
+    auto add_mate = [&](const std::string& id, const std::string& type,
+                        const std::string& cid) {
+        mates.push_back({{"id", id}, {"type", type}, {"align", "aligned"},
+                         {"refs", {{{"component", "frame"}}, {{"component", cid}}}}});
+    };
+    // Two consistent chains off the anchor, one per corner: bore concentric + face flush.
+    add_mate("l_bore", "concentric", "hub_l");
+    add_mate("l_face", "coincident", "hub_l");
+    add_mate("r_bore", "concentric", "hub_r");
+    add_mate("r_face", "coincident", "hub_r");
+
+    json input;
+    input["components"] = components;
+    input["mates"] = mates;
+    input["resolved_geometry"] = json::array({
+        geom_entry("l_bore", 0, "axis", axle_l, {0, 0, 1}, out_dir, 12.505),
+        geom_entry("l_bore", 1, "axis", axle_l, {0, 0, 1}, out_dir, 12.500),
+        geom_entry("l_face", 0, "plane", axle_l, out_dir, {0, 0, 1}, 0.0),
+        geom_entry("l_face", 1, "plane", axle_l, -out_dir, {0, 0, 1}, 0.0),
+        geom_entry("r_bore", 0, "axis", axle_r, {0, 0, 1}, out_dir, 12.505),
+        geom_entry("r_bore", 1, "axis", axle_r, {0, 0, 1}, out_dir, 12.500),
+        geom_entry("r_face", 0, "plane", axle_r, out_dir, {0, 0, 1}, 0.0),
+        geom_entry("r_face", 1, "plane", axle_r, -out_dir, {0, 0, 1}, 0.0),
+    });
+
+    json out = solve_mates_json(input);
+    REQUIRE(out["converged"].get<bool>());
+
+    // 1. The anchor's transform is the document's, to the last bit.
+    auto solved = out["transforms"]["frame"].get<std::vector<double>>();
+    REQUIRE(solved.size() == authored.size());
+    for (size_t i = 0; i < authored.size(); ++i) CHECK(solved[i] == authored[i]);
+
+    // 2. Stated as the measurement the mission made: the grounded component's geometry does
+    // not move. Pre-fix the exp-map round trip moved these two mate points 0.045758 mm and
+    // 0.045756 mm (the authored 1.0e-4 shear came back as +/-5e-05) — the mission's
+    // reported ~0.046 mm micro-pose.
+    auto world = [](const std::vector<double>& M, const Vector3d& p) {
+        return Vector3d(M[0] * p[0] + M[1] * p[1] + M[2] * p[2] + M[3],
+                        M[4] * p[0] + M[5] * p[1] + M[6] * p[2] + M[7],
+                        M[8] * p[0] + M[9] * p[1] + M[10] * p[2] + M[11]);
+    };
+    for (const Vector3d& p : {axle_l, axle_r})
+        CHECK((world(solved, p) - world(authored, p)).norm() < 1e-9);
+
+    // 3. And the mates that touch it are satisfied against THAT placement, in mm, not
+    // against a projection of it: every residual is numerical zero.
+    REQUIRE(out["residuals"].size() == 4);
+    for (const auto& r : out["residuals"])
+        CHECK(r["max_abs"].get<double>() < 1e-9);
+    CHECK(out["max_residual"].get<double>() < 1e-9);
+    CHECK(out["tolerance"].get<double>() <= 1e-6);
+}
+
+// The scale-widened threshold is a widening of a LENGTH IN MM, so it needs a ceiling: left
+// proportional it grows without bound with the model, and a large enough assembly would
+// report a visible gap as a seated mate. One nanometre is the ceiling — three orders below
+// any real fit tolerance, and 46 000 times smaller than the micro-pose above.
+TEST_CASE("the convergence threshold is absolute in mm however big the assembly") {
+    auto seat = [](double reach) {
+        const Vector3d axle(reach, 0.0, 0.0);
+        json components = json::array();
+        components.push_back({{"id", "frame"}, {"transform", ident16()}, {"fixed", true}});
+        components.push_back({{"id", "hub"}, {"transform", ident16()}, {"fixed", false}});
+        json mates = json::array();
+        mates.push_back({{"id", "bore"}, {"type", "concentric"}, {"align", "aligned"},
+                         {"refs", {{{"component", "frame"}}, {{"component", "hub"}}}}});
+        mates.push_back({{"id", "face"}, {"type", "coincident"}, {"align", "aligned"},
+                         {"refs", {{{"component", "frame"}}, {{"component", "hub"}}}}});
+        json input;
+        input["components"] = components;
+        input["mates"] = mates;
+        input["resolved_geometry"] = json::array({
+            geom_entry("bore", 0, "axis", axle, {0, 0, 1}, {0, 1, 0}, 20.0),
+            geom_entry("bore", 1, "axis", axle, {0, 0, 1}, {0, 1, 0}, 20.0),
+            geom_entry("face", 0, "plane", axle, {0, 1, 0}, {0, 0, 1}, 0.0),
+            geom_entry("face", 1, "plane", axle, {0, -1, 0}, {0, 0, 1}, 0.0),
+        });
+        return solve_mates_json(input);
+    };
+
+    // 400 m of reach: the proportional threshold was 4e-6 mm here and keeps growing with
+    // the model. (doctest's Approx is useless at this magnitude — its default scale of 1.0
+    // makes every value below ~1e-5 "equal" — so these are strict comparisons.)
+    json huge = seat(400000.0);
+    CHECK(huge["tolerance"].get<double>() <= 1e-6);
+    CHECK(huge["converged"].get<bool>());
+    CHECK(huge["max_residual"].get<double>() <= huge["tolerance"].get<double>());
+    CHECK(huge["max_residual"].get<double>() <= 1e-6);
+
+    // Nothing at or below the 100 mm reference moves: the caller's own threshold stands.
+    json small = seat(60.0);
+    CHECK(small["tolerance"].get<double>() == 1e-9);
+    CHECK(small["converged"].get<bool>());
+}

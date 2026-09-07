@@ -1901,7 +1901,10 @@ _FOS_CAP = 15.0
 
 # The release-evidence fields the engine attaches BESIDE `summary` (never inside it):
 #   mesh_quality  aspect/jacobian extremes, pct_poor, min tet volume, node/elem counts,
-#                 order, connected_components / unfixed_components (the mechanism gate)
+#                 order, char_len_mm (the DELIVERED element size in mm — the mesh-size
+#                 governor sizes against an element budget, so it is routinely not the
+#                 requested target_size_mm; null when the route meshed nothing itself),
+#                 connected_components / unfixed_components (the mechanism gate)
 #                 and thin_wall_ratio (wall thickness in element sizes)
 #   reactions     applied vs reaction force/moment plus equilibrium_error_pct (static family
 #                 only — a modal or thermal solve has no applied load to balance)
@@ -2981,6 +2984,86 @@ def _degenerate_legs(rows: list) -> list:
     return hits
 
 
+#: A delivered size this far off the request is a different study from the one asked for.
+#: Live on 2026-09-06: a ladder requested at 1.6/1.2/0.9 mm was meshed at 5.62/5.43/5.42 mm
+#: by the memory governor — ratios of 3.5x, 4.5x and 6.0x — and the only trace was governor
+#: prose the reader had to reverse-engineer the size out of.
+_SIZE_DELIVERY_MAX_RATIO = 1.25
+#: The other direction: a mesh finer than asked for is also not the stated discretization
+#: (a band floor or a feature-refine can pull it down), and it changes the cost of the leg.
+_SIZE_DELIVERY_MIN_RATIO = 0.8
+
+
+def _size_delivery(rows: list) -> list:
+    """Requested vs DELIVERED element size, one entry per solved leg.
+
+    `size_mm` on a row is what the caller asked for and `delivered_size_mm` is what the
+    mesher actually meshed at (engine `mesh_quality.char_len_mm`). They are routinely not
+    the same number — the memory governor sizes against an element budget — and until this
+    table existed the delivered size appeared nowhere in the reply at all, so a ladder read
+    as three fine meshes when it was three coarse ones. A leg that failed or was skipped has
+    no mesh and gets no entry; `ratio` is null when either side is unavailable (a `fineness`
+    rung states no size in mm, and an inline mesh reports no length).
+    """
+    out: list = []
+    for i, row in enumerate(rows):
+        if row.get("error") or row.get("skipped"):
+            continue
+        requested = row.get("size_mm")
+        delivered = row.get("delivered_size_mm")
+        usable = [
+            v
+            for v in (requested, delivered)
+            if isinstance(v, (int, float)) and not isinstance(v, bool)
+        ]
+        ratio = (
+            round(float(delivered) / float(requested), 4)
+            if len(usable) == 2 and float(requested) > 0.0
+            else None
+        )
+        out.append(
+            {
+                "leg": i,
+                "requested_mm": requested,
+                "delivered_mm": delivered,
+                "ratio": ratio,
+            }
+        )
+    return out
+
+
+def _size_delivery_note(delivery: list) -> Optional[str]:
+    """One sentence naming the legs whose delivered size missed the request, else None.
+
+    Pure function of the `size_delivery` table so the disclosure can be tested without an
+    engine. It is appended to the reply's existing `note` rather than added as a second
+    note field: a reader who is being told the ladder is degenerate must be told in the
+    same breath that the sizes are not the ones they asked for.
+    """
+    coarse = [
+        e for e in delivery
+        if isinstance(e.get("ratio"), (int, float)) and e["ratio"] > _SIZE_DELIVERY_MAX_RATIO
+    ]
+    fine = [
+        e for e in delivery
+        if isinstance(e.get("ratio"), (int, float)) and e["ratio"] < _SIZE_DELIVERY_MIN_RATIO
+    ]
+    if not coarse and not fine:
+        return None
+    parts = [
+        f"leg {e['leg']} asked {e['requested_mm']:g} mm and got {e['delivered_mm']:g} mm "
+        f"({e['ratio']:g}x)"
+        for e in sorted(coarse + fine, key=lambda e: e["leg"])
+    ]
+    return (
+        "DELIVERED SIZE != REQUESTED SIZE — "
+        + "; ".join(parts)
+        + f" (tolerance: {_SIZE_DELIVERY_MIN_RATIO}x-{_SIZE_DELIVERY_MAX_RATIO}x of the "
+        "request); the mesh-size governor sized these legs against its element budget, so "
+        "size_mm is the request and each row's delivered_size_mm is what solved."
+    )
+
+
 def _convergence_ladder(sizes_mm, fineness) -> tuple:
     """The explicit coarse-to-fine discretization ladder: ("target_size_mm"|"fineness", [...]).
 
@@ -3056,6 +3139,12 @@ def _leg_vtu_path(vtu_dir: str, doc_id, index: int, step: dict) -> str:
     carries the three things that make a ladder leg what it is — its position, its
     discretization and its element order. A fineness rung has no size in mm, so it is
     named `f<fineness>` instead of `h<size>`; nothing else changes.
+
+    The `h<size>` in the name is the REQUESTED size, fixed before the leg is solved. It is
+    NOT necessarily the size that was meshed: the engine's mesh-size governor sizes against
+    an element budget, so a file named `_h0.9_` can hold a 5.4 mm field. The row's
+    `delivered_size_mm` (engine `mesh_quality.char_len_mm`) is the truth about the mesh
+    behind this file; the filename is only a stable label for the rung that asked for it.
     """
     base = (_handoff_doc_name(str(doc_id)) or "").strip() or str(doc_id or "part")
     stem = re.sub(r"[^A-Za-z0-9._-]+", "_", base).strip("._-") or "part"
@@ -3099,6 +3188,11 @@ def _convergence_row(step: dict, out: dict, monitor: str, prev: Optional[float])
     """
     row = {
         "size_mm": step.get("target_size_mm"),
+        # What the mesher DELIVERED, filled in below from the engine's own
+        # mesh_quality.char_len_mm. `size_mm` above stays the REQUESTED size; the two
+        # differ whenever the mesh-size governor sizes against its element budget, and
+        # without this number on the row that substitution was invisible.
+        "delivered_size_mm": None,
         "fineness": step.get("fineness"),
         "mesh_order": step.get("mesh_order"),
         **({"min_size_mm": step["min_size_mm"]}
@@ -3131,6 +3225,9 @@ def _convergence_row(step: dict, out: dict, monitor: str, prev: Optional[float])
             row[key] = summary.get(key)
     if isinstance(out.get("mesh_quality"), dict):
         row["mesh_quality"] = out["mesh_quality"]
+        delivered = out["mesh_quality"].get("char_len_mm")
+        if isinstance(delivered, (int, float)) and not isinstance(delivered, bool):
+            row["delivered_size_mm"] = delivered
     if isinstance(out.get("reactions"), dict):
         row["equilibrium_error_pct"] = out["reactions"].get("equilibrium_error_pct")
     # The solve echoes the .vtu it wrote; the step is the fallback for an engine build
@@ -3207,6 +3304,7 @@ def _convergence_envelope(
     skipped = [i for i, r in enumerate(rows) if r.get("skipped")]
     degenerate = _degenerate_legs(rows)
     implausible = [i for i, r in enumerate(rows) if r.get("implausible")]
+    delivery = _size_delivery(rows)
     last_delta = rows[-1].get("delta_pct_vs_prev") if rows else None
     converged = (
         not failed
@@ -3226,6 +3324,11 @@ def _convergence_envelope(
         "n_meshes": len(rows),
         "converged": converged,
         "degenerate_ladder": bool(degenerate),
+        # Requested vs delivered element size per solved leg, beside the degeneracy
+        # verdict because it is usually the CAUSE of one: legs the governor collapsed
+        # onto one budget-limited size are also legs whose delivered size is not the
+        # size the caller asked for.
+        "size_delivery": delivery,
         "final_delta_pct": last_delta,
         "resources": _resources_line(rows),
         "note": (
@@ -3287,6 +3390,12 @@ def _convergence_envelope(
             "unfixed_components, refine so h <= the wall thickness, and confirm the "
             "fixture faces resolved onto mesh nodes."
         )
+    # Appended LAST so it survives whichever verdict claimed `note` above: a ladder that
+    # was not meshed at the sizes it stated has to say so in the same sentence a reader
+    # takes its verdict from, not in a field they have to know to look for.
+    delivery_note = _size_delivery_note(delivery)
+    if delivery_note:
+        out["note"] = out["note"] + " " + delivery_note
     if skipped:
         out["skipped_legs"] = skipped
     if failed:
@@ -3720,7 +3829,9 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
         max_von_mises_raw_mpa.
 
         Release evidence rides BESIDE "summary": "mesh_quality" (aspect/jacobian extremes,
-        pct_poor, node/elem counts, order, plus connected_components /
+        pct_poor, node/elem counts, order, char_len_mm — the element size the mesher
+        DELIVERED, which is not the size you asked for whenever the memory governor
+        resized against its element budget — plus connected_components /
         unfixed_components and thin_wall_ratio — the wall thickness in element sizes,
         under 1 meaning one element spans the wall), "reactions" (applied vs reaction
         force/moment plus equilibrium_error_pct — check it before trusting a stress),
@@ -3936,8 +4047,9 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
         carries the governor's own numbers in `memory_budget` when the engine reported
         them, and the reply's `resources` line states the rule.
 
-        Returns {ok, monitor, tol_pct, converged, degenerate_ladder, final_delta_pct,
-        n_meshes, resources, job_ids, table:[{size_mm|fineness, mesh_order, n_dof,
+        Returns {ok, monitor, tol_pct, converged, degenerate_ladder, size_delivery,
+        final_delta_pct, n_meshes, resources, job_ids, table:[{size_mm|fineness,
+        delivered_size_mm, mesh_order, n_dof,
         n_nodes, n_elems, max_von_mises_mpa, max_disp_mm, min_fos, monitored_value,
         delta_pct_vs_prev, mesh_quality, equilibrium_error_pct, plausibility,
         implausible, mesh_governor_notes, memory_budget}]}. `converged` is |the FINEST
@@ -3953,6 +4065,13 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
         or under 5% DOF growth between consecutive legs); converged is then forced false
         and `note` carries the remedy, because a 0% delta between two copies of one mesh
         is not evidence.
+        `size_mm` is the size you REQUESTED and `delivered_size_mm` is the size the mesher
+        actually meshed at (engine mesh_quality.char_len_mm) — the memory governor sizes
+        against an element budget, so a ladder asked for 1.6/1.2/0.9 mm can be delivered
+        at 5.62/5.43/5.42 mm. `size_delivery` is that comparison per solved leg
+        ({leg, requested_mm, delivered_mm, ratio}); when any ratio leaves 0.8x-1.25x of the
+        request, `note` names those legs. The .vtu filenames carry the REQUESTED size, so
+        `delivered_size_mm` is the only truth about what was meshed.
         A leg whose peak displacement exceeded the part's own bounding-box diagonal is
         marked `implausible:true` and listed in `implausible_legs`: it left the
         linear-elastic small-strain regime (usually a mechanism — a thin wall meshed one

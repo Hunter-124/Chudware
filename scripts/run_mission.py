@@ -447,6 +447,10 @@ def main(argv: list[str] | None = None) -> int:
         previous = signal.getsignal(signal.SIGINT)
         signal.signal(signal.SIGINT, on_sigint)
 
+        # `timeout` is the host's turn budget (chudcode_host.wait_for_idle); without it the
+        # host applies its 2-hour absolute cap and a long convergence turn dies with
+        # "Timed out waiting for agent_end" well inside --timeout-s. The RPC wait below is
+        # the same number plus slack, so the host always reports first.
         params: dict[str, Any] = {
             "request": prompt,
             "role": args.role,
@@ -455,6 +459,7 @@ def main(argv: list[str] | None = None) -> int:
             "session_id": session_id,
             "workspace_dir": str(workspace),
             "sessions_dir": str(sessions_dir),
+            "timeout": args.timeout_s,
         }
         if args.provider:
             params["provider"] = args.provider
@@ -468,7 +473,7 @@ def main(argv: list[str] | None = None) -> int:
         result: dict = {}
         failure = ""
         try:
-            result = worker.call("agent_admin_turn", params, timeout=args.timeout_s)
+            result = worker.call("agent_admin_turn", params, timeout=args.timeout_s + 60.0)
         except WorkerError as exc:
             failure = str(exc)
         except KeyboardInterrupt:

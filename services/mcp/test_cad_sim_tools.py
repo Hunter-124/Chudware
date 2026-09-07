@@ -1754,6 +1754,81 @@ def test_a_ladder_of_plausible_legs_still_converges_on_its_own_delta(
     assert out["converged"] is True, out
 
 
+# --------------------------------------------------- requested vs DELIVERED element size
+# The ladder that forced this asked for 1.6 / 1.2 / 0.9 mm and was meshed at
+# 5.62 / 5.43 / 5.42 mm by the memory governor. Nothing in the row or the .vtu name said
+# so, so the delivered size had to be reverse-engineered out of governor prose. These
+# drive the pure helpers directly: no engine, synthetic rows, exact ratios.
+
+def test_size_delivery_ratio_and_note_name_the_legs_the_governor_resized():
+    """Every solved leg gets an entry, ratio is delivered/requested, and a miss is a
+    sentence naming the legs — not a flag the reader has to know to look for."""
+    rows = [
+        {"size_mm": 1.6, "delivered_size_mm": 5.62},
+        {"size_mm": 1.2, "delivered_size_mm": 5.43},
+        {"size_mm": 0.9, "delivered_size_mm": 5.42},
+    ]
+    delivery = sim_tools._size_delivery(rows)
+
+    assert [e["leg"] for e in delivery] == [0, 1, 2], delivery
+    assert [e["requested_mm"] for e in delivery] == [1.6, 1.2, 0.9], delivery
+    assert [e["delivered_mm"] for e in delivery] == [5.62, 5.43, 5.42], delivery
+    assert [e["ratio"] for e in delivery] == [3.5125, 4.525, 6.0222], delivery
+
+    note = sim_tools._size_delivery_note(delivery)
+    assert note is not None
+    assert all(f"leg {i}" in note for i in (0, 1, 2)), note
+    assert "1.6 mm" in note and "5.62 mm" in note, note
+    assert "delivered_size_mm" in note, note
+
+
+def test_size_delivery_is_silent_inside_tolerance_and_ignores_unsolved_legs():
+    """A leg meshed close to its request is not news; a leg with no mesh has nothing to
+    report; a fineness rung states no size in mm, so its ratio is null rather than a
+    number invented from one side."""
+    rows = [
+        {"size_mm": 4.0, "delivered_size_mm": 4.0},
+        {"size_mm": 2.0, "delivered_size_mm": 2.4},          # 1.2x — inside the band
+        {"size_mm": None, "fineness": 0.5, "delivered_size_mm": 3.2},
+        {"size_mm": 1.0, "error": "the governor refused this leg"},
+        {"size_mm": 0.5, "skipped": True},
+    ]
+    delivery = sim_tools._size_delivery(rows)
+
+    assert [e["leg"] for e in delivery] == [0, 1, 2], delivery
+    assert [e["ratio"] for e in delivery] == [1.0, 1.2, None], delivery
+    assert sim_tools._size_delivery_note(delivery) is None
+
+
+def test_size_delivery_also_reports_a_mesh_FINER_than_the_request():
+    """The band floor and feature refinement pull the other way, and a leg meshed at
+    0.6x the stated size is also not the discretization that was stated."""
+    delivery = sim_tools._size_delivery([{"size_mm": 1.0, "delivered_size_mm": 0.6}])
+
+    assert delivery[0]["ratio"] == 0.6, delivery
+    note = sim_tools._size_delivery_note(delivery)
+    assert note is not None and "leg 0" in note, note
+
+
+def test_the_ladder_reply_carries_size_delivery_beside_its_verdict(
+        ladder_setup, monkeypatch, tools):
+    """The table is on the reply of a real ladder run, one entry per solved leg, and a
+    ladder meshed at the sizes it asked for says nothing extra in its note."""
+    _LegStub(monkeypatch, {0: 100.0, 1: 104.0, 2: 105.0})
+    out = json.loads(tools["run_fea_convergence"](
+        fixtures=["bottom"], loads=[{"face": "top", "force": [0, 0, -200]}],
+        sizes_mm=[4, 2, 1]))
+
+    # The stub reports no mesh_quality, so no leg has a delivered size to compare: the
+    # entries exist (one per solved leg) and say so honestly instead of inventing one.
+    assert [e["leg"] for e in out["size_delivery"]] == [0, 1, 2], out["size_delivery"]
+    assert [e["requested_mm"] for e in out["size_delivery"]] == [4, 2, 1], out
+    assert all(e["delivered_mm"] is None and e["ratio"] is None
+               for e in out["size_delivery"]), out["size_delivery"]
+    assert all(r["delivered_size_mm"] is None for r in out["table"]), out["table"]
+    assert "DELIVERED SIZE" not in out["note"], out["note"]
+
+
 def test_collect_static_forwards_the_engines_mechanism_and_plausibility_evidence(
         monkeypatch):
     """An evidence field the engine sent must reach the caller VERBATIM, reply and study."""

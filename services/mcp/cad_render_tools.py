@@ -371,15 +371,50 @@ def _sids_areas_text(groups: list) -> str:
     return ", ".join(bits) if bits else "no sid"
 
 
+def _entry_anchor(group: dict) -> Optional[list]:
+    """Area-weighted centroid of ONE load entry's faces — where its arrow lands.
+
+    Weighted, not plain-mean: an entry naming a big barrel and a sliver chamfer must anchor
+    on the barrel. Falls back to a plain mean when no face reports an area, and to None when
+    no match carries a centroid at all (nothing to point at)."""
+    num = [0.0, 0.0, 0.0]
+    wsum = 0.0
+    for m in group["matches"]:
+        c = m.get("centroid")
+        if not isinstance(c, (list, tuple)) or len(c) < 3:
+            continue
+        try:
+            w = float(m.get("area_or_len"))
+        except (TypeError, ValueError):
+            w = 0.0
+        w = w if w > 0.0 else 1.0
+        wsum += w
+        for i in range(3):
+            num[i] += w * float(c[i])
+    return [c / wsum for c in num] if wsum > 0.0 else None
+
+
 def _load_resultant(load_specs: list, groups: list) -> tuple:
-    """(resultant [Fx,Fy,Fz] N, per-load description) for the solver's own load payload.
+    """(resultant [Fx,Fy,Fz] N, per-load description, per-entry records) for the solver's own
+    load payload.
 
     A force load contributes its vector as given. A pressure load contributes
     p[MPa] * area[mm2] = N along the INWARD face normal — what {"face": q, "pressure": p}
     means to the solver — computed from the face's own area and outward normal so the
-    figure states a real number instead of "some pressure"."""
+    figure states a real number instead of "some pressure".
+
+    The per-entry records ({vector, mag, anchor, sids}) are what the figure DRAWS: the
+    resultant alone is not the load — four tangential tractions summing to zero are a couple,
+    and a figure showing nothing for them is false evidence."""
     total = [0.0, 0.0, 0.0]
     terms: list = []
+    entries: list = []
+
+    def _entry(vec: list, g: dict) -> None:
+        entries.append({"vector": [float(c) for c in vec],
+                        "mag": math.sqrt(sum(float(c) * float(c) for c in vec)),
+                        "anchor": _entry_anchor(g), "sids": list(g["sids"])})
+
     for spec, g in zip(load_specs, groups):
         if spec.get("type") == "force":
             f = [float(c) for c in spec["vector"]]
@@ -387,6 +422,7 @@ def _load_resultant(load_specs: list, groups: list) -> tuple:
                 total[i] += f[i]
             terms.append(f"force [{f[0]:.4g}, {f[1]:.4g}, {f[2]:.4g}] N on "
                          f"{', '.join(g['sids']) or 'the resolved face(s)'}")
+            _entry(f, g)
             continue
         p = float(spec.get("magnitude") or 0.0)
         area = 0.0
@@ -408,7 +444,8 @@ def _load_resultant(load_specs: list, groups: list) -> tuple:
         terms.append(f"pressure {p:.4g} MPa over {area:.4g} mm2 = "
                      f"{math.sqrt(sum(c * c for c in vec)):.4g} N inward along the face "
                      f"normal of {', '.join(g['sids']) or 'the resolved face(s)'}")
-    return total, terms
+        _entry(vec, g)
+    return total, terms, entries
 
 
 def register_cad_render_tools(mcp: FastMCP) -> None:
@@ -852,8 +889,12 @@ def register_cad_render_tools(mcp: FastMCP) -> None:
         Renders the whole part with the study's boundary conditions painted on the actual
         faces the solver would use: every FIXTURE face in ONE reserved colour (magenta),
         every LOAD face in another (violet), the rest of the part desaturated so the two
-        groups read at a glance. This is the figure a report needs beside a stress plot: it
-        shows the reader WHICH faces the numbers assumed were bolted down and pushed on.
+        groups read at a glance, plus ONE ARROW PER LOAD ENTRY — tip on that entry's face
+        centroid, aimed along that entry's own force vector, length scaled to its magnitude
+        against the largest entry — and the resultant burned into a band at the bottom of
+        the frame. This is the figure a report needs beside a stress plot: it shows the
+        reader which faces the numbers assumed were bolted down and WHAT was pushed on them,
+        so an axial and a radial case on the same faces are different pictures.
 
         fixtures / load: EXACTLY the run_fea_static dialect, resolved by the same code —
           fixtures = list of face queries held fully fixed, e.g. ["bottom"] or
@@ -875,9 +916,10 @@ def register_cad_render_tools(mcp: FastMCP) -> None:
 
         save_path (optional): ALSO write this figure to your own absolute .png path. The
           file contains exactly the bytes returned inline — one flat RGB PNG of the shaded
-          part with the fixture/load paint, glow outlines, per-face labels, B-rep edge
-          outline, feature callouts and scale bar already burned in (no layers, no alpha,
-          no metadata), ready to embed in a report. Same rules as render_part: absolute,
+          part with the fixture/load paint, glow outlines, per-face labels, the load arrows,
+          the burned-in resultant band, the B-rep edge outline, feature callouts and scale
+          bar already burned in (no layers, no alpha, no metadata), ready to embed in a
+          report. Same rules as render_part: absolute,
           inside the project/workspace dir unless CHUDWARE_RENDER_SAVE_ANYWHERE=1.
 
         Returns [image, caption]. The caption carries the legend in words —
@@ -967,19 +1009,40 @@ def register_cad_render_tools(mcp: FastMCP) -> None:
         png, frame, _r = _render_view_png(d, view_dir, png,
                                           name=f"STUDY {str(view_name).upper()}"[:28],
                                           annotate=True)
-        png, ann_info = _annotate_render(
-            png, d, view_dir, edges=True, callouts=True, scale=True, frame=frame,
-            emphasis={"matches": all_matches, "mode": "study_setup",
-                      "label": "FIXTURE+LOAD", "palette": palette},
-            out_png=render_output_path(stem, ".png"))
 
-        emp = (ann_info or {}).get("emphasis") or {}
-        visible = set(emp.get("visible_sids") or [])
-        resultant, terms = _load_resultant(load_specs, load_groups)
+        # The load VECTOR, not just the loaded faces. One arrow per entry, tip on that
+        # entry's own face centroid, aimed along its own force and scaled to its magnitude
+        # against the largest entry — so an axial 136 N and a radial 980 N on the SAME face
+        # pair are different pictures, and a couple that sums to zero still draws its four
+        # tractions. The resultant is burned into the frame as well: a PNG lifted out of the
+        # tool response into a report carries its own numbers.
+        resultant, terms, entries = _load_resultant(load_specs, load_groups)
         mag = math.sqrt(sum(c * c for c in resultant))
         direction = (f"[{resultant[0] / mag:.3f}, {resultant[1] / mag:.3f}, "
                      f"{resultant[2] / mag:.3f}]" if mag > 1e-12
                      else "none (the load entries cancel to a zero resultant)")
+        mag_max = max([e["mag"] for e in entries] or [0.0])
+        arrows = [{"at": e["anchor"], "vec": e["vector"], "mag": e["mag"],
+                   "rel": (e["mag"] / mag_max) if mag_max > 1e-12 else 1.0,
+                   "rgb": list(_LOAD_RGB), "label": f"{e['mag']:.4g} N"}
+                  for e in entries if e["anchor"] and e["mag"] > 1e-12]
+        per_entry = "; ".join(
+            f"{', '.join(e['sids']) or 'face'} {e['mag']:.4g} N "
+            f"[{e['vector'][0]:.4g}, {e['vector'][1]:.4g}, {e['vector'][2]:.4g}]"
+            for e in entries[:3])
+        banner = [f"LOAD resultant {mag:.4g} N   direction {direction}",
+                  f"{len(entries)} entry(ies): {per_entry}"
+                  + (f"; +{len(entries) - 3} more" if len(entries) > 3 else "")]
+
+        png, ann_info = _annotate_render(
+            png, d, view_dir, edges=True, callouts=True, scale=True, frame=frame,
+            emphasis={"matches": all_matches, "mode": "study_setup",
+                      "label": "FIXTURE+LOAD", "palette": palette},
+            arrows=arrows, banner=banner,
+            out_png=render_output_path(stem, ".png"))
+
+        emp = (ann_info or {}).get("emphasis") or {}
+        visible = set(emp.get("visible_sids") or [])
         fix_nodes = sum(g["n_points"] for g in fix_groups)
         load_nodes = sum(g["n_points"] for g in load_groups)
         legend = (
@@ -989,14 +1052,26 @@ def register_cad_render_tools(mcp: FastMCP) -> None:
             f"LOAD ({_LOAD_COLOUR}): resultant {mag:.4g} N, direction {direction}, "
             f"vector [{resultant[0]:.4g}, {resultant[1]:.4g}, {resultant[2]:.4g}] N "
             f"({'; '.join(terms)}); {_sids_areas_text(load_groups)}"
-            f" — {load_nodes} solver sample node(s) across {len(load_matches)} face(s)."
+            f" — {load_nodes} solver sample node(s) across {len(load_matches)} face(s). "
+            f"{len(ann_info.get('arrows') or [])} of {len(entries)} load entry(ies) are "
+            f"drawn as a {_LOAD_COLOUR} arrow whose tip sits on that entry's face centroid, "
+            f"aimed along that entry's own force vector and scaled to its magnitude (a "
+            f"vector pointing at the camera becomes a ringed dot/cross), with the resultant "
+            f"burned into the bottom band."
         )
         if not emp.get("target_px"):
+            # Name the REAL cause. "no tessellation" was printed for every empty mask,
+            # including the ordinary case of a camera that simply faces none of the BC
+            # faces — which reads as an engine failure and sends the caller nowhere.
+            why = emp.get("note") or (ann_info or {}).get("note")
+            if not why and emp.get("hidden_sids"):
+                why = ("this camera faces none of them: "
+                       + ", ".join(emp["hidden_sids"]) + " — re-call with view= a direction "
+                       "that sees them")
             legend += (" WARNING: the colour overlay could NOT be painted ("
-                       + str(emp.get("note") or (ann_info or {}).get("note")
-                             or "no tessellation")
-                       + ") — this image is the plain render, so read the sids above rather "
-                         "than the pixels.")
+                       + str(why or "no tessellation")
+                       + ") — the load arrows and the resultant band are still drawn, but "
+                         "read the sids above rather than the painted pixels.")
         else:
             hidden = [s for g in (fix_groups + load_groups) for s in g["sids"]
                       if s not in visible]

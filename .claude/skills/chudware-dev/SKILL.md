@@ -192,10 +192,29 @@ judgment).
   `ok:false, stop_reason:"provider_error"` even though Chudcode emitted a terminal
   `agent_end`; `scripts/run_mission.py` exits non-zero on it. Hunter's `chud config` carries
   `retry.maxDelayMs=1800000, retry.maxRetries=4` so a 429 with a 17-minute retry-after is
-  waited out instead of ending the mission. Sim ladders from one call are sequential, and
-  the memory governor budgets `min(CHUDWARE_MEM_FRAC×total, avail−CHUDWARE_HEADROOM_GB)` at
-  solve time — an explicit `sizes_mm` leg is coarsened to that budget, so free RAM (close
-  builds/GUI) before a fine leg rather than raising the fraction.
+  waited out instead of ending the mission; a retry-after above it ends the turn. Sim
+  ladders from one call are sequential, and the memory governor budgets
+  `min(CHUDWARE_MEM_FRAC×total, avail−CHUDWARE_HEADROOM_GB)` at solve time — an explicit
+  `sizes_mm` leg is coarsened to that budget, so free RAM (close builds/GUI) before a fine
+  leg rather than raising the fraction. The coarsening is a number, not prose (2026-09-07):
+  every result carries `mesh_quality.char_len_mm` (delivered size, null when no mesh
+  length exists), ladder rows carry `delivered_size_mm` beside the requested `size_mm`,
+  and the reply's `size_delivery` names legs outside 0.8–1.25× — the `.vtu` name still
+  carries the REQUESTED `h`. `min_size_mm` on `run_fea_static|convergence|contact` lowers
+  the size-band floor when a feature-resolution refusal names a size below it.
+- **The turn budget is the caller's (2026-09-07).** `agent_admin_turn` forwards `timeout`
+  to `chudcode_host.wait_for_idle`; without it the host's 2-hour absolute cap kills a long
+  turn with `Timed out waiting for agent_end` regardless of `run_mission.py --timeout-s`
+  (the driver now sends it and waits `--timeout-s + 60`). OAuth account balancing is
+  sticky on the **Chudware session id**, not the resumed Chudcode history: a session id
+  pinned to an exhausted account keeps 429-ing after `chud usage` shows a fresh account —
+  resume the same `.jsonl` under a new `--session-id` (`chud dry-balance <model>` shows
+  where fresh ids land).
+- **`render_study_setup` figures are load-vector-specific (2026-09-07).** One arrow per
+  load entry through the engine frame, a bottom banner with resultant/direction/per-entry
+  vectors; multi-body docs paint (AICM face ids are per-body 1-based — `_mesh_topo_index`
+  offsets them into `doc_query`'s running numbering; the old last-body map silently
+  aliased body A's faces onto body B).
 - **Chat sessions are keyed by project (2026-09-04).** `Conversation.projectDir` is stamped
   once at creation from `convProjectDir(st)` (= `st.workspaceDir`, else `plmProjectPath()`) —
   the same value the composer sends Chudcode as `workspace_dir`. `index.json` v3 keeps

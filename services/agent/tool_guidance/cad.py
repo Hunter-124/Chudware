@@ -660,7 +660,10 @@ ENTRIES: dict[str, dict[str, Any]] = {
     "render_study_setup": {
         "prompt_note": (
             "The fixture/load FIGURE an FEA report needs beside its stress plot: fixtures "
-            "painted magenta, load faces violet, rest desaturated. fixtures/load are "
+            "painted magenta, load faces violet, rest desaturated, plus ONE ARROW PER LOAD "
+            "ENTRY (tip on that entry's face centroid, along its own force vector, scaled "
+            "to its magnitude) and the resultant burned into a band at the bottom, so two "
+            "cases on the same faces are different figures. fixtures/load are "
             "EXACTLY run_fea_static's dialect and are resolved by the same gates, so pass "
             "the identical arguments and draw this BEFORE the solve — a refusal here is "
             "the setup error the solver would have raised. Omit view to let the occlusion "

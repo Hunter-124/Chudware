@@ -145,6 +145,16 @@ struct MeshQualityFacts {
     int hanging_elems_dropped = 0;
     // Thinnest wall in element sizes (mesher.h MeshOut). 0 = unavailable.
     double thin_wall_ratio = 0.0;
+    // The discretization the study ACTUALLY solved: the mesh's characteristic
+    // element length in mm (mesher.h MeshOut::char_len_mm — for a multi-body
+    // mesh the worst, i.e. smallest, of the parts). This is the DELIVERED size,
+    // not the requested one: the memory governor coarsens a request against its
+    // element budget, and a convergence ladder asked for 1.6/1.2/0.9 mm was
+    // delivered at 5.62/5.43/5.42 mm with nothing in the result saying so. 0
+    // means the route has no mesh length to report (an inline points/tets mesh
+    // Chudware never sized), and it is emitted as null rather than as a
+    // plausible-looking zero.
+    double char_len_mm = 0.0;
     // ── The refined region's own quality (mesher.h MeshOut) ──────────────────
     // A local size contract is delivered by conforming bisection, which is
     // shapely nowhere except at the interface it was asked for: the ME 490
@@ -186,6 +196,12 @@ json mesh_quality_json(const MeshQualityFacts& quality, std::size_t n_nodes,
     json out = {{"n_nodes", n_nodes},
                 {"n_elems", n_elems},
                 {"order", nodes_per_elem == 10 ? 2 : 1}};
+    // Beside n_elems because it is the same fact from the other side, and it is
+    // the one a reader compares against what they asked for.
+    out["char_len_mm"] =
+        (std::isfinite(quality.char_len_mm) && quality.char_len_mm > 0.0)
+            ? json(quality.char_len_mm)
+            : json(nullptr);
     static constexpr const char* kMetrics[] = {
         "aspect_min", "aspect_avg", "aspect_max", "jacobian_min",
         "pct_poor",   "min_tet_volume_mm3",       "max_tet_edge_ratio"};
@@ -973,6 +989,9 @@ bool resolve_mesh(const json &study, std::vector<double> &points,
     quality.max_tet_edge_ratio = mesh->max_tet_edge_ratio;
     quality.connected_components = mesh->connected_components;
     quality.thin_wall_ratio = mesh->thin_wall_ratio;
+    // The size the mesher DELIVERED (after its own governor), which for a
+    // contact study is the refined mesh's — `mesh` is reseated above.
+    quality.char_len_mm = mesh->char_len_mm;
     quality.lonely_nodes_repaired = mesh->lonely_nodes_repaired;
     quality.lonely_nodes_remaining = mesh->lonely_nodes_remaining;
     quality.hanging_elems_dropped = mesh->hanging_elems_dropped;

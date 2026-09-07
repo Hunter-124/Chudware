@@ -413,6 +413,23 @@ def test_convergence_legs_write_one_field_each_and_the_reply_names_the_released_
         assert path.stat().st_size > 0, f"leg {k} wrote no field"
     assert len({Path(r["vtu_path"]).name.split("_leg")[0] for r in rows}) == 1, rows
 
+    # The DELIVERED discretization is a NUMBER on every solved row, not something a
+    # reader reverse-engineers out of governor prose (a ladder asked for 1.6/1.2/0.9 mm
+    # was meshed at 5.62/5.43/5.42 mm and only the prose said so). The .vtu name above
+    # carries the REQUESTED size; this is what actually solved.
+    for k, row in enumerate(rows):
+        delivered = row["delivered_size_mm"]
+        assert isinstance(delivered, (int, float)) and not isinstance(delivered, bool), row
+        assert math.isfinite(delivered) and delivered > 0.0, row
+        assert row["mesh_quality"]["char_len_mm"] == delivered, row["mesh_quality"]
+    delivery = out["size_delivery"]
+    assert [e["leg"] for e in delivery] == [0, 1], delivery
+    for entry, row in zip(delivery, rows):
+        assert entry["requested_mm"] == row["size_mm"], entry
+        assert entry["delivered_mm"] == row["delivered_size_mm"], entry
+        assert entry["ratio"] == pytest.approx(
+            entry["delivered_mm"] / entry["requested_mm"], rel=1e-3), entry
+
     released = out.get("released_leg")
     assert released, out
     assert released["index"] == 1, released

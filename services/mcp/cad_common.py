@@ -4894,6 +4894,36 @@ def _doc_mesh(doc_id: str) -> Optional[dict]:
     return mesh
 
 
+def _mesh_topo_index(mesh: dict) -> tuple:
+    """(face_by_topo, edge_by_topo): 1-based doc_query topo id -> index into mesh["faces"] /
+    mesh["edges"], across EVERY body in the document.
+
+    AICM `face_id`/`edge_id` are 1-based TopExp indices WITHIN their own body, while
+    doc_query enumerates the whole document body-by-body with ONE running counter — so the
+    two agree only on the first body. Offsetting each body by the subshape count of every
+    preceding body (ascending body id, the order doc_query walks them) is the join.
+
+    The overlay used to build these maps from the LAST body alone, which on a multi-body doc
+    failed twice over: every face enumerated after the first body fell out of the map (no
+    mask, "no tessellation"), and the first body's ids silently ALIASED onto the last body's
+    faces (a study figure painting the wrong solid). Single-body docs were unaffected, which
+    is why it survived — same class of bug as the doc_query/face_points last-body join.
+    """
+    out: list = []
+    for recs, id_key in ((mesh.get("faces") or [], "face_id"),
+                         (mesh.get("edges") or [], "edge_id")):
+        counts: dict = {}
+        for r in recs:
+            b = int(r["body"])
+            counts[b] = max(counts.get(b, 0), int(r[id_key]))
+        offset, acc = {}, 0
+        for b in sorted(counts):
+            offset[b] = acc
+            acc += counts[b]
+        out.append({offset[int(r["body"])] + int(r[id_key]): i for i, r in enumerate(recs)})
+    return out[0], out[1]
+
+
 def _mesh_render_frame(mesh: dict, view_dir: tuple,
                        W: int = _RENDER_W, H: int = _RENDER_H) -> dict:
     """The EXACT orthographic frame core render_view_to_rgb builds for this mesh.
@@ -5069,11 +5099,14 @@ def _target_mesh_tris(mesh: Optional[dict], doc_id: str, matches: list):
             if str(m.get("sid") or "") in topo["face_sid"]}
     if not want:
         return None
+    face_by_topo, _e = _mesh_topo_index(mesh)
     sel = np.zeros(mesh["idx"].shape[0], dtype=bool)
     hit = False
-    for fr in mesh["faces"]:
-        if fr["body"] != mesh["last_body"] or fr["face_id"] not in want:
+    for t in want:
+        fi = face_by_topo.get(t)
+        if fi is None:
             continue
+        fr = mesh["faces"][fi]
         sel[fr["first_tri"]:fr["first_tri"] + fr["tri_count"]] = True
         hit = True
     return sel if hit else None
@@ -5339,9 +5372,109 @@ def _draw_scale_bar(draw, font, frame: dict, size_mm: tuple, W: int, H: int) -> 
     return mm
 
 
+# ---------------------------------------------------------------- load vectors on a figure
+# A boundary-condition figure that paints only WHICH faces are loaded cannot tell an axial
+# 136 N from a radial 980 N: two studies sharing a face pair render byte-identical, which is
+# indistinguishable from a copy-paste mistake in an evidence folder. The load VECTOR is drawn.
+_ARROW_MIN_FRAC = 0.075   # shortest arrow (smallest entry), as a fraction of min(W, H)
+_ARROW_MAX_FRAC = 0.22    # longest arrow (the largest-magnitude entry)
+_ARROW_AXIAL_TOL = 0.12   # projected/world length below this = the vector points at the eye
+
+
+def _draw_load_arrows(draw, font, arrows: list, frame: dict, W: int, H: int,
+                      taken: list) -> list:
+    """One arrow per load entry, reprojected through `frame` — the camera every other
+    overlay uses — so the arrow lands on the face it loads.
+
+    `arrows` is [{"at": world xyz anchor, "vec": world force, "mag": N, "rel": 0..1,
+    "rgb": (r,g,b), "label": str|None}]. The arrow flies INTO its anchor (tail upstream
+    along the force direction, tip ON the face centroid) so the paint under the tip stays
+    readable, and its length interpolates `rel` between a legible floor and a frame-relative
+    ceiling — the largest entry is the longest arrow, and equal magnitudes draw equal.
+    A vector within a few degrees of the view axis projects to nothing; that entry gets the
+    head-on glyph a drawing uses (ringed dot coming at the reader, ringed cross going away)
+    instead of a one-pixel smudge. Returns a record per drawn entry for the caption."""
+    out: list = []
+    span = float(min(W, H))
+    lo, hi = _ARROW_MIN_FRAC * span, _ARROW_MAX_FRAC * span
+    for a in arrows or []:
+        v = _v3(a.get("vec"))
+        if math.sqrt(sum(c * c for c in v)) < 1e-12:
+            continue
+        u = _vnorm(v)
+        at = _v3(a.get("at"))
+        S = _screen_xyz([at, [at[i] + u[i] for i in range(3)]], frame)
+        tipx, tipy = float(S[0, 0]), float(S[0, 1])
+        dx, dy = float(S[1, 0] - S[0, 0]), float(S[1, 1] - S[0, 1])
+        dz = float(S[1, 2] - S[0, 2])
+        plen = math.hypot(dx, dy)
+        L = lo + (hi - lo) * max(0.0, min(1.0, float(a.get("rel", 1.0))))
+        rgb = tuple(int(c) for c in a["rgb"])
+        rec = {"label": a.get("label"), "mag": a.get("mag"), "head_on": False,
+               "tip": (int(round(tipx)), int(round(tipy)))}
+        if plen < _ARROW_AXIAL_TOL * max(frame.get("scale", 1.0), 1e-9):
+            r = max(7.0, 0.18 * L)
+            draw.ellipse([tipx - r, tipy - r, tipx + r, tipy + r], outline=rgb, width=3)
+            if dz > 0:                       # larger depth = nearer the camera
+                q = r * 0.34
+                draw.ellipse([tipx - q, tipy - q, tipx + q, tipy + q], fill=rgb)
+            else:
+                k = r * 0.62
+                draw.line([(tipx - k, tipy - k), (tipx + k, tipy + k)], fill=rgb, width=3)
+                draw.line([(tipx - k, tipy + k), (tipx + k, tipy - k)], fill=rgb, width=3)
+            rec["head_on"] = True
+            tail = (tipx, tipy - r - 4.0)
+        else:
+            ux, uy = dx / plen, dy / plen
+            tail = (tipx - ux * L, tipy - uy * L)
+            hl = max(8.0, min(20.0, 0.34 * L))
+            hw = hl * 0.5
+            bx, by = tipx - ux * hl, tipy - uy * hl
+            draw.line([tail, (bx, by)], fill=rgb, width=4)
+            draw.line([tail, (bx, by)], fill=(0, 0, 0), width=1)
+            draw.polygon([(tipx, tipy), (bx - uy * hw, by + ux * hw),
+                          (bx + uy * hw, by - ux * hw)], fill=rgb, outline=(0, 0, 0))
+        rec["tail"] = (int(round(tail[0])), int(round(tail[1])))
+        if a.get("label"):
+            _place_label(draw, font, (max(2, min(int(tail[0]), W - 3)),
+                                      max(2, min(int(tail[1]), H - 3))),
+                         str(a["label"]), rgb, W, H, taken)
+        out.append(rec)
+    return out
+
+
+def _draw_bottom_banner(draw, font, lines: list, W: int, H: int, rgb: tuple,
+                        bottom: int) -> Optional[tuple]:
+    """Burn `lines` into a dark full-width band whose BOTTOM edge sits at y=`bottom`.
+
+    Numbers a figure states only in its caption are lost the moment the PNG is pasted into a
+    report, so the load resultant is drawn INTO the pixels. `bottom` is the caller's, because
+    the scale bar owns the last ~46 px of the frame. Returns the band rect (or None)."""
+    if not lines:
+        return None
+    heights: list = []
+    for t in lines:
+        try:
+            b = draw.textbbox((0, 0), t, font=font)
+            heights.append(b[3] - b[1] + 5)
+        except Exception:  # noqa: BLE001
+            heights.append(17)
+    y0 = max(0, int(bottom) - (sum(heights) + 9))
+    rect = (0, y0, W, int(bottom))
+    draw.rectangle(list(rect), fill=(18, 20, 26))
+    draw.line([(0, y0), (W, y0)], fill=rgb, width=2)
+    y = y0 + 5
+    for t, h in zip(lines, heights):
+        draw.text((8, y), t, font=font, fill=rgb)
+        y += h
+    return rect
+
+
 def _doc_topo_maps(doc_id: str) -> dict:
     """{"face": [match,...], "edge": [match,...]} in doc_query enumeration order, so index i
-    is topo id i+1 == the AICM face_id/edge_id. Also gives sid -> topo lookups."""
+    is topo id i+1 — the id the whole document is addressed by. On a multi-body doc that is
+    NOT the AICM per-body face_id/edge_id; _mesh_topo_index does that join. Also gives
+    sid -> topo lookups."""
     out = {"face": [], "edge": [], "face_sid": {}, "edge_sid": {}}
     for of in ("face", "edge"):
         try:
@@ -5417,7 +5550,9 @@ def _annotate_render(src_png: str, doc_id: str, view_dir: tuple,
                      highlight=None, callouts: bool = True, edges: bool = True,
                      scale: bool = True, frame: Optional[dict] = None,
                      out_png: Optional[str] = None,
-                     emphasis: Optional[dict] = None) -> tuple:
+                     emphasis: Optional[dict] = None,
+                     arrows: Optional[list] = None,
+                     banner: Optional[list] = None) -> tuple:
     """Overlay B-rep edges, highlights, feature callouts and a scale bar onto a render.
 
     src_png MUST be the engine render taken along `view_dir` (this reprojects the SAME
@@ -5431,13 +5566,17 @@ def _annotate_render(src_png: str, doc_id: str, view_dir: tuple,
     and how much of the frame they hold. This is the one emphasis implementation; it uses the
     same exact visible-face masks as `highlight`, not a splat of projected sample points.
 
+    `arrows` draws world force/direction vectors through the SAME reprojection
+    (_draw_load_arrows), and `banner` burns caption lines into a band at the bottom of the
+    frame (_draw_bottom_banner), so a figure carries its own numbers into a report.
+
     Returns (path, info) where `info` feeds _render_annotation_caption. On any failure the
     ORIGINAL png path is returned with info["available"] False — the caller's render is never
     lost to an overlay problem."""
     info: dict = {"available": False, "edges": False, "hlr": False, "highlights": [],
                   "callouts": [], "callouts_omitted": [], "hidden_features": [],
                   "hidden_faces": 0, "scale_bar_mm": None, "bbox_mm": None,
-                  "note": None, "part_name": None, "emphasis": None}
+                  "note": None, "part_name": None, "emphasis": None, "arrows": []}
     try:
         import numpy as np  # noqa: PLC0415
         from PIL import Image as PILImage, ImageDraw  # noqa: PLC0415
@@ -5452,6 +5591,25 @@ def _annotate_render(src_png: str, doc_id: str, view_dir: tuple,
         info["highlights"] = [{"label": h["label"], "colour_name": h["colour_name"],
                                "sids": [], "error": h.get("error") or "no mesh"}
                               for h in hl_specs]
+        # The load vector is not a mesh overlay: with the engine's own frame in hand it can
+        # still be drawn, so a setup figure never degrades to one that hides its own load.
+        if frame and (arrows or banner):
+            try:
+                with PILImage.open(src_png) as im0:
+                    im = im0.convert("RGB")
+                draw = ImageDraw.Draw(im)
+                W, H = im.size
+                fnt = _annot_font(13)
+                band = _draw_bottom_banner(draw, fnt, banner, W, H,
+                                           tuple((arrows or [{}])[0].get("rgb")
+                                                 or (240, 242, 248)), H - 4)
+                info["arrows"] = _draw_load_arrows(draw, fnt, arrows, frame, W, H,
+                                                   [band] if band else [])
+                out_png = out_png or _tmp(".png")
+                im.save(out_png, format="PNG")
+                return out_png, info
+            except Exception as e:  # noqa: BLE001
+                info["note"] += f"; load overlay failed ({type(e).__name__}: {e})"
         return src_png, info
 
     try:
@@ -5473,10 +5631,7 @@ def _annotate_render(src_png: str, doc_id: str, view_dir: tuple,
 
         arr = np.asarray(im, dtype=np.float64)
         topo = _doc_topo_maps(doc_id)
-        face_by_topo = {f["face_id"]: i for i, f in enumerate(mesh["faces"])
-                        if f["body"] == mesh["last_body"]}
-        edge_by_topo = {e["edge_id"]: i for i, e in enumerate(mesh["edges"])
-                        if e["body"] == mesh["last_body"]}
+        face_by_topo, edge_by_topo = _mesh_topo_index(mesh)
 
         def _topos_for(matches: list) -> tuple:
             ftop, etop = set(), set()
@@ -5613,6 +5768,16 @@ def _annotate_render(src_png: str, doc_id: str, view_dir: tuple,
             ay = max(2, min(int(anchor[1]), H - 3))
             _place_label(draw, font, (ax, ay), t["label"], tuple(t["rgb"]), W, H, emp_taken)
 
+        # ---- load vectors + burned-in banner -------------------------------------------
+        # After the emphasis paint (an arrow the desaturation pass could grey out is no
+        # arrow) and before the highlight/callout chips, which then route around both.
+        band = _draw_bottom_banner(draw, _annot_font(12), banner, W, H,
+                                   tuple((arrows or [{}])[0].get("rgb") or (240, 242, 248)),
+                                   H - (48 if scale else 4))
+        if band:
+            emp_taken.append(band)
+        info["arrows"] = _draw_load_arrows(draw, font, arrows, frame, W, H, emp_taken)
+
         # ---- highlight outlines + leader labels ---------------------------------------
         taken: list = emp_taken   # one registry, so a chip never lands on an emphasis label
         for h in hl_draw:
@@ -5693,12 +5858,14 @@ def _annotate_render(src_png: str, doc_id: str, view_dir: tuple,
         # ---- what the camera cannot see ------------------------------------------------
         if FI is not None:
             seen = set(np.unique(FI).tolist()) - {-1}
+            topo_of_face = {fi: t for t, fi in face_by_topo.items()}
             hidden = []
-            for i, fr in enumerate(mesh["faces"]):
-                if i in seen or fr["body"] != mesh["last_body"]:
+            for i in range(len(mesh["faces"])):
+                t = topo_of_face.get(i)
+                if i in seen or t is None:
                     continue
-                m = topo["face"][fr["face_id"] - 1] if fr["face_id"] - 1 < len(topo["face"]) else {}
-                tag = str(m.get("sid") or f"face#{fr['face_id']}")
+                m = topo["face"][t - 1] if t - 1 < len(topo["face"]) else {}
+                tag = str(m.get("sid") or f"face#{t}")
                 bits = [b for b in (m.get("side"), m.get("surf"), m.get("concavity")) if b]
                 hidden.append(f"{tag}" + (f" ({'/'.join(bits)})" if bits else ""))
             info["hidden_faces"] = len(hidden)

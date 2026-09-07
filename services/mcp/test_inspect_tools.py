@@ -1164,3 +1164,97 @@ class TestRenderStudySetup:
             self._tool()(fixtures=["back"],
                          load=[{"face": "top", "force": [0, 0, 0]}],
                          doc_id="doc-test")
+
+
+# ------------------------------------------------------- engine-backed study-setup figure
+# Two defects the monkeypatched fixtures above structurally cannot catch: the multi-body
+# tessellation join (the fake mesh has one body) and the load VECTOR reaching the pixels
+# (byte-identity is only meaningful against a real render). Small boxes, no solve.
+
+from services.mcp import core_bridge as _cb  # noqa: E402
+
+
+def _two_box_doc() -> str:
+    """Two 20 mm boxes 30 mm apart in X — separate bodies, NOT touching."""
+    doc = _cb.call("doc_new", {"name": "study_setup_two_boxes"})["doc_id"]
+    _cb.call("doc_apply_ops", {"doc_id": doc, "ops": [
+        {"op": "add_feature", "feature": {
+            "type": "box", "name": "A",
+            "params": {"length": {"value": 20}, "width": {"value": 20},
+                       "height": {"value": 20}}}},
+        {"op": "add_feature", "feature": {
+            "type": "transform", "name": "B",
+            "params": {"translate": [30.0, 0.0, 0.0], "copy": True}}},
+    ]})
+    return doc
+
+
+@pytest.fixture(scope="module")
+def two_box_doc() -> str:
+    return _two_box_doc()
+
+
+@pytest.fixture(scope="module")
+def two_box_faces(two_box_doc) -> dict:
+    ms = _cb.call("doc_query", {"doc_id": two_box_doc, "query": {"of": "face"}})["matches"]
+    a = [m for m in ms if m["centroid"][0] < 20]
+    b = [m for m in ms if m["centroid"][0] >= 20]
+    return {"a_top": next(m["sid"] for m in a if m.get("side") == "top"),
+            "a_bot": next(m["sid"] for m in a if m.get("side") == "bottom"),
+            "b_top": next(m["sid"] for m in b if m.get("side") == "top")}
+
+
+@pytest.mark.skipif(not _cb.available(),
+                    reason="libchudware not staged; engine-backed render unavailable")
+class TestRenderStudySetupOnTheEngine:
+    """The study figure against the real tessellation: every body's faces paint, and the
+    load vector is part of the raster."""
+
+    def _tool(self):
+        from mcp.server.fastmcp import FastMCP
+        mcp = FastMCP("test-study-setup-engine")
+        ct.register_cad_tools(mcp)
+        return mcp._tool_manager._tools["render_study_setup"].fn
+
+    def _png(self, result) -> bytes:
+        img = result[0]
+        return Path(getattr(img, "path", img)).read_bytes()
+
+    def test_bc_faces_on_two_different_bodies_are_both_painted(
+            self, two_box_doc, two_box_faces):
+        """Fixture on body A, load on body B. The overlay used to index only the LAST
+        body's tessellation, so body B's face was unknown (empty mask, 'no tessellation')
+        while body A's id silently aliased onto a body-B face — the figure painted the
+        wrong solid or nothing at all."""
+        _img, caption = self._tool()(
+            fixtures=[two_box_faces["a_top"]],
+            load=[{"face": two_box_faces["b_top"], "force": [0, 0, -100]}],
+            view="iso", doc_id=two_box_doc)
+        assert "WARNING: the colour overlay could NOT be painted" not in caption, caption
+        seen = caption.split("Visible from this camera: ", 1)[1].split(".")[0]
+        assert two_box_faces["a_top"] in seen and two_box_faces["b_top"] in seen, seen
+
+    def test_the_same_faces_with_a_different_load_are_a_different_figure(
+            self, two_box_doc, two_box_faces):
+        """The reported bug: an axial and a radial case on one face pair rendered
+        byte-identical, so an evidence reviewer could not tell the two apart."""
+        args = dict(fixtures=[two_box_faces["a_bot"]], view="iso", doc_id=two_box_doc)
+        axial = self._png(self._tool()(
+            load=[{"face": two_box_faces["b_top"], "force": [0, 0, -100]}], **args))
+        radial = self._png(self._tool()(
+            load=[{"face": two_box_faces["b_top"], "force": [0, -700, 0]}], **args))
+        assert axial != radial
+
+    def test_a_zero_resultant_pair_still_draws_its_own_entries(
+            self, two_box_doc, two_box_faces):
+        """Two opposite entries cancel to zero net force — a couple. The resultant is not
+        the load: the figure must still differ from the single-entry one."""
+        args = dict(fixtures=[two_box_faces["a_bot"]], view="iso", doc_id=two_box_doc)
+        one = self._png(self._tool()(
+            load=[{"face": two_box_faces["b_top"], "force": [0, 0, -100]}], **args))
+        couple = self._tool()(
+            load=[{"face": two_box_faces["b_top"], "force": [0, 0, -100]},
+                  {"face": two_box_faces["a_top"], "force": [0, 0, 100]}], **args)
+        assert "resultant 0 N" in couple[1]
+        assert "2 of 2 load entry(ies) are drawn" in couple[1]
+        assert self._png(couple) != one

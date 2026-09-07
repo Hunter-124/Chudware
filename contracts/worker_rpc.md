@@ -995,3 +995,28 @@ mesh the caller just named, so it is a `ValueError` rather than a solve.
 It is echoed exactly where the stated size is echoed today: the persisted study record
 beside `target_size_mm`, and each `run_fea_convergence` table row beside `size_mm`. Both
 appear only when stated.
+
+## 26. Delivered discretization — `mesh_quality.char_len_mm` (append-only, 2026-09-07)
+
+Every result that carries `mesh_quality` (`sim_run_static`, its contact and refusal
+envelopes, `sim_run_modal`, `sim_run_thermal`) now carries `mesh_quality.char_len_mm`
+beside `n_elems`: the DELIVERED characteristic element length in mm of the mesh that was
+solved — `MeshOut::char_len_mm` (`core/sim/mesher.h`), the smallest part's value on a
+multi-body mesh — not the requested `target_size_mm`. It is `null`, never `0`, on a route
+with no mesh length to report (an inline `points`/`tets` study Chudware never sized, which
+includes every `adapt` pass; that route states its size per pass in
+`adapt.passes[].element_size_mm`).
+
+This exists because the two numbers routinely differ: the memory governor sizes against an
+element budget (`core/sim/mesh_size_band.cpp`), and a convergence ladder requested at
+1.6 / 1.2 / 0.9 mm was delivered at 5.62 / 5.43 / 5.42 mm with the substitution visible
+only in governor prose.
+
+At the MCP seam, `run_fea_convergence` puts it on every solved table row as
+`delivered_size_mm` (`size_mm` stays the REQUESTED size) and adds a reply-level
+`size_delivery: [{leg, requested_mm, delivered_mm, ratio}]`, one entry per solved leg,
+`ratio = delivered/requested` (`null` when either side is unavailable, e.g. a `fineness`
+rung). When any leg's ratio leaves `0.8x .. 1.25x`, the reply's existing `note` gains one
+sentence naming those legs — no second note field. The per-leg `.vtu` filename keeps
+carrying the REQUESTED size (`_h<size>_`); `delivered_size_mm` is the truth about the mesh
+behind the file.

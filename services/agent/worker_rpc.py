@@ -2954,6 +2954,12 @@ def _agent_admin_turn(params: dict, _emit: Callable) -> dict:
         host_params["images"] = raw_params["images"][:_ATTACH_MAX]
     if isinstance(raw_params.get("host_uris"), list):
         host_params["host_uris"] = raw_params["host_uris"]
+    # Turn budget. Without it the host waits on its 2-hour absolute cap, which killed
+    # ME 490 convergence turns mid-solve while the mission driver had asked for 4 h.
+    raw_timeout = raw_params.get("timeout")
+    if isinstance(raw_timeout, (int, float)) and not isinstance(raw_timeout, bool):
+        if math.isfinite(raw_timeout) and raw_timeout > 0:
+            host_params["timeout"] = float(raw_timeout)
 
     event_context = {
         "run_id": run_id,

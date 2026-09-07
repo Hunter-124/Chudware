@@ -2265,7 +2265,7 @@
    "prompt_note": "add_features batches already append a compact auto-readback — read that first; pair this with sketch_health for the final verify loop."
   },
   "render_study_setup": {
-   "prompt_note": "The fixture/load FIGURE an FEA report needs beside its stress plot: fixtures painted magenta, load faces violet, rest desaturated. fixtures/load are EXACTLY run_fea_static's dialect and are resolved by the same gates, so pass the identical arguments and draw this BEFORE the solve — a refusal here is the setup error the solver would have raised. Omit view to let the occlusion scorer pick the camera that sees the most of those faces; save_path also writes the embeddable PNG."
+   "prompt_note": "The fixture/load FIGURE an FEA report needs beside its stress plot: fixtures painted magenta, load faces violet, rest desaturated, plus ONE ARROW PER LOAD ENTRY (tip on that entry's face centroid, along its own force vector, scaled to its magnitude) and the resultant burned into a band at the bottom, so two cases on the same faces are different figures. fixtures/load are EXACTLY run_fea_static's dialect and are resolved by the same gates, so pass the identical arguments and draw this BEFORE the solve — a refusal here is the setup error the solver would have raised. Omit view to let the occlusion scorer pick the camera that sees the most of those faces; save_path also writes the embeddable PNG."
   },
   "render_views": {
    "prompt_note": "Full 6-ortho+iso grid — catches back/bottom features a single iso hides; lighter 4-tile alternative → contact_sheet."

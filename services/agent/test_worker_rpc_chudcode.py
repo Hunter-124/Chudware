@@ -437,6 +437,7 @@ def test_persistent_reuse_one_time_history_seed_and_mapped_streaming(online_lane
             run_id="run-2",
             request="Continue",
             history=history,
+            timeout=14400,
         ),
         emitted.append,
     )
@@ -451,6 +452,10 @@ def test_persistent_reuse_one_time_history_seed_and_mapped_streaming(online_lane
     assert "Earlier question" in online_lane.host.turns[0]["request"]
     assert online_lane.host.turns[1]["request"] == "Continue"
     assert online_lane.host.turns[0]["system_prompt"] == "RESOLVED ROLE PROMPT"
+    # The turn budget is the caller's (mission driver --timeout-s); an absent one leaves
+    # the host's absolute cap in force rather than inventing a number.
+    assert "timeout" not in online_lane.host.turns[0]
+    assert online_lane.host.turns[1]["timeout"] == 14400.0
     assert [tool.name for tool in online_lane.host.turns[0]["host_tools"]] == [
         "cad_tool",
         "enable_tools",

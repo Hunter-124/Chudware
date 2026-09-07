@@ -203,7 +203,10 @@ ENTRIES: dict[str, dict[str, Any]] = {
             "Pass vtu_dir=/abs/dir to get one .vtu per leg: the reply's "
             "released_leg then names the finest solved leg's field, which "
             "sim_evidence_packet hashes — without it the ladder has no "
-            "field and needs a fourth solve."
+            "field and needs a fourth solve. min_size_mm=<mm> lowers the "
+            "element-size band floor for EVERY leg when a leg is refused for "
+            "needing an element smaller than that floor to resolve a feature; "
+            "it costs elements and memory, so keep the ladder's sizes coarse."
         ),
         "timeout_s": fea_timeout_s(FEA_SOLVER_LEGS["run_fea_convergence"]),
     },
@@ -334,7 +337,11 @@ ENTRIES: dict[str, dict[str, Any]] = {
             "answer is the artefact, not the part: re-run with "
             'plasticity={"hardening_mpa": 1200} so the seat yields and the patch '
             "spreads (the active-set loop runs inside each load increment), then quote "
-            "the plastic contact_area_mm2 / mean pressure and the plasticity block."
+            "the plastic contact_area_mm2 / mean pressure and the plasticity block. "
+            "min_size_mm=<mm> lowers the element-size band floor when the run is "
+            "refused for needing an element smaller than that floor to resolve a "
+            "feature away from the interface; it costs elements and memory, so pair it "
+            "with a coarse mesh_size_mm."
         ),
         "timeout_s": _FEA_TIMEOUT_S,
     },
@@ -375,7 +382,10 @@ ENTRIES: dict[str, dict[str, Any]] = {
             "appearance only. Repeat at a finer mesh and compare governing stress/deflection "
             "(<10% change) before PASS. mesh_size_mm=<mm> is the exact element size "
             "(mutually exclusive with mesh_fineness) — use it with vtu_path to re-solve "
-            "one run_fea_convergence leg on its own mesh. "
+            "one run_fea_convergence leg on its own mesh. min_size_mm=<mm> lowers the "
+            "element-size band floor when a run is refused for needing an element "
+            "smaller than that floor to resolve a feature; it costs elements and "
+            "memory, so pair it with a coarse mesh_size_mm. "
             'plasticity={"hardening_mpa": 1200} switches the material to small-strain '
             "J2 (yield_mpa defaults to the material's own; hardening_mpa is a TANGENT "
             "MODULUS in MPa, 0 = perfectly plastic): use it when an elastic peak sits "

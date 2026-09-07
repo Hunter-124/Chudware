@@ -966,3 +966,32 @@ response) and any study carrying `adapt` (the ZZ error estimator is derived for 
 elasticity). At the MCP seam it is the `plasticity=` parameter of `run_fea_static` and
 `run_fea_contact` and is NOT accepted inside the `material` dict, so it cannot reach a tool
 that would silently drop it.
+
+## 25. Size-band floor at the MCP seam — `study.min_size_mm` (append-only, 2026-09-07)
+
+`study.min_size_mm` is unchanged in the engine (section 18 already lists it among the
+`sim_mesh` controls, and `sim_run_static` reads it from the study through
+`core/sim/fea_run.cpp resolve_mesh`). What is new is that three MCP tools can state it:
+
+| tool | parameter | reaches |
+|---|---|---|
+| `run_fea_static` | `min_size_mm?: float` | `study.min_size_mm` |
+| `run_fea_convergence` | `min_size_mm?: float` | every leg's `study.min_size_mm` |
+| `run_fea_contact` | `min_size_mm?: float` | `study.min_size_mm` |
+
+It is the element-size band FLOOR in mm — `MeshSizeBand.min_len`, which defaults to half
+the base size — and it is what bounds the mesher's feature-resolution descent
+(`core/sim/mesher.cpp`). Without it a study whose feature needs less than half its own
+element size is REFUSED with "polymesh needs an element size of X mm to resolve this
+feature, below this study's element-size band floor of Y mm — raise fineness or set
+min_size_mm to mesh it"; that refusal now names a parameter the caller has.
+
+Validation at the seam: finite and `> 0`, and never greater than the size it floors —
+`mesh_size_mm` for `run_fea_static` / `run_fea_contact`, the FINEST `sizes_mm` entry for
+`run_fea_convergence`. A floor above the stated size would raise the base size instead
+(`core/sim/mesh_size_band.cpp` clamps the base up to the floor), silently coarsening the
+mesh the caller just named, so it is a `ValueError` rather than a solve.
+
+It is echoed exactly where the stated size is echoed today: the persisted study record
+beside `target_size_mm`, and each `run_fea_convergence` table row beside `size_mm`. Both
+appear only when stated.

@@ -439,3 +439,60 @@ def test_a_stated_size_and_the_fineness_dial_together_are_refused(tools):
     assert out.get("ok") is False, out
     assert "mesh_size_mm" in out["error"] and "mesh_fineness" in out["error"], out
     assert "job_id" not in out, "a refused setup must not start a solve"
+
+
+def _small_feature_doc(tools: dict, name: str) -> str:
+    """A 6x5x4 mm block with a 0.8 mm through hole — a feature far below half of the
+    3 mm element size the test states, which is what puts it under the band floor."""
+    r = _json(tools["new_part"](name=name))
+    assert r.get("ok"), r
+    doc = r["doc_id"]
+    rr = _json(tools["add_features"](doc_id=doc, ops=[
+        {"op": "add_feature", "feature": {
+            "type": "box", "name": "Blk",
+            "params": {"length": 6.0, "width": 5.0, "height": 4.0}}},
+        {"op": "add_feature", "feature": {
+            "type": "hole", "name": "Pin",
+            "params": {"style": "simple", "end": "through_all",
+                       "diameter": 0.8, "positions": [[0, 0]]},
+            "refs": {"face": {"of": "face", "side": "top"}}}}]))
+    assert rr.get("ok"), rr
+    return doc
+
+
+def test_a_stated_band_floor_resolves_a_feature_the_default_floor_refuses(tools):
+    """`min_size_mm` is the element-size band FLOOR, and the floor is what bounds the
+    mesher's feature-resolution descent (default: half the stated element size). A
+    0.8 mm hole inside a 3 mm study sits under it, so the mesh is REFUSED rather than
+    meshed over — the refusal an agent could not answer before this parameter existed.
+    Same doc, same 3 mm background, same load: without the floor there is no mesh at
+    all; with min_size_mm=0.4 the descent reaches the hole and the solve reports a mesh
+    orders finer than 3 mm (a 3 mm mesh of this 120 mm3 block is a handful of cells),
+    and the persisted study names the floor beside the size it belongs to.
+    A floor COARSER than the stated size is refused before any solve: it would raise the
+    base size instead of refining under it, i.e. coarsen the mesh the caller named."""
+    doc = _small_feature_doc(tools, "band_floor")
+    setup = dict(doc_id=doc, fixtures=["bottom"],
+                 loads=[{"face": "top", "force": [0.0, 0.0, -300.0]}],
+                 material="steel", mesh_size_mm=3.0)
+
+    refused = _json(tools["run_fea_static"](**setup))
+    assert refused.get("ok") is False, refused
+    assert "feature unresolved" in refused["error"], refused["error"]
+
+    out = _finish(tools, _json(tools["run_fea_static"](min_size_mm=0.4, **setup)),
+                  "summary")
+    assert out.get("ok"), out
+    assert out["n_elems"] > 2000, (
+        f"solved {out['n_elems']} elements — a 3 mm mesh of a 6x5x4 mm block is ~4 "
+        "cells, so the band floor never reached the mesher")
+    assert out["summary"]["max_von_mises_mpa"] > 0.0, out["summary"]
+    studies = fsc._cb().call("sim_study_list", {"doc_id": doc}).get("studies") or []
+    assert studies and studies[-1]["min_size_mm"] == 0.4, studies
+    assert studies[-1]["target_size_mm"] == 3.0, studies
+
+    coarse_floor = _json(tools["run_fea_static"](min_size_mm=4.0, **setup))
+    assert coarse_floor.get("ok") is False, coarse_floor
+    assert "min_size_mm" in coarse_floor["error"], coarse_floor["error"]
+    assert "mesh_size_mm" in coarse_floor["error"], coarse_floor["error"]
+    assert "job_id" not in coarse_floor, "a refused setup must not start a solve"

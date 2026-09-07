@@ -1352,6 +1352,42 @@ def _norm_mesh_size_mm(mesh_size_mm, mesh_fineness: float) -> Optional[float]:
     return size
 
 
+def _norm_min_size_mm(
+    min_size_mm, size_mm: Optional[float], size_arg: str = "mesh_size_mm"
+) -> Optional[float]:
+    """Validate an EXPLICIT size-band FLOOR (mm) — `study.min_size_mm`.
+
+    The mesher answers a feature it cannot resolve by descending polymesh's own
+    resolution hints, and that descent stops at the study's element-size band floor
+    (core/sim/mesher.cpp, `loaded.band.min_len`), which defaults to HALF the base size
+    (core/sim/mesh_size_band.cpp). A feature needing less than that half-size is refused
+    with "polymesh needs an element size of X mm ... below this study's element-size band
+    floor of Y mm — raise fineness or set min_size_mm to mesh it". This argument is that
+    floor, stated: it lowers it so the descent can reach X.
+
+    It may not exceed the stated element size. `min_size_mm > mesh_size_mm` would raise
+    the base size itself (mesh_size_band.cpp clamps base up to the floor), so it would
+    silently coarsen the mesh the caller just named instead of letting the mesher refine
+    below it.
+    """
+    if min_size_mm is None:
+        return None
+    floor = _finite_float(min_size_mm, "min_size_mm")
+    if floor <= 0.0:
+        raise ValueError(
+            "min_size_mm must be finite and > 0 when given: it is the smallest element "
+            "size in millimetres the mesher may descend to, e.g. 0.5."
+        )
+    if size_mm is not None and floor > size_mm:
+        raise ValueError(
+            f"min_size_mm ({floor:g} mm) cannot exceed {size_arg} ({size_mm:g} mm): the "
+            "floor would raise the base element size instead of letting the mesher "
+            "refine below it, coarsening the very mesh you stated. Pass a floor under "
+            "the size polymesh asked for, e.g. min_size_mm=0.5 for a 0.78 mm feature."
+        )
+    return floor
+
+
 def _norm_plasticity(plasticity, mat: dict) -> Optional[dict]:
     """Validate and canonicalize the `plasticity=` argument of run_fea_static/contact.
 
@@ -1436,6 +1472,7 @@ def _build_static_study(
     vtu_path: Optional[str] = None,
     export_system_path: Optional[str] = None,
     target_size_mm: Optional[float] = None,
+    min_size_mm: Optional[float] = None,
     plasticity: Optional[dict] = None,
 ) -> dict:
     """SETUP stage for run_fea_static / sim_run(analysis="fea_static")."""
@@ -1457,6 +1494,7 @@ def _build_static_study(
     loads = _norm_bc_list(loads, "loads", notes=notes)
     mesh_fineness = _norm_fineness(mesh_fineness)
     target_size_mm = _norm_mesh_size_mm(target_size_mm, mesh_fineness)
+    min_size_mm = _norm_min_size_mm(min_size_mm, target_size_mm)
     vtu_path = _norm_vtu_path(vtu_path)
     export_system_path = _norm_abs_out_path(export_system_path, "export_system_path")
     mat = _resolve_study_material(material, "static")
@@ -1521,6 +1559,11 @@ def _build_static_study(
         # `fineness` stays in the payload (the engine reads it only when no explicit size
         # is present) and target_size_mm bypasses the mesh-size governor's band.
         study["target_size_mm"] = target_size_mm
+    if min_size_mm is not None:
+        # The size-band FLOOR, beside the base size it belongs to: it is what bounds the
+        # mesher's feature-resolution descent, so a feature below base/2 is reachable
+        # only when this is stated (core/sim/mesher.cpp band.min_len).
+        study["min_size_mm"] = min_size_mm
     if vtu_path:
         study["vtu_path"] = vtu_path
     if export_system_path:
@@ -1536,6 +1579,7 @@ def _build_static_study(
         "loads": loads,
         "mesh_fineness": mesh_fineness,
         "target_size_mm": target_size_mm,
+        "min_size_mm": min_size_mm,
         "vtu_path": vtu_path,
         "export_system_path": export_system_path,
         **advisor,
@@ -1597,6 +1641,7 @@ def _build_contact_study(
     notes: list,
     vtu_path: Optional[str] = None,
     interface_size_mm: Optional[float] = None,
+    min_size_mm: Optional[float] = None,
     plasticity: Optional[dict] = None,
 ) -> dict:
     """SETUP stage for run_fea_contact.
@@ -1621,6 +1666,7 @@ def _build_contact_study(
         mesh_size_mm = _finite_float(mesh_size_mm, "mesh_size_mm")
         if mesh_size_mm <= 0.0:
             raise ValueError("mesh_size_mm must be finite and > 0 when given")
+    min_size_mm = _norm_min_size_mm(min_size_mm, mesh_size_mm)
     if interface_size_mm is not None:
         interface_size_mm = _finite_float(interface_size_mm, "interface_size_mm")
         if interface_size_mm <= 0.0:
@@ -1649,6 +1695,9 @@ def _build_contact_study(
     ctx["study"]["mesh_order"] = mesh_order
     if mesh_size_mm is not None:
         ctx["study"]["target_size_mm"] = mesh_size_mm
+    if min_size_mm is not None:
+        ctx["study"]["min_size_mm"] = min_size_mm
+    ctx["min_size_mm"] = min_size_mm
     ctx["study"]["contact"] = {
         "enabled": True,
         "max_gap_mm": max_gap_mm,
@@ -1960,6 +2009,10 @@ def _collect_static(
         # target_size_mm is what the mesher actually honoured.
         **({"target_size_mm": ctx["target_size_mm"]}
            if ctx.get("target_size_mm") is not None else {}),
+        # Same rule for the band floor: it is only in the record when it was stated, and
+        # it is part of the discretization the numbers above belong to.
+        **({"min_size_mm": ctx["min_size_mm"]}
+           if ctx.get("min_size_mm") is not None else {}),
         "learned_advisor": ctx.get("learned_advisor", False),
         "advisor_max_dof": ctx.get("advisor_max_dof", 0),
         "results": summary,
@@ -3027,6 +3080,10 @@ def _convergence_skipped_row(step: dict, reason: str) -> dict:
         "size_mm": step.get("target_size_mm"),
         "fineness": step.get("fineness"),
         "mesh_order": step.get("mesh_order"),
+        # Only when the ladder stated a floor: it is part of the discretization this
+        # row's numbers belong to, and it is what let the leg resolve its features.
+        **({"min_size_mm": step["min_size_mm"]}
+           if step.get("min_size_mm") is not None else {}),
         "skipped": True,
         "error": reason,
         "monitored_value": None,
@@ -3044,6 +3101,8 @@ def _convergence_row(step: dict, out: dict, monitor: str, prev: Optional[float])
         "size_mm": step.get("target_size_mm"),
         "fineness": step.get("fineness"),
         "mesh_order": step.get("mesh_order"),
+        **({"min_size_mm": step["min_size_mm"]}
+           if step.get("min_size_mm") is not None else {}),
     }
     budget = _memory_budget(out)
     if budget:
@@ -3532,6 +3591,7 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
         material: Union[str, dict] = "steel",
         mesh_fineness: Union[float, str] = _DEFAULT_FINENESS,
         mesh_size_mm: Optional[float] = None,
+        min_size_mm: Optional[float] = None,
         plasticity: Optional[dict] = None,
         learned_advisor: bool = False,
         advisor_max_dof: int = 0,
@@ -3565,6 +3625,15 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
                    spelling and the ONLY way to re-solve one run_fea_convergence leg on
                    the mesh that produced its number — pass the leg's size_mm together
                    with vtu_path to write that leg's field.
+        min_size_mm : the element-size band FLOOR in mm — the smallest element the
+                   mesher may descend to. Raise the resolution of a SMALL FEATURE
+                   without restating the global size: when a run is refused with
+                   "polymesh needs an element size of X mm ... below this study's
+                   element-size band floor of Y mm", pass min_size_mm just under X
+                   (0.5 for a 0.78 mm feature) and the mesher's feature-resolution
+                   descent can reach it. It may not exceed mesh_size_mm — a floor above
+                   the stated size would coarsen the mesh instead of refining it — and
+                   it costs elements and memory, so pair it with a COARSE global size.
         plasticity : opt-in SMALL-STRAIN J2 (von Mises) ELASTIC-PLASTIC material, as
                    {yield_mpa, hardening_mpa, max_increments, tol}. Omitted = the
                    linear-elastic solve this tool has always done.
@@ -3680,6 +3749,7 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
                 vtu_path=vtu_path,
                 export_system_path=export_system_path,
                 target_size_mm=mesh_size_mm,
+                min_size_mm=min_size_mm,
                 plasticity=plasticity,
             )
             _autosave_all_open()  # R-1 guard: protect every open doc before the solve starts
@@ -3776,6 +3846,7 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
         material: Union[str, dict] = "steel",
         sizes_mm: Optional[Union[list, str]] = None,
         fineness: Optional[Union[list, str]] = None,
+        min_size_mm: Optional[float] = None,
         mesh_order: int = 2,
         monitor: Optional[str] = None,
         tol_pct: float = _CONVERGENCE_TOL_PCT,
@@ -3806,6 +3877,16 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
                    collapse onto one identical mesh, and identical meshes cannot converge.
                    Prefer sizes_mm for anything you intend to release.
                    Pass exactly one of sizes_mm / fineness; at least 2 entries either way.
+        min_size_mm : the element-size band FLOOR in mm, shared by EVERY leg — the
+                   smallest element the mesher may descend to. A leg refused with
+                   "polymesh needs an element size of X mm ... below this study's
+                   element-size band floor of Y mm" cannot resolve a feature the
+                   ladder's own sizes put out of reach (the floor is half the leg's
+                   size): pass min_size_mm just under X (0.5 for a 0.78 mm feature) and
+                   every leg can reach it. It may not exceed the FINEST sizes_mm entry —
+                   a floor above a stated size would coarsen that leg instead of
+                   refining it — and it costs elements and memory on every leg, so keep
+                   the ladder's sizes coarse.
         mesh_order : 1 (tet4) or 2 (tet10, default). Keep it constant across the ladder —
                    changing element order mid-study is a different discretization family.
         monitor : which `summary` scalar the convergence is judged on; default
@@ -3912,6 +3993,13 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
             if isinstance(mesh_order, bool) or mesh_order not in (1, 2):
                 raise ValueError("mesh_order must be 1 (tet4) or 2 (tet10).")
             key, ladder = _convergence_ladder(sizes_mm, fineness)
+            # The floor is shared by the whole ladder, so it is checked against the
+            # FINEST stated leg: a floor above any leg's own size would coarsen that leg.
+            min_size_mm = _norm_min_size_mm(
+                min_size_mm,
+                min(ladder) if key == "target_size_mm" else None,
+                "the finest sizes_mm leg",
+            )
             bc_notes: list = []
             # The base context resolves the setup; the first leg's own fineness overwrites
             # the placeholder below, so nothing is solved at an unstated discretization.
@@ -3924,6 +4012,7 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
                 0,
                 doc_id,
                 bc_notes,
+                min_size_mm=min_size_mm,
             )
             _autosave_all_open()  # R-1 guard: protect every open doc before the solve starts
             plan: list = []
@@ -3933,6 +4022,7 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
                     "index": i,
                     "mesh_order": mesh_order,
                     "target_size_mm": value if key == "target_size_mm" else None,
+                    "min_size_mm": min_size_mm,
                     "fineness": study["fineness"],
                 }
                 # The leg's own discretization, so the study this leg persists names the
@@ -5753,6 +5843,7 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
         max_iterations: int = 25,
         mesh_size_mm: Optional[float] = None,
         interface_size_mm: Optional[float] = None,
+        min_size_mm: Optional[float] = None,
         plasticity: Optional[dict] = None,
         mesh_order: int = 1,
         doc_id: Optional[str] = None,
@@ -5813,6 +5904,15 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
                    0.35 mm keyway clearance, 0.09-0.14 mm. Resolving the same clearance
                    with mesh_size_mm instead means meshing the WHOLE part that fine — the
                    case that motivated this knob needed 1.16M elements that way.
+        min_size_mm : the element-size band FLOOR in mm — the smallest element the
+                   mesher may descend to anywhere. This is the knob for a small feature
+                   AWAY from the interface (interface_size_mm owns the interface): when
+                   a run is refused with "polymesh needs an element size of X mm ...
+                   below this study's element-size band floor of Y mm", pass
+                   min_size_mm just under X (0.5 for a 0.78 mm feature). It may not
+                   exceed mesh_size_mm — a floor above the stated background size would
+                   coarsen it instead of refining — and it costs elements and memory, so
+                   pair it with a coarse mesh_size_mm.
         plasticity : opt-in SMALL-STRAIN J2 elastic-plastic material, same dict as
                    run_fea_static ({yield_mpa, hardening_mpa, max_increments, tol};
                    hardening_mpa is a TANGENT MODULUS in MPa, 0 = perfectly plastic).
@@ -5962,6 +6062,7 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
                 bc_notes,
                 vtu_path=vtu_path,
                 interface_size_mm=interface_size_mm,
+                min_size_mm=min_size_mm,
                 plasticity=plasticity,
             )
             _autosave_all_open()  # R-1 guard: protect every open doc before the solve starts

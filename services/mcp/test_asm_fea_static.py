@@ -101,14 +101,38 @@ def test_exact_selector_not_ambiguous_among_siblings(two_body):
         assert fp.get("points"), (m.get("centroid"), fp)
 
 
-def test_mesh_multi_solid_step_preserves_separate_parts(two_body, tmp_path):
-    """The exported 2-solid STEP meshes each part without inventing contact semantics."""
+def test_mesh_multi_solid_step_fuses_overlapping_parts(two_body, tmp_path):
+    """Two solids that interpenetrate (5 mm band) are one load path: the mesher fuses
+    them before the fill (mesh_quality.fused_bodies) rather than shedding debris
+    islands at the overlap and refusing the study as a mechanism."""
     step = str(tmp_path / "two_body.step")
     cb.call("doc_export_step", {"doc_id": two_body, "path": step})
     m = cb.call("sim_mesh", {"step_path": step, "fineness": 0.4, "order": 1})
     assert m.get("ok"), m.get("error")
     assert m.get("n_elems", 0) > 0 and m.get("n_nodes", 0) > 0, \
         {k: m.get(k) for k in ("n_elems", "n_nodes", "note")}
+    note = m.get("note") or ""
+    assert "fused" in note and "separate solid bodies" not in note, note
+
+
+def test_mesh_multi_solid_step_keeps_disjoint_parts_separate(tmp_path):
+    """Solids that do not touch are meshed independently — no invented contact."""
+    r = cb.call("doc_new", {"name": "asm_fea_two_boxes_apart"})
+    doc = r["doc_id"]
+    ops = [
+        {"op": "add_feature", "feature": {
+            "type": "box", "name": "A",
+            "params": {"length": {"value": 20}, "width": {"value": 20},
+                       "height": {"value": 20}}}},
+        {"op": "add_feature", "feature": {
+            "type": "transform", "name": "B",
+            "params": {"translate": [25.0, 0.0, 0.0], "copy": True}}},
+    ]
+    assert cb.call("doc_apply_ops", {"doc_id": doc, "ops": ops}).get("revision") is not None
+    step = str(tmp_path / "two_body_apart.step")
+    cb.call("doc_export_step", {"doc_id": doc, "path": step})
+    m = cb.call("sim_mesh", {"step_path": step, "fineness": 0.4, "order": 1})
+    assert m.get("ok"), m.get("error")
     assert "separate solid bodies" in (m.get("note") or ""), m.get("note")
 
 

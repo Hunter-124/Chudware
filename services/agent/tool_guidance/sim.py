@@ -329,7 +329,12 @@ ENTRIES: dict[str, dict[str, Any]] = {
             "max_contact_pressure_mpa, and reactions.equilibrium_error_pct. No friction, no "
             "large sliding, no preload — apply a clamp load as a face load instead. A load "
             "that pulls the parts apart is refused as a mechanism. Bonded (tension-carrying) "
-            "joints use run_fea_static with bond_gap_mm; the two are mutually exclusive."
+            "joints use run_fea_static with bond_gap_mm; the two are mutually exclusive. "
+            "When mean_contact_pressure_mpa comes back well above yield the ELASTIC "
+            "answer is the artefact, not the part: re-run with "
+            'plasticity={"hardening_mpa": 1200} so the seat yields and the patch '
+            "spreads (the active-set loop runs inside each load increment), then quote "
+            "the plastic contact_area_mm2 / mean pressure and the plasticity block."
         ),
         "timeout_s": _FEA_TIMEOUT_S,
     },
@@ -370,7 +375,15 @@ ENTRIES: dict[str, dict[str, Any]] = {
             "appearance only. Repeat at a finer mesh and compare governing stress/deflection "
             "(<10% change) before PASS. mesh_size_mm=<mm> is the exact element size "
             "(mutually exclusive with mesh_fineness) — use it with vtu_path to re-solve "
-            "one run_fea_convergence leg on its own mesh."
+            "one run_fea_convergence leg on its own mesh. "
+            'plasticity={"hardening_mpa": 1200} switches the material to small-strain '
+            "J2 (yield_mpa defaults to the material's own; hardening_mpa is a TANGENT "
+            "MODULUS in MPa, 0 = perfectly plastic): use it when an elastic peak sits "
+            "well above yield in a small region, because a linear-elastic solve cannot "
+            "redistribute and reports a stress the material could never carry. Past "
+            "the part's limit load it REFUSES as a collapse mechanism naming the load "
+            "fraction carried; over 5 % plastic strain it warns (small strain, no mesh "
+            "update). Not accepted by modal/buckling/thermal/fatigue or adaptive runs."
         ),
         "timeout_s": _FEA_TIMEOUT_S,
     },

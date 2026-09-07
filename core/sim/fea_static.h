@@ -112,6 +112,15 @@ struct FeaStaticResult {
     // reused the reduced DOF map + assembled K + numeric factorization and only
     // re-solved the RHS (load-only repeat). Always false on the tet4 parity path.
     bool factor_cache_hit = false;
+
+    // ── Elastic-plastic state (empty unless FeaPlasticity::enabled) ──────────
+    // Equivalent (accumulated) plastic strain per node, dimensionless: the node
+    // average of the Gauss-point state variable the radial return integrates. 0
+    // everywhere the material stayed elastic, and the field the VTU exports as
+    // `equivalent_plastic_strain`. The peak reported in FeaPlasticReport is taken
+    // over GAUSS POINTS, not over this averaged field, so it is the real maximum
+    // of the state variable rather than a smoothed one.
+    std::vector<double> equivalent_plastic_strain;
 };
 
 // Factor-cache counters (tet10/hex8 prepared-system reuse). Thread-safe.
@@ -234,6 +243,65 @@ struct FeaContactOptions {
     double seat_tolerance_mm = -1.0;
 };
 
+// ── Small-strain J2 (von Mises) plasticity with isotropic hardening ─────────────
+// A frictionless linear-elastic contact cannot redistribute: on the ME 490 hinge
+// saddle 1446 N funnelled through 12 node pairs on a sharp edge and the mean
+// bearing stress came out at 450 MPa against a 276 MPa yield, which is not a
+// result — it is the answer to a question about a material that does not exist.
+// An elastic-plastic law lets the edge yield, so the bearing patch GROWS until the
+// load fits inside the flow stress, which is what the steel actually does.
+//
+// The law is the standard one: von Mises yield surface, associated flow, linear
+// isotropic hardening
+//
+//   sigma_y(eq_plastic_strain) = yield_mpa + hardening_mpa * eq_plastic_strain
+//
+// integrated by radial return at every Gauss point with the consistent (algorithmic)
+// tangent, under an incremental Newton-Raphson load-stepping loop. hardening_mpa is
+// a TANGENT MODULUS in MPa (0 = perfectly plastic, i.e. a flat yield plateau); it is
+// H in the bilinear law, not the ratio H/E.
+//
+// Validity: SMALL strain. The mesh is never updated, so the answer is a
+// small-strain plasticity answer; past a few percent of plastic strain the geometry
+// change matters and fea_run emits a warning saying so.
+struct FeaPlasticity {
+    bool enabled = false;
+    // Initial yield stress (MPa). 0 means "use the study's yield_mpa", which is the
+    // same number the factor-of-safety summary is measured against.
+    double yield_mpa = 0.0;
+    // Linear isotropic hardening tangent modulus H (MPa). 0 = perfectly plastic.
+    double hardening_mpa = 0.0;
+    // Equal load increments the full load is applied in. A non-converging increment
+    // is retried at half the step (down to 1/32 of the requested increment), so this
+    // is the starting ladder, not a hard schedule.
+    int max_increments = 10;
+    // Newton convergence tolerance on ||residual|| / ||applied load|| (relative).
+    double tol = 1e-3;
+};
+
+// What the plastic integration did, as evidence rather than as a footnote.
+struct FeaPlasticReport {
+    bool enabled = false;
+    // Load increments that CONVERGED (adaptive substeps included, so this can
+    // exceed FeaPlasticity::max_increments).
+    int increments = 0;
+    int newton_iterations_total = 0;
+    // true only when the FULL applied load was reached with every increment
+    // converged. false means the structure stopped carrying load at
+    // `load_fraction` — a collapse mechanism, not a solver preference.
+    bool converged = false;
+    // Fraction of the applied load the last converged increment carried (1.0 on a
+    // converged run). Without it a partial result is uninterpretable, so it is
+    // reported even on the refusal.
+    double load_fraction = 0.0;
+    double max_equivalent_plastic_strain = 0.0;
+    // Integration volume whose Gauss point has yielded (mm^3), and its share of the
+    // model volume.
+    double plastic_volume_mm3 = 0.0;
+    double plastic_fraction = 0.0;
+    int yielded_nodes = 0;
+};
+
 // nodes_per_elem==4 uses the analytical tet4 strain-displacement operator UNCHANGED
 // (byte-for-byte parity with the prior solver / the Python oracle). ==10 uses an
 // isoparametric quadratic tet (4-point Gauss); ==8 uses an isoparametric trilinear
@@ -275,5 +343,28 @@ FeaStaticResult fea_static_solve_contact(
     const std::vector<BondSpring>& bond_springs,
     const std::vector<ContactSpring>& contact_springs, const FeaContactOptions& options,
     FeaContactReport& report, const SimCancelToken& cancel_token = {});
+
+// Same kernel with the J2 material law switched on: radial return at every Gauss
+// point, a consistent tangent, and an incremental Newton-Raphson load-stepping loop
+// whose every tangent solve goes down the SAME CHOLMOD/LDLT ladder (and through the
+// same process-wide solve gate) as a linear solve.
+//
+// `contact_springs` may be empty (plastic statics) or not (plastic contact), and
+// when it is not, the active-set loop runs INSIDE each load increment: contact state
+// and plastic state are both updated per increment, which is the only ordering that
+// can grow a bearing patch as the edge under it yields.
+//
+// An increment that will not converge is retried at half the load step; when even
+// the smallest step fails the result is a REFUSAL naming the load fraction reached
+// (`plastic_report.load_fraction`), never a last-iterate stress field. Both reports
+// are always written, including on failure.
+FeaStaticResult fea_static_solve_plastic(
+    const std::vector<double>& points, const std::vector<int>& tets, double E_mpa,
+    double nu, double yield_mpa, const std::vector<int>& fixed_nodes,
+    const std::vector<double>& nodal_forces, int nodes_per_elem,
+    const std::vector<BondSpring>& bond_springs,
+    const std::vector<ContactSpring>& contact_springs, const FeaContactOptions& options,
+    const FeaPlasticity& plasticity, FeaContactReport& contact_report,
+    FeaPlasticReport& plastic_report, const SimCancelToken& cancel_token = {});
 
 }  // namespace chudware::sim

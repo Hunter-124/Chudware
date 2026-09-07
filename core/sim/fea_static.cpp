@@ -19,6 +19,7 @@
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
+#include <limits>
 #include <list>
 #include <map>
 #include <memory>
@@ -590,6 +591,148 @@ bool hex8_B_at(const std::array<Eigen::Vector3d, 8>& ep, double xi, double eta, 
     return true;
 }
 
+// ── Small-strain J2 plasticity: element quadrature, radial return, tangent ───────
+//
+// The plastic path integrates a material state at every Gauss point, so it needs the
+// same B operators the three element kernels above build, but reached through ONE
+// runtime-dispatched call: the Newton loop is written once for tet4/tet10/hex8
+// instead of three times. The 6x30 buffer is the tet10 worst case; a tet4 uses its
+// leading 12 columns and a hex8 its leading 24, which is why every consumer slices
+// with leftCols(edof).
+
+// Gauss points per element for the plastic path. tet4's isoparametric map is affine,
+// so its strain is constant and ONE point integrates it exactly — the same statement
+// the elastic tet4 assembly makes by multiplying by the element volume.
+inline int plastic_gauss_count(int nodes_per_elem) {
+    return nodes_per_elem == 10 ? 4 : (nodes_per_elem == 8 ? 8 : 1);
+}
+
+// B and the integration weight (mm^3, i.e. |detJ| * w_gauss) at Gauss point `g` of
+// one element whose node coordinates are `ep` (nodes_per_elem entries). false on a
+// degenerate Jacobian.
+bool plastic_gauss_b(int nodes_per_elem, const Eigen::Vector3d* ep, int g,
+                     Eigen::Matrix<double, 6, 30>& B, double& weight) {
+    B.setZero();
+    if (nodes_per_elem == 10) {
+        static const TetGauss4 gauss;
+        std::array<Eigen::Vector3d, 10> pts;
+        for (int j = 0; j < 10; ++j) pts[static_cast<std::size_t>(j)] = ep[j];
+        Eigen::Matrix<double, 6, 30> Bl;
+        Eigen::Matrix<double, 10, 3> dNxyz;
+        double detJ = 0.0;
+        if (!tet10_B_at(pts, gauss.pt[g][0], gauss.pt[g][1], gauss.pt[g][2], Bl, detJ,
+                        dNxyz))
+            return false;
+        B = Bl;
+        weight = std::abs(detJ) * gauss.w[g];
+        return true;
+    }
+    if (nodes_per_elem == 8) {
+        static const HexGauss8 hg;
+        std::array<Eigen::Vector3d, 8> pts;
+        for (int j = 0; j < 8; ++j) pts[static_cast<std::size_t>(j)] = ep[j];
+        Eigen::Matrix<double, 6, 24> Bl;
+        double detJ = 0.0;
+        if (!hex8_B_at(pts, hg.pt[g][0], hg.pt[g][1], hg.pt[g][2], Bl, detJ)) return false;
+        B.leftCols<24>() = Bl;
+        weight = std::abs(detJ) * hg.w[g];
+        return true;
+    }
+    std::array<Eigen::Vector3d, 4> pts;
+    for (int j = 0; j < 4; ++j) pts[static_cast<std::size_t>(j)] = ep[j];
+    Eigen::Matrix<double, 6, 12> Bl;
+    double vol = 0.0;
+    if (!tet4_B(pts, Bl, vol)) return false;
+    B.leftCols<12>() = Bl;
+    weight = vol;
+    return true;
+}
+
+// The Voigt deviatoric projector, as the operator that turns an ENGINEERING strain
+// vector into 1/(2mu) of the deviatoric stress it causes: C = K*(1 (x) 1) + 2mu*Idev
+// with 1 (x) 1 the ones-block on the normal components. It is the piece of the
+// elastic operator the plastic flow softens, so the consistent tangent is written as
+// a correction to C rather than re-derived from lambda and mu.
+const Eigen::Matrix<double, 6, 6>& plastic_idev() {
+    static const Eigen::Matrix<double, 6, 6> Id = [] {
+        Eigen::Matrix<double, 6, 6> m = Eigen::Matrix<double, 6, 6>::Zero();
+        for (int i = 0; i < 3; ++i)
+            for (int j = 0; j < 3; ++j) m(i, j) = (i == j) ? 2.0 / 3.0 : -1.0 / 3.0;
+        for (int i = 3; i < 6; ++i) m(i, i) = 0.5;
+        return m;
+    }();
+    return Id;
+}
+
+// ── Radial return (closest-point projection) for J2 with linear isotropic hardening.
+//
+// Given the total strain at this Gauss point and the CONVERGED plastic state of the
+// previous increment, the elastic predictor is sigma_tr = C(eps - eps_p_n). Its
+// deviator s_tr fixes the flow direction N = 1.5*s_tr/q_tr (so N:N = 3/2 and the
+// plastic strain increment is d_eq * N), and for a yield stress linear in the
+// equivalent plastic strain the consistency condition
+//
+//     q_tr - 3mu*d_eq = yield + H*(eq_n + d_eq)
+//
+// is linear too, so the return is CLOSED FORM: d_eq = (q_tr - Y_n)/(3mu + H). No
+// local iteration, and therefore no local convergence failure to propagate into the
+// global Newton loop.
+//
+// `tangent` receives the CONSISTENT (algorithmic) tangent, not the continuum one:
+//
+//     D = C - 2mu(1-theta) Idev + [ (4/3)mu(1-theta) - 4mu^2/(3mu+H) ] N N^T
+//     theta = 1 - 3mu*d_eq/q_tr
+//
+// which is Simo & Hughes Box 3.2 written in engineering Voigt (their n (x) n is
+// (2/3) N N^T here). Using the continuum tangent instead costs Newton its quadratic
+// convergence exactly where the step is largest, which on a bearing edge is every
+// increment that matters.
+//
+// Voigt convention: stress-like vectors are [xx,yy,zz,xy,yz,xz] and strain-like ones
+// carry ENGINEERING shear (gamma = 2*eps_ij), which is what tet4_B/tet10_B_at emit
+// and what `elasticity()` expects — so eps_p is stored with engineering shear too
+// and C*(eps - eps_p) is the stress with no conversion anywhere.
+void plastic_radial_return(const Eigen::Matrix<double, 6, 6>& C, double mu, double Y0,
+                           double H, const Eigen::Matrix<double, 6, 1>& eps,
+                           const double* eps_p_n, double eq_n,
+                           Eigen::Matrix<double, 6, 1>& stress, double* eps_p_out,
+                           double& eq_out, Eigen::Matrix<double, 6, 6>* tangent) {
+    Eigen::Matrix<double, 6, 1> ep_n;
+    for (int i = 0; i < 6; ++i) ep_n(i) = eps_p_n[i];
+    stress = C * (eps - ep_n);
+    eq_out = eq_n;
+    if (eps_p_out)
+        for (int i = 0; i < 6; ++i) eps_p_out[i] = ep_n(i);
+    const double p = (stress(0) + stress(1) + stress(2)) / 3.0;
+    Eigen::Matrix<double, 6, 1> dev = stress;
+    for (int i = 0; i < 3; ++i) dev(i) -= p;
+    const double dd = dev(0) * dev(0) + dev(1) * dev(1) + dev(2) * dev(2) +
+                      2.0 * (dev(3) * dev(3) + dev(4) * dev(4) + dev(5) * dev(5));
+    const double q_tr = std::sqrt(1.5 * dd);
+    const double Y = Y0 + H * eq_n;
+    if (!(q_tr > Y) || !(q_tr > 0.0)) {
+        if (tangent) *tangent = C;
+        return;
+    }
+    const double d_eq = (q_tr - Y) / (3.0 * mu + H);
+    const Eigen::Matrix<double, 6, 1> N = dev * (1.5 / q_tr);
+    stress -= (2.0 * mu * d_eq) * N;
+    eq_out = eq_n + d_eq;
+    if (eps_p_out) {
+        for (int i = 0; i < 3; ++i) eps_p_out[i] = ep_n(i) + d_eq * N(i);
+        // Engineering shear: the plastic strain TENSOR gains d_eq*N_ij, so the
+        // engineering component gains twice that.
+        for (int i = 3; i < 6; ++i) eps_p_out[i] = ep_n(i) + 2.0 * d_eq * N(i);
+    }
+    if (tangent) {
+        const double theta = 1.0 - 3.0 * mu * d_eq / q_tr;
+        const double coef_n =
+            (4.0 / 3.0) * mu * (1.0 - theta) - 4.0 * mu * mu / (3.0 * mu + H);
+        *tangent = C - (2.0 * mu * (1.0 - theta)) * plastic_idev() +
+                   coef_n * (N * N.transpose());
+    }
+}
+
 }  // namespace
 
 // ── Prepared-system (factor) cache for load-only repeats ─────────────────────────
@@ -1018,8 +1161,11 @@ private:
 }  // namespace
 
 // The single implementation behind fea_static_solve (contact_springs empty — every
-// existing caller, parity path untouched) and fea_static_solve_contact (non-empty,
-// which switches the solve into the active-set loop and fills *contact_report).
+// existing caller, parity path untouched), fea_static_solve_contact (non-empty,
+// which switches the solve into the active-set loop and fills *contact_report) and
+// fea_static_solve_plastic (plasticity->enabled, which replaces the single
+// factorization with an incremental Newton-Raphson load-stepping loop and runs the
+// active-set loop inside each increment).
 static FeaStaticResult solve_impl(const std::vector<double>& points,
                                  const std::vector<int>& tets,
                                  double E_mpa, double nu, double yield_mpa,
@@ -1030,6 +1176,8 @@ static FeaStaticResult solve_impl(const std::vector<double>& points,
                                  const std::vector<ContactSpring>& contact_springs,
                                  const FeaContactOptions& contact_options,
                                  FeaContactReport* contact_report,
+                                 const FeaPlasticity* plasticity,
+                                 FeaPlasticReport* plastic_report,
                                  const SimCancelToken& cancel_token) {
     FeaProf prof;
     FeaStaticResult res;
@@ -1154,6 +1302,45 @@ static FeaStaticResult solve_impl(const std::vector<double>& points,
                 contact_options.tangential_stabilization;
         }
     }
+    // Plasticity options: validated up front for the same reason the contact springs
+    // are — a silently ignored material law is a wrong answer wearing a right label.
+    const bool plastic_mode = plasticity && plasticity->enabled;
+    if (plastic_report) *plastic_report = FeaPlasticReport{};
+    double plastic_yield = yield_mpa;
+    double plastic_hardening = 0.0;
+    int plastic_increments = 1;
+    double plastic_tol = 1e-3;
+    if (plastic_mode) {
+        plastic_yield =
+            plasticity->yield_mpa > 0.0 ? plasticity->yield_mpa : yield_mpa;
+        plastic_hardening = plasticity->hardening_mpa;
+        plastic_increments = plasticity->max_increments;
+        plastic_tol = plasticity->tol;
+        if (!std::isfinite(plastic_yield) || plastic_yield <= 0.0) {
+            res.error = "fea_static: plasticity yield_mpa must be finite and > 0";
+            return res;
+        }
+        if (!std::isfinite(plastic_hardening) || plastic_hardening < 0.0) {
+            res.error =
+                "fea_static: plasticity hardening_mpa is a tangent modulus in MPa and "
+                "must be finite and >= 0 (0 = perfectly plastic)";
+            return res;
+        }
+        if (plastic_increments < 1 || plastic_increments > 1000) {
+            res.error =
+                "fea_static: plasticity max_increments must be from 1 through 1000";
+            return res;
+        }
+        if (!std::isfinite(plastic_tol) || plastic_tol <= 0.0 || plastic_tol >= 1.0) {
+            res.error =
+                "fea_static: plasticity tol is a relative residual tolerance and must "
+                "be in (0, 1)";
+            return res;
+        }
+        if (plastic_report) {
+            plastic_report->enabled = true;
+        }
+    }
 
     double lam, mu;
     lame(E_mpa, nu, lam, mu);
@@ -1168,6 +1355,24 @@ static FeaStaticResult solve_impl(const std::vector<double>& points,
     };
     const int n_tets = static_cast<int>(tets.size() / stride);
     const TetGauss4 gauss;
+    // ── The plastic state, and the one place stress is formed from strain ────
+    // eps_p / eq_plastic hold the CONVERGED state of the last committed load
+    // increment, one entry per (element, Gauss point). They stay empty on an elastic
+    // run, and `plastic_stress` then degenerates to C*eps — so the reaction pass and
+    // the stress recovery below are the same code for both material laws, and an
+    // elastic result is bit-identical to what it was before plasticity existed.
+    const int plastic_ngp = plastic_gauss_count(nodes_per_elem);
+    std::vector<double> eps_p;
+    std::vector<double> eq_plastic;
+    std::vector<double> gp_volume;  // integration weight per Gauss point, mm^3
+    auto plastic_stress = [&](int e, int g, const Eigen::Matrix<double, 6, 1>& eps) {
+        if (eps_p.empty()) return Eigen::Matrix<double, 6, 1>(C * eps);
+        const double* ep =
+            &eps_p[(static_cast<std::size_t>(e) * plastic_ngp + g) * 6];
+        Eigen::Matrix<double, 6, 1> pl;
+        for (int i = 0; i < 6; ++i) pl(i) = ep[i];
+        return Eigen::Matrix<double, 6, 1>(C * (eps - pl));
+    };
     // Validate every element before assembly. Silently skipping one bad element changes the
     // domain and can leave a plausible-looking solution on only part of the requested mesh.
     for (int e = 0; e < n_tets; ++e) {
@@ -1225,8 +1430,10 @@ static FeaStaticResult solve_impl(const std::vector<double>& points,
     // retained factor would hold memory the NEXT, finer leg needs.
     std::shared_ptr<const PreparedSystem> prepared;
     // Contact bypasses the cache entirely: the active set changes K every iteration, and
-    // the cache key cannot see an active set (it would serve a stale contact state).
-    const bool use_factor_cache = (tet10 || hex8) && !contact_mode;
+    // the cache key cannot see an active set (it would serve a stale contact state). So
+    // does plasticity — the tangent changes with the material state at every Newton
+    // iteration, and the key cannot see a state either.
+    const bool use_factor_cache = (tet10 || hex8) && !contact_mode && !plastic_mode;
     uint64_t sys_key = 0;
     if (use_factor_cache) {
         sys_key = factor_system_key(points, tets, E_mpa, nu, fixed_nodes, nodes_per_elem,
@@ -1496,45 +1703,90 @@ static FeaStaticResult solve_impl(const std::vector<double>& points,
         // symmetric positive definite for every element order, so the factorization
         // ladder is Cholesky-first — supernodal LLT, then SimplicialLDLT(AMD) — with
         // SparseLU only for a non-positive pivot. See factor_and_solve / SolverKind.
-        if (contact_mode) {
-            // ── Unilateral frictionless contact: active-set loop ──────────────
-            // Kff (elements + bond ties) is the CACHED part: an iteration only rebuilds
-            // the spring block Ks from the current active set and factors Kff + Ks. The
-            // element assembly above never runs twice.
-            //
-            // Per active pair, with n̂ the pair normal and g = gap0 + n̂·(u_b - u_a):
-            //   stiffness  k·(n̂ n̂ᵀ) on the (a,b) block, + kt·(I - n̂ n̂ᵀ) stabilization
-            //   RHS        +k·gap0·n̂ at a, -k·gap0·n̂ at b   (the constant part of k·g)
-            // so the solved pair carries the normal force k·g: negative (compressive)
-            // while penetrating, positive (tensile — not allowed) once separated.
-            const int n_pairs = static_cast<int>(pairs.size());
-            contact_active.assign(static_cast<std::size_t>(n_pairs), 0);
-
-            // Reachability skeleton: node connectivity through ELEMENTS and bond ties,
-            // which never changes. Each iteration adds only its active contact pairs.
-            std::vector<int> base_parent(static_cast<std::size_t>(n_nodes));
-            for (int i = 0; i < n_nodes; ++i) base_parent[static_cast<std::size_t>(i)] = i;
-            auto uf_find = [](std::vector<int>& p, int x) {
-                while (p[static_cast<std::size_t>(x)] != x) {
-                    p[static_cast<std::size_t>(x)] =
-                        p[static_cast<std::size_t>(p[static_cast<std::size_t>(x)])];
-                    x = p[static_cast<std::size_t>(x)];
-                }
-                return x;
-            };
-            auto uf_unite = [&](std::vector<int>& p, int a, int b) {
-                a = uf_find(p, a);
-                b = uf_find(p, b);
-                if (a != b) p[static_cast<std::size_t>(std::max(a, b))] = std::min(a, b);
-            };
-            std::vector<char> meshed(static_cast<std::size_t>(n_nodes), 0);
-            for (int e = 0; e < n_tets; ++e) {
-                const int* tn = &tets[static_cast<std::size_t>(e) * stride];
-                for (int j = 0; j < stride; ++j) meshed[static_cast<std::size_t>(tn[j])] = 1;
-                for (int j = 1; j < stride; ++j) uf_unite(base_parent, tn[0], tn[j]);
+        //
+        // ── Contact topology, shared by the elastic and the plastic loop ─────
+        // Which nodes reach a fixture through ELEMENTS and bond ties never changes, so
+        // the skeleton is built once and an iteration of either loop adds only its own
+        // active pairs. The plastic path needs exactly the same seed and the same
+        // mechanism gate — a part held only by contact is a mechanism whether or not
+        // the material under the seat yields — so neither is written twice.
+        const int n_pairs = static_cast<int>(pairs.size());
+        contact_active.assign(static_cast<std::size_t>(n_pairs), 0);
+        std::vector<int> base_parent(static_cast<std::size_t>(n_nodes));
+        for (int i = 0; i < n_nodes; ++i) base_parent[static_cast<std::size_t>(i)] = i;
+        auto uf_find = [](std::vector<int>& p, int x) {
+            while (p[static_cast<std::size_t>(x)] != x) {
+                p[static_cast<std::size_t>(x)] =
+                    p[static_cast<std::size_t>(p[static_cast<std::size_t>(x)])];
+                x = p[static_cast<std::size_t>(x)];
             }
-            for (const BondSpring& s : bond_springs) uf_unite(base_parent, s.a, s.b);
-
+            return x;
+        };
+        auto uf_unite = [&](std::vector<int>& p, int a, int b) {
+            a = uf_find(p, a);
+            b = uf_find(p, b);
+            if (a != b) p[static_cast<std::size_t>(std::max(a, b))] = std::min(a, b);
+        };
+        std::vector<char> meshed(static_cast<std::size_t>(n_nodes), 0);
+        for (int e = 0; e < n_tets; ++e) {
+            const int* tn = &tets[static_cast<std::size_t>(e) * stride];
+            for (int j = 0; j < stride; ++j) meshed[static_cast<std::size_t>(tn[j])] = 1;
+            for (int j = 1; j < stride; ++j) uf_unite(base_parent, tn[0], tn[j]);
+        }
+        for (const BondSpring& s : bond_springs) uf_unite(base_parent, s.a, s.b);
+        auto seed_anchors_all = [&]() {
+            std::vector<int> parent = base_parent;
+            for (int p = 0; p < n_pairs; ++p)
+                if (contact_active[static_cast<std::size_t>(p)])
+                    uf_unite(parent, pairs[static_cast<std::size_t>(p)].a,
+                             pairs[static_cast<std::size_t>(p)].b);
+            std::set<int> anchored;
+            for (int nid : fixed_nodes) anchored.insert(uf_find(parent, nid));
+            for (int i = 0; i < n_nodes; ++i) {
+                if (!meshed[static_cast<std::size_t>(i)]) continue;
+                if (!anchored.count(uf_find(parent, i))) return false;
+            }
+            return true;
+        };
+        auto seed_within = [&](double tol) {
+            int n = 0;
+            for (int p = 0; p < n_pairs; ++p) {
+                const char on = pairs[static_cast<std::size_t>(p)].gap0 <= tol ? 1 : 0;
+                contact_active[static_cast<std::size_t>(p)] = on;
+                n += on;
+            }
+            return n;
+        };
+        // Mechanism gate on the CURRENT active set: a part whose contact has fully
+        // separated is free to fly off and its "solution" is arbitrary. Empty return
+        // = every meshed component still reaches a fixture.
+        auto contact_mechanism_error = [&](int iter) -> std::string {
+            std::vector<int> parent = base_parent;
+            for (int p = 0; p < n_pairs; ++p)
+                if (contact_active[static_cast<std::size_t>(p)])
+                    uf_unite(parent, pairs[static_cast<std::size_t>(p)].a,
+                             pairs[static_cast<std::size_t>(p)].b);
+            std::set<int> anchored;
+            for (int nid : fixed_nodes) anchored.insert(uf_find(parent, nid));
+            std::set<int> floating;
+            for (int i = 0; i < n_nodes; ++i) {
+                if (!meshed[static_cast<std::size_t>(i)]) continue;
+                const int root = uf_find(parent, i);
+                if (!anchored.count(root)) floating.insert(root);
+            }
+            if (floating.empty()) return std::string();
+            int still_active = 0;
+            for (char c : contact_active) still_active += c ? 1 : 0;
+            return "fea_static: contact separated — " + std::to_string(floating.size()) +
+                   " mesh component(s) reach no fixture with " +
+                   std::to_string(still_active) + " of " + std::to_string(n_pairs) +
+                   " candidate contact pair(s) still active (iteration " +
+                   std::to_string(iter) +
+                   "). The load pulls the parts APART, so nothing holds them: a "
+                   "unilateral contact carries compression only. Reverse the load "
+                   "into the joint, or fixture the lifting part.";
+        };
+        if (contact_mode) {
             // ── Where the active set STARTS ───────────────────────────────────
             // An active pair whose gap0 > 0 carries k·gap0 of TENSION on this
             // iteration's right-hand side: that is how a part held only by contact
@@ -1564,30 +1816,7 @@ static FeaStaticResult solve_impl(const std::vector<double>& points,
             //   3. Every candidate: the caller supplied no seat tolerance, or the
             //      seatable set still leaves a part floating, so there is nothing to
             //      lose by handing the widest set to the loop.
-            auto seed_anchors_all = [&]() {
-                std::vector<int> parent = base_parent;
-                for (int p = 0; p < n_pairs; ++p)
-                    if (contact_active[static_cast<std::size_t>(p)])
-                        uf_unite(parent, pairs[static_cast<std::size_t>(p)].a,
-                                 pairs[static_cast<std::size_t>(p)].b);
-                std::set<int> anchored;
-                for (int nid : fixed_nodes) anchored.insert(uf_find(parent, nid));
-                for (int i = 0; i < n_nodes; ++i) {
-                    if (!meshed[static_cast<std::size_t>(i)]) continue;
-                    if (!anchored.count(uf_find(parent, i))) return false;
-                }
-                return true;
-            };
-            auto seed_within = [&](double tol) {
-                int n = 0;
-                for (int p = 0; p < n_pairs; ++p) {
-                    const char on =
-                        pairs[static_cast<std::size_t>(p)].gap0 <= tol ? 1 : 0;
-                    contact_active[static_cast<std::size_t>(p)] = on;
-                    n += on;
-                }
-                return n;
-            };
+            //
             // Mirrors fea_contact.h's kContactMinActivePairs, which is the bar the
             // study itself is judged on. Not included from there: this file is the
             // pure kernel and fea_contact.h is built on top of it.
@@ -1615,7 +1844,687 @@ static FeaStaticResult solve_impl(const std::vector<double>& points,
             }
             prof.note("contact seed: %d of %d pair(s) start active — %s", n_seeded,
                       n_pairs, seed_rung);
+        }
 
+        if (plastic_mode) {
+            // ── Elastic-plastic: incremental Newton-Raphson load stepping ─────
+            //
+            // The load is applied in fractions lambda of the requested load, and each
+            // increment is solved by Newton-Raphson on
+            //
+            //     r(u) = lambda * F_ext - f_int(u, state_n) = 0
+            //
+            // where f_int integrates the RETURN-MAPPED stress over every element and
+            // the tangent is assembled from the CONSISTENT tangent at every Gauss
+            // point. The material state advances only when an increment CONVERGES —
+            // every radial return measures from the committed state_n, never from a
+            // mid-Newton guess — which is what makes the path history a property of
+            // the load schedule instead of the iteration count.
+            //
+            // Contact is resolved INSIDE the increment: the active set is settled at
+            // this load level before the state is committed, so a yielding edge and
+            // the patch it is growing see each other within the increment rather than
+            // one lagging the other by a whole load step. That ordering IS the
+            // redistribution the elastic solve cannot produce.
+            const int edof = nodes_per_elem * 3;
+            const std::size_t n_gp_total =
+                static_cast<std::size_t>(n_tets) * static_cast<std::size_t>(plastic_ngp);
+            eps_p.assign(n_gp_total * 6, 0.0);
+            eq_plastic.assign(n_gp_total, 0.0);
+            gp_volume.assign(n_gp_total, 0.0);
+            // Element geometry is fixed (small strain — the mesh is never updated), so
+            // the quadrature weights are computed once and double as the integration
+            // measure the plastic volume is summed over.
+            {
+                std::array<Eigen::Vector3d, 10> ep;
+                Eigen::Matrix<double, 6, 30> B;
+                for (int e = 0; e < n_tets; ++e) {
+                    const int* tn = &tets[static_cast<std::size_t>(e) * stride];
+                    for (int j = 0; j < stride; ++j)
+                        ep[static_cast<std::size_t>(j)] = node_pt(tn[j]);
+                    for (int g = 0; g < plastic_ngp; ++g) {
+                        double w = 0.0;
+                        if (!plastic_gauss_b(nodes_per_elem, ep.data(), g, B, w)) {
+                            res.error = "fea_static: degenerate element " +
+                                        std::to_string(e) + " at Gauss point " +
+                                        std::to_string(g);
+                            return res;
+                        }
+                        gp_volume[static_cast<std::size_t>(e) * plastic_ngp + g] = w;
+                    }
+                }
+            }
+            const std::size_t knnz = static_cast<std::size_t>(Kff.nonZeros());
+            auto solver = make_solver(requested_solver_kind());
+            const bool symbolic_ok = solver->analyze(Kff);
+            prof.mark("plastic symbolic analyze");
+            std::string solver_label;
+            // One tangent solve, down the SAME ladder a linear solve uses. Unlike the
+            // elastic stiffness the consistent tangent is NOT positive definite in
+            // general — at a limit point it is singular by construction, which is the
+            // physics of collapse and not a defect — so a Cholesky refusal here walks
+            // the ladder silently instead of raising a conditioning warning.
+            auto tangent_solve = [&](const Eigen::VectorXd& rhs,
+                                     Eigen::VectorXd& out) -> bool {
+                const int nthreads = fea_solver_threads(n_free);
+                apply_solver_thread_cap(nthreads);
+                if (symbolic_ok && solver->factorize(Kff)) {
+                    out = solver->solve(rhs);
+                    if (out.size() == n_free && out.allFinite()) {
+                        solver_label = solver->label();
+                        return true;
+                    }
+                }
+                for (SolverKind k : {SolverKind::Ldlt, SolverKind::Lu}) {
+                    auto alt = make_solver(k);
+                    if (!alt->analyze(Kff) || !alt->factorize(Kff)) continue;
+                    out = alt->solve(rhs);
+                    if (out.size() != n_free || !out.allFinite()) continue;
+                    solver_label = std::string(alt->label()) + " (fallback: " +
+                                   solver->label() +
+                                   " reported a non-positive pivot — the plastic "
+                                   "tangent had softened past positive definite)";
+                    return true;
+                }
+                return false;
+            };
+            std::vector<double> f_int(static_cast<std::size_t>(n_dof), 0.0);
+            // One pass over the mesh: return-map every Gauss point from the committed
+            // state at the current displacement `u`, and then
+            //   kTangent  — assemble the consistent tangent into the invariant pattern
+            //               AND the internal force (a Newton iteration),
+            //   kResidual — the internal force alone, no tangent (a line-search merit
+            //               evaluation, which is most of the passes and needs none),
+            //   kCommit   — write the new material state back IN PLACE and nothing
+            //               else (the pass that ends a converged increment).
+            // Reading eps_p_n before writing eps_p is what makes the in-place commit
+            // safe (see plastic_radial_return).
+            enum AsmMode { kTangent, kResidual, kCommit };
+            auto assemble_state = [&](const std::vector<double>& u, AsmMode mode) -> bool {
+                const bool commit = (mode == kCommit);
+                const bool want_tangent = (mode == kTangent);
+                if (!commit) {
+                    if (want_tangent) std::memset(kval, 0, knnz * sizeof(double));
+                    std::fill(f_int.begin(), f_int.end(), 0.0);
+                }
+                std::array<Eigen::Vector3d, 10> ep;
+                Eigen::Matrix<double, 6, 30> B;
+                Eigen::Matrix<double, 6, 6> D;
+                Eigen::Matrix<double, 6, 1> stress;
+                Eigen::Matrix<double, 30, 30> Ke;
+                Eigen::Matrix<double, 30, 1> ue, fe;
+                double ep_scratch[6];
+                for (int e = 0; e < n_tets; ++e) {
+                    const int* tn = &tets[static_cast<std::size_t>(e) * stride];
+                    for (int j = 0; j < stride; ++j) {
+                        ep[static_cast<std::size_t>(j)] = node_pt(tn[j]);
+                        for (int k = 0; k < 3; ++k)
+                            ue(j * 3 + k) = u[static_cast<std::size_t>(tn[j]) * 3 + k];
+                    }
+                    Ke.topLeftCorner(edof, edof).setZero();
+                    fe.head(edof).setZero();
+                    for (int g = 0; g < plastic_ngp; ++g) {
+                        double w = 0.0;
+                        if (!plastic_gauss_b(nodes_per_elem, ep.data(), g, B, w))
+                            return false;
+                        const std::size_t gi =
+                            static_cast<std::size_t>(e) * plastic_ngp + g;
+                        const Eigen::Matrix<double, 6, 1> eps =
+                            B.leftCols(edof) * ue.head(edof);
+                        double eq_new = 0.0;
+                        plastic_radial_return(
+                            C, mu, plastic_yield, plastic_hardening, eps,
+                            &eps_p[gi * 6], eq_plastic[gi], stress,
+                            commit ? &eps_p[gi * 6] : ep_scratch, eq_new,
+                            commit ? nullptr : (want_tangent ? &D : nullptr));
+                        if (commit) {
+                            eq_plastic[gi] = eq_new;
+                            continue;
+                        }
+                        if (want_tangent)
+                            Ke.topLeftCorner(edof, edof) +=
+                                B.leftCols(edof).transpose() * D * B.leftCols(edof) * w;
+                        fe.head(edof) += B.leftCols(edof).transpose() * stress * w;
+                    }
+                    if (commit) continue;
+                    if (want_tangent)
+                        for (int la = 0; la < stride; ++la) {
+                            const int r = bp.free_node[static_cast<std::size_t>(tn[la])];
+                            if (r < 0) continue;
+                            for (int lb = 0; lb < stride; ++lb) {
+                                const int c =
+                                    bp.free_node[static_cast<std::size_t>(tn[lb])];
+                                if (c < 0) continue;
+                                const int pos = bp.block_pos(c, r);
+                                if (pos < 0) continue;
+                                const int64_t base = bp.value_index(c, pos, 0, 0);
+                                const int nb = bp.start[static_cast<std::size_t>(c) + 1] -
+                                               bp.start[static_cast<std::size_t>(c)];
+                                for (int j = 0; j < 3; ++j)
+                                    for (int i = 0; i < 3; ++i)
+                                        kval[base + static_cast<int64_t>(j) * 3 * nb + i] +=
+                                            Ke(la * 3 + i, lb * 3 + j);
+                            }
+                        }
+                    for (int j = 0; j < stride; ++j)
+                        for (int k = 0; k < 3; ++k)
+                            f_int[static_cast<std::size_t>(tn[j]) * 3 + k] +=
+                                fe(j * 3 + k);
+                }
+                if (commit) return true;
+                // Bond ties and ACTIVE contact pairs are load-carrying members of the
+                // same residual: their stiffness goes into the tangent and their
+                // internal force into f_int, so the Newton residual is the whole
+                // model's out-of-balance rather than the elements' alone.
+                for (const BondSpring& s : bond_springs) {
+                    if (s.a < 0 || s.a >= n_nodes || s.b < 0 || s.b >= n_nodes ||
+                        s.a == s.b)
+                        continue;
+                    if (!(std::isfinite(s.k) && s.k > 0.0)) continue;
+                    for (int d = 0; d < 3; ++d) {
+                        if (want_tangent) {
+                            add_entry(bp, kval, s.a, s.a, d, d, s.k);
+                            add_entry(bp, kval, s.b, s.b, d, d, s.k);
+                            add_entry(bp, kval, s.a, s.b, d, d, -s.k);
+                            add_entry(bp, kval, s.b, s.a, d, d, -s.k);
+                        }
+                        const double stretch =
+                            s.k * (u[static_cast<std::size_t>(s.a) * 3 + d] -
+                                   u[static_cast<std::size_t>(s.b) * 3 + d]);
+                        f_int[static_cast<std::size_t>(s.a) * 3 + d] += stretch;
+                        f_int[static_cast<std::size_t>(s.b) * 3 + d] -= stretch;
+                    }
+                }
+                for (int p = 0; p < n_pairs; ++p) {
+                    if (!contact_active[static_cast<std::size_t>(p)]) continue;
+                    const ContactPair& cp = pairs[static_cast<std::size_t>(p)];
+                    double du[3];
+                    double rel = 0.0;
+                    for (int d = 0; d < 3; ++d) {
+                        du[d] = u[static_cast<std::size_t>(cp.b) * 3 + d] -
+                                u[static_cast<std::size_t>(cp.a) * 3 + d];
+                        rel += cp.n[d] * du[d];
+                    }
+                    const double gap = cp.gap0 + rel;
+                    for (int i = 0; i < 3; ++i) {
+                        if (want_tangent)
+                            for (int j = 0; j < 3; ++j) {
+                                const double kij = (cp.k - cp.kt) * cp.n[i] * cp.n[j] +
+                                                   (i == j ? cp.kt : 0.0);
+                                if (kij == 0.0) continue;
+                                add_entry(bp, kval, cp.a, cp.a, i, j, kij);
+                                add_entry(bp, kval, cp.b, cp.b, i, j, kij);
+                                add_entry(bp, kval, cp.a, cp.b, i, j, -kij);
+                                add_entry(bp, kval, cp.b, cp.a, i, j, -kij);
+                            }
+                        const double force_b =
+                            cp.k * gap * cp.n[i] + cp.kt * (du[i] - rel * cp.n[i]);
+                        f_int[static_cast<std::size_t>(cp.b) * 3 + i] += force_b;
+                        f_int[static_cast<std::size_t>(cp.a) * 3 + i] -= force_b;
+                    }
+                }
+                return true;
+            };
+
+            // ── The load ladder ──────────────────────────────────────────────
+            //
+            // Contact is resolved by the SAME Newton loop, not by an outer loop around
+            // it: the closure test is re-applied to the current iterate at every
+            // iteration and the increment is converged only when the residual is small
+            // AND the pairs that changed state carry no force. A nested loop — settle
+            // Newton with a frozen set, then update the set — was tried first and is
+            // WRONG here: the frozen set is the previous load level's, so the inner
+            // Newton has to equilibrate a whole new load increment on a patch that is
+            // too small, which on a bearing edge means driving a handful of pairs deep
+            // into the plastic range and then asking Newton to converge on a nearly
+            // singular tangent. Measured on the pin-on-edge gate: the nested form
+            // declared a false collapse at 2 % of a load the semi-smooth form carries
+            // in full. Because the penalty force k*g vanishes at g = 0 the residual is
+            // continuous across an activation, so this is a semi-smooth Newton and not
+            // a discontinuous switch, and below first yield ONE such iteration is the
+            // exact solve for its own active set — i.e. it degenerates precisely into
+            // fea_static_solve_contact's active-set loop.
+            //
+            // WHERE THE LADDER STARTS IS NOT ZERO. A contact interface at a small
+            // fraction of its load is in a marginal regime the full-load problem never
+            // visits: two or three pairs hold the part, the tangential stabilizer is
+            // the only thing resisting its remaining rigid modes, and the active set
+            // CHATTERS. That is not a plastic phenomenon — measured on the pin-on-edge
+            // geometry, fea_static_solve_contact ITSELF reports converged=false at
+            // 500 N and converges at every load from 1000 N up. Marching a plastic
+            // ladder from zero therefore walks into a regime whose contact state has
+            // no fixed point, fails the increment, halves the step, and lands deeper
+            // in it — reporting a collapse at 1.5 % of a load the material carries
+            // with 2 % plastic strain.
+            //
+            // So the ladder starts at FIRST YIELD, which it can do exactly because
+            // below first yield the answer is the elastic one and no state has to be
+            // integrated to reach it:
+            //
+            //   Phase 0  solve the whole load with an INFINITE yield stress. That is
+            //            the linear-elastic contact solve, it converges wherever the
+            //            elastic solver does, and it yields both the elastic peak
+            //            equivalent stress q_max and a fully-formed contact set.
+            //   lambda_1 = 0.95 * yield / q_max, clamped to (0, 1]. At lambda_1
+            //            nothing has yielded yet, so one increment reaches it.
+            //   Phase 1  the requested increments over [lambda_1, 1] — the only part
+            //            of the path where the material state actually evolves.
+            //
+            // q_max <= yield means the load never reaches the yield surface at all: the
+            // elastic answer IS the plastic answer, and it is returned as such with an
+            // empty plastic state rather than re-derived by a ladder.
+            //
+            // A non-converging increment is HALVED and retried from the last committed
+            // state (never from the failed iterate), down to 1/32 of the requested
+            // step. Below that the structure is not stiffening again: it has formed a
+            // collapse mechanism, and the honest answer is a refusal naming the load
+            // fraction it carried, not the last Newton iterate's stress field.
+            constexpr int kPlasticNewtonMax = 40;
+            const double f_ref = std::max(ff.norm(), 1e-12);
+            Eigen::VectorXd rhs(n_free), du_step(n_free);
+            std::vector<double> u_cur(static_cast<std::size_t>(n_dof), 0.0);
+            std::vector<double> u_committed(static_cast<std::size_t>(n_dof), 0.0);
+            std::vector<double> u_try(static_cast<std::size_t>(n_dof), 0.0);
+            // The seed the ladder above chose: the set a body that has to TRAVEL into
+            // its seat needs on the iterations before the closure test can see the
+            // seat at all (its pairs are still open, so closure alone would call the
+            // model a mechanism and refuse a part that is merely on its way down).
+            const std::vector<char> seed_active = contact_active;
+            std::vector<char> active_committed = contact_active;
+            std::vector<char> active_prev;
+            std::vector<double> pair_gap(static_cast<std::size_t>(n_pairs), 0.0);
+            int newton_total = 0, last_newton_iters = 0;
+            double target = 1.0;  // the load fraction the current increment aims at
+            std::string mech_error;
+
+            // The active set the closure test implies at `u`, with the travel-seed
+            // fallback. Returns the FORCE carried by the pairs whose state differs from
+            // `active_prev`: a pair whose gap sits at 0 flips between iterations while
+            // carrying k*g ~= 0 — the penalty force VANISHES at closure — so that flip
+            // moves the residual by nothing and is not a state change worth another
+            // iteration. Demanding a bit-identical set instead makes a pair resting
+            // exactly on its seat chatter forever and the increment fail.
+            auto refresh_active = [&](const std::vector<double>& u, int it,
+                                      bool compare_prev, bool& used_seed,
+                                      std::string& mech) -> double {
+                used_seed = false;
+                mech.clear();
+                if (!contact_mode) return 0.0;
+                for (int p = 0; p < n_pairs; ++p) {
+                    const ContactPair& cp = pairs[static_cast<std::size_t>(p)];
+                    double rel = 0.0;
+                    for (int i = 0; i < 3; ++i)
+                        rel += cp.n[i] * (u[static_cast<std::size_t>(cp.b) * 3 + i] -
+                                          u[static_cast<std::size_t>(cp.a) * 3 + i]);
+                    pair_gap[static_cast<std::size_t>(p)] = cp.gap0 + rel;
+                    contact_active[static_cast<std::size_t>(p)] =
+                        pair_gap[static_cast<std::size_t>(p)] < 0.0 ? 1 : 0;
+                }
+                if (!contact_mechanism_error(it).empty()) {
+                    // Nothing the deformation has closed holds every body. Fall back to
+                    // the ladder's seed, which is how a seated-but-not-yet-touching part
+                    // travels in; if THAT is a mechanism too, the load really does pull
+                    // the joint apart.
+                    contact_active = seed_active;
+                    mech = contact_mechanism_error(it);
+                    if (!mech.empty()) return 0.0;
+                    used_seed = true;
+                }
+                double flip = 0.0;
+                if (compare_prev)
+                    for (int p = 0; p < n_pairs; ++p)
+                        if (contact_active[static_cast<std::size_t>(p)] !=
+                            active_prev[static_cast<std::size_t>(p)])
+                            flip += std::abs(pairs[static_cast<std::size_t>(p)].k *
+                                             pair_gap[static_cast<std::size_t>(p)]);
+                return flip;
+            };
+            // ||target*F - f_int(u)||, evaluated with the active set `u` itself
+            // implies — a semi-smooth merit, continuous across an activation.
+            auto residual_norm_at = [&](const std::vector<double>& u, int it) -> double {
+                bool seed_used = false;
+                std::string ignored;
+                refresh_active(u, it, false, seed_used, ignored);
+                if (!assemble_state(u, kResidual))
+                    return std::numeric_limits<double>::quiet_NaN();
+                double n2 = 0.0;
+                for (int d = 0; d < n_dof; ++d) {
+                    if (reduced[d] < 0) continue;
+                    const double v = target * nodal_forces[static_cast<std::size_t>(d)] -
+                                     f_int[static_cast<std::size_t>(d)];
+                    n2 += v * v;
+                }
+                return std::sqrt(n2);
+            };
+
+            enum class Inc { Converged, Separated, Stalled, Fatal };
+            // One load increment, from the committed state to load fraction `t`.
+            auto run_increment = [&](double t) -> Inc {
+                target = t;
+                u_cur = u_committed;
+                contact_active = active_committed;
+                active_prev.clear();
+                mech_error.clear();
+                bool have_prev = false;
+                for (int it = 1; it <= kPlasticNewtonMax; ++it) {
+                    if (cancelled()) return Inc::Fatal;
+                    last_newton_iters = it;
+                    bool used_seed = false;
+                    const double flip_force =
+                        refresh_active(u_cur, it, have_prev, used_seed, mech_error);
+                    if (!mech_error.empty()) return Inc::Separated;
+                    active_prev = contact_active;
+                    have_prev = true;
+                    if (!assemble_state(u_cur, kTangent)) {
+                        res.error =
+                            "fea_static: element assembly failed on a degenerate "
+                            "element during the plastic Newton loop";
+                        return Inc::Fatal;
+                    }
+                    for (int d = 0; d < n_dof; ++d)
+                        if (reduced[d] >= 0)
+                            rhs(reduced[d]) =
+                                target * nodal_forces[static_cast<std::size_t>(d)] -
+                                f_int[static_cast<std::size_t>(d)];
+                    const double rnorm = rhs.norm();
+                    int n_active_now = 0;
+                    for (char c : contact_active) n_active_now += c ? 1 : 0;
+                    prof.note("plastic newton lambda=%.5f it=%d |r|=%.6g (tol %.6g) "
+                              "flip=%.6g active=%d%s",
+                              target, it, rnorm, plastic_tol * f_ref, flip_force,
+                              n_active_now, used_seed ? " [travel seed]" : "");
+                    if (!std::isfinite(rnorm)) return Inc::Stalled;
+                    if (rnorm <= plastic_tol * f_ref &&
+                        flip_force <= plastic_tol * f_ref) {
+                        // Converged. If the set that carried it is the travel seed
+                        // rather than the closure set, the parts have SEPARATED at this
+                        // load: the seed's open pairs are holding the body in tension,
+                        // which a unilateral contact cannot do.
+                        if (used_seed) {
+                            mech_error = contact_mechanism_error(it);
+                            if (mech_error.empty())
+                                mech_error =
+                                    "fea_static: contact separated — the converged "
+                                    "state is held only by pairs that are still OPEN, "
+                                    "so nothing presses: the load pulls the parts "
+                                    "apart. A unilateral contact carries compression "
+                                    "only.";
+                            return Inc::Separated;
+                        }
+                        return Inc::Converged;
+                    }
+                    ++newton_total;
+                    if (!tangent_solve(rhs, du_step)) return Inc::Stalled;
+                    // Damping, not a merit line search. Below first yield the full step
+                    // IS the exact solve for its own active set, so alpha = 1 is taken
+                    // and the iteration is the elastic active-set loop; a plastic step
+                    // that overshoots into a much worse residual is halved instead.
+                    // Refusing to move at all when no alpha improves the residual would
+                    // be worse than a bad step: activating a pair legitimately RAISES
+                    // the residual on the way to the solution, and a strict-descent
+                    // search on that merit crawls (measured: alpha collapsing to 1/256
+                    // with the residual falling 1 % per iteration).
+                    constexpr int kMaxBacktrack = 6;
+                    double alpha = 1.0;
+                    for (int ls = 0; ls < kMaxBacktrack; ++ls) {
+                        for (int d = 0; d < n_dof; ++d)
+                            u_try[static_cast<std::size_t>(d)] =
+                                u_cur[static_cast<std::size_t>(d)] +
+                                (reduced[d] >= 0 ? alpha * du_step(reduced[d]) : 0.0);
+                        bool finite = true;
+                        for (double x : u_try) finite = finite && std::isfinite(x);
+                        if (finite) {
+                            const double try_norm = residual_norm_at(u_try, it);
+                            if (std::isfinite(try_norm) && try_norm < 4.0 * rnorm) {
+                                if (alpha < 1.0)
+                                    prof.note("plastic newton it=%d damped alpha=%.4f "
+                                              "(|r| %.6g -> %.6g)",
+                                              it, alpha, rnorm, try_norm);
+                                break;
+                            }
+                        }
+                        alpha *= 0.5;
+                    }
+                    u_cur = u_try;
+                    bool finite = true;
+                    for (double x : u_cur) finite = finite && std::isfinite(x);
+                    if (!finite) return Inc::Stalled;
+                }
+                return Inc::Stalled;
+            };
+
+            // The largest trial equivalent stress anywhere in the model at `u` — the
+            // number that says whether the yield surface has been reached at all.
+            auto max_trial_q = [&](const std::vector<double>& u) -> double {
+                double qmax = 0.0;
+                std::array<Eigen::Vector3d, 10> ep;
+                Eigen::Matrix<double, 6, 30> B;
+                Eigen::Matrix<double, 30, 1> ue;
+                for (int e = 0; e < n_tets; ++e) {
+                    const int* tn = &tets[static_cast<std::size_t>(e) * stride];
+                    for (int j = 0; j < stride; ++j) {
+                        ep[static_cast<std::size_t>(j)] = node_pt(tn[j]);
+                        for (int k = 0; k < 3; ++k)
+                            ue(j * 3 + k) = u[static_cast<std::size_t>(tn[j]) * 3 + k];
+                    }
+                    for (int g = 0; g < plastic_ngp; ++g) {
+                        double w = 0.0;
+                        if (!plastic_gauss_b(nodes_per_elem, ep.data(), g, B, w)) continue;
+                        const Eigen::Matrix<double, 6, 1> s =
+                            plastic_stress(e, g, B.leftCols(edof) * ue.head(edof));
+                        const double p = (s(0) + s(1) + s(2)) / 3.0;
+                        const double dd = (s(0) - p) * (s(0) - p) + (s(1) - p) * (s(1) - p) +
+                                          (s(2) - p) * (s(2) - p) +
+                                          2.0 * (s(3) * s(3) + s(4) * s(4) + s(5) * s(5));
+                        qmax = std::max(qmax, std::sqrt(1.5 * dd));
+                    }
+                }
+                return qmax;
+            };
+
+            // ── Phase 0: the elastic predictor ───────────────────────────────
+            const double requested_yield = plastic_yield;
+            plastic_yield = std::numeric_limits<double>::infinity();
+            Inc pre = run_increment(1.0);
+            plastic_yield = requested_yield;
+            if (pre == Inc::Fatal) return res;
+            if (pre == Inc::Separated) {
+                res.error = mech_error;
+                if (plastic_report)
+                    plastic_report->newton_iterations_total = newton_total;
+                if (contact_report && contact_mode)
+                    contact_report->contact_iterations = last_newton_iters;
+                return res;
+            }
+            if (pre == Inc::Stalled) {
+                res.error =
+                    "fea_static: the linear-elastic predictor for this elastic-plastic "
+                    "study did not converge in " + std::to_string(kPlasticNewtonMax) +
+                    " Newton iteration(s)" +
+                    (contact_mode ? " — the contact active set never settled at full "
+                                    "load, so no state is the solution. Reduce "
+                                    "contact.penalty_scale (a very stiff penalty makes "
+                                    "pairs chatter across the gap) or resolve the "
+                                    "interface (contact.interface_size_mm). This is a "
+                                    "contact-discretization failure, NOT plastic "
+                                    "collapse: the material never reached its yield "
+                                    "surface."
+                                  : ". A linear-elastic model has no nonlinearity for "
+                                    "Newton to fail on, so this is a conditioning "
+                                    "failure — check mesh_quality for slivers.");
+                if (plastic_report)
+                    plastic_report->newton_iterations_total = newton_total;
+                if (contact_report && contact_mode) {
+                    contact_report->contact_iterations = last_newton_iters;
+                    contact_report->converged = false;
+                }
+                return res;
+            }
+            const double q_elastic_max = max_trial_q(u_cur);
+            prof.note("plastic: elastic predictor peak equivalent stress %.4f MPa vs "
+                      "yield %.4f MPa (%d Newton iteration(s))",
+                      q_elastic_max, plastic_yield, newton_total);
+
+            double lambda = 0.0;
+            int increments_done = 0;
+            bool full_load = false, contact_settled = true;
+            if (q_elastic_max <= plastic_yield) {
+                // The load never reaches the yield surface: the elastic answer IS the
+                // answer, with an empty plastic state. No ladder, no state to commit.
+                u_committed = u_cur;
+                active_committed = contact_active;
+                lambda = 1.0;
+                increments_done = 1;
+                full_load = true;
+                prof.note("plastic: wholly elastic (peak %.4f MPa < yield %.4f MPa) — "
+                          "one increment, no plastic strain",
+                          q_elastic_max, plastic_yield);
+            } else {
+                const double lambda1 = std::min(
+                    1.0, std::max(1e-6, 0.95 * plastic_yield / q_elastic_max));
+                // Start the ladder from the elastic predictor's own contact set: it is
+                // the set at full load, which is the widest the path ever needs, and
+                // seeding with it keeps the first increment out of the marginal regime.
+                active_committed = contact_active;
+                std::fill(u_committed.begin(), u_committed.end(), 0.0);
+                double step = (1.0 - lambda1) / static_cast<double>(plastic_increments);
+                const double min_step = step / 32.0;
+                const int max_attempts = 16 * plastic_increments + 64;
+                double next_target = lambda1;
+                for (int attempt = 0; attempt < max_attempts && lambda < 1.0 - 1e-12;
+                     ++attempt) {
+                    if (cancelled()) return cancel_result();
+                    const Inc st = run_increment(std::min(1.0, next_target));
+                    if (st == Inc::Fatal) return res;
+                    if (st == Inc::Separated) {
+                        res.error = mech_error;
+                        if (plastic_report) {
+                            plastic_report->increments = increments_done;
+                            plastic_report->newton_iterations_total = newton_total;
+                            plastic_report->load_fraction = lambda;
+                        }
+                        if (contact_report && contact_mode)
+                            contact_report->contact_iterations = last_newton_iters;
+                        return res;
+                    }
+                    if (st == Inc::Converged) {
+                        if (!assemble_state(u_cur, kCommit)) {
+                            res.error =
+                                "fea_static: plastic state commit failed on a "
+                                "degenerate element";
+                            return res;
+                        }
+                        u_committed = u_cur;
+                        active_committed = contact_active;
+                        lambda = std::min(1.0, next_target);
+                        ++increments_done;
+                        if (lambda >= 1.0 - 1e-12) full_load = true;
+                        prof.note("plastic increment %d: lambda=%.5f (step %.5f), %d "
+                                  "Newton iteration(s) so far",
+                                  increments_done, lambda, step, newton_total);
+                        next_target = lambda + step;
+                    } else {
+                        step *= 0.5;
+                        contact_active = active_committed;
+                        if (step < min_step) break;
+                        next_target = lambda + step;
+                        prof.note("plastic increment did not converge — retrying at "
+                                  "step %.6f", step);
+                    }
+                }
+            }
+            u_cur = u_committed;
+            contact_active = active_committed;
+            prof.mark("plastic load steps");
+            // Plastic-state statistics, measured on the COMMITTED state — they are
+            // reported on the refusal too, because the load fraction and how far the
+            // material got are the whole diagnosis of a collapse.
+            double max_eq = 0.0, plastic_vol = 0.0, total_vol = 0.0;
+            for (std::size_t i = 0; i < eq_plastic.size(); ++i) {
+                max_eq = std::max(max_eq, eq_plastic[i]);
+                total_vol += gp_volume[i];
+                if (eq_plastic[i] > 0.0) plastic_vol += gp_volume[i];
+            }
+            // Nodal equivalent plastic strain: the mean of the incident elements' own
+            // Gauss-point mean. It is the field a reader opens in ParaView; the peak
+            // in the report stays the Gauss-point maximum above, which no averaging
+            // can flatten.
+            res.equivalent_plastic_strain.assign(static_cast<std::size_t>(n_nodes), 0.0);
+            {
+                std::vector<int> count(static_cast<std::size_t>(n_nodes), 0);
+                for (int e = 0; e < n_tets; ++e) {
+                    double sum = 0.0;
+                    for (int g = 0; g < plastic_ngp; ++g)
+                        sum += eq_plastic[static_cast<std::size_t>(e) * plastic_ngp + g];
+                    const double mean = sum / static_cast<double>(plastic_ngp);
+                    for (int j = 0; j < stride; ++j) {
+                        const int nid = tets[static_cast<std::size_t>(e) * stride + j];
+                        res.equivalent_plastic_strain[static_cast<std::size_t>(nid)] +=
+                            mean;
+                        ++count[static_cast<std::size_t>(nid)];
+                    }
+                }
+                int yielded = 0;
+                for (int i = 0; i < n_nodes; ++i) {
+                    if (count[static_cast<std::size_t>(i)] > 0)
+                        res.equivalent_plastic_strain[static_cast<std::size_t>(i)] /=
+                            count[static_cast<std::size_t>(i)];
+                    if (res.equivalent_plastic_strain[static_cast<std::size_t>(i)] > 0.0)
+                        ++yielded;
+                }
+                if (plastic_report) plastic_report->yielded_nodes = yielded;
+            }
+            if (plastic_report) {
+                plastic_report->increments = increments_done;
+                plastic_report->newton_iterations_total = newton_total;
+                plastic_report->converged = full_load;
+                plastic_report->load_fraction = lambda;
+                plastic_report->max_equivalent_plastic_strain = max_eq;
+                plastic_report->plastic_volume_mm3 = plastic_vol;
+                plastic_report->plastic_fraction =
+                    total_vol > 0.0 ? plastic_vol / total_vol : 0.0;
+            }
+            if (contact_report && contact_mode) {
+                contact_report->contact_iterations = last_newton_iters;
+                contact_report->converged = contact_settled && full_load;
+            }
+            if (!full_load) {
+                res.error =
+                    "fea_static: elastic-plastic collapse — no equilibrium exists past " +
+                    std::to_string(lambda * 100.0) +
+                    "% of the applied load. " + std::to_string(increments_done) +
+                    " increment(s) converged and then the load step had to be halved to "
+                    "below 1/32 of the requested increment without Newton converging, "
+                    "which is what a COLLAPSE MECHANISM looks like: the yielded region "
+                    "has spread across the section, so there is no stiffer configuration "
+                    "for the next increment to find. The limit load of this model is "
+                    "about " +
+                    std::to_string(lambda) +
+                    "x the load you applied. Reduce the load below that, give the "
+                    "material a non-zero plasticity hardening_mpa (a perfectly plastic "
+                    "section has no reserve past its plastic hinge), or raise "
+                    "plasticity yield_mpa if the material really is stronger. The last "
+                    "iterate is NOT reported: it is not a stress state, it is a Newton "
+                    "step that failed.";
+                return res;
+            }
+            uf.setZero(n_free);
+            for (int d = 0; d < n_dof; ++d)
+                if (reduced[d] >= 0)
+                    uf(reduced[d]) = u_committed[static_cast<std::size_t>(d)];
+            solved = true;
+            res.solver = solver_label;
+        } else if (contact_mode) {
+            // ── Unilateral frictionless contact: active-set loop ──────────────
+            // Kff (elements + bond ties) is the CACHED part: an iteration only rebuilds
+            // the spring block Ks from the current active set and factors Kff + Ks. The
+            // element assembly above never runs twice.
+            //
+            // Per active pair, with n̂ the pair normal and g = gap0 + n̂·(u_b - u_a):
+            //   stiffness  k·(n̂ n̂ᵀ) on the (a,b) block, + kt·(I - n̂ n̂ᵀ) stabilization
+            //   RHS        +k·gap0·n̂ at a, -k·gap0·n̂ at b   (the constant part of k·g)
+            // so the solved pair carries the normal force k·g: negative (compressive)
+            // while penetrating, positive (tensile — not allowed) once separated.
             // The pattern already carries every CANDIDATE pair, so K's sparsity is
             // invariant across the loop: an iteration restores the element+bond values
             // and adds only the ACTIVE springs. The symbolic analysis (ordering +
@@ -1680,33 +2589,9 @@ static FeaStaticResult solve_impl(const std::vector<double>& points,
                 // (1) Mechanism gate on the CURRENT active set. A part whose contact has
                 // fully separated is free to fly off; its "solution" is arbitrary.
                 {
-                    std::vector<int> parent = base_parent;
-                    for (int p = 0; p < n_pairs; ++p)
-                        if (contact_active[static_cast<std::size_t>(p)])
-                            uf_unite(parent, pairs[static_cast<std::size_t>(p)].a,
-                                     pairs[static_cast<std::size_t>(p)].b);
-                    std::set<int> anchored;
-                    for (int nid : fixed_nodes) anchored.insert(uf_find(parent, nid));
-                    std::set<int> floating;
-                    for (int i = 0; i < n_nodes; ++i) {
-                        if (!meshed[static_cast<std::size_t>(i)]) continue;
-                        const int root = uf_find(parent, i);
-                        if (!anchored.count(root)) floating.insert(root);
-                    }
-                    if (!floating.empty()) {
-                        int still_active = 0;
-                        for (char c : contact_active) still_active += c ? 1 : 0;
-                        res.error =
-                            "fea_static: contact separated — " +
-                            std::to_string(floating.size()) +
-                            " mesh component(s) reach no fixture with " +
-                            std::to_string(still_active) + " of " +
-                            std::to_string(n_pairs) +
-                            " candidate contact pair(s) still active (iteration " +
-                            std::to_string(iter) +
-                            "). The load pulls the parts APART, so nothing holds them: a "
-                            "unilateral contact carries compression only. Reverse the load "
-                            "into the joint, or fixture the lifting part.";
+                    const std::string mech = contact_mechanism_error(iter);
+                    if (!mech.empty()) {
+                        res.error = mech;
                         return res;
                     }
                 }
@@ -1975,7 +2860,8 @@ static FeaStaticResult solve_impl(const std::vector<double>& points,
                     Eigen::Matrix<double, 6, 24> B;
                     double detJ;
                     if (!hex8_B_at(ep, hg.pt[g][0], hg.pt[g][1], hg.pt[g][2], B, detJ)) continue;
-                    fe += B.transpose() * (C * (B * ue)) * (std::abs(detJ) * hg.w[g]);
+                    fe += B.transpose() * plastic_stress(e, g, B * ue) *
+                          (std::abs(detJ) * hg.w[g]);
                 }
                 scatter(8, fe.data());
             } else if (tet10) {
@@ -1992,7 +2878,8 @@ static FeaStaticResult solve_impl(const std::vector<double>& points,
                     if (!tet10_B_at(ep, gauss.pt[g][0], gauss.pt[g][1], gauss.pt[g][2], B,
                                     detJ, dNxyz))
                         continue;
-                    fe += B.transpose() * (C * (B * ue)) * (std::abs(detJ) * gauss.w[g]);
+                    fe += B.transpose() * plastic_stress(e, g, B * ue) *
+                          (std::abs(detJ) * gauss.w[g]);
                 }
                 scatter(10, fe.data());
             } else {
@@ -2005,7 +2892,7 @@ static FeaStaticResult solve_impl(const std::vector<double>& points,
                 for (int j = 0; j < 4; ++j)
                     for (int k = 0; k < 3; ++k) ue(j * 3 + k) = u_full[tn[j] * 3 + k];
                 const Eigen::Matrix<double, 12, 1> fe =
-                    B.transpose() * (C * (B * ue)) * vol;
+                    B.transpose() * plastic_stress(e, 0, B * ue) * vol;
                 scatter(4, fe.data());
             }
         }
@@ -2216,7 +3103,7 @@ static FeaStaticResult solve_impl(const std::vector<double>& points,
                 if (!hex8_B_at(ep, hg_stress.pt[g][0], hg_stress.pt[g][1], hg_stress.pt[g][2],
                                B, detJ))
                     continue;
-                stress_avg += C * (B * ue);
+                stress_avg += plastic_stress(e, g, B * ue);
                 ++ngp;
             }
             if (ngp == 0) return out;
@@ -2239,7 +3126,7 @@ static FeaStaticResult solve_impl(const std::vector<double>& points,
                 if (!tet10_B_at(ep, gauss.pt[g][0], gauss.pt[g][1], gauss.pt[g][2], B, detJ,
                                 dNxyz))
                     continue;
-                gp.col(ngp++) = C * (B * ue);
+                gp.col(ngp++) = plastic_stress(e, g, B * ue);
             }
             if (ngp == 4) {
                 const Eigen::Matrix<double, 6, 1> gsum = gp.rowwise().sum();
@@ -2271,7 +3158,7 @@ static FeaStaticResult solve_impl(const std::vector<double>& points,
             Eigen::Matrix<double, 12, 1> ue;
             for (int j = 0; j < 4; ++j)
                 for (int k = 0; k < 3; ++k) ue(j * 3 + k) = u_full[tn[j] * 3 + k];
-            const NodeStress st = node_state(C * (B * ue));
+            const NodeStress st = node_state(plastic_stress(e, 0, B * ue));
             for (int j = 0; j < 4; ++j) out.n[j] = st;
         }
         out.ok = true;
@@ -2471,7 +3358,7 @@ FeaStaticResult fea_static_solve(const std::vector<double>& points, const std::v
                                  const SimCancelToken& cancel_token) {
     return solve_impl(points, tets, E_mpa, nu, yield_mpa, fixed_nodes, nodal_forces,
                       nodes_per_elem, bond_springs, {}, FeaContactOptions{}, nullptr,
-                      cancel_token);
+                      nullptr, nullptr, cancel_token);
 }
 
 FeaStaticResult fea_static_solve_contact(
@@ -2492,7 +3379,31 @@ FeaStaticResult fea_static_solve_contact(
     }
     return solve_impl(points, tets, E_mpa, nu, yield_mpa, fixed_nodes, nodal_forces,
                       nodes_per_elem, bond_springs, contact_springs, options, &report,
-                      cancel_token);
+                      nullptr, nullptr, cancel_token);
+}
+
+FeaStaticResult fea_static_solve_plastic(
+    const std::vector<double>& points, const std::vector<int>& tets, double E_mpa,
+    double nu, double yield_mpa, const std::vector<int>& fixed_nodes,
+    const std::vector<double>& nodal_forces, int nodes_per_elem,
+    const std::vector<BondSpring>& bond_springs,
+    const std::vector<ContactSpring>& contact_springs, const FeaContactOptions& options,
+    const FeaPlasticity& plasticity, FeaContactReport& contact_report,
+    FeaPlasticReport& plastic_report, const SimCancelToken& cancel_token) {
+    contact_report = FeaContactReport{};
+    plastic_report = FeaPlasticReport{};
+    if (!plasticity.enabled) {
+        FeaStaticResult res;
+        res.n_dof = static_cast<int>(points.size());
+        res.error =
+            "fea_static: fea_static_solve_plastic was called with plasticity disabled — "
+            "use fea_static_solve or fea_static_solve_contact for the linear-elastic "
+            "law.";
+        return res;
+    }
+    return solve_impl(points, tets, E_mpa, nu, yield_mpa, fixed_nodes, nodal_forces,
+                      nodes_per_elem, bond_springs, contact_springs, options,
+                      &contact_report, &plasticity, &plastic_report, cancel_token);
 }
 
 }  // namespace chudware::sim

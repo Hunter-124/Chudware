@@ -2544,3 +2544,24 @@ target_link_libraries(test_fea_contact PRIVATE chudware_sim)
 set_target_properties(test_fea_contact PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 add_test(NAME fea_contact COMMAND test_fea_contact)
+
+# ── Small-strain J2 plasticity (elastic-plastic statics and contact) ────────────
+# The material law that lets a bearing edge redistribute: radial return at every
+# Gauss point with a consistent tangent, under an incremental Newton-Raphson load
+# ladder, with the contact active-set loop running INSIDE each load increment.
+# Gates (OCCT-/mesher-free inline meshes, so it links only chudware_sim):
+#   (a) an axial bar past yield reproduces the BILINEAR closed form — stress = F/A
+#       to 0.5 %, equivalent plastic strain (F/A - Y)/H to 1 %;
+#   (b) the same bar PERFECTLY plastic at 1.2x its limit load is REFUSED as a
+#       collapse mechanism at a load fraction equal to the limit load, with no
+#       stress field offered; below the limit it converges;
+#   (c) pin-on-edge bearing (test_fea_contact's pin-in-a-clearance-bore geometry),
+#       elastic vs plastic on the same mesh and load -> the plastic patch grows
+#       >= 3x and the mean pressure falls to about yield;
+#   (d) the converged answer is stable in the load-increment count (4 vs 16).
+add_executable(test_fea_plastic tests/test_fea_plastic.cpp)
+target_include_directories(test_fea_plastic PRIVATE ${doctest_SOURCE_DIR})
+target_link_libraries(test_fea_plastic PRIVATE chudware_sim)
+set_target_properties(test_fea_plastic PROPERTIES
+  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+add_test(NAME fea_plastic COMMAND test_fea_plastic)

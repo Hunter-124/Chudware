@@ -17,6 +17,7 @@ suites); the services/mcp conftest gives the run its own private hostd.
 from __future__ import annotations
 
 import json
+import re
 import sys
 from pathlib import Path
 
@@ -89,7 +90,8 @@ def _stacked_boxes(tools: dict, name: str) -> str:
     return doc
 
 
-def _contact(tools: dict, doc: str, fz: float, vtu: str = None) -> dict:
+def _contact(tools: dict, doc: str, fz: float, vtu: str = None,
+             plasticity: dict = None) -> dict:
     return json.loads(tools["run_fea_contact"](
         fixtures=["bottom"],
         load={"face": "top", "force": [0.0, 0.0, fz]},
@@ -98,6 +100,7 @@ def _contact(tools: dict, doc: str, fz: float, vtu: str = None) -> dict:
         mesh_size_mm=6.0,
         doc_id=doc,
         vtu_path=vtu,
+        plasticity=plasticity,
     ))
 
 
@@ -151,6 +154,116 @@ def test_pull_apart_is_refused_as_a_mechanism(tools):
     out = _contact(tools, _stacked_boxes(tools, "contact_live_pull"), FORCE_N)
     assert out.get("ok") is False, out
     assert "contact separated" in out.get("error", ""), out
+
+
+# ── material.plasticity across the MCP seam ─────────────────────────────────────
+# The law itself is gated by ctest ``fea_plastic`` (bilinear closed form, collapse
+# refusal, patch growth on a pin-on-edge bearing). What is only observable HERE is
+# the seam: that ``plasticity=`` reaches the engine as ``study.material.plasticity``,
+# that the packet an agent reads carries the block and the nodal field, that the .vtu
+# gains the array, and that the two refusals arrive as refusals.
+PLASTICITY_KEYS = {
+    "enabled", "yield_mpa", "hardening_mpa", "tol", "requested_increments",
+    "increments", "newton_iterations_total", "converged", "load_fraction",
+    "max_equivalent_plastic_strain", "plastic_volume_mm3", "plastic_fraction",
+    "yielded_nodes",
+}
+# A 20 x 20 mm seat carrying 4000 N is a 10 MPa nominal stress, so a 5 MPa yield puts
+# the whole interface into the hardening branch at the load the elastic sibling test
+# already uses. Real steel would need 100 kN for the same picture and a much finer
+# mesh to resolve it; the law does not care which number is small.
+SOFT_YIELD_MPA = 5.0
+HARDENING_MPA = 200.0
+
+
+def test_plasticity_caps_the_seat_stress_and_reports_its_state(tools, tmp_path):
+    doc = _stacked_boxes(tools, "contact_live_plastic")
+    elastic = _contact(tools, doc, -FORCE_N)
+    assert elastic.get("ok"), elastic.get("error")
+    assert "plasticity" not in elastic, "an elastic run must not claim a plastic state"
+
+    vtu = str(tmp_path / "plastic.vtu")
+    out = _contact(tools, doc, -FORCE_N, vtu, plasticity={
+        "yield_mpa": SOFT_YIELD_MPA,
+        "hardening_mpa": HARDENING_MPA,
+        "max_increments": 6,
+    })
+    assert out.get("ok"), out.get("error")
+    pl = out["plasticity"]
+    assert set(pl) == PLASTICITY_KEYS, sorted(set(pl) ^ PLASTICITY_KEYS)
+    assert pl["enabled"] is True and pl["converged"] is True, pl
+    assert pl["yield_mpa"] == SOFT_YIELD_MPA and pl["hardening_mpa"] == HARDENING_MPA
+    assert abs(pl["load_fraction"] - 1.0) < 1e-6, pl
+    assert pl["requested_increments"] == 6, pl
+    assert pl["increments"] >= 1 and pl["newton_iterations_total"] >= 1, pl
+    # The seat really yielded, and the packet says how much of the part did.
+    assert pl["max_equivalent_plastic_strain"] > 0.0, pl
+    assert pl["yielded_nodes"] > 0, pl
+    assert 0.0 < pl["plastic_fraction"] <= 1.0, pl
+    assert pl["plastic_volume_mm3"] > 0.0, pl
+
+    # The observable difference from the elastic run: the stress is BOUNDED by the flow
+    # stress the law admits, where the elastic answer is not bounded by anything.
+    flow = SOFT_YIELD_MPA + HARDENING_MPA * pl["max_equivalent_plastic_strain"]
+    plastic_peak = out["summary"]["max_von_mises_raw_mpa"]
+    elastic_peak = elastic["summary"]["max_von_mises_raw_mpa"]
+    assert plastic_peak <= flow * 1.02, (plastic_peak, flow)
+    assert plastic_peak < elastic_peak, (plastic_peak, elastic_peak)
+    # Still a contact solve, still in equilibrium, and the load still crosses the seat.
+    assert out["contact"]["converged"] is True, out["contact"]
+    assert out["reactions"]["equilibrium_error_pct"] < 1.0, out["reactions"]
+    assert abs(out["contact"]["pairs"][0]["contact_force_n"] - FORCE_N) < 0.05 * FORCE_N
+
+    # The field that says WHERE it yielded rides in the .vtu. (Nodal arrays do not
+    # cross this seam — the MCP envelope carries scalars and evidence blocks, and the
+    # engine's own sim_run_static reply is where equivalent_plastic_strain[] lives.)
+    assert out["vtu_path"] == vtu, out.get("vtu_path")
+    assert "equivalent_plastic_strain" in Path(vtu).read_text()
+
+
+def test_plasticity_past_the_limit_load_is_refused_with_the_load_fraction(tools):
+    # Perfectly plastic (no hardening) at twice the section's limit load: there is no
+    # equilibrium, so the run must refuse and say where it ran out.
+    doc = _stacked_boxes(tools, "contact_live_collapse")
+    out = _contact(tools, doc, -FORCE_N, plasticity={
+        "yield_mpa": SOFT_YIELD_MPA, "hardening_mpa": 0.0, "max_increments": 6,
+    })
+    assert out.get("ok") is False, out
+    err = out.get("error", "")
+    assert "elastic-plastic collapse" in err, err
+    # The refusal is QUANTITATIVE: it names the load fraction that was carried, which
+    # for 4000 N over a 20 x 20 mm section at a 5 MPa yield is about half (limit load
+    # 2000 N). Without that number a collapse refusal is not actionable.
+    frac = float(re.search(r"no equilibrium exists past ([0-9.]+)%", err).group(1))
+    assert 20.0 < frac < 80.0, err
+    assert "summary" not in out, "a collapsed run must not report a stress state"
+
+
+def test_plasticity_is_refused_where_it_would_be_ignored(tools):
+    doc = _stacked_boxes(tools, "contact_live_plastic_refuse")
+    # In the material dict it would be an elastic answer under a plastic label.
+    out = json.loads(tools["run_fea_static"](
+        fixtures=["bottom"],
+        loads=[{"face": "top", "force": [0.0, 0.0, -FORCE_N]}],
+        material={"E_mpa": 200000.0, "nu": 0.3, "yield_mpa": 250.0,
+                  "plasticity": {"hardening_mpa": 1000.0}},
+        doc_id=doc,
+    ))
+    assert out.get("ok") is False, out
+    assert "not a material property" in out.get("error", ""), out.get("error")
+    # And a modal study has no stress for a yield surface to bound.
+    modal = cb.call("sim_run_modal", {
+        "study": {
+            "mesh": {"points": [[0, 0, 0], [1, 0, 0], [0, 1, 0], [0, 0, 1]],
+                     "tets": [[0, 1, 2, 3]]},
+            "material": {"E_mpa": 200000.0, "nu": 0.3, "density_g_cm3": 7.85,
+                         "plasticity": {"hardening_mpa": 1000.0}},
+            "fixtures": [],
+        },
+        "n_modes": 1,
+    })
+    assert modal.get("ok") is False, modal
+    assert "not applicable to a modal study" in modal.get("error", ""), modal
 
 
 if __name__ == "__main__":

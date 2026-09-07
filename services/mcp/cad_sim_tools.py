@@ -375,6 +375,23 @@ def _resolve_study_material(
     """Resolve a material and enforce only the properties the selected physics consumes."""
     raw = coerce_json_or_repr(material)
     if isinstance(raw, dict):
+        # `plasticity` is a LAW, not a property, and only two studies solve it. Naming
+        # it here means a caller that put it in the material dict — or aimed it at
+        # modal/buckling/thermal/fatigue, where it would be an elastic answer under a
+        # plastic label — is told where it belongs instead of reading a generic
+        # unsupported-property list.
+        if any(_norm_key(k) == "plasticity" for k in raw):
+            raise ValueError(
+                "material.plasticity is not a material property and is not accepted in "
+                "the material dict. Small-strain J2 plasticity is a parameter of the "
+                "STATIC and CONTACT solvers only: pass "
+                'plasticity={"yield_mpa": 276, "hardening_mpa": 1200} to '
+                "run_fea_static or run_fea_contact. It is refused for modal "
+                "(eigenvalues linearize about an unstressed state, so they stay "
+                "elastic), buckling (a critical multiplier is defined only for a "
+                "linear pre-buckling response), thermal (no stress to bound) and "
+                "fatigue (its S-N curves are nominal-elastic-stress curves)."
+            )
         unknown = [k for k in raw if _norm_key(k) not in _MATERIAL_INPUT_KEY_NORMS]
         if unknown:
             raise ValueError(
@@ -1335,6 +1352,78 @@ def _norm_mesh_size_mm(mesh_size_mm, mesh_fineness: float) -> Optional[float]:
     return size
 
 
+def _norm_plasticity(plasticity, mat: dict) -> Optional[dict]:
+    """Validate and canonicalize the `plasticity=` argument of run_fea_static/contact.
+
+    None / False / {} means "elastic", which is the default every existing caller gets.
+    Anything else must be a dict of {yield_mpa, hardening_mpa, max_increments, tol};
+    yield_mpa defaults to the resolved material's own yield strength, which is the
+    number summary.min_fos is already measured against, so the two cannot disagree.
+    """
+    if plasticity is None or plasticity is False:
+        return None
+    raw = coerce_json_or_repr(plasticity)
+    if raw is None or raw is False:
+        return None
+    if raw is True:
+        raw = {}
+    if not isinstance(raw, dict):
+        raise ValueError(
+            "plasticity must be a dict, e.g. "
+            '{"yield_mpa": 276, "hardening_mpa": 1200, "max_increments": 10}; '
+            "omit it (or pass None) for the linear-elastic material."
+        )
+    canon_by_norm = {
+        _norm_key(k): k
+        for k in ("yield_mpa", "hardening_mpa", "max_increments", "tol")
+    }
+    unknown = sorted(k for k in raw if _norm_key(k) not in canon_by_norm)
+    if unknown:
+        raise ValueError(
+            f"plasticity has unsupported keys {unknown!r}; refusing to ignore them. "
+            "Supported: yield_mpa (MPa, defaults to material.yield_mpa), "
+            "hardening_mpa (post-yield TANGENT MODULUS in MPa, 0 = perfectly "
+            "plastic), max_increments (load steps, default 10), tol (relative "
+            "residual, default 1e-3)."
+        )
+    canon = {canon_by_norm[_norm_key(k)]: v for k, v in raw.items()}
+    out: dict = {"enabled": True}
+    yield_mpa = canon.get("yield_mpa", mat.get("yield_mpa"))
+    out["yield_mpa"] = _finite_float(yield_mpa, "plasticity.yield_mpa")
+    if out["yield_mpa"] <= 0.0:
+        raise ValueError("plasticity.yield_mpa must be > 0")
+    hardening = _finite_float(
+        canon.get("hardening_mpa", 0.0), "plasticity.hardening_mpa"
+    )
+    if hardening < 0.0:
+        raise ValueError(
+            "plasticity.hardening_mpa is a post-yield TANGENT MODULUS in MPa and must "
+            "be >= 0; 0 means perfectly plastic (a flat yield plateau). It is not a "
+            "ratio of E — for structural steel it is about 1000-2000 MPa."
+        )
+    out["hardening_mpa"] = hardening
+    if "max_increments" in canon:
+        inc = canon["max_increments"]
+        if isinstance(inc, bool) or not isinstance(inc, int):
+            raise ValueError(
+                "plasticity.max_increments must be an integer from 1 through 1000"
+            )
+        if not 1 <= inc <= 1000:
+            raise ValueError(
+                "plasticity.max_increments must be an integer from 1 through 1000"
+            )
+        out["max_increments"] = inc
+    if "tol" in canon:
+        tol = _finite_float(canon["tol"], "plasticity.tol")
+        if not 0.0 < tol < 1.0:
+            raise ValueError(
+                "plasticity.tol is a RELATIVE residual tolerance "
+                "(||out-of-balance force|| / ||applied load||) and must be in (0, 1)"
+            )
+        out["tol"] = tol
+    return out
+
+
 def _build_static_study(
     fixtures,
     loads,
@@ -1347,6 +1436,7 @@ def _build_static_study(
     vtu_path: Optional[str] = None,
     export_system_path: Optional[str] = None,
     target_size_mm: Optional[float] = None,
+    plasticity: Optional[dict] = None,
 ) -> dict:
     """SETUP stage for run_fea_static / sim_run(analysis="fea_static")."""
     d = _doc(doc_id)
@@ -1370,6 +1460,9 @@ def _build_static_study(
     vtu_path = _norm_vtu_path(vtu_path)
     export_system_path = _norm_abs_out_path(export_system_path, "export_system_path")
     mat = _resolve_study_material(material, "static")
+    plasticity = _norm_plasticity(plasticity, mat)
+    if plasticity is not None:
+        mat = {**mat, "plasticity": plasticity}
     advisor = _advisor_params(learned_advisor, advisor_max_dof)
     # fixtures=[] and "fixtures that resolved to nothing" are DIFFERENT mistakes, and the
     # single old message diagnosed the wrong one — it told a caller who supplied no queries
@@ -1504,6 +1597,7 @@ def _build_contact_study(
     notes: list,
     vtu_path: Optional[str] = None,
     interface_size_mm: Optional[float] = None,
+    plasticity: Optional[dict] = None,
 ) -> dict:
     """SETUP stage for run_fea_contact.
 
@@ -1550,6 +1644,7 @@ def _build_contact_study(
         doc_id,
         notes,
         vtu_path=vtu_path,
+        plasticity=plasticity,
     )
     ctx["study"]["mesh_order"] = mesh_order
     if mesh_size_mm is not None:
@@ -1563,6 +1658,7 @@ def _build_contact_study(
     if interface_size_mm is not None:
         ctx["study"]["contact"]["interface_size_mm"] = interface_size_mm
     ctx["interface_size_mm"] = interface_size_mm
+    ctx["plasticity"] = ctx["study"]["material"].get("plasticity")
     # A face filter wider than the clearance is a defect the caller can fix from the
     # reply, and the comparison needs neither a mesh nor a solve — so it is said now,
     # not after minutes of meshing and an engine refusal.
@@ -1780,6 +1876,7 @@ _EVIDENCE_KEYS = (
     "provenance",
     "vtu_path",
     "contact",
+    "plasticity",
 )
 
 
@@ -1941,6 +2038,10 @@ def _collect_contact(ctx: dict, res: dict, notes: list) -> dict:
         # Forward the engine's contact evidence onto the refusal as well.
         if isinstance(res.get("contact"), dict):
             out["contact"] = res["contact"]
+        # A plastic collapse refusal is only actionable with the load fraction it
+        # reached, so the plasticity block rides on the refusal too.
+        if isinstance(res.get("plasticity"), dict):
+            out["plasticity"] = res["plasticity"]
         return out
     contact = out.get("contact") or {}
     active = contact.get("active_pairs")
@@ -3431,6 +3532,7 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
         material: Union[str, dict] = "steel",
         mesh_fineness: Union[float, str] = _DEFAULT_FINENESS,
         mesh_size_mm: Optional[float] = None,
+        plasticity: Optional[dict] = None,
         learned_advisor: bool = False,
         advisor_max_dof: int = 0,
         doc_id: Optional[str] = None,
@@ -3463,6 +3565,43 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
                    spelling and the ONLY way to re-solve one run_fea_convergence leg on
                    the mesh that produced its number — pass the leg's size_mm together
                    with vtu_path to write that leg's field.
+        plasticity : opt-in SMALL-STRAIN J2 (von Mises) ELASTIC-PLASTIC material, as
+                   {yield_mpa, hardening_mpa, max_increments, tol}. Omitted = the
+                   linear-elastic solve this tool has always done.
+                     yield_mpa      initial yield (MPa); omitted uses material.yield_mpa
+                     hardening_mpa  post-yield TANGENT MODULUS in MPa — NOT a ratio of
+                                    E. 0 = perfectly plastic (a flat plateau, so the
+                                    part has no reserve past its plastic hinge);
+                                    structural steel is about 1000-2000 MPa
+                     max_increments load steps over [first yield, full load], default
+                                    10; a non-converging step is halved automatically
+                     tol            relative residual tolerance, default 1e-3
+                   WHAT IT IS FOR: a linear-elastic solve cannot redistribute. Where a
+                   sharp edge or a small bearing patch takes the load, the elastic
+                   answer funnels all of it through however many nodes the mesh put
+                   there and reports a stress the material could never carry (the case
+                   this exists for: 1446 N through 12 node pairs on a hinge saddle
+                   edge, 450 MPa mean against a 276 MPa yield). With the law on, that
+                   edge YIELDS, the load spreads until it fits inside the flow stress,
+                   and summary.max_von_mises_mpa comes back capped at
+                   yield + hardening_mpa * plasticity.max_equivalent_plastic_strain.
+                   Reach for it when an elastic peak sits well above yield in a small
+                   region and you need to know whether the part survives by yielding
+                   locally rather than what the singular peak says.
+                   Returns a top-level "plasticity" block: {enabled, yield_mpa,
+                   hardening_mpa, tol, requested_increments, increments,
+                   newton_iterations_total, converged, load_fraction,
+                   max_equivalent_plastic_strain, plastic_volume_mm3,
+                   plastic_fraction, yielded_nodes}, plus the nodal field
+                   "equivalent_plastic_strain" (also written into any vtu_path).
+                   REFUSALS, both of them physics and not preference: a load past the
+                   part's LIMIT LOAD is refused as a collapse mechanism naming the
+                   load_fraction it did carry (there is no equilibrium to report, and a
+                   last Newton iterate is not a stress state); and a peak plastic
+                   strain over 5 % raises a "warnings" entry, because the mesh is never
+                   updated and past a few percent the geometry itself has changed.
+                   Not accepted by run_fea_modal / run_fea_buckling / run_fea_thermal /
+                   the fatigue tools, and not combinable with an adaptive run.
         learned_advisor : opt-in Polyhedral-FEA sizing/order advice; false by default.
         advisor_max_dof : optional non-negative advisor budget; 0 leaves it unset.
         background : if True, return a job_id immediately and solve in a separate process —
@@ -3541,6 +3680,7 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
                 vtu_path=vtu_path,
                 export_system_path=export_system_path,
                 target_size_mm=mesh_size_mm,
+                plasticity=plasticity,
             )
             _autosave_all_open()  # R-1 guard: protect every open doc before the solve starts
             return _dumps(
@@ -5613,6 +5753,7 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
         max_iterations: int = 25,
         mesh_size_mm: Optional[float] = None,
         interface_size_mm: Optional[float] = None,
+        plasticity: Optional[dict] = None,
         mesh_order: int = 1,
         doc_id: Optional[str] = None,
         vtu_path: Optional[str] = None,
@@ -5672,6 +5813,28 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
                    0.35 mm keyway clearance, 0.09-0.14 mm. Resolving the same clearance
                    with mesh_size_mm instead means meshing the WHOLE part that fine — the
                    case that motivated this knob needed 1.16M elements that way.
+        plasticity : opt-in SMALL-STRAIN J2 elastic-plastic material, same dict as
+                   run_fea_static ({yield_mpa, hardening_mpa, max_increments, tol};
+                   hardening_mpa is a TANGENT MODULUS in MPa, 0 = perfectly plastic).
+                   THIS IS THE ANSWER TO A BEARING EDGE. A frictionless linear-elastic
+                   contact cannot redistribute: whatever arc the geometry closes takes
+                   the whole load at whatever pressure that implies, and on a sharp
+                   seat that is a number the steel could never carry (the case this
+                   exists for: 1446 N through 12 node pairs on a hinge saddle,
+                   450 MPa mean against a 276 MPa yield, with no mechanism in the model
+                   by which it could spread). With plasticity on, the ACTIVE-SET LOOP
+                   RUNS INSIDE EACH LOAD INCREMENT — contact state and plastic state
+                   both advance per increment — so the edge yields and the patch grows
+                   within the increment instead of one lagging the other. Measured on
+                   the pin-on-edge gate at 16 kN: contact_area_mm2 19.6 -> 70.3 (3.6x)
+                   and mean_contact_pressure_mpa 810 -> 226 (3.2x yield -> 0.9x yield).
+                   Read contact.contact_area_mm2 and contact.mean_contact_pressure_mpa
+                   against the elastic run, and the top-level "plasticity" block
+                   (max_equivalent_plastic_strain, plastic_fraction, yielded_nodes,
+                   load_fraction, converged) for how much of the part paid for it. A
+                   peak plastic strain over 5 % raises a "warnings" entry: the mesh is
+                   never updated, so past that the patch the solve spread the load over
+                   is not the patch the part has.
         mesh_order : 1 = tet4 (default, fastest), 2 = tet10.
         vtu_path : optional ABSOLUTE .vtu path for the solved fields, as for
                    run_fea_static (displacement, von_mises and the summary_node mask).
@@ -5799,6 +5962,7 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
                 bc_notes,
                 vtu_path=vtu_path,
                 interface_size_mm=interface_size_mm,
+                plasticity=plasticity,
             )
             _autosave_all_open()  # R-1 guard: protect every open doc before the solve starts
             return _dumps(

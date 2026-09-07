@@ -145,6 +145,39 @@ struct MeshQualityFacts {
     int hanging_elems_dropped = 0;
     // Thinnest wall in element sizes (mesher.h MeshOut). 0 = unavailable.
     double thin_wall_ratio = 0.0;
+    // ── The refined region's own quality (mesher.h MeshOut) ──────────────────
+    // A local size contract is delivered by conforming bisection, which is
+    // shapely nowhere except at the interface it was asked for: the ME 490
+    // hinge-latch packet shipped a study whose interface was exactly the
+    // requested size and whose mesh one layer out carried aspect_max 263 and
+    // jacobian_min 0.0029. So the mesher runs a bounded quality pass over that
+    // region and reports what it found and what it left. `active` is false when
+    // the study made no local request, in which case the block is omitted
+    // rather than reported as a row of zeros.
+    bool local_refine_active = false;
+    int local_refine_waves = 0;
+    int local_refine_smoothing_passes = 0;
+    double local_refine_jacobian_min_before = 0.0;
+    double local_refine_jacobian_min_after = 0.0;
+    double local_refine_aspect_max_before = 0.0;
+    double local_refine_aspect_max_after = 0.0;
+    std::uint64_t local_refine_cells_below_floor_before = 0;
+    std::uint64_t local_refine_cells_below_floor_after = 0;
+    bool local_refine_resplit = false;
+    // ── Solids the mesher FUSED, and the sub-element debris it dissolved ────
+    // Both are edits to the DOMAIN the study solves, so both ride with the
+    // packet: a fused body is a different structure from two touching solids
+    // (it carries moment across the weld), and the volume delta is the
+    // interpenetration the design model contained. `bodies` carries one entry
+    // per meshed body with the 1-based STEP solid ordinals that went into it,
+    // which is what lets a rigid-body refusal name an island's body.
+    std::vector<chudware::sim::MeshOut::Body> bodies;
+    int fused_groups = 0;
+    int fused_solids = 0;
+    double fused_overlap_mm3 = 0.0;
+    int debris_components_dissolved = 0;
+    int debris_elems_dropped = 0;
+    double debris_volume_mm3 = 0.0;
     std::string note;
 };
 
@@ -180,6 +213,46 @@ json mesh_quality_json(const MeshQualityFacts& quality, std::size_t n_nodes,
     // mesh-level report must not imply it checked.
     if (quality.unfixed_components >= 0)
         out["unfixed_components"] = quality.unfixed_components;
+    // The refined region's before/after, only where a local request was made.
+    // These describe the REGION the size contract was delivered in, not the
+    // whole mesh — the aspect_max / jacobian_min above still do that — because
+    // a 300 k-element mesh whose refined shell is debris reads healthy on a
+    // whole-mesh statistic.
+    if (quality.local_refine_active)
+        out["local_refine"] =
+            json{{"waves", quality.local_refine_waves},
+                 {"smoothing_passes", quality.local_refine_smoothing_passes},
+                 {"jacobian_min_before", quality.local_refine_jacobian_min_before},
+                 {"jacobian_min_after", quality.local_refine_jacobian_min_after},
+                 {"aspect_max_before", quality.local_refine_aspect_max_before},
+                 {"aspect_max_after", quality.local_refine_aspect_max_after},
+                 {"cells_below_floor_before",
+                  quality.local_refine_cells_below_floor_before},
+                 {"cells_below_floor_after",
+                  quality.local_refine_cells_below_floor_after},
+                 {"resplit", quality.local_refine_resplit}};
+    // ── What the mesher did to the DOMAIN before solving it ─────────────────
+    // Present only when it happened, so a study on one clean solid carries
+    // neither block. `fused_bodies` is per fused body: which 1-based STEP
+    // solid ordinals were welded, the fused volume, and the overlap the fuse
+    // removed — the interpenetration the design model carried, measured.
+    if (quality.fused_groups > 0) {
+        json fused = json::array();
+        for (const auto& body : quality.bodies) {
+            if (body.source_ordinals.size() < 2) continue;
+            fused.push_back(json{{"body_ordinals", body.source_ordinals},
+                                 {"volume_mm3", body.volume_mm3},
+                                 {"overlap_removed_mm3", body.fused_overlap_mm3}});
+        }
+        out["fused_bodies"] = std::move(fused);
+        out["fused_solids"] = quality.fused_solids;
+        out["fused_overlap_mm3"] = quality.fused_overlap_mm3;
+    }
+    if (quality.debris_components_dissolved > 0)
+        out["debris_islands_dissolved"] =
+            json{{"components", quality.debris_components_dissolved},
+                 {"elements", quality.debris_elems_dropped},
+                 {"volume_mm3", quality.debris_volume_mm3}};
     if (!quality.note.empty()) out["note"] = quality.note;
     return out;
 }
@@ -258,7 +331,11 @@ bool write_result_vtu(const nlohmann::json& study, const std::vector<double>& po
     //   max{ von_mises[i] : summary_node[i] == 1 } == summary.max_von_mises_mpa
     //   max{ von_mises[i] }                        == summary.max_von_mises_raw_mpa
     // hold by construction and the field can never silently contradict the packet.
-    for (const char* scalar : {"von_mises", "summary_node", "temperature"}) {
+    // equivalent_plastic_strain rides beside them on an elastic-plastic run: it is the
+    // field that says WHERE the redistribution happened, and a von Mises plot capped
+    // at the flow stress is uninterpretable without it.
+    for (const char* scalar :
+         {"von_mises", "summary_node", "temperature", "equivalent_plastic_strain"}) {
         std::vector<double> values = nodal(scalar);
         if (values.size() == n_nodes)
             fields.push_back(VtuPointField{scalar, 1, std::move(values)});
@@ -558,6 +635,28 @@ double contact_max_gap_mm(const json& study) {
     return std::isfinite(gap) && gap > 0.0 ? gap : 0.5;
 }
 
+// Has the study DECLARED how the interfaces between its bodies are treated? A
+// `contact` block (enabled) or a positive `bond_gap_mm` says the bodies are
+// meant to stay separate and to interact through their surfaces, so the mesher
+// must not fuse touching solids into one body (mesher.h
+// MeshOptions::declared_interfaces). Read leniently for the same reason as the
+// two above: a malformed block refuses the STUDY later, not the mesh.
+bool declares_body_interfaces(const json& study) {
+    if (study.contains("contact") && study["contact"].is_object() &&
+        study["contact"].value("enabled", true))
+        return true;
+    if (study.contains("bond_gap_mm") && study["bond_gap_mm"].is_number() &&
+        study["bond_gap_mm"].get<double>() > 0.0)
+        return true;
+    if (const char* env = std::getenv("CHUDWARE_FEA_BOND_GAP_MM")) {
+        char* end = nullptr;
+        const double parsed = std::strtod(env, &end);
+        if (end != env && *end == '\0' && std::isfinite(parsed) && parsed > 0.0)
+            return true;
+    }
+    return false;
+}
+
 // The contact.resolution block: the discretization facts a reader needs to know
 // whether "contact_force_n / contact_area_mm2" is a pressure or an artefact.
 // Same shape whether the study was refused before the solve (the a-priori
@@ -705,6 +804,7 @@ bool resolve_mesh(const json &study, std::vector<double> &points,
     options.max_size_mm = study.value("max_size_mm", 0.0);
     options.learned_advisor = study.value("learned_advisor", false);
     options.advisor_max_dof = study.value("advisor_max_dof", uint32_t{0});
+    options.declared_interfaces = declares_body_interfaces(study);
     const std::string step_path = study["step_path"].get<std::string>();
     auto mesh = mesh_step_cached(step_path, options);
     if (!mesh->ok) {
@@ -876,6 +976,31 @@ bool resolve_mesh(const json &study, std::vector<double> &points,
     quality.lonely_nodes_repaired = mesh->lonely_nodes_repaired;
     quality.lonely_nodes_remaining = mesh->lonely_nodes_remaining;
     quality.hanging_elems_dropped = mesh->hanging_elems_dropped;
+    quality.bodies = mesh->bodies;
+    quality.fused_groups = mesh->fused_groups;
+    quality.fused_solids = mesh->fused_solids;
+    quality.fused_overlap_mm3 = mesh->fused_overlap_mm3;
+    quality.debris_components_dissolved = mesh->debris_components_dissolved;
+    quality.debris_elems_dropped = mesh->debris_elems_dropped;
+    quality.debris_volume_mm3 = mesh->debris_volume_mm3;
+    // Only a study that actually asked for a local size carries the region
+    // report; `local_refine_size_mm` is the request, and it is zero otherwise.
+    if (mesh->local_refine_size_mm > 0.0) {
+      quality.local_refine_active = true;
+      quality.local_refine_waves = mesh->local_refine_waves;
+      quality.local_refine_smoothing_passes = mesh->local_refine_smoothing_passes;
+      quality.local_refine_jacobian_min_before =
+          mesh->local_refine_jacobian_min_before;
+      quality.local_refine_jacobian_min_after =
+          mesh->local_refine_jacobian_min_after;
+      quality.local_refine_aspect_max_before = mesh->local_refine_aspect_max_before;
+      quality.local_refine_aspect_max_after = mesh->local_refine_aspect_max_after;
+      quality.local_refine_cells_below_floor_before =
+          mesh->local_refine_cells_below_floor_before;
+      quality.local_refine_cells_below_floor_after =
+          mesh->local_refine_cells_below_floor_after;
+      quality.local_refine_resplit = mesh->local_refine_resplit;
+    }
     return true;
   }
   err = "study must have inline points/tets or a step_path";
@@ -1885,6 +2010,84 @@ static nlohmann::json fea_run_static_impl(
         return json{{"ok", false},
                     {"error", "fea_static: material E, Poisson ratio, and yield strength "
                               "must be finite and physically valid"}};
+    // ── material.plasticity ──────────────────────────────────────────────────
+    // Validated at the study gate (not at the solver) so a malformed elastic-plastic
+    // request costs no mesh. yield_mpa defaults to the material's own yield strength,
+    // which is the number summary.min_fos is already measured against.
+    if (material_input.contains("plasticity") &&
+        !material_input["plasticity"].is_null()) {
+        const json& pl = material_input["plasticity"];
+        if (!pl.is_object())
+            return json{{"ok", false},
+                        {"error", "fea_static: material.plasticity must be an object "
+                                  "{yield_mpa, hardening_mpa, max_increments, tol}"}};
+        for (auto it = pl.begin(); it != pl.end(); ++it) {
+            static const std::set<std::string> known = {
+                "enabled", "yield_mpa", "hardening_mpa", "max_increments", "tol"};
+            if (!known.count(it.key()))
+                return json{{"ok", false},
+                            {"error", "fea_static: material.plasticity has unsupported "
+                                      "key '" + it.key() +
+                                          "' — refusing to ignore it. Supported: "
+                                          "enabled, yield_mpa, hardening_mpa, "
+                                          "max_increments, tol"}};
+        }
+        const double pl_yield = pl.contains("yield_mpa") && pl["yield_mpa"].is_number()
+                                    ? pl["yield_mpa"].get<double>()
+                                    : yield_input;
+        const double pl_hard = pl.contains("hardening_mpa")
+                                   ? (pl["hardening_mpa"].is_number()
+                                          ? pl["hardening_mpa"].get<double>()
+                                          : std::numeric_limits<double>::quiet_NaN())
+                                   : 0.0;
+        const double pl_tol =
+            pl.contains("tol") ? (pl["tol"].is_number()
+                                      ? pl["tol"].get<double>()
+                                      : std::numeric_limits<double>::quiet_NaN())
+                               : 1e-3;
+        if (!std::isfinite(pl_yield) || !(pl_yield > 0.0))
+            return json{{"ok", false},
+                        {"error", "fea_static: material.plasticity.yield_mpa must be "
+                                  "finite and > 0 (omit it to use material.yield_mpa)"}};
+        if (!std::isfinite(pl_hard) || pl_hard < 0.0)
+            return json{{"ok", false},
+                        {"error", "fea_static: material.plasticity.hardening_mpa is a "
+                                  "TANGENT MODULUS in MPa (not a ratio of E) and must "
+                                  "be finite and >= 0; 0 means perfectly plastic"}};
+        if (pl_hard >= E_input)
+            return json{{"ok", false},
+                        {"error", "fea_static: material.plasticity.hardening_mpa (" +
+                                      std::to_string(pl_hard) +
+                                      " MPa) is at or above Young's modulus (" +
+                                      std::to_string(E_input) +
+                                      " MPa), so the post-yield branch would be stiffer "
+                                      "than the elastic one. Real metals sit near "
+                                      "E/100 to E/20."}};
+        if (pl.contains("max_increments")) {
+            if (!pl["max_increments"].is_number_integer())
+                return json{{"ok", false},
+                            {"error", "fea_static: material.plasticity.max_increments "
+                                      "must be an integer from 1 through 1000"}};
+            const int inc = pl["max_increments"].get<int>();
+            if (inc < 1 || inc > 1000)
+                return json{{"ok", false},
+                            {"error", "fea_static: material.plasticity.max_increments "
+                                      "must be an integer from 1 through 1000"}};
+        }
+        if (!std::isfinite(pl_tol) || !(pl_tol > 0.0) || !(pl_tol < 1.0))
+            return json{{"ok", false},
+                        {"error", "fea_static: material.plasticity.tol is a RELATIVE "
+                                  "residual tolerance (||out-of-balance|| / ||applied "
+                                  "load||) and must be in (0, 1)"}};
+        if (study.contains("adapt") && !study["adapt"].is_null())
+            return json{{"ok", false},
+                        {"error", "fea_static: material.plasticity cannot be combined "
+                                  "with an adaptive (error-estimator) run — the ZZ "
+                                  "estimator is derived for linear elasticity and its "
+                                  "indicator is meaningless once the material yields. "
+                                  "Converge the mesh elastically, then re-solve that "
+                                  "mesh with plasticity at an explicit mesh_size_mm."}};
+    }
     if (!study.contains("fixtures") || !study["fixtures"].is_array() ||
         study["fixtures"].empty())
         return json{{"ok", false},
@@ -2047,6 +2250,19 @@ static nlohmann::json fea_run_static_impl(
     const double E_mpa = material.value("E_mpa", 0.0);
     const double nu = material.value("nu", 0.0);
     const double yield_mpa = material.value("yield_mpa", 250.0);
+    // Elastic-plastic law (validated at the study gate above). An absent or
+    // explicitly disabled `plasticity` block leaves this default-constructed, and the
+    // solve is the linear-elastic one it has always been.
+    chudware::sim::FeaPlasticity plasticity;
+    if (material.contains("plasticity") && material["plasticity"].is_object()) {
+        const json& pl = material["plasticity"];
+        plasticity.enabled = pl.value("enabled", true);
+        plasticity.yield_mpa = pl.value("yield_mpa", yield_mpa);
+        plasticity.hardening_mpa = pl.value("hardening_mpa", 0.0);
+        plasticity.max_increments = pl.value("max_increments", 10);
+        plasticity.tol = pl.value("tol", 1e-3);
+    }
+    const bool plastic_enabled = plasticity.enabled;
 
     std::vector<std::string> notes;
     if (!mesh_note.empty()) notes.push_back("mesh: " + mesh_note);
@@ -2744,10 +2960,106 @@ static nlohmann::json fea_run_static_impl(
         }
         mesh_quality.unfixed_components = static_cast<int>(floating.size());
         if (!floating.empty()) {
+            // ── Name the island, don't just count it ───────────────────────
+            // "3 connected component(s) with no fixture" told a reader nothing
+            // they could act on: not WHICH body floated, and not whether it was
+            // 1 mm from the structure (a missing weld / an undeclared contact)
+            // or 200 mm away (the wrong bodies were isolated). Both are
+            // knowable here — the mesher records which STEP solid ordinals went
+            // into each meshed body (mesher.h MeshOut::Body), and the distance
+            // to the nearest FIXTURED body is a min over nodes. This runs only
+            // on the refusal path, so the O(n) sweep costs nothing that matters.
+            struct Island {
+                std::vector<int> ordinals;
+                int nodes = 0;
+                double gap_mm = std::numeric_limits<double>::infinity();
+                std::vector<int> nearest_ordinals;
+            };
+            std::unordered_map<int, Island> islands;
+            islands.reserve(floating.size());
+            const auto body_ordinals_of = [&](int node) {
+                for (const auto& body : mesh_quality.bodies)
+                    if (node >= body.node_begin && node < body.node_end)
+                        return body.source_ordinals;
+                return std::vector<int>{};
+            };
+            std::vector<int> island_nodes;
+            for (int i = 0; i < n_nodes_i; ++i) {
+                if (!referenced[static_cast<size_t>(i)]) continue;
+                const int root = sfind(i);
+                if (!floating.count(root)) continue;
+                Island& island = islands[root];
+                if (island.ordinals.empty()) island.ordinals = body_ordinals_of(i);
+                ++island.nodes;
+                island_nodes.push_back(i);
+            }
+            // One pass over the anchored nodes against every island node: the
+            // islands are what is small here (they are why the study is being
+            // refused), so this is |anchored| x |island nodes| with no build-up.
+            for (int j = 0; j < n_nodes_i; ++j) {
+                if (!referenced[static_cast<size_t>(j)]) continue;
+                const int root = sfind(j);
+                if (floating.count(root)) continue; // another island, not a fixture
+                const double jx = points[static_cast<size_t>(j) * 3];
+                const double jy = points[static_cast<size_t>(j) * 3 + 1];
+                const double jz = points[static_cast<size_t>(j) * 3 + 2];
+                for (int i : island_nodes) {
+                    const double dx = points[static_cast<size_t>(i) * 3] - jx;
+                    const double dy = points[static_cast<size_t>(i) * 3 + 1] - jy;
+                    const double dz = points[static_cast<size_t>(i) * 3 + 2] - jz;
+                    const double d = std::sqrt(dx * dx + dy * dy + dz * dz);
+                    Island& island = islands[sfind(i)];
+                    if (d < island.gap_mm) {
+                        island.gap_mm = d;
+                        island.nearest_ordinals = body_ordinals_of(j);
+                    }
+                }
+            }
+            const auto ordinal_text = [](const std::vector<int>& ordinals) {
+                if (ordinals.empty()) return std::string("unattributed");
+                std::string text;
+                for (std::size_t k = 0; k < ordinals.size(); ++k) {
+                    if (k) text += "+";
+                    text += std::to_string(ordinals[k]);
+                }
+                return text;
+            };
             std::string message =
                 "fea_static: mesh has " + std::to_string(floating.size()) +
-                " connected component(s) with no fixture: rigid-body motion — "
-                "refine the mesh (h <= wall thickness) or fix the island";
+                " connected component(s) with no fixture: rigid-body motion";
+            json island_json = json::array();
+            int shown = 0;
+            for (const auto& entry : islands) {
+                const Island& island = entry.second;
+                json record{{"body_ordinals", island.ordinals},
+                            {"nodes", island.nodes}};
+                if (std::isfinite(island.gap_mm)) {
+                    record["gap_to_nearest_fixed_body_mm"] =
+                        round_nd(island.gap_mm, 6);
+                    record["nearest_fixed_body_ordinals"] =
+                        island.nearest_ordinals;
+                }
+                island_json.push_back(std::move(record));
+                if (shown++ >= 4) continue; // the text names the first five
+                message += shown == 1 ? ". Island(s): " : "; ";
+                message += "body " + ordinal_text(island.ordinals) + " (" +
+                           std::to_string(island.nodes) + " node(s))";
+                if (std::isfinite(island.gap_mm)) {
+                    char gap[160];
+                    std::snprintf(gap, sizeof(gap),
+                                  " sits %.4g mm from the nearest fixtured body "
+                                  "(body %s)",
+                                  island.gap_mm,
+                                  ordinal_text(island.nearest_ordinals).c_str());
+                    message += gap;
+                }
+            }
+            message +=
+                ". Remedies, in order: weld/union the bodies in CAD if that gap "
+                "is not real (solids closer than 1e-3 mm are fused for meshing "
+                "automatically), declare the interface with `contact` "
+                "(max_gap_mm above the gap) or `bond_gap_mm`, fixture the island, "
+                "or re-isolate the study without it";
             if (!bond_springs.empty())
                 message += ". " + std::to_string(bond_springs.size()) +
                            " explicit bonded gap tie(s) were added and still did not "
@@ -2761,6 +3073,7 @@ static nlohmann::json fea_run_static_impl(
             return json{
                 {"ok", false},
                 {"error", message},
+                {"unfixed_islands", std::move(island_json)},
                 {"mesh_quality",
                  detail::mesh_quality_json(
                      mesh_quality, points.size() / 3,
@@ -2902,14 +3215,28 @@ static nlohmann::json fea_run_static_impl(
                         " (mm / N / MPa; fixed_nodes pins all 3 DOFs per entry)");
     }
     FeaContactReport contact_report;
+    chudware::sim::FeaPlasticReport plastic_report;
+    // Three routes, ONE kernel: the plastic one subsumes contact (its active-set loop
+    // runs inside each load increment), so an elastic-plastic contact study is a
+    // single call and not a contact solve with a material pass bolted on.
     FeaStaticResult r =
-        contact_enabled
-            ? fea_static_solve_contact(points, tets, E_mpa, nu, yield_mpa, fixed_nodes,
-                                       nodal_forces, nodes_per_elem, bond_springs,
-                                       contact_set.springs, contact_solver_opts,
-                                       contact_report, job.token())
-            : fea_static_solve(points, tets, E_mpa, nu, yield_mpa, fixed_nodes,
-                               nodal_forces, nodes_per_elem, bond_springs, job.token());
+        plastic_enabled
+            ? fea_static_solve_plastic(
+                  points, tets, E_mpa, nu, yield_mpa, fixed_nodes, nodal_forces,
+                  nodes_per_elem, bond_springs,
+                  contact_enabled ? contact_set.springs
+                                  : std::vector<chudware::sim::ContactSpring>{},
+                  contact_solver_opts, plasticity, contact_report, plastic_report,
+                  job.token())
+            : (contact_enabled
+                   ? fea_static_solve_contact(points, tets, E_mpa, nu, yield_mpa,
+                                              fixed_nodes, nodal_forces, nodes_per_elem,
+                                              bond_springs, contact_set.springs,
+                                              contact_solver_opts, contact_report,
+                                              job.token())
+                   : fea_static_solve(points, tets, E_mpa, nu, yield_mpa, fixed_nodes,
+                                      nodal_forces, nodes_per_elem, bond_springs,
+                                      job.token()));
     // The contact block is EVIDENCE, so it rides on the refusal too: a reader has to be
     // able to see how many pairs there were and how far the active set got.
     //
@@ -3018,6 +3345,26 @@ static nlohmann::json fea_run_static_impl(
         if (!contact_resolution.load_path_note.empty())
             notes.push_back("contact load path: " + contact_resolution.load_path_note);
     }
+    // The plastic block is EVIDENCE on the same terms the contact block is: a
+    // collapse refusal is only actionable WITH the load fraction it reached and how
+    // far the material got, so it rides on the refusal too.
+    auto plasticity_json = [&]() {
+        return json{
+            {"enabled", true},
+            {"yield_mpa", round_nd(plasticity.yield_mpa, 4)},
+            {"hardening_mpa", round_nd(plasticity.hardening_mpa, 4)},
+            {"tol", plasticity.tol},
+            {"requested_increments", plasticity.max_increments},
+            {"increments", plastic_report.increments},
+            {"newton_iterations_total", plastic_report.newton_iterations_total},
+            {"converged", plastic_report.converged},
+            {"load_fraction", round_nd(plastic_report.load_fraction, 6)},
+            {"max_equivalent_plastic_strain",
+             round_nd(plastic_report.max_equivalent_plastic_strain, 8)},
+            {"plastic_volume_mm3", round_nd(plastic_report.plastic_volume_mm3, 6)},
+            {"plastic_fraction", round_nd(plastic_report.plastic_fraction, 6)},
+            {"yielded_nodes", plastic_report.yielded_nodes}};
+    };
     chudware::prof::phases::add("solve", std::chrono::duration<double, std::milli>(
                                           std::chrono::steady_clock::now() - t_solve0).count());
     if (fprof) {
@@ -3039,32 +3386,46 @@ static nlohmann::json fea_run_static_impl(
                    "bonded-contact region is physically intended.";
         json fail{{"ok", false}, {"error", msg}, {"notes", notes}};
         if (contact_enabled) fail["contact"] = contact_json();
+        if (plastic_enabled) fail["plasticity"] = plasticity_json();
         return fail;
     }
     // A non-converged active set is not a contact solution: the displacements belong to
     // whichever set the loop happened to stop on, so the stresses are not the ones the
     // touching state implies. Report the evidence, refuse the verdict.
     if (contact_enabled && !contact_report.converged) {
-        return json{
+        json fail{
             {"ok", false},
-            {"error", "fea_static: the contact active set did not settle in " +
-                          std::to_string(contact_solver_opts.max_iterations) +
-                          " iteration(s) — pairs kept opening and closing, so no state "
-                          "is the solution. Raise contact.max_iterations, or reduce "
-                          "contact.penalty_scale (a very stiff penalty makes pairs "
-                          "chatter across the gap)."},
+            {"error", plastic_enabled
+                          ? std::string(
+                                "fea_static: the contact active set did not settle "
+                                "inside a load increment, so no state is the solution. "
+                                "Reduce contact.penalty_scale (a very stiff penalty "
+                                "makes pairs chatter across the gap), resolve the "
+                                "interface (contact.interface_size_mm), or raise "
+                                "material.plasticity.max_increments so each increment "
+                                "moves the seat less.")
+                          : "fea_static: the contact active set did not settle in " +
+                                std::to_string(contact_solver_opts.max_iterations) +
+                                " iteration(s) — pairs kept opening and closing, so no "
+                                "state is the solution. Raise contact.max_iterations, "
+                                "or reduce contact.penalty_scale (a very stiff penalty "
+                                "makes pairs chatter across the gap)."},
             {"contact", contact_json()},
             {"notes", notes}};
+        if (plastic_enabled) fail["plasticity"] = plasticity_json();
+        return fail;
     }
     // The load crossed the interface through too few pairs to be a contact patch:
     // a converged, equilibrium-clean, plausible-looking point load. This clause is
     // the one the live keyway needed — 1 active pair of 848 carrying 2902 N — and
     // it can only be checked here, after the active set is known.
     if (contact_enabled && !contact_resolution.resolved) {
-        return json{{"ok", false},
-                    {"error", "fea_static: " + contact_resolution.reason},
-                    {"contact", contact_json()},
-                    {"notes", notes}};
+        json fail{{"ok", false},
+                  {"error", "fea_static: " + contact_resolution.reason},
+                  {"contact", contact_json()},
+                  {"notes", notes}};
+        if (plastic_enabled) fail["plasticity"] = plasticity_json();
+        return fail;
     }
     if (nodes_per_elem == 10) notes.push_back("second-order (tet10) elements");
     // Which factorization actually ran, and whether this solve queued behind another
@@ -3239,6 +3600,15 @@ static nlohmann::json fea_run_static_impl(
     // Contact rides BESIDE summary/reactions/mesh_quality, like every other evidence
     // block: the equilibrium check and the contact resultants have to be read together.
     if (contact_enabled) out["contact"] = contact_json();
+    // Plasticity rides beside them for the same reason: summary.max_von_mises_mpa is
+    // still the stress, but with the law on it is CAPPED at the flow stress
+    // (yield + hardening_mpa * max_equivalent_plastic_strain), and a reader comparing
+    // it against an elastic run needs the plastic state to know why it moved.
+    if (plastic_enabled) {
+        out["plasticity"] = plasticity_json();
+        if (static_cast<int>(r.equivalent_plastic_strain.size()) == r.n_nodes)
+            out["equivalent_plastic_strain"] = r.equivalent_plastic_strain;
+    }
     out["mesh_quality"] = detail::mesh_quality_json(
         mesh_quality, static_cast<std::size_t>(r.n_nodes),
         static_cast<std::size_t>(r.n_elems), nodes_per_elem);
@@ -3312,6 +3682,31 @@ static nlohmann::json fea_run_static_impl(
             out["warnings"] = json::array();
         out["warnings"].push_back(excluded_peak_warning);
     }
+    // ── Is the plastic strain still a SMALL strain? ──────────────────────────
+    // The law is small-strain J2 on an undeformed mesh: strains add, the geometry
+    // never updates, and no area reduction is accounted for. Past a few percent of
+    // plastic strain that stops being an approximation and starts being the wrong
+    // problem — a bearing edge at 20 % plastic strain has visibly changed shape, so
+    // the patch the solve spread the load over is not the patch the part has. 5 % is
+    // the conventional line, and it is stated where an analyst scanning a packet
+    // cannot miss it rather than left implicit in the plasticity block.
+    if (plastic_enabled && plastic_report.max_equivalent_plastic_strain > 0.05) {
+        if (!out.contains("warnings") || !out["warnings"].is_array())
+            out["warnings"] = json::array();
+        out["warnings"].push_back(
+            "plastic_strain_beyond_small_strain: peak equivalent plastic strain " +
+            std::to_string(plastic_report.max_equivalent_plastic_strain) +
+            " (" + std::to_string(100.0 *
+                                  plastic_report.max_equivalent_plastic_strain) +
+            " %) exceeds the 5 % small-strain validity limit of this formulation. The "
+            "mesh is never updated and no area reduction is modelled, so the stress "
+            "and the contact patch are both optimistic at this strain. Treat the "
+            "result as a redistribution study, not a strength number: reduce the load, "
+            "or take the geometry to a large-deformation solver. plasticity."
+            "plastic_fraction (" +
+            std::to_string(plastic_report.plastic_fraction) +
+            ") says how much of the part is involved.");
+    }
     {
         std::string vtu_path, vtu_error;
         if (!detail::write_result_vtu(study, points, tets, nodes_per_elem, out,
@@ -3353,11 +3748,37 @@ nlohmann::json fea_run_static_with_cancel_token(
 }
 }  // namespace detail
 
+// ── Plasticity is a STATIC law and belongs to no other physics ──────────────────
+// A modal solve linearizes about an unstressed state and its eigenvalues are the
+// elastic ones; a thermal solve has no stress at all; and buckling is an EIGENVALUE
+// problem whose critical multiplier is defined only for a linear pre-buckling
+// response. Accepting material.plasticity on any of them and silently ignoring it
+// would report an elastic answer under a plastic label, which is the exact failure
+// mode ME 490 O-28 was: a number that looks like the material's and is not.
+static bool plasticity_requested(const nlohmann::json& study) {
+    if (!study.is_object() || !study.contains("material") ||
+        !study["material"].is_object())
+        return false;
+    const json& m = study["material"];
+    if (!m.contains("plasticity") || !m["plasticity"].is_object()) return false;
+    return m["plasticity"].value("enabled", true);
+}
+
 nlohmann::json fea_run_modal(const nlohmann::json& study, int n_modes) {
     try {
         SimJobScope job(study);
     if (!study.is_object())
         return json{{"ok", false}, {"error", "fea_modal: study must be an object"}};
+    if (plasticity_requested(study))
+        return json{{"ok", false},
+                    {"error", "fea_modal: material.plasticity is not applicable to a "
+                              "modal study. A modal solve linearizes about an "
+                              "unstressed state, so its eigenvalues are the ELASTIC "
+                              "ones however the material yields under load — the "
+                              "plastic law would be silently ignored, and an elastic "
+                              "answer under a plastic label is worse than a refusal. "
+                              "Run the elastic-plastic study with sim_run_static, and "
+                              "the modal study with the elastic material."}};
     if (!has_mesh_source(study))
         return json{{"ok", false},
                     {"error", "fea_modal: a non-empty STEP path or inline mesh is required"}};
@@ -3665,6 +4086,13 @@ nlohmann::json fea_run_thermal(const nlohmann::json& study) {
     if (study.contains("material") && !study["material"].is_object())
         return json{{"ok", false},
                     {"error", "fea_thermal: material must be an object"}};
+    if (plasticity_requested(study))
+        return json{{"ok", false},
+                    {"error", "fea_thermal: material.plasticity is not applicable to a "
+                              "thermal study — a conduction solve has no stress for a "
+                              "yield surface to bound. Take the temperature field to a "
+                              "static study if you need thermal stress; plasticity "
+                              "belongs there."}};
     const json material_input = study.value("material", json::object());
     const json* conductivity =
         material_input.contains("k_w_mk") ? &material_input["k_w_mk"]
@@ -4179,6 +4607,12 @@ inline uint64_t mesh_opts_key(const MeshOptions &options, uint64_t hash) {
   hash = fnv1a(&options.max_size_mm, sizeof options.max_size_mm, hash);
   hash = fnv1a(&options.learned_advisor, sizeof options.learned_advisor, hash);
   hash = fnv1a(&options.advisor_max_dof, sizeof options.advisor_max_dof, hash);
+  // Whether the study declared its interfaces changes the MESH itself
+  // (overlapping solids fused into one body versus kept separate), so it is
+  // part of the key: serving the fused mesh to a contact study would hand it a
+  // single component and no interface at all.
+  hash =
+      fnv1a(&options.declared_interfaces, sizeof options.declared_interfaces, hash);
   // The local refinement contract is part of the mesh, so it is part of the
   // key: the same STEP at the same fineness with a refined contact interface is
   // a DIFFERENT mesh, and serving the coarse one from cache would hand back

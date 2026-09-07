@@ -886,3 +886,83 @@ pressurisation / suction). Force loads are vectors in the global frame and carry
 sign. Before this date the engine deposited `+p` along the OUTWARD normal, contradicting every
 tool docstring; the fix is in the engine and is pinned by ctest `fatigue` ("pressure load acts
 along the INWARD face normal"). `sim_run_adaptive` and `sim_run_fatigue` share the deposit.
+
+## 24. Elastic-plastic material — `sim_run_static` `material.plasticity` (append-only, 2026-09-06)
+
+`study.material` accepts an optional `plasticity` object that switches the static and the
+contact solve from linear elasticity to SMALL-STRAIN J2 (von Mises) plasticity with linear
+isotropic hardening. Absent, `null`, or `{"enabled": false}` is the linear-elastic solve
+every existing caller gets, byte for byte.
+
+```
+material.plasticity = {
+  "enabled":        true,      // optional, default true when the object is present
+  "yield_mpa":      276.0,     // initial yield; omitted uses material.yield_mpa
+  "hardening_mpa":  1200.0,    // post-yield TANGENT MODULUS in MPa. 0 = perfectly
+                               //   plastic. NOT a ratio of E; refused at >= E_mpa
+  "max_increments": 10,        // load steps over [first yield, full load], 1..1000
+  "tol":            1e-3       // relative residual ||r|| / ||applied load||, in (0,1)
+}
+```
+
+The law is `sigma_y(eq_p) = yield_mpa + hardening_mpa * eq_p`, integrated by radial return at
+every Gauss point with the CONSISTENT (algorithmic) tangent, under an incremental
+Newton-Raphson load-stepping loop whose every tangent solve goes down the same
+CHOLMOD/LDLT/SparseLU ladder and through the same process-wide solve gate as a linear solve.
+Supported for tet4, tet10 and hex8. When `study.contact.enabled` is also set, the ACTIVE-SET
+CONTACT LOOP RUNS INSIDE EACH LOAD INCREMENT — contact state and plastic state both advance
+per increment — which is the only ordering that can grow a bearing patch as the edge under it
+yields. An unknown key inside `plasticity` is REFUSED, never ignored.
+
+The ladder does not start at zero load. Phase 0 solves the whole load with an infinite yield
+stress (the linear-elastic contact solve), which yields the elastic peak equivalent stress
+`q_max`; the requested increments then run over `[0.95*yield/q_max, 1]`, the only part of the
+path where material state evolves. `q_max <= yield` returns the elastic answer with an empty
+plastic state and `increments: 1`. This is not an optimisation: a contact interface at a small
+fraction of its load is a marginal regime whose active set has no fixed point (the elastic
+solver itself reports `converged:false` there), and marching from zero walks into it.
+
+Reply, on success and on refusal, as a TOP-LEVEL sibling of `summary`:
+
+```
+plasticity = {enabled, yield_mpa, hardening_mpa, tol, requested_increments,
+              increments, newton_iterations_total, converged, load_fraction,
+              max_equivalent_plastic_strain, plastic_volume_mm3, plastic_fraction,
+              yielded_nodes}
+```
+
+`increments` counts the increments that CONVERGED (adaptive substeps included, so it may
+exceed `requested_increments`, and it includes the one that reaches first yield).
+`load_fraction` is the fraction of the applied load the last converged increment carried — 1.0
+on a converged run, and the limit load of the model on a refusal.
+`max_equivalent_plastic_strain` is the GAUSS-POINT peak, not the peak of the averaged nodal
+field. `plastic_volume_mm3` is the integration volume whose Gauss point has yielded and
+`plastic_fraction` its share of the model.
+
+`summary.max_von_mises_mpa` remains the stress with its existing fixture-ring reduction
+(section 22) — it is not replaced by anything plastic — but it is now bounded by the flow
+stress `yield_mpa + hardening_mpa * max_equivalent_plastic_strain`, which is the observable
+difference from an elastic run of the same study. The reply gains a top-level nodal
+`equivalent_plastic_strain[]` (length `n_nodes`, the mean of each incident element's own
+Gauss-point mean), and the `.vtu` written for `study.vtu_path` carries it as an
+`equivalent_plastic_strain` point-data array beside `von_mises` and `summary_node`.
+
+Two refusals, both physics rather than preference:
+
+* **Plastic collapse.** A load past the model's limit load has NO equilibrium. When an
+  increment will not converge even after the step has been halved to below 1/32 of the
+  requested increment, the run is `ok:false` with an error naming the load fraction reached,
+  and the `plasticity` block rides on the refusal. The last Newton iterate is never reported:
+  it is not a stress state.
+* **Beyond small strain.** A peak equivalent plastic strain above 0.05 appends a plain
+  `warnings` entry (`plastic_strain_beyond_small_strain: …`). The mesh is never updated and no
+  area reduction is modelled, so past a few percent the patch the solve spread the load over is
+  not the patch the part has.
+
+`material.plasticity` is REFUSED, not ignored, by `sim_run_modal` (eigenvalues linearize about
+an unstressed state and stay elastic), `sim_run_thermal` (no stress for a yield surface to
+bound), linear buckling (a critical multiplier is defined only for a linear pre-buckling
+response) and any study carrying `adapt` (the ZZ error estimator is derived for linear
+elasticity). At the MCP seam it is the `plasticity=` parameter of `run_fea_static` and
+`run_fea_contact` and is NOT accepted inside the `material` dict, so it cannot reach a tool
+that would silently drop it.

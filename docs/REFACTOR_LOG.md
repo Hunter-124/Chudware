@@ -2749,3 +2749,135 @@ Pre-fix the same interface reported 2.874 mm at every background with 0 waves.
 marking on the measured statistic), `core/sim/fea_run.cpp` (the interface-contract refusal only),
 and in Hunter's Polyhedral-FEA tree `src/fea/src/element_validity.cpp`,
 `src/mesh/src/quality.cpp`, `src/mesh/include/mesh/cell_validity.hpp`.
+## A locally-refined region has to be a MESH, not just a fine interface (2026-09-06)
+
+**What went wrong.** O-28's hinge-latch packet (`CONTACT_RESOLVED_2026-09-06b`) shipped a contact
+study whose interface size was exactly what was asked for and whose mesh AWAY from it was debris:
+`aspect_max` 263, `jacobian_min` 0.0029, 50 cells under polymesh's 0.02 shape floor. That is not a
+sizing failure, it is what conforming bisection COSTS — LEPP closure has to bisect a whole chain of
+neighbours to stay conforming and pays with stretched cells one size class out from the refined
+shell — and a mesh like that cannot carry a plasticity Newton loop, because the tangent stiffness
+of a 0.003-Jacobian cell is noise.
+
+**What changed.** Every LEB wave in `deliver_local_contract`, and the mesh the last wave leaves,
+now gets a bounded quality pass over the refined region (`quality_pass` in `core/sim/mesher.cpp`):
+boundary-aware smoothing (interior nodes placed by max-min pattern search on the star, surface
+nodes sliding on their CAD face by projection, feature-EDGE nodes with one degree of freedom along
+the edge tangent, corners pinned), 2-3 flips, edge removal for rings of 3 to 7 by Klincsek's
+dynamic program, and sliver removal by edge collapse. The loop stops when the region meets the
+reported floors, when a pass changes nothing, or after 5 passes. The delivered interface size is
+RE-MEASURED afterwards and re-marked and re-split once if the pass coarsened it past the request;
+`run_wave` was extracted so the wave loop and that re-split cannot disagree about what a wave is.
+The census rides out as `mesh_quality.local_refine{waves, smoothing_passes,
+jacobian_min_before/after, aspect_max_before/after, cells_below_floor_before/after, resplit}`.
+
+**One metric, two reported floors.** Every move, flip and collapse is judged by the minimum shape
+quality (`6*sqrt(2)*V / L_max^3`) of the cells it changes, because that one number bounds both
+reported statistics exactly: `scaled_jacobian >= shape_quality` (no corner's edge product exceeds
+`L_max^3`) and `aspect <= 1 / shape_quality` (the largest face of a tet whose longest edge is
+`L_max` has area at most `sqrt(3)/4*L_max^2`, and `2.3094 * 0.4330 = 1`). A region driven to 0.05
+therefore has `jacobian_min >= 0.05` and `aspect_max <= 20`. `detail::tet_shape`
+(`core/sim/mesh_quality.cpp`, declared in `mesher.h`) is now the single definition of both, so
+`fill_quality` and the pass cannot drift apart.
+
+**Measured** (`core/build-fix`, tet4, both cases new in `test_mesher_advanced`):
+
+| case | waves | passes | delivered | jacobian_min | aspect_max | under 0.02 floor | wall |
+|---|---|---|---|---|---|---|---|
+| pin-in-bore, 0.35 mm request | 6 | 3 | 0.3107 mm | 0.0304 -> 0.0885 | 39.50 -> 13.67 | 4 -> 0 | 19.6 s |
+| nested saddle, 0.4 mm at 4 mm | 6 | 10 | 0.3542 mm | 0.0198 -> 0.0343 | 75.3 -> 28.5 | 44 -> 0 | 13.3 s |
+
+The existing contract cases improved with it: the flat pad seats 1331 of 1694 pairs (was
+1308/1647) and the tight bore 49 of 3595, both contracts still met.
+
+**Gotchas.** Four things were measured and are load-bearing, all commented in place. (1) An
+unrestricted surface-node collapse fights the wave loop — a collapse coarsens an interface face,
+the next `scan` marks it, the wave bisects it, the next pass collapses it again: 6 waves / 150 484
+elements / 20 s became 10 waves / **3 901 081** elements / 366 s with the region ending at
+`aspect_max` 724. Collapses are bounded by `scan`'s own marking threshold or the longest boundary
+edge already there, whichever is more permissive, which makes the invariant exact rather than
+prophylactic. (2) `dirty` marks may NOT carry from the flip sweep into the collapse sweep; the flip
+sweep is deterministic, so it starved the same collapse every pass. (3) A near-collinear boundary
+facet's normal is rounding noise, and feeding it to the feature test PINS the nodes that most need
+to move — facets under `kNormalConditionFloor` are left out of the fan. (4) The feature-edge slide
+is a genuine fidelity trade, not a free win: spending the full face budget takes the saddle to
+0.0621 and costs the pin-in-bore 0.0881 -> 0.0422, because the same budget on a 6.35 mm rim buys a
+slide across it. The bound therefore stays tight and monotone, and the saddle's asserted floor is
+the measured 0.034 with that reasoning in the test — the pass's own 0.05 target is met on the
+pin-in-bore.
+
+**Files.** `core/sim/mesher.h`, `core/sim/mesher.cpp`, `core/sim/mesh_quality.cpp`,
+`core/sim/fea_run.cpp` (four hunks: `MeshQualityFacts`, `mesh_quality_json`, the `MeshOut` copy),
+`core/tests/test_mesher_advanced.cpp`.
+
+## Sub-element debris is not a body, and a coarser mesh is not always cheaper (2026-09-07)
+
+**What went wrong (ME 490 O-01, BRAKE-CALIPER-BRACKET).** Six refused solves, re-attributed by
+the released packet to "an un-meshable design model" with a 9.8 um wall and ~6e13 elements. It
+was neither compute nor an impossibility. Reproduced on the isolate (source body 201, one closed
+manifold solid, 88864.793755 mm3, `core/build-fix`, tet4): h = 4.0 -> 345,716 elements in 8
+components, h = 3.0 -> 271,233 in 4, h = 2.2 -> 243,586 in 5. Every island but one was
+SUB-ELEMENT DEBRIS: 1-15 elements, 0.0002-0.058 mm3 each, 0.005-0.106 mm3 per mesh against
+88,505 mm3 of domain — cells shed where the r 9.000 rod runs nearly coaxially INSIDE the r 10.000
+rod and emerges over microns (faces of 9.168 and 1.502 mm2 are the whole knife-edge). The
+hanging-fragment rule cannot reach them by construction: each is internally face-connected and
+shares NO node with the body, so it reads as a separate BODY (`outside_corners == 0`) and is
+deliberately spared there — that guard is what stops the repair deleting a real second body. And
+`fill_quality` counted every UNREFERENCED node as its own component (57 for a domain of 4, 45 for
+8), which the dissolve leaves behind by design; `mesh_loaded_model`'s honest-coarsening rebuild
+reads that number, so it fired on every mesh and kept whichever fill had fewer orphans. That is
+the packet's non-monotone memory, reproduced to the digit: tet10 345,716 el = **25.07 GB** at
+h = 4.0 against 271,233 el = **17.52 GB** at h = 3.0.
+
+**What changed.** `core/sim/mesh_quality.cpp` (fragment rule): `fill_quality` counts components
+over the nodes an element REFERENCES, and a new `dissolve_debris_components` drops any component
+that is not the domain, is under a millionth of its volume AND is smaller than one average
+element of that mesh — measured, not a size constant, so it cannot be tuned into deleting
+geometry. `core/sim/mesher.cpp`: solids whose closest approach is under `kFuseTolMm` = 1e-3 mm are
+FUSED (`BRepAlgoAPI_Fuse`, fuzzy at the same tolerance) into one body before the fill, because
+separately-meshed solids share no nodes and an unfused weld is a rigid-body mechanism at every
+element size; skipped when the study declared `contact` / `bond_gap_mm`
+(`MeshOptions::declared_interfaces`, hashed into the mesh-cache key). `MeshOut::bodies` records
+each meshed body's node RANGE plus the 1-based STEP solid ordinals in it (ranges, not a per-element
+id: 4 bytes/element would be 34 MB on an 8.6M-element mesh for what the append order already
+knows). `mesh_size_band.{h,cpp}` publishes the prediction basis (`predicted_elements`,
+`predict_exponent`, `element_limit`, `memory_coarsened`) and `mesh_loaded_model` re-decides on
+MEASUREMENT: re-fill at the requested size when the model and the probe disagree by more than
+30 % or the coarse mesh misses the limit anyway, keep the cheaper, and — only when the coarse fill
+was the more expensive one, which is the feature-dominated signature — step once more to 0.8x.
+`core/sim/fea_run.cpp`: `mesh_quality.fused_bodies` / `fused_overlap_mm3` /
+`debris_islands_dissolved`, and the rigid-body refusal now NAMES the island: "body 2 (10589
+node(s)) sits 1 mm from the nearest fixtured body (body 1)" plus an `unfixed_islands` array, with
+remedies in order.
+
+**Measured.** The bracket isolate SOLVES for the first time — tet4 h = 3.0 mm, 271,226 elements /
+56,613 nodes, `connected_components` 1, `unfixed_components` 0, 3 debris islands (7 elements,
+0.010050 mm3) dissolved, peak vM **199.9448 MPa** masked / **542.7539 MPa** raw, `min_fos`
+**1.3804** (raw 0.5085), max disp 0.048190 mm, `equilibrium_error_pct` **0.0** with the reaction
+exactly the applied [-2057, 0, 241.3] N. The tet10 estimate table is monotone and the finest leg
+now FITS: h = 4.0 -> 3.20 mm delivered, 287,555 el, **19.10 GB**; h = 3.0 -> 2.40 mm, 237,067 el,
+**14.37 GB**; h = 2.2 -> 1.76 mm, 190,197 el, **10.38 GB against a 12.0 GB budget** (was 25.07 /
+17.52 / 29.9 GB, down then up). Fusing source bodies 200+201 removes **9300.630370 mm3** where the
+project's own `check_interference` recorded **9299.81 mm3** (0.009 % apart) and yields ONE solid,
+which meshes in one component. ctest `mesh_mechanism` 6/6 (77 assertions) with two new cases — a
+plate and two rods that interpenetrate fuse and solve, overlap **1750.4720 mm3** against the
+closed-form 1750.4720 (inclusion-exclusion over the two rod/plate lenses and the triple region);
+two rods 1 mm apart are refused by ordinal and by that 1 mm — plus `mesh` 6/6, `mesh_sector` 2/2,
+`mesh_quality` 4/4, `fea_contact` 11/11 (315 assertions).
+
+**Gotchas.** The fuse tolerance is an IMPORT tolerance, not a modelling one: at 1e-3 mm nothing a
+study could call a clearance is welded shut, and the ctest's 1 mm gap is still refused. A selector
+tolerance must stay BELOW the gap it is not meant to cross — at `tol_mm` 1.2 across that 1 mm the
+fixture disc captured the OTHER rod's nodes, grounded both bodies, and the study "solved" a
+non-positive-definite system at 1e-7 mm instead of refusing (the sampler is at 0.4 mm pitch with
+`tol_mm` 0.3). The debris rule runs AFTER the hanging dissolve and its two guards and keeps its own
+counters, because it REMOVES components on purpose and must never trip the guard that refuses a
+repair for adding them. And the reason a coarser request costs more here is polymesh's own feature
+pass: at h = 4.0 the coarse lattice straddles more of the knife-edge, so the fill spends its budget
+on feature seeds (2260 feature + 1777 seed cells at 4.0 against 1885 + 1697 at 2.2) — which is why
+the honest remedy on this geometry is to mesh FINER, and the measurement is what says so.
+
+**Files.** `core/sim/mesher.h`, `core/sim/mesher.cpp` (fuse pass, `BodyGroup`,
+`mesh_separate_solids`, `mesh_step`, `mesh_loaded_model`), `core/sim/mesh_quality.cpp` (fragment
+rule), `core/sim/mesh_size_band.{h,cpp}`, `core/sim/fea_run.cpp` (options, packet, refusal, cache
+key), `core/tests/test_mesh_mechanism.cpp`.

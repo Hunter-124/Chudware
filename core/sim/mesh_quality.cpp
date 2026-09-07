@@ -31,66 +31,6 @@ double edge_len(const std::vector<double> &p, int a, int b) {
   return std::sqrt(dx * dx + dy * dy + dz * dz);
 }
 
-double tri_area(const std::vector<double> &p, int a, int b, int c) {
-  const double *A = &p[static_cast<size_t>(a) * 3];
-  const double *B = &p[static_cast<size_t>(b) * 3];
-  const double *C = &p[static_cast<size_t>(c) * 3];
-  const double ux = B[0] - A[0], uy = B[1] - A[1], uz = B[2] - A[2];
-  const double vx = C[0] - A[0], vy = C[1] - A[1], vz = C[2] - A[2];
-  const double cx = uy * vz - uz * vy;
-  const double cy = uz * vx - ux * vz;
-  const double cz = ux * vy - uy * vx;
-  return 0.5 * std::sqrt(cx * cx + cy * cy + cz * cz);
-}
-
-struct TetQuality {
-  double aspect;
-  double sjac;
-};
-
-TetQuality tet_quality(const std::vector<double> &p, int a, int b, int c,
-                       int d) {
-  const int v[4] = {a, b, c, d};
-  static constexpr int kFaces[4][3] = {
-      {1, 2, 3}, {0, 2, 3}, {0, 1, 3}, {0, 1, 2}};
-  static constexpr int kEdges[6][2] = {{0, 1}, {0, 2}, {0, 3},
-                                       {1, 2}, {1, 3}, {2, 3}};
-  static constexpr int kIncident[4][3] = {
-      {1, 2, 3}, {0, 2, 3}, {0, 1, 3}, {0, 1, 2}};
-
-  const double volume = std::abs(tet_volume6(p, a, b, c, d)) / 6.0;
-  TetQuality quality{std::numeric_limits<double>::infinity(), 0.0};
-  if (!(volume > 0.0))
-    return quality;
-
-  double longest = 0.0;
-  for (const auto &edge : kEdges)
-    longest = std::max(longest, edge_len(p, v[edge[0]], v[edge[1]]));
-
-  double max_face = 0.0;
-  for (const auto &face : kFaces)
-    max_face =
-        std::max(max_face, tri_area(p, v[face[0]], v[face[1]], v[face[2]]));
-
-  if (max_face > 0.0 && longest > 0.0) {
-    const double shortest_altitude = 3.0 * volume / max_face;
-    if (shortest_altitude > 0.0)
-      quality.aspect = (longest / shortest_altitude) / 1.224744871391589;
-  }
-
-  const double det6 = 6.0 * volume;
-  double minimum = std::numeric_limits<double>::infinity();
-  for (int corner = 0; corner < 4; ++corner) {
-    double product = 1.0;
-    for (int i = 0; i < 3; ++i)
-      product *= edge_len(p, v[corner], v[kIncident[corner][i]]);
-    if (product > 0.0)
-      minimum = std::min(minimum, std::sqrt(2.0) * det6 / product);
-  }
-  quality.sjac = std::isfinite(minimum) ? minimum : 0.0;
-  return quality;
-}
-
 double det3(const double j[3][3]) {
   return j[0][0] * (j[1][1] * j[2][2] - j[1][2] * j[2][1]) -
          j[0][1] * (j[1][0] * j[2][2] - j[1][2] * j[2][0]) +
@@ -253,6 +193,75 @@ std::string element_location(const std::vector<double> &p, const int *element) {
 
 namespace detail {
 
+// THE tet shape metrics (mesher.h TetShape). Both are volume-over-edge-lengths
+// forms normalized to 1.0 on a regular tet, and they are ordered:
+// `scaled_jacobian >= aspect^-1` and `scaled_jacobian >= 6*sqrt(2)*V/L_max^3`
+// (the corner whose three edges are longest carries the smallest ratio, and no
+// corner's edge product exceeds L_max^3), which is why the local quality pass
+// can drive a single objective and report both floors.
+TetShape tet_shape(const double *a, const double *b, const double *c,
+                   const double *d) {
+  const double *p[4] = {a, b, c, d};
+  static constexpr int kEdges[6][2] = {{0, 1}, {0, 2}, {0, 3},
+                                       {1, 2}, {1, 3}, {2, 3}};
+  static constexpr int kFaces[4][3] = {
+      {1, 2, 3}, {0, 2, 3}, {0, 1, 3}, {0, 1, 2}};
+  static constexpr int kIncident[4][3] = {
+      {1, 2, 3}, {0, 2, 3}, {0, 1, 3}, {0, 1, 2}};
+  const auto length = [&p](int i, int j) {
+    const double dx = p[i][0] - p[j][0];
+    const double dy = p[i][1] - p[j][1];
+    const double dz = p[i][2] - p[j][2];
+    return std::sqrt(dx * dx + dy * dy + dz * dz);
+  };
+  const double ux = b[0] - a[0], uy = b[1] - a[1], uz = b[2] - a[2];
+  const double vx = c[0] - a[0], vy = c[1] - a[1], vz = c[2] - a[2];
+  const double wx = d[0] - a[0], wy = d[1] - a[1], wz = d[2] - a[2];
+  const double det6 = std::abs(ux * (vy * wz - vz * wy) -
+                               uy * (vx * wz - vz * wx) +
+                               uz * (vx * wy - vy * wx));
+  TetShape shape{std::numeric_limits<double>::infinity(), 0.0};
+  const double volume = det6 / 6.0;
+  if (!(volume > 0.0))
+    return shape;
+
+  double longest = 0.0;
+  for (const auto &edge : kEdges)
+    longest = std::max(longest, length(edge[0], edge[1]));
+  double max_face = 0.0;
+  for (const auto &face : kFaces) {
+    const double *A = p[face[0]];
+    const double *B = p[face[1]];
+    const double *C = p[face[2]];
+    const double ax = B[0] - A[0], ay = B[1] - A[1], az = B[2] - A[2];
+    const double bx = C[0] - A[0], by = C[1] - A[1], bz = C[2] - A[2];
+    const double cx = ay * bz - az * by;
+    const double cy = az * bx - ax * bz;
+    const double cz = ax * by - ay * bx;
+    max_face = std::max(max_face, 0.5 * std::sqrt(cx * cx + cy * cy + cz * cz));
+  }
+  if (max_face > 0.0 && longest > 0.0) {
+    const double shortest_altitude = 3.0 * volume / max_face;
+    if (shortest_altitude > 0.0)
+      shape.aspect = (longest / shortest_altitude) / 1.224744871391589;
+  }
+
+  // Magnitude, not signed: Chudware's tet4 contract carries no orientation
+  // (every consumer takes |det|), so a mirrored cell must measure like its
+  // twin. Inversion is a SEPARATE verdict and has its own gate — the local
+  // quality pass detects folds with polymesh's signed tet_shape_quality.
+  double minimum = std::numeric_limits<double>::infinity();
+  for (int corner = 0; corner < 4; ++corner) {
+    double product = 1.0;
+    for (int i = 0; i < 3; ++i)
+      product *= length(corner, kIncident[corner][i]);
+    if (product > 0.0)
+      minimum = std::min(minimum, std::sqrt(2.0) * det6 / product);
+  }
+  shape.scaled_jacobian = std::isfinite(minimum) ? minimum : 0.0;
+  return shape;
+}
+
 bool fill_quality(MeshOut &out) {
   const int stride = out.nodes_per_elem == 10 ? 10 : 4;
   if (out.points.empty() || out.points.size() % 3 != 0 || out.tets.empty() ||
@@ -284,7 +293,22 @@ bool fill_quality(MeshOut &out) {
   // cache included) so no solve route has to re-derive it, and the union rule
   // is the one the static route uses when it decides whether every island
   // reaches a fixture: every node of an element joins that element's set.
+  //
+  // Nodes NO element references are not components of the domain, and counting
+  // them here was a live defect, not pedantry: the hanging-fragment dissolve
+  // preserves node numbering by design, so every repaired mesh carries orphan
+  // nodes — on the ME 490 caliper-bracket isolate at tet4 h = 3.0 mm this read
+  // 57 components for a domain of 4, and 45 for 8 at h = 4.0. Two consumers
+  // then read a number that was mostly orphan count: mesh_loaded_model's
+  // honest-coarsening rebuild ("came back in more pieces than the shape has
+  // solids") fired on every mesh and kept whichever fill happened to have
+  // fewer orphans, which is how a COARSER request delivered a FINER mesh
+  // (345,716 elements at h = 4.0 against 271,233 at h = 3.0, i.e. a
+  // non-monotone memory estimate), and the reported mesh_quality contradicted
+  // the static route's own domain count in the same packet. The orphans stay
+  // reported by the solve route, which names them in a solver note.
   std::vector<int> parent(static_cast<size_t>(node_count));
+  std::vector<char> referenced(static_cast<size_t>(node_count), 0);
   for (int node = 0; node < node_count; ++node)
     parent[static_cast<size_t>(node)] = node;
   auto find = [&parent](int x) {
@@ -304,6 +328,7 @@ bool fill_quality(MeshOut &out) {
                     " contains an invalid node index";
         return false;
       }
+      referenced[static_cast<size_t>(element[node])] = 1;
     }
     for (int node = 1; node < stride; ++node) {
       const int a = find(element[0]);
@@ -353,10 +378,14 @@ bool fill_quality(MeshOut &out) {
     if (std::isfinite(shortest) && shortest > 0.0)
       maximum_edge_ratio = std::max(maximum_edge_ratio, longest / shortest);
 
-    const TetQuality quality =
-        tet_quality(out.points, element[0], element[1], element[2], element[3]);
-    if (!std::isfinite(quality.aspect) || !std::isfinite(quality.sjac) ||
-        !(quality.sjac > 0.0)) {
+    const TetShape quality =
+        tet_shape(&out.points[static_cast<size_t>(element[0]) * 3],
+                  &out.points[static_cast<size_t>(element[1]) * 3],
+                  &out.points[static_cast<size_t>(element[2]) * 3],
+                  &out.points[static_cast<size_t>(element[3]) * 3]);
+    if (!std::isfinite(quality.aspect) ||
+        !std::isfinite(quality.scaled_jacobian) ||
+        !(quality.scaled_jacobian > 0.0)) {
       out.error = "mesh quality: element " + std::to_string(index) +
                   " has invalid quality metrics";
       return false;
@@ -364,7 +393,7 @@ bool fill_quality(MeshOut &out) {
     minimum_aspect = std::min(minimum_aspect, quality.aspect);
     maximum_aspect = std::max(maximum_aspect, quality.aspect);
     aspect_sum += quality.aspect;
-    minimum_jacobian = std::min(minimum_jacobian, quality.sjac);
+    minimum_jacobian = std::min(minimum_jacobian, quality.scaled_jacobian);
     if (quality.aspect > kPoorAspect)
       ++poor;
     int bucket =
@@ -372,12 +401,9 @@ bool fill_quality(MeshOut &out) {
     out.aspect_hist[static_cast<size_t>(std::clamp(bucket, 0, 9))]++;
   }
 
-  // A node reachable from no element is its own component: it carries zero
-  // stiffness, so counting it is not pedantry — it is the same singular system
-  // a detached island is.
   int components = 0;
   for (int node = 0; node < node_count; ++node)
-    if (find(node) == node)
+    if (referenced[static_cast<size_t>(node)] && find(node) == node)
       ++components;
   out.connected_components = components;
 
@@ -700,6 +726,116 @@ int element_component_count(const MeshOut &out, int stride, int node_count) {
   return components;
 }
 
+// ── Sub-element debris islands ───────────────────────────────────────────────
+// A component that is not the domain, is under a MILLIONTH of the domain's
+// volume, and is smaller than ONE average element of this very mesh is fill
+// debris: it cannot carry load, it cannot be refined into anything, and it
+// costs the whole study a rigid-body refusal. Measured on the ME 490
+// caliper-bracket isolate (body 201 — rods that pass THROUGH each other, so
+// their union leaves a 9.8 um knife-edge where one emerges from the next), tet4:
+//
+//   h = 4.0 mm : 8 components, 7 debris of 9/15/8/1/1/1/2 elements,
+//                0.0002-0.058 mm^3 each, 0.106 mm^3 total vs 88526.2 mm^3
+//   h = 3.0 mm : 4 components, 3 debris of 1/3/3 elements, 0.0101 mm^3 total
+//   h = 2.2 mm : 5 components, 4 debris of 1/2/3/3 elements, 0.0053 mm^3
+//
+// The hanging-fragment rule above cannot reach them: each debris island is
+// internally face-connected and shares NO node with the body, so it reads as a
+// separate BODY (outside_corners == 0) and is deliberately spared there —
+// that guard exists so a real second body is never deleted. The volume test is
+// what tells the two apart, and it is the physics: a millionth of the domain
+// contributes a millionth of the stiffness at most, and a component smaller
+// than one element of its own mesh was never resolved in the first place.
+// Anything bigger stays, and the static route still refuses it BY NAME.
+//
+// Node numbering is preserved (only the element list shrinks), like every other
+// repair here, so caller-side node indices stay valid.
+int dissolve_debris_components(MeshOut &out, int stride, int node_count) {
+  const size_t element_count = out.tets.size() / static_cast<size_t>(stride);
+  if (element_count < 2)
+    return 0;
+  std::vector<int> parent(static_cast<size_t>(node_count));
+  for (int node = 0; node < node_count; ++node)
+    parent[static_cast<size_t>(node)] = node;
+  std::function<int(int)> find = [&parent](int x) {
+    while (parent[static_cast<size_t>(x)] != x) {
+      parent[static_cast<size_t>(x)] =
+          parent[static_cast<size_t>(parent[static_cast<size_t>(x)])];
+      x = parent[static_cast<size_t>(x)];
+    }
+    return x;
+  };
+  for (size_t e = 0; e < element_count; ++e) {
+    const int *element = &out.tets[e * static_cast<size_t>(stride)];
+    for (int k = 1; k < stride; ++k) {
+      if (element[0] < 0 || element[0] >= node_count || element[k] < 0 ||
+          element[k] >= node_count)
+        return 0; // malformed: leave the mesh to the validating pass
+      const int a = find(element[0]);
+      const int b = find(element[k]);
+      if (a != b)
+        parent[static_cast<size_t>(std::max(a, b))] = std::min(a, b);
+    }
+  }
+  // Per-component element count and volume, keyed by root.
+  std::unordered_map<int, std::pair<int, double>> census;
+  census.reserve(16);
+  double total_volume = 0.0;
+  for (size_t e = 0; e < element_count; ++e) {
+    const int *element = &out.tets[e * static_cast<size_t>(stride)];
+    const double volume =
+        std::abs(tet_volume6(out.points, element[0], element[1], element[2],
+                             element[3])) /
+        6.0;
+    total_volume += volume;
+    auto &entry = census[find(element[0])];
+    entry.first += 1;
+    entry.second += volume;
+  }
+  if (census.size() < 2 || !(total_volume > 0.0))
+    return 0;
+  const double mean_element_volume =
+      total_volume / static_cast<double>(element_count);
+  int domain_root = census.begin()->first;
+  double domain_volume = census.begin()->second.second;
+  for (const auto &entry : census)
+    if (entry.second.second > domain_volume) {
+      domain_root = entry.first;
+      domain_volume = entry.second.second;
+    }
+  std::unordered_map<int, char> debris;
+  debris.reserve(census.size());
+  for (const auto &entry : census) {
+    if (entry.first == domain_root)
+      continue;
+    if (entry.second.second < total_volume * 1e-6 &&
+        entry.second.second < mean_element_volume)
+      debris.emplace(entry.first, 1);
+  }
+  if (debris.empty())
+    return 0;
+  std::vector<int> kept;
+  kept.reserve(out.tets.size());
+  int dropped = 0;
+  for (size_t e = 0; e < element_count; ++e) {
+    const int *element = &out.tets[e * static_cast<size_t>(stride)];
+    if (debris.count(find(element[0]))) {
+      ++dropped;
+      out.debris_volume_mm3 +=
+          std::abs(tet_volume6(out.points, element[0], element[1], element[2],
+                               element[3])) /
+          6.0;
+      continue;
+    }
+    kept.insert(kept.end(), element, element + stride);
+  }
+  out.tets.swap(kept);
+  out.debris_components_dissolved += static_cast<int>(debris.size());
+  out.debris_elems_dropped += dropped;
+  out.n_elems = static_cast<int>(out.tets.size() / static_cast<size_t>(stride));
+  return dropped;
+}
+
 // What the mesh carries when the hanging-fragment dissolve is refused because
 // it would have fragmented the domain (see repair_lonely_nodes).
 constexpr const char *kSplitRefusalNote =
@@ -870,6 +1006,14 @@ int repair_lonely_nodes(MeshOut &out) {
   }
   out.hanging_elems_dropped = total_dropped;
   out.n_elems = static_cast<int>(out.tets.size() / static_cast<size_t>(stride));
+  // ── …and the islands the corner rule structurally cannot reach ────────────
+  // Runs AFTER the hanging dissolve and its two guards, and keeps its own
+  // accounting: this one REMOVES components on purpose, so it must never be
+  // inside the guard that refuses a repair for adding them.
+  out.debris_components_dissolved = 0;
+  out.debris_elems_dropped = 0;
+  out.debris_volume_mm3 = 0.0;
+  dissolve_debris_components(out, stride, node_count);
   const int lonely_after = count_lonely_nodes(out);
   out.lonely_nodes_repaired = std::max(0, lonely_before - lonely_after);
   return total_dropped;

@@ -264,6 +264,15 @@ SizeBand resolve_size_band(const TopoDS_Shape &shape,
   // coarsened fill comes back fragmented, so this is a load-bearing field, not
   // telemetry: it must stay the pre-coarsening value on every path.
   band.geometry_base = base;
+  band.element_limit = memory_element_limit > 0
+                           ? static_cast<uint64_t>(memory_element_limit)
+                           : 0ull;
+  band.predicted_elements = predict_elements(base);
+  band.predict_exponent =
+      kTetSurfaceFactor * area_estimate / (base * base) >=
+              kTetPackingFactor * volume_estimate / (base * base * base)
+          ? 2.0
+          : 3.0;
   if (!explicit_size) {
     long interactive_budget = static_cast<long>(8000.0 + 52000.0 * band.fineness);
     if (const char *value = std::getenv("CHUDWARE_MESH_MAX_ELEMS")) {
@@ -323,6 +332,7 @@ SizeBand resolve_size_band(const TopoDS_Shape &shape,
             append_note(capped);
           }
           base = applied;
+          band.memory_coarsened = memory_bound;
         } else {
           std::snprintf(
               text, sizeof(text),
@@ -356,6 +366,7 @@ SizeBand resolve_size_band(const TopoDS_Shape &shape,
           estimate_gb(static_cast<double>(memory_element_limit)));
       append_note(text);
       base = raised;
+      band.memory_coarsened = true;
     }
   }
 

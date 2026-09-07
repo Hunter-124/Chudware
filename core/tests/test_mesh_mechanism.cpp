@@ -18,6 +18,7 @@
 
 #include <BRepBuilderAPI_Transform.hxx>
 #include <BRepPrimAPI_MakeBox.hxx>
+#include <BRepPrimAPI_MakeCylinder.hxx>
 #include <BRep_Builder.hxx>
 #include <IFSelect_ReturnStatus.hxx>
 #include <STEPControl_Writer.hxx>
@@ -247,5 +248,211 @@ TEST_CASE("nodes left behind by mesh repair are not unfixtured components") {
     if (note.get<std::string>().find("reference no element") != std::string::npos)
       named = true;
   CHECK(named);
+}
+
+// ── Solids that interpenetrate are ONE body, and a real gap is named ─────────
+// The ME 490 caliper bracket (source body 201) is a welded rod-and-lug upright
+// whose members were never unioned: `check_interference` records 9299.81 mm^3
+// of overlap against its neighbour alone. Separately meshed solids share no
+// nodes, so every such study was refused for rigid-body motion at every element
+// size, and the refusal named no remedy. Two witnesses:
+//   * three solids that interpenetrate (a plate and two rods that pass through
+//     it and through each other) must FUSE, mesh as ONE component, solve, and
+//     report the volume the fuse removed;
+//   * two rods 1 mm apart with no contact/bond declared must still be REFUSED,
+//     naming the island's body ordinal and that 1 mm.
+namespace {
+
+constexpr double kPlateX = 50.0;
+constexpr double kPlateY = 30.0;
+constexpr double kPlateZ = 10.0;
+constexpr double kRodR = 6.0;
+constexpr double kRodZ0 = 5.0;   // rods start INSIDE the plate
+constexpr double kRodLen = 30.0; // ...and stand 25 mm above it
+constexpr double kRod1X = 20.0;
+constexpr double kRod2X = 28.0;  // axes 8 mm apart: r+r = 12, so they overlap
+constexpr double kRodY = 15.0;
+
+TopoDS_Shape rod_at(double x, double y, double z0, double length) {
+  return BRepPrimAPI_MakeCylinder(gp_Ax2(gp_Pnt(x, y, z0), gp_Dir(0, 0, 1)), kRodR,
+                                  length)
+      .Shape();
+}
+
+// Plate + two rods, every pair interpenetrating.
+std::string write_fused_step() {
+  TopoDS_Compound compound;
+  BRep_Builder builder;
+  builder.MakeCompound(compound);
+  builder.Add(compound, BRepPrimAPI_MakeBox(gp_Pnt(0.0, 0.0, 0.0), kPlateX, kPlateY,
+                                            kPlateZ)
+                            .Shape());
+  builder.Add(compound, rod_at(kRod1X, kRodY, kRodZ0, kRodLen));
+  builder.Add(compound, rod_at(kRod2X, kRodY, kRodZ0, kRodLen));
+  return write_step(compound, "chudware_fuse_plate_two_rods.step");
+}
+
+// Two rods whose surfaces are exactly 1.000 mm apart (axes 13 mm, radii 6+6).
+std::string write_gap_step() {
+  TopoDS_Compound compound;
+  BRep_Builder builder;
+  builder.MakeCompound(compound);
+  builder.Add(compound, rod_at(0.0, 0.0, 0.0, kRodLen));
+  builder.Add(compound, rod_at(2.0 * kRodR + 1.0, 0.0, 0.0, kRodLen));
+  return write_step(compound, "chudware_fuse_two_rods_1mm_gap.step");
+}
+
+// Sample points over a disc of radius r about (cx, cy) at height z on a
+// `divisions`-square grid. The grid pitch has to be tight enough that a
+// TOLERANCE below the 1 mm rod gap still captures every node of the end face:
+// at 30 divisions over a 12 mm disc the pitch is 0.4 mm, so no node is further
+// than 0.29 mm from a sample and tol_mm = 0.3 picks the face without reaching
+// across the gap to the OTHER rod (which is what a 1.2 mm tolerance did — it
+// fixed both bodies and the study then "solved" a non-positive-definite system
+// at 1e-7 mm instead of refusing).
+json disc_samples(double cx, double cy, double z, double r, int divisions = 12) {
+  json points = json::array();
+  for (int i = 0; i <= divisions; ++i)
+    for (int j = 0; j <= divisions; ++j) {
+      const double x = cx - r + 2.0 * r * i / divisions;
+      const double y = cy - r + 2.0 * r * j / divisions;
+      if ((x - cx) * (x - cx) + (y - cy) * (y - cy) <= r * r + 1e-9)
+        points.push_back({x, y, z});
+    }
+  return points;
+}
+
+json rectangle_samples(double x1, double y1, double z) {
+  json points = json::array();
+  for (int i = 0; i <= 20; ++i)
+    for (int j = 0; j <= 12; ++j)
+      points.push_back({x1 * i / 20.0, y1 * j / 12.0, z});
+  return points;
+}
+
+}  // namespace
+
+TEST_CASE("interpenetrating solids are fused into one body and solve") {
+  const std::string step = write_fused_step();
+
+  MeshOptions options;
+  options.order = 1;
+  options.target_size_mm = 4.0;
+  const MeshOut mesh = mesh_step(step, options);
+  REQUIRE_MESSAGE(mesh.ok, mesh.error);
+  // The point of the fuse: ONE fill, so the weld carries nodes. Meshed per
+  // solid, this same STEP is three islands and no static study can run.
+  CHECK(mesh.connected_components == 1);
+  REQUIRE(mesh.fused_groups == 1);
+  CHECK(mesh.fused_solids == 3);
+  REQUIRE(mesh.bodies.size() == 1);
+  CHECK(mesh.bodies[0].source_ordinals.size() == 3);
+  // The volume the fuse removed is the model's own interpenetration, and it is
+  // closed-form here. Inclusion-exclusion over plate P and rods A, B:
+  //   |A∩P| = |B∩P| = pi*36*5                       = 565.4867 mm^3 each
+  //   |A∩B| = lens(d=8, r=6) * 30 = 24.7799 * 30    = 743.3982 mm^3
+  //   |A∩B∩P| = 24.7799 * 5                         = 123.8997 mm^3
+  //   removed = sum|V| - |union| = Σpairwise - triple = 1750.4720 mm^3
+  constexpr double kOverlap = 1750.4720;
+  CHECK(mesh.fused_overlap_mm3 == doctest::Approx(kOverlap).epsilon(0.005));
+  MESSAGE("fused: elems=" << mesh.n_elems << " overlap_mm3=" << mesh.fused_overlap_mm3);
+
+  json study{
+      {"step_path", step},
+      {"mesh_order", 1},
+      {"target_size_mm", 4.0},
+      {"material", steel()},
+      // Fixture: the plate's underside. Load: the top disc of the first rod.
+      {"fixtures", json::array({json{{"points", rectangle_samples(kPlateX, kPlateY, 0.0)},
+                                     {"tol_mm", 1.2}}})},
+      {"loads",
+       json::array({json{{"faces",
+                          {{"points",
+                            disc_samples(kRod1X, kRodY, kRodZ0 + kRodLen, kRodR)},
+                           {"tol_mm", 1.2}}},
+                         {"type", "force"},
+                         {"vector", {600.0, 0.0, 0.0}}}})}};
+  const json result = fea_run_static(study);
+  REQUIRE_MESSAGE(result.value("ok", false), result.dump().substr(0, 1200));
+  const json& quality = result.at("mesh_quality");
+  CHECK(quality.at("connected_components").get<int>() == 1);
+  CHECK(quality.at("unfixed_components").get<int>() == 0);
+  // The packet names what was welded, so a reader never mistakes a fused study
+  // for three bodies in contact.
+  REQUIRE(quality.contains("fused_bodies"));
+  REQUIRE(quality.at("fused_bodies").size() == 1);
+  const json& fused = quality.at("fused_bodies")[0];
+  CHECK(fused.at("body_ordinals").size() == 3);
+  CHECK(fused.at("overlap_removed_mm3").get<double>() ==
+        doctest::Approx(kOverlap).epsilon(0.005));
+  CHECK(quality.at("fused_solids").get<int>() == 3);
+  CHECK(result.at("summary").at("max_disp_mm").get<double>() > 0.0);
+  MESSAGE("fused solve: " << result.at("summary").dump());
+}
+
+TEST_CASE("a body a real gap away is refused by ordinal and by that gap") {
+  const std::string step = write_gap_step();
+
+  MeshOptions options;
+  options.order = 1;
+  options.target_size_mm = 4.0;
+  const MeshOut mesh = mesh_step(step, options);
+  REQUIRE_MESSAGE(mesh.ok, mesh.error);
+  // A millimetre is a GAP, not a weld: nothing is fused and the two rods mesh
+  // as two bodies, each with its own ordinal.
+  CHECK(mesh.fused_groups == 0);
+  CHECK(mesh.connected_components == 2);
+  REQUIRE(mesh.bodies.size() == 2);
+
+  json study{
+      {"step_path", step},
+      {"mesh_order", 1},
+      {"target_size_mm", 4.0},
+      {"material", steel()},
+      // tol BELOW the 1 mm gap, or the selector reaches across it and grounds
+      // both rods — the defect fea_selection.h calls a selection spanning an
+      // interface, here on an interface nobody declared.
+      {"fixtures",
+       json::array({json{{"points", disc_samples(0.0, 0.0, 0.0, kRodR, 30)},
+                         {"tol_mm", 0.3}}})},
+      {"loads",
+       json::array({json{{"faces",
+                          {{"points", disc_samples(2.0 * kRodR + 1.0, 0.0, kRodLen,
+                                                   kRodR, 30)},
+                           {"tol_mm", 0.3}}},
+                         {"type", "force"},
+                         {"vector", {0.0, 0.0, -400.0}}}})}};
+  const json refusal = fea_run_static(study);
+  REQUIRE_MESSAGE(!refusal.value("ok", true), refusal.dump().substr(0, 1200));
+  const std::string error = refusal.value("error", std::string());
+  CHECK(error.find("with no fixture") != std::string::npos);
+  CHECK(error.find("from the nearest fixtured body") != std::string::npos);
+  MESSAGE("gap refusal: " << error);
+
+  // The evidence, not just the prose: which body floated, how big it is, how
+  // far it is from the structure, and which body that is.
+  REQUIRE(refusal.contains("unfixed_islands"));
+  REQUIRE(refusal.at("unfixed_islands").size() == 1);
+  const json& island = refusal.at("unfixed_islands")[0];
+  REQUIRE(island.at("body_ordinals").size() == 1);
+  const int island_ordinal = island.at("body_ordinals")[0].get<int>();
+  REQUIRE(island.contains("nearest_fixed_body_ordinals"));
+  REQUIRE(island.at("nearest_fixed_body_ordinals").size() == 1);
+  const int fixed_ordinal = island.at("nearest_fixed_body_ordinals")[0].get<int>();
+  // The STEP reader decides which rod is solid 1; what must hold is that the
+  // two are named, and named differently.
+  CHECK(island_ordinal != fixed_ordinal);
+  CHECK(island_ordinal + fixed_ordinal == 3);
+  CHECK(island.at("nodes").get<int>() > 0);
+  // The distance is measured between mesh NODES, and the closest approach of
+  // two cylinders is a single line the fill has no reason to sample exactly, so
+  // the reported gap is the true 1.000 mm plus at most a lateral element of
+  // sampling error. It must never be less than the CAD gap, and it must be
+  // recognizably a millimetre rather than the 13 mm axis spacing.
+  const double gap = island.at("gap_to_nearest_fixed_body_mm").get<double>();
+  CHECK(gap >= 1.0);
+  CHECK(gap < 1.0 + 4.0);
+  MESSAGE("island gap_mm=" << gap << " ordinal=" << island_ordinal
+                           << " nearest=" << fixed_ordinal);
 }
 

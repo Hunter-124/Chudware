@@ -128,6 +128,29 @@ struct MeshOut {
   // that could not conform, a wave that grew nothing). Empty when the waves
   // simply converged on the request.
   std::string local_refine_limit;
+  // ── The bounded quality pass over the refined region ─────────────────────
+  // A bisection wave is conforming but not shapely: LEPP closure leaves
+  // stretched neighbours a whole size class away from the interface, and the
+  // ME 490 hinge saddle came back with aspect_max 263 / jacobian_min 0.0029
+  // and 50 cells under polymesh's ship floor while the interface itself was
+  // exactly what was asked for. So each wave — and the mesh the last wave
+  // leaves — gets a bounded pass of boundary-aware smoothing, 2-3/3-2 edge
+  // flips and sliver collapses over the region the size field reached
+  // (mesher.cpp: region_quality / quality_pass). These are the pass's own
+  // before/after, measured over that region only: the whole-mesh aspect_max /
+  // jacobian_min above still describe the whole mesh.
+  int local_refine_smoothing_passes = 0;
+  double local_refine_jacobian_min_before = 0.0;
+  double local_refine_jacobian_min_after = 0.0;
+  double local_refine_aspect_max_before = 0.0;
+  double local_refine_aspect_max_after = 0.0;
+  uint64_t local_refine_cells_below_floor_before = 0;
+  uint64_t local_refine_cells_below_floor_after = 0;
+  // A quality pass moves nodes, so it can lengthen the interface faces the
+  // contract is measured on. When it coarsened the delivery past the contract
+  // the interface is re-marked and re-split ONCE, and that is reported: a
+  // delivered size nobody re-measured after smoothing is not a measurement.
+  bool local_refine_resplit = false;
 
   // Fill cells whose node order was left-handed (negative signed volume) and
   // was relabelled right-handed before promotion (see
@@ -153,6 +176,59 @@ struct MeshOut {
   // stiffness. `degenerate_elems_remaining` > 0 is a refusal, never a warning.
   int degenerate_elems_repaired = 0;
   int degenerate_elems_remaining = 0;
+
+  // ── Which CAD solid each meshed node came from ───────────────────────────
+  // A multi-solid STEP is meshed solid by solid (mesh_separate_solids), so the
+  // node array is a CONCATENATION of per-body blocks and every body occupies
+  // one contiguous half-open range. Recording the ranges instead of a per-node
+  // or per-element body id is not a micro-optimization: a body id array costs
+  // 4 bytes per element (34 MB on an 8.6M-element mesh) to carry information
+  // the append order already has exactly.
+  //
+  // `source_ordinals` are the 1-based STEP solid ordinals — the same numbering
+  // `import_part(keep_bodies=...)` uses — that ended up in this meshed body;
+  // it holds more than one entry when overlapping solids were fused (see
+  // fuse below). This is what lets a rigid-body refusal NAME the island's
+  // body instead of reporting an anonymous "component 3".
+  struct Body {
+    std::vector<int> source_ordinals;
+    int node_begin = 0; // into points/3
+    int node_end = 0;   // exclusive
+    double volume_mm3 = 0.0;        // CAD volume of the body that was meshed
+    double fused_overlap_mm3 = 0.0; // volume the fuse removed (0 = not fused)
+  };
+  std::vector<Body> bodies;
+
+  // ── Solids the mesher FUSED before filling ───────────────────────────────
+  // Separately-meshed solids share no nodes, so two rods that merely touch (or
+  // interpenetrate — the ME 490 rover records 9299.81 mm3 of overlap between
+  // source bodies 200 and 201) mesh as two islands and every static study on
+  // them is refused for rigid-body motion. A multi-solid STEP whose solids
+  // OVERLAP or touch within tolerance is therefore fused into one solid before
+  // the fill, unless the study declared how those interfaces are to be treated
+  // (MeshOptions::declared_interfaces) — a declared contact or bonded-tie
+  // interface must keep its two bodies. `fused_groups` counts the fusions and
+  // `fused_overlap_mm3` is the total volume delta (sum of the inputs minus the
+  // fused result), i.e. the interpenetration the design model carried.
+  int fused_groups = 0;
+  int fused_solids = 0;
+  double fused_overlap_mm3 = 0.0;
+
+  // ── Sub-element debris the fill left as separate islands ─────────────────
+  // A graded fill on a solid whose lumps meet TANGENTIALLY (body 201's rods
+  // pass through each other, leaving a 9.8 um knife-edge where they emerge)
+  // sheds cells at the knife edge that touch nothing else: measured on that
+  // isolate at tet4 h = 3.0 mm, 3 islands of 1/3/3 elements totalling
+  // 0.0101 mm3 against a domain of 88504.8 mm3. They are not bodies and they
+  // are not hanging flaps either (each is internally face-connected, so the
+  // corner rule below never sees them) — they are debris below the fill's own
+  // resolution, and each one costs the whole study a rigid-body refusal. The
+  // dissolve drops any component both under a millionth of the domain volume
+  // and smaller than ONE nominal element of the requested size; anything
+  // bigger is real geometry and is still refused, by name.
+  int debris_components_dissolved = 0;
+  int debris_elems_dropped = 0;
+  double debris_volume_mm3 = 0.0;
 
   std::string mesh_type_used; // "tet4" or "tet10"
   std::string note;
@@ -196,6 +272,11 @@ struct MeshOptions {
   double max_size_mm = 0.0;    // >0 overrides the automatic size-band ceiling
   bool learned_advisor = false;
   uint32_t advisor_max_dof = 0; // 0 disables the advisor's DOF budget
+  // The STUDY has declared how the interfaces between its bodies are treated
+  // (a `contact` block, or a positive `bond_gap_mm`). Overlapping/touching
+  // solids are then meshed as SEPARATE bodies — the declaration is the whole
+  // point of the study — instead of being fused into one (MeshOut::fused_*).
+  bool declared_interfaces = false;
   MeshLocalRefine local_refine;
 };
 
@@ -226,6 +307,26 @@ void mesh_cache_note_generation();
 
 namespace detail {
 bool fill_quality(MeshOut &out);
+
+// Aspect ratio and minimum corner scaled Jacobian of ONE tet, from four corner
+// points given as xyz triples. These are exactly the definitions fill_quality
+// aggregates into MeshOut::aspect_max / jacobian_min, and the local
+// quality pass in mesher.cpp has to judge candidate node moves and edge flips
+// in the same currency the report is stated in — two definitions of "aspect"
+// in one mesher is how a pass converges on a floor the reader never sees.
+// `aspect` is (longest edge / shortest altitude) normalized so a regular tet
+// scores 1.0; `scaled_jacobian` is the min over the four corners of
+// sqrt(2)*|6V| / (product of the three incident edge lengths), also 1.0 for a
+// regular tet. Both are magnitudes — Chudware's tet4 contract carries no
+// orientation, so a mirrored cell measures like its twin and inversion is a
+// separate verdict. A zero-volume tet reports aspect = +inf and
+// scaled_jacobian = 0.
+struct TetShape {
+  double aspect = 0.0;
+  double scaled_jacobian = 0.0;
+};
+TetShape tet_shape(const double *a, const double *b, const double *c,
+                   const double *d);
 
 // Element-local straight-edge fallback for a promoted+projected tet10 mesh.
 //

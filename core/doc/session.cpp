@@ -5715,6 +5715,14 @@ json doc_sim_study_delete(const std::string& doc_id, const std::string& study_id
 json doc_asm_world_bodies(const std::string& doc_id, bool explode) {
     DocLock lk;
     Session& s = require_session(doc_id);
+    // Match gather_export_shapes / STEP traversal: one body can contain several solids.
+    int next_source_ordinal = 1;
+    const auto source_ordinals = [&next_source_ordinal](const TopoDS_Shape& shape) {
+        json ordinals = json::array();
+        for (TopExp_Explorer ex(shape, TopAbs_SOLID); ex.More(); ex.Next())
+            ordinals.push_back(next_source_ordinal++);
+        return ordinals;
+    };
     if (!s.is_assembly()) {
         // Multi-body PART fallback (Issue 9). A part assembled via import_part (several
         // imported + transform-placed bodies) is not a formal assembly doc, but the caller
@@ -5737,7 +5745,8 @@ json doc_asm_world_bodies(const std::string& doc_id, bool explode) {
             }
             const std::string nm =
                 i < r.bodies_info.size() ? r.bodies_info[i].name : ("Body" + std::to_string(i + 1));
-            out.push_back({{"name", nm}, {"component", nm}, {"bbox", bb}});
+            out.push_back({{"name", nm}, {"component", nm}, {"bbox", bb},
+                           {"source_ordinals", source_ordinals(world)}});
         }
         return json{{"bodies", out}, {"multibody_part", true}};
     }
@@ -5760,7 +5769,8 @@ json doc_asm_world_bodies(const std::string& doc_id, bool explode) {
                 bb = {{"min", {xa, ya, za}}, {"max", {xb, yb, zb}},
                       {"size", {xb - xa, yb - ya, zb - za}}};
             }
-            out.push_back({{"name", body.name}, {"component", body.component_id}, {"bbox", bb}});
+            out.push_back({{"name", body.name}, {"component", body.component_id}, {"bbox", bb},
+                           {"source_ordinals", source_ordinals(world)}});
         }
     return json{{"bodies", out}};
 }
@@ -6415,19 +6425,42 @@ bool eval_is_closed_solid(const TopoDS_Shape& shape) {
 // and every export threw "no bodies to export". No explode offset: an export captures the
 // assembled configuration, not the exploded view. Parts fall through to compile_document.
 // Mirror of tessellate_session_bodies' assembly branch, but yielding exact B-rep shapes.
-static std::vector<TopoDS_Shape> gather_export_shapes(Session& s) {
+static std::vector<TopoDS_Shape> gather_export_shapes(Session& s, json* components = nullptr) {
+    if (components) *components = json::array();
     if (s.is_assembly()) {
-        if (!s.asm_result) rebuild_assembly(s);
+        // A path-backed descendant can change without changing this document's revision.
+        rebuild_assembly(s);
         std::vector<TopoDS_Shape> shapes;
-        const AssemblyResult* ares = s.asm_result.get();
-        if (ares)
-            for (const AsmBodyOut& body : ares->bodies) {
-                try {
-                    TopoDS_Shape world = placed_world_shape(body, std::nullopt);
-                    if (!world.IsNull()) shapes.push_back(world);
-                } catch (...) {
-                }
-            }
+        std::map<std::string, int> solids_by_component;
+        const AssemblyResult& ar = *s.asm_result;
+        for (const AsmBodyOut& body : ar.bodies) {
+            TopoDS_Shape world = placed_world_shape(body, std::nullopt);
+            int solids = 0;
+            if (!world.IsNull())
+                for (TopExp_Explorer ex(world, TopAbs_SOLID); ex.More(); ex.Next()) ++solids;
+            if (!solids)
+                throw OpError("export_failed", "component '" + body.name + "' has no solids",
+                              {{"component", body.component_id}});
+            solids_by_component[body.component_id] += solids;
+            shapes.push_back(std::move(world));
+        }
+        for (const json& component : s.doc.value("components", json::array())) {
+            if (component.value("suppressed", false)) continue;
+            const std::string id = component.value("id", std::string());
+            const std::string name = component.value("name", id);
+            const json source = component.value("source", json::object());
+            const std::string path = source.value("path", source.value("embedded", std::string()));
+            std::string failure;
+            for (const AsmComponentStatus& st : ar.component_status)
+                if (st.id == id && !st.ok) failure = st.error.value_or("component load failed");
+            const int solids = solids_by_component[id];
+            if (!solids || !failure.empty())
+                throw OpError("export_failed", "component '" + name + "' at '" + path +
+                              "' contributed no complete geometry: " + failure,
+                              {{"component", id}, {"name", name}, {"path", path}});
+            if (components)
+                components->push_back({{"name", name}, {"solids", solids}, {"source", source}});
+        }
         return shapes;
     }
     CompileResult r = compile_session(s);
@@ -11800,7 +11833,8 @@ json doc_export_file(const std::string& doc_id, const std::string& path, const s
         throw OpError("invalid_op", "export_file: 'path' is required", {{"reason", "missing path"}});
     if (fmt.empty())
         throw OpError("invalid_op", "export_file: 'format' is required", {{"reason", "missing format"}});
-    std::vector<TopoDS_Shape> shapes = gather_export_shapes(s);  // assembly-aware (world-placed)
+    json components;
+    std::vector<TopoDS_Shape> shapes = gather_export_shapes(s, &components);
     if (shapes.empty())
         throw OpError("export_failed", "export_file: document has no bodies to export",
                       {{"doc_id", doc_id}});
@@ -11835,6 +11869,7 @@ json doc_export_file(const std::string& doc_id, const std::string& path, const s
 
     json meta{{"path", out}, {"format", fmt}, {"bytes", static_cast<double>(bytes)},
               {"expected_solids", static_cast<int>(expected_solids)}};
+    if (s.is_assembly()) meta["components"] = std::move(components);
 
     // Round-trip B-rep formats: re-read with the SAME kernel and confirm the solids survived and
     // are topologically valid BEFORE returning success. This catches the "STEP/IGES won't open"
@@ -11851,10 +11886,7 @@ json doc_export_file(const std::string& doc_id, const std::string& path, const s
                 if (!nb.second.IsNull() && BRepCheck_Analyzer(nb.second).IsValid()) ++valid;
             meta["solid_count"] = static_cast<int>(reread.size());
             meta["valid_solids"] = static_cast<int>(valid);
-            // IGES is a face-soup format: solids may sew into fewer/zero TopAbs_SOLIDs, so we
-            // only HARD-fail step/brep on a solid-count mismatch; IGES just reports what it read.
-            const bool count_ok = (f == "iges" || f == "igs") ? (reread.size() > 0)
-                                                              : (reread.size() >= expected_solids);
+            const bool count_ok = reread.size() == expected_solids;
             meta["validated"] = (count_ok && valid == reread.size() && !reread.empty());
             if (!meta["validated"].get<bool>())
                 throw OpError("export_failed",
@@ -11873,7 +11905,7 @@ json doc_export_file(const std::string& doc_id, const std::string& path, const s
                           {{"path", out}, {"format", fmt}});
         }
     } else {
-        meta["validated"] = true;  // mesh formats: bytes>0 is the only integrity signal we have
+        meta["validated"] = false;  // bytes alone do not prove a solid-preserving round trip
     }
     return meta;
 }
@@ -11882,13 +11914,15 @@ json doc_export_estimate(const std::string& doc_id, double lin_deflection, doubl
                          bool relative) {
     DocLock lk;
     Session& s = require_session(doc_id);
-    std::vector<TopoDS_Shape> shapes = gather_export_shapes(s);  // assembly-aware (world-placed)
+    json components;
+    std::vector<TopoDS_Shape> shapes = gather_export_shapes(s, &components);
     TessOptions tess;
     if (lin_deflection > 0.0) tess.lin_deflection = lin_deflection;
     if (ang_deflection > 0.0) tess.ang_deflection = ang_deflection;
     tess.relative = relative;
     auto [tris, verts] = estimate_tessellation(shapes, tess);
-    return json{{"triangles", tris}, {"vertices", verts}, {"bodies", shapes.size()}};
+    return json{{"triangles", tris}, {"vertices", verts}, {"bodies", shapes.size()},
+                {"components", std::move(components)}};
 }
 
 // True iff `path` has the native .step+ container extension (case-insensitive). Used to
@@ -11949,6 +11983,12 @@ json doc_import_file(const std::string& path, const std::string& into, bool as_s
         if (tmp_id.empty())
             throw OpError("import_failed", "import_file: could not open .step+ container",
                           {{"path", path}});
+        struct CloseImportedDoc {
+            std::string id;
+            ~CloseImportedDoc() {
+                try { doc_close(id); } catch (...) { }
+            }
+        } close_imported{tmp_id};
         const std::string stem = std::filesystem::path(path).stem().string();
         std::string blob;
         std::size_t n = 0;
@@ -11963,7 +12003,6 @@ json doc_import_file(const std::string& path, const std::string& into, bool as_s
                 if (!shp.IsNull()) { bb.Add(comp, shp); ++n; }
             if (n > 0) blob = shape_to_brep_b64(comp);
         }
-        try { doc_close(tmp_id); } catch (...) { /* best-effort cleanup of the temp doc */ }
         if (n == 0 || blob.empty())
             throw OpError("import_failed", "import_file: .step+ contained no solids to import",
                           {{"path", path}});
@@ -12450,6 +12489,19 @@ json doc_open(const std::string& path, bool as_solid, bool detach_path) {
     sp->doc = std::move(loaded.doc);
     sp->revision = 0;
     sp->path = detach_path ? std::string() : path;
+    // Detached imports must retain relative component references without retaining
+    // the source's save destination. Resolve against the container, not process cwd.
+    if (detach_path && sp->is_assembly() && sp->doc.contains("components")) {
+        const auto base = std::filesystem::absolute(path).parent_path();
+        for (json& component : sp->doc["components"]) {
+            if (!component.contains("source") || !component["source"].is_object()) continue;
+            json& source = component["source"];
+            if (!source.contains("path") || !source["path"].is_string()) continue;
+            const std::filesystem::path ref(source["path"].get<std::string>());
+            if (!ref.empty() && ref.is_relative())
+                source["path"] = (base / ref).lexically_normal().string();
+        }
+    }
     sp->extra_entries = std::move(loaded.extra);
     // Stamp the document's own id to the new session id (mirrors blank_part).
     if (sp->doc.is_object()) sp->doc["id"] = sp->doc_id;
@@ -15370,9 +15422,13 @@ static MotionAxisLine motion_axis_line(const json& doc, json& driver,
 }
 
 static json motion_pose_check(const MotionAxisLine& line, const Eigen::Matrix4d& pose,
-                               const Eigen::Matrix3d& expected_rotation) {
+                               double requested_value) {
     const Eigen::Matrix4d delta = pose * line.base.inverse();
     const Eigen::Matrix3d r = delta.topLeftCorner<3, 3>();
+    // Validate against the requested world line, not the matrix used to drive it.
+    const Eigen::Matrix3d expected_rotation = Eigen::AngleAxisd(
+        line.sign * (requested_value - line.value) * M_PI / 180.0,
+        line.direction).toRotationMatrix();
     const double tol = 1e-6 * std::max(1.0, line.point.norm());
     const double error = (delta.topRightCorner<3, 1>() -
                          (line.point - r * line.point)).norm();
@@ -15500,6 +15556,8 @@ json doc_simulate_motion(const std::string& doc_id,
                                     static_cast<double>(steps - 1));
 
     json trajectory = json::array();
+    json reference_bodies = json::array();
+    json reference_transforms = json::object();
     json first_collision_step = nullptr;
     json first_collision_value = nullptr;
     json first_collision_detail = json::array();
@@ -15530,6 +15588,21 @@ json doc_simulate_motion(const std::string& doc_id,
         }
         AssemblyResult solved = compile_assembly(sweep_doc, base_dir, warm);
         warm = solved.warm;
+        if (i == 0) {
+            reference_transforms = solved.transforms;
+            for (const AsmBodyOut& body : solved.bodies) {
+                const TopoDS_Shape world = placed_world_shape(body);
+                if (world.IsNull()) continue;
+                Bnd_Box box;
+                BRepBndLib::Add(world, box);
+                if (box.IsVoid()) continue;
+                double xa, ya, za, xb, yb, zb;
+                box.Get(xa, ya, za, xb, yb, zb);
+                reference_bodies.push_back({
+                    {"component", body.component_id},
+                    {"bbox", {{"min", {xa, ya, za}}, {"max", {xb, yb, zb}}}}});
+            }
+        }
 
         bool converged = solved.converged;
         json issues = json::array();
@@ -15586,7 +15659,7 @@ json doc_simulate_motion(const std::string& doc_id,
                 pose_check["ok"] = false;
                 pose_check["reason"] = "driver_pose_missing";
             } else {
-                json checked = motion_pose_check(*axis_line, it->second, drive_rotation);
+                json checked = motion_pose_check(*axis_line, it->second, value);
                 pose_check["ok"] = checked["ok"];
                 pose_check["bodies"].push_back(std::move(checked));
             }
@@ -15602,7 +15675,11 @@ json doc_simulate_motion(const std::string& doc_id,
 
         json frame = {{"i", i},
                       {"value", value},
-                      {"dof", solved.dof},
+                      {"dof", solved.dof + (axis_line &&
+                          (*driven)["value"].contains("axis_point") &&
+                          ((*driven)["value"].contains("axis") ||
+                           (*driven)["value"].contains("reference_axis")) ? 1 : 0)},
+                      {"residual_dof", solved.dof},
                       {"converged", converged},
                       {"bodies", bodies_j}, {"pose_check", pose_check}};
         if (!issues.empty()) frame["issues"] = issues;
@@ -15681,6 +15758,8 @@ json doc_simulate_motion(const std::string& doc_id,
                     {"stop", stop},
                     {"steps", steps}}},
         {"trajectory", trajectory},
+        {"reference_bodies", std::move(reference_bodies)},
+        {"reference_transforms", std::move(reference_transforms)},
         {"pose_check", {{"ok", all_pose_ok}, {"frames", pose_frames}}},
         {"interference", interference},
         {"summary", std::string(summary_buf)}};

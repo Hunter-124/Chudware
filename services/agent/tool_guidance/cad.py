@@ -360,9 +360,11 @@ ENTRIES: dict[str, dict[str, Any]] = {
     },
     "export_part": {
         "prompt_note": (
-            "Interchange/mesh only — no feature tree or studies survive. A machine shop "
-            "needs fmt='step' (.step/.stp); save_part's .step+ is Chudware's native ZIP "
-            "document and is NOT a standard STEP exchange file."
+            "fmt='step' is standard machine-shop exchange; fmt='step+' saves the editable "
+            "native ZIP. Assembly exports resolve nested path-backed children or refuse "
+            "with the missing component/path; inspect components:[{name,solids,source}]. "
+            "validated:true means exact B-rep round-trip solid counts; mesh/native saves "
+            "do not claim that validation."
         ),
     },
     "fit_cylinder_axis": {
@@ -387,8 +389,10 @@ ENTRIES: dict[str, dict[str, Any]] = {
     },
     "import_part": {
         "prompt_note": (
-            "into=doc_id adds to the current part; omit for a new doc. .sldprt rebuilds "
-            "the SW tree (needs local SolidWorks); mesh → as_solid=True to sew a solid. "
+            "into=doc_id adds an import feature there; omit for a NEW independent doc "
+            "(resume=False default), even if the source is open. resume=True explicitly "
+            "reuses that saved session. Use the returned doc_id and its feature ids. "
+            ".sldprt prefers the SW tree; mesh → as_solid=True to sew a solid. "
             "Multi-body source: describe_part rosters the bodies, keep_bodies/"
             "exclude_bodies (ordinals or names) drop the ones you don't want."
         ),

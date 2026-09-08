@@ -703,3 +703,35 @@ TEST_CASE("a sweep through zero measures one axis, not one per frame") {
         CHECK(std::abs(std::atan2(M[9], M[5]) * kRad2Deg - target) < 1e-6);
     }
 }
+
+TEST_CASE("line angle binds a bore-less plate without warm-start drift") {
+    const Vector3d pin(910, 0, 545);
+    json components = json::array({
+        {{"id", "front"}, {"fixed", true}, {"transform", ident16()}},
+        {{"id", "rear"}, {"fixed", false}, {"transform", ident16()}}});
+    json mates = json::array({{{"id", "fold"}, {"type", "angle"},
+        {"refs", {{{"component", "front"}}, {{"component", "rear"}}}},
+        {"value", {{"value", 0.0}, {"axis", {0, 1, 0}},
+                   {"axis_point", {910, 0, 545}}}}}});
+    ResolvedGeometry geometry;
+    geometry[{"fold", 0}] = mgeom("plane", {0, 0, 0}, {1, 0, 0}, {0, 0, 1});
+    geometry[{"fold", 1}] = mgeom("plane", {0, 0, 0}, {1, 0, 0}, {0, 0, 1});
+    WarmMap warm;
+    for (int degrees = 0; degrees >= -180; degrees -= 5) {
+        mates[0]["value"]["value"] = degrees;
+        const Vector3d w(0, degrees * M_PI / 180.0, 0);
+        const Vector3d t = pin - rodrigues(w) * pin;
+        // Deliberately displaced seed proves the pin is constrained, not merely seeded.
+        warm["rear"] = {t + Vector3d(0.01, -0.02, 0.03), w};
+        const auto solved = solve_mates(components, mates, geometry, warm, std::nullopt, 1e-12, 100);
+        REQUIRE(solved.converged);
+        CHECK(solved.dof == 0);
+        const auto expected = xform(t, w);
+        const auto& actual = solved.transforms.at("rear");
+        for (size_t k = 0; k < 16; ++k)
+            CHECK(std::abs(actual[k] - expected[k]) < 1e-9);
+    }
+    mates[0]["value"].erase("axis_point");
+    mates[0]["value"]["value"] = 0;
+    CHECK(solve_mates(components, mates, geometry).dof == 5);
+}

@@ -199,6 +199,7 @@ struct CompFrame {
     // the previous frame — measures the same signed angle at every frame instead of one
     // that drifts with the solver's own path.
     Matrix3d R_auth = Matrix3d::Identity();
+    Vector3d t_auth = Vector3d::Zero();
     std::vector<int> t_idx;   // 3 var indices (translation), empty if fixed
     std::vector<int> w_idx;   // 3 var indices (rotation vector), empty if fixed
 
@@ -608,6 +609,52 @@ private:
                             + self->place("b", (g_db.transpose() * Jdb).eval())
                             + self->place("a", (g_ref.transpose() * Jref).eval()));
         };
+        if (params_.is_object() && params_.contains("axis_point") &&
+            (params_.contains("axis") || params_.contains("reference_axis"))) {
+            const json& point = params_["axis_point"];
+            if (!point.is_array() || point.size() != 3)
+                throw std::runtime_error("angle axis_point must be a 3-element vector");
+            Vector3d pa_l;
+            for (int k = 0; k < 3; ++k) {
+                if (!point[k].is_number() || !std::isfinite(point[k].get<double>()))
+                    throw std::runtime_error("angle axis_point must be finite and numeric");
+                pa_l[k] = point[k].get<double>();
+            }
+            // Bind the virtual pin to both AUTHORED frames, never the warm start.
+            // Three point rows preserve its axial station as well as its line.
+            const Vector3d pb_l = fb_->R_auth.transpose() *
+                (fa_->R_auth * pa_l + fa_->t_auth - fb_->t_auth);
+            const Vector3d axis_b = fb_->R_auth.transpose() * fa_->R_auth * ref_l;
+            R angle_r = rfunc;
+            J angle_j = jfunc;
+            rfunc = [=](const VectorXd& xs) {
+                Vector3d a, b, pa, pb; MatrixXd unused;
+                self->wd("a", xs, ref_l, a, unused);
+                self->wd("b", xs, axis_b, b, unused);
+                self->wp("a", xs, pa_l, pa, unused);
+                self->wp("b", xs, pb_l, pb, unused);
+                VectorXd r(6);
+                r.head(2) = two_indep_cross(a, b);
+                r.segment(2, 3) = pb - pa;
+                r(5) = angle_r(xs)(0);
+                return r;
+            };
+            jfunc = [=](const VectorXd& xs) {
+                Vector3d a, b, pa, pb; MatrixXd Ja, Jb, Jpa, Jpb;
+                self->wd("a", xs, ref_l, a, Ja);
+                self->wd("b", xs, axis_b, b, Jb);
+                self->wp("a", xs, pa_l, pa, Jpa);
+                self->wp("b", xs, pb_l, pb, Jpb);
+                MatrixXd out = self->empty_jac(6);
+                const MatrixXd cross_jac = self->place("a", (-skew(b) * Ja).eval())
+                    + self->place("b", (skew(a) * Jb).eval());
+                out.topRows(2) = two_indep_cross_jac(a, b, cross_jac);
+                out.middleRows(2, 3) = self->place("b", Jpb) - self->place("a", Jpa);
+                out.bottomRows(1) = angle_j(xs);
+                return out;
+            };
+            return {rfunc, jfunc, 6};
+        }
         return {rfunc, jfunc, 1};
     }
 
@@ -1532,6 +1579,7 @@ MateSolveResult solve_mates(const json& components, const json& mates,
         frame.w0 = w;
         frame.fixed = fixed;
         frame.R_auth = fixed ? R_authored : rodrigues_impl(w_auth);
+        frame.t_auth = t_auth;
         if (fixed) {
             // Hard constraint, carried by the document's own numbers: the residuals see the
             // authored rotation block and the result echoes the authored 16 doubles.

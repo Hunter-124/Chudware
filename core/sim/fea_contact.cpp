@@ -140,6 +140,45 @@ ContactCandidateSet fea_contact_candidates(const std::vector<double>& points,
         out.component[static_cast<std::size_t>(i)] = it->second;
     }
     out.n_components = static_cast<int>(root_ordinal.size());
+    auto ordinal = [&](int node) {
+        return options.node_body_ordinal ? options.node_body_ordinal(node)
+                                         : out.component[static_cast<std::size_t>(node)] + 1;
+    };
+    std::set<int> body_ordinals;
+    if (!options.bonded_pairs.empty() || !options.contact_pairs.empty())
+        for (int i = 0; i < n_nodes; ++i)
+            if (meshed[static_cast<std::size_t>(i)]) body_ordinals.insert(ordinal(i));
+    std::map<std::array<int, 2>, InterfaceKind> interfaces;
+    auto declare = [&](const std::vector<std::array<int, 2>>& pairs, InterfaceKind kind) {
+        for (auto pair : pairs) {
+            std::sort(pair.begin(), pair.end());
+            for (int body : pair)
+                if (body <= 0 || !body_ordinals.count(body)) {
+                    out.error = "interfaces: body ordinal " + std::to_string(body) + " is not in the mesh";
+                    return false;
+                }
+            if (pair[0] == pair[1]) {
+                out.error = "interfaces: body ordinal " + std::to_string(pair[0]) + " cannot interface with itself";
+                return false;
+            }
+            const auto previous = interfaces.find(pair);
+            if (previous != interfaces.end() && previous->second != kind) {
+                out.error = "interfaces: pair [" + std::to_string(pair[0]) + "," +
+                            std::to_string(pair[1]) + "] is listed in both bonded and contact";
+                return false;
+            }
+            interfaces[pair] = kind;
+        }
+        return true;
+    };
+    if (!declare(options.bonded_pairs, InterfaceKind::Bonded) ||
+        !declare(options.contact_pairs, InterfaceKind::Contact)) return out;
+    auto kind_of = [&](int a, int b) {
+        const int oa = ordinal(a), ob = ordinal(b);
+        if (oa == ob) return InterfaceKind::Free;
+        const auto it = interfaces.find({std::min(oa, ob), std::max(oa, ob)});
+        return it == interfaces.end() ? options.default_interface : it->second;
+    };
 
     // Characteristic element length: mean first-edge length over a sample of elements.
     {
@@ -319,6 +358,7 @@ ContactCandidateSet fea_contact_candidates(const std::vector<double>& points,
                     for (int j : it->second) {
                         const int cj = out.component[static_cast<std::size_t>(j)];
                         if (cj == ci) continue;
+                        if (kind_of(i, j) == InterfaceKind::Free) continue;
                         double d[3];
                         double d2 = 0.0;
                         for (int c = 0; c < 3; ++c) {
@@ -366,15 +406,18 @@ ContactCandidateSet fea_contact_candidates(const std::vector<double>& points,
             // the node-to-node projection answers it wrongly by up to the whole
             // clearance — see ContactGapProbe in fea_contact.h.
             double gap_used = b.gap;
+            const bool bonded = kind_of(i, b.node) == InterfaceKind::Bonded;
             if (options.gap_probe != nullptr) {
                 double analytic = 0.0;
                 const double* pj = &points[static_cast<std::size_t>(b.node) * 3];
                 if (options.gap_probe->pair_gap_mm(i, pi, b.node, pj, analytic)) {
                     gap_used = analytic;
-                    ++out.gap_analytic_pairs;
+                    if (!bonded) ++out.gap_analytic_pairs;
                 } else {
-                    fallback_nodes.insert(i);
-                    fallback_nodes.insert(b.node);
+                    if (!bonded) {
+                        fallback_nodes.insert(i);
+                        fallback_nodes.insert(b.node);
+                    }
                 }
             }
             // max_gap_mm is the caller's statement of what counts as contact, and
@@ -385,9 +428,11 @@ ContactCandidateSet fea_contact_candidates(const std::vector<double>& points,
                 ++out.gap_beyond_max_pairs;
                 continue;
             }
+            if (bonded && options.bond_gap_mm >= 0.0 &&
+                std::abs(gap_used) > options.bond_gap_mm + 1e-8) continue;
             const std::array<int, 2> comps{std::min(ci, cj), std::max(ci, cj)};
             auto git = group_of.find(comps);
-            if (git == group_of.end()) {
+            if (!bonded && git == group_of.end()) {
                 git = group_of.emplace(comps, static_cast<int>(out.group_components.size()))
                           .first;
                 out.group_components.push_back(comps);
@@ -408,11 +453,16 @@ ContactCandidateSet fea_contact_candidates(const std::vector<double>& points,
                 out.error = "contact: pair material E must be finite and > 0";
                 return out;
             }
-            s.k = pair_E * out.char_len_mm * options.penalty_scale;
+            s.k = pair_E * out.char_len_mm * (bonded ? 1.0 : options.penalty_scale);
             s.gap0_mm = gap_used;
             for (int c = 0; c < 3; ++c)
                 s.normal[static_cast<std::size_t>(c)] = flip ? -dir.n[c] : dir.n[c];
             s.area_mm2 = dir.area;
+            if (bonded) {
+                s.group = -1;
+                out.bonded.push_back(s);
+                continue;
+            }
             s.group = git->second;
             out.springs.push_back(s);
             facet_gaps.push_back(b.gap);

@@ -1779,6 +1779,61 @@ static FeaStaticResult solve_impl(const std::vector<double>& points,
             for (int j = 1; j < stride; ++j) uf_unite(base_parent, tn[0], tn[j]);
         }
         for (const BondSpring& s : bond_springs) uf_unite(base_parent, s.a, s.b);
+        // A clearance body's first iterate must travel WITH its load, not be
+        // pulled towards every side of an enclosing bore at once. Sum loads over
+        // element+bond components so a pressed sleeve and its plate are one support.
+        std::set<int> fixed_roots;
+        if (contact_mode)
+            for (int nid : fixed_nodes) fixed_roots.insert(uf_find(base_parent, nid));
+        std::map<int, Eigen::Vector3d> component_force;
+        if (contact_mode)
+            for (int i = 0; i < n_nodes; ++i) {
+                if (!meshed[static_cast<std::size_t>(i)]) continue;
+                const int root = uf_find(base_parent, i);
+                if (fixed_roots.count(root)) continue;
+                auto it = component_force.try_emplace(root, Eigen::Vector3d::Zero()).first;
+                for (int c = 0; c < 3; ++c)
+                    it->second[c] += nodal_forces[static_cast<std::size_t>(i) * 3 + c];
+            }
+        std::vector<char> load_closing(static_cast<std::size_t>(n_pairs), 0);
+        std::vector<char> load_directed(static_cast<std::size_t>(n_pairs), 0);
+        for (int p = 0; p < n_pairs; ++p) {
+            const auto& cp = pairs[static_cast<std::size_t>(p)];
+            Eigen::Vector3d relative_force = Eigen::Vector3d::Zero();
+            const auto a = component_force.find(uf_find(base_parent, cp.a));
+            const auto b = component_force.find(uf_find(base_parent, cp.b));
+            if (a != component_force.end()) relative_force += a->second;
+            if (b != component_force.end()) relative_force -= b->second;
+            const double magnitude = relative_force.norm();
+            load_directed[static_cast<std::size_t>(p)] = magnitude > 1e-12;
+            load_closing[static_cast<std::size_t>(p)] =
+                relative_force.dot(Eigen::Vector3d(cp.n[0], cp.n[1], cp.n[2])) >
+                1e-10 * std::max(magnitude, 1e-12);
+        }
+        // Before dropping a load-bearing component's last support, retain its
+        // load-facing travel pairs for the next iterate. They are NOT converged
+        // contacts until the ordinary zero-gap test accepts them. Opposite-facing
+        // pairs cannot rescue a genuine lift-off.
+        auto preserve_load_support = [&](std::vector<char>& next) {
+            std::vector<int> parent = base_parent;
+            for (int p = 0; p < n_pairs; ++p)
+                if (next[static_cast<std::size_t>(p)])
+                    uf_unite(parent, pairs[static_cast<std::size_t>(p)].a,
+                             pairs[static_cast<std::size_t>(p)].b);
+            std::set<int> anchored;
+            for (int nid : fixed_nodes) anchored.insert(uf_find(parent, nid));
+            bool retained = false;
+            for (int p = 0; p < n_pairs; ++p) {
+                const auto at = static_cast<std::size_t>(p);
+                if (next[at] || !contact_active[at] || !load_closing[at]) continue;
+                const auto& cp = pairs[at];
+                if (anchored.count(uf_find(parent, cp.a)) &&
+                    anchored.count(uf_find(parent, cp.b))) continue;
+                next[at] = 1;
+                retained = true;
+            }
+            return retained;
+        };
         auto seed_anchors_all = [&]() {
             std::vector<int> parent = base_parent;
             for (int p = 0; p < n_pairs; ++p)
@@ -2213,6 +2268,11 @@ static FeaStaticResult solve_impl(const std::vector<double>& points,
                     // travels in; if THAT is a mechanism too, the load really does pull
                     // the joint apart.
                     contact_active = seed_active;
+                    for (int p = 0; p < n_pairs; ++p)
+                        if (pair_gap[static_cast<std::size_t>(p)] >= 0.0 &&
+                            load_directed[static_cast<std::size_t>(p)] &&
+                            !load_closing[static_cast<std::size_t>(p)])
+                            contact_active[static_cast<std::size_t>(p)] = 0;
                     mech = contact_mechanism_error(it);
                     if (!mech.empty()) return 0.0;
                     used_seed = true;
@@ -2698,9 +2758,16 @@ static FeaStaticResult solve_impl(const std::vector<double>& points,
                     next_active[static_cast<std::size_t>(p)] = now;
                     if (now != contact_active[static_cast<std::size_t>(p)]) ++n_changed;
                 }
+                const bool travel_retained = n_changed > 0 && preserve_load_support(next_active);
+                if (travel_retained) {
+                    n_changed = 0;
+                    for (int p = 0; p < n_pairs; ++p)
+                        if (next_active[static_cast<std::size_t>(p)] !=
+                            contact_active[static_cast<std::size_t>(p)]) ++n_changed;
+                }
                 prof.note("contact iteration %d: %d pair(s) changed state", iter, n_changed);
                 solved = true;  // uf holds this iterate's solution
-                if (n_changed == 0) {
+                if (n_changed == 0 && !travel_retained) {
                     set_stable = true;
                     break;
                 }

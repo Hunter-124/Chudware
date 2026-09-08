@@ -58,6 +58,8 @@ struct ContactGapProbe {
                              const double* pb, double& gap_mm) const = 0;
 };
 
+enum class InterfaceKind { Contact, Bonded, Free };
+
 struct ContactCandidateOptions {
     // Widest mesh gap still treated as a contact candidate (mm).
     double max_gap_mm = 0.5;
@@ -73,10 +75,22 @@ struct ContactCandidateOptions {
     const ContactGapProbe* gap_probe = nullptr;
     // Optional body-range lookup; returns min(E_a,E_b) for heterogeneous contact.
     std::function<double(int, int)> pair_modulus;
+    // Explicit STEP solid ordinals; absent node lookup uses mesh component + 1
+    // (inline meshes). Explicit pairs override the default, never each other.
+    std::vector<std::array<int, 2>> bonded_pairs;
+    std::vector<std::array<int, 2>> contact_pairs;
+    InterfaceKind default_interface = InterfaceKind::Contact;
+    // Negative: bond the measured interface gap within max_gap_mm. Otherwise
+    // require the measured bonded gap to be at most this explicit tolerance.
+    double bond_gap_mm = -1.0;
+    std::function<int(int)> node_body_ordinal;
 };
 
 struct ContactCandidateSet {
     std::vector<ContactSpring> springs;
+    // Same geometric pairing as contact, but these ties carry all three components
+    // of relative displacement, including tension, through the BondSpring kernel.
+    std::vector<ContactSpring> bonded;
     // Dense component ordinal per node (0..n_components-1); -1 for a node no element
     // references. Stable: ordinals follow ascending lowest-node-id per component.
     std::vector<int> component;

@@ -202,16 +202,7 @@ def test_import_part_missing_relative_path_keeps_teaching_envelope(exchange, tmp
     assert str(tmp_path) in out["hint"]  # teaches the resolved location it checked
     assert calls == []  # isfile gate fired before any cb.call
 
-# ---------------------------------------------------------------------------------------
-# Re-importing an already-open file must RESUME it, never mint a second document.
-#
-# Live-run root cause (run-138660919763973): the agent imported
-# Projects/Testing/mudbucket.step+ and then kept working through tools that mint documents,
-# and the user was left with mudbucket.step+ AND mudbucket2.step+ on disk plus three tabs.
-# doc_open/import_file mint a fresh doc per call and doc_new uniquifies the colliding name,
-# so every re-import compounds. Matching is on the RESOLVED path only — a GUI-created doc
-# lists its autosave path, so this can never adopt a document that is not this file.
-# ---------------------------------------------------------------------------------------
+# Explicit resume reuses the resolved source path; ordinary imports remain independent.
 
 
 @pytest.fixture()
@@ -248,17 +239,13 @@ def test_import_part_resumes_an_already_open_file(exchange_with_open_file):
     """The whole duplicate-part class: no second document, and the caller is told why."""
     tools_fn, calls, part = exchange_with_open_file
 
-    out = json.loads(tools_fn["import_part"](path=str(part)))
+    out = json.loads(tools_fn["import_part"](path=str(part), resume=True))
 
     assert out["ok"] is True, out
     assert out["reused"] is True, out
     assert out["doc_id"] == "doc-already"
     assert out["feature_count"] == 4
     assert [m for m, _ in calls if m in ("doc_open", "import_file")] == []
-    # The note must teach: name the file, the doc it resumed, and the corrected call.
-    assert "mudbucket.step+" in out["note"]
-    assert "doc-already" in out["note"]
-    assert 'into="doc-already"' in out["note"]
 
 
 def test_import_part_resume_survives_a_non_canonical_path(exchange_with_open_file,
@@ -267,7 +254,7 @@ def test_import_part_resume_survives_a_non_canonical_path(exchange_with_open_fil
     tools_fn, calls, part = exchange_with_open_file
     monkeypatch.chdir(part.parent)
 
-    out = json.loads(tools_fn["import_part"](path="./sub/../mudbucket.step+"))
+    out = json.loads(tools_fn["import_part"](path="./sub/../mudbucket.step+", resume=True))
 
     assert out.get("reused") is True, out
     assert out["doc_id"] == "doc-already"

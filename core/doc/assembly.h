@@ -3,12 +3,11 @@
 // An assembly document (``aicad.asm/1``) is rebuilt very differently from a part:
 //
 //   1. Component loading — each non-suppressed component's ``source.path`` is opened
-//      (cached per path+mtime). ``.step+`` containers are parsed + compiled to bodies;
-//      bare ``.step``/``.iges``/``.brep``/mesh files import via doc/formats.cpp. The
-//      result is a list of local-frame TopoDS solids + a topology description for
-//      mate-ref resolution. (The Python oracle's compile path is PATH-only — the
-//      schema permits ``source.embedded`` but no loader consumes it — so this port
-//      matches: embedded-only components fail to load exactly as the oracle would.)
+//      (parts cached per path+mtime). Native child assemblies resolve recursively,
+//      preserving their solved local placements; their descendant geometry is not
+//      cached by the parent file's mtime. Bare neutral/mesh files use formats.cpp.
+//      The resulting local-frame solids and topology describe mate references.
+//      Embedded-only sources are unsupported and produce explicit component errors.
 //
 //   2. Mate-ref resolution — every mate ref {component, selector} resolves the selector
 //      against that component's LOCAL geometry (doc/selectors.{h,cpp}) into a

@@ -5,6 +5,7 @@ from mcp.server.fastmcp import FastMCP  # noqa: F401 — register signature
 from typing import Optional
 import os
 import tempfile
+import zipfile
 
 from .cad_common import (
     CoreError,
@@ -68,6 +69,9 @@ def register_cad_exchange_tools(mcp: FastMCP) -> None:
                                **{k: r[k] for k in ("source_state",) if k in r}})
             if not allow_empty and not cb.call(
                     "asm_world_bodies", {"doc_id": d, "explode": False}).get("bodies"):
+                # An unresolved assembly is not an empty design: let the strict
+                # geometry census name the missing component and source path.
+                cb.call("export_tess_estimate", {"doc_id": d})
                 return _dumps({"ok": False, "reason": "no_bodies_empty_document",
                                "doc_id": d, "content": "Export refused: document has 0 bodies."})
             # The native editable container is written by doc_save, not the interchange writer.
@@ -79,6 +83,8 @@ def register_cad_exchange_tools(mcp: FastMCP) -> None:
                        else _default_deliverable_path(d, ".step+"))
                 if not out.lower().endswith(".step+"):
                     out += ".step+"
+                # A save can preserve an unfinished tree; an export cannot omit a child.
+                census = cb.call("export_tess_estimate", {"doc_id": d})
                 r = cb.call("doc_save", {"doc_id": d, "path": out})
                 written = r.get("path", out)
                 if os.path.exists(written):
@@ -88,6 +94,18 @@ def register_cad_exchange_tools(mcp: FastMCP) -> None:
                 res = {"ok": os.path.exists(written), "format": "step+",
                        "native": True, "doc_id": d, "path": written,
                        "exists": os.path.exists(written)}
+                res["validated"] = False  # native tree save is not a geometry round-trip check
+                if res["ok"] and census.get("bodies", 0):
+                    with zipfile.ZipFile(written) as archive:
+                        if ("geometry.step" not in archive.namelist() or
+                                archive.getinfo("geometry.step").file_size == 0):
+                            return _dumps({"ok": False, "doc_id": d, "path": written,
+                                           "components": census.get("components", []),
+                                           "content": "Export refused: native snapshot has no "
+                                                      "geometry.step; resolve rebuild errors.",
+                                           "reason": "native_geometry_missing"})
+                res["components"] = census.get("components", [])
+                res["content"] = f"Exported editable native document to {written}."
                 warnings = placement_warnings(d)
                 if warnings:
                     res["warnings"] = warnings
@@ -108,7 +126,9 @@ def register_cad_exchange_tools(mcp: FastMCP) -> None:
                     _LAST_DELIVER_REV[d] = rev  # delivered: quiet close_part until further edits
             res = {"ok": True, "format": fmt, "doc_id": d, "path": written,
                    "exists": os.path.exists(written)}
-            for k in ("bytes", "solid_count", "valid_solids", "expected_solids", "validated"):
+            res["content"] = f"Exported {fmt} geometry to {written}."
+            for k in ("bytes", "solid_count", "valid_solids", "expected_solids", "validated",
+                      "components"):
                 if k in r:
                     res[k] = r[k]
             # Non-blocking placement provenance: a transform-placed component nobody
@@ -125,7 +145,7 @@ def register_cad_exchange_tools(mcp: FastMCP) -> None:
     @mcp.tool()
     def import_part(path: str, into: Optional[str] = None, as_solid: bool = False,
                     resolve_features: bool = True, keep_bodies: Optional[list] = None,
-                    exclude_bodies: Optional[list] = None) -> str:
+                    exclude_bodies: Optional[list] = None, resume: bool = False) -> str:
         """Import a CAD/mesh file (STEP/IGES/BREP/STL/3MF/OBJ/PLY/glTF/3DM/DXF/DWG/
         STEP+/DRAW+/…) as a body, or open a native standalone drawing.
         Lets you assemble components built or exported separately, or recover geometry from a file
@@ -133,11 +153,9 @@ def register_cad_exchange_tools(mcp: FastMCP) -> None:
         (for assembly); omit it to open the file as a NEW part (made current). `as_solid` sews a
         mesh (STL/OBJ/…) into a solid on import; B-rep formats already import as solids.
 
-        A file that is ALREADY OPEN is RESUMED, not opened twice: the reply carries
-        `reused: true` with the existing doc_id, so re-importing the part you are already
-        working in can never leave a second "<name>2" document in the user's tab strip. Pass
-        `into=<doc_id>` when you genuinely want this file added as another BODY inside an
-        open part.
+        Imports create a NEW document by default, even when the source file is already open.
+        `resume=True` explicitly reuses the open document at that path (reply `reused:true`).
+        `into=<doc_id>` adds geometry to that document instead of opening or resuming one.
 
         DXF/DWG are 2D vector drawings: they import as planar wires + faces (closed loops become
         faces) — reference/profile geometry to extrude or dimension, not a solid. DWG needs a
@@ -194,14 +212,9 @@ def register_cad_exchange_tools(mcp: FastMCP) -> None:
                                        "necessarily your project folder. Run fs_list on the "
                                        "containing directory for the exact name, or pass an "
                                        "absolute path."})
-            # A file that is ALREADY OPEN is reused, not opened a second time. doc_open /
-            # import_file mint a fresh document per call and doc_new uniquifies the colliding
-            # name, so an agent that re-imports the part it is already working in ends up with
-            # "mudbucket" and "mudbucket2" side by side in the user's tab strip (observed live,
-            # run-138660919763973). Matching is on the RESOLVED file path only: a GUI-created
-            # doc lists its autosave path, so this can only ever match a document that really
-            # was opened from this file.
-            if not into:
+            # Resuming a saved session is opt-in: an import must never silently redirect
+            # subsequent edits to the source document.
+            if resume and not into:
                 try:
                     open_docs = [e for e in (cb.call("doc_list", {}) or {}).get("docs", [])
                                  if isinstance(e, dict) and e.get("doc_id")]
@@ -224,10 +237,8 @@ def register_cad_exchange_tools(mcp: FastMCP) -> None:
                         "ok": True, "doc_id": did, "imported_from": path, "reused": True,
                         "name": e.get("name"), "revision": e.get("revision", 0),
                         "feature_count": e.get("feature_count"),
-                        "note": f'"{os.path.basename(path_abs)}" is already open as doc_id='
-                                f'{did} — resumed it instead of opening a second copy. Pass '
-                                f'into="{did}" to add this file as a BODY inside an existing '
-                                "part instead."})
+                        "content": f'Resumed "{os.path.basename(path_abs)}" as {did}.',
+                        "note": "Pass resume=False to import an independent document."})
             # SolidWorks feature-tree resolution (opening as a NEW editable part/assembly).
             portable_fallback_reason: Optional[str] = None
             if resolve_features and not into and path_abs.lower().endswith((".sldprt", ".sldasm")):
@@ -326,7 +337,7 @@ def register_cad_exchange_tools(mcp: FastMCP) -> None:
             # container's solids and bakes them as an embedded-BREP import feature on the target
             # doc (Issue 2 — native parts are assemblable without re-exporting to plain STEP).
             if path_abs.lower().endswith(".step+") and not into:
-                r = cb.call("doc_open", {"path": path_abs})
+                r = cb.call("doc_open", {"path": path_abs, "detach_path": not resume})
                 new_id = r.get("doc_id")
                 if new_id:
                     _CUR["doc_id"] = new_id
@@ -338,6 +349,8 @@ def register_cad_exchange_tools(mcp: FastMCP) -> None:
                         _LAST_VOLUME[new_id] = vol
                 return _dumps({"ok": True, "doc_id": new_id, "imported_from": path,
                                "format": "step+", "native": True,
+                               "content": f"Opened independent native document {new_id}."
+                                          if not resume else f"Opened native document {new_id}.",
                                **{k: r[k] for k in ("revision", "name", "body_count")
                                   if k in r}})
             params: dict = {"path": path_abs, "as_solid": bool(as_solid)}

@@ -501,6 +501,7 @@ def steer_pose_sweep(doc_id: str, steer, rear_steer, steps: int,
     """
     clone = _clone_detached(doc_id, tool)
     try:
+        reference_bodies = cb.call("asm_world_bodies", {"doc_id": clone}).get("bodies") or []
         base = _comp_transforms(clone)
         names = {}
         for c in _components(clone):
@@ -597,6 +598,8 @@ def steer_pose_sweep(doc_id: str, steer, rear_steer, steps: int,
                        "axes": [{"point": d["axis"]["point"], "dir": d["axis"]["dir"],
                                  "source": d["axis"]["source"]} for d in drives]},
             "trajectory": trajectory,
+            "reference_bodies": reference_bodies,
+            "reference_transforms": base,
             "steer_drives": drives,
             "pose_check": {"ok": all(f["pose_check"]["ok"] for f in trajectory),
                            "frames": [{"i": f["i"], **f["pose_check"]} for f in trajectory]},
@@ -695,6 +698,27 @@ def register_cad_motion_tools(mcp: FastMCP) -> None:
         return {"min": lo, "max": hi,
                 "size": [hi[a] - lo[a] for a in range(3)],
                 "center": [(hi[a] + lo[a]) / 2.0 for a in range(3)]}
+
+    def _reference_corners(sweep: dict) -> dict:
+        """World-shape AABB corners, expressed in each component's reference frame.
+
+        Never rotate a source AABB by the initial placement: a wheel's arbitrary
+        axle spin would rotate its square bbox into fictitious ground penetration.
+        These eight points instead move by pose @ inverse(reference_pose), so the
+        initial envelope agrees with list_world_bodies and world-Z steering keeps
+        its height. Do not re-box the points after converting to component space.
+        """
+        transforms = sweep["reference_transforms"]
+        world: dict = {}
+        for body in sweep["reference_bodies"]:
+            cid = str(body.get("component") or "").split("#", 1)[0]
+            if cid in transforms and body.get("bbox"):
+                world.setdefault(cid, []).extend(_corners(body["bbox"]))
+        result = {}
+        for cid, points in world.items():
+            inverse = _rigid_inverse16(transforms[cid])
+            result[cid] = [_xform_point(inverse, p) for p in _corners(_bbox_of(points))]
+        return result
 
     def _frame_transforms(frame: dict) -> dict:
         """{component_id: row-major 16} for the top-level components of one sweep frame."""
@@ -823,11 +847,11 @@ def register_cad_motion_tools(mcp: FastMCP) -> None:
                        doc_id: Optional[str] = None) -> str:
         """SWEPT ENVELOPE of a moving mechanism — the volume its parts need to be given.
 
-        Drives the mechanism and, at every sample, transforms each listed component's own
-        bounding box (all 8 corners, so a rotated pose is not under-reported) into world
-        coordinates. Returns the union envelope over the whole sweep plus the per-step,
-        per-component boxes — the numbers a clearance claim ("the wheel never leaves its
-        arch") is actually made from.
+        Drives the mechanism and, at every sample, moves the eight corners of each
+        component's initial WORLD-shape bounding box by its relative solved motion.
+        The zero-motion envelope therefore agrees with list_world_bodies, regardless
+        of pre-existing placement or free wheel spin. Returns the union envelope and
+        per-step, per-component boxes for clearance claims.
 
         TWO WAYS TO DRIVE IT:
           * `mate_id` + [start, stop] — one dimensional (angle/distance) mate, swept with
@@ -845,7 +869,7 @@ def register_cad_motion_tools(mcp: FastMCP) -> None:
             whole steering range, not just the extreme.
 
         components : component ids or names to sweep (default: every non-suppressed
-                     component). Each needs a source part file.
+                     component). Source part files are needed only for fuse=True.
         fuse       : also BUILD the swept solid. Each component's part is imported into a new
                      part document and one `transform` copy per step is fused
                      (`boolean op:"fuse"`) into a body named `<component>_sweep`; the reply
@@ -880,7 +904,6 @@ def register_cad_motion_tools(mcp: FastMCP) -> None:
                 raise ValueError("sweep_envelope: `rear_steer` is the 4WS companion to "
                                  "`steer` — pass `steer` too (or drive the rear axle with "
                                  "`steer` alone).")
-            local = {c["id"]: _local_bbox(_source_path(c)) for c in comps}
 
             if steer is not None:
                 if mate_id is not None or start is not None or stop is not None:
@@ -894,21 +917,24 @@ def register_cad_motion_tools(mcp: FastMCP) -> None:
                 out = _sweep(d, mate_id, start, stop, steps)
             if not out.get("ok"):
                 return _dumps(out)
+            reference = _reference_corners(out)
+            reference = {c["id"]: reference[c["id"]] for c in comps
+                         if c["id"] in reference}
             trajectory = out.get("trajectory") or []
             warnings = []
 
             per_step = []
             all_points: list = []
-            per_component_points: dict = {cid: [] for cid in local}
-            poses: dict = {cid: [] for cid in local}
+            per_component_points: dict = {c["id"]: [] for c in comps}
+            poses: dict = {c["id"]: [] for c in comps}
             for frame in trajectory:
                 xf = _frame_transforms(frame)
                 row: dict = {}
-                for cid, bbox in local.items():
+                for cid, corners in reference.items():
                     m = xf.get(cid)
                     if m is None:
                         continue
-                    pts = [_xform_point(m, p) for p in _corners(bbox)]
+                    pts = [_xform_point(m, p) for p in corners]
                     per_component_points[cid].extend(pts)
                     all_points.extend(pts)
                     poses[cid].append(m)
@@ -1132,19 +1158,10 @@ def register_cad_motion_tools(mcp: FastMCP) -> None:
                     "dimensional mate to drive: pass steer={'components':[...], "
                     "'axis':{'point':[...],'dir':[...]}, 'angle_deg':...} instead.")
 
-            # Local + world bbox of every placed component at the straight-ahead pose.
-            locals_: dict = {}
-            boxes: dict = {}
-            for c in comps:
-                cid = c["id"]
-                if cid not in xf0:
-                    continue
-                try:
-                    lb = _local_bbox(_source_path(c))
-                except Exception:  # noqa: BLE001 — a component with no part file is not a wheel
-                    continue
-                locals_[cid] = lb
-                boxes[cid] = _bbox_of([_xform_point(xf0[cid], p) for p in _corners(lb)])
+            # Use the actual placed shape's bounds, not a rotated source AABB.
+            reference = _reference_corners(out)
+            boxes = {cid: _bbox_of([_xform_point(xf0[cid], p) for p in corners])
+                     for cid, corners in reference.items() if cid in xf0}
 
             warnings = []
             assumptions = ["world +Z is up",
@@ -1333,10 +1350,10 @@ def register_cad_motion_tools(mcp: FastMCP) -> None:
                 radius = abs((cx * v[0] + cy * v[1]) - vehicle_lat)
                 swept = 0.0
                 for cid, m in xf.items():
-                    lb = locals_.get(cid)
-                    if lb is None:
+                    corners = reference.get(cid)
+                    if corners is None:
                         continue
-                    for p in _corners(lb):
+                    for p in corners:
                         w = _xform_point(m, p)
                         swept = max(swept, math.hypot(w[0] - cx, w[1] - cy))
                 return {"turn_center": [cx, cy],
@@ -1409,10 +1426,10 @@ def register_cad_motion_tools(mcp: FastMCP) -> None:
 
                 swept = 0.0
                 for cid, m in xf.items():
-                    lb = locals_.get(cid)
-                    if lb is None:
+                    corners = reference.get(cid)
+                    if corners is None:
                         continue
-                    for p in _corners(lb):
+                    for p in corners:
                         w = _xform_point(m, p)
                         swept = max(swept, math.hypot(w[0] - center[0], w[1] - center[1]))
                 radius = (kin["turning_radius_mm"] if kin else r_center)

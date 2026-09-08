@@ -2574,3 +2574,6 @@ target_link_libraries(test_fea_buckling PRIVATE chudware_sim)
 set_target_properties(test_fea_buckling PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 add_test(NAME fea_buckling COMMAND test_fea_buckling)
+
+# Mixed-interface evidence/refusal regressions exercise the real study glue.
+target_link_libraries(test_fea_contact PRIVATE chudware_mesh)

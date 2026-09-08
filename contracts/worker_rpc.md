@@ -1202,3 +1202,108 @@ when the mate defines its line. The second measured body is the driver unless
 it is grounded, in which case the first is driven with opposite angular sign.
 Both-floating mechanisms retain their full mate solve; an incompatible solved
 pose still fails `pose_check` rather than being accepted or assigned a new pivot.
+
+## 30. Mixed bonded/contact interfaces and penalty control (2026-09-08)
+
+`sim_run_static` accepts `study.interfaces`:
+`{"bonded":[[1,2]],"contact":[[2,3]],"default":"contact"|"bonded"|"free"}`.
+Body references at the engine seam are positive, 1-based STEP solid ordinals,
+matching `material.per_body`. MCP `run_fea_static` and `run_fea_contact` also accept
+exact document body names: `asm_world_bodies` records `source_ordinals` in STEP
+export order, and a name resolves only when it identifies one solid. Unknown,
+duplicate, or multi-solid names refuse with an ordinal-selection remedy.
+
+Explicit unordered body pairs override the default. The omitted default is
+`contact` when `study.contact.enabled` is true, otherwise `free`. Listing a pair
+in both arrays refuses naming the pair; a nonexistent mesh ordinal refuses naming
+the ordinal. Every interfaces declaration preserves separate bodies during meshing
+rather than fusing touching solids. Candidate faces are paired only within
+`contact.max_gap_mm` (default 0.5 mm). Bonded pairs use bilateral three-axis
+`BondSpring` ties at their measured gap; an optional nonnegative `bond_gap_mm`
+further limits that measured bonded gap. Contact pairs use the compression-only
+active set; free pairs contribute neither ties nor contact. A global
+`bond_gap_mm` plus contact without `interfaces` remains contradictory and refuses.
+
+The packet's `contact.interfaces` contains `bonded` and `contact` arrays of
+`{a,b,pairs,area_mm2}` using canonical ascending STEP ordinals, geometric candidate
+counts, and tributary interface areas. `unmatched:[{a,b,type}]` reports declared
+pairs for which no candidate survived the geometric/gap criteria, including on
+the resulting disconnected-body refusal. Bonded candidates do not contribute to
+the unilateral `contact.resolution` gap, area, seating or pressure guards.
+
+MCP contact controls follow its flat-argument convention:
+`penalty_scale=1.0`, `max_iterations=25`. Both are echoed in `contact`, including
+resolution refusals. Penalty scale is finite and positive; iteration count is an
+integer in 1..500. A chatter refusal names the penalty scale and iteration limit
+it actually ran with. Reducing penalty softens only the unilateral normal penalty,
+not the bilateral bonded ties. Press fits are bonded; running clearances are
+contact, and both can now coexist in one material-mapped study.
+
+The active-set release step preserves load-facing travel supports when dropping all
+tensile trial pairs would disconnect a loaded component before it can move into its
+seat (notably a concentric pin surrounded by positive clearance). Resultants are
+summed over element-plus-bond components, so the pressed sleeve belongs to its
+plate's support. Penetrating pairs are re-seated before this topology decision.
+A retained travel guess is never accepted as converged contact: the final active
+set must pass the ordinary compression-only gap test. A true lifting load with no
+load-facing support still separates and refuses. Plastic contact uses the same
+load-facing rule when recovering its travel seed.
+
+For a durable job that ends `FAILED` with an engine `ok:false` packet,
+`sim_results` retains its `contact`, `mesh_quality`, `reason`, `notes`,
+`selection_spans_contact`, and `unfixed_islands` diagnostics when present, and
+reports the engine error as `solver_error`. This includes delayed
+`contact.interfaces.unmatched` and resolution/load-path refusals. The reply
+remains `ok:false`; unconverged summary, displacement, and stress fields are
+never promoted into results.
+
+## 31. Independent native imports and complete assembly exports (2026-09-08)
+
+MCP `import_part(path, ..., resume=False)` creates a new document by default.
+For `.step+`, its fresh session has a unique document id/name and is detached from
+the source save destination. Relative component paths retain their source-container
+base. `resume=True` explicitly reuses an open document whose resolved path matches;
+the reply carries `reused:true`. `into=<doc_id>` always adds a real import feature to
+that target and never resumes the source. Subsequent transforms use that target's
+returned feature ids; source documents remain unchanged.
+
+Assembly exports recursively resolve path-backed native child assemblies in their
+own local frames, then apply the parent placement. Every active component must
+contribute at least one solid or export refuses with its name and source path.
+Replies include `components:[{name,solids,source}]` in component-tree order, with
+`source` retaining the component source object. Suppressed components are excluded.
+Unsupported embedded-only sources also refuse explicitly rather than disappearing.
+
+Interchange B-rep `validated:true` requires every re-read body to be valid and its
+solid count to equal the world-geometry solid count exactly (a compound contributes
+all its solids, not merely one body). Mesh writes and native document saves return
+`validated:false`: nonzero bytes or an editable tree alone are not a solid-preserving
+round-trip proof. A nonempty native export must carry `geometry.step`; a saver that
+preserved only an unfinished tree cannot be advertised as a geometry export.
+
+`get_part` ownership is scoped to its explicit `doc_id`. Its full form preserves the
+complete engine `owner_map`; it does not cap or paginate feature ownership.
+
+## 32. Motion reference bounds and placement-independent envelopes (2026-09-08)
+
+Motion trajectories carry `reference_bodies:[{component,bbox:{min,max}}]` and
+`reference_transforms:{component:[16 row-major values]}`. Bounds enclose the
+actual WORLD-placed shapes at the reference pose, not their source-part AABBs.
+Native dimensional motion uses its first solved sample; explicit MCP steering
+uses the detached clone's solved pose before applying the drive. Native viewport
+trajectory matrices remain column-major, while these reference matrices and MCP
+trajectory matrices are row-major. Querying this reference does not re-solve or
+mutate the caller's live document.
+
+`sweep_envelope` moves each reference world's eight AABB corners by
+`pose * inverse(reference_transform)`, then unions the resulting boxes. Thus a
+pre-existing component placement or free wheel axle spin is not applied to a
+source AABB and cannot manufacture ground penetration before steering starts.
+The result remains a conservative bounding-box envelope, not an exact swept
+solid; `fuse=True` still transforms and fuses source geometry using full placements.
+`steering_turning_radius` uses these same bounds for wheel recognition, axle
+centres and outer swept radius; the kinematic radius remains the intersection
+of the posed wheel axle lines. Explicit steer axes remain WORLD lines and drive
+on the left of the placement, with carried mate islands following the same
+world rigid motion. Native `pose_check` reconstructs the expected rotation from
+the requested world line and scalar value, independently of the drive matrix.

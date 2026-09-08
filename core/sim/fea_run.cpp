@@ -661,6 +661,7 @@ double contact_max_gap_mm(const json& study) {
 // MeshOptions::declared_interfaces). Read leniently for the same reason as the
 // two above: a malformed block refuses the STUDY later, not the mesh.
 bool declares_body_interfaces(const json& study) {
+    if (study.contains("interfaces") && study["interfaces"].is_object()) return true;
     if (study.contains("contact") && study["contact"].is_object() &&
         study["contact"].value("enabled", true))
         return true;
@@ -2614,10 +2615,10 @@ static nlohmann::json fea_run_static_impl(
     // ── study.contact: real unilateral (frictionless) contact ────────────────
     // {"enabled":true, "max_gap_mm":0.5, "max_iterations":25, "penalty_scale":1.0,
     //  "interface_size_mm":0.35}
-    // Contact and bond_gap_mm are two DIFFERENT idealizations of the same interface —
-    // one carries tension, one cannot — so asking for both is a contradiction, not a
-    // merge, and it is refused rather than silently resolved.
+    // A global bond gap conflicts with global contact; explicit body interfaces
+    // instead choose the physical law independently for each body pair.
     bool contact_enabled = false;
+    const bool interfaces_enabled = study.contains("interfaces") && !study["interfaces"].is_null();
     ContactCandidateOptions contact_opts;
     FeaContactOptions contact_solver_opts;
     double contact_interface_size = 0.0;
@@ -2630,7 +2631,7 @@ static nlohmann::json fea_run_static_impl(
                                   "{\"enabled\":true,\"max_gap_mm\":0.5}"}};
         contact_enabled = c.value("enabled", true);
         if (contact_enabled) {
-            if (study.contains("bond_gap_mm"))
+            if (study.contains("bond_gap_mm") && !interfaces_enabled)
                 return json{
                     {"ok", false},
                     {"error", "fea_static: study.contact and study.bond_gap_mm are "
@@ -2648,10 +2649,11 @@ static nlohmann::json fea_run_static_impl(
                 return v;
             };
             contact_opts.max_gap_mm = number("max_gap_mm", 0.5, 1e-6, 1e4);
-            contact_opts.penalty_scale = number("penalty_scale", 1.0, 1e-6, 1e6);
+            contact_opts.penalty_scale = number("penalty_scale", 1.0,
+                std::numeric_limits<double>::min(), std::numeric_limits<double>::max());
             const double iters = number("max_iterations", 25.0, 1.0, 500.0);
             if (!std::isfinite(contact_opts.max_gap_mm) ||
-                !std::isfinite(contact_opts.penalty_scale) || !std::isfinite(iters))
+                !std::isfinite(contact_opts.penalty_scale) || !std::isfinite(iters) || std::floor(iters) != iters)
                 return json{
                     {"ok", false},
                     {"error", "fea_static: study.contact needs finite max_gap_mm > 0 "
@@ -2671,6 +2673,48 @@ static nlohmann::json fea_run_static_impl(
                               "without meshing the whole part that fine"}};
         }
     }
+    if (interfaces_enabled) {
+        const auto& spec = study["interfaces"];
+        if (!spec.is_object())
+            return json{{"ok", false}, {"error", "fea_static: interfaces must be an object"}};
+        const std::string fallback = contact_enabled ? "contact" : "free";
+        if (spec.contains("default") && !spec["default"].is_string())
+            return json{{"ok", false}, {"error", "fea_static: interfaces.default must be contact, bonded or free"}};
+        const std::string mode = spec.value("default", fallback);
+        if (mode != "contact" && mode != "bonded" && mode != "free")
+            return json{{"ok", false}, {"error", "fea_static: interfaces.default must be contact, bonded or free"}};
+        contact_opts.default_interface = mode == "contact" ? InterfaceKind::Contact :
+            mode == "bonded" ? InterfaceKind::Bonded : InterfaceKind::Free;
+        for (const char* key : {"bonded", "contact"}) {
+            if (!spec.contains(key)) continue;
+            if (!spec[key].is_array())
+                return json{{"ok", false}, {"error", std::string("fea_static: interfaces.") + key + " must be a list of body pairs"}};
+            auto& pairs = std::string(key) == "bonded" ? contact_opts.bonded_pairs : contact_opts.contact_pairs;
+            for (const auto& pair : spec[key]) {
+                if (!pair.is_array() || pair.size() != 2 ||
+                    !pair[0].is_number_integer() || !pair[1].is_number_integer())
+                    return json{{"ok", false}, {"error", "fea_static: interfaces pair " + pair.dump() +
+                        " needs two STEP solid ordinals; resolve document body names before meshing"}};
+                pairs.push_back({pair[0].get<int>(), pair[1].get<int>()});
+            }
+        }
+        if (study.contains("bond_gap_mm") &&
+            (!study["bond_gap_mm"].is_number() ||
+             !std::isfinite(study["bond_gap_mm"].get<double>()) ||
+             study["bond_gap_mm"].get<double>() < 0.0))
+            return json{{"ok", false}, {"error", "fea_static: bond_gap_mm must be finite and non-negative"}};
+        if (study.contains("bond_gap_mm"))
+            contact_opts.bond_gap_mm = study["bond_gap_mm"].get<double>();
+    }
+    if (!mesh_quality.bodies.empty())
+        contact_opts.node_body_ordinal = [&](int node) {
+            const auto index = node_body_index(node);
+            return index < mesh_quality.bodies.size() &&
+                           !mesh_quality.bodies[index].source_ordinals.empty()
+                       ? mesh_quality.bodies[index].source_ordinals.front() : 0;
+        };
+    json interface_packet{{"bonded", json::array()}, {"contact", json::array()},
+                          {"unmatched", json::array()}};
     ContactCandidateSet contact_set;
     std::vector<int> held_by_contact_only;
     std::vector<BondSpring> bond_springs;
@@ -2728,13 +2772,13 @@ static nlohmann::json fea_run_static_impl(
                 " node(s) reference no element (left behind by mesh repair, which "
                 "preserves node numbering); they are not counted as mesh components "
                 "and the solver eliminates their zero rows");
-        if (contact_enabled) {
+        if (contact_enabled || interfaces_enabled) {
             // Real contact on the meshed bodies: surface nodes of DIFFERENT components
             // that face each other across at most max_gap_mm, normals taken from the
             // MESH's own boundary faces (fea_contact.cpp), each pair remembering its
             // initial signed gap. No pair is a tie: the solver decides per pair whether
             // it is touching.
-            if (roots.size() < 2)
+            if (roots.size() < 2 && !interfaces_enabled)
                 return json{
                     {"ok", false},
                     {"error", "fea_static: study.contact needs at least two disconnected "
@@ -2797,7 +2841,36 @@ static nlohmann::json fea_run_static_impl(
                 return json{{"ok", false},
                             {"error", "fea_static: " + contact_set.error},
                             {"notes", notes}};
-            if (contact_set.springs.empty())
+            auto body_ordinal = [&](int node) {
+                return contact_opts.node_body_ordinal ? contact_opts.node_body_ordinal(node)
+                    : contact_set.component[static_cast<size_t>(node)] + 1;
+            };
+            auto describe_interfaces = [&](const char* kind, const std::vector<ContactSpring>& springs,
+                                           const std::vector<std::array<int, 2>>& declared) {
+                struct Facts { int pairs = 0; double area = 0; std::set<int> nodes; };
+                std::map<std::array<int, 2>, Facts> facts;
+                for (const auto& s : springs) {
+                    const int a = body_ordinal(s.a), b = body_ordinal(s.b);
+                    auto& f = facts[{std::min(a, b), std::max(a, b)}];
+                    ++f.pairs;
+                    if (f.nodes.insert(s.a).second) f.area += s.area_mm2;
+                }
+                for (const auto& [pair, f] : facts)
+                    interface_packet[kind].push_back(json{{"a", pair[0]}, {"b", pair[1]},
+                        {"pairs", f.pairs}, {"area_mm2", round_nd(f.area, 6)}});
+                std::set<std::array<int, 2>> seen;
+                for (auto pair : declared) {
+                    std::sort(pair.begin(), pair.end());
+                    if (!facts.count(pair) && seen.insert(pair).second)
+                        interface_packet["unmatched"].push_back(json{{"a", pair[0]},
+                            {"b", pair[1]}, {"type", kind}});
+                }
+            };
+            describe_interfaces("bonded", contact_set.bonded, contact_opts.bonded_pairs);
+            describe_interfaces("contact", contact_set.springs, contact_opts.contact_pairs);
+            for (const auto& s : contact_set.bonded)
+                bond_springs.push_back(BondSpring{s.a, s.b, s.k});
+            if (contact_set.springs.empty() && !interfaces_enabled)
                 return json{
                     {"ok", false},
                     {"error", "fea_static: no contact pair was found within max_gap_mm = " +
@@ -2807,6 +2880,8 @@ static nlohmann::json fea_run_static_impl(
                                   "facing surfaces are not opposed. Measure the real "
                                   "clearance and raise max_gap_mm to just above it."},
                     {"notes", notes}};
+            contact_enabled = !contact_set.springs.empty();
+            if (contact_enabled) {
             // ── A selection must not SPAN the interface (sim/fea_selection.h) ──
             // Decided the moment both halves are known — the resolved BC nodes and
             // the candidate set that says which bodies are in contact — and BEFORE
@@ -2922,6 +2997,9 @@ static nlohmann::json fea_run_static_impl(
                     {"contact",
                      json{{"enabled", true},
                           {"max_gap_mm", contact_opts.max_gap_mm},
+                          {"penalty_scale", contact_opts.penalty_scale},
+                          {"max_iterations", contact_solver_opts.max_iterations},
+                          {"interfaces", interface_packet},
                           {"interface_size_mm", contact_interface_size},
                           {"candidate_pairs",
                            static_cast<int>(contact_set.springs.size())},
@@ -2940,6 +3018,7 @@ static nlohmann::json fea_run_static_impl(
                 notes.push_back(
                     "CHUDWARE_FEA_BOND_GAP_MM is set but IGNORED: this study requested "
                     "contact, which cannot carry the tension a bonded tie would");
+            }
         } else if (roots.size() > 1) {
             double gap_mm = 0.0;
             if (study.contains("bond_gap_mm")) {
@@ -3209,7 +3288,7 @@ static nlohmann::json fea_run_static_impl(
                            " contact candidate pair(s) were found and still did not "
                            "reach a fixtured component; raise contact.max_gap_mm only "
                            "when that interface really is that close";
-            return json{
+            json failure{
                 {"ok", false},
                 {"error", message},
                 {"unfixed_islands", std::move(island_json)},
@@ -3219,6 +3298,12 @@ static nlohmann::json fea_run_static_impl(
                      tets.size() / static_cast<std::size_t>(nodes_per_elem),
                      nodes_per_elem)},
                 {"notes", notes}};
+            if (contact_enabled || interfaces_enabled)
+                failure["contact"] = json{{"enabled", contact_enabled},
+                    {"interfaces", interface_packet},
+                    {"penalty_scale", contact_opts.penalty_scale},
+                    {"max_iterations", contact_solver_opts.max_iterations}};
+            return failure;
         }
     }
     // ── A hanging FRAGMENT is a REFUSAL, in the same class as an unfixtured
@@ -3395,8 +3480,9 @@ static nlohmann::json fea_run_static_impl(
             total_force += g.contact_force_n;
             total_area += g.contact_area_mm2;
         }
-        json body = {{"enabled", true},
+        json body = {{"enabled", contact_enabled},
                      {"max_gap_mm", contact_opts.max_gap_mm},
+                     {"interfaces", interface_packet},
                      {"penalty_scale", contact_opts.penalty_scale},
                      {"penalty_material_rule", "softer_body_E"},
                      {"interface_size_mm", contact_interface_size},
@@ -3532,8 +3618,11 @@ static nlohmann::json fea_run_static_impl(
                    " explicit bonded gap ties were added, but a loaded part may still not "
                    "reach any fixtured part. Increase bond_gap_mm only when the larger "
                    "bonded-contact region is physically intended.";
+        if (contact_enabled)
+            msg += " Contact controls: penalty_scale=" + json(contact_opts.penalty_scale).dump() +
+                   ", max_iterations=" + std::to_string(contact_solver_opts.max_iterations) + ".";
         json fail{{"ok", false}, {"error", msg}, {"notes", notes}};
-        if (contact_enabled) fail["contact"] = contact_json();
+        if (contact_enabled || interfaces_enabled) fail["contact"] = contact_json();
         if (plastic_enabled) fail["plasticity"] = plasticity_json();
         return fail;
     }
@@ -3551,13 +3640,17 @@ static nlohmann::json fea_run_static_impl(
                                 "makes pairs chatter across the gap), resolve the "
                                 "interface (contact.interface_size_mm), or raise "
                                 "material.plasticity.max_increments so each increment "
-                                "moves the seat less.")
+                                "moves the seat less. Ran with contact.penalty_scale=") +
+                                json(contact_opts.penalty_scale).dump() +
+                                ", contact.max_iterations=" +
+                                std::to_string(contact_solver_opts.max_iterations) + "."
                           : "fea_static: the contact active set did not settle in " +
                                 std::to_string(contact_solver_opts.max_iterations) +
                                 " iteration(s) — pairs kept opening and closing, so no "
                                 "state is the solution. Raise contact.max_iterations, "
-                                "or reduce contact.penalty_scale (a very stiff penalty "
-                                "makes pairs chatter across the gap)."},
+                                "or reduce contact.penalty_scale (ran with " +
+                                json(contact_opts.penalty_scale).dump() +
+                                "; a very stiff penalty makes pairs chatter across the gap)."},
             {"contact", contact_json()},
             {"notes", notes}};
         if (plastic_enabled) fail["plasticity"] = plasticity_json();
@@ -3756,7 +3849,7 @@ static nlohmann::json fea_run_static_impl(
     if (mesh_advisor) out["advisor"] = detail::mesh_advisor_json(*mesh_advisor);
     // Contact rides BESIDE summary/reactions/mesh_quality, like every other evidence
     // block: the equilibrium check and the contact resultants have to be read together.
-    if (contact_enabled) out["contact"] = contact_json();
+    if (contact_enabled || interfaces_enabled) out["contact"] = contact_json();
     // Plasticity rides beside them for the same reason: summary.max_von_mises_mpa is
     // still the stress, but with the law on it is CAPPED at the flow stress
     // (yield + hardening_mpa * max_equivalent_plastic_strain), and a reader comparing

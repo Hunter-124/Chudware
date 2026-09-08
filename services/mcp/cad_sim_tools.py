@@ -1510,6 +1510,55 @@ def _norm_plasticity(plasticity, mat: dict) -> Optional[dict]:
     return out
 
 
+def _resolve_study_interfaces(interfaces: dict, bodies: list) -> dict:
+    """Resolve validated body names using the exporter-authoritative solid ordinals."""
+    if not any(
+        isinstance(body, str)
+        for kind in ("bonded", "contact")
+        for pair in interfaces.get(kind, [])
+        for body in pair
+    ):
+        return interfaces
+    by_name: dict = {}
+    for body in bodies:
+        name = body.get("name")
+        if isinstance(name, str) and name:
+            by_name.setdefault(name, []).append(body)
+
+    def ordinal(ref) -> int:
+        if isinstance(ref, int):
+            return ref
+        matches = by_name.get(ref, [])
+        if not matches:
+            raise ValueError(f"interfaces references unknown body name {ref!r}")
+        if len(matches) != 1:
+            raise ValueError(
+                f"interfaces body name {ref!r} is ambiguous; use 1-based STEP solid ordinals"
+            )
+        values = matches[0].get("source_ordinals")
+        if not isinstance(values, list) or not values or any(
+            isinstance(value, bool) or not isinstance(value, int) or value <= 0
+            for value in values
+        ):
+            raise ValueError(
+                f"interfaces body name {ref!r} has no authoritative STEP solid ordinals; "
+                "use 1-based STEP solid ordinals or rebuild the engine"
+            )
+        if len(values) != 1:
+            raise ValueError(
+                f"interfaces body name {ref!r} spans multiple STEP solids {values!r}; "
+                "use explicit 1-based STEP solid ordinals to select the intended pair"
+            )
+        return values[0]
+
+    resolved = dict(interfaces)
+    for kind in ("bonded", "contact"):
+        if kind not in interfaces:
+            continue
+        resolved[kind] = [[ordinal(a), ordinal(b)] for a, b in interfaces[kind]]
+    return resolved
+
+
 def _build_static_study(
     fixtures,
     loads,
@@ -1525,10 +1574,20 @@ def _build_static_study(
     min_size_mm: Optional[float] = None,
     plasticity: Optional[dict] = None,
     material_analysis: str = "static",
+    interfaces: Optional[dict] = None,
+    bond_gap_mm: Optional[float] = None,
 ) -> dict:
     """SETUP stage for run_fea_static / sim_run(analysis="fea_static")."""
+    if interfaces is not None:
+        simjobs.validate_interfaces(interfaces)
+    if bond_gap_mm is not None:
+        bond_gap_mm = _finite_float(bond_gap_mm, "bond_gap_mm")
+        if bond_gap_mm < 0.0:
+            raise ValueError("bond_gap_mm must be finite and >= 0 when given")
     d = _doc(doc_id)
-    _require_sim_geometry(d)
+    bodies = _require_sim_geometry(d)
+    if interfaces is not None:
+        interfaces = _resolve_study_interfaces(interfaces, bodies)
     fixtures = require_list(
         fixtures,
         "fixtures",
@@ -1605,6 +1664,10 @@ def _build_static_study(
         "mesh_order": 2,
         "fineness": mesh_fineness,
     }
+    if interfaces is not None:
+        study["interfaces"] = interfaces
+    if bond_gap_mm is not None:
+        study["bond_gap_mm"] = bond_gap_mm
     if target_size_mm is not None:
         # Exactly what a convergence leg sets, so a leg can be re-solved at its own size:
         # `fineness` stays in the payload (the engine reads it only when no explicit size
@@ -1694,6 +1757,9 @@ def _build_contact_study(
     interface_size_mm: Optional[float] = None,
     min_size_mm: Optional[float] = None,
     plasticity: Optional[dict] = None,
+    interfaces: Optional[dict] = None,
+    penalty_scale: float = 1.0,
+    bond_gap_mm: Optional[float] = None,
 ) -> dict:
     """SETUP stage for run_fea_contact.
 
@@ -1701,6 +1767,17 @@ def _build_contact_study(
     the fully-constrained-load refusal — plus `study.contact`, which switches the engine
     onto the unilateral active-set solve over the mesh's own body interfaces.
     """
+    if (
+        bond_gap_mm is not None
+        and interfaces is None
+    ):
+        raise ValueError(
+            "bond_gap_mm with contact requires interfaces to distinguish bonded "
+            "and contact body pairs"
+        )
+    penalty_scale = _finite_float(penalty_scale, "penalty_scale")
+    if penalty_scale <= 0.0:
+        raise ValueError("penalty_scale must be finite and > 0")
     max_gap_mm = _finite_float(max_gap_mm, "max_gap_mm")
     if max_gap_mm <= 0.0:
         raise ValueError(
@@ -1742,6 +1819,8 @@ def _build_contact_study(
         notes,
         vtu_path=vtu_path,
         plasticity=plasticity,
+        interfaces=interfaces,
+        bond_gap_mm=bond_gap_mm,
     )
     ctx["study"]["mesh_order"] = mesh_order
     if mesh_size_mm is not None:
@@ -1753,7 +1832,7 @@ def _build_contact_study(
         "enabled": True,
         "max_gap_mm": max_gap_mm,
         "max_iterations": max_iterations,
-        "penalty_scale": 1.0,
+        "penalty_scale": penalty_scale,
     }
     if interface_size_mm is not None:
         ctx["study"]["contact"]["interface_size_mm"] = interface_size_mm
@@ -1769,6 +1848,7 @@ def _build_contact_study(
     ctx["analysis"] = "fea_contact"
     ctx["max_gap_mm"] = max_gap_mm
     ctx["max_iterations"] = max_iterations
+    ctx["penalty_scale"] = penalty_scale
     ctx["mesh_size_mm"] = mesh_size_mm
     ctx["mesh_order"] = mesh_order
     return ctx
@@ -3760,6 +3840,8 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
         vtu_path: Optional[str] = None,
         export_system_path: Optional[str] = None,
         background: bool = False,
+        interfaces: Optional[dict] = None,
+        bond_gap_mm: Optional[float] = None,
     ) -> str:
         """Linear-static stress FEA on the current part. Returns max stress, displacement, and FoS.
 
@@ -3779,6 +3861,21 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
                    Or {per_body: {"1": name_or_dict, ...}, default: name_or_dict} for
                    heterogeneous bodies; ordinals are one-based STEP solid ordinals.
                    default is optional when every body has an explicit assignment.
+        interfaces : optional body-pair policy object with exactly these optional keys:
+                   {"bonded":[[a,b],...], "contact":[[a,b],...],
+                    "default":"contact"|"bonded"|"free"}.
+                   Each a/b is a positive 1-based STEP solid ordinal or a body-name string.
+                   Explicit pairs override default; omitted default is "free" here.
+                   Names resolve through the exported solid roster; unknown, ambiguous,
+                   or multi-solid names are refused with an explicit ordinal remedy.
+                   The engine validates mesh identity and refuses pairs in both lists.
+                   Use bonded pairs for welded/glued or idealized press-fit joints.
+                   For mixed press-fit + clearance joints, use run_fea_contact with
+                   bonded and contact lists so clearance joints can open and close.
+        bond_gap_mm : optional nonnegative finite bonded-search limit in mm. With
+                   interfaces, this limits only bonded pairs (zero means touching);
+                   when omitted, bonded pairs use the measured gap within max_gap_mm.
+                   Without interfaces a positive value enables legacy all-nearby bonding.
         mesh_fineness : 0..1 (default 0.5), or a preset word
                    ("coarse"=0.25, "medium"=0.5, "fine"=0.75, "finest"=1.0).
                    Second-order (tet10) elements are used for accuracy.
@@ -3917,6 +4014,8 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
                 target_size_mm=mesh_size_mm,
                 min_size_mm=min_size_mm,
                 plasticity=plasticity,
+                interfaces=interfaces,
+                bond_gap_mm=bond_gap_mm,
             )
             _autosave_all_open()  # R-1 guard: protect every open doc before the solve starts
             return _dumps(
@@ -4549,6 +4648,17 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
                     )
                 elif st.get("error"):
                     out["solver_error"] = st["error"]
+                if state == "failed":
+                    refusal = simjobs.refusal_result(job_id)
+                    if refusal:
+                        # These explain why the study refused; never promote
+                        # unconverged displacement, stress, or summary fields.
+                        for key in ("contact", "mesh_quality", "reason", "notes",
+                                    "selection_spans_contact", "unfixed_islands"):
+                            if key in refusal:
+                                out[key] = refusal[key]
+                        if refusal.get("error"):
+                            out["solver_error"] = refusal["error"]
                 return _dumps(out)
             out = dict(collect_durable(job_id, st))
             out.update(
@@ -5745,13 +5855,16 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
         mesh_order: int = 1,
         doc_id: Optional[str] = None,
         vtu_path: Optional[str] = None,
+        interfaces: Optional[dict] = None,
+        penalty_scale: float = 1.0,
+        bond_gap_mm: Optional[float] = None,
     ) -> str:
         """Frictionless unilateral CONTACT FEA on the real meshed bodies of this document.
 
-        What it solves: a small-deflection linear-elastic static problem in which the
-        interfaces BETWEEN separate bodies carry compression only. The mesher meshes every
-        body, the engine finds surface-node pairs that face each other across at most
-        max_gap_mm (normals taken from the mesh's own boundary faces, each pair keeping its
+        What it solves: a small-deflection static problem whose contact-classified
+        interfaces carry compression only; bonded interfaces also carry tension.
+        The mesher meshes every body, and the engine finds facing surface-node pairs
+        across at most max_gap_mm (normals from the mesh boundary faces, each keeping its
         initial signed gap), and an ACTIVE-SET loop solves repeatedly: pairs whose gap
         closed press, pairs that went into tension are released, until the set stops
         changing. So a gap really closes, a seated face really lifts off, and load only
@@ -5760,9 +5873,10 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
         Use it for: a slip-fit pin in a clearance bore (which side of the bore takes the
         load), a bolted or shimmed stack (how the clamp load splits between seats), a part
         merely SEATED in a pocket or on a pad, and any assembly where run_fea_static would
-        have to pretend the joint is welded. For a welded/glued/press-fit joint that really
-        does carry tension, use run_fea_static with study bond_gap_mm instead — the two are
-        mutually exclusive and passing both is refused.
+        have to pretend the joint is welded. Mixed press-fit + clearance assemblies use
+        interfaces to bond the welded/glued or idealized press-fit body pairs while the
+        clearance pairs remain unilateral contact. For an entirely bonded study use
+        run_fea_static with interfaces instead.
 
         What it does NOT do: friction (the interface is frictionless; a small tangential
         stabilizer removes the sliding nullspace and its share of the resultant is reported
@@ -5787,6 +5901,26 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
                    that never touch.
         max_iterations : active-set iterations (default 25). A set that never settles is
                    REFUSED, not averaged.
+        penalty_scale : positive finite multiplier of the contact penalty stiffness
+                   (default 1.0). Reduce it if an overly stiff penalty makes pairs chatter;
+                   the engine echoes penalty_scale and max_iterations under contact.
+        interfaces : optional body-pair policy object with exactly these optional keys:
+                   {"bonded":[[a,b],...], "contact":[[a,b],...],
+                    "default":"contact"|"bonded"|"free"}.
+                   Each a/b is a positive 1-based STEP solid ordinal or a body-name string.
+                   Explicit pairs override default; omitted default is "contact" here
+                   ("free" on ordinary run_fea_static). Example for a press-fit pin and
+                   clearance bore: {"bonded":[["pin","carrier"]],
+                   "contact":[["pin","bore"]], "default":"free"}.
+                   Names resolve through the exported solid roster; unknown, ambiguous,
+                   or multi-solid names are refused with an explicit ordinal remedy.
+                   Ordinal-only objects pass unchanged to study.interfaces. The engine
+                   validates mesh identity and refuses pairs in both lists. Every declared
+                   pair preserves separate bodies through meshing.
+        bond_gap_mm : optional nonnegative finite bonded-search limit in mm. It requires
+                   interfaces on a contact run and limits only bonded pairs (zero means
+                   touching); when omitted, use the measured pair gap within max_gap_mm.
+                   It does not widen the clearance-contact search.
         mesh_size_mm : explicit BACKGROUND element size in mm; omitted uses the medium
                    fineness band. Do NOT use this to resolve a clearance — that is what
                    interface_size_mm is for, at a fraction of the element count.
@@ -5918,6 +6052,8 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
            pairs:[{bodies:[i,j], candidate_pairs, active_pairs, contact_force_n,
               force_vector_n:[x,y,z], contact_area_mm2, mean_contact_pressure_mpa,
               max_contact_pressure_mpa, max_penetration_mm}]}
+        contact.interfaces reports bonded/contact lists of {a,b,pairs,area_mm2} and
+        unmatched declared pairs; inspect these to verify the intended mixed load path.
         contact_area_mm2 is the summed TRIBUTARY area of the pairs that carried load
         (one side of the interface, each node counted once), so
         contact_force_n / contact_area_mm2 is a mean patch pressure — reported as
@@ -5964,6 +6100,9 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
                 interface_size_mm=interface_size_mm,
                 min_size_mm=min_size_mm,
                 plasticity=plasticity,
+                interfaces=interfaces,
+                penalty_scale=penalty_scale,
+                bond_gap_mm=bond_gap_mm,
             )
             _autosave_all_open()  # R-1 guard: protect every open doc before the solve starts
             return _dumps(

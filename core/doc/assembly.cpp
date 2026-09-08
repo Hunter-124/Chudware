@@ -114,11 +114,47 @@ json env_from_doc(const json& doc) {
     return env;
 }
 
+// Nested loads bypass the shared-future cache: waiting on an ancestor's promise
+// would deadlock on a reference cycle. Assemblies are not cached by their own
+// mtime, because a referenced descendant can change independently.
+thread_local std::vector<std::string> loading_paths;
+
 // Load local-frame solids for a component file (port of assembly.py::_load_bodies).
-std::vector<TopoDS_Shape> load_bodies(const std::string& abspath) {
+std::vector<TopoDS_Shape> load_bodies(const std::string& abspath, bool& cacheable) {
+    const std::string canonical = std::filesystem::weakly_canonical(abspath).string();
+    if (std::find(loading_paths.begin(), loading_paths.end(), canonical) != loading_paths.end())
+        throw OpError("import_failed", "cyclic component reference: " + canonical,
+                      {{"path", canonical}});
+    loading_paths.push_back(canonical);
+    struct PopPath { ~PopPath() { loading_paths.pop_back(); } } pop_path;
     const std::string low = lower(abspath);
     if (ends_with(low, ".step+") || ends_with(low, ".stepplus")) {
         StepPlusDoc loaded = stepplus_open(abspath);  // throws OpError on a bad file
+        if (loaded.doc.value("schema", std::string()) == "aicad.asm/1") {
+            cacheable = false;
+            AssemblyResult ar = compile_assembly(
+                loaded.doc, std::filesystem::path(abspath).parent_path().string());
+            for (const AsmComponentStatus& st : ar.component_status)
+                if (!st.ok)
+                    throw OpError("import_failed",
+                                  "component '" + st.id + "' in '" + abspath + "': " +
+                                      st.error.value_or("no geometry"),
+                                  {{"component", st.id}, {"path", abspath}});
+            std::vector<TopoDS_Shape> bodies;
+            for (const AsmBodyOut& body : ar.bodies) {
+                TopoDS_Shape world = placed_world_shape(body);
+                TopExp_Explorer solids(world, TopAbs_SOLID);
+                if (world.IsNull() || !solids.More())
+                    throw OpError("import_failed", "component '" + body.name +
+                                  "' in '" + abspath + "' produced no solids",
+                                  {{"component", body.component_id}, {"path", abspath}});
+                bodies.push_back(std::move(world));
+            }
+            if (bodies.empty())
+                throw OpError("import_failed", "assembly '" + abspath + "' produced no solids",
+                              {{"path", abspath}});
+            return bodies;
+        }
         // Solved-bodies fast path: a part saved after a fully-ok rebuild embeds its compiled
         // bodies as cache.brep (BREP + triangulation) with a `solved` flag in the cache.json
         // header. When the engine key + doc hash still match, those bodies ARE the exact
@@ -197,8 +233,14 @@ std::string component_cache_key(const std::string& abspath) {
     return abspath + ":" + std::to_string(static_cast<long long>(mtime));
 }
 
-const LoadedComponent& load_component(const std::string& path, const std::string& base_dir) {
+std::shared_ptr<const LoadedComponent> load_component(const std::string& path,
+                                                     const std::string& base_dir) {
     const std::string abspath = resolve_source_path(path, base_dir);
+    if (!loading_paths.empty()) {
+        bool cacheable = false;
+        return std::make_shared<const LoadedComponent>(
+            describe_component(load_bodies(abspath, cacheable)));
+    }
     const std::string key = component_cache_key(abspath);
 
     // WHY: find-or-install-a-placeholder happens in ONE g_cache_mtx acquisition below (no
@@ -220,9 +262,14 @@ const LoadedComponent& load_component(const std::string& path, const std::string
     }
     if (mine) {
         try {
+            bool cacheable = true;
             auto lc = std::make_shared<const LoadedComponent>(
-                describe_component(load_bodies(abspath)));
+                describe_component(load_bodies(abspath, cacheable)));
             mine->set_value(lc);
+            if (!cacheable) {
+                std::lock_guard<std::mutex> lk(g_cache_mtx);
+                g_load_cache.erase(key);
+            }
         } catch (...) {
             mine->set_exception(std::current_exception());
             // A failed load is NOT cached (pre-existing semantics: a fixed file re-loads).
@@ -231,7 +278,7 @@ const LoadedComponent& load_component(const std::string& path, const std::string
             g_load_cache.erase(key);
         }
     }
-    return *fut.get();  // re-throws the loader's exception for every waiter
+    return fut.get();  // pins uncached nested assemblies through their caller's solve
 }
 
 // ---------------------------------------------------------------- mate-ref geometry
@@ -585,9 +632,10 @@ AssemblyResult compile_assembly(const json& doc, const std::string& base_dir,
     // decode, both CPU-bound) run in parallel worker threads; the per-key shared_future in
     // load_component dedups same-file components. The serial loop below then hits the cache.
     // Kill-switch: CHUDWARE_ASM_PARALLEL_LOAD=0.
+    std::map<std::string, std::shared_ptr<const LoadedComponent>> prefetched;
     {
         const char* env = std::getenv("CHUDWARE_ASM_PARALLEL_LOAD");
-        const bool par = !(env && env[0] == '0');
+        const bool par = loading_paths.empty() && !(env && env[0] == '0');
         if (par && components.size() > 1) {
             std::vector<std::string> paths;
             for (const json& comp : components) {
@@ -597,6 +645,7 @@ AssemblyResult compile_assembly(const json& doc, const std::string& base_dir,
                 if (!p.empty()) paths.push_back(p);
             }
             const unsigned hw = std::max(2u, std::thread::hardware_concurrency());
+            std::vector<std::shared_ptr<const LoadedComponent>> pins(paths.size());
             const std::size_t n_workers = std::min<std::size_t>(paths.size(), hw);
             std::atomic<std::size_t> next{0};
             std::vector<std::thread> pool;
@@ -606,14 +655,16 @@ AssemblyResult compile_assembly(const json& doc, const std::string& base_dir,
                     for (std::size_t i = next.fetch_add(1); i < paths.size();
                          i = next.fetch_add(1)) {
                         try {
-                            load_component(paths[i], base_dir);
+                            pins[i] = load_component(paths[i], base_dir);
                         } catch (...) { /* reported per-component in the serial loop */ }
                     }
                 });
             for (std::thread& t : pool) t.join();
+            for (std::size_t i = 0; i < paths.size(); ++i)
+                if (pins[i]) prefetched.emplace(paths[i], std::move(pins[i]));
         }
     }
-    std::map<std::string, const LoadedComponent*> loaded;
+    std::map<std::string, std::shared_ptr<const LoadedComponent>> loaded;
     for (const json& comp : components) {
         const std::string cid = comp.value("id", std::string());
         AsmComponentStatus st;
@@ -625,8 +676,9 @@ AssemblyResult compile_assembly(const json& doc, const std::string& base_dir,
             if (path.empty())
                 throw OpError("import_failed", "component '" + cid + "' has no source.path",
                               {{"component", cid}});
-            const LoadedComponent& lc = load_component(path, base_dir);
-            loaded[cid] = &lc;
+            auto ready = prefetched.find(path);
+            loaded[cid] = ready == prefetched.end() ? load_component(path, base_dir)
+                                                    : ready->second;
             st.ok = true;
             st.error = std::nullopt;
         } catch (const std::exception& exc) {

@@ -475,3 +475,31 @@ Angle `value` objects may define a hinge line with `axis:[x,y,z]` (existing alia
 local frame. An authored axis is normalized, never flattened to a different axis.
 The scalar mate alone still constrains only an angle. A motion sweep additionally
 requires an identifiable axis line, as specified in `worker_rpc.md`.
+
+## 11. Explicit line angle mates are revolute joints (2026-09-08)
+
+Superseding the scalar-only statement above for explicit lines: an angle mate
+carrying both `axis` (or `reference_axis`) and `axis_point` binds a virtual pin to
+the two authored component frames. No cylindrical face or bore is required.
+Five structural residuals preserve the three coordinates of the pin station and
+align its two axes; the signed angular residual prescribes the remaining rotation.
+Binding uses document placements, never warm-start poses, so sweeps cannot drift
+axially or rebind their pivot. Points may be zero and are not normalized.
+Without `axis_point`, existing single-angular-residual semantics are unchanged.
+
+For an explicit-line angle driver, motion trajectory `dof` reports mechanism
+mobility including the driven coordinate (one for a single grounded revolute).
+`residual_dof` reports the actual solver nullity with the angle prescribed (zero
+for that mechanism). Mate-solver DOF remains the actual residual nullity.
+
+## 12. Nested native component geometry (2026-09-08)
+
+Loading a `.step+` component dispatches on the contained schema: part documents
+compile their features, assembly documents recursively resolve components and
+world-place them inside the child's local frame before the parent's pose is applied.
+Relative references resolve against their containing file. Cycles and missing or
+solid-free descendants fail explicitly; they cannot contribute a partial compound
+to an export. Native assembly results are not cached solely by the parent mtime.
+Detached `doc_open` imports rebase relative component paths before clearing the
+source save destination. Export metadata and the explicit MCP resume opt-in are
+specified in `worker_rpc.md` §31.

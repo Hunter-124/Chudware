@@ -27,7 +27,9 @@ if _REPO_ROOT not in sys.path:
 import pytest
 
 from services.mcp import core_bridge as cb
-from services.mcp.cad_motion_tools import _turn_center_2d
+from services.mcp.cad_motion_tools import (
+    _axis_rotation16, _mat_mul16, _pose_check, _turn_center_2d,
+)
 
 # The test vehicle, in mm. Wheels are Ø600 x 200 discs whose kingpin bore runs vertically
 # through the wheel centre, so the closed-form Ackermann geometry is exactly the one the
@@ -76,6 +78,20 @@ def test_straight_ahead_axle_lines_have_no_turn_centre():
     lines = [((x, lat), (0.0, 1.0))
              for x in (0.0, WHEELBASE) for lat in (TRACK / 2, -TRACK / 2)]
     assert _turn_center_2d(lines) is None
+
+
+def test_pose_check_rejects_local_steering_about_a_requested_world_axis():
+    point = [31.0, -558.8, 263.0]
+    base = [1, 0, 0, point[0], 0, 0, -1, point[1],
+            0, 1, 0, point[2], 0, 0, 0, 1]
+    requested = {"point": point, "dir": [0, 0, 1]}
+    world_pose = _mat_mul16(_axis_rotation16(point, requested["dir"], 35), base)
+    local_pose = _mat_mul16(base, _axis_rotation16([0, 0, 0], requested["dir"], 35))
+    assert _pose_check("Hub", base, world_pose, requested, 35)["ok"]
+    rejected = _pose_check("Hub", base, local_pose, requested, 35)
+    assert not rejected["ok"]
+    assert not rejected["rotation_ok"]
+    assert rejected["invariant_coordinate"] == {"axis": "z", "ok": False}
 
 
 # ------------------------------------------------------------------------------- fixtures
@@ -355,8 +371,9 @@ def test_sweep_envelope_takes_the_same_steer_spec(rover):
     assert len(out["per_step"]) == 4
 
 
-def test_sweep_envelope_carries_nonidentity_wheel_pose_about_kingpin(tmp_path):
-    """Steering the hub must not inject free axle spin into its carried wheel."""
+@pytest.mark.parametrize("hub_angle", [0, 90, -90])
+def test_sweep_envelope_carries_nonidentity_wheel_pose_about_kingpin(tmp_path, hub_angle):
+    """A world-Z steer preserves every wheel point's height, regardless of hub frame."""
     if not cb.available():
         pytest.skip("libchudware not staged; engine-backed MCP tools unavailable")
     wheel = _part("carried_wheel", [
@@ -364,14 +381,19 @@ def test_sweep_envelope_carries_nonidentity_wheel_pose_about_kingpin(tmp_path):
     ], tmp_path)
     hub = _part("carried_hub", [
         cb.feat("cylinder", "Hub", {"radius": cb.dim(30), "height": cb.dim(100)}),
-        cb.feat("transform", "Axle", {"rotate": [1, 0, 0], "angle": 90}),
+        cb.feat("transform", "Axle", {"rotate": [1, 0, 0], "angle": 90 - hub_angle}),
     ], tmp_path)
     asm = cb.call("doc_new", {"kind": "assembly", "name": "CarriedSteering"})["doc_id"]
     point = [31.0, 558.8, 263.0]
-    hub_pose = [1, 0, 0, point[0], 0, 1, 0, point[1], 0, 0, 1, point[2], 0, 0, 0, 1]
+    c, s = math.cos(math.radians(hub_angle)), math.sin(math.radians(hub_angle))
+    hub_pose = [1, 0, 0, point[0], 0, c, -s, point[1], 0, s, c, point[2], 0, 0, 0, 1]
     # The wheel's local spin axis is Z, placed on the hub's world -Y axle.
-    # An identity component pose misses the solver's rotation-vector nullspace bug.
-    wheel_pose = [1, 0, 0, point[0], 0, 0, -1, point[1], 0, 1, 0, point[2], 0, 0, 0, 1]
+    # A free axle spin must not turn the source bbox's square corners into a
+    # fictitious larger wheel before the steering has even begun.
+    spin = math.radians(37)
+    cs, ss = math.cos(spin), math.sin(spin)
+    wheel_pose = [cs, -ss, 0, point[0], 0, 0, -1, point[1],
+                  ss, cs, 0, point[2], 0, 0, 0, 1]
     try:
         cb.call("doc_apply_ops", {"doc_id": asm, "with_tess": False, "ops": [
             {"op": "asm_insert_component", "source": {"path": hub}, "name": "Hub",
@@ -387,6 +409,8 @@ def test_sweep_envelope_carries_nonidentity_wheel_pose_about_kingpin(tmp_path):
         assert mate["ok"] and mate["converged"], mate
         cb.call("doc_save", {"doc_id": asm, "path": str(tmp_path / "carried.step+")})
         before = cb.call("doc_tree", {"doc_id": asm})
+        static = next(b["bbox"] for b in _call(
+            "list_world_bodies", {"doc_id": asm})["bodies"] if b["component"] == "k2")
         out = _call("sweep_envelope", {
             "doc_id": asm, "components": ["Wheel"], "steps": 5,
             "steer": {"components": ["Hub"],
@@ -394,10 +418,15 @@ def test_sweep_envelope_carries_nonidentity_wheel_pose_about_kingpin(tmp_path):
         })
         assert out["ok"], out
         assert out["pose_check"]["ok"], out
+        assert out["per_step"][0]["components"]["k2"]["min"] == pytest.approx(
+            static["min"], abs=1e-5)
+        assert out["per_step"][0]["components"]["k2"]["max"] == pytest.approx(
+            static["max"], abs=1e-5)
         for frame in out["per_step"]:
             box = frame["components"]["k2"]
-            assert box["min"][2] == pytest.approx(3.0, abs=1e-6), frame
-            assert box["max"][2] == pytest.approx(523.0, abs=1e-6), frame
+            initial = out["per_step"][0]["components"]["k2"]
+            assert box["min"][2] == pytest.approx(initial["min"][2], abs=1e-6), frame
+            assert box["max"][2] == pytest.approx(initial["max"][2], abs=1e-6), frame
         for frame in out["pose_check"]["frames"]:
             checks = {b["component"]: b for b in frame["bodies"]}
             for cid in ("k1", "k2"):
@@ -408,6 +437,59 @@ def test_sweep_envelope_carries_nonidentity_wheel_pose_about_kingpin(tmp_path):
         assert cb.call("doc_tree", {"doc_id": asm}) == before
     finally:
         cb.call("doc_close", {"doc_id": asm})
+
+
+def test_turning_radius_is_independent_of_hub_component_frame(tmp_path):
+    """Equivalent hub geometry with identity/Rx(±90) frames has the same wheel axes."""
+    if not cb.available():
+        pytest.skip("libchudware not staged; engine-backed MCP tools unavailable")
+    wheel = _part("radius_wheel", [
+        cb.feat("cylinder", "Disc", {"radius": cb.dim(260), "height": cb.dim(120)}),
+    ], tmp_path)
+    radii = []
+    for hub_angle in (0, 90, -90):
+        hub = _part(f"radius_hub_{hub_angle}", [
+            cb.feat("cylinder", "Hub", {"radius": cb.dim(30), "height": cb.dim(100)}),
+            cb.feat("transform", "Axle", {"rotate": [1, 0, 0], "angle": 90 - hub_angle}),
+        ], tmp_path)
+        asm = cb.call("doc_new", {"kind": "assembly", "name": "RadiusFrames"})["doc_id"]
+        try:
+            c, s = math.cos(math.radians(hub_angle)), math.sin(math.radians(hub_angle))
+            ops = []
+            for tag, (x, y) in STATIONS.items():
+                ops.extend([
+                    {"op": "asm_insert_component", "source": {"path": hub},
+                     "name": f"Hub_{tag}", "fixed": True,
+                     "transform": [1, 0, 0, x, 0, c, -s, y, 0, s, c, 263, 0, 0, 0, 1]},
+                    {"op": "asm_insert_component", "source": {"path": wheel},
+                     "name": f"Wheel_{tag}", "fixed": False,
+                     "transform": [1, 0, 0, x, 0, 0, -1, y, 0, 1, 0, 263, 0, 0, 0, 1]},
+                ])
+            cb.call("doc_apply_ops", {"doc_id": asm, "ops": ops, "with_tess": False})
+            for i, tag in enumerate(STATIONS):
+                mate = _call("asm_mate", {
+                    "doc_id": asm, "mate_type": "concentric",
+                    "a": {"component": f"k{2 * i + 1}", "query": {"of": "face", "surf": "round"}},
+                    "b": {"component": f"k{2 * i + 2}", "query": {"of": "face", "surf": "round"}},
+                })
+                assert mate["ok"] and mate["converged"], mate
+            cb.call("doc_save", {"doc_id": asm,
+                                "path": str(tmp_path / f"radius_{hub_angle}.step+")})
+            out = _call("steering_turning_radius", {
+                "doc_id": asm, "steps": 3,
+                "steer": {"components": ["Hub_FL", "Hub_FR"],
+                          "wheels": ["Wheel_FL", "Wheel_FR"], "angle_deg": 35,
+                          "axis": _axis("FL", "FR")},
+                "rear_steer": {"components": ["Hub_RL", "Hub_RR"],
+                               "wheels": ["Wheel_RL", "Wheel_RR"], "angle_deg": 0,
+                               "axis": _axis("RL", "RR")},
+            })
+            assert out["ok"], out
+            assert out["tightest"]["radius_source"] == "wheel axle lines", out
+            radii.append(out["tightest"]["kinematic"]["turning_radius_mm"])
+        finally:
+            cb.call("doc_close", {"doc_id": asm})
+    assert radii[1:] == pytest.approx([radii[0], radii[0]], abs=1e-9, rel=0)
 
 
 _AX_FL = {"point": [1000.0, 800.0, 0.0], "dir": [0, 0, 1]}

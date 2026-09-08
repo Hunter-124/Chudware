@@ -2265,15 +2265,15 @@ def test_simulate_motion_honors_offset_hinge_line(tmp_path, line_source):
     for tag, radius, mode in (("Front", 4, "boss"), ("Rear", 5, "cut")):
         doc = cb.call("doc_new", {"kind": "part", "name": f"MotionHinge{tag}"})["doc_id"]
         try:
-            rebuilt = cb.call("doc_apply_ops", {"doc_id": doc, "ops": [
+            features = [
                 cb.feat("box", "Plate", {"length": cb.dim(100), "width": cb.dim(60),
-                                         "height": cb.dim(8)}),
-                cb.feat("cylinder", "Pin" if tag == "Front" else "Bore",
-                        {"radius": cb.dim(radius), "height": cb.dim(18),
-                         "mode": mode}),
-                cb.feat("transform", "Place", {"rotate": [1, 0, 0], "angle": 90,
-                                                "translate": point}),
-            ]})
+                                         "height": cb.dim(8)})]
+            if tag == "Front" or line_source != "authored":
+                features.append(cb.feat("cylinder", "Pin" if tag == "Front" else "Bore",
+                        {"radius": cb.dim(radius), "height": cb.dim(18), "mode": mode}))
+            features.append(cb.feat("transform", "Place",
+                                   {"rotate": [1, 0, 0], "angle": 90, "translate": point}))
+            rebuilt = cb.call("doc_apply_ops", {"doc_id": doc, "ops": features})
             assert all(s["ok"] for s in rebuilt["rebuild"]["feature_status"]), rebuilt
             selectors.append(cb.call("doc_query", {
                 "doc_id": doc, "query": {"of": "face", "side": "right"}})["matches"][0])
@@ -2313,8 +2313,8 @@ def test_simulate_motion_honors_offset_hinge_line(tmp_path, line_source):
             mate_id = added["id_map"]["$0"]
         before = cb.call("doc_tree", {"doc_id": asm})
         out, _ = _call("simulate_motion", {
-            "doc_id": asm, "mate_id": mate_id, "start": 0, "stop": -90,
-            "steps": 10, "check_interference": False})
+            "doc_id": asm, "mate_id": mate_id, "start": 0, "stop": -180,
+            "steps": 37, "check_interference": False})
         assert out["ok"], out
         assert out["pose_check"]["ok"], out
         for frame in out["trajectory"]:
@@ -2325,7 +2325,10 @@ def test_simulate_motion_honors_offset_hinge_line(tmp_path, line_source):
                         -s, 0, c, point[2] + s * point[0] - c * point[2],
                         0, 0, 0, 1]
             actual = next(b["transform"] for b in frame["bodies"] if b["component"] == "k2")
-            assert actual == pytest.approx(expected, abs=1e-6), frame
+            assert actual == pytest.approx(expected, abs=1e-9), frame
+            assert frame["converged"], frame
+            if line_source == "authored":
+                assert frame["dof"] == 1 and frame["residual_dof"] == 0, frame
             checked = frame["pose_check"]["bodies"][0]
             assert checked["axis_dir"] == pytest.approx([0, 1, 0])
             # Any point on the pin LINE is valid; its station along Y is immaterial.

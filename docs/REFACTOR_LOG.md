@@ -2997,3 +2997,35 @@ extra prerequisite when the mate identifies its line. That smoke passed all thre
 cases and its script was removed. Final rebuilt-library acceptance:
 **161 passed in 103.34s (0:01:43)** across the two requested MCP files, followed by
 **100% tests passed, 0 tests failed out of 2** for native `mate|simulate_motion`.
+
+## Steering envelope reference frames and free axle spin (2026-09-08)
+
+The exact ME 490 rover's reported wheel z-minima (−99.866533738, −109.754975857,
+−99.254518607, −104.851604360 mm) were reproduced on a temporary copy of
+`CC-001_Merged_Rover_v4b.step+`. They already occurred at zero steering and stayed
+constant throughout the sweep: the steer driver and carried-island transport
+were correctly WORLD-left, and `pose_check` correctly certified their relative
+motion. The defect was transforming square source-AABB corners through the
+wheel's pre-existing free axle spin (~37–45 degrees), inflating a circular wheel
+into fictitious ground penetration. `cad_motion_tools.py` now transports the
+actual reference WORLD-shape bbox corners by relative placement for envelopes,
+wheel geometry inference and outer swept radius; source placement is retained
+only for fused solids. `session.cpp` supplies first-frame reference bounds and
+row-major placements for native dimensional sweeps and independently reconstructs
+the requested rotation in `motion_pose_check`. Reference queries stay on detached
+clones; the caller's document remains unchanged. The expanded motion tests cover
+Rx(0/±90)-placed hubs with a concentric wheel carrying 37 degrees of free spin,
+zero-sample agreement with static world bounds, height invariance, and kinematic
+radius equality across equivalent hub frames to 1e-9 mm. Pre-fix: **3 failed,
+22 deselected in 1.54s** (spun wheel reported −101.117 instead of +2.976 mm).
+Post-fix: **26 passed in 10.60s**; native `simulate_motion`: **100% tests passed,
+0 tests failed out of 1**. Exact-rover static versus zero-sample discrepancy is
+below 4.2e-8 mm and maximum wheel-height variation across five steering samples
+is 5.2e-13 mm. Its fresh static solve itself places one wheel at −1.971 mm; that
+real pre-existing pose is not hidden by the envelope correction. Original
+project files were untouched; all native/pytest proof used the systemd wrapper.
+
+Final motion acceptance, including an explicit wrong-local-axis pose-check
+rejection regression: **27 passed in 10.53s**. The temporary reproduction script
+was removed; its copied-rover result is retained at
+`/tmp/motion42-cvt0od8h/result.json` for review.

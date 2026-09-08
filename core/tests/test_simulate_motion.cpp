@@ -311,3 +311,41 @@ TEST_CASE("doc_simulate_motion: invalid finite/timing/dynamics setup is rejected
     fs::remove(pa);
     fs::remove(pb);
 }
+
+TEST_CASE("doc_simulate_motion: bore-less plate is a one-DOF revolute") {
+    const auto path = make_box_step("revolute_plate");
+    const auto did = doc::doc_new("assembly", "line_revolute").at("doc_id").get<std::string>();
+    doc::doc_apply_ops(did, -1, json::array({
+        {{"op", "asm_insert_component"}, {"source", {{"path", path.string()}}}, {"fixed", true}},
+        {{"op", "asm_insert_component"}, {"source", {{"path", path.string()}}}, {"fixed", false}}
+    }), false);
+    const json selector = {{"kind", "face"}, {"centroid", {10, 5, 5}}};
+    const auto added = doc::doc_apply_ops(did, -1, json::array({
+        {{"op", "asm_add_mate"}, {"mate", {
+            {"type", "angle"}, {"align", "aligned"},
+            {"refs", {{{"component", "k1"}, {"selector", selector}},
+                      {{"component", "k2"}, {"selector", selector}}}},
+            {"value", {{"value", 0}, {"axis", {0, 1, 0}}, {"axis_point", {910, 0, 545}}}}
+        }}}
+    }), false);
+    const auto mid = added.at("id_map").at("$0").get<std::string>();
+    const auto result = doc::doc_simulate_motion(did, mid, 0, -180, 37, false, 0);
+    REQUIRE(result.value("ok", false));
+    for (const auto& frame : result.at("trajectory")) {
+        CHECK(frame.at("converged").get<bool>());
+        CHECK(frame.at("dof") == 1);
+        CHECK(frame.at("residual_dof") == 0);
+        const double theta = frame.at("value").get<double>() * M_PI / 180;
+        const double c = std::cos(theta), s = std::sin(theta);
+        const std::vector<double> expected = {
+            c, 0, -s, 0, 0, 1, 0, 0, s, 0, c, 0,
+            910 - 910*c - 545*s, 0, 545 + 910*s - 545*c, 1};
+        for (const auto& body : frame.at("bodies")) {
+            if (body.at("component") != "k2") continue;
+            const auto actual = body.at("transform").get<std::vector<double>>();
+            for (size_t k = 0; k < 16; ++k)
+                CHECK(std::abs(actual[k] - expected[k]) < 1e-9);
+        }
+    }
+    fs::remove(path);
+}

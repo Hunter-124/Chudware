@@ -12,6 +12,8 @@ an agent actually reads back —
   * reversing that load is REFUSED as a mechanism rather than reported as a solve.
   * a steel pin transfers a lateral load into a bronze bore, with each body's
     factor of safety measured against its own yield strength.
+  * a bonded plate/bushing joint and a unilateral bushing/pin clearance coexist
+    without fusing their material identities, and transmit bearing load into the plate.
 
 Skips honestly when libchudware is not staged (same convention as the sibling live
 suites); the services/mcp conftest gives the run its own private hostd.
@@ -77,6 +79,45 @@ def _stacked_boxes(tools: dict, name: str) -> str:
     ]))
     assert rr.get("ok"), rr
     return doc
+
+
+def _plate_bushing_pin(tools: dict, name: str) -> str:
+    """Aluminium plate, touching bronze sleeve, and a steel pin with 0.05 mm clearance."""
+    made = json.loads(tools["new_part"](name=name))
+    assert made.get("ok"), made
+    doc = made["doc_id"]
+    built = json.loads(tools["add_features"](doc_id=doc, ops=[
+        {"op": "add_feature", "feature": {
+            "type": "box", "name": "Plate", "centered": True,
+            "params": {"length": 30, "width": 30, "height": 20}}},
+        {"op": "add_feature", "feature": {
+            "type": "cylinder", "name": "PlateBore", "mode": "cut", "centered": True,
+            "params": {"radius": 7.5, "height": 40}}},
+        {"op": "add_feature", "feature": {
+            "type": "cylinder", "name": "Bushing", "centered": False, "merge": False,
+            "at": [0, 0, -8], "params": {"radius": 7.5, "height": 16}}},
+        {"op": "add_feature", "feature": {
+            "type": "cylinder", "name": "BushingBore", "mode": "cut", "centered": True,
+            "params": {"radius": 5.05, "height": 40}}},
+        {"op": "add_feature", "feature": {
+            "type": "cylinder", "name": "Pin", "centered": False, "merge": False,
+            "at": [0, 0, -5], "params": {"radius": 5, "height": 20}}},
+    ]))
+    assert built.get("ok"), built
+    return doc
+
+
+def _contact_result(tools: dict, out: dict) -> dict:
+    if out.get("job_id") and "provenance" not in out:
+        job_id = out["job_id"]
+        deadline = time.monotonic() + 300
+        while time.monotonic() < deadline:
+            status = json.loads(tools["sim_status"](job_id))
+            if status.get("state") not in ("queued", "running"):
+                break
+            time.sleep(0.2)
+        return json.loads(tools["sim_results"](job_id))
+    return out
 
 
 def _contact(tools: dict, doc: str, fz: float, vtu: str = None,
@@ -175,15 +216,7 @@ def test_steel_pin_in_bronze_bore_uses_each_bodys_yield(tools, tmp_path):
         doc_id=doc,
         vtu_path=str(tmp_path / "steel_pin_bronze_bore.vtu"),
     ))
-    if out.get("job_id") and "provenance" not in out:
-        job_id = out["job_id"]
-        deadline = time.monotonic() + 300
-        while time.monotonic() < deadline:
-            status = json.loads(tools["sim_status"](job_id))
-            if status.get("state") not in ("queued", "running"):
-                break
-            time.sleep(0.2)
-        out = json.loads(tools["sim_results"](job_id))
+    out = _contact_result(tools, out)
     assert out.get("ok"), json.dumps(out)
     assert out["provenance"]["material_mode"] == "per_body", out["provenance"]
     assert out["contact"]["converged"] is True, out["contact"]
@@ -212,6 +245,78 @@ def test_steel_pin_in_bronze_bore_uses_each_bodys_yield(tools, tmp_path):
         material["per_body"][str(bore)]["material_id"],
         material["per_body"][str(pin)]["material_id"],
     }
+
+
+def test_bonded_plate_bushing_and_contact_pin_transmit_bearing_load(tools, tmp_path):
+    doc = _plate_bushing_pin(tools, "contact_live_mixed_bearing")
+    bronze = {"name": "bronze", "E_mpa": 110000.0, "nu": 0.34, "yield_mpa": 125.0}
+    penalty_scale = 0.5
+    max_iterations = 100
+    out = _contact_result(tools, json.loads(tools["run_fea_contact"](
+        # Plate bottom z=-10 and pin top z=15 isolate the fixture and load.
+        fixtures=["bottom"],
+        load={"face": "top", "force": [FORCE_N, 0.0, 0.0]},
+        material={"per_body": {"1": "aluminum", "2": bronze, "3": "steel"}},
+        interfaces={"bonded": [[1, 2]], "contact": [[2, 3]], "default": "free"},
+        bond_gap_mm=0.05,
+        max_gap_mm=0.4,
+        penalty_scale=penalty_scale,
+        max_iterations=max_iterations,
+        mesh_size_mm=4.0,
+        interface_size_mm=0.5,
+        min_size_mm=0.5,
+        doc_id=doc,
+        vtu_path=str(tmp_path / "plate_bushing_pin.vtu"),
+    )))
+
+    assert out.get("ok"), json.dumps(out)
+    contact = out["contact"]
+    assert contact["penalty_scale"] == pytest.approx(penalty_scale), contact
+    assert contact["max_iterations"] == max_iterations, contact
+    for kind, expected in (("bonded", (1, 2)), ("contact", (2, 3))):
+        group = contact["interfaces"][kind]
+        assert [(pair["a"], pair["b"]) for pair in group] == [expected], group
+        assert group[0]["pairs"] > 0, group
+        assert group[0]["area_mm2"] > 0.0, group
+    assert contact["interfaces"]["unmatched"] == [], contact["interfaces"]
+    assert contact["converged"] is True, contact
+    assert contact["active_pairs"] > 0, contact
+    assert contact["contact_carries_load"] is True, contact
+    assert contact["tangential_force_fraction"] < 0.01, contact
+    assert out["reactions"]["equilibrium_error_pct"] < 1.0, out["reactions"]
+    assert out["reactions"]["reaction_force_n"][0] == pytest.approx(-FORCE_N, rel=0.01)
+    # A fused plate/sleeve would erase the mixed-interface/material contract.
+    assert out["mesh_quality"]["connected_components"] == 3, out["mesh_quality"]
+    assert out["provenance"]["material_mode"] == "per_body", out["provenance"]
+    material = out["material"]
+    assert set(material["body_summary"]) == {"1", "2", "3"}, material
+    assert material["per_body"]["2"]["yield_mpa"] == bronze["yield_mpa"], material
+    assert material["per_body"]["1"]["material_id"] != material["per_body"]["2"]["material_id"]
+    assert material["per_body"]["3"]["material_id"] != material["per_body"]["1"]["material_id"]
+
+
+def test_deferred_unmatched_interface_refusal_keeps_diagnostics(tools):
+    from services.mcp.cad_sim_tools import _build_contact_study
+    from services.sim import jobs
+
+    doc = _stacked_boxes(tools, "contact_unmatched_durable")
+    ctx = _build_contact_study(
+        ["bottom"], {"face": "top", "force": [0, 0, -FORCE_N]}, "steel",
+        0.001, 25, 6.0, 1, doc, [],
+        interfaces={"contact": [[1, 2]], "default": "free"},
+    )
+    # Submit the real solve durably instead of depending on wall-clock handoff
+    # timing: a late FAILED result must preserve the same interface diagnosis.
+    submitted = jobs.start("fea_contact", "core_rpc",
+                           {"method": "sim_run_static", "params": {"study": ctx["study"]}})
+    out = _contact_result(tools, submitted)
+    assert out["ok"] is False and out["state"] == "failed", out
+    assert out["contact"]["interfaces"]["unmatched"] == [
+        {"a": 1, "b": 2, "type": "contact"}
+    ], out
+    assert out["mesh_quality"]["connected_components"] == 2, out
+    assert "no fixture" in out["solver_error"], out
+    assert "summary" not in out and "displacement" not in out, out
 
 
 def test_per_body_refuses_an_ordinal_absent_from_the_mesh(tools):

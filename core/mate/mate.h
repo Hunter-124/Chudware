@@ -26,6 +26,11 @@
 // the geoms' companion vector (a plane's in-plane `direction`, an axis's `normal`).
 // The sign of a derived axis is canonical, so a driven sweep measures the same signed
 // angle on both sides of zero.
+// With an explicit axis AND axis_point (also in A's local frame), the angle mate
+// additionally binds a virtual revolute pin to both authored component poses:
+// three anchor-coincidence rows and two axis-parallel rows. A prescribed angle
+// then leaves zero residual DOF; releasing that drive leaves one mechanism DOF.
+// Without axis_point the single angular residual is unchanged.
 //
 // Dict-in/dict-out via nlohmann::json keeps the document and harness seams
 // simple. OCCT-free (only solver/Eigen/json).

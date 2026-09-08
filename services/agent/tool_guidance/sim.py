@@ -334,8 +334,17 @@ ENTRIES: dict[str, dict[str, Any]] = {
             "touched), contact.converged, contact.pairs[].contact_force_n / "
             "max_contact_pressure_mpa, and reactions.equilibrium_error_pct. No friction, no "
             "large sliding, no preload — apply a clamp load as a face load instead. A load "
-            "that pulls the parts apart is refused as a mechanism. Bonded (tension-carrying) "
-            "joints use run_fea_static with bond_gap_mm; the two are mutually exclusive. "
+            "that pulls the parts apart is refused as a mechanism. Model press fits as "
+            "bonded and running clearances as contact in the same study with "
+            'interfaces={"bonded":[[1,2]],"contact":[[2,3]],"default":"free"} '
+            "(one-based STEP solid ordinals or body names; explicit pairs override the "
+            "default, which is contact on contact runs and free on ordinary static runs). "
+            "bond_gap_mm can constrain the bonded search when interfaces is supplied; "
+            "otherwise bonded pairs use their measured gap within max_gap_mm. "
+            "For active-set chatter, tune the positive finite penalty_scale (default 1.0) "
+            "and max_iterations (default 25), then check convergence and penetration. "
+            "Read contact.interfaces.bonded/contact pair counts and area_mm2, unmatched "
+            "declared pairs, and the echoed contact.penalty_scale/max_iterations. "
             'For mixed bodies pass material={"per_body":{"1":"steel","2":'
             '{"E_mpa":110000,"nu":0.34,"yield_mpa":125}},"default":"steel"} '
             "(one-based STEP solid ordinals); each body's own yield governs its FoS. "

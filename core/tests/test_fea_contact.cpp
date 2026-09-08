@@ -23,6 +23,7 @@
 #include <vector>
 
 #include "sim/fea_contact.h"
+#include "sim/fea_run.h"
 #include "sim/fea_selection.h"
 #include "sim/fea_static.h"
 
@@ -316,6 +317,143 @@ TEST_CASE("contact: a load that lifts the part off is refused, not solved") {
     CHECK(r.max_disp_mm == 0.0);
     std::printf("(b) refused after %d iteration(s): %s\n", report.contact_iterations,
                 r.error.c_str());
+}
+
+TEST_CASE("contact: mixed three-body interfaces keep the press fit bonded and the pin unilateral") {
+    // A structured section through the plate / bushing / pin load path. The
+    // zero-gap press-fit section is bilateral; the running seat is 0.05 mm away.
+    // The live STEP test covers the actual cylindrical geometry and materials.
+    Mesh m;
+    add_box(m, 3, 3, 2, 0, 0, 0, 20, 20, 10);
+    add_box(m, 3, 3, 2, 0, 0, 10, 20, 20, 10);
+    add_box(m, 3, 3, 2, 0, 0, 20.05, 20, 20, 10);
+    ContactCandidateOptions opts;
+    opts.max_gap_mm = 0.1;
+    opts.bonded_pairs = {{1, 2}};
+    opts.contact_pairs = {{2, 3}};
+    opts.default_interface = chudware::sim::InterfaceKind::Free;
+    auto candidates = fea_contact_candidates(m.points, m.tets, 4, kE, opts);
+    REQUIRE(candidates.error.empty());
+    REQUIRE(candidates.bonded.size() == 16);
+    REQUIRE(candidates.springs.size() == 16);
+    CHECK(candidates.min_gap0_mm == doctest::Approx(0.05));
+    CHECK(chudware::sim::fea_contact_resolution(candidates).resolved);
+    std::vector<chudware::sim::BondSpring> bonds;
+    for (const auto& s : candidates.bonded) bonds.push_back({s.a, s.b, s.k});
+
+    // Load only the sleeve in tension, with the pin independently restrained:
+    // none of the unilateral springs can be mistaken for the tensile tie.
+    auto fixed = nodes_at_z(m, 0);
+    for (size_t i = 0; i < candidates.component.size(); ++i)
+        if (candidates.component[i] == 2) fixed.push_back(static_cast<int>(i));
+    std::vector<double> force(m.points.size(), 0);
+    const auto sleeve_top = nodes_at_z(m, 20);
+    for (int i : sleeve_top) force[i * 3 + 2] = 4000.0 / sleeve_top.size();
+    auto tension = chudware::sim::fea_static_solve(
+        m.points, m.tets, kE, kNu, kYield, fixed, force, 4, bonds);
+    REQUIRE(tension.ok);
+    CHECK(tension.reaction_force_n[2] == doctest::Approx(-4000).epsilon(0.01));
+    double tensile_tie_force = 0;
+    for (const auto& s : bonds)
+        tensile_tie_force += s.k * (tension.displacement[s.b * 3 + 2] -
+                                    tension.displacement[s.a * 3 + 2]);
+    CHECK(tensile_tie_force == doctest::Approx(4000).epsilon(0.01));
+    CHECK(tension.max_disp_mm < 0.01);
+
+    using nlohmann::json;
+    auto faces = [&](double z) {
+        json samples = json::array();
+        for (int i : nodes_at_z(m, z))
+            samples.push_back({m.points[i * 3], m.points[i * 3 + 1], m.points[i * 3 + 2]});
+        return json{{"points", samples}, {"tol_mm", 0.001}};
+    };
+    json study{{"points", m.points}, {"tets", m.tets}, {"nodes_per_elem", 4},
+        {"material", {{"E_mpa", kE}, {"nu", kNu}, {"yield_mpa", kYield}}},
+        {"fixtures", json::array({faces(0)})},
+        {"loads", json::array({json{{"faces", faces(30.05)}, {"type", "force"},
+                                    {"vector", {0, 0, -4000}}}})},
+        {"contact", {{"max_gap_mm", 0.1}, {"penalty_scale", 0.5}, {"max_iterations", 50}}},
+        {"interfaces", {{"bonded", {{1, 2}}}, {"contact", {{2, 3}}}, {"default", "free"}}}};
+    auto packet = chudware::sim::fea_run_static(study);
+    INFO(packet.dump());
+    REQUIRE(packet["ok"] == true);
+    CHECK(packet["contact"]["interfaces"]["bonded"][0]["pairs"] == 16);
+    CHECK(packet["contact"]["interfaces"]["contact"][0]["pairs"] == 16);
+    CHECK(packet["contact"]["interfaces"]["bonded"][0]["a"] == 1);
+    CHECK(packet["contact"]["interfaces"]["contact"][0]["b"] == 3);
+    CHECK(packet["contact"]["penalty_scale"] == 0.5);
+    CHECK(packet["contact"]["load_path"]["fraction"].get<double>() > 0.95);
+    study["loads"][0]["vector"] = {0, 0, 4000};
+    auto lifted = chudware::sim::fea_run_static(study);
+    REQUIRE(lifted["ok"] == false);
+    CHECK(lifted["contact"]["active_pairs"] == 0);
+    CHECK(lifted["contact"]["load_path"]["fraction"] == 0.0);
+
+    study["interfaces"]["contact"] = {{2, 1}};
+    auto conflict = chudware::sim::fea_run_static(study);
+    CHECK(conflict["ok"] == false);
+    CHECK(conflict["error"].get<std::string>().find("[1,2]") != std::string::npos);
+    study["interfaces"]["contact"] = {{2, 9}};
+    auto unknown = chudware::sim::fea_run_static(study);
+    CHECK(unknown["ok"] == false);
+    CHECK(unknown["error"].get<std::string>().find("ordinal 9") != std::string::npos);
+    study["interfaces"]["contact"] = {{1, 3}};
+    auto unmatched = chudware::sim::fea_run_static(study);
+    CHECK(unmatched["ok"] == false);
+    CHECK(unmatched["contact"]["interfaces"]["unmatched"][0]["a"] == 1);
+    CHECK(unmatched["contact"]["interfaces"]["unmatched"][0]["b"] == 3);
+}
+
+TEST_CASE("contact: concentric plate bushing pin keeps both declared interfaces") {
+    Mesh m;
+    // Annular plate around a pressed-in sleeve, with the pin's 0.05 mm
+    // running clearance. Hollow pin core avoids degenerate axis tetrahedra.
+    add_tube(m, 2, 48, 3, 8, 12, 0, 6, 0, 0);
+    add_tube(m, 2, 48, 3, 5.05, 8, 0, 6, 0, 0);
+    add_tube(m, 2, 48, 3, 1, 5, 0, 6, 0, 0);
+    ContactCandidateOptions options;
+    options.max_gap_mm = 0.1;
+    options.bonded_pairs = {{1, 2}};
+    options.contact_pairs = {{2, 3}};
+    auto candidates = fea_contact_candidates(m.points, m.tets, 4, kE, options);
+    REQUIRE(candidates.error.empty());
+    REQUIRE_FALSE(candidates.bonded.empty());
+    REQUIRE_FALSE(candidates.springs.empty());
+    std::vector<chudware::sim::BondSpring> bonds;
+    for (const auto& s : candidates.bonded) {
+        CHECK(candidates.component[s.a] == 0);
+        CHECK(candidates.component[s.b] == 1);
+        bonds.push_back({s.a, s.b, s.k});
+    }
+    for (const auto& s : candidates.springs) {
+        CHECK(candidates.component[s.a] == 1);
+        CHECK(candidates.component[s.b] == 2);
+        CHECK(s.gap0_mm == doctest::Approx(0.05).epsilon(0.01));
+    }
+    std::vector<int> fixed;
+    std::vector<double> forces(m.points.size(), 0);
+    int pin_nodes = 0;
+    for (int c : candidates.component) if (c == 2) ++pin_nodes;
+    for (size_t i = 0; i < candidates.component.size(); ++i) {
+        if (candidates.component[i] == 0 &&
+            std::hypot(m.points[i * 3], m.points[i * 3 + 1]) > 11.99)
+            fixed.push_back(static_cast<int>(i));
+        if (candidates.component[i] == 2) forces[i * 3 + 1] = -4000.0 / pin_nodes;
+    }
+    FeaContactOptions solver_options;
+    solver_options.max_iterations = 100;
+    FeaContactReport report;
+    auto solved = fea_static_solve_contact(m.points, m.tets, kE, kNu, kYield,
+        fixed, forces, 4, bonds, candidates.springs, solver_options, report);
+    INFO(solved.error);
+    REQUIRE(solved.ok);
+    REQUIRE(report.converged);
+    CHECK(report.active_pairs > 6);
+    CHECK(solved.reaction_force_n[1] == doctest::Approx(4000).epsilon(0.01));
+    CHECK(report.groups[0].force_n[1] == doctest::Approx(4000).epsilon(0.02));
+    std::printf("mixed concentric: %zu bonds, %d/%d active contacts, %d iterations, Ry=%.3f N\n",
+        bonds.size(), report.active_pairs, report.candidate_pairs,
+        report.contact_iterations, solved.reaction_force_n[1]);
 }
 
 // ── (c) Pin in a clearance bore, loaded transversely: one-sided contact ─────────

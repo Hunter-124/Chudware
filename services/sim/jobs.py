@@ -464,11 +464,63 @@ def _validate_driving_loads(method: str, study: dict) -> None:
         raise ValueError(f"{method} needs at least one non-zero load")
 
 
+def validate_interfaces(interfaces: Any, label: str = "interfaces") -> None:
+    """Validate the JSON shape only; the engine resolves STEP/body identities."""
+    if not isinstance(interfaces, dict):
+        raise ValueError(f"{label} must be an object")
+    unknown = set(interfaces) - {"bonded", "contact", "default"}
+    if unknown:
+        raise ValueError(f"{label} has unknown keys: {', '.join(sorted(map(str, unknown)))}")
+    if "default" in interfaces and interfaces["default"] not in ("contact", "bonded", "free"):
+        raise ValueError(f"{label}.default must be contact, bonded, or free")
+    for kind in ("bonded", "contact"):
+        if kind not in interfaces:
+            continue
+        pairs = interfaces[kind]
+        if not isinstance(pairs, list):
+            raise ValueError(f"{label}.{kind} must be a list of [a, b] body pairs")
+        for index, pair in enumerate(pairs):
+            where = f"{label}.{kind}[{index}]"
+            if not isinstance(pair, list) or len(pair) != 2:
+                raise ValueError(f"{where} must be a two-item [a, b] body pair")
+            for body in pair:
+                if (
+                    isinstance(body, int) and not isinstance(body, bool) and body > 0
+                ) or (isinstance(body, str) and body.strip()):
+                    continue
+                raise ValueError(
+                    f"{where} body references must be positive 1-based STEP solid "
+                    "ordinals or non-empty body names"
+                )
+
+
 def _validate_study_params(method: str, params: dict) -> None:
     study = params.get("study")
     if not isinstance(study, dict):
         raise ValueError(f"{method} params need a study object")
     _require_geometry_file(study.get("step_path"), f"{method} STEP geometry")
+    if "interfaces" in study:
+        validate_interfaces(study["interfaces"], f"{method} study.interfaces")
+    if "bond_gap_mm" in study:
+        gap = study["bond_gap_mm"]
+        if isinstance(gap, bool) or _finite(gap, f"{method} bond_gap_mm") < 0.0:
+            raise ValueError(f"{method} bond_gap_mm must be finite and >= 0")
+    if "contact" in study:
+        contact = study["contact"]
+        if not isinstance(contact, dict):
+            raise ValueError(f"{method} study.contact must be an object")
+        penalty = contact.get("penalty_scale", 1.0)
+        if isinstance(penalty, bool) or _finite(penalty, f"{method} contact.penalty_scale") <= 0.0:
+            raise ValueError(f"{method} contact.penalty_scale must be finite and > 0")
+        if (
+            contact.get("enabled", True)
+            and "bond_gap_mm" in study
+            and "interfaces" not in study
+        ):
+            raise ValueError(
+                f"{method} bond_gap_mm with contact requires study.interfaces "
+                "to distinguish bonded and contact body pairs"
+            )
     fixtures = study.get("fixtures")
     if not isinstance(fixtures, list):
         raise ValueError(f"{method} study fixtures must be a list")
@@ -851,6 +903,16 @@ def raw_result(job_id: str) -> Optional[dict]:
         return None
     result = finished.get("result")
     return result if isinstance(result, dict) and result.get("ok") is True else None
+
+
+def refusal_result(job_id: str) -> Optional[dict]:
+    """A failed stage's diagnostic packet, never a converged/collectable result."""
+    row = _row(job_id)
+    if row is None or _reconcile(row).get("state") != FAILED:
+        return None
+    finished = _read_json(job_dir(job_id) / "result.json")
+    result = finished.get("result") if isinstance(finished, dict) else None
+    return result if isinstance(result, dict) and result.get("ok") is False else None
 
 
 # ---------------------------------------------------------------- collect (exactly once)

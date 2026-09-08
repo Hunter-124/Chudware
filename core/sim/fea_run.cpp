@@ -31,12 +31,11 @@
 #include <sys/resource.h>
 #endif
 
-// ── OCCT, for the analytic contact-gap measurement only ───────────────────────
-// detail::make_cad_gap_probe re-reads the study's own STEP/BREP so a candidate
-// pair's clearance can be measured against the CAD faces instead of the mesh
-// facets. Nothing else in this TU touches OCCT; the mesher owns the geometry
-// pipeline. NOMINMAX is set project-wide (core/CMakeLists.txt) so the OCCT ->
-// windows.h transitive include cannot clobber std::min/std::max below.
+// OCCT supplies geometry-only contact preflights and the analytic gap oracle;
+// the mesher still owns volume generation. NOMINMAX is set project-wide so the
+// OCCT -> windows.h transitive include cannot clobber std::min/std::max below.
+#include <BRepAdaptor_Surface.hxx>
+#include <BRepClass_FaceClassifier.hxx>
 #include <BRepBndLib.hxx>
 #include <BRepBuilderAPI_MakeVertex.hxx>
 #include <BRepClass3d_SolidClassifier.hxx>
@@ -57,6 +56,10 @@
 #include <TopoDS_Solid.hxx>
 #include <TopoDS_Vertex.hxx>
 #include <gp_Pnt.hxx>
+#include <gp_Cylinder.hxx>
+#include <gp_Lin.hxx>
+#include <gp_Pln.hxx>
+#include <gp_Pnt2d.hxx>
 
 #include "sim/fea_contact.h"
 #include "sim/fea_buckling.h"
@@ -67,6 +70,7 @@
 #include "sim/mesher.h"
 #include "sim/sim_cache.h"
 #include "sim/sim_cancel.h"
+#include "sim/progress.h"
 #include "sim/vtu_writer.h"
 #include "util/resource_governor.h"
 #include "version_info.h"  // CMake-configured CHUDWARE_HOSTD_BUILD_ID (engine build id)
@@ -81,6 +85,7 @@ json mesh_governor_json(const MeshOut& mesh, int dof_per_node) {
     for (const auto& probe : mesh.governor_probes) {
         json row{{"h", probe.h}, {"elems", probe.elems},
                  {"rss_gb", probe.rss_gb},
+                 {"elapsed_s", probe.elapsed_s}, {"phase", probe.phase},
                  {"predicted_elems", probe.predicted_elems > 0.0
                                          ? json(probe.predicted_elems) : json(nullptr)},
                  {"exponent", probe.exponent}};
@@ -89,6 +94,10 @@ json mesh_governor_json(const MeshOut& mesh, int dof_per_node) {
             probe.elems == static_cast<uint64_t>(mesh.n_elems))
             delivered = row;
     }
+    json skipped = json::array();
+    for (const auto& probe : mesh.governor_skipped_probes)
+        skipped.push_back({{"h", probe.h}, {"predicted_s", probe.predicted_s},
+                           {"remaining_s", probe.remaining_s}, {"reason", probe.reason}});
     return json{
         {"mode", "measured_octave"},
         {"estimate_gb", chudware::governor::fea_peak_bytes(
@@ -97,6 +106,10 @@ json mesh_governor_json(const MeshOut& mesh, int dof_per_node) {
         {"estimated_elems", mesh.n_elems},
         {"measured_probe", delivered},
         {"probes", std::move(probes)},
+        {"skipped_probes", std::move(skipped)},
+        {"probe_budget_s", mesh.governor_probe_budget_s},
+        {"elapsed_s", mesh.governor_elapsed_s},
+        {"budget_origin", mesh.governor_budget_origin},
         {"model", {{"count", "geometry_local_power_fit_max_one_octave"},
                    {"solve_peak", chudware::governor::fea_calibration_basis()},
                    {"rss_stage", "mesh_before_assembly"},
@@ -914,6 +927,7 @@ bool resolve_mesh(const json &study, std::vector<double> &points,
     options.declared_interfaces = declares_body_interfaces(study);
     const std::string step_path = study["step_path"].get<std::string>();
     auto mesh = mesh_step_cached(step_path, options);
+    quality.governor = mesh_governor_json(*mesh);
     if (!mesh->ok) {
       err = "mesh failed: " + mesh->error;
       return false;
@@ -978,6 +992,7 @@ bool resolve_mesh(const json &study, std::vector<double> &points,
             seed_node(s.b);
         }
         const auto refined_mesh = mesh_step_cached(step_path, refined);
+        quality.governor = mesh_governor_json(*refined_mesh);
         // A refinement contract that cannot be met is a REFUSAL, not a silent
         // fallback to the coarse mesh the study asked to get away from.
         if (!refined_mesh->ok) {
@@ -2370,6 +2385,354 @@ json resolve_mechanical_loads(
     return nullptr;
 }
 
+// CAD-only load-path preflight. The normal envelope is over WHOLE analytic
+// candidate faces (including parameter extrema), not mesh nodes or a sampled
+// active set. Unsupported surface combinations leave the proof undecided.
+struct CadPreflightFace {
+    TopoDS_Face face;
+    Bnd_Box box;
+    std::vector<std::array<double, 3>> normals;
+};
+
+std::vector<std::array<double, 3>> cad_face_normal_envelope(const TopoDS_Face& face) {
+    BRepAdaptor_Surface surface(face);
+    std::vector<std::array<double, 3>> normals;
+    const double sign = face.Orientation() == TopAbs_REVERSED ? -1.0 : 1.0;
+    if (surface.GetType() == GeomAbs_Plane) {
+        const auto n = surface.Plane().Axis().Direction();
+        normals.push_back({sign * n.X(), sign * n.Y(), sign * n.Z()});
+    } else if (surface.GetType() == GeomAbs_Cylinder) {
+        const auto frame = surface.Cylinder().Position();
+        const auto x = frame.XDirection(), y = frame.YDirection();
+        const double u0 = surface.FirstUParameter(), u1 = surface.LastUParameter();
+        if (!std::isfinite(u0) || !std::isfinite(u1)) return normals;
+        auto append = [&](double u) {
+            normals.push_back({sign * (x.X() * std::cos(u) + y.X() * std::sin(u)),
+                               sign * (x.Y() * std::cos(u) + y.Y() * std::sin(u)),
+                               sign * (x.Z() * std::cos(u) + y.Z() * std::sin(u))});
+        };
+        // Intermediate directions give the arc diagnostic; extrema make the
+        // coordinate-sign proof exact even for rotated cylinders.
+        for (int i = 0; i <= 64; ++i) append(u0 + (u1 - u0) * i / 64.0);
+        const double pi = std::acos(-1.0);
+        for (int axis = 1; axis <= 3; ++axis) {
+            const double u = std::atan2(y.Coord(axis), x.Coord(axis));
+            for (int k = static_cast<int>(std::floor((u0 - u) / pi));
+                 k <= static_cast<int>(std::ceil((u1 - u) / pi)); ++k)
+                if (u + k * pi >= u0 && u + k * pi <= u1) append(u + k * pi);
+        }
+    }
+    return normals;
+}
+
+// 1 = retain complete analytic normal envelopes, 0 = provably cannot oppose
+// within the declared gap, -1 = unsupported surface family. A radial cut face
+// has |n_plane . n_pin| <= (axis-to-plane distance + gap) / radius.
+int cad_face_opposition(const TopoDS_Face& a, const TopoDS_Face& b, double gap) {
+    BRepAdaptor_Surface sa(a), sb(b);
+    const double orientation = (a.Orientation() == TopAbs_REVERSED ? -1.0 : 1.0) *
+                               (b.Orientation() == TopAbs_REVERSED ? -1.0 : 1.0);
+    if (sa.GetType() == GeomAbs_Plane && sb.GetType() == GeomAbs_Plane)
+        return orientation * sa.Plane().Axis().Direction().Dot(sb.Plane().Axis().Direction())
+                       <= -0.35 ? 1 : 0;
+    if (sa.GetType() == GeomAbs_Cylinder && sb.GetType() == GeomAbs_Cylinder) {
+        const auto ca = sa.Cylinder(), cb = sb.Cylinder();
+        if (std::abs(ca.Axis().Direction().Dot(cb.Axis().Direction())) > 1.0 - 1e-10 &&
+            gp_Lin(ca.Axis()).Distance(cb.Location()) < 1e-6)
+            return orientation < 0.0 ? 1 : 0;
+        return 1; // both complete analytic normal envelopes are conservative
+    }
+    if (sa.GetType() == GeomAbs_Plane && sb.GetType() == GeomAbs_Cylinder)
+        return cad_face_opposition(b, a, gap);
+    if (sa.GetType() == GeomAbs_Cylinder && sb.GetType() == GeomAbs_Plane) {
+        const auto cylinder = sa.Cylinder();
+        const auto plane = sb.Plane();
+        const double axial = std::abs(cylinder.Axis().Direction().Dot(plane.Axis().Direction()));
+        if (axial > 1.0 - 1e-10) return 0;
+        if (axial < 1e-10) {
+            const double axis_offset = gp_Vec(plane.Location(), cylinder.Location()).Dot(
+                gp_Vec(plane.Axis().Direction()));
+            // Every cylinder point within gap of the plane has this bounded
+            // normal dot product, independent of trimming or tessellation.
+            const double minimum_dot = (-orientation * axis_offset - gap) / cylinder.Radius();
+            if (minimum_dot > -0.35) return 0;
+        }
+        return 1; // cannot exclude this pair; retain the WHOLE face envelope
+    }
+    return -1;
+}
+
+json cad_contact_preflight(const json& study) {
+    if (!study.contains("step_path") || !study["step_path"].is_string() ||
+        !declares_body_interfaces(study)) return nullptr;
+    const bool enabled = study.contains("contact") && study["contact"].is_object() &&
+                         study["contact"].value("enabled", true);
+    if (!enabled && !study.contains("interfaces")) return nullptr;
+    ContactCandidateOptions options;
+    std::string error;
+    if (!contact_interface_policy(study, enabled, options, error))
+        return json{{"ok", false}, {"error", error}};
+    if (enabled) options.max_gap_mm = contact_max_gap_mm(study);
+    const auto start = std::chrono::steady_clock::now();
+    report_progress("contact.geometry_preflight", 0);
+    auto refusal = [&](json packet) {
+        packet["ok"] = false;
+        packet["elapsed_s"] = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - start).count();
+        packet["n_elems"] = 0;
+        packet["n_nodes"] = 0;
+        packet["mesh_quality"] = detail::mesh_quality_json({}, 0, 0,
+            study.value("mesh_order", study.value("order", 1)) == 2 ? 10 : 4);
+        packet["provenance"] = detail::provenance_json("chudware/fea_contact_preflight");
+        packet["provenance"]["governor"] = {
+            {"mode", "not_started"}, {"estimated_elems", 0}, {"estimate_gb", 0},
+            {"probes", json::array()}, {"reason", "geometry_preflight_refused_before_fill"}};
+        report_progress("contact.geometry_refused", 0);
+        return packet;
+    };
+    try {
+        TopoDS_Shape shape;
+        const std::string path = study["step_path"];
+        if (std::filesystem::path(path).extension() == ".brep") {
+            BRep_Builder builder;
+            BRepTools::Read(shape, path.c_str(), builder);
+        } else {
+            STEPControl_Reader reader;
+            if (reader.ReadFile(path.c_str()) == IFSelect_RetDone) {
+                reader.TransferRoots();
+                shape = reader.OneShape();
+            }
+        }
+        if (shape.IsNull()) return nullptr; // mesh entry reports geometry read errors
+        std::vector<std::vector<CadPreflightFace>> bodies;
+        std::vector<Bnd_Box> body_bounds;
+        std::vector<double> samples;
+        std::vector<int> sample_body;
+        for (TopExp_Explorer solid(shape, TopAbs_SOLID); solid.More(); solid.Next()) {
+            const int body = static_cast<int>(bodies.size());
+            bodies.emplace_back();
+            body_bounds.emplace_back();
+            BRepBndLib::Add(solid.Current(), body_bounds.back());
+            for (TopExp_Explorer it(solid.Current(), TopAbs_FACE); it.More(); it.Next()) {
+                CadPreflightFace face;
+                face.face = TopoDS::Face(it.Current());
+                BRepBndLib::Add(face.face, face.box);
+                face.box.Enlarge(options.max_gap_mm);
+                face.normals = cad_face_normal_envelope(face.face);
+                BRepAdaptor_Surface surface(face.face);
+                const double u0 = surface.FirstUParameter(), u1 = surface.LastUParameter();
+                const double v0 = surface.FirstVParameter(), v1 = surface.LastVParameter();
+                if (std::isfinite(u0) && std::isfinite(u1) &&
+                    std::isfinite(v0) && std::isfinite(v1)) {
+                    const int nu = surface.GetType() == GeomAbs_Cylinder ? 64 : 8;
+                    for (int i = 0; i <= nu; ++i) for (int j = 0; j <= 8; ++j) {
+                        const double u = u0 + (u1 - u0) * i / nu;
+                        const double v = v0 + (v1 - v0) * j / 8.0;
+                        BRepClass_FaceClassifier classifier(face.face, gp_Pnt2d(u, v), 1e-7);
+                        if (classifier.State() != TopAbs_IN && classifier.State() != TopAbs_ON) continue;
+                        const auto p = surface.Value(u, v);
+                        samples.insert(samples.end(), {p.X(), p.Y(), p.Z()});
+                        sample_body.push_back(body);
+                    }
+                }
+                bodies.back().push_back(std::move(face));
+            }
+        }
+        const int count = static_cast<int>(bodies.size());
+        if (count < 2) return nullptr;
+        auto kind = [&](int a, int b) {
+            for (const auto& pair : options.bonded_pairs)
+                if (std::min(pair[0], pair[1]) == a + 1 && std::max(pair[0], pair[1]) == b + 1)
+                    return InterfaceKind::Bonded;
+            for (const auto& pair : options.contact_pairs)
+                if (std::min(pair[0], pair[1]) == a + 1 && std::max(pair[0], pair[1]) == b + 1)
+                    return InterfaceKind::Contact;
+            return options.default_interface;
+        };
+        std::set<std::pair<int, int>> declared;
+        for (const auto* pairs : {&options.bonded_pairs, &options.contact_pairs})
+            for (const auto& pair : *pairs)
+                if (pair[0] < 1 || pair[1] < 1 || pair[0] > count || pair[1] > count ||
+                    pair[0] == pair[1] ||
+                    !declared.emplace(std::min(pair[0], pair[1]), std::max(pair[0], pair[1])).second)
+                    return refusal({{"error", "fea_static: invalid or duplicate interface body pair " +
+                                              json(pair).dump()}});
+        std::vector<ContactCandidateSet> support(count);
+        std::vector<bool> unknown(count, false), bonded(count, false), fixed(count, false);
+        std::vector<std::pair<int, int>> contact_pairs;
+        json interfaces{{"bonded", json::array()}, {"contact", json::array()},
+                        {"unmatched", json::array()}};
+        for (int body = 0; body < count; ++body) {
+            support[body].n_components = count;
+            for (int i = 0; i < count; ++i) support[body].component.push_back(i);
+        }
+        report_progress("contact.interface_classification", 0);
+        for (int a = 0; a < count; ++a) for (int b = a + 1; b < count; ++b) {
+            const auto mode = kind(a, b);
+            if (mode == InterfaceKind::Free) continue;
+            bool found = false;
+            const double gap = mode == InterfaceKind::Bonded && options.bond_gap_mm >= 0.0
+                                   ? options.bond_gap_mm : options.max_gap_mm;
+            for (const auto& fa : bodies[a]) for (const auto& fb : bodies[b]) {
+                if (fa.box.IsOut(fb.box)) continue;
+                const int opposition = cad_face_opposition(fa.face, fb.face, gap);
+                if (opposition == 0) continue;
+                BRepExtrema_DistShapeShape distance(fa.face, fb.face, Extrema_ExtFlag_MIN);
+                if (!distance.IsDone()) { unknown[a] = unknown[b] = true; continue; }
+                if (distance.Value() > gap + 1e-7) continue;
+                found = true;
+                if (mode == InterfaceKind::Bonded) continue;
+                if (opposition < 0 || fa.normals.empty() || fb.normals.empty()) {
+                    if (std::getenv("CHUDWARE_FEA_PROFILE")) {
+                        BRepAdaptor_Surface sa(fa.face), sb(fb.face);
+                        std::fprintf(stderr, "[fea preflight] unresolved faces bodies %d/%d types %d/%d gap %.9g\n",
+                                     a + 1, b + 1, int(sa.GetType()), int(sb.GetType()), distance.Value());
+                        std::fflush(stderr);
+                    }
+                    unknown[a] = unknown[b] = true;
+                    continue;
+                }
+                auto append = [&](int target, int partner, const CadPreflightFace& face) {
+                    for (const auto& normal : face.normals) {
+                        ContactSpring spring{};
+                        spring.a = partner;
+                        spring.b = target;
+                        spring.group = a * count + b;
+                        spring.normal = normal;
+                        support[target].springs.push_back(spring);
+                    }
+                };
+                append(a, b, fb);
+                append(b, a, fa);
+            }
+            const auto pair = json::array({a + 1, b + 1});
+            if (!found) { interfaces["unmatched"].push_back(pair); continue; }
+            if (mode == InterfaceKind::Bonded) {
+                bonded[a] = bonded[b] = true;
+                interfaces["bonded"].push_back(pair);
+            } else {
+                contact_pairs.emplace_back(a, b);
+                interfaces["contact"].push_back(pair);
+            }
+        }
+        report_progress("contact.selector_preflight", 0);
+        auto selected_bodies = [&](const json& selector) {
+            std::set<int> selected;
+            for (int node : faceset_membership(selector, samples))
+                selected.insert(sample_body[node]);
+            return selected;
+        };
+        // The samples above can PROVE a selector spans two bodies, but cannot
+        // prove absence on a small unsampled patch. Use a conservative bounding
+        // envelope for fixture exclusion and unique load-body attribution.
+        auto possible_bodies = [&](const json& selector) {
+            std::set<int> possible;
+            const auto cloud = faceset_sample_local(selector.value("points", json::array()));
+            const double tol = selector.value("tol_mm", 1.0);
+            std::array<double, 3> normal{};
+            double perpendicular = 0.0;
+            const bool planar = faceset_normal_local(selector, normal, perpendicular);
+            for (int body = 0; body < count; ++body) {
+                if (body_bounds[body].IsVoid()) continue;
+                const auto lo = body_bounds[body].CornerMin(), hi = body_bounds[body].CornerMax();
+                if (planar && cloud.size() >= 3) {
+                    double minimum = 0.0, maximum = 0.0;
+                    for (int axis = 0; axis < 3; ++axis) {
+                        const double a = normal[axis] * (lo.Coord(axis + 1) - cloud[axis]);
+                        const double b = normal[axis] * (hi.Coord(axis + 1) - cloud[axis]);
+                        minimum += std::min(a, b);
+                        maximum += std::max(a, b);
+                    }
+                    if (minimum > perpendicular || maximum < -perpendicular) continue;
+                }
+                for (std::size_t p = 0; p + 2 < cloud.size(); p += 3) {
+                    double distance2 = 0.0;
+                    for (int axis = 0; axis < 3; ++axis) {
+                        const double distance = cloud[p + axis] -
+                            std::clamp(cloud[p + axis], lo.Coord(axis + 1), hi.Coord(axis + 1));
+                        distance2 += distance * distance;
+                    }
+                    if (distance2 <= tol * tol) { possible.insert(body); break; }
+                }
+            }
+            return possible;
+        };
+        auto span = [&](const std::set<int>& selected, const std::string& label,
+                        const char* type) -> json {
+            for (const auto& [a, b] : contact_pairs)
+                if (selected.count(a) && selected.count(b))
+                    return refusal({{"error", "fea_static: " + std::string(type) + " selector " +
+                                              label + " spans contact bodies " +
+                                              std::to_string(a + 1) + " and " + std::to_string(b + 1)},
+                        {"selection_spans_contact", {{"kind", type}, {"selector", label},
+                            {"bodies", {a + 1, b + 1}}, {"source", "cad_boundary_samples"}}}});
+            return nullptr;
+        };
+        if (study.contains("fixtures")) for (std::size_t i = 0; i < study["fixtures"].size(); ++i) {
+            const auto& fixture = study["fixtures"][i];
+            const auto selected = selected_bodies(fixture);
+            if (selected.empty()) return nullptr;
+            if (auto out = span(selected, selector_label(fixture, "fixtures", i), "fixture"); !out.is_null())
+                return out;
+            for (int body : possible_bodies(fixture)) fixed[body] = true;
+        }
+        std::vector<std::array<double, 3>> loads(count);
+        if (study.contains("loads")) for (std::size_t i = 0; i < study["loads"].size(); ++i) {
+            const auto& load = study["loads"][i];
+            const auto& faces = load.value("faces", json::object());
+            const auto selected = possible_bodies(faces);
+            if (auto out = span(selected_bodies(faces), selector_label(faces, "loads", i), "load"); !out.is_null())
+                return out;
+            if (selected.size() != 1 || load.value("type", "force") != "force" ||
+                !load.contains("vector") || !load["vector"].is_array() || load["vector"].size() != 3) {
+                // A pressure resultant or ambiguous body attribution needs the
+                // existing boundary quadrature. Never guess a force for the proof.
+                if (selected.empty()) std::fill(unknown.begin(), unknown.end(), true);
+                else for (int body : selected) unknown[body] = true;
+                continue;
+            }
+            for (int axis = 0; axis < 3; ++axis)
+                loads[*selected.begin()][axis] += load["vector"][axis].get<double>();
+        }
+        report_progress("contact.normal_cone_preflight", 0);
+        for (int body = 0; body < count; ++body) {
+            if (std::getenv("CHUDWARE_FEA_PROFILE")) {
+                std::fprintf(stderr, "[fea preflight] body %d fixed=%d bonded=%d unknown=%d normals=%zu load=[%g,%g,%g]\n",
+                             body + 1, int(fixed[body]), int(bonded[body]), int(unknown[body]),
+                             support[body].springs.size(), loads[body][0], loads[body][1], loads[body][2]);
+                std::fflush(stderr);
+            }
+            if (fixed[body] || bonded[body] || unknown[body]) continue;
+            const auto cone = fea_contact_support_cone(support[body], body, loads[body]);
+            if (!cone.excludes_load) continue;
+            json pair = json::array();
+            if (cone.group >= 0) pair = {cone.group / count + 1, cone.group % count + 1};
+            const std::string axis(1, "XYZ"[cone.separating_axis]);
+            std::string reason = "contact pair " + pair.dump() +
+                " cannot carry the applied resultant: all admissible CAD contact normals share sign in " +
+                axis + "; no equilibrium without friction or an opposing bearing surface. "
+                "Refining the clearance cannot supply the missing reaction";
+            if (std::abs(cone.load_direction[cone.separating_axis]) > 0.99)
+                reason = "contact separated: " + reason;
+            return refusal({{"error", reason}, {"contact", {
+                {"enabled", true}, {"interfaces", interfaces}, {"contact_pressure_reliable", false},
+                {"resolution", {{"resolved", false}, {"reason", reason},
+                                {"required_interface_size_mm", 0}}},
+                {"load_path_refusal", {
+                    {"criterion", "normal_cone_excludes_load"}, {"bodies", pair},
+                    {"axis", axis}, {"supported_arc_deg", cone.supported_arc_deg},
+                    {"normal_range", {{"min", cone.normal_min}, {"max", cone.normal_max}}},
+                    {"load_direction", cone.load_direction},
+                    {"normal_population", "whole_cad_candidate_face_superset"},
+                    {"normal_source", "cad_analytic_face_extrema"}}}}}});
+        }
+    } catch (const Standard_Failure&) {
+        // CAD proof unavailable; normal meshing retains its diagnostic/error path.
+    }
+    report_progress("contact.geometry_preflight_complete", 0);
+    return nullptr;
+}
+
 }  // namespace
 
 static nlohmann::json fea_run_static_impl(
@@ -2497,6 +2860,8 @@ static nlohmann::json fea_run_static_impl(
     }
     if (json failure = validate_mechanical_boundary_conditions(study); !failure.is_null())
         return failure;
+    if (json failure = cad_contact_preflight(study); !failure.is_null())
+        return failure;
     // Content-addressed solve-result cache (sim_cache): HIT returns the stored result
     // (O(load)); ANY input change is a MISS. Tag the result with cache_hit so callers
     // / tests can observe the path honestly.
@@ -2518,6 +2883,7 @@ static nlohmann::json fea_run_static_impl(
             out["input_hash"] = input_hash;
             if (job.cancelled())
                 return json{{"ok", false}, {"error", "fea_static: cancelled"}};
+            report_progress("cache.hit", out.value("n_elems", std::size_t{0}));
             return out;
         }
     }
@@ -2540,11 +2906,14 @@ static nlohmann::json fea_run_static_impl(
     detail::MeshQualityFacts mesh_quality;
     std::string err;
     {
+        report_progress("mesh.begin", 0);
         chudware::prof::phases::PhaseScope _p("mesh");
         if (!resolve_mesh(study, points, tets, nodes_per_elem, mesh_type_used,
                           mesh_note, mesh_advisor, mesh_quality, err))
-            return json{{"ok", false}, {"error", err}};
+            return json{{"ok", false}, {"error", err},
+                        {"provenance", {{"governor", mesh_quality.governor}}}};
     }
+    report_progress("setup", tets.size() / static_cast<std::size_t>(nodes_per_elem));
     if (job.cancelled())
         return json{{"ok", false}, {"error", "fea_static: cancelled"}};
     if (fprof) {
@@ -3554,6 +3923,7 @@ static nlohmann::json fea_run_static_impl(
     }
 
     const auto t_solve0 = std::chrono::steady_clock::now();
+    report_progress("solve", tets.size() / static_cast<std::size_t>(nodes_per_elem));
     chudware::prof::phases::add("setup", std::chrono::duration<double, std::milli>(
                                           t_solve0 - t_setup0).count());
     if (job.cancelled())
@@ -3804,6 +4174,7 @@ static nlohmann::json fea_run_static_impl(
     };
     chudware::prof::phases::add("solve", std::chrono::duration<double, std::milli>(
                                           std::chrono::steady_clock::now() - t_solve0).count());
+    report_progress("solve.complete", tets.size() / static_cast<std::size_t>(nodes_per_elem));
     if (fprof) {
         const auto now = std::chrono::steady_clock::now();
         std::fprintf(stderr, "[fea] %-22s %10.2f ms\n[fea] %-22s %10.2f ms\n",

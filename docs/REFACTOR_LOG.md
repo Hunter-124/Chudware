@@ -3119,3 +3119,70 @@ The unchanged 2000-byte/tet10 mesh ceiling model predicts 0.393374, 0.574384,
 and 0.423266 GiB at the measured counts: 1.4784x, 1.6205x, and 1.4500x actual
 mesh peak RSS. It already meets the 2x mesh-memory bound; it was not substituted
 for the distinct solve-factor model. Evidence is `/tmp/governor-evidence.json`.
+
+## ME 490 independent feature bodies (2026-09-10)
+
+`core/doc/document.cpp` now shares the `new`/`add`/`boss`/`cut` body policy across
+primitives, extrusion, revolution, sweep, and loft. `new` and `merge:false` never
+boolean against existing bodies; additive modes select only actual B-rep contacts,
+including earlier bodies and multiple contacted targets. Unknown modes fail by name.
+Primitive base placement excludes bounding-box tolerance padding so a nominally
+touching `centered:false` boss remains touching. `services/mcp/gsl_tools.py` counts
+the source-solid ordinals of multibody assembly components, not component rows.
+The policy is appended to `contracts/doc_schema.md`. Regressions in
+`core/tests/test_document.cpp`, `services/mcp/test_add_features_shape.py`, and
+`services/mcp/test_gsl_tools.py` defend untouched original volumes, contact-only
+merging, mode rejection, and four-body ring geometry through assembly description.
+The obsolete native test assertion that disjoint bosses share one compound was
+removed; its physical mass/body-count checks remain. Pre-fix box reproduction:
+2 bodies, second original volume 1000→1500 mm³; corrected: 3 bodies, both originals
+remain 1000 mm³. Measured reproduction elapsed time: 98.17→76.60 ms (single runs,
+not a performance benchmark). Both touched MCP files passed: **605 passed in
+10.04s**, through the memory-capped in-process `build-fix` engine.
+
+## ME 490 contact preflight latency and durable progress (2026-09-08)
+
+`core/sim/fea_run.cpp` now checks CAD interfaces, selector spans, and analytic
+plane/cylinder support-normal envelopes before any volume fill. Whole-face
+parameter extrema and conservative selector bounds avoid proving equilibrium
+from incomplete samples; unsupported normal families and ambiguous load
+attribution retain the existing full-system checks. Geometry refusals report
+zero mesh counts and `provenance.governor.mode:"not_started"`. `mesher.cpp/.h`
+separate background-only measured-octave probes from one delivered interface
+band, preserve the final actual count for admission, and disclose optional-probe
+time-budget skips. `sim/progress.h`, `api/libchudware.cpp`, simulation jobs/worker,
+and MCP job readers stream real phase/count records and retain terminal progress,
+with a 30-second heartbeat during opaque fills. `resource_governor.cpp/.h`
+add a thread-local injectable host-memory probe; the cgroup regression now uses
+fixed host memory instead of comparing two racing `/proc/meminfo` snapshots.
+The wire behavior is appended to `contracts/worker_rpc.md`.
+
+Exact original tet4/fineness 0.5/h=8 study, with geometry/output paths redirected
+to `/tmp`: pre-fix **2700.17 seconds, deadline exit 124, no refusal**. Native
+stack samples at 420 and 1801 seconds remained in `local_refine_tets`; instrumented
+development runs also exposed the expensive first background fill. Passing the
+contact band into every disposable governor probe was an additional source-level
+multiplier, not an observed completed probe in that timed-out baseline.
+Corrected asynchronous job **1.0608 seconds wall**, native CAD refusal **0.9105
+seconds**, zero elements/nodes, 0.0702 GiB process peak RSS. Its phase log reaches
+geometry/interface/selector/cone/refusal at **0.042/0.337/0.950/0.952/0.953
+seconds**. A real admissible-load fill ran for 65 seconds and emitted heartbeat
+records at **1.258, 31.261, 61.273 seconds**, then its own worker group was cancelled
+cleanly. Scoped proofs: **11 contact live tests passed in 161.12s** including the
+private stack; **20 job tests passed in 0.73s**; **32 local-band governor assertions
+passed**; final ctest **governor + fea_contact: 2/2 passed in 3.31s**. No user
+document or output-field file was changed.
+
+Gate integration tightened the progress regressions: the MCP partial-results test
+had raced the new startup phase and indexed a nonexistent `pct` before an
+iteration snapshot arrived. It now publishes controlled startup and iteration
+states and checks collection semantics without a child-scheduling race. The
+native worker regression now isolates its cache and checks phase order and
+completed mesh evidence, leaving heartbeat cadence to the injected-clock test
+instead of asserting wall-clock record spacing under gate load. The native
+gate failure did not reproduce in the paired scoped run; the timing-dependent
+assertion was removed, not represented as a reproduced solver failure.
+`sim_results` documents that a phase-only snapshot need not contain a percentage
+or field values. Full scoped files: **114 passed in 295.89s**
+(`services/mcp/test_cad_sim_tools.py`) and **20 passed in 0.64s**
+(`services/sim/test_jobs.py`), through the same 10 GiB `build-fix` wrapper.

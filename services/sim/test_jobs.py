@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import os
 import signal
+import subprocess
+import sys
 import time
 
 import pytest
@@ -330,3 +332,103 @@ def test_unserializable_collect_result_is_returned_not_lost(isolated_registry):
     value = {"ok": True, "peak": float("inf")}
     assert J.save_collected(job_id, value) is value
     assert J.collected(job_id) is None
+
+
+def test_fill_heartbeat_retains_measured_progress(isolated_registry, capsys):
+    """An opaque native fill must not silence or invent progress between callbacks."""
+    job_id = "sim-progress-fill"
+    _insert_job(job_id, state=J.FAILED)
+    now = [0.0]
+    progress = job_worker._Progress(J.job_dir(job_id), job_id, clock=lambda: now[0])
+    progress.emit({"phase": "governor_probe"})
+    assert J.status(job_id)["progress"]["elements"] is None
+    now[0] = 2.0
+    progress.emit({"phase": "background_fill", "elements": 128})
+    now[0] = 3.0
+    progress.emit({"phase": "interface_band_fill"})
+    for instant in (32.9, 33.0, 63.0, 93.0):
+        now[0] = instant
+        progress.heartbeat()
+    observed = J.status(job_id)["progress"]
+    assert observed["phase"] == "interface_band_fill"
+    assert observed["elements"] == 128
+    assert observed["elapsed_s"] == 93.0
+    assert observed["converged"] is False
+    lines = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    assert [row["elapsed_s"] for row in lines] == [0.0, 2.0, 3.0, 33.0, 63.0, 93.0]
+    assert max(b["elapsed_s"] - a["elapsed_s"] for a, b in zip(lines, lines[1:])) <= 60
+    assert all(row["phase"] == "interface_band_fill" and row["elements"] == 128
+               for row in lines[2:])
+    assert {k: v for k, v in lines[-1].items() if k != "partial"} == observed
+
+
+@pytest.mark.parametrize("state", [J.RUNNING, J.FAILED])
+def test_get_job_keeps_last_phase_and_snapshot_time(isolated_registry, state):
+    from mcp.server.fastmcp import FastMCP
+    from services.mcp import cad_doc_tools
+
+    job_id = "sim-progress-refusal"
+    _insert_job(job_id, state=state, pid=os.getpid())
+    J._set(job_id, proc_key=J._proc_key(os.getpid()))
+    progress = job_worker._Progress(J.job_dir(job_id), job_id, clock=lambda: 0.0)
+    progress.emit({"phase": "contact_preflight", "elements": 48})
+    mcp = FastMCP("test-last-sim-phase")
+    cad_doc_tools.register_cad_doc_tools(mcp)
+    result = json.loads(mcp._tool_manager._tools["get_job"].fn(job_id=job_id))
+    assert result["ok"] is (state == J.RUNNING)
+    assert result["progress"]["phase"] == "contact_preflight"
+    assert result["progress"]["elements"] == 48
+    assert result["progress"]["elapsed_s"] == 0.0
+
+
+def test_native_small_study_streams_progress_across_worker_process(
+        isolated_registry, monkeypatch):
+    """Real C ABI callbacks survive the child boundary and reach the durable reader."""
+    monkeypatch.setenv("CHUDWARE_ENGINE_DAEMON", "0")
+    try:
+        J._probe_backend("sim_run_static")
+    except ValueError as exc:
+        pytest.skip(str(exc))
+    job_id = "sim-progress-native"
+    _insert_job(job_id)
+    directory = J.job_dir(job_id)
+    monkeypatch.setenv("CHUDWARE_SIM_CACHE_DIR", str(directory / "cache"))
+    # The worker accepts the engine's tiny inline study. Queue validation normally
+    # requires an exported STEP; bypass only that geometry-preparation boundary.
+    study = {
+        "points": [0, 0, 0, 10, 0, 0, 0, 10, 0, 0, 0, 10],
+        "tets": [0, 1, 2, 3], "nodes_per_elem": 4,
+        "material": {"E_mpa": 200000.0, "nu": 0.3, "yield_mpa": 250.0},
+        "fixtures": [{"points": [[0, 0, 0], [10, 0, 0], [0, 10, 0]],
+                      "tol_mm": 0.01}],
+        "loads": [{"type": "force", "vector": [0, 0, -1],
+                   "faces": {"points": [[10, 0, 0], [0, 10, 0], [0, 0, 10]],
+                             "tol_mm": 0.01}}],
+        "vtu_path": str(directory / "small.vtu"),
+    }
+    (directory / "payload.json").write_text(json.dumps({
+        "stage": "core_rpc", "kind": "fea_static",
+        "payload": {"method": "sim_run_static", "params": {"study": study}},
+    }), encoding="utf-8")
+    with (directory / "worker.log").open("w", encoding="utf-8") as log:
+        child = subprocess.run(
+            [sys.executable, "-m", "services.sim.job_worker", job_id],
+            stdout=log, stderr=subprocess.STDOUT, timeout=90, check=False)
+    log_text = (directory / "worker.log").read_text(encoding="utf-8")
+    assert child.returncode == 0, (
+        log_text, J._read_json(directory / "result.json"))
+    records = [json.loads(line) for line in log_text.splitlines()
+               if line.startswith("{") and '"partial": true' in line]
+    phases = [record["phase"] for record in records]
+    expected = ["starting", "sim_run_static", "mesh.begin", "setup",
+                "solve", "solve.complete"]
+    positions = [phases.index(phase) for phase in expected]
+    assert positions == sorted(positions), records
+    # Completion, not a scheduler deadline, establishes that the measured mesh
+    # crossed the process boundary. Cadence belongs to the injected-clock test.
+    assert records[positions[3]]["elements"] == 1, records
+    state = J.status(job_id)
+    assert state["state"] == J.DONE, state
+    assert state["progress"]["elements"] == 1
+    assert state["progress"]["state"] == "done"
+    assert J.partial(job_id) == records[-1]

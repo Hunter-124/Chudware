@@ -51,6 +51,7 @@ envelope instead of persisting a duplicate study.
 """
 from __future__ import annotations
 
+import ctypes
 import json
 import math
 import os
@@ -252,6 +253,42 @@ def _require_geometry_file(path: Any, label: str) -> str:
     return path
 
 
+def _core_call(method: str, params: dict, emit) -> dict:
+    """Stream the existing thread-local native event hook into this job's spool."""
+    from services.mcp import core_bridge as cb  # noqa: PLC0415
+
+    # Job launch forces the local engine. A daemon call would install the hook in
+    # the wrong process and leave the actual solve silent.
+    if cb.active_daemon_mode():
+        raise RuntimeError("simulation job progress requires the local engine")
+    callback_type = ctypes.CFUNCTYPE(None, ctypes.c_char_p, ctypes.c_void_p)
+    sink = cb._load().chudware_set_event_sink
+    sink.argtypes = [callback_type, ctypes.c_void_p]
+    sink.restype = None
+    callback_error: list[Exception] = []
+
+    def on_event(raw, _user_data):
+        try:
+            event = json.loads(raw)
+            if isinstance(event, dict) and event.get("type") == "sim.progress":
+                emit({key: value for key, value in event.items() if key != "type"})
+        except Exception as exc:
+            # ctypes callbacks cannot propagate an exception across the C ABI.
+            # Retain the first failure and report it once the call returns.
+            if not callback_error:
+                callback_error.append(exc)
+
+    callback = callback_type(on_event)
+    sink(callback, None)
+    try:
+        result = cb.call(method, params)
+        if callback_error:
+            raise RuntimeError(f"simulation progress publication failed: {callback_error[0]}")
+        return result
+    finally:
+        sink(callback_type(), None)
+
+
 def _open_geometry(payload: dict, emit) -> Optional[str]:
     """Open the payload's ``open_step`` into a fresh document in THIS child.
 
@@ -264,9 +301,8 @@ def _open_geometry(payload: dict, emit) -> Optional[str]:
     step = payload.get("open_step")
     if not step:
         return None
-    from services.mcp import core_bridge as cb  # noqa: PLC0415
     emit({"stage": "open_geometry", "note": "loading the exported study solid"})
-    res = cb.call("doc_open", {"path": str(step)}) or {}
+    res = _core_call("doc_open", {"path": str(step)}, emit) or {}
     doc_id = res.get("doc_id")
     if not doc_id:
         raise ValueError(
@@ -281,7 +317,6 @@ def _stage_core_rpc(payload: dict, emit) -> dict:
     ``CHUDWARE_ENGINE_DAEMON=0`` is forced by the launcher so the solve really runs HERE
     and dies with this process.
     """
-    from services.mcp import core_bridge as cb  # noqa: PLC0415
     method = payload.get("method")
     if method not in CORE_RPC_METHODS:
         raise ValueError(f"core_rpc method must be one of {list(CORE_RPC_METHODS)}")
@@ -290,7 +325,7 @@ def _stage_core_rpc(payload: dict, emit) -> dict:
     if doc_id is not None:
         params[_DOC_PARAM] = doc_id
     emit({"stage": method, "note": "engine RPC in flight"})
-    return cb.call(str(method), params)
+    return _core_call(str(method), params, emit)
 
 
 def _n_rigid(freqs) -> int:
@@ -315,11 +350,10 @@ def _stage_modal_rpc(payload: dict, emit) -> dict:
     answer IDENTICAL to the synchronous one instead of making the background path a
     second, weaker physics that silently renumbers modes.
     """
-    from services.mcp import core_bridge as cb  # noqa: PLC0415
     study = payload.get("study")
     solve_n = int(payload.get("solve_n") or 0)
     emit({"stage": "sim_run_modal", "n_modes": solve_n, "note": "eigensolve in flight"})
-    res = cb.call("sim_run_modal", {"study": study, "n_modes": solve_n})
+    res = _core_call("sim_run_modal", {"study": study, "n_modes": solve_n}, emit)
     if not payload.get("widen_free_free") or not res.get("ok"):
         return res
     for _ in range(2):
@@ -328,7 +362,7 @@ def _stage_modal_rpc(payload: dict, emit) -> dict:
         solve_n += 6
         emit({"stage": "sim_run_modal", "n_modes": solve_n,
               "note": "widening the Krylov subspace for the rigid-body cluster"})
-        retry = cb.call("sim_run_modal", {"study": study, "n_modes": solve_n})
+        retry = _core_call("sim_run_modal", {"study": study, "n_modes": solve_n}, emit)
         if not retry.get("ok"):
             break
         res = retry

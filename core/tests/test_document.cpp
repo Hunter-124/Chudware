@@ -277,6 +277,61 @@ TEST_CASE("single-feature part: sketch -> extrude -> exact box") {
     CHECK((hi[2] - lo[2]) == doctest::Approx(D).epsilon(1e-4));
 }
 
+TEST_CASE("solid feature modes preserve independent bodies and merge only contacted bodies") {
+    auto box = [](const char* id, double x, const char* mode) {
+        return json{{"id", id}, {"type", "box"}, {"length", 10.0}, {"width", 10.0},
+                    {"height", 10.0}, {"at", {x, 0.0, 0.0}}, {"mode", mode}};
+    };
+    auto volume = [](const TopoDS_Shape& shape) {
+        GProp_GProps props;
+        BRepGProp::VolumeProperties(shape, props);
+        return props.Mass();
+    };
+    for (double x : {5.0, 10.0, 10.05}) {
+        for (bool merge : {false, true}) {
+            json third = box("third", x, merge ? "new" : "add");
+            third["merge"] = merge;
+            json doc{{"features", json::array({
+                box("first", 0, "new"), box("second", -10, "new"), third})}};
+            CompileResult r = compile_document(doc, json::object());
+            REQUIRE(r.ok);
+            REQUIRE(r.body_count == 3);
+            for (const auto& shape : r.shapes)
+                CHECK(volume(shape) == doctest::Approx(1000));
+        }
+    }
+    // The last body is remote: add must find the earlier touched body, not consume
+    // the unrelated current body. A bridge must merge BOTH contacted bodies.
+    for (double second_x : {30.0, 15.0}) {
+        json doc{{"features", json::array({
+            box("first", 0, "new"), box("second", second_x, "new"),
+            box("third", 7.5, "add")})}};
+        CompileResult r = compile_document(doc, json::object());
+        REQUIRE(r.ok);
+        REQUIRE(r.body_count == (second_x == 30 ? 2 : 1));
+        double total = 0;
+        for (const auto& shape : r.shapes) total += volume(shape);
+        CHECK(total == doctest::Approx(second_x == 30 ? 2750 : 2500));
+    }
+    // A real positive clearance is not contact, even with overlapping AABBs.
+    json doc{{"features", json::array({
+        json{{"id", "pin"}, {"type", "cylinder"}, {"radius", 6.0}, {"height", 127.0},
+             {"mode", "new"}},
+        json{{"id", "ball"}, {"type", "sphere"}, {"radius", 1.0},
+             {"at", {7.05 / std::sqrt(2.0), 7.05 / std::sqrt(2.0), 0.0}}, {"mode", "add"}}})}};
+    CompileResult gap = compile_document(doc, json::object());
+    REQUIRE(gap.ok);
+    CHECK(gap.body_count == 2);
+    doc["features"] = json::array({box("first", 0, "new"),
+                                   box("bad", 5, "neww")});
+    CompileResult invalid = compile_document(doc, json::object());
+    REQUIRE(invalid.statuses.size() == 2);
+    CHECK_FALSE(invalid.statuses[1].ok);
+    CHECK(invalid.statuses[1].error.find("neww") != std::string::npos);
+    REQUIRE(invalid.body_count == 1);
+    CHECK(volume(invalid.shapes.front()) == doctest::Approx(1000));
+}
+
 // 1b. REVOLVE AUTO-CLOSE: an OPEN profile — just the outer-wall line, offset from the
 //     axis — is closed back to the revolve axis so it still makes a solid. Weak local
 //     models routinely sketch the wall but forget the line back down the axis; without
@@ -3107,12 +3162,9 @@ TEST_CASE("eval_measure: face ref carries anchor and polyline") {
     }
 }
 
-// P3: a boolean fuse / boss-merge of two DISJOINT solids (two cylinders placed far apart)
-// leaves a single TopoDS_Compound holding TWO TopAbs_SOLIDs — OCCT does not weld bodies that
-// do not touch. doc_eval_mass must report the PHYSICAL body count (2) by exploding the
-// compound into its connected sub-solids, not the top-level compound count (1). The combined
-// volume/COM were already correct; this locks the body_count + per-body breakdown.
-TEST_CASE("eval_mass counts disconnected sub-solids in a fused compound (not 1)") {
+// Disjoint additive features stay independent, and mass evaluation reports both bodies
+// with their combined volume, centre of mass, and per-body breakdown.
+TEST_CASE("eval_mass counts independent disjoint additive bodies") {
     using chudware::doc::doc_new;
     using chudware::doc::doc_apply_ops;
     using chudware::doc::doc_eval_mass;
@@ -3120,8 +3172,7 @@ TEST_CASE("eval_mass counts disconnected sub-solids in a fused compound (not 1)"
     json nr = doc_new("part", "DisjointFuse");
     const std::string id = nr.at("doc_id").get<std::string>();
 
-    // C1 at the origin; C2 a boss merged in 100mm away (well clear of C1's r=10) -> the
-    // boss FUSES into the running body but the two solids never touch -> a 2-solid compound.
+    // C2 is 100 mm away: add/boss must leave both bodies independent.
     json ops = json::array({
         json{{"op", "add_feature"}, {"feature", {{"type", "cylinder"}, {"name", "C1"},
              {"params", {{"radius", dimv(10)}, {"height", dimv(30)}}}}}},
@@ -3133,9 +3184,6 @@ TEST_CASE("eval_mass counts disconnected sub-solids in a fused compound (not 1)"
     for (const auto& fst : resp["rebuild"]["feature_status"])
         CHECK_MESSAGE(fst.value("ok", false), "feature " << fst.value("id", std::string())
                       << " failed: " << fst.value("error", json(nullptr)).dump());
-    // The compile pipeline still tracks the fused compound as ONE surviving body — that
-    // is the (unchanged) behavior the picking/owner-map relies on.
-    CHECK(resp["tess"]["bodies"].size() == 1);
     // The compile `volume` stat is mesh-based (BRepGProp UseTriangulation over the just-
     // tessellated body — a documented display/stats approximation, see compile_document),
     // so assert it with the same 2% tolerance the other compile-stat volume checks in this

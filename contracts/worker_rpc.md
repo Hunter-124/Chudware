@@ -1409,3 +1409,43 @@ still occurs before solver assembly. The refusal retains mesh counts,
 `mesh_quality`, and `provenance` including measured governor and process-peak
 RSS evidence. The same diagnostic fields survive synchronous contact
 collection and durable `sim_results` failure collection.
+
+## Contact geometry-first admission and durable progress (2026-09-08)
+
+STEP-backed static/contact studies classify declared interfaces and check selector
+spans before volume filling. A CAD support-normal refusal now precedes every
+background probe and interface refinement. The analytic plane/cylinder proof uses
+whole candidate-face normal envelopes, including parameter extrema; conservative
+selector bounds establish fixture exclusion and unique force-body attribution.
+Unsupported CAD normal families or ambiguous load attribution leave the proof
+undecided, retaining the existing mesh/solver checks rather than inventing a
+reaction. Floating bonded clusters remain full-system checks.
+
+A geometry refusal retains `normal_cone_excludes_load` and reports
+`normal_population:"whole_cad_candidate_face_superset"` with
+`normal_source:"cad_analytic_face_extrema"`. Its `n_elems`, `n_nodes`, and
+`mesh_quality` counts are zero; `provenance.governor.mode:"not_started"` and empty
+`probes` explicitly prove no fill ran. No measured closed-fit population or
+interface resolution is fabricated before a mesh exists.
+
+Measured-octave probes for a local contact-size request fill the background only.
+The interface band is filled once at the delivered background size, and its
+actual total element count remains authoritative for solve-memory admission.
+Probe rows additionally expose `elapsed_s` and `phase`
+(`background`, `local_refine`, or multi-body `combined`).
+`provenance.governor` additionally carries `probe_budget_s`, `elapsed_s`,
+`budget_origin`, and `skipped_probes:[{h,predicted_s,remaining_s,reason}]`.
+The optional-probe budget defaults to 60 seconds per mesh operation, shared
+across bodies; `CHUDWARE_MESH_PROBE_BUDGET_S` overrides it, including zero.
+The preceding measured fill duration and count forecast admit optional probes
+against remaining time. This is not cancellation of mandatory bootstrap,
+interface delivery, or the caller's overall study deadline.
+
+The existing C event sink emits `type:"sim.progress"` events with `phase`,
+`elapsed_s`, and `elements`. Simulation workers publish each phase boundary to
+flushed JSON lines in `worker.log` and atomically replace `partial.json`; a
+30-second monotonic heartbeat republishes the current phase during opaque fills
+and solves. `elements` is null until measured, then retains the last actual count.
+Durable job readers and `get_job` expose the final progress record after success
+or refusal as well as during execution, preserving its publication timestamp
+rather than replacing it with polling time.

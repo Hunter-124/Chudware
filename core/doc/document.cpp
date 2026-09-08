@@ -69,6 +69,7 @@
 #include <TopTools_ListIteratorOfListOfShape.hxx>
 #include <TopoDS_Vertex.hxx>
 #include <Bnd_Box.hxx>
+#include <Precision.hxx>
 #include <GCPnts_TangentialDeflection.hxx>
 #include <Standard_Failure.hxx>
 #include <GProp_GProps.hxx>
@@ -1795,6 +1796,57 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
             if (!consumed.count(*it)) return *it;
         return std::string();
     };
+    // Shared solid-feature body policy; see contracts/doc_schema.md "Solid feature modes".
+    auto solid_mode = [](const json& feat, const char* fallback) {
+        std::string mode = feat.value("mode", std::string(fallback));
+        if (mode != "new" && mode != "boss" && mode != "add" && mode != "cut")
+            throw std::runtime_error(feat.value("type", std::string("feature")) +
+                ": unknown mode '" + mode + "'. Solid feature modes: new, add, boss, cut");
+        return feat.value("merge", true) ? mode : std::string("new");
+    };
+    struct BodyTargets {
+        std::vector<std::string> ids;
+        TopoDS_Shape shape;
+    };
+    auto solid_targets = [&](const TopoDS_Shape& tool, const std::string& mode) {
+        BodyTargets targets;
+        if (mode == "new") return targets;  // Never even test existing geometry.
+        if (mode == "cut") {
+            const std::string id = current_solid_id();
+            if (!id.empty()) {
+                targets.ids.push_back(id);
+                targets.shape = require_solid(results, id, "target");
+            }
+            return targets;
+        }
+        Bnd_Box tool_box;
+        BRepBndLib::Add(tool, tool_box, Standard_False);
+        for (const std::string& id : solid_order) {
+            if (consumed.count(id)) continue;
+            const TopoDS_Shape& body = require_solid(results, id, "target");
+            Bnd_Box body_box;
+            BRepBndLib::Add(body, body_box, Standard_False);
+            if (tool_box.IsOut(body_box)) continue;
+            BRepExtrema_DistShapeShape distance(body, tool);
+            if (!distance.IsDone())
+                throw std::runtime_error("add: could not determine contact with body '" + id + "'");
+            if (distance.Value() > Precision::Confusion()) continue;
+            targets.ids.push_back(id);
+            if (targets.shape.IsNull()) {
+                targets.shape = body;
+            } else {
+                if (targets.ids.size() == 2) {
+                    TopoDS_Compound compound;
+                    BRep_Builder builder;
+                    builder.MakeCompound(compound);
+                    builder.Add(compound, targets.shape);
+                    targets.shape = compound;
+                }
+                BRep_Builder().Add(targets.shape, body);
+            }
+        }
+        return targets;
+    };
     // The body a dress/hole/mirror/transform feature targets: an explicit "body"
     // ref or, for canonical features that carry no body ref, the current top body.
     // The body ref may arrive as a bare id string ("f3") OR a canonical body
@@ -3438,14 +3490,30 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                             "params.offset, or use a different datum plane)");
                 }
 
-                results[id] = SolidResult{solid};
-                // Patternable tool: the lofted solid (instance-0 pose), op "add" — so a
-                // loft boss can be a pattern/mirror seed exactly like a revolve boss
-                // (Bug J3: loft previously left tool_body_of unset, so a pattern of a loft
-                // failed with "feature has no patternable geometry").
+                const std::string mode = solid_mode(feat, "new");
+                const BodyTargets targets = solid_targets(solid, mode);
+                TopoDS_Shape out = solid;
+                if (!targets.ids.empty()) {
+                    out = mode == "cut" ? ::geom::cut(targets.shape, solid)
+                                        : ::geom::fuse_unify(targets.shape, solid);
+                    if (out.IsNull())
+                        throw std::runtime_error("loft " + mode + " produced an empty shape");
+                    if (mode == "cut") {
+                        GProp_GProps before, after;
+                        BRepGProp::VolumeProperties(targets.shape, before);
+                        BRepGProp::VolumeProperties(out, after);
+                        if (std::abs(before.Mass() - after.Mass()) < 1e-9)
+                            throw std::runtime_error("loft cut removed no material");
+                    }
+                    consumed.insert(targets.ids.begin(), targets.ids.end());
+                    source_of[id] = targets.ids.front();
+                } else if (mode == "cut") {
+                    throw std::runtime_error("loft: cut mode requires an existing body");
+                }
+                results[id] = SolidResult{out};
                 tool_body_of[id] = solid;
-                feature_op_of[id] = "add";
-                record_tool(id, "add", solid);
+                feature_op_of[id] = mode == "cut" ? "cut" : "add";
+                record_tool(id, mode == "cut" ? "cut" : "add", solid);
                 solid_order.push_back(id);
                 st.ok = true;
 
@@ -3592,8 +3660,8 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                         placed = true;
                     }
                     // (3) The `centered:false` base offset, measured on the UNROTATED
-                    // centred solid's bbox — so the default-axis numbers are bit-identical
-                    // to before — and then carried through the rotation with the body.
+                    // centred solid's unpadded bbox, then carried through the rotation
+                    // with the body.
                     Eigen::Vector3d base_off(0, 0, 0);
                     bool has_base = false;
                     if (!feat.value("centered", true)) {
@@ -3601,6 +3669,9 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                         BRepBndLib::Add(solid, bb);
                         if (!bb.IsVoid()) {
                             double xmn, ymn, zmn, xmx, ymx, zmx;
+                            // Bnd_Box's tolerance padding is not geometry: including it
+                            // lifts a nominally touching base off the target face.
+                            bb.SetGap(0.0);
                             bb.Get(xmn, ymn, zmn, xmx, ymx, zmx);
                             if (type == "box") {
                                 base_off = Eigen::Vector3d((xmx - xmn) / 2.0, (ymx - ymn) / 2.0,
@@ -3648,22 +3719,16 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                     if (placed) solid = ::geom::translate_copy(solid, at);
                 }
 
-                // Apply boss/cut/merge against the running body, matching
-                // engine/doc/features/primitives.py::_apply_boolean: a FIRST primitive (no
-                // body) or merge:false starts a NEW body; otherwise mode "cut" subtracts and
-                // "boss" fuses into the current top body (which is consumed). Previously the
-                // primitive was ALWAYS added as a new body, so e.g. a cylinder with mode:"cut"
-                // left the tool as a 2nd body instead of boring a hole.
-                const std::string pmode = feat.value("mode", std::string("boss"));
-                const bool pmerge = feat.value("merge", true);
-                const std::string ptgt = pmerge ? current_solid_id() : std::string();
+                const std::string pmode = solid_mode(feat, "boss");
+                const BodyTargets targets = solid_targets(solid, pmode);
+                const std::string ptgt = targets.ids.empty() ? std::string() : targets.ids.front();
                 if (ptgt.empty()) {
                     if (pmode == "cut")
                         throw std::runtime_error(type + ": cut mode requires an existing body");
                     results[id] = SolidResult{solid};
                     record_tool(id, "add", solid);
                 } else {
-                    const TopoDS_Shape& target = require_solid(results, ptgt, "target");
+                    const TopoDS_Shape& target = targets.shape;
                     TopoDS_Shape out = (pmode == "cut") ? ::geom::cut(target, solid)
                                                         : ::geom::fuse(target, solid);
                     if (out.IsNull())
@@ -3725,7 +3790,7 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                                 "boss. Check the placement before changing anything else.");
                     }
                     record_tool(id, pmode == "cut" ? "cut" : "add", solid);
-                    consumed.insert(ptgt);
+                    consumed.insert(targets.ids.begin(), targets.ids.end());
                     source_of[id] = ptgt;  // owner-map: result derives from the target body
                     results[id] = SolidResult{out};
                 }
@@ -4089,9 +4154,7 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                 if (prof.empty())
                     throw std::runtime_error("missing string ref 'profile'");
                 const SketchResult& src = require_sketch(results, prof, prof.c_str());
-                // Canonical mode: "cut" subtracts the prism from the current body;
-                // anything else ("new"/"boss"/"add") builds a standalone boss.
-                const std::string mode = feat.value("mode", std::string("new"));
+                const std::string mode = solid_mode(feat, "new");
                 const bool is_cut = (mode == "cut");
                 // Canonical end condition: "blind" (depth), "through_all" (penetrate
                 // the body both ways), "mid_plane" (centered). Simplified shape uses
@@ -4407,17 +4470,10 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                     feature_op_of[id] = "cut";
                     record_tool(id, "cut", solid);
                 } else {
-                    // Boss: with a running body AND merge (default true), FUSE into it
-                    // (SolidWorks "Merge result"); the merged solid replaces the body
-                    // (extrude.py: target + tool_solid). merge:false -> NEW body. The
-                    // SIMPLIFIED flat shape's mode "new" (the C++ default) is an explicit
-                    // standalone boss, so it never merges; only a canonical "boss"/"add"
-                    // mode honours the running-body merge (matches the audit's params.mode).
-                    const bool merge = feat.value("merge", true) &&
-                                       (mode == "boss" || mode == "add");
-                    const std::string mtgt = merge ? current_solid_id() : std::string();
+                    const BodyTargets targets = solid_targets(solid, mode);
+                    const std::string mtgt = targets.ids.empty() ? std::string() : targets.ids.front();
                     if (!mtgt.empty()) {
-                        const TopoDS_Shape& tgt = require_solid(results, mtgt, "target");
+                        const TopoDS_Shape& tgt = targets.shape;
                         TopoDS_Shape out = ::geom::fuse_unify(tgt, solid);
                         if (out.IsNull())
                             throw std::runtime_error("extrude boss fuse produced an empty shape");
@@ -4477,7 +4533,7 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                                        "plane.top. Check which one applies before editing.";
                             throw std::runtime_error(msg);
                         }
-                        consumed.insert(mtgt);
+                        consumed.insert(targets.ids.begin(), targets.ids.end());
                         source_of[id] = mtgt;  // owner-map: merged boss derives from the body
                         results[id] = SolidResult{out};
                     } else {
@@ -4659,17 +4715,9 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                     }
                 }
 
-                // Apply to the running body, matching engine/doc/features/revolve.py:
-                //   mode default "boss"; merge default True. With no existing body OR
-                //   merge=False (SolidWorks "Merge result" unticked) OR mode=="new",
-                //   the revolve is a NEW standalone body (cut errors — needs a body).
-                //   Otherwise it combines with the CURRENT top body the SAME way the
-                //   extrude path does: cut -> target - tool, boss/add -> target + tool;
-                //   the target body is consumed (owner-map derives the result from it).
-                const std::string rmode = feat.value("mode", std::string("boss"));
-                const bool rmerge = feat.value("merge", true);
-                const std::string rtgt =
-                    (rmode == "new" || !rmerge) ? std::string() : current_solid_id();
+                const std::string rmode = solid_mode(feat, "boss");
+                const BodyTargets targets = solid_targets(tool, rmode);
+                const std::string rtgt = targets.ids.empty() ? std::string() : targets.ids.front();
 
                 if (rtgt.empty()) {
                     if (rmode == "cut")
@@ -4677,7 +4725,7 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                             "revolve: cut mode requires an existing body to subtract from");
                     results[id] = SolidResult{tool};
                 } else {
-                    const TopoDS_Shape& target = require_solid(results, rtgt, "target");
+                    const TopoDS_Shape& target = targets.shape;
                     TopoDS_Shape out = (rmode == "cut")
                         ? ::geom::cut(target, tool)
                         : ::geom::fuse(target, tool);
@@ -4691,7 +4739,7 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                         if (std::abs(ga.Mass() - gb.Mass()) < 1e-9)
                             throw std::runtime_error("revolve cut removed no material");
                     }
-                    consumed.insert(rtgt);
+                    consumed.insert(targets.ids.begin(), targets.ids.end());
                     source_of[id] = rtgt;  // owner-map: result derives from the target body
                     results[id] = SolidResult{out};
                 }
@@ -4914,20 +4962,11 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                         "the pipe may self-intersect (profile large for the path's bend "
                         "radius); verify the geometry";
 
-                // Apply the sweep to the running body the SAME way the extrude-boss
-                // path does (Bug H1): canonical sweeps default to mode "boss" (SolidWorks
-                // "Merge result"), so a sweep with a running body fuses INTO it — leaving
-                // ONE solid, not two disjoint bodies (the degenerate two-body result that
-                // also produced a NEGATIVE principal inertia). merge:false or mode:"new"
-                // keeps the sweep as a standalone body. cut subtracts the swept tool from
-                // the current body. (Before this fix the sweep never fused and never
-                // registered a patternable tool — Bug J3 for sweep seeds.)
-                const std::string smode = feat.value("mode", std::string("boss"));
-                const bool smerge = feat.value("merge", true) &&
-                                    (smode == "boss" || smode == "add" || smode == "cut");
-                const std::string stgt = smerge ? current_solid_id() : std::string();
+                const std::string smode = solid_mode(feat, "boss");
+                const BodyTargets targets = solid_targets(solid, smode);
+                const std::string stgt = targets.ids.empty() ? std::string() : targets.ids.front();
                 if (!stgt.empty()) {
-                    const TopoDS_Shape& tgt = require_solid(results, stgt, "target");
+                    const TopoDS_Shape& tgt = targets.shape;
                     TopoDS_Shape out = (smode == "cut")
                         ? ::geom::cut(tgt, solid)
                         : ::geom::fuse_unify(tgt, solid);
@@ -4941,10 +4980,12 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                         if (std::abs(gsa.Mass() - gsb.Mass()) < 1e-9)
                             throw std::runtime_error("sweep cut removed no material");
                     }
-                    consumed.insert(stgt);
+                    consumed.insert(targets.ids.begin(), targets.ids.end());
                     source_of[id] = stgt;  // owner-map: result derives from the body
                     results[id] = SolidResult{out};
                 } else {
+                    if (smode == "cut")
+                        throw std::runtime_error("sweep: cut mode requires an existing body");
                     results[id] = SolidResult{solid};
                 }
                 // Patternable tool: the swept solid (instance-0 pose), op follows the

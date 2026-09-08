@@ -72,6 +72,12 @@ struct HostMem {
 // GlobalMemoryStatusEx, macOS sysctl+host_statistics; zeros when unknowable).
 HostMem host_mem();
 
+// Override the current thread's host-memory source for deterministic resource
+// policy replay. nullptr restores the live OS probe; returns the previous source
+// so a scoped caller can restore it without affecting concurrent studies.
+using HostMemoryProbe = HostMem (*)();
+HostMemoryProbe set_host_memory_probe(HostMemoryProbe probe);
+
 // Live process resident set size in bytes (0 when unknowable). Used by plan_for
 // so the grade accounts for what this process already holds, not just host free.
 uint64_t process_rss_bytes();

@@ -8136,8 +8136,8 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
         if snap is None:
             return _dumps({"ok": False, "error": f"unknown job_id {job_id!r}"})
         out = {"ok": True, "job_id": job_id, "status": snap["status"], "kind": snap["kind"]}
-        if snap["status"] == "running" and snap.get("progress"):
-            progress = dict(snap["progress"])  # live {pct, stage, text} for long OpenFOAM runs
+        if snap.get("progress"):
+            progress = dict(snap["progress"])  # retain the final phase on done/error, too
             # LBM reports progress via a file the engine writes each checkpoint — fold it in so the
             # built-in CFD path gets an ETA-style readout like OpenFOAM (report footnote).
             pf = progress.pop("progress_file", None)

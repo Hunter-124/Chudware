@@ -13,9 +13,11 @@
 #include <cmath>
 #include <filesystem>
 #include <string>
+#include <optional>
 
 #include <nlohmann/json.hpp>
 
+#include "environment_test_support.h"
 #include "sim/fea_adaptive.h"
 #include "sim/fea_run.h"
 #include "sim/mesh_size_band.h"
@@ -238,4 +240,66 @@ TEST_CASE("the element budget never coarsens past four elements across the thinn
   MESSAGE("bulky band: base=" << bulky.base << " note=" << bulky.note);
   CHECK(bulky.base > 12.0);            // coarsened well past the 8.25 mm auto size
   CHECK(bulky.base <= 25.0 * 1.001);   // and never past its own floor (100/4)
+}
+
+TEST_CASE("measured governor skips expired probes and delivers the local band once") {
+  struct Environment {
+    const char *name;
+    std::optional<std::string> saved;
+    Environment(const char *key, const char *value) : name(key) {
+      if (const char *old = std::getenv(key)) saved = old;
+      chudware::test::setEnvironment(key, value);
+    }
+    ~Environment() {
+      chudware::test::setOrUnsetEnvironment(
+          name, saved ? saved->c_str() : nullptr);
+    }
+  };
+  // Zero deterministically exhausts the optional budget without a sleep or a
+  // machine-speed assertion. The bootstrap and actual local delivery must
+  // still happen; a skipped optional probe must not become a mesh refusal.
+  const Environment enabled("CHUDWARE_GOVERNOR", "1");
+  const Environment memory("CHUDWARE_MEM_CAP_GB", "3");
+  const Environment probe_time("CHUDWARE_MESH_PROBE_BUDGET_S", "0");
+  const TopoDS_Shape cube =
+      BRepPrimAPI_MakeBox(gp_Pnt(0, 0, 0), 10.0, 10.0, 10.0).Shape();
+  MeshOptions options;
+  options.order = 2;
+  options.target_size_mm = 0.5;
+  const SizeBand band = resolve_size_band(cube, options);
+  REQUIRE_MESSAGE(band.ok, band.error);
+  REQUIRE(band.memory_coarsened);
+  const std::string step = write_step(cube, "chudware_governor_band.step");
+  SUBCASE("background only") {}
+  SUBCASE("local contact band") {
+    options.local_refine.points = {5.0, 5.0, 0.0};
+    options.local_refine.size_mm = 0.4;
+    options.local_refine.band_mm = 1.2;
+    options.local_refine.max_depth_mm = 1.2;
+    options.local_refine.label = "contact regression";
+  }
+  const MeshOut mesh = mesh_step(step, options);
+  std::filesystem::remove(step);
+  REQUIRE_MESSAGE(mesh.ok, mesh.error);
+  REQUIRE(mesh.governor_skipped_probes.size() == 1);
+  const auto &skipped = mesh.governor_skipped_probes.front();
+  CHECK(skipped.h < mesh.char_len_mm);
+  CHECK(skipped.predicted_s > skipped.remaining_s);
+  CHECK(skipped.remaining_s == 0.0);
+  CHECK(skipped.reason == "predicted_probe_exceeds_remaining_budget");
+  CHECK(mesh.governor_elapsed_s > mesh.governor_probe_budget_s);
+  REQUIRE(mesh.governor_probes.size() ==
+          (options.local_refine.active() ? 2u : 1u));
+  CHECK(std::string(mesh.governor_probes.front().phase) == "background");
+  // The final count, not a hypothetical background-only solve, is the
+  // admission evidence even when the optional budget was already spent.
+  CHECK(mesh.governor_probes.back().elems ==
+        static_cast<uint64_t>(mesh.n_elems));
+  if (options.local_refine.active()) {
+    CHECK(std::string(mesh.governor_probes.back().phase) == "local_refine");
+    CHECK(mesh.char_len_mm == mesh.governor_probes.front().h);
+    CHECK(mesh.local_refine_achieved_mm > 0.0);
+    CHECK(mesh.local_refine_achieved_mm <=
+          kLocalContractSlack * options.local_refine.size_mm);
+  }
 }

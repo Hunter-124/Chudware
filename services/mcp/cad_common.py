@@ -2634,7 +2634,7 @@ def durable_job_snapshot(job_id: str) -> Optional[dict]:
         rec["error"] = st.get("error") or f"solve {state}"
     else:
         rec["status"] = "running"
-        rec["progress"] = {**rec["progress"], "elapsed_s": st.get("elapsed_s")}
+        rec["progress"].setdefault("elapsed_s", st.get("elapsed_s"))
     return rec
 
 

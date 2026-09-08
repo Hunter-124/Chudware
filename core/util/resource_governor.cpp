@@ -27,6 +27,7 @@ namespace chudware::governor {
 namespace {
 
 constexpr uint64_t kGB = 1024ull * 1024ull * 1024ull;
+thread_local HostMemoryProbe host_memory_probe = nullptr;
 
 double env_f(const char* name, double fallback) {
     const char* e = std::getenv(name);
@@ -465,7 +466,14 @@ double MeshCountModel::predict(double target_h) const {
     return elems * std::pow(h / target_h, exponent);
 }
 
+HostMemoryProbe set_host_memory_probe(HostMemoryProbe probe) {
+    const auto previous = host_memory_probe;
+    host_memory_probe = probe;
+    return previous;
+}
+
 HostMem host_mem() {
+    if (host_memory_probe) return host_memory_probe();
     HostMem m;
 #if defined(_WIN32)
     MEMORYSTATUSEX st;

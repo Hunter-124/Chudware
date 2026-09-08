@@ -7,6 +7,8 @@ Contract with :mod:`services.sim.jobs` (the parent-side registry):
 * streams ``<spool>/<job_id>/partial.json`` — every snapshot carries ``"partial": true``,
   so a reader can never mistake it for a converged answer
 * writes ``<spool>/<job_id>/result.json`` ATOMICALLY (tmp + os.replace) exactly once
+* logs each phase snapshot as one JSON line and heartbeats the last real state every
+  30 seconds, even while a native fill/solve has released the GIL
 
 The stage runs on a thread, not the main thread, on purpose: an FEA solve is one ctypes
 call into ``libchudware`` and a Python signal handler cannot run while the interpreter is
@@ -34,6 +36,43 @@ def _atomic_write(path: Path, obj: dict) -> None:
     os.replace(tmp, path)
 
 
+_HEARTBEAT_S = 30.0
+
+
+class _Progress:
+    """Serialize phase events and heartbeat snapshots through one atomic publisher."""
+
+    def __init__(self, directory: Path, job_id: str, *, clock=None):
+        self.path = directory / "partial.json"
+        self.job_id = job_id
+        self.clock = clock or time.monotonic
+        self.started = self.clock()
+        self.last_write = self.started
+        self.latest: dict = {"phase": "starting", "elements": None}
+        # SIGTERM may interrupt the main thread during its heartbeat publication.
+        self.lock = threading.RLock()
+
+    def emit(self, snapshot: dict) -> None:
+        if not isinstance(snapshot, dict):
+            raise ValueError("partial snapshot must be an object")
+        with self.lock:
+            self.latest.update(snapshot)
+            if "stage" in snapshot and "phase" not in snapshot:
+                self.latest["phase"] = snapshot["stage"]
+            now = self.clock()
+            body = dict(self.latest)
+            body.update(partial=True, converged=False, job_id=self.job_id,
+                        elapsed_s=round(now - self.started, 3))
+            _atomic_write(self.path, body)
+            print(json.dumps(body, allow_nan=False), flush=True)
+            self.last_write = now
+
+    def heartbeat(self) -> None:
+        with self.lock:
+            if self.clock() - self.last_write >= _HEARTBEAT_S:
+                self.emit({})
+
+
 def main(argv: list) -> int:
     if len(argv) < 2:
         print("usage: python -m services.sim.job_worker <job_id>", file=sys.stderr)
@@ -49,24 +88,9 @@ def main(argv: list) -> int:
                       {"error": f"unknown stage {stage_name!r}", "done_at": time.time()})
         return 2
 
-    partial_path = d / "partial.json"
-    t0 = time.time()
-    latest: dict = {}
-    lock = threading.Lock()
-
-    def emit(snapshot: dict) -> None:
-        """Publish a labelled, finite partial snapshot."""
-        if not isinstance(snapshot, dict):
-            raise ValueError("partial snapshot must be an object")
-        with lock:
-            latest.update(snapshot)
-            body = dict(latest)
-            body.update(partial=True, converged=False, job_id=job_id,
-                        elapsed_s=round(time.time() - t0, 3))
-            try:
-                _atomic_write(partial_path, body)
-            except (OSError, TypeError, ValueError):
-                pass
+    progress = _Progress(d, job_id)
+    emit = progress.emit
+    emit({})
 
     # Solvers that publish live progress to a file of their own (the LBM CFD path writes
     # {pct, step, n_steps}) get it folded into the same partial channel.
@@ -119,8 +143,9 @@ def main(argv: list) -> int:
 
     threading.Thread(target=_run, name=f"sim-stage-{stage_name}", daemon=True).start()
     while not finished.wait(0.25):
-        pass
+        progress.heartbeat()
     stop.set()
+    emit({"state": "failed" if outcome.get("error") else "done"})
 
     outcome["done_at"] = time.time()
     _atomic_write(d / "result.json", outcome)

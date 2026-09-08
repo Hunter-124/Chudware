@@ -4599,9 +4599,10 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
         synchronous tool returns. On a job that has NOT finished this REFUSES — it will not
         hand back half a solution dressed as an answer.
 
-        partial=True: the last snapshot the solver published, always tagged
-        `partial: true, converged: false`. When the stage published nothing (a direct FEA
-        solve has no meaningful intermediate state) this says so instead of inventing one.
+        partial=True: the last progress or solver-intermediate snapshot, always tagged
+        `partial: true, converged: false`. A phase-only record can have no percentage or
+        field values: it describes work in flight, not a partial solution. If the stage
+        published nothing, this says so instead of inventing a snapshot.
 
         The collect stage runs exactly ONCE per job however many times it is polled and from
         however many processes, so a solved study is written into the document once.

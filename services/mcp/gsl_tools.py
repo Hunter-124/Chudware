@@ -432,7 +432,9 @@ def _digest(doc_id: str) -> dict:
 
     return {
         "part": (tree.get("tree") or {}).get("name"),
-        "bodies": len(bodies),
+        # Assembly rows are components; a multibody component carries one source
+        # ordinal per solid. Surface-only rows still represent one body.
+        "bodies": sum(max(1, len(body["source_ordinals"])) for body in bodies),
         "bbox_mm": bbox.get("size"),
         "faces": len(faces), "edges": len(edges),
         "symmetry": part_symmetry,

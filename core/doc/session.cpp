@@ -14208,6 +14208,8 @@ json project_external_refs(const json& doc, const chudware::geom::SketchPlane& p
     json all_entities = json::array();
     json sources = json::array();
     bool any_approx = false;
+    TopoDS_Shape projection_body;
+    double projection_diag = 0.0;
 
     auto append_entities = [&](const std::vector<chudware::doc::ProjectedEntity>& pes) {
         for (const chudware::doc::ProjectedEntity& pe : pes) all_entities.push_back(pe.entity);
@@ -14252,8 +14254,24 @@ json project_external_refs(const json& doc, const chudware::geom::SketchPlane& p
         if (r.shapes.empty())
             throw OpError("invalid_op", "sketch projection: no solid bodies",
                           {{"reason", "no solid bodies"}});
-        const TopoDS_Shape& body = r.shapes.back();  // multi-body best-match deferred (as ref)
-        double diag = sim_bbox_diag(body);
+        // doc_query mints selectors over the whole document. Resolve against that
+        // same topology domain, not the last body: a later independent extrusion
+        // must not hide the earlier body supplying an associative conversion.
+        if (projection_body.IsNull()) {
+            if (r.shapes.size() == 1) {
+                projection_body = r.shapes.front();
+            } else {
+                TopoDS_Compound compound;
+                BRep_Builder builder;
+                builder.MakeCompound(compound);
+                for (const TopoDS_Shape& shape : r.shapes)
+                    if (!shape.IsNull()) builder.Add(compound, shape);
+                projection_body = compound;
+            }
+            projection_diag = sim_bbox_diag(projection_body);
+        }
+        const TopoDS_Shape& body = projection_body;
+        const double diag = projection_diag;
         json sel = ref.contains("selector") ? ref["selector"] : json(nullptr);
         std::string kind = ref.value("kind", std::string());
 
@@ -14453,10 +14471,9 @@ void refresh_sketch_external_refs(json& doc, CompileCache* cache,
     }
     if (!any) return;
 
-    // One compile of the whole doc serves every ref (selectors resolve against the LAST
-    // body, same convention as sketch_convert creation / doc_sketch_project_entities) —
-    // and every per-sketch plane resolution below (passed as `&pre`). Runs through the
-    // session's incremental-rebuild cache when the caller supplied it.
+    // One compile of the whole doc serves every ref and per-sketch plane resolution
+    // (passed as `&pre`). Projection resolves over all surviving bodies, matching
+    // doc_query's selector domain. Use the session's incremental cache when supplied.
     CompileResult pre = compile_document(doc, env_from_doc(doc), cache, quality);
     IdGen gen(doc);
     for (json& f : doc["features"]) {

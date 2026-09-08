@@ -265,14 +265,15 @@ TEST_CASE("cgroup budget term counts anon usage, not page cache") {
     std::printf("[governor] cgroup term: not a cgroup platform (SKIP) wall=%.3f ms\n",
                 wall_ms(t0));
 #else
+    const auto previous_probe = set_host_memory_probe(
+        +[] { return HostMem{32 * kGiB, 24 * kGiB}; });
+    struct RestoreProbe {
+        HostMemoryProbe previous;
+        ~RestoreProbe() { set_host_memory_probe(previous); }
+    } restore_probe{previous_probe};
     chudware::test::setOrUnsetEnvironment("CHUDWARE_GOVERNOR", nullptr);
     chudware::test::setOrUnsetEnvironment("CHUDWARE_MEM_CAP_GB", nullptr);
     const HostMem m = host_mem();
-    if (m.total == 0) {
-        std::printf("[governor] cgroup term: platform unknown (SKIP) wall=%.3f ms\n",
-                    wall_ms(t0));
-        return;
-    }
     // Open the host terms as wide as this machine allows, so whatever binds below
     // them is the cgroup term and the pins do not depend on the box's free RAM.
     chudware::test::setOrUnsetEnvironment("CHUDWARE_MEM_FRAC", "1.0");
@@ -283,7 +284,7 @@ TEST_CASE("cgroup budget term counts anon usage, not page cache") {
     // (a) No control files at all: uncapped, the baseline every case compares to.
     const FakeCgroup none("uncapped");
     const uint64_t base = none.budget();
-    CHECK(base > 0);
+    CHECK(base == 24 * kGiB);
 
     // (b) Files present but no finite limit: memory.high "max" must not win the
     // min, and a huge memory.current/anon must not shrink anything.

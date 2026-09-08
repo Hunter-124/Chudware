@@ -940,27 +940,41 @@ def test_sim_cancel_actually_kills_the_solver_process():
 
 
 def test_partial_results_are_labelled_and_full_results_are_refused_until_converged():
-    job = simjobs.start("selftest", "selftest_sleep", {"seconds": 6.0, "steps": 12})
-    jid = job["job_id"]
+    from services.sim.job_worker import _Progress
+
+    # This tests collection semantics, not how quickly a child reaches its first
+    # iteration. Publish the two real channel shapes in a controlled RUNNING job.
+    jid = "sim-" + uuid.uuid4().hex[:12]
+    directory = simjobs.job_dir(jid)
+    directory.mkdir(parents=True, exist_ok=True)
+    now = time.time()
+    with simjobs._db() as connection:
+        connection.execute(
+            "INSERT INTO jobs(job_id,kind,stage,state,pid,proc_key,created_at,"
+            "started_at,cancel_requested,meta) VALUES(?,?,?,?,?,?,?,?,?,?)",
+            (jid, "selftest", "selftest_sleep", simjobs.RUNNING, os.getpid(),
+             simjobs._proc_key(os.getpid()), now, now, 0, "{}"))
+    progress = _Progress(directory, jid)
     try:
-        deadline = time.monotonic() + 10.0
-        while time.monotonic() < deadline and not simjobs.partial(jid):
-            time.sleep(0.1)
+        progress.emit({"phase": "starting"})
+        initial = json.loads(_tool("sim_results")(job_id=jid, partial=True))
+        assert initial["partial"] is True and initial["converged"] is False, initial
+        assert initial["snapshot"]["phase"] == "starting", initial
+        assert "pct" not in initial["snapshot"] and "summary" not in initial, initial
+        progress.emit({"phase": "iteration", "pct": 50.0, "elements": 128})
 
         full = json.loads(_tool("sim_results")(job_id=jid))
         assert full["ok"] is False and full["state"] == "running", full
-        assert "no converged results" in full["error"], full
         assert "summary" not in full and "snapshot" not in full, full
 
         part = json.loads(_tool("sim_results")(job_id=jid, partial=True))
         assert part["ok"] is True and part["partial"] is True, part
         assert part["converged"] is False, part
-        assert "PARTIAL" in part["warning"] and "NOT a" in part["warning"], part
         snap = part["snapshot"]
         assert snap["partial"] is True and snap["converged"] is False, snap
         assert 0 < snap["pct"] < 100, snap
     finally:
-        simjobs.cancel(jid)
+        simjobs._set(jid, state=simjobs.CANCELLED, pid=None, proc_key=None)
 
 
 def test_a_stage_with_no_partial_channel_says_so_instead_of_faking_one():

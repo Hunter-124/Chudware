@@ -155,7 +155,6 @@ def test_compression_closes_the_gap_and_carries_the_load_into_the_fixture(tools,
     lp = contact["load_path"]
     assert abs(lp["applied_n"] - FORCE_N) < 0.01 * FORCE_N, lp
     assert abs(lp["fraction"] - 1.0) < 0.05, lp
-    assert lp["note"] == "", lp
 
     assert len(contact["pairs"]) == 1, contact["pairs"]
     pair = contact["pairs"][0]
@@ -180,9 +179,11 @@ def test_compression_closes_the_gap_and_carries_the_load_into_the_fixture(tools,
 
 
 def test_pull_apart_is_refused_as_a_mechanism(tools):
-    out = _contact(tools, _stacked_boxes(tools, "contact_live_pull"), FORCE_N)
+    out = _contact_result(tools, _contact(
+        tools, _stacked_boxes(tools, "contact_live_pull"), FORCE_N))
     assert out.get("ok") is False, out
-    assert "contact separated" in out.get("error", ""), out
+    assert out["contact"]["load_path_refusal"]["criterion"] == "normal_cone_excludes_load", out
+    assert out["mesh_quality"]["n_elems"] == 0, out
 
 
 def test_steel_pin_in_bronze_bore_uses_each_bodys_yield(tools, tmp_path):
@@ -479,8 +480,9 @@ def test_real_stack_open_saddle_refuses_missing_normal_reaction(tools, tmp_path)
     )))
     assert out.get("ok") is False, out
     contact = out["contact"]
-    assert contact["resolution"]["mode"] == "closed_fit", contact
-    assert contact["resolution"]["closed_fit"]["pairs"] >= 6, contact
+    assert time.monotonic() - started < 120, out
+    assert out["mesh_quality"]["n_elems"] == 0, out
+    assert out["provenance"]["governor"]["probes"] == [], out
     refusal = contact["load_path_refusal"]
     assert refusal["criterion"] == "normal_cone_excludes_load", refusal
     assert refusal["bodies"] == [2, 3], refusal

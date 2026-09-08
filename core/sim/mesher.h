@@ -23,9 +23,8 @@ namespace chudware::sim {
 // contact guard's own measure is a median over candidate pairs rather than a
 // maximum, so a little slack is honest. 1.5x is not: at 2x the ratio the
 // resolution guard applies has already moved a whole factor, which is how a
-// 0.35 mm request solved a 1.299 mm interface. Shared, so the mesher's own
-// last-resort re-fill (fill_with_recovery) and fea_run's study refusal cannot
-// disagree about whether a contract was met.
+// 0.35 mm request solved a 1.299 mm interface. Shared by the mesher and the
+// study refusal so they cannot disagree about whether the contract was met.
 constexpr double kLocalContractSlack = 1.5;
 
 // Optional learned-advisor telemetry. Absence means the study did not request
@@ -58,6 +57,15 @@ struct MeshGovernorProbe {
   double rss_gb = 0.0;
   double predicted_elems = 0.0; // 0 = unmeasured bootstrap
   double exponent = 2.0;
+  double elapsed_s = 0.0; // wall time of this fill, including recovery
+  const char *phase = "background"; // background, local_refine, or combined
+};
+
+struct MeshGovernorSkippedProbe {
+  double h = 0.0;
+  double predicted_s = 0.0;
+  double remaining_s = 0.0;
+  std::string reason;
 };
 
 struct MeshOut {
@@ -65,6 +73,10 @@ struct MeshOut {
   std::vector<int> tets;      // m*K flat, 0-based; K is nodes_per_elem
   double char_len_mm = 0.0;
   std::vector<MeshGovernorProbe> governor_probes;
+  std::vector<MeshGovernorSkippedProbe> governor_skipped_probes;
+  double governor_probe_budget_s = 0.0;
+  double governor_elapsed_s = 0.0;
+  const char *governor_budget_origin = "default";
   int n_nodes = 0;
   int n_elems = 0;
   int nodes_per_elem = 4; // 4 (tet4) or 10 (tet10)
@@ -260,10 +272,9 @@ struct MeshOut {
 // It is a CONTRACT, like target_size_mm: the element-count governor never coarsens
 // it (see mesh_size_band.cpp — the governor moves the background size only), and a
 // fill that cannot deliver it fails the study rather than silently returning the
-// coarse mesh. What it CANNOT do is beat the fill's own lattice: polymesh's graded
-// tet places local children at h/2 and h/4 of the background cell, so a size below
-// background/4 lowers the background as far as 4x the requested local size and says
-// so in the mesh note.
+// coarse mesh. The fill's lattice only places local children at h/2 and h/4;
+// longest-edge bisection delivers smaller requests at the selected background
+// size, once, and reports the achieved local size for downstream refusal.
 struct MeshLocalRefine {
   std::vector<double> points; // n*3 flat, millimetres, world coordinates
   double size_mm = 0.0;       // requested local element size, mm (0 = no request)

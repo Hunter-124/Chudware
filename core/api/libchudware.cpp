@@ -112,6 +112,7 @@
 #include "sim/numpy_rng.h"
 #include "sim/overlay.h"
 #include "sim/sim_cancel.h"
+#include "sim/progress.h"
 #include "firmware/firmware_rpc.h"
 #include "sourcing/sourcing.h"
 #include "ecad/container.h"
@@ -585,10 +586,10 @@ CHUDWARE_API const char* chudware_build_id(void) { return CHUDWARE_HOSTD_BUILD_I
 CHUDWARE_API void chudware_free(char* s) { std::free(s); }
 
 
-// Live event streaming: bridge the flat C callback to the core's thread-local run-event sink
-// (agent::set_stream_event_sink). Called on the host/daemon dispatch thread right before an
-// agent_* chudware_call so run events surface AS THEY HAPPEN; cleared (cb=NULL) right after.
+// Live event streaming: one thread-local C hook for agent events and simulation phases.
+// Armed on the dispatch/solver thread before chudware_call; cleared immediately after.
 CHUDWARE_API void chudware_set_event_sink(void (*cb)(const char* event_json, void* ud), void* ud) {
+    chudware::sim::set_progress_sink(cb, ud);
     if (cb) {
         chudware::agent::set_stream_event_sink([cb, ud](const nlohmann::json& ev) {
             const std::string s = ev.dump();

@@ -637,6 +637,32 @@ def live():
 
 
 @enginetest
+@pytest.mark.parametrize("policy", [{"mode": "new"}, {"merge": False},
+                                  {"mode": "add", "merge": False}])
+def test_live_new_body_preserves_touching_and_overlapping_bodies(policy):
+    from services.agent.agent_turn import _bind_tool
+    add = _bind_tool("add_features")
+    doc = _cb.call("doc_new", {"name": "independent_body"})["doc_id"]
+    def box(x, **options):
+        return {"type": "box", "params": {"length": 10, "width": 10, "height": 10},
+                "at": [x, 0, 0], **options}
+    try:
+        first = json.loads(add(doc_id=doc, ops=[box(0, merge=False), box(10, merge=False)]))
+        assert first["ok"] and first["body_count"] == 2, first
+        before = [_cb.call("eval_mass", {"doc_id": doc, "body": i})["volume_mm3"]
+                  for i in (1, 2)]
+        added = json.loads(add(doc_id=doc, ops=[box(15, **policy)]))
+        assert added["ok"] and added["body_count"] == 3, added
+        after = [_cb.call("eval_mass", {"doc_id": doc, "body": i})["volume_mm3"]
+                 for i in (1, 2)]
+        assert before == pytest.approx([1000, 1000])
+        assert after == pytest.approx(before)
+        assert added["volume_mm3"] == pytest.approx(3000)
+    finally:
+        _cb.call("doc_close", {"doc_id": doc})
+
+
+@enginetest
 def test_live_canonical_call_reports_no_interpretation(live):
     add_features, doc = live
     r = json.loads(add_features(doc_id=doc, ops=[{"op": "add_feature", "feature": {

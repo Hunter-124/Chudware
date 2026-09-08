@@ -799,6 +799,54 @@ def test_dod4_health_text_state_c_conflicting():
     )
 
 
+def test_hinge_ring_new_body_survives_assembly_description(tmp_path, monkeypatch):
+    """The ring's 0.050 mm bore clearance must not absorb the existing pin."""
+    monkeypatch.setenv("CHUDWARE_PROJECT_SAVE_DIR", str(tmp_path))
+    docs = []
+    try:
+        part = cb.call("doc_new", {"name": "hinge_ring_body_policy"})["doc_id"]
+        docs.append(part)
+        base = [
+            {"type": "box", "name": "Leaf", "merge": False, "at": [880, 0, 510],
+             "params": {"length": 10, "width": 127, "height": 10}},
+            {"type": "cylinder", "name": "Bushing", "merge": False, "at": [940, 0, 510],
+             "axis": [0, 1, 0], "params": {"radius": 3, "height": 127}},
+            {"type": "cylinder", "name": "Pin", "merge": False, "at": [910, 0, 510],
+             "axis": [0, 1, 0], "params": {"radius": 6, "height": 127}},
+        ]
+        added, _ = _call("add_features", {"doc_id": part, "ops": base})
+        assert added["ok"] and added["body_count"] == 3, added
+        before = [cb.call("eval_mass", {"doc_id": part, "body": i})["volume_mm3"]
+                  for i in (1, 2, 3)]
+        ring, _ = _call("add_features", {"doc_id": part, "ops": [
+            {"type": "cylinder", "name": "RingOuter", "mode": "new",
+             "axis": [0, 1, 0], "at": [910, 0, 510],
+             "params": {"radius": 8.55, "height": 127}},
+            {"type": "cylinder", "name": "RingBore", "mode": "cut",
+             "axis": [0, 1, 0], "at": [910, 0, 510],
+             "params": {"radius": 6.05, "height": 127}},
+        ]})
+        assert ring["ok"] and ring["body_count"] == 4, ring
+        after = [cb.call("eval_mass", {"doc_id": part, "body": i})["volume_mm3"]
+                 for i in (1, 2, 3)]
+        assert after == pytest.approx(before)
+        described, _ = _call("describe_part", {"doc_id": part})
+        assert described["digest"]["bodies"] == 4
+        path = tmp_path / "hinge.step+"
+        cb.call("doc_save", {"doc_id": part, "path": str(path)})
+        assembly, _ = _call("new_assembly", {"name": "hinge_ring_assembly"})
+        did = assembly["doc_id"]
+        docs.append(did)
+        inserted, _ = _call("add_features", {"doc_id": did, "ops": [{
+            "op": "asm_insert_component", "source": {"path": str(path)},
+            "name": "Hinge", "fixed": True}]})
+        assert inserted["ok"], inserted
+        described, _ = _call("describe_part", {"doc_id": did})
+        assert described["ok"] and described["digest"]["bodies"] == 4, described
+    finally:
+        for did in reversed(docs):
+            cb.call("doc_close", {"doc_id": did})
+
 def test_assembly_native_roundtrip_keeps_live_geometry(tmp_path, monkeypatch):
     """Assembly source has no features: bounds/mass/import must use component solids."""
     monkeypatch.setenv("CHUDWARE_PROJECT_SAVE_DIR", str(tmp_path))

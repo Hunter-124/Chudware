@@ -614,3 +614,30 @@ component's local frame. See `doc_ops.md` §10 and `worker_rpc.md` §29 for moti
 drive resolution, composition, refusal and pose evidence semantics. This does
 not change sketch angle constraint arities or make a scalar assembly angle mate
 itself a five-constraint revolute joint.
+
+## Solid feature modes (2026-09-10)
+
+This is the authoritative body policy for `box`, `cylinder`, `sphere`, `cone`,
+`torus`, `extrude`, `revolve`, `sweep`, and `loft`, including features submitted
+through `add_features`. Options live in `params`; the feature-op API also accepts
+them at feature level and hoists them into `params`.
+
+| Mode | Body semantics |
+|---|---|
+| `new` | Create an independent body. Never boolean with existing bodies, even when fully contained, interpenetrating, coincident, or touching. Existing bodies and their volumes remain unchanged. |
+| `add` | Fuse the generated solid with **all and only** surviving bodies it touches or overlaps, not simply the most recently created body. Consume those targets; leave every other body unchanged. Without contact, create an independent body. |
+| `boss` | Same semantics as `add`. |
+| `cut` | Subtract the generated tool from the most recent surviving body. Refuse when there is no target or no material is removed. Other bodies remain unchanged. |
+
+`merge:false` overrides any valid mode to independent-body creation (`new`);
+`merge:true` never overrides an explicit `new`. Unknown modes are rejected by
+name, including when `merge:false` is present; they never silently become `add`.
+Contact uses exact B-rep distance at OCCT's modeling precision (1e-7 mm), with
+bounding boxes only as an early rejection. A positive 0.050 mm clearance is not
+contact and must not be bridged by an additive boolean.
+
+Omitted mode retains the existing compiler defaults: `boss` for primitives,
+`revolve`, and `sweep`; `new` for flat `extrude` and `loft` inputs. Canonical
+profile-feature schemas require an explicit `params.mode`; callers should always
+state their intended body policy. The `op` of an explicit `boolean` feature and
+the engraving/thread-specific `mode` vocabularies are separate contracts.

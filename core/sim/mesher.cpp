@@ -1,5 +1,6 @@
 // Polyhedral-FEA mesher and adaptive-refinement bridge for Chudware.
 #include "sim/mesher.h"
+#include "sim/progress.h"
 
 #include "prof/phases.h"
 #include <algorithm>
@@ -116,6 +117,49 @@ namespace {
 
 namespace pm = polymesh;
 
+// Only optional sizing probes spend this budget. The first measurable mesh
+// and the single delivery of a local contract must still run to completion.
+struct MeshProbeBudget {
+  const std::chrono::steady_clock::time_point start =
+      std::chrono::steady_clock::now();
+  double seconds = 60.0;
+  const char *origin = "default";
+
+  MeshProbeBudget() {
+    if (const char *value = std::getenv("CHUDWARE_MESH_PROBE_BUDGET_S")) {
+      char *end = nullptr;
+      const double configured = std::strtod(value, &end);
+      if (end != value && *end == '\0' && std::isfinite(configured) &&
+          configured >= 0.0) {
+        seconds = configured;
+        origin = "CHUDWARE_MESH_PROBE_BUDGET_S";
+      }
+    }
+  }
+
+  double elapsed() const {
+    return std::chrono::duration<double>(std::chrono::steady_clock::now() - start)
+        .count();
+  }
+
+  bool admit(double h, double predicted_s, MeshOut &out) const {
+    const double remaining = std::max(0.0, seconds - elapsed());
+    if (std::isfinite(predicted_s) && predicted_s <= remaining && remaining > 0.0)
+      return true;
+    out.governor_skipped_probes.push_back(
+        {h, std::isfinite(predicted_s) ? predicted_s : 0.0, remaining,
+         std::isfinite(predicted_s) ? "predicted_probe_exceeds_remaining_budget"
+                                   : "probe_time_forecast_unavailable"});
+    report_progress("mesh_probe_skipped", static_cast<std::size_t>(out.n_elems));
+    return false;
+  }
+
+  void stamp(MeshOut &out) const {
+    out.governor_probe_budget_s = seconds;
+    out.governor_elapsed_s = elapsed();
+    out.governor_budget_origin = origin;
+  }
+};
 // polymesh reads OpenMP thread count once from the environment at process
 // start. Chudware governs solver/mesher parallelism centrally so a background
 // study cannot starve the GUI render thread, so re-point polymesh at the same
@@ -690,11 +734,8 @@ std::string in_model_units(std::string diagnostic) {
 // a local request drives both, exactly as the adaptive driver does for its
 // marked elements.
 //
-// The lattice has a floor: local children live at h/2 and h/4 of the background
-// cell, so a request below h/4 cannot be honoured locally. build_mesh does not
-// silently accept that; fill_with_recovery lowers the BACKGROUND size to 4x the
-// requested local size (still far coarser than meshing the whole part at the
-// local size) and says so.
+// The lattice stops at h/4. Smaller local requests are delivered by LEB after
+// this fill, without repeating the band at alternate background sizes.
 pm::mesh::SizeFieldFn local_size_field(const MeshOptions &options, double h,
                                        const pm::mesh::SizeFieldFn &outer,
                                        std::vector<Eigen::Vector3d> &seeds,
@@ -716,8 +757,8 @@ pm::mesh::SizeFieldFn local_size_field(const MeshOptions &options, double h,
   if (request.max_depth_mm > 0.0)
     seed_band = std::min(seed_band, request.max_depth_mm);
   // Clamped into the field's own legal band, at BOTH ends.
-  //   * below: the lattice cannot place under h/4, and the caller is
-  //     responsible for having lowered h far enough (see fill_with_recovery);
+  //   * below: the lattice cannot place under h/4; deliver_local_contract
+  //     bisects below that floor after the volume fill;
   //   * above: a GradedSizing is `clamp(min_i(h_i + beta*d), h_min, h_max)` and
   //     its constructor REQUIRES 0 < h_min <= h_max, so a local request coarser
   //     than the background threw `GradedSizing: need 0 < h_min <= h_max` and
@@ -2271,6 +2312,7 @@ bool quality_pass(const pm::geom::TriSurface *surface, pm::fea::NodalMesh &nodal
                   const std::function<double(const Eigen::Vector3d &)>
                       &boundary_edge_limit,
                   std::vector<char> &in_region, LocalContract &contract) {
+  report_progress("mesh_interface_band_quality", nodal.elements.size());
   std::vector<std::size_t> poor;
   for (std::size_t e = 0; e < nodal.elements.size(); ++e) {
     if (e >= in_region.size() || in_region[e] == 0) continue;
@@ -2692,6 +2734,7 @@ void deliver_local_contract(const LoadedModel &loaded, const MeshOptions &option
   };
   contract.achieved_mm = scan(nullptr);
   for (int wave = 0; wave < kLebWaves; ++wave) {
+    report_progress("mesh_interface_band_refine", nodal.elements.size());
     // Two mark sources, unioned: the owners of the interface faces the
     // DELIVERED size is still failing on (the layer that carries the contract,
     // marked in the contract's own per-node currency) and any element coarser
@@ -3044,6 +3087,8 @@ bool build_mesh(const LoadedModel &loaded, const MeshOptions &options, double h,
   // adaptive refinement.
   const pm::pipeline::VolumeMeshOutput volume = [&] {
     chudware::prof::phases::PhaseScope phase("generate");
+    if (options.local_refine.active())
+      report_progress("mesh_interface_band_fill");
     return pm::pipeline::volume_mesh(
         loaded.model, h, pm::pipeline::VolumeMesher::kGradedTet,
         /*skin_layers=*/2,
@@ -3058,7 +3103,11 @@ bool build_mesh(const LoadedModel &loaded, const MeshOptions &options, double h,
   // The local size contract, before any promotion: LEB is tet4-only, and a
   // tet10 mesh promoted from bisected tet4 is the same mesh one order up.
   LocalContract contract;
+  if (options.local_refine.active())
+    report_progress("mesh_interface_band_refine", nodal.elements.size());
   deliver_local_contract(loaded, options, h, nodal, contract);
+  if (options.local_refine.active())
+    report_progress("mesh_interface_band_extract", nodal.elements.size());
   // Right-handed before anything reads the sign: the quadratic promotion
   // refuses a left-handed cell, and the fill emits a few on sharp edges.
   out.reoriented_elems = orient_tets_right_handed(nodal);
@@ -3489,109 +3538,6 @@ std::vector<Eigen::Vector3d> feature_face_seeds(const LoadedModel &loaded,
   return seeds;
 }
 
-// ── Last resort before the caller refuses: deliver the contract by RE-FILLING ─
-// Bisection (deliver_local_contract) delivers a local size by cutting up the
-// mesh the fill produced, and on a tight curved feature it can still stall
-// above the request — a wave whose children cannot be placed validly, or the
-// element ceiling. The other lever is the fill itself: the graded lattice puts
-// local children at h/2 and h/4 of the background cell, so a background of 4x
-// the request places the request WITHOUT bisecting anything, using the same
-// seed cloud and size field the request already carries (local_size_field).
-//
-// It is only worth a second full fill when it can actually win, so both bounds
-// are predicted first and the one that binds is named in the note:
-//   * polymesh raises any h to its own Cartesian grid-cell budget floor
-//     (mesh::min_h_for_cell_budget over the model bbox). On the 230 mm
-//     FRAME-PEDAL-BRAKE keyway isolate that floor is 2.75 mm and its finest
-//     child is 0.687 mm, so NO background delivers a 0.35 mm interface and the
-//     re-fill would spend millions of elements arriving at the same size.
-//   * the size band's element ceiling, predicted from the bbox at the re-fill
-//     size before anything is built.
-// The bisected mesh is kept unless the re-fill delivers a strictly finer
-// interface, so this can only improve the answer.
-template <typename AttemptWith>
-void deliver_contract_by_refill(const LoadedModel &loaded, const AdvisorPlan &plan,
-                                double h_first, bool feature_refine,
-                                AttemptWith &&attempt_with, MeshOut &out) {
-  const MeshLocalRefine &request = plan.options.local_refine;
-  if (!request.active() || !(request.size_mm > 0.0))
-    return;
-  if (!(out.local_refine_achieved_mm > kLocalContractSlack * request.size_mm))
-    return;  // bisection delivered it
-  const double grid_floor = pm::mesh::min_h_for_cell_budget(
-      loaded.model.bbox_min, loaded.model.bbox_max,
-      pm::mesh::kDefaultMaxGridCells, /*subdivision=*/1);
-  const double h_refill = std::max(4.0 * request.size_mm, grid_floor);
-  const double lattice_finest = 0.25 * h_refill;
-  char why[512];
-  if (lattice_finest > kLocalContractSlack * request.size_mm) {
-    std::snprintf(why, sizeof(why),
-                  "re-filling the whole solid to deliver %.4g mm was skipped: "
-                  "polymesh floors the background element size at %.4g mm on "
-                  "this bounding box (its Cartesian grid-cell budget), whose "
-                  "finest graded child is %.4g mm, so no background size can "
-                  "place the request and bisection's %.4g mm is the best "
-                  "available",
-                  request.size_mm, grid_floor, lattice_finest,
-                  out.local_refine_achieved_mm);
-    append_note(out.note, why);
-    return;
-  }
-  if (!(h_refill < h_first)) {
-    std::snprintf(why, sizeof(why),
-                  "re-filling to deliver %.4g mm was skipped: the background "
-                  "element size is already %.4g mm, at or under the %.4g mm the "
-                  "lattice would need",
-                  request.size_mm, h_first, h_refill);
-    append_note(out.note, why);
-    return;
-  }
-  const Eigen::Vector3d extent = loaded.model.bbox_max - loaded.model.bbox_min;
-  // Kuhn-split lattice: ~5.5 tets per interior cell. An OVER-estimate here is
-  // the right sign — this guard exists to keep a hopeless fill from being built.
-  const double predicted = 5.5 * std::abs(extent.x() * extent.y() * extent.z()) /
-                           (h_refill * h_refill * h_refill);
-  if (loaded.band.element_ceiling > 0 &&
-      predicted > static_cast<double>(loaded.band.element_ceiling)) {
-    std::snprintf(why, sizeof(why),
-                  "re-filling the whole solid at %.4g mm to deliver %.4g mm was "
-                  "skipped: it predicts %.3g elements against a ceiling of %llu, "
-                  "so bisection's %.4g mm is the best available",
-                  h_refill, request.size_mm, predicted,
-                  static_cast<unsigned long long>(loaded.band.element_ceiling),
-                  out.local_refine_achieved_mm);
-    append_note(out.note, why);
-    return;
-  }
-  MeshOut bisected = out;  // the mesh to fall back to
-  const bool refilled = attempt_with(plan.options, h_refill,
-                                     /*feature_refine=*/true);
-  if (!refilled ||
-      !(out.local_refine_achieved_mm < bisected.local_refine_achieved_mm)) {
-    const std::string refill_note =
-        refilled ? "delivered " + std::to_string(out.local_refine_achieved_mm) +
-                       " mm, no finer"
-                 : "failed: " + out.error;
-    out = std::move(bisected);
-    std::snprintf(why, sizeof(why),
-                  "re-filling the whole solid at %.4g mm to deliver %.4g mm was "
-                  "tried and discarded (%s); the bisected mesh at %.4g mm is "
-                  "kept",
-                  h_refill, request.size_mm, refill_note.c_str(),
-                  out.local_refine_achieved_mm);
-    append_note(out.note, why);
-    return;
-  }
-  std::snprintf(why, sizeof(why),
-                "bisection stalled at %.4g mm for a %.4g mm request, so the "
-                "solid was RE-FILLED at a %.4g mm background (the lattice places "
-                "the request on its own graded children) and delivers %.4g mm in "
-                "%d element(s)",
-                bisected.local_refine_achieved_mm, request.size_mm, h_refill,
-                out.local_refine_achieved_mm, out.n_elems);
-  append_note(out.note, why);
-}
-
 // The fill and its bounded recovery ladder, starting from `h_start` (0 = the
 // size the advisor/size band resolved). Split out so the caller can re-run the
 // WHOLE ladder at a different starting size: a recovery rung is what finally
@@ -3634,8 +3580,6 @@ bool fill_with_recovery(const LoadedModel &loaded, const MeshOptions &options,
   // feature pass.
   const bool feature_refine = default_feature_refine(plan.options);
   if (attempt(h_first, feature_refine)) {
-    deliver_contract_by_refill(loaded, plan, h_first, feature_refine,
-                               attempt_with, out);
     return true;
   }
   const std::string first_error = out.error;
@@ -3859,8 +3803,10 @@ bool fill_with_recovery(const LoadedModel &loaded, const MeshOptions &options,
 // unsolvable. A genuinely multi-solid compound reports its own solid count and
 // is untouched, and the rebuild is bounded: ONE re-run of the ladder, kept only
 // if it is no more fragmented than what it replaces.
-bool mesh_loaded_model(const LoadedModel &loaded, const MeshOptions &options,
-                       MeshOut &out) {
+bool mesh_background(const LoadedModel &loaded, const MeshOptions &options,
+                     const MeshProbeBudget &budget, MeshOut &out) {
+  report_progress("mesh_background_probe");
+  auto probe_start = std::chrono::steady_clock::now();
   if (!fill_with_recovery(loaded, options, /*h_start=*/0.0, out))
     return false;
   std::vector<MeshGovernorProbe> probes;
@@ -3869,8 +3815,12 @@ bool mesh_loaded_model(const LoadedModel &loaded, const MeshOptions &options,
     const double exponent = count_model.exponent;
     probes.push_back({mesh.char_len_mm, static_cast<uint64_t>(mesh.n_elems),
                      chudware::governor::process_rss_bytes() / 1073741824.0,
-                     std::isfinite(prediction) ? prediction : 0.0, exponent});
+                     std::isfinite(prediction) ? prediction : 0.0, exponent,
+                     std::chrono::duration<double>(
+                         std::chrono::steady_clock::now() - probe_start).count()});
     count_model.observe(mesh.char_len_mm, mesh.n_elems);
+    report_progress("mesh_background_probe_complete",
+                    static_cast<std::size_t>(mesh.n_elems));
   };
   record_probe(out, 0.0);
   out.governor_probes = std::move(probes);
@@ -3888,6 +3838,15 @@ bool mesh_loaded_model(const LoadedModel &loaded, const MeshOptions &options,
     const auto limit = loaded.band.element_limit;
     while (count_model.h > honest * (1.0 + 1e-9)) {
       const double next = std::max(honest, count_model.h / std::sqrt(2.0));
+      // A non-monotone count does not imply a cheaper fill: keep at least the
+      // last observed wall cost, scaling upward when the measured model grows.
+      const double predicted_s = probes.back().elapsed_s *
+          std::max(1.0, count_model.predict(next) /
+                            static_cast<double>(probes.back().elems));
+      if (!budget.admit(next, predicted_s, out))
+        break;
+      report_progress("mesh_background_probe");
+      probe_start = std::chrono::steady_clock::now();
       MeshOut candidate;
       if (!fill_with_recovery(loaded, options, next, candidate)) {
         append_note(out.note, "measured_octave governor: finer probe refused: " +
@@ -3926,6 +3885,13 @@ bool mesh_loaded_model(const LoadedModel &loaded, const MeshOptions &options,
       static_cast<int>(std::max<std::size_t>(model_solids(loaded).size(), 1));
   if (out.connected_components <= expected)
     return true;
+  const double predicted_s = out.governor_probes.back().elapsed_s *
+      std::max(1.0, count_model.predict(honest) /
+                        static_cast<double>(out.governor_probes.back().elems));
+  if (!budget.admit(honest, predicted_s, out))
+    return true;
+  report_progress("mesh_background_probe");
+  probe_start = std::chrono::steady_clock::now();
 
   MeshOut coarse = std::move(out);
   out = MeshOut();
@@ -3956,6 +3922,82 @@ bool mesh_loaded_model(const LoadedModel &loaded, const MeshOptions &options,
   out = std::move(coarse);
   append_note(out.note, text);
   return true;
+}
+
+bool mesh_loaded_model(const LoadedModel &loaded, const MeshOptions &options,
+                       const MeshProbeBudget &budget, MeshOut &out) {
+  if (!options.local_refine.active()) {
+    const bool ok = mesh_background(loaded, options, budget, out);
+    budget.stamp(out);
+    return ok;
+  }
+
+  // Never run the contact band through the measured-octave ladder. In
+  // particular LEB closure and regional quality work belong to the delivered
+  // mesh, not to discarded background-size probes.
+  MeshOptions background{
+      .fineness = options.fineness,
+      .order = options.order,
+      .target_size_mm = options.target_size_mm,
+      .min_size_mm = options.min_size_mm,
+      .max_size_mm = options.max_size_mm,
+      .learned_advisor = options.learned_advisor,
+      .advisor_max_dof = options.advisor_max_dof,
+      .declared_interfaces = options.declared_interfaces,
+      .local_refine = {}};
+  if (!mesh_background(loaded, background, budget, out)) {
+    budget.stamp(out);
+    return false;
+  }
+  const double delivered_h = out.char_len_mm;
+  std::optional<MeshOptions> advised_options;
+  if (out.nodes_per_elem != (options.order == 2 ? 10 : 4)) {
+    advised_options = options;
+    advised_options->order = out.nodes_per_elem == 10 ? 2 : 1;
+  }
+  auto probes = std::move(out.governor_probes);
+  auto skipped = std::move(out.governor_skipped_probes);
+  std::string background_note = std::move(out.note);
+  auto advisor = std::move(out.advisor);
+  // Release the disposable background arrays before allocating the band fill.
+  out = MeshOut();
+  report_progress("mesh_interface_band");
+  const auto started = std::chrono::steady_clock::now();
+  bool ok = false;
+  try {
+    pm::fea::NodalMesh nodal;
+    // Feature recovery has already selected a viable background size. The
+    // final band is filled ONCE at that size: no alternate-size band probes
+    // and no full-solid local-contract refill fallback.
+    ok = build_mesh(loaded, advised_options ? *advised_options : options,
+                    delivered_h, /*feature_refine=*/true, {}, nodal, out);
+  } catch (const std::exception &e) {
+    out.ok = false;
+    out.error = in_model_units(e.what());
+  }
+  if (out.n_elems > 0) {
+    probes.push_back(
+        {out.char_len_mm, static_cast<uint64_t>(out.n_elems),
+         chudware::governor::process_rss_bytes() / 1073741824.0, 0.0, 1.0,
+         std::chrono::duration<double>(
+             std::chrono::steady_clock::now() - started).count(),
+         "local_refine"});
+  }
+  out.governor_probes = std::move(probes);
+  out.governor_skipped_probes = std::move(skipped);
+  out.advisor = std::move(advisor);
+  append_note(out.note, background_note);
+  if (ok)
+    append_note(out.note,
+                "local band filled once at the delivered background size; " +
+                    std::to_string(out.n_elems) +
+                    " ACTUAL total elements retained for solve admission");
+  budget.stamp(out);
+  report_progress(ok ? "mesh_interface_band_complete" : "mesh_interface_band_failed",
+                  static_cast<std::size_t>(out.n_elems));
+  // Downstream solve admission sees this ACTUAL total, including the band.
+  // Never substitute the accepted background count or quietly fall back to it.
+  return ok;
 }
 
 std::vector<TopoDS_Shape> model_solids(const LoadedModel &loaded) {
@@ -4122,7 +4164,8 @@ std::vector<BodyGroup> group_touching_solids(
 }
 
 bool mesh_separate_solids(const std::vector<BodyGroup> &bodies,
-                          const MeshOptions &options, MeshOut &out) {
+                          const MeshOptions &options,
+                          const MeshProbeBudget &budget, MeshOut &out) {
   static std::atomic<uint64_t> sequence{0};
   MeshOut combined;
   combined.nodes_per_elem = options.order == 2 ? 10 : 4;
@@ -4150,8 +4193,16 @@ bool mesh_separate_solids(const std::vector<BodyGroup> &bodies,
       return false;
     }
     MeshOut part;
-    if (!mesh_loaded_model(loaded, options, part)) {
-      out.error = "solid " + std::to_string(i + 1) + ": " + part.error;
+    if (!mesh_loaded_model(loaded, options, budget, part)) {
+      out = std::move(part);
+      out.governor_probes.insert(out.governor_probes.begin(),
+                                 combined.governor_probes.begin(),
+                                 combined.governor_probes.end());
+      out.governor_skipped_probes.insert(
+          out.governor_skipped_probes.begin(),
+          combined.governor_skipped_probes.begin(),
+          combined.governor_skipped_probes.end());
+      out.error = "solid " + std::to_string(i + 1) + ": " + out.error;
       return false;
     }
     const int node_offset = static_cast<int>(combined.points.size() / 3);
@@ -4193,6 +4244,9 @@ bool mesh_separate_solids(const std::vector<BodyGroup> &bodies,
     combined.governor_probes.insert(combined.governor_probes.end(),
                                    part.governor_probes.begin(),
                                    part.governor_probes.end());
+    combined.governor_skipped_probes.insert(
+        combined.governor_skipped_probes.end(),
+        part.governor_skipped_probes.begin(), part.governor_skipped_probes.end());
     // The local size contract is a property of the WHOLE mesh a study solves,
     // and every solid was meshed against the same seed set: the worst achieved
     // size decides whether the contract was met, and a ceiling that bound on
@@ -4258,7 +4312,9 @@ bool mesh_separate_solids(const std::vector<BodyGroup> &bodies,
   combined.ok = true;
   combined.governor_probes.push_back(
       {combined.char_len_mm, static_cast<uint64_t>(combined.n_elems),
-       chudware::governor::process_rss_bytes() / 1073741824.0, 0.0, 2.0});
+       chudware::governor::process_rss_bytes() / 1073741824.0, 0.0, 2.0,
+       budget.elapsed(), "combined"});
+  budget.stamp(combined);
   out = std::move(combined);
   return true;
 }
@@ -4274,6 +4330,7 @@ MeshOut mesh_step(const std::string &step_path, const MeshOptions &options) {
   init_polymesh_runtime();
 
   chudware::prof::phases::StudyScope study_scope("mesh_tet");
+  const MeshProbeBudget probe_budget;
   try {
     LoadedModel loaded;
     {
@@ -4299,7 +4356,7 @@ MeshOut mesh_step(const std::string &step_path, const MeshOptions &options) {
           single.volume_after_mm3 = single.volume_before_mm3;
           bodies.push_back(std::move(single));
         }
-        mesh_separate_solids(bodies, options, out);
+        mesh_separate_solids(bodies, options, probe_budget, out);
         append_note(out.note,
                     "the study declared its interfaces (contact / bonded gap), "
                     "so touching solids were NOT fused");
@@ -4323,7 +4380,7 @@ MeshOut mesh_step(const std::string &step_path, const MeshOptions &options) {
           std::error_code remove_error;
           std::filesystem::remove(path, remove_error);
           if (ready) {
-            mesh_loaded_model(fused_model, options, out);
+            mesh_loaded_model(fused_model, options, probe_budget, out);
             MeshOut::Body span;
             span.source_ordinals = bodies[0].ordinals;
             span.node_begin = 0;
@@ -4337,19 +4394,19 @@ MeshOut mesh_step(const std::string &step_path, const MeshOptions &options) {
             out.fused_overlap_mm3 =
                 bodies[0].volume_before_mm3 - bodies[0].volume_after_mm3;
           } else {
-            mesh_separate_solids(bodies, options, out);
+            mesh_separate_solids(bodies, options, probe_budget, out);
             append_note(out.note,
                         "the fused body could not be re-loaded for meshing (" +
                             load_error + "), so it was meshed per solid");
           }
         } else {
-          mesh_separate_solids(bodies, options, out);
+          mesh_separate_solids(bodies, options, probe_budget, out);
         }
         if (!fuse_note.empty())
           append_note(out.note, fuse_note);
       }
     } else {
-      mesh_loaded_model(loaded, options, out);
+      mesh_loaded_model(loaded, options, probe_budget, out);
       MeshOut::Body span;
       span.source_ordinals.push_back(1);
       span.node_begin = 0;

@@ -11,12 +11,14 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
 #include <string>
 #include <system_error>
 #include <thread>
+#include <utility>
 
 #include "environment_test_support.h"
 #include "util/resource_governor.h"
@@ -344,4 +346,41 @@ TEST_CASE("cgroup budget term counts anon usage, not page cache") {
     chudware::test::setOrUnsetEnvironment("CHUDWARE_MEM_FRAC", nullptr);
     chudware::test::setOrUnsetEnvironment("CHUDWARE_HEADROOM_GB", nullptr);
 #endif
+}
+
+TEST_CASE("thin-slice count forecasts remeasure beyond one octave") {
+    // Fixed through-thickness layering: refining the in-plane grid multiplies
+    // tet count as h^-2, not h^-3. The second measurement must displace a
+    // volumetric prior instead of perpetuating its eightfold count growth.
+    MeshCountModel model;
+    model.exponent = 3.0;
+    model.observe(8.0, 12000.0);
+    model.observe(5.68, 12000.0 * std::pow(8.0 / 5.68, 2));
+    for (double h : {4.0, 2.84}) {
+        const double measured = 12000.0 * std::pow(8.0 / h, 2);
+        const double estimate = model.predict(h);
+        CHECK(estimate >= measured * 0.5);
+        CHECK(estimate <= measured * 2.0);
+        model.observe(h, measured);
+    }
+    CHECK(std::isnan(model.predict(1.0)));
+    model.observe(1.42, 12000.0 * std::pow(8.0 / 1.42, 2));
+    CHECK(model.predict(1.0) == doctest::Approx(768000.0));
+}
+
+TEST_CASE("measured wheel slice forecasts retain a nonmonotone count trend") {
+    // CD-210-01C, native mesh-only census: the 4 mm fill is CHEAPER than 5.68.
+    // Keeping the bbox h^-2 exponent predicts 621k there versus 227k measured.
+    MeshCountModel model;
+    model.observe(8.0, 211191.0);
+    for (const auto& probe :
+         {std::pair{5.68, 308370.0}, std::pair{4.0, 227239.0}}) {
+        const double estimate = model.predict(probe.first);
+        CHECK(estimate >= probe.second * 0.5);
+        CHECK(estimate <= probe.second * 2.0);
+        std::printf("[governor] wheel h=%.2f predicted=%.0f measured=%.0f ratio=%.6f\n",
+                    probe.first, estimate, probe.second, estimate / probe.second);
+        model.observe(probe.first, probe.second);
+    }
+    CHECK(model.predict(2.84) < model.elems);
 }

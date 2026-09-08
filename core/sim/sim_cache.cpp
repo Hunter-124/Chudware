@@ -44,7 +44,10 @@ constexpr const char* kBlobMagic = "AICRES1";
 // entry reports a fixture-ring-masked peak as if it were the field's peak, and
 // its cached vtu_path names a file written without the mask, so serving one
 // would re-introduce exactly the 3.7x contradiction the disclosure closes.
-constexpr const char* kCacheSchema = "chudware-simcache/4";
+// /5: measured-octave mesh admission replaces bbox-only coarsening, and closed_fit
+// is an explicit contact idealization. A /4 entry can carry a different delivered
+// mesh or omit these load-bearing modes; never reuse it as current evidence.
+constexpr const char* kCacheSchema = "chudware-simcache/5";
 constexpr size_t kMemCapEntries = 64;
 constexpr size_t kMaxSidecarOverhead = 4096;
 

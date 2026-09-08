@@ -56,6 +56,10 @@ struct ContactGapProbe {
     // nodes in `gap_fallback_nodes`.
     virtual bool pair_gap_mm(int node_a, const double* pa, int node_b,
                              const double* pb, double& gap_mm) const = 0;
+    // Optional closest-surface direction from a toward b, for the support-cone
+    // proof. It does not change the mesh-normal penalty spring law.
+    virtual bool pair_normal(int, const double*, int, const double*,
+                             std::array<double, 3>&) const { return false; }
 };
 
 enum class InterfaceKind { Contact, Bonded, Free };
@@ -84,10 +88,16 @@ struct ContactCandidateOptions {
     // require the measured bonded gap to be at most this explicit tolerance.
     double bond_gap_mm = -1.0;
     std::function<int(int)> node_body_ordinal;
+    // Named conformal-fit idealization, only for gaps measured on CAD surfaces.
+    // Negative threshold selects one quarter of the measured interface size.
+    bool closed_fit = true;
+    double closed_fit_gap_mm = -1.0;
 };
 
 struct ContactCandidateSet {
     std::vector<ContactSpring> springs;
+    std::vector<std::array<double, 3>> support_normals; // same order/orientation as springs
+    int support_normal_analytic_pairs = 0;
     // Same geometric pairing as contact, but these ties carry all three components
     // of relative displacement, including tension, through the BondSpring kernel.
     std::vector<ContactSpring> bonded;
@@ -164,6 +174,9 @@ struct ContactCandidateSet {
     // placed in the closing zone, and a load funnelled through 1 of them is a point
     // load wearing a contact-pressure label.
     int seatable_pairs = 0;
+    int closed_fit_pairs = 0;
+    double closed_fit_gap_mm_max = 0.0;
+    double closed_fit_limit_mm = 0.0;
     // Total tributary area of the candidate pairs (mm^2) — the contact patch the
     // pressure of an active subset is measured against.
     double candidate_area_mm2 = 0.0;
@@ -260,6 +273,9 @@ struct ContactResolution {
     // The element size at the interface that resolves the clearance (or the
     // patch). This is the number to pass as contact.interface_size_mm.
     double required_interface_size_mm = 0.0;
+    int closed_fit_pairs = 0;
+    double closed_fit_gap_mm_max = 0.0;
+    double closed_fit_limit_mm = 0.0;
     bool resolved = true;
     // force/area is a pressure only when a load-carrying patch of pairs exists.
     bool pressure_reliable = false;
@@ -333,6 +349,23 @@ inline constexpr double kMinLoadFraction = 0.5;
 // Below this the applied resultant on the contact-held bodies is treated as
 // absent rather than small: there is no load to trace, so no fraction to judge.
 inline constexpr double kLoadPathMinAppliedN = 1e-9;
+
+// Necessary static equilibrium condition, before any numerical tangential
+// stabilizer can manufacture an opposing reaction. Refusal is a proof; passing
+// this axis-separation test is not proof that the complete normal cone contains
+// the load. Bond-connected floating clusters must be considered together by the
+// caller, not mistaken for individually contact-held bodies.
+struct ContactSupportCone {
+    bool excludes_load = false;
+    int separating_axis = -1;
+    int group = -1;
+    int pairs = 0;
+    std::array<double, 3> normal_min{}, normal_max{}, load_direction{};
+    double supported_arc_deg = 0.0;
+};
+ContactSupportCone fea_contact_support_cone(const ContactCandidateSet& candidates,
+                                           int component,
+                                           const std::array<double, 3>& applied_force);
 
 // A-priori resolution judgement on the candidate set (before any solve).
 ContactResolution fea_contact_resolution(const ContactCandidateSet& candidates);

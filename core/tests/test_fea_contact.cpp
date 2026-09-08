@@ -386,8 +386,11 @@ TEST_CASE("contact: mixed three-body interfaces keep the press fit bonded and th
     study["loads"][0]["vector"] = {0, 0, 4000};
     auto lifted = chudware::sim::fea_run_static(study);
     REQUIRE(lifted["ok"] == false);
-    CHECK(lifted["contact"]["active_pairs"] == 0);
-    CHECK(lifted["contact"]["load_path"]["fraction"] == 0.0);
+    const auto& separation = lifted["contact"]["load_path_refusal"];
+    CHECK(separation["criterion"] == "normal_cone_excludes_load");
+    CHECK(separation["normal_range"]["min"][2].get<double>() > 0.0);
+    CHECK(separation["load_direction"][2] == 1.0);
+    CHECK_FALSE(lifted.contains("summary"));
 
     study["interfaces"]["contact"] = {{2, 1}};
     auto conflict = chudware::sim::fea_run_static(study);
@@ -1216,6 +1219,7 @@ TEST_CASE("contact: a pin in a bore reports the CAD clearance, not the facet one
     facet_opt.max_gap_mm = 0.5;
     ContactCandidateOptions cad_opt = facet_opt;
     cad_opt.gap_probe = &probe;
+    cad_opt.closed_fit = false;  // This control tests the clearance-resolved model.
 
     const auto facet = fea_contact_candidates(m.points, m.tets, 4, kE, facet_opt);
     const auto cad = fea_contact_candidates(m.points, m.tets, 4, kE, cad_opt);
@@ -1350,4 +1354,171 @@ TEST_CASE("heterogeneous bonded and contact bars reproduce series compliance") {
         std::printf("series %s: displacement %.9g analytic %.9g; interface VM steel %.9g aluminium %.9g\n",
                     contact ? "contact" : "bonded", displacement, analytic, steel_stress, aluminium_stress);
     }
+}
+
+TEST_CASE("contact: closed fit idealizes CAD clearance but remains unilateral") {
+    Mesh m;
+    constexpr double gap = 0.05, radius = 6.0, length = 2.4, force = 1500.0;
+    add_tube(m, 2, 64, 4, 3.0, radius, 0, length, 0, 0);
+    const int pin_nodes = static_cast<int>(m.points.size() / 3);
+    add_tube(m, 2, 64, 4, radius + gap, 9.0, 0, length, 0, 0);
+    struct Probe : chudware::sim::ContactGapProbe {
+        bool pair_gap_mm(int, const double*, int, const double*, double& value) const override {
+            value = gap;
+            return true;
+        }
+    } probe;
+    ContactCandidateOptions options;
+    options.max_gap_mm = 0.2;
+    options.gap_probe = &probe;
+    auto candidates = fea_contact_candidates(m.points, m.tets, 4, kE, options);
+    REQUIRE(candidates.error.empty());
+    REQUIRE(candidates.closed_fit_pairs == static_cast<int>(candidates.springs.size()));
+    CHECK(candidates.interface_h_mm / gap > 10);
+    CHECK(candidates.interface_h_mm / gap < 16);
+    CHECK(candidates.min_gap0_mm == doctest::Approx(gap));
+    for (const auto& spring : candidates.springs) CHECK(spring.gap0_mm == 0);
+    auto resolution = chudware::sim::fea_contact_resolution(candidates);
+    CHECK(resolution.resolved);
+    std::vector<int> fixed;
+    std::vector<double> loads(m.points.size(), 0);
+    for (int i = pin_nodes; i < static_cast<int>(m.points.size() / 3); ++i)
+        if (std::hypot(m.points[i * 3], m.points[i * 3 + 1]) > 8.99) fixed.push_back(i);
+    FeaContactOptions solver;
+    solver.max_iterations = 100;
+    const double full_bearing = force / (2 * radius * length);
+    const double effective_radius = radius * (radius + gap) / gap;
+    const double effective_modulus = kE / (2 * (1 - kNu * kNu));
+    const double hertz_peak = std::sqrt(force / length * effective_modulus /
+                                      (M_PI * effective_radius));
+    for (double direction : {1.0, -1.0}) {
+        CHECK_FALSE(chudware::sim::fea_contact_support_cone(
+            candidates, 0, {direction * force, 0, 0}).excludes_load);
+        for (int i = 0; i < pin_nodes; ++i) loads[i * 3] = direction * force / pin_nodes;
+        FeaContactReport report;
+        auto solved = fea_static_solve_contact(m.points, m.tets, kE, kNu, kYield,
+            fixed, loads, 4, {}, candidates.springs, solver, report);
+        REQUIRE(solved.ok);
+        CHECK(solved.reaction_force_n[0] == doctest::Approx(-direction * force).epsilon(0.01));
+        CHECK(report.active_pairs >= chudware::sim::kContactMinActivePairs);
+        CHECK(report.active_pairs < report.candidate_pairs);
+        REQUIRE(report.groups.size() == 1);
+        CHECK(report.groups[0].force_n[0] * direction > 0);
+        int wrong_side = 0;
+        for (const auto& spring : candidates.springs) {
+            double relative = 0;
+            for (int axis = 0; axis < 3; ++axis)
+                relative += spring.normal[axis] *
+                    (solved.displacement[spring.b * 3 + axis] -
+                     solved.displacement[spring.a * 3 + axis]);
+            if (relative < -1e-10 && spring.normal[0] * direction < -0.1)
+                ++wrong_side;
+        }
+        CHECK(wrong_side == 0);  // The formerly loaded side lifts off on reversal.
+        CHECK(report.groups[0].max_contact_pressure_mpa >= full_bearing);
+        CHECK(report.groups[0].max_contact_pressure_mpa <= hertz_peak);
+        chudware::sim::fea_contact_resolution_after_solve(resolution, report.active_pairs,
+            report.groups[0].contact_force_n, report.groups[0].contact_area_mm2);
+        CHECK(resolution.resolved);
+        std::printf("closed fit direction %.0f h/gap %.3f: %d/%d active, mean %.6g MPa, peak %.6g MPa"
+                    " (full bearing %.6g, Hertz peak %.6g MPa)\n",
+            direction, candidates.interface_h_mm / gap, report.active_pairs, report.candidate_pairs,
+            report.groups[0].contact_force_n / report.groups[0].contact_area_mm2,
+            report.groups[0].max_contact_pressure_mpa, full_bearing, hertz_peak);
+    }
+    options.closed_fit = false;
+    auto resolved = fea_contact_candidates(m.points, m.tets, 4, kE, options);
+    CHECK(resolved.closed_fit_pairs == 0);
+    for (const auto& spring : resolved.springs) CHECK(spring.gap0_mm == doctest::Approx(gap));
+    // A sparse solved patch is still refused with an actionable size.
+    auto refusal = chudware::sim::fea_contact_resolution(resolved);
+    chudware::sim::fea_contact_resolution_after_solve(refusal, 2, force, 0.1);
+    CHECK_FALSE(refusal.resolved);
+    CHECK(refusal.required_interface_size_mm == doctest::Approx(4 * gap));
+}
+
+TEST_CASE("contact: coarse closed bore settles a marginal off-axis bearing patch") {
+    // Nonmatching 32/31-sector surfaces, a cantilevered pin, and a 0.0038-degree
+    // off-axis load. The zero-threshold loop alternated two sets at iteration 6
+    // (53/128 active pairs), despite balancing the load: the patch rim repeatedly
+    // released and re-seated. Keep the geometry and load, not an iteration cap.
+    Mesh m;
+    add_tube(m, 2, 32, 4, 3.0, 6.0, 0.0, 15.0, 0.0, 0.0);
+    const int pin_nodes = static_cast<int>(m.points.size() / 3);
+    add_tube(m, 2, 31, 4, 6.05, 9.0, -5.0, 15.0, 0.0, 0.0);
+    struct Probe : chudware::sim::ContactGapProbe {
+        bool pair_gap_mm(int, const double*, int, const double*, double& gap) const override {
+            gap = 0.05;
+            return true;
+        }
+    } probe;
+    ContactCandidateOptions options;
+    options.max_gap_mm = 0.3;
+    options.penalty_scale = 0.5;
+    options.gap_probe = &probe;
+    const auto candidates = fea_contact_candidates(m.points, m.tets, 4, kE, options);
+    REQUIRE(candidates.error.empty());
+    REQUIRE(candidates.closed_fit_pairs == static_cast<int>(candidates.springs.size()));
+    std::vector<int> fixed;
+    std::vector<double> loads(m.points.size(), 0.0);
+    for (int i = pin_nodes; i < static_cast<int>(m.points.size() / 3); ++i)
+        if (m.points[i * 3 + 2] < -4.99) fixed.push_back(i);
+    for (int i = 0; i < pin_nodes; ++i)
+        if (m.points[i * 3 + 2] > 14.99) {
+            loads[i * 3] = 1500.0 / 96;
+            loads[i * 3 + 1] = 0.1 / 96;
+        }
+    FeaContactOptions solver;
+    solver.max_iterations = 100;
+    solver.interface_h_mm = candidates.interface_h_mm;
+    FeaContactReport report;
+    const auto result = fea_static_solve_contact(m.points, m.tets, kE, kNu, kYield,
+        fixed, loads, 4, {}, candidates.springs, solver, report);
+    REQUIRE_MESSAGE(result.ok, result.error);
+    REQUIRE(report.converged);
+    CHECK(result.equilibrium_error_pct < 0.01);
+    CHECK(result.reaction_force_n[0] == doctest::Approx(-1500.0).epsilon(0.001));
+    CHECK(result.reaction_force_n[1] == doctest::Approx(-0.1).epsilon(0.001));
+    REQUIRE(report.groups.size() == 1);
+    CHECK(report.groups[0].force_n[0] == doctest::Approx(1500.0).epsilon(0.01));
+    CHECK(report.tangential_force_fraction < 0.01);
+    CHECK(report.active_pairs >= chudware::sim::kContactMinActivePairs);
+    CHECK(report.active_pairs < report.candidate_pairs);
+    std::printf("coarse off-axis bore: iterations=%d cycles_broken=%d active=%d/%d "
+                "tol_g=%.9g mm tol_f=%.9g N Rx=%.9g N\n",
+        report.contact_iterations, report.cycles_broken, report.active_pairs,
+        report.candidate_pairs, report.hysteresis_tol_g_mm, report.hysteresis_tol_f_n,
+        result.reaction_force_n[0]);
+}
+
+TEST_CASE("contact: an open saddle cannot carry a load outside its normal cone") {
+    chudware::sim::ContactCandidateSet candidates;
+    candidates.component = {0, 1};
+    candidates.n_components = 2;
+    candidates.group_components = {{0, 1}};
+    for (int i = 0; i <= 30; ++i) {
+        const double angle = (-43.5 + 87.0 * i / 30) * M_PI / 180;
+        chudware::sim::ContactSpring spring;
+        spring.a = 0;
+        spring.b = 1;
+        spring.group = 0;
+        spring.normal = {std::cos(angle), 0, std::sin(angle)};
+        candidates.springs.push_back(spring);
+    }
+    const auto transverse = chudware::sim::fea_contact_support_cone(
+        candidates, 0, {0, 0, -1446});
+    CHECK(transverse.excludes_load);
+    CHECK(transverse.separating_axis == 0);
+    CHECK(transverse.normal_max[0] < -0.7);
+    CHECK(transverse.supported_arc_deg == doctest::Approx(87));
+    // The saddle can oppose a load into its seat, but never one pulling away.
+    CHECK_FALSE(chudware::sim::fea_contact_support_cone(
+        candidates, 0, {1446, 0, 0}).excludes_load);
+    CHECK(chudware::sim::fea_contact_support_cone(
+        candidates, 0, {-1446, 0, 0}).excludes_load);
+    // An opposing seat restores the missing reaction; this sufficient refusal
+    // must not declare that two-sided bearing geometrically impossible.
+    candidates.springs.front().normal = {-1, 0, 0};
+    CHECK_FALSE(chudware::sim::fea_contact_support_cone(
+        candidates, 0, {0, 0, -1446}).excludes_load);
 }

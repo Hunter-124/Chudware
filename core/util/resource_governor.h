@@ -90,23 +90,35 @@ bool admit(uint64_t estimate_bytes, const char* what, std::string& why);
 
 // ── Calibrated FEA peak-memory model ────────────────────────────────────────────
 // Projected peak working set of ONE direct-solve FEA job (mesh residency +
-// triplet assembly + sparse factor fill + stress recovery + result packet), from
+// fixed-pattern assembly + sparse factor fill + stress recovery + result packet), from
 // MEASURED peak RSS of the production path — not an analytic guess. The measured
 // table, the two solver families it covers and the safety factor are documented
 // at the top of resource_governor.cpp; fea_calibration_basis() is the one-line
 // summary meant for user-facing messages.
 //
 // The returned number ALREADY carries the safety factor, so callers compare it to
-// budget_bytes() directly. nodes_per_element selects the family (4 = tet4, which
-// is locked to Eigen SparseLU by the parity harness; >= 8 = tet10/hex8, which use
-// the CHOLMOD/LDLT Cholesky path and cost far less per DOF). dof_per_node is 3
-// for structural, 1 for thermal.
+// budget_bytes() directly. nodes_per_element selects the family (4 = tet4,
+// >= 8 = tet10/hex8); both use the CHOLMOD/LDLT SPD ladder. dof_per_node is 3
+// for structural, 1 for thermal. Mesh-stage RSS alone cannot calibrate factor fill.
 uint64_t fea_peak_bytes(uint64_t n_elements, int nodes_per_element, int dof_per_node);
 
 // Inverse of fea_peak_bytes: the largest element count whose projected peak still
 // fits `budget` bytes. 0 when even one element does not fit. Meshers use this to
 // coarsen a study into the envelope instead of being refused after meshing.
 uint64_t fea_element_limit(uint64_t budget, int nodes_per_element, int dof_per_node);
+
+// A geometry-local mesh-count probe. Predictions are valid for at most one
+// octave in h; NaN means the caller must measure an intermediate mesh first.
+// Two measurements fit the local exponent (including non-monotone fills).
+struct MeshCountModel {
+    double h = 0.0;
+    double elems = 0.0;
+    // Midpoint of slopes [-1,3]: with a half-octave initial step the forecast
+    // stays within 2x from a mild feature-count turnover through volume scaling.
+    double exponent = 1.0;
+    void observe(double measured_h, double measured_elems);
+    double predict(double target_h) const;
+};
 
 // One-line provenance for the numbers above, e.g. for a study note or refusal.
 const char* fea_calibration_basis();

@@ -69,6 +69,7 @@ struct AsmMateStatus {
     // positional rows, dimensionless for the direction rows). 0 for a mate that
     // contributed no rows (suppressed / unresolved).
     double residual = 0.0;
+    std::string reason;
 };
 
 // One RESOLVED mate reference: which component owns it + the local-frame geometry

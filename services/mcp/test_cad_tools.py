@@ -2257,10 +2257,18 @@ def _build_rotated_slider_assembly(tmp_path) -> tuple:
         ]})
     return asm, added.get("id_map", {}).get("$0"), "k2"
 
-@pytest.mark.parametrize("line_source", ["authored", "pin_reference"])
+@pytest.mark.parametrize("line_source", [
+    "authored", "authored_parallel", "authored_placed", "pin_reference"])
 def test_simulate_motion_honors_offset_hinge_line(tmp_path, line_source):
     """An angle-only rear plate folds about the FRONT pin, not a guessed origin axis."""
     point = [31.0, 17.0, 23.0]
+    authored = line_source != "pin_reference"
+    parallel_normal = line_source in ("authored_parallel", "authored_placed")
+    query = {"of": "face", "side": "back" if parallel_normal else "right", "count": 1}
+    placement = [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1]
+    if line_source == "authored_placed":
+        placement = [0, 0, 1, 107, 0, 1, 0, -23, -1, 0, 0, 41, 0, 0, 0, 1]
+        point = [130.0, -6.0, 10.0]
     paths, selectors, pin = [], [], None
     for tag, radius, mode in (("Front", 4, "boss"), ("Rear", 5, "cut")):
         doc = cb.call("doc_new", {"kind": "part", "name": f"MotionHinge{tag}"})["doc_id"]
@@ -2268,15 +2276,15 @@ def test_simulate_motion_honors_offset_hinge_line(tmp_path, line_source):
             features = [
                 cb.feat("box", "Plate", {"length": cb.dim(100), "width": cb.dim(60),
                                          "height": cb.dim(8)})]
-            if tag == "Front" or line_source != "authored":
+            if tag == "Front" or not authored:
                 features.append(cb.feat("cylinder", "Pin" if tag == "Front" else "Bore",
                         {"radius": cb.dim(radius), "height": cb.dim(18), "mode": mode}))
             features.append(cb.feat("transform", "Place",
-                                   {"rotate": [1, 0, 0], "angle": 90, "translate": point}))
+                                   {"rotate": [1, 0, 0], "angle": 90, "translate": [31, 17, 23]}))
             rebuilt = cb.call("doc_apply_ops", {"doc_id": doc, "ops": features})
             assert all(s["ok"] for s in rebuilt["rebuild"]["feature_status"]), rebuilt
             selectors.append(cb.call("doc_query", {
-                "doc_id": doc, "query": {"of": "face", "side": "right"}})["matches"][0])
+                "doc_id": doc, "query": query})["matches"][0])
             if tag == "Front":
                 pin = cb.call("doc_query", {
                     "doc_id": doc, "query": {"of": "face", "surf": "round"}})["matches"][0]
@@ -2289,21 +2297,33 @@ def test_simulate_motion_honors_offset_hinge_line(tmp_path, line_source):
     try:
         cb.call("doc_apply_ops", {"doc_id": asm, "with_tess": False, "ops": [
             {"op": "asm_insert_component", "source": {"path": paths[0]},
-             "name": "Front", "fixed": True},
-            {"op": "asm_insert_component", "source": {"path": paths[1]}, "name": "Rear"},
+             "name": "Front", "fixed": True, "transform": placement},
+            {"op": "asm_insert_component", "source": {"path": paths[1]}, "name": "Rear",
+             "transform": placement},
         ]})
         refs = [{"component": f"k{i + 1}", "selector": s}
                 for i, s in enumerate(selectors)]
         value = {"value": 0.0, "axis": [0, 1, 0]}
-        if line_source == "authored":
+        if authored:
             value["axis_point"] = point
             added, _ = _call("asm_mate", {
                 "doc_id": asm, "mate_type": "angle", "value": value,
-                "a": {"component": "k1", "query": {"of": "face", "side": "right"}},
-                "b": {"component": "k2", "query": {"of": "face", "side": "right"}},
+                "a": {"component": "k1", "query": query},
+                "b": {"component": "k2", "query": query},
             })
             assert added["ok"] and added["converged"], added
             mate_id = added["mate"]
+            # The real failure was an MCP-authored value object on a saved/reopened
+            # assembly, with the reference face normal parallel to the hinge line.
+            saved, _ = _call("save_part", {
+                "doc_id": asm, "path": str(tmp_path / "hinge.step+")})
+            assert saved["ok"], saved
+            cb.call("doc_close", {"doc_id": asm})
+            reopened, _ = _call("import_part", {"path": str(tmp_path / "hinge.step+")})
+            asm = reopened["doc_id"]
+            solved, _ = _call("solve_mates", {"doc_id": asm})
+            assert solved["ok"] and solved["converged"], solved
+            assert solved["dof"] == 1 and solved["residual_dof"] == 0, solved
         else:
             refs.append({"component": "k1", "selector": pin})
             added = cb.call("doc_apply_ops", {"doc_id": asm, "with_tess": False, "ops": [
@@ -2317,6 +2337,7 @@ def test_simulate_motion_honors_offset_hinge_line(tmp_path, line_source):
             "steps": 37, "check_interference": False})
         assert out["ok"], out
         assert out["pose_check"]["ok"], out
+        assert len(out["trajectory"]) == 37
         for frame in out["trajectory"]:
             theta = math.radians(frame["value"])
             c, s = math.cos(theta), math.sin(theta)
@@ -2324,15 +2345,19 @@ def test_simulate_motion_honors_offset_hinge_line(tmp_path, line_source):
                         0, 1, 0, 0,
                         -s, 0, c, point[2] + s * point[0] - c * point[2],
                         0, 0, 0, 1]
+            if line_source == "authored_placed":
+                import numpy as np
+                expected = (np.asarray(expected).reshape(4, 4)
+                            @ np.asarray(placement).reshape(4, 4)).ravel().tolist()
             actual = next(b["transform"] for b in frame["bodies"] if b["component"] == "k2")
             assert actual == pytest.approx(expected, abs=1e-9), frame
             assert frame["converged"], frame
-            if line_source == "authored":
+            if authored:
                 assert frame["dof"] == 1 and frame["residual_dof"] == 0, frame
             checked = frame["pose_check"]["bodies"][0]
             assert checked["axis_dir"] == pytest.approx([0, 1, 0])
             # Any point on the pin LINE is valid; its station along Y is immaterial.
-            assert [checked["axis_point"][i] for i in (0, 2)] == pytest.approx([31, 23])
+            assert [checked["axis_point"][i] for i in (0, 2)] == pytest.approx([point[0], point[2]])
             assert checked["translation_ok"] and checked["rotation_ok"]
             assert checked["invariant_coordinate"] == {"axis": "y", "ok": True}
         assert cb.call("doc_tree", {"doc_id": asm}) == before
@@ -2357,6 +2382,13 @@ def test_simulate_motion_honors_offset_hinge_line(tmp_path, line_source):
                 "type": "angle", "align": "aligned", "refs": refs[:2],
                 "value": {"value": 0.0, "axis": [0, 1, 0]}}},
         ]})
+        if parallel_normal:
+            refused, _ = _call("solve_mates", {"doc_id": asm})
+            assert not refused["ok"] and not refused["converged"], refused
+            assert refused["reason"] == "mate_unresolved", refused
+            assert refused["worst_mate"] in refused["error"]
+            assert "parallel" in refused["error"], refused
+            return
         refused, _ = _call("simulate_motion", {
             "doc_id": asm, "stop": -10, "steps": 2, "check_interference": False})
         assert not refused["ok"], refused

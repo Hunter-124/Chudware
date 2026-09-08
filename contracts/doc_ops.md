@@ -503,3 +503,29 @@ to an export. Native assembly results are not cached solely by the parent mtime.
 Detached `doc_open` imports rebase relative component paths before clearing the
 source save destination. Export metadata and the explicit MCP resume opt-in are
 specified in `worker_rpc.md` §31.
+
+## 13. MCP-authored revolute lines and solve diagnostics (2026-09-08)
+
+At the MCP `asm_mate` boundary, an angle `value` object carrying `axis` (or
+`reference_axis`) and `axis_point` supplies a WORLD-coordinate line. The tool
+converts it once into the first reference component's local frame before
+`asm_add_mate`; the native document schema remains local as specified above.
+Save/close/open preserves that stored line, including non-identity component
+placements.
+
+If either selected direction is parallel to an explicit pin line, face normals
+cannot measure the joint's phase. The revolute uses a deterministic perpendicular
+datum attached to the first component and the two authored body orientations as
+zero angle. It still contributes all six residuals; neither a rear bore nor a
+different face selector is required. Scalar-only angles retain their existing
+semantics and refuse an unmeasurable reference axis.
+
+A failed residual builder marks its mate `unresolved`, preserves the diagnostic in
+the mate's `reason`, and makes the native solve nonconverged. MCP `solve_mates`
+returns `ok:false`, `reason:"mate_unresolved"`, and an error naming the mate and
+diagnostic, rather than reporting a vacuously converged empty residual system.
+
+For explicit-line angles, `doc_solve_mates` rebuild results, MCP `solve_mates`,
+and `describe_assembly` now expose `residual_dof` beside mechanism `dof`, matching
+motion frames. A grounded revolute has `dof:1` and `residual_dof:0` at its prescribed
+angle; the underlying mate solver continues to report actual residual nullity.

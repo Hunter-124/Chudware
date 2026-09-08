@@ -342,6 +342,7 @@ ContactCandidateSet fea_contact_candidates(const std::vector<double>& points,
     // itself carries the gap the PHYSICS uses (analytic where the probe answered),
     // and the facet value is what the resolution block quotes beside it.
     std::vector<double> facet_gaps;
+    std::vector<bool> analytic_gaps;
     std::set<int> fallback_nodes;
     for (int i : surface) {
         const int ci = out.component[static_cast<std::size_t>(i)];
@@ -406,12 +407,14 @@ ContactCandidateSet fea_contact_candidates(const std::vector<double>& points,
             // the node-to-node projection answers it wrongly by up to the whole
             // clearance — see ContactGapProbe in fea_contact.h.
             double gap_used = b.gap;
+            bool measured_on_cad = false;
             const bool bonded = kind_of(i, b.node) == InterfaceKind::Bonded;
             if (options.gap_probe != nullptr) {
                 double analytic = 0.0;
                 const double* pj = &points[static_cast<std::size_t>(b.node) * 3];
                 if (options.gap_probe->pair_gap_mm(i, pi, b.node, pj, analytic)) {
                     gap_used = analytic;
+                    measured_on_cad = true;
                     if (!bonded) ++out.gap_analytic_pairs;
                 } else {
                     if (!bonded) {
@@ -465,7 +468,19 @@ ContactCandidateSet fea_contact_candidates(const std::vector<double>& points,
             }
             s.group = git->second;
             out.springs.push_back(s);
+            std::array<double, 3> support = s.normal;
+            if (options.gap_probe != nullptr) {
+                std::array<double, 3> analytic_normal{};
+                const double* pj = &points[static_cast<std::size_t>(b.node) * 3];
+                if (options.gap_probe->pair_normal(i, pi, b.node, pj, analytic_normal)) {
+                    for (int axis = 0; axis < 3; ++axis)
+                        support[axis] = flip ? -analytic_normal[axis] : analytic_normal[axis];
+                    ++out.support_normal_analytic_pairs;
+                }
+            }
+            out.support_normals.push_back(support);
             facet_gaps.push_back(b.gap);
+            analytic_gaps.push_back(measured_on_cad);
         }
     }
 
@@ -531,19 +546,24 @@ ContactCandidateSet fea_contact_candidates(const std::vector<double>& points,
         out.seat_limit_mm = std::max({kSeatFractionH * out.interface_h_mm,
                                       kSeatFractionGap * options.max_gap_mm,
                                       kSeatMinAbsMm});
-        // The penetration is CLAMPED and nothing else is: adjusting the positive gaps
-        // inside some tolerance to touching (the classic "adjust to touch") was tried
-        // and rejected here, because on a curved fit the seated arc it produces is
-        // 2*r*sqrt(2*tol/clearance) — it scales with the SQUARE ROOT of the
-        // tolerance, so any tolerance that tracks the mesh (a fraction of h, or the
-        // measured residual) makes the seated arc a function of the element size.
-        // Measured on the pin-in-bore ladder of test_fea_contact: 5.70 / 3.99 /
-        // 4.23 mm across three sizes with the adjustment, 4.17 / 3.64 / 3.61 mm
-        // without it. What seats past the touching pairs is DEFORMATION.
-        for (ContactSpring& s : out.springs)
+        out.closed_fit_limit_mm = options.closed_fit_gap_mm >= 0.0
+                                      ? options.closed_fit_gap_mm
+                                      : out.interface_h_mm * 0.25;
+        // Closing a sub-resolution CAD clearance is an explicit modelling mode,
+        // never a facet-error correction. Preserve measured gaps above; only the
+        // unilateral spring sees zero, so tensile pairs still release normally.
+        for (std::size_t i = 0; i < out.springs.size(); ++i) {
+            ContactSpring& s = out.springs[i];
+            if (options.closed_fit && analytic_gaps[i] &&
+                s.gap0_mm >= 0.0 && s.gap0_mm < out.closed_fit_limit_mm) {
+                ++out.closed_fit_pairs;
+                out.closed_fit_gap_mm_max =
+                    std::max(out.closed_fit_gap_mm_max, s.gap0_mm);
+                s.gap0_mm = 0.0;
+            }
             if (s.gap0_mm < 0.0) s.gap0_mm = 0.0;
-        for (double gap : gaps)
-            if (gap <= out.seat_limit_mm) ++out.seatable_pairs;
+            if (s.gap0_mm <= out.seat_limit_mm) ++out.seatable_pairs;
+        }
     }
     // Counted whether or not any candidate survived: a set emptied by the analytic
     // measurement still has to say what it could not measure.
@@ -551,8 +571,74 @@ ContactCandidateSet fea_contact_candidates(const std::vector<double>& points,
     return out;
 }
 
+ContactSupportCone fea_contact_support_cone(const ContactCandidateSet& candidates,
+                                           int component,
+                                           const std::array<double, 3>& applied_force) {
+    ContactSupportCone out;
+    double magnitude = 0.0;
+    for (double force : applied_force) magnitude += force * force;
+    magnitude = std::sqrt(magnitude);
+    if (!(magnitude > kLoadPathMinAppliedN)) return out;
+    out.normal_min.fill(1.0);
+    out.normal_max.fill(-1.0);
+    for (int axis = 0; axis < 3; ++axis)
+        out.load_direction[axis] = applied_force[axis] / magnitude;
+    auto sign_on_body = [&](const ContactSpring& spring) {
+        const bool a = candidates.component[spring.a] == component;
+        const bool b = candidates.component[spring.b] == component;
+        return a == b ? 0.0 : (a ? -1.0 : 1.0);
+    };
+    auto normal_at = [&](std::size_t i) -> const std::array<double, 3>& {
+        return candidates.support_normals.size() == candidates.springs.size()
+                   ? candidates.support_normals[i] : candidates.springs[i].normal;
+    };
+    for (std::size_t i = 0; i < candidates.springs.size(); ++i) {
+        const auto& spring = candidates.springs[i];
+        const double sign = sign_on_body(spring);
+        if (sign == 0.0) continue;
+        if (out.pairs == 0) out.group = spring.group;
+        else if (out.group != spring.group) out.group = -1;
+        ++out.pairs;
+        for (int axis = 0; axis < 3; ++axis) {
+            const double value = sign * normal_at(i)[axis];
+            out.normal_min[axis] = std::min(out.normal_min[axis], value);
+            out.normal_max[axis] = std::max(out.normal_max[axis], value);
+        }
+    }
+    if (out.pairs == 0) return out;
+    for (int axis = 0; axis < 3; ++axis) {
+        if ((out.normal_min[axis] > 1e-6 && out.load_direction[axis] >= -1e-8) ||
+            (out.normal_max[axis] < -1e-6 && out.load_direction[axis] <= 1e-8)) {
+            out.separating_axis = axis;
+            out.excludes_load = true;
+            break;
+        }
+    }
+    if (!out.excludes_load) return out;
+    int transverse = 0;
+    for (int axis = 1; axis < 3; ++axis)
+        if (std::abs(out.load_direction[axis]) > std::abs(out.load_direction[transverse]))
+            transverse = axis;
+    if (transverse == out.separating_axis) transverse = (transverse + 1) % 3;
+    double minimum_angle = 4.0, maximum_angle = -4.0;
+    for (std::size_t i = 0; i < candidates.springs.size(); ++i) {
+        const double sign = sign_on_body(candidates.springs[i]);
+        if (sign == 0.0) continue;
+        const auto& normal = normal_at(i);
+        const double angle = std::atan2(sign * normal[transverse],
+                                       std::abs(normal[out.separating_axis]));
+        minimum_angle = std::min(minimum_angle, angle);
+        maximum_angle = std::max(maximum_angle, angle);
+    }
+    out.supported_arc_deg = (maximum_angle - minimum_angle) * 180.0 / std::acos(-1.0);
+    return out;
+}
+
 ContactResolution fea_contact_resolution(const ContactCandidateSet& candidates) {
     ContactResolution out;
+    out.closed_fit_pairs = candidates.closed_fit_pairs;
+    out.closed_fit_gap_mm_max = candidates.closed_fit_gap_mm_max;
+    out.closed_fit_limit_mm = candidates.closed_fit_limit_mm;
     out.min_active_pairs = kContactMinActivePairs;
     out.candidate_pairs = static_cast<int>(candidates.springs.size());
     out.seatable_pairs = candidates.seatable_pairs;
@@ -569,7 +655,7 @@ ContactResolution fea_contact_resolution(const ContactCandidateSet& candidates) 
     out.facet_error_mm = candidates.facet_error_mm;
     out.gap_analytic = candidates.gap_analytic_pairs > 0;
     out.gap_fallback_nodes = candidates.gap_fallback_nodes;
-    const bool touching = !(out.gap_mm > 0.0);
+    const bool touching = candidates.closed_fit_pairs > 0 || !(out.gap_mm > 0.0);
     out.criterion = touching ? kCriterionPatchArea : kCriterionClearance;
     if (touching) {
         out.max_h_interface_mm = out.candidate_area_mm2 > 0.0

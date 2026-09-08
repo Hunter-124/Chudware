@@ -131,6 +131,7 @@ def _contact(tools: dict, doc: str, fz: float, vtu: str = None,
         doc_id=doc,
         vtu_path=vtu,
         plasticity=plasticity,
+        closed_fit=False,  # This scenario measures the travel closing a real gap.
     ))
 
 
@@ -450,6 +451,50 @@ def test_plasticity_is_refused_where_it_would_be_ignored(tools):
     })
     assert modal.get("ok") is False, modal
     assert "not applicable to a modal study" in modal.get("error", ""), modal
+
+
+def test_real_stack_open_saddle_refuses_missing_normal_reaction(tools, tmp_path):
+    import os
+    import shutil
+    source = os.environ.get("CHUDWARE_CONTACT_STACK")
+    if not source:
+        pytest.skip("set CHUDWARE_CONTACT_STACK to the private CC-006R stack fixture")
+    path = tmp_path / "contact-stack.step+"
+    shutil.copy2(source, path)
+    opened = json.loads(tools["import_part"](path=str(path)))
+    assert opened.get("ok"), opened
+    started = time.monotonic()
+    out = _contact_result(tools, json.loads(tools["run_fea_contact"](
+        fixtures=["F12a36f"],
+        load=[{"face": "Fb9679a", "force": [0, 0, -723]},
+              {"face": "F0ec55c", "force": [0, 0, -723]}],
+        material={"per_body": {
+            "1": {"name": "6061-T6", "E_mpa": 68900, "nu": 0.33, "yield_mpa": 276},
+            "2": {"name": "C93200", "E_mpa": 100000, "nu": 0.34, "yield_mpa": 125},
+            "3": {"name": "4140", "E_mpa": 205000, "nu": 0.29, "yield_mpa": 655}}},
+        interfaces={"bonded": [[1, 2]], "contact": [[2, 3]], "default": "free"},
+        mesh_size_mm=4, min_size_mm=0.3, interface_size_mm=0.6,
+        max_gap_mm=0.4, max_iterations=100, closed_fit=True,
+        doc_id=opened["doc_id"],
+    )))
+    assert out.get("ok") is False, out
+    contact = out["contact"]
+    assert contact["resolution"]["mode"] == "closed_fit", contact
+    assert contact["resolution"]["closed_fit"]["pairs"] >= 6, contact
+    refusal = contact["load_path_refusal"]
+    assert refusal["criterion"] == "normal_cone_excludes_load", refusal
+    assert refusal["bodies"] == [2, 3], refusal
+    assert refusal["axis"] == "X", refusal
+    assert refusal["normal_range"]["max"][0] < -0.6, refusal
+    assert refusal["load_direction"] == pytest.approx([0, 0, -1]), refusal
+    assert 80 < refusal["supported_arc_deg"] < 95, refusal
+    assert "friction or an opposing bearing surface" in out.get("solver_error", out.get("error", "")), out
+    assert "summary" not in out, out
+    assert out["provenance"]["peak_rss_gb"] < 10, out
+    print("REAL_STACK_REFUSAL", json.dumps({
+        "elapsed_s": time.monotonic() - started, "refusal": refusal,
+        "resolution": contact["resolution"], "n_elems": out["n_elems"],
+        "mesh_quality": out["mesh_quality"], "provenance": out["provenance"]}))
 
 
 if __name__ == "__main__":

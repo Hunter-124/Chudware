@@ -188,9 +188,9 @@ struct BondSpring {
 //
 // While the pair is ACTIVE the penalty energy is 0.5·k·gap², whose stiffness is
 // k·(n nᵀ) on the (a,b) block and whose constant part k·gap0 enters the right-hand
-// side. The active-set loop (fea_static_solve_contact) deactivates any pair whose
-// converged normal force turns TENSILE (gap > 0, i.e. the surfaces have separated) and
-// re-activates any pair whose gap has closed, so no pair ever pulls its partner back.
+// side. The active-set loop releases tensile pairs and re-seats penetrating pairs
+// with mesh/load-scaled hysteresis (FeaContactReport): convergence requires normal
+// force >= -tol_f on active pairs and gap >= -tol_g on inactive pairs.
 // Where that loop STARTS is FeaContactOptions::seat_tolerance_mm: only pairs the mesh
 // cannot tell from touching begin active, so the first iterate is the applied load
 // acting on the seated arc instead of thousands of open pairs being dragged shut.
@@ -236,6 +236,9 @@ struct FeaContactReport {
     int candidate_pairs = 0;
     int active_pairs = 0;
     int contact_iterations = 0;
+    int cycles_broken = 0;
+    double hysteresis_tol_g_mm = 0.0;
+    double hysteresis_tol_f_n = 0.0;
     // false = the active set was still changing when max_iterations ran out. The
     // displacement/stress fields are then the LAST iterate, not a converged solution.
     bool converged = false;
@@ -264,6 +267,9 @@ struct FeaContactOptions {
     // fea_run passes ContactCandidateSet::seat_limit_mm here (fea_contact.h), which
     // is the gap the MESH cannot tell from touching.
     double seat_tolerance_mm = -1.0;
+    // Measured candidate-interface element size; zero uses the median sqrt of
+    // positive pair tributary areas for callers supplying springs without a mesh probe.
+    double interface_h_mm = 0.0;
 };
 
 // ── Small-strain J2 (von Mises) plasticity with isotropic hardening ─────────────

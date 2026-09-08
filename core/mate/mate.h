@@ -66,6 +66,7 @@ struct MateStatus {
     std::string mate_id;
     std::string type;
     std::string status;
+    std::string reason;  // diagnostic for unresolved residuals
 };
 
 // Per-mate residual at the solved configuration. `max_abs` is the largest absolute

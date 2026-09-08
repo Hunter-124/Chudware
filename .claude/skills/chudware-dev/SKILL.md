@@ -237,6 +237,43 @@ judgment).
   bar at h=4 yields 205 504 tet10 (thin_wall_ratio 17.1) vs 2700 structured. `placement_source`
   persists in doc meta `placement_sources` (inside `.step+`); `scripts/provision_venv.sh`
   builds `.venv-mcp` from `requirements.txt` (+ `CHUDCODE_RPC_SRC` editable).
+- **Contact studies model joints, not meshes (2026-09-08..10).** `run_fea_contact` /
+  `run_fea_static` take `material={"per_body":{ordinal|name: …},"default":…}` (uint16
+  element→material index; FoS against each element's own yield; penalty uses the softer
+  body) and `interfaces={"bonded":[[a,b]],"contact":[[a,b]],"free":[…],"default":…}` —
+  press fits are bonded, running clearances are contact, declared pairs stay unfused and
+  only contact pairs are refined (band depth ≤ 3h). `contact.resolution.mode` is
+  `closed_fit` when a measured clearance is below h/4 (initially-closed conformal fit,
+  opens under tension; `closed_fit=false` restores the resolve-or-refuse rule).
+  `penalty_scale` / `max_iterations` are args. The active set uses hysteresis (`tol_g`
+  1e-3·h, `tol_f` 1e-4·|R|/n) and one union step on a 2-cycle; packet
+  `contact.active_set{iterations,cycles_broken}`. A contact pair whose normals all share a
+  sign against the load is refused by name (`normal_cone_excludes_load`, with the arc and
+  normal range) before any solve — the ME 490 bushing was an 87° open saddle. A delayed
+  refusal keeps its diagnostics in the job result.
+- **The governor measures, it does not extrapolate (2026-09-09).** Element counts come
+  from half-octave probes (`measured_octave`), first forecast p=1, never more than one
+  octave from a measured probe; `provenance.governor{estimate_gb, measured_probe, probes,
+  model}` on every packet and `sim_mesh` reply. The old `105·A_bbox/h²` envelope said a
+  thin wheel slice at h 2.84 needed 6.8 M tet10 / 2061 GB; measured: 227 k at h 4. Real
+  counts are non-monotone in h on thin parts. sim_cache namespace is `/5`.
+- **Angle mates with a hinge line are revolutes (2026-09-09).** `asm_mate value={"value",
+  "axis","axis_point"}` (WORLD line, converted once to the reference component's local
+  frame) binds the other five DOF: `residual_dof 0`, mechanism `dof 1`, `simulate_motion`
+  sweeps a bore-less body. A reference face normal parallel to the axis gets a
+  deterministic perpendicular datum; a residual builder that throws is `ok:false,
+  reason:mate_unresolved`, never "converged". `sweep_envelope` / `steering_turning_radius`
+  transport the reference WORLD-shape bounds by the relative placement (the local AABB
+  square spun through a wheel's free axle spin put wheels 109 mm underground).
+- **Assemblies report honestly (2026-09-08).** `doc_bbox` / `eval_mass` / native import
+  gather assembly world solids; `describe_part` states the body count; `save_part` /
+  `export_part` refuse an empty document (`allow_empty`); `check_interference` refuses an
+  EMPTY document and reports `pairs_checked` (one body is a no-pair success — the
+  members-filter contract). `import_part` of `.step+` is a fresh detached document
+  (`resume=True` opts in) with a real import feature; nested path-backed assemblies load
+  recursively; `validated: true` requires every component to contribute solids and an
+  exact round-trip count (`components:[{name,solids,source}]`). The MCP mass tool is
+  `measure_part(density_g_cm3=)`; `eval_mass` is engine-internal.
 - **Chat sessions are keyed by project (2026-09-04).** `Conversation.projectDir` is stamped
   once at creation from `convProjectDir(st)` (= `st.workspaceDir`, else `plmProjectPath()`) —
   the same value the composer sends Chudcode as `workspace_dir`. `index.json` v3 keeps

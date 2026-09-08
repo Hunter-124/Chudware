@@ -55,12 +55,18 @@ def _solve_report(rebuild: dict) -> dict:
     mates = [m for m in (rb.get("mates") or []) if isinstance(m, dict)]
     ranked = sorted(mates, key=lambda m: -float(m.get("residual") or 0.0))[:5]
     worst = [{"id": m.get("id"), "type": m.get("type"), "status": m.get("status"),
-              "residual": float(m.get("residual") or 0.0)} for m in ranked]
+              "residual": float(m.get("residual") or 0.0), "reason": m.get("reason")}
+             for m in ranked]
     converged = bool(rb.get("converged", True))
     worst_mate = rb.get("worst_mate") or (worst[0]["id"] if worst else None)
     worst_res = float(rb.get("max_residual") or 0.0)
     over = bool(rb.get("over_defined", False))
     msg = ""
+    unresolved = next((m for m in mates if m.get("status") == "unresolved"), None)
+    reason = "mate_unresolved" if unresolved else None
+    if unresolved:
+        converged = False
+        worst_mate = unresolved.get("id")
     if not converged:
         msg = (f"mate solve did not converge: worst mate '{worst_mate}' "
                f"residual {worst_res:.6g} (tolerance {float(rb.get('tolerance') or 0.0):.3g}; "
@@ -70,9 +76,12 @@ def _solve_report(rebuild: dict) -> dict:
                "sense and that both refs are the intended faces/axes), then re-solve.")
         if over:
             msg += " The network is also OVER-DEFINED; drop the redundant mate first."
+        if unresolved:
+            msg = (f"mate '{worst_mate}' is unresolved: "
+                   f"{unresolved.get('reason') or 'mate references could not be resolved'}")
     return {"converged": converged, "worst_mate": worst_mate,
             "worst_residual": worst_res, "tolerance": rb.get("tolerance"),
-            "mates_over_defined": over, "worst": worst, "message": msg}
+            "mates_over_defined": over, "worst": worst, "message": msg, "reason": reason}
 
 def register_cad_asm_tools(mcp: FastMCP) -> None:
     """CAD assembly + motion MCP tools (T-RF8 split of cad_tools.py): new_assembly, asm_add_component, asm_mate, solve_mates, simulate_motion, motion_fea_handoff, list_world_bodies."""
@@ -329,8 +338,10 @@ def register_cad_asm_tools(mcp: FastMCP) -> None:
         align     : "aligned" or "anti" (flip which way the normals/axes face).
         value     : the driving dimension for distance/angle mates. For an angle-only
                     hinge, pass {"value":0, "axis":[0,1,0], "axis_point":[x,y,z]};
-                    axis and axis_point are in component a's LOCAL frame and define
-                    the pin line used by simulate_motion (no concentric mate needed).
+                    axis and axis_point are in WORLD coordinates; they are stored in
+                    component a's local frame so the joint survives save/reopen.
+                    If a face normal lies along the pin, the authored body orientation
+                    defines zero angle (no concentric mate or rear bore is needed).
         solve     : re-solve the mate network immediately (default) and report status.
 
         Typical seating pattern: `concentric` (bolt shank ↔ hole bore) + `coincident`
@@ -381,6 +392,22 @@ def register_cad_asm_tools(mcp: FastMCP) -> None:
                           "refs": refs}
             if value is not None:
                 mate["value"] = dict(value) if isinstance(value, dict) else {"value": float(value)}
+                if (mate_type == "angle" and isinstance(value, dict)
+                        and "axis_point" in value
+                        and ("axis" in value or "reference_axis" in value)):
+                    import numpy as np
+                    transform = np.asarray(comps[refs[0]["component"]]["transform"],
+                                           dtype=float).reshape(4, 4)
+                    inverse = np.linalg.inv(transform)
+                    point = np.asarray(value["axis_point"], dtype=float)
+                    axis_key = "axis" if "axis" in value else "reference_axis"
+                    axis = np.asarray(value[axis_key], dtype=float)
+                    if (point.shape != (3,) or axis.shape != (3,)
+                            or not np.isfinite(point).all() or not np.isfinite(axis).all()
+                            or np.linalg.norm(axis) < 1e-12):
+                        raise ValueError("angle hinge line needs finite 3-vectors and a nonzero axis")
+                    mate["value"]["axis_point"] = (inverse[:3, :3] @ point + inverse[:3, 3]).tolist()
+                    mate["value"][axis_key] = (inverse[:3, :3] @ axis).tolist()
             r = cb.call("doc_apply_ops", {"doc_id": d, "base_revision": _asm_revision(d),
                                           "with_tess": False,
                                           "ops": [{"op": "asm_add_mate", "mate": mate}]})
@@ -398,11 +425,17 @@ def register_cad_asm_tools(mcp: FastMCP) -> None:
                 rep = _solve_report(rb)
                 out["converged"] = rep["converged"]
                 out["mate_residuals"] = rep["worst"]
+                out["dof"] = rb.get("dof")
+                if "residual_dof" in rb:
+                    out["residual_dof"] = rb["residual_dof"]
                 if not rep["converged"]:
                     # The mate landed in the doc; the NETWORK is what failed. Say which
                     # mate, so the next call fixes that one instead of rebuilding blind.
                     out["solve_error"] = rep["message"]
                     out["worst_mate"] = rep["worst_mate"]
+                    out["ok"] = False
+                    if rep["reason"]:
+                        out["reason"] = rep["reason"]
                 wb = cb.call("asm_world_bodies", {"doc_id": d})
                 out["world_bodies"] = wb.get("bodies")
             _publish_current(d)
@@ -443,9 +476,13 @@ def register_cad_asm_tools(mcp: FastMCP) -> None:
                    "dof": rb.get("dof"), "over_defined": rep["mates_over_defined"],
                    "max_residual": rep["worst_residual"], "tolerance": rep["tolerance"],
                    "mate_residuals": rep["worst"]}
+            if "residual_dof" in rb:
+                out["residual_dof"] = rb["residual_dof"]
             if not rep["converged"]:
                 out["error"] = rep["message"]
                 out["worst_mate"] = rep["worst_mate"]
+                if rep["reason"]:
+                    out["reason"] = rep["reason"]
             return _dumps(out)
         except Exception as e:  # noqa: BLE001
             return _err(e)

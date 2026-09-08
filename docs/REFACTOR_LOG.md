@@ -3029,3 +3029,93 @@ Final motion acceptance, including an explicit wrong-local-axis pose-check
 rejection regression: **27 passed in 10.53s**. The temporary reproduction script
 was removed; its copied-rover result is retained at
 `/tmp/motion42-cvt0od8h/result.json` for review.
+
+## MCP revolute fold: parallel reference normals and persistence (2026-09-08)
+
+The ME 490 fold failure was not dropped `value` metadata, stale mates, or a
+world/local placement mismatch: the saved/reopened value retained `[0,1,0]` and
+`[910,0,545]`, the first reference placement was identity, and its selected planar
+normal was exactly parallel to the hinge axis. `angle_reference_local` threw
+before adding the six revolute rows; the builder catch marked the mate unresolved
+but still advertised convergence. The copied study reproduced `dof:6`, absent
+solve `residual_dof`, and a refused sweep with zero interference samples (37 seeded
+trajectory poses existed, but none was a valid collision sample). `core/mate`
+now uses a deterministic body-frame phase datum for explicit-line joints whose
+selected directions cannot measure pin rotation, and unresolved builders carry
+their diagnostic and force nonconvergence. `core/doc/assembly.{h,cpp}` transports
+the diagnostic; `session.cpp` reports mechanism and residual DOF separately.
+`cad_asm_tools.py` converts MCP world lines to persisted local coordinates and
+returns named unresolved refusals; `gsl_tools.py` narrates both DOF fields.
+
+The extended `test_cad_tools.py` regression authors through `asm_mate`, saves,
+closes, reopens, solves, and sweeps, covering parallel normals, a non-identity
+reference placement, and a genuinely invalid scalar-only axis. Prebuild:
+**3 failed, 1 passed, 137 deselected in 3.40s**. Post-fix selection
+`-k "simulate_motion or asm_mate or solve_mates"`:
+**13 passed, 128 deselected in 15.89s**. Wrapped native ctests:
+**simulate_motion Passed 0.29 sec; mate Passed 0.06 sec; 100% tests passed,
+0 tests failed out of 2**.
+
+The copied seven-component study was reset through recorded assembly operations
+to the design transcript's fresh authored poses/fixed flags, then the exact
+world-line mate was added, saved, closed, reopened, and driven 0 to −180 degrees
+in 5-degree increments. All **37 interference samples** converged with **dof 1,
+residual_dof 0, pose_check.ok true**; maximum translation-check error was
+**6.732e-11 mm**. Front–Rear residual overlap at −180 degrees is
+**4305.319107935 mm³**, confirming the earlier pose-driven number. Excluding the
+Front–Rear split pair, first interference is still **0 degrees**: eight other
+pairs already overlap at the initial pose (including Rear–Leaf at 121.961638 mm³).
+No previously absent pair appeared during the sampled sweep. Total endpoint
+overlap across all pairs is **20633.824076625 mm³**, not 4305.319 mm³; the latter
+is specifically Front–Rear. Original project files were untouched (`cmp` against
+the initial copy passed). All native/pytest runs used the required cgroup
+wrappers. Evidence remains in `/tmp/revolute-fold-before/` and
+`/tmp/revolute-fold-after/` (`motion.json`, `summary.json`, and saved study);
+the throwaway driver was removed. Contract clarification is `doc_ops.md` §13.
+
+## ME 490 thin-wheel measured-count governor
+
+The CD-210-01C t4p7625/w60 slice exposed two independent estimate errors:
+`mesh_size_band.cpp` used the bulky-box `105*A_bbox/h^2` count envelope as a
+study cost, and `mesher.cpp` let a long-range count forecast overrule an actual
+requested-size refill. This was not a units error. At 2.84 mm the copied STEP
+produced an unmeasured 6,845,066-element / 2052.792 GiB envelope. Under the
+required 10 GiB cgroup with `CHUDWARE_MEM_FRAC=0.6` and
+`CHUDWARE_HEADROOM_GB=4`, the old bootstrap was 17.254622 mm; it is now
+bounded to 5.68 mm and explicitly labelled unmeasured.
+The historical 16 GiB host budget was not the effective budget of this proof.
+
+Three raw mesh-only measurements were 211,191 elements / 0.266083 GiB peak RSS
+at 8 mm, 308,370 / 0.354439 GiB at 5.68 mm, and 227,239 / 0.291901 GiB at 4 mm.
+Counts are nonmonotone: adjacent log-log slopes are +1.10525 and -0.87065,
+not one transferable box exponent. The RSS fit is about 928 bytes/element plus
+0.089 GiB; it is mesh memory, NOT a solver-factor calibration. The old predicted
+counts at these sizes were 862,649, 1,711,267, and 3,450,598.
+
+`MeshCountModel` fits local measured slopes, declines forecasts beyond one
+octave, and uses exponent 1 before a second measurement. The probe ladder
+measures every half octave. Actual counts, not forecasts, determine delivery;
+the existing CHOLMOD/assembly solve-peak envelope and hard admission remain.
+The native replay forecasts 297,452 at 5.68 mm and 454,348 at 4 mm, respectively
+0.964595x and 1.999429x measured counts. At actual counts the unchanged solve
+envelopes are 12.1146, 21.1776, and 13.4971 GiB; these are not measured solve
+peaks. Recovery forecasts use delivered h and only preceding counts.
+
+`sim_mesh` and static FEA provenance now expose the named `measured_octave`
+mode, solve estimate, actual count, measured h/count/RSS probes, and model;
+static memory refusals retain this record. `simcache/5` prevents reuse of old
+coarsened/contact evidence. Contracts are appended in `worker_rpc.md`.
+The native governor regression covers true h^-2 scaling and the real
+nonmonotone sequence. The MCP thin-slice regression checks two delivered sizes
+and measured forecasts. Final focused proof: `governor` and `sim_cache`,
+**100% tests passed, 0 tests failed out of 2 (10.22 sec)**; MCP thin-slice case,
+**1 passed in 114.57s**. The existing material-swap test now uses its file's
+job-polling helper instead of treating a legitimate `status:running` response
+as a completed summary. Native size-band inspection proved that study does not
+enter the new probe ladder (`memory_coarsened=0`); physics assertions remain.
+Full touched MCP file: **114 passed in 1580.86s (0:26:20)**. All native and
+pytest runs used the prescribed cgroup wrappers; builds stayed in `build-fix`.
+The unchanged 2000-byte/tet10 mesh ceiling model predicts 0.393374, 0.574384,
+and 0.423266 GiB at the measured counts: 1.4784x, 1.6205x, and 1.4500x actual
+mesh peak RSS. It already meets the 2x mesh-memory bound; it was not substituted
+for the distinct solve-factor model. Evidence is `/tmp/governor-evidence.json`.

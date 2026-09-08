@@ -80,7 +80,8 @@ def _static(doc_id: str, **kw) -> dict:
     a worker thread (`auto_backgrounded`) to dodge the transport timeout, so the result has
     to be polled off get_job — otherwise a loaded box turns a numeric assertion into a
     flake about a job_id."""
-    out = json.loads(_dispatch()("run_fea_static")(doc_id=doc_id, material="steel", **kw))
+    material = kw.pop("material", "steel")
+    out = json.loads(_dispatch()("run_fea_static")(doc_id=doc_id, material=material, **kw))
     if out.get("skipped"):
         pytest.skip(f"FEA backend unavailable: {out.get('reason')}")
     jid = out.get("job_id")
@@ -1125,14 +1126,10 @@ def test_a_doubled_load_doubles_the_linear_static_answer(bc_doc):
 def test_swapping_steel_for_aluminium_changes_the_stiffness_it_solved_with(bc_doc):
     """Silent material drop is the rib/thread defect class. Same load, same mesh: deflection
     must scale as E_steel/E_alu (~2.9), and stress must NOT move (statically determinate)."""
-    bind = _dispatch()("run_fea_static")
-    steel = json.loads(bind(doc_id=bc_doc, fixtures=["bottom"], material="steel",
-                            loads=[{"face": "top", "force": [0, 0, -200]}]))
-    alu = json.loads(bind(doc_id=bc_doc, fixtures=["bottom"], material="aluminum",
-                          loads=[{"face": "top", "force": [0, 0, -200]}]))
-    for r in (steel, alu):
-        if r.get("skipped"):
-            pytest.skip(f"FEA backend unavailable: {r.get('reason')}")
+    steel = _static(bc_doc, fixtures=["bottom"], material="steel",
+                    loads=[{"face": "top", "force": [0, 0, -200]}])
+    alu = _static(bc_doc, fixtures=["bottom"], material="aluminum",
+                  loads=[{"face": "top", "force": [0, 0, -200]}])
     ratio = alu["summary"]["max_disp_mm"] / steel["summary"]["max_disp_mm"]
     assert 2.4 < ratio < 3.4, (ratio, steel["summary"], alu["summary"])
     assert alu["summary"]["max_von_mises_mpa"] == pytest.approx(
@@ -1915,3 +1912,40 @@ def test_collect_static_omits_plausibility_when_the_engine_sent_none(monkeypatch
         dict(_STATIC_RAW), [])
     assert out["ok"] is True, out
     assert "plausibility" not in out and "warnings" not in out, out
+
+
+def test_thin_slice_governor_uses_measured_count_at_two_sizes(tmp_path, monkeypatch):
+    """A box-envelope overestimate must not discard a feasible thin plate mesh."""
+    from services.mcp import core_bridge as cb
+
+    if not cb.available():
+        pytest.skip("native mesh bridge unavailable")
+    # The fine mesh measures 94,528 tet10 (~3.7 GiB solve envelope), while the
+    # old bbox prediction says 260k / 16.5 GiB. Budget between those numbers.
+    monkeypatch.setenv("CHUDWARE_MEM_CAP_GB", "5")
+    doc = cb.call("doc_new", {"kind": "part", "name": "governor_thin_slice"})["doc_id"]
+    try:
+        cb.call("doc_apply_ops", {"doc_id": doc, "ops": [{
+            "op": "add_feature", "feature": {
+                "type": "box", "name": "ThinSlice",
+                "params": {"length": 120, "width": 80, "height": 2},
+            },
+        }]})
+        step = str(tmp_path / "thin_slice.step")
+        cb.call("doc_export_step", {"doc_id": doc, "path": step})
+        for h in (4.0, 2.84):
+            mesh = cb.call("sim_mesh", {
+                "step_path": step, "target_size_mm": h, "order": 2,
+            })
+            assert mesh["ok"], mesh
+            evidence = mesh["provenance"]["governor"]
+            measured = evidence["measured_probe"]
+            assert mesh["char_len_mm"] == pytest.approx(h), evidence
+            assert measured["elems"] == mesh["n_elems"]
+            assert 0.5 * measured["elems"] <= evidence["estimated_elems"] <= 2 * measured["elems"]
+            forecasts = [p for p in evidence["probes"] if p["predicted_elems"] is not None]
+            assert forecasts, "fixture must exercise a measured governor re-fill"
+            for probe in forecasts:
+                assert 0.5 * probe["elems"] <= probe["predicted_elems"] <= 2 * probe["elems"], probe
+    finally:
+        cb.call("doc_close", {"doc_id": doc})

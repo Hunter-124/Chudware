@@ -561,12 +561,24 @@ private:
     Built angle() {
         if (!std::isfinite(value_))
             throw std::runtime_error("angle value must be finite");
-        const Vector3d da_l = unit(ga_.dir_vector());
+        Vector3d da_l = unit(ga_.dir_vector());
         // `align: anti` measures to the opposite of b's direction, as it does for every
         // other direction mate here: an anti target of A deg is the aligned A - 180 deg.
-        const Vector3d db_l = unit(Vector3d(sign_ * gb_.dir_vector()));
+        Vector3d db_l = unit(Vector3d(sign_ * gb_.dir_vector()));
         const double target = deg2rad(value_);
         const Vector3d ref_l = angle_reference_local(da_l, db_l);
+        if (params_.is_object() && params_.contains("axis_point") &&
+            (params_.contains("axis") || params_.contains("reference_axis"))) {
+            const Vector3d db_a = fa_->R_auth.transpose() * fb_->R_auth * db_l;
+            if (da_l.cross(ref_l).norm() < 1e-6 || db_a.cross(ref_l).norm() < 1e-6) {
+                // Faces normal to the pin cannot measure its phase. A line-carrying
+                // mate is a joint between BODY frames, so measure rotation from
+                // their authored relative orientation instead (zero at authoring).
+                Vector3d unused;
+                perp_basis(ref_l, da_l, unused);
+                db_l = fb_->R_auth.transpose() * fa_->R_auth * da_l;
+            }
+        }
         auto self = this;
         // s = |pa||pb| sin(theta), c = |pa||pb| cos(theta) for the ref-perpendicular
         // projections pa, pb of da, db. `ref` is normalized here (s is linear in it, c
@@ -692,7 +704,7 @@ private:
 
         if (auto authored = param_vec3({"axis", "reference_axis"})) {
             const Vector3d p = perp_to_da(*authored);
-            if (p.norm() < 1e-6)
+            if (p.norm() < 1e-6 && !params_.contains("axis_point"))
                 throw std::runtime_error(
                     "angle reference axis is parallel to the mate's first direction: "
                     "no angle can be measured about it");
@@ -1593,6 +1605,7 @@ MateSolveResult solve_mates(const json& components, const json& mates,
     for (auto& cid : frame_order) frames[cid].alloc(system);
 
     std::vector<std::pair<std::string, std::string>> mate_records;  // (mid, forced-status or "")
+    std::map<std::string, std::string> unresolved_reasons;
     std::vector<std::string> active_tags;
     // Builders own MateBuilder via stable storage (deque-like vector of unique_ptr).
     std::vector<std::unique_ptr<MateBuilder>> builder_store;
@@ -1650,7 +1663,8 @@ MateSolveResult solve_mates(const json& components, const json& mates,
             rfunc = std::get<0>(built);
             jfunc = std::get<1>(built);
             m = std::get<2>(built);
-        } catch (const std::exception&) {
+        } catch (const std::exception& e) {
+            unresolved_reasons[mid] = e.what();
             mate_records.push_back({mid, "unresolved"});
             continue;
         }
@@ -1830,7 +1844,10 @@ MateSolveResult solve_mates(const json& components, const json& mates,
         else if (in_set(conflicting, mid)) status = "conflicting";
         else if (in_set(redundant, mid)) status = "redundant";
         else status = "ok";
-        out.mate_status.push_back({mid, mtype, status});
+        if (status == "unresolved") res_converged = false;
+        out.mate_status.push_back({mid, mtype, status,
+            status == "unresolved" ? (unresolved_reasons.count(mid)
+                ? unresolved_reasons.at(mid) : "mate references could not be resolved") : ""});
     }
 
     // Per-mate residual report, worst first. This is the diagnosis a caller needs when
@@ -1942,7 +1959,8 @@ json solve_mates_json(const json& input) {
 
     json statuses = json::array();
     for (const auto& s : res.mate_status)
-        statuses.push_back({{"mate_id", s.mate_id}, {"type", s.type}, {"status", s.status}});
+        statuses.push_back({{"mate_id", s.mate_id}, {"type", s.type}, {"status", s.status},
+                            {"reason", s.reason}});
     out["mate_status"] = statuses;
 
     json residuals = json::array();

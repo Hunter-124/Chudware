@@ -50,10 +50,21 @@ struct MeshAdvisor {
   std::string note;
 };
 
+// Measured before solver assembly, not a factorization measurement. Count
+// forecasts belong to the immediately preceding (at most one-octave) probe.
+struct MeshGovernorProbe {
+  double h = 0.0;
+  uint64_t elems = 0;
+  double rss_gb = 0.0;
+  double predicted_elems = 0.0; // 0 = unmeasured bootstrap
+  double exponent = 2.0;
+};
+
 struct MeshOut {
   std::vector<double> points; // n*3 flat, row-major, millimetres
   std::vector<int> tets;      // m*K flat, 0-based; K is nodes_per_elem
   double char_len_mm = 0.0;
+  std::vector<MeshGovernorProbe> governor_probes;
   int n_nodes = 0;
   int n_elems = 0;
   int nodes_per_elem = 4; // 4 (tet4) or 10 (tet10)
@@ -257,6 +268,9 @@ struct MeshLocalRefine {
   std::vector<double> points; // n*3 flat, millimetres, world coordinates
   double size_mm = 0.0;       // requested local element size, mm (0 = no request)
   double band_mm = 0.0;       // influence radius around each point, mm
+  // Optional maximum direct-refinement depth; conforming closure can extend beyond.
+  // Contact uses 3*size_mm: two fine layers plus one graded transition layer.
+  double max_depth_mm = 0.0;
   std::string label;          // what asked for it, quoted in the mesh note
 
   bool active() const { return size_mm > 0.0 && !points.empty(); }

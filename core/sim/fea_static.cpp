@@ -1812,8 +1812,8 @@ static FeaStaticResult solve_impl(const std::vector<double>& points,
         }
         // Before dropping a load-bearing component's last support, retain its
         // load-facing travel pairs for the next iterate. They are NOT converged
-        // contacts until the ordinary zero-gap test accepts them. Opposite-facing
-        // pairs cannot rescue a genuine lift-off.
+        // contacts until the solved gap/force complementarity test accepts them.
+        // Opposite-facing pairs cannot rescue a genuine lift-off.
         auto preserve_load_support = [&](std::vector<char>& next) {
             std::vector<int> parent = base_parent;
             for (int p = 0; p < n_pairs; ++p)
@@ -2682,17 +2682,44 @@ static FeaStaticResult solve_impl(const std::vector<double>& points,
 
             std::vector<double> u_iter(static_cast<std::size_t>(n_dof), 0.0);
             std::vector<char> next_active(static_cast<std::size_t>(n_pairs), 0);
-            // The set from two iterations back: an active-set loop can CHATTER between
-            // two states (a pair on the edge of closing). Detecting the 2-cycle stops at
-            // iteration 3 instead of paying max_iterations factorizations for a result
-            // that is reported non-converged either way.
+            // Retain the previous solved set to detect A -> B -> A. Released
+            // pairs remember their state so marginal penetration cannot re-seat
+            // them on the next solve (or simply one iteration later).
             std::vector<char> prev_prev_active;
-            std::vector<Eigen::Triplet<double>> spring_trips;
+            std::vector<char> released(static_cast<std::size_t>(n_pairs), 0);
+            bool union_iteration = false;
+            double interface_h = contact_options.interface_h_mm;
+            if (!(interface_h > 0.0)) {
+                std::vector<double> lengths;
+                lengths.reserve(pairs.size());
+                for (const auto& cp : pairs)
+                    if (cp.area > 0.0) lengths.push_back(std::sqrt(cp.area));
+                if (!lengths.empty()) {
+                    const auto mid = lengths.begin() + lengths.size() / 2;
+                    std::nth_element(lengths.begin(), mid, lengths.end());
+                    interface_h = *mid;
+                }
+            }
+            // 0.1% of the interface element size resolves opening/closing below
+            // the mesh scale. The force band is 0.01% of the applied resultant
+            // divided among the current active pairs: aggregate tolerated tension
+            // cannot become a load-bearing support as the mesh is refined.
+            const double tol_g = 1e-3 * interface_h;
+            Eigen::Vector3d applied = Eigen::Vector3d::Zero();
+            for (int i = 0; i < n_nodes; ++i)
+                for (int d = 0; d < 3; ++d)
+                    applied[d] += nodal_forces[static_cast<std::size_t>(i) * 3 + d];
+            const double force_band = 1e-4 * applied.norm();
+            if (contact_report) contact_report->hysteresis_tol_g_mm = tol_g;
             bool set_stable = false;
             const int max_it = contact_options.max_iterations;
             for (int iter = 1; iter <= max_it; ++iter) {
                 if (cancelled()) return cancel_result();
                 if (contact_report) contact_report->contact_iterations = iter;
+                const int n_active = static_cast<int>(
+                    std::count(contact_active.begin(), contact_active.end(), char{1}));
+                const double tol_f = force_band / std::max(1, n_active);
+                if (contact_report) contact_report->hysteresis_tol_f_n = tol_f;
                 // (1) Mechanism gate on the CURRENT active set. A part whose contact has
                 // fully separated is free to fly off; its "solution" is arbitrary.
                 {
@@ -2737,26 +2764,32 @@ static FeaStaticResult solve_impl(const std::vector<double>& points,
                     return res;
                 }
                 prof.mark("contact-iteration");
-                // (3) Gap per pair from this iterate, then the new active set:
-                // penetrating (g < 0) is active, separated (g >= 0) is not. The
-                // tolerance is 0 and it is applied to EVERY pair, active or not —
-                // the same test as seed rung 1, so a pair seats the moment the
-                // deformation closes it and is released the moment it opens. No
-                // tolerance band is admissible here: a pair kept active at g > 0
-                // would carry k·g of tension across the interface.
+                // (3) Compression-positive normal force is -k*g. Release only
+                // below -tol_f; a released pair re-enters only past tol_g of
+                // penetration. A union recovery solve only releases tensile pairs.
+                // Check complementarity independently: retaining travel supports
+                // or suppressing an update must never manufacture convergence.
                 for (int d = 0; d < n_dof; ++d)
                     u_iter[static_cast<std::size_t>(d)] =
                         reduced[d] >= 0 ? uf(reduced[d]) : 0.0;
                 int n_changed = 0;
+                bool complementary = true;
                 for (int p = 0; p < n_pairs; ++p) {
                     const ContactPair& cp = pairs[static_cast<std::size_t>(p)];
                     double rel = 0.0;
                     for (int i = 0; i < 3; ++i)
                         rel += cp.n[i] * (u_iter[static_cast<std::size_t>(cp.b) * 3 + i] -
                                           u_iter[static_cast<std::size_t>(cp.a) * 3 + i]);
-                    const char now = (cp.gap0 + rel) < 0.0 ? 1 : 0;
-                    next_active[static_cast<std::size_t>(p)] = now;
-                    if (now != contact_active[static_cast<std::size_t>(p)]) ++n_changed;
+                    const auto at = static_cast<std::size_t>(p);
+                    const double gap = cp.gap0 + rel;
+                    const double normal_force = -cp.k * gap;
+                    const bool was_active = contact_active[at] != 0;
+                    complementary = complementary && std::isfinite(gap) &&
+                        (was_active ? normal_force >= -tol_f : gap >= -tol_g);
+                    const char now = was_active ? normal_force >= -tol_f :
+                        (!union_iteration && gap < -(released[at] ? tol_g : 0.0));
+                    next_active[at] = now;
+                    if (now != contact_active[at]) ++n_changed;
                 }
                 const bool travel_retained = n_changed > 0 && preserve_load_support(next_active);
                 if (travel_retained) {
@@ -2767,21 +2800,31 @@ static FeaStaticResult solve_impl(const std::vector<double>& points,
                 }
                 prof.note("contact iteration %d: %d pair(s) changed state", iter, n_changed);
                 solved = true;  // uf holds this iterate's solution
-                if (n_changed == 0 && !travel_retained) {
+                if (n_changed == 0 && !travel_retained && complementary) {
                     set_stable = true;
                     break;
                 }
-                // Out of iterations, or chattering between two sets: keep contact_active
-                // as the set that produced `uf`, so the reactions and the per-pair report
-                // below describe the same state the displacements came from. converged
-                // stays false either way.
+                // Exhaustion is still a refusal, not an acceptance of the last
+                // iterate. Keep its solved set for consistent reaction reporting.
                 if (iter == max_it) break;
+                union_iteration = false;
                 if (next_active == prev_prev_active) {
-                    prof.note("contact: active set is chattering between two states");
-                    break;
+                    for (int p = 0; p < n_pairs; ++p) {
+                        const auto at = static_cast<std::size_t>(p);
+                        next_active[at] = next_active[at] || contact_active[at];
+                    }
+                    union_iteration = true;
+                    if (contact_report) ++contact_report->cycles_broken;
+                    prof.note("contact: breaking active-set 2-cycle with a union solve");
+                    prev_prev_active.clear();
+                } else {
+                    prev_prev_active = contact_active;
                 }
-                prev_prev_active = contact_active;
-                contact_active = next_active;
+                for (int p = 0; p < n_pairs; ++p) {
+                    const auto at = static_cast<std::size_t>(p);
+                    if (contact_active[at] && !next_active[at]) released[at] = 1;
+                }
+                contact_active.swap(next_active);
             }
             if (contact_report) contact_report->converged = set_stable;
             res.solver = solver_label;

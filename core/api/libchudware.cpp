@@ -2753,6 +2753,7 @@ static int chudware_call_inner(const char* method, const char* params_json, char
                        {"char_len_mm", r.char_len_mm},
                        {"n_nodes", r.n_nodes},
                        {"n_elems", r.n_elems},
+                       {"provenance", {{"governor", chudware::sim::mesh_governor_json(r)}}},
                        {"nodes_per_elem", r.nodes_per_elem},
                        {"min_tet_volume_mm3", r.min_tet_volume_mm3},
                        {"max_tet_edge_ratio", r.max_tet_edge_ratio},

@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <mutex>
 #include <thread>
 
@@ -445,6 +446,24 @@ double fea_peak_gb(double n_elements, int nodes_per_element, int dof_per_node) {
 }
 
 }  // namespace
+
+void MeshCountModel::observe(double measured_h, double measured_elems) {
+    if (!(measured_h > 0.0) || !(measured_elems > 0.0) ||
+        !std::isfinite(measured_h) || !std::isfinite(measured_elems)) return;
+    if (h > 0.0 && elems > 0.0 &&
+        std::abs(std::log(h / measured_h)) > 1e-6)
+        exponent = std::clamp(std::log(measured_elems / elems) /
+                                  std::log(h / measured_h), -3.0, 3.0);
+    h = measured_h;
+    elems = measured_elems;
+}
+
+double MeshCountModel::predict(double target_h) const {
+    if (!(h > 0.0) || !(target_h > 0.0) ||
+        target_h < h * 0.5 || target_h > h * 2.0)
+        return std::numeric_limits<double>::quiet_NaN();
+    return elems * std::pow(h / target_h, exponent);
+}
 
 HostMem host_mem() {
     HostMem m;

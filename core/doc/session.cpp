@@ -4317,6 +4317,21 @@ std::pair<std::string, json> write_aicm_assembly(Session& s,
     return {path, bodies_meta};
 }
 
+// A line-carrying angle is a revolute joint whose scalar fixes its drive pose.
+// Report mechanism mobility separately from the remaining solved-pose freedom.
+int angle_drive_dof(const json& doc) {
+    int count = 0;
+    const auto mates = doc.find("mates");
+    if (mates == doc.end() || !mates->is_array()) return count;
+    for (const json& mate : *mates) {
+        if (mate.value("suppressed", false) || mate.value("type", "") != "angle") continue;
+        const auto value = mate.find("value");
+        if (value != mate.end() && value->is_object() && value->contains("axis_point") &&
+            (value->contains("axis") || value->contains("reference_axis"))) ++count;
+    }
+    return count;
+}
+
 // The assembly ops-response (port of the assembly branch of session.py::_ops_response).
 json ops_response_assembly(Session& s, const json& id_map,
                            std::vector<uint8_t>* aicm_blob_out = nullptr) {
@@ -4344,7 +4359,7 @@ json ops_response_assembly(Session& s, const json& id_map,
         for (const AsmMateStatus& ms : ares->mate_status)
             mates.push_back({{"id", ms.id}, {"type", ms.type}, {"status", ms.status},
                              {"dangling_refs", ms.dangling_refs},
-                             {"residual", ms.residual}});
+                             {"residual", ms.residual}, {"reason", ms.reason}});
         dof = ares->dof;
         over_defined = ares->over_defined;
         converged = ares->converged;
@@ -4373,6 +4388,10 @@ json ops_response_assembly(Session& s, const json& id_map,
         {"tolerance", tolerance},
         {"dof_summary", dof_summary},
     };
+    if (const int drives = angle_drive_dof(s.doc); drives > 0) {
+        rebuild["residual_dof"] = dof;
+        rebuild["dof"] = dof + drives;
+    }
     return json{
         {"revision", s.revision},
         {"id_map", id_map},
@@ -15547,6 +15566,7 @@ json doc_simulate_motion(const std::string& doc_id,
     }
     json pose_frames = json::array();
     bool all_pose_ok = true;
+    const int drive_dof = angle_drive_dof(sweep_doc);
 
     std::vector<double> samples;
     samples.reserve(static_cast<size_t>(steps));
@@ -15675,10 +15695,7 @@ json doc_simulate_motion(const std::string& doc_id,
 
         json frame = {{"i", i},
                       {"value", value},
-                      {"dof", solved.dof + (axis_line &&
-                          (*driven)["value"].contains("axis_point") &&
-                          ((*driven)["value"].contains("axis") ||
-                           (*driven)["value"].contains("reference_axis")) ? 1 : 0)},
+                      {"dof", solved.dof + drive_dof},
                       {"residual_dof", solved.dof},
                       {"converged", converged},
                       {"bodies", bodies_j}, {"pose_check", pose_check}};

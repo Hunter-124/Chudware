@@ -54,6 +54,7 @@
 
 #include "sim/mesh_size_band.h"
 #include "sim/solver_threads.h"
+#include "util/resource_governor.h"
 
 #include <adapt/graded_sizing.hpp>
 #include <adapt/loop.hpp>
@@ -712,6 +713,8 @@ pm::mesh::SizeFieldFn local_size_field(const MeshOptions &options, double h,
   // stamp lands inside one cell and changes nothing.
   const double band = request.band_mm > 0.0 ? request.band_mm : 2.0 * request.size_mm;
   seed_band = std::max(band, h);
+  if (request.max_depth_mm > 0.0)
+    seed_band = std::min(seed_band, request.max_depth_mm);
   // Clamped into the field's own legal band, at BOTH ends.
   //   * below: the lattice cannot place under h/4, and the caller is
   //     responsible for having lowered h far enough (see fill_with_recovery);
@@ -737,8 +740,10 @@ pm::mesh::SizeFieldFn local_size_field(const MeshOptions &options, double h,
   // cell where an L2 was asked for. Measured on the seated-pad assembly probe
   // (seat 8 x 8 mm, background 2.0 mm, requested 0.5 mm): beta 1.0 delivered an
   // interface element size of 2.07 mm, beta 0.5 delivers the L2 cells.
+  const double fill_beta = request.max_depth_mm > 0.0
+      ? std::max(0.5, (h - h_local) / request.max_depth_mm) : 0.5;
   pm::mesh::SizeFieldFn local =
-      pm::adapt::size_field_from_sources(sources, h_local, h, /*beta=*/0.5);
+      pm::adapt::size_field_from_sources(sources, h_local, h, fill_beta);
   if (!outer)
     return local;
   // Two requests, one field: whichever asks for the smaller element wins.
@@ -2355,8 +2360,11 @@ void deliver_local_contract(const LoadedModel &loaded, const MeshOptions &option
   // construction, and its DEPTH is what the refinement costs: 0.7 x spacing, not
   // a whole spacing, is the difference between a 38k-element shell and a 100k
   // one on the same seat.
-  const double core_mm =
+  const double uncapped_core =
       std::max(0.71 * seed_spacing_mm(seeds), 2.0 * request.size_mm);
+  const double core_mm = request.max_depth_mm > 0.0
+      ? std::min(uncapped_core, request.max_depth_mm * (2.0 / 3.0))
+      : uncapped_core;
   contract.core_mm = core_mm;
   const double reach_span = core_mm + h + 2.0 * request.size_mm;
   const std::vector<pm::adapt::SizeSource> sources =
@@ -2367,9 +2375,16 @@ void deliver_local_contract(const LoadedModel &loaded, const MeshOptions &option
     return (reach(p) - request.size_mm) / kBeta;  // saturates at reach_span
   };
   const double background = std::max(h, request.size_mm);
+  // Bound the fine shell independently of the background cell size. The last
+  // third of the requested depth grades back to the bulk; LEPP may still add
+  // closure neighbours outside this direct-marking zone.
+  const double grade = request.max_depth_mm > core_mm
+      ? std::max(kBeta, (background - request.size_mm) /
+                           (request.max_depth_mm - core_mm))
+      : kBeta;
   auto want = [&](const Eigen::Vector3d &p) {
     const double outside = std::max(0.0, seed_distance(p) - core_mm);
-    return std::min(background, request.size_mm + kBeta * outside);
+    return std::min(background, request.size_mm + grade * outside);
   };
   auto centroid_of = [&](const pm::fea::NodalElement &element) {
     Eigen::Vector3d centroid = Eigen::Vector3d::Zero();
@@ -3231,6 +3246,14 @@ bool build_mesh(const LoadedModel &loaded, const MeshOptions &options, double h,
                   h * 0.25, contract.waves, contract.elems_added,
                   contract.achieved_mm);
     append_note(out.note, text);
+    if (options.local_refine.max_depth_mm > 0.0) {
+      char depth[192];
+      std::snprintf(depth, sizeof(depth),
+          "direct refinement band depth capped at %.4g mm (3 interface layers: "
+          "2 fine + 1 graded); conforming closure neighbours may extend beyond",
+          options.local_refine.max_depth_mm);
+      append_note(out.note, depth);
+    }
     if (contract.waves > 0) {
       char placed[576];
       std::snprintf(placed, sizeof(placed),
@@ -3840,118 +3863,62 @@ bool mesh_loaded_model(const LoadedModel &loaded, const MeshOptions &options,
                        MeshOut &out) {
   if (!fill_with_recovery(loaded, options, /*h_start=*/0.0, out))
     return false;
+  std::vector<MeshGovernorProbe> probes;
+  chudware::governor::MeshCountModel count_model;
+  auto record_probe = [&](const MeshOut& mesh, double prediction) {
+    const double exponent = count_model.exponent;
+    probes.push_back({mesh.char_len_mm, static_cast<uint64_t>(mesh.n_elems),
+                     chudware::governor::process_rss_bytes() / 1073741824.0,
+                     std::isfinite(prediction) ? prediction : 0.0, exponent});
+    count_model.observe(mesh.char_len_mm, mesh.n_elems);
+  };
+  record_probe(out, 0.0);
+  out.governor_probes = std::move(probes);
   const double honest = loaded.band.geometry_base;
   if (!(honest > 0.0) || !(honest < loaded.band.base * (1.0 - 1e-9)))
     return true;
 
-  // ── The coarsening was PREDICTED; a fill MEASURES it ──────────────────────
-  // The band model is max(6V/h^3, 105*A_bbox/h^2), and on the ME 490
-  // caliper-bracket isolate (body 201 — rods that pass through each other) it
-  // over-predicts by 15 % at h = 4.0 mm, 160 % at 3.0 and 440 % at 2.2. So the
-  // coarsening it justifies is a different multiple of the request on every leg
-  // of one ladder, and the delivered mesh is not monotone in h: measured tet10,
-  // 345,716 elements at 4.0 mm (25.07 GB projected peak) against 271,233 at
-  // 3.0 mm (17.52 GB) — the exact non-monotone pair the blocked packet
-  // reported. The cause is the fill, not the model alone: on a feature-dominated
-  // solid a COARSER lattice straddles more of the knife-edge geometry and the
-  // fill spends its budget on feature seeds, so coarsening buys nothing and
-  // costs resolution.
-  //
-  // Three measured steps, each bounded to one extra fill and each only on the
-  // path where the study would otherwise be refused:
-  //   1. re-fill at the size the study ASKED for, when the measurement and the
-  //      model disagree by more than 30 % (or when the coarse mesh does not fit
-  //      the element limit either, i.e. the coarsening failed its own purpose);
-  //   2. keep whichever of the two is CHEAPER — a coarsening is justified by
-  //      cost, so cost is what has to be measured, not predicted;
-  //   3. if the coarse fill was the more expensive one, the count is falling
-  //      with refinement on THIS geometry (the feature-dominated signature, and
-  //      the only thing that can make a memory estimate rise as h rises), so
-  //      when the honest mesh still does not fit, step once further in the
-  //      direction the measurement points — 0.8x — and keep that if it is
-  //      cheaper again. On an ordinary part the coarse fill is the cheap one and
-  //      this step never runs.
-  if (loaded.band.memory_coarsened && loaded.band.element_limit > 0 &&
-      out.n_elems > 0 && loaded.band.predicted_elements > 0.0) {
-    const double exponent =
-        loaded.band.predict_exponent > 0.0 ? loaded.band.predict_exponent : 2.0;
-    const double measured_at_request =
-        static_cast<double>(out.n_elems) *
-        std::pow(loaded.band.base / honest, exponent);
-    const double model = loaded.band.predicted_elements;
-    const double limit = static_cast<double>(loaded.band.element_limit);
-    const bool disagree =
-        std::abs(model - measured_at_request) > 0.30 * measured_at_request;
-    const bool coarse_fits = static_cast<double>(out.n_elems) <= limit;
-    if (disagree || !coarse_fits) {
-      MeshOut coarse = std::move(out);
-      out = MeshOut();
-      char text[640];
-      if (!fill_with_recovery(loaded, options, honest, out)) {
-        out = std::move(coarse);
-        std::snprintf(text, sizeof(text),
-                      "the coarsened %.4g mm mesh (%d elements) was measured "
-                      "against the requested %.4g mm, but the re-fill at that "
-                      "size failed, so the coarsened mesh stands",
-                      loaded.band.base, coarse.n_elems, honest);
-        append_note(out.note, text);
-        return true;
+  // The bounding-box envelope is only a bootstrap, never evidence of the
+  // requested mesh's cost. Measure every half-octave: feature-driven thin
+  // fills need not be monotone, and one full-octave step can miss their turnover.
+  // Previously a 14.72 mm probe was extrapolated directly to 2.84 mm, then that
+  // forecast overruled even the ACTUAL count of the requested refill.
+  if (loaded.band.memory_coarsened && loaded.band.element_limit > 0) {
+    probes = std::move(out.governor_probes);
+    const auto limit = loaded.band.element_limit;
+    while (count_model.h > honest * (1.0 + 1e-9)) {
+      const double next = std::max(honest, count_model.h / std::sqrt(2.0));
+      MeshOut candidate;
+      if (!fill_with_recovery(loaded, options, next, candidate)) {
+        append_note(out.note, "measured_octave governor: finer probe refused: " +
+                                 candidate.error);
+        break;
       }
-      const bool coarsening_backfired = coarse.n_elems > out.n_elems;
-      if (!coarsening_backfired && !(measured_at_request <= limit)) {
-        // The coarsening really was cheaper and the request really does not
-        // fit: keep the coarse mesh, and say what it was measured against.
-        std::snprintf(text, sizeof(text),
-                      "the memory coarsening %.4g->%.4g mm was VERIFIED on "
-                      "measurement: %d elements coarse against %d at the "
-                      "requested size (the size model predicted %.0fk there, "
-                      "%.0f%% off the measured ~%.0fk; limit %.0fk)",
-                      honest, loaded.band.base, coarse.n_elems, out.n_elems,
-                      model / 1000.0,
-                      100.0 * std::abs(model - measured_at_request) /
-                          measured_at_request,
-                      measured_at_request / 1000.0, limit / 1000.0);
-        out = std::move(coarse);
-        append_note(out.note, text);
-        return true;
-      }
-      std::snprintf(text, sizeof(text),
-                    "the memory coarsening %.4g->%.4g mm was WITHDRAWN on "
-                    "measurement: %d elements at the requested size against %d "
-                    "coarse (the size model predicted %.0fk, %.0f%% off the "
-                    "measured ~%.0fk; limit %.0fk)%s",
-                    honest, loaded.band.base, out.n_elems, coarse.n_elems,
-                    model / 1000.0,
-                    100.0 * std::abs(model - measured_at_request) /
-                        measured_at_request,
-                    measured_at_request / 1000.0, limit / 1000.0,
-                    coarsening_backfired
-                        ? " — coarsening COST elements on this geometry"
-                        : "");
-      append_note(out.note, text);
-      // Step 3: the measurement says refinement is what makes this fill
-      // cheaper. Take exactly one more step while the mesh still does not fit.
-      if (coarsening_backfired &&
-          static_cast<double>(out.n_elems) > limit && honest > 1e-9) {
-        MeshOut honest_mesh = std::move(out);
-        out = MeshOut();
-        const double finer = honest * 0.8;
-        if (fill_with_recovery(loaded, options, finer, out) &&
-            out.n_elems > 0 && out.n_elems < honest_mesh.n_elems) {
-          std::snprintf(text, sizeof(text),
-                        "…and one step FINER is cheaper again: %.4g mm gives %d "
-                        "elements against %d at %.4g mm, so the study was "
-                        "delivered at %.4g mm — on this geometry the element "
-                        "count falls with refinement, so a coarser request is "
-                        "never the cheaper mesh",
-                        finer, out.n_elems, honest_mesh.n_elems, honest, finer);
-          append_note(out.note, text);
-        } else {
-          out = std::move(honest_mesh);
-        }
-      }
-      return true;
+      const double previous_h = count_model.h;
+      // Recovery may change h; predict its delivered size from PREVIOUS counts,
+      // before observing this candidate. Never label a different-size forecast.
+      record_probe(candidate, count_model.predict(candidate.char_len_mm));
+      // Resolution wins whenever the ACTUAL mesh fits. If neither fits, retain
+      // the cheaper mesh for the solver's unchanged hard admission/refusal.
+      const bool candidate_fits = static_cast<uint64_t>(candidate.n_elems) <= limit;
+      const bool current_fits = static_cast<uint64_t>(out.n_elems) <= limit;
+      if (candidate_fits ||
+          (!current_fits && candidate.n_elems < out.n_elems))
+        out = std::move(candidate);
+      // Recovery can itself change h. Do not loop on a non-progressing fill.
+      if (!(count_model.h < previous_h * (1.0 - 1e-9))) break;
     }
+    out.governor_probes = std::move(probes);
+    char text[384];
+    std::snprintf(text, sizeof(text),
+                  "%smeasured_octave governor: requested %.4g mm, delivered %.4g mm; "
+                  "%d ACTUAL elements versus %llu solve-budget elements; "
+                  "bounding-box forecast replaced by measured probes",
+                  out.char_len_mm > honest * (1.0 + 1e-9) ? "auto-coarsened by " : "",
+                  honest, out.char_len_mm, out.n_elems,
+                  static_cast<unsigned long long>(limit));
+    append_note(out.note, text);
+    return true;
   }
   if (out.connected_components <= 1)
     return true;
@@ -3974,6 +3941,9 @@ bool mesh_loaded_model(const LoadedModel &loaded, const MeshOptions &options,
                   honest, out.connected_components, out.n_elems,
                   coarse.n_elems);
     append_note(out.note, text);
+    probes = std::move(coarse.governor_probes);
+    record_probe(out, count_model.predict(out.char_len_mm));
+    out.governor_probes = std::move(probes);
     return true;
   }
   std::snprintf(text, sizeof(text),
@@ -4220,6 +4190,9 @@ bool mesh_separate_solids(const std::vector<BodyGroup> &bodies,
     combined.debris_elems_dropped += part.debris_elems_dropped;
     combined.debris_volume_mm3 += part.debris_volume_mm3;
     combined.char_len_mm = std::min(combined.char_len_mm, part.char_len_mm);
+    combined.governor_probes.insert(combined.governor_probes.end(),
+                                   part.governor_probes.begin(),
+                                   part.governor_probes.end());
     // The local size contract is a property of the WHOLE mesh a study solves,
     // and every solid was meshed against the same seed set: the worst achieved
     // size decides whether the contract was met, and a ceiling that bound on
@@ -4283,6 +4256,9 @@ bool mesh_separate_solids(const std::vector<BodyGroup> &bodies,
     return false;
   }
   combined.ok = true;
+  combined.governor_probes.push_back(
+      {combined.char_len_mm, static_cast<uint64_t>(combined.n_elems),
+       chudware::governor::process_rss_bytes() / 1073741824.0, 0.0, 2.0});
   out = std::move(combined);
   return true;
 }

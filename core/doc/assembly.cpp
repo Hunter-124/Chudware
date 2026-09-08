@@ -776,6 +776,7 @@ AssemblyResult compile_assembly(const json& doc, const std::string& base_dir,
         st.id = m.mate_id;
         st.type = m.type;
         st.status = m.status;
+        st.reason = m.reason;
         auto rit = mate_residual.find(m.mate_id);
         if (rit != mate_residual.end()) st.residual = rit->second;
         auto dit = dangling.find(m.mate_id);

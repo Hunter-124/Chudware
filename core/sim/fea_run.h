@@ -26,6 +26,10 @@
 
 namespace chudware::sim {
 
+struct MeshOut;
+// Shared mesh-only and solved-study governor evidence (RSS is pre-assembly).
+nlohmann::json mesh_governor_json(const MeshOut& mesh, int dof_per_node = 3);
+
 // Resolve mesh nodes within tol_mm of ANY faceset sample point — a direct port
 // of engine/sim/fea_static.py:_nodes_in_faceset. points is n*3 flat, sample is
 // k*3 flat. Returns SORTED UNIQUE node indices (ascending; node i = the i-th

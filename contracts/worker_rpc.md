@@ -1307,3 +1307,105 @@ of the posed wheel axle lines. Explicit steer axes remain WORLD lines and drive
 on the left of the placement, with carried mate islands following the same
 world rigid motion. Native `pose_check` reconstructs the expected rotation from
 the requested world line and scalar value, independently of the drive matrix.
+
+## Closed-fit contact idealization and bounded refinement (2026-09-08)
+
+`run_fea_contact` forwards `closed_fit` (boolean, default true) and optional
+`closed_fit_gap_mm` (finite nonnegative mm) to `study.contact`. The default
+threshold is one quarter of the **measured** interface element size. Only
+nonnegative gaps actually measured on analytic CAD faces and strictly below the
+threshold are idealized as initially closed; facet-only/fallback gaps are not.
+Raw CAD/facet gap measurements remain in the packet. Idealization changes only
+the initial normal spring gap to zero: compression-only normal contact, free
+tangential motion, active-set opening under tension, and load-path checks remain.
+`closed_fit:false` preserves the clearance-resolved model and existing refusals.
+
+`contact.resolution.mode` is `"closed_fit"` when any pairs were idealized, otherwise
+`"resolved"` (the separate `resolved` boolean still determines acceptance).
+The former carries `closed_fit:{pairs,gap_mm_max,limit_mm,note}`. The packet notes
+state that the clearance was **not resolved**, and describe the bearing pressure
+distribution as the conformal-fit upper bound. This bounds the conformal bearing
+distribution, not the peak of a clearance-resolved Hertz contact: a conformal-fit
+peak is checked between `P/(d*L)` and the finite-clearance Hertz line-contact peak,
+not against a false claim of matching Hertz within ten percent.
+Seatable-pair and geometric patch criteria use the initially closed pairs; the
+post-solve minimum active population, equilibrium, and load-path criteria are
+not relaxed. Sparse or unloaded patches still refuse with the required size.
+
+Contact interface refinement requests a maximum direct influence depth of
+`3*interface_size_mm`: two fine layers and one graded transition layer. The fill
+stamp, graded field and bisection field honor that depth; conforming mesh closure
+can add neighboring elements outside the directly marked band. Mesh notes report
+the band depth, bisection waves, added elements and measured delivered size.
+This bounds the direct refinement region, not total element count or process RAM.
+The existing delivery refusal still applies if the bounded band cannot deliver
+the requested interface size.
+
+On Linux, successful solve provenance includes `peak_rss_gb` in GiB measured with
+`getrusage(RUSAGE_SELF)` and `peak_rss_scope:"solver_process_lifetime"`. This is a
+process-lifetime high-water mark, not an incremental estimate or per-study delta.
+
+## Measured mesh-count governor (2026-09-08)
+
+`sim_mesh` and STEP-backed static/contact results carry `provenance.governor`.
+Its named `mode:"measured_octave"` preserves the existing hard mesh ceiling and
+solve-memory admission. The unmeasured bounding-box envelope chooses only an
+initial mesh-only probe (at most twice an explicit requested size); it is not
+the requested study's measured cost. Subsequent mesh-count forecasts use a
+geometry-local power fit and never span more than one octave in element size
+without another mesh measurement. Actual measured counts, not forecasts,
+decide whether the finer mesh fits the solve budget.
+
+The record contains `estimate_gb` (GiB solve-peak envelope evaluated at
+`estimated_elems`, the delivered mesh's actual count), `measured_probe` with
+`h` (mm), `elems`, and `rss_gb`, and `probes` containing the measured sequence.
+Probe `predicted_elems` is null for the unmeasured bootstrap or a combined-body
+measurement; otherwise it is the preceding probe's bounded forecast and
+`exponent` identifies that forecast's power. `model.count`, `model.solve_peak`,
+`model.rss_stage`, and `model.dof_per_node` identify the model and measurement
+stage. Probe RSS is process resident memory before solver assembly, not CHOLMOD
+factor memory, a solve-peak measurement, or an incremental per-element cost.
+Inline meshes that never ran the mesher have no mesh-probe evidence.
+Static solve-memory refusals retain the governor record as well.
+
+The contact refinement seed search uses the same explicit interface policy as
+the solve. `interface_size_mm` refines contact-classified interfaces only;
+bonded and free pairs do not seed that field. This prevents an explicitly
+bonded sleeve exterior from launching a second fine shell through its entire
+wall when only its interior running fit needs contact resolution.
+Closed-fit successful summaries also carry `summary.contact_resolution_note`
+so the unresolved-clearance disclosure remains visible beside stress and FoS.
+
+The mesh-count probe scheduler samples at half-octave intervals. Its first
+forecast uses exponent 1 (a 2x envelope for slopes from -1 through 3 over that
+interval); subsequent forecasts fit measured local slopes, including negative
+slopes on feature-driven fills. The maximum extrapolation remains one octave.
+Simulation cache namespace `chudware-simcache/5` invalidates pre-governor and
+pre-closed-fit results; old coarse meshes cannot masquerade as current evidence.
+
+## Contact support-normal refusal (2026-09-08)
+
+A frictionless contact-held solid whose applied resultant lies outside a
+provably separating coordinate half-space of its admissible normal cone is
+refused before matrix assembly or factorization. The proof uses the entire
+candidate population, a superset of any active contact patch, not invented
+active-pair forces. CAD closest-point directions are reused when available;
+otherwise the mesh-facet direction is used. Floating bonded clusters are left
+to the existing full-system checks rather than incorrectly testing each
+constituent solid as an independently supported body.
+
+The refusal carries `contact.load_path_refusal.criterion:
+"normal_cone_excludes_load"`, one-based source-body `bodies` when a single
+interface is involved, the separating `axis`, oriented `normal_range.min/max`,
+normalized `load_direction`, and `supported_arc_deg` measured in the
+load/separating-axis plane. `normal_population:"candidate_superset_of_active"`
+and `normal_source` identify the evidence. Refining a clearance cannot supply
+the missing reaction; no stress, displacement, or pressure summary is returned.
+Closed-fit mode does not bypass this check and does not introduce friction,
+opposing restraints, tensile ties, or a fictitious equilibrium.
+
+Geometric and rigid-support preflight precede solve-memory admission; admission
+still occurs before solver assembly. The refusal retains mesh counts,
+`mesh_quality`, and `provenance` including measured governor and process-peak
+RSS evidence. The same diagnostic fields survive synchronous contact
+collection and durable `sim_results` failure collection.

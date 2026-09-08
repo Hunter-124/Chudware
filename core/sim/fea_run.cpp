@@ -27,6 +27,9 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
+#ifdef __linux__
+#include <sys/resource.h>
+#endif
 
 // ── OCCT, for the analytic contact-gap measurement only ───────────────────────
 // detail::make_cad_gap_probe re-reads the study's own STEP/BREP so a candidate
@@ -71,6 +74,34 @@
 using nlohmann::json;
 
 namespace chudware::sim {
+
+json mesh_governor_json(const MeshOut& mesh, int dof_per_node) {
+    json probes = json::array();
+    json delivered = nullptr;
+    for (const auto& probe : mesh.governor_probes) {
+        json row{{"h", probe.h}, {"elems", probe.elems},
+                 {"rss_gb", probe.rss_gb},
+                 {"predicted_elems", probe.predicted_elems > 0.0
+                                         ? json(probe.predicted_elems) : json(nullptr)},
+                 {"exponent", probe.exponent}};
+        probes.push_back(row);
+        if (probe.h == mesh.char_len_mm &&
+            probe.elems == static_cast<uint64_t>(mesh.n_elems))
+            delivered = row;
+    }
+    return json{
+        {"mode", "measured_octave"},
+        {"estimate_gb", chudware::governor::fea_peak_bytes(
+                            mesh.n_elems, mesh.nodes_per_elem, dof_per_node) /
+                            1073741824.0},
+        {"estimated_elems", mesh.n_elems},
+        {"measured_probe", delivered},
+        {"probes", std::move(probes)},
+        {"model", {{"count", "geometry_local_power_fit_max_one_octave"},
+                   {"solve_peak", chudware::governor::fea_calibration_basis()},
+                   {"rss_stage", "mesh_before_assembly"},
+                   {"dof_per_node", dof_per_node}}}};
+}
 
 namespace detail {
 // The one advisor->JSON shape. Every study route that can carry a learned-advisor
@@ -156,6 +187,7 @@ struct MeshQualityFacts {
     // Chudware never sized), and it is emitted as null rather than as a
     // plausible-looking zero.
     double char_len_mm = 0.0;
+    json governor;
     // ── The refined region's own quality (mesher.h MeshOut) ──────────────────
     // A local size contract is delivered by conforming bisection, which is
     // shapely nowhere except at the interface it was asked for: the ME 490
@@ -291,11 +323,19 @@ std::string utc_now_iso8601() {
 // Which engine, which mesher, which commit, when — the reproducibility half of a
 // result. `solver` is the canonical route name ("chudware/fea_static", …).
 json provenance_json(const char* solver) {
-    return json{{"engine_build_id", CHUDWARE_HOSTD_BUILD_ID},
-                {"polymesh_commit", CHUDWARE_POLYMESH_COMMIT},
-                {"solver", solver},
-                {"mesher", "polyhedral-fea/graded-tet"},
-                {"timestamp_utc", utc_now_iso8601()}};
+    json out{{"engine_build_id", CHUDWARE_HOSTD_BUILD_ID},
+             {"polymesh_commit", CHUDWARE_POLYMESH_COMMIT},
+             {"solver", solver},
+             {"mesher", "polyhedral-fea/graded-tet"},
+             {"timestamp_utc", utc_now_iso8601()}};
+#ifdef __linux__
+    rusage usage{};
+    if (getrusage(RUSAGE_SELF, &usage) == 0) {
+        out["peak_rss_gb"] = static_cast<double>(usage.ru_maxrss) / (1024.0 * 1024.0);
+        out["peak_rss_scope"] = "solver_process_lifetime";
+    }
+#endif
+    return out;
 }
 
 bool vtu_evidence_missing(const nlohmann::json& study) {
@@ -654,6 +694,44 @@ double contact_max_gap_mm(const json& study) {
     return std::isfinite(gap) && gap > 0.0 ? gap : 0.5;
 }
 
+// One policy parser for both refinement seeds and the final physics pairing.
+// Refining a bonded/free pair as if it were contact fills a thin sleeve from
+// both sides even when only its inner running fit needs the requested size.
+bool contact_interface_policy(const json& study, bool contact_enabled,
+                              ContactCandidateOptions& options, std::string& error) {
+    if (!study.contains("interfaces") || study["interfaces"].is_null()) return true;
+    const auto& spec = study["interfaces"];
+    auto fail = [&](std::string message) { error = "fea_static: " + message; return false; };
+    if (!spec.is_object()) return fail("interfaces must be an object");
+    if (spec.contains("default") && !spec["default"].is_string())
+        return fail("interfaces.default must be contact, bonded or free");
+    const std::string mode = spec.value("default", contact_enabled ? "contact" : "free");
+    if (mode != "contact" && mode != "bonded" && mode != "free")
+        return fail("interfaces.default must be contact, bonded or free");
+    options.default_interface = mode == "contact" ? InterfaceKind::Contact :
+        mode == "bonded" ? InterfaceKind::Bonded : InterfaceKind::Free;
+    for (const char* key : {"bonded", "contact"}) {
+        if (!spec.contains(key)) continue;
+        if (!spec[key].is_array())
+            return fail(std::string("interfaces.") + key + " must be a list of body pairs");
+        auto& pairs = std::strcmp(key, "bonded") == 0 ? options.bonded_pairs : options.contact_pairs;
+        for (const auto& pair : spec[key]) {
+            if (!pair.is_array() || pair.size() != 2 ||
+                !pair[0].is_number_integer() || !pair[1].is_number_integer())
+                return fail("interfaces pair " + pair.dump() +
+                    " needs two STEP solid ordinals; resolve document body names before meshing");
+            pairs.push_back({pair[0].get<int>(), pair[1].get<int>()});
+        }
+    }
+    if (study.contains("bond_gap_mm")) {
+        const auto& gap = study["bond_gap_mm"];
+        if (!gap.is_number() || !std::isfinite(gap.get<double>()) || gap.get<double>() < 0.0)
+            return fail("bond_gap_mm must be finite and non-negative");
+        options.bond_gap_mm = gap.get<double>();
+    }
+    return true;
+}
+
 // Has the study DECLARED how the interfaces between its bodies are treated? A
 // `contact` block (enabled) or a positive `bond_gap_mm` says the bodies are
 // meant to stay separate and to interact through their surfaces, so the mesher
@@ -691,6 +769,7 @@ bool declares_body_interfaces(const json& study) {
 json contact_resolution_json(const ContactResolution& r) {
     json out{{"h_interface_mm", round_nd(r.h_interface_mm, 6)},
              {"gap_mm", round_nd(r.gap_mm, 6)},
+             {"mode", r.closed_fit_pairs > 0 ? "closed_fit" : "resolved"},
              {"criterion", r.criterion ? r.criterion : kCriterionClearance},
              {"candidate_pairs", r.candidate_pairs},
              {"seatable_pairs", r.seatable_pairs},
@@ -718,6 +797,14 @@ json contact_resolution_json(const ContactResolution& r) {
              {"facet_error_mm", round_nd(r.facet_error_mm, 6)},
              {"gap_fallback_nodes", r.gap_fallback_nodes},
              {"resolved", r.resolved}};
+    if (r.closed_fit_pairs > 0)
+        out["closed_fit"] = json{
+            {"pairs", r.closed_fit_pairs},
+            {"gap_mm_max", round_nd(r.closed_fit_gap_mm_max, 6)},
+            {"limit_mm", round_nd(r.closed_fit_limit_mm, 6)},
+            {"note", "Clearance was not resolved: initially closed, compression-only "
+                     "and frictionless; the bearing pressure distribution is the "
+                     "conformal-fit upper bound, not clearance-resolved contact."}};
     if (r.criterion == kCriterionPatchArea) {
         out["max_h_interface_mm"] = round_nd(r.max_h_interface_mm, 4);
         out["min_elements_across_patch"] = kContactMinPatchElems;
@@ -846,9 +933,19 @@ bool resolve_mesh(const json &study, std::vector<double> &points,
       // judge is refined, plus a few that turn out to be further apart than
       // max_gap_mm. Paying for a second CAD read to refine slightly fewer faces
       // would be the wrong trade.
+      ContactCandidateOptions seed_options;
+      seed_options.max_gap_mm = contact_max_gap_mm(study);
+      if (!contact_interface_policy(study, true, seed_options, err)) return false;
+      if (!mesh->bodies.empty())
+          seed_options.node_body_ordinal = [&](int node) {
+              for (const auto& body : mesh->bodies)
+                  if (node >= body.node_begin && node < body.node_end)
+                      return body.source_ordinals.empty() ? 0 : body.source_ordinals.front();
+              return 0;
+          };
       const ContactCandidateSet probe = fea_contact_candidates(
           mesh->points, mesh->tets, mesh->nodes_per_elem, /*E_mpa=*/1.0,
-          ContactCandidateOptions{contact_max_gap_mm(study), 1.0, 0.35});
+          seed_options);
       if (probe.error.empty() && !probe.springs.empty()) {
         MeshOptions refined = options;
         refined.local_refine.size_mm = interface_size;
@@ -857,6 +954,7 @@ bool resolve_mesh(const json &study, std::vector<double> &points,
         // so a narrower band would refine dots instead of the interface.
         refined.local_refine.band_mm =
             std::max(mesh->char_len_mm, 2.0 * interface_size);
+        refined.local_refine.max_depth_mm = 3.0 * interface_size;
         refined.local_refine.label = "contact interface";
         // Seeds at the candidate NODES themselves — both endpoints, so both
         // bodies' faces are refined — deduped onto a grid of the requested size
@@ -996,6 +1094,7 @@ bool resolve_mesh(const json &study, std::vector<double> &points,
     // The size the mesher DELIVERED (after its own governor), which for a
     // contact study is the refined mesh's — `mesh` is reseated above.
     quality.char_len_mm = mesh->char_len_mm;
+    quality.governor = mesh_governor_json(*mesh);
     quality.lonely_nodes_repaired = mesh->lonely_nodes_repaired;
     quality.lonely_nodes_remaining = mesh->lonely_nodes_remaining;
     quality.hanging_elems_dropped = mesh->hanging_elems_dropped;
@@ -1407,7 +1506,36 @@ public:
         return false;
     }
 
+    bool pair_normal(int node_a, const double* pa, int node_b, const double* pb,
+                     std::array<double, 3>& normal) const override {
+        const int own_a = owner(node_a, pa), own_b = owner(node_b, pb);
+        if (own_a < 0 || own_b < 0 || own_a == own_b) return false;
+        // owner() populated both node/body measurements. Reuse the exact closest
+        // points rather than projecting onto CAD again or guessing from facets.
+        std::lock_guard<std::mutex> lock(mu_);
+        const auto a = memo_.find(static_cast<long long>(node_a) * 64LL + own_b);
+        const auto b = memo_.find(static_cast<long long>(node_b) * 64LL + own_a);
+        // Match pair_gap_mm's smaller reciprocal clearance. Taking the other
+        // projection can substitute an axial end-cap or corner direction for
+        // the closer running surface and misreport the supported bearing arc.
+        if (a != memo_.end() && a->second.gap > 1e-8 &&
+            (b == memo_.end() || !std::isfinite(b->second.gap) ||
+             a->second.gap <= b->second.gap)) {
+            normal = a->second.direction;
+            return true;
+        }
+        if (b != memo_.end() && b->second.gap > 1e-8) {
+            for (int axis = 0; axis < 3; ++axis) normal[axis] = -b->second.direction[axis];
+            return true;
+        }
+        return false;
+    }
+
 private:
+    struct Measurement {
+        double gap = std::numeric_limits<double>::quiet_NaN();
+        std::array<double, 3> direction{};
+    };
     struct Facet {
         TopoDS_Face face;
         Bnd_Box box;  // grown by reach_, so a hit means "worth measuring"
@@ -1427,29 +1555,36 @@ private:
         std::lock_guard<std::mutex> lock(mu_);
         auto it = memo_.find(key);
         if (it == memo_.end()) it = memo_.emplace(key, measure(p, b)).first;
-        if (!std::isfinite(it->second)) return false;
-        out = it->second;
+        if (!std::isfinite(it->second.gap)) return false;
+        out = it->second.gap;
         return true;
     }
 
     // Called under mu_.
-    double measure(const double* p, int b) const {
+    Measurement measure(const double* p, int b) const {
         const gp_Pnt pnt(p[0], p[1], p[2]);
         const Body& body = bodies_[static_cast<std::size_t>(b)];
         const TopoDS_Vertex vertex = BRepBuilderAPI_MakeVertex(pnt);
-        double best = std::numeric_limits<double>::quiet_NaN();
+        Measurement best;
         for (const Facet& facet : body.faces) {
             if (facet.box.IsOut(pnt)) continue;
-            BRepExtrema_DistShapeShape dss(vertex, facet.face,
-                                           Extrema_ExtFlag_MIN);
+            BRepExtrema_DistShapeShape dss(vertex, facet.face, Extrema_ExtFlag_MIN);
             if (!dss.IsDone() || dss.NbSolution() < 1) continue;
-            const double d = dss.Value();
-            if (!std::isfinite(d) || d > reach_) continue;
-            if (!std::isfinite(best) || d < best) best = d;
+            const double distance = dss.Value();
+            if (!std::isfinite(distance) || distance > reach_) continue;
+            if (!std::isfinite(best.gap) || distance < best.gap) {
+                best.gap = distance;
+                const gp_Pnt projected = dss.PointOnShape2(1);
+                const double length = pnt.Distance(projected);
+                if (length > 1e-8)
+                    for (int axis = 0; axis < 3; ++axis)
+                        best.direction[axis] = (projected.Coord(axis + 1) - p[axis]) / length;
+            }
         }
-        if (!std::isfinite(best)) return best;
+        if (!std::isfinite(best.gap)) return best;
         body.classifier->Perform(pnt, Precision::Confusion());
-        return body.classifier->State() == TopAbs_IN ? -best : best;
+        if (body.classifier->State() == TopAbs_IN) best.gap = -best.gap;
+        return best;
     }
 
     int owner(int node, const double* p) const {
@@ -1469,7 +1604,7 @@ private:
     std::vector<Body> bodies_;
     double reach_ = 0.0;
     mutable std::mutex mu_;
-    mutable std::unordered_map<long long, double> memo_;
+    mutable std::unordered_map<long long, Measurement> memo_;
 };
 
 }  // namespace
@@ -2424,18 +2559,6 @@ static nlohmann::json fea_run_static_impl(
     const int n_nodes = static_cast<int>(points.size() / 3);
     const int n_dof = n_nodes * 3;
 
-    // Governor admission: refuse a solve that would blow past the host's memory
-    // budget with a clear, actionable error instead of OOM-crashing the process
-    // (the GUI/MCP already render {"ok":false,"error"} gracefully). The projected
-    // peak comes from governor::fea_peak_bytes — MEASURED peak RSS of this very
-    // path, safety-factored — so it is compared to the budget as-is.
-    {
-        std::string why;
-        const size_t n_elems_est = tets.size() / static_cast<size_t>(nodes_per_elem);
-        if (!chudware::governor::admit_fea(n_elems_est, nodes_per_elem, 3,
-                                           "static FEA solve", why))
-            return json{{"ok", false}, {"error", why}};
-    }
 
     const json material = study.value("material", json::object());
     const double E_mpa = scalar_material["E_mpa"].get<double>();
@@ -2659,6 +2782,12 @@ static nlohmann::json fea_run_static_impl(
                     {"error", "fea_static: study.contact needs finite max_gap_mm > 0 "
                               "(mm), penalty_scale > 0, and max_iterations in 1..500"}};
             contact_solver_opts.max_iterations = static_cast<int>(iters);
+            if (c.contains("closed_fit") && !c["closed_fit"].is_boolean())
+                return json{{"ok", false}, {"error", "fea_static: contact.closed_fit must be boolean"}};
+            contact_opts.closed_fit = c.value("closed_fit", true);
+            contact_opts.closed_fit_gap_mm = number("closed_fit_gap_mm", -1.0, 0.0, 1e4);
+            if (!std::isfinite(contact_opts.closed_fit_gap_mm))
+                return json{{"ok", false}, {"error", "fea_static: contact.closed_fit_gap_mm must be finite and non-negative"}};
             // interface_size_mm is a MESH contract, applied back in resolve_mesh
             // (local refinement on the candidate faces). It is validated here so
             // a malformed value refuses the study instead of being ignored by a
@@ -2673,39 +2802,9 @@ static nlohmann::json fea_run_static_impl(
                               "without meshing the whole part that fine"}};
         }
     }
-    if (interfaces_enabled) {
-        const auto& spec = study["interfaces"];
-        if (!spec.is_object())
-            return json{{"ok", false}, {"error", "fea_static: interfaces must be an object"}};
-        const std::string fallback = contact_enabled ? "contact" : "free";
-        if (spec.contains("default") && !spec["default"].is_string())
-            return json{{"ok", false}, {"error", "fea_static: interfaces.default must be contact, bonded or free"}};
-        const std::string mode = spec.value("default", fallback);
-        if (mode != "contact" && mode != "bonded" && mode != "free")
-            return json{{"ok", false}, {"error", "fea_static: interfaces.default must be contact, bonded or free"}};
-        contact_opts.default_interface = mode == "contact" ? InterfaceKind::Contact :
-            mode == "bonded" ? InterfaceKind::Bonded : InterfaceKind::Free;
-        for (const char* key : {"bonded", "contact"}) {
-            if (!spec.contains(key)) continue;
-            if (!spec[key].is_array())
-                return json{{"ok", false}, {"error", std::string("fea_static: interfaces.") + key + " must be a list of body pairs"}};
-            auto& pairs = std::string(key) == "bonded" ? contact_opts.bonded_pairs : contact_opts.contact_pairs;
-            for (const auto& pair : spec[key]) {
-                if (!pair.is_array() || pair.size() != 2 ||
-                    !pair[0].is_number_integer() || !pair[1].is_number_integer())
-                    return json{{"ok", false}, {"error", "fea_static: interfaces pair " + pair.dump() +
-                        " needs two STEP solid ordinals; resolve document body names before meshing"}};
-                pairs.push_back({pair[0].get<int>(), pair[1].get<int>()});
-            }
-        }
-        if (study.contains("bond_gap_mm") &&
-            (!study["bond_gap_mm"].is_number() ||
-             !std::isfinite(study["bond_gap_mm"].get<double>()) ||
-             study["bond_gap_mm"].get<double>() < 0.0))
-            return json{{"ok", false}, {"error", "fea_static: bond_gap_mm must be finite and non-negative"}};
-        if (study.contains("bond_gap_mm"))
-            contact_opts.bond_gap_mm = study["bond_gap_mm"].get<double>();
-    }
+    std::string interface_error;
+    if (!contact_interface_policy(study, contact_enabled, contact_opts, interface_error))
+        return json{{"ok", false}, {"error", interface_error}};
     if (!mesh_quality.bodies.empty())
         contact_opts.node_body_ordinal = [&](int node) {
             const auto index = node_body_index(node);
@@ -2934,6 +3033,7 @@ static nlohmann::json fea_run_static_impl(
             // deform. Handing the solver every candidate instead made the seated
             // population run-to-run mesh luck on a nominally-touching fit.
             contact_solver_opts.seat_tolerance_mm = contact_set.seat_limit_mm;
+            contact_solver_opts.interface_h_mm = contact_set.interface_h_mm;
             // Is this mesh even capable of describing the interface? The a-priori
             // clause (fea_contact.h ContactResolution) is decided here, BEFORE the
             // active-set solve: a solve cannot rescue an interface the mesh cannot
@@ -2972,6 +3072,10 @@ static nlohmann::json fea_run_static_impl(
                         contact_resolution.seat_limit_mm);
                 notes.push_back(text);
             }
+            if (contact_resolution.closed_fit_pairs > 0)
+                notes.push_back("closed_fit: clearance was not resolved; the bearing pressure "
+                                "distribution is the conformal-fit upper bound. Initially "
+                                "closed pairs remain compression-only and open under tension.");
             if (contact_set.initial_penetration_max_mm > 0.0) {
                 char pen[608];
                 std::snprintf(
@@ -3306,6 +3410,86 @@ static nlohmann::json fea_run_static_impl(
             return failure;
         }
     }
+    if (contact_enabled && !held_by_contact_only.empty()) {
+        std::vector<std::array<double, 3>> component_loads(contact_set.n_components);
+        std::vector<bool> bonded_component(contact_set.n_components, false);
+        for (std::size_t node = 0; node < contact_set.component.size(); ++node) {
+            const int component = contact_set.component[node];
+            if (component < 0) continue;
+            for (int axis = 0; axis < 3; ++axis)
+                component_loads[component][axis] += nodal_forces[node * 3 + axis];
+        }
+        for (const auto& bond : bond_springs) {
+            const int a = contact_set.component[bond.a], b = contact_set.component[bond.b];
+            if (a >= 0) bonded_component[a] = true;
+            if (b >= 0) bonded_component[b] = true;
+        }
+        for (int component : held_by_contact_only) {
+            // A floating bonded cluster must be tested as a whole, not as each
+            // constituent solid. Leave that case to the existing full solve.
+            if (bonded_component[component]) continue;
+            const auto cone = fea_contact_support_cone(
+                contact_set, component, component_loads[component]);
+            if (!cone.excludes_load) continue;
+            json pair = json::array();
+            if (cone.group >= 0) {
+                for (const auto& spring : contact_set.springs) {
+                    if (spring.group != cone.group) continue;
+                    const int a = contact_opts.node_body_ordinal
+                        ? contact_opts.node_body_ordinal(spring.a)
+                        : contact_set.component[spring.a] + 1;
+                    const int b = contact_opts.node_body_ordinal
+                        ? contact_opts.node_body_ordinal(spring.b)
+                        : contact_set.component[spring.b] + 1;
+                    pair = json::array({std::min(a, b), std::max(a, b)});
+                    break;
+                }
+            }
+            const char axis = "XYZ"[cone.separating_axis];
+            char evidence[416];
+            std::snprintf(evidence, sizeof(evidence),
+                "cannot carry the applied resultant: all admissible contact normals "
+                "share sign in %c (supported arc %.1f degrees, load direction "
+                "[%+.3g,%+.3g,%+.3g]); no equilibrium without friction or an opposing "
+                "bearing surface. Refining the clearance cannot supply the missing reaction",
+                axis, cone.supported_arc_deg, cone.load_direction[0],
+                cone.load_direction[1], cone.load_direction[2]);
+            std::string reason = "contact pair " + pair.dump() + " " + evidence;
+            if (std::abs(cone.load_direction[cone.separating_axis]) > 0.99)
+                reason = "contact separated: " + reason;
+            contact_resolution.resolved = false;
+            contact_resolution.pressure_reliable = false;
+            contact_resolution.reason = reason;
+            contact_resolution.required_interface_size_mm = 0.0;
+            json provenance = detail::provenance_json("chudware/fea_contact_preflight");
+            provenance["governor"] = mesh_quality.governor;
+            return json{
+                {"ok", false}, {"error", reason},
+                {"elapsed_s", std::chrono::duration<double>(
+                    std::chrono::steady_clock::now() - t_start).count()},
+                {"n_elems", tets.size() / static_cast<std::size_t>(nodes_per_elem)},
+                {"n_nodes", points.size() / 3},
+                {"provenance", provenance},
+                {"mesh_quality", detail::mesh_quality_json(mesh_quality, points.size() / 3,
+                    tets.size() / static_cast<std::size_t>(nodes_per_elem), nodes_per_elem)},
+                {"contact", {
+                    {"enabled", true}, {"interfaces", interface_packet},
+                    {"contact_pressure_reliable", false},
+                    {"resolution", contact_resolution_json(contact_resolution)},
+                    {"load_path_refusal", {
+                        {"criterion", "normal_cone_excludes_load"}, {"bodies", pair},
+                        {"axis", std::string(1, axis)}, {"supported_arc_deg", cone.supported_arc_deg},
+                        {"normal_range", {{"min", cone.normal_min}, {"max", cone.normal_max}}},
+                        {"load_direction", cone.load_direction},
+                        {"normal_population", "candidate_superset_of_active"},
+                        {"normal_source", contact_set.support_normal_analytic_pairs ==
+                            static_cast<int>(contact_set.springs.size()) ? "cad_closest_points" :
+                            contact_set.support_normal_analytic_pairs > 0 ? "cad_and_mesh" : "mesh_facets"}
+                    }}
+                }}
+            };
+        }
+    }
     // ── A hanging FRAGMENT is a REFUSAL, in the same class as an unfixtured
     // component. `lonely_nodes_remaining` counts the nodes of element fragments —
     // elements glued to each other face-to-face — that touch the rest of their own
@@ -3354,6 +3538,19 @@ static nlohmann::json fea_run_static_impl(
                  tets.size() / static_cast<std::size_t>(nodes_per_elem),
                  nodes_per_elem)},
             {"notes", notes}};
+    }
+    // Governor admission: refuse a solve that would blow past the host's memory
+    // budget with a clear, actionable error instead of OOM-crashing the process
+    // (the GUI/MCP already render {"ok":false,"error"} gracefully). The projected
+    // peak comes from governor::fea_peak_bytes — MEASURED peak RSS of this very
+    // path, safety-factored — so it is compared to the budget as-is.
+    {
+        std::string why;
+        const size_t n_elems_est = tets.size() / static_cast<size_t>(nodes_per_elem);
+        if (!chudware::governor::admit_fea(n_elems_est, nodes_per_elem, 3,
+                                           "static FEA solve", why))
+            return json{{"ok", false}, {"error", why},
+                        {"provenance", {{"governor", mesh_quality.governor}}}};
     }
 
     const auto t_solve0 = std::chrono::steady_clock::now();
@@ -3492,6 +3689,12 @@ static nlohmann::json fea_run_static_impl(
                      {"candidate_pairs", contact_report.candidate_pairs},
                      {"active_pairs", contact_report.active_pairs},
                      {"contact_iterations", contact_report.contact_iterations},
+                     {"active_set",
+                      json{{"iterations", contact_report.contact_iterations},
+                           {"cycles_broken", contact_report.cycles_broken},
+                           {"hysteresis",
+                            json{{"tol_g", contact_report.hysteresis_tol_g_mm},
+                                 {"tol_f", contact_report.hysteresis_tol_f_n}}}}},
                      {"converged", contact_report.converged},
                      {"tangential_stabilization", contact_report.tangential_stabilization},
                      {"tangential_force_fraction",
@@ -3850,6 +4053,10 @@ static nlohmann::json fea_run_static_impl(
     // Contact rides BESIDE summary/reactions/mesh_quality, like every other evidence
     // block: the equilibrium check and the contact resultants have to be read together.
     if (contact_enabled || interfaces_enabled) out["contact"] = contact_json();
+    if (contact_enabled && contact_resolution.closed_fit_pairs > 0)
+        out["summary"]["contact_resolution_note"] =
+            "Clearance was not resolved; the bearing pressure distribution is "
+            "the conformal-fit upper bound (closed_fit).";
     // Plasticity rides beside them for the same reason: summary.max_von_mises_mpa is
     // still the stress, but with the law on it is CAPPED at the flow stress
     // (yield + hardening_mpa * max_equivalent_plastic_strain), and a reader comparing
@@ -3874,6 +4081,7 @@ static nlohmann::json fea_run_static_impl(
             r.solver.empty() ? std::string("chudware/fea_static")
                              : "chudware/fea_static [" + r.solver + "]";
         out["provenance"] = detail::provenance_json(solver_route.c_str());
+        out["provenance"]["governor"] = mesh_quality.governor;
         out["provenance"]["material_mode"] = per_body_material ? "per_body" : "single";
         out["material"] = material_packet;
         out["material"]["interface_stiffness_rule"] = "softer_body_E";
@@ -5099,6 +5307,8 @@ inline uint64_t mesh_opts_key(const MeshOptions &options, uint64_t hash) {
                hash);
   hash = fnv1a(&options.local_refine.band_mm, sizeof options.local_refine.band_mm,
                hash);
+  hash = fnv1a(&options.local_refine.max_depth_mm,
+               sizeof options.local_refine.max_depth_mm, hash);
   if (!options.local_refine.points.empty())
     hash = fnv1a(options.local_refine.points.data(),
                  options.local_refine.points.size() * sizeof(double), hash);

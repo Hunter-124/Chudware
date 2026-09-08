@@ -37,26 +37,13 @@ struct SizeBand {
     // less than it used to. See resolve_size_band for the measurements.
     uint64_t element_ceiling = 0;
     uint64_t dof_ceiling = 0;
-    // ── What the coarsening decision was made ON ──────────────────────────
-    // `predicted_elements` is the band model's count at `geometry_base` — the
-    // size actually requested — and `element_limit` is what the memory
-    // governor allows at this order. `predict_exponent` is 2 when the
-    // surface term dominated the prediction and 3 when the volume term did,
-    // i.e. the power the count is assumed to follow in h.
-    //
-    // They are published because the model is only a model: measured against
-    // polymesh on the ME 490 caliper-bracket isolate it read 397k / 706k /
-    // 1313k tet elements at h = 4.0 / 3.0 / 2.2 mm where the fill delivered
-    // 346k / 271k / 244k — an error of +15 %, +160 % and +440 %, i.e. NOT
-    // even monotone in h, which is how a coarser leg of a ladder ended up
-    // demanding more memory (25.1 GB at h = 4.0 against 17.5 GB at h = 3.0).
-    // So mesh_loaded_model re-anchors the decision on the count a real fill
-    // MEASURED whenever the two disagree by more than 30 %.
+    // Unmeasured bounding-box envelope at geometry_base, used ONLY to choose
+    // the initial mesh-only probe. It is not a measured study cost; forecasts
+    // fit this geometry's measured counts in mesh_loaded_model.
     double predicted_elements = 0.0;
-    double predict_exponent = 0.0;
     uint64_t element_limit = 0;
-    // The memory governor (not interactivity) is what moved `base` off
-    // `geometry_base`. Only then is a measured re-anchor worth a re-fill.
+    // The memory envelope moved base to a mesh-only bootstrap. Probe back
+    // toward geometry_base and decide delivery on actual counts, not forecasts.
     bool memory_coarsened = false;
 };
 

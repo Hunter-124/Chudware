@@ -1760,6 +1760,8 @@ def _build_contact_study(
     interfaces: Optional[dict] = None,
     penalty_scale: float = 1.0,
     bond_gap_mm: Optional[float] = None,
+    closed_fit: bool = True,
+    closed_fit_gap_mm: Optional[float] = None,
 ) -> dict:
     """SETUP stage for run_fea_contact.
 
@@ -1775,6 +1777,12 @@ def _build_contact_study(
             "bond_gap_mm with contact requires interfaces to distinguish bonded "
             "and contact body pairs"
         )
+    if not isinstance(closed_fit, bool):
+        raise ValueError("closed_fit must be boolean")
+    if closed_fit_gap_mm is not None:
+        closed_fit_gap_mm = _finite_float(closed_fit_gap_mm, "closed_fit_gap_mm")
+        if closed_fit_gap_mm < 0:
+            raise ValueError("closed_fit_gap_mm must be non-negative")
     penalty_scale = _finite_float(penalty_scale, "penalty_scale")
     if penalty_scale <= 0.0:
         raise ValueError("penalty_scale must be finite and > 0")
@@ -1833,7 +1841,10 @@ def _build_contact_study(
         "max_gap_mm": max_gap_mm,
         "max_iterations": max_iterations,
         "penalty_scale": penalty_scale,
+        "closed_fit": closed_fit,
     }
+    if closed_fit_gap_mm is not None:
+        ctx["study"]["contact"]["closed_fit_gap_mm"] = closed_fit_gap_mm
     if interface_size_mm is not None:
         ctx["study"]["contact"]["interface_size_mm"] = interface_size_mm
     ctx["interface_size_mm"] = interface_size_mm
@@ -2226,6 +2237,9 @@ def _collect_contact(ctx: dict, res: dict, notes: list) -> dict:
         # Forward the engine's contact evidence onto the refusal as well.
         if isinstance(res.get("contact"), dict):
             out["contact"] = res["contact"]
+        for key in ("provenance", "mesh_quality", "n_elems", "n_nodes", "elapsed_s"):
+            if key in res:
+                out[key] = res[key]
         # A plastic collapse refusal is only actionable with the load fraction it
         # reached, so the plasticity block rides on the refusal too.
         if isinstance(res.get("plasticity"), dict):
@@ -4654,7 +4668,8 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
                         # These explain why the study refused; never promote
                         # unconverged displacement, stress, or summary fields.
                         for key in ("contact", "mesh_quality", "reason", "notes",
-                                    "selection_spans_contact", "unfixed_islands"):
+                                    "selection_spans_contact", "unfixed_islands",
+                                    "provenance", "n_elems", "n_nodes"):
                             if key in refusal:
                                 out[key] = refusal[key]
                         if refusal.get("error"):
@@ -5858,6 +5873,8 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
         interfaces: Optional[dict] = None,
         penalty_scale: float = 1.0,
         bond_gap_mm: Optional[float] = None,
+        closed_fit: bool = True,
+        closed_fit_gap_mm: Optional[float] = None,
     ) -> str:
         """Frictionless unilateral CONTACT FEA on the real meshed bodies of this document.
 
@@ -5921,6 +5938,14 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
                    interfaces on a contact run and limits only bonded pairs (zero means
                    touching); when omitted, use the measured pair gap within max_gap_mm.
                    It does not widen the clearance-contact search.
+        closed_fit : default True: CAD-measured gaps below closed_fit_gap_mm
+                   (default one quarter of the measured interface element size) are
+                   initially closed, still compression-only and free tangentially.
+                   This does NOT resolve the clearance: resolution.mode="closed_fit"
+                   discloses the conformal-fit upper-bound pressure distribution.
+                   False preserves the clearance-resolved model and its refusals.
+        closed_fit_gap_mm : optional non-negative closure threshold in mm. Gaps
+                   without an analytic CAD measurement are never idealized.
         mesh_size_mm : explicit BACKGROUND element size in mm; omitted uses the medium
                    fineness band. Do NOT use this to resolve a clearance — that is what
                    interface_size_mm is for, at a fraction of the element count.
@@ -6103,6 +6128,8 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
                 interfaces=interfaces,
                 penalty_scale=penalty_scale,
                 bond_gap_mm=bond_gap_mm,
+                closed_fit=closed_fit,
+                closed_fit_gap_mm=closed_fit_gap_mm,
             )
             _autosave_all_open()  # R-1 guard: protect every open doc before the solve starts
             return _dumps(

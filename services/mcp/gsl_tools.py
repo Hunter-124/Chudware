@@ -1195,12 +1195,18 @@ def _describe_assembly_text(doc_id: str) -> str:
         lines.append(f"  {name}: {size_txt}, {origin_txt}{psrc_txt}  "
                      f"(source: asm_world_bodies)")
 
-    # 3. Solve/DOF summary (best-effort — doc_solve_mates returns a status string)
+    # 3. Solve/DOF summary, including solved-pose freedom beside mechanism mobility.
     try:
         sm_r = cb.call("doc_solve_mates", {"doc_id": doc_id})
-        status = (sm_r.get("rebuild") or {}).get("doc_status") or sm_r.get("status") or ""
+        rebuild = sm_r.get("rebuild") or {}
+        status = rebuild.get("doc_status") or sm_r.get("status") or ""
         if status:
             lines.append(f"\nMate solve: {status}  (source: doc_solve_mates)")
+            if "dof" in rebuild:
+                freedom = f"dof: {rebuild['dof']}"
+                if "residual_dof" in rebuild:
+                    freedom += f", residual_dof: {rebuild['residual_dof']}"
+                lines.append(f"  {freedom}")
         else:
             lines.append("\nMate solve: solve completed (DOF detail not available via read RPC — "
                          "call solve_mates for the live result)")

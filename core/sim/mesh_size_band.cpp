@@ -268,11 +268,6 @@ SizeBand resolve_size_band(const TopoDS_Shape &shape,
                            ? static_cast<uint64_t>(memory_element_limit)
                            : 0ull;
   band.predicted_elements = predict_elements(base);
-  band.predict_exponent =
-      kTetSurfaceFactor * area_estimate / (base * base) >=
-              kTetPackingFactor * volume_estimate / (base * base * base)
-          ? 2.0
-          : 3.0;
   if (!explicit_size) {
     long interactive_budget = static_cast<long>(8000.0 + 52000.0 * band.fineness);
     if (const char *value = std::getenv("CHUDWARE_MESH_MAX_ELEMS")) {
@@ -351,19 +346,20 @@ SizeBand resolve_size_band(const TopoDS_Shape &shape,
              (volume_estimate > 1e-9 || area_estimate > 1e-9) && base > 1e-9) {
     const double estimate = predict_elements(base);
     if (estimate > static_cast<double>(memory_element_limit)) {
-      const double raised =
-          raise_size(base, estimate, static_cast<double>(memory_element_limit));
+      // This envelope was calibrated on a bulky box, not this geometry. It
+      // chooses a bounded mesh-only probe, not the delivered study size.
+      const double raised = std::min(
+          base * 2.0,
+          raise_size(base, estimate, static_cast<double>(memory_element_limit)));
       char text[512];
       std::snprintf(
           text, sizeof(text),
-          "auto-coarsened by the memory governor: target size %.2f mm needs about "
-          "%.0fk %s elements at an estimated %.1f GB peak, beyond this machine's "
-          "%.1f GB study budget (calibration: %s); raised to %.2f mm (~%.0fk "
-          "elements, ~%.1f GB)",
-          base, estimate / 1000.0, element_name, estimate_gb(estimate), budget_gb,
-          chudware::governor::fea_calibration_basis(), raised,
-          static_cast<double>(memory_element_limit) / 1000.0,
-          estimate_gb(static_cast<double>(memory_element_limit)));
+          "measured_octave governor: unmeasured bounding-box envelope %.0fk %s "
+          "elements at %.2f mm (%.1f GB solve estimate, %.1f GB budget); "
+          "mesh-only bootstrap at %.2f mm, then measured probes toward the "
+          "request; this envelope is NOT a measured study cost",
+          estimate / 1000.0, element_name, base, estimate_gb(estimate), budget_gb,
+          raised);
       append_note(text);
       base = raised;
       band.memory_coarsened = true;

@@ -263,12 +263,14 @@ def mission_dispatch_advertised() -> set[str]:
 
       * ``MissionDispatch.TOOLS`` — the mission-scoped tool set (adopt_role,
         request_role_change, the parts/scrape verbs);
-      * the Settings → AI → Harness preference grants in
-        ``_apply_session_preferences`` (``add.add("task_list")``). ``task_list`` is
-        granted THERE on purpose — the docstring at that site explains that spending a
-        MAX_TOOLS_PER_ROLE seat on it in general_agent.yaml evicted ``plm_checkpoint``
-        off the tail of ``family: plm``. Scanning the grant call rather than hard-coding
-        the name means the next preference-granted tool is picked up for free.
+      * the Settings → AI preference grants in ``_apply_session_preferences``: every
+        string literal that function unions onto the allow-set (today
+        ``allowed = sorted(set(allowed) | {"task_list"})``, gated on
+        ``preferences.task_list``). ``task_list`` is granted THERE on purpose — the
+        docstring at that site explains that spending a MAX_TOOLS_PER_ROLE seat on it in
+        general_agent.yaml evicted ``plm_checkpoint`` off the tail of ``family: plm``.
+        Scanning the grant rather than hard-coding the name means the next
+        preference-granted tool is picked up for free.
     """
     with open(MISSION_DISPATCH, encoding="utf-8") as fh:
         tree = ast.parse(fh.read())
@@ -280,12 +282,19 @@ def mission_dispatch_advertised() -> set[str]:
                 if isinstance(elt, ast.Constant) and isinstance(elt.value, str):
                     names.add(elt.value)
         elif isinstance(node, ast.FunctionDef) and node.name == "_apply_session_preferences":
+            # A grant is a set-literal of tool names unioned (`|`, `|=`, `.add`,
+            # `.update`) onto the allow-set anywhere in the function body.
             for sub in ast.walk(node):
-                if (isinstance(sub, ast.Call) and isinstance(sub.func, ast.Attribute)
-                        and sub.func.attr in ("add", "update")
-                        and isinstance(sub.func.value, ast.Name)
-                        and sub.func.value.id == "add"):
-                    for arg in sub.args:
+                grant_args: list[ast.AST] = []
+                if isinstance(sub, ast.BinOp) and isinstance(sub.op, ast.BitOr):
+                    grant_args = [sub.left, sub.right]
+                elif isinstance(sub, ast.AugAssign) and isinstance(sub.op, ast.BitOr):
+                    grant_args = [sub.value]
+                elif (isinstance(sub, ast.Call) and isinstance(sub.func, ast.Attribute)
+                      and sub.func.attr in ("add", "update")):
+                    grant_args = list(sub.args)
+                for arg in grant_args:
+                    if isinstance(arg, (ast.Set, ast.Constant)):
                         for lit in ast.walk(arg):
                             if isinstance(lit, ast.Constant) and isinstance(lit.value, str):
                                 names.add(lit.value)

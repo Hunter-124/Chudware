@@ -1183,7 +1183,8 @@ static FeaStaticResult solve_impl(const std::vector<double>& points,
                                  FeaContactReport* contact_report,
                                  const FeaPlasticity* plasticity,
                                  FeaPlasticReport* plastic_report,
-                                 const SimCancelToken& cancel_token) {
+                                 const SimCancelToken& cancel_token,
+                                 const FeaMaterials& materials) {
     FeaProf prof;
     FeaStaticResult res;
     const int n_nodes = static_cast<int>(points.size() / 3);
@@ -1217,15 +1218,56 @@ static FeaStaticResult solve_impl(const std::vector<double>& points,
         res.error = "fea_static: tets length must be divisible by nodes_per_elem";
         return res;
     }
-    if (!std::isfinite(E_mpa) || E_mpa <= 0.0 || !std::isfinite(nu) || nu <= -1.0 ||
-        nu >= 0.5) {
-        res.error = "fea_static: material requires E>0 and -1<nu<0.5";
+    const bool heterogeneous = !materials.materials.empty();
+    const std::size_t elem_count = tets.size() / static_cast<std::size_t>(nodes_per_elem);
+    if ((!heterogeneous && !materials.elem_material.empty()) ||
+        (heterogeneous && materials.elem_material.size() != elem_count)) {
+        res.error = "fea_static: material index map must match the element count "
+                    "(and be empty for scalar material)";
         return res;
     }
-    if (!std::isfinite(yield_mpa) || yield_mpa <= 0.0) {
-        res.error = "fea_static: yield strength must be finite and > 0";
+    if (materials.materials.size() >
+        static_cast<std::size_t>(std::numeric_limits<uint16_t>::max()) + 1) {
+        res.error = "fea_static: material table exceeds the uint16 index capacity";
         return res;
     }
+    for (uint16_t index : materials.elem_material) {
+        if (static_cast<std::size_t>(index) >= materials.materials.size()) {
+            res.error = "fea_static: element material index out of range";
+            return res;
+        }
+    }
+    // Elasticity is computed once per material, not once per element/Gauss point.
+    struct MaterialElasticity {
+        Eigen::Matrix<double, 6, 6> C;
+        double mu;
+        double yield_mpa;
+    };
+    std::vector<MaterialElasticity> elastic(heterogeneous ? materials.materials.size() : 1);
+    for (std::size_t i = 0; i < elastic.size(); ++i) {
+        const FeaMaterial material =
+            heterogeneous ? materials.materials[i] : FeaMaterial{E_mpa, nu, yield_mpa};
+        if (!std::isfinite(material.E_mpa) || material.E_mpa <= 0.0 ||
+            !std::isfinite(material.nu) || material.nu <= -1.0 || material.nu >= 0.5) {
+            res.error = "fea_static: material requires E>0 and -1<nu<0.5";
+            return res;
+        }
+        if (!std::isfinite(material.yield_mpa) || material.yield_mpa <= 0.0) {
+            res.error = "fea_static: yield strength must be finite and > 0";
+            return res;
+        }
+        double lam;
+        lame(material.E_mpa, material.nu, lam, elastic[i].mu);
+        elastic[i].C = elasticity(lam, elastic[i].mu);
+        elastic[i].yield_mpa = material.yield_mpa;
+        if (!elastic[i].C.allFinite()) {
+            res.error = "fea_static: material constants overflowed";
+            return res;
+        }
+    }
+    auto element_material = [&](int e) -> const MaterialElasticity& {
+        return elastic[heterogeneous ? materials.elem_material[static_cast<std::size_t>(e)] : 0];
+    };
     for (double x : points) {
         if (!std::isfinite(x)) {
             res.error = "fea_static: mesh coordinates must be finite";
@@ -1311,13 +1353,13 @@ static FeaStaticResult solve_impl(const std::vector<double>& points,
     // are — a silently ignored material law is a wrong answer wearing a right label.
     const bool plastic_mode = plasticity && plasticity->enabled;
     if (plastic_report) *plastic_report = FeaPlasticReport{};
-    double plastic_yield = yield_mpa;
+    double plastic_yield = elastic[0].yield_mpa;
     double plastic_hardening = 0.0;
     int plastic_increments = 1;
     double plastic_tol = 1e-3;
     if (plastic_mode) {
-        plastic_yield =
-            plasticity->yield_mpa > 0.0 ? plasticity->yield_mpa : yield_mpa;
+        if (!heterogeneous && plasticity->yield_mpa > 0.0)
+            plastic_yield = plasticity->yield_mpa;
         plastic_hardening = plasticity->hardening_mpa;
         plastic_increments = plasticity->max_increments;
         plastic_tol = plasticity->tol;
@@ -1347,14 +1389,6 @@ static FeaStaticResult solve_impl(const std::vector<double>& points,
         }
     }
 
-    double lam, mu;
-    lame(E_mpa, nu, lam, mu);
-    const Eigen::Matrix<double, 6, 6> C = elasticity(lam, mu);
-    if (!C.allFinite()) {
-        res.error = "fea_static: material constants overflowed";
-        return res;
-    }
-
     auto node_pt = [&](int nid) {
         return Eigen::Vector3d(points[nid * 3], points[nid * 3 + 1], points[nid * 3 + 2]);
     };
@@ -1371,6 +1405,7 @@ static FeaStaticResult solve_impl(const std::vector<double>& points,
     std::vector<double> eq_plastic;
     std::vector<double> gp_volume;  // integration weight per Gauss point, mm^3
     auto plastic_stress = [&](int e, int g, const Eigen::Matrix<double, 6, 1>& eps) {
+        const auto& C = element_material(e).C;
         if (eps_p.empty()) return Eigen::Matrix<double, 6, 1>(C * eps);
         const double* ep =
             &eps_p[(static_cast<std::size_t>(e) * plastic_ngp + g) * 6];
@@ -1437,8 +1472,10 @@ static FeaStaticResult solve_impl(const std::vector<double>& points,
     // Contact bypasses the cache entirely: the active set changes K every iteration, and
     // the cache key cannot see an active set (it would serve a stale contact state). So
     // does plasticity — the tangent changes with the material state at every Newton
-    // iteration, and the key cannot see a state either.
-    const bool use_factor_cache = (tet10 || hex8) && !contact_mode && !plastic_mode;
+    // iteration, and the key cannot see a state either. Material tables also bypass
+    // this scalar-material key so changing an assignment cannot reuse stale stiffness.
+    const bool use_factor_cache =
+        (tet10 || hex8) && !contact_mode && !plastic_mode && !heterogeneous;
     uint64_t sys_key = 0;
     if (use_factor_cache) {
         sys_key = factor_system_key(points, tets, E_mpa, nu, fixed_nodes, nodes_per_elem,
@@ -1612,6 +1649,7 @@ static FeaStaticResult solve_impl(const std::vector<double>& points,
             const HexGauss8 hg;
             asm_ok = assemble_chunked<8>(n_tets, tets, bp, kval,
                                          [&](int e, Eigen::Matrix<double, 24, 24>& Ke) {
+                const auto& C = element_material(e).C;
                 std::array<Eigen::Vector3d, 8> ep;
                 for (int j = 0; j < 8; ++j) ep[j] = node_pt(tets[e * 8 + j]);
                 Ke.setZero();
@@ -1628,6 +1666,7 @@ static FeaStaticResult solve_impl(const std::vector<double>& points,
             // ── tet4 path (element math UNCHANGED) ───────────────────────────────
             asm_ok = assemble_chunked<4>(n_tets, tets, bp, kval,
                                          [&](int e, Eigen::Matrix<double, 12, 12>& Ke) {
+                const auto& C = element_material(e).C;
                 std::array<Eigen::Vector3d, 4> ep;
                 for (int j = 0; j < 4; ++j) ep[j] = node_pt(tets[e * 4 + j]);
                 Eigen::Matrix<double, 6, 12> B;
@@ -1640,6 +1679,7 @@ static FeaStaticResult solve_impl(const std::vector<double>& points,
             // ── tet10 path (quadratic isoparametric, 4-point Gauss) ──────────────
             asm_ok = assemble_chunked<10>(n_tets, tets, bp, kval,
                                           [&](int e, Eigen::Matrix<double, 30, 30>& Ke) {
+                const auto& C = element_material(e).C;
                 std::array<Eigen::Vector3d, 10> ep;
                 for (int j = 0; j < 10; ++j) ep[j] = node_pt(tets[e * 10 + j]);
                 Ke.setZero();
@@ -1960,6 +2000,8 @@ static FeaStaticResult solve_impl(const std::vector<double>& points,
                 Eigen::Matrix<double, 30, 1> ue, fe;
                 double ep_scratch[6];
                 for (int e = 0; e < n_tets; ++e) {
+                    const auto& material = element_material(e);
+                    const double element_yield = heterogeneous ? material.yield_mpa : plastic_yield;
                     const int* tn = &tets[static_cast<std::size_t>(e) * stride];
                     for (int j = 0; j < stride; ++j) {
                         ep[static_cast<std::size_t>(j)] = node_pt(tn[j]);
@@ -1978,7 +2020,7 @@ static FeaStaticResult solve_impl(const std::vector<double>& points,
                             B.leftCols(edof) * ue.head(edof);
                         double eq_new = 0.0;
                         plastic_radial_return(
-                            C, mu, plastic_yield, plastic_hardening, eps,
+                            material.C, material.mu, element_yield, plastic_hardening, eps,
                             &eps_p[gi * 6], eq_plastic[gi], stress,
                             commit ? &eps_p[gi * 6] : ep_scratch, eq_new,
                             commit ? nullptr : (want_tangent ? &D : nullptr));
@@ -3066,6 +3108,12 @@ static FeaStaticResult solve_impl(const std::vector<double>& points,
     std::vector<int> vm_count(n_nodes, 0);
     std::vector<double> sx_accum(n_nodes, 0.0), sy_accum(n_nodes, 0.0), sz_accum(n_nodes, 0.0);
     std::vector<double> txy_accum(n_nodes, 0.0), tyz_accum(n_nodes, 0.0), txz_accum(n_nodes, 0.0);
+    res.element_von_mises.assign(n_tets, 0.0);
+    res.element_factor_of_safety.assign(n_tets, 15.0);
+    res.factor_of_safety.assign(n_nodes, 15.0);
+    auto safety_factor = [](double yield, double vm) {
+        return vm > 0.0 ? std::clamp(yield / vm, 0.0, 15.0) : 15.0;
+    };
     // Recovery runs in CHUNKS: a chunk's element stresses are computed in PARALLEL into
     // a bounded buffer (~4 MB), then scattered SERIALLY in element order. The previous
     // shape materialized one ElemStress for every element in the mesh before scattering
@@ -3191,16 +3239,28 @@ static FeaStaticResult solve_impl(const std::vector<double>& points,
                     return res;
                 }
                 const int nid = tets[static_cast<std::size_t>(e) * stride + j];
+                res.element_von_mises[e] = std::max(res.element_von_mises[e], v.vm);
                 vm_accum[nid] += v.vm; vm_count[nid] += 1;
                 sx_accum[nid] += v.sx;  sy_accum[nid] += v.sy;  sz_accum[nid] += v.sz;
                 txy_accum[nid] += v.txy; tyz_accum[nid] += v.tyz; txz_accum[nid] += v.txz;
             }
+            const double fos =
+                safety_factor(element_material(e).yield_mpa, res.element_von_mises[e]);
+            res.element_factor_of_safety[e] = fos;
+            if (heterogeneous)
+                for (int j = 0; j < stride; ++j) {
+                    const int nid = tets[static_cast<std::size_t>(e) * stride + j];
+                    res.factor_of_safety[nid] = std::min(res.factor_of_safety[nid], fos);
+                }
         }
         if (cancelled()) return cancel_result();
     }
     res.von_mises.assign(n_nodes, 0.0);
     for (int i = 0; i < n_nodes; ++i)
         if (vm_count[i] > 0) res.von_mises[i] = vm_accum[i] / vm_count[i];
+    if (!heterogeneous)
+        for (int i = 0; i < n_nodes; ++i)
+            res.factor_of_safety[i] = safety_factor(yield_mpa, res.von_mises[i]);
 
     // ── Additive principal/shear/normal-component recovery ───────────────────
     // Average each tensor component (same divisor), build the 3x3 symmetric stress
@@ -3280,18 +3340,19 @@ static FeaStaticResult solve_impl(const std::vector<double>& points,
             max_vm = std::max(max_vm, res.von_mises[static_cast<size_t>(i)]);
     for (double v : res.disp_magnitude) max_disp = std::max(max_disp, v);
     double min_fos = 15.0;
-    bool any = false;
-    for (int i = 0; i < n_nodes; ++i) {
-        if (!summary_node[static_cast<size_t>(i)]) continue;
-        const double v = res.von_mises[static_cast<size_t>(i)];
-        if (v > 0.0) {
-            const double fos = yield_mpa / v;
-            if (!any || fos < min_fos) min_fos = fos;
-            any = true;
+    if (heterogeneous) {
+        for (int e = 0; e < n_tets; ++e) {
+            bool selected = false;
+            for (int j = 0; j < stride; ++j)
+                selected = selected ||
+                           summary_node[tets[static_cast<std::size_t>(e) * stride + j]];
+            if (selected) min_fos = std::min(min_fos, res.element_factor_of_safety[e]);
         }
+    } else {
+        for (int i = 0; i < n_nodes; ++i)
+            if (summary_node[static_cast<std::size_t>(i)])
+                min_fos = std::min(min_fos, res.factor_of_safety[i]);
     }
-    if (!any) min_fos = 15.0;
-    min_fos = std::min(std::max(min_fos, 0.0), 15.0);
 
     res.max_von_mises_mpa = max_vm;
     res.max_disp_mm = max_disp;
@@ -3320,16 +3381,8 @@ static FeaStaticResult solve_impl(const std::vector<double>& points,
         }
     }
     double min_fos_raw = 15.0;
-    bool any_raw = false;
-    for (int i = 0; i < n_nodes; ++i) {
-        const double v = res.von_mises[static_cast<size_t>(i)];
-        if (v > 0.0) {
-            const double fos = yield_mpa / v;
-            if (!any_raw || fos < min_fos_raw) min_fos_raw = fos;
-            any_raw = true;
-        }
-    }
-    if (!any_raw) min_fos_raw = 15.0;
+    for (double fos : heterogeneous ? res.element_factor_of_safety : res.factor_of_safety)
+        min_fos_raw = std::min(min_fos_raw, fos);
     res.max_von_mises_raw_mpa = max_vm_raw;
     res.min_fos_raw = std::min(std::max(min_fos_raw, 0.0), 15.0);
     res.max_von_mises_raw_node = max_vm_raw_node;
@@ -3360,10 +3413,11 @@ FeaStaticResult fea_static_solve(const std::vector<double>& points, const std::v
                                  const std::vector<int>& fixed_nodes,
                                  const std::vector<double>& nodal_forces, int nodes_per_elem,
                                  const std::vector<BondSpring>& bond_springs,
-                                 const SimCancelToken& cancel_token) {
+                                 const SimCancelToken& cancel_token,
+                                 const FeaMaterials& materials) {
     return solve_impl(points, tets, E_mpa, nu, yield_mpa, fixed_nodes, nodal_forces,
                       nodes_per_elem, bond_springs, {}, FeaContactOptions{}, nullptr,
-                      nullptr, nullptr, cancel_token);
+                      nullptr, nullptr, cancel_token, materials);
 }
 
 FeaStaticResult fea_static_solve_contact(
@@ -3372,7 +3426,8 @@ FeaStaticResult fea_static_solve_contact(
     const std::vector<double>& nodal_forces, int nodes_per_elem,
     const std::vector<BondSpring>& bond_springs,
     const std::vector<ContactSpring>& contact_springs, const FeaContactOptions& options,
-    FeaContactReport& report, const SimCancelToken& cancel_token) {
+    FeaContactReport& report, const SimCancelToken& cancel_token,
+    const FeaMaterials& materials) {
     report = FeaContactReport{};
     if (contact_springs.empty()) {
         FeaStaticResult res;
@@ -3384,7 +3439,7 @@ FeaStaticResult fea_static_solve_contact(
     }
     return solve_impl(points, tets, E_mpa, nu, yield_mpa, fixed_nodes, nodal_forces,
                       nodes_per_elem, bond_springs, contact_springs, options, &report,
-                      nullptr, nullptr, cancel_token);
+                      nullptr, nullptr, cancel_token, materials);
 }
 
 FeaStaticResult fea_static_solve_plastic(
@@ -3394,7 +3449,8 @@ FeaStaticResult fea_static_solve_plastic(
     const std::vector<BondSpring>& bond_springs,
     const std::vector<ContactSpring>& contact_springs, const FeaContactOptions& options,
     const FeaPlasticity& plasticity, FeaContactReport& contact_report,
-    FeaPlasticReport& plastic_report, const SimCancelToken& cancel_token) {
+    FeaPlasticReport& plastic_report, const SimCancelToken& cancel_token,
+    const FeaMaterials& materials) {
     contact_report = FeaContactReport{};
     plastic_report = FeaPlasticReport{};
     if (!plasticity.enabled) {
@@ -3408,7 +3464,7 @@ FeaStaticResult fea_static_solve_plastic(
     }
     return solve_impl(points, tets, E_mpa, nu, yield_mpa, fixed_nodes, nodal_forces,
                       nodes_per_elem, bond_springs, contact_springs, options,
-                      &contact_report, &plasticity, &plastic_report, cancel_token);
+                      &contact_report, &plasticity, &plastic_report, cancel_token, materials);
 }
 
 }  // namespace chudware::sim

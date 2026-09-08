@@ -8034,7 +8034,8 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
 
 
     @mcp.tool()
-    def save_part(path: Optional[str] = None, doc_id: Optional[str] = None) -> str:
+    def save_part(path: Optional[str] = None, doc_id: Optional[str] = None,
+                  allow_empty: bool = False) -> str:
         """Save the part as Chudware's NATIVE .step+ — the editable, reopenable format. PREFER THIS.
 
         .step+ is the only format that round-trips the full PARAMETRIC feature tree (so the user
@@ -8061,9 +8062,14 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
         Save every deliverable BEFORE your session ends: the user is never warned about your
         unsaved docs, so anything you don't save (and don't close_part(discard=True)) is only
         recoverable from a fallback crash-recovery tier — not a delivery mechanism.
+        Empty documents are refused without writing; allow_empty=True explicitly saves one.
         """
         try:
             d = _doc(doc_id)
+            if not allow_empty and not cb.call(
+                    "asm_world_bodies", {"doc_id": d, "explode": False}).get("bodies"):
+                return _dumps({"ok": False, "reason": "no_bodies_empty_document",
+                               "doc_id": d, "content": "Save refused: document has 0 bodies."})
             # K3: canonicalise the caller-supplied path so any '..' traversal sequences are
             # fully resolved before we pass them to the engine.  This means the caller sees
             # exactly where the file will be written (no hidden navigation).

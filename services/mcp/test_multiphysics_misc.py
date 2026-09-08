@@ -529,7 +529,8 @@ def _swing_arm(tmp_path):
         {"op": "asm_add_mate", "mate": {
             "type": "angle", "align": "aligned", "suppressed": False,
             "refs": [{"component": "k1", "selector": xsel},
-                     {"component": "k2", "selector": xsel}], "value": {"value": 0.0}}},
+                     {"component": "k2", "selector": xsel}],
+            "value": {"value": 0.0, "axis": [0, 0, 1], "axis_point": [0, -200, 0]}}},
         {"op": "asm_add_mate", "mate": {
             "type": "parallel", "align": "aligned", "suppressed": False,
             "refs": [{"component": "k1", "selector": zsel},

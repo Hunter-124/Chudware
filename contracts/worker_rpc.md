@@ -1121,3 +1121,84 @@ how many modes satisfy `0 < lambda < max_load_factor`. Zero count returns
 `ok:false` and a reason naming the ceiling and epsilon; otherwise the shared
 CHOLMOD/LDLT Cholesky eigen path requests at most that count and `n_modes`.
 No element stresses are filtered and no load direction is special-cased.
+
+## 28. Per-body static/contact materials (2026-09-08)
+
+`sim_run_static` accepts the existing single `study.material` object or
+`{"per_body":{"1":{"E_mpa":200000,"nu":0.3,"yield_mpa":500},
+"2":{"E_mpa":110000,"nu":0.34,"yield_mpa":125}},"default":{...}}`.
+Keys are canonical positive, **1-based STEP solid ordinals**. `default` is optional
+when every meshed ordinal has an assignment. Each material requires finite positive
+`E_mpa` and `-1 < nu < 0.5`; `yield_mpa` defaults to 250 MPa. Optional `density`
+is finite and positive. Density is echoed, not used by these static solves.
+An unknown ordinal or missing assignment is refused naming the ordinal. A fused
+mesh group with different effective materials is refused naming its source
+ordinals; declare contact or bonded interfaces to preserve separate bodies.
+
+Stiffness assembly, stress recovery and plastic radial return use a compact
+per-element material index, attributed through the body's first-node range.
+With heterogeneous plasticity, each body's yield is authoritative; the study's
+plasticity hardening/increment/tolerance settings are shared. Contact penalties
+and explicit bonded-gap springs use the **softer Young's modulus of the two
+bodies** at each pair. `material.interface_stiffness_rule` and
+`contact.penalty_material_rule` report `softer_body_E`. Heterogeneous contact
+reports the actual `penalty_stiffness_range_n_per_mm`; its legacy scalar
+`penalty_stiffness_n_per_mm` is null rather than claiming one stiffness.
+
+Packets report `provenance.material_mode:"single"|"per_body"`. In per-body mode,
+`material.per_body` echoes every actually used ordinal's effective properties
+and zero-based `material_id`; `material.body_summary` gives each body's
+`max_von_mises_mpa` and `min_fos` over summary-selected elements.
+`element_von_mises` is the peak recovered stress within the element before nodal
+averaging. `element_factor_of_safety` uses that element's own yield, capped at 15;
+heterogeneous `summary.min_fos` is its minimum over elements incident to at least
+one summary-selected node. The raw minimum includes every element. The nodal
+`factor_of_safety` map uses the minimum incident element FoS. Existing single
+material summary semantics remain unchanged. The VTU contains a UInt16
+`material_id` cell array and the nodal `factor_of_safety` field.
+
+MCP `run_fea_static(material=...)` and `run_fea_contact(material=...)` accept this
+same shape. Existing material-name strings still resolve through the material
+lookup; names are also accepted in `per_body` entries and `default`. MCP resolves
+them to physical property objects before submitting the study.
+
+## 29. Motion axis-line evidence (2026-09-08)
+
+`simulate_motion` preserves the complete driven mate `value` object while changing
+its scalar value. An angle drive resolves a hinge LINE from `value.axis` plus
+`value.axis_point`, the angle mate's own third axial reference, or a concentric/hinge
+mate on the driven body. The line's authored coordinates are local to the first
+reference component; resolved geometry is carried into world coordinates. The
+angle driver needs one grounded and one floating reference. An unidentifiable line
+is refused with `ok:false`, `reason:"driver_axis_line_unresolved"` and a failed
+`pose_check`, never a successful origin-pivot sweep.
+
+For each sample, the rigid driver is `D=[R, p-Rp; 0,1]`, composed as `D*T_initial`;
+the angular increment is relative to the initial mate value. Every sample is still
+solved against the complete mate network, and a solved pose that departs from the
+driver is refused (`driver_pose_mismatch` in frame issues). Native trajectory
+matrices remain column-major but retain double precision; the MCP seam exposes the
+established row-major representation.
+
+`simulate_motion` and `sweep_envelope` replies add
+`pose_check:{ok,frames:[{i,ok,bodies:[...]}]}`. Each rotationally driven body's check
+contains `component`, world `axis_point`, unit `axis_dir`, `translation_ok`,
+`translation_error_mm`, `rotation_ok`, `invariant_coordinate`, and `ok`. Translation
+is checked on `T_sample*inverse(T_initial)`, not the pre-existing body placement,
+against `p-Rp` with tolerance `1e-6*max(1,|p|)` mm. Rotation must match the requested
+Rodrigues rotation to `1e-6`. For a world-aligned axis, `invariant_coordinate` is
+`{axis:"x"|"y"|"z",ok}` and checks the whole affine coordinate row, hence every
+point and both extrema; otherwise it is null. Distance sweeps have no rotational
+body checks. Loop playback repeats the first frame's check along with its pose.
+
+Steering checks include floating components carried by each driven hub's
+single-anchor mate island, not only directly driven hubs. Failed checks make the
+tool `ok:false`; invalid frames do not produce interference evidence. Missing-line
+refusals have no sampled frames. `asm_mate(value=...)` now accepts the same native
+value object, allowing an angle-only hinge line to be authored through MCP.
+
+Clarification to §29's grounding statement: grounding is preferred, not required
+when the mate defines its line. The second measured body is the driver unless
+it is grounded, in which case the first is driven with opposite angular sign.
+Both-floating mechanisms retain their full mate solve; an incompatible solved
+pose still fails `pose_check` rather than being accepted or assigned a new pivot.

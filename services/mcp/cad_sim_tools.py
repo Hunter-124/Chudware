@@ -392,6 +392,53 @@ def _resolve_study_material(
                 "linear pre-buckling response), thermal (no stress to bound) and "
                 "fatigue (its S-N curves are nominal-elastic-stress curves)."
             )
+        if analysis == "static" and "per_body" in raw:
+            unknown = [k for k in raw if k not in ("per_body", "default")]
+            if unknown:
+                raise ValueError(
+                    f"material has unsupported properties {unknown!r}; refusing to ignore them. "
+                    "A per-body material accepts only per_body and default."
+                )
+            per_body = raw["per_body"]
+            if not isinstance(per_body, dict):
+                raise ValueError(
+                    "material.per_body must be an object mapping one-based STEP solid ordinals "
+                    "to material names or property objects."
+                )
+            resolved: dict = {}
+            for ordinal, value in per_body.items():
+                key = str(ordinal)
+                if re.fullmatch(r"[1-9][0-9]*", key) is None:
+                    raise ValueError(
+                        f"material.per_body key {ordinal!r} must be a one-based STEP solid ordinal."
+                    )
+                if key in resolved:
+                    raise ValueError(f"material.per_body repeats body ordinal {key}.")
+                leaf = coerce_json_or_repr(value)
+                if isinstance(leaf, dict):
+                    leaf = dict(leaf)
+                    leaf.setdefault("yield_mpa", 250.0)
+                if isinstance(leaf, dict) and "per_body" in leaf:
+                    raise ValueError(
+                        f"material.per_body[{key}] must be a material name or property object, "
+                        "not another per_body assignment."
+                    )
+                resolved[key] = _resolve_study_material(leaf, analysis)
+            out = {"per_body": resolved}
+            if "default" in raw:
+                leaf = coerce_json_or_repr(raw["default"])
+                if isinstance(leaf, dict):
+                    leaf = dict(leaf)
+                    leaf.setdefault("yield_mpa", 250.0)
+                if isinstance(leaf, dict) and "per_body" in leaf:
+                    raise ValueError(
+                        "material.default must be a material name or property object, "
+                        "not another per_body assignment."
+                    )
+                out["default"] = _resolve_study_material(leaf, analysis)
+            elif not resolved:
+                raise ValueError("material.per_body is empty and no default material was supplied.")
+            return out
         unknown = [k for k in raw if _norm_key(k) not in _MATERIAL_INPUT_KEY_NORMS]
         if unknown:
             raise ValueError(
@@ -1425,6 +1472,8 @@ def _norm_plasticity(plasticity, mat: dict) -> Optional[dict]:
         )
     canon = {canon_by_norm[_norm_key(k)]: v for k, v in raw.items()}
     out: dict = {"enabled": True}
+    if "per_body" in mat:
+        mat = mat.get("default") or next(iter(mat["per_body"].values()))
     yield_mpa = canon.get("yield_mpa", mat.get("yield_mpa"))
     out["yield_mpa"] = _finite_float(yield_mpa, "plasticity.yield_mpa")
     if out["yield_mpa"] <= 0.0:
@@ -1931,6 +1980,7 @@ _EVIDENCE_KEYS = (
     "vtu_path",
     "contact",
     "plasticity",
+    "material",
 )
 
 
@@ -3726,6 +3776,9 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
                    SID from describe_part / query_geometry ("F58db6d") — a FEATURE id is not a face.
         material : a name ("steel","aluminum","titanium","stainless","brass","abs","pla") or an
                    explicit dict {E_mpa, nu, density_g_cm3, yield_mpa, ...}.
+                   Or {per_body: {"1": name_or_dict, ...}, default: name_or_dict} for
+                   heterogeneous bodies; ordinals are one-based STEP solid ordinals.
+                   default is optional when every body has an explicit assignment.
         mesh_fineness : 0..1 (default 0.5), or a preset word
                    ("coarse"=0.25, "medium"=0.5, "fine"=0.75, "finest"=1.0).
                    Second-order (tet10) elements are used for accuracy.
@@ -5725,6 +5778,9 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
         load     : ONE face query plus a force (N, world XYZ) or pressure (MPa), e.g.
                    {"face":"top","force":[0,0,-500]}; a list is accepted.
         material : a registry name ("steel","aluminum",...) or an explicit property dict.
+                   Or {per_body: {"1": name_or_dict, ...}, default: name_or_dict};
+                   STEP solid ordinals are one-based; each body uses its own E_mpa/nu/yield_mpa,
+                   and default is optional when every body is explicitly assigned.
         max_gap_mm : widest mesh gap still treated as a contact candidate (default 0.5).
                    Measure the real clearance first and pass just above it: too small finds
                    no pair (refused, with the measured body count), too large pairs surfaces

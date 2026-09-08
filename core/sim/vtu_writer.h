@@ -27,6 +27,7 @@
 #pragma once
 
 #include <string>
+#include <cstdint>
 #include <vector>
 
 namespace chudware::sim {
@@ -43,6 +44,7 @@ struct VtuPointField {
 // Never throws: every failure returns false with a diagnostic in `error`.
 bool write_vtu(const std::string &path, const std::vector<double> &points,
                const std::vector<int> &tets, int nodes_per_elem,
-               const std::vector<VtuPointField> &fields, std::string &error);
+               const std::vector<VtuPointField> &fields, std::string &error,
+               const std::vector<uint16_t>& material_id = {});
 
 } // namespace chudware::sim

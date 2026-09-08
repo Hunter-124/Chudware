@@ -2934,3 +2934,66 @@ Final expanded scoped verification: **811 passed in 22.84s**, including both
 simulation advisor files. Removed a mocked assignment-forwarding test rather
 than repinning its private resolver-call assumption; the Auto rules table tests
 actual model/tool policy outcomes.
+
+## Assembly live-geometry reporting and empty delivery guards (2026-09-08)
+
+The ME 490 `CC-006_Saddle_Bushed_2026-09-07.step+` was never empty: its assembly graph
+references three live components and its container already includes `geometry.step`.
+The reported zero-feature count is normal for an assembly. `core/doc/session.cpp`
+incorrectly used the part compiler for bounding boxes, mass properties, and native
+assembly import into another document; these paths now gather world-placed assembly
+solids. The copied original now describes 3 bodies, 35 faces, 96 edges and a
+16.7500001 × 190 × 152.4 mm envelope. No ME 490 project file was modified.
+`services/mcp/gsl_tools.py` checks live world bodies before topology queries and states
+body counts, including an explicit zero-body digest. `cad_doc_tools.py` and
+`cad_exchange_tools.py` refuse empty delivery with `no_bodies_empty_document` before
+writing unless `allow_empty=True` (native empty documents remain intentionally savable).
+Native interference refuses an EMPTY document (`insufficient_bodies`, body_count 0) and
+`cad_eval_tools.py` does not record that refusal as placement verification; a single body
+or a one-member filter stays a legitimate no-pair success with `pairs_checked: 0` (the
+members-filter contract in `test_interference.cpp`). Regression coverage in
+`test_gsl_tools.py` exercises assembly save/close/open/describe, native flattening,
+empty delivery and insufficient pairs; delivery-path mock fixtures were updated and
+the obsolete single-body interference-pass test removed. Reclassify O-38 as
+assembly-blind evaluation/reporting, not a lossy `.step+` writer.
+
+## Motion hinge-line transport and carried steering poses (2026-09-08)
+
+ME 490 motion defects A/B were reproduced before fixing them: the angle-only
+two-plate hinge at `(31,17,23)` returned a world-Z rotation and zero translation
+at −10° instead of `Ry(-10°)` with `(4.464867743,0,-5.033671827)` mm translation;
+a hub carrying a concentric wheel with a nonidentity `Rx(90°)` placement steered
+about world Z yet its reported wheel z-min drifted from 3 to −3.476685 mm.
+`core/doc/session.cpp` had replaced the complete mate value object on each angle
+sample (discarding its axis), leaving an orientation-only residual to choose
+unconstrained rotation/translation; the steering path correctly rotated the hub
+but left its child's previous warm pose untransported, so the solver introduced
+free axle spin and the transformed local bbox corners dipped. The engine now
+preserves the mate definition, resolves and validates a hinge line, seeds the
+complete composed rigid drive, and transports single-anchor floating mate islands
+with their re-posed hub without grounding their free DOFs. `core/mate/mate.*`
+preserves authored 3D axes and shares signed-axis canonicalization;
+`core/doc/validate.cpp` and `assembly.cpp` allow/resolve the angle's third axial
+reference. Missing lines are explicitly refused. MCP `cad_asm_tools.py` accepts
+native angle value objects; it and `cad_motion_tools.py` return per-body/per-frame
+`pose_check` evidence (including carried wheels), preserve failed checks, and
+withhold interference for invalid poses. Regressions live in `test_cad_tools.py`
+and `test_cad_motion_tools.py`; the planar fixture in `test_multiphysics_misc.py`
+now authors its pin line, and the obsolete exact result-key whitelist was removed
+from `core/tests/test_simulate_motion.cpp`. The two required files passed together:
+**161 passed in 104.55s (0:01:44)**. Scoped native `mate|simulate_motion`:
+**100% tests passed, 0 tests failed out of 2**. Migrated motion fixtures:
+**3 passed, 15 deselected, 4 warnings in 5.71s** (build123d deprecations). An
+additional nonidentity-placement, tilted-axis smoke passed ten frames with maximum
+matrix error **1.42e-14**. All native/pytest runs used the systemd memory wrapper
+and build-fix library; both throwaway scripts were deleted. Append-only contracts
+were extended in `doc_ops.md`, `doc_schema.md`, and `worker_rpc.md`; no project
+assembly files were modified.
+
+Final driver-selection proof also covers an ungrounded first reference with a fixed
+second reference (opposite drive sign), both references floating with an explicit
+line, and both fixed (pose-check refusal for nonzero motion). Grounding is not an
+extra prerequisite when the mate identifies its line. That smoke passed all three
+cases and its script was removed. Final rebuilt-library acceptance:
+**161 passed in 103.34s (0:01:43)** across the two requested MCP files, followed by
+**100% tests passed, 0 tests failed out of 2** for native `mate|simulate_motion`.

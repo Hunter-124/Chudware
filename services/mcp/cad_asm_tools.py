@@ -313,7 +313,7 @@ def register_cad_asm_tools(mcp: FastMCP) -> None:
 
     @mcp.tool()
     def asm_mate(mate_type: str, a: Union[dict, str, list], b: Union[dict, str, list],
-                 value: Optional[float] = None,
+                 value: Optional[Union[float, dict]] = None,
                  align: str = "aligned", solve: bool = True,
                  doc_id: Optional[str] = None) -> str:
         """Add a MATE between two components of the current assembly (and solve it).
@@ -327,7 +327,10 @@ def register_cad_asm_tools(mcp: FastMCP) -> None:
                     side word ("top") also works. It must resolve to exactly ONE face/edge;
                     narrow with pick/near/count if it matches several.
         align     : "aligned" or "anti" (flip which way the normals/axes face).
-        value     : the driving dimension for distance/angle mates.
+        value     : the driving dimension for distance/angle mates. For an angle-only
+                    hinge, pass {"value":0, "axis":[0,1,0], "axis_point":[x,y,z]};
+                    axis and axis_point are in component a's LOCAL frame and define
+                    the pin line used by simulate_motion (no concentric mate needed).
         solve     : re-solve the mate network immediately (default) and report status.
 
         Typical seating pattern: `concentric` (bolt shank ↔ hole bore) + `coincident`
@@ -377,7 +380,7 @@ def register_cad_asm_tools(mcp: FastMCP) -> None:
             mate: dict = {"type": mate_type, "align": align, "suppressed": False,
                           "refs": refs}
             if value is not None:
-                mate["value"] = {"value": float(value)}
+                mate["value"] = dict(value) if isinstance(value, dict) else {"value": float(value)}
             r = cb.call("doc_apply_ops", {"doc_id": d, "base_revision": _asm_revision(d),
                                           "with_tess": False,
                                           "ops": [{"op": "asm_add_mate", "mate": mate}]})
@@ -512,6 +515,10 @@ def register_cad_asm_tools(mcp: FastMCP) -> None:
                   was drivable produced a stationary false-success sweep; drive an angle
                   or distance mate that parameterizes the mechanism instead. Omit to
                   auto-pick when exactly one drivable mate exists.
+                  An angle drive requires a hinge LINE: value.axis + value.axis_point
+                  (first ref's local frame), a third axial ref on the angle mate, or
+                  a concentric/hinge mate on the driven body. A scalar angle alone
+                  cannot define a pivot and is refused as driver_axis_line_unresolved.
         start,stop : the value range to sweep (in the mate's unit — deg or mm). Omit `start` to
                   begin at the mate's current value. `stop` is required.
         steps   : number of SAMPLES across [start, stop] inclusive (>=2, >=3 with dynamics).
@@ -524,10 +531,12 @@ def register_cad_asm_tools(mcp: FastMCP) -> None:
         Returns {ok, doc_id, mate_id, driver:{type,unit,start,stop,steps,samples},
                  trajectory:[{i, value, dof, converged, bodies:[{component,name,transform}]}],
                  interference:{checked, first_collision_step, first_collision_value, detail},
-                 summary}. Each `transform` is the body's world 4x4 (row-major 16). ok=false
-        distinguishes any unresolved/non-converged frame. The engine solves on an immutable
-        assembly snapshot, so the live mate value/expression, component transforms, revision,
-        undo history, dirty state and warm state never change.
+                 summary, pose_check}. Each `transform` is the body's world 4x4
+        (row-major 16). pose_check checks the relative motion against the hinge line:
+        axis_point, axis_dir, translation_ok (t=p-Rp), rotation_ok, and the invariant
+        coordinate for world-aligned axes, per driven body and frame. A failed check
+        makes ok=false and skips interference for that invalid frame. The engine solves
+        on an immutable snapshot; live poses, mate expressions and history never change.
         """
         try:
             d = _doc(doc_id)
@@ -641,6 +650,8 @@ def register_cad_asm_tools(mcp: FastMCP) -> None:
                 closing["value"] = start
                 trajectory.append(closing)
                 out["trajectory"] = trajectory
+                checked = copy.deepcopy(closing["pose_check"])
+                out["pose_check"]["frames"].append({"i": closing["i"], **checked})
 
             driver = out.setdefault("driver", {})
             driver.update({

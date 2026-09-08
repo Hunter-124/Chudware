@@ -457,3 +457,21 @@ A repair is only real if it is part of the feature tree: `heal` is recorded, re-
 rebuild, and its before/after BRepCheck verdict is the evidence. Repairing a body outside the
 tree (a BREP/STL round-trip, a boolean with itself) is not a repair — nothing downstream can
 tell what was changed, and the next rebuild loses it.
+
+## 10. Carried assembly pose seeds and angle hinge lines (2026-09-08)
+
+When an `asm_edit_component` authors a grounded component's transform, a floating
+mate-connected island whose only grounded boundary is that component has its warm
+poses transported by `T_new * inverse(T_old)`. This composes the complete rigid
+transform with every carried component's existing world placement; it preserves
+unconstrained wheel spin and axial station instead of asking a least-squares solve
+to choose them again. The components remain floating and all their mate equations
+are still solved. Islands with multiple grounded boundaries are linkage networks,
+not rigidly carried children, and are not transported this way. Assembly operation
+replies add `pose_transport: {carried_component_id: grounded_component_id}`.
+
+Angle `value` objects may define a hinge line with `axis:[x,y,z]` (existing alias:
+`reference_axis`) and `axis_point:[x,y,z]`, both in the first reference component's
+local frame. An authored axis is normalized, never flattened to a different axis.
+The scalar mate alone still constrains only an angle. A motion sweep additionally
+requires an identifiable axis line, as specified in `worker_rpc.md`.

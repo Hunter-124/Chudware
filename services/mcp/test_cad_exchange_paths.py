@@ -53,6 +53,8 @@ def exchange(monkeypatch):
         calls.append((method, dict(params)))
         if method == "doc_list":
             return {"docs": [{"doc_id": "doc-live", "revision": 3}]}
+        if method == "asm_world_bodies":
+            return {"bodies": [{"name": "Block"}]}
         if method == "doc_open":
             return {"doc_id": "doc-opened"}
         if method == "drawing_open_standalone":

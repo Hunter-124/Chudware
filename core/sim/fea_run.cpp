@@ -352,7 +352,7 @@ bool write_result_vtu(const nlohmann::json& study, const std::vector<double>& po
     // field that says WHERE the redistribution happened, and a von Mises plot capped
     // at the flow stress is uninterpretable without it.
     for (const char* scalar :
-         {"von_mises", "summary_node", "temperature", "equivalent_plastic_strain"}) {
+         {"von_mises", "summary_node", "temperature", "equivalent_plastic_strain", "factor_of_safety"}) {
         std::vector<double> values = nodal(scalar);
         if (values.size() == n_nodes)
             fields.push_back(VtuPointField{scalar, 1, std::move(values)});
@@ -377,7 +377,9 @@ bool write_result_vtu(const nlohmann::json& study, const std::vector<double>& po
                 "matching the solved mesh";
         return false;
     }
-    if (!write_vtu(path, points, tets, nodes_per_elem, fields, error)) return false;
+    const auto material_ids = result.contains("material_id")
+        ? result["material_id"].get<std::vector<uint16_t>>() : std::vector<uint16_t>{};
+    if (!write_vtu(path, points, tets, nodes_per_elem, fields, error, material_ids)) return false;
     path_out = path;
     return true;
 }
@@ -2246,25 +2248,39 @@ static nlohmann::json fea_run_static_impl(
         return json{{"ok", false}, {"error", "fea_static: cancelled"}};
 
     const json material_input = study.value("material", json::object());
-    if (!material_input.is_object() || !material_input.contains("E_mpa") ||
-        !material_input["E_mpa"].is_number() || !material_input.contains("nu") ||
-        !material_input["nu"].is_number())
-        return json{{"ok", false},
-                    {"error", "fea_static: material requires numeric E_mpa and nu"}};
-    const double E_input = material_input["E_mpa"].get<double>();
-    const double nu_input = material_input["nu"].get<double>();
-    const double yield_input =
-        !material_input.contains("yield_mpa")
-            ? 250.0
-            : (material_input["yield_mpa"].is_number()
-                   ? material_input["yield_mpa"].get<double>()
-                   : std::numeric_limits<double>::quiet_NaN());
-    if (!std::isfinite(E_input) || !(E_input > 0.0) || !std::isfinite(nu_input) ||
-        !(nu_input > -1.0 && nu_input < 0.5) || !std::isfinite(yield_input) ||
-        !(yield_input > 0.0))
-        return json{{"ok", false},
-                    {"error", "fea_static: material E, Poisson ratio, and yield strength "
-                              "must be finite and physically valid"}};
+    const bool per_body_material = material_input.is_object() && material_input.contains("per_body");
+    auto valid_material = [](const json& m) {
+        if (!m.is_object() || !m.contains("E_mpa") || !m["E_mpa"].is_number() ||
+            !m.contains("nu") || !m["nu"].is_number()) return false;
+        const double E = m["E_mpa"].get<double>(), nu = m["nu"].get<double>();
+        if (!std::isfinite(E) || E <= 0 || !std::isfinite(nu) || nu <= -1 || nu >= 0.5)
+            return false;
+        for (const char* key : {"yield_mpa", "density", "density_g_cm3"})
+            if (m.contains(key) && (!m[key].is_number() ||
+                !std::isfinite(m[key].get<double>()) || m[key].get<double>() <= 0))
+                return false;
+        return true;
+    };
+    json scalar_material = material_input;
+    if (per_body_material) {
+        const auto& entries = material_input["per_body"];
+        if (!entries.is_object() || (entries.empty() && !material_input.contains("default")))
+            return json{{"ok", false}, {"error", "fea_static: material.per_body must be an ordinal map with assignments or a default"}};
+        for (auto it = entries.begin(); it != entries.end(); ++it) {
+            if (it.key().empty() || it.key()[0] == '0' ||
+                it.key().find_first_not_of("0123456789") != std::string::npos ||
+                !valid_material(it.value()))
+                return json{{"ok", false}, {"error", "fea_static: invalid material for body ordinal '" + it.key() + "'"}};
+        }
+        scalar_material = material_input.contains("default") ? material_input["default"] : entries.begin().value();
+    }
+    if (!valid_material(scalar_material))
+        return json{{"ok", false}, {"error", "fea_static: material requires finite E_mpa>0, -1<nu<0.5 and positive yield_mpa/density"}};
+    const double yield_input = scalar_material.value("yield_mpa", 250.0);
+    double E_input = scalar_material["E_mpa"].get<double>();
+    if (per_body_material)
+        for (const auto& m : material_input["per_body"])
+            E_input = std::min(E_input, m["E_mpa"].get<double>());
     // ── material.plasticity ──────────────────────────────────────────────────
     // Validated at the study gate (not at the solver) so a malformed elastic-plastic
     // request costs no mesh. yield_mpa defaults to the material's own yield strength,
@@ -2421,9 +2437,84 @@ static nlohmann::json fea_run_static_impl(
     }
 
     const json material = study.value("material", json::object());
-    const double E_mpa = material.value("E_mpa", 0.0);
-    const double nu = material.value("nu", 0.0);
-    const double yield_mpa = material.value("yield_mpa", 250.0);
+    const double E_mpa = scalar_material["E_mpa"].get<double>();
+    const double nu = scalar_material["nu"].get<double>();
+    const double yield_mpa = scalar_material.value("yield_mpa", 250.0);
+    chudware::sim::FeaMaterials element_materials;
+    std::vector<uint16_t> body_material;
+    json material_packet = material_input;
+    auto node_body_index = [&](int node) -> size_t {
+        const auto& bodies = mesh_quality.bodies;
+        auto it = std::upper_bound(bodies.begin(), bodies.end(), node,
+            [](int n, const chudware::sim::MeshOut::Body& b) { return n < b.node_begin; });
+        if (it == bodies.begin()) return bodies.size();
+        --it;
+        return node < it->node_end ? static_cast<size_t>(it - bodies.begin()) : bodies.size();
+    };
+    auto node_material_id = [&](int node) -> uint16_t {
+        const size_t b = node_body_index(node);
+        return b < body_material.size() ? body_material[b] : 0;
+    };
+    if (per_body_material) {
+        if (mesh_quality.bodies.empty())
+            return json{{"ok", false}, {"error", "fea_static: per_body material requires mesh body ordinal ranges"}};
+        std::set<std::string> ordinals;
+        for (const auto& body : mesh_quality.bodies)
+            for (int ordinal : body.source_ordinals) ordinals.insert(std::to_string(ordinal));
+        for (auto it = material_input["per_body"].begin(); it != material_input["per_body"].end(); ++it)
+            if (!ordinals.count(it.key()))
+                return json{{"ok", false}, {"error", "fea_static: material body ordinal " + it.key() + " is not in the mesh"}};
+        material_packet["per_body"] = json::object();
+        auto register_material = [&](const json& m) -> uint16_t {
+            const chudware::sim::FeaMaterial value{m["E_mpa"].get<double>(), m["nu"].get<double>(), m.value("yield_mpa", 250.0)};
+            for (size_t i = 0; i < element_materials.materials.size(); ++i) {
+                const auto& v = element_materials.materials[i];
+                if (v.E_mpa == value.E_mpa && v.nu == value.nu && v.yield_mpa == value.yield_mpa)
+                    return static_cast<uint16_t>(i);
+            }
+            element_materials.materials.push_back(value);
+            return static_cast<uint16_t>(element_materials.materials.size() - 1);
+        };
+        for (const auto& body : mesh_quality.bodies) {
+            int first_id = -1;
+            json first_physics;
+            for (int ordinal : body.source_ordinals) {
+                const std::string key = std::to_string(ordinal);
+                const auto& entries = material_input["per_body"];
+                if (!entries.contains(key) && !material_input.contains("default"))
+                    return json{{"ok", false}, {"error", "fea_static: no material or default for body ordinal " + key}};
+                json m = entries.contains(key) ? entries[key] : material_input["default"];
+                if (element_materials.materials.size() >= 65535)
+                    return json{{"ok", false}, {"error", "fea_static: too many distinct body materials"}};
+                const uint16_t id = register_material(m);
+                const json physics = {m["E_mpa"], m["nu"], m.value("yield_mpa", 250.0), m.value("density_g_cm3", m.value("density", 0.0))};
+                if (first_id >= 0 && physics != first_physics)
+                    return json{{"ok", false}, {"error", "fea_static: fused mesh group mixes materials for ordinals " + json(body.source_ordinals).dump()}};
+                first_id = id;
+                first_physics = physics;
+                m["yield_mpa"] = m.value("yield_mpa", 250.0);
+                m["material_id"] = id;
+                material_packet["per_body"][key] = std::move(m);
+            }
+            if (first_id < 0)
+                return json{{"ok", false}, {"error", "fea_static: meshed body has no source ordinal"}};
+            body_material.push_back(static_cast<uint16_t>(first_id));
+        }
+        element_materials.elem_material.reserve(tets.size() / nodes_per_elem);
+        for (size_t e = 0; e < tets.size(); e += nodes_per_elem) {
+            const int node = tets[e];
+            const size_t body = node_body_index(node);
+            if (body == mesh_quality.bodies.size())
+                return json{{"ok", false}, {"error", "fea_static: element first node has no material body range"}};
+            element_materials.elem_material.push_back(body_material[body]);
+        }
+    }
+    auto pair_modulus = [&](int a, int b) {
+        return per_body_material
+            ? std::min(element_materials.materials[node_material_id(a)].E_mpa,
+                       element_materials.materials[node_material_id(b)].E_mpa)
+            : E_mpa;
+    };
     // Elastic-plastic law (validated at the study gate above). An absent or
     // explicitly disabled `plasticity` block leaves this default-constructed, and the
     // solve is the linear-elastic one it has always been.
@@ -2688,6 +2779,7 @@ static nlohmann::json fea_run_static_impl(
                 if (!probe_note.empty()) notes.push_back("contact: " + probe_note);
                 contact_opts.gap_probe = gap_probe.get();
             }
+            if (per_body_material) contact_opts.pair_modulus = pair_modulus;
             contact_set = fea_contact_candidates(points, tets, nodes_per_elem, E_mpa,
                                                  contact_opts);
             contact_opts.gap_probe = nullptr;  // consumed; nothing below reads it
@@ -2931,7 +3023,7 @@ static nlohmann::json fea_run_static_impl(
                         const int best = kv.second.second;
                         if (tied.emplace(std::min(i, best), std::max(i, best)).second)
                             bond_springs.push_back(
-                                BondSpring{i, best, E_mpa * char_len});
+                                BondSpring{i, best, pair_modulus(i, best) * char_len});
                     }
                 }
                 notes.push_back(
@@ -3204,6 +3296,8 @@ static nlohmann::json fea_run_static_impl(
         dump["nodes_per_elem"] = nodes_per_elem;
         dump["E_mpa"] = E_mpa;
         dump["nu"] = nu;
+        dump["material"] = material_packet;
+        if (per_body_material) dump["material_id"] = element_materials.elem_material;
         json pts = json::array();
         json forces = json::array();
         for (int i = 0; i < n_nodes_out; ++i) {
@@ -3274,16 +3368,16 @@ static nlohmann::json fea_run_static_impl(
                   contact_enabled ? contact_set.springs
                                   : std::vector<chudware::sim::ContactSpring>{},
                   contact_solver_opts, plasticity, contact_report, plastic_report,
-                  job.token())
+                  job.token(), element_materials)
             : (contact_enabled
                    ? fea_static_solve_contact(points, tets, E_mpa, nu, yield_mpa,
                                               fixed_nodes, nodal_forces, nodes_per_elem,
                                               bond_springs, contact_set.springs,
                                               contact_solver_opts, contact_report,
-                                              job.token())
+                                              job.token(), element_materials)
                    : fea_static_solve(points, tets, E_mpa, nu, yield_mpa, fixed_nodes,
                                       nodal_forces, nodes_per_elem, bond_springs,
-                                      job.token()));
+                                      job.token(), element_materials));
     // The contact block is EVIDENCE, so it rides on the refusal too: a reader has to be
     // able to see how many pairs there were and how far the active set got.
     //
@@ -3304,9 +3398,10 @@ static nlohmann::json fea_run_static_impl(
         json body = {{"enabled", true},
                      {"max_gap_mm", contact_opts.max_gap_mm},
                      {"penalty_scale", contact_opts.penalty_scale},
+                     {"penalty_material_rule", "softer_body_E"},
                      {"interface_size_mm", contact_interface_size},
                      {"penalty_stiffness_n_per_mm",
-                      round_nd(E_mpa * contact_set.char_len_mm * contact_opts.penalty_scale, 4)},
+                      per_body_material ? json(nullptr) : json(round_nd(E_mpa * contact_set.char_len_mm * contact_opts.penalty_scale, 4))},
                      {"max_iterations", contact_solver_opts.max_iterations},
                      {"candidate_pairs", contact_report.candidate_pairs},
                      {"active_pairs", contact_report.active_pairs},
@@ -3333,6 +3428,12 @@ static nlohmann::json fea_run_static_impl(
                            {"fraction", round_nd(contact_resolution.load_fraction, 6)},
                            {"note", contact_resolution.load_path_note}}},
                      {"pairs", json::array()}};
+        body["penalty_stiffness_range_n_per_mm"] = json::array();
+        if (!contact_set.springs.empty()) {
+            double lo = contact_set.springs.front().k, hi = lo;
+            for (const auto& s : contact_set.springs) { lo = std::min(lo, s.k); hi = std::max(hi, s.k); }
+            body["penalty_stiffness_range_n_per_mm"] = {lo, hi};
+        }
         for (const FeaContactGroup& g : contact_report.groups) {
             const std::array<int, 2> comps =
                 g.group >= 0 && g.group < static_cast<int>(contact_set.group_components.size())
@@ -3582,8 +3683,17 @@ static nlohmann::json fea_run_static_impl(
         if (f > 15.0) f = 15.0;
         return f;
     };
-    const double min_fos_tresca = clamp_fos(yield_mpa, max_tresca);
-    const double min_fos_rankine = clamp_fos(yield_mpa, max_abs_principal);
+    double min_fos_tresca = clamp_fos(yield_mpa, max_tresca);
+    double min_fos_rankine = clamp_fos(yield_mpa, max_abs_principal);
+    if (per_body_material) {
+        min_fos_tresca = min_fos_rankine = 15.0;
+        for (size_t i = 0; i < r.principal1.size(); ++i) {
+            const double own_yield = element_materials.materials[node_material_id(static_cast<int>(i))].yield_mpa;
+            min_fos_tresca = std::min(min_fos_tresca, clamp_fos(own_yield, r.principal1[i] - r.principal3[i]));
+            min_fos_rankine = std::min(min_fos_rankine,
+                clamp_fos(own_yield, std::max(std::abs(r.principal1[i]), std::abs(r.principal3[i]))));
+        }
+    }
 
     json out = {{"ok", true},
                 {"displacement", r.displacement},
@@ -3671,6 +3781,33 @@ static nlohmann::json fea_run_static_impl(
             r.solver.empty() ? std::string("chudware/fea_static")
                              : "chudware/fea_static [" + r.solver + "]";
         out["provenance"] = detail::provenance_json(solver_route.c_str());
+        out["provenance"]["material_mode"] = per_body_material ? "per_body" : "single";
+        out["material"] = material_packet;
+        out["material"]["interface_stiffness_rule"] = "softer_body_E";
+        out["material_id"] = per_body_material
+            ? json(element_materials.elem_material)
+            : json(std::vector<uint16_t>(static_cast<size_t>(r.n_elems), 0));
+        out["element_von_mises"] = r.element_von_mises;
+        out["factor_of_safety"] = r.factor_of_safety;
+        out["element_factor_of_safety"] = r.element_factor_of_safety;
+        if (per_body_material) {
+            json summaries = json::object();
+            std::vector<double> peaks(mesh_quality.bodies.size(), 0.0);
+            std::vector<double> safety(mesh_quality.bodies.size(), 15.0);
+            for (size_t e = 0; e < r.element_von_mises.size(); ++e) {
+                bool selected = false;
+                for (int j = 0; j < nodes_per_elem; ++j)
+                    if (r.summary_node[tets[e * nodes_per_elem + j]] > 0) { selected = true; break; }
+                if (!selected) continue;
+                const size_t b = node_body_index(tets[e * nodes_per_elem]);
+                peaks[b] = std::max(peaks[b], r.element_von_mises[e]);
+                safety[b] = std::min(safety[b], r.element_factor_of_safety[e]);
+            }
+            for (size_t b = 0; b < mesh_quality.bodies.size(); ++b)
+                for (int ordinal : mesh_quality.bodies[b].source_ordinals)
+                    summaries[std::to_string(ordinal)] = {{"max_von_mises_mpa", peaks[b]}, {"min_fos", safety[b]}};
+            out["material"]["body_summary"] = std::move(summaries);
+        }
     }
 
     // ── Result plausibility: is this displacement even a small strain? ───────

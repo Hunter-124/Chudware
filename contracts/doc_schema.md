@@ -603,3 +603,14 @@ the parsed dict for in-memory diffs). The diff is keyed on stable ids (`f*`, `e*
 paste/undo must not produce false positives).
 
 Implemented in `services/mcp/doc_diff_tools.py`, registered as MCP tool `doc_diff`.
+
+## Assembly angle hinge-line extension (2026-09-08)
+
+An assembly `angle` mate accepts two or three references. The first two select
+the measured directions; the optional third selects axial geometry carrying the
+hinge line's point and direction. The existing `value` dimension object may also
+carry `axis` (alias `reference_axis`) and `axis_point`, in the first reference
+component's local frame. See `doc_ops.md` §10 and `worker_rpc.md` §29 for motion
+drive resolution, composition, refusal and pose evidence semantics. This does
+not change sketch angle constraint arities or make a scalar assembly angle mate
+itself a five-constraint revolute joint.

@@ -137,6 +137,7 @@ MateSolveResult solve_mates(const nlohmann::json& components,
 
 // --- rotation helpers (exposed for the CLI / tests; match the oracle exactly) ---
 Eigen::Vector3d unit(const Eigen::Vector3d& v);
+Eigen::Vector3d canonical_sign(const Eigen::Vector3d& v);
 Eigen::Matrix3d rodrigues(const Eigen::Vector3d& w);
 Eigen::Vector3d mat_to_rotvec(const Eigen::Matrix3d& R);
 

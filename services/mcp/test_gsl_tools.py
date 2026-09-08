@@ -799,6 +799,99 @@ def test_dod4_health_text_state_c_conflicting():
     )
 
 
+def test_assembly_native_roundtrip_keeps_live_geometry(tmp_path, monkeypatch):
+    """Assembly source has no features: bounds/mass/import must use component solids."""
+    monkeypatch.setenv("CHUDWARE_PROJECT_SAVE_DIR", str(tmp_path))
+    docs = []
+    try:
+        paths = []
+        for index in range(2):
+            part = cb.call("doc_new", {"name": f"roundtrip_source_{index}"})["doc_id"]
+            docs.append(part)
+            cb.call("doc_apply_ops", {"doc_id": part, "base_revision": 0, "ops": [
+                cb.feat("box", "Block", {"length": cb.dim(10), "width": cb.dim(8),
+                                         "height": cb.dim(6)})]})
+            path = tmp_path / f"source_{index}.step+"
+            cb.call("doc_save", {"doc_id": part, "path": str(path)})
+            paths.append(path)
+        assembly, content = _call("new_assembly", {"name": "roundtrip_assembly"})
+        assert assembly["ok"] and content, assembly
+        did = assembly["doc_id"]
+        docs.append(did)
+        ops = [{"op": "asm_insert_component", "source": {"path": str(path)},
+                "name": f"Block{index}", "fixed": True,
+                "transform": [1, 0, 0, index * 20, 0, 1, 0, 0,
+                              0, 0, 1, 0, 0, 0, 0, 1]}
+               for index, path in enumerate(paths)]
+        added, _ = _call("add_features", {"doc_id": did, "ops": ops})
+        assert added["ok"], added
+        path = tmp_path / "assembly.step+"
+        saved, content = _call("save_part", {"doc_id": did, "path": str(path)})
+        assert saved["ok"] and content, saved
+        cb.call("doc_close", {"doc_id": did})
+        docs.remove(did)
+        opened, _ = _call("import_part", {"path": str(path)})
+        assert opened["ok"], opened
+        did = opened["doc_id"]
+        docs.append(did)
+        described, content = _call("describe_part", {"doc_id": did})
+        assert described["ok"] and content, described
+        assert described["digest"]["bodies"] == 2
+        assert described["digest"]["faces"] == 12
+        assert described["digest"]["bbox_mm"] == pytest.approx([30, 8, 6])
+        mass = cb.call("eval_mass", {"doc_id": did})
+        assert mass.get("volume_mm3", mass.get("volume")) == pytest.approx(960)
+        target = cb.call("doc_new", {"name": "flattened_roundtrip"})["doc_id"]
+        docs.append(target)
+        imported, _ = _call("import_part", {"path": str(path), "into": target})
+        assert imported["ok"], imported
+        flat, _ = _call("describe_part", {"doc_id": target})
+        assert flat["digest"]["bodies"] == 2
+        assert flat["digest"]["bbox_mm"] == pytest.approx([30, 8, 6])
+    finally:
+        for did in docs:
+            cb.call("doc_close", {"doc_id": did})
+
+
+def test_empty_delivery_and_insufficient_interference_refused(tmp_path):
+    did = cb.call("doc_new", {"name": "empty_delivery_guard"})["doc_id"]
+    try:
+        for tool, extra in [("save_part", {}), ("export_part", {"fmt": "step+"}),
+                            ("export_part", {"fmt": "step"})]:
+            path = tmp_path / (tool + extra.get("fmt", "") + ".step+")
+            result, content = _call(tool, {"doc_id": did, "path": str(path), **extra})
+            assert result["ok"] is False and content, result
+            assert result["reason"] == "no_bodies_empty_document"
+            assert not path.exists()
+        description, _ = _call("describe_part", {"doc_id": did})
+        assert description["digest"] == {"bodies": 0, "faces": 0, "edges": 0, "bbox_mm": None}
+        assert "0 bodies" in description["outline"]
+        # Empty document: refused (the O-38 trap). One body: a legitimate no-pair result
+        # that says so, never mistakable for a verification.
+        result, content = _call("check_interference", {"doc_id": did})
+        assert result["ok"] is False and content, result
+        assert result["reason"] == "insufficient_bodies"
+        assert result["body_count"] == 0
+        cb.call("doc_apply_ops", {"doc_id": did, "base_revision": 0, "ops": [
+            cb.feat("box", "Block", {"length": cb.dim(10), "width": cb.dim(8),
+                                     "height": cb.dim(6)})]})
+        result, _ = _call("check_interference", {"doc_id": did})
+        assert result["ok"] is True and result["pairs_checked"] == 0, result
+        assert result["interferences"] == [] and len(result["parts"]) == 1, result
+        empty = cb.call("doc_new", {"name": "explicit_empty"})["doc_id"]
+        try:
+            for tool in ("save_part", "export_part"):
+                path = tmp_path / f"{tool}_allowed.step+"
+                extra = {"fmt": "step+"} if tool == "export_part" else {}
+                result, _ = _call(tool, {"doc_id": empty, "path": str(path),
+                                        "allow_empty": True, **extra})
+                assert result["ok"] and path.exists(), result
+        finally:
+            cb.call("doc_close", {"doc_id": empty})
+    finally:
+        cb.call("doc_close", {"doc_id": did})
+
+
 if __name__ == "__main__":
     if not cb.available():
         print("SKIP: libchudware not staged")

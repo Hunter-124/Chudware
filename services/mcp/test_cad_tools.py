@@ -2137,10 +2137,9 @@ def _build_swinging_arm_assembly(tmp_path) -> tuple:
       * a fixed Ground bar, parked far out in +Y and coplanar (Z=0), only there to give the drive
         + planar-lock mates a fixed reference — it is NOT in the Arm's swing region, so it never
         pollutes the interference sweep;
-      * a free Arm bar pivoting about the origin, driven by an `angle` mate (its `value`) and
-        held IN the Z-plane by a `parallel` mate (wide-face to wide-face) — without that lock a
-        single angle mate leaves ~5 free DOF and the solver returns an arbitrary out-of-plane
-        pose;
+      * a free Arm bar pivoting about the origin, driven by an `angle` mate carrying
+        its explicit hinge line; a `parallel` mate retains the planar mechanism's
+        physical constraint for inverse dynamics;
       * a fixed Obstacle block sitting in the Arm's swing arc at (14,14).
 
     Driving the angle mate 0->~150 deg swings the Arm from CLEAR into the Obstacle (~120 deg).
@@ -2170,7 +2169,8 @@ def _build_swinging_arm_assembly(tmp_path) -> tuple:
         {"op": "asm_add_mate", "mate": {
             "type": "angle", "align": "aligned", "suppressed": False,
             "refs": [{"component": "k1", "selector": xsel},
-                     {"component": "k2", "selector": xsel}], "value": {"value": 0.0}}},
+                     {"component": "k2", "selector": xsel}],
+            "value": {"value": 0.0, "axis": [0, 0, 1], "axis_point": [0, -200, 0]}}},
         {"op": "asm_add_mate", "mate": {
             "type": "parallel", "align": "aligned", "suppressed": False,
             "refs": [{"component": "k1", "selector": zsel},
@@ -2256,6 +2256,112 @@ def _build_rotated_slider_assembly(tmp_path) -> tuple:
                          {"component": "k1", "selector": top}]}},
         ]})
     return asm, added.get("id_map", {}).get("$0"), "k2"
+
+@pytest.mark.parametrize("line_source", ["authored", "pin_reference"])
+def test_simulate_motion_honors_offset_hinge_line(tmp_path, line_source):
+    """An angle-only rear plate folds about the FRONT pin, not a guessed origin axis."""
+    point = [31.0, 17.0, 23.0]
+    paths, selectors, pin = [], [], None
+    for tag, radius, mode in (("Front", 4, "boss"), ("Rear", 5, "cut")):
+        doc = cb.call("doc_new", {"kind": "part", "name": f"MotionHinge{tag}"})["doc_id"]
+        try:
+            rebuilt = cb.call("doc_apply_ops", {"doc_id": doc, "ops": [
+                cb.feat("box", "Plate", {"length": cb.dim(100), "width": cb.dim(60),
+                                         "height": cb.dim(8)}),
+                cb.feat("cylinder", "Pin" if tag == "Front" else "Bore",
+                        {"radius": cb.dim(radius), "height": cb.dim(18),
+                         "mode": mode}),
+                cb.feat("transform", "Place", {"rotate": [1, 0, 0], "angle": 90,
+                                                "translate": point}),
+            ]})
+            assert all(s["ok"] for s in rebuilt["rebuild"]["feature_status"]), rebuilt
+            selectors.append(cb.call("doc_query", {
+                "doc_id": doc, "query": {"of": "face", "side": "right"}})["matches"][0])
+            if tag == "Front":
+                pin = cb.call("doc_query", {
+                    "doc_id": doc, "query": {"of": "face", "surf": "round"}})["matches"][0]
+            path = str(tmp_path / f"{tag}.step+")
+            cb.call("doc_save", {"doc_id": doc, "path": path})
+            paths.append(path)
+        finally:
+            cb.call("doc_close", {"doc_id": doc})
+    asm = cb.call("doc_new", {"kind": "assembly", "name": "OffsetHinge"})["doc_id"]
+    try:
+        cb.call("doc_apply_ops", {"doc_id": asm, "with_tess": False, "ops": [
+            {"op": "asm_insert_component", "source": {"path": paths[0]},
+             "name": "Front", "fixed": True},
+            {"op": "asm_insert_component", "source": {"path": paths[1]}, "name": "Rear"},
+        ]})
+        refs = [{"component": f"k{i + 1}", "selector": s}
+                for i, s in enumerate(selectors)]
+        value = {"value": 0.0, "axis": [0, 1, 0]}
+        if line_source == "authored":
+            value["axis_point"] = point
+            added, _ = _call("asm_mate", {
+                "doc_id": asm, "mate_type": "angle", "value": value,
+                "a": {"component": "k1", "query": {"of": "face", "side": "right"}},
+                "b": {"component": "k2", "query": {"of": "face", "side": "right"}},
+            })
+            assert added["ok"] and added["converged"], added
+            mate_id = added["mate"]
+        else:
+            refs.append({"component": "k1", "selector": pin})
+            added = cb.call("doc_apply_ops", {"doc_id": asm, "with_tess": False, "ops": [
+                {"op": "asm_add_mate", "mate": {
+                    "type": "angle", "align": "aligned", "refs": refs, "value": value}},
+            ]})
+            mate_id = added["id_map"]["$0"]
+        before = cb.call("doc_tree", {"doc_id": asm})
+        out, _ = _call("simulate_motion", {
+            "doc_id": asm, "mate_id": mate_id, "start": 0, "stop": -90,
+            "steps": 10, "check_interference": False})
+        assert out["ok"], out
+        assert out["pose_check"]["ok"], out
+        for frame in out["trajectory"]:
+            theta = math.radians(frame["value"])
+            c, s = math.cos(theta), math.sin(theta)
+            expected = [c, 0, s, point[0] - c * point[0] - s * point[2],
+                        0, 1, 0, 0,
+                        -s, 0, c, point[2] + s * point[0] - c * point[2],
+                        0, 0, 0, 1]
+            actual = next(b["transform"] for b in frame["bodies"] if b["component"] == "k2")
+            assert actual == pytest.approx(expected, abs=1e-6), frame
+            checked = frame["pose_check"]["bodies"][0]
+            assert checked["axis_dir"] == pytest.approx([0, 1, 0])
+            # Any point on the pin LINE is valid; its station along Y is immaterial.
+            assert [checked["axis_point"][i] for i in (0, 2)] == pytest.approx([31, 23])
+            assert checked["translation_ok"] and checked["rotation_ok"]
+            assert checked["invariant_coordinate"] == {"axis": "y", "ok": True}
+        assert cb.call("doc_tree", {"doc_id": asm}) == before
+        if line_source == "authored":
+            # A second mate forbids the requested rotation. Neither convergence
+            # of some other pose nor its interference numbers can certify motion.
+            cb.call("doc_apply_ops", {"doc_id": asm, "with_tess": False, "ops": [
+                {"op": "asm_add_mate", "mate": {
+                    "type": "parallel", "align": "aligned", "refs": refs[:2]}},
+            ]})
+            failed, _ = _call("simulate_motion", {
+                "doc_id": asm, "stop": -10, "steps": 2, "check_interference": True})
+            assert not failed["ok"] and not failed["pose_check"]["ok"], failed
+            invalid = [f for f in failed["trajectory"] if not f["pose_check"]["ok"]]
+            assert invalid
+            assert all(not f["converged"] and "collisions" not in f for f in invalid)
+        # Removing the point/third ref leaves only an angular scalar: it cannot
+        # advertise a valid rigid-body motion about a made-up line.
+        cb.call("doc_apply_ops", {"doc_id": asm, "with_tess": False, "ops": [
+            {"op": "asm_delete_mate", "id": mate_id},
+            {"op": "asm_add_mate", "mate": {
+                "type": "angle", "align": "aligned", "refs": refs[:2],
+                "value": {"value": 0.0, "axis": [0, 1, 0]}}},
+        ]})
+        refused, _ = _call("simulate_motion", {
+            "doc_id": asm, "stop": -10, "steps": 2, "check_interference": False})
+        assert not refused["ok"], refused
+        assert refused["reason"] == "driver_axis_line_unresolved"
+        assert not refused["pose_check"]["ok"]
+    finally:
+        cb.call("doc_close", {"doc_id": asm})
+
 
 def test_simulate_motion_trajectory_and_swept_interference(tmp_path):
     """simulate_motion drives the angle mate 0->150 deg, returns a per-body trajectory whose

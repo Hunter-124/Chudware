@@ -21,10 +21,31 @@
 
 namespace chudware::sim {
 
+// A compact material table: one index per element, never a copy of its constants.
+// An empty table selects the scalar solver arguments and requires an empty index map.
+// Otherwise elem_material must contain exactly one valid index per mesh element.
+struct FeaMaterial {
+    double E_mpa;
+    double nu;
+    double yield_mpa;
+};
+
+struct FeaMaterials {
+    std::vector<FeaMaterial> materials;
+    std::vector<uint16_t> elem_material;
+};
+
 struct FeaStaticResult {
     std::vector<double> displacement;    // n*3, row-major (node i -> [3i,3i+1,3i+2]) mm
     std::vector<double> disp_magnitude;  // n,  ||u|| per node, mm
     std::vector<double> von_mises;       // n,  node-averaged von Mises stress, MPa
+    // Scalar mode: yield / node-averaged von Mises. Table mode: minimum incident
+    // element factor of safety. Values are clamped to [0,15]; zero stress gives 15.
+    std::vector<double> factor_of_safety;
+    // Peak recovered nodal von Mises within each element, before inter-element
+    // averaging, and that element's own yield divided by this peak (clamped [0,15]).
+    std::vector<double> element_von_mises;
+    std::vector<double> element_factor_of_safety;
 
     // Additive stress fields (all length n_nodes, node-averaged, MPa). These are
     // computed from the SAME averaged stress tensor as von_mises and never alter the
@@ -56,9 +77,11 @@ struct FeaStaticResult {
     // A reader can therefore re-derive max_von_mises_mpa from von_mises and this
     // mask, byte for byte, and max_von_mises_raw_mpa is the same reduction with
     // no mask at all — the two together are the evidence.
+    // In material-table mode min_fos instead reduces element_factor_of_safety over
+    // elements incident to any selected node; min_fos_raw reduces all elements.
     std::vector<std::uint8_t> summary_node;
     double max_von_mises_raw_mpa = 0.0;  // max over ALL nodes of von_mises, MPa
-    double min_fos_raw = 0.0;            // yield / max_von_mises_raw_mpa (clamped 0..15)
+    double min_fos_raw = 0.0;            // unmasked minimum factor of safety (clamped 0..15)
     int summary_excluded_nodes = 0;      // count of summary_node[i] == 0
     int max_von_mises_raw_node = -1;     // WHERE the unmasked peak is (node index)
     int n_dof = 0;
@@ -266,8 +289,8 @@ struct FeaContactOptions {
 // change matters and fea_run emits a warning saying so.
 struct FeaPlasticity {
     bool enabled = false;
-    // Initial yield stress (MPa). 0 means "use the study's yield_mpa", which is the
-    // same number the factor-of-safety summary is measured against.
+    // Initial yield stress (MPa). 0 means "use the study's yield_mpa". This scalar
+    // override is ignored when FeaMaterials supplies per-element yield strengths.
     double yield_mpa = 0.0;
     // Linear isotropic hardening tangent modulus H (MPa). 0 = perfectly plastic.
     double hardening_mpa = 0.0;
@@ -309,6 +332,9 @@ struct FeaPlasticReport {
 // SEPARATE code path; default 4 keeps every existing caller on the parity path.
 // bond_springs (default empty = every existing caller unchanged, parity preserved)
 // appends penalty-tie stiffness AFTER element assembly.
+// materials overrides the scalar E_mpa/nu/yield_mpa when its table is non-empty.
+// All table entries require finite E>0, -1<nu<0.5 and yield>0; at most 65536 entries.
+// Heterogeneous solves bypass the prepared-system cache.
 // Never throws: a degenerate/unsolvable model returns ok=false with an error string.
 FeaStaticResult fea_static_solve(const std::vector<double>& points,
                                  const std::vector<int>& tets, double E_mpa, double nu,
@@ -316,7 +342,8 @@ FeaStaticResult fea_static_solve(const std::vector<double>& points,
                                  const std::vector<double>& nodal_forces,
                                  int nodes_per_elem = 4,
                                  const std::vector<BondSpring>& bond_springs = {},
-                                 const SimCancelToken& cancel_token = {});
+                                 const SimCancelToken& cancel_token = {},
+                                 const FeaMaterials& materials = {});
 
 // Same linear-elastic kernel, plus an ACTIVE-SET loop over `contact_springs`:
 //
@@ -342,7 +369,8 @@ FeaStaticResult fea_static_solve_contact(
     const std::vector<double>& nodal_forces, int nodes_per_elem,
     const std::vector<BondSpring>& bond_springs,
     const std::vector<ContactSpring>& contact_springs, const FeaContactOptions& options,
-    FeaContactReport& report, const SimCancelToken& cancel_token = {});
+    FeaContactReport& report, const SimCancelToken& cancel_token = {},
+    const FeaMaterials& materials = {});
 
 // Same kernel with the J2 material law switched on: radial return at every Gauss
 // point, a consistent tangent, and an incremental Newton-Raphson load-stepping loop
@@ -365,6 +393,7 @@ FeaStaticResult fea_static_solve_plastic(
     const std::vector<BondSpring>& bond_springs,
     const std::vector<ContactSpring>& contact_springs, const FeaContactOptions& options,
     const FeaPlasticity& plasticity, FeaContactReport& contact_report,
-    FeaPlasticReport& plastic_report, const SimCancelToken& cancel_token = {});
+    FeaPlasticReport& plastic_report, const SimCancelToken& cancel_token = {},
+    const FeaMaterials& materials = {});
 
 }  // namespace chudware::sim

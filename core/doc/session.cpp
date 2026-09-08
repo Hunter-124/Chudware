@@ -4114,11 +4114,76 @@ bool component_is_fixed(const json& doc, const std::string& cid) {
     return false;
 }
 
+// A grounded component's authored motion carries each floating mate island attached
+// only to it. Transport the WARM POSES, not constraints: a wheel keeps its free spin
+// and axial station while its hub steers, and the solver still checks every mate.
+// Islands spanning multiple anchors are linkages, not rigidly carried children.
+json transport_carried_poses(Session& s, const json& after, const json& ops) {
+    json carried = json::object();
+    if (!s.is_assembly() || s.asm_warm.empty()) return carried;
+    std::map<std::string, Eigen::Matrix4d> anchors;
+    auto matrix = [](const json& c) {
+        Eigen::Matrix4d m = Eigen::Matrix4d::Identity();
+        if (c.contains("transform") && c["transform"].is_array() &&
+            c["transform"].size() == 16)
+            for (int r = 0; r < 4; ++r)
+                for (int k = 0; k < 4; ++k) m(r, k) = c["transform"][r * 4 + k];
+        return m;
+    };
+    for (const json& op : ops) {
+        if (op.value("op", std::string()) != "asm_edit_component" ||
+            !op.contains("transform")) continue;
+        const std::string id = op.value("id", std::string());
+        if (!component_is_fixed(after, id)) continue;
+        for (const json& old : s.doc["components"])
+            if (old.value("id", std::string()) == id)
+                for (const json& now : after["components"])
+                    if (now.value("id", std::string()) == id)
+                        anchors[id] = matrix(now) * matrix(old).inverse();
+    }
+    if (anchors.empty()) return carried;
+    std::map<std::string, std::set<std::string>> graph;
+    for (const json& m : after.value("mates", json::array())) {
+        if (m.value("suppressed", false)) continue;
+        std::vector<std::string> refs;
+        for (const json& ref : m.value("refs", json::array()))
+            refs.push_back(ref.value("component", std::string()));
+        for (const auto& a : refs)
+            for (const auto& b : refs)
+                if (a != b) graph[a].insert(b);
+    }
+    std::set<std::string> seen;
+    for (const json& c : after["components"]) {
+        const std::string id = c.value("id", std::string());
+        if (c.value("suppressed", false) || c.value("fixed", false) || seen.count(id))
+            continue;
+        std::vector<std::string> island{id};
+        std::set<std::string> boundary;
+        seen.insert(id);
+        for (size_t i = 0; i < island.size(); ++i)
+            for (const auto& other : graph[island[i]]) {
+                if (component_is_fixed(after, other)) boundary.insert(other);
+                else if (seen.insert(other).second) island.push_back(other);
+            }
+        if (boundary.size() != 1 || !anchors.count(*boundary.begin())) continue;
+        const auto& owner = *boundary.begin();
+        const Eigen::Matrix4d& delta = anchors.at(owner);
+        for (const auto& child : island) {
+            auto it = s.asm_warm.find(child);
+            if (it == s.asm_warm.end()) continue;
+            auto& [t, w] = it->second;
+            t = delta.topLeftCorner<3, 3>() * t + delta.topRightCorner<3, 1>();
+            w = chudware::mate::mat_to_rotvec(
+                delta.topLeftCorner<3, 3>() * chudware::mate::rodrigues(w));
+            carried[child] = owner;
+        }
+    }
+    return carried;
+}
+
 // An `asm_edit_component` that writes `transform` (or promotes the component to `fixed`)
-// AUTHORS the pose. `s.asm_warm` holds the PREVIOUS solve's params for every component
-// (fixed ones included) and wins over `components[].transform` in mate::solve_mates, so a
-// stale warm entry silently discards the edit on the very rebuild the op triggers — an
-// insert only survived because its brand-new id was not in the map yet.
+// AUTHORS the pose. Free unmated components read their seed from the document
+// after invalidation; fixed components always use their authored transform.
 //
 // The erase is deliberately NARROW: only a component whose pose it actually owns —
 // `fixed`, or referenced by no non-suppressed mate. A mated, unfixed component KEEPS its
@@ -4508,6 +4573,7 @@ json apply_ops_locked(Session& s, long base_revision, const json& ops, bool coal
                       {{"index", -1}, {"reason", errs.front()}, {"all_errors", errs}});
     }
 
+    const json pose_transport = transport_carried_poses(s, working, ops);
     // The batch is validated and will be applied: drop the warm-start entry of every
     // component whose pose this batch AUTHORS **and** owns (fixed, or bound by no
     // non-suppressed mate), so the rebuild below (either branch) seeds mate::solve_mates
@@ -4541,7 +4607,9 @@ json apply_ops_locked(Session& s, long base_revision, const json& ops, bool coal
     if (s.is_assembly()) {
         rebuild_assembly(s);
         if (!coalesce) push_undo_document(s, rollback_doc);
-        return ops_response_assembly(s, id_map);
+        json response = ops_response_assembly(s, id_map);
+        response["pose_transport"] = pose_transport;
+        return response;
     }
     CompileResult r = compile_session(s);
     if (!r.ok) {
@@ -8518,11 +8586,11 @@ json doc_face_points(const std::string& doc_id, const json& selector, int max_n)
 json doc_bbox(const std::string& doc_id) {
     DocLock lk;
     Session& s = require_session(doc_id);
-    CompileResult r = compile_session(s);
-    if (r.shapes.empty())
-        throw_no_bodies(doc_id, r, "bound");
+    const auto shapes = gather_export_shapes(s);
+    if (shapes.empty())
+        throw_no_bodies(doc_id, ensure_compiled(s), "bound");
     Bnd_Box box;
-    for (const TopoDS_Shape& shp : r.shapes)
+    for (const TopoDS_Shape& shp : shapes)
         if (!shp.IsNull())
             BRepBndLib::AddOptimal(shp, box, /*useTriangulation=*/Standard_False,
                                    /*useShapeTolerance=*/Standard_False);
@@ -8546,7 +8614,11 @@ json doc_bbox(const std::string& doc_id) {
 json doc_eval_mass(const std::string& doc_id, int body_id, double density_g_cm3) {
     DocLock lk;
     Session& s = require_session(doc_id);
-    CompileResult r = compile_session(s);
+    CompileResult r;
+    if (s.is_assembly())
+        r.shapes = gather_export_shapes(s);
+    else
+        r = compile_session(s);
     if (r.shapes.empty())
         throw_no_bodies(doc_id, r, "evaluate");
 
@@ -10450,6 +10522,8 @@ json interference_report(const std::vector<std::pair<std::string, TopoDS_Shape>>
                       clearances[tight]["b"].get<std::string>().c_str(),
                       clearances[tight]["distance"].get<double>());
         summary = buf;
+    } else if (members.size() < 2) {
+        summary = "No body pairs to check (1 body).";
     } else {
         summary = "No interference detected.";
     }
@@ -10457,6 +10531,7 @@ json interference_report(const std::vector<std::pair<std::string, TopoDS_Shape>>
     return json{
         {"ok", interferences.empty()},
         {"summary", summary},
+        {"pairs_checked", members.size() < 2 ? 0 : members.size() * (members.size() - 1) / 2},
         {"parts", parts},
         {"interferences", interferences},
         {"clearances", clearances},
@@ -10509,6 +10584,14 @@ json doc_eval_interference(const std::string& doc_id, const json& params) {
             members.swap(filtered);
         }
     }
+    // An EMPTY document is the trap: `check_interference` on nothing "passes" and the
+    // caller records a verified placement (ME 490 O-38). A single body, or a `members`
+    // filter that keeps one, is a legitimate no-pair result and stays ok:true with
+    // pairs_checked = 0 so nobody mistakes it for a verification.
+    if (members.empty())
+        return json{{"ok", false}, {"reason", "insufficient_bodies"},
+                    {"body_count", 0},
+                    {"summary", "Interference requires bodies; this document has none."}};
     const bool include_coincident = params.contains("include_coincident") &&
                                     params["include_coincident"].is_boolean() &&
                                     params["include_coincident"].get<bool>();
@@ -11872,11 +11955,11 @@ json doc_import_file(const std::string& path, const std::string& into, bool as_s
         {
             DocLock lk;
             Session& tmp = require_session(tmp_id);
-            CompileResult r = compile_document(tmp.doc, env_from_doc(tmp.doc));
+            const auto shapes = gather_export_shapes(tmp);
             TopoDS_Compound comp;
             BRep_Builder bb;
             bb.MakeCompound(comp);
-            for (const TopoDS_Shape& shp : r.shapes)
+            for (const TopoDS_Shape& shp : shapes)
                 if (!shp.IsNull()) { bb.Add(comp, shp); ++n; }
             if (n > 0) blob = shape_to_brep_b64(comp);
         }
@@ -15178,15 +15261,138 @@ static const std::map<std::string, std::string> k_drivable_mate_types = {
     {"distance", "mm"},
 };
 
-// Transpose a 4×4 row-major double matrix to column-major float (for viewport).
+// Keep double precision at the RPC seam; viewport consumers may narrow on upload.
 // Row-major M[r][c] = flat[r*4+c]; col-major M[r][c] = flat[c*4+r].
-static std::array<float, 16> row_to_col_major(const std::vector<double>& rm) {
-    std::array<float, 16> cm{};
+static std::array<double, 16> row_to_col_major(const std::vector<double>& rm) {
+    std::array<double, 16> cm{};
     if (rm.size() < 16) { cm[0] = 1; cm[5] = 1; cm[10] = 1; cm[15] = 1; return cm; }
     for (int r = 0; r < 4; ++r)
         for (int c = 0; c < 4; ++c)
-            cm[(size_t)(c * 4 + r)] = (float)rm[(size_t)(r * 4 + c)];
+            cm[(size_t)(c * 4 + r)] = rm[(size_t)(r * 4 + c)];
     return cm;
+}
+
+struct MotionAxisLine {
+    std::string component;
+    Eigen::Vector3d point = Eigen::Vector3d::Zero();
+    Eigen::Vector3d direction = Eigen::Vector3d::Zero();
+    Eigen::Matrix4d base = Eigen::Matrix4d::Identity();
+    double value = 0.0;
+    double sign = 1.0;
+};
+
+static Eigen::Matrix4d motion_matrix(const std::vector<double>& values) {
+    Eigen::Matrix4d out;
+    for (int r = 0; r < 4; ++r)
+        for (int c = 0; c < 4; ++c) out(r, c) = values.at(r * 4 + c);
+    return out;
+}
+
+// A scalar angle supplies ONE rotational equation, not a revolute joint. Motion
+// needs a line as well: authored point+axis, the mate's own third axial reference,
+// or a concentric/hinge joint on its driven body. Never guess a pivot at the origin.
+static MotionAxisLine motion_axis_line(const json& doc, json& driver,
+                                       const AssemblyResult& initial) {
+    MotionAxisLine line;
+    const auto& refs = driver.at("refs");
+    const std::string a = refs.at(0).at("component");
+    const std::string b = refs.at(1).at("component");
+    // Prefer the second measured body; if it is grounded, drive the first with
+    // opposite angular sign. Both-floating mechanisms still have a well-defined
+    // driver when the mate supplies a line; the full solve and pose check decide
+    // whether the network can honor it.
+    const bool fb = component_is_fixed(doc, b);
+    line.component = fb ? a : b;
+    line.sign = fb ? -1.0 : 1.0;
+    line.base = motion_matrix(initial.transforms.at(line.component));
+    const Eigen::Matrix4d ma = motion_matrix(initial.transforms.at(a));
+    json& value = driver["value"];
+    if (!value.is_object()) value = {{"value", value}};
+    line.value = value.value("value", 0.0);
+    const json axis = value.value("axis", value.value("reference_axis", json()));
+    const bool authored_axis = !axis.is_null();
+    if (authored_axis)
+        line.direction = ma.topLeftCorner<3, 3>() * motion_vec3(axis, "value.axis");
+    bool have_point = false;
+    if (value.contains("axis_point")) {
+        line.point = ma.topLeftCorner<3, 3>() *
+            motion_vec3(value["axis_point"], "value.axis_point") + ma.topRightCorner<3, 1>();
+        have_point = true;
+    }
+    auto take_axis = [&](const AsmMateRefGeom& ref) {
+        if (ref.geom.kind != "axis") return false;
+        const Eigen::Matrix4d m = motion_matrix(initial.transforms.at(ref.component));
+        Eigen::Vector3d dir = m.topLeftCorner<3, 3>() * ref.geom.direction;
+        if (dir.norm() < 1e-12) return false;
+        dir.normalize();
+        if (authored_axis && line.direction.normalized().cross(dir).norm() > 1e-6)
+            return false;
+        if (!have_point) {
+            line.point = m.topLeftCorner<3, 3>() * ref.geom.point + m.topRightCorner<3, 1>();
+            have_point = true;
+        }
+        if (!authored_axis) {
+            // Match the solver's derived-axis sign convention.
+            line.direction = ma.topLeftCorner<3, 3>() *
+                chudware::mate::canonical_sign(ma.topLeftCorner<3, 3>().transpose() * dir);
+        }
+        return true;
+    };
+    const auto own = initial.mate_geometry.find(driver.at("id").get<std::string>());
+    if ((!have_point || !authored_axis) && own != initial.mate_geometry.end())
+        for (const auto& ref : own->second)
+            if (ref.ref_index >= 2 && take_axis(ref)) break;
+    if (!have_point || line.direction.norm() < 1e-12)
+        for (const json& mate : doc["mates"]) {
+            const std::string type = mate.value("type", std::string());
+            if (mate.value("suppressed", false) || (type != "concentric" && type != "hinge"))
+                continue;
+            const auto found = initial.mate_geometry.find(mate.at("id").get<std::string>());
+            if (found == initial.mate_geometry.end()) continue;
+            bool attached = false;
+            for (const auto& ref : found->second)
+                attached = attached || ref.component == line.component;
+            if (!attached) continue;
+            for (const auto& ref : found->second)
+                if (ref.component == line.component && take_axis(ref)) break;
+            if (have_point && line.direction.norm() >= 1e-12) break;
+        }
+    if (!have_point || !line.direction.allFinite() || line.direction.norm() < 1e-12)
+        motion_invalid("driver_axis_line_unresolved: angle mate has no hinge line; "
+                       "provide value.axis and value.axis_point in the first reference's "
+                       "local frame, a third axial reference, or a concentric/hinge mate "
+                       "on the driven body");
+    line.direction.normalize();
+    // Freeze the resolved direction for the entire sweep; keep its true 3D direction.
+    const Eigen::Vector3d local_axis = ma.topLeftCorner<3, 3>().transpose() * line.direction;
+    value["axis"] = {local_axis.x(), local_axis.y(), local_axis.z()};
+    return line;
+}
+
+static json motion_pose_check(const MotionAxisLine& line, const Eigen::Matrix4d& pose,
+                               const Eigen::Matrix3d& expected_rotation) {
+    const Eigen::Matrix4d delta = pose * line.base.inverse();
+    const Eigen::Matrix3d r = delta.topLeftCorner<3, 3>();
+    const double tol = 1e-6 * std::max(1.0, line.point.norm());
+    const double error = (delta.topRightCorner<3, 1>() -
+                         (line.point - r * line.point)).norm();
+    const bool translation_ok = error <= tol;
+    const bool rotation_ok = (r - expected_rotation).cwiseAbs().maxCoeff() <= 1e-6;
+    json invariant = nullptr;
+    bool invariant_ok = true;
+    for (int k = 0; k < 3; ++k)
+        if (std::abs(std::abs(line.direction[k]) - 1.0) < 1e-12) {
+            Eigen::RowVector4d row = Eigen::RowVector4d::Zero();
+            row[k] = 1.0;
+            invariant_ok = (delta.row(k) - row).cwiseAbs().maxCoeff() <= 1e-6;
+            invariant = {{"axis", std::string(1, "xyz"[k])}, {"ok", invariant_ok}};
+        }
+    return {{"component", line.component},
+            {"axis_point", {line.point.x(), line.point.y(), line.point.z()}},
+            {"axis_dir", {line.direction.x(), line.direction.y(), line.direction.z()}},
+            {"translation_ok", translation_ok}, {"translation_error_mm", error},
+            {"rotation_ok", rotation_ok}, {"invariant_coordinate", invariant},
+            {"ok", translation_ok && rotation_ok && invariant_ok}};
 }
 
 json doc_simulate_motion(const std::string& doc_id,
@@ -15267,6 +15473,25 @@ json doc_simulate_motion(const std::string& doc_id,
                        "drive an angle or distance mate");
     driver_unit = driver_it->second;
 
+    std::optional<MotionAxisLine> axis_line;
+    if (driver_type == "angle") {
+        const AssemblyResult initial = compile_assembly(sweep_doc, base_dir, warm);
+        if (!initial.converged)
+            motion_invalid("driver_initial_pose_unresolved: assembly must solve before driving");
+        warm = initial.warm;
+        try {
+            axis_line = motion_axis_line(sweep_doc, *driven, initial);
+        } catch (const std::exception& e) {
+            return {{"ok", false}, {"doc_id", doc_id}, {"mate_id", mate_id},
+                    {"reason", "driver_axis_line_unresolved"}, {"error", e.what()},
+                    {"trajectory", json::array()},
+                    {"pose_check", {{"ok", false}, {"reason", "driver_axis_line_unresolved"},
+                                    {"frames", json::array()}}}};
+        }
+    }
+    json pose_frames = json::array();
+    bool all_pose_ok = true;
+
     std::vector<double> samples;
     samples.reserve(static_cast<size_t>(steps));
     for (int i = 0; i < steps; ++i)
@@ -15286,9 +15511,23 @@ json doc_simulate_motion(const std::string& doc_id,
 
     for (int i = 0; i < steps; ++i) {
         const double value = samples[static_cast<size_t>(i)];
-        // The snapshot can discard expression metadata because it is never
-        // committed. The live mate, including its exact {value,expr}, is untouched.
-        (*driven)["value"] = {{"value", value}, {"expr", nullptr}};
+        // Change only the scalar: axis/axis_point and other mate geometry survive.
+        if (!(*driven)["value"].is_object())
+            (*driven)["value"] = {{"value", (*driven)["value"]}};
+        (*driven)["value"]["value"] = value;
+        (*driven)["value"]["expr"] = nullptr;
+        Eigen::Matrix3d drive_rotation = Eigen::Matrix3d::Identity();
+        if (axis_line) {
+            const auto& line = *axis_line;
+            drive_rotation = chudware::mate::rodrigues(
+                line.direction * (line.sign * (value - line.value) * M_PI / 180.0));
+            Eigen::Matrix4d delta = Eigen::Matrix4d::Identity();
+            delta.topLeftCorner<3, 3>() = drive_rotation;
+            delta.topRightCorner<3, 1>() = line.point - drive_rotation * line.point;
+            const Eigen::Matrix4d pose = delta * line.base;
+            (*warm)[line.component] = {pose.topRightCorner<3, 1>(),
+                chudware::mate::mat_to_rotvec(pose.topLeftCorner<3, 3>())};
+        }
         AssemblyResult solved = compile_assembly(sweep_doc, base_dir, warm);
         warm = solved.warm;
 
@@ -15333,22 +15572,42 @@ json doc_simulate_motion(const std::string& doc_id,
             }
             auto column_major = row_to_col_major(body.transform);
             json transform_j = json::array();
-            for (float entry : column_major) transform_j.push_back(entry);
+            for (double entry : column_major) transform_j.push_back(entry);
             bodies_j.push_back({{"name", body.name},
                                 {"component", body.component_id},
                                 {"transform", transform_j}});
             if (body.component_id.find('#') == std::string::npos)
                 frame_poses[body.component_id] = transform;
         }
+        json pose_check = {{"ok", true}, {"bodies", json::array()}};
+        if (axis_line) {
+            const auto it = frame_poses.find(axis_line->component);
+            if (it == frame_poses.end()) {
+                pose_check["ok"] = false;
+                pose_check["reason"] = "driver_pose_missing";
+            } else {
+                json checked = motion_pose_check(*axis_line, it->second, drive_rotation);
+                pose_check["ok"] = checked["ok"];
+                pose_check["bodies"].push_back(std::move(checked));
+            }
+            if (!pose_check["ok"].get<bool>()) {
+                converged = false;
+                all_converged = false;
+                all_pose_ok = false;
+                issues.push_back("driver_pose_mismatch: solved pose does not honor hinge line");
+            }
+        }
+        pose_frames.push_back({{"i", i}, {"ok", pose_check["ok"]},
+                               {"bodies", pose_check["bodies"]}});
 
         json frame = {{"i", i},
                       {"value", value},
                       {"dof", solved.dof},
                       {"converged", converged},
-                      {"bodies", bodies_j}};
+                      {"bodies", bodies_j}, {"pose_check", pose_check}};
         if (!issues.empty()) frame["issues"] = issues;
 
-        if (check_interference) {
+        if (check_interference && converged) {
             std::vector<std::pair<std::string, TopoDS_Shape>> members;
             members.reserve(solved.bodies.size());
             for (const AsmBodyOut& body : solved.bodies)
@@ -15422,6 +15681,7 @@ json doc_simulate_motion(const std::string& doc_id,
                     {"stop", stop},
                     {"steps", steps}}},
         {"trajectory", trajectory},
+        {"pose_check", {{"ok", all_pose_ok}, {"frames", pose_frames}}},
         {"interference", interference},
         {"summary", std::string(summary_buf)}};
     if (!all_converged)

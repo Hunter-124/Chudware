@@ -2019,6 +2019,7 @@ std::pair<int, int> mate_ref_counts(const string& t) {
     if (t == "width") return {3, 4};
     if (t == "symmetric") return {3, 3};
     if (t == "hinge") return {2, 4};
+    if (t == "angle") return {2, 3};  // optional axial reference supplies the hinge line
     return {2, 2};
 }
 // mtype -> (required numeric keys, optional numeric keys) for coupling/limit mates.

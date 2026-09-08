@@ -355,6 +355,61 @@ def test_sweep_envelope_takes_the_same_steer_spec(rover):
     assert len(out["per_step"]) == 4
 
 
+def test_sweep_envelope_carries_nonidentity_wheel_pose_about_kingpin(tmp_path):
+    """Steering the hub must not inject free axle spin into its carried wheel."""
+    if not cb.available():
+        pytest.skip("libchudware not staged; engine-backed MCP tools unavailable")
+    wheel = _part("carried_wheel", [
+        cb.feat("cylinder", "Disc", {"radius": cb.dim(260), "height": cb.dim(120)}),
+    ], tmp_path)
+    hub = _part("carried_hub", [
+        cb.feat("cylinder", "Hub", {"radius": cb.dim(30), "height": cb.dim(100)}),
+        cb.feat("transform", "Axle", {"rotate": [1, 0, 0], "angle": 90}),
+    ], tmp_path)
+    asm = cb.call("doc_new", {"kind": "assembly", "name": "CarriedSteering"})["doc_id"]
+    point = [31.0, 558.8, 263.0]
+    hub_pose = [1, 0, 0, point[0], 0, 1, 0, point[1], 0, 0, 1, point[2], 0, 0, 0, 1]
+    # The wheel's local spin axis is Z, placed on the hub's world -Y axle.
+    # An identity component pose misses the solver's rotation-vector nullspace bug.
+    wheel_pose = [1, 0, 0, point[0], 0, 0, -1, point[1], 0, 1, 0, point[2], 0, 0, 0, 1]
+    try:
+        cb.call("doc_apply_ops", {"doc_id": asm, "with_tess": False, "ops": [
+            {"op": "asm_insert_component", "source": {"path": hub}, "name": "Hub",
+             "fixed": True, "transform": hub_pose},
+            {"op": "asm_insert_component", "source": {"path": wheel}, "name": "Wheel",
+             "transform": wheel_pose},
+        ]})
+        mate = _call("asm_mate", {
+            "doc_id": asm, "mate_type": "concentric",
+            "a": {"component": "k1", "query": {"of": "face", "surf": "round"}},
+            "b": {"component": "k2", "query": {"of": "face", "surf": "round"}},
+        })
+        assert mate["ok"] and mate["converged"], mate
+        cb.call("doc_save", {"doc_id": asm, "path": str(tmp_path / "carried.step+")})
+        before = cb.call("doc_tree", {"doc_id": asm})
+        out = _call("sweep_envelope", {
+            "doc_id": asm, "components": ["Wheel"], "steps": 5,
+            "steer": {"components": ["Hub"],
+                      "axis": {"point": point, "dir": [0, 0, 1]}, "angle_deg": 35},
+        })
+        assert out["ok"], out
+        assert out["pose_check"]["ok"], out
+        for frame in out["per_step"]:
+            box = frame["components"]["k2"]
+            assert box["min"][2] == pytest.approx(3.0, abs=1e-6), frame
+            assert box["max"][2] == pytest.approx(523.0, abs=1e-6), frame
+        for frame in out["pose_check"]["frames"]:
+            checks = {b["component"]: b for b in frame["bodies"]}
+            for cid in ("k1", "k2"):
+                assert checks[cid]["axis_point"] == point
+                assert checks[cid]["axis_dir"] == [0, 0, 1]
+                assert checks[cid]["translation_ok"] and checks[cid]["rotation_ok"]
+                assert checks[cid]["invariant_coordinate"] == {"axis": "z", "ok": True}
+        assert cb.call("doc_tree", {"doc_id": asm}) == before
+    finally:
+        cb.call("doc_close", {"doc_id": asm})
+
+
 _AX_FL = {"point": [1000.0, 800.0, 0.0], "dir": [0, 0, 1]}
 
 

@@ -414,6 +414,24 @@ def _validate_material(method: str, study: dict, keys: tuple) -> None:
     material = study.get("material")
     if not isinstance(material, dict) or not material:
         raise ValueError(f"{method} study needs a material object")
+    if "per_body" in material:
+        if method != "sim_run_static":
+            raise ValueError(f"{method} does not support per-body materials")
+        entries = material["per_body"]
+        if not isinstance(entries, dict) or (not entries and "default" not in material):
+            raise ValueError(f"{method} material.per_body needs assignments or a default")
+        for ordinal, leaf in entries.items():
+            if not isinstance(ordinal, str) or not ordinal.isascii() or not ordinal.isdecimal() or ordinal.startswith("0"):
+                raise ValueError(f"{method} invalid material body ordinal {ordinal!r}")
+            if not isinstance(leaf, dict) or "per_body" in leaf:
+                raise ValueError(f"{method} material body {ordinal} needs a property object")
+            _validate_material(method, {"material": {"yield_mpa": 250.0, **leaf}}, keys)
+        if "default" in material:
+            default = material["default"]
+            if not isinstance(default, dict) or "per_body" in default:
+                raise ValueError(f"{method} material.default needs a property object")
+            _validate_material(method, {"material": {"yield_mpa": 250.0, **default}}, keys)
+        return
     for key in keys:
         value = _finite(material.get(key), f"{method} material {key}")
         if key != "nu" and value <= 0.0:

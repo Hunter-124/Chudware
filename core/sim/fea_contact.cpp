@@ -291,7 +291,6 @@ ContactCandidateSet fea_contact_candidates(const std::vector<double>& points,
     for (int i : surface)
         grid[cell_key(points[i * 3], points[i * 3 + 1], points[i * 3 + 2])].push_back(i);
 
-    const double k_pair = E_mpa * out.char_len_mm * options.penalty_scale;
     std::map<std::array<int, 2>, int> group_of;
     std::map<std::array<int, 2>, char> paired;  // (min node, max node) dedupe
     struct Best {
@@ -404,7 +403,12 @@ ContactCandidateSet fea_contact_candidates(const std::vector<double>& points,
             ContactSpring s;
             s.a = flip ? b.node : i;
             s.b = flip ? i : b.node;
-            s.k = k_pair;
+            const double pair_E = options.pair_modulus ? options.pair_modulus(s.a, s.b) : E_mpa;
+            if (!std::isfinite(pair_E) || pair_E <= 0.0) {
+                out.error = "contact: pair material E must be finite and > 0";
+                return out;
+            }
+            s.k = pair_E * out.char_len_mm * options.penalty_scale;
             s.gap0_mm = gap_used;
             for (int c = 0; c < 3; ++c)
                 s.normal[static_cast<std::size_t>(c)] = flip ? -dir.n[c] : dir.n[c];

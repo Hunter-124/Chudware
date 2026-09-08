@@ -309,6 +309,9 @@ def _kept_import_bodies(names: list, keep, exclude) -> list:
 
 
 def _digest(doc_id: str) -> dict:
+    bodies = cb.call("asm_world_bodies", {"doc_id": doc_id, "explode": False}).get("bodies", [])
+    if not bodies:
+        raise ValueError("document has no bodies")
     faces = cb.call("doc_query", {"doc_id": doc_id, "query": {"of": "face"}}).get("matches", [])
     edges = cb.call("doc_query", {"doc_id": doc_id, "query": {"of": "edge"}}).get("matches", [])
     try:
@@ -429,6 +432,7 @@ def _digest(doc_id: str) -> dict:
 
     return {
         "part": (tree.get("tree") or {}).get("name"),
+        "bodies": len(bodies),
         "bbox_mm": bbox.get("size"),
         "faces": len(faces), "edges": len(edges),
         "symmetry": part_symmetry,
@@ -445,7 +449,7 @@ def _outline_text(d: dict) -> str:
     bb = d.get("bbox_mm")
     bbs = (f"{bb[0]:.0f}x{bb[1]:.0f}x{bb[2]:.0f} mm" if isinstance(bb, list) and len(bb) == 3
            else "?")
-    lines.append(f'Part "{d.get("part") or "part"}"  bbox {bbs}  | {d["faces"]} faces, '
+    lines.append(f'Part "{d.get("part") or "part"}"  bbox {bbs}  | {d["bodies"]} bodies, {d["faces"]} faces, '
                  f'{d["edges"]} edges')
     if d.get("symmetry"):
         s = d["symmetry"]
@@ -1789,8 +1793,8 @@ def _empty_part_text(doc_id: str) -> str:
         feats = [f for f in (tree.get("features") or []) if isinstance(f, dict)]
     except Exception:  # noqa: BLE001
         pass
-    lines = [f'Part "{name}" ({doc_id}) is EMPTY: the document exists but holds no solid body '
-             'yet, so there is nothing to describe. This is not a tool failure.']
+    lines = [f'Part "{name}" ({doc_id}) is EMPTY: 0 bodies; the document exists but holds no '
+             'solid body yet, so there is nothing to describe. This is not a tool failure.']
     if feats:
         roster = ", ".join(f'{f.get("id")} [{f.get("type")}]' for f in feats[:8])
         lines.append(f'  It has {len(feats)} feature(s) ({roster}) but none of them produced a '
@@ -1975,6 +1979,7 @@ def register_gsl_tools(mcp: FastMCP) -> None:
                 if "no bodies" not in str(e):
                     raise
                 out = {"ok": True, "empty": True, "doc_id": did,
+                       "digest": {"bodies": 0, "faces": 0, "edges": 0, "bbox_mm": None},
                        "outline": _empty_part_text(did)}
                 if notes:
                     out["interpreted"] = notes

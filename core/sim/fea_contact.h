@@ -15,6 +15,7 @@
 #pragma once
 
 #include <array>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -70,6 +71,8 @@ struct ContactCandidateOptions {
     // The analytic-surface oracle (above). Null = measure the gaps on the mesh
     // facets alone, which is all an inline mesh or a mesher-free unit test has.
     const ContactGapProbe* gap_probe = nullptr;
+    // Optional body-range lookup; returns min(E_a,E_b) for heterogeneous contact.
+    std::function<double(int, int)> pair_modulus;
 };
 
 struct ContactCandidateSet {

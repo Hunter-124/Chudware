@@ -13,6 +13,7 @@
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include <doctest/doctest.h>
 
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstdio>
@@ -1144,4 +1145,71 @@ TEST_CASE("contact: a pin in a bore reports the CAD clearance, not the facet one
                 cad.min_gap_facet_mm, cad.facet_error_mm, cad_res.h_interface_mm,
                 cad_res.ratio, cad_res.required_interface_size_mm, facet_res.gap_mm,
                 facet_res.criterion, facet_res.required_interface_size_mm);
+}
+
+TEST_CASE("heterogeneous bonded and contact bars reproduce series compliance") {
+    Mesh m;
+    add_box(m, 2, 2, 16, 0, 0, 0, 4, 4, 32);
+    const size_t steel_elements = m.tets.size() / 4;
+    const int steel_nodes = static_cast<int>(m.points.size() / 3);
+    add_box(m, 2, 2, 16, 0, 0, 32, 4, 4, 32);
+    chudware::sim::FeaMaterials materials;
+    // nu=0 gives an exact uniaxial solution with all-DOF end fixtures.
+    materials.materials = {{200000, 0, 500}, {70000, 0, 200}};
+    materials.elem_material.assign(m.tets.size() / 4, 1);
+    std::fill(materials.elem_material.begin(),
+              materials.elem_material.begin() + steel_elements, 0);
+    auto fixed = nodes_at_z(m, 0);
+    auto top = nodes_at_z(m, 64);
+    std::vector<double> forces(m.points.size(), 0);
+    // Consistent uniform pressure on the triangulated top surface: derive each
+    // triangle's area load rather than giving corners the same load as interiors.
+    for (int j = 0; j < 2; ++j) for (int i = 0; i < 2; ++i) {
+        const int n00 = top[j * 3 + i], n10 = top[j * 3 + i + 1];
+        const int n01 = top[(j + 1) * 3 + i], n11 = top[(j + 1) * 3 + i + 1];
+        for (int n : {n00, n10, n11, n00, n11, n01}) forces[n * 3 + 2] -= 40.0 / 3.0;
+    }
+    const double force = 320.0;
+    const double analytic = force / 16.0 * (32.0 / 200000.0 + 32.0 / 70000.0);
+    ContactCandidateOptions options;
+    options.max_gap_mm = 0.01;
+    options.penalty_scale = 10000;
+    options.pair_modulus = [&](int a, int b) {
+        return a < steel_nodes && b < steel_nodes ? 200000.0 : 70000.0;
+    };
+    const auto candidates = fea_contact_candidates(m.points, m.tets, 4, 200000, options);
+    REQUIRE(candidates.error.empty());
+    REQUIRE_FALSE(candidates.springs.empty());
+    std::vector<chudware::sim::BondSpring> bonds;
+    for (const auto& s : candidates.springs) {
+        CHECK(s.k == doctest::Approx(70000 * candidates.char_len_mm * options.penalty_scale));
+        bonds.push_back({s.a, s.b, s.k});
+    }
+    for (bool contact : {false, true}) {
+        FeaContactReport report;
+        FeaStaticResult result = contact
+            ? fea_static_solve_contact(m.points, m.tets, 200000, 0, 500, fixed,
+                forces, 4, {}, candidates.springs, FeaContactOptions{}, report, {}, materials)
+            : chudware::sim::fea_static_solve(m.points, m.tets, 200000, 0, 500,
+                fixed, forces, 4, bonds, {}, materials);
+        REQUIRE_MESSAGE(result.ok, result.error);
+        if (contact) REQUIRE(report.converged);
+        double displacement = 0;
+        for (int n : top) displacement -= result.displacement[n * 3 + 2] / top.size();
+        CHECK(displacement == doctest::Approx(analytic).epsilon(0.02));
+        double steel_stress = 0, aluminium_stress = 0;
+        int ns = 0, na = 0;
+        for (int n : nodes_at_z(m, 32)) {
+            if (n < steel_nodes) { steel_stress += result.von_mises[n]; ++ns; }
+            else { aluminium_stress += result.von_mises[n]; ++na; }
+        }
+        steel_stress /= ns;
+        aluminium_stress /= na;
+        CHECK(steel_stress == doctest::Approx(aluminium_stress).epsilon(0.05));
+        CHECK(steel_stress == doctest::Approx(force / 16).epsilon(0.05));
+        // Aluminium governs at FoS=10; incorrectly using steel yield caps at 15.
+        CHECK(result.min_fos == doctest::Approx(200.0 / (force / 16)).epsilon(0.02));
+        std::printf("series %s: displacement %.9g analytic %.9g; interface VM steel %.9g aluminium %.9g\n",
+                    contact ? "contact" : "bonded", displacement, analytic, steel_stress, aluminium_stress);
+    }
 }

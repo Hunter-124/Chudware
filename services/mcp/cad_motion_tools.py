@@ -123,6 +123,36 @@ def _axis_rotation16(point, direction, angle_deg: float) -> list:
             0.0, 0.0, 0.0, 1.0]
 
 
+def _pose_check(component: str, base: list, pose: list, axis: dict,
+                angle_deg: float) -> dict:
+    """Check the RELATIVE motion, not the body's pre-existing placement.
+
+    The affine invariant row checks every local point (and therefore bbox extrema),
+    not merely the component origin. Rotation is checked too: t=p-Rp alone would
+    incorrectly certify no motion, wrong-axis motion, or free wheel spin.
+    """
+    point, direction = axis["point"], axis["dir"]
+    delta = _mat_mul16(pose, _rigid_inverse16(base))
+    expected = _axis_rotation16(point, direction, angle_deg)
+    tolerance = 1e-6 * max(1.0, math.sqrt(sum(v * v for v in point)))
+    translation_error = math.sqrt(sum(
+        (delta[4 * i + 3] - point[i] +
+         sum(delta[4 * i + j] * point[j] for j in range(3))) ** 2 for i in range(3)))
+    translation_ok = translation_error <= tolerance
+    rotation_ok = max(abs(delta[4 * i + j] - expected[4 * i + j])
+                      for i in range(3) for j in range(3)) <= 1e-6
+    invariant = None
+    for k in range(3):
+        if abs(abs(direction[k]) - 1.0) < 1e-12:
+            invariant = {"axis": "xyz"[k], "ok": all(
+                abs(delta[4 * k + j] - float(j == k)) <= 1e-6 for j in range(4))}
+    return {"component": component, "axis_point": point, "axis_dir": direction,
+            "translation_ok": translation_ok, "translation_error_mm": translation_error,
+            "rotation_ok": rotation_ok, "invariant_coordinate": invariant,
+            "ok": translation_ok and rotation_ok and
+                  (invariant is None or invariant["ok"])}
+
+
 def _turn_center_2d(lines: list) -> Optional[dict]:
     """Instantaneous centre of rotation of a set of plan-view WHEEL AXLE lines.
 
@@ -499,6 +529,7 @@ def steer_pose_sweep(doc_id: str, steer, rear_steer, steps: int,
         trajectory = []
         first_hit = None
         interferences = []
+        drive_by_id = {d["component"]: d for d in drives}
         for i in range(steps):
             scale = i / (steps - 1) if steps > 1 else 1.0
             ops = []
@@ -508,19 +539,40 @@ def steer_pose_sweep(doc_id: str, steer, rear_steer, steps: int,
                 ops.append({"op": "asm_edit_component", "id": d["component"],
                             "transform": _mat_mul16(r, base[d["component"]]),
                             "fixed": True})
-            cb.call("doc_apply_ops", {"doc_id": clone, "with_tess": False, "ops": ops})
-            sr = cb.call("doc_solve_mates", {"doc_id": clone}) or {}
-            rb = sr.get("rebuild") or {}
+            applied = cb.call("doc_apply_ops",
+                              {"doc_id": clone, "with_tess": False, "ops": ops})
+            rb = applied.get("rebuild") or {}
             rep = _solve_report(rb)
             xf = _comp_transforms(clone)
+            # The engine transports single-anchor floating mate islands with their
+            # hub. Check the carried wheels as well as the directly driven hubs.
+            owners = {cid: cid for cid in drive_by_id}
+            owners.update(applied.get("pose_transport") or {})
+            checks = []
+            for cid, owner in owners.items():
+                if owner not in drive_by_id:
+                    continue
+                dr = drive_by_id[owner]
+                if cid not in xf or cid not in base:
+                    checks.append({"component": cid, "axis_point": dr["axis"]["point"],
+                                   "axis_dir": dr["axis"]["dir"], "ok": False,
+                                   "translation_ok": False, "reason": "driver_pose_missing"})
+                    continue
+                checks.append(_pose_check(cid, base[cid], xf[cid], dr["axis"],
+                                          scale * dr["angle_deg"]))
+            pose_check = {"ok": all(c["ok"] for c in checks), "bodies": checks}
             frame = {"i": i, "value": scale * primary, "scale": scale,
-                     "dof": rb.get("dof"), "converged": rep["converged"],
+                     "dof": rb.get("dof"),
+                     "converged": rep["converged"] and pose_check["ok"],
+                     "pose_check": pose_check,
                      "max_residual": rep["worst_residual"],
                      "bodies": [{"component": cid, "name": names.get(cid, cid),
                                  "transform": m} for cid, m in xf.items()]}
             if not rep["converged"]:
                 frame["solve_error"] = rep["message"]
-            if check_interference:
+            if not pose_check["ok"]:
+                frame["solve_error"] = "driver_pose_mismatch: solved pose violates axis line"
+            if check_interference and frame["converged"]:
                 ir = cb.call("eval_interference",
                              {"doc_id": clone, "include_coincident": False,
                               "min_clearance_mm": 0.0}) or {}
@@ -546,6 +598,8 @@ def steer_pose_sweep(doc_id: str, steer, rear_steer, steps: int,
                                  "source": d["axis"]["source"]} for d in drives]},
             "trajectory": trajectory,
             "steer_drives": drives,
+            "pose_check": {"ok": all(f["pose_check"]["ok"] for f in trajectory),
+                           "frames": [{"i": f["i"], **f["pose_check"]} for f in trajectory]},
             "interference": {"checked": bool(check_interference),
                              "first_collision_step":
                                  first_hit["step"] if first_hit else None,
@@ -658,12 +712,8 @@ def register_cad_motion_tools(mcp: FastMCP) -> None:
         out = _call_tool("simulate_motion", mate_id=mate_id, start=start, stop=stop,
                          steps=int(steps), check_interference=bool(check_interference),
                          dynamics=dynamics, doc_id=doc_id)
-        if not out.get("ok"):
-            # A refusal (nothing to drive) is not a failed solve — pass it through as-is
-            # so the model reads the teaching text, not "did not converge" over the top.
-            raise ValueError(
-                str(out.get("error") or out.get("summary") or "motion sweep failed"))
-        if not (out.get("trajectory") or []):
+        # Preserve evidence (including failed pose_check) through every caller.
+        if out.get("ok") and not (out.get("trajectory") or []):
             raise ValueError("motion sweep returned no trajectory")
         return out
 
@@ -809,6 +859,10 @@ def register_cad_motion_tools(mcp: FastMCP) -> None:
                  body_name, volume_mm3, bbox}] (fuse only), warnings}. The envelope is
         AXIS-ALIGNED in world coordinates. On a steer sweep `driver.type` is "steer" and
         `driver.axes` echoes the kingpin axis each component was rotated about.
+        `pose_check` verifies t=p-Rp, the requested rotation and world-aligned
+        coordinate invariants for driven hubs AND their single-anchor carried
+        mate islands (including wheels). Failed checks return ok=false instead of
+        a misleading clearance envelope.
         """
         try:
             d = _doc(doc_id)
@@ -835,10 +889,11 @@ def register_cad_motion_tools(mcp: FastMCP) -> None:
                         "are two different drives — pass one or the other.")
                 out = steer_pose_sweep(d, steer, rear_steer, steps, False, "sweep_envelope")
                 if not out.get("ok"):
-                    raise ValueError("steer sweep did not converge: " +
-                                     str(out.get("error") or "unknown"))
+                    return _dumps(out)
             else:
                 out = _sweep(d, mate_id, start, stop, steps)
+            if not out.get("ok"):
+                return _dumps(out)
             trajectory = out.get("trajectory") or []
             warnings = []
 
@@ -877,6 +932,7 @@ def register_cad_motion_tools(mcp: FastMCP) -> None:
                 "doc_id": d,
                 "mate_id": out.get("mate_id"),
                 "driver": out.get("driver"),
+                "pose_check": out["pose_check"],
                 "components": [c["id"] for c in comps],
                 "envelope": _bbox_of(all_points),
                 "per_component": {cid: _bbox_of(pts)
@@ -1040,11 +1096,12 @@ def register_cad_motion_tools(mcp: FastMCP) -> None:
                 out = steer_pose_sweep(d, steer, rear_steer, steps, check_interference,
                                    "steering_turning_radius")
                 if not out.get("ok"):
-                    raise ValueError("steer sweep did not converge: " +
-                                     str(out.get("error") or "unknown"))
+                    return _dumps(out)
             else:
                 out = _sweep(d, steer_mate_id, start, stop, steps,
                              check_interference=check_interference)
+            if not out.get("ok"):
+                return _dumps(out)
             trajectory = out.get("trajectory") or []
             first, last = trajectory[0], trajectory[-1]
             xf0, xf1 = _frame_transforms(first), _frame_transforms(last)

@@ -1402,10 +1402,11 @@ def register_cad_eval_tools(mcp: FastMCP) -> None:
         accepted as min_clearance= / clearance= / clearance_mm= / min_gap_mm=, and
         include_coincident= as coincident= / include_contacts= (echoed in `interpreted`).
 
-        Returns {ok, summary, parts:[{name,bbox,volume}], interferences:[{a,b,volume}],
-        clearances:[{a,b,distance}], contacts:[{a,b,distance}]}. ok is True only when NOTHING
-        interferes. A single-body part trivially reports no interference (build a multi-body
-        part with the `transform` copy feature, or open an assembly, to get meaningful pairs).
+        Returns {ok, summary, pairs_checked, parts:[{name,bbox,volume}],
+        interferences:[{a,b,volume}], clearances:[{a,b,distance}], contacts:[{a,b,distance}]}.
+        ok is True only when NOTHING interferes. An EMPTY document is refused with
+        reason="insufficient_bodies" (a check on nothing is not a verification); a single
+        body returns ok with pairs_checked=0.
         """
         d = None
         try:
@@ -1433,7 +1434,8 @@ def register_cad_eval_tools(mcp: FastMCP) -> None:
                                                 "min_clearance_mm": min_clearance_mm})
             # This IS the verification step for transform-placed components: record that it
             # ran at the doc's current revision so save_part/export_part stop warning.
-            note_interference_check(d)
+            if res.get("reason") != "insufficient_bodies":
+                note_interference_check(d)
             return _dumps(_interpreted({"ok": res.get("ok", True), "doc_id": d, **res}, notes))
         except Exception as e:  # noqa: BLE001
             return _err(_teach_no_bodies(e, d, "check_interference()"))

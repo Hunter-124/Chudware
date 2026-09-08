@@ -42,6 +42,8 @@ class _FakeEngine:
         if method == "doc_list":
             return {"docs": [{"doc_id": d, "name": n, "revision": 1}
                              for d, n in self.names.items()]}
+        if method == "asm_world_bodies":
+            return {"bodies": [{"name": "Block"}]}
         if method == "doc_save":
             path = p.get("path")
             self.saves.append(path)

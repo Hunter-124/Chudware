@@ -336,6 +336,9 @@ ENTRIES: dict[str, dict[str, Any]] = {
             "large sliding, no preload — apply a clamp load as a face load instead. A load "
             "that pulls the parts apart is refused as a mechanism. Bonded (tension-carrying) "
             "joints use run_fea_static with bond_gap_mm; the two are mutually exclusive. "
+            'For mixed bodies pass material={"per_body":{"1":"steel","2":'
+            '{"E_mpa":110000,"nu":0.34,"yield_mpa":125}},"default":"steel"} '
+            "(one-based STEP solid ordinals); each body's own yield governs its FoS. "
             "When mean_contact_pressure_mpa comes back well above yield the ELASTIC "
             "answer is the artefact, not the part: re-run with "
             'plasticity={"hardening_mpa": 1200} so the seat yields and the patch '
@@ -381,8 +384,11 @@ ENTRIES: dict[str, dict[str, Any]] = {
             "Real-part linear static FEA. Confirm face queries first. fixtures must react a "
             "non-zero load: force vectors/magnitude are N, pressure is MPa; zero loads are "
             "refused and there is no gravity/self-weight term. An explicit material dict needs "
-            "E_mpa, nu, and yield_mpa; named registry materials resolve them. set_material is "
-            "appearance only. Repeat at a finer mesh and compare governing stress/deflection "
+            "E_mpa, nu, and yield_mpa; named registry materials resolve them. "
+            'For mixed bodies use material={"per_body":{"1":"steel","2":'
+            '{"E_mpa":110000,"nu":0.34,"yield_mpa":125}},"default":"steel"} '
+            "(one-based STEP solid ordinals, default optional if every body is assigned). "
+            "set_material is appearance only. Repeat at a finer mesh and compare governing stress/deflection "
             "(<10% change) before PASS. mesh_size_mm=<mm> is the exact element size "
             "(mutually exclusive with mesh_fineness) — use it with vtu_path to re-solve "
             "one run_fea_convergence leg on its own mesh. min_size_mm=<mm> lowers the "

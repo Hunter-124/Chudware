@@ -29,7 +29,7 @@ def register_cad_exchange_tools(mcp: FastMCP) -> None:
 
     @mcp.tool()
     def export_part(fmt: str = "step", path: Optional[str] = None,
-                    doc_id: Optional[str] = None) -> str:
+                    doc_id: Optional[str] = None, allow_empty: bool = False) -> str:
         """Export the current part to an interchange/mesh file; returns the written path.
 
         fmt: "draw+" (standalone native drawing) | "step+" (native part) | "step" | "stl" |
@@ -48,6 +48,8 @@ def register_cad_exchange_tools(mcp: FastMCP) -> None:
         component poses you asserted with asm_add_component(at=/rotate=) have not been
         re-validated since the last mutation. Run check_interference (and measure_between /
         list_world_bodies against the expected envelope) and export again.
+        Empty geometry is refused before writing unless allow_empty=True. Use native step+
+        to deliberately preserve an empty editable document.
         """
         try:
             d = _doc(doc_id)
@@ -64,6 +66,10 @@ def register_cad_exchange_tools(mcp: FastMCP) -> None:
                                "native": True, "drawing_id": d, "doc_id": d,
                                "path": written, "exists": os.path.exists(written),
                                **{k: r[k] for k in ("source_state",) if k in r}})
+            if not allow_empty and not cb.call(
+                    "asm_world_bodies", {"doc_id": d, "explode": False}).get("bodies"):
+                return _dumps({"ok": False, "reason": "no_bodies_empty_document",
+                               "doc_id": d, "content": "Export refused: document has 0 bodies."})
             # The native editable container is written by doc_save, not the interchange writer.
             if fmt in ("step+", "stepplus", "stp+", "native"):
                 # K3: canonicalise caller-supplied path before passing to the engine — expanduser

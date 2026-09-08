@@ -645,7 +645,7 @@ AssemblyResult compile_assembly(const json& doc, const std::string& base_dir,
         const std::string mid = mate.value("id", std::string());
         const json refs = mate.contains("refs") && mate["refs"].is_array() ? mate["refs"]
                                                                            : json::array();
-        for (int i = 0; i < static_cast<int>(refs.size()) && i < 2; ++i) {
+        for (int i = 0; i < static_cast<int>(refs.size()); ++i) {
             const json& ref = refs[i];
             const std::string cid = ref.is_object() ? ref.value("component", std::string())
                                                     : std::string();

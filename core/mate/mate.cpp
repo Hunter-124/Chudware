@@ -113,22 +113,6 @@ void perp_basis(const Vector3d& axis, Vector3d& e1, Vector3d& e2) {
     e2 = unit(a.cross(e1));
 }
 
-// Pick one of the two directions along an axis, from the vector's own numbers. An axis
-// and its negation describe the same line, but they are OPPOSITE references for a signed
-// angle, so a derived reference axis has to land on the same one every time it is
-// derived — including from a seed a hair either side of 0 deg, where the natural
-// derivation (a cross product) flips. `g` is a generic direction: only an axis lying in
-// the one plane perpendicular to it is ambiguous, and that case falls back to making the
-// largest component positive.
-Vector3d canonical_sign(const Vector3d& v) {
-    static const Vector3d g = unit(Vector3d(5.0, 2.0, 1.0));
-    const double d = v.dot(g);
-    if (std::abs(d) > 1e-9) return (d < 0.0) ? Vector3d(-v) : v;
-    int k = 0;
-    for (int i = 1; i < 3; ++i)
-        if (std::abs(v[i]) > std::abs(v[k])) k = i;
-    return (v[k] < 0.0) ? Vector3d(-v) : v;
-}
 
 // Two scalars measuring the component of vec perpendicular to axis.
 VectorXd perp_residual2(const Vector3d& axis, const Vector3d& vec) {
@@ -642,10 +626,10 @@ private:
     //      the vector a mate measures, so unless the caller supplied one this is the
     //      component's local +Z — a guess, which is why case 1 exists;
     //   5. any perpendicular of da.
-    // Whatever it comes from, the result is made perpendicular to da (an axis with a
-    // component along da measures nothing) and, for the DERIVED cases 2-5, sign-
-    // canonicalized: a cross product flips as an assembly passes through 0 deg, and a
-    // reference that flips is a mate whose +30 deg silently becomes -30 deg mid-sweep.
+    // An authored direction is normalized but NEVER projected onto a different
+    // axis. The angle uses the perpendicular projections of the measured normals.
+    // Derived fallback cases 2-5 are made perpendicular to da and sign-canonicalized
+    // so crossing zero cannot silently turn +30 degrees into -30 degrees.
     //
     // Nothing here reads the SOLVER's seed. A driven sweep re-solves the same document
     // warm-started from the previous frame, so a reference derived from the warm pose
@@ -665,7 +649,7 @@ private:
                 throw std::runtime_error(
                     "angle reference axis is parallel to the mate's first direction: "
                     "no angle can be measured about it");
-            return unit(p);
+            return unit(*authored);
         }
 
         std::vector<Vector3d> candidates;
@@ -1485,6 +1469,22 @@ Vector3d unit(const Vector3d& v) {
 
 Matrix3d rodrigues(const Vector3d& w) { return rodrigues_impl(w); }
 Vector3d mat_to_rotvec(const Matrix3d& R) { return mat_to_rotvec_impl(R); }
+// Pick one of the two directions along an axis, from the vector's own numbers. An axis
+// and its negation describe the same line, but they are OPPOSITE references for a signed
+// angle, so a derived reference axis has to land on the same one every time it is
+// derived — including from a seed a hair either side of 0 deg, where the natural
+// derivation (a cross product) flips. `g` is a generic direction: only an axis lying in
+// the one plane perpendicular to it is ambiguous, and that case falls back to making the
+// largest component positive.
+Vector3d canonical_sign(const Vector3d& v) {
+    static const Vector3d g = unit(Vector3d(5.0, 2.0, 1.0));
+    const double d = v.dot(g);
+    if (std::abs(d) > 1e-9) return (d < 0.0) ? Vector3d(-v) : v;
+    int k = 0;
+    for (int i = 1; i < 3; ++i)
+        if (std::abs(v[i]) > std::abs(v[k])) k = i;
+    return (v[k] < 0.0) ? Vector3d(-v) : v;
+}
 
 // --------------------------------------------------------------------------- public solve
 

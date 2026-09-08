@@ -36,7 +36,8 @@ void append_int(std::string &out, long long value) {
 
 bool write_vtu(const std::string &path, const std::vector<double> &points,
                const std::vector<int> &tets, int nodes_per_elem,
-               const std::vector<VtuPointField> &fields, std::string &error) {
+               const std::vector<VtuPointField> &fields, std::string &error,
+               const std::vector<uint16_t>& material_id) {
   error.clear();
   if (path.empty()) {
     error = "vtu: empty output path";
@@ -58,6 +59,10 @@ bool write_vtu(const std::string &path, const std::vector<double> &points,
   }
   const size_t n_nodes = points.size() / 3;
   const size_t n_cells = tets.size() / stride;
+  if (!material_id.empty() && material_id.size() != n_cells) {
+    error = "vtu: material_id length must match the cell count";
+    return false;
+  }
   for (int index : tets) {
     if (index < 0 || static_cast<size_t>(index) >= n_nodes) {
       error = "vtu: connectivity references a node outside the mesh";
@@ -186,8 +191,17 @@ bool write_vtu(const std::string &path, const std::vector<double> &points,
       }
       body += "        </DataArray>\n";
     }
-    body += "      </PointData>\n    </Piece>\n  </UnstructuredGrid>\n"
-            "</VTKFile>\n";
+    body += "      </PointData>\n";
+    if (!material_id.empty()) {
+      body += "      <CellData Scalars=\"material_id\">\n"
+              "        <DataArray type=\"UInt16\" Name=\"material_id\" format=\"ascii\">\n";
+      for (uint16_t id : material_id) {
+        body += ' ';
+        append_int(body, id);
+      }
+      body += "\n        </DataArray>\n      </CellData>\n";
+    }
+    body += "    </Piece>\n  </UnstructuredGrid>\n</VTKFile>\n";
 
     std::ofstream out(out_path, std::ios::binary | std::ios::trunc);
     if (!out) {

@@ -12,12 +12,13 @@
    Registry material names resolve their stored properties. Confirm every face query.
 2. Anchor before solving, or record `no anchor`. Force is N, pressure MPa, geometry
    mm. Never turn pressure into force without measured area.
-3. Static/fatigue need a mount and non-zero force N or pressure MPa. Buckling needs
-   one mount plus one inward axial force N; its proxy rejects pressure/shear/tension.
+3. Static/fatigue/buckling need mounted faces and non-zero force N or pressure MPa.
+   Buckling uses real tet10 (size_mm=8); max_load_factor=10000 bounds its search.
+   No mode below that ceiling is a refusal, not infinite strength.
    Modal takes no load; `fixtures=[]` is intentional free-free with six rigid modes.
-4. Steady thermal is a CalculiX 1-D box proxy with exactly one hot face and one
-   cold face at distinct °C values; it rejects loads. Transient is real-mesh and
-   accepts W/m² flux or W/(m²·K) convection. Flux-only transient heat-up is valid.
+4. Steady and transient thermal use the real mesh with °C temperature faces,
+   W/m² flux and W/(m²·K) convection. Steady needs a temperature/convection datum;
+   schedules require transient. Flux-only transient heat-up is valid.
 5. CFD uses m/s and air|water; LBM is trends only. Motion uses degrees/mm and
    `stop`+`steps>=2`. EM uses GHz/mm (antenna APIs use Hz) and needs `em_status`
    before openEMS.

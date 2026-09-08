@@ -33,9 +33,9 @@ constexpr int kGlobalIterCap = 60;
 constexpr int kSameSigLimit = 3;
 constexpr int kStagnationLimit = 3;
 
-// Stage classification for prewalk (strong-plan / cheap-implement) and similar
-// per-stage model routing. Planning stages keep the strong model; implementation
-// stages switch to agent.prewalk_target when armed.
+// Stage classification for strong-plan / cheap-implement routing. Planning
+// stages keep the main provider; implementation stages may use an explicitly
+// supplied provider descriptor.
 bool is_planning_stage(const std::string& stage);       // intake|plan|decompose|review|memory
 bool is_implementation_stage(const std::string& stage);  // model|fix|execute|build
 

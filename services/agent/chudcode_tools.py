@@ -313,6 +313,7 @@ def _effective_names(context: Any, available: Sequence[str]) -> list[str]:
             subagent=bool(
                 _ctx(context, "subagent_id", None) or _ctx(context, "subagent", False)
             ),
+            preferences=_ctx(context, "turn_preferences", None),
         )
         if narrowed is not None:
             names = _ordered_unique(narrowed)
@@ -344,6 +345,12 @@ def _effective_names(context: Any, available: Sequence[str]) -> list[str]:
                 names = _ordered_unique([*names, "verify_battery"])
         except Exception as exc:  # noqa: BLE001 - optional guardrail catalog
             _debug_fallback("mutation verification floor", exc)
+    preferences = _ctx(context, "turn_preferences", None)
+    if preferences is not None:
+        from services.agent.copilot_mode_tools import apply_preference_tools
+
+        return apply_preference_tools(names if names is not None else available,
+                                      preferences, mode=mode)
 
     if names is None and not restricted:
         # Unrestricted: the whole live registry. `enable_tools` and
@@ -766,10 +773,16 @@ def build_host_tools(context: Any) -> list[HostToolBinding]:
             _debug_fallback(f"final callability check for {name}", exc)
             if not callable(fn) or inspect.iscoroutinefunction(fn):
                 continue
+        description = _entry_description(entry, fn)
+        preferences = _ctx(context, "turn_preferences", None)
+        if preferences is not None and preferences.trim_tool_schemas:
+            from services.agent.tool_schemas import _description_line
+
+            description = _description_line(description, trim=True)
         out.append(
             HostToolBinding(
                 name=name,
-                description=_entry_description(entry, fn),
+                description=description,
                 input_schema=_entry_schema(entry, fn),
                 load_mode=_entry_load_mode(name, entry),
                 handler=fn,

@@ -14,7 +14,7 @@ from services.agent.providers.mock_provider import MockProvider
 from services.agent.tiers import (
     parse_openrouter_tier,
     parse_xai_tier,
-    effort_tier_for,
+    profile_tier_for,
 )
 from tools.flywheel.bench.gym.runner import (
     _ChudcodeCompletionProvider,
@@ -68,10 +68,10 @@ class TestOpenRouterTier:
         assert parse_openrouter_tier("") is None
         assert parse_openrouter_tier(None) is None  # type: ignore[arg-type]
 
-    def test_effort_tier_for_openrouter_maps_to_frontier(self):
-        assert effort_tier_for("openrouter:anthropic/claude-opus-4") == "frontier"
-        assert effort_tier_for("local-24k") == "local-24k"
-        assert effort_tier_for("mid") == "mid"
+    def test_profile_tier_for_openrouter_maps_to_frontier(self):
+        assert profile_tier_for("openrouter:anthropic/claude-opus-4") == "frontier"
+        assert profile_tier_for("local-24k") == "local-24k"
+        assert profile_tier_for("mid") == "mid"
 
     def test_openrouter_tier_routes_identifiers_to_chudcode(self, monkeypatch):
         monkeypatch.delenv("CHUDWARE_PROVIDER", raising=False)
@@ -117,9 +117,9 @@ class TestXaiTier:
         assert parse_xai_tier("") is None
         assert parse_xai_tier(None) is None  # type: ignore[arg-type]
 
-    def test_effort_tier_for_xai_maps_to_frontier(self):
-        assert effort_tier_for("xai:grok-4.5") == "frontier"
-        assert effort_tier_for("xai:grok-4-5") == "frontier"
+    def test_profile_tier_for_xai_maps_to_frontier(self):
+        assert profile_tier_for("xai:grok-4.5") == "frontier"
+        assert profile_tier_for("xai:grok-4-5") == "frontier"
 
     def test_xai_tier_routes_identifiers_to_chudcode(self, monkeypatch):
         monkeypatch.delenv("CHUDWARE_PROVIDER", raising=False)

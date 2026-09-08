@@ -48,6 +48,7 @@ run_cfd_flow / run_cfd_accurate / ecad_simulate. CFD-accurate (OpenFOAM) is stil
 - Transient thermal: `services/sim/fea_thermal_transient.py` (T-FIN18)
 - OpenFOAM CHT: `services/sim/foam_cht.py` (T-FIN19 / T-SIM5)
 - Worker multiphysics mirror for host Simulate tab: `services/sim/multiphysics_rpc.py`
-  (T-FIN24) — sim_caps, ccx buckling/contact, freq-response, ecad_thermal_handoff, heatsink_select
+  (T-FIN24) — sim_caps, legacy ccx contact, freq-response, ecad_thermal_handoff, heatsink_select.
+  Buckling uses engine `sim_run_buckling {study,n_modes}` on the real CAD mesh.
 - Golden demo: `scripts/demo_sensor_node.py` (T-FIN25) + gate stage 4.7
 - T-SIM10 superseded by T-FIN24; T-SIM11 = deferred deeper EM solvers (GUI forms already live)

@@ -545,25 +545,27 @@ def test_ledger_artifacts_written():
 # ---------------------------------------------------------------------------
 
 def test_build_strategy_needed():
-    """Feature-count gate: below threshold → False; at/above → True."""
-    import os
-    # Default threshold is 5
-    assert build_strategy_needed(3) is False
-    assert build_strategy_needed(4) is False
-    assert build_strategy_needed(5) is True
-    assert build_strategy_needed(10) is True
+    """Mission councils start at five features, and double-check can disable them."""
+    assert build_strategy_needed(4, cfg={}) is False
+    assert build_strategy_needed(5, cfg={}) is True
+    assert build_strategy_needed(
+        10, cfg={"copilot": {"double_check": False}},
+    ) is False
 
-    # Override via env var
-    original = os.environ.get("CHUDWARE_COUNCIL_FEATURE_THRESHOLD")
-    try:
-        os.environ["CHUDWARE_COUNCIL_FEATURE_THRESHOLD"] = "3"
-        assert build_strategy_needed(2) is False
-        assert build_strategy_needed(3) is True
-    finally:
-        if original is None:
-            os.environ.pop("CHUDWARE_COUNCIL_FEATURE_THRESHOLD", None)
-        else:
-            os.environ["CHUDWARE_COUNCIL_FEATURE_THRESHOLD"] = original
+
+def test_double_check_off_prevents_council_provider_calls():
+    class Provider:
+        def complete(self, *args, **kwargs):
+            pytest.fail("Disabled reviews must not call a provider")
+
+    record = council_convene(
+        kind="build_strategy", topic="build a multi-part assembly",
+        inputs={"feature_count": 8}, provider=Provider(),
+        cfg={"copilot": {"double_check": False}},
+    )
+    assert record["complete"] is False
+    assert record["status"] == "incomplete"
+    assert record["diagnostics"]["policy"]["executed"] is False
 
 
 # ---------------------------------------------------------------------------
@@ -804,39 +806,6 @@ def test_council_clamps_provider_reasoning_effort_without_mutating_ambient_provi
     assert provider.reasoning_effort == "max"
 
 
-def test_council_consumes_resolved_seat_and_round_token_knobs(monkeypatch):
-    """One effort resolution controls breadth and both round budgets."""
-    from types import SimpleNamespace
-    from services.agent import effort
-
-    monkeypatch.setattr(
-        effort,
-        "resolve_effort",
-        lambda tier: SimpleNamespace(values={
-            "council_seats": 2,
-            "ponder_round1_tokens": 111,
-            "ponder_round2_tokens": 222,
-        }),
-    )
-    seen_tokens: list[int] = []
-
-    class Provider:
-        reasoning_effort = "medium"
-
-        def complete(self, system: str, messages: list[dict],
-                     max_tokens: int = 8000, **kwargs) -> str:
-            seen_tokens.append(max_tokens)
-            if "CHAIR" in system:
-                return _SYNTHESIS
-            return _typed_position("budgeted", [], [])
-
-    record = council_convene(
-        kind="build_strategy", topic="budgets", inputs={},
-        provider=Provider(), stage="spec", tier="local-24k")
-
-    assert len(record["seats"]) == 2
-    assert record["policy"]["breadth"] == 2
-    assert seen_tokens == [111, 111, 222, 222, 222]
 
 
 def test_regen_council_harness_exception_returns_persisted_incomplete_marker(

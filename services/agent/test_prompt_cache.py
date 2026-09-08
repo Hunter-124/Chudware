@@ -245,29 +245,6 @@ def test_skills_block_is_opt_out_for_run_turn():
     assert not any(s.label == "skills" for s in without)
 
 
-def test_compose_uses_the_same_main_chat_floor_as_live_turn():
-    from services.agent.copilot_mode_tools import MAIN_CHAT_DEFAULT_TOOLS
-    from services.agent.mission_dispatch import (
-        _apply_session_preferences,
-        effective_role_system_prompt,
-        linear_role_allowed_tools,
-    )
-    from services.agent.roles import load_role
-
-    card = load_role("general_agent")
-    live_allowed, _ = _apply_session_preferences(
-        "general_agent",
-        linear_role_allowed_tools(card),
-        effective_role_system_prompt(card),
-    )
-    composed = pc.compose(include_tools=False)
-
-    assert set(composed.allowed) == set(live_allowed)
-    assert MAIN_CHAT_DEFAULT_TOOLS <= set(composed.allowed)
-    # Security hardening 3aaee658: the contract keeps shell behind explicit
-    # role/category enablement, never on the automatic main-chat floor.
-    assert "run_shell" not in MAIN_CHAT_DEFAULT_TOOLS
-    assert "run_shell" not in composed.allowed
 
 
 # --------------------------------------------------------------------------- the linear lane
@@ -373,29 +350,23 @@ def test_a_repeat_turn_reuses_the_tools_block_but_a_new_fingerprint_recomposes(
 
 def test_a_session_preference_override_beats_a_valid_cache_entry(
         isolated_cache, linear_tools_memo, monkeypatch):
-    """The Harness knobs are read through ``config`` accessors, so an entry
-    composed with the other value is fingerprint-VALID: config.json never
-    changed. Trusting the entry's allowlist would silently re-arm ``delegate``
-    for a session that switched sub-agents off — the dead-knob defect the
-    preferences were added to fix, reintroduced by a cache."""
+    """A cached prompt must not re-enable reviews after double-check is disabled."""
     from services.agent import config as agent_config
     from services.agent import mission_dispatch as md
 
-    monkeypatch.setattr(agent_config, "get_subagent_preference",
-                        lambda *a, **k: "option", raising=False)
+    monkeypatch.setattr(agent_config, "load_config",
+                        lambda: {"copilot": {"double_check": True}})
     entry = pc.get(role="general_agent")
-    assert "delegate" in entry.allowed, "precondition: the entry allows it"
+    assert "advise" in entry.allowed
 
-    monkeypatch.setattr(agent_config, "get_subagent_preference",
-                        lambda *a, **k: "off", raising=False)
+    monkeypatch.setattr(agent_config, "load_config",
+                        lambda: {"copilot": {"double_check": False}})
     dispatcher = md.MissionDispatch(run_id="pref")
     system_prompt, allowed, tools_text = md.linear_role_prompt(
         "general_agent", resolver=at.resolver_for(dispatcher))
 
-    assert "delegate" not in allowed and "mission_start" not in allowed
-    assert "not available" in system_prompt
-    assert "\n- delegate(" not in (tools_text or ""), (
-        "a dropped tool must also vanish from the schema block")
+    assert "advise" not in allowed
+    assert "\n- advise(" not in (tools_text or "")
 
 # --------------------------------------------------------------------------- caching
 

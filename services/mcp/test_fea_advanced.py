@@ -90,20 +90,6 @@ def test_fatigue_summary_refuses_missing_or_zero_solver_theory_fields():
 
 # --------------------------------------------------------------------- .inp generators
 
-def test_thermal_inp_and_expected_mid_T():
-    gen = fa.build_thermal_bar_inp(200.0, 20.0, 20.0, 50.0, 100.0, 0.0, nx=8)
-    assert "*HEAT TRANSFER, STEADY STATE" in gen["inp"]
-    assert "*CONDUCTIVITY" in gen["inp"]
-    assert "*CONDUCTIVITY\n0.050000000\n" in gen["inp"]  # W/mK -> W/mmK, once
-    assert gen["expected_mid_T"] == 50.0
-
-
-def test_buckling_inp_and_euler_reference():
-    gen = fa.build_buckling_column_inp(1000.0, 20.0, 20.0, 200000.0, 0.29, 5000.0)
-    assert "*BUCKLE" in gen["inp"]
-    I = 20.0 * 20.0 ** 3 / 12.0
-    Pcr = math.pi ** 2 * 200000.0 * I / (2000.0 ** 2)
-    assert math.isclose(gen["expected_Pcr"], Pcr, rel_tol=1e-9)
 
 
 def test_contact_inp_two_disjoint_blocks():
@@ -120,19 +106,9 @@ def test_contact_inp_two_disjoint_blocks():
 
 def test_generators_reject_degenerate_or_non_finite_inputs_before_meshing():
     with pytest.raises(ValueError, match="must all be > 0"):
-        fa.build_thermal_bar_inp(0.0, 20.0, 20.0, 50.0, 100.0, 0.0)
-    with pytest.raises(ValueError, match="finite"):
-        fa.build_buckling_column_inp(
-            1000.0, 20.0, 20.0, float("inf"), 0.29, 5000.0)
+        fa.build_contact_block_inp(0.0, 20.0, 20.0, 200000.0, 0.29, 5.0)
     with pytest.raises(ValueError, match="pressure"):
         fa.build_contact_block_inp(20.0, 20.0, 10.0, 200000.0, 0.29, 0.0)
-
-
-def test_buckling_deck_requests_the_public_mode_count():
-    gen = fa.build_buckling_column_inp(
-        1000.0, 20.0, 20.0, 200000.0, 0.29, 5000.0,
-        nx=4, ny=2, nz=2, n_modes=7)
-    assert "*BUCKLE\n7\n" in gen["inp"]
 
 
 # --------------------------------------------------------------------- ccx runner
@@ -291,23 +267,6 @@ def test_all_four_tools_registered():
         assert name in fns, f"{name} not registered"
 
 
-def test_ccx_tools_skip_when_absent(monkeypatch):
-    """When ccx is absent, the ccx-backed tools must return skipped:true — never a
-    fabricated result. Uses the module's ccx_path so no binary is required."""
-    monkeypatch.setattr(fa, "ccx_path", lambda: None)
-    fns = _cad_tools()
-    # These early-return on the ccx check before touching any doc, so doc_id="x"
-    # never resolves geometry.
-    r_th = json.loads(fns["run_fea_thermal"]([{"face": "+x", "temperature": 100}],
-                                             [{"face": "-x", "temperature": 0}],
-                                             doc_id="nope"))
-    assert r_th.get("skipped") is True and r_th.get("ok") is False
-    r_bk = json.loads(fns["run_fea_buckling"](["bottom"],
-                                              [{"face": "top", "force": [0, 0, -1]}],
-                                              doc_id="nope"))
-    assert r_bk.get("skipped") is True
-    # run_fea_contact no longer touches ccx at all — it solves in the engine, so it is
-    # deliberately NOT in this list.
 
 
 @pytest.mark.parametrize(

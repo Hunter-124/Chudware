@@ -394,7 +394,10 @@ def test_crash_save_runs_and_surfaces_all_finalization_faults(monkeypatch):
     """A usage-sink reset fault must not jump over the crash-path save. The original
     turn crash, reset fault, and persistence failure all remain visible to the caller."""
     from services.agent import worker_rpc
+    from services.agent import config as agent_config
     from services.agent.providers import token_usage
+
+    monkeypatch.setattr(agent_config, "load_config", lambda: {})
 
     monkeypatch.setattr(
         worker_rpc,
@@ -420,7 +423,13 @@ def test_crash_save_runs_and_surfaces_all_finalization_faults(monkeypatch):
         lambda: sweeps.append("save") or persistence,
     )
 
-    out = worker_rpc._agent_admin_turn({"request": "build it"}, lambda data: None)
+    # Select a model explicitly: Auto's live catalog/auth discovery is unrelated
+    # to finalization and must not prevent this test from reaching the turn crash.
+    out = worker_rpc._agent_admin_turn(
+        {"request": "build it", "provider": "anthropic", "model": "claude-sonnet-4-6",
+         "mode": "agent"},
+        lambda data: None,
+    )
 
     assert sweeps == ["save"]
     assert out["ok"] is False

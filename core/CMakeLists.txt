@@ -2565,3 +2565,12 @@ target_link_libraries(test_fea_plastic PRIVATE chudware_sim)
 set_target_properties(test_fea_plastic PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 add_test(NAME fea_plastic COMMAND test_fea_plastic)
+
+# Native initial-stress linear buckling, sharing static quadrature and modal eigen ladder.
+target_sources(chudware_sim PRIVATE sim/fea_buckling.cpp)
+add_executable(test_fea_buckling tests/test_fea_buckling.cpp)
+target_include_directories(test_fea_buckling PRIVATE ${doctest_SOURCE_DIR})
+target_link_libraries(test_fea_buckling PRIVATE chudware_sim)
+set_target_properties(test_fea_buckling PROPERTIES
+  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+add_test(NAME fea_buckling COMMAND test_fea_buckling)

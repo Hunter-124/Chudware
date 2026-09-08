@@ -541,6 +541,10 @@ bool cppSimFlag() {
 }
 
 bool routeSimToCpp(const std::string &method, const json & /*params*/) {
+  // Buckling has no services-worker/CalculiX implementation. Claim it even if
+  // engine loading fails, so an unavailable engine is an error, never a proxy.
+  if (method == "sim_run_buckling")
+    return true;
   if (!cppSimFlag())
     return false;
   if (!(method == "sim_mesh" || method == "sim_run_static" ||
@@ -2192,6 +2196,12 @@ bool WorkerClient::callImpl(const std::string &method, const json &params,
           errorSink_(method, err);
         return false;
       }
+    }
+    if (method == "sim_run_buckling") {
+      err = cerr.empty() ? "Engine linear buckling is unavailable" : cerr;
+      if (errorSink_)
+        errorSink_(method, err);
+      return false;
     }
     // Any other hard failure (DLL throw / load race after the available() check):
     // do NOT hard-break sim — fall through to the Python sim worker path below so

@@ -1,6 +1,6 @@
 """Model tier profiles — loader, budget enforcer, and provider tier detection.
 
-Contract: contracts/advisor.md §8 + 1.3 addendum (deliberation dial).
+Contract: contracts/advisor.md §8 (tier budgets).
 Spec: docs/ADVISOR_ARCHITECTURE.md §2.9.
 
 What this module provides
@@ -10,7 +10,7 @@ What this module provides
 
 * ``TierProfile`` dataclass
   Carries all per-tier dials: budgets, enforcement, structured-output mode,
-  verbosity, deliberation level, tool-schema-trim flag.
+  verbosity and tool-schema-trim flag.
 
 * ``detect_tier(context_length)`` / ``detect_tier_from_env()``
   Map a model's context length to a tier (CHUDWARE_TIER env override honoured).
@@ -143,9 +143,8 @@ class TierProfile:
     structured_output: str  # gbnf | json_mode | free
     advisory_verbosity: str  # full | compact
     max_tools_per_role: int
-    deliberation: str  # full | standard | minimal  (§8 1.3 addendum)
     tool_schema_trim: bool
-    # Coercion level A/B/C — orthogonal to deliberation (effort). A = scaffold hard,
+    # Coercion level A/B/C — independent of turn priority. A = scaffold hard,
     # B = soft gates, C = freedom + HARD floors only. See capability.py.
     capability_profile: str = "C"  # A | B | C
 
@@ -187,7 +186,6 @@ def _profile_from_dict(name: str, raw: dict, source: str) -> TierProfile:
         "structured_output",
         "advisory_verbosity",
         "max_tools_per_role",
-        "deliberation",
         "tool_schema_trim",
     )
     missing = [k for k in required if k not in raw]
@@ -211,7 +209,6 @@ def _profile_from_dict(name: str, raw: dict, source: str) -> TierProfile:
         structured_output=str(raw["structured_output"]),
         advisory_verbosity=str(raw["advisory_verbosity"]),
         max_tools_per_role=int(raw["max_tools_per_role"]),
-        deliberation=str(raw["deliberation"]),
         tool_schema_trim=bool(raw["tool_schema_trim"]),
         capability_profile=str(cap),
     )
@@ -329,12 +326,12 @@ def parse_xai_tier(tier: str) -> str | None:
     return model_id or None
 
 
-def effort_tier_for(tier: str | None) -> str | None:
-    """Map a gym/CLI tier string onto a tiers.yaml profile name for effort.
+def profile_tier_for(tier: str | None) -> str | None:
+    """Map a gym/CLI tier string onto a tiers.yaml budget profile name.
 
     Parameterized ``openrouter:<model-id>`` and ``xai:<model-id>`` paid tiers
     reuse the ``frontier`` budget profile (same context class). Local / mid /
-    frontier names pass through unchanged so resolve_effort keeps working.
+    frontier names pass through unchanged.
     """
     if not tier:
         return tier
@@ -625,27 +622,6 @@ def grammar_for_tier(
 
     return schema_to_gbnf(handoff_schema)
 
-
-# --------------------------------------------------------------------------- effort resolution (T-W28)
-
-
-def resolve_effort(tier: str, **kwargs):
-    """Resolve the effective harness effort profile for *tier*.
-
-    Shipped defaults (this module's tiers.yaml + the shipped code constants)
-    layered under the active effort preset (services/agent/effort_presets.yaml)
-    and per-tier user overrides (config.json ``ai_effort``).  The mission
-    pipeline, the design gym and the settings GUI all resolve through this ONE
-    path.  Import is deferred (mirrors grammar_for_tier) to avoid cycles —
-    effort.py imports this module.
-    Parameterized ``openrouter:<model-id>`` / ``xai:<model-id>`` paid tiers
-    share the frontier budget profile (see :func:`effort_tier_for`).
-    """
-    # openrouter:/xai: paid tiers share the frontier budget profile.
-    tier = effort_tier_for(tier)
-    from services.agent.effort import resolve_effort as _resolve
-
-    return _resolve(tier, **kwargs)
 
 
 # --------------------------------------------------------------------------- turn assembler

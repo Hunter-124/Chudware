@@ -111,13 +111,6 @@ class TestBcLint:
         })
         assert not any(issue["kind"] == "no_load" for issue in issues)
 
-    def test_buckling_rejects_pressure_as_proxy_load(self):
-        issues = _surface_issues({
-            "type": "fea_buckling",
-            "load": [{"face": "top", "pressure": 1.0}],
-        })
-        assert any(issue["kind"] == "invalid_buckling_load" for issue in issues)
-
     def test_contact_requires_a_positive_gap_window(self):
         issues = _surface_issues({"type": "fea_contact", "max_gap_mm": 0.0})
         assert any(issue["kind"] == "invalid_contact_gap" for issue in issues)
@@ -938,7 +931,7 @@ class TestThermalBcLint:
             for item in items
         )
 
-    def test_steady_requires_two_distinct_public_temperature_bcs(self):
+    def test_steady_requires_nonzero_excitation(self):
         issues = _thermal_bc_issues({
             "type": "fea_thermal",
             "hot_faces": [{"face": "+x", "temperature": 100.0}],
@@ -946,7 +939,7 @@ class TestThermalBcLint:
         })
         assert any(issue["kind"] == "thermal_steady_bcs" for issue in issues)
 
-    def test_steady_rejects_extra_temperature_faces_and_loads(self):
+    def test_steady_accepts_multiple_temperature_faces_and_flux(self):
         issues = _thermal_bc_issues({
             "type": "fea_thermal",
             "hot_faces": [
@@ -956,7 +949,7 @@ class TestThermalBcLint:
             "cold_faces": [{"face": "-x", "temperature": 20.0}],
             "loads": [{"face": "+z", "flux_w_m2": 100.0}],
         })
-        assert any(issue["kind"] == "thermal_steady_bcs" for issue in issues)
+        assert issues == []
 
     def test_steady_public_hot_and_cold_faces_are_valid(self):
         issues = _thermal_bc_issues({

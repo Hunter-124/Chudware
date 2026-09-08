@@ -314,11 +314,14 @@ ENTRIES: dict[str, dict[str, Any]] = {
     },
     "run_fea_buckling": {
         "prompt_note": (
-            "CalculiX fixed-free BOX PROXY, not real CAD stress/buckling. Pass exactly "
-            "one fixture face and one inward axial force in N on one load face; pressure, "
-            "shear, and tension are rejected. lambda*applied_load is Pcr; lambda<1 fails. "
-            "The tool returns ok:false, skipped:true when ccx is unavailable; compare "
-            "euler_reference_pcr_n."
+            "Engine linear buckling on the real CAD tet10 mesh, size_mm=8 by default. "
+            "Use the static fixtures/load/material dialect: face forces in N or pressures "
+            "in MPa, including multiple loads. Read modes[].load_factor/participation, "
+            "critical_load_factor, critical_load_n, mesh_quality and provenance.solver='engine'. "
+            "A factor below 1 predicts buckling below the reference load. max_load_factor "
+            "(default10000) is the search ceiling; no mode below it is refused, not a PASS "
+            "or infinite strength. Refine size_mm for convergence; vtu_path exports mode "
+            "shapes. Linear elastic instability is not nonlinear collapse strength."
         ),
         "timeout_s": _FEA_TIMEOUT_S,
     },
@@ -399,12 +402,14 @@ ENTRIES: dict[str, dict[str, Any]] = {
     },
     "run_fea_thermal": {
         "prompt_note": (
-            "Steady default is a CalculiX 1-D BOX PROXY: exactly one hot_faces and one "
-            "cold_faces entry need {face,temperature °C}; temperatures must differ and loads "
-            "are rejected. Compare mid_plane_T to the linear Fourier anchor; ccx absent "
-            "returns SKIP. Steady needs conductivity_w_mk/k_w_mk in W/(m·K). "
-            "transient={t_end_s,dt_s,...} uses the real tet mesh with flux_w_m2 or "
-            "h_w_m2k/t_amb_c; flux-only heat-up is valid and needs conductivity, "
+            "Steady and transient use the real part tet mesh in the engine. "
+            "hot_faces/cold_faces entries need {face,temperature °C}; loads support "
+            "flux_w_m2 or h_w_m2k/t_amb_c. Steady requires a fixed-temperature or "
+            "convection datum and non-zero thermal excitation, returns temperature extrema, "
+            "flux_max_w_m2, mesh_quality/provenance, and supports vtu_path. "
+            "Steady needs conductivity_w_mk/k_w_mk in W/(m·K). "
+            "transient={t_end_s,dt_s,...} additionally supports schedules; "
+            "flux-only heat-up is valid and needs conductivity, "
             "density_g_cm3, and cp_j_kgk/specific_heat_j_kgk in J/(kg·K)."
         ),
         "timeout_s": _FEA_TIMEOUT_S,

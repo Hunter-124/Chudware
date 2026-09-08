@@ -172,7 +172,7 @@ def test_delegate_session_default_clamps_final_ambient_provider(
 
     ambient = SimpleNamespace(name="ambient", model="frontier", reasoning_effort="max")
     assignment = rm.RoleModelAssignment(
-        role="task", provider="", model="", mode=rm.SESSION_DEFAULT
+        role="worker", provider="", model="", mode=rm.SESSION_DEFAULT
     )
     captured = {}
 
@@ -182,19 +182,22 @@ def test_delegate_session_default_clamps_final_ambient_provider(
     )
     monkeypatch.setattr(
         "services.agent.config.load_config",
-        lambda: {"reasoning_effort": "max"},
+        lambda: {
+            "reasoning_effort": "max",
+            "copilot": {"priority": "best_results"},
+        },
     )
     if role_resolution_fails:
 
-        def resolve_for_node(*_args, **_kwargs):
+        def resolve_role_model(*_args, **_kwargs):
             raise RuntimeError("role resolution unavailable")
     else:
 
-        def resolve_for_node(*_args, **_kwargs):
+        def resolve_role_model(*_args, **_kwargs):
             return assignment
 
-    monkeypatch.setattr(rm, "resolve_for_node", resolve_for_node)
-    monkeypatch.setattr(rm, "resolve_role_thinking", lambda *a, **k: None)
+    # Unpinned delegated leaves resolve through the worker seat, not ai_roles.
+    monkeypatch.setattr(rm, "resolve_role_model", resolve_role_model)
 
     def fake_run_turn(_request, _role, **kwargs):
         captured["options"] = kwargs.get("options") or {}
@@ -223,6 +226,8 @@ def test_delegate_session_default_clamps_final_ambient_provider(
     options = captured["options"]
     assert result["ok"] is True
     assert options["settings"]["reasoning_effort"] == "high"
+    assert "provider" not in options["settings"]
+    assert "model" not in options["settings"]
     assert "offline_provider" not in options
     assert ambient.reasoning_effort == "max"
 

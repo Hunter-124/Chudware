@@ -1,9 +1,8 @@
-"""simsuite bench — fea_ccx_advanced: CalculiX-backed buckling + contact and the
-engine fatigue (S-N) chain.
+"""simsuite bench — engine buckling/fatigue and legacy CalculiX contact.
 
 Cases
-  buckling_euler_fixed_free   ccx *BUCKLE on the box-proxy column; first critical
-                              load vs Euler Pcr = pi^2*E*I/(K*L)^2, K=2 fixed-free
+  buckling_euler_fixed_free   engine tet10 on real STEP CAD; first critical load
+                              vs Euler Pcr = pi^2*E*I/(K*L)^2, K=2 fixed-free
                               (Timoshenko & Gere, Theory of Elastic Stability).
   contact_force_balance       ccx *STATIC,NLGEOM two-block *CONTACT PAIR; base
                               reaction vs applied load p*L*b (static equilibrium /
@@ -19,9 +18,8 @@ Cases
                               zero mean stress, so every mean-stress theory's sa_eq
                               equals crit_sigma_a exactly (ratio ref = 1.0).
 
-ccx absent -> the two ccx cases return status "skip" (honest degrade, GPL-2.0
-subprocess isolation). Engine .so without the FEA plugin -> fatigue_engine_cube
-skips. quick=True uses the coarser buckling mesh; the whole module runs in ~2 s.
+ccx absent -> only the contact proxy case returns status "skip" (GPL-2.0 subprocess
+isolation). Engine studies do not need ccx. quick=True uses the coarser buckling mesh.
 """
 from __future__ import annotations
 
@@ -73,31 +71,40 @@ def _finish(c: dict, t0: float, metric, ref, tol: float, units: str) -> dict:
 # --------------------------------------------------------------------- buckling
 
 def _bench_buckling(quick: bool) -> dict:
-    from services.mcp import fea_advanced as fa
+    from scripts.sim_audit import _load_core_bridge, _cantilever_setup, _AUDIT_STEEL
+
     t0 = time.time()
     c = _case("buckling_euler_fixed_free")
-    # Slender steel column 400x10x10 mm (L/h=40): I=10*10^3/12=833.33 mm^4,
-    # Pcr = pi^2*200000*833.33/(2*400)^2 = 2570.2 N (Euler fixed-free, K=2).
-    L, b, h, E, nu, P = 400.0, 10.0, 10.0, 200000.0, 0.3, 1000.0
-    nx = 24 if quick else 48
-    ts = time.time()
-    gen = fa.build_buckling_column_inp(L, b, h, E, nu, P, nx=nx, ny=4, nz=4)
-    c["setup_s"] = time.time() - ts
-    if not _ccx_ready():
-        c.update(status="skip", detail="ccx not on PATH/CHUDWARE_CCX",
-                 total_s=time.time() - t0)
+    cb, reason = _load_core_bridge()
+    if cb is None:
+        c.update(status="skip", detail=reason, total_s=time.time() - t0)
         return c
-    ts = time.time()
-    run = fa.run_ccx(gen["inp"], job="bk", timeout=180.0)
-    c["solve_s"] = time.time() - ts
-    if not run.get("ok") or not run.get("dat_path"):
-        c.update(status="fail", total_s=time.time() - t0,
-                 detail=(run.get("stderr") or run.get("error") or "ccx failed")[-200:])
+    try:
+        ctx = _cantilever_setup(cb)
+        if ctx.get("error"):
+            raise ValueError(ctx["error"])
+        length, width, height = ctx["L_mm"], ctx["b_mm"], ctx["h_mm"]
+        inertia = min(width * height**3, height * width**3) / 12
+        expected = math.pi**2 * _AUDIT_STEEL["E_mpa"] * inertia / (2 * length)**2
+        size_mm = 20.0 if quick else 10.0
+        study = {
+            "step_path": ctx["step"], "material": _AUDIT_STEEL,
+            "fixtures": [ctx["fix_fp"]],
+            "loads": [{"faces": ctx["load_fp"], "type": "force",
+                       "vector": [-1000.0, 0.0, 0.0]}],
+            "mesh_order": 2, "target_size_mm": size_mm,
+        }
+        c["setup_s"] = time.time() - t0
+        ts = time.time()
+        out = cb.call("sim_run_buckling", {"study": study, "n_modes": 4})
+        c["solve_s"] = time.time() - ts
+        if not out.get("ok"):
+            raise ValueError(out.get("error", "engine buckling failed"))
+        return _finish(c, t0, out["critical_load_n"], expected, 0.08,
+                       f"N (real STEP tet10, h={size_mm:g} mm)")
+    except Exception as exc:  # noqa: BLE001
+        c.update(status="fail", detail=str(exc), total_s=time.time() - t0)
         return c
-    factors = fa.parse_buckle_factors(run["dat_path"])
-    metric = factors[0] * P if factors else None
-    return _finish(c, t0, metric, gen["expected_Pcr"], 0.05,
-                   f"N (first critical load, nx={nx}, C3D8I)")
 
 
 # --------------------------------------------------------------------- contact

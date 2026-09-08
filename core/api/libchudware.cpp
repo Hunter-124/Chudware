@@ -2914,6 +2914,29 @@ static int chudware_call_inner(const char* method, const char* params_json, char
             }
             return emit(std::move(res), out_json, 0);
         }
+        if (m == "sim_run_buckling") {
+            // Engine-only real-geometry prestress + eigenvalue solve; same C ABI
+            // and study envelope as modal, with the static reference loads.
+            if (params.contains("n_modes") &&
+                (!params["n_modes"].is_number_integer() ||
+                 params["n_modes"] < 1 || params["n_modes"] > 100))
+                return emit(json{
+                                {"ok", false},
+                                {"error", "fea_buckling: n_modes must be an integer from 1 to 100"},
+                                {"reason", "fea_buckling: n_modes must be an integer from 1 to 100"}},
+                            out_json, 0);
+            if (params.contains("max_load_factor") &&
+                !params["max_load_factor"].is_number())
+                return emit(json{
+                                {"ok", false},
+                                {"error", "fea_buckling: max_load_factor must be numeric"},
+                                {"reason", "fea_buckling: max_load_factor must be numeric"}},
+                            out_json, 0);
+            const json& study = params.contains("study") ? params["study"] : json::object();
+            return emit(chudware::sim::fea_run_buckling(
+                            study, params.value("n_modes", 4),
+                            params.value("max_load_factor", 1e4)), out_json, 0);
+        }
         if (m == "aicm_scalar_chunk") {
             // DIAGNOSTIC (byte-contract proof): return the SCLR chunk bytes (hex) for a
             // crafted (body_id, name, values, vmin, vmax) so the gate can byte-compare

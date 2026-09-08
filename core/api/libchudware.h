@@ -86,3 +86,11 @@ CHUDWARE_API void chudware_set_doc_publish_sink(
 #ifdef __cplusplus
 }  // extern "C"
 #endif
+
+// Engine-only linear buckling uses the same public C entry as modal:
+// chudware_call("sim_run_buckling", "{\"study\":{...},\"n_modes\":4}", &out).
+// The study is the static mesh/material/fixture/load shape; results and in-band
+// refusals are JSON at rc 0, and out is released with chudware_free().
+// See contracts/worker_rpc.md section 27 for mode/participation/evidence fields.
+// Optional top-level max_load_factor (default 10000) bounds the buckling search;
+// no mode below that ceiling is an in-band refusal, not infinite strength.

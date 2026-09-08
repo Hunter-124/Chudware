@@ -2732,30 +2732,53 @@ def _agent_admin_turn(params: dict, _emit: Callable) -> dict:
             return {"ok": False, "reason": "invalid_subscription_grant"}
 
     cfg = dict(agent_config.load_config() or {})
-    provider_name = param_str("provider")
-    model_name = param_str("model")
-    if not provider_name:
-        provider_name = str(cfg.get("provider") or "").strip()
-    if not model_name:
-        model_name = str(cfg.get("model") or "").strip()
-    if not provider_name or not model_name:
-        try:
-            from services.agent.role_models import (
-                harness_role_for_mission_role,
-                resolve_role_model,
-            )
+    from services.agent.preferences import resolve_turn_preferences
+    from services.agent.role_models import resolve_role_model, _auto_local_provider
 
-            assignment = resolve_role_model(
-                harness_role_for_mission_role(role), cfg=cfg
-            )
-            provider_name = provider_name or str(assignment.provider or "").strip()
-            model_name = model_name or str(assignment.model or "").strip()
-        except (ImportError, OSError, RuntimeError, TypeError, ValueError) as exc:
-            _LOG.debug(
-                "role model resolution unavailable; using session model: %s",
-                exc,
-                exc_info=exc,
-            )
+    try:
+        # An explicit composer/CLI choice is the user's turn override, not Auto.
+        requested_mode = param_str("mode")
+        styles = {"agent": "do_it", "plan": "check_with_me", "ask": "answer_only"}
+        turn_cfg = cfg
+        if requested_mode in styles:
+            turn_cfg = {**cfg, "copilot": {**(cfg.get("copilot") or {}),
+                                         "work_style": styles[requested_mode]}}
+        turn_preferences = resolve_turn_preferences(
+            request, cfg=turn_cfg,
+            feature_count=max(0, int(raw_params.get("feature_count") or 0)),
+            doc_count=max(1, int(raw_params.get("doc_count") or 1)),
+            context_tokens=max(0, int(raw_params.get("context_tokens") or 0)),
+            context_window=max(0, int(raw_params.get("context_window") or cfg.get("context_window") or 0)),
+        )
+        provider_name, model_name = param_str("provider"), param_str("model")
+        assignment = None
+        auto_candidates = None
+        if not provider_name and not model_name:
+            catalog = _chudcode_transient_call("get_available_models", {})
+            auth = _chudcode_transient_call("get_auth_state", {})
+            if not catalog.get("ok") or not auth.get("ok"):
+                raise RuntimeError("Cannot inspect available models. Repair the runtime or sign in in Accounts.")
+            authenticated = {row["id"] for row in _auth_providers(auth) if row["authenticated"]}
+            auto_candidates = [
+                {"provider": row["provider"], "model": row["id"],
+                 "base_url": row.get("baseUrl") or row.get("base_url") or ""}
+                for row in catalog.get("models", [])
+                if isinstance(row, Mapping) and row.get("provider") and row.get("id")
+                and (row["provider"] in authenticated
+                     or _auto_local_provider(row["provider"], cfg, row.get("baseUrl") or row.get("base_url")))
+            ]
+            assignment = resolve_role_model("chat", cfg=cfg, request=request,
+                                           turn_preferences=turn_preferences,
+                                           enabled=auto_candidates)
+            provider_name, model_name = assignment.provider, assignment.model
+        else:
+            provider_name = provider_name or str(cfg.get("provider") or "")
+            model_name = model_name or str(cfg.get("model") or "")
+        if turn_preferences.local_only and not _auto_local_provider(provider_name, cfg):
+            raise ValueError("This computer only requires a loopback model. Configure a local model in Accounts.")
+    except (OSError, RuntimeError, TypeError, ValueError) as exc:
+        agent_config.clear_pooled_credentials()
+        return {"ok": False, "reason": str(exc)}
 
     attachments = None
     raw_attachments = raw_params.get("attachments")
@@ -2830,9 +2853,14 @@ def _agent_admin_turn(params: dict, _emit: Callable) -> dict:
         )
 
     options = {"project_dir": project_root} if project_root else {}
+    options.update({"mode": turn_preferences.roster_mode,
+                    "advisor": turn_preferences.advisor,
+                    "max_subagent_depth": turn_preferences.delegation_depth})
     for key in ("mode", "plan_only", "advisor", "autonomy"):
         if key in raw_params:
             options[key] = raw_params[key]
+    if turn_preferences.task_kind == "chat" or turn_preferences.mode == "ask":
+        options["mode"] = "ask"
     try:
         mission_dispatch = MissionDispatch(
             run_id=run_id,
@@ -2849,6 +2877,7 @@ def _agent_admin_turn(params: dict, _emit: Callable) -> dict:
             card=card,
             capability=turn_capability,
             tier=turn_tier,
+            preferences=turn_preferences,
         )
     except Exception as exc:  # noqa: BLE001
         agent_config.clear_pooled_credentials()
@@ -2881,8 +2910,9 @@ def _agent_admin_turn(params: dict, _emit: Callable) -> dict:
         "workspace_dir": project_root,
         "project_dir": project_root,
         "options": options,
-        "mode": raw_params.get("mode"),
-        "plan_only": raw_params.get("plan_only"),
+        "mode": options["mode"],
+        "plan_only": options.get("plan_only"),
+        "turn_preferences": turn_preferences,
         "subagent_id": raw_params.get("subagent_id"),
         "categories": categories,
         "enabled_categories": categories,
@@ -2905,6 +2935,10 @@ def _agent_admin_turn(params: dict, _emit: Callable) -> dict:
 
     settings_value = raw_params.get("settings")
     settings = dict(settings_value) if isinstance(settings_value, Mapping) else {}
+    if not any(key in raw_params or key in settings for key in ("thinking", "reasoning_effort")):
+        settings["thinking"] = turn_preferences.thinking
+    if turn_preferences.schedule_compaction:
+        settings.setdefault("auto_compaction", True)
     if provider_name:
         settings["provider"] = provider_name
     if model_name:
@@ -3040,7 +3074,39 @@ def _agent_admin_turn(params: dict, _emit: Callable) -> dict:
         }
     response: dict[str, Any]
     try:
+        if assignment is not None:
+            _emit({"kind": "sub_run", **event_context, "id": f"{run_id}:auto",
+                   "purpose": assignment.reason, "status": "done"})
+        started = time.monotonic()
+        total_timeout = host_params.get("timeout", 7200.0)
         host_result = chudcode_agent_turn(host_params, raw_emit)
+        # Chudcode owns retry-after waiting. Only after its retries end in a
+        # rate-limit failure may Auto move to the next authenticated cost class.
+        import re
+
+        while (assignment is not None and assignment.mode == "auto"
+               and not host_result.get("ok") and not host_result.get("cancelled")
+               and re.search(r"\b429\b|rate.?limit", str(host_result.get("reason") or ""), re.I)):
+            from services.agent.role_models import _COST_CLASS
+
+            current_class = _COST_CLASS.get(assignment.provider, 5)
+            later = [row for row in (auto_candidates or [])
+                     if _COST_CLASS.get(row["provider"], 5) > current_class]
+            remaining = total_timeout - (time.monotonic() - started)
+            if not later or remaining <= 0:
+                break
+            next_class = min(_COST_CLASS.get(row["provider"], 5) for row in later)
+            later = [row for row in later if _COST_CLASS.get(row["provider"], 5) == next_class]
+            previous_provider = assignment.provider
+            assignment = resolve_role_model("chat", cfg=cfg, request=request,
+                turn_preferences=turn_preferences, enabled=later)
+            _emit({"kind": "sub_run", **event_context,
+                   "id": f"{run_id}:auto:{next_class}", "status": "done",
+                   "purpose": f"{previous_provider} is still rate-limited after waiting; switching to {assignment.model}."})
+            host_params["settings"].update(provider=assignment.provider, model=assignment.model)
+            host_params["timeout"] = remaining
+            host_params["request"] = "Continue the current request from the saved state; do not repeat completed actions."
+            host_result = chudcode_agent_turn(host_params, raw_emit)
         if not host_result.get("ok"):
             response = {
                 "ok": False,

@@ -46,10 +46,10 @@ def tier_tools_slot(tier: str | None) -> tuple[int, bool]:
     if tier:
         try:
             from services.agent.tiers import (  # noqa: PLC0415
-                effort_tier_for,
+                profile_tier_for,
                 load_tier,
             )
-            profile = load_tier(effort_tier_for(tier) or tier)
+            profile = load_tier(profile_tier_for(tier) or tier)
         except Exception:  # noqa: BLE001 — an unknown tier name is not fatal
             pass
         else:

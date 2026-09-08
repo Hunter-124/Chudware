@@ -64,7 +64,7 @@ run engine in-process (`CHUDWARE_ENGINE_DAEMON=0`) → return structured JSON.
 | `fea_static` | 8–12 diverse parts (cantilever, plate+hole, annulus, L-bracket, shelled box, revolved, lofted, swept, multi-feature); tet4/tet10/hex × fineness sweeps → accuracy-vs-time frontier | Euler-Bernoulli tip deflection, Kirsch Kt≈3, Lamé hoop/radial |
 | `fea_modal_freq` | modal natural freqs; free-free 6 rigid-body modes; frequency response via ccx path | Euler-Bernoulli beam modes |
 | `fea_thermal` | steady conduction + fin/convection; transient probe | 1-D slab flux, fin theory, lumped-capacitance / semi-infinite solid |
-| `fea_ccx_advanced` | CalculiX buckling, contact, fatigue; bad-`.inp`/missing-binary/timeout handling | Euler Pcr, Hertz contact, Basquin S-N |
+| `fea_ccx_advanced` | Engine buckling/fatigue, legacy CalculiX contact; bad-`.inp`/missing-binary/timeout handling for contact only | Euler Pcr, Hertz contact, Basquin S-N |
 | `cfd` | LBM channel/bluff-body + convergence curve; OpenFOAM case-gen (skip-gated) | Poiseuille profile, mass conservation |
 | `ecad_sim` | RC/RLC/diode/MOSFET through the sim stack; `ecad_new_schematic→wire→ecad_simulate`; orchestrator sim (no live LLM); C++↔Python SPICE parity; ngspice if present | RC τ, RLC resonance, MOSFET DC transfer |
 | `em_wave` | analytic (waveguide TE10 cutoff, microstrip Z0); BuiltinFdfdAdapter convergence; openEMS-absent clean degrade | f_c = c/(2a), closed-form Z0 |

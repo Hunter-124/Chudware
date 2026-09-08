@@ -8,6 +8,7 @@
 // strain-displacement operator, in chunks, and averaged onto nodes.
 
 #include "sim/fea_static.h"
+#include "sim/fea_element.h"
 
 #include "prof/phases.h"
 
@@ -610,7 +611,9 @@ inline int plastic_gauss_count(int nodes_per_elem) {
 // B and the integration weight (mm^3, i.e. |detJ| * w_gauss) at Gauss point `g` of
 // one element whose node coordinates are `ep` (nodes_per_elem entries). false on a
 // degenerate Jacobian.
-bool plastic_gauss_b(int nodes_per_elem, const Eigen::Vector3d* ep, int g,
+}  // namespace
+
+bool fea_element_gauss_b(int nodes_per_elem, const Eigen::Vector3d* ep, int g,
                      Eigen::Matrix<double, 6, 30>& B, double& weight) {
     B.setZero();
     if (nodes_per_elem == 10) {
@@ -647,6 +650,8 @@ bool plastic_gauss_b(int nodes_per_elem, const Eigen::Vector3d* ep, int g,
     weight = vol;
     return true;
 }
+
+namespace {
 
 // The Voigt deviatoric projector, as the operator that turns an ENGINEERING strain
 // vector into 1/(2mu) of the deviatoric stress it causes: C = K*(1 (x) 1) + 2mu*Idev
@@ -1884,7 +1889,7 @@ static FeaStaticResult solve_impl(const std::vector<double>& points,
                         ep[static_cast<std::size_t>(j)] = node_pt(tn[j]);
                     for (int g = 0; g < plastic_ngp; ++g) {
                         double w = 0.0;
-                        if (!plastic_gauss_b(nodes_per_elem, ep.data(), g, B, w)) {
+                        if (!fea_element_gauss_b(nodes_per_elem, ep.data(), g, B, w)) {
                             res.error = "fea_static: degenerate element " +
                                         std::to_string(e) + " at Gauss point " +
                                         std::to_string(g);
@@ -1965,7 +1970,7 @@ static FeaStaticResult solve_impl(const std::vector<double>& points,
                     fe.head(edof).setZero();
                     for (int g = 0; g < plastic_ngp; ++g) {
                         double w = 0.0;
-                        if (!plastic_gauss_b(nodes_per_elem, ep.data(), g, B, w))
+                        if (!fea_element_gauss_b(nodes_per_elem, ep.data(), g, B, w))
                             return false;
                         const std::size_t gi =
                             static_cast<std::size_t>(e) * plastic_ngp + g;
@@ -2309,7 +2314,7 @@ static FeaStaticResult solve_impl(const std::vector<double>& points,
                     }
                     for (int g = 0; g < plastic_ngp; ++g) {
                         double w = 0.0;
-                        if (!plastic_gauss_b(nodes_per_elem, ep.data(), g, B, w)) continue;
+                        if (!fea_element_gauss_b(nodes_per_elem, ep.data(), g, B, w)) continue;
                         const Eigen::Matrix<double, 6, 1> s =
                             plastic_stress(e, g, B.leftCols(edof) * ue.head(edof));
                         const double p = (s(0) + s(1) + s(2)) / 3.0;

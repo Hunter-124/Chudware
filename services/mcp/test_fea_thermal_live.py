@@ -1,6 +1,5 @@
-"""fea_thermal live regression suite — the C++ sim_run_thermal RPC (the seam behind
-cad_tools.run_fea_thermal's transient branch) vs analytic truths and the Python
-oracle, plus the CalculiX steady bar path the tool's steady branch uses.
+"""Thermal live regression suite — engine steady/transient conduction vs analytic
+truths, including the public tool on a meshed 6061 bar.
 
 Layers covered:
   * steady conduction (fea_thermal_solve via sim_run_thermal): slab linear profile,
@@ -9,15 +8,10 @@ Layers covered:
     Fourier-series decay, lumped-capacitance cooling, duty-schedule differential
     parity against engine_oracle/sim/fea_thermal_transient.py, malformed-schedule
     rejection;
-  * CalculiX steady path (fea_advanced.build_thermal_bar_inp + run_ccx) — the
-    box-proxy 1-D bar run_fea_thermal(steady) drives; skips honestly without ccx.
+  * public steady tool: real CAD bar, VTU linear temperature field and Fourier flux.
 
-Everything runs the engine IN-PROCESS on the services/dist lib
-(CHUDWARE_ENGINE_DAEMON=0) with INLINE Kuhn box meshes (engine_oracle box_mesh), so
-the studies are deterministic, mesher-free and fast; facesets are passed as exact
-node coordinates with a tight tol_mm. Convection facesets are built one plane at a
-time — a merged multi-plane node set makes interior diagonal faces count as surface
-in the element-face enumeration (documented node-set semantics, both stacks).
+Kernel studies use deterministic inline Kuhn box meshes; the public-tool study
+uses the actual part mesher. All engine calls run in-process.
 
 Run:  CHUDWARE_ENGINE_DAEMON=0 .venv-mcp/bin/python -X utf8 -m pytest \
           services/mcp/test_fea_thermal_live.py -q
@@ -241,27 +235,43 @@ def test_transient_malformed_schedule_is_rejected():
     assert "schedule" in res.get("error", "").lower()
 
 
-# ---------------------------------------------------------------------------
-# CalculiX steady bar (the run_fea_thermal steady-branch backend)
-# ---------------------------------------------------------------------------
+@needs_engine
+def test_public_steady_6061_bar_temperature_and_flux(tmp_path):
+    import json
+    import xml.etree.ElementTree as ET
+    from services.agent.agent_turn import _bind_tool
 
-def _ccx_available() -> bool:
-    from services.mcp import fea_advanced as fa
-    return fa.ccx_path() is not None
-
-
-@pytest.mark.skipif(not _ccx_available(), reason="ccx (CalculiX) not on PATH/CHUDWARE_CCX")
-def test_ccx_steady_bar_mid_plane_temperature():
-    # The exact study run_fea_thermal(steady) builds: *HEAT TRANSFER, STEADY STATE
-    # box bar, hot end / cold end. 1-D linear conduction ⇒ mid-plane = (Th+Tc)/2.
-    from services.mcp import fea_advanced as fa
-    gen = fa.build_thermal_bar_inp(200.0, 20.0, 20.0, 50.0, 100.0, 0.0, nx=8)
-    run = fa.run_ccx(gen["inp"], job="thermal_suite", timeout=120.0)
-    assert not run.get("skipped"), run
-    assert run.get("ok") and run.get("dat_path"), run.get("stderr", "")[-400:]
-    mid = fa.parse_dat_nodal(run["dat_path"], "NT", gen["mid_nodes"], component=1)
-    assert mid is not None
-    assert abs(mid - 50.0) < 1e-3
+    created = json.loads(_bind_tool("new_part")(name="thermal_6061_bar", fresh=True))
+    assert created["ok"], created
+    doc = created["doc_id"]
+    added = json.loads(_bind_tool("add_features")(doc_id=doc, ops=[
+        {"op": "add_feature", "feature": {"type": "box", "name": "Bar",
+         "params": {"length": 20, "width": 8, "height": 8}}}]))
+    assert added["ok"], added
+    path = tmp_path / "steady.vtu"
+    from services.mcp.test_fea_advanced import _cad_tools
+    result = json.loads(_cad_tools()["run_fea_thermal"](
+        hot_faces=[{"face": "-x", "temperature": 100}],
+        cold_faces=[{"face": "+x", "temperature": 0}],
+        material={"name": "6061-T6", "conductivity_w_mk": 167.0},
+        mesh_fineness="coarse", doc_id=doc,
+        vtu_path=str(path)))
+    assert result["ok"], result
+    assert result["provenance"]["solver"] == "engine"
+    assert result["mesh_quality"]["n_nodes"] > 0
+    assert result["temperature_max_c"] == pytest.approx(100, abs=1e-4)
+    assert result["temperature_min_c"] == pytest.approx(0, abs=1e-4)
+    assert result["flux_max_w_m2"] == pytest.approx(
+        result["conductivity_w_mk"] * 100 / 0.020, rel=0.03)
+    root = ET.parse(path).getroot()
+    points = np.fromstring(root.find(".//Points/DataArray").text, sep=" ").reshape(-1, 3)
+    field = np.fromstring(root.find(".//PointData/DataArray[@Name='temperature']").text, sep=" ")
+    x = points[:, 0]
+    expected = 100 * (x.max() - x) / (x.max() - x.min())
+    assert np.max(np.abs(field - expected)) < 1.0
+    mid = (x.max() + x.min()) / 2
+    assert np.polyval(np.polyfit(x, field, 1), mid) == pytest.approx(50, abs=1)
+    assert "frames" not in result
 
 
 if __name__ == "__main__":

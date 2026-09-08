@@ -251,6 +251,7 @@ def _assemble_role_runtime(
 ) -> tuple[str, list[str], list[Any], Any, dict[str, Any]]:
     from services.agent import agent_turn
     from services.agent.mission_dispatch import MissionDispatch, linear_role_prompt
+    from services.agent.preferences import resolve_turn_preferences
 
     mission_dispatch = options.get("mission_dispatch")
     if mission_dispatch is None:
@@ -275,6 +276,7 @@ def _assemble_role_runtime(
         card=card,
         capability=capability,
         tier=tier,
+        preferences=resolve_turn_preferences("", task_kind="modelling", headless=True),
     )
     # Nested callers may narrow a role card without mutating the process-global
     # registry.  Preserve the allowlist tri-state all the way into

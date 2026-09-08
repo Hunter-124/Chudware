@@ -443,3 +443,52 @@ def model_for_role_shape(shape: str) -> str | None:
         if entry.get("role_shape") == shape:
             return str(entry["id"])
     return None
+
+
+def classify_bundled_task(prompt: str, *, cfg=None) -> str | None:
+    """Use the running bundled fanout model, never a cloud or download fallback.
+
+    An absent server/model is normal (including an offline install without GGUFs).
+    The deterministic classifier then owns the decision. Do not spawn a competing
+    model server merely to classify a turn.
+    """
+    import json
+    from urllib.parse import urlparse
+
+    local = (cfg or {}).get("llamacpp") or {}
+    base = str(local.get("base_url") or "http://127.0.0.1:1234/v1").rstrip("/")
+    if urlparse(base).hostname not in {"localhost", "127.0.0.1", "::1"}:
+        return None
+    model = model_for_role_shape("fanout")
+    if not model:
+        return None
+    # No proxy or redirect may move classification data off the computer.
+    class NoRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, req, fp, code, msg, headers, newurl):
+            return None
+
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
+    try:
+        with opener.open(base + "/models", timeout=0.25) as response:
+            models = json.loads(response.read(65536))
+        ids = {str(row.get("id", "")) for row in models.get("data", [])}
+        filename = _REGISTRY[model]["file"]
+        served = next((mid for mid in sorted(ids) if mid == model or Path(mid).name == filename), None)
+        if served is None:
+            return None
+        payload = {
+            "model": served, "temperature": 0, "max_tokens": 12,
+            "chat_template_kwargs": {"enable_thinking": False},
+            "messages": [
+                {"role": "system", "content": "Classify the request. Reply with only chat, modelling, analysis, or mission. chat: question without mutation intent. modelling: features on one document. analysis: simulation or engineering analysis. mission: multiple deliverables or documents."},
+                {"role": "user", "content": prompt[:12000]},
+            ],
+        }
+        request = urllib.request.Request(base + "/chat/completions",
+            data=json.dumps(payload).encode(), headers={"Content-Type": "application/json"})
+        with opener.open(request, timeout=2) as response:
+            result = json.loads(response.read(65536))
+        kind = result["choices"][0]["message"]["content"].strip().lower()
+        return kind if kind in {"chat", "modelling", "analysis", "mission"} else None
+    except (OSError, ValueError, KeyError, IndexError, TypeError):
+        return None

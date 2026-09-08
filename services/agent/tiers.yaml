@@ -1,14 +1,11 @@
 # Tier profiles — aicad.tier/1
-# Contract: contracts/advisor.md §8 + 1.3 addendum (deliberation dial)
+# Contract: contracts/advisor.md §8 (tier budgets)
 # Spec: docs/ADVISOR_ARCHITECTURE.md §2.9
 #
 # Four profiles: local-24k, local-48k, mid, frontier.
 # Budget slots must satisfy: sum(slot budgets) + generation_headroom ≤ context_tokens.
 # Slot assembly order follows §9.1: system → ledger → state → advisory → tools → history.
 #
-# deliberation (§8 1.3 addendum): INVERTED dial.
-#   local tiers = full  (tokens free; councils, ponders, trigger packs all on)
-#   frontier    = minimal (tokens cost money; councils only where risk warrants)
 
 schema: aicad.tier/1
 
@@ -40,8 +37,8 @@ local_models:
 #   openrouter:openai/gpt-4o
 #   xai:<model-id>         e.g. xai:grok-4.5  (or xai:grok-4-5)
 # Online provider/model selection is resolved by Chudcode. Explicit offline role
-# turns use only local tier/provider mappings. Effort budgets reuse the frontier
-# profile (see tiers.effort_tier_for). These are NOT listed as static
+# turns use only local tier/provider mappings. Context budgets reuse the frontier
+# profile (see tiers.profile_tier_for). These are NOT listed as static
 # profiles below — the model id is the tier parameter.
 
 profiles:
@@ -61,7 +58,6 @@ profiles:
     structured_output: gbnf             # llama.cpp GBNF grammar via schema_to_gbnf()
     advisory_verbosity: full
     max_tools_per_role: 14
-    deliberation: full      # councils, ponders, trigger packs all on
     tool_schema_trim: true  # strip tool descriptions to first sentence
     capability_profile: A   # local: scaffold hard; force grounding + read-back
 
@@ -81,7 +77,6 @@ profiles:
     structured_output: gbnf
     advisory_verbosity: full
     max_tools_per_role: 14
-    deliberation: full      # same as local-24k: local tokens are free
     tool_schema_trim: true
     capability_profile: A   # local: scaffold hard
 
@@ -101,7 +96,6 @@ profiles:
     structured_output: json_mode        # OpenAI response_format: json_object
     advisory_verbosity: full
     max_tools_per_role: 14
-    deliberation: standard              # mid point: risk-gated councils
     tool_schema_trim: false
     capability_profile: B               # budget: full tools + soft gates
 
@@ -121,6 +115,5 @@ profiles:
     structured_output: free             # no grammar constraint; validate_handoff post-parse
     advisory_verbosity: compact
     max_tools_per_role: 14
-    deliberation: minimal               # frontier tokens cost money; councils only where risk warrants
     tool_schema_trim: false
     capability_profile: C               # frontier: freedom; HARD floors only

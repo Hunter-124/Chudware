@@ -419,6 +419,7 @@ def _resolve_study_material(
 
     required_by_analysis = {
         "static": ("E_mpa", "nu", "yield_mpa"),
+        "buckling": ("E_mpa", "nu"),
         "fatigue": ("E_mpa", "nu", "yield_mpa", "ultimate_mpa", "endurance_mpa"),
         "modal": ("E_mpa", "nu", "density_g_cm3"),
         "frequency_response": ("E_mpa", "nu", "density_g_cm3"),
@@ -1474,6 +1475,7 @@ def _build_static_study(
     target_size_mm: Optional[float] = None,
     min_size_mm: Optional[float] = None,
     plasticity: Optional[dict] = None,
+    material_analysis: str = "static",
 ) -> dict:
     """SETUP stage for run_fea_static / sim_run(analysis="fea_static")."""
     d = _doc(doc_id)
@@ -1497,7 +1499,7 @@ def _build_static_study(
     min_size_mm = _norm_min_size_mm(min_size_mm, target_size_mm)
     vtu_path = _norm_vtu_path(vtu_path)
     export_system_path = _norm_abs_out_path(export_system_path, "export_system_path")
-    mat = _resolve_study_material(material, "static")
+    mat = _resolve_study_material(material, material_analysis)
     plasticity = _norm_plasticity(plasticity, mat)
     if plasticity is not None:
         mat = {**mat, "plasticity": plasticity}
@@ -4958,11 +4960,9 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
 
     # ================================================================
     # T-BL04 — fatigue / thermal / buckling / contact FEA
-    # Fatigue routes to the C++ `sim_run_fatigue` solver (same posture as
-    # run_fea_static→sim_run_static). Thermal/buckling/contact route to a
-    # CalculiX (ccx) subprocess — GPL-2.0, subprocess-only, PATH-discovered,
-    # never linked/bundled (contracts/licenses.md) — and degrade HONESTLY
-    # (skipped:true) when ccx is absent. See services/mcp/fea_advanced.py.
+    # These tools solve on the real CAD mesh through the C++ engine.
+    # fea_advanced retains fatigue post-processing and the legacy ccx contact
+    # worker/V&V helpers, not a thermal or buckling proxy.
     # ================================================================
 
     def _part_bbox_world_spans(d: str) -> tuple[float, float, float]:
@@ -5236,19 +5236,13 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
         doc_id: Optional[str] = None,
         vtu_path: Optional[str] = None,
     ) -> str:
-        """Thermal (heat-conduction) FEA — steady-state via CalculiX, TRANSIENT via the
-        C++ core solver on the real part mesh.
+        """Thermal conduction on the real part tet mesh using the C++ engine.
 
-        STEADY (default, transient=None): solves ∇·(k∇T)=0 with the given faces held at
-        fixed temperatures (Dirichlet) via a ccx subprocess. Because arbitrary CAD meshing
-        needs the FEA mesher, this ccx path solves on a PRISMATIC BOX PROXY sized to the
-        part's bounding box with a 1-D conduction setup (hot end vs cold end) — an
-        engineering estimate honest for bar/plate-like parts. CalculiX is GPL-2.0 →
-        subprocess-only, PATH-discovered; absent ccx ⇒ {ok:false, skipped:true}.
+        STEADY (default, transient=None): solves ∇·(k∇T)=0 with fixed-temperature
+        faces, heat-flux faces and convection. A fixed temperature or convection
+        boundary anchors the temperature datum. Time schedules require transient.
 
-        TRANSIENT (T-FIN18, pass a `transient` dict): solves C dT/dt + K T = f(t) with
-        implicit backward Euler on the REAL tet mesh of the part (C++ core, same solver
-        family as run_fea_static — no box proxy, no ccx needed).
+        TRANSIENT: solves C dT/dt + K T = f(t) with implicit backward Euler.
           transient : {"t_end_s": <s>, "dt_s": <s, optional — defaults t_end/200>,
                        "t_init_c": <°C, default 20>, "frame_times_s": [<s>, ...],
                        "capacitance": "lumped"|"consistent" (default lumped)}
@@ -5275,15 +5269,12 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
 
         conductivity_w_mk : thermal conductivity override (W/m·K); else from material
                             (falls back to a typical value for the named material).
-        learned_advisor : default-off Polyhedral-FEA mesh advice for the transient
-                          real-mesh route only. It does not promote the static-trained
-                          model as a thermal optimizer.
+        learned_advisor : default-off Polyhedral-FEA mesh advice; not a thermal optimizer.
         advisor_max_dof : optional non-negative advisor budget; 0 leaves it unset.
-        vtu_path : TRANSIENT ONLY — optional ABSOLUTE .vtu path (ASCII VTK XML
-                   UnstructuredGrid) with the nodal temperature field as point data. The
-                   steady route is a CalculiX box proxy, not the part mesh, so it refuses
-                   this rather than writing a .vtu of a proxy. A transient reply also
-                   carries "mesh_quality" and "provenance" beside "summary".
+        vtu_path : optional ABSOLUTE .vtu path with nodal temperature point data.
+        Both routes return mesh_quality and provenance beside summary. Steady
+        returns temperature_max_c, temperature_min_c and flux_max_w_m2 without
+        a time axis; full nodal temperatures are persisted in the doc study.
         """
         try:
             bc_notes: list = []
@@ -5312,20 +5303,6 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
             cold_faces = _norm_bc_list(cold_faces, "cold_faces", notes=bc_notes)
             mesh_fineness = _norm_fineness(mesh_fineness)
             advisor = _advisor_params(learned_advisor, advisor_max_dof)
-            if learned_advisor and transient is None:
-                raise ValueError(
-                    "learned_advisor is available only on the transient real-mesh "
-                    "thermal route; the steady route is a CalculiX box proxy and "
-                    "does not run the selected mesher."
-                )
-            if vtu_path and transient is None:
-                raise ValueError(
-                    "vtu_path is available only on the transient real-mesh thermal "
-                    "route; the steady route solves a CalculiX box proxy, so its field "
-                    "is not the part's mesh and must not be released as one."
-                )
-            # Validated (not yet archived) only AFTER the steady-route refusal above: a
-            # call that is about to be refused must not touch a file.
             vtu_path = _norm_vtu_path(vtu_path)
             material = coerce_json_or_repr(material)
             if conductivity_w_mk is not None:
@@ -5396,320 +5373,230 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
                         "transient.capacitance must be 'lumped' or 'consistent'."
                     )
 
-                d = _doc(doc_id)
-                _require_sim_geometry(d)
-                mat = _resolve_study_material(
-                    material,
-                    "thermal_transient",
-                    conductivity_w_mk=conductivity_w_mk,
-                    specific_heat_j_kgk=specific_heat_j_kgk,
-                )
-                k_cond = mat["conductivity_w_mk"]
-                cp = mat["cp_j_kgk"]
-
-                def _faceset(q):
-                    merged = _merge_face_sets(_sim_face_points(d, q))
-                    return merged if merged["points"] else None
-
-                fixtures = []
-                thermal_driving = False
-                for i, f in enumerate(list(hot_faces) + list(cold_faces)):
-                    where = f"temperature_faces[{i}]"
-                    if (
-                        not isinstance(f, dict)
-                        or "temperature" not in f
-                        or "face" not in f
-                    ):
-                        raise ValueError(
-                            "each hot/cold face needs {'face': <query>, "
-                            f"'temperature': <°C>}}: {f!r}"
-                        )
-                    _reject_ignored_fields(f, {"face", "temperature"}, where)
-                    temp = _finite_float(f["temperature"], f"{where}.temperature")
-                    fs = _faceset(f["face"])
-                    if fs is None:
-                        raise ValueError(
-                            f"face query {f['face']!r} resolved to no faces — "
-                            "use query_geometry() to confirm."
-                        )
-                    fs["temp_c"] = temp
-                    fixtures.append(fs)
-                    thermal_driving = thermal_driving or abs(temp - t_init) > 0.0
-
-                load_specs = []
-                for i, ld in enumerate(loads):
-                    where = f"loads[{i}]"
-                    if not isinstance(ld, dict) or "face" not in ld:
-                        raise ValueError(
-                            f"each thermal load needs a 'face' query: {ld!r}"
-                        )
-                    has_flux = "flux_w_m2" in ld
-                    has_film = "h_w_m2k" in ld
-                    if has_flux == has_film:
-                        raise ValueError(
-                            f"{where} needs exactly one of flux_w_m2 or h_w_m2k."
-                        )
-                    fs = _faceset(ld["face"])
-                    if fs is None:
-                        raise ValueError(
-                            f"load face query {ld['face']!r} resolved to no faces."
-                        )
-                    if has_flux:
-                        _reject_ignored_fields(
-                            ld, {"face", "flux_w_m2", "schedule"}, where
-                        )
-                        flux = _finite_float(ld["flux_w_m2"], f"{where}.flux_w_m2")
-                        active = _validate_thermal_schedule(
-                            ld.get("schedule"), f"{where}.schedule"
-                        )
-                        spec = {"faces": fs, "type": "flux", "magnitude": flux}
-                        if "schedule" in ld:
-                            spec["schedule"] = ld["schedule"]
-                        thermal_driving = thermal_driving or (
-                            active and abs(flux) > 0.0
-                        )
-                    else:
-                        _reject_ignored_fields(
-                            ld, {"face", "h_w_m2k", "t_amb_c"}, where
-                        )
-                        htc = _finite_float(ld["h_w_m2k"], f"{where}.h_w_m2k")
-                        if htc <= 0.0:
-                            raise ValueError(f"{where}.h_w_m2k must be > 0.")
-                        ambient = _finite_float(
-                            ld.get("t_amb_c", 20.0), f"{where}.t_amb_c"
-                        )
-                        spec = {
-                            "faces": fs,
-                            "type": "convection",
-                            "h": htc,
-                            "t_amb_c": ambient,
-                        }
-                        thermal_driving = thermal_driving or abs(ambient - t_init) > 0.0
-                    load_specs.append(spec)
-
-                if not thermal_driving:
-                    raise _StudyRefusal(
-                        {
-                            "ok": False,
-                            "error": (
-                                "the transient study has no thermal input / non-zero excitation: every "
-                                "fixed temperature and convection ambient equals t_init_c, and every "
-                                "active heat flux is zero. The part would only echo its initial "
-                                "temperature. Supply a different face/ambient temperature or a "
-                                "non-zero scheduled flux."
-                            ),
-                        }
-                    )
-
-                step = _tmp(".step")
-                cb.call("doc_export_step", {"doc_id": d, "path": step})
-                _archive_existing_vtu(vtu_path, bc_notes)
-                study = {
-                    "step_path": step,
-                    "material": {**mat, "k_w_mk": k_cond, "cp_j_kgk": cp},
-                    "fixtures": fixtures,
-                    "loads": load_specs,
-                    "mesh_order": 2,
-                    "fineness": mesh_fineness,
-                    "transient": {
-                        "t_end_s": t_end,
-                        "dt_s": dt,
-                        "t_init_c": t_init,
-                        "frame_times_s": frame_times,
-                        "capacitance": capacitance,
-                    },
-                }
-                if vtu_path:
-                    study["vtu_path"] = vtu_path
-                study.update(advisor)
-                res = cb.call("sim_run_thermal", {"study": study})
-                if not res.get("ok"):
-                    return _dumps(
-                        {
-                            "ok": False,
-                            "doc_id": d,
-                            "error": res.get("error", "transient thermal solve failed"),
-                        }
-                    )
-                try:
-                    checked = _validate_transient_thermal_result(res, t_end)
-                except ValueError as exc:
-                    return _dumps(
-                        {
-                            "ok": False,
-                            "doc_id": d,
-                            "error": f"thermal solver returned an incomplete/non-finite "
-                            f"or inconsistent result: {exc}",
-                        }
-                    )
-                frames = checked["frames"]
-                frame_summ = checked["frame_summaries"]
-                summary = checked["summary"]
-                counts = checked["counts"]
-                out = {
-                    "ok": True,
-                    "doc_id": d,
-                    "transient": True,
-                    "solver": "C++ core transient conduction (backward Euler, "
-                    f"{capacitance} capacitance)",
-                    "material": mat.get("name", material),
-                    "conductivity_w_mk": k_cond,
-                    "specific_heat_j_kgk": cp,
-                    "summary": summary,
-                    "n_steps": counts["n_steps"],
-                    "n_nodes": counts["n_nodes"],
-                    "n_elems": counts["n_elems"],
-                    "frames": frame_summ,
-                    "solver_notes": res.get("solver_notes", []),
-                    "note": "summary.max_temp_c is the PEAK over the whole run "
-                    "(max-temp envelope), at summary.max_temp_time_s; "
-                    "per-frame nodal fields persisted in the doc study.",
-                    **_evidence_fields(res),
-                }
-                advisor_record = (
-                    {"advisor": res["advisor"]}
-                    if isinstance(res.get("advisor"), dict)
-                    else {}
-                )
-                out.update(advisor_record)
-                sid = _persist_study(
-                    d,
-                    {
-                        "type": "fea_thermal_transient",
-                        "name": f"Transient thermal ({mat.get('name', material)})",
-                        "engine": "cpp",
-                        "material": {**mat, "k_w_mk": k_cond, "cp_j_kgk": cp},
-                        "transient": study["transient"],
-                        **advisor,
-                        **advisor_record,
-                        **_evidence_fields(res),
-                        "results": {
-                            "summary": summary,
-                            "frames": frames,
-                            "envelope_max": checked["envelope_max"],
-                        },
-                    },
-                )
-                out["saved_to_study"] = bool(sid)
-                return _dumps(_interpreted(out, bc_notes))
-
-            if loads:
-                raise ValueError(
-                    "steady thermal box-proxy does not support flux/convection loads; pass "
-                    "transient={...} to run them on the real part mesh instead of silently "
-                    "dropping loads."
-                )
-            if len(hot_faces) != 1 or len(cold_faces) != 1:
-                raise ValueError(
-                    "steady thermal box-proxy supports exactly one hot face and one cold "
-                    "face; use transient={...} for multiple real-mesh boundary faces."
-                )
-            for label, entry in (
-                ("hot_faces[0]", hot_faces[0]),
-                ("cold_faces[0]", cold_faces[0]),
-            ):
-                if (
-                    not isinstance(entry, dict)
-                    or "face" not in entry
-                    or "temperature" not in entry
-                ):
-                    raise ValueError(f"{label} needs face + temperature.")
-                _reject_ignored_fields(entry, {"face", "temperature"}, label)
-            T_hot = _finite_float(
-                hot_faces[0]["temperature"], "hot_faces[0].temperature"
-            )
-            T_cold = _finite_float(
-                cold_faces[0]["temperature"], "cold_faces[0].temperature"
-            )
-            if T_hot == T_cold:
-                raise ValueError(
-                    "hot and cold temperatures are equal, so the steady solution is a "
-                    "constant input field with zero heat flow; provide a non-zero temperature "
-                    "difference."
-                )
-            from . import fea_advanced as fa
-
-            if fa.ccx_path() is None:
-                return _dumps(fa._ccx_absent_result("thermal steady-state"))
             d = _doc(doc_id)
+            _require_sim_geometry(d)
             mat = _resolve_study_material(
-                material, "thermal_steady", conductivity_w_mk=conductivity_w_mk
+                material,
+                "thermal_transient" if transient is not None else "thermal_steady",
+                conductivity_w_mk=conductivity_w_mk,
+                specific_heat_j_kgk=specific_heat_j_kgk,
             )
             k_cond = mat["conductivity_w_mk"]
-            hot_set = _merge_face_sets(_sim_face_points(d, hot_faces[0]["face"]))
-            cold_set = _merge_face_sets(_sim_face_points(d, cold_faces[0]["face"]))
-            if not hot_set["points"] or not cold_set["points"]:
-                raise ValueError(
-                    "hot/cold face queries must both resolve to surface points."
-                )
+            cp = mat.get("cp_j_kgk")
 
-            def _centroid(points):
-                return [
-                    sum(_finite_float(p[i], "face point") for p in points) / len(points)
-                    for i in range(3)
-                ]
+            def _faceset(q):
+                merged = _merge_face_sets(_sim_face_points(d, q))
+                # Planar CAD boundaries are exact mesh planes. A millimetre-scale
+                # picking tolerance would prescribe temperatures on interior layers.
+                normal = merged.get("face_normal")
+                points = merged["points"]
+                if normal and points:
+                    norm = math.sqrt(sum(v * v for v in normal))
+                    if norm > 0.0 and all(
+                        abs(sum((p[i] - points[0][i]) * normal[i] for i in range(3)))
+                        <= 1e-6 * norm for p in points
+                    ):
+                        merged["perp_tol_mm"] = 1e-6
+                return merged if merged["points"] else None
 
-            hot_c = _centroid(hot_set["points"])
-            cold_c = _centroid(cold_set["points"])
-            L = math.sqrt(sum((a - b0) ** 2 for a, b0 in zip(hot_c, cold_c)))
-            if not math.isfinite(L) or L <= 1e-9:
-                raise ValueError(
-                    "hot and cold face centroids coincide; the 1-D box proxy cannot define "
-                    "a conduction length from those selections."
-                )
-            _, b, h = _part_bbox_dims(d)
-            gen = fa.build_thermal_bar_inp(L, b, h, k_cond, T_hot, T_cold)
-            # Inner subprocess clock, deliberately shorter than this tool's outer
-            # harness timeout_s — see fea_advanced's layered-timeout block.
-            run = fa.run_ccx(
-                gen["inp"], job="thermal", timeout=fa.HARNESS_CCX_TIMEOUT_S
-            )
-            if run.get("skipped"):
-                return _dumps(run)
-            if not run.get("ok") or not run.get("dat_path"):
-                return _dumps(
+            fixtures = []
+            thermal_driving = False
+            for i, f in enumerate(list(hot_faces) + list(cold_faces)):
+                where = f"temperature_faces[{i}]"
+                if (
+                    not isinstance(f, dict)
+                    or "temperature" not in f
+                    or "face" not in f
+                ):
+                    raise ValueError(
+                        "each hot/cold face needs {'face': <query>, "
+                        f"'temperature': <°C>}}: {f!r}"
+                    )
+                _reject_ignored_fields(f, {"face", "temperature"}, where)
+                temp = _finite_float(f["temperature"], f"{where}.temperature")
+                fs = _faceset(f["face"])
+                if fs is None:
+                    raise ValueError(
+                        f"face query {f['face']!r} resolved to no faces — "
+                        "use query_geometry() to confirm."
+                    )
+                fs["temp_c"] = temp
+                fixtures.append(fs)
+                thermal_driving = thermal_driving or transient is None or abs(temp - t_init) > 0.0
+
+            load_specs = []
+            for i, ld in enumerate(loads):
+                where = f"loads[{i}]"
+                if not isinstance(ld, dict) or "face" not in ld:
+                    raise ValueError(
+                        f"each thermal load needs a 'face' query: {ld!r}"
+                    )
+                has_flux = "flux_w_m2" in ld
+                has_film = "h_w_m2k" in ld
+                if has_flux == has_film:
+                    raise ValueError(
+                        f"{where} needs exactly one of flux_w_m2 or h_w_m2k."
+                    )
+                fs = _faceset(ld["face"])
+                if fs is None:
+                    raise ValueError(
+                        f"load face query {ld['face']!r} resolved to no faces."
+                    )
+                if has_flux:
+                    _reject_ignored_fields(
+                        ld, {"face", "flux_w_m2", "schedule"}, where
+                    )
+                    flux = _finite_float(ld["flux_w_m2"], f"{where}.flux_w_m2")
+                    active = _validate_thermal_schedule(
+                        ld.get("schedule"), f"{where}.schedule"
+                    )
+                    spec = {"faces": fs, "type": "flux", "magnitude": flux}
+                    if "schedule" in ld and transient is None:
+                        raise ValueError("steady thermal loads cannot have a time schedule")
+                    if "schedule" in ld:
+                        spec["schedule"] = ld["schedule"]
+                    thermal_driving = thermal_driving or (
+                        active and abs(flux) > 0.0
+                    )
+                else:
+                    _reject_ignored_fields(
+                        ld, {"face", "h_w_m2k", "t_amb_c"}, where
+                    )
+                    htc = _finite_float(ld["h_w_m2k"], f"{where}.h_w_m2k")
+                    if htc <= 0.0:
+                        raise ValueError(f"{where}.h_w_m2k must be > 0.")
+                    ambient = _finite_float(
+                        ld.get("t_amb_c", 20.0), f"{where}.t_amb_c"
+                    )
+                    spec = {
+                        "faces": fs,
+                        "type": "convection",
+                        "h": htc,
+                        "t_amb_c": ambient,
+                    }
+                    thermal_driving = thermal_driving or transient is None or abs(ambient - t_init) > 0.0
+                load_specs.append(spec)
+
+            if transient is not None and not thermal_driving:
+                raise _StudyRefusal(
                     {
                         "ok": False,
-                        "error": run.get("stderr", "")[-400:]
-                        or run.get("error", "ccx thermal run failed"),
-                        "backend": run.get("backend"),
+                        "error": (
+                            "the transient study has no thermal input / non-zero excitation: every "
+                            "fixed temperature and convection ambient equals t_init_c, and every "
+                            "active heat flux is zero. The part would only echo its initial "
+                            "temperature. Supply a different face/ambient temperature or a "
+                            "non-zero scheduled flux."
+                        ),
                     }
                 )
-            mid_T = fa.parse_dat_nodal(
-                run["dat_path"], "NT", gen["mid_nodes"], component=1
-            )
-            if mid_T is None or not math.isfinite(mid_T):
+
+            step = _tmp(".step")
+            cb.call("doc_export_step", {"doc_id": d, "path": step})
+            _archive_existing_vtu(vtu_path, bc_notes)
+            study = {
+                "step_path": step,
+                "material": {**mat, "k_w_mk": k_cond},
+                "fixtures": fixtures,
+                "loads": load_specs,
+                "mesh_order": 2,
+                "fineness": mesh_fineness,
+            }
+            if transient is not None:
+                study["transient"] = {
+                    "t_end_s": t_end, "dt_s": dt, "t_init_c": t_init,
+                    "frame_times_s": frame_times, "capacitance": capacitance,
+                }
+            if vtu_path:
+                study["vtu_path"] = vtu_path
+            study.update(advisor)
+            res = cb.call("sim_run_thermal", {"study": study})
+            if not res.get("ok"):
                 return _dumps(
                     {
                         "ok": False,
                         "doc_id": d,
-                        "backend": run["backend"],
-                        "error": "CalculiX completed but no finite mid-plane "
-                        "temperature could be parsed; refusing a false-success "
-                        "null result.",
+                        "error": res.get("error", "thermal solve failed"),
                     }
                 )
+            if transient is None:
+                out = {
+                    "ok": True, "doc_id": d, "transient": False,
+                    "solver": "C++ core steady conduction",
+                    "material": mat.get("name", material),
+                    "conductivity_w_mk": k_cond,
+                    **{key: res[key] for key in (
+                        "summary", "temperature_max_c", "temperature_min_c",
+                        "flux_max_w_m2", "n_nodes", "n_elems")},
+                    "solver_notes": res.get("solver_notes", []),
+                    **_evidence_fields(res),
+                }
+                if isinstance(res.get("advisor"), dict):
+                    out["advisor"] = res["advisor"]
+                sid = _persist_study(d, {
+                    "type": "fea_thermal", "name": f"Thermal ({mat.get('name', material)})",
+                    "engine": "cpp", "material": mat, **advisor,
+                    **_evidence_fields(res), "results": res,
+                })
+                out["saved_to_study"] = bool(sid)
+                return _dumps(_interpreted(out, bc_notes))
+            try:
+                checked = _validate_transient_thermal_result(res, t_end)
+            except ValueError as exc:
+                return _dumps(
+                    {
+                        "ok": False,
+                        "doc_id": d,
+                        "error": f"thermal solver returned an incomplete/non-finite "
+                        f"or inconsistent result: {exc}",
+                    }
+                )
+            frames = checked["frames"]
+            frame_summ = checked["frame_summaries"]
+            summary = checked["summary"]
+            counts = checked["counts"]
             out = {
                 "ok": True,
                 "doc_id": d,
-                "backend": run["backend"],
-                "solver": "CalculiX *HEAT TRANSFER, STEADY STATE (box proxy)",
+                "transient": True,
+                "solver": "C++ core transient conduction (backward Euler, "
+                f"{capacitance} capacitance)",
+                "material": mat.get("name", material),
                 "conductivity_w_mk": k_cond,
-                "T_hot_c": T_hot,
-                "T_cold_c": T_cold,
-                "boundary_separation_mm": L,
-                "mid_plane_T_c": round(mid_T, 3),
-                "expected_mid_T_c": round(gen["expected_mid_T"], 3),
-                "note": "1-D box proxy runs between the selected face centroids; "
-                "ccx GPL-2.0 subprocess.",
+                "specific_heat_j_kgk": cp,
+                "summary": summary,
+                "n_steps": counts["n_steps"],
+                "n_nodes": counts["n_nodes"],
+                "n_elems": counts["n_elems"],
+                "frames": frame_summ,
+                "solver_notes": res.get("solver_notes", []),
+                "note": "summary.max_temp_c is the PEAK over the whole run "
+                "(max-temp envelope), at summary.max_temp_time_s; "
+                "per-frame nodal fields persisted in the doc study.",
+                **_evidence_fields(res),
             }
+            advisor_record = (
+                {"advisor": res["advisor"]}
+                if isinstance(res.get("advisor"), dict)
+                else {}
+            )
+            out.update(advisor_record)
             sid = _persist_study(
                 d,
                 {
-                    "type": "fea_thermal",
-                    "name": f"Thermal ({mat.get('name', material)})",
-                    "engine": "calculix",
-                    "results": out,
+                    "type": "fea_thermal_transient",
+                    "name": f"Transient thermal ({mat.get('name', material)})",
+                    "engine": "cpp",
+                    "material": {**mat, "k_w_mk": k_cond, "cp_j_kgk": cp},
+                    "transient": study["transient"],
+                    **advisor,
+                    **advisor_record,
+                    **_evidence_fields(res),
+                    "results": {
+                        "summary": summary,
+                        "frames": frames,
+                        "envelope_max": checked["envelope_max"],
+                    },
                 },
             )
             out["saved_to_study"] = bool(sid)
@@ -5721,233 +5608,71 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
 
     @mcp.tool()
     def run_fea_buckling(
-        fixtures: list,
+        fixtures: Union[list, str],
         load: Union[list, str],
         material: Union[str, dict] = "steel",
         n_modes: int = 4,
         doc_id: Optional[str] = None,
+        size_mm: float = 8.0,
+        vtu_path: Optional[str] = None,
+        max_load_factor: float = 1e4,
     ) -> str:
-        """Linear (eigenvalue) buckling via CalculiX (ccx subprocess) — critical load
-        factor for slender members / thin panels.
+        """Linear eigenvalue buckling on the real CAD mesh using the engine solver.
 
-        Returns the buckling load FACTORS λ (the applied load × λ = the critical load
-        Pcr). λ<1 means the part buckles BELOW the applied load — unsafe. Like the
-        thermal tool this solves a BOX PROXY sized to the part bounding box (a
-        fixed-free column under axial compression), an Euler-grade estimate honest for
-        column/strut-like parts.
+        fixtures : mounted face queries, with the same syntax as run_fea_static.
+        load : reference face forces in N or pressures in MPa, using the static
+               load dialect, including magnitude/direction and plural faces.
+        material : named material or explicit elastic material dict.
+        n_modes : number of positive buckling modes, lowest load factor first.
+        size_mm : target quadratic-tetrahedron size in mm (default 8).
+        vtu_path : optional absolute .vtu path containing normalized mode shapes.
+        max_load_factor : finite positive search ceiling (default 10000). A critical
+                          load above this multiple of the reference load is reported
+                          as no buckling mode below the specified ceiling.
 
-        fixtures : face(s) held fixed (the mounted/clamped end), e.g. ["bottom"].
-        load     : the compressive load as a single {face + force}, e.g.
-                   [{"face":"top","force":[0,0,-1000]}] — magnitude is what λ scales. The
-                   polar form [{"face":"top","magnitude":1000,"direction":[0,0,-1]}] is
-                   equivalent (direction is normalized before scaling).
-        n_modes  : number of buckling modes to return (lowest first).
-
-        CalculiX GPL-2.0 → subprocess-only. Absent ccx ⇒ {ok:false, skipped:true}.
+        Each modes entry has load_factor and directional participation {x,y,z}
+        (normalized squared shape components, not effective mass fractions).
+        critical_load_factor scales the reference load; critical_load_n reports
+        its critical magnitude.
+        A factor below one predicts instability below the applied reference load.
+        The engine refuses when no positive mode is below max_load_factor, including
+        non-compressive prestress. This is linear elastic buckling, not nonlinear collapse.
+        Read mesh_quality and provenance, and refine before relying on a margin.
         """
         try:
             n_modes = _positive_int(n_modes, "n_modes")
-            from . import fea_advanced as fa
-
-            if fa.ccx_path() is None:
-                return _dumps(fa._ccx_absent_result("linear buckling"))
-            d = _doc(doc_id)
-            fixtures = require_list(
-                fixtures, "fixtures", 'one fixed face query, e.g. ["bottom"]'
-            )
-            load = require_list(
-                load, "load", 'a single-item list [{"face": <query>, "force": [x,y,z]}]'
-            )
+            size_mm = _finite_float(size_mm, "size_mm")
+            if size_mm <= 0.0:
+                raise ValueError("size_mm must be > 0")
+            max_load_factor = _finite_float(max_load_factor, "max_load_factor")
+            if max_load_factor <= 0.0:
+                raise ValueError("max_load_factor must be > 0")
             bc_notes: list = []
-            fixtures = _norm_bc_list(
-                fixtures, "fixtures", unwrap_query=True, notes=bc_notes
+            ctx = _build_static_study(
+                fixtures, load, material, 0.5, False, 0, doc_id, bc_notes,
+                target_size_mm=size_mm, vtu_path=vtu_path,
+                material_analysis="buckling",
             )
-            load = _norm_bc_list(load, "load", notes=bc_notes)
-            if len(fixtures) != 1:
-                raise ValueError(
-                    "buckling box-proxy supports exactly one clamped-end face query; "
-                    f"got {len(fixtures)}. Multiple independent fixtures cannot be mapped "
-                    "onto its fixed-free column model."
-                )
-            if len(load) != 1 or not isinstance(load[0], dict):
-                raise ValueError(
-                    "load must be exactly one {'face': <query>, 'force': [x,y,z]} entry."
-                )
-            _reject_ignored_fields(load[0], {"face", "force"}, "load[0]")
-            if "face" not in load[0] or "force" not in load[0]:
-                raise ValueError(
-                    "load must contain both face and force; there is no safe default "
-                    "buckling excitation."
-                )
-            vec = _force_vector(load[0]["force"], "load[0]")
-            P = math.sqrt(sum(x * x for x in vec))
-            if P <= 0.0:
-                raise ValueError(
-                    "the buckling load is zero. λ scales the applied load, so every "
-                    "critical_loads_n value would be meaningless."
-                )
-            mat = _resolve_study_material(material, "buckling")
-            E = _finite_float(mat["E_mpa"], "material.E_mpa")
-            nu = _finite_float(mat["nu"], "material.nu")
-            fixture_set = _merge_face_sets(_sim_face_points(d, fixtures[0]))
-            load_set = _merge_face_sets(_sim_face_points(d, load[0]["face"]))
-            if not fixture_set["points"] or not load_set["points"]:
-                raise ValueError("fixture and load face queries must both resolve.")
-            fixed_points = {
-                tuple(float(c) for c in point)
-                for point in fixture_set["points"]
-                if isinstance(point, (list, tuple)) and len(point) == 3
-            }
-            loaded_points = {
-                tuple(float(c) for c in point)
-                for point in load_set["points"]
-                if isinstance(point, (list, tuple)) and len(point) == 3
-            }
-            if loaded_points and loaded_points.issubset(fixed_points):
-                raise ValueError(
-                    "buckling fixture and load resolve to the same constrained face; the "
-                    "real load would be absorbed as a support reaction, while the proxy "
-                    "incorrectly places it on the free end."
-                )
-            normal = load_set.get("face_normal")
-            fixture_normal = fixture_set.get("face_normal")
-            if not (
-                isinstance(normal, (list, tuple))
-                and len(normal) == 3
-                and isinstance(fixture_normal, (list, tuple))
-                and len(fixture_normal) == 3
-            ):
-                raise ValueError(
-                    "buckling needs planar fixture/load end faces with outward normals so the "
-                    "fixed-free proxy axis can be mapped without guessing."
-                )
-            unit_normal = _norm_direction(normal, "load[0].face_normal")
-            unit_fixture_normal = _norm_direction(
-                fixture_normal, "fixtures[0].face_normal"
+            _autosave_all_open()
+            out = cb.call(
+                "sim_run_buckling", {"study": ctx["study"], "n_modes": n_modes,
+                                     "max_load_factor": max_load_factor}
             )
-            face_opposition = sum(
-                a * b0 for a, b0 in zip(unit_normal, unit_fixture_normal)
-            )
-            if face_opposition > -0.99:
-                raise ValueError(
-                    "buckling fixture and load faces are not opposing parallel ends; the "
-                    f"normal dot product is {face_opposition:g}, but the box proxy requires "
-                    "approximately -1."
-                )
-            normal_component = sum(a * b0 for a, b0 in zip(vec, unit_normal))
-            if normal_component >= -1e-9 * max(1.0, P):
-                raise ValueError(
-                    "buckling requires a compressive force pointing into the selected load "
-                    f"face; force·outward_normal={normal_component:g} N is tensile/tangential."
-                )
-            tangential = math.sqrt(
-                max(0.0, P * P - normal_component * normal_component)
-            )
-            if tangential > 1e-6 * P:
-                raise ValueError(
-                    "buckling box-proxy supports a purely axial compressive load; the supplied "
-                    f"force has {tangential:g} N tangential to the selected end face. Split "
-                    "shear/bending into a different analysis instead of silently mapping the "
-                    "full vector to axial compression."
-                )
-            P = -normal_component
-
-            def _centroid(points, label):
-                return [
-                    sum(_finite_float(point[axis], label) for point in points)
-                    / len(points)
-                    for axis in range(3)
-                ]
-
-            fixture_c = _centroid(fixture_set["points"], "fixture face point")
-            load_c = _centroid(load_set["points"], "load face point")
-            delta = [load_c[axis] - fixture_c[axis] for axis in range(3)]
-            L = math.sqrt(sum(value * value for value in delta))
-            if not math.isfinite(L) or L <= 1e-9:
-                raise ValueError(
-                    "buckling fixture/load face centroids coincide; no column length can be "
-                    "mapped to the fixed-free proxy."
-                )
-            axis_unit = [value / L for value in delta]
-            end_alignment = sum(a * b0 for a, b0 in zip(axis_unit, unit_normal))
-            if end_alignment < 0.99:
-                raise ValueError(
-                    "buckling fixture/load faces do not define a column axis aligned with the "
-                    f"load-face normal (alignment={end_alignment:g}); the box proxy cannot "
-                    "map those selections honestly."
-                )
-            dominant_axis = max(range(3), key=lambda axis: abs(axis_unit[axis]))
-            if abs(axis_unit[dominant_axis]) < 0.99:
-                raise ValueError(
-                    "buckling box-proxy only supports a world-axis-aligned column; the selected "
-                    "end faces are rotated, so world bounding-box transverse dimensions would "
-                    "overstate the section."
-                )
-            spans = _part_bbox_world_spans(d)
-            transverse = [spans[axis] for axis in range(3) if axis != dominant_axis]
-            b, h = transverse
-            gen = fa.build_buckling_column_inp(L, b, h, E, nu, P, nz=4, n_modes=n_modes)
-            run = fa.run_ccx(gen["inp"], job="buckle", timeout=fa.HARNESS_CCX_TIMEOUT_S)
-            if run.get("skipped"):
-                return _dumps(run)
-            if not run.get("ok") or not run.get("dat_path"):
-                return _dumps(
+            out["doc_id"] = ctx["doc"]
+            if out.get("ok"):
+                sid = _persist_study(
+                    ctx["doc"],
                     {
-                        "ok": False,
-                        "error": run.get("stderr", "")[-400:]
-                        or run.get("error", "ccx buckling run failed"),
-                        "backend": run.get("backend"),
-                    }
+                        "type": "fea_buckling",
+                        "name": f"Buckling ({ctx['material'].get('name', material)})",
+                        "engine": "engine",
+                        "results": out,
+                    },
                 )
-            factors = fa.parse_buckle_factors(run["dat_path"])
-            if len(factors) < n_modes or any(
-                not math.isfinite(f) or f <= 0.0 for f in factors[:n_modes]
-            ):
-                return _dumps(
-                    {
-                        "ok": False,
-                        "doc_id": d,
-                        "backend": run["backend"],
-                        "error": f"CalculiX returned {len(factors)} usable buckling factors; "
-                        f"{n_modes} finite positive modes were requested. Refusing a "
-                        "partial/degenerate mode list.",
-                    }
-                )
-            factors = factors[:n_modes]
-            crit = [round(f * P, 3) for f in factors]
-            out = {
-                "ok": True,
-                "doc_id": d,
-                "backend": run["backend"],
-                "solver": "CalculiX *BUCKLE (box proxy, fixed-free column)",
-                "applied_load_n": P,
-                "load_factors": [round(f, 4) for f in factors],
-                "critical_loads_n": crit,
-                "euler_reference_pcr_n": round(gen["expected_Pcr"], 3),
-                "input_mapping": {
-                    "fixture_face": fixtures[0],
-                    "load_face": load[0]["face"],
-                    "force_dot_outward_normal_n": normal_component,
-                    "proxy_length_mm": L,
-                    "proxy_cross_section_mm": [b, h],
-                    "world_axis": ("x", "y", "z")[dominant_axis],
-                    "end_face_normal_alignment": end_alignment,
-                },
-                "note": "box-proxy Euler buckling estimate after validating a real "
-                "clamped face and inward compressive load face; ccx GPL-2.0 "
-                "subprocess. load_factor<1 ⇒ buckles below the applied load.",
-            }
-            sid = _persist_study(
-                d,
-                {
-                    "type": "fea_buckling",
-                    "name": f"Buckling ({mat.get('name', material)})",
-                    "engine": "calculix",
-                    "results": out,
-                },
-            )
-            out["saved_to_study"] = bool(sid)
+                out["saved_to_study"] = bool(sid)
             return _dumps(_interpreted(out, bc_notes))
+        except _StudyRefusal as e:
+            return _dumps(e.payload)
         except CoreError as e:
             return _err(e)
         except Exception as e:  # noqa: BLE001

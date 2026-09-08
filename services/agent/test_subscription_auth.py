@@ -557,14 +557,14 @@ def test_xai_default_model_is_grok_45():
 
 def test_parse_xai_tier_and_provider_resolution(tmp_config, monkeypatch):
     """xai:<model> gym tiers prefer subscription when connected, else API key."""
-    from services.agent.tiers import parse_xai_tier, effort_tier_for, provider_for_tier
+    from services.agent.tiers import parse_xai_tier, profile_tier_for, provider_for_tier
     from services.agent import config as agent_config
 
     assert parse_xai_tier("xai:grok-4.5") == "grok-4.5"
     assert parse_xai_tier("xai:grok-4-5") == "grok-4-5"
     assert parse_xai_tier("xai:") is None
     assert parse_xai_tier("openrouter:x") is None
-    assert effort_tier_for("xai:grok-4.5") == "frontier"
+    assert profile_tier_for("xai:grok-4.5") == "frontier"
 
     monkeypatch.delenv("CHUDWARE_PROVIDER", raising=False)
 

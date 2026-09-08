@@ -636,17 +636,19 @@ def _thermal_bc_issues(study: dict) -> list[dict]:
                 ),
             })
     else:
-        public_shape = "hot_faces" in study or "cold_faces" in study
-        invalid_public_pair = public_shape and (
-            len(hot_faces) != 1 or len(cold_faces) != 1
-        )
-        if invalid_public_pair or len(set(fixed_temps)) < 2 or loads:
+        ambients = [
+            _finite_float(load.get("t_amb_c", 20.0))
+            for load in loads if isinstance(load, dict) and _finite_float(
+                load.get("h") if load.get("h") is not None else load.get("h_w_m2k"),
+                positive=True) is not None
+        ]
+        temperatures = set(fixed_temps + [t for t in ambients if t is not None])
+        if (not fixed_temps and not ambients) or (not has_flux and len(temperatures) < 2):
             issues.append({
                 "kind": "thermal_steady_bcs",
                 "detail": (
-                    "Steady run_fea_thermal is a 1-D CalculiX box proxy and requires exactly "
-                    "one hot_faces entry and one cold_faces entry with distinct temperatures. "
-                    "It rejects flux/convection loads; use the transient real-mesh path."
+                    "Steady thermal needs a fixed-temperature or convection datum and "
+                    "non-zero excitation: distinct boundary temperatures or a heat flux."
                 ),
             })
     return issues
@@ -659,12 +661,12 @@ def _thermal_bc_fix(kind: str) -> dict:
             "action": "add_thermal_dirichlet_pair",
             "params": {
                 "hint": (
-                    "Pass exactly one hot_faces and one cold_faces entry as "
-                    "{'face': <query>, 'temperature': <°C>} with distinct temperatures; "
-                    "do not pass loads to the steady proxy."
+                    "Pass fixed-temperature faces as {'face': <query>, 'temperature': <°C>}, "
+                    "or convection h_w_m2k/t_amb_c loads to anchor the datum. "
+                    "Supply distinct boundary temperatures or a non-zero flux_w_m2."
                 )
             },
-            "basis": "The steady public tool is a hot-end/cold-end 1-D box-proxy solve.",
+            "basis": "Steady conduction requires a temperature datum and thermal excitation.",
             "predicted_effect": "A finite steady temperature gradient is defined.",
             "confidence": "heuristic",
         }
@@ -808,24 +810,6 @@ def _surface_issues(study: dict) -> list[dict]:
                 "tool": kind,
             })
     thermal = "thermal" in kind
-    if "buckling" in kind:
-        raw_buckling_loads = study.get("load")
-        if raw_buckling_loads is None:
-            raw_buckling_loads = study.get("loads")
-        buckling_loads = (
-            raw_buckling_loads
-            if isinstance(raw_buckling_loads, list)
-            else ([raw_buckling_loads] if raw_buckling_loads else [])
-        )
-        if _single_force_vector_n(buckling_loads) is None:
-            issues.append({
-                "kind": "invalid_buckling_load",
-                "detail": (
-                    "run_fea_buckling needs exactly one inward axial force in N on one load "
-                    "face; pressure, multiple loads, shear, and tension cannot map to its proxy."
-                ),
-                "tool": "run_fea_buckling",
-            })
     if "contact" in kind and _finite_float(
         study.get("max_gap_mm", 0.5), positive=True
     ) is None:
@@ -1084,12 +1068,20 @@ PRECHECK_BLOCK_ENABLED: bool = (
 def precheck(study: dict, doc_geom: Optional[dict] = None) -> list[dict]:
     """Pre-dispatch setup checks over the normalized arguments of current sim tools.
 
-    Static/fatigue require a mounted face and non-zero force/pressure; buckling requires
-    one mount and one axial force. Modal deliberately permits ``fixtures=[]`` for a
-    free-free solve. Steady and transient thermal paths are linted separately because
+    Static/fatigue/buckling require mounted faces and non-zero force/pressure.
+    Modal deliberately permits ``fixtures=[]`` for a free-free solve.
+    Steady and transient thermal paths are linted separately because
     their boundary requirements differ. ``backend_available``/``capabilities`` are
     optional inputs from a real capability probe; absence is unknown, never available.
     """
+    from services.agent.preferences import resolve_turn_preferences
+
+    # Auto's setup floor comes from the same resolver as model/tool selection.
+    # An explicit environment setting retains the diagnostic escape hatch.
+    block_enabled = (
+        PRECHECK_BLOCK_ENABLED if "CHUDWARE_SIM_PRECHECK_BLOCK" in os.environ
+        else resolve_turn_preferences("", task_kind="analysis").sim_precheck_block
+    )
     items: list[dict] = []
     kind = _study_kind(study)
     thermal = _is_thermal(study)
@@ -1098,7 +1090,7 @@ def precheck(study: dict, doc_geom: Optional[dict] = None) -> list[dict]:
     if thermal:
         for issue in _thermal_bc_issues(study):
             issue_kind = issue["kind"]
-            is_blocker = PRECHECK_BLOCK_ENABLED
+            is_blocker = block_enabled
             items.append({
                 "schema": "aicad.advisory/1",
                 "check": "sim_bc",
@@ -1116,7 +1108,7 @@ def precheck(study: dict, doc_geom: Optional[dict] = None) -> list[dict]:
             diagnostic = issue_kind == "zero_load_diagnostic"
             is_blocker = (
                 issue_kind in ("no_fixture", "no_load", "dangling_ref")
-                and PRECHECK_BLOCK_ENABLED
+                and block_enabled
             )
             items.append({
                 "schema": "aicad.advisory/1",
@@ -1135,7 +1127,7 @@ def precheck(study: dict, doc_geom: Optional[dict] = None) -> list[dict]:
             "schema": "aicad.advisory/1",
             "check": "sim_bc",
             "severity": (
-                "blocker" if issue.get("blocker", True) and PRECHECK_BLOCK_ENABLED else "action"
+                "blocker" if issue.get("blocker", True) and block_enabled else "action"
             ),
             "finding": issue["detail"],
             "refs": {},
@@ -1151,7 +1143,7 @@ def precheck(study: dict, doc_geom: Optional[dict] = None) -> list[dict]:
         items.append({
             "schema": "aicad.advisory/1",
             "check": "sim_bc",
-            "severity": "blocker" if PRECHECK_BLOCK_ENABLED else "action",
+            "severity": "blocker" if block_enabled else "action",
             "finding": backend_issue["detail"],
             "refs": {},
             "numbers": {},

@@ -18,6 +18,72 @@ import yaml
 from services.agent import role_models as rm
 
 
+@pytest.mark.parametrize("signal,prompt,inputs,expected", [
+    ("chat", "What is a fillet?", {}, ("local", "low")),
+    ("modelling", "Create a bracket", {}, ("mid", "medium")),
+    ("analysis", "Analyse thermal stress", {}, ("strongest", "high")),
+    ("mission", "Build two parts", {"feature_count": 5}, ("strong", "high")),
+    ("document_size", "Create a bracket", {"feature_count": 41, "context_tokens": 500, "context_window": 1000}, ("strong", "medium")),
+    ("availability", "What is a fillet?", {}, ("served", "low")),
+    ("local_only", "Analyse thermal stress", {}, None),
+])
+def test_auto_rules_table(monkeypatch, signal, prompt, inputs, expected):
+    from services.agent.preferences import resolve_turn_preferences
+    from services.agent.copilot_mode_tools import apply_mode_tools
+
+    monkeypatch.setattr("services.agent.model_manager.classify_bundled_task", lambda *a, **k: None)
+    cfg = {"copilot": {"work_style": "do_it"}}
+    candidates = [
+        {"provider": "llamacpp", "model": "local"},
+        {"provider": "vllm", "model": "served"},
+        {"provider": "anthropic-sub", "model": "mid"},
+        {"provider": "codex-sub", "model": "strong"},
+        {"provider": "anthropic", "model": "strongest"},
+    ]
+    ranks = {model: rm.ModelRank(model_id=model, rank=rank, source="user")
+             for model, rank in (("local", 1), ("served", 1), ("mid", 3), ("strong", 4), ("strongest", 5))}
+    if signal == "availability":
+        candidates[0]["authenticated"] = False
+    if signal == "local_only":
+        cfg["copilot"]["location"] = "this_computer_only"
+        candidates = candidates[2:]
+    policy = resolve_turn_preferences(prompt, cfg=cfg, **inputs)
+    if expected is None:
+        with pytest.raises(rm.RoleModelError, match="local model"):
+            rm.resolve_role_model("chat", cfg, request=prompt, turn_preferences=policy,
+                                  enabled=candidates, rankings=ranks)
+        return
+    assignment = rm.resolve_role_model("chat", cfg, request=prompt, turn_preferences=policy,
+                                      enabled=candidates, rankings=ranks)
+    assert (assignment.model, policy.thinking) == expected
+    tools = apply_mode_tools(None, ["describe_part", "new_part", "add_features", "delegate",
+                                   "mission_start", "advise", "task_list"], preferences=policy)
+    if signal == "chat":
+        assert "describe_part" in tools
+        assert not {"new_part", "add_features", "delegate", "mission_start", "advise"} & set(tools)
+    if signal == "modelling":
+        assert "add_features" in tools and "delegate" not in tools and policy.verify_battery
+        for priority, model, thinking in (
+            ("best_results", "strongest", "high"),
+            ("fastest", "mid", "low"),
+            ("lowest_cost", "mid", "low"),
+        ):
+            preferred = {**cfg, "copilot": {**cfg["copilot"], "priority": priority}}
+            chosen_policy = resolve_turn_preferences(prompt, cfg=preferred)
+            chosen = rm.resolve_role_model("chat", preferred, request=prompt,
+                turn_preferences=chosen_policy, enabled=candidates, rankings=ranks)
+            assert (chosen.model, chosen_policy.thinking) == (model, thinking)
+    if signal == "analysis":
+        assert policy.sim_precheck_block
+    if signal == "mission":
+        assert policy.delegation_depth == 2 and policy.task_list and policy.council
+        leaf = rm.resolve_role_model("worker", cfg, request=prompt, turn_preferences=policy,
+                                    enabled=candidates, rankings=ranks)
+        assert leaf.model == "local"
+    if signal == "document_size":
+        assert policy.schedule_compaction and policy.trim_tool_schemas
+
+
 _SHIPPED = Path(__file__).resolve().parent / "model_rankings.yaml"
 
 

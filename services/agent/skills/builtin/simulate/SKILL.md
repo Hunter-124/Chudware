@@ -98,10 +98,10 @@ closes a requirement:
   should show six near-zero rigid modes. Frequency response uses `excitation_dir`,
   `base_accel_g`, damping `zeta`, and optional PSD in g²/Hz; it returns acceleration
   amplification, not stress or displacement.
-- **Thermal:** steady `run_fea_thermal` is a CalculiX 1-D box proxy requiring
-  exactly one `hot_faces` and one `cold_faces` entry with distinct `temperature`
-  values in °C; it rejects loads. `transient={t_end_s,...}` uses the real mesh and
-  accepts `flux_w_m2` or `h_w_m2k`/`t_amb_c`; flux-only transient heat-up is valid.
+- **Thermal:** steady and transient `run_fea_thermal` use the real part mesh,
+  with `hot_faces`/`cold_faces` temperature entries in °C and `flux_w_m2` or
+  `h_w_m2k`/`t_amb_c` loads. Steady needs a fixed-temperature or convection
+  datum. Schedules require `transient={t_end_s,...}`; flux-only heat-up is valid.
   State k W/(m·K), cp J/(kg·K), and time seconds.
 - **CFD:** `run_cfd_flow` is directional LBM; require `converged=true` and
   `min_feature_voxels>=~8`, then refine `cells`. Absolute Cd/Cl needs

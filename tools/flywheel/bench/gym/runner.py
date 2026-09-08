@@ -237,7 +237,7 @@ def _capable_interpreter() -> str | None:
 def ensure_capable_interpreter(module: str) -> None:
     """Re-exec the gym into an interpreter that has the DAG deps — once.
 
-    *module* is the dotted entrypoint module (e.g. "tools.flywheel.bench.gym.tuning")
+    *module* is the dotted entrypoint module (e.g. "tools.flywheel.bench.gym.runner")
     so the re-exec preserves the ``-m`` package invocation (and thus the repo-root
     sys.path[0] the original launch relied on).
 
@@ -639,19 +639,12 @@ def run_cell(
         "pipeline", title=f"Gym {challenge.id}", summary=challenge.request[:400]
     )
 
-    # T-W28: the gym reads the SAME effort resolution path as the mission
-    # pipeline and the settings GUI (tiers.resolve_effort → presets + user
-    # overrides), and snapshots it into the cell ledger like a real mission.
-    from services.agent.tiers import resolve_effort, effort_tier_for
-    from services.agent.effort import record_effort_snapshot
+    from dataclasses import asdict
+    from services.agent.effort import TurnInputs
 
-    # openrouter:<model-id> / xai:<model-id> reuse frontier; ollama:<model> reuses
-    # the local-24k budget profile (small local context class).
-    et = effort_tier_for(tier) or tier
-    if _parse_ollama_tier(tier) is not None:
-        et = "local-24k"
-    effort_profile = resolve_effort(et)
-    record_effort_snapshot(ledger, active_tier=effort_profile.tier)
+    turn_preferences = TurnInputs(challenge.request).resolve()
+    preference_snapshot = asdict(turn_preferences)
+    ledger.append("harness", "preferences", preference_snapshot)
 
     if real_mode:
         # REAL: run the full pipeline, then FOLD the mission's own ledger (written at
@@ -686,7 +679,7 @@ def run_cell(
         "seed": seed,
         "tier": tier,
         "division": division,
-        "effort": effort_profile.to_payload(),
+        "preferences": preference_snapshot,
         "tools_offered": tools_offered,
     }
     graded = challenge.grade(ledger_doc, ctx)

@@ -8,12 +8,10 @@ module functions.
 
 Endpoints:
   sim_caps            capability doctor for the Simulate tab's honest gating: CalculiX
-                      presence (buckling/contact), vibration post-processing (numpy),
+                      presence (contact proxy), vibration post-processing (numpy),
                       and which cross-sim handoff endpoints are actually servable —
                       including a forward probe for the T-FIN17 heatsink picker so the
                       GUI button lights up the moment that tool lands.
-  sim_run_buckling    CalculiX linear (eigenvalue) buckling — box-proxy column, the
-                      exact pipeline of the run_fea_buckling MCP tool.
   sim_run_contact     CalculiX nonlinear contact two-block proxy (run_fea_contact).
   sim_freq_response   modal-superposition harmonic + Miles random post-processing over
                       a C++ core sim_run_modal result (run_fea_frequency_response's
@@ -127,7 +125,7 @@ def _sim_caps(params: dict) -> dict:
         ccx = fa.ccx_path()
         caps["ccx"] = {"found": bool(ccx), "path": ccx or "",
                        "hint": "" if ccx else
-                       "CalculiX (ccx) not on PATH — buckling/contact studies need it. "
+                       "CalculiX (ccx) not on PATH — the legacy contact proxy needs it. "
                        "Install ccx or set CHUDWARE_CCX."}
     except Exception as e:  # noqa: BLE001
         caps["ccx"] = {"found": False, "path": "", "hint": f"fea_advanced unavailable: {e}"}
@@ -167,54 +165,6 @@ def _sim_caps(params: dict) -> dict:
 
 
 # --------------------------------------------------------------------------- ccx proxies
-
-def _sim_run_buckling(params: dict) -> dict:
-    """Run the CalculiX box-proxy buckling study with validated physical inputs."""
-    try:
-        length = _finite_param(params, "L_mm", 100.0, positive=True)
-        width = _finite_param(params, "b_mm", 20.0, positive=True)
-        height = _finite_param(params, "h_mm", 20.0, positive=True)
-        modulus = _finite_param(params, "E_mpa", 200000.0, positive=True)
-        poisson = _finite_param(params, "nu", 0.3)
-        load = abs(_finite_param(params, "load_n", 1000.0))
-        n_modes = _positive_int_param(params, "n_modes", 4)
-    except (TypeError, ValueError, OverflowError) as exc:
-        return {"ok": False, "error": f"invalid buckling setup: {exc}"}
-    if not -1.0 < poisson < 0.5:
-        return {"ok": False, "error": "invalid buckling setup: nu must be between -1 and 0.5"}
-    if load == 0.0:
-        return {"ok": False, "error": "invalid buckling setup: load_n must be non-zero"}
-
-    from services.mcp import fea_advanced as fa
-    if fa.ccx_path() is None:
-        return fa._ccx_absent_result("linear buckling")  # noqa: SLF001
-    generated = fa.build_buckling_column_inp(
-        length, width, height, modulus, poisson, load, nz=4)
-    run = fa.run_ccx(generated["inp"], job="buckle")
-    if run.get("skipped"):
-        return run
-    if not run.get("ok") or not run.get("dat_path"):
-        return {"ok": False, "error": run.get("stderr", "")[-400:]
-                or run.get("error", "ccx buckling run failed"),
-                "backend": run.get("backend")}
-    factors = fa.parse_buckle_factors(run["dat_path"])[:n_modes]
-    if (not factors or any(not math.isfinite(float(f)) or float(f) <= 0.0
-                           for f in factors)):
-        return {"ok": False, "error": "CalculiX returned no finite positive buckling factors",
-                "backend": run.get("backend")}
-    expected = float(generated["expected_Pcr"])
-    if not math.isfinite(expected) or expected <= 0.0:
-        return {"ok": False, "error": "buckling reference calculation was non-finite",
-                "backend": run.get("backend")}
-    return {"ok": True, "backend": run["backend"],
-            "solver": "CalculiX *BUCKLE (box proxy, fixed-free column)",
-            "applied_load_n": load,
-            "load_factors": [round(float(f), 4) for f in factors],
-            "critical_loads_n": [round(float(f) * load, 3) for f in factors],
-            "euler_reference_pcr_n": round(expected, 3),
-            "note": "box-proxy Euler buckling estimate sized to the part bounding box; "
-                    "ccx GPL-2.0 subprocess. load_factor<1 = buckles below the applied load."}
-
 
 def _sim_run_contact(params: dict) -> dict:
     """Run the CalculiX two-block contact proxy and require force balance."""
@@ -406,7 +356,6 @@ def _piping_verify_cfd(params: dict) -> dict:
 
 WORKER_METHODS: dict[str, Callable] = {
     "sim_caps": _wrap(_sim_caps),
-    "sim_run_buckling": _wrap(_sim_run_buckling),
     "sim_run_contact": _wrap(_sim_run_contact),
     "sim_freq_response": _wrap(_sim_freq_response),
     "ecad_thermal_handoff": _wrap(_ecad_thermal_handoff),

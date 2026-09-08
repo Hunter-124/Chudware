@@ -10,7 +10,6 @@ Coverage:
   * Overflow policy: shrink history first, then state; never system/advisory.
   * Tier detect: context_length → tier name; env override wins.
   * Grammar flag routing: gbnf tiers produce a grammar string; others produce None.
-  * Deliberation dial: local = full, mid = standard, frontier = minimal (INVERTED).
   * Tool schema trim: description shortened to first sentence for local tiers.
   * Loader: all 4 profiles load without error; bad yaml raises TierError.
 """
@@ -69,7 +68,6 @@ def _make_profile(
     structured_output: str = "gbnf",
     playbook_enforcement: str = "step_locked",
     advisory_verbosity: str = "full",
-    deliberation: str = "full",
     tool_schema_trim: bool = True,
 ) -> TierProfile:
     """Build a TierProfile directly for unit tests that don't need YAML I/O."""
@@ -86,7 +84,6 @@ def _make_profile(
         structured_output=structured_output,
         advisory_verbosity=advisory_verbosity,
         max_tools_per_role=14,
-        deliberation=deliberation,
         tool_schema_trim=tool_schema_trim,
     )
 
@@ -127,7 +124,6 @@ class TestLoader:
             "    structured_output: free\n"
             "    advisory_verbosity: full\n"
             "    max_tools_per_role: 14\n"
-            "    deliberation: full\n"
             "    tool_schema_trim: false\n"
         )
         with pytest.raises(TierError, match="budgets missing"):
@@ -153,7 +149,6 @@ class TestLoader:
             "    structured_output: free\n"
             "    advisory_verbosity: full\n"
             "    max_tools_per_role: 14\n"
-            "    deliberation: minimal\n"
             "    tool_schema_trim: false\n"
         )
         with pytest.raises(TierError, match="overflow"):
@@ -190,30 +185,6 @@ class TestBudgetMath:
         for name, p in _all_profiles().items():
             for slot_name, tokens in p.budgets:
                 assert tokens > 0, f"{name}.{slot_name} must be > 0"
-
-
-# ---------------------------------------------------------------------------
-# Deliberation dial tests
-
-class TestDeliberationDial:
-    """INVERTED dial: local = full, mid = standard, frontier = minimal."""
-
-    def test_local_24k_deliberation_full(self):
-        assert load_tier("local-24k", path=_TIERS_YAML).deliberation == "full"
-
-    def test_local_48k_deliberation_full(self):
-        assert load_tier("local-48k", path=_TIERS_YAML).deliberation == "full"
-
-    def test_mid_deliberation_standard(self):
-        assert load_tier("mid", path=_TIERS_YAML).deliberation == "standard"
-
-    def test_frontier_deliberation_minimal(self):
-        assert load_tier("frontier", path=_TIERS_YAML).deliberation == "minimal"
-
-    def test_deliberation_values_valid(self):
-        valid = {"full", "standard", "minimal"}
-        for name, p in _all_profiles().items():
-            assert p.deliberation in valid, f"{name}.deliberation={p.deliberation!r}"
 
 
 # ---------------------------------------------------------------------------
@@ -490,7 +461,6 @@ class TestTurnAssembler:
             structured_output="gbnf",
             advisory_verbosity="full",
             max_tools_per_role=14,
-            deliberation="full",
             tool_schema_trim=True,
         )
 
@@ -627,7 +597,6 @@ class TestTurnAssembler:
             structured_output="free",
             advisory_verbosity="full",
             max_tools_per_role=14,
-            deliberation="minimal",
             tool_schema_trim=False,
         )
         assembler = TurnAssembler(profile)

@@ -179,4 +179,15 @@ nlohmann::json fea_run_modal(const nlohmann::json& study, int n_modes);
 // Never throws: a bad mesh / singular model returns {ok:false, error}.
 nlohmann::json fea_run_thermal(const nlohmann::json& study);
 
+// Combined linear buckling on the static study's real mesh, elastic material,
+// fixtures and reference force/pressure loads. STEP defaults to tet10.
+// Returns modes[{load_factor,participation:{x,y,z}}], critical_load_factor,
+// critical_load_n (= factor * magnitude of the reference applied resultant),
+// full max-component-normalized mode_shapes, mesh_quality and engine provenance.
+// Participation is the axis share of squared nodal shape, not effective mass.
+// study.vtu_path writes mode_1, mode_2, ... 3-vector point fields.
+// No compressive reference stress/positive buckling factor -> {ok:false,error,reason}.
+nlohmann::json fea_run_buckling(const nlohmann::json& study, int n_modes = 4,
+                               double max_load_factor = 1e4);
+
 }  // namespace chudware::sim

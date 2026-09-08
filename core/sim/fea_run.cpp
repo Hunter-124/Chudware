@@ -56,6 +56,7 @@
 #include <gp_Pnt.hxx>
 
 #include "sim/fea_contact.h"
+#include "sim/fea_buckling.h"
 #include "sim/fea_modal.h"
 #include "sim/fea_selection.h"
 #include "sim/fea_static.h"
@@ -1998,6 +1999,241 @@ std::vector<int> boundary_faceset_membership(
     return ids;
 }
 
+namespace {
+
+// Shared mechanical study gates and load deposition: static and buckling must
+// use the same exterior faces, tet10 work-equivalent weights and pressure sign.
+json validate_mechanical_boundary_conditions(const json& study) {
+    if (!study.contains("fixtures") || !study["fixtures"].is_array() ||
+        study["fixtures"].empty())
+        return json{{"ok", false},
+                    {"error", "fea_static: at least one fixture is required"}};
+    for (size_t i = 0; i < study["fixtures"].size(); ++i) {
+        const auto& fixture = study["fixtures"][i];
+        if (!fixture.is_object())
+            return json{{"ok", false},
+                        {"error", "fea_static: fixture " + std::to_string(i) +
+                                      " must be an object"}};
+        std::string faceset_error;
+        if (!validate_faceset_input(fixture, faceset_error))
+            return json{{"ok", false},
+                        {"error", "fea_static: fixture " + std::to_string(i) +
+                                      ": " + faceset_error}};
+        if (fixture.contains("tol_mm") && !fixture["tol_mm"].is_number())
+            return json{{"ok", false},
+                        {"error", "fea_static: fixture " + std::to_string(i) +
+                                      " has non-numeric tol_mm"}};
+        const double tol = fixture.value("tol_mm", 1.0);
+        if (!std::isfinite(tol) || !(tol > 0.0))
+            return json{{"ok", false},
+                        {"error", "fea_static: fixture " + std::to_string(i) +
+                                      " has invalid tol_mm"}};
+    }
+    if (!study.contains("loads") || !study["loads"].is_array() ||
+        study["loads"].empty())
+        return json{{"ok", false},
+                    {"error", "fea_static: at least one non-zero load is required"}};
+    bool have_nonzero_load = false;
+    for (size_t i = 0; i < study["loads"].size(); ++i) {
+        const auto& load = study["loads"][i];
+        if (!load.is_object() || !load.contains("faces") ||
+            !load["faces"].is_object())
+            return json{{"ok", false},
+                        {"error", "fea_static: load " + std::to_string(i) +
+                                      " requires a faces object"}};
+        if (load["faces"].contains("tol_mm") &&
+            !load["faces"]["tol_mm"].is_number())
+            return json{{"ok", false},
+                        {"error", "fea_static: load " + std::to_string(i) +
+                                      " has non-numeric tol_mm"}};
+        const double tol = load["faces"].value("tol_mm", 1.0);
+        std::string faceset_error;
+        if (!validate_faceset_input(load["faces"], faceset_error))
+            return json{{"ok", false},
+                        {"error", "fea_static: load " + std::to_string(i) +
+                                      ": " + faceset_error}};
+        if (!std::isfinite(tol) || !(tol > 0.0))
+            return json{{"ok", false},
+                        {"error", "fea_static: load " + std::to_string(i) +
+                                      " has invalid tol_mm"}};
+        if (!load.contains("type") || !load["type"].is_string())
+            return json{{"ok", false},
+                        {"error", "fea_static: load " + std::to_string(i) +
+                                      " requires a string type"}};
+        const std::string type = load.value("type", std::string());
+        if (type == "force") {
+            if (!load.contains("vector") || !finite3(load["vector"]))
+                return json{{"ok", false},
+                            {"error", "fea_static: force load " + std::to_string(i) +
+                                          " requires a finite 3-vector"}};
+            have_nonzero_load = have_nonzero_load || nonzero3(load["vector"]);
+        } else if (type == "pressure") {
+            if (!load.contains("magnitude") || !load["magnitude"].is_number()) {
+                return json{{"ok", false},
+                            {"error", "fea_static: pressure load " + std::to_string(i) +
+                                          " requires a finite magnitude"}};
+            }
+            const double magnitude = load["magnitude"].get<double>();
+            if (!std::isfinite(magnitude))
+                return json{{"ok", false},
+                            {"error", "fea_static: pressure load " + std::to_string(i) +
+                                          " requires a finite magnitude"}};
+            have_nonzero_load = have_nonzero_load || magnitude != 0.0;
+        } else {
+            return json{{"ok", false},
+                        {"error", "fea_static: unsupported load type '" + type + "'"}};
+        }
+    }
+    if (!have_nonzero_load)
+        return json{{"ok", false},
+                    {"error", "fea_static: at least one non-zero load is required"}};
+    return nullptr;
+}
+
+json resolve_mechanical_loads(
+    const json& study, const std::vector<double>& points,
+    const std::vector<int>& tets, int nodes_per_elem,
+    std::vector<double>& nodal_forces, std::vector<std::string>& notes,
+    std::vector<std::pair<std::string, std::vector<int>>>* load_selections = nullptr) {
+    const int n_nodes = static_cast<int>(points.size() / 3);
+    const int n_dof = n_nodes * 3;
+    nodal_forces.assign(static_cast<size_t>(n_dof), 0.0);
+    std::size_t loads_seen = 0;
+    if (study.contains("loads") && study["loads"].is_array()) {
+        for (const auto& load : study["loads"]) {
+            const std::size_t load_ordinal = loads_seen++;
+            const json faces = load.contains("faces") ? load["faces"] : json::object();
+            const double tol = faces.value("tol_mm", 1.0);
+            const std::string type = load.value("type", std::string());
+            // A load that deposits nothing is a no-op, so it is decided BEFORE the
+            // selection is judged: refusing a whole study over a ZERO load's
+            // unresolvable faceset reports a fault where there is no load. Upstream
+            // validation already guarantees `vector`/`magnitude` exist and are finite
+            // here, and `have_nonzero_load` guarantees the study carries a real load.
+            // (Witness: a consistent-pressure oracle sums the traction over every
+            // element face and relies on interior faces cancelling identically —
+            // Zienkiewicz & Taylor §2 — so a coarse bore mesh yields a handful of
+            // O(1e-15) forces sitting on INTERIOR mid-side nodes, which
+            // boundary_faceset_membership correctly resolves to nothing. Ordering the
+            // refusal first killed the whole Lamé study over 32 numerically-zero
+            // loads out of 1208.)
+            if ((type == "force" && !nonzero3(load["vector"])) ||
+                (type == "pressure" && load["magnitude"].get<double>() == 0.0))
+                continue;
+            std::vector<int> node_ids =
+                boundary_faceset_membership(faces, points, tets, nodes_per_elem);
+            if (node_ids.empty())
+                return json{{"ok", false},
+                            {"error", "fea_static: load faces resolved to 0 mesh nodes "
+                                      "(tol=" +
+                                          std::to_string(tol) + " mm)"}};
+            // Consistent boundary-load weights w_i = ∫ N_i dA over the loaded faces.
+            // Tet10 uses mapped tri6 quadrature; tet4/hex8 use A/n per corner. Shared by
+            // force and pressure deposition.
+            std::unordered_set<int> node_set(node_ids.begin(), node_ids.end());
+            // For tet10, the geometric faceset pick (corners only on a flat face) MUST be
+            // completed with the mid-side nodes that actually carry the work-equivalent load,
+            // or w_sum collapses to ~0 and the force degenerates to a wrong, non-convergent
+            // corner split (Bug Z1). add_midside_face_nodes inserts every mid-edge node whose
+            // two endpoint corners are already selected; no-op for tet4/hex8.
+            add_midside_face_nodes(tets, nodes_per_elem, node_set);
+            // Re-materialise node_ids from the completed set (sorted, unique) so the force /
+            // pressure deposition loops below land on the SAME nodes the weights were put on.
+            node_ids.assign(node_set.begin(), node_set.end());
+            std::sort(node_ids.begin(), node_ids.end());
+            if (load_selections)
+                load_selections->emplace_back(
+                    selector_label(faces, "loads", load_ordinal), node_ids);
+            // P5: the consistent-weight arrays are only meaningful when the set can hold a
+            // complete boundary face (>= 3 nodes) — oracle-style studies carry hundreds of
+            // single-node loads, and zero-filling 4*n_nodes doubles per load was real time.
+            std::vector<double> node_w, node_nw;
+            double loaded_area = 0.0;
+            if (node_set.size() >= 3) {
+                node_w.assign(static_cast<size_t>(n_nodes), 0.0);
+                node_nw.assign(static_cast<size_t>(n_nodes) * 3, 0.0);
+                std::string fold_detail;
+                loaded_area = accumulate_face_weights(points, tets, nodes_per_elem,
+                                                      node_set, node_w, node_nw,
+                                                      fold_detail);
+                if (!std::isfinite(loaded_area))
+                    return json{{"ok", false},
+                                {"error", "fea_static: invalid or folded quadratic "
+                                          "boundary face" + fold_detail}};
+            }
+            double w_sum = 0.0;
+            if (!node_w.empty())
+                for (int nid : node_ids) w_sum += node_w[static_cast<size_t>(nid)];
+
+            if (type == "force") {
+                std::array<double, 3> fv{0.0, 0.0, 0.0};
+                if (load.contains("vector") && load["vector"].is_array()) {
+                    const auto& v = load["vector"];
+                    for (size_t c = 0; c < 3 && c < v.size(); ++c) fv[c] = v[c].get<double>();
+                }
+                // tet10 gets the WORK-EQUIVALENT split; tet4/hex8 keep the equal-per-node
+                // split byte-identical to the oracle (their linear faces are equal-weighted
+                // anyway, but routing them through the identical branch avoids any drift).
+                const bool tet10 = (nodes_per_elem == 10);
+                if (tet10 && w_sum > 1e-12) {
+                    // Each node carries the SHARE of the total force proportional to its
+                    // boundary tributary w_i/Σw. Resultant == F exactly; on a tet10 face the
+                    // corners get 0 and the mid-sides 1/3 each, which removes the bogus corner
+                    // stress spike the old equal split produced (Bug F1).
+                    const double invw = 1.0 / w_sum;
+                    for (int nid : node_ids) {
+                        const double s = node_w[static_cast<size_t>(nid)] * invw;
+                        for (int c = 0; c < 3; ++c) nodal_forces[nid * 3 + c] += fv[c] * s;
+                    }
+                    notes.push_back("Force spread work-consistently over " +
+                                    std::to_string(node_ids.size()) + " nodes");
+                } else {
+                    // tet4/hex8, OR a tet10 node set with no complete boundary face (a sparse
+                    // point pick): equal split so the resultant is still F.
+                    const double inv = 1.0 / static_cast<double>(node_ids.size());
+                    for (int nid : node_ids)
+                        for (int c = 0; c < 3; ++c) nodal_forces[nid * 3 + c] += fv[c] * inv;
+                    notes.push_back("Force spread equally over " +
+                                    std::to_string(node_ids.size()) + " nodes");
+                }
+            } else if (type == "pressure") {
+                const double pressure =
+                    load.contains("magnitude") && !load["magnitude"].is_null()
+                        ? load["magnitude"].get<double>()
+                        : 0.0;
+                if (loaded_area > 1e-12 && w_sum > 1e-12) {
+                    // Consistent pressure load: f_i = −p · ∫ N_i n̂ dA, accumulated per node
+                    // with the PER-FACE outward normal (node_nw), so a curved loaded surface
+                    // gets the right directional load and the resultant spans p·A·(−n̂). The
+                    // load lands on the mid-side nodes for tet10 (the prior code lumped p·A
+                    // onto corner nodes only, which drove the δ/σ several-fold error).
+                    //
+                    // SIGN (V&V, 2026-09-05): the minus is the CONTRACT. `pressure` is
+                    // documented "MPa, inward" (cad_sim_tools.run_fea_static, cad_guide,
+                    // and cad_render_tools, which quotes p·A "N inward"), and a positive
+                    // pressure pushing into the surface is the universal engineering
+                    // convention. Depositing +p·n̂ made +20 MPa on a Lamé bore read
+                    // σ_hoop = −29.6 MPa (external pressurisation) against Lamé's +33.33,
+                    // i.e. every bore/vessel study needed a hand-flipped magnitude.
+                    for (int nid : node_ids)
+                        for (int c = 0; c < 3; ++c)
+                            nodal_forces[nid * 3 + c] -=
+                                pressure * node_nw[static_cast<size_t>(nid) * 3 + c];
+                    notes.push_back("Pressure on loaded area " + std::to_string(loaded_area) +
+                                    " mm2 (work-consistent, +p acts inward)");
+                } else {
+                    return json{{"ok", false},
+                                {"error", "fea_static: pressure selection contains no "
+                                          "complete exterior boundary face"}};
+                }
+            }
+        }
+    }
+    return nullptr;
+}
+
+}  // namespace
+
 static nlohmann::json fea_run_static_impl(
     const nlohmann::json& study, const SimCancelToken& inherited_token) {
     SimJobScope job(study, inherited_token);
@@ -2107,89 +2343,8 @@ static nlohmann::json fea_run_static_impl(
                                   "Converge the mesh elastically, then re-solve that "
                                   "mesh with plasticity at an explicit mesh_size_mm."}};
     }
-    if (!study.contains("fixtures") || !study["fixtures"].is_array() ||
-        study["fixtures"].empty())
-        return json{{"ok", false},
-                    {"error", "fea_static: at least one fixture is required"}};
-    for (size_t i = 0; i < study["fixtures"].size(); ++i) {
-        const auto& fixture = study["fixtures"][i];
-        if (!fixture.is_object())
-            return json{{"ok", false},
-                        {"error", "fea_static: fixture " + std::to_string(i) +
-                                      " must be an object"}};
-        std::string faceset_error;
-        if (!validate_faceset_input(fixture, faceset_error))
-            return json{{"ok", false},
-                        {"error", "fea_static: fixture " + std::to_string(i) +
-                                      ": " + faceset_error}};
-        if (fixture.contains("tol_mm") && !fixture["tol_mm"].is_number())
-            return json{{"ok", false},
-                        {"error", "fea_static: fixture " + std::to_string(i) +
-                                      " has non-numeric tol_mm"}};
-        const double tol = fixture.value("tol_mm", 1.0);
-        if (!std::isfinite(tol) || !(tol > 0.0))
-            return json{{"ok", false},
-                        {"error", "fea_static: fixture " + std::to_string(i) +
-                                      " has invalid tol_mm"}};
-    }
-    if (!study.contains("loads") || !study["loads"].is_array() ||
-        study["loads"].empty())
-        return json{{"ok", false},
-                    {"error", "fea_static: at least one non-zero load is required"}};
-    bool have_nonzero_load = false;
-    for (size_t i = 0; i < study["loads"].size(); ++i) {
-        const auto& load = study["loads"][i];
-        if (!load.is_object() || !load.contains("faces") ||
-            !load["faces"].is_object())
-            return json{{"ok", false},
-                        {"error", "fea_static: load " + std::to_string(i) +
-                                      " requires a faces object"}};
-        if (load["faces"].contains("tol_mm") &&
-            !load["faces"]["tol_mm"].is_number())
-            return json{{"ok", false},
-                        {"error", "fea_static: load " + std::to_string(i) +
-                                      " has non-numeric tol_mm"}};
-        const double tol = load["faces"].value("tol_mm", 1.0);
-        std::string faceset_error;
-        if (!validate_faceset_input(load["faces"], faceset_error))
-            return json{{"ok", false},
-                        {"error", "fea_static: load " + std::to_string(i) +
-                                      ": " + faceset_error}};
-        if (!std::isfinite(tol) || !(tol > 0.0))
-            return json{{"ok", false},
-                        {"error", "fea_static: load " + std::to_string(i) +
-                                      " has invalid tol_mm"}};
-        if (!load.contains("type") || !load["type"].is_string())
-            return json{{"ok", false},
-                        {"error", "fea_static: load " + std::to_string(i) +
-                                      " requires a string type"}};
-        const std::string type = load.value("type", std::string());
-        if (type == "force") {
-            if (!load.contains("vector") || !finite3(load["vector"]))
-                return json{{"ok", false},
-                            {"error", "fea_static: force load " + std::to_string(i) +
-                                          " requires a finite 3-vector"}};
-            have_nonzero_load = have_nonzero_load || nonzero3(load["vector"]);
-        } else if (type == "pressure") {
-            if (!load.contains("magnitude") || !load["magnitude"].is_number()) {
-                return json{{"ok", false},
-                            {"error", "fea_static: pressure load " + std::to_string(i) +
-                                          " requires a finite magnitude"}};
-            }
-            const double magnitude = load["magnitude"].get<double>();
-            if (!std::isfinite(magnitude))
-                return json{{"ok", false},
-                            {"error", "fea_static: pressure load " + std::to_string(i) +
-                                          " requires a finite magnitude"}};
-            have_nonzero_load = have_nonzero_load || magnitude != 0.0;
-        } else {
-            return json{{"ok", false},
-                        {"error", "fea_static: unsupported load type '" + type + "'"}};
-        }
-    }
-    if (!have_nonzero_load)
-        return json{{"ok", false},
-                    {"error", "fea_static: at least one non-zero load is required"}};
+    if (json failure = validate_mechanical_boundary_conditions(study); !failure.is_null())
+        return failure;
     // Content-addressed solve-result cache (sim_cache): HIT returns the stored result
     // (O(load)); ANY input change is a MISS. Tag the result with cache_hit so callers
     // / tests can observe the path honestly.
@@ -2300,138 +2455,11 @@ static nlohmann::json fea_run_static_impl(
     // while `contact_declared`.
     std::vector<std::pair<std::string, std::vector<int>>> load_selections;
     // ── Force vector (replicate run_static's load loop EXACTLY) ──────────────
-    std::vector<double> nodal_forces(static_cast<size_t>(n_dof), 0.0);
-    std::size_t loads_seen = 0;
-    if (study.contains("loads") && study["loads"].is_array()) {
-        for (const auto& load : study["loads"]) {
-            const std::size_t load_ordinal = loads_seen++;
-            const json faces = load.contains("faces") ? load["faces"] : json::object();
-            const double tol = faces.value("tol_mm", 1.0);
-            const std::string type = load.value("type", std::string());
-            // A load that deposits nothing is a no-op, so it is decided BEFORE the
-            // selection is judged: refusing a whole study over a ZERO load's
-            // unresolvable faceset reports a fault where there is no load. Upstream
-            // validation already guarantees `vector`/`magnitude` exist and are finite
-            // here, and `have_nonzero_load` guarantees the study carries a real load.
-            // (Witness: a consistent-pressure oracle sums the traction over every
-            // element face and relies on interior faces cancelling identically —
-            // Zienkiewicz & Taylor §2 — so a coarse bore mesh yields a handful of
-            // O(1e-15) forces sitting on INTERIOR mid-side nodes, which
-            // boundary_faceset_membership correctly resolves to nothing. Ordering the
-            // refusal first killed the whole Lamé study over 32 numerically-zero
-            // loads out of 1208.)
-            if ((type == "force" && !nonzero3(load["vector"])) ||
-                (type == "pressure" && load["magnitude"].get<double>() == 0.0))
-                continue;
-            std::vector<int> node_ids =
-                boundary_faceset_membership(faces, points, tets, nodes_per_elem);
-            if (node_ids.empty())
-                return json{{"ok", false},
-                            {"error", "fea_static: load faces resolved to 0 mesh nodes "
-                                      "(tol=" +
-                                          std::to_string(tol) + " mm)"}};
-            // Consistent boundary-load weights w_i = ∫ N_i dA over the loaded faces.
-            // Tet10 uses mapped tri6 quadrature; tet4/hex8 use A/n per corner. Shared by
-            // force and pressure deposition.
-            std::unordered_set<int> node_set(node_ids.begin(), node_ids.end());
-            // For tet10, the geometric faceset pick (corners only on a flat face) MUST be
-            // completed with the mid-side nodes that actually carry the work-equivalent load,
-            // or w_sum collapses to ~0 and the force degenerates to a wrong, non-convergent
-            // corner split (Bug Z1). add_midside_face_nodes inserts every mid-edge node whose
-            // two endpoint corners are already selected; no-op for tet4/hex8.
-            add_midside_face_nodes(tets, nodes_per_elem, node_set);
-            // Re-materialise node_ids from the completed set (sorted, unique) so the force /
-            // pressure deposition loops below land on the SAME nodes the weights were put on.
-            node_ids.assign(node_set.begin(), node_set.end());
-            std::sort(node_ids.begin(), node_ids.end());
-            if (contact_declared)
-                load_selections.emplace_back(
-                    selector_label(faces, "loads", load_ordinal), node_ids);
-            // P5: the consistent-weight arrays are only meaningful when the set can hold a
-            // complete boundary face (>= 3 nodes) — oracle-style studies carry hundreds of
-            // single-node loads, and zero-filling 4*n_nodes doubles per load was real time.
-            std::vector<double> node_w, node_nw;
-            double loaded_area = 0.0;
-            if (node_set.size() >= 3) {
-                node_w.assign(static_cast<size_t>(n_nodes), 0.0);
-                node_nw.assign(static_cast<size_t>(n_nodes) * 3, 0.0);
-                std::string fold_detail;
-                loaded_area = accumulate_face_weights(points, tets, nodes_per_elem,
-                                                      node_set, node_w, node_nw,
-                                                      fold_detail);
-                if (!std::isfinite(loaded_area))
-                    return json{{"ok", false},
-                                {"error", "fea_static: invalid or folded quadratic "
-                                          "boundary face" + fold_detail}};
-            }
-            double w_sum = 0.0;
-            if (!node_w.empty())
-                for (int nid : node_ids) w_sum += node_w[static_cast<size_t>(nid)];
-
-            if (type == "force") {
-                std::array<double, 3> fv{0.0, 0.0, 0.0};
-                if (load.contains("vector") && load["vector"].is_array()) {
-                    const auto& v = load["vector"];
-                    for (size_t c = 0; c < 3 && c < v.size(); ++c) fv[c] = v[c].get<double>();
-                }
-                // tet10 gets the WORK-EQUIVALENT split; tet4/hex8 keep the equal-per-node
-                // split byte-identical to the oracle (their linear faces are equal-weighted
-                // anyway, but routing them through the identical branch avoids any drift).
-                const bool tet10 = (nodes_per_elem == 10);
-                if (tet10 && w_sum > 1e-12) {
-                    // Each node carries the SHARE of the total force proportional to its
-                    // boundary tributary w_i/Σw. Resultant == F exactly; on a tet10 face the
-                    // corners get 0 and the mid-sides 1/3 each, which removes the bogus corner
-                    // stress spike the old equal split produced (Bug F1).
-                    const double invw = 1.0 / w_sum;
-                    for (int nid : node_ids) {
-                        const double s = node_w[static_cast<size_t>(nid)] * invw;
-                        for (int c = 0; c < 3; ++c) nodal_forces[nid * 3 + c] += fv[c] * s;
-                    }
-                    notes.push_back("Force spread work-consistently over " +
-                                    std::to_string(node_ids.size()) + " nodes");
-                } else {
-                    // tet4/hex8, OR a tet10 node set with no complete boundary face (a sparse
-                    // point pick): equal split so the resultant is still F.
-                    const double inv = 1.0 / static_cast<double>(node_ids.size());
-                    for (int nid : node_ids)
-                        for (int c = 0; c < 3; ++c) nodal_forces[nid * 3 + c] += fv[c] * inv;
-                    notes.push_back("Force spread equally over " +
-                                    std::to_string(node_ids.size()) + " nodes");
-                }
-            } else if (type == "pressure") {
-                const double pressure =
-                    load.contains("magnitude") && !load["magnitude"].is_null()
-                        ? load["magnitude"].get<double>()
-                        : 0.0;
-                if (loaded_area > 1e-12 && w_sum > 1e-12) {
-                    // Consistent pressure load: f_i = −p · ∫ N_i n̂ dA, accumulated per node
-                    // with the PER-FACE outward normal (node_nw), so a curved loaded surface
-                    // gets the right directional load and the resultant spans p·A·(−n̂). The
-                    // load lands on the mid-side nodes for tet10 (the prior code lumped p·A
-                    // onto corner nodes only, which drove the δ/σ several-fold error).
-                    //
-                    // SIGN (V&V, 2026-09-05): the minus is the CONTRACT. `pressure` is
-                    // documented "MPa, inward" (cad_sim_tools.run_fea_static, cad_guide,
-                    // and cad_render_tools, which quotes p·A "N inward"), and a positive
-                    // pressure pushing into the surface is the universal engineering
-                    // convention. Depositing +p·n̂ made +20 MPa on a Lamé bore read
-                    // σ_hoop = −29.6 MPa (external pressurisation) against Lamé's +33.33,
-                    // i.e. every bore/vessel study needed a hand-flipped magnitude.
-                    for (int nid : node_ids)
-                        for (int c = 0; c < 3; ++c)
-                            nodal_forces[nid * 3 + c] -=
-                                pressure * node_nw[static_cast<size_t>(nid) * 3 + c];
-                    notes.push_back("Pressure on loaded area " + std::to_string(loaded_area) +
-                                    " mm2 (work-consistent, +p acts inward)");
-                } else {
-                    return json{{"ok", false},
-                                {"error", "fea_static: pressure selection contains no "
-                                          "complete exterior boundary face"}};
-                }
-            }
-        }
-    }
+    std::vector<double> nodal_forces;
+    if (json failure = resolve_mechanical_loads(
+            study, points, tets, nodes_per_elem, nodal_forces, notes,
+            contact_declared ? &load_selections : nullptr); !failure.is_null())
+        return failure;
 
     // ── Fixtures -> fixed nodes (union, sorted unique) ───────────────────────
     std::vector<int> fixed_nodes;
@@ -3981,6 +4009,201 @@ nlohmann::json fea_run_modal(const nlohmann::json& study, int n_modes) {
     }
 }
 
+nlohmann::json fea_run_buckling(const nlohmann::json& study, int n_modes,
+                               double max_load_factor) {
+    json out{{"ok", false},
+             {"solver", "engine"},
+             {"modes", json::array()},
+             {"critical_load_factor", nullptr},
+             {"critical_load_n", nullptr},
+             {"mesh_quality", nullptr},
+             {"max_load_factor", max_load_factor},
+             {"provenance", detail::provenance_json("engine")}};
+    out["provenance"]["analysis"] = "linear_buckling";
+    const auto fail = [&](const std::string& error) {
+        out["ok"] = false;
+        out["error"] = error;
+        out["reason"] = error;
+        return std::move(out);
+    };
+    try {
+        SimJobScope job(study);
+        if (!study.is_object())
+            return fail("fea_buckling: study must be an object");
+        if (!has_mesh_source(study))
+            return fail("fea_buckling: a non-empty STEP path or inline mesh is required");
+        if (n_modes <= 0 || n_modes > 100)
+            return fail("fea_buckling: n_modes must be between 1 and 100");
+        if (!std::isfinite(max_load_factor) || !(max_load_factor > 0.0) ||
+            !std::isfinite(1.0/max_load_factor))
+            return fail("fea_buckling: max_load_factor must be finite and positive");
+        const json material = study.value("material", json::object());
+        if (!material.is_object() || !material.contains("E_mpa") ||
+            !material["E_mpa"].is_number() || !material.contains("nu") ||
+            !material["nu"].is_number())
+            return fail("fea_buckling: material requires numeric E_mpa and nu");
+        const double E_mpa = material["E_mpa"].get<double>();
+        const double nu = material["nu"].get<double>();
+        if (!std::isfinite(E_mpa) || !(E_mpa > 0.0) || !std::isfinite(nu) ||
+            !(nu > -1.0 && nu < 0.5))
+            return fail("fea_buckling: material E and Poisson ratio must be finite "
+                        "and physically valid");
+        if (material.contains("plasticity") && !material["plasticity"].is_null()) {
+            if (!material["plasticity"].is_object())
+                return fail("fea_buckling: material.plasticity must be an object");
+            if (plasticity_requested(study))
+                return fail("fea_buckling: material.plasticity is not applicable to "
+                            "linear buckling; the reference stress must be elastic");
+        }
+        if (declares_body_interfaces(study) ||
+            (study.contains("bond_gap_mm") && study["bond_gap_mm"] != 0.0))
+            return fail("fea_buckling: contact and bonded-gap interfaces are not "
+                        "supported by the linear buckling eigenproblem");
+        if (study.contains("adapt") && !study["adapt"].is_null())
+            return fail("fea_buckling: adaptive static refinement is not a buckling study");
+        if (json failure = validate_mechanical_boundary_conditions(study);
+            !failure.is_null())
+            return fail(failure["error"].get<std::string>());
+        if (job.cancelled()) return fail("fea_buckling: cancelled");
+
+        chudware::prof::phases::StudyScope study_scope("fea_buckling");
+        std::vector<double> points;
+        std::vector<int> tets;
+        int nodes_per_elem = 4;
+        std::string mesh_type_used, mesh_note, error;
+        std::optional<MeshAdvisor> mesh_advisor;
+        detail::MeshQualityFacts mesh_quality;
+        json mesh_study = study;
+        if (study.contains("step_path") && study["step_path"].is_string() &&
+            !study["step_path"].get<std::string>().empty())
+            mesh_study["mesh_order"] = study.value("mesh_order", 2);
+        {
+            chudware::prof::phases::PhaseScope phase("mesh");
+            if (!resolve_mesh(mesh_study, points, tets, nodes_per_elem,
+                              mesh_type_used, mesh_note, mesh_advisor, mesh_quality, error))
+                return fail(error);
+        }
+        if (nodes_per_elem != 4 && nodes_per_elem != 10)
+            return fail("fea_buckling: only tet4 and tet10 meshes are supported");
+        if (points.size() % 3 != 0 ||
+            points.size() > static_cast<std::size_t>(std::numeric_limits<int>::max()) ||
+            tets.size() % static_cast<std::size_t>(nodes_per_elem) != 0 ||
+            !std::all_of(points.begin(), points.end(),
+                         [](double value) { return std::isfinite(value); }))
+            return fail("fea_buckling: mesh coordinates/connectivity are malformed");
+        if (std::any_of(tets.begin(), tets.end(), [&](int node) {
+                return node < 0 || static_cast<std::size_t>(node) >= points.size() / 3;
+            }))
+            return fail("fea_buckling: element node index is outside the mesh");
+        const std::size_t n_nodes = points.size() / 3;
+        const std::size_t n_elems = tets.size() / static_cast<std::size_t>(nodes_per_elem);
+        out["mesh_quality"] =
+            detail::mesh_quality_json(mesh_quality, n_nodes, n_elems, nodes_per_elem);
+        out["mesh_type_used"] = mesh_type_used;
+        out["n_elems"] = n_elems;
+        if (mesh_advisor) out["advisor"] = detail::mesh_advisor_json(*mesh_advisor);
+        if (job.cancelled()) return fail("fea_buckling: cancelled");
+        // K, reference-stress geometric stiffness, and the eigensolver workspace
+        // have the same two-matrix admission scale as the modal route.
+        if (!chudware::governor::admit(
+                2 * chudware::governor::fea_peak_bytes(n_elems, nodes_per_elem, 3),
+                "buckling FEA solve", error))
+            return fail(error);
+
+        std::vector<std::string> notes;
+        if (!mesh_note.empty()) notes.push_back("mesh: " + mesh_note);
+        std::vector<int> fixed_nodes;
+        std::vector<double> nodal_forces;
+        {
+            chudware::prof::phases::PhaseScope phase("setup");
+            std::unordered_set<int> fixed;
+            for (std::size_t i = 0; i < study["fixtures"].size(); ++i) {
+                const auto ids = boundary_faceset_membership(
+                    study["fixtures"][i], points, tets, nodes_per_elem);
+                if (ids.empty())
+                    return fail("fea_buckling: fixture " + std::to_string(i) +
+                                " resolved to 0 mesh nodes");
+                fixed.insert(ids.begin(), ids.end());
+            }
+            fixed_nodes.assign(fixed.begin(), fixed.end());
+            std::sort(fixed_nodes.begin(), fixed_nodes.end());
+            if (json failure = resolve_mechanical_loads(
+                    study, points, tets, nodes_per_elem, nodal_forces, notes);
+                !failure.is_null())
+                return fail(failure["error"].get<std::string>());
+        }
+        std::array<long double, 3> resultant{};
+        long double force_scale = 0.0L;
+        for (std::size_t i = 0; i < nodal_forces.size(); ++i) {
+            resultant[i % 3] += nodal_forces[i];
+            force_scale += std::fabs(nodal_forces[i]);
+        }
+        const double reference_load_n = static_cast<double>(
+            std::sqrt(resultant[0] * resultant[0] + resultant[1] * resultant[1] +
+                      resultant[2] * resultant[2]));
+        if (!std::isfinite(reference_load_n))
+            return fail("fea_buckling: reference applied resultant is not finite");
+        out["reference_load_n"] = reference_load_n;
+        out["reference_resultant_n"] = json::array(
+            {static_cast<double>(resultant[0]), static_cast<double>(resultant[1]),
+             static_cast<double>(resultant[2])});
+        out["solver_notes"] = notes;
+        if (reference_load_n <=
+            64 * std::numeric_limits<double>::epsilon() * force_scale)
+            return fail("fea_buckling: reference applied resultant is zero; "
+                        "scalar critical load is undefined for self-equilibrated loads");
+        if (job.cancelled()) return fail("fea_buckling: cancelled");
+        FeaBucklingResult result = [&] {
+            chudware::prof::phases::PhaseScope phase("solve");
+            return fea_buckling_solve(points, tets, E_mpa, nu, fixed_nodes,
+                                      nodal_forces, n_modes, nodes_per_elem,
+                                      max_load_factor, job.token());
+        }();
+        if (!result.ok) return fail(result.error);
+
+        // A directional SHAPE measure, not modal effective mass: each axis gets
+        // its share of sum_i ||phi_i||^2, independent of eigenvector sign/scale.
+        json modes = json::array();
+        const std::size_t mode_size = n_nodes * 3;
+        for (int m = 0; m < result.n_modes; ++m) {
+            std::array<double, 3> energy{};
+            const std::size_t base = static_cast<std::size_t>(m) * mode_size;
+            for (std::size_t i = 0; i < mode_size; ++i) {
+                const double value = result.mode_shapes[base + i];
+                energy[i % 3] += value * value;
+            }
+            const double total = energy[0] + energy[1] + energy[2];
+            modes.push_back(
+                json{{"load_factor", result.load_factors[static_cast<std::size_t>(m)]},
+                     {"participation", json{{"x", energy[0] / total},
+                                             {"y", energy[1] / total},
+                                             {"z", energy[2] / total}}}});
+        }
+        const double critical_load_n = result.load_factors.front() * reference_load_n;
+        if (!std::isfinite(critical_load_n))
+            return fail("fea_buckling: critical resultant magnitude overflows");
+        out["modes"] = std::move(modes);
+        out["critical_load_factor"] = result.load_factors.front();
+        out["critical_load_n"] = critical_load_n;
+        out["load_factors"] = std::move(result.load_factors);
+        out["mode_shapes"] = std::move(result.mode_shapes);
+        out["n_modes"] = result.n_modes;
+        out["n_nodes"] = result.n_nodes;
+        out["n_dof"] = result.n_dof;
+        out["participation_measure"] = "sum_node_axis_shape_squared / sum_node_shape_squared";
+        std::string vtu_path;
+        if (!detail::write_result_vtu(study, points, tets, nodes_per_elem, out,
+                                     vtu_path, error))
+            return fail("fea_buckling: " + error);
+        if (!vtu_path.empty()) out["vtu_path"] = vtu_path;
+        if (job.cancelled()) return fail("fea_buckling: cancelled");
+        out["ok"] = true;
+        return out;
+    } catch (const std::exception& e) {
+        return fail(std::string("fea_buckling: ") + e.what());
+    }
+}
+
 namespace {
 
 // Resolve a faceset object ({points,tol_mm[,face_normal,perp_tol_mm]}) to mesh node indices,
@@ -4551,11 +4774,16 @@ nlohmann::json fea_run_thermal(const nlohmann::json& study) {
                  {{"max_temp_c", round_nd(r.max_temp, 4)}, {"min_temp_c", round_nd(r.min_temp, 4)}}},
                 {"flux_summary", flux_summary},
                 {"solver_notes", notes}};
+    out["temperature_max_c"] = r.max_temp;
+    out["temperature_min_c"] = r.min_temp;
+    out["flux_max_w_m2"] = 1.0e6 * thermal_flux_max(
+        points, tets, r.temperature, k_cond, nodes_per_elem);
     if (mesh_advisor) out["advisor"] = detail::mesh_advisor_json(*mesh_advisor);
     out["mesh_quality"] = detail::mesh_quality_json(
         mesh_quality, static_cast<std::size_t>(r.n_nodes),
         static_cast<std::size_t>(r.n_elems), nodes_per_elem);
     out["provenance"] = detail::provenance_json("chudware/fea_thermal");
+    out["provenance"]["solver"] = "engine";
     {
         std::string vtu_path, vtu_error;
         if (!detail::write_result_vtu(study, points, tets, nodes_per_elem, out,

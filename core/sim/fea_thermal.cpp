@@ -1307,4 +1307,42 @@ ThermalTransientResult fea_thermal_transient(
     return res;
 }
 
+double thermal_flux_max(const std::vector<double>& points, const std::vector<int>& tets,
+                        const std::vector<double>& temperature, double k_cond,
+                        int nodes_per_elem) {
+    double maximum = 0.0;
+    const TetGauss4 gauss;
+    for (size_t e = 0; e < tets.size(); e += nodes_per_elem) {
+        if (nodes_per_elem == 10) {
+            std::array<Vec3, 10> ep;
+            Eigen::Matrix<double, 10, 1> temp;
+            for (int j = 0; j < 10; ++j) {
+                const int n = tets[e + j];
+                ep[j] = Vec3(points[3*n], points[3*n+1], points[3*n+2]);
+                temp[j] = temperature[n];
+            }
+            for (int g = 0; g < 4; ++g) {
+                Eigen::Matrix<double, 10, 3> grad;
+                double detJ;
+                if (tet10_grad_at(ep, gauss.pt[g][0], gauss.pt[g][1],
+                                  gauss.pt[g][2], grad, detJ))
+                    maximum = std::max(maximum, k_cond * (grad.transpose() * temp).norm());
+            }
+        } else {
+            std::array<Vec3, 4> ep;
+            Eigen::Vector4d temp;
+            for (int j = 0; j < 4; ++j) {
+                const int n = tets[e + j];
+                ep[j] = Vec3(points[3*n], points[3*n+1], points[3*n+2]);
+                temp[j] = temperature[n];
+            }
+            Eigen::Matrix<double, 4, 3> grad;
+            double volume;
+            if (tet4_grad(ep, grad, volume))
+                maximum = std::max(maximum, k_cond * (grad.transpose() * temp).norm());
+        }
+    }
+    return maximum;
+}
+
 }  // namespace chudware::sim

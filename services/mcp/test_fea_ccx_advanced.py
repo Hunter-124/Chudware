@@ -1,15 +1,9 @@
-"""CalculiX-backed advanced FEA regression tests — buckling, contact, fatigue.
+"""Advanced FEA regression tests — CalculiX contact and engine fatigue.
 
-Three legs (simsuite fea_ccx_advanced domain; anchors: core/tests/test_fatigue.cpp,
+Two legs (simsuite fea_ccx_advanced domain; anchors: core/tests/test_fatigue.cpp,
 scripts/vv_benchmark.py FAMILY 10, engine_oracle/sim/multiphysics_rpc.py T-FIN24):
 
-1. BUCKLING — the box-proxy fixed-free Euler column (`build_buckling_column_inp`)
-   solved live by ccx *BUCKLE; the FIRST buckling factor must reproduce
-   Pcr = pi^2*E*I/(K*L)^2 with K=2 (fixed-free; Timoshenko & Gere, Theory of
-   Elastic Stability). Regression-pins the C3D8I element fix: fully-integrated
-   C3D8 hexes shear-lock and overshot Pcr by 40-62% at the shipped mesh density.
-
-2. CONTACT — the two-block *NLGEOM *CONTACT PAIR proxy: base reaction must equal
+1. CONTACT — the two-block *NLGEOM *CONTACT PAIR proxy: base reaction must equal
    the applied load (static equilibrium / Newton III), and the slave-interface
    settlement must obey Hooke uniaxial compression (sigma = E*epsilon) plus the
    penalty penetration bound delta = p/K of the LINEAR pressure-overclosure law
@@ -17,7 +11,7 @@ scripts/vv_benchmark.py FAMILY 10, engine_oracle/sim/multiphysics_rpc.py T-FIN24
    Regression-pins the parse_dat_nodal last-block fix: averaging RF across all
    NLGEOM increments under-reported the reaction by ~53%.
 
-3. FATIGUE — the C++ engine `sim_run_fatigue` (core/sim/fea_fatigue.cpp) on the
+2. FATIGUE — the C++ engine `sim_run_fatigue` (core/sim/fea_fatigue.cpp) on the
    same inline 6-tet cube as core/tests/test_fatigue.cpp (cross-language parity),
    plus the host-mirror S-N life vs a hand-computed Basquin/Shigley case.
 
@@ -54,63 +48,6 @@ if fa.ccx_path() is None and _DEFAULT_CCX.exists():
 _HAS_CCX = fa.ccx_path() is not None
 needs_ccx = pytest.mark.skipif(
     not _HAS_CCX, reason="CalculiX (ccx) not found — set CHUDWARE_CCX or add to PATH")
-
-
-# ---------------------------------------------------------------------------
-# Buckling — Euler fixed-free column, Pcr = pi^2*E*I/(2L)^2
-# ---------------------------------------------------------------------------
-# Slender steel column 400 x 10 x 10 mm (L/h = 40, Euler-slender), E = 200 GPa.
-#   I_min = b*h^3/12 = 10*10^3/12 = 833.333 mm^4
-#   Pcr   = pi^2 * 200000 * 833.333 / (2*400)^2 = 2570.2 N
-# (Timoshenko & Gere, Theory of Elastic Stability — fixed-free K=2.)
-BK_L, BK_B, BK_H = 400.0, 10.0, 10.0
-BK_E, BK_NU, BK_P = 200000.0, 0.3, 1000.0
-BK_I = min(BK_B * BK_H ** 3, BK_H * BK_B ** 3) / 12.0
-BK_PCR = math.pi ** 2 * BK_E * BK_I / (2.0 * BK_L) ** 2
-
-
-def test_buckling_generator_uses_c3d8i_and_euler_ref():
-    """Element-type regression: C3D8 (full integration) shear-locks in the bending
-    buckling mode (+61.8% on the vv BK1 column, measured); the generator must emit
-    C3D8I. The returned Euler reference must match pi^2*E*I/(2L)^2 exactly."""
-    gen = fa.build_buckling_column_inp(BK_L, BK_B, BK_H, BK_E, BK_NU, BK_P)
-    assert "TYPE=C3D8I," in gen["inp"]
-    assert "TYPE=C3D8," not in gen["inp"]      # no locking-prone elements left
-    assert math.isclose(gen["expected_Pcr"], BK_PCR, rel_tol=1e-12)
-
-
-@needs_ccx
-def test_buckling_first_factor_matches_euler():
-    """First ccx *BUCKLE factor vs Euler Pcr = pi^2*E*I/(2L)^2 (K=2 fixed-free),
-    +-5% (measured 0.35% with C3D8I; C3D8 was ~40% off — the bug this pins).
-    A square section buckles identically about both axes, so modes 1 and 2 must be
-    a near-degenerate pair."""
-    gen = fa.build_buckling_column_inp(BK_L, BK_B, BK_H, BK_E, BK_NU, BK_P,
-                                       nx=40, ny=4, nz=4)
-    run = fa.run_ccx(gen["inp"], job="bk", timeout=180.0)
-    assert run.get("ok") and run.get("dat_path"), run.get("stderr", "")[-300:]
-    factors = fa.parse_buckle_factors(run["dat_path"])
-    assert factors, "no buckling factors parsed from .dat"
-    pcr_ccx = factors[0] * BK_P
-    rel = abs(pcr_ccx - BK_PCR) / BK_PCR
-    assert rel < 0.05, f"Pcr {pcr_ccx:.1f} N vs Euler {BK_PCR:.1f} N ({rel:.1%})"
-    assert len(factors) >= 2 and factors[1] / factors[0] < 1.02, \
-        f"square-section buckling pair not degenerate: {factors[:2]}"
-    # positive, sorted factors (compressive load, lowest mode first)
-    assert all(f > 0 for f in factors) and factors == sorted(factors)
-
-
-@needs_ccx
-def test_buckling_via_multiphysics_rpc_endpoint():
-    """The T-FIN24 worker endpoint (exact run_fea_buckling pipeline) end-to-end."""
-    from services.sim import multiphysics_rpc as mp
-    out = mp._sim_run_buckling({"L_mm": BK_L, "b_mm": BK_B, "h_mm": BK_H,
-                                "E_mpa": BK_E, "nu": BK_NU, "load_n": BK_P})
-    assert out.get("ok"), out
-    assert out["load_factors"], out
-    rel = abs(out["critical_loads_n"][0] - out["euler_reference_pcr_n"]) \
-        / out["euler_reference_pcr_n"]
-    assert rel < 0.05, out
 
 
 # ---------------------------------------------------------------------------
@@ -317,14 +254,12 @@ def test_engine_fatigue_plus_host_life_hand_checked():
 # Harness robustness — missing binary / malformed .inp / timeout
 # ---------------------------------------------------------------------------
 
-def test_missing_ccx_skips_cleanly_via_worker_endpoints(monkeypatch):
-    """multiphysics_rpc buckling/contact must degrade to {ok:false, skipped:true}
-    when ccx is absent — never raise, never fabricate."""
+def test_missing_ccx_skips_cleanly_via_contact_endpoint(monkeypatch):
+    """The legacy contact proxy refuses honestly when its solver is absent."""
     from services.sim import multiphysics_rpc as mp
     monkeypatch.setattr(fa, "ccx_path", lambda: None)
-    for endpoint in (mp._sim_run_buckling, mp._sim_run_contact):
-        out = endpoint({})
-        assert out.get("ok") is False and out.get("skipped") is True, out
+    out = mp._sim_run_contact({})
+    assert out.get("ok") is False and out.get("skipped") is True, out
 
 
 @needs_ccx
@@ -338,20 +273,6 @@ def test_malformed_inp_clean_error_not_fabricated_result():
     assert time.time() - t0 < 30.0, "malformed deck must not hang"
     assert r.get("skipped") is None or r.get("skipped") is False
     assert r.get("dat_path") is None, "zero-byte .dat must not be a result"
-    # Caller-level: the worker endpoint turns this into ok:false, not a crash.
-    from services.sim import multiphysics_rpc as mp
-    orig = fa.build_buckling_column_inp
-
-    def bad_gen(*a, **k):
-        gen = orig(*a, **k)
-        return {**gen, "inp": "*GARBAGE\nnot an inp\n"}
-
-    try:
-        fa.build_buckling_column_inp = bad_gen
-        out = mp._sim_run_buckling({})
-    finally:
-        fa.build_buckling_column_inp = orig
-    assert out.get("ok") is False and not out.get("load_factors"), out
 
 
 @needs_ccx
@@ -420,31 +341,6 @@ def test_every_run_fea_tool_outer_ceiling_exceeds_the_inner_ccx_clock():
             f"outer {outer}s — CalculiX's own timeout diagnostic is unreachable")
 
 
-def test_mcp_ccx_call_sites_pass_the_harness_budget_explicitly():
-    """Anti-drift on the wiring: every ``run_ccx`` call in the MCP tool layer —
-    the only layer that runs under agent_turn's outer deadline — must pass the
-    harness budget. run_ccx's 300 s default exists for DIRECT callers (benches,
-    vv_benchmark, the GUI worker seam), which have no outer clock; inheriting it
-    inside a tool re-creates the equality that buried the diagnostic."""
-    import ast
-
-    path = Path(__file__).with_name("cad_sim_tools.py")
-    tree = ast.parse(path.read_text(encoding="utf-8"))
-    sites = [n for n in ast.walk(tree)
-             if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
-             and n.func.attr == "run_ccx"]
-    assert sites, "no run_ccx call sites in cad_sim_tools.py — did they move?"
-    for call in sites:
-        kwargs = {kw.arg: kw.value for kw in call.keywords}
-        assert "timeout" in kwargs, (
-            f"cad_sim_tools.py:{call.lineno} calls run_ccx with no timeout= — it "
-            "inherits the 300 s default and equals the harness ceiling")
-        expr = ast.unparse(kwargs["timeout"])
-        assert expr == "fa.HARNESS_CCX_TIMEOUT_S", (
-            f"cad_sim_tools.py:{call.lineno} passes timeout={expr}, not the "
-            "harness budget")
-
-
 @needs_ccx
 def test_slow_solve_surfaces_ccx_timeout_not_harness_abandonment(monkeypatch, tmp_path):
     """END TO END through the REAL harness dispatcher, with both clocks scaled by
@@ -480,7 +376,7 @@ def test_slow_solve_surfaces_ccx_timeout_not_harness_abandonment(monkeypatch, tm
 
     def _tool_body(_tool, _args):
         time.sleep(setup)                            # deck generation + mesh build
-        gen = fa.build_thermal_bar_inp(200.0, 20.0, 20.0, 50.0, 100.0, 0.0)
+        gen = fa.build_contact_block_inp(20.0, 20.0, 10.0, 200000.0, 0.29, 5.0)
         return fa.run_ccx(gen["inp"], job="thermal", timeout=inner)
 
     t0 = time.time()

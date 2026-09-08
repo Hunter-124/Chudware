@@ -102,26 +102,6 @@ struct CallBudget {
 };
 CallBudget fit_call_budget(const json& provider_cfg, int desired_output);
 
-// --- agent.prewalk strong-plan / cheap-implement handoff ---------------------
-// Nested under config.json "agent": { "prewalk": bool, "prewalk_target": str }.
-// Defaults: prewalk=false, prewalk_target="@smol". Off = today's single-provider
-// behavior (byte-identical). When armed, planning stages keep the strong model;
-// implementation stages (model/fix/execute) switch once to the resolved target.
-struct PrewalkConfig {
-    bool enabled = false;
-    std::string target = "@smol";  // role alias (@smol) or provider[/model] pattern
-};
-PrewalkConfig load_prewalk_config(const json& cfg = json(nullptr));
-
-// Resolve agent.prewalk_target into a provider descriptor (same shape as
-// resolve_provider). Supports:
-//   "@smol" / "smol" / empty → cheapest local (llamacpp or openai-loopback default)
-//   "provider/model" or "provider:model" → that provider + model overlay
-//   bare provider name → resolve_provider(name)
-// Returns null when prewalk is off or the target cannot be resolved (safe no-op).
-// Never throws; offline refusals return null (no-op) rather than {error}.
-json resolve_prewalk_provider(const json& cfg, const json& env = json::object());
-
 // --- eng_firm.models (per-role provider overrides for the Eng. Firm org) ------
 // Nested under config.json "eng_firm": { "models": {
 //   "mission_planner"|"advisor"|"lead"|"subcontractor": {provider, model, thinking},

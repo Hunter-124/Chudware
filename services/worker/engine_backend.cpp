@@ -69,6 +69,7 @@ bool isLongRunMethod(const std::string& method) {
            method == "agent_admin_turn" ||
            method == "sim_mesh" || method == "sim_run_static" ||
            method == "sim_run_modal" || method == "sim_run_fatigue" ||
+           method == "sim_run_buckling" ||
            method == "sim_run_thermal" || method == "sim_run_flow";
 }
 

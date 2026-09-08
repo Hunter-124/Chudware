@@ -2881,3 +2881,56 @@ the honest remedy on this geometry is to mesh FINER, and the measurement is what
 `mesh_separate_solids`, `mesh_step`, `mesh_loaded_model`), `core/sim/mesh_quality.cpp` (fragment
 rule), `core/sim/mesh_size_band.{h,cpp}`, `core/sim/fea_run.cpp` (options, packet, refusal, cache
 key), `core/tests/test_mesh_mechanism.cpp`.
+
+## Real-mesh steady thermal evidence (2026-09-07)
+
+`run_fea_thermal` now shares the transient STEP/fixture/load path and invokes the
+existing steady `sim_run_thermal` engine route. Removed the CalculiX thermal deck
+and migrated its benchmark, tests, advisor, and tool/user guidance. The kernel
+reports maximum Fourier flux at tet integration points alongside temperature
+extrema, mesh quality, engine provenance and temperature VTU. The live 20 mm
+6061-T6 bar regression exposed planar picking tolerance prescribing interior
+node layers; thermal planar selectors now use exact-plane tolerance. Scoped
+thermal/advisor verification: 18 passed in 3.11s with build-fix libchudware.
+
+## Copilot preferences and Auto resolver — overhaul Phases 0–1 (2026-09-07)
+
+`services/agent/preferences.py` now owns the four Copilot preferences, defaults,
+help/derivation metadata and task/document policy. The bundled fanout classifier
+uses only a matching loopback-served model; an unavailable local runtime takes the
+deterministic keyword path without downloading or contacting a cloud model.
+`role_models.py` resolves the new chat/worker/private seats while leaving the
+Advanced per-role table readable. `worker_rpc.py`, `mission_dispatch.py`,
+`copilot_mode_tools.py`, `chudcode_tools.py` and `scripts/run_mission.py` consume the
+same policy; explicit turn model/mode choices remain overrides. Auto reads the
+authenticated Chudcode catalog, emits its selection, and only moves to the next
+cost class after Chudcode's own rate-limit retries finish. Read-only restrictions
+are re-applied after capability floors/on-demand loads; document pressure trims
+tool descriptions and enables session auto-compaction.
+
+Retired the `ai_effort` preset/override API and `effort_presets.yaml`, tier
+`deliberation`, the gym preset tuner/router scaffold selection, and native
+`agent.prewalk_target` resolution. `effort.py` is now task evidence for the
+resolver; tier detection/budgets remain. Council, trigger, capability, DAG,
+gym/bench and regression consumers were migrated without compatibility aliases.
+Native explicit `provider_cfg.prewalk_provider` routing remains; the removed
+`PrewalkConfig`/target resolver has no remaining reader.
+
+Scoped Python proof through the systemd memory wrapper: **685 passed in 24.46s**
+across the preference/model/tier/mission/mode/host-tool/council/trigger/prompt
+regressions; the complete gym diagnostic file: **50 passed in 137.81s**.
+A throwaway resolver smoke exercised the actual unavailable-local-classifier
+fallback, four task kinds, tool restrictions, and local-only refusal; it was
+removed. Native `chudware_agent`/`test_agent` build and CTest `agent` are delegated
+to the session driver's union validation. Settings UI and transparency UI
+Phases 2–3, §14 provider-table retirement, and every VERIFY LATER benchmark remain
+untouched/unrun.
+
+Final integration adds the resolver's simulation-precheck floor at
+`advisor/sim_advisor.py::precheck` while retaining the explicit
+`CHUDWARE_SIM_PRECHECK_BLOCK=0` diagnostic escape. Unpinned mission workers now
+resolve from the actual brief/task class, not an empty-prompt seat lookup.
+Final expanded scoped verification: **811 passed in 22.84s**, including both
+simulation advisor files. Removed a mocked assignment-forwarding test rather
+than repinning its private resolver-call assumption; the Auto rules table tests
+actual model/tool policy outcomes.

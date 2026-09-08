@@ -14,9 +14,6 @@ T-W14 (delegation) is not yet merged.  Seats run as plain provider calls behind 
 delegation-shaped seam (`_run_seat`).  Swap in the real ponder delegation later
 without changing call sites.  Flagged in FEATURE_FLAGGED_TOOLS (`council_convene`).
 
-T-W10 (tiers.yaml) is not yet merged.  Default deliberation dial = ``full``
-(councils always on), per the 2026-07-04 advisor amendment.
-
 T-W19 (buildgraph pipeline) is not yet merged.  Phase-3 gate is feature-flagged
 behind ``CHUDWARE_COUNCIL_BUILDGRAPH`` (default on).
 
@@ -72,17 +69,10 @@ if TYPE_CHECKING:
 COUNCIL_SCHEMA = "aicad.council/1"
 ADVISORY_SCHEMA = "aicad.advisory/1"
 
-# Feature-count threshold above which a build-strategy council is required.
-# Configurable via CHUDWARE_COUNCIL_FEATURE_THRESHOLD env var.
-_DEFAULT_FEATURE_THRESHOLD = 5
-
 # Phase-3 buildgraph seam feature-flag (default on; off = disable must_have
 # injection into buildgraph, e.g. while T-W19 is integrating).
 _BUILDGRAPH_SEAM_ENABLED = os.environ.get("CHUDWARE_COUNCIL_BUILDGRAPH", "1") != "0"
 
-# Deliberation dial: "full" = always on, "minimal" = risk-trigger only.
-# Read from T-W10 tiers.yaml when merged; else default full per 2026-07-04 amendment.
-_DELIBERATION_DEFAULT = os.environ.get("CHUDWARE_COUNCIL_DELIBERATION", "full")
 _DEFAULT_PONDER_ROUND1_TOKENS = 1500
 _DEFAULT_PONDER_ROUND2_TOKENS = 600
 
@@ -907,18 +897,15 @@ def _synthesize(
 # Phase-3 gate
 # ---------------------------------------------------------------------------
 
-def build_strategy_needed(feature_count: int) -> bool:
-    """True if a build-strategy council is required before Phase 3 execution.
+def build_strategy_needed(
+    feature_count: int, *, cfg: Optional[dict] = None,
+) -> bool:
+    """Derive the mission council gate from the user's Copilot preferences."""
+    from services.agent.preferences import resolve_turn_preferences
 
-    Threshold configured via CHUDWARE_COUNCIL_FEATURE_THRESHOLD env var
-    (default 5).  Also checks the deliberation dial: 'minimal' skips unless
-    threshold exceeded AND a risk trigger has fired (risk trigger not implemented
-    here — callers pass the result of their own risk check in that mode).
-    """
-    threshold = int(
-        os.environ.get("CHUDWARE_COUNCIL_FEATURE_THRESHOLD", str(_DEFAULT_FEATURE_THRESHOLD))
-    )
-    return feature_count >= threshold
+    return resolve_turn_preferences(
+        "", cfg=cfg, feature_count=feature_count, task_kind="mission",
+    ).council
 
 
 # ---------------------------------------------------------------------------
@@ -970,6 +957,7 @@ def council_convene(
     tier: Optional[str] = None,
     policy_overrides: Optional[dict] = None,
     policy_path: Optional[Any] = None,
+    cfg: Optional[dict] = None,
 ) -> dict:
     """Convene a council and return the completed aicad.council/1 record.
 
@@ -997,32 +985,30 @@ def council_convene(
                          (all seats from ``_new_council_record``) are used.
         tier:            Tier name (local-24k | local-48k | mid | frontier).
                          When None, no policy breadth capping is applied.
-        policy_overrides: Optional dict passed to ``resolve_policy`` for Advanced
-                         mode / effort preset overrides.
+        policy_overrides: Optional per-call policy passed to ``resolve_policy``.
         policy_path:     Override path for council_policy.yaml (tests).
+        cfg:             Optional Copilot configuration for this review.
 
     Returns:
         A complete or explicitly incomplete aicad.council/1 record.
     """
-    personas = get_seat_personas()
-    record = _new_council_record(kind, topic, inputs)
+    from services.agent.preferences import resolve_preferences
 
-    # Resolve the effort profile exactly once. Calls without a tier retain the
-    # historical budgets and authored four-seat breadth.
+    record = _new_council_record(kind, topic, inputs)
+    if not resolve_preferences(cfg).double_check:
+        record["diagnostics"] = {
+            "policy": {
+                "executed": False,
+                "reason": "Double-check my work is turned off.",
+            },
+        }
+        return _incomplete_council(record, ledger, actor)
+    personas = get_seat_personas()
+
+    # Authored seat and token budgets are implementation policy, not user knobs.
     seat_cap = len(record["seats"])
     round1_tokens = _DEFAULT_PONDER_ROUND1_TOKENS
     round2_tokens = _DEFAULT_PONDER_ROUND2_TOKENS
-    if tier is not None:
-        from services.agent.effort import resolve_effort
-        effort_values = resolve_effort(tier).values
-        seat_cap = max(1, min(
-            len(record["seats"]),
-            int(effort_values.get("council_seats", seat_cap)),
-        ))
-        round1_tokens = int(effort_values.get(
-            "ponder_round1_tokens", round1_tokens))
-        round2_tokens = int(effort_values.get(
-            "ponder_round2_tokens", round2_tokens))
 
     # T-DP8: resolve policy when stage+tier provided; apply breadth + diversity.
     policy: Optional[CouncilPolicy] = None

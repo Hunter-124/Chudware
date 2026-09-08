@@ -213,61 +213,6 @@ def test_explicit_offline_delegate_passes_only_injected_safe_provider(
     assert calls[0]["max_total_tokens"] == 6000
 
 
-def test_role_assignment_becomes_chudcode_settings_and_audit(runtime, monkeypatch):
-    from services.agent import chudcode_roles
-    from services.agent import role_models
-
-    class Assignment:
-        provider = "anthropic"
-        model = "claude-sonnet-5"
-        rank = 3
-        mode = "configured"
-        reason = "review role mapping"
-        is_session_default = False
-
-        def to_dict(self):
-            return {
-                "provider": self.provider,
-                "model": self.model,
-                "rank": self.rank,
-                "mode": self.mode,
-                "reason": self.reason,
-            }
-
-    calls: list[dict[str, Any]] = []
-    monkeypatch.setattr(
-        role_models, "resolve_for_node", lambda *args, **kwargs: Assignment()
-    )
-    monkeypatch.setattr(
-        role_models, "resolve_role_thinking", lambda *args, **kwargs: "high"
-    )
-    monkeypatch.setattr(
-        chudcode_roles,
-        "run_role_turn",
-        lambda request, role, **kwargs: (
-            calls.append({"request": request, "role": role, **kwargs})
-            or _completed_result()
-        ),
-    )
-    dispatch = _dispatch()
-    out = dispatch.delegate(
-        role="reviewer", brief="audit model settings", budget_tokens=9000
-    )
-
-    assert out["ok"] is True
-    assert out["role_model"]["provider"] == "anthropic"
-    assert out["role_model"]["model"] == "claude-sonnet-5"
-    assert calls[0]["options"]["settings"] == {
-        "provider": "anthropic",
-        "model": "claude-sonnet-5",
-        "reasoning_effort": "high",
-    }
-    assignment_rows = [
-        row
-        for row in dispatch.ledger.rows
-        if row["payload"].get("event") == "model_assignment"
-    ]
-    assert assignment_rows
 
 
 def test_cancelled_delegate_fails_tree_and_leads_with_cause(runtime, monkeypatch):

@@ -35,7 +35,7 @@ namespace ui {
 
 // T-FIN24: one Simulate workspace hosts EVERY study kind. Flow/Thermal are the OpenFOAM/LBM
 // CFD family; ThermalFea is the core conduction solver (sim_run_thermal, steady + T-FIN18
-// transient); Buckling/Contact are CalculiX box proxies via the worker's multiphysics seam;
+// transient); Buckling is engine linear buckling; Contact is a CalculiX box proxy;
 // FreqResponse is modal superposition (core modal + worker vibration post-processing).
 enum class StudyType { Static, Modal, Flow, Fatigue, Thermal, Motion,
                        ThermalFea, Buckling, Contact, FreqResponse };
@@ -139,14 +139,12 @@ struct Study {
   std::vector<float> meshAspectHist; // 10 buckets
   std::string meshTypeUsed;
   std::string meshNote;
-    int nModes = 6;                 // modal
+    int nModes = 6;                 // modal / buckling
 
     // Static: which failure theory drives the headline FoS + the FoS plot field.
     FailureCriterion criterion = FailureCriterion::VonMises;
 
     // ---- T-FIN24 study kinds -----------------------------------------------------------
-    // Buckling (CalculiX box-proxy Euler column): compressive load magnitude λ scales.
-    float bucklingLoadN = 1000.0f;
     // Contact (CalculiX two-block proxy): pressure on the upper block.
     float contactPressureMpa = 1.0f;
     // Frequency response (modal superposition over the core modal solve).
@@ -583,7 +581,7 @@ private:
                         const char* xlabel, const char* ylabel);
 
     // ---- T-FIN24: multiphysics capability doctor + panels ----------------------------------
-    // sim_caps probe (worker multiphysics seam): CalculiX presence (buckling/contact), the
+    // sim_caps probe (worker multiphysics seam): CalculiX presence (contact), the
     // vibration post leg, and which cross-sim handoff endpoints are servable. Probed once
     // asynchronously when the Simulate workspace activates; drives honest gating (fw_status
     // pattern: absent legs show doctor guidance, never dead buttons).
@@ -677,13 +675,12 @@ private:
 
     // T-FIN24 runs.
     void runThermalFea(AppState& st, Study& s);       // SimClient sim_run_thermal
-    void runBuckling(AppState& st, Study& s);         // worker sim_run_buckling (async rpc)
     void runContact(AppState& st, Study& s);          // worker sim_run_contact (async rpc)
     void runFreqResponse(AppState& st, Study& s);     // modal solve, post in tick completion
     void postFreqResponse(AppState& st, Study& s, const nlohmann::json& modalRes,
                           const std::string& docId);
     bool advRunning_ = false;                          // an async worker study run in flight
-    // Model bbox from the face-centroid cache (proxy dims for buckling/contact).
+    // Model bbox from the face-centroid cache (proxy dimensions for contact).
     bool modelBbox(AppState& st, float lo[3], float hi[3]) const;
     // Draw the results block for the T-FIN24 kinds (tables + line plots, no overlay).
     void drawAdvancedResults(AppState& st, Study& s);

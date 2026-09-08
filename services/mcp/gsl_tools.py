@@ -1186,6 +1186,7 @@ def _describe_assembly_text(doc_id: str) -> str:
         else:
             origin_txt = "origin ?"
         psrc = placement_source_of(doc_id, b.get("component"))
+        b["placement_source"] = psrc
         psrc_txt = f", placed by {psrc}" if psrc else ""
         lines.append(f"  {name}: {size_txt}, {origin_txt}{psrc_txt}  "
                      f"(source: asm_world_bodies)")
@@ -1230,7 +1231,7 @@ def _describe_assembly_text(doc_id: str) -> str:
 
     lines.append("\n(Source: asm_world_bodies, eval_interference, doc_solve_mates — "
                  "numbers narrated, never recomputed)")
-    return _dumps({"ok": True, "text": "\n".join(lines)})
+    return _dumps({"ok": True, "text": "\n".join(lines), "bodies": bodies})
 
 
 def _board_power_lines(engs: list, label: str) -> list:

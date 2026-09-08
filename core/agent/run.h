@@ -148,11 +148,11 @@ json worker_actor_from_options(const json& options);
 //               doc_dry_run_ops / doc_undo all route to this session.
 // provider_cfg  the resolved provider descriptor:
 //                 {name:"anthropic"|"openai"|"llamacpp", model, api_key, base_url,
-//                  supports_vision}
+//                  supports_vision, prewalk_provider?: <implementation-stage descriptor>}
 //               OR, for the parity gate, the role-scripted mock:
 //                 {name:"mock", replies:{<role>:[reply,...], ...}}
 // emit          optional event callback (may be empty).
-// options       {run_id?, budgets?, prompts_dir?, offline?, prewalk?, prewalk_target?,
+// options       {run_id?, budgets?, prompts_dir?, offline?,
 //                capability?, cam?,
 //                // Copilot mode overhaul (agent|plan|swarm|edit|ask|eng_firm):
 //                mode?,            // "agent"|"plan"|"swarm"|"edit"|"ask"|"eng_firm"

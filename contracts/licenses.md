@@ -177,3 +177,13 @@ row in the same change" rule.
 | package | license | role | posture |
 |---|---|---|---|
 | **Chudcode** (`Hunter-124/chudcode`, artifact-locked commit `e3d8790f50d33a86ef7b295eeeda504fd6399835`) | **MIT** | compiled protocol-v2 online agent runtime for providers, sessions, auth, memory, compaction, browser/computer, STT, and host-tool orchestration | ok — **subprocess/RPC-only** behind `vendor/chudcode/CHUDCODE_ARTIFACT.lock`; Chudware never imports or vendors the Chudcode engine source. The compiled binary's Bun-embedded runtime and all bundled third-party packages, fonts, stb/native-GUI code, and ASR components are covered by the shipped `CHUDCODE-NOTICE` and `CHUDCODE-THIRD-PARTY-NOTICES.txt`; their SHA-256 values are lock-validated and both files are required in every signed desktop/web payload. No OMP source/runtime boundary remains in Chudware. |
+
+## Native linear buckling cutover (2026-09-07)
+
+The historical CalculiX buckling role above is superseded. `run_fea_buckling` and
+`sim_run_buckling` use Chudware's in-process static prestress, geometric stiffness,
+and shared Spectra generalized eigensolver, on the real tet4/tet10 CAD mesh.
+No CalculiX executable, deck generator, or parser is used for buckling. This adds
+no dependency: the existing Eigen/Spectra and optional CHOLMOD solver stack is
+reused. CalculiX retains its existing subprocess-only posture for remaining
+non-buckling tools and validation scenarios.

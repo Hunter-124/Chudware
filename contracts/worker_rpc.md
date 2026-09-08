@@ -1020,3 +1020,104 @@ rung). When any leg's ratio leaves `0.8x .. 1.25x`, the reply's existing `note` 
 sentence naming those legs — no second note field. The per-leg `.vtu` filename keeps
 carrying the REQUESTED size (`_h<size>_`); `delivered_size_mm` is the truth about the mesh
 behind the file.
+
+## Assembly placement provenance persistence (append-only, 2026-09-07)
+
+Assembly placement provenance uses the existing `doc_set_meta` / `doc_get_meta`
+document-metadata RPCs under key `placement_sources`. Its value maps component IDs
+to `{"placement_source": "transform" | "mate" | "origin", "at_revision": integer | null}`.
+`at_revision` is the engine revision at placement; metadata writes mark the document
+dirty without advancing its geometry revision.
+
+This record is part of the document JSON inside the `.step+` container, not process
+memory or a separate file. Save, close, and reopen retain the provenance even though
+the reopened document has a fresh runtime ID. A persisted `"mate"` record takes
+precedence over later starting-pose `"transform"` notes. Missing records (including
+imported components without recorded provenance) remain `null`, never inferred.
+
+`list_world_bodies` and `describe_assembly` expose `bodies[].placement_source` from
+this persisted record; `describe_assembly` retains its placement narrative alongside
+the structured `bodies` result.
+
+## Steady thermal part-mesh evidence (append-only, 2026-09-07)
+
+`run_fea_thermal` without `transient` now dispatches `sim_run_thermal` without a
+`study.transient` object, using the same part STEP meshing and face-selector
+resolution as transient conduction. The engine runs `fea_thermal_solve`; fixed
+temperature fixtures, constant heat-flux loads and convection are supported.
+Time schedules require the transient route. No CalculiX executable is required.
+
+Successful steady packets carry `summary`, `temperature_max_c`,
+`temperature_min_c`, `flux_max_w_m2` (maximum Fourier flux magnitude sampled at
+element integration points), `n_nodes`, `n_elems`, `mesh_quality`, and
+`provenance.solver="engine"`. An optional absolute `vtu_path` writes the actual
+part mesh with nodal `temperature`. Nodal temperatures persist in the document
+study. Steady packets have no frame/time axis.
+
+## 27. Engine linear buckling — `sim_run_buckling` (append-only, 2026-09-07)
+
+This supersedes the historical CalculiX box-proxy `sim_run_buckling` row in section 4.
+The only route is the native engine: `chudware_call("sim_run_buckling", params_json,
+&out_json)` follows the modal C ABI (release the reply with `chudware_free`), and
+the worker and Python core bridge preserve that route without a CalculiX fallback.
+
+Request: `{study, n_modes?: 4}`, with integer `n_modes` from 1 through 100.
+`study` has the static study's real STEP path or flat inline `points`/`tets`
+plus `nodes_per_elem` (4 or 10), elastic
+`material:{E_mpa,nu}`, fixtures, and reference force/pressure loads. It uses the
+same exterior-face resolution and tet10 work-equivalent force/pressure
+distribution as static; positive pressure is MPa inward. A STEP study defaults
+to quadratic tet10 and accepts the current shared mesh sizing controls. Inline
+connectivity is never reinterpreted by mesh order. `job_id` remains cancellable
+through `sim_cancel`.
+
+The engine solves the elastic reference-load state, assembles its geometric
+stiffness, then solves the linear buckling eigenproblem. The requested modes are
+the smallest positive finite load factors. No compressive reference stress or no
+positive buckling modes is an `ok:false` refusal with `error` and `reason`, not an
+Euler estimate, skipped success or a fabricated positive factor. Plasticity,
+contact/bonded-gap interfaces, and adaptive-static requests are refused rather
+than ignored.
+
+Successful packets carry these top-level fields:
+
+* `modes:[{load_factor, participation:{x,y,z}}]`, `load_factors`, `n_modes`,
+  `n_nodes`, `n_dof`, `n_elems`, and flat `mode_shapes[n_modes*n_nodes*3]`.
+  Each shape includes fixed-node zeros and is normalized to maximum absolute
+  component 1; it has arbitrary amplitude, not a physical displacement in mm.
+* `participation` is a directional shape measure:
+  `p_c = sum_i(phi[i,c]^2) / sum_i,c(phi[i,c]^2)`. Its nonnegative x/y/z shares
+  sum to 1 and are independent of mode sign/amplitude. This is not effective
+  modal mass, which is not defined by this buckling eigenproblem.
+  `participation_measure` names that reduction.
+* `critical_load_factor` is the first positive factor.
+  `reference_resultant_n` is the vector sum of the assembled reference nodal
+  forces; `reference_load_n` is its magnitude. `critical_load_n` equals
+  `critical_load_factor * reference_load_n`, not the sum of load magnitudes.
+  A zero resultant (including numerical cancellation relative to the applied
+  forces) is refused: a scalar critical resultant load is undefined for
+  self-equilibrated loading, even if that loading produces compression.
+* `mesh_quality`, `mesh_type_used`, `solver_notes`, `solver:"engine"` and
+  `provenance` with `solver:"engine"`, `analysis:"linear_buckling"`,
+  `engine_build_id`, `polymesh_commit` and timestamp.
+
+An optional absolute `study.vtu_path` writes the actual solved mesh with one
+three-component point field `mode_1`, `mode_2`, ... for each normalized shape,
+using the modal VTU convention. Its path is echoed only after the write succeeds.
+Failures retain mesh evidence when it was resolved; pre-solve refusals have null
+critical values rather than a plausible zero.
+
+### Buckling search ceiling (2026-09-08)
+
+`sim_run_buckling` also accepts top-level `max_load_factor`, finite and positive,
+default `10000`. `run_fea_buckling` exposes the same parameter. This is an explicit
+engineering search ceiling: a critical load at or above that multiple of the
+reference load is reported as no buckling mode below the chosen ceiling, not as
+infinite strength. Results and in-band refusals echo `max_load_factor`.
+
+The reciprocal pencil is `K_G phi = mu K phi`, with `lambda = -1/mu`. The negative
+pivot count of `LDLT(K_G + epsilon K)`, `epsilon = 1/max_load_factor`, determines
+how many modes satisfy `0 < lambda < max_load_factor`. Zero count returns
+`ok:false` and a reason naming the ceiling and epsilon; otherwise the shared
+CHOLMOD/LDLT Cholesky eigen path requests at most that count and `n_modes`.
+No element stresses are filtered and no load direction is special-cased.

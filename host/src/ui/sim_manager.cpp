@@ -170,7 +170,7 @@ static bool isFlowFamily(StudyType t) {
 
 static bool supportsLearnedAdvisor(StudyType t) {
   return t == StudyType::Static || t == StudyType::Modal ||
-         t == StudyType::ThermalFea;
+         t == StudyType::ThermalFea || t == StudyType::Buckling;
 }
 
 static const char *studyTypeKey(StudyType t) {
@@ -1224,11 +1224,9 @@ nlohmann::json SimManager::studyToJson(const Study &s) {
         {"loop", s.motionLoop},
         {"fps", s.motionFps},
         {"check_interference", s.motionCheckInterference}}},
-      // T-FIN24 study kinds (buckling/contact proxies, frequency response,
-      // thermal FEA).
+      // Advanced study settings (contact proxy, vibration, thermal FEA).
       {"adv",
-       {{"buckling_load_n", s.bucklingLoadN},
-        {"contact_pressure_mpa", s.contactPressureMpa},
+       {{"contact_pressure_mpa", s.contactPressureMpa},
         {"fr_dir", s.frDir},
         {"fr_zeta", s.frZeta},
         {"fr_base_g", s.frBaseG},
@@ -1319,7 +1317,6 @@ Study SimManager::studyFromJson(const nlohmann::json &j) {
   }
   if (j.contains("adv") && j["adv"].is_object()) {
     const auto &av = j["adv"];
-    s.bucklingLoadN = av.value("buckling_load_n", 1000.0f);
     s.contactPressureMpa = av.value("contact_pressure_mpa", 1.0f);
     s.frDir = av.value("fr_dir", 2);
     s.frZeta = av.value("fr_zeta", 0.02f);
@@ -1486,6 +1483,8 @@ void SimManager::newStudy(AppState &st, StudyType t) {
   refresh(st);
   Study s;
   s.type = t;
+  if (t == StudyType::Buckling)
+    s.nModes = 4;
   s.name = std::string(studyTypeLabel(t)) + " " +
            std::to_string((int)studies_.size() + 1);
   // Structural & frequency studies need a material (stiffness/density/yield).
@@ -1582,8 +1581,8 @@ bool SimManager::handleCommand(AppState &st, const std::string &cmdId) {
   // pane) immediately.
   auto newAndOpen = [&](StudyType t) {
 #ifdef __EMSCRIPTEN__
-    if (isFlowFamily(t) || t == StudyType::Buckling ||
-        t == StudyType::Contact || t == StudyType::FreqResponse) {
+    if (isFlowFamily(t) || t == StudyType::Contact ||
+        t == StudyType::FreqResponse) {
       st.toast(ui::ToastLevel::Warn, "not available in the web version yet");
       return true;
     }
@@ -3987,8 +3986,8 @@ void SimManager::run(AppState &st, Study &s) {
     return;
   }
 #ifdef __EMSCRIPTEN__
-  if (isFlowFamily(s.type) || s.type == StudyType::Buckling ||
-      s.type == StudyType::Contact || s.type == StudyType::FreqResponse) {
+  if (isFlowFamily(s.type) || s.type == StudyType::Contact ||
+      s.type == StudyType::FreqResponse) {
     block("not available in the web version yet");
     return;
   }
@@ -4002,8 +4001,7 @@ void SimManager::run(AppState &st, Study &s) {
       return;
     }
   }
-  if (s.type == StudyType::Buckling || s.type == StudyType::Contact ||
-      s.type == StudyType::FreqResponse) {
+  if (s.type == StudyType::Contact || s.type == StudyType::FreqResponse) {
     if (capsStatus_ == 0) {
       probeCaps(st);
       block("Checking simulation capabilities; run again when the capability check completes.");
@@ -4013,7 +4011,7 @@ void SimManager::run(AppState &st, Study &s) {
       block("The advanced simulation capability probe failed; the worker route is unavailable.");
       return;
     }
-    if ((s.type == StudyType::Buckling || s.type == StudyType::Contact) &&
+    if (s.type == StudyType::Contact &&
         (!caps_.contains("ccx") || !caps_["ccx"].is_object() ||
          !caps_["ccx"].value("found", false))) {
       block(caps_.contains("ccx") && caps_["ccx"].is_object()
@@ -4037,8 +4035,7 @@ void SimManager::run(AppState &st, Study &s) {
       return;
     }
   }
-  if (s.type != StudyType::Motion && s.type != StudyType::Buckling &&
-      s.type != StudyType::Contact && !st.simClient) {
+  if (s.type != StudyType::Motion && s.type != StudyType::Contact && !st.simClient) {
     block("The simulation backend is unavailable.");
     return;
   }
@@ -4054,8 +4051,6 @@ void SimManager::run(AppState &st, Study &s) {
     runFatigue(st, s);
   else if (s.type == StudyType::ThermalFea)
     runThermalFea(st, s);
-  else if (s.type == StudyType::Buckling)
-    runBuckling(st, s);
   else if (s.type == StudyType::Contact)
     runContact(st, s);
   else if (s.type == StudyType::FreqResponse)
@@ -4241,7 +4236,7 @@ void SimManager::runStaticOrModal(AppState &st, Study &s) {
   for (const auto &pick : s.fixtures.picks)
     prep->fixtureSelectors.push_back(pick.selector);
   prep->fixtures.resize(prep->fixtureSelectors.size());
-  if (s.type == StudyType::Static) {
+  if (s.type == StudyType::Static || s.type == StudyType::Buckling) {
     prep->loads.reserve(s.loads.size());
     for (const auto &load : s.loads) {
       StaticModalPrep::Load snap;
@@ -4411,7 +4406,8 @@ void SimManager::finishStaticModalPrep(
                         "Simulation cancelled: source document was closed");
     return;
   }
-  if (prep->type == StudyType::Static && prep->fixtures.empty()) {
+  if ((prep->type == StudyType::Static || prep->type == StudyType::Buckling) &&
+      prep->fixtures.empty()) {
     failStaticModalPrep(st, prep, "Add a fixture before running");
     return;
   }
@@ -4423,15 +4419,14 @@ void SimManager::finishStaticModalPrep(
                           {"material", prep->material},
                           {"fixtures", std::move(fixtures)}};
   addMeshParams(study, prep->meshOptions,
-                prep->type == StudyType::Static
-                    ? prep->meshOptions.meshOrder
-                    : 1,
+                (prep->type == StudyType::Static || prep->type == StudyType::Buckling)
+                    ? prep->meshOptions.meshOrder : 1,
                 supportsLearnedAdvisor(prep->type));
 
   std::string note;
   bool launched = false;
   const std::uint64_t token = prep->reservationToken;
-  if (prep->type == StudyType::Static) {
+  if (prep->type == StudyType::Static || prep->type == StudyType::Buckling) {
     nlohmann::json loads = nlohmann::json::array();
     for (const auto &load : prep->loads) {
       nlohmann::json points = nlohmann::json::array();
@@ -4453,10 +4448,14 @@ void SimManager::finishStaticModalPrep(
       loads.push_back(std::move(item));
     }
     study["loads"] = std::move(loads);
-    const char *method =
-        prep->meshOptions.adaptEnabled ? "sim_run_adaptive" : "sim_run_static";
-    launched = prep->sim->launch(method, {{"study", study}}, note, prep->docId,
-                                 token);
+    const char *method = prep->type == StudyType::Buckling
+                             ? "sim_run_buckling"
+                             : (prep->meshOptions.adaptEnabled
+                                    ? "sim_run_adaptive" : "sim_run_static");
+    nlohmann::json params{{"study", std::move(study)}};
+    if (prep->type == StudyType::Buckling)
+      params["n_modes"] = prep->nModes;
+    launched = prep->sim->launch(method, std::move(params), note, prep->docId, token);
   } else {
     launched = prep->sim->launch(
         "sim_run_modal", {{"study", study}, {"n_modes", prep->nModes}}, note,
@@ -4929,6 +4928,29 @@ void SimManager::drainSimClientJob(AppState &st) {
       }
       s.hasResult = true;
       st.addLog("[sim] flow done: " + s.summary);
+    } else if (s.type == StudyType::Buckling) {
+      double factor = 0.0, critical = 0.0;
+      if (!finiteNumber(res, "critical_load_factor", factor) || factor <= 0.0 ||
+          !finiteNumber(res, "critical_load_n", critical) || critical <= 0.0 ||
+          !res.contains("modes") || !res["modes"].is_array() || res["modes"].empty()) {
+        rejectResult("buckling solver returned no finite positive mode");
+        return;
+      }
+      s.nNodes = res.value("n_nodes", 0);
+      s.nElems = res.value("n_elems", 0);
+      s.nDof = res.value("n_dof", 0);
+      s.advResult = nlohmann::json::object();
+      for (const char *key : {"modes", "critical_load_factor", "critical_load_n",
+                              "reference_load_n", "mesh_quality", "provenance",
+                              "vtu_path"})
+        if (res.contains(key))
+          s.advResult[key] = res[key];
+      char text[160];
+      std::snprintf(text, sizeof(text),
+                    "lowest load factor %.3g (critical %.4g N)", factor, critical);
+      s.summary = text;
+      s.hasResult = true;
+      st.addLog("[sim] buckling done: " + s.summary);
     } else if (s.type == StudyType::ThermalFea) {
       // Conduction solve (steady or T-FIN18 transient): numeric summary only —
       // the core returns the nodal temperature field but packages no display
@@ -5177,11 +5199,15 @@ void SimManager::drainSimClientJob(AppState &st) {
       case StudyType::ThermalFea:
         st.status = "Thermal FEA complete";
         break;
+      case StudyType::Buckling:
+        st.status = "Linear buckling complete";
+        break;
       default:
         break;
       }
       if (s.type == StudyType::Static || s.type == StudyType::Modal ||
-          s.type == StudyType::Fatigue || s.type == StudyType::ThermalFea)
+          s.type == StudyType::Fatigue || s.type == StudyType::ThermalFea ||
+          s.type == StudyType::Buckling)
         st.statusKind = adaptUnproven ? 1 : 0;
     }
     // Cache the summary into the document so it reopens with the last-run
@@ -5209,8 +5235,8 @@ static bool studyReady(const Study &s, std::string &blocker) {
     return true;
   }
 #ifdef __EMSCRIPTEN__
-  if (isFlowFamily(s.type) || s.type == StudyType::Buckling ||
-      s.type == StudyType::Contact || s.type == StudyType::FreqResponse) {
+  if (isFlowFamily(s.type) || s.type == StudyType::Contact ||
+      s.type == StudyType::FreqResponse) {
     blocker = "not available in the web version yet";
     return false;
   }
@@ -5285,7 +5311,7 @@ static bool studyReady(const Study &s, std::string &blocker) {
   }
   if (s.type == StudyType::Static || s.type == StudyType::Modal ||
       s.type == StudyType::Fatigue || s.type == StudyType::ThermalFea ||
-      s.type == StudyType::FreqResponse) {
+      s.type == StudyType::FreqResponse || s.type == StudyType::Buckling) {
     if (!finite(s.meshFineness) || s.meshFineness < 0.0f ||
         s.meshFineness > 1.0f || !finite(s.meshTargetMm) ||
         s.meshTargetMm < 0.0f || !finite(s.meshMinMm) ||
@@ -5298,12 +5324,9 @@ static bool studyReady(const Study &s, std::string &blocker) {
     }
   }
 
-  if (s.type == StudyType::Buckling) {
-    if (!finite(s.bucklingLoadN) || s.bucklingLoadN <= 0.0f) {
-      blocker = "Buckling needs a finite positive compressive load.";
-      return false;
-    }
-    return true;
+  if (s.type == StudyType::Buckling && (s.nModes < 1 || s.nModes > 100)) {
+    blocker = "Buckling requires between 1 and 100 modes.";
+    return false;
   }
   if (s.type == StudyType::Contact) {
     if (!finite(s.contactPressureMpa) || s.contactPressureMpa <= 0.0f) {
@@ -5646,9 +5669,8 @@ void SimManager::drawTreeBody(AppState &st) {
            webNoPy ? webNoPyHint : vibrationHint});
       kEntries.push_back({Kind::Fea, StudyType::Buckling, "Buckling",
                           studyTypeIcon(StudyType::Buckling),
-                          "Critical load factors (CalculiX box proxy).",
-                          webNoPy || ccxMissing,
-                          webNoPy ? webNoPyHint : ccxHint});
+                          "Engine linear buckling on the part mesh and selected loads.",
+                          false, ""});
       kEntries.push_back({Kind::Fea, StudyType::Contact, "Contact",
                           studyTypeIcon(StudyType::Contact),
                           "Nonlinear contact conservation check (CalculiX).",
@@ -6037,13 +6059,10 @@ void SimManager::drawStudyRow(AppState &st, int i) {
     if (s.type == StudyType::Thermal)
       child("study_thermal", "Heat source / wall BC", SimNode::Study, true,
             "Configure the thermal boundary condition in the study form.");
-    // T-FIN24 kinds: type-level setup entry points. The ccx proxies have no
-    // per-face setup (they solve a box proxy sized to the part), so
-    // fixtures/loads/mesh nodes are hidden for them below.
+    // Buckling uses ordinary fixture/load/mesh nodes; only contact remains a proxy.
     if (s.type == StudyType::Buckling)
-      child(
-          "study_static", "Proxy load / modes", SimNode::Study, true,
-          "Compressive load and mode count for the eigenvalue buckling solve.");
+      child("study_static", "Buckling modes", SimNode::Study, true,
+            "Mode count for the engine linear buckling solve.");
     if (s.type == StudyType::Contact)
       child("study_static", "Contact pressure", SimNode::Study, true,
             "Pressure on the two-block contact proxy.");
@@ -6054,8 +6073,7 @@ void SimManager::drawStudyRow(AppState &st, int i) {
       child("study_thermal", "Conductivity / transient", SimNode::Study, true,
             "Solid conductivity and the optional transient time settings.");
 
-    const bool proxyKind =
-        (s.type == StudyType::Buckling || s.type == StudyType::Contact);
+    const bool proxyKind = s.type == StudyType::Contact;
     if (!isFlowFamily(s.type) && !proxyKind) {
       bool hasFix = !s.fixtures.empty();
       child("fixture",
@@ -8419,28 +8437,11 @@ void SimManager::drawForm(AppState &st, Study &s) {
     } else if (s.type == StudyType::Buckling) {
       drawStudyTypeBanner(
           s.type,
-          "Linear (eigenvalue) buckling via CalculiX: critical load factors "
-          "for "
-          "slender members. Solves a BOX PROXY sized to the part bounding box "
-          "(fixed-free column) — an Euler-grade estimate, honest for "
-          "strut-like parts.");
-      if (capsStatus_ == 1 && caps_.contains("ccx") &&
-          !caps_["ccx"].value("found", false)) {
-        kit::dimText(
-            caps_["ccx"]
-                .value("hint", std::string("CalculiX (ccx) not found."))
-                .c_str());
-      }
-      ImGui::SeparatorText("Compressive load");
-      ImGui::SetNextItemWidth(-FLT_MIN);
-      if (ImGui::InputFloat("##buckload", &s.bucklingLoadN, 0, 0,
-                            "P = %.0f N")) {
-      }
-      if (ImGui::IsItemDeactivatedAfterEdit())
-        persist(st, s);
-      simTip("Axial compressive load the factors scale: critical load = P x "
-             "lambda. "
-             "lambda < 1 means the part buckles below this load.");
+          "Engine linear buckling on the actual part mesh. Add fixed faces and "
+          "compressive force or pressure loads. The positive eigenvalues scale "
+          "that reference load pattern; a factor below 1 means instability below "
+          "the applied load. No box proxy or CalculiX is used.");
+      ImGui::SeparatorText("Buckling modes");
       ImGui::SetNextItemWidth(-FLT_MIN);
       if (ImGui::SliderInt("##buckmodes", &s.nModes, 1, 8, "%d modes")) {
       }
@@ -8545,8 +8546,7 @@ void SimManager::drawForm(AppState &st, Study &s) {
       blocker = "Motion studies require an active assembly document.";
     }
     if (ready && s.type != StudyType::Motion &&
-        s.type != StudyType::Buckling && s.type != StudyType::Contact &&
-        !st.simClient) {
+        s.type != StudyType::Contact && !st.simClient) {
       ready = false;
       blocker = "The simulation backend is unavailable.";
     }
@@ -8561,16 +8561,14 @@ void SimManager::drawForm(AppState &st, Study &s) {
             "OpenFOAM is not routed by this backend; thermal CFD is unavailable.";
       }
     }
-    if (ready && (s.type == StudyType::Buckling ||
-                  s.type == StudyType::Contact ||
+    if (ready && (s.type == StudyType::Contact ||
                   s.type == StudyType::FreqResponse)) {
       if (capsStatus_ <= 0) {
         ready = false;
         blocker = capsStatus_ == 0
                       ? "Checking advanced simulation capabilities."
                       : "Advanced simulation capability probe failed.";
-      } else if ((s.type == StudyType::Buckling ||
-                  s.type == StudyType::Contact) &&
+      } else if (s.type == StudyType::Contact &&
                  (!caps_.contains("ccx") || !caps_["ccx"].is_object() ||
                   !caps_["ccx"].value("found", false))) {
         ready = false;
@@ -9756,8 +9754,8 @@ void SimManager::drawMotionResults(AppState &st, Study &s) {
 //
 // One Simulate workspace for every study kind. The pieces below add: the
 // sim_caps / fw_status capability probes (honest gating), the four new
-// study-kind runs (thermal FEA on the core conduction solver; CalculiX
-// buckling/contact box proxies + modal-superposition frequency response via the
+// study-kind runs (thermal FEA and linear buckling on the core mesh solvers;
+// CalculiX contact proxy + modal-superposition frequency response via the
 // worker's multiphysics seam), the stateless electronics-SPICE and firmware-
 // emulation panels, and the cross-sim handoff panel (aicad.simhandoff/1: ECAD
 // board -> thermal FEA + the T-FIN17 heatsink-pick forward seam). All async
@@ -10022,101 +10020,6 @@ void SimManager::runThermalFea(AppState &st, Study &s) {
 // ---------------------------------------------------------------- ccx proxy
 // runs (worker seam)
 
-void SimManager::runBuckling(AppState &st, Study &s) {
-  float lo[3], hi[3];
-  if (!modelBbox(st, lo, hi)) {
-    st.toast(ui::ToastLevel::Warn,
-             "No model geometry to size the buckling proxy from");
-    return;
-  }
-  int mi = materialIndexByKey(s.materialKey);
-  if (mi < 0) {
-    st.toast(ui::ToastLevel::Warn, "Pick a material first");
-    return;
-  }
-  const auto &m = materials()[mi];
-  // Column axis = the longest bbox extent; the two others are the section.
-  float d[3] = {hi[0] - lo[0], hi[1] - lo[1], hi[2] - lo[2]};
-  int ax = (d[1] > d[0]) ? 1 : 0;
-  if (d[2] > d[ax])
-    ax = 2;
-  const float L = std::max(1.0f, d[ax]);
-  const float b = std::max(1.0f, d[(ax + 1) % 3]);
-  const float h = std::max(1.0f, d[(ax + 2) % 3]);
-  nlohmann::json params = {{"L_mm", L},          {"b_mm", b},
-                           {"h_mm", h},          {"E_mpa", m.E_mpa},
-                           {"nu", m.nu},         {"load_n", s.bucklingLoadN},
-                           {"n_modes", s.nModes}};
-  clearTransientResult(s);
-  persist(st, s);
-  resultShown_ = false;
-  shownStudyId_.clear();
-  advRunning_ = true;
-  s.summary = "Solving (CalculiX)\xe2\x80\xa6";
-  const std::string sid = s.id;
-  const std::string docId = st.docMirror.docId();
-  st.rpc.call(
-      "sim_run_buckling", params,
-      [this, &st, sid, docId](const core::RpcResult &r) {
-        advRunning_ = false;
-        for (auto &stu : studies_) {
-          if (stu.id != sid)
-            continue;
-          auto fail = [&](std::string message) {
-            stu.hasResult = false;
-            stu.summary = std::move(message);
-            persist(st, docId, stu);
-            st.addLog("[sim] " + stu.summary);
-            if (simOriginActive(st, this, docId)) {
-              st.status = stu.summary;
-              st.statusKind = 2;
-              st.toast(ui::ToastLevel::Error, stu.summary);
-            }
-          };
-          if (!r.ok || !r.result.is_object()) {
-            fail("Buckling run failed: " +
-                 (r.err.empty() ? std::string("worker error") : r.err));
-            return;
-          }
-          if (!simJsonBool(r.result, "ok", false)) {
-            fail("Buckling: " +
-                 simJsonText(r.result, "error", "reason", "solve failed"));
-            return;
-          }
-          double l0 = 0.0, applied = 0.0;
-          if (!r.result.contains("load_factors") ||
-              !r.result["load_factors"].is_array() ||
-              r.result["load_factors"].empty() ||
-              !r.result["load_factors"][0].is_number() ||
-              !std::isfinite(
-                  l0 = r.result["load_factors"][0].get<double>()) ||
-              l0 <= 0.0 ||
-              !finiteNumber(r.result, "applied_load_n", applied) ||
-              applied <= 0.0) {
-            fail(
-                "Buckling run failed: solver returned no finite positive mode");
-            return;
-          }
-          stu.advResult = r.result;
-          stu.advisor = parseAdvisor(r.result);
-          stu.hasResult = true;
-          char buf[160];
-          std::snprintf(buf, sizeof(buf),
-                        "lowest load factor %.3g (critical %.4g N)", l0,
-                        l0 * applied);
-          stu.summary = buf;
-          persist(st, docId, stu);
-          node_ = SimNode::Results;
-          st.addLog("[sim] buckling done: " + stu.summary);
-          if (simOriginActive(st, this, docId)) {
-            st.status = "Buckling complete";
-            st.statusKind = 0;
-          }
-          return;
-        }
-      },
-      120000);
-}
 
 void SimManager::runContact(AppState &st, Study &s) {
   float lo[3], hi[3];
@@ -10395,19 +10298,20 @@ void SimManager::drawAdvancedResults(AppState &st, Study &s) {
   const auto &res = s.advResult;
   if (s.type == StudyType::Buckling && res.is_object()) {
     ImGui::SeparatorText("Buckling load factors");
-    if (res.contains("load_factors") && res["load_factors"].is_array() &&
-        ImGui::BeginTable("##bucktab", 3, ImGuiTableFlags_SizingStretchProp)) {
+    if (res.contains("modes") && res["modes"].is_array() &&
+        ImGui::BeginTable("##bucktab", 4, ImGuiTableFlags_SizingStretchProp)) {
       ImGui::TableSetupColumn("Mode");
       ImGui::TableSetupColumn("Factor");
       ImGui::TableSetupColumn("Critical load (N)");
+      ImGui::TableSetupColumn("Shape X / Y / Z");
       ImGui::TableHeadersRow();
-      const auto &fac = res["load_factors"];
+      const auto &modes = res["modes"];
       double P = 0.0;
-      finiteNumber(res, "applied_load_n", P);
-      for (int i = 0; i < (int)fac.size(); ++i) {
-        if (!fac[i].is_number() || !std::isfinite(fac[i].get<double>()))
+      finiteNumber(res, "reference_load_n", P);
+      for (int i = 0; i < (int)modes.size(); ++i) {
+        double factor = 0.0;
+        if (!finiteNumber(modes[i], "load_factor", factor))
           continue;
-        const double factor = fac[i].get<double>();
         ImGui::TableNextRow();
         ImGui::TableSetColumnIndex(0);
         ImGui::Text("%d", i + 1);
@@ -10415,10 +10319,17 @@ void SimManager::drawAdvancedResults(AppState &st, Study &s) {
         ImGui::Text("%.4g", factor);
         ImGui::TableSetColumnIndex(2);
         ImGui::Text("%.4g", factor * P);
+        ImGui::TableSetColumnIndex(3);
+        if (modes[i].contains("participation") &&
+            modes[i]["participation"].is_object()) {
+          const auto &p = modes[i]["participation"];
+          ImGui::Text("%.0f / %.0f / %.0f %%", p.value("x", 0.0) * 100,
+                      p.value("y", 0.0) * 100, p.value("z", 0.0) * 100);
+        }
       }
       ImGui::EndTable();
     }
-    kit::dimText(res.value("note", std::string()).c_str());
+    kit::dimText("Directional shape shares, not effective modal mass.");
   } else if (s.type == StudyType::Contact && res.is_object()) {
     ImGui::SeparatorText("Contact conservation check");
     double applied = 0.0, reaction = 0.0;

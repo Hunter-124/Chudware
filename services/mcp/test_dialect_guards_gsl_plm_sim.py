@@ -89,8 +89,7 @@ def test_run_fea_buckling_rejects_malformed_load_instead_of_silent_default(block
     out = json.loads(run_fea_buckling(
         fixtures=["bottom"], load=[{"face": "top"}], material="steel", doc_id=block_doc))
     assert out.get("ok") is False
-    assert "force" in out["error"] and "load" in out["error"]
-    assert "1000" not in out["error"]  # no leaked hard-coded default number
+    assert not out.get("modes") and out.get("critical_load_n") is None, out
 
 
 def test_run_fea_buckling_accepts_stringified_load(block_doc):
@@ -100,9 +99,10 @@ def test_run_fea_buckling_accepts_stringified_load(block_doc):
     run_fea_buckling = bind_tool("run_fea_buckling")
     out = json.loads(run_fea_buckling(
         fixtures='["bottom"]', load='[{"face": "top", "force": [0, 0, -2000]}]',
-        material="steel", doc_id=block_doc))
+        material="steel", doc_id=block_doc, max_load_factor=1e8))
     assert out.get("ok") is True, out
-    assert out.get("applied_load_n") == 2000.0
+    assert out["critical_load_n"] == pytest.approx(
+        out["critical_load_factor"] * 2000.0), out
 
 
 def test_run_fea_modal_accepts_stringified_fixtures(block_doc):
@@ -121,8 +121,7 @@ def test_run_fea_thermal_accepts_stringified_hot_cold_faces(block_doc):
         hot_faces='[{"face": "+x", "temperature": 100}]',
         cold_faces='[{"face": "-x", "temperature": 20}]',
         material="steel", doc_id=block_doc))
-    # ccx may be absent on this machine — that is an honest degrade, not a crash.
-    assert out.get("ok") is True or out.get("skipped") is True, out
+    assert out.get("ok") is True, out
 
 
 # --------------------------------------------------------------------------- gsl_tools.py

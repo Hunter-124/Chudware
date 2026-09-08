@@ -575,19 +575,8 @@ def build_advisory(obs: Observation) -> dict:
 
     # T-W21 §20: append trigger-based context items (severity=info, tail position
     # so the global drop-first policy drops them before findings).
-    # Effort knob trigger_injection (eco preset = false) skips the whole layer.
     trigger_events: list[dict] = []
-    _trigger_on = True
-    try:
-        from services.agent.effort import resolve_effort  # noqa: PLC0415
-        _tier = (getattr(obs, "tier", None) or os.environ.get("CHUDWARE_TIER")
-                 or "mid")
-        _trigger_on = bool(
-            resolve_effort(str(_tier)).values.get("trigger_injection", True)
-        )
-    except Exception:  # noqa: BLE001
-        _trigger_on = True
-    if _trigger_on and (obs.output_text or obs.tool_names or obs.events):
+    if obs.output_text or obs.tool_names or obs.events:
         try:
             from .triggers import match_triggers  # noqa: PLC0415
             ctx_items, trigger_events = match_triggers(

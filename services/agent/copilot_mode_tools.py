@@ -134,6 +134,7 @@ def apply_mode_tools(
     *,
     plan_only: bool | None = None,
     subagent: bool = False,
+    preferences: Any | None = None,
 ) -> Optional[list[str]]:
     """Apply mode policy while preserving open-vs-explicit tool scopes.
 
@@ -142,6 +143,13 @@ def apply_mode_tools(
     :data:`SUBAGENT_DEFAULT_TOOLS`; main turns use
     :data:`AGENT_DEFAULT_TOOLS`.
     """
+    if preferences is not None:
+        chosen_mode = mode or preferences.mode
+        if preferences.task_kind == "chat" or preferences.mode == "ask":
+            chosen_mode = "ask"
+        allowed = apply_mode_tools(chosen_mode, role_tools, plan_only=plan_only,
+                                   subagent=subagent)
+        return apply_preference_tools(allowed, preferences, mode=chosen_mode)
     m = normalize_mode(mode)
     if plan_only:
         m = "plan"
@@ -199,6 +207,38 @@ def apply_mode_tools(
     # web + meta enable_tools / list_tool_categories).
     allowed |= SHARED_DEFAULT_TOOLS
     return sorted(allowed)
+
+
+def apply_preference_tools(allowed, preferences, *, mode=None):
+    """Apply derived restrictions after every floor and on-demand tool load."""
+    from services.agent.guardrails import MUTATING_TOOLS
+
+    tools = set(allowed) if allowed is not None else None
+    readonly = (mode or preferences.roster_mode) in ("ask", "plan")
+    if tools is None:
+        if not readonly and preferences.delegation_depth and preferences.advisor:
+            return None
+        from services.agent.tool_categories import tool_menu_groups
+        tools = {name for _, _, names in tool_menu_groups() for name in names}
+    if readonly:
+        # Denylists cannot cover newly loaded tool families. Start with the
+        # frozen read-only roster and non-mutating capability floors.
+        tools &= (set(ASK_TOOLS) | set(META_TOOL_FLOOR) | set(MAIN_CHAT_DEFAULT_TOOLS)
+                  | {"task_list", "advise", "verify_battery", "render_part"})
+        tools -= set(MUTATING_TOOLS) | set(_MUTATING_TOOLS) | {
+            "new_part", "new_assembly", "close_part", "save_part", "import_part",
+            "export_part", "fs_write", "fs_edit", "run_shell", "mission_start",
+            "corporate_activate", "delegate", "run_dag",
+        }
+    if preferences.delegation_depth == 0:
+        tools -= {"delegate", "mission_start", "corporate_activate", "run_dag"}
+    if not preferences.advisor:
+        tools -= {"advise", "council", "council_run"}
+    if not preferences.task_list:
+        tools.discard("task_list")
+    if preferences.verify_battery and tools.intersection(set(MUTATING_TOOLS) | set(_MUTATING_TOOLS)):
+        tools.add("verify_battery")
+    return sorted(tools)
 
 
 # Escape hatches a restricted lane must be able to SEE, not merely call.

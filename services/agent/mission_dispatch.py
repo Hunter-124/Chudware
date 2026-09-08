@@ -1033,6 +1033,7 @@ class MissionDispatch:
                     ledger=self.ledger,
                     tier=self.tier,
                     on_event=self.on_event,
+                    max_subagent_depth=self.execution_options.get("max_subagent_depth"),
                 )
                 self._delegation_tree_autobound = True
                 if self.ledger is not None:
@@ -1109,6 +1110,10 @@ class MissionDispatch:
             except Exception:  # noqa: BLE001
                 parent = None
             depth = (int(getattr(parent, "depth", 0)) + 1) if parent is not None else 1
+            preference_limit = self.execution_options.get("max_subagent_depth")
+            if preference_limit is not None and depth > int(preference_limit):
+                return {"ok": False, "status": "refused", "reason": "spawn_depth_policy",
+                        "error": f"This turn allows at most {preference_limit} levels of delegation."}
             letter = None
             if self.capability is not None:
                 letter = getattr(self.capability, "letter", None)
@@ -1471,6 +1476,13 @@ class MissionDispatch:
                     else harness_role_for_mission_role(role)
                 )
                 cfg = dict(agent_config.load_config() or {})
+                from services.agent.preferences import resolve_turn_preferences
+
+                child_preferences = resolve_turn_preferences(brief, cfg=cfg)
+                # Existing Advanced rows remain authoritative during Phase 1.
+                # Unpinned leaves inherit the worker seat rather than a task alias.
+                if harness_role not in (cfg.get("ai_roles") or {}):
+                    harness_role = "worker"
                 context = {
                     "task_class": self.task_class,
                     "depth": depth,
@@ -1480,7 +1492,8 @@ class MissionDispatch:
                         "depth": depth,
                     },
                 }
-                assignment = resolve_for_node(harness_role, context, cfg=cfg)
+                assignment = (None if harness_role == "worker"
+                              else resolve_for_node(harness_role, context, cfg=cfg))
                 if assignment is None or min_rank_i is not None:
                     depth_assignment = resolve_role_model(
                         harness_role,
@@ -1489,6 +1502,8 @@ class MissionDispatch:
                         node_depth=depth,
                         risk=risk,
                         min_rank=min_rank_i,
+                        request=brief,
+                        turn_preferences=child_preferences,
                     )
                     if depth_assignment is not None:
                         assignment = depth_assignment
@@ -1501,19 +1516,22 @@ class MissionDispatch:
                         or (node.get("role_model") or {}).get("reasoning_effort")
                     )
                     try:
-                        resolved_effort = resolve_role_thinking(
-                            harness_role,
-                            cfg,
-                            request=brief,
-                            task_class=self.task_class,
-                            node_depth=depth,
-                            risk=risk,
-                            min_rank=min_rank_i,
-                            dispatch_effort=(
-                                str(dispatch_effort) if dispatch_effort else None
-                            ),
-                            rank=rank,
-                        )
+                        if harness_role == "worker":
+                            resolved_effort = child_preferences.thinking
+                        else:
+                            resolved_effort = resolve_role_thinking(
+                                harness_role,
+                                cfg,
+                                request=brief,
+                                task_class=self.task_class,
+                                node_depth=depth,
+                                risk=risk,
+                                min_rank=min_rank_i,
+                                dispatch_effort=(
+                                    str(dispatch_effort) if dispatch_effort else None
+                                ),
+                                rank=rank,
+                            )
                     except Exception:  # noqa: BLE001 - assignment itself remains valid
                         resolved_effort = (
                             "low" if rank <= 2 else "medium" if rank <= 3 else None
@@ -2558,123 +2576,24 @@ def _apply_session_preferences(
     role: str,
     allowed: list[str],
     system_prompt: str,
+    preferences: Any | None = None,
 ) -> tuple[list[str], str]:
-    """Fold the Settings → AI → Harness preference knobs into the role card.
-
-    ``get_plan_preference``/``get_subagent_preference`` had ZERO consumers
-    repo-wide: the combos persisted to config.json and nothing ever read them,
-    so both were dead UI. This is the one place the interactive lane's system
-    prompt and allow-set are assembled, so it is where they belong.
-
-    Interactive lane ONLY (``general_agent``). Curated DAG-node / sub-agent
-    cards keep their allow-list as a hard, unmodified boundary — a session knob
-    must never widen or narrow a curated role's scope.
-
-    Returns the possibly-trimmed allow-set and the prompt with one compact
-    SESSION PREFERENCES block appended, followed by the main-chat TOOL MENU
-    (:func:`tool_categories.render_tool_menu`): every registered tool that is
-    NOT in the allow-set, by exact name, so the model can see and load any of
-    them. Never raises into the turn path.
-
-    ``task_list`` is granted HERE rather than from a ``tool:`` seat in
-    general_agent.yaml: it is a harness surface (like enable_tools), not a CAD
-    capability, so it belongs on the lane floor with the rest of the core.
-    """
+    """Compose the same derived preference policy for live turns and previews."""
     if role != "general_agent":
         return allowed, system_prompt
-    try:
-        from services.agent import config as agent_config  # noqa: PLC0415
-    except Exception:  # noqa: BLE001 — preferences are best-effort
-        return allowed, system_prompt
+    from services.agent.preferences import resolve_turn_preferences
+    from services.agent.copilot_mode_tools import apply_mode_tools
+    from services.agent.tool_categories import render_tool_menu
 
-    def _pref(name: str, fallback: str) -> str:
-        # getattr-guarded: get_task_list_preference is newer than some installs.
-        fn = getattr(agent_config, name, None)
-        if not callable(fn):
-            return fallback
-        try:
-            return str(fn() or fallback).strip().lower()
-        except Exception:  # noqa: BLE001
-            return fallback
-
-    task_pref = _pref("get_task_list_preference", "encourage")
-    plan_pref = _pref("get_plan_preference", "off")
-    sub_pref = _pref("get_subagent_preference", "option")
-
-    drop: set[str] = set()
-    add: set[str] = set()
-    lines: list[str] = []
-
-    if task_pref == "off":
-        drop.add("task_list")
-    else:
-        add.add("task_list")
-    if task_pref == "encourage":
-        lines.append(
-            "Task list: for any job with more than about three steps, publish "
-            "a task list with `task_list` before you start, and re-publish it "
-            "as item statuses change."
-        )
-    elif task_pref == "require":
-        lines.append(
-            "Task list: REQUIRED. For any multi-step job your FIRST tool call "
-            "must be `task_list`, and you must re-publish it (same item ids) "
-            "every time a status changes."
-        )
-
-    if plan_pref == "off":
-        lines.append(
-            "Planning: do NOT draft a plan first - act directly on the "
-            "request with real tool calls."
-        )
-    elif plan_pref == "encourage":
-        lines.append(
-            "Planning: briefly state a plan before mutations when the request "
-            "has multiple dependent steps, then execute it."
-        )
-    elif plan_pref == "require":
-        lines.append(
-            "Planning: REQUIRED for multi-step work. State the ordered plan "
-            "before the first mutating tool call, then execute and update it "
-            "when evidence changes the route."
-        )
-
-    if sub_pref == "off":
-        drop.update({"delegate", "mission_start"})
-        lines.append(
-            "Sub-agents: disabled for this session - `delegate` and "
-            "`mission_start` are not available. Do the work yourself."
-        )
-    elif sub_pref == "encourage":
-        lines.append(
-            "Sub-agents: consider `delegate` when genuinely independent pieces "
-            "can run concurrently; keep coupled work in this turn."
-        )
-    elif sub_pref == "require":
-        lines.append(
-            "Sub-agents: REQUIRED when the request contains two or more "
-            "genuinely independent workstreams. Delegate those workstreams "
-            "before doing them serially; do not invent parallelism for coupled work."
-        )
-
-    if add:
-        allowed = sorted(set(allowed) | add)
-    if drop:
-        allowed = [t for t in allowed if t not in drop]
-    if lines:
-        system_prompt = (
-            (system_prompt or "").rstrip()
-            + "\n\nSESSION PREFERENCES (override earlier role-card defaults)\n"
-            + "\n".join(f"- {ln}" for ln in lines)
-        )
-    try:
-        from services.agent.tool_categories import render_tool_menu  # noqa: PLC0415
-
-        menu = render_tool_menu(allowed)
-    except Exception:  # noqa: BLE001 — a cold registry simply renders no menu
-        menu = ""
+    preferences = preferences or resolve_turn_preferences("", task_kind="modelling")
+    if preferences.task_list:
+        allowed = sorted(set(allowed) | {"task_list"})
+    allowed = apply_mode_tools(preferences.roster_mode, allowed,
+                               preferences=preferences) or []
+    system_prompt = system_prompt.rstrip() + "\n\n" + preferences.prompt_guidance()
+    menu = render_tool_menu(allowed)
     if menu:
-        system_prompt = (system_prompt or "").rstrip() + "\n\n" + menu
+        system_prompt += "\n\n" + menu
     return allowed, system_prompt
 
 
@@ -2745,6 +2664,7 @@ def linear_role_prompt(
     card: Any | None = None,
     capability: Any | None = None,
     tier: str | None = None,
+    preferences: Any | None = None,
 ) -> tuple[str, list[str], str | None]:
     """``(system_prompt, allowed, tools_text)`` for one linear role turn.
 
@@ -2807,7 +2727,7 @@ def linear_role_prompt(
     # Preferences BEFORE the tools render: a dropped tool must also vanish from
     # the schema block, or the model is shown a tool every call to which will be
     # refused.
-    allowed, system_prompt = _apply_session_preferences(role, allowed, system_prompt)
+    allowed, system_prompt = _apply_session_preferences(role, allowed, system_prompt, preferences)
 
     # The skills catalog, for the ONLINE lane. Every online role prompt — main
     # chat (`worker_rpc._agent_admin_turn`) and delegated roles
@@ -2977,12 +2897,15 @@ def run_linear_role_turn(
     # Role prose, allowlist and the tool-schema slot: served from the
     # fingerprinted prompt cache when it renders these exact bytes, composed
     # live (and memoized) when the mission-scoped meta tools make it not.
+    from services.agent.preferences import resolve_turn_preferences
+
     system_prompt, allowed, tools_text = linear_role_prompt(
         role,
         resolver=_at.resolver_for(mission_dispatch),
         card=card,
         capability=capability,
         tier=tier or getattr(mission_dispatch, "tier", None),
+        preferences=resolve_turn_preferences(request, task_kind="modelling", headless=True),
     )
     explicit_allowed = isinstance(options, dict) and "allowed_tools" in options
     if explicit_allowed:

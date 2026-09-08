@@ -2617,6 +2617,7 @@ def test_assembly_tools_end_to_end(tmp_path):
                                        "at": [15, 5, 30]})
     assert r["ok"] and r["component"] == "k2", r
     assert r["component_count"] == 2, r
+    assert r["placement_source"] == "transform", r
 
     # ambiguous query → helpful error with candidates
     bad, _ = _call("asm_mate", {"doc_id": asm, "mate_type": "concentric",
@@ -2632,6 +2633,7 @@ def test_assembly_tools_end_to_end(tmp_path):
                                     "query": {"of": "face", "surf": "round"}}})
     assert r["ok"], r
     assert r["mate"], r
+    assert r["converged"] and r["placement_source"]["k2"] == "mate", r
     bodies = {b["component"]: b for b in (r.get("world_bodies") or [])}
     assert "k2" in bodies, r
     # concentric seats the pin's axis on the bore's axis at (x=15, y=5). Assert on the EXACT
@@ -2649,10 +2651,32 @@ def test_assembly_tools_end_to_end(tmp_path):
     cx, cy, _cz = q["matches"][0]["centroid"]
     assert abs(cx - 15.0) < 1e-6 and abs(cy - 5.0) < 1e-6, q["matches"][0]
 
-    # describe_assembly narrates it without error
-    out, _ = _call("describe_assembly", {"doc_id": asm})
-    assert out is None or out.get("ok", True) is not False, out
-    _call("close_part", {"doc_id": asm})
+    # A component imported outside the placement tools has unknown provenance.
+    rev = cb.call("doc_tree", {"doc_id": asm})["revision"]
+    imported = cb.call("doc_apply_ops", {
+        "doc_id": asm, "base_revision": rev, "with_tess": False,
+        "ops": [{"op": "asm_insert_component", "source": {"path": pin_path},
+                 "name": "Imported", "fixed": True,
+                 "transform": [1, 0, 0, 100, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1]}]})
+    imported_id = imported["id_map"]["$0"]
+    saved = str(tmp_path / "aa_asm.step+")
+    cb.call("doc_save", {"doc_id": asm, "path": saved})
+    cb.call("doc_close", {"doc_id": asm})
+    reopened = cb.call("doc_open", {"path": saved})["doc_id"]
+    assert reopened != asm
+    try:
+        out, _ = _call("describe_assembly", {"doc_id": reopened})
+        assert out["ok"], out
+        bodies = {b["component"]: b for b in out["bodies"]}
+        assert bodies["k2"]["placement_source"] == "mate", out
+        assert bodies[imported_id]["placement_source"] is None, out
+        # A later starting-pose note cannot override a persisted mate-owned pose.
+        from services.mcp.cad_common import note_placement_source
+        note_placement_source(reopened, "k2", "transform")
+        out, _ = _call("list_world_bodies", {"doc_id": reopened})
+        assert {b["component"]: b["placement_source"] for b in out["bodies"]}["k2"] == "mate"
+    finally:
+        cb.call("doc_close", {"doc_id": reopened})
     _call("close_part", {"doc_id": pin})
     _call("close_part", {"doc_id": plate})
 

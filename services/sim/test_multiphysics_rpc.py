@@ -7,8 +7,6 @@ from services.sim import multiphysics_rpc as mp
 
 
 @pytest.mark.parametrize("endpoint, params, expected", [
-    (mp._sim_run_buckling, {"load_n": 0.0}, "load_n"),
-    (mp._sim_run_buckling, {"L_mm": float("nan")}, "finite"),
     (mp._sim_run_contact, {"pressure_mpa": 0.0}, "pressure_mpa"),
     (mp._sim_run_contact, {"nu": 0.5}, "nu"),
 ])
@@ -26,22 +24,6 @@ def test_malformed_proxy_studies_fail_before_backend_probe(
     assert result["ok"] is False
     assert expected in result["error"]
     assert probed is False
-
-
-def test_buckling_rejects_empty_factor_output(monkeypatch):
-    monkeypatch.setattr(fa, "ccx_path", lambda: "/fake/ccx")
-    monkeypatch.setattr(fa, "build_buckling_column_inp", lambda *_args, **_kwargs: {
-        "inp": "deck", "expected_Pcr": 1000.0,
-    })
-    monkeypatch.setattr(fa, "run_ccx", lambda *_args, **_kwargs: {
-        "ok": True, "dat_path": "/fake/result.dat", "backend": "ccx",
-    })
-    monkeypatch.setattr(fa, "parse_buckle_factors", lambda _path: [])
-
-    result = mp._sim_run_buckling({})
-    assert result["ok"] is False
-    assert "no finite positive buckling factors" in result["error"]
-    assert "critical_loads_n" not in result
 
 
 def _patch_contact_backend(monkeypatch, reaction_per_node):

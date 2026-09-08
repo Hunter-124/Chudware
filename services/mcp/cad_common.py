@@ -83,10 +83,9 @@ _LAST_DELIVER_REV: dict = {}
 # Placement provenance (assembly-merge discipline). A component dropped at an `at`/`rotate`
 # pose is only as good as the measurement it came from: the failed merge session placed a
 # wheel by a guessed transform, never re-checked interference, and exported it off-frame.
-# _PLACEMENT_SOURCE[doc_id][component_id] = {"placement_source": "transform"|"mate",
-# "revision": <engine revision when it was placed>}; a mate always supersedes a transform
-# for the same component (solve_mates is the authority on where it ended up).
-_PLACEMENT_SOURCE: dict = {}
+# doc.meta["placement_sources"][component_id] = {"placement_source": "transform"|"mate"|
+# "origin", "at_revision": <engine revision when it was placed>}. This travels inside the
+# .step+ document; a mate always supersedes a starting-pose transform.
 
 # The engine revision at which each doc was last interference-checked (check_interference).
 # Compared against the doc's CURRENT revision — monotonic, bumped only by mutating ops — so
@@ -126,23 +125,30 @@ def pose_to_transform16(at: Optional[list], axis: Optional[list],
             0.0, 0.0, 0.0, 1.0]
 
 
+def _placement_sources(doc_id: str) -> dict:
+    """Read placement provenance from the document, including after save/reopen."""
+    value = cb.call("doc_get_meta", {"doc_id": doc_id, "key": "placement_sources"}).get("value")
+    return value if isinstance(value, dict) else {}
+
+
 def note_placement_source(doc_id: Optional[str], component: Optional[str],
                           source: str) -> None:
     """Record HOW a component was positioned ("transform" = a raw pose, "mate" = solved)."""
     if not doc_id or not component:
         return
-    rec = _PLACEMENT_SOURCE.setdefault(str(doc_id), {})
+    rec = _placement_sources(str(doc_id))
     prev = rec.get(str(component))
     if isinstance(prev, dict) and prev.get("placement_source") == "mate" and source != "mate":
         return  # a mate owns the pose; a later starting-pose transform does not un-verify it
-    rec[str(component)] = {"placement_source": source, "revision": _doc_revision(str(doc_id))}
+    rec[str(component)] = {"placement_source": source, "at_revision": _doc_revision(str(doc_id))}
+    cb.call("doc_set_meta", {"doc_id": str(doc_id), "key": "placement_sources", "value": rec})
 
 
 def placement_source_of(doc_id: Optional[str], component: Optional[str]) -> Optional[str]:
-    """"transform" | "mate" for a component this process placed, else None (unknown/imported)."""
+    """"transform" | "mate" | "origin" from the document, else None (unknown/imported)."""
     if not doc_id or not component:
         return None
-    rec = (_PLACEMENT_SOURCE.get(str(doc_id)) or {}).get(str(component))
+    rec = _placement_sources(str(doc_id)).get(str(component))
     return rec.get("placement_source") if isinstance(rec, dict) else None
 
 
@@ -166,7 +172,7 @@ def placement_warnings(doc_id: Optional[str]) -> list:
     if not doc_id:
         return []
     did = str(doc_id)
-    by_transform = [c for c, rec in (_PLACEMENT_SOURCE.get(did) or {}).items()
+    by_transform = [c for c, rec in _placement_sources(did).items()
                     if isinstance(rec, dict) and rec.get("placement_source") == "transform"]
     if not by_transform:
         return []
@@ -6479,7 +6485,7 @@ _DEFAULT_CONDUCTIVITY_WMK: dict = {
 
 
 def _default_conductivity(mat: dict, material_arg: Any) -> float:
-    """Best-effort thermal conductivity (W/m·K) for the box-proxy thermal solve."""
+    """Best-effort thermal conductivity (W/m·K) for thermal studies."""
     name = str(mat.get("name", material_arg) or "").lower()
     for key, val in _DEFAULT_CONDUCTIVITY_WMK.items():
         if key in name:

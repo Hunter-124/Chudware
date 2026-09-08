@@ -98,6 +98,7 @@ def test_dispatch_table_entries_are_3_tuples():
     ("firmware",     _tool_ok(passed=True, assertions=[], elapsed_ms=120)),
     ("dc_ratio",     _tool_ok(results=[{"element_id": "B1", "dc_ratio": 0.72, "passed": True}])),
     ("budget",       _tool_ok(unit_cost=45.0)),
+    ("buckling",     _tool_ok(critical_load_factor=1.0)),
 ])
 def test_verify_pass(check_type, tool_result):
     node = _node(check_type)
@@ -119,6 +120,8 @@ def test_verify_pass(check_type, tool_result):
     ("drc",          _tool_ok(errors=1, warnings=3)),
     ("firmware",     _tool_ok(passed=False, assertions=["assert GPIO_PIN == 3"])),
     ("dc_ratio",     _tool_ok(results=[{"element_id": "B1", "dc_ratio": 1.15, "passed": False}])),
+    ("buckling",     _tool_ok(critical_load_factor=0.99)),
+    ("buckling",     _tool_ok(critical_load_factor=None)),
 ])
 def test_verify_fail_with_budget_gives_retry(check_type, tool_result):
     node = _node(check_type)

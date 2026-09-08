@@ -1231,7 +1231,7 @@ def audit_vibration() -> None:
 
 
 # ===========================================================================
-# FAMILY 10: Advanced FEA — CalculiX buckling/contact + input generators
+# FAMILY 10: Engine buckling/contact + legacy CalculiX contact capability
 # ===========================================================================
 
 def _cload_sum(inp_text: str) -> float:
@@ -1356,39 +1356,61 @@ def _audit_contact_engine() -> None:
     _record("fea_contact [engine]", "VALIDATED" if ok else "BROKEN", note)
 
 
+def _audit_buckling_engine() -> None:
+    """Real STEP column: Euler compression capacity and tensile refusal."""
+    cb, reason = _load_core_bridge()
+    if cb is None:
+        _skip("fea_buckling [engine]", reason)
+        return
+    try:
+        ctx = _cantilever_setup(cb)
+        if ctx.get("error"):
+            raise ValueError(ctx["error"])
+        length, width, height = ctx["L_mm"], ctx["b_mm"], ctx["h_mm"]
+        inertia = min(width * height**3, height * width**3) / 12
+        expected = math.pi**2 * _AUDIT_STEEL["E_mpa"] * inertia / (2 * length)**2
+        study = {
+            "step_path": ctx["step"], "material": _AUDIT_STEEL,
+            "fixtures": [ctx["fix_fp"]],
+            "loads": [{"faces": ctx["load_fp"], "type": "force",
+                       "vector": [-1000.0, 0.0, 0.0]}],
+            "mesh_order": 2, "target_size_mm": 20.0,
+        }
+        out = cb.call("sim_run_buckling", {"study": study, "n_modes": 4})
+        if not out.get("ok"):
+            raise ValueError(out.get("error", "engine buckling failed"))
+        got = float(out["critical_load_n"])
+        error_pct = _pct_err(got, expected)
+        valid = (math.isfinite(got) and error_pct < 8.0
+                 and out.get("provenance", {}).get("solver") == "engine")
+        _record("fea_buckling [engine]", "VALIDATED" if valid else "BROKEN",
+                f"Real CAD tet10 h=20 mm: Pcr={got} N vs Euler {expected} N "
+                f"(err={error_pct:.3f}%; tolerance 8%)")
+        study["loads"][0]["vector"] = [1000.0, 0.0, 0.0]
+        tension = cb.call("sim_run_buckling", {"study": study, "n_modes": 4})
+        refused = (not tension.get("ok") and not tension.get("skipped")
+                   and bool(tension.get("error") or tension.get("reason"))
+                   and not tension.get("modes")
+                   and tension.get("critical_load_n") is None)
+        _record("fea_buckling [tension]", "VALIDATED" if refused else "BROKEN",
+                f"Tensile prestress refusal: {tension.get('error', tension)}")
+    except Exception as exc:  # noqa: BLE001
+        _record("fea_buckling [engine]", "BROKEN", f"engine solve failed: {exc}")
+
+
 def audit_advanced_fea() -> None:
     print("\n--- FAMILY: advanced FEA (buckling/contact, CalculiX capability) ---")
-    # Contact is an ENGINE capability now (no ccx, no .inp proxy), so it is audited
-    # before the CalculiX imports and never skipped because they failed.
+    # Engine studies run before optional legacy CalculiX capability checks.
     _audit_contact_engine()
+    _audit_buckling_engine()
     try:
         from services.mcp import fea_advanced as fa
         from services.sim.multiphysics_rpc import WORKER_METHODS
     except Exception as exc:  # noqa: BLE001
-        for name in ("fea_buckling [input]", "fea_buckling [CalculiX]"):
-            _record(name, "BROKEN", f"advanced FEA import failed: {exc}")
+        _record("sim_run_contact [input]", "BROKEN", f"advanced FEA import failed: {exc}")
         return
 
-    length, width, height = 1000.0, 20.0, 10.0
-    elastic_modulus, poisson, applied = 200000.0, 0.3, 100.0
-    try:
-        buckling = fa.build_buckling_column_inp(
-            length, width, height, elastic_modulus, poisson, applied,
-            nx=16, ny=2, nz=2)
-        inertia = min(width * height ** 3, height * width ** 3) / 12.0
-        euler = math.pi ** 2 * elastic_modulus * inertia / (2.0 * length) ** 2
-        pcr_err = _pct_err(float(buckling["expected_Pcr"]), euler)
-        load_err = _pct_err(abs(_cload_sum(buckling["inp"])), applied)
-        keywords_ok = "*BUCKLE" in buckling["inp"] and "TYPE=C3D8I" in buckling["inp"]
-        note = (f"generated fixed-free column: Pcr={buckling['expected_Pcr']:.6f} N "
-                f"vs Euler {euler:.6f} N (err={pcr_err:.6f}%); "
-                f"summed load err={load_err:.6f}%")
-        _record("fea_buckling [input]",
-                "VALIDATED" if pcr_err < 1e-8 and load_err < 1e-4 and keywords_ok
-                else "BROKEN", note)
-    except Exception as exc:  # noqa: BLE001
-        buckling = None
-        _record("fea_buckling [input]", "BROKEN", f"generator failed: {exc}")
+    elastic_modulus, poisson = 200000.0, 0.3
 
     # The ccx two-block proxy is no longer what run_fea_contact does; it is what the
     # frozen `sim_run_contact` worker RPC (GUI sim manager) still ships, so it is
@@ -1431,39 +1453,12 @@ def audit_advanced_fea() -> None:
     if not ccx:
         hint = ("install CalculiX (ccx_2.20 or newer), put it on PATH, or set "
                 "CHUDWARE_CCX=/full/path/to/ccx")
-        _skip("fea_buckling [CalculiX]",
-              "CalculiX not found; generated input was audited but no eigenvalue solve ran",
-              install=hint)
         _skip("sim_run_contact [CalculiX]",
               "CalculiX not found; generated input was audited but no nonlinear solve ran",
               install=hint)
         return
 
     workdirs: list[str] = []
-    try:
-        if buckling is None:
-            _record("fea_buckling [CalculiX]", "BROKEN",
-                    "input generation failed; solver was not launched")
-        else:
-            run = fa.run_ccx(buckling["inp"], job="sim_audit_buckle", timeout=60.0)
-            if run.get("workdir"):
-                workdirs.append(run["workdir"])
-            if not run.get("ok") or not run.get("dat_path"):
-                _record("fea_buckling [CalculiX]", "BROKEN",
-                        f"ccx failed or emitted no .dat result: "
-                        f"{run.get('error') or run.get('stderr') or run.get('stdout')}")
-            else:
-                factors = fa.parse_buckle_factors(run["dat_path"])
-                got = factors[0] * applied if factors else None
-                err = (_pct_err(got, float(buckling["expected_Pcr"]))
-                       if got is not None else math.inf)
-                _record("fea_buckling [CalculiX]",
-                        "VALIDATED" if got is not None and err < 10.0 else "BROKEN",
-                        f"first critical load={got} N vs Euler "
-                        f"{buckling['expected_Pcr']:.6f} N (err={err:.3f}%)")
-    except Exception as exc:  # noqa: BLE001
-        _record("fea_buckling [CalculiX]", "BROKEN", f"solver error: {exc}")
-
     try:
         if contact is None:
             _record("sim_run_contact [CalculiX]", "BROKEN",

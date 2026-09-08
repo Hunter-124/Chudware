@@ -14,8 +14,8 @@ These tests pin the fixes:
     2026-07-30 against the live sidecar: maxTokens=16 -> stopReason "length",
     maxTokens=4000 -> "stop".
   * `mission_dispatch.run_linear_role_turn` passes a real output-token budget.
-  * the three Settings → AI → Harness preference knobs actually shape the
-    interactive lane's allow-set and system prompt.
+  * derived Copilot preferences constrain interactive tools without rewriting
+    curated role policy; the explicit offline loop retains its task-list nudges.
 """
 from __future__ import annotations
 
@@ -384,7 +384,7 @@ def test_parse_error_clause_names_the_defect():
 
 
 # ---------------------------------------------------------------------------
-# run_linear_role_turn: output cap + the three preference knobs
+# run_linear_role_turn: output cap + derived session preferences
 # ---------------------------------------------------------------------------
 
 
@@ -424,65 +424,62 @@ def test_linear_role_turn_caller_max_tokens_wins(_captured_turn):
     assert _captured_turn.get("max_tokens") == 16000
 
 
-def _pin_prefs(monkeypatch, *, task="encourage", plan="off", sub="option"):
+def _pin_offline_task_list(monkeypatch, task):
+    """Pin only the explicit offline loop's task-list nudge policy."""
     from services.agent import config as agent_config
 
-    monkeypatch.setattr(
-        agent_config, "get_plan_preference", lambda *a, **k: plan, raising=False)
-    monkeypatch.setattr(
-        agent_config, "get_subagent_preference", lambda *a, **k: sub,
-        raising=False)
     monkeypatch.setattr(
         agent_config, "get_task_list_preference", lambda *a, **k: task,
         raising=False)
 
 
-def test_subagent_preference_off_drops_delegation_tools(
-        monkeypatch, _captured_turn):
-    """Dead knob no more: `off` must remove the tools, not just say so."""
-    _pin_prefs(monkeypatch, sub="off")
-    _run_linear()
-    allowed = list(_captured_turn.get("allowed_tools") or [])
-    assert "delegate" not in allowed, allowed
-    assert "mission_start" not in allowed, allowed
-    assert "not available" in (_captured_turn.get("system_prompt") or "")
+def test_answer_only_cannot_mutate_or_delegate_even_for_a_mission():
+    from services.agent.mission_dispatch import _apply_session_preferences
+    from services.agent.preferences import resolve_turn_preferences
+
+    preferences = resolve_turn_preferences(
+        "", cfg={"copilot": {"work_style": "answer_only"}}, task_kind="mission",
+    )
+    allowed, _ = _apply_session_preferences(
+        "general_agent",
+        ["describe_part", "new_part", "fs_write", "delegate", "mission_start"],
+        "BASE", preferences=preferences,
+    )
+    assert "describe_part" in allowed
+    assert not ({"new_part", "fs_write", "delegate", "mission_start"} & set(allowed))
 
 
-def test_task_list_preference_off_drops_the_tool(monkeypatch, _captured_turn):
-    _pin_prefs(monkeypatch, task="off")
-    _run_linear()
-    assert "task_list" not in list(_captured_turn.get("allowed_tools") or [])
+def test_delegation_is_available_for_missions_not_single_part_work():
+    from services.agent.mission_dispatch import _apply_session_preferences
+    from services.agent.preferences import resolve_turn_preferences
+
+    cfg = {"copilot": {"work_style": "do_it"}}
+    mission = resolve_turn_preferences("", cfg=cfg, task_kind="mission")
+    modelling = resolve_turn_preferences("", cfg=cfg, task_kind="modelling")
+    tools = ["describe_part", "new_part", "delegate", "mission_start"]
+    mission_tools, _ = _apply_session_preferences(
+        "general_agent", tools, "BASE", preferences=mission,
+    )
+    part_tools, _ = _apply_session_preferences(
+        "general_agent", tools, "BASE", preferences=modelling,
+    )
+    assert {"delegate", "mission_start", "task_list"} <= set(mission_tools)
+    assert not ({"delegate", "mission_start", "task_list"} & set(part_tools))
+    assert "new_part" in part_tools
 
 
-def test_task_list_preference_require_states_the_directive(
-        monkeypatch, _captured_turn):
-    _pin_prefs(monkeypatch, task="require")
-    _run_linear()
-    prompt = _captured_turn.get("system_prompt") or ""
-    assert "SESSION PREFERENCES" in prompt, prompt[-400:]
-    assert "FIRST tool call" in prompt, prompt[-400:]
+def test_curated_roles_keep_their_execution_permissions():
+    from services.agent.mission_dispatch import _apply_session_preferences
+    from services.agent.preferences import resolve_turn_preferences
 
-
-def test_plan_preference_off_says_act_directly(monkeypatch, _captured_turn):
-    """config default is plan=off; the model must be told, not left guessing."""
-    _pin_prefs(monkeypatch, plan="off")
-    _run_linear()
-    assert "do NOT draft a plan first" in (
-        _captured_turn.get("system_prompt") or "")
-
-
-def test_curated_roles_keep_their_card_untouched(monkeypatch, _captured_turn):
-    """A session knob must never reshape a curated DAG/sub-agent role card."""
-    from services.agent import mission_dispatch as md
-
-    _pin_prefs(monkeypatch, sub="off", task="require")
-    md.run_linear_role_turn(
-        "make a bracket", "feature_modeler", _ScriptedProvider([]))
-    prompt = _captured_turn.get("system_prompt") or ""
-    assert "SESSION PREFERENCES" not in prompt
-    # SUBAGENT_DEFAULT_TOOLS puts delegate on every card; `off` must not have
-    # stripped it from a curated one.
-    assert "delegate" in list(_captured_turn.get("allowed_tools") or [])
+    preferences = resolve_turn_preferences(
+        "", cfg={"copilot": {"work_style": "answer_only"}}, task_kind="modelling",
+    )
+    allowed, _ = _apply_session_preferences(
+        "feature_modeler", ["new_part", "delegate"], "BASE", preferences=preferences,
+    )
+    assert "new_part" in allowed
+    assert "delegate" in allowed
 
 # ---------------------------------------------------------------------------
 # Task-list nudge: the preference must ACT, not merely advise
@@ -498,7 +495,7 @@ _TL_ALLOW = [*_GENERAL_ALLOW, "task_list"]
 def _run_general(monkeypatch, *, task, replies, calls=6):
     from services.agent import agent_turn as at
 
-    _pin_prefs(monkeypatch, task=task)
+    _pin_offline_task_list(monkeypatch, task=task)
     p = _ScriptedProvider(replies)
     res = at.run_turn(
         "organize the project and build the bracket",
@@ -533,7 +530,7 @@ def test_require_nudges_at_the_first_call(monkeypatch):
 def test_require_prevents_work_before_successful_task_list(monkeypatch):
     from services.agent import agent_turn as at
 
-    _pin_prefs(monkeypatch, task="require")
+    _pin_offline_task_list(monkeypatch, task="require")
     provider = _ScriptedProvider([
         _CALL % "ledger_get",
         _CALL % "task_list",
@@ -556,22 +553,6 @@ def test_require_prevents_work_before_successful_task_list(monkeypatch):
     assert dispatched.count("ledger_get") == 1
 
 
-def test_plan_and_subagent_require_are_stronger_than_encourage(monkeypatch):
-    from services.agent import mission_dispatch as md
-
-    _pin_prefs(monkeypatch, plan="encourage", sub="encourage")
-    _, encouraged = md._apply_session_preferences(
-        "general_agent", list(_TL_ALLOW), "BASE"
-    )
-    _pin_prefs(monkeypatch, plan="require", sub="require")
-    _, required = md._apply_session_preferences(
-        "general_agent", list(_TL_ALLOW), "BASE"
-    )
-
-    assert "consider `delegate`" in encouraged
-    assert "Planning: REQUIRED" in required
-    assert "Sub-agents: REQUIRED" in required
-    assert encouraged != required
 
 
 def test_no_nudge_once_the_model_published(monkeypatch):
@@ -600,7 +581,7 @@ def test_curated_subagent_lane_is_never_nudged(monkeypatch):
     """auto_enable_packs is off for DAG nodes/sub-agents — no session knob there."""
     from services.agent import agent_turn as at
 
-    _pin_prefs(monkeypatch, task="require")
+    _pin_offline_task_list(monkeypatch, task="require")
     p = _ScriptedProvider([_CALL % "ledger_get", _CALL % "describe_project",
                            _CALL % "workspace_status", "Done."])
     at.run_turn("build the bracket", p, allowed_tools=list(_TL_ALLOW),

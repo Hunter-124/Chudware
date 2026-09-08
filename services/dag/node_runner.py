@@ -477,7 +477,7 @@ def _tier_profile(context_pack: dict[str, Any] | None = None):
     try:
         from services.agent.tiers import (  # noqa: PLC0415
             detect_tier_from_env,
-            effort_tier_for,
+            profile_tier_for,
             load_tier,
         )
 
@@ -488,7 +488,7 @@ def _tier_profile(context_pack: dict[str, Any] | None = None):
         )
         if not tier_name:
             return None
-        return load_tier(effort_tier_for(str(tier_name)) or str(tier_name))
+        return load_tier(profile_tier_for(str(tier_name)) or str(tier_name))
     except Exception:  # noqa: BLE001 — tiers layer optional at node level
         return None
 

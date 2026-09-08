@@ -1,6 +1,6 @@
-"""Advanced FEA backends for T-BL04 — fatigue, thermal, buckling, and contact.
+"""Fatigue post-processing and CalculiX contact cross-check support.
 
-Four analysis types beyond the built-in C++ static/modal solvers:
+Thermal and buckling studies use the built-in C++ solvers.
 
 1. **Fatigue life** — pure S-N (Basquin) post-processing on an existing
    ``run_fea_static`` result. NO external solver: it reads the peak von-Mises
@@ -8,9 +8,7 @@ Four analysis types beyond the built-in C++ static/modal solvers:
    the material's endurance limit + ultimate strength (Goodman mean-stress
    correction). Fully deterministic + hand-calc-validated.
 
-2. **Thermal steady-state** — CalculiX ``*HEAT TRANSFER, STEADY STATE``.
-3. **Linear buckling** — CalculiX ``*BUCKLE`` eigenvalue (critical load factor).
-4. **Nonlinear / contact** — CalculiX ``*STATIC, NLGEOM`` with ``*CONTACT PAIR``.
+2. **Contact cross-check** — CalculiX ``*STATIC, NLGEOM`` with ``*CONTACT PAIR``.
 
 CalculiX (``ccx``) is **GPL-2.0** → **subprocess-only, PATH-discovered, never
 linked or bundled** (contracts/licenses.md, same isolation posture as
@@ -116,8 +114,7 @@ _CCX_NAMES = ("ccx", "ccx_2.20", "ccx_2.21", "ccx_2.19", "calculix")
 # Arithmetic, naming both clocks:
 #   CCX_SETUP_MARGIN_S    = 120 s — the pre-solve share of the OUTER clock that
 #       the INNER clock cannot see. Clean-room deck generation itself is ~1 ms
-#       (measured 2026-08-27 on the 7600X3D: build_thermal_bar_inp 0.9 ms,
-#       build_buckling_column_inp 1.4 ms, build_contact_block_inp 0.9 ms), so the
+#       (build_contact_block_inp measured 0.9 ms on the 7600X3D), so the
 #       margin is sized for what actually dominates — the mesh build and the
 #       autosave/STEP round trip. A cold bench mesh is 0.982 s and a 54k-DOF
 #       modal assembly 2.0 s (benchmarks/simsuite/DAG_PLAN.md P4/P2, same box),
@@ -497,93 +494,6 @@ def _set_lines(ids) -> list:
     return [", ".join(str(n) for n in ids[i:i + 16]) for i in range(0, len(ids), 16)]
 
 
-def build_thermal_bar_inp(L: float, b: float, h: float, k_cond: float,
-                          T_hot: float, T_cold: float,
-                          nx: int = 40, ny: int = 3, nz: int = 3) -> dict:
-    """1-D steady conduction along x: face x=0 held at T_hot, face x=L at T_cold.
-    ``k_cond`` is public W/(m*K); the N-mm-s-K CalculiX deck converts it once to
-    W/(mm*K). Returns {inp, hot_nodes, cold_nodes, mid_nodes, expected_mid_T}."""
-    k_cond = _finite(k_cond, "k_cond")
-    T_hot = _finite(T_hot, "T_hot")
-    T_cold = _finite(T_cold, "T_cold")
-    if k_cond <= 0.0:
-        raise ValueError("k_cond must be > 0")
-    if T_hot == T_cold:
-        raise ValueError("T_hot and T_cold must differ")
-    node_lines, elem_lines, nnx, nny, nnz = _hex_box_nodes_elems(L, b, h, nx, ny, nz)
-    nid = _nid_fn(nnx, nny)
-    hot = [nid(0, j, k) for k in range(nnz) for j in range(nny)]
-    cold = [nid(nx, j, k) for k in range(nnz) for j in range(nny)]
-    imid = nx // 2
-    mid = [nid(imid, j, k) for k in range(nnz) for j in range(nny)]
-    lines = list(node_lines) + list(elem_lines)
-    lines += [
-        "*NSET, NSET=NHOT", *_set_lines(hot),
-        "*NSET, NSET=NCOLD", *_set_lines(cold),
-        "*NSET, NSET=NMID", *_set_lines(mid),
-        "*MATERIAL, NAME=MAT",
-        # The deck is consistently N-mm-s-K, so W/(m*K) must become W/(mm*K)
-        # exactly once. Fixed-temperature-only results hid this 1000x unit error.
-        "*CONDUCTIVITY", f"{k_cond / 1000.0:.9f}",
-        "*SOLID SECTION, ELSET=EALL, MATERIAL=MAT",
-        "*STEP",
-        "*HEAT TRANSFER, STEADY STATE",
-        "*BOUNDARY",
-        f"NHOT, 11, 11, {T_hot:.6f}",
-        f"NCOLD, 11, 11, {T_cold:.6f}",
-        "*NODE PRINT, NSET=NMID", "NT", "*END STEP",
-    ]
-    # Linear conduction → mid-plane temperature is the arithmetic mean.
-    expected_mid = (T_hot + T_cold) / 2.0
-    return {"inp": "\n".join(lines) + "\n", "hot_nodes": hot, "cold_nodes": cold,
-            "mid_nodes": mid, "expected_mid_T": expected_mid}
-
-
-def build_buckling_column_inp(L: float, b: float, h: float, E: float, nu: float,
-                              P: float, nx: int = 40, ny: int = 4, nz: int = 4,
-                              n_modes: int = 4) -> dict:
-    """Fixed-free column buckling: base x=0 encastre, axial compressive load -x on the
-    x=L end. Clean-room *BUCKLE .inp. Returns {inp, expected_Pcr, tip_nodes} where
-    Pcr is the Euler fixed-free critical load; ccx returns the load FACTOR λ so
-    Pcr_ccx = λ * P.
-
-    Elements are C3D8I (incompatible modes): fully-integrated C3D8 hexes
-    shear-lock in the bending-dominated buckling mode and overshoot the Euler
-    critical load by 40-60% at these mesh densities (measured: +61.8% at
-    L/h=50, nx=40); C3D8I removes the parasitic shear and lands within <1% of
-    Pcr = π²EI/(2L)² (Timoshenko & Gere, Theory of Elastic Stability, K=2)."""
-    E, nu, P = (_finite(E, "E"), _finite(nu, "nu"), _finite(P, "P"))
-    n_modes = _positive_int(n_modes, "n_modes")
-    if E <= 0.0 or P <= 0.0:
-        raise ValueError("E and P must both be > 0")
-    if not -1.0 < nu < 0.5:
-        raise ValueError("nu must be in (-1, 0.5)")
-    node_lines, elem_lines, nnx, nny, nnz = _hex_box_nodes_elems(L, b, h, nx, ny, nz)
-    elem_lines = [ln.replace("TYPE=C3D8,", "TYPE=C3D8I,") for ln in elem_lines]
-    nid = _nid_fn(nnx, nny)
-    fixed = [nid(0, j, k) for k in range(nnz) for j in range(nny)]
-    tip = [nid(nx, j, k) for k in range(nnz) for j in range(nny)]
-    per = P / len(tip)
-    lines = list(node_lines) + list(elem_lines)
-    lines += [
-        "*NSET, NSET=NFIX", *_set_lines(fixed),
-        "*NSET, NSET=NTIP", *_set_lines(tip),
-        "*MATERIAL, NAME=MAT",
-        "*ELASTIC", f"{E:.1f}, {nu:.3f}",
-        "*SOLID SECTION, ELSET=EALL, MATERIAL=MAT",
-        "*BOUNDARY", "NFIX, 1, 3, 0.0",
-        "*STEP",
-        "*BUCKLE", str(n_modes),
-        "*CLOAD",
-    ]
-    lines += [f"{n}, 1, {-per:.6f}" for n in tip]
-    lines += ["*END STEP"]
-    # Euler fixed-free (one end clamped, one free): Pcr = π²EI / (2L)²; use the
-    # SMALLER of the two cross-section second moments (weakest bending axis).
-    I_min = min(b * h ** 3, h * b ** 3) / 12.0
-    Pcr = (math.pi ** 2) * E * I_min / ((2.0 * L) ** 2)
-    return {"inp": "\n".join(lines) + "\n", "expected_Pcr": Pcr, "tip_nodes": tip,
-            "applied_P": P, "I_min": I_min}
 
 
 def build_contact_block_inp(L: float, b: float, h: float, E: float, nu: float,
@@ -779,35 +689,3 @@ def parse_dat_nodal(dat_path: str, key: str, node_set: list,
     return sum(vals.values()) / len(vals)
 
 
-def parse_buckle_factors(dat_path: str) -> list:
-    """Parse the eigenvalue (buckling load factor) list from a ccx *BUCKLE .dat.
-
-    ccx prints a 'B U C K L I N G   F A C T O R   O U T P U T' block with rows
-    '<mode>  <factor>'. Return the factors in mode order (lowest first)."""
-    factors: list = []
-    text = Path(dat_path).read_text()
-    lines = text.splitlines()
-    in_block = False
-    for ln in lines:
-        u = ln.upper()
-        if "BUCKLING FACTOR" in u.replace("  ", " ").replace("   ", " ") \
-                or ("B U C K L I N G" in u):
-            in_block = True
-            continue
-        if in_block:
-            parts = ln.split()
-            if len(parts) >= 2:
-                try:
-                    int(parts[0])
-                    factor = float(parts[1])
-                except ValueError:
-                    if factors:
-                        break
-                    continue
-                if not math.isfinite(factor):
-                    raise ValueError("non-finite CalculiX buckling factor")
-                factors.append(factor)
-                continue
-            elif factors:
-                break
-    return factors

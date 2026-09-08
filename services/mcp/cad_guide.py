@@ -56,13 +56,14 @@ run_fea_fatigue(fixtures, loads, material, load_type, theory) — high-cycle FAT
   to-failure and a factor of safety. load_type "reversed"|"zero_based"|"ratio" sets the
   cyclic spectrum. regime="infinite" ⇒ runout (>1e6 cycles). Same FEA backend as run_fea_static.
 
-run_fea_thermal(hot_faces, cold_faces, material) — steady-state THERMAL (heat conduction) via
-  CalculiX (ccx). hot_faces/cold_faces each carry a {face + temperature °C}. Solves a prismatic
-  box proxy sized to the part bbox (through-conduction estimate). ccx is a GPL-2.0 subprocess
-  (PATH-discovered); if absent it returns {skipped:true} — never a fabricated result.
+run_fea_thermal(hot_faces, cold_faces, material) — steady heat conduction on the real
+  part tet mesh using the engine. Temperature faces carry {face, temperature °C}.
+  Flux/convection loads are supported; a fixed temperature or convection anchors the
+  datum. Returns temperature extrema, flux_max_w_m2, mesh_quality/provenance; vtu_path
+  writes the mesh with nodal temperature. No time axis and no external solver.
 
 run_fea_thermal(..., transient={...}, loads=[...]) — TRANSIENT thermal on the REAL part mesh
-  (C++ core, backward Euler; no ccx, no box proxy). transient={"t_end_s":60, "dt_s":0.5,
+  (C++ core, backward Euler). transient={"t_end_s":60, "dt_s":0.5,
   "t_init_c":20, "frame_times_s":[10,30,60]}. hot/cold faces are Dirichlet held for the run
   (may be empty — flux-only heat-up is fine). loads carry time-varying heat sources:
     {"face":"top", "flux_w_m2":5000, "schedule":{"duty":0.25, "period_s":1.0}}   duty cycle —
@@ -74,9 +75,13 @@ run_fea_thermal(..., transient={...}, loads=[...]) — TRANSIENT thermal on the 
   summary.max_temp_time_s, plus per-frame max temps at the requested frame times. Use this to
   check duty-cycled electronics/heater loads that never reach the 100%-on steady state.
 
-run_fea_buckling(fixtures, load, material, n_modes) — linear (eigenvalue) BUCKLING via CalculiX.
-  Returns the critical load factors λ (applied load × λ = Pcr); λ<1 buckles below the load.
-  Box-proxy Euler-column estimate for slender members. ccx subprocess; absent ⇒ {skipped:true}.
+run_fea_buckling(fixtures, load, material, n_modes, size_mm=8, vtu_path=None,
+  max_load_factor=10000) — engine
+  linear eigenvalue BUCKLING on the real CAD tet10 mesh, with static face/load syntax.
+  modes contain load_factor and participation; critical_load_factor<1 buckles below the
+  reference load. Read critical_load_n, mesh_quality and provenance.solver="engine".
+  No mode below max_load_factor is refused, not infinite strength. Refine size_mm
+  for convergence; VTU carries mode shapes.
 
 run_fea_contact(fixtures, load, material, max_gap_mm, max_iterations, mesh_size_mm,
   mesh_order) — FRICTIONLESS UNILATERAL CONTACT FEA on the document's own meshed bodies.

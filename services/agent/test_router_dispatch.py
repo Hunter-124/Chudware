@@ -1,14 +1,23 @@
 """test_router_dispatch.py — live linear-turn and routing regression coverage.
 
-Pins the real ``run_linear_role_turn`` entry, the advisory workflow-router
-classification telemetry rendered by the GUI Routing card, and the build-swarm
-DAG compiler used when the model escalates.  There is no deterministic
-dag-vs-linear structure gate.
+Exercises the explicit linear-turn tool dispatch and the build-swarm DAG compiler.
+Copilot preference policy is supplied independently of the task classifier.
 
 Discipline: scripted providers only (T-mega24-style), no model/network/port.
 Run: pytest services/agent/test_router_dispatch.py -q
 """
 from __future__ import annotations
+
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def direct_work_preferences(monkeypatch):
+    from services.agent import config
+
+    monkeypatch.setattr(
+        config, "load_config", lambda: {"copilot": {"work_style": "do_it"}},
+    )
 
 from services.agent.mission_dispatch import run_linear_role_turn
 
@@ -74,8 +83,7 @@ class TestLinearRoleTurn:
         assert turn["role"] == "general_agent"
         assert dispatched == ["fs_list", "plm_checkpoint"]
 
-        # fs/plm floor advertised, plus the escalation levers the model uses to
-        # reach the build swarm on its own decision.
+        # Explicit Do it permits filesystem/project work.
         allowed = turn["allowed_tools"]
         for t in ("fs_write", "fs_edit", "plm_open", "plm_checkpoint"):
             assert t in allowed, f"{t} missing from general_agent turn tools"
@@ -84,8 +92,9 @@ class TestLinearRoleTurn:
         assert "run_shell" not in allowed, "run_shell must not be in the main-chat floor"
         for t in ("fs_read", "fs_glob", "fs_grep"):  # SUBAGENT_DEFAULT_TOOLS floor
             assert t in allowed, f"{t} (subagent floor) missing"
-        for t in ("delegate", "mission_start", "enable_tools"):
-            assert t in allowed, f"{t} (escalation lever) missing"
+        assert "enable_tools" in allowed
+        assert "delegate" not in allowed
+        assert "mission_start" not in allowed
         # The broad CAD core is loaded up front — the model never has to
         # enable_tools(['modeling']) before a fillet.
         for t in ("new_part", "add_features", "asm_add_component", "asm_mate",

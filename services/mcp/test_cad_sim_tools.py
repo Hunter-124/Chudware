@@ -220,32 +220,82 @@ def test_transient_thermal_accepts_plural_hot_and_cold_faces(bc_doc):
     assert float(out["summary"]["max_temp_c"]) == pytest.approx(100.0, abs=1e-6), out
 
 
-def test_buckling_polar_load_sets_the_applied_magnitude(bc_doc):
-    """The buckling load factor scales the APPLIED load, so the polar form reaching the
-    solver is provable from applied_load_n itself."""
+@pytest.fixture(scope="module")
+def buckling_column_doc():
+    """Real 10x10x200 mm steel column; no external-solver skip is permitted."""
+    bind_tool = _dispatch()
+    out = json.loads(bind_tool("new_part")(name="buckling_euler_column", fresh=True))
+    assert out.get("ok"), out
+    doc_id = out["doc_id"]
+    out = json.loads(bind_tool("add_features")(doc_id=doc_id, ops=[
+        {"op": "add_feature", "feature": {
+            "type": "box", "name": "Column",
+            "params": {"length": 10, "width": 10, "height": 200},
+        }},
+    ]))
+    assert out.get("ok"), out
+    return doc_id
+
+
+def test_buckling_real_column_matches_euler_without_ccx(
+        buckling_column_doc, monkeypatch, tmp_path):
+    """Tet10 fixed-free column must reproduce Euler within 8%, using real CAD."""
+    from services.mcp import fea_advanced
+    from xml.etree import ElementTree
+
+    monkeypatch.setattr(fea_advanced, "ccx_path", lambda: None)
+    vtu = tmp_path / "buckling.vtu"
     out = json.loads(_dispatch()("run_fea_buckling")(
-        fixtures=["bottom"],
-        load=[{"face": "top", "magnitude": 1000, "direction": [0, 0, -1]}],
-        doc_id=bc_doc))
-    if out.get("skipped"):
-        pytest.skip(f"ccx unavailable: {out.get('reason')}")
+        fixtures=[{"faces": ["bottom"], "type": "fixed"}],
+        load=[{"faces": ["top"], "magnitude": 1000, "direction": [0, 0, -1]}],
+        material={"E_mpa": 200000, "nu": 0.3},
+        doc_id=buckling_column_doc, vtu_path=str(vtu)))
     assert out.get("ok") is True, out
-    assert out["applied_load_n"] == pytest.approx(1000.0), out
-    assert out["load_factors"] and out["load_factors"][0] > 0.0, out
-    mapping = out["input_mapping"]
-    assert mapping["world_axis"] == "z", mapping
-    assert mapping["proxy_length_mm"] == pytest.approx(20.0, rel=1e-3), mapping
-    assert mapping["proxy_cross_section_mm"] == pytest.approx([100.0, 50.0], rel=1e-3)
+    expected = math.pi**2 * 200000 * (10 * 10**3 / 12) / (2 * 200)**2
+    assert out["critical_load_n"] == pytest.approx(expected, rel=0.08), out
+    factors = [mode["load_factor"] for mode in out["modes"]]
+    assert len(factors) == 4 and factors == sorted(factors), out
+    assert all(math.isfinite(factor) and factor > 0 for factor in factors), out
+    assert out["critical_load_factor"] == pytest.approx(factors[0]), out
+    assert out["critical_load_n"] == pytest.approx(factors[0] * 1000), out
+    for mode in out["modes"]:
+        participation = mode["participation"]
+        assert set(participation) == {"x", "y", "z"}, out
+        assert all(math.isfinite(value) and 0 <= value <= 1
+                   for value in participation.values()), out
+        assert sum(participation.values()) == pytest.approx(1.0), out
+    assert out["provenance"]["solver"] == "engine", out
+    point_data = ElementTree.parse(vtu).find(".//PointData")
+    assert point_data is not None
+    for number in range(1, 5):
+        field = point_data.find(f"./DataArray[@Name='mode_{number}']")
+        assert field is not None
+        assert field.get("NumberOfComponents") == "3"
+        values = [float(value) for value in field.text.split()]
+        assert len(values) == 3 * out["n_nodes"]
+        assert max(abs(value) for value in values) == pytest.approx(1.0)
 
 
-def test_buckling_refuses_to_map_shear_into_axial_compression(bc_doc):
+def test_buckling_refuses_tension(buckling_column_doc, monkeypatch):
+    """A tensile prestress must not be reported as a positive buckling capacity."""
+    from services.mcp import fea_advanced
+
+    monkeypatch.setattr(fea_advanced, "ccx_path", lambda: None)
     out = json.loads(_dispatch()("run_fea_buckling")(
-        fixtures=["bottom"],
-        load=[{"face": "top", "force": [10, 0, -1000]}],
-        doc_id=bc_doc))
-    if out.get("skipped"):
-        pytest.skip(f"ccx unavailable: {out.get('reason')}")
-    assert out["ok"] is False and "tangential" in out["error"], out
+        fixtures=["bottom"], load=[{"face": "top", "force": [0, 0, 1000]}],
+        doc_id=buckling_column_doc))
+    assert out["ok"] is False and not out.get("skipped"), out
+    assert not out.get("modes") and out.get("critical_load_n") is None, out
+
+
+def test_buckling_search_ceiling_is_not_reported_as_infinite_strength(buckling_column_doc):
+    out = json.loads(_dispatch()("run_fea_buckling")(
+        fixtures=["bottom"], load=[{"face": "top", "force": [0, 0, -1000]}],
+        material={"E_mpa": 200000, "nu": 0.3},
+        doc_id=buckling_column_doc, max_load_factor=1.0))
+    assert out["ok"] is False and not out.get("skipped"), out
+    assert out["max_load_factor"] == 1.0, out
+    assert not out.get("modes") and out.get("critical_load_n") is None, out
 
 
 # ----------------------------------------------- rejected dialects (clear error, no study run)
@@ -1044,11 +1094,8 @@ def test_buckling_refuses_a_zero_load_instead_of_substituting_one_newton(bc_doc)
     load the caller never supplied — the surviving half of the hard-coded-1000-N defect."""
     out = json.loads(_dispatch()("run_fea_buckling")(
         doc_id=bc_doc, fixtures=["bottom"], load=[{"face": "top", "force": [0, 0, 0]}]))
-    if out.get("skipped"):
-        pytest.skip(f"ccx unavailable: {out.get('reason')}")
     assert out["ok"] is False, out
-    assert "buckling load is zero" in out["error"], out
-    assert "applied_load_n" not in out, out
+    assert not out.get("modes") and out.get("critical_load_n") is None, out
 
 
 def test_a_transient_thermal_run_with_no_thermal_input_is_refused(bc_doc):

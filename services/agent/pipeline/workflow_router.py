@@ -1,73 +1,17 @@
-"""Workflow router — auto-mode task classifier (T-DP10).
+"""Deterministic task taxonomy and execution structure for mission callers.
 
-Contract: contracts/design_pipeline.md §7 / docs/AGENT_DESIGN_PIPELINE.md §3.6.
-
-Auto-mode is the DEFAULT: the router classifies an incoming task into one of the
-recognised task-classes and maps it to the scaffold level that the tuning loop has
-measured as best for that class.  When no discriminating winner has been measured
-(tied or untested), the router falls back to the tier default:
-
-    LOCAL  → full      (contract §7: "local models default to full scaffold")
-    FRONTIER → minimal (contract §7: "frontier defaults to minimal")
-
-The mapping from task-class → scaffold level is driven by the tuning output stored in
-``tools/flywheel/bench/gym/reports/tuning_results.json`` (written by
-``tools/flywheel/bench/gym/tuning.py``).  The router loads it on first call (lazy, cached
-at module level so tests can inject a fixture via ``_inject_tuning_results``).
-
-Design note: the router classifies task *text* only — no model call, no tool call,
-deterministic.  The classifier is a keyword/pattern rules table; the task author
-requested a tuning loop, not a trained text classifier, and the rules table is the
-correct lightweight complement to the measured gym data.
-
-Schema: ``aicad.router/1``
+Per-turn model and thinking policy belongs to services.agent.preferences.
+This classifier remains available to role selection and gym challenge metadata.
 """
 from __future__ import annotations
 
-import json
-import os
 import re
 from dataclasses import dataclass, field
 from enum import Enum
-from pathlib import Path
 from typing import Any
 
 ROUTER_SCHEMA = "aicad.router/1"
 
-# Path to the tuning results file written by the gym tuning loop.
-_TUNING_RESULTS_PATH = (
-    Path(__file__).resolve().parents[3]  # repo root
-    / "tools" / "flywheel" / "bench" / "gym" / "reports" / "tuning_results.json"
-)
-
-# ---------------------------------------------------------------------------
-# Scaffold levels (mirror the effort preset levels from aicad.effort/1)
-# ---------------------------------------------------------------------------
-
-class ScaffoldLevel(str, Enum):
-    ECO = "eco"
-    STANDARD = "standard"
-    DELIBERATE = "deliberate"
-    MAXIMUM = "maximum"
-
-    # Aliases for the pipeline contract §7 deliberation dial values.
-    @classmethod
-    def from_deliberation(cls, d: str) -> "ScaffoldLevel":
-        """Map a contract §7 deliberation dial value to a scaffold level."""
-        return {
-            "full": cls.MAXIMUM,
-            "standard": cls.STANDARD,
-            "minimal": cls.ECO,
-        }.get(d, cls.STANDARD)
-
-    @classmethod
-    def tier_default(cls, tier: str) -> "ScaffoldLevel":
-        """Documented default per contract §7:
-        local → full (maximum); frontier → minimal (eco).
-        """
-        if tier.startswith("frontier"):
-            return cls.ECO
-        return cls.MAXIMUM   # local-24k, local-48k, mid — all default full
 
 
 # ---------------------------------------------------------------------------
@@ -75,7 +19,7 @@ class ScaffoldLevel(str, Enum):
 # ---------------------------------------------------------------------------
 
 class TaskClass(str, Enum):
-    """Coarse task-class vocabulary the router maps to scaffold levels.
+    """Coarse task-class vocabulary for mission execution and role selection.
 
     Classes correspond to the C-suite challenge categories:
       SIMPLE_PART         single-body, <3 features, no assembly (C1, C6 mod)
@@ -90,7 +34,7 @@ class TaskClass(str, Enum):
       GENERAL_WORK        general/basic-assistant work (files, search, summarize,
                           PLM-lite) — the DEFAULT lane; a free linear general_agent
                           turn, never a multi-step modeling plan
-      UNKNOWN             unclassified; router falls back to tier default
+      UNKNOWN             unclassified; general-agent execution fallback
     """
     SIMPLE_PART = "simple_part"
     MULTI_FEATURE_PART = "multi_feature_part"
@@ -275,130 +219,6 @@ def collect_class_alternatives(
     return alts
 
 
-# ---------------------------------------------------------------------------
-# Tuning results
-# ---------------------------------------------------------------------------
-
-_tuning_cache: dict[str, Any] | None = None
-
-
-def _load_tuning_results(*, path: Path | None = None) -> dict[str, Any]:
-    """Load tuning results, preserving corrupt/unreadable-artifact diagnostics."""
-    global _tuning_cache
-    if _tuning_cache is not None:
-        return _tuning_cache
-    p = path or _TUNING_RESULTS_PATH
-    try:
-        if not p.exists():
-            _tuning_cache = {}
-            return _tuning_cache
-        loaded = json.loads(p.read_text(encoding="utf-8"))
-        if not isinstance(loaded, dict):
-            raise ValueError(
-                f"tuning artifact root must be an object, got {type(loaded).__name__}")
-        _tuning_cache = loaded
-    except json.JSONDecodeError as exc:
-        _tuning_cache = {
-            "_load_error": _tuning_load_error("invalid_artifact", p, exc),
-        }
-    except (OSError, UnicodeError, ValueError) as exc:
-        kind = "invalid_artifact" if isinstance(exc, (UnicodeError, ValueError)) \
-            else "artifact_unavailable"
-        _tuning_cache = {"_load_error": _tuning_load_error(kind, p, exc)}
-    return _tuning_cache
-
-
-
-
-def _tuning_load_error(kind: str, path: Path, exc: Exception) -> dict[str, str]:
-    detail = " ".join(str(exc).split())
-    rendered = f"{type(exc).__name__}: {detail}" if detail else type(exc).__name__
-    return {
-        "kind": kind,
-        "path": str(path),
-        "error": rendered[:240],
-        "outcome_kind": "internal_error",
-    }
-def _inject_tuning_results(data: dict[str, Any]) -> None:
-    """Test helper: inject a fixture into the module-level cache."""
-    global _tuning_cache
-    _tuning_cache = data
-
-
-def _clear_tuning_cache() -> None:
-    """Test helper: clear the module-level cache."""
-    global _tuning_cache
-    _tuning_cache = None
-
-
-def best_scaffold_for_class(task_class: TaskClass, tier: str,
-                             *, tuning: dict[str, Any] | None = None) -> tuple[ScaffoldLevel, str]:
-    """Return (scaffold_level, reason) for *task_class* on *tier*.
-
-    Consults the tuning results for a measured winner.  Falls back to the tier
-    default (local=full, frontier=eco) when:
-      - no tuning data exists for this class/tier combo, OR
-      - all measured configs are tied (no discriminating winner), OR
-      - the winner's win_rate equals 0 (all failed — still honest: full is the safe default)
-
-    Returns a 2-tuple (level, reason_string) so tests and transparency panels can
-    display why the router chose this level.
-    """
-    data = tuning if tuning is not None else _load_tuning_results()
-    default = ScaffoldLevel.tier_default(tier)
-    default_reason = (
-        f"tier default (local → full per contract §7)" if not tier.startswith("frontier")
-        else "tier default (frontier → eco per contract §7)"
-    )
-    load_error = data.get("_load_error")
-    load_reason = ""
-    if isinstance(load_error, dict):
-        load_reason = (
-            f"{str(load_error.get('kind') or 'invalid_artifact').replace('_', ' ')} "
-            f"tuning data ({load_error.get('error', 'unknown load error')}); "
-        )
-
-    per_class = data.get("per_class_winners", {})
-    key = f"{task_class.value}|{_normalize_tier(tier)}"
-    winner = per_class.get(key)
-    if not winner:
-        return default, f"{load_reason}no tuning data for {key}; {default_reason}"
-
-    w_level = winner.get("scaffold_level")
-    w_rate = winner.get("win_rate", 0.0)
-    w_n = winner.get("n", 0)
-
-    if w_level is None or w_n == 0:
-        return default, f"empty tuning entry for {key}; {default_reason}"
-
-    if winner.get("tied", False):
-        return default, (
-            f"all configs tied at win_rate={w_rate:.2f} over {w_n} cells for {key}; "
-            f"{default_reason}"
-        )
-
-    # We have a genuine measured winner.
-    try:
-        lvl = ScaffoldLevel(w_level)
-    except ValueError:
-        return default, f"unknown scaffold level {w_level!r} in tuning data; {default_reason}"
-
-    return lvl, (
-        f"measured winner: {w_level} at win_rate={w_rate:.2f} over {w_n} cells "
-        f"(cycle {winner.get('cycle', 'unknown')})"
-    )
-
-
-def _normalize_tier(tier: str) -> str:
-    """Coarse-normalize a tier string for the tuning key.
-
-    local-24k / local-48k → local; frontier-200k → frontier; mid → mid.
-    Mirrors effort.normalize_tier's prefix logic but without loading tiers.yaml.
-    """
-    for prefix in ("frontier", "local", "mid"):
-        if tier.startswith(prefix):
-            return prefix
-    return tier
 
 
 # ---------------------------------------------------------------------------
@@ -456,9 +276,8 @@ def structure_for_class(task_class: TaskClass) -> tuple[str, str | None]:
 
 @dataclass
 class RouterResult:
-    """The router's classification + scaffold decision for one task."""
+    """Classification and execution structure for one task."""
     task_class: TaskClass
-    scaffold_level: ScaffoldLevel
     tier: str
     reason: str
     request_snippet: str = ""
@@ -471,7 +290,6 @@ class RouterResult:
         return {
             "schema": ROUTER_SCHEMA,
             "task_class": self.task_class.value,
-            "scaffold_level": self.scaffold_level.value,
             "tier": self.tier,
             "reason": self.reason,
             "request_snippet": self.request_snippet,
@@ -486,67 +304,16 @@ class RouterResult:
 # Main entry point
 # ---------------------------------------------------------------------------
 
-def route(request: str, tier: str, *,
-          tuning: dict[str, Any] | None = None,
-          capability=None) -> RouterResult:
-    """Classify *request* and return the scaffold level for *tier*.
-
-    This is the auto-mode entry point.  It is:
-      - deterministic (no model call, no network),
-      - reads the measured tuning results on first call (cached),
-      - falls back gracefully to the tier default when measurements are absent or tied.
-
-    Args:
-        request: the verbatim user request string.
-        tier: the active tier name (e.g. ``"local-24k"``, ``"frontier-200k"``).
-        tuning: optional injected tuning dict (tests); None → load from disk.
-        capability: optional CapabilityProfile — when workflow=supervised (A),
-            force MAXIMUM scaffold; autopilot (C) keeps eco/tier default.
-
-    Returns:
-        RouterResult with task_class, scaffold_level, tier, reason, structure,
-        role, and alternatives.
-    """
+def route(request: str, tier: str) -> RouterResult:
+    """Classify a mission request without selecting a second effort policy."""
     cls, class_why = classify_task_detailed(request)
-    effective_tuning = tuning if tuning is not None else _load_tuning_results()
-    level, reason = best_scaffold_for_class(cls, tier, tuning=effective_tuning)
-    # Prefix scaffold reason with the class match so the Routing card shows both
-    # "what class" and "why this scaffold" (parity with C++ domain.reason).
-    if class_why:
-        reason = f"{class_why} · {reason}"
-    elif cls == TaskClass.UNKNOWN:
-        reason = f"unclassified request · {reason}"
-    # WI-9: capability workflow dial overlays scaffold choice (SOFT).
-    # Only when an explicit CapabilityProfile is passed — never re-resolve from
-    # tier alone (would force MAXIMUM on every local-tier route call and break
-    # measured tuning defaults).
-    if capability is not None:
-        try:
-            wf = str(getattr(capability, "workflow", "") or "")
-            if wf == "supervised":
-                level = ScaffoldLevel.MAXIMUM
-                reason = f"capability A supervised → MAXIMUM ({reason})"
-            elif wf == "autopilot_verify":
-                if level == ScaffoldLevel.ECO:
-                    level = ScaffoldLevel.STANDARD
-                    reason = f"capability B autopilot_verify → STANDARD ({reason})"
-            # wf == "autopilot" (C): never invent new approve gates.
-        except Exception:  # noqa: BLE001
-            pass
-    alternatives = collect_class_alternatives(request, cls)
     structure, exec_role = structure_for_class(cls)
-    diagnostics: dict[str, Any] = {}
-    load_error = effective_tuning.get("_load_error")
-    if isinstance(load_error, dict):
-        diagnostics["load_error"] = dict(load_error)
     return RouterResult(
         task_class=cls,
-        scaffold_level=level,
         tier=tier,
-        reason=reason,
+        reason=class_why or "unclassified request",
         request_snippet=request[:120],
-        alternatives=alternatives,
+        alternatives=collect_class_alternatives(request, cls),
         structure=structure,
         role=exec_role,
-        diagnostics=diagnostics,
     )

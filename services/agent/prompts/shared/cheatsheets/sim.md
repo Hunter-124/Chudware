@@ -1,10 +1,9 @@
 SIMULATION — define one case, check capability, anchor, refine, then interpret.
 
 REAL-PART:
-  run_fea_static/fatigue/modal/frequency_response; transient run_fea_thermal;
+  run_fea_static/fatigue/modal/frequency_response/thermal/buckling/contact;
   run_cfd_flow; simulate_motion.
-PROXY/ANALYTIC:
-  steady thermal + buckling/contact are CalculiX box/two-block proxies;
+ANALYTIC/REDUCED:
   EM defaults are builtin FDFD eigenmode or analytic-uniform guide response.
 
 SETUP:

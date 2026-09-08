@@ -6,7 +6,7 @@ capability_profile = *how much coercion*:
   B budget   — full tools + soft gates; structured plan
   C frontier — freedom; HARD floors only
 
-Resolution (mirrors effort.resolve_effort):
+Resolution:
   tiers.yaml default  <  model_manager registry override  <  config.json
   ai_capability.overrides.<tier>  (SOFT dials only — HARD floors ignore overrides)
 
@@ -202,12 +202,12 @@ def _resolve_letter_from_tier(
 ) -> tuple[str, str, list[str]]:
     """Map a gym/CLI tier string onto (letter, normalized_tier_name, warnings).
 
-    Uses effort_tier_for so openrouter:*/xai:* → frontier profile (C).
+    Uses profile_tier_for so openrouter:*/xai:* → frontier profile (C).
     Unknown tier → C with a warning.
     """
     warns: list[str] = []
     from services.agent.tiers import (
-        effort_tier_for,
+        profile_tier_for,
         load_all_tiers,
         parse_openrouter_tier,
         parse_xai_tier,
@@ -215,7 +215,7 @@ def _resolve_letter_from_tier(
 
     # Parameterized paid tiers are C by definition (frontier class).
     if parse_openrouter_tier(tier) is not None or parse_xai_tier(tier) is not None:
-        return "C", effort_tier_for(tier) or "frontier", warns
+        return "C", profile_tier_for(tier) or "frontier", warns
 
     try:
         tiers = load_all_tiers(path=tiers_path)
@@ -246,8 +246,8 @@ def _resolve_letter_from_tier(
                 letter = DEFAULT_LETTER
             return letter, known, warns
 
-    # effort_tier_for may still map something (passthrough for unknown).
-    mapped = effort_tier_for(tier)
+    # profile_tier_for may still map something (passthrough for unknown).
+    mapped = profile_tier_for(tier)
     if mapped and mapped in tiers:
         letter = tiers[mapped].capability_profile
         if letter not in LETTERS:
@@ -289,7 +289,7 @@ def resolve_capability(
 
     Precedence
     ----------
-    1. tiers.yaml ``capability_profile`` (via effort_tier_for mapping)
+    1. tiers.yaml ``capability_profile`` (via profile_tier_for mapping)
     2. model_manager registry ``capability_profile`` when set for *model_id*
     3. config.json ``ai_capability.overrides.<tier>`` — SOFT dials only
 

@@ -90,9 +90,9 @@ system_prompt: |
   - CFD: run_cfd_flow is directional LBM; require converged=true and
     min_feature_voxels>=~8. Absolute Cd/Cl needs run_cfd_accurate, which self-checks
     OpenFOAM and returns SKIP if unavailable. Refine cells/preset.
-  - Thermal: steady run_fea_thermal is a CalculiX 1-D box proxy needing exactly one
-    hot face and one cold face at distinct temperatures; it rejects loads.
-    transient={t_end_s,...} is real-mesh and accepts flux/convection; flux-only
+  - Thermal: steady and transient run_fea_thermal solve on the real part mesh with
+    temperature faces and flux/convection loads. Steady needs a fixed-temperature
+    or convection datum; schedules require transient={t_end_s,...}. Flux-only
     transient heat-up is valid. State W/m-K, J/kg-K, W/m^2 and seconds.
   - Motion: simulate_motion drives one dimensional mate; stop is required, degrees/mm,
     steps>=2. Refine samples near contact. dynamics adds inverse reactions, not contact.

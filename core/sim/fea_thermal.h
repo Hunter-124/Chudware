@@ -141,6 +141,12 @@ ThermalResult fea_thermal_solve(const std::vector<double>& points, const std::ve
                                 int nodes_per_elem = 4,
                                 const SimCancelToken& cancel_token = {});
 
+// Maximum Fourier heat-flux magnitude at element integration points, in W/L^2.
+// Inputs must be the validated mesh and temperature field of a successful solve.
+double thermal_flux_max(const std::vector<double>& points, const std::vector<int>& tets,
+                        const std::vector<double>& temperature, double k_cond,
+                        int nodes_per_elem);
+
 struct ThermalTransientOptions {
     double rho_cp = 0.0;   // volumetric heat capacity rho*cp, J/(L^3·K); must be > 0
     double t_end = 0.0;    // total simulated time, s; must be > 0

@@ -74,6 +74,7 @@ Env/naming: `CHUDWARE_*` env vars are canonical; MCP id is `chudware`
 ## Commands
 
 ```bash
+scripts/provision_venv.sh # create/refresh .venv-mcp + audit deps; VENV_DIR and CHUDCODE_RPC_SRC override paths
 ./build.sh              # default: host GUI (cmake -S host -B host/build-linux + ninja), 2–3 min
 ./build.sh core         # C++ kernel only (linux-core preset; needs system OCCT)
 ./build.sh all          # core, then GUI
@@ -215,6 +216,27 @@ judgment).
   vectors; multi-body docs paint (AICM face ids are per-body 1-based — `_mesh_topo_index`
   offsets them into `doc_query`'s running numbering; the old last-body map silently
   aliased body A's faces onto body B).
+- **Headless turns are `do_it` (2026-09-07).** `services/agent/preferences.py` owns the four
+  Copilot preferences (work_style/priority/privacy/…); the interactive default
+  `work_style=check_with_me` maps to plan mode and MUST NOT govern unattended callers.
+  `resolve_turn_preferences(cfg, headless=True)` is the one place that forces `do_it`; it is
+  used by `mission_dispatch.run_linear_role_turn`, `chudcode_roles._assemble_role_runtime`,
+  and `scripts/run_mission.py --mode` defaults to `agent`. When it leaked, three ME 490
+  mission turns produced only `blocked_by_mode` refusals. Phase 1 of
+  `docs/plans/AI_HARNESS_OVERHAUL_2026-09-05.md` deleted `effort_presets.yaml`, `ai_effort.*`,
+  `agent.prewalk_target`, `effort.resolve_effort`, `TierProfile.deliberation` and the council
+  threshold env readers — the Auto resolver (`preferences.py` §3.1 rules + bundled
+  classifier with keyword fallback) replaces the seat lookups; the per-role table stays.
+- **Buckling and steady thermal are engine-native (2026-09-07).** `run_fea_buckling` = static
+  prestress → geometric stiffness → reciprocal pencil `K_G φ = μ K φ` (Spectra Cholesky on
+  the shared modal factor); `max_load_factor` (default 1e4) is an engineering ceiling: the
+  LDLT inertia of `K_G + K/λ_max` counts the modes below it exactly, zero → refusal naming
+  the ceiling (a clamped tension bar legitimately has local compressive Gauss stresses).
+  `run_fea_thermal` steady runs `fea_thermal_solve` on the part mesh (the CalculiX box proxy
+  is gone; ccx remains only as V&V cross-check elsewhere). Known mesher defect: a 10×10×200
+  bar at h=4 yields 205 504 tet10 (thin_wall_ratio 17.1) vs 2700 structured. `placement_source`
+  persists in doc meta `placement_sources` (inside `.step+`); `scripts/provision_venv.sh`
+  builds `.venv-mcp` from `requirements.txt` (+ `CHUDCODE_RPC_SRC` editable).
 - **Chat sessions are keyed by project (2026-09-04).** `Conversation.projectDir` is stamped
   once at creation from `convProjectDir(st)` (= `st.workspaceDir`, else `plmProjectPath()`) —
   the same value the composer sends Chudcode as `workspace_dir`. `index.json` v3 keeps

@@ -1418,11 +1418,10 @@ json run_design(const std::string& request, const std::string& doc_id, const jso
             : std::string();
 
     // ---- PREWALK (strong plan → cheap implement) ----
-    // When agent.prewalk is true and the target resolves, model/fix stages use a
-    // separate cheap provider. Planning stages (intake/plan) keep the strong main
-    // provider. One-way: first implementation stage emits a run_note and stays on
-    // the cheap model for the rest of the run. Null target = safe no-op (identical
-    // to prewalk off).
+    // An explicit prewalk_provider descriptor routes model/fix stages to a
+    // separate provider. Planning stages (intake/plan) keep the main provider.
+    // The first implementation stage emits a one-shot run_note. Without a
+    // descriptor, every stage keeps the main provider.
     ProviderFn implement_provider = provider;
     int implement_budget = call_budget;
     int implement_ctx_cap = ctx_cap;
@@ -1430,25 +1429,10 @@ json run_design(const std::string& request, const std::string& doc_id, const jso
     bool prewalk_armed = false;
     bool prewalk_switched = false;
     std::string prewalk_model_label;
-    {
-        // options.prewalk / options.prewalk_target override ambient config (tests + host).
-        json cfg_pw = load_config();
-        if (!cfg_pw.is_object()) cfg_pw = json::object();
-        if (!cfg_pw.contains("agent") || !cfg_pw["agent"].is_object())
-            cfg_pw["agent"] = json::object();
-        if (options.contains("prewalk")) cfg_pw["agent"]["prewalk"] = options["prewalk"];
-        if (options.contains("prewalk_target") && options["prewalk_target"].is_string())
-            cfg_pw["agent"]["prewalk_target"] = options["prewalk_target"].get<std::string>();
-        // Also honor a pre-resolved descriptor the host/gate may attach.
-        json pw_desc = json(nullptr);
-        if (provider_cfg.contains("prewalk_provider") &&
-            provider_cfg["prewalk_provider"].is_object() &&
-            !provider_cfg["prewalk_provider"].contains("error")) {
-            pw_desc = provider_cfg["prewalk_provider"];
-        } else {
-            pw_desc = resolve_prewalk_provider(cfg_pw, json::object());
-        }
-        if (pw_desc.is_object() && !pw_desc.contains("error") && !pw_desc.empty()) {
+    if (provider_cfg.contains("prewalk_provider") &&
+        provider_cfg["prewalk_provider"].is_object()) {
+        const json& pw_desc = provider_cfg["prewalk_provider"];
+        if (!pw_desc.contains("error") && !pw_desc.empty()) {
             // Same provider+model as main → nothing to switch (disarm silently).
             const std::string main_name = provider_cfg.value("name", std::string());
             const std::string main_model =

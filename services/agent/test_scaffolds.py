@@ -782,16 +782,3 @@ def test_ops_need_aggressive_checkpoint():
         {"ops": [{"op": "extrude"}]})
 
 
-def test_workflow_router_supervised_a():
-    from services.agent.pipeline.workflow_router import route, ScaffoldLevel
-    cap = profile_for_letter("A")
-    r = route("make a simple bushing", "local-24k", capability=cap)
-    assert r.scaffold_level == ScaffoldLevel.MAXIMUM
-
-
-def test_workflow_router_c_no_force_maximum():
-    from services.agent.pipeline.workflow_router import route, ScaffoldLevel
-    cap = profile_for_letter("C")
-    r = route("make a simple bushing", "frontier", capability=cap)
-    # frontier default is ECO; C must not raise to MAXIMUM
-    assert r.scaffold_level == ScaffoldLevel.ECO

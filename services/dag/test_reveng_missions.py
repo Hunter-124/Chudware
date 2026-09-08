@@ -636,6 +636,24 @@ class TestMissionGateTools(unittest.TestCase):
         images.mkdir(parents=True, exist_ok=True)
         (images / "a.jpg").write_bytes(b"\xff\xd8\xff")
 
+        # Gate lifecycle tests use synthetic images, not real photogrammetry.
+        # Sparse SfM now precedes the scale gate; optional backend discovery and
+        # reconstruction must not consume the background run's polling deadline.
+        sparse = images.parent / "sparse"
+        sparse.mkdir()
+        for patcher in (
+            mock.patch.object(rc, "_reveng_status", return_value={"capabilities": {}}),
+            mock.patch(
+                "services.vision.colmap_pipeline.run_sparse",
+                return_value={
+                    "ok": True, "sparse_dir": str(sparse),
+                    "registered": 1, "backend": "test",
+                },
+            ),
+        ):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
     def tearDown(self):
         import shutil
         rc._release_mission(self.SESSION_ID, "run_busy_probe")
@@ -675,6 +693,11 @@ class TestMissionGateTools(unittest.TestCase):
         self.assertEqual(rec["run_id"], started["run_id"])
         self.assertEqual(rec["gate"]["node_id"], "n_scale_gate")
         self.assertEqual(rec["gate"]["gate_kind"], "scale_confirm")
+
+        # The sidecar can become visible during the publish-and-release critical
+        # section, before the manifest write finishes. Observe the mission slot
+        # through its synchronized API before reading the completed publication.
+        self.assertIsNone(rc._mission_running(self.SESSION_ID))
 
         # The session manifest is the progress source of truth.
         session = rt._load_session(self.SESSION_ID)

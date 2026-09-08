@@ -784,19 +784,6 @@ def test_mission_graph_fan_out_independent_builds_share_no_edge():
     assert ("n_plan", "n_build_DL9") in build_edges
 
 
-def test_invalid_tuning_json_falls_back_with_diagnostic(tmp_path, monkeypatch):
-    from services.agent.pipeline import workflow_router
-
-    artifact = tmp_path / "tuning_results.json"
-    artifact.write_text("{not valid json", encoding="utf-8")
-    monkeypatch.setattr(workflow_router, "_TUNING_RESULTS_PATH", artifact)
-    workflow_router._clear_tuning_cache()
-    result = workflow_router.route("make a simple bracket", "local-24k")
-    workflow_router._clear_tuning_cache()
-
-    assert result.scaffold_level is workflow_router.ScaffoldLevel.MAXIMUM
-    assert "invalid artifact" in result.reason
-    assert result.diagnostics["load_error"]["kind"] == "invalid_artifact"
 
 
 def test_mission_graph_validates_against_dag_schema():

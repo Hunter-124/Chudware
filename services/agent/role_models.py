@@ -48,6 +48,9 @@ SESSION_DEFAULT = "default"
 # Roles the Settings GUI / Contract expose. routing.yaml roles still resolve via
 # routing.py; these are the *harness-level* role knobs (advisor/task/planning/...).
 KNOWN_ROLES = (
+    "chat",
+    "worker",
+    "private",
     "advisor",
     "task",
     "planning",
@@ -756,6 +759,11 @@ def resolve_role_thinking(
     Returns None only when intentionally leaving provider default (should be rare;
     auto paths return a concrete level, defaulting to medium).
     """
+    if role in ("chat", "worker", "private"):
+        from services.agent.preferences import TASK_CLASS_KINDS, resolve_turn_preferences
+
+        return resolve_turn_preferences(request or "", cfg=cfg,
+            task_kind=TASK_CLASS_KINDS.get(task_class)).thinking
     role_s = (role or "default").strip().lower() or "default"
     level = get_role_thinking(role_s, cfg)
     if level in CONCRETE_THINKING:
@@ -2085,6 +2093,8 @@ def resolve_role_model(
     min_rank: int | None = None,
     rankings: Mapping[str, ModelRank] | None = None,
     enabled: Iterable[Mapping[str, str]] | None = None,
+    request: str = "",
+    turn_preferences: Any | None = None,
 ) -> RoleModelAssignment:
     """Resolve provider+model for *role* honouring config.json ``ai_roles``.
 
@@ -2096,6 +2106,19 @@ def resolve_role_model(
       ``\"default\"`` is downgraded to ``\"auto\"`` for redaction, because the chat
       model is normally a cloud provider and this role may never leave loopback.
     """
+    if role in ("chat", "worker", "private"):
+        from services.agent.preferences import TASK_CLASS_KINDS, resolve_turn_preferences
+
+        if turn_preferences is None:
+            turn_preferences = resolve_turn_preferences(request, cfg=cfg,
+                task_kind=TASK_CLASS_KINDS.get(task_class))
+        if min_rank is not None:
+            from dataclasses import replace
+
+            turn_preferences = replace(turn_preferences,
+                min_rank=max(turn_preferences.min_rank, max(1, min(5, int(min_rank)))))
+        return _resolve_auto_seat(role, cfg, request=request, policy=turn_preferences,
+                                  rankings=rankings, enabled=enabled)
     role_s = (role or "default").strip().lower() or "default"
     role_s = ROLE_MODEL_KEY_ALIASES.get(role_s, role_s)
     cfg = cfg or {}
@@ -2179,6 +2202,74 @@ def resolve_role_model(
     )
 
 
+def _resolve_auto_seat(role, cfg, *, request, policy, rankings, enabled):
+    """Three Auto seats; legacy per-role assignments remain independently readable."""
+    from services.agent.preferences import resolve_turn_preferences
+    from services.agent.config import load_config
+
+    cfg = load_config() if cfg is None else cfg
+    policy = policy or resolve_turn_preferences(request, cfg=cfg)
+    ranks = rankings if rankings is not None else load_rankings(cfg)
+    local_only = policy.local_only or role == "private"
+    entry = get_ai_roles(cfg)[role]
+    if isinstance(entry, Mapping) and entry.get("provider") and entry.get("model"):
+        provider, model = str(entry["provider"]), str(entry["model"])
+        if local_only and not _auto_local_provider(provider, cfg, entry.get("base_url")):
+            raise RoleModelError("This computer only requires a loopback model. Configure a local model in Accounts.")
+        return RoleModelAssignment(role, provider, model, "fixed",
+            rank=ranks[model].rank if model in ranks else None, source="ai_roles",
+            reason=f"Using your ai_roles.{role} model.")
+    if entry == SESSION_DEFAULT and not local_only:
+        return RoleModelAssignment(role, "", "", SESSION_DEFAULT, source="ai_roles",
+                                   reason="Using the current chat model.")
+    candidates = list(enabled) if enabled is not None else _enabled_providers(cfg)
+    disabled = set(cfg.get("disabled_providers") or ())
+    candidates = [c for c in candidates if c.get("authenticated", True) and c.get("provider") not in disabled
+                  and not is_provider_unavailable(c.get("provider"))
+                  and (not local_only or _auto_local_provider(c.get("provider", ""), cfg, c.get("base_url")))]
+    if not candidates:
+        raise RoleModelError("No available local model. Configure a loopback model in Accounts."
+                             if local_only else "No authenticated model is available. Sign in to a provider in Accounts.")
+    def rank(c):
+        row = ranks.get(str(c.get("model", "")))
+        return row.rank if row else 2
+    threshold = 1 if role == "worker" and policy.cheap_leaves else policy.min_rank
+    capable = [c for c in candidates if rank(c) >= threshold]
+    if policy.task_kind == "analysis" or policy.priority == "best_results":
+        strongest = max(map(rank, candidates))
+        capable = [c for c in candidates if rank(c) == strongest]
+    if not capable:
+        strongest = max(map(rank, candidates))
+        capable = [c for c in candidates if rank(c) == strongest]
+    def cost(c):
+        return _COST_CLASS.get(str(c["provider"]), 5)
+    if policy.priority == "fastest":
+        capable.sort(key=lambda c: (rank(c), cost(c), str(c["model"])))
+    else:
+        capable.sort(key=lambda c: (cost(c), rank(c), str(c["model"])))
+    chosen = capable[0]
+    model, provider = str(chosen["model"]), str(chosen["provider"])
+    reason = f"Auto chose {model} for {policy.task_kind.replace('_', ' ')} ({policy.thinking} thinking)."
+    if rank(chosen) < threshold:
+        reason += " No available model meets the requested capability; using the strongest available."
+    return RoleModelAssignment(role, provider, model, "auto", rank(chosen),
+                               ranks[model].source if model in ranks else "unranked", reason)
+
+
+def _auto_local_provider(provider, cfg, base_url=None):
+    # Frozen offline table: cloud provider ids never become local by URL alone.
+    name = str(provider).lower()
+    if name in ("mock", "mock-roles", "base"):
+        return True
+    if name not in ("openai", "llamacpp", "lmstudio", "ollama", "vllm"):
+        return False
+    section = cfg.get(name) or {}
+    url = base_url or section.get("base_url")
+    if not url and name == "openai":
+        url = cfg.get("base_url")
+    return host_is_loopback(url) if url else name != "openai"
+
+
 def resolve_for_node(
     role: str | None,
     context: Mapping[str, Any] | None = None,
@@ -2197,7 +2288,7 @@ def resolve_for_node(
             cfg = {}
     has_ai_roles = isinstance((cfg or {}).get(AI_ROLES_KEY), Mapping)
     role_s = (role or "default").strip().lower() or "default"
-    if not has_ai_roles and role_s != "redaction":
+    if not has_ai_roles and role_s not in ("redaction", "chat", "worker", "private"):
         return None
 
     ctx = context or {}
@@ -2218,4 +2309,5 @@ def resolve_for_node(
         task_class=str(task_class) if task_class else None,
         node_depth=depth,
         risk=str(risk) if risk else None,
+        request=str(ctx.get("brief") or node_inputs.get("brief") or ctx.get("request") or ""),
     )

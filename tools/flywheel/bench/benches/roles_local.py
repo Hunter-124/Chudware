@@ -294,7 +294,6 @@ def run_frontier_dial_check() -> dict:
         "tier": "frontier",
         "structured_output": profile.structured_output,
         "playbook_enforcement": profile.playbook_enforcement,
-        "deliberation": profile.deliberation,
         "grammar_is_none": grammar is None,
         "advisory_verbosity": profile.advisory_verbosity,
     }
@@ -424,10 +423,6 @@ if _PYTEST_AVAILABLE:
             profile = load_tier("local-24k")
             assert profile.playbook_enforcement == "step_locked"
 
-        def test_deliberation_full_for_local(self):
-            from services.agent.tiers import load_tier
-            profile = load_tier("local-24k")
-            assert profile.deliberation == "full"
 
     class TestFixerFixture:
         def test_no_context_overflow(self):
@@ -452,9 +447,6 @@ if _PYTEST_AVAILABLE:
             r = run_frontier_dial_check()
             assert r["playbook_enforcement"] == "off"
 
-        def test_frontier_deliberation_minimal(self):
-            r = run_frontier_dial_check()
-            assert r["deliberation"] == "minimal"
 
         def test_frontier_advisory_compact(self):
             r = run_frontier_dial_check()

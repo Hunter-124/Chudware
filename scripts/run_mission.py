@@ -360,7 +360,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--sessions-dir", required=True, help="Chudcode session dir")
     parser.add_argument("--prompt-file", required=True, help="file holding the prompt")
     parser.add_argument("--role", default="general_agent")
-    parser.add_argument("--mode", default="agent")
+    # A headless mission has nobody to check with: the interactive `work_style` preference
+    # (default check_with_me → plan mode) must not govern it. Three ME 490 turns produced
+    # nothing but blocked_by_mode refusals when it did (2026-09-07).
+    parser.add_argument("--mode", default="agent", choices=("agent", "plan", "ask"),
+                        help="copilot mode for this turn (headless default: agent)")
     parser.add_argument("--resume", default="", help="chudcode_session_file to resume")
     parser.add_argument("--session-id", default="", help="Chudware conversation id")
     parser.add_argument("--provider", default="", help="override the configured provider")
@@ -389,7 +393,6 @@ def main(argv: list[str] | None = None) -> int:
     if not WORKER_PY.exists():
         print(f"error: runtime venv missing: {WORKER_PY}", file=sys.stderr)
         return 2
-
     session_id = args.session_id or f"mission-{time.time_ns():x}"
     run_id = f"mission-run-{time.time_ns():x}"
     log_path = Path(args.log).expanduser() if args.log else sessions_dir / f"{session_id}.events.jsonl"

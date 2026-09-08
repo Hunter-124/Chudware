@@ -212,7 +212,7 @@ def register_cad_asm_tools(mcp: FastMCP) -> None:
                 translation).
         Returns the new component id ("k1", "k2", ...) for use in asm_mate refs, plus
         `placement_source` ("transform" when you passed at/rotate, "mate" once a mate on this
-        component solves).
+        component solves). Provenance is saved inside the .step+ document and survives reopen.
 
         `at`/`rotate` ARE NOT A GUESS. For INDEPENDENTLY-SOURCED parts (a wheel from one
         vendor onto a frame from another) a pose must come from ONE of:
@@ -1340,7 +1340,7 @@ def register_cad_asm_tools(mcp: FastMCP) -> None:
 
         `placement_source` is "mate" (solver-derived pose), "transform" (a pose YOU asserted
         via asm_add_component at/rotate — verify it with check_interference + measure_between),
-        "origin" (inserted at identity) or null (this process did not place it). Any
+        "origin" (inserted at identity) or null (no provenance recorded in the document). Any
         transform-placed component still carries `placement_warnings` here and on
         save_part/export_part until check_interference runs again.
         """

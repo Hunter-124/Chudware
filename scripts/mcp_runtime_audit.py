@@ -416,6 +416,43 @@ def call_tool(mcp, name: str, args: dict) -> tuple[Any, Exception | None]:
         return None, exc
 
 
+def check_dependencies(req_file: Path | None = None) -> dict:
+    """Check active requirements against distribution metadata, including file installs."""
+    from importlib.metadata import distributions
+    from packaging.requirements import Requirement
+    from packaging.utils import canonicalize_name
+
+    req_file = req_file if req_file is not None else _REPO / "requirements.txt"
+    installed = {
+        canonicalize_name(dist.metadata["Name"]): dist.version
+        for dist in distributions() if dist.metadata["Name"]
+    }
+    declared: set[str] = set()
+    missing: list[dict] = []
+    applicable = 0
+    for raw_line in req_file.read_text().splitlines():
+        line = raw_line.split("#", 1)[0].strip()
+        if not line:
+            continue
+        requirement = Requirement(line)
+        pkg = canonicalize_name(requirement.name)
+        declared.add(pkg)
+        if requirement.marker and not requirement.marker.evaluate():
+            continue
+        applicable += 1
+        version = installed.get(pkg)
+        # PEP 610 file:// (including editable) installs retain distribution version
+        # metadata: their origin does not invalidate an otherwise satisfied pin.
+        if version is None or not requirement.specifier.contains(version):
+            missing.append({"pkg": pkg, "req_line": raw_line.strip()})
+    return {
+        "installed_pkgs": set(installed),
+        "req_pkgs": declared,
+        "declared_missing": missing,
+        "requirements_count": applicable,
+    }
+
+
 def run_audit(out_path: Path | None = None) -> dict:
     from mcp.server.fastmcp import FastMCP
     import services.mcp.tool_registry as _reg
@@ -509,56 +546,12 @@ def run_audit(out_path: Path | None = None) -> dict:
         icon = {"WORKS": "ok  ", "DEGRADED": "DEGR", "DEAD": "DEAD", "INCONCLUSIVE": "INCN"}[verdict]
         print(f"  {icon}         {tool_name:45s} {elapsed*1000:5.0f}ms  {detail[:80]}")
 
-    # ---------------------------------------------------------------------------
-    # Dep cross-check: requirements.txt vs mcp-venv installed
-    venv_bin = Path(sys.executable).parent
-    import subprocess
-    pip_list = subprocess.run(
-        [str(venv_bin / "pip"), "list", "--format=freeze"],
-        capture_output=True, text=True,
-    )
-    installed_pkgs = set()
-    for line in pip_list.stdout.splitlines():
-        pkg = line.split("==")[0].lower().replace("_", "-")
-        installed_pkgs.add(pkg)
-
-    req_file = _REPO / "requirements.txt"
-    declared_missing: list[dict] = []
-    if req_file.exists():
-        for line in req_file.read_text().splitlines():
-            line = line.strip()
-            if not line or line.startswith("#"):
-                continue
-            # Strip environment markers (e.g. "; sys_platform == 'win32'") before pkg name extraction
-            req_spec = line.split(";")[0].strip()
-            pkg = req_spec.split("==")[0].split(">=")[0].split("<=")[0].split("!=")[0]
-            pkg = pkg.strip().lower().replace("_", "-")
-            # Evaluate the marker: skip entries that don't apply to the current platform
-            if ";" in line:
-                import platform as _platform
-                marker = line.split(";", 1)[1].strip()
-                # Simple sys_platform check (covers the only case we have: pywin32)
-                if "sys_platform" in marker:
-                    import sys as _sys
-                    sys_plat = _sys.platform
-                    try:
-                        if not eval(marker, {"sys_platform": sys_plat, "__builtins__": {}}):
-                            continue  # marker evaluates false on this platform — skip
-                    except Exception:
-                        pass  # conservative: don't skip on parse error
-            if pkg and pkg not in installed_pkgs:
-                declared_missing.append({"pkg": pkg, "req_line": line})
+    deps = check_dependencies()
+    installed_pkgs = deps["installed_pkgs"]
+    req_pkgs = deps["req_pkgs"]
+    declared_missing = deps["declared_missing"]
 
     # Undeclared deps: imports in services/+engine_oracle/+services/mcp/ NOT in requirements.txt
-    req_pkgs: set[str] = set()
-    if req_file.exists():
-        for line in req_file.read_text().splitlines():
-            line = line.strip()
-            if not line or line.startswith("#"):
-                continue
-            req_spec = line.split(";")[0].strip()
-            pkg = req_spec.split("==")[0].split(">=")[0].split("<=")[0].split("!=")[0]
-            req_pkgs.add(pkg.strip().lower().replace("_", "-"))
 
     # Stdlib + internal packages to ignore
     STDLIB_AND_INTERNAL = {
@@ -949,7 +942,17 @@ def main() -> None:
                         help="Run test suite pollution analysis (slow, suite-by-suite)")
     parser.add_argument("--no-tools", action="store_true",
                         help="Skip tool calls (only do dep + pollution analysis)")
+    parser.add_argument("--deps-only", action="store_true",
+                        help="Check declared dependencies only; fail if any are missing or incompatible")
     args = parser.parse_args()
+    if args.deps_only:
+        deps = check_dependencies()
+        print(f"Venv: {sys.executable}")
+        print(f"Missing from venv: {len(deps['declared_missing'])} of {deps['requirements_count']} requirements")
+        for missing in deps["declared_missing"]:
+            print(f"  Missing or incompatible: {missing['req_line']}")
+        raise SystemExit(bool(deps["declared_missing"]))
+
 
     out_path = _REPO / args.out
     out_path.parent.mkdir(parents=True, exist_ok=True)

@@ -4,8 +4,7 @@
 # configurable, per-tier, diverse-model).
 #
 # Key design decisions:
-#   - deliberation dial from TierProfile (contracts/advisor.md §8 1.3) is the anchor.
-#     local tiers (full) → wide breadth, frontier (minimal) → narrow breadth.
+#   - Local tiers have wider breadth; frontier tiers use fewer seats.
 #   - breadth = number of seats from the 4-seat roster (manufacturing / tolerancing /
 #     fitment / simplicity). local=4, mid=2, frontier=1.
 #   - enabled = whether the council is on by default for this (stage, tier) combo.
@@ -18,14 +17,7 @@
 # Stage vocabulary from contracts/advisor.md §1 (FROZEN):
 #   intake | spec | layout | sketch | feature | part_verify | assembly | sim | cam | deliver | fix
 #
-# Override discipline (lowest wins):
-#   1. Shipped defaults in this file (per stage+tier row, else the star fallback)
-#   2. effort_presets.yaml (CHUDWARE_EFFORT_PRESET env / GUI preset selection)
-#   3. Per-tier user overrides (config.json ai_effort.council_* knobs, §23)
-#
-# Knobs exposed to Advanced mode (§23 table: council, council_seats,
-# council_feature_threshold — all live in effort.py resolve_effort; this file
-# sets the shipped defaults they layer over).
+# Per-call resolve_policy(overrides=...) values override these shipped defaults.
 #
 schema: aicad.council_policy/1
 

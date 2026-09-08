@@ -161,10 +161,10 @@ def test_turn_failure_lands_in_the_report_context(tmp_path, monkeypatch):
     brc.clear()
 
 
-def test_linear_turn_advertises_the_tool_only_when_enabled(tmp_path, monkeypatch):
-    """The universal live entry (agent_admin_turn → run_linear_role_turn) must
-    put submit_bug_report on the advertised/allowed list when the toggle is
-    on, and leave it out when off."""
+@pytest.mark.parametrize("lane", ["offline", "chudcode"])
+def test_linear_turn_advertises_the_tool_only_when_enabled(tmp_path, monkeypatch, lane):
+    """Headless role turns retain mutation tools and honor the report toggle,
+    regardless of the interactive approval-first default."""
     from services.agent import agent_turn as at
     from services.agent import mission_dispatch as md
 
@@ -183,10 +183,25 @@ def test_linear_turn_advertises_the_tool_only_when_enabled(tmp_path, monkeypatch
 
     monkeypatch.setattr(at, "run_turn", _fake_run_turn)
 
+    def advertised_tools():
+        if lane == "offline":
+            md.run_linear_role_turn("build me a bracket", "general_agent", provider=object())
+            return captured["allowed_tools"]
+        from services.agent.chudcode_roles import _assemble_role_runtime
+        from services.agent.roles import load_role
+
+        _, allowed, _, _, _ = _assemble_role_runtime(
+            load_role("general_agent"), "general_agent", "bug-report-turn", "",
+            {}, None, None, None, None,
+        )
+        return allowed
+
     _write_cfg(cfg, True)
-    md.run_linear_role_turn("build me a bracket", "general_agent", provider=object())
-    assert "submit_bug_report" in (captured.get("allowed_tools") or [])
+    allowed = advertised_tools()
+    assert "submit_bug_report" in allowed
+    assert "new_part" in allowed
 
     _write_cfg(cfg, False)
-    md.run_linear_role_turn("build me a bracket", "general_agent", provider=object())
-    assert "submit_bug_report" not in (captured.get("allowed_tools") or [])
+    allowed = advertised_tools()
+    assert "submit_bug_report" not in allowed
+    assert "new_part" in allowed

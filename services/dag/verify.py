@@ -35,6 +35,7 @@ Mapping (check_type → MCP tool name, module_key for battery._get_fn):
 from __future__ import annotations
 
 import json
+import math
 import time
 import warnings
 from typing import Any, Callable, Optional
@@ -138,8 +139,9 @@ def _check_buckling_default(r: dict) -> bool:
     (the part does NOT buckle below the applied load)."""
     if not r.get("ok", False) or r.get("skipped"):
         return False
-    factors = r.get("load_factors", [])
-    return bool(factors) and min(factors) >= 1.0
+    factor = r.get("critical_load_factor")
+    return (isinstance(factor, (int, float)) and not isinstance(factor, bool)
+            and math.isfinite(factor) and factor >= 1.0)
 
 def _check_contact_default(r: dict) -> bool:
     """Pass when a real contact solve converged with load actually crossing an interface.
@@ -334,7 +336,7 @@ def _build_tool_kwargs(check_type: str, node_inputs: dict[str, Any]) -> dict[str
             if k in node_inputs}
     if check_type == "buckling":
         return {k: node_inputs[k] for k in (
-            "fixtures", "load", "material", "n_modes", "doc_id")
+            "fixtures", "load", "material", "n_modes", "size_mm", "vtu_path", "doc_id")
             if k in node_inputs}
     if check_type == "contact":
         return {k: node_inputs[k] for k in (

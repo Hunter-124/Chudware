@@ -16,9 +16,7 @@ provider that records every ``messages`` list it is handed, proving:
      ``part_search``);
   b) an identical second fire within ``cooldown_turns`` (triggers.yaml: 8 for
      thread_mention) does NOT re-inject a second block;
-  c) the effort knob ``trigger_injection=false`` (tiers.yaml/effort.py) suppresses
-     injection entirely, even on a match;
-  d) a turn with no trigger-matching text/tools injects nothing.
+  c) a turn with no trigger-matching text/tools injects nothing.
 
 Hermetic: no network, no real provider, no core kernel — only the shipped
 triggers.yaml table (real, like advisor/test_triggers.py) plus a scripted provider
@@ -79,17 +77,6 @@ def _messages_text(messages: list[dict]) -> str:
     return "\n".join(out)
 
 
-def _patch_effort(monkeypatch, *, on: bool) -> None:
-    """Deterministic trigger_injection flag — never depends on the local
-    machine's config.json (engine.build_advisory reads it via resolve_effort)."""
-    from services.agent import effort as effort_mod
-
-    class _Profile:
-        values = {"trigger_injection": on}
-
-    monkeypatch.setattr(effort_mod, "resolve_effort", lambda *a, **kw: _Profile())
-
-
 # ---------------------------------------------------------------------------
 # (a) production-shaped run: a matching turn injects the expected block
 # ---------------------------------------------------------------------------
@@ -98,7 +85,6 @@ def test_matching_request_injects_advisory_block(monkeypatch):
     """A request mentioning a threaded hole (thread_mention keyword) is matched
     before the first completion — a rule exists to steer the model, so waiting
     for the model to say it first would deliver the pack a turn too late."""
-    _patch_effort(monkeypatch, on=True)
     prov = _CapturingProvider([
         _tool_reply("measure_part", note="I'll add a tapped hole M6x1.0 through it"),
         _done_reply(),
@@ -121,7 +107,6 @@ def test_matching_request_injects_advisory_block(monkeypatch):
 
 def test_tool_name_match_also_injects(monkeypatch):
     """bearing_seat fires on the part_search TOOL NAME, not just keywords."""
-    _patch_effort(monkeypatch, on=True)
     prov = _CapturingProvider([
         _tool_reply("part_search", {"query": "6203 bearing"}),
         _done_reply(),
@@ -144,7 +129,6 @@ def test_tool_name_match_also_injects(monkeypatch):
 # ---------------------------------------------------------------------------
 
 def test_cooldown_suppresses_second_fire_within_turn(monkeypatch):
-    _patch_effort(monkeypatch, on=True)
     prov = _CapturingProvider([
         _tool_reply("measure_part", note="tap M6x1.0 pilot hole"),
         _tool_reply("measure_part", note="tap M6x1.0 again"),
@@ -167,32 +151,10 @@ def test_cooldown_suppresses_second_fire_within_turn(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# (c) effort trigger_injection=false — never injects, even on a match
-# ---------------------------------------------------------------------------
-
-def test_effort_flag_off_never_injects(monkeypatch):
-    _patch_effort(monkeypatch, on=False)
-    prov = _CapturingProvider([
-        _tool_reply("measure_part", note="tap M6x1.0 pilot hole"),
-        _done_reply(),
-    ])
-    res = at.run_turn(
-        "add a threaded hole", prov,
-        allowed_tools=["measure_part"],
-        tool_dispatch=_dispatch_ok,
-        max_tool_calls=4,
-    )
-    assert res.success is True
-    assert len(prov.seen_messages) == 2
-    assert "[ADVISORY" not in _messages_text(prov.seen_messages[1])
-
-
-# ---------------------------------------------------------------------------
 # (d) non-matching turn injects nothing
 # ---------------------------------------------------------------------------
 
 def test_non_matching_turn_injects_nothing(monkeypatch):
-    _patch_effort(monkeypatch, on=True)
     prov = _CapturingProvider([
         _tool_reply("measure_part", note="just check the overall envelope size"),
         _done_reply(),

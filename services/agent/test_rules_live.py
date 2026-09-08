@@ -94,16 +94,9 @@ def _messages_text(messages: list[dict]) -> str:
     return "\n".join(out)
 
 
-def _patch_effort(monkeypatch, *, on: bool = True) -> None:
-    """Deterministic ``trigger_injection`` flag, and project memory off so the
-    local machine's .plm store cannot inject its own context event."""
+def _disable_project_memory(monkeypatch) -> None:
+    """Keep the local machine's project memory out of rule-injection tests."""
     from services.agent import config as config_mod
-    from services.agent import effort as effort_mod
-
-    class _Profile:
-        values = {"trigger_injection": on}
-
-    monkeypatch.setattr(effort_mod, "resolve_effort", lambda *a, **kw: _Profile())
     monkeypatch.setattr(config_mod, "memory_enabled", lambda: False)
 
 
@@ -190,7 +183,7 @@ def test_shipped_rule_display_strings_are_ascii(user_dir):
 # ---------------------------------------------------------------------------
 
 def test_request_keyword_fires_rule_and_emits_one_event(user_dir, monkeypatch):
-    _patch_effort(monkeypatch)
+    _disable_project_memory(monkeypatch)
     ev = _Events()
     led = _Ledger()
     prov = _run("add a tapped hole M6x1.0",
@@ -221,7 +214,7 @@ def test_request_keyword_fires_rule_and_emits_one_event(user_dir, monkeypatch):
 
 def test_reply_keyword_fires_rule_the_request_did_not_match(user_dir, monkeypatch):
     """A rule can also fire on the MODEL's own output, one iteration later."""
-    _patch_effort(monkeypatch)
+    _disable_project_memory(monkeypatch)
     ev = _Events()
     prov = _run(
         "clean up this bracket",
@@ -239,7 +232,7 @@ def test_reply_keyword_fires_rule_the_request_did_not_match(user_dir, monkeypatc
 # ---------------------------------------------------------------------------
 
 def test_disabled_rule_never_fires(user_dir, monkeypatch):
-    _patch_effort(monkeypatch)
+    _disable_project_memory(monkeypatch)
     _override("thread_mention", enabled=False)
     ev = _Events()
     prov = _run("add a tapped hole M6x1.0",
@@ -253,7 +246,7 @@ def test_disabled_rule_never_fires(user_dir, monkeypatch):
 # ---------------------------------------------------------------------------
 
 def test_cooldown_suppresses_next_turn_of_same_session(user_dir, monkeypatch):
-    _patch_effort(monkeypatch)
+    _disable_project_memory(monkeypatch)
     ev = _Events()
     req = "add a tapped hole M6x1.0"
     _run(req, [_neutral(), _done_reply()], events=ev, run_id="sess-1")
@@ -272,7 +265,7 @@ def test_cooldown_suppresses_next_turn_of_same_session(user_dir, monkeypatch):
 
 
 def test_cooldown_permits_fire_after_window(user_dir, monkeypatch):
-    _patch_effort(monkeypatch)
+    _disable_project_memory(monkeypatch)
     req = "add a tapped hole M6x1.0"
     _run(req, [_neutral(), _done_reply()], events=_Events(), run_id="sess-3")
     st = at._trigger_session_state("sess-3")
@@ -290,7 +283,7 @@ def test_cooldown_permits_fire_after_window(user_dir, monkeypatch):
 # ---------------------------------------------------------------------------
 
 def test_no_match_emits_no_context_event(user_dir, monkeypatch):
-    _patch_effort(monkeypatch)
+    _disable_project_memory(monkeypatch)
     ev = _Events()
     prov = _run(
         "rename the part to Bracket",
@@ -302,14 +295,6 @@ def test_no_match_emits_no_context_event(user_dir, monkeypatch):
     assert ev.injections() == []
 
 
-def test_effort_gate_off_emits_no_event(user_dir, monkeypatch):
-    """The eco preset disables injection — no pack, and no chip claiming one."""
-    _patch_effort(monkeypatch, on=False)
-    ev = _Events()
-    prov = _run("add a tapped hole M6x1.0",
-                [_neutral(), _done_reply()], events=ev)
-    assert "[ADVISORY" not in _messages_text(prov.seen_messages[0])
-    assert ev.rules() == []
 
 
 # ---------------------------------------------------------------------------
@@ -325,7 +310,7 @@ def _injected_block(prov) -> str:
 def test_budget_tokens_truncates_injected_pack(user_dir, monkeypatch):
     """A small budget truncates the pack; a large one does not. Size, not
     presence — the whole point of the knob is what it costs per turn."""
-    _patch_effort(monkeypatch)
+    _disable_project_memory(monkeypatch)
     full = (triggers.get_pack("threads") or {}).get("body") or ""
     assert len(full) > 800, "fixture assumption: threads.md is bigger than the budget"
     # Two fixed strings ride along AFTER the pack budget (§20): the exemplar

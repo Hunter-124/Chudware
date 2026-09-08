@@ -5,6 +5,7 @@
 // unit-max mode-shape normalization mirror engine/sim/fea_modal.py exactly.
 
 #include "sim/fea_modal.h"
+#include "sim/fea_eigen.h"
 
 #include "sim/solver_threads.h"
 
@@ -18,6 +19,7 @@
 
 #include <Eigen/Dense>
 #include <Eigen/SparseCore>
+#include <Eigen/SparseCholesky>
 #ifdef CHUDWARE_WITH_CHOLMOD
 #include <Eigen/CholmodSupport>  // Eigen::CholmodSupernodalLLT (SuiteSparse BLAS3 Cholesky)
 #endif
@@ -26,7 +28,7 @@
 #endif
 
 #include <Spectra/MatOp/SparseSymMatProd.h>
-#include <Spectra/MatOp/SymShiftInvert.h>
+#include <Spectra/SymGEigsSolver.h>
 #include <Spectra/SymGEigsShiftSolver.h>
 
 namespace chudware::sim {
@@ -41,6 +43,47 @@ constexpr double kPi = 3.14159265358979323846;
 // the dominant modal cost on real meshes. sigma < 0 here (see the shift note below),
 // so K - sigma*M = K + |sigma|*M is strictly SPD and CHOLMOD's LLT applies. Throws on
 // factorization failure so the caller can fall back to the stock LDLT op.
+class CholmodTriangularFactor
+    : public Eigen::CholmodSupernodalLLT<Eigen::SparseMatrix<double>> {
+public:
+    ~CholmodTriangularFactor() {
+        cholmod_free_dense(&solution_, &context());
+        cholmod_free_dense(&work_y_, &context());
+        cholmod_free_dense(&work_e_, &context());
+    }
+    void prepare_cholesky() { scratch_.resize(rows()); }
+    void lower_triangular_solve(const double* input, double* output) const {
+        const auto* permutation = static_cast<const int*>(m_cholmodFactor->Perm);
+        for (Eigen::Index i = 0; i < rows(); ++i) scratch_[i] = input[permutation[i]];
+        triangular_solve(CHOLMOD_L, scratch_.data(), output);
+    }
+    void upper_triangular_solve(const double* input, double* output) const {
+        triangular_solve(CHOLMOD_Lt, input, scratch_.data());
+        const auto* permutation = static_cast<const int*>(m_cholmodFactor->Perm);
+        for (Eigen::Index i = 0; i < rows(); ++i) output[permutation[i]] = scratch_[i];
+    }
+private:
+    cholmod_common& context() const {
+        return const_cast<CholmodTriangularFactor*>(this)->cholmod();
+    }
+    void triangular_solve(int system, const double* input, double* output) const {
+        cholmod_dense rhs{};
+        rhs.nrow = rhs.nzmax = rhs.d = static_cast<size_t>(rows());
+        rhs.ncol = 1;
+        rhs.x = const_cast<double*>(input);
+        rhs.xtype = CHOLMOD_REAL;
+        rhs.dtype = CHOLMOD_DOUBLE;
+        if (!cholmod_solve2(system, m_cholmodFactor, &rhs, nullptr, &solution_,
+                            nullptr, &work_y_, &work_e_, &context()) || !solution_)
+            throw std::runtime_error("CHOLMOD triangular solve failed");
+        std::copy_n(static_cast<const double*>(solution_->x), rows(), output);
+    }
+    mutable Eigen::VectorXd scratch_;
+    mutable cholmod_dense* solution_ = nullptr;
+    mutable cholmod_dense* work_y_ = nullptr;
+    mutable cholmod_dense* work_e_ = nullptr;
+};
+
 class CholmodShiftInvert {
 public:
     using Scalar = double;
@@ -50,8 +93,11 @@ public:
     Eigen::Index rows() const { return K_.rows(); }
     Eigen::Index cols() const { return K_.cols(); }
     void set_shift(const double& sigma) {
-        Eigen::SparseMatrix<double> A = K_ - sigma * M_;
-        llt_.compute(A);
+        if (sigma == 0.0) llt_.compute(K_);
+        else {
+            Eigen::SparseMatrix<double> A = K_ - sigma * M_;
+            llt_.compute(A);
+        }
         if (llt_.info() != Eigen::Success)
             throw std::runtime_error("CHOLMOD LLT of (K - sigma*M) failed");
     }
@@ -60,13 +106,106 @@ public:
         Eigen::Map<Eigen::VectorXd> y(y_out, K_.rows());
         y = llt_.solve(x);
     }
+    void prepare_cholesky() { llt_.prepare_cholesky(); }
+    void lower_triangular_solve(const double* input, double* output) const {
+        llt_.lower_triangular_solve(input, output);
+    }
+    void upper_triangular_solve(const double* input, double* output) const {
+        llt_.upper_triangular_solve(input, output);
+    }
 
 private:
     const Eigen::SparseMatrix<double>& K_;
     const Eigen::SparseMatrix<double>& M_;
-    Eigen::CholmodSupernodalLLT<Eigen::SparseMatrix<double>> llt_;
+    CholmodTriangularFactor llt_;
 };
 #endif
+
+class LdltShiftInvert {
+public:
+    using Scalar = double;
+    LdltShiftInvert(const Eigen::SparseMatrix<double>& K,
+                    const Eigen::SparseMatrix<double>& M) : K_(K), M_(M) {}
+    Eigen::Index rows() const { return K_.rows(); }
+    Eigen::Index cols() const { return K_.cols(); }
+    void set_shift(const double& sigma) {
+        if (sigma == 0.0) factor_.compute(K_);
+        else {
+            Eigen::SparseMatrix<double> A = K_ - sigma * M_;
+            factor_.compute(A);
+        }
+        if (factor_.info() != Eigen::Success || !factor_.vectorD().allFinite() ||
+            (factor_.vectorD().array() <= 0.0).any())
+            throw std::runtime_error("shifted stiffness is not positive definite");
+    }
+    void perform_op(const double* input, double* output) const {
+        Eigen::Map<const Eigen::VectorXd> x(input, rows());
+        Eigen::Map<Eigen::VectorXd> y(output, rows());
+        y = factor_.solve(x);
+    }
+    void prepare_cholesky() {
+        inverse_sqrt_diagonal_ = factor_.vectorD().array().sqrt().inverse();
+    }
+    void lower_triangular_solve(const double* input, double* output) const {
+        Eigen::Map<const Eigen::VectorXd> x(input, rows());
+        Eigen::Map<Eigen::VectorXd> y(output, rows());
+        y = factor_.permutationP() * x;
+        factor_.matrixL().solveInPlace(y);
+        y.array() *= inverse_sqrt_diagonal_.array();
+    }
+    void upper_triangular_solve(const double* input, double* output) const {
+        Eigen::Map<const Eigen::VectorXd> x(input, rows());
+        Eigen::Map<Eigen::VectorXd> y(output, rows());
+        y = x.array() * inverse_sqrt_diagonal_.array();
+        factor_.matrixU().solveInPlace(y);
+        y = factor_.permutationPinv() * y;
+    }
+private:
+    const Eigen::SparseMatrix<double>& K_;
+    const Eigen::SparseMatrix<double>& M_;
+    Eigen::SimplicialLDLT<Eigen::SparseMatrix<double>> factor_;
+    Eigen::VectorXd inverse_sqrt_diagonal_;
+};
+
+template <class Op>
+bool solve_shifted(Op& op, Spectra::SparseSymMatProd<double>& metric, int modes,
+                   double sigma, Eigen::VectorXd& values, Eigen::MatrixXd& vectors) {
+    const int ncv = std::min<int>(op.rows(), std::max(3 * modes + 1, 30));
+    Spectra::SymGEigsShiftSolver<Op, Spectra::SparseSymMatProd<double>,
+                                 Spectra::GEigsMode::ShiftInvert>
+        eigs(op, metric, modes, ncv, sigma);
+    eigs.init();
+    eigs.compute(Spectra::SortRule::LargestMagn,
+                 10 * op.rows(), 1e-10, Spectra::SortRule::SmallestAlge);
+    if (eigs.info() != Spectra::CompInfo::Successful) return false;
+    values = eigs.eigenvalues();
+    vectors = eigs.eigenvectors();
+    return values.allFinite() && vectors.allFinite();
+}
+
+
+template <class Inverse>
+bool solve_buckling_reciprocal(Inverse& inverse, const Eigen::SparseMatrix<double>& K,
+                               const Eigen::SparseMatrix<double>& KG, int modes,
+                               Eigen::VectorXd& values, Eigen::MatrixXd& vectors) {
+    // K_G phi = mu K phi, lambda = -1/mu. The zero-shift K inverse uses the
+    // modal factor ladder, but the bounded reciprocal spectrum avoids the
+    // lambda/(lambda-sigma) cluster at one in a non-compressive reference state.
+    inverse.set_shift(0.0);
+    inverse.prepare_cholesky();
+    Spectra::SparseSymMatProd<double> geometric(KG);
+    const int ncv = std::min<int>(K.rows(), std::max(3 * modes + 1, 60));
+    Spectra::SymGEigsSolver<Spectra::SparseSymMatProd<double>, Inverse,
+                            Spectra::GEigsMode::Cholesky>
+        eigs(geometric, inverse, modes, ncv);
+    eigs.init();
+    eigs.compute(Spectra::SortRule::SmallestAlge, 1000, 1e-10,
+                 Spectra::SortRule::SmallestAlge);
+    if (eigs.info() != Spectra::CompInfo::Successful) return false;
+    values = eigs.eigenvalues();
+    vectors = eigs.eigenvectors();
+    return values.allFinite() && vectors.allFinite();
+}
 
 void lame(double E, double nu, double& lam, double& mu) {
     lam = E * nu / ((1.0 + nu) * (1.0 - 2.0 * nu));
@@ -214,6 +353,31 @@ Eigen::Matrix<double, 10, 10> tet10_mass_consistent(
 }
 
 }  // namespace
+
+bool fea_shift_invert(const Eigen::SparseMatrix<double>& K,
+                      const Eigen::SparseMatrix<double>& M, int n_modes,
+                      double sigma, bool buckling,
+                      Eigen::VectorXd& values, Eigen::MatrixXd& vectors) {
+    cap_solver_threads_for_host();
+    Spectra::SparseSymMatProd<double> metric(buckling ? K : M);
+    auto solve = [&](auto& op) {
+        return buckling
+            ? solve_buckling_reciprocal(op, K, M, n_modes, values, vectors)
+            : solve_shifted(op, metric, n_modes, sigma, values, vectors);
+    };
+#ifdef CHUDWARE_WITH_CHOLMOD
+    try {
+        CholmodShiftInvert op(K, M);
+        if (solve(op)) return true;
+    } catch (const std::exception&) {}
+#endif
+    try {
+        LdltShiftInvert op(K, M);
+        return solve(op);
+    } catch (const std::exception&) {
+        return false;
+    }
+}
 
 FeaModalResult fea_modal_solve(const std::vector<double>& points, const std::vector<int>& tets,
                                double E_mpa, double nu, double density_g_cm3,
@@ -458,43 +622,10 @@ FeaModalResult fea_modal_solve(const std::vector<double>& points, const std::vec
         return res;
     }
 
-    using BOpType = Spectra::SparseSymMatProd<double>;
-    BOpType Bop(Mff);
-    cap_solver_threads_for_host();  // CHOLMOD/BLAS threads (P2) — leave cores for the GUI
-
     Eigen::VectorXd evals;
     Eigen::MatrixXd evecs;
-    auto run_geigs = [&](auto& op, int ks) -> bool {
-        // 3k+1 (not 2k+1): the wider subspace is what actually lets Lanczos pull a full
-        // degenerate cluster through; measured negligible cost at these problem sizes.
-        const int ncv = std::min(n_free, std::max(3 * ks + 1, 30));
-        Spectra::SymGEigsShiftSolver<std::decay_t<decltype(op)>, BOpType,
-                                     Spectra::GEigsMode::ShiftInvert>
-            geigs(op, Bop, ks, ncv, sigma);
-        geigs.init();
-        geigs.compute(Spectra::SortRule::LargestMagn, 10 * n_free, 1e-10,
-                      Spectra::SortRule::SmallestAlge);
-        if (geigs.info() != Spectra::CompInfo::Successful) return false;
-        evals = geigs.eigenvalues();  // generalized eigenvalues (omega^2-ish)
-        evecs = geigs.eigenvectors();  // (n_free, k)
-        return true;
-    };
-    auto eigensolve = [&](int ks) -> bool {
-        // Prefer the CHOLMOD-backed shift-invert (multithreaded BLAS3 factorization of
-        // K + |sigma|·M); fall back to Spectra's stock single-threaded LDLT op when
-        // SuiteSparse is absent or its strict-SPD LLT rejects the system.
-#ifdef CHUDWARE_WITH_CHOLMOD
-        try {
-            CholmodShiftInvert op(Kff, Mff);
-            if (run_geigs(op, ks)) return true;
-        } catch (const std::exception&) { /* fall through to LDLT */ }
-#endif
-        try {
-            Spectra::SymShiftInvert<double, Eigen::Sparse, Eigen::Sparse> op(Kff, Mff);
-            return run_geigs(op, ks);
-        } catch (const std::exception&) {
-            return false;
-        }
+    auto eigensolve = [&](int ks) {
+        return fea_shift_invert(Kff, Mff, ks, sigma, false, evals, evecs);
     };
     const double rigid_eigenvalue_tol = 1e-8 * evscale;
     auto n_rigid = [&] {

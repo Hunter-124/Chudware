@@ -1356,8 +1356,8 @@ def bench_calculix() -> None:
 
 # ===========================================================================
 # FAMILY 10: Advanced FEA (T-BL04) — fatigue / thermal / buckling / contact
-# Fatigue is pure-Python (S-N life layer, no binary). Thermal/buckling/contact
-# run through the SAME ccx subprocess as FAMILY 9 and SKIP honestly when absent.
+# Fatigue is pure-Python (S-N life layer). Thermal/buckling use the engine;
+# only the legacy contact proxy uses the optional ccx subprocess from FAMILY 9.
 # Each case cites a closed-form reference with literal expected values + a tier.
 # ===========================================================================
 
@@ -1390,66 +1390,68 @@ def bench_fatigue_life() -> None:
            "Shigley 10th Eq 6-19 Table 6-2 (surface factor, machined)")
 
 
-def bench_thermal_ccx() -> None:
-    """T-BL04 thermal: 1-D steady conduction mid-plane temperature via ccx."""
-    print("\n--- [thermal] CalculiX steady-state conduction ---")
-    from services.mcp import fea_advanced as fa
-    # Reference: 1-D steady conduction with fixed end temperatures has a LINEAR
-    # profile, so T(mid) = (T_hot + T_cold)/2 exactly (Incropera, Fundamentals of
-    # Heat and Mass Transfer, plane-wall conduction). Hand-typed.
+def bench_thermal_engine() -> None:
+    """Steady conduction on a tetrahedral bar against Fourier's law."""
+    import numpy as np
+    from services.mcp import core_bridge as cb
+    from services.sim.fea_thermal_transient import box_mesh
+    print("\n--- [thermal] engine steady-state conduction ---")
     cite = "Incropera Heat & Mass Transfer — 1-D plane-wall conduction (linear T)"
-    L, b, h = 200.0, 20.0, 20.0
-    gen = fa.build_thermal_bar_inp(L, b, h, 50.0, 100.0, 0.0)
-    if fa.ccx_path() is None:
-        _skip("thermal", "TH1-1d-conduction-mid-T",
-              "ccx not on PATH — subprocess-only (GPL-2.0 isolation); the .inp "
-              "generator + expected mid-T are covered by TestSmoke without ccx", cite)
-        return
-    run = fa.run_ccx(gen["inp"], job="th")
-    if not run.get("ok") or not run.get("dat_path"):
+    points, tets, hot, cold = box_mesh(20.0, 8.0, 8.0, 8, 2, 2)
+    result = cb.call("sim_run_thermal", {"study": {
+        "points": points.flatten().tolist(), "tets": tets.flatten().tolist(),
+        "nodes_per_elem": 4, "material": {"k_w_mk": 167.0},
+        "fixtures": [{"points": points[ids].tolist(), "tol_mm": 1e-6, "temp_c": temp}
+                     for ids, temp in ((hot, 100.0), (cold, 0.0))],
+        "loads": [],
+    }})
+    if not result.get("ok"):
         _record("thermal", "TH1-1d-conduction-mid-T", "ENGINEERING", "FAIL", None,
-                gen["expected_mid_T"], run.get("stderr", "")[-200:] or "ccx failed", cite)
+                50.0, result.get("error", "engine solve failed"), cite)
         return
-    mid = fa.parse_dat_nodal(run["dat_path"], "NT", gen["mid_nodes"], component=1)
-    if mid is None:
-        _record("thermal", "TH1-1d-conduction-mid-T", "ENGINEERING", "FAIL", None,
-                gen["expected_mid_T"], "could not parse NT from .dat", cite)
-        return
-    _check("thermal", "TH1-1d-conduction-mid-T", "ENGINEERING", mid,
-           gen["expected_mid_T"], cite, note="100/0 C ends, k=50 W/mK")
+    field = np.asarray(result["temperature"])
+    mid = float(np.mean(field[np.abs(points[:, 0] - 10.0) < 1e-9]))
+    _check("thermal", "TH1-1d-conduction-mid-T", "ENGINEERING", mid, 50.0, cite)
+    _check("thermal", "TH2-fourier-flux", "ENGINEERING",
+           result["flux_max_w_m2"], 167.0 * 100.0 / 0.020, cite)
 
 
-def bench_buckling_ccx() -> None:
-    """T-BL04 buckling: Euler fixed-free critical load via ccx *BUCKLE."""
-    print("\n--- [buckling] CalculiX linear buckling ---")
-    from services.mcp import fea_advanced as fa
-    # Reference: Euler critical load, fixed-free column, Pcr = π²EI/(2L)²
-    #   (Timoshenko & Gere, Theory of Elastic Stability, K=2 end condition). Hand-typed.
+def bench_buckling_engine() -> None:
+    """Euler fixed-free critical load on a real STEP-backed engine tet10 mesh."""
+    print("\n--- [buckling] Engine linear buckling ---")
+    from scripts.sim_audit import _load_core_bridge, _cantilever_setup, _AUDIT_STEEL
+
     cite = "Timoshenko & Gere, Theory of Elastic Stability — Euler fixed-free Pcr=π²EI/(2L)²"
-    L, b, h, E, nu = 1000.0, 20.0, 20.0, 200000.0, 0.29
-    P = 5000.0
-    gen = fa.build_buckling_column_inp(L, b, h, E, nu, P)
-    if fa.ccx_path() is None:
-        _skip("buckling", "BK1-euler-fixed-free",
-              "ccx not on PATH — subprocess-only (GPL-2.0 isolation); the .inp "
-              "generator + Euler reference are covered by TestSmoke without ccx", cite)
+    cb, reason = _load_core_bridge()
+    if cb is None:
+        _skip("buckling", "BK1-euler-fixed-free", reason, cite)
         return
-    run = fa.run_ccx(gen["inp"], job="bk")
-    if not run.get("ok") or not run.get("dat_path"):
-        _record("buckling", "BK1-euler-fixed-free", "ENGINEERING", "FAIL", None,
-                gen["expected_Pcr"], run.get("stderr", "")[-200:] or "ccx failed", cite)
-        return
-    factors = fa.parse_buckle_factors(run["dat_path"])
-    if not factors:
-        _record("buckling", "BK1-euler-fixed-free", "ENGINEERING", "FAIL", None,
-                gen["expected_Pcr"], "could not parse buckling factors", cite)
-        return
-    Pcr_ccx = factors[0] * P
-    # 3-D hex buckling of a stubby block over-stiffens vs the slender Euler ideal;
-    # ENGINEERING tier (10%) for the discretised critical load. Note the aspect
-    # ratio L/h=50 keeps it Euler-slender so the tier holds.
-    _check("buckling", "BK1-euler-fixed-free", "ENGINEERING", Pcr_ccx,
-           gen["expected_Pcr"], cite, note=f"L/h=50 slender, λ1={factors[0]:.4g}")
+    expected = None
+    try:
+        ctx = _cantilever_setup(cb)
+        if ctx.get("error"):
+            raise ValueError(ctx["error"])
+        length, width, height = ctx["L_mm"], ctx["b_mm"], ctx["h_mm"]
+        inertia = min(width * height**3, height * width**3) / 12
+        expected = math.pi**2 * _AUDIT_STEEL["E_mpa"] * inertia / (2 * length)**2
+        study = {
+            "step_path": ctx["step"], "material": _AUDIT_STEEL,
+            "fixtures": [ctx["fix_fp"]],
+            "loads": [{"faces": ctx["load_fp"], "type": "force",
+                       "vector": [-1000.0, 0.0, 0.0]}],
+            "mesh_order": 2, "target_size_mm": 20.0,
+        }
+        out = cb.call("sim_run_buckling", {"study": study, "n_modes": 4})
+        if not out.get("ok"):
+            raise ValueError(out.get("error", "engine buckling failed"))
+        got = float(out["critical_load_n"])
+        valid = math.isfinite(got) and abs(got - expected) / expected < 0.08
+        _record("buckling", "BK1-euler-fixed-free", "ENGINEERING",
+                "PASS" if valid else "FAIL", got, expected,
+                "Real CAD tet10, h=20 mm; Euler tolerance 8%", cite)
+    except Exception as exc:  # noqa: BLE001
+        _record("buckling", "BK1-euler-fixed-free", "ENGINEERING", "FAIL",
+                None, expected, str(exc), cite)
 
 
 def bench_contact_ccx() -> None:
@@ -1493,8 +1495,8 @@ def bench_contact_ccx() -> None:
 def bench_advanced_fea() -> None:
     """T-BL04 FAMILY 10 driver — fatigue + thermal + buckling + contact."""
     bench_fatigue_life()
-    bench_thermal_ccx()
-    bench_buckling_ccx()
+    bench_thermal_engine()
+    bench_buckling_engine()
     bench_contact_ccx()
 
 
@@ -1881,26 +1883,6 @@ class TestSmoke:
         assert out["theories"]["gerber"]["regime"] == "infinite"   # below Se
         assert out["fos_endurance"] == round(200.0 / 250.0, 4)
 
-    def test_bl04_thermal_inp_generator(self):
-        """T-BL04 TH1: thermal .inp is self-consistent + mid-T = mean (no ccx)."""
-        from services.mcp import fea_advanced as fa
-        gen = fa.build_thermal_bar_inp(200.0, 20.0, 20.0, 50.0, 100.0, 0.0,
-                                       nx=8, ny=2, nz=2)
-        assert "*HEAT TRANSFER, STEADY STATE" in gen["inp"]
-        assert "*CONDUCTIVITY" in gen["inp"] and "*BOUNDARY" in gen["inp"]
-        assert gen["expected_mid_T"] == 50.0
-        assert gen["hot_nodes"] and gen["cold_nodes"] and gen["mid_nodes"]
-
-    def test_bl04_buckling_inp_generator(self):
-        """T-BL04 BK1: buckling .inp has *BUCKLE + Euler reference is exact (no ccx)."""
-        from services.mcp import fea_advanced as fa
-        import math as _m
-        gen = fa.build_buckling_column_inp(1000.0, 20.0, 20.0, 200000.0, 0.29,
-                                           5000.0, nx=8, ny=2, nz=2)
-        assert "*BUCKLE" in gen["inp"] and "*CLOAD" in gen["inp"]
-        I = 20.0 * 20.0 ** 3 / 12.0
-        Pcr = _m.pi ** 2 * 200000.0 * I / (2000.0 ** 2)
-        assert abs(gen["expected_Pcr"] - Pcr) < 1e-6, gen["expected_Pcr"]
 
     def test_bl04_contact_inp_generator(self):
         """T-BL04 CT1: contact .inp has NLGEOM + CONTACT PAIR + two disjoint blocks."""

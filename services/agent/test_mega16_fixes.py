@@ -29,10 +29,10 @@ def _clear_unavailable():
 
 
 def test_parse_openrouter_deepseek_tier():
-    from services.agent.tiers import parse_openrouter_tier, effort_tier_for
+    from services.agent.tiers import parse_openrouter_tier, profile_tier_for
 
     assert parse_openrouter_tier(TIER) == PAID_DEEPSEEK
-    assert effort_tier_for(TIER) == "frontier"
+    assert profile_tier_for(TIER) == "frontier"
 
 
 def test_shipped_deepseek_rank_meets_frontier_floor():

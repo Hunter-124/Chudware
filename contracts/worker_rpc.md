@@ -1515,3 +1515,28 @@ measured solve admission remain active. CAD curvature and wall demands act
 locally instead of globally halving the pitch or refining every planar crease.
 A zero global floor does not certify wall resolution or a global element-quality
 floor; those remain separate measured quality and underresolved-wall disclosures.
+
+## Global projected-sliver repair and quality limits (2026-09-09)
+
+Tetrahedral mesh delivery now attempts a bounded, topology-changing sliver
+collapse on every cell whose measured scaled Jacobian is below `0.034`, even
+when the caller requested no local-refinement band. This runs before quadratic
+promotion and the final quality summary. It reuses the existing star-quality
+and boundary-fidelity acceptance rules; it does not invoke the local LEB,
+smoothing, or interface-size loop. An applied repair is disclosed in the
+existing mesh note as `global sub-0.034 Jacobian repair: N sliver collapses`.
+
+The graded fill also retains the pre-projection corner spacing and applies its
+existing guarded collapse at the final boundary-placement stage to pairs
+compressed below five percent of that spacing (projection travel fraction
+`0.95`). This collision-only round does not run the void carve. Invalid
+topology, volume loss, and degraded incident-cell quality remain grounds to
+reject a candidate merge.
+
+These are repair attempts, **not a global `0.034` quality certificate**.
+Consumers must continue reading the delivered mesh's measured Jacobian, aspect,
+and edge statistics. In particular, the FRAME-PEDAL-BRAKE h=8 mm probe still
+has minimum Jacobian `0.02910736` after repair; the coarse-mesh bulk-quality
+defect remains open. Local-region floors, size-delivery contracts, and CAD
+fidelity tolerances are unchanged. Curved-rim feature-segment fidelity remains
+unresolved; no denser volume field or regressing rim-sampling patch is retained.

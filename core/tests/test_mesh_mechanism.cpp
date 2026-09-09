@@ -17,6 +17,8 @@
 #include <doctest/doctest.h>
 
 #include <BRepBuilderAPI_Transform.hxx>
+#include <BRepAlgoAPI_Cut.hxx>
+#include <BRepAlgoAPI_Fuse.hxx>
 #include <BRepPrimAPI_MakeBox.hxx>
 #include <BRepPrimAPI_MakeCylinder.hxx>
 #include <BRep_Builder.hxx>
@@ -28,6 +30,10 @@
 #include <gp_Vec.hxx>
 
 #include <filesystem>
+#include <algorithm>
+#include <array>
+#include <cmath>
+#include <map>
 #include <string>
 
 #include <nlohmann/json.hpp>
@@ -104,6 +110,76 @@ json study_for(const std::string& step, double fix_x, double load_x) {
 }
 
 }  // namespace
+
+TEST_CASE("zero-gap press-fit preserves delivered bore and shaft boundary patches") {
+  constexpr double radius = 5.0, height = 10.0;
+  const auto shaft = BRepPrimAPI_MakeCylinder(radius, height).Shape();
+  const auto stock = BRepPrimAPI_MakeCylinder(2.0 * radius, height).Shape();
+  const auto sleeve = BRepAlgoAPI_Cut(stock, shaft).Shape();
+  TopoDS_Compound compound;
+  BRep_Builder builder;
+  builder.MakeCompound(compound);
+  builder.Add(compound, sleeve);
+  builder.Add(compound, shaft);
+  const auto step = write_step(compound, "chudware_zero_gap_press_fit.step");
+  MeshOptions options;
+  options.order = 1;
+  options.target_size_mm = 0.35 * radius;
+  options.declared_interfaces = true;
+  const auto mesh = mesh_step(step, options);
+  REQUIRE_MESSAGE(mesh.ok, mesh.error);
+  REQUIRE(mesh.bodies.size() == 2);
+  std::map<std::array<int, 3>, int> uses;
+  for (int e = 0; e < mesh.n_elems; ++e) {
+    for (int omitted = 0; omitted < 4; ++omitted) {
+      std::array<int, 3> face{};
+      int j = 0;
+      for (int k = 0; k < 4; ++k)
+        if (k != omitted) face[j++] = mesh.tets[4 * e + k];
+      std::sort(face.begin(), face.end());
+      ++uses[face];
+    }
+  }
+  std::array<double, 2> wall_area{};
+  for (const auto& [face, count] : uses) {
+    if (count != 1) continue;
+    std::array<std::array<double, 3>, 3> p{};
+    bool wall = true;
+    for (int i = 0; i < 3; ++i) {
+      for (int k = 0; k < 3; ++k) p[i][k] = mesh.points[3 * face[i] + k];
+      wall = wall && std::abs(std::hypot(p[i][0], p[i][1]) - radius) < 0.1;
+    }
+    if (!wall) continue;
+    const std::array<double, 3> a{p[1][0]-p[0][0], p[1][1]-p[0][1], p[1][2]-p[0][2]};
+    const std::array<double, 3> b{p[2][0]-p[0][0], p[2][1]-p[0][1], p[2][2]-p[0][2]};
+    const double area = 0.5 * std::hypot(a[1]*b[2]-a[2]*b[1],
+                                       a[2]*b[0]-a[0]*b[2],
+                                       a[0]*b[1]-a[1]*b[0]);
+    for (std::size_t body = 0; body < mesh.bodies.size(); ++body)
+      if (face[0] >= mesh.bodies[body].node_begin && face[0] < mesh.bodies[body].node_end)
+        wall_area[body] += area;
+  }
+  for (double area : wall_area)
+    CHECK(area > 0.5 * 2.0 * std::acos(-1.0) * radius * height);
+  std::filesystem::remove(step);
+}
+
+TEST_CASE("sub-resolution raised rim is reported as absorbed rather than missing") {
+  const auto stock = BRepPrimAPI_MakeBox(gp_Pnt(-10, -10, 0), 20, 20, 5).Shape();
+  const auto pad = BRepPrimAPI_MakeCylinder(
+      gp_Ax2(gp_Pnt(0, 0, 4), gp_Dir(0, 0, 1)), 3.0, 1.001).Shape();
+  const auto step = write_step(BRepAlgoAPI_Fuse(stock, pad).Shape(),
+                               "chudware_subresolution_rim.step");
+  MeshOptions options;
+  options.order = 1;
+  options.target_size_mm = 3.5;
+  const auto mesh = mesh_step(step, options);
+  REQUIRE_MESSAGE(mesh.ok, mesh.error);
+  CHECK(mesh.note.find("feature_absorbed face=") != std::string::npos);
+  CHECK(mesh.connected_components == 1);
+  CHECK(mesh.char_len_mm > 0.8 * options.target_size_mm);
+  std::filesystem::remove(step);
+}
 
 TEST_CASE("a mesh island with no fixture is refused, not solved") {
   const std::string step = write_two_island_step();

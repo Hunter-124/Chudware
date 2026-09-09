@@ -285,6 +285,26 @@ judgment).
   geometry; `add`/boss fuse only with bodies they touch; unknown modes refused by name;
   `centered:false` primitives are not offset by their padded bbox.
   `project_external_refs` resolves against the whole document, not the last body.
+- **Ladders share their probes; meshes deliver the size you asked for (2026-09-11).**
+  `run_fea_convergence` carries the measured probe table across legs (leg k's count is
+  leg k+1's anchor); every row has `delivered_size_mm`, `provenance.governor` and a named
+  reason; `degenerate_ladder` names `memory_admission` / `feature_resolution` /
+  `size_band_floor` / `probe_time_budget`; falling DOF invalidates convergence.
+  `mesh_quality.underresolved_wall{min_wall_mm, elements_across}` + a summary caveat when
+  < 1 element spans a wall. Explicit-h bbox forecasts are diagnostic, never coarsening
+  instructions. Mesher (Polyhedral-FEA `e66efe4`): local CAD size fields (no global
+  curved-area halving, no crease bands on straight edges), parents refined BEFORE
+  projection, LEB ceiling from the governor, pitch `p = h/√2`, boundary-collision sliver
+  collapse + a global collapse-only pass below Jacobian 0.034;
+  `mesh_quality.size_band{applied_floor_mm,reason}` and `edge_mm{min,median,max}`. Bar
+  10×10×200 at h=4: 205 504 → 6 912 tet10. Known: curved-rim feature-segment fidelity
+  (upstream test 266, plate 0.092 > 0.09, cylinder 0.310 > 0.20 — needs rim-chain
+  topology, two designs rejected for regressing pin quality/contact); brake isolate at
+  h 8 bulk Jacobian 0.029. `boundary_faceset_membership` admits a facet only when every
+  corner passes (chamfer facets bled midside nodes into a cylinder pressure set).
+  `transform` MOVES its body (`copy:true` duplicates; a consumed owner is a named
+  refusal); assembly transforms compose with placements; `set_suppressed` takes component
+  ids on assembly docs. Sim job `_reconcile` observes exit before reading `result.json`.
 - **Chat sessions are keyed by project (2026-09-04).** `Conversation.projectDir` is stamped
   once at creation from `convProjectDir(st)` (= `st.workspaceDir`, else `plmProjectPath()`) —
   the same value the composer sends Chudcode as `workspace_dir`. `index.json` v3 keeps

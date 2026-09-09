@@ -2350,6 +2350,37 @@ bool quality_pass(const pm::geom::TriSurface *surface, pm::fea::NodalMesh &nodal
          contract.collapsed_slivers != mark.collapsed_slivers;
 }
 
+// Projection can create a short-edge sliver without any requested local band.
+// Repair that topology globally, without running the local LEB/smoothing loop.
+int collapse_global_slivers(const pm::geom::TriSurface *surface,
+                            pm::fea::NodalMesh &nodal) {
+  constexpr double kGlobalJacobianFloor = 0.034;
+  int collapsed = 0;
+  for (int pass = 0; pass < kQualityPasses; ++pass) {
+    std::vector<std::size_t> poor;
+    std::vector<std::uint32_t> movable;
+    for (std::size_t e = 0; e < nodal.elements.size(); ++e) {
+      const auto &element = nodal.elements[e];
+      if (!is_tet4(element)) continue;
+      const auto shape = detail::tet_shape(
+          nodal.nodes[element.nodes[0]].data(), nodal.nodes[element.nodes[1]].data(),
+          nodal.nodes[element.nodes[2]].data(), nodal.nodes[element.nodes[3]].data());
+      if (shape.scaled_jacobian >= kGlobalJacobianFloor) continue;
+      poor.push_back(e);
+      movable.insert(movable.end(), element.nodes.begin(), element.nodes.begin() + 4);
+    }
+    if (poor.empty()) break;
+    const StarTopology topo = build_star_topology(nodal, std::move(movable));
+    MeshEdits edits(nodal.elements.size());
+    const int before = collapsed;
+    collapse_slivers(surface, nodal, poor, topo, edits, {}, collapsed);
+    if (collapsed == before) break;
+    std::vector<char> region;
+    compact_dead_cells(nodal, edits.dead, region);
+  }
+  return collapsed;
+}
+
 void deliver_local_contract(const LoadedModel &loaded, const MeshOptions &options,
                             double h, pm::fea::NodalMesh &nodal,
                             LocalContract &contract) {
@@ -3107,6 +3138,11 @@ bool build_mesh(const LoadedModel &loaded, const MeshOptions &options, double h,
   // Right-handed before anything reads the sign: the quadratic promotion
   // refuses a left-handed cell, and the fill emits a few on sharp edges.
   out.reoriented_elems = orient_tets_right_handed(nodal);
+  const int global_collapses =
+      collapse_global_slivers(&loaded.model.surface, nodal);
+  if (global_collapses > 0)
+    append_note(out.note, "global sub-0.034 Jacobian repair: " +
+                             std::to_string(global_collapses) + " sliver collapses");
   // ...and non-degenerate before the promotion reads the determinant's sign:
   // a cell the fill shipped flat has no positive Jacobian to promote.
   out.degenerate_elems_repaired =

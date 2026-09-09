@@ -3349,3 +3349,154 @@ min/median/max **1 / 1.2071067811865475 / 1.4142135623730951**, floor 0/none.
 Both native trees were freshly built at `-j2` under 12G; runs used the 10G wrapper.
 No gate, formatter, or host-daemon termination was used. Throwaway measurement
 scripts were removed; JSON evidence is retained.
+
+## 2026-09-09 — projected brake sliver repaired; curved-rim attempts rejected
+
+Retained changes are `core/sim/mesher.cpp`, upstream
+`src/mesh/src/hybrid_fill.cpp`, and the append-only disclosure in
+`contracts/worker_rpc.md`. The core now runs the existing guarded sliver collapse
+globally on cells below scaled Jacobian 0.034, before quadratic promotion,
+whether or not a local band was requested. This is collapse only, not the local
+LEB/smoothing loop. The graded fill records original corner spacing and reuses
+its collapse after final boundary projection/pull for pairs compressed below
+0.05 of that spacing (travel fraction 0.95), without its void carve. Existing
+topology, volume, fidelity, quality floors and pass limits are unchanged.
+
+**MESHER-BULK-SLIVER at brake h=2.8 is fixed.** The old worst tet was element
+162304, corners 18238/39967/17551/17549: one interior corner and three boundary
+corners, not an all-interior LEB child. Its short pair lies on z=457.2 mm at
+y=28.2881567444 mm, x=-166.35 versus -166.3514135327 mm. The exterior gate
+independently named the latter retreat node with a 0.00141 mm residual: this is
+a boundary-projection collapse that escaped the local-band-only quality pass.
+The final global pass collapses one short-edge star, removing its eight tets.
+Minimum edge rises from 0.001413533 to **0.511805026 mm**.
+
+Final mesh-only measurements use the unchanged isolate and no explicit local
+band. Baseline is `/tmp/brake-ladder/counts-final.json`; new evidence is
+`/tmp/brake-ladder/defects-final.json` and `sliver-cell.json`.
+
+| Brake requested h mm | Before tets | After tets | Before min Jacobian | After min Jacobian | Before max aspect | After max aspect |
+|---|---:|---:|---:|---:|---:|---:|
+| 8 | 16144 | 16072 | 0.025594810 | 0.029107361 | 47.125258 | 45.291935 |
+| 6 | 27162 | 27098 | 0.032227441 | 0.057512144 | 36.943437 | 22.670417 |
+| 4 | 61064 | 61064 | 0.085907145 | 0.085907145 | 9.142881 | 9.142881 |
+| 2.8 | 185700 | 185692 | 0.000714901 | **0.085466971** | 1176.663915 | **14.070272** |
+
+Both ladders remain strictly increasing. The 10x10x200 bar is unchanged at
+**864 / 4608 / 6912 / 22032** tets for h=8/6/4/2.8: zero percent count deviation,
+inside the ten-percent allowance. **Remaining coarse-mesh bulk-quality defect:**
+brake h=8 still has min Jacobian **0.029107361 < 0.034**, despite sixteen
+guarded global collapses. A repair attempt is not a universal floor certificate;
+the delivered quality summary retains that number rather than hiding it.
+
+**MESHER-CURVED-RIM-FIDELITY remains unfixed.** The two permitted design
+iterations were measured and fully reverted:
+
+1. Exact curved-rim sample insertion by conformingly splitting only incident
+   boundary-edge stars, independent of the volume field, improved plate-hole
+   p99/h **0.0917903714 -> 0.0299800214** (7816 -> 7824 tets), but cylinder
+   stayed **0.3103285593**. Core proof then exposed pin-region Jacobian
+   **0.0477164 < 0.05** and tight-contact chatter through the unchanged 25
+   iterations; this partial patch was not retained.
+2. Insert and own curved-rim samples before projection, then recover remaining
+   rim segments afterwards: cylinder worsened to **0.3362002470**, while plate
+   remained 0.0299800214. This variant was also reverted.
+
+The cylinder failure is missing boundary-rim topology, not inadequate CAD
+polyline sampling. Its existing 33 capture intervals have chord 0.0095056 m and
+sag/h 0.0283005, already below the 0.20 budget; the curvature bound allows
+s <= 0.0252982 m at R=0.05 m and h=0.008 m. The worst CAD sample instead sees
+a chamfer segment joining a point inside the cap to a point below the rim on
+the cylindrical wall. Inserting its exact rim target into that projected star
+produces inverted children, correctly rejected by the unchanged quality gate.
+The existing exact-edge connector reports **connected=0** on the cylinder.
+Further work must address the boundary cavity/rim chain; simply densifying the
+CAD sampling cannot create the missing mesh adjacency. Detailed measurements
+remain in `/tmp/brake-ladder/rim-designs.json`.
+
+Final B-only rollback proof after rebuilding both trees at `-j2`:
+
+```text
+1/5 mesh              Passed 110.01 sec
+2/5 mesh_quality      Passed   3.43 sec
+3/5 mesher_advanced   Passed 101.81 sec
+4/5 mesh_mechanism    Passed  11.32 sec
+5/5 mesh_sector       Passed  26.66 sec
+100% tests passed, 0 tests failed out of 5; 253.24 sec
+```
+
+The pin-region floor passes at **0.0513328**, aspect 25.2043, delivered 0.31517 mm
+for 0.35 mm. Tight-bore contact resolves at 0.297528 mm, with 51/3083 active
+pairs and 168009 elements. Fresh upstream `ctest --test-dir .../build -R mesh`
+after rebuilding `polymesh_tests`: **50 passed, 1 skipped, 2 failed out of 53,
+86.45 sec**. Test 266 still reports plate-hole **0.0917903713775 > 0.09** and
+cylinder **0.3103285592707 > 0.20**. Test 265 retains the separate icecream-cone
+exact-surface rounding failure **1.97178e-12 > 1e-12**. Thus the requested B
+h=2.8/count/core-test acceptance is met, but the requested A acceptance is not.
+All native builds and runs used the 10G systemd wrapper, never the live
+`build-occt-linux` tree. No gate, formatter, full sweep, or host-daemon
+termination was used. Throwaway probe programs/scripts were removed; JSON
+measurement evidence is retained.
+
+## 2026-09-12 — classify sub-resolution CAD rims as absorbed, not missing walls
+
+The CC-006D LeafB/Bushing4/Pin `sim_mesh` refusal was reproduced at h=3.4,
+order 1, from `geometry.step` extracted from a `/tmp` copy of the STEP+.
+Solid 1 face 0 is the leaf's radius-14 cylindrical pad rim, not the press-fit
+interface: area 1.01159283445 mm², bbox (920.75,-14,496)–(920.7615,14,524),
+axial extent 0.0115 mm. Every boundary facet was already checked against every
+CAD feature face, with centroid distance ≤0.3h and |normal dot|≥0.5; no owner
+assignment or patch-area fraction was involved. Projection/sliver cleanup
+absorbed this 11.5 µm rim while leaving sampled distance 0.002875 mm. Demanding
+a separate aligned patch then incorrectly refused the whole mesh.
+
+Upstream `geom/cad_topology.hpp/.cpp` now records the exact oriented intrinsic
+face extent (excluding a plane's zero normal thickness). `pipeline/src/scene.cpp`
+classifies an otherwise unresolved face as `feature_absorbed` only below
+0.05×min(requested h, delivered fine lattice pitch), with the existing sampled
+0.3h distance bound still satisfied. Notes name face, extent, area, scale and
+distance. Size/quality floors and volume/distance/normal tolerances are unchanged.
+The CAD caller already meshes the bodies independently and forwards the notes;
+`core/sim/mesher.cpp` needed no additional change. Upstream `docs/cli.md`
+documents absorption distinctly from an aligned delivered patch.
+
+Real-file results (linear tetrahedra; edge values min/median/max in mm):
+
+| h | Elements | edge_mm | size_band |
+|---|---:|---|---|
+| 3.4 | 95,468 | 0.104771269 / 2.382688603 / 6.132101358 | floor 0, reason none |
+| 6 | 20,675 | 0.706677288 / 4.237495722 / 12.116276690 | floor 0, reason none |
+
+At h=3.4, solid 1 face 0 is absorbed (scale 0.0595672 mm). At h=6, faces
+0,30,31 are absorbed (scale 0.10591 mm); faces 30/31 have extent 0.0115063 mm
+and area 0.13990669 mm² each. All other feature faces retain aligned patches.
+Full smoke summaries remain in `/tmp/feature_patch_fixed_h3.4_summary.json` and
+`/tmp/feature_patch_fixed_h6_summary.json`; the original refusal is preserved in
+`/tmp/feature_patch_prefixed_refusal.json` (this tree's pre-fix volume error was
+0.003355, with the existing uncommitted sliver changes).
+
+The two new `core/tests/test_mesh_mechanism.cpp` cases pass (12 assertions):
+a zero-gap sleeve/shaft at h=0.35R delivers both cylindrical boundary patches,
+each with >50% exact wall area, and a micron-height pad is explicitly absorbed.
+The archived box-hole parity case skips because its corpus fixture is absent.
+A self-contained replacement witness in upstream `test_mixed_fill.cpp`, using
+`tests/fixtures/parts/missing_bore_guard.brep` (40×40×1 plate, R1.5 bore), passes
+four assertions: the coarse hybrid fill still refuses the missing aligned bore
+despite only 0.00443747 volume relative error.
+
+```text
+1/5 mesh              Passed 113.29 sec
+2/5 mesh_quality      Passed   3.64 sec
+3/5 mesher_advanced   Passed 102.35 sec
+4/5 mesh_mechanism    Passed  16.60 sec
+5/5 mesh_sector       Passed  25.76 sec
+100% tests passed, 0 tests failed out of 5; 261.64 sec
+```
+
+Upstream `ctest -R mesh`: 50 passed, 1 skipped, 2 known failures out of 53,
+83.49 sec. The unchanged failures are `boundary nodes land on the exact BRep
+for every CAD mesher` and `sharp BRep edges are reproduced by mesh feature
+segments`. Builds used ninja -j2 with 12G cgroups in `core/build-fix` and the
+approved upstream build; native runs used 10G cgroups. The mission's
+`core/build-occt-linux` tree, source STEP+, host daemon and user changes were
+not touched.

@@ -267,8 +267,17 @@ SizeBand resolve_size_band(const TopoDS_Shape &shape,
   band.element_limit = memory_element_limit > 0
                            ? static_cast<uint64_t>(memory_element_limit)
                            : 0ull;
-  band.predicted_elements = predict_elements(base);
-  if (!explicit_size) {
+  band.predicted_elements = 0.0;
+  if (!options.governor_probes.empty()) {
+    chudware::governor::MeshCountModel measured;
+    for (const auto& probe : options.governor_probes)
+      measured.observe(probe.h, probe.elems);
+    const double prediction = measured.predict(base);
+    if (std::isfinite(prediction)) band.predicted_elements = prediction;
+    append_note("measured_octave governor: preceding ladder measurements replace "
+                "the bounding-box bootstrap; solve admission uses actual mesh counts");
+  } else if (!explicit_size) {
+    band.predicted_elements = predict_elements(base);
     long interactive_budget = static_cast<long>(8000.0 + 52000.0 * band.fineness);
     if (const char *value = std::getenv("CHUDWARE_MESH_MAX_ELEMS")) {
       const long configured = std::atol(value);
@@ -342,28 +351,15 @@ SizeBand resolve_size_band(const TopoDS_Shape &shape,
         }
       }
     }
-  } else if (memory_element_limit > 0 &&
-             (volume_estimate > 1e-9 || area_estimate > 1e-9) && base > 1e-9) {
-    const double estimate = predict_elements(base);
-    if (estimate > static_cast<double>(memory_element_limit)) {
-      // This envelope was calibrated on a bulky box, not this geometry. It
-      // chooses a bounded mesh-only probe, not the delivered study size.
-      const double raised = std::min(
-          base * 2.0,
-          raise_size(base, estimate, static_cast<double>(memory_element_limit)));
-      char text[512];
-      std::snprintf(
-          text, sizeof(text),
-          "measured_octave governor: unmeasured bounding-box envelope %.0fk %s "
-          "elements at %.2f mm (%.1f GB solve estimate, %.1f GB budget); "
-          "mesh-only bootstrap at %.2f mm, then measured probes toward the "
-          "request; this envelope is NOT a measured study cost",
-          estimate / 1000.0, element_name, base, estimate_gb(estimate), budget_gb,
-          raised);
-      append_note(text);
-      base = raised;
-      band.memory_coarsened = true;
-    }
+  } else {
+    // An explicit size is a request for a discretization, not a bounding-box
+    // solve forecast. Mesh at that size under the mesh-stage memory ceiling;
+    // admission then uses the measured count. The old unmeasured bootstrap
+    // consumed the entire probe-time allowance on thin/curved parts and shipped
+    // its coarser mesh without ever attempting the requested resolution.
+    band.predicted_elements = predict_elements(base);
+    append_note("explicit size: bounding-box count is diagnostic only; "
+                "mesh allocation and solve admission use their measured budgets");
   }
 
   // Only SAY the ceiling was raised when the raise is load-bearing: a study whose
@@ -402,6 +398,17 @@ SizeBand resolve_size_band(const TopoDS_Shape &shape,
   band.base = base;
   band.min_len = minimum;
   band.max_len = maximum;
+  char decision[384];
+  std::snprintf(decision, sizeof(decision),
+                "size_band requested=%.6g base=%.6g min=%.6g max=%.6g mm; "
+                "solve_element_budget=%llu mesh_element_ceiling=%llu "
+                "predicted_elements=%.0f; thin_wall_floor=local "
+                "feature_resolution_floor=local curvature=local",
+                band.geometry_base, band.base, band.min_len, band.max_len,
+                static_cast<unsigned long long>(band.element_limit),
+                static_cast<unsigned long long>(band.element_ceiling),
+                band.predicted_elements);
+  append_note(decision);
   band.ok = true;
   return band;
 }

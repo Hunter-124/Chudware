@@ -47,7 +47,10 @@ constexpr const char* kBlobMagic = "AICRES1";
 // /5: measured-octave mesh admission replaces bbox-only coarsening, and closed_fit
 // is an explicit contact idealization. A /4 entry can carry a different delivered
 // mesh or omit these load-bearing modes; never reuse it as current evidence.
-constexpr const char* kCacheSchema = "chudware-simcache/5";
+// /6: ladder probe anchors, local CAD size fields (without global curvature or
+// explicit-size bbox coarsening), and measured edge/size-band/underresolved-wall
+// evidence are part of the result; a /5 packet cannot certify this discretization.
+constexpr const char* kCacheSchema = "chudware-simcache/6";
 constexpr size_t kMemCapEntries = 64;
 constexpr size_t kMaxSidecarOverhead = 4096;
 

@@ -6,6 +6,7 @@ import signal
 import subprocess
 import sys
 import time
+from pathlib import Path
 
 import pytest
 
@@ -96,6 +97,30 @@ def test_stale_done_row_without_result_artifact_becomes_failed(isolated_registry
     assert status["state"] == J.FAILED
     assert status["ok"] is False
     assert "result artifact" in status["error"]
+
+
+def test_worker_completion_between_result_read_and_liveness_check(
+        isolated_registry, monkeypatch):
+    """Exit can race the first result read, but cannot erase a published verdict."""
+    job_id = "sim-exit-publication-race"
+    _insert_job(job_id)
+    directory = J.job_dir(job_id)
+
+    def finish_before_liveness_check(_pid, _proc_key):
+        progress = job_worker._Progress(directory, job_id)
+        progress.emit({"phase": "solve.complete", "elements": 1, "state": "done"})
+        job_worker._atomic_write(directory / "result.json", {
+            "result": {"ok": True, "value": 42}, "done_at": time.time(),
+        })
+        return False
+
+    monkeypatch.setattr(J, "pid_alive", finish_before_liveness_check)
+    status = J.status(job_id)
+    assert status["state"] == J.DONE, status
+    assert status["progress"]["phase"] == "solve.complete"
+    assert status["progress"]["state"] == "done"
+    assert J.raw_result(job_id) == {"ok": True, "value": 42}
+
 
 
 @pytest.mark.parametrize("stored_state", [J.RUNNING, J.DONE])
@@ -410,9 +435,38 @@ def test_native_small_study_streams_progress_across_worker_process(
         "stage": "core_rpc", "kind": "fea_static",
         "payload": {"method": "sim_run_static", "params": {"study": study}},
     }), encoding="utf-8")
+    # Hold the completed native stage until the real worker heartbeat publishes.
+    # An event handshake, rather than sleeping for a presumed scheduler window,
+    # proves the heartbeat crosses the same child/file boundary as native phases.
+    child_script = """
+import sys
+import threading
+from services.sim import job_worker as worker, jobs
+
+heartbeat = threading.Event()
+publish = worker._Progress.emit
+native_stage = jobs.STAGES["core_rpc"]
+worker._HEARTBEAT_S = 0.01
+
+def emit(self, snapshot):
+    publish(self, snapshot)
+    if not snapshot and self.latest.get("phase") == "solve.complete":
+        heartbeat.set()
+
+def run_native(payload, emit):
+    result = native_stage(payload, emit)
+    if result.get("ok") is True and not heartbeat.wait(60):
+        raise RuntimeError("worker heartbeat did not publish after native completion")
+    return result
+
+worker._Progress.emit = emit
+jobs.STAGES["core_rpc"] = run_native
+sys.exit(worker.main(["job_worker", sys.argv[1]]))
+"""
     with (directory / "worker.log").open("w", encoding="utf-8") as log:
         child = subprocess.run(
-            [sys.executable, "-m", "services.sim.job_worker", job_id],
+            [sys.executable, "-c", child_script, job_id],
+            cwd=str(Path(J.__file__).resolve().parents[2]),
             stdout=log, stderr=subprocess.STDOUT, timeout=90, check=False)
     log_text = (directory / "worker.log").read_text(encoding="utf-8")
     assert child.returncode == 0, (
@@ -426,6 +480,11 @@ def test_native_small_study_streams_progress_across_worker_process(
     assert positions == sorted(positions), records
     # Completion, not a scheduler deadline, establishes that the measured mesh
     # crossed the process boundary. Cadence belongs to the injected-clock test.
+    completed = [record for record in records
+                 if record["phase"] == "solve.complete" and "state" not in record]
+    assert len(completed) >= 2, records
+    assert completed[-1]["elements"] == completed[0]["elements"] == 1
+    assert completed[-1]["elapsed_s"] > completed[0]["elapsed_s"]
     assert records[positions[3]]["elements"] == 1, records
     state = J.status(job_id)
     assert state["state"] == J.DONE, state

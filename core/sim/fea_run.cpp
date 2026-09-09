@@ -100,6 +100,7 @@ json mesh_governor_json(const MeshOut& mesh, int dof_per_node) {
                            {"remaining_s", probe.remaining_s}, {"reason", probe.reason}});
     return json{
         {"mode", "measured_octave"},
+        {"reason", mesh.governor_reason},
         {"estimate_gb", chudware::governor::fea_peak_bytes(
                             mesh.n_elems, mesh.nodes_per_elem, dof_per_node) /
                             1073741824.0},
@@ -110,7 +111,8 @@ json mesh_governor_json(const MeshOut& mesh, int dof_per_node) {
         {"probe_budget_s", mesh.governor_probe_budget_s},
         {"elapsed_s", mesh.governor_elapsed_s},
         {"budget_origin", mesh.governor_budget_origin},
-        {"model", {{"count", "geometry_local_power_fit_max_one_octave"},
+        {"model", "measured_octave"},
+        {"calibration", {{"count", "geometry_local_power_fit_max_one_octave"},
                    {"solve_peak", chudware::governor::fea_calibration_basis()},
                    {"rss_stage", "mesh_before_assembly"},
                    {"dof_per_node", dof_per_node}}}};
@@ -190,6 +192,7 @@ struct MeshQualityFacts {
     int hanging_elems_dropped = 0;
     // Thinnest wall in element sizes (mesher.h MeshOut). 0 = unavailable.
     double thin_wall_ratio = 0.0;
+    double min_wall_mm = 0.0;
     // The discretization the study ACTUALLY solved: the mesh's characteristic
     // element length in mm (mesher.h MeshOut::char_len_mm — for a multi-body
     // mesh the worst, i.e. smallest, of the parts). This is the DELIVERED size,
@@ -200,6 +203,9 @@ struct MeshQualityFacts {
     // Chudware never sized), and it is emitted as null rather than as a
     // plausible-looking zero.
     double char_len_mm = 0.0;
+    double size_band_applied_floor_mm = 0.0;
+    std::string size_band_reason = "none";
+    double edge_min_mm = 0.0, edge_median_mm = 0.0, edge_max_mm = 0.0;
     json governor;
     // ── The refined region's own quality (mesher.h MeshOut) ──────────────────
     // A local size contract is delivered by conforming bisection, which is
@@ -248,6 +254,10 @@ json mesh_quality_json(const MeshQualityFacts& quality, std::size_t n_nodes,
         (std::isfinite(quality.char_len_mm) && quality.char_len_mm > 0.0)
             ? json(quality.char_len_mm)
             : json(nullptr);
+    out["size_band"] = {{"applied_floor_mm", quality.size_band_applied_floor_mm},
+                        {"reason", quality.size_band_reason}};
+    out["edge_mm"] = {{"min", quality.edge_min_mm}, {"median", quality.edge_median_mm},
+                      {"max", quality.edge_max_mm}};
     static constexpr const char* kMetrics[] = {
         "aspect_min", "aspect_avg", "aspect_max", "jacobian_min",
         "pct_poor",   "min_tet_volume_mm3",       "max_tet_edge_ratio"};
@@ -271,6 +281,10 @@ json mesh_quality_json(const MeshQualityFacts& quality, std::size_t n_nodes,
     out["thin_wall_ratio"] = quality.thin_wall_ratio > 0.0
                                  ? json(quality.thin_wall_ratio)
                                  : json(nullptr);
+    if (quality.thin_wall_ratio > 0.0 && quality.thin_wall_ratio < 0.5 &&
+        quality.min_wall_mm > 0.0 && quality.char_len_mm > 2.0 * quality.min_wall_mm)
+        out["underresolved_wall"] = {{"min_wall_mm", quality.min_wall_mm},
+                                      {"elements_across", quality.thin_wall_ratio}};
     // Present only on a route that actually resolved fixtures; a modal or
     // mesh-level report must not imply it checked.
     if (quality.unfixed_components >= 0)
@@ -891,6 +905,10 @@ bool resolve_mesh(const json &study, std::vector<double> &points,
       probe.tets = std::move(tets);
       probe.nodes_per_elem = nodes_per_elem;
       if (detail::fill_quality(probe)) {
+        detail::measure_edges(probe);
+        quality.edge_min_mm = probe.edge_min_mm;
+        quality.edge_median_mm = probe.edge_median_mm;
+        quality.edge_max_mm = probe.edge_max_mm;
         quality.valid = true;
         quality.aspect_min = probe.aspect_min;
         quality.aspect_avg = probe.aspect_avg;
@@ -916,15 +934,7 @@ bool resolve_mesh(const json &study, std::vector<double> &points,
     return true;
   }
   if (has_step) {
-    MeshOptions options;
-    options.fineness = study.value("fineness", 0.5);
-    options.order = study.value("mesh_order", study.value("order", 1));
-    options.target_size_mm = study.value("target_size_mm", 0.0);
-    options.min_size_mm = study.value("min_size_mm", 0.0);
-    options.max_size_mm = study.value("max_size_mm", 0.0);
-    options.learned_advisor = study.value("learned_advisor", false);
-    options.advisor_max_dof = study.value("advisor_max_dof", uint32_t{0});
-    options.declared_interfaces = declares_body_interfaces(study);
+    const MeshOptions options = mesh_options_from_study(study);
     const std::string step_path = study["step_path"].get<std::string>();
     auto mesh = mesh_step_cached(step_path, options);
     quality.governor = mesh_governor_json(*mesh);
@@ -1106,9 +1116,15 @@ bool resolve_mesh(const json &study, std::vector<double> &points,
     quality.max_tet_edge_ratio = mesh->max_tet_edge_ratio;
     quality.connected_components = mesh->connected_components;
     quality.thin_wall_ratio = mesh->thin_wall_ratio;
+    quality.min_wall_mm = mesh->min_wall_mm;
     // The size the mesher DELIVERED (after its own governor), which for a
     // contact study is the refined mesh's — `mesh` is reseated above.
     quality.char_len_mm = mesh->char_len_mm;
+    quality.size_band_applied_floor_mm = mesh->size_band_applied_floor_mm;
+    quality.size_band_reason = mesh->size_band_reason;
+    quality.edge_min_mm = mesh->edge_min_mm;
+    quality.edge_median_mm = mesh->edge_median_mm;
+    quality.edge_max_mm = mesh->edge_max_mm;
     quality.governor = mesh_governor_json(*mesh);
     quality.lonely_nodes_repaired = mesh->lonely_nodes_repaired;
     quality.lonely_nodes_remaining = mesh->lonely_nodes_remaining;
@@ -1461,6 +1477,38 @@ void add_midside_face_nodes(const std::vector<int>& tets, int nodes_per_elem,
 }
 
 }  // namespace
+
+MeshOptions mesh_options_from_study(const json& study) {
+    MeshOptions options;
+    options.fineness = study.value("fineness", 0.5);
+    options.order = study.value("mesh_order", study.value("order", 1));
+    options.target_size_mm = study.value("target_size_mm", 0.0);
+    options.min_size_mm = study.value("min_size_mm", 0.0);
+    options.max_size_mm = study.value("max_size_mm", 0.0);
+    options.learned_advisor = study.value("learned_advisor", false);
+    options.advisor_max_dof = study.value("advisor_max_dof", uint32_t{0});
+    options.declared_interfaces = declares_body_interfaces(study);
+    if (study.contains("governor_probes")) {
+      for (const auto& p : study.at("governor_probes")) {
+        MeshGovernorProbe probe;
+        probe.h = p.at("h").get<double>();
+        probe.elems = p.at("elems").get<uint64_t>();
+        if (!(std::isfinite(probe.h) && probe.h > 0.0 && probe.elems > 0))
+          throw std::invalid_argument("governor probes require positive measured sizes and counts");
+        probe.elapsed_s = p.value("elapsed_s", 0.0);
+        probe.rss_gb = p.value("rss_gb", 0.0);
+        probe.predicted_elems = p.value("predicted_elems", json()).is_number()
+            ? p.at("predicted_elems").get<double>() : 0.0;
+        probe.exponent = p.value("exponent", 1.0);
+        const auto phase = p.value("phase", std::string("background"));
+        probe.phase = phase == "combined" ? "combined" :
+                      phase == "local_refine" ? "local_refine" :
+                      phase == "admission_fallback" ? "admission_fallback" : "background";
+        options.governor_probes.push_back(probe);
+      }
+    }
+    return options;
+}
 
 namespace detail {
 
@@ -2101,6 +2149,18 @@ std::vector<int> boundary_faceset_membership(
             const int* table = hex ? kHexFaces[face] : kTetFaces[face].corner;
             if (owners[key_for(element, table)] != 1) continue;
             if (has_analytic_surface) {
+                // A curved faceset owns facets, not isolated near-surface
+                // nodes. A chamfer can have a radial normal and a midside
+                // node within tolerance while one corner lies off the face.
+                // Do not let that incomplete facet admit its midside nodes.
+                bool all_corners = true;
+                for (int i = 0; i < corners_per_face; ++i) {
+                    if (!std::binary_search(ids.begin(), ids.end(), element[table[i]])) {
+                        all_corners = false;
+                        break;
+                    }
+                }
+                if (!all_corners) continue;
                 double center[3] = {0.0, 0.0, 0.0};
                 for (int i = 0; i < corners_per_face; ++i) {
                     const double* p =
@@ -3917,9 +3977,12 @@ static nlohmann::json fea_run_static_impl(
         std::string why;
         const size_t n_elems_est = tets.size() / static_cast<size_t>(nodes_per_elem);
         if (!chudware::governor::admit_fea(n_elems_est, nodes_per_elem, 3,
-                                           "static FEA solve", why))
+                                           "static FEA solve", why)) {
+            if (mesh_quality.governor.is_object())
+                mesh_quality.governor["reason"] = "memory_admission";
             return json{{"ok", false}, {"error", why},
                         {"provenance", {{"governor", mesh_quality.governor}}}};
+        }
     }
 
     const auto t_solve0 = std::chrono::steady_clock::now();
@@ -4440,6 +4503,12 @@ static nlohmann::json fea_run_static_impl(
     out["mesh_quality"] = detail::mesh_quality_json(
         mesh_quality, static_cast<std::size_t>(r.n_nodes),
         static_cast<std::size_t>(r.n_elems), nodes_per_elem);
+    if (out["mesh_quality"].contains("underresolved_wall")) {
+        out["summary"]["underresolved_wall"] = out["mesh_quality"]["underresolved_wall"];
+        out["summary"]["resolution_caveat"] =
+            "Underresolved wall: stress and factor of safety do not establish bending safety; "
+            "refine through the measured minimum wall before release.";
+    }
     out["reactions"] = json{{"applied_force_n", r.applied_force_n},
                             {"reaction_force_n", r.reaction_force_n},
                             {"applied_moment_nmm", r.applied_moment_nmm},
@@ -5669,6 +5738,15 @@ inline uint64_t mesh_opts_key(const MeshOptions &options, uint64_t hash) {
   // single component and no interface at all.
   hash =
       fnv1a(&options.declared_interfaces, sizeof options.declared_interfaces, hash);
+  for (const auto& probe : options.governor_probes) {
+    hash = fnv1a(&probe.h, sizeof probe.h, hash);
+    hash = fnv1a(&probe.elems, sizeof probe.elems, hash);
+    hash = fnv1a(&probe.rss_gb, sizeof probe.rss_gb, hash);
+    hash = fnv1a(&probe.elapsed_s, sizeof probe.elapsed_s, hash);
+    hash = fnv1a(&probe.predicted_elems, sizeof probe.predicted_elems, hash);
+    hash = fnv1a(&probe.exponent, sizeof probe.exponent, hash);
+    hash = fnv1a(probe.phase, std::strlen(probe.phase), hash);
+  }
   // The local refinement contract is part of the mesh, so it is part of the
   // key: the same STEP at the same fineness with a refined contact interface is
   // a DIFFERENT mesh, and serving the coarse one from cache would hand back

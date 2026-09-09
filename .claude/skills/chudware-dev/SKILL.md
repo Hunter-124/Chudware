@@ -274,6 +274,17 @@ judgment).
   recursively; `validated: true` requires every component to contribute solids and an
   exact round-trip count (`components:[{name,solids,source}]`). The MCP mass tool is
   `measure_part(density_g_cm3=)`; `eval_mass` is engine-internal.
+- **Refuse before you mesh; never go silent (2026-09-10).** Contact geometry preflights
+  (interface classification, selector span, normal cone from CAD face normals) run before
+  any fill — the open-saddle refusal takes ~1 s with 0 elements where it used to burn 45
+  min in `local_refine_tets`. Governor probes mesh the BACKGROUND only; the interface
+  band is filled once at the delivered size and its measured count enters admission.
+  Every sim job writes native phase events + a 30 s heartbeat to `partial.json`
+  (atomic); `get_job` keeps the last record. Silence > 60 s is a defect. `add_features`
+  `mode:"new"` / `merge:false` is an independent body never booleaned with existing
+  geometry; `add`/boss fuse only with bodies they touch; unknown modes refused by name;
+  `centered:false` primitives are not offset by their padded bbox.
+  `project_external_refs` resolves against the whole document, not the last body.
 - **Chat sessions are keyed by project (2026-09-04).** `Conversation.projectDir` is stamped
   once at creation from `convProjectDir(st)` (= `st.workspaceDir`, else `plmProjectPath()`) —
   the same value the composer sends Chudcode as `workspace_dir`. `index.json` v3 keeps

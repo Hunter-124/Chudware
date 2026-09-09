@@ -33,17 +33,6 @@ namespace {
 constexpr int kDefaultMaxPasses = 3;
 constexpr double kDefaultEtaTarget = 0.05;
 
-MeshOptions mesh_options_from_study(const json& study) {
-    MeshOptions options;
-    options.fineness = study.value("fineness", 0.5);
-    options.order = study.value("mesh_order", study.value("order", 1));
-    options.target_size_mm = study.value("target_size_mm", 0.0);
-    options.min_size_mm = study.value("min_size_mm", 0.0);
-    options.max_size_mm = study.value("max_size_mm", 0.0);
-    options.learned_advisor = study.value("learned_advisor", false);
-    options.advisor_max_dof = study.value("advisor_max_dof", uint32_t{0});
-    return options;
-}
 
 }  // namespace
 
@@ -190,9 +179,17 @@ json fea_run_adaptive(const json& study) {
             // mesher that produced the final mesh. Same correction shape as the solver
             // name above: an adaptive result must not under-report evidence an ordinary
             // STEP study carries.
-            if (mesh.thin_wall_ratio > 0.0 && result.contains("mesh_quality") &&
-                result["mesh_quality"].is_object())
-                result["mesh_quality"]["thin_wall_ratio"] = mesh.thin_wall_ratio;
+            if (result.contains("mesh_quality") && result["mesh_quality"].is_object()) {
+                auto& quality = result["mesh_quality"];
+                if (mesh.thin_wall_ratio > 0.0)
+                    quality["thin_wall_ratio"] = mesh.thin_wall_ratio;
+                quality["char_len_mm"] = mesh.char_len_mm;
+                quality["size_band"] = {{"applied_floor_mm", mesh.size_band_applied_floor_mm},
+                                         {"reason", mesh.size_band_reason}};
+                quality["edge_mm"] = {{"min", mesh.edge_min_mm},
+                                      {"median", mesh.edge_median_mm},
+                                      {"max", mesh.edge_max_mm}};
+            }
             std::string vtu_path, vtu_error;
             if (!detail::write_result_vtu(study, mesh.points, mesh.tets,
                                           mesh.nodes_per_elem, result, vtu_path,

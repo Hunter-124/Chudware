@@ -1449,3 +1449,69 @@ and solves. `elements` is null until measured, then retains the last actual coun
 Durable job readers and `get_job` expose the final progress record after success
 or refusal as well as during execution, preserving its publication timestamp
 rather than replacing it with polling time.
+
+## Convergence measured admission and wall disclosure (2026-09-08)
+
+`run_fea_convergence` carries the preceding legs' measured probe table into each
+subsequent `study.governor_probes` payload, including the preceding delivered
+mesh as the final anchor. The mesher advances directly from that measurement by a
+half-octave instead of independently selecting another bounding-box bootstrap.
+It rebuilds the finest prior admitted mesh only when finer actual counts do not
+fit. Actual counts still control hard solve admission.
+Rejected finer candidates cannot replace a finer admitted mesh with a coarser one.
+An `admission_fallback` probe revisits a previously measured admitted size; its
+`predicted_elems` is null because it is not an extrapolation from a rejected finer
+probe. The carried history preserves this distinction.
+
+`provenance.governor.model` is now the string `measured_octave`; the prior model
+description fields move to `provenance.governor.calibration`. `reason` identifies
+`requested_size_admitted`, `memory_admission`, `size_band_floor`,
+`feature_resolution`, or `probe_time_budget`. Time-bound optional probing is not
+misreported as memory admission. Ladder rows retain the complete provenance and
+the governor decision on both success and native refusal; recovered failed jobs
+are terminal rows, not permanently pending legs. `delivered_size_mm` remains the
+actual mesh length, and each degenerate pair has a `cause`. Decreasing DOF cannot
+certify convergence even when its absolute change exceeds five percent.
+
+When the measured `thin_wall_ratio` is below 0.5 and the delivered characteristic
+length exceeds twice the measured minimum wall, `mesh_quality.underresolved_wall`
+contains `{min_wall_mm,elements_across}`. Static summaries and convergence rows
+carry the same disclosure and a `resolution_caveat`: their stress/FoS does not
+establish bending safety. Evidence-packet checklists retain this limitation beside
+mesh quality, stress, FoS, and the release limitations, even when caller notes are
+present. The minimum wall is measured from the CAD thickness samples, not inferred
+by multiplying a local elements-across ratio by the global mesh size.
+Simulation cache namespace `/6` invalidates results predating these disclosures.
+
+Study mesh options are parsed once through the shared native parser for static,
+adaptive, mesh-only, and static/modal overlay callers. In particular, overlay
+cache lookups retain `governor_probes`; they must not start a new unmeasured
+bootstrap after the solve by dropping the ladder's mesh-cache identity.
+
+## Explicit tetrahedral sizing and measured edges (2026-09-08)
+
+Successful `sim_mesh` results expose these additional `mesh_quality` facts.
+The shared tetrahedral solve reports, including inline tet4/tet10 and the final
+adaptive mesh, carry the same fields:
+
+- `size_band.applied_floor_mm`: the applied allocation/admission or recovery
+  floor in millimetres; `0` means no global floor was applied.
+- `size_band.reason`: `"none"` for that zero-floor case, otherwise a string
+  identifying the allocation, measured admission, or sizing recovery responsible.
+- `edge_mm.{min,median,max}`: measured straight corner-edge chord lengths in
+  millimetres. Each unordered pair of corner-node indices is counted once across
+  the mesh. Tet10 midside nodes do not split these six tetrahedral edges; an even
+  population uses the mean of its two central lengths for the median.
+
+`char_len_mm` is the selected nominal sizing-field length, not a measured edge
+median. The Cartesian pitch is normalized by the infinite Kuhn-lattice median
+factor `sqrt(2)`; finite cross-sections and local geometry refinement change the
+actual edge population. Use `edge_mm` rather than inferring physical lengths
+from the nominal size or its floor.
+
+For an explicit target, the bounding-box element forecast is diagnostic and
+does not silently bootstrap to a coarser size. Mesh allocation limits and
+measured solve admission remain active. CAD curvature and wall demands act
+locally instead of globally halving the pitch or refining every planar crease.
+A zero global floor does not certify wall resolution or a global element-quality
+floor; those remain separate measured quality and underresolved-wall disclosures.

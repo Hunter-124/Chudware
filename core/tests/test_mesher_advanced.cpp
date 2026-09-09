@@ -336,6 +336,7 @@ TopoDS_Shape build_nested_saddle(double length, double &pin_r, double &bore_r) {
 void check_local_region(const MeshOut& m, double requested,
                         double jacobian_floor, const char* what) {
     REQUIRE_MESSAGE(m.ok, what << ": " << m.error);
+    INFO(m.note);
     MESSAGE(what << ": " << m.n_elems << " elems, " << m.local_refine_waves
                  << " wave(s), " << m.local_refine_smoothing_passes
                  << " quality pass(es), delivered "
@@ -798,4 +799,30 @@ TEST_CASE("local refine: the refined region of a sharp-edged saddle is shapely")
         std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
     MESSAGE("saddle region wall time = " << secs << " s");
     CHECK(secs < wall_ceiling_sec());
+}
+
+TEST_CASE("mesher: plain STEP bar follows requested size without a feature flood") {
+    const auto step = write_step(BRepPrimAPI_MakeBox(10.0, 10.0, 200.0).Shape(),
+                                 "size_delivery_bar");
+    int previous = 0;
+    for (const double h : {8.0, 6.0, 4.0, 2.8}) {
+        MeshOptions options;
+        options.order = 2;
+        options.target_size_mm = h;
+        const auto mesh = mesh_step(step, options);
+        check_mesh_quality(mesh, "plain STEP bar");
+        MESSAGE("bar h=" << h << " elements=" << mesh.n_elems
+                << " edge min/median/max=" << mesh.edge_min_mm << "/"
+                << mesh.edge_median_mm << "/" << mesh.edge_max_mm);
+        CHECK(mesh.n_elems >= previous);
+        const double pitch = h / std::sqrt(2.0);
+        const double median = mesh.edge_median_mm;
+        const bool requested_band = median >= 0.75 * h && median <= 1.25 * h;
+        const bool thin_lattice_band = 10.0 / pitch < 4.0 &&
+            median >= 0.75 * pitch && median <= 1.25 * pitch;
+        CHECK((requested_band || thin_lattice_band));
+        if (h == 4.0) CHECK(mesh.n_elems <= 3 * 2700);
+        previous = mesh.n_elems;
+    }
+    std::filesystem::remove(step);
 }

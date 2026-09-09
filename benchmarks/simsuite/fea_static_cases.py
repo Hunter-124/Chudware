@@ -134,9 +134,12 @@ def close_doc(doc: str) -> None:
         pass
 
 
-def mesh_step(step_path: str, order: int = 1, fineness: float = 0.25) -> dict:
-    m = _cb().call("sim_mesh", {"step_path": step_path, "fineness": fineness,
-                                "order": order})
+def mesh_step(step_path: str, order: int = 1, fineness: float = 0.25,
+              target_size_mm: float | None = None) -> dict:
+    params = {"step_path": step_path, "fineness": fineness, "order": order}
+    if target_size_mm is not None:
+        params["target_size_mm"] = target_size_mm
+    m = _cb().call("sim_mesh", params)
     if not m.get("ok"):
         raise RuntimeError(f"sim_mesh failed: {m.get('error')}")
     return m
@@ -527,7 +530,7 @@ def case_annulus_lame(case_id, order=2, fineness=0.25):
                  extra={"quality": _quality(m), "vm_mid": vm_mid, "vm_ref": vm_ref})
 
 
-def case_annulus_lame_native(case_id, order=2, fineness=0.25):
+def case_annulus_lame_native(case_id, order=2, fineness=0.25, target_size_mm=8.0):
     """Lamé thick-wall cylinder driven by the ENGINE-NATIVE curved-face pressure path —
     the combined witness for the two 2026-07-12 core fixes:
       * C1  outward-oriented pressure fan normals (accumulate_face_weights), and
@@ -535,7 +538,9 @@ def case_annulus_lame_native(case_id, order=2, fineness=0.25):
         nodes_in_faceset_surface keeps a node iff |dist_to_axis − R| < perp_tol).
     The inner-bore faceset comes from doc_face_points on the live doc (no oracle-side
     consistent_pressure_loads), so a regression in either fix reads several-x here.
-    Same analytic reference as case_annulus_lame: u_r(Ri) mid-height band."""
+    Same analytic reference as case_annulus_lame: u_r(Ri) mid-height band.
+    Explicit h=8 mm gives 3.86% error without the former hidden curvature
+    halving; fineness=0.25 alone now delivers h=16 mm and 15.71% error."""
     Ro, Ri, H, p = 40.0, 20.0, 120.0, 10.0
     u_ref = (p * Ri / STEEL["E_mpa"]) * ((Ro ** 2 + Ri ** 2) / (Ro ** 2 - Ri ** 2)
                                          + STEEL["nu"])
@@ -568,7 +573,7 @@ def case_annulus_lame_native(case_id, order=2, fineness=0.25):
     bot = plane_faceset([0, 0, -H / 2], [0, 0, -1], tol_mm=Ro + 1)
     setup_s = time.time() - t0
     t0 = time.time()
-    m = mesh_step(step, order=order, fineness=fineness)
+    m = mesh_step(step, order=order, fineness=fineness, target_size_mm=target_size_mm)
     mesh_s = time.time() - t0
     t0 = time.time()
     r = static_solve(m, [bot], [{"faces": bore, "type": "pressure", "magnitude": p}])

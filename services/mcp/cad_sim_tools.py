@@ -3113,7 +3113,7 @@ def _degenerate_legs(rows: list) -> list:
             continue
         if a <= 0:
             continue
-        growth = abs(float(b) - float(a)) / abs(float(a)) * 100.0
+        growth = (float(b) - float(a)) / abs(float(a)) * 100.0
         identical = a == b and prev.get("n_elems") == cur.get("n_elems")
         if identical or growth >= _LADDER_MIN_DOF_GROWTH_PCT:
             continue  # identical pairs are already recorded above; healthy growth is fine
@@ -3127,6 +3127,17 @@ def _degenerate_legs(rows: list) -> list:
             }
         )
     hits.sort(key=lambda h: (h["legs"][1], h["legs"][0]))
+    for hit in hits:
+        reasons = [
+            (rows[i].get("governor") or {}).get("reason")
+            for i in hit["legs"]
+        ]
+        hit["cause"] = next(
+            (reason for reason in reasons if reason in
+             ("memory_admission", "size_band_floor", "feature_resolution",
+              "probe_time_budget")),
+            "feature_resolution",
+        )
     return hits
 
 
@@ -3344,6 +3355,9 @@ def _convergence_row(step: dict, out: dict, monitor: str, prev: Optional[float])
         **({"min_size_mm": step["min_size_mm"]}
            if step.get("min_size_mm") is not None else {}),
     }
+    if isinstance(out.get("provenance"), dict):
+        row["provenance"] = out["provenance"]
+        row["governor"] = out["provenance"].get("governor", {})
     budget = _memory_budget(out)
     if budget:
         # Attached BEFORE the failure return: on a refused leg the governor's budget is
@@ -3366,7 +3380,8 @@ def _convergence_row(step: dict, out: dict, monitor: str, prev: Optional[float])
     # unmasked twin is how a packet came to report 105.98 MPa as "the peak at the
     # keyway bolt-hole edge" while the field peaked at 402.93 MPa there. Pass-through
     # only — nothing is re-derived here.
-    for key in ("max_von_mises_reduction", "max_von_mises_raw_mpa", "min_fos_raw"):
+    for key in ("max_von_mises_reduction", "max_von_mises_raw_mpa", "min_fos_raw",
+                "underresolved_wall", "resolution_caveat"):
         if key in summary:
             row[key] = summary.get(key)
     if isinstance(out.get("mesh_quality"), dict):
@@ -3591,6 +3606,7 @@ def _convergence_leg_solve(
             return jid, collect_durable(jid, st)
         if state in (simjobs.FAILED, simjobs.CANCELLED):
             return jid, {
+                **(simjobs.refusal_result(jid) or {}),
                 "ok": False,
                 "job_id": jid,
                 "state": state,
@@ -3647,6 +3663,7 @@ class _ConvergenceLadder:
         self.index = 0
         self.inflight: Optional[str] = None
         self.stop_reason: Optional[str] = None
+        self.governor_probes: list = []
         # Handed to the thread-job table by reference, so get_job() sees the ladder
         # advance leg by leg instead of one opaque "running".
         self.progress: dict = {
@@ -3664,6 +3681,8 @@ class _ConvergenceLadder:
                 self._record(_convergence_skipped_row(step, self.stop_reason))
                 continue
             if self.inflight is None:
+                if self.governor_probes:
+                    payload["params"]["study"]["governor_probes"] = self.governor_probes
                 self.inflight = simjobs.start(
                     "fea_static", "core_rpc", payload, meta
                 )["job_id"]
@@ -3674,6 +3693,15 @@ class _ConvergenceLadder:
             if out is None:
                 return None  # this leg is still solving; the ladder resumes in background
             row = _convergence_row(step, out, self.monitor, self.prev)
+            governor = (out.get("provenance") or {}).get("governor") or {}
+            probes = governor.get("probes")
+            if isinstance(probes, list) and probes:
+                self.governor_probes = list(probes)
+                # The delivered mesh may not be the last attempted (refused) probe.
+                # It, not a rejected finer mesh, anchors the following leg.
+                delivered = governor.get("measured_probe")
+                if isinstance(delivered, dict):
+                    self.governor_probes.append(delivered)
             if row.get("error") and not self.continue_on_fail:
                 self.stop_reason = (
                     f"not solved: leg {self.index} ({_leg_label(step)}) failed and stopped "
@@ -3793,10 +3821,18 @@ def _convergence_from_jobs(job_ids, monitor: str, tol_pct: float) -> dict:
                 "metadata); it cannot be placed on the ladder."
             )
         doc_id = doc_id or meta.get("doc")
-        if st.get("state") != simjobs.DONE:
+        if st.get("state") not in simjobs.TERMINAL:
             pending.append({"job_id": jid, "state": st.get("state"), **step})
             continue
-        legs.append((step, collect_durable(str(jid), st)))
+        if st.get("state") == simjobs.DONE:
+            out = collect_durable(str(jid), st)
+        else:
+            out = {
+                **(simjobs.refusal_result(str(jid)) or {}),
+                "ok": False,
+                "error": st.get("error") or f"solve {st.get('state')}",
+            }
+        legs.append((step, out))
     if pending:
         return {
             "ok": False,

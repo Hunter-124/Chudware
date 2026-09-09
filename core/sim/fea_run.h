@@ -27,6 +27,9 @@
 namespace chudware::sim {
 
 struct MeshOut;
+struct MeshOptions;
+// One study-option parser shared by the solve and its cached display mesh.
+MeshOptions mesh_options_from_study(const nlohmann::json& study);
 // Shared mesh-only and solved-study governor evidence (RSS is pre-assembly).
 nlohmann::json mesh_governor_json(const MeshOut& mesh, int dof_per_node = 3);
 

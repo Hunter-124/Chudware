@@ -192,6 +192,33 @@ std::string element_location(const std::vector<double> &p, const int *element) {
 } // namespace
 
 namespace detail {
+void measure_edges(MeshOut &out) {
+  std::vector<uint64_t> edges;
+  edges.reserve(out.tets.size() / static_cast<std::size_t>(out.nodes_per_elem) * 6);
+  for (std::size_t e = 0; e < out.tets.size(); e += out.nodes_per_elem)
+    for (int a = 0; a < 4; ++a)
+      for (int b = a + 1; b < 4; ++b) {
+        const auto lo = static_cast<uint32_t>(std::min(out.tets[e+a], out.tets[e+b]));
+        const auto hi = static_cast<uint32_t>(std::max(out.tets[e+a], out.tets[e+b]));
+        edges.push_back((static_cast<uint64_t>(lo) << 32) | hi);
+      }
+  std::sort(edges.begin(), edges.end());
+  edges.erase(std::unique(edges.begin(), edges.end()), edges.end());
+  std::vector<double> lengths;
+  lengths.reserve(edges.size());
+  for (const auto edge : edges)
+    lengths.push_back(edge_len(out.points, static_cast<int>(edge >> 32),
+                               static_cast<int>(edge & 0xffffffffu)));
+  if (lengths.empty()) return;
+  const auto bounds = std::minmax_element(lengths.begin(), lengths.end());
+  out.edge_min_mm = *bounds.first;
+  out.edge_max_mm = *bounds.second;
+  const auto middle = lengths.begin() + lengths.size()/2;
+  std::nth_element(lengths.begin(), middle, lengths.end());
+  out.edge_median_mm = *middle;
+  if (lengths.size()%2 == 0)
+    out.edge_median_mm = 0.5 * (*middle + *std::max_element(lengths.begin(), middle));
+}
 
 // THE tet shape metrics (mesher.h TetShape). Both are volume-over-edge-lengths
 // forms normalized to 1.0 on a regular tet, and they are ordered:

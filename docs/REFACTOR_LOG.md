@@ -3186,3 +3186,166 @@ assertion was removed, not represented as a reproduced solver failure.
 or field values. Full scoped files: **114 passed in 295.89s**
 (`services/mcp/test_cad_sim_tools.py`) and **20 passed in 0.64s**
 (`services/sim/test_jobs.py`), through the same 10 GiB `build-fix` wrapper.
+
+## ME 490 transform ownership and component suppression (2026-09-08)
+
+Fixed `core/doc/document.cpp` and `session.cpp`: a transform could resurrect a
+consumed non-transform feature's historical solid, reporting success while adding
+a body. It now refuses that stale owner by name; live-body transforms remain moves
+by default, and only `copy:true` duplicates. Nested `rotate:{axis,angle}` now rotates
+rather than silently translating only. Assembly transform features become composed
+component-placement mutations through the existing warm-start/island-transport
+path, refusing missing components and mate-owned poses. `set_suppressed` dispatches
+by document kind, accepting assembly components and part features with named
+wrong-kind refusals. MCP guidance is updated in `cad_doc_tools.py` and
+`cad_asm_tools.py`; append-only contracts document the behavior.
+
+New end-to-end cases in `test_add_features_shape.py` failed against the prebuild
+library: stale-owner transform returned `ok:true` and 3→4 bodies; assembly transform
+left placement at `[10,0,0]` instead of `[20,10,30]`. The throwaway also reproduced
+`set_suppressed: no feature`. Fixed smoke: 3→3 bodies, 3000→3000 mm³,
+middle-body COM `[1720,0,1090]` with the other COMs unchanged; stale-owner refusal
+preserved 3 bodies and 3500 mm³. Proof through the prescribed 10 GiB wrapper:
+**581 passed in 12.03s** (full feature file); ctest **document 1/1 passed in
+14.51 sec**. Assembly tests exercise composed rotation, explicit copies,
+suppression/restoration, mate-owned refusal, and wrong-kind ids. The reported
+275-body fold-study file was not modified.
+
+## Measured convergence admission and wall caveats (2026-09-08)
+
+The convergence driver launched independent durable studies without carrying a
+measured mesh-count table; failure collection also discarded native admission
+provenance. The current baseline was already `measured_octave`, not a separate
+`bbox_envelope` solver: its unmeasured bootstrap still restarted per leg, and the
+60-second optional-probe budget was exhausted by a 251.7-second initial fill.
+`cad_sim_tools.py` now carries measurements and the delivered anchor across legs,
+retains success/refusal provenance, treats failed recovery jobs as terminal, and
+names degeneracy causes. Falling DOF is not convergence. `mesher.*`,
+`mesh_size_band.cpp`, and `fea_run.*` advance directly by measured half-octaves;
+refused finer counts can rebuild the finest prior admitted mesh, explicitly
+recorded as `admission_fallback`, never as a multi-octave forecast.
+
+Live replay additionally exposed a post-solve caller mismatch: API overlay mesh
+lookups dropped the shared probes and re-meshed after `solve.complete`.
+`libchudware.cpp`, `fea_run.*`, and `fea_adaptive.cpp` now share one study-options
+parser (the duplicate adaptive parser was removed). A real three-leg wrapper
+smoke returned shared-memory overlays with no post-solve mesh phase on any leg.
+The long FRAME replay had started before this last caller migration; the separate
+smoke verifies that final correction.
+
+The requested FRAME-PEDAL-BRAKE geometry directory was empty. Its packet
+`inputs.json` identifies `MECHANISM/geometry/_src_B.step`, ordinal 715; the source
+was copied to `/tmp/brake-ladder/source.step` and isolated through the wrapper.
+Source SHA-256 remains
+`eda65dab8a7dc06b5b6e7d1c220db7aee1dddb3dc748aadb834b29445a0c01d4`;
+the exported `/tmp/brake-ladder/isolate.step` hashes to
+`b3669503840ccc4cc7ecc822ee56fb00d0aba83b1039a5e6ddb629cce92d59bd`.
+Original study geometry was not edited.
+
+Acceptance replay used the approved 16 GiB scope, `CHUDWARE_MEM_FRAC=0.6`,
+`CHUDWARE_HEADROOM_GB=2`, and `CHUDWARE_MESH_PROBE_BUDGET_S=1800` (the native
+bootstrap alone exceeds the default 60-second optional-probe allowance).
+All three rows solved and report `model=measured_octave`:
+
+| Requested mm | Delivered mm | Tet10 | DOF | Estimate GiB | Decision |
+| --- | --- | --- | --- | --- | --- |
+| 6.0 | 6.0 | 199964 | 945534 | 11.176498 | requested_size_admitted |
+| 4.0 | 4.0 | 192556 | 916620 | 10.570982 | requested_size_admitted |
+| 2.8 | 4.0 | 192556 | 916620 | 10.570982 | memory_admission |
+
+The last leg measured 259252 elements at 2.828427 mm and 259036 at 2.8 mm,
+then returned the admitted 4 mm mesh. The reported historical delivery was
+6/5.383/5.306 mm with 959634/958410/957930 DOF. The replay is correctly
+`converged:false`: its first pair names `feature_resolution`, its second
+`memory_admission`. **Separate mesher defect to file:** on this same
+FRAME-PEDAL-BRAKE isolate, actual count falls from 199964 at 6 mm to 192556 at
+4 mm (DOF 945534→916620), despite the requested sizes being delivered. This is
+not a memory refusal and must not be relabeled as one.
+
+`mesh_quality.underresolved_wall` uses measured CAD minimum thickness, not global
+size times a local ratio. Static summaries, ladder rows, and evidence-packet
+checklists retain the bending/FoS caveat. Real 20×10×0.53 mm wall proof:
+delivered h=6, measured min wall=0.530372 mm, elements_across=0.327045; the
+caveat clears on refinement above 0.5 elements across. A fixed-3-GiB cube
+smoke delivered 10/10/10 mm for requests 10/5/2.5, with both refused finer legs
+explicitly `memory_admission` and valid admitted solves. Regression additions
+cover falling DOF, terminal refusal recovery, and packet limitations.
+Cache namespace `/6` invalidates earlier evidence; contracts are appended.
+Evidence JSON is retained under `/tmp/brake-ladder/`.
+Final checks after the shared-parser migration: `test_cad_sim_tools.py` plus
+`test_sim_evidence_packet.py`: **133 passed in 302.21s (0:05:02)**.
+ctest **governor 1/1 passed in 0.00 sec; 100% tests passed, 0 failed**.
+The targeted native `chudware`/`test_governor` build passed; no project-wide gate
+or formatter was run. Throwaway reproduction scripts were removed.
+
+## 2026-09-08 — explicit mesher counts, local geometry fields, and edge evidence
+
+Changed `core/sim/{mesh_size_band,mesher,mesh_quality,fea_run,fea_adaptive,sim_cache}`,
+the `sim_mesh` RPC output, native/MCP regressions, and the upstream graded-fill
+pipeline/headers. Explicit-size bounding-box forecasts are diagnostic rather
+than silent coarse bootstraps; CAD curvature/thickness fields replace global
+curved-area pitch halving and unconditional planar-crease floods. The fixed
+200000-tet LEB stop is replaced by the caller's memory ceiling. The background
+pitch is `h/sqrt(2)`. Local sources retain their requested size instead of raising
+the entire distance-graded field to nominal `h/4`. Crucially, regular parents are
+refined BEFORE boundary projection: projecting coarse corners first left locally
+refined children with boundary slivers. Quality/fidelity floors and pass limits
+were not loosened. Mesh and solve reports now carry `mesh_quality.size_band` and
+unique tetrahedral corner-edge chord statistics; `contracts/worker_rpc.md` is
+appended. The unreleased cache namespace `/6` comment records this cutover.
+
+Final mesh-only measurements, under the 10G wrapper, are retained in
+`/tmp/brake-ladder/counts-final.json` (baseline: `counts-before.json`).
+The final pipeline is the exact projection-order version restored after the
+failed rim experiment below, so these final measurements remain applicable.
+
+| Part | Requested h mm | Before elements | Final elements | Final edge min / median / max mm |
+|---|---:|---:|---:|---|
+| 10x10x200 bar | 8 | 24128 | 864 | 5 / 5.555556 / 8.992452 |
+| bar | 6 | 13056 | 4608 | 2.5 / 4.166667 / 5.464532 |
+| bar | 4 | 205504 | 6912 | 2.5 / 3.535534 / 4.496226 |
+| bar | 2.8 | 94384 | 22032 | 1.666667 / 2.357023 / 3.065980 |
+| brake isolate | 8 | 154992 | 16144 | 2.237240 / 4.815493 / 8.969029 |
+| brake isolate | 6 | 199964 | 27162 | 0.819483 / 4.107191 / 8.013600 |
+| brake isolate | 4 | 195968 | 61064 | 1.073398 / 2.840176 / 9.065066 |
+| brake isolate | 2.8 | 207804 | 185700 | 0.001414 / 1.954595 / 4.549586 |
+
+Both final ladders are strictly increasing; every final nominal delivered h equals
+its request and every `size_band` is `{applied_floor_mm:0,reason:"none"}`.
+Independent NumPy unique-corner-edge measurements agree with the C++ statistics.
+The h=4 bar is 2.56 times the 2700-element structured reference, below the 3x bound.
+The baseline brake requests 4/2.8 were actually bootstrapped to 5.968209/5.6 mm
+under this wrapper/probe allowance, unlike the earlier unrestricted replay.
+**The original median-within-25%-of-requested-h criterion is not met**: the brake
+medians above, and the coarsest two bar medians, are lower. The native bar test
+uses the agreed finite-lattice exception when fewer than four cells span its
+smallest dimension; it does not establish the original brake median criterion.
+
+**Remaining defect MESHER-CURVED-RIM-FIDELITY:** upstream `sharp BRep edges are
+reproduced by mesh feature segments` still fails unchanged CAD-to-feature p99/h
+ceilings: plate-hole **0.0917903714 > 0.09**, cylinder **0.3103285593 > 0.20**.
+One attempted local field around protected curved CAD rims (h/8 sources, gradient
+0.25) regressed core: pin-region Jacobian **0.0424415 < 0.05** and tight contact
+chattered through 25 iterations. That entire rim-field attempt was reverted.
+The obsolete plate-hole `>30000` elements and `>400` feature-segments pins were
+removed; its actual geometry-fidelity assertions pass unchanged.
+
+**Remaining defect MESHER-EXACT-SURFACE-ROUNDING:** upstream `boundary nodes land
+on the exact BRep for every CAD mesher` still fails icecream-cone/graded node
+p99/h **1.97178e-12 > 1e-12**; the tolerance is unchanged.
+**Remaining defect MESHER-BULK-SLIVER:** the final brake h=2.8 global tally has
+minimum Jacobian **0.0007149005**, maximum aspect **1176.663915**, and minimum
+corner edge **0.001413533 mm**. This probe requests no explicit local-refinement
+band, so its scoped local quality pass is not invoked; membership of that worst
+cell in a CAD geometry-field rim band was not measured. It is not a certificate
+that every bulk cell meets the local saddle's 0.034 floor.
+
+Final rollback proof: core mesher ctest **100% tests passed, 0 tests failed out
+of 5**, **241.70 sec**. Fresh upstream ctest: **96% tests passed, 2 tests failed
+out of 53**, **79.96 sec**, with one skipped preview test; the two failures are
+the named fidelity tests above. MCP size-delivery/pocket-floor and measured
+governor regressions: **2 passed in 28.65s**. Inline tet-edge smoke passed
+min/median/max **1 / 1.2071067811865475 / 1.4142135623730951**, floor 0/none.
+Both native trees were freshly built at `-j2` under 12G; runs used the 10G wrapper.
+No gate, formatter, or host-daemon termination was used. Throwaway measurement
+scripts were removed; JSON evidence is retained.

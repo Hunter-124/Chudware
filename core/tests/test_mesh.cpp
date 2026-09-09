@@ -242,7 +242,7 @@ TEST_CASE("the element budget never coarsens past four elements across the thinn
   CHECK(bulky.base <= 25.0 * 1.001);   // and never past its own floor (100/4)
 }
 
-TEST_CASE("measured governor skips expired probes and delivers the local band once") {
+TEST_CASE("an expired probe budget does not coarsen an explicit size or skip its local band") {
   struct Environment {
     const char *name;
     std::optional<std::string> saved;
@@ -255,9 +255,8 @@ TEST_CASE("measured governor skips expired probes and delivers the local band on
           name, saved ? saved->c_str() : nullptr);
     }
   };
-  // Zero deterministically exhausts the optional budget without a sleep or a
-  // machine-speed assertion. The bootstrap and actual local delivery must
-  // still happen; a skipped optional probe must not become a mesh refusal.
+  // Zero exhausts optional probes, not the requested discretization or its
+  // local contract. A bounding-box solve forecast must not replace either.
   const Environment enabled("CHUDWARE_GOVERNOR", "1");
   const Environment memory("CHUDWARE_MEM_CAP_GB", "3");
   const Environment probe_time("CHUDWARE_MESH_PROBE_BUDGET_S", "0");
@@ -266,9 +265,6 @@ TEST_CASE("measured governor skips expired probes and delivers the local band on
   MeshOptions options;
   options.order = 2;
   options.target_size_mm = 0.5;
-  const SizeBand band = resolve_size_band(cube, options);
-  REQUIRE_MESSAGE(band.ok, band.error);
-  REQUIRE(band.memory_coarsened);
   const std::string step = write_step(cube, "chudware_governor_band.step");
   SUBCASE("background only") {}
   SUBCASE("local contact band") {
@@ -281,23 +277,14 @@ TEST_CASE("measured governor skips expired probes and delivers the local band on
   const MeshOut mesh = mesh_step(step, options);
   std::filesystem::remove(step);
   REQUIRE_MESSAGE(mesh.ok, mesh.error);
-  REQUIRE(mesh.governor_skipped_probes.size() == 1);
-  const auto &skipped = mesh.governor_skipped_probes.front();
-  CHECK(skipped.h < mesh.char_len_mm);
-  CHECK(skipped.predicted_s > skipped.remaining_s);
-  CHECK(skipped.remaining_s == 0.0);
-  CHECK(skipped.reason == "predicted_probe_exceeds_remaining_budget");
-  CHECK(mesh.governor_elapsed_s > mesh.governor_probe_budget_s);
-  REQUIRE(mesh.governor_probes.size() ==
-          (options.local_refine.active() ? 2u : 1u));
-  CHECK(std::string(mesh.governor_probes.front().phase) == "background");
+  CHECK(mesh.char_len_mm == options.target_size_mm);
+  CHECK(mesh.size_band_applied_floor_mm == 0.0);
+  REQUIRE_FALSE(mesh.governor_probes.empty());
   // The final count, not a hypothetical background-only solve, is the
   // admission evidence even when the optional budget was already spent.
   CHECK(mesh.governor_probes.back().elems ==
         static_cast<uint64_t>(mesh.n_elems));
   if (options.local_refine.active()) {
-    CHECK(std::string(mesh.governor_probes.back().phase) == "local_refine");
-    CHECK(mesh.char_len_mm == mesh.governor_probes.front().h);
     CHECK(mesh.local_refine_achieved_mm > 0.0);
     CHECK(mesh.local_refine_achieved_mm <=
           kLocalContractSlack * options.local_refine.size_mm);

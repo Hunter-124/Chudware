@@ -100,6 +100,18 @@ def _geometry(tmp_path, body: str = "solid frame"):
     return step
 
 
+def test_underresolved_ladder_wall_remains_a_packet_limitation(tmp_path):
+    result = _result()
+    caveat = "Underresolved wall: refine through the measured minimum wall before release."
+    result["table"][-1]["underresolved_wall"] = {
+        "min_wall_mm": 0.53, "elements_across": 0.09}
+    result["table"][-1]["resolution_caveat"] = caveat
+    written = _write(_tools(), tmp_path / "out", _geometry(tmp_path), result)
+    assert written["ok"], written
+    checklist = (tmp_path / "out" / "FRAME-PEDAL-BRAKE" / "checklist.md").read_text()
+    assert caveat in checklist
+
+
 def test_second_packet_archives_the_first_and_names_it(tmp_path):
     """A re-run into the same folder must not destroy the released packet.
 

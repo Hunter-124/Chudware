@@ -5747,15 +5747,23 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                            guard.insert(eff_id).second)
                         eff_id = superseded_by[eff_id];
                 }
+                if (consumed.count(eff_id))
+                    throw std::runtime_error("transform: body '" + body_id +
+                        "' is consumed by a later feature; target its live body owner");
                 const TopoDS_Shape& body = require_solid(results, eff_id, "body");
 
                 Eigen::Vector3d translate(0, 0, 0);
                 if (auto t = opt_vec3(feat, "translate")) translate = *t;
 
-                const double angle_deg =
-                    feat.contains("angle") ? num_or_expr(feat.at("angle"), env) : 0.0;
+                const json rotation = feat.value("rotate", json());
+                const bool rotation_object = rotation.is_object();
+                const double angle_deg = rotation_object && rotation.contains("angle")
+                    ? num_or_expr(rotation.at("angle"), env)
+                    : feat.contains("angle") ? num_or_expr(feat.at("angle"), env) : 0.0;
                 Eigen::Vector3d axis_dir(0, 0, 1);
-                if (auto a = opt_vec3(feat, "rotate")) axis_dir = *a;
+                if (rotation_object) {
+                    if (auto a = opt_vec3(rotation, "axis")) axis_dir = *a;
+                } else if (auto a = opt_vec3(feat, "rotate")) axis_dir = *a;
                 else if (auto a2 = opt_vec3(feat, "axis")) axis_dir = *a2;
                 Eigen::Vector3d pivot(0, 0, 0);
                 if (auto pv = opt_vec3(feat, "pivot")) pivot = *pv;

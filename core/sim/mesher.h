@@ -58,7 +58,7 @@ struct MeshGovernorProbe {
   double predicted_elems = 0.0; // 0 = unmeasured bootstrap
   double exponent = 2.0;
   double elapsed_s = 0.0; // wall time of this fill, including recovery
-  const char *phase = "background"; // background, local_refine, or combined
+  const char *phase = "background"; // background, local_refine, combined, admission_fallback
 };
 
 struct MeshGovernorSkippedProbe {
@@ -72,7 +72,14 @@ struct MeshOut {
   std::vector<double> points; // n*3 flat, row-major, millimetres
   std::vector<int> tets;      // m*K flat, 0-based; K is nodes_per_elem
   double char_len_mm = 0.0;
+  double size_band_applied_floor_mm = 0.0;
+  std::string size_band_reason = "none";
+  // Unique corner-to-corner edges, not the half-edges of tet10 mids.
+  double edge_min_mm = 0.0;
+  double edge_median_mm = 0.0;
+  double edge_max_mm = 0.0;
   std::vector<MeshGovernorProbe> governor_probes;
+  std::string governor_reason;
   std::vector<MeshGovernorSkippedProbe> governor_skipped_probes;
   double governor_probe_budget_s = 0.0;
   double governor_elapsed_s = 0.0;
@@ -124,6 +131,7 @@ struct MeshOut {
   // that turns a thin tube into a mechanism. 0 = unavailable (inline mesh, no
   // CAD tessellation, or an open shell the inward raycast never crossed).
   double thin_wall_ratio = 0.0;
+  double min_wall_mm = 0.0;
 
   double aspect_min = 0.0;
   double aspect_avg = 0.0;
@@ -303,6 +311,8 @@ struct MeshOptions {
   // point of the study — instead of being fused into one (MeshOut::fused_*).
   bool declared_interfaces = false;
   MeshLocalRefine local_refine;
+  // Measurements from preceding legs of the same geometry/order ladder.
+  std::vector<MeshGovernorProbe> governor_probes;
 };
 
 bool validate_mesh_options(const MeshOptions &options, std::string &error);
@@ -332,6 +342,8 @@ void mesh_cache_note_generation();
 
 namespace detail {
 bool fill_quality(MeshOut &out);
+// Unique corner-edge statistics after fill_quality validated connectivity.
+void measure_edges(MeshOut &out);
 
 // Aspect ratio and minimum corner scaled Jacobian of ONE tet, from four corner
 // points given as xyz triples. These are exactly the definitions fill_quality

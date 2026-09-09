@@ -397,6 +397,16 @@ def _checklist_state(
             ),
         ),
     ]
+    caveats = [
+        entry.get("resolution_caveat")
+        for entry in [summary, *rows]
+        if entry.get("resolution_caveat")
+    ]
+    if caveats:
+        caveat = "; ".join(dict.fromkeys(caveats))
+        for index in (6, 10, 12, 14):
+            state[index]["auto_satisfied"] = False
+            state[index]["evidence"] += " " + caveat
     return state
 
 

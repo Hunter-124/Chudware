@@ -629,3 +629,20 @@ rung to try.
 - the envelope-movement budget becomes `max(1e-6 mm, 10*max(tolerance, sew_tolerance_mm,
   rebuild_fuzzy_mm), 1e-5*diagonal)`. Authorizing a 0.05 mm merge authorizes movement on that
   scale; without the fuzzy term the guard refused body 47's own fix over an 18 micron shift.
+
+### `transform` — body ownership and assembly placement (2026-09-08)
+
+`copy` defaults to `false`: a transform consumes its live source and replaces it;
+only `copy:true` duplicates. An explicit `body` never falls back to another body.
+An unknown, malformed, or consumed non-transform owner is refused by name instead
+of resurrecting historical geometry. Repeated transforms of the same original
+owner continue along its in-place transform lineage.
+
+Rotation accepts `rotate:[ax,ay,az], angle:degrees` or
+`rotate:{"axis":[ax,ay,az],"angle":degrees}`. Rotation about `pivot` precedes
+`translate`. On assemblies, `body` names a component, and the operation composes
+this world-space delta with its current placement, without adding a part feature.
+`copy:true` explicitly inserts a placed component copy. An unfixed component
+referenced by an active mate refuses with `component_is_mated`; a missing component
+refuses with `component_not_found`. Authored poses use the existing assembly warm
+start invalidation and grounded-island transport path.

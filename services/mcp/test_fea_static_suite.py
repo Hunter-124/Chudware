@@ -220,10 +220,10 @@ def test_regression_parts_solve_with_finite_fields():
 
 def test_curved_faceset_covers_cylinder_exactly():
     """doc_face_points on a cylinder barrel must emit the analytic surface descriptor,
-    and the solver's membership test must then fix EXACTLY the lateral-face nodes —
-    no misses (the pre-fix triangulation sampling missed every node between the end
-    rings) and no interior/end-face bleed. Regression witness for the C2 fix
-    (session.cpp doc_face_points + fea_run.cpp nodes_in_faceset_surface)."""
+    and the solver's membership test must then fix EXACTLY the lateral boundary
+    nodes — no misses and no interior/end-face bleed. The old radius-only oracle
+    was a stale pin: it assumed the old halved pitch. At the honest h=5 mm, 480
+    interior nodes sit 0.142–0.145 mm inside the barrel, legitimately unfixed."""
     def _run():
         cb = fsc._cb()
         doc = cb.call("doc_new", {"name": "c2_cyl_cover"})["doc_id"]
@@ -257,14 +257,40 @@ def test_curved_faceset_covers_cylinder_exactly():
     assert fp.get("perp_tol_mm") == pytest.approx(1.5)
 
     # Membership through a real solve: fixture = the barrel faceset; fixed nodes are
-    # exactly the zero-displacement ones. Ground truth = nodes at hypot(x,y) ≈ R.
+    # exactly the zero-displacement ones. Surface truth requires exterior topology,
+    # not just proximity: near-barrel interior tet10 nodes must remain free.
     load = [{"faces": {"points": [[0, 0, 50]], "tol_mm": 3.0},
              "type": "force", "vector": [100.0, 0.0, 0.0]}]
     r = fsc.static_solve(mesh, [fp], load)
     pts, dm = mesh["points"], r["disp_magnitude"]
     n = len(pts) // 3
-    truth = {i for i in range(n) if abs(math.hypot(pts[3 * i], pts[3 * i + 1]) - 10.0) < 0.2}
+    owners = {}
+    element_faces = {}
+    stride = mesh["nodes_per_elem"]
+    for start in range(0, len(mesh["tets"]), stride):
+        el = mesh["tets"][start:start + stride]
+        for corners, mids in fsc._KTET_FACES:
+            key = tuple(sorted(el[c] for c in corners))
+            owners[key] = owners.get(key, 0) + 1
+            element_faces[key] = tuple(el[c] for c in corners + mids)
+    boundary_faces = [face for key, face in element_faces.items() if owners[key] == 1]
+    radial_error = [abs(math.hypot(pts[3 * i], pts[3 * i + 1]) - 10.0)
+                    for i in range(n)]
+    # End-cap facets have constant z. Rim/chamfer facets with an off-cylinder
+    # corner are not barrel facets, even when one edge lies at radius R.
+    cylinder_faces = [face for face in boundary_faces
+                      if max(pts[3 * c + 2] for c in face[:3]) -
+                      min(pts[3 * c + 2] for c in face[:3]) > 1e-6
+                      and all(radial_error[c] <= fp["perp_tol_mm"] for c in face[:3])]
+    supported = {i for face in cylinder_faces for i in face}
+    truth = {i for i in supported if radial_error[i] < 0.2}
     fixed = {i for i in range(n) if dm[i] == 0.0}
+    # A near-surface midside node on a chamfer must not join the faceset when
+    # its facet has a corner outside the analytic tolerance.
+    assert fixed <= supported, "fixed nodes admitted from off-cylinder facets"
+    for face in boundary_faces:
+        if all(i in fixed for i in face):
+            assert all(radial_error[c] <= fp["perp_tol_mm"] for c in face[:3])
     missed = truth - fixed
     bled = fixed - truth
     assert not missed, f"{len(missed)}/{len(truth)} lateral nodes missed"
@@ -274,9 +300,11 @@ def test_curved_faceset_covers_cylinder_exactly():
 def test_native_curved_pressure_matches_lame():
     """End-to-end C1+C2: engine-native pressure on the annulus BORE face (surface
     faceset from doc_face_points + oriented consistent-pressure deposition) must match
-    the Lamé radial displacement. Pre-fix this read several-x off (C1) on a mostly
-    missed node set (C2)."""
-    c = _cached(("lame_native",), lambda: fsc.case_annulus_lame_native("t"))
+    the Lamé radial displacement. Explicit h=8 mm measures 3.86% error; the
+    former hidden global halving masked the 15.71% error at the fineness-only
+    h=16 mm. The 8% accuracy bound is unchanged."""
+    c = _cached(("lame_native", 8.0),
+                lambda: fsc.case_annulus_lame_native("t", target_size_mm=8.0))
     assert c["status"] == "ok", c
     assert c["rel_err"] is not None and c["rel_err"] < 0.08, c
 

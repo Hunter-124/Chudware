@@ -2736,14 +2736,8 @@ static int chudware_call_inner(const char* method, const char* params_json, char
           return emit_error(std::string("sim_mesh: option '") + key +
                                 "' was removed with the Polyhedral-FEA cutover",
                             out_json);
-      chudware::sim::MeshOptions options;
-      options.fineness = params.value("fineness", 0.5);
+      auto options = chudware::sim::mesh_options_from_study(params);
       options.order = params.value("order", params.value("mesh_order", 1));
-      options.target_size_mm = params.value("target_size_mm", 0.0);
-      options.min_size_mm = params.value("min_size_mm", 0.0);
-      options.max_size_mm = params.value("max_size_mm", 0.0);
-      options.learned_advisor = params.value("learned_advisor", false);
-      options.advisor_max_dof = params.value("advisor_max_dof", uint32_t{0});
       const auto mesh = chudware::sim::mesh_step_cached(step_path, options);
       const chudware::sim::MeshOut &r = *mesh;
       if (!r.ok)
@@ -2754,6 +2748,13 @@ static int chudware_call_inner(const char* method, const char* params_json, char
                        {"char_len_mm", r.char_len_mm},
                        {"n_nodes", r.n_nodes},
                        {"n_elems", r.n_elems},
+                       {"mesh_quality", {
+                           {"size_band", {{"applied_floor_mm", r.size_band_applied_floor_mm},
+                                          {"reason", r.size_band_reason}}},
+                           {"edge_mm", {{"min", r.edge_min_mm}, {"median", r.edge_median_mm},
+                                        {"max", r.edge_max_mm}}},
+                           {"char_len_mm", r.char_len_mm},
+                           {"thin_wall_ratio", r.thin_wall_ratio}}},
                        {"provenance", {{"governor", chudware::sim::mesh_governor_json(r)}}},
                        {"nodes_per_elem", r.nodes_per_elem},
                        {"min_tet_volume_mm3", r.min_tet_volume_mm3},
@@ -2792,14 +2793,7 @@ static int chudware_call_inner(const char* method, const char* params_json, char
                     std::vector<double> vol;
                     std::vector<int> tets;
                     int npe = 4;
-          chudware::sim::MeshOptions options;
-          options.fineness = study.value("fineness", 0.5);
-          options.order = study.value("mesh_order", study.value("order", 1));
-          options.target_size_mm = study.value("target_size_mm", 0.0);
-          options.min_size_mm = study.value("min_size_mm", 0.0);
-          options.max_size_mm = study.value("max_size_mm", 0.0);
-          options.learned_advisor = study.value("learned_advisor", false);
-          options.advisor_max_dof = study.value("advisor_max_dof", uint32_t{0});
+                    const auto options = chudware::sim::mesh_options_from_study(study);
           auto mo = chudware::sim::mesh_step_cached(step_path, options);
                     if (mo->ok) {
                         vol = mo->points;
@@ -2880,14 +2874,8 @@ static int chudware_call_inner(const char* method, const char* params_json, char
                     std::vector<double> vol;
                     std::vector<int> tets;
                     int npe = 4;
-          chudware::sim::MeshOptions options;
-          options.fineness = study.value("fineness", 0.5);
-          options.order = study.value("mesh_order", 2);
-          options.target_size_mm = study.value("target_size_mm", 0.0);
-          options.min_size_mm = study.value("min_size_mm", 0.0);
-          options.max_size_mm = study.value("max_size_mm", 0.0);
-          options.learned_advisor = study.value("learned_advisor", false);
-          options.advisor_max_dof = study.value("advisor_max_dof", uint32_t{0});
+                    auto options = chudware::sim::mesh_options_from_study(study);
+                    options.order = study.value("mesh_order", 2);
           auto mo = chudware::sim::mesh_step_cached(step_path, options);
                     if (mo->ok) {
                         vol = mo->points;

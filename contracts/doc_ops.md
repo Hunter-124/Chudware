@@ -529,3 +529,17 @@ For explicit-line angles, `doc_solve_mates` rebuild results, MCP `solve_mates`,
 and `describe_assembly` now expose `residual_dof` beside mechanism `dof`, matching
 motion frames. A grounded revolute has `dof:1` and `residual_dof:0` at its prescribed
 angle; the underlying mate solver continues to report actual residual nullity.
+
+## 14. Component suppression and transform ownership (2026-09-08)
+
+`set_suppressed {id, value}` addresses feature ids on part documents and component
+ids on assembly documents. `value:true` suppresses; `value:false` restores.
+Unknown or wrong-kind ids produce a named refusal identifying the document kind,
+not the former unqualified `no feature` error.
+
+An assembly `add_feature` of type `transform` addresses `body:<component-id>` and
+is applied as a placement mutation, composing a world-space rigid delta with the
+current placement. It never stores an inert part feature in the assembly tree.
+`copy:true` alone requests a new component. Missing components and mate-owned
+unfixed poses refuse atomically. See `feature_params.md` for body-reference and
+rotation semantics.

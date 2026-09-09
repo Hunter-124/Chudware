@@ -7066,6 +7066,13 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
                     refs.profile=[{"kind":"region","sketch":…}]; revolve's params.axis:"Z"
                     becomes refs.axis:"axis.z", and a revolve with no angle defaults to
                     a full 360° revolution.
+          transform moves its body by default; only copy:true duplicates. body names a
+                    live body-owner feature id on a part, or a component id on an assembly.
+                    Missing/consumed refs refuse, never target another body. rotate accepts
+                    [x,y,z] plus angle or {"axis":[x,y,z],"angle":degrees}. Assembly motion
+                    composes in world space with placement; mate-owned poses refuse.
+          set_suppressed targets feature ids on parts and component ids on assemblies;
+                    value:true suppresses, value:false restores. Wrong-kind ids refuse.
           any       feature TYPE synonyms are mapped (cube/cuboid/block -> box, cylindrical/
                     rod/tube -> cylinder, ball -> sphere, cut_<shape> -> <shape> with
                     mode:"cut", pocket -> extrude with mode:"cut"); an unknown type is

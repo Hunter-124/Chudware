@@ -621,7 +621,7 @@ bool default_feature_refine(const MeshOptions &options) {
 // Returns 0 when no usable pair exists (no tessellation, or an open shell whose
 // inward rays never reached an opposite wall).
 double thin_wall_ratio(const pm::pipeline::Model &model, const MeshOut &out,
-                       double h) {
+                       double h, double &min_wall_mm) {
   const int stride = out.nodes_per_elem == 10 ? 10 : 4;
   if (model.surface.vertices.empty() || out.points.empty() ||
       out.tets.empty() ||
@@ -682,6 +682,8 @@ double thin_wall_ratio(const pm::pipeline::Model &model, const MeshOut &out,
   for (size_t v = 0; v < thickness.size(); ++v) {
     if (!pm::geom::has_finite_thickness(thickness[v]))
       continue;
+    if (min_wall_mm <= 0.0 || thickness[v] < min_wall_mm)
+      min_wall_mm = thickness[v];
     const Eigen::Vector3d &p = model.surface.vertices[v];
     const std::array<long long, 3> home = cell_of(p.x(), p.y(), p.z());
     double local = std::numeric_limits<double>::infinity();
@@ -756,20 +758,13 @@ pm::mesh::SizeFieldFn local_size_field(const MeshOptions &options, double h,
   seed_band = std::max(band, h);
   if (request.max_depth_mm > 0.0)
     seed_band = std::min(seed_band, request.max_depth_mm);
-  // Clamped into the field's own legal band, at BOTH ends.
-  //   * below: the lattice cannot place under h/4; deliver_local_contract
-  //     bisects below that floor after the volume fill;
-  //   * above: a GradedSizing is `clamp(min_i(h_i + beta*d), h_min, h_max)` and
-  //     its constructor REQUIRES 0 < h_min <= h_max, so a local request coarser
-  //     than the background threw `GradedSizing: need 0 < h_min <= h_max` and
-  //     failed the whole mesh. That is not an error condition: a request to be
-  //     no coarser than 2.9 mm inside a 1.2 mm background is already satisfied
-  //     everywhere, so it collapses to the uniform background field and
-  //     deliver_local_contract finds nothing to bisect. Without this clamp the
-  //     box has no exit — every interface size at or below the background is
-  //     refused as undeliverable and every size above it mesh-FAILS, which is
-  //     exactly what closed O-22 (CONTACT_BLOCKED_2026-09-06b §4, attempt 3).
-  const double h_local = std::clamp(request.size_mm, h * 0.25, h);
+  // Keep the requested source size: raising it to the background h/4 also
+  // raises the entire grading band and starves the interface of fine parents.
+  // The fill clamps its own discrete levels; later LEB delivers finer sizes.
+  // A GradedSizing is `clamp(min_i(h_i + beta*d), h_min, h_max)` and
+  // its constructor requires 0 < h_min <= h_max. A coarser local request is
+  // already met by the background, so clamp only the upper bound.
+  const double h_local = std::min(request.size_mm, h);
   const std::vector<pm::adapt::SizeSource> sources =
       pm::adapt::point_size_sources(seeds, h_local);
   // beta is the gradient limit: the requested size may grow beta mm per mm away
@@ -3059,6 +3054,7 @@ int repair_degenerate_tets(pm::fea::NodalMesh &nodal, double h,
   return repaired;
 }
 
+
 // Fill at coarse element size `h`, optionally under a spatial size field h(x),
 // promote to tet10 when asked, and normalize into MeshOut. `feature_refine` is
 // an explicit caller decision rather than a re-derivation of the fineness gate,
@@ -3241,6 +3237,13 @@ bool build_mesh(const LoadedModel &loaded, const MeshOptions &options, double h,
   }
 
   out.char_len_mm = h;
+  out.size_band_applied_floor_mm = volume.size_floor;
+  if (volume.size_floor > 0.0)
+    out.size_band_reason = "cartesian_allocation_budget";
+  if (h > loaded.band.geometry_base * (1.0 + 1e-9)) {
+    out.size_band_applied_floor_mm = std::max(h, out.size_band_applied_floor_mm);
+    out.size_band_reason = loaded.band.memory_coarsened ? "memory_admission" : "size_band_or_lattice_recovery";
+  }
   out.n_nodes = static_cast<int>(nodal.nodes.size());
   out.n_elems = static_cast<int>(nodal.elements.size());
   out.nodes_per_elem = stride;
@@ -3428,7 +3431,7 @@ bool build_mesh(const LoadedModel &loaded, const MeshOptions &options, double h,
   }
   // Element sizes read off corner nodes only, so the mid-edge fallback above
   // cannot move this number.
-  out.thin_wall_ratio = thin_wall_ratio(loaded.model, out, h);
+  out.thin_wall_ratio = thin_wall_ratio(loaded.model, out, h, out.min_wall_mm);
   if (out.thin_wall_ratio > 0.0 && out.thin_wall_ratio < 1.0)
     append_note(out.note,
                 "thinnest wall spans under one element (thin_wall_ratio " +
@@ -3438,6 +3441,7 @@ bool build_mesh(const LoadedModel &loaded, const MeshOptions &options, double h,
     out.ok = false; // fill_quality set the diagnostic
     return false;
   }
+  detail::measure_edges(out);
   mesh_cache_note_generation();
   out.ok = true;
   return true;
@@ -3807,10 +3811,17 @@ bool mesh_background(const LoadedModel &loaded, const MeshOptions &options,
                      const MeshProbeBudget &budget, MeshOut &out) {
   report_progress("mesh_background_probe");
   auto probe_start = std::chrono::steady_clock::now();
-  if (!fill_with_recovery(loaded, options, /*h_start=*/0.0, out))
-    return false;
-  std::vector<MeshGovernorProbe> probes;
+  std::vector<MeshGovernorProbe> probes = options.governor_probes;
   chudware::governor::MeshCountModel count_model;
+  for (const auto& probe : probes)
+    count_model.observe(probe.h, probe.elems);
+  // The preceding leg already measured its anchor. Advance by a half-octave;
+  // rebuild an admitted coarse mesh only if these finer actual counts do not fit.
+  const double anchor = count_model.h;
+  const double first_h = anchor > 0.0
+      ? std::max(loaded.band.geometry_base, anchor / std::sqrt(2.0)) : 0.0;
+  if (!fill_with_recovery(loaded, options, first_h, out))
+    return false;
   auto record_probe = [&](const MeshOut& mesh, double prediction) {
     const double exponent = count_model.exponent;
     probes.push_back({mesh.char_len_mm, static_cast<uint64_t>(mesh.n_elems),
@@ -3822,18 +3833,60 @@ bool mesh_background(const LoadedModel &loaded, const MeshOptions &options,
     report_progress("mesh_background_probe_complete",
                     static_cast<std::size_t>(mesh.n_elems));
   };
-  record_probe(out, 0.0);
+  record_probe(out, count_model.h > 0.0 ? count_model.predict(out.char_len_mm) : 0.0);
   out.governor_probes = std::move(probes);
+  auto retain_previous_admitted = [&]() {
+    const auto limit = loaded.band.element_limit;
+    if (limit == 0 || static_cast<uint64_t>(out.n_elems) <= limit)
+      return;
+    const MeshGovernorProbe* previous = nullptr;
+    for (const auto& p : options.governor_probes)
+      if (p.elems <= limit && (!previous || p.h < previous->h))
+        previous = &p;
+    if (!previous) return; // No measured mesh can be honestly offered instead.
+    MeshOut fallback;
+    report_progress("mesh_background_probe");
+    const auto started = std::chrono::steady_clock::now();
+    if (!fill_with_recovery(loaded, options, previous->h, fallback)) {
+      append_note(out.note, "previous admitted mesh rebuild failed: " + fallback.error);
+      return;
+    }
+    // This rebuild revisits an existing measurement; it is not an extrapolation
+    // from the last rejected fine probe (which may be several octaves away).
+    out.governor_probes.push_back({
+        fallback.char_len_mm, static_cast<uint64_t>(fallback.n_elems),
+        chudware::governor::process_rss_bytes() / 1073741824.0,
+        0.0, 1.0,
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count(),
+        "admission_fallback"});
+    report_progress("mesh_background_probe_complete",
+                    static_cast<std::size_t>(fallback.n_elems));
+    if (static_cast<uint64_t>(fallback.n_elems) <= limit ||
+        fallback.n_elems < out.n_elems) {
+      fallback.governor_probes = std::move(out.governor_probes);
+      fallback.governor_skipped_probes = std::move(out.governor_skipped_probes);
+      append_note(fallback.note, out.note);
+      fallback.governor_reason = "memory_admission";
+      append_note(fallback.note,
+                  "memory_admission: finer measured meshes exceed the solve budget; "
+                  "delivering the finest previously admitted measurement");
+      out = std::move(fallback);
+    }
+  };
   const double honest = loaded.band.geometry_base;
-  if (!(honest > 0.0) || !(honest < loaded.band.base * (1.0 - 1e-9)))
+  if (!(honest > 0.0) || !(honest < out.char_len_mm * (1.0 - 1e-9))) {
+    out.governor_reason = out.char_len_mm < honest * (1.0 - 1e-9)
+        ? "feature_resolution" : "requested_size_admitted";
+    retain_previous_admitted();
     return true;
+  }
 
   // The bounding-box envelope is only a bootstrap, never evidence of the
   // requested mesh's cost. Measure every half-octave: feature-driven thin
   // fills need not be monotone, and one full-octave step can miss their turnover.
   // Previously a 14.72 mm probe was extrapolated directly to 2.84 mm, then that
   // forecast overruled even the ACTUAL count of the requested refill.
-  if (loaded.band.memory_coarsened && loaded.band.element_limit > 0) {
+  if ((loaded.band.memory_coarsened || anchor > 0.0) && loaded.band.element_limit > 0) {
     probes = std::move(out.governor_probes);
     const auto limit = loaded.band.element_limit;
     while (count_model.h > honest * (1.0 + 1e-9)) {
@@ -3843,12 +3896,16 @@ bool mesh_background(const LoadedModel &loaded, const MeshOptions &options,
       const double predicted_s = probes.back().elapsed_s *
           std::max(1.0, count_model.predict(next) /
                             static_cast<double>(probes.back().elems));
-      if (!budget.admit(next, predicted_s, out))
+      if (!budget.admit(next, predicted_s, out)) {
+        out.governor_reason = "probe_time_budget";
         break;
+      }
       report_progress("mesh_background_probe");
       probe_start = std::chrono::steady_clock::now();
       MeshOut candidate;
       if (!fill_with_recovery(loaded, options, next, candidate)) {
+        out.governor_reason = candidate.error.find("band floor") != std::string::npos
+            ? "size_band_floor" : "feature_resolution";
         append_note(out.note, "measured_octave governor: finer probe refused: " +
                                  candidate.error);
         break;
@@ -3861,13 +3918,21 @@ bool mesh_background(const LoadedModel &loaded, const MeshOptions &options,
       // the cheaper mesh for the solver's unchanged hard admission/refusal.
       const bool candidate_fits = static_cast<uint64_t>(candidate.n_elems) <= limit;
       const bool current_fits = static_cast<uint64_t>(out.n_elems) <= limit;
-      if (candidate_fits ||
+      if (!candidate_fits) out.governor_reason = "memory_admission";
+      if ((candidate_fits && (!current_fits || candidate.char_len_mm < out.char_len_mm)) ||
           (!current_fits && candidate.n_elems < out.n_elems))
         out = std::move(candidate);
       // Recovery can itself change h. Do not loop on a non-progressing fill.
-      if (!(count_model.h < previous_h * (1.0 - 1e-9))) break;
+      if (!(count_model.h < previous_h * (1.0 - 1e-9))) {
+        if (out.governor_reason.empty()) out.governor_reason = "feature_resolution";
+        break;
+      }
     }
     out.governor_probes = std::move(probes);
+    retain_previous_admitted();
+    if (out.char_len_mm <= honest * (1.0 + 1e-9))
+      out.governor_reason = out.char_len_mm < honest * (1.0 - 1e-9)
+          ? "feature_resolution" : "requested_size_admitted";
     char text[384];
     std::snprintf(text, sizeof(text),
                   "%smeasured_octave governor: requested %.4g mm, delivered %.4g mm; "
@@ -3944,7 +4009,8 @@ bool mesh_loaded_model(const LoadedModel &loaded, const MeshOptions &options,
       .learned_advisor = options.learned_advisor,
       .advisor_max_dof = options.advisor_max_dof,
       .declared_interfaces = options.declared_interfaces,
-      .local_refine = {}};
+      .local_refine = {},
+      .governor_probes = options.governor_probes};
   if (!mesh_background(loaded, background, budget, out)) {
     budget.stamp(out);
     return false;
@@ -3957,6 +4023,7 @@ bool mesh_loaded_model(const LoadedModel &loaded, const MeshOptions &options,
   }
   auto probes = std::move(out.governor_probes);
   auto skipped = std::move(out.governor_skipped_probes);
+  std::string governor_reason = std::move(out.governor_reason);
   std::string background_note = std::move(out.note);
   auto advisor = std::move(out.advisor);
   // Release the disposable background arrays before allocating the band fill.
@@ -3985,6 +4052,7 @@ bool mesh_loaded_model(const LoadedModel &loaded, const MeshOptions &options,
   }
   out.governor_probes = std::move(probes);
   out.governor_skipped_probes = std::move(skipped);
+  out.governor_reason = std::move(governor_reason);
   out.advisor = std::move(advisor);
   append_note(out.note, background_note);
   if (ok)
@@ -4241,6 +4309,19 @@ bool mesh_separate_solids(const std::vector<BodyGroup> &bodies,
     combined.debris_elems_dropped += part.debris_elems_dropped;
     combined.debris_volume_mm3 += part.debris_volume_mm3;
     combined.char_len_mm = std::min(combined.char_len_mm, part.char_len_mm);
+    if (part.size_band_applied_floor_mm > combined.size_band_applied_floor_mm) {
+      combined.size_band_applied_floor_mm = part.size_band_applied_floor_mm;
+      combined.size_band_reason = part.size_band_reason;
+    }
+    if (part.thin_wall_ratio > 0.0 &&
+        (combined.thin_wall_ratio <= 0.0 || part.thin_wall_ratio < combined.thin_wall_ratio))
+      combined.thin_wall_ratio = part.thin_wall_ratio;
+    if (part.min_wall_mm > 0.0 &&
+        (combined.min_wall_mm <= 0.0 || part.min_wall_mm < combined.min_wall_mm))
+      combined.min_wall_mm = part.min_wall_mm;
+    if (!part.governor_reason.empty() &&
+        part.governor_reason != "requested_size_admitted")
+      combined.governor_reason = part.governor_reason;
     combined.governor_probes.insert(combined.governor_probes.end(),
                                    part.governor_probes.begin(),
                                    part.governor_probes.end());
@@ -4414,6 +4495,7 @@ MeshOut mesh_step(const std::string &step_path, const MeshOptions &options) {
       span.volume_mm3 = solids.empty() ? 0.0 : solid_volume_mm3(solids[0]);
       out.bodies.push_back(std::move(span));
     }
+    if (out.ok && solids.size() > 1) detail::measure_edges(out);
     if (!out.ok && !out.error.starts_with("polymesh mesher failed: "))
       out.error = "polymesh mesher failed: " + out.error;
     return out;

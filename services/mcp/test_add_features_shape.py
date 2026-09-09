@@ -4090,3 +4090,119 @@ def test_a_pose_the_rebuild_discarded_is_reported_not_claimed():
     assert M._asm_transform_rejects(
         [{"op": "asm_edit_component", "id": "k2", "transform": _T111}],
         {"components": [{"id": "k2", "transform": _T111}]}) == []
+
+
+@pytest.fixture
+def transform_part():
+    if not M.cb.available():
+        pytest.skip("native engine unavailable")
+    doc = M.cb.call("doc_new", {"kind": "part", "name": "transform_" + uuid.uuid4().hex})["doc_id"]
+    result = M.cb.call("doc_apply_ops", {"doc_id": doc, "ops": [
+        M.cb.feat("box", f"Body{i}", {"length": 10, "width": 10, "height": 10,
+                                    "at": [100 * i, 0, 0], "mode": "new"})
+        for i in range(3)]})
+    yield doc, result["id_map"]["$1"]
+    M.cb.call("doc_close", {"doc_id": doc})
+
+
+def _transform_apply(doc, feature):
+    from services.mcp.test_cad_tools import _call
+    result, _ = _call("add_features", {"doc_id": doc, "ops": [feature]})
+    return result
+
+
+def test_transform_nested_rotation_moves_only_middle_body(transform_part):
+    doc, body = transform_part
+    result = _transform_apply(doc, {"type": "transform", "body": body, "params": {
+        "translate": [1820, 0, 1090], "rotate": {"axis": [0, 1, 0], "angle": 180}}})
+    assert result["ok"] and result["body_count"] == 3, result
+    mass = M.cb.call("eval_mass", {"doc_id": doc})
+    bodies = sorted(mass["bodies"], key=lambda b: b["com"][0])
+    for actual, expected in zip(bodies, [[0, 0, 0], [200, 0, 0], [1720, 0, 1090]]):
+        assert actual["com"] == pytest.approx(expected, abs=1e-8)
+    assert [b["volume_mm3"] for b in bodies] == pytest.approx([1000] * 3)
+    copied = _transform_apply(doc, {"type": "transform", "body": body, "params": {
+        "translate": [0, 0, 50], "copy": True}})
+    assert copied["ok"] and copied["body_count"] == 4, copied
+    assert M.cb.call("eval_mass", {"doc_id": doc})["volume_mm3"] == pytest.approx(4000)
+
+
+@pytest.mark.parametrize("body", ["missing-body", {"unrecognized": "body"}])
+def test_transform_unresolved_body_is_atomic_refusal(transform_part, body):
+    doc, _ = transform_part
+    result = _transform_apply(doc, {"type": "transform", "body": body,
+                                  "params": {"translate": [100, 0, 0]}})
+    assert not result["ok"], result
+    assert "body" in json.dumps(result).lower()
+    mass = M.cb.call("eval_mass", {"doc_id": doc})
+    assert len(mass["bodies"]) == 3
+    assert sorted(b["com"][0] for b in mass["bodies"]) == pytest.approx([0, 100, 200])
+
+
+def test_transform_consumed_body_never_resurrects_a_copy(transform_part):
+    doc, body = transform_part
+    # A later boss consumes the original feature, unlike a transform lineage.
+    M.cb.call("doc_apply_ops", {"doc_id": doc, "ops": [
+        M.cb.feat("box", "Boss", {"length": 10, "width": 10, "height": 10,
+                                "at": [105, 0, 0], "mode": "add"})]})
+    before = M.cb.call("eval_mass", {"doc_id": doc})
+    result = _transform_apply(doc, {"type": "transform", "body": body,
+                                  "params": {"translate": [0, 0, 100]}})
+    assert not result["ok"], result
+    assert "consumed" in json.dumps(result) and body in json.dumps(result)
+    after = M.cb.call("eval_mass", {"doc_id": doc})
+    assert len(after["bodies"]) == len(before["bodies"]) == 3
+    assert after["volume_mm3"] == pytest.approx(before["volume_mm3"])
+
+
+def test_assembly_transform_and_suppression_use_component_ids(transform_part, tmp_path):
+    doc, feature = transform_part
+    source = str(tmp_path / "component.step")
+    M.cb.call("doc_export_step", {"doc_id": doc, "path": source})
+    assembly = M.cb.call("doc_new", {"kind": "assembly", "name": uuid.uuid4().hex})["doc_id"]
+    try:
+        inserted = M.cb.call("doc_apply_ops", {"doc_id": assembly, "ops": [{
+            "op": "asm_insert_component", "source": {"path": source}, "fixed": False,
+            "transform": [1, 0, 0, 10, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1]}]})
+        component = inserted["id_map"]["$0"]
+        result = _transform_apply(assembly, {"type": "transform", "body": component,
+            "params": {"translate": [20, 0, 30], "rotate": {"axis": [0, 0, 1], "angle": 90}}})
+        assert result["ok"], result
+        tree = M.cb.call("doc_tree", {"doc_id": assembly})["tree"]
+        assert len(tree["components"]) == 1
+        assert [tree["components"][0]["transform"][i] for i in (3, 7, 11)] == pytest.approx([20, 10, 30])
+        copied = _transform_apply(assembly, {"type": "transform", "body": component,
+            "params": {"translate": [0, 0, 100], "copy": True}})
+        assert copied["ok"], copied
+        assert M.cb.call("eval_mass", {"doc_id": assembly})["volume_mm3"] == pytest.approx(6000)
+        copy_tree = M.cb.call("doc_tree", {"doc_id": assembly})["tree"]
+        other = next(c["id"] for c in copy_tree["components"] if c["id"] != component)
+        M.cb.call("doc_apply_ops", {"doc_id": assembly, "ops": [{
+            "op": "asm_delete_component", "id": other}]})
+        result = _transform_apply(assembly, {"op": "set_suppressed", "id": component, "value": True})
+        assert result["ok"], result
+        assert M.cb.call("doc_tree", {"doc_id": assembly})["tree"]["components"][0]["suppressed"]
+        assert result["body_count"] == 0, result
+        restored = _transform_apply(assembly, {"op": "set_suppressed", "id": component, "value": False})
+        assert restored["ok"], restored
+        assert M.cb.call("eval_mass", {"doc_id": assembly})["volume_mm3"] == pytest.approx(3000)
+        anchor = M.cb.call("doc_apply_ops", {"doc_id": assembly, "ops": [{
+            "op": "asm_insert_component", "source": {"path": source}, "fixed": True}]})["id_map"]["$0"]
+        M.cb.call("doc_apply_ops", {"doc_id": assembly, "ops": [
+            {"op": "asm_edit_component", "id": component, "fixed": False}]})
+        face = M.cb.call("doc_query", {"doc_id": doc, "query": {"of": "face", "side": "top"}})["matches"][0]
+        M.cb.call("doc_apply_ops", {"doc_id": assembly, "ops": [{
+            "op": "asm_add_mate", "mate": {"type": "coincident", "refs": [
+                {"component": component, "selector": face},
+                {"component": anchor, "selector": face}]}}]})
+        refused = _transform_apply(assembly, {"type": "transform", "body": component,
+            "params": {"translate": [100, 0, 0]}})
+        assert not refused["ok"] and "mate" in json.dumps(refused).lower(), refused
+        missing = _transform_apply(assembly, {"type": "transform", "body": "missing-component",
+            "params": {"translate": [100, 0, 0]}})
+        assert not missing["ok"] and "missing-component" in json.dumps(missing), missing
+        for target_doc, wrong_id in ((assembly, feature), (doc, component)):
+            refused = _transform_apply(target_doc, {"op": "set_suppressed", "id": wrong_id, "value": True})
+            assert not refused["ok"] and wrong_id in json.dumps(refused), refused
+    finally:
+        M.cb.call("doc_close", {"doc_id": assembly})

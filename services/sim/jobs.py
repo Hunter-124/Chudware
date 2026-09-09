@@ -823,6 +823,12 @@ def _reconcile(row: sqlite3.Row) -> dict:
             out["error"] = row["error"]
         return out
 
+    # Observe exit before reading the artifact. The worker publishes its final
+    # partial and result before exiting; a missing result read made BEFORE an
+    # exit check can otherwise turn a successful completion into a permanent failure.
+    alive = state != DONE and pid_alive(row["pid"], row["proc_key"])
+    if not alive:
+        _reap(job_id)
     finished = _read_json(d / "result.json")
     if state == DONE:
         if row["cancel_requested"]:
@@ -860,7 +866,7 @@ def _reconcile(row: sqlite3.Row) -> dict:
         _reap(job_id)
         return out
 
-    if not pid_alive(row["pid"], row["proc_key"]):
+    if not alive:
         if row["cancel_requested"]:
             state, error = CANCELLED, "cancelled by sim_cancel"
         else:

@@ -3714,9 +3714,23 @@ void apply_one(json& doc, const json& op, std::size_t idx, IdGen& gen, json& id_
     else if (k == "delete_feature")      op_delete_feature(doc, op);
     else if (k == "reorder_feature")     op_reorder_feature(doc, op);
     else if (k == "set_suppressed") {
-        json* f = find_feature(doc, op.value("id", std::string()));
-        if (!f) throw OpError("invalid_op", "set_suppressed: no feature");
-        (*f)["suppressed"] = op.value("value", false);
+        const std::string id = op.value("id", std::string());
+        if (doc.value("schema", std::string()) == "aicad.asm/1") {
+            bool found = false;
+            for (json& c : doc["components"])
+                if (c.value("id", std::string()) == id) {
+                    c["suppressed"] = op.value("value", false);
+                    found = true;
+                    break;
+                }
+            if (!found) throw OpError("invalid_op", "set_suppressed: component '" + id +
+                "' not found in assembly; feature ids require a part document");
+        } else {
+            json* f = find_feature(doc, id);
+            if (!f) throw OpError("invalid_op", "set_suppressed: feature '" + id +
+                "' not found in part; component ids require an assembly document");
+            (*f)["suppressed"] = op.value("value", false);
+        }
     } else if (k == "set_folder") {
         // FeatureManager folder grouping ("Add Folder" / "Name & group" / "Remove from folder").
         // `folder` is a plain display-only tag on the feature (never affects geometry or rebuild);
@@ -4527,22 +4541,86 @@ std::vector<std::string> touched_sketch_fids(const json& ops, const json& id_map
     }
     return out;
 }
+// Assembly transforms are placement mutations, never inert part features.
+json assembly_transform_op(const json& doc, const json& op, const json& id_map) {
+    if (op.value("op", std::string()) != "add_feature") return op;
+    const json& feature = op.contains("feature") ? op["feature"] : op;
+    if (feature.value("type", std::string()) != "transform") return op;
+    json p = feature;
+    if (feature.contains("params") && feature["params"].is_object())
+        p.update(feature["params"]);
+    if (feature.contains("refs") && feature["refs"].contains("body"))
+        p["body"] = feature["refs"]["body"];
+    json ref = p.value("body", json());
+    if (ref.is_object()) ref = ref.value("component", ref.value("owner_feature", json()));
+    if (!ref.is_string())
+        throw OpError("invalid_op", "transform: assembly body must name a component id",
+                      {{"reason", "component_not_found"}, {"body", ref}});
+    std::string id = ref.get<std::string>();
+    if (id_map.contains(id) && id_map[id].is_string()) id = id_map[id];
+    const json* component = nullptr;
+    for (const json& c : doc["components"])
+        if (c.value("id", std::string()) == id) { component = &c; break; }
+    if (!component)
+        throw OpError("invalid_op", "transform: component '" + id + "' not found in assembly",
+                      {{"reason", "component_not_found"}, {"component", id}});
+    if (!component->value("fixed", false) && component_is_mated(doc, id))
+        throw OpError("invalid_op", "transform: component '" + id +
+            "' pose is owned by mates; suppress its mates or ground it before moving",
+            {{"reason", "component_is_mated"}, {"component", id}});
+    auto vector = [](const json& value, const Eigen::Vector3d& fallback) -> Eigen::Vector3d {
+        if (value.is_null()) return fallback;
+        if (!value.is_array() || value.size() != 3)
+            throw OpError("invalid_op", "transform: expected a three-number vector");
+        return {value.at(0).get<double>(), value.at(1).get<double>(), value.at(2).get<double>()};
+    };
+    const json rotation = p.value("rotate", json());
+    const double angle = rotation.is_object() ? rotation.value("angle", 0.0) : p.value("angle", 0.0);
+    Eigen::Vector3d axis = vector(rotation.is_object() ? rotation.value("axis", json())
+        : rotation.is_null() ? p.value("axis", json()) : rotation, Eigen::Vector3d::UnitZ());
+    if (std::abs(angle) > 1e-9 && axis.norm() < 1e-12)
+        throw OpError("invalid_op", "transform: rotate axis has zero length");
+    const Eigen::Vector3d translation = vector(p.value("translate", json()), Eigen::Vector3d::Zero());
+    const Eigen::Vector3d pivot = vector(p.value("pivot", json()), Eigen::Vector3d::Zero());
+    Eigen::Matrix4d delta = Eigen::Matrix4d::Identity(), base = Eigen::Matrix4d::Identity();
+    if (std::abs(angle) > 1e-9)
+        delta.topLeftCorner<3, 3>() = Eigen::AngleAxisd(angle * M_PI / 180.0, axis.normalized()).toRotationMatrix();
+    delta.topRightCorner<3, 1>() = translation + pivot - delta.topLeftCorner<3, 3>() * pivot;
+    if (component->contains("transform"))
+        for (int r = 0; r < 4; ++r)
+            for (int c = 0; c < 4; ++c) base(r, c) = component->at("transform").at(r * 4 + c);
+    const Eigen::Matrix4d moved = delta * base;
+    json transform = json::array();
+    for (int r = 0; r < 4; ++r)
+        for (int c = 0; c < 4; ++c) transform.push_back(moved(r, c));
+    if (p.value("copy", false))
+        return {{"op", "asm_insert_component"}, {"source", component->at("source")},
+                {"name", feature.value("name", component->value("name", id))},
+                {"fixed", component->value("fixed", false)}, {"transform", transform}};
+    return {{"op", "asm_edit_component"}, {"id", id}, {"transform", transform}};
+}
+
 
 // Apply an op batch to a session that the caller already holds g_mtx for (the shared
 // transactional core of doc_apply_ops; doc_import_file reuses it).
-json apply_ops_locked(Session& s, long base_revision, const json& ops, bool coalesce) {
+json apply_ops_locked(Session& s, long base_revision, const json& input_ops, bool coalesce) {
     if (base_revision >= 0 && base_revision != s.revision)
         throw OpError("stale_revision",
                       "base_revision " + std::to_string(base_revision) + " != current " +
                           std::to_string(s.revision),
                       {{"current_revision", s.revision}});
+    json assembly_ops;
+    if (s.is_assembly()) assembly_ops = input_ops;
+    const json& ops = s.is_assembly() ? assembly_ops : input_ops;
     if (!ops.is_array())
         throw OpError("invalid_op", "ops must be a list", {{"index", -1}, {"reason", "ops not a list"}});
     json working = s.doc;
     json id_map = json::object();
     IdGen gen(working);
-    for (std::size_t i = 0; i < ops.size(); ++i)
+    for (std::size_t i = 0; i < ops.size(); ++i) {
+        if (s.is_assembly()) assembly_ops[i] = assembly_transform_op(working, ops[i], id_map);
         apply_one(working, ops[i], i, gen, id_map);
+    }
 
     // T-W2 auto-coincident: on a sketch-mutating batch, pin touching endpoints (within
     // tolerance) as coincident BEFORE validation/compile, so touching-corner profiles

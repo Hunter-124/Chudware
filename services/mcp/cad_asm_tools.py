@@ -222,6 +222,10 @@ def register_cad_asm_tools(mcp: FastMCP) -> None:
         Returns the new component id ("k1", "k2", ...) for use in asm_mate refs, plus
         `placement_source` ("transform" when you passed at/rotate, "mate" once a mate on this
         component solves). Provenance is saved inside the .step+ document and survives reopen.
+        Use add_features with a transform feature and body:<component_id> to compose a
+        measured world-space move with its placement (copy:true alone duplicates).
+        Mate-owned poses refuse. set_suppressed with that component id suppresses/restores
+        it; feature ids are only valid suppression targets on part documents.
 
         `at`/`rotate` ARE NOT A GUESS. For INDEPENDENTLY-SOURCED parts (a wheel from one
         vendor onto a frame from another) a pose must come from ONE of:

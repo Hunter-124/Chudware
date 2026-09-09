@@ -1540,3 +1540,34 @@ has minimum Jacobian `0.02910736` after repair; the coarse-mesh bulk-quality
 defect remains open. Local-region floors, size-delivery contracts, and CAD
 fidelity tolerances are unchanged. Curved-rim feature-segment fidelity remains
 unresolved; no denser volume field or regressing rim-sampling patch is retained.
+
+## Live mesh probes and inactivity admission (2026-09-09)
+
+Native `sim.progress` events during background probes and interface-band fills
+add `probe:{h_mm,elements_so_far,cells_done,cells_total,sub_phase}`. `h_mm` is
+the current probe's actual requested size in document millimetres. Element
+counts come from the live tetrahedra, including topology changes; they are not
+forecasts and need not increase during quality repair. Before any tetrahedra
+exist, zero is legitimate; after creation, an active fill must not report a
+stale pre-fill zero. `elements` carries the current native count.
+
+The fill observer reports phase transitions immediately and polls working
+loops on a four-second wall-clock throttle (the five-second progress contract).
+`sub_phase` distinguishes classification, background lattice, projection,
+numbered LEB waves, numbered quality passes, and interface-band work.
+`cells_done/cells_total` count actual work in that phase: lattice cells during
+filling, then nodes/tetrahedra/candidates during projection and repair.
+Projection may advance these counters without creating any additional elements.
+Individual synchronous CAD/kernel calls cannot be interrupted by the observer;
+no timer invents computational advancement while one is blocked.
+
+The existing simulation worker atomically publishes this probe in `partial.json`
+and logs the same record to `worker.log`, retaining its 30-second heartbeat when
+native events are absent. An unchanged callback or heartbeat does not reset
+the advancement clock. `get_job`, `sim_status`, and both `sim_results` modes
+expose `progress.last_advance_s` (seconds since counters or phase last changed)
+and `progress.stalled`. The age is recomputed on every poll even if the worker
+has stopped publishing. `stalled` is true only for a running job whose age is
+strictly greater than 120 seconds; terminal jobs are never stalled.
+For lack of progress, **cancel only when `stalled` is true**. A long-running
+probe with advancing work counters is not a hung job.

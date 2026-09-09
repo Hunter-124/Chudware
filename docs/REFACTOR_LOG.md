@@ -3500,3 +3500,65 @@ segments`. Builds used ninja -j2 with 12G cgroups in `core/build-fix` and the
 approved upstream build; native runs used 10G cgroups. The mission's
 `core/build-occt-linux` tree, source STEP+, host daemon and user changes were
 not touched.
+
+## 2026-09-09 — live mesh probe counters and counter-based inactivity
+
+The worker was heartbeating the last native phase's zero element count while
+`volume_mesh` spent minutes inside a healthy fill. Polyhedral-FEA now accepts
+an optional `FillOptions.on_progress(const FillProgress&)` observer and polls
+actual lattice, LEB, projection and quality work through `mesh/fill_progress.hpp`;
+OpenMP classification remains parallel and only its calling thread publishes.
+CAD `core/sim/mesher.cpp` forwards live probe size/count/work/sub-phase through
+`core/sim/progress.h` and the existing FEA/C event sink; `core/api/libchudware.cpp`
+also brackets mesh-only calls. Local interface repair, pipeline exterior/ship
+checks and quadratic boundary projection report their own work. The first
+real-file smoke exposed a 212-second false inactivity age after fill, where
+quadratic projection reused the last collapse counter; the final implementation
+instruments those actual midpoint and quality loops rather than refreshing the
+clock on unchanged events.
+
+`services/sim/job_worker.py` preserves native probes in atomic partial/log
+snapshots and retains the existing 30-second fallback heartbeat. `jobs.py`
+computes elapsed time since actual counter/phase advancement at every poll;
+unchanged callbacks and heartbeats do not refresh it. MCP `get_job` and both
+`sim_results` modes expose `progress.last_advance_s` and `stalled` (running and
+strictly over 120 seconds). Simulation tool guidance says to cancel for
+inactivity only when stalled, not because a probe is long.
+`services/sim/test_jobs.py` now observes a real exported box's durable positive
+background-lattice record before solve completion, and
+`services/mcp/test_cad_sim_tools.py` exercises the injected-clock threshold,
+silent-worker aging, unchanged callbacks, cell-only advancement and terminal
+behavior. Obsolete assertions pinning cancellation-guidance wording were removed.
+The schema is appended to `contracts/worker_rpc.md`.
+
+Verification used only `core/build-fix`, ninja `-j2`, and 10G systemd cgroups:
+
+```text
+governor  Passed   0.01 sec
+mesh      Passed 102.98 sec
+100% tests passed, 0 tests failed out of 2
+services/sim/test_jobs.py + services/mcp/test_cad_sim_tools.py:
+138 passed in 234.26s
+```
+
+The requested WHEEL-LATERAL geometry directory was empty. The approved released
+source `Engineering/CAD_Merged_v4/CD-210-01C_Wheel_Slice_t4p7625_w60_2026-09-07.step+`
+(SHA256 `3d1ee64e26afd26c81620f5b0cbde482e8f2c860125d082f16b14fa7d1442086`)
+was copied to `/tmp/probe-heartbeat-wheel`, opened locally and exported to STEP.
+The final `sim_mesh` run delivered **844,478 tet10 / 1,288,768 nodes at h=2.84 mm**
+without coarsening. `provenance.governor` reports `requested_size_admitted`,
+`measured_probe:{h:2.84,elems:844478,elapsed_s:1671.573936688,rss_gb:0.8564262390136719}`,
+and `estimate_gb:93.63321647699922`. This is mesh-only success, not solve-memory
+admission. Both real-file runs delivered identical mesh counts and quality.
+
+The final log contains 512 real progress records; maximum observed counter age
+was 8 seconds, so no healthy interval would be labelled stalled. Instrumented
+fill/projection loops published about every four seconds (largest such gap
+4.055 seconds); the largest whole-pipeline gap was 6.323 seconds at the
+post-fill region-mapping/validation boundary. Individual synchronous CAD calls,
+allocation and sorts remain non-interruptible, not fabricated work.
+`worker.log`, `partial.json`, `result.json`, `cadence.json` and the first-run
+comparison artifacts remain under `/tmp/probe-heartbeat-wheel`; the throwaway
+driver was removed. The live host daemon, mission build tree and source STEP+
+were untouched. The CAD build depends on the corresponding upstream FillOptions
+API/header changes; fetched-upstream release pins must include those changes.

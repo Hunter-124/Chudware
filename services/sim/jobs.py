@@ -75,6 +75,11 @@ CANCELLED = "cancelled"
 
 TERMINAL = (DONE, FAILED, CANCELLED)
 
+# Monotonic time is shared across local worker/poller processes. Keep it injectable
+# so stall thresholds can be exercised without waiting or changing wall time.
+_clock = time.monotonic
+_STALL_S = 120.0
+
 # How long a finished job's row + spool directory are kept so a LATER turn can still
 # collect it. Generous by default: the whole point is surviving turn boundaries.
 _TTL_S = float(os.environ.get("CHUDWARE_SIM_JOB_TTL_S", "86400") or 86400)
@@ -923,7 +928,15 @@ def status(job_id: str) -> dict:
     st["elapsed_s"] = round(float(end) - float(started), 3)
     prog = _read_json(job_dir(job_id) / "partial.json")
     if prog:
-        st["progress"] = {k: v for k, v in prog.items() if k != "partial"}
+        progress = {k: v for k, v in prog.items()
+                    if k not in ("partial", "_last_advance_monotonic")}
+        last_advance = prog.get("_last_advance_monotonic")
+        age = float(progress.get("last_advance_s", 0.0))
+        if last_advance is not None:
+            age = max(0.0, _clock() - float(last_advance))
+        progress["last_advance_s"] = round(age, 3)
+        progress["stalled"] = st["state"] == RUNNING and age > _STALL_S
+        st["progress"] = progress
     st["ok"] = st["state"] not in (FAILED, CANCELLED)
     return st
 

@@ -8129,6 +8129,11 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
         Returns {status: "running"|"done"|"error"}; when done, the solve `result` is included.
         Polling a long solve this way never trips the per-call transport timeout that would
         otherwise drop the whole session.
+        For durable simulation jobs, progress.probe contains the live fill counters.
+        progress.last_advance_s is time since counters or phase last changed, not
+        time since a heartbeat. progress.stalled is true only while running with
+        more than 120 seconds without advancement. Cancel for lack of progress
+        only when stalled is true, not for a healthy long mesh probe.
         """
         # The process-local mapping lookup is the only work allowed under _JOB_LOCK.
         # Durable lookup can touch SQLite; a DONE snapshot can additionally wait for a

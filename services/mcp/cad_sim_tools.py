@@ -2885,9 +2885,12 @@ def _started(job: dict, doc_id) -> dict:
             "solving in a SEPARATE PROCESS — this call did not wait. The job is "
             "persisted on disk, so it survives an MCP restart and can be collected "
             f"in a later turn. Poll get_job('{jid}') or sim_status('{jid}'); "
+            "progress.last_advance_s measures counter/phase inactivity, not heartbeat age. "
+            "Cancel for lack of progress only when progress.stalled is true "
+            "(running with >120s unchanged counters), not during a healthy long probe. "
             f"sim_cancel('{jid}') really terminates the solver."
         ),
-        "next_actions": [f"get_job('{jid}')", f"sim_cancel('{jid}')"],
+        "next_actions": [f"get_job('{jid}')"],
     }
 
 
@@ -4587,6 +4590,10 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
         The state is reconciled against the OPERATING SYSTEM, not just a stored flag: a
         worker that died without writing a result is reported as `failed` with its last
         output, never as `running` and never as `done`.
+        progress.probe preserves native live fill counters; last_advance_s is time
+        since counters/phase advanced, independent of 30-second heartbeats.
+        stalled means running with >120 seconds without advancement. Cancel for
+        lack of progress only when stalled is true, not for healthy long probes.
         """
         try:
             st = simjobs.status(job_id)
@@ -4602,11 +4609,14 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
                 st["next_actions"] = [
                     f"sim_status('{job_id}')",
                     f"sim_results('{job_id}', partial=True)",
-                    f"sim_cancel('{job_id}')",
                 ]
+                if st.get("progress", {}).get("stalled"):
+                    st["next_actions"].append(f"sim_cancel('{job_id}')")
                 st["note"] = (
                     "still solving — nothing has converged yet; sim_results with "
-                    "partial=True returns the last snapshot, clearly marked partial"
+                    "partial=True returns the last snapshot, clearly marked partial. "
+                    "Cancel for lack of progress only when progress.stalled is true, "
+                    "not for a healthy long probe."
                 )
             return _dumps(st)
         except Exception as e:  # noqa: BLE001
@@ -4621,6 +4631,8 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
         whole process group, which catches solver subprocesses) is actually gone. If the
         process survives, this returns ok:false and says the solver is STILL RUNNING rather
         than flipping a flag and letting you believe the CPU was freed.
+        For lack of progress, cancel only when progress.stalled is true (>120s
+        without counter/phase advancement), not merely because a probe is long.
         """
         try:
             return _dumps(simjobs.cancel(job_id))
@@ -4639,6 +4651,9 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
         `partial: true, converged: false`. A phase-only record can have no percentage or
         field values: it describes work in flight, not a partial solution. If the stage
         published nothing, this says so instead of inventing a snapshot.
+        progress carries live probe counters, last_advance_s and stalled, recomputed
+        at polling time even if the worker is silent. Cancel for lack of progress
+        only when stalled is true, not for a healthy long probe.
 
         The collect stage runs exactly ONCE per job however many times it is polled and from
         however many processes, so a solved study is written into the document once.
@@ -4649,7 +4664,8 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
             if state == "unknown":
                 return _dumps(st)
             if partial:
-                snap = simjobs.partial(job_id)
+                progress = st.get("progress")
+                snap = {"partial": True, **progress} if progress else None
                 base = {
                     "job_id": job_id,
                     "state": state,
@@ -4657,6 +4673,8 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
                     "converged": False,
                     "elapsed_s": st.get("elapsed_s"),
                 }
+                if progress:
+                    base["progress"] = progress
                 if not snap:
                     base.update(
                         ok=False,
@@ -4691,6 +4709,8 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
                     "error": f"job {job_id} is {state} — there are no converged results to "
                     "return. Refusing to answer with a partial or absent solution.",
                 }
+                if st.get("progress"):
+                    out["progress"] = st["progress"]
                 if state in ("running", "queued"):
                     out["hint"] = (
                         f"poll sim_status('{job_id}'), or "
@@ -4719,6 +4739,8 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
                 converged=bool(out.get("ok")),
                 elapsed_s=st.get("elapsed_s"),
             )
+            if st.get("progress"):
+                out["progress"] = st["progress"]
             return _dumps(out)
         except Exception as e:  # noqa: BLE001
             return _err(e)

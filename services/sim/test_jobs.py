@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import signal
+import shutil
 import subprocess
 import sys
 import time
@@ -359,36 +360,44 @@ def test_unserializable_collect_result_is_returned_not_lost(isolated_registry):
     assert J.collected(job_id) is None
 
 
-def test_fill_heartbeat_retains_measured_progress(isolated_registry, capsys):
-    """An opaque native fill must not silence or invent progress between callbacks."""
+def test_fill_heartbeat_retains_measured_progress(isolated_registry, capsys, monkeypatch):
+    """Heartbeats publish live counters without claiming that work advanced."""
     job_id = "sim-progress-fill"
     _insert_job(job_id, state=J.FAILED)
     now = [0.0]
+    monkeypatch.setattr(J, "_clock", lambda: now[0])
     progress = job_worker._Progress(J.job_dir(job_id), job_id, clock=lambda: now[0])
-    progress.emit({"phase": "governor_probe"})
-    assert J.status(job_id)["progress"]["elements"] is None
+    progress.emit({"phase": "mesh_background_probe", "elements": 0})
+    assert J.status(job_id)["progress"]["elements"] == 0
     now[0] = 2.0
-    progress.emit({"phase": "background_fill", "elements": 128})
+    probe = {"h_mm": 4.0, "cells_done": 8, "cells_total": 64,
+             "elements_so_far": 128, "sub_phase": "fill"}
+    progress.emit({"phase": "mesh_background_probe", "elements": 128, "probe": probe})
     now[0] = 3.0
-    progress.emit({"phase": "interface_band_fill"})
+    progress.emit({"phase": "mesh_interface_band_fill", "elements": None})
     for instant in (32.9, 33.0, 63.0, 93.0):
         now[0] = instant
         progress.heartbeat()
     observed = J.status(job_id)["progress"]
-    assert observed["phase"] == "interface_band_fill"
+    assert observed["phase"] == "mesh_interface_band_fill"
     assert observed["elements"] == 128
+    assert observed["probe"] == probe
+    assert observed["last_advance_s"] == 90.0
+    assert observed["stalled"] is False  # terminal jobs never stall
     assert observed["elapsed_s"] == 93.0
     assert observed["converged"] is False
     lines = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
     assert [row["elapsed_s"] for row in lines] == [0.0, 2.0, 3.0, 33.0, 63.0, 93.0]
     assert max(b["elapsed_s"] - a["elapsed_s"] for a, b in zip(lines, lines[1:])) <= 60
-    assert all(row["phase"] == "interface_band_fill" and row["elements"] == 128
+    assert all(row["phase"] == "mesh_interface_band_fill" and row["elements"] == 128
                for row in lines[2:])
-    assert {k: v for k, v in lines[-1].items() if k != "partial"} == observed
+    assert {k: v for k, v in lines[-1].items()
+            if k not in ("partial", "_last_advance_monotonic")} == {
+                k: v for k, v in observed.items() if k != "stalled"}
 
 
 @pytest.mark.parametrize("state", [J.RUNNING, J.FAILED])
-def test_get_job_keeps_last_phase_and_snapshot_time(isolated_registry, state):
+def test_get_job_keeps_last_phase_and_snapshot_time(isolated_registry, state, monkeypatch):
     from mcp.server.fastmcp import FastMCP
     from services.mcp import cad_doc_tools
 
@@ -396,6 +405,7 @@ def test_get_job_keeps_last_phase_and_snapshot_time(isolated_registry, state):
     _insert_job(job_id, state=state, pid=os.getpid())
     J._set(job_id, proc_key=J._proc_key(os.getpid()))
     progress = job_worker._Progress(J.job_dir(job_id), job_id, clock=lambda: 0.0)
+    monkeypatch.setattr(J, "_clock", lambda: 15.0)
     progress.emit({"phase": "contact_preflight", "elements": 48})
     mcp = FastMCP("test-last-sim-phase")
     cad_doc_tools.register_cad_doc_tools(mcp)
@@ -404,6 +414,8 @@ def test_get_job_keeps_last_phase_and_snapshot_time(isolated_registry, state):
     assert result["progress"]["phase"] == "contact_preflight"
     assert result["progress"]["elements"] == 48
     assert result["progress"]["elapsed_s"] == 0.0
+    assert result["progress"]["last_advance_s"] == 15.0
+    assert result["progress"]["stalled"] is False
 
 
 def test_native_small_study_streams_progress_across_worker_process(
@@ -418,50 +430,62 @@ def test_native_small_study_streams_progress_across_worker_process(
     _insert_job(job_id)
     directory = J.job_dir(job_id)
     monkeypatch.setenv("CHUDWARE_SIM_CACHE_DIR", str(directory / "cache"))
-    # The worker accepts the engine's tiny inline study. Queue validation normally
-    # requires an exported STEP; bypass only that geometry-preparation boundary.
-    study = {
-        "points": [0, 0, 0, 10, 0, 0, 0, 10, 0, 0, 0, 10],
-        "tets": [0, 1, 2, 3], "nodes_per_elem": 4,
-        "material": {"E_mpa": 200000.0, "nu": 0.3, "yield_mpa": 250.0},
-        "fixtures": [{"points": [[0, 0, 0], [10, 0, 0], [0, 10, 0]],
-                      "tol_mm": 0.01}],
-        "loads": [{"type": "force", "vector": [0, 0, -1],
-                   "faces": {"points": [[10, 0, 0], [0, 10, 0], [0, 0, 10]],
-                             "tol_mm": 0.01}}],
-        "vtu_path": str(directory / "small.vtu"),
-    }
+    from services.mcp import cad_sim_tools
+
+    # An inline tetrahedron bypasses graded fill entirely. Export real CAD and
+    # use the production study builder so absence of upstream probes fails here.
+    doc = cb.call("doc_new", {"kind": "part", "name": "progress_small_box"})["doc_id"]
+    try:
+        cb.call("doc_apply_ops", {"doc_id": doc, "ops": [{
+            "op": "add_feature", "feature": {
+                "type": "box", "name": "Block",
+                "params": {"length": 10, "width": 10, "height": 10},
+            },
+        }]})
+        ctx = cad_sim_tools._build_static_study(
+            fixtures=["bottom"], loads=[{"face": "top", "force": [0, 0, -1]}],
+            material="steel", mesh_fineness=0.5, learned_advisor=False,
+            advisor_max_dof=0, doc_id=doc, notes=[], target_size_mm=4.0,
+            vtu_path=str(directory / "small.vtu"))
+        study = ctx["study"]
+        step = directory / "small.step"
+        shutil.move(study["step_path"], step)
+        study["step_path"] = str(step)
+    finally:
+        cb.call("doc_close", {"doc_id": doc})
     (directory / "payload.json").write_text(json.dumps({
         "stage": "core_rpc", "kind": "fea_static",
         "payload": {"method": "sim_run_static", "params": {"study": study}},
     }), encoding="utf-8")
-    # Hold the completed native stage until the real worker heartbeat publishes.
-    # An event handshake, rather than sleeping for a presumed scheduler window,
-    # proves the heartbeat crosses the same child/file boundary as native phases.
+    # Inspect the durable partial synchronously at each actual native emission.
+    # Polling from the parent can miss every fill event on a fast small study.
+    # This observer never synthesizes native events or delays native completion.
     child_script = """
 import sys
-import threading
 from services.sim import job_worker as worker, jobs
 
-heartbeat = threading.Event()
 publish = worker._Progress.emit
-native_stage = jobs.STAGES["core_rpc"]
-worker._HEARTBEAT_S = 0.01
+observed = []
+solve_complete = False
 
 def emit(self, snapshot):
+    global solve_complete
     publish(self, snapshot)
-    if not snapshot and self.latest.get("phase") == "solve.complete":
-        heartbeat.set()
-
-def run_native(payload, emit):
-    result = native_stage(payload, emit)
-    if result.get("ok") is True and not heartbeat.wait(60):
-        raise RuntimeError("worker heartbeat did not publish after native completion")
-    return result
+    if snapshot.get("phase") == "solve.complete":
+        solve_complete = True
+    probe = snapshot.get("probe")
+    if (not solve_complete and snapshot.get("phase") == "mesh_background_probe"
+            and probe and probe.get("elements_so_far", 0) > 0):
+        durable = jobs.partial(self.job_id)
+        if durable.get("probe") != probe or durable.get("elements") != probe["elements_so_far"]:
+            raise RuntimeError("native live probe did not reach durable partial")
+        observed.append(durable)
 
 worker._Progress.emit = emit
-jobs.STAGES["core_rpc"] = run_native
-sys.exit(worker.main(["job_worker", sys.argv[1]]))
+code = worker.main(["job_worker", sys.argv[1]])
+worker._atomic_write(jobs.job_dir(sys.argv[1]) / "observed_probes.json",
+                     {"before_solve_complete": observed, "solve_complete": solve_complete})
+sys.exit(code)
 """
     with (directory / "worker.log").open("w", encoding="utf-8") as log:
         child = subprocess.run(
@@ -474,20 +498,26 @@ sys.exit(worker.main(["job_worker", sys.argv[1]]))
     records = [json.loads(line) for line in log_text.splitlines()
                if line.startswith("{") and '"partial": true' in line]
     phases = [record["phase"] for record in records]
-    expected = ["starting", "sim_run_static", "mesh.begin", "setup",
-                "solve", "solve.complete"]
+    expected = ["starting", "sim_run_static", "mesh.begin", "mesh_background_probe",
+                "setup", "solve", "solve.complete"]
     positions = [phases.index(phase) for phase in expected]
     assert positions == sorted(positions), records
-    # Completion, not a scheduler deadline, establishes that the measured mesh
-    # crossed the process boundary. Cadence belongs to the injected-clock test.
-    completed = [record for record in records
-                 if record["phase"] == "solve.complete" and "state" not in record]
-    assert len(completed) >= 2, records
-    assert completed[-1]["elements"] == completed[0]["elements"] == 1
-    assert completed[-1]["elapsed_s"] > completed[0]["elapsed_s"]
-    assert records[positions[3]]["elements"] == 1, records
+    evidence = J._read_json(directory / "observed_probes.json")
+    assert evidence["solve_complete"] is True, evidence
+    probes = evidence["before_solve_complete"]
+    assert probes, "no positive native fill probe reached partial.json before solve.complete"
+    assert any(record["probe"]["sub_phase"] == "background_lattice"
+               and record["probe"]["cells_done"] > 0 for record in probes), (
+        "progress must originate inside the fill, not only after volume_mesh returns")
+    for record in probes:
+        probe = record["probe"]
+        assert record["elements"] == probe["elements_so_far"] > 0
+        assert 0 <= probe["cells_done"] <= probe["cells_total"]
+        assert probe["h_mm"] > 0
+    completed = records[positions[-1]]
+    assert completed["elements"] > 0, completed
     state = J.status(job_id)
     assert state["state"] == J.DONE, state
-    assert state["progress"]["elements"] == 1
+    assert state["progress"]["elements"] == completed["elements"]
     assert state["progress"]["state"] == "done"
     assert J.partial(job_id) == records[-1]

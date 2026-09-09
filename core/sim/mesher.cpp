@@ -66,6 +66,7 @@
 #include <fea/zz.hpp>
 #include <geom/indicators.hpp>
 #include <mesh/cell_validity.hpp>
+#include <mesh/fill_progress.hpp>
 #include <mesh/grid_classify.hpp>
 #include <mesh/local_refine.hpp>
 #include <mesh/surface_project.hpp>
@@ -116,6 +117,19 @@ bool validate_mesh_options(const MeshOptions &options, std::string &error) {
 namespace {
 
 namespace pm = polymesh;
+
+void report_fill_work(std::size_t elements, std::size_t done, std::size_t total) {
+  if (auto *progress = pm::mesh::active_fill_progress) {
+    progress->set_elements(elements);
+    progress->set_cells(done, total);
+    progress->poll();
+  }
+}
+
+void report_fill_phase(const char *phase, int pass = 0, int total = 0) {
+  if (auto *progress = pm::mesh::active_fill_progress)
+    progress->set_phase(phase, pass, total);
+}
 
 // Only optional sizing probes spend this budget. The first measurable mesh
 // and the single delivery of a local contract must still run to completion.
@@ -1305,7 +1319,9 @@ void smooth_nodes(const pm::geom::TriSurface *surface, pm::fea::NodalMesh &nodal
   };
   const bool have_surface = surface != nullptr && !surface->triangles.empty();
   for (int pass = 0; pass < kSmoothPasses; ++pass) {
+    report_fill_phase("projection", pass + 1, kSmoothPasses);
     for (std::size_t at = 0; at < count; ++at) {
+      report_fill_work(nodal.elements.size(), at, count);
       if (topo.star[at].empty()) continue;  // orphan midpoint; compacted later
       if (topo.corner[at] != 0) continue;  // a CAD corner has nowhere to go
       const double scale = local_edge(at);
@@ -1621,6 +1637,7 @@ bool lexicographically_better(std::vector<double> before,
 struct MeshEdits {
   std::vector<char> dead;
   std::vector<char> dirty;
+  std::size_t removed = 0;
 
   explicit MeshEdits(std::size_t cells) : dead(cells, 0), dirty(cells, 0) {}
   bool usable(std::uint32_t e) const {
@@ -1628,6 +1645,12 @@ struct MeshEdits {
   }
   void claim(std::uint32_t e) {
     if (e < dirty.size()) dirty[e] = 1;
+  }
+  void remove(std::uint32_t e) {
+    if (dead[e] == 0) {
+      dead[e] = 1;
+      ++removed;
+    }
   }
   void grew(std::size_t cells) {
     dead.resize(cells, 0);
@@ -1676,7 +1699,10 @@ void flip_region(pm::fea::NodalMesh &nodal,
     }
   }
 
+  report_fill_phase("quality flips");
+  std::size_t completed = 0;
   for (const std::size_t candidate : candidates) {
+    report_fill_work(nodal.elements.size() - edits.removed, completed++, candidates.size());
     const std::uint32_t here = static_cast<std::uint32_t>(candidate);
     if (!edits.usable(here) || !is_tet4(nodal.elements[here])) continue;
     const Tet cell = cell_nodes(nodal.elements[here]);
@@ -1897,7 +1923,7 @@ void flip_region(pm::fea::NodalMesh &nodal,
         if (i < best.size())
           nodal.elements[around[i]].nodes.assign(best[i].begin(), best[i].end());
         else
-          edits.dead[around[i]] = 1;
+          edits.remove(around[i]);
         edits.claim(around[i]);
       }
       for (std::size_t i = found; i < best.size(); ++i)
@@ -1944,7 +1970,10 @@ void collapse_slivers(const pm::geom::TriSurface *surface,
                                           {1, 2}, {1, 3}, {2, 3}};
   std::vector<std::uint32_t> doomed;
   std::vector<std::uint32_t> moved;
+  report_fill_phase("quality collapses");
+  std::size_t completed = 0;
   for (const std::size_t candidate : candidates) {
+    report_fill_work(nodal.elements.size() - edits.removed, completed++, candidates.size());
     const std::uint32_t here = static_cast<std::uint32_t>(candidate);
     if (!edits.usable(here) || !is_tet4(nodal.elements[here])) continue;
     const Tet cell = cell_nodes(nodal.elements[here]);
@@ -2189,7 +2218,7 @@ void collapse_slivers(const pm::geom::TriSurface *surface,
           edits.claim(moved[i]);
         }
         for (const std::uint32_t e : doomed) {
-          edits.dead[e] = 1;
+          edits.remove(e);
           edits.claim(e);
         }
         ++collapsed;
@@ -2310,6 +2339,7 @@ bool quality_pass(const pm::geom::TriSurface *surface, pm::fea::NodalMesh &nodal
   report_progress("mesh_interface_band_quality", nodal.elements.size());
   std::vector<std::size_t> poor;
   for (std::size_t e = 0; e < nodal.elements.size(); ++e) {
+    report_fill_work(nodal.elements.size(), e, nodal.elements.size());
     if (e >= in_region.size() || in_region[e] == 0) continue;
     if (!is_tet4(nodal.elements[e])) continue;
     if (tet_quality_of(nodal, cell_nodes(nodal.elements[e])) < kQualityTarget)
@@ -2357,9 +2387,11 @@ int collapse_global_slivers(const pm::geom::TriSurface *surface,
   constexpr double kGlobalJacobianFloor = 0.034;
   int collapsed = 0;
   for (int pass = 0; pass < kQualityPasses; ++pass) {
+    report_fill_phase("quality pass", pass + 1, kQualityPasses);
     std::vector<std::size_t> poor;
     std::vector<std::uint32_t> movable;
     for (std::size_t e = 0; e < nodal.elements.size(); ++e) {
+      report_fill_work(nodal.elements.size(), e, nodal.elements.size());
       const auto &element = nodal.elements[e];
       if (!is_tet4(element)) continue;
       const auto shape = detail::tet_shape(
@@ -2760,7 +2792,7 @@ void deliver_local_contract(const LoadedModel &loaded, const MeshOptions &option
   };
   contract.achieved_mm = scan(nullptr);
   for (int wave = 0; wave < kLebWaves; ++wave) {
-    report_progress("mesh_interface_band_refine", nodal.elements.size());
+    report_fill_phase("interface band LEB waves", wave + 1, kLebWaves);
     // Two mark sources, unioned: the owners of the interface faces the
     // DELIVERED size is still failing on (the layer that carries the contract,
     // marked in the contract's own per-node currency) and any element coarser
@@ -2816,6 +2848,7 @@ void deliver_local_contract(const LoadedModel &loaded, const MeshOptions &option
     std::vector<char> in_region = refined_region(nodal, nodes_before_waves);
     const auto bounded_loop = [&](std::vector<char> &region) {
       for (int pass = 0; pass < kQualityPasses; ++pass) {
+        report_fill_phase("interface band quality pass", pass + 1, kQualityPasses);
         if (region_quality(nodal, region).met())
           break;
         if (!quality_pass(cad_surface, nodal, boundary_edge_limit, region, contract))
@@ -3112,6 +3145,15 @@ bool build_mesh(const LoadedModel &loaded, const MeshOptions &options, double h,
   // Graded tet is the one Polyhedral-FEA family that matches Chudware's
   // fixed-stride tet solve contract and accepts the spatial size field used by
   // adaptive refinement.
+  pm::mesh::FillOptions fill_options;
+  if (progress_detail::sink) {
+    fill_options.on_progress = [&](const pm::mesh::FillProgress &progress) {
+      report_mesh_progress(options.local_refine.active() ? "mesh_interface_band_fill"
+                                                        : "mesh_background_probe",
+                           h, progress.elements_so_far, progress.cells_done,
+                           progress.cells_total, progress.sub_phase);
+    };
+  }
   const pm::pipeline::VolumeMeshOutput volume = [&] {
     chudware::prof::phases::PhaseScope phase("generate");
     if (options.local_refine.active())
@@ -3123,10 +3165,15 @@ bool build_mesh(const LoadedModel &loaded, const MeshOptions &options, double h,
         // sharp-edge/thickness pass is the caller's choice.
         feature_refine, refine_seeds, seed_band,
         /*element_tendency=*/0.0, resolved.element_ceiling, resolved.dof_ceiling,
-        /*auto_retry_budget=*/0, /*cancel_check=*/{}, effective_field);
+        /*auto_retry_budget=*/0, /*cancel_check=*/{}, effective_field,
+        /*on_stage=*/{}, fill_options);
   }();
 
   nodal = volume.mesh;
+  pm::mesh::FillProgressScope delivery_progress(fill_options);
+  delivery_progress.set_elements(nodal.elements.size());
+  delivery_progress.set_cells(0, nodal.elements.size());
+  delivery_progress.set_phase(options.local_refine.active() ? "interface band" : "quality");
   // The local size contract, before any promotion: LEB is tet4-only, and a
   // tet10 mesh promoted from bisected tet4 is the same mesh one order up.
   LocalContract contract;
@@ -3147,7 +3194,10 @@ bool build_mesh(const LoadedModel &loaded, const MeshOptions &options, double h,
   // a cell the fill shipped flat has no positive Jacobian to promote.
   out.degenerate_elems_repaired =
       repair_degenerate_tets(nodal, h, out.degenerate_elems_remaining);
+  delivery_progress.set_elements(nodal.elements.size());
+  delivery_progress.set_cells(0, nodal.elements.size());
   if (options.order == 2) {
+    delivery_progress.set_phase("quadratic_promotion");
     nodal = pm::fea::promote_to_quadratic(nodal);
     // Project free-surface mids onto the exact BRep so quadratic elements
     // follow fillets, bores, and other curved faces instead of retaining
@@ -3162,6 +3212,7 @@ bool build_mesh(const LoadedModel &loaded, const MeshOptions &options, double h,
       }
     }
   }
+  delivery_progress.set_phase("mesh_extract");
   nodal.compact_unused_nodes();
   // The fill's own note goes in BEFORE the refusal gates below, so a refused
   // mesh still carries polymesh's ship-gate census (cells below the shape
@@ -3480,6 +3531,10 @@ bool build_mesh(const LoadedModel &loaded, const MeshOptions &options, double h,
   detail::measure_edges(out);
   mesh_cache_note_generation();
   out.ok = true;
+  delivery_progress.set_elements(static_cast<std::size_t>(out.n_elems));
+  delivery_progress.set_cells(static_cast<std::size_t>(out.n_elems),
+                              static_cast<std::size_t>(out.n_elems));
+  delivery_progress.set_phase("complete");
   return true;
 }
 

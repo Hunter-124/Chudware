@@ -2738,8 +2738,11 @@ static int chudware_call_inner(const char* method, const char* params_json, char
                             out_json);
       auto options = chudware::sim::mesh_options_from_study(params);
       options.order = params.value("order", params.value("mesh_order", 1));
+      chudware::sim::report_progress("mesh.begin", 0);
       const auto mesh = chudware::sim::mesh_step_cached(step_path, options);
       const chudware::sim::MeshOut &r = *mesh;
+      chudware::sim::report_progress(r.ok ? "mesh.complete" : "mesh.failed",
+                                    static_cast<std::size_t>(r.n_elems));
       if (!r.ok)
         return emit(json{{"ok", false}, {"error", r.error}}, out_json, 0);
       return emit(json{{"ok", true},

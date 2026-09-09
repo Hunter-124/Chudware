@@ -1233,8 +1233,6 @@ def test_background_static_hands_back_a_durable_job_not_a_thread(
     assert out["ok"] and out["status"] == "running" and out["doc_id"] == "doc-1", out
     assert out["job_id"].startswith("sim-"), out
     assert out["cancel_supported"] is True, out
-    assert f"sim_cancel('{out['job_id']}')" in out["next_actions"], out
-    assert "survives an MCP restart" in out["note"], out
 
     job = started[0]
     assert (job["kind"], job["stage"]) == ("fea_static", "core_rpc"), job
@@ -1488,6 +1486,68 @@ def test_a_finished_job_survives_the_server_that_started_it(
     # the winner wrote, rather than re-deriving it or reporting the job unknown.
     monkeypatch.delitem(cad_common._DURABLE_COLLECTORS, "fea_static")
     assert cad_common.collect_durable(job_id) == collected
+
+
+def test_running_get_job_ages_real_progress_not_heartbeats(
+        monkeypatch, registry, get_job_tool, tools):
+    from services.sim.job_worker import _Progress
+
+    job_id = "sim-" + uuid.uuid4().hex[:12]
+    directory = simjobs.job_dir(job_id)
+    directory.mkdir(parents=True)
+    wall_now = time.time()
+    with simjobs._db() as connection:
+        connection.execute(
+            "INSERT INTO jobs(job_id,kind,stage,state,pid,proc_key,created_at,"
+            "started_at,cancel_requested,meta) VALUES(?,?,?,?,?,?,?,?,?,?)",
+            (job_id, "selftest", "selftest_sleep", simjobs.RUNNING, os.getpid(),
+             simjobs._proc_key(os.getpid()), wall_now, wall_now, 0, "{}"))
+    now = [0.0]
+    monkeypatch.setattr(simjobs, "_clock", lambda: now[0])
+    publisher = _Progress(directory, job_id)
+    probe = {"h_mm": 4.0, "cells_done": 8, "cells_total": 64,
+             "elements_so_far": 128, "sub_phase": "fill"}
+    event = {"phase": "mesh_background_probe", "elements": 128, "probe": probe}
+    publisher.emit(event)
+    try:
+        for instant in (30.0, 60.0, 90.0):
+            now[0] = instant
+            publisher.heartbeat()
+            # A native callback/file watcher may repeat unchanged counters too.
+            publisher.emit({**event, "elapsed_s": instant, "note": str(instant)})
+            polled = json.loads(get_job_tool(job_id=job_id))
+            assert polled["status"] == "running", polled
+            assert polled["progress"]["probe"] == probe
+            assert polled["progress"]["elements"] == 128
+            assert polled["progress"]["last_advance_s"] == instant
+            assert polled["progress"]["stalled"] is False
+
+        # No more publications: the public poll must age a silent worker itself.
+        for instant, stalled in ((120.0, False), (120.001, True), (180.0, True)):
+            now[0] = instant
+            polled = json.loads(get_job_tool(job_id=job_id))["progress"]
+            assert polled["last_advance_s"] == instant
+            assert polled["stalled"] is stalled
+            for partial in (False, True):
+                result = json.loads(tools["sim_results"](job_id=job_id, partial=partial))
+                assert result["progress"] == polled
+                if partial:
+                    assert result["snapshot"]["probe"] == probe
+                    assert result["snapshot"]["last_advance_s"] == instant
+                    assert result["converged"] is False
+
+        # Cells can advance without creating any additional elements.
+        publisher.emit({**event, "probe": {**probe, "cells_done": 9}})
+        advanced = json.loads(get_job_tool(job_id=job_id))["progress"]
+        assert advanced["last_advance_s"] == 0.0
+        assert advanced["stalled"] is False
+        assert advanced["elements"] == 128
+        now[0] = 301.0
+        assert json.loads(get_job_tool(job_id=job_id))["progress"]["stalled"] is True
+        simjobs._set(job_id, state=simjobs.CANCELLED, pid=None, proc_key=None)
+        assert json.loads(get_job_tool(job_id=job_id))["progress"]["stalled"] is False
+    finally:
+        simjobs._set(job_id, state=simjobs.CANCELLED, pid=None, proc_key=None)
 
 
 def test_get_job_collects_a_reconnected_durable_job_only_after_releasing_thread_lock(

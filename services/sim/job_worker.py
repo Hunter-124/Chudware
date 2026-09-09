@@ -45,9 +45,10 @@ class _Progress:
     def __init__(self, directory: Path, job_id: str, *, clock=None):
         self.path = directory / "partial.json"
         self.job_id = job_id
-        self.clock = clock or time.monotonic
+        self.clock = clock or J._clock
         self.started = self.clock()
         self.last_write = self.started
+        self.last_advance = self.started
         self.latest: dict = {"phase": "starting", "elements": None}
         # SIGTERM may interrupt the main thread during its heartbeat publication.
         self.lock = threading.RLock()
@@ -56,16 +57,40 @@ class _Progress:
         if not isinstance(snapshot, dict):
             raise ValueError("partial snapshot must be an object")
         with self.lock:
-            self.latest.update(snapshot)
+            previous = self._counters()
+            self.latest.update((key, value) for key, value in snapshot.items()
+                               if key != "elements" or value is not None)
+            if isinstance(snapshot.get("probe"), dict):
+                probe = dict(snapshot["probe"])
+                self.latest["probe"] = probe
+                if snapshot.get("elements") is None and probe.get("elements_so_far") is not None:
+                    self.latest["elements"] = probe["elements_so_far"]
             if "stage" in snapshot and "phase" not in snapshot:
                 self.latest["phase"] = snapshot["stage"]
             now = self.clock()
+            if self._counters() != previous:
+                self.last_advance = now
             body = dict(self.latest)
             body.update(partial=True, converged=False, job_id=self.job_id,
-                        elapsed_s=round(now - self.started, 3))
+                        elapsed_s=round(now - self.started, 3),
+                        _last_advance_monotonic=self.last_advance,
+                        last_advance_s=round(now - self.last_advance, 3))
             _atomic_write(self.path, body)
             print(json.dumps(body, allow_nan=False), flush=True)
             self.last_write = now
+
+    def _counters(self) -> tuple:
+        # Publication time, elapsed time and notes are not work. Native fill
+        # counters can reset at a new h/sub-phase; those transitions are work too.
+        probe = self.latest.get("probe") or {}
+        return (
+            *(self.latest.get(key) for key in (
+                "phase", "elements", "step", "n_steps", "pct", "iteration",
+                "iterations", "legs_done", "current_leg", "cells_done",
+                "cells_total", "work_done", "work_total")),
+            *(probe.get(key) for key in (
+                "h_mm", "cells_done", "cells_total", "elements_so_far", "sub_phase")),
+        )
 
     def heartbeat(self) -> None:
         with self.lock:

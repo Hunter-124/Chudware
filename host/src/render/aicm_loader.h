@@ -34,6 +34,15 @@ struct BrepVertex {
     float xyz[3] = {0, 0, 0};
 };
 
+// Authored material over stable 1-based face IDs, independent of tessellation density.
+struct AppearanceRegion {
+    uint32_t first_face = 1;
+    uint32_t face_count = 0;
+    float color[3] = {0.62f, 0.70f, 0.82f};
+    float metallic = 0.0f;
+    float roughness = 0.5f;
+};
+
 // One renderable body: geometry + picking topology. GPU buffers are NOT here (CPU arrays only);
 // the id pass / overlays upload from these.
 struct BodyMesh {
@@ -43,6 +52,7 @@ struct BodyMesh {
     // C32-A RealView material (dielectric default == pre-C32 look; absent in old AICM files).
     float metallic = 0.0f;
     float roughness = 0.5f;
+    std::vector<AppearanceRegion> appearance_regions;
 
     uint32_t n_verts = 0;
     uint32_t n_tris = 0;

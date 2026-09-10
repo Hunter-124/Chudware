@@ -37,6 +37,9 @@ from mcp.server.fastmcp import FastMCP  # noqa: F401 — register signature
 from mcp.server.fastmcp import Image
 from typing import Optional
 from typing import Union
+from functools import lru_cache
+import glob
+import re
 import hashlib
 import json
 import math
@@ -76,7 +79,6 @@ _GIF_MAX_BYTES = 25 * 1024 * 1024
 # and both end points), then width. Never content.
 _FPS_LADDER = (30, 24, 20, 15, 12, 10)
 _WIDTH_LADDER = (1280, 1024, 854, 720, 640, 512)
-_FOOTER_H = 34
 _BG = (16, 17, 20)
 
 
@@ -169,43 +171,89 @@ def _short(commit: Optional[str], n: int = 12) -> str:
 
 
 # ------------------------------------------------------------------------------ footer
-def _stamp_footer(png: str, left: str, right: str = "") -> str:
-    """Burn a provenance footer band into `png` IN PLACE and return it.
+@lru_cache(maxsize=64)
+def _font(bold: bool, px: int):
+    """Resolve a scalable face as the showcase cards do, including Fedora's Noto fonts."""
+    from PIL import ImageFont
+    candidates = (("/usr/share/fonts/dejavu-sans-fonts/DejaVuSans-Bold.ttf",
+                   "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf") if bold else
+                  ("/usr/share/fonts/dejavu-sans-fonts/DejaVuSansMono.ttf",
+                   "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf"))
+    for path in candidates:
+        if os.path.exists(path):
+            return ImageFont.truetype(path, px)
+    pattern = "DejaVu Sans:bold,sans-serif:bold" if bold else "DejaVu Sans Mono,monospace"
+    try:
+        found = subprocess.run(["fc-match", "-f", "%{file}", pattern],
+                               capture_output=True, text=True, check=True).stdout.strip()
+        if found and os.path.isfile(found):
+            return ImageFont.truetype(found, px)
+    except (OSError, subprocess.CalledProcessError):
+        pass
+    raise ValueError("Animation typography needs a scalable font; install "
+                     "dejavu-sans-fonts or google-noto-sans-mono-fonts and fontconfig.")
 
-    The footer is not decoration: a frame lifted out of a film into a slide deck has to
-    carry which engine built it and which document it is of, or it is an unattributable
-    picture. Never raises — a missing font must not be able to lose a frame."""
-    try:
-        from PIL import Image as PILImage, ImageDraw, ImageFont  # noqa: PLC0415
-    except Exception:  # noqa: BLE001
-        return png
-    try:
-        im = PILImage.open(png).convert("RGB")
-        w, h = im.size
-        out = PILImage.new("RGB", (w, h + _FOOTER_H), _BG)
-        out.paste(im, (0, 0))
-        dr = ImageDraw.Draw(out)
-        font = None
-        for cand in ("/usr/share/fonts/dejavu-sans-fonts/DejaVuSansMono.ttf",
-                     "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
-                     "/usr/share/fonts/dejavu/DejaVuSansMono.ttf"):
-            if os.path.exists(cand):
-                font = ImageFont.truetype(cand, 13)
-                break
-        if font is None:
-            font = ImageFont.load_default()
-        dr.line([(0, h), (w, h)], fill=(60, 62, 70), width=1)
-        dr.text((8, h + 9), left, fill=(196, 200, 210), font=font)
-        if right:
-            try:
-                tw = dr.textlength(right, font=font)
-            except Exception:  # noqa: BLE001
-                tw = 7 * len(right)
-            dr.text((max(8.0, w - 8 - tw), h + 9), right, fill=(150, 154, 164), font=font)
-        out.save(png)
-        return png
-    except Exception:  # noqa: BLE001
-        return png
+
+def _wrap_to_width(text: str, font, width: int) -> list:
+    """Wrap measured glyphs, splitting long paths/tokens rather than clipping evidence."""
+    lines = []
+    for paragraph in str(text).split("\n"):
+        line = ""
+        for word in paragraph.split():
+            candidate = f"{line} {word}" if line else word
+            if font.getlength(candidate) <= width:
+                line = candidate
+                continue
+            if line:
+                lines.append(line)
+            line = ""
+            for char in word:
+                if font.getlength(line + char) > width:
+                    if not line:
+                        raise ValueError("Animation text region is narrower than one glyph.")
+                    lines.append(line)
+                    line = ""
+                line += char
+        lines.append(line)
+    return lines or [""]
+
+
+def _text_rows(text: str, font, width: int) -> tuple:
+    rows = _wrap_to_width(text, font, width)
+    ascent, descent = font.getmetrics()
+    return rows, ascent + descent + max(2, font.size // 5)
+
+
+def _footer_layout(width: int, left: str, right: str) -> tuple:
+    pad = max(8, round(width * 0.012))
+    font = _font(False, max(10, round(width / 72)))
+    left_rows, pitch = _text_rows(left, font, width - 2 * pad)
+    right_rows = _wrap_to_width(right, font, width - 2 * pad) if right else []
+    needed = 2 * pad + pitch * (len(left_rows) + len(right_rows))
+    return font, pad, pitch, left_rows, right_rows, needed
+
+
+def _stamp_footer(png: str, left: str, right: str = "", *, height: Optional[int] = None) -> str:
+    """Append two vertically separated, fully wrapped provenance fields; never overprint."""
+    from PIL import Image as PILImage, ImageDraw
+    with PILImage.open(png) as source:
+        im = source.convert("RGB")
+    w, h = im.size
+    font, pad, pitch, left_rows, right_rows, needed = _footer_layout(w, left, right)
+    if height is not None and needed > height:
+        raise ValueError(f"Animation footer needs {needed}px, has {height}px; "
+                         "shorten footer_note/document name or increase output size.")
+    out = PILImage.new("RGB", (w, h + (height or needed)), _BG)
+    out.paste(im, (0, 0))
+    dr = ImageDraw.Draw(out)
+    dr.line([(0, h), (w, h)], fill=(60, 62, 70))
+    y = h + pad
+    for rows, colour in ((left_rows, (196, 200, 210)), (right_rows, (150, 154, 164))):
+        for row in rows:
+            dr.text((pad, y), row, fill=colour, font=font, anchor="lt")
+            y += pitch
+    out.save(png)
+    return png
 
 
 def _collision_text(measured: dict) -> str:
@@ -221,63 +269,53 @@ def _collision_text(measured: dict) -> str:
     return f"INTERFERENCE{pair}{at}"
 
 
-def _mark_collision(png: str, text: str) -> str:
-    """Mark a COLLIDING sample: a red border plus the colliding pair, in place.
-
-    The engine's renderer has no per-body colour override (doc_render_view tints by face
-    direction), so a film cannot paint the two offending bodies red without reimplementing
-    the shading. Marking the SAMPLE and naming the pair states exactly what
-    simulate_motion reported instead of implying a body-level result it did not give."""
-    try:
-        from PIL import Image as PILImage, ImageDraw, ImageFont  # noqa: PLC0415
-        im = PILImage.open(png).convert("RGB")
-        dr = ImageDraw.Draw(im)
-        w, h = im.size
-        for k in range(6):
-            dr.rectangle([k, k, w - 1 - k, h - 1 - k], outline=(226, 66, 58))
-        font = None
-        for cand in ("/usr/share/fonts/dejavu-sans-fonts/DejaVuSans-Bold.ttf",
-                     "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"):
-            if os.path.exists(cand):
-                font = ImageFont.truetype(cand, max(18, h // 34))
-                break
-        font = font or ImageFont.load_default()
-        dr.text((24, 20), text, fill=(240, 120, 112), font=font)
-        im.save(png)
-    except Exception:  # noqa: BLE001
-        pass
+def _mark_collision(png: str, text: str, *, current: bool = True) -> str:
+    """A red current-hit banner or amber historical warning, never a body recolouring."""
+    from PIL import Image as PILImage, ImageDraw
+    with PILImage.open(png) as source:
+        im = source.convert("RGB")
+    dr = ImageDraw.Draw(im)
+    w, h = im.size
+    pad = max(8, round(w * 0.018))
+    font = _font(True, max(12, round(w / 48)))
+    rows, pitch = _text_rows(text, font, w - 2 * pad)
+    band = 2 * pad + len(rows) * pitch
+    if band > h // 2:
+        raise ValueError("Collision legend exceeds half the frame; increase output size.")
+    colour = (240, 120, 112) if current else (238, 188, 94)
+    dr.rectangle((0, 0, w - 1, band), fill=_BG)
+    dr.rectangle((0, 0, w - 1, h - 1), outline=colour, width=max(2, w // 320))
+    for i, row in enumerate(rows):
+        dr.text((pad, pad + i * pitch), row, fill=colour, font=font, anchor="lt")
+    im.save(png)
     return png
 
 
 def _caption_card(w: int, h: int, lines: list, out_png: str) -> str:
-    """A dark title card holding `lines` — the 2-3 second hold that tells a viewer what the
-    next shot IS. Rendered at the film's own size so no scaling is needed at encode time."""
-    from PIL import Image as PILImage, ImageDraw, ImageFont  # noqa: PLC0415
+    """Center fully wrapped title/body blocks, refusing text that cannot remain readable."""
+    from PIL import Image as PILImage, ImageDraw
     im = PILImage.new("RGB", (w, h), _BG)
     dr = ImageDraw.Draw(im)
-    big = small = None
-    for cand in ("/usr/share/fonts/dejavu-sans-fonts/DejaVuSans-Bold.ttf",
-                 "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"):
-        if os.path.exists(cand):
-            big = ImageFont.truetype(cand, max(18, h // 22))
-            break
-    for cand in ("/usr/share/fonts/dejavu-sans-fonts/DejaVuSansMono.ttf",
-                 "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf"):
-        if os.path.exists(cand):
-            small = ImageFont.truetype(cand, max(13, h // 34))
-            break
-    big = big or ImageFont.load_default()
-    small = small or ImageFont.load_default()
-    y = int(h * 0.30)
+    pad = max(12, round(w * 0.06))
+    blocks = []
+    total = 0
     for i, line in enumerate(lines):
-        font = big if i == 0 else small
-        colour = (238, 240, 245) if i == 0 else (176, 182, 195)
-        try:
-            tw = dr.textlength(str(line), font=font)
-        except Exception:  # noqa: BLE001
-            tw = 8 * len(str(line))
-        dr.text(((w - tw) / 2.0, y), str(line), fill=colour, font=font)
-        y += int((h // 18) if i == 0 else (h // 26))
+        font = _font(i == 0, max(16 if i == 0 else 12,
+                                round(h / (22 if i == 0 else 34))))
+        rows, pitch = _text_rows(str(line), font, w - 2 * pad)
+        gap = pitch // 2
+        blocks.append((rows, pitch, gap, font, i == 0))
+        total += len(rows) * pitch + gap
+    if total > h - 2 * pad:
+        raise ValueError("Title card text does not fit at readable size; split the card "
+                         "or shorten the subtitle.")
+    y = (h - total) // 2
+    for rows, pitch, gap, font, bold in blocks:
+        for row in rows:
+            dr.text(((w - font.getlength(row)) / 2, y), row, font=font, anchor="lt",
+                    fill=(238, 240, 245) if bold else (176, 182, 195))
+            y += pitch
+        y += gap
     im.save(out_png)
     return out_png
 
@@ -316,21 +354,36 @@ def _ffprobe_film(path: str) -> dict:
         return {}
 
 
-def _encode_gif(pattern: str, out: str, fps: int, width: Optional[int] = None) -> None:
-    """Two-pass palettegen/paletteuse GIF. One global 256-colour palette; Bayer dithering
-    keeps a shaded CAD surface smooth instead of speckled."""
+def _encode_gif(pattern: str, out: str, source_fps: int, width: Optional[int] = None,
+                *, output_fps: Optional[int] = None) -> None:
+    """Resample the source timeline, preserving endpoints and duration (GIF: 10ms ticks)."""
     exe = _ffmpeg()
-    vf = f"fps={int(fps)}"
+    count = len(glob.glob(re.sub(r"%0?\d*d", "*", pattern)))
+    if not count:
+        raise ValueError(f"No animation frames match {pattern}")
+    output_fps = output_fps or source_fps
+    samples = min(count, max(2, round(count * output_fps / source_fps)))
+    # Select evenly spaced SOURCE indices including 0 and count-1, not interpolated poses.
+    # The output rate is adjusted by <1 frame to span the original duration exactly.
+    vf = ""
+    if samples < count:
+        vf = (f"select='eq(n,round(round(n*{samples - 1}/{count - 1})"
+              f"*{count - 1}/{samples - 1}))',")
+    vf += f"settb=1/100,setpts=round(N*100*{count}/({samples}*{source_fps}))"
     if width:
         vf += f",scale={int(width)}:-2:flags=lanczos"
+    duration_cs = math.floor(100 * count / source_fps + 0.5)
+    last_pts_cs = math.floor(100 * (samples - 1) * count / (samples * source_fps) + 0.5)
+    final_delay = max(1, duration_cs - last_pts_cs)
     pal = os.path.join(os.path.dirname(out) or ".", f".palette_{os.getpid()}.png")
-    p = _run([exe, "-y", "-v", "error", "-f", "image2", "-framerate", str(int(fps)),
+    p = _run([exe, "-y", "-v", "error", "-f", "image2", "-framerate", str(source_fps),
               "-i", pattern, "-vf", vf + ",palettegen=stats_mode=diff", pal])
     if p.returncode != 0 or not os.path.exists(pal):
         raise ValueError(f"ffmpeg palettegen failed: {(p.stderr or '').strip()[:400]}")
-    p = _run([exe, "-y", "-v", "error", "-f", "image2", "-framerate", str(int(fps)),
+    p = _run([exe, "-y", "-v", "error", "-f", "image2", "-framerate", str(source_fps),
               "-i", pattern, "-i", pal, "-lavfi",
               vf + "[x];[x][1:v]paletteuse=dither=bayer:bayer_scale=3:diff_mode=rectangle",
+              "-fps_mode", "vfr", "-enc_time_base", "1:100", "-final_delay", str(final_delay),
               "-loop", "0", out])
     try:
         os.unlink(pal)
@@ -382,7 +435,7 @@ def _encode(pattern: str, out: str, fps: int, max_bytes: int, source_w: int) -> 
     for w in (None,) + tuple(x for x in _WIDTH_LADDER if x < source_w):
         for f in (fps,) + tuple(x for x in _FPS_LADDER if x < fps):
             if is_gif:
-                _encode_gif(pattern, out, f, w)
+                _encode_gif(pattern, out, fps, w, output_fps=f)
             else:
                 _encode_mp4(pattern, out, f, w)
             size = os.path.getsize(out)
@@ -461,6 +514,19 @@ def _components(doc_id: str) -> list:
     return comps if isinstance(comps, list) else []
 
 
+def _freeze_clone_poses(doc_id: str) -> None:
+    """Prevent mate solving from changing playback poses on the render copy."""
+    tree = cb.call("doc_tree", {"doc_id": doc_id})["tree"]
+    ops = [{"op": "asm_edit_mate", "id": mate["id"], "suppressed": True}
+           for mate in tree.get("mates", []) if not mate.get("suppressed")]
+    ops.extend({"op": "asm_edit_component", "id": component["id"], "fixed": True}
+               for component in tree.get("components", []) if not component.get("fixed"))
+    if ops:
+        frozen = cb.call("doc_apply_ops", {"doc_id": doc_id, "ops": ops, "with_tess": False})
+        if frozen.get("ok") is False:
+            raise ValueError(f"Cannot freeze animation poses: {frozen}")
+
+
 def _revision(doc_id: str) -> int:
     return int((cb.call("doc_tree", {"doc_id": doc_id}) or {}).get("revision", 0) or 0)
 
@@ -472,8 +538,10 @@ def _apply_poses(doc_id: str, poses: dict) -> None:
            for cid, t in poses.items()]
     if not ops:
         return
-    cb.call("doc_apply_ops", {"doc_id": doc_id, "base_revision": _revision(doc_id),
-                              "with_tess": False, "ops": ops})
+    result = cb.call("doc_apply_ops", {"doc_id": doc_id, "base_revision": _revision(doc_id),
+                                      "with_tess": False, "ops": ops})
+    if result.get("ok") is False:
+        raise ValueError(f"Animation component pose failed: {result.get('error') or result}")
 
 
 def _mat_mul(a: list, b: list) -> list:
@@ -528,6 +596,148 @@ def _scene_bbox(bodies: list) -> tuple:
     return centre, diag
 
 
+def _pose_bounds(bodies: list, base: dict, poses: list) -> dict:
+    """Conservative union of source WORLD boxes transported by relative rigid placements.
+
+    Partial pose rows have the same carry-forward semantics as _apply_poses. No geometry
+    is re-queried, and unposed bodies stay in the frame. Synthetic pattern instances need
+    native preflight instead: their WORLD delta is offset * seed_delta * offset^-1, and
+    asm_world_bodies does not expose those exact compiled offsets.
+    """
+    if poses and _has_pattern_instances(bodies, base):
+        raise ValueError("Animation pattern framing needs measured posed world bounds.")
+    points = {}
+    for body in bodies:
+        bb = body.get("bbox") or {}
+        if (not all(len(bb.get(k, [])) == 3 for k in ("min", "max"))
+                or not all(isinstance(v, (int, float)) and math.isfinite(v)
+                           for k in ("min", "max") for v in bb[k])
+                or any(bb["min"][a] > bb["max"][a] for a in range(3))):
+            raise ValueError("Animation framing needs measured bounds for every body.")
+        cid = str(body.get("component") or "")
+        points.setdefault(cid, []).extend(
+            tuple(float(bb["max" if mask & (1 << axis) else "min"][axis])
+                  for axis in range(3)) for mask in range(8))
+    if not points:
+        raise ValueError("Animation framing has no measured scene bounds.")
+    lo, hi = [math.inf] * 3, [-math.inf] * 3
+    inverse = {cid: _rigid_inverse(m) for cid, m in base.items()}
+    current = dict(base)
+    for row in [{}] + poses:
+        current.update(row)
+        for cid, corners in points.items():
+            delta = _mat_mul(current[cid], inverse[cid]) if cid in inverse else None
+            for point in corners:
+                p = ([sum(delta[a * 4 + k] * point[k] for k in range(3))
+                      + delta[a * 4 + 3] for a in range(3)] if delta else point)
+                for a in range(3):
+                    lo[a], hi[a] = min(lo[a], p[a]), max(hi[a], p[a])
+    return {"min": lo, "max": hi}
+
+
+def _has_pattern_instances(bodies: list, base: dict) -> bool:
+    return any("#" in str(b.get("component") or "") and b.get("component") not in base
+               for b in bodies)
+
+
+def _pattern_pose_bounds(clone: str, bodies: list, base: dict, poses: list) -> dict:
+    """Measure each sampled placement on the detached render clone, then restore its base.
+
+    Compiled pattern offsets are not in world-body metadata; reconstructing them from
+    feature parameters would duplicate the engine and misframe solved/nested placements.
+    Keep full instance identities and refuse missing bodies/bounds instead of guessing.
+    """
+    bounds = _pose_bounds(bodies, {}, [])
+    identities = sorted(str(b.get("component") or "") for b in bodies)
+    try:
+        _apply_poses(clone, base)
+        for index, row in enumerate([{}] + poses):
+            _apply_poses(clone, row)
+            posed = _world_bodies(clone)
+            if sorted(str(b.get("component") or "") for b in posed) != identities:
+                raise ValueError(
+                    f"Animation pattern framing sample {index}: world bodies changed "
+                    "or could not be measured.")
+            measured = _pose_bounds(posed, {}, [])
+            for a in range(3):
+                bounds["min"][a] = min(bounds["min"][a], measured["min"][a])
+                bounds["max"][a] = max(bounds["max"][a], measured["max"][a])
+    except Exception as exc:
+        raise ValueError(f"Animation pattern framing preflight failed: {exc}") from exc
+    finally:
+        _apply_poses(clone, base)
+    return bounds
+
+
+def _orbit_framing(bounds: dict, direction, width: int, height: int) -> tuple:
+    """Fit the full orbit at constant scale, including end-on slender parts.
+
+    A small centered camera-fit cube avoids the native focus-margin cap. It is
+    not geometry or a clipping volume: the actual bounds determine the scale.
+    """
+    d = _vnorm(direction)
+    polar = abs(d[2]) > 0.985
+    ref = (0, 1, 0) if polar else (0, 0, 1)
+    right = _vnorm((ref[1] * d[2] - ref[2] * d[1],
+                    ref[2] * d[0] - ref[0] * d[2],
+                    ref[0] * d[1] - ref[1] * d[0]))
+    up = (d[1] * right[2] - d[2] * right[1],
+          d[2] * right[0] - d[0] * right[2],
+          d[0] * right[1] - d[1] * right[0])
+    span = [bounds["max"][a] - bounds["min"][a] for a in range(3)]
+    if polar:
+        max_u = max_v = math.sqrt(sum(s * s for s in span))
+    else:
+        max_u = math.hypot(span[0], span[1])
+        max_v = abs(d[2]) * max_u + math.hypot(d[0], d[1]) * span[2]
+    # Match the native focus fitter's two-percent minimum projected extent.
+    target = 1.16 * max(max(max_u, 0.02 * max_v, 2e-5) / width,
+                       max(max_v, 0.02 * max_u, 2e-5) / height)
+    side = target * min(width, height) / math.sqrt(3)
+    u = side * sum(abs(v) for v in right)
+    v = side * sum(abs(value) for value in up)
+    projected = max(max(u, 0.02 * v, 2e-5) / width,
+                    max(v, 0.02 * u, 2e-5) / height)
+    center = _bbox_centre(bounds)
+    focus = {"min": [c - side / 2 for c in center],
+             "max": [c + side / 2 for c in center]}
+    return focus, max(0.0, (target / projected - 1) / 2)
+
+
+def _animation_raster_size(scene_size: tuple) -> tuple:
+    supersample = min(2.0, 4096 / max(scene_size))
+    if supersample < 1:
+        raise ValueError("Animation output dimensions exceed the renderer's "
+                         "4096px limit; request a supported size.")
+    return tuple(max(64, min(4096, round(x * supersample))) for x in scene_size)
+
+
+def _downsample(png: str, size: tuple) -> tuple:
+    """Downsample geometry before any film typography; never recolour CAD pixels."""
+    from PIL import Image as PILImage
+    with PILImage.open(png) as im:
+        rendered = im.size
+        if rendered != size:
+            im.resize(size, PILImage.Resampling.LANCZOS).save(png)
+    return rendered
+
+
+def _collision_legend(measured: dict, index: int) -> tuple:
+    """Return (text, current-hit) only from evidence for this sample."""
+    samples = measured.get("sample_collisions") or []
+    if index < len(samples) and samples[index] is not None:
+        if not samples[index]:
+            return "", False
+        record = {"interference": {"detail": samples[index]}}
+        return _collision_text(record), True
+    first = (measured.get("interference") or {}).get("first_collision_step")
+    if isinstance(first, int) and index == first:
+        return _collision_text(measured), True
+    if isinstance(first, int) and index > first:
+        return "Prior collision detected; later state not checked", False
+    return "", False
+
+
 # ------------------------------------------------------------------------- FEA frames
 def _fea_frames(vtu_path: str, out_dir: str, frames: int, size: tuple, view,
                 warp_mm: Optional[float], field: str) -> dict:
@@ -567,7 +777,7 @@ def _fea_frames(vtu_path: str, out_dir: str, frames: int, size: tuple, view,
     surf = grid.extract_surface(algorithm="dataset_surface")
     written = []
     for i in range(frames):
-        t = 0.5 - 0.5 * math.cos(math.pi * min(1.0, i / max(1, frames * 0.62)))  # ease-in hold
+        t = 0.5 - 0.5 * math.cos(math.pi * i / max(1, frames - 1))
         pl = pv.Plotter(off_screen=True, window_size=[int(size[0]), int(size[1])])
         pl.set_background("#101114")
         pl.add_mesh(surf, style="wireframe", color="#4a4d55", line_width=1, opacity=0.55)
@@ -643,13 +853,10 @@ def register_cad_animation_tools(mcp: FastMCP) -> None:
                         poses, never a second interpolation. Each sample is held on screen
                         until the film is `frames` long, because a solve can refuse a very
                         fine increment while a watchable shot still needs seconds of
-                        frames. Every sample from the sweep's `first_collision_step` onward
-                        is marked with a red border naming the colliding pair
-                        (doc_render_view tints by face direction and has no per-body colour
-                        override, so the film marks the SAMPLE and names the pair rather
-                        than implying a body-level result the engine did not report); the
-                        caption carries the step and driver value. THREE drives, exactly
-                        one per call:
+                        frames. A measured collision sample gets a red border; a first-hit
+                        record alone gives later samples an amber "prior collision detected;
+                        later state not checked" warning. Per-sample results, when supplied
+                        by the sweep, take precedence. THREE drives, exactly one per call:
                           `mate_id` + `start`/`stop`/`steps` — simulate_motion sweeps a
                             dimensional (angle/distance) mate.
                           `steer` (+ optional `rear_steer`) — a STEER SWEEP for an assembly
@@ -742,7 +949,14 @@ def register_cad_animation_tools(mcp: FastMCP) -> None:
             W, H = (int(size[0]), int(size[1])) if (isinstance(size, (list, tuple))
                                                     and len(size) == 2) else (1280, 720)
             W, H = max(160, W - W % 2), max(120, H - H % 2)
+            footer_h = min(H - 32, max(88, round(H * 0.22)))
+            scene_size = (W, H - footer_h)
+            raster_size = _animation_raster_size(scene_size)
+            raster_sizes = set()
             prov = _provenance()
+            left_prefix = (f"chudware {_short(prov['engine_build_id'], 40)} | polymesh "
+                           f"{_short(prov['polymesh_commit'])}")
+            word = "sample" if kind == "motion" else "frame"
             work = tempfile.mkdtemp(prefix="chudware_anim_")
             t_start = time.time()
             measured: dict = {}
@@ -754,16 +968,20 @@ def register_cad_animation_tools(mcp: FastMCP) -> None:
                         "render_animation(kind='fea') needs vtu_path — the .vtu a solve "
                         "wrote (run_fea_static(vtu_path='/abs/path.vtu')). "
                         f"{vtu_path!r} does not exist.")
-                rec = _fea_frames(str(vtu_path), work, frames, (W, H - _FOOTER_H), view,
+                rec = _fea_frames(str(vtu_path), work, frames, raster_size, view,
                                   warp_mm, field)
                 measured = {k: v for k, v in rec.items() if k != "frames"}
                 doc_name = os.path.basename(str(vtu_path))
+                left = f"{left_prefix} | {doc_name}"
                 paths = rec["frames"]
+                for png in paths:
+                    raster_sizes.add(_downsample(png, scene_size))
                 foot_right = (f"{measured['field']} peak {measured['peak_field']:.4g} MPa | "
                               f"warp x{measured['warp_factor']:.0f}")
             else:
                 d = _doc(doc_id)
                 doc_name = _handoff_doc_name(d) or d
+                left = f"{left_prefix} | {doc_name}"
                 if display_quality:
                     cb.call("doc_set_display_quality",
                             {"doc_id": d, "quality": str(display_quality)})
@@ -954,6 +1172,7 @@ def register_cad_animation_tools(mcp: FastMCP) -> None:
                         first = {b.get("component"): list(b.get("transform") or [])
                                  for b in (traj[0].get("bodies") or [])
                                  if isinstance(b.get("transform"), list)}
+                        reference = sweep["reference_transforms"] if steer is None else None
                         for fr in traj:
                             frame_poses = {}
                             for b in fr.get("bodies") or []:
@@ -961,21 +1180,25 @@ def register_cad_animation_tools(mcp: FastMCP) -> None:
                                 if (cid not in base or not isinstance(tb, list)
                                         or len(tb) != 16):
                                     continue
+                                if steer is not None:
+                                    # The steering adapter reports component poses directly.
+                                    frame_poses[cid] = list(tb)
+                                    continue
                                 t0 = first.get(cid)
                                 if not t0 or len(t0) != 16:
                                     continue
-                                # delta = T_i * inv(T_0) is the rigid motion the solver
-                                # applied to this body between the first sample and this
-                                # one; composing it with the component's own pose is exact
-                                # even when a component carries several bodies.
+                                # Native body motion may include a source-local placement.
+                                # Transport the SOLVED first-sample component pose, not the
+                                # authored document pose (which can differ from start).
                                 frame_poses[cid] = _mat_mul(
-                                    _mat_mul(tb, _rigid_inverse(t0)), base[cid])
+                                    _mat_mul(tb, _rigid_inverse(t0)), reference[cid])
                             poses_per_frame.append(frame_poses)
                         interf = sweep.get("interference") or {}
                         driver = sweep.get("driver") or {}
                         measured = {"mate_id": sweep.get("mate_id"),
                                     "driver": driver,
                                     "samples": len(traj),
+                                    "sample_collisions": [fr.get("collisions") for fr in traj],
                                     "interference": {
                                         "checked": interf.get("checked"),
                                         "first_collision_step": interf.get(
@@ -1012,41 +1235,80 @@ def register_cad_animation_tools(mcp: FastMCP) -> None:
                                 {"doc_id": clone, "quality": str(display_quality)})
                     az, el = _view_angles(view)
                     dirs = [_dir_from_angles(az, el)] * len(poses_per_frame)
+                    bodies = _world_bodies(clone)
 
-                # ---- the frames themselves: the engine's own renders, one per pose ----
+                if poses_per_frame:
+                    # Read initial placements and fixed/free ownership before grounding.
+                    _freeze_clone_poses(render_doc)
+
+                # One conservative envelope for all sampled rigid poses; never per-frame fit.
+                patterned = bool(poses_per_frame) and _has_pattern_instances(bodies, base)
+                focus = (_pattern_pose_bounds(render_doc, bodies, base, poses_per_frame)
+                         if patterned else
+                         _pose_bounds(bodies, base if poses_per_frame else {}, poses_per_frame))
+                measured["framing"] = {
+                    "bounds_mm": focus, "center_mm": list(_bbox_centre(focus)),
+                    "method": "fixed full-orbit bounds projection" if kind == "turntable" else
+                              "fixed measured world bounds across sampled pattern poses"
+                              if patterned else
+                              "fixed source-body bounds transported across sampled poses",
+                    "clip_near": False}
+                scales = []
                 paths = []
                 render_count = len(poses_per_frame) if poses_per_frame else frames
-                collide_from = None
-                if kind == "motion":
-                    cs = (measured.get("interference") or {}).get("first_collision_step")
-                    collide_from = int(cs) if isinstance(cs, int) else None
+                footer_right = str(footer_note) if footer_note else foot_right
+                _, _, _, _, _, footer_h = _footer_layout(
+                    W, f"{left} | {word} {render_count}/{render_count}", footer_right)
+                footer_h = max(88, footer_h)
+                if footer_h > H - 32:
+                    raise ValueError(f"Animation footer needs {footer_h}px; increase "
+                                     "output height or shorten footer_note/document name.")
+                scene_size = (W, H - footer_h)
+                raster_size = _animation_raster_size(scene_size)
                 bg = list(_BG) if dark else None
                 for i in range(render_count):
                     if poses_per_frame:
                         _apply_poses(render_doc, poses_per_frame[i])
                     png = os.path.join(work, f"f{i:05d}.png")
+                    camera_focus, margin = (_orbit_framing(focus, dirs[i], *raster_size)
+                                            if kind == "turntable" else (focus, 0.08))
                     png, frame, _r = _render_view_png(render_doc, dirs[i], png, name="",
-                                                      W=W, H=H - _FOOTER_H,
+                                                      W=raster_size[0], H=raster_size[1],
+                                                      focus=camera_focus, margin=margin,
+                                                      clip_near=False,
                                                       annotate=bool(annotate),
                                                       background=bg)
+                    raster_sizes.add(_downsample(png, scene_size))
+                    if frame:
+                        sx, sy = W / frame["W"], scene_size[1] / frame["H"]
+                        frame = dict(frame, W=W, H=scene_size[1],
+                                     scale=frame["scale"] * min(sx, sy))
+                        scales.append(frame["scale"])
                     if annotate or highlight is not None:
                         png, _info = _annotate_render(
                             png, render_doc, dirs[i], highlight=highlight,
                             edges=bool(annotate), callouts=False, scale=bool(annotate),
                             frame=frame, out_png=png)
-                    if collide_from is not None and i >= collide_from:
-                        _mark_collision(png, _collision_text(measured))
+                    collision_text, current_hit = _collision_legend(measured, i)
+                    if collision_text:
+                        _mark_collision(png, collision_text, current=current_hit)
                     paths.append(png)
+                measured["framing"]["output_pixels_per_mm_range"] = (
+                    [min(scales), max(scales)] if scales else None)
 
             # ---- provenance footer on every RENDERED frame ----
             stem = os.path.splitext(os.path.basename(target))[0]
-            left = (f"chudware {_short(prov['engine_build_id'], 40)} | polymesh "
-                    f"{_short(prov['polymesh_commit'])} | {doc_name}")
             if footer_note:
                 foot_right = str(footer_note)
-            word = "sample" if kind == "motion" else "frame"
             for i, png in enumerate(paths):
-                _stamp_footer(png, f"{left} | {word} {i + 1}/{len(paths)}", foot_right)
+                _stamp_footer(png, f"{left} | {word} {i + 1}/{len(paths)}", foot_right,
+                              height=footer_h)
+            measured["output_quality"] = {
+                "rendered_geometry_px": [list(s) for s in sorted(raster_sizes)],
+                "delivered_geometry_px": list(scene_size), "footer_px": footer_h,
+                "downsample": "Lanczos before film typography",
+                "material_appearance": "stored CAD appearance; no film recolouring"
+                if kind != "fea" else "solved scalar field"}
 
             # ---- playback: hold each solved sample until the film is `frames` long ----
             if len(paths) < frames:
@@ -1064,11 +1326,7 @@ def register_cad_animation_tools(mcp: FastMCP) -> None:
                 head = max(1, int(round(float(hold_s) * fps)))
                 card = _caption_card(W, H, [title] + list(subtitle or []),
                                      os.path.join(work, "card.png"))
-                for k in range(head):
-                    dst = os.path.join(work, f"c{k:05d}.png")
-                    shutil.copyfile(card, dst)
-                ordered = [os.path.join(work, f"c{k:05d}.png")
-                           for k in range(head)] + list(paths)
+                ordered = [card] * head + list(paths)
             # One contiguously numbered sequence, ALWAYS: what ffmpeg's image2 demuxer
             # needs, and what a caller composing a multi-segment chapter out of several
             # render_animation calls concatenates. It cannot be skipped when the film
@@ -1079,7 +1337,7 @@ def register_cad_animation_tools(mcp: FastMCP) -> None:
             seq = os.path.join(work, "seq")
             os.makedirs(seq, exist_ok=True)
             for k, src in enumerate(ordered):
-                shutil.copyfile(src, os.path.join(seq, f"f{k:05d}.png"))
+                os.link(src, os.path.join(seq, f"f{k:05d}.png"))
             pattern = os.path.join(seq, "f%05d.png")
             total = len(ordered)
             exported = None
@@ -1103,15 +1361,18 @@ def register_cad_animation_tools(mcp: FastMCP) -> None:
             inline = render_output_path(_render_stem(doc_name or stem, "poster"), ".png")
             shutil.copyfile(poster_src, inline)
 
-            dur = probe.get("duration_s") or round(total / float(enc["fps"]), 3)
+            dur = probe.get("duration_s")
             cap = [
                 f"{kind} animation -> {target}",
                 f"{enc['bytes']} B ({enc['bytes'] / 1048576.0:.2f} MiB), sha256 {sha[:12]}",
-                f"{total} frames ({len(set(paths))} rendered"
-                + (f" + {head} title-card" if head else "") + f") at {enc['fps']} fps, "
-                f"{enc['width']}x{probe.get('height') or H} px, duration {dur} s measured by "
-                f"ffprobe (codec {probe.get('codec') or 'n/a'}, "
-                f"{probe.get('frames') or '?'} frames read back)",
+                f"{probe.get('frames') or 'unknown'} frames encoded ({total} source frames; "
+                f"{len(set(paths))} rendered"
+                + (f" + {head} title-card" if head else "")
+                + f") at target {enc['fps']} fps (source {fps} fps), "
+                f"{probe.get('width') or enc['width']}x{probe.get('height') or H} px, "
+                f"duration {dur if dur is not None else 'unknown'} s measured by ffprobe "
+                f"(source timeline {total / fps:.3f} s; codec {probe.get('codec') or 'n/a'}, "
+                f"measured average rate {probe.get('avg_frame_rate') or 'unknown'})",
                 f"engine build {prov['engine_build_id'] or 'unknown'} "
                 f"({prov['engine_build_id_source']}); polymesh commit "
                 f"{prov['polymesh_commit'] or 'unknown'} ({prov['polymesh_commit_source']}) "
@@ -1123,11 +1384,12 @@ def register_cad_animation_tools(mcp: FastMCP) -> None:
             if exported:
                 cap.append(f"frames exported: {total} PNG in {exported}")
             if len(enc["ladder"]) > 1:
-                cap.append("size ladder (fps, then width; the film keeps every frame's "
-                           f"content and both end points): {json.dumps(enc['ladder'])}")
+                cap.append("size ladder (fps, then width; temporal resampling preserves "
+                           f"duration and both endpoints): {json.dumps(enc['ladder'])}")
             if enc["bytes"] > int(max_bytes):
                 cap.append(f"WARNING: {enc['bytes']} B is still over the {int(max_bytes)} B "
-                           "budget after the whole ladder — lower `frames` or `size`.")
+                           + ("budget after the GIF size ladder." if ext == ".gif" else
+                              "budget; MP4 quality is not reduced by the GIF size ladder."))
             return [Image(path=inline), "  ".join(cap)]
         except Exception as e:  # noqa: BLE001
             return [_err(e)]

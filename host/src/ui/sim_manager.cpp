@@ -9281,6 +9281,7 @@ bool SimManager::applyMotionFrame(AppState &st, Study &s, int frame) {
     pm.color[2] = body.color[2];
     pm.metallic = body.metallic;
     pm.roughness = body.roughness;
+    pm.appearance_regions = body.appearance_regions;
     pm.faces.reserve(body.faces.size());
     for (const auto &face : body.faces)
       pm.faces.push_back(

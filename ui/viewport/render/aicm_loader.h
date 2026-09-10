@@ -34,6 +34,15 @@ struct BrepVertex {
     float xyz[3] = {0, 0, 0};
 };
 
+// Material over a nonempty span of stable 1-based face IDs, never triangle offsets.
+struct AppearanceRegion {
+    uint32_t first_face = 1;
+    uint32_t face_count = 0;
+    float color[3] = {0.62f, 0.70f, 0.82f};
+    float metallic = 0.0f;
+    float roughness = 0.5f;
+};
+
 // One renderable body: geometry + picking topology. GPU buffers are NOT here (CPU arrays only);
 // the id pass / overlays upload from these.
 struct BodyMesh {
@@ -54,6 +63,7 @@ struct BodyMesh {
     std::vector<EdgeSegment> edges;
     std::vector<float> edge_pts;  // 3*total_pts (polyline vertices referenced by EdgeSegment)
     std::vector<BrepVertex> brep_verts;
+    std::vector<AppearanceRegion> appearance_regions;
 };
 
 // Per-vertex scalar overlay (Evaluate / FEA results). Stored, exposed for C16/C19; minimal use now.

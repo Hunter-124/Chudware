@@ -1571,3 +1571,35 @@ has stopped publishing. `stalled` is true only for a running job whose age is
 strictly greater than 120 seconds; terminal jobs are never stalled.
 For lack of progress, **cancel only when `stalled` is true**. A long-running
 probe with advancing work counters is not a hung job.
+
+## World-solid integrity inspection and presentation fidelity (2026-09-09)
+
+`eval_model_integrity` accepts `{doc_id, proximity_mm:0.05,
+include_nearest:true, pair_budget_s:2.0}`. It inventories individual world-placed
+solids, including solids inside compounded assembly components, without changing
+the source document. Body/component/source provenance and revision-scoped solid
+identifiers accompany validity, signed volume, centroid and bounds.
+
+Exact near-pair distance and overlap checks produce geometric proximity islands,
+isolated-solid candidates and optional nearest-neighbor evidence. Positive gaps
+are `proximity`, never physical contact. Bounding-box broadphase rejection is not
+an exact distance measurement. A fixed component or a geometric connection does
+not establish an attachment, intended joint, preload, or structural load path.
+The caller must investigate isolated candidates before deleting or repositioning
+anything; running clearances and separate fasteners may be intentional.
+
+Native failures and timed-out checks are explicit in `pair_failures` and
+`complete`; `ok` describes execution, not engineering acceptance. Empty documents
+are refused. Counts distinguish possible, candidate, completed and failed checks.
+The MCP `inspect_model_integrity` tool preserves this evidence and does not mark
+placement or structural requirements verified.
+
+Headless `doc_render_view` accepts image dimensions up to 4096 pixels per axis,
+retaining the 64-pixel lower bound and existing defaults. Animation renders can
+therefore supersample 1080p CAD frames before downsampling and adding readable
+text. Saved source appearance is preserved through assembly nesting via the
+optional AICM `APRG` chunk; diagnostic orientation and scalar-field colors are
+separate display modes. Animation camera framing is fixed across the pose
+envelope, and GIF output-rate reduction resamples the source timeline rather
+than changing its duration. A first-collision-only result is not evidence of
+collision at every subsequent pose.

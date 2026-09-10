@@ -24,18 +24,30 @@
 #include <vector>
 #include <miniz.h>
 
+#include <BRepBuilderAPI_MakeEdge.hxx>
+#include <BRepBuilderAPI_MakeFace.hxx>
+#include <BRepBuilderAPI_MakeVertex.hxx>
+#include <BRepBuilderAPI_MakeWire.hxx>
 #include <BRepGProp.hxx>
 #include <BRepPrimAPI_MakeBox.hxx>
+#include <BRep_Builder.hxx>
 #include <BRep_Tool.hxx>
 #include <GProp_GProps.hxx>
+#include <IGESControl_Writer.hxx>
 #include <Poly_Triangulation.hxx>
+#include <TopExp.hxx>
 #include <TopExp_Explorer.hxx>
 #include <TopLoc_Location.hxx>
+#include <TopTools_IndexedMapOfShape.hxx>
+#include <TopTools_MapOfShape.hxx>
 #include <TopoDS.hxx>
+#include <TopoDS_Compound.hxx>
 #include <TopoDS_Face.hxx>
 #include <TopoDS_Shape.hxx>
+#include <TopoDS_Shell.hxx>
 #include <gp_Dir.hxx>
 #include <gp_Pnt.hxx>
+#include <gp_Pln.hxx>
 #include <gp_Vec.hxx>
 
 #include "doc/formats.h"
@@ -61,6 +73,29 @@ int body_count(const json& resp) {
 }
 fs::path tmp(const std::string& name) {
     return fs::temp_directory_path() / ("chudware_imp_" + name);
+}
+
+TopoDS_Compound compound(const std::vector<TopoDS_Shape>& shapes) {
+    BRep_Builder builder;
+    TopoDS_Compound result;
+    builder.MakeCompound(result);
+    for (const auto& shape : shapes) builder.Add(result, shape);
+    return result;
+}
+
+void check_unique_topology(
+    const std::vector<std::pair<std::string, TopoDS_Shape>>& bodies,
+    TopAbs_ShapeEnum kind, int expected) {
+    TopTools_MapOfShape seen;
+    int count = 0;
+    for (const auto& body : bodies) {
+        TopTools_IndexedMapOfShape members;
+        TopExp::MapShapes(body.second, kind, members);
+        count += members.Extent();
+        for (int i = 1; i <= members.Extent(); ++i)
+            CHECK(seen.Add(members(i)));
+    }
+    CHECK(count == expected);
 }
 
 void append_u32(std::string& out, std::uint32_t value) {
@@ -246,6 +281,171 @@ TEST_CASE("multi-solid STEP imports as separate bodies") {
     json r = doc_import_file(step.string(), "", false, "");
     CHECK(body_count(r) == 2);  // the bug merged them into one compound body
     fs::remove(step);
+}
+
+TEST_CASE("mixed STEP and BREP preserve surface bodies after stable solid ordinals") {
+    const TopoDS_Shape first = BRepPrimAPI_MakeBox(10.0, 10.0, 10.0).Shape();
+    const TopoDS_Shape second =
+        BRepPrimAPI_MakeBox(gp_Pnt(20, 0, 0), 2.0, 4.0, 6.0).Shape();
+    const TopoDS_Face shell_face =
+        BRepBuilderAPI_MakeFace(gp_Pln(gp_Pnt(40, 0, 0), gp_Dir(0, 0, 1)),
+                                0.0, 5.0, 0.0, 6.0).Face();
+    TopoDS_Shell shell;
+    BRep_Builder builder;
+    builder.MakeShell(shell);
+    builder.Add(shell, shell_face);
+    const TopoDS_Face face =
+        BRepBuilderAPI_MakeFace(gp_Pln(gp_Pnt(70, 0, 0), gp_Dir(0, 0, 1)),
+                                0.0, 2.0, 0.0, 3.0).Face();
+    // Surfaces deliberately precede/interleave solids: existing solid body IDs
+    // must not shift when the previously discarded surfaces become visible.
+    const TopoDS_Compound mixed = compound({shell, first, face, second});
+    for (const std::string format : {"step", "brep"}) {
+        CAPTURE(format);
+        const fs::path path = tmp("mixed_surfaces." + format);
+        chudware::doc::export_bodies({mixed}, path.string(), format);
+        const auto bodies = chudware::doc::import_bodies(path.string(), format);
+        REQUIRE(bodies.size() == 4);
+        for (std::size_t i = 0; i < bodies.size(); ++i)
+            CHECK(bodies[i].first == "Body" + std::to_string(i + 1));
+        CHECK(bodies[0].second.ShapeType() == TopAbs_SOLID);
+        CHECK(bodies[1].second.ShapeType() == TopAbs_SOLID);
+        CHECK(vol(bodies[0].second) == doctest::Approx(1000.0));
+        CHECK(vol(bodies[1].second) == doctest::Approx(48.0));
+        GProp_GProps center;
+        BRepGProp::VolumeProperties(bodies[1].second, center);
+        CHECK(center.CentreOfMass().X() == doctest::Approx(21.0));
+        double surface_area = 0.0;
+        for (std::size_t i = 2; i < bodies.size(); ++i) {
+            CHECK_FALSE(TopExp_Explorer(bodies[i].second, TopAbs_SOLID).More());
+            GProp_GProps area;
+            BRepGProp::SurfaceProperties(bodies[i].second, area);
+            surface_area += area.Mass();
+        }
+        CHECK(surface_area == doctest::Approx(36.0));
+        check_unique_topology(bodies, TopAbs_FACE, 14);
+        check_unique_topology(bodies, TopAbs_EDGE, 32);
+        const json imported =
+            chudware::doc::doc_import_file(path.string(), "", false, format);
+        auto check_document = [](const json& response) {
+            REQUIRE(body_count(response) == 4);
+            const auto& rows = response.at("tess").at("bodies");
+            CHECK(rows[0].at("kind") == "solid");
+            CHECK(rows[1].at("kind") == "solid");
+            CHECK(rows[2].at("kind") == "surface");
+            CHECK(rows[3].at("kind") == "surface");
+            CHECK(response.at("volume").get<double>() == doctest::Approx(1048.0));
+            const json census = chudware::doc::doc_eval_model_integrity(
+                response.at("doc_id").get<std::string>(), {{"include_nearest", false}});
+            REQUIRE(census.at("solids").size() == 2);
+            REQUIRE(census.at("non_solids").size() == 2);
+            CHECK(census.at("solids")[0].at("volume_mm3").get<double>() ==
+                  doctest::Approx(1000.0));
+            CHECK(census.at("solids")[1].at("volume_mm3").get<double>() ==
+                  doctest::Approx(48.0));
+            CHECK(census.at("non_solids")[0].at("body_id") == 3);
+            CHECK(census.at("non_solids")[1].at("body_id") == 4);
+            CHECK_FALSE(census.at("complete").get<bool>());
+        };
+        check_document(imported);
+        const fs::path native = tmp("mixed_surfaces_" + format + ".step+");
+        chudware::doc::doc_save(imported.at("doc_id").get<std::string>(), native.string());
+        fs::remove(path);
+        const json reopened = chudware::doc::doc_open(native.string(), false);
+        check_document(reopened);
+        const json destination = chudware::doc::doc_new("part", "MixedNativeImport");
+        const json reimported = chudware::doc::doc_import_file(
+            native.string(), destination.at("doc_id").get<std::string>(), false, "");
+        check_document(reimported);
+        chudware::doc::doc_close(imported.at("doc_id").get<std::string>());
+        chudware::doc::doc_close(reopened.at("doc_id").get<std::string>());
+        chudware::doc::doc_close(destination.at("doc_id").get<std::string>());
+        fs::remove(native);
+    }
+}
+
+TEST_CASE("mixed BREP keeps free curves and points without duplicating owned topology") {
+    const TopoDS_Shape solid = BRepPrimAPI_MakeBox(10.0, 10.0, 10.0).Shape();
+    const TopoDS_Face face =
+        BRepBuilderAPI_MakeFace(gp_Pln(gp_Pnt(40, 0, 0), gp_Dir(0, 0, 1)),
+                                0.0, 5.0, 0.0, 6.0).Face();
+    TopoDS_Shell shell;
+    BRep_Builder builder;
+    builder.MakeShell(shell);
+    builder.Add(shell, face);
+    const TopoDS_Shape wire = BRepBuilderAPI_MakeWire(
+        BRepBuilderAPI_MakeEdge(gp_Pnt(60, 0, 0), gp_Pnt(61, 0, 0)).Edge()).Shape();
+    const TopoDS_Shape edge =
+        BRepBuilderAPI_MakeEdge(gp_Pnt(70, 0, 0), gp_Pnt(71, 0, 0)).Shape();
+    const TopoDS_Shape vertex = BRepBuilderAPI_MakeVertex(gp_Pnt(80, 0, 0)).Shape();
+    // New containers around existing members are not new authored geometry.
+    TopoDS_Shell overlapping_shell;
+    builder.MakeShell(overlapping_shell);
+    builder.Add(overlapping_shell, TopExp_Explorer(solid, TopAbs_FACE).Current());
+    builder.Add(overlapping_shell, face);
+    const TopoDS_Shape overlapping_wire = BRepBuilderAPI_MakeWire(
+        TopoDS::Edge(TopExp_Explorer(solid, TopAbs_EDGE).Current())).Shape();
+    const TopoDS_Compound mixed = compound({
+        overlapping_shell, overlapping_wire, face, wire, solid, shell, edge, vertex,
+        TopExp_Explorer(solid, TopAbs_FACE).Current(),
+        TopExp_Explorer(solid, TopAbs_SHELL).Current(),
+        TopExp_Explorer(face, TopAbs_WIRE).Current(),
+        TopExp_Explorer(wire, TopAbs_EDGE).Current(),
+        TopExp_Explorer(edge, TopAbs_VERTEX).Current()});
+    const fs::path path = tmp("mixed_aliases.brep");
+    chudware::doc::export_bodies({mixed}, path.string(), "brep");
+    const auto bodies = chudware::doc::import_bodies(path.string(), "brep");
+    REQUIRE(bodies.size() == 5);
+    CHECK(bodies[0].second.ShapeType() == TopAbs_SOLID);
+    CHECK(bodies[1].second.ShapeType() == TopAbs_SHELL);
+    CHECK(bodies[2].second.ShapeType() == TopAbs_WIRE);
+    CHECK(bodies[3].second.ShapeType() == TopAbs_EDGE);
+    CHECK(bodies[4].second.ShapeType() == TopAbs_VERTEX);
+    check_unique_topology(bodies, TopAbs_FACE, 7);
+    check_unique_topology(bodies, TopAbs_EDGE, 18);
+    check_unique_topology(bodies, TopAbs_VERTEX, 17);
+    fs::remove(path);
+
+    const fs::path surface_path = tmp("surfaces_only.brep");
+    chudware::doc::export_bodies({compound({shell, wire, edge, vertex})},
+                                surface_path.string(), "brep");
+    const auto surfaces =
+        chudware::doc::import_bodies(surface_path.string(), "brep");
+    REQUIRE(surfaces.size() == 1);
+    CHECK(surfaces.front().second.ShapeType() == TopAbs_COMPOUND);
+    CHECK_FALSE(TopExp_Explorer(surfaces.front().second, TopAbs_SOLID).More());
+    check_unique_topology(surfaces, TopAbs_FACE, 1);
+    check_unique_topology(surfaces, TopAbs_EDGE, 6);
+    fs::remove(surface_path);
+}
+
+TEST_CASE("IGES shell promotion retains every closed shell and detached surface") {
+    const fs::path path = tmp("multiple_shells.iges");
+    const TopoDS_Shape first = BRepPrimAPI_MakeBox(10.0, 10.0, 10.0).Shape();
+    const TopoDS_Shape second =
+        BRepPrimAPI_MakeBox(gp_Pnt(20, 0, 0), 2.0, 4.0, 6.0).Shape();
+    const TopoDS_Shape face =
+        BRepBuilderAPI_MakeFace(gp_Pln(gp_Pnt(40, 0, 0), gp_Dir(0, 0, 1)),
+                                0.0, 5.0, 0.0, 6.0).Shape();
+    // Face-mode output exercises import sewing/promotion, not a prebuilt solid.
+    IGESControl_Writer writer("MM", 0);
+    REQUIRE(writer.AddShape(TopExp_Explorer(first, TopAbs_SHELL).Current()));
+    REQUIRE(writer.AddShape(TopExp_Explorer(second, TopAbs_SHELL).Current()));
+    REQUIRE(writer.AddShape(face));
+    writer.ComputeModel();
+    REQUIRE(writer.Write(path.string().c_str()));
+    const auto bodies = chudware::doc::import_bodies(path.string(), "iges");
+    REQUIRE(bodies.size() == 3);
+    CHECK(bodies[0].second.ShapeType() == TopAbs_SOLID);
+    CHECK(bodies[1].second.ShapeType() == TopAbs_SOLID);
+    CHECK(vol(bodies[0].second) + vol(bodies[1].second) == doctest::Approx(1048.0));
+    CHECK_FALSE(TopExp_Explorer(bodies[2].second, TopAbs_SOLID).More());
+    GProp_GProps area;
+    BRepGProp::SurfaceProperties(bodies[2].second, area);
+    CHECK(area.Mass() == doctest::Approx(30.0));
+    check_unique_topology(bodies, TopAbs_FACE, 13);
+    check_unique_topology(bodies, TopAbs_EDGE, 28);
+    fs::remove(path);
 }
 
 // --- N-8 + manual import + N-4 round-trip. ---------------------------------------------

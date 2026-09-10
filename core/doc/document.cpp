@@ -3803,7 +3803,7 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                 // (`embedded_brep`, written by doc_import_file): that makes a saved .step+
                 // self-contained — it no longer depends on the original source file
                 // surviving on disk (Bug N-8). Fall back to re-reading `source_path` for
-                // legacy features / when no blob is present. Each imported solid becomes
+                // legacy features / when no blob is present. Each imported body becomes
                 // its OWN body ("<id>#k"), so a multi-body STEP keeps its bodies separate
                 // (Bug N-5) instead of being merged into one compound.
                 std::vector<TopoDS_Shape> solids;
@@ -3823,12 +3823,7 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                     if (cit != import_cache.end()) {
                         solids = cit->second;  // SHARE the cached TShape(s) across identical imports
                     } else {
-                        TopoDS_Shape baked = brep_b64_to_shape(embedded);
-                        if (!baked.IsNull()) {
-                            for (TopExp_Explorer ex(baked, TopAbs_SOLID); ex.More(); ex.Next())
-                                solids.push_back(ex.Current());
-                            if (solids.empty()) solids.push_back(baked);  // bare shell/solid
-                        }
+                        solids = split_import_bodies(brep_b64_to_shape(embedded));
                         import_cache.emplace(emb_key, solids);
                     }
                 }
@@ -3947,11 +3942,13 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                     body_names = std::move(kept_names);
                 }
 
-                // Register each surviving solid as a separate body (id = "<fid>" then
+                // Register each surviving body as a separate body (id = "<fid>" then
                 // "<fid>#k"), renumbered over the KEPT set.
                 for (std::size_t k = 0; k < solids.size(); ++k) {
                     std::string pid = (k == 0) ? id : id + "#" + std::to_string(k);
                     results[pid] = SolidResult{solids[k]};
+                    if (!TopExp_Explorer(solids[k], TopAbs_SOLID).More())
+                        body_kinds[pid] = "surface";
                     solid_order.push_back(pid);
                 }
                 st.ok = true;

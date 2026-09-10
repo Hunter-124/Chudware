@@ -35,8 +35,10 @@
 #include <gp_Pnt.hxx>
 #include <miniz.h>
 
+#include "doc/assembly.h"
 #include "doc/formats.h"
 #include "doc/session.h"
+#include "doc/stepplus.h"
 
 using nlohmann::json;
 namespace fs = std::filesystem;
@@ -114,6 +116,27 @@ double total_volume(const std::vector<TopoDS_Shape>& solids) {
         v += std::abs(props.Mass());
     }
     return v;
+}
+
+void save_box_part(const fs::path& path) {
+    using namespace chudware::doc;
+    const std::string id = doc_new("part", "nested_source").at("doc_id").get<std::string>();
+    doc_apply_ops(id, -1, json::array({
+        {{"op", "add_feature"}, {"feature", {
+            {"type", "box"}, {"name", "survivor"},
+            {"params", {{"length", 10.0}, {"width", 10.0}, {"height", 10.0}}}
+        }}}
+    }), false);
+    doc_save(id, path.string());
+}
+
+std::pair<std::string, json> insert_native_source(const fs::path& path) {
+    using namespace chudware::doc;
+    const std::string id = doc_new("assembly", "nested_parent").at("doc_id").get<std::string>();
+    json response = doc_apply_ops(id, -1, json::array({
+        {{"op", "asm_insert_component"}, {"source", {{"path", path.string()}}}, {"fixed", true}}
+    }), false);
+    return {id, std::move(response)};
 }
 }  // namespace
 
@@ -245,4 +268,178 @@ TEST_CASE("doc_save omits geometry.step when the document has no successful rebu
     CHECK(geometry_step_of(out).empty());
 
     fs::remove(out);
+}
+
+TEST_CASE("partial native child reports its failed feature without dropping surviving geometry") {
+    using namespace chudware::doc;
+    const fs::path part = tmp("partial_child.step+");
+    const fs::path nested = tmp("partial_nested.step+");
+    save_box_part(part);
+    json child = stepplus_open(part.string()).doc;
+    child["features"].push_back({{"id", "broken_child_feature"}, {"type", "unsupported_feature"},
+                                 {"params", json::object()}, {"refs", json::object()}});
+    // No solved cache: rebuild the actual authored feature tree, not its old good snapshot.
+    stepplus_save(child, part.string(), {});
+
+    const auto [id, response] = insert_native_source(part);
+    REQUIRE(response["rebuild"]["components"].size() == 1);
+    CHECK(response["rebuild"]["components"][0]["ok"] == false);
+    CHECK(response["rebuild"]["converged"] == false);
+    const std::string error = response["rebuild"]["components"][0]["error"].get<std::string>();
+    CHECK(error.find("broken_child_feature") != std::string::npos);
+    const json report = doc_eval_model_integrity(id, json::object());
+    CHECK(report["complete"] == false);
+    REQUIRE(report["solids"].size() == 1);
+    CHECK(report["assembly"]["components"][0]["status"] == "failed");
+    CHECK_FALSE(report["source_failures"].empty());
+
+    // The same partial geometry and diagnostic must survive another assembly boundary.
+    doc_save(id, nested.string());
+    const auto [outer_id, outer_response] = insert_native_source(nested);
+    CHECK(outer_response["rebuild"]["components"][0]["ok"] == false);
+    CHECK(outer_response["rebuild"]["components"][0]["error"].get<std::string>().find(
+              "broken_child_feature") != std::string::npos);
+    const json outer_report = doc_eval_model_integrity(outer_id, json::object());
+    CHECK(outer_report["complete"] == false);
+    CHECK(outer_report["solids"].size() == 1);
+    fs::remove(part); fs::remove(nested);
+}
+
+TEST_CASE("nested unresolved mate preserves provisional bodies and prevents clean parent rebuild") {
+    using namespace chudware::doc;
+    const fs::path part = tmp("unsolved_child_part.step+");
+    const fs::path nested = tmp("unsolved_child_assembly.step+");
+    save_box_part(part);
+    const auto [child_id, child_response] = insert_native_source(part);
+    REQUIRE(child_response["rebuild"]["converged"] == true);
+    doc_save(child_id, nested.string());
+    json child = stepplus_open(nested.string()).doc;
+    const std::string component = child["components"][0]["id"].get<std::string>();
+    child["mates"] = json::array({{
+        {"id", "unresolved_child_mate"}, {"type", "coincident"},
+        {"refs", json::array({
+            {{"component", component}, {"selector", {{"kind", "unsupported"}}}},
+            {{"component", "missing_component"}, {"selector", {{"kind", "face"}}}}
+        })}
+    }});
+    stepplus_save(child, nested.string(), {});
+
+    const auto [id, response] = insert_native_source(nested);
+    CHECK(response["rebuild"]["converged"] == false);
+    REQUIRE(response["rebuild"]["components"].size() == 1);
+    CHECK(response["rebuild"]["components"][0]["ok"] == false);
+    CHECK(response["rebuild"]["components"][0]["error"].get<std::string>().find(
+              "unresolved_child_mate") != std::string::npos);
+    const json report = doc_eval_model_integrity(id, json::object());
+    CHECK(report["complete"] == false);
+    CHECK(report["solids"].size() == 1);
+    CHECK_FALSE(report["source_failures"].empty());
+    fs::remove(part); fs::remove(nested);
+}
+
+TEST_CASE("fully rebuilt nested native source remains complete and exports unchanged geometry") {
+    using namespace chudware::doc;
+    const fs::path part = tmp("complete_child_part.step+");
+    const fs::path nested = tmp("complete_child_assembly.step+");
+    const fs::path output = tmp("complete_nested_export.step");
+    save_box_part(part);
+    const auto [child_id, child_response] = insert_native_source(part);
+    REQUIRE(child_response["rebuild"]["converged"] == true);
+    doc_save(child_id, nested.string());
+    const auto [id, response] = insert_native_source(nested);
+    CHECK(response["rebuild"]["converged"] == true);
+    CHECK(response["rebuild"]["components"][0]["ok"] == true);
+    const json report = doc_eval_model_integrity(id, json::object());
+    CHECK(report["complete"] == true);
+    CHECK(report["source_failures"].empty());
+    REQUIRE(report["solids"].size() == 1);
+    const json exported = doc_export_file(id, output.string(), "step", 0.0, 0.0, false, false);
+    CHECK(exported["validated"] == true);
+    CHECK(exported["expected_solids"] == 1);
+    std::vector<TopoDS_Shape> solids;
+    for (const auto& body : import_bodies(output.string(), "step")) solids.push_back(body.second);
+    CHECK(total_volume(solids) == doctest::Approx(1000.0).epsilon(0.001));
+    fs::remove(part); fs::remove(nested); fs::remove(output);
+}
+
+TEST_CASE("assembly pattern failure retains earlier instances and reports authored feature") {
+    using namespace chudware::doc;
+    const fs::path part = tmp("pattern_status_part.step+");
+    save_box_part(part);
+    json assembly{
+        {"schema", "aicad.asm/1"},
+        {"components", json::array({{{"id", "seed"}, {"fixed", true},
+                                     {"source", {{"path", part.string()}}}}})},
+        {"features", json::array({
+            {{"id", "valid_pattern"}, {"type", "asm_linear_pattern"},
+             {"refs", {{"components", json::array({"seed"})}, {"dir1", "x"}}},
+             {"params", {{"count1", 2}, {"spacing1", 20.0}}}},
+            {{"id", "broken_pattern"}, {"type", "asm_circular_pattern"},
+             {"refs", {{"components", json::array({"seed"})}, {"axis", "z"}}},
+             {"params", {{"count", 2}, {"equal_spacing", true}}}}
+        })}
+    };
+    SUBCASE("exception in later pattern") {
+        assembly["features"][1]["params"]["equal_spacing"] = "not_a_boolean";
+    }
+    SUBCASE("unresolved direction instead of exception") {
+        assembly["features"][1]["refs"]["axis"] = "missing_axis";
+    }
+    SUBCASE("missing seed alongside surviving seed") {
+        assembly["features"][1]["refs"]["components"] = json::array({"seed", "missing_seed"});
+    }
+    const AssemblyResult result = compile_assembly(assembly);
+    CHECK_FALSE(result.converged);
+    REQUIRE(result.feature_status.size() == 2);
+    CHECK(result.feature_status[0].ok);
+    CHECK_FALSE(result.feature_status[1].ok);
+    CHECK(result.feature_status[1].id == "broken_pattern");
+    CHECK_FALSE(result.feature_status[1].error.empty());
+    REQUIRE(result.bodies.size() >= 2);
+    CHECK(result.bodies[0].component_id == "seed");
+    CHECK(result.bodies[0].body_id == 1);
+    CHECK(result.bodies[1].component_id == "seed#1");
+    CHECK(total_volume({placed_world_shape(result.bodies[0]),
+                        placed_world_shape(result.bodies[1])}) == doctest::Approx(2000.0));
+    fs::remove(part);
+}
+
+TEST_CASE("component source replacement changes saved and exported geometry without moving it") {
+    using namespace chudware::doc;
+    const fs::path a = tmp("source_edit_a.step"), b = tmp("source_edit_b.step");
+    const fs::path replacement = tmp("source_edit_replacement.step");
+    const fs::path saved = tmp("source_edit.step+"), output = tmp("source_edit_out.step");
+    const std::string id = make_two_part_assembly(a, b);
+    const json pose = json::array({1, 0, 0, 25, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1});
+    doc_apply_ops(id, -1, json::array({
+        {{"op", "asm_edit_component"}, {"id", "k2"}, {"fixed", true}, {"transform", pose}}
+    }), false);
+    REQUIRE(doc_bbox(id)["max"][0].get<double>() == doctest::Approx(85.0));
+    export_bodies({
+        BRepPrimAPI_MakeBox(gp_Pnt(0, 0, 0), 20.0, 10.0, 10.0).Shape(),
+        BRepPrimAPI_MakeBox(gp_Pnt(30, 0, 0), 10.0, 10.0, 10.0).Shape()
+    }, replacement.string(), "step");
+    doc_apply_ops(id, -1, json::array({
+        {{"op", "asm_edit_component"}, {"id", "k2"},
+         {"source", {{"path", replacement.string()}}}}
+    }), false);
+    CHECK(doc_bbox(id)["max"][0].get<double>() == doctest::Approx(65.0));
+    CHECK_THROWS(doc_apply_ops(id, -1, json::array({
+        {{"op", "asm_edit_component"}, {"id", "k2"}, {"source", 42}}
+    }), false));
+    CHECK(doc_bbox(id)["max"][0].get<double>() == doctest::Approx(65.0));
+    doc_save(id, saved.string());
+    doc_close(id);
+    const std::string reopened = doc_open(saved.string()).at("doc_id").get<std::string>();
+    CHECK(doc_bbox(reopened)["max"][0].get<double>() == doctest::Approx(65.0));
+    const json result = doc_export_file(reopened, output.string(), "step", 0.0, 0.0, false, false);
+    REQUIRE(result["validated"] == true);
+    CHECK(result["expected_solids"] == 3);
+    std::vector<TopoDS_Shape> solids;
+    for (const auto& named : import_bodies(output.string(), "step"))
+        solids.push_back(named.second);
+    CHECK(total_volume(solids) == doctest::Approx(4000.0));
+    doc_close(reopened);
+    for (const fs::path& path : {a, b, replacement, saved, output})
+        fs::remove(path);
 }

@@ -33,6 +33,17 @@ ENTRIES: dict[str, dict[str, Any]] = {
             "heal_body (a recorded ShapeFix repair)."
         ),
     },
+    "inspect_model_integrity": {
+        "prompt_note": (
+            "Read-only census of EVERY solid, including disconnected children inside "
+            "assembly components. Inspect complete, source_failures, pair_failures, "
+            "isolated_solids and nearest; ok only means the query ran. proximity_mm is "
+            "a search radius, not approved clearance; a positive gap is not contact. "
+            "Increase pair_budget_s (maximum60) when exact checks time out, never "
+            "treat unknown evidence as clean. Geometric islands, overlaps and fixed "
+            "flags do not establish fastening, mechanical capture or a load path."
+        ),
+    },
     "heal_body": {
         "prompt_note": (
             "The repair check_geometry_health refuses — use it ONLY on a body "

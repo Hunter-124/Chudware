@@ -9,7 +9,7 @@
 //   Header : "AICM" · u32 version=1 · u32 chunk_count
 //   Chunk  : fourcc[4] · u64 payload_len · payload
 //   String : u16 byte_len + UTF-8 bytes (no terminator)
-// Per body, in order: BODY, FACE, EDGE, VERT. chunk_count = 4 * n_bodies.
+// Per body, in order: BODY, FACE, EDGE, VERT, then optional APRG appearance regions.
 #pragma once
 
 #include <cstdint>
@@ -41,6 +41,15 @@ struct EdgeRec {
 struct VertRec {
     uint32_t vertex_id = 0;
     float xyz[3] = {0, 0, 0};
+};
+
+// Material over a nonempty span of stable 1-based face IDs, never triangle offsets.
+struct AppearanceRegion {
+    uint32_t first_face = 1;
+    uint32_t face_count = 0;
+    float color[3] = {0.62f, 0.70f, 0.82f};
+    float metallic = 0.0f;
+    float roughness = 0.5f;
 };
 
 // Copy-on-write vector: AicmBody assignment / cache-hit reuse is O(1) pointer
@@ -125,6 +134,7 @@ struct AicmBody {
     // C32-A RealView material trailer (dielectric default == pre-C32 look).
     float metallic = 0.0f;
     float roughness = 0.5f;
+    std::vector<AppearanceRegion> appearance_regions;
 
     uint32_t n_verts() const { return static_cast<uint32_t>(pos.size() / 3); }
     uint32_t n_tris() const { return static_cast<uint32_t>(idx.size() / 3); }

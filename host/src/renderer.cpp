@@ -1149,6 +1149,55 @@ void Renderer::setMesh(const Mesh& m) {
     setMeshes({p});
 }
 
+void Renderer::drawSubFaces(const Sub& s, uint32_t firstTri, uint32_t triCount, int editing) {
+    auto draw = [](uint32_t first, uint32_t count) {
+        if (count)
+            glDrawElements(GL_TRIANGLES, static_cast<GLsizei>(count * 3), GL_UNSIGNED_INT,
+                           reinterpret_cast<const void*>(size_t(first) * 3 * sizeof(unsigned int)));
+    };
+    if (editing < 0 || s.faces.empty()) {
+        if (editing != 1) draw(firstTri, triCount);
+        return;
+    }
+    const uint64_t hi = uint64_t(s.body_id) << 32;
+    const uint64_t endTri = uint64_t(firstTri) + triCount;
+    uint32_t runFirst = 0, runCount = 0;
+    auto face = std::lower_bound(s.faces.begin(), s.faces.end(), firstTri,
+        [](const FaceSpan& f, uint32_t first) {
+            return uint64_t(f.first_tri) + f.tri_count <= first;
+        });
+    for (; face != s.faces.end() && face->first_tri < endTri; ++face) {
+        if ((previewFaces_.count(hi | face->face_id) != 0) != (editing != 0)) continue;
+        const uint32_t first = std::max(firstTri, face->first_tri);
+        const uint32_t end = static_cast<uint32_t>(
+            std::min(endTri, uint64_t(face->first_tri) + face->tri_count));
+        if (end <= first) continue;
+        if (runCount && runFirst + runCount != first) {
+            draw(runFirst, runCount);
+            runCount = 0;
+        }
+        if (!runCount) runFirst = first;
+        runCount += end - first;
+    }
+    draw(runFirst, runCount);
+}
+
+void Renderer::drawSubMaterials(const Sub& s, bool isolate) {
+    if (s.materials.empty()) {
+        glUniform3fv(uFace_.color, 1, s.color);
+        glUniform1f(uFace_.metallic, s.metallic);
+        glUniform1f(uFace_.roughness, s.roughness);
+        drawSubFaces(s, 0, static_cast<uint32_t>(s.idxCount / 3), isolate ? 0 : -1);
+        return;
+    }
+    for (const auto& material : s.materials) {
+        glUniform3fv(uFace_.color, 1, material.color);
+        glUniform1f(uFace_.metallic, material.metallic);
+        glUniform1f(uFace_.roughness, material.roughness);
+        drawSubFaces(s, material.first_tri, material.tri_count, isolate ? 0 : -1);
+    }
+}
+
 void Renderer::setMeshes(const std::vector<PartMesh>& parts) {
     freeSubs();
     // setMeshes is a content change/rebuild, not a tab bind. The caller marks the new immutable
@@ -1178,6 +1227,64 @@ void Renderer::setMeshes(const std::vector<PartMesh>& parts) {
         s.faces = part.faces;
         std::sort(s.faces.begin(), s.faces.end(),
                   [](const FaceSpan& a, const FaceSpan& b) { return a.first_tri < b.first_tri; });
+        if (!part.appearance_regions.empty()) {
+            // APRG is sorted by first_face by the loader. Resolve IDs only on upload;
+            // draw time walks compact triangle runs over the unchanged index buffer.
+            auto append = [&](uint32_t firstTri, uint32_t triCount, const float* color,
+                              float metallic, float roughness) {
+                if (!triCount) return;
+                if (!s.materials.empty()) {
+                    auto& last = s.materials.back();
+                    if (last.first_tri + last.tri_count == firstTri &&
+                        std::equal(last.color, last.color + 3, color) &&
+                        last.metallic == metallic && last.roughness == roughness) {
+                        last.tri_count += triCount;
+                        return;
+                    }
+                }
+                MaterialSpan span;
+                span.first_tri = firstTri;
+                span.tri_count = triCount;
+                std::copy(color, color + 3, span.color);
+                span.metallic = metallic;
+                span.roughness = roughness;
+                s.materials.push_back(span);
+            };
+            const uint32_t totalTris = static_cast<uint32_t>(m.indices.size() / 3);
+            uint32_t nextTri = 0;
+            for (const auto& face : s.faces) {
+                const uint32_t firstTri = std::min(face.first_tri, totalTris);
+                const uint32_t endTri = static_cast<uint32_t>(std::min(
+                    uint64_t(face.first_tri) + face.tri_count, uint64_t(totalTris)));
+                if (firstTri > nextTri)
+                    append(nextTri, firstTri - nextTri, s.color, s.metallic, s.roughness);
+                const uint32_t start = std::max(firstTri, nextTri);
+                if (endTri <= start) continue;
+                auto region = std::upper_bound(
+                    part.appearance_regions.begin(), part.appearance_regions.end(), face.face_id,
+                    [](uint32_t id, const render::AppearanceRegion& r) { return id < r.first_face; });
+                const render::AppearanceRegion* material = nullptr;
+                if (region != part.appearance_regions.begin()) {
+                    --region;
+                    if (uint64_t(face.face_id) < uint64_t(region->first_face) + region->face_count)
+                        material = &*region;
+                }
+                append(start, endTri - start, material ? material->color : s.color,
+                       material ? material->metallic : s.metallic,
+                       material ? material->roughness : s.roughness);
+                nextTri = endTri;
+            }
+            if (nextTri < totalTris)
+                append(nextTri, totalTris - nextTri, s.color, s.metallic, s.roughness);
+            // Uniform authored bodies retain the original one-draw fast path.
+            if (s.materials.size() == 1) {
+                const auto& material = s.materials.front();
+                std::copy(material.color, material.color + 3, s.color);
+                s.metallic = material.metallic;
+                s.roughness = material.roughness;
+                s.materials.clear();
+            }
+        }
         // C19: keep CPU copies so the deform slider can re-upload displaced positions.
         s.basePos = m.positions;
         s.baseEdge = m.edgeLines;
@@ -1438,33 +1545,6 @@ void Renderer::drawCurrent(float yawDeg, float pitchDeg, float zoom) {
     // opaque model. HLR forces everything opaque (its faces only write depth, no color).
     const bool isolate = (previewAlpha_ < 0.999f) && !previewFaces_.empty() && !hlr;
 
-    // Draw the faces of `s` whose membership in the edited-feature set equals `editing`, as a few
-    // merged contiguous index ranges (s.faces is sorted by first_tri, so neighbours coalesce). A body
-    // with no face metadata is one whole non-editing range (drawn only in the opaque pass).
-    auto drawSubFaces = [&](const Sub& s, bool editing) {
-        if (s.faces.empty()) {
-            if (!editing) glDrawElements(GL_TRIANGLES, s.idxCount, GL_UNSIGNED_INT, 0);
-            return;
-        }
-        const uint64_t hi = (uint64_t)s.body_id << 32;
-        size_t i = 0;
-        while (i < s.faces.size()) {
-            bool inSet = previewFaces_.count(hi | s.faces[i].face_id) != 0;
-            if (inSet != editing) { ++i; continue; }
-            uint32_t first = s.faces[i].first_tri;
-            uint32_t count = s.faces[i].tri_count;
-            size_t j = i + 1;
-            while (j < s.faces.size() &&
-                   (previewFaces_.count(hi | s.faces[j].face_id) != 0) == editing &&
-                   s.faces[j].first_tri == first + count) {
-                count += s.faces[j].tri_count;
-                ++j;
-            }
-            glDrawElements(GL_TRIANGLES, (GLsizei)(count * 3), GL_UNSIGNED_INT,
-                           (const void*)((size_t)first * 3 * sizeof(unsigned int)));
-            i = j;
-        }
-    };
 
     // Solids, pushed back a touch so the feature edges win the depth test on top of them.
     // In HLR styles the faces are painted in the background color so they only occlude (depth) —
@@ -1494,13 +1574,15 @@ void Renderer::drawCurrent(float yawDeg, float pitchDeg, float zoom) {
                 glUniform1f(sminLoc, s.scalarMin);
                 glUniform1f(smaxLoc, s.scalarMax);
             }
-            if (hlr) glUniform3fv(colorLoc, 1, bgMid_);
-            else     glUniform3f(colorLoc, s.color[0], s.color[1], s.color[2]);
-            glUniform1f(metallicLoc, s.metallic);    // C32-A per-body RealView material
-            glUniform1f(roughnessLoc, s.roughness);
             glBindVertexArray(s.vao);
-            if (isolate) drawSubFaces(s, /*editing=*/false);
-            else         glDrawElements(GL_TRIANGLES, s.idxCount, GL_UNSIGNED_INT, 0);
+            if (!hlr && !useScalar) {
+                drawSubMaterials(s, isolate);
+            } else {
+                glUniform3fv(colorLoc, 1, hlr ? bgMid_ : s.color);
+                glUniform1f(metallicLoc, s.metallic);
+                glUniform1f(roughnessLoc, s.roughness);
+                drawSubFaces(s, 0, static_cast<uint32_t>(s.idxCount / 3), isolate ? 0 : -1);
+            }
         }
         if (bodyGhost) {
             glUniform1f(alphaLoc, 1.0f);
@@ -1528,7 +1610,7 @@ void Renderer::drawCurrent(float yawDeg, float pitchDeg, float zoom) {
             for (const auto& s : subs_) {
                 if (!s.visible || s.faces.empty()) continue;
                 glBindVertexArray(s.vao);
-                drawSubFaces(s, /*editing=*/true);
+                drawSubFaces(s, 0, static_cast<uint32_t>(s.idxCount / 3), 1);
             }
             glUniform1f(alphaLoc, 1.0f);
             glDepthMask(GL_TRUE);
@@ -1767,18 +1849,12 @@ unsigned int Renderer::renderThumbnail(float yawDeg, float pitchDeg, int px, boo
     glUniform1f(uFace_.realView, 1.0f);  // C30-C: reflections on in previews
     glUniform1i(uFace_.zebra, 0);        // thumbnail: never striped
     glUniform1f(uFace_.alpha, 1.0f);     // thumbnail: always opaque
-    const int colorLoc = uFace_.color;
-    const int metallicLoc = uFace_.metallic;    // C32-A RealView material
-    const int roughnessLoc = uFace_.roughness;
     glEnable(GL_POLYGON_OFFSET_FILL);
     glPolygonOffset(1.0f, 1.0f);
     for (const auto& s : subs_) {
         if (!s.visible) continue;   // Solid Bodies: thumbnail mirrors viewport visibility
-        glUniform3f(colorLoc, s.color[0], s.color[1], s.color[2]);
-        glUniform1f(metallicLoc, s.metallic);
-        glUniform1f(roughnessLoc, s.roughness);
         glBindVertexArray(s.vao);
-        glDrawElements(GL_TRIANGLES, s.idxCount, GL_UNSIGNED_INT, 0);
+        drawSubMaterials(s);
     }
     glBindVertexArray(0);
     glDisable(GL_POLYGON_OFFSET_FILL);

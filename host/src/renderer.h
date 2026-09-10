@@ -12,6 +12,7 @@
 
 #include "vec_math.h"
 #include "mesh.h"
+#include "render/aicm_loader.h"
 #include "render/ref_datum_geom.h"   // render::RefDatum + the GL-free datum batch builder
 
 // Display style for the shaded pass (SolidWorks "Display Style" toolbar).
@@ -73,6 +74,8 @@ public:
         // C32-A RealView material (0 metallic / 0.5 roughness == dielectric plastic, the C30 look).
         float metallic = 0.0f;
         float roughness = 0.5f;
+        // Sorted, non-overlapping 1-based face-ID ranges (as decoded by parseAicm).
+        std::vector<render::AppearanceRegion> appearance_regions;
         std::vector<float> scalar;       // n_verts values (NaN = neutral); empty = no field
         float scalarMin = 0.0f, scalarMax = 1.0f;
         std::vector<float> disp;         // 3*n_verts displacement vectors (mm); empty = none
@@ -404,6 +407,12 @@ public:
     float frameMsEma() const { return frameMsEma_; }
 
 private:
+    struct MaterialSpan {
+        uint32_t first_tri = 0, tri_count = 0;
+        float color[3];
+        float metallic = 0.0f, roughness = 0.5f;
+    };
+
     // GPU buffers for one body.
     struct Sub {
         unsigned int vao = 0, vboPos = 0, vboNrm = 0, ebo = 0;
@@ -414,6 +423,8 @@ private:
         std::vector<FaceSpan> faces;          // per-face triangle runs, sorted by first_tri
         float color[3] = {0.62f, 0.70f, 0.80f};
         float metallic = 0.0f, roughness = 0.5f;  // C32-A RealView material
+        // Coalesced at upload; references the existing EBO without copying geometry.
+        std::vector<MaterialSpan> materials;
         // CPU-side copies kept so the deform slider can re-upload displaced positions.
         std::vector<float> basePos;   // undeformed positions (3*n)
         std::vector<float> baseEdge;  // undeformed edge-line verts (3*k)
@@ -425,6 +436,8 @@ private:
 
     void allocTargets();
     void drawCurrent(float yawDeg, float pitchDeg, float zoom);
+    void drawSubFaces(const Sub& s, uint32_t firstTri, uint32_t triCount, int editing = -1);
+    void drawSubMaterials(const Sub& s, bool isolate = false);
     void drawGroundShadow(const Mat4& mvp, const Vec3& eye, const Vec3& up);  // soft contact blob
     void drawReferencePlanes(const Mat4& mvp);   // translucent datum planes (after the opaque pass)
     // Feature datum overlays. axesOnly=false draws non-axis datums (planes/points/csys/curves);

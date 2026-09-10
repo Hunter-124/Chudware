@@ -2,6 +2,8 @@
 
 #include <cstdio>
 #include <cstring>
+#include <limits>
+#include <stdexcept>
 
 namespace aicm {
 
@@ -109,6 +111,24 @@ std::vector<uint8_t> encode_vert(const AicmBody& bt) {
     return p;
 }
 
+std::vector<uint8_t> encode_appearance_regions(const AicmBody& bt) {
+    std::vector<uint8_t> p;
+    if (bt.appearance_regions.size() > (p.max_size() - 8) / 28 ||
+        bt.appearance_regions.size() > std::numeric_limits<uint32_t>::max())
+        throw std::length_error("too many AICM appearance regions");
+    p.reserve(8 + 28 * bt.appearance_regions.size());
+    put_u32(p, bt.body_id);
+    put_u32(p, static_cast<uint32_t>(bt.appearance_regions.size()));
+    for (const AppearanceRegion& region : bt.appearance_regions) {
+        put_u32(p, region.first_face);
+        put_u32(p, region.face_count);
+        for (float color : region.color) put_f32(p, color);
+        put_f32(p, region.metallic);
+        put_f32(p, region.roughness);
+    }
+    return p;
+}
+
 // Build one length-prefixed chunk: fourcc[4] · u64 payload_len · payload.
 std::vector<uint8_t> make_chunk(const char fourcc[4], const std::vector<uint8_t>& payload) {
     std::vector<uint8_t> c;
@@ -185,17 +205,28 @@ std::vector<uint8_t> lines_chunk(const std::string& name,
 std::vector<uint8_t> write_aicm(const std::vector<AicmBody>& bodies,
                                 const std::vector<std::vector<uint8_t>>& extra_chunks) {
     std::vector<uint8_t> out;
-    // Header: "AICM" · version=1 · chunk_count (4 per body + the extra chunks).
+    // Header: four topology chunks per body, optional APRG, then extra chunks.
+    constexpr size_t max_chunks = std::numeric_limits<uint32_t>::max();
+    if (bodies.size() > max_chunks / 4 || extra_chunks.size() > max_chunks - bodies.size() * 4)
+        throw std::length_error("too many AICM chunks");
+    size_t chunk_count = bodies.size() * 4 + extra_chunks.size();
+    for (const AicmBody& bt : bodies) {
+        if (bt.appearance_regions.empty()) continue;
+        if (chunk_count == max_chunks) throw std::length_error("too many AICM chunks");
+        ++chunk_count;
+    }
     const char magic[4] = {'A', 'I', 'C', 'M'};
     out.insert(out.end(), magic, magic + 4);
     put_u32(out, 1);
-    put_u32(out, static_cast<uint32_t>(bodies.size() * 4 + extra_chunks.size()));
+    put_u32(out, static_cast<uint32_t>(chunk_count));
 
     for (const AicmBody& bt : bodies) {
         emit_chunk(out, "BODY", encode_body(bt));
         emit_chunk(out, "FACE", encode_face(bt));
         emit_chunk(out, "EDGE", encode_edge(bt));
         emit_chunk(out, "VERT", encode_vert(bt));
+        if (!bt.appearance_regions.empty())
+            emit_chunk(out, "APRG", encode_appearance_regions(bt));
     }
     // Append pre-encoded extra chunks (SCLR/DISP/LINS) after the body chunks — exactly
     // as tessellate.py: all_chunks = body_chunks + list(extra_chunks).

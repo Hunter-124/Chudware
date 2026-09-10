@@ -543,3 +543,13 @@ current placement. It never stores an inert part feature in the assembly tree.
 `copy:true` alone requests a new component. Missing components and mate-owned
 unfixed poses refuse atomically. See `feature_params.md` for body-reference and
 rotation semantics.
+
+## 15. Component source replacement
+
+`asm_edit_component {id, source:{path|embedded}}` replaces the component source
+without changing its id, authored transform, fixed state or mate references.
+The source object uses the same validation as `asm_insert_component`; malformed
+sources refuse the operation atomically. The next rebuild and saved/exported
+geometry use the replacement. Existing mate references are retained, not
+automatically remapped to unrelated replacement topology; inspect solve status
+after replacement.

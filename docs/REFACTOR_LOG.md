@@ -3562,3 +3562,42 @@ comparison artifacts remain under `/tmp/probe-heartbeat-wheel`; the throwaway
 driver was removed. The live host daemon, mission build tree and source STEP+
 were untouched. The CAD build depends on the corresponding upstream FillOptions
 API/header changes; fetched-upstream release pins must include those changes.
+
+## 2026-09-09 — source-faithful CAD presentation and explicit model-integrity evidence
+
+Assembly compilation, AICM material regions, native rendering, both viewport loaders,
+and host simulation uploads now preserve stored source appearance instead of assigning
+ordinal/rainbow colors; unassigned geometry stays neutral. The native integrity query
+and MCP `inspect_model_integrity` enumerate every world solid and non-solid, preserve
+source/child identities, report exact pair failures and nearest-distance unknowns, and
+separate geometric proximity from fastening or structural acceptance. Imported mixed
+geometry and nested source failures are no longer silently discarded; invalid B-reps
+always produce an `eval_check` finding. `asm_edit_component.source` now actually
+replaces a path/embedded source while retaining component identity, placement and mate
+references; save/reopen/export regressions defend that contract. Animation typography
+uses measured wrapped text and reserved canvas space; CAD footer height follows its
+content. Full-orbit projected bounds replace the overconservative sphere fit, with a
+bounded camera-fit proxy preventing the native margin cap from pumping the zoom on
+end-on slender parts. The native reproduction changed from approximately 0.31034 to
+10 pixels/mm under the old algorithm; the regression now verifies constant native
+scale and unclipped world-bound corners, including polar views. Playback now grounds
+components and suppresses mates only on its detached render copy, so re-solving cannot
+hold or distort already-solved poses. Native motion transports the solved first-sample
+component placement rather than assuming the requested start equals the authored pose;
+steering uses its reported component placements directly. A live translated-hinge
+regression checks rendered world bounds at nonzero start/end angles and verifies the
+source document remains unchanged. Explosion selection is captured before grounding;
+a three-component render regression verifies originally fixed components stay put.
+Focused verification: 108/108 native tests and 20/20 animation tests passed.
+The built host also opened the repaired ME-490 rover in a 1920x1080 Xvfb session;
+the actual viewport capture was inspected and the protected source SHA256 remained
+unchanged (`e0cb30b48162`). Diagnostic drivers and captures were removed afterward.
+The Linux gate passed: native/host/WASM builds, 108 native tests, service suites,
+hostd/web parity, all 13 golden-demo legs and host screenshots. After the final
+playback cutover, the isolated MCP rerun passed 3,021 tests (22 skipped, 1 xfailed).
+Opt-in gate stages were not enabled.
+Curated integrity-tool guidance
+and generated host tool tables are updated; the metrology immutability test now
+checks that classification cannot change instead of pinning a Python-version-specific
+frozen-slot assignment exception. ME-490 repair generators, native revisions and
+geometric evidence remain in the project workspace, not this code repository.

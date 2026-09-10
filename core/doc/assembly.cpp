@@ -17,9 +17,11 @@
 #include <future>
 #include <map>
 #include <mutex>
+#include <set>
 #include <thread>
 
 #include <TopLoc_Location.hxx>
+#include <Standard_Failure.hxx>
 
 #include <BRep_Builder.hxx>
 #include <BRepAdaptor_Curve.hxx>
@@ -31,6 +33,8 @@
 #include <GeomAbs_SurfaceType.hxx>
 #include <TopExp_Explorer.hxx>
 #include <TopAbs.hxx>
+#include <TopExp.hxx>
+#include <TopTools_IndexedMapOfShape.hxx>
 #include <TopoDS.hxx>
 #include <TopoDS_Compound.hxx>
 #include <gp_Circ.hxx>
@@ -64,6 +68,8 @@ struct LoadedComponent {
     std::vector<TopoInfo> verts;
     std::vector<TopoDS_Shape> face_shapes;        // parallel kernel faces (for adaptor radii)
     std::vector<TopoDS_Shape> edge_shapes;
+    std::vector<aicm::AppearanceRegion> appearance_regions;  // compound face IDs, not bodies
+    std::string error;                          // incomplete source; surviving geometry retained
 };
 
 // Keyed by abspath:mtime. Values are shared_future-of-shared_ptr so concurrent loaders of
@@ -119,8 +125,15 @@ json env_from_doc(const json& doc) {
 // mtime, because a referenced descendant can change independently.
 thread_local std::vector<std::string> loading_paths;
 
+void append_load_error(std::string& error, const std::string& detail) {
+    if (!error.empty()) error += "; ";
+    error += detail;
+}
+
 // Load local-frame solids for a component file (port of assembly.py::_load_bodies).
-std::vector<TopoDS_Shape> load_bodies(const std::string& abspath, bool& cacheable) {
+std::vector<TopoDS_Shape> load_bodies(
+    const std::string& abspath, bool& cacheable,
+    std::vector<std::vector<aicm::AppearanceRegion>>& appearances, std::string& error) {
     const std::string canonical = std::filesystem::weakly_canonical(abspath).string();
     if (std::find(loading_paths.begin(), loading_paths.end(), canonical) != loading_paths.end())
         throw OpError("import_failed", "cyclic component reference: " + canonical,
@@ -136,25 +149,56 @@ std::vector<TopoDS_Shape> load_bodies(const std::string& abspath, bool& cacheabl
                 loaded.doc, std::filesystem::path(abspath).parent_path().string());
             for (const AsmComponentStatus& st : ar.component_status)
                 if (!st.ok)
-                    throw OpError("import_failed",
-                                  "component '" + st.id + "' in '" + abspath + "': " +
-                                      st.error.value_or("no geometry"),
-                                  {{"component", st.id}, {"path", abspath}});
+                    append_load_error(error, "component '" + st.id + "' in '" + abspath +
+                                                "': " + st.error.value_or("no geometry"));
+            for (const FeatureStatus& st : ar.feature_status)
+                if (!st.ok)
+                    append_load_error(error, "feature '" + st.id + "' in '" + abspath +
+                                                "': " + st.error);
+            for (const AsmMateStatus& st : ar.mate_status)
+                if (st.status == "unresolved" || st.status == "conflicting") {
+                    std::string detail = "mate '" + st.id + "' in '" + abspath +
+                                         "' is " + st.status;
+                    if (!st.reason.empty()) detail += ": " + st.reason;
+                    for (const auto& ref : st.dangling_refs) detail += " " + ref;
+                    append_load_error(error, detail);
+                }
+            if (!ar.converged)
+                append_load_error(error, "assembly '" + abspath +
+                                            "' did not converge; retained placements are provisional");
             std::vector<TopoDS_Shape> bodies;
             for (const AsmBodyOut& body : ar.bodies) {
                 TopoDS_Shape world = placed_world_shape(body);
                 TopExp_Explorer solids(world, TopAbs_SOLID);
-                if (world.IsNull() || !solids.More())
-                    throw OpError("import_failed", "component '" + body.name +
-                                  "' in '" + abspath + "' produced no solids",
-                                  {{"component", body.component_id}, {"path", abspath}});
+                if (world.IsNull() || !solids.More()) {
+                    append_load_error(error, "component '" + body.name + "' in '" + abspath +
+                                                "' produced no solids");
+                    if (world.IsNull()) continue;
+                }
+                appearances.push_back(body.appearance_regions);
                 bodies.push_back(std::move(world));
             }
             if (bodies.empty())
-                throw OpError("import_failed", "assembly '" + abspath + "' produced no solids",
+                throw OpError("import_failed", error.empty()
+                                  ? "assembly '" + abspath + "' produced no solids" : error,
                               {{"path", abspath}});
             return bodies;
         }
+        auto resolve_appearances = [&](const std::vector<TopoDS_Shape>& bodies) {
+            appearances.clear();
+            appearances.reserve(bodies.size());
+            uint32_t ordinal = 0;
+            for (const auto& shape : bodies) {
+                TopTools_IndexedMapOfShape faces;
+                TopExp::MapShapes(shape, TopAbs_FACE, faces);
+                aicm::AppearanceRegion appearance;
+                appearance.first_face = 1;
+                appearance.face_count = static_cast<uint32_t>(faces.Extent());
+                apply_doc_appearance(loaded.doc, ++ordinal, appearance.color,
+                                     appearance.metallic, appearance.roughness);
+                appearances.push_back({appearance});
+            }
+        };
         // Solved-bodies fast path: a part saved after a fully-ok rebuild embeds its compiled
         // bodies as cache.brep (BREP + triangulation) with a `solved` flag in the cache.json
         // header. When the engine key + doc hash still match, those bodies ARE the exact
@@ -171,15 +215,24 @@ std::vector<TopoDS_Shape> load_bodies(const std::string& abspath, bool& cacheabl
                             stepplus_doc_hash(loaded.doc) &&
                         header.value("solved", false)) {
                         std::vector<TopoDS_Shape> bodies = brep_cache_decode(cb->second);
-                        if (!bodies.empty()) return bodies;
+                        if (!bodies.empty()) {
+                            resolve_appearances(bodies);
+                            return bodies;
+                        }
                     }
                 } catch (...) { /* stale/corrupt cache -> full compile below */ }
             }
         }
         CompileResult r = compile_document(loaded.doc, env_from_doc(loaded.doc));
+        for (const FeatureStatus& st : r.statuses)
+            if (!st.ok)
+                append_load_error(error, "feature '" + st.id + "' in '" + abspath +
+                                            "' failed to rebuild: " + st.error);
         if (r.shapes.empty())
-            throw OpError("import_failed", "component '" + abspath + "' produced no bodies",
+            throw OpError("import_failed", error.empty()
+                              ? "component '" + abspath + "' produced no bodies" : error,
                           {{"path", abspath}});
+        resolve_appearances(r.shapes);
         return r.shapes;
     }
     // bare neutral formats (step/iges/brep/stl/obj/ply/gltf/glb)
@@ -199,10 +252,55 @@ TopoDS_Shape compound_of(const std::vector<TopoDS_Shape>& bodies);  // defined b
 // Describe every face/edge/vertex of the component's bodies (local frame) for mate
 // resolution (port of assembly.py::_describe_component). Flat across all bodies in
 // body order; indices re-numbered contiguously.
-LoadedComponent describe_component(std::vector<TopoDS_Shape> bodies) {
+LoadedComponent describe_component(
+    std::vector<TopoDS_Shape> bodies,
+    const std::vector<std::vector<aicm::AppearanceRegion>>& appearances, std::string error) {
     LoadedComponent lc;
     lc.bodies = std::move(bodies);
+    lc.error = std::move(error);
     lc.compound = compound_of(lc.bodies);
+    // Use the tessellator's unique face map, not explorer counts: shared topology must
+    // retain exactly the same IDs whether a component is styled, repeated or nested.
+    TopTools_IndexedMapOfShape compound_faces;
+    TopExp::MapShapes(lc.compound, TopAbs_FACE, compound_faces);
+    uint32_t assigned_faces = 0;
+    for (size_t bi = 0; bi < lc.bodies.size(); ++bi) {
+        TopTools_IndexedMapOfShape faces;
+        TopExp::MapShapes(lc.bodies[bi], TopAbs_FACE, faces);
+        size_t region_index = 0;
+        for (int fi = 1; fi <= faces.Extent(); ++fi) {
+            const uint32_t compound_id =
+                static_cast<uint32_t>(compound_faces.FindIndex(faces.FindKey(fi)));
+            if (compound_id <= assigned_faces) continue;  // already-owned shared face
+            aicm::AppearanceRegion appearance;
+            if (bi < appearances.size()) {
+                const auto& regions = appearances[bi];
+                while (region_index < regions.size() &&
+                       regions[region_index].first_face + regions[region_index].face_count <=
+                           static_cast<uint32_t>(fi))
+                    ++region_index;
+                if (region_index < regions.size() &&
+                    regions[region_index].first_face <= static_cast<uint32_t>(fi))
+                    appearance = regions[region_index];
+            }
+            appearance.first_face = compound_id;
+            appearance.face_count = 1;
+            if (!lc.appearance_regions.empty()) {
+                auto& previous = lc.appearance_regions.back();
+                if (previous.first_face + previous.face_count == compound_id &&
+                    std::equal(std::begin(previous.color), std::end(previous.color),
+                               std::begin(appearance.color)) &&
+                    previous.metallic == appearance.metallic &&
+                    previous.roughness == appearance.roughness) {
+                    ++previous.face_count;
+                    assigned_faces = compound_id;
+                    continue;
+                }
+            }
+            lc.appearance_regions.push_back(appearance);
+            assigned_faces = compound_id;
+        }
+    }
     int fidx = 0, eidx = 0, vidx = 0;
     for (const TopoDS_Shape& bo : lc.bodies) {
         std::vector<TopoInfo> faces = describe_faces(bo);
@@ -238,8 +336,11 @@ std::shared_ptr<const LoadedComponent> load_component(const std::string& path,
     const std::string abspath = resolve_source_path(path, base_dir);
     if (!loading_paths.empty()) {
         bool cacheable = false;
+        std::vector<std::vector<aicm::AppearanceRegion>> appearances;
+        std::string error;
+        auto bodies = load_bodies(abspath, cacheable, appearances, error);
         return std::make_shared<const LoadedComponent>(
-            describe_component(load_bodies(abspath, cacheable)));
+            describe_component(std::move(bodies), appearances, std::move(error)));
     }
     const std::string key = component_cache_key(abspath);
 
@@ -263,8 +364,11 @@ std::shared_ptr<const LoadedComponent> load_component(const std::string& path,
     if (mine) {
         try {
             bool cacheable = true;
+            std::vector<std::vector<aicm::AppearanceRegion>> appearances;
+            std::string error;
+            auto bodies = load_bodies(abspath, cacheable, appearances, error);
             auto lc = std::make_shared<const LoadedComponent>(
-                describe_component(load_bodies(abspath, cacheable)));
+                describe_component(std::move(bodies), appearances, std::move(error)));
             mine->set_value(lc);
             if (!cacheable) {
                 std::lock_guard<std::mutex> lk(g_cache_mtx);
@@ -399,29 +503,6 @@ bool selector_to_mategeom(const json& selector, const LoadedComponent& lc,
     return false;
 }
 
-// A distinct, pleasant colour per component ordinal (golden-angle hue walk; port of
-// assembly.py::_component_color, which rounds to 4 decimals).
-std::array<float, 3> component_color(int ordinal) {
-    double h = std::fmod(0.58 + 0.61803398875 * ordinal, 1.0);
-    double s = 0.45, v = 0.86;
-    // colorsys.hsv_to_rgb
-    int i = static_cast<int>(h * 6.0);
-    double f = h * 6.0 - i;
-    double p = v * (1.0 - s);
-    double q = v * (1.0 - s * f);
-    double t = v * (1.0 - s * (1.0 - f));
-    double r = 0, g = 0, b = 0;
-    switch (((i % 6) + 6) % 6) {
-        case 0: r = v; g = t; b = p; break;
-        case 1: r = q; g = v; b = p; break;
-        case 2: r = p; g = v; b = t; break;
-        case 3: r = p; g = q; b = v; break;
-        case 4: r = t; g = p; b = v; break;
-        case 5: r = v; g = p; b = q; break;
-    }
-    auto round4 = [](double x) { return static_cast<float>(std::round(x * 10000.0) / 10000.0); };
-    return {round4(r), round4(g), round4(b)};
-}
 
 TopoDS_Shape compound_of(const std::vector<TopoDS_Shape>& bodies) {
     if (bodies.size() == 1) return bodies[0];
@@ -540,10 +621,11 @@ Eigen::Matrix4d rotation16_about_axis(const Eigen::Vector3d& axis_pt,
 }
 
 // Expand asm_linear_pattern / asm_circular_pattern features into synthetic instance bodies.
-// `placed` is the solved component bodies; returns ONLY the new instance bodies. Patterns with a
-// dangling direction/axis or unknown seeds are silently skipped (matches the oracle).
-std::vector<AsmBodyOut> compile_component_patterns(const json& doc,
-                                                   const std::vector<AsmBodyOut>& placed) {
+// `placed` is the solved component bodies; returns ONLY the new instance bodies.
+// Failures are reported per authored feature without discarding surviving instances.
+std::vector<AsmBodyOut> compile_component_patterns(
+    const json& doc, const std::vector<AsmBodyOut>& placed,
+    std::vector<FeatureStatus>& statuses) {
     std::map<std::string, const AsmBodyOut*> by_cid;
     for (const AsmBodyOut& b : placed) by_cid[b.component_id] = &b;
 
@@ -555,6 +637,10 @@ std::vector<AsmBodyOut> compile_component_patterns(const json& doc,
         if (!feat.is_object() || feat.value("suppressed", false)) continue;
         const std::string ftype = feat.value("type", std::string());
         if (ftype != "asm_linear_pattern" && ftype != "asm_circular_pattern") continue;
+        FeatureStatus status;
+        status.id = feat.value("id", std::string());
+        status.type = ftype;
+        try {
         const json refs = feat.contains("refs") && feat["refs"].is_object() ? feat["refs"]
                                                                             : json::object();
         const json params = feat.contains("params") && feat["params"].is_object() ? feat["params"]
@@ -562,11 +648,17 @@ std::vector<AsmBodyOut> compile_component_patterns(const json& doc,
         std::vector<std::string> seed_cids;
         if (refs.contains("components") && refs["components"].is_array())
             for (const json& c : refs["components"]) {
-                if (!c.is_string()) continue;
+                if (!c.is_string()) {
+                    append_load_error(status.error, "pattern seed component is not an id");
+                    continue;
+                }
                 const std::string cid = c.get<std::string>();
                 if (by_cid.count(cid)) seed_cids.push_back(cid);
+                else append_load_error(status.error, "pattern seed component '" + cid +
+                                                         "' has no loaded geometry");
             }
-        if (seed_cids.empty()) continue;
+        if (seed_cids.empty())
+            throw OpError("invalid_ref", "pattern has no loaded seed components");
 
         // Build the additional instance transforms (k = 1..count-1; instance 0 = the seed).
         std::vector<Eigen::Matrix4d> offsets;
@@ -574,18 +666,16 @@ std::vector<AsmBodyOut> compile_component_patterns(const json& doc,
             int count1 = std::max(1, static_cast<int>(std::lround(feat_dim(params, "count1", 2))));
             double spacing1 = feat_dim(params, "spacing1", 10.0);
             Eigen::Vector3d d1;
-            if (!world_axis_from_ref(refs.contains("dir1") ? refs["dir1"] : json(nullptr), d1) ||
-                count1 < 2)
-                continue;
+            if (!world_axis_from_ref(refs.contains("dir1") ? refs["dir1"] : json(nullptr), d1))
+                throw OpError("invalid_ref", "pattern direction dir1 is unresolved");
             for (int k = 1; k < count1; ++k) offsets.push_back(translate16(d1 * (spacing1 * k)));
         } else {  // asm_circular_pattern
             int count = std::max(1, static_cast<int>(std::lround(feat_dim(params, "count", 4))));
             double angle_total = feat_dim(params, "angle", 360.0);
             bool equal = params.value("equal_spacing", true);
             Eigen::Vector3d ax;
-            if (!world_axis_from_ref(refs.contains("axis") ? refs["axis"] : json(nullptr), ax) ||
-                count < 2)
-                continue;
+            if (!world_axis_from_ref(refs.contains("axis") ? refs["axis"] : json(nullptr), ax))
+                throw OpError("invalid_ref", "pattern axis is unresolved");
             double step = equal ? (angle_total / count) : angle_total;
             for (int k = 1; k < count; ++k)
                 offsets.push_back(rotation16_about_axis(Eigen::Vector3d::Zero(), ax, step * k));
@@ -598,16 +688,34 @@ std::vector<AsmBodyOut> compile_component_patterns(const json& doc,
             for (const Eigen::Matrix4d& off : offsets) {
                 ++k;
                 Eigen::Matrix4d inst_mat = off * seed_mat;
-                AsmBodyOut inst;
+                AsmBodyOut inst = *seed;
                 inst.body_id = body_id++;
                 inst.component_id = seed_cid + "#" + std::to_string(k);
                 inst.name = seed->name + "#" + std::to_string(k);
-                inst.shape_local = seed->shape_local;
                 inst.transform = xform16_from_mat(inst_mat);
-                inst.color = seed->color;
+                for (auto& appearance : inst.appearance_regions)
+                    apply_doc_appearance(doc, static_cast<uint32_t>(inst.body_id),
+                                         appearance.color, appearance.metallic, appearance.roughness);
+                if (!inst.appearance_regions.empty()) {
+                    const auto& appearance = inst.appearance_regions.front();
+                    std::copy(std::begin(appearance.color), std::end(appearance.color),
+                              inst.color.begin());
+                    inst.metallic = appearance.metallic;
+                    inst.roughness = appearance.roughness;
+                }
                 instances.push_back(std::move(inst));
             }
         }
+        } catch (const Standard_Failure& exc) {
+            append_load_error(status.error, exc.GetMessageString()
+                                               ? exc.GetMessageString() : "pattern kernel failure");
+        } catch (const std::exception& exc) {
+            append_load_error(status.error, exc.what());
+        } catch (...) {
+            append_load_error(status.error, "unknown pattern build failure");
+        }
+        status.ok = status.error.empty();
+        statuses.push_back(std::move(status));
     }
     return instances;
 }
@@ -679,8 +787,8 @@ AssemblyResult compile_assembly(const json& doc, const std::string& base_dir,
             auto ready = prefetched.find(path);
             loaded[cid] = ready == prefetched.end() ? load_component(path, base_dir)
                                                     : ready->second;
-            st.ok = true;
-            st.error = std::nullopt;
+            st.ok = loaded[cid]->error.empty();
+            if (!st.ok) st.error = loaded[cid]->error;
         } catch (const std::exception& exc) {
             st.ok = false;
             st.error = std::string(exc.what());
@@ -753,19 +861,26 @@ AssemblyResult compile_assembly(const json& doc, const std::string& base_dir,
                         ? comp["name"].get<std::string>() : cid;
         body.shape_local = lit->second->compound;
         body.transform = xform;
-        body.color = component_color(ordinal - 1);
+        body.appearance_regions = lit->second->appearance_regions;
+        for (auto& appearance : body.appearance_regions)
+            apply_doc_appearance(doc, static_cast<uint32_t>(ordinal), appearance.color,
+                                 appearance.metallic, appearance.roughness);
+        if (!body.appearance_regions.empty()) {
+            const auto& appearance = body.appearance_regions.front();
+            std::copy(std::begin(appearance.color), std::end(appearance.color), body.color.begin());
+            body.metallic = appearance.metallic;
+            body.roughness = appearance.roughness;
+        }
         res.bodies.push_back(std::move(body));
     }
 
     // --- component patterns ---------------------------------------------
     // Expand asm_linear_pattern / asm_circular_pattern into synthetic instance bodies (NOT
-    // components: excluded from the mate solve + interference/BOM). A bad pattern must never
-    // sink the whole assembly rebuild.
-    try {
-        std::vector<AsmBodyOut> instances = compile_component_patterns(doc, res.bodies);
-        for (AsmBodyOut& inst : instances) res.bodies.push_back(std::move(inst));
-    } catch (...) {
-    }
+    // components: excluded from the mate solve + interference/BOM). Keep surviving
+    // instances and report failed authored features through their own status channel.
+    std::vector<AsmBodyOut> instances =
+        compile_component_patterns(doc, res.bodies, res.feature_status);
+    for (AsmBodyOut& inst : instances) res.bodies.push_back(std::move(inst));
 
     // mate status (merge dangling + the per-mate residual report)
     std::map<std::string, double> mate_residual;
@@ -789,7 +904,15 @@ AssemblyResult compile_assembly(const json& doc, const std::string& base_dir,
 
     res.dof = solve_res.dof;
     res.over_defined = solve_res.over_defined;
-    res.converged = solve_res.converged;
+    res.converged = solve_res.converged &&
+        std::all_of(res.component_status.begin(), res.component_status.end(),
+                    [](const AsmComponentStatus& st) { return st.ok; }) &&
+        std::all_of(res.feature_status.begin(), res.feature_status.end(),
+                    [](const FeatureStatus& st) { return st.ok; }) &&
+        std::none_of(res.mate_status.begin(), res.mate_status.end(),
+                     [](const AsmMateStatus& st) {
+                         return st.status == "unresolved" || st.status == "conflicting";
+                     });
     res.max_residual = solve_res.residuals.empty() ? solve_res.max_residual
                                                    : solve_res.residuals.front().max_abs;
     res.tolerance = solve_res.tolerance;
@@ -801,21 +924,44 @@ AssemblyResult compile_assembly(const json& doc, const std::string& base_dir,
 
 json asm_component_fingerprints(const json& doc, const std::string& base_dir) {
     json fp = json::array();
-    if (!doc.contains("components") || !doc["components"].is_array()) return fp;
-    for (const json& c : doc["components"]) {
-        if (c.value("suppressed", false)) continue;
-        const std::string path = c.contains("source") && c["source"].is_object()
-                                     ? c["source"].value("path", std::string())
-                                     : std::string();
-        const std::string abspath = path.empty() ? path : resolve_source_path(path, base_dir);
-        uint64_t size = 0;
-        long long mtime = 0;
+    auto append_components = [&](const json& assembly, const std::string& directory) {
+        if (!assembly.contains("components") || !assembly["components"].is_array()) return;
+        for (const json& c : assembly["components"]) {
+            if (c.value("suppressed", false)) continue;
+            const std::string path = c.contains("source") && c["source"].is_object()
+                                         ? c["source"].value("path", std::string())
+                                         : std::string();
+            const std::string abspath = path.empty() ? path : resolve_source_path(path, directory);
+            uint64_t size = 0;
+            long long mtime = 0;
+            std::error_code ec;
+            auto sz = std::filesystem::file_size(abspath, ec);
+            if (!ec) size = static_cast<uint64_t>(sz);
+            auto ft = std::filesystem::last_write_time(abspath, ec);
+            if (!ec) mtime = static_cast<long long>(ft.time_since_epoch().count());
+            fp.push_back({{"path", abspath}, {"size", size}, {"mtime", mtime}});
+        }
+    };
+    append_components(doc, base_dir);
+    // Keep the original direct-component rows first, then append descendant rows in
+    // breadth-first order. A child assembly's own mtime cannot fingerprint its sources.
+    // Repeated/cyclic references still have a row, but each source is traversed only once.
+    std::set<std::string> visited;
+    for (size_t i = 0; i < fp.size(); ++i) {
+        const std::string path = fp[i].at("path").get<std::string>();
+        const std::string low = lower(path);
+        if (!ends_with(low, ".step+") && !ends_with(low, ".stepplus")) continue;
         std::error_code ec;
-        auto sz = std::filesystem::file_size(abspath, ec);
-        if (!ec) size = static_cast<uint64_t>(sz);
-        auto ft = std::filesystem::last_write_time(abspath, ec);
-        if (!ec) mtime = static_cast<long long>(ft.time_since_epoch().count());
-        fp.push_back({{"path", abspath}, {"size", size}, {"mtime", mtime}});
+        const auto canonical = std::filesystem::weakly_canonical(path, ec);
+        if (!visited.insert(ec ? path : canonical.string()).second) continue;
+        try {
+            const StepPlusDoc child = stepplus_open(path);
+            if (child.doc.value("schema", std::string()) == "aicad.asm/1")
+                append_components(child.doc, std::filesystem::path(path).parent_path().string());
+        } catch (...) {
+            // Missing/unreadable sources retain their direct row (including zero size/mtime).
+            // Compilation reports their component error; fingerprinting never hides them.
+        }
     }
     return fp;
 }

@@ -347,11 +347,26 @@ TEST_CASE("dispatch advertises capability and echoes exact camera plus revision"
     nested["camera"]["height"] = 8;
     const json clamped = render(cube.id, nested, tmp_png("clamped"));
     REQUIRE(clamped.value("ok", false));
-    CHECK(clamped.at("camera").at("image_width_px") == 2048);
+    CHECK(clamped.at("camera").at("image_width_px") == 4096);
     CHECK(clamped.at("camera").at("image_height_px") == 64);
     CHECK(clamped.at("image_size_clamped").get<bool>());
     CHECK(clamped.at("requested_image_width_px") == 5000);
     CHECK(clamped.at("requested_image_height_px") == 8);
+    const Rgb clamped_image = decode_png(clamped.at("path").get<std::string>());
+    REQUIRE(clamped_image.ok());
+    CHECK(clamped_image.width == 4096);
+    CHECK(clamped_image.height == 64);
+
+    // A 2x HD-width frame must be delivered, not silently reduced to the old 2048 cap.
+    json supersampled = exact_view(10.0, 3840);
+    supersampled["height"] = 64;
+    const json delivered = render(cube.id, supersampled, tmp_png("supersampled"));
+    REQUIRE(delivered.value("ok", false));
+    CHECK_FALSE(delivered.at("image_size_clamped").get<bool>());
+    const Rgb delivered_image = decode_png(delivered.at("path").get<std::string>());
+    REQUIRE(delivered_image.ok());
+    CHECK(delivered_image.width == 3840);
+    CHECK(delivered_image.height == 64);
 }
 
 TEST_CASE("pre-existing render specifications retain semantic output and report byte hashes") {

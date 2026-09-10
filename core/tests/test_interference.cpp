@@ -16,11 +16,24 @@
 #include <doctest/doctest.h>
 
 #include <string>
+#include <algorithm>
+#include <filesystem>
 #include <vector>
+#include <set>
 
 #include <nlohmann/json.hpp>
 
 #include "doc/session.h"
+#include "doc/formats.h"
+#include <BRepPrimAPI_MakeBox.hxx>
+#include <BRepBuilderAPI_MakeFace.hxx>
+#include <BRep_Builder.hxx>
+#include <BRepTools.hxx>
+#include <TopExp_Explorer.hxx>
+#include <TopoDS_Shell.hxx>
+#include <TopoDS_Solid.hxx>
+#include <gp_Pln.hxx>
+#include <gp_Pnt.hxx>
 
 using json = nlohmann::json;
 using chudware::doc::doc_new;
@@ -28,6 +41,7 @@ using chudware::doc::doc_apply_ops;
 using chudware::doc::doc_eval_interference;
 using chudware::doc::doc_eval_feature_overlap;
 using chudware::doc::doc_eval_compare;
+using chudware::doc::doc_eval_model_integrity;
 
 namespace {
 
@@ -92,6 +106,11 @@ bool has_dead(const json& dead_features, const std::string& id) {
         if (v.is_string() && v.get<std::string>() == id) return true;
     return false;
 }
+
+struct IntegrityFixtureFile {
+    std::filesystem::path path;
+    ~IntegrityFixtureFile() { std::error_code ec; std::filesystem::remove(path, ec); }
+};
 
 }  // namespace
 
@@ -346,4 +365,327 @@ TEST_CASE("eval_interference: min_clearance_mm tags a below-threshold gap with a
         CHECK(c.value("warning", std::string()) == "below min clearance");
     }
     CHECK_MESSAGE(found, "no ~0.05mm clearance entry in: " << ir.at("clearances").dump());
+}
+
+TEST_CASE("model integrity: positive gap is proximity, not touching, and nearest is exact") {
+    Built b = build("IntegrityGap", json::array({
+        box("A", 10, 10, 10, {0, 0, 0}, {{"merge", false}}),
+        box("B", 10, 10, 10, {10.02, 0, 0}, {{"merge", false}}),
+    }));
+    json near = doc_eval_model_integrity(b.id, {{"proximity_mm", 0.05}});
+    REQUIRE_MESSAGE(near["complete"] == true, near.dump());
+    REQUIRE(near["pairs"].size() == 1);
+    CHECK(near["pairs"][0]["relation"] == "proximity");
+    CHECK(near["pairs"][0]["distance_mm"].get<double>() == doctest::Approx(0.02));
+    CHECK(near["pairs"][0]["overlap_volume_mm3"].get<double>() == doctest::Approx(0.0));
+    CHECK(near["isolated_solids"].empty());
+    CHECK(near["islands"].size() == 1);
+
+    json far = doc_eval_model_integrity(b.id, {{"proximity_mm", 0.01}});
+    REQUIRE_MESSAGE(far["complete"] == true, far.dump());
+    CHECK(far["pairs"].empty());
+    CHECK(far["islands"].size() == 2);
+    CHECK(far["isolated_solids"].size() == 2);
+    CHECK(far["summary"]["theoretical_pairs"] == 1);
+    CHECK(far["summary"]["candidate_pairs"] == 0);
+    REQUIRE(far["nearest"].size() == 2);
+    for (const json& nearest : far["nearest"]) {
+        CHECK(nearest["status"] == "exact");
+        CHECK(nearest["nearest_id"] != nearest["solid_id"]);
+        CHECK(nearest["distance_mm"].get<double>() == doctest::Approx(0.02));
+    }
+}
+
+TEST_CASE("model integrity: touching and positive volume overlap remain distinct") {
+    Built touching = build("IntegrityTouch", json::array({
+        box("A", 10, 10, 10, {0, 0, 0}, {{"merge", false}}),
+        box("B", 10, 10, 10, {10, 0, 0}, {{"merge", false}}),
+    }));
+    json touch = doc_eval_model_integrity(touching.id, json::object());
+    REQUIRE_MESSAGE(touch["complete"] == true, touch.dump());
+    REQUIRE(touch["pairs"].size() == 1);
+    CHECK(touch["pairs"][0]["relation"] == "touching");
+    CHECK(touch["pairs"][0]["distance_mm"] == 0.0);
+    CHECK(touch["pairs"][0]["overlap_volume_mm3"].get<double>() == doctest::Approx(0.0));
+    Built overlapping = build("IntegrityOverlap", json::array({
+        box("A", 10, 10, 10, {0, 0, 0}, {{"merge", false}}),
+        box("B", 10, 10, 10, {5, 0, 0}, {{"merge", false}}),
+    }));
+    json overlap = doc_eval_model_integrity(overlapping.id, json::object());
+    REQUIRE_MESSAGE(overlap["complete"] == true, overlap.dump());
+    CHECK(overlap["ok"] == true);  // query success, not a geometry safety verdict
+    REQUIRE(overlap["pairs"].size() == 1);
+    CHECK(overlap["pairs"][0]["relation"] == "overlap");
+    CHECK(overlap["pairs"][0]["overlap_volume_mm3"].get<double>() == doctest::Approx(500.0));
+}
+
+TEST_CASE("model integrity: canceled pair work is unknown, never a clean minimum") {
+    Built b = build("IntegrityTimeout", json::array({
+        box("A", 10, 10, 10, {0, 0, 0}, {{"merge", false}}),
+        box("B", 10, 10, 10, {5, 0, 0}, {{"merge", false}}),
+    }));
+    const json report = doc_eval_model_integrity(b.id, {{"pair_budget_s", 1e-12}});
+    CHECK(report["ok"] == true);
+    CHECK(report["complete"] == false);
+    CHECK(report["pairs"].empty());
+    REQUIRE(report["pair_failures"].size() == 1);
+    CHECK(report["pair_failures"][0]["reason"] == "pair_timeout");
+    CHECK(report["summary"]["theoretical_pairs"] == 1);
+    CHECK(report["summary"]["candidate_pairs"] == 1);
+    CHECK(report["summary"]["exact_pairs"] == 0);
+    CHECK(report["summary"]["failed_pairs"] == 1);
+    REQUIRE(report["nearest"].size() == 2);
+    for (const auto& nearest : report["nearest"]) {
+        CHECK(nearest["status"] == "unknown");
+        CHECK(nearest["distance_mm"].is_null());
+        CHECK(nearest["nearest_id"].is_null());
+    }
+}
+
+TEST_CASE("model integrity: empty refusal and single solid census do not claim connectivity") {
+    const std::string empty = doc_new("part", "IntegrityEmpty").at("doc_id").get<std::string>();
+    const json refused = doc_eval_model_integrity(empty, json::object());
+    CHECK(refused["ok"] == false);
+    CHECK(refused["complete"] == false);
+    CHECK(refused["reason"] == "no_solids");
+    Built one = build("IntegrityOne", json::array({box("A", 10, 10, 10, {0, 0, 0})}));
+    const json census = doc_eval_model_integrity(one.id, json::object());
+    REQUIRE_MESSAGE(census["complete"] == true, census.dump());
+    REQUIRE(census["solids"].size() == 1);
+    CHECK(census["solids"][0]["brep_valid"] == true);
+    CHECK(census["solids"][0]["volume_mm3"].get<double>() == doctest::Approx(1000.0));
+    CHECK(census["summary"]["theoretical_pairs"] == 0);
+    CHECK(census["pairs"].empty());
+    REQUIRE(census["nearest"].size() == 1);
+    CHECK(census["nearest"][0]["status"] == "no_other_solids");
+}
+
+TEST_CASE("model integrity: one placed assembly component exposes both disconnected solids and missing source") {
+    const std::string did = doc_new("assembly", "IntegrityCompound").at("doc_id").get<std::string>();
+    IntegrityFixtureFile fixture{
+        std::filesystem::temp_directory_path() / ("integrity_" + did + ".step")};
+    chudware::doc::export_bodies({
+        BRepPrimAPI_MakeBox(gp_Pnt(0, 0, 0), 10, 10, 10).Shape(),
+        BRepPrimAPI_MakeBox(gp_Pnt(30, 0, 0), 10, 10, 10).Shape()
+    }, fixture.path.string(), "step");
+    doc_apply_ops(did, -1, json::array({
+        {{"op", "asm_insert_component"}, {"name", "Disconnected"},
+         {"source", {{"path", fixture.path.string()}}}}
+    }), false);
+    const json tree = chudware::doc::doc_tree(did);
+    const json& tree_body = tree.contains("tree") ? tree["tree"] : tree;
+    const std::string cid = tree_body.at("components").at(0).at("id").get<std::string>();
+    // Quarter-turn about Z followed by translation: local +X separation becomes world +Y.
+    doc_apply_ops(did, -1, json::array({
+        {{"op", "asm_edit_component"}, {"id", cid},
+         {"transform", {0, -1, 0, 100, 1, 0, 0, 200, 0, 0, 1, 300, 0, 0, 0, 1}}}
+    }), false);
+    const json report = doc_eval_model_integrity(did, json::object());
+    REQUIRE_MESSAGE(report["complete"] == true, report.dump());
+    REQUIRE(report["solids"].size() == 2);
+    CHECK(report["pairs"].empty());
+    CHECK(report["isolated_solids"].size() == 2);
+    CHECK(report["islands"].size() == 2);
+    for (const json& solid : report["solids"]) {
+        CHECK(solid["component_id"] == cid);
+        CHECK(solid["source_path"] == fixture.path.string());
+        CHECK(solid["body_id"] == 1);
+        CHECK(solid["volume_mm3"].get<double>() == doctest::Approx(1000.0));
+        CHECK(solid["centroid_mm"][0].get<double>() == doctest::Approx(95.0));
+        CHECK(solid["centroid_mm"][2].get<double>() == doctest::Approx(305.0));
+    }
+    const double y0 = report["solids"][0]["centroid_mm"][1].get<double>();
+    const double y1 = report["solids"][1]["centroid_mm"][1].get<double>();
+    CHECK(std::min(y0, y1) == doctest::Approx(205.0));
+    CHECK(std::max(y0, y1) == doctest::Approx(235.0));
+    REQUIRE(report["nearest"].size() == 2);
+    CHECK(report["nearest"][0]["distance_mm"].get<double>() == doctest::Approx(20.0));
+    const json health = chudware::doc::doc_eval_solid_health(did, 1);
+    REQUIRE(health["bodies"].size() == 1);
+    CHECK(health["bodies"][0]["solids"] == 2);
+    CHECK(health["bodies"][0]["body_id"] == 1);
+    CHECK(chudware::doc::doc_eval_check(did, 1)["issues"].empty());
+
+    std::filesystem::remove(fixture.path);
+    const json missing = doc_eval_model_integrity(did, json::object());
+    CHECK(missing["ok"] == false);
+    CHECK(missing["complete"] == false);
+    CHECK(missing["reason"] == "no_solids");
+    REQUIRE(missing["source_failures"].size() == 1);
+    CHECK(missing["assembly"]["components"][0]["status"] == "failed");
+}
+
+TEST_CASE("assembly health: mating surfaces are not self-piercing solid skins") {
+    const std::string did = doc_new("assembly", "MatingSolidHealth").at("doc_id").get<std::string>();
+    IntegrityFixtureFile fixture{
+        std::filesystem::temp_directory_path() / ("mating_health_" + did + ".step")};
+    chudware::doc::export_bodies({
+        BRepPrimAPI_MakeBox(gp_Pnt(0, 0, 0), 10, 10, 10).Shape(),
+        BRepPrimAPI_MakeBox(gp_Pnt(10, 0, 0), 10, 10, 10).Shape()
+    }, fixture.path.string(), "step");
+    doc_apply_ops(did, -1, json::array({
+        {{"op", "asm_insert_component"}, {"name", "MatingParts"},
+         {"source", {{"path", fixture.path.string()}}}}
+    }), false);
+    const json health = chudware::doc::doc_eval_solid_health(did, 0);
+    REQUIRE(health["bodies"].size() == 1);
+    const json& body = health["bodies"][0];
+    CHECK(body["solids"] == 2);
+    CHECK(body["self_intersection"]["checked"] == true);
+    CHECK(body["self_intersection"]["self_intersecting"] == false);
+    CHECK(body["sound"] == true);
+    const json census = doc_eval_model_integrity(did, json::object());
+    REQUIRE(census["complete"] == true);
+    REQUIRE(census["pairs"].size() == 1);
+    CHECK(census["pairs"][0]["distance_mm"].get<double>() == doctest::Approx(0.0));
+    CHECK(census["pairs"][0]["overlap_volume_mm3"].get<double>() == doctest::Approx(0.0));
+    CHECK(census["islands"].size() == 1);
+}
+
+TEST_CASE("model integrity: two patterns of one seed keep distinct world identities and graph nodes") {
+    const std::string did = doc_new("assembly", "IntegrityPatterns").at("doc_id").get<std::string>();
+    IntegrityFixtureFile fixture{
+        std::filesystem::temp_directory_path() / ("integrity_patterns_" + did + ".step")};
+    chudware::doc::export_bodies(
+        {BRepPrimAPI_MakeBox(gp_Pnt(0, 0, 0), 10, 10, 10).Shape()},
+        fixture.path.string(), "step");
+    doc_apply_ops(did, -1, json::array({
+        {{"op", "asm_insert_component"}, {"name", "Seed"},
+         {"source", {{"path", fixture.path.string()}}}}
+    }), false);
+    const json tree = chudware::doc::doc_tree(did);
+    const json& tree_body = tree.contains("tree") ? tree["tree"] : tree;
+    const std::string cid = tree_body.at("components").at(0).at("id").get<std::string>();
+    json ops = json::array();
+    for (double spacing : {10.0, 20.0})
+        ops.push_back({{"op", "add_feature"},
+            {"feature", {{"type", "asm_linear_pattern"}, {"name", "Pattern"},
+                {"refs", {{"components", json::array({cid})}, {"dir1", "axis.x"}}},
+                {"params", {{"count1", 2}, {"spacing1", spacing}}}}}});
+    doc_apply_ops(did, -1, ops, false);
+
+    const json report = doc_eval_model_integrity(did, json::object());
+    REQUIRE_MESSAGE(report["complete"] == true, report.dump());
+    REQUIRE(report["solids"].size() == 3);
+    std::set<std::string> ids;
+    std::set<int> body_ids;
+    int pattern_labels = 0;
+    for (const auto& solid : report["solids"]) {
+        CHECK(ids.insert(solid["id"].get<std::string>()).second);
+        body_ids.insert(solid["body_id"].get<int>());
+        CHECK(solid["source_path"] == fixture.path.string());
+        CHECK(solid["source_ordinal"] == 1);
+        if (solid["component_id"] == cid + "#1") ++pattern_labels;
+    }
+    CHECK(pattern_labels == 2);  // provenance labels can repeat; world identities cannot
+    REQUIRE(report["pairs"].size() == 2);
+    for (const auto& pair : report["pairs"]) {
+        CHECK(pair["a"] != pair["b"]);
+        CHECK(ids.count(pair["a"].get<std::string>()) == 1);
+        CHECK(ids.count(pair["b"].get<std::string>()) == 1);
+    }
+    REQUIRE(report["islands"].size() == 1);
+    const auto island_ids = report["islands"][0]["solids"].get<std::vector<std::string>>();
+    CHECK(std::set<std::string>(island_ids.begin(), island_ids.end()) == ids);
+    CHECK(report["isolated_solids"].empty());
+
+    const json health = chudware::doc::doc_eval_solid_health(did, 0);
+    REQUIRE(health["bodies"].size() == 3);
+    std::set<int> health_ids;
+    for (const auto& body : health["bodies"]) health_ids.insert(body["body_id"].get<int>());
+    CHECK(health_ids == body_ids);
+    const int pattern_id = *body_ids.rbegin();
+    REQUIRE(pattern_id >= 1000000);
+    const json selected = chudware::doc::doc_eval_solid_health(did, pattern_id);
+    REQUIRE(selected["bodies"].size() == 1);
+    CHECK(selected["bodies"][0]["body_id"] == pattern_id);
+    CHECK(selected["bodies"][0]["volume_mm3"].get<double>() == doctest::Approx(1000.0));
+    const json checked = chudware::doc::doc_eval_check(did, pattern_id);
+    CHECK(checked["body_id"] == pattern_id);
+    CHECK(checked["issues"].empty());
+    CHECK(chudware::doc::doc_eval_check(did, 0)["body_id"] == pattern_id);
+    CHECK_THROWS(chudware::doc::doc_eval_check(did, 2));  // no dense alias for an instance
+    CHECK_THROWS(chudware::doc::doc_eval_solid_health(did, 2));
+}
+
+TEST_CASE("assembly health: surviving surface is inspected and missing sources prevent a clean aggregate") {
+    const std::string did = doc_new("assembly", "IntegritySurfaces").at("doc_id").get<std::string>();
+    IntegrityFixtureFile solid_file{
+        std::filesystem::temp_directory_path() / ("integrity_solid_" + did + ".step")};
+    IntegrityFixtureFile surface_file{
+        std::filesystem::temp_directory_path() / ("integrity_surface_" + did + ".step")};
+    chudware::doc::export_bodies(
+        {BRepPrimAPI_MakeBox(gp_Pnt(0, 0, 0), 10, 10, 10).Shape()},
+        solid_file.path.string(), "step");
+    chudware::doc::export_bodies(
+        {BRepBuilderAPI_MakeFace(gp_Pln(gp_Pnt(30, 0, 0), gp_Dir(0, 0, 1)),
+                                0, 10, 0, 10).Shape()},
+        surface_file.path.string(), "step");
+    doc_apply_ops(did, -1, json::array({
+        {{"op", "asm_insert_component"}, {"name", "Solid"},
+         {"source", {{"path", solid_file.path.string()}}}},
+        {{"op", "asm_insert_component"}, {"name", "Surface"},
+         {"source", {{"path", surface_file.path.string()}}}}
+    }), false);
+
+    const json census = doc_eval_model_integrity(did, json::object());
+    REQUIRE(census["solids"].size() == 1);
+    REQUIRE(census["non_solids"].size() == 1);
+    const int surface_id = census["non_solids"][0]["body_id"].get<int>();
+    const json health = chudware::doc::doc_eval_solid_health(did, 0);
+    REQUIRE(health["bodies"].size() == 2);
+    CHECK(health["all_sound"] == false);
+    const json surface = chudware::doc::doc_eval_solid_health(did, surface_id);
+    REQUIRE(surface["bodies"].size() == 1);
+    CHECK(surface["bodies"][0]["body_id"] == surface_id);
+    CHECK(surface["bodies"][0]["solids"] == 0);
+    CHECK(surface["bodies"][0]["faces"] == 1);
+    CHECK(surface["bodies"][0]["sound"] == false);
+    const json checked = chudware::doc::doc_eval_check(did, surface_id);
+    CHECK(std::any_of(checked["issues"].begin(), checked["issues"].end(),
+        [](const json& issue) { return issue["kind"] == "free_edges"; }));
+
+    // Delete only the surface source: the solid survives, but is not the whole model.
+    std::filesystem::remove(surface_file.path);
+    const json partial = chudware::doc::doc_eval_solid_health(did, 0);
+    REQUIRE(partial["bodies"].size() == 1);
+    CHECK(partial["bodies"][0]["sound"] == true);
+    CHECK(partial["complete"] == false);
+    CHECK(partial["all_sound"] == false);
+    CHECK(partial["all_watertight"] == false);
+    CHECK(std::any_of(partial["source_failures"].begin(), partial["source_failures"].end(),
+        [](const json& failure) { return failure.contains("component_id"); }));
+    const json partial_check = chudware::doc::doc_eval_check(did, 1);
+    CHECK(partial_check["complete"] == false);
+    CHECK(partial_check["source_failures"] == partial["source_failures"]);
+}
+
+TEST_CASE("invalid solid topology always produces an evaluate-check error") {
+    const std::string id = doc_new("part", "InvalidOrientation").at("doc_id").get<std::string>();
+    IntegrityFixtureFile fixture{
+        std::filesystem::temp_directory_path() / ("invalid_orientation_" + id + ".brep")};
+    const TopoDS_Shape cube = BRepPrimAPI_MakeBox(10.0, 10.0, 10.0).Shape();
+    BRep_Builder builder;
+    TopoDS_Shell shell;
+    builder.MakeShell(shell);
+    bool reverse = true;
+    for (TopExp_Explorer it(cube, TopAbs_FACE); it.More(); it.Next()) {
+        TopoDS_Shape face = it.Current();
+        if (reverse) face.Reverse();
+        reverse = false;
+        builder.Add(shell, face);
+    }
+    TopoDS_Solid invalid;
+    builder.MakeSolid(invalid);
+    builder.Add(invalid, shell);
+    REQUIRE(BRepTools::Write(invalid, fixture.path.string().c_str()));
+    chudware::doc::doc_import_file(fixture.path.string(), id, false, "brep");
+    const json health = chudware::doc::doc_eval_solid_health(id, 1);
+    REQUIRE(health["bodies"][0]["brep_valid"] == false);
+    const json checked = chudware::doc::doc_eval_check(id, 1);
+    CHECK(std::any_of(checked["issues"].begin(), checked["issues"].end(),
+        [](const json& issue) {
+            return issue["kind"] == "brep_check" && issue["severity"] == "error";
+        }));
+    chudware::doc::doc_close(id);
 }

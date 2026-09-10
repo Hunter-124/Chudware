@@ -4,7 +4,7 @@
 //
 //   1. Component loading — each non-suppressed component's ``source.path`` is opened
 //      (parts cached per path+mtime). Native child assemblies resolve recursively,
-//      preserving their solved local placements; their descendant geometry is not
+//      preserving their local placements (provisional if unsolved); their descendant geometry is not
 //      cached by the parent file's mtime. Bare neutral/mesh files use formats.cpp.
 //      The resulting local-frame solids and topology describe mate references.
 //      Embedded-only sources are unsupported and produce explicit component errors.
@@ -20,8 +20,8 @@
 //      transforms + a per-mate status list + the DOF summary are reported.
 //
 //   4. Tessellation — each component contributes ONE AICM body (body_id = ordinal,
-//      name = component name, a distinct colour per ordinal), world-placed by the solved
-//      transform (+ an optional explode offset).
+//      name = component name), world-placed by the solved transform (+ an optional
+//      explode offset). Face appearance regions retain authored child-body finishes.
 //
 // Canonical units: mm / degrees / grams.
 #pragma once
@@ -37,6 +37,8 @@
 #include <gp_Trsf.hxx>
 
 #include "mate/mate.h"
+#include "geom/aicm.h"
+#include "doc/document.h"
 
 namespace chudware::doc {
 
@@ -47,10 +49,15 @@ struct AsmBodyOut {
     std::string name;
     TopoDS_Shape shape_local;            // local-frame compound of the component's bodies
     std::vector<double> transform;       // solved 16-float row-major (world placement, no explode)
-    std::array<float, 3> color{0.7f, 0.7f, 0.7f};  // rgb [0..1]
+    std::array<float, 3> color{0.62f, 0.70f, 0.82f};  // part-renderer neutral fallback
+    float metallic = 0.0f;
+    float roughness = 0.5f;
+    std::vector<aicm::AppearanceRegion> appearance_regions;  // local compound face IDs
 };
 
-// Per-component build status.
+// Per-component build status. ok requires the ENTIRE source to rebuild successfully,
+// including descendant features/components and nested mate placement. A failed status
+// may still contribute surviving display geometry; error describes every source failure.
 struct AsmComponentStatus {
     std::string id;
     bool ok = false;
@@ -87,9 +94,10 @@ struct AssemblyResult {
     std::vector<AsmBodyOut> bodies;
     std::vector<AsmComponentStatus> component_status;
     std::vector<AsmMateStatus> mate_status;
+    std::vector<FeatureStatus> feature_status;  // authored assembly patterns, not components/mates
     int dof = 0;
     bool over_defined = false;
-    bool converged = true;
+    bool converged = true;                  // local mate solve AND complete, solved child sources
     double max_residual = 0.0;               // worst residual over every active mate
     double tolerance = 0.0;                  // the size-scaled threshold `converged` used
     std::string worst_mate;                  // mate id owning max_residual ("" if none)
@@ -108,10 +116,11 @@ AssemblyResult compile_assembly(const nlohmann::json& doc,
                                 const std::optional<chudware::mate::WarmMap>& warm = std::nullopt,
                                 const std::optional<chudware::mate::Drag>& drag = std::nullopt);
 
-// Fingerprints of every non-suppressed component's resolved source file
-// ([{path, size, mtime}] — same identity the in-memory component cache keys on). Written
-// into the assembly's persisted-geometry cache header so doc_open can prove no component
-// file changed since the cache was saved; missing files fingerprint as size/mtime 0.
+// Fingerprints of every non-suppressed component's resolved source file, followed by
+// nested descendants ([{path, size, mtime}] — the same file identity as the load cache).
+// Written into persisted-geometry cache headers so doc_open detects child appearance
+// and geometry changes even when the containing assembly file has not changed.
+// Missing files fingerprint as size/mtime 0; repeated/cyclic sources are traversed once.
 nlohmann::json asm_component_fingerprints(const nlohmann::json& doc,
                                           const std::string& base_dir);
 

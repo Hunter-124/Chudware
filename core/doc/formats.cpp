@@ -105,6 +105,7 @@
 #include <BRep_Builder.hxx>
 #include <BRep_Tool.hxx>
 #include <BRepTools.hxx>
+#include <BRepTools_ReShape.hxx>
 #include <GC_MakeArcOfCircle.hxx>
 #include <Geom_BSplineCurve.hxx>
 #include <TColgp_Array1OfPnt.hxx>
@@ -134,10 +135,12 @@
 #include <TDF_LabelSequence.hxx>
 #include <TDocStd_Document.hxx>
 #include <TopAbs.hxx>
+#include <TopExp.hxx>
 #include <TopExp_Explorer.hxx>
 #include <TopLoc_Location.hxx>
 #include <TopTools_FormatVersion.hxx>
 #include <TopTools_HSequenceOfShape.hxx>
+#include <TopTools_MapOfShape.hxx>
 #include <TopoDS.hxx>
 #include <TopoDS_Compound.hxx>
 #include <TopoDS_Edge.hxx>
@@ -880,6 +883,47 @@ bool run_dwg2dxf(const std::string& output, const std::string& input) {
 }
 
 }  // namespace
+
+// Keep solid ordinals stable, then append maximal surface/curve/point remnants.
+// A surface-only import remains one body, preserving its existing grouping.
+std::vector<TopoDS_Shape> split_import_bodies(const TopoDS_Shape& shape) {
+    std::vector<TopoDS_Shape> solids;
+    for (TopExp_Explorer ex(shape, TopAbs_SOLID); ex.More(); ex.Next())
+        solids.push_back(ex.Current());
+    if (solids.empty()) {
+        if (!shape.IsNull()) solids.push_back(shape);
+        return solids;
+    }
+
+    TopTools_MapOfShape covered;
+    for (const TopoDS_Shape& solid : solids) TopExp::MapShapes(solid, covered);
+    // Membership includes location but ignores orientation: an explicitly repeated
+    // face/edge of a solid or shell must not become another body. Visit higher-order
+    // topology first so shell faces and face wires are covered before their own pass.
+    for (TopAbs_ShapeEnum kind :
+         {TopAbs_SHELL, TopAbs_FACE, TopAbs_WIRE, TopAbs_EDGE, TopAbs_VERTEX}) {
+        for (TopExp_Explorer ex(shape, kind); ex.More(); ex.Next()) {
+            if (covered.Contains(ex.Current())) continue;
+            // A different shell/wire can still wrap already-owned faces/edges.
+            // In that case retain only its uncovered members on the later pass.
+            if (kind == TopAbs_SHELL || kind == TopAbs_WIRE) {
+                const TopAbs_ShapeEnum member =
+                    kind == TopAbs_SHELL ? TopAbs_FACE : TopAbs_EDGE;
+                bool overlaps = false;
+                for (TopExp_Explorer part(ex.Current(), member); part.More(); part.Next()) {
+                    if (covered.Contains(part.Current())) {
+                        overlaps = true;
+                        break;
+                    }
+                }
+                if (overlaps) continue;
+            }
+            solids.push_back(ex.Current());
+            TopExp::MapShapes(ex.Current(), covered);
+        }
+    }
+    return solids;
+}
 
 std::string dwg_to_temp_dxf(const std::string& path) {
     std::error_code ec;
@@ -2063,16 +2107,13 @@ std::string export_bodies(const std::vector<TopoDS_Shape>& bodies, const std::st
             // self-validation rejects the file even though .brep/.step+ wrote it fine. Exploding
             // to individual solids writes each lump as its own valid STEP solid (an implicit
             // STEP assembly), and a re-read recovers them all. A body with NO solid (an open
-            // sheet/shell surface body) is transferred as-is so surfaces still export.
+            // sheet/shell surface body) is transferred as-is; mixed bodies retain
+            // their uncovered surfaces and curves alongside the solids.
             std::vector<TopoDS_Shape> units;
             for (const TopoDS_Shape& b : bodies) {
                 if (b.IsNull()) continue;
-                bool any_solid = false;
-                for (TopExp_Explorer ex(b, TopAbs_SOLID); ex.More(); ex.Next()) {
-                    units.push_back(ex.Current());
-                    any_solid = true;
-                }
-                if (!any_solid) units.push_back(b);
+                for (TopoDS_Shape& unit : split_import_bodies(b))
+                    units.push_back(std::move(unit));
             }
             if (units.empty()) units.push_back(shape);
             for (const TopoDS_Shape& u : units)
@@ -2258,16 +2299,6 @@ std::pair<std::size_t, std::size_t> estimate_tessellation(
 
 namespace {
 
-// All solids in a shape, or the shape itself when it carries none (a single solid is
-// often returned bare; a multi-body STEP returns a compound of solids).
-std::vector<TopoDS_Shape> split_solids(const TopoDS_Shape& shape) {
-    std::vector<TopoDS_Shape> solids;
-    for (TopExp_Explorer ex(shape, TopAbs_SOLID); ex.More(); ex.Next())
-        solids.push_back(ex.Current());
-    if (solids.empty() && !shape.IsNull()) solids.push_back(shape);
-    return solids;
-}
-
 std::vector<std::pair<std::string, TopoDS_Shape>> name_bodies(
     const std::vector<TopoDS_Shape>& solids) {
     std::vector<std::pair<std::string, TopoDS_Shape>> out;
@@ -2320,7 +2351,7 @@ std::vector<std::pair<std::string, TopoDS_Shape>> import_bodies(const std::strin
             TopoDS_Shape shape = r.OneShape();
             if (shape.IsNull())
                 throw OpError("import_failed", "STEP reader: no shape transferred", {{"path", path}});
-            return name_bodies(split_solids(shape));
+            return name_bodies(split_import_bodies(shape));
         }
         if (fmt == "iges") {
             IGESControl_Reader r;
@@ -2339,34 +2370,36 @@ std::vector<std::pair<std::string, TopoDS_Shape>> import_bodies(const std::strin
             fix.Perform();
             TopoDS_Shape fixed = fix.Shape();
             if (fixed.IsNull()) fixed = raw;
-            // Promote any closed shells to solids (same pattern as mesh_to_shape).
-            // Without this step, IGES returns a surface shell with volume=0 even for
-            // geometrically-closed bodies, because split_solids only finds TopAbs_SOLID.
-            TopoDS_Shape promoted = fixed;
-            for (TopExp_Explorer ex(fixed, TopAbs_SHELL); ex.More(); ex.Next()) {
-                TopoDS_Shell shell = TopoDS::Shell(ex.Current());
-                if (BRep_Tool::IsClosed(shell)) {
-                    try {
-                        BRepBuilderAPI_MakeSolid ms(shell);
-                        if (ms.IsDone()) {
-                            ShapeFix_Solid sfix;
-                            TopoDS_Shape solid = sfix.SolidFromShell(shell);
-                            promoted = solid.IsNull() ? TopoDS_Shape(ms.Solid()) : solid;
-                        }
-                    } catch (const Standard_Failure&) {
-                        // leave as shell — truly open surfaces stay shells
+            // Promote every valid closed free shell without discarding its siblings.
+            // Existing solids retain their order; newly recovered solids follow them.
+            BRepTools_ReShape remaining;
+            std::vector<TopoDS_Shape> promoted;
+            for (TopExp_Explorer ex(fixed, TopAbs_SHELL, TopAbs_SOLID);
+                 ex.More(); ex.Next()) {
+                const TopoDS_Shell shell = TopoDS::Shell(ex.Current());
+                if (remaining.IsRecorded(shell) || !BRep_Tool::IsClosed(shell)) continue;
+                try {
+                    ShapeFix_Solid sfix;
+                    const TopoDS_Shape solid = sfix.SolidFromShell(shell);
+                    if (!solid.IsNull() && solid.ShapeType() == TopAbs_SOLID &&
+                        BRepCheck_Analyzer(solid).IsValid()) {
+                        remaining.Remove(shell);
+                        promoted.push_back(solid);
                     }
-                    break;  // single closed shell is the common IGES case
+                } catch (const Standard_Failure&) {
+                    // Preserve the original shell if promotion cannot recover a solid.
                 }
             }
-            return name_bodies(split_solids(promoted));
+            if (promoted.empty()) return name_bodies(split_import_bodies(fixed));
+            promoted.insert(promoted.begin(), remaining.Apply(fixed));
+            return name_bodies(split_import_bodies(as_compound(promoted)));
         }
         if (fmt == "brep") {
             TopoDS_Shape shape;
             BRep_Builder b;
             if (!BRepTools::Read(shape, path.c_str(), b) || shape.IsNull())
                 throw OpError("import_failed", "BREP reader returned failure", {{"path", path}});
-            return name_bodies(split_solids(shape));
+            return name_bodies(split_import_bodies(shape));
         }
         if (fmt == "sldprt" || fmt == "sldasm") {
             // Portable modern-SolidWorks lane. Recover the saved display triangle strips, sew
@@ -2392,7 +2425,7 @@ std::vector<std::pair<std::string, TopoDS_Shape>> import_bodies(const std::strin
                     cached = sewn.emplace(key, std::move(base)).first;
                 }
                 TopoDS_Shape placed = place_solidworks_body(cached->second, item.transform);
-                const auto solids = split_solids(placed);
+                const auto solids = split_import_bodies(placed);
                 for (std::size_t i = 0; i < solids.size(); ++i) {
                     std::string name = item.name;
                     if (solids.size() > 1) name += "/Body" + std::to_string(i + 1);
@@ -2418,7 +2451,7 @@ std::vector<std::pair<std::string, TopoDS_Shape>> import_bodies(const std::strin
                 throw OpError("import_failed",
                               "import: mesh in '" + path + "' could not be sewn into a body",
                               {{"path", path}, {"format", fmt}});
-            return name_bodies(split_solids(shape));
+            return name_bodies(split_import_bodies(shape));
         }
         if (fmt == "3mf") {
 #ifdef CHUDWARE_WITH_LIB3MF
@@ -2477,7 +2510,7 @@ std::vector<std::pair<std::string, TopoDS_Shape>> import_bodies(const std::strin
 #endif
         }
         if (fmt == "dxf") {
-            // 2D lane: one Compound body (faces + free wires), no split_solids — a DXF
+            // 2D lane: one Compound body (faces + free wires), no split_import_bodies — a DXF
             // profile has no solids, and splitting would silently drop the free wires.
             TopoDS_Shape shape = read_dxf_shape(path);
             std::string stem = std::filesystem::path(path).stem().string();

@@ -374,6 +374,12 @@ nlohmann::json doc_eval_check(const std::string& doc_id, int body_id);
 // 1-based; <= 0 reports EVERY body. Throws OpError on no bodies / a bad body_id.
 nlohmann::json doc_eval_solid_health(const std::string& doc_id, int body_id);
 
+// Exhaustive world-solid validity and geometric proximity census, including solids
+// inside assembly components. Connectivity is geometric, not attachment/load-path proof.
+// Incomplete native checks are explicit failures, never an empty passing inventory.
+nlohmann::json doc_eval_model_integrity(const std::string& doc_id,
+                                       const nlohmann::json& params);
+
 // Evaluate — cross-section properties of the LAST body at `plane` (port of
 // evaluate.py::section_props via worker.py::_eval_section_props). `plane` is a reserved
 // planar datum id ("plane.top/front/right"), a {"kind":"datum","feature":<id>} selector,

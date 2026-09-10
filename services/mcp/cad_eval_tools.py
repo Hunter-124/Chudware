@@ -9,6 +9,7 @@ from typing import Any
 from typing import Optional
 from typing import Union
 import json
+import math
 import os
 import re
 
@@ -1439,6 +1440,86 @@ def register_cad_eval_tools(mcp: FastMCP) -> None:
             return _dumps(_interpreted({"ok": res.get("ok", True), "doc_id": d, **res}, notes))
         except Exception as e:  # noqa: BLE001
             return _err(_teach_no_bodies(e, d, "check_interference()"))
+
+    @mcp.tool()
+    def inspect_model_integrity(
+        doc_id: Optional[str] = None,
+        proximity_mm: Annotated[float, Field(strict=True)] = 0.05,
+        include_nearest: Annotated[bool, Field(strict=True)] = True,
+        pair_budget_s: Annotated[float, Field(strict=True)] = 2.0,
+    ) -> str:
+        """Census every solid, including disconnected solids INSIDE assembly components.
+
+        Read-only native inspection of part bodies and world-placed assembly sources:
+        per-solid provenance, BRep validity, volume, centroid and bounds; exact near-pair
+        distances/overlap volumes; geometric islands and isolated solid IDs. IDs identify
+        THIS model revision only, not persistent references across edits.
+
+        proximity_mm (finite 0..1000 mm) is a geometric search radius, NOT an acceptable
+        clearance. Pairs are overlap, touching, or proximity: a positive gap is NEVER
+        contact. include_nearest also finds the exact nearest solid for each isolated
+        solid, even outside the radius. nearest[].status is exact, unknown, or
+        no_other_solids; unknown distances stay null, and candidate_best_* is only partial
+        evidence, not a proven minimum. pair_budget_s is a finite per-pair budget (0,60].
+
+        Returns the native census intact: ok, complete, solids, non_solids, pairs,
+        pair_failures, islands, isolated_solids, optional nearest, assembly, summary and
+        limitations, plus inspection_summary and interpretation. ok means the QUERY ran,
+        NOT geometry is safe; incomplete results cannot rule out omitted connections or
+        overlaps. Pair failures or invalid sources make complete false.
+
+        Islands describe geometric connectivity only: neither touching nor proximity
+        proves physical attachment or a load path. Fixed/mate flags do not prove either.
+        An isolated solid may be an intentional running-clearance part, not a floating
+        error; verify its retention/joints and motion across the operating range. A
+        proximity pair can be an intentional bearing clearance, not a connection to fuse.
+        This does not verify engineering criteria, manufacturing safety, or interference
+        placement, and does not save or modify the document.
+        """
+        try:
+            for name, value, upper, zero_allowed in (
+                ("proximity_mm", proximity_mm, 1000.0, True),
+                ("pair_budget_s", pair_budget_s, 60.0, False),
+            ):
+                if (isinstance(value, bool) or not isinstance(value, (int, float))
+                        or not math.isfinite(value) or value > upper
+                        or (value < 0 if zero_allowed else value <= 0)):
+                    interval = f"[0, {upper:g}]" if zero_allowed else f"(0, {upper:g}]"
+                    raise ValueError(
+                        f"inspect_model_integrity: {name} must be a finite number in {interval}.")
+            if not isinstance(include_nearest, bool):
+                raise ValueError("inspect_model_integrity: include_nearest must be true or false.")
+            d = _doc(doc_id)
+            res = cb.call("eval_model_integrity", {
+                "doc_id": d, "proximity_mm": proximity_mm,
+                "include_nearest": include_nearest, "pair_budget_s": pair_budget_s,
+            })
+            status = ("Query refused" if res.get("ok") is not True else
+                      "Complete geometric census" if res.get("complete") is True else
+                      "Incomplete geometric census; unknown evidence remains")
+            inspection_summary = (
+                f"{status}: {len(res.get('solids', []))} solids, "
+                f"{len(res.get('non_solids', []))} non-solid records, "
+                f"{len(res.get('pairs', []))} near pairs, "
+                f"{len(res.get('pair_failures', []))} pair failures, "
+                f"{len(res.get('islands', []))} geometric islands, "
+                f"{len(res.get('isolated_solids', []))} isolated solids. "
+                "Positive gaps are proximity, not contact. Geometric islands do not prove "
+                "physical attachment or load paths; assess retention and running clearances "
+                "separately. No engineering criteria or placement verification performed."
+            )
+            return _dumps({
+                **res,
+                "inspection_summary": inspection_summary,
+                "interpretation": {
+                    "physical_attachment": "not_assessed",
+                    "load_paths": "not_assessed",
+                    "running_clearances": "not_assessed",
+                    "placement_verification": "not_performed",
+                },
+            })
+        except Exception as e:  # noqa: BLE001
+            return _err(e)
 
 
 

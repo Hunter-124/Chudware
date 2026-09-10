@@ -102,3 +102,29 @@ normals), 12 tris, 12 edges (2-pt polylines), 8 B-rep vertices, face order −X,
 ids 1…; body_id 1, name "Body1", color (0.71, 0.76, 0.82). The generator is deterministic;
 tests regenerate and byte-compare against the committed file. The C++ loader test parses the same
 file and asserts counts/ranges.
+
+## 5. Optional appearance regions (`APRG`)
+
+Assembly components retain one `BODY` and unchanged picking topology while inheriting
+different appearances from their source solids. An optional `APRG` chunk binds to an
+already emitted body by ID:
+
+```
+u32 body_id
+u32 region_count
+repeat region_count:
+  u32 first_face     // inclusive stable 1-based FACE.face_id
+  u32 face_count     // positive count of consecutive face IDs
+  f32 color[3]       // finite 0..1 sRGB
+  f32 metallic       // finite 0..1
+  f32 roughness      // finite 0..1
+```
+
+Each record is 28 bytes. Regions MUST be non-overlapping, refer only to existing
+face IDs, and contain finite appearance values in the stated ranges. Readers MUST
+reject truncated or invalid region records. Uncovered faces use the BODY appearance.
+Files without APRG retain the existing whole-body appearance; older readers skip
+APRG using its payload length. Producers MUST NOT change body IDs, face IDs, or
+triangle topology to convey appearance. Explicit assembly appearance overrides
+take precedence over inherited source appearance. Diagnostic tint and scalar-field
+overlays remain distinct display modes, not authored material colors.

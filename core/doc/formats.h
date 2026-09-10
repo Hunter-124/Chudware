@@ -120,8 +120,8 @@ std::vector<std::pair<std::string, MeshData>> read_mesh_raw(const std::string& p
 // shape (shell or solid). Empty mesh -> a null shape.
 TopoDS_Shape mesh_to_shape(const MeshData& mesh);
 
-// Write the surviving solid bodies to `path` in `fmt`. Supported: step, iges, brep,
-// stl, obj, ply, gltf, glb (mesh formats tessellate the solids at the Python defaults).
+// Write surviving solid and non-solid bodies to `path` in `fmt`. Supported: step, iges,
+// brep, stl, obj, ply, gltf, glb (mesh formats tessellate at the Python defaults).
 // Bodies are merged into one compound for the B-rep writers (mirrors formats.py::
 // _shapes_to_export_list). Throws OpError("export_failed") on an unsupported format or
 // a writer failure. Returns the absolute path written.
@@ -129,7 +129,7 @@ std::string export_bodies(const std::vector<TopoDS_Shape>& bodies,
                           const std::string& path, const std::string& fmt,
                           const TessOptions& tess = TessOptions{});
 
-// Read solid bodies from `path`. Supported: step (multi-solid), iges (sewn+healed),
+// Read solid and non-solid bodies from `path`. Supported: step (multi-body), iges (sewn+healed),
 // brep, mesh formats stl/obj/ply/gltf/glb/3mf/3dm (sewn into a shell/solid), and
 // modern sldprt/sldasm saved-display tessellations. Returns (name, shape) pairs in file
 // order; SolidWorks assemblies retain flattened hierarchy/instance path names and world
@@ -137,6 +137,10 @@ std::string export_bodies(const std::vector<TopoDS_Shape>& bodies,
 // unavailable optional dependency, or empty result. x_t/x_b must route through COM -> STEP.
 std::vector<std::pair<std::string, TopoDS_Shape>> import_bodies(const std::string& path,
                                                                 const std::string& fmt);
+
+// Keep solid body ordinals stable, then append uncovered non-solid remnants.
+// Shapes without solids retain their existing whole-shape grouping.
+std::vector<TopoDS_Shape> split_import_bodies(const TopoDS_Shape& shape);
 
 // Serialize a shape to a base64-encoded OCCT BREP blob, and back. Used to BAKE imported
 // geometry directly into the .step+ container (document.json) so a saved assembly no

@@ -65,6 +65,7 @@
 #include <TopoDS_Compound.hxx>
 #include <TopoDS_Face.hxx>
 #include <TopoDS_Shape.hxx>
+#include <TopoDS_Iterator.hxx>
 #include <BRep_Builder.hxx>
 #include <gp_Pnt.hxx>
 #include <gp_Pln.hxx>
@@ -2772,12 +2773,15 @@ void op_sketch_rotate(json& doc, const json& op, std::size_t idx, IdGen& gen, js
 
 const std::array<double, 16> kIdent16{1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
 
+bool valid_component_source(const json& source) {
+    return source.is_object() &&
+           ((source.contains("path") && source["path"].is_string()) ||
+            (source.contains("embedded") && source["embedded"].is_string()));
+}
+
 void op_asm_insert_component(json& doc, const json& op, std::size_t idx, IdGen& gen, json& id_map) {
     const json& source = op.contains("source") ? op["source"] : json(nullptr);
-    bool ok_src = source.is_object() &&
-                  ((source.contains("path") && source["path"].is_string()) ||
-                   (source.contains("embedded") && source["embedded"].is_string()));
-    if (!ok_src)
+    if (!valid_component_source(source))
         throw OpError("invalid_op", "asm_insert_component requires source.{path|embedded}",
                       {{"index", idx}});
     const std::string kid = gen.next("k");
@@ -2819,6 +2823,9 @@ void op_asm_insert_component(json& doc, const json& op, std::size_t idx, IdGen& 
 
 void op_asm_edit_component(json& doc, const json& op, std::size_t idx) {
     const std::string kid = op.value("id", std::string());
+    if (op.contains("source") && !valid_component_source(op["source"]))
+        throw OpError("invalid_op", "asm_edit_component requires source.{path|embedded}",
+                      {{"index", idx}});
     if (doc.contains("components") && doc["components"].is_array())
         for (json& c : doc["components"])
             if (c.value("id", std::string()) == kid) {
@@ -2826,7 +2833,7 @@ void op_asm_edit_component(json& doc, const json& op, std::size_t idx) {
                 // mask, re-derived from this flag on every load) but still participates in the
                 // mate solve / interference / BOM — unlike `suppressed`, which drops the
                 // component from the build entirely. Persisted so hide survives save + undo.
-                for (const char* k : {"transform", "name", "suppressed", "fixed", "hidden"})
+                for (const char* k : {"source", "transform", "name", "suppressed", "fixed", "hidden"})
                     if (op.contains(k) && !op[k].is_null()) c[k] = op[k];
                 return;
             }
@@ -4021,7 +4028,7 @@ json ops_response(Session& s, const CompileResult& r, const json& id_map, bool w
             bodies.push_back({{"body_id", i + 1}, {"name", key},
                               {"color", {bcolor[0], bcolor[1], bcolor[2]}},
                               {"owner_key", key}, {"metallic", bmetal}, {"roughness", brough},
-                              {"kind", "solid"}});
+                              {"kind", r.bodies_info[static_cast<std::size_t>(i)].kind}});
         }
         resp["tess"] = {{"aicm_path", aicm_path}, {"bodies", bodies}};
         resp["volume"] = r.volume;  // C++ convenience (geometric parity signal)
@@ -4303,20 +4310,24 @@ std::pair<std::string, json> write_aicm_assembly(Session& s,
                 bt.body_id = static_cast<uint32_t>(body.body_id);
                 bt.name = body.name;
                 bt.color[0] = color[0]; bt.color[1] = color[1]; bt.color[2] = color[2];
+                bt.metallic = body.metallic;
+                bt.roughness = body.roughness;
                 if (t.Form() != gp_Identity) ::geom::transform_body_rigid(bt, t);
             } else {
                 TopoDS_Shape world = placed_world_shape(body, off);
                 const ::geom::DisplayDeflections d =
                     ::geom::display_deflections(s.display_quality, world);
                 bt = ::geom::tessellate_body(world, static_cast<uint32_t>(body.body_id),
-                                             body.name, color, d.lin, d.ang);
+                                             body.name, color, d.lin, d.ang,
+                                             body.metallic, body.roughness);
             }
+            bt.appearance_regions = body.appearance_regions;
             tesses.push_back(std::move(bt));
             bodies_meta.push_back({{"body_id", body.body_id}, {"name", body.name},
                                    {"color", {body.color[0], body.color[1], body.color[2]}},
                                    {"component", body.component_id},
                                    {"owner_key", body.component_id},
-                                   {"metallic", 0.0}, {"roughness", 0.5}});
+                                   {"metallic", body.metallic}, {"roughness", body.roughness}});
         }
     }
     std::vector<uint8_t> blob = aicm::write_aicm(tesses);
@@ -4370,6 +4381,12 @@ json ops_response_assembly(Session& s, const json& id_map,
             feature_status.push_back(row);
             components.push_back(row);
         }
+        for (const FeatureStatus& status : ares->feature_status)
+            feature_status.push_back({{"id", status.id}, {"ok", status.ok},
+                                      {"ms", status.ms},
+                                      {"error", status.ok ? json(nullptr) : json(status.error)},
+                                      {"warning", status.warning.empty() ? json(nullptr) : json(status.warning)},
+                                      {"dangling_refs", json::array()}});
         for (const AsmMateStatus& ms : ares->mate_status)
             mates.push_back({{"id", ms.id}, {"type", ms.type}, {"status", ms.status},
                              {"dangling_refs", ms.dangling_refs},
@@ -5842,12 +5859,12 @@ json doc_asm_world_bodies(const std::string& doc_id, bool explode) {
             }
             const std::string nm =
                 i < r.bodies_info.size() ? r.bodies_info[i].name : ("Body" + std::to_string(i + 1));
-            out.push_back({{"name", nm}, {"component", nm}, {"bbox", bb},
+            out.push_back({{"body_id", i + 1}, {"name", nm}, {"component", nm}, {"bbox", bb},
                            {"source_ordinals", source_ordinals(world)}});
         }
         return json{{"bodies", out}, {"multibody_part", true}};
     }
-    if (!s.asm_result) rebuild_assembly(s);
+    rebuild_assembly(s);
     std::map<std::string, Eigen::Vector3d> offsets;
     if (explode && s.explode_active) offsets = explode_offsets(s.doc, s.explode_factor);
     json out = json::array();
@@ -5866,7 +5883,7 @@ json doc_asm_world_bodies(const std::string& doc_id, bool explode) {
                 bb = {{"min", {xa, ya, za}}, {"max", {xb, yb, zb}},
                       {"size", {xb - xa, yb - ya, zb - za}}};
             }
-            out.push_back({{"name", body.name}, {"component", body.component_id}, {"bbox", bb},
+            out.push_back({{"body_id", body.body_id}, {"name", body.name}, {"component", body.component_id}, {"bbox", bb},
                            {"source_ordinals", source_ordinals(world)}});
         }
     return json{{"bodies", out}};
@@ -7315,6 +7332,7 @@ bool render_view_to_rgb(const std::vector<aicm::AicmBody>& bodies,
             face_tint.push_back(tint[0]); face_tint.push_back(tint[1]); face_tint.push_back(tint[2]);
             face_tinted.push_back(tinted ? 1 : 0);
         }
+        size_t appearance_index = 0;
         for (size_t t = 0; t + 2 < b.idx.size(); t += 3) {
             uint32_t i0 = b.idx[t], i1 = b.idx[t + 1], i2 = b.idx[t + 2];
             if (3u * i0 + 2 >= b.pos.size() || 3u * i1 + 2 >= b.pos.size() ||
@@ -7344,6 +7362,18 @@ bool render_view_to_rgb(const std::vector<aicm::AicmBody>& bodies,
             bool use_tint = false;
             const int fidx = (t / 3 < face_of_tri.size()) ? face_of_tri[t / 3] : -1;
             if (fidx >= 0) {
+                const uint32_t face_id = b.faces[static_cast<size_t>(fidx)].face_id;
+                while (appearance_index < b.appearance_regions.size() &&
+                       static_cast<uint64_t>(b.appearance_regions[appearance_index].first_face) +
+                           b.appearance_regions[appearance_index].face_count <= face_id)
+                    ++appearance_index;
+                if (appearance_index < b.appearance_regions.size() &&
+                    b.appearance_regions[appearance_index].first_face <= face_id) {
+                    const auto& appearance = b.appearance_regions[appearance_index];
+                    cr = appearance.color[0];
+                    cg = appearance.color[1];
+                    cb = appearance.color[2];
+                }
                 // Per-FACE decision (kills the curved-face blotch): use the face's precomputed hue.
                 if (face_tinted[fidx]) {
                     tint[0] = face_tint[3 * fidx];
@@ -7356,9 +7386,9 @@ bool render_view_to_rgb(const std::vector<aicm::AicmBody>& bodies,
             }
             if (use_tint && annotate) {   // orientation tint is an annotation — off for clean shots
                 const double mix = 0.55;
-                cr = (1 - mix) * br + mix * (tint[0] / 255.0);
-                cg = (1 - mix) * bg + mix * (tint[1] / 255.0);
-                cb = (1 - mix) * bb + mix * (tint[2] / 255.0);
+                cr = (1 - mix) * cr + mix * (tint[0] / 255.0);
+                cg = (1 - mix) * cg + mix * (tint[1] / 255.0);
+                cb = (1 - mix) * cb + mix * (tint[2] / 255.0);
             }
             ProjectedVertex p0, p1, p2;
             proj(w0.x, w0.y, w0.z, p0.pu, p0.pv, p0.pd);
@@ -7529,7 +7559,8 @@ static std::vector<aicm::AicmBody> tessellate_session_bodies(Session& s) {
                         ::geom::display_deflections(s.display_quality, world);
                     bodies.push_back(::geom::tessellate_body(
                         world, static_cast<uint32_t>(body.body_id), body.name, color,
-                        d.lin, d.ang));
+                        d.lin, d.ang, body.metallic, body.roughness));
+                    bodies.back().appearance_regions = body.appearance_regions;
                 } catch (...) {
                 }
             }
@@ -7661,7 +7692,7 @@ json doc_render_png(const std::string& doc_id, const std::string& out_path, bool
 // Render one requested view through the shared software rasterizer. Legacy named, azimuth/
 // elevation, direction, size, and focus specs retain their orthographic auto-fit path. A
 // `view.camera` object selects the authoritative perspective path: position, target, up, FOV, and
-// near/far are validated without fallback or clamping, while width/height alone clamp to 64..2048.
+// near/far are validated without fallback or clamping, while width/height alone clamp to 64..4096.
 //
 // Legacy responses keep the orthographic `{center,right,up,dir,scale,cu,cv,...}` frame. Perspective
 // responses identify `projection:"perspective"` and return position, forward/right/true-up,
@@ -7669,7 +7700,7 @@ json doc_render_png(const std::string& doc_id, const std::string& out_path, bool
 // also echo the applied camera, capability, and locked document revision.
 //
 // The legacy object form accepts CLOSE-UP framing:
-//   "width" / "height"   image size in pixels (default 512x400, clamped to 64..2048)
+//   "width" / "height"   image size in pixels (default 512x400, clamped to 64..4096)
 //   "focus": {"min":[x,y,z], "max":[x,y,z]} or {"center":[x,y,z], "radius":r}
 //            "margin":0.15, "clip_near":false
 // Exact cameras refuse `focus` because honoring both would silently reframe or clip the pose.
@@ -7711,10 +7742,10 @@ json doc_render_view(const std::string& doc_id, const std::string& out_path,
                 requested = *value;
                 if (value->is_number_unsigned()) {
                     const unsigned long long raw = value->get<unsigned long long>();
-                    applied = raw > 2048 ? 2048 : (raw < 64 ? 64 : static_cast<int>(raw));
+                    applied = raw > 4096 ? 4096 : (raw < 64 ? 64 : static_cast<int>(raw));
                 } else {
                     const long long raw = value->get<long long>();
-                    applied = raw < 64 ? 64 : (raw > 2048 ? 2048 : static_cast<int>(raw));
+                    applied = raw < 64 ? 64 : (raw > 4096 ? 4096 : static_cast<int>(raw));
                 }
                 return true;
             };
@@ -7728,8 +7759,8 @@ json doc_render_view(const std::string& doc_id, const std::string& out_path,
             auto clampi = [](int v, int lo2, int hi2) {
                 return std::max(lo2, std::min(v, hi2));
             };
-            W = clampi(view.value("width", 512), 64, 2048);
-            H = clampi(view.value("height", 400), 64, 2048);
+            W = clampi(view.value("width", 512), 64, 4096);
+            H = clampi(view.value("height", 400), 64, 4096);
             requested_W = W;
             requested_H = H;
         }
@@ -9630,13 +9661,82 @@ TopoDS_Shape eval_resolve_ref(const json& ref, const TopoDS_Shape& shape, double
 
 }  // namespace
 
+// Evaluation must inspect surviving geometry, not apply the export acceptance gate.
+// Assembly body IDs are public identities (patterns are sparse), never vector ordinals.
+struct EvalShapeSet {
+    CompileResult compiled;
+    std::vector<int> body_ids;
+    json source_failures = json::array();
+    bool complete = true;
+};
+
+static EvalShapeSet gather_eval_shapes(Session& s) {
+    EvalShapeSet result;
+    auto failure = [&](json row, const std::string& reason) {
+        row["reason"] = reason;
+        result.source_failures.push_back(std::move(row));
+        result.complete = false;
+    };
+    if (!s.is_assembly()) {
+        result.compiled = compile_session(s);
+        for (const auto& status : result.compiled.statuses)
+            if (!status.ok) failure({{"feature_id", status.id}}, status.error);
+        for (std::size_t i = 0; i < result.compiled.shapes.size(); ++i)
+            result.body_ids.push_back(static_cast<int>(i + 1));
+        return result;
+    }
+    rebuild_assembly(s);
+    const AssemblyResult& ar = *s.asm_result;
+    if (!ar.converged) failure(json::object(), "assembly_not_converged");
+    for (const auto& status : ar.component_status)
+        if (!status.ok)
+            failure({{"component_id", status.id}},
+                    status.error.value_or("component_source_incomplete"));
+    for (const auto& status : ar.feature_status)
+        if (!status.ok) failure({{"feature_id", status.id}}, status.error);
+    for (const auto& mate : ar.mate_status)
+        if (mate.status == "unresolved" || mate.status == "conflicting")
+            failure({{"mate_id", mate.id}, {"status", mate.status}}, mate.reason);
+    for (const auto& body : ar.bodies) {
+        const json provenance{{"body_id", body.body_id}, {"component_id", body.component_id}};
+        try {
+            TopoDS_Shape shape = placed_world_shape(body, std::nullopt);
+            if (shape.IsNull()) {
+                failure(provenance, "null_source_shape");
+                continue;
+            }
+            result.compiled.shapes.push_back(std::move(shape));
+            result.body_ids.push_back(body.body_id);
+        } catch (const Standard_Failure& e) {
+            failure(provenance, e.GetMessageString() ? e.GetMessageString() : "world_placement_failed");
+        } catch (const std::exception& e) {
+            failure(provenance, e.what());
+        }
+    }
+    return result;
+}
+
+static std::size_t eval_shape_index(const EvalShapeSet& shapes, const std::string& doc_id,
+                                    int body_id) {
+    if (shapes.compiled.shapes.empty())
+        throw_no_bodies(doc_id, shapes.compiled, "evaluate");
+    if (body_id <= 0) return shapes.body_ids.size() - 1;
+    const auto it = std::find(shapes.body_ids.begin(), shapes.body_ids.end(), body_id);
+    if (it == shapes.body_ids.end())
+        throw OpError("invalid_op", "body_id " + std::to_string(body_id) +
+                      " is not a surviving body in the document",
+                      {{"body_ids", shapes.body_ids}});
+    return static_cast<std::size_t>(it - shapes.body_ids.begin());
+}
+
 // engine/doc/evaluate.py::check via worker.py::_eval_check. BRepCheck_Analyzer +
 // free-edge / tiny-edge / sliver-face census. Returns {"issues":[{kind,severity,text}]}.
 json doc_eval_check(const std::string& doc_id, int body_id) {
     DocLock lk;
     Session& s = require_session(doc_id);
-    CompileResult r = compile_session(s);
-    const TopoDS_Shape& shape = eval_active_shape(r, doc_id, body_id);
+    const EvalShapeSet shapes = gather_eval_shapes(s);
+    const std::size_t index = eval_shape_index(shapes, doc_id, body_id);
+    const TopoDS_Shape& shape = shapes.compiled.shapes[index];
 
     json issues = json::array();
 
@@ -9671,6 +9771,9 @@ json doc_eval_check(const std::string& doc_id, int body_id) {
             }
         } catch (const Standard_Failure&) {
         }
+        if (issues.empty())
+            issues.push_back(json{{"kind", "brep_check"}, {"severity", "error"},
+                                  {"text", "BRepCheck analyzer reported invalid topology"}});
     }
 
     // Free-edge census: edges with fewer than 2 adjacent faces — BUT a SEAM edge of a
@@ -9745,7 +9848,8 @@ json doc_eval_check(const std::string& doc_id, int body_id) {
         issues.push_back(json{{"kind", "sliver_faces"}, {"severity", "warning"}, {"text", buf}});
     }
 
-    return json{{"issues", issues}};
+    return json{{"issues", issues}, {"body_id", shapes.body_ids[index]},
+                {"complete", shapes.complete}, {"source_failures", shapes.source_failures}};
 }
 
 // ── eval_solid_health (T-GH1) ────────────────────────────────────────────────────────────
@@ -9763,9 +9867,9 @@ json doc_eval_check(const std::string& doc_id, int body_id) {
 // cone apex / sphere pole). Both of those are file-local statics elsewhere, and neither
 // yields the offending edge, so the walk is reimplemented here rather than called.
 //
-// body_id is 1-based; <= 0 reports EVERY surviving body (deliberately unlike eval_*'s
-// "last body" default — a health sweep that silently skipped bodies 1..n-1 would be exactly
-// the confidently-incomplete answer this op exists to kill).
+// body_id is the public world-body ID (1..n for parts, sparse for assembly patterns).
+// <= 0 reports EVERY surviving body, deliberately unlike eval_check's last-body default.
+// Completeness and source failures cover the whole document even when selecting one body.
 static const char* health_status_text(BRepCheck_Status st) {
     switch (st) {
         case BRepCheck_NoError:                    return "no_error";
@@ -9842,23 +9946,367 @@ static std::string si_one_line(const std::string& in) {
     return out;
 }
 
+// A census of individual solids, not component compounds. The graph records geometry,
+// never fastening intent; even a complete report is not a manufacturing verdict.
+json doc_eval_model_integrity(const std::string& doc_id, const json& params) {
+    DocLock lk;
+    Session& s = require_session(doc_id);
+    auto number = [&](const char* key, double fallback, double maximum, bool positive) {
+        if (params.contains(key) && !params[key].is_number())
+            throw OpError("invalid_op", std::string(key) + " must be numeric");
+        const double v = params.value(key, fallback);
+        if (!std::isfinite(v) || v > maximum || (positive ? v <= 0 : v < 0))
+            throw OpError("invalid_op", std::string(key) + " is outside the supported range");
+        return v;
+    };
+    const double proximity = number("proximity_mm", 0.05, 1000.0, false);
+    const double budget_s = number("pair_budget_s", 2.0, 60.0, true);
+    if (params.contains("include_nearest") && !params["include_nearest"].is_boolean())
+        throw OpError("invalid_op", "include_nearest must be boolean");
+    const bool include_nearest = params.value("include_nearest", true);
+    json out{{"ok", true}, {"complete", true}, {"doc_id", doc_id},
+             {"revision", s.revision},
+             {"proximity_mm", proximity}, {"solids", json::array()},
+             {"non_solids", json::array()}, {"pairs", json::array()},
+             {"pair_failures", json::array()}, {"source_failures", json::array()},
+             {"islands", json::array()}, {"isolated_solids", json::array()},
+             {"nearest", json::array()},
+             {"assembly", {{"components", json::array()}, {"mates", json::array()},
+                           {"converged", nullptr}}},
+             {"limitations", json::array({
+                 "Solid IDs are scoped to the current document revision, not persistent across edits.",
+                 "Islands and isolation describe the geometric proximity graph, not attachment or load paths.",
+                 "Positive measured gaps are proximity, never contact. OCCT distances and booleans use kernel tolerances.",
+                 "BRep validity is not a self-intersection, manufacturability, or structural safety proof.",
+                 "Pair distances and the proximity graph assess solids only; non-solid remnants are listed separately.",
+                 "Pair time budgets use cooperative OCCT cancellation, not a hard process deadline.",
+                 "Assembly provenance names the owning top-level component/source; nested leaf body identity is unavailable."
+             })}};
+    struct Solid {
+        TopoDS_Shape shape;
+        Bnd_Box box;
+        std::string id;
+        bool usable = false;
+    };
+    std::vector<Solid> solids;
+    auto source_failure = [&](json provenance, const std::string& reason) {
+        provenance["reason"] = reason;
+        out["source_failures"].push_back(std::move(provenance));
+        out["complete"] = false;
+    };
+    auto collect = [&](const TopoDS_Shape& shape, int bid, const std::string& component,
+                       const std::string& name, const std::string& path, int ordinal) {
+        json provenance{{"body_id", bid}, {"component_id", component.empty() ? json(nullptr) : json(component)},
+                        {"component_name", name.empty() ? json(nullptr) : json(name)},
+                        {"source_path", path.empty() ? json(nullptr) : json(path)},
+                        {"source_ordinal", ordinal}};
+        if (shape.IsNull()) {
+            source_failure(provenance, "null_source_shape");
+            return;
+        }
+        TopTools_IndexedMapOfShape map;
+        TopExp::MapShapes(shape, TopAbs_SOLID, map);
+        for (int k = 1; k <= map.Extent(); ++k) {
+            Solid solid;
+            solid.shape = map.FindKey(k);
+            solid.id = "b" + std::to_string(bid) + "/s" + std::to_string(k);
+            json row = provenance;
+            row.update({{"id", solid.id}, {"solid_index", k}, {"bbox", nullptr},
+                        {"volume_mm3", nullptr}, {"centroid_mm", nullptr}, {"brep_valid", nullptr}});
+            try {
+                BRepCheck_Analyzer analyzer(solid.shape);
+                const bool valid = analyzer.IsValid();
+                row["brep_valid"] = valid;
+                GProp_GProps props;
+                BRepGProp::VolumeProperties(solid.shape, props);
+                const gp_Pnt c = props.CentreOfMass();
+                const double volume = props.Mass();
+                if (!std::isfinite(volume) || !std::isfinite(c.X()) ||
+                    !std::isfinite(c.Y()) || !std::isfinite(c.Z()))
+                    throw std::runtime_error("nonfinite_mass_properties");
+                row["volume_mm3"] = volume;
+                row["centroid_mm"] = {c.X(), c.Y(), c.Z()};
+                // Add uses analytic geometry (no tessellation), with tolerances retained:
+                // the resulting box is conservative for broadphase lower bounds.
+                BRepBndLib::Add(solid.shape, solid.box, Standard_False);
+                if (solid.box.IsVoid() || solid.box.IsOpen())
+                    throw std::runtime_error("unbounded_or_empty_solid_bbox");
+                double x0, y0, z0, x1, y1, z1;
+                solid.box.Get(x0, y0, z0, x1, y1, z1);
+                if (!std::isfinite(x0) || !std::isfinite(y0) || !std::isfinite(z0) ||
+                    !std::isfinite(x1) || !std::isfinite(y1) || !std::isfinite(z1))
+                    throw std::runtime_error("nonfinite_solid_bbox");
+                row["bbox"] = {{"min", {x0, y0, z0}}, {"max", {x1, y1, z1}}};
+                solid.usable = valid && volume > 0.0;
+                if (!solid.usable) source_failure(row, valid ? "nonpositive_solid_volume" : "invalid_brep");
+            } catch (const Standard_Failure& e) {
+                source_failure(row, e.GetMessageString() ? e.GetMessageString() : "solid_census_failed");
+            } catch (const std::exception& e) {
+                source_failure(row, e.what());
+            }
+            out["solids"].push_back(std::move(row));
+            solids.push_back(std::move(solid));
+        }
+        // Maximal non-solid remnants only: don't misreport the skin of a solid as
+        // an independent shell, or a shell's faces as independent loose faces.
+        TopTools_IndexedMapOfShape remnants;
+        std::function<void(const TopoDS_Shape&)> walk = [&](const TopoDS_Shape& node) {
+            if (node.ShapeType() == TopAbs_SOLID) return;
+            if (node.ShapeType() == TopAbs_COMPOUND || node.ShapeType() == TopAbs_COMPSOLID) {
+                for (TopoDS_Iterator it(node); it.More(); it.Next()) walk(it.Value());
+            } else {
+                remnants.Add(node);
+            }
+        };
+        walk(shape);
+        for (int k = 1; k <= remnants.Extent(); ++k) {
+            json row = provenance;
+            row["kind"] = si_shape_kind(remnants.FindKey(k).ShapeType());
+            row["remnant_index"] = k;
+            out["non_solids"].push_back(std::move(row));
+        }
+        if (map.IsEmpty()) source_failure(provenance, "source_has_no_solids");
+    };
+    if (s.is_assembly()) {
+        rebuild_assembly(s);  // refresh path-backed descendants, not just this doc's revision
+        const AssemblyResult& ar = *s.asm_result;
+        out["assembly"]["converged"] = ar.converged;
+        if (!ar.converged) out["complete"] = false;
+        for (const FeatureStatus& status : ar.feature_status)
+            if (!status.ok) source_failure({{"feature_id", status.id}}, status.error);
+        std::map<std::string, std::string> paths;
+        int ordinal = 0;
+        std::map<std::string, int> ordinals;
+        for (const json& component : s.doc.value("components", json::array())) {
+            const std::string id = component.value("id", std::string());
+            const json source = component.value("source", json::object());
+            paths[id] = source.value("path", source.value("embedded", std::string()));
+            ordinals[id] = ++ordinal;
+            const bool suppressed = component.value("suppressed", false);
+            json row{{"id", id}, {"name", component.value("name", id)},
+                     {"source_path", paths[id]}, {"suppressed", suppressed},
+                     {"status", suppressed ? "suppressed" : "missing"}, {"reason", nullptr}};
+            bool contributed = false;
+            for (const auto& body : ar.bodies)
+                if (body.component_id == id && !body.shape_local.IsNull()) contributed = true;
+            for (const auto& status : ar.component_status)
+                if (status.id == id && !suppressed) {
+                    row["status"] = status.ok && contributed ? "ok" : "failed";
+                    row["reason"] = status.error ? json(*status.error) : json(nullptr);
+                }
+            if (!suppressed && row["status"] != "ok") source_failure(row, "component_source_incomplete");
+            out["assembly"]["components"].push_back(std::move(row));
+        }
+        for (const auto& mate : ar.mate_status) {
+            out["assembly"]["mates"].push_back({{"id", mate.id}, {"type", mate.type},
+                {"status", mate.status}, {"reason", mate.reason},
+                {"residual", mate.residual}, {"dangling_refs", mate.dangling_refs}});
+            if (mate.status == "unresolved" || mate.status == "conflicting") out["complete"] = false;
+        }
+        for (const auto& body : ar.bodies) {
+            // Authored IDs may themselves contain '#': prefer the exact component,
+            // then strip only the synthetic instance suffix to find its authored seed.
+            std::string source_id = body.component_id;
+            if (!paths.count(source_id)) {
+                const auto suffix = source_id.rfind('#');
+                if (suffix != std::string::npos) source_id.resize(suffix);
+            }
+            const auto path = paths.find(source_id);
+            const auto ordinal = ordinals.find(source_id);
+            try {
+                collect(placed_world_shape(body, std::nullopt), body.body_id, body.component_id,
+                        body.name, path == paths.end() ? "" : path->second,
+                        ordinal == ordinals.end() ? 0 : ordinal->second);
+            } catch (const Standard_Failure& e) {
+                source_failure({{"component_id", body.component_id}},
+                               e.GetMessageString() ? e.GetMessageString() : "world_placement_failed");
+            }
+        }
+    } else {
+        CompileResult r = compile_session(s);
+        for (const auto& status : r.statuses)
+            if (!status.ok) source_failure({{"feature_id", status.id}}, status.error);
+        for (std::size_t i = 0; i < r.shapes.size(); ++i)
+            collect(r.shapes[i], static_cast<int>(i + 1), "", "", s.path, static_cast<int>(i + 1));
+    }
+    const std::size_t n = solids.size();
+    if (n == 0) {
+        out["ok"] = false;
+        out["complete"] = false;
+        out["reason"] = "no_solids";
+    }
+    struct PairEvidence {
+        bool distance_ok = false;
+        double distance = 0.0;
+    };
+    std::map<std::pair<std::size_t, std::size_t>, PairEvidence> distances;
+    std::size_t candidates = 0, exact_pairs = 0, failed_pairs = 0, nearest_attempts = 0;
+    auto lower_bound = [&](std::size_t a, std::size_t b) {
+        if (!solids[a].usable || !solids[b].usable) return 0.0;
+        return solids[a].box.Distance(solids[b].box);
+    };
+    auto evaluate = [&](std::size_t a, std::size_t b, bool near) -> PairEvidence {
+        const auto key = std::minmax(a, b);
+        auto cached = distances.find(key);
+        if (cached != distances.end()) return cached->second;
+        PairEvidence evidence;
+        std::string phase = "distance";
+        Handle(SelfIntersectBudget) budget = new SelfIntersectBudget(budget_s);
+        const auto start = std::chrono::steady_clock::now();
+        auto expired = [&]() {
+            return budget->broke() ||
+                std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count() >= budget_s;
+        };
+        try {
+            if (!solids[a].usable || !solids[b].usable)
+                throw std::runtime_error("invalid_solid_source");
+            BRepExtrema_DistShapeShape distance;
+            distance.LoadS1(solids[a].shape);
+            distance.LoadS2(solids[b].shape);
+            distance.Perform(budget->Start());
+            if (expired()) throw std::runtime_error("pair_timeout");
+            if (!distance.IsDone()) throw std::runtime_error("distance_not_done");
+            evidence.distance = distance.Value();
+            if (!std::isfinite(evidence.distance) || evidence.distance < 0.0)
+                throw std::runtime_error("invalid_distance");
+            evidence.distance_ok = true;
+            if (near) {
+                phase = "overlap";
+                TopTools_ListOfShape args, tools;
+                args.Append(solids[a].shape);
+                tools.Append(solids[b].shape);
+                BRepAlgoAPI_Common common;
+                common.SetArguments(args);
+                common.SetTools(tools);
+                common.SetRunParallel(Standard_False);
+                common.Build(budget->Start());
+                if (expired()) throw std::runtime_error("pair_timeout");
+                if (!common.IsDone() || common.HasErrors() || common.Shape().IsNull())
+                    throw std::runtime_error("common_not_done");
+                GProp_GProps properties;
+                BRepGProp::VolumeProperties(common.Shape(), properties);
+                const double overlap = std::abs(properties.Mass());
+                if (!std::isfinite(overlap)) throw std::runtime_error("invalid_overlap_volume");
+                ++exact_pairs;
+                if (evidence.distance <= proximity || overlap > 0.0) {
+                    // No epsilon snapping: every positive gap remains proximity.
+                    const char* relation = evidence.distance > 0.0 ? "proximity" :
+                                           overlap > 0.0 ? "overlap" : "touching";
+                    out["pairs"].push_back({{"a", solids[a].id}, {"b", solids[b].id},
+                        {"distance_mm", evidence.distance}, {"overlap_volume_mm3", overlap},
+                        {"relation", relation}});
+                }
+            }
+        } catch (const Standard_Failure& e) {
+            ++failed_pairs;
+            out["complete"] = false;
+            out["pair_failures"].push_back({{"a", solids[a].id}, {"b", solids[b].id},
+                {"phase", phase}, {"reason", expired() ? "pair_timeout" :
+                    (e.GetMessageString() ? e.GetMessageString() : "occt_failure")}});
+        } catch (const std::exception& e) {
+            ++failed_pairs;
+            out["complete"] = false;
+            out["pair_failures"].push_back({{"a", solids[a].id}, {"b", solids[b].id},
+                {"phase", phase}, {"reason", e.what()}});
+        }
+        distances.emplace(key, evidence);
+        return evidence;
+    };
+    for (std::size_t a = 0; a < n; ++a)
+        for (std::size_t b = a + 1; b < n; ++b) {
+            if (lower_bound(a, b) > proximity) continue;
+            ++candidates;
+            evaluate(a, b, true);
+        }
+    std::map<std::string, std::size_t> indices;
+    std::vector<std::vector<std::size_t>> adjacency(n);
+    for (std::size_t i = 0; i < n; ++i) indices[solids[i].id] = i;
+    for (const json& pair : out["pairs"]) {
+        const auto a = indices.at(pair["a"].get<std::string>());
+        const auto b = indices.at(pair["b"].get<std::string>());
+        adjacency[a].push_back(b);
+        adjacency[b].push_back(a);
+    }
+    std::vector<bool> seen(n, false);
+    for (std::size_t i = 0; i < n; ++i) {
+        if (adjacency[i].empty()) out["isolated_solids"].push_back(solids[i].id);
+        if (seen[i]) continue;
+        std::vector<std::size_t> stack{i};
+        seen[i] = true;
+        json members = json::array();
+        while (!stack.empty()) {
+            const auto a = stack.back();
+            stack.pop_back();
+            members.push_back(solids[a].id);
+            for (auto b : adjacency[a]) if (!seen[b]) {
+                seen[b] = true;
+                stack.push_back(b);
+            }
+        }
+        out["islands"].push_back({{"id", out["islands"].size() + 1}, {"solids", std::move(members)}});
+    }
+    if (include_nearest) for (std::size_t i = 0; i < n; ++i) {
+        if (!adjacency[i].empty()) continue;
+        json row{{"solid_id", solids[i].id}, {"nearest_id", nullptr}, {"distance_mm", nullptr},
+                 {"status", n == 1 ? "no_other_solids" : "unknown"}};
+        std::vector<std::pair<double, std::size_t>> order;
+        order.reserve(n - 1);
+        for (std::size_t j = 0; j < n; ++j)
+            if (i != j) order.emplace_back(lower_bound(i, j), j);
+        std::sort(order.begin(), order.end());
+        double best = std::numeric_limits<double>::infinity();
+        double unknown_bound = std::numeric_limits<double>::infinity();
+        std::size_t best_id = n;
+        for (const auto& candidate : order) {
+            if (candidate.first > best) break;
+            const auto key = std::minmax(i, candidate.second);
+            if (!distances.count(key)) ++nearest_attempts;
+            PairEvidence evidence = evaluate(i, candidate.second, false);
+            if (!evidence.distance_ok) {
+                unknown_bound = std::min(unknown_bound, candidate.first);
+                continue;
+            }
+            if (evidence.distance < best) {
+                best = evidence.distance;
+                best_id = candidate.second;
+            }
+        }
+        if (best_id != n) {
+            if (unknown_bound > best) {
+                row["status"] = "exact";
+                row["nearest_id"] = solids[best_id].id;
+                row["distance_mm"] = best;
+            } else {
+                row["candidate_best_id"] = solids[best_id].id;
+                row["candidate_best_distance_mm"] = best;
+            }
+        }
+        out["nearest"].push_back(std::move(row));
+    }
+    if (n == 1) out["limitations"].push_back("A single-solid census provides no inter-solid connectivity proof.");
+    if (!out["complete"].get<bool>())
+        out["limitations"].push_back("Incomplete geometry or pair work: reported islands/isolation may change when failures are resolved.");
+    out["summary"] = {{"solid_count", n}, {"non_solid_count", out["non_solids"].size()},
+        {"theoretical_pairs", n > 0 ? n * (n - 1) / 2 : 0}, {"candidate_pairs", candidates},
+        {"exact_pairs", exact_pairs}, {"failed_pairs", failed_pairs},
+        {"nearest_distance_attempts", nearest_attempts}, {"island_count", out["islands"].size()},
+        {"isolated_solid_count", out["isolated_solids"].size()}};
+    return out;
+}
+
 json doc_eval_solid_health(const std::string& doc_id, int body_id) {
     DocLock lk;
     Session& s = require_session(doc_id);
-    CompileResult r = compile_session(s);
-    if (r.shapes.empty())
-        throw_no_bodies(doc_id, r, "solid health check");
+    const EvalShapeSet shapes = gather_eval_shapes(s);
+    if (shapes.compiled.shapes.empty())
+        throw_no_bodies(doc_id, shapes.compiled, "solid health check");
 
-    const int nbodies = static_cast<int>(r.shapes.size());
-    std::vector<int> want;
+    const int nbodies = static_cast<int>(shapes.body_ids.size());
+    std::vector<std::size_t> want;
     if (body_id > 0) {
-        if (body_id > nbodies)
-            throw OpError("invalid_op",
-                          "body_id " + std::to_string(body_id) + " is out of range: the "
-                          "document has " + std::to_string(nbodies) + " body(ies)");
-        want.push_back(body_id);
+        want.push_back(eval_shape_index(shapes, doc_id, body_id));
     } else {
-        for (int i = 1; i <= nbodies; ++i) want.push_back(i);
+        for (std::size_t i = 0; i < shapes.body_ids.size(); ++i) want.push_back(i);
     }
 
     constexpr double TINY_EDGE_MM = 0.01;
@@ -9867,10 +10315,11 @@ json doc_eval_solid_health(const std::string& doc_id, int body_id) {
     auto round6 = [](double x) { return std::abs(x) < 1e-9 ? 0.0 : std::round(x * 1e6) / 1e6; };
 
     json bodies = json::array();
-    bool all_watertight = true;
-    bool all_sound = true;
-    for (int bid : want) {
-        const TopoDS_Shape& shape = r.shapes[bid - 1];
+    bool all_watertight = shapes.complete;
+    bool all_sound = shapes.complete;
+    for (std::size_t index : want) {
+        const int bid = shapes.body_ids[index];
+        const TopoDS_Shape& shape = shapes.compiled.shapes[index];
         json b = json::object();
         b["body_id"] = bid;
 
@@ -9992,17 +10441,12 @@ json doc_eval_solid_health(const std::string& doc_id, int body_id) {
                                  "no volume; an open shell has no inside to measure";
         b["area_mm2"] = round6(area);
 
-        // Self-intersection — a real test, not a disclaimer. BOPAlgo_CheckerSI is the
-        // kernel's single-body self-interference algorithm (the one
-        // BOPAlgo_ArgumentAnalyzer's self-intersection mode drives): it pave-fills the body
-        // against itself at level 9 (V/V … S/S — every interference type) and lands each
-        // genuine self-interference in DS().Interferences(). Pairs touching a NEW
-        // (section-born) shape are dropped, exactly as ArgumentAnalyzer does: the vertices
-        // and edges the algorithm invents to DESCRIBE an intersection would otherwise be
-        // counted as further intersections. MEASURED on OCCT 7.9.1: a box, a cylinder and a
-        // fused pair of overlapping boxes all report 0 (adjacent faces meeting at a shared
-        // edge produce an F/F record but no interference), a figure-eight prism reports 3.
-        // A watertight verdict is still only a TOPOLOGY verdict — this is the geometric one.
+        // Check each solid's own skin. An assembly component can contain independently
+        // authored solids: their mating faces touch without either skin self-intersecting.
+        // Running CheckerSI on their compound mislabels those interfaces as defects.
+        // Inter-solid contacts and overlaps belong to eval_model_integrity's exact pairs.
+        // Surface-only bodies retain the whole-shape check. All constituent checks share
+        // one per-body budget; an interrupted census never claims a checked result.
         bool si_checked = false;
         bool si_self_intersecting = false;
         {
@@ -10010,30 +10454,36 @@ json doc_eval_solid_health(const std::string& doc_id, int body_id) {
             Handle(SelfIntersectBudget) si_budget = new SelfIntersectBudget(SI_BUDGET_S);
             std::string si_reason;
             int si_count = 0;
+            int si_completed = 0;
+            const int si_units = has_solid ? somap.Extent() : 1;
             std::set<std::string> si_kinds;
             try {
-                BOPAlgo_CheckerSI ck;
-                TopTools_ListOfShape one;
-                one.Append(shape);
-                ck.SetArguments(one);
-                ck.SetLevelOfCheck(9);
-                ck.SetNonDestructive(Standard_True);
-                ck.SetRunParallel(Standard_False);
-                ck.Perform(si_budget->Start());
-                if (si_budget->broke()) {
-                    si_reason = "not checked — the self-intersection check hit its " +
-                                std::to_string(static_cast<int>(SI_BUDGET_S)) +
-                                " s per-body budget and was stopped, so its interference "
-                                "table is truncated and proves nothing either way. Split "
-                                "this body or simplify the feature that made it.";
-                } else if (ck.HasErrors()) {
-                    std::ostringstream es;
-                    ck.DumpErrors(es);
-                    si_reason = "not checked — BOPAlgo_CheckerSI failed on this body: " +
-                                si_one_line(es.str());
-                } else if (ck.PDS() == nullptr) {
-                    si_reason = "not checked — BOPAlgo_CheckerSI returned no data structure";
-                } else {
+                for (int unit = 1; unit <= si_units; ++unit) {
+                    BOPAlgo_CheckerSI ck;
+                    TopTools_ListOfShape one;
+                    one.Append(has_solid ? somap.FindKey(unit) : shape);
+                    ck.SetArguments(one);
+                    ck.SetLevelOfCheck(9);
+                    ck.SetNonDestructive(Standard_True);
+                    ck.SetRunParallel(Standard_False);
+                    ck.Perform(si_budget->Start());
+                    if (si_budget->broke()) {
+                        si_reason = "not checked — the self-intersection check hit its " +
+                                    std::to_string(static_cast<int>(SI_BUDGET_S)) +
+                                    " s per-body budget; not every constituent was checked";
+                        break;
+                    }
+                    if (ck.HasErrors()) {
+                        std::ostringstream es;
+                        ck.DumpErrors(es);
+                        si_reason = "not checked — BOPAlgo_CheckerSI failed: " +
+                                    si_one_line(es.str());
+                        break;
+                    }
+                    if (ck.PDS() == nullptr) {
+                        si_reason = "not checked — BOPAlgo_CheckerSI returned no data structure";
+                        break;
+                    }
                     const BOPDS_DS& ds = *ck.PDS();
                     for (BOPDS_MapOfPair::Iterator it(ds.Interferences()); it.More();
                          it.Next()) {
@@ -10042,16 +10492,15 @@ json doc_eval_solid_health(const std::string& doc_id, int body_id) {
                         if (ds.IsNewShape(n1) || ds.IsNewShape(n2)) continue;
                         TopAbs_ShapeEnum t1 = ds.Shape(n1).ShapeType();
                         TopAbs_ShapeEnum t2 = ds.Shape(n2).ShapeType();
-                        // TopAbs_ShapeEnum descends by dimension (SOLID 2 … VERTEX 7), so
-                        // the LARGER enum is the lower-dimensional shape and goes first.
                         if (t1 < t2) std::swap(t1, t2);
                         si_kinds.insert(std::string(si_shape_kind(t1)) + "_" +
                                         si_shape_kind(t2));
                         ++si_count;
                     }
-                    si_checked = true;
-                    si_self_intersecting = si_count > 0;
+                    ++si_completed;
                 }
+                si_checked = si_completed == si_units;
+                si_self_intersecting = si_count > 0;
             } catch (const Standard_Failure& f) {
                 const char* m = f.GetMessageString();
                 si_reason = std::string("not checked — BOPAlgo_CheckerSI raised on this "
@@ -10074,6 +10523,9 @@ json doc_eval_solid_health(const std::string& doc_id, int body_id) {
                                               {"reason", si_reason},
                                               {"elapsed_ms", std::round(si_ms * 10.0) / 10.0}};
             }
+            b["self_intersection"]["scope"] = has_solid ? "within_each_solid" : "surface_body";
+            b["self_intersection"]["constituents_checked"] = si_completed;
+            b["self_intersection"]["inter_solid_interactions_checked"] = false;
         }
 
         const bool watertight =
@@ -10093,6 +10545,8 @@ json doc_eval_solid_health(const std::string& doc_id, int body_id) {
 
     return json{{"bodies", bodies},
                 {"body_count", nbodies},
+                {"complete", shapes.complete},
+                {"source_failures", shapes.source_failures},
                 {"all_watertight", all_watertight},
                 {"all_sound", all_sound}};
 }
@@ -12529,6 +12983,7 @@ json doc_save(const std::string& doc_id, const std::string& path) {
                 json header = {{"engine", stepplus_cache_engine_key()},
                                {"doc_hash", stepplus_doc_hash(s.doc)},
                                {"solved", true},
+                               {"assembly_appearance", 1},
                                {"display_quality",
                                 ::geom::display_quality_name(s.display_quality)},
                                {"components", asm_component_fingerprints(s.doc, base_dir)},
@@ -12642,6 +13097,7 @@ json doc_open(const std::string& path, bool as_solid, bool detach_path) {
                         header.value("doc_hash", std::string()) ==
                             stepplus_doc_hash(stored.doc) &&
                         header.value("solved", false) &&
+                        header.value("assembly_appearance", 0) == 1 &&
                         header.value("display_quality", std::string()) ==
                             ::geom::display_quality_name(stored.display_quality) &&
                         header.contains("response") && header["response"].is_object() &&

@@ -1713,6 +1713,7 @@ static std::vector<Renderer::PartMesh> rendererPartsFromDoc(
         pm.color[2] = b.color[2];
         pm.metallic = b.metallic;
         pm.roughness = b.roughness;
+        pm.appearance_regions = b.appearance_regions;
         pm.body_id = b.body_id;
         pm.faces.reserve(b.faces.size());
         for (const auto& fr : b.faces)
@@ -2011,6 +2012,7 @@ static bool commitDocMeshFromParsed(AppState& st, render::DocMesh& doc, std::str
             pm.mesh = meshFromBody(b);
             pm.color[0] = b.color[0]; pm.color[1] = b.color[1]; pm.color[2] = b.color[2];
             pm.metallic = b.metallic; pm.roughness = b.roughness;
+            pm.appearance_regions = b.appearance_regions;
             pm.body_id = b.body_id;
             pm.faces.reserve(b.faces.size());
             for (const auto& fr : b.faces)
@@ -2059,6 +2061,7 @@ static bool commitDocMeshFromParsed(AppState& st, render::DocMesh& doc, std::str
         pm.mesh = meshFromBody(b);
         pm.color[0] = b.color[0]; pm.color[1] = b.color[1]; pm.color[2] = b.color[2];
         pm.metallic = b.metallic; pm.roughness = b.roughness;  // C32-A RealView material
+        pm.appearance_regions = b.appearance_regions;
         // Per-feature edit-preview isolation: carry the body id + per-face triangle runs so the
         // st.renderer can draw a single feature's faces translucent. meshFromBody copies b.idx
         // verbatim, so each FaceRange's first_tri/tri_count still index this body's EBO 1:1.

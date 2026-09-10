@@ -382,8 +382,8 @@ TEST_CASE("doc_render_view focus: requested viewport dimensions are honoured and
     CHECK(requested.at("height").get<int>() == 768);
 
     json high = render_size(5000, 5000, "size_high");
-    CHECK(high.at("width").get<int>() == 2048);
-    CHECK(high.at("height").get<int>() == 2048);
+    CHECK(high.at("width").get<int>() == 4096);
+    CHECK(high.at("height").get<int>() == 4096);
 
     json low = render_size(8, 8, "size_low");
     CHECK(low.at("width").get<int>() == 64);
@@ -600,4 +600,61 @@ TEST_CASE("doc_render_png: background clears the legacy iso render too") {
     CHECK((int)im.px[0] == 10);
     CHECK((int)im.px[1] == 20);
     CHECK((int)im.px[2] == 30);
+}
+
+TEST_CASE("doc_render_view: nested multibody appearances shade each face without ordinal tint") {
+    using namespace chudware::doc;
+    const std::string part = doc_new("part", "RenderInheritedAppearance").at("doc_id");
+    json ops = json::array();
+    for (int i = 0; i < 2; ++i) {
+        ops.push_back({{"op", "add_feature"}, {"feature", {
+            {"type", "box"}, {"name", i == 0 ? "Red" : "Blue"},
+            {"params", {{"length", 20}, {"width", 20}, {"height", 20},
+                        {"at", {i * 40, 0, 0}}, {"mode", "new"}}}}}});
+        ops.push_back({{"op", "set_appearance"}, {"id", "b" + std::to_string(i + 1)},
+                       {"color", i == 0 ? json{0.9, 0.03, 0.03} : json{0.03, 0.03, 0.9}}});
+    }
+    doc_apply_ops(part, -1, ops, false);
+    const fs::path directory = fs::temp_directory_path() / ("chudware_render_appearance_" + part);
+    fs::create_directories(directory);
+    struct RemoveDirectory {
+        fs::path path;
+        ~RemoveDirectory() { std::error_code ec; fs::remove_all(path, ec); }
+    } cleanup{directory};
+    auto path = directory / "part.step+";
+    doc_save(part, path.string());
+    std::string current = part;
+    for (int depth = 0; depth < 2; ++depth) {
+        current = doc_new("assembly", "RenderAppearanceNesting").at("doc_id");
+        doc_apply_ops(current, -1, json::array({
+            {{"op", "asm_insert_component"}, {"source", {{"path", path.string()}}}, {"fixed", true}},
+        }), false);
+        path = directory / ("assembly" + std::to_string(depth) + ".step+");
+        doc_save(current, path.string());
+    }
+    auto hue_counts = [](const Rgb& image) {
+        std::array<long, 2> counts{};
+        for (size_t i = 0; i + 2 < image.px.size(); i += 3) {
+            const int r = image.px[i], g = image.px[i + 1], b = image.px[i + 2];
+            if (r > 60 && r > 3 * g && r > 3 * b) ++counts[0];
+            if (b > 60 && b > 3 * g && b > 3 * r) ++counts[1];
+        }
+        return counts;
+    };
+    const auto shot = (directory / "nested.png").string();
+    REQUIRE(doc_render_view(current, shot, "front", false).value("ok", false));
+    const Rgb inherited = decode_png(shot);
+    REQUIRE(inherited.ok());
+    const auto colors = hue_counts(inherited);
+    CHECK(colors[0] > inherited.w * inherited.h / 20);
+    CHECK(colors[1] > inherited.w * inherited.h / 20);
+    doc_apply_ops(current, -1, json::array({
+        {{"op", "set_appearance"}, {"id", "b1"}, {"color", {0.5, 0.5, 0.5}}},
+    }), false);
+    REQUIRE(doc_render_view(current, shot, "front", false).value("ok", false));
+    const Rgb overridden = decode_png(shot);
+    REQUIRE(overridden.ok());
+    const auto cleared = hue_counts(overridden);
+    CHECK(cleared[0] == 0);
+    CHECK(cleared[1] == 0);
 }

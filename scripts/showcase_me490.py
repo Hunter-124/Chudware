@@ -201,41 +201,87 @@ def _wrap_to_width(text: str, font, max_px: int, continuation: str = "") -> list
 
 
 def text_card(title: str, lines, out_png: str, mono_block=None) -> str:
-    """A dark card: headline, then measured lines, then an optional verbatim mono block
-    (real command output — the film shows the terminal, not a paraphrase of it).
+    """Lay out every requested line before drawing or saving the evidence card.
 
-    Every string is wrapped to the frame, so a long absolute path or a 100-character argv
-    is carried onto a continuation line instead of running off the right edge."""
+    Fonts and spacing shrink only within readable bounds (42 px headline, 28 px body,
+    24 px command output at 1080p). Content that still cannot fit raises ValueError;
+    no partial card is saved and no measured claim is silently dropped.
+    """
     from PIL import Image, ImageDraw
+
+    # Materialize once: every layout attempt must see the same input, even for generators.
+    body_lines = [str(line) for line in lines]
+    mono_lines = [str(line) for line in mono_block] if mono_block is not None else []
+    top, bottom = 120, FRAME_H - 60
+    fonts = {}
+    overflow = ""
+    for step in range(7):
+        sizes = (54 - 2 * step, max(28, 30 - step // 2), 24)
+        for bold, px in ((True, sizes[0]), (False, sizes[1]), (False, sizes[2])):
+            if (bold, px) not in fonts:
+                fonts[bold, px] = _font(bold, px)
+        groups = [
+            ("title", [str(title)], fonts[True, sizes[0]], 110, FRAME_W - 220,
+             (240, 242, 248), max(6, 10 - step)),
+            ("body", body_lines, fonts[False, sizes[1]], 110, FRAME_W - 220,
+             (178, 186, 202), max(6, 14 - 2 * step)),
+            ("mono", mono_lines, fonts[False, sizes[2]], 124, FRAME_W - 248,
+             (150, 220, 176), max(4, 6 - step)),
+        ]
+        layout = []
+        mono_bounds = None
+        y = top
+        overflow = ""
+        for name, source_lines, font, x, width, color, row_gap in groups:
+            if not source_lines:
+                continue
+            # Explicit newlines and blank rows are part of the requested content too.
+            rows = [
+                row
+                for line in source_lines
+                for logical_line in line.split("\n")
+                for row in _wrap_to_width(logical_line, font, width - 2)
+            ]
+            bounds = [font.getbbox(row) for row in rows]
+            widest = max(right - left for left, _, right, _ in bounds)
+            if widest > width:
+                overflow = f"{name} requires {widest} px width; available {width} px"
+                break
+            row_height = max(font.size, max(b - t for _, t, _, b in bounds))
+            if name == "body":
+                y += max(20, 32 - 2 * step)
+            elif name == "mono":
+                y += max(18, 26 - step)
+                box_top = y
+                y += 14
+            for row, (left, glyph_top, _, _) in zip(rows, bounds):
+                # Anchor the measured ink bounds, not an assumed font ascender offset.
+                layout.append(((x - left, y - glyph_top), row, font, color))
+                y += row_height + row_gap
+            y -= row_gap
+            if name == "mono":
+                y += 14
+                mono_bounds = (100, box_top, FRAME_W - 100, y)
+        if overflow:
+            continue
+        if y > bottom:
+            overflow = f"requires {y - top} px height; available {bottom - top} px"
+            continue
+        break
+    else:
+        raise ValueError(
+            f"showcase text_card overflow for {title!r}: {overflow} at minimum readable "
+            f"font sizes (title/body/mono = 42/28/24 px), frame {FRAME_W}x{FRAME_H}; "
+            "split the complete content into additional cards before encoding. "
+            f"No card written to {out_png!r}."
+        )
+
     im = Image.new("RGB", (FRAME_W, FRAME_H), (16, 17, 20))
     dr = ImageDraw.Draw(im)
-    big, small, mono = _font(True, 54), _font(False, 30), _font(False, 24)
-    body_w = FRAME_W - 110 - 110
-    mono_w = FRAME_W - 124 - 124
-    y = 120
-    for row in _wrap_to_width(title, big, body_w):
-        dr.text((110, y), row, fill=(240, 242, 248), font=big)
-        y += 64
-    y += 32
-    for line in lines:
-        for row in _wrap_to_width(str(line), small, body_w, continuation="    "):
-            if y > FRAME_H - 70:
-                break
-            dr.text((110, y), row, fill=(178, 186, 202), font=small)
-            y += 44
-    if mono_block:
-        rows: list = []
-        for line in mono_block:
-            rows += _wrap_to_width(str(line), mono, mono_w, continuation="  ")
-        y += 26
-        dr.rectangle([100, y - 14, FRAME_W - 100,
-                      min(FRAME_H - 60, y + 30 * len(rows) + 14)],
-                     fill=(24, 26, 31), outline=(58, 62, 72))
-        for row in rows:
-            if y > FRAME_H - 70:
-                break
-            dr.text((124, y), row, fill=(150, 220, 176), font=mono)
-            y += 30
+    if mono_bounds is not None:
+        dr.rectangle(mono_bounds, fill=(24, 26, 31), outline=(58, 62, 72))
+    for position, row, font, color in layout:
+        dr.text(position, row, fill=color, font=font)
     im.save(out_png)
     return out_png
 
@@ -355,7 +401,7 @@ class Chapter:
         chosen = None
         for width in GIF_W_LADDER:
             for fps in (self.fps,) + tuple(f for f in (20, 15, 12, 10) if f < self.fps):
-                anim._encode_gif(pattern, str(gif), fps, width)
+                anim._encode_gif(pattern, str(gif), self.fps, width, output_fps=fps)
                 size = gif.stat().st_size
                 ladder.append({"fps": fps, "width": width, "bytes": size})
                 if size <= GIF_MAX:

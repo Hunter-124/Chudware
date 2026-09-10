@@ -1118,6 +1118,89 @@ def test_check_interference_overlapping_bodies():
     assert r2["interferences"][0]["volume"] > 0, r2
 
 
+def test_inspect_model_integrity_empty_document_is_not_complete_evidence():
+    """A census with no solids must not masquerade as a complete clean model."""
+    created, _ = _call("new_part", {"name": "IntegrityEmpty"})
+    doc = created["doc_id"]
+    try:
+        out, _ = _call("inspect_model_integrity", {"doc_id": doc})
+        assert out["ok"] is False and out["complete"] is False, out
+        assert out["reason"] == "no_solids", out
+        assert out["solids"] == [] and out["pairs"] == [], out
+    finally:
+        _call("close_part", {"doc_id": doc})
+
+
+@pytest.mark.parametrize("invalid", [
+    {"proximity_mm": float("nan")},
+    {"proximity_mm": -0.01},
+    {"pair_budget_s": 0.0},
+    {"pair_budget_s": float("inf")},
+])
+def test_inspect_model_integrity_refuses_invalid_search_limits(invalid):
+    """Invalid limits must refuse, never become an empty successful pair search."""
+    doc = _new_plate_with_hole()
+    try:
+        out, _ = _call("inspect_model_integrity", {"doc_id": doc, **invalid})
+        assert out["ok"] is False, out
+        assert "error" in out, out
+    finally:
+        _call("close_part", {"doc_id": doc})
+
+
+def test_inspect_model_integrity_sees_disconnected_solids_inside_component(tmp_path):
+    """One fixed component can contain two gapped solids; a positive gap is not contact."""
+    created, _ = _call("new_part", {"name": "IntegrityCompound"})
+    part = created["doc_id"]
+    asm = None
+    try:
+        built, _ = _call("add_features", {"doc_id": part, "ops": [
+            cb.feat("box", "Block", {
+                "length": cb.dim(10), "width": cb.dim(10), "height": cb.dim(10)}),
+            cb.feat("transform", "GappedCopy", {
+                "translate": [10.02, 0, 0], "copy": True}),
+        ]})
+        assert built["ok"], built
+        path = str(tmp_path / "integrity_compound.step+")
+        cb.call("doc_save", {"doc_id": part, "path": path})
+        asm = cb.call("doc_new", {"name": "IntegrityAssembly", "kind": "assembly"})["doc_id"]
+        cb.call("doc_apply_ops", {"doc_id": asm, "with_tess": False, "ops": [
+            {"op": "asm_insert_component", "source": {"path": path},
+             "name": "FixedCompound", "fixed": True},
+        ]})
+        near, _ = _call("inspect_model_integrity", {
+            "doc_id": asm, "proximity_mm": 0.05,
+        })
+        assert near["ok"] is True and near["complete"] is True, near
+        assert len(near["solids"]) == 2, near
+        assert len({s["component_id"] for s in near["solids"]}) == 1, near
+        assert len(near["pairs"]) == 1, near
+        pair = near["pairs"][0]
+        assert pair["relation"] == "proximity", pair
+        assert pair["distance_mm"] == pytest.approx(0.02, abs=1e-6), pair
+        assert pair["overlap_volume_mm3"] == pytest.approx(0.0, abs=1e-9), pair
+        ids = {s["id"] for s in near["solids"]}
+        assert {pair["a"], pair["b"]} == ids, near
+        assert len(near["islands"]) == 1, near
+
+        separated, _ = _call("inspect_model_integrity", {
+            "doc_id": asm, "proximity_mm": 0.01,
+        })
+        assert separated["ok"] is True and separated["complete"] is True, separated
+        assert separated["pairs"] == [], separated
+        assert set(separated["isolated_solids"]) == ids, separated
+        assert len(separated["islands"]) == 2, separated
+        assert {row["solid_id"] for row in separated["nearest"]} == ids, separated
+        for row in separated["nearest"]:
+            assert row["status"] == "exact", row
+            assert {row["solid_id"], row["nearest_id"]} == ids, row
+            assert row["distance_mm"] == pytest.approx(0.02, abs=1e-6), row
+    finally:
+        if asm is not None:
+            _call("close_part", {"doc_id": asm})
+        _call("close_part", {"doc_id": part})
+
+
 def test_check_symmetry_centered_box():
     """A box centered on the origin is symmetric about all three principal planes."""
     r, _ = _call("new_part", {"name": "sym"})

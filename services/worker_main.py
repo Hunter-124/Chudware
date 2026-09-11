@@ -244,9 +244,19 @@ def serve() -> None:
             if shutdown_complete:
                 return
             shutdown_complete = True
-        control.stop()
-        _shutdown_chudcode()
-        _drain_box_mirror_on_exit()
+        try:
+            control.stop()
+        finally:
+            try:
+                from services.reveng.gaussian_jobs import shutdown as shutdown_gaussian_jobs
+                shutdown_gaussian_jobs()
+            except Exception as exc:
+                log.error("Gaussian shutdown failed: %s", type(exc).__name__)
+            finally:
+                try:
+                    _shutdown_chudcode()
+                finally:
+                    _drain_box_mirror_on_exit()
 
     old_handlers: dict[int, object] = {}
     if threading.current_thread() is threading.main_thread():

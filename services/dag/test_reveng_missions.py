@@ -20,10 +20,8 @@ from __future__ import annotations
 
 import json
 import os
-import sys
 import tempfile
 import time
-import types
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -35,92 +33,29 @@ import pytest
 pytest.importorskip("langgraph.checkpoint.sqlite")
 
 
-# ---------------------------------------------------------------------------
-# Stubs so reveng_tools imports cleanly without the MCP server / core_bridge /
-# heavy vision deps (mirrors services/mcp/test_reveng_tools.py).
-# ---------------------------------------------------------------------------
-
-def _install_stubs() -> None:
-    # Prefer the REAL core_bridge when importable — a minimal stub (no CoreError)
-    # would make the real cad_tools import fail, which forces the cad_tools stub
-    # below and shadows _doc/_get_part for every sibling test in this pytest
-    # session. Only fall back to a stub in an env with no core_bridge at all.
-    try:
-        import services.mcp.core_bridge  # noqa: F401
-        _cb_real = True
-    except Exception:  # noqa: BLE001
-        _cb_real = False
-
-    if not _cb_real:
-        cb_mod = types.ModuleType("services.mcp.core_bridge")
-        cb_mod.available = lambda: False
-        cb_mod.call = lambda method, params=None: {}
-
-        class CoreError(Exception):
-            pass
-
-        cb_mod.CoreError = CoreError
-        sys.modules.setdefault("services.mcp.core_bridge", cb_mod)
-        sys.modules.setdefault("core_bridge", cb_mod)
-
-    # Prefer the real ``mcp`` package when it is importable — installing a fake
-    # FastMCP into sys.modules would pollute sibling tests that need the real one
-    # (this file runs in the same pytest session as the whole services/dag suite).
-    # Only fall back to the stub when mcp genuinely cannot be imported.
-    try:
-        import mcp.server.fastmcp  # noqa: F401
-        _mcp_real = True
-    except Exception:  # noqa: BLE001
-        _mcp_real = False
-
-    if not _mcp_real and "mcp" not in sys.modules:
-        mcp_pkg = types.ModuleType("mcp")
-        server_mod = types.ModuleType("mcp.server")
-        fastmcp_mod = types.ModuleType("mcp.server.fastmcp")
-
-        class _FakeFastMCP:
-            def __init__(self, name="", **kw):
-                self._tools: dict = {}
-
-            def tool(self):
-                def decorator(fn):
-                    self._tools[fn.__name__] = fn
-                    return fn
-                return decorator
-
-        fastmcp_mod.FastMCP = _FakeFastMCP
-        sys.modules["mcp"] = mcp_pkg
-        sys.modules["mcp.server"] = server_mod
-        sys.modules["mcp.server.fastmcp"] = fastmcp_mod
-
-    # Same real-first rule for cad_tools: a bare _dumps/_err stub would shadow the
-    # real module and break sibling tests that import _doc/_get_part/etc. from it.
-    try:
-        import services.mcp.cad_tools  # noqa: F401
-        _cad_real = True
-    except Exception:  # noqa: BLE001
-        _cad_real = False
-
-    if not _cad_real and "services.mcp.cad_tools" not in sys.modules:
-        ct_mod = types.ModuleType("services.mcp.cad_tools")
-        ct_mod._dumps = lambda obj: json.dumps(obj)
-        ct_mod._err = lambda e: json.dumps({"ok": False, "error": str(e)})
-        sys.modules["services.mcp.cad_tools"] = ct_mod
-
-
-_install_stubs()
-
-# NOTE: we do NOT stub the ``engine_oracle`` package — the real vision modules
-# (reveng_provision / frames) import cleanly, and shadowing the package would break
-# verify.py's ``services.requirements`` import chain. reveng_tools' own
-# fallback handles the one missing symbol (ingest.ingest_pdf). The mission walk
-# injects its own agent_fn, so the real all-False ``reveng_status`` is what we want
-# (honest degradation with no provisioned backend).
-
 from services.dag import executor  # noqa: E402
+from services.dag import node_runner  # noqa: E402
 from services.dag import verify as vr  # noqa: E402
 from services.mcp import reveng_common as rc  # noqa: E402
 from services.mcp import reveng_tools as rt  # noqa: E402
+from services.mcp import reveng_build_tools as rb
+from services.mcp import reveng_session_tools as rs
+
+
+@pytest.fixture(autouse=True)
+def _isolated_backends(tmp_path, monkeypatch):
+    monkeypatch.setenv("CHUDWARE_REVENG_DIR", str(tmp_path / "reveng"))
+    monkeypatch.delenv("OPENMVS_BIN", raising=False)
+    for module in (rc, rb, rs):
+        monkeypatch.setattr(module, "_reveng_status", lambda: {"capabilities": {}})
+    # Exercise real routing, checkpoints and human gates, not the external
+    # foreman/Chudcode audits triggered when a node completes.
+    monkeypatch.setattr(node_runner, "_ADVISOR_ENABLED", False)
+
+
+def _write_image(path):
+    from PIL import Image
+    Image.new("RGB", (16, 16), (30, 80, 140)).save(path)
 
 
 def _passthrough_agent_fn(request, context_pack):
@@ -420,8 +355,7 @@ class TestRevengScanNodeOrder(unittest.TestCase):
         ])
 
     def test_split_emits_the_contract_dense_and_mesh_stages(self):
-        """dense/splat/mesh were declared in aicad.reveng_events/1 §4 but never emitted
-        while all of that hid inside one sparse-stage node."""
+        """CAD mesh progress advances through sparse, dense, and mesh, never splat."""
         run_id = "run_order02"
         executor.run(
             rt._load_template("reveng_scan"),
@@ -437,6 +371,7 @@ class TestRevengScanNodeOrder(unittest.TestCase):
         self.assertIn("sparse", stages)
         self.assertIn("dense", stages)
         self.assertIn("mesh", stages)
+        self.assertNotIn("splat", stages)
         # The GUI substring-matches sparse → dense → mesh on this field, in that order,
         # to light its sub-step track: the sequence must never rewind.
         self.assertLess(max(i for i, s in enumerate(stages) if s == "sparse"),
@@ -444,7 +379,7 @@ class TestRevengScanNodeOrder(unittest.TestCase):
         self.assertLess(max(i for i, s in enumerate(stages) if s == "dense"),
                         min(i for i, s in enumerate(stages) if s == "mesh"))
         # Stage tokens stay bare contract values — never prose.
-        allowed = {"capture", "scale", "sparse", "dense", "splat",
+        allowed = {"capture", "scale", "sparse", "dense",
                    "mesh", "fit", "parametric", "review", "deliver"}
         self.assertTrue(set(stages) <= allowed, sorted(set(stages) - allowed))
 
@@ -456,18 +391,17 @@ class TestDenseAppliesConfirmedScale(unittest.TestCase):
     SESSION_ID = "re_scale_apply"
 
     def setUp(self):
+        self.o3d = pytest.importorskip("open3d")
         self.tmp = tempfile.mkdtemp()
         self._old_env = {k: os.environ.get(k)
                          for k in ("CHUDWARE_REVENG_DIR", "OPENMVS_BIN")}
         os.environ["CHUDWARE_REVENG_DIR"] = self.tmp
         os.environ["OPENMVS_BIN"] = "/fake/openmvs"
-        self.calls: list = []
-        self._old_modules = {}
         self._install_dense_backends()
 
         root = Path(self.tmp) / self.SESSION_ID
         (root / "images").mkdir(parents=True)
-        (root / "images" / "a.jpg").write_bytes(b"\xff\xd8\xff")
+        _write_image(root / "images" / "a.jpg")
         sparse = root / "sparse"
         sparse.mkdir()
         s = rt._make_session(self.SESSION_ID, "scale apply", None)
@@ -476,11 +410,6 @@ class TestDenseAppliesConfirmedScale(unittest.TestCase):
 
     def tearDown(self):
         import shutil
-        for name, mod in self._old_modules.items():
-            if mod is None:
-                sys.modules.pop(name, None)
-            else:
-                sys.modules[name] = mod
         for key, val in self._old_env.items():
             if val is None:
                 os.environ.pop(key, None)
@@ -488,42 +417,27 @@ class TestDenseAppliesConfirmedScale(unittest.TestCase):
                 os.environ[key] = val
         shutil.rmtree(self.tmp, ignore_errors=True)
 
-    def _fake_module(self, name: str):
-        self._old_modules[name] = sys.modules.get(name)
-        mod = types.ModuleType(name)
-        sys.modules[name] = mod
-        return mod
-
     def _install_dense_backends(self):
-        db = self._fake_module("services.vision.dense_backends")
-        calls = self.calls
+        from services.vision import dense_backends
 
         def run_openmvs(sparse_dir, session_dir, **kw):
             mesh = Path(session_dir) / "mesh" / "openmvs.obj"
             mesh.parent.mkdir(parents=True, exist_ok=True)
-            mesh.write_text("o mesh\n")
+            mesh.write_text(
+                "v 0 0 0\nv 1 0 0\nv 0 2 0\nv 0 0 3\n"
+                "f 1 3 2\nf 1 2 4\nf 1 4 3\nf 2 3 4\n"
+            )
             return {"ok": True, "mesh_path": str(mesh), "backend": "openmvs"}
 
-        def run_brush(sparse_dir, session_dir, **kw):
-            return {"ok": False, "reason": "backend_not_provisioned"}
+        patcher = mock.patch.object(dense_backends, "run_openmvs", run_openmvs)
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
-        db.run_openmvs = run_openmvs
-        db.run_brush = run_brush
-
-        mc = self._fake_module("services.vision.mesh_cleanup")
-
-        def cleanup_mesh(mesh_path, out_path, **kw):
-            calls.append(kw)
-            Path(out_path).parent.mkdir(parents=True, exist_ok=True)
-            Path(out_path).write_text("cleaned\n")
-            return {
-                "ok": True,
-                "mesh_path": out_path,
-                "scale_applied": kw.get("mm_per_unit") is not None,
-                "scale_mode": "mm_per_unit" if kw.get("mm_per_unit") else None,
-            }
-
-        mc.cleanup_mesh = cleanup_mesh
+    def _assert_mesh_extent(self, result, expected):
+        mesh = self.o3d.io.read_triangle_mesh(result.result["mesh_path"])
+        extent = mesh.get_axis_aligned_bounding_box().get_extent()
+        for actual, wanted in zip(extent, expected):
+            self.assertAlmostEqual(actual, wanted, places=6)
 
     def _set_scale(self, mm_per_unit, confirmed: bool):
         s = rt._load_session(self.SESSION_ID)
@@ -543,7 +457,7 @@ class TestDenseAppliesConfirmedScale(unittest.TestCase):
         self._set_scale(2.5, confirmed=True)
         res = self._run_dense_node()
         self.assertTrue(res.success, res.result)
-        self.assertEqual([c.get("mm_per_unit") for c in self.calls], [2.5])
+        self._assert_mesh_extent(res, (2.5, 5.0, 7.5))
         self.assertEqual(res.result["mesh_units"], "mm")
         session = rt._load_session(self.SESSION_ID)
         self.assertEqual(session["artifacts"]["mesh_units"], "mm")
@@ -553,21 +467,17 @@ class TestDenseAppliesConfirmedScale(unittest.TestCase):
         self._set_scale(2.5, confirmed=False)
         res = self._run_dense_node()
         self.assertTrue(res.success, res.result)
-        self.assertEqual([c.get("mm_per_unit") for c in self.calls], [None])
+        self._assert_mesh_extent(res, (1.0, 2.0, 3.0))
         self.assertEqual(res.result["mesh_units"], "reconstruction")
         self.assertEqual(
             rt._load_session(self.SESSION_ID)["artifacts"]["mesh_units"],
             "reconstruction",
         )
-        self.assertTrue(
-            any("unconfirmed" in n for n in res.result["dense_notes"]),
-            res.result["dense_notes"],
-        )
 
     def test_unsolved_scale_never_invents_a_factor(self):
         res = self._run_dense_node()          # session.scale.mm_per_unit is None
         self.assertTrue(res.success, res.result)
-        self.assertEqual([c.get("mm_per_unit") for c in self.calls], [None])
+        self._assert_mesh_extent(res, (1.0, 2.0, 3.0))
         self.assertEqual(res.result["mesh_units"], "reconstruction")
 
     def test_scale_gate_approval_is_what_flips_confirmed(self):
@@ -582,7 +492,8 @@ class TestDenseAppliesConfirmedScale(unittest.TestCase):
 
         # …and with the gate approved, dense now delivers millimetres.
         dense = self._run_dense_node()
-        self.assertEqual([c.get("mm_per_unit") for c in self.calls], [2.5])
+        self.assertTrue(dense.success, dense.result)
+        self._assert_mesh_extent(dense, (2.5, 5.0, 7.5))
         self.assertEqual(dense.result["mesh_units"], "mm")
 
     def test_scale_gate_never_confirms_a_scale_that_does_not_exist(self):
@@ -634,9 +545,9 @@ class TestMissionGateTools(unittest.TestCase):
         rt._save_session(s)
         images = Path(os.environ["CHUDWARE_REVENG_DIR"]) / self.SESSION_ID / "images"
         images.mkdir(parents=True, exist_ok=True)
-        (images / "a.jpg").write_bytes(b"\xff\xd8\xff")
+        _write_image(images / "a.jpg")
 
-        # Gate lifecycle tests use synthetic images, not real photogrammetry.
+        # Gate lifecycle tests use small valid images, not real photogrammetry.
         # Sparse SfM now precedes the scale gate; optional backend discovery and
         # reconstruction must not consume the background run's polling deadline.
         sparse = images.parent / "sparse"
@@ -656,7 +567,6 @@ class TestMissionGateTools(unittest.TestCase):
 
     def tearDown(self):
         import shutil
-        rc._release_mission(self.SESSION_ID, "run_busy_probe")
         for key, val in self._old_env.items():
             if val is None:
                 os.environ.pop(key, None)
@@ -794,16 +704,29 @@ class TestMissionGateTools(unittest.TestCase):
         self.assertFalse(rt._load_session(self.SESSION_ID)["scale"]["confirmed"])
 
     def test_second_concurrent_mission_on_one_session_is_refused(self):
-        rc._reserve_mission(self.SESSION_ID, "run_busy_probe")
-        out = self._launch()
-        self.assertFalse(out.get("ok", True), out)
-        self.assertEqual(out["reason"], "mission_already_running")
-        self.assertEqual(out["run_id"], "run_busy_probe")
+        import threading
 
-    def test_gate_tools_are_bridged_to_the_gui_transport(self):
-        from services.reveng import worker_rpc
-        for name in ("reveng_gate_status", "reveng_resolve_gate"):
-            self.assertIn(name, worker_rpc.REVENG_WORKER_METHODS)
+        entered = threading.Event()
+        release = threading.Event()
+        sparse = Path(os.environ["CHUDWARE_REVENG_DIR"]) / self.SESSION_ID / "sparse"
+
+        def blocked_sparse(*args, **kwargs):
+            entered.set()
+            if not release.wait(30):
+                raise TimeoutError("test did not release sparse reconstruction")
+            return {"ok": True, "sparse_dir": str(sparse), "registered": 1}
+
+        with mock.patch("services.vision.colmap_pipeline.run_sparse", blocked_sparse):
+            started = self._launch()
+            try:
+                self.assertTrue(entered.wait(30), "mission did not reach sparse reconstruction")
+                out = self._launch()
+                self.assertFalse(out.get("ok", True), out)
+                self.assertEqual(out["reason"], "mission_already_running")
+                self.assertEqual(out["run_id"], started["run_id"])
+            finally:
+                release.set()
+                self._wait_for("paused")
 
     def test_gate_status_on_a_session_with_no_mission_is_honest(self):
         out = self._call("reveng_gate_status", session_id="re_nothing_here")

@@ -220,7 +220,8 @@ build_python_sidecar() {
         exit 1
     }
     echo "==> compiling $name"
-    local -a includes=("--include-module=chudware_protected_assets" "--include-module=services.$module")
+    local -a includes=("--include-module=chudware_protected_assets" "--include-module=services.$module"
+                       "--include-package=pycolmap")
     if [ "$module" = "worker_main" ]; then
         includes+=(
             --include-module=services.parts.vendor_parts

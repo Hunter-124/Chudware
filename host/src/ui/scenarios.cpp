@@ -1261,15 +1261,9 @@ void ScenarioRunner::runIconPipe(AppState& st) {
 ScenarioRunner::ScenarioRunner() = default;
 ScenarioRunner::~ScenarioRunner() = default;
 
-// RE-28 3DGS splat scenario (CHUDWARE_SHOT=reveng_splat). Self-contained: loads the canned gaussian
-// .ply fixture and draws it through the real render::SplatRenderer into its OWN offscreen FBO, reads
-// it back, and writes the PNG directly — the iconpipe drain pattern (see runIconPipe lines ~1040).
-//
-// Why an own FBO and not the backbuffer: this runner is called from tick() BEFORE ImGui::NewFrame
-// and the frame's own glClear, so anything drawn to the default framebuffer here is wiped before the
-// backbuffer capture in endFrame(). Rendering to a private FBO + glReadPixels sidesteps that AND the
-// swap/present path entirely, so it completes headless in one synchronous tick (no settle frames).
-// Purpose: prove the loader + the real GL billboard/blend draw path run without crashing headless.
+// Shot-only native GL proof: a real PLY override or a valid parser fixture, two
+// camera directions, and an isolated rotated anisotropic covariance probe.
+// The private FBO avoids the frame loop's subsequent backbuffer clear.
 void ScenarioRunner::runRevengSplat(AppState& st) {
     if (!rsInit) {
         rsInit = true;
@@ -1281,81 +1275,214 @@ void ScenarioRunner::runRevengSplat(AppState& st) {
     const char* repo = std::getenv("CHUDWARE_REPO");
     std::string base = repo ? std::string(repo) : std::string(".");
     rsSavePath = base + "/scratch/reveng_splat_shots";
-    std::error_code ec; std::filesystem::create_directories(rsSavePath, ec);
-
-    // Load the committed fixture (host/tests/fixtures/splat_tiny.ply, repo-relative).
+    std::error_code ec;
+    std::filesystem::create_directories(rsSavePath, ec);
+    nlohmann::json report = {{"ok", false}, {"views", nlohmann::json::array()},
+                             {"gl_errors", nlohmann::json::array()}};
+    auto glErrors = [&](const char* phase) {
+        for (int i = 0; i < 32; ++i) {
+            GLenum error = glGetError();
+            if (error == GL_NO_ERROR) break;
+            report["gl_errors"].push_back({{"phase", phase}, {"code", error}});
+        }
+    };
+    glErrors("entry");
     rsRenderer = std::make_unique<render::SplatRenderer>();
-    std::string plyPath = base + "/host/tests/fixtures/splat_tiny.ply";
     std::string err;
+    const char* overridePath = std::getenv("CHUDWARE_SPLAT_SMOKE_PATH");
+    const bool realInput = overridePath && overridePath[0];
+    const std::string plyPath = realInput ? std::string(overridePath)
+                                        : base + "/host/tests/fixtures/splat_tiny.ply";
+    report["source"] = plyPath;
     rsLoaded = rsRenderer->load(plyPath, err);
-    std::printf("reveng_splat: load %s ok=%d count=%zu%s%s\n", plyPath.c_str(),
-                (int)rsLoaded, rsLoaded ? rsRenderer->count() : 0,
-                rsLoaded ? "" : " err=", rsLoaded ? "" : err.c_str());
-    std::fflush(stdout);
+    Vec3 minimum, maximum;
+    const bool bounded = rsLoaded && rsRenderer->bounds(minimum, maximum);
+    report["loaded"] = rsLoaded;
+    report["count"] = rsRenderer->count();
+    report["load_error"] = err;
+    report["bounds"] = {minimum.x, minimum.y, minimum.z, maximum.x, maximum.y, maximum.z};
+    bool passed = !ec && bounded;
+    if (ec) report["directory_error"] = ec.message();
 
-    const int W = 640, H = 480;
-
-    // Private offscreen FBO: color (RGBA8) + depth (SplatRenderer::draw enables GL_DEPTH_TEST).
+    constexpr int W = 640, H = 480;
+    GLint oldDrawFbo = 0, oldReadFbo = 0, oldViewport[4], oldScissor[4], oldPack = 4;
+    GLfloat oldClearColor[4];
+    GLboolean oldDepthMask = GL_TRUE, oldColorMask[4];
+    const GLboolean oldScissorEnabled = glIsEnabled(GL_SCISSOR_TEST);
+    const GLboolean oldDepthEnabled = glIsEnabled(GL_DEPTH_TEST);
+    glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &oldDrawFbo);
+    glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &oldReadFbo);
+    glGetIntegerv(GL_VIEWPORT, oldViewport);
+    glGetIntegerv(GL_SCISSOR_BOX, oldScissor);
+    glGetIntegerv(GL_PACK_ALIGNMENT, &oldPack);
+    glGetFloatv(GL_COLOR_CLEAR_VALUE, oldClearColor);
+    glGetBooleanv(GL_DEPTH_WRITEMASK, &oldDepthMask);
+    glGetBooleanv(GL_COLOR_WRITEMASK, oldColorMask);
     GLuint fbo = 0, colorTex = 0, depthRbo = 0;
     glGenFramebuffers(1, &fbo);
     glBindFramebuffer(GL_FRAMEBUFFER, fbo);
     glGenTextures(1, &colorTex);
     glBindTexture(GL_TEXTURE_2D, colorTex);
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, W, H, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
     glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, colorTex, 0);
     glGenRenderbuffers(1, &depthRbo);
     glBindRenderbuffer(GL_RENDERBUFFER, depthRbo);
     glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH_COMPONENT24, W, H);
     glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, depthRbo);
-    GLenum fbStatus = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+    const GLenum fbStatus = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+    report["fbo_status"] = fbStatus;
+    passed = passed && fbStatus == GL_FRAMEBUFFER_COMPLETE;
+    glErrors("fbo");
 
-    std::vector<unsigned char> rgba(W * H * 4, 0);
-    size_t opaque = 0;
-    if (fbStatus == GL_FRAMEBUFFER_COMPLETE) {
-        glViewport(0, 0, W, H);
-        glClearColor(0.10f, 0.11f, 0.13f, 1.0f);
-        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
-
-        // Camera framing the fixture (gaussians span z in [-5,20], centered ~7.5).
-        Vec3 center{0.0f, 0.0f, 7.5f};
-        Vec3 eye{22.0f, 18.0f, 38.0f};
-        Vec3 up{0.0f, 0.0f, 1.0f};
-        float aspect = (float)W / (float)H;
-        Mat4 proj = perspective(35.0f * 3.14159265f / 180.0f, aspect, 1.0f, 500.0f);
-        Mat4 view = lookAt(eye, center, up);
+    auto camera = [&](Vec3 center, float radius, Vec3 direction) {
         Renderer::CameraXform cam;
-        cam.mvp = mul(proj, view);
-        cam.eye = eye; cam.center = center; cam.radius = 20.0f;
-        cam.ssWidth = W; cam.ssHeight = H;
-        rsRenderer->draw(cam);  // real SplatRenderer path: billboards + back-to-front alpha blend
-
+        cam.center = center;
+        cam.radius = radius;
+        cam.dist = radius * 4.0f;
+        cam.dir = normalize(direction);
+        cam.eye = center + cam.dir * cam.dist;
+        cam.right = normalize(cross(Vec3{0, 1, 0}, cam.dir));
+        cam.up = cross(cam.dir, cam.right);
+        cam.view = lookAt(cam.eye, center, cam.up);
+        const float fov = Renderer::kFovDeg * 3.14159265f / 180.0f;
+        cam.proj = perspective(fov, float(W) / H, radius * 0.01f, radius * 12.0f);
+        cam.mvp = mul(cam.proj, cam.view);
+        cam.halfHeight = cam.dist * std::tan(fov * 0.5f);
+        cam.orthographic = false;
+        cam.ssWidth = cam.vpWidth = W;
+        cam.ssHeight = cam.vpHeight = H;
+        return cam;
+    };
+    std::vector<unsigned char> rgba(W * H * 4), flip(W * H * 4);
+    auto renderView = [&](render::SplatRenderer& renderer, const Renderer::CameraXform& cam,
+                          const char* name, bool probe, bool expectEmpty = false) {
+        glViewport(0, 0, W, H);
+        glDisable(GL_SCISSOR_TEST);
+        glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+        glDepthMask(GL_TRUE);
+        const GLfloat clearDepth = 1.0f;
+        glClearBufferfv(GL_DEPTH, 0, &clearDepth);
+        // RGB zero is intentional: neither opaque clear alpha nor stale depth
+        // can count as rendered coverage.
+        glClearColor(0, 0, 0, 0);
+        glClear(GL_COLOR_BUFFER_BIT);
+        renderer.draw(cam);
+        glReadBuffer(GL_COLOR_ATTACHMENT0);
+        glPixelStorei(GL_PACK_ALIGNMENT, 1);
         glReadPixels(0, 0, W, H, GL_RGBA, GL_UNSIGNED_BYTE, rgba.data());
-        for (size_t i = 3; i < rgba.size(); i += 4) if (rgba[i] > 8) ++opaque;
-    } else {
-        std::printf("reveng_splat: FBO incomplete (0x%x) — cannot render\n", fbStatus);
-        std::fflush(stdout);
+        glErrors(name);
+        size_t covered = 0, colored = 0, colorBins = 0;
+        bool bins[4096] = {};
+        double weight = 0, mx = 0, my = 0, xx = 0, xy = 0, yy = 0;
+        for (int y = 0; y < H; ++y) {
+            for (int x = 0; x < W; ++x) {
+                const unsigned char* p = &rgba[(size_t(y) * W + x) * 4];
+                const int high = std::max({int(p[0]), int(p[1]), int(p[2])});
+                const int low = std::min({int(p[0]), int(p[1]), int(p[2])});
+                if (high <= 8) continue;
+                ++covered;
+                if (high - low > 8) ++colored;
+                const int bin = (p[0] >> 4) * 256 + (p[1] >> 4) * 16 + (p[2] >> 4);
+                if (!bins[bin]) { bins[bin] = true; ++colorBins; }
+                const double w = double(p[0]) + p[1] + p[2];
+                weight += w;
+                mx += w * x; my += w * y;
+                xx += w * x * x; xy += w * x * y; yy += w * y * y;
+            }
+        }
+        double ratio = 0, correlation = 0;
+        if (weight > 0) {
+            mx /= weight; my /= weight;
+            xx = std::max(0.0, xx / weight - mx * mx);
+            xy = xy / weight - mx * my;
+            yy = std::max(0.0, yy / weight - my * my);
+            const double discriminant = std::sqrt((xx - yy) * (xx - yy) + 4 * xy * xy);
+            ratio = std::sqrt((xx + yy + discriminant) /
+                              std::max(1e-9, xx + yy - discriminant));
+            correlation = xy / std::sqrt(std::max(1e-9, xx * yy));
+        }
+        bool viewOk = expectEmpty ? covered == 0 : covered >= 16 && colorBins >= 3;
+        if (probe) viewOk = viewOk && colored >= 32 && ratio > 2.0 &&
+                            std::abs(correlation) > 0.35;
+        for (int y = 0; y < H; ++y)
+            std::memcpy(&flip[size_t(H - 1 - y) * W * 4],
+                        &rgba[size_t(y) * W * 4], size_t(W) * 4);
+        const std::string path = rsSavePath + "/" + name + ".png";
+        const bool pngOk = stbi_write_png(path.c_str(), W, H, 4, flip.data(), W * 4) != 0;
+        report["views"].push_back({{"name", name}, {"ok", viewOk && pngOk},
+            {"rgb_coverage", covered}, {"colored_pixels", colored}, {"rgb_bins", colorBins},
+            {"axis_ratio", ratio}, {"xy_correlation", correlation}, {"png", path},
+            {"png_written", pngOk}, {"eye", {cam.eye.x, cam.eye.y, cam.eye.z}}});
+        passed = passed && viewOk && pngOk;
+    };
+    if (fbStatus == GL_FRAMEBUFFER_COMPLETE && bounded) {
+        const Vec3 center = (minimum + maximum) * 0.5f;
+        const float radius = std::max(0.001f, length(maximum - minimum) * 0.5f);
+        renderView(*rsRenderer, camera(center, radius, {0.5f, 0.3f, 1.0f}),
+                   "reveng_splat_01", false);
+        renderView(*rsRenderer, camera(center, radius, {-1.0f, 0.2f, 0.4f}),
+                   "reveng_splat_02", false);
+
+        render::SplatRenderer probeRenderer;
+        render::SplatCloud probeCloud;
+        render::Gaussian probe;
+        probe.scale = {0.7f, 0.1f, 0.05f};
+        probe.rot[0] = 0.9659258f; probe.rot[3] = 0.2588190f;
+        probe.color[0] = 0.9f; probe.color[1] = 0.2f; probe.color[2] = 0.05f;
+        probe.opacity = 0.95f;
+        probeCloud.gaussians.push_back(probe);
+        probeRenderer.setCloud(std::move(probeCloud));
+        renderView(probeRenderer, camera({}, 2.0f, {0, 0, 1}),
+                   "reveng_splat_anisotropy", true);
+
+        // A far-offscreen depth-elongated Gaussian must not project across the
+        // image through an unbounded perspective Jacobian.
+        render::SplatCloud offscreenCloud;
+        render::Gaussian offscreen;
+        offscreen.pos = {80.0f, 0.0f, 0.0f};
+        offscreen.scale = {0.01f, 0.1f, 8.0f};
+        offscreen.rot[0] = 1.0f;
+        offscreen.color[0] = 0.1f; offscreen.color[1] = 0.9f; offscreen.color[2] = 0.1f;
+        offscreen.opacity = 0.95f;
+        offscreenCloud.gaussians.push_back(offscreen);
+        probeRenderer.setCloud(std::move(offscreenCloud));
+        renderView(probeRenderer, camera({}, 2.0f, {0, 0, 1}),
+                   "reveng_splat_offscreen", false, true);
     }
 
-    // Restore the default framebuffer so the normal frame loop is unaffected.
-    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, oldDrawFbo);
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, oldReadFbo);
     glDeleteFramebuffers(1, &fbo);
     glDeleteTextures(1, &colorTex);
     glDeleteRenderbuffers(1, &depthRbo);
-
-    // glReadPixels is bottom-up; flip to top-down for the PNG.
-    std::vector<unsigned char> flip(W * H * 4);
-    for (int y = 0; y < H; ++y)
-        std::memcpy(&flip[(size_t)(H - 1 - y) * W * 4], &rgba[(size_t)y * W * 4], (size_t)W * 4);
-
-    rsCapture = rsSavePath + "/reveng_splat_01.png";
-    stbi_write_png(rsCapture.c_str(), W, H, 4, flip.data(), W * 4);
-    std::printf("reveng_splat: wrote %s (%dx%d, %zu opaque px, %zu gaussians)\n",
-                rsCapture.c_str(), W, H, opaque, rsLoaded ? rsRenderer->count() : 0);
+    glViewport(oldViewport[0], oldViewport[1], oldViewport[2], oldViewport[3]);
+    glScissor(oldScissor[0], oldScissor[1], oldScissor[2], oldScissor[3]);
+    if (oldScissorEnabled) glEnable(GL_SCISSOR_TEST); else glDisable(GL_SCISSOR_TEST);
+    if (oldDepthEnabled) glEnable(GL_DEPTH_TEST); else glDisable(GL_DEPTH_TEST);
+    glDepthMask(oldDepthMask);
+    glColorMask(oldColorMask[0], oldColorMask[1], oldColorMask[2], oldColorMask[3]);
+    glClearColor(oldClearColor[0], oldClearColor[1], oldClearColor[2], oldClearColor[3]);
+    glPixelStorei(GL_PACK_ALIGNMENT, oldPack);
+    glErrors("restore");
+    passed = passed && report["gl_errors"].empty();
+    report["ok"] = passed;
+    const std::string diagnostics = report.dump(2);
+    std::ofstream out(rsSavePath + "/diagnostics.json", std::ios::trunc);
+    out << diagnostics << '\n';
+    out.close();
+    const bool diagnosticsWritten = bool(out);
+    std::printf("reveng_splat: %s\n", diagnostics.c_str());
     std::fflush(stdout);
-
-    rsDone = true;  // one-tick drain complete; frame loop exits at the generic shot gate (frame 6)
+    rsCapture = rsSavePath + "/reveng_splat_01.png";
+    rsDone = true;
+    // A shot is an executable smoke, not a screenshot that silently succeeds
+    // after a loader/shader/FBO/readback failure.
+    if (!passed || !diagnosticsWritten) {
+        std::fflush(nullptr);
+        std::_Exit(EXIT_FAILURE);
+    }
 }
 
 // Appearance scenario (CHUDWARE_SHOT=appearance). Same frame-driven step machine + kSettle

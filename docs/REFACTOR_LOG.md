@@ -3601,3 +3601,49 @@ and generated host tool tables are updated; the metrology immutability test now
 checks that classification cannot change instead of pinning a Python-version-specific
 frozen-slot assignment exception. ME-490 repair generators, native revisions and
 geometric evidence remain in the project workspace, not this code repository.
+
+## 2026-09-10 — native live/video Gaussian reverse engineering
+
+The Source lane now performs real environment and stationary-object Gaussian
+reconstruction: canonical photo/video ingest, continuous native camera keyframes,
+COLMAP registration/undistortion and headless Apache-2.0 Brush v0.3.0 training.
+`scripts/provision_reveng.py` installs a checksum-pinned binary or checks out its
+pinned editable source; `BRUSH_BIN` remains the local-fork seam. Gaussian references
+stay in reconstruction units. Measured CAD remains a separate OpenMVS workflow
+with scale/dimension gates; the fabricated Brush-to-mesh path is removed.
+
+`services/reveng/gaussian_jobs.py` owns atomic sidecars, immutable exports, verified
+Linux process groups, GPU reservation, recovery and cancellation. Live capture
+builds successive frozen batches while the camera continues, then finalizes all
+accepted views. This is not video-rate SLAM, optimizer resume, moving-object
+reconstruction or automatic object segmentation. Explicit 3D object crop/reset
+preserves the original cloud. Worker shutdown and pending-start finalize are
+covered; session identity fences prevent cross-session frame/artifact delivery.
+Source and compiled child commands have explicit dispatcher routes, and Linux
+packaging includes pycolmap. A compiled release artifact was not built in this work.
+
+The native viewer now projects quaternion covariance and SH0–3, shares the
+2,000,000-Gaussian budget with training, uses a matching registered capture camera,
+and supports orbit/pan/zoom/capture-view reset. Full-rectangle projection plus
+visible scissoring fixes partially clipped previews. Matching Brush's frustum
+Jacobian clamp removed a reproduced offscreen smear: 28,606 stray pixels before,
+zero after. The smoke retains that behavioral probe alongside anisotropy and
+two real render views; no GL errors on a 90,638-Gaussian, 10,000-iteration artifact.
+
+Verification: native build; 250 focused Python tests passed, 20 skipped; 22 Linux
+packaging tests passed using system Python 3.14; renderer CTest passed; changed-scope
+GUI lint clean. Real NVIDIA training registered 24/24 imported video views. Native
+V4L2 loopback capture produced six progressive previews and a 2,000-step final pass;
+this exercised the camera path, not a physical camera. The live-object smoke grew
+8→14 views, finalized, cropped/restored, then cancelled an actual Brush process
+group and verified its descendants exited. Pausing the owned worker before native
+Start/Finalize proved the pending finish request survives startup. Native gestures
+changed the image without scrolling its parent, and Capture view restored it
+pixel-for-pixel. New-session selection survived rail refresh.
+
+Local evidence is under `scratch/reveng-overhaul-smoke/`: `proof.json`,
+`native-quality-proof.json`, `pending-start-proof.json`,
+`native-navigation-proof.json`, and native PNG captures. Source-dispatch smoke
+completed real SfM and Brush training; this is not Nuitka/AppImage execution proof.
+Contract additions are append-only in `contracts/reveng.md` §13; workspace and
+viewport skills carry the new file map and invariants.

@@ -13,11 +13,11 @@ traceback. No new dependency is introduced — OpenCV is already the vision-modu
 
 Design (both knobs are explicit parameters, defaults documented — no silent magic):
 
-* **sample-then-cull.** We first sample up to ``sample_cap`` candidate frames evenly across the
-  whole video (so a long clip is not front-loaded), score each, drop everything below
-  ``blur_threshold``, then keep the ``max_frames`` sharpest of the survivors. Sampling before
-  culling keeps the kept stills spread across the orbit instead of clustered wherever the camera
-  happened to hold still.
+* **sample-then-cull.** With a trustworthy frame count, sample up to ``sample_cap``
+  candidates evenly across the video; unknown-length decoding stops at that cap
+  plus one lookahead and explicitly reports truncation. Drop candidates below
+  ``blur_threshold`` and retain the ``max_frames`` sharpest. Only those best frames
+  are retained in memory, never the whole video.
 * **absolute Laplacian-variance threshold.** ``blur_threshold`` is scene-dependent in general;
   the default (:data:`DEFAULT_BLUR_THRESHOLD`) is a sane starting point for phone video and is a
   parameter the caller (or a later adaptive pass) can override. A synthetic fixture controls the
@@ -25,10 +25,14 @@ Design (both knobs are explicit parameters, defaults documented — no silent ma
 """
 from __future__ import annotations
 
-import copy
+import hashlib
+import heapq
+import math
+import os
+import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 from .fiducial import HAVE_CV2, VisionUnavailable, require_cv2
 
@@ -39,8 +43,8 @@ DEFAULT_BLUR_THRESHOLD: float = 100.0
 #: Contract default (``reveng_add_video(..., max_frames=120)``): most stills we keep.
 DEFAULT_MAX_FRAMES: int = 120
 
-#: Most candidate frames we decode+score before culling. Bounds work on a long/high-fps clip;
-#: the even sample still spans the whole video.
+#: Candidate decode/score budget; known-length sampling spans the whole video.
+#: Unknown-length decoding uses at most one additional frame to report truncation.
 DEFAULT_SAMPLE_CAP: int = 600
 
 
@@ -63,6 +67,8 @@ class FrameRecord:
     frame_index: int          # source frame index in the original video
     time_s: float             # timestamp (seconds) of that frame in the source
     sharpness: float          # variance-of-Laplacian focus score
+    source_path: str = ""
+    clip_id: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -70,6 +76,9 @@ class FrameRecord:
             "frame_index": self.frame_index,
             "time_s": self.time_s,
             "sharpness": self.sharpness,
+            "blur_score": self.sharpness,
+            "source_path": self.source_path,
+            "clip_id": self.clip_id,
         }
 
 
@@ -82,6 +91,15 @@ class FrameExtraction:
     rejected_blurry: int = 0  # scored candidates dropped below threshold
     total_frames: int = 0     # frame count reported by the source video
     blur_threshold: float = DEFAULT_BLUR_THRESHOLD
+    clip_id: str = ""
+    source_path: str = ""
+    count_known: bool = True
+    truncated: bool = False
+    sampling_limited: bool = False
+    rejected_limit: int = 0
+    sample_cap: int = DEFAULT_SAMPLE_CAP
+    decoded: int = 0
+    warnings: list[str] = field(default_factory=list)
 
     @property
     def kept(self) -> int:
@@ -95,6 +113,15 @@ class FrameExtraction:
             "rejected_blurry": self.rejected_blurry,
             "total_frames": self.total_frames,
             "blur_threshold": self.blur_threshold,
+            "clip_id": self.clip_id,
+            "source_path": self.source_path,
+            "count_known": self.count_known,
+            "truncated": self.truncated,
+            "sampling_limited": self.sampling_limited,
+            "rejected_limit": self.rejected_limit,
+            "sample_cap": self.sample_cap,
+            "decoded": self.decoded,
+            "warnings": self.warnings,
         }
 
 
@@ -125,94 +152,123 @@ def extract_frames(
     sample_cap: int = DEFAULT_SAMPLE_CAP,
     jpeg_quality: int = 92,
 ) -> FrameExtraction:
-    """Extract blur-culled stills from ``video_path`` into ``out_dir``.
+    """Write sharp stills with content-addressed clip and source-frame identities.
 
-    Samples up to ``sample_cap`` frames evenly across the whole video, scores each by
-    variance-of-Laplacian, drops everything below ``blur_threshold``, then writes the
-    ``max_frames`` sharpest survivors (in source-time order) as JPEGs.
-
-    Raises :class:`VisionUnavailable` if OpenCV is not installed and
-    :class:`FileNotFoundError` if the video cannot be opened — the MCP adapter turns those
-    into a contract-shaped ``{ok: False, reason, hint}`` rather than a traceback.
+    Known-length clips are sampled evenly. Unknown-length sources are decoded only
+    through ``sample_cap`` plus one lookahead, with explicit truncation accounting.
+    Only the best ``max_frames`` decoded images remain in memory. Decode, encode and
+    filesystem errors raise; no failed candidate is silently treated as a blur cull.
     """
+    for name, value in (("max_frames", max_frames), ("sample_cap", sample_cap)):
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            raise ValueError(f"{name} must be a positive integer")
+    if (isinstance(jpeg_quality, bool) or not isinstance(jpeg_quality, int)
+            or not 1 <= jpeg_quality <= 100):
+        raise ValueError("jpeg_quality must be an integer between 1 and 100")
+    if not math.isfinite(blur_threshold) or blur_threshold < 0:
+        raise ValueError("blur_threshold must be finite and nonnegative")
     cv2 = require_cv2()
-
-    src = Path(video_path).expanduser()
+    src = Path(video_path).expanduser().resolve()
     if not src.is_file():
         raise FileNotFoundError(f"no such video file: {video_path}")
-
+    with src.open("rb") as stream:
+        clip_id = hashlib.file_digest(stream, "sha256").hexdigest()
     cap = cv2.VideoCapture(str(src))
     if not cap.isOpened():
         cap.release()
         raise FileNotFoundError(f"OpenCV could not open video: {video_path}")
+    result = FrameExtraction(
+        blur_threshold=blur_threshold, clip_id=clip_id, source_path=str(src),
+        sample_cap=sample_cap,
+    )
+    # Heap ties prefer the earliest source frame; indices are unique, so image
+    # arrays are never compared. Memory is bounded independently of clip length.
+    best: list[tuple[float, int, Any]] = []
+
+    def score(idx, frame):
+        result.sampled += 1
+        sharpness = blur_score(frame)
+        if not math.isfinite(sharpness):
+            raise ValueError(f"invalid sharpness for source frame {idx}")
+        if sharpness < blur_threshold:
+            result.rejected_blurry += 1
+        elif len(best) < max_frames:
+            heapq.heappush(best, (sharpness, -idx, frame))
+        else:
+            result.rejected_limit += 1
+            if (sharpness, -idx) > best[0][:2]:
+                heapq.heapreplace(best, (sharpness, -idx, frame))
 
     try:
-        total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
-        fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
-
-        # Some containers report 0/garbage frame counts; fall back to a linear read.
+        reported = float(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+        total = int(reported) if math.isfinite(reported) and reported > 0 else 0
+        fps = float(cap.get(cv2.CAP_PROP_FPS) or 0)
+        fps = fps if math.isfinite(fps) and fps > 0 else 0
+        result.total_frames = total
+        result.count_known = total > 0
         if total > 0:
-            want = _even_indices(total, sample_cap)
-            candidates = []
-            for idx in want:
-                cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+            result.sampling_limited = total > sample_cap
+            for idx in _even_indices(total, sample_cap):
+                if not cap.set(cv2.CAP_PROP_POS_FRAMES, idx):
+                    raise OSError(f"could not seek to source frame {idx}")
                 ok, frame = cap.read()
-                if not ok or frame is None:
-                    continue
-                candidates.append((idx, frame))
+                if not ok or frame is None or frame.size == 0:
+                    raise OSError(f"could not decode source frame {idx} of {total}")
+                result.decoded += 1
+                score(idx, frame)
         else:
-            candidates = []
-            idx = 0
-            while True:
+            for idx in range(sample_cap + 1):
                 ok, frame = cap.read()
-                if not ok or frame is None:
+                if not ok:
+                    if idx == 0:
+                        raise OSError("video contains no decodable frames")
                     break
-                candidates.append((idx, frame))
-                idx += 1
-            total = len(candidates)
-            # apply the sample cap post-hoc on an unknown-length stream
-            if sample_cap and len(candidates) > sample_cap:
-                keep = set(_even_indices(len(candidates), sample_cap))
-                candidates = [c for i, c in enumerate(candidates) if i in keep]
+                if frame is None or frame.size == 0:
+                    raise OSError(f"could not decode source frame {idx}")
+                result.decoded += 1
+                if idx == sample_cap:
+                    result.truncated = True
+                    result.sampling_limited = True
+                    break
+                score(idx, frame)
+            result.total_frames = result.decoded
+            result.warnings.append(
+                f"source frame count unavailable; decoded {result.decoded} frames"
+                + (f"; truncated sampling at {sample_cap} candidates"
+                   if result.truncated else "; decoder reached end of stream")
+                + "; source length and decoder EOF cannot be independently verified"
+            )
     finally:
         cap.release()
 
-    result = FrameExtraction(
-        sampled=len(candidates),
-        total_frames=total,
-        blur_threshold=blur_threshold,
-    )
-
-    scored: list[tuple[int, float, Any]] = []
-    for idx, frame in candidates:
-        s = blur_score(frame)
-        if s < blur_threshold:
-            result.rejected_blurry += 1
-            continue
-        scored.append((idx, s, frame))
-
-    # keep the sharpest max_frames, then re-order by source time for a coherent orbit
-    scored.sort(key=lambda t: t[1], reverse=True)
-    if max_frames and len(scored) > max_frames:
-        scored = scored[:max_frames]
-    scored.sort(key=lambda t: t[0])
-
-    out = Path(out_dir).expanduser()
+    if result.sampling_limited and result.count_known:
+        result.warnings.append(f"sampled {result.sampled} of {result.total_frames} source frames")
+    if result.rejected_limit:
+        result.warnings.append(f"discarded {result.rejected_limit} sharp candidates at max_frames={max_frames}")
+    out = Path(out_dir).expanduser().resolve()
     out.mkdir(parents=True, exist_ok=True)
-
-    for i, (idx, s, frame) in enumerate(scored):
-        time_s = (idx / fps) if fps > 0 else 0.0
-        fpath = out / f"frame_{i:04d}.jpg"
-        cv2.imwrite(str(fpath), frame, [cv2.IMWRITE_JPEG_QUALITY, int(jpeg_quality)])
-        result.frames.append(
-            FrameRecord(
-                path=str(fpath.resolve()),
-                frame_index=idx,
-                time_s=round(time_s, 4),
-                sharpness=round(s, 3),
-            )
-        )
-
+    # Stage all selected JPEGs before publishing: a failed encoder cannot leave
+    # empty/partial JPEGs where the live job's image enumeration would see them.
+    with tempfile.TemporaryDirectory(prefix=".video-", dir=out) as staging:
+        pending = []
+        for sharpness, neg_idx, frame in sorted(best, key=lambda row: -row[1]):
+            idx = -neg_idx
+            filename = f"clip_{clip_id}_frame_{idx:09d}.jpg"
+            fpath = out / filename
+            if not fpath.is_file() or fpath.stat().st_size == 0:
+                temporary = Path(staging) / filename
+                if not cv2.imwrite(str(temporary), frame, [cv2.IMWRITE_JPEG_QUALITY, jpeg_quality]):
+                    raise OSError(f"could not write extracted source frame {idx}")
+                if not temporary.is_file() or temporary.stat().st_size == 0:
+                    raise OSError(f"encoder produced no data for source frame {idx}")
+                pending.append((temporary, fpath))
+            result.frames.append(FrameRecord(
+                path=str(fpath), frame_index=idx,
+                time_s=round(idx / fps, 4) if fps else 0.0,
+                sharpness=round(sharpness, 3), source_path=str(src), clip_id=clip_id,
+            ))
+        for temporary, fpath in pending:
+            os.replace(temporary, fpath)
     return result
 
 
@@ -232,6 +288,10 @@ def extract_frames_safe(video_path: str, out_dir: str, **kw) -> dict[str, Any]:
         return {"ok": False, "reason": e.reason, "hint": e.hint}
     except FileNotFoundError as e:
         return {"ok": False, "reason": str(e), "hint": "check the video path and codec support"}
+    except (ValueError, TypeError) as e:
+        return {"ok": False, "reason": str(e), "hint": "check frame limits and extraction parameters"}
+    except Exception as e:
+        return {"ok": False, "reason": str(e), "hint": "check video decoding and output directory write access"}
     out = {"ok": True}
     out.update(res.to_dict())
     return out

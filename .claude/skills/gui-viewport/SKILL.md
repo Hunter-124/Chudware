@@ -36,6 +36,33 @@ CAM overlays are Manufacture-only, excluded from the ID pass, section-clipped, a
 The remnant-stock aux mesh cache key is `{camSimGen(), frameIndex}` so a new simulation can never
 reuse the old frame-zero upload.
 
+## Gaussian reference rendering
+
+- `render/splat_renderer.cpp/.h` loads validated ASCII/little-endian PLY with log
+  scales, wxyz quaternions, opacity logits and SH degree 0–3. It projects full
+  anisotropic covariance, not point sprites. CPU bounds include three-sigma extents.
+  Loader and Brush training share a 2,000,000-Gaussian limit; input files cap at 2 GiB.
+- Keep immutable Gaussian attributes in the data texture and update only sorted
+  indices for camera motion. Subsequent large-cloud sorts run asynchronously.
+  Match Brush's projection Jacobian clamp: image-plane NDC is clamped to ±1.3 before
+  differentiating. Unbounded offscreen depth-elongated splats otherwise smear over
+  the full image. Preserve SH direction, quaternion order and source-over blending.
+- `ui/reveng/reveng_workspace.cpp` owns the calibrated camera and interactive
+  orbit/pan/zoom. `view_camera` comes from the matching registered capture batch,
+  including its roll/up basis and fx/fy/principal point. Initial bounds-fitting is
+  not a substitute for that camera. A new SfM batch changes coordinate frame; do not
+  attach its camera to an older PLY.
+- `app.cpp` draws the RE previews after ImGui. `kit::previewSlotRect` supplies the
+  complete projection viewport; `previewSlotClip` supplies its visible scissor.
+  Clear depth with OpenGL/GLES `glClearBufferfv`, not desktop-only clear-depth APIs,
+  and restore caller GL state. Worker threads parse files but never touch GL.
+- Real GL smoke: `CHUDWARE_ENGINE_DAEMON=0 CHUDWARE_SHOT=reveng_splat
+  CHUDWARE_REPO="$PWD" ./host/build-linux/bin/chudware --ui-screenshot scratch/re.png`.
+  Optional `CHUDWARE_SPLAT_SMOKE_PATH` uses an actual trained PLY. The smoke checks
+  two rendered views, rotated anisotropy, offscreen leakage, RGB coverage and GL
+  errors; diagnostics/PNGs go to `scratch/reveng_splat_shots/`. CPU parsing contract:
+  `test_splat_renderer`. Do not replace either proof with a nonempty screenshot check.
+
 ## Conventions & gotchas
 
 - Selection and picking are ID-based (topo IDs from the kernel), not raycast against triangles.

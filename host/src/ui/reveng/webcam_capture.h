@@ -28,6 +28,7 @@
 // there is no capture thread, because the reveng store is a mutex-free GL-thread singleton.
 #pragma once
 
+#include <cstdint>
 #include <string>
 
 struct AppState;
@@ -43,11 +44,16 @@ void drawWebcamCapture(AppState& st,
                        const std::string& session_id,
                        const std::string& session_dir);
 
-// Clear per-session capture state (coverage ring, capture strip, shot counter, status) WITHOUT
-// closing the device or dropping the capture lock. Call this when the selected session changes:
-// a full shutdown there would silently unlock focus/exposure and force a slow max-resolution
-// reopen, which is exactly the intrinsics drift lockForCapture() exists to prevent.
+// Stop/finalize live capture and clear per-session state on selection changes.
+// Releases the device so no images can leak into a newly selected session; an outstanding
+// ingest retains its originating session and is drained before that run is finalized.
 void webcamCaptureResetSession();
+
+// Monotonic session-selection epoch for source RPC callbacks (including A -> B -> A).
+uint64_t webcamCaptureSessionGeneration();
+
+// Gaussian panel Finish shares the camera's ingest-drain boundary. False means no native run.
+bool webcamCaptureFinishGaussian(AppState& st, const std::string& session_id);
 
 // Release the GL textures + CameraBackend held by the console. Workspace teardown / app shutdown
 // only. Leaving the RE tab without this leaks the camera fd and the preview texture.

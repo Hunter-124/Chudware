@@ -22,7 +22,7 @@ the frame loop in `host/src/app.cpp`.
 | **CAM** | `host/src/ui/cam/cam_panel.cpp/.h`, `cam_mirror.cpp/.h` | Integrated Explorer / Job Manager / NC Output left rail; all stock, toolpath, tool and removal previews render in the native viewport |
 | **ECAD** | `host/src/ui/ecad/ecad_panel.cpp/.h`, `ecad_canvas.cpp/.h`, `ecad_mirror.cpp/.h` | Schematic/PCB 2D canvas editor; schemas in `contracts/ecad/` |
 | **PLM** | `host/src/ui/plm/plm_workspace.cpp`, `plm_pages.cpp`, `plm_hub.h` | Versioning, releases, document control; `contracts/plm.md` |
-| **Reverse Eng.** | `host/src/ui/reveng/`: `reveng_workspace.cpp` (shell), `reveng_widgets.h/.cpp` (shared visual kit), `sources_panel.cpp`, `webcam_capture.cpp`, `stage_panels.cpp`, `dim_review.cpp`, `image_gallery.cpp`, `img_tex.cpp` | Six-stage scan → mesh → AI → parametric wizard (`contracts/reveng.md`). **Every panel draws with `ui::reveng::kit`** (`reveng_widgets.h`) and sizes itself from `ui::metrics::re*()` — no bespoke cards, no pixel literals. Camera seam: `host/src/platform/camera.h` v2. Splat/point-cloud rendering lives in `host/src/render/` (gui-viewport), fed by `kit::previewSlotRect`. Full breakdown below. |
+| **Reverse Eng.** | `host/src/ui/reveng/`: `reveng_workspace.cpp` (shell), `reveng_widgets.h/.cpp` (shared visual kit), `sources_panel.cpp`, `webcam_capture.cpp`, `stage_panels.cpp`, `dim_review.cpp`, `image_gallery.cpp`, `img_tex.cpp` | Native live/video Gaussian reconstruction plus the separate six-stage measured-CAD wizard (`contracts/reveng.md` §13). **Every panel draws with `ui::reveng::kit`** and uses `ui::metrics::re*()`. Camera seam: `host/src/platform/camera.h` v2. Native splat/point rendering reads `kit::previewSlotRect` and `previewSlotClip`. Full breakdown below. |
 | **AI / Activity** | `host/src/ui/ai/ai_workspace.cpp/.h` + `ai/{plan_board,docs_panel,active_work,metrics_view,activity_view,insights_view}.cpp` (activity_view/insights_view are the composed Activity and Insights views of the 6-view nav), and `host/src/ui/copilot/` (the chat impl the workspace embeds via the reuse hooks at the bottom of `copilot/copilot.h`; the old `legacy_chat.cpp` monolith is GONE — see the module map in `copilot/copilot_internal.h`) | Agent run tree, role-prompt editor, live progress; Context Injection tab edits `aicad.trigger/1` via `triggers_*` RPCs; events per `contracts/agent_events.md` |
 | **Drawing** | `host/src/ui/drawing_panel.cpp` | Sheet layout, views, DXF export |
 | **Simulation** | `host/src/ui/sim_manager.cpp`, `host/src/ui/evaluate_dialogs.cpp` | Study tree, fixtures/loads, results; Evaluate dialogs (measure, mass props, …) |
@@ -90,8 +90,9 @@ Eight TUs behind one tab. Read `reveng_widgets.h` before touching any of them.
   `InlineStatus`/`HelpMarker`, form rows (`FieldLabel`, `KeyValueRow`),
   `PrimaryButton`/`SecondaryButton`/`DangerButton`, `SegmentedControl`, `ProgressBar`,
   `StepTrack`, `HeroPreview`, `ThumbTile`, `ThumbHoverPreview`, `Viewport3DPreview` +
-  `previewSlotRect`/`resetPreviewSlots` (the seam app.cpp's post-ImGui GL pass reads for the
-  `Splat` / `SparseCloud` slots), `EmptyState`, `BlockedState`, `CapabilityRow`, `Rule`,
+  `previewSlotRect`/`previewSlotClip`/`resetPreviewSlots` (app.cpp's post-ImGui GL seam:
+  full rectangle for projection, visible clip intersection for scissoring), `EmptyState`,
+  `BlockedState`, `CapabilityRow`, `Rule`,
   `GapCards`/`GapSection`/`GapControl`, and the `fmtMm`/`fmtPct`/`fmtDuration` formatters.
   Hard rules it encodes: sizes from `ui::metrics::re*()`, colours from `ui::theme().palette`,
   every async action shows Busy/Ok/Warn/Error, every stage that produces an artifact shows it.
@@ -105,6 +106,37 @@ Eight TUs behind one tab. Read `reveng_widgets.h` before touching any of them.
   photogrammetry pre-flight, a coverage dome fed by real `get_reveng_coverage` (never a local
   counter), live variance-of-Laplacian sharpness shown before the shutter, and a **hard block on
   persisting synthetic frames** (refused in `shutterFire`, not merely greyed out).
+- Gaussian reconstruction lives in the **Source** lane, independent of the measured-CAD
+  stepper. `reveng_workspace.cpp` owns `GaussianState`, capability/status polling, async
+  validated PLY loads, object crop/reset, and calibrated orbit/pan/zoom. `sources_panel.cpp`
+  starts imported-video jobs; `webcam_capture.cpp` supplies continuous native keyframes.
+  Both share per-session `GaussianRunControl`: finish/cancel requested while start or ingest
+  is pending must be delivered after that request completes, not silently discarded.
+- Live capture binds session ID and generation; changing rail selection never retargets an
+  active camera stream. Persist accepted frames through canonical ingest, not directly into
+  the gallery. The rail uses the optional Gaussian summary, not unrelated CAD stage status,
+  and preserves selected/gallery **session IDs** across list replacement and reordering.
+- Backend map: `services/reveng/gaussian_jobs.py` owns Linux supervisors, atomic sidecars,
+  GPU reservation and cancellation; `services/vision/gaussian_pipeline.py` runs real
+  COLMAP registration/undistortion and Brush; `dense_backends.py` owns the CLI adapter.
+  Exact tool names are `reveng_start_splat`, `reveng_splat_status`,
+  `reveng_finish_splat`, `reveng_cancel_splat`, and `reveng_crop_splat`.
+  Source and compiled children both dispatch through the accepted modules in
+  `services/compiled_entry.py`.
+- Backend setup: `.venv-mcp/bin/python scripts/provision_reveng.py` installs checksum-pinned
+  Apache-2.0 Brush v0.3.0. `--source-checkout PATH` gets its editable pinned source;
+  `BRUSH_BIN` selects a locally modified build. The worker needs `pycolmap==3.13.0`;
+  launch a development build with `CHUDWARE_PYTHON="$PWD/.venv-mcp/bin/python"`.
+  Do not launch Brush's external viewer or restore the obsolete Brush-to-mesh adapter.
+- Honesty invariants: live means successive frozen batches while capture continues,
+  not video-rate SLAM or optimizer resume. Object mode is a stationary subject plus
+  explicit 3D crop, not automatic segmentation. Gaussian units are reconstruction units;
+  measured CAD remains the separate OpenMVS + scale/dimension-gate workflow.
+- A PLY and its `view_camera` must belong to the same immutable SfM batch. Publish them
+  together and fence asynchronous loads by session/path/revision. Use a registered capture
+  camera for the initial view; **Capture view** restores calibration and **Frame splat
+  bounds** is explicit. Do not reset user navigation on every export of the same batch.
+  Claim mouse-wheel ownership inside the preview so zoom cannot also scroll its parent.
 - `stage_panels.cpp` — Scale (`drawScalePanel`: aruco_mat / two_point / known_dim →
   `reveng_set_scale`; `reason:"scale_needs_sparse"` renders as a `BlockedState` that jumps to
   Reconstruct), Model (`drawModelPanel`: `reveng_fit_primitives` cards, `reveng_build_parametric`

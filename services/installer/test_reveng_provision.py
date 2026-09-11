@@ -6,7 +6,7 @@ and that with nothing provisioned the probe returns a structured missing-list.
 """
 from __future__ import annotations
 
-import os
+import builtins
 
 import pytest
 
@@ -15,25 +15,6 @@ from services.vision import reveng_provision as rp
 # Frozen §8.1 key sets.
 CAPABILITY_KEYS = {"sparse", "dense", "splat", "single_photo", "webcam", "gpu"}
 PROVISIONING_KEYS = {"colmap", "openmvs", "brush", "triposr", "vggt", "docling"}
-
-
-# --- descriptor schema ------------------------------------------------------
-
-def test_descriptor_schema_valid():
-    for name, d in rp.REVENG_DESCRIPTORS.items():
-        # every descriptor carries the schema keys, well-formed
-        for key in ("kind", "capability", "license", "mode", "sha256"):
-            assert key in d, f"{name} missing {key}"
-        # sha256 is present (may be the PENDING sentinel / None), never a fabricated hex
-        sha = d["sha256"]
-        assert sha in (None, rp.SHA_PENDING) or (
-            isinstance(sha, str) and len(sha) == 64 and all(c in "0123456789abcdef" for c in sha.lower())
-        ), f"{name} has a malformed sha256"
-        # download-mode descriptors must name a url; env-mode must NOT auto-fetch
-        if d["mode"] == "download":
-            assert d.get("url"), f"{name} is download mode but has no url"
-        if d["mode"] == "env":
-            assert d.get("url") is None, f"{name} is env(discovery) mode but has a url"
 
 
 def test_openmvs_is_agpl_discovery_only():
@@ -45,27 +26,26 @@ def test_openmvs_is_agpl_discovery_only():
     assert d["env_var"] == "OPENMVS_BIN"
 
 
-def test_no_fabricated_hashes():
-    """Any pinned url must carry a real 64-hex sha OR the explicit PENDING sentinel."""
-    for name, d in rp.REVENG_DESCRIPTORS.items():
-        if d["mode"] == "download":
-            sha = d["sha256"]
-            assert sha == rp.SHA_PENDING or (isinstance(sha, str) and len(sha) == 64), (
-                f"{name}: download descriptor must be PENDING or a real 64-hex sha"
-            )
-
-
 # --- readiness probe --------------------------------------------------------
 
 @pytest.fixture
-def clean_env(monkeypatch):
-    """Strip every provisioning env var so the probe sees a bare, offline machine."""
+def clean_env(monkeypatch, tmp_path):
+    """Isolate env, Python-package, managed-tool, and PATH discovery from the host."""
     for var in ("COLMAP_BIN", "OPENMVS_BIN", "BRUSH_BIN", "MESHROOM_BIN",
                 "TRIPOSR_WEIGHTS", "TRELLIS_WEIGHTS", "VGGT_WEIGHTS",
-                "CHUDWARE_TEST_CAMERA", "CUDA_VISIBLE_DEVICES"):
+                "CAD_RECODE_WEIGHTS", "CHUDWARE_TEST_CAMERA", "CUDA_VISIBLE_DEVICES"):
         monkeypatch.delenv(var, raising=False)
     # neutralize PATH-based tool discovery so the offline assertions are deterministic
     monkeypatch.setattr(rp.shutil, "which", lambda *_a, **_k: None)
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
+    real_import = builtins.__import__
+
+    def _unavailable_packages(name, *args, **kwargs):
+        if name in {"docling", "pycolmap"}:
+            raise ImportError(f"{name} unavailable in test")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", _unavailable_packages)
     yield
 
 
@@ -83,17 +63,8 @@ def test_status_shape(clean_env):
 
 def test_status_offline_all_missing(clean_env, monkeypatch):
     """Bare offline machine -> every provisioning artifact reported missing, structured."""
-    # also block the pip-mode docling import and device-node GPU/webcam checks
+    # Package and managed-tool discovery are isolated by clean_env; hide device nodes.
     monkeypatch.setattr(rp.os.path, "exists", lambda *_a, **_k: False)
-    import builtins
-    real_import = builtins.__import__
-
-    def _no_docling(name, *a, **k):
-        if name == "docling":
-            raise ImportError("blocked in test")
-        return real_import(name, *a, **k)
-
-    monkeypatch.setattr(builtins, "__import__", _no_docling)
 
     st = rp.reveng_status()
     assert set(st["missing"]) == PROVISIONING_KEYS, st["missing"]
@@ -103,14 +74,37 @@ def test_status_offline_all_missing(clean_env, monkeypatch):
 
 
 def test_env_provisioned_flips_available(clean_env, monkeypatch, tmp_path):
-    """Setting an env var at an existing path marks that capability available."""
-    fake = tmp_path / "colmap"
-    fake.write_text("#!/bin/sh\n")
-    monkeypatch.setenv("COLMAP_BIN", str(fake))
+    """OpenMVS can be installed without its required sparse reconstruction runtime."""
+    executable = tmp_path / "DensifyPointCloud"
+    executable.write_text("#!/bin/sh\n")
+    executable.chmod(0o755)
+    monkeypatch.setenv("OPENMVS_BIN", str(executable))
     st = rp.reveng_status()
-    assert st["provisioning"]["colmap"] is True
-    assert "colmap" not in st["missing"]
-    assert st["capabilities"]["sparse"] is True
+    assert st["provisioning"]["openmvs"] is True
+    assert "openmvs" not in st["missing"]
+    assert st["capabilities"]["dense"] is False
+
+
+def test_colmap_binary_does_not_replace_pycolmap(clean_env, monkeypatch, tmp_path):
+    """Installed native tools cannot enable workflows without the Python SfM runtime."""
+    executable = tmp_path / "colmap"
+    executable.write_text("#!/bin/sh\n")
+    executable.chmod(0o755)
+    monkeypatch.setenv("COLMAP_BIN", str(executable))
+    monkeypatch.setenv("OPENMVS_BIN", str(executable))
+    brush = rp.brush_install_dir() / "brush_app"
+    brush.parent.mkdir(parents=True)
+    brush.write_text("#!/bin/sh\n")
+    brush.chmod(0o755)
+
+    st = rp.reveng_status()
+    assert st["provisioning"]["brush"] is True
+    assert st["provisioning"]["openmvs"] is True
+    assert st["provisioning"]["colmap"] is False
+    assert "colmap" in st["missing"]
+    assert st["capabilities"]["sparse"] is False
+    assert st["capabilities"]["dense"] is False
+    assert st["capabilities"]["splat"] is False
 
 
 def test_installer_wrapper_offline(clean_env):

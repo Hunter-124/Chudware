@@ -80,7 +80,16 @@ struct ShotThumb {
     double      sharpness = -1.0;
 };
 
+struct LiveCapture {
+    AppState* app = nullptr;
+    std::string sid;
+    bool active = false;
+    uint64_t generation = 0;
+    std::shared_ptr<GaussianRunControl> control;
+};
+
 struct WebcamState {
+    std::string sessionId;
     // ---- preview texture ----
     GLuint texId  = 0;
     int    allocW = 0;
@@ -96,6 +105,14 @@ struct WebcamState {
     bool   frameSynthetic = true;
     double frameSharp = -1.0;
 
+    double frameTimestamp = -1.0;
+    double frameReceivedT = -100.0;
+    double lastCapturedTimestamp = -1.0;
+    uint64_t frameSerial = 0;
+    uint64_t sampledSerial = 0;
+    uint64_t frameFingerprint = 0;
+    uint64_t capturedFingerprint = 0;
+    bool haveCapturedFingerprint = false;
     // ---- backend ----
     std::unique_ptr<cam::CameraBackend> backend;
     std::vector<cam::CameraInfo> devices;
@@ -140,6 +157,14 @@ struct WebcamState {
     kit::Level  statusLevel = kit::Level::Neutral;
     bool   blurArmed = false;       // a blurry press happened; "Capture anyway" is offered
     std::vector<ShotThumb> strip;
+    std::shared_ptr<LiveCapture> live;
+    float intervalSec = 1.0f;
+    double nextSampleT = 0.0;
+    int accepted = 0;
+    int rejectedStale = 0;
+    int rejectedBlur = 0;
+    int rejectedSynthetic = 0;
+    int backpressured = 0;
 
     // ---- throttles ----
     double lastGrabT = -100.0;
@@ -151,6 +176,21 @@ struct WebcamState {
 };
 
 WebcamState g_wcam;
+uint64_t g_captureGeneration = 0;
+uint64_t g_sessionGeneration = 0;
+
+bool activeSessionIs(const std::string& sid) {
+    const auto& s = S();
+    return s.selected >= 0 && s.selected < (int)s.sessions.size() &&
+           s.sessions[(size_t)s.selected].session_id == sid;
+}
+
+void stopLiveCapture() {
+    const auto& run = g_wcam.live;
+    if (!run || !run->active) return;
+    run->active = false;
+    finishGaussianRun(*run->app, run->control);
+}
 
 // ---------------------------------------------------------------------------
 // Colour helpers — every draw-list colour is derived from the palette or the kit's
@@ -320,6 +360,7 @@ void rebuildModeLabels() {
 // reopening resets focus/exposure to the driver defaults, and claiming otherwise would be a lie.
 void dropDevice() {
     WebcamState& ws = g_wcam;
+    stopLiveCapture();
     if (ws.backend) ws.backend->close();
     ws.opened    = false;
     ws.locked    = false;
@@ -329,6 +370,9 @@ void dropDevice() {
     ws.haveFrame = false;
     ws.frameSynthetic = true;
     ws.frameSharp = -1.0;
+    ws.sampledSerial = ws.frameSerial;
+    ws.lastCapturedTimestamp = -1.0;
+    ws.haveCapturedFingerprint = false;
     ws.lastOpenT  = -100.0;
     ws.ctlRefreshT = -100.0;
 }
@@ -424,6 +468,18 @@ void updatePreviewFrame() {
             const bool valid = frame.width > 0 && frame.height > 0 &&
                                frame.rgba.size() >= (size_t)frame.width * frame.height * 4u;
             if (valid) {
+                ws.frameTimestamp = frame.timestamp_sec;
+                ws.frameReceivedT = now;
+                ++ws.frameSerial;
+                // A bounded image fingerprint catches drivers repeating pixels with new timestamps.
+                uint64_t fingerprint = 1469598103934665603ull;
+                const size_t stride = std::max<size_t>(4, (frame.rgba.size() / 4096) & ~size_t(3));
+                for (size_t i = 0; i + 2 < frame.rgba.size(); i += stride) {
+                    fingerprint = (fingerprint ^ frame.rgba[i]) * 1099511628211ull;
+                    fingerprint = (fingerprint ^ frame.rgba[i + 1]) * 1099511628211ull;
+                    fingerprint = (fingerprint ^ frame.rgba[i + 2]) * 1099511628211ull;
+                }
+                ws.frameFingerprint = fingerprint;
                 ws.frameSynthetic = frame.synthetic;
                 ws.frameSharp = frame.sharpness >= 0.0 ? frame.sharpness
                                                        : cam::frameSharpness(frame);
@@ -505,8 +561,10 @@ void refreshCoverage(AppState& st, const std::string& sid, bool force) {
 
     nlohmann::json params;
     params["session_id"] = sid;
-    st.rpc.call("get_reveng_coverage", params, [](const core::RpcResult& r) {
+    const uint64_t generation = g_captureGeneration;
+    st.rpc.call("get_reveng_coverage", params, [sid, generation](const core::RpcResult& r) {
         WebcamState& w = g_wcam;
+        if (generation != g_captureGeneration || !activeSessionIs(sid)) return;
         w.covPending = false;
         if (!r.ok) {
             w.covErr = r.err.empty() ? "get_reveng_coverage failed" : r.err;
@@ -577,7 +635,7 @@ std::string defaultSessionDir(const std::string& session_id) {
     if (!session_id.empty()) {
         if (!root.empty() && root.back() != '/') root += '/';
         root += session_id;
-        root += "/images";
+        root += "/capture_pending";
     }
     return root;
 }
@@ -600,10 +658,27 @@ void shutterFire(AppState& st,
                  bool ignoreBlur) {
     WebcamState& ws = g_wcam;
     if (ws.addPending) return;
+    if (!activeSessionIs(session_id) || S().selected != S().gallerySession ||
+        ws.sessionId != session_id ||
+        (ws.live && (ws.live->sid != session_id || ws.live->generation != g_captureGeneration))) {
+        stopLiveCapture();
+        return;
+    }
+    const auto& gaussian = S().gaussian;
+    const bool terminal = gaussian.status == "done" || gaussian.status == "failed" ||
+                          gaussian.status == "cancelled" || gaussian.status == "interrupted";
+    if (gaussian.pending || (gaussian.control && !terminal &&
+        gaussian.control->requested != GaussianRunControl::Action::None)) return;
 
     if (session_id.empty()) {
         ws.status = "No active session — create or select one before capturing.";
         ws.statusLevel = kit::Level::Error;
+        return;
+    }
+    if (!st.workerStarted) {
+        ws.status = "The worker is disconnected; no capture was written.";
+        ws.statusLevel = kit::Level::Error;
+        stopLiveCapture();
         return;
     }
     if (!ws.haveFrame || ws.lastRgba.empty() || ws.frameW <= 0 || ws.frameH <= 0) {
@@ -614,6 +689,7 @@ void shutterFire(AppState& st,
 
     // ---- HARD BLOCK: a synthetic frame never becomes a capture ----
     if (ws.frameSynthetic) {
+        ++ws.rejectedSynthetic;
         ws.status = "Refused: the preview is a software test pattern, not a camera frame. "
                     "A synthetic frame can never be written into a session — connect a webcam "
                     "and press Rescan.";
@@ -621,9 +697,19 @@ void shutterFire(AppState& st,
         ws.blurArmed = false;
         return;
     }
+    if (ws.frameSerial == ws.sampledSerial ||
+        ImGui::GetTime() - ws.frameReceivedT > std::max(1.0f, ws.intervalSec * 2.0f) ||
+        (ws.frameTimestamp > 0.0 && ws.frameTimestamp <= ws.lastCapturedTimestamp) ||
+        (ws.haveCapturedFingerprint && ws.frameFingerprint == ws.capturedFingerprint)) {
+        ++ws.rejectedStale;
+        ws.status = "Skipped stale or repeated camera frame.";
+        ws.statusLevel = kit::Level::Warn;
+        return;
+    }
 
     const bool blurry = ws.frameSharp >= 0.0 && ws.frameSharp < cam::kSharpnessBlurThreshold;
     if (blurry && !ignoreBlur) {
+        ++ws.rejectedBlur;
         char buf[224];
         std::snprintf(buf, sizeof(buf),
                       "This frame is blurry (sharpness %.0f, need %.0f). Steady the camera, or "
@@ -644,33 +730,50 @@ void shutterFire(AppState& st,
         return;
     }
 
-    std::string dir = session_dir.empty() ? defaultSessionDir(session_id) : session_dir;
+    // The job watches only accepted images/frames. Never expose a partially written JPEG there.
+    std::string dir = session_dir.empty() ? defaultSessionDir(session_id)
+                                         : session_dir + "/capture_pending";
+    std::error_code dirError;
+    const auto absoluteDir = std::filesystem::absolute(std::filesystem::u8path(dir), dirError);
+    if (dirError) {
+        ws.status = "Could not resolve the capture directory: " + dirError.message();
+        ws.statusLevel = kit::Level::Error;
+        return;
+    }
+    dir = absoluteDir.lexically_normal().u8string();
     ensureDir(dir);
     if (!dir.empty() && dir.back() != '/') dir += '/';
 
     // Never clobber a previous shot: bump until the name is free.
     std::string path;
+    bool available = false;
     for (int guard = 0; guard < 10000; ++guard) {
         char fname[64];
         std::snprintf(fname, sizeof(fname), "webcam_%03d.jpg", ws.shotSeq);
         ++ws.shotSeq;
         path = dir + fname;
         std::error_code ec;
-        if (!std::filesystem::exists(std::filesystem::u8path(path), ec)) break;
+        if (!std::filesystem::exists(std::filesystem::u8path(path), ec) && !ec) {
+            available = true;
+            break;
+        }
+    }
+    if (!available) {
+        ws.status = "No unused capture filename could be reserved.";
+        ws.statusLevel = kit::Level::Error;
+        return;
     }
 
-    std::vector<unsigned char> rgb((size_t)w * h * 3);
-    for (size_t i = 0, n = (size_t)w * h; i < n; ++i) {
-        rgb[i * 3 + 0] = ws.lastRgba[i * 4 + 0];
-        rgb[i * 3 + 1] = ws.lastRgba[i * 4 + 1];
-        rgb[i * 3 + 2] = ws.lastRgba[i * 4 + 2];
-    }
-    if (!stbi_write_jpg(path.c_str(), w, h, 3, rgb.data(), 92)) {
+    if (!stbi_write_jpg(path.c_str(), w, h, 4, ws.lastRgba.data(), 92)) {
         ws.status = "JPEG write failed: " + path;
         ws.statusLevel = kit::Level::Error;
         return;
     }
     ws.lastShotPath = path;
+    ws.sampledSerial = ws.frameSerial;
+    ws.lastCapturedTimestamp = ws.frameTimestamp;
+    ws.capturedFingerprint = ws.frameFingerprint;
+    ws.haveCapturedFingerprint = true;
 
     // Capture strip: own texture so the shot is visible this frame.
     {
@@ -701,14 +804,49 @@ void shutterFire(AppState& st,
     ws.statusLevel = kit::Level::Busy;
 
     nlohmann::json args;
-    args["session_id"] = session_id;
+    // Both the durable ingest and its drain ticket belong to the frame's originating session.
+    const std::string captureSid = ws.live && ws.live->active ? ws.live->sid : ws.sessionId;
+    args["session_id"] = captureSid;
     args["paths"]      = nlohmann::json::array({ path });
-    st.rpc.call("reveng_add_images", args, [path, blurry](const core::RpcResult& r) {
+    const uint64_t generation = g_captureGeneration;
+    const auto run = ws.live && ws.live->active ? ws.live->control : nullptr;
+    if (run) ++run->pendingIngest;
+    st.rpc.call("reveng_add_images", args, [&st, path, blurry, session_id = captureSid, generation, run](const core::RpcResult& r) {
+        std::string persisted;
+        double sharpness = -1.0;
+        if (r.ok && r.result.is_object() && r.result.contains("images") &&
+            r.result["images"].is_array()) {
+            for (const auto& image : r.result["images"]) {
+                if (!image.is_object() || image.value("source_path", std::string()) != path) continue;
+                persisted = image.value("path", std::string());
+                if (image.contains("blur_score") && image["blur_score"].is_number())
+                    sharpness = image["blur_score"].get<double>();
+                break;
+            }
+        }
+        if (!persisted.empty() && persisted != path) {
+            std::error_code ec;
+            std::filesystem::remove(std::filesystem::u8path(path), ec);
+        }
+        if (run) {
+            --run->pendingIngest;
+            drainGaussianActions(st, run);
+        }
+        if (generation != g_captureGeneration || !activeSessionIs(session_id)) return;
         WebcamState& w = g_wcam;
         w.addPending = false;
 
         std::string quality = blurry ? "blurred" : "ok";
-        if (!r.ok) {
+        if (!persisted.empty()) {
+            const int added = r.result.value("added", 0);
+            w.accepted += added;
+            quality = sharpness >= 0.0
+                ? (sharpness < cam::kSharpnessBlurThreshold ? "blurred" : "ok") : quality;
+            w.status = added > 0 ? "Keyframe accepted into the session."
+                                 : "Duplicate image already exists in the session; not added again.";
+            w.statusLevel = added > 0 ? kit::Level::Ok : kit::Level::Warn;
+            if (added == 0) ++w.rejectedStale;
+        } else if (!r.ok) {
             w.status = r.err.empty() ? "reveng_add_images failed (transport)." : r.err;
             w.statusLevel = kit::Level::Error;
             quality.clear();
@@ -719,27 +857,43 @@ void shutterFire(AppState& st,
         } else if (!r.result.value("ok", true)) {
             w.status = r.result.value("reason", std::string("reveng_add_images failed."));
             w.statusLevel = kit::Level::Error;
+            const auto hint = r.result.value("hint", std::string());
+            if (!hint.empty()) w.status += " — " + hint;
             quality.clear();
         } else {
-            const int added = r.result.value("added", 0);
-            if (added > 0) {
-                char buf[128];
-                std::snprintf(buf, sizeof(buf), "Saved and added to the session (%d image%s).",
-                              added, added == 1 ? "" : "s");
-                w.status = buf;
-                w.statusLevel = blurry ? kit::Level::Warn : kit::Level::Ok;
-            } else {
-                w.status = "The session accepted the call but reported 0 images added — "
-                           "check the session's images directory.";
-                w.statusLevel = kit::Level::Warn;
-                quality.clear();
-            }
+            w.status = "Image ingest returned no persisted path. The staged capture was retained.";
+            w.statusLevel = kit::Level::Error;
+            quality.clear();
         }
 
-        // Write the outcome back onto the gallery entry we optimistically pushed.
-        for (GalleryImage& g : S().galleryImages) {
-            if (g.path == path) { g.quality = quality; break; }
+        // Replace the staging path with the worker's durable image identity, deduplicating a
+        // detail hydration that may have landed while this ingest was in flight.
+        auto& gallery = S().galleryImages;
+        const bool alreadyPresent = !persisted.empty() &&
+            std::any_of(gallery.begin(), gallery.end(),
+                        [&persisted](const GalleryImage& image) { return image.path == persisted; });
+        for (auto it = gallery.begin(); it != gallery.end(); ++it) {
+            if (it->path != path) continue;
+            if (alreadyPresent) {
+                gallery.erase(it);
+                S().selectedImage = -1;
+            } else {
+                it->quality = quality;
+                if (!persisted.empty()) {
+                    it->path = persisted;
+                    it->texId = 0;
+                    it->texFailed = false;
+                    it->sharpness = sharpness;
+                }
+            }
+            break;
         }
+        for (auto& shot : w.strip) {
+            if (shot.path != path) continue;
+            shot.badge = quality;
+            if (!persisted.empty()) shot.path = persisted;
+        }
+        if (!persisted.empty()) w.lastShotPath = persisted;
         // Coverage is now stale — let the next frame refetch it.
         w.covLastT = -100.0;
     });
@@ -1290,8 +1444,20 @@ void drawPreviewCard(AppState& st, const std::string& session_id, const std::str
 
     // ---- shutter ----
     std::string reason;
-    if (session_id.empty()) {
+    if (!activeSessionIs(session_id) || ws.sessionId != session_id ||
+        S().selected != S().gallerySession) {
+        reason = "The capture session changed; wait for a new camera frame.";
+    } else if (S().gaussian.pending) {
+        reason = "Waiting for the Gaussian request to finish.";
+    } else if (S().gaussian.control &&
+               S().gaussian.control->requested != GaussianRunControl::Action::None &&
+               S().gaussian.status != "done" && S().gaussian.status != "failed" &&
+               S().gaussian.status != "cancelled" && S().gaussian.status != "interrupted") {
+        reason = "Capture stopped; waiting for the Gaussian job to finish.";
+    } else if (session_id.empty()) {
         reason = "No active session — create or select one in the session rail first.";
+    } else if (!st.workerStarted) {
+        reason = "The worker is not connected.";
     } else if (ws.devices.empty()) {
         reason = "No camera is connected. Plug in a USB webcam and press Rescan in the device "
                  "card above.";
@@ -1304,6 +1470,46 @@ void drawPreviewCard(AppState& st, const std::string& session_id, const std::str
         reason = "The previous shot is still being added to the session.";
     }
     const bool canShoot = reason.empty();
+    kit::FieldLabel("Keyframe interval", "Accepted frames feed bounded training snapshots. Only one image ingest may be in flight.");
+    ImGui::SliderFloat("##live_interval", &ws.intervalSec, 0.5f, 5.0f, "%.1f s");
+    ws.intervalSec = std::clamp(ws.intervalSec, 0.5f, 5.0f);
+    const bool live = ws.live && ws.live->active;
+    if (live) {
+        kit::StatusChip("Live keyframes", kit::Level::Busy);
+        if (kit::SecondaryButton("Stop and finalize")) stopLiveCapture();
+        ImGui::SameLine(0.0f, mx::reCtlGap());
+        if (kit::DangerButton("Cancel live splat")) {
+            ws.live->active = false;
+            cancelGaussian(st, ws.live->sid);
+        }
+    } else {
+        const auto& gaussian = S().gaussian;
+        const bool idle = !gaussian.pending &&
+            (gaussian.status.empty() || gaussian.status == "done" ||
+             gaussian.status == "failed" || gaussian.status == "cancelled" ||
+             gaussian.status == "interrupted");
+        if (kit::SecondaryButton("Start live splat", canShoot && idle,
+                                 !canShoot ? reason.c_str() : "A Gaussian job is already active.")) {
+            startGaussian(st, session_id, true);
+            const auto& control = S().gaussian.control;
+            if (control && control->starting) {
+                ws.live = std::make_shared<LiveCapture>();
+                ws.live->app = &st;
+                ws.live->sid = session_id;
+                ws.live->generation = g_captureGeneration;
+                ws.live->control = control;
+                ws.live->active = true;
+                ws.nextSampleT = ImGui::GetTime();
+                ws.accepted = ws.rejectedStale = ws.rejectedBlur = ws.rejectedSynthetic = ws.backpressured = 0;
+            }
+        }
+    }
+    char counts[192];
+    std::snprintf(counts, sizeof(counts),
+                  "Accepted %d | stale %d | blurred %d | synthetic %d | waiting for ingest %d",
+                  ws.accepted, ws.rejectedStale, ws.rejectedBlur, ws.rejectedSynthetic, ws.backpressured);
+    kit::InlineStatus(counts, kit::Level::Neutral);
+    kit::GapControl();
 
     if (kit::PrimaryButton("Capture photo", canShoot, canShoot ? nullptr : reason.c_str(),
                            ImVec2(prevW, mx::reBtnH()))) {
@@ -1383,8 +1589,40 @@ void drawPreviewCard(AppState& st, const std::string& session_id, const std::str
 void drawWebcamCapture(AppState& st,
                        const std::string& session_id,
                        const std::string& session_dir) {
+    if (!activeSessionIs(session_id) || S().selected != S().gallerySession) {
+        stopLiveCapture();
+        return;
+    }
+    if (g_wcam.sessionId != session_id) {
+        webcamCaptureResetSession();
+        g_wcam.sessionId = session_id;
+    }
+    if (g_wcam.live && (g_wcam.live->sid != session_id ||
+                       g_wcam.live->generation != g_captureGeneration)) {
+        stopLiveCapture();
+        return;
+    }
     updatePreviewFrame();
     refreshCoverage(st, session_id, /*force=*/false);
+    auto& ws = g_wcam;
+    if (ws.live && ws.live->active) {
+        const auto& gaussian = S().gaussian;
+        if (ws.live->control->startFailed ||
+            ws.live->control->requested != GaussianRunControl::Action::None) {
+            ws.live->active = false;
+        } else if (!gaussian.pending &&
+            (gaussian.status == "failed" || gaussian.status == "cancelled" ||
+             gaussian.status == "done" || gaussian.status == "interrupted" ||
+             gaussian.status == "finalizing")) {
+            ws.live->active = false;
+        } else if (ImGui::GetTime() >= ws.nextSampleT) {
+            ws.nextSampleT = ImGui::GetTime() + ws.intervalSec;
+            if (ws.addPending || gaussian.pending) ++ws.backpressured;
+            else if (ws.frameSynthetic) ++ws.rejectedSynthetic;
+            else shutterFire(st, ws.live->sid, session_dir, false);
+            ws.blurArmed = false; // live capture never offers to override its blur filter
+        }
+    }
 
     drawDeviceCard(st);
     kit::GapCards();
@@ -1395,6 +1633,17 @@ void drawWebcamCapture(AppState& st,
 
 void webcamCaptureResetSession() {
     WebcamState& ws = g_wcam;
+    ++g_sessionGeneration;
+    ++g_captureGeneration;
+    dropDevice();
+    ws.live.reset();
+    ws.sessionId.clear();
+    ws.addPending = false;
+    ws.covPending = false;
+    ws.sampledSerial = ws.frameSerial;
+    ws.lastCapturedTimestamp = -1.0;
+    ws.haveCapturedFingerprint = false;
+    ws.accepted = ws.rejectedStale = ws.rejectedBlur = ws.rejectedSynthetic = ws.backpressured = 0;
     clearStrip();
     for (int i = 0; i < kPlanSize; ++i) { ws.covCaptured[i] = false; ws.covBlurred[i] = false; }
     ws.covCapturedN = 0;
@@ -1410,11 +1659,14 @@ void webcamCaptureResetSession() {
     ws.status.clear();
     ws.statusLevel = kit::Level::Neutral;
     ws.blurArmed = false;
-    // Device, negotiated mode and the capture lock deliberately survive a session switch.
+    // Session changes release capture; an in-flight ingest finalizes only its originating run.
 }
 
 void webcamCaptureShutdown() {
     WebcamState& ws = g_wcam;
+    if (!ws.backend && !ws.texId && !ws.live && !ws.addPending) return;
+    ++g_captureGeneration;
+    stopLiveCapture();
     clearStrip();
     if (ws.backend) {
         ws.backend->close();
@@ -1425,6 +1677,17 @@ void webcamCaptureShutdown() {
         ws.texId = 0;
     }
     ws = WebcamState{};
+}
+
+uint64_t webcamCaptureSessionGeneration() {
+    return g_sessionGeneration;
+}
+
+bool webcamCaptureFinishGaussian(AppState&, const std::string& sid) {
+    const auto& run = g_wcam.live;
+    if (!run || run->sid != sid || run->control != S().gaussian.control) return false;
+    stopLiveCapture();
+    return true;
 }
 
 }  // namespace reveng

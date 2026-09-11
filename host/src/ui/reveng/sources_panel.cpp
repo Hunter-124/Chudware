@@ -30,6 +30,7 @@
 #include "core/app_state.h"
 #include "ui_theme.h"
 #include "ui/metrics.h"
+#include "platform/camera.h"
 
 #include "reveng_internal.h"
 #include "reveng_widgets.h"          // ui::reveng::kit — the RE visual vocabulary
@@ -57,6 +58,8 @@ struct SourcesUi {
     // Scan-lane capture method. Deep-linked by the three ribbon buttons via S().sourceFocus.
     int  captureTab = 0;              // 0 = Webcam, 1 = Photos, 2 = Video, 3 = Phone
     bool focusPulse = false;          // one-shot: scroll the capture card into view
+    uint64_t sessionGeneration = 0;
+    bool webcamVisible = false;
 
     // reveng_add_images (file picker)
     bool        addPhotosPending = false;
@@ -67,12 +70,8 @@ struct SourcesUi {
     std::string dropMsg;
     kit::Level  dropLvl = kit::Level::Neutral;
 
-    // reveng_add_video
-    bool        addVideoPending = false;
-    std::string addVideoMsg;
-    kit::Level  addVideoLvl = kit::Level::Neutral;
+    // The video path belongs to the asynchronous Gaussian job, not an extraction run token.
     std::string addVideoPath;
-    std::string addVideoRunId;
 
     // Datasheet lane detail (the shared store only keeps path / err / pending).
     int                      dsTables = 0;
@@ -160,7 +159,9 @@ void kickAddImages(AppState& st, const std::string& sid,
     nlohmann::json args;
     args["session_id"] = sid;
     args["paths"]      = nlohmann::json(paths);
-    st.rpc.call("reveng_add_images", args, [paths, slot](const core::RpcResult& r) {
+    const uint64_t generation = webcamCaptureSessionGeneration();
+    st.rpc.call("reveng_add_images", args, [paths, slot, sid, generation](const core::RpcResult& r) {
+        if (generation != webcamCaptureSessionGeneration() || sid != activeSessionId()) return;
         std::string msg;
         kit::Level  lvl = kit::Level::Ok;
         bool        accepted = false;
@@ -173,6 +174,8 @@ void kickAddImages(AppState& st, const std::string& sid,
             lvl = kit::Level::Error;
         } else if (!r.result.value("ok", true)) {
             msg = r.result.value("reason", std::string("reveng_add_images failed."));
+            const auto hint = r.result.value("hint", std::string());
+            if (!hint.empty()) msg += " — " + hint;
             lvl = kit::Level::Error;
         } else {
             const int added = r.result.value("added", 0);
@@ -184,34 +187,48 @@ void kickAddImages(AppState& st, const std::string& sid,
                 lvl = kit::Level::Ok;
             } else {
                 std::snprintf(buf, sizeof(buf), "%s",
-                              "The session accepted the call but added 0 images \xe2\x80\x94 "
-                              "check that the files still exist and are readable.");
+                              "No new images added; matching inputs may already be in this session.");
                 lvl = kit::Level::Warn;
             }
             msg = buf;
         }
 
-        // Quality badges: honour a per-image verdict if the worker sends one. The contract's
-        // response is {ok, added, session} with no per-image quality, and we refuse to stamp a
-        // green "ok" badge on a photo nobody actually scored — unknown stays unknown.
-        std::vector<std::pair<std::string, std::string>> verdicts;
+        // The ingest response maps user paths onto durable content-addressed images. Honour
+        // per-image successes even for a mixed-failure envelope, and never invent a quality score.
         if (r.ok && r.result.is_object() && r.result.contains("images") &&
             r.result["images"].is_array()) {
-            for (const auto& im : r.result["images"]) {
-                if (!im.is_object()) continue;
-                verdicts.emplace_back(im.value("path", std::string()),
-                                      im.value("quality", std::string()));
-            }
-        }
-        for (GalleryImage& g : S().galleryImages) {
-            for (const std::string& p : paths) {
-                if (g.path != p) continue;
-                std::string q;
-                for (const auto& v : verdicts)
-                    if (v.first == p) { q = v.second; break; }
-                if (!accepted) q.clear();
-                g.quality = q;
-                break;
+            auto& gallery = S().galleryImages;
+            for (const auto& image : r.result["images"]) {
+                if (!image.is_object()) continue;
+                const auto persisted = image.value("path", std::string());
+                if (persisted.empty()) continue;
+                const auto source = image.value("source_path", std::string());
+                const double sharpness = image.contains("blur_score") && image["blur_score"].is_number()
+                    ? image["blur_score"].get<double>() : -1.0;
+                for (const auto& input : paths) {
+                    bool matches = input == source;
+                    if (image.contains("source_paths") && image["source_paths"].is_array())
+                        for (const auto& alias : image["source_paths"])
+                            if (alias.is_string() && alias.get<std::string>() == input) matches = true;
+                    if (!matches) continue;
+                    const bool known = std::any_of(gallery.begin(), gallery.end(),
+                        [&persisted](const GalleryImage& g) { return g.path == persisted; });
+                    for (auto it = gallery.begin(); it != gallery.end(); ++it) {
+                        if (it->path != input) continue;
+                        if (known && input != persisted) {
+                            gallery.erase(it);
+                            S().selectedImage = -1;
+                        } else {
+                            it->path = persisted;
+                            it->texId = 0;
+                            it->texFailed = false;
+                            it->sharpness = sharpness;
+                            it->quality = sharpness < 0.0 ? "" :
+                                sharpness < chudware::platform::kSharpnessBlurThreshold ? "blurred" : "ok";
+                        }
+                        break;
+                    }
+                }
             }
         }
 
@@ -223,59 +240,6 @@ void kickAddImages(AppState& st, const std::string& sid,
             g_ui.dropMsg = msg;
             g_ui.dropLvl = lvl;
         }
-    });
-}
-
-// ---------------------------------------------------------------------------------------------
-// reveng_add_video — server-side frame extraction + blur culling. Long job; the response carries
-// the run_id and the session's new image count.
-// ---------------------------------------------------------------------------------------------
-
-void kickAddVideo(AppState& st, const std::string& sid, const std::string& path) {
-    if (sid.empty() || path.empty() || g_ui.addVideoPending) return;
-    g_ui.addVideoPending = true;
-    g_ui.addVideoPath    = path;
-    g_ui.addVideoRunId.clear();
-    g_ui.addVideoMsg = "Extracting frames\xe2\x80\xa6 this runs on the worker and can take a while "
-                       "for a long clip.";
-    g_ui.addVideoLvl = kit::Level::Busy;
-
-    nlohmann::json args;
-    args["session_id"] = sid;
-    args["path"]       = path;
-    st.rpc.call("reveng_add_video", args, [](const core::RpcResult& r) {
-        g_ui.addVideoPending = false;
-        if (!r.ok) {
-            g_ui.addVideoMsg = r.err.empty() ? "reveng_add_video failed (transport)." : r.err;
-            g_ui.addVideoLvl = kit::Level::Error;
-            return;
-        }
-        if (!r.result.is_object()) {
-            g_ui.addVideoMsg = "reveng_add_video returned a non-object.";
-            g_ui.addVideoLvl = kit::Level::Error;
-            return;
-        }
-        if (!r.result.value("ok", true)) {
-            const std::string reason = r.result.value("reason",
-                                                      std::string("reveng_add_video failed."));
-            const std::string hint = r.result.value("hint", std::string());
-            g_ui.addVideoMsg = hint.empty() ? reason : (reason + " \xe2\x80\x94 " + hint);
-            g_ui.addVideoLvl = kit::Level::Error;
-            return;
-        }
-        g_ui.addVideoRunId = r.result.value("run_id", std::string());
-        int images = 0;
-        if (r.result.contains("session") && r.result["session"].is_object()) {
-            const auto& sess = r.result["session"];
-            if (sess.contains("artifacts") && sess["artifacts"].is_object())
-                images = sess["artifacts"].value("images", 0);
-        }
-        char buf[192];
-        std::snprintf(buf, sizeof(buf),
-                      "Frames extracted and blur-culled. The session now holds %d image%s.",
-                      images, images == 1 ? "" : "s");
-        g_ui.addVideoMsg = buf;
-        g_ui.addVideoLvl = kit::Level::Ok;
     });
 }
 
@@ -299,7 +263,9 @@ void kickResearch(AppState& st) {
     if (!sid.empty()) params["session_id"] = sid;
     params["query"] = s.researchQuery;
 
-    st.rpc.call("reveng_research_source", params, [](const core::RpcResult& r) {
+    const uint64_t generation = webcamCaptureSessionGeneration();
+    st.rpc.call("reveng_research_source", params, [sid, generation](const core::RpcResult& r) {
+        if (generation != webcamCaptureSessionGeneration() || sid != activeSessionId()) return;
         RevEngState& s2 = S();
         s2.researchPending = false;
         g_ui.webRan = true;
@@ -417,7 +383,9 @@ void kickDatasheetIngest(AppState& st, const std::string& path) {
     if (!sid.empty()) params["session_id"] = sid;
     params["path"] = path;
 
-    st.rpc.call("reveng_ingest_datasheet", params, [](const core::RpcResult& r) {
+    const uint64_t generation = webcamCaptureSessionGeneration();
+    st.rpc.call("reveng_ingest_datasheet", params, [sid, generation](const core::RpcResult& r) {
+        if (generation != webcamCaptureSessionGeneration() || sid != activeSessionId()) return;
         RevEngState& s2 = S();
         s2.datasheetPending = false;
         if (!r.ok) {
@@ -506,7 +474,10 @@ void kickStartPhoneCapture(AppState& st) {
     nlohmann::json params = nlohmann::json::object();
     params["port"] = s.phonePort > 0 ? s.phonePort : 8742;
 
-    st.rpc.call("start_capture_session", params, [](const core::RpcResult& r) {
+    const std::string sid = activeSessionId();
+    const uint64_t generation = webcamCaptureSessionGeneration();
+    st.rpc.call("start_capture_session", params, [sid, generation](const core::RpcResult& r) {
+        if (generation != webcamCaptureSessionGeneration() || sid != activeSessionId()) return;
         RevEngState& s2 = S();
         s2.phonePending = false;
         if (!r.ok) {
@@ -559,7 +530,10 @@ void pollPhoneCount(AppState& st) {
 
     nlohmann::json params = nlohmann::json::object();
     params["port"] = s.phonePort > 0 ? s.phonePort : 8742;
-    st.rpc.call("start_capture_session", params, [](const core::RpcResult& r) {
+    const std::string sid = activeSessionId();
+    const uint64_t generation = webcamCaptureSessionGeneration();
+    st.rpc.call("start_capture_session", params, [sid, generation](const core::RpcResult& r) {
+        if (generation != webcamCaptureSessionGeneration() || sid != activeSessionId()) return;
         g_ui.phonePollPending = false;
         if (!r.ok || !r.result.is_object()) return;
         RevEngState& s2 = S();
@@ -582,7 +556,10 @@ void kickStopPhoneCapture(AppState& st, bool attach) {
     const std::string sid = attach ? activeSessionId() : std::string();
     AppState* stp = &st;   // AppState is process-lifetime for the host
 
-    st.rpc.call("stop_capture_session", params, [sid, stp](const core::RpcResult& r) {
+    const auto origin = activeSessionId();
+    const uint64_t generation = webcamCaptureSessionGeneration();
+    st.rpc.call("stop_capture_session", params, [sid, stp, origin, generation](const core::RpcResult& r) {
+        if (generation != webcamCaptureSessionGeneration() || origin != activeSessionId()) return;
         RevEngState& s2 = S();
         s2.phonePending = false;
         s2.phoneActive  = false;
@@ -682,42 +659,34 @@ void drawPhotosTab(AppState& st, const std::string& sid) {
 }
 
 void drawVideoTab(AppState& st, const std::string& sid) {
-    kit::SectionHeader("Add a video orbit");
+    kit::SectionHeader("Train a Gaussian splat from video");
     ImGui::TextWrapped(
-        "Walk the camera once around the part and hand over the clip. The worker samples frames, "
-        "throws away the blurry ones, and adds what survives as still images. This is usually the "
-        "fastest way to get good coverage, but a slow, deliberate orbit beats a quick sweep: "
-        "motion blur is the single most common cause of a failed reconstruction.");
+        "Move slowly with overlapping views of a stationary scene or object. The local job "
+        "extracts sharp frames, solves cameras, then trains a visible 3D Gaussian splat. "
+        "Use the Gaussian panel below for environment/object mode, quality and cropping. "
+        "Photos remain in this session for the separate mesh/CAD reconstruction workflow.");
     kit::GapControl();
 
-    const bool canAdd = !sid.empty() && !g_ui.addVideoPending;
-    const char* why = sid.empty() ? "No active session — create or select one first."
-                                  : "A video is already being processed.";
-    if (kit::PrimaryButton("Add video\xe2\x80\xa6", canAdd, canAdd ? nullptr : why,
+    const auto& gaussian = S().gaussian;
+    const bool idle = !gaussian.pending &&
+        (gaussian.status.empty() || gaussian.status == "done" || gaussian.status == "failed" ||
+         gaussian.status == "cancelled" || gaussian.status == "interrupted");
+    const bool canAdd = st.workerStarted && !sid.empty() && idle;
+    const char* why = sid.empty() ? "Create or select a session first."
+        : !st.workerStarted ? "The worker is not connected." : "A Gaussian job is already active.";
+    if (kit::PrimaryButton("Choose video and train splat...", canAdd, canAdd ? nullptr : why,
                            ImVec2(0, mx::reBtnH()))) {
         const std::string path = ui::openFileDialog(
             "Video (*.mp4 *.mov *.avi *.mkv *.webm)\0*.mp4;*.mov;*.avi;*.mkv;*.webm\0"
             "All files (*.*)\0*.*\0");
-        if (!path.empty()) kickAddVideo(st, sid, path);
+        if (!path.empty()) {
+            g_ui.addVideoPath = path;
+            startGaussian(st, sid, false, path);
+        }
     }
-    ImGui::SameLine(0.0f, mx::reCtlGap());
-    kit::HelpMarker(
-        "Frame extraction runs on the worker with OpenCV. Frames are scored with the same "
-        "variance-of-Laplacian blur metric the webcam preview shows, and anything under the "
-        "threshold is dropped before it can poison feature matching.");
-
-    if (g_ui.addVideoPending) kit::ProgressBar(-1.0f, "extracting frames", kit::Level::Busy);
-    kit::InlineStatus(g_ui.addVideoMsg.c_str(), g_ui.addVideoLvl);
-
     if (!g_ui.addVideoPath.empty()) {
         kit::GapControl();
         kit::KeyValueRow("clip", g_ui.addVideoPath.c_str());
-        if (!g_ui.addVideoRunId.empty())
-            kit::KeyValueRow("run id", g_ui.addVideoRunId.c_str(), kit::Level::Ok);
-    } else {
-        kit::GapControl();
-        kit::EmptyState(nullptr, "No video ingested yet",
-                        "Pick a clip and the extracted frames will appear in the gallery below.");
     }
 }
 
@@ -802,7 +771,7 @@ void drawScanEntry(AppState& st) {
     const std::string sid = activeSessionId();
 
     // ---- capture-method card ----
-    if (kit::CardBegin("re_src_capture", "Capture the part")) {
+    if (kit::CardBegin("re_src_capture", "Capture an environment or object")) {
         const char* head = sid.empty() ? "no session" : "session ready";
         kit::CardHeaderRight(chipWidth(head));
         kit::StatusChip(head, sid.empty() ? kit::Level::Error : kit::Level::Ok,
@@ -827,6 +796,8 @@ void drawScanEntry(AppState& st) {
         }
     }
     kit::CardEnd();
+    kit::GapCards();
+    drawGaussianPanel(st);
 
     kit::GapCards();
 
@@ -1108,6 +1079,13 @@ void drawFromLibraryEntry() {
 
 void drawSourcesPanel(AppState& st) {
     RevEngState& s = S();
+    if (g_ui.sessionGeneration != webcamCaptureSessionGeneration()) {
+        releaseDatasheetTex();
+        const int tab = g_ui.captureTab;
+        g_ui = SourcesUi{};
+        g_ui.captureTab = tab;
+        g_ui.sessionGeneration = webcamCaptureSessionGeneration();
+    }
 
     // One-shot deep link from the three ribbon buttons (reveng_add_photos / reveng_add_video /
     // reveng_webcam). Consume-and-clear, same contract as focusNewName.
@@ -1121,6 +1099,10 @@ void drawSourcesPanel(AppState& st) {
         g_ui.focusPulse = true;
         s.sourceFocus = SourceFocus::None;
     }
+    // Capture is owned by the visible webcam console, never by a hidden source lane.
+    const bool showWebcam = s.sourceMode == SourceMode::Scan && g_ui.captureTab == 0;
+    if (g_ui.webcamVisible && !showWebcam) webcamCaptureShutdown();
+    g_ui.webcamVisible = showWebcam;
 
     switch (s.sourceMode) {
         case SourceMode::Scan:        drawScanEntry(st);        break;

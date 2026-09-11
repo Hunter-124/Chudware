@@ -19,25 +19,9 @@ import pytest
 # ---------------------------------------------------------------------------
 # photogrammetry.py tests
 # ---------------------------------------------------------------------------
-# Import directly from submodules to avoid triggering services.vision.__init__,
-# which eagerly imports ingest.py -> Pillow (optional runtime dep).
-import importlib
-import sys as _sys
-
-def _import_vision_submodule(name: str):
-    """Import services.vision.<name> without triggering the package __init__."""
-    full = f"services.vision.{name}"
-    if full in _sys.modules:
-        return _sys.modules[full]
-    import importlib.util, pathlib
-    _vision_dir = pathlib.Path(__file__).parent
-    spec = importlib.util.spec_from_file_location(full, _vision_dir / f"{name}.py")
-    mod = importlib.util.module_from_spec(spec)
-    _sys.modules[full] = mod
-    spec.loader.exec_module(mod)
-    return mod
-
-photogrammetry = _import_vision_submodule("photogrammetry")
+# Use normal package imports so sys.modules and services.vision attributes refer
+# to the same modules when other suites patch backend callables.
+from services.vision import photogrammetry
 from services.vision.photogrammetry import available_backend, reconstruct
 
 
@@ -153,7 +137,7 @@ class TestReconstructColmapMocked:
 # ---------------------------------------------------------------------------
 # mesh_cleanup.py tests
 # ---------------------------------------------------------------------------
-mesh_cleanup = _import_vision_submodule("mesh_cleanup")
+from services.vision import mesh_cleanup
 from services.vision.mesh_cleanup import cleanup_mesh
 
 
@@ -289,7 +273,7 @@ class TestCleanupMeshOpen3dMocked:
 # ---------------------------------------------------------------------------
 # capture_server.py tests
 # ---------------------------------------------------------------------------
-capture_server = _import_vision_submodule("capture_server")
+from services.vision import capture_server
 from services.vision.capture_server import (
     CaptureSession,
     get_guided_shot_names,

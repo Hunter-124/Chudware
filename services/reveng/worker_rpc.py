@@ -177,6 +177,11 @@ _BRIDGED_TOOLS: tuple[str, ...] = (
     "reveng_print_scale_mat",
     # ── §8.2 WRITE — reconstruction + modelling (reveng_build_tools) ─────────
     "reveng_reconstruct",
+    "reveng_start_splat",
+    "reveng_splat_status",
+    "reveng_finish_splat",
+    "reveng_cancel_splat",
+    "reveng_crop_splat",
     # Mission gates. reveng_reconstruct returns a run_id immediately and the mission
     # suspends at its scale-confirm / dimension-confirm gates; without these two the
     # GUI's Reconstruct button dead-ends at the first pause.

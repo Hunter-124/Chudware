@@ -5,10 +5,13 @@
 #pragma once
 
 #include <string>
+#include <cstdint>
+#include <memory>
 #include <vector>
 
 // RE-19: GalleryImage is defined in image_gallery.h; included below to avoid
 // a circular dependency (image_gallery.h must NOT include reveng_internal.h).
+#include "reveng_workspace.h"  // shared Gaussian actions
 #include "image_gallery.h"
 #include "render/re_points.h"       // RE-21: sparse point-cloud + frusta overlay
 #include "render/splat_renderer.h"  // RE-28: 3DGS splat renderer (wired RE-27)
@@ -58,6 +61,10 @@ struct SessionSummary {
     std::string createdAt;   // ISO-8601
     std::string updatedAt;   // ISO-8601
     std::string partRef;     // parts-hub part_id when seeded from the library; empty otherwise
+    // Optional Gaussian sidecar projection; never replaces CAD status or image counts.
+    bool hasGaussian = false;
+    std::string gaussianStatus, gaussianStage, gaussianMode;
+    int gaussianFrames = 0, gaussianRegistered = 0, gaussianPct = 0;
 };
 
 // RE-21/RE-40: Reconstruct-stage progress event (mirrors aicad.reveng_events/1 subset).
@@ -84,6 +91,44 @@ struct ReconstructState {
     bool        kickPending = false;
     std::string kickErr;          // sticky; empty when healthy
     std::string runId;            // run_id returned by the kick (for status display)
+};
+
+// A run's control lifetime is independent of the selected session and camera device.
+// RPC callbacks retain this ticket through start, image ingest and a single terminal action.
+struct GaussianRunControl {
+    enum class Action { None, Finish, Cancel };
+    std::string sid;
+    bool starting = false, pending = false, startFailed = false;
+    int pendingIngest = 0;
+    Action requested = Action::None;
+    bool finishSent = false, cancelSent = false, acknowledged = false;
+};
+
+void finishGaussianRun(AppState& st, const std::shared_ptr<GaussianRunControl>& run);
+void drainGaussianActions(AppState& st, const std::shared_ptr<GaussianRunControl>& run);
+
+// Calibrated, undistorted capture pose in the published Gaussian artifact's SfM gauge.
+// An empty id means a legacy artifact without capture calibration.
+struct GaussianViewCamera {
+    std::string id;
+    Vec3 eye, forward, up;
+    float focusDistance = 1.0f;
+    float intrinsics[6] = {};  // fx, fy, cx, cy, source width, source height
+};
+
+// Local Gaussian jobs are independent of the scaled CAD/mesh reconstruction mission.
+struct GaussianState {
+    int mode = 0, quality = 1, iterations = 2000;
+    bool pending = false, live = false;
+    std::shared_ptr<GaussianRunControl> control;
+    std::string runId, status, stage, msg, error, splatPath;
+    int pct = 0, frames = 0, registered = 0, iteration = 0, totalIterations = 0;
+    uint64_t artifactRevision = 0;
+    GaussianViewCamera viewCamera;
+    bool cropEnabled = false;
+    float cropBounds[6] = {};
+    float bounds[6] = {};
+    bool hasBounds = false;
 };
 
 // Scale stage (contracts/reveng.md §2 session.scale + reveng_set_scale §8.2).
@@ -251,6 +296,7 @@ struct RevEngState {
 
     // RE-21: Reconstruct stage.
     ReconstructState recon;
+    GaussianState gaussian;
 
     // Per-stage panel state (reset when the selected session changes).
     ScaleState   scale;
@@ -323,6 +369,8 @@ struct RevEngState {
 };
 
 RevEngState& S();
+
+Renderer::CameraXform gaussianPreviewCamera(int width, int height);
 
 // RE-21/RE-40: Apply one aicad.reveng_events/1 event to the singleton state.
 // Called from core::engineEventsTick()'s EventJournal tail (and from app.cpp's canned

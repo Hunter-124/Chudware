@@ -8092,12 +8092,12 @@ int run_gui(const char *screenshotPath, const char *openPath) {
         vw = (int)((r.Max.x - r.Min.x) * sx);
         vh = (int)((r.Max.y - r.Min.y) * sy);
         vy = dh - (int)(r.Max.y * sy);  // flip Y
-        return vw > 1 && vh > 1 && vx < dw && vy < dh;
+        return vw > 1 && vh > 1 && vx < dw && vy < dh &&
+               vx + vw > 0 && vy + vh > 0;
       };
 
-      // Neutral framing camera for a reserved preview rect. There is no live
-      // orbit camera in a 2D workspace, so we frame the origin from a fixed
-      // three-quarter eye and let the rect's own aspect drive the projection.
+      // Preserve the existing sparse-cloud framing; Gaussian previews have
+      // their own bounds-fitted interactive camera in the workspace.
       auto slotCamera = [](int vw, int vh) {
         Renderer::CameraXform cam;
         cam.ssWidth = vw;
@@ -8118,15 +8118,35 @@ int run_gui(const char *screenshotPath, const char *openPath) {
       auto drawSlot = [&](ui::reveng::kit::PreviewSlot slot,
                           const std::function<void(const Renderer::CameraXform &)>
                               &render) {
-        ImRect r;
-        if (!ui::reveng::kit::previewSlotRect(slot, r)) return;
+        ImRect r, clip;
+        if (!ui::reveng::kit::previewSlotRect(slot, r) ||
+            !ui::reveng::kit::previewSlotClip(slot, clip)) return;
         int vx = 0, vy = 0, vw = 0, vh = 0;
         if (!slotViewport(r, vx, vy, vw, vh)) return;
+        int cx = 0, cy = 0, cw = 0, ch = 0;
+        if (!slotViewport(clip, cx, cy, cw, ch)) return;
+        GLint previousScissor[4];
+        GLboolean previousDepthMask = GL_TRUE;
+        const GLboolean scissorEnabled = glIsEnabled(GL_SCISSOR_TEST);
+        glGetIntegerv(GL_SCISSOR_BOX, previousScissor);
+        glGetBooleanv(GL_DEPTH_WRITEMASK, &previousDepthMask);
         glViewport(vx, vy, vw, vh);
         glEnable(GL_SCISSOR_TEST);
-        glScissor(vx, vy, vw, vh);
-        render(slotCamera(vw, vh));
-        glDisable(GL_SCISSOR_TEST);
+        glScissor(std::max(0, cx), std::max(0, cy),
+                  std::min(dw, cx + cw) - std::max(0, cx),
+                  std::min(dh, cy + ch) - std::max(0, cy));
+        // ImGui clears color only. Stale default-framebuffer depth must not
+        // occlude this independent preview; never clear outside its slot.
+        glDepthMask(GL_TRUE);
+        const GLfloat clearDepth = 1.0f;
+        glClearBufferfv(GL_DEPTH, 0, &clearDepth);
+        glDepthMask(previousDepthMask);
+        render(slot == ui::reveng::kit::PreviewSlot::Splat
+                   ? ui::reveng::gaussianPreviewCamera(vw, vh)
+                   : slotCamera(vw, vh));
+        glScissor(previousScissor[0], previousScissor[1],
+                  previousScissor[2], previousScissor[3]);
+        if (!scissorEnabled) glDisable(GL_SCISSOR_TEST);
       };
 
       // RE-27: 3DGS splat (Brush export) — the Reconstruct stage's splat slot.

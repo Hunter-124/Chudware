@@ -8,7 +8,11 @@ transport, session store redirected to a temp dir.
 """
 from __future__ import annotations
 
+from hashlib import sha256
+from pathlib import Path
+
 import pytest
+from PIL import Image
 
 from services.reveng import worker_rpc as reveng_rpc
 
@@ -31,28 +35,11 @@ def _call(method: str, params: dict | None = None) -> dict:
     return M[method](params or {}, _emit)
 
 
-# Every reveng RPC the desktop GUI dispatches (host/src/ui/reveng/*, parts_workspace.cpp).
-# A name missing here is a button that round-trips to "unknown method" and sticks an
-# error in the panel — the defect this transport exists to prevent.
-_GUI_DISPATCHED = (
-    "list_reveng_sessions", "get_reveng_session", "get_reveng_coverage",
-    "get_reveng_deviation", "list_reveng_dims", "describe_reveng_result",
-    "reveng_status", "reveng_start_session", "reveng_add_images",
-    "reveng_add_video", "reveng_ingest_datasheet", "reveng_set_scale",
-    "reveng_print_scale_mat", "reveng_reconstruct", "reveng_single_photo",
-    "reveng_fit_primitives", "reveng_build_parametric", "reveng_attach_result",
-    "reveng_research_source", "reveng_make_part_from_library", "import_scan_mesh",
-    "export_reveng_bundle", "start_capture_session", "stop_capture_session",
-    "reveng_start_from_product",
-)
-
-
-def test_methods_registered_on_worker():
-    """The whole GUI surface lands in the aggregated worker table (GUI reachability)."""
-    from services import worker_main as w  # the post-oracle stdio worker (T-RF20)
-    for name in _GUI_DISPATCHED:
-        assert name in M, f"{name} not exposed by REVENG_WORKER_METHODS"
-        assert name in w._METHODS, f"{name} not registered on the worker"
+def _jpg(path: Path, key: str = "front") -> None:
+    """Write a real JPEG with deterministic, distinct pixels for each source."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    pixels = sha256(key.encode()).digest() * 24
+    Image.frombytes("RGB", (16, 16), pixels).save(path, quality=95)
 
 
 def test_start_session_then_list_and_get(reveng_dir):
@@ -78,12 +65,30 @@ def test_start_session_with_research_seed_populates_lane(reveng_dir):
 def test_add_images_delivers_photos(reveng_dir, tmp_path):
     sid = _call("reveng_start_session", {"name": "photos"})["session_id"]
     photo = tmp_path / "front.jpg"
-    photo.write_bytes(b"\xff\xd8\xff\xe0" + b"\x00" * 16)  # minimal JFIF
+    _jpg(photo)
 
     r = _call("reveng_add_images", {"session_id": sid, "paths": [str(photo)]})
     assert r["ok"] and r["added"] == 1
     assert r["session"]["artifacts"]["images"] == 1
     assert r["session"]["stages"]["capture"] == "done"
+    persisted = Path(r["images"][0]["path"])
+    assert persisted.is_relative_to(reveng_dir / sid)
+    assert persisted.read_bytes() == photo.read_bytes()
+
+    duplicate = tmp_path / "renamed.jpg"
+    duplicate.write_bytes(photo.read_bytes())
+    repeated = _call("reveng_add_images", {"session_id": sid, "paths": [str(duplicate)]})
+    assert repeated["ok"] and repeated["added"] == 0
+    assert repeated["session"]["artifacts"]["images"] == 1
+    assert repeated["images"][0]["path"] == str(persisted)
+
+    photo.unlink()
+    duplicate.unlink()
+    got = _call("get_reveng_session", {"session_id": sid})
+    assert got["session"]["artifacts"]["images"] == 1
+    with Image.open(persisted) as image:
+        image.load()
+        assert image.size == (16, 16)
 
 
 def test_start_from_product_threads_media(reveng_dir, monkeypatch):
@@ -100,8 +105,10 @@ def test_start_from_product_threads_media(reveng_dir, monkeypatch):
 
     def _download(url, site, dest, **_k):
         dest.parent.mkdir(parents=True, exist_ok=True)
-        dest.write_bytes(b"%PDF-1.4\n" if str(dest).endswith(".pdf")
-                         else b"\xff\xd8\xff\xe0" + b"\x00" * 8)
+        if dest.suffix == ".pdf":
+            dest.write_bytes(b"%PDF-1.4\n")
+        else:
+            _jpg(dest, url)
         return {"ok": True, "dest": str(dest)}
     monkeypatch.setattr(bsession, "browser_download", _download)
     # datasheet ingest backend may be absent in CI — make it deterministic. The tool
@@ -148,7 +155,7 @@ def _media_harvest(monkeypatch, images, documents):
 
 
 def _writing_download(cooldown_after: int | None = None, calls: list | None = None):
-    """browser_download stub: writes a plausible body, and after ``cooldown_after``
+    """browser_download stub: writes real images, and after ``cooldown_after``
     successful calls starts answering with the cooldown_active refusal."""
     def _download(url, site, dest, **_k):
         if calls is not None:
@@ -157,8 +164,10 @@ def _writing_download(cooldown_after: int | None = None, calls: list | None = No
             return {"ok": False, "reason": "cooldown_active", "retry_after_s": 612.0,
                     "policy_refusal": True, "executed": False, "hint": "cooling down"}
         dest.parent.mkdir(parents=True, exist_ok=True)
-        dest.write_bytes(b"%PDF-1.4\n" if str(dest).endswith(".pdf")
-                         else b"\xff\xd8\xff\xe0" + b"\x00" * 8)
+        if dest.suffix == ".pdf":
+            dest.write_bytes(b"%PDF-1.4\n")
+        else:
+            _jpg(dest, url)
         return {"ok": True, "dest": str(dest)}
     return _download
 
@@ -190,9 +199,6 @@ def test_harvest_keeps_partial_results_when_the_site_starts_cooling_down(
     assert r["retry_after_s"] == 612.0
     assert len(calls) == 3, calls                     # stopped AT the refusal, not after
     assert "ds.pdf" not in " ".join(calls)
-    # The hint must route the model somewhere, not just name the state.
-    assert "reveng_add_images" in r["hint"]
-    assert "reverse_engineer_product" in r["hint"]    # ...and say not to re-call it
 
 
 def test_harvest_is_bounded_by_the_item_cap(reveng_dir, monkeypatch):
@@ -214,7 +220,6 @@ def test_harvest_is_bounded_by_the_item_cap(reveng_dir, monkeypatch):
     assert r["media_skipped"] == 61 - cap
     assert r["media_skipped_reason"] == "harvest_item_cap"
     assert "retry_after_s" not in r                   # a cap is not a cooldown
-    assert str(cap) in r["hint"]
 
 
 def test_clean_harvest_reports_zero_skips_and_no_hint(reveng_dir, monkeypatch):

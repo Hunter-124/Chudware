@@ -677,3 +677,136 @@ mission could never pass verification even on a perfect scan. It now carries a r
 
 > Repo-wide: every other DAG template still has prose in a verify node's `end_condition` and is
 > escalating the same way. Out of scope here — tracked separately.
+
+---
+
+## 13. Native Gaussian reconstruction — environment and stationary object capture
+
+This extension supersedes the Brush-as-mesh claims in §12. Gaussian reconstruction
+and measured CAD reconstruction are separate workflows. Brush produces a Gaussian
+PLY reference, **not a mesh or dimensionally verified CAD model**. The measured CAD
+mission uses OpenMVS and retains its sparse → scale confirmation → dense →
+dimension-review gates. Gaussian capture does not require or silently approve those
+gates; its units remain `"reconstruction"`.
+
+### 13.1 Local backend and inputs
+
+`services/vision/gaussian_pipeline.py` runs real COLMAP registration and image
+undistortion followed by headless Brush training. The maintained adapter is
+`services/vision/dense_backends.py`; it invokes Brush's positional dataset CLI and
+omits `--with-viewer`, so no external application window is required.
+
+Brush v0.3.0 is Apache-2.0, pinned to source commit
+`3edecbb2fe79d3e2c87eeab85b15e0b1dd10d486`. The Linux x86-64 release archive is
+SHA-256 `4f0f9a8785d1951c62df26aae247c02c5bba32b00f40b06df4e1c9b867399e20`.
+`scripts/provision_reveng.py` verifies and installs it; `--source-checkout PATH`
+checks out that exact source for local development. `BRUSH_BIN` selects a compatible
+locally modified build. Upstream: <https://github.com/ArthurBrussee/brush>.
+
+Photo ingest validates, copies and content-addresses accepted images within the
+session. Video ingest publishes bounded, decoded keyframes through the same
+canonical image store, reports truncation, and does not manufacture a mission
+`run_id`. Source-file removal does not invalidate already ingested frames.
+The native camera rejects synthetic, stale, repeated and blurred frames before
+ingest; continuous capture has one ingest request in flight and a session/generation
+binding, so changing rail selection cannot redirect frames into another session.
+
+### 13.2 Gaussian tools
+
+| Tool | Arguments and effect |
+|---|---|
+| `reveng_start_splat` | `session_id`, `mode="environment"`, `live=false`, `video_path=""`, `quality="normal"`, `iterations=2000`, `crop_bounds=null`. Starts an owned asynchronous reconstruction. `mode` is `environment` or `object`. |
+| `reveng_splat_status` | `session_id`. Returns current persisted state and the last validated artifact. |
+| `reveng_finish_splat` | `session_id`. Stops waiting for new views and requests a final pass over accepted frames. |
+| `reveng_cancel_splat` | `session_id`. Cancels the verified owned supervisor and trainer descendants; retains the last valid preview. |
+| `reveng_crop_splat` | `session_id`, `bounds=null`. Applies six reconstruction-coordinate bounds to the source Gaussian cloud; null restores the original artifact. |
+
+`object` means a stationary subject observed from multiple viewpoints plus explicit
+3D cropping. It does not promise automatic segmentation, a rotating-background
+turntable solution, moving-object reconstruction or 4D splatting.
+
+The public state includes `ok`, `session_id`, `run_id`, `status`, `stage`, `msg`,
+`mode`, `live`, `quality`, `frames`, `registered`, `iteration`, `total_iterations`,
+`pct`, `finish_requested`, `splat_path`, `source_splat_path`, `artifact_revision`,
+`bounds`, `crop_bounds`, `view_camera`, `units`, `backend`, and structured failure
+details (`error`, `reason`, `hint`). Not every field is populated before the first
+valid export. Process identities and ownership tokens are private.
+
+### 13.3 Progressive capture, publication and recovery
+
+Live capture begins reconstruction with at least six accepted images. At least
+three new images trigger another frozen snapshot; preview passes use at most
+250 iterations. Capture continues while these snapshots register and train.
+Finalize uses the requested full iteration budget on the accepted capture set.
+This is progressive batch reconstruction, **not video-rate SLAM, continuous pose
+tracking or resumed optimizer state**.
+
+States are `waiting`, `sparse`, `training`, `watching`, `finalizing`, `done`,
+`cancelled`, `failed`, or `interrupted`. A non-live final pass may remain
+`finalizing` while `stage` reports sparse registration or training. Missing
+dependencies, insufficient registration and invalid outputs are explicit failures,
+not fixture/model fallbacks.
+
+`services/reveng/gaussian_jobs.py` owns atomic `<session>/splat_job.json` state,
+immutable batch exports, a cross-process GPU reservation, and verified Linux
+process groups. PID, start identity and boot identity prevent cancellation from
+signalling reused/unrelated processes. Worker shutdown terminates and reaps owned
+descendants without reacquiring a lock from its signal handler. CAD missions and
+Gaussian jobs cannot concurrently mutate the same session.
+
+Each published PLY is validated before advancing `artifact_revision`. Training
+and loading share a **2,000,000-Gaussian limit**; the native loader also caps files
+at 2 GiB. Cancel, interrupted/restarted work and failed later batches retain the
+last complete artifact rather than exposing partially written files. Session
+status projects the Gaussian sidecar without rewriting capture-owned metadata.
+The rail's optional `gaussian` summary is independent of measured-CAD stage status.
+
+### 13.4 Native viewing and calibrated cameras
+
+The native renderer reads ASCII or little-endian binary PLY, log scales, wxyz
+quaternions, opacity logits and degree 0–3 spherical harmonics. It projects full
+anisotropic covariance, depth-sorts, and alpha-composites in the embedded workspace.
+It matches Brush's 15%-expanded frustum clamp in the projection Jacobian; offscreen
+depth-elongated Gaussians must not smear across the image.
+
+Each immutable SfM batch can publish a calibrated camera:
+
+```json
+{
+  "id": "immutable batch identity",
+  "eye": [0, 0, 0],
+  "forward": [0, 0, 1],
+  "up": [0, -1, 0],
+  "focus_distance": 1,
+  "intrinsics": [500, 500, 320, 240, 640, 480]
+}
+```
+
+These numbers illustrate the shape only. Production values come from a supported
+registered, undistorted capture camera and its visible positive-depth points.
+Camera metadata is published atomically with its matching validated PLY; an early
+or failed new batch cannot move the old cloud into a different SfM coordinate frame.
+Asynchronous UI loads are fenced by session, artifact and revision.
+
+The first view uses that capture calibration. Orbit, pan and wheel zoom remain
+interactive; **Capture view** restores it and **Frame splat bounds** explicitly
+fits the entire cloud. Wheel ownership prevents parent-panel scrolling. The GL
+pass keeps projection on the full preview rectangle and intersects its scissor
+with the visible ImGui clip rectangle. New-session and rail-refresh selection use
+session identity, never an unstable list index.
+
+### 13.5 Runtime provisioning
+
+Use the application's Python environment with the pinned `pycolmap==3.13.0`
+dependency, video decoding support, the provisioned Brush executable and a working
+Vulkan GPU driver. For a development checkout:
+
+```bash
+.venv-mcp/bin/python scripts/provision_reveng.py
+CHUDWARE_PYTHON="$PWD/.venv-mcp/bin/python" ./host/build-linux/bin/chudware
+```
+
+The compiled service dispatcher accepts `services.reveng.gaussian_jobs` and
+`services.vision.gaussian_pipeline` child commands; Linux packaging includes
+pycolmap. Process supervision is Linux-only. A source-dispatch smoke is not evidence
+that a Nuitka/AppImage release artifact has been built or tested.

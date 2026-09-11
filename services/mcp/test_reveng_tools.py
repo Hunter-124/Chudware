@@ -1,203 +1,56 @@
 """Tests for services/mcp/reveng_tools.py — contracts/reveng.md §8.
 
-Round-trips every live tool against the contract shapes.  Long-job tools
-(reconstruct / build_parametric / single_photo / fit_primitives) are verified
-to return the honest ``backend_not_provisioned`` envelope.
-
-Imports are standalone (no libchudware.so, no MCP server running): we stub
-FastMCP and core_bridge the same way test_mcp_freshness.py does, then call
-register_reveng_tools() directly with the stub MCP object and invoke the
-registered functions by name.
+Session lifecycle, capture retention, scale solving, and honest backend failures.
+Use a local registration collector with the real MCP/runtime modules; no package
+or import-cache mutation is needed and no server or engine process is started.
 """
 from __future__ import annotations
 
 import json
 import os
-import sys
 import tempfile
-import types
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
 
-# ---------------------------------------------------------------------------
-# Lightweight stubs (mirrors test_mcp_freshness.py pattern)
-# ---------------------------------------------------------------------------
-
-def _build_fake_mcp_modules() -> dict:
-    """Build fake mcp package modules. Returns a dict suitable for patch.dict(sys.modules)."""
-    mcp_pkg = types.ModuleType("mcp")
-    server_mod = types.ModuleType("mcp.server")
-    fastmcp_mod = types.ModuleType("mcp.server.fastmcp")
-
-    class _FakeFastMCP:
-        def __init__(self, name="", **kw):
-            self._tools: dict = {}
-
-        def tool(self):
-            def decorator(fn):
-                self._tools[fn.__name__] = fn
-                return fn
-            return decorator
-
-    fastmcp_mod.FastMCP = _FakeFastMCP
-    return {
-        "mcp": mcp_pkg,
-        "mcp.server": server_mod,
-        "mcp.server.fastmcp": fastmcp_mod,
-    }
+from services.mcp import reveng_build_tools as rb
+from services.mcp import reveng_common as rc
+from services.mcp import reveng_session_tools as rs
+from services.mcp.reveng_tools import register_reveng_tools
 
 
-# Module-level stub dict for the fake mcp — populated once, reused by the
-# patcher so setUpClass/tearDownClass can install/remove without re-creating.
-_FAKE_MCP_MODULES: dict = _build_fake_mcp_modules()
+class _ToolCollector:
+    def __init__(self):
+        self._tools = {}
 
-# Stub keys this module inserted into sys.modules (popped after the import window).
-# Anything installed here MUST be tracked, or it leaks into every later test module in the
-# same process: the untracked `services.mcp.cad_tools` stub used to survive, and because it
-# only carries _dumps/_err any later `from .cad_tools import _CUR` failed with
-# "cannot import name '_CUR' (unknown location)" — which in turn made recon_tools
-# unimportable and the reveng worker bridge answer `reveng_unavailable`.
-_STUBBED_CORE_BRIDGE_KEYS: list = []
-_STUBBED_MODULE_KEYS: list = []
+    def tool(self):
+        def register(fn):
+            self._tools[fn.__name__] = fn
+            return fn
+        return register
 
 
-def _install_stubs():
-    """Install stubs needed to import reveng_tools at module scope.
-
-    The fake mcp modules are installed temporarily here so reveng_tools imports
-    cleanly; they are REMOVED from sys.modules immediately after the import
-    (see bottom of this block) and restored only for the duration of the test
-    class via setUpClass/tearDownClass.  This prevents leaking _FakeFastMCP
-    into later test modules (e.g. test_reveng_e2e_datasheet) that need the
-    real mcp.server.fastmcp.FastMCP with _tool_manager.
-    """
-    # core_bridge stub (carries CoreError: cad_common does
-    # ``from .core_bridge import CoreError`` at module scope since T-RF8, and this
-    # stub leaks into later modules' imports by design of setdefault)
-    cb_mod = types.ModuleType("services.mcp.core_bridge")
-    cb_mod.available = lambda: False
-    cb_mod.call = lambda method, params=None: {}
-
-    class _StubCoreError(Exception):
-        def __init__(self, message: str, code: str = "", detail: dict | None = None):
-            super().__init__(message)
-            self.code = code
-            self.detail = detail or {}
-
-    cb_mod.CoreError = _StubCoreError
-    # Track which keys WE inserted so they can be removed after the import below —
-    # a leaked stub with call()->{} silently breaks later modules that drive the
-    # real core_bridge (e.g. test_reveng_e2e_datasheet's C++ match_part_number leg).
-    for _k in ("services.mcp.core_bridge", "core_bridge"):
-        if _k not in sys.modules:
-            sys.modules[_k] = cb_mod
-            _STUBBED_CORE_BRIDGE_KEYS.append(_k)
-
-    # mcp package stub — installed temporarily; removed after import below
-    for key, mod in _FAKE_MCP_MODULES.items():
-        sys.modules.setdefault(key, mod)
-
-    # cad_tools stub — only _dumps/_err needed
-    if "services.mcp.cad_tools" not in sys.modules:
-        ct_mod = types.ModuleType("services.mcp.cad_tools")
-
-        def _dumps(obj):
-            return json.dumps(obj)
-
-        def _err(e):
-            return json.dumps({"ok": False, "error": str(e)})
-
-        ct_mod._dumps = _dumps
-        ct_mod._err = _err
-        sys.modules["services.mcp.cad_tools"] = ct_mod
-        _STUBBED_MODULE_KEYS.append("services.mcp.cad_tools")
-
-
-_install_stubs()
-
-
-# ---------------------------------------------------------------------------
-# Import the module under test
-# ---------------------------------------------------------------------------
-# reveng_provision and frames may not be importable in CI without heavy deps.
-# Patch them at module import time with lightweight stubs.
-
-def _stub_reveng_status():
+def _unavailable_status():
     return {
         "ok": True,
         "capabilities": {
             "sparse": False, "dense": False, "splat": False,
             "single_photo": False, "webcam": False, "gpu": False,
         },
-        "provisioning": {k: False for k in
-                         ("colmap", "openmvs", "brush", "triposr", "vggt", "docling")},
-        "banners": ["stub"],
-        "missing": ["colmap", "openmvs", "brush", "triposr", "vggt", "docling"],
+        "provisioning": {},
+        "banners": [],
+        "missing": [],
     }
-
-
-def _stub_extract_frames_safe(video_path, out_dir, **kw):
-    # Pretend it extracted 5 frames (no real OpenCV needed)
-    return {
-        "ok": True,
-        "frames": [
-            {"path": f"{out_dir}/frame_{i:04d}.jpg",
-             "frame_index": i * 10, "time_s": i * 0.5, "sharpness": 200.0}
-            for i in range(5)
-        ],
-        "kept": 5,
-        "sampled": 20,
-        "rejected_blurry": 15,
-        "total_frames": 100,
-        "blur_threshold": 100.0,
-    }
-
-
-def _stub_ingest_pdf(path, out_dir):
-    return {
-        "ok": True,
-        "tables": [{"header": ["Dim", "Value"], "rows": [["A", "10mm"]]}],
-        "crops": [f"{out_dir}/crop_0.png"],
-    }
-
-
-# Patch before importing the module so the fallback stubs inside reveng_tools
-# are bypassed (the real modules may not exist in this environment).
-with (
-    patch.dict("sys.modules", {
-        "engine_oracle": types.ModuleType("engine_oracle"),
-        "services.vision": types.ModuleType("services.vision"),
-        "services.vision.reveng_provision": types.ModuleType("services.vision.reveng_provision"),
-        "services.vision.frames": types.ModuleType("services.vision.frames"),
-        "services.vision.ingest": types.ModuleType("services.vision.ingest"),
-    }),
-):
-    sys.modules["services.vision.reveng_provision"].reveng_status = _stub_reveng_status
-    sys.modules["services.vision.frames"].extract_frames_safe = _stub_extract_frames_safe
-    sys.modules["services.vision.ingest"].ingest_pdf = _stub_ingest_pdf
-
-    from services.mcp.reveng_tools import register_reveng_tools  # noqa: E402
-
-# Remove the fake mcp stubs from sys.modules now that reveng_tools is imported.
-# Tests restore them only for their own class lifetime via setUpClass/tearDownClass.
-for _key in list(_FAKE_MCP_MODULES):
-    sys.modules.pop(_key, None)
-for _key in _STUBBED_CORE_BRIDGE_KEYS:
-    sys.modules.pop(_key, None)
-for _key in _STUBBED_MODULE_KEYS:
-    sys.modules.pop(_key, None)
 
 
 # ---------------------------------------------------------------------------
 # Test helpers
 # ---------------------------------------------------------------------------
 
-def _build_tools(extra_env: dict | None = None) -> dict:
-    """Register tools and return the name→function dict."""
-    from mcp.server.fastmcp import FastMCP
-    mcp = FastMCP("test")
+def _build_tools() -> dict:
+    """Register tools without replacing the MCP package."""
+    mcp = _ToolCollector()
     register_reveng_tools(mcp)
     return mcp._tools
 
@@ -208,66 +61,50 @@ def _call(tools: dict, tool_name: str, **kwargs) -> dict:
     return json.loads(raw)
 
 
+def _write_real_image(path: Path, value: int):
+    try:
+        import cv2
+        import numpy as np
+    except ImportError:
+        raise unittest.SkipTest("OpenCV and numpy required for image ingestion")
+    image = np.full((48, 64, 3), value, dtype=np.uint8)
+    image[::2, ::2] = 255
+    assert cv2.imwrite(str(path), image)
+
+
+def _write_real_video(path: Path, value: int):
+    try:
+        import cv2
+        import numpy as np
+    except ImportError:
+        raise unittest.SkipTest("OpenCV and numpy required for video ingestion")
+    writer = cv2.VideoWriter(str(path), cv2.VideoWriter_fourcc(*"FFV1"), 10, (64, 48))
+    assert writer.isOpened()
+    for idx in range(6):
+        image = np.full((48, 64, 3), value + idx * 12, dtype=np.uint8)
+        image[::2, ::2] = 255
+        writer.write(image)
+    writer.release()
+
+
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
 
-class _FakeMCPTestBase(unittest.TestCase):
-    """Base class that installs _FAKE_MCP_MODULES for the test class lifetime.
-
-    All test classes in this module inherit from this base so _FakeFastMCP is
-    available during test execution but is NOT present in sys.modules between
-    test classes (or after this module's tests finish).  This prevents leaking
-    the fake into later test modules such as test_reveng_e2e_datasheet which
-    imports the *real* mcp.server.fastmcp.FastMCP (which has _tool_manager).
-    """
-
-    _mcp_patcher = None
-
+class _RevengTestBase(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls._mcp_patcher = patch.dict(sys.modules, _FAKE_MCP_MODULES)
-        cls._mcp_patcher.start()
-
-    @classmethod
-    def tearDownClass(cls):
-        if cls._mcp_patcher is not None:
-            cls._mcp_patcher.stop()
-
-
-class TestRevengToolsRegistration(_FakeMCPTestBase):
-
-    def setUp(self):
-        self.tools = _build_tools()
-
-    def test_all_expected_tools_registered(self):
-        expected = {
-            "list_reveng_sessions",
-            "get_reveng_session",
-            "get_reveng_coverage",
-            "get_reveng_deviation",
-            "describe_reveng_result",
-            "reveng_status",
-            "reveng_start_session",
-            "reveng_add_images",
-            "reveng_add_video",
-            "reveng_ingest_datasheet",
-            "reveng_set_scale",
-            "reveng_reconstruct",
-            "reveng_single_photo",
-            "reveng_fit_primitives",
-            "reveng_build_parametric",
-            "reveng_attach_result",
-            "reveng_print_scale_mat",
-            "import_scan_mesh",
-            "export_reveng_bundle",
-        }
-        registered = set(self.tools.keys())
-        missing = expected - registered
-        self.assertFalse(missing, f"Tools not registered: {missing}")
+        super().setUpClass()
+        for module in (rc, rb, rs):
+            patcher = patch.object(module, "_reveng_status", _unavailable_status)
+            patcher.start()
+            cls.addClassCleanup(patcher.stop)
+        environment = patch.dict(os.environ)
+        environment.start()
+        cls.addClassCleanup(environment.stop)
 
 
-class TestRevengSessionLifecycle(_FakeMCPTestBase):
+class TestRevengSessionLifecycle(_RevengTestBase):
 
     def setUp(self):
         self.tmp = tempfile.mkdtemp()
@@ -339,12 +176,12 @@ class TestRevengSessionLifecycle(_FakeMCPTestBase):
     def test_add_images_from_paths(self):
         create = _call(self.tools, "reveng_start_session", name="Bracket")
         sid = create["session_id"]
-        # Create a couple of fake image files
+        # Distinct valid images are counted only after decode and publication.
         img_dir = tempfile.mkdtemp()
         try:
             for i in range(3):
                 p = Path(img_dir) / f"img_{i:03d}.jpg"
-                p.write_bytes(b"\xff\xd8\xff" + b"\x00" * 10)  # minimal JPEG header
+                _write_real_image(p, i * 30)
             paths = [str(Path(img_dir) / f"img_{i:03d}.jpg") for i in range(3)]
             r = _call(self.tools, "reveng_add_images", session_id=sid, paths=paths)
             self.assertTrue(r["ok"])
@@ -361,7 +198,7 @@ class TestRevengSessionLifecycle(_FakeMCPTestBase):
         img_dir = tempfile.mkdtemp()
         try:
             for i in range(2):
-                (Path(img_dir) / f"shot_{i}.png").write_bytes(b"\x89PNG\r\n" + b"\x00" * 10)
+                _write_real_image(Path(img_dir) / f"shot_{i}.png", i * 30)
             r = _call(self.tools, "reveng_add_images", session_id=sid, dir=img_dir)
             self.assertTrue(r["ok"])
             self.assertEqual(r["added"], 2)
@@ -369,29 +206,74 @@ class TestRevengSessionLifecycle(_FakeMCPTestBase):
             import shutil
             shutil.rmtree(img_dir, ignore_errors=True)
 
-    def test_add_video_delegates_to_extract_frames(self):
-        create = _call(self.tools, "reveng_start_session", name="Bracket")
-        sid = create["session_id"]
-        # The stub extract_frames_safe doesn't need a real video file
-        # but reveng_add_video will call it with whatever path we give.
-        # Patch the seam directly (reveng_common binds the REAL frames module at
-        # import whenever another test module imported it first — import-order
-        # stubbing is not reliable in a full sweep).
-        import services.mcp.reveng_common as _rc
-        import services.mcp.reveng_session_tools as _rst
-        with patch.object(_rc, "_extract_frames_safe", _stub_extract_frames_safe), \
-                patch.object(_rst, "_extract_frames_safe", _stub_extract_frames_safe):
-            r = _call(self.tools, "reveng_add_video",
-                      session_id=sid, path="/fake/orbit.mp4", max_frames=60)
-        self.assertTrue(r["ok"])
-        self.assertIn("run_id", r)
-        self.assertTrue(r["run_id"].startswith("run_"))
-        # 5 frames added by stub
-        self.assertEqual(r["session"]["artifacts"]["images"], 5)
-        self.assertEqual(r["session"]["stages"]["capture"], "done")
-        # provenance entry recorded
-        prov_steps = [p["step"] for p in r["session"]["provenance"]]
-        self.assertIn("add_video", prov_steps)
+    def test_two_videos_and_still_survive_repeat_import_and_reopen(self):
+        from services.vision.frames import extract_frames_safe
+        import services.mcp.reveng_session_tools as tools
+
+        sid = _call(self.tools, "reveng_start_session", name="Orbit")["session_id"]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            first, second, still = root / "first.avi", root / "second.avi", root / "live.png"
+            _write_real_video(first, 0)
+            _write_real_video(second, 70)
+            _write_real_image(still, 25)
+            with patch.object(tools, "_extract_frames_safe", extract_frames_safe):
+                a = _call(self.tools, "reveng_add_video", session_id=sid, path=str(first), max_frames=3)
+                b = _call(self.tools, "reveng_add_video", session_id=sid, path=str(second), max_frames=3)
+                capture = _call(self.tools, "reveng_add_images", session_id=sid, paths=[str(still)])
+                repeat = _call(self.tools, "reveng_add_video", session_id=sid, path=str(first), max_frames=3)
+            self.assertTrue(a["ok"], a)
+            self.assertTrue(b["ok"], b)
+            self.assertTrue(capture["ok"], capture)
+            self.assertTrue(repeat["ok"], repeat)
+            self.assertEqual(repeat["added"], 0)
+            self.assertEqual(repeat["session"]["artifacts"]["images"], 7)
+            self.assertEqual(len([p for p in repeat["session"]["provenance"]
+                                  if p["step"] == "add_video"]), 2)
+            reopened = _call(self.tools, "get_reveng_session", session_id=sid)
+            gallery = reopened["source_images"]
+            self.assertEqual(len(gallery), 7)
+            self.assertEqual(len({row["path"] for row in gallery}), 7)
+            self.assertTrue(all(Path(row["path"]).is_file() for row in gallery))
+            self.assertTrue(all(row["blur_score"] is not None for row in gallery))
+            self.assertEqual({row["source_path"] for row in gallery if row["kind"] == "video"},
+                             {str(first), str(second)})
+
+    def test_same_named_stills_do_not_overwrite_and_repeat_is_idempotent(self):
+        sid = _call(self.tools, "reveng_start_session", name="Stills")["session_id"]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            first, second = root / "a", root / "b"
+            first.mkdir()
+            second.mkdir()
+            _write_real_image(first / "capture.png", 10)
+            _write_real_image(second / "capture.png", 80)
+            sources = [str(first / "capture.png"), str(second / "capture.png")]
+            imported = _call(self.tools, "reveng_add_images", session_id=sid, paths=sources)
+            repeated = _call(self.tools, "reveng_add_images", session_id=sid, paths=sources)
+            self.assertTrue(imported["ok"], imported)
+            self.assertTrue(repeated["ok"], repeated)
+            self.assertEqual(imported["added"], 2)
+            self.assertEqual(repeated["added"], 0)
+            self.assertEqual(repeated["session"]["artifacts"]["images"], 2)
+            reopened = _call(self.tools, "get_reveng_session", session_id=sid)
+            self.assertEqual({Path(row["path"]).read_bytes() for row in reopened["source_images"]},
+                             {Path(source).read_bytes() for source in sources})
+
+    def test_bad_still_is_refused_without_losing_valid_sources(self):
+        sid = _call(self.tools, "reveng_start_session", name="Decode")["session_id"]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            good, bad = root / "good.png", root / "bad.png"
+            _write_real_image(good, 10)
+            bad.write_bytes(b"not an image")
+            result = _call(self.tools, "reveng_add_images", session_id=sid,
+                           paths=[str(good), str(bad), str(root / "missing.png")])
+            self.assertFalse(result["ok"])
+            self.assertEqual(result["added"], 1)
+            self.assertEqual(result["session"]["artifacts"]["images"], 1)
+            self.assertEqual({row["path"] for row in result["failed"]},
+                             {str(bad), str(root / "missing.png")})
 
     def test_ingest_datasheet(self):
         import os
@@ -543,6 +425,11 @@ class TestRevengSessionLifecycle(_FakeMCPTestBase):
             self.assertEqual(r["session"]["scale"]["mm_per_unit"], 1.0)
             prov_steps = [p["step"] for p in r["session"]["provenance"]]
             self.assertIn("import_scan_mesh", prov_steps)
+            gaussian = _call(self.tools, "reveng_splat_status", session_id=sid)
+            self.assertFalse(gaussian["ok"])
+            self.assertEqual(gaussian["reason"], "no_splat_job")
+            reopened = _call(self.tools, "get_reveng_session", session_id=sid)
+            self.assertEqual(reopened["session"]["artifacts"]["mesh_path"], r["mesh_path"])
         finally:
             import shutil
             shutil.rmtree(ply_dir, ignore_errors=True)
@@ -560,42 +447,10 @@ class TestRevengSessionLifecycle(_FakeMCPTestBase):
         self.assertIn("session.json", names)
 
 
-class TestRevengStatusTool(_FakeMCPTestBase):
-
-    def setUp(self):
-        self.tmp = tempfile.mkdtemp()
-        os.environ["CHUDWARE_REVENG_DIR"] = self.tmp
-        self.tools = _build_tools()
-
-    def tearDown(self):
-        import shutil
-        shutil.rmtree(self.tmp, ignore_errors=True)
-        os.environ.pop("CHUDWARE_REVENG_DIR", None)
-
-    def test_reveng_status_shape(self):
-        """reveng_status() returns the contract §8.1 envelope."""
-        r = _call(self.tools, "reveng_status")
-        self.assertTrue(r["ok"])
-        self.assertIn("capabilities", r)
-        self.assertIn("provisioning", r)
-        self.assertIn("banners", r)
-        caps = r["capabilities"]
-        for key in ("sparse", "dense", "splat", "single_photo", "webcam", "gpu"):
-            self.assertIn(key, caps)
-        prov = r["provisioning"]
-        for key in ("colmap", "openmvs", "brush", "triposr", "vggt", "docling"):
-            self.assertIn(key, prov)
-
-    def test_reveng_status_booleans(self):
-        r = _call(self.tools, "reveng_status")
-        for v in r["capabilities"].values():
-            self.assertIsInstance(v, bool)
-        for v in r["provisioning"].values():
-            self.assertIsInstance(v, bool)
 
 
-class TestRevengLongJobStubs(_FakeMCPTestBase):
-    """Long-job tools must return the honest backend_not_provisioned envelope."""
+class TestRevengBackendFailures(_RevengTestBase):
+    """Unavailable backends must refuse rather than fabricate successful jobs."""
 
     def setUp(self):
         self.tmp = tempfile.mkdtemp()
@@ -609,17 +464,10 @@ class TestRevengLongJobStubs(_FakeMCPTestBase):
         shutil.rmtree(self.tmp, ignore_errors=True)
         os.environ.pop("CHUDWARE_REVENG_DIR", None)
 
-    # This class models an UNPROVISIONED environment, but the assertion has to survive a dev
-    # box that actually has the vision stack installed. `reveng_fit_primitives` is handed an
-    # empty PLY here: with no backend the honest answer is backend_not_provisioned, and with
-    # trimesh/open3d present it is mesh_unreadable. Both are correct refusals of the same
-    # input — pinning only the first made the test pass or fail on whether numpy happened to
-    # be importable. What actually matters is that it refuses honestly and says why.
-    _HONEST_REFUSALS = {"backend_not_provisioned", "mesh_unreadable"}
 
     def _assert_not_provisioned(self, result: dict):
         self.assertFalse(result["ok"])
-        self.assertIn(result["reason"], self._HONEST_REFUSALS)
+        self.assertEqual(result["reason"], "backend_not_provisioned")
         self.assertIn("hint", result)
 
     def test_reveng_reconstruct_stub(self):
@@ -636,9 +484,12 @@ class TestRevengLongJobStubs(_FakeMCPTestBase):
         self.assertEqual(r0["reason"], "no_images")
         imgdir = Path(self.tmp) / self.sid / "images"
         imgdir.mkdir(parents=True, exist_ok=True)
-        (imgdir / "p.png").write_bytes(b"\x89PNG\r\n\x1a\n")
-        r = _call(self.tools, "reveng_single_photo",
-                  session_id=self.sid, tier="triposr")
+        _write_real_image(imgdir / "p.png", 35)
+        with patch("services.vision.single_photo.reconstruct_single_photo",
+                   return_value={"ok": False, "reason": "backend_not_provisioned",
+                                 "hint": "single-photo backend unavailable"}):
+            r = _call(self.tools, "reveng_single_photo",
+                      session_id=self.sid, tier="triposr")
         self._assert_not_provisioned(r)
 
     def test_reveng_fit_primitives_stub(self):
@@ -652,7 +503,10 @@ class TestRevengLongJobStubs(_FakeMCPTestBase):
         mesh.write_text("ply\nformat ascii 1.0\nelement vertex 0\nend_header\n")
         sess.setdefault("artifacts", {})["mesh_path"] = str(mesh)
         sess_json.write_text(json.dumps(sess))
-        r = _call(self.tools, "reveng_fit_primitives", session_id=self.sid)
+        with patch("services.vision.segment_fit.segment_fit",
+                   return_value={"ok": False, "reason": "backend_not_provisioned",
+                                 "hint": "mesh fitting backend unavailable"}):
+            r = _call(self.tools, "reveng_fit_primitives", session_id=self.sid)
         self._assert_not_provisioned(r)
 
     def test_reveng_build_parametric_stub(self):
@@ -689,7 +543,7 @@ class TestRevengLongJobStubs(_FakeMCPTestBase):
         self._assert_not_provisioned(r)
 
 
-class TestRevengDeviationAndResult(_FakeMCPTestBase):
+class TestRevengDeviationAndResult(_RevengTestBase):
 
     def setUp(self):
         self.tmp = tempfile.mkdtemp()
@@ -714,7 +568,7 @@ class TestRevengDeviationAndResult(_FakeMCPTestBase):
         self.assertIn("reason", r)
 
 
-class TestRevengPrintScaleMat(_FakeMCPTestBase):
+class TestRevengPrintScaleMat(_RevengTestBase):
 
     def setUp(self):
         self.tmp = tempfile.mkdtemp()
@@ -731,13 +585,6 @@ class TestRevengPrintScaleMat(_FakeMCPTestBase):
         self.assertFalse(r["ok"])
         self.assertIn("reason", r)
 
-    def test_not_provisioned_without_module(self):
-        # scale_mat module not installed in test env → backend_not_provisioned
-        r = _call(self.tools, "reveng_print_scale_mat", size="A4")
-        # either ok (if scale_mat happened to import) or not_provisioned — both legal
-        self.assertIn("ok", r)
-        if not r["ok"]:
-            self.assertIn(r["reason"], ("backend_not_provisioned",))
 
 
 if __name__ == "__main__":

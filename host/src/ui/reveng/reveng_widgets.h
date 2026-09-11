@@ -145,6 +145,8 @@ ImRect Viewport3DPreview(const char* id, const ImVec2& box, PreviewSlot slot,
 // Rect published by the most recent Viewport3DPreview() for `slot` this frame, plus whether it
 // was drawn at all. app.cpp's post-ImGui GL pass consumes these instead of hardcoding regions.
 bool  previewSlotRect(PreviewSlot slot, ImRect& out);
+// Visible scissor clip, separate from the full rect that defines camera projection.
+bool  previewSlotClip(PreviewSlot slot, ImRect& out);
 void  resetPreviewSlots();   // call once per frame before drawing the workspace
 
 // ---- empty / error states ------------------------------------------------------------------------

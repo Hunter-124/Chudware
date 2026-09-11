@@ -172,12 +172,24 @@ def _make_session(session_id: str, name: str, part_ref: Optional[str]) -> dict:
     }
 
 
-def _load_session(session_id: str) -> Optional[dict]:
+def _load_session(session_id: str, *, merge_gaussian: bool = True) -> Optional[dict]:
     p = _session_json_path(session_id)
     if not p.exists():
         return None
     try:
-        return _json.loads(p.read_text())
+        session = _json.loads(p.read_text())
+        if not isinstance(session, dict):
+            return None
+        from services.reveng.gaussian_jobs import status as splat_status
+        gaussian = splat_status(session_id) if merge_gaussian else {}
+        if gaussian.get("run_id"):
+            session["gaussian"] = gaussian
+            artifacts = session.setdefault("artifacts", {})
+            for key in ("splat_path", "sparse_dir"):
+                value = gaussian.get(key)
+                if value:
+                    artifacts[key] = str(_Path(value).resolve())
+        return session
     except Exception:
         return None
 
@@ -187,19 +199,45 @@ def _save_session(session: dict) -> None:
     root = _session_path(sid)
     root.mkdir(parents=True, exist_ok=True)
     session["updated_at"] = _now_iso()
-    _session_json_path(sid).write_text(_json.dumps(session, indent=2))
+    from services.reveng.gaussian_jobs import _atomic, _read
+    stored = dict(session)
+    gaussian = stored.pop("gaussian", None)
+    if isinstance(gaussian, dict) and gaussian.get("run_id"):
+        # Projection is read-only. A later capture save must not bake Gaussian
+        # sparse coordinates into the CAD mission's own artifact namespace.
+        previous = _read(_session_json_path(sid)).get("artifacts") or {}
+        artifacts = dict(stored.get("artifacts") or {})
+        for key in ("splat_path", "sparse_dir"):
+            if gaussian.get(key) and artifacts.get(key) == gaussian[key]:
+                if key in previous:
+                    artifacts[key] = previous[key]
+                else:
+                    artifacts.pop(key, None)
+        stored["artifacts"] = artifacts
+    _atomic(_session_json_path(sid), stored)
 
 
 def _session_summary(s: dict) -> dict:
-    return {
+    summary = {
         "session_id": s["session_id"],
         "name": s["name"],
         "status": s["status"],
         "created_at": s["created_at"],
         "updated_at": s["updated_at"],
         "part_ref": s.get("part_ref"),
-        "images": s.get("artifacts", {}).get("images", 0),
+        "images": len(_session_image_paths(s["session_id"])),
     }
+    gaussian = s.get("gaussian")
+    if isinstance(gaussian, dict) and gaussian.get("run_id"):
+        summary["gaussian"] = {
+            "status": gaussian.get("status", ""),
+            "stage": gaussian.get("stage", ""),
+            "mode": gaussian.get("mode", ""),
+            "frames": gaussian.get("frames", 0),
+            "registered": gaussian.get("registered", 0),
+            "pct": gaussian.get("pct", 0),
+        }
+    return summary
 
 
 # ── backend_not_provisioned stub ─────────────────────────────────────────────
@@ -441,7 +479,7 @@ def _autosolve_scale(session_id: str) -> dict:
     failure is reported rather than fatal: the gate still runs, and the mission may
     proceed unscaled with an honest ``mesh_units: "reconstruction"``.
     """
-    s = _load_session(session_id) or {}
+    s = _load_session(session_id, merge_gaussian=False) or {}
     existing = (s.get("scale") or {}).get("mm_per_unit")
     try:
         if existing is not None and float(existing) > 0.0:
@@ -627,7 +665,7 @@ def _make_pipeline_agent_fn(
                 sparse_result.get("sparse_dir")
                 or str(_Path(session_dir) / "sparse")
             )
-            s = _load_session(session_id) or _make_session(session_id, session_id, None)
+            s = _load_session(session_id, merge_gaussian=False) or _make_session(session_id, session_id, None)
             s.setdefault("artifacts", {})
             s["artifacts"]["sparse_dir"] = sparse_dir
             s["stages"]["reconstruct"] = "running"
@@ -646,7 +684,7 @@ def _make_pipeline_agent_fn(
             require_confirmed_scale: bool,
             provenance_step: str,
         ) -> tuple[bool, str, dict]:
-            """Dense MVS / splat + mesh cleanup. Returns ``(ok, reason, payload)``.
+            """Dense MVS + mesh cleanup. Returns ``(ok, reason, payload)``.
 
             ``require_confirmed_scale`` decides which scales may touch the geometry.
             On the gated template path the scale-confirm gate is immediately upstream,
@@ -658,7 +696,7 @@ def _make_pipeline_agent_fn(
             ``artifacts.mesh_units`` says exactly that.
             """
             session_dir = str(_session_path(session_id))
-            s = _load_session(session_id) or _make_session(session_id, session_id, None)
+            s = _load_session(session_id, merge_gaussian=False) or _make_session(session_id, session_id, None)
             if not sparse_dir:
                 sparse_dir = (s.get("artifacts") or {}).get("sparse_dir")
             if not sparse_dir:
@@ -667,11 +705,10 @@ def _make_pipeline_agent_fn(
                     "hint": "run the n_sparse node (reveng_reconstruct) first",
                 }
 
-            # Dense: OpenMVS and/or Brush — first success wins for mesh_path.
+            # CAD reconstruction requires an actual mesh. Brush belongs exclusively
+            # to gaussian_jobs; a Gaussian PLY is never a mesh reconstruction.
             mesh_path: Optional[str] = None
-            splat_path: Optional[str] = None
             dense_notes: list = []
-            dense_ok = False
 
             if _os.environ.get("OPENMVS_BIN"):
                 _progress("dense", 45, "dense MVS (OpenMVS) started")
@@ -680,7 +717,6 @@ def _make_pipeline_agent_fn(
                     omvs = run_openmvs(sparse_dir, session_dir) or {}
                     if omvs.get("ok") and omvs.get("mesh_path"):
                         mesh_path = omvs["mesh_path"]
-                        dense_ok = True
                         dense_notes.append("openmvs")
                         _progress("dense", 55, "dense MVS complete", mesh_path)
                     else:
@@ -690,41 +726,19 @@ def _make_pipeline_agent_fn(
                 except Exception as exc:  # noqa: BLE001
                     dense_notes.append(f"openmvs_import:{exc}")
 
-            # Brush when provisioned (BRUSH_BIN) — also yields splat.
-            if _os.environ.get("BRUSH_BIN") or caps.get("splat"):
-                _progress("splat", 58, "gaussian splat (Brush) started")
-                try:
-                    from services.vision.dense_backends import run_brush  # noqa: PLC0415
-                    brush = run_brush(sparse_dir, session_dir) or {}
-                    if brush.get("ok"):
-                        dense_ok = True
-                        dense_notes.append("brush")
-                        if brush.get("splat_path"):
-                            splat_path = brush["splat_path"]
-                        if not mesh_path and brush.get("mesh_path"):
-                            mesh_path = brush["mesh_path"]
-                        _progress("splat", 60, "gaussian splat complete", splat_path)
-                    else:
-                        dense_notes.append(
-                            f"brush:{brush.get('reason') or 'failed'}"
-                        )
-                except Exception as exc:  # noqa: BLE001
-                    dense_notes.append(f"brush_import:{exc}")
-
-            if not dense_ok and not mesh_path:
+            if not mesh_path:
                 # Sparse-only is not a full reconstruct success for the mesh path,
                 # but if sparse ok we still report honest partial.
-                s = _load_session(session_id) or s
+                s = _load_session(session_id, merge_gaussian=False) or s
                 s.setdefault("artifacts", {})
                 s["artifacts"]["sparse_dir"] = sparse_dir
-                if splat_path:
-                    s["artifacts"]["splat_path"] = splat_path
                 _save_session(s)
-                return False, "backend_not_provisioned: dense", {
+                return False, "no_mesh", {
                     "sparse": sparse_result,
                     "dense_notes": dense_notes,
                     "used_ffwd": used_ffwd,
-                    "hint": "set OPENMVS_BIN and/or BRUSH_BIN; check reveng_status()",
+                    "hint": "Configure OPENMVS_BIN for CAD mesh reconstruction; "
+                            "use reveng_start_splat for the separate Gaussian workflow.",
                 }
 
             # Mesh cleanup when we have a mesh.
@@ -744,7 +758,7 @@ def _make_pipeline_agent_fn(
                     )
                     _Path(out_clean).parent.mkdir(parents=True, exist_ok=True)
                     mm_per_unit = None
-                    scale_block = (_load_session(session_id) or {}).get("scale") or {}
+                    scale_block = (_load_session(session_id, merge_gaussian=False) or {}).get("scale") or {}
                     try:
                         raw_scale = scale_block.get("mm_per_unit")
                         if raw_scale is not None:
@@ -777,7 +791,7 @@ def _make_pipeline_agent_fn(
                     dense_notes.append(f"cleanup_import:{exc}")
 
             mesh_units = "reconstruction" if mesh_unscaled else "mm"
-            s = _load_session(session_id) or s
+            s = _load_session(session_id, merge_gaussian=False) or s
             s.setdefault("artifacts", {})
             s["artifacts"]["sparse_dir"] = sparse_dir
             if cleaned:
@@ -785,8 +799,6 @@ def _make_pipeline_agent_fn(
                 # Honest units tag: consumers (fit / parametric / GUI) must not read a
                 # reconstruction-unit mesh as millimetres.
                 s["artifacts"]["mesh_units"] = mesh_units
-            if splat_path:
-                s["artifacts"]["splat_path"] = splat_path
             s["stages"]["reconstruct"] = "done"
             s["provenance"].append({
                 "step": provenance_step,
@@ -802,7 +814,7 @@ def _make_pipeline_agent_fn(
                 "sparse": sparse_result,
                 "mesh_path": cleaned,
                 "mesh_units": mesh_units,
-                "splat_path": splat_path,
+                "splat_path": None,
                 "used_ffwd": used_ffwd,
                 "dense_notes": dense_notes,
             }
@@ -822,7 +834,7 @@ def _make_pipeline_agent_fn(
         # therefore the human's decision, never an assumption — a reject never gets
         # here (the handler returns paused without dispatching the agent).
         if node_id == "n_scale_gate":
-            s = _load_session(session_id)
+            s = _load_session(session_id, merge_gaussian=False)
             if s is None:
                 return _Result(False, f"session {session_id!r} not found")
             scale = s.setdefault("scale", {})
@@ -869,9 +881,9 @@ def _make_pipeline_agent_fn(
                 "method": scale.get("method"),
             })
 
-        # ── n_dense: dense/splat/mesh with the CONFIRMED scale ───────────────
+        # ── n_dense: CAD mesh with the CONFIRMED scale ──────────────────────
         if node_id == "n_dense":
-            s = _load_session(session_id) or {}
+            s = _load_session(session_id, merge_gaussian=False) or {}
             sparse_dir = (s.get("artifacts") or {}).get("sparse_dir")
             ok, reason, payload = _run_dense(
                 {}, sparse_dir, False,
@@ -903,7 +915,7 @@ def _make_pipeline_agent_fn(
 
         # ── Primitive fit ────────────────────────────────────────────────────
         if node_id in ("n_fit",):
-            s = _load_session(session_id)
+            s = _load_session(session_id, merge_gaussian=False)
             if s is None:
                 return _Result(False, f"session {session_id!r} not found")
             mesh_path = (s.get("artifacts") or {}).get("mesh_path")
@@ -950,7 +962,7 @@ def _make_pipeline_agent_fn(
 
         # ── Parametric rebuild ───────────────────────────────────────────────
         if node_id in ("n_parametric", "n_iterate"):
-            s = _load_session(session_id)
+            s = _load_session(session_id, merge_gaussian=False)
             if s is None:
                 return _Result(False, f"session {session_id!r} not found")
             mesh_path = (s.get("artifacts") or {}).get("mesh_path")
@@ -1032,7 +1044,7 @@ def _make_pipeline_agent_fn(
                     if re_res.get("ok") and re_res.get("doc_id"):
                         doc_id = re_res["doc_id"]
                         ml = {**ml, "reverse_engineer": re_res}
-                s = _load_session(session_id) or s
+                s = _load_session(session_id, merge_gaussian=False) or s
                 s.setdefault("artifacts", {})
                 if doc_id:
                     s["artifacts"]["doc_id"] = doc_id
@@ -1075,7 +1087,7 @@ def _make_pipeline_agent_fn(
                     re_res,
                 )
             doc_id = re_res.get("doc_id")
-            s = _load_session(session_id) or s
+            s = _load_session(session_id, merge_gaussian=False) or s
             s.setdefault("artifacts", {})
             if doc_id:
                 s["artifacts"]["doc_id"] = doc_id
@@ -1190,7 +1202,7 @@ def _run_summary(rec: dict) -> dict:
 def _record_session_run(rec: dict) -> None:
     """Mirror the run record onto session.json — the progress source of truth."""
     try:
-        s = _load_session(rec.get("session_id") or "")
+        s = _load_session(rec.get("session_id") or "", merge_gaussian=False)
         if s is None:
             return
         s["run"] = _run_summary(rec)
@@ -1258,6 +1270,10 @@ def _reserve_mission(session_id: str, run_id: str) -> Optional[str]:
         entry = _MISSION_THREADS.get(session_id)
         if _slot_busy(entry):
             return entry[0]
+        from services.reveng.gaussian_jobs import active_run
+        splat_run = active_run(_session_path(session_id))
+        if splat_run:
+            return splat_run
         _MISSION_THREADS[session_id] = (run_id, None)
     return None
 
@@ -1416,7 +1432,7 @@ def _find_session_run(session_id: str) -> Optional[dict]:
     back to scanning the runs dir so a mission launched before the pointer existed is
     still addressable.
     """
-    s = _load_session(session_id)
+    s = _load_session(session_id, merge_gaussian=False)
     run_id = ((s or {}).get("run") or {}).get("run_id")
     if run_id:
         rec = _read_run_record(str(run_id))

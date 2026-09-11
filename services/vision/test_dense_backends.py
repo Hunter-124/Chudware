@@ -1,13 +1,15 @@
 """Tests for services/vision/dense_backends.py.
 
-These tests PASS without OpenMVS or Brush installed.  They verify:
-  1. Correct command-line construction (arg order, I/O paths).
-  2. Graceful backend_not_provisioned envelope when binaries are absent.
+Tests run without OpenMVS or Brush installed. Brush subprocess doubles exercise
+observable failure, complete-output publication, and cancellation boundaries.
 """
 from __future__ import annotations
 
 import os
 import sys
+import textwrap
+import time
+from pathlib import Path
 
 import pytest
 
@@ -15,7 +17,6 @@ import pytest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
 from ..vision.dense_backends import (
-    brush_commands,
     openmvs_commands,
     run_brush,
     run_openmvs,
@@ -25,7 +26,6 @@ SPARSE = "/session/sparse/0"
 SESSION = "/session"
 DENSE_DIR = "/session/dense"
 MESH_DIR = "/session/mesh"
-SPLAT_DIR = "/session/splat"
 
 
 # ---------------------------------------------------------------------------
@@ -41,8 +41,6 @@ def _set_openmvs(monkeypatch, path="/fake/openmvs/bin"):
     monkeypatch.setenv("OPENMVS_BIN", path)
 
 
-def _set_brush(monkeypatch, path="/fake/brush"):
-    monkeypatch.setenv("BRUSH_BIN", path)
 
 
 # ---------------------------------------------------------------------------
@@ -65,16 +63,9 @@ class TestNotProvisioned:
         assert result["reason"] == "backend_not_provisioned"
         assert result["backend"] == "openmvs"
 
-    def test_brush_commands_not_provisioned(self, monkeypatch):
+    def test_run_brush_not_provisioned(self, monkeypatch, tmp_path):
         _clear_bins(monkeypatch)
-        result = brush_commands(SPARSE, SESSION)
-        assert result["ok"] is False
-        assert result["reason"] == "backend_not_provisioned"
-        assert result["backend"] == "brush"
-        assert "BRUSH_BIN" in result["hint"]
-
-    def test_run_brush_not_provisioned(self, monkeypatch):
-        _clear_bins(monkeypatch)
+        monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path))
         result = run_brush(SPARSE, SESSION)
         assert result["ok"] is False
         assert result["reason"] == "backend_not_provisioned"
@@ -181,69 +172,130 @@ class TestOpenMVSCommands:
             assert prev_out == this_in, f"Chain broken between step {i-1} and {i}"
 
 
-# ---------------------------------------------------------------------------
-# Brush command-line construction
-# ---------------------------------------------------------------------------
+@pytest.fixture
+def brush_dataset(tmp_path):
+    dataset = tmp_path / "dataset"
+    model = dataset / "sparse/0"
+    model.mkdir(parents=True)
+    (dataset / "images").mkdir()
+    for name in ("cameras", "images", "points3D"):
+        (model / (name + ".txt")).write_text("# model\n")
+    return model, tmp_path / "session", dataset
 
-class TestBrushCommands:
-    BIN = "/usr/local/bin/brush"
 
-    def setup_method(self):
-        os.environ["BRUSH_BIN"] = self.BIN
+@pytest.fixture
+def brush_process(tmp_path, monkeypatch):
+    """Executable double produces real scalar Gaussian PLY, never engine fixtures."""
+    executable = tmp_path / "brush"
+    executable.write_text("#!" + sys.executable + "\n" + textwrap.dedent("""
+        import os, pathlib, struct, sys, time
+        args = sys.argv
+        out = pathlib.Path(args[args.index("--export-path") + 1])
+        steps = int(args[args.index("--total-steps") + 1])
+        mode = os.environ.get("BRUSH_TEST_MODE", "valid")
+        props = ["x", "y", "z", "opacity", "scale_0", "scale_1", "scale_2",
+                 "rot_0", "rot_1", "rot_2", "rot_3", "f_dc_0", "f_dc_1", "f_dc_2"]
+        header = ("ply\\nformat binary_little_endian 1.0\\nelement vertex 1\\n" +
+                  "".join("property float " + p + "\\n" for p in props) + "end_header\\n").encode()
+        payload = struct.pack("<14f", 1, 2, 3, 0, -1, -2, -3, 1, 0, 0, 0, .2, .4, .6)
+        path = out / ("export_%d.ply" % steps)
+        if mode == "missing":
+            sys.exit(0)
+        if mode == "cancel":
+            pathlib.Path(os.environ["BRUSH_TEST_PID"]).write_text(str(os.getpid()))
+            time.sleep(60)
+        if mode != "progress":
+            path.write_bytes(header if mode == "truncated" else header + payload)
+        if mode == "failed":
+            print("GPU initialization failed", flush=True)
+            sys.exit(7)
+        if mode == "progress":
+            intermediate = out / "export_1.ply"
+            intermediate.write_bytes(header)
+            time.sleep(1.3)
+            intermediate.write_bytes(header + payload)
+            time.sleep(1.3)
+            path.write_bytes(header + payload)
+    """))
+    executable.chmod(0o755)
+    monkeypatch.setenv("BRUSH_BIN", str(executable))
+    return executable
 
-    def teardown_method(self):
-        os.environ.pop("BRUSH_BIN", None)
 
-    def test_returns_ok(self):
-        result = brush_commands(SPARSE, SESSION)
-        assert result["ok"] is True
-        assert result["backend"] == "brush"
+def test_brush_rejects_invalid_override_even_with_managed_install(tmp_path, monkeypatch):
+    from .reveng_provision import brush_install_dir, brush_executable
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path))
+    managed = brush_install_dir() / "brush_app"
+    managed.parent.mkdir(parents=True)
+    managed.write_text("#!/bin/sh\nexit 0\n")
+    managed.chmod(0o755)
+    assert brush_executable() == str(managed)
+    monkeypatch.setenv("BRUSH_BIN", str(tmp_path / "missing"))
+    assert brush_executable() is None
 
-    def test_two_commands_by_default(self):
-        result = brush_commands(SPARSE, SESSION)
-        assert len(result["commands"]) == 2
 
-    def test_one_command_when_no_mesh_export(self):
-        result = brush_commands(SPARSE, SESSION, export_mesh=False)
-        assert len(result["commands"]) == 1
+@pytest.mark.parametrize("mode,reason", [
+    ("missing", "invalid_brush_output"),
+    ("truncated", "invalid_brush_output"),
+    ("failed", "brush_failed"),
+])
+def test_brush_does_not_report_false_success(brush_dataset, brush_process, monkeypatch, mode, reason):
+    model, session, dataset = brush_dataset
+    monkeypatch.setenv("BRUSH_TEST_MODE", mode)
+    result = run_brush(str(model), str(session), image_dir=str(dataset), max_steps=2)
+    assert result["ok"] is False
+    assert result["reason"] == reason
+    if mode == "failed":
+        assert result["returncode"] == 7
+        assert "GPU initialization failed" in result["hint"]
 
-    def test_train_command_structure(self):
-        cmds = brush_commands(SPARSE, SESSION)["commands"]
-        train = cmds[0]
-        assert train[0] == self.BIN
-        assert train[1] == "train"
-        sp_idx = train.index("--source-path")
-        assert train[sp_idx + 1] == SPARSE
-        mp_idx = train.index("--model-path")
-        assert train[mp_idx + 1].startswith(SPLAT_DIR)
-        ply_idx = train.index("--output-ply")
-        assert train[ply_idx + 1].endswith(".ply")
-        iter_idx = train.index("--iterations")
-        assert train[iter_idx + 1] == "30000"
 
-    def test_train_custom_steps(self):
-        cmds = brush_commands(SPARSE, SESSION, max_steps=10_000)["commands"]
-        train = cmds[0]
-        iter_idx = train.index("--iterations")
-        assert train[iter_idx + 1] == "10000"
+def test_brush_publishes_complete_immutable_output(brush_dataset, brush_process, monkeypatch):
+    from .gaussian_pipeline import inspect_splat
+    model, session, dataset = brush_dataset
+    monkeypatch.setenv("BRUSH_TEST_MODE", "progress")
+    snapshots = {}
 
-    def test_export_mesh_command_structure(self):
-        cmds = brush_commands(SPARSE, SESSION)["commands"]
-        export = cmds[1]
-        assert export[0] == self.BIN
-        assert export[1] == "export-mesh"
-        # --splat must match the train --output-ply
-        train_ply = cmds[0][cmds[0].index("--output-ply") + 1]
-        splat_idx = export.index("--splat")
-        assert export[splat_idx + 1] == train_ply
-        # --output goes to mesh dir
-        out_idx = export.index("--output")
-        assert export[out_idx + 1].startswith(MESH_DIR)
-        # method is tsdf
-        m_idx = export.index("--method")
-        assert export[m_idx + 1] == "tsdf"
+    def progress(stage, pct, msg, artifact=None):
+        if artifact:
+            path = Path(artifact["splat_path"])
+            assert inspect_splat(str(path))["count"] == 1
+            data = path.read_bytes()
+            assert snapshots.get(path, data) == data
+            snapshots[path] = data
 
-    def test_brush_bin_in_all_commands(self):
-        cmds = brush_commands(SPARSE, SESSION)["commands"]
-        for cmd in cmds:
-            assert cmd[0] == self.BIN
+    result = run_brush(str(model), str(session), image_dir=str(dataset),
+                       max_steps=2, export_every=1, progress=progress)
+    assert result["ok"] is True
+    assert result["iteration"] == 2
+    assert result["bounds"] == [1, 2, 3, 1, 2, 3]
+    assert result["mesh_path"] is None
+    assert {p.name for p in snapshots} == {"export_1.ply", "export_2.ply"}
+    for path, data in snapshots.items():
+        assert path.read_bytes() == data
+
+
+def test_brush_cancel_reaps_process(brush_dataset, brush_process, monkeypatch, tmp_path):
+    model, session, dataset = brush_dataset
+    pid_file = tmp_path / "pid"
+    monkeypatch.setenv("BRUSH_TEST_MODE", "cancel")
+    monkeypatch.setenv("BRUSH_TEST_PID", str(pid_file))
+    start = time.monotonic()
+    result = run_brush(str(model), str(session), image_dir=str(dataset), max_steps=2,
+                       cancel=lambda: pid_file.exists() or time.monotonic() - start > 10)
+    assert result["reason"] == "cancelled"
+    assert result["ok"] is False
+    pid = int(pid_file.read_text())
+    with pytest.raises(ProcessLookupError):
+        os.kill(pid, 0)
+
+
+def test_brush_cannot_reuse_prior_success(brush_dataset, brush_process, monkeypatch):
+    model, session, dataset = brush_dataset
+    good = run_brush(str(model), str(session), image_dir=str(dataset), max_steps=2)
+    assert good["ok"] is True
+    previous = Path(good["splat_path"]).read_bytes()
+    monkeypatch.setenv("BRUSH_TEST_MODE", "missing")
+    failed = run_brush(str(model), str(session), image_dir=str(dataset), max_steps=2)
+    assert failed["ok"] is False
+    assert Path(good["splat_path"]).read_bytes() == previous

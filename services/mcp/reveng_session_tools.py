@@ -8,7 +8,8 @@ import json as _json
 import math as _math
 import os as _os
 import re as _re
-import secrets as _secrets
+import hashlib as _hashlib
+import tempfile as _tempfile
 import shutil as _shutil
 
 from .cad_common import coerce_json_or_repr, require_list, require_mapping
@@ -694,6 +695,86 @@ def collect_session_dims(session_id: str) -> dict:
     return out
 
 
+def _ingest_stills(session_id: str, session: dict, sources: list) -> tuple:
+    """Publish verified stills atomically without overwriting same-named sources."""
+    from services.vision.fiducial import require_cv2
+    from services.vision.frames import blur_score
+
+    cv2 = require_cv2()
+    root = _session_path(session_id).resolve()
+    images_dir = root / "images"
+    images_dir.mkdir(parents=True, exist_ok=True)
+    before = set(_session_image_paths(session_id))
+    rows = {r["path"]: r for r in session.get("source_images", []) if r.get("path")}
+    accepted, failed = [], []
+    for source in dict.fromkeys(str(_Path(p).expanduser().resolve()) for p in sources):
+        src = _Path(source)
+        try:
+            if not src.is_file():
+                raise FileNotFoundError(f"image not found: {src}")
+            if src.suffix.lower() not in (".jpg", ".jpeg", ".png", ".tif", ".tiff", ".bmp", ".webp"):
+                raise ValueError(f"unsupported image type: {src.suffix}")
+            image = cv2.imread(str(src))
+            if image is None or image.size == 0:
+                raise ValueError(f"could not decode image: {src}")
+            score = float(blur_score(image))
+            if not _math.isfinite(score):
+                raise ValueError(f"invalid image sharpness: {src}")
+            with src.open("rb") as stream:
+                digest = _hashlib.file_digest(stream, "sha256").hexdigest()
+            # Captures already published inside this session remain in place.
+            dest = src if src.parent in (images_dir, root / "frames") else (
+                images_dir / f"still_{digest}{src.suffix.lower()}"
+            )
+            if not dest.is_file() or dest.stat().st_size == 0:
+                temporary = None
+                try:
+                    with _tempfile.NamedTemporaryFile(prefix=".ingest-", dir=images_dir, delete=False) as stream:
+                        temporary = _Path(stream.name)
+                        with src.open("rb") as input_stream:
+                            _shutil.copyfileobj(input_stream, stream)
+                    _os.replace(temporary, dest)
+                finally:
+                    if temporary is not None:
+                        temporary.unlink(missing_ok=True)
+            path = str(dest)
+            row = rows.setdefault(path, {"path": path, "source_path": source, "source_paths": []})
+            if source not in row.setdefault("source_paths", []):
+                row["source_paths"].append(source)
+            row.update(blur_score=round(score, 3), content_sha256=digest, kind="image")
+            session.setdefault("analysis", {}).setdefault("blur", {})[path] = {
+                "sig": _file_sig(dest), "score": round(score, 3),
+            }
+            accepted.append(dict(row, source_path=source))
+        except Exception as exc:
+            failed.append({"path": source, "reason": str(exc)})
+    session["source_images"] = list(rows.values())
+    current = set(_session_image_paths(session_id))
+    session["artifacts"]["images"] = len(current)
+    session["stages"]["capture"] = "done" if current else "idle"
+    return len({row["path"] for row in accepted} - before), accepted, failed
+
+
+def _source_image_gallery(session_id: str, session: dict) -> list:
+    """Rehydrate the gallery from files, retaining video-frame provenance."""
+    paths = _session_image_paths(session_id)
+    rows = {r["path"]: dict(r) for r in session.get("source_images", []) if r.get("path")}
+    for entry in session.get("provenance", []):
+        for frame in entry.get("frames", []):
+            if isinstance(frame, dict) and frame.get("path"):
+                rows.setdefault(frame["path"], dict(frame, kind="video"))
+    scores, _, _ = _score_session_blur(session, paths)
+    gallery = []
+    for path in paths:
+        row = rows.get(path, {"path": path, "kind": "video" if _Path(path).parent.name == "frames" else "image"})
+        row["blur_score"] = scores.get(path)
+        gallery.append(row)
+    session["artifacts"]["images"] = len(paths)
+    return gallery
+
+
+
+
 def register_reveng_session_tools(mcp: FastMCP) -> None:
     """Reverse-engineering session + ingest MCP tools (T-RF8 split of reveng_tools.py): session CRUD/status/coverage/deviation, images/video/datasheet ingest, scale setting, scale-mat print."""
 
@@ -723,12 +804,13 @@ def register_reveng_session_tools(mcp: FastMCP) -> None:
     def get_reveng_session(session_id: str) -> str:
         """Return the full ``aicad.reveng_session/1`` manifest for *session_id*.
 
-        Returns ``{ok, session}`` or ``{ok: false, reason}`` if not found.
+        Returns ``{ok, session, source_images}``; gallery paths refer to files on disk.
         """
         s = _load_session(session_id)
         if s is None:
             return _dumps({"ok": False, "reason": f"session {session_id!r} not found"})
-        return _dumps({"ok": True, "session": s})
+        source_images = _source_image_gallery(session_id, s)
+        return _dumps({"ok": True, "session": s, "source_images": source_images})
 
 
 
@@ -1078,19 +1160,10 @@ def register_reveng_session_tools(mcp: FastMCP) -> None:
                         if photos or datasheet:
                             sess_dir = _session_path(sid)
                             if photos:
-                                images_dir = sess_dir / "images"
-                                images_dir.mkdir(parents=True, exist_ok=True)
-                                import shutil as _shutil2  # noqa: PLC0415
-                                copied = 0
-                                for p in photos:
-                                    src = _Path(p).expanduser()
-                                    if src.is_file():
-                                        _shutil2.copy2(str(src), str(images_dir / src.name))
-                                        copied += 1
-                                session["artifacts"]["images"] = copied
-                                if copied:
-                                    session["stages"]["capture"] = "done"
-                                    seeded["images"] = copied
+                                copied, _, failures = _ingest_stills(sid, session, photos)
+                                seeded["images"] = copied
+                                if failures:
+                                    seeded["image_failures"] = failures
                             if datasheet:
                                 ds_dir = sess_dir / "datasheet"
                                 ds_dir.mkdir(parents=True, exist_ok=True)
@@ -1144,15 +1217,14 @@ def register_reveng_session_tools(mcp: FastMCP) -> None:
             s = _load_session(session_id)
             if s is None:
                 return _dumps({"ok": False, "reason": f"session {session_id!r} not found"})
-            images_dir = _session_path(session_id) / "images"
-            images_dir.mkdir(parents=True, exist_ok=True)
+            # Counts are rebuilt from disk, never incremented from attempted copies.
             sources: list[_Path] = []
             if dir:
                 src = _Path(dir).expanduser()
                 if not src.is_dir():
                     return _dumps({"ok": False, "reason": f"directory not found: {dir}"})
-                for ext in ("*.jpg", "*.jpeg", "*.png", "*.JPG", "*.JPEG", "*.PNG"):
-                    sources.extend(src.glob(ext))
+                sources.extend(p for p in sorted(src.iterdir()) if p.is_file()
+                               and p.suffix.lower() in (".jpg", ".jpeg", ".png", ".tif", ".tiff", ".bmp", ".webp"))
             if isinstance(paths, str) and paths.strip():
                 # SILENT WRONG BEHAVIOR: `for p in paths` over a stringified/python-repr
                 # list ("['a.jpg','b.jpg']") iterates CHARACTER BY CHARACTER, building
@@ -1162,17 +1234,16 @@ def register_reveng_session_tools(mcp: FastMCP) -> None:
                                      'a list of image file paths, e.g. ["a.jpg", "b.jpg"]')
             if paths:
                 sources.extend(_Path(p).expanduser() for p in paths)
-            added = 0
-            for src_path in sources:
-                if not src_path.is_file():
-                    continue
-                dest = images_dir / src_path.name
-                _shutil.copy2(str(src_path), str(dest))
-                added += 1
-            s["artifacts"]["images"] = s["artifacts"].get("images", 0) + added
-            s["stages"]["capture"] = "done" if s["artifacts"]["images"] > 0 else "idle"
+            if not sources:
+                return _dumps({"ok": False, "reason": "no image sources supplied or found"})
+            added, accepted, failed = _ingest_stills(session_id, s, sources)
             _save_session(s)
-            return _dumps({"ok": True, "added": added, "session": s})
+            result = {"ok": not failed, "added": added, "images": accepted,
+                      "failed": failed, "session": s}
+            if failed:
+                result.update(reason=f"{len(failed)} image source(s) could not be imported",
+                              hint="valid sources were retained; check failed paths and image decoding")
+            return _dumps(result)
         except Exception as e:
             return _err(e)
 
@@ -1187,31 +1258,55 @@ def register_reveng_session_tools(mcp: FastMCP) -> None:
         """Extract blur-culled stills from a video orbit and add them to *session_id*.
 
         Delegates to ``services.vision.frames.extract_frames_safe`` (RE-04).
-        Returns ``{ok, run_id, session}`` where ``run_id`` is a synthetic job token;
-        the extraction runs synchronously (no DAG dispatch yet — RE-17).
+        Returns ``{ok, run_id: null, added, extraction, session}``. Extraction is
+        synchronous; there is no background run to poll.
         """
         try:
             s = _load_session(session_id)
             if s is None:
                 return _dumps({"ok": False, "reason": f"session {session_id!r} not found"})
+            before = set(_session_image_paths(session_id))
             frames_dir = str(_session_path(session_id) / "frames")
             result = _extract_frames_safe(path, frames_dir, max_frames=max_frames)
+            current = set(_session_image_paths(session_id))
+            s["artifacts"]["images"] = len(current)
+            s["stages"]["capture"] = "done" if current else "idle"
             if not result.get("ok"):
-                return _dumps(result)
-            added = result.get("kept", 0)
-            run_id = "run_" + _secrets.token_hex(4)
-            s["artifacts"]["images"] = s["artifacts"].get("images", 0) + added
-            s["stages"]["capture"] = "done" if s["artifacts"]["images"] > 0 else "idle"
-            s["provenance"].append({
-                "step": "add_video",
-                "run_id": run_id,
-                "frames_kept": added,
+                _save_session(s)
+                return _dumps(dict(result, session=s))
+            frames = result.get("frames", [])
+            added = len({row["path"] for row in frames} - before)
+            missing = [row.get("path") for row in frames if row.get("path") not in current]
+            if missing:
+                _save_session(s)
+                return _dumps({"ok": False, "reason": "extracted frames are missing from disk",
+                               "missing": missing, "session": s})
+            # A repeat import retains the union of selected source frames, even if
+            # a later import uses a different sampling limit.
+            rows = {r["path"]: r for r in s.get("source_images", []) if r.get("path")}
+            for frame in frames:
+                rows[frame["path"]] = dict(frame, kind="video",
+                                          blur_score=frame.get("sharpness"))
+            s["source_images"] = list(rows.values())
+            provenance = {
+                "step": "add_video", "run_id": None,
+                "source_path": str(_Path(path).expanduser().resolve()),
+                "clip_id": result.get("clip_id"), "frames": frames,
+                "frames_kept": len(frames), "frames_added": added,
                 "frames_sampled": result.get("sampled", 0),
                 "frames_rejected_blurry": result.get("rejected_blurry", 0),
-                "ts": _now_iso(),
-            })
+                "max_frames": max_frames, "sample_cap": result.get("sample_cap"),
+                "truncated": result.get("truncated", False),
+                "count_known": result.get("count_known", True),
+                "total_frames": result.get("total_frames", 0),
+                "warnings": result.get("warnings", []),
+            }
+            if not any(all(old.get(k) == v for k, v in provenance.items() if k != "frames_added")
+                       for old in s["provenance"]):
+                s["provenance"].append(dict(provenance, ts=_now_iso()))
             _save_session(s)
-            return _dumps({"ok": True, "run_id": run_id, "session": s})
+            return _dumps({"ok": True, "run_id": None, "added": added,
+                           "extraction": result, "session": s})
         except Exception as e:
             return _err(e)
 

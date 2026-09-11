@@ -104,11 +104,18 @@ def run_sparse(
         _has_glomap = False
 
     try:
+        backend = "pycolmap"
+        registered = 0
         if _has_glomap:
-            registered = _run_glomap(pycolmap, image_dir, sparse_dir,
-                                     camera_model, single_camera)
-            backend = "pycolmap+glomap"
-        else:
+            try:
+                registered = _run_glomap(pycolmap, image_dir, sparse_dir,
+                                         camera_model, single_camera)
+                backend = "pycolmap+glomap"
+            except Exception:
+                # An installed binding is not necessarily executable with this
+                # pycolmap version. Use the documented incremental fallback.
+                registered = 0
+        if registered == 0:
             registered = _run_incremental(pycolmap, image_dir, sparse_dir,
                                           camera_model, single_camera)
             backend = "pycolmap"
@@ -155,7 +162,7 @@ def _run_incremental(
         pycolmap.extract_features(
             database_path=database_path,
             image_path=image_dir,
-            camera_mode=pycolmap.CameraMode.SINGLE if single_camera else pycolmap.CameraMode.PER_FOLDER,
+            camera_mode=pycolmap.CameraMode.SINGLE if single_camera else pycolmap.CameraMode.AUTO,
             camera_model=camera_model,
         )
 
@@ -195,7 +202,7 @@ def _run_glomap(
         pycolmap.extract_features(
             database_path=database_path,
             image_path=image_dir,
-            camera_mode=pycolmap.CameraMode.SINGLE if single_camera else pycolmap.CameraMode.PER_FOLDER,
+            camera_mode=pycolmap.CameraMode.SINGLE if single_camera else pycolmap.CameraMode.AUTO,
             camera_model=camera_model,
         )
         pycolmap.match_exhaustive(database_path=database_path)

@@ -91,6 +91,49 @@ def _persist_build_result(session_id: str, *, strategy: str, state: str,
 def register_reveng_build_tools(mcp: FastMCP) -> None:
     """Reverse-engineering reconstruction MCP tools (T-RF8 split of reveng_tools.py): reconstruct, single_photo, fit_primitives, build_parametric, attach_result, scan-mesh import, bundle export, make_part_from_library, research_source."""
 
+    @mcp.tool()
+    def reveng_start_splat(
+        session_id: str, mode: str = "environment", live: bool = False,
+        video_path: str = "", quality: str = "normal", iterations: int = 2000,
+        crop_bounds: Optional[list[float]] = None,
+    ) -> str:
+        """Start local Gaussian reconstruction immediately, without CAD scale or mesh gates.
+
+        Live jobs train bounded snapshots as accepted images arrive. Finish requests
+        a full-quality pass. Object mode uses an explicit reconstruction-unit crop,
+        not automatic segmentation. Interrupted runs restart rather than resume.
+        """
+        from services.reveng.gaussian_jobs import start
+        return _dumps(start(session_id, mode, live, video_path, quality, iterations, crop_bounds))
+
+    @mcp.tool()
+    def reveng_splat_status(session_id: str) -> str:
+        """Read durable Gaussian progress and the latest immutable preview without waiting."""
+        from services.reveng.gaussian_jobs import status
+        return _dumps(status(session_id))
+
+    @mcp.tool()
+    def reveng_finish_splat(session_id: str) -> str:
+        """Finish live acquisition with a full-quality pass over the latest accepted frames."""
+        from services.reveng.gaussian_jobs import finish
+        return _dumps(finish(session_id))
+
+    @mcp.tool()
+    def reveng_cancel_splat(session_id: str) -> str:
+        """Stop the owned Gaussian process tree, retaining the last valid preview."""
+        from services.reveng.gaussian_jobs import cancel
+        return _dumps(cancel(session_id))
+
+    @mcp.tool()
+    def reveng_crop_splat(session_id: str, bounds: Optional[list[float]] = None) -> str:
+        """Crop saved Gaussian centers in reconstruction units; null restores the original.
+
+        Bounds are [xmin,ymin,zmin,xmax,ymax,zmax]. Training must be stopped.
+        Every edit uses the unmodified source and preserves all Gaussian properties.
+        """
+        from services.reveng.gaussian_jobs import crop
+        return _dumps(crop(session_id, bounds))
+
 
     # ── §8.2 WRITE — long-job stubs (RE-17 wires real DAG) ──────────────────
 

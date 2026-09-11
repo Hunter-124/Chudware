@@ -27,11 +27,15 @@
 
 #include <algorithm>
 #include <cctype>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <future>
+#include <memory>
+#include <unordered_map>
 #include <string>
 #include <vector>
 
@@ -88,11 +92,177 @@ struct ShellState {
     // leaves the RE tab, so we detect the gap on re-entry and tear the camera down then.
     int  lastDrawFrame = -1000;
     bool webcamLive    = false;
+
+    uint64_t sessionEpoch = 0;
+    bool gaussianPollPending = false, gaussianHydrated = false;
+    double gaussianPollT = -100.0;
+    uint64_t splatRevisionTried = 0;
+    std::string splatLoadError;
+    Vec3 gaussianCenter;
+    float gaussianRadius = 1.0f, gaussianYaw = 0.6f, gaussianPitch = 0.25f;
+    float gaussianZoom = 1.0f;
+    bool gaussianCameraFitted = false, cropDirty = false;
+    Vec3 gaussianRight{1, 0, 0}, gaussianUp{0, 1, 0}, gaussianBack{0, 0, 1};
+    GaussianViewCamera loadedViewCamera;
+    bool gaussianCaptureProjection = false;
+    uint64_t gaussianActionSerial = 0;
+    std::unordered_map<std::string, std::shared_ptr<GaussianRunControl>> gaussianRuns;
+    std::string gaussianArtifactDirectory;
+    struct SplatLoad {
+        render::SplatCloud cloud;
+        std::string error, path;
+        uint64_t epoch = 0;
+        uint64_t revision = 0;
+        GaussianViewCamera viewCamera;
+    };
+    std::future<SplatLoad> splatLoad;
 };
 
 ShellState& SH() {
     static ShellState s;
     return s;
+}
+
+bool selectedSession(const std::string& sid) {
+    const auto& s = S();
+    return s.selected >= 0 && s.selected < (int)s.sessions.size() &&
+           s.sessions[s.selected].session_id == sid;
+}
+
+bool gaussianRunning(const GaussianState& g) {
+    return g.status == "waiting" || g.status == "sparse" || g.status == "training" ||
+           g.status == "watching" || g.status == "finalizing";
+}
+
+bool readBounds(const nlohmann::json& j, float (&out)[6]) {
+    if (!j.is_array() || j.size() != 6) return false;
+    float values[6];
+    for (int i = 0; i < 6; ++i) {
+        if (!j[i].is_number()) return false;
+        values[i] = j[i].get<float>();
+        if (!std::isfinite(values[i])) return false;
+    }
+    for (int i = 0; i < 3; ++i) if (values[i] > values[i + 3]) return false;
+    std::copy(values, values + 6, out);
+    return true;
+}
+
+GaussianViewCamera readViewCamera(const nlohmann::json& j) {
+    GaussianViewCamera camera;
+    if (!j.is_object() || !j.contains("id") || !j["id"].is_string() ||
+        j["id"].get_ref<const std::string&>().empty()) return camera;
+    const auto readVector = [&](const char* key, float* values, size_t size) {
+        const auto it = j.find(key);
+        if (it == j.end() || !it->is_array() || it->size() != size) return false;
+        for (size_t i = 0; i < size; ++i) {
+            if (!(*it)[i].is_number()) return false;
+            values[i] = (*it)[i].get<float>();
+            if (!std::isfinite(values[i])) return false;
+        }
+        return true;
+    };
+    float eye[3], forward[3], up[3];
+    if (!readVector("eye", eye, 3) || !readVector("forward", forward, 3) ||
+        !readVector("up", up, 3) || !readVector("intrinsics", camera.intrinsics, 6) ||
+        !j.contains("focus_distance") || !j["focus_distance"].is_number()) return {};
+    camera.focusDistance = j["focus_distance"].get<float>();
+    if (!std::isfinite(camera.focusDistance) || camera.focusDistance <= 0.0f ||
+        camera.intrinsics[0] <= 0.0f || camera.intrinsics[1] <= 0.0f ||
+        camera.intrinsics[4] <= 0.0f || camera.intrinsics[5] <= 0.0f) return {};
+    camera.eye = {eye[0], eye[1], eye[2]};
+    camera.forward = {forward[0], forward[1], forward[2]};
+    camera.up = {up[0], up[1], up[2]};
+    const float forwardLength = length(camera.forward), upLength = length(camera.up);
+    if (!std::isfinite(forwardLength) || !std::isfinite(upLength) ||
+        forwardLength < 1e-6f || upLength < 1e-6f) return {};
+    camera.forward = camera.forward * (1.0f / forwardLength);
+    camera.up = camera.up * (1.0f / upLength);
+    const Vec3 right = cross(camera.forward, camera.up);
+    if (length(right) < 1e-6f) return {};
+    camera.up = cross(normalize(right), camera.forward);
+    const Vec3 target = camera.eye + camera.forward * camera.focusDistance;
+    if (!std::isfinite(target.x) || !std::isfinite(target.y) || !std::isfinite(target.z)) return {};
+    camera.id = j["id"].get<std::string>();
+    return camera;
+}
+
+void mirrorGaussian(const nlohmann::json& j, bool restoreOptions) {
+    if (!j.is_object()) return;
+    auto& g = S().gaussian;
+    const auto text = [&](const char* key) {
+        auto it = j.find(key);
+        return it != j.end() && it->is_string() ? it->get<std::string>() : std::string();
+    };
+    const std::string runId = j.value("run_id", g.runId);
+    restoreOptions = restoreOptions || (!runId.empty() && runId != g.runId);
+    g.runId = runId;
+    g.status = j.value("status", g.status);
+    g.stage = j.value("stage", g.stage);
+    g.msg = j.value("msg", std::string());
+    g.live = j.value("live", g.live);
+    g.pct = std::clamp(j.value("pct", g.pct), 0, 100);
+    g.frames = j.value("frames", g.frames);
+    g.registered = j.value("registered", g.registered);
+    g.iteration = j.value("iteration", g.iteration);
+    g.totalIterations = j.value("total_iterations", g.totalIterations);
+    if (j.contains("splat_path") && j["splat_path"].is_string() &&
+        !j["splat_path"].get_ref<const std::string&>().empty()) {
+        const auto path = j["splat_path"].get<std::string>();
+        const bool changed = path != g.splatPath ||
+            j.value("artifact_revision", g.artifactRevision) != g.artifactRevision;
+        // The pose travels with the artifact, never with a sparse/training stage transition.
+        if (j.contains("view_camera")) g.viewCamera = readViewCamera(j["view_camera"]);
+        else if (changed) g.viewCamera = {};
+        g.splatPath = path;
+    }
+    if (j.value("artifact_revision", g.artifactRevision) != g.artifactRevision &&
+        j.contains("crop_bounds")) {
+        float crop[6];
+        g.cropEnabled = readBounds(j["crop_bounds"], crop);
+        if (g.cropEnabled && !SH().cropDirty)
+            std::copy(crop, crop + 6, g.cropBounds);
+    }
+    g.artifactRevision = j.value("artifact_revision", g.artifactRevision);
+    if (j.contains("bounds")) g.hasBounds = readBounds(j["bounds"], g.bounds);
+    if (restoreOptions) {
+        g.mode = j.value("mode", std::string("environment")) == "object" ? 1 : 0;
+        const auto quality = j.value("quality", std::string("normal"));
+        g.quality = quality == "draft" ? 0 : quality == "high" ? 2 : 1;
+        g.iterations = j.value("iterations", g.iterations);
+        g.cropEnabled = j.contains("crop_bounds") && readBounds(j["crop_bounds"], g.cropBounds);
+        SH().cropDirty = false;
+    }
+    g.error = text("error");
+    const std::string reason = text("reason");
+    const std::string hint = text("hint");
+    if (!reason.empty() && reason != g.error) g.error += (g.error.empty() ? "" : ": ") + reason;
+    if (!hint.empty()) g.error += (g.error.empty() ? "" : " — ") + hint;
+}
+
+void fitGaussianCamera() {
+    auto& sh = SH();
+    Vec3 lo, hi;
+    if (!S().splat.bounds(lo, hi)) return;
+    sh.gaussianCenter = (lo + hi) * 0.5f;
+    sh.gaussianRadius = std::max(length(hi - lo) * 0.5f, 1e-6f);
+    sh.gaussianZoom = 1.0f;
+    sh.gaussianCaptureProjection = false;
+    sh.gaussianCameraFitted = true;
+}
+
+void restoreGaussianCaptureCamera() {
+    auto& sh = SH();
+    const auto& capture = sh.loadedViewCamera;
+    if (capture.id.empty()) return;
+    sh.gaussianBack = capture.forward * -1.0f;
+    sh.gaussianUp = capture.up;
+    sh.gaussianRight = normalize(cross(capture.forward, capture.up));
+    sh.gaussianCenter = capture.eye + capture.forward * capture.focusDistance;
+    sh.gaussianRadius = capture.focusDistance;
+    sh.gaussianYaw = sh.gaussianPitch = 0.0f;
+    sh.gaussianZoom = 1.0f;
+    sh.gaussianCaptureProjection = true;
+    sh.gaussianCameraFitted = true;
 }
 
 // Exponential approach used for the column roll — same 120 ms feel as ui::PanelCollapseAnim.
@@ -273,6 +443,7 @@ void feedRevEngEvent(const RevEngEvent& ev) {
 
 // RE-27: seed the canned splat fixture (for shot modes / headless verification).
 void seedSplatFixture() {
+    if (!std::getenv("CHUDWARE_SHOT")) return;
     RevEngState& s = S();
     if (s.splatLoaded) return;
     const char* repo = std::getenv("CHUDWARE_REPO");
@@ -366,6 +537,8 @@ unsigned int railThumb(const SessionSummary& ss, int* outW, int* outH) {
 
 // ---- async loaders -------------------------------------------------------------
 
+void resetForSessionChange(RevEngState& s);
+
 void loadSessions(AppState& st, bool force = false) {
     if (!st.workerStarted) return;
     RevEngState& s = S();
@@ -386,11 +559,14 @@ void loadSessions(AppState& st, bool force = false) {
             st2.listErr = r.result.is_object()
                               ? r.result.value("reason", std::string("Reverse Eng tools unavailable"))
                               : std::string("Reverse Eng tools unavailable");
-            st2.sessions.clear();
             return;
         }
         st2.listErr.clear();
-        st2.sessions.clear();
+        const std::string selectedId = st2.selected >= 0 && st2.selected < (int)st2.sessions.size()
+                                           ? st2.sessions[st2.selected].session_id : std::string();
+        const std::string galleryId = st2.gallerySession >= 0 && st2.gallerySession < (int)st2.sessions.size()
+                                          ? st2.sessions[st2.gallerySession].session_id : std::string();
+        std::vector<SessionSummary> sessions;
         if (r.result.contains("sessions") && r.result["sessions"].is_array()) {
             for (const auto& j : r.result["sessions"]) {
                 if (!j.is_object()) continue;
@@ -399,6 +575,16 @@ void loadSessions(AppState& st, bool force = false) {
                 ss.name = j.value("name", std::string("(unnamed)"));
                 ss.status = j.value("status", std::string());
                 ss.images = j.value("images", 0);
+                if (j.contains("gaussian") && j["gaussian"].is_object()) {
+                    const auto& gaussian = j["gaussian"];
+                    ss.hasGaussian = true;
+                    ss.gaussianStatus = gaussian.value("status", std::string());
+                    ss.gaussianStage = gaussian.value("stage", std::string());
+                    ss.gaussianMode = gaussian.value("mode", std::string());
+                    ss.gaussianFrames = gaussian.value("frames", 0);
+                    ss.gaussianRegistered = gaussian.value("registered", 0);
+                    ss.gaussianPct = gaussian.value("pct", 0);
+                }
                 ss.createdAt = j.value("created_at", std::string());
                 ss.updatedAt = j.value("updated_at", std::string());
                 if (j.contains("part_ref") && j["part_ref"].is_string())
@@ -406,10 +592,21 @@ void loadSessions(AppState& st, bool force = false) {
                 if (j.contains("honesty") && j["honesty"].is_object())
                     ss.approximate = j["honesty"].value("approximate", false);
                 ss.approximate = ss.approximate || j.value("approximate", false);
-                st2.sessions.push_back(std::move(ss));
+                sessions.push_back(std::move(ss));
             }
         }
-        if (st2.selected >= (int)st2.sessions.size()) st2.selected = -1;
+        st2.sessions = std::move(sessions);
+        st2.selected = -1;
+        st2.gallerySession = -1;
+        for (int i = 0; i < (int)st2.sessions.size(); ++i) {
+            if (!selectedId.empty() && st2.sessions[i].session_id == selectedId) st2.selected = i;
+            if (!galleryId.empty() && st2.sessions[i].session_id == galleryId) st2.gallerySession = i;
+        }
+        if ((!selectedId.empty() && st2.selected < 0) ||
+            (!galleryId.empty() && st2.gallerySession < 0)) {
+            st2.stage = Stage::Source;
+            resetForSessionChange(st2);
+        }
     });
 }
 
@@ -448,8 +645,10 @@ void loadSessionDetail(AppState& st, bool force = false) {
     s.lastDetailT = now;
     nlohmann::json params = nlohmann::json::object();
     params["session_id"] = sid;
-    st.rpc.call("get_reveng_session", params, [sid](const core::RpcResult& r) {
+    const uint64_t epoch = SH().sessionEpoch;
+    st.rpc.call("get_reveng_session", params, [sid, epoch](const core::RpcResult& r) {
         RevEngState& st2 = S();
+        if (!selectedSession(sid) || SH().sessionEpoch != epoch) return;
         st2.detailPending = false;
         if (!r.ok) {
             st2.detailErr = r.err.empty() ? "get_reveng_session failed" : r.err;
@@ -472,6 +671,31 @@ void loadSessionDetail(AppState& st, bool force = false) {
         st2.honestyTier.clear();
         if (!r.result.contains("session") || !r.result["session"].is_object()) return;
         const auto& sess = r.result["session"];
+        if (sess.contains("gaussian") && sess["gaussian"].is_object() &&
+            !SH().gaussianHydrated && !st2.gaussian.pending) {
+            mirrorGaussian(sess["gaussian"], true);
+            SH().gaussianHydrated = true;
+        }
+        if (r.result.contains("source_images") && r.result["source_images"].is_array()) {
+            for (const auto& image : r.result["source_images"]) {
+                if (!image.is_object()) continue;
+                const std::string path = image.value("path", std::string());
+                if (path.empty()) continue;
+                auto it = std::find_if(st2.galleryImages.begin(), st2.galleryImages.end(),
+                                      [&](const GalleryImage& old) { return old.path == path; });
+                if (it == st2.galleryImages.end()) {
+                    st2.galleryImages.emplace_back();
+                    it = st2.galleryImages.end() - 1;
+                    it->path = path;
+                }
+                it->quality = image.value("quality", it->quality);
+                if (image.contains("blur_score") && image["blur_score"].is_number())
+                    it->sharpness = image["blur_score"].get<double>();
+                it->synthetic = image.value("synthetic", it->synthetic);
+                it->srcW = image.value("width", it->srcW);
+                it->srcH = image.value("height", it->srcH);
+            }
+        }
 
         // session.scale (§2) — the Scale stage + properties column read the mirror.
         if (sess.contains("scale") && sess["scale"].is_object()) {
@@ -635,37 +859,447 @@ void loadCapabilities(AppState& st, bool force = false) {
     });
 }
 
-// Prefer the session splat; the canned fixture is an explicit demo fallback only.
+// Publish only a successfully parsed cloud; a failed refresh never destroys the last preview.
 void ensureSplatForSession(RevEngState& s) {
-    std::string want;
-    bool demoFallback = false;
-    if (!s.artifactSplatPath.empty()) {
-        want = s.artifactSplatPath;
-    } else if (s.recon.done) {
+    auto& sh = SH();
+    std::string want = s.gaussian.splatPath.empty() ? s.artifactSplatPath : s.gaussian.splatPath;
+    if (want.empty() && s.recon.done && std::getenv("CHUDWARE_SHOT")) {
         const char* repo = std::getenv("CHUDWARE_REPO");
-        std::string base = repo ? std::string(repo) : std::string(".");
-        want = base + "/host/tests/fixtures/splat_tiny.ply";
-        demoFallback = true;
-    } else {
-        return;
+        want = std::string(repo ? repo : ".") + "/host/tests/fixtures/splat_tiny.ply";
     }
-    if (want.empty()) return;
-    if (s.splatLoaded && s.splatPathTried == want) return;
-
-    s.splatLoaded = true;
-    s.splatPathTried = want;
-    std::string err;
-    if (!s.splat.load(want, err)) {
-        std::fprintf(stderr, "reveng splat load failed (%s): %s\n",
-                     demoFallback ? "fixture" : "session", err.c_str());
-        if (!demoFallback) {
-            s.splatLoaded = false;
-            s.splatPathTried.clear();
+    if (sh.splatLoad.valid()) {
+        if (sh.splatLoad.wait_for(std::chrono::seconds(0)) != std::future_status::ready) return;
+        auto loaded = sh.splatLoad.get();
+        if (loaded.epoch == sh.sessionEpoch && loaded.path == want &&
+            loaded.revision == s.gaussian.artifactRevision) {
+            if (!loaded.error.empty() || loaded.cloud.empty()) {
+                sh.splatLoadError = "Cannot load Gaussian preview: " +
+                    (loaded.error.empty() ? std::string("empty artifact") : loaded.error);
+            } else {
+                s.splat.setCloud(std::move(loaded.cloud));
+                s.splatLoaded = true;
+                sh.splatLoadError.clear();
+                s.artifactSplatPath = loaded.path;
+                const std::string directory = std::filesystem::path(loaded.path).parent_path().string();
+                const bool newGauge = loaded.viewCamera.id != sh.loadedViewCamera.id;
+                sh.loadedViewCamera = std::move(loaded.viewCamera);
+                if (!sh.loadedViewCamera.id.empty()) {
+                    if (newGauge || !sh.gaussianCameraFitted) restoreGaussianCaptureCamera();
+                } else if (newGauge || !sh.gaussianCameraFitted ||
+                           sh.gaussianArtifactDirectory != directory) {
+                    sh.gaussianRight = {1, 0, 0};
+                    sh.gaussianUp = {0, 1, 0};
+                    sh.gaussianBack = {0, 0, 1};
+                    sh.gaussianYaw = 0.6f;
+                    sh.gaussianPitch = 0.25f;
+                    fitGaussianCamera();
+                }
+                sh.gaussianArtifactDirectory = directory;
+            }
         }
     }
+    if (want.empty()) return;
+    if (s.splatPathTried == want && sh.splatRevisionTried == s.gaussian.artifactRevision) return;
+    s.splatPathTried = want;
+    sh.splatRevisionTried = s.gaussian.artifactRevision;
+    const auto epoch = sh.sessionEpoch;
+    const auto revision = s.gaussian.artifactRevision;
+    const auto viewCamera = want == s.gaussian.splatPath ? s.gaussian.viewCamera : GaussianViewCamera{};
+    sh.splatLoad = std::async(std::launch::async, [want, epoch, revision, viewCamera] {
+        ShellState::SplatLoad result;
+        result.path = want;
+        result.epoch = epoch;
+        result.revision = revision;
+        result.viewCamera = viewCamera;
+        try {
+            if (!render::loadSplatPly(want, result.cloud, result.error) && result.error.empty())
+                result.error = "Invalid Gaussian PLY";
+        } catch (const std::exception& error) {
+            result.error = error.what();
+        }
+        return result;
+    });
+}
+
+void pollGaussian(AppState& st) {
+    // Retry only actions never dispatched while disconnected, never an unacknowledged RPC.
+    for (const auto& entry : SH().gaussianRuns) drainGaussianActions(st, entry.second);
+    auto& s = S();
+    auto& sh = SH();
+    if (!st.workerStarted || s.selected < 0 || s.selected >= (int)s.sessions.size() ||
+        sh.gaussianPollPending || s.gaussian.pending) return;
+    const double now = ImGui::GetTime();
+    if (now - sh.gaussianPollT < (gaussianRunning(s.gaussian) ? 0.75 : 3.0)) return;
+    sh.gaussianPollT = now;
+    sh.gaussianPollPending = true;
+    const auto sid = s.sessions[s.selected].session_id;
+    const auto epoch = sh.sessionEpoch;
+    const auto serial = sh.gaussianActionSerial;
+    st.rpc.call("reveng_splat_status", {{"session_id", sid}}, [sid, epoch, serial](const core::RpcResult& r) {
+        if (!selectedSession(sid) || SH().sessionEpoch != epoch) return;
+        SH().gaussianPollPending = false;
+        if (S().gaussian.pending || SH().gaussianActionSerial != serial) return;
+        if (!r.ok || !r.result.is_object()) {
+            S().gaussian.error = r.err.empty() ? "Gaussian status unavailable; check the local worker." : r.err;
+            return;
+        }
+        if (r.result.value("reason", std::string()) == "no_splat_job" && S().gaussian.runId.empty()) {
+            SH().gaussianHydrated = true;
+            return;  // An untouched session is ready to start, not a failed training run.
+        }
+        mirrorGaussian(r.result, !SH().gaussianHydrated);
+        SH().gaussianHydrated = true;
+    });
+}
+
+void gaussianAction(AppState& st, const std::string& sid, const char* method,
+                    nlohmann::json args,
+                    const std::shared_ptr<GaussianRunControl>& explicitRun = nullptr) {
+    if (!explicitRun && (!selectedSession(sid) || S().gaussian.pending)) return;
+    const auto run = explicitRun ? explicitRun : S().gaussian.control;
+    if (!st.workerStarted) {
+        if (selectedSession(sid))
+            S().gaussian.error = "Local worker unavailable. Start or reconnect the worker before training.";
+        return;
+    }
+    if (run) run->pending = true;
+    if (selectedSession(sid)) {
+        S().gaussian.pending = true;
+        S().gaussian.error.clear();
+    }
+    ++SH().gaussianActionSerial;
+    args["session_id"] = sid;
+    const auto epoch = SH().sessionEpoch;
+    const bool starting = std::strcmp(method, "reveng_start_splat") == 0;
+    const bool terminalAction = explicitRun && !starting;
+    st.rpc.call(method, args, [&st, sid, epoch, run, starting, terminalAction](const core::RpcResult& r) {
+        const bool ok = r.ok && r.result.is_object() && r.result.value("ok", false);
+        if (run) {
+            run->pending = false;
+            if (starting) {
+                run->starting = false;
+                run->startFailed = !ok;
+                if (!ok) run->requested = GaussianRunControl::Action::None;
+            } else if (terminalAction) {
+                run->acknowledged = ok;
+            }
+        }
+        const bool current = selectedSession(sid) &&
+            (run ? S().gaussian.control == run : SH().sessionEpoch == epoch);
+        if (current) {
+            S().gaussian.pending = false;
+            SH().gaussianPollT = -100.0;
+            if (!r.ok || !r.result.is_object()) {
+                S().gaussian.error = r.err.empty() ? "Gaussian request failed; check the local worker." : r.err;
+            } else {
+                mirrorGaussian(r.result, ok);
+                SH().gaussianHydrated = true;
+                if (!ok && S().gaussian.error.empty())
+                    S().gaussian.error = "Gaussian request was rejected; no new artifact was published.";
+            }
+            if (starting && !ok) S().gaussian.status = "failed";
+        }
+        // This is control-plane work, not a selected-session UI update. It must run even
+        // after the camera, workspace or original session mirror has been torn down.
+        if (run) drainGaussianActions(st, run);
+    });
 }
 
 }  // namespace
+
+void drainGaussianActions(AppState& st, const std::shared_ptr<GaussianRunControl>& run) {
+    using Action = GaussianRunControl::Action;
+    if (!run || run->pending || run->starting || run->startFailed || !st.workerStarted) return;
+    const auto it = SH().gaussianRuns.find(run->sid);
+    if (it == SH().gaussianRuns.end() || it->second != run) return;
+    const char* method = nullptr;
+    if (run->requested == Action::Cancel && !run->cancelSent) {
+        run->cancelSent = true;
+        method = "reveng_cancel_splat";
+    } else if (run->requested == Action::Finish && !run->finishSent &&
+               !run->cancelSent && run->pendingIngest == 0) {
+        run->finishSent = true;
+        method = "reveng_finish_splat";
+    }
+    if (!method) return;
+    run->acknowledged = false;
+    gaussianAction(st, run->sid, method, nlohmann::json::object(), run);
+}
+
+void finishGaussianRun(AppState& st, const std::shared_ptr<GaussianRunControl>& run) {
+    if (!run || run->startFailed || run->requested == GaussianRunControl::Action::Cancel) return;
+    run->requested = GaussianRunControl::Action::Finish;
+    drainGaussianActions(st, run);
+}
+
+Renderer::CameraXform gaussianPreviewCamera(int width, int height) {
+    auto& sh = SH();
+    if (!sh.gaussianCameraFitted) fitGaussianCamera();
+    Renderer::CameraXform cam;
+    cam.vpWidth = cam.ssWidth = std::max(width, 1);
+    cam.vpHeight = cam.ssHeight = std::max(height, 1);
+    const float aspect = float(cam.vpWidth) / float(cam.vpHeight);
+    const float halfFov = Renderer::kFovDeg * 0.00872664626f;
+    const float limitingFov = std::atan(std::tan(halfFov) * std::min(aspect, 1.0f));
+    cam.radius = sh.gaussianRadius;
+    cam.zoom = sh.gaussianZoom;
+    cam.dist = sh.gaussianCaptureProjection ? sh.loadedViewCamera.focusDistance / cam.zoom
+        : cam.radius * 1.1f / (std::sin(limitingFov) * cam.zoom);
+    cam.center = sh.gaussianCenter;
+    cam.dir = sh.gaussianRight * (std::cos(sh.gaussianPitch) * std::sin(sh.gaussianYaw)) +
+              sh.gaussianUp * std::sin(sh.gaussianPitch) +
+              sh.gaussianBack * (std::cos(sh.gaussianPitch) * std::cos(sh.gaussianYaw));
+    cam.eye = cam.center + cam.dir * cam.dist;
+    cam.right = normalize(cross(sh.gaussianUp, cam.dir));
+    cam.up = cross(cam.dir, cam.right);
+    cam.orthographic = false;
+    cam.view = lookAt(cam.eye, cam.center, cam.up);
+    float farPlane = cam.dist + cam.radius * 100.0f;
+    if (sh.gaussianCaptureProjection) {
+        Vec3 lo, hi;
+        if (S().splat.bounds(lo, hi))
+            farPlane = std::max(farPlane, length((lo + hi) * 0.5f - cam.eye) + length(hi - lo));
+    }
+    cam.proj = perspective(halfFov * 2.0f, aspect, cam.radius * 0.0001f, farPlane);
+    if (sh.gaussianCaptureProjection) {
+        const auto& k = sh.loadedViewCamera.intrinsics;
+        const float scale = std::min(float(cam.vpWidth) / k[4], float(cam.vpHeight) / k[5]);
+        const float cx = k[2] * scale + (cam.vpWidth - k[4] * scale) * 0.5f;
+        const float cy = k[3] * scale + (cam.vpHeight - k[5] * scale) * 0.5f;
+        cam.proj.m[0] = 2.0f * k[0] * scale / cam.vpWidth;
+        cam.proj.m[5] = 2.0f * k[1] * scale / cam.vpHeight;
+        // Source pixels are top-left/down; OpenGL clip coordinates are bottom-left/up.
+        cam.proj.m[8] = 1.0f - 2.0f * cx / cam.vpWidth;
+        cam.proj.m[9] = 2.0f * cy / cam.vpHeight - 1.0f;
+    }
+    cam.halfHeight = cam.dist / cam.proj.m[5];
+    cam.mvp = mul(cam.proj, cam.view);
+    return cam;
+}
+
+void startGaussian(AppState& st, const std::string& sid, bool live,
+                   const std::string& videoPath) {
+    if (!selectedSession(sid)) return;
+    auto& g = S().gaussian;
+    if (g.pending || gaussianRunning(g) || S().recon.active || S().recon.kickPending ||
+        (g.control && (g.control->pending || g.control->pendingIngest != 0 ||
+                       (g.control->requested != GaussianRunControl::Action::None &&
+                        !g.control->finishSent && !g.control->cancelSent)))) {
+        g.error = "A reconstruction is already running. Finish or cancel it before starting another.";
+        return;
+    }
+    if (!st.workerStarted) {
+        g.error = "Local worker unavailable. Start or reconnect the worker before training.";
+        return;
+    }
+    static const char* qualities[] = {"draft", "normal", "high"};
+    nlohmann::json args = {{"mode", g.mode == 1 ? "object" : "environment"},
+                          {"quality", qualities[std::clamp(g.quality, 0, 2)]},
+                          {"iterations", std::clamp(g.iterations, 1, 1000000)},
+                          {"live", live}, {"video_path", videoPath}, {"crop_bounds", nullptr}};
+    // Every new SfM solve chooses a new coordinate gauge; an old crop is not transferable.
+    g.cropEnabled = false;
+    g.hasBounds = false;
+    std::fill(g.cropBounds, g.cropBounds + 6, 0.0f);
+    SH().cropDirty = false;
+    auto run = std::make_shared<GaussianRunControl>();
+    run->sid = sid;
+    run->starting = true;
+    SH().gaussianRuns[sid] = run;
+    g.control = run;
+    g.live = live;
+    gaussianAction(st, sid, "reveng_start_splat", std::move(args), run);
+}
+
+void finishGaussian(AppState& st, const std::string& sid) {
+    auto it = SH().gaussianRuns.find(sid);
+    if (it == SH().gaussianRuns.end()) {
+        if (!selectedSession(sid) || !gaussianRunning(S().gaussian)) return;
+        auto run = std::make_shared<GaussianRunControl>();
+        run->sid = sid;
+        it = SH().gaussianRuns.emplace(sid, std::move(run)).first;
+        S().gaussian.control = it->second;
+    }
+    finishGaussianRun(st, it->second);
+}
+
+void cancelGaussian(AppState& st, const std::string& sid) {
+    auto it = SH().gaussianRuns.find(sid);
+    if (it == SH().gaussianRuns.end()) {
+        if (!selectedSession(sid) || !gaussianRunning(S().gaussian)) return;
+        auto run = std::make_shared<GaussianRunControl>();
+        run->sid = sid;
+        it = SH().gaussianRuns.emplace(sid, std::move(run)).first;
+        S().gaussian.control = it->second;
+    }
+    if (it->second->startFailed) return;
+    it->second->requested = GaussianRunControl::Action::Cancel;
+    drainGaussianActions(st, it->second);
+}
+
+void drawGaussianPanel(AppState& st) {
+    auto& s = S();
+    auto& g = s.gaussian;
+    auto& sh = SH();
+    if (s.selected < 0 || s.selected >= (int)s.sessions.size()) return;
+    const auto sid = s.sessions[s.selected].session_id;
+    pollGaussian(st);
+    ensureSplatForSession(s);
+    const bool running = gaussianRunning(g);
+    const bool busy = running || g.pending;
+    const kit::Level level = !g.error.empty() || g.status == "failed" ? kit::Level::Error
+                           : busy ? kit::Level::Busy
+                           : g.status == "done" ? kit::Level::Ok
+                           : g.status == "interrupted" || g.status == "cancelled" ? kit::Level::Warn
+                           : kit::Level::Neutral;
+    if (kit::CardBegin("##gaussian_job", "3D Gaussian splatting", "display_shaded")) {
+        kit::StatusChip(g.pending ? "Sending request" : g.status.empty() ? "Ready" : g.status.c_str(), level);
+        kit::InlineStatus("Local photo reconstruction in reconstruction units — not a scaled CAD model.",
+                          kit::Level::Neutral);
+        static const char* modes[] = {"Environment", "Stationary object"};
+        static const char* qualities[] = {"Draft", "Normal", "High"};
+        ImGui::BeginDisabled(busy);
+        kit::FieldLabel("Workflow");
+        kit::SegmentedControl("##gaussian_mode", modes, 2, &g.mode, M::reFieldW());
+        kit::FieldLabel("Quality");
+        if (kit::SegmentedControl("##gaussian_quality", qualities, 3, &g.quality, M::reFieldW())) {
+            static const int iterations[] = {500, 2000, 10000};
+            g.iterations = iterations[std::clamp(g.quality, 0, 2)];
+        }
+        kit::FieldLabel("Final iterations", "Live updates use short snapshot passes; Finalize trains all accepted frames with this budget.");
+        ImGui::InputInt("##gaussian_iterations", &g.iterations, 100, 1000);
+        g.iterations = std::clamp(g.iterations, 1, 1000000);
+        ImGui::EndDisabled();
+        kit::KeyValueRow("Training / viewer budget", "2,000,000 splats maximum");
+        if (g.mode == 1)
+            kit::InlineStatus("Keep the object stationary and move the camera around it. No automatic masks or background removal.",
+                              kit::Level::Warn);
+        if (g.status == "interrupted")
+            kit::InlineStatus("The previous worker stopped. Start again to retrain from saved frames; optimizer state is not resumed.",
+                              kit::Level::Warn);
+        if (g.live || running)
+            kit::InlineStatus("Live preview uses bounded snapshots (6 frames minimum, 3 new frames per update). Finalize uses all accepted frames.",
+                              kit::Level::Neutral);
+        if (!g.stage.empty()) kit::KeyValueRow("Stage", g.stage.c_str(), level);
+        char counts[160];
+        std::snprintf(counts, sizeof(counts), "%d frames / %d registered / iteration %d of %d",
+                      g.frames, g.registered, g.iteration, g.totalIterations);
+        kit::ProgressBar(g.pct / 100.0f, counts, level);
+        kit::InlineStatus(g.msg.c_str(), level);
+        kit::InlineStatus(g.error.c_str(), kit::Level::Error);
+        if (!st.workerStarted)
+            kit::InlineStatus("Start or reconnect the local worker to train.", kit::Level::Warn);
+        for (const auto& dependency : s.caps.artifacts) {
+            if ((dependency.key == "brush" || dependency.key == "pycolmap") && !dependency.present)
+                kit::CapabilityRow(dependency.key.c_str(), false, dependency.hint.c_str());
+        }
+        if (kit::SecondaryButton("Re-check local dependencies", !s.caps.pending))
+            loadCapabilities(st, true);
+        kit::GapControl();
+        if (kit::PrimaryButton("Start Gaussian splat", !busy && st.workerStarted &&
+                               !s.recon.active && !s.recon.kickPending,
+                               "Select an idle session with accepted photos or use live camera capture."))
+            startGaussian(st, sid, false);
+        if (g.control && g.control->requested != GaussianRunControl::Action::None) {
+            const bool cancelling = g.control->requested == GaussianRunControl::Action::Cancel;
+            const bool sent = cancelling ? g.control->cancelSent : g.control->finishSent;
+            if (!sent)
+                kit::InlineStatus(cancelling ? "Cancel queued until startup completes."
+                                             : "Finalize queued until startup and image ingest complete.",
+                                  kit::Level::Busy);
+            else if (!g.control->pending && !g.control->acknowledged)
+                kit::InlineStatus("The terminal request was not acknowledged. Check the worker and job status before starting again.",
+                                  kit::Level::Error);
+        }
+        if (kit::SecondaryButton("Finalize all frames", (running || g.pending) && g.live &&
+                                 g.status != "finalizing", "Available during a live Gaussian job, including startup.")) {
+            if (!webcamCaptureFinishGaussian(st, sid)) finishGaussian(st, sid);
+        }
+        if (kit::DangerButton("Cancel Gaussian job", running || g.pending))
+            cancelGaussian(st, sid);
+        if (!g.splatPath.empty()) kit::KeyValueRow("Saved PLY", g.splatPath.c_str());
+    }
+    kit::CardEnd();
+    kit::GapCards();
+    if (kit::CardBegin("##gaussian_preview_card", "Gaussian preview", "display_shaded")) {
+        const bool have = s.splatLoaded && s.splat.hasSplats();
+        const ImVec2 box(ImGui::GetContentRegionAvail().x, M::reThumbLg());
+        const ImRect rect = kit::Viewport3DPreview("##gaussian_preview", box,
+                            have ? kit::PreviewSlot::Splat : kit::PreviewSlot::None,
+                            have ? nullptr : "The first complete training export will appear here.");
+        if (have) {
+            // Place input on the same surface the native GL pass renders, respecting child clips.
+            const ImVec2 after = ImGui::GetCursorScreenPos();
+            ImGui::SetCursorScreenPos(rect.Min);
+            ImGui::InvisibleButton("##gaussian_camera", rect.GetSize(),
+                                   ImGuiButtonFlags_MouseButtonLeft | ImGuiButtonFlags_MouseButtonRight |
+                                   ImGuiButtonFlags_MouseButtonMiddle);
+            const auto& io = ImGui::GetIO();
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetKeyOwner(ImGuiKey_MouseWheelY, ImGui::GetID("##gaussian_camera"));
+                sh.gaussianZoom = std::clamp(sh.gaussianZoom * std::exp(io.MouseWheel * 0.15f), 0.02f, 100.0f);
+                if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) fitGaussianCamera();
+            }
+            if (ImGui::IsItemActive()) {
+                if (ImGui::IsMouseDown(ImGuiMouseButton_Left) && !io.KeyShift) {
+                    sh.gaussianYaw -= io.MouseDelta.x / std::max(rect.GetWidth(), 1.0f) * 6.2831853f;
+                    sh.gaussianPitch = std::clamp(sh.gaussianPitch + io.MouseDelta.y /
+                                                  std::max(rect.GetHeight(), 1.0f) * 3.1415927f, -1.55f, 1.55f);
+                } else {
+                    const auto cam = gaussianPreviewCamera((int)rect.GetWidth(), (int)rect.GetHeight());
+                    const float perPixelX = 2.0f * cam.dist / (cam.proj.m[0] * std::max(rect.GetWidth(), 1.0f));
+                    const float perPixelY = 2.0f * cam.halfHeight / std::max(rect.GetHeight(), 1.0f);
+                    sh.gaussianCenter = sh.gaussianCenter +
+                        cam.right * (-io.MouseDelta.x * perPixelX) + cam.up * (io.MouseDelta.y * perPixelY);
+                }
+            }
+            ImGui::SetCursorScreenPos(after);
+            if (kit::SecondaryButton("Frame splat bounds")) fitGaussianCamera();
+            if (kit::SecondaryButton("Capture view", !sh.loadedViewCamera.id.empty(),
+                                     "This artifact has no calibrated capture camera."))
+                restoreGaussianCaptureCamera();
+            kit::InlineStatus("Drag: orbit | Right / middle / Shift-drag: pan | Wheel: zoom | Double-click: frame",
+                              kit::Level::Neutral);
+            if (std::getenv("CHUDWARE_SHOT") && s.splatPathTried.find("splat_tiny.ply") != std::string::npos)
+                kit::InlineStatus("Screenshot fixture — not reconstructed session data.", kit::Level::Warn);
+        }
+        if (sh.splatLoad.valid())
+            kit::InlineStatus("Loading complete Gaussian export in the background…", kit::Level::Busy);
+        kit::InlineStatus(sh.splatLoadError.c_str(), kit::Level::Error);
+        if (!sh.splatLoadError.empty()) {
+            kit::InlineStatus(have ? "Showing the last valid preview, not the failed refresh." :
+                                    "No valid preview is loaded.", kit::Level::Warn);
+            if (kit::SecondaryButton("Retry loading artifact")) s.splatPathTried.clear();
+        }
+        if (g.mode == 1) {
+            kit::GapSection();
+            kit::SectionHeader("Object crop — reconstruction units");
+            kit::InlineStatus(g.cropEnabled ? "Explicit 3D center crop applied to saved Gaussian PLY." :
+                                              "Uncropped object preview includes the surrounding scene.",
+                              g.cropEnabled ? kit::Level::Neutral : kit::Level::Warn);
+            ImGui::BeginDisabled(busy);
+            if (!sh.cropDirty && !g.cropEnabled && g.hasBounds)
+                std::copy(g.bounds, g.bounds + 6, g.cropBounds);
+            kit::FieldLabel("Minimum X / Y / Z");
+            sh.cropDirty |= ImGui::InputFloat3("##gaussian_crop_min", g.cropBounds, "%.6g");
+            kit::FieldLabel("Maximum X / Y / Z");
+            sh.cropDirty |= ImGui::InputFloat3("##gaussian_crop_max", g.cropBounds + 3, "%.6g");
+            bool validCrop = true;
+            for (int i = 0; i < 3; ++i)
+                validCrop &= std::isfinite(g.cropBounds[i]) && std::isfinite(g.cropBounds[i + 3]) &&
+                             g.cropBounds[i] < g.cropBounds[i + 3];
+            if (kit::PrimaryButton("Apply object crop", have && validCrop,
+                                   "Load a splat and specify finite minimum values below maximum values."))
+                gaussianAction(st, sid, "reveng_crop_splat", {{"bounds", g.cropBounds}});
+            if (kit::SecondaryButton("Reset crop from original", have && g.cropEnabled))
+                gaussianAction(st, sid, "reveng_crop_splat", {{"bounds", nullptr}});
+            ImGui::EndDisabled();
+            kit::InlineStatus("Crop keeps Gaussian centers inside this box and preserves the original source. A new reconstruction clears the crop because its coordinates change. No semantic segmentation.",
+                              kit::Level::Neutral);
+        }
+    }
+    kit::CardEnd();
+}
 
 // ---- reconstruction kick -------------------------------------------------------
 
@@ -677,15 +1311,22 @@ void kickReconstruct(AppState& st) {
         return;
     }
     if (s.recon.kickPending) return;
+    if (gaussianRunning(s.gaussian) || s.gaussian.pending) {
+        s.recon.kickErr = "Finish or cancel the Gaussian job before starting a CAD reconstruction.";
+        return;
+    }
     static const char* kQuality[] = { "draft", "normal", "high" };
     s.recon.kickPending = true;
     s.recon.kickErr.clear();
     SH().reconStartT = ImGui::GetTime();
     nlohmann::json args = nlohmann::json::object();
-    args["session_id"] = s.sessions[s.selected].session_id;
+    const auto sid = s.sessions[s.selected].session_id;
+    const auto epoch = SH().sessionEpoch;
+    args["session_id"] = sid;
     args["quality"]    = kQuality[std::clamp(s.recon.quality, 0, 2)];
-    st.rpc.call("reveng_reconstruct", args, [](const core::RpcResult& r) {
+    st.rpc.call("reveng_reconstruct", args, [sid, epoch](const core::RpcResult& r) {
         RevEngState& s2 = S();
+        if (!selectedSession(sid) || SH().sessionEpoch != epoch) return;
         s2.recon.kickPending = false;
         if (!r.ok) {
             s2.recon.kickErr = r.err.empty() ? "reveng_reconstruct failed" : r.err;
@@ -870,7 +1511,6 @@ void drawReconSubSteps(const RevEngState& s) {
 
 // The artifact this session currently has, and the slot that renders it.
 kit::PreviewSlot reconSlot(const RevEngState& s) {
-    if (s.splatLoaded && s.splat.hasSplats()) return kit::PreviewSlot::Splat;
     if (!s.artifactMeshPath.empty())          return kit::PreviewSlot::Mesh;
     return kit::PreviewSlot::SparseCloud;
 }
@@ -881,9 +1521,7 @@ void drawReconPreview(RevEngState& s) {
     const kit::PreviewSlot slot = reconSlot(s);
     // The canned sparse fixture deliberately does NOT count as an artifact: it is demo scaffolding,
     // and treating it as content is exactly how "it worked, trust me" sneaks back in.
-    const bool haveArtifact = (slot == kit::PreviewSlot::Splat) ||
-                              (slot == kit::PreviewSlot::Mesh) ||
-                              !s.artifactSparseDir.empty();
+    const bool haveArtifact = (slot == kit::PreviewSlot::Mesh) || !s.artifactSparseDir.empty();
 
     const char* emptyLabel = haveArtifact ? nullptr
                                           : "No reconstruction yet \xe2\x80\x94 run one to see the "
@@ -892,18 +1530,7 @@ void drawReconPreview(RevEngState& s) {
     kit::Viewport3DPreview("##recon_preview", box, slot, emptyLabel);
 
     // Always say WHAT is on screen and whether it is this session's data.
-    if (slot == kit::PreviewSlot::Splat) {
-        const bool isFixture = s.splatPathTried.find("splat_tiny.ply") != std::string::npos;
-        char line[64];
-        std::snprintf(line, sizeof(line), "%zu gaussians", s.splat.count());
-        kit::ValueChip("3DGS splat", line, isFixture ? kit::Level::Warn : kit::Level::Ok,
-                       isFixture ? "Demo fixture, not this session's data."
-                                 : s.splatPathTried.c_str());
-        if (isFixture) {
-            ImGui::SameLine(0.0f, M::reCtlGap());
-            kit::HonestyTag("approximate", "Demo fixture \xe2\x80\x94 preview only, not measurable.");
-        }
-    } else if (slot == kit::PreviewSlot::Mesh) {
+    if (slot == kit::PreviewSlot::Mesh) {
         kit::ValueChip("mesh", "ready", kit::Level::Ok, s.artifactMeshPath.c_str());
     } else if (!s.artifactSparseDir.empty()) {
         kit::ValueChip("sparse model", "ready", kit::Level::Ok, s.artifactSparseDir.c_str());
@@ -957,8 +1584,10 @@ void drawReconRunControls(AppState& st, RevEngState& s, const ReconGate& gate) {
 
     const char* runLabel = s.recon.kickPending ? "Starting\xe2\x80\xa6"
                          : s.recon.active      ? "Running\xe2\x80\xa6"
-                                               : "Run reconstruction";
-    if (kit::PrimaryButton(runLabel, gate.canRun, gate.reason.c_str(),
+                                               : "Run full CAD reconstruction";
+    const bool gaussianBusy = gaussianRunning(s.gaussian) || s.gaussian.pending;
+    if (kit::PrimaryButton(runLabel, gate.canRun && !gaussianBusy,
+                           gaussianBusy ? "Finish or cancel the Gaussian job first." : gate.reason.c_str(),
                            ImVec2(ImGui::GetContentRegionAvail().x, M::reBtnH()))) {
         kickReconstruct(st);
     }
@@ -976,10 +1605,11 @@ void drawReconRunControls(AppState& st, RevEngState& s, const ReconGate& gate) {
 // Decomposed from the old 183-line monolith into the focused helpers above.
 void drawReconstructStage(AppState& st) {
     RevEngState& s = S();
+    drawGaussianPanel(st);
+    kit::GapCards();
 
-    // Lazy-load the canned sparse fixture into the RePoints overlay on first entry (until a real
-    // sparse cloud lands via session artifacts).
-    if (!s.cannedFixtureLoaded) {
+    // Fixtures are strictly screenshot-only; an ordinary empty session stays empty.
+    if (!s.cannedFixtureLoaded && std::getenv("CHUDWARE_SHOT")) {
         s.cannedFixtureLoaded = true;
         std::vector<render::SparsePoint>   pts;
         std::vector<render::CameraFrustum> frusta;
@@ -993,7 +1623,7 @@ void drawReconstructStage(AppState& st) {
     const ReconGate gate = reconPreflight(st, s);
 
     if (gate.hardBlock) {
-        if (kit::BlockedState("Reconstruction unavailable", gate.reason.c_str(), gate.hint.c_str(),
+        if (kit::BlockedState("CAD reconstruction unavailable", gate.reason.c_str(), gate.hint.c_str(),
                               "Re-check backends")) {
             loadCapabilities(st, /*force=*/true);
             S().propsTab = 1;
@@ -1002,7 +1632,7 @@ void drawReconstructStage(AppState& st) {
         return;
     }
 
-    if (kit::CardBegin("##recon_run", "Reconstruct", "mesh")) {
+    if (kit::CardBegin("##recon_run", "Separate CAD / mesh reconstruction", "mesh")) {
         const kit::Level runLvl = !s.recon.err.empty() || !s.recon.kickErr.empty()
                                       ? kit::Level::Error
                                   : s.recon.active ? kit::Level::Busy
@@ -1028,7 +1658,7 @@ void drawReconstructStage(AppState& st) {
 
     kit::GapCards();
 
-    if (kit::CardBegin("##recon_preview_card", "Preview", "display_shaded")) {
+    if (kit::CardBegin("##recon_preview_card", "CAD reconstruction preview", "display_shaded")) {
         drawReconPreview(s);
     }
     kit::CardEnd();
@@ -1059,8 +1689,9 @@ void drawSessionCard(AppState& st, RevEngState& s, int i) {
             std::vector<std::string> meta;
             meta.push_back(ss.name);
             char imgLine[64];
-            std::snprintf(imgLine, sizeof(imgLine), "%d image%s", ss.images,
-                          ss.images == 1 ? "" : "s");
+            const int count = ss.hasGaussian ? ss.gaussianFrames : ss.images;
+            std::snprintf(imgLine, sizeof(imgLine), "%d %s%s", count,
+                          ss.hasGaussian ? "frame" : "image", count == 1 ? "" : "s");
             meta.push_back(imgLine);
             if (!ss.updatedAt.empty()) meta.push_back("updated " + ss.updatedAt);
             kit::ThumbHoverPreview(tex, tw, th, meta);
@@ -1073,12 +1704,36 @@ void drawSessionCard(AppState& st, RevEngState& s, int i) {
             if (ImGui::IsItemHovered() && !ss.session_id.empty())
                 ImGui::SetTooltip("%s", ss.session_id.c_str());
 
-            kit::StatusChip(ss.status.empty() ? "new" : ss.status.c_str(), statusLevel(ss.status));
-            ImGui::SameLine(0.0f, M::reCtlGap());
-            char imgTxt[24];
-            std::snprintf(imgTxt, sizeof(imgTxt), "%d", ss.images);
-            kit::ValueChip("img", imgTxt, ss.images > 0 ? kit::Level::Ok : kit::Level::Neutral,
-                           "Images captured or imported into this session.");
+            if (ss.hasGaussian) {
+                const kit::Level level = ss.gaussianStatus == "cancelled" ? kit::Level::Warn
+                                        : badgeLevel(ss.gaussianStatus);
+                const std::string label = "Gaussian " +
+                    (ss.gaussianStatus.empty() ? std::string("idle") : ss.gaussianStatus);
+                kit::StatusChip(label.c_str(), level,
+                                "Gaussian reference in reconstruction units, not completed CAD.");
+                char frameTxt[24];
+                std::snprintf(frameTxt, sizeof(frameTxt), "%d", ss.gaussianFrames);
+                kit::ValueChip("frames", frameTxt, kit::Level::Neutral,
+                               "Frames accepted by the Gaussian job, including imported video.");
+                if (!ss.gaussianMode.empty())
+                    kit::KeyValueRow("Mode", ss.gaussianMode.c_str());
+                char registeredTxt[48];
+                std::snprintf(registeredTxt, sizeof(registeredTxt), "%d/%d",
+                              ss.gaussianRegistered, ss.gaussianFrames);
+                kit::KeyValueRow("Registered", registeredTxt);
+                char progressTxt[96];
+                std::snprintf(progressTxt, sizeof(progressTxt), "%s %d%%",
+                              ss.gaussianStage.empty() ? "Gaussian" : ss.gaussianStage.c_str(),
+                              std::clamp(ss.gaussianPct, 0, 100));
+                kit::ProgressBar(std::clamp(ss.gaussianPct, 0, 100) / 100.0f, progressTxt, level);
+            } else {
+                kit::StatusChip(ss.status.empty() ? "new" : ss.status.c_str(), statusLevel(ss.status));
+                ImGui::SameLine(0.0f, M::reCtlGap());
+                char imgTxt[24];
+                std::snprintf(imgTxt, sizeof(imgTxt), "%d", ss.images);
+                kit::ValueChip("img", imgTxt, ss.images > 0 ? kit::Level::Ok : kit::Level::Neutral,
+                               "Images captured or imported into this session.");
+            }
             if (ss.approximate) {
                 ImGui::SameLine(0.0f, M::reCtlGap());
                 kit::HonestyTag("approximate",
@@ -1086,18 +1741,21 @@ void drawSessionCard(AppState& st, RevEngState& s, int i) {
                                 "geometry only, not a measured model.");
             }
 
-            const float frac = sessionProgress(s, i);
-            char stageTxt[32];
-            std::snprintf(stageTxt, sizeof(stageTxt), "%d/%d stages",
-                          (int)(frac * kStageCount + 0.5f), kStageCount);
-            kit::ProgressBar(frac, stageTxt,
-                             frac >= 1.0f ? kit::Level::Ok : kit::Level::Neutral);
+            if (!ss.hasGaussian) {
+                const float frac = sessionProgress(s, i);
+                char stageTxt[32];
+                std::snprintf(stageTxt, sizeof(stageTxt), "%d/%d stages",
+                              (int)(frac * kStageCount + 0.5f), kStageCount);
+                kit::ProgressBar(frac, stageTxt,
+                                 frac >= 1.0f ? kit::Level::Ok : kit::Level::Neutral);
+            }
         }
         ImGui::EndGroup();
 
         if (pick && s.selected != i) {
             s.selected = i;
             s.stage = Stage::Source;
+            resetForSessionChange(s);
         }
     }
     kit::CardEnd();
@@ -1113,7 +1771,7 @@ void drawNewSessionCard(AppState& st, RevEngState& s) {
             ImGui::SetKeyboardFocusHere();
             s.focusNewName = false;
         }
-        ImGui::InputTextWithHint("##reveng_new_name", "Part name (optional)",
+        ImGui::InputTextWithHint("##reveng_new_name", "Environment / object name (optional)",
                                  s.newNameBuf, sizeof(s.newNameBuf));
         kit::GapControl();
         if (kit::PrimaryButton(s.newSessionPending ? "Creating\xe2\x80\xa6" : "Create session",
@@ -1151,7 +1809,9 @@ void drawNewSessionCard(AppState& st, RevEngState& s) {
 bool sessionMatchesFilter(const SessionSummary& ss, const char* filter) {
     if (!filter || filter[0] == '\0') return true;
     std::string needle(filter);
-    std::string hay = ss.name + " " + ss.session_id + " " + ss.status;
+    std::string hay = ss.name + " " + ss.session_id + " " +
+        (ss.hasGaussian ? "Gaussian " + ss.gaussianStatus + " " + ss.gaussianStage + " " + ss.gaussianMode
+                        : ss.status);
     for (char& c : needle) c = (char)std::tolower((unsigned char)c);
     for (char& c : hay)    c = (char)std::tolower((unsigned char)c);
     return hay.find(needle) != std::string::npos;
@@ -1195,8 +1855,8 @@ void drawSessionRailBody(AppState& st) {
             return;
         }
         if (kit::EmptyState("part", "No sessions yet",
-                            "A session holds the photos, the scale, the reconstruction and the "
-                            "model for ONE physical part. Create one to start.",
+                            "Capture an environment or object with a live camera, video or photos. "
+                            "Gaussian references use reconstruction units; measured CAD needs scale and review.",
                             "New session")) {
             s.focusNewName = true;
         }
@@ -1624,10 +2284,11 @@ void drawStageStepper(AppState& st, RevEngState& s) {
 
 void drawStageBody(AppState& st, RevEngState& s) {
     if (s.selected < 0 || s.selected >= (int)s.sessions.size()) {
-        if (kit::EmptyState("part", "Point a camera at a part",
-                            "A Reverse Engineering session turns ordinary photos of a real object "
-                            "into a dimensionally-correct, editable CAD model \xe2\x80\x94 for printing a "
-                            "replacement, modifying it, or designing something that mates with it.\n\n"
+        if (kit::EmptyState("part", "Capture an environment or object",
+                            "Use live camera capture, imported video or photos to build a Gaussian "
+                            "reference in reconstruction units — not a dimensionally-correct CAD model.\n\n"
+                            "Measured, editable CAD is a separate workflow requiring scale references "
+                            "and dimension review. Arbitrary photos do not guarantee accurate dimensions.\n\n"
                             "Select a session in the rail, or create one to begin.",
                             "New session")) {
             s.focusNewName = true;
@@ -1650,25 +2311,47 @@ void drawStageBody(AppState& st, RevEngState& s) {
 // Per-frame housekeeping
 // ================================================================================
 
-// Consume a session_id seeded from outside (Parts Library "Generate 3D model" → RE-32).
+// Select a newly created or externally seeded session only once it appears in the list.
 void consumePendingSession(AppState& st, RevEngState& s) {
     if (st.pendingRevengSessionId.empty() || !s.listedOnce) return;
-    const std::string want = st.pendingRevengSessionId;
-    st.pendingRevengSessionId.clear();
     for (int i = 0; i < (int)s.sessions.size(); ++i) {
-        if (s.sessions[i].session_id == want) { s.selected = i; break; }
+        if (s.sessions[i].session_id != st.pendingRevengSessionId) continue;
+        st.pendingRevengSessionId.clear();
+        if (s.selected != i) {
+            s.selected = i;
+            s.stage = Stage::Source;
+            resetForSessionChange(s);
+        }
+        return;
     }
-    // Not in the list yet (backend still writing it) — expire the throttle so it surfaces fast.
-    if (s.selected < 0 || s.selected >= (int)s.sessions.size() ||
-        s.sessions[s.selected].session_id != want) {
-        s.lastListT = -100.0;
-    }
+    // Keep the intended SID until a refresh includes it; never consume it against the old list.
+    s.lastListT = -100.0;
 }
 
-// Everything that must be dropped when the selected session changes. Note the webcam: the device
-// stays OPEN (closing it would lose the negotiated mode and the focus/exposure lock), only the
-// per-session capture bookkeeping is cleared.
+// Session changes release capture and invalidate in-flight callbacks before replacing mirrors.
 void resetForSessionChange(RevEngState& s) {
+    webcamCaptureShutdown();
+    ++SH().sessionEpoch;
+    SH().gaussianPollPending = false;
+    SH().gaussianHydrated = false;
+    SH().gaussianPollT = -100.0;
+    SH().splatRevisionTried = 0;
+    SH().splatLoadError.clear();
+    SH().gaussianCameraFitted = false;
+    SH().loadedViewCamera = {};
+    SH().gaussianCaptureProjection = false;
+    SH().gaussianArtifactDirectory.clear();
+    SH().gaussianRight = {1, 0, 0};
+    SH().gaussianUp = {0, 1, 0};
+    SH().gaussianBack = {0, 0, 1};
+    SH().gaussianYaw = 0.6f;
+    SH().gaussianPitch = 0.25f;
+    SH().cropDirty = false;
+    s.splat.setCloud(render::SplatCloud{});
+    s.rePoints.setCloud({});
+    s.rePoints.setFrusta({});
+    s.cannedFixtureLoaded = false;
+    s.detailPending = false;
     galleryFreeTextures(s.galleryImages);
     s.galleryImages.clear();
     s.gallerySession = s.selected;
@@ -1688,6 +2371,14 @@ void resetForSessionChange(RevEngState& s) {
     for (int i = 0; i < kStageCount; ++i) s.stages[i].badge = "idle";
 
     s.recon = ReconstructState{};
+    s.gaussian = GaussianState{};
+    if (s.selected >= 0 && s.selected < (int)s.sessions.size()) {
+        const auto it = SH().gaussianRuns.find(s.sessions[s.selected].session_id);
+        if (it != SH().gaussianRuns.end()) {
+            s.gaussian.control = it->second;
+            s.gaussian.pending = it->second->pending;
+        }
+    }
     s.scale   = ScaleState{};
     s.model   = ModelState{};
     s.deliver = DeliverState{};
@@ -1733,6 +2424,7 @@ void drawRevEngWorkspace(AppState& st) {
 
     if (s.selected != s.gallerySession) resetForSessionChange(s);
     if (s.selected >= 0 && s.selected < (int)s.sessions.size()) loadSessionDetail(st);
+    pollGaussian(st);
     clampStageToPipeline(s);
 
     // The webcam widget only exists on the Scan lane's Source stage; when it stops being drawn

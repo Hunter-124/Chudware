@@ -481,6 +481,12 @@ CATEGORY_PACKS: dict[str, list[str]] = {
         "reveng_print_scale_mat",
         "list_reveng_sessions",
         "get_reveng_session",
+        # Local Gaussian capture, training, inspection, and object isolation.
+        "reveng_start_splat",
+        "reveng_splat_status",
+        "reveng_finish_splat",
+        "reveng_cancel_splat",
+        "reveng_crop_splat",
         # Reconstruction gate + build.
         "reveng_gate_status",
         "reveng_resolve_gate",

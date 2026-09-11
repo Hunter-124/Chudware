@@ -7,8 +7,21 @@ import argparse
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Start a compiled Chudware service sidecar.")
-    parser.add_argument("--module", required=True, choices=("worker", "mcp"))
-    args = parser.parse_args()
+    parser.add_argument("--module", required=True, choices=(
+        "worker", "mcp", "services.reveng.gaussian_jobs", "services.vision.gaussian_pipeline",
+    ))
+    args, remaining = parser.parse_known_args()
+    if args.module == "services.reveng.gaussian_jobs":
+        from services.reveng.gaussian_jobs import main as supervise
+
+        supervise(remaining)
+        return
+    if args.module == "services.vision.gaussian_pipeline":
+        from services.vision.gaussian_pipeline import main as reconstruct
+
+        raise SystemExit(reconstruct(remaining))
+    if remaining:
+        parser.error("unrecognized arguments: " + " ".join(remaining))
 
     if args.module == "worker":
         from services.worker_main import serve

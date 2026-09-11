@@ -13,10 +13,10 @@ Two backends, both subprocess-only:
              Input:  COLMAP sparse model dir (from RE-09 colmap_pipeline.py)
              Output: dense/ and mesh/ under the session root.
 
-  Brush    — trains a 3D Gaussian Splat, then exports a mesh (TSDF/Poisson).
-             Triggered by BRUSH_BIN env var (path to the brush binary).
-             Input:  COLMAP sparse model dir
-             Output: splat/ (.ply) and mesh/ under the session root.
+  Brush    — trains 3D Gaussians using pinned Brush v0.3.0 (no mesh export).
+             Managed install or explicit BRUSH_BIN executable.
+             Input:  standalone undistorted COLMAP dataset with model + images.
+             Output: immutable, validated Gaussian PLY exports under splat/.
 
 When the required binary env/path is absent, both functions return the degradation
 envelope  {"ok": false, "reason": "backend_not_provisioned", ...}  — never a traceback.
@@ -25,6 +25,13 @@ from __future__ import annotations
 
 import os
 import subprocess
+import shutil
+import signal
+import tempfile
+import time
+from pathlib import Path
+
+from .reveng_provision import brush_executable
 from typing import Optional
 
 
@@ -213,104 +220,173 @@ def run_brush(
     session_dir: str,
     *,
     max_steps: int = 30_000,
-    export_mesh: bool = True,
+    export_mesh: bool = False,
+    image_dir: Optional[str] = None,
+    export_every: Optional[int] = None,
+    progress=None,
+    cancel=None,
+    own_process_group: bool = True,
 ) -> dict:
-    """Run the Brush 3DGS trainer on a COLMAP sparse model and export a mesh.
+    """Train a complete COLMAP dataset with Brush's positional v0.3.0 CLI.
 
-    Args:
-        sparse_dir:   Path to the COLMAP sparse model directory.
-        session_dir:  Session root.  Splat goes to <session_dir>/splat/,
-                      mesh to <session_dir>/mesh/.
-        max_steps:    Training iterations (default 30 000).
-        export_mesh:  If True (default) export a mesh via TSDF/Poisson after training.
-
-    Returns:
-        On success:  {"ok": True, "splat_path": <str>, "mesh_path": <str|None>, "backend": "brush"}
-        On failure:  {"ok": False, "reason": ..., "hint": ..., "backend": "brush"}
+    ``image_dir`` names the entire undistorted dataset root, not its images
+    subfolder. Without it, ``session_dir`` must itself be a complete dataset.
+    Each invocation owns a fresh output directory: stale exports cannot turn a
+    failed refresh into success. Standalone calls own a new process group and
+    cancel that group boundedly. A supervising process-group owner explicitly
+    passes ``own_process_group=False`` and is responsible for stopping the tree.
     """
-    brush_bin = os.environ.get("BRUSH_BIN", "")
-    if not brush_bin:
-        return {**_not_provisioned("set BRUSH_BIN to the Brush binary path"), "backend": "brush"}
+    max_splats = 2_000_000  # Native viewer's explicit training resource budget.
+    base = {"backend": "brush", "mesh_path": None, "max_splats": max_splats}
 
-    splat_dir = os.path.join(session_dir, "splat")
-    mesh_dir = os.path.join(session_dir, "mesh")
-    os.makedirs(splat_dir, exist_ok=True)
-    os.makedirs(mesh_dir, exist_ok=True)
+    def failure(reason, hint, **extra):
+        return {**base, "ok": False, "reason": reason, "hint": hint, **extra}
 
-    splat_ply = os.path.join(splat_dir, "splat.ply")
-    mesh_ply = os.path.join(mesh_dir, "brush_mesh.ply")
-
-    # Train the Gaussian splat
-    train_cmd = [
-        brush_bin,
-        "train",
-        "--source-path", sparse_dir,
-        "--model-path", splat_dir,
-        "--output-ply", splat_ply,
-        "--iterations", str(max_steps),
-    ]
-    ok, err = _run(train_cmd)
-    if not ok:
-        return {"ok": False, "reason": f"Brush train failed: {err}", "hint": "check BRUSH_BIN and sparse_dir", "backend": "brush"}
-
-    mesh_path: Optional[str] = None
     if export_mesh:
-        export_cmd = [
-            brush_bin,
-            "export-mesh",
-            "--splat", splat_ply,
-            "--output", mesh_ply,
-            "--method", "tsdf",
+        return failure("mesh_export_unsupported", "Brush exports Gaussians, not meshes; use the separate OpenMVS action.")
+    executable = brush_executable()
+    if not executable:
+        return {**base, **_not_provisioned("Run python scripts/provision_reveng.py or set BRUSH_BIN to an executable.")}
+    if isinstance(max_steps, bool) or not isinstance(max_steps, int) or max_steps < 1:
+        return failure("invalid_iterations", "max_steps must be a positive integer.")
+    every = min(max_steps, 100) if export_every is None else export_every
+    if isinstance(every, bool) or not isinstance(every, int) or every < 1:
+        return failure("invalid_export_interval", "export_every must be a positive integer.")
+    dataset = Path(image_dir or session_dir).expanduser().resolve()
+    model_dirs = (dataset / "sparse/0", dataset / "sparse", dataset)
+    model = next((p for p in model_dirs if any(
+        all((p / (name + ext)).is_file() for name in ("cameras", "images", "points3D"))
+        for ext in (".bin", ".txt"))), None)
+    if not (dataset / "images").is_dir() or model is None:
+        return failure("invalid_dataset", "Brush needs a complete undistorted COLMAP dataset root with images/ and a sparse model.")
+    if not Path(sparse_dir).is_dir():
+        return failure("invalid_sparse_model", "sparse_dir must name the reconstructed COLMAP model.")
+    if cancel and cancel():
+        return failure("cancelled", "Training cancelled before launch.")
+
+    # Import at call time: the pipeline also uses this adapter for training.
+    from .gaussian_pipeline import inspect_splat
+
+    proc = None
+    latest = {}
+    owned_group = os.name == "posix" and own_process_group
+
+    def stop():
+        if proc is None:
+            return
+        if owned_group:
+            try:
+                os.killpg(proc.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+        elif proc.poll() is None:
+            proc.terminate()
+        try:
+            proc.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            if owned_group:
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+            else:
+                proc.kill()
+            proc.wait(timeout=3)
+        # Descendants can outlive their immediate parent after TERM.
+        if owned_group:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+
+    try:
+        root = Path(session_dir).resolve() / "splat"
+        root.mkdir(parents=True, exist_ok=True)
+        run_dir = Path(tempfile.mkdtemp(prefix="brush-", dir=root))
+        exports = run_dir / "exports"
+        exports.mkdir()
+        published = run_dir / "published"
+        published.mkdir()
+        log_path = run_dir / "brush.log"
+        command = [
+            executable, str(dataset),
+            "--total-steps", str(max_steps), "--export-every", str(every),
+            "--max-splats", str(max_splats),
+            "--export-path", str(exports), "--export-name", "export_{iter}.ply",
         ]
-        ok, err = _run(export_cmd)
-        if not ok:
-            # Non-fatal: splat succeeded; mesh export failed
-            return {
-                "ok": True,
-                "splat_path": splat_ply,
-                "mesh_path": None,
-                "mesh_warning": f"Brush mesh export failed: {err}",
-                "backend": "brush",
-            }
-        mesh_path = mesh_ply
+        seen = set()
 
-    return {"ok": True, "splat_path": splat_ply, "mesh_path": mesh_path, "backend": "brush"}
+        def publish():
+            nonlocal latest
+            candidates = []
+            for path in exports.glob("export_*.ply"):
+                try:
+                    iteration = int(path.stem.removeprefix("export_"))
+                except ValueError:
+                    continue
+                if iteration not in seen:
+                    candidates.append((iteration, path))
+            # Only the newest completed snapshot is useful to an interactive UI.
+            for iteration, path in sorted(candidates, reverse=True):
+                if latest and iteration <= latest["iteration"]:
+                    continue
+                temporary = published / (path.name + ".tmp")
+                try:
+                    before = path.stat()
+                    shutil.copyfile(path, temporary)
+                    info = inspect_splat(str(temporary))
+                    if info["count"] > max_splats:
+                        continue
+                    after = path.stat()
+                    if (before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns):
+                        continue
+                    target = published / path.name
+                    os.replace(temporary, target)
+                except (ValueError, OSError):
+                    # Export writes are not atomic upstream. Retry next poll.
+                    continue
+                finally:
+                    temporary.unlink(missing_ok=True)
+                seen.add(iteration)
+                latest = {"splat_path": str(target), "iteration": iteration,
+                          "total_iterations": max_steps, "bounds": info["bounds"],
+                          "max_splats": max_splats}
+                if progress:
+                    progress("training", min(99, iteration * 100 // max_steps),
+                             f"Brush exported iteration {iteration}/{max_steps}", dict(latest))
+                break
 
-
-def brush_commands(
-    sparse_dir: str,
-    session_dir: str,
-    *,
-    max_steps: int = 30_000,
-    export_mesh: bool = True,
-) -> dict:
-    """Return the exact subprocess command lines for the Brush pipeline without running them.
-
-    Returns:
-        {"ok": True, "commands": [list-of-args, ...], "backend": "brush"}
-        {"ok": False, "reason": "backend_not_provisioned", ...} when BRUSH_BIN unset.
-    """
-    brush_bin = os.environ.get("BRUSH_BIN", "")
-    if not brush_bin:
-        return {**_not_provisioned("set BRUSH_BIN to the Brush binary path"), "backend": "brush"}
-
-    splat_dir = os.path.join(session_dir, "splat")
-    mesh_dir = os.path.join(session_dir, "mesh")
-    splat_ply = os.path.join(splat_dir, "splat.ply")
-    mesh_ply = os.path.join(mesh_dir, "brush_mesh.ply")
-
-    commands = [
-        [brush_bin, "train",
-         "--source-path", sparse_dir,
-         "--model-path", splat_dir,
-         "--output-ply", splat_ply,
-         "--iterations", str(max_steps)],
-    ]
-    if export_mesh:
-        commands.append([
-            brush_bin, "export-mesh",
-            "--splat", splat_ply,
-            "--output", mesh_ply,
-            "--method", "tsdf",
-        ])
-    return {"ok": True, "commands": commands, "backend": "brush"}
+        with log_path.open("wb") as log:
+            proc = subprocess.Popen(command, cwd=str(dataset), stdout=log,
+                                    stderr=subprocess.STDOUT, start_new_session=owned_group)
+            if progress:
+                progress("training", 0, "Brush training started", None)
+            next_publish = 0.0
+            while proc.poll() is None:
+                if cancel and cancel():
+                    return failure("cancelled", "Training cancelled; last completed preview retained.", **latest)
+                now = time.monotonic()
+                if now >= next_publish:
+                    publish()
+                    next_publish = now + 1.0
+                time.sleep(0.1)
+            publish()
+        if cancel and cancel():
+            return failure("cancelled", "Training cancelled; last completed preview retained.", **latest)
+        if proc.returncode != 0:
+            with log_path.open("rb") as log:
+                log.seek(max(0, log_path.stat().st_size - 8192))
+                detail = log.read().decode("utf-8", errors="replace")
+            return failure("brush_failed", detail or f"Brush exited with {proc.returncode}",
+                           returncode=proc.returncode, log_path=str(log_path), **latest)
+        if not latest or latest["iteration"] != max_steps:
+            return failure("invalid_brush_output", "Brush did not produce a complete valid final Gaussian PLY.",
+                           log_path=str(log_path), **latest)
+        if progress:
+            progress("training", 100, "Brush training complete", dict(latest))
+        return {**base, "ok": True, **latest, "log_path": str(log_path)}
+    except (OSError, ValueError) as exc:
+        return failure("brush_failed", str(exc), **latest)
+    finally:
+        if proc is not None and (owned_group or proc.poll() is None):
+            stop()

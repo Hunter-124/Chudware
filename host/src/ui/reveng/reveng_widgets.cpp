@@ -233,6 +233,7 @@ ChipGeom chipGeom(const char* label, bool withDot) {
 constexpr int kSlotCount = 6;   // None, SparseCloud, Splat, Mesh, Deviation, Parametric
 struct SlotRec {
     ImRect rect;
+    ImRect clip;
     bool   drawn = false;
 };
 SlotRec g_slots[kSlotCount];
@@ -769,6 +770,8 @@ ImRect Viewport3DPreview(const char* id, const ImVec2& box, PreviewSlot slot,
     const ImRect r(p0, p1);
     SlotRec&     rec = g_slots[slotIndex(slot)];
     rec.rect  = r;
+    rec.clip = r;
+    rec.clip.ClipWith(ImRect(dl->GetClipRectMin(), dl->GetClipRectMax()));
     rec.drawn = true;
 
     ImGui::PopID();
@@ -779,6 +782,14 @@ bool previewSlotRect(PreviewSlot slot, ImRect& out) {
     const SlotRec& rec = g_slots[slotIndex(slot)];
     if (!rec.drawn) return false;
     out = rec.rect;
+    return true;
+}
+
+bool previewSlotClip(PreviewSlot slot, ImRect& out) {
+    const SlotRec& rec = g_slots[slotIndex(slot)];
+    if (!rec.drawn || rec.clip.GetWidth() <= 0.0f || rec.clip.GetHeight() <= 0.0f)
+        return false;
+    out = rec.clip;
     return true;
 }
 

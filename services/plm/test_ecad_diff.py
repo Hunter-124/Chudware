@@ -2,7 +2,7 @@
 points that route ECAD documents to it instead of the part/asm doc_diff shape:
 
   * ecad_diff() on in-memory canonical PCB docs — add/remove/change coverage
-    for nets and components, float-noise suppression (6dp, like doc_diff),
+    for nets and components,
     and untouched sections (footprints/tracks) staying empty
   * doc_diff_tools.doc_diff() dispatch: ECAD schema -> ecad_diff, part/asm
     schema -> unchanged feature-tree diff (byte-identical old behavior)
@@ -157,19 +157,6 @@ def test_identical_docs_produce_empty_diff():
             assert diff[f"{section}_{kind}"] == []
 
 
-def test_float_noise_below_6dp_suppressed_like_doc_diff():
-    a = _pcb_a()
-    b = _pcb_a()
-    # 7th decimal place noise only — rounds away to the same 6dp value.
-    b["tracks"][0]["width"] = 0.2500001
-    diff = ecad_diff.ecad_diff(a, b)
-    assert diff["tracks_changed"] == []
-
-    # a genuine (>= 6dp) change is still caught.
-    b2 = _pcb_a()
-    b2["tracks"][0]["width"] = 0.5
-    diff2 = ecad_diff.ecad_diff(a, b2)
-    assert {r["id"] for r in diff2["tracks_changed"]} == {"t1"}
 
 
 def test_missing_section_is_schema_agnostic():

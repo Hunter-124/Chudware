@@ -473,8 +473,10 @@ Eigen::VectorXd System::lm(const Eigen::VectorXd& x_in, const BlockSet& bs,
                 }
                 if (!solved) {
                     // A rank-deficient QR basic solution is not minimum-norm.
-                    const Eigen::MatrixXd A = sparse_jacobian.transpose() * sparse_jacobian;
-                    step = solve_step(A, sparse_jacobian.transpose() * sparse_rhs);
+                    // Solve the augmented system itself: forming its normal
+                    // matrix squares the spectrum and discards weak constrained
+                    // directions merely because another coordinate is free.
+                    step = lstsq(Eigen::MatrixXd(sparse_jacobian), sparse_rhs);
                 }
             } else {
                 Eigen::MatrixXd A = JtJ;

@@ -184,8 +184,13 @@ TEST_CASE("large under-defined solve preserves free coordinates and minimum-norm
 }
 
 TEST_CASE("large sparse solve retains weak coordinates in mixed-scale constraints") {
+    int variables = 128;
+    SUBCASE("fully constrained") {}
+    SUBCASE("with an unrelated free coordinate") { variables = 129; }
     System s;
-    const auto ids = s.add_vars(128);
+    std::vector<double> initial(variables, 0.0);
+    if (variables > 128) initial[128] = 17.0;
+    const auto ids = s.add_vars(variables, initial);
     for (int i = 0; i < 64; ++i) {
         s.add_residual(
             [](const Eigen::VectorXd& xs) {
@@ -206,6 +211,7 @@ TEST_CASE("large sparse solve retains weak coordinates in mixed-scale constraint
         CHECK(std::abs(result.x(2 * i) + 300.0) < 1e-6);
         CHECK(std::abs(result.x(2 * i + 1) - 0.1) < 1e-10);
     }
+    if (variables > 128) CHECK(result.x(128) == 17.0);
 }
 
 TEST_CASE("high initial damping does not stop a progressing solve") {

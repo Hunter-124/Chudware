@@ -3802,3 +3802,52 @@ motion scenario produced 24 frames, applied frame 12 and exited successfully.
 Gate logs and the GUI evidence are retained under
 `ME-490/Engineering/Verification/me490_reference_final_gate` and
 `me490_motion_gui_smoke`. These program checks do not establish rover clearance.
+
+## 2026-09-11 — lossless joint persistence and normal motion smoke
+
+The actual ME-490 advance at pose 12 exposed a persistence defect, not solver
+stagnation. Six-decimal JSON serialization changed the oblique steering axis by
+3.6637e-7 radians, making the angle joint inconsistent with its two spherical
+pivots. The captured Jacobian and native rotation reproduce the failed angular
+residual exactly; direct-J corrections cannot solve those contradictory inputs.
+Original native requests, full-precision declarations and numerical captures are
+retained in `ME-490/Engineering/Verification/me490_pose12_probe`.
+
+Native editable containers and Python canonical history now preserve round-trip
+numeric precision. Live-state snapshots retain the same values and hash as
+clients; semantic CAD/ECAD diffs no longer hide small numeric changes. The lossy
+helpers and their rounding-only tests are removed. Existing six-decimal files
+remain readable, but lost declarations must be restored from original sources,
+not compensated with a looser solver tolerance.
+
+An independently reproduced minimum-norm defect is also corrected: the sparse
+rank-deficient fallback solves the augmented Jacobian directly rather than its
+normal matrix. A mixed-scale constrained system must still converge when an
+unrelated coordinate is free, without moving that free coordinate.
+
+The GUI motion smoke now waits for the RPC busy guard and verifies that a study
+was actually created. The former daemon failure was premature scenario dispatch,
+not production snapshot routing; production source matching remains unchanged.
+
+Focused verification passes `nsolve`, `simulate_motion` and `sim_cache` in both
+native build trees, plus 68 Python canonical/diff/live-state cases. A real native
+three-sample oblique-pivot sweep succeeds before save, after reopen, and after
+PLM history restoration at unchanged tolerances. The save/reopen smoke's maximum
+pivot shift is 3.553e-15 mm. Both daemon and in-process GUI scenarios produce 24
+samples and apply midpoint 12; their logs and images are retained under
+`me490_motion_gui_smoke/{daemon_fixed,direct_fixed}`. These checks do not establish
+the rover's full sampled motion or clearance.
+
+The regenerated 1191-solid rover now passes the formerly failing pose 12:
+3.333298081997782e-10 residual against the unchanged
+1.4375923640545746e-8 tolerance, including both exact-current-value frames.
+`me490_pose12_lossless.json` binds that result to the regenerated source and
+pinned native runtime. The full 241-pose solve/interference run remains separate.
+
+The complete Linux gate also passes (native/host/WASM builds, full CTest, hostd,
+web parity, packaging, service/tool/training suites and GUI shot smokes).
+MCP reports 2994 passed, 26 skipped and one expected failure; PLM reports 392
+passed. The golden-demo gate reports 13 passed, zero failed and one skipped.
+Opt-in AppImage, V&V, modeling and benchmark stages were not enabled. Gate logs,
+demo summary and smoke images are preserved in
+`ME-490/Engineering/Verification/me490_precision_final_gate`.

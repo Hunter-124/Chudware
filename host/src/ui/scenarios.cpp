@@ -2388,18 +2388,16 @@ void ScenarioRunner::runWorkspaces(AppState& st) {
 // Kinematic motion study end-to-end. Steps:
 //   0: Build two parts (base box + arm box), author them as AICM files.
 //   1: new_assembly, insert both components.
-//   2: Add an angle mate between two faces (the motion driver mate).
-//   3: Open Simulate workspace, create Motion study, set leftPaneTab = LP_Simulation.
+//   2: Add a plane-distance mate between two faces (the motion driver mate).
+//   3: Wait for engine readiness, create and configure a Motion study in Simulate.
 //      Capture motion_t0.png (the setup/tree view before solve).
-//   4: Run the motion study (sim_run — synchronous). If solve fails, report and stop.
+//   4: Dispatch the async motion study once; 5: wait for its completed trajectory.
 //      Capture motion_t1.png (frame 0, bodies at start pose).
-//   5: Advance to mid-frame via applyMotionFramePublic, capture motion_t2.png.
+//   6: Advance to mid-frame via applyMotionFramePublic, capture motion_t2.png.
 //      Bodies MUST be at a different position from t1 to prove live playback.
 //
-// Note: the motion scenario requires a real assembly with at least one drivable mate.
-// If the worker's simulate_motion RPC fails (no kinematic solver available or no mate
-// found), the scenario reports "motion solve FAILED" and still writes t0 + t1 as
-// partial evidence — it does NOT fake the body-position difference.
+// Requires a real assembly with a drivable mate. Setup/solve failures stop the scenario
+// explicitly; a captured setup image is not evidence of a completed motion run.
 void ScenarioRunner::runMotion(AppState& st) {
     if (!st.wantMotion || st.motionShotDone) return;
     if (!st.workerStarted || st.frame < 5) return;
@@ -2546,16 +2544,28 @@ void ScenarioRunner::runMotion(AppState& st) {
             mtSettle = kSettle; ++mtStep; break;
         }
         case 3: {
-            // Switch to Simulate workspace, create Motion study.
+            // Daemon bootstrap/snapshot RPCs can still be active after the viewport has
+            // settled. newStudy rejects a busy engine; a frame delay is not readiness.
+            if (st.rpc.busy()) return;
+            if (!st.simManager) {
+                std::printf("motion: FAILED — no Simulation Manager for the assembly\n");
+                std::fflush(stdout);
+                st.motionShotDone = true;
+                break;
+            }
             st.activeWorkspace = AppState::Workspace::Simulate;
             st.leftPaneTab     = AppState::LP_Simulation;
-            if (st.simManager) {
-                st.simManager->handleCommand(st, "sim_new_motion");
-                st.simManager->configureActiveMotion(st, 60.0f, 100.0f, 24);
-                std::printf("motion: Motion study created\n"); std::fflush(stdout);
-            } else {
-                std::printf("motion: WARNING no simManager\n"); std::fflush(stdout);
+            const int studiesBefore = st.simManager->studyCount();
+            st.simManager->handleCommand(st, "sim_new_motion");
+            if (st.simManager->studyCount() != studiesBefore + 1) {
+                std::printf("motion: FAILED — Motion study was not created: %s\n",
+                            st.status.c_str());
+                std::fflush(stdout);
+                st.motionShotDone = true;
+                break;
             }
+            st.simManager->configureActiveMotion(st, 60.0f, 100.0f, 24);
+            std::printf("motion: Motion study created\n"); std::fflush(stdout);
             mtCapture = mtSavePath + "/motion_t0.png";
             mtSettle  = kSettle; ++mtStep; break;
         }
@@ -2574,7 +2584,7 @@ void ScenarioRunner::runMotion(AppState& st) {
                         (int)mtRunOk, mtRunOk ? st.simManager->motionFrameCount() : 0);
             std::fflush(stdout);
             if (!mtRunOk) {
-                std::printf("motion: FAILED — no completed trajectory\n");
+                std::printf("motion: FAILED — no completed trajectory: %s\n", st.status.c_str());
                 std::fflush(stdout);
                 st.motionShotDone = true;
                 break;

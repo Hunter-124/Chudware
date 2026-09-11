@@ -51,8 +51,8 @@ This document extends what already ships. It does **not** invent a greenfield fo
 
 Canonical `document.json` rules (`doc_schema.md` Appendix A / T-H2):
 
-- sorted keys, floats rounded to **6 dp**, indent=2, UTF-8 no BOM, **no wall-clock timestamps**.
-- C++: `canonical_doc_json()` = `round_floats(doc, 6).dump(2)` (`stepplus.cpp`).
+- sorted keys, full round-trip numeric precision, indent=2, UTF-8 no BOM, **no wall-clock timestamps**.
+- C++: `canonical_doc_json()` uses `doc.dump(2)` without quantization (`stepplus.cpp`).
 - Hash for cache validity: FNV-1a of that form with volatile top-level `id` stripped (`stepplus_doc_hash`).
 
 ### 1.3 Document kinds already carried by the container

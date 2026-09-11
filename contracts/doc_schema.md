@@ -543,16 +543,16 @@ that drive configurations live in [worker_rpc.md §Configurations](worker_rpc.md
 
 ## Appendix A — Canonical `document.json` dump policy (T-H2)
 
-**Goal:** saving the same document twice, or rebuilding geometry that did not change, must yield
-byte-identical `document.json` so that PDM-lite (T-BL10), correction-trace diffing (T-H1), and
-`doc_diff` (below) produce zero false-positive deltas.
+**Goal:** serializing the same document tree repeatedly must yield byte-identical
+`document.json` without changing its numeric values. PDM-lite (T-BL10), correction
+traces (T-H1), and `doc_diff` must retain even small changes to axes and transforms.
 
 ### Rules (normative for every `document.json` producer)
 
 | Rule | Detail |
 |---|---|
 | **Sorted keys** | Object keys MUST be emitted in lexicographic (ASCII) order. |
-| **Float rounding** | Every float MUST be rounded to **6 decimal places** before serialization (µm-grade for mm lengths; covers 1e-3 deg for angles). Rounding is applied at serialize time only — in-memory doubles are never mutated. |
+| **Numeric precision** | Every number MUST retain its full round-trip precision. Serialization, history snapshots, live synchronization, and semantic diffing MUST NOT quantize floats. Decimal rounding of dimensionless axes or rotation coefficients can make otherwise consistent constraints unsolvable after reopening. |
 | **No timestamps** | `document.json` MUST NOT contain wall-clock timestamps or build counters. Timestamps belong in `meta.json` only (exempt from the byte-stability requirement). |
 | **indent=2** | Two-space indentation, no trailing whitespace. |
 | **UTF-8, no BOM** | The file is UTF-8 encoded with no byte-order mark. |
@@ -561,24 +561,30 @@ byte-identical `document.json` so that PDM-lite (T-BL10), correction-trace diffi
 
 | Source | Fix |
 |---|---|
-| Float dust (`599.9999…`, `1e-16` centroid residuals) | Round to 6 dp at serialize time |
 | Non-canonical key order in some emitters | Sort keys |
 | Timestamps inside `document.json` | Moved to `meta.json` exclusively |
+
+Numerical differences are document data, not serialization noise. Display formatting
+may shorten numbers without changing stored values. Older six-decimal files remain
+readable, but discarded precision cannot be recovered from them; restore original
+authored declarations or regenerate from preserved sources rather than relax solver
+tolerances.
 
 ### Implementations
 
 - **C++** (`.step+` save path): `core/doc/stepplus.cpp::canonical_doc_json()` — calls
-  `round_floats(doc, 6).dump(2)`. `nlohmann::json` uses `std::map` → keys are already sorted.
+  `doc.dump(2)`, omitting only an explicitly excluded root entry when requested.
+  `nlohmann::json` uses `std::map` → keys are already sorted.
 - **Python** (utility + ECAD already canonical): `services/plm/canonical.py::canonical_dump()` —
-  calls `json.dumps(round_floats_doc(doc), indent=2, sort_keys=True)`.
-- ECAD `.ecad+` save (`services/formats/formats.py:107`) already uses `sort_keys=True`; the float
-  rounding rule applies there too via `services/plm/canonical.py` if ECAD floats ever carry dust.
+  calls `json.dumps(doc, indent=2, sort_keys=True)` without changing numbers.
+- ECAD `.ecad+` save (`services/formats/formats.py`) likewise preserves numbers and
+  uses sorted keys.
 
 ### `doc_diff` — semantic document diff
 
 `doc_diff(rev_a, rev_b)` computes a feature-level delta between two canonical `document.json`
-dicts. Both inputs MUST be already-canonical (use `canonical_dump` before persisting; call on
-the parsed dict for in-memory diffs). The diff is keyed on stable ids (`f*`, `e*`, `c*`,
+dicts. Use `canonical_dump` before persisting and parsed dictionaries for in-memory
+diffs. Numeric changes are compared without quantization. The diff is keyed on stable ids (`f*`, `e*`, `c*`,
 `k*`, `m*`) and returns:
 
 ```json

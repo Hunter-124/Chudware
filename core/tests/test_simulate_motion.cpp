@@ -30,6 +30,7 @@
 #include <BRepAlgoAPI_Cut.hxx>
 #include <BRepPrimAPI_MakeBox.hxx>
 #include <BRepPrimAPI_MakeCylinder.hxx>
+#include <BRepPrimAPI_MakeSphere.hxx>
 #include <gp_Ax2.hxx>
 #include <gp_Dir.hxx>
 #include <gp_Pnt.hxx>
@@ -401,7 +402,7 @@ TEST_CASE("doc_simulate_motion: offset revolute pose survives rebuilds and save 
             -s, 0, c, 575 + 910*s - 545*c,
             0, 0, 0, 1};
     };
-    const auto check_tree_pose = [&](const json& response, double degrees, double rotation_tolerance = 1e-9) {
+    const auto check_tree_pose = [&](const json& response, double degrees) {
         const auto& tree = response.at("tree");
         REQUIRE(tree.at("components").size() == 2);
         const auto expected = expected_pose(degrees);
@@ -412,7 +413,7 @@ TEST_CASE("doc_simulate_motion: offset revolute pose survives rebuilds and save 
                 const double wanted = component.at("id") == "k2" ? expected[k] :
                     authored_pose.at(k).get<double>();
                 // A 1e-9-radian residual permits ~1e-6 mm at this offset pin.
-                const double tolerance = k == 3 || k == 7 || k == 11 ? 2e-6 : rotation_tolerance;
+                const double tolerance = k == 3 || k == 7 || k == 11 ? 2e-6 : 1e-9;
                 CHECK(std::abs(actual[k] - wanted) < tolerance);
             }
         }
@@ -467,10 +468,79 @@ TEST_CASE("doc_simulate_motion: offset revolute pose survives rebuilds and save 
     doc::doc_save(did, saved_path.string());
     const auto reopened = doc::doc_open(saved_path.string());
     const auto reopened_id = reopened.at("doc_id").get<std::string>();
-    // Canonical document.json rounds coefficients to six decimal places.
-    check_tree_pose(reopened, -4.0, 5.1e-7);
+    check_tree_pose(reopened, -4.0);
     check_tree_pose(doc::doc_rebuild(reopened_id), -4.0);
     check_current_motion(reopened_id, -4.0);
+    fs::remove(saved_path);
+    fs::remove(path);
+}
+
+TEST_CASE("doc_simulate_motion: saved oblique joint remains compatible with its two spherical pivots") {
+    const auto path = tmp_path("oblique_spherical_pivots.step");
+    const auto saved_path = tmp_path("oblique_spherical_pivots.step+");
+    const TopoDS_Shape lower = BRepPrimAPI_MakeSphere(gp_Pnt(0, 0, 0), 1).Shape();
+    const TopoDS_Shape upper = BRepPrimAPI_MakeSphere(gp_Pnt(10, 20, 120), 1).Shape();
+    doc::export_bodies({lower, upper}, path.string(), "step");
+    json lower_selector, upper_selector;
+    for (const auto& face : doc::describe_faces(lower))
+        if (face.surf == "sphere") lower_selector = doc::make_selector(face);
+    for (const auto& face : doc::describe_faces(upper))
+        if (face.surf == "sphere") upper_selector = doc::make_selector(face);
+    REQUIRE_FALSE(lower_selector.is_null());
+    REQUIRE_FALSE(upper_selector.is_null());
+    const auto did = doc::doc_new("assembly", "oblique_spherical_pivots")
+                         .at("doc_id").get<std::string>();
+    doc::doc_apply_ops(did, -1, json::array({
+        {{"op", "asm_insert_component"}, {"source", {{"path", path.string()}}}, {"fixed", true}},
+        {{"op", "asm_insert_component"}, {"source", {{"path", path.string()}}}, {"fixed", false}}
+    }), false);
+    const auto refs = [](const json& selector) {
+        return json::array({{{"component", "k1"}, {"selector", selector}},
+                            {{"component", "k2"}, {"selector", selector}}});
+    };
+    // The two real sphere centers and the declared pin define the SAME line.
+    // Rounding the unit axis on save changes that line and makes the redundant
+    // constraints inconsistent as soon as the driven body rotates.
+    const double length = std::sqrt(149.0);
+    const auto added = doc::doc_apply_ops(did, -1, json::array({
+        {{"op", "asm_add_mate"}, {"mate", {
+            {"type", "coincident"}, {"refs", refs(lower_selector)}}}},
+        {{"op", "asm_add_mate"}, {"mate", {
+            {"type", "coincident"}, {"refs", refs(upper_selector)}}}},
+        {{"op", "asm_add_mate"}, {"mate", {
+            {"type", "angle"}, {"align", "aligned"}, {"refs", refs(lower_selector)},
+            {"value", {{"value", 0.0}, {"axis", {1.0 / length, 2.0 / length, 12.0 / length}},
+                       {"axis_point", {0, 0, 0}}}}}}}
+    }), false);
+    REQUIRE(added.at("rebuild").at("converged").get<bool>());
+    const auto mid = added.at("id_map").at("$2").get<std::string>();
+    const auto sweep = [&](const std::string& id) {
+        const auto motion = doc::doc_simulate_motion(id, mid, 0, 20, 3, false, 0);
+        INFO(motion.dump(2));
+        REQUIRE(motion.at("ok").get<bool>());
+        REQUIRE(motion.at("trajectory").size() == 3);
+        for (const auto& frame : motion.at("trajectory")) {
+            REQUIRE(frame.at("converged").get<bool>());
+            CHECK(frame.at("pose_check").at("ok").get<bool>());
+            for (const auto& body : frame.at("bodies")) {
+                if (body.at("component") != "k2") continue;
+                const auto transform = body.at("transform").get<std::vector<double>>();
+                for (const auto& point : std::array<std::array<double, 3>, 2>{
+                         std::array<double, 3>{0, 0, 0}, {10, 20, 120}}) {
+                    for (size_t row = 0; row < 3; ++row) {
+                        double world = transform[12 + row];
+                        for (size_t column = 0; column < 3; ++column)
+                            world += transform[4 * column + row] * point[column];
+                        CHECK(std::abs(world - point[row]) < 1e-7);
+                    }
+                }
+            }
+        }
+    };
+    sweep(did);
+    doc::doc_save(did, saved_path.string());
+    const auto reopened = doc::doc_open(saved_path.string());
+    sweep(reopened.at("doc_id").get<std::string>());
     fs::remove(saved_path);
     fs::remove(path);
 }

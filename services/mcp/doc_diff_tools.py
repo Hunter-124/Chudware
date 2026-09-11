@@ -25,11 +25,11 @@ Registration: register_doc_diff_tools(mcp) → adds tool ``doc_diff``.
 from __future__ import annotations
 
 import json
+from copy import deepcopy
 from typing import Any
 
 from mcp.server.fastmcp import FastMCP
 
-from services.plm.canonical import canonical_dump, round_floats_doc
 from services.plm.ecad_diff import ecad_diff as _ecad_semantic_diff, is_ecad_schema
 
 
@@ -114,9 +114,8 @@ def _mate_diff(old_mates: dict, new_mates: dict) -> list[dict]:
 def doc_diff(rev_a: dict, rev_b: dict) -> dict:
     """Compute a semantic feature-level diff between two document dicts.
 
-    Both inputs should be canonical (floats already rounded) for a stable diff.
-    The function applies round_floats_doc internally to tolerate minor float noise
-    in inputs that haven't been through canonical_dump yet.
+    Numeric values are compared without quantization: even a small change to an
+    axis or transform can alter the assembly constraints.
 
     ECAD documents (schema head aicad.pcb/aicad.sch/aicad.ecad) are delegated to
     services.plm.ecad_diff.ecad_diff, which returns an id-keyed nets/components/
@@ -129,9 +128,8 @@ def doc_diff(rev_a: dict, rev_b: dict) -> dict:
     if is_ecad_schema(rev_a) or is_ecad_schema(rev_b):
         return _ecad_semantic_diff(rev_a, rev_b)
 
-    # Canonicalize floats so float noise doesn't produce false positives
-    a = round_floats_doc(rev_a)
-    b = round_floats_doc(rev_b)
+    a = rev_a
+    b = rev_b
 
     old_feats = _by_id(a.get("features", []))
     new_feats = _by_id(b.get("features", []))
@@ -180,7 +178,7 @@ def doc_diff(rev_a: dict, rev_b: dict) -> dict:
     new_mates = _by_id(b.get("mates", []))
     mate_deltas = _mate_diff(old_mates, new_mates)
 
-    return {
+    return deepcopy({
         "features_added": features_added,
         "features_removed": features_removed,
         "features_changed": features_changed,
@@ -188,7 +186,7 @@ def doc_diff(rev_a: dict, rev_b: dict) -> dict:
         "sketch_deltas": sketch_deltas,
         "mate_deltas": mate_deltas,
         "suppression_flips": suppression_flips,
-    }
+    })
 
 
 # ---------------------------------------------------------------------------

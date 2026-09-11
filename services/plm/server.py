@@ -20,7 +20,6 @@ from pathlib import Path
 from typing import Any, Callable, Mapping
 
 from services.plm import manifest as manifest_mod
-from services.plm.canonical import round_floats_doc
 from services.plm.vault import Vault, VaultError
 
 SCHEMA = "aicad.plm-live/1"
@@ -56,7 +55,7 @@ class EngineRejected(Exception):
 
 def _canonical_bytes(document: Mapping[str, Any]) -> bytes:
     return json.dumps(
-        round_floats_doc(dict(document)),
+        dict(document),
         sort_keys=True,
         separators=(",", ":"),
         ensure_ascii=False,
@@ -65,8 +64,7 @@ def _canonical_bytes(document: Mapping[str, Any]) -> bytes:
 
 
 def _canonical_state(document: Mapping[str, Any], revision: Any) -> dict[str, Any]:
-    canonical = round_floats_doc(dict(document))
-    raw = _canonical_bytes(canonical)
+    raw = _canonical_bytes(document)
     try:
         rev = int(revision)
     except (TypeError, ValueError) as exc:
@@ -74,7 +72,7 @@ def _canonical_state(document: Mapping[str, Any], revision: Any) -> dict[str, An
     if rev < 0:
         raise EngineRejected("engine_unavailable", "The document engine returned an invalid revision.")
     return {
-        "document": canonical,
+        "document": json.loads(raw),
         "engine_revision": rev,
         "state_hash": "sha256:" + hashlib.sha256(raw).hexdigest(),
     }

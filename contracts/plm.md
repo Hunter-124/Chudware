@@ -12,7 +12,7 @@
 > (Pillar 19, Workstream R). Supersedes backlog T-BL15 + T-BL10.
 >
 > **Builds on `contracts/doc_schema.md`.** History snapshots are the T-H2
-> **canonical `document.json`** (Appendix A: sorted keys, floats@6dp, **no
+> **canonical `document.json`** (Appendix A: sorted keys, lossless numbers, **no
 > timestamps**, indent=2, UTF-8 no-BOM). Semantic diffing reuses the existing
 > `doc_diff` tool; visual compare reuses `eval_compare`. This contract does NOT
 > re-specify either — it specifies only the vault, manifest, history, lock, and

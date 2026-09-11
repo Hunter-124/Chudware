@@ -10,6 +10,7 @@ Run:
 from __future__ import annotations
 
 import json
+import math
 import sys
 import os
 import types
@@ -43,7 +44,7 @@ except ImportError:
     sys.modules["mcp.server"] = _stub_server
     sys.modules["mcp.server.fastmcp"] = _stub_fastmcp
 
-from services.plm.canonical import canonical_dump, round_floats_doc  # noqa: E402
+from services.plm.canonical import canonical_dump  # noqa: E402
 from services.mcp.doc_diff_tools import doc_diff  # noqa: E402
 
 
@@ -74,16 +75,6 @@ def _feature(fid, ftype="extrude", params=None, suppressed=False):
 # ---------------------------------------------------------------------------
 
 class TestCanonicalDumpByteStability:
-    def test_same_doc_produces_identical_string(self):
-        doc = {"features": [{"id": "f1", "type": "extrude", "params": {"depth": 10.0}}]}
-        assert canonical_dump(doc) == canonical_dump(doc)
-
-    def test_repeated_calls_on_float_heavy_doc(self):
-        doc = {"a": 1.123456789, "b": [2.999999999, 0.0], "c": {"d": 42.0}}
-        first = canonical_dump(doc)
-        second = canonical_dump(doc)
-        assert first == second
-
     def test_already_canonical_string_is_stable(self):
         """Parsing a canonical string and re-serializing yields the same string."""
         doc = {"x": 1.5, "y": "hello", "z": [True, None]}
@@ -91,48 +82,29 @@ class TestCanonicalDumpByteStability:
         assert canonical_dump(json.loads(s)) == s
 
 
-# ---------------------------------------------------------------------------
-# canonical_dump: float rounding
-# ---------------------------------------------------------------------------
+def test_saved_oblique_axis_remains_collinear_with_pivot_centers():
+    direction = [12.7, 25.4, 152.4]
+    axis = [value / math.hypot(*direction) for value in direction]
+    document = _doc(mates=[{"id": "m1", "type": "angle", "value": {"axis": axis}}])
+    saved = json.loads(canonical_dump(document))["mates"][0]["value"]["axis"]
+    cross = [
+        saved[1] * direction[2] - saved[2] * direction[1],
+        saved[2] * direction[0] - saved[0] * direction[2],
+        saved[0] * direction[1] - saved[1] * direction[0],
+    ]
+    assert math.hypot(*cross) / math.hypot(*direction) < 1e-15
 
-class TestCanonicalDumpFloatRounding:
-    def test_near_integer_rounds_up(self):
-        """599.9999999999 should round to 600.0 at 6 dp."""
-        doc = {"v": 599.9999999999}
-        result = json.loads(canonical_dump(doc))
-        assert result["v"] == 600.0
 
-    def test_near_integer_rounds_down(self):
-        """45.0000001 should round to 45.0 at 6 dp."""
-        doc = {"v": 45.0000001}
-        result = json.loads(canonical_dump(doc))
-        assert result["v"] == 45.0
-
-    def test_significant_digits_preserved(self):
-        """1.123456789 should round to 1.123457 (6 dp, round-half-up)."""
-        doc = {"v": 1.123456789}
-        result = json.loads(canonical_dump(doc))
-        assert result["v"] == round(1.123456789, 6)
-
-    def test_nested_floats_rounded(self):
-        doc = {"outer": {"inner": [0.9999999, 1.0000001]}}
-        result = json.loads(canonical_dump(doc))
-        assert result["outer"]["inner"] == [round(0.9999999, 6), round(1.0000001, 6)]
-
-    def test_int_unchanged(self):
-        doc = {"n": 42}
-        result = json.loads(canonical_dump(doc))
-        assert result["n"] == 42
-
-    def test_bool_unchanged(self):
-        doc = {"flag": True}
-        result = json.loads(canonical_dump(doc))
-        assert result["flag"] is True
-
-    def test_none_unchanged(self):
-        doc = {"v": None}
-        result = json.loads(canonical_dump(doc))
-        assert result["v"] is None
+def test_diff_reports_small_joint_axis_changes_without_mutating_source():
+    axis = [0.08192319205190406, 0.16384638410380797, 0.9830783046228486]
+    original = {"id": "m1", "type": "angle", "value": {"axis": axis}}
+    rounded = {"id": "m1", "type": "angle", "value": {"axis": [round(v, 6) for v in axis]}}
+    delta = doc_diff(_doc(mates=[original]), _doc(mates=[rounded]))
+    assert delta["mate_deltas"] == [
+        {"id": "m1", "kind": "changed", "old": original, "new": rounded},
+    ]
+    delta["mate_deltas"][0]["old"]["value"]["axis"][0] = 0.0
+    assert original["value"]["axis"][0] == 0.08192319205190406
 
 
 # ---------------------------------------------------------------------------
@@ -316,35 +288,6 @@ class TestDocDiffSuppressionFlips:
 
 
 # ---------------------------------------------------------------------------
-# doc_diff: float noise suppressed
-# ---------------------------------------------------------------------------
-
-class TestDocDiffFloatNoiseSuppressed:
-    def test_sub_micron_noise_no_params_changed(self):
-        """depth 10.0 vs 10.0000001 rounds to same 6-dp value → no diff."""
-        f_old = _feature("f1", params={"depth": {"value": 10.0, "expr": None}})
-        f_new = _feature("f1", params={"depth": {"value": 10.0000001, "expr": None}})
-        delta = doc_diff(_doc(features=[f_old]), _doc(features=[f_new]))
-        assert delta["params_changed"] == []
-
-    def test_above_micron_noise_detected(self):
-        """depth 10.0 vs 10.000002 differ at 6 dp (10.000000 vs 10.000002) → detected."""
-        f_old = _feature("f1", params={"depth": {"value": 10.0, "expr": None}})
-        f_new = _feature("f1", params={"depth": {"value": 10.000002, "expr": None}})
-        delta = doc_diff(_doc(features=[f_old]), _doc(features=[f_new]))
-        assert len(delta["params_changed"]) == 1
-
-    def test_float_noise_on_canonical_dump_roundtrip(self):
-        """Values that survive canonical_dump → json.loads are truly stable."""
-        f = _feature("f1", params={"depth": {"value": 1.123456789, "expr": None}})
-        doc = _doc(features=[f])
-        # Round-trip through canonical_dump
-        doc_rt = json.loads(canonical_dump(doc))
-        delta = doc_diff(doc, doc_rt)
-        assert delta["params_changed"] == []
-
-
-# ---------------------------------------------------------------------------
 # doc_diff: sketch_deltas
 # ---------------------------------------------------------------------------
 
@@ -394,40 +337,3 @@ class TestDocDiffSketchDeltas:
             assert key in sd
 
 
-# ---------------------------------------------------------------------------
-# round_floats_doc standalone
-# ---------------------------------------------------------------------------
-
-class TestRoundFloatsDoc:
-    def test_float_rounded(self):
-        assert round_floats_doc(1.123456789) == round(1.123456789, 6)
-
-    def test_int_unchanged(self):
-        assert round_floats_doc(42) == 42
-
-    def test_bool_unchanged(self):
-        assert round_floats_doc(True) is True
-
-    def test_none_unchanged(self):
-        assert round_floats_doc(None) is None
-
-    def test_string_unchanged(self):
-        assert round_floats_doc("hello") == "hello"
-
-    def test_list_recursed(self):
-        result = round_floats_doc([1.0000001, 2, "x"])
-        assert result == [round(1.0000001, 6), 2, "x"]
-
-    def test_dict_recursed(self):
-        result = round_floats_doc({"a": 1.9999999, "b": 3})
-        assert result == {"a": round(1.9999999, 6), "b": 3}
-
-    def test_nested_structure(self):
-        obj = {"outer": [{"inner": 0.9999999999}]}
-        result = round_floats_doc(obj)
-        assert result["outer"][0]["inner"] == round(0.9999999999, 6)
-
-    def test_input_not_mutated(self):
-        original = {"v": 1.123456789}
-        _ = round_floats_doc(original)
-        assert original["v"] == 1.123456789

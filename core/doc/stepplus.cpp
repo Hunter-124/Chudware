@@ -149,46 +149,22 @@ std::string iso_utc_now() {
 // ------------------------------------------------------------------ canonical JSON
 //
 // Policy (T-H2 / contracts/doc_schema.md §Canonical dump):
-//   - Floats are rounded at serialize time ONLY (in-memory precision unchanged):
-//       * mm-valued quantities: 6 decimal places (µm resolution)
-//       * degree-valued quantities: 3 decimal places (1e-3 deg resolution)
-//   - Both length and angle fields are stored as the same float in JSON, so we
-//     apply a single rounding pass at 6 dp (µm covers both: 1e-3 deg ≫ needed).
+//   - JSON numbers retain their full round-trip precision. Rounding dimensionless
+//     axes or rigid transforms changes the constraints when a document is reopened.
 //   - nlohmann::json uses std::map → keys are already sorted alphabetically.
 //   - The resulting string is deterministic for the same document tree.
 //
-// Recursively round every JSON float to `decimals` decimal places. When
-// `skip_root_key` is set, omit that key from this object only; recursive calls
-// deliberately do not forward it, so identically named nested keys survive.
-json round_floats(const json& v, int decimals = 6,
-                  const char* skip_root_key = nullptr) {
-    const double factor = std::pow(10.0, decimals);
-    if (v.is_number_float()) {
-        double d = v.get<double>();
-        return json(std::round(d * factor) / factor);
-    }
-    if (v.is_array()) {
-        json out = json::array();
-        for (const auto& elem : v) out.push_back(round_floats(elem, decimals));
-        return out;
-    }
-    if (v.is_object()) {
-        json out = json::object();
-        for (auto& [k, val] : v.items()) {
-            if (skip_root_key != nullptr && k == skip_root_key) continue;
-            out[k] = round_floats(val, decimals);
-        }
-        return out;
-    }
-    return v;  // bool, int, null, string — unchanged
-}
-
-// Return the canonical document.json serialization:
-//   round_floats(doc, 6) then dump(2).  Keys are sorted because nlohmann::json
-//   (std::map) always iterates in lexicographic order.
+// Return the canonical document.json serialization without copying the tree unless
+// an optional root entry must be omitted (notably an oversized simulation cache).
+// nlohmann::json (std::map) emits keys in lexicographic order.
 std::string canonical_doc_json(const json& doc,
                                const char* skip_root_key = nullptr) {
-    return round_floats(doc, 6, skip_root_key).dump(2);
+    if (skip_root_key == nullptr || !doc.is_object() || !doc.contains(skip_root_key))
+        return doc.dump(2);
+    json filtered = json::object();
+    for (const auto& [key, value] : doc.items())
+        if (key != skip_root_key) filtered[key] = value;
+    return filtered.dump(2);
 }
 
 }  // namespace
@@ -219,7 +195,7 @@ std::string editable_container_save(const json& doc, const std::string& path,
         {"name", doc.value("name", std::string("Untitled"))},
     };
 
-    // Canonical dump: sorted keys (std::map) + float rounding (6 dp = µm grade).
+    // Canonical dump: sorted keys and lossless numeric serialization.
     const std::string document = editable_document_json(doc);
     const std::string meta_json = meta.dump(2);  // meta.json timestamps exempt from stability DoD
 

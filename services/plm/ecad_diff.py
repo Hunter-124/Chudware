@@ -15,9 +15,8 @@ Output mirrors doc_diff's envelope style: three lists per section —
 ``<section>_added`` / ``<section>_removed`` / ``<section>_changed`` — each
 entry carrying its stable ``id`` and a short human ``summary``; changed
 entries additionally carry a ``changes`` list of ``{field, old, new}``
-records (mirrors doc_diff's ``params_changed``). Float noise below µm (6dp)
-is suppressed the same way doc_diff does it, via
-``services.plm.canonical.round_floats_doc``.
+records (mirrors doc_diff's ``params_changed``). Numeric values are compared
+without quantization, matching lossless canonical document persistence.
 
 Consumers: services/plm/compare.py ``semantic_compare`` (routes here instead
 of ``doc_diff`` for any document whose schema head is aicad.pcb/aicad.sch/
@@ -26,9 +25,9 @@ the standalone ``doc_diff`` MCP tool also answers correctly for ECAD docs).
 """
 from __future__ import annotations
 
+from copy import deepcopy
 from typing import Any
 
-from services.plm.canonical import round_floats_doc
 
 # The id-keyed ECAD sections this diff surfaces individually (the subset of
 # branches.py's _LIST_KEYS_ECAD a PLM change list calls out by name; vias/
@@ -120,10 +119,8 @@ def _section_diff(section: str, old_list: Any, new_list: Any) -> dict[str, list]
 def ecad_diff(rev_a: dict[str, Any], rev_b: dict[str, Any]) -> dict[str, Any]:
     """Compute an id-based semantic diff between two ECAD document dicts.
 
-    Both inputs should be canonical ECAD documents (contracts/ecad/{pcb,sch}
-    _schema.md); float noise below 6dp is suppressed internally via
-    ``round_floats_doc`` so a rebuilt-but-unchanged board/schematic produces
-    an empty diff (mirrors doc_diff — services/mcp/doc_diff_tools.py).
+    Inputs follow the canonical ECAD schemas (contracts/ecad/{pcb,sch}_schema.md).
+    Numeric values retain their full precision, as in persisted documents.
 
     Returns a dict with three lists per section (nets/components/footprints/
     tracks): ``<section>_added`` / ``<section>_removed`` / ``<section>_changed``.
@@ -132,15 +129,13 @@ def ecad_diff(rev_a: dict[str, Any], rev_b: dict[str, Any]) -> dict[str, Any]:
     A section absent from both documents (e.g. ``tracks`` on a schematic)
     simply comes back with three empty lists.
     """
-    a = round_floats_doc(rev_a)
-    b = round_floats_doc(rev_b)
-    a = a if isinstance(a, dict) else {}
-    b = b if isinstance(b, dict) else {}
+    a = rev_a if isinstance(rev_a, dict) else {}
+    b = rev_b if isinstance(rev_b, dict) else {}
 
     out: dict[str, Any] = {}
     for section in _SECTIONS:
         out.update(_section_diff(section, a.get(section), b.get(section)))
-    return out
+    return deepcopy(out)
 
 
 _MAX_SUMMARY_CLAUSES = 6

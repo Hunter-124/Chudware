@@ -519,16 +519,16 @@ def register_cad_asm_tools(mcp: FastMCP) -> None:
                         stop: Optional[float] = None, steps: int = 24,
                         check_interference: bool = True, min_clearance_mm: float = 0.0,
                         loop: bool = False, dynamics: Optional[dict] = None,
-                        doc_id: Optional[str] = None) -> str:
-        """Kinematic motion study: DRIVE one mate over a range, re-solve the mechanism each
-        step, return the trajectory (every body's pose per step) + a swept interference check.
+                        doc_id: Optional[str] = None,
+                        drivers: Optional[list[dict]] = None) -> str:
+        """Kinematic motion study: DRIVE one or more mates over synchronized ranges, re-solve
+        the mechanism each sample, return every body's pose + a swept interference check.
 
-        This is the "does this linkage / cam / gear-train clear everything as it moves?" tool —
-        SolidWorks Motion / Onshape Assembly-Motion for the common kinematic case. It drives ONE
-        DIMENSIONAL mate (its `value`) across a sweep and re-solves the whole mate graph at each
-        sample, so the rest of the mechanism follows. Positions carry forward step-to-step (the
-        previous solved pose warm-starts the next), so a full-cycle sweep stays on one branch
-        instead of flipping to a mirror configuration.
+        Uses the same native engine as the GUI Motion tab, not a separate Python solver.
+        Each driver changes an angle/distance mate's scalar value at the same sample fraction;
+        the whole mate graph is solved together so the rest of the mechanism follows.
+        Reference axes follow their reference components (e.g. wheel roll follows steering).
+        The previous solved pose warm-starts the next sample to preserve branch continuity.
 
         Scope: kinematics by default; pass `dynamics` (even {}) to ALSO run rigid-body inverse
         dynamics over the swept trajectory — mass/inertia from each component's geometry x
@@ -562,22 +562,35 @@ def register_cad_asm_tools(mcp: FastMCP) -> None:
                   cannot define a pivot and is refused as driver_axis_line_unresolved.
         start,stop : the value range to sweep (in the mate's unit — deg or mm). Omit `start` to
                   begin at the mate's current value. `stop` is required.
+        drivers : optional nonempty list [{mate_id, start, stop}, ...]. When supplied it
+                  replaces the legacy mate_id/start/stop arguments. Each row requires a
+                  unique, active angle/distance mate ID and finite numeric bounds (degrees
+                  for angle, mm for distance); no auto-pick or omitted bounds inside rows.
+                  All drivers share `steps` and the same normalized sample timeline.
         steps   : number of SAMPLES across [start, stop] inclusive (>=2, >=3 with dynamics).
                   More samples improve finite-difference accuracy and branch continuity.
-        loop    : if True, append the already-solved start pose as one final playback sample,
-                  closing the cycle without changing the dynamics time map.
-        check_interference : evaluate every sample and flag the FIRST solid overlap or
-                  below-minimum-clearance pair. min_clearance_mm is in mm.
+        loop    : if True, append the original start pose, driver_values and check outcomes
+                  for playback only. No additional pose or interference check is computed;
+                  neither frames_checked nor the dynamics timeline includes this copy.
+        check_interference : evaluate every valid sample for solid overlap or
+                  below-minimum-clearance pairs. min_clearance_mm is in mm.
 
         Returns {ok, doc_id, mate_id, driver:{type,unit,start,stop,steps,samples},
-                 trajectory:[{i, value, dof, converged, bodies:[{component,name,transform}]}],
-                 interference:{checked, first_collision_step, first_collision_value, detail},
-                 summary, pose_check}. Each `transform` is the body's world 4x4
-        (row-major 16). pose_check checks the relative motion against the hinge line:
-        axis_point, axis_dir, translation_ok (t=p-Rp), rotation_ok, and the invariant
-        coordinate for world-aligned axes, per driven body and frame. A failed check
-        makes ok=false and skips interference for that invalid frame. The engine solves
-        on an immutable snapshot; live poses, mate expressions and history never change.
+                 drivers:[{mate_id,type,unit,start,stop,steps}],
+                 trajectory:[{i,value,driver_values:{mate_id:value},dof,converged,
+                              bodies:[{component,name,transform}]}],
+                 interference:{checked,complete,frames_checked,pair_failures,
+                               first_collision_step,first_collision_value,detail},
+                 summary, pose_check}. mate_id, driver and frame.value describe the first
+        driver for compatibility. Every body transform is world 4x4 (row-major 16);
+        reference_transforms are already row-major and are not transposed. pose_check checks
+        each driven body's relative motion against its hinge line. Failed pose checks make
+        ok=false and skip interference for that invalid frame. Per-frame collisions retain
+        known hits and stable component IDs even if some pairs fail; interference is null
+        when unchecked/incomplete. Never claim swept clearance unless interference.complete
+        is true, all computed samples were checked, and no collisions were reported.
+        Missing/failed geometry is incomplete evidence, not a collision-free sweep.
+        The engine solves an immutable snapshot; live poses, mates and history never change.
         """
         try:
             d = _doc(doc_id)
@@ -585,65 +598,77 @@ def register_cad_asm_tools(mcp: FastMCP) -> None:
             if not mates:
                 raise ValueError("simulate_motion: document has no mates (not an assembly, or "
                                  "no mates added). Build/open an assembly with mates first.")
-            drivable = [m for m in mates
-                        if m.get("type") in _DRIVABLE_MATE_TYPES and not m.get("suppressed")]
-            # LIVE-DIALECT pattern (refs.faces:"none" analogue): a model saying mate_id="" /
-            # "none" MEANS "no specific mate — auto-pick", the same as omitting the arg. A
-            # literal lookup for a mate named "none" always fails, so normalize first.
-            mate_id = _normalize_optional_slot(mate_id)
-            if mate_id is None:
-                if len(drivable) == 1:
-                    mate = drivable[0]
-                    mate_id = mate.get("id")
-                elif not drivable:
-                    raise ValueError(
-                        "simulate_motion: no drivable (dimensional) mate found. "
-                        "Drivable types: " + ", ".join(sorted(_DRIVABLE_MATE_TYPES))
-                        + ". Add e.g. an angle mate to drive the joint — or, when the "
-                        "components you want to move are positioned by concentric/"
-                        "coincident mates about a measured axis (a steering upright on "
-                        "its kingpin) and there is no dimension to add, drive them "
-                        "directly with steering_turning_radius(steer={'components':[...],"
-                        " 'axis':{'point':[x,y,z],'dir':[x,y,z]}, 'angle_deg':...}) or "
-                        "sweep_envelope(steer=...), which rotate the named components "
-                        "about that axis on a detached clone and re-solve the rest.")
-                else:
-                    ids = ", ".join(f"{m.get('id')}({m.get('type')})" for m in drivable)
-                    raise ValueError("simulate_motion: multiple drivable mates — pass mate_id. "
-                                     f"Candidates: {ids}")
+            if drivers is None:
+                drivable = [m for m in mates
+                            if m.get("type") in _DRIVABLE_MATE_TYPES and not m.get("suppressed")]
+                # Preserve the established optional-slot auto-pick behavior for legacy callers.
+                mate_id = _normalize_optional_slot(mate_id)
+                if mate_id is None:
+                    if len(drivable) == 1:
+                        mate_id = drivable[0].get("id")
+                    elif not drivable:
+                        raise ValueError(
+                            "simulate_motion: no drivable (dimensional) mate found. "
+                            "Drivable types: " + ", ".join(sorted(_DRIVABLE_MATE_TYPES))
+                            + ". Add e.g. an angle mate to drive the joint — or, when the "
+                            "components you want to move are positioned by concentric/"
+                            "coincident mates about a measured axis (a steering upright on "
+                            "its kingpin) and there is no dimension to add, drive them "
+                            "directly with steering_turning_radius(steer={'components':[...],"
+                            " 'axis':{'point':[x,y,z],'dir':[x,y,z]}, 'angle_deg':...}) or "
+                            "sweep_envelope(steer=...), which rotate the named components "
+                            "about that axis on a detached clone and re-solve the rest.")
+                    else:
+                        ids = ", ".join(f"{m.get('id')}({m.get('type')})" for m in drivable)
+                        raise ValueError(
+                            "simulate_motion: multiple drivable mates — pass mate_id or drivers. "
+                            f"Candidates: {ids}")
+                requested = [{"mate_id": mate_id, "start": start, "stop": stop}]
             else:
-                mate = next((m for m in mates if m.get("id") == mate_id), None)
+                if not isinstance(drivers, list) or not drivers:
+                    raise ValueError("simulate_motion: drivers must be a nonempty list.")
+                requested = drivers
+
+            normalized = []
+            seen = set()
+            for row in requested:
+                if not isinstance(row, dict):
+                    raise ValueError("simulate_motion: each driver must be an object.")
+                mid = row.get("mate_id")
+                if not isinstance(mid, str) or not mid:
+                    raise ValueError("simulate_motion: every driver requires a nonempty mate_id.")
+                if mid in seen:
+                    raise ValueError(f"simulate_motion: duplicate driver mate '{mid}'.")
+                seen.add(mid)
+                mate = next((m for m in mates if m.get("id") == mid), None)
                 if mate is None:
-                    raise ValueError(f"simulate_motion: mate '{mate_id}' not found.")
+                    raise ValueError(f"simulate_motion: mate '{mid}' not found.")
+                if mate.get("suppressed"):
+                    raise ValueError(f"simulate_motion: mate '{mid}' is suppressed, not active.")
                 if mate.get("type") not in _DRIVABLE_MATE_TYPES:
                     raise ValueError(
-                        f"simulate_motion: mate '{mate_id}' is a '{mate.get('type')}' mate with "
+                        f"simulate_motion: mate '{mid}' is a '{mate.get('type')}' mate with "
                         "no driven value to sweep. Drive a dimensional mate "
                         "(" + ", ".join(sorted(_DRIVABLE_MATE_TYPES)) + ") instead.")
-            mtype = mate.get("type")
+                bounds = {}
+                for key in ("start", "stop"):
+                    value = row.get(key)
+                    if drivers is None and key == "start" and value is None:
+                        value = mate.get("value")
+                        if isinstance(value, dict):
+                            value = value.get("value")
+                    if (not isinstance(value, (int, float)) or isinstance(value, bool)
+                            or not math.isfinite(value)):
+                        raise ValueError(
+                            f"simulate_motion: driver '{mid}' {key} must be a finite number.")
+                    bounds[key] = float(value)
+                normalized.append({"mate_id": mid, **bounds})
+
+            first = normalized[0]
+            mate_id, start, stop = first["mate_id"], first["start"], first["stop"]
+            primary_mate = next(m for m in mates if m.get("id") == mate_id)
+            mtype = primary_mate["type"]
             unit = _DRIVABLE_MATE_TYPES[mtype]
-
-            def _cur_value(m: dict) -> float:
-                v = m.get("value")
-                if isinstance(v, dict):
-                    v = v.get("value")
-                if not isinstance(v, (int, float)) or isinstance(v, bool):
-                    raise ValueError(
-                        f"simulate_motion: mate '{mate_id}' has no numeric driven value.")
-                value = float(v)
-                if not math.isfinite(value):
-                    raise ValueError(
-                        f"simulate_motion: mate '{mate_id}' has a non-finite driven value.")
-                return value
-
-            if start is None:
-                start = _cur_value(mate)
-            if stop is None:
-                raise ValueError("simulate_motion: `stop` is required (the end of the sweep).")
-            start = float(start)
-            stop = float(stop)
-            if not math.isfinite(start) or not math.isfinite(stop):
-                raise ValueError("simulate_motion: start and stop must be finite.")
             steps = int(steps)
             if steps < 2:
                 raise ValueError("simulate_motion: `steps` must be >= 2.")
@@ -661,6 +686,8 @@ def register_cad_asm_tools(mcp: FastMCP) -> None:
                 "check_interference": bool(check_interference),
                 "min_clearance_mm": min_clearance_mm,
             }
+            if drivers is not None:
+                payload["drivers"] = normalized
             if dynamics is not None:
                 dyn = coerce_json_or_repr(dynamics)
                 if not isinstance(dyn, dict):
@@ -688,11 +715,11 @@ def register_cad_asm_tools(mcp: FastMCP) -> None:
             if loop and trajectory:
                 closing = copy.deepcopy(trajectory[0])
                 closing["i"] = len(trajectory)
-                closing["value"] = start
                 trajectory.append(closing)
                 out["trajectory"] = trajectory
-                checked = copy.deepcopy(closing["pose_check"])
-                out["pose_check"]["frames"].append({"i": closing["i"], **checked})
+                if "pose_check" in closing and "pose_check" in out:
+                    checked = copy.deepcopy(closing["pose_check"])
+                    out["pose_check"]["frames"].append({**checked, "i": closing["i"]})
 
             driver = out.setdefault("driver", {})
             driver.update({

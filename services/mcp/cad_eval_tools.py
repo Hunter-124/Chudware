@@ -156,20 +156,9 @@ def _reject_unknown(tool: str, kwargs: dict, accepted: str) -> None:
 
 
 def _measure_ref(doc_id: str, target):
-    """One measure target -> the ref eval_measure wants, refusing a query that cannot select.
-
-    A `sid` names one element and is resolved against the live document — that is the whole
-    point of query_geometry handing sids out. Anything else that is already an engine
-    selector goes straight through. A geometry QUERY is guarded first, because picks.cpp
-    ignores keys it does not know and a query whose only predicate was a misspelled `shape`
-    silently matched every face.
-    """
-    resolved = resolve_readback_selector(doc_id, target) or already_resolved_selector(target)
-    if resolved is not None:
-        return resolved
-    if is_geom_query(target):
-        target, _notes = normalize_geom_query(target, where="measure_between()")
-    return _resolve_one_selector(doc_id, target)
+    """Use the same owner-preserving resolver for text and annotated measurements."""
+    ref, _label = _resolve_measure_target(doc_id, target)
+    return ref
 
 
 def _interpreted(out: dict, notes: list) -> dict:
@@ -905,6 +894,11 @@ def register_cad_eval_tools(mcp: FastMCP) -> None:
         except Exception as e:  # noqa: BLE001
             raise ValueError(f"eval_measure failed: {e}") from e
 
+        # Native readbacks are in world coordinates even when the input was a
+        # local selector on a rotated/translated assembly instance.
+        if isinstance(batch, dict) and isinstance(batch.get("resolved_refs"), list):
+            matches = batch["resolved_refs"]
+
         # Per-element intrinsic readings with index-distinct palette colours.
         palette = _build_emphasis_palette(matches, mode="per_face")
         readings: list = []
@@ -922,7 +916,7 @@ def register_cad_eval_tools(mcp: FastMCP) -> None:
             readings.append(_reading_from_measure(
                 mres if isinstance(mres, dict) else {},
                 label=label, color_name=color_name, rgb=rgb,
-                sid=(ref.get("sid") if isinstance(ref, dict) else None)))
+                sid=(matches[i].get("sid") if i < len(matches) else None)))
 
         between = None
         if len(refs) >= 2 and isinstance(batch, dict):

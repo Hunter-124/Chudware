@@ -192,6 +192,7 @@ std::string DocMirror::resolvePickAsm(WorkerClient& w, uint32_t body_id,
                                       const std::string& kind, uint32_t topo_id,
                                       std::string& component, std::string& err) {
     component.clear();
+    err.clear();
     if (docId_.empty()) { err = "no document open"; return {}; }
     nlohmann::json res;
     nlohmann::json params = {
@@ -208,7 +209,9 @@ std::string DocMirror::resolvePickAsm(WorkerClient& w, uint32_t body_id,
         return {};
     }
     component = jstr(res, "component");
-    if (res.contains("selector")) return res["selector"].dump();
+    if (res.contains("selector") && res["selector"].is_object())
+        return res["selector"].dump();
+    err = "The selected topology no longer exists. Select it again.";
     return {};
 }
 
@@ -441,6 +444,7 @@ PushPullResult DocMirror::pushPull(WorkerClient& w, uint32_t body_id, uint32_t t
 std::string DocMirror::resolvePick(WorkerClient& w, uint32_t body_id,
                                    const std::string& kind, uint32_t topo_id,
                                    std::string& err) {
+    err.clear();
     if (docId_.empty()) { err = "no document open"; return {}; }
     nlohmann::json res;
     nlohmann::json params = {
@@ -457,7 +461,9 @@ std::string DocMirror::resolvePick(WorkerClient& w, uint32_t body_id,
         return {};
     }
     // selector is returned as a JSON object; serialize to string for storage in SelItem
-    if (res.contains("selector")) return res["selector"].dump();
+    if (res.contains("selector") && res["selector"].is_object())
+        return res["selector"].dump();
+    err = "The selected topology no longer exists. Select it again.";
     return {};
 }
 

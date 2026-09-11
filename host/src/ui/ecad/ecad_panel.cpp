@@ -2658,7 +2658,7 @@ void drawEcadEditor(AppState& st) {
         std::snprintf(buf, sizeof(buf), "%.2f, %.2f mm", io.worldMouse.x, io.worldMouse.y);
         ImVec2 p = ImGui::GetWindowPos();
         ImGui::GetWindowDrawList()->AddText(
-            ImVec2(p.x + 8, p.y + ImGui::GetWindowHeight() - 20),
+            ImVec2(p.x + ui::metrics::px(8), p.y + ImGui::GetWindowHeight() - ui::metrics::px(20)),
             ui::Palette::toU32(pal.textDim), buf);
     }
     ImGui::EndChild();

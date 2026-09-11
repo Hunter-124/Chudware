@@ -14,12 +14,14 @@
 #include <string>
 
 #include "imgui.h"
-#include "imgui_internal.h"     // ImRect (ui::adaptivePanel / ui::glassPanel rect argument)
+#include "imgui_internal.h"
 
 #include "../core/app_state.h"
 #include "../core/doc_mirror.h"
-#include "../ui_theme.h"        // ui::palette / ui::uiScale / adaptivePanel / glassPanel
+#include "../ui_theme.h"
 #include "layout.h"             // setNextCommandDialogPlacement (floating dialog anchor)
+#include "metrics.h"
+#include "widgets/kit.h"
 #include "property_manager.h"   // pmFindForm / PMFieldKind / pmFormatDim / pmParseDim
 
 namespace ui {
@@ -271,50 +273,24 @@ void DesignTablePanel::buildCandidates(AppState& st, std::vector<Candidate>& out
 
 void DesignTablePanel::draw(AppState& st) {
     if (!st.showDesignTablePanel) return;
-    // Frosted-glass fill so the floating panel joins the app-wide glass family.
-    ui::setNextCommandDialogPlacement();   // sane first-open anchor over the full-width viewport
-    ImGui::SetNextWindowSize(ImVec2(640 * ui::uiScale, 400 * ui::uiScale), ImGuiCond_FirstUseEver);
-    // Liquid-glass v2: transparent native WindowBg so the adaptive glassPanel (painted below,
-    // once Begin succeeds) is the only fill — ImGui's dark rect must not compete with the frost.
-    // The title bar renders DURING Begin (before our glass paint), so give it its own opaque-ish
-    // glassBg backing via a scoped TitleBg push (the theme sets it transparent globally); we then
-    // frost only the CONTENT region so the title/X stay crisp instead of filmed over.
-    const ImVec4 titleTint(ui::palette.glassBg[0], ui::palette.glassBg[1],
-                           ui::palette.glassBg[2], ui::palette.glassBg[3]);
-    ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0, 0, 0, 0));
-    ImGui::PushStyleColor(ImGuiCol_TitleBg, titleTint);
-    ImGui::PushStyleColor(ImGuiCol_TitleBgActive, titleTint);
-    ImGui::PushStyleColor(ImGuiCol_TitleBgCollapsed, titleTint);
-    const bool dtVis = ImGui::Begin("Design Table", &st.showDesignTablePanel);
-    ImGui::PopStyleColor(3);  // title bar already rendered; WindowBg stays for the frame
-    if (!dtVis) {
+    ui::setNextCommandDialogPlacement("Design Table",
+        ImVec2(ui::metrics::px(760), ui::metrics::px(520)),
+        ImVec2(ui::metrics::px(340), ui::metrics::px(300)));
+    ImGui::SetNextWindowBgAlpha(1.0f);
+    if (!ImGui::Begin("Design Table", &st.showDesignTablePanel, ImGuiWindowFlags_NoDocking)) {
         ImGui::End();
-        ImGui::PopStyleColor();
         return;
     }
-
-    // Paint the panel's own frosted-glass background over the content region (below title).
-    const ImVec2 wp = ImGui::GetWindowPos(), ws = ImGui::GetWindowSize();
-    const float contentTopY = ImGui::GetCursorScreenPos().y - ImGui::GetStyle().WindowPadding.y;
-    const ImRect winRect(ImVec2(wp.x, contentTopY), ImVec2(wp.x + ws.x, wp.y + ws.y));
-    const ui::AdaptiveSurface& surf = ui::adaptivePanel(
-        ui::panelId("host_design_table_glass"), winRect, ui::GlassGroup::Global);
-    ui::glassPanel(ImGui::GetWindowDrawList(), winRect, ui::GlassLevel::Regular, 12.0f, surf);
-    // Default ink for the plain grid/header readouts tracks the frost's contrast tone.
-    ImGui::PushStyleColor(ImGuiCol_Text, surf.textPrimary);
-
     const auto& pal = ui::palette;
     const ImVec4 accentCol(pal.accent[0], pal.accent[1], pal.accent[2], 1);
-    // Contrast-matched text over the frosted backdrop (dim = secondary tone).
-    const ImVec4 dimCol = surf.textSecondary;
+    const ImVec4 dimCol(pal.textDim[0], pal.textDim[1], pal.textDim[2], pal.textDim[3]);
 
     // Gate: only part/asm docs have configurations. Drawing tabs / no-doc show a hint.
     if (!dtApplicable(st)) {
-        ImGui::TextColored(dimCol, "Open a part or assembly to edit its design table.");
+        ui::kit::dimText("Open a part or assembly to edit its design table.");
         cacheValid_ = false;
         addCfgOpen_ = false;
         ImGui::End();
-        ImGui::PopStyleColor(2);  // text ink + WindowBg
         return;
     }
 
@@ -326,19 +302,16 @@ void DesignTablePanel::draw(AppState& st) {
     if (!cacheValid_) refresh(st);
 
     // ---- header ----
-    ImGui::PushFont(st.fonts.medium);
-    ImGui::TextColored(accentCol, "Design Table");
-    ImGui::PopFont();
-    ImGui::SameLine();
-    ImGui::TextColored(dimCol, "(%d config%s, %d column%s)",
-                       (int)names_.size(), names_.size() == 1 ? "" : "s",
-                       (int)columns_.size(), columns_.size() == 1 ? "" : "s");
+    ui::kit::sectionHeader("Design Table", nullptr, nullptr, -1, true);
+    ImGui::TextWrapped("%d configuration%s, %d driven column%s",
+                      (int)names_.size(), names_.size() == 1 ? "" : "s",
+                      (int)columns_.size(), columns_.size() == 1 ? "" : "s");
 
     const bool busy = st.anyRunActive() || st.agentV2Running;
 
     // ---- toolbar: Add Config / Delete / Activate / Add Column ----
     if (busy) ImGui::BeginDisabled();
-    if (ImGui::Button("Add Config...")) {
+    if (ui::kit::secondaryButton("Add Config...")) {
         addCfgOpen_ = true;
         addCfgName_[0] = 0;
         focusAddCfg_ = true;
@@ -348,25 +321,24 @@ void DesignTablePanel::draw(AppState& st) {
         const bool canDelete = selectedRow_ >= 0 && selectedRow_ < (int)names_.size() &&
                                names_.size() > 1;
         if (!canDelete) ImGui::BeginDisabled();
-        if (ImGui::Button("Delete Config"))
+        if (ui::kit::secondaryButton("Delete Config"))
             runConfigOp(st, "config_delete", {{"name", names_[selectedRow_]}});
         if (!canDelete) ImGui::EndDisabled();
         if (ImGui::IsItemHovered() && names_.size() <= 1)
             ImGui::SetTooltip("A document must keep at least one configuration.");
     }
-    ImGui::SameLine();
     {
         const bool canActivate = selectedRow_ >= 0 && selectedRow_ < (int)names_.size() &&
                                  names_[selectedRow_] != active_;
         if (!canActivate) ImGui::BeginDisabled();
-        if (ImGui::Button("Activate"))
+        if (ui::kit::secondaryButton("Activate"))
             runConfigOp(st, "config_activate", {{"name", names_[selectedRow_]}});
         if (!canActivate) ImGui::EndDisabled();
     }
     ImGui::SameLine();
-    if (ImGui::Button("Add Column...")) { addOpen_ = true; ImGui::OpenPopup("##addcol"); }
+    if (ui::kit::secondaryButton("Add Column...")) { addOpen_ = true; ImGui::OpenPopup("##addcol"); }
     if (busy) ImGui::EndDisabled();
-    if (busy) { ImGui::SameLine(); ImGui::TextColored(dimCol, "busy..."); }
+    if (busy) ui::kit::dimText("Model update in progress.");
 
     // ---- add-column popup: candidate dims + suppression entries from the live model ----
     if (ImGui::BeginPopup("##addcol")) {
@@ -377,15 +349,27 @@ void DesignTablePanel::draw(AppState& st) {
         if (cands.empty()) {
             ImGui::TextColored(dimCol, "No more columns to add.");
         } else {
-            ImGui::BeginChild("##candlist", ImVec2(280.0f * ui::uiScale, 320.0f * ui::uiScale));
+            const ImGuiViewport* viewport = ImGui::GetMainViewport();
+            const ImVec2 listSize(
+                std::min(ui::metrics::px(320), viewport->WorkSize.x * 0.8f),
+                std::min(ui::metrics::px(320), viewport->WorkSize.y * 0.5f));
+            ImGui::BeginChild("##candlist", listSize, ImGuiChildFlags_None,
+                              ImGuiWindowFlags_NoScrollbar);
             for (size_t i = 0; i < cands.size(); ++i) {
                 ImGui::PushID((int)i);
-                if (ImGui::Selectable(cands[i].menuLabel.c_str())) {
+                const std::string label = ui::kit::elide(cands[i].menuLabel.c_str(),
+                    std::max(1.0f, ImGui::GetContentRegionAvail().x - ui::metrics::px(14)));
+                if (ImGui::Selectable(label.c_str())) {
                     addColumn(cands[i].col);
                     ImGui::CloseCurrentPopup();
                 }
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("%s", cands[i].menuLabel.c_str());
                 ImGui::PopID();
             }
+            ui::AdaptiveSurface scrollSurface{};
+            scrollSurface.textTertiary = dimCol;
+            ui::drawWindowPillScrollbarV(scrollSurface);
             ImGui::EndChild();
         }
         ImGui::EndPopup();
@@ -424,13 +408,10 @@ void DesignTablePanel::draw(AppState& st) {
     if (names_.empty()) {
         ImGui::TextColored(dimCol, "No configurations.");
         ImGui::End();
-        ImGui::PopStyleColor(2);  // text ink + WindowBg
         return;
     }
     if (columns_.empty()) {
-        ImGui::TextColored(dimCol,
-            "No driven columns yet. Use \"Add Column...\" to drive a feature dimension or");
-        ImGui::TextColored(dimCol, "suppression per configuration.");
+        ui::kit::dimText("No driven columns yet. Use \"Add Column...\" to drive a feature dimension or suppression per configuration.");
         // Still show the config-name list so rows are selectable/activatable.
     }
 
@@ -438,9 +419,12 @@ void DesignTablePanel::draw(AppState& st) {
     const int ncols = 1 + (int)columns_.size();
     const ImGuiTableFlags flags = ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg |
                                   ImGuiTableFlags_ScrollX | ImGuiTableFlags_ScrollY |
-                                  ImGuiTableFlags_Resizable;
-    if (ImGui::BeginTable("designtable", ncols, flags)) {
-        ImGui::TableSetupScrollFreeze(1, 1);  // freeze the config-name column + header row
+                                  ImGuiTableFlags_Resizable | ImGuiTableFlags_SizingFixedFit;
+    const float footerHeight = ImGui::GetFrameHeightWithSpacing() + ui::kit::sectionGap();
+    const float tableHeight = std::max(ImGui::GetFrameHeightWithSpacing(),
+                                      ImGui::GetContentRegionAvail().y - footerHeight);
+    if (ImGui::BeginTable("designtable", ncols, flags, ImVec2(0, tableHeight))) {
+        ImGui::TableSetupScrollFreeze(ImGui::GetContentRegionAvail().x >= ui::metrics::px(300) ? 1 : 0, 1);
         ImGui::TableSetupColumn("Configuration", ImGuiTableColumnFlags_WidthFixed,
                                 160.0f * ui::uiScale);
         for (const auto& c : columns_)
@@ -467,8 +451,7 @@ void DesignTablePanel::draw(AppState& st) {
 
             // --- config-name cell: selectable; double-click activates; active row highlighted ---
             ImGui::TableSetColumnIndex(0);
-            std::string nameLabel = (isActive ? std::string("\xe2\x97\x8f  ")
-                                              : std::string("    ")) + name;
+            std::string nameLabel = (isActive ? std::string("[Active] ") : std::string()) + name;
             if (isActive) ImGui::PushStyleColor(ImGuiCol_Text, accentCol);
             // selected=false: the row backing above (TableSetBgColor) is the selection cue, so the
             // Selectable's own opaque highlight is suppressed to keep the frosted look coherent.
@@ -581,9 +564,10 @@ void DesignTablePanel::draw(AppState& st) {
         }
         ImGui::EndTable();
     }
+    ImGui::Separator();
+    if (ui::kit::secondaryButton("Close")) st.showDesignTablePanel = false;
 
     ImGui::End();
-    ImGui::PopStyleColor(2);  // text ink + WindowBg
 }
 
 }  // namespace ui

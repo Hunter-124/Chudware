@@ -2560,19 +2560,30 @@ void ScenarioRunner::runMotion(AppState& st) {
             mtSettle  = kSettle; ++mtStep; break;
         }
         case 4: {
-            // Run the motion study synchronously.
-            if (st.simManager) {
+            // Dispatch once; the following step waits for the async result.
+            if (st.rpc.busy()) return;
+            if (st.simManager)
                 st.simManager->handleCommand(st, "sim_run");
-                mtRunOk = st.simManager->motionHasResult();
-                std::printf("motion: sim_run complete, hasResult=%d, frames=%d\n",
-                            (int)mtRunOk, mtRunOk ? st.simManager->motionFrameCount() : 0);
+            ++mtStep;
+            break;
+        }
+        case 5: {
+            if (st.rpc.busy()) return;
+            mtRunOk = st.simManager && st.simManager->motionHasResult();
+            std::printf("motion: sim_run complete, hasResult=%d, frames=%d\n",
+                        (int)mtRunOk, mtRunOk ? st.simManager->motionFrameCount() : 0);
+            std::fflush(stdout);
+            if (!mtRunOk) {
+                std::printf("motion: FAILED — no completed trajectory\n");
                 std::fflush(stdout);
+                st.motionShotDone = true;
+                break;
             }
-            // Capture frame 0 (bodies at start pose) regardless of solve outcome.
+            // Capture the completed trajectory's start pose.
             mtCapture = mtSavePath + "/motion_t1.png";
             mtSettle  = kSettle; ++mtStep; break;
         }
-        case 5: {
+        case 6: {
             // Advance to mid-frame and capture. Bodies must differ from t1 to prove live playback.
             if (mtRunOk && st.simManager) {
                 const int nFrames = st.simManager->motionFrameCount();

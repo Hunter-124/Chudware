@@ -3005,25 +3005,109 @@ int run_gui(const char *screenshotPath, const char *openPath) {
   }
 #endif
 
-  // C16: Selection observer — on every selection change, resolve picks through
-  // the worker (doc_resolve_pick) and fill the selector slot in each pending
-  // SelItem. Called on the GL thread (selection changes happen there); worker
-  // call is synchronous.
+  // Ordinary viewport/Measure picks resolve off the GL thread. Editing wells keep
+  // their established routing, but never wait behind a busy async engine call.
   st.selection.setObserver([&st]() {
-    if (!st.docMirror.hasDoc() || !st.workerStarted)
+    if (!st.docMirror.hasDoc() || !st.workerStarted) {
+      for (auto &item : st.selection.mutableItems()) {
+        if (!item.pending_resolve) continue;
+        item.pending_resolve = false;
+        item.resolution_error = "No connected document is available to resolve this selection.";
+      }
       return;
+    }
     bool simPickConsumed =
         false; // a sim face pick was routed into a fixture/load well this pass
     for (auto &item : st.selection.mutableItems()) {
-      if (!item.pending_resolve || !item.hit.valid())
+      if (!item.pending_resolve || item.resolve_request != 0 || !item.hit.valid())
         continue;
+      item.resolution_error.clear();
       const char *kindStr = item.hit.kind == render::PickKind::Face   ? "face"
                             : item.hit.kind == render::PickKind::Edge ? "edge"
                             : item.hit.kind == render::PickKind::Vertex
                                 ? "vertex"
                                 : nullptr;
-      if (!kindStr)
+      if (!kindStr) {
+        item.pending_resolve = false;
+        item.resolution_error = "This topology kind cannot be resolved.";
         continue;
+      }
+      const bool routedPick =
+          (st.propertyManager && st.propertyManager->active()) ||
+          (st.asmPanels && (st.asmPanels->mateFormActive() || st.asmPanels->patternFormActive())) ||
+          (st.simManager && st.simManager->wantsViewportFacePick(st));
+      if (!routedPick) {
+        static uint64_t nextPickRequest = 0; // GL-thread only; never recycled across tabs
+        const uint64_t request = item.resolve_request = ++nextPickRequest;
+        const auto hit = item.hit;
+        const std::string docId = st.docMirror.docId();
+        const int revision = st.docMirror.revision();
+        st.rpc.call("doc_resolve_pick",
+            {{"doc_id", docId}, {"revision", revision}, {"body_id", hit.body_id},
+             {"kind", kindStr}, {"topo_id", hit.topo_id}},
+            [&st, request, hit, docId, revision](const core::RpcResult& reply) {
+              std::vector<core::SelItem>* items = nullptr;
+              int currentRevision = -1;
+              const bool active = st.docMirror.docId() == docId;
+              if (active) {
+                items = &st.selection.mutableItems();
+                currentRevision = st.docMirror.revision();
+              } else {
+                for (auto& tab : st.docTabs) {
+                  if (tab.docId != docId || !tab.session) continue;
+                  items = &tab.session->selItems;
+                  currentRevision = tab.session->cachedRevision;
+                  break;
+                }
+              }
+              if (!items) return; // originating document was closed
+              for (auto& selected : *items) {
+                if (selected.resolve_request != request || !(selected.hit == hit)) continue;
+                selected.pending_resolve = false;
+                selected.resolve_request = 0;
+                selected.selector.clear();
+                if (currentRevision != revision) {
+                  selected.resolution_error = "The document changed while resolving this pick. Select it again.";
+                } else if (!reply.ok) {
+                  selected.resolution_error = reply.err.empty()
+                      ? "The engine could not resolve this selection." : reply.err;
+                } else if (reply.result.contains("code")) {
+                  selected.resolution_error = reply.result.value("message",
+                      std::string("The selected topology could not be resolved."));
+                } else if (!reply.result.contains("selector") ||
+                           !reply.result["selector"].is_object()) {
+                  selected.resolution_error = "The selected topology no longer exists. Select it again.";
+                } else {
+                  selected.selector = reply.result["selector"].dump();
+                  selected.resolution_error.clear();
+                  if (active) {
+                    std::string owner = hit.kind == render::PickKind::Face
+                        ? st.docMirror.ownerOfFace(hit.body_id, hit.topo_id)
+                        : hit.kind == render::PickKind::Edge
+                            ? st.docMirror.ownerOfEdge(hit.body_id, hit.topo_id) : std::string();
+                    if (owner.empty()) {
+                      const auto owners = st.docMirror.ownerOfBody(hit.body_id);
+                      if (!owners.empty()) owner = owners.back();
+                    }
+                    if (!owner.empty()) {
+                      st.selectedFeatureId = owner;
+                      st.treeScrollToSelection = true;
+                    }
+                  }
+                }
+                if (!selected.resolution_error.empty())
+                  st.addLog("[selection] " + selected.resolution_error);
+                break;
+              }
+            });
+        continue;
+      }
+      if (st.rpc.busy()) {
+        item.pending_resolve = false;
+        item.resolution_error = "The engine is busy. Select this element again when the operation finishes.";
+        st.toast(ui::ToastLevel::Info, item.resolution_error);
+        continue;
+      }
       std::string err;
       // C20b: while the Mate form is open, assembly picks resolve via the asm
       // path (doc_resolve_pick returns {selector, component}) and route into
@@ -3035,6 +3119,8 @@ int run_gui(const char *screenshotPath, const char *openPath) {
           std::string asel =
               st.docMirror.resolvePickAsm(st.worker, item.hit.body_id, kindStr,
                                           item.hit.topo_id, comp, err);
+          item.pending_resolve = false;
+          item.resolution_error = asel.empty() ? err : std::string();
           if (!asel.empty()) {
             item.selector = asel;
             item.pending_resolve = false;
@@ -3050,8 +3136,10 @@ int run_gui(const char *screenshotPath, const char *openPath) {
         // face/edge).
         if (ap->patternFormActive()) {
           std::string comp;
-          st.docMirror.resolvePickAsm(st.worker, item.hit.body_id, kindStr,
-                                      item.hit.topo_id, comp, err);
+          item.selector = st.docMirror.resolvePickAsm(st.worker, item.hit.body_id, kindStr,
+                                                      item.hit.topo_id, comp, err);
+          item.pending_resolve = false;
+          item.resolution_error = item.selector.empty() ? err : std::string();
           if (!comp.empty())
             ap->routeAsmPatternPick(comp);
           continue; // handled — skip the part-doc resolve path
@@ -3086,6 +3174,9 @@ int run_gui(const char *screenshotPath, const char *openPath) {
                   std::to_string(item.hit.topo_id) + " -> " +
                   std::to_string(added) + " edge(s)");
         item.pending_resolve = false;
+        item.selector = st.docMirror.resolvePick(st.worker, item.hit.body_id, kindStr,
+                                                 item.hit.topo_id, err);
+        item.resolution_error = item.selector.empty() ? err : std::string();
         continue;
       }
       // Body wells (boolean targets/tools): resolve the clicked element's
@@ -3179,9 +3270,11 @@ int run_gui(const char *screenshotPath, const char *openPath) {
                      "Fixtures and loads take faces — click a model face");
           }
         }
-      } else if (!err.empty()) {
-        // Log once (avoid flooding; resolvePick logs stale_revision
-        // internally).
+      } else {
+        item.pending_resolve = false;
+        item.selector.clear();
+        item.resolution_error = err.empty() ? "The selected topology could not be resolved." : err;
+        st.addLog("[selection] " + item.resolution_error);
       }
     }
     // A routed sim face pick belongs to the fixture/load WELL (shown as the

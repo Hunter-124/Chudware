@@ -22,8 +22,10 @@
 #include "../core/app_state.h"
 #include "../core/sim_client.h"
 #include "../render/aicm_loader.h" // parse the flow overlay's streamline / slice LINS chunks
+#include "../render/overlays.h"
 #include "../renderer.h"
 #include "../ui_theme.h"
+#include "anim.h"
 #include "appearance_common.h" // materialAppearance / kPhysicalMaterials — set_material recolour
 #include "engine_backend.h" // engine::daemonMode — server-owned export paths
 #include "feature_tree.h" // fmRowPill/fmTreeIcon/fmSectionDivider — FM-grade row styling
@@ -393,6 +395,10 @@ static void clearTransientResult(Study &s) {
   s.motionBodyLabels.clear();
   s.motionDriverUnit.clear();
   s.motionRenderError.clear();
+  s.motionRunning = false;
+  s.motionInterference = nlohmann::json();
+  s.motionResultDrivers = nlohmann::json();
+  s.motionCollisionFrames.clear();
 }
 
 static bool studyReady(const Study &s, std::string &blocker);
@@ -1138,6 +1144,189 @@ SimManager::SimManager() {}
 // ---------------------------------------------------------------- JSON <->
 // Study
 
+namespace {
+struct MotionJoint {
+  std::string id, label, type, unit;
+  double value = 0.0;
+};
+
+std::vector<MotionJoint> motionJoints(const nlohmann::json &tree) {
+  std::vector<MotionJoint> joints;
+  const auto mates = tree.find("mates");
+  if (mates == tree.end() || !mates->is_array())
+    return joints;
+  std::map<std::string, std::string> names;
+  std::map<std::string, bool> movable;
+  const auto components = tree.find("components");
+  if (components != tree.end() && components->is_array())
+    for (const auto &c : *components)
+      if (c.is_object() && !simJsonBool(c, "suppressed", false)) {
+        const std::string id = c.value("id", std::string());
+        names[id] = c.value("name", std::string());
+        movable[id] = !simJsonBool(c, "fixed", false);
+      }
+  for (const auto &mate : *mates) {
+    if (!mate.is_object() || simJsonBool(mate, "suppressed", false))
+      continue;
+    const std::string type = mate.value("type", std::string());
+    const std::string id = mate.value("id", std::string());
+    if (id.empty() || (type != "angle" && type != "distance"))
+      continue;
+    const auto refs = mate.find("refs");
+    if (refs == mate.end() || !refs->is_array() || refs->size() < 2 ||
+        !(*refs)[0].is_object() || !(*refs)[1].is_object())
+      continue;
+    const auto a = movable.find((*refs)[0].value("component", std::string()));
+    const auto b = movable.find((*refs)[1].value("component", std::string()));
+    if (a == movable.end() || b == movable.end() || a == b || (!a->second && !b->second))
+      continue;
+    MotionJoint joint{id, mate.value("name", std::string()), type,
+                      type == "angle" ? "deg" : "mm", 0.0};
+    const auto value = mate.find("value");
+    bool finiteValue = false;
+    if (value != mate.end()) {
+      const auto *v = &*value;
+      if (v->is_object() && v->contains("value"))
+        v = &(*v)["value"];
+      if (v->is_number() && std::isfinite(v->get<double>())) {
+        joint.value = v->get<double>();
+        finiteValue = true;
+      }
+    }
+    if (!finiteValue)
+      continue;
+    if (joint.label.empty() && mate.contains("refs") && mate["refs"].is_array())
+      for (const auto &ref : mate["refs"]) {
+        if (!ref.is_object())
+          continue;
+        const std::string component = ref.value("component", std::string());
+        if (component.empty())
+          continue;
+        const auto name = names.find(component);
+        if (!joint.label.empty())
+          joint.label += " / ";
+        joint.label += name != names.end() && !name->second.empty()
+                           ? name->second : component;
+      }
+    if (joint.label.empty())
+      joint.label = "Joint";
+    joint.label += " [" + id + "] - " + type + " (" + joint.unit + ")";
+    joints.push_back(std::move(joint));
+  }
+  return joints;
+}
+
+void seedMotionDriver(Study &s, const std::vector<MotionJoint> &joints) {
+  if (s.motionDrivers.size() == 1 && s.motionDrivers[0].mateId.empty() &&
+      !joints.empty()) {
+    auto &driver = s.motionDrivers[0];
+    driver.mateId = joints[0].id;
+    if (driver.start == 0.0 && driver.stop == 360.0) {
+      driver.start = joints[0].value;
+      driver.stop = driver.start + (joints[0].type == "angle" ? 360.0 : 10.0);
+    }
+  }
+}
+
+bool motionJointsReady(const Study &s, const nlohmann::json &tree,
+                       std::string &blocker) {
+  const auto joints = motionJoints(tree);
+  if (joints.empty()) {
+    blocker = "No drivable joint. In Assembly > Mate, add an unsuppressed Angle "
+              "or Distance mate between the moving and reference components, "
+              "then return to Motion setup.";
+    return false;
+  }
+  for (const auto &driver : s.motionDrivers)
+    if (std::none_of(joints.begin(), joints.end(), [&](const MotionJoint &joint) {
+          return joint.id == driver.mateId;
+        })) {
+      blocker = "A driver joint is missing, suppressed, or no longer dimensional. "
+                "Choose an Angle or Distance joint in Motion setup.";
+      return false;
+    }
+  return true;
+}
+
+nlohmann::json motionDriversJson(const Study &s) {
+  auto drivers = nlohmann::json::array();
+  for (const auto &driver : s.motionDrivers)
+    drivers.push_back({{"mate_id", driver.mateId}, {"start", driver.start},
+                      {"stop", driver.stop}});
+  return drivers;
+}
+nlohmann::json motionSettingsJson(const Study &s) {
+  return {{"drivers", motionDriversJson(s)}, {"steps", s.motionSteps},
+          {"loop", s.motionLoop}, {"fps", s.motionFps},
+          {"check_interference", s.motionCheckInterference},
+          {"min_clearance", s.motionMinClearance}};
+}
+
+bool sameMotionSource(const nlohmann::json &a, const nlohmann::json &b) {
+  if (!a.is_object() || !b.is_object())
+    return a == b;
+  if (a.size() - a.count("studies") != b.size() - b.count("studies"))
+    return false;
+  for (auto it = a.begin(); it != a.end(); ++it) {
+    if (it.key() == "studies")
+      continue;
+    const auto other = b.find(it.key());
+    if (other == b.end() || *other != it.value())
+      return false;
+  }
+  return true;
+}
+
+
+nlohmann::json motionSource(const nlohmann::json &tree) {
+  auto source = tree;
+  if (source.is_object())
+    source.erase("studies");
+  return source;
+}
+
+bool motionFrameCollision(const nlohmann::json &frame) {
+  const auto detail = frame.find("collision_detail");
+  return simJsonBool(frame, "interference", false) ||
+         (detail != frame.end() && detail->is_array() && !detail->empty());
+}
+
+bool motionChecksComplete(const Study &s) {
+  const auto &check = s.motionInterference;
+  if (!check.is_object() || !simJsonBool(check, "checked", false) ||
+      !simJsonBool(check, "complete", false) ||
+      !check.contains("frames_checked") || !check["frames_checked"].is_number_integer() ||
+      check["frames_checked"].get<int>() != static_cast<int>(s.motionTrajectory.size()) ||
+      !check.contains("pair_failures") || !check["pair_failures"].is_array() ||
+      !check["pair_failures"].empty())
+    return false;
+  if (check.contains("geometry_failures") &&
+      (!check["geometry_failures"].is_array() || !check["geometry_failures"].empty()))
+    return false;
+  for (const auto &frame : s.motionTrajectory)
+    if (!simJsonBool(frame, "interference_complete", false) ||
+        !frame.contains("interference") || !frame["interference"].is_boolean())
+      return false;
+  return true;
+}
+
+const char *motionCheckLabel(const Study &s) {
+  if (!s.motionCollisionFrames.empty())
+    return motionChecksComplete(s) ? "Collision" : "Collision / checks incomplete";
+  if (!s.motionCheckInterference)
+    return "Not checked";
+  return motionChecksComplete(s) ? "Sampled clear" : "Incomplete";
+}
+
+kit::Tone motionCheckTone(const Study &s) {
+  if (!s.motionCollisionFrames.empty())
+    return kit::Tone::Err;
+  if (!s.motionCheckInterference)
+    return kit::Tone::Neutral;
+  return motionChecksComplete(s) ? kit::Tone::Ok : kit::Tone::Warn;
+}
+} // namespace
+
 nlohmann::json SimManager::studyToJson(const Study &s) {
   nlohmann::json fixtures = nlohmann::json::array();
   for (const auto &p : s.fixtures.picks)
@@ -1216,14 +1405,7 @@ nlohmann::json SimManager::studyToJson(const Study &s) {
         {"size_mm", s.fatigueSizeMm},
         {"temp_c", s.fatigueTempC},
         {"reliability", s.fatigueReliability}}},
-      {"motion",
-       {{"mate_id", s.motionMateId},
-        {"start", s.motionStart},
-        {"stop", s.motionStop},
-        {"steps", s.motionSteps},
-        {"loop", s.motionLoop},
-        {"fps", s.motionFps},
-        {"check_interference", s.motionCheckInterference}}},
+      {"motion", motionSettingsJson(s)},
       // Advanced study settings (contact proxy, vibration, thermal FEA).
       {"adv",
        {{"contact_pressure_mpa", s.contactPressureMpa},
@@ -1237,7 +1419,7 @@ nlohmann::json SimManager::studyToJson(const Study &s) {
         {"therm_t_end_s", s.thermTEndS},
         {"therm_dt_s", s.thermDtS},
         {"therm_t_init_c", s.thermTInitC}}},
-      {"result_summary", s.summary},
+      {"result_summary", s.type == StudyType::Motion ? std::string() : s.summary},
   };
 }
 
@@ -1331,15 +1513,26 @@ Study SimManager::studyFromJson(const nlohmann::json &j) {
   }
   if (j.contains("motion") && j["motion"].is_object()) {
     const auto &mo = j["motion"];
-    s.motionMateId = mo.value("mate_id", std::string());
-    s.motionStart = mo.value("start", 0.0f);
-    s.motionStop = mo.value("stop", 360.0f);
+    if (mo.contains("drivers") && mo["drivers"].is_array()) {
+      s.motionDrivers.clear();
+      for (const auto &driver : mo["drivers"])
+        if (driver.is_object())
+          s.motionDrivers.push_back({driver.value("mate_id", std::string()),
+                                     driver.value("start", 0.0),
+                                     driver.value("stop", 360.0)});
+    } else {
+      // Read pre-multiple-driver studies; all future saves use the shared drivers array.
+      s.motionDrivers = {{mo.value("mate_id", std::string()),
+                          mo.value("start", 0.0), mo.value("stop", 360.0)}};
+    }
     s.motionSteps = mo.value("steps", 24);
     s.motionLoop = mo.value("loop", true);
     s.motionFps = mo.value("fps", 24.0f);
-    s.motionCheckInterference = mo.value("check_interference", false);
+    s.motionCheckInterference = simJsonBool(mo, "check_interference", true);
+    s.motionMinClearance = mo.value("min_clearance", 0.0);
   }
-  s.summary = j.value("result_summary", std::string());
+  if (s.type != StudyType::Motion)
+    s.summary = j.value("result_summary", std::string());
   if (j.contains("fixtures") && j["fixtures"].is_array())
     for (const auto &sel : j["fixtures"])
       s.fixtures.picks.push_back(selFromJson(sel));
@@ -1374,6 +1567,8 @@ void SimManager::refresh(AppState &st) {
     sel_ = -1;
     return;
   }
+  if (st.rpc.busy())
+    return; // Never wait on the motion solve's serialized worker mutex.
   nlohmann::json res;
   std::string err;
   if (!st.worker.call("sim_study_list", {{"doc_id", st.docMirror.docId()}}, res,
@@ -1427,6 +1622,19 @@ void SimManager::refresh(AppState &st) {
           if (!p.summary.empty())
             s.summary = p.summary;
           // Motion transient result
+          if (s.type == StudyType::Motion && motionSettingsJson(s) != motionSettingsJson(p)) {
+            s.motionGeneration = p.motionGeneration + 1;
+            clearTransientResult(s);
+            s.summary = "Setup changed; run Motion again.";
+            break;
+          }
+          s.motionGeneration = p.motionGeneration;
+          s.motionSourceRevision = p.motionSourceRevision;
+          s.motionRunning = p.motionRunning;
+          s.motionSource = p.motionSource;
+          s.motionInterference = p.motionInterference;
+          s.motionResultDrivers = p.motionResultDrivers;
+          s.motionCollisionFrames = p.motionCollisionFrames;
           s.motionHasResult = p.motionHasResult;
           s.motionPlaying = p.motionPlaying;
           s.motionFrame = p.motionFrame;
@@ -1456,6 +1664,25 @@ void SimManager::persist(AppState &st, Study &s) {
 void SimManager::persist(AppState &st, const std::string &docId, Study &s) {
   if (s.id.empty() || docId.empty())
     return;
+  if (s.type == StudyType::Motion) {
+    const std::string studyId = s.id;
+    st.rpc.call("sim_study_edit",
+                {{"doc_id", docId}, {"study_id", studyId}, {"study", studyToJson(s)}},
+                [this, &st, docId, studyId](const core::RpcResult &r) {
+      if (!simDocOpen(st, docId))
+        return;
+      if (!r.ok || !r.result.is_object() || r.result.contains("code") ||
+          !simJsonBool(r.result, "ok", true)) {
+        st.addLog("[motion] could not save " + studyId + ": " +
+                  simJsonText(r.result, "message", "error", r.err));
+        if (simOriginActive(st, this, docId))
+          st.toast(ui::ToastLevel::Error, "Could not save Motion setup; retry the edit.");
+        return;
+      }
+      markSimDocDirty(st, docId);
+    });
+    return;
+  }
   nlohmann::json res;
   std::string err;
   nlohmann::json params = {{"doc_id", docId},
@@ -1476,6 +1703,10 @@ void SimManager::persist(AppState &st, const std::string &docId, Study &s) {
 }
 
 void SimManager::newStudy(AppState &st, StudyType t) {
+  if (st.rpc.busy()) {
+    st.toast(ui::ToastLevel::Info, "Wait for the current engine request before adding a study.");
+    return;
+  }
   if (!st.docMirror.hasDoc()) {
     st.toast(ui::ToastLevel::Warn, "Open a part before creating a study");
     return;
@@ -1483,6 +1714,8 @@ void SimManager::newStudy(AppState &st, StudyType t) {
   refresh(st);
   Study s;
   s.type = t;
+  if (t == StudyType::Motion)
+    seedMotionDriver(s, motionJoints(st.docMirror.tree()));
   if (t == StudyType::Buckling)
     s.nModes = 4;
   s.name = std::string(studyTypeLabel(t)) + " " +
@@ -1540,6 +1773,44 @@ void SimManager::deleteStudy(AppState &st, int i) {
   if (i < 0 || i >= (int)studies_.size() || !st.docMirror.hasDoc())
     return;
   std::string id = studies_[i].id;
+  if (studies_[i].type == StudyType::Motion) {
+    const std::string docId = st.docMirror.docId();
+    invalidateMotion(studies_[i]);
+    st.rpc.call("sim_study_delete", {{"doc_id", docId}, {"study_id", id}},
+                [this, &st, docId, id](const core::RpcResult &r) {
+      if (!simDocOpen(st, docId))
+        return;
+      if (!r.ok || !r.result.is_object() || r.result.contains("code") ||
+          !simJsonBool(r.result, "ok", true)) {
+        st.addLog("[motion] delete failed: " +
+                  simJsonText(r.result, "message", "error", r.err));
+        if (simOriginActive(st, this, docId))
+          st.toast(ui::ToastLevel::Error, "Could not delete Motion study; retry.");
+        return;
+      }
+      const std::string selectedId = sel_ >= 0 && sel_ < static_cast<int>(studies_.size())
+                                         ? studies_[sel_].id : std::string();
+      studies_.erase(std::remove_if(studies_.begin(), studies_.end(),
+                                    [&](const Study &study) { return study.id == id; }),
+                     studies_.end());
+      const auto selected = std::find_if(studies_.begin(), studies_.end(),
+                                         [&](const Study &study) { return study.id == selectedId; });
+      if (selected == studies_.end()) {
+        sel_ = studies_.empty() ? -1 : 0;
+        node_ = SimNode::Study;
+        armedWell_ = -1;
+      }
+      else {
+        sel_ = static_cast<int>(std::distance(studies_.begin(), selected));
+      }
+      markSimDocDirty(st, docId);
+    });
+    return;
+  }
+  if (st.rpc.busy()) {
+    st.toast(ui::ToastLevel::Info, "Wait for the current engine request before deleting this study.");
+    return;
+  }
   nlohmann::json res;
   std::string err;
   if (!st.worker.call("sim_study_delete",
@@ -2527,8 +2798,12 @@ void SimManager::configureActiveMotion(AppState &st, float start, float stop,
   Study &s = studies_[sel_];
   if (s.type != StudyType::Motion)
     return;
-  s.motionStart = start;
-  s.motionStop = stop;
+  seedMotionDriver(s, motionJoints(st.docMirror.tree()));
+  if (s.motionDrivers.empty())
+    s.motionDrivers.push_back({});
+  s.motionDrivers.front().start = start;
+  s.motionDrivers.front().stop = stop;
+  invalidateMotion(s);
   s.motionSteps = std::max(2, std::min(steps, 120));
   persist(st, s);
 }
@@ -3981,6 +4256,11 @@ void SimManager::run(AppState &st, Study &s) {
     return;
   }
   std::string readiness;
+  if (s.type == StudyType::Motion &&
+      !motionJointsReady(s, st.docMirror.tree(), readiness)) {
+    block(readiness);
+    return;
+  }
   if (!studyReady(s, readiness)) {
     block(readiness);
     return;
@@ -4039,7 +4319,8 @@ void SimManager::run(AppState &st, Study &s) {
     block("The simulation backend is unavailable.");
     return;
   }
-  if ((st.simClient && st.simClient->busy()) || advRunning_ || prepInFlight_) {
+  if ((st.simClient && st.simClient->busy()) || advRunning_ || prepInFlight_ ||
+      motionRun_ || (s.type != StudyType::Motion && st.rpc.busy())) {
     block("A simulation is already in progress.");
     return;
   }
@@ -4589,30 +4870,44 @@ void SimManager::clearResultOverlay(AppState &st) {
 
 void SimManager::restoreModelMesh(AppState &st) {
   clearResultOverlay(st);
-  pendingOverlayStudyId_.clear();
   if (!st.docMirror.hasDoc())
     return;
-  // The result overlay REPLACED the doc mesh with the FEA surface (no pickable
-  // faces). Re-tessellate the current document so the editable, face-bearing
-  // model mesh comes back. activate() fires the mirror listener; suppress the
-  // tab-dirty marker around it (restoring a view must not "modify" the
-  // document), exactly like switchToTab does.
-  const bool prevSuppress = st.suppressTabDirty;
-  st.suppressTabDirty = true;
-  std::string aicm, err;
-  if (st.docMirror.activate(st.worker, st.docMirror.docId(), aicm, err) &&
-      !aicm.empty()) {
-#ifdef __EMSCRIPTEN__
-    st.loadDocMeshAsync(aicm);
-#else
-    std::string le;
-    if (!st.loadDocMesh(aicm, le) && !le.empty())
-      st.addLog("[sim] restore model mesh: " + le);
-#endif
-  } else if (!err.empty()) {
-    st.addLog("[sim] restore model mesh failed: " + err);
+  st.clearSelection();
+  const auto generation = ++modelRestoreGeneration_;
+  const std::string docId = st.docMirror.docId();
+  const int revision = st.docMirror.revision();
+  // Motion parks the immutable base GPU mesh before uploading its first pose. Switching back
+  // needs neither a worker request nor another mesh upload when that cache is still available.
+  const auto *session = st.activeSession();
+  if (motionHighlightPose_ && st.overlays && session && session->cachedDocMesh) {
+    std::string err;
+    if (!st.overlays->setDoc(*session->cachedDocMesh, err))
+      st.addLog("[motion] restore selection geometry: " + err);
+    motionHighlightPose_ = false;
   }
-  st.suppressTabDirty = prevSuppress;
+  if (st.renderer && session && session->cachedRevision == revision &&
+      st.renderer->bindCachedMeshes(docId, revision))
+    return;
+  st.rpc.call("doc_activate", {{"doc_id", docId}},
+              [this, &st, docId, revision, generation](const core::RpcResult &r) {
+    if (generation != modelRestoreGeneration_ || !simOriginActive(st, this, docId) ||
+        st.docMirror.revision() != revision || resultShown_)
+      return;
+    if (!r.ok || !r.result.is_object() || r.result.contains("code")) {
+      st.addLog("[sim] restore model mesh failed: " +
+                simJsonText(r.result, "message", "error", r.err));
+      return;
+    }
+    const bool previous = st.suppressTabDirty;
+    st.suppressTabDirty = true;
+    std::string aicm, err;
+    const bool adopted = st.docMirror.adoptActivateResponse(docId, r.result, aicm, err);
+    st.suppressTabDirty = previous;
+    if (adopted && !aicm.empty())
+      st.loadDocMeshAsync(aicm);
+    else
+      st.addLog("[sim] restore model mesh failed: " + err);
+  }, 60000);
 }
 
 void SimManager::syncResultView(AppState &st) {
@@ -4629,6 +4924,16 @@ void SimManager::syncResultView(AppState &st) {
   // actually set, so it hides/restores correctly on every workspace switch.
   const bool valid = sel_ >= 0 && sel_ < (int)studies_.size();
   const bool onSimWs = st.activeWorkspace == AppState::Workspace::Simulate;
+  if (valid && studies_[sel_].type == StudyType::Motion &&
+      studies_[sel_].motionHasResult &&
+      studies_[sel_].motionSourceRevision != st.docMirror.revision()) {
+    auto &motion = studies_[sel_];
+    if (!sameMotionSource(motion.motionSource, st.docMirror.tree())) {
+      invalidateMotion(motion);
+      motion.summary = "Assembly changed. Run Motion again before playing or checking clearance.";
+    }
+    motion.motionSourceRevision = st.docMirror.revision();
+  }
 
   // Motion studies manage the viewport via applyMotionFrame (setMeshes); they
   // don't use the overlay path. Re-apply the current frame on a real view transition because
@@ -5223,9 +5528,29 @@ void SimManager::drainSimClientJob(AppState &st) {
 static bool studyReady(const Study &s, std::string &blocker) {
   auto finite = [](double v) { return std::isfinite(v); };
   if (s.type == StudyType::Motion) {
-    if (!finite(s.motionStart) || !finite(s.motionStop) ||
-        std::fabs(s.motionStop - s.motionStart) < 1e-9) {
-      blocker = "Motion needs distinct finite start and stop values.";
+    if (s.motionDrivers.empty()) {
+      blocker = "Add at least one Angle or Distance driver in Motion setup.";
+      return false;
+    }
+    std::unordered_set<std::string> ids;
+    bool moving = false;
+    for (const auto &driver : s.motionDrivers) {
+      if (driver.mateId.empty() || !ids.insert(driver.mateId).second) {
+        blocker = "Choose a different named joint for each driver row.";
+        return false;
+      }
+      if (!finite(driver.start) || !finite(driver.stop)) {
+        blocker = "Each driver needs finite start and stop values.";
+        return false;
+      }
+      moving = moving || std::fabs(driver.stop - driver.start) >= 1e-9;
+    }
+    if (!moving) {
+      blocker = "At least one driver must move between distinct start and stop values.";
+      return false;
+    }
+    if (!finite(s.motionMinClearance) || s.motionMinClearance < 0.0) {
+      blocker = "Minimum clearance must be a finite, non-negative distance in mm.";
       return false;
     }
     if (s.motionSteps < 2 || s.motionSteps > 120) {
@@ -5468,7 +5793,7 @@ static void simBadge(bool ok, const char *tip) {
 void SimManager::drawTreeBody(AppState &st) {
   // Keep the mirror in step with the active document (cheap: re-pull only on a
   // doc/revision change).
-  if (st.docMirror.hasDoc() && (lastDocId_ != st.docMirror.docId() ||
+  if (!st.rpc.busy() && st.docMirror.hasDoc() && (lastDocId_ != st.docMirror.docId() ||
                                 lastRevision_ != (long)st.docMirror.revision()))
     refresh(st);
 
@@ -8196,11 +8521,10 @@ void SimManager::drawForm(AppState &st, Study &s) {
   // Keep study materialKey in lockstep with the part's active material.
   resolveStudyMaterialFromDoc(st, s);
 
-  // Header: study name (editable).
+  // Keep the study name and type readable in the narrow setup rail.
   ImGui::PushFont(st.fonts.medium);
-  ImGui::TextUnformatted(s.name.c_str());
+  ImGui::TextWrapped("%s", s.name.c_str());
   ImGui::PopFont();
-  ImGui::SameLine();
   ImGui::TextDisabled("(%s)", studyTypeLabel(s.type));
 
   // Units selector — drives how loads + results are shown/entered. The solver
@@ -8531,7 +8855,8 @@ void SimManager::drawForm(AppState &st, Study &s) {
     ImGui::Separator();
     ImGui::Spacing();
     bool busy =
-        (st.simClient && st.simClient->busy()) || advRunning_ || prepInFlight_;
+        (st.simClient && st.simClient->busy()) || advRunning_ || prepInFlight_ ||
+        motionRun_ || (s.type != StudyType::Motion && st.rpc.busy());
     std::string blocker;
     bool ready = studyReady(s, blocker);
     if (ready && (!st.docMirror.hasDoc() || !hasSimulationGeometry(st))) {
@@ -8545,6 +8870,8 @@ void SimManager::drawForm(AppState &st, Study &s) {
       ready = false;
       blocker = "Motion studies require an active assembly document.";
     }
+    if (ready && s.type == StudyType::Motion)
+      ready = motionJointsReady(s, st.docMirror.tree(), blocker);
     if (ready && s.type != StudyType::Motion &&
         s.type != StudyType::Contact && !st.simClient) {
       ready = false;
@@ -8633,16 +8960,11 @@ void SimManager::drawForm(AppState &st, Study &s) {
 // ============================================================ Motion study
 // (T-SIM3/T-SIM4)
 //
-// Motion studies drive ONE dimensional assembly mate across [start, stop] in
-// `steps` samples. simulate_motion is a synchronous worker RPC (same path as
-// sim_mesh / doc_export_step) that returns the full per-body world-transform
-// trajectory in one shot. The result is cached in the Study and played back on
-// the main thread by tickMotion + applyMotionFrame. The cached AICM is already
-// world-space, so playback applies frameWorld * inverse(cachedBaseWorld).
-//
-// Engine-side solve path: worker_router dispatches "simulate_motion" ->
-// engine.assemble.motion which calls solve_mates() at each driver step.  No
-// simClient / sim worker involved.
+// Motion studies sample synchronized dimensional assembly mates through the existing native
+// simulate_motion RPC. AsyncRpc keeps both activation and solving off the UI thread. Only the
+// owning document/study/generation may consume a completion; viewport changes additionally require
+// that study's Results view to be active. AICM is world-space, so playback applies
+// frameWorld * inverse(cachedBaseWorld), never an independent fixed-world spin.
 
 using MotionMat4 = std::array<double, 16>;
 
@@ -8753,55 +9075,126 @@ static MotionMat4 multiplyMotionMatrices(const MotionMat4 &a,
 // ---------- runMotion
 // -------------------------------------------------------------------
 
+struct SimManager::MotionRun {
+  std::string docId, studyId;
+  uint64_t generation = 0;
+  nlohmann::json source, activation, params;
+  std::shared_ptr<const render::DocMesh> baseMesh;
+};
+
+void SimManager::invalidateMotion(Study &s) {
+  ++s.motionGeneration;
+  clearTransientResult(s);
+  s.motionSource = nlohmann::json();
+  s.summary.clear();
+}
+
+Study *SimManager::motionRunStudy(AppState &st, const std::shared_ptr<MotionRun> &run) {
+  if (motionRun_ != run)
+    return nullptr;
+  const nlohmann::json *tree = nullptr;
+  for (const auto &tab : st.docTabs)
+    if (tab.docId == run->docId && tab.session && tab.session->sim.get() == this) {
+      if (simOriginActive(st, this, run->docId))
+        tree = &st.docMirror.tree();
+      else if (tab.session->cachedMirror.valid())
+        tree = &tab.session->cachedMirror.tree;
+      break;
+    }
+  for (auto &study : studies_)
+    if (study.id == run->studyId && study.motionGeneration == run->generation) {
+      if (tree && sameMotionSource(*tree, run->source))
+        return &study;
+      invalidateMotion(study);
+      study.summary = "Assembly changed or closed during the run. Reopen Motion setup and run again.";
+      break;
+    }
+  motionRun_.reset();
+  return nullptr;
+}
+
 void SimManager::runMotion(AppState &st, Study &s) {
-  if (!st.docMirror.hasDoc()) {
+  if (!st.docMirror.hasDoc() || motionRun_)
+    return;
+  const auto *session = st.activeSession();
+  if (!session || !session->cachedDocMesh || session->cachedDocMesh->empty() ||
+      !session->cachedMirror.valid() ||
+      !sameMotionSource(session->cachedMirror.tree, st.docMirror.tree())) {
     st.toast(ui::ToastLevel::Warn,
-             "Open an assembly with mates before running Motion");
+             "Assembly geometry is still loading or changed. Wait for the viewport to finish, then Run Motion.");
     return;
   }
-  const std::string docId = st.docMirror.docId();
-  clearTransientResult(s);
-  motionDocMesh_ = render::DocMesh{};
-  motionCacheDocId_.clear();
-  motionComponentByBodyId_.clear();
-  motionInverseBaseWorldByComponentId_.clear();
+  // Persist only inputs. No restore/activation or solver call may block the UI thread.
+  invalidateMotion(s);
   persist(st, s);
-  restoreModelMesh(st);
+  auto run = std::make_shared<MotionRun>();
+  run->docId = st.docMirror.docId();
+  run->studyId = s.id;
+  run->generation = s.motionGeneration;
+  run->source = motionSource(st.docMirror.tree());
+  run->baseMesh = session->cachedDocMesh; // share immutable parsed geometry; never copy/parse on Run
+  const auto &first = s.motionDrivers.front();
+  run->params = {{"doc_id", run->docId}, {"mate_id", first.mateId},
+                 {"start", first.start}, {"stop", first.stop},
+                 {"drivers", motionDriversJson(s)}, {"steps", s.motionSteps},
+                 {"check_interference", s.motionCheckInterference},
+                 {"min_clearance", s.motionMinClearance}};
+  motionRun_ = run;
+  s.motionRunning = true;
+  s.summary = "Preparing Motion snapshot...";
+  st.rpc.call("doc_activate", {{"doc_id", run->docId}},
+              [this, &st, run](const core::RpcResult &r) {
+    Study *study = motionRunStudy(st, run);
+    if (!study)
+      return;
+    if (!r.ok || !r.result.is_object() || r.result.contains("code") ||
+        !r.result.contains("tree") ||
+        !sameMotionSource(r.result["tree"], run->source)) {
+      core::RpcResult failure;
+      failure.err = !r.ok || r.result.contains("code")
+                        ? simJsonText(r.result, "message", "error", r.err)
+                        : "Assembly snapshot changed. Refresh the document and run Motion again.";
+      finishMotionRun(st, run, failure);
+      return;
+    }
+    run->activation = r.result;
+    study->summary = "Solving synchronized Motion samples...";
+    st.rpc.call("simulate_motion", run->params,
+                [this, &st, run](const core::RpcResult &result) {
+                  finishMotionRun(st, run, result);
+                }, 120000);
+  }, 60000);
+}
 
-  nlohmann::json params = {
-      {"doc_id", docId},
-      {"start", s.motionStart},
-      {"stop", s.motionStop},
-      {"steps", std::max(2, std::min(s.motionSteps, 120))},
-      {"check_interference", s.motionCheckInterference},
-  };
-  if (!s.motionMateId.empty())
-    params["mate_id"] = s.motionMateId;
-
-  st.status = "Motion: solving\xe2\x80\xa6";
-  st.statusKind = 0;
-
+void SimManager::finishMotionRun(AppState &st, const std::shared_ptr<MotionRun> &run,
+                                 const core::RpcResult &response) {
+  Study *study = motionRunStudy(st, run);
+  if (!study)
+    return;
+  Study &s = *study;
+  s.motionRunning = false;
+  motionRun_.reset();
+  const std::string &docId = run->docId;
+  const bool active = simOriginActive(st, this, docId);
   auto failRun = [&](const std::string &message) {
     s.motionPlaying = false;
     s.summary = "Motion failed: " + message;
-    st.status = s.summary;
-    st.statusKind = 2;
     st.addLog("[motion] " + s.summary);
-    st.toast(ui::ToastLevel::Error, s.summary);
+    if (active) {
+      st.status = s.summary;
+      st.statusKind = 2;
+      st.toast(ui::ToastLevel::Error, s.summary);
+    }
   };
 
-  nlohmann::json result;
-  std::string err;
-  const bool ok =
-      st.worker.call("simulate_motion", params, result, err, 120000);
-  if (!ok || !result.is_object() || result.contains("code")) {
-    failRun(result.is_object() && result.contains("message")
-                ? result.value("message", err)
-                : (err.empty() ? "motion solver returned no result" : err));
+  const auto &result = response.result;
+  if (!response.ok || !result.is_object() || result.contains("code")) {
+    failRun(simJsonText(result, "message", "error",
+                       response.err.empty() ? "motion solver returned no result" : response.err));
     return;
   }
-  if (!result.value("ok", false)) {
-    failRun(result.value("error", std::string("motion error")));
+  if (!simJsonBool(result, "ok", false)) {
+    failRun(simJsonText(result, "error", "message", "motion error"));
     return;
   }
   if (!result.contains("doc_id") || !result["doc_id"].is_string() ||
@@ -8813,15 +9206,15 @@ void SimManager::runMotion(AppState &st, Study &s) {
   // The native worker contract is column-major. Accept a trajectory only when every frame
   // converged, every stable component id is present exactly once, and every transform is finite,
   // affine, and invertible.
-  const nlohmann::json trajectory =
-      result.value("trajectory", nlohmann::json::array());
+  static const nlohmann::json emptyTrajectory = nlohmann::json::array();
+  const auto &trajectory = result.contains("trajectory") ? result["trajectory"] : emptyTrajectory;
   std::string trajectoryError;
   std::unordered_set<std::string> expectedComponents;
   if (!trajectory.is_array() || trajectory.size() < 2)
     trajectoryError = "trajectory must contain at least two frames";
   for (size_t fi = 0; trajectoryError.empty() && fi < trajectory.size(); ++fi) {
     const auto &frameJ = trajectory[fi];
-    if (!frameJ.is_object() || !frameJ.value("converged", false) ||
+    if (!frameJ.is_object() || !simJsonBool(frameJ, "converged", false) ||
         !frameJ.contains("bodies") || !frameJ["bodies"].is_array() ||
         frameJ["bodies"].empty()) {
       trajectoryError = "frame " + std::to_string(fi) +
@@ -8870,11 +9263,16 @@ void SimManager::runMotion(AppState &st, Study &s) {
   s.motionDriverUnit = "deg";
   if (result.contains("driver") && result["driver"].is_object())
     s.motionDriverUnit = result["driver"].value("unit", std::string("deg"));
-  if (result.contains("mate_id") && result["mate_id"].is_string())
-    s.motionMateId = result["mate_id"].get<std::string>();
+  s.motionResultDrivers = result.value("drivers", nlohmann::json::array());
+  s.motionInterference = result.value("interference", nlohmann::json());
+  s.motionSource = run->source;
+  s.motionSourceRevision = active ? st.docMirror.revision() : -1;
+  for (size_t i = 0; i < trajectory.size(); ++i)
+    if (motionFrameCollision(trajectory[i]))
+      s.motionCollisionFrames.push_back(static_cast<int>(i));
 
   std::string cacheError;
-  if (!prepareMotionCache(st, s, cacheError)) {
+  if (!prepareMotionCache(s, run->activation, docId, run->baseMesh, cacheError)) {
     s.motionRenderError = cacheError;
     failRun("could not prepare playback geometry: " + cacheError);
     return;
@@ -8903,81 +9301,33 @@ void SimManager::runMotion(AppState &st, Study &s) {
   s.motionLastTick = -1.0;
   const int nFrames = static_cast<int>(s.motionTrajectory.size());
 
-  std::string ifNote;
-  if (s.motionCheckInterference && result.contains("interference")) {
-    const auto &inf = result["interference"];
-    if (inf.value("checked", false)) {
-      int col = inf.value("first_collision_step", -1);
-      char buf[80];
-      if (col >= 0) {
-        std::snprintf(buf, sizeof(buf), " | first collision step %d", col);
-        ifNote = buf;
-      } else {
-        ifNote = " | no collisions";
-      }
+  s.summary = "Motion: " + std::to_string(nFrames) + " samples, " +
+              std::to_string(s.motionDrivers.size()) + " synchronized driver(s) | " +
+              motionCheckLabel(s);
+  st.addLog("[motion] " + s.summary);
+  if (active) {
+    st.status = s.summary;
+    st.statusKind = motionCheckTone(s) == kit::Tone::Err ? 2 :
+                    motionCheckTone(s) == kit::Tone::Warn ? 1 : 0;
+    st.toast(ui::ToastLevel::Info, s.summary);
+    if (sel_ >= 0 && sel_ < static_cast<int>(studies_.size()) &&
+        studies_[sel_].id == s.id &&
+        st.activeWorkspace == AppState::Workspace::Simulate) {
+      node_ = SimNode::Results;
+      resultShown_ = false; // syncResultView applies frame zero only to this visible study.
+      shownStudyId_.clear();
     }
   }
-  char hdr[160];
-  std::snprintf(
-      hdr, sizeof(hdr), "Motion: %d frames, %.1f\xe2\x80\x93%.1f %s%s", nFrames,
-      s.motionStart, s.motionStop, s.motionDriverUnit.c_str(), ifNote.c_str());
-  s.summary = hdr;
-  persist(st, s);
-
-  const bool frameApplied = applyMotionFrame(st, s, 0);
-  node_ = SimNode::Results;
-  resultShown_ = true;
-  shownStudyId_ = s.id;
-  st.colormapOn = false;
-  if (st.renderer)
-    st.renderer->setColormapMode(false);
-  st.legendOn = false;
-  if (!frameApplied)
-    return;
-
-  st.status = "Motion ready \xe2\x80\x94 " + s.summary;
-  st.statusKind = ifNote.empty() ? 0 : 1;
-  st.addLog("[motion] " + s.summary);
-  st.toast(ui::ToastLevel::Info, hdr);
 }
 
-bool SimManager::prepareMotionCache(AppState &st, Study &s,
-                                    std::string &err) {
+bool SimManager::prepareMotionCache(Study &s, const nlohmann::json &activation,
+                                    const std::string &docId,
+                                    std::shared_ptr<const render::DocMesh> mesh, std::string &err) {
   err.clear();
-  if (!st.docMirror.hasDoc()) {
-    err = "no active document";
-    return false;
-  }
-  const std::string docId = st.docMirror.docId();
-
-  // Keep the tessellation metadata from the same activation response as the AICM path. BODY
-  // stores a numeric body id and a display name, while tess.bodies carries the stable component
-  // id; joining those two by body_id avoids ambiguous/renamed component labels.
-  nlohmann::json activation;
-  std::string callError;
-  if (!st.worker.call("doc_activate", {{"doc_id", docId}}, activation,
-                      callError, 60000) ||
-      !activation.is_object() || activation.contains("code")) {
-    err = activation.is_object()
-              ? activation.value("message", callError)
-              : callError;
-    if (err.empty())
-      err = "doc_activate returned no base mesh";
-    return false;
-  }
-  std::string aicmPath;
-  if (!st.docMirror.adoptActivateResponse(docId, activation, aicmPath,
-                                          callError) ||
-      aicmPath.empty()) {
-    err = callError.empty() ? "activation response has no AICM path" : callError;
-    return false;
-  }
-
-  render::DocMesh parsedMesh;
-  std::string parseError;
-  if (!render::loadAicmFile(aicmPath, parsedMesh, parseError) ||
-      parsedMesh.empty()) {
-    err = parseError.empty() ? "base AICM contains no bodies" : parseError;
+  // The host already parsed this immutable source revision on its mesh-loader thread. Share it
+  // rather than re-reading a large assembly on the UI thread or adopting a background document.
+  if (!mesh || mesh->empty()) {
+    err = "base geometry is unavailable; wait for the viewport to load and run again";
     return false;
   }
 
@@ -9037,38 +9387,31 @@ bool SimManager::prepareMotionCache(AppState &st, Study &s,
     }
   }
 
-  // Pattern-instance bodies have synthetic stable component ids and no row in tree.components.
-  // When the requested sweep contains the assembly's current driven value, that solved frame is
-  // the exact base pose for those instances.
-  double currentDriver = 0.0;
-  bool haveCurrentDriver = false;
-  if (treeIt->contains("mates") && (*treeIt)["mates"].is_array()) {
-    for (const auto &mate : (*treeIt)["mates"]) {
-      if (!mate.is_object() ||
-          mate.value("id", std::string()) != s.motionMateId ||
-          !mate.contains("value"))
-        continue;
-      const nlohmann::json *value = &mate["value"];
-      if (value->is_object() && value->contains("value"))
-        value = &(*value)["value"];
-      if (value->is_number()) {
-        currentDriver = value->get<double>();
-        haveCurrentDriver = std::isfinite(currentDriver);
+  // Pattern instances may have no tree.components row. A trajectory pose can supply their base
+  // transform only if ALL driven dimensions equal the activation's current values at that sample.
+  const auto joints = motionJoints(*treeIt);
+  for (const auto &frameJ : s.motionTrajectory) {
+    bool atBase = !s.motionDrivers.empty();
+    for (const auto &driver : s.motionDrivers) {
+      const auto joint = std::find_if(joints.begin(), joints.end(),
+                                     [&](const MotionJoint &j) { return j.id == driver.mateId; });
+      const nlohmann::json *value = nullptr;
+      if (frameJ.contains("driver_values") && frameJ["driver_values"].is_object()) {
+        const auto v = frameJ["driver_values"].find(driver.mateId);
+        if (v != frameJ["driver_values"].end())
+          value = &*v;
+      } else if (s.motionDrivers.size() == 1 && frameJ.contains("value")) {
+        value = &frameJ["value"];
       }
-      break;
+      if (joint == joints.end() || !value || !value->is_number() ||
+          !std::isfinite(value->get<double>()) ||
+          std::abs(value->get<double>() - joint->value) >
+              1e-9 * std::max(1.0, std::abs(joint->value))) {
+        atBase = false;
+        break;
+      }
     }
-  }
-  if (haveCurrentDriver) {
-    for (const auto &frameJ : s.motionTrajectory) {
-      if (!frameJ.contains("value") || !frameJ["value"].is_number())
-        continue;
-      const double frameValue = frameJ["value"].get<double>();
-      const double valueTol =
-          1e-9 * std::max({1.0, std::abs(currentDriver),
-                           std::abs(frameValue)});
-      if (!std::isfinite(frameValue) ||
-          std::abs(frameValue - currentDriver) > valueTol)
-        continue;
+    if (atBase) {
       for (const auto &bodyJ : frameJ["bodies"]) {
         const std::string component =
             bodyJ.value("component", std::string());
@@ -9090,7 +9433,7 @@ bool SimManager::prepareMotionCache(AppState &st, Study &s,
   }
 
   size_t renderableBodies = 0;
-  for (const auto &body : parsedMesh.bodies) {
+  for (const auto &body : mesh->bodies) {
     if (body.pos.empty())
       continue;
     ++renderableBodies;
@@ -9129,7 +9472,7 @@ bool SimManager::prepareMotionCache(AppState &st, Study &s,
     inverseBaseWorld.emplace(entry.first, inverse);
   }
 
-  motionDocMesh_ = std::move(parsedMesh);
+  motionDocMesh_ = std::move(mesh);
   motionCacheDocId_ = docId;
   motionComponentByBodyId_ = std::move(componentByBodyId);
   motionInverseBaseWorldByComponentId_ = std::move(inverseBaseWorld);
@@ -9208,11 +9551,21 @@ bool SimManager::applyMotionFrame(AppState &st, Study &s, int frame) {
   if (frame < 0 || frame >= static_cast<int>(s.motionTrajectory.size()))
     return failPlayback("requested frame is outside the trajectory");
 
-  if (motionDocMesh_.empty() ||
-      motionCacheDocId_ != st.docMirror.docId()) {
-    std::string cacheError;
-    if (!prepareMotionCache(st, s, cacheError))
-      return failPlayback("could not rebuild the base mesh: " + cacheError);
+  if (!motionDocMesh_ || motionDocMesh_->empty() || motionCacheDocId_ != st.docMirror.docId())
+    return failPlayback("base geometry is unavailable; run Motion again to refresh it");
+  if (s.motionSourceRevision != st.docMirror.revision()) {
+    if (!sameMotionSource(s.motionSource, st.docMirror.tree())) {
+      invalidateMotion(s);
+      return failPlayback("assembly changed; run Motion again");
+    }
+    s.motionSourceRevision = st.docMirror.revision();
+  }
+  if (motionHighlightPose_ && st.overlays) {
+    std::string err;
+    st.clearSelection();
+    if (!st.overlays->setDoc(*motionDocMesh_, err))
+      return failPlayback("could not restore selection geometry: " + err);
+    motionHighlightPose_ = false;
   }
 
   const auto &frameJ = s.motionTrajectory[frame];
@@ -9243,8 +9596,8 @@ bool SimManager::applyMotionFrame(AppState &st, Study &s, int frame) {
   // Build the whole upload before touching the renderer. Any identity, matrix, or vertex failure
   // leaves the last known-good geometry in place instead of partially corrupting the assembly.
   std::vector<Renderer::PartMesh> parts;
-  parts.reserve(motionDocMesh_.bodies.size());
-  for (const auto &body : motionDocMesh_.bodies) {
+  parts.reserve(motionDocMesh_->bodies.size());
+  for (const auto &body : motionDocMesh_->bodies) {
     if (body.pos.empty())
       continue;
     const auto componentIt =
@@ -9345,6 +9698,9 @@ bool SimManager::applyMotionFrame(AppState &st, Study &s, int frame) {
   if (parts.empty())
     return failPlayback("base mesh contains no renderable bodies");
 
+  ++modelRestoreGeneration_;
+  st.meshGen_.fetch_add(1); // an older async model restore cannot replace this playback frame
+  st.renderer->parkActiveMeshes();
   st.renderer->setFramingFrozen(true);
   st.renderer->setMeshes(parts);
   st.renderer->setFramingFrozen(false);
@@ -9408,6 +9764,7 @@ void SimManager::tickMotion(AppState &st) {
   const int nFrames = (int)s.motionTrajectory.size();
   if (nFrames <= 1)
     return;
+  anim::requestFrames();
 
   const double now = ImGui::GetTime();
   if (s.motionLastTick < 0.0) {
@@ -9437,166 +9794,341 @@ void SimManager::tickMotion(AppState &st) {
 // ------------------------------------------------
 
 void SimManager::drawMotionForm(AppState &st, Study &s) {
-  const float S = ui::uiScale;
+  drawStudyTypeBanner(s.type, "Drive joints together; inspect sampled motion and interference.");
+  if (s.motionRunning) {
+    kit::spinner(s.summary.c_str());
+    kit::dimText("The UI stays available. Editing setup discards this run's result; "
+                 "the native solve still finishes in the background.");
+    if (kit::secondaryButton("Discard pending result"))
+      invalidateMotion(s);
+  } else if (!s.summary.empty() && !s.motionHasResult) {
+    kit::inlineStatus(s.summary.c_str(), kit::Tone::Warn);
+  }
 
-  drawStudyTypeBanner(s.type, "Motion study: drives one dimensional assembly "
-                              "mate across a range, re-solves "
-                              "the mate graph at each step, and plays back the "
-                              "per-body trajectory in the viewport.");
-
-  ImGui::Spacing();
-  ImGui::PushFont(st.fonts.medium);
-  ImGui::TextUnformatted("Driven mate");
-  ImGui::PopFont();
-
-  ImGui::SetNextItemWidth(-FLT_MIN);
-  char mateIdBuf[128];
-  std::strncpy(mateIdBuf, s.motionMateId.c_str(), sizeof(mateIdBuf) - 1);
-  mateIdBuf[sizeof(mateIdBuf) - 1] = '\0';
-  if (ImGui::InputText("##motionMateId", mateIdBuf, sizeof(mateIdBuf)))
-    s.motionMateId = mateIdBuf;
-  if (ImGui::IsItemDeactivatedAfterEdit())
-    persist(st, s);
-  simTip("Mate ID to drive (e.g. \"m3\"). Leave blank to auto-pick the single "
-         "drivable mate.");
-
-  ImGui::Spacing();
-  ImGui::PushFont(st.fonts.medium);
-  ImGui::TextUnformatted("Driver range");
-  ImGui::PopFont();
-
-  ImGui::SetNextItemWidth(100.0f * S);
-  if (ImGui::DragFloat("Start##ms", &s.motionStart, 1.0f, -720.0f, 720.0f,
-                       "%.1f"))
-    persist(st, s);
-  simTip("Driver start value (deg for angle mates, mm for distance mates).");
-  ImGui::SameLine(0, 12.0f * S);
-  ImGui::SetNextItemWidth(100.0f * S);
-  if (ImGui::DragFloat("Stop##ms", &s.motionStop, 1.0f, -720.0f, 720.0f,
-                       "%.1f"))
-    persist(st, s);
-  simTip("Driver stop value.");
-
-  int steps = s.motionSteps;
-  ImGui::SetNextItemWidth(-FLT_MIN);
-  if (ImGui::SliderInt("Steps", &steps, 2, 120)) {
-    s.motionSteps = steps;
+  const auto joints = motionJoints(st.docMirror.tree());
+  if (joints.empty()) {
+    kit::blockedState("No drivable joint",
+                      "This assembly has no active Angle or Distance mate.",
+                      "Open Assembly > Mate, add an Angle or Distance mate between the "
+                      "moving component and its reference, then return to Motion setup. "
+                      "A concentric or hinge mate alone does not define a driver.");
+    return;
+  }
+  if (s.motionDrivers.size() == 1 && s.motionDrivers[0].mateId.empty()) {
+    seedMotionDriver(s, joints);
     persist(st, s);
   }
-  simTip("Number of frames in the trajectory (2..120).");
+  kit::sectionHeader("Synchronized drivers", nullptr, nullptr,
+                     static_cast<int>(s.motionDrivers.size()));
+  kit::dimText("All rows use the same samples. Equal endpoints hold a joint.");
+  bool changed = false, save = false;
+  for (size_t i = 0; i < s.motionDrivers.size(); ++i) {
+    ImGui::PushID(static_cast<int>(i));
+    auto &driver = s.motionDrivers[i];
+    auto joint = std::find_if(joints.begin(), joints.end(),
+                              [&](const MotionJoint &j) { return j.id == driver.mateId; });
+    ImGui::Text("Driver %d", static_cast<int>(i + 1));
+    ImGui::SetNextItemWidth(-FLT_MIN);
+    if (ImGui::BeginCombo("##joint", joint == joints.end()
+                                       ? "Choose an Angle / Distance joint" : joint->label.c_str())) {
+      for (const auto &option : joints) {
+        const bool selected = option.id == driver.mateId;
+        const bool used = !selected && std::any_of(s.motionDrivers.begin(), s.motionDrivers.end(),
+                             [&](const MotionDriver &d) { return d.mateId == option.id; });
+        ImGui::BeginDisabled(used);
+        if (ImGui::Selectable(option.label.c_str(), selected)) {
+          driver = {option.id, option.value,
+                    option.value + (option.type == "angle" ? 360.0 : 10.0)};
+          changed = save = true;
+        }
+        ImGui::EndDisabled();
+        if (selected)
+          ImGui::SetItemDefaultFocus();
+      }
+      ImGui::EndCombo();
+    }
+    joint = std::find_if(joints.begin(), joints.end(),
+                        [&](const MotionJoint &j) { return j.id == driver.mateId; });
+    const std::string unit = joint == joints.end() ? "deg / mm" : joint->unit;
+    ImGui::SetNextItemWidth(-ImGui::CalcTextSize(("Start (" + unit + ")").c_str()).x -
+                            ImGui::GetStyle().ItemInnerSpacing.x);
+    changed |= ImGui::InputDouble(("Start (" + unit + ")").c_str(), &driver.start, 0, 0, "%.3f");
+    save |= ImGui::IsItemDeactivatedAfterEdit();
+    ImGui::SetNextItemWidth(-ImGui::CalcTextSize(("Stop (" + unit + ")").c_str()).x -
+                            ImGui::GetStyle().ItemInnerSpacing.x);
+    changed |= ImGui::InputDouble(("Stop (" + unit + ")").c_str(), &driver.stop, 0, 0, "%.3f");
+    save |= ImGui::IsItemDeactivatedAfterEdit();
+    const bool remove = kit::secondaryButton("Remove driver", s.motionDrivers.size() > 1,
+                                             "Keep at least one driver.");
+    ImGui::PopID();
+    if (remove) {
+      s.motionDrivers.erase(s.motionDrivers.begin() + i);
+      changed = save = true;
+      break;
+    }
+    kit::gapRow();
+  }
+  const auto unused = std::find_if(joints.begin(), joints.end(), [&](const MotionJoint &joint) {
+    return std::none_of(s.motionDrivers.begin(), s.motionDrivers.end(),
+                        [&](const MotionDriver &driver) { return driver.mateId == joint.id; });
+  });
+  if (kit::secondaryButton("Add driver", unused != joints.end(),
+                            "All drivable joints are already in this study.")) {
+    s.motionDrivers.push_back({unused->id, unused->value,
+                              unused->value + (unused->type == "angle" ? 360.0 : 10.0)});
+    changed = save = true;
+  }
 
-  ImGui::Spacing();
-  ImGui::PushFont(st.fonts.medium);
-  ImGui::TextUnformatted("Playback");
-  ImGui::PopFont();
+  kit::sectionHeader("Sampling and interference");
+  ImGui::TextUnformatted("Samples");
+  ImGui::SetNextItemWidth(-FLT_MIN);
+  changed |= ImGui::SliderInt("##motionSamples", &s.motionSteps, 2, 120);
+  save |= ImGui::IsItemDeactivatedAfterEdit();
+  simTip("Includes both endpoints. These are sampled poses, not a continuous collision guarantee.");
+  if (ImGui::Checkbox("Check interference", &s.motionCheckInterference))
+    changed = save = true;
+  ImGui::BeginDisabled(!s.motionCheckInterference);
+  ImGui::SetNextItemWidth(-FLT_MIN);
+  ImGui::TextUnformatted("Minimum clearance (mm)");
+  changed |= ImGui::InputDouble("##motionClearance", &s.motionMinClearance, 0, 0, "%.3f");
+  save |= ImGui::IsItemDeactivatedAfterEdit();
+  simTip("Report separation below this value as well as solid intersections. Zero checks intersections.");
+  ImGui::EndDisabled();
+  if (changed)
+    invalidateMotion(s);
+  if (save && std::isfinite(s.motionMinClearance) &&
+      std::all_of(s.motionDrivers.begin(), s.motionDrivers.end(), [](const MotionDriver &d) {
+        return std::isfinite(d.start) && std::isfinite(d.stop);
+      }))
+    persist(st, s);
+  std::string blocker;
+  if (!studyReady(s, blocker) || !motionJointsReady(s, st.docMirror.tree(), blocker))
+    kit::inlineStatus(blocker.c_str(), kit::Tone::Warn);
 
-  ImGui::SetNextItemWidth(80.0f * S);
-  if (ImGui::DragFloat("FPS##ms", &s.motionFps, 0.5f, 1.0f, 120.0f, "%.0f"))
+  kit::sectionHeader("Playback");
+  ImGui::SetNextItemWidth(-FLT_MIN);
+  ImGui::SliderFloat("FPS", &s.motionFps, 1.0f, 120.0f, "%.0f",
+                     ImGuiSliderFlags_AlwaysClamp);
+  if (ImGui::IsItemDeactivatedAfterEdit())
     persist(st, s);
-  simTip("Playback speed in frames per second.");
-  ImGui::SameLine(0, 16.0f * S);
-  if (ImGui::Checkbox("Loop##ms", &s.motionLoop))
+  if (ImGui::Checkbox("Loop playback", &s.motionLoop))
     persist(st, s);
-  simTip("Wrap playback back to frame 0 after the last frame.");
-
-  ImGui::Spacing();
-  if (ImGui::Checkbox("Check interference at each step",
-                      &s.motionCheckInterference))
-    persist(st, s);
-  simTip("Test for body-body intersection at each trajectory step (slower "
-         "solve).");
+  kit::dimText("Playback does not modify the assembly. Run again after changing geometry or drivers.");
 }
 
 // ---------- drawMotionTimeline (transport bar + scrub)
 // --------------------------------
 
 void SimManager::drawMotionTimeline(AppState &st, Study &s) {
-  if (!s.motionHasResult)
+  if (!s.motionHasResult || s.motionTrajectory.empty())
     return;
-  const int nFrames = (int)s.motionTrajectory.size();
-  if (nFrames == 0)
-    return;
-  const float S = ui::uiScale;
-  const auto &pal = ui::palette;
-
-  ImGui::Spacing();
-  const float bW = 28.0f * S, bH = 24.0f * S;
-
-  if (ImGui::Button("|<##mt", ImVec2(bW, bH))) {
+  const int nFrames = static_cast<int>(s.motionTrajectory.size());
+  s.motionFrame = std::clamp(s.motionFrame, 0, nFrames - 1);
+  auto jump = [&](int frame, bool collisions) {
     s.motionPlaying = false;
-    s.motionFrame = 0;
-    applyMotionFrame(st, s, 0);
-  }
-  simTip("Rewind to first frame.");
-  ImGui::SameLine(0, 2.0f * S);
-  if (ImGui::Button("<<##mt", ImVec2(bW, bH))) {
-    s.motionPlaying = false;
-    s.motionFrame = std::max(0, s.motionFrame - 1);
-    applyMotionFrame(st, s, s.motionFrame);
-  }
-  simTip("Previous frame.");
-  ImGui::SameLine(0, 2.0f * S);
-  if (ImGui::Button(s.motionPlaying ? "||##mt" : ">##mt", ImVec2(bW, bH))) {
+    s.motionLastTick = -1.0;
+    s.motionFrame = std::clamp(frame, 0, nFrames - 1);
+    if (applyMotionFrame(st, s, s.motionFrame)) {
+      st.clearSelection();
+      if (collisions)
+        highlightMotionCollisions(st, s);
+    }
+  };
+  const float size = ImGui::GetFrameHeight();
+  if (ImGui::Button("|<##mt", ImVec2(size, size))) jump(0, false);
+  simTip("First sample");
+  ImGui::SameLine(0, kit::rowGap());
+  if (ImGui::Button("<##mt", ImVec2(size, size))) jump(s.motionFrame - 1, false);
+  simTip("Previous sample");
+  ImGui::SameLine(0, kit::rowGap());
+  if (ImGui::Button(s.motionPlaying ? "Pause##mt" : "Play##mt")) {
     s.motionPlaying = !s.motionPlaying;
     s.motionLastTick = -1.0;
+    st.clearSelection();
   }
-  simTip(s.motionPlaying ? "Pause" : "Play");
-  ImGui::SameLine(0, 2.0f * S);
-  if (ImGui::Button(">>##mt", ImVec2(bW, bH))) {
-    s.motionPlaying = false;
-    s.motionFrame = std::min(nFrames - 1, s.motionFrame + 1);
-    applyMotionFrame(st, s, s.motionFrame);
-  }
-  simTip("Next frame.");
-  ImGui::SameLine(0, 2.0f * S);
-  if (ImGui::Button(">|##mt", ImVec2(bW, bH))) {
-    s.motionPlaying = false;
-    s.motionFrame = nFrames - 1;
-    applyMotionFrame(st, s, s.motionFrame);
-  }
-  simTip("Jump to last frame.");
-
-  // Driver value label.
-  float driverVal = s.motionStart;
-  if (s.motionFrame < nFrames) {
-    const auto &fj = s.motionTrajectory[s.motionFrame];
-    if (fj.contains("value") && fj["value"].is_number())
-      driverVal = (float)fj["value"].get<double>();
-  }
-  char info[64];
-  std::snprintf(info, sizeof(info), "  %d/%d  %.1f %s", s.motionFrame + 1,
-                nFrames, driverVal, s.motionDriverUnit.c_str());
-  ImGui::SameLine(0, 6.0f * S);
-  ImGui::TextUnformatted(info);
-
-  // Scrub slider.
+  ImGui::SameLine(0, kit::rowGap());
+  if (ImGui::Button(">##mt", ImVec2(size, size))) jump(s.motionFrame + 1, false);
+  simTip("Next sample");
+  ImGui::SameLine(0, kit::rowGap());
+  if (ImGui::Button(">|##mt", ImVec2(size, size))) jump(nFrames - 1, false);
+  simTip("Last sample");
+  ImGui::Text("Sample %d / %d", s.motionFrame + 1, nFrames);
   int frame = s.motionFrame;
   ImGui::SetNextItemWidth(-FLT_MIN);
-  if (ImGui::SliderInt("##motionScrub", &frame, 0, nFrames - 1, "")) {
-    s.motionFrame = frame;
-    s.motionPlaying = false;
-    applyMotionFrame(st, s, frame);
-  }
-  simTip("Drag to scrub to any frame.");
+  if (ImGui::SliderInt("##motionScrub", &frame, 0, nFrames - 1, ""))
+    jump(frame, false);
+  simTip("Scrub to any sampled pose.");
 
-  // Per-frame status badges.
-  if (s.motionFrame < nFrames) {
-    const auto &fj = s.motionTrajectory[s.motionFrame];
-    if (fj.contains("converged") && !fj["converged"].get<bool>()) {
-      ImGui::PushStyleColor(ImGuiCol_Text,
-                            ImVec4(pal.statusWarn[0], pal.statusWarn[1],
-                                   pal.statusWarn[2], 1.0f));
-      ImGui::TextUnformatted("  ! Solver did not converge at this frame");
-      ImGui::PopStyleColor();
+  const auto &pose = s.motionTrajectory[s.motionFrame];
+  if (s.motionResultDrivers.is_array() && pose.contains("driver_values") &&
+      pose["driver_values"].is_object()) {
+    for (const auto &driver : s.motionResultDrivers) {
+      if (!driver.is_object())
+        continue;
+      const std::string id = driver.value("mate_id", std::string());
+      const auto value = pose["driver_values"].find(id);
+      if (value == pose["driver_values"].end() || !value->is_number())
+        continue;
+      char text[80];
+      std::snprintf(text, sizeof(text), "%.3f %s", value->get<double>(),
+                    driver.value("unit", std::string()).c_str());
+      kit::keyValueRow(id.c_str(), text);
     }
-    if (fj.contains("interference") && fj["interference"].get<bool>()) {
-      ImGui::PushStyleColor(
-          ImGuiCol_Text,
-          ImVec4(pal.statusErr[0], pal.statusErr[1], pal.statusErr[2], 1.0f));
-      ImGui::TextUnformatted("  ! Interference at this frame");
-      ImGui::PopStyleColor();
+  } else if (pose.contains("value") && pose["value"].is_number()) {
+    ImGui::Text("Driver: %.3f %s", pose["value"].get<double>(), s.motionDriverUnit.c_str());
+  }
+
+  kit::sectionHeader("Interference");
+  kit::chip(motionCheckLabel(s), motionCheckTone(s), true);
+  kit::dimText("Sampled results only; motion between samples is not checked. "
+               "Collisions include intersections and requested clearance violations.");
+  if (s.motionInterference.is_object()) {
+    const auto checked = s.motionInterference.find("frames_checked");
+    if (checked != s.motionInterference.end() && checked->is_number_integer())
+      ImGui::Text("Fully checked: %d / %d samples", checked->get<int>(), nFrames);
+  }
+  const bool hits = !s.motionCollisionFrames.empty();
+  if (kit::secondaryButton("Previous collision", hits, "No recorded collision poses.")) {
+    auto it = std::lower_bound(s.motionCollisionFrames.begin(), s.motionCollisionFrames.end(),
+                               s.motionFrame);
+    if (it == s.motionCollisionFrames.begin())
+      it = s.motionCollisionFrames.end();
+    jump(*--it, true);
+  }
+  if (kit::secondaryButton("Next collision", hits, "No recorded collision poses.")) {
+    auto it = std::upper_bound(s.motionCollisionFrames.begin(), s.motionCollisionFrames.end(),
+                               s.motionFrame);
+    if (it == s.motionCollisionFrames.end())
+      it = s.motionCollisionFrames.begin();
+    jump(*it, true);
+  }
+
+  // Re-read after navigation; the driver readout catches up on the following frame.
+  const auto &current = s.motionTrajectory[s.motionFrame];
+  const bool complete = simJsonBool(current, "interference_complete", false) &&
+                        current.contains("interference") && current["interference"].is_boolean();
+  kit::inlineStatus(motionFrameCollision(current) ? "This pose: collision recorded" :
+                    !s.motionCheckInterference ? "This pose: not checked" :
+                    complete ? "This pose: sampled clear" : "This pose: incomplete check",
+                    motionFrameCollision(current) ? kit::Tone::Err :
+                    !s.motionCheckInterference ? kit::Tone::Neutral :
+                    complete ? kit::Tone::Ok : kit::Tone::Warn);
+  const auto details = current.find("collision_detail");
+  if (details != current.end() && details->is_array()) {
+    for (size_t i = 0; i < details->size(); ++i) {
+      const auto &pair = (*details)[i];
+      if (!pair.is_object())
+        continue;
+      const std::string a = simJsonText(pair, "a", "component_a", "Unknown component");
+      const std::string b = simJsonText(pair, "b", "component_b", "Unknown component");
+      const std::string label = a + " / " + b;
+      ImGui::PushID(static_cast<int>(i));
+      if (ImGui::Selectable(label.c_str())) {
+        s.motionPlaying = false;
+        if (applyMotionFrame(st, s, s.motionFrame))
+          highlightMotionCollisions(st, s, &pair);
+      }
+      simTip("Select this pair in the viewport when its stable component mapping is available.");
+      for (const char *key : {"volume", "distance"})
+        if (pair.contains(key) && pair[key].is_number())
+          ImGui::Text("%s: %.6g %s", key, pair[key].get<double>(),
+                       std::string(key) == "volume" ? "mm^3" : "mm");
+      const std::string warning = simJsonText(pair, "warning", "reason", "");
+      if (!warning.empty())
+        kit::dimText(warning.c_str());
+      ImGui::PopID();
+    }
+  } else if (motionFrameCollision(current)) {
+    kit::inlineStatus("Pair detail unavailable; the recorded collision is not a clearance result.",
+                       kit::Tone::Warn);
+  }
+  if (s.motionInterference.is_object() && s.motionInterference.contains("pair_failures") &&
+      s.motionInterference["pair_failures"].is_array()) {
+    for (const auto &failure : s.motionInterference["pair_failures"]) {
+      if (!failure.is_object() || !failure.contains("i") || !failure["i"].is_number_integer() ||
+          failure["i"].get<int>() != s.motionFrame)
+        continue;
+      const std::string message = simJsonText(failure, "a", "component_a", "Geometry") +
+          " / " + simJsonText(failure, "b", "component_b", "unavailable") + ": " +
+          simJsonText(failure, "reason", "warning", "Pair could not be checked.");
+      kit::inlineStatus(message.c_str(), kit::Tone::Warn);
     }
   }
+  if (current.contains("geometry_failures") && current["geometry_failures"].is_array())
+    for (const auto &failure : current["geometry_failures"]) {
+      const std::string message = simJsonText(failure, "name", "component", "Geometry") + ": " +
+          simJsonText(failure, "reason", "warning", "Geometry could not be checked.");
+      kit::inlineStatus(message.c_str(), kit::Tone::Warn);
+    }
+}
+
+void SimManager::highlightMotionCollisions(AppState &st, const Study &s,
+                                            const nlohmann::json *pair) {
+  std::unordered_set<std::string> components;
+  auto include = [&](const nlohmann::json &hit) {
+    for (const char *key : {"component_a", "component_b"})
+      if (hit.contains(key) && hit[key].is_string())
+        components.insert(hit[key].get<std::string>());
+  };
+  if (pair) {
+    include(*pair);
+  } else {
+    const auto &pose = s.motionTrajectory[s.motionFrame];
+    if (pose.contains("collision_detail") && pose["collision_detail"].is_array())
+      for (const auto &hit : pose["collision_detail"])
+        if (hit.is_object())
+          include(hit);
+  }
+  st.clearSelection();
+  st.hover = {};
+  if (!st.overlays || !motionDocMesh_)
+    return;
+  render::DocMesh highlights;
+  // Reuse the FeatureManager's whole-component face-highlight channel. Do not issue pick-resolve
+  // RPCs for a playback pose, whose geometry is intentionally different from the editable model.
+  std::unordered_set<std::string> highlighted;
+  for (const auto &body : motionDocMesh_->bodies) {
+    const auto component = motionComponentByBodyId_.find(body.body_id);
+    if (component == motionComponentByBodyId_.end() || !components.count(component->second))
+      continue;
+    const auto &bodies = s.motionTrajectory[s.motionFrame]["bodies"];
+    const auto pose = std::find_if(bodies.begin(), bodies.end(), [&](const nlohmann::json &b) {
+      return b.value("component", std::string()) == component->second;
+    });
+    const auto inverse = motionInverseBaseWorldByComponentId_.find(component->second);
+    MotionMat4 world;
+    std::string err;
+    if (pose == bodies.end() || inverse == motionInverseBaseWorldByComponentId_.end() ||
+        !readMotionMatrix((*pose)["transform"], MotionMatrixLayout::ColumnMajor, world, err))
+      continue;
+    const auto delta = multiplyMotionMatrices(world, inverse->second);
+    render::BodyMesh visible;
+    visible.body_id = body.body_id;
+    visible.n_verts = body.n_verts;
+    visible.n_tris = body.n_tris;
+    visible.faces = body.faces;
+    visible.idx = body.idx;
+    visible.pos.resize(body.pos.size());
+    for (size_t i = 0; i + 2 < body.pos.size(); i += 3) {
+      const double x = body.pos[i], y = body.pos[i + 1], z = body.pos[i + 2];
+      visible.pos[i] = static_cast<float>(delta[0] * x + delta[4] * y + delta[8] * z + delta[12]);
+      visible.pos[i + 1] = static_cast<float>(delta[1] * x + delta[5] * y + delta[9] * z + delta[13]);
+      visible.pos[i + 2] = static_cast<float>(delta[2] * x + delta[6] * y + delta[10] * z + delta[14]);
+    }
+    highlights.bodies.push_back(std::move(visible));
+    for (const auto &face : body.faces)
+      st.featureHighlightFaces.push_back((static_cast<uint64_t>(body.body_id) << 32) | face.face_id);
+    if (!body.faces.empty())
+      highlighted.insert(component->second);
+  }
+  std::string error;
+  motionHighlightPose_ = true;
+  if (!st.overlays->setDoc(highlights, error)) {
+    st.featureHighlightFaces.clear();
+    st.toast(ui::ToastLevel::Warn, "Could not highlight the collision pose: " + error);
+  }
+  if (highlighted.size() < components.size() || components.empty())
+    st.toast(ui::ToastLevel::Warn, "Some collision components have no viewport mapping; see pair details.");
 }
 
 // ---------- drawMotionResults (called from drawResultControls)
@@ -9604,7 +10136,13 @@ void SimManager::drawMotionTimeline(AppState &st, Study &s) {
 
 void SimManager::drawMotionResults(AppState &st, Study &s) {
   if (!s.motionHasResult) {
-    ImGui::TextWrapped("Run the motion study to generate a trajectory.");
+    if (s.motionRunning)
+      kit::spinner(s.summary.c_str());
+    else if (!s.summary.empty())
+      kit::inlineStatus(s.summary.c_str(), kit::Tone::Warn);
+    else
+      kit::emptyState("rotate_component", "No Motion results",
+                      "Open Motion setup, choose named drivers, then Run.");
     return;
   }
   const float S = ui::uiScale;

@@ -2120,7 +2120,7 @@ void drawDrawingSheet(AppState& st) {
                             ImVec2 dd = ImGui::GetMouseDragDelta(ImGuiMouseButton_Left);
                             // ghost rect at the dragged offset
                             ImVec2 g0(hl0.x + dd.x, hl0.y + dd.y), g1(hl1.x + dd.x, hl1.y + dd.y);
-                            dl->AddRect(g0, g1, sheetCol(pal.sketchUnder, 0.90f), 2.0f, 0, 1.6f * s);
+                            dl->AddRect(g0, g1, sheetCol(pal.sketchUnder, 0.90f), 2.0f * s, 0, 1.6f * s);
                             tab.viewDragDX = dd.x / z;       // sheet-mm offset
                             tab.viewDragDY = -dd.y / z;
                         }

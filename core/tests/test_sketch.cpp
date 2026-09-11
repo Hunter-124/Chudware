@@ -101,6 +101,42 @@ TEST_CASE("remove width dim -> dof 1 with an under entity") {
     CHECK(under >= 1);
 }
 
+TEST_CASE("spline interior freedom does not unpin constrained endpoints and neighbors") {
+    json points = json::array();
+    for (int i = 0; i <= 40; ++i)
+        points.push_back(json::array({0.25 * i, 0.01 * i * (40 - i)}));
+    json s = {
+        {"entities", json::array({
+            point("e1", 0, 0), point("e2", 10, 0),
+            json{{"id", "e3"}, {"type", "spline"}, {"points", points}},
+            line("e4", 0, 0, 10, 0), line("e5", 0, 3, 10, 3)})},
+        {"constraints", json::array({
+            rel("c1", "fix", {"e1"}), rel("c2", "fix", {"e2"}),
+            rel("c3", "coincident", {"e3.start", "e1"}),
+            rel("c4", "coincident", {"e3.end", "e2"}),
+            rel("c5", "coincident", {"e4.p1", "e1"}),
+            rel("c6", "coincident", {"e4.p2", "e2"}),
+            rel("c7", "horizontal", {"e5"})})}
+    };
+    const auto sol = solve_sketch(s, json::object());
+    REQUIRE(sol.converged);
+    CHECK(sol.dof == 81);
+    for (const auto* id : {"e1", "e2", "e4"})
+        CHECK(sol.statuses.at(id) == "full");
+    CHECK(sol.statuses.at("e3") == "under");
+    CHECK(sol.statuses.at("e5") == "under");
+
+    const auto free = chudware::sketch::free_variables(s, json::object(), sol.state.x);
+    int spline_free = 0, line_free = 0;
+    for (const auto& variable : free) {
+        if (variable.entity == "e3") ++spline_free;
+        else if (variable.entity == "e5") ++line_free;
+        else FAIL_CHECK("a pinned coordinate was reported free");
+    }
+    CHECK(spline_free == 78);
+    CHECK(line_free == 4);
+}
+
 TEST_CASE("duplicate width dim -> redundant, still well posed") {
     json s = bracket();
     s["constraints"].push_back(dim("c12", "distance", {"e1.p1", "e1.p2"}, 80.0));

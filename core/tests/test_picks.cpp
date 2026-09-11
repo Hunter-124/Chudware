@@ -21,6 +21,7 @@
 #include <set>
 #include <string>
 #include <tuple>
+#include <utility>
 #include <vector>
 
 #include <nlohmann/json.hpp>
@@ -28,6 +29,8 @@
 #include <BRep_Builder.hxx>
 #include <BRepBuilderAPI_MakeEdge.hxx>  // I1/I3: circle wires for the loft test
 #include <BRepBuilderAPI_MakeWire.hxx>
+#include <BRepGProp.hxx>
+#include <GProp_GProps.hxx>
 #include <TopoDS_Compound.hxx>
 #include <TopoDS_Wire.hxx>
 #include <gp_Ax2.hxx>
@@ -577,6 +580,21 @@ TEST_CASE("geom query: inner/outer tells the coaxial walls of a tube apart") {
     QueryPicks no_round_in = resolve_geom_query(box, json{{"of", "face"}, {"pick", "inner"}});
     CHECK(no_round_in.error.empty());
     CHECK(no_round_in.faces.empty());
+}
+
+TEST_CASE("geom query: spherical socket radii remain distinguishable") {
+    const TopoDS_Shape socket = geom::cut(geom::make_sphere(12.0), geom::make_sphere(8.0));
+    for (const auto& [pick, radius] :
+         {std::pair{"inner", 8.0}, std::pair{"outer", 12.0}}) {
+        const auto result = chudware::doc::resolve_geom_query(
+            socket, json{{"of", "face"}, {"surf", "sphere"}, {"pick", pick}});
+        REQUIRE_MESSAGE(result.error.empty(), result.error);
+        REQUIRE(result.faces.size() == 1);
+        CHECK(result.selectors.at(0).at("radius").get<double>() == doctest::Approx(radius));
+        GProp_GProps properties;
+        BRepGProp::SurfaceProperties(result.faces.front(), properties);
+        CHECK(properties.Mass() == doctest::Approx(4.0 * M_PI * radius * radius));
+    }
 }
 
 // (h) B5 SIDE TIE-BREAK by area. A compound of two non-touching boxes at the SAME top

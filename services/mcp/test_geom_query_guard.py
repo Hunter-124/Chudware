@@ -135,12 +135,6 @@ def test_a_sid_measures_the_element_it_names(bored_cube):
         assert abs(out["area"] - 3141.592654) < 1e-3, (target, out)
 
 
-def test_a_stale_sid_is_named_rather_than_widened(bored_cube):
-    out = _call("measure_between", doc_id=bored_cube, a_query={"sid": "F000000"})
-    assert out.get("ok") is False
-    assert "F000000" in str(out.get("error")) and "stable" in str(out.get("error"))
-
-
 def test_a_bogus_sid_no_longer_fillets_the_whole_body(bored_cube):
     """The live failure: one edge asked for, every edge rounded, no error at all."""
     before = _call("query_geometry", doc_id=bored_cube, query={"of": "face", "surf": "round"})

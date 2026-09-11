@@ -30,6 +30,15 @@
 #include <BRep_Tool.hxx>                                  // seam/degenerate edge test (S1/S2)
 #include <BRep_Builder.hxx>                                // heal: craft a reversed-face solid
 #include <BRepPrimAPI_MakeBox.hxx>                         // heal: the box to corrupt
+#include <BRepPrimAPI_MakeCylinder.hxx>
+#include <BRepPrimAPI_MakeCone.hxx>
+#include <BRepPrimAPI_MakeSphere.hxx>
+#include <BRepAlgoAPI_Cut.hxx>
+#include <BRepAdaptor_Surface.hxx>
+#include <TopLoc_Location.hxx>
+#include <gp_Cylinder.hxx>
+#include <gp_Cone.hxx>
+#include <gp_Sphere.hxx>
 #include <BRepTools.hxx>                                   // heal: write the broken .brep
 #include <TopoDS_Compound.hxx>                             // heal: two-lump refusal input
 #include <BRepBuilderAPI_MakePolygon.hxx>                  // self-intersection: bowtie wire
@@ -56,6 +65,8 @@
 #include <TopAbs_ShapeEnum.hxx>
 
 #include "doc/document.h"
+#include "doc/assembly.h"
+#include "doc/selectors.h"
 #include "doc/validate.h"  // validate_document (explicit-axis acceptance regression)
 #include "doc/session.h"   // doc_new/doc_apply_ops (top-level-option hoist regression)
 #include "doc/stepplus.h"  // stepplus_save (craft a persisted broken-import doc on disk)
@@ -2280,6 +2291,9 @@ TEST_CASE("C2/C3/C4: a compile-rejected batch leaves the doc and undo stacks unt
     using chudware::doc::doc_undo;
     using chudware::doc::doc_tree;
     auto dimv = [](double v) { return json{{"value", v}, {"expr", nullptr}}; };
+    bool with_tess = true;
+    SUBCASE("display response") {}
+    SUBCASE("mesh response opt-out") { with_tess = false; }
 
     json nr = doc_new("part", "FailBatchUndo");
     const std::string id = nr.at("doc_id").get<std::string>();
@@ -2304,7 +2318,8 @@ TEST_CASE("C2/C3/C4: a compile-rejected batch leaves the doc and undo stacks unt
              {"refs", {{"edges", json{{"of", "edge"}, {"surf", "round"}}}}}}}},
     });
     json badresp;
-    CHECK_NOTHROW(badresp = doc_apply_ops(id, -1, badops, false));
+    CHECK_NOTHROW(badresp = doc_apply_ops(id, -1, badops, false, with_tess));
+    CHECK(badresp.contains("tess") == with_tess);
     bool any_failed = false;
     for (const json& st : badresp.at("rebuild").at("feature_status"))
         if (!st.value("ok", true)) any_failed = true;
@@ -2321,6 +2336,95 @@ TEST_CASE("C2/C3/C4: a compile-rejected batch leaves the doc and undo stacks unt
     //     revision left by the rejected batch — so the part returns to empty.
     json undone = doc_undo(id);
     CHECK(undone.at("tree").at("features").size() == 0);
+}
+
+TEST_CASE("doc_apply_ops mesh response opt-out preserves edits and subsequent display") {
+    using namespace chudware::doc;
+    const std::string id = doc_new("part", "NoTessEdit").at("doc_id");
+    const json built = doc_apply_ops(id, -1, json::array({
+        {{"op", "add_feature"}, {"feature", {{"type", "box"}, {"name", "Block"},
+            {"params", {{"length", 10.0}, {"width", 20.0}, {"height", 30.0},
+                        {"centered", false}}}}}}
+    }), false);
+    const std::string feature = built.at("id_map").at("$0");
+    const json edited = doc_apply_ops(id, built.at("revision").get<long>(), json::array({
+        {{"op", "edit_feature"}, {"id", feature}, {"params", {{"length", 25.0}}}}
+    }), false, false);
+    CHECK_FALSE(edited.contains("tess"));
+    CHECK(edited.at("volume").get<double>() == doctest::Approx(15000.0));
+    REQUIRE(edited.at("rebuild").at("feature_status").size() == 1);
+    CHECK(edited.at("rebuild").at("feature_status")[0].at("ok").get<bool>());
+    CHECK(edited.at("tree").at("features")[0].at("params").at("length") == 25.0);
+    CHECK(edited.at("owner_map") == built.at("owner_map"));
+
+    const json copied = doc_apply_ops(id, -1, json::array({
+        {{"op", "copy_feature"}, {"id", feature}}
+    }), false, false);
+    CHECK_FALSE(copied.contains("tess"));
+    CHECK(copied.at("revision") == edited.at("revision"));
+    CHECK(copied.at("id_map").at("$bundle").at("features").at("$0")
+              .at("params").at("length") == 25.0);
+    CHECK(copied.at("rebuild").at("feature_status")[0].at("ok").get<bool>());
+
+    // Activation must display the new geometry, not an old pre-opt-out mesh.
+    const json displayed = doc_activate(id);
+    render::DocMesh mesh;
+    std::string error;
+    REQUIRE_MESSAGE(render::loadAicmFile(displayed.at("tess").at("aicm_path"), mesh, error), error);
+    REQUIRE(mesh.bodies.size() == 1);
+    double lo[3], hi[3];
+    bbox(mesh.bodies[0], lo, hi);
+    CHECK(hi[0] - lo[0] == doctest::Approx(25.0));
+    CHECK(hi[1] - lo[1] == doctest::Approx(20.0));
+    CHECK(hi[2] - lo[2] == doctest::Approx(30.0));
+    CHECK(displayed.at("revision") == edited.at("revision"));
+    CHECK(doc_undo(id).at("volume").get<double>() == doctest::Approx(6000.0));
+    CHECK(doc_redo(id).at("volume").get<double>() == doctest::Approx(15000.0));
+}
+
+TEST_CASE("doc_apply_ops mesh response opt-out preserves assembly poses and diagnostics") {
+    using namespace chudware::doc;
+    const std::string id = doc_new("assembly", "NoTessAssembly").at("doc_id");
+    const auto dir = std::filesystem::temp_directory_path() / id;
+    std::filesystem::create_directories(dir);
+    struct Cleanup {
+        std::filesystem::path dir;
+        ~Cleanup() { std::error_code ec; std::filesystem::remove_all(dir, ec); }
+    } cleanup{dir};
+    const auto source = dir / "block.brep";
+    REQUIRE(BRepTools::Write(BRepPrimAPI_MakeBox(10, 20, 30).Shape(), source.string().c_str()));
+    const json built = doc_apply_ops(id, -1, json::array({
+        {{"op", "asm_insert_component"}, {"source", {{"path", source.string()}}}, {"fixed", true}}
+    }), false);
+    const std::string component = built.at("id_map").at("$0");
+    const json moved = doc_apply_ops(id, built.at("revision").get<long>(), json::array({
+        {{"op", "asm_edit_component"}, {"id", component},
+         {"transform", {1,0,0,40, 0,1,0,50, 0,0,1,60, 0,0,0,1}}}
+    }), false, false);
+    CHECK_FALSE(moved.contains("tess"));
+    REQUIRE(moved.at("rebuild").at("components").size() == 1);
+    CHECK(moved.at("rebuild").at("components")[0].at("ok").get<bool>());
+    CHECK(moved.at("rebuild").at("converged").get<bool>());
+    CHECK(moved.at("rebuild").at("dof") == 0);
+    CHECK(moved.at("rebuild").at("mates") == json::array());
+    CHECK(moved.at("owner_map") == built.at("owner_map"));
+    CHECK(moved.contains("pose_transport"));
+    CHECK(moved.at("tree").at("components")[0].at("transform")[3] == 40);
+
+    // A later default doc_apply_ops call must still publish the moved assembly.
+    const json displayed = doc_apply_ops(id, -1, json::array(), false);
+    render::DocMesh mesh;
+    std::string error;
+    REQUIRE_MESSAGE(render::loadAicmFile(displayed.at("tess").at("aicm_path"), mesh, error), error);
+    REQUIRE(mesh.bodies.size() == 1);
+    double lo[3], hi[3];
+    bbox(mesh.bodies[0], lo, hi);
+    CHECK(lo[0] == doctest::Approx(40.0));
+    CHECK(lo[1] == doctest::Approx(50.0));
+    CHECK(lo[2] == doctest::Approx(60.0));
+    CHECK(hi[0] == doctest::Approx(50.0));
+    CHECK(hi[1] == doctest::Approx(70.0));
+    CHECK(hi[2] == doctest::Approx(90.0));
 }
 
 // P0 DEADLOCK REGRESSION: a rejected op batch must NOT leave the process-global session
@@ -3162,6 +3266,131 @@ TEST_CASE("eval_measure: face ref carries anchor and polyline") {
     }
 }
 
+TEST_CASE("eval_measure binds picked nonlast bodies and refuses invalid owners") {
+    using namespace chudware::doc;
+    const std::string id = doc_new("part", "MeasureOwners").at("doc_id");
+    const json built = doc_apply_ops(id, -1, json::array({
+        {{"op", "add_feature"}, {"feature", {{"type", "cylinder"}, {"name", "Small"},
+            {"params", {{"radius", 3.0}, {"height", 12.0}, {"centered", false},
+                        {"mode", "new"}}}}}},
+        {{"op", "add_feature"}, {"feature", {{"type", "cylinder"}, {"name", "Large"},
+            {"params", {{"radius", 7.0}, {"height", 25.0}, {"centered", false},
+                        {"at", {100.0, 0.0, 0.0}}, {"mode", "new"}}}}}}
+    }), false);
+    for (const auto& status : built.at("rebuild").at("feature_status"))
+        REQUIRE_MESSAGE(status.value("ok", false), status.dump());
+    json small, large, seam;
+    for (int body = 1; body <= 2; ++body) {
+        for (int edge = 1; edge <= 3; ++edge) {
+            const json selector = doc_resolve_pick(id, body, "edge", edge).at("selector");
+            const json ref{{"body_id", body}, {"selector", selector}};
+            if (selector.value("surf", std::string()) == "circle" &&
+                std::abs(selector.at("centroid")[2].get<double>()) < 1e-6) {
+                (body == 1 ? small : large) = ref;
+            } else if (body == 1 && selector.value("surf", std::string()) == "line") {
+                seam = ref;
+            }
+        }
+    }
+    REQUIRE(small.is_object());
+    REQUIRE(large.is_object());
+    REQUIRE(seam.is_object());
+    const json radius = doc_eval_measure(id, json::array({small}));
+    CHECK(radius.at("radius").get<double>() == doctest::Approx(3.0));
+    CHECK(radius.at("length").get<double>() == doctest::Approx(6.0 * std::acos(-1.0)));
+    CHECK(doc_eval_measure(id, json::array({seam})).at("length").get<double>() ==
+          doctest::Approx(12.0));
+    CHECK(doc_eval_measure(id, json::array({small, large})).at("distance").get<double>() ==
+          doctest::Approx(90.0));
+    // A legacy readback still addresses its own geometry, not the final cylinder.
+    CHECK(doc_eval_measure(id, json::array({small.at("selector")})).at("radius").get<double>() ==
+          doctest::Approx(3.0));
+    json wrong_owner = small;
+    wrong_owner["body_id"] = 2;
+    CHECK_THROWS(doc_eval_measure(id, json::array({wrong_owner})));
+    for (int bad_id : {0, -1, 999}) {
+        json invalid = small;
+        invalid["body_id"] = bad_id;
+        CHECK_THROWS(doc_eval_measure(id, json::array({invalid})));
+        CHECK_THROWS(doc_resolve_pick(id, bad_id, "edge", 1));
+    }
+    CHECK_THROWS(doc_resolve_pick(id, 1, "edge", 999));
+    json stale = small;
+    stale["selector"]["sid"] = "E000000";
+    CHECK_THROWS(doc_eval_measure(id, json::array({stale, large})));
+    CHECK(doc_close(id));
+}
+
+TEST_CASE("eval_measure preserves repeated nested assembly pick identity and world placement") {
+    using namespace chudware::doc;
+    const std::string part = doc_new("part", "MeasureNestedSource").at("doc_id");
+    const std::filesystem::path dir = std::filesystem::temp_directory_path() / part;
+    std::filesystem::create_directories(dir);
+    const auto part_path = dir / "source.step+";
+    const auto nested_path = dir / "nested.step+";
+    doc_apply_ops(part, -1, json::array({
+        {{"op", "add_feature"}, {"feature", {{"type", "box"}, {"name", "Block"},
+            {"params", {{"length", 10.0}, {"width", 20.0}, {"height", 30.0},
+                        {"centered", false}}}}}}
+    }), false);
+    doc_save(part, part_path.string());
+    const auto translation = [](double x, double y, double z) {
+        return json::array({1.0,0.0,0.0,x, 0.0,1.0,0.0,y, 0.0,0.0,1.0,z, 0.0,0.0,0.0,1.0});
+    };
+    const std::string nested = doc_new("assembly", "MeasureNested").at("doc_id");
+    doc_apply_ops(nested, -1, json::array({
+        {{"op", "asm_insert_component"}, {"source", {{"path", part_path.string()}}},
+         {"fixed", true}, {"transform", translation(0, 0, 0)}},
+        {{"op", "asm_insert_component"}, {"source", {{"path", part_path.string()}}},
+         {"fixed", true}, {"transform", translation(40, 0, 0)}}
+    }), false);
+    doc_save(nested, nested_path.string());
+    const std::string root = doc_new("assembly", "MeasureRepeatedNested").at("doc_id");
+    doc_apply_ops(root, -1, json::array({
+        {{"op", "asm_insert_component"}, {"source", {{"path", nested_path.string()}}},
+         {"fixed", true}, {"transform", {0.0,-1.0,0.0,100.0, 1.0,0.0,0.0,200.0,
+                                        0.0,0.0,1.0,300.0, 0.0,0.0,0.0,1.0}}},
+        {{"op", "asm_insert_component"}, {"source", {{"path", nested_path.string()}}},
+         {"fixed", true}, {"transform", translation(500, 0, 0)}}
+    }), false);
+    // Two equal, coplanar top faces survive on the rotated nested instance.
+    // A side word does not authorize silently choosing one of them.
+    CHECK_THROWS(doc_eval_measure(root, json::array({json{{"of", "face"}, {"side", "top"}}})));
+    const auto vertex_ref = [&](int body, const json& point) {
+        for (int vertex = 1; vertex <= 16; ++vertex) {
+            json selector = doc_resolve_pick(root, body, "vertex", vertex).at("selector");
+            if (selector.at("centroid") == point)
+                return json{{"body_id", body}, {"selector", std::move(selector)}};
+        }
+        return json();
+    };
+    const json a = vertex_ref(1, {0.0, 0.0, 0.0});
+    const json b = vertex_ref(2, {0.0, 0.0, 0.0});
+    const json far_corner = vertex_ref(1, {50.0, 20.0, 30.0});
+    REQUIRE(a.is_object());
+    REQUIRE(b.is_object());
+    REQUIRE(far_corner.is_object()); // unique vertex map, not per-face occurrence IDs
+    REQUIRE(a["selector"]["sid"] == b["selector"]["sid"]);
+    const json pa = doc_eval_measure(root, json::array({a}));
+    const json pc = doc_eval_measure(root, json::array({far_corner}));
+    const json expected_a = {100.0, 200.0, 300.0};
+    const json expected_corner = {80.0, 250.0, 330.0};
+    for (int axis = 0; axis < 3; ++axis) {
+        CHECK(pa.at("points")[0][axis].get<double>() ==
+              doctest::Approx(expected_a[axis].get<double>()));
+        CHECK(pc.at("points")[0][axis].get<double>() ==
+              doctest::Approx(expected_corner[axis].get<double>()));
+    }
+    CHECK(doc_eval_measure(root, json::array({a, b})).at("distance").get<double>() ==
+          doctest::Approx(std::sqrt(290000.0)));
+    // A LOCAL instance selector with no owner is not silently matched in world space.
+    CHECK_THROWS(doc_eval_measure(root, json::array({a.at("selector")})));
+    CHECK(doc_close(root));
+    CHECK(doc_close(nested));
+    CHECK(doc_close(part));
+    std::filesystem::remove_all(dir);
+}
+
 // Disjoint additive features stay independent, and mass evaluation reports both bodies
 // with their combined volume, centre of mass, and per-body breakdown.
 TEST_CASE("eval_mass counts independent disjoint additive bodies") {
@@ -3458,6 +3687,180 @@ TEST_CASE("eval_section_props accepts origin+normal plane on a box") {
     CHECK(std::isfinite(Iyy));
     CHECK(Ixx > 0.0);
     CHECK(Iyy > 0.0);
+}
+
+TEST_CASE("eval_section_props includes a first-body-only intersection and distinguishes no intersection") {
+    using namespace chudware::doc;
+    const std::string id = doc_new("part", "SectionFirstBody").at("doc_id");
+    const json built = doc_apply_ops(id, -1, json::array({
+        {{"op", "add_feature"}, {"feature", {{"type", "box"}, {"name", "Block"},
+            {"params", {{"length", 40.0}, {"width", 30.0}, {"height", 20.0},
+                        {"centered", true}}}}}},
+        {{"op", "add_feature"}, {"feature", {{"type", "cylinder"}, {"name", "Cylinder"},
+            {"params", {{"radius", 8.0}, {"height", 30.0}, {"mode", "new"},
+                        {"centered", true}, {"at", {70.0, 0.0, 0.0}}}}}}}
+    }), false);
+    for (const auto& status : built.at("rebuild").at("feature_status"))
+        REQUIRE_MESSAGE(status.value("ok", false), status.dump());
+    const json section = doc_eval_section_props(id, "plane.right");
+    CHECK(section.at("area_mm2").get<double>() == doctest::Approx(600.0));
+    for (int axis = 0; axis < 3; ++axis)
+        CHECK(section.at("centroid")[axis].get<double>() == doctest::Approx(0.0).epsilon(1e-8));
+    CHECK(section.at("Ixx").get<double>() == doctest::Approx(20000.0));
+    CHECK(section.at("Iyy").get<double>() == doctest::Approx(45000.0));
+    CHECK(section.at("Ixy").get<double>() == doctest::Approx(0.0).epsilon(1e-8));
+
+    const json empty = doc_eval_section_props(id,
+        {{"origin", {100.0, 0.0, 0.0}}, {"normal", {1.0, 0.0, 0.0}}});
+    for (const char* key : {"area_mm2", "Ixx", "Iyy", "Ixy"})
+        CHECK(empty.at(key).get<double>() == 0.0);
+    for (int axis = 0; axis < 3; ++axis)
+        CHECK(empty.at("centroid")[axis].get<double>() == 0.0);
+    CHECK(doc_close(id));
+}
+
+TEST_CASE("eval_section_props aggregates disjoint areas centroid and signed centroidal inertia") {
+    using namespace chudware::doc;
+    const std::string id = doc_new("part", "SectionDisjoint").at("doc_id");
+    const json built = doc_apply_ops(id, -1, json::array({
+        {{"op", "add_feature"}, {"feature", {{"type", "box"}, {"name", "A"},
+            {"params", {{"length", 4.0}, {"width", 6.0}, {"height", 10.0},
+                        {"centered", true}}}}}},
+        {{"op", "add_feature"}, {"feature", {{"type", "box"}, {"name", "B"},
+            {"params", {{"length", 8.0}, {"width", 3.0}, {"height", 10.0},
+                        {"centered", true}, {"mode", "new"}, {"at", {20.0, 12.0, 0.0}}}}}}}
+    }), false);
+    for (const auto& status : built.at("rebuild").at("feature_status"))
+        REQUIRE_MESSAGE(status.value("ok", false), status.dump());
+    const json section = doc_eval_section_props(id, "plane.top");
+    CHECK(section.at("area_mm2").get<double>() == doctest::Approx(48.0));
+    CHECK(section.at("centroid")[0].get<double>() == doctest::Approx(10.0));
+    CHECK(section.at("centroid")[1].get<double>() == doctest::Approx(6.0));
+    CHECK(section.at("centroid")[2].get<double>() == doctest::Approx(0.0).epsilon(1e-8));
+    CHECK(section.at("Ixx").get<double>() == doctest::Approx(1818.0));
+    CHECK(section.at("Iyy").get<double>() == doctest::Approx(4960.0));
+    CHECK(section.at("Ixy").get<double>() == doctest::Approx(-2880.0));
+    CHECK(doc_close(id));
+}
+
+TEST_CASE("eval_section_props preserves annular holes and an independent island inside the bore") {
+    using namespace chudware::doc;
+    const std::string id = doc_new("part", "SectionAnnulus").at("doc_id");
+    const auto path = std::filesystem::temp_directory_path() / (id + ".brep");
+    BRepAlgoAPI_Cut tube(BRepPrimAPI_MakeCylinder(10.0, 5.0).Shape(),
+                        BRepPrimAPI_MakeCylinder(4.0, 5.0).Shape());
+    REQUIRE(tube.IsDone());
+    REQUIRE(BRepTools::Write(tube.Shape(), path.string().c_str()));
+    const json imported = doc_apply_ops(id, -1, json::array({
+        {{"op", "add_feature"}, {"feature", {{"type", "import"}, {"name", "Tube"},
+            {"params", {{"source_path", path.string()}, {"format", "brep"}}}}}}
+    }), false);
+    for (const auto& status : imported.at("rebuild").at("feature_status"))
+        REQUIRE_MESSAGE(status.value("ok", false), status.dump());
+    const json top_plane = {{"origin", {0.0, 0.0, 2.5}}, {"normal", {0.0, 0.0, 1.0}}};
+    const json annulus = doc_eval_section_props(id, top_plane);
+    CHECK(annulus.at("area_mm2").get<double>() == doctest::Approx(84.0 * PI));
+    CHECK(annulus.at("Ixx").get<double>() == doctest::Approx(2436.0 * PI));
+    CHECK(annulus.at("Iyy").get<double>() == doctest::Approx(2436.0 * PI));
+    CHECK(annulus.at("Ixy").get<double>() == doctest::Approx(0.0).epsilon(1e-7));
+    const json lengthwise = doc_eval_section_props(id, "plane.right");
+    CHECK(lengthwise.at("area_mm2").get<double>() == doctest::Approx(60.0));
+    CHECK(lengthwise.at("centroid")[1].get<double>() == doctest::Approx(0.0).epsilon(1e-8));
+    CHECK(lengthwise.at("centroid")[2].get<double>() == doctest::Approx(2.5));
+    CHECK(lengthwise.at("Ixx").get<double>() == doctest::Approx(125.0));
+    CHECK(lengthwise.at("Iyy").get<double>() == doctest::Approx(3120.0));
+
+    const json added = doc_apply_ops(id, -1, json::array({
+        {{"op", "add_feature"}, {"feature", {{"type", "cylinder"}, {"name", "Island"},
+            {"params", {{"radius", 2.0}, {"height", 5.0}, {"mode", "new"},
+                        {"centered", true}, {"at", {0.0, 0.0, 2.5}}}}}}}
+    }), false);
+    for (const auto& status : added.at("rebuild").at("feature_status"))
+        REQUIRE_MESSAGE(status.value("ok", false), status.dump());
+    const json island = doc_eval_section_props(id, top_plane);
+    CHECK(island.at("area_mm2").get<double>() == doctest::Approx(88.0 * PI));
+    CHECK(island.at("Ixx").get<double>() == doctest::Approx(2440.0 * PI));
+    CHECK(island.at("Iyy").get<double>() == doctest::Approx(2440.0 * PI));
+    CHECK(island.at("centroid")[2].get<double>() == doctest::Approx(2.5));
+    CHECK(doc_close(id));
+    std::filesystem::remove(path);
+}
+
+TEST_CASE("eval_section_props uses rotated nested assembly world geometry") {
+    using namespace chudware::doc;
+    const std::string part = doc_new("part", "SectionNestedSource").at("doc_id");
+    const auto dir = std::filesystem::temp_directory_path() / part;
+    std::filesystem::create_directories(dir);
+    const auto part_path = dir / "source.step+";
+    const auto nested_path = dir / "nested.step+";
+    const json built = doc_apply_ops(part, -1, json::array({
+        {{"op", "add_feature"}, {"feature", {{"type", "box"}, {"name", "Block"},
+            {"params", {{"length", 4.0}, {"width", 6.0}, {"height", 10.0},
+                        {"centered", true}}}}}}
+    }), false);
+    for (const auto& status : built.at("rebuild").at("feature_status"))
+        REQUIRE_MESSAGE(status.value("ok", false), status.dump());
+    doc_save(part, part_path.string());
+    const std::string nested = doc_new("assembly", "SectionNested").at("doc_id");
+    doc_apply_ops(nested, -1, json::array({
+        {{"op", "asm_insert_component"}, {"source", {{"path", part_path.string()}}},
+         {"fixed", true}},
+        {{"op", "asm_insert_component"}, {"source", {{"path", part_path.string()}}},
+         {"fixed", true}, {"transform", {1.0,0.0,0.0,20.0, 0.0,1.0,0.0,12.0,
+                                        0.0,0.0,1.0,0.0, 0.0,0.0,0.0,1.0}}}
+    }), false);
+    doc_save(nested, nested_path.string());
+    const std::string root = doc_new("assembly", "SectionWorld").at("doc_id");
+    doc_apply_ops(root, -1, json::array({
+        {{"op", "asm_insert_component"}, {"source", {{"path", nested_path.string()}}},
+         {"fixed", true}, {"transform", {0.0,-1.0,0.0,100.0, 1.0,0.0,0.0,200.0,
+                                        0.0,0.0,1.0,300.0, 0.0,0.0,0.0,1.0}}}
+    }), false);
+    const json section = doc_eval_section_props(root,
+        {{"origin", {0.0, 0.0, 300.0}}, {"normal", {0.0, 0.0, 1.0}},
+         {"xdir", {1.0, 0.0, 0.0}}});
+    CHECK(section.at("area_mm2").get<double>() == doctest::Approx(48.0));
+    CHECK(section.at("centroid")[0].get<double>() == doctest::Approx(94.0));
+    CHECK(section.at("centroid")[1].get<double>() == doctest::Approx(210.0));
+    CHECK(section.at("centroid")[2].get<double>() == doctest::Approx(300.0));
+    CHECK(section.at("Ixx").get<double>() == doctest::Approx(4864.0));
+    CHECK(section.at("Iyy").get<double>() == doctest::Approx(1872.0));
+    CHECK(section.at("Ixy").get<double>() == doctest::Approx(2880.0));
+    CHECK(doc_close(root));
+    CHECK(doc_close(nested));
+    CHECK(doc_close(part));
+    std::filesystem::remove_all(dir);
+}
+
+TEST_CASE("eval_section_props refuses an open contour instead of returning a partial section") {
+    using namespace chudware::doc;
+    const std::string id = doc_new("part", "SectionOpenContour").at("doc_id");
+    const auto path = std::filesystem::temp_directory_path() / (id + ".brep");
+    BRepBuilderAPI_MakePolygon boundary;
+    boundary.Add(gp_Pnt(30.0, -10.0, -10.0));
+    boundary.Add(gp_Pnt(30.0, 10.0, -10.0));
+    boundary.Add(gp_Pnt(30.0, 10.0, 10.0));
+    boundary.Add(gp_Pnt(30.0, -10.0, 10.0));
+    boundary.Close();
+    BRepBuilderAPI_MakeFace face(boundary.Wire());
+    REQUIRE(face.IsDone());
+    REQUIRE(BRepTools::Write(face.Face(), path.string().c_str()));
+    const json built = doc_apply_ops(id, -1, json::array({
+        {{"op", "add_feature"}, {"feature", {{"type", "box"}, {"name", "Block"},
+            {"params", {{"length", 4.0}, {"width", 6.0}, {"height", 10.0}}}}}},
+        {{"op", "add_feature"}, {"feature", {{"type", "import"}, {"name", "OpenSurface"},
+            {"params", {{"source_path", path.string()}, {"format", "brep"}, {"mode", "new"}}}}}}
+    }), false);
+    for (const auto& status : built.at("rebuild").at("feature_status"))
+        REQUIRE_MESSAGE(status.value("ok", false), status.dump());
+    try {
+        (void)doc_eval_section_props(id, "plane.top");
+        FAIL("open section contour must not produce a partial area or a successful zero");
+    } catch (const OpError& error) {
+        CHECK(error.code == "section_failed");
+    }
+    CHECK(doc_close(id));
+    std::filesystem::remove(path);
 }
 
 
@@ -5134,4 +5537,190 @@ TEST_CASE("eval_solid_health: self-intersection is really computed, and it costs
 
     std::error_code ec;
     fs::remove(brep_path, ec);
+}
+
+namespace {
+
+json mate_surface_selector(const TopoDS_Shape& shape, const std::string& surface,
+                           bool inner = false) {
+    const auto faces = chudware::doc::describe_faces(shape);
+    int i = 0;
+    json selector;
+    for (TopExp_Explorer ex(shape, TopAbs_FACE); ex.More(); ex.Next(), ++i) {
+        if (faces[i].surf != surface) continue;
+        if (inner && ex.Current().Orientation() != TopAbs_REVERSED) continue;
+        REQUIRE_MESSAGE(selector.is_null(), "mate fixture must identify one analytic face");
+        selector = chudware::doc::make_selector(faces[i]);
+    }
+    REQUIRE_FALSE(selector.is_null());
+    return selector;
+}
+
+std::vector<double> mate_pose(const gp_Trsf& pose) {
+    std::vector<double> values(16, 0.0);
+    values[15] = 1.0;
+    for (int row = 1; row <= 3; ++row)
+        for (int col = 1; col <= 4; ++col)
+            values[(row - 1) * 4 + col - 1] = pose.Value(row, col);
+    return values;
+}
+
+TopoDS_Face placed_mate_face(const chudware::doc::AsmBodyOut& body,
+                            GeomAbs_SurfaceType surface, bool inner = false) {
+    const TopoDS_Shape world = chudware::doc::placed_world_shape(body);
+    for (TopExp_Explorer ex(world, TopAbs_FACE); ex.More(); ex.Next()) {
+        const TopoDS_Face face = TopoDS::Face(ex.Current());
+        if (inner && face.Orientation() != TopAbs_REVERSED) continue;
+        if (BRepAdaptor_Surface(face).GetType() == surface) return face;
+    }
+    REQUIRE_MESSAGE(false, "placed assembly lost its analytic mating face");
+    return {};
+}
+
+}  // namespace
+
+TEST_CASE("native assembly: partially trimmed hub bores mate on their true axes") {
+    using namespace chudware::doc;
+    bool conical = false;
+    SUBCASE("partial cylindrical bore") {}
+    SUBCASE("partial conical bore") { conical = true; }
+    const std::string surface = conical ? "cone" : "cylinder";
+    const GeomAbs_SurfaceType type = conical ? GeomAbs_Cone : GeomAbs_Cylinder;
+    const double height = 18.0, sweep = 2.0 * PI / 3.0;
+    const TopoDS_Shape outer = conical
+        ? BRepPrimAPI_MakeCone(20.0, 18.0, height, sweep).Shape()
+        : BRepPrimAPI_MakeCylinder(20.0, height, sweep).Shape();
+    const TopoDS_Shape bore = conical
+        ? BRepPrimAPI_MakeCone(8.0, 6.0, height).Shape()
+        : BRepPrimAPI_MakeCylinder(8.0, height).Shape();
+    TopoDS_Shape shaft = conical
+        ? BRepPrimAPI_MakeCone(7.8, 5.8, height).Shape()
+        : BRepPrimAPI_MakeCylinder(7.8, height).Shape();
+    BRepAlgoAPI_Cut cut(outer, bore);
+    REQUIRE(cut.IsDone());
+    TopoDS_Shape hub = cut.Shape();
+    REQUIRE(BRepCheck_Analyzer(hub).IsValid());
+
+    // The imported bodies and their assembly placement have DIFFERENT local frames.
+    gp_Trsf local;
+    local.SetRotation(gp_Ax1(gp_Pnt(0, 0, 0), gp_Dir(1, 0, 0)), 0.4);
+    local.SetTranslationPart(gp_Vec(35, -22, 80));
+    hub = hub.Moved(TopLoc_Location(local));
+    shaft = shaft.Moved(TopLoc_Location(local));
+    const json hub_face = mate_surface_selector(hub, surface, true);
+    const json shaft_face = mate_surface_selector(shaft, surface);
+    gp_Trsf anchor;
+    anchor.SetRotation(gp_Ax1(gp_Pnt(0, 0, 0), gp_Dir(0, 1, 0)), 0.3);
+    anchor.SetTranslationPart(gp_Vec(100, 200, 30));
+    gp_Trsf initial = anchor;
+    initial.SetTranslationPart(gp_Vec(102, 197, 31));
+
+    const auto dir = std::filesystem::temp_directory_path();
+    const auto hub_path = dir / ("chudware_mate_partial_" + surface + "_hub.brep");
+    const auto shaft_path = dir / ("chudware_mate_partial_" + surface + "_shaft.brep");
+    REQUIRE(BRepTools::Write(hub, hub_path.string().c_str()));
+    REQUIRE(BRepTools::Write(shaft, shaft_path.string().c_str()));
+    const json assembly{
+        {"schema", "aicad.asm/1"},
+        {"components", json::array({
+            {{"id", "shaft"}, {"source", {{"path", shaft_path.string()}}},
+             {"fixed", true}, {"transform", mate_pose(anchor)}},
+            {{"id", "hub"}, {"source", {{"path", hub_path.string()}}},
+             {"fixed", false}, {"transform", mate_pose(initial)}}
+        })},
+        {"mates", json::array({
+            {{"id", "bore_axis"}, {"type", "concentric"}, {"align", "aligned"},
+             {"refs", json::array({
+                 {{"component", "shaft"}, {"selector", shaft_face}},
+                 {{"component", "hub"}, {"selector", hub_face}}
+             })}}
+        })}
+    };
+    const AssemblyResult result = compile_assembly(assembly);
+    REQUIRE(result.converged);
+    CHECK(result.dof == 2);  // sliding along, and spinning about, the common axis
+    REQUIRE(result.bodies.size() == 2);
+    const BRepAdaptor_Surface shaft_surface(placed_mate_face(result.bodies[0], type));
+    const BRepAdaptor_Surface hub_surface(placed_mate_face(result.bodies[1], type, true));
+    const gp_Ax1 shaft_axis = conical ? shaft_surface.Cone().Axis()
+                                    : shaft_surface.Cylinder().Axis();
+    const gp_Ax1 hub_axis = conical ? hub_surface.Cone().Axis()
+                                  : hub_surface.Cylinder().Axis();
+    const gp_Vec direction(shaft_axis.Direction());
+    CHECK(direction.Crossed(gp_Vec(hub_axis.Direction())).Magnitude() < 1e-6);
+    CHECK(gp_Vec(shaft_axis.Location(), hub_axis.Location())
+              .Crossed(direction).Magnitude() < 1e-5);
+    std::error_code ec;
+    std::filesystem::remove(hub_path, ec);
+    std::filesystem::remove(shaft_path, ec);
+}
+
+TEST_CASE("native assembly: spherical caps coincide at centers without locking rotation") {
+    using namespace chudware::doc;
+    const TopoDS_Shape outer = BRepPrimAPI_MakeSphere(12.0, PI / 6.0, PI / 2.0).Shape();
+    const TopoDS_Shape cavity = BRepPrimAPI_MakeSphere(10.0).Shape();
+    BRepAlgoAPI_Cut cut(outer, cavity);
+    REQUIRE(cut.IsDone());
+    gp_Trsf local;
+    local.SetTranslation(gp_Vec(20, -30, 40));
+    const TopoDS_Shape socket = cut.Shape().Moved(TopLoc_Location(local));
+    const TopoDS_Shape ball = BRepPrimAPI_MakeSphere(9.8, 0.0, PI / 2.0).Shape();
+    REQUIRE(BRepCheck_Analyzer(socket).IsValid());
+    const json socket_face = mate_surface_selector(socket, "sphere", true);
+    const json ball_face = mate_surface_selector(ball, "sphere");
+
+    const auto dir = std::filesystem::temp_directory_path();
+    const auto socket_path = dir / "chudware_mate_spherical_socket.brep";
+    const auto ball_path = dir / "chudware_mate_spherical_cap.brep";
+    REQUIRE(BRepTools::Write(socket, socket_path.string().c_str()));
+    REQUIRE(BRepTools::Write(ball, ball_path.string().c_str()));
+    gp_Trsf anchor;
+    anchor.SetRotation(gp_Ax1(gp_Pnt(0, 0, 0), gp_Dir(0, 1, 0)), 0.3);
+    anchor.SetTranslationPart(gp_Vec(100, 200, 30));
+    const gp_Pnt center = gp_Pnt(20, -30, 40).Transformed(anchor);
+    for (double angle : {0.0, 0.45}) {
+        gp_Trsf initial;
+        initial.SetRotation(gp_Ax1(gp_Pnt(0, 0, 0), gp_Dir(1, 2, 3)), angle);
+        initial.SetTranslationPart(gp_Vec(center.X() + 2.0, center.Y() - 3.0,
+                                         center.Z() + 1.0));
+        json assembly{
+            {"schema", "aicad.asm/1"},
+            {"components", json::array({
+                {{"id", "socket"}, {"source", {{"path", socket_path.string()}}},
+                 {"fixed", true}, {"transform", mate_pose(anchor)}},
+                {{"id", "ball"}, {"source", {{"path", ball_path.string()}}},
+                 {"fixed", false}, {"transform", mate_pose(initial)}}
+            })},
+            {"mates", json::array({
+                {{"id", "ball_center"}, {"type", "coincident"},
+                 {"refs", json::array({
+                     {{"component", "socket"}, {"selector", socket_face}},
+                     {{"component", "ball"}, {"selector", ball_face}}
+                 })}}
+            })}
+        };
+        const AssemblyResult result = compile_assembly(assembly);
+        REQUIRE(result.converged);
+        CHECK(result.dof == 3);
+        REQUIRE(result.bodies.size() == 2);
+        const gp_Pnt socket_center = BRepAdaptor_Surface(
+            placed_mate_face(result.bodies[0], GeomAbs_Sphere, true)).Sphere().Location();
+        const gp_Pnt ball_center = BRepAdaptor_Surface(
+            placed_mate_face(result.bodies[1], GeomAbs_Sphere)).Sphere().Location();
+        CHECK(socket_center.Distance(ball_center) < 1e-5);
+        const auto& solved = result.transforms.at("ball");
+        for (int row = 0; row < 3; ++row)
+            for (int col = 0; col < 3; ++col)
+                CHECK(std::abs(solved[row * 4 + col] - initial.Value(row + 1, col + 1)) < 1e-6);
+
+        // A missing spherical surface must not turn into a valid guessed center.
+        assembly["mates"][0]["refs"][1]["selector"]["centroid"] = {1e9, 1e9, 1e9};
+        const AssemblyResult dangling = compile_assembly(assembly);
+        CHECK_FALSE(dangling.converged);
+        REQUIRE(dangling.mate_status.size() == 1);
+        CHECK(dangling.mate_status[0].status == "unresolved");
+    }
+    std::error_code ec;
+    std::filesystem::remove(socket_path, ec);
+    std::filesystem::remove(ball_path, ec);
 }

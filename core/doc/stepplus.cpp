@@ -228,6 +228,21 @@ std::string editable_container_save(const json& doc, const std::string& path,
     auto th = extra.find("thumbnail.png");
     thumb = (th != extra.end()) ? th->second : placeholder_png();
 
+    // Essential/forward-compatible payloads have priority over the optional mesh.
+    // Reserve their expanded bytes before deciding whether its STORED blob fits.
+    mz_uint64 mesh_cache_budget = kMaxArchiveExpandedBytes;
+    auto reserve_payload = [&](std::size_t bytes) {
+        mesh_cache_budget = bytes > mesh_cache_budget ? 0 : mesh_cache_budget - bytes;
+    };
+    reserve_payload(document.size());
+    reserve_payload(meta_json.size());
+    reserve_payload(thumb.size());
+    for (const auto& [name, data] : extra) {
+        if ((owns_geometry_step && name == "geometry.step") ||
+            (!is_known_entry(name, owns_geometry_step) && name != "cache.aicm"))
+            reserve_payload(data.size());
+    }
+
     if (out_path.has_parent_path()) {
         std::error_code ec;
         fs::create_directories(out_path.parent_path(), ec);
@@ -277,6 +292,10 @@ std::string editable_container_save(const json& doc, const std::string& path,
     // compatible; the cache is display-only + hash-gated, so the skipped zip CRC is fine.
     for (const auto& [name, data] : extra) {
         if (is_known_entry(name, owns_geometry_step)) continue;
+        // Display caches are optional. Never persist one that the bounded
+        // reader would have to discard before allocating its payload.
+        if (owns_geometry_step && name == "cache.aicm" && data.size() > mesh_cache_budget)
+            continue;
         // cache.aicm + studies/*/results.npz are large binary blobs — STORED (no deflate).
         const bool stored = (name == "cache.aicm") ||
                             (name.rfind("studies/", 0) == 0 && name.find("/results.") != std::string::npos);
@@ -332,6 +351,10 @@ StepPlusDoc editable_container_open(const std::string& path,
             io_error("doc_open: invalid .step+ archive metadata");
         }
         if (st.m_is_directory) continue;
+        // Admit the optional mesh only after all required/unknown payloads have
+        // passed their unchanged limits and reserved the aggregate byte budget.
+        if (owns_geometry_step && std::strcmp(st.m_filename, "cache.aicm") == 0)
+            continue;
         if (st.m_uncomp_size > kMaxEntryExpandedBytes) {
             mz_zip_reader_end(&zip);
             archive_limit_error("per-entry expanded byte limit", format_name);
@@ -404,6 +427,19 @@ StepPlusDoc editable_container_open(const std::string& path,
         if (!mz_zip_reader_file_stat(&zip, i, &st)) continue;
         const std::string name = st.m_filename;
         if (is_known_entry(name, owns_geometry_step) || st.m_is_directory) continue;
+        if (owns_geometry_step && name == "cache.aicm") {
+            // A STORED mesh cannot expand during decompression. It may use the
+            // remaining bounded archive budget; compressed meshes retain the
+            // ordinary per-entry and compression-ratio caps.
+            const bool stored = st.m_method == 0 && st.m_comp_size == st.m_uncomp_size;
+            const mz_uint64 entry_limit = stored ? kMaxArchiveExpandedBytes : kMaxEntryExpandedBytes;
+            if (st.m_uncomp_size > entry_limit ||
+                st.m_uncomp_size > kMaxArchiveExpandedBytes - aggregate_expanded ||
+                (st.m_uncomp_size != 0 && (st.m_comp_size == 0 ||
+                    st.m_uncomp_size / st.m_comp_size > kMaxCompressionRatio)))
+                continue;
+            aggregate_expanded += st.m_uncomp_size;
+        }
         // STORED entries (method 0 — e.g. cache.aicm) carry the persisted-geometry mesh. Extract
         // them raw with MZ_ZIP_FLAG_COMPRESSED_DATA so miniz skips BOTH inflate and CRC; for a
         // STORED entry the compressed bytes are the data. Allocate the destination exactly once.
@@ -541,9 +577,13 @@ std::string stepplus_geometry_step_bytes(const std::vector<TopoDS_Shape>& bodies
 }
 
 std::string stepplus_cache_engine_key() {
-    // Bump CACHE_SCHEMA on ANY geometry-compiler change that could alter output geometry, so
-    // caches written by an older engine are rejected. OCCT version folded in when available.
-    static constexpr const char* kCacheSchema = "chudware-geomcache/1";
+    // This is a geometry-semantic epoch, not just a serialization version. Bump it on
+    // ANY compiler change that can alter geometry OR topology: the same document hash
+    // and OCCT version do not prove that an older compiler produced the current faces.
+    // /2 invalidates pre-fix centered:false placement (bbox tolerance padding), whose
+    // nearly-coplanar split faces disagree with selectors from a fresh feature rebuild.
+    // Both display replay and assembly BREP loading must reject that old snapshot.
+    static constexpr const char* kCacheSchema = "chudware-geomcache/2";
 #ifdef OCC_VERSION_COMPLETE
     return std::string(kCacheSchema) + ";occt=" OCC_VERSION_COMPLETE;
 #else

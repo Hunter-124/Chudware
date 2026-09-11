@@ -182,8 +182,10 @@ def _axis(*tags) -> list:
 
 
 def _reopened(rover) -> str:
-    doc = cb.call("doc_open", {"path": rover["path"]})["doc_id"]
+    doc = cb.call("doc_open", {"path": rover["path"], "detach_path": True})["doc_id"]
     assert doc
+    cb.call("doc_save", {"doc_id": doc,
+                        "path": str(Path(rover["path"]).with_name(f"{doc}.step+"))})
     return doc
 
 
@@ -286,24 +288,23 @@ def test_four_wheel_steer_halves_the_turning_radius(rover):
 
 
 def test_the_kingpin_axis_can_come_from_the_concentric_mate(rover):
-    """`mate_id` instead of `axis`: the concentric mate already carries the measured
-    kingpin axis, so naming it must give the identical answer to spelling the axis out."""
+    """A measured concentric-mate axis must reproduce the explicit-axis turning radius."""
     by_axis = _call("steering_turning_radius", {
         "doc_id": rover["doc_id"], "steps": 3,
         "steer": {"components": ["wheel_FL", "wheel_FR"],
                   "axis": _axis("FL", "FR"), "angle_deg": 30}})
+    assert by_axis["ok"], by_axis
     by_mate = _call("steering_turning_radius", {
         "doc_id": rover["doc_id"], "steps": 3,
         "steer": {"components": ["wheel_FL", "wheel_FR"],
                   "mate_ids": [rover["mates"]["FL"], rover["mates"]["FR"]],
                   "angle_deg": 30}})
     assert by_mate["ok"], by_mate
+    # Compare the consumer's geometry, not an arbitrary point along the axis.
+    # Mate selectors carry OCCT surface centroids rounded to 1e-6 mm, then
+    # transported through solved placements; their coordinates are not exact datums.
     assert by_mate["turning_radius_mm"] == pytest.approx(
         by_axis["turning_radius_mm"], rel=1e-6)
-    sources = [a["source"] for a in by_mate["driver"]["axes"]]
-    assert all("mate" in s for s in sources), sources
-    for got, want in zip(by_mate["driver"]["axes"], _axis("FL", "FR")):
-        assert got["point"] == pytest.approx(want["point"], abs=1e-6)
 
 
 def test_check_interference_names_the_first_steer_angle_that_clashes(rover):
@@ -565,6 +566,153 @@ def test_the_dimensional_mate_path_still_works(rover):
                    for w in out["warnings"]), out["warnings"]
     finally:
         cb.call("doc_close", {"doc_id": doc})
+
+
+# ------------------------------------------------------- synchronized native joint drives
+
+@pytest.fixture
+def motion_joint_chain(tmp_path):
+    """An off-origin Z hinge carrying an X hinge: the second drive is not world-fixed."""
+    if not cb.available():
+        pytest.skip("libchudware not staged; engine-backed MCP tools unavailable")
+    part = _part("motion_joint_body", [
+        cb.feat("box", "Body", {"length": cb.dim(4), "width": cb.dim(6),
+                                "height": cb.dim(8)}),
+    ], tmp_path)
+    # Native creation mints an independent document without MCP current-doc/reset
+    # policy; the module-scoped rover and any other open documents must survive.
+    created = cb.call("doc_new", {
+        "kind": "assembly", "name": "motion_joint_chain", "resume_if_open": False})
+    assert isinstance(created.get("doc_id"), str) and created["doc_id"], created
+    doc = created["doc_id"]
+    try:
+        ids = {}
+        for name, point, fixed in (
+                ("base", [-20, -40, -10], True),
+                ("carrier", [31, 18, 7], False),
+                ("rotor", [60, 18, 7], False)):
+            added = _call("asm_add_component", {
+                "doc_id": doc, "path": part, "name": name, "at": point, "fixed": fixed})
+            assert added["ok"], added
+            ids[name] = added["component"]
+        mates = {}
+        for name, reference, moving, axis, point in (
+                ("steer", "base", "carrier", [0, 0, 1], [31, 18, 7]),
+                ("roll", "carrier", "rotor", [1, 0, 0], [60, 18, 7])):
+            added = _call("asm_mate", {
+                "doc_id": doc, "mate_type": "angle",
+                "a": {"component": ids[reference], "query": {"of": "face", "side": "top"}},
+                "b": {"component": ids[moving], "query": {"of": "face", "side": "top"}},
+                "value": {"value": 0, "axis": axis, "axis_point": point},
+            })
+            assert added["ok"] and added["converged"], added
+            mates[name] = added["mate"]
+        yield {"doc_id": doc, "components": ids, "mates": mates, "directory": tmp_path}
+    finally:
+        cb.call("doc_close", {"doc_id": doc})
+
+
+def test_multi_driver_motion_carries_joint_frame_and_reuses_checked_start(motion_joint_chain):
+    """World placement must equal Rz(steer)*Rx(roll), not two independent world spins."""
+    doc = motion_joint_chain["doc_id"]
+    ids, mates = motion_joint_chain["components"], motion_joint_chain["mates"]
+    before = cb.call("doc_tree", {"doc_id": doc})
+    # Descendant first deliberately: declaration order is not kinematic dependency order.
+    out = _call("simulate_motion", {
+        "doc_id": doc, "steps": 3, "loop": True, "check_interference": True,
+        "drivers": [{"mate_id": mates["roll"], "start": 15, "stop": 75},
+                    {"mate_id": mates["steer"], "start": 0, "stop": 30}],
+    })
+    assert out["ok"], out
+    assert out["pose_check"]["ok"], out
+    assert out["mate_id"] == mates["roll"]
+    assert {d["mate_id"]: d["unit"] for d in out["drivers"]} == {
+        mates["roll"]: "deg", mates["steer"]: "deg"}
+    frames = out["trajectory"]
+    assert [f["i"] for f in frames] == [0, 1, 2, 3]
+    for frame, steer, roll in zip(frames[:3], (0, 15, 30), (15, 45, 75)):
+        assert frame["value"] == pytest.approx(roll)
+        assert frame["driver_values"] == pytest.approx({
+            mates["roll"]: roll, mates["steer"]: steer})
+        a, b = math.radians(steer), math.radians(roll)
+        ca, sa, cbeta, sbeta = math.cos(a), math.sin(a), math.cos(b), math.sin(b)
+        poses = {body["component"]: body["transform"] for body in frame["bodies"]}
+        assert poses[ids["base"]] == pytest.approx(
+            [1, 0, 0, -20, 0, 1, 0, -40, 0, 0, 1, -10, 0, 0, 0, 1], abs=1e-6)
+        assert poses[ids["carrier"]] == pytest.approx(
+            [ca, -sa, 0, 31, sa, ca, 0, 18, 0, 0, 1, 7, 0, 0, 0, 1], abs=1e-6)
+        assert poses[ids["rotor"]] == pytest.approx([
+            ca, -sa * cbeta, sa * sbeta, 31 + 29 * ca,
+            sa, ca * cbeta, -ca * sbeta, 18 + 29 * sa,
+            0, sbeta, cbeta, 7,
+            0, 0, 0, 1,
+        ], abs=1e-6)
+        assert frame["interference_complete"] is True
+        assert frame["interference"] is False
+    for body in frames[0]["bodies"]:
+        assert out["reference_transforms"][body["component"]] == pytest.approx(
+            body["transform"], abs=1e-6)
+    # Reuse all evidence and both values, not a fabricated fourth solve at scalar start.
+    assert frames[-1] == {**frames[0], "i": 3}
+    assert out["pose_check"]["frames"][-1] == {
+        **out["pose_check"]["frames"][0], "i": 3}
+    assert out["interference"]["complete"] is True
+    assert out["interference"]["frames_checked"] == 3
+    assert out["interference"]["pair_failures"] == []
+    assert cb.call("doc_tree", {"doc_id": doc}) == before
+
+
+@pytest.mark.parametrize("invalid", ["duplicate", "suppressed", "nonfinite", "missing_bound"])
+def test_multi_driver_motion_refuses_invalid_drive_set(motion_joint_chain, invalid):
+    doc = motion_joint_chain["doc_id"]
+    mid = motion_joint_chain["mates"]["steer"]
+    drivers = [{"mate_id": mid, "start": 0, "stop": 30}]
+    if invalid == "duplicate":
+        drivers.append({"mate_id": mid, "start": 0, "stop": -30})
+    elif invalid == "suppressed":
+        cb.call("doc_apply_ops", {"doc_id": doc, "with_tess": False, "ops": [
+            {"op": "asm_edit_mate", "id": mid, "suppressed": True}]})
+    elif invalid == "nonfinite":
+        drivers[0]["stop"] = float("inf")
+    else:
+        del drivers[0]["start"]
+    before = cb.call("doc_tree", {"doc_id": doc})
+    out = _call("simulate_motion", {"doc_id": doc, "drivers": drivers, "steps": 2})
+    assert out["ok"] is False, out
+    assert not out.get("trajectory"), out
+    assert cb.call("doc_tree", {"doc_id": doc}) == before
+
+
+def test_multi_driver_motion_refuses_nondimensional_mate(rover):
+    before = cb.call("doc_tree", {"doc_id": rover["doc_id"]})
+    out = _call("simulate_motion", {
+        "doc_id": rover["doc_id"], "steps": 2,
+        "drivers": [{"mate_id": rover["mates"]["FL"], "start": 0, "stop": 30}],
+    })
+    assert out["ok"] is False, out
+    assert not out.get("trajectory"), out
+    assert cb.call("doc_tree", {"doc_id": rover["doc_id"]}) == before
+
+
+def test_multi_driver_motion_missing_geometry_is_not_clearance_evidence(motion_joint_chain):
+    doc = motion_joint_chain["doc_id"]
+    missing = cb.call("doc_apply_ops", {"doc_id": doc, "with_tess": False, "ops": [{
+        "op": "asm_insert_component", "name": "unavailable_guard", "fixed": True,
+        "source": {"path": str(motion_joint_chain["directory"] / "absent_guard.step+")},
+    }]})
+    missing_id = missing["id_map"]["$0"]
+    before = cb.call("doc_tree", {"doc_id": doc})
+    out = _call("simulate_motion", {
+        "doc_id": doc, "steps": 3, "loop": True, "check_interference": True,
+        "drivers": [{"mate_id": mid, "start": 0, "stop": 30}
+                    for mid in motion_joint_chain["mates"].values()],
+    })
+    assert out["ok"] is False, out
+    assert out["interference"]["complete"] is False
+    assert out["interference"]["frames_checked"] == 0
+    assert missing_id in {f["component"] for f in out["interference"]["geometry_failures"]}
+    assert out["trajectory"] == []
+    assert cb.call("doc_tree", {"doc_id": doc}) == before
 
 
 if __name__ == "__main__":

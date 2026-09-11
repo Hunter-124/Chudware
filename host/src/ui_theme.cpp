@@ -22,6 +22,19 @@ Palette palette;
 Theme   activeTheme = Theme::Dark;
 float   uiScale     = 1.0f;
 
+const float evalEmphasisPalette[10][4] = {
+    {0.90f, 0.20f, 0.18f, 1.0f},
+    {0.95f, 0.55f, 0.15f, 1.0f},
+    {0.95f, 0.80f, 0.20f, 1.0f},
+    {0.30f, 0.75f, 0.30f, 1.0f},
+    {0.18f, 0.78f, 0.72f, 1.0f},
+    {0.20f, 0.65f, 0.90f, 1.0f},
+    {0.25f, 0.45f, 0.90f, 1.0f},
+    {0.55f, 0.35f, 0.85f, 1.0f},
+    {0.85f, 0.30f, 0.70f, 1.0f},
+    {0.60f, 0.40f, 0.25f, 1.0f},
+};
+
 // ---- small helper -------------------------------------------------------
 static ImVec4 rgba(float r, float g, float b, float a = 1.0f) {
     return ImVec4(r, g, b, a);

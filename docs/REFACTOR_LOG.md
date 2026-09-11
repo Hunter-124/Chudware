@@ -3602,6 +3602,62 @@ checks that classification cannot change instead of pinning a Python-version-spe
 frozen-slot assignment exception. ME-490 repair generators, native revisions and
 geometric evidence remain in the project workspace, not this code repository.
 
+## 2026-09-10 — owned measurements, shared analysis windows and synchronized motion
+
+Measure now preserves body ownership through asynchronous picking, native queries,
+MCP annotation and viewport emphasis; selection/revision changes invalidate stale
+readings. Section properties integrate all intersected world solids, including
+nested placements and holes, and report failed/open intersections rather than
+fabricating an empty result. Measure, Mass/Section Properties, BOM, Cut List and
+Design Table share resizable, DPI-aware placement with off-screen recovery. The
+native-only GUI smoke exercised two-body measurement, separate and combined
+sections, scrolling, narrow-window recovery and light/dark tool windows; BOM
+launch remained blocked by the isolated profile's read-only entitlement.
+Motion accepts synchronized drivers, preserves component identities in complete
+sampled-interference results, invalidates results when checking is disabled, and
+jumps to collision poses with visible highlighting. The two-driver native/GUI
+smoke checked all nine poses and found overlaps of 6.8966377 and 96 mm³ at the
+last two samples; it is not evidence about the rover or continuous clearance.
+Sketch diagnostics now project only active Jacobian columns and validate
+coincidence proposals together before the conflict fallback: the measured
+24-spline construction fell from 0.581 s to 0.0145 s with the same 24 constraints
+and enclosed area; all 39 focused sketch/autoconstraint cases passed.
+Primary changes span `core/doc`, `core/mate`, `core/sketch`, their regression
+tests, `host/src/ui/{evaluate_dialogs,layout,sim_manager,viewport_panel}`,
+selection/mirror plumbing, MCP measurement/motion adapters and shared GUI lint.
+STEP+ now admits STORED display meshes within the remaining 256 MiB archive budget,
+after reserving required and unknown payloads; their existing limits are unchanged.
+Seven archive regression cases passed. Native assembly consumers reopened and
+resaved both 68 MB and 140 MB mesh-cache inputs with unchanged body counts, volumes
+and source bytes. This is archive preservation evidence, not geometry acceptance.
+ME-490 mechanism generators and geometry verification remain in the external
+project workspace. Full repository delivery-gate verification is pending.
+
+Native `doc_apply_ops` now honors `with_tess=false` through JSON dispatch and part,
+assembly, read-only and rejected-batch responses. It retains edit/solve diagnostics
+and avoids assembly response mesh construction/publication. Normal later display
+requests still expose the committed geometry. The persisted geometry epoch is `/2`:
+pre-fix primitive placements could leave five near-coplanar hub patches where the
+current compiler produces one face, so old snapshots cannot resolve current selectors.
+No selector tolerance was relaxed. Three operation cases, one stale-topology case
+and seven archive cases passed (4,485 assertions). The real ME-490 hub probe now
+converges at zero DOF, rejects malformed selectors, exercises mesh opt-out/default
+restoration and leaves the source archive byte-identical. The complete proposed
+mechanism and presentation still require their separate geometry/motion verification.
+
+Assembly diagnostics now request rank-only `System::degrees_of_freedom` instead
+of unused chronological row attribution. Mate-level classification retains the
+same absolute-SVD threshold and chronological accepted rows, but factors only
+connected variable groups touched by the next mate. All 36 numeric/mate/corpus
+cases passed (1,792 assertions). The actual 275-mate ME-490 operation converged
+in 10.2 s (271 active mates `ok`, four intentionally suppressed), versus an
+interrupted pre-fix call still in diagnostics after 398.4 s. This does not replace
+the mechanism's separate solid census, round-trip or sampled-interference checks.
+The delivery gate also found desktop-only depth-clear APIs in concurrently edited
+reverse-engineering previews. Both preview sites now use OpenGL/GLES
+`glClearBufferfv`, without changing global depth-clear state. Native preview smoke
+passed all three views without GL errors; WASM build and 15/15 asset parity passed.
+
 ## 2026-09-10 — native live/video Gaussian reverse engineering
 
 The Source lane now performs real environment and stationary-object Gaussian
@@ -3647,3 +3703,102 @@ Local evidence is under `scratch/reveng-overhaul-smoke/`: `proof.json`,
 completed real SfM and Brush training; this is not Nuitka/AppImage execution proof.
 Contract additions are append-only in `contracts/reveng.md` §13; workspace and
 viewport skills carry the new file map and invariants.
+
+## 2026-09-11 — exact-world integrity evidence reuse
+
+`core/doc/session.cpp` retains only the preceding complete integrity query's
+valid-solid metrics and completed distance/Common evidence. Identity is retained
+immutable TShape, orientation and exact absolute placement; no rounded transform,
+bounding-box signature or inferred rigid-group equivalence is admitted. Common
+is non-destructive. Source completeness, ownership, graph policy and nearest
+reporting remain fresh; failures cannot seed reuse. Entry caps drop memoization
+without dropping checks. `contracts/worker_rpc.md` documents the additive counters.
+
+The native interference regression suite passed, including source replacement,
+movement, nearest-only evidence promotion and timeout recovery. A read-only run
+on the 1,191-solid proposed ME-490 mechanism checked all 4,324 candidates at 1 mm
+proximity: 500.850 s cold, 7.793 s warm. The warm query reused all 1,191 metrics and
+4,324 completed pairs; geometric/provenance/graph evidence compared identically.
+The model remained byte-identical. Full replies and runtime identity are in
+`ME-490/Engineering/Verification/me490_integrity_cache_probe.json` and its sibling
+directory. This proves unchanged-query reuse, not moving-pose clearance or safety.
+
+Motion pose evidence now publishes the hinge line in the posed reference's world
+frame while retaining reference-local validation math. A tilted-reference case
+checks the corresponding world-coordinate invariant. Conflicting poses must
+retain explicit incomplete/null interference, rather than relying on an absent
+optional collision list. The focused MCP motion/measurement suite passed all
+150 cases. The obsolete stale-SID message-wording test was removed; native and
+MCP invalid-selector refusal coverage remains.
+
+## 2026-09-11 — sparse damped least-squares mechanism steps
+
+`core/solver/nsolve.cpp` builds large block-sparse Jacobians directly and solves
+the augmented damped least-squares system with sparse QR. This avoids both dense
+normal-matrix multiplication and loss of weak rotation directions from squaring
+the condition number. Rank-deficient QR falls back to the original minimum-norm
+normal solve, not a QR basic solution. Dense oracle cases, damping, step caps,
+residual acceptance and deadlines remain unchanged.
+
+The mixed-scale coordinate regression fails against the preserved pre-fix native
+library (residual 0.0340349) and passes with augmented QR. All 13 numeric cases
+pass, including free-coordinate preservation and equivalent equation grouping;
+the 23 mate cases and two differential corpus cases also passed. Actual rover
+motion/interference acceptance remains separately gated by its native pose proof.
+
+## 2026-09-11 — moving-reference joint derivatives and stable locks
+
+The real ME-490 first driven pose exposed derivatives differing from independent
+central differences by up to 1397. `core/mate/mate.cpp` now differentiates moving
+perpendicular bases, point-to-axis distance, signed-angle reference directions,
+and the full relative rigid transform of a lock. Lock rest placement comes from
+authored frames, never from a perturbed warm-start seed.
+
+Both new behavioral regressions fail on the preserved preceding library: an
+offset locked child drifts 0.911043 mm at zero drive and fails at 20 degrees; a
+concentric slider fails at 15 degrees. All 25 mate cases pass after correction.
+Before/after executable output is retained under
+`ME-490/Engineering/Verification/me490_joint_derivative_probe/`.
+
+## 2026-09-11 — persistent mate datums and advancing rover proof
+
+`core/doc/session.cpp` binds engine-owned component reference frames before
+assembly compilation can write solved placements back. `core/mate/mate.cpp`
+uses those frames for virtual pins, angle references and lock attachments.
+Scalar edits, rebuilding, native save/reopen and private motion snapshots retain
+the same datum. This fixes the actual ME-490 -1.5-degree input-yoke request
+silently becoming -3 degrees on the next compilation despite passing residuals.
+The rotation logarithm also preserves near-pi signed axes; reversed alignment
+remains effective when parallel face normals require a body-frame angle datum.
+
+The damped solver now permits representable cost progress even when a mixed-unit
+step norm is tiny. A high-damping regression fails on the preserved old library;
+the corrected numeric suite passes 14 cases. Current focused validation passes
+26 mate cases, two differential corpus cases, 10 native motion cases and 151 MCP
+motion/measurement cases. Native save/reopen assertions respect canonical
+six-decimal document serialization while rebuilt motion is checked at solver
+precision with a dimensioned offset-lever error bound.
+
+The actual saved rover passes poses 0 and 1, including independent Cardan,
+plunge, pedal and steering transform comparisons, without changing its source.
+Evidence: `ME-490/Engineering/Verification/me490_advancing_pose_probe.json`;
+the preceding doubled-angle failure is retained in the sibling
+`me490_advancing_pose_probe_reference_failed` directory and JSON record.
+This is only initial advancing kinematics; the full sampled interference sweep
+and presentation remain separately gated.
+
+The retained native-library comparison in
+`me490_persistent_reference_regression.json` records 66 failed assertions before
+the binding fix and all 513 passing afterward for the same offset-revolute
+rebuild/save-reopen case. `me490_reference_rotation_regression.json` separately
+records failing-before/passing-after near-pi and reversed-alignment behavior.
+Both comparison executables link their named preserved native libraries under
+isolated library search paths.
+
+The final Linux integration gate passed all enabled stages, including native,
+host and WASM builds, CTest, the MCP suite (3013 passed, 26 skipped, one expected
+failure), the sensor-node golden demo and GUI smoke. The separate native GUI
+motion scenario produced 24 frames, applied frame 12 and exited successfully.
+Gate logs and the GUI evidence are retained under
+`ME-490/Engineering/Verification/me490_reference_final_gate` and
+`me490_motion_gui_smoke`. These program checks do not establish rover clearance.

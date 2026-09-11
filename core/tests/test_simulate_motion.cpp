@@ -27,12 +27,17 @@
 #include <string>
 #include <vector>
 
+#include <BRepAlgoAPI_Cut.hxx>
 #include <BRepPrimAPI_MakeBox.hxx>
+#include <BRepPrimAPI_MakeCylinder.hxx>
+#include <gp_Ax2.hxx>
+#include <gp_Dir.hxx>
 #include <gp_Pnt.hxx>
 
 #include <nlohmann/json.hpp>
 
 #include "doc/formats.h"
+#include "doc/selectors.h"
 #include "doc/session.h"
 
 using json = nlohmann::json;
@@ -347,5 +352,303 @@ TEST_CASE("doc_simulate_motion: bore-less plate is a one-DOF revolute") {
                 CHECK(std::abs(actual[k] - expected[k]) < 1e-9);
         }
     }
+    fs::remove(path);
+}
+
+TEST_CASE("doc_simulate_motion: offset revolute pose survives rebuilds and save reopen") {
+    const auto path = make_box_step("persistent_revolute");
+    const auto saved_path = tmp_path("persistent_revolute.step+");
+    const auto did = doc::doc_new("assembly", "persistent_revolute")
+                         .at("doc_id").get<std::string>();
+    const json authored_pose = {
+        1, 0, 0, 10, 0, 1, 0, 20, 0, 0, 1, 30, 0, 0, 0, 1};
+    doc::doc_apply_ops(did, -1, json::array({
+        {{"op", "asm_insert_component"}, {"source", {{"path", path.string()}}},
+         {"fixed", true}, {"transform", authored_pose}},
+        {{"op", "asm_insert_component"}, {"source", {{"path", path.string()}}},
+         {"fixed", false}, {"transform", authored_pose}}
+    }), false);
+
+    // Both measured normals are parallel to the pin. Their real face normals
+    // cannot measure its rotation: the angle needs the authored body-frame datum.
+    json selector;
+    for (const auto& face : doc::describe_faces(
+             BRepPrimAPI_MakeBox(10.0, 10.0, 10.0).Shape()))
+        if (face.surf == "plane" && std::abs(face.centroid.y() - 10.0) < 1e-9)
+            selector = doc::make_selector(face);
+    REQUIRE_FALSE(selector.is_null());
+    const auto angle_value = [](double degrees) {
+        return json{{"value", degrees}, {"axis", {0, 1, 0}},
+                    {"axis_point", {910, 0, 545}}};
+    };
+    const auto added = doc::doc_apply_ops(did, -1, json::array({
+        {{"op", "asm_add_mate"}, {"mate", {
+            {"type", "angle"}, {"align", "aligned"},
+            {"refs", {{{"component", "k1"}, {"selector", selector}},
+                      {{"component", "k2"}, {"selector", selector}}}},
+            {"value", angle_value(0.0)}
+        }}}
+    }), false);
+    const auto mid = added.at("id_map").at("$0").get<std::string>();
+    const auto expected_pose = [](double degrees) {
+        const double theta = degrees * M_PI / 180;
+        const double c = std::cos(theta), s = std::sin(theta);
+        // The authored pin is first-component local; its WORLD line passes
+        // through (920, 20, 575). Preserve that line across solved placements.
+        return std::array<double, 16>{
+            c, 0, s, 920 - 910*c - 545*s,
+            0, 1, 0, 20,
+            -s, 0, c, 575 + 910*s - 545*c,
+            0, 0, 0, 1};
+    };
+    const auto check_tree_pose = [&](const json& response, double degrees, double rotation_tolerance = 1e-9) {
+        const auto& tree = response.at("tree");
+        REQUIRE(tree.at("components").size() == 2);
+        const auto expected = expected_pose(degrees);
+        for (const auto& component : tree.at("components")) {
+            const auto actual = component.at("transform").get<std::vector<double>>();
+            REQUIRE(actual.size() == 16);
+            for (size_t k = 0; k < 16; ++k) {
+                const double wanted = component.at("id") == "k2" ? expected[k] :
+                    authored_pose.at(k).get<double>();
+                // A 1e-9-radian residual permits ~1e-6 mm at this offset pin.
+                const double tolerance = k == 3 || k == 7 || k == 11 ? 2e-6 : rotation_tolerance;
+                CHECK(std::abs(actual[k] - wanted) < tolerance);
+            }
+        }
+        REQUIRE(tree.at("mates").size() == 1);
+        CHECK(tree.at("mates").front().at("id") == mid);
+        CHECK(tree.at("mates").front().at("value").at("value") == degrees);
+    };
+    const auto check_current_motion = [&](const std::string& id, double degrees) {
+        const json before = doc::doc_tree(id);
+        const auto result = doc::doc_simulate_motion(id, mid, degrees, degrees, 2, false, 0);
+        INFO(result.dump(2));
+        REQUIRE(result.value("ok", false));
+        CHECK(result.at("driver").at("start") == degrees);
+        CHECK(result.at("driver").at("stop") == degrees);
+        REQUIRE(result.at("trajectory").size() == 2);
+        const auto expected = expected_pose(degrees);
+        for (const auto& frame : result.at("trajectory")) {
+            CHECK(frame.at("value") == degrees);
+            CHECK(frame.at("converged").get<bool>());
+            CHECK(frame.at("residual_dof") == 0);
+            REQUIRE(frame.at("bodies").size() == 2);
+            for (const auto& body : frame.at("bodies")) {
+                const auto actual = body.at("transform").get<std::vector<double>>();
+                REQUIRE(actual.size() == 16);
+                for (size_t k = 0; k < 16; ++k) {
+                    // Motion frames expose column-major transforms.
+                    const size_t row_major = (k % 4) * 4 + k / 4;
+                    const double wanted = body.at("component") == "k2" ?
+                        expected[row_major] : authored_pose.at(row_major).get<double>();
+                    const double tolerance = row_major == 3 || row_major == 7 || row_major == 11 ?
+                        2e-6 : 1e-9;
+                    CHECK(std::abs(actual[k] - wanted) < tolerance);
+                }
+            }
+        }
+        const json after = doc::doc_tree(id);
+        CHECK(after.at("revision") == before.at("revision"));
+        CHECK(after.at("tree") == before.at("tree"));
+    };
+
+    check_tree_pose(added, 0.0);
+    for (double degrees : {-1.5, -4.0}) {
+        // The first ME490 input-yoke edit was -1.5 degrees. Recompiling its
+        // solved pose used to silently turn that into -3 despite zero residuals.
+        const auto edited = doc::doc_apply_ops(did, -1, json::array({
+            {{"op", "asm_edit_mate"}, {"id", mid}, {"value", angle_value(degrees)}}
+        }), false);
+        check_tree_pose(edited, degrees);
+        check_tree_pose(doc::doc_rebuild(did), degrees);
+        check_current_motion(did, degrees);
+    }
+    doc::doc_save(did, saved_path.string());
+    const auto reopened = doc::doc_open(saved_path.string());
+    const auto reopened_id = reopened.at("doc_id").get<std::string>();
+    // Canonical document.json rounds coefficients to six decimal places.
+    check_tree_pose(reopened, -4.0, 5.1e-7);
+    check_tree_pose(doc::doc_rebuild(reopened_id), -4.0);
+    check_current_motion(reopened_id, -4.0);
+    fs::remove(saved_path);
+    fs::remove(path);
+}
+
+TEST_CASE("doc_simulate_motion: legacy angle borrows only an unambiguous grounded kingpin") {
+    const auto frame_path = make_box_step("legacy_frame");
+    const auto pin_path = tmp_path("legacy_pin.step");
+    const auto wheel_path = tmp_path("legacy_wheel.step");
+    const TopoDS_Shape pin = BRepPrimAPI_MakeCylinder(1.5, 10).Shape();
+    const TopoDS_Shape blank =
+        BRepPrimAPI_MakeBox(gp_Pnt(10, 20, 0), 30, 20, 10).Shape();
+    const TopoDS_Shape bore = BRepPrimAPI_MakeCylinder(
+        gp_Ax2(gp_Pnt(20, 30, -5), gp_Dir(0, 0, 1)), 2, 20).Shape();
+    const TopoDS_Shape cross_bore = BRepPrimAPI_MakeCylinder(
+        gp_Ax2(gp_Pnt(0, 35, 5), gp_Dir(1, 0, 0)), 2, 60).Shape();
+    const TopoDS_Shape wheel = BRepAlgoAPI_Cut(
+        BRepAlgoAPI_Cut(blank, bore).Shape(), cross_bore).Shape();
+    doc::export_bodies({pin}, pin_path.string(), "step");
+    doc::export_bodies({wheel}, wheel_path.string(), "step");
+    json pin_axis, wheel_axis, second_axis, wheel_face;
+    for (const auto& face : doc::describe_faces(pin))
+        if (face.surf == "cylinder") pin_axis = doc::make_selector(face);
+    for (const auto& face : doc::describe_faces(wheel)) {
+        if (face.surf == "cylinder" && face.axis && std::abs(face.axis->z()) > 0.9)
+            wheel_axis = doc::make_selector(face);
+        if (face.surf == "cylinder" && face.axis && std::abs(face.axis->x()) > 0.9)
+            second_axis = doc::make_selector(face);
+        if (face.surf == "plane" && std::abs(face.centroid.x() - 40) < 1e-6)
+            wheel_face = doc::make_selector(face);
+    }
+    REQUIRE_FALSE(pin_axis.is_null());
+    REQUIRE_FALSE(wheel_axis.is_null());
+    REQUIRE_FALSE(second_axis.is_null());
+    REQUIRE_FALSE(wheel_face.is_null());
+    const auto did = doc::doc_new("assembly", "legacy_kingpin").at("doc_id").get<std::string>();
+    // Distinct translated/rotated frames: the pin is world +Y, which is +X in
+    // the angle mate's fixed reference and +Z in the driven plate.
+    const json frame_pose = {0, -1, 0, 100, 1, 0, 0, 200, 0, 0, 1, 300, 0, 0, 0, 1};
+    const json pin_pose = {1, 0, 0, 70, 0, 0, 1, 60, 0, -1, 0, 40, 0, 0, 0, 1};
+    const json wheel_pose = {1, 0, 0, 50, 0, 0, 1, 60, 0, -1, 0, 70, 0, 0, 0, 1};
+    doc::doc_apply_ops(did, -1, json::array({
+        {{"op", "asm_insert_component"}, {"source", {{"path", frame_path.string()}}},
+         {"fixed", true}, {"transform", frame_pose}},
+        {{"op", "asm_insert_component"}, {"source", {{"path", pin_path.string()}}},
+         {"fixed", true}, {"transform", pin_pose}},
+        {{"op", "asm_insert_component"}, {"source", {{"path", wheel_path.string()}}},
+         {"fixed", false}, {"transform", wheel_pose}}
+    }), false);
+    const auto added = doc::doc_apply_ops(did, -1, json::array({
+        {{"op", "asm_add_mate"}, {"mate", {
+            {"type", "concentric"}, {"align", "aligned"},
+            {"refs", {{{"component", "k2"}, {"selector", pin_axis}},
+                      {{"component", "k3"}, {"selector", wheel_axis}}}}
+        }}},
+        {{"op", "asm_add_mate"}, {"mate", {
+            {"type", "angle"}, {"align", "aligned"}, {"value", {{"value", 0}}},
+            {"refs", {{{"component", "k1"},
+                       {"selector", {{"kind", "face"}, {"centroid", {5, 0, 5}}}}},
+                      {{"component", "k3"}, {"selector", wheel_face}}}}
+        }}}
+    }), false);
+    const auto mid = added.at("id_map").at("$1").get<std::string>();
+    bool expect_motion = true;
+    SUBCASE("fixed pin supplies the measured line") {}
+    SUBCASE("a floating pin is not the fixed angle reference") {
+        doc::doc_apply_ops(did, -1, json::array({
+            {{"op", "asm_edit_component"}, {"id", "k2"}, {"fixed", false}}
+        }), false);
+        expect_motion = false;
+    }
+    SUBCASE("two different grounded joint axes are ambiguous") {
+        // A second fixed pin lies on the plate's transverse bore. Both concentric
+        // mates hold at the initial pose, but neither is a unique rotation axis.
+        doc::doc_apply_ops(did, -1, json::array({
+            {{"op", "asm_insert_component"}, {"source", {{"path", pin_path.string()}}},
+             {"fixed", true},
+             {"transform", {0, 0, 1, 70, 1, 0, 0, 65, 0, 1, 0, 35, 0, 0, 0, 1}}},
+            {{"op", "asm_add_mate"}, {"mate", {
+                {"type", "concentric"}, {"align", "aligned"},
+                {"refs", {{{"component", "k4"}, {"selector", pin_axis}},
+                          {{"component", "k3"}, {"selector", second_axis}}}}
+            }}}
+        }), false);
+        expect_motion = false;
+    }
+    const json before = doc::doc_tree(did);
+    const auto result = doc::doc_simulate_motion(did, mid, -30, 30, 3, false, 0);
+    INFO(result.dump(2));
+    CHECK(result.value("ok", false) == expect_motion);
+    if (expect_motion) {
+        REQUIRE(result.at("trajectory").size() == 3);
+        for (const auto& sample : result.at("trajectory")) {
+            const double theta = sample.at("value").get<double>() * M_PI / 180;
+            const double c = std::cos(theta), s = std::sin(theta);
+            // World rotation about x=70,z=40, composed with the original plate pose.
+            const std::vector<double> expected = {
+                c, 0, -s, 0, -s, 0, -c, 0, 0, 1, 0, 0,
+                70 - 20*c + 30*s, 60, 40 + 20*s + 30*c, 1};
+            for (const auto& body : sample.at("bodies")) {
+                const auto actual = body.at("transform").get<std::vector<double>>();
+                const auto& source = body.at("component") == "k1" ? frame_pose : pin_pose;
+                for (size_t k = 0; k < 16; ++k) {
+                    const double wanted = body.at("component") == "k3" ? expected[k] :
+                        source.at((k % 4) * 4 + k / 4).get<double>();
+                    CHECK(actual[k] == doctest::Approx(wanted).epsilon(1e-7));
+                }
+            }
+        }
+    } else {
+        CHECK(result.at("reason") == "driver_axis_line_unresolved");
+        CHECK(result.at("trajectory").empty());
+    }
+    const json after = doc::doc_tree(did);
+    CHECK(after.at("revision") == before.at("revision"));
+    CHECK(after.at("tree") == before.at("tree"));
+    fs::remove(frame_path);
+    fs::remove(pin_path);
+    fs::remove(wheel_path);
+}
+
+TEST_CASE("doc_simulate_motion: classification keeps overlap and exact unsafe clearance") {
+    const auto path = make_box_step("classification");
+    const auto did = doc::doc_new("assembly", "motion_classification").at("doc_id").get<std::string>();
+    doc::doc_apply_ops(did, -1, json::array({
+        {{"op", "asm_insert_component"}, {"source", {{"path", path.string()}}}, {"fixed", true}},
+        {{"op", "asm_insert_component"}, {"source", {{"path", path.string()}}}, {"fixed", false},
+         {"transform", {1, 0, 0, 12, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1}}},
+        {{"op", "asm_insert_component"}, {"source", {{"path", path.string()}}}, {"fixed", true},
+         {"transform", {1, 0, 0, 0, 0, 1, 0, 1000, 0, 0, 1, 0, 0, 0, 0, 1}}}
+    }), false);
+    const json selector = {{"kind", "face"}, {"centroid", {10, 5, 5}}};
+    const auto added = doc::doc_apply_ops(did, -1, json::array({
+        {{"op", "asm_add_mate"}, {"mate", {
+            {"type", "distance"}, {"align", "aligned"}, {"value", {{"value", 12}}},
+            {"refs", {{{"component", "k1"}, {"selector", selector}},
+                      {{"component", "k2"}, {"selector", selector}}}}
+        }}}
+    }), false);
+    const auto mid = added.at("id_map").at("$0").get<std::string>();
+    const json before = doc::doc_tree(did);
+    const auto overlap = doc::doc_simulate_motion(did, mid, 0, 15, 4, true, 0);
+    INFO(overlap.dump(2));
+    REQUIRE(overlap.at("ok").get<bool>());
+    for (const auto& frame : overlap.at("trajectory")) {
+        const double value = frame.at("value").get<double>();
+        CHECK(frame.at("interference_complete").get<bool>());
+        CHECK(frame.at("pairs_checked") == 3);
+        CHECK(frame.at("interference").get<bool>() == (value < 10));
+        if (value < 10) {
+            REQUIRE(frame.at("collision_detail").size() == 1);
+            const auto& pair = frame.at("collision_detail").front();
+            CHECK(pair.at("component_a") == "k1");
+            CHECK(pair.at("component_b") == "k2");
+            CHECK(pair.at("overlap_volume_mm3").get<double>() ==
+                  doctest::Approx((10 - value) * 100));
+        }
+    }
+    const auto clearance = doc::doc_simulate_motion(did, mid, 12, 14, 3, true, 3);
+    INFO(clearance.dump(2));
+    REQUIRE(clearance.at("ok").get<bool>());
+    const auto& unsafe = clearance.at("trajectory").front().at("collision_detail");
+    REQUIRE(unsafe.size() == 1);
+    CHECK(unsafe.front().at("component_a") == "k1");
+    CHECK(unsafe.front().at("component_b") == "k2");
+    CHECK(unsafe.front().at("distance").get<double>() == doctest::Approx(2));
+    CHECK(clearance.at("trajectory").back().at("collision_detail").empty());
+    CHECK(clearance.at("interference").at("complete").get<bool>());
+    // Single Evaluate still measures ALL three gaps, including the distant part.
+    const auto exact = doc::doc_eval_interference(did, json::object());
+    REQUIRE(exact.at("complete").get<bool>());
+    REQUIRE(exact.at("clearances").size() == 3);
+    for (const auto& pair : exact.at("clearances")) {
+        CHECK(pair.at("distance").is_number());
+        CHECK_FALSE(pair.contains("distance_lower_bound_mm"));
+        CHECK_FALSE(pair.value("approx", false));
+    }
+    const auto after = doc::doc_tree(did);
+    CHECK(after.at("revision") == before.at("revision"));
+    CHECK(after.at("tree") == before.at("tree"));
     fs::remove(path);
 }

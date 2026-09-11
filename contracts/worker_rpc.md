@@ -1594,6 +1594,18 @@ are refused. Counts distinguish possible, candidate, completed and failed checks
 The MCP `inspect_model_integrity` tool preserves this evidence and does not mark
 placement or structural requirements verified.
 
+Repeated native queries may reuse the immediately preceding complete query's
+valid-solid metrics and complete distance/Common evidence. Reuse requires the
+same retained immutable BRep topology, orientation and exactly equal absolute
+world placement; it never uses rounded transforms, bounds or user IDs as geometry
+identity. Source/assembly completeness, provenance, current IDs, broadphase,
+proximity graph and nearest reporting are rebuilt for each query. Failed or
+incomplete queries cannot publish reusable evidence. Session-owned entry caps
+disable reuse, not coverage. `summary.computed_exact_pairs` plus
+`summary.reused_exact_pairs` equals `summary.exact_pairs`;
+`summary.reused_solids` reports metric reuse. These are measured-query accounting,
+not evidence that motion between samples or intended joint contact was checked.
+
 Headless `doc_render_view` accepts image dimensions up to 4096 pixels per axis,
 retaining the 64-pixel lower bound and existing defaults. Animation renders can
 therefore supersample 1080p CAD frames before downsampling and adding readable
@@ -1603,3 +1615,109 @@ separate display modes. Animation camera framing is fixed across the pose
 envelope, and GIF output-rate reduction resamples the source timeline rather
 than changing its duration. A first-collision-only result is not evidence of
 collision at every subsequent pose.
+
+## Synchronized native Motion drivers and complete collision evidence (2026-09-10)
+
+`simulate_motion` appends an optional `drivers` input:
+`[{mate_id:string, start:number, stop:number}, ...]`. A non-null list is authoritative
+over legacy `mate_id/start/stop` and must be nonempty. Every row requires a unique,
+nonempty ID of an existing, active angle or distance mate and finite numeric bounds.
+Angle bounds are degrees; distance bounds are mm. Boolean bounds, omitted row bounds,
+duplicate IDs, suppressed mates and nondimensional mates refuse; native setup refusals
+use `invalid_op`. Absent/null `drivers` preserves the single-driver protocol and MCP's
+existing single-mate auto-selection/current-start behavior.
+
+The existing native engine solves all requested dimensions on one immutable snapshot,
+at the same `steps` inclusive sample fractions. It resolves carried reference frames:
+the axis of a wheel-roll joint follows its steered carrier rather than remaining fixed
+in world coordinates. Driver declaration order is not kinematic dependency order.
+The GUI Motion tab and MCP adapter consume this engine; neither introduces another
+kinematic solver or mutates the live assembly to animate it.
+
+Results append `drivers:[{mate_id,type,unit,start,stop,steps}]` in request order and
+`trajectory[].driver_values:{mate_id:number,...}` for every sampled driver. Existing
+`mate_id`, `driver` and `trajectory[].value` retain the first driver's meaning.
+Every native trajectory body `transform` remains column-major; MCP transposes each
+returned body matrix to its established row-major representation. The already-row-major
+`reference_transforms` are not transposed. MCP `loop:true` appends a deep copy of frame
+zero with only the playback index changed, preserving all driver values, body poses,
+pose checks and collision outcomes. This is not another computed sample, does not
+increase `interference.frames_checked`, and is outside the dynamics timeline.
+
+The `interference` block appends:
+
+- `complete:bool`: whether every requested sample and required geometry/pair check
+  completed. Disabled checks, unresolved poses, unavailable geometry or failed pair
+  evaluations never establish a clear sweep.
+- `frames_checked:int`: fully checked, valid computed samples; excludes loop playback.
+- `pair_failures:[{i,a,b,component_a,component_b,reason}]`: failed evaluations with
+  their sample index, display names and stable component IDs.
+- `geometry_failures:[{component,reason}]`: component geometry that could not be
+  obtained. An initial unresolved assembly returns `ok:false`,
+  `reason:"driver_initial_pose_unresolved"`, no trajectory, `complete:false` and
+  `frames_checked:0`, retaining these failures.
+
+Each sampled frame adds `interference_complete:bool`. Its `interference` is null when
+unchecked or incomplete, never a false no-collision result. `collisions` retains known
+hits even when other checks fail; pair details carry stable `component_a/component_b`
+IDs alongside names and the measured volume/distance or clearance warning. Legacy
+`first_collision_step`, `first_collision_value` and `detail` still identify the first
+known offending sample, not every later sample. `ok`/convergence alone, an empty
+collision list, or a null first-collision index is not clearance evidence.
+
+A sampled-clearance claim requires successful poses, `complete:true`, all requested
+computed samples counted in `frames_checked`, and no reported collisions. Incomplete
+checks must be presented as incomplete/failed, preserving any known hits and reasons.
+Even a complete sampled sweep is not a continuous-time collision guarantee, a strength
+analysis, or fabrication approval.
+
+## Body-owned measurement and explicit analysis scope (2026-09-10)
+
+`eval_measure` retains its 1–8 ordered references and existing single/pair/chain
+result fields. A picked reference is `{body_id, selector}`: `body_id` is the actual
+AICM body identity, not an assembly component index, and `selector` is local to
+that body's source geometry. Assembly placement is applied exactly once before
+world-space distances, angles, anchors and annotation readbacks are computed.
+An envelope without a valid live body ID refuses instead of using the last body.
+Unwrapped queries/readbacks remain world-space; without `body_id` they search the
+whole document. Ambiguous queries must be narrowed explicitly, and stale exact
+selectors or unsupported query keys refuse rather than choosing an unrelated face.
+`resolved_refs` appends the corresponding world-space selectors in input order.
+
+`eval_interference` additionally exposes `complete`, `pairs_checked`, `pairs_total`,
+`geometry_failures` and `pair_failures`. Known overlaps remain available when other
+checks fail; incomplete evidence is not clearance. One selected member can produce
+a valid zero-pair result, but this is not a verified clear pair. GUI member filters
+retain their full unfiltered inventory so unchecked members remain selectable.
+
+`eval_section_props` evaluates all world-placed document solids, with additive
+material area and moments; independent bodies are not Boolean-unioned. It retains
+`area_mm2`, global `centroid`, and plane-local centroidal `Ixx/Iyy/Ixy`. Holes are
+classified within each solid before aggregation. A genuine empty intersection
+returns zero fields; failed section construction/integration raises `section_failed`
+instead of reporting partial or empty success.
+
+## Moving-reference mate invariants (2026-09-11)
+
+Lock mates preserve the relative authored component placement, independently of
+the nonlinear solver's warm-start seed. A failed or perturbed seed does not
+redefine the attachment. Their derivatives include the rotational motion of
+offset attachment origins and the relative rotation error.
+
+Concentric/hinge projection equations and point-to-axis distances differentiate
+their moving reference directions as well as the measured points. Signed-angle
+derivatives include the moving measurement axis. Solver convergence continues
+to require the original residual tolerance; these corrections do not establish
+interference clearance or physical joint suitability.
+
+Native mate-derived datums additionally use the persisted `reference_frames`
+document field rather than the current, potentially already solved placements.
+An exact-current-value motion request therefore does not apply the current
+rotation twice. The current reference body's world transform still transports
+the reported hinge line. A nearly axis-aligned line has no exact global-coordinate
+invariant; it remains subject to full line and pose validation.
+
+Near-half-turn rotation log/exp preserves the signed off-axis direction and uses
+the antisymmetric sine with `atan2`, avoiding trace-only precision loss near pi.
+These changes retain residual tolerances and do not turn sampled kinematics into
+interference or continuous-clearance evidence.

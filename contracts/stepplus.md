@@ -43,9 +43,21 @@ Readers validate `cache.json`'s `engine` (engine+cache-schema key) + `doc_hash` 
 canonical `document.json`, volatile `id` stripped) + `solved: true` and treat ANY mismatch
 or parse error as a cache miss (full rebuild). Writers that don't understand these entries
 just preserve them (rule §3.1) or drop them — both are safe.
+The native engine key includes a geometry/topology semantic epoch as well as the
+OCCT version. Changes to compiled geometry or selectable topology must invalidate
+that epoch even when the source document and OCCT version are unchanged. An older
+epoch is a cache miss, never a reason to relax native selector resolution.
 
 | entry | doc kind | contents |
 |---|---|---|
 | `cache.json` | part + asm | header `{engine, doc_hash, solved: true, response}`; for assemblies also `components`: fingerprints `[{path, size, mtime}]` of every non-suppressed component's resolved source file — reopen replays the cache only if ALL still match |
 | `cache.aicm` | part + asm | the saved tessellation (AICM blob), STORED uncompressed |
 | `cache.brep` | part | compiled bodies as `"AICBREP1"` magic · u64 count · per-body u64 length + BinTools stream (**no triangulation** — BinTools-restored triangulation triggers runaway BRepMesh refinement on NURBS faces, OCCT 7.9); lets an assembly load this part as a component without re-running `compile_document` |
+
+Optional `.step+` mesh caches are admitted only after source and unknown entries.
+STORED `cache.aicm` blobs may use the remaining 256 MiB aggregate archive budget;
+compressed mesh caches retain the 64 MiB per-entry and compression-ratio caps.
+A cache that does not fit is skipped before allocation/decompression, and writers
+omit mesh caches that exceed the budget left by all other payloads. Entry-count,
+per-entry, aggregate-expansion and compression-ratio limits remain unchanged for
+source documents and unknown entries; caches cannot crowd out that data.

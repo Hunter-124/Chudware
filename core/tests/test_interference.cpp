@@ -419,6 +419,170 @@ TEST_CASE("model integrity: touching and positive volume overlap remain distinct
     CHECK(overlap["pairs"][0]["overlap_volume_mm3"].get<double>() == doctest::Approx(500.0));
 }
 
+TEST_CASE("model integrity: reused assembly evidence follows a moved component and current owners") {
+    const std::string did = doc_new("assembly", "IntegrityMovedEvidence").at("doc_id");
+    IntegrityFixtureFile fixture{
+        std::filesystem::temp_directory_path() / ("integrity_moved_" + did + ".step")};
+    chudware::doc::export_bodies(
+        {BRepPrimAPI_MakeBox(10, 10, 10).Shape()}, fixture.path.string(), "step");
+    json ops = json::array();
+    for (double x : {0.0, 5.0, 20.0})
+        ops.push_back({{"op", "asm_insert_component"}, {"fixed", true},
+            {"source", {{"path", fixture.path.string()}}},
+            {"transform", {1,0,0,x, 0,1,0,0, 0,0,1,0, 0,0,0,1}}});
+    const json built = doc_apply_ops(did, -1, ops, false);
+    const std::string first = built.at("id_map").at("$0");
+    const std::string moving = built.at("id_map").at("$1");
+    const std::string last = built.at("id_map").at("$2");
+    const json params{{"proximity_mm", 1.0}, {"include_nearest", true}};
+    const json cold = doc_eval_model_integrity(did, params);
+    REQUIRE_MESSAGE(cold["complete"] == true, cold.dump());
+    const json warm = doc_eval_model_integrity(did, params);
+    REQUIRE_MESSAGE(warm["complete"] == true, warm.dump());
+    REQUIRE(warm["summary"]["reused_exact_pairs"].get<int>() > 0);
+    CHECK(warm["pairs"] == cold["pairs"]);
+    REQUIRE(warm["pairs"].size() == 1);
+    CHECK(warm["pairs"][0]["overlap_volume_mm3"].get<double>() == doctest::Approx(500.0));
+
+    doc_apply_ops(did, -1, json::array({
+        {{"op", "asm_edit_component"}, {"id", moving},
+         {"transform", {1,0,0,15, 0,1,0,0, 0,0,1,0, 0,0,0,1}}}
+    }), false);
+    const json moved = doc_eval_model_integrity(did, params);
+    REQUIRE_MESSAGE(moved["complete"] == true, moved.dump());
+    REQUIRE(moved["solids"].size() == 3);
+    std::string first_solid, moving_solid, last_solid;
+    for (const json& solid : moved["solids"]) {
+        CHECK(solid["source_path"] == fixture.path.string());
+        CHECK(solid["volume_mm3"].get<double>() == doctest::Approx(1000.0));
+        if (solid["component_id"] == first) {
+            first_solid = solid["id"];
+            CHECK(solid["centroid_mm"][0].get<double>() == doctest::Approx(5.0));
+        } else if (solid["component_id"] == moving) {
+            moving_solid = solid["id"];
+            CHECK(solid["centroid_mm"][0].get<double>() == doctest::Approx(20.0));
+        } else {
+            CHECK(solid["component_id"] == last);
+            last_solid = solid["id"];
+            CHECK(solid["centroid_mm"][0].get<double>() == doctest::Approx(25.0));
+        }
+    }
+    REQUIRE(!first_solid.empty());
+    REQUIRE(!moving_solid.empty());
+    REQUIRE(!last_solid.empty());
+    REQUIRE(moved["pairs"].size() == 1);
+    const json& pair = moved["pairs"][0];
+    CHECK((std::set<std::string>{pair["a"], pair["b"]} ==
+           std::set<std::string>{moving_solid, last_solid}));
+    CHECK(pair["relation"] == "overlap");
+    CHECK(pair["overlap_volume_mm3"].get<double>() == doctest::Approx(500.0));
+    CHECK(moved["isolated_solids"] == json::array({first_solid}));
+    REQUIRE(moved["nearest"].size() == 1);
+    CHECK(moved["nearest"][0]["solid_id"] == first_solid);
+    CHECK(moved["nearest"][0]["nearest_id"] == moving_solid);
+    CHECK(moved["nearest"][0]["status"] == "exact");
+    CHECK(moved["nearest"][0]["distance_mm"].get<double>() == doctest::Approx(5.0));
+}
+
+TEST_CASE("model integrity: replacing source geometry invalidates cached volume and distance") {
+    const std::string did = doc_new("assembly", "IntegrityChangedSource").at("doc_id");
+    IntegrityFixtureFile original{
+        std::filesystem::temp_directory_path() / ("integrity_original_" + did + ".step")};
+    IntegrityFixtureFile replacement{
+        std::filesystem::temp_directory_path() / ("integrity_replacement_" + did + ".step")};
+    chudware::doc::export_bodies(
+        {BRepPrimAPI_MakeBox(10, 10, 10).Shape()}, original.path.string(), "step");
+    chudware::doc::export_bodies(
+        {BRepPrimAPI_MakeBox(4, 10, 10).Shape()}, replacement.path.string(), "step");
+    const json built = doc_apply_ops(did, -1, json::array({
+        {{"op", "asm_insert_component"}, {"fixed", true},
+         {"source", {{"path", original.path.string()}}}},
+        {{"op", "asm_insert_component"}, {"fixed", true},
+         {"source", {{"path", original.path.string()}}},
+         {"transform", {1,0,0,8, 0,1,0,0, 0,0,1,0, 0,0,0,1}}}
+    }), false);
+    const std::string changed = built.at("id_map").at("$0");
+    const json params{{"proximity_mm", 5.0}, {"include_nearest", false}};
+    const json cold = doc_eval_model_integrity(did, params);
+    REQUIRE_MESSAGE(cold["complete"] == true, cold.dump());
+    const json warm = doc_eval_model_integrity(did, params);
+    REQUIRE_MESSAGE(warm["complete"] == true, warm.dump());
+    REQUIRE(warm["summary"]["reused_exact_pairs"].get<int>() > 0);
+    REQUIRE(warm["pairs"].size() == 1);
+    CHECK(warm["pairs"][0]["overlap_volume_mm3"].get<double>() == doctest::Approx(200.0));
+
+    doc_apply_ops(did, -1, json::array({
+        {{"op", "asm_edit_component"}, {"id", changed},
+         {"source", {{"path", replacement.path.string()}}}}
+    }), false);
+    const json updated = doc_eval_model_integrity(did, params);
+    REQUIRE_MESSAGE(updated["complete"] == true, updated.dump());
+    REQUIRE(updated["solids"].size() == 2);
+    bool found = false;
+    for (const json& solid : updated["solids"]) {
+        if (solid["component_id"] != changed) continue;
+        found = true;
+        CHECK(solid["source_path"] == replacement.path.string());
+        CHECK(solid["volume_mm3"].get<double>() == doctest::Approx(400.0));
+        CHECK(solid["centroid_mm"][0].get<double>() == doctest::Approx(2.0));
+    }
+    REQUIRE(found);
+    REQUIRE(updated["pairs"].size() == 1);
+    CHECK(updated["pairs"][0]["relation"] == "proximity");
+    CHECK(updated["pairs"][0]["distance_mm"].get<double>() == doctest::Approx(4.0));
+    CHECK(updated["pairs"][0]["overlap_volume_mm3"].get<double>() == doctest::Approx(0.0));
+}
+
+TEST_CASE("model integrity: nearest-only evidence cannot replace Common or retain a prior graph") {
+    Built b = build("IntegrityEvidencePromotion", json::array({
+        box("A", 10, 10, 10, {0, 0, 0}, {{"merge", false}}),
+        box("B", 10, 10, 10, {10.02, 0, 0}, {{"merge", false}}),
+    }));
+    const json distance_only = doc_eval_model_integrity(
+        b.id, {{"proximity_mm", 0.01}, {"include_nearest", true}});
+    REQUIRE_MESSAGE(distance_only["complete"] == true, distance_only.dump());
+    REQUIRE(distance_only["summary"]["candidate_pairs"] == 0);
+    REQUIRE(distance_only["nearest"].size() == 2);
+    for (const json& nearest : distance_only["nearest"]) {
+        CHECK(nearest["status"] == "exact");
+        CHECK(nearest["distance_mm"].get<double>() == doctest::Approx(0.02));
+    }
+    const json params{{"proximity_mm", 0.05}, {"include_nearest", false}};
+    const json full = doc_eval_model_integrity(b.id, params);
+    REQUIRE_MESSAGE(full["complete"] == true, full.dump());
+    // A successful distance-only result is not successful Common evidence.
+    CHECK(full["summary"]["computed_exact_pairs"] == 1);
+    CHECK(full["summary"]["reused_exact_pairs"] == 0);
+    REQUIRE(full["pairs"].size() == 1);
+    CHECK(full["pairs"][0]["relation"] == "proximity");
+    CHECK(full["pairs"][0]["distance_mm"].get<double>() == doctest::Approx(0.02));
+    CHECK(full["pairs"][0]["overlap_volume_mm3"].get<double>() == doctest::Approx(0.0));
+    CHECK(full["islands"].size() == 1);
+    CHECK(full["nearest"].empty());
+    const json warm = doc_eval_model_integrity(b.id, params);
+    REQUIRE_MESSAGE(warm["complete"] == true, warm.dump());
+    REQUIRE(warm["summary"]["reused_exact_pairs"] == 1);
+    CHECK(warm["pairs"] == full["pairs"]);
+
+    const json disconnected = doc_eval_model_integrity(
+        b.id, {{"proximity_mm", 0.01}, {"include_nearest", false}});
+    REQUIRE_MESSAGE(disconnected["complete"] == true, disconnected.dump());
+    CHECK(disconnected["pairs"].empty());
+    CHECK(disconnected["islands"].size() == 2);
+    CHECK(disconnected["isolated_solids"].size() == 2);
+    CHECK(disconnected["nearest"].empty());
+    const json nearest_again = doc_eval_model_integrity(
+        b.id, {{"proximity_mm", 0.01}, {"include_nearest", true}});
+    REQUIRE_MESSAGE(nearest_again["complete"] == true, nearest_again.dump());
+    CHECK(nearest_again["pairs"].empty());
+    CHECK(nearest_again["islands"].size() == 2);
+    REQUIRE(nearest_again["nearest"].size() == 2);
+    for (const json& nearest : nearest_again["nearest"]) {
+        CHECK(nearest["status"] == "exact");
+        CHECK(nearest["distance_mm"].get<double>() == doctest::Approx(0.02));
+    }
+}
+
 TEST_CASE("model integrity: canceled pair work is unknown, never a clean minimum") {
     Built b = build("IntegrityTimeout", json::array({
         box("A", 10, 10, 10, {0, 0, 0}, {{"merge", false}}),
@@ -440,6 +604,12 @@ TEST_CASE("model integrity: canceled pair work is unknown, never a clean minimum
         CHECK(nearest["distance_mm"].is_null());
         CHECK(nearest["nearest_id"].is_null());
     }
+    const json retried = doc_eval_model_integrity(b.id, {{"pair_budget_s", 30.0}});
+    REQUIRE_MESSAGE(retried["complete"] == true, retried.dump());
+    CHECK(retried["pair_failures"].empty());
+    REQUIRE(retried["pairs"].size() == 1);
+    CHECK(retried["pairs"][0]["relation"] == "overlap");
+    CHECK(retried["pairs"][0]["overlap_volume_mm3"].get<double>() == doctest::Approx(500.0));
 }
 
 TEST_CASE("model integrity: empty refusal and single solid census do not claim connectivity") {

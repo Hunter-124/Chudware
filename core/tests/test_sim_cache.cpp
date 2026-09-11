@@ -26,6 +26,7 @@
 #include <miniz.h>
 
 #include "environment_test_support.h"
+#include "doc/session.h"
 #include "doc/stepplus.h"
 #include "sim/fea_run.h"
 #include "sim/flow_run.h"
@@ -169,12 +170,13 @@ fs::path tmp_path(const std::string& name) {
 
 }  // namespace
 void write_zip(const fs::path& path,
-               const std::vector<std::pair<std::string, std::string>>& entries) {
+               const std::vector<std::pair<std::string, std::string>>& entries,
+               mz_uint compression = MZ_DEFAULT_COMPRESSION) {
     mz_zip_archive zip{};
     REQUIRE(mz_zip_writer_init_file(&zip, path.string().c_str(), 0));
     for (const auto& [name, data] : entries) {
         REQUIRE(mz_zip_writer_add_mem(&zip, name.c_str(), data.data(), data.size(),
-                                      MZ_DEFAULT_COMPRESSION));
+                                      compression));
     }
     REQUIRE(mz_zip_writer_finalize_archive(&zip));
     REQUIRE(mz_zip_writer_end(&zip));
@@ -184,8 +186,9 @@ void check_stepplus_limit(const fs::path& path, const std::string& expected) {
     try {
         (void)chudware::doc::stepplus_open(path.string());
         FAIL("malicious archive was accepted");
-    } catch (const std::exception& e) {
-        CHECK(std::string(e.what()).find(expected) != std::string::npos);
+    } catch (const chudware::doc::OpError& e) {
+        CHECK(e.code == "io_error");
+        CHECK(e.detail.at("limit") == expected);
     }
     std::error_code ec;
     fs::remove(path, ec);
@@ -584,6 +587,72 @@ TEST_CASE("stepplus rejects excessive aggregate expansion before extraction") {
     }
     write_zip(path, entries);
     check_stepplus_limit(path, "aggregate expanded byte limit");
+}
+
+TEST_CASE("stepplus reopens editable data without an oversized optional mesh cache") {
+    const fs::path path = tmp_path("oversized_mesh_cache.step+");
+    const json doc = {{"schema", "aicad.part/1"}, {"name", "Retained model"},
+                      {"features", json::array({{{"id", "f1"}, {"type", "box"},
+                                                {"params", {{"length", 10}}}}})}};
+    const std::string large(64ull * 1024ull * 1024ull + 1, 'A');
+    const std::string future = "future-format user data";
+    SUBCASE("legacy reader skips the payload without inflating it") {
+        write_zip(path, {{"meta.json", R"({"container":"aicad.step+/1"})"},
+                         {"document.json", doc.dump()}, {"cache.aicm", large},
+                         {"future.bin", future}});
+    }
+    SUBCASE("writer omits an inadmissible display cache") {
+        chudware::doc::stepplus_save(doc, path.string(),
+            {{"cache.aicm", std::string(256ull * 1024ull * 1024ull + 1, 'A')}, {"future.bin", future}});
+    }
+    const auto loaded = chudware::doc::stepplus_open(path.string());
+    CHECK(loaded.doc == doc);
+    CHECK(loaded.extra.at("future.bin") == future);
+    CHECK(loaded.extra.count("cache.aicm") == 0);
+    std::error_code ec;
+    fs::remove(path, ec);
+}
+
+TEST_CASE("stepplus retains large STORED mesh caches within the archive budget") {
+    const fs::path path = tmp_path("large_stored_mesh_cache.step+");
+    const json doc = {{"schema", "aicad.part/1"}, {"name", "Cached model"}};
+    std::map<std::string, std::string> extra;
+    extra.emplace("cache.aicm", std::string(64ull * 1024ull * 1024ull + 1, 'A'));
+    chudware::doc::stepplus_save(doc, path.string(), extra);
+    const auto loaded = chudware::doc::stepplus_open(path.string());
+    CHECK(loaded.doc == doc);
+    CHECK(loaded.extra.at("cache.aicm") == extra.at("cache.aicm"));
+    std::error_code ec;
+    fs::remove(path, ec);
+}
+
+TEST_CASE("stepplus reserves archive capacity for user data before optional meshes") {
+    const fs::path path = tmp_path("mesh_budget_priority.step+");
+    const json doc = {{"schema", "aicad.part/1"}, {"name", "User data wins"}};
+    std::vector<std::pair<std::string, std::string>> entries{
+        {"meta.json", R"({"container":"aicad.step+/1"})"}, {"document.json", doc.dump()}};
+    for (int i = 0; i < 4; ++i)
+        entries.emplace_back("future/" + std::to_string(i),
+                             std::string(48ull * 1024ull * 1024ull, static_cast<char>('a' + i)));
+    entries.emplace_back("cache.aicm", std::string(64ull * 1024ull * 1024ull, 'm'));
+    write_zip(path, entries, MZ_NO_COMPRESSION);
+    const auto loaded = chudware::doc::stepplus_open(path.string());
+    CHECK(loaded.doc == doc);
+    CHECK(loaded.extra.count("cache.aicm") == 0);
+    for (int i = 0; i < 4; ++i)
+        CHECK(loaded.extra.at("future/" + std::to_string(i)) == entries[i + 2].second);
+    std::error_code ec;
+    fs::remove(path, ec);
+}
+
+TEST_CASE("stepplus mesh-cache exception does not admit oversized source or unknown data") {
+    const fs::path path = tmp_path("oversized_required_entry.step+");
+    const std::string large(64ull * 1024ull * 1024ull + 1, 'A');
+    std::string entry;
+    SUBCASE("source document") { entry = "document.json"; }
+    SUBCASE("unknown user entry") { entry = "future.bin"; }
+    write_zip(path, {{"meta.json", R"({"container":"aicad.step+/1"})"}, {entry, large}});
+    check_stepplus_limit(path, "per-entry expanded byte limit");
 }
 
 TEST_CASE("sim_cache: hash is stable and kind-scoped") {

@@ -3,6 +3,7 @@
 // tree) and C17 (PropertyManager) subscribe to. Each entry carries a `pending_resolve` slot for
 // the typed selector the worker returns from doc_resolve_pick (filled in C16) — left empty here.
 #pragma once
+#include <cstdint>
 
 #include <functional>
 #include <string>
@@ -17,6 +18,8 @@ struct SelItem {
     render::PickHit hit;
     bool pending_resolve = true;  // true until doc_resolve_pick fills `selector`
     std::string selector;         // JSON selector ref (empty until resolved by C16)
+    std::string resolution_error; // terminal pick failure; empty on successful resolution
+    uint64_t resolve_request = 0; // nonzero while this exact pick has an async request queued
 };
 
 class Selection {

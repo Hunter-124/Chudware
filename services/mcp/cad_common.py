@@ -4473,8 +4473,8 @@ def _measure_match(doc_id: str, match: dict) -> dict:
     try:
         m = cb.call("eval_measure", {"doc_id": doc_id, "refs": [match]})
         out["measure"] = m
-    except Exception:  # noqa: BLE001
-        pass
+    except Exception as e:  # noqa: BLE001
+        out["measure_error"] = str(e)
     return out
 
 
@@ -6149,38 +6149,33 @@ def resolve_readback_selector(doc_id: str, target: Any) -> Optional[dict]:
 
 
 def _resolve_measure_target(doc_id: str, target: Union[str, dict]) -> tuple:
-    """Resolve one measure target → (ref_dict, label).
+    """Keep owner-scoped picks intact; the native measure resolver binds live geometry.
 
-    Prefer the single-selector path (measure_between / eval_measure). Fall back to the
-    inspect_part resolver for feature ids / multi-match queries, taking the first match.
+    Readbacks are not rerouted through doc_query: doing that loses the body owner,
+    and selecting the first SID match can bind an identical assembly instance.
     """
-    resolved = resolve_readback_selector(doc_id, target) or already_resolved_selector(target)
-    if resolved is not None:
-        return resolved, str(resolved.get("sid") or resolved.get("kind") or "ref")
-
-    try:
-        ref = _resolve_one_selector(doc_id, target)
-        if isinstance(target, str):
-            label = target.strip()
-        else:
-            label = str(ref.get("sid") or (target.get("side") if isinstance(target, dict)
-                                           else None) or ref.get("kind") or "ref")
-        return ref, label
-    except ValueError:
-        resolved = _resolve_inspect_target(doc_id, target)
-        ms = list(resolved.get("matches") or [])
-        if not ms:
-            raise ValueError(
-                f"No geometry matched measure target {target!r}. "
-                f"Use query_geometry(...) to explore, or narrow with pick/side/near.")
-        ref = ms[0]
-        label = resolved.get("label") or (
-            target.strip() if isinstance(target, str) else str(ref.get("sid") or "ref"))
-        if len(ms) > 1 and ref.get("sid"):
-            # A feature/multi-match target measures ONE element — say WHICH, so the caption
-            # can't read as "the whole feature is 9345 mm²".
-            label = f'{label} → {ref["sid"]} (1 of {len(ms)})'
-        return ref, label
+    if isinstance(target, str):
+        label = target.strip()
+        if _SID_RE.fullmatch(label):
+            return {"sid": label}, label
+        try:
+            ref = _as_face_query(target)
+        except ValueError:
+            ref = _resolve_one_selector(doc_id, target)
+    elif isinstance(target, dict):
+        ref = target
+        selector = target.get("selector", target)
+        if not isinstance(selector, dict):
+            raise ValueError("A body-scoped measure ref requires a selector object.")
+        label = str(selector.get("sid") or selector.get("side") or selector.get("kind") or "ref")
+    else:
+        raise ValueError("A measure target must be a selector object or plain-English query.")
+    if isinstance(ref, dict) and "selector" not in ref and not ref.get("sid"):
+        if not ref.get("centroid"):
+            ref = {"of": ref.get("of", ref.get("kind", "face")), **ref}
+        if is_geom_query(ref):
+            ref, _notes = normalize_geom_query(ref, where="measure()")
+    return ref, label
 
 
 def _reading_from_measure(mres: dict, label: str, color_name: str, rgb,

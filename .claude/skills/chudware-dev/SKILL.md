@@ -265,6 +265,12 @@ judgment).
   reason:mate_unresolved`, never "converged". `sweep_envelope` / `steering_turning_radius`
   transport the reference WORLD-shape bounds by the relative placement (the local AABB
   square spun through a wheel's free axle spin put wheels 109 mm underground).
+  Native mates persist engine-owned `reference_frames` at creation/first legacy
+  compilation. Derived angle datums, virtual pins and lock rest poses use these
+  frames, never solved-placement writeback or warm seeds. Scalar edits and
+  save/reopen must not redefine zero; exact-current-value sweeps must not apply
+  the current angle twice. Legacy binding preserves first-observed interpretation,
+  not a reconstructed original datum.
 - **Assemblies report honestly (2026-09-08).** `doc_bbox` / `eval_mass` / native import
   gather assembly world solids; `describe_part` states the body count; `save_part` /
   `export_part` refuse an empty document (`allow_empty`); `check_interference` refuses an

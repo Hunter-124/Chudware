@@ -1,10 +1,12 @@
-// C++/Eigen port of engine/doc/nsolve.py. See nsolve.h for the API contract; the
-// algorithm here mirrors the Python line for line so the differential harness can
-// hold the two at parity.
+// C++/Eigen port of engine/doc/nsolve.py. See nsolve.h for the API contract.
+// LM damping and acceptance follow the oracle; large sparse steps use the
+// augmented Jacobian to avoid squaring an assembly's condition number.
 #include "nsolve.h"
 
 #include <Eigen/Cholesky>
 #include <Eigen/QR>
+#include <Eigen/SparseCore>
+#include <Eigen/SparseQR>
 
 #include <algorithm>
 #include <chrono>
@@ -34,10 +36,8 @@ double max_abs(const Eigen::VectorXd& v) {
     return v.size() ? v.cwiseAbs().maxCoeff() : 0.0;
 }
 
-// Minimum-norm least-squares solve of A x = b (the numpy.linalg.lstsq fallback the
-// oracle uses). numpy's lstsq with rcond=None uses an SVD with a singular-value cutoff
-// of eps * max(M, N) * sigma_max and drops the null-space (minimum-norm) solution; we
-// mirror that exactly with a JacobiSVD so the C++ fallback step matches the oracle's.
+// Minimum-norm least squares, with numpy's rcond=None singular-value cutoff.
+// Retained for dense steps and rank-deficient sparse fallbacks.
 Eigen::VectorXd lstsq(const Eigen::MatrixXd& A, const Eigen::VectorXd& b) {
     Eigen::JacobiSVD<Eigen::MatrixXd> svd(A, Eigen::ComputeThinU | Eigen::ComputeThinV);
     const Eigen::VectorXd& s = svd.singularValues();
@@ -51,11 +51,10 @@ Eigen::VectorXd lstsq(const Eigen::MatrixXd& A, const Eigen::VectorXd& b) {
     return svd.matrixV() * z;
 }
 
-// Exact-path normal solve (oracle parity): always the SVD min-norm step that mirrors
-// numpy.linalg.lstsq after scipy.linalg.solve(assume_a="pos") + caught LinAlgWarning.
-// See the pre-T-PERF8 comment history — a Cholesky-first path with a diagonal rcond
-// estimate diverged from LAPACK pocon on coupled mate chains. Kept as the default so
-// the differential harness stays bit-identical.
+// Exact-path normal solve (oracle parity): retain numpy.linalg.lstsq's min-norm
+// rule after scipy.linalg.solve(assume_a="pos") + caught LinAlgWarning.
+// A Cholesky-first diagonal-rcond estimate diverged on coupled mate chains.
+// Keep the original Jacobi path for these normal-equation solves.
 Eigen::VectorXd solve_pos_exact(const Eigen::MatrixXd& A, const Eigen::VectorXd& b) {
     return lstsq(A, b);
 }
@@ -388,17 +387,63 @@ Eigen::VectorXd System::lm(const Eigen::VectorXd& x_in, const BlockSet& bs,
     double nu = 2.0;    // damping growth factor on rejected steps
     int it = 0;
     Eigen::VectorXd step;
+    std::size_t potential_entries = 0;
+    for (const Block* block : bs.blocks)
+        potential_entries += static_cast<std::size_t>(block->m) * block->var_idx.size();
+    const bool sparse_step = n_vars() >= 128 &&
+        static_cast<double>(potential_entries) < 0.25 * bs.n_rows * n_vars();
+    std::vector<Eigen::Triplet<double>> entries;
+    Eigen::SparseMatrix<double> sparse_jacobian;
+    Eigen::VectorXd sparse_rhs;
+    Eigen::SparseQR<Eigen::SparseMatrix<double>, Eigen::COLAMDOrdering<int>> sparse_qr;
+    if (sparse_step) {
+        entries.reserve(potential_entries + n_vars());
+        sparse_jacobian.resize(bs.n_rows + n_vars(), n_vars());
+        sparse_rhs.setZero(bs.n_rows + n_vars());
+    }
     for (it = 1; it <= max_iter; ++it) {
-        Eigen::MatrixXd J = jacobian_of(bs, x);
-        Eigen::MatrixXd JtJ = J.transpose() * J;       // dense normal matrix
-        Eigen::VectorXd g = J.transpose() * r;         // gradient = J^T r
-        Eigen::VectorXd diag = JtJ.diagonal().cwiseMax(1e-12);  // scale-invariant basis
+        Eigen::MatrixXd JtJ;
+        Eigen::VectorXd g, diag;
+        if (sparse_step) {
+            // Mate blocks touch only their participating components. Do not
+            // allocate or multiply a mostly-zero global dense Jacobian.
+            entries.clear();
+            diag.setZero(n_vars());
+            int row = 0;
+            for (const Block* block : bs.blocks) {
+                const Eigen::MatrixXd jb = block->jfunc(sub(x, block->var_idx));
+                for (std::size_t c = 0; c < block->var_idx.size(); ++c) {
+                    const int column = block->var_idx[c];
+                    // Preserve jacobian_of's last-column semantics for aliases.
+                    if (std::find(block->var_idx.begin() + c + 1,
+                                  block->var_idx.end(), column) != block->var_idx.end())
+                        continue;
+                    for (int rj = 0; rj < block->m; ++rj) {
+                        const double value = jb(rj, static_cast<Eigen::Index>(c));
+                        if (value != 0.0) {
+                            entries.emplace_back(row + rj, column, value);
+                            diag(column) += value * value;
+                        }
+                    }
+                }
+                row += block->m;
+            }
+            sparse_rhs.head(bs.n_rows) = -r;
+        } else {
+            Eigen::MatrixXd J = jacobian_of(bs, x);
+            JtJ = J.transpose() * J;
+            g = J.transpose() * r;
+            diag = JtJ.diagonal();
+        }
+        const std::size_t jacobian_entries = entries.size();
+        const double largest_diagonal = diag.maxCoeff();
+        diag = diag.cwiseMax(1e-12);  // scale-invariant damping basis
         // FreeCAD-planegcs-style initial damping: normalize the opening step to the
         // problem scale (tau * max(diag(JtJ)), tau = 1e-4). A fixed 1e-4 over-steps
         // when numeric-Jacobian conic/tangent blocks make the normal matrix tiny
         // (O(1e-8)); scaling by max(diag) keeps the first LM step consistently
         // conditioned. Subsequent iterations keep the multiplicatively adapted lam.
-        if (lam < 0.0) lam = 1e-4 * std::max(JtJ.diagonal().maxCoeff(), 1.0);
+        if (lam < 0.0) lam = 1e-4 * std::max(largest_diagonal, 1.0);
 
         bool accepted = false;
         for (int t = 0; t < 12; ++t) {
@@ -410,9 +455,32 @@ Eigen::VectorXd System::lm(const Eigen::VectorXd& x_in, const BlockSet& bs,
                 maxr_out = best_maxr;
                 return best_x;
             }
-            Eigen::MatrixXd A = JtJ;
-            A.diagonal() += lam * diag;
-            step = solve_step(A, -g);
+            if (sparse_step) {
+                // [J; sqrt(lambda * diag)] step = [-r; 0] is the same damped
+                // least-squares problem, without losing weak rotation directions
+                // to the squared spectrum of J^T J.
+                entries.resize(jacobian_entries);
+                for (int c = 0; c < n_vars(); ++c)
+                    entries.emplace_back(bs.n_rows + c, c, std::sqrt(lam * diag(c)));
+                sparse_jacobian.setFromTriplets(entries.begin(), entries.end());
+                sparse_qr.setPivotThreshold(std::numeric_limits<double>::epsilon() *
+                    sparse_jacobian.rows() * std::sqrt((1.0 + lam) * diag.maxCoeff()));
+                sparse_qr.compute(sparse_jacobian);
+                bool solved = false;
+                if (sparse_qr.info() == Eigen::Success && sparse_qr.rank() == n_vars()) {
+                    step = sparse_qr.solve(sparse_rhs);
+                    solved = step.allFinite();
+                }
+                if (!solved) {
+                    // A rank-deficient QR basic solution is not minimum-norm.
+                    const Eigen::MatrixXd A = sparse_jacobian.transpose() * sparse_jacobian;
+                    step = solve_step(A, sparse_jacobian.transpose() * sparse_rhs);
+                }
+            } else {
+                Eigen::MatrixXd A = JtJ;
+                A.diagonal() += lam * diag;
+                step = solve_step(A, -g);
+            }
             clamp_step(step);
 
             Eigen::VectorXd x_new = x + step;
@@ -449,8 +517,9 @@ Eigen::VectorXd System::lm(const Eigen::VectorXd& x_in, const BlockSet& bs,
             return best_x;
         }
         if (!accepted) break;  // damping saturated without progress
-        double step_norm = max_abs(step);
-        if (step_norm <= 1e-12 * (1.0 + max_abs(x))) break;
+        // A representable cost reduction is progress even when high damping
+        // makes the step tiny. Residual tolerance, rejected trials and the
+        // iteration/deadline bounds decide termination, not mixed-unit step size.
     }
 
     iters_out = it;
@@ -603,6 +672,12 @@ Eigen::MatrixXd System::real_jacobian(const Eigen::VectorXd& x) {
 }
 
 // -- diagnostics --------------------------------------------------------------
+
+int System::degrees_of_freedom(const Eigen::VectorXd& x, double tol) {
+    if (x.size() != n_vars())
+        throw std::invalid_argument("degrees_of_freedom: x has wrong number of entries");
+    return n_vars() - numeric_rank(real_jacobian(x), tol);
+}
 
 Analysis System::analyze(const Eigen::VectorXd& x, double tol) {
     if (dirty_) finalize_rows();

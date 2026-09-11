@@ -12,11 +12,11 @@ backlog can be cleared (and kept clear) deterministically:
   rule=theme  flags applyTheme(..., 1.0f) literal scale (collapses padding to 100% on HiDPI and
               clobbers ui::uiScale) and any io.FontGlobalScale assignment (runtime font blur).
   rule=scale  flags raw pixel literals passed to ImGui geometry calls that are NOT multiplied by a
-              scale token (ui::uiScale / uiScale / sc / s / rsc / scale) or the metrics helpers
-              (px()/U()), and not derived from a pre-scaled metric (CalcTextSize / GetFrameHeight /
-              GetStyle() / GetContentRegion* / GetTextLineHeight*). This is heuristic; suppress a
-              legitimate case with a trailing  // gui-lint: allow <reason>  comment, or absorb the
-              existing-but-accepted set into a baseline (see --baseline / --update-baseline).
+              scale token (ui::uiScale / uiScale / sc / s / rsc / scale) or enclosed by a metrics
+              helper (px()/U()/stroke()/rounding()). Draw-call colors, flags and segment counts
+              are not geometry; raw offsets added to pre-scaled metrics still need scaling.
+              This is heuristic; suppress a legitimate case with a trailing // gui-lint: allow
+              <reason> comment, or absorb accepted findings into a baseline (see --baseline).
 
 Usage:
   python scripts/gui_lint.py [ROOT ...]            # lint host/src (default), text output
@@ -48,14 +48,6 @@ DEFAULT_BASELINE = os.path.join(REPO, "scripts", "gui_lint_baseline.json")
 
 # ---- helpers --------------------------------------------------------------------------------------
 
-SCALE_TOKENS = ("ui::uiScale", "uiScale", "rsc", "sc", "scale", "s", "S", "px(", "U(",
-                "ui::metrics::px(", "ui::metrics::U(", "dpiS", "pxScale")
-# Metric accessors whose result is already DPI-correct (pre-scaled fonts / scaled style).
-METRIC_TOKENS = ("CalcTextSize", "GetFrameHeight", "GetTextLineHeight", "GetContentRegion",
-                 "GetFontSize", "GetStyle(", "CalcItemWidth", "GetWindowWidth", "GetWindowHeight",
-                 "GetCursorPos", "GetContentRegionAvail", "ItemSpacing", "FramePadding",
-                 "ItemInnerSpacing", "IndentSpacing")
-
 # ImGui calls whose numeric literal arguments are PIXEL GEOMETRY and therefore must be scaled.
 GEOM_FUNCS = [
     "ImVec2", "SameLine", "Indent", "Unindent", "SetNextItemWidth", "Dummy",
@@ -63,6 +55,18 @@ GEOM_FUNCS = [
     "AddTriangleFilled", "AddTriangle", "SetCursorPosX", "SetCursorPosY",
     "SetNextWindowSize", "ImageButton", "PushTextWrapPos",
 ]
+# Zero-based physical argument positions; all other arguments are colors, flags or counts.
+GEOM_ARG_INDICES = {
+    "AddLine": (0, 1, 3),
+    "AddRectFilled": (0, 1, 3),
+    "AddRect": (0, 1, 3, 5),
+    "AddCircleFilled": (0, 1),
+    "AddCircle": (0, 1, 4),
+    "AddNgon": (0, 1, 4),
+    "AddTriangleFilled": (0, 1, 2),
+    "AddTriangle": (0, 1, 2, 4),
+    "SetNextWindowSize": (0,),
+}
 # These literals are ratios / sentinels / counts, not pixels — never flag.
 SAFE_LITERALS = {0.0, 1.0, -1.0}
 # A literal below this magnitude is treated as a ratio/multiplier (e.g. 0.5f, 0.3f) — not a pixel.
@@ -82,11 +86,12 @@ SCALE_WORLDSPACE_FILES = {
 
 NUM_RE = re.compile(r"(?<![\w.])(-?\d+\.?\d*)f?(?![\w.\d])")
 SUPPRESS_RE = re.compile(r"gui-lint:\s*(allow|ok)")
-SCALE_MUL_RE = re.compile(
-    r"(\*\s*(?:ui::uiScale|uiScale|rsc|sc|scale|s|S|dpiS|pxScale)\b)|"
-    r"((?:ui::uiScale|uiScale|rsc|sc|scale|s|S|dpiS|pxScale)\b\s*\*)|"
-    r"(?:ui::metrics::)?(?:px|U)\s*\("
-)
+SCALE_NAME = r"(?:ui::uiScale|uiScale|rsc|sc|scale|s|S|uS|dpiS|pxScale)\b"
+SCALE_LEFT_RE = re.compile(r"\b" + SCALE_NAME + r"\s*\*\s*$")
+SCALE_RIGHT_RE = re.compile(r"^\s*\*\s*" + SCALE_NAME)
+SCALE_CALL_RE = re.compile(
+    r"(?<![\w:])(?:(?:[A-Za-z_]\w*::)*(?:px|U)|"
+    r"(?:ui::)?metrics::(?:stroke|rounding))\s*\(")
 COLOR_MACRO_RE = re.compile(r"\bIM_COL32\s*\([^)]*\)")
 
 
@@ -119,52 +124,77 @@ def iter_source_files(roots: list[str]):
                     yield os.path.join(dirpath, fn)
 
 
-def extract_call_args(line: str, func: str):
-    """Yield the argument substring for each `func(` occurrence on the line (paren-balanced within
-    the line; truncated at line end if the call spans lines — good enough for a heuristic)."""
-    start = 0
-    while True:
-        idx = line.find(func + "(", start)
-        if idx < 0:
-            return
-        # Reject as a substring of a longer identifier (e.g. "MyImVec2(").
-        if idx > 0 and (line[idx - 1].isalnum() or line[idx - 1] == "_"):
-            start = idx + 1
+def argument_spans(text: str, start: int = 0):
+    """Yield top-level argument spans, ending at the enclosing ')' or the line end.
+
+    Nested calls, subscripts, braced initializers and quoted delimiters do not split arguments.
+    As before, a multiline call is inspected only through the end of its opening line.
+    """
+    stack = []
+    quote = None
+    escaped = False
+    begin = start
+    for i in range(start, len(text)):
+        c = text[i]
+        if quote:
+            if escaped:
+                escaped = False
+            elif c == "\\":
+                escaped = True
+            elif c == quote:
+                quote = None
             continue
-        i = idx + len(func) + 1
-        depth = 1
-        while i < len(line) and depth:
-            c = line[i]
-            if c == "(":
-                depth += 1
-            elif c == ")":
-                depth -= 1
-            i += 1
-        yield line[idx + len(func) + 1: i - 1 if depth == 0 else len(line)]
-        start = i
+        if c in "\"'":
+            quote = c
+        elif c in "([{":
+            stack.append(c)
+        elif c == ")" and not stack:
+            yield begin, i
+            return
+        elif c in ")]}" and stack:
+            stack.pop()
+        elif c == "," and not stack:
+            yield begin, i
+            begin = i + 1
+    yield begin, len(text)
+
+
+def extract_call_args(line: str, func: str):
+    """Yield separately bounded arguments for each named call on the line."""
+    for call in re.finditer(r"\b" + re.escape(func) + r"\s*\(", line):
+        yield [line[start:end] for start, end in argument_spans(line, call.end())]
 
 
 def literal_is_scaled(args: str, mstart: int, mend: int) -> bool:
-    """True if the numeric literal at args[mstart:mend] is multiplied by a scale token, or the
-    surrounding call clearly derives from a pre-scaled metric."""
-    ctx = args[max(0, mstart - 16): min(len(args), mend + 16)]
-    if SCALE_MUL_RE.search(ctx):
+    """Recognize scaling of this literal, never a neighboring argument or additive term."""
+    if SCALE_LEFT_RE.search(args[:mstart]) or SCALE_RIGHT_RE.match(args[mend:]):
         return True
-    # Lenient: if the whole call references a pre-scaled metric, assume the author is mixing
-    # intentionally (these are rarer and noisier to flag); the audit covers the double-scale cases.
-    if any(tok in args for tok in METRIC_TOKENS):
-        return True
+    for call in SCALE_CALL_RE.finditer(args):
+        start, end = next(argument_spans(args, call.end()))
+        if start <= mstart and mend <= end:
+            return True
+    stack = []
+    for index, char in enumerate(args):
+        if char == "(":
+            stack.append(index)
+        elif char == ")" and stack:
+            start = stack.pop()
+            if start < mstart and mend <= index and (
+                    SCALE_LEFT_RE.search(args[:start])
+                    or SCALE_RIGHT_RE.match(args[index + 1:])):
+                return True
     return False
 
 
 def literal_is_ratio(args: str, mstart: int, mend: int) -> bool:
-    """Treat simple multiply/divide factors as ratios/counts, not pixel dimensions.
+    """Treat factors and comparison operands as ratios/counts, not pixel dimensions.
 
     Examples: `hitR * 2`, `bw * 3.0f`, `(p0.y + p1.y) * 0.5f`. Raw offsets like `x + 2` still flag.
     """
-    left = args[max(0, mstart - 3):mstart]
-    right = args[mend:min(len(args), mend + 3)]
-    return "*" in left or "*" in right or "/" in left or "/" in right
+    left = args[:mstart].rstrip()
+    right = args[mend:].lstrip()
+    operators = ("*", "/", "==", "!=", "<", ">", "<=", ">=")
+    return left.endswith(operators) or right.startswith(operators)
 
 
 def strip_color_macros(args: str) -> str:
@@ -354,24 +384,27 @@ def lint_file(path: str, atlas: set[str], rules: set[str], findings: list):
 
         if "scale" in rules and not suppressed:
             for func in GEOM_FUNCS:
-                if func + "(" not in code:
-                    continue
-                for args in extract_call_args(code, func):
-                    args = strip_color_macros(args)
-                    for nm in NUM_RE.finditer(args):
-                        try:
-                            val = abs(float(nm.group(1)))
-                        except ValueError:
+                for call_args in extract_call_args(code, func):
+                    physical = GEOM_ARG_INDICES.get(func, range(len(call_args)))
+                    for index in physical:
+                        if index >= len(call_args):
                             continue
-                        if val < PIXEL_MIN or val in SAFE_LITERALS:
-                            continue
-                        if literal_is_ratio(args, nm.start(), nm.end()):
-                            continue
-                        if literal_is_scaled(args, nm.start(), nm.end()):
-                            continue
-                        findings.append((rel, n, scale_rule,
-                                         f'raw px literal {nm.group(1)} in {func}(...) not *uiScale',
-                                         line.strip()))
+                        args = strip_color_macros(call_args[index])
+                        args = STRING_LITERAL_RE.sub(lambda m: " " * len(m.group()), args)
+                        for nm in NUM_RE.finditer(args):
+                            try:
+                                val = abs(float(nm.group(1)))
+                            except ValueError:
+                                continue
+                            if val < PIXEL_MIN or val in SAFE_LITERALS:
+                                continue
+                            if literal_is_ratio(args, nm.start(), nm.end()):
+                                continue
+                            if literal_is_scaled(args, nm.start(), nm.end()):
+                                continue
+                            findings.append((rel, n, scale_rule,
+                                             f'raw px literal {nm.group(1)} in {func}(...) not *uiScale',
+                                             line.strip()))
 
         if "color" in rules and not suppressed and rel not in COLOR_AUTHORING_FILES:
             if COLOR_LITERAL_MACRO_RE.search(code) and not COLOR_IMAGE_TINT_RE.search(code):

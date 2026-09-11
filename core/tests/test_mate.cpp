@@ -8,6 +8,7 @@
 
 #include "mate/mate.h"
 
+#include <algorithm>
 #include <cmath>
 #include <optional>
 #include <random>
@@ -57,6 +58,12 @@ TEST_CASE("rotation log/exp round-trips") {
         Vector3d w(nd(rng), nd(rng), nd(rng));
         Vector3d w2 = mat_to_rotvec(rodrigues(w));
         CHECK((w - w2).cwiseAbs().maxCoeff() < 1e-9);
+    }
+    for (const Vector3d& axis : {unit(Vector3d(0.3, -0.7, 0.4)), unit(Vector3d(-1e-6, 1, 0))}) {
+        for (double angle : {M_PI - 1e-7, M_PI, M_PI + 1e-7}) {
+            const Matrix3d rotation = rodrigues(axis * angle);
+            CHECK((rodrigues(mat_to_rotvec(rotation)) - rotation).cwiseAbs().maxCoeff() < 1e-12);
+        }
     }
 }
 
@@ -125,6 +132,99 @@ TEST_CASE("redundant concentric is not over-defined") {
     for (const auto& s : out["mate_status"])
         if (s["status"].get<std::string>() == "redundant") any_redundant = true;
     CHECK(any_redundant);
+}
+
+TEST_CASE("mate diagnostics preserve chronological groups through late merges") {
+    json input;
+    input["components"] = json::array({
+        {{"id", "frame"}, {"transform", ident16()}, {"fixed", true}},
+        {{"id", "a"}, {"transform", xform({0, 0, 10}, {0, 0, 0})}},
+        {{"id", "c"}, {"transform", xform({0, 0, 3}, {0, 0, 0})}},
+        {{"id", "b"}, {"transform", xform({0, 0, -4}, {0, 0, 0})}},
+        {{"id", "datum"}, {"transform", ident16()}, {"fixed", true}},
+    });
+    input["mates"] = json::array();
+    input["resolved_geometry"] = json::array();
+    auto add_mate = [&](const std::string& id, const std::string& type,
+                        const std::string& a, const std::string& b) {
+        input["mates"].push_back({{"id", id}, {"type", type}, {"align", "aligned"},
+                                 {"refs", {{{"component", a}}, {{"component", b}}}}});
+        const bool plane = type == "coincident";
+        input["resolved_geometry"].push_back(geom_entry(
+            id, 0, plane ? "plane" : "axis", {0, 0, 0}, {0, 0, 1}, {0, 0, 1}, 0.0));
+        input["resolved_geometry"].push_back(geom_entry(
+            id, 1, plane ? "plane" : "axis", {0, 0, 0},
+            plane ? Vector3d(0, 0, -1) : Vector3d(0, 0, 1), {0, 0, 1}, 0.0));
+    };
+    add_mate("a_bore", "concentric", "frame", "a");
+    add_mate("c_bore", "concentric", "frame", "c");
+    add_mate("b_bore", "concentric", "frame", "b");
+    add_mate("a_duplicate", "concentric", "frame", "a");
+    add_mate("fixed_datums", "coincident", "frame", "datum");
+    // A rejected bridge must leave its two accumulated groups untouched.
+    add_mate("redundant_bridge", "concentric", "a", "b");
+    // This four-row mate adds only one independent constraint. Its reversed
+    // component order also exercises scattering non-sorted builder columns.
+    add_mate("seat_ba", "coincident", "b", "a");
+    add_mate("seat_c", "coincident", "frame", "c");
+    add_mate("seat_a", "coincident", "frame", "a");
+    // B is now seated indirectly via A, despite never having had its own seat.
+    add_mate("seat_b_duplicate", "coincident", "frame", "b");
+    add_mate("seated_bridge", "coincident", "a", "c");
+    add_mate("b_duplicate", "concentric", "frame", "b");
+
+    const json out = solve_mates_json(input);
+    REQUIRE(out["converged"].get<bool>());
+    CHECK_FALSE(out["over_defined"].get<bool>());
+    CHECK(out["dof"].get<int>() == 3);  // one free spin per component
+    CHECK(out["max_residual"].get<double>() < 1e-6);
+    const std::vector<std::string> expected = {
+        "ok", "ok", "ok", "redundant", "ok", "redundant", "ok", "ok", "ok",
+        "redundant", "redundant", "redundant",
+    };
+    REQUIRE(out["mate_status"].size() == expected.size());
+    for (size_t i = 0; i < expected.size(); ++i) {
+        CAPTURE(i);
+        CHECK(out["mate_status"][i]["mate_id"] == input["mates"][i]["id"]);
+        CHECK(out["mate_status"][i]["status"].get<std::string>() == expected[i]);
+    }
+    for (const auto& residual : out["residuals"])
+        CHECK(residual["max_abs"].get<double>() < 1e-6);
+    for (const std::string cid : {"a", "b", "c"}) {
+        const auto transform = out["transforms"][cid].get<std::vector<double>>();
+        const auto identity = ident16();
+        REQUIRE(transform.size() == identity.size());
+        for (size_t i = 0; i < identity.size(); ++i)
+            CHECK(transform[i] == doctest::Approx(identity[i]).epsilon(1e-6));
+    }
+    CHECK(out["transforms"]["frame"].get<std::vector<double>>() == ident16());
+    CHECK(out["transforms"]["datum"].get<std::vector<double>>() == ident16());
+}
+
+TEST_CASE("fixed-only mate diagnostics retain authored poses with zero DOF") {
+    const auto authored = xform({3, 4, 5}, {0, 0, 0});
+    json input;
+    input["components"] = json::array({
+        {{"id", "a"}, {"transform", authored}, {"fixed", true}},
+        {{"id", "b"}, {"transform", authored}, {"fixed", true}},
+    });
+    input["mates"] = json::array({
+        {{"id", "seat"}, {"type", "coincident"}, {"align", "aligned"},
+         {"refs", {{{"component", "a"}}, {{"component", "b"}}}}},
+    });
+    input["resolved_geometry"] = json::array({
+        geom_entry("seat", 0, "plane", {0, 0, 0}, {0, 0, 1}, {0, 0, 1}, 0.0),
+        geom_entry("seat", 1, "plane", {0, 0, 0}, {0, 0, -1}, {0, 0, 1}, 0.0),
+    });
+    const json out = solve_mates_json(input);
+    CHECK(out["converged"].get<bool>());
+    CHECK_FALSE(out["over_defined"].get<bool>());
+    CHECK(out["dof"].get<int>() == 0);
+    CHECK(out["max_residual"].get<double>() == 0.0);
+    REQUIRE(out["mate_status"].size() == 1);
+    CHECK(out["mate_status"][0]["status"].get<std::string>() == "ok");
+    CHECK(out["transforms"]["a"].get<std::vector<double>>() == authored);
+    CHECK(out["transforms"]["b"].get<std::vector<double>>() == authored);
 }
 
 // A FIXED component's pose is authored, never solved — so a stale warm-start entry
@@ -225,9 +325,13 @@ TEST_CASE("one unsatisfiable mate cannot move a different chain") {
         CHECK(out["residuals"][i]["max_abs"].get<double>()
               <= out["residuals"][i - 1]["max_abs"].get<double>());
     CHECK(out["over_defined"].get<bool>());
-    for (const auto& s : out["mate_status"])
-        if (s["mate_id"].get<std::string>() == "b_wrong_bore")
-            CHECK(s["status"].get<std::string>() == "conflicting");
+    CHECK(out["dof"].get<int>() == 2);  // the two axle spins remain free
+    REQUIRE(out["mate_status"].size() == 5);
+    for (const auto& s : out["mate_status"]) {
+        const std::string expected = s["mate_id"].get<std::string>() == "b_wrong_bore"
+            ? "conflicting" : "ok";
+        CHECK(s["status"].get<std::string>() == expected);
+    }
 
     // The satisfiable chain SEATS: hub_a takes up its own 0.46 mm of authored error and
     // nothing more, and its two mates read zero. It used to come back from the restart
@@ -734,4 +838,293 @@ TEST_CASE("line angle binds a bore-less plate without warm-start drift") {
     mates[0]["value"].erase("axis_point");
     mates[0]["value"]["value"] = 0;
     CHECK(solve_mates(components, mates, geometry).dof == 5);
+}
+
+TEST_CASE("a body-frame revolute honors reversed alignment") {
+    const Vector3d pin(910, 0, 545);
+    const json components = json::array({
+        {{"id", "a"}, {"fixed", true}, {"transform", ident16()}},
+        {{"id", "b"}, {"fixed", false}, {"transform", ident16()}}});
+    const json mates = json::array({{{"id", "turn"}, {"type", "angle"}, {"align", "anti"},
+        {"refs", {{{"component", "a"}}, {{"component", "b"}}}},
+        {"value", {{"value", 30.0}, {"axis", {0, 1, 0}}, {"axis_point", {910, 0, 545}}}}}});
+    ResolvedGeometry geometry;
+    geometry[{"turn", 0}] = mgeom("plane", {0, 0, 0}, {0, 1, 0}, {0, 0, 1});
+    geometry[{"turn", 1}] = geometry[{"turn", 0}];
+    // Reversing B's measured direction makes a -150-degree physical turn
+    // measure +30 degrees. A parallel face must not silently discard align.
+    const Vector3d w(0, -150.0 * M_PI / 180.0, 0);
+    const Vector3d t = pin - rodrigues(w) * pin;
+    const WarmMap warm{{"b", {t + Vector3d(0.01, -0.02, 0.03), w}}};
+    const auto solved = solve_mates(components, mates, geometry, warm, std::nullopt, 1e-12, 100);
+    REQUIRE(solved.converged);
+    const auto expected = xform(t, w);
+    const auto& actual = solved.transforms.at("b");
+    for (size_t k = 0; k < 16; ++k)
+        CHECK(std::abs(actual[k] - expected[k]) < 1e-9);
+}
+
+TEST_CASE("a virtual hinge keeps its authored pin and leaves rotation free") {
+    const Vector3d ta(120, -35, 70), tb(-18, 42, 11);
+    const Vector3d wa(0.3, -0.5, 0.2), wb(-0.4, 0.2, 0.6);
+    const Matrix3d Ra = rodrigues(wa), Rb = rodrigues(wb);
+    const Vector3d pa(9, -4, 6), axis_a(0, 1, 0);
+    const Vector3d pin = Ra * pa + ta, axis = Ra * axis_a;
+    const Vector3d pb = Rb.transpose() * (pin - tb);
+    const Vector3d axis_b = Rb.transpose() * axis;
+    json components = json::array({
+        {{"id", "cup"}, {"fixed", true}, {"transform", xform(ta, wa)}},
+        {{"id", "cross"}, {"fixed", false}, {"transform", xform(tb, wb)}}});
+    json mates = json::array({{{"id", "pin"}, {"type", "hinge"},
+        {"refs", {{{"component", "cup"}}, {{"component", "cross"}}}},
+        {"value", {{"value", 17.0}, {"axis", {0, 1, 0}}, {"axis_point", {9, -4, 6}}}}}});
+    ResolvedGeometry geometry;
+    // Cup and journal selector centroids/directions do not define the virtual pin.
+    geometry[{"pin", 0}] = mgeom("plane", {80, 10, -20}, {1, 0, 0}, {0, 0, 1});
+    geometry[{"pin", 1}] = mgeom("axis", {-11, 32, 44}, {0, 0, 1}, {1, 0, 0});
+    for (double degrees : {-65.0, -20.0, 0.0, 40.0, 95.0}) {
+        INFO("free rotation = " << degrees);
+        const Matrix3d R = rodrigues(axis * (degrees * kDeg2Rad)) * Rb;
+        const Vector3d w = mat_to_rotvec(R), t = pin - R * pb;
+        WarmMap warm;
+        warm["cross"] = {t, w};
+        const auto free = solve_mates(components, mates, geometry, warm);
+        REQUIRE(free.converged);
+        CHECK(free.dof == 1);
+        // A hinge's scalar value must never prescribe a cross angle.
+        const auto expected = xform(t, w);
+        const auto& actual = free.transforms.at("cross");
+        for (size_t k = 0; k < 16; ++k)
+            CHECK(std::abs(actual[k] - expected[k]) < 1e-8);
+
+        warm = free.params;
+        for (int repeat = 0; repeat < 3; ++repeat) {
+            // Axial translation is forbidden even though axial rotation is free.
+            warm["cross"].first += axis * 0.25;
+            const auto corrected = solve_mates(
+                components, mates, geometry, warm, std::nullopt, 1e-10, 100);
+            REQUIRE(corrected.converged);
+            CHECK(corrected.dof == 1);
+            const auto& pose = corrected.params.at("cross");
+            const Matrix3d rotation = rodrigues(pose.second);
+            CHECK((rotation * pb + pose.first - pin).norm() < 1e-8);
+            CHECK((rotation * axis_b - axis).norm() < 1e-8);
+            warm = corrected.params;
+        }
+    }
+}
+
+TEST_CASE("a passive cross follows a driven rotated reference without a cross driver") {
+    const Vector3d ta(120, -35, 70), tb(-18, 42, 11);
+    const Vector3d wa(0.3, -0.5, 0.2), wb(-0.4, 0.2, 0.6);
+    const Matrix3d Ra = rodrigues(wa), Rb = rodrigues(wb);
+    const Vector3d pa(9, -4, 6), axis_a(0, 1, 0);
+    const Vector3d pb = Rb.transpose() * (Ra * pa + ta - tb);
+    const Vector3d axis_b = Rb.transpose() * Ra * axis_a;
+    json components = json::array({
+        {{"id", "ground"}, {"fixed", true}, {"transform", xform(ta, wa)}},
+        {{"id", "cup"}, {"fixed", false}, {"transform", xform(ta, wa)}},
+        {{"id", "cross"}, {"fixed", false}, {"transform", xform(tb, wb)}}});
+    json mates = json::array({
+        {{"id", "crank"}, {"type", "angle"},
+         {"refs", {{{"component", "ground"}}, {{"component", "cup"}}}},
+         {"value", {{"value", 0.0}, {"axis", {0, 0, 1}}, {"axis_point", {0, 0, 0}}}}},
+        {{"id", "pin"}, {"type", "hinge"},
+         {"refs", {{{"component", "cup"}}, {{"component", "cross"}}}},
+         {"value", {{"axis", {0, 1, 0}}, {"axis_point", {9, -4, 6}}}}}});
+    ResolvedGeometry geometry;
+    geometry[{"crank", 0}] = mgeom("plane", {0, 0, 0}, {1, 0, 0}, {0, 0, 1});
+    geometry[{"crank", 1}] = geometry.at({"crank", 0});
+    geometry[{"pin", 0}] = mgeom("plane", {80, 10, -20}, {1, 0, 0}, {0, 0, 1});
+    geometry[{"pin", 1}] = mgeom("axis", {-11, 32, 44}, {0, 0, 1}, {1, 0, 0});
+    std::optional<WarmMap> warm;
+    for (int degrees = -40; degrees <= 40; degrees += 10) {
+        INFO("primary crank = " << degrees);
+        mates[0]["value"]["value"] = degrees;
+        const auto solved = solve_mates(
+            components, mates, geometry, warm, std::nullopt, 1e-10, 150);
+        REQUIRE(solved.converged);
+        CHECK(solved.dof == 1);
+        const Matrix3d expected_cup = Ra * rodrigues({0, 0, degrees * kDeg2Rad});
+        const auto& cup = solved.params.at("cup");
+        CHECK((rodrigues(cup.second) - expected_cup).norm() < 1e-8);
+        CHECK((cup.first - ta).norm() < 1e-8);
+        const auto& cross = solved.params.at("cross");
+        const Matrix3d rotation = rodrigues(cross.second);
+        CHECK((rotation * pb + cross.first - (expected_cup * pa + ta)).norm() < 1e-8);
+        CHECK((rotation * axis_b - expected_cup * axis_a).norm() < 1e-8);
+        warm = solved.params;
+    }
+}
+
+TEST_CASE("hinge limits remain active with geometric and explicit pins") {
+    json components = json::array({
+        {{"id", "a"}, {"fixed", true}, {"transform", ident16()}},
+        {{"id", "b"}, {"fixed", false}, {"transform", ident16()}}});
+    json mates = json::array({{{"id", "pin"}, {"type", "hinge"},
+        {"refs", {{{"component", "a"}}, {{"component", "b"}}}},
+        {"value", {{"min", 10.0}, {"max", 30.0}}}}});
+    ResolvedGeometry geometry;
+    geometry[{"pin", 0}] = mgeom("axis", {0, 0, 0}, {1, 0, 0}, {0, 0, 1});
+    geometry[{"pin", 1}] = geometry.at({"pin", 0});
+    for (bool explicit_pin : {false, true}) {
+        if (explicit_pin) {
+            mates[0]["value"]["axis"] = {0, 0, 1};
+            mates[0]["value"]["axis_point"] = {0, 0, 0};
+        }
+        for (double seed : {5.0, 50.0}) {
+            WarmMap warm;
+            warm["b"] = {Vector3d(0, 0, 0.25), Vector3d(0, 0, seed * kDeg2Rad)};
+            const auto solved = solve_mates(
+                components, mates, geometry, warm, std::nullopt, 1e-10, 100);
+            REQUIRE(solved.converged);
+            const auto& pose = solved.params.at("b");
+            CHECK(pose.first.norm() < 1e-8);
+            const double angle = std::acos(std::max(-1.0, std::min(
+                1.0, rodrigues(pose.second)(0, 0)))) * kRad2Deg;
+            CHECK(angle >= 10.0 - 1e-6);
+            CHECK(angle <= 30.0 + 1e-6);
+        }
+    }
+    for (const json& invalid : json::array({
+             json{{"axis", {0, 0, 1}}},
+             json{{"axis_point", {0, 0, 0}}},
+             json{{"axis", {0, 0, 0}}, {"axis_point", {0, 0, 0}}},
+             json{{"axis", {0, 1}}, {"axis_point", {0, 0, 0}}},
+             json{{"axis", {0, 0, 1}}, {"axis_point", {0, 0}}},
+             json{{"axis", {0, 0, 1}}, {"axis_point", {0, "invalid", 0}}}})) {
+        mates[0]["value"] = invalid;
+        const auto refused = solve_mates(components, mates, geometry);
+        CHECK_FALSE(refused.converged);
+        CHECK(status_of(refused, "pin") == "unresolved");
+    }
+}
+
+TEST_CASE("two passive cross hinges transmit a Cardan drive between inclined shafts") {
+    const Vector3d pin(120, -35, 70), frame_w(0.3, -0.5, 0.2);
+    const Matrix3d frame = rodrigues(frame_w);
+    const double beta = 25.0 * kDeg2Rad;
+    const Matrix3d output_frame = frame * rodrigues({0, beta, 0});
+    json components = json::array({
+        {{"id", "ground"}, {"fixed", true}, {"transform", xform(pin, frame_w)}},
+        {{"id", "input"}, {"fixed", false}, {"transform", xform(pin, frame_w)}},
+        {{"id", "cross"}, {"fixed", false}, {"transform", xform(pin, frame_w)}},
+        {{"id", "output"}, {"fixed", false},
+         {"transform", xform(pin, mat_to_rotvec(output_frame))}}});
+    json mates = json::array({
+        {{"id", "crank"}, {"type", "angle"},
+         {"refs", {{{"component", "ground"}}, {{"component", "input"}}}},
+         {"value", {{"value", 0.0}, {"axis", {0, 0, 1}}, {"axis_point", {0, 0, 0}}}}},
+        {{"id", "output_bearing"}, {"type", "hinge"},
+         {"refs", {{{"component", "ground"}}, {{"component", "output"}}}},
+         {"value", {{"axis", {std::sin(beta), 0, std::cos(beta)}},
+                    {"axis_point", {0, 0, 0}}}}},
+        {{"id", "input_journal"}, {"type", "hinge"},
+         {"refs", {{{"component", "input"}}, {{"component", "cross"}}}},
+         {"value", {{"axis", {1, 0, 0}}, {"axis_point", {0, 0, 0}}}}},
+        {{"id", "output_journal"}, {"type", "hinge"},
+         {"refs", {{{"component", "output"}}, {{"component", "cross"}}}},
+         {"value", {{"axis", {0, 1, 0}}, {"axis_point", {0, 0, 0}}}}}});
+    ResolvedGeometry geometry;
+    for (const auto& mate : mates) {
+        const std::string id = mate.at("id").get<std::string>();
+        geometry[{id, 0}] = mgeom("plane", {20, -4, 8}, {1, 0, 0}, {0, 0, 1});
+        geometry[{id, 1}] = mgeom("plane", {-30, 2, -7}, {1, 0, 0}, {0, 0, 1});
+    }
+    std::optional<WarmMap> warm;
+    for (double degrees : {0.0, 15.0, 30.0, 45.0, 60.0, 45.0, 30.0,
+                           15.0, 0.0, -15.0, -30.0, -45.0, -60.0}) {
+        INFO("Cardan input = " << degrees);
+        mates[0]["value"]["value"] = degrees;
+        const auto solved = solve_mates(
+            components, mates, geometry, warm, std::nullopt, 1e-10, 150);
+        REQUIRE(solved.converged);
+        CHECK(solved.dof == 0);
+        const double theta = degrees * kDeg2Rad;
+        // Orthogonal journals require tan(output) = tan(input) / cos(shaft bend).
+        // No output or cross angle is prescribed anywhere in the mate graph.
+        const double phi = std::atan2(std::sin(theta), std::cos(beta) * std::cos(theta));
+        const auto& output = solved.params.at("output");
+        CHECK((rodrigues(output.second) -
+               output_frame * rodrigues({0, 0, phi})).norm() < 1e-8);
+        for (const char* component : {"input", "cross", "output"})
+            CHECK((solved.params.at(component).first - pin).norm() < 1e-8);
+        const Matrix3d cross = rodrigues(solved.params.at("cross").second);
+        const Matrix3d input = rodrigues(solved.params.at("input").second);
+        CHECK((cross.col(0) - input.col(0)).norm() < 1e-8);
+        CHECK((cross.col(1) - rodrigues(output.second).col(1)).norm() < 1e-8);
+        warm = solved.params;
+    }
+}
+
+TEST_CASE("a driven body carries an offset locked child without redefining its attachment") {
+    const Vector3d pin(120, -35, 70), frame_w(0.3, -0.5, 0.2);
+    const Vector3d child_t(1397, -570, 263), child_w(-0.4, 0.2, 0.6);
+    const Matrix3d frame = rodrigues(frame_w), child_frame = rodrigues(child_w);
+    const Vector3d offset = frame.transpose() * (child_t - pin);
+    json components = json::array({
+        {{"id", "ground"}, {"fixed", true}, {"transform", xform(pin, frame_w)}},
+        {{"id", "carrier"}, {"fixed", false}, {"transform", xform(pin, frame_w)}},
+        {{"id", "child"}, {"fixed", false}, {"transform", xform(child_t, child_w)}}});
+    json mates = json::array({
+        {{"id", "drive"}, {"type", "angle"},
+         {"refs", {{{"component", "ground"}}, {{"component", "carrier"}}}},
+         {"value", {{"value", 0.0}, {"axis", {0, 0, 1}}, {"axis_point", {0, 0, 0}}}}},
+        {{"id", "attachment"}, {"type", "lock"},
+         {"refs", {{{"component", "carrier"}}, {{"component", "child"}}}}}});
+    ResolvedGeometry geometry;
+    for (const auto& mate : mates) {
+        const auto id = mate.at("id").get<std::string>();
+        geometry[{id, 0}] = mgeom("plane", {0, 0, 0}, {1, 0, 0}, {0, 0, 1});
+        geometry[{id, 1}] = geometry.at({id, 0});
+    }
+    WarmMap warm;
+    warm["carrier"] = {pin, frame_w};
+    warm["child"] = {child_t, child_w};
+    for (double degrees : {0.0, 20.0, 50.0, -15.0}) {
+        INFO("drive=" << degrees);
+        mates[0]["value"]["value"] = degrees;
+        warm["child"].first += Vector3d(0.5, -0.7, 0.3);
+        warm["child"].second += Vector3d(0.002, -0.003, 0.001);
+        const auto solved = solve_mates(components, mates, geometry, warm, std::nullopt, 1e-11, 150);
+        REQUIRE(solved.converged);
+        const Matrix3d carrier = frame * rodrigues({0, 0, degrees * kDeg2Rad});
+        const auto& child = solved.params.at("child");
+        CHECK((child.first - (pin + carrier * offset)).norm() < 1e-7);
+        CHECK((rodrigues(child.second) - carrier * frame.transpose() * child_frame).norm() < 1e-9);
+        warm = solved.params;
+    }
+}
+
+TEST_CASE("a concentric slider follows the moving reference axis through a driven turn") {
+    json components = json::array({
+        {{"id", "ground"}, {"fixed", true}, {"transform", ident16()}},
+        {{"id", "carrier"}, {"fixed", false}, {"transform", ident16()}},
+        {{"id", "slider"}, {"fixed", false}, {"transform", xform({0, 300, 0}, {0, 0, 0})}}});
+    json refs = {{{"component", "carrier"}}, {{"component", "slider"}}};
+    json mates = json::array({
+        {{"id", "drive"}, {"type", "angle"},
+         {"refs", {{{"component", "ground"}}, {{"component", "carrier"}}}},
+         {"value", {{"value", 0.0}, {"axis", {0, 0, 1}}, {"axis_point", {0, 0, 0}}}}},
+        {{"id", "axis"}, {"type", "concentric"}, {"refs", refs}},
+        {{"id", "extension"}, {"type", "distance"}, {"refs", refs}, {"value", 300.0}}});
+    ResolvedGeometry geometry;
+    geometry[{"drive", 0}] = mgeom("plane", {0, 0, 0}, {1, 0, 0}, {0, 0, 1});
+    geometry[{"drive", 1}] = geometry.at({"drive", 0});
+    for (int side = 0; side < 2; ++side) {
+        geometry[{"axis", side}] = mgeom("axis", {0, 0, 0}, {0, 1, 0}, {0, 1, 0});
+        geometry[{"extension", side}] = mgeom("plane", {0, 0, 0}, {0, 1, 0}, {0, 1, 0});
+    }
+    std::optional<WarmMap> warm;
+    for (double degrees : {0.0, 15.0, 40.0, -25.0}) {
+        INFO("drive=" << degrees);
+        mates[0]["value"]["value"] = degrees;
+        const auto solved = solve_mates(components, mates, geometry, warm, std::nullopt, 1e-11, 150);
+        REQUIRE(solved.converged);
+        const Matrix3d rotation = rodrigues({0, 0, degrees * kDeg2Rad});
+        const auto& slider = solved.params.at("slider");
+        CHECK((slider.first - rotation * Vector3d(0, 300, 0)).norm() < 1e-7);
+        CHECK((rodrigues(slider.second).col(1) - rotation.col(1)).norm() < 1e-9);
+        warm = solved.params;
+    }
 }

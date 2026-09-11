@@ -6,16 +6,22 @@
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include <doctest/doctest.h>
 
+#include <cmath>
 #include <filesystem>
 #include <string>
 #include <vector>
 
+#include <BRepAlgoAPI_Fuse.hxx>
 #include <BRepPrimAPI_MakeBox.hxx>
 #include <TopoDS_Shape.hxx>
+#include <Standard_Version.hxx>
 #include <gp_Pnt.hxx>
 
+#include "doc/assembly.h"
 #include "doc/formats.h"
 #include "doc/session.h"
+#include "doc/selectors.h"
+#include "doc/stepplus.h"
 
 using nlohmann::json;
 namespace fs = std::filesystem;
@@ -360,4 +366,81 @@ TEST_CASE("an unsatisfiable mate network is reported, named and bounded") {
 
     fs::remove(pa);
     fs::remove(pb);
+}
+
+TEST_CASE("legacy split-face caches cannot override queried component topology") {
+    // A geometry-semantic change can merge coplanar faces without changing the
+    // document or OCCT version. Reproduce the old hub-cache disagreement with a
+    // simple plate: the old BREP has two top faces; the current feature has one.
+    const TopoDS_Shape left =
+        BRepPrimAPI_MakeBox(gp_Pnt(0, 0, 0), 10.0, 10.0, 2.0).Shape();
+    const TopoDS_Shape right =
+        BRepPrimAPI_MakeBox(gp_Pnt(10, 0, 0), 10.0, 10.0, 2.0).Shape();
+    BRepAlgoAPI_Fuse fuse(left, right);  // deliberately no same-domain unification
+    REQUIRE(fuse.IsDone());
+    const TopoDS_Shape split = fuse.Shape();
+    const json part = {
+        {"schema", "aicad.part/1"}, {"id", "legacy-plate"}, {"name", "Plate"},
+        {"units", {{"system", "MMGS"}}},
+        {"features", json::array({
+            {{"id", "f1"}, {"name", "Plate"}, {"type", "box"}, {"suppressed", false},
+             {"params", {{"length", 20.0}, {"width", 10.0}, {"height", 2.0},
+                         {"centered", false}}},
+             {"refs", json::object()}}
+        })}};
+    const json header = {
+        {"engine", "chudware-geomcache/1;occt=" OCC_VERSION_COMPLETE},
+        {"doc_hash", doc::stepplus_doc_hash(part)}, {"solved", true}};
+    const fs::path path = tmp("legacy_split_faces.step+");
+    struct Cleanup {
+        fs::path path;
+        std::string doc_id;
+        ~Cleanup() {
+            if (!doc_id.empty()) doc::doc_close(doc_id);
+            std::error_code ec;
+            fs::remove(path, ec);
+        }
+    } cleanup{path, {}};
+    doc::stepplus_save(part, path.string(),
+        {{"cache.json", header.dump()}, {"cache.brep", doc::brep_cache_encode({split})}});
+
+    cleanup.doc_id = doc::doc_open(path.string(), /*as_solid=*/false, /*detach_path=*/true)
+                         .at("doc_id").get<std::string>();
+    const json query = doc::doc_query(cleanup.doc_id,
+        {{"of", "face"}, {"surf", "plane"}, {"side", "top"},
+         {"pick", "largest"}, {"count", 1}});
+    REQUIRE(query.at("matches").size() == 1);
+    const json selector = query.at("matches").at(0);
+    REQUIRE(selector.at("area_or_len").get<double>() == doctest::Approx(200.0));
+    // Control: it is genuinely ambiguous against the obsolete split topology.
+    // The fix must invalidate that snapshot, not relax selector resolution.
+    CHECK_FALSE(doc::resolve(selector, doc::describe_faces(split), std::sqrt(504.0)).index);
+
+    const json assembly = {
+        {"schema", "aicad.asm/1"},
+        {"components", json::array({
+            {{"id", "fixed"}, {"name", "Fixed"}, {"fixed", true},
+             {"source", {{"path", path.string()}}}, {"transform", pose_tx(0)}},
+            {{"id", "moving"}, {"name", "Moving"}, {"fixed", false},
+             {"source", {{"path", path.string()}}}, {"transform", pose_tx(40)}}
+        })},
+        {"mates", json::array({
+            {{"id", "lock"}, {"type", "lock"}, {"refs", json::array({
+                {{"component", "fixed"}, {"selector", selector}},
+                {{"component", "moving"}, {"selector", selector}}
+            })}}
+        })}};
+    const auto result = doc::compile_assembly(assembly);
+    REQUIRE(result.component_status.size() == 2);
+    for (const auto& component : result.component_status) REQUIRE(component.ok);
+    REQUIRE(result.mate_status.size() == 1);
+    CHECK(result.mate_status.front().dangling_refs.empty());
+    CHECK(result.mate_status.front().status == "ok");
+    REQUIRE(result.converged);
+    CHECK(result.dof == 0);
+    CHECK(result.max_residual <= result.tolerance);
+    const auto& moved = result.transforms.at("moving");
+    CHECK(std::abs(moved[3] - 40.0) < 1e-7);  // lock preserves the authored relative pose
+    CHECK(std::abs(moved[7]) < 1e-7);
+    CHECK(std::abs(moved[11]) < 1e-7);
 }

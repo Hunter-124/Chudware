@@ -38,6 +38,9 @@
 #include <TopoDS.hxx>
 #include <TopoDS_Compound.hxx>
 #include <gp_Circ.hxx>
+#include <gp_Cone.hxx>
+#include <gp_Cylinder.hxx>
+#include <gp_Sphere.hxx>
 #include <gp_Trsf.hxx>
 
 #include "doc/document.h"
@@ -66,7 +69,7 @@ struct LoadedComponent {
     std::vector<TopoInfo> faces;                  // across all bodies, flat
     std::vector<TopoInfo> edges;
     std::vector<TopoInfo> verts;
-    std::vector<TopoDS_Shape> face_shapes;        // parallel kernel faces (for adaptor radii)
+    std::vector<TopoDS_Shape> face_shapes;        // parallel kernel faces (analytic mate datums)
     std::vector<TopoDS_Shape> edge_shapes;
     std::vector<aicm::AppearanceRegion> appearance_regions;  // compound face IDs, not bodies
     std::string error;                          // incomplete source; surviving geometry retained
@@ -398,42 +401,6 @@ double bbox_diag(const std::vector<TopoDS_Shape>& bodies) {
     return std::max(d, 1e-3);
 }
 
-double cyl_radius(const TopoDS_Shape& face_shape) {
-    try {
-        BRepAdaptor_Surface ad(TopoDS::Face(face_shape));
-        if (ad.GetType() == GeomAbs_Cylinder) return ad.Cylinder().Radius();
-        if (ad.GetType() == GeomAbs_Cone) return ad.Cone().RefRadius();
-    } catch (...) {}
-    return 0.0;
-}
-
-double sphere_radius(const TopoDS_Shape& face_shape) {
-    try {
-        BRepAdaptor_Surface ad(TopoDS::Face(face_shape));
-        if (ad.GetType() == GeomAbs_Sphere) return ad.Sphere().Radius();
-    } catch (...) {}
-    return 0.0;
-}
-
-double circle_radius(const TopoDS_Shape& edge_shape) {
-    try {
-        BRepAdaptor_Curve ad(TopoDS::Edge(edge_shape));
-        if (ad.GetType() == GeomAbs_Circle) return ad.Circle().Radius();
-    } catch (...) {}
-    return 0.0;
-}
-
-Eigen::Vector3d circle_centre(const TopoDS_Shape& edge_shape, const Eigen::Vector3d& fallback) {
-    try {
-        BRepAdaptor_Curve ad(TopoDS::Edge(edge_shape));
-        if (ad.GetType() == GeomAbs_Circle) {
-            gp_Pnt c = ad.Circle().Location();
-            return Eigen::Vector3d(c.X(), c.Y(), c.Z());
-        }
-    } catch (...) {}
-    return fallback;
-}
-
 // Resolve a selector against a component's LOCAL geometry into a MateGeom (port of
 // assembly.py::_selector_to_mategeom). Returns false (out-param unset) on a dangle.
 bool selector_to_mategeom(const json& selector, const LoadedComponent& lc,
@@ -448,23 +415,56 @@ bool selector_to_mategeom(const json& selector, const LoadedComponent& lc,
         const TopoDS_Shape& fs = lc.face_shapes[*rr.index];
         const std::string surf = info.surf ? *info.surf : std::string();
         if (surf == "plane") {
+            if (!info.axis) return false;
             out.kind = "plane";
             out.point = info.centroid;
-            out.normal = info.axis ? *info.axis : Eigen::Vector3d(0, 0, 1);
+            out.normal = *info.axis;
             return true;
         }
         if (surf == "cylinder" || surf == "cone") {
-            out.kind = "axis";
-            out.point = info.centroid;
-            out.direction = info.axis ? *info.axis : Eigen::Vector3d(0, 0, 1);
-            out.radius = cyl_radius(fs);
-            return true;
+            try {
+                BRepAdaptor_Surface ad(TopoDS::Face(fs));
+                gp_Ax1 axis;
+                double radius;
+                if (surf == "cylinder" && ad.GetType() == GeomAbs_Cylinder) {
+                    const gp_Cylinder cylinder = ad.Cylinder();
+                    axis = cylinder.Axis();
+                    radius = cylinder.Radius();
+                } else if (surf == "cone" && ad.GetType() == GeomAbs_Cone) {
+                    const gp_Cone cone = ad.Cone();
+                    axis = cone.Axis();
+                    radius = cone.RefRadius();
+                } else {
+                    return false;
+                }
+                const gp_Pnt& origin = axis.Location();
+                const gp_Dir& direction = axis.Direction();
+                const Eigen::Vector3d p(origin.X(), origin.Y(), origin.Z());
+                const Eigen::Vector3d d(direction.X(), direction.Y(), direction.Z());
+                out.kind = "axis";
+                // Trimming displaces the area centroid radially away from the bore.
+                // Retain its axial station (for hinge/distance mates), not that offset.
+                out.point = p + d * (info.centroid - p).dot(d);
+                out.direction = d;
+                out.radius = radius;
+                return true;
+            } catch (const Standard_Failure&) {
+                return false;
+            }
         }
         if (surf == "sphere") {
-            out.kind = "sphere";
-            out.point = info.centroid;
-            out.radius = sphere_radius(fs);
-            return true;
+            try {
+                BRepAdaptor_Surface ad(TopoDS::Face(fs));
+                if (ad.GetType() != GeomAbs_Sphere) return false;
+                const gp_Sphere sphere = ad.Sphere();
+                const gp_Pnt& center = sphere.Location();
+                out.kind = "sphere";
+                out.point = Eigen::Vector3d(center.X(), center.Y(), center.Z());
+                out.radius = sphere.Radius();
+                return true;
+            } catch (const Standard_Failure&) {
+                return false;
+            }
         }
         // other surfaces: a plane at the centroid with its best normal.
         out.kind = "plane";
@@ -479,11 +479,20 @@ bool selector_to_mategeom(const json& selector, const LoadedComponent& lc,
         const TopoInfo& info = lc.edges[*rr.index];
         const TopoDS_Shape& es = lc.edge_shapes[*rr.index];
         if (info.surf && *info.surf == "circle") {
-            out.kind = "axis";
-            out.point = circle_centre(es, info.centroid);
-            out.direction = info.axis ? *info.axis : Eigen::Vector3d(0, 0, 1);
-            out.radius = circle_radius(es);
-            return true;
+            try {
+                BRepAdaptor_Curve ad(TopoDS::Edge(es));
+                if (ad.GetType() != GeomAbs_Circle) return false;
+                const gp_Circ circle = ad.Circle();
+                const gp_Pnt& center = circle.Location();
+                const gp_Dir& direction = circle.Axis().Direction();
+                out.kind = "axis";
+                out.point = Eigen::Vector3d(center.X(), center.Y(), center.Z());
+                out.direction = Eigen::Vector3d(direction.X(), direction.Y(), direction.Z());
+                out.radius = circle.Radius();
+                return true;
+            } catch (const Standard_Failure&) {
+                return false;
+            }
         }
         out.kind = "axis";
         out.point = info.centroid;

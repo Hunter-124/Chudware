@@ -108,6 +108,12 @@ struct SimLoad {
     float tAmbC = 25.0f;            // ambient temperature C (thermalKind 1)
 };
 
+struct MotionDriver {
+    std::string mateId;
+    double start = 0.0;
+    double stop = 360.0;
+};
+
 // A study definition + its last (transient, not-persisted) result.
 struct Study {
     std::string id;                 // engine-assigned ("study-XXXXXXXX")
@@ -213,19 +219,23 @@ struct Study {
     float flowPowerW = 20.0f;       // power dissipated inside the solid (W)
 
     // ---- Motion study (StudyType::Motion) ----
-    // Drives ONE dimensional assembly mate across [motionStart, motionStop] in `motionSteps`
-    // samples; re-solves the mate graph at each step. Per-component world transforms are keyed
-    // by stable component id and played back against a cached world-space AICM base pose.
-    std::string motionMateId;           // mate id to drive (empty = auto-pick single drivable mate)
-    float motionStart = 0.0f;           // driver start value (deg or mm)
-    float motionStop  = 360.0f;         // driver stop value
+    // Synchronized dimensional mates, sampled at the same normalized time.
+    std::vector<MotionDriver> motionDrivers = {MotionDriver{}};
     int   motionSteps = 24;             // number of samples [2..120]
-    bool  motionLoop  = true;           // append a closing sample back at start
-    bool  motionCheckInterference = false;  // run interference check at each step
+    bool  motionLoop  = true;           // wrap playback to the first sample
+    bool  motionCheckInterference = true;
+    double motionMinClearance = 0.0;    // mm; intersections always checked
     float motionFps   = 24.0f;          // playback speed (frames per second)
 
     // Transient result (filled by runMotion, never persisted).
     bool  motionHasResult = false;
+    bool  motionRunning = false;
+    uint64_t motionGeneration = 0;      // invalidates queued results after settings edits/deletion
+    nlohmann::json motionSource;        // assembly inputs, excluding persisted study settings
+    int motionSourceRevision = -1;     // last mirror revision checked against motionSource
+    nlohmann::json motionInterference;  // complete/frames_checked/pair_failures from this run only
+    nlohmann::json motionResultDrivers; // native type/unit metadata for all drivers
+    std::vector<int> motionCollisionFrames;
     bool  motionPlaying   = false;
     int   motionFrame     = 0;          // current displayed frame
     double motionLastTick = -1.0;       // ImGui::GetTime() at last frame advance
@@ -345,6 +355,9 @@ public:
     // against its last-seen value and re-upload only on a change. Per-SimManager (per-document), so
     // it never resets or goes backwards for the life of one document's manager.
     uint64_t overlayGeneration() const { return overlayGeneration_; }
+
+    // Collision faces are already transformed to the selected sampled pose.
+    bool motionCollisionHighlightActive() const { return motionHighlightPose_; }
 
     // ---- honest presentation-budget disclosure ---------------------------------------------------
     // One short line describing the decimation currently applied to the SELECTED study's cached
@@ -469,21 +482,29 @@ private:
     void runStaticOrModal(AppState& st, Study& s);
     void runFlow(AppState& st, Study& s);
     void runFatigue(AppState& st, Study& s);
-    // Motion study: call simulate_motion synchronously on the worker, parse the trajectory,
-    // show frame 0 and navigate to Results. runMotion is called once from run().
+    // AsyncRpc owns the long worker calls; completion is pinned to document/study/generation.
     void runMotion(AppState& st, Study& s);
-    // Cache the active document's world-space AICM plus its stable body-id -> component-id join and
-    // the world transform already baked into each body's vertices.
-    bool prepareMotionCache(AppState& st, Study& s, std::string& err);
+    struct MotionRun;
+    std::shared_ptr<MotionRun> motionRun_;
+    Study* motionRunStudy(AppState& st, const std::shared_ptr<MotionRun>& run);
+    void finishMotionRun(AppState& st, const std::shared_ptr<MotionRun>& run,
+                         const core::RpcResult& result);
+    void invalidateMotion(Study& s);
+    // Cache one activation's world-space AICM and stable body/component transform join.
+    bool prepareMotionCache(Study& s, const nlohmann::json& activation,
+                            const std::string& docId,
+                            std::shared_ptr<const render::DocMesh> mesh, std::string& err);
     // Apply frameWorld * inverse(cachedBaseWorld) to the cached world-space vertices, validate the
     // complete frame, then atomically re-upload it. Returns false without touching the renderer.
     bool applyMotionFrame(AppState& st, Study& s, int frame);
     // Validate the per-component position-magnitude trace inputs.
     void buildMotionTrace(Study& s);
-    // Inline form for a Motion study (mate-id / range / steps / interference / fps / loop).
+    // Inline form for named driver rows / ranges / samples / interference / fps / loop.
     void drawMotionForm(AppState& st, Study& s);
     // Timeline transport bar (rewind / step-back / play-pause / step-fwd / scrub slider).
     void drawMotionTimeline(AppState& st, Study& s);
+    void highlightMotionCollisions(AppState& st, const Study& s,
+                                   const nlohmann::json* pair = nullptr);
     // Full results panel for a completed motion study (timeline + trace plot).
     void drawMotionResults(AppState& st, Study& s);
     // Advance the playback frame on the main thread (called from tick()).
@@ -766,10 +787,12 @@ private:
     // playback across workspace/document-tab switches without leaking it to another document.
     // AICM vertices are world-space; base transforms are keyed by stable component id and removed
     // from each requested frame before upload.
-    render::DocMesh motionDocMesh_;
+    std::shared_ptr<const render::DocMesh> motionDocMesh_;
     std::string motionCacheDocId_;
     std::map<uint32_t, std::string> motionComponentByBodyId_;
     std::map<std::string, std::array<double, 16>> motionInverseBaseWorldByComponentId_;
+    uint64_t modelRestoreGeneration_ = 0;
+    bool motionHighlightPose_ = false; // shared selection overlay temporarily carries a sampled pose
 
     // Custom-material editor scratch (filled by the "+ New material…" popup).
     char cmName_[64] = "";

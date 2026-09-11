@@ -49,7 +49,8 @@ def parts_hub_with_metadata_part(monkeypatch):
     # Provide small temp files for photo + datasheet so seeding can copy them.
     tmp = tempfile.mkdtemp(prefix="re23_assets_")
     photo_path = Path(tmp) / "front_view.jpg"
-    photo_path.write_bytes(b"\xff\xd8\xff\xe0" + b"\x00" * 10)  # minimal JFIF header
+    image = pytest.importorskip("PIL.Image")
+    image.new("RGB", (32, 32), "red").save(photo_path)
     ds_path = Path(tmp) / "datasheet.pdf"
     ds_path.write_bytes(b"%PDF-1.4 fake\n")
 
@@ -161,17 +162,16 @@ class TestRevengPartsRoundtrip:
 
         # Seeding: the photo should have been copied into the session images/ dir.
         seeded = result.get("seeded", {})
-        assert seeded.get("images", 0) >= 1, \
-            f"Expected at least 1 image seeded; got seeded={seeded}"
+        assert seeded.get("images") == 1, seeded
 
         # The session directory should contain the image.
         sess_dir = reveng_dir / result["session_id"]
         images = list((sess_dir / "images").glob("*.jpg"))
-        assert images, "No images found in session images/ dir after seeding"
+        assert [path.read_bytes() for path in images] == [Path(photo_path).read_bytes()]
 
         # Datasheet should also be present.
         ds_files = list((sess_dir / "datasheet").iterdir())
-        assert ds_files, "No datasheet found in session datasheet/ dir after seeding"
+        assert [path.read_bytes() for path in ds_files] == [Path(ds_path).read_bytes()]
 
         # Provenance should record the seed step.
         prov_steps = [p["step"] for p in sess.get("provenance", [])]

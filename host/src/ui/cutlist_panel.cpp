@@ -6,15 +6,17 @@
 // result is cached and re-pulled when the mirror's doc id or revision changes, or on Refresh.
 #include "cutlist_panel.h"
 
+#include <algorithm>
 #include <string>
 
 #include "imgui.h"
-#include "imgui_internal.h"     // ImRect (ui::adaptivePanel / ui::glassPanel rect argument)
 
 #include "../core/app_state.h"
 #include "../core/doc_mirror.h"
 #include "../ui_theme.h"        // ui::palette / ui::uiScale
 #include "layout.h"             // setNextCommandDialogPlacement (floating dialog anchor)
+#include "metrics.h"
+#include "widgets/kit.h"
 #include "property_manager.h"   // pmFormatDim — match the rest of the UI's dim formatting
 
 namespace ui {
@@ -68,49 +70,19 @@ void CutListPanel::refresh(AppState& st) {
 
 void CutListPanel::draw(AppState& st) {
     if (!st.showCutListPanel) return;
-    // Frosted-glass fill so the floating panel joins the app-wide glass family.
-    ui::setNextCommandDialogPlacement();   // sane first-open anchor over the full-width viewport
-    ImGui::SetNextWindowSize(ImVec2(560 * ui::uiScale, 380 * ui::uiScale), ImGuiCond_FirstUseEver);
-    // Liquid-glass v2: transparent native WindowBg so the adaptive glassPanel (painted below,
-    // once Begin succeeds) is the only fill — ImGui's dark rect must not compete with the frost.
-    // The title bar renders DURING Begin (before our glass paint), so give it its own opaque-ish
-    // glassBg backing via a scoped TitleBg push (the theme sets it transparent globally); we then
-    // frost only the CONTENT region so the title/X stay crisp instead of filmed over.
-    const ImVec4 titleTint(ui::palette.glassBg[0], ui::palette.glassBg[1],
-                           ui::palette.glassBg[2], ui::palette.glassBg[3]);
-    ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0, 0, 0, 0));
-    ImGui::PushStyleColor(ImGuiCol_TitleBg, titleTint);
-    ImGui::PushStyleColor(ImGuiCol_TitleBgActive, titleTint);
-    ImGui::PushStyleColor(ImGuiCol_TitleBgCollapsed, titleTint);
-    const bool clVis = ImGui::Begin("Cut List", &st.showCutListPanel);
-    ImGui::PopStyleColor(3);  // title bar already rendered; WindowBg stays for the frame
-    if (!clVis) {
+    ui::setNextCommandDialogPlacement("Cut List",
+        ImVec2(ui::metrics::px(680), ui::metrics::px(440)),
+        ImVec2(ui::metrics::px(320), ui::metrics::px(260)));
+    ImGui::SetNextWindowBgAlpha(1.0f);
+    if (!ImGui::Begin("Cut List", &st.showCutListPanel, ImGuiWindowFlags_NoDocking)) {
         ImGui::End();
-        ImGui::PopStyleColor();
         return;
     }
-
-    // Paint the panel's own frosted-glass background over the content region (below title).
-    const ImVec2 wp = ImGui::GetWindowPos(), ws = ImGui::GetWindowSize();
-    const float contentTopY = ImGui::GetCursorScreenPos().y - ImGui::GetStyle().WindowPadding.y;
-    const ImRect winRect(ImVec2(wp.x, contentTopY), ImVec2(wp.x + ws.x, wp.y + ws.y));
-    const ui::AdaptiveSurface& surf =
-        ui::adaptivePanel(ui::panelId("host_cutlist_glass"), winRect, ui::GlassGroup::Global);
-    ui::glassPanel(ImGui::GetWindowDrawList(), winRect, ui::GlassLevel::Regular, 12.0f, surf);
-    // Default ink for the plain table readouts tracks the frost's contrast tone.
-    ImGui::PushStyleColor(ImGuiCol_Text, surf.textPrimary);
-
-    const auto& pal = ui::palette;
-    const ImVec4 accentCol(pal.accent[0], pal.accent[1], pal.accent[2], 1);
-    // Contrast-matched text over the frosted backdrop (dim = secondary tone).
-    const ImVec4 dimCol = surf.textSecondary;
-
     // Gate: only part docs have a weldment cut list. Drawing tabs / no-doc show a hint.
     if (!cutListApplicable(st)) {
-        ImGui::TextColored(dimCol, "Open a part to see its weldment cut list.");
+        ui::kit::dimText("Open a part to see its weldment cut list.");
         cacheValid_ = false;
         ImGui::End();
-        ImGui::PopStyleColor(2);  // text ink + WindowBg
         return;
     }
 
@@ -121,23 +93,11 @@ void CutListPanel::draw(AppState& st) {
         cacheValid_ = false;
     if (!cacheValid_) refresh(st);
 
-    // ---- header + Refresh ----
-    ImGui::PushFont(st.fonts.medium);
-    ImGui::TextColored(accentCol, "Weldment Cut List");
-    ImGui::PopFont();
-    ImGui::SameLine();
-    ImGui::TextColored(dimCol, "(%d item%s)", (int)rows_.size(),
-                       rows_.size() == 1 ? "" : "s");
-    ImGui::SameLine(ImGui::GetWindowWidth() - 90.0f * ui::uiScale);
-    if (ImGui::Button("Refresh")) cacheValid_ = false;
-
-    // ---- empty hint: a part with no weld_member features ----
+    ui::kit::sectionHeader("Weldment Cut List", nullptr, nullptr, (int)rows_.size(), true);
     if (rows_.empty()) {
-        ImGui::Separator();
-        ImGui::TextColored(dimCol, "No weldment members.");
-        ImGui::TextColored(dimCol, "Add a Structural Member (Weldments tab) to populate the cut list.");
+        ui::kit::dimText("No weldment members. Add a Structural Member from the Weldments tab to populate the cut list.");
+        if (ui::kit::secondaryButton("Refresh")) cacheValid_ = false;
         ImGui::End();
-        ImGui::PopStyleColor(2);  // text ink + WindowBg
         return;
     }
 
@@ -145,16 +105,20 @@ void CutListPanel::draw(AppState& st) {
 
     // ---- cut-list table ----
     const ImGuiTableFlags flags = ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg |
-                                  ImGuiTableFlags_SizingStretchProp |
+                                  ImGuiTableFlags_SizingFixedFit | ImGuiTableFlags_ScrollX |
                                   ImGuiTableFlags_ScrollY | ImGuiTableFlags_Resizable;
-    if (ImGui::BeginTable("cutlist", 6, flags)) {
+    const float footerHeight = 2 * ImGui::GetTextLineHeightWithSpacing() +
+                               ImGui::GetFrameHeightWithSpacing() + ui::kit::sectionGap();
+    const float tableHeight = std::max(ImGui::GetFrameHeightWithSpacing(),
+                                      ImGui::GetContentRegionAvail().y - footerHeight);
+    if (ImGui::BeginTable("cutlist", 6, flags, ImVec2(0, tableHeight))) {
         ImGui::TableSetupScrollFreeze(0, 1);
-        ImGui::TableSetupColumn("Item", ImGuiTableColumnFlags_WidthFixed, 40.0f * ui::uiScale);
-        ImGui::TableSetupColumn("Profile", ImGuiTableColumnFlags_WidthStretch, 1.0f);
-        ImGui::TableSetupColumn("Description", ImGuiTableColumnFlags_WidthStretch, 2.0f);
-        ImGui::TableSetupColumn("Length", ImGuiTableColumnFlags_WidthStretch, 1.0f);
-        ImGui::TableSetupColumn("Qty", ImGuiTableColumnFlags_WidthFixed, 40.0f * ui::uiScale);
-        ImGui::TableSetupColumn("Total Length", ImGuiTableColumnFlags_WidthStretch, 1.2f);
+        ImGui::TableSetupColumn("Item", ImGuiTableColumnFlags_WidthFixed, ui::metrics::px(44));
+        ImGui::TableSetupColumn("Profile", ImGuiTableColumnFlags_WidthFixed, ui::metrics::px(120));
+        ImGui::TableSetupColumn("Description", ImGuiTableColumnFlags_WidthFixed, ui::metrics::px(200));
+        ImGui::TableSetupColumn("Length", ImGuiTableColumnFlags_WidthFixed, ui::metrics::px(100));
+        ImGui::TableSetupColumn("Qty", ImGuiTableColumnFlags_WidthFixed, ui::metrics::px(44));
+        ImGui::TableSetupColumn("Total Length", ImGuiTableColumnFlags_WidthFixed, ui::metrics::px(120));
         ImGui::TableHeadersRow();
 
         const bool ips = st.ips();
@@ -166,10 +130,10 @@ void CutListPanel::draw(AppState& st) {
             ImGui::Text("%lld", cjint(r, "item"));
 
             ImGui::TableSetColumnIndex(1);
-            ImGui::TextUnformatted(cjstr(r, "profile").c_str());
+            ImGui::TextWrapped("%s", cjstr(r, "profile").c_str());
 
             ImGui::TableSetColumnIndex(2);
-            ImGui::TextUnformatted(cjstr(r, "description").c_str());
+            ImGui::TextWrapped("%s", cjstr(r, "description").c_str());
 
             ImGui::TableSetColumnIndex(3);
             ImGui::TextUnformatted(pmFormatDim(cjnum(r, "length_mm"), ips).c_str());
@@ -185,13 +149,13 @@ void CutListPanel::draw(AppState& st) {
 
     // ---- footer totals ----
     ImGui::Separator();
-    ImGui::TextColored(dimCol, "%d member%s total", totalMembers_, totalMembers_ == 1 ? "" : "s");
+    ImGui::TextWrapped("%d member%s total", totalMembers_, totalMembers_ == 1 ? "" : "s");
+    ImGui::TextWrapped("Total length: %s", pmFormatDim(totalLengthMm_, st.ips()).c_str());
+    if (ui::kit::secondaryButton("Refresh")) cacheValid_ = false;
     ImGui::SameLine();
-    ImGui::TextColored(dimCol, "  |  total length %s",
-                       pmFormatDim(totalLengthMm_, st.ips()).c_str());
+    if (ui::kit::secondaryButton("Close")) st.showCutListPanel = false;
 
     ImGui::End();
-    ImGui::PopStyleColor(2);  // text ink + WindowBg
 }
 
 }  // namespace ui

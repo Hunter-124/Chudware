@@ -641,3 +641,20 @@ Omitted mode retains the existing compiler defaults: `boss` for primitives,
 profile-feature schemas require an explicit `params.mode`; callers should always
 state their intended body policy. The `op` of an explicit `boolean` feature and
 the engraving/thread-specific `mode` vocabularies are separate contracts.
+
+## Persistent assembly mate reference frames (2026-09-11)
+
+Native mates carry engine-owned `reference_frames`: an object keyed by referenced
+component ID, with each value a 16-number row-major component placement. New mates
+capture these frames when created; caller-supplied bindings in `asm_add_mate` are
+discarded. Legacy mates without bindings capture the first observed placements
+before compilation or operation-batch placement changes.
+
+These are the stable frames for derived angle datums, virtual hinge pins and lock
+rest transforms, not live component poses. Solved-transform writeback, scalar or
+alignment edits, suppression, rebuild and save/reopen do not redefine them.
+Serialization follows the existing canonical document precision policy. Motion
+binds any missing legacy frames only in its private snapshot; it does not mutate
+the source document. A legacy file lacking this metadata cannot establish a lost
+original zero frame; first-observed binding preserves its existing interpretation,
+not an inferred design datum.

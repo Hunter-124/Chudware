@@ -104,6 +104,12 @@ duplication**, and it is why the product read differently tab to tab.
   T-G21 affordance) — not shrink-to-pill.
 - **Overlay band**: screen-space rect between ribbon and status bar, published per-frame;
   floating dialogs (Measure, BOM, …) anchor inside it.
+- `setNextCommandDialogPlacement(windowName, preferredSizePx, minimumSizePx)` takes
+  already metric-scaled pixel sizes. Call immediately before the matching `Begin`.
+  It preserves user placement/size and recovers off-screen bounds after viewport
+  or DPI changes. Published columns guide the initial anchor, not a permanent
+  exclusion zone. Measure, Mass/Section Properties, BOM, Cut List and Design Table
+  use normal resizable windows; do not add `AlwaysAutoResize` or scale sizes twice.
 - "Reset layout" → `resetOverlayColumns()` restores default widths.
 - Frame-loop draw order lives in `run_gui()` in `host/src/app.cpp` (integrator-owned):
   title bar → left pane tabs → viewport → console → status bar → ribbon dispatch → modals.

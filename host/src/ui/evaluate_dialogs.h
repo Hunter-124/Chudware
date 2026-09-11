@@ -11,8 +11,8 @@
 // translucency via the overlay accessors below. Interference view tints bodies + overlap meshes;
 // Measure color-codes refs with viewport highlights + callouts.
 // Wave 3: massMarkers_ carry COM + bending-I value chips (unit-aware); sectionPlanes_ expose three
-// draggable orthogonal cutting planes with live section-prop re-eval. Field tools dock into the
-// Evaluate ribbon dead-space strip (ui::evalRibbonDock).
+// draggable orthogonal cutting planes with live section-prop re-eval. All analysis controls use
+// resizable floating command windows with persistent geometry.
 #pragma once
 
 #include <array>
@@ -53,7 +53,7 @@ struct InterferenceView {
         float rgbaA[4] = {1, 1, 1, 1};
         float rgbaB[4] = {1, 1, 1, 1};
         std::vector<float> overlapTris;  // flat xyz triples for Overlays::drawTriangles
-        float overlapRgba[4] = {0.90f, 0.20f, 0.18f, 0.60f};
+        float overlapRgba[4] = {1, 1, 1, 1};
     };
     std::vector<Pair> pairs;
 };
@@ -91,6 +91,8 @@ public:
     // Draw the currently-open result window (no-op when none is open). Also drives live Measure
     // re-eval and mass-design section fetches.
     void draw(AppState& st);
+    // Invalidate before viewport overlay consumption, including selections changed this frame.
+    void prepareFrame(AppState& st);
 
     // Which exclusive result window is open ("measure","check",...; empty = none). Mass and
     // Section use independent flags (massOpen_/sectionOpen_) so they can coexist.
@@ -139,6 +141,8 @@ private:
     void drawMassWindow(AppState& st);
     void drawSectionWindow(AppState& st);
     void drawExclusiveWindow(AppState& st);
+    void syncDocument(AppState& st);
+    void drawMeasure(AppState& st);
 
     // Exclusive tools (measure/check/interference/draft/thickness/curvature/zebra/symmetry).
     // Mass and Section are independent so both can be open at once.
@@ -148,6 +152,8 @@ private:
     std::string errorText_;      // exclusive-tool error
     bool pending_ = false;
     int  gen_ = 0;
+    std::string evalDocId_;
+    int evalDocRevision_ = -1;
 
     // Independent Mass Properties window + its own result slot (survives exclusive tools).
     bool massOpen_ = false;
@@ -182,13 +188,12 @@ private:
     int designSectionsPending_ = 0;
     bool designSectionsDirty_ = false;
 
-    // Measure accumulation + live mode.
+    // Live measure: selection identity includes unresolved picks so every change invalidates.
     std::vector<std::string> measureLog_;
-    int   measureLoggedGen_ = -1;
     std::string lastMeasureRefs_;
-    double lastMeasureFireT_ = -1e9;
-    // Stable palette colors for the last measured refs (same order as selectionRefs).
-    std::vector<std::array<float, 4>> measureRefColors_;
+    bool measureResolving_ = false;
+    bool measureDirty_ = false;
+    double lastMeasureChangeT_ = -1e9;
 
     // Section props: 3 orthogonal planes through centroid with per-plane offset along normal.
     // (Legacy sectionPlane_ combo removed — 3-card layout replaces it.)
@@ -210,7 +215,7 @@ private:
     int   curvatureKind_ = 0;       // 0=mean 1=gaussian 2=max 3=min
     float thicknessRes_ = 0.5f;     // optional resolution hint (mm)
 
-    // Interference member subset (names from last result parts[]; empty = all).
+    // Interference member subset; inventory comes only from an unfiltered result.
     std::vector<std::string> interferencePartNames_;
     std::vector<char> interferencePartChecked_;  // parallel to names; 1 = included
 

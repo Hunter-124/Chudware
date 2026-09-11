@@ -737,6 +737,8 @@ QueryPicks resolve_geom_query(const TopoDS_Shape& shape, const nlohmann::json& q
                     // boolean+fillet (a convex fillet can come back REVERSED), so we don't trust
                     // it. nullopt (degenerate normal) -> fall back to the radius heuristic.
                     c.concave = cylinder_face_concave(f);
+                } else if (st == GeomAbs_Sphere) {
+                    c.radius = ad.Sphere().Radius();
                 } else if (st == GeomAbs_Cone) {
                     gp_Ax1 ax = ad.Cone().Axis();
                     c.axis = Eigen::Vector3d(ax.Direction().X(), ax.Direction().Y(),

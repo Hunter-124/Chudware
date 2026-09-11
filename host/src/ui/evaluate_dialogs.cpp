@@ -11,8 +11,9 @@
 #include "imgui_internal.h"     // ImRect (ui::adaptivePanel / ui::glassPanel rect argument)
 
 #include "appearance_common.h"
-#include "layout.h"    // setNextCommandDialogPlacement / evalRibbonDock
+#include "layout.h"
 #include "metrics.h"
+#include "widgets/kit.h"
 #include "../core/app_state.h"
 #include "../renderer.h"
 #include "../ui_theme.h"
@@ -25,35 +26,48 @@ namespace ui {
 // renderer's default frequency; the slider (4..60) drives it live via Renderer::setZebra().
 static float gZebraFreq = 18.0f;
 
-// Fixed 10-color palette for Measure ref chips + Interference body/overlap tints (Contract).
-static const float kEvalPalette[10][4] = {
-    {0.90f, 0.20f, 0.18f, 1.0f},  // red
-    {0.95f, 0.55f, 0.15f, 1.0f},  // orange
-    {0.95f, 0.80f, 0.20f, 1.0f},  // amber
-    {0.30f, 0.75f, 0.30f, 1.0f},  // green
-    {0.18f, 0.78f, 0.72f, 1.0f},  // teal
-    {0.20f, 0.65f, 0.90f, 1.0f},  // cyan
-    {0.25f, 0.45f, 0.90f, 1.0f},  // blue
-    {0.55f, 0.35f, 0.85f, 1.0f},  // violet
-    {0.85f, 0.30f, 0.70f, 1.0f},  // magenta
-    {0.60f, 0.40f, 0.25f, 1.0f},  // brown
-};
+// Shared with the viewport and MCP measurement emphasis contract.
+static const auto& kEvalPalette = ui::evalEmphasisPalette;
 
 // Format a linear value (canonical mm) for an evaluate readout in the active document units.
 static std::string evalLen(AppState& st, double mm) { return pmFormatDim(mm, st.ips()); }
 
-// Build the refs array for eval_measure from the current selection's resolved selectors (cap 8).
-static nlohmann::json selectionRefs(AppState& st) {
+struct MeasureSelection {
     nlohmann::json refs = nlohmann::json::array();
-    for (const auto& it : st.selection.items()) {
-        if (it.selector.empty()) continue;
-        try {
-            refs.push_back(nlohmann::json::parse(it.selector));
-        } catch (...) {
+    std::string key;
+    std::string error;
+    bool resolving = false;
+};
+
+// Preserve every selected pick in the identity, including unresolved and failed picks.
+// Never submit a resolved subset: that would label the wrong measurement as the selection.
+static MeasureSelection measureSelection(const AppState& st) {
+    MeasureSelection out;
+    nlohmann::json identity = nlohmann::json::array();
+    for (const auto& item : st.selection.items()) {
+        identity.push_back({item.hit.body_id, item.hit.topo_id, (int)item.hit.kind,
+                            item.pending_resolve, item.selector, item.resolution_error});
+        out.resolving |= item.pending_resolve;
+        if (!item.resolution_error.empty()) {
+            if (out.error.empty()) out.error = item.resolution_error;
+            continue;
         }
-        if (refs.size() >= 8) break;
+        if (item.pending_resolve) continue;
+        if (item.hit.body_id == 0 || item.selector.empty()) {
+            out.error = "Selected geometry has no resolved body reference. Remove it and pick again.";
+            continue;
+        }
+        auto selector = nlohmann::json::parse(item.selector, nullptr, false);
+        if (selector.is_discarded() || !selector.is_object()) {
+            out.error = "Selected geometry returned an invalid reference. Remove it and pick again.";
+            continue;
+        }
+        out.refs.push_back({{"body_id", item.hit.body_id}, {"selector", std::move(selector)}});
     }
-    return refs;
+    if (st.selection.size() > 8)
+        out.error = "Measure supports up to 8 selections. Remove selections to continue.";
+    out.key = identity.dump();
+    return out;
 }
 
 // True when the open doc is an assembly or multi-body part — field analyses (draft/thickness/
@@ -135,63 +149,72 @@ static std::unordered_map<std::string, int> buildNameToBodyId(AppState& st) {
     return map;
 }
 
-// Unit-aware reading text from a measure result (summary line).
-static std::string measureReadingText(AppState& st, const nlohmann::json& r) {
-    auto numAt = [&](const char* k, double& out) -> bool {
-        if (r.contains(k) && r[k].is_number()) {
-            out = r[k].get<double>();
-            return true;
-        }
-        return false;
+using MeasureRows = std::vector<std::pair<std::string, std::string>>;
+
+// Render only quantities actually supplied by the kernel. Radius and diameter accompany
+// arc length rather than competing with it for a single summary slot.
+static MeasureRows measureRows(AppState& st, const nlohmann::json& result) {
+    MeasureRows rows;
+    auto number = [&](const char* key, const char* label, auto format) {
+        const auto it = result.find(key);
+        if (it != result.end() && it->is_number() && std::isfinite(it->get<double>()))
+            rows.emplace_back(label, format(it->get<double>()));
     };
-    std::string summary;
-    double v = 0;
-    if (numAt("distance", v))
-        summary = evalLen(st, v);
-    else if (numAt("length", v))
-        summary = evalLen(st, v);
-    else if (numAt("radius", v))
-        summary = "R " + evalLen(st, v);
-    else if (numAt("area", v))
-        summary = pmFormatArea(v, st.ips());
-    else if (numAt("volume", v))
-        summary = pmFormatVolume(v, st.ips());
-    else if (numAt("total_length", v))
-        summary = evalLen(st, v);
-    else if (numAt("total_distance", v))
-        summary = evalLen(st, v);
-    else if (numAt("perimeter", v))
-        summary = "P " + evalLen(st, v);
-    double ang = 0;
-    if (numAt("angle", ang)) {
-        char b[48];
-        std::snprintf(b, sizeof(b), "%.2f°", ang);
-        summary = summary.empty() ? std::string(b) : summary + " " + b;
+    auto length = [&](double value) { return evalLen(st, value); };
+    number("distance", "Minimum distance", length);
+    number("length", "Length", length);
+    number("radius", "Radius", length);
+    number("diameter", "Diameter", length);
+    if (!result.contains("diameter"))
+        number("radius", "Diameter", [&](double radius) { return length(2.0 * radius); });
+    number("perimeter", "Perimeter", length);
+    number("area", "Area", [&](double value) { return pmFormatArea(value, st.ips()); });
+    number("volume", "Volume", [&](double value) { return pmFormatVolume(value, st.ips()); });
+    number("total_length", "Total length", length);
+    number("total_distance", "Chain distance", length);
+    number("angle", "Angle", [](double angle) {
+        char value[48];
+        std::snprintf(value, sizeof(value), "%.4f deg", angle);
+        return std::string(value);
+    });
+    for (const char* key : {"segment_lengths", "distances"}) {
+        const auto it = result.find(key);
+        if (it == result.end() || !it->is_array()) continue;
+        for (size_t i = 0; i < it->size(); ++i) {
+            const auto& value = (*it)[i];
+            if (!value.is_number() || !std::isfinite(value.get<double>())) continue;
+            const std::string label = std::string(key[0] == 's' ? "Segment " : "Distance ") +
+                                      std::to_string(i + 1);
+            rows.emplace_back(label, length(value.get<double>()));
+        }
     }
-    if (summary.empty()) summary = r.value("kind", std::string("measure"));
-    return summary;
+    if (result.value("kind", std::string()) == "point" && result.contains("points") &&
+        result["points"].is_array() && !result["points"].empty()) {
+        const auto& p = result["points"][0];
+        if (p.is_array() && p.size() == 3) {
+            const char* axes[] = {"X", "Y", "Z"};
+            for (int i = 0; i < 3; ++i)
+                if (p[i].is_number()) rows.emplace_back(axes[i], length(p[i].get<double>()));
+        }
+    }
+    return rows;
 }
 
-// Draw a color-chip row: filled rounded rect behind the label text (axis/plane chip language).
+static std::string measureReadingText(AppState& st, const nlohmann::json& result) {
+    std::string text;
+    for (const auto& row : measureRows(st, result)) {
+        if (!text.empty()) text += "; ";
+        text += row.first + ": " + row.second;
+    }
+    return text;
+}
+
 static void drawColorChipRow(const char* text, const float rgba[4]) {
-    ImDrawList* dl = ImGui::GetWindowDrawList();
-    ImVec2 ts = ImGui::CalcTextSize(text);
-    const float padX = 6.0f * ui::uiScale;
-    const float padY = 2.0f * ui::uiScale;
-    ImVec2 p0 = ImGui::GetCursorScreenPos();
-    ImVec2 p1(p0.x + ts.x + padX * 2.0f, p0.y + ts.y + padY * 2.0f);
-    const float rnd = 4.0f * ui::uiScale;
-    ImU32 fill = IM_COL32((int)(rgba[0] * 255), (int)(rgba[1] * 255), (int)(rgba[2] * 255),
-                          (int)(0.35f * 255));
-    ImU32 bord = IM_COL32((int)(rgba[0] * 255), (int)(rgba[1] * 255), (int)(rgba[2] * 255),
-                          (int)(0.90f * 255));
-    dl->AddRectFilled(p0, p1, fill, rnd);
-    dl->AddRect(p0, p1, bord, rnd, 0, 1.0f * ui::uiScale);
-    ImGui::SetCursorScreenPos(ImVec2(p0.x + padX, p0.y + padY));
-    ImGui::TextUnformatted(text);
-    // Advance layout past the chip.
-    ImGui::SetCursorScreenPos(ImVec2(p0.x, p1.y + 2.0f * ui::uiScale));
-    ImGui::Dummy(ImVec2(1, 0));
+    ImGui::PushID(text);
+    if (kit::cardBegin("##colored_reading", nullptr, nullptr, nullptr, rgba))
+        ImGui::TextWrapped("%s", text);
+    kit::cardEnd();
+    ImGui::PopID();
 }
 
 static const char* kPlaneNames[] = {"plane.top", "plane.front", "plane.right"};
@@ -256,6 +279,8 @@ void EvaluateDialogs::seedMassFromDoc(AppState& st) {
 // Exclusive-tool slot (measure/check/interference/symmetry) — not mass/section.
 void EvaluateDialogs::runEval(AppState& st, const std::string& method,
                               const nlohmann::json& extra) {
+    const int gen = ++gen_;
+    clearOverlays();
     errorText_.clear();
     result_ = nlohmann::json::object();
     pending_ = false;
@@ -266,11 +291,20 @@ void EvaluateDialogs::runEval(AppState& st, const std::string& method,
     nlohmann::json params = {{"doc_id", st.docMirror.docId()}};
     for (auto it = extra.begin(); it != extra.end(); ++it) params[it.key()] = it.value();
     pending_ = true;
-    const int gen = ++gen_;
+    const std::string docId = st.docMirror.docId();
+    const int revision = st.docMirror.revision();
+    const std::string selectionKey = method == "eval_measure" ? lastMeasureRefs_ : std::string();
+    const bool fullInterferenceInventory = method == "eval_interference" && !extra.contains("members");
     ++st.rebuildsInFlight;
-    st.rpc.call(method, params, [this, &st, gen, method](const core::RpcResult& r) {
+    st.rpc.call(method, params, [this, &st, gen, method, docId, revision, selectionKey, fullInterferenceInventory](const core::RpcResult& r) {
         --st.rebuildsInFlight;
-        if (gen != gen_) return;  // a newer eval replaced this one
+        if (gen != gen_ || openWindow_.empty()) return;
+        if (st.docMirror.docId() != docId || st.docMirror.revision() != revision) {
+            evalDocRevision_ = -1;  // refresh this per-document window when it is reactivated
+            pending_ = false;
+            return;
+        }
+        if (method == "eval_measure" && measureSelection(st).key != selectionKey) return;
         pending_ = false;
         if (!r.ok) {
             errorText_ = r.err.empty() ? ("worker call failed: " + method) : r.err;
@@ -282,10 +316,24 @@ void EvaluateDialogs::runEval(AppState& st, const std::string& method,
             if (openWindow_ == "interference") rebuildInterferenceView(st);
             return;
         }
+        if (!r.result.is_object()) {
+            errorText_ = "Analysis returned an invalid result.";
+            return;
+        }
         result_ = r.result;
-        if (openWindow_ == "measure") rebuildMeasureOverlays(st);
-        if (openWindow_ == "interference") {
-            // Seed member checklist from parts[] once (preserve checks on re-run when names match).
+        if (openWindow_ == "measure") {
+            const std::string reading = measureReadingText(st, result_);
+            if (reading.empty()) {
+                result_ = nlohmann::json::object();
+                errorText_ = "No measurable quantity was returned for this selection. Try another face, edge, or vertex.";
+                return;
+            }
+            rebuildMeasureOverlays(st);
+            if (measureLog_.size() == 20) measureLog_.erase(measureLog_.begin());
+            measureLog_.push_back(reading);
+        }
+        if (openWindow_ == "interference" && fullInterferenceInventory) {
+            // Subset results must not remove unchecked members from the full inventory.
             std::vector<std::string> names;
             if (result_.contains("parts") && result_["parts"].is_array()) {
                 for (const auto& p : result_["parts"]) {
@@ -298,13 +346,20 @@ void EvaluateDialogs::runEval(AppState& st, const std::string& method,
                 interferencePartNames_ = names;
                 interferencePartChecked_.assign(names.size(), 1);
             }
-            rebuildInterferenceView(st);
         }
+        if (openWindow_ == "interference") rebuildInterferenceView(st);
     }, 60000);
 }
 
 // Dedicated mass eval slot so Mass Properties can stay open while exclusive tools use result_.
 void EvaluateDialogs::runMassEval(AppState& st, const nlohmann::json& extra) {
+    const int gen = ++massGen_;
+    ++designSectionGen_;
+    designSectionsPending_ = 0;
+    designSectionsDirty_ = false;
+    designSections_ = nlohmann::json::array({nullptr, nullptr, nullptr});
+    massMarkers_.clear();
+    massSegs_.clear();
     massErrorText_.clear();
     massResult_ = nlohmann::json::object();
     massPending_ = false;
@@ -315,11 +370,17 @@ void EvaluateDialogs::runMassEval(AppState& st, const nlohmann::json& extra) {
     nlohmann::json params = {{"doc_id", st.docMirror.docId()}};
     for (auto it = extra.begin(); it != extra.end(); ++it) params[it.key()] = it.value();
     massPending_ = true;
-    const int gen = ++massGen_;
+    const std::string docId = st.docMirror.docId();
+    const int revision = st.docMirror.revision();
     ++st.rebuildsInFlight;
-    st.rpc.call("eval_mass", params, [this, &st, gen](const core::RpcResult& r) {
+    st.rpc.call("eval_mass", params, [this, &st, gen, docId, revision](const core::RpcResult& r) {
         --st.rebuildsInFlight;
-        if (gen != massGen_) return;
+        if (gen != massGen_ || !massOpen_) return;
+        if (st.docMirror.docId() != docId || st.docMirror.revision() != revision) {
+            evalDocRevision_ = -1;
+            massPending_ = false;
+            return;
+        }
         massPending_ = false;
         if (!r.ok) {
             massErrorText_ = r.err.empty() ? "worker call failed: eval_mass" : r.err;
@@ -327,6 +388,11 @@ void EvaluateDialogs::runMassEval(AppState& st, const nlohmann::json& extra) {
         }
         if (r.result.is_object() && r.result.contains("code")) {
             massErrorText_ = r.result.value("message", std::string("evaluate error"));
+            return;
+        }
+        if (!r.result.is_object() || !r.result.contains("volume_mm3") ||
+            !r.result.contains("mass_g")) {
+            massErrorText_ = "Mass properties returned no volume or mass.";
             return;
         }
         massResult_ = r.result;
@@ -340,6 +406,9 @@ void EvaluateDialogs::runMassEval(AppState& st, const nlohmann::json& extra) {
 void EvaluateDialogs::runFieldEval(AppState& st, const std::string& method,
                                    const nlohmann::json& extra,
                                    const std::string& legendTitle, const std::string& units) {
+    const int gen = ++gen_;
+    clearOverlays();
+    clearFieldColormap(st);
     errorText_.clear();
     result_ = nlohmann::json::object();
     pending_ = false;
@@ -366,18 +435,18 @@ void EvaluateDialogs::runFieldEval(AppState& st, const std::string& method,
     nlohmann::json params = {{"doc_id", st.docMirror.docId()}};
     for (auto it = extra.begin(); it != extra.end(); ++it) params[it.key()] = it.value();
     pending_ = true;
-    const int gen = ++gen_;
+    const int revision = st.docMirror.revision();
     const std::string fieldDocId = st.docMirror.docId();
     // Keep the dock id visible while computing (do not flip to field_wait).
     if (restoreDock.empty()) openWindow_ = "field_wait";
     ++st.rebuildsInFlight;
     st.rpc.call(method, params,
-        [this, &st, gen, method, legendTitle, units, fieldDocId, restoreDock](const core::RpcResult& r) {
+        [this, &st, gen, method, legendTitle, units, fieldDocId, revision, restoreDock](const core::RpcResult& r) {
             --st.rebuildsInFlight;
-            if (gen != gen_) return;
-            if (st.docMirror.docId() != fieldDocId) {
+            if (gen != gen_ || openWindow_.empty()) return;
+            if (st.docMirror.docId() != fieldDocId || st.docMirror.revision() != revision) {
                 pending_ = false;
-                clearFieldColormap(st);
+                evalDocRevision_ = -1;
                 return;
             }
             pending_ = false;
@@ -453,7 +522,9 @@ void EvaluateDialogs::rebuildMeasureOverlays(AppState& st) {
     // Prefer explicit path, else points pair (distance line + mid labels).
     nlohmann::json pts = nlohmann::json::array();
     if (result_.contains("path") && result_["path"].is_array()) pts = result_["path"];
-    else if (result_.contains("points") && result_["points"].is_array()) pts = result_["points"];
+    else if (result_.value("kind", std::string()) != "multi_distance" &&
+             result_.contains("points") && result_["points"].is_array())
+        pts = result_["points"];
 
     if (pts.size() >= 2) {
         for (size_t i = 0; i + 1 < pts.size(); ++i) {
@@ -504,15 +575,6 @@ void EvaluateDialogs::rebuildMeasureOverlays(AppState& st) {
         }
         hits.push_back(h);
         if (hits.size() >= 8) break;
-    }
-
-    // Stable palette colors for chips / highlights (ref order).
-    measureRefColors_.clear();
-    measureRefColors_.reserve(hits.empty() ? 1 : hits.size());
-    const size_t nColor = hits.empty() ? 1 : hits.size();
-    for (size_t i = 0; i < nColor; ++i) {
-        const float* p = kEvalPalette[i % 10];
-        measureRefColors_.push_back({p[0], p[1], p[2], p[3]});
     }
 
     auto applyEnrich = [&](EvalHighlight& hl, const nlohmann::json& enrich) {
@@ -574,7 +636,7 @@ void EvaluateDialogs::rebuildMeasureOverlays(AppState& st) {
 
         overlayHighlights_.push_back(std::move(hl));
 
-        // Callout at anchor with the reading text (one per ref; same reading for multi is fine).
+        // Single-ref reading or a stable ref number matching the selection list.
         EvalCallout co;
         copyRgba(co.rgba, col, 0.95f);
         const EvalHighlight& hlr = overlayHighlights_.back();
@@ -589,13 +651,7 @@ void EvaluateDialogs::rebuildMeasureOverlays(AppState& st) {
         } else {
             continue;  // no anchor — skip callout
         }
-        // Per-ref text: single reading, or segment length for multi.
-        if (result_.contains("distances") && result_["distances"].is_array() &&
-            i < result_["distances"].size() && result_["distances"][i].is_number()) {
-            co.text = evalLen(st, result_["distances"][i].get<double>());
-        } else {
-            co.text = reading;
-        }
+        co.text = n == 1 ? reading : "Ref " + std::to_string(i + 1);
         if (!co.text.empty()) overlayCallouts_.push_back(std::move(co));
     }
 }
@@ -604,7 +660,7 @@ void EvaluateDialogs::rebuildMassOverlays(AppState& st) {
     // Mass geometry lives in massSegs_ (never thrash measure's overlaySegs_).
     massSegs_.clear();
     massMarkers_.clear();
-    if (!massOpen_) {
+    if (!massOpen_ || !st.docMirror.hasDoc()) {
         if (!sectionOpen_ && openWindow_ != "interference") massBodyAlpha_ = 1.0f;
         return;
     }
@@ -687,6 +743,7 @@ void EvaluateDialogs::rebuildMassOverlays(AppState& st) {
             if (designSections_.is_array() && (size_t)i < designSections_.size() &&
                 designSections_[i].is_object()) {
                 const auto& sec = designSections_[i];
+                if (sec.contains("error")) continue;
                 double Ixx = sec.value("Ixx", 0.0), Iyy = sec.value("Iyy", 0.0);
                 double Imax = std::max(Ixx, Iyy);
                 double J = sec.value("J", Ixx + Iyy);
@@ -812,10 +869,7 @@ void EvaluateDialogs::rebuildInterferenceView(AppState& st) {
         copyRgba(pr.rgbaA, ca, 0.35f);
         copyRgba(pr.rgbaB, cb, 0.35f);
         // Overlap region always red (Contract) at alpha 0.6.
-        pr.overlapRgba[0] = 0.90f;
-        pr.overlapRgba[1] = 0.20f;
-        pr.overlapRgba[2] = 0.18f;
-        pr.overlapRgba[3] = 0.60f;
+        copyRgba(pr.overlapRgba, kEvalPalette[0], 0.60f);
 
         // Expand overlap_mesh {positions, indices} into flat triangle xyz.
         if (p.contains("overlap_mesh") && p["overlap_mesh"].is_object()) {
@@ -866,22 +920,27 @@ void EvaluateDialogs::rebuildInterferenceView(AppState& st) {
 
 void EvaluateDialogs::tickLiveMeasure(AppState& st) {
     if (openWindow_ != "measure") return;
-    nlohmann::json refs = selectionRefs(st);
-    std::string key = refs.dump();
-    if (key == lastMeasureRefs_) return;
-    const double now = ImGui::GetTime();
-    if (now - lastMeasureFireT_ < 0.05) return;  // 50 ms debounce
-    lastMeasureFireT_ = now;
-    lastMeasureRefs_ = key;
-    if (refs.empty()) {
+    auto selection = measureSelection(st);
+    if (selection.key != lastMeasureRefs_) {
+        ++gen_;
+        lastMeasureRefs_ = selection.key;
+        lastMeasureChangeT_ = ImGui::GetTime();
+        measureDirty_ = true;
         result_ = nlohmann::json::object();
-        errorText_.clear();
         pending_ = false;
+        errorText_ = selection.error;
+        measureResolving_ = selection.resolving;
         clearOverlays();
-        measureRefColors_.clear();
+    }
+    if (!st.docMirror.hasDoc()) {
+        errorText_ = "No document loaded. Open a part or assembly to measure.";
         return;
     }
-    runEval(st, "eval_measure", {{"refs", refs}});
+    if (!measureDirty_ || st.selection.empty() || measureResolving_ || !errorText_.empty())
+        return;
+    if (ImGui::GetTime() - lastMeasureChangeT_ < 0.05) return;
+    measureDirty_ = false;
+    runEval(st, "eval_measure", {{"refs", selection.refs}});
 }
 
 void EvaluateDialogs::tickMassDesignSections(AppState& st) {
@@ -915,12 +974,18 @@ void EvaluateDialogs::tickMassDesignSections(AppState& st) {
              {Pa[i][0].get<double>(), Pa[i][1].get<double>(), Pa[i][2].get<double>()}},
         };
         nlohmann::json params = {{"doc_id", st.docMirror.docId()}, {"plane", plane}};
+        const std::string docId = st.docMirror.docId();
+        const int revision = st.docMirror.revision();
         ++st.rebuildsInFlight;
         st.rpc.call(
             "eval_section_props", params,
-            [this, &st, batch, i](const core::RpcResult& r) {
+            [this, &st, batch, i, docId, revision](const core::RpcResult& r) {
                 --st.rebuildsInFlight;
-                if (batch != designSectionGen_) return;
+                if (batch != designSectionGen_ || !massOpen_) return;
+                if (st.docMirror.docId() != docId || st.docMirror.revision() != revision) {
+                    evalDocRevision_ = -1;
+                    return;
+                }
                 --designSectionsPending_;
                 if (r.ok && r.result.is_object() && !r.result.contains("code")) {
                     nlohmann::json sec = r.result;
@@ -939,6 +1004,12 @@ void EvaluateDialogs::tickMassDesignSections(AppState& st) {
                     }
                     if (designSections_.is_array() && (size_t)i < designSections_.size())
                         designSections_[i] = std::move(sec);
+                } else {
+                    const std::string message = !r.ok
+                        ? (r.err.empty() ? "Section analysis failed." : r.err)
+                        : (r.result.is_object() ? r.result.value("message", std::string("Section analysis failed."))
+                                                : "Section analysis returned an invalid result.");
+                    designSections_[i] = nlohmann::json{{"error", message}};
                 }
                 if (designSectionsPending_ <= 0) rebuildMassOverlays(st);
             },
@@ -1025,7 +1096,7 @@ void EvaluateDialogs::initSectionSession(AppState& st) {
 
 void EvaluateDialogs::rebuildSectionPlaneViews(AppState& st) {
     sectionPlanes_.clear();
-    if (!sectionOpen_) return;
+    if (!sectionOpen_ || !st.docMirror.hasDoc()) return;
     const float hs = sectionHalfSize_ * 0.6f;
     for (int i = 0; i < 3; ++i) {
         SectionPlaneView pv;
@@ -1082,16 +1153,24 @@ void EvaluateDialogs::fireSectionEval(AppState& st, int idx) {
         {"normal", {(double)n[0], (double)n[1], (double)n[2]}},
     };
     nlohmann::json params = {{"doc_id", st.docMirror.docId()}, {"plane", plane}};
+    sectionResults_[idx] = nullptr;
+    const std::string docId = st.docMirror.docId();
+    const int revision = st.docMirror.revision();
     const int batch = sectionEvalGen_;  // shared with fireAll; single-plane uses current gen
+    const float offset = sectionOffset_[idx];
     ++sectionPendingCount_;
     ++st.rebuildsInFlight;
     st.rpc.call(
         "eval_section_props", params,
-        [this, &st, batch, idx](const core::RpcResult& r) {
+        [this, &st, batch, idx, docId, revision, offset](const core::RpcResult& r) {
             --st.rebuildsInFlight;
-            // Always book-keep pending count, even for superseded gens (avoid sticky leak).
+            if (batch != sectionEvalGen_ || !sectionOpen_) return;
+            if (st.docMirror.docId() != docId || st.docMirror.revision() != revision) {
+                evalDocRevision_ = -1;
+                return;
+            }
             if (sectionPendingCount_ > 0) --sectionPendingCount_;
-            if (batch != sectionEvalGen_) return;
+            if (offset != sectionOffset_[idx]) return;
             if (!r.ok) {
                 std::string msg = r.err.empty() ? "worker call failed: eval_section_props" : r.err;
                 sectionErrorText_ = msg;
@@ -1148,6 +1227,7 @@ void EvaluateDialogs::applySectionOffset(AppState& st, int idx, float newOffset,
     if (newOffset > lim) newOffset = lim;
     if (newOffset < -lim) newOffset = -lim;
     sectionOffset_[idx] = newOffset;
+    sectionResults_[idx] = nullptr;
     // Live plane origin update for the viewport.
     if ((size_t)idx < sectionPlanes_.size()) {
         const float* n = kSectionNormals[idx];
@@ -1160,6 +1240,7 @@ void EvaluateDialogs::applySectionOffset(AppState& st, int idx, float newOffset,
     if (scheduleEval) {
         sectionPendingIdx_ = idx;
         sectionDragLastT_ = ImGui::GetTime();
+        rebuildSectionPlaneViews(st);
     }
 }
 
@@ -1176,14 +1257,26 @@ void EvaluateDialogs::tickSectionDrag(AppState& st) {
     if (now - sectionDragLastT_ < 0.08) return;  // ~80 ms debounce
     const int idx = sectionPendingIdx_;
     sectionPendingIdx_ = -1;
-    // Supersede in-flight multi/single fires; reset pending bookkeeping for the new gen.
-    ++sectionEvalGen_;
-    sectionPendingCount_ = 0;
     fireSectionEval(st, idx);
 }
 
 
 bool EvaluateDialogs::handleCommand(AppState& st, const std::string& cmdId) {
+    syncDocument(st);
+    const bool exclusive = cmdId == "eval_measure" || cmdId == "eval_check" ||
+        cmdId == "eval_geometry" || cmdId == "eval_interference" || cmdId == "eval_symmetry" ||
+        cmdId == "eval_draft" || cmdId == "eval_thickness" || cmdId == "eval_curvature" ||
+        cmdId == "eval_zebra";
+    if (exclusive) {
+        ++gen_;
+        pending_ = false;
+        result_ = nlohmann::json::object();
+        errorText_.clear();
+        clearOverlays();
+        if (openWindow_ == "zebra" && st.renderer) st.renderer->setZebra(false, gZebraFreq);
+        if (openWindow_ == "draft" || openWindow_ == "thickness" || openWindow_ == "curvature")
+            clearFieldColormap(st);
+    }
     if (cmdId == "eval_mass_props") {
         massCustomDensity_ = false;
         seedMassFromDoc(st);
@@ -1195,22 +1288,11 @@ bool EvaluateDialogs::handleCommand(AppState& st, const std::string& cmdId) {
     }
     if (cmdId == "eval_measure") {
         lastMeasureRefs_.clear();
-        lastMeasureFireT_ = -1e9;
-        measureLoggedGen_ = -1;
+        measureResolving_ = false;
+        measureDirty_ = true;
         openWindow_ = "measure";
         title_ = "Measure";
-        // Immediate first eval if selection present.
-        nlohmann::json refs = selectionRefs(st);
-        if (!refs.empty()) {
-            lastMeasureRefs_ = refs.dump();
-            runEval(st, "eval_measure", {{"refs", refs}});
-        } else {
-            result_ = nlohmann::json::object();
-            errorText_.clear();
-            pending_ = false;
-            clearOverlays();
-            measureRefColors_.clear();
-        }
+        tickLiveMeasure(st);
         return true;
     }
     if (cmdId == "eval_section_props") {
@@ -1283,30 +1365,151 @@ bool EvaluateDialogs::handleCommand(AppState& st, const std::string& cmdId) {
     return false;
 }
 
+void EvaluateDialogs::syncDocument(AppState& st) {
+    const std::string docId = st.docMirror.docId();
+    const int revision = st.docMirror.revision();
+    if (docId == evalDocId_ && revision == evalDocRevision_) return;
+    const bool switched = docId != evalDocId_;
+    evalDocId_ = docId;
+    evalDocRevision_ = revision;
+    ++gen_;
+    ++massGen_;
+    ++designSectionGen_;
+    ++sectionEvalGen_;
+    pending_ = massPending_ = false;
+    designSectionsPending_ = sectionPendingCount_ = 0;
+    designSectionsDirty_ = false;
+    sectionPendingIdx_ = -1;
+    result_ = massResult_ = nlohmann::json::object();
+    designSections_ = sectionResults_ = nlohmann::json::array({nullptr, nullptr, nullptr});
+    errorText_.clear();
+    massErrorText_.clear();
+    sectionErrorText_.clear();
+    clearOverlays();
+    massMarkers_.clear();
+    massSegs_.clear();
+    sectionPlanes_.clear();
+    lastMeasureRefs_.clear();
+    measureLog_.clear();
+    measureDirty_ = true;
+    measureResolving_ = false;
+    if (openWindow_ == "draft" || openWindow_ == "thickness" || openWindow_ == "curvature")
+        clearFieldColormap(st);
+    if (!st.docMirror.hasDoc()) {
+        errorText_ = massErrorText_ = sectionErrorText_ = "No document loaded.";
+        return;
+    }
+    if (massOpen_) {
+        if (switched) massCustomDensity_ = false;
+        seedMassFromDoc(st);
+        runMassEval(st, {{"density_g_cm3", (double)massDensity_}});
+    }
+    if (sectionOpen_) {
+        initSectionSession(st);
+        fireAllSectionEvals(st);
+    }
+    if (openWindow_ == "check") runEval(st, "eval_check", nlohmann::json::object());
+    else if (openWindow_ == "interference") {
+        interferencePartNames_.clear();
+        interferencePartChecked_.clear();
+        runEval(st, "eval_interference", nlohmann::json::object());
+    } else if (openWindow_ == "symmetry") {
+        static const int map[] = {1, 0, 2};
+        runEval(st, "eval_symmetry", {{"plane", kPlaneNames[map[symmetryPlane_]]}});
+    } else if (openWindow_ == "draft" || openWindow_ == "thickness" || openWindow_ == "curvature") {
+        errorText_ = "Document changed. Update the analysis for the current geometry.";
+    }
+}
+
+void EvaluateDialogs::drawMeasure(AppState& st) {
+    kit::dimText("Pick a face, edge, or vertex to measure it. Ctrl-click adds or removes picks. "
+                 "Two picks measure distance; three to eight measure a chain.");
+    kit::sectionHeader("Selection", nullptr, nullptr, (int)st.selection.size(), true);
+    if (kit::secondaryButton("Clear selection", !st.selection.empty())) {
+        st.selection.clear();
+        tickLiveMeasure(st);
+    }
+    int remove = -1;
+    const auto& items = st.selection.items();
+    for (size_t i = 0; i < items.size(); ++i) {
+        const auto& item = items[i];
+        ImGui::PushID((int)i);
+        if (kit::cardBegin("##pick", nullptr, nullptr, nullptr, kEvalPalette[i % 10])) {
+            const char* kind = item.hit.kind == render::PickKind::Face ? "Face" :
+                               item.hit.kind == render::PickKind::Edge ? "Edge" : "Vertex";
+            ImGui::TextWrapped("%zu. %s %u · Body %u", i + 1, kind,
+                               item.hit.topo_id, item.hit.body_id);
+            if (!item.resolution_error.empty()) {
+                ImGui::PushStyleColor(ImGuiCol_Text, kit::toneVec(kit::Tone::Err));
+                ImGui::TextWrapped("%s", item.resolution_error.c_str());
+                ImGui::PopStyleColor();
+            } else if (item.pending_resolve) kit::dimText("Resolving geometry...");
+            if (kit::secondaryButton("Remove")) remove = (int)i;
+        }
+        kit::cardEnd();
+        ImGui::PopID();
+    }
+    if (remove >= 0) {
+        const auto hit = items[(size_t)remove].hit;
+        st.selection.toggle(hit);
+        tickLiveMeasure(st);
+    }
+    kit::sectionHeader("Reading");
+    if (!errorText_.empty()) {
+        kit::blockedState("Measurement unavailable", errorText_.c_str(),
+                          "Remove an unresolved pick and select its geometry again.");
+        if (!measureResolving_ && st.selection.size() <= 8 &&
+            measureSelection(st).error.empty() && kit::secondaryButton("Retry measurement")) {
+            lastMeasureRefs_.clear();
+            tickLiveMeasure(st);
+        }
+    } else if (st.selection.empty()) {
+        kit::emptyState("measure", "Ready to measure", "Select geometry in the viewport to see its dimensions here.");
+    } else if (measureResolving_) {
+        kit::spinner("Resolving selection...");
+        kit::dimText("Waiting for every selected item. No partial reading is shown.");
+    } else if (pending_) {
+        kit::spinner("Computing measurement...");
+    } else if (measureDirty_) {
+        kit::dimText("Ready — waiting for selection to settle.");
+    } else {
+        kit::chip("Ready", kit::Tone::Ok);
+        const auto rows = measureRows(st, result_);
+        for (const auto& row : rows)
+            kit::keyValueRow(row.first.c_str(), row.second.c_str(), kit::Tone::Neutral, true);
+        if (result_.contains("closed") && result_["closed"].is_boolean())
+            kit::keyValueRow("Closed profile", result_["closed"].get<bool>() ? "Yes" : "No");
+        if (kit::secondaryButton("Copy reading")) {
+            const auto text = measureReadingText(st, result_);
+            ImGui::SetClipboardText(text.c_str());
+        }
+    }
+    if (!measureLog_.empty() && ImGui::CollapsingHeader("Recent readings (this document)")) {
+        kit::dimText("Previous readings are history, not the current selection.");
+        if (kit::secondaryButton("Clear history")) measureLog_.clear();
+        for (size_t i = measureLog_.size(); i-- > 0;) {
+            ImGui::PushID((int)i);
+            ImGui::TextWrapped("%s", measureLog_[i].c_str());
+            if (kit::secondaryButton("Copy")) ImGui::SetClipboardText(measureLog_[i].c_str());
+            kit::rule();
+            ImGui::PopID();
+        }
+    }
+}
+
 void EvaluateDialogs::drawMassWindow(AppState& st) {
     if (!massOpen_) return;
 
-    ui::setNextCommandDialogPlacement();
-    ImGui::SetNextWindowSize(ImVec2(ui::metrics::px(360), 0), ImGuiCond_Always);
-
+    ui::setNextCommandDialogPlacement("Mass Properties##eval_mass",
+        ImVec2(ui::metrics::px(480), ui::metrics::px(620)),
+        ImVec2(ui::metrics::px(340), ui::metrics::px(260)));
     const auto& gpal = ui::palette;
-    const ImVec4 titleTint(gpal.glassBg[0], gpal.glassBg[1], gpal.glassBg[2], gpal.glassBg[3]);
-    ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0, 0, 0, 0));
-    ImGui::PushStyleColor(ImGuiCol_TitleBg, titleTint);
-    ImGui::PushStyleColor(ImGuiCol_TitleBgActive, titleTint);
-    ImGui::PushStyleColor(ImGuiCol_TitleBgCollapsed, titleTint);
     bool open = true;
-    const bool vis = ImGui::Begin("Mass Properties##eval_mass", &open);
-    ImGui::PopStyleColor(3);
+    ImGui::SetNextWindowBgAlpha(1.0f);
+    const bool vis = ImGui::Begin("Mass Properties##eval_mass", &open, ImGuiWindowFlags_NoScrollbar);
     if (vis) {
-        const ImVec2 wp = ImGui::GetWindowPos(), ws = ImGui::GetWindowSize();
-        const float contentTopY =
-            ImGui::GetCursorScreenPos().y - ImGui::GetStyle().WindowPadding.y;
-        const ImRect winRect(ImVec2(wp.x, contentTopY), ImVec2(wp.x + ws.x, wp.y + ws.y));
-        const ui::AdaptiveSurface& surf =
-            ui::adaptivePanel(ui::panelId("host_eval_mass_glass"), winRect, ui::GlassGroup::Global);
-        ui::glassPanel(ImGui::GetWindowDrawList(), winRect, ui::GlassLevel::Regular, 12.0f, surf);
-        ImGui::PushStyleColor(ImGuiCol_Text, surf.textPrimary);
+        const auto surf = ui::adaptiveSurface(-1.0f);
+        ImGui::PushTextWrapPos(0.0f);
         // Material combo lists curated physical materials (same keys as FeatureManager Material).
         // Selecting one WRITES set_material (+ derived set_appearance) so mass, sim, and the tree
         // all share ONE active part material. Density follows that key unless the user has set an
@@ -1370,16 +1573,14 @@ void EvaluateDialogs::drawMassWindow(AppState& st) {
             }
         }
 
-        if (!massDocKey_.empty())
-            ImGui::Text("Part material: %s", massDocName_.c_str());
-        else
-            ImGui::TextDisabled("Part material: not set");
+        kit::keyValueRow("Part material", massDocKey_.empty() ? "Not set" : massDocName_.c_str());
 
-        ImGui::SetNextItemWidth(180 * ui::uiScale);
+        ImGui::TextUnformatted("Material");
+        ImGui::SetNextItemWidth(-1.0f);
         const std::string comboLabel = massDocKey_.empty()
             ? std::string("(select material)")
             : massDocName_;
-        if (ImGui::BeginCombo("Material", comboLabel.c_str())) {
+        if (ImGui::BeginCombo("##Material", comboLabel.c_str())) {
             for (int i = 0; i < kPhysicalMaterialsCount; ++i) {
                 const auto& pm = kPhysicalMaterials[i];
                 bool sel = (massDocKey_ == pm.key);
@@ -1394,10 +1595,11 @@ void EvaluateDialogs::drawMassWindow(AppState& st) {
         // display a converted proxy in IPS; the wire value stays metric.
         constexpr double kLbPerIn3PerGcm3 = 0.0361272929;
         const bool ips = st.ips();
-        ImGui::SetNextItemWidth(140 * ui::uiScale);
+        ImGui::TextUnformatted("Density override");
+        ImGui::SetNextItemWidth(-1.0f);
         float shown = ips ? (float)(massDensity_ * kLbPerIn3PerGcm3) : massDensity_;
         const float shownMax = ips ? (float)(25.0 * kLbPerIn3PerGcm3) : 25.0f;
-        if (ImGui::DragFloat("Density (override)", &shown, ips ? 0.0005f : 0.01f, 0.0f, shownMax,
+        if (ImGui::DragFloat("##Density", &shown, ips ? 0.0005f : 0.01f, 0.0f, shownMax,
                              ips ? "%.4f lb/in3" : "%.3f g/cm3", ImGuiSliderFlags_AlwaysClamp)) {
             massDensity_ = ips ? (float)(shown / kLbPerIn3PerGcm3) : shown;
             massCustomDensity_ = true;
@@ -1405,7 +1607,6 @@ void EvaluateDialogs::drawMassWindow(AppState& st) {
         if (ImGui::IsItemDeactivatedAfterEdit())
             runMassEval(st, {{"density_g_cm3", (double)massDensity_}});
         if (massCustomDensity_ && !massDocKey_.empty()) {
-            ImGui::SameLine();
             if (ImGui::SmallButton("Reset##mass_dens")) {
                 massCustomDensity_ = false;
                 massDensity_ = materialDensityGcm3(massDocKey_);
@@ -1421,20 +1622,18 @@ void EvaluateDialogs::drawMassWindow(AppState& st) {
             ImGui::TextWrapped("%s", massErrorText_.c_str());
             ImGui::PopStyleColor();
         } else if (massPending_) {
-            ImGui::TextDisabled("Computing…");
+            kit::spinner("Computing mass properties...");
         } else {
             ImGui::Separator();
-            ImGui::Text("Volume:  %s",
-                        pmFormatVolume(massResult_.value("volume_mm3", 0.0), st.ips()).c_str());
-            ImGui::Text("Mass:    %s",
-                        pmFormatMass(massResult_.value("mass_g", 0.0), st.ips()).c_str());
+            kit::keyValueRow("Volume", pmFormatVolume(massResult_.value("volume_mm3", 0.0), st.ips()).c_str());
+            kit::keyValueRow("Mass", pmFormatMass(massResult_.value("mass_g", 0.0), st.ips()).c_str());
             if (ips)
                 ImGui::Text("Density: %.4f lb/in3", massDensity_ * kLbPerIn3PerGcm3);
             else
                 ImGui::Text("Density: %.3f g/cm3", massDensity_);
             if (massResult_.contains("com") && massResult_["com"].is_array() &&
                 massResult_["com"].size() == 3) {
-                ImGui::SeparatorText("Center of gravity");
+                kit::sectionHeader("Center of gravity");
                 // A CG on a symmetry plane comes back as floating-point zero noise, and the panel
                 // printed it verbatim: "X: 4.449e-17in  Y: -1.062e-17in  Z: -6.856e-19in" for a
                 // centred box. Anything under a nanometre is zero at any display precision.
@@ -1443,12 +1642,13 @@ void EvaluateDialogs::drawMassWindow(AppState& st) {
                     if (std::abs(mm) < 1e-6) mm = 0.0;
                     return evalLen(st, mm);
                 };
-                ImGui::Text("X: %s   Y: %s   Z: %s",
-                            com(0).c_str(), com(1).c_str(), com(2).c_str());
+                kit::keyValueRow("X", com(0).c_str());
+                kit::keyValueRow("Y", com(1).c_str());
+                kit::keyValueRow("Z", com(2).c_str());
             }
 
             // ---- Moment of inertia (bending area I + polar J) — clear callout ----
-            ImGui::SeparatorText("Moment of inertia");
+            kit::sectionHeader("Moment of inertia");
             ImGui::TextWrapped(
                 "Area moments about centroidal planes through CG: I resists bending; "
                 "polar J = Imax+Imin resists torsion. Units follow document (in⁴ / mm⁴).");
@@ -1460,27 +1660,33 @@ void EvaluateDialogs::drawMassWindow(AppState& st) {
             if (cb) rebuildMassOverlays(st);
 
             if (designSectionsPending_ > 0)
-                ImGui::TextDisabled("Computing section I/J…");
+                kit::spinner("Computing section I/J...");
             if (designSections_.is_array()) {
                 for (int i = 0; i < 3; ++i) {
                     if ((size_t)i >= designSections_.size() || !designSections_[i].is_object())
                         continue;
                     const auto& sec = designSections_[i];
+                    if (sec.contains("error")) {
+                        ImGui::PushStyleColor(ImGuiCol_Text, kit::toneVec(kit::Tone::Err));
+                        ImGui::TextWrapped("Principal axis %d: %s", i + 1,
+                                           sec["error"].get<std::string>().c_str());
+                        ImGui::PopStyleColor();
+                        continue;
+                    }
                     ImGui::Separator();
                     double Ixx = sec.value("Ixx", 0.0), Iyy = sec.value("Iyy", 0.0);
                     double Imax = std::max(Ixx, Iyy), Imin = std::min(Ixx, Iyy);
                     double J = sec.value("J", Ixx + Iyy);
                     ImGui::Text("Principal axis %d", i + 1);
                     if (showI_) {
-                        ImGui::Text("  Imax: %s", pmFormatAreaMoment(Imax, st.ips()).c_str());
-                        ImGui::Text("  Imin: %s", pmFormatAreaMoment(Imin, st.ips()).c_str());
+                        kit::keyValueRow("Imax", pmFormatAreaMoment(Imax, st.ips()).c_str());
+                        kit::keyValueRow("Imin", pmFormatAreaMoment(Imin, st.ips()).c_str());
                     }
                     if (showJ_)
-                        ImGui::Text("  Polar J: %s", pmFormatAreaMoment(J, st.ips()).c_str());
+                        kit::keyValueRow("Polar J", pmFormatAreaMoment(J, st.ips()).c_str());
                     if (showK_ && sec.contains("EA") && sec["EA"].is_number()) {
                         ImGui::TextDisabled("  EA: %.4g N  (divide by length L for k)",
                                             sec["EA"].get<double>());
-                        ImGui::Text("  EA:  %.4g N", sec["EA"].get<double>());
                     }
                     if (sec.contains("area_mm2"))
                         ImGui::Text("  Section area: %s",
@@ -1515,12 +1721,15 @@ void EvaluateDialogs::drawMassWindow(AppState& st) {
                 ImGui::TreePop();
             }
         }
-        ImGui::PopStyleColor();
+        ImGui::PopTextWrapPos();
+        ui::drawWindowPillScrollbarV(surf);
     }
     ImGui::End();
-    ImGui::PopStyleColor();  // WindowBg
 
     if (!open) {
+        ++massGen_;
+        ++designSectionGen_;
+        designSectionsPending_ = 0;
         massOpen_ = false;
         massMarkers_.clear();
         massSegs_.clear();
@@ -1540,27 +1749,16 @@ void EvaluateDialogs::drawMassWindow(AppState& st) {
 void EvaluateDialogs::drawSectionWindow(AppState& st) {
     if (!sectionOpen_) return;
 
-    ui::setNextCommandDialogPlacement();
-    ImGui::SetNextWindowSize(ImVec2(ui::metrics::px(420), 0), ImGuiCond_Always);
-
+    ui::setNextCommandDialogPlacement("Section Properties##eval_section",
+        ImVec2(ui::metrics::px(480), ui::metrics::px(640)),
+        ImVec2(ui::metrics::px(340), ui::metrics::px(280)));
     const auto& gpal = ui::palette;
-    const ImVec4 titleTint(gpal.glassBg[0], gpal.glassBg[1], gpal.glassBg[2], gpal.glassBg[3]);
-    ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0, 0, 0, 0));
-    ImGui::PushStyleColor(ImGuiCol_TitleBg, titleTint);
-    ImGui::PushStyleColor(ImGuiCol_TitleBgActive, titleTint);
-    ImGui::PushStyleColor(ImGuiCol_TitleBgCollapsed, titleTint);
     bool open = true;
-    const bool vis = ImGui::Begin("Section Properties##eval_section", &open);
-    ImGui::PopStyleColor(3);
+    ImGui::SetNextWindowBgAlpha(1.0f);
+    const bool vis = ImGui::Begin("Section Properties##eval_section", &open, ImGuiWindowFlags_NoScrollbar);
     if (vis) {
-        const ImVec2 wp = ImGui::GetWindowPos(), ws = ImGui::GetWindowSize();
-        const float contentTopY =
-            ImGui::GetCursorScreenPos().y - ImGui::GetStyle().WindowPadding.y;
-        const ImRect winRect(ImVec2(wp.x, contentTopY), ImVec2(wp.x + ws.x, wp.y + ws.y));
-        const ui::AdaptiveSurface& surf = ui::adaptivePanel(ui::panelId("host_eval_section_glass"),
-                                                            winRect, ui::GlassGroup::Global);
-        ui::glassPanel(ImGui::GetWindowDrawList(), winRect, ui::GlassLevel::Regular, 12.0f, surf);
-        ImGui::PushStyleColor(ImGuiCol_Text, surf.textPrimary);
+        const auto surf = ui::adaptiveSurface(-1.0f);
+        ImGui::PushTextWrapPos(0.0f);
 
         if (!sectionErrorText_.empty()) {
             ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(gpal.statusErr[0], gpal.statusErr[1],
@@ -1569,15 +1767,14 @@ void EvaluateDialogs::drawSectionWindow(AppState& st) {
             ImGui::PopStyleColor();
         }
         if (sectionPendingCount_ > 0)
-            ImGui::TextDisabled("Computing section properties…");
-        ImGui::TextDisabled("Drag a plane in the viewport or use the offset sliders.");
+            kit::spinner("Computing section properties...");
+        kit::dimText("Drag a plane in the viewport or use the offset sliders.");
 
         // 3-card layout: one card per orthogonal section.
         for (int i = 0; i < 3; ++i) {
             const float* col = kEvalPalette[i % 10];
             char header[64];
             std::snprintf(header, sizeof(header), "Sec %d · %s", i + 1, kSectionNames[i]);
-            ImGui::SeparatorText(header);
             drawColorChipRow(header, col);
 
             ImGui::PushID(i);
@@ -1585,12 +1782,13 @@ void EvaluateDialogs::drawSectionWindow(AppState& st) {
             ImGui::TextUnformatted("Offset");
             const float avail = ImGui::GetContentRegionAvail().x;
             ImGui::SetNextItemWidth(std::max(80.0f * ui::uiScale, avail - 4.0f * ui::uiScale));
-            float off = sectionOffset_[i];
+            const float unitScale = st.ips() ? 25.4f : 1.0f;
+            float off = sectionOffset_[i] / unitScale;
             char sliderId[32];
             std::snprintf(sliderId, sizeof(sliderId), "##sec%d", i);
-            if (ImGui::SliderFloat(sliderId, &off, -sectionHalfSize_, sectionHalfSize_,
-                                   "%.2f mm")) {
-                applySectionOffset(st, i, off, true);
+            if (ImGui::SliderFloat(sliderId, &off, -sectionHalfSize_ / unitScale,
+                                   sectionHalfSize_ / unitScale, st.ips() ? "%.3f in" : "%.2f mm")) {
+                applySectionOffset(st, i, off * unitScale, true);
             }
             if (ImGui::IsItemDeactivatedAfterEdit()) {
                 sectionPendingIdx_ = i;
@@ -1607,34 +1805,21 @@ void EvaluateDialogs::drawSectionWindow(AppState& st) {
                     ImGui::TextWrapped("%s", sec["error"].get<std::string>().c_str());
                     ImGui::PopStyleColor();
                 } else {
-                    // Compact two-column rows so values fit ~420 px.
-                    ImGui::Text("Area  %s",
-                                pmFormatArea(sec.value("area_mm2", 0.0), st.ips()).c_str());
+                    kit::keyValueRow("Area", pmFormatArea(sec.value("area_mm2", 0.0), st.ips()).c_str());
                     if (sec.contains("centroid") && sec["centroid"].is_array() &&
-                        sec["centroid"].size() == 3)
-                        ImGui::Text("CG   %s, %s, %s",
-                                    evalLen(st, sec["centroid"][0].get<double>()).c_str(),
-                                    evalLen(st, sec["centroid"][1].get<double>()).c_str(),
-                                    evalLen(st, sec["centroid"][2].get<double>()).c_str());
+                        sec["centroid"].size() == 3) {
+                        const char* labels[] = {"Centroid X", "Centroid Y", "Centroid Z"};
+                        for (int axis = 0; axis < 3; ++axis)
+                            kit::keyValueRow(labels[axis], evalLen(st, sec["centroid"][axis].get<double>()).c_str());
+                    }
                     double Ixx = sec.value("Ixx", 0.0);
                     double Iyy = sec.value("Iyy", 0.0);
                     double Ixy = sec.value("Ixy", 0.0);
                     double J = sec.value("J", Ixx + Iyy);
-                    if (ImGui::BeginTable("##secI", 2,
-                                          ImGuiTableFlags_SizingStretchProp |
-                                              ImGuiTableFlags_NoPadOuterX)) {
-                        ImGui::TableNextRow();
-                        ImGui::TableNextColumn();
-                        ImGui::Text("Ixx  %s", pmFormatAreaMoment(Ixx, st.ips()).c_str());
-                        ImGui::TableNextColumn();
-                        ImGui::Text("Iyy  %s", pmFormatAreaMoment(Iyy, st.ips()).c_str());
-                        ImGui::TableNextRow();
-                        ImGui::TableNextColumn();
-                        ImGui::Text("Ixy  %s", pmFormatAreaMoment(Ixy, st.ips()).c_str());
-                        ImGui::TableNextColumn();
-                        ImGui::Text("J    %s", pmFormatAreaMoment(J, st.ips()).c_str());
-                        ImGui::EndTable();
-                    }
+                    kit::keyValueRow("Ixx", pmFormatAreaMoment(Ixx, st.ips()).c_str());
+                    kit::keyValueRow("Iyy", pmFormatAreaMoment(Iyy, st.ips()).c_str());
+                    kit::keyValueRow("Ixy", pmFormatAreaMoment(Ixy, st.ips()).c_str());
+                    kit::keyValueRow("Polar J", pmFormatAreaMoment(J, st.ips()).c_str());
                 }
             } else if (sectionPendingCount_ > 0) {
                 ImGui::TextDisabled("Waiting for section…");
@@ -1643,10 +1828,10 @@ void EvaluateDialogs::drawSectionWindow(AppState& st) {
             }
             ImGui::PopID();
         }
-        ImGui::PopStyleColor();
+        ImGui::PopTextWrapPos();
+        ui::drawWindowPillScrollbarV(surf);
     }
     ImGui::End();
-    ImGui::PopStyleColor();  // WindowBg
 
     if (!open) {
         sectionOpen_ = false;
@@ -1667,188 +1852,36 @@ void EvaluateDialogs::drawSectionWindow(AppState& st) {
 void EvaluateDialogs::drawExclusiveWindow(AppState& st) {
     if (openWindow_.empty()) return;
 
-    // Geometry tools pin into the Evaluate ribbon dead-space strip when available.
-    const bool dockWindows =
-        (openWindow_ == "zebra" || openWindow_ == "symmetry" || openWindow_ == "draft" ||
-         openWindow_ == "thickness" || openWindow_ == "curvature");
-    const ui::EvalRibbonDock dock = ui::evalRibbonDock();
-    if (dockWindows && dock.valid) {
-        const float pad = 6.0f * ui::uiScale;
-        ImGui::SetNextWindowPos(ImVec2(dock.minX + pad, dock.minY + pad), ImGuiCond_Always);
-        ImGui::SetNextWindowSize(
-            ImVec2(std::max(80.0f, dock.maxX - dock.minX - 2.0f * pad),
-                   std::max(40.0f, dock.maxY - dock.minY - 2.0f * pad)),
-            ImGuiCond_Always);
-    } else {
-        ui::setNextCommandDialogPlacement();
-        ImGui::SetNextWindowSize(ImVec2(ui::metrics::px(360), 0), ImGuiCond_Always);
-    }
-
     const auto& gpal = ui::palette;
-    const ImVec4 titleTint(gpal.glassBg[0], gpal.glassBg[1], gpal.glassBg[2], gpal.glassBg[3]);
-    ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0, 0, 0, 0));
-    ImGui::PushStyleColor(ImGuiCol_TitleBg, titleTint);
-    ImGui::PushStyleColor(ImGuiCol_TitleBgActive, titleTint);
-    ImGui::PushStyleColor(ImGuiCol_TitleBgCollapsed, titleTint);
     bool open = true;
-    // Unique id so exclusive window never collides with mass/section.
     char winTitle[128];
-    std::snprintf(winTitle, sizeof(winTitle), "%s##eval_excl",
-                  title_.empty() ? "Evaluate" : title_.c_str());
-    const bool evVis = ImGui::Begin(winTitle, &open);
-    ImGui::PopStyleColor(3);
+    std::snprintf(winTitle, sizeof(winTitle), "%s###eval_%s",
+                  title_.empty() ? "Evaluate" : title_.c_str(), openWindow_.c_str());
+    ui::setNextCommandDialogPlacement(winTitle,
+        ImVec2(ui::metrics::px(480),
+               ui::metrics::px(openWindow_ == "measure" || openWindow_ == "interference" ? 580 : 380)),
+        ImVec2(ui::metrics::px(340), ui::metrics::px(240)));
+    ImGui::SetNextWindowBgAlpha(1.0f);
+    const bool evVis = ImGui::Begin(winTitle, &open, ImGuiWindowFlags_NoScrollbar);
     if (evVis) {
-        const ImVec2 wp = ImGui::GetWindowPos(), ws = ImGui::GetWindowSize();
-        const float contentTopY =
-            ImGui::GetCursorScreenPos().y - ImGui::GetStyle().WindowPadding.y;
-        const ImRect winRect(ImVec2(wp.x, contentTopY), ImVec2(wp.x + ws.x, wp.y + ws.y));
-        const ui::AdaptiveSurface& surf =
-            ui::adaptivePanel(ui::panelId("host_evaluate_glass"), winRect, ui::GlassGroup::Global);
-        ui::glassPanel(ImGui::GetWindowDrawList(), winRect, ui::GlassLevel::Regular, 12.0f, surf);
-        ImGui::PushStyleColor(ImGuiCol_Text, surf.textPrimary);
+        const auto surf = ui::adaptiveSurface(-1.0f);
+        ImGui::PushTextWrapPos(0.0f);
 
         const bool interactivePending =
             openWindow_ == "measure" || openWindow_ == "draft" || openWindow_ == "thickness" ||
             openWindow_ == "curvature" || openWindow_ == "zebra" || openWindow_ == "symmetry";
         if (pending_ && !interactivePending) {
-            ImGui::PushStyleColor(ImGuiCol_Text, surf.textSecondary);
-            ImGui::TextUnformatted("Computing");
-            ImGui::SameLine(0, 0);
-            ImGui::TextUnformatted(&"..."[2 - ((int)(ImGui::GetTime() * 3.0) % 3)]);
-            ImGui::PopStyleColor();
+            kit::spinner("Computing analysis...");
         } else if (!errorText_.empty() && openWindow_ != "measure" && openWindow_ != "draft" &&
                    openWindow_ != "thickness" && openWindow_ != "curvature" &&
-                   openWindow_ != "field_err") {
+                   openWindow_ != "field_err" && openWindow_ != "interference") {
             ImGui::PushStyleColor(
                 ImGuiCol_Text,
                 ImVec4(gpal.statusErr[0], gpal.statusErr[1], gpal.statusErr[2], gpal.statusErr[3]));
             ImGui::TextWrapped("%s", errorText_.c_str());
             ImGui::PopStyleColor();
         } else if (openWindow_ == "measure") {
-            if (pending_) {
-                ImGui::PushStyleColor(ImGuiCol_Text, surf.textSecondary);
-                ImGui::TextUnformatted("Computing…");
-                ImGui::PopStyleColor();
-            }
-            if (!errorText_.empty()) {
-                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(gpal.statusErr[0], gpal.statusErr[1],
-                                                           gpal.statusErr[2], gpal.statusErr[3]));
-                ImGui::TextWrapped("%s", errorText_.c_str());
-                ImGui::PopStyleColor();
-            }
-            std::string kind = result_.value("kind", std::string("(none)"));
-            auto numAt = [&](const char* k, double& out) -> bool {
-                if (result_.contains(k) && result_[k].is_number()) {
-                    out = result_[k].get<double>();
-                    return true;
-                }
-                return false;
-            };
-            std::string summary;
-            double v;
-            if (numAt("distance", v))
-                summary = "Distance " + evalLen(st, v);
-            else if (numAt("length", v))
-                summary = "Length " + evalLen(st, v);
-            else if (numAt("radius", v))
-                summary =
-                    "Radius " + evalLen(st, v) + " (Dia " + evalLen(st, 2.0 * v) + ")";
-            else if (numAt("area", v))
-                summary = "Area " + pmFormatArea(v, st.ips());
-            else if (numAt("volume", v))
-                summary = "Volume " + pmFormatVolume(v, st.ips());
-            else if (numAt("total_length", v))
-                summary = "Path " + evalLen(st, v);
-            else if (numAt("total_distance", v))
-                summary = "Chain " + evalLen(st, v);
-            double ang;
-            if (numAt("angle", ang)) {
-                char b[48];
-                std::snprintf(b, sizeof(b), "Angle %.3f deg", ang);
-                summary = summary.empty() ? std::string(b) : summary + ", " + b;
-            }
-            if (!pending_ && !summary.empty() && gen_ != measureLoggedGen_) {
-                measureLoggedGen_ = gen_;
-                measureLog_.push_back(summary);
-            }
-
-            if (!summary.empty() && !measureRefColors_.empty()) {
-                drawColorChipRow(summary.c_str(), measureRefColors_[0].data());
-            } else if (!summary.empty()) {
-                ImGui::TextUnformatted(summary.c_str());
-            }
-            ImGui::Text("Kind: %s", kind.c_str());
-
-            int ri = 0;
-            for (const auto& it : st.selection.items()) {
-                if (it.selector.empty() && !it.hit.valid()) continue;
-                std::string label;
-                if (it.hit.valid()) {
-                    const char* kn =
-                        it.hit.kind == render::PickKind::Face
-                            ? "Face"
-                            : (it.hit.kind == render::PickKind::Edge
-                                   ? "Edge"
-                                   : (it.hit.kind == render::PickKind::Vertex ? "Vertex" : "Elem"));
-                    char buf[64];
-                    std::snprintf(buf, sizeof(buf), "%s %u · Body%u", kn, it.hit.topo_id,
-                                  it.hit.body_id);
-                    label = buf;
-                } else {
-                    label = "Ref " + std::to_string(ri + 1);
-                }
-                const float* col = kEvalPalette[ri % 10];
-                drawColorChipRow(label.c_str(), col);
-                ++ri;
-                if (ri >= 8) break;
-            }
-
-            auto showLen = [&](const char* k) {
-                if (result_.contains(k) && result_[k].is_number())
-                    ImGui::Text("%s: %s", k, evalLen(st, result_[k].get<double>()).c_str());
-            };
-            showLen("distance");
-            if (result_.contains("angle") && result_["angle"].is_number())
-                ImGui::Text("angle: %.4f deg", result_["angle"].get<double>());
-            showLen("length");
-            showLen("radius");
-            showLen("diameter");
-            showLen("perimeter");
-            showLen("total_length");
-            showLen("total_distance");
-            if (result_.contains("area") && result_["area"].is_number())
-                ImGui::Text("area: %s",
-                            pmFormatArea(result_["area"].get<double>(), st.ips()).c_str());
-            if (result_.contains("volume") && result_["volume"].is_number())
-                ImGui::Text("volume: %s",
-                            pmFormatVolume(result_["volume"].get<double>(), st.ips()).c_str());
-            if (result_.contains("segment_lengths") && result_["segment_lengths"].is_array()) {
-                ImGui::TextUnformatted("Segments:");
-                int si = 0;
-                for (const auto& s : result_["segment_lengths"]) {
-                    if (!s.is_number()) continue;
-                    ImGui::BulletText("#%d  %s", ++si, evalLen(st, s.get<double>()).c_str());
-                }
-            }
-            if (result_.contains("closed") && result_["closed"].is_boolean())
-                ImGui::Text("Closed profile: %s", result_["closed"].get<bool>() ? "yes" : "no");
-
-            if (kind == "(none)" || result_.empty())
-                ImGui::TextDisabled(
-                    "Select faces, edges, or vertices. 1 = property; 2 = distance; 3+ = chain.");
-
-            if (!measureLog_.empty()) {
-                ImGui::SeparatorText("History");
-                if (ImGui::SmallButton("Clear")) {
-                    measureLog_.clear();
-                    measureLoggedGen_ = -1;
-                }
-                ImGui::BeginChild("##measlog", ImVec2(0, 120 * ui::uiScale),
-                                  ImGuiChildFlags_Border);
-                for (size_t i = measureLog_.size(); i-- > 0;)
-                    ImGui::TextUnformatted(measureLog_[i].c_str());
-                ImGui::EndChild();
-            }
+            drawMeasure(st);
         } else if (openWindow_ == "check") {
             if (result_.contains("issues") && result_["issues"].is_array()) {
                 const auto& issues = result_["issues"];
@@ -1868,26 +1901,40 @@ void EvaluateDialogs::drawExclusiveWindow(AppState& st) {
                 }
             }
         } else if (openWindow_ == "interference") {
+            if (!errorText_.empty())
+                kit::blockedState("Interference unavailable", errorText_.c_str());
             if (!interferencePartNames_.empty()) {
-                ImGui::SeparatorText("Members");
+                kit::sectionHeader("Members");
                 bool anyChange = false;
                 for (size_t i = 0; i < interferencePartNames_.size(); ++i) {
                     if (i >= interferencePartChecked_.size()) break;
                     bool checked = interferencePartChecked_[i] != 0;
-                    if (ImGui::Checkbox(interferencePartNames_[i].c_str(), &checked)) {
+                    ImGui::PushID((int)i);
+                    if (ImGui::Checkbox("##member", &checked)) {
                         interferencePartChecked_[i] = checked ? 1 : 0;
                         anyChange = true;
                     }
+                    ImGui::SameLine();
+                    ImGui::TextWrapped("%s", interferencePartNames_[i].c_str());
+                    ImGui::PopID();
                 }
-                if (anyChange && !pending_) {
+                if (anyChange) {
                     nlohmann::json members = nlohmann::json::array();
                     for (size_t i = 0; i < interferencePartNames_.size(); ++i) {
                         if (i < interferencePartChecked_.size() && interferencePartChecked_[i])
                             members.push_back(interferencePartNames_[i]);
                     }
                     nlohmann::json extra = nlohmann::json::object();
-                    if (!members.empty()) extra["members"] = members;
-                    runEval(st, "eval_interference", extra);
+                    if (members.empty()) {
+                        ++gen_;
+                        pending_ = false;
+                        result_ = nlohmann::json::object();
+                        errorText_ = "Select at least one member to check interference.";
+                        clearOverlays();
+                    } else {
+                        extra["members"] = members;
+                        runEval(st, "eval_interference", extra);
+                    }
                 }
                 ImGui::Separator();
             }
@@ -1899,8 +1946,29 @@ void EvaluateDialogs::drawExclusiveWindow(AppState& st) {
                             !result_["clearances"].empty();
             if (result_.contains("summary"))
                 ImGui::TextWrapped("%s", result_.value("summary", std::string()).c_str());
+            const bool complete = result_.value("complete", false);
+            if (!result_.empty() && !complete) {
+                kit::blockedState("Incomplete interference check",
+                    "Some geometry or pair checks failed. Known clashes below remain valid; "
+                    "this report cannot establish clearance.");
+                for (const char* key : {"geometry_failures", "pair_failures"}) {
+                    if (!result_.contains(key) || !result_[key].is_array()) continue;
+                    kit::sectionHeader(key[0] == 'g' ? "Geometry failures" : "Pair failures");
+                    for (const auto& failure : result_[key]) {
+                        if (!failure.is_object()) continue;
+                        std::string subject = failure.value("name",
+                            failure.value("component", failure.value("feature", std::string())));
+                        if (failure.contains("a") && failure.contains("b"))
+                            subject = failure["a"].is_string() ? failure["a"].get<std::string>() : failure["a"].dump();
+                        if (failure.contains("b"))
+                            subject += " / " + (failure["b"].is_string() ? failure["b"].get<std::string>() : failure["b"].dump());
+                        ImGui::TextWrapped("%s: %s", subject.empty() ? "Geometry" : subject.c_str(),
+                                           failure.value("reason", std::string("Analysis failed")).c_str());
+                    }
+                }
+            }
             if (hasPairs) {
-                ImGui::SeparatorText("Interferences");
+                kit::sectionHeader("Interferences");
                 int pi = 0;
                 for (const auto& p : result_["interferences"]) {
                     std::string a = p.value("a", std::string("?"));
@@ -1921,20 +1989,14 @@ void EvaluateDialogs::drawExclusiveWindow(AppState& st) {
                         bboxTxt = evalLen(st, dx) + " × " + evalLen(st, dy) + " × " + evalLen(st, dz);
                     }
                     const float* ca = kEvalPalette[(pi * 2) % 10];
-                    char line[256];
-                    if (!bboxTxt.empty())
-                        std::snprintf(line, sizeof(line), "%s × %s: overlap %s, bbox %s", a.c_str(),
-                                      b.c_str(), pmFormatVolume(vol, st.ips()).c_str(),
-                                      bboxTxt.c_str());
-                    else
-                        std::snprintf(line, sizeof(line), "%s × %s: overlap %s", a.c_str(),
-                                      b.c_str(), pmFormatVolume(vol, st.ips()).c_str());
-                    drawColorChipRow(line, ca);
+                    std::string line = a + " × " + b + ": overlap " + pmFormatVolume(vol, st.ips());
+                    if (!bboxTxt.empty()) line += ", bounding box " + bboxTxt;
+                    drawColorChipRow(line.c_str(), ca);
                     ++pi;
                 }
             }
             if (hasClear) {
-                ImGui::SeparatorText("Clearances");
+                kit::sectionHeader("Clearances");
                 for (const auto& p : result_["clearances"]) {
                     std::string a = p.value("a", std::string("?"));
                     std::string b = p.value("b", std::string("?"));
@@ -1948,9 +2010,9 @@ void EvaluateDialogs::drawExclusiveWindow(AppState& st) {
                     "Interference detection runs across assembly components or multi-body parts. "
                     "Open an assembly or a multi-body part to check clashes.");
             }
-            if (result_.value("ok", true) && !hasPairs && errorText_.empty() && !pending_)
-                ImGui::TextColored(ImVec4(gpal.statusOk[0], gpal.statusOk[1], gpal.statusOk[2], 1),
-                                   "No interference.");
+            if (complete && result_.value("ok", false) && result_.value("pairs_checked", 0) > 0 &&
+                !hasPairs && errorText_.empty() && !pending_)
+                kit::chip("No interference", kit::Tone::Ok);
         } else if (openWindow_ == "symmetry") {
             ImGui::SetNextItemWidth(100 * ui::uiScale);
             if (ImGui::Combo("Plane", &symmetryPlane_, "Front\0Top\0Right\0")) {
@@ -1958,13 +2020,12 @@ void EvaluateDialogs::drawExclusiveWindow(AppState& st) {
                 int pi = (symmetryPlane_ >= 0 && symmetryPlane_ < 3) ? map[symmetryPlane_] : 1;
                 runEval(st, "eval_symmetry", {{"plane", kPlaneNames[pi]}});
             }
-            ImGui::SameLine();
             if (pending_) {
-                ImGui::TextDisabled("Computing…");
+                kit::spinner("Computing symmetry...");
             } else {
                 bool sym = result_.value("symmetric", false);
-                ImGui::Text("Symmetric: %s  ·  Dev: %s", sym ? "yes" : "no",
-                            pmFormatVolume(result_.value("deviation_mm3", 0.0), st.ips()).c_str());
+                kit::keyValueRow("Symmetric", sym ? "Yes" : "No");
+                kit::keyValueRow("Deviation", pmFormatVolume(result_.value("deviation_mm3", 0.0), st.ips()).c_str());
             }
         } else if (openWindow_ == "zebra") {
             ImGui::TextWrapped(
@@ -1973,8 +2034,7 @@ void EvaluateDialogs::drawExclusiveWindow(AppState& st) {
             if (ImGui::SliderFloat("Density", &gZebraFreq, 4.0f, 60.0f, "%.0f")) {
                 if (st.renderer) st.renderer->setZebra(true, gZebraFreq);
             }
-            ImGui::SameLine();
-            if (ImGui::Button("Turn Off")) {
+            if (kit::secondaryButton("Turn Off")) {
                 if (st.renderer) st.renderer->setZebra(false, gZebraFreq);
                 openWindow_.clear();
             }
@@ -1986,17 +2046,14 @@ void EvaluateDialogs::drawExclusiveWindow(AppState& st) {
                 ImGui::PopStyleColor();
             }
             if (pending_) {
-                ImGui::TextDisabled("Computing…");
-                ImGui::SameLine();
+                kit::spinner("Computing draft...");
             }
             ImGui::SetNextItemWidth(90 * ui::uiScale);
             ImGui::Combo("Pull", &draftPull_, "X\0Y\0Z\0-Z\0");
-            ImGui::SameLine();
             ImGui::SetNextItemWidth(80 * ui::uiScale);
             ImGui::DragFloat("Angle", &draftAngleDeg_, 0.1f, 0.0f, 45.0f, "%.1f°",
                              ImGuiSliderFlags_AlwaysClamp);
-            ImGui::SameLine();
-            if (ImGui::Button("Update") && !pending_) {
+            if (kit::primaryButton("Update", !pending_)) {
                 static const double kPull[4][3] = {
                     {1, 0, 0}, {0, 1, 0}, {0, 0, 1}, {0, 0, -1}};
                 int pi = (draftPull_ >= 0 && draftPull_ < 4) ? draftPull_ : 2;
@@ -2005,8 +2062,7 @@ void EvaluateDialogs::drawExclusiveWindow(AppState& st) {
                               {"angle_deg", (double)draftAngleDeg_}},
                              "Draft angle", "deg");
             }
-            ImGui::SameLine();
-            if (ImGui::Button("Turn Off")) {
+            if (kit::secondaryButton("Turn Off")) {
                 clearFieldColormap(st);
                 openWindow_.clear();
             }
@@ -2018,21 +2074,18 @@ void EvaluateDialogs::drawExclusiveWindow(AppState& st) {
                 ImGui::PopStyleColor();
             }
             if (pending_) {
-                ImGui::TextDisabled("Computing…");
-                ImGui::SameLine();
+                kit::spinner("Computing thickness...");
             }
             ImGui::SetNextItemWidth(90 * ui::uiScale);
-            ImGui::DragFloat("Res", &thicknessRes_, 0.05f, 0.05f, 5.0f, "%.2f mm",
+            ImGui::DragFloat("Resolution", &thicknessRes_, 0.05f, 0.05f, 5.0f, "%.2f mm",
                              ImGuiSliderFlags_AlwaysClamp);
-            ImGui::SameLine();
-            if (ImGui::Button("Update") && !pending_) {
+            if (kit::primaryButton("Update", !pending_)) {
                 nlohmann::json extra = nlohmann::json::object();
                 if (thicknessRes_ > 0.0f) extra["resolution"] = (double)thicknessRes_;
                 runFieldEval(st, "eval_thickness", extra, "Wall thickness",
                              st.ips() ? "in" : "mm");
             }
-            ImGui::SameLine();
-            if (ImGui::Button("Turn Off")) {
+            if (kit::secondaryButton("Turn Off")) {
                 clearFieldColormap(st);
                 openWindow_.clear();
             }
@@ -2044,13 +2097,11 @@ void EvaluateDialogs::drawExclusiveWindow(AppState& st) {
                 ImGui::PopStyleColor();
             }
             if (pending_) {
-                ImGui::TextDisabled("Computing…");
-                ImGui::SameLine();
+                kit::spinner("Computing curvature...");
             }
             ImGui::SetNextItemWidth(110 * ui::uiScale);
             ImGui::Combo("Kind", &curvatureKind_, "Mean\0Gaussian\0Max\0Min\0");
-            ImGui::SameLine();
-            if (ImGui::Button("Update") && !pending_) {
+            if (kit::primaryButton("Update", !pending_)) {
                 static const char* kKinds[] = {"mean", "gaussian", "max", "min"};
                 int ki = (curvatureKind_ >= 0 && curvatureKind_ < 4) ? curvatureKind_ : 0;
                 const char* kind = kKinds[ki];
@@ -2062,8 +2113,7 @@ void EvaluateDialogs::drawExclusiveWindow(AppState& st) {
                                         : "Min");
                 runFieldEval(st, "eval_curvature", {{"kind", kind}}, titleBuf, "1/mm");
             }
-            ImGui::SameLine();
-            if (ImGui::Button("Turn Off")) {
+            if (kit::secondaryButton("Turn Off")) {
                 clearFieldColormap(st);
                 openWindow_.clear();
             }
@@ -2076,11 +2126,16 @@ void EvaluateDialogs::drawExclusiveWindow(AppState& st) {
             ImGui::TextWrapped("%s", errorText_.c_str());
             ImGui::PopStyleColor();
         }
-        ImGui::PopStyleColor();  // default text ink
+        ImGui::PopTextWrapPos();
+        ui::drawWindowPillScrollbarV(surf);
     }
     ImGui::End();
-    ImGui::PopStyleColor();  // ImGuiCol_WindowBg
-    if (!open) {
+    if (!open || openWindow_.empty()) {
+        ++gen_;
+        pending_ = false;
+        measureDirty_ = false;
+        result_ = nlohmann::json::object();
+        errorText_.clear();
         if (openWindow_ == "zebra" && st.renderer) st.renderer->setZebra(false, gZebraFreq);
         if (openWindow_ == "draft" || openWindow_ == "thickness" || openWindow_ == "curvature" ||
             openWindow_ == "field_wait" || openWindow_ == "field_err")
@@ -2096,9 +2151,14 @@ void EvaluateDialogs::drawExclusiveWindow(AppState& st) {
     }
 }
 
-void EvaluateDialogs::draw(AppState& st) {
-    // Live measure re-eval + mass design section chain + section plane drag debounce.
+void EvaluateDialogs::prepareFrame(AppState& st) {
+    syncDocument(st);
     tickLiveMeasure(st);
+}
+
+void EvaluateDialogs::draw(AppState& st) {
+    prepareFrame(st);
+    // Mass design section chain and section plane drag debounce.
     tickMassDesignSections(st);
     tickSectionDrag(st);
     if (massOpen_ && !massPending_) rebuildMassOverlays(st);
@@ -2118,9 +2178,11 @@ void EvaluateDialogs::draw(AppState& st) {
     }
 
     // Independent windows — order: mass, section, exclusive.
+    kit::pushDensity(kit::Density::Cozy);
     drawMassWindow(st);
     drawSectionWindow(st);
     drawExclusiveWindow(st);
+    kit::popDensity();
 }
 
 }  // namespace ui

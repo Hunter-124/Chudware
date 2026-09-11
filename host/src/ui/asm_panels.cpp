@@ -19,6 +19,7 @@
 #include "icons.h"
 #include "layout.h"           // setNextCommandDialogPlacement (floating dialog anchor)
 #include "metrics.h"
+#include "widgets/kit.h"
 #include "property_manager.h"   // pmParseDim / pmFormatDim (DimField parsing)
 
 #include "../core/app_state.h"
@@ -1490,61 +1491,60 @@ void AsmPanels::refreshBom(AppState& st) {
 void AsmPanels::drawBom(AppState& st) {
     if (!bomOpen_) return;
     bool open = true;
-    ui::setNextCommandDialogPlacement();   // first-open anchor over the full-width viewport
-    ImGui::SetNextWindowSize(ImVec2(560 * ui::uiScale, 0), ImGuiCond_Appearing);  // W1-B (item 10): DPI
+    ui::setNextCommandDialogPlacement("Bill of Materials",
+        ImVec2(ui::metrics::px(700), ui::metrics::px(480)),
+        ImVec2(ui::metrics::px(340), ui::metrics::px(300)));
     if (bomFocus_) { ImGui::SetNextWindowFocus(); bomFocus_ = false; }
-    pushGlassWindow();
-    const bool bomWin = ImGui::Begin("Bill of Materials", &open);
-    popGlassWindow();
+    ImGui::SetNextWindowBgAlpha(1.0f);
+    const bool bomWin = ImGui::Begin("Bill of Materials", &open, ImGuiWindowFlags_NoDocking);
     if (bomWin) {
-        paintGlassWindow("asm_bom_glass");
-        asmIcon("bom", "[B]"); ImGui::SameLine(0, ui::metrics::asmHeaderIconGap());
-        ImGui::TextUnformatted("Components");
-        ImGui::SameLine(ImGui::GetWindowWidth() - 80);
-        if (ImGui::Button("Refresh")) refreshBom(st);
+        ui::kit::sectionHeader("Components", "bom", nullptr, (int)bomRows_.size(), true);
+        if (ui::kit::secondaryButton("Refresh")) refreshBom(st);
         ImGui::Separator();
 
-        if (!bomNote_.empty()) {
-            pushText(ui::palette.textDim);
-            ImGui::TextWrapped("%s", bomNote_.c_str());
-            ImGui::PopStyleColor();
-        }
+        if (!bomNote_.empty()) ui::kit::dimText(bomNote_.c_str());
+        const float footerHeight = ImGui::GetTextLineHeightWithSpacing() +
+                                   2 * ImGui::GetFrameHeightWithSpacing() + ui::kit::sectionGap();
+        const float tableHeight = std::max(ImGui::GetFrameHeightWithSpacing(),
+                                          ImGui::GetContentRegionAvail().y - footerHeight);
         if (ImGui::BeginTable("##bom_tbl", 5,
-            ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingStretchProp)) {
-            ImGui::TableSetupColumn("#", ImGuiTableColumnFlags_WidthFixed, 28);
-            ImGui::TableSetupColumn("Part");
-            ImGui::TableSetupColumn("Source");
-            ImGui::TableSetupColumn("Qty", ImGuiTableColumnFlags_WidthFixed, 40);
-            ImGui::TableSetupColumn("Mass (g)", ImGuiTableColumnFlags_WidthFixed, 90);
+            ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingFixedFit |
+            ImGuiTableFlags_Resizable | ImGuiTableFlags_ScrollX | ImGuiTableFlags_ScrollY,
+            ImVec2(0, tableHeight))) {
+            ImGui::TableSetupScrollFreeze(0, 1);
+            ImGui::TableSetupColumn("#", ImGuiTableColumnFlags_WidthFixed, ui::metrics::px(32));
+            ImGui::TableSetupColumn("Part", ImGuiTableColumnFlags_WidthFixed, ui::metrics::px(180));
+            ImGui::TableSetupColumn("Source", ImGuiTableColumnFlags_WidthFixed, ui::metrics::px(220));
+            ImGui::TableSetupColumn("Qty", ImGuiTableColumnFlags_WidthFixed, ui::metrics::px(44));
+            ImGui::TableSetupColumn("Mass (g)", ImGuiTableColumnFlags_WidthFixed, ui::metrics::px(100));
             ImGui::TableHeadersRow();
             int n = 1;
             for (const auto& row : bomRows_) {
                 ImGui::TableNextRow();
                 ImGui::TableNextColumn(); ImGui::Text("%d", n++);
-                ImGui::TableNextColumn(); ImGui::TextUnformatted(row.name.c_str());
+                ImGui::TableNextColumn(); ImGui::TextWrapped("%s", row.name.c_str());
                 ImGui::TableNextColumn();
                 // show just the file stem to keep the column readable; full path on hover
                 std::string src = row.source;
                 std::string stem = src;
                 size_t slash = stem.find_last_of("/\\");
                 if (slash != std::string::npos) stem = stem.substr(slash + 1);
-                ImGui::TextUnformatted(stem.c_str());
+                ImGui::TextWrapped("%s", stem.c_str());
                 if (ImGui::IsItemHovered() && !src.empty()) ImGui::SetTooltip("%s", src.c_str());
                 ImGui::TableNextColumn(); ImGui::Text("%d", row.qty);
                 ImGui::TableNextColumn();
                 if (row.haveMass) ImGui::Text("%.2f", row.massG * row.qty);
                 else if (bomPending_ > 0) ImGui::TextDisabled("...");  // C39: eval_mass in flight
-                else ImGui::Text("%.0f mm3", row.volMm3 * row.qty);
+                else ImGui::TextDisabled("Unavailable");
             }
             ImGui::EndTable();
         }
 
         ImGui::Spacing();
         ImGui::TextUnformatted("Export CSV to:");
-        ImGui::SetNextItemWidth(-ui::metrics::asmBtnW());
+        ImGui::SetNextItemWidth(-1);
         ImGui::InputText("##bom_csv", bomCsvPath_.data(), bomCsvPath_.size());
-        ImGui::SameLine();
-        if (ImGui::Button("Export", ImVec2(ui::metrics::px(80), 0)) && bomCsvPath_[0]) {
+        if (ui::kit::primaryButton("Export CSV", bomCsvPath_[0] != 0)) {
             FILE* f = std::fopen(bomCsvPath_.data(), "wb");
             if (f) {
                 std::fprintf(f, "Item,Part,Source,Qty,Mass_g,Volume_mm3\n");
@@ -1561,7 +1561,8 @@ void AsmPanels::drawBom(AppState& st) {
                 bomNote_ = "Could not open CSV path for writing.";
             }
         }
-        endGlassWindow();
+        ImGui::SameLine();
+        if (ui::kit::secondaryButton("Close")) open = false;
     }
     ImGui::End();
     if (!open) bomOpen_ = false;

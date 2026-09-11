@@ -76,8 +76,9 @@ nlohmann::json doc_new(const std::string& kind, const std::string& name,
 // Apply an op batch. `base_revision` < 0 skips the optimistic-concurrency guard;
 // otherwise a mismatch throws OpError("stale_revision"). A bad op throws OpError.
 // `coalesce` folds the batch into the previous undo step (no new snapshot).
+// `with_tess=false` omits mesh publication/response data, retaining rebuild diagnostics.
 nlohmann::json doc_apply_ops(const std::string& doc_id, long base_revision,
-                             const nlohmann::json& ops, bool coalesce);
+                             const nlohmann::json& ops, bool coalesce, bool with_tess = true);
 
 // Stateless dry-run validation (engine.doc.ops dry_run, used by the agent modeler/
 // fixer path). Clones the live session's current doc into a scratch session and runs
@@ -380,13 +381,14 @@ nlohmann::json doc_eval_solid_health(const std::string& doc_id, int body_id);
 nlohmann::json doc_eval_model_integrity(const std::string& doc_id,
                                        const nlohmann::json& params);
 
-// Evaluate — cross-section properties of the LAST body at `plane` (port of
-// evaluate.py::section_props via worker.py::_eval_section_props). `plane` is a reserved
-// planar datum id ("plane.top/front/right"), a {"kind":"datum","feature":<id>} selector,
-// or an arbitrary cut {"origin":[x,y,z],"normal":[nx,ny,nz]} (optional "xdir":[3]).
-// Returns {area_mm2, centroid[3], Ixx, Iyy, Ixy}. Matches the oracle's degenerate path
-// (area/moments == 0; only the section-wire centroid is meaningful). Throws OpError on no
-// bodies / a non-reserved-planar / degenerate plane.
+// Evaluate — additive cross-section properties of all world-placed document solids.
+// Independent bodies are not Boolean-unioned. `plane` is a reserved planar datum id
+// ("plane.top/front/right"), a {"kind":"datum","feature":<id>} selector, or an arbitrary
+// cut {"origin":[x,y,z],"normal":[nx,ny,nz]} (optional "xdir":[3]).
+// Returns {area_mm2, centroid[3], Ixx, Iyy, Ixy}: global centroid and plane-local
+// centroidal moments. A genuine empty intersection returns zero fields. Failed
+// section/loop/face/integration throws section_failed, never partial or empty success.
+// Missing geometry and invalid planes also throw OpError.
 nlohmann::json doc_eval_section_props(const std::string& doc_id, const nlohmann::json& plane_ref);
 
 // Evaluate — mirror-symmetry of the active body about `plane` (port of evaluate.py::
@@ -473,12 +475,13 @@ nlohmann::json doc_render_diff(const nlohmann::json& params);
 // params.face, or a resolved-but-non-planar face.
 nlohmann::json doc_face_wires(const std::string& doc_id, const nlohmann::json& params);
 
-// Evaluate — measure 1-8 resolved refs against the LAST body (port of evaluate.py::measure
-// via worker.py::_eval_measure). Each ref is a face/edge/vertex selector. 1 ref ->
+// Evaluate — measure 1-8 refs in world space. Picked refs carry
+// {body_id, selector}; the body ID is the AICM identity, not a vector index. 1 ref ->
 // single-entity measure (length/radius/area/point/volume) plus `anchor` [x,y,z] centroid
 // and (for edge/face) `polyline` [[x,y,z],...] <=128 pts; 2 refs -> pair measure
 // (distance + optional angle) with per-ref enrichment under `a`/`b`; 3+ -> multi_distance
-// with per-ref `elements[]`. Throws OpError on no bodies / a dangling ref / a bad count.
+// with per-ref `elements[]`. `resolved_refs[]` carries world-space selector readbacks.
+// Throws OpError on missing bodies, invalid owners, stale refs or an invalid count.
 nlohmann::json doc_eval_measure(const std::string& doc_id, const nlohmann::json& refs);
 
 // Evaluate FIELD — per-vertex DRAFT-ANGLE field of the active body (port of evaluate.py::
@@ -723,12 +726,25 @@ nlohmann::json doc_dep_unregister(const std::string& dep_doc_id, const std::stri
 //   worst_case,worst_moment_case,warnings}. Reactions act on component_b from
 // component_a in world coordinates; force is N and moment is N·m.
 // Pass null / omit for the field-compatible kinematics-only behavior.
+// `drivers`: optional nonempty [{mate_id,start,stop}] array, authoritative over the
+// legacy single-driver fields. Unique active angle/distance mates share the same
+// normalized sample times. Drivers and live expressions/poses/history are not mutated.
+// Adds drivers:[{mate_id,type,unit,start,stop,steps}], frame.driver_values:{id:value},
+// and per-driver residual/relative-reference pose checks in frame.pose_check.bodies.
+// frame.value and result.driver/mate_id remain the first driver's legacy projection.
+// Interference adds complete, frames_checked (fully evaluated valid frames),
+// pair_failures:[{i,a,b,component_a,component_b,reason}], geometry_failures.
+// Every frame carries interference_complete, nullable interference, collisions and
+// collision_detail (stable component_a/component_b plus names, overlap or distance).
+// Incomplete geometry/checks never mean collision-free; first_collision_step stays null
+// until a known hit. ok=false on incomplete requested checks, not on a known collision.
 nlohmann::json doc_simulate_motion(const std::string& doc_id,
                                    const std::string& mate_id,  // "" = auto-pick
                                    double start, double stop, int steps,
                                    bool check_interference,
                                    double min_clearance_mm = 0.0,
-                                   const nlohmann::json& dynamics = nlohmann::json(nullptr));
+                                   const nlohmann::json& dynamics = nlohmann::json(nullptr),
+                                   const nlohmann::json& drivers = nlohmann::json(nullptr));
 
 // --- doc-lock contention meters (Phase 1b + T-PERF5 per-doc locking) ---------------
 // Each modeling RPC locks the target document (DocLock → per-session mutex). Meters

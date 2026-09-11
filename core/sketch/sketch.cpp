@@ -2340,6 +2340,39 @@ json extract_entities(const VectorXd& x, const json& entities_list,
     return out;
 }
 
+// Exactly-zero columns are unconstrained coordinates. Keep their projection at one
+// without constructing a quadratic full-V basis for unused spline control points.
+VectorXd nullspace_projection(const MatrixXd& J) {
+    VectorXd projection = VectorXd::Ones(J.cols());
+    std::vector<int> active;
+    active.reserve(J.cols());
+    for (int i = 0; i < J.cols(); ++i)
+        if (!J.col(i).isZero(0.0)) active.push_back(i);
+    if (active.empty()) return projection;
+
+    MatrixXd reduced;
+    const MatrixXd* matrix = &J;
+    if (active.size() != static_cast<size_t>(J.cols())) {
+        reduced.resize(J.rows(), active.size());
+        for (size_t i = 0; i < active.size(); ++i)
+            reduced.col(i) = J.col(active[i]);
+        matrix = &reduced;
+    }
+    Eigen::JacobiSVD<MatrixXd> svd(*matrix, Eigen::ComputeFullV);
+    const VectorXd& s = svd.singularValues();
+    const double s0 = s.size() ? s(0) : 1.0;
+    const double thr =
+        std::max(1e-7, 1e3 * std::numeric_limits<double>::epsilon() * s0);
+    int rank = 0;
+    for (int i = 0; i < s.size(); ++i)
+        if (s(i) > thr) ++rank;
+    const int n_null = static_cast<int>(active.size()) - rank;
+    const MatrixXd& V = svd.matrixV();
+    for (size_t i = 0; i < active.size(); ++i)
+        projection(active[i]) = n_null ? V.row(i).segment(rank, n_null).norm() : 0.0;
+    return projection;
+}
+
 // SVD-nullspace per-entity status coloring (port of _compute_entity_statuses).
 std::map<std::string, std::string> compute_statuses(
     const VectorXd& x, const json& entities_list, const VarMap& var_map,
@@ -2350,20 +2383,7 @@ std::map<std::string, std::string> compute_statuses(
         for (const auto& e : entities_list) statuses[jid(e)] = "under";
         return statuses;
     }
-    Eigen::JacobiSVD<MatrixXd> svd(J, Eigen::ComputeFullV);
-    VectorXd s = svd.singularValues();
-    double s0 = s.size() ? s(0) : 1.0;
-    double thr = std::max(1e-7, 1e3 * std::numeric_limits<double>::epsilon() * s0);
-    int rank = 0;
-    for (int i = 0; i < s.size(); ++i)
-        if (s(i) > thr) ++rank;
-    const MatrixXd& V = svd.matrixV();  // n x n
-    int n_null = n_vars - rank;
-    VectorXd null_proj = VectorXd::Zero(n_vars);
-    if (n_null > 0) {
-        MatrixXd Vn = V.block(0, rank, n_vars, n_null);
-        for (int i = 0; i < n_vars; ++i) null_proj(i) = Vn.row(i).norm();
-    }
+    const VectorXd null_proj = nullspace_projection(J);
     const double tol_null = 1e-6;
 
     std::set<int> conflicting_vars;
@@ -2924,23 +2944,9 @@ std::vector<FreeVar> free_variables_at(const json& sketch, const json& env,
     std::vector<FreeVar> out;
     if (J.rows() == 0 || n == 0) return out;  // wholly unconstrained -> no J rows
 
-    // Same SVD null-space projection compute_statuses uses: a variable is FREE when its
-    // row of the null-space basis has non-trivial norm (it can move without violating a
-    // constraint). This is the per-VARIABLE version of the per-entity status coloring.
-    Eigen::JacobiSVD<MatrixXd> svd(J, Eigen::ComputeFullV);
-    VectorXd s = svd.singularValues();
-    double s0 = s.size() ? s(0) : 1.0;
-    double thr = std::max(1e-7, 1e3 * std::numeric_limits<double>::epsilon() * s0);
-    int rank = 0;
-    for (int i = 0; i < s.size(); ++i)
-        if (s(i) > thr) ++rank;
-    int n_null = n - rank;
-    VectorXd null_proj = VectorXd::Zero(n);
-    if (n_null > 0) {
-        const MatrixXd& V = svd.matrixV();
-        MatrixXd Vn = V.block(0, rank, n, n_null);
-        for (int i = 0; i < n; ++i) null_proj(i) = Vn.row(i).norm();
-    }
+    // Share the per-entity classifier's projection, including coordinates absent
+    // from every constraint Jacobian.
+    const VectorXd null_proj = nullspace_projection(J);
     const double tol_null = 1e-6;
 
     // Walk entities in declaration order; for each, map its loose local variables to

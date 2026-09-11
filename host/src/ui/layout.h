@@ -102,12 +102,12 @@ void drawLeftPane(AppState& st,
 // nothing from ConfigPanel (that dockable window stays for the right task pane).
 void drawConfigurationsBody(AppState& st);
 
-// Default first-open placement for the floating command dialogs (Evaluate / assembly / Cut List /
-// Design Table windows): with the docked rightBottom slot gone they open as free floaters, so this
-// anchors the NEXT window's top-right corner just left of where the Copilot column pins, 12dp
-// inside the overlay band (ImGuiCond_FirstUseEver — a user's later placement persists in the ini).
-// Call immediately before ImGui::Begin(); no-op fallback (ImGui default cascade) pre-band-publish.
-void setNextCommandDialogPlacement();
+// Floating command dialogs keep user geometry; callers provide metric-scaled pixel sizes.
+// Call immediately before Begin() with its exact window name. Constraints and recovery clamp
+// remembered geometry to the current work/overlay band (also after viewport or DPI changes).
+// Published column edges guide only initial placement; they never prevent dragging/resizing.
+void setNextCommandDialogPlacement(const char* windowName, ImVec2 preferredSizePx,
+                                   ImVec2 minimumSizePx);
 
 // Evaluate-tab ribbon "dead space" (screen px) to the RIGHT of the last Evaluate group. The
 // Zebra / Symmetry inspector windows dock INTO this strip while the Evaluate tab is active

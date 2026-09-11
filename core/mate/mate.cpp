@@ -73,6 +73,14 @@ Matrix3d left_jacobian(const Vector3d& w) {
     return Matrix3d::Identity() + a * K + b * (K * K);
 }
 
+Matrix3d left_jacobian_inverse(const Vector3d& w) {
+    const double theta = w.norm();
+    const Matrix3d K = skew(w);
+    const double c = theta < 1e-6 ? 1.0 / 12.0 + theta * theta / 720.0
+        : (1.0 - 0.5 * theta / std::tan(0.5 * theta)) / (theta * theta);
+    return Matrix3d::Identity() - 0.5 * K + c * (K * K);
+}
+
 // Analytic 3x3 Jacobian of R(w) @ v w.r.t. w. -[R v]_x J_l.
 Matrix3d rot_jac(const Vector3d& w, const Vector3d& v) {
     Vector3d Rv = rodrigues_impl(w) * v;
@@ -83,12 +91,14 @@ Matrix3d rot_jac(const Vector3d& w, const Vector3d& v) {
 Vector3d mat_to_rotvec_impl(const Matrix3d& R) {
     double cos_t = (R.trace() - 1.0) * 0.5;
     cos_t = std::max(-1.0, std::min(1.0, cos_t));
-    double theta = std::acos(cos_t);
+    const Vector3d antisymmetric(R(2, 1) - R(1, 2), R(0, 2) - R(2, 0), R(1, 0) - R(0, 1));
+    // atan2 retains the small sine near pi; acos amplifies trace roundoff there.
+    double theta = std::atan2(0.5 * antisymmetric.norm(), cos_t);
     if (theta < 1e-8) {
-        return Vector3d(R(2, 1) - R(1, 2), R(0, 2) - R(2, 0), R(1, 0) - R(0, 1)) * 0.5;
+        return 0.5 * antisymmetric;
     }
     if (std::abs(kPi - theta) < 1e-6) {
-        Matrix3d A = (R + Matrix3d::Identity()) * 0.5;
+        Matrix3d A = (R + R.transpose() + 2.0 * Matrix3d::Identity()) * 0.25;
         int k = 0;
         double best = A(0, 0);
         for (int i = 1; i < 3; ++i) {
@@ -96,11 +106,11 @@ Vector3d mat_to_rotvec_impl(const Matrix3d& R) {
         }
         Vector3d axis = A.col(k) / std::sqrt(std::max(A(k, k), 1e-12));
         axis = unit(axis);
+        if (axis.dot(antisymmetric) < 0.0) axis = -axis;
         return axis * theta;
     }
     double s = std::sin(theta);
-    Vector3d w(R(2, 1) - R(1, 2), R(0, 2) - R(2, 0), R(1, 0) - R(0, 1));
-    return (w / (2.0 * s)) * theta;
+    return (antisymmetric / (2.0 * s)) * theta;
 }
 
 // --------------------------------------------------------------------------- vector primitives
@@ -113,6 +123,13 @@ void perp_basis(const Vector3d& axis, Vector3d& e1, Vector3d& e2) {
     e2 = unit(a.cross(e1));
 }
 
+Matrix3d unit_jacobian(const Vector3d& v) {
+    const double norm = v.norm();
+    if (norm <= 1e-12) return Matrix3d::Identity();
+    const Vector3d direction = v / norm;
+    return (Matrix3d::Identity() - direction * direction.transpose()) / norm;
+}
+
 
 // Two scalars measuring the component of vec perpendicular to axis.
 VectorXd perp_residual2(const Vector3d& axis, const Vector3d& vec) {
@@ -123,14 +140,19 @@ VectorXd perp_residual2(const Vector3d& axis, const Vector3d& vec) {
     return r;
 }
 
-// Jacobian of perp_residual2 (basis locally constant). Jvec is (3, k).
-MatrixXd perp_residual2_jac(const Vector3d& axis, const MatrixXd& /*Jaxis*/,
-                            const Vector3d& /*vec*/, const MatrixXd& Jvec) {
-    Vector3d e1, e2;
-    perp_basis(axis, e1, e2);
+// Differentiate the moving perpendicular basis as well as the measured vector.
+MatrixXd perp_residual2_jac(const Vector3d& axis, const MatrixXd& Jaxis,
+                            const Vector3d& vec, const MatrixXd& Jvec) {
+    const Vector3d a = unit(axis);
+    const Vector3d helper = std::abs(a[0]) < 0.9 ? Vector3d(1, 0, 0) : Vector3d(0, 1, 0);
+    const Vector3d first = a.cross(helper), e1 = unit(first);
+    const Vector3d second = a.cross(e1), e2 = unit(second);
+    const Matrix3d Ja = unit_jacobian(axis);
+    const Matrix3d Je1 = -unit_jacobian(first) * skew(helper) * Ja;
+    const Matrix3d Je2 = unit_jacobian(second) * (-skew(e1) * Ja + skew(a) * Je1);
     MatrixXd out(2, Jvec.cols());
-    out.row(0) = e1.transpose() * Jvec;
-    out.row(1) = e2.transpose() * Jvec;
+    out.row(0) = e1.transpose() * Jvec + (vec.transpose() * Je1) * Jaxis;
+    out.row(1) = e2.transpose() * Jvec + (vec.transpose() * Je2) * Jaxis;
     return out;
 }
 
@@ -144,14 +166,9 @@ VectorXd two_indep_cross(const Vector3d& da, const Vector3d& db) {
     return r;
 }
 
-MatrixXd two_indep_cross_jac(const Vector3d& da, const Vector3d& /*db*/,
-                             const MatrixXd& cross_jac) {
-    Vector3d e1, e2;
-    perp_basis(da, e1, e2);
-    MatrixXd out(2, cross_jac.cols());
-    out.row(0) = e1.transpose() * cross_jac;
-    out.row(1) = e2.transpose() * cross_jac;
-    return out;
+MatrixXd two_indep_cross_jac(const Vector3d& da, const Vector3d& db,
+                             const MatrixXd& Jda, const MatrixXd& cross_jac) {
+    return perp_residual2_jac(da, Jda, da.cross(db), cross_jac);
 }
 
 double axis_point_distance(const Vector3d& p_axis, const Vector3d& d_axis,
@@ -164,7 +181,7 @@ double axis_point_distance(const Vector3d& p_axis, const Vector3d& d_axis,
 
 // (1, k) jacobian. Jp, Jd, Jq are (3, k).
 MatrixXd axis_point_distance_jac(const Vector3d& p_axis, const MatrixXd& Jp,
-                                 const Vector3d& d_axis, const MatrixXd& /*Jd*/,
+                                 const Vector3d& d_axis, const MatrixXd& Jd,
                                  const Vector3d& q, const MatrixXd& Jq) {
     Vector3d d = unit(d_axis);
     Vector3d v = q - p_axis;
@@ -172,10 +189,8 @@ MatrixXd axis_point_distance_jac(const Vector3d& p_axis, const MatrixXd& Jp,
     double nrm = perp.norm();
     if (nrm < 1e-9) return MatrixXd::Zero(1, Jp.cols());
     Vector3d u = perp / nrm;
-    MatrixXd Jv = Jq - Jp;                          // (3, k)
-    // Jperp = Jv - d (d^T Jv)
-    MatrixXd Jperp = Jv - d * (d.transpose() * Jv);  // (3, k)
-    return (u.transpose() * Jperp);                  // (1, k)
+    return u.transpose() * (Jq - Jp)
+        - v.dot(d) * (u.transpose() * unit_jacobian(d_axis)) * Jd;
 }
 
 // --------------------------------------------------------------------------- component frame
@@ -225,12 +240,36 @@ struct CompFrame {
 
 // --------------------------------------------------------------------------- residual builder
 
+// Split a 16-double row-major transform into the solver's pose parameters. `R_authored`,
+// when given, receives the 3x3 block VERBATIM — the caller that pins a fixed component
+// needs the document's own rotation, not the orthonormal projection the exp-map
+// parameterization requires.
+void transform_to_params(const std::vector<double>& transform, Vector3d& t, Vector3d& w,
+                         Matrix3d* R_authored = nullptr) {
+    Eigen::Matrix4d M;
+    for (int r = 0; r < 4; ++r)
+        for (int c = 0; c < 4; ++c)
+            M(r, c) = transform[r * 4 + c];
+    Matrix3d Rm = M.block(0, 0, 3, 3);
+    t = M.block(0, 3, 3, 1);
+    if (R_authored) *R_authored = Rm;
+    // Orthonormalize defensively (SVD), matching numpy's U @ Vt with det fix.
+    Eigen::JacobiSVD<Matrix3d> svd(Rm, Eigen::ComputeFullU | Eigen::ComputeFullV);
+    Matrix3d U = svd.matrixU();
+    Matrix3d V = svd.matrixV();
+    Matrix3d Rn = U * V.transpose();
+    if (Rn.determinant() < 0) {
+        U.col(2) *= -1;
+        Rn = U * V.transpose();
+    }
+    w = mat_to_rotvec_impl(Rn);
+}
 class MateBuilder {
 public:
     MateBuilder(CompFrame* fa, MateGeom ga, CompFrame* fb, MateGeom gb,
                 std::string mtype, const std::string& align, double value,
                 std::vector<MateGeom> extra, json params,
-                std::vector<std::string> extra_owners)
+                std::vector<std::string> extra_owners, const json* reference_frames)
         : fa_(fa), ga_(std::move(ga)), fb_(fb), gb_(std::move(gb)),
           mtype_(std::move(mtype)), sign_(align == "anti" ? -1.0 : 1.0),
           value_(value), extra_(std::move(extra)), params_(std::move(params)),
@@ -243,6 +282,24 @@ public:
         xb_const_ << fb_->t0, fb_->w0;
         if (extra_owners_.size() < extra_.size())
             extra_owners_.resize(extra_.size(), "b");
+        auto bind_frame = [&](const CompFrame* frame, Matrix3d& rotation, Vector3d& translation) {
+            rotation = frame->R_auth;
+            translation = frame->t_auth;
+            if (!reference_frames) return;
+            if (!reference_frames->is_object() || !reference_frames->contains(frame->id))
+                throw std::runtime_error("mate reference_frames missing component " + frame->id);
+            const json& encoded = reference_frames->at(frame->id);
+            if (!encoded.is_array() || encoded.size() != 16)
+                throw std::runtime_error("mate reference frame must contain 16 numbers");
+            for (const auto& value : encoded)
+                if (!value.is_number() || !std::isfinite(value.get<double>()))
+                    throw std::runtime_error("mate reference frame must be finite and numeric");
+            Vector3d w;
+            transform_to_params(encoded.get<std::vector<double>>(), translation, w, &rotation);
+            if (!frame->fixed) rotation = rodrigues_impl(w);
+        };
+        bind_frame(fa_, Ra_reference_, ta_reference_);
+        bind_frame(fb_, Rb_reference_, tb_reference_);
     }
 
     const std::vector<int>& idx() const { return idx_; }
@@ -288,6 +345,8 @@ private:
     int na_ = 0;
     Eigen::Matrix<double, 6, 1> xa_const_;
     Eigen::Matrix<double, 6, 1> xb_const_;
+    Matrix3d Ra_reference_, Rb_reference_;
+    Vector3d ta_reference_, tb_reference_;
 
     // -- sub-vector helpers ------------------------------------------------
     VectorXd xa(const VectorXd& xs) const {
@@ -389,6 +448,23 @@ private:
             return unit(out);
         }
         return std::nullopt;
+    }
+
+    // Explicit virtual pins are stored in A's local frame. Bind their point and
+    // direction to B using the authored placements, never a previous solve's pose.
+    void bind_virtual_pin(const Vector3d& axis_a, Vector3d& point_a,
+                          Vector3d& point_b, Vector3d& axis_b) const {
+        const json& point = params_.at("axis_point");
+        if (!point.is_array() || point.size() != 3)
+            throw std::runtime_error(mtype_ + " axis_point must be a 3-element vector");
+        for (int k = 0; k < 3; ++k) {
+            if (!point[k].is_number() || !std::isfinite(point[k].get<double>()))
+                throw std::runtime_error(mtype_ + " axis_point must be finite and numeric");
+            point_a[k] = point[k].get<double>();
+        }
+        point_b = Rb_reference_.transpose() *
+            (Ra_reference_ * point_a + ta_reference_ - tb_reference_);
+        axis_b = Rb_reference_.transpose() * Ra_reference_ * axis_a;
     }
 
     Vector3d axis_world(const std::string& which) const {
@@ -569,14 +645,14 @@ private:
         const Vector3d ref_l = angle_reference_local(da_l, db_l);
         if (params_.is_object() && params_.contains("axis_point") &&
             (params_.contains("axis") || params_.contains("reference_axis"))) {
-            const Vector3d db_a = fa_->R_auth.transpose() * fb_->R_auth * db_l;
+            const Vector3d db_a = Ra_reference_.transpose() * Rb_reference_ * db_l;
             if (da_l.cross(ref_l).norm() < 1e-6 || db_a.cross(ref_l).norm() < 1e-6) {
                 // Faces normal to the pin cannot measure its phase. A line-carrying
                 // mate is a joint between BODY frames, so measure rotation from
                 // their authored relative orientation instead (zero at authoring).
                 Vector3d unused;
                 perp_basis(ref_l, da_l, unused);
-                db_l = fb_->R_auth.transpose() * fa_->R_auth * da_l;
+                db_l = sign_ * Rb_reference_.transpose() * Ra_reference_ * da_l;
             }
         }
         auto self = this;
@@ -590,8 +666,8 @@ private:
             self->wd("a", xs, da_l, da, Jda);
             self->wd("b", xs, db_l, db, Jdb);
             self->wd("a", xs, ref_l, ref, Jref);
-            const double rn = ref.norm();
-            if (rn > 1e-12) { ref /= rn; Jref /= rn; }
+            Jref = unit_jacobian(ref) * Jref;
+            ref = unit(ref);
             s = ref.dot(da.cross(db));
             c = da.dot(db) - da.dot(ref) * db.dot(ref);
         };
@@ -616,27 +692,16 @@ private:
             const Vector3d g_da = (c * db.cross(ref) - s * pb) / den;
             const Vector3d g_db = (c * ref.cross(da) - s * pa) / den;
             const Vector3d g_ref =
-                (c * da.cross(db) - s * (db.dot(ref) * da + da.dot(ref) * db)) / den;
+                (c * da.cross(db) + s * (db.dot(ref) * da + da.dot(ref) * db)) / den;
             return MatrixXd(self->place("a", (g_da.transpose() * Jda).eval())
                             + self->place("b", (g_db.transpose() * Jdb).eval())
                             + self->place("a", (g_ref.transpose() * Jref).eval()));
         };
         if (params_.is_object() && params_.contains("axis_point") &&
             (params_.contains("axis") || params_.contains("reference_axis"))) {
-            const json& point = params_["axis_point"];
-            if (!point.is_array() || point.size() != 3)
-                throw std::runtime_error("angle axis_point must be a 3-element vector");
-            Vector3d pa_l;
-            for (int k = 0; k < 3; ++k) {
-                if (!point[k].is_number() || !std::isfinite(point[k].get<double>()))
-                    throw std::runtime_error("angle axis_point must be finite and numeric");
-                pa_l[k] = point[k].get<double>();
-            }
-            // Bind the virtual pin to both AUTHORED frames, never the warm start.
-            // Three point rows preserve its axial station as well as its line.
-            const Vector3d pb_l = fb_->R_auth.transpose() *
-                (fa_->R_auth * pa_l + fa_->t_auth - fb_->t_auth);
-            const Vector3d axis_b = fb_->R_auth.transpose() * fa_->R_auth * ref_l;
+            Vector3d pa_l, pb_l, axis_b;
+            bind_virtual_pin(ref_l, pa_l, pb_l, axis_b);
+            // Three point rows preserve the pin's axial station as well as its line.
             R angle_r = rfunc;
             J angle_j = jfunc;
             rfunc = [=](const VectorXd& xs) {
@@ -660,7 +725,7 @@ private:
                 MatrixXd out = self->empty_jac(6);
                 const MatrixXd cross_jac = self->place("a", (-skew(b) * Ja).eval())
                     + self->place("b", (skew(a) * Jb).eval());
-                out.topRows(2) = two_indep_cross_jac(a, b, cross_jac);
+                out.topRows(2) = two_indep_cross_jac(a, b, self->place("a", Ja), cross_jac);
                 out.middleRows(2, 3) = self->place("b", Jpb) - self->place("a", Jpa);
                 out.bottomRows(1) = angle_j(xs);
                 return out;
@@ -699,8 +764,8 @@ private:
         auto perp_to_da = [&](const Vector3d& v) {
             return Vector3d(v - v.dot(da_l) * da_l);
         };
-        const Matrix3d& Ra = fa_->R_auth;
-        const Matrix3d& Rb = fb_->R_auth;
+        const Matrix3d& Ra = Ra_reference_;
+        const Matrix3d& Rb = Rb_reference_;
 
         if (auto authored = param_vec3({"axis", "reference_axis"})) {
             const Vector3d p = perp_to_da(*authored);
@@ -762,7 +827,8 @@ private:
             Vector3d sdb = sign * db;
             MatrixXd cross_jac = self->place("a", (-skew(sdb) * Jda).eval())
                 + self->place("b", (skew(da) * (sign * Jdb)).eval());
-            Jm.block(0, 0, 2, self->icols()) = two_indep_cross_jac(da, sdb, cross_jac);
+            Jm.block(0, 0, 2, self->icols()) =
+                two_indep_cross_jac(da, sdb, self->place("a", Jda), cross_jac);
             Vector3d diff = pb - pa;
             MatrixXd Jdiff = self->place("b", Jpb) - self->place("a", Jpa);
             Jm.block(2, 0, 2, self->icols()) =
@@ -896,10 +962,8 @@ private:
 
     // ----- lock -----------------------------------------------------------
     Built lock() {
-        Matrix3d Ra0 = fa_->rot(fa_->w0);
-        Vector3d ta0 = fa_->t0;
-        Matrix3d Rb0 = fb_->rot(fb_->w0);
-        Vector3d tb0 = fb_->t0;
+        const Matrix3d Ra0 = Ra_reference_, Rb0 = Rb_reference_;
+        const Vector3d ta0 = ta_reference_, tb0 = tb_reference_;
         Matrix3d relR0 = Ra0.transpose() * Rb0;
         Vector3d relt0 = Ra0.transpose() * (tb0 - ta0);
         auto self = this;
@@ -920,16 +984,22 @@ private:
             return r;
         };
         J jfunc = [=](const VectorXd& xs) {
-            VectorXd xav = self->xa(xs);
+            const VectorXd xav = self->xa(xs), xbv = self->xb(xs);
+            const Vector3d wa = xav.tail(3), wb = xbv.tail(3);
+            const Matrix3d Ra = self->fa_->rot(wa), Rb = self->fb_->rot(wb);
+            const Vector3d diff = xbv.head(3) - xav.head(3);
+            const Vector3d error = mat_to_rotvec_impl(relR0.transpose() * Ra.transpose() * Rb);
+            const Matrix3d rotation_gradient =
+                left_jacobian_inverse(error) * relR0.transpose() * Ra.transpose();
             MatrixXd Jm = self->empty_jac(6);
-            Matrix3d Ra = self->fa_->rot(xav.segment(3, 3));
             if (self->fb_->var_size()) {
                 Jm.block(0, self->na_, 3, 3) = Ra.transpose();
-                Jm.block(3, self->na_ + 3, 3, 3) = Matrix3d::Identity();
+                Jm.block(3, self->na_ + 3, 3, 3) = rotation_gradient * left_jacobian(wb);
             }
             if (self->na_) {
                 Jm.block(0, 0, 3, 3) = -Ra.transpose();
-                Jm.block(3, 3, 3, 3) = -Matrix3d::Identity();
+                Jm.block(0, 3, 3, 3) = Ra.transpose() * skew(diff) * left_jacobian(wa);
+                Jm.block(3, 3, 3, 3) = -rotation_gradient * left_jacobian(wa);
             }
             return Jm;
         };
@@ -1231,6 +1301,17 @@ private:
         Vector3d db_l = gb_.dir_vector();
         Vector3d pa_l = ga_.point, pb_l = gb_.point;
         double sign = sign_;
+        const auto axis = param_vec3({"axis", "reference_axis"});
+        const bool explicit_pin = axis.has_value() || params_.contains("axis_point");
+        if (explicit_pin) {
+            if (!axis || !params_.contains("axis_point"))
+                throw std::runtime_error("hinge virtual pin requires axis and axis_point");
+            da_l = *axis;
+            bind_virtual_pin(da_l, pa_l, pb_l, db_l);
+            // Both directions name the same authored body-frame line; selector
+            // directions and their align flag must not relocate this virtual pin.
+            sign = 1.0;
+        }
         Vector3d ma_l, mb_l;
         if (extra_.size() >= 2) {
             ma_l = extra_[0].dir_vector();
@@ -1238,7 +1319,11 @@ private:
         } else {
             Vector3d e1, e2;
             perp_basis(da_l, e1, e2); ma_l = e1;
-            perp_basis(db_l, e1, e2); mb_l = e1;
+            if (explicit_pin)
+                mb_l = Rb_reference_.transpose() * Ra_reference_ * ma_l;
+            else {
+                perp_basis(db_l, e1, e2); mb_l = e1;
+            }
         }
         double lo = deg2rad(param("min", 0.0));
         double hi = deg2rad(param("max", 360.0));
@@ -1285,7 +1370,8 @@ private:
             Vector3d sdb = sign * db;
             MatrixXd cross_jac = self->place("a", (-skew(sdb) * Jda).eval())
                 + self->place("b", (skew(da) * (sign * Jdb)).eval());
-            Jm.block(0, 0, 2, self->icols()) = two_indep_cross_jac(da, sdb, cross_jac);
+            Jm.block(0, 0, 2, self->icols()) =
+                two_indep_cross_jac(da, sdb, self->place("a", Jda), cross_jac);
             Jm.block(2, 0, 3, self->icols()) =
                 self->place("b", Jpb) - self->place("a", Jpa);
             double ang; MatrixXd row; swing(xs, ang, row);
@@ -1351,30 +1437,6 @@ private:
 
 const std::vector<double> kIdentity16 = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
 
-// Split a 16-double row-major transform into the solver's pose parameters. `R_authored`,
-// when given, receives the 3x3 block VERBATIM — the caller that pins a fixed component
-// needs the document's own rotation, not the orthonormal projection the exp-map
-// parameterization requires.
-void transform_to_params(const std::vector<double>& transform, Vector3d& t, Vector3d& w,
-                         Matrix3d* R_authored = nullptr) {
-    Eigen::Matrix4d M;
-    for (int r = 0; r < 4; ++r)
-        for (int c = 0; c < 4; ++c)
-            M(r, c) = transform[r * 4 + c];
-    Matrix3d Rm = M.block(0, 0, 3, 3);
-    t = M.block(0, 3, 3, 1);
-    if (R_authored) *R_authored = Rm;
-    // Orthonormalize defensively (SVD), matching numpy's U @ Vt with det fix.
-    Eigen::JacobiSVD<Matrix3d> svd(Rm, Eigen::ComputeFullU | Eigen::ComputeFullV);
-    Matrix3d U = svd.matrixU();
-    Matrix3d V = svd.matrixV();
-    Matrix3d Rn = U * V.transpose();
-    if (Rn.determinant() < 0) {
-        U.col(2) *= -1;
-        Rn = U * V.transpose();
-    }
-    w = mat_to_rotvec_impl(Rn);
-}
 
 std::vector<double> params_to_transform(const Vector3d& t, const Vector3d& w) {
     Matrix3d Rm = rodrigues_impl(w);
@@ -1477,11 +1539,17 @@ std::set<std::string> failing_groups(const std::vector<Builders>& builders,
 void classify_mates(std::vector<Builders>& builders, const VectorXd& x, double tol,
                     std::vector<std::string>& redundant,
                     std::vector<std::string>& conflicting) {
-    double rtol = std::max(1e-6, 1e3 * tol);
-    bool have_accum = false;
-    MatrixXd accum;
-    int base_rank = 0;
-    int n = static_cast<int>(x.size());
+    const double rtol = std::max(1e-6, 1e3 * tol);
+    const double rank_tol = std::max(1e-9, tol);
+    struct Group {
+        std::vector<int> columns;  // sorted global variable indices
+        MatrixXd rows;
+        int rank = 0;
+    };
+    std::vector<Group> groups;
+    groups.reserve(builders.size());
+    std::vector<int> owner(x.size(), -1);
+    std::vector<int> local_column(x.size(), -1);
     for (auto& b : builders) {
         const std::vector<int>& idx = b.builder->idx();
         // rebuild jfunc (matches Python building a fresh jfunc via make()[1]).
@@ -1492,27 +1560,62 @@ void classify_mates(std::vector<Builders>& builders, const VectorXd& x, double t
         for (size_t i = 0; i < idx.size(); ++i) xsub(static_cast<int>(i)) = x(idx[i]);
         MatrixXd Jb = jfunc(xsub);
         VectorXd rb = b.rfunc(xsub);
-        MatrixXd Wb = MatrixXd::Zero(Jb.rows(), n);
-        for (size_t i = 0; i < idx.size(); ++i) Wb.col(idx[i]) = Jb.col(static_cast<int>(i));
-        MatrixXd stacked;
-        if (!have_accum) {
-            stacked = Wb;
-        } else {
-            stacked.resize(accum.rows() + Wb.rows(), n);
-            stacked.topRows(accum.rows()) = accum;
-            stacked.bottomRows(Wb.rows()) = Wb;
+        // Untouched variable groups form independent diagonal blocks. With an
+        // absolute singular-value threshold their cached ranks add exactly; only
+        // groups touched by this mate need to be factored again.
+        std::vector<int> touched;
+        for (int column : idx)
+            if (owner[column] >= 0) touched.push_back(owner[column]);
+        std::sort(touched.begin(), touched.end());
+        touched.erase(std::unique(touched.begin(), touched.end()), touched.end());
+        std::vector<int> columns(idx.begin(), idx.end());
+        Eigen::Index prior_rows = 0;
+        int base_rank = 0;
+        for (int id : touched) {
+            const Group& group = groups[id];
+            columns.insert(columns.end(), group.columns.begin(), group.columns.end());
+            prior_rows += group.rows.rows();
+            base_rank += group.rank;
         }
-        int new_rank = matrix_rank_abs(stacked, std::max(1e-9, tol));
-        int gained = new_rank - base_rank;
+        std::sort(columns.begin(), columns.end());
+        columns.erase(std::unique(columns.begin(), columns.end()), columns.end());
+        for (size_t i = 0; i < columns.size(); ++i)
+            local_column[columns[i]] = static_cast<int>(i);
+
+        MatrixXd candidate = MatrixXd::Zero(prior_rows + Jb.rows(), columns.size());
+        Eigen::Index row = 0;
+        for (int id : touched) {
+            const Group& group = groups[id];
+            for (size_t i = 0; i < group.columns.size(); ++i)
+                candidate.col(local_column[group.columns[i]]).segment(row, group.rows.rows())
+                    = group.rows.col(static_cast<int>(i));
+            row += group.rows.rows();
+        }
+        for (size_t i = 0; i < idx.size(); ++i)
+            candidate.col(local_column[idx[i]]).tail(Jb.rows()) = Jb.col(static_cast<int>(i));
+        const int new_rank = matrix_rank_abs(candidate, rank_tol);
+        const int gained = new_rank - base_rank;
         if (gained <= 0) {
             if (rb.size() > 0 && rb.cwiseAbs().maxCoeff() > rtol)
                 conflicting.push_back(b.mid);
             else
                 redundant.push_back(b.mid);
         } else {
-            accum = stacked;
-            have_accum = true;
-            base_rank = new_rank;
+            // Keep every row of an accepted mate, even if only some add rank.
+            // Rejected mates must not merge groups or contribute rows later.
+            const int accepted = touched.empty() ? static_cast<int>(groups.size()) : touched.front();
+            if (touched.empty()) groups.emplace_back();
+            for (int id : touched) {
+                if (id == accepted) continue;
+                groups[id].columns.clear();
+                groups[id].rows.resize(0, 0);
+                groups[id].rank = 0;
+            }
+            Group& group = groups[accepted];
+            group.columns = std::move(columns);
+            group.rows = std::move(candidate);
+            group.rank = new_rank;
+            for (int column : group.columns) owner[column] = accepted;
         }
     }
 }
@@ -1658,7 +1761,8 @@ MateSolveResult solve_mates(const json& components, const json& mates,
         try {
             bptr = std::make_unique<MateBuilder>(
                 &ca_it->second, ga_it->second, &cb_it->second, gb_it->second,
-                mtype, align, value, extra_geoms, params, extra_owners);
+                mtype, align, value, extra_geoms, params, extra_owners,
+                mate.contains("reference_frames") ? &mate.at("reference_frames") : nullptr);
             auto built = bptr->make();
             rfunc = std::get<0>(built);
             jfunc = std::get<1>(built);
@@ -1816,8 +1920,7 @@ MateSolveResult solve_mates(const json& components, const json& mates,
     std::vector<std::string> redundant, conflicting;
     int dof = system.n_vars();
     if (system.n_vars() > 0 && !active_tags.empty()) {
-        auto analysis = system.analyze(x);
-        dof = analysis.dof;
+        dof = system.degrees_of_freedom(x);
         classify_mates(builders, x, eff_tol, redundant, conflicting);
     }
 

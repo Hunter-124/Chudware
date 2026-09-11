@@ -55,8 +55,8 @@ ENTRIES: dict[str, dict[str, Any]] = {
     },
     "reveng_add_images": {
         "prompt_note": (
-            "Capture step for multi-view stills; pass paths OR dir (neither "
-            "silently adds 0). Verify with get_reveng_coverage before reconstructing."
+            "Supply image paths or a directory. Each image must decode; failed "
+            "sources return ok:false with full failed paths while valid images are retained."
         ),
     },
     "reveng_add_video": {
@@ -78,6 +78,24 @@ ENTRIES: dict[str, dict[str, Any]] = {
             "sessions are refused unless strategy='override_approximate'; score with describe_reveng_result."
         ),
         "timeout_s": 300,
+    },
+    "reveng_cancel_splat": {
+        "prompt_note": (
+            "Stops the owned Gaussian process tree while retaining the last valid "
+            "preview; cancellation is not completion of the reconstruction."
+        ),
+    },
+    "reveng_crop_splat": {
+        "prompt_note": (
+            "Stop training first. Bounds are [xmin,ymin,zmin,xmax,ymax,zmax] in "
+            "reconstruction units, not calibrated CAD millimetres; null restores the original."
+        ),
+    },
+    "reveng_finish_splat": {
+        "prompt_note": (
+            "Ends live acquisition by requesting a full-quality pass over accepted "
+            "frames. Read reveng_splat_status for progress and the resulting preview."
+        ),
     },
     "reveng_fit_primitives": {
         "prompt_note": (
@@ -144,10 +162,23 @@ ENTRIES: dict[str, dict[str, Any]] = {
         ),
         "timeout_s": 600,
     },
+    "reveng_splat_status": {
+        "prompt_note": (
+            "Nonblocking durable job status and latest immutable Gaussian preview. "
+            "A preview during training is not a finished full-quality result."
+        ),
+    },
     "reveng_start_session": {
         "prompt_note": (
             "First call of any RE flow; pass research= (MPN/query/URL) to "
             "auto-populate the datasheet lane or part_ref to seed photos/datasheet from the parts hub."
+        ),
+    },
+    "reveng_start_splat": {
+        "prompt_note": (
+            "Starts local Gaussian reconstruction without CAD scale or mesh gates. "
+            "Use live=true for arriving accepted images; object mode needs an explicit "
+            "reconstruction-unit crop, not automatic segmentation."
         ),
     },
     "reveng_status": {

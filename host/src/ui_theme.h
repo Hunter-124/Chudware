@@ -21,6 +21,9 @@ struct Fonts {
 // Canonical theme identifiers.
 enum class Theme { Dark, Light };
 
+// Shared Measure reference and Interference emphasis colors, matching the MCP view.
+extern const float evalEmphasisPalette[10][4];
+
 // =========================================================================
 // Shared UI contract (chud-ui-shared-v1) — assets/ui-shared-manifest.json
 // =========================================================================

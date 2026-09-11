@@ -102,10 +102,11 @@ public:
     // Row offsets / has_soft are re-finalized lazily on the next solve/analyze.
     void clear_soft_targets();
 
-    // Interactive-mode flag (T-PERF8). When true, the LM step uses LDLT-first with
-    // an SVD fallback, the damping trial loop honours the wall-clock deadline, and
-    // analyze() attributes redundant rows via a single ColPivQR instead of repeated
-    // growing QRs. Default false keeps the exact Python-oracle parity path.
+    // Interactive-mode flag (T-PERF8). Dense LM steps use LDLT-first with an SVD
+    // fallback; damping trials honour the wall-clock deadline, and analyze()
+    // attributes redundant rows via a single ColPivQR instead of growing QRs.
+    // Large sparse steps use augmented QR in either mode; dense exact steps retain
+    // the Python-oracle path.
     void set_interactive(bool on) { interactive_ = on; }
     bool interactive() const { return interactive_; }
 
@@ -133,6 +134,11 @@ public:
     Result solve(const std::optional<Eigen::VectorXd>& x0 = std::nullopt,
                  double tol = 1e-10, int max_iter = 50,
                  std::optional<double> time_budget_ms = std::nullopt);
+
+    // DOF at configuration x: n_vars minus the numeric rank of the real
+    // (non-soft) Jacobian, using the same tolerance as analyze(). Does not
+    // evaluate residuals or attribute redundant/conflicting constraints.
+    int degrees_of_freedom(const Eigen::VectorXd& x, double tol = 1e-7);
 
     // DOF / redundancy / conflict analysis at configuration x. Rank via a
     // column-pivoted QR of the dense Jacobian. dof = n_vars - rank. Redundant rows

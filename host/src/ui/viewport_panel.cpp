@@ -2569,8 +2569,18 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
             // silently skipped inside drawFeatureHighlight. Suppressed while a PM edit preview is
             // ghosting: the translucent feature already marks itself, and an opaque tint on top of
             // the ghost would read muddy.
-            if (!st.featureHighlightFaces.empty() && !pmPreviewing)
-                st.overlays->drawFeatureHighlight(renderer.camera(), st.featureHighlightFaces);
+            if (!st.featureHighlightFaces.empty() && !pmPreviewing) {
+                if (st.activeWorkspace == AppState::Workspace::Simulate && st.simManager &&
+                    st.simManager->motionCollisionHighlightActive()) {
+                    const float collisionColor[4] = {
+                        ui::palette.statusErr[0], ui::palette.statusErr[1],
+                        ui::palette.statusErr[2], 0.45f};
+                    st.overlays->drawFaceWash(renderer.camera(), st.featureHighlightFaces,
+                                             collisionColor);
+                } else {
+                    st.overlays->drawFeatureHighlight(renderer.camera(), st.featureHighlightFaces);
+                }
+            }
             // Build the simulation CPU batches first: collectFlowResultLines may lazily rebuild its
             // cached stream/slice geometry and advance overlayGeneration(). Capturing the generation
             // afterwards ensures this frame's persistent GL buffers are keyed to the data drawn.
@@ -2726,6 +2736,7 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
             }
             // Evaluate Measure / Mass Properties markers (distance lines, COM cross, I/J axes).
             if (st.evaluateDialogs) {
+                st.evaluateDialogs->prepareFrame(st);
                 const auto& es = st.evaluateDialogs->overlaySegments();
                 if (!es.empty()) {
                     const auto& pal = ui::palette;

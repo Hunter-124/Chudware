@@ -41,6 +41,12 @@ Response (also returned by `doc_undo`/`doc_redo`/`doc_rebuild`):
   configuration the returned geometry reflects (`"Default"` for documents without configurations —
   doc_schema.md §9 / worker_rpc.md §2.2).
 - `id_map` maps batch placeholders (§3) to assigned ids.
+- `with_tess` is an optional request boolean (default `true`). When `false`, part and
+  assembly operation responses omit `tess` and do not publish a response mesh.
+  Document edits, mate solving, undo/redo state, `rebuild` diagnostics, `owner_map`,
+  and applicable non-mesh result fields are unchanged. Part compilation may still
+  construct its internal geometry/display cache. A later normal display request
+  renders the committed state; this flag does not suppress geometry validation.
 
 ## 2. Transactionality (normative)
 
@@ -553,3 +559,14 @@ sources refuse the operation atomically. The next rebuild and saved/exported
 geometry use the replacement. Existing mate references are retained, not
 automatically remapped to unrelated replacement topology; inspect solve status
 after replacement.
+
+## 16. Passive explicit-line hinges
+
+A native `hinge` mate may specify `value.axis` (or `reference_axis`) and
+`value.axis_point` together. These coordinates are local to the first reference
+component. The second reference binds through authored component placements, not
+through the current warm-start pose. Five structural constraints preserve the
+pin station and axis while leaving its angular coordinate free; a scalar `value`
+does not turn the passive hinge into a prescribed angle. Existing angular limits
+remain active. Incomplete or malformed explicit pin metadata refuses. Geometric
+hinges and prescribed angle-mate behavior retain their existing semantics.

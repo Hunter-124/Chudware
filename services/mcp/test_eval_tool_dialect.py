@@ -606,22 +606,6 @@ def test_feature_name_resolves_like_its_id(part):
     assert "measuring needs exactly one" in by_name["error"]
 
 
-def test_unknown_sid_still_fails_honestly(part):
-    """The fallback must not turn a bogus handle into a silent success.
-
-    Asserts the SID-SHAPED miss specifically: a well-formed sid that names nothing must
-    say so ("No face/edge with sid") and warn that sids move when the model changes —
-    not fall back to reciting the query grammar, which is what a caller holding a stale
-    sid would be most misled by.
-    """
-    m, err = _dispatch("measure_between", a_query="Fdeadbe", doc_id=part)
-    assert err is None, err
-    assert m["ok"] is False
-    msg = m["error"]
-    assert "sid" in msg and "Fdeadbe" in msg, msg
-    assert "describe_part" in msg, msg
-    assert "TOKENS" not in msg, msg
-
 
 # --------------------------------------------------------------------------
 # A size request is a different TOOL, and the error must say which

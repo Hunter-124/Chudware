@@ -3033,7 +3033,8 @@ static int chudware_call_inner(const char* method, const char* params_json, char
                                 params.contains("base_revision") && params["base_revision"].is_number()
                                     ? params["base_revision"].get<long>() : -1,
                                 params.contains("ops") ? params["ops"] : json::array(),
-                                params.value("coalesce", false)),
+                                params.value("coalesce", false),
+                                params.value("with_tess", true)),
                             out_json, 0);
             if (m == "doc_dry_run_ops")
                 return emit(chudware::doc::doc_dry_run_ops(
@@ -3885,25 +3886,24 @@ static int chudware_call_inner(const char* method, const char* params_json, char
                             out_json, 0);
 
             // ---- kinematic motion study (simulate_motion) ------------------
-            // Pure math: drive one dimensional mate, re-solve the mate graph at
-            // each step, collect per-body column-major transforms, optionally
-            // check interference. Restores the mate to its original value when done.
-            // Synchronous and fast (no meshing). Used by SimManager::runMotion().
+            // Drive dimensional mates together on an immutable snapshot, solving
+            // their shared graph at every sample. Native transforms are column-major.
             if (m == "simulate_motion") {
                 const std::string sm_doc = params.value("doc_id", std::string());
-                const std::string sm_mid = params.value("mate_id", std::string());
-                const double sm_start = params.value("start", 0.0);
-                const double sm_stop  = params.value("stop",  90.0);
-                const int    sm_steps = std::max(2, params.value("steps", 24));
+                const json sm_drivers = params.contains("drivers") ? params["drivers"] : json(nullptr);
+                const std::string sm_mid = sm_drivers.is_null()
+                    ? params.value("mate_id", std::string()) : std::string();
+                const double sm_start = sm_drivers.is_null() ? params.value("start", 0.0) : 0.0;
+                const double sm_stop = sm_drivers.is_null() ? params.value("stop", 90.0) : 90.0;
+                const int    sm_steps = params.value("steps", 24);
                 const bool   sm_ci    = params.value("check_interference", true);
                 const double sm_mcl   = params.value("min_clearance_mm", 0.0);
-                // T-FIN20: optional rigid-body dynamics options object — null keeps
-                // the kinematics-only result field-identical (regression contract).
+                // Optional inverse dynamics and synchronized multi-driver sweep.
                 const json   sm_dyn   = params.contains("dynamics") ? params["dynamics"]
                                                                     : json(nullptr);
                 return emit(chudware::doc::doc_simulate_motion(
                                 sm_doc, sm_mid, sm_start, sm_stop, sm_steps, sm_ci, sm_mcl,
-                                sm_dyn),
+                                sm_dyn, sm_drivers),
                             out_json, 0);
             }
 

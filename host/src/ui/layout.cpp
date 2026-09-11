@@ -27,7 +27,7 @@
 #include "plm_overview.h"       // compact PLM overview tab (left of Explorer on Model)
 #include "doc_tabs.h"           // docTabStripHeight (the column never overlaps the doc-tab band)
 #include "icons.h"              // getIcon / IconUV
-#include "metrics.h"            // dockRightTarget (command-dialog default anchor)
+#include "metrics.h"            // logical dp scaling
 #include "panel_collapse.h"     // ui::PanelCollapseAnim — shared vertical-collapse animation (T-G21)
 #include "widgets/kit.h"         // ui::kit::elide
 
@@ -75,16 +75,64 @@ void setOverlayBand(float minX, float minY, float maxX, float maxY) {
 const OverlayBand& overlayBand() { return g_overlayBand; }
 
 
-// Floating command dialogs (Evaluate / assembly / Cut List / Design Table…) lost their docked
-// rightBottom slot with the overlay layout; give them a sane first-open anchor: top-right inside
-// the overlay band, left of the Copilot column's default pin, 12dp margins. Pivot (1,0) anchors
-// the window's top-RIGHT corner so the placement works for any dialog width.
-void setNextCommandDialogPlacement() {
+void setNextCommandDialogPlacement(const char* windowName, ImVec2 preferredSizePx,
+                                   ImVec2 minimumSizePx) {
+    const ImGuiViewport* viewport = ImGui::GetMainViewport();
+    ImVec2 lo = viewport->WorkPos;
+    ImVec2 hi(lo.x + viewport->WorkSize.x, lo.y + viewport->WorkSize.y);
     const OverlayBand& band = overlayBand();
-    if (!band.valid) return;  // pre-publish frame: keep ImGui's default cascade
-    const float margin = 12.0f * ui::uiScale;
-    const float x = band.maxX - margin - ui::metrics::dockRightTarget() - margin;
-    ImGui::SetNextWindowPos(ImVec2(x, band.minY + margin), ImGuiCond_FirstUseEver, ImVec2(1, 0));
+    if (band.valid) {
+        lo.x = std::max(lo.x, band.minX);
+        lo.y = std::max(lo.y, band.minY);
+        hi.x = std::min(hi.x, band.maxX);
+        hi.y = std::min(hi.y, band.maxY);
+    }
+    if (hi.x <= lo.x || hi.y <= lo.y) return;
+    const float marginX = std::min(metrics::px(12), (hi.x - lo.x) * 0.05f);
+    const float marginY = std::min(metrics::px(12), (hi.y - lo.y) * 0.05f);
+    lo.x += marginX; lo.y += marginY;
+    hi.x -= marginX; hi.y -= marginY;
+    const ImVec2 maximum(hi.x - lo.x, hi.y - lo.y);
+    const ImVec2 minimum(std::min(minimumSizePx.x, maximum.x),
+                         std::min(minimumSizePx.y, maximum.y));
+    const ImVec2 preferred(std::clamp(preferredSizePx.x, minimum.x, maximum.x),
+                           std::clamp(preferredSizePx.y, minimum.y, maximum.y));
+    ImGui::SetNextWindowSizeConstraints(minimum, maximum);
+    ImGui::SetNextWindowSize(preferred, ImGuiCond_FirstUseEver);
+
+    // Columns are hints, not hard boundaries: on narrow viewports a useful dialog may overlap
+    // them. Never reserve space for a hidden Copilot or use its nominal/default width.
+    const float leftEdge = overlayColumnEdge(0);
+    const float rightEdge = overlayColumnEdge(1);
+    const float freeLeft = leftEdge >= lo.x ? std::min(hi.x, leftEdge + marginX) : lo.x;
+    const float freeRight = rightEdge >= lo.x ? std::min(hi.x, rightEdge - marginX) : hi.x;
+    const float anchorRight = freeRight - freeLeft >= preferred.x ? freeRight : hi.x;
+    ImVec2 position(std::clamp(anchorRight - preferred.x, lo.x, hi.x - preferred.x), lo.y);
+    ImVec2 size = preferred;
+    bool remembered = false;
+    if (const ImGuiWindow* window = ImGui::FindWindowByName(windowName)) {
+        position = window->Pos;
+        size = window->SizeFull;
+        remembered = true;
+    } else if (const ImGuiWindowSettings* settings =
+                   ImGui::FindWindowSettingsByID(ImHashStr(windowName))) {
+        const ImVec2 viewportPos = settings->ViewportId
+            ? ImVec2((float)settings->ViewportPos.x, (float)settings->ViewportPos.y)
+            : viewport->Pos;
+        position = ImVec2(settings->Pos.x + viewportPos.x, settings->Pos.y + viewportPos.y);
+        size = ImVec2((float)settings->Size.x, (float)settings->Size.y);
+        remembered = true;
+    }
+    const ImVec2 boundedSize(std::clamp(size.x, minimum.x, maximum.x),
+                             std::clamp(size.y, minimum.y, maximum.y));
+    const ImVec2 boundedPos(std::clamp(position.x, lo.x, hi.x - boundedSize.x),
+                            std::clamp(position.y, lo.y, hi.y - boundedSize.y));
+    if (remembered && (boundedSize.x != size.x || boundedSize.y != size.y))
+        ImGui::SetNextWindowSize(boundedSize);
+    if (remembered && (boundedPos.x != position.x || boundedPos.y != position.y))
+        ImGui::SetNextWindowPos(boundedPos);
+    else
+        ImGui::SetNextWindowPos(boundedPos, ImGuiCond_FirstUseEver);
 }
 
 void resetOverlayColumns() { g_overlayColReset[0] = g_overlayColReset[1] = true; }

@@ -284,18 +284,16 @@ def test_reveng_set_scale_params_accepts_python_repr_dict(reveng_session_id):
     assert out["scale"]["detail"]["source"] == "caliper"
 
 
-def test_reveng_add_images_paths_never_silently_iterated_char_by_char(reveng_session_id):
+def test_reveng_add_images_paths_never_silently_iterated_char_by_char(reveng_session_id, tmp_path):
     """SILENT WRONG BEHAVIOR class: `for p in paths` over a stringified list used to
     iterate CHARACTER BY CHARACTER, silently building garbage single-letter "paths"
     that all failed `.is_file()` — `added` stayed 0 with no error at all."""
     add_images = _bind("reveng_add_images")
-    out = _as_dict(add_images(session_id=reveng_session_id,
-                              paths="['/nonexistent/a.jpg', '/nonexistent/b.jpg']"))
-    assert out.get("ok") is True, out
-    # Neither path exists on disk, so `added` must be 0 — but the important proof
-    # is that this ran the SAME two paths, not 60-odd single characters, which we
-    # confirm by checking the tool never raised/reported a parse error.
+    requested = [str(tmp_path / "missing_a.jpg"), str(tmp_path / "missing_b.jpg")]
+    out = _as_dict(add_images(session_id=reveng_session_id, paths=repr(requested)))
+    assert out.get("ok") is False, out
     assert out["added"] == 0
+    assert [row["path"] for row in out["failed"]] == requested
 
 
 def test_reveng_add_images_paths_reads_real_files_not_characters(reveng_session_id, tmp_path):
@@ -303,13 +301,15 @@ def test_reveng_add_images_paths_reads_real_files_not_characters(reveng_session_
     those two files, not as dozens of single-character path fragments."""
     p1 = tmp_path / "a.jpg"
     p2 = tmp_path / "b.jpg"
-    p1.write_bytes(b"\xff\xd8\xff\xe0fake")
-    p2.write_bytes(b"\xff\xd8\xff\xe0fake")
+    image = pytest.importorskip("PIL.Image")
+    image.new("RGB", (32, 32), "red").save(p1)
+    image.new("RGB", (32, 32), "blue").save(p2)
     add_images = _bind("reveng_add_images")
     paths_str = json.dumps([str(p1), str(p2)])
     out = _as_dict(add_images(session_id=reveng_session_id, paths=paths_str))
     assert out.get("ok") is True, out
     assert out["added"] == 2
+    assert {row["source_path"] for row in out["images"]} == {str(p1), str(p2)}
 
 
 # --------------------------------------------------------------------------- pure coercion sanity

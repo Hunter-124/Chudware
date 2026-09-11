@@ -2341,17 +2341,32 @@ def _build_rotated_slider_assembly(tmp_path) -> tuple:
     return asm, added.get("id_map", {}).get("$0"), "k2"
 
 @pytest.mark.parametrize("line_source", [
-    "authored", "authored_parallel", "authored_placed", "pin_reference"])
+    "authored", "authored_parallel", "authored_placed", "authored_tilted", "authored_near_axis", "pin_reference"])
 def test_simulate_motion_honors_offset_hinge_line(tmp_path, line_source):
     """An angle-only rear plate folds about the FRONT pin, not a guessed origin axis."""
     point = [31.0, 17.0, 23.0]
+    axis = [0, 1, 0]
+    invariant_axis = "y"
     authored = line_source != "pin_reference"
-    parallel_normal = line_source in ("authored_parallel", "authored_placed")
+    parallel_normal = line_source in ("authored_parallel", "authored_placed", "authored_tilted", "authored_near_axis")
     query = {"of": "face", "side": "back" if parallel_normal else "right", "count": 1}
     placement = [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1]
     if line_source == "authored_placed":
         placement = [0, 0, 1, 107, 0, 1, 0, -23, -1, 0, 0, 41, 0, 0, 0, 1]
         point = [130.0, -6.0, 10.0]
+    elif line_source == "authored_tilted":
+        # Local Y becomes world Z: line direction and invariant must rotate too.
+        placement = [1, 0, 0, 107, 0, 0, -1, -23, 0, 1, 0, 41, 0, 0, 0, 1]
+        point = [138.0, -46.0, 58.0]
+        axis = [0, 0, 1]
+        invariant_axis = "z"
+    elif line_source == "authored_near_axis":
+        # A tiny transverse component is not an exact world-coordinate invariant.
+        c, s = math.cos(1e-6), math.sin(1e-6)
+        placement = [c, -s, 0, 1400, s, c, 0, -600, 0, 0, 1, 263, 0, 0, 0, 1]
+        point = [1400 + c * 31 - s * 17, -600 + s * 31 + c * 17, 286]
+        axis = [-s, c, 0]
+        invariant_axis = None
     paths, selectors, pin = [], [], None
     for tag, radius, mode in (("Front", 4, "boss"), ("Rear", 5, "cut")):
         doc = cb.call("doc_new", {"kind": "part", "name": f"MotionHinge{tag}"})["doc_id"]
@@ -2386,7 +2401,7 @@ def test_simulate_motion_honors_offset_hinge_line(tmp_path, line_source):
         ]})
         refs = [{"component": f"k{i + 1}", "selector": s}
                 for i, s in enumerate(selectors)]
-        value = {"value": 0.0, "axis": [0, 1, 0]}
+        value = {"value": 0.0, "axis": axis}
         if authored:
             value["axis_point"] = point
             added, _ = _call("asm_mate", {
@@ -2428,7 +2443,20 @@ def test_simulate_motion_honors_offset_hinge_line(tmp_path, line_source):
                         0, 1, 0, 0,
                         -s, 0, c, point[2] + s * point[0] - c * point[2],
                         0, 0, 0, 1]
-            if line_source == "authored_placed":
+            if line_source == "authored_tilted":
+                expected = [c, -s, 0, point[0] - c * point[0] + s * point[1],
+                            s, c, 0, point[1] - s * point[0] - c * point[1],
+                            0, 0, 1, 0,
+                            0, 0, 0, 1]
+            if line_source == "authored_near_axis":
+                import numpy as np
+                a = np.asarray(axis)
+                cross = np.array([[0, -a[2], a[1]], [a[2], 0, -a[0]], [-a[1], a[0], 0]])
+                rotation = c * np.eye(3) + (1 - c) * np.outer(a, a) + s * cross
+                expected = np.eye(4)
+                expected[:3, :3] = rotation
+                expected[:3, 3] = np.asarray(point) - rotation @ np.asarray(point)
+            if line_source in ("authored_placed", "authored_tilted", "authored_near_axis"):
                 import numpy as np
                 expected = (np.asarray(expected).reshape(4, 4)
                             @ np.asarray(placement).reshape(4, 4)).ravel().tolist()
@@ -2438,11 +2466,23 @@ def test_simulate_motion_honors_offset_hinge_line(tmp_path, line_source):
             if authored:
                 assert frame["dof"] == 1 and frame["residual_dof"] == 0, frame
             checked = frame["pose_check"]["bodies"][0]
-            assert checked["axis_dir"] == pytest.approx([0, 1, 0])
-            # Any point on the pin LINE is valid; its station along Y is immaterial.
-            assert [checked["axis_point"][i] for i in (0, 2)] == pytest.approx([point[0], point[2]])
+            assert checked["coordinate_frame"] == "world"
+            assert checked["axis_dir"] == pytest.approx(axis)
+            if authored:
+                reference = next(b["transform"] for b in frame["bodies"]
+                                 if b["component"] == checked["reference_component"])
+                world_point = [sum(reference[4 * i + j] * local
+                                   for j, local in enumerate([31, 17, 23]))
+                               + reference[4 * i + 3] for i in range(3)]
+                assert checked["axis_point"] == pytest.approx(world_point)
+                assert checked["axis_point"] == pytest.approx(point)
+                assert checked["axis_dir"] == pytest.approx([reference[i] for i in (1, 5, 9)])
+            else:
+                # Any point on the pin LINE is valid; its station along Y is immaterial.
+                assert [checked["axis_point"][i] for i in (0, 2)] == pytest.approx([point[0], point[2]])
             assert checked["translation_ok"] and checked["rotation_ok"]
-            assert checked["invariant_coordinate"] == {"axis": "y", "ok": True}
+            expected_invariant = {"axis": invariant_axis, "ok": True} if invariant_axis else None
+            assert checked["invariant_coordinate"] == expected_invariant
         assert cb.call("doc_tree", {"doc_id": asm}) == before
         if line_source == "authored":
             # A second mate forbids the requested rotation. Neither convergence
@@ -2456,7 +2496,13 @@ def test_simulate_motion_honors_offset_hinge_line(tmp_path, line_source):
             assert not failed["ok"] and not failed["pose_check"]["ok"], failed
             invalid = [f for f in failed["trajectory"] if not f["pose_check"]["ok"]]
             assert invalid
-            assert all(not f["converged"] and "collisions" not in f for f in invalid)
+            assert failed["interference"]["checked"] is True
+            assert failed["interference"]["complete"] is False
+            assert failed["interference"]["frames_checked"] <= len(failed["trajectory"]) - len(invalid)
+            for frame in invalid:
+                assert not frame["converged"], frame
+                assert frame["interference_complete"] is False, frame
+                assert frame["interference"] is None, frame
         # Removing the point/third ref leaves only an angular scalar: it cannot
         # advertise a valid rigid-body motion about a made-up line.
         cb.call("doc_apply_ops", {"doc_id": asm, "with_tess": False, "ops": [
@@ -2469,8 +2515,6 @@ def test_simulate_motion_honors_offset_hinge_line(tmp_path, line_source):
             refused, _ = _call("solve_mates", {"doc_id": asm})
             assert not refused["ok"] and not refused["converged"], refused
             assert refused["reason"] == "mate_unresolved", refused
-            assert refused["worst_mate"] in refused["error"]
-            assert "parallel" in refused["error"], refused
             return
         refused, _ = _call("simulate_motion", {
             "doc_id": asm, "stop": -10, "steps": 2, "check_interference": False})

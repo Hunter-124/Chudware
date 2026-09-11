@@ -205,6 +205,37 @@ TEST_CASE("auto_constrain rolls back a proposal that would conflict") {
         "rollback must leave the sketch non-conflicting: " << h["conflicting"].dump());
 }
 
+TEST_CASE("auto_constrain retains valid corners when another batch proposal conflicts") {
+    json ents = json::array({
+        line("e1", 0, 0, 10, 0), line("e2", 10, 0, 10, 10),
+        line("e3", 30, 0, 40, 0), line("e4", 40.00003, 0, 40.00003, 10),
+    });
+    json cons = json::array({rel("c1", "fix", {"e3"}), rel("c2", "fix", {"e4"})});
+    auto [doc_id, fid] = make_sketch_doc(ents, cons, false);
+    const json preview = doc_sketch_auto_constrain(doc_id, fid, json{{"apply", false}});
+    REQUIRE(preview["proposals"].size() == 2);
+    const json result = doc_sketch_auto_constrain(doc_id, fid, json{{"apply", true}});
+    REQUIRE(result["applied"].size() == 1);
+    CHECK(result["skipped_conflicting"] == 1);
+    const json tree = doc_tree(doc_id);
+    bool retained_valid_corner = false;
+    for (const json& feature : tree["tree"]["features"]) {
+        if (feature.value("id", std::string()) != fid) continue;
+        for (const json& constraint : feature["params"]["constraints"]) {
+            if (constraint["id"] != result["applied"][0]) continue;
+            const auto& refs = constraint["refs"];
+            retained_valid_corner =
+                (refs[0] == "e1.p2" && refs[1] == "e2.p1") ||
+                (refs[1] == "e1.p2" && refs[0] == "e2.p1");
+        }
+    }
+    CHECK(retained_valid_corner);
+    CHECK(doc_sketch_health(doc_id, fid)["conflicting"].empty());
+    const json again = doc_sketch_auto_constrain(doc_id, fid, json{{"apply", false}});
+    CHECK(again["proposals"].size() == 1);
+    chudware::doc::doc_close(doc_id);
+}
+
 TEST_CASE("sketch_health names the free variables of an under-constrained sketch") {
     // One free line, one point pinned at origin. The line is wholly loose: p1x,p1y,p2x,p2y.
     json ents = json::array({

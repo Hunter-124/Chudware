@@ -492,6 +492,9 @@
    "reveng_add_video",
    "reveng_attach_result",
    "reveng_build_parametric",
+   "reveng_cancel_splat",
+   "reveng_crop_splat",
+   "reveng_finish_splat",
    "reveng_fit_primitives",
    "reveng_gate_status",
    "reveng_ingest_datasheet",
@@ -502,7 +505,9 @@
    "reveng_resolve_gate",
    "reveng_set_scale",
    "reveng_single_photo",
+   "reveng_splat_status",
    "reveng_start_session",
+   "reveng_start_splat",
    "reveng_status"
   ],
   "shell": [
@@ -969,6 +974,9 @@
   "reveng_add_video": "Extract blur-culled stills from a video orbit and add them to *session_id*.",
   "reveng_attach_result": "Attach a parts-hub ``part_ref`` to the completed RE result for *session_id*.",
   "reveng_build_parametric": "Build an editable parametric model from the reconstructed mesh.",
+  "reveng_cancel_splat": "Stop the owned Gaussian process tree, retaining the last valid preview.",
+  "reveng_crop_splat": "Crop saved Gaussian centers in reconstruction units; null restores the original.",
+  "reveng_finish_splat": "Finish live acquisition with a full-quality pass over the latest accepted frames.",
   "reveng_fit_primitives": "Segment the mesh and RANSAC-fit primitive shapes (cylinder, box, cone, etc.).",
   "reveng_gate_status": "Report a reveng mission's status and the human gate it is waiting on.",
   "reveng_ingest_datasheet": "Ingest a PDF datasheet into *session_id* via docling (RE-04).",
@@ -979,7 +987,9 @@
   "reveng_resolve_gate": "Answer the human gate a reveng mission is suspended on.",
   "reveng_set_scale": "Solve and record scale calibration for *session_id* (contracts/reveng.md §8.2).",
   "reveng_single_photo": "Run single-photo mesh reconstruction (TripoSR or TRELLIS tier).",
+  "reveng_splat_status": "Read durable Gaussian progress and the latest immutable preview without waiting.",
   "reveng_start_session": "Create a new reverse engineering session.",
+  "reveng_start_splat": "Start local Gaussian reconstruction immediately, without CAD scale or mesh gates.",
   "reveng_status": "Return the RE workspace readiness probe (contracts/reveng.md §8.1).",
   "reverse_engineer": "Rebuild an imported solid (STEP/IGES/BREP/STL/...) as an EDITABLE parametric feature tree, verified against the source by boolean …",
   "reverse_engineer_product": "Reverse-engineer hand-off (contracts/sourcing.md §2b): when match_model finds NO confident repo match (fallback.how == \"reverse_engineer\") …",
@@ -1018,7 +1028,7 @@
   "sim_results": "Collect a simulation job's results — from ANY tool that returned a job_id.",
   "sim_run": "Start an FEA solve in a SEPARATE PROCESS and return a job_id immediately.",
   "sim_status": "State of a sim_run job: queued|running|done|failed|cancelled, elapsed, progress.",
-  "simulate_motion": "Kinematic motion study: DRIVE one mate over a range, re-solve the mechanism each step, return the trajectory (every body's pose per step) + …",
+  "simulate_motion": "Kinematic motion study: DRIVE one or more mates over synchronized ranges, re-solve the mechanism each sample, return every body's pose + a …",
   "sketch3d_add_constraints": "Add constraints to a sketch3d and return the narrated solve results.",
   "sketch3d_add_curves": "Append curve entities to a sketch3d feature (edit_feature) and report the solve.",
   "sketch3d_as_sweep_guide": "Get the exact sweep ref syntax for using this sketch3d as the PATH or a GUIDE.",
@@ -2347,7 +2357,7 @@
    "prompt_note": "Decide once, then bind the choice with set_process. Pass run_id so the clarification is ledgered and a DAG gate never re-asks."
   },
   "reveng_add_images": {
-   "prompt_note": "Capture step for multi-view stills; pass paths OR dir (neither silently adds 0). Verify with get_reveng_coverage before reconstructing."
+   "prompt_note": "Supply image paths or a directory. Each image must decode; failed sources return ok:false with full failed paths while valid images are retained."
   },
   "reveng_add_video": {
    "prompt_note": "Alternative to reveng_add_images for an orbit video — extracts blur-culled stills synchronously; drop max_frames on long clips.",
@@ -2359,6 +2369,15 @@
   "reveng_build_parametric": {
    "prompt_note": "Run after reveng_fit_primitives (fits feed the hints). Single-photo sessions are refused unless strategy='override_approximate'; score with describe_reveng_result.",
    "timeout_s": 300
+  },
+  "reveng_cancel_splat": {
+   "prompt_note": "Stops the owned Gaussian process tree while retaining the last valid preview; cancellation is not completion of the reconstruction."
+  },
+  "reveng_crop_splat": {
+   "prompt_note": "Stop training first. Bounds are [xmin,ymin,zmin,xmax,ymax,zmax] in reconstruction units, not calibrated CAD millimetres; null restores the original."
+  },
+  "reveng_finish_splat": {
+   "prompt_note": "Ends live acquisition by requesting a full-quality pass over accepted frames. Read reveng_splat_status for progress and the resulting preview."
   },
   "reveng_fit_primitives": {
    "prompt_note": "Needs a mesh first (reveng_reconstruct / reveng_single_photo / import_scan_mesh) and open3d provisioned; persists fits.json for reveng_build_parametric.",
@@ -2395,8 +2414,14 @@
    "prompt_note": "Preview tier when only one photo exists — uses the first image in images/ and force-tags the session approximate, so build_parametric will refuse without the override.",
    "timeout_s": 600
   },
+  "reveng_splat_status": {
+   "prompt_note": "Nonblocking durable job status and latest immutable Gaussian preview. A preview during training is not a finished full-quality result."
+  },
   "reveng_start_session": {
    "prompt_note": "First call of any RE flow; pass research= (MPN/query/URL) to auto-populate the datasheet lane or part_ref to seed photos/datasheet from the parts hub."
+  },
+  "reveng_start_splat": {
+   "prompt_note": "Starts local Gaussian reconstruction without CAD scale or mesh gates. Use live=true for arriving accepted images; object mode needs an explicit reconstruction-unit crop, not automatic segmentation."
   },
   "reveng_status": {
    "prompt_note": "Call first — probes backends (COLMAP etc.) before promising a reconstruction; pure and offline-safe, with fix-it banners for what's missing."

@@ -1,10 +1,10 @@
 ---
 name: assembly-merge
-description: Merge independently-sourced CAD (a vendor wheel onto someone else's frame) with measured, verified placement — roster and exclude bodies at import, fit axes, mate, then prove the fit before exporting.
+description: Merge independently-sourced CAD with measured placement, then verify assembly fit and native Motion studies before exporting; incomplete checks are not clearance evidence.
 inject: auto
 triggers:
-  keywords: [merge cad, merge the wheel, merge two parts, mount onto, graft, retrofit, swap the wheel, replace the wheel, two step files, imported step, vendor part, third-party part, foreign geometry, off-frame, independently sourced]
-  tools: [import_part, fit_cylinder_axis, asm_add_component, asm_mate, solve_mates, check_interference, measure_between, list_world_bodies, describe_part, describe_assembly]
+  keywords: [merge cad, merge the wheel, merge two parts, mount onto, graft, retrofit, swap the wheel, replace the wheel, two step files, imported step, vendor part, third-party part, foreign geometry, off-frame, independently sourced, assembled mechanism, motion study, kinematic simulation, motion interference]
+  tools: [import_part, fit_cylinder_axis, asm_add_component, asm_mate, solve_mates, check_interference, measure_between, list_world_bodies, describe_part, describe_assembly, simulate_motion]
   phases: [assembly]
 ---
 
@@ -28,6 +28,12 @@ a source file.
   `save_part`/`export_part` reply with
   `warnings:["placement_unverified: N component(s) placed by transform with no
   check_interference since last mutation"]`.
+- **Static fit is not swept clearance.** A moving mechanism also needs a native Motion study
+  over its intended joint ranges. Missing/failed geometry, unresolved poses, skipped checks,
+  or `interference.complete:false` mean **incomplete**, never "no unwanted interference".
+  A movie alone does not verify interference, nor does a sampled check prove continuous
+  clearance between samples. Identify deliberate joint contact separately; never silently
+  discard known collision pairs to obtain a clear verdict.
 
 ## Procedure
 
@@ -66,6 +72,49 @@ a source file.
 8. **Only then export.** `save_part()` for the editable deliverable, `export_part(fmt=...)`
    for interchange. A `placement_unverified` warning in the reply means step 7 has not run
    since the last change — go back, do not ship.
+
+## Assembled mechanism motion
+
+1. **Complete the mechanism before animating it.** Roster each actual moving part and the
+   fixed structure. Model pivots, bearings, shafts, engagement, running clearances and
+   retention with native operations; record measured mount geometry and explicitly label
+   proposed joint designs. A fixed pose is not a joint or evidence of a load path.
+2. **Author the intended freedoms.** Add scalar angle (degrees) or distance (mm) mates to
+   drive joints; concentric/coincident mates and coupling ratios are not scalar drivers.
+   An angle-only joint needs its measured hinge line:
+   `asm_mate("angle", ..., value={"value":0,"axis":[...],"axis_point":[...]})`.
+   This input line is WORLD geometry, stored relative to the first reference component;
+   wheel roll can therefore follow a steered carrier rather than spinning about an obsolete
+   world axis. Keep a straight rear axle non-steering while allowing wheel roll when that is
+   the design. `solve_mates()` must resolve the complete network before the sweep.
+3. **Use the existing Motion tab for interactive studies.** Open the assembly, choose joints
+   from the joint dropdown, add the needed driver rows, and set each start/stop range.
+   Set shared sample steps and minimum clearance; keep interference checking enabled
+   (the default). Run the study, then play or scrub its frames and use collision navigation
+   to inspect offending poses and component pairs. The study runs asynchronously on the
+   native engine without changing the saved assembly's poses or mates.
+4. **Use the same engine from MCP for repeatable evidence.**
+   `simulate_motion(drivers=[{"mate_id":steer_joint,"start":-30,"stop":30},
+   {"mate_id":roll_joint,"start":0,"stop":360}], steps=49,
+   check_interference=True, min_clearance_mm=clearance_mm, doc_id=assembly_id)`.
+   Each ID must be a unique active angle/distance mate. Explicit `drivers` replaces legacy
+   `mate_id/start/stop`; omitting it preserves one-driver calls. All rows sample the same
+   normalized timeline, and every `frame.driver_values` records every requested joint value.
+   Do not write another kinematic pose loop or hand-edit assembly source files.
+5. **Classify evidence honestly.** Require `ok`, successful pose checks, and
+   `interference.complete:true` with `frames_checked` equal to the requested sample count
+   before claiming the sampled sweep is clear. Inspect every frame's `collisions`, not only
+   `first_collision_step`; IDs identify components even when names repeat.
+   `pair_failures` and `geometry_failures` must be resolved and the study rerun.
+   Per-frame `interference:null` / `interference_complete:false` is unchecked or incomplete,
+   not false. Known hits remain actionable even when other checks failed. Increase sampling
+   around close approaches and report the tested ranges, steps and clearance threshold.
+6. **Treat playback separately from verification.** `loop=True` reuses the original start
+   frame, including all driver values and check outcomes. It adds no computed pose or
+   interference check and does not increase `frames_checked` or the dynamics timeline.
+   Keep model material colors, a stable full-mechanism camera, and visible collision
+   information in animations. Preserve approved source models and movies when producing
+   proposed alternatives; animation is not manufacturing or strength approval.
 
 ## Failure modes this exists to prevent
 

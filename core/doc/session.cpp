@@ -188,6 +188,58 @@ struct SketchState {
 static void drop_history_entry(const std::string& entry);
 static void wipe_undo_journal(const std::string& doc_id);
 
+// Integrity evidence is numeric only; provenance and graph policy are rebuilt each call.
+// Compiled TShapes are immutable (see geom/booleans.cpp). Owning these handles prevents
+// allocator address reuse while an identity is cached; no BRep is copied/serialized.
+struct IntegrityWorldSolidKey {
+    TopoDS_Shape shape;
+    std::array<double, 12> placement;
+
+    bool operator<(const IntegrityWorldSolidKey& other) const {
+        const auto* a = shape.TShape().get();
+        const auto* b = other.shape.TShape().get();
+        if (a != b) return std::less<const TopoDS_TShape*>{}(a, b);
+        if (shape.Orientation() != other.shape.Orientation())
+            return shape.Orientation() < other.shape.Orientation();
+        return placement < other.placement;
+    }
+};
+
+static std::optional<IntegrityWorldSolidKey> integrity_world_solid_key(const TopoDS_Shape& shape) {
+    IntegrityWorldSolidKey key{shape, {}};
+    const gp_Trsf& placement = shape.Location().Transformation();
+    for (int row = 1; row <= 3; ++row)
+        for (int col = 1; col <= 4; ++col) {
+            const double value = placement.Value(row, col);
+            if (!std::isfinite(value)) return std::nullopt;
+            key.placement[(row - 1) * 4 + col - 1] = value;
+        }
+    // Exact numeric world placement, NOT TopLoc chain identity, quantization, a
+    // bbox/volume signature, document revision, or relative placement of a pair.
+    return key;
+}
+
+struct IntegritySolidMetrics {
+    Bnd_Box box;
+    double volume = 0.0;
+    gp_Pnt centroid;
+};
+
+struct IntegrityPairMetrics {
+    double distance = 0.0;
+    double overlap = 0.0;
+};
+
+struct IntegrityMemo {
+    // Hard entry caps bound numeric evidence and retained shape roots. Crossing
+    // either cap drops memoization, never solids, candidate pairs, or exact work.
+    static constexpr std::size_t max_solids = 16384;
+    static constexpr std::size_t max_pairs = 262144;
+    std::map<IntegrityWorldSolidKey, std::size_t> indices;
+    std::vector<IntegritySolidMetrics> solids;
+    std::map<std::pair<std::size_t, std::size_t>, IntegrityPairMetrics> pairs;
+};
+
 struct Session {
     // T-PERF5: per-doc mutex. Locked by DocLock::acquire / require_session; never
     // touched while holding g_registry_mtx (pin-then-lock). Non-copyable/non-movable
@@ -217,6 +269,11 @@ struct Session {
     // on every click (measured ~190 ms/click on a modest part before this cache).
     std::shared_ptr<CompileResult> compiled;
     long compiled_rev = -1;
+    // Previous integrity call only, under the same DocLock as compilation. Failed
+    // or incomplete calls leave no memo; only valid solids and complete distance +
+    // non-destructive Common evidence can be published.
+    std::unique_ptr<IntegrityMemo> integrity_memo;
+
 
     // Incremental-rebuild prefix cache (see CompileCache in document.h). Complements
     // `compiled` above: `compiled` short-circuits WHOLE compiles on an unchanged
@@ -230,12 +287,6 @@ struct Session {
     // C20 — assembly state. asm_result is the last assembly compile; asm_warm seeds the
     // next mate solve; explode_active/explode_factor drive tessellation-time offsets.
     std::shared_ptr<AssemblyResult> asm_result;        // nullptr until first assembly rebuild
-    // Per-component topology-description cache for assembly picks (PERF). Keyed "<body_id>:<kind>"
-    // -> describe_{faces,edges,vertices}(component). describe_* runs Gauss integration over the
-    // whole component, so without this every click in a big assembly re-derived it. Valid only
-    // while built against the current asm_result (asm_describe_for); a rebuild swaps the pointer.
-    std::map<std::string, std::vector<TopoInfo>> asm_describe_cache;
-    const void* asm_describe_for = nullptr;
     chudware::mate::WarmMap asm_warm;
     bool explode_active = false;
     double explode_factor = 1.0;
@@ -2886,6 +2937,37 @@ void op_asm_delete_component(json& doc, const json& op, std::size_t idx) {
     doc["mates"] = kept_mates;
 }
 
+// Bind authored placements once, before any solve can write posed placements back.
+// Suppressed mates/components still need their original frames when re-enabled.
+void bind_mate_reference_frames(json& mate, const json& components) {
+    if (!mate.is_object() || !mate.contains("refs") || !mate["refs"].is_array()) return;
+    if (!mate.contains("reference_frames")) mate["reference_frames"] = json::object();
+    json& frames = mate["reference_frames"];
+    if (!frames.is_object())
+        throw OpError("invalid_op", "mate reference_frames must be an object",
+                      {{"mate", mate.value("id", std::string())}});
+    for (const json& ref : mate["refs"]) {
+        if (!ref.is_object()) continue;
+        const std::string cid = ref.value("component", std::string());
+        if (cid.empty() || frames.contains(cid)) continue;
+        for (const json& component : components) {
+            if (!component.is_object() || component.value("id", std::string()) != cid) continue;
+            const auto transform = component.find("transform");
+            frames[cid] = transform != component.end() && transform->is_array() &&
+                                  transform->size() == 16
+                              ? *transform : json(kIdent16);
+            break;
+        }
+    }
+}
+
+void bind_assembly_reference_frames(json& doc) {
+    if (!doc.contains("mates") || !doc["mates"].is_array() ||
+        !doc.contains("components") || !doc["components"].is_array()) return;
+    for (json& mate : doc["mates"])
+        bind_mate_reference_frames(mate, doc["components"]);
+}
+
 void op_asm_add_mate(json& doc, const json& op, std::size_t idx, IdGen& gen, json& id_map) {
     if (!op.contains("mate") || !op["mate"].is_object())
         throw OpError("invalid_op", "asm_add_mate requires a 'mate' object", {{"index", idx}});
@@ -2893,6 +2975,10 @@ void op_asm_add_mate(json& doc, const json& op, std::size_t idx, IdGen& gen, jso
     m["id"] = gen.next("m");
     if (!m.contains("suppressed")) m["suppressed"] = false;
     if (!m.contains("align")) m["align"] = "aligned";
+    // This field is engine-owned, never accepted from a mate-creation payload.
+    m.erase("reference_frames");
+    if (doc.contains("components") && doc["components"].is_array())
+        bind_mate_reference_frames(m, doc["components"]);
     if (!doc.contains("mates") || !doc["mates"].is_array()) doc["mates"] = json::array();
     doc["mates"].push_back(m);
     id_map["$" + std::to_string(idx)] = m["id"];
@@ -2905,6 +2991,8 @@ void op_asm_edit_mate(json& doc, const json& op, std::size_t idx) {
             if (m.value("id", std::string()) == mid) {
                 for (const char* k : {"value", "align", "suppressed"})
                     if (op.contains(k) && !op[k].is_null()) m[k] = op[k];
+                if (doc.contains("components") && doc["components"].is_array())
+                    bind_mate_reference_frames(m, doc["components"]);
                 return;
             }
     throw OpError("invalid_op", "asm_edit_mate: '" + mid + "' not found", {{"index", idx}});
@@ -3996,24 +4084,25 @@ json ops_response(Session& s, const CompileResult& r, const json& id_map, bool w
     // Displayable reference geometry (datum axes/planes/points/csys) — empty for docs with no
     // datum features. The host draws these as overlays; without it a created datum is invisible.
     resp["datums"] = r.datums;
+    json active_sketch_status = nullptr;
+    if (s.active_sketch && !s.active_sketch->last_overall_status.empty())
+        active_sketch_status = s.active_sketch->last_overall_status;
+    resp["rebuild"] = {{"feature_status", fs},
+                       {"doc_status", {{"active_sketch", active_sketch_status},
+                                       {"mates", nullptr},
+                                       {"active_configuration", r.active_configuration},
+                                       // incremental-rebuild accounting (CompileCache)
+                                       {"features_reused", r.features_reused},
+                                       {"features_executed", r.features_executed},
+                                       // compile phase split: what an edit paid for
+                                       {"phase_ms", {{"features", r.loop_ms},
+                                                     {"tessellation", r.tess_ms},
+                                                     {"tess_mesh", r.tess_mesh_ms},
+                                                     {"tess_extract", r.tess_extract_ms},
+                                                     {"tess_write", r.tess_write_ms},
+                                                     {"owner_map", r.owner_ms}}}}}};
+    resp["volume"] = r.volume;  // C++ convenience (geometric parity signal)
     if (with_tess) {
-        json active_sketch_status = nullptr;
-        if (s.active_sketch && !s.active_sketch->last_overall_status.empty())
-            active_sketch_status = s.active_sketch->last_overall_status;
-        resp["rebuild"] = {{"feature_status", fs},
-                           {"doc_status", {{"active_sketch", active_sketch_status},
-                                           {"mates", nullptr},
-                                           {"active_configuration", r.active_configuration},
-                                           // incremental-rebuild accounting (CompileCache)
-                                           {"features_reused", r.features_reused},
-                                           {"features_executed", r.features_executed},
-                                           // compile phase split: what an edit paid for
-                                           {"phase_ms", {{"features", r.loop_ms},
-                                                         {"tessellation", r.tess_ms},
-                                                         {"tess_mesh", r.tess_mesh_ms},
-                                                         {"tess_extract", r.tess_extract_ms},
-                                                         {"tess_write", r.tess_write_ms},
-                                                         {"owner_map", r.owner_ms}}}}}};
         std::string aicm_path;
         if (!r.aicm.empty())
             aicm_path = publish_doc_aicm(s.doc_id, s.revision, r.aicm);
@@ -4031,7 +4120,6 @@ json ops_response(Session& s, const CompileResult& r, const json& id_map, bool w
                               {"kind", r.bodies_info[static_cast<std::size_t>(i)].kind}});
         }
         resp["tess"] = {{"aicm_path", aicm_path}, {"bodies", bodies}};
-        resp["volume"] = r.volume;  // C++ convenience (geometric parity signal)
     }
     return resp;
 }
@@ -4100,6 +4188,7 @@ void rebuild_assembly(Session& s) {
     if (!s.path.empty()) base_dir = std::filesystem::path(s.path).parent_path().string();
     std::optional<chudware::mate::WarmMap> warm;
     if (!s.asm_warm.empty()) warm = s.asm_warm;
+    bind_assembly_reference_frames(s.doc);
     AssemblyResult ares = compile_assembly(s.doc, base_dir, warm);
     // Persist solved transforms back into the document (matched by component id).
     if (s.doc.contains("components") && s.doc["components"].is_array())
@@ -4358,9 +4447,8 @@ int angle_drive_dof(const json& doc) {
 }
 
 // The assembly ops-response (port of the assembly branch of session.py::_ops_response).
-json ops_response_assembly(Session& s, const json& id_map,
+json ops_response_assembly(Session& s, const json& id_map, bool with_tess = true,
                            std::vector<uint8_t>* aicm_blob_out = nullptr) {
-    auto [aicm_path, bodies_meta] = write_aicm_assembly(s, aicm_blob_out);
     const AssemblyResult* ares = s.asm_result.get();
 
     json feature_status = json::array();
@@ -4423,14 +4511,19 @@ json ops_response_assembly(Session& s, const json& id_map,
         rebuild["residual_dof"] = dof;
         rebuild["dof"] = dof + drives;
     }
-    return json{
+    json response{
         {"revision", s.revision},
         {"id_map", id_map},
         {"tree", s.doc},
         {"rebuild", rebuild},
-        {"tess", {{"aicm_path", aicm_path}, {"bodies", bodies_meta}}},
         {"owner_map", json::object()},
     };
+    if (with_tess) {
+        auto [aicm_path, bodies_meta] = write_aicm_assembly(s, aicm_blob_out);
+        response["tess"] = {{"aicm_path", std::move(aicm_path)},
+                            {"bodies", std::move(bodies_meta)}};
+    }
+    return response;
 }
 
 // ----------------------------------------------------------------- configurations
@@ -4620,7 +4713,8 @@ json assembly_transform_op(const json& doc, const json& op, const json& id_map) 
 
 // Apply an op batch to a session that the caller already holds g_mtx for (the shared
 // transactional core of doc_apply_ops; doc_import_file reuses it).
-json apply_ops_locked(Session& s, long base_revision, const json& input_ops, bool coalesce) {
+json apply_ops_locked(Session& s, long base_revision, const json& input_ops, bool coalesce,
+                      bool with_tess = true) {
     if (base_revision >= 0 && base_revision != s.revision)
         throw OpError("stale_revision",
                       "base_revision " + std::to_string(base_revision) + " != current " +
@@ -4632,6 +4726,7 @@ json apply_ops_locked(Session& s, long base_revision, const json& input_ops, boo
     if (!ops.is_array())
         throw OpError("invalid_op", "ops must be a list", {{"index", -1}, {"reason", "ops not a list"}});
     json working = s.doc;
+    if (s.is_assembly()) bind_assembly_reference_frames(working);
     json id_map = json::object();
     IdGen gen(working);
     for (std::size_t i = 0; i < ops.size(); ++i) {
@@ -4701,10 +4796,10 @@ json apply_ops_locked(Session& s, long base_revision, const json& input_ops, boo
     if (is_readonly_batch(ops)) {
         if (s.is_assembly()) {
             rebuild_assembly(s);
-            return ops_response_assembly(s, id_map);
+            return ops_response_assembly(s, id_map, with_tess);
         }
         CompileResult r = compile_session(s);
-        return ops_response(s, r, id_map, /*with_tess=*/true);
+        return ops_response(s, r, id_map, with_tess);
     }
 
     // Compile against the candidate as the live document, but keep sole ownership of
@@ -4721,7 +4816,7 @@ json apply_ops_locked(Session& s, long base_revision, const json& input_ops, boo
     if (s.is_assembly()) {
         rebuild_assembly(s);
         if (!coalesce) push_undo_document(s, rollback_doc);
-        json response = ops_response_assembly(s, id_map);
+        json response = ops_response_assembly(s, id_map, with_tess);
         response["pose_transport"] = pose_transport;
         return response;
     }
@@ -4732,10 +4827,10 @@ json apply_ops_locked(Session& s, long base_revision, const json& input_ops, boo
         s.doc = std::move(rollback_doc);
         s.revision = rollback_revision;
         s.dirty = rollback_dirty;
-        return ops_response(s, r, id_map, /*with_tess=*/true);
+        return ops_response(s, r, id_map, with_tess);
     }
     if (!coalesce) push_undo_document(s, rollback_doc);
-    return warm_and_respond(s, std::move(r), id_map, /*with_tess=*/true);
+    return warm_and_respond(s, std::move(r), id_map, with_tess);
 }
 
 // Create + register a blank part session. Inserts under the registry lock, then
@@ -5340,10 +5435,11 @@ json doc_new(const std::string& kind, const std::string& name, bool resume_if_op
     return resp;
 }
 
-json doc_apply_ops(const std::string& doc_id, long base_revision, const json& ops, bool coalesce) {
+json doc_apply_ops(const std::string& doc_id, long base_revision, const json& ops, bool coalesce,
+                   bool with_tess) {
     DocLock lk;
     Session& s = require_session(doc_id);
-    return apply_ops_locked(s, base_revision, ops, coalesce);
+    return apply_ops_locked(s, base_revision, ops, coalesce, with_tess);
 }
 
 json doc_dry_run_ops(const std::string& doc_id, const json& ops) {
@@ -5643,6 +5739,7 @@ json doc_solve_mates(const std::string& doc_id, const json& drag) {
                                        drag["target"][2].get<double>());
         drag_opt = d;
     }
+    bind_assembly_reference_frames(s.doc);
     AssemblyResult ares = compile_assembly(s.doc, base_dir, warm, drag_opt);
     if (s.doc.contains("components") && s.doc["components"].is_array())
         for (json& comp : s.doc["components"]) {
@@ -6315,18 +6412,20 @@ json doc_config_set_suppression(const std::string& doc_id, const std::string& na
     return config_commit(s, std::move(working));
 }
 
-// Resolve a pick in an ASSEMBLY: body_id = component ordinal, topo_id indexes that
-// component's LOCAL topology (TopExp order is transform-invariant, so the world AICM ids
-// match local ids). Returns {selector, component} so the host can build a mate ref
-// {component, selector}. Port of session.py::_resolve_pick_assembly.
+// Resolve against the exact AICM body identity and UNIQUE topology enumeration.
+// Assembly selectors stay local for mate/PM consumers; Measure world-places only
+// after binding the selector to this same body.
 json resolve_pick_assembly(Session& s, int body_id, const std::string& kind, int topo_id) {
     if (!s.asm_result) rebuild_assembly(s);
     const AssemblyResult* ares = s.asm_result.get();
-    if (!ares || body_id < 1 || body_id > static_cast<int>(ares->bodies.size()))
+    const auto body = ares ? std::find_if(ares->bodies.begin(), ares->bodies.end(),
+        [body_id](const AsmBodyOut& b) { return b.body_id == body_id; })
+        : std::vector<AsmBodyOut>::const_iterator{};
+    if (!ares || body_id < 1 || body == ares->bodies.end())
         throw OpError("invalid_op",
                       "body_id " + std::to_string(body_id) + " out of range for assembly",
                       {{"reason", "bad body_id"}});
-    const AsmBodyOut& abody = ares->bodies[body_id - 1];
+    const AsmBodyOut& abody = *body;
     const TopoDS_Shape& shape_local = abody.shape_local;
 
     if (kind == "body") {
@@ -6334,34 +6433,15 @@ json resolve_pick_assembly(Session& s, int body_id, const std::string& kind, int
                     {"component", abody.component_id}};
     }
 
-    // describe_* runs Gauss integration over the WHOLE component; cache it per (component, kind)
-    // so repeated clicks in a big assembly don't re-derive it. The cache is tied to the current
-    // asm_result — a rebuild swaps the pointer and drops the stale entries.
-    if (s.asm_describe_for != static_cast<const void*>(ares)) {
-        s.asm_describe_cache.clear();
-        s.asm_describe_for = static_cast<const void*>(ares);
-    }
-    const std::string ckey = std::to_string(body_id) + ":" + kind;
-    auto cit = s.asm_describe_cache.find(ckey);
-    if (cit == s.asm_describe_cache.end()) {
-        std::vector<TopoInfo> computed;
-        if (kind == "face") computed = describe_faces(shape_local);
-        else if (kind == "edge") computed = describe_edges(shape_local);
-        else if (kind == "vertex") computed = describe_vertices(shape_local);
-        else
-            throw OpError("invalid_op", "kind '" + kind + "' must be face|edge|vertex|body",
-                          {{"reason", "bad kind"}});
-        cit = s.asm_describe_cache.emplace(ckey, std::move(computed)).first;
-    }
-    const std::vector<TopoInfo>& infos = cit->second;
-    if (topo_id < 1 || topo_id > static_cast<int>(infos.size()))
-        throw OpError("invalid_op",
-                      "topo_id " + std::to_string(topo_id) + " out of range (1.." +
-                          std::to_string(infos.size()) + ") for " + kind,
-                      {{"reason", "bad topo_id"}});
-    TopoInfo info = infos[topo_id - 1];
-    info.hint_index = topo_id - 1;
-    return json{{"selector", make_selector(info)}, {"component", abody.component_id}};
+    if (kind != "face" && kind != "edge" && kind != "vertex")
+        throw OpError("invalid_op", "kind '" + kind + "' must be face|edge|vertex|body",
+                      {{"reason", "bad kind"}});
+    json selector = make_pick_selector(shape_local, kind, topo_id, std::nullopt);
+    if (!selector.is_object())
+        throw OpError("invalid_op", "topo_id " + std::to_string(topo_id) +
+                      " is not a live " + kind + " on body " + std::to_string(body_id),
+                      {{"reason", "bad topo_id"}, {"body_id", body_id}, {"topo_id", topo_id}});
+    return json{{"selector", std::move(selector)}, {"component", abody.component_id}};
 }
 
 json doc_resolve_pick(const std::string& doc_id, int body_id, const std::string& kind,
@@ -6371,6 +6451,10 @@ json doc_resolve_pick(const std::string& doc_id, int body_id, const std::string&
     if (s.is_assembly())
         return resolve_pick_assembly(s, body_id, kind, topo_id);
     json sel = resolve_pick(ensure_compiled(s), body_id, kind, topo_id);
+    if (!sel.is_object())
+        throw OpError("invalid_op", "No live " + kind + " " + std::to_string(topo_id) +
+                      " on body " + std::to_string(body_id) + "; select the geometry again.",
+                      {{"reason", "invalid pick"}, {"body_id", body_id}, {"topo_id", topo_id}});
     return json{{"selector", sel}};
 }
 
@@ -9554,7 +9638,9 @@ json eval_measure_pair(const TopoDS_Shape& a, const TopoDS_Shape& b) {
         result["angle"] = angle;
         if (!result.contains("kind")) result["kind"] = "angle";
     }
-    if (result.empty()) result["kind"] = "unknown";
+    if (!result.contains("distance"))
+        throw OpError("invalid_op", "Measure could not compute the distance between these elements",
+                      {{"reason", "distance failed"}});
     // Per-element enrichment for the two resolved refs (anchor/polyline on a/b).
     json ea = json::object();
     eval_measure_enrich(ea, a);
@@ -9951,6 +10037,12 @@ static std::string si_one_line(const std::string& in) {
 json doc_eval_model_integrity(const std::string& doc_id, const json& params) {
     DocLock lk;
     Session& s = require_session(doc_id);
+    // Consume before argument validation: a failed call must not bridge back to
+    // evidence from an older successful call. Publish only at the successful end.
+    auto previous = std::move(s.integrity_memo);
+    auto next = std::make_unique<IntegrityMemo>();
+    constexpr std::size_t no_memo = std::numeric_limits<std::size_t>::max();
+    std::size_t reused_solids = 0;
     auto number = [&](const char* key, double fallback, double maximum, bool positive) {
         if (params.contains(key) && !params[key].is_number())
             throw OpError("invalid_op", std::string(key) + " must be numeric");
@@ -9987,6 +10079,8 @@ json doc_eval_model_integrity(const std::string& doc_id, const json& params) {
         Bnd_Box box;
         std::string id;
         bool usable = false;
+        std::size_t previous_index = no_memo;
+        std::size_t next_index = no_memo;
     };
     std::vector<Solid> solids;
     auto source_failure = [&](json provenance, const std::string& reason) {
@@ -10007,6 +10101,10 @@ json doc_eval_model_integrity(const std::string& doc_id, const json& params) {
         TopTools_IndexedMapOfShape map;
         TopExp::MapShapes(shape, TopAbs_SOLID, map);
         for (int k = 1; k <= map.Extent(); ++k) {
+            if (solids.size() >= IntegrityMemo::max_solids) {
+                previous.reset();
+                next.reset();
+            }
             Solid solid;
             solid.shape = map.FindKey(k);
             solid.id = "b" + std::to_string(bid) + "/s" + std::to_string(k);
@@ -10014,31 +10112,58 @@ json doc_eval_model_integrity(const std::string& doc_id, const json& params) {
             row.update({{"id", solid.id}, {"solid_index", k}, {"bbox", nullptr},
                         {"volume_mm3", nullptr}, {"centroid_mm", nullptr}, {"brep_valid", nullptr}});
             try {
-                BRepCheck_Analyzer analyzer(solid.shape);
-                const bool valid = analyzer.IsValid();
-                row["brep_valid"] = valid;
-                GProp_GProps props;
-                BRepGProp::VolumeProperties(solid.shape, props);
-                const gp_Pnt c = props.CentreOfMass();
-                const double volume = props.Mass();
-                if (!std::isfinite(volume) || !std::isfinite(c.X()) ||
-                    !std::isfinite(c.Y()) || !std::isfinite(c.Z()))
-                    throw std::runtime_error("nonfinite_mass_properties");
-                row["volume_mm3"] = volume;
-                row["centroid_mm"] = {c.X(), c.Y(), c.Z()};
-                // Add uses analytic geometry (no tessellation), with tolerances retained:
-                // the resulting box is conservative for broadphase lower bounds.
-                BRepBndLib::Add(solid.shape, solid.box, Standard_False);
-                if (solid.box.IsVoid() || solid.box.IsOpen())
-                    throw std::runtime_error("unbounded_or_empty_solid_bbox");
+                const auto key = integrity_world_solid_key(solid.shape);
+                IntegritySolidMetrics metrics;
+                bool valid = true;
+                if (previous && key) {
+                    const auto found = previous->indices.find(*key);
+                    if (found != previous->indices.end()) {
+                        solid.previous_index = found->second;
+                        metrics = previous->solids[found->second];
+                    }
+                }
+                if (solid.previous_index != no_memo) {
+                    solid.box = metrics.box;
+                    row["brep_valid"] = true;
+                    row["volume_mm3"] = metrics.volume;
+                    row["centroid_mm"] = {metrics.centroid.X(), metrics.centroid.Y(), metrics.centroid.Z()};
+                    ++reused_solids;
+                } else {
+                    BRepCheck_Analyzer analyzer(solid.shape);
+                    valid = analyzer.IsValid();
+                    row["brep_valid"] = valid;
+                    GProp_GProps props;
+                    BRepGProp::VolumeProperties(solid.shape, props);
+                    metrics.centroid = props.CentreOfMass();
+                    metrics.volume = props.Mass();
+                    const gp_Pnt& c = metrics.centroid;
+                    const double volume = metrics.volume;
+                    if (!std::isfinite(volume) || !std::isfinite(c.X()) ||
+                        !std::isfinite(c.Y()) || !std::isfinite(c.Z()))
+                        throw std::runtime_error("nonfinite_mass_properties");
+                    row["volume_mm3"] = volume;
+                    row["centroid_mm"] = {c.X(), c.Y(), c.Z()};
+                    // Analytic geometry, no tessellation; retain tolerances for
+                    // conservative broadphase lower bounds.
+                    BRepBndLib::Add(solid.shape, solid.box, Standard_False);
+                    if (solid.box.IsVoid() || solid.box.IsOpen())
+                        throw std::runtime_error("unbounded_or_empty_solid_bbox");
+                    metrics.box = solid.box;
+                }
                 double x0, y0, z0, x1, y1, z1;
                 solid.box.Get(x0, y0, z0, x1, y1, z1);
                 if (!std::isfinite(x0) || !std::isfinite(y0) || !std::isfinite(z0) ||
                     !std::isfinite(x1) || !std::isfinite(y1) || !std::isfinite(z1))
                     throw std::runtime_error("nonfinite_solid_bbox");
                 row["bbox"] = {{"min", {x0, y0, z0}}, {"max", {x1, y1, z1}}};
-                solid.usable = valid && volume > 0.0;
-                if (!solid.usable) source_failure(row, valid ? "nonpositive_solid_volume" : "invalid_brep");
+                solid.usable = valid && metrics.volume > 0.0;
+                if (!solid.usable)
+                    source_failure(row, valid ? "nonpositive_solid_volume" : "invalid_brep");
+                else if (next && key) {
+                    const auto inserted = next->indices.emplace(*key, next->solids.size());
+                    solid.next_index = inserted.first->second;
+                    if (inserted.second) next->solids.push_back(metrics);
+                }
             } catch (const Standard_Failure& e) {
                 source_failure(row, e.GetMessageString() ? e.GetMessageString() : "solid_census_failed");
             } catch (const std::exception& e) {
@@ -10141,6 +10266,7 @@ json doc_eval_model_integrity(const std::string& doc_id, const json& params) {
     };
     std::map<std::pair<std::size_t, std::size_t>, PairEvidence> distances;
     std::size_t candidates = 0, exact_pairs = 0, failed_pairs = 0, nearest_attempts = 0;
+    std::size_t computed_exact_pairs = 0, reused_exact_pairs = 0;
     auto lower_bound = [&](std::size_t a, std::size_t b) {
         if (!solids[a].usable || !solids[b].usable) return 0.0;
         return solids[a].box.Distance(solids[b].box);
@@ -10151,42 +10277,61 @@ json doc_eval_model_integrity(const std::string& doc_id, const json& params) {
         if (cached != distances.end()) return cached->second;
         PairEvidence evidence;
         std::string phase = "distance";
-        Handle(SelfIntersectBudget) budget = new SelfIntersectBudget(budget_s);
+        Handle(SelfIntersectBudget) budget;
         const auto start = std::chrono::steady_clock::now();
         auto expired = [&]() {
-            return budget->broke() ||
+            return (!budget.IsNull() && budget->broke()) ||
                 std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count() >= budget_s;
         };
         try {
             if (!solids[a].usable || !solids[b].usable)
                 throw std::runtime_error("invalid_solid_source");
-            BRepExtrema_DistShapeShape distance;
-            distance.LoadS1(solids[a].shape);
-            distance.LoadS2(solids[b].shape);
-            distance.Perform(budget->Start());
-            if (expired()) throw std::runtime_error("pair_timeout");
-            if (!distance.IsDone()) throw std::runtime_error("distance_not_done");
-            evidence.distance = distance.Value();
-            if (!std::isfinite(evidence.distance) || evidence.distance < 0.0)
-                throw std::runtime_error("invalid_distance");
-            evidence.distance_ok = true;
-            if (near) {
-                phase = "overlap";
-                TopTools_ListOfShape args, tools;
-                args.Append(solids[a].shape);
-                tools.Append(solids[b].shape);
-                BRepAlgoAPI_Common common;
-                common.SetArguments(args);
-                common.SetTools(tools);
-                common.SetRunParallel(Standard_False);
-                common.Build(budget->Start());
+            std::optional<IntegrityPairMetrics> reused;
+            if (previous && solids[a].previous_index != no_memo && solids[b].previous_index != no_memo) {
+                const auto old_key = std::minmax(solids[a].previous_index, solids[b].previous_index);
+                const auto found = previous->pairs.find(old_key);
+                if (found != previous->pairs.end()) reused = found->second;
+            }
+            double overlap = 0.0;
+            if (reused) {
+                evidence.distance = reused->distance;
+                evidence.distance_ok = true;
+                overlap = reused->overlap;
+            } else {
+                budget = new SelfIntersectBudget(budget_s);
+                BRepExtrema_DistShapeShape distance;
+                distance.LoadS1(solids[a].shape);
+                distance.LoadS2(solids[b].shape);
+                distance.Perform(budget->Start());
                 if (expired()) throw std::runtime_error("pair_timeout");
-                if (!common.IsDone() || common.HasErrors() || common.Shape().IsNull())
-                    throw std::runtime_error("common_not_done");
-                GProp_GProps properties;
-                BRepGProp::VolumeProperties(common.Shape(), properties);
-                const double overlap = std::abs(properties.Mass());
-                if (!std::isfinite(overlap)) throw std::runtime_error("invalid_overlap_volume");
+                if (!distance.IsDone()) throw std::runtime_error("distance_not_done");
+                evidence.distance = distance.Value();
+                if (!std::isfinite(evidence.distance) || evidence.distance < 0.0)
+                    throw std::runtime_error("invalid_distance");
+                evidence.distance_ok = true;
+                if (near) {
+                    phase = "overlap";
+                    TopTools_ListOfShape args, tools;
+                    args.Append(solids[a].shape);
+                    tools.Append(solids[b].shape);
+                    BRepAlgoAPI_Common common;
+                    common.SetArguments(args);
+                    common.SetTools(tools);
+                    common.SetRunParallel(Standard_False);
+                    common.SetNonDestructive(Standard_True);  // preserve immutable cached TShapes
+                    common.Build(budget->Start());
+                    if (expired()) throw std::runtime_error("pair_timeout");
+                    if (!common.IsDone() || common.HasErrors() || common.Shape().IsNull())
+                        throw std::runtime_error("common_not_done");
+                    GProp_GProps properties;
+                    BRepGProp::VolumeProperties(common.Shape(), properties);
+                    overlap = std::abs(properties.Mass());
+                    if (!std::isfinite(overlap)) throw std::runtime_error("invalid_overlap_volume");
+                }
+            }
+            if (near) {
+                if (reused) ++reused_exact_pairs;
+                else ++computed_exact_pairs;
                 ++exact_pairs;
                 if (evidence.distance <= proximity || overlap > 0.0) {
                     // No epsilon snapping: every positive gap remains proximity.
@@ -10195,6 +10340,19 @@ json doc_eval_model_integrity(const std::string& doc_id, const json& params) {
                     out["pairs"].push_back({{"a", solids[a].id}, {"b", solids[b].id},
                         {"distance_mm", evidence.distance}, {"overlap_volume_mm3", overlap},
                         {"relation", relation}});
+                }
+            }
+            // A nearest-only distance is NOT full pair evidence. In particular it
+            // cannot skip Common when a larger proximity makes this a candidate
+            // on the next call. Failed/partial evidence never reaches this point.
+            if ((near || reused) && next &&
+                solids[a].next_index != no_memo && solids[b].next_index != no_memo) {
+                const auto new_key = std::minmax(solids[a].next_index, solids[b].next_index);
+                if (next->pairs.size() < IntegrityMemo::max_pairs || next->pairs.count(new_key)) {
+                    next->pairs.emplace(new_key, IntegrityPairMetrics{evidence.distance, overlap});
+                } else {
+                    previous.reset();
+                    next.reset();
                 }
             }
         } catch (const Standard_Failure& e) {
@@ -10289,8 +10447,14 @@ json doc_eval_model_integrity(const std::string& doc_id, const json& params) {
     out["summary"] = {{"solid_count", n}, {"non_solid_count", out["non_solids"].size()},
         {"theoretical_pairs", n > 0 ? n * (n - 1) / 2 : 0}, {"candidate_pairs", candidates},
         {"exact_pairs", exact_pairs}, {"failed_pairs", failed_pairs},
+        {"computed_exact_pairs", computed_exact_pairs}, {"reused_exact_pairs", reused_exact_pairs},
+        {"reused_solids", reused_solids},
         {"nearest_distance_attempts", nearest_attempts}, {"island_count", out["islands"].size()},
         {"isolated_solid_count", out["isolated_solids"].size()}};
+    // No success can be seeded by a failed source, mate, pair, or timeout. Even
+    // cache hits are transplanted into THIS call's inventory, never merged with
+    // older unvisited solids/pairs. Dropping the memo does not affect the report.
+    if (out["complete"].get<bool>()) s.integrity_memo = std::move(next);
     return out;
 }
 
@@ -10551,254 +10715,188 @@ json doc_eval_solid_health(const std::string& doc_id, int body_id) {
                 {"all_sound", all_sound}};
 }
 
-// engine/doc/evaluate.py::section_props via worker.py::_eval_section_props. Cut the body by
-// the cutting plane (BRepAlgoAPI_Section -> a compound of edges), GROUP those edges into the
-// closed loop(s) of the cross-section, build the planar face (outer loop bounded by inner
-// loops as HOLES), and read the REAL cross-section properties off the face: area =
-// |SurfaceProperties.Mass| (so a hollow/annular section = outer - holes), centroid = its CoM,
-// and the 2nd area moments Ixx/Iyy/Ixy about the CENTROID expressed in the CUTTING PLANE'S
-// local (u,v) frame. Falls back to the section-wire (LinearProperties) centroid with zero
-// area/moments only when no face can be built (open/degenerate section).
-//
-// Two bugs fixed here (vs the prior "force ALL edges into ONE wire / read GLOBAL-axis
-// MatrixOfInertia" code):
-//   * Multi-loop sections (a tube wall = outer loop + inner bore loop) made the single
-//     MakeWire fail -> area 0. Now ShapeAnalysis_FreeBounds::ConnectEdgesToWires groups the
-//     edges into separate closed wires and the largest-area wire becomes the face boundary
-//     with the rest added as holes, so an annulus reports the wall area.
-//   * Ixx/Iyy were read straight off MatrixOfInertia(1,1)/(2,2) which are GLOBAL-axis area
-//     moments — correct only for an XY (top) cut. For a front/right cut they mixed in the
-//     out-of-plane coordinate. We now express the face in the plane's LOCAL frame located at
-//     the section centroid (a gp_Trsf SetTransformation about the centroidal local Ax3) so the
-//     in-plane second moments fall straight out of the transformed face's MatrixOfInertia. For
-//     an XY cut of a centred body that transform is the identity, so the top-cut result is
-//     unchanged.
+// Section each world-placed solid independently so an unrelated nested body never becomes
+// another body's hole. Preserve even/odd loop nesting within each solid, then integrate
+// all material faces together: areas are additive (not a Boolean union), centroid is
+// area-weighted, and the plane-local inertia includes the parallel-axis contributions.
+// An empty intersection is zero; failed section/loop/face construction is an OpError,
+// never a plausible-looking zero or a partial document result.
 json doc_eval_section_props(const std::string& doc_id, const json& plane_ref) {
     DocLock lk;
     Session& s = require_session(doc_id);
-    CompileResult r = compile_session(s);
-    if (r.shapes.empty())
-        throw_no_bodies(doc_id, r, "evaluate");
-    const TopoDS_Shape& shape = r.shapes.back();  // worker: bodies[-1]
-    gp_Pln pln = eval_resolve_plane(plane_ref);
+    const auto bodies = gather_export_shapes(s);
+    if (bodies.empty())
+        throw_no_bodies(doc_id, ensure_compiled(s), "evaluate");
+    const gp_Pln pln = eval_resolve_plane(plane_ref);
+    const gp_Ax3& pos = pln.Position();
+    const gp_Pnt o3 = pos.Location();
+    const gp_Dir ud = pos.XDirection(), vd = pos.YDirection();
+    auto to_uv = [&](const gp_Pnt& p) -> Eigen::Vector2d {
+        const gp_Vec d(o3, p);
+        return Eigen::Vector2d(d.Dot(gp_Vec(ud)), d.Dot(gp_Vec(vd)));
+    };
+
+    TopoDS_Compound sec_comp;
+    BRep_Builder cb;
+    cb.MakeCompound(sec_comp);
+    bool any_face = false;
+    auto append_section = [&](const TopoDS_Shape& shape) {
+        BRepAlgoAPI_Section section(shape, pln, Standard_False);
+        section.Build();
+        if (!section.IsDone())
+            throw OpError("section_failed", "cutting-plane intersection failed",
+                          {{"doc_id", doc_id}});
+        TopTools_IndexedMapOfShape edge_map;
+        TopExp::MapShapes(section.Shape(), TopAbs_EDGE, edge_map);
+        if (edge_map.IsEmpty()) return;  // completed, genuinely zero-area intersection
+
+        // Join free-edge vertices at the established body-relative tolerance.
+        const double join_tol = std::max(sim_bbox_diag(shape) * 1e-4, 1e-6);
+        Handle(TopTools_HSequenceOfShape) in_edges = new TopTools_HSequenceOfShape();
+        for (int ei = 1; ei <= edge_map.Extent(); ++ei)
+            in_edges->Append(edge_map.FindKey(ei));
+        Handle(TopTools_HSequenceOfShape) wires;
+        ShapeAnalysis_FreeBounds::ConnectEdgesToWires(in_edges, join_tol,
+                                                      Standard_False, wires);
+        if (wires.IsNull() || wires->IsEmpty())
+            throw OpError("section_failed", "section edges could not form closed contours",
+                          {{"doc_id", doc_id}});
+
+        struct Loop {
+            TopoDS_Wire wire;
+            double area;
+            std::vector<Eigen::Vector2d> poly;
+            Eigen::Vector2d cuv;
+        };
+        std::vector<Loop> loops;
+        loops.reserve(wires->Length());
+        for (int wi = 1; wi <= wires->Length(); ++wi) {
+            const TopoDS_Shape& ws = wires->Value(wi);
+            if (ws.ShapeType() != TopAbs_WIRE || !BRep_Tool::IsClosed(ws))
+                throw OpError("section_failed", "section contains an open contour",
+                              {{"doc_id", doc_id}});
+            BRepBuilderAPI_MakeFace fm(pln, TopoDS::Wire(ws));
+            if (!fm.IsDone())
+                throw OpError("section_failed", "section contour face construction failed",
+                              {{"doc_id", doc_id}});
+            GProp_GProps wp;
+            BRepGProp::SurfaceProperties(fm.Face(), wp);
+            Loop lp;
+            // Keep MakeFace's finite-domain orientation so reversing a hole always subtracts.
+            lp.wire = BRepTools::OuterWire(fm.Face());
+            lp.area = std::abs(wp.Mass());
+            lp.cuv = to_uv(wp.CentreOfMass());
+            if (!std::isfinite(lp.area) || lp.area <= 0.0 || !lp.cuv.allFinite())
+                throw OpError("section_failed", "section contour has invalid area properties",
+                              {{"doc_id", doc_id}});
+            // Sample curves, not only vertices: a circle has just one seam vertex.
+            for (TopExp_Explorer ee(lp.wire, TopAbs_EDGE); ee.More(); ee.Next()) {
+                BRepAdaptor_Curve ca(TopoDS::Edge(ee.Current()));
+                const double t0 = ca.FirstParameter(), t1 = ca.LastParameter();
+                constexpr int N = 16;
+                for (int k = 0; k < N; ++k)
+                    lp.poly.push_back(to_uv(ca.Value(t0 + (t1 - t0) * k / N)));
+            }
+            loops.push_back(std::move(lp));
+        }
+
+        // EVEN-ODD nesting within this solid only: depth 0/2/... is material; its
+        // immediate odd-depth children are holes. Disjoint tube-wall regions both
+        // have depth zero. Larger-area gating keeps concentric bore/outer centroids
+        // from making each loop a hole in the other.
+        const std::size_t n = loops.size();
+        std::vector<int> depth(n, 0);
+        std::vector<int> parent(n, -1);
+        auto poly_inside = [](const Eigen::Vector2d& pt,
+                              const std::vector<Eigen::Vector2d>& poly) -> bool {
+            const std::size_t m = poly.size();
+            if (m < 3) return false;
+            bool in = false;
+            for (std::size_t i = 0, j = m - 1; i < m; j = i++) {
+                const double xi = poly[i].x(), yi = poly[i].y();
+                const double xj = poly[j].x(), yj = poly[j].y();
+                if (((yi > pt.y()) != (yj > pt.y())) &&
+                    (pt.x() < (xj - xi) * (pt.y() - yi) / (yj - yi + 1e-30) + xi))
+                    in = !in;
+            }
+            return in;
+        };
+        for (std::size_t i = 0; i < n; ++i) {
+            double parent_area = std::numeric_limits<double>::infinity();
+            for (std::size_t j = 0; j < n; ++j) {
+                if (i == j || loops[j].area <= loops[i].area) continue;
+                if (poly_inside(loops[i].cuv, loops[j].poly)) {
+                    ++depth[i];
+                    if (loops[j].area < parent_area) {
+                        parent_area = loops[j].area;
+                        parent[i] = static_cast<int>(j);
+                    }
+                }
+            }
+        }
+
+        for (std::size_t i = 0; i < n; ++i) {
+            if (depth[i] % 2 != 0) continue;
+            BRepBuilderAPI_MakeFace fm(pln, loops[i].wire);
+            for (std::size_t h = 0; h < n; ++h) {
+                if (depth[h] % 2 == 0 || parent[h] != static_cast<int>(i)) continue;
+                TopoDS_Wire hole = loops[h].wire;
+                hole.Reverse();
+                fm.Add(hole);
+            }
+            if (!fm.IsDone() || !BRepCheck_Analyzer(fm.Face()).IsValid())
+                throw OpError("section_failed", "section material face construction failed",
+                              {{"doc_id", doc_id}});
+            cb.Add(sec_comp, fm.Face());
+            any_face = true;
+        }
+    };
 
     double area = 0.0, cx = 0.0, cy = 0.0, cz = 0.0, Ixx = 0.0, Iyy = 0.0, Ixy = 0.0;
     try {
-        BRepAlgoAPI_Section section(shape, pln, Standard_False);
-        section.Build();
-        if (section.IsDone()) {
-            const TopoDS_Shape& sec_shape = section.Shape();
-
-            try {
-                TopTools_IndexedMapOfShape edge_map;
-                TopExp::MapShapes(sec_shape, TopAbs_EDGE, edge_map);
-                if (edge_map.Extent() > 0) {
-                    // Tolerance for joining edge ends into loops — relative to the body size so
-                    // section sliver gaps still connect on big and small parts alike.
-                    const double join_tol = std::max(sim_bbox_diag(shape) * 1e-4, 1e-6);
-
-                    // Group the section edges into closed loops. A solid box/cylinder yields ONE
-                    // loop; a hollow/annular section yields an outer loop + one inner loop per
-                    // bore. (The old single MakeWire could only ever hold one loop -> area 0 on
-                    // anything hollow.) shared=false joins by end-point proximity (join_tol),
-                    // robust to the section's free-edge vertices not being shared.
-                    Handle(TopTools_HSequenceOfShape) in_edges = new TopTools_HSequenceOfShape();
-                    for (int ei = 1; ei <= edge_map.Extent(); ++ei)
-                        in_edges->Append(edge_map.FindKey(ei));
-                    Handle(TopTools_HSequenceOfShape) wires;
-                    ShapeAnalysis_FreeBounds::ConnectEdgesToWires(in_edges, join_tol,
-                                                                  Standard_False, wires);
-
-                    // Build a face per closed wire; keep its area, wire and a 2D polygon (the
-                    // wire's vertices projected into the plane's (u,v) basis) so we can classify
-                    // loop NESTING. A solid box yields one loop; an annulus yields a big outer
-                    // loop + an inner bore loop (the bore is INSIDE the outer); a tube cut along
-                    // its length yields TWO DISJOINT solid loops (neither inside the other).
-                    const gp_Ax3& pos = pln.Position();
-                    const gp_Pnt o3 = pos.Location();
-                    const gp_Dir ud = pos.XDirection();
-                    const gp_Dir vd = pos.YDirection();
-                    auto to_uv = [&](const gp_Pnt& p) -> Eigen::Vector2d {
-                        gp_Vec d(o3, p);
-                        return Eigen::Vector2d(d.Dot(gp_Vec(ud)), d.Dot(gp_Vec(vd)));
-                    };
-                    // Sample a wire into a 2D polygon (plane u,v coords). We sample ALONG each
-                    // edge's curve — not just the vertices — so a CIRCULAR loop (which carries a
-                    // single seam vertex) still yields a real polygon for the point-in-loop test;
-                    // a vertex-only polygon would have <3 points and wrongly report "not inside",
-                    // breaking the annulus (bore-inside-outer) classification.
-                    auto wire_poly = [&](const TopoDS_Wire& w) -> std::vector<Eigen::Vector2d> {
-                        std::vector<Eigen::Vector2d> poly;
-                        for (TopExp_Explorer ee(w, TopAbs_EDGE); ee.More(); ee.Next()) {
-                            try {
-                                BRepAdaptor_Curve ca(TopoDS::Edge(ee.Current()));
-                                const double t0 = ca.FirstParameter(), t1 = ca.LastParameter();
-                                const int N = 16;  // straight edges collapse to their 2 ends
-                                for (int k = 0; k < N; ++k)
-                                    poly.push_back(to_uv(ca.Value(t0 + (t1 - t0) * k / N)));
-                            } catch (const Standard_Failure&) {
-                            }
-                        }
-                        return poly;
-                    };
-                    struct Loop { TopoDS_Wire wire; double area; std::vector<Eigen::Vector2d> poly;
-                                  Eigen::Vector2d cuv{0, 0}; };
-                    std::vector<Loop> loops;
-                    if (!wires.IsNull()) {
-                        for (int wi = 1; wi <= wires->Length(); ++wi) {
-                            const TopoDS_Shape& ws = wires->Value(wi);
-                            if (ws.ShapeType() != TopAbs_WIRE) continue;
-                            TopoDS_Wire w = TopoDS::Wire(ws);
-                            BRepBuilderAPI_MakeFace fm(pln, w);
-                            if (!fm.IsDone()) continue;
-                            GProp_GProps wp;
-                            BRepGProp::SurfaceProperties(fm.Face(), wp);
-                            Loop lp;
-                            lp.wire = w;
-                            lp.area = std::abs(wp.Mass());
-                            lp.poly = wire_poly(w);
-                            gp_Pnt c = wp.CentreOfMass();
-                            lp.cuv = to_uv(c);
-                            loops.push_back(std::move(lp));
-                        }
-                    }
-                    // Fallback for the single-loop path when grouping returned nothing usable
-                    // (e.g. one already-closed wire OCCT didn't re-emit): stitch every edge into
-                    // one wire, exactly as before, so the solid-section path stays correct.
-                    if (loops.empty()) {
-                        BRepBuilderAPI_MakeWire wb;
-                        for (int ei = 1; ei <= edge_map.Extent(); ++ei)
-                            wb.Add(TopoDS::Edge(edge_map.FindKey(ei)));
-                        if (wb.IsDone()) {
-                            BRepBuilderAPI_MakeFace fm(pln, wb.Wire());
-                            if (fm.IsDone()) {
-                                GProp_GProps wp;
-                                BRepGProp::SurfaceProperties(fm.Face(), wp);
-                                Loop lp;
-                                lp.wire = wb.Wire();
-                                lp.area = std::abs(wp.Mass());
-                                gp_Pnt c = wp.CentreOfMass();
-                                lp.cuv = to_uv(c);
-                                loops.push_back(std::move(lp));
-                            }
-                        }
-                    }
-
-                    if (!loops.empty()) {
-                        // EVEN-ODD nesting: a loop's depth = how many OTHER loops contain it
-                        // (its centroid inside their polygon). Depth 0/2/… = SOLID material;
-                        // depth 1/3/… = a HOLE in the solid that immediately encloses it. This
-                        // is correct for an annulus (outer depth 0, bore depth 1 -> a hole) AND
-                        // for two disjoint solids (both depth 0 -> two separate material faces),
-                        // unlike a naive "biggest loop is outer, rest are holes" rule which would
-                        // wrongly punch one disjoint solid out of the other.
-                        const std::size_t n = loops.size();
-                        std::vector<int> depth(n, 0);
-                        std::vector<int> parent(n, -1);  // immediate (smallest) enclosing loop
-                        auto poly_inside = [](const Eigen::Vector2d& pt,
-                                              const std::vector<Eigen::Vector2d>& poly) -> bool {
-                            const std::size_t m = poly.size();
-                            if (m < 3) return false;
-                            bool in = false;
-                            for (std::size_t i = 0, j = m - 1; i < m; j = i++) {
-                                double xi = poly[i].x(), yi = poly[i].y();
-                                double xj = poly[j].x(), yj = poly[j].y();
-                                if (((yi > pt.y()) != (yj > pt.y())) &&
-                                    (pt.x() < (xj - xi) * (pt.y() - yi) / (yj - yi + 1e-30) + xi))
-                                    in = !in;
-                            }
-                            return in;
-                        };
-                        for (std::size_t i = 0; i < n; ++i) {
-                            double parent_area = std::numeric_limits<double>::infinity();
-                            for (std::size_t j = 0; j < n; ++j) {
-                                if (i == j) continue;
-                                // i is inside j only if j is STRICTLY LARGER — without this guard
-                                // CONCENTRIC loops (a bore and its outer wall share a centroid)
-                                // each test "inside" the other and both collapse to holes (area 0).
-                                if (loops[j].area <= loops[i].area) continue;
-                                if (poly_inside(loops[i].cuv, loops[j].poly)) {
-                                    ++depth[i];
-                                    if (loops[j].area < parent_area) {  // smallest enclosing = parent
-                                        parent_area = loops[j].area;
-                                        parent[i] = static_cast<int>(j);
-                                    }
-                                }
-                            }
-                        }
-
-                        // One face per SOLID loop, with its direct HOLE children added. Collect
-                        // every solid face into a compound so disjoint material regions SUM.
-                        TopoDS_Compound sec_comp;
-                        BRep_Builder cb;
-                        cb.MakeCompound(sec_comp);
-                        bool any_face = false;
-                        for (std::size_t i = 0; i < n; ++i) {
-                            if (depth[i] % 2 != 0) continue;  // odd depth = a hole, not material
-                            BRepBuilderAPI_MakeFace fm(pln, loops[i].wire);
-                            for (std::size_t h = 0; h < n; ++h) {
-                                if (depth[h] % 2 == 0 || parent[h] != static_cast<int>(i)) continue;
-                                // A hole wire must run opposite to its outer wire; MakeFace::Add
-                                // treats the added wire as an inner boundary and subtracts it.
-                                TopoDS_Wire hole = loops[h].wire;
-                                hole.Reverse();
-                                fm.Add(hole);
-                            }
-                            if (fm.IsDone()) { cb.Add(sec_comp, fm.Face()); any_face = true; }
-                        }
-
-                        if (any_face) {
-                            GProp_GProps fp;
-                            BRepGProp::SurfaceProperties(sec_comp, fp);
-                            area = std::abs(fp.Mass());
-                            gp_Pnt com = fp.CentreOfMass();
-                            cx = com.X();
-                            cy = com.Y();
-                            cz = com.Z();
-
-                            // Ixx/Iyy/Ixy in the CUTTING PLANE's local frame, about the section
-                            // centroid. Re-express the section in a frame whose origin is the
-                            // centroid and whose X/Y axes are the plane's in-plane u/v: a
-                            // gp_Trsf::SetTransformation(localAx3) maps a point's GLOBAL coords
-                            // into that frame's LOCAL coords, so after the transform the section
-                            // lies in z=0 with its centroid at the origin. Its MatrixOfInertia is
-                            // then the centroidal planar tensor: (1,1)=∫v²dA=Ixx (about local u),
-                            // (2,2)=∫u²dA=Iyy (about local v), (1,2)=-∫uv dA=Ixy. (Reading the
-                            // GLOBAL-axis MatrixOfInertia directly only happens to be right for an
-                            // XY/top cut; a front/right cut mixed in the out-of-plane axis.)
-                            gp_Ax3 local(com, pos.Direction(), pos.XDirection());
-                            gp_Trsf to_local;
-                            to_local.SetTransformation(local);
-                            TopoDS_Shape lf =
-                                BRepBuilderAPI_Transform(sec_comp, to_local, true).Shape();
-                            GProp_GProps lp;
-                            BRepGProp::SurfaceProperties(lf, lp);
-                            const gp_Mat& mat = lp.MatrixOfInertia();  // 1-based, about origin
-                            Ixx = mat.Value(1, 1);
-                            Iyy = mat.Value(2, 2);
-                            Ixy = mat.Value(1, 2);
-                        }
-                    }
-                }
-            } catch (const Standard_Failure&) {
-                // face build failed -> fall through to the wire-centroid fallback below
-            }
-
-            // Fallback: a centroid from the section wire when no face could be built (open
-            // or degenerate section); leaves area/moments at 0.
-            if (area == 0.0 && cx == 0.0 && cy == 0.0 && cz == 0.0) {
-                GProp_GProps lin;
-                BRepGProp::LinearProperties(sec_shape, lin);
-                gp_Pnt com = lin.CentreOfMass();
-                cx = com.X();
-                cy = com.Y();
-                cz = com.Z();
-            }
+        for (const TopoDS_Shape& body : bodies) {
+            TopTools_IndexedMapOfShape solids;
+            TopExp::MapShapes(body, TopAbs_SOLID, solids);
+            if (solids.IsEmpty())
+                append_section(body);
+            else
+                for (int si = 1; si <= solids.Extent(); ++si)
+                    append_section(solids.FindKey(si));
         }
-    } catch (const Standard_Failure&) {
-        // matches the oracle's broad except -> zero everything
-    }
+        if (any_face) {
+            GProp_GProps fp;
+            BRepGProp::SurfaceProperties(sec_comp, fp);
+            area = std::abs(fp.Mass());
+            const gp_Pnt com = fp.CentreOfMass();
+            cx = com.X();
+            cy = com.Y();
+            cz = com.Z();
 
+            // Express every material face in the cutting plane's centroidal (u,v)
+            // frame. The compound integrates parallel-axis terms across bodies:
+            // Ixx = integral(v²), Iyy = integral(u²), Ixy = -integral(uv).
+            gp_Trsf to_local;
+            to_local.SetTransformation(gp_Ax3(com, pos.Direction(), pos.XDirection()));
+            const TopoDS_Shape local =
+                BRepBuilderAPI_Transform(sec_comp, to_local, true).Shape();
+            GProp_GProps lp;
+            BRepGProp::SurfaceProperties(local, lp);
+            const gp_Mat& mat = lp.MatrixOfInertia();
+            Ixx = mat.Value(1, 1);
+            Iyy = mat.Value(2, 2);
+            Ixy = mat.Value(1, 2);
+        }
+    } catch (const Standard_Failure& ex) {
+        throw OpError("section_failed",
+                      std::string("section calculation failed: ") +
+                          (ex.GetMessageString() ? ex.GetMessageString() : "OCCT failure"),
+                      {{"doc_id", doc_id}});
+    }
+    if (!std::isfinite(area) || !std::isfinite(cx) || !std::isfinite(cy) ||
+        !std::isfinite(cz) || !std::isfinite(Ixx) || !std::isfinite(Iyy) ||
+        !std::isfinite(Ixy) || (any_face && area <= 0.0))
+        throw OpError("section_failed", "section properties are not finite positive-area values",
+                      {{"doc_id", doc_id}});
     return json{
         {"area_mm2", area},
         {"centroid", {cx, cy, cz}},
@@ -10957,170 +11055,233 @@ json eval_overlap_bbox(const TopoDS_Shape& common_shape) {
 // Pairwise interference report over a list of named (name, shape) members — the shared core
 // of engine/doc/evaluate.py::interference (kernel.py::_fit_report). Pairwise overlap
 // (BRepAlgoAPI_Common volume) + clearance (BRepExtrema min distance), per-part bbox.
-// ok iff nothing interferes.
+// ok iff every member/pair was checked and nothing interferes. Failures are evidence,
+// not zero volume/distance; pairs_checked counts classified pairs, not candidates.
 // `include_coincident` (B4, default false) additionally classifies a near-zero-clearance
 // pair (common volume < eps AND DistShapeShape distance <= 1e-6) as a `contacts` entry
 // instead of a `clearances` one (SW-parity "coincident faces" gap, docs/SW_PARITY_SPEC.md).
 // `min_clearance_mm` (B4, default 0) tags a `clearances` entry below it with
 // `"warning":"below min clearance"`.
+// Motion needs threshold classification, not a complete minimum-distance table.
+// In that internal mode a proven-safe bound is explicitly a lower bound; exact
+// distance remains mandatory whenever clearance/contact cannot be decided by it.
 json interference_report(const std::vector<std::pair<std::string, TopoDS_Shape>>& members,
                          bool include_coincident = false, double min_clearance_mm = 0.0,
-                         bool quick = false) {
+                         bool quick = false,
+                         const std::vector<std::string>& component_ids = {},
+                         bool include_overlap_mesh = true, bool classify_motion = false) {
     const std::size_t n = members.size();
     constexpr double INTERFERENCE_EPS = 1e-3;
     constexpr double kCoincidentTol = 1e-6;
-
-    // Per-part bbox + volume (kernel.py::_bbox_dict uses build123d bounding_box() ->
-    // BRepBndLib::AddOptimal, the precise box, after BRepTools::Clean). The Bnd_Boxes are
-    // kept for the pair loop's prefilter below.
     json parts = json::array();
+    json geometry_failures = json::array();
     std::vector<Bnd_Box> boxes(n);
+    std::vector<bool> usable(n, false);
+    auto component_id = [&](std::size_t i) -> std::string {
+        return i < component_ids.size() ? component_ids[i] : members[i].first;
+    };
     for (std::size_t i = 0; i < n; ++i) {
-        const TopoDS_Shape& shp = members[i].second;
-        json part = {{"name", members[i].first}, {"volume", eval_vol_or_zero(shp)}};
+        const TopoDS_Shape& shape = members[i].second;
+        json part = {{"name", members[i].first}, {"component", component_id(i)},
+                     {"volume", nullptr}, {"bbox", nullptr}};
+        std::string failure;
         try {
-            BRepTools::Clean(shp);
-            Bnd_Box box;
-            BRepBndLib::AddOptimal(shp, box);
-            if (!box.IsVoid()) {
-                double xmn, ymn, zmn, xmx, ymx, zmx;
-                box.Get(xmn, ymn, zmn, xmx, ymx, zmx);
-                part["bbox"] = json{{"min", {xmn, ymn, zmn}},
-                                    {"max", {xmx, ymx, zmx}},
-                                    {"size", {xmx - xmn, ymx - ymn, zmx - zmn}}};
-                boxes[i] = box;
-            } else {
-                part["bbox"] = nullptr;
+            if (shape.IsNull())
+                failure = "missing_geometry";
+            else if (!TopExp_Explorer(shape, TopAbs_SOLID).More())
+                failure = "geometry_has_no_solids";
+            else if (classify_motion && !BRepCheck_Analyzer(shape).IsValid())
+                failure = "invalid_geometry";
+            else {
+                GProp_GProps props;
+                BRepGProp::VolumeProperties(shape, props);
+                const double volume = std::abs(props.Mass());
+                // Never clean shared source topology: motion is an immutable snapshot.
+                BRepBndLib::AddOptimal(shape, boxes[i], Standard_False,
+                                      classify_motion ? Standard_True : Standard_False);
+                if (!std::isfinite(volume) || volume <= 0.0)
+                    failure = "invalid_geometry_volume";
+                else if (boxes[i].IsVoid() || boxes[i].IsOpen())
+                    failure = "invalid_geometry_bounds";
+                else {
+                    double xa, ya, za, xb, yb, zb;
+                    boxes[i].Get(xa, ya, za, xb, yb, zb);
+                    if (!std::isfinite(xa) || !std::isfinite(ya) || !std::isfinite(za) ||
+                        !std::isfinite(xb) || !std::isfinite(yb) || !std::isfinite(zb))
+                        failure = "nonfinite_geometry_bounds";
+                    else {
+                        part["volume"] = volume;
+                        part["bbox"] = {{"min", {xa, ya, za}}, {"max", {xb, yb, zb}},
+                                        {"size", {xb - xa, yb - ya, zb - za}}};
+                        usable[i] = true;
+                    }
+                }
             }
         } catch (const Standard_Failure&) {
-            part["bbox"] = nullptr;
+            failure = "geometry_evaluation_failed";
+        } catch (const std::exception&) {
+            failure = "geometry_evaluation_failed";
+        }
+        if (!failure.empty()) {
+            part["reason"] = failure;
+            geometry_failures.push_back({{"name", members[i].first},
+                                         {"component", component_id(i)}, {"reason", failure}});
         }
         parts.push_back(std::move(part));
     }
 
-    // Axis-aligned gap between two precise bboxes: 0 when they overlap/touch, else the
-    // Euclidean distance between the boxes — a LOWER bound on the true B-rep distance.
-    auto bbox_gap = [&](std::size_t i, std::size_t j) -> double {
-        if (boxes[i].IsVoid() || boxes[j].IsVoid()) return 0.0;  // unknown -> never prune
-        return boxes[i].Distance(boxes[j]);
-    };
-    // `quick` (asm-fea F4): pairs whose bbox gap exceeds this window report the bbox gap
-    // itself ("approx": true) instead of paying an exact BRepExtrema_DistShapeShape — on a
-    // 40-body vehicle assembly the exact all-pairs distance pass alone took minutes. The
-    // window keeps every possibly-tight pair exact (min-clearance warnings stay exact).
+    // AABB separation is a conservative distance lower bound, not an exact gap.
+    // Ordinary Evaluate retains its full distance table (or requested quick mode).
     const double quick_window_mm = std::max(10.0, min_clearance_mm * 2.0);
-
     json interferences = json::array();
     json clearances = json::array();
     json contacts = json::array();
+    json pair_failures = json::array();
+    std::size_t pairs_checked = 0;
     for (std::size_t i = 0; i < n; ++i) {
-        const std::string& name_i = members[i].first;
         for (std::size_t j = i + 1; j < n; ++j) {
-            const std::string& name_j = members[j].first;
-            const double gap_lb = bbox_gap(i, j);
-            // overlap volume (None on boolean failure -> Python warns + continue).
-            // Disjoint bboxes (positive gap) mean the common volume is EXACTLY zero — skip
-            // the boolean, the result is identical (lossless prefilter, all callers).
-            bool ov_ok = false;
-            double ov = 0.0;
+            json pair = {{"a", members[i].first}, {"b", members[j].first},
+                         {"component_a", component_id(i)}, {"component_b", component_id(j)}};
+            auto fail = [&](const char* reason) {
+                json failure = pair;
+                failure["reason"] = reason;
+                pair_failures.push_back(std::move(failure));
+            };
+            if (!usable[i] || !usable[j]) {
+                fail("member_geometry_unavailable");
+                continue;
+            }
+            const double gap_lb = boxes[i].Distance(boxes[j]);
+            double overlap = 0.0;
             TopoDS_Shape common_shape;
-            if (gap_lb > 0.0) {
-                ov_ok = true;
-            } else {
+            if (gap_lb <= 0.0) {
                 try {
-                    BRepAlgoAPI_Common common(members[i].second, members[j].second);
+                    TopTools_ListOfShape args, tools;
+                    args.Append(members[i].second);
+                    tools.Append(members[j].second);
+                    BRepAlgoAPI_Common common;
+                    common.SetArguments(args);
+                    common.SetTools(tools);
+                    common.SetNonDestructive(Standard_True);
                     common.Build();
-                    if (common.IsDone()) {
-                        common_shape = common.Shape();
-                        ov = eval_vol_or_zero(common_shape);
-                        ov_ok = true;
+                    if (!common.IsDone() || common.HasErrors()) {
+                        fail("boolean_failed");
+                        continue;
+                    }
+                    common_shape = common.Shape();
+                    if (common_shape.IsNull()) {
+                        fail("boolean_result_missing");
+                        continue;
+                    }
+                    GProp_GProps props;
+                    BRepGProp::VolumeProperties(common_shape, props);
+                    overlap = std::abs(props.Mass());
+                    if (!std::isfinite(overlap)) {
+                        fail("overlap_volume_nonfinite");
+                        continue;
                     }
                 } catch (const Standard_Failure&) {
+                    fail("boolean_or_volume_failed");
+                    continue;
+                } catch (const std::exception&) {
+                    fail("boolean_or_volume_failed");
+                    continue;
                 }
             }
-            if (!ov_ok) continue;  // matches the warnings-sink "interference check failed" path
-            if (ov > INTERFERENCE_EPS) {
-                json item = {{"a", name_i},
-                             {"b", name_j},
-                             {"volume", ov},
-                             {"overlap_volume_mm3", ov}};
-                // Bbox + mesh of the Common shape (never throws; empty mesh on failure).
-                try {
-                    if (!common_shape.IsNull()) {
-                        json bb = eval_overlap_bbox(common_shape);
-                        if (bb.is_array() && bb.size() == 2) item["overlap_bbox"] = std::move(bb);
-                        item["overlap_mesh"] = eval_overlap_mesh(common_shape);
-                    } else {
-                        item["overlap_mesh"] =
-                            json{{"positions", json::array()}, {"indices", json::array()}};
-                    }
-                } catch (...) {
-                    item["overlap_mesh"] =
-                        json{{"positions", json::array()}, {"indices", json::array()}};
+            if (overlap > INTERFERENCE_EPS) {
+                pair["volume"] = overlap;
+                pair["overlap_volume_mm3"] = overlap;
+                if (include_overlap_mesh) {
+                    json bbox = eval_overlap_bbox(common_shape);
+                    if (bbox.size() == 2) pair["overlap_bbox"] = std::move(bbox);
+                    pair["overlap_mesh"] = eval_overlap_mesh(common_shape);
                 }
-                interferences.push_back(std::move(item));
+                interferences.push_back(std::move(pair));
+            } else if (classify_motion &&
+                       (min_clearance_mm <= 0.0 || gap_lb >= min_clearance_mm) &&
+                       (!include_coincident || gap_lb > kCoincidentTol)) {
+                // An overlapping AABB reaches here only after a completed Common
+                // proved no interfering volume. With no clearance/contact request,
+                // that classification is complete even for nearly touching faces.
+                pair["distance_lower_bound_mm"] = gap_lb;
+                clearances.push_back(std::move(pair));
             } else if (quick && gap_lb > quick_window_mm) {
-                // Far pair in quick mode: the bbox gap stands in for the exact distance.
-                clearances.push_back(json{{"a", name_i}, {"b", name_j},
-                                          {"distance", gap_lb}, {"approx", true}});
+                pair["distance"] = gap_lb;
+                pair["approx"] = true;
+                clearances.push_back(std::move(pair));
             } else {
                 try {
-                    BRepExtrema_DistShapeShape dss(members[i].second, members[j].second);
-                    if (dss.IsDone()) {
-                        const double dist = dss.Value();
-                        if (include_coincident && dist <= kCoincidentTol) {
-                            contacts.push_back(json{{"a", name_i}, {"b", name_j}, {"distance", dist}});
-                        } else {
-                            json c = {{"a", name_i}, {"b", name_j}, {"distance", dist}};
-                            if (min_clearance_mm > 0.0 && dist < min_clearance_mm)
-                                c["warning"] = "below min clearance";
-                            clearances.push_back(std::move(c));
-                        }
+                    BRepExtrema_DistShapeShape distance(members[i].second, members[j].second);
+                    if (!distance.IsDone()) {
+                        fail("distance_failed");
+                        continue;
+                    }
+                    const double value = distance.Value();
+                    if (!std::isfinite(value) || value < 0.0) {
+                        fail("distance_invalid");
+                        continue;
+                    }
+                    pair["distance"] = value;
+                    if (include_coincident && value <= kCoincidentTol)
+                        contacts.push_back(std::move(pair));
+                    else {
+                        if (min_clearance_mm > 0.0 && value < min_clearance_mm)
+                            pair["warning"] = "below min clearance";
+                        clearances.push_back(std::move(pair));
                     }
                 } catch (const Standard_Failure&) {
+                    fail("distance_failed");
+                    continue;
+                } catch (const std::exception&) {
+                    fail("distance_failed");
+                    continue;
                 }
             }
+            ++pairs_checked;
         }
     }
 
+    const bool complete = n > 0 && geometry_failures.empty() && pair_failures.empty();
     std::string summary;
-    if (!interferences.empty()) {
-        std::size_t big = 0;
-        for (std::size_t k = 1; k < interferences.size(); ++k)
-            if (interferences[k]["volume"].get<double>() > interferences[big]["volume"].get<double>())
-                big = k;
+    if (!complete)
+        summary = "Interference check incomplete: " + std::to_string(geometry_failures.size()) +
+                  " geometry failure(s), " + std::to_string(pair_failures.size()) +
+                  " failed pair(s); " + std::to_string(interferences.size()) +
+                  " known interfering pair(s).";
+    else if (!interferences.empty()) {
+        const auto biggest = std::max_element(interferences.begin(), interferences.end(),
+            [](const json& a, const json& b) {
+                return a["volume"].get<double>() < b["volume"].get<double>();
+            });
         char buf[160];
         std::snprintf(buf, sizeof(buf), "%zu interfering pair(s); largest %s<->%s = %.1f mm^3",
-                      interferences.size(), interferences[big]["a"].get<std::string>().c_str(),
-                      interferences[big]["b"].get<std::string>().c_str(),
-                      interferences[big]["volume"].get<double>());
+                      interferences.size(), (*biggest)["a"].get<std::string>().c_str(),
+                      (*biggest)["b"].get<std::string>().c_str(),
+                      (*biggest)["volume"].get<double>());
         summary = buf;
+    } else if (classify_motion) {
+        summary = n < 2 ? "No body pairs to check (1 body)." :
+                         "No volumetric interference; requested clearance classified.";
     } else if (!clearances.empty()) {
-        std::size_t tight = 0;
-        for (std::size_t k = 1; k < clearances.size(); ++k)
-            if (clearances[k]["distance"].get<double>() < clearances[tight]["distance"].get<double>())
-                tight = k;
+        const auto tightest = std::min_element(clearances.begin(), clearances.end(),
+            [](const json& a, const json& b) {
+                return a["distance"].get<double>() < b["distance"].get<double>();
+            });
         char buf[160];
         std::snprintf(buf, sizeof(buf), "No interference. Tightest gap %s<->%s = %.2f mm",
-                      clearances[tight]["a"].get<std::string>().c_str(),
-                      clearances[tight]["b"].get<std::string>().c_str(),
-                      clearances[tight]["distance"].get<double>());
+                      (*tightest)["a"].get<std::string>().c_str(),
+                      (*tightest)["b"].get<std::string>().c_str(),
+                      (*tightest)["distance"].get<double>());
         summary = buf;
-    } else if (members.size() < 2) {
-        summary = "No body pairs to check (1 body).";
-    } else {
-        summary = "No interference detected.";
-    }
-
-    return json{
-        {"ok", interferences.empty()},
-        {"summary", summary},
-        {"pairs_checked", members.size() < 2 ? 0 : members.size() * (members.size() - 1) / 2},
-        {"parts", parts},
-        {"interferences", interferences},
-        {"clearances", clearances},
-        {"contacts", contacts},
-    };
+    } else
+        summary = n < 2 ? "No body pairs to check (1 body)." : "No interference detected.";
+    return {{"ok", complete && interferences.empty()}, {"complete", complete},
+            {"summary", summary}, {"pairs_checked", pairs_checked},
+            {"pairs_total", n < 2 ? 0 : n * (n - 1) / 2},
+            {"pair_failures", std::move(pair_failures)},
+            {"geometry_failures", std::move(geometry_failures)}, {"parts", std::move(parts)},
+            {"interferences", std::move(interferences)}, {"clearances", std::move(clearances)},
+            {"contacts", std::move(contacts)}};
 }
 
 // engine/doc/evaluate.py::interference via worker.py::_eval_interference.
@@ -11135,21 +11296,53 @@ json doc_eval_interference(const std::string& doc_id, const json& params) {
     Session& s = require_session(doc_id);
 
     std::vector<std::pair<std::string, TopoDS_Shape>> members;
+    std::vector<std::string> component_ids;
+    json source_failures = json::array();
     if (s.is_assembly()) {
         if (!s.asm_result) rebuild_assembly(s);
         const AssemblyResult* ares = s.asm_result.get();
-        if (ares)
+        if (ares) {
             for (const AsmBodyOut& body : ares->bodies) {
                 // interference measures the REAL assembly: no explode offset (explode=False).
-                TopoDS_Shape world = placed_world_shape(body, std::nullopt);
-                // Imported STEP bodies may arrive as compounds — explode to SOLID(s).
+                TopoDS_Shape world;
+                try {
+                    world = placed_world_shape(body, std::nullopt);
+                } catch (const Standard_Failure&) {
+                    // Retain the member so the report records missing-geometry pairs.
+                }
                 members.emplace_back(body.name, eval_interference_member_shape(world));
+                component_ids.push_back(body.component_id);
             }
+            for (const auto& status : ares->component_status) {
+                if (status.ok) continue;
+                std::string name = status.id;
+                for (const auto& component : s.doc["components"])
+                    if (component.value("id", std::string()) == status.id)
+                        name = component.value("name", status.id);
+                source_failures.push_back({{"name", name}, {"component", status.id},
+                    {"reason", status.error.value_or("component_build_failed")}});
+                if (std::find(component_ids.begin(), component_ids.end(), status.id) ==
+                    component_ids.end()) {
+                    members.emplace_back(name, TopoDS_Shape());
+                    component_ids.push_back(status.id);
+                }
+            }
+            for (const auto& status : ares->feature_status)
+                if (!status.ok)
+                    source_failures.push_back({{"feature", status.id},
+                                               {"reason", "assembly_feature_build_failed"}});
+        }
     } else {
         CompileResult r = compile_session(s);
-        for (std::size_t i = 0; i < r.shapes.size(); ++i)
-            members.emplace_back("b" + std::to_string(i + 1),
-                                eval_interference_member_shape(r.shapes[i]));
+        for (std::size_t i = 0; i < r.shapes.size(); ++i) {
+            const std::string id = "b" + std::to_string(i + 1);
+            members.emplace_back(id, eval_interference_member_shape(r.shapes[i]));
+            component_ids.push_back(id);
+        }
+        for (const auto& status : r.statuses)
+            if (!status.ok)
+                source_failures.push_back({{"feature", status.id},
+                                           {"reason", "part_feature_build_failed"}});
     }
     // Optional `members` filter: case-sensitive exact match on the same names emitted in
     // parts[]/interferences[]. Absent or empty preserves all-members behaviour.
@@ -11161,11 +11354,20 @@ json doc_eval_interference(const std::string& doc_id, const json& params) {
         }
         if (!keep.empty()) {
             std::vector<std::pair<std::string, TopoDS_Shape>> filtered;
+            std::vector<std::string> filtered_ids;
             filtered.reserve(members.size());
-            for (auto& mem : members) {
-                if (keep.count(mem.first)) filtered.push_back(std::move(mem));
+            for (std::size_t i = 0; i < members.size(); ++i) {
+                if (!keep.count(members[i].first)) continue;
+                filtered.push_back(std::move(members[i]));
+                filtered_ids.push_back(std::move(component_ids[i]));
             }
             members.swap(filtered);
+            component_ids.swap(filtered_ids);
+            json filtered_failures = json::array();
+            for (auto& failure : source_failures)
+                if (!failure.contains("name") || keep.count(failure["name"].get<std::string>()))
+                    filtered_failures.push_back(std::move(failure));
+            source_failures = std::move(filtered_failures);
         }
     }
     // An EMPTY document is the trap: `check_interference` on nothing "passes" and the
@@ -11174,7 +11376,8 @@ json doc_eval_interference(const std::string& doc_id, const json& params) {
     // pairs_checked = 0 so nobody mistakes it for a verification.
     if (members.empty())
         return json{{"ok", false}, {"reason", "insufficient_bodies"},
-                    {"body_count", 0},
+                    {"body_count", 0}, {"complete", false}, {"pairs_checked", 0},
+                    {"pair_failures", json::array()}, {"geometry_failures", source_failures},
                     {"summary", "Interference requires bodies; this document has none."}};
     const bool include_coincident = params.contains("include_coincident") &&
                                     params["include_coincident"].is_boolean() &&
@@ -11182,12 +11385,23 @@ json doc_eval_interference(const std::string& doc_id, const json& params) {
     const double min_clearance_mm = params.contains("min_clearance_mm") &&
                                             params["min_clearance_mm"].is_number()
                                         ? params["min_clearance_mm"].get<double>() : 0.0;
+    if (!std::isfinite(min_clearance_mm) || min_clearance_mm < 0.0)
+        throw OpError("invalid_op", "min_clearance_mm must be finite and non-negative");
     // `quick` (asm-fea F4, default false = oracle-exact): approximate FAR clearances by
     // their bbox gap ("approx": true) so narration callers don't pay the all-pairs exact
     // distance pass on large assemblies. Interference volumes stay exact either way.
     const bool quick = params.contains("quick") && params["quick"].is_boolean() &&
                        params["quick"].get<bool>();
-    return interference_report(members, include_coincident, min_clearance_mm, quick);
+    json report = interference_report(members, include_coincident, min_clearance_mm, quick,
+                                      component_ids);
+    if (!source_failures.empty()) {
+        report["ok"] = false;
+        report["complete"] = false;
+        for (auto& failure : source_failures)
+            report["geometry_failures"].push_back(std::move(failure));
+        report["summary"] = "Interference check incomplete: one or more sources failed to build.";
+    }
+    return report;
 }
 
 // B2 — intra-part FEATURE-overlap detection (see session.h doc_eval_feature_overlap for the
@@ -11623,32 +11837,115 @@ json doc_face_wires(const std::string& doc_id, const json& params) {
 }
 
 
-// engine/doc/evaluate.py::measure via worker.py::_eval_measure. Resolve 1-8 refs against
-// the LAST body, then single / pair / multi-distance measure. Refs resolve in the SAME
-// enumeration describe_* + body.faces()/edges()/vertices() use (a TopExp re-walk).
+// Resolved readbacks bind exact geometry, never the nearest centroid. In particular,
+// a stale selector must not quietly turn into a measurement of a neighbouring edge.
+static TopoDS_Shape measure_resolve_ref(const json& ref, const TopoDS_Shape& body,
+                                      bool picked) {
+    if (!ref.is_object())
+        throw OpError("invalid_op", "measure ref must be a selector object");
+    std::string sid = ref.value("sid", std::string());
+    if (!sid.empty()) {
+        std::transform(sid.begin(), sid.end(), sid.begin(),
+                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        sid.front() = static_cast<char>(std::toupper(static_cast<unsigned char>(sid.front())));
+    }
+    if (is_geom_query(ref) && sid.empty()) {
+        const auto unknown = unknown_query_keys(ref);
+        if (!unknown.empty())
+            throw OpError("invalid_op", unknown_query_keys_error("measure", unknown));
+        const QueryPicks query = resolve_geom_query(body, ref);
+        if (!query.error.empty())
+            throw OpError("invalid_op", "measure ref: " + query.error, {{"reason", "bad query"}});
+        const std::size_t count = query.faces.size() + query.edges.size();
+        if (!count)
+            throw OpError("invalid_op", "measure ref matched no geometry", {{"reason", "no match"}});
+        if (count > 1 && !ref.contains("pick") && !ref.contains("near") &&
+            !ref.contains("index") && !ref.contains("count"))
+            throw OpError("invalid_op", "measure ref matched multiple elements; narrow it with body_id, pick, near or index",
+                          {{"reason", "ambiguous"}});
+        return !query.faces.empty() ? TopoDS_Shape(query.faces.front())
+                                    : TopoDS_Shape(query.edges.front());
+    }
+    const std::string kind = ref.contains("of") ? ref.value("of", std::string())
+                                               : ref.value("kind", std::string());
+    if (kind.empty() && sid.empty())
+        throw OpError("invalid_op", "measure ref needs a topology kind or sid");
+    const auto matches = [&](const json& candidate) {
+        if (!sid.empty() && candidate.value("sid", std::string()) != sid) return false;
+        bool fingerprint = !sid.empty();
+        for (const char* key : {"centroid", "surf", "axis", "area_or_len", "radius"}) {
+            if (!ref.contains(key) || ref[key].is_null()) continue;
+            fingerprint = true;
+            if (!candidate.contains(key) || candidate[key] != ref[key]) return false;
+        }
+        return fingerprint;
+    };
+    for (const auto& domain : {std::pair<const char*, TopAbs_ShapeEnum>{"face", TopAbs_FACE},
+                              {"edge", TopAbs_EDGE}, {"vertex", TopAbs_VERTEX}}) {
+        if (!kind.empty() && kind != domain.first) continue;
+        TopTools_IndexedMapOfShape unique;
+        TopExp::MapShapes(body, domain.second, unique);
+        // Pick hints are indices into the SAME unique map used to draw the AICM IDs.
+        // Verify the fingerprint before trusting the index, so stale picks fail closed.
+        if (picked && ref.contains("hint_index") && ref["hint_index"].is_number_integer()) {
+            if (ref["hint_index"] < 0 || ref["hint_index"] >= unique.Extent())
+                throw OpError("invalid_op", "measure pick topology index is out of range",
+                              {{"reason", "stale pick"}});
+            const int index = ref["hint_index"].get<int>();
+            if (index >= 0 && index < unique.Extent() &&
+                matches(make_pick_selector(body, domain.first, index + 1, std::nullopt)))
+                return unique(index + 1);
+            throw OpError("invalid_op", "measure pick no longer matches its body's topology; select it again",
+                          {{"reason", "stale pick"}});
+        }
+        const auto infos = domain.second == TopAbs_FACE ? describe_faces(body)
+                         : domain.second == TopAbs_EDGE ? describe_edges(body)
+                                                        : describe_vertices(body);
+        TopoDS_Shape found;
+        std::size_t index = 0;
+        for (TopExp_Explorer ex(body, domain.second); ex.More(); ex.Next(), ++index) {
+            if (index >= infos.size() || !matches(make_selector(infos[index]))) continue;
+            if (!found.IsNull() && !found.IsSame(ex.Current()))
+                throw OpError("invalid_op", "measure selector matches multiple elements; supply body_id and an exact pick",
+                              {{"reason", "ambiguous"}});
+            found = ex.Current();
+        }
+        if (!found.IsNull()) return found;
+        // Query readbacks include analytic face concavity in their SID. Match that
+        // native descriptor too; do not turn a SID lookup into a nearest-face query.
+        if (domain.second != TopAbs_VERTEX) {
+            const QueryPicks query = resolve_geom_query(body, json{{"of", domain.first}});
+            for (std::size_t i = 0; i < query.selectors.size(); ++i) {
+                if (!matches(query.selectors[i])) continue;
+                const TopoDS_Shape candidate = domain.second == TopAbs_FACE
+                    ? TopoDS_Shape(query.faces.at(i)) : TopoDS_Shape(query.edges.at(i));
+                if (!found.IsNull() && !found.IsSame(candidate))
+                    throw OpError("invalid_op", "measure selector matches multiple elements; supply body_id",
+                                  {{"reason", "ambiguous"}});
+                found = candidate;
+            }
+            if (!found.IsNull()) return found;
+        }
+    }
+    throw OpError("invalid_op", "measure selector does not match live geometry on the requested owner",
+                  {{"reason", "dangling selector"}});
+}
+
+// Pick refs are {body_id: AICM identity, selector: local selector}. Legacy plain
+// refs are world-space queries/readbacks over the whole document, never the last body.
 json doc_eval_measure(const std::string& doc_id, const json& refs) {
     DocLock lk;
     Session& s = require_session(doc_id);
-    CompileResult r = compile_session(s);
-    if (r.shapes.empty())
-        throw OpError("invalid_op", "no bodies for measure", {{"reason", "no bodies"}});
-    const TopoDS_Shape& shape = r.shapes.back();  // worker: bodies[-1]
-
-    // bbox diag (build123d bounding_box() = BRepBndLib::AddOptimal), floor 1e-3, 100 on fail.
-    double diag = 100.0;
-    try {
-        BRepTools::Clean(shape);
-        Bnd_Box box;
-        BRepBndLib::AddOptimal(shape, box);
-        if (!box.IsVoid()) {
-            double xmn, ymn, zmn, xmx, ymx, zmx;
-            box.Get(xmn, ymn, zmn, xmx, ymx, zmx);
-            double dx = xmx - xmn, dy = ymx - ymn, dz = zmx - zmn;
-            diag = std::max(std::sqrt(dx * dx + dy * dy + dz * dz), 1e-3);
-        }
-    } catch (const Standard_Failure&) {
+    const CompileResult* part = nullptr;
+    const AssemblyResult* assembly = nullptr;
+    if (s.is_assembly()) {
+        if (!s.asm_result) rebuild_assembly(s);
+        assembly = s.asm_result.get();
+    } else {
+        part = &ensure_compiled(s);
     }
-
+    if ((!assembly || assembly->bodies.empty()) && (!part || part->shapes.empty()))
+        throw OpError("invalid_op", "no bodies for measure", {{"reason", "no bodies"}});
     if (!refs.is_array() || refs.empty() || refs.size() > 8)
         throw OpError("invalid_op",
                       "measure() takes 1..8 refs, got " +
@@ -11656,10 +11953,82 @@ json doc_eval_measure(const std::string& doc_id, const json& refs) {
 
     std::vector<TopoDS_Shape> shapes;
     shapes.reserve(refs.size());
-    for (const auto& ref : refs) shapes.push_back(eval_resolve_ref(ref, shape, diag));
+    TopoDS_Shape whole;
+    for (const auto& ref : refs) {
+        if (!ref.is_object())
+            throw OpError("invalid_op", "measure ref must be an object");
+        const bool scoped = ref.contains("selector");
+        const bool has_owner = ref.contains("body_id");
+        if (scoped && !has_owner)
+            throw OpError("invalid_op", "measure selector envelope requires body_id");
+        if (has_owner) {
+            if (!ref["body_id"].is_number_integer() || ref["body_id"] < 1 ||
+                ref["body_id"] > std::numeric_limits<int>::max())
+                throw OpError("invalid_op", "measure body_id must be a positive AICM body identity",
+                              {{"reason", "bad body_id"}});
+            const int body_id = ref["body_id"].get<int>();
+            if (assembly) {
+                const auto it = std::find_if(assembly->bodies.begin(), assembly->bodies.end(),
+                    [body_id](const AsmBodyOut& b) { return b.body_id == body_id; });
+                if (it == assembly->bodies.end())
+                    throw OpError("invalid_op", "measure body_id " + std::to_string(body_id) +
+                                  " is not a live assembly body", {{"reason", "bad body_id"}});
+                if (scoped) {
+                    AsmBodyOut selected;
+                    selected.shape_local = measure_resolve_ref(ref["selector"], it->shape_local, true);
+                    selected.transform = it->transform;
+                    shapes.push_back(placed_world_shape(selected));
+                } else {
+                    shapes.push_back(measure_resolve_ref(ref, placed_world_shape(*it), false));
+                }
+            } else {
+                if (body_id > static_cast<int>(part->shapes.size()))
+                    throw OpError("invalid_op", "measure body_id " + std::to_string(body_id) +
+                                  " is not a live part body", {{"reason", "bad body_id"}});
+                shapes.push_back(measure_resolve_ref(scoped ? ref["selector"] : ref,
+                    part->shapes[body_id - 1], scoped));
+            }
+        } else {
+            if (whole.IsNull()) {
+                TopoDS_Compound compound;
+                BRep_Builder builder;
+                builder.MakeCompound(compound);
+                if (assembly) {
+                    for (const auto& body : assembly->bodies)
+                        builder.Add(compound, placed_world_shape(body));
+                } else {
+                    for (const auto& body : part->shapes) builder.Add(compound, body);
+                }
+                whole = compound;
+            }
+            shapes.push_back(measure_resolve_ref(ref, whole, false));
+        }
+    }
 
-    if (shapes.size() == 1) return eval_measure_single(shapes[0]);
-    if (shapes.size() == 2) return eval_measure_pair(shapes[0], shapes[1]);
+    // World-space readbacks let non-GUI consumers annotate the measured geometry,
+    // including local selectors picked on rotated instances.
+    const auto finish = [&](json result) {
+        json resolved = json::array();
+        for (const auto& shape : shapes) {
+            const char* kind = shape.ShapeType() == TopAbs_FACE ? "face"
+                             : shape.ShapeType() == TopAbs_EDGE ? "edge" : "vertex";
+            json selector;
+            if (shape.ShapeType() == TopAbs_FACE) {
+                const QueryPicks query = resolve_geom_query(shape, json{{"of", "face"}});
+                if (!query.error.empty() || query.selectors.size() != 1)
+                    throw OpError("invalid_op", "Could not describe the measured face");
+                selector = query.selectors.front();
+            } else {
+                selector = make_pick_selector(shape, kind, 1, std::nullopt);
+            }
+            selector.erase("hint_index"); // subshape-local ordinal is not a body pick ID
+            resolved.push_back(std::move(selector));
+        }
+        result["resolved_refs"] = std::move(resolved);
+        return result;
+    };
+    if (shapes.size() == 1) return finish(eval_measure_single(shapes[0]));
+    if (shapes.size() == 2) return finish(eval_measure_pair(shapes[0], shapes[1]));
 
     // 3+ refs: successive pairwise distances along the given order (v1 multi — no wire
     // topology). points = chain of extrema midpoints when each pair solves.
@@ -11668,7 +12037,7 @@ json doc_eval_measure(const std::string& doc_id, const json& refs) {
     double total = 0.0;
     for (std::size_t i = 0; i + 1 < shapes.size(); ++i) {
         const json pair = eval_measure_pair(shapes[i], shapes[i + 1]);
-        const double d = pair.value("distance", 0.0);
+        const double d = pair.at("distance").get<double>();
         distances.push_back(d);
         total += d;
         if (pair.contains("points") && pair["points"].is_array() &&
@@ -11698,7 +12067,7 @@ json doc_eval_measure(const std::string& doc_id, const json& refs) {
         elements.push_back(std::move(el));
     }
     out["elements"] = std::move(elements);
-    return out;
+    return finish(std::move(out));
 }
 
 // ----------------------------------------------------------- Evaluate field methods
@@ -12975,7 +13344,7 @@ json doc_save(const std::string& doc_id, const std::string& path) {
                 if (!geometry_step.empty())
                     s.extra_entries["geometry.step"] = std::move(geometry_step);
                 std::vector<uint8_t> blob;
-                json cached = ops_response_assembly(s, json::object(), &blob);
+                json cached = ops_response_assembly(s, json::object(), /*with_tess=*/true, &blob);
                 if (cached.contains("tess") && cached["tess"].is_object())
                     cached["tess"].erase("aicm_path");
                 const std::string base_dir =
@@ -13074,6 +13443,8 @@ json doc_open(const std::string& path, bool as_solid, bool detach_path) {
 
     CompileResult r;
     if (stored.is_assembly()) {
+        // Migrate legacy bindings even if a persisted display cache avoids compilation.
+        bind_assembly_reference_frames(stored.doc);
         // Assemblies compile via rebuild_assembly / asm_result — NOT compile_document —
         // exactly as doc_new(kind=assembly) does. base_dir is derived from stored.path
         // inside rebuild_assembly, so the components' saved source paths resolve.
@@ -14311,33 +14682,47 @@ json apply_coincident_proposals(json& params, const json& proposals, const json&
                                 std::optional<double> solve_budget_ms = std::nullopt) {
     if (!params.contains("constraints") || !params["constraints"].is_array())
         params["constraints"] = json::array();
-    json applied = json::array();
-    int skipped = 0;
+    json candidates = json::array();
     for (const json& p : proposals) {
         if (!p.is_object() || !p.contains("a") || !p.contains("b")) continue;
         std::string ha = p["a"].value("handle", std::string());
         std::string hb = p["b"].value("handle", std::string());
         if (ha.empty() || hb.empty()) continue;
-        const std::string cid = gen.next("c");
-        json c = {{"id", cid}, {"type", "coincident"},
-                  {"refs", json::array({ha, hb})}};
-        // Trial-add on a COPY, analyze; keep only if it does not become conflicting.
-        json trial = params;
-        trial["constraints"].push_back(c);
-        json sk;
-        sk["entities"] = trial["entities"];
-        sk["constraints"] = trial["constraints"];
-        // Interactive when a wall-clock budget is set (apply_ops auto-coincident);
-        // the explicit auto-constrain RPC leaves budget unset so the exact path is used.
-        const bool interactive = solve_budget_ms.has_value();
-        chudware::sketch::SketchSolution sol =
-            chudware::sketch::solve_sketch(sk, env, std::nullopt, solve_budget_ms,
-                                        interactive);
+        candidates.push_back(json{{"id", gen.next("c")}, {"type", "coincident"},
+                                  {"refs", json::array({ha, hb})}});
+    }
+    // Preserve the exact/interactive choice and its solve budget for every trial.
+    const auto solve_trial = [&](const json& constraints) {
+        return chudware::sketch::solve_sketch(
+            json{{"entities", params["entities"]}, {"constraints", constraints}},
+            env, std::nullopt, solve_budget_ms, solve_budget_ms.has_value());
+    };
+    json applied = json::array();
+    if (candidates.size() > 1) {
+        // Imported/generated profiles commonly have many already-touching corners.
+        // Validate their complete constraint set once, not one dense solve per corner.
+        json constraints = params["constraints"];
+        constraints.insert(constraints.end(), candidates.begin(), candidates.end());
+        const auto sol = solve_trial(constraints);
+        if (sol.converged && sol.conflicting.empty()) {
+            params["constraints"] = std::move(constraints);
+            for (const json& c : candidates) applied.push_back(c["id"]);
+            return json{{"applied", applied}, {"skipped_conflicting", 0}};
+        }
+    }
+    // A failed batch must not discard valid proposals. Retain the original ordered
+    // trial/rollback behavior, using the same generated IDs.
+    int skipped = 0;
+    for (json& c : candidates) {
+        const std::string cid = c["id"];
+        json constraints = params["constraints"];
+        constraints.push_back(c);
+        const auto sol = solve_trial(constraints);
         bool conflicts = false;
         for (const std::string& t : sol.conflicting)
             if (t == cid) conflicts = true;
         if (conflicts || !sol.converged) { ++skipped; continue; }
-        params["constraints"].push_back(std::move(c));  // commit into live params
+        params["constraints"].push_back(std::move(c));
         applied.push_back(cid);
     }
     return json{{"applied", applied}, {"skipped_conflicting", skipped}};
@@ -15896,6 +16281,7 @@ static std::array<double, 16> row_to_col_major(const std::vector<double>& rm) {
 
 struct MotionAxisLine {
     std::string component;
+    std::string reference;
     Eigen::Vector3d point = Eigen::Vector3d::Zero();
     Eigen::Vector3d direction = Eigen::Vector3d::Zero();
     Eigen::Matrix4d base = Eigen::Matrix4d::Identity();
@@ -15912,7 +16298,8 @@ static Eigen::Matrix4d motion_matrix(const std::vector<double>& values) {
 
 // A scalar angle supplies ONE rotational equation, not a revolute joint. Motion
 // needs a line as well: authored point+axis, the mate's own third axial reference,
-// or a concentric/hinge joint on its driven body. Never guess a pivot at the origin.
+// or a concentric/hinge joint to the reference (including another grounded body).
+// Grounded bodies share a rigid world frame, not necessarily a local placement.
 static MotionAxisLine motion_axis_line(const json& doc, json& driver,
                                        const AssemblyResult& initial) {
     MotionAxisLine line;
@@ -15925,6 +16312,7 @@ static MotionAxisLine motion_axis_line(const json& doc, json& driver,
     // whether the network can honor it.
     const bool fb = component_is_fixed(doc, b);
     line.component = fb ? a : b;
+    line.reference = fb ? b : a;
     line.sign = fb ? -1.0 : 1.0;
     line.base = motion_matrix(initial.transforms.at(line.component));
     const Eigen::Matrix4d ma = motion_matrix(initial.transforms.at(a));
@@ -15941,16 +16329,28 @@ static MotionAxisLine motion_axis_line(const json& doc, json& driver,
             motion_vec3(value["axis_point"], "value.axis_point") + ma.topRightCorner<3, 1>();
         have_point = true;
     }
+    bool have_measured_axis = false;
     auto take_axis = [&](const AsmMateRefGeom& ref) {
         if (ref.geom.kind != "axis") return false;
         const Eigen::Matrix4d m = motion_matrix(initial.transforms.at(ref.component));
         Eigen::Vector3d dir = m.topLeftCorner<3, 3>() * ref.geom.direction;
-        if (dir.norm() < 1e-12) return false;
+        const Eigen::Vector3d point =
+            m.topLeftCorner<3, 3>() * ref.geom.point + m.topRightCorner<3, 1>();
+        if (!dir.allFinite() || !point.allFinite() || dir.norm() < 1e-12) return false;
         dir.normalize();
         if (authored_axis && line.direction.normalized().cross(dir).norm() > 1e-6)
             return false;
+        const double line_tolerance = std::max(1e-6, initial.tolerance);
+        if (have_measured_axis) {
+            if (line.direction.normalized().cross(dir).norm() > 1e-6 ||
+                (line.point - point).cross(dir).norm() > line_tolerance)
+                motion_invalid("driver_axis_line_unresolved: ambiguous concentric/hinge axes");
+            return true;
+        }
+        if (have_point && (line.point - point).cross(dir).norm() > line_tolerance)
+            return false;
         if (!have_point) {
-            line.point = m.topLeftCorner<3, 3>() * ref.geom.point + m.topRightCorner<3, 1>();
+            line.point = point;
             have_point = true;
         }
         if (!authored_axis) {
@@ -15958,44 +16358,60 @@ static MotionAxisLine motion_axis_line(const json& doc, json& driver,
             line.direction = ma.topLeftCorner<3, 3>() *
                 chudware::mate::canonical_sign(ma.topLeftCorner<3, 3>().transpose() * dir);
         }
+        have_measured_axis = true;
         return true;
     };
     const auto own = initial.mate_geometry.find(driver.at("id").get<std::string>());
     if ((!have_point || !authored_axis) && own != initial.mate_geometry.end())
         for (const auto& ref : own->second)
             if (ref.ref_index >= 2 && take_axis(ref)) break;
-    if (!have_point || line.direction.norm() < 1e-12)
+    if (!have_point || line.direction.norm() < 1e-12) {
+        const bool fixed_reference = component_is_fixed(doc, line.reference);
         for (const json& mate : doc["mates"]) {
             const std::string type = mate.value("type", std::string());
             if (mate.value("suppressed", false) || (type != "concentric" && type != "hinge"))
                 continue;
             const auto found = initial.mate_geometry.find(mate.at("id").get<std::string>());
             if (found == initial.mate_geometry.end()) continue;
-            bool attached = false;
+            bool attached_driven = false, attached_reference = false;
+            for (const auto& ref : found->second) {
+                attached_driven = attached_driven || ref.component == line.component;
+                attached_reference = attached_reference || ref.component == line.reference ||
+                    (fixed_reference && component_is_fixed(doc, ref.component));
+            }
+            if (!attached_driven || !attached_reference) continue;
+            // Inspect every eligible line: different grounded pins are not an
+            // invitation to pick the first axis, and a floating neighbor is never
+            // interchangeable with the driver's reference.
             for (const auto& ref : found->second)
-                attached = attached || ref.component == line.component;
-            if (!attached) continue;
-            for (const auto& ref : found->second)
-                if (ref.component == line.component && take_axis(ref)) break;
-            if (have_point && line.direction.norm() >= 1e-12) break;
+                if (ref.component == line.component) take_axis(ref);
         }
-    if (!have_point || !line.direction.allFinite() || line.direction.norm() < 1e-12)
+    }
+    if (!have_point || !line.point.allFinite() ||
+        !line.direction.allFinite() || line.direction.norm() < 1e-12)
         motion_invalid("driver_axis_line_unresolved: angle mate has no hinge line; "
                        "provide value.axis and value.axis_point in the first reference's "
                        "local frame, a third axial reference, or a concentric/hinge mate "
-                       "on the driven body");
+                       "between the driven body and its reference or an equivalent fixed body");
     line.direction.normalize();
-    // Freeze the resolved direction for the entire sweep; keep its true 3D direction.
+    // Keep the axis attached to A in the solver. Store the seed/check in the OTHER
+    // component's frame: nested drivers must move with their steering carrier.
     const Eigen::Vector3d local_axis = ma.topLeftCorner<3, 3>().transpose() * line.direction;
     value["axis"] = {local_axis.x(), local_axis.y(), local_axis.z()};
+    const Eigen::Matrix4d reference = motion_matrix(initial.transforms.at(line.reference));
+    line.point = reference.topLeftCorner<3, 3>().transpose() *
+        (line.point - reference.topRightCorner<3, 1>());
+    line.direction = reference.topLeftCorner<3, 3>().transpose() * line.direction;
+    line.base = reference.inverse() * line.base;
     return line;
 }
 
 static json motion_pose_check(const MotionAxisLine& line, const Eigen::Matrix4d& pose,
-                               double requested_value) {
-    const Eigen::Matrix4d delta = pose * line.base.inverse();
+                               const Eigen::Matrix4d& reference, double requested_value) {
+    const Eigen::Matrix4d reference_inverse = reference.inverse();
+    const Eigen::Matrix4d delta = reference_inverse * pose * line.base.inverse();
     const Eigen::Matrix3d r = delta.topLeftCorner<3, 3>();
-    // Validate against the requested world line, not the matrix used to drive it.
+    // Validate relative motion, not an independent fixed-world spin.
     const Eigen::Matrix3d expected_rotation = Eigen::AngleAxisd(
         line.sign * (requested_value - line.value) * M_PI / 180.0,
         line.direction).toRotationMatrix();
@@ -16004,21 +16420,91 @@ static json motion_pose_check(const MotionAxisLine& line, const Eigen::Matrix4d&
                          (line.point - r * line.point)).norm();
     const bool translation_ok = error <= tol;
     const bool rotation_ok = (r - expected_rotation).cwiseAbs().maxCoeff() <= 1e-6;
+    // Publish the line and affine-coordinate invariant in the current reference's
+    // world frame; the relative rotation/translation checks above stay local.
+    const Eigen::Vector3d world_point = reference.topLeftCorner<3, 3>() * line.point +
+        reference.topRightCorner<3, 1>();
+    const Eigen::Vector3d world_direction =
+        reference.topLeftCorner<3, 3>() * line.direction;
     json invariant = nullptr;
     bool invariant_ok = true;
     for (int k = 0; k < 3; ++k)
-        if (std::abs(std::abs(line.direction[k]) - 1.0) < 1e-12) {
+        if ((world_direction - std::copysign(1.0, world_direction[k]) *
+             Eigen::Vector3d::Unit(k)).norm() < 1e-12) {
+            const Eigen::Matrix4d world_delta = reference * delta * reference_inverse;
             Eigen::RowVector4d row = Eigen::RowVector4d::Zero();
             row[k] = 1.0;
-            invariant_ok = (delta.row(k) - row).cwiseAbs().maxCoeff() <= 1e-6;
+            invariant_ok = (world_delta.row(k) - row).cwiseAbs().maxCoeff() <= 1e-6;
             invariant = {{"axis", std::string(1, "xyz"[k])}, {"ok", invariant_ok}};
         }
     return {{"component", line.component},
-            {"axis_point", {line.point.x(), line.point.y(), line.point.z()}},
-            {"axis_dir", {line.direction.x(), line.direction.y(), line.direction.z()}},
+            {"reference_component", line.reference}, {"coordinate_frame", "world"},
+            {"axis_point", {world_point.x(), world_point.y(), world_point.z()}},
+            {"axis_dir", {world_direction.x(), world_direction.y(), world_direction.z()}},
             {"translation_ok", translation_ok}, {"translation_error_mm", error},
             {"rotation_ok", rotation_ok}, {"invariant_coordinate", invariant},
             {"ok", translation_ok && rotation_ok && invariant_ok}};
+}
+
+struct MotionDriver {
+    std::string id, type, component, reference;
+    json* mate = nullptr;
+    double start = 0.0, stop = 0.0;
+    std::optional<MotionAxisLine> axis;
+    AsmMateRefGeom a, b;
+    Eigen::Matrix4d base = Eigen::Matrix4d::Identity();
+};
+
+// Distance mates measure either a plane-normal gap or point separation, not an
+// arbitrary world translation. Return that same scalar and its actual direction.
+static double motion_distance(const MotionDriver& driver,
+                              const std::map<std::string, Eigen::Matrix4d>& poses,
+                              Eigen::Vector3d& direction) {
+    const auto& a = poses.at(driver.a.component);
+    const auto& b = poses.at(driver.b.component);
+    const Eigen::Vector3d pa = a.topLeftCorner<3, 3>() * driver.a.geom.point +
+        a.topRightCorner<3, 1>();
+    const Eigen::Vector3d pb = b.topLeftCorner<3, 3>() * driver.b.geom.point +
+        b.topRightCorner<3, 1>();
+    if (driver.a.geom.kind == "plane" || driver.b.geom.kind == "plane") {
+        if (driver.a.geom.kind == "plane")
+            direction = a.topLeftCorner<3, 3>() * driver.a.geom.normal;
+        else
+            direction = b.topLeftCorner<3, 3>() * driver.b.geom.normal;
+        if (driver.mate->value("align", std::string()) == "anti") direction = -direction;
+        return direction.dot(pb - pa);
+    }
+    direction = pb - pa;
+    const double length = direction.norm();
+    if (length > 1e-12) direction /= length;
+    return length;
+}
+
+static void motion_seed_driver(const MotionDriver& driver, double value,
+                               std::map<std::string, Eigen::Matrix4d>& poses,
+                               chudware::mate::WarmMap& warm) {
+    Eigen::Matrix4d pose = poses.at(driver.reference) * driver.base;
+    if (driver.axis) {
+        const auto& line = *driver.axis;
+        Eigen::Matrix4d delta = Eigen::Matrix4d::Identity();
+        const Eigen::Matrix3d rotation = chudware::mate::rodrigues(
+            line.direction * (line.sign * (value - line.value) * M_PI / 180.0));
+        delta.topLeftCorner<3, 3>() = rotation;
+        delta.topRightCorner<3, 1>() = line.point - rotation * line.point;
+        pose = poses.at(line.reference) * delta * line.base;
+    } else {
+        poses[driver.component] = pose;
+        Eigen::Vector3d direction;
+        const double current = motion_distance(driver, poses, direction);
+        const double squared = direction.squaredNorm();
+        if (squared > 1e-24)
+            pose.topRightCorner<3, 1>() +=
+                (driver.component == driver.b.component ? 1.0 : -1.0) *
+                (value - current) * direction / squared;
+    }
+    poses[driver.component] = pose;
+    warm[driver.component] = {pose.topRightCorner<3, 1>(),
+        chudware::mate::mat_to_rotvec(pose.topLeftCorner<3, 3>())};
 }
 
 json doc_simulate_motion(const std::string& doc_id,
@@ -16026,10 +16512,10 @@ json doc_simulate_motion(const std::string& doc_id,
                          double start, double stop, int steps,
                          bool check_interference,
                          double min_clearance_mm,
-                         const json& dynamics) {
+                         const json& dynamics, const json& drivers_in) {
     if (steps < 2)
         motion_invalid("steps must be >= 2");
-    if (!std::isfinite(start) || !std::isfinite(stop))
+    if (drivers_in.is_null() && (!std::isfinite(start) || !std::isfinite(stop)))
         motion_invalid("start and stop must be finite");
     if (!std::isfinite(min_clearance_mm) || min_clearance_mm < 0.0)
         motion_invalid("min_clearance_mm must be finite and non-negative");
@@ -16063,68 +16549,151 @@ json doc_simulate_motion(const std::string& doc_id,
             base_dir = std::filesystem::path(live.path).parent_path().string();
         if (!live.asm_warm.empty()) warm = live.asm_warm;
     }
+    // Legacy migration belongs to the private snapshot, never the live motion source.
+    bind_assembly_reference_frames(sweep_doc);
 
-    std::string mate_id = mate_id_in;
-    std::string driver_type;
-    std::string driver_unit;
+    json requested = drivers_in;
     json& mates = sweep_doc["mates"];
     if (!mates.is_array() || mates.empty())
         motion_invalid("document has no mates. Build an assembly with mates first.");
-    std::vector<json*> drivable;
-    for (json& mate : mates) {
-        if (mate.value("suppressed", false)) continue;
-        if (k_drivable_mate_types.count(mate.value("type", std::string())))
-            drivable.push_back(&mate);
-    }
-    if (mate_id.empty()) {
-        if (drivable.empty())
+    if (requested.is_null()) {
+        std::string id = mate_id_in;
+        if (id.empty())
+            for (const json& mate : mates) {
+                if (mate.value("suppressed", false) ||
+                    !k_drivable_mate_types.count(mate.value("type", std::string()))) continue;
+                if (!id.empty())
+                    motion_invalid("multiple drivable mates — pass mate_id or drivers explicitly");
+                id = mate.value("id", std::string());
+            }
+        if (id.empty())
             motion_invalid("no drivable dimensional mate found; add an angle or distance mate");
-        if (drivable.size() > 1)
-            motion_invalid("multiple drivable mates — pass mate_id explicitly");
-        mate_id = drivable.front()->value("id", std::string());
+        requested = json::array({{{"mate_id", id}, {"start", start}, {"stop", stop}}});
     }
-    json* driven = nullptr;
-    for (json& mate : mates)
-        if (mate.value("id", std::string()) == mate_id) {
-            driven = &mate;
-            break;
+    if (!requested.is_array() || requested.empty())
+        motion_invalid("drivers must be a nonempty array or null");
+    std::vector<MotionDriver> drivers;
+    json driver_metadata = json::array();
+    std::set<std::string> selected;
+    for (const json& row : requested) {
+        if (!row.is_object() || !row.contains("mate_id") || !row["mate_id"].is_string() ||
+            row["mate_id"].get<std::string>().empty() || !row.contains("start") ||
+            !row.contains("stop") || !row["start"].is_number() || !row["stop"].is_number())
+            motion_invalid("each driver requires mate_id, numeric start and stop");
+        MotionDriver driver;
+        driver.id = row["mate_id"].get<std::string>();
+        driver.start = row["start"].get<double>();
+        driver.stop = row["stop"].get<double>();
+        if (!std::isfinite(driver.start) || !std::isfinite(driver.stop))
+            motion_invalid("driver '" + driver.id + "' bounds must be finite");
+        if (!selected.insert(driver.id).second)
+            motion_invalid("duplicate driver mate '" + driver.id + "'");
+        for (json& mate : mates)
+            if (mate.value("id", std::string()) == driver.id) {
+                driver.mate = &mate;
+                break;
+            }
+        if (!driver.mate) motion_invalid("mate '" + driver.id + "' not found");
+        if (driver.mate->value("suppressed", false))
+            motion_invalid("driver mate '" + driver.id + "' is suppressed");
+        driver.type = driver.mate->value("type", std::string());
+        const auto type = k_drivable_mate_types.find(driver.type);
+        if (type == k_drivable_mate_types.end())
+            motion_invalid("mate '" + driver.id + "' has no drivable angle or distance value");
+        const auto& refs = driver.mate->at("refs");
+        if (!refs.is_array() || refs.size() < 2)
+            motion_invalid("driver '" + driver.id + "' requires two component references");
+        const std::string a = refs.at(0).at("component");
+        const std::string b = refs.at(1).at("component");
+        if (a == b || (component_is_fixed(sweep_doc, a) && component_is_fixed(sweep_doc, b)))
+            motion_invalid("driver '" + driver.id + "' has no moving component");
+        const bool reverse = component_is_fixed(sweep_doc, b);
+        driver.component = reverse ? a : b;
+        driver.reference = reverse ? b : a;
+        json& value = (*driver.mate)["value"];
+        if (!value.is_object()) value = {{"value", value}};
+        if (!value.contains("value") || !value["value"].is_number() ||
+            !std::isfinite(value["value"].get<double>()))
+            motion_invalid("driver '" + driver.id + "' current value must be finite");
+        driver_metadata.push_back({{"mate_id", driver.id}, {"type", driver.type},
+            {"unit", type->second}, {"start", driver.start}, {"stop", driver.stop}, {"steps", steps}});
+        drivers.push_back(std::move(driver));
+    }
+    const std::string mate_id = drivers.front().id;
+    const AssemblyResult initial = compile_assembly(sweep_doc, base_dir, warm);
+    auto unresolved = [&](const std::string& reason, const std::string& error) -> json {
+        json failures = json::array();
+        for (const auto& status : initial.component_status)
+            if (!status.ok)
+                failures.push_back({{"component", status.id},
+                    {"reason", status.error.value_or("component_build_failed")}});
+        for (const auto& status : initial.feature_status)
+            if (!status.ok)
+                failures.push_back({{"feature", status.id}, {"reason", "assembly_feature_build_failed"}});
+        return {{"ok", false}, {"doc_id", doc_id}, {"mate_id", mate_id},
+                {"driver", driver_metadata.front()}, {"drivers", driver_metadata},
+                {"reason", reason}, {"error", error}, {"trajectory", json::array()},
+                {"pose_check", {{"ok", false}, {"reason", reason}, {"frames", json::array()}}},
+                {"interference", {{"checked", check_interference}, {"complete", false},
+                    {"frames_checked", 0}, {"pair_failures", json::array()},
+                    {"geometry_failures", failures}, {"first_collision_step", nullptr},
+                    {"first_collision_value", nullptr}, {"detail", json::array()}}},
+                {"summary", error}};
+    };
+    if (!initial.converged)
+        return unresolved("driver_initial_pose_unresolved",
+                          "assembly must solve completely before driving");
+    warm = initial.warm;
+    std::map<std::string, Eigen::Matrix4d> seed_poses;
+    for (const auto& [id, transform] : initial.transforms) {
+        if (transform.size() != 16 || !motion_matrix(transform).allFinite())
+            return unresolved("driver_initial_pose_unresolved", "invalid initial transform");
+        seed_poses[id] = motion_matrix(transform);
+    }
+    try {
+        for (auto& driver : drivers) {
+            driver.base = seed_poses.at(driver.reference).inverse() * seed_poses.at(driver.component);
+            if (driver.type == "angle")
+                driver.axis = motion_axis_line(sweep_doc, *driver.mate, initial);
+            else {
+                bool have_a = false, have_b = false;
+                for (const auto& ref : initial.mate_geometry.at(driver.id)) {
+                    if (ref.ref_index == 0) { driver.a = ref; have_a = true; }
+                    if (ref.ref_index == 1) { driver.b = ref; have_b = true; }
+                }
+                if (!have_a || !have_b)
+                    motion_invalid("distance driver '" + driver.id + "' references unresolved");
+                Eigen::Vector3d direction;
+                motion_distance(driver, seed_poses, direction);
+                if (!direction.allFinite() || direction.norm() < 1e-12)
+                    motion_invalid("distance driver '" + driver.id + "' direction unresolved");
+            }
         }
-    if (!driven)
-        motion_invalid("mate '" + mate_id + "' not found");
-    driver_type = driven->value("type", std::string());
-    auto driver_it = k_drivable_mate_types.find(driver_type);
-    if (driver_it == k_drivable_mate_types.end())
-        motion_invalid("mate '" + mate_id + "' (type '" + driver_type +
-                       "') has no scalar value that the mate solver actually drives; "
-                       "drive an angle or distance mate");
-    driver_unit = driver_it->second;
-
-    std::optional<MotionAxisLine> axis_line;
-    if (driver_type == "angle") {
-        const AssemblyResult initial = compile_assembly(sweep_doc, base_dir, warm);
-        if (!initial.converged)
-            motion_invalid("driver_initial_pose_unresolved: assembly must solve before driving");
-        warm = initial.warm;
-        try {
-            axis_line = motion_axis_line(sweep_doc, *driven, initial);
-        } catch (const std::exception& e) {
-            return {{"ok", false}, {"doc_id", doc_id}, {"mate_id", mate_id},
-                    {"reason", "driver_axis_line_unresolved"}, {"error", e.what()},
-                    {"trajectory", json::array()},
-                    {"pose_check", {{"ok", false}, {"reason", "driver_axis_line_unresolved"},
-                                    {"frames", json::array()}}}};
+    } catch (const std::exception& e) {
+        return unresolved("driver_axis_line_unresolved", e.what());
+    }
+    // Seed a carrier before its driven child even if the request lists spin first.
+    // Closed loops retain one deterministic seed pass; the full mate solve, never
+    // this ordering or an authored pose, is authoritative for every frame.
+    std::vector<std::size_t> seed_order;
+    std::set<std::size_t> pending;
+    for (std::size_t k = 0; k < drivers.size(); ++k) pending.insert(k);
+    while (!pending.empty()) {
+        auto next = pending.end();
+        for (auto candidate = pending.begin(); candidate != pending.end(); ++candidate) {
+            bool waits = false;
+            for (std::size_t other : pending)
+                waits = waits || (other != *candidate &&
+                    drivers[other].component == drivers[*candidate].reference);
+            if (!waits) { next = candidate; break; }
         }
+        if (next == pending.end()) next = pending.begin();
+        seed_order.push_back(*next);
+        pending.erase(next);
     }
     json pose_frames = json::array();
     bool all_pose_ok = true;
     const int drive_dof = angle_drive_dof(sweep_doc);
-
-    std::vector<double> samples;
-    samples.reserve(static_cast<size_t>(steps));
-    for (int i = 0; i < steps; ++i)
-        samples.push_back(start + (stop - start) *
-                                    static_cast<double>(i) /
-                                    static_cast<double>(steps - 1));
 
     json trajectory = json::array();
     json reference_bodies = json::array();
@@ -16134,32 +16703,32 @@ json doc_simulate_motion(const std::string& doc_id,
     json first_collision_detail = json::array();
     bool had_collision = false;
     bool all_converged = true;
+    int frames_checked = 0;
+    json pair_failures = json::array();
+    json geometry_failures = json::array();
     std::vector<std::map<std::string, Eigen::Matrix4d>> dyn_poses;
-    dyn_poses.reserve(want_dyn ? samples.size() : 0);
+    dyn_poses.reserve(want_dyn ? static_cast<std::size_t>(steps) : 0);
     std::optional<AssemblyResult> dyn_topology;
 
     for (int i = 0; i < steps; ++i) {
-        const double value = samples[static_cast<size_t>(i)];
-        // Change only the scalar: axis/axis_point and other mate geometry survive.
-        if (!(*driven)["value"].is_object())
-            (*driven)["value"] = {{"value", (*driven)["value"]}};
-        (*driven)["value"]["value"] = value;
-        (*driven)["value"]["expr"] = nullptr;
-        Eigen::Matrix3d drive_rotation = Eigen::Matrix3d::Identity();
-        if (axis_line) {
-            const auto& line = *axis_line;
-            drive_rotation = chudware::mate::rodrigues(
-                line.direction * (line.sign * (value - line.value) * M_PI / 180.0));
-            Eigen::Matrix4d delta = Eigen::Matrix4d::Identity();
-            delta.topLeftCorner<3, 3>() = drive_rotation;
-            delta.topRightCorner<3, 1>() = line.point - drive_rotation * line.point;
-            const Eigen::Matrix4d pose = delta * line.base;
-            (*warm)[line.component] = {pose.topRightCorner<3, 1>(),
-                chudware::mate::mat_to_rotvec(pose.topLeftCorner<3, 3>())};
+        const double t = static_cast<double>(i) / static_cast<double>(steps - 1);
+        json driver_values = json::object();
+        for (auto& driver : drivers) {
+            // Weighted endpoints avoid overflow in stop-start for finite bounds.
+            const double sample = i == 0 ? driver.start : i == steps - 1 ? driver.stop :
+                (1.0 - t) * driver.start + t * driver.stop;
+            driver_values[driver.id] = sample;
+            (*driver.mate)["value"]["value"] = sample;
+            (*driver.mate)["value"]["expr"] = nullptr;
         }
+        const double value = driver_values.at(mate_id).get<double>();
+        for (std::size_t k : seed_order)
+            motion_seed_driver(drivers[k], driver_values.at(drivers[k].id).get<double>(),
+                               seed_poses, *warm);
         AssemblyResult solved = compile_assembly(sweep_doc, base_dir, warm);
-        warm = solved.warm;
-        if (i == 0) {
+        // Never replace the warm state with a failed solver result.
+        if (solved.converged) warm = solved.warm;
+        if (i == 0 && solved.converged) {
             reference_transforms = solved.transforms;
             for (const AsmBodyOut& body : solved.bodies) {
                 const TopoDS_Shape world = placed_world_shape(body);
@@ -16181,13 +16750,20 @@ json doc_simulate_motion(const std::string& doc_id,
             if (!status.ok) {
                 converged = false;
                 issues.push_back("component '" + status.id + "' failed to build");
+                geometry_failures.push_back({{"i", i}, {"component", status.id},
+                    {"reason", status.error.value_or("component_build_failed")}});
             }
         for (const AsmMateStatus& status : solved.mate_status)
             if (status.status == "unresolved" || status.status == "conflicting") {
                 converged = false;
                 issues.push_back("mate '" + status.id + "' is " + status.status);
             }
-        all_converged = all_converged && converged;
+        for (const FeatureStatus& status : solved.feature_status)
+            if (!status.ok) {
+                issues.push_back("assembly feature failed to build");
+                geometry_failures.push_back({{"i", i}, {"feature", status.id},
+                                             {"reason", "assembly_feature_build_failed"}});
+            }
 
         json bodies_j = json::array();
         std::map<std::string, Eigen::Matrix4d> frame_poses;
@@ -16224,43 +16800,92 @@ json doc_simulate_motion(const std::string& doc_id,
                 frame_poses[body.component_id] = transform;
         }
         json pose_check = {{"ok", true}, {"bodies", json::array()}};
-        if (axis_line) {
-            const auto it = frame_poses.find(axis_line->component);
-            if (it == frame_poses.end()) {
-                pose_check["ok"] = false;
-                pose_check["reason"] = "driver_pose_missing";
+        for (const auto& driver : drivers) {
+            json checked = {{"mate_id", driver.id}, {"component", driver.component}, {"ok", false}};
+            const auto status = std::find_if(solved.mate_status.begin(), solved.mate_status.end(),
+                [&](const AsmMateStatus& entry) { return entry.id == driver.id; });
+            const bool residual_ok = status != solved.mate_status.end() &&
+                (status->status == "ok" || status->status == "redundant") &&
+                std::isfinite(status->residual) && status->residual <= solved.tolerance;
+            if (!frame_poses.count(driver.component) || !frame_poses.count(driver.reference))
+                checked["reason"] = "driver_pose_missing";
+            else if (driver.axis) {
+                checked = motion_pose_check(*driver.axis, frame_poses.at(driver.component),
+                    frame_poses.at(driver.reference), driver_values.at(driver.id).get<double>());
+                checked["mate_id"] = driver.id;
             } else {
-                json checked = motion_pose_check(*axis_line, it->second, value);
-                pose_check["ok"] = checked["ok"];
-                pose_check["bodies"].push_back(std::move(checked));
+                Eigen::Vector3d direction;
+                const double measured = motion_distance(driver, frame_poses, direction);
+                const double error = std::abs(measured - driver_values.at(driver.id).get<double>());
+                checked["measured_value"] = measured;
+                checked["translation_error_mm"] = error;
+                checked["ok"] = std::isfinite(error) && error <= std::max(1e-6, solved.tolerance);
+                checked["reference_component"] = driver.reference;
             }
-            if (!pose_check["ok"].get<bool>()) {
+            checked["residual"] = status == solved.mate_status.end() ? json(nullptr) : json(status->residual);
+            checked["tolerance"] = solved.tolerance;
+            checked["residual_ok"] = residual_ok;
+            checked["ok"] = checked.value("ok", false) && residual_ok;
+            if (!checked["ok"].get<bool>()) {
+                pose_check["ok"] = false;
                 converged = false;
-                all_converged = false;
                 all_pose_ok = false;
-                issues.push_back("driver_pose_mismatch: solved pose does not honor hinge line");
+                issues.push_back("driver_pose_mismatch: '" + driver.id + "' did not honor its joint");
             }
+            pose_check["bodies"].push_back(std::move(checked));
         }
+        all_converged = all_converged && converged;
+        if (converged) seed_poses = frame_poses;
         pose_frames.push_back({{"i", i}, {"ok", pose_check["ok"]},
                                {"bodies", pose_check["bodies"]}});
 
         json frame = {{"i", i},
                       {"value", value},
+                      {"driver_values", driver_values},
+                      {"max_residual", solved.max_residual},
+                      {"worst_mate", solved.worst_mate}, {"tolerance", solved.tolerance},
                       {"dof", solved.dof + drive_dof},
                       {"residual_dof", solved.dof},
                       {"converged", converged},
                       {"bodies", bodies_j}, {"pose_check", pose_check}};
         if (!issues.empty()) frame["issues"] = issues;
+        frame["interference"] = nullptr;
+        frame["interference_complete"] = false;
+        frame["collisions"] = json::array();
+        frame["collision_detail"] = json::array();
+        frame["pair_failures"] = json::array();
 
         if (check_interference && converged) {
             std::vector<std::pair<std::string, TopoDS_Shape>> members;
+            std::vector<std::string> component_ids;
             members.reserve(solved.bodies.size());
-            for (const AsmBodyOut& body : solved.bodies)
-                members.emplace_back(
-                    body.name,
-                    eval_interference_member_shape(placed_world_shape(body, std::nullopt)));
-            json report = interference_report(
-                members, /*include_coincident=*/false, min_clearance_mm, /*quick=*/false);
+            component_ids.reserve(solved.bodies.size());
+            for (const AsmBodyOut& body : solved.bodies) {
+                TopoDS_Shape shape;
+                try {
+                    shape = eval_interference_member_shape(placed_world_shape(body, std::nullopt));
+                } catch (const Standard_Failure&) {
+                    // A null member records a failed pair rather than disappearing.
+                }
+                members.emplace_back(body.name, shape);
+                component_ids.push_back(body.component_id);
+            }
+            json report = interference_report(members, false, min_clearance_mm, false,
+                                              component_ids, false, true);
+            const bool complete = report.value("complete", false);
+            if (complete) ++frames_checked;
+            frame["interference_complete"] = complete;
+            frame["pairs_checked"] = report["pairs_checked"];
+            frame["pair_failures"] = report["pair_failures"];
+            frame["geometry_failures"] = report["geometry_failures"];
+            for (json failure : report["pair_failures"]) {
+                failure["i"] = i;
+                pair_failures.push_back(std::move(failure));
+            }
+            for (json failure : report["geometry_failures"]) {
+                failure["i"] = i;
+                geometry_failures.push_back(std::move(failure));
+            }
             json detail = json::array();
             for (const json& pair : report.value("interferences", json::array()))
                 detail.push_back(pair);
@@ -16268,18 +16893,13 @@ json doc_simulate_motion(const std::string& doc_id,
                 if (pair.value("warning", std::string()) == "below min clearance")
                     detail.push_back(pair);
             const bool collision = !detail.empty();
-            frame["interference"] = collision;
-            // Per-step collision list (kinematic sweep evidence): every offending pair at
-            // THIS sample, not just the first colliding sample. Compact by construction —
-            // the report's overlap_mesh/bbox stay out of a trajectory that can hold
-            // hundreds of steps. A below-min-clearance pair is a zero-overlap collision.
-            json collisions = json::array();
-            for (const json& pair : detail)
-                collisions.push_back({{"a", pair.value("a", std::string())},
-                                      {"b", pair.value("b", std::string())},
-                                      {"overlap_volume_mm3",
-                                       pair.value("overlap_volume_mm3", 0.0)}});
-            frame["collisions"] = std::move(collisions);
+            frame["interference"] = collision ? json(true) : complete ? json(false) : json(nullptr);
+            frame["collision_detail"] = detail;
+            for (const json& pair : detail) {
+                json collision_pair = pair;
+                collision_pair["overlap_volume_mm3"] = pair.value("overlap_volume_mm3", 0.0);
+                frame["collisions"].push_back(std::move(collision_pair));
+            }
             if (collision && !had_collision) {
                 had_collision = true;
                 first_collision_step = i;
@@ -16297,42 +16917,41 @@ json doc_simulate_motion(const std::string& doc_id,
 
     json interference = {
         {"checked", check_interference},
+        {"complete", check_interference && frames_checked == steps},
+        {"frames_checked", frames_checked},
+        {"pair_failures", std::move(pair_failures)},
+        {"geometry_failures", std::move(geometry_failures)},
         {"first_collision_step", first_collision_step},
         {"first_collision_value", first_collision_value},
         {"detail", had_collision ? first_collision_detail : json::array()}};
 
-    char summary_buf[320];
-    if (!all_converged) {
-        std::snprintf(summary_buf, sizeof(summary_buf),
-                      "%d frames | driver %s | one or more frames did not solve",
-                      steps, mate_id.c_str());
-    } else if (had_collision) {
-        std::snprintf(summary_buf, sizeof(summary_buf),
-                      "%d frames | driver %s | interference/clearance violation at step %d",
-                      steps, mate_id.c_str(), first_collision_step.get<int>());
-    } else {
-        std::snprintf(summary_buf, sizeof(summary_buf),
-                      "%d frames | driver %s | no interference detected",
-                      steps, mate_id.c_str());
-    }
+    const bool interference_complete = interference["complete"].get<bool>();
+    std::string summary = std::to_string(steps) + " frames | " +
+        std::to_string(drivers.size()) + " driver(s) | ";
+    if (!all_converged) summary += "one or more frames did not solve";
+    else if (!check_interference) summary += "interference not checked";
+    else if (!interference_complete) summary += "interference check incomplete";
+    else if (!had_collision) summary += "no interference detected";
+    if (had_collision)
+        summary += (summary.back() == ' ' ? "" : " | ") +
+            std::string("interference/clearance violation at step ") + first_collision_step.dump();
 
     json result = {
-        {"ok", all_converged},
+        {"ok", all_converged && (!check_interference || interference_complete)},
         {"doc_id", doc_id},
         {"mate_id", mate_id},
-        {"driver", {{"type", driver_type},
-                    {"unit", driver_unit},
-                    {"start", start},
-                    {"stop", stop},
-                    {"steps", steps}}},
+        {"driver", driver_metadata.front()},
+        {"drivers", driver_metadata},
         {"trajectory", trajectory},
         {"reference_bodies", std::move(reference_bodies)},
         {"reference_transforms", std::move(reference_transforms)},
         {"pose_check", {{"ok", all_pose_ok}, {"frames", pose_frames}}},
         {"interference", interference},
-        {"summary", std::string(summary_buf)}};
+        {"summary", summary}};
     if (!all_converged)
         result["error"] = "motion sweep contains unresolved or non-converged frames";
+    else if (check_interference && !interference_complete)
+        result["error"] = "motion interference check is incomplete";
 
     if (want_dyn) {
         if (!all_converged || !dyn_topology) {

@@ -914,6 +914,70 @@ TEST_CASE("a virtual hinge keeps its authored pin and leaves rotation free") {
     }
 }
 
+TEST_CASE("hinge alignment corrects an opposite-hemisphere seed without fixing its phase") {
+    const Vector3d pin(9, -4, 6), axis(0, 0, 1);
+    json components = json::array({
+        {{"id", "a"}, {"fixed", true}, {"transform", ident16()}},
+        {{"id", "b"}, {"fixed", false}, {"transform", ident16()}}});
+    ResolvedGeometry geometry;
+    geometry[{"pin", 0}] = mgeom("axis", pin, {1, 0, 0}, axis);
+    geometry[{"pin", 1}] = geometry.at({"pin", 0});
+    for (bool explicit_pin : {false, true}) {
+        for (bool anti : {false, true}) {
+            INFO("explicit pin = " << explicit_pin << ", anti = " << anti);
+            json mate = {{"id", "pin"}, {"type", "hinge"},
+                {"align", anti ? "anti" : "aligned"},
+                {"refs", {{{"component", "a"}}, {{"component", "b"}}}}};
+            if (explicit_pin)
+                mate["value"] = {{"axis", {0, 0, 1}}, {"axis_point", {9, -4, 6}}};
+            // Explicit pins bind the same oriented reference line on both bodies,
+            // independently of selector alignment; geometric pins honor anti.
+            const double sign = anti && !explicit_pin ? -1.0 : 1.0;
+            const Matrix3d target = rodrigues({sign < 0 ? M_PI : 0.0, 0, 0});
+            const Matrix3d seed = rodrigues({170 * kDeg2Rad, 0, 0}) * target;
+            WarmMap warm;
+            warm["b"] = {pin - seed * pin, mat_to_rotvec(seed)};
+            const json mates = json::array({mate});
+            const auto solved = solve_mates(
+                components, mates, geometry, warm, std::nullopt, 1e-10, 150);
+            REQUIRE(solved.converged);
+            CHECK(solved.dof == 1);
+            const auto& pose = solved.params.at("b");
+            const Matrix3d rotation = rodrigues(pose.second);
+            CHECK((rotation * axis - sign * axis).norm() < 1e-8);
+            CHECK((rotation * pin + pose.first - pin).norm() < 1e-8);
+
+            // Another phase on the corrected branch remains a valid free pose.
+            const Matrix3d spun = rodrigues(axis * (73 * kDeg2Rad)) * rotation;
+            warm["b"] = {pin - spun * pin, mat_to_rotvec(spun)};
+            const auto free = solve_mates(components, mates, geometry, warm);
+            REQUIRE(free.converged);
+            CHECK(free.dof == 1);
+            CHECK((rodrigues(free.params.at("b").second) - spun).norm() < 1e-8);
+            CHECK((free.params.at("b").first - warm.at("b").first).norm() < 1e-8);
+        }
+    }
+}
+
+TEST_CASE("an aligned hinge cannot accept a locked antiparallel axis") {
+    json components = json::array({
+        {{"id", "a"}, {"fixed", true}, {"transform", ident16()}},
+        {{"id", "b"}, {"fixed", false}, {"transform", xform({0, 0, 0}, {M_PI, 0, 0})}}});
+    json mates = json::array({
+        {{"id", "pin"}, {"type", "hinge"}, {"align", "aligned"},
+         {"refs", {{{"component", "a"}}, {{"component", "b"}}}}},
+        {{"id", "rest"}, {"type", "lock"},
+         {"refs", {{{"component", "a"}}, {{"component", "b"}}}}}});
+    ResolvedGeometry geometry;
+    for (const char* id : {"pin", "rest"}) {
+        geometry[{id, 0}] = mgeom("axis", {0, 0, 0}, {1, 0, 0}, {0, 0, 1});
+        geometry[{id, 1}] = geometry.at({id, 0});
+    }
+    const auto solved = solve_mates(components, mates, geometry);
+    CHECK_FALSE(solved.converged);
+    CHECK(solved.max_residual > solved.tolerance);
+}
+
 TEST_CASE("a passive cross follows a driven rotated reference without a cross driver") {
     const Vector3d ta(120, -35, 70), tb(-18, 42, 11);
     const Vector3d wa(0.3, -0.5, 0.2), wb(-0.4, 0.2, 0.6);

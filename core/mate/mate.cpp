@@ -1347,17 +1347,21 @@ private:
             self->wd("b", xs, db_l, db, Jd);
             self->wp("a", xs, pa_l, pa, Jd);
             self->wp("b", xs, pb_l, pb, Jd);
-            VectorXd r(6);
-            r.head(2) = two_indep_cross(da, sign * db);
+            VectorXd r(7);
+            // An oriented pin must not accept the antiparallel branch. A cross
+            // product vanishes at both directions, regardless of the align sign.
+            // The three chord components have rank two at alignment and leave
+            // rotation about the pin free.
+            r.head(3) = unit(da) - sign * unit(db);
             // A revolute joint makes the two axis origins coincident.  The old
             // two-component perpendicular residual left translation along the
             // hinge axis free, so "hinge" actually behaved as a cylindrical
             // joint and motion sweeps could drift axially.
-            r.segment(2, 3) = pb - pa;
+            r.segment(3, 3) = pb - pa;
             double ang; MatrixXd row; swing(xs, ang, row);
-            if (ang < lo) r(5) = ang - lo;
-            else if (ang > hi) r(5) = ang - hi;
-            else r(5) = 0.0;
+            if (ang < lo) r(6) = ang - lo;
+            else if (ang > hi) r(6) = ang - hi;
+            else r(6) = 0.0;
             return r;
         };
         J jfunc = [=](const VectorXd& xs) {
@@ -1366,19 +1370,17 @@ private:
             self->wd("b", xs, db_l, db, Jdb);
             self->wp("a", xs, pa_l, pa, Jpa);
             self->wp("b", xs, pb_l, pb, Jpb);
-            MatrixXd Jm = self->empty_jac(6);
-            Vector3d sdb = sign * db;
-            MatrixXd cross_jac = self->place("a", (-skew(sdb) * Jda).eval())
-                + self->place("b", (skew(da) * (sign * Jdb)).eval());
-            Jm.block(0, 0, 2, self->icols()) =
-                two_indep_cross_jac(da, sdb, self->place("a", Jda), cross_jac);
-            Jm.block(2, 0, 3, self->icols()) =
+            MatrixXd Jm = self->empty_jac(7);
+            Jm.block(0, 0, 3, self->icols()) =
+                self->place("a", (unit_jacobian(da) * Jda).eval())
+                - sign * self->place("b", (unit_jacobian(db) * Jdb).eval());
+            Jm.block(3, 0, 3, self->icols()) =
                 self->place("b", Jpb) - self->place("a", Jpa);
             double ang; MatrixXd row; swing(xs, ang, row);
-            if (ang < lo || ang > hi) Jm.block(5, 0, 1, self->icols()) = row;
+            if (ang < lo || ang > hi) Jm.block(6, 0, 1, self->icols()) = row;
             return Jm;
         };
-        return {rfunc, jfunc, 6};
+        return {rfunc, jfunc, 7};
     }
 
     Built slot() {

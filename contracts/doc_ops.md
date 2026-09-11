@@ -570,3 +570,14 @@ pin station and axis while leaving its angular coordinate free; a scalar `value`
 does not turn the passive hinge into a prescribed angle. Existing angular limits
 remain active. Incomplete or malformed explicit pin metadata refuses. Geometric
 hinges and prescribed angle-mate behavior retain their existing semantics.
+
+## 17. Oriented hinge alignment (2026-09-11)
+
+A hinge preserves its authored pin direction, not merely an unoriented line.
+Geometric hinges honor `align:"aligned"` or `"anti"`; explicit virtual pins bind
+the same oriented reference line on both bodies independently of selector
+alignment. Antiparallel axes cannot satisfy an aligned hinge. Direction residuals
+are dimensionless normalized-vector chord components; their rank is two at a
+valid alignment. Coincident pin origins and the free angular coordinate remain
+unchanged. Contradictory orientation constraints refuse convergence rather than
+accepting a disconnected half-turn branch. No solve tolerance is widened.

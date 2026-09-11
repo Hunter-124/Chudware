@@ -3851,3 +3851,36 @@ passed. The golden-demo gate reports 13 passed, zero failed and one skipped.
 Opt-in AppImage, V&V, modeling and benchmark stages were not enabled. Gate logs,
 demo summary and smoke images are preserved in
 `ME-490/Engineering/Verification/me490_precision_final_gate`.
+
+## 2026-09-11 — preserve the authored hinge orientation
+
+The full rover sweep passed independent comparisons through sample 64, then
+sample 65 exposed a separate native hinge defect: two aligned virtual pins had
+axis dot products of -1 while their cross-product residuals were effectively
+zero. The native solver accepted a disconnected half-turn branch in the keyed
+front-right output spindle and a rear cross; the independent Cardan witness
+remained continuous and correctly refused the result.
+
+`core/mate/mate.cpp::hinge` now uses oriented normalized-vector differences and
+their analytic derivatives for both bodies. Five physical constraints still
+leave hinge rotation free; limits, reference frames and tolerances are unchanged.
+Direction units are clarified in `mate.h` and `contracts/doc_ops.md`. Two
+behavioral cases in `test_mate.cpp` fail against the pre-fix mate archive and pass
+against the corrected implementation: opposite-hemisphere correction with free
+spin, and refusal of a locked antiparallel contradiction. The targeted OCCT
+`mate`, `simulate_motion` and `nsolve` suites pass.
+
+Evidence lives in `ME-490/Engineering/Verification/me490_pose65_probe`.
+An attempted native64 checkpoint restoration failed its exact-placement guard
+and was not used as a continuation. The full 241-pose verification restarted
+from the original saved model with no skipped samples or prescribed analytic
+poses; its eventual motion/interference result remains separate from these
+focused tests.
+
+The direct native build's same three suites also pass, followed by the full
+Linux gate (native/host/WASM, full CTest, hostd, web parity, packaging,
+service/tool/training and GUI smokes). All 12 golden-demo legs pass; the nested
+firmware emulator remains an explicitly skipped timeout. Opt-in benchmark,
+V&V, modeling and AppImage stages were not enabled. Full logs and demo counts
+are retained under `ME-490/Engineering/Verification/me490_oriented_final_gate`.
+The corrected runtime is staged for normal daemon and in-process launches.

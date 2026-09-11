@@ -1160,6 +1160,59 @@ TEST_CASE("a driven body carries an offset locked child without redefining its a
     }
 }
 
+TEST_CASE("coaxial mates reject the reverse branch without restraining slide or spin") {
+    const Vector3d pin(9, -4, 6), axis(0, 0, 1);
+    const json components = json::array({
+        {{"id", "a"}, {"fixed", true}, {"transform", ident16()}},
+        {{"id", "b"}, {"fixed", false}, {"transform", ident16()}}});
+    ResolvedGeometry geometry;
+    geometry[{"bore", 0}] = mgeom("axis", pin, {1, 0, 0}, axis);
+    geometry[{"bore", 1}] = geometry.at({"bore", 0});
+    for (const char* type : {"concentric", "coincident"}) for (bool anti : {false, true}) {
+        INFO("type = " << type << ", anti = " << anti);
+        const double sign = anti ? -1.0 : 1.0;
+        const json mates = json::array({{{"id", "bore"}, {"type", type},
+            {"align", anti ? "anti" : "aligned"},
+            {"refs", {{{"component", "a"}}, {{"component", "b"}}}}}});
+        const Matrix3d seed = rodrigues({(anti ? -10.0 : 170.0) * kDeg2Rad, 0, 0});
+        WarmMap warm{{"b", {pin - seed * pin, mat_to_rotvec(seed)}}};
+        const auto solved = solve_mates(components, mates, geometry, warm);
+        REQUIRE(solved.converged);
+        CHECK(solved.dof == 2);
+        CHECK((rodrigues(solved.params.at("b").second) * axis - sign * axis).norm() < 1e-8);
+        const Matrix3d spun = rodrigues(axis * (73 * kDeg2Rad))
+            * rodrigues(solved.params.at("b").second);
+        const Vector3d translated = pin + 45 * axis - spun * pin;
+        warm["b"] = {translated, mat_to_rotvec(spun)};
+        const auto free = solve_mates(components, mates, geometry, warm);
+        REQUIRE(free.converged);
+        CHECK(free.dof == 2);
+        CHECK((rodrigues(free.params.at("b").second) - spun).norm() < 1e-8);
+        CHECK((free.params.at("b").first - translated).norm() < 1e-8);
+    }
+}
+
+TEST_CASE("a prescribed line angle cannot satisfy its phase with a reversed pin") {
+    const Vector3d pin(9, -4, 6), axis(0, 0, 1);
+    const json components = json::array({
+        {{"id", "a"}, {"fixed", true}, {"transform", ident16()}},
+        {{"id", "b"}, {"fixed", false}, {"transform", ident16()}}});
+    const json mates = json::array({{{"id", "turn"}, {"type", "angle"},
+        {"refs", {{{"component", "a"}}, {{"component", "b"}}}},
+        {"value", {{"value", 35.0}, {"axis", {0, 0, 1}}, {"axis_point", {9, -4, 6}}}}}});
+    ResolvedGeometry geometry;
+    geometry[{"turn", 0}] = mgeom("plane", pin, {1, 0, 0}, axis);
+    geometry[{"turn", 1}] = geometry.at({"turn", 0});
+    const Matrix3d expected = rodrigues(axis * (35 * kDeg2Rad));
+    const Matrix3d seed = expected * rodrigues({170 * kDeg2Rad, 0, 0});
+    const WarmMap warm{{"b", {pin - seed * pin, mat_to_rotvec(seed)}}};
+    const auto solved = solve_mates(components, mates, geometry, warm, std::nullopt, 1e-10, 150);
+    REQUIRE(solved.converged);
+    CHECK(solved.dof == 0);
+    CHECK((rodrigues(solved.params.at("b").second) - expected).norm() < 1e-8);
+    CHECK((solved.params.at("b").first - (pin - expected * pin)).norm() < 1e-8);
+}
+
 TEST_CASE("a concentric slider follows the moving reference axis through a driven turn") {
     json components = json::array({
         {{"id", "ground"}, {"fixed", true}, {"transform", ident16()}},

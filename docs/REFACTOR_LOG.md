@@ -3884,3 +3884,38 @@ firmware emulator remains an explicitly skipped timeout. Opt-in benchmark,
 V&V, modeling and AppImage stages were not enabled. Full logs and demo counts
 are retained under `ME-490/Engineering/Verification/me490_oriented_final_gate`.
 The corrected runtime is staged for normal daemon and in-process launches.
+
+## 2026-09-11 — complete the oriented-axis cutover
+
+The repaired sequential rover run passed sample 65 (maximum affected transform
+translation discrepancy 9.095e-13 mm, rotation-entry discrepancy 1.776e-15), then
+sample 74 exposed the same antiparallel zero in the remaining concentric and
+explicit-angle pin residuals. The pedal angle pin m231 had axis dot -1 with
+cross norm 1.225e-16 despite a passing native residual. The full independent
+named-transform comparison rejected the halfshaft and pedal branches.
+
+Both remaining two-component cross-product paths now use oriented normalized
+direction differences and analytic derivatives. Coincident axis/axis dispatch
+shares the corrected concentric implementation instead of duplicating its old
+cross-product defect; point coincidence stays unchanged. The obsolete cross
+helpers are removed. Coaxial slide/spin freedom, angle phase conventions,
+reference frames, limits, model geometry and solve tolerances are unchanged.
+`mate.h` and `contracts/doc_ops.md` describe the residuals and alignment rule.
+
+Two behavioral regressions fail against the previous native mate archive and
+pass after the cutover: coaxial aligned/anti branch correction with slide/spin
+freedom, and a prescribed line angle refusing the reverse pin branch. Full
+`mate`, `simulate_motion` and `nsolve` suites pass in both native build trees.
+Evidence is retained in `ME-490/Engineering/Verification/me490_pose74_probe`.
+The full rover verification again starts from zero; no incomplete earlier
+trajectory is used as motion or clearance evidence.
+
+The complete integration gate exited zero with native/host/WASM, full CTest,
+hostd, web parity, packaging and GUI smokes passing. It recorded one MCP
+multiuser-event test failure; that original output is preserved. The isolated
+four-test file then passed, followed by the complete MCP directory with 3019
+passed, 26 skipped and one expected failure. No unrelated test or production
+code was changed to obtain that result. Gate and followup evidence is archived
+under `ME-490/Engineering/Verification/me490_all_axes_final_gate`; its pinned
+runtime matches the staged normal-launch copies. This is a development build,
+not a tagged release or rover clearance approval.

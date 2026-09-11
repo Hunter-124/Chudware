@@ -156,20 +156,6 @@ MatrixXd perp_residual2_jac(const Vector3d& axis, const MatrixXd& Jaxis,
     return out;
 }
 
-// Two independent scalars that vanish iff da || db. Projects da x db onto perp(da).
-VectorXd two_indep_cross(const Vector3d& da, const Vector3d& db) {
-    Vector3d c = da.cross(db);
-    Vector3d e1, e2;
-    perp_basis(da, e1, e2);
-    VectorXd r(2);
-    r << c.dot(e1), c.dot(e2);
-    return r;
-}
-
-MatrixXd two_indep_cross_jac(const Vector3d& da, const Vector3d& db,
-                             const MatrixXd& Jda, const MatrixXd& cross_jac) {
-    return perp_residual2_jac(da, Jda, da.cross(db), cross_jac);
-}
 
 double axis_point_distance(const Vector3d& p_axis, const Vector3d& d_axis,
                            const Vector3d& q) {
@@ -520,59 +506,22 @@ private:
     }
 
     Built coincident_axis() {
-        Vector3d da_l = ga_.dir_vector();
-        Vector3d db_l = gb_.dir_vector();
-        Vector3d pa_l = ga_.point, pb_l = gb_.point;
-        double sign = sign_;
-        bool has_dir = (ga_.kind == "axis") && (gb_.kind == "axis");
+        if (ga_.kind == "axis" && gb_.kind == "axis") return concentric();
+        const Vector3d pa_l = ga_.point, pb_l = gb_.point;
         auto self = this;
-
-        if (!has_dir) {
-            R rfunc = [=](const VectorXd& xs) {
-                Vector3d pa, pb; MatrixXd Jd;
-                self->wp("a", xs, pa_l, pa, Jd);
-                self->wp("b", xs, pb_l, pb, Jd);
-                return VectorXd(pa - pb);
-            };
-            J jfunc = [=](const VectorXd& xs) {
-                Vector3d pa, pb; MatrixXd Jpa, Jpb;
-                self->wp("a", xs, pa_l, pa, Jpa);
-                self->wp("b", xs, pb_l, pb, Jpb);
-                return MatrixXd(self->place("a", Jpa) - self->place("b", Jpb));
-            };
-            return {rfunc, jfunc, 3};
-        }
-
         R rfunc = [=](const VectorXd& xs) {
-            Vector3d da, db, pa, pb; MatrixXd Jd;
-            self->wd("a", xs, da_l, da, Jd);
-            self->wd("b", xs, db_l, db, Jd);
+            Vector3d pa, pb; MatrixXd Jd;
             self->wp("a", xs, pa_l, pa, Jd);
             self->wp("b", xs, pb_l, pb, Jd);
-            VectorXd r(5);
-            r.head(3) = da.cross(sign * db);
-            r.segment(3, 2) = perp_residual2(da, pb - pa);
-            return r;
+            return VectorXd(pa - pb);
         };
         J jfunc = [=](const VectorXd& xs) {
-            Vector3d da, db, pa, pb;
-            MatrixXd Jda, Jdb, Jpa, Jpb;
-            self->wd("a", xs, da_l, da, Jda);
-            self->wd("b", xs, db_l, db, Jdb);
+            Vector3d pa, pb; MatrixXd Jpa, Jpb;
             self->wp("a", xs, pa_l, pa, Jpa);
             self->wp("b", xs, pb_l, pb, Jpb);
-            MatrixXd Jm = self->empty_jac(5);
-            Vector3d sdb = sign * db;
-            Jm.block(0, 0, 3, self->icols()) =
-                self->place("a", (-skew(sdb) * Jda).eval())
-                + self->place("b", (skew(da) * (sign * Jdb)).eval());
-            Vector3d diff = pb - pa;
-            MatrixXd Jdiff = self->place("b", Jpb) - self->place("a", Jpa);
-            Jm.block(3, 0, 2, self->icols()) =
-                perp_residual2_jac(da, self->place("a", Jda), diff, Jdiff);
-            return Jm;
+            return MatrixXd(self->place("a", Jpa) - self->place("b", Jpb));
         };
-        return {rfunc, jfunc, 5};
+        return {rfunc, jfunc, 3};
     }
 
     // ----- parallel / perpendicular / angle -------------------------------
@@ -710,10 +659,10 @@ private:
                 self->wd("b", xs, axis_b, b, unused);
                 self->wp("a", xs, pa_l, pa, unused);
                 self->wp("b", xs, pb_l, pb, unused);
-                VectorXd r(6);
-                r.head(2) = two_indep_cross(a, b);
-                r.segment(2, 3) = pb - pa;
-                r(5) = angle_r(xs)(0);
+                VectorXd r(7);
+                r.head(3) = unit(a) - unit(b);
+                r.segment(3, 3) = pb - pa;
+                r(6) = angle_r(xs)(0);
                 return r;
             };
             jfunc = [=](const VectorXd& xs) {
@@ -722,15 +671,14 @@ private:
                 self->wd("b", xs, axis_b, b, Jb);
                 self->wp("a", xs, pa_l, pa, Jpa);
                 self->wp("b", xs, pb_l, pb, Jpb);
-                MatrixXd out = self->empty_jac(6);
-                const MatrixXd cross_jac = self->place("a", (-skew(b) * Ja).eval())
-                    + self->place("b", (skew(a) * Jb).eval());
-                out.topRows(2) = two_indep_cross_jac(a, b, self->place("a", Ja), cross_jac);
-                out.middleRows(2, 3) = self->place("b", Jpb) - self->place("a", Jpa);
+                MatrixXd out = self->empty_jac(7);
+                out.topRows(3) = self->place("a", (unit_jacobian(a) * Ja).eval())
+                    - self->place("b", (unit_jacobian(b) * Jb).eval());
+                out.middleRows(3, 3) = self->place("b", Jpb) - self->place("a", Jpa);
                 out.bottomRows(1) = angle_j(xs);
                 return out;
             };
-            return {rfunc, jfunc, 6};
+            return {rfunc, jfunc, 7};
         }
         return {rfunc, jfunc, 1};
     }
@@ -811,9 +759,9 @@ private:
             self->wd("b", xs, db_l, db, Jd);
             self->wp("a", xs, pa_l, pa, Jd);
             self->wp("b", xs, pb_l, pb, Jd);
-            VectorXd r(4);
-            r.head(2) = two_indep_cross(da, sign * db);
-            r.segment(2, 2) = perp_residual2(da, pb - pa);
+            VectorXd r(5);
+            r.head(3) = unit(da) - sign * unit(db);
+            r.segment(3, 2) = perp_residual2(da, pb - pa);
             return r;
         };
         J jfunc = [=](const VectorXd& xs) {
@@ -823,19 +771,17 @@ private:
             self->wd("b", xs, db_l, db, Jdb);
             self->wp("a", xs, pa_l, pa, Jpa);
             self->wp("b", xs, pb_l, pb, Jpb);
-            MatrixXd Jm = self->empty_jac(4);
-            Vector3d sdb = sign * db;
-            MatrixXd cross_jac = self->place("a", (-skew(sdb) * Jda).eval())
-                + self->place("b", (skew(da) * (sign * Jdb)).eval());
-            Jm.block(0, 0, 2, self->icols()) =
-                two_indep_cross_jac(da, sdb, self->place("a", Jda), cross_jac);
+            MatrixXd Jm = self->empty_jac(5);
+            Jm.block(0, 0, 3, self->icols()) =
+                self->place("a", (unit_jacobian(da) * Jda).eval())
+                - sign * self->place("b", (unit_jacobian(db) * Jdb).eval());
             Vector3d diff = pb - pa;
             MatrixXd Jdiff = self->place("b", Jpb) - self->place("a", Jpa);
-            Jm.block(2, 0, 2, self->icols()) =
+            Jm.block(3, 0, 2, self->icols()) =
                 perp_residual2_jac(da, self->place("a", Jda), diff, Jdiff);
             return Jm;
         };
-        return {rfunc, jfunc, 4};
+        return {rfunc, jfunc, 5};
     }
 
     // ----- distance -------------------------------------------------------

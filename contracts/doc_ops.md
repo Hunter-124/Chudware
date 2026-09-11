@@ -581,3 +581,13 @@ are dimensionless normalized-vector chord components; their rank is two at a
 valid alignment. Coincident pin origins and the free angular coordinate remain
 unchanged. Contradictory orientation constraints refuse convergence rather than
 accepting a disconnected half-turn branch. No solve tolerance is widened.
+
+## 18. Oriented coaxial and prescribed pin alignment (2026-09-11)
+
+The oriented-axis rule also applies to concentric mates, coincident axis/axis
+mates, and explicit-line angle mates. Concentric and coincident axis/axis mates
+honor `align` while retaining free axial translation and rotation. An explicit
+angle pin retains its authored direction as well as its prescribed phase and
+coincident origin; satisfying only the phase with a reversed pin is invalid.
+Its existing phase-alignment convention is unchanged. Point coincidence and
+ordinary direction-only angle mates keep their existing constraints.

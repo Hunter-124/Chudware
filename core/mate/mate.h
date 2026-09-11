@@ -71,8 +71,8 @@ struct MateStatus {
 
 // Per-mate residual at the solved configuration. `max_abs` is the largest absolute
 // entry of the mate's residual block: mm for the positional rows (offset from the
-// axis / plane it asks for), dimensionless for the direction rows (cross-product
-// or oriented unit-vector chord components), RADIANS for an angle mate (which is
+// axis / plane it asks for), dimensionless for the direction rows (oriented
+// direction-vector differences or dot products), RADIANS for an angle mate (which is
 // a signed angle about its reference axis, not a dot product — see mate.cpp::angle).
 // `norm` is the block's 2-norm.
 // Reported for every mate that produced residual rows, worst first, so a solve that

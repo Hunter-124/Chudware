@@ -32,32 +32,33 @@
       background: #12181c;
       color: #e6edf3;
       font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
-      /* Safe-area for notched phones (fullscreen PWA / iOS Safari). */
-      padding: env(safe-area-inset-top) env(safe-area-inset-right)
-               env(safe-area-inset-bottom) env(safe-area-inset-left);
       box-sizing: border-box;
-      touch-action: none;
       -webkit-user-select: none;
       user-select: none;
+    }
+    /* Safe areas are applied exactly once, to the visual viewport surface. */
+    #app-surface {
+      position: fixed;
+      left: calc(var(--viewport-left, 0px) + env(safe-area-inset-left, 0px));
+      top: calc(var(--viewport-top, 0px) + env(safe-area-inset-top, 0px));
+      width: max(1px, calc(var(--viewport-width, 100vw) - env(safe-area-inset-left, 0px) - env(safe-area-inset-right, 0px)));
+      height: max(1px, calc(var(--viewport-height, 100vh) - env(safe-area-inset-top, 0px) - env(safe-area-inset-bottom, 0px)));
+      overflow: hidden;
     }
     #canvas {
       display: block;
       width: 100%;
       height: 100%;
-      /* Fill the content box after safe-area padding so the GL surface
-         doesn't sit under the notch/home indicator. */
-      width: 100vw;
-      height: 100vh;
-      width: 100dvw;
-      height: 100dvh;
+      position: absolute;
+      inset: 0;
       background: #0f1418;
       outline: none;
       touch-action: none;
     }
     #status {
-      position: fixed;
-      left: max(12px, env(safe-area-inset-left));
-      bottom: max(12px, env(safe-area-inset-bottom));
+      position: absolute;
+      left: 12px;
+      bottom: 60px;
       padding: 6px 10px;
       border-radius: 6px;
       background: rgba(0, 0, 0, 0.55);
@@ -104,23 +105,34 @@
     /* On-screen camera HUD — only shown on narrow / touch viewports. */
     #mobile-hud {
       display: none;
-      position: fixed;
+      position: absolute;
       z-index: 20;
-      right: max(10px, env(safe-area-inset-right));
-      bottom: calc(max(16px, env(safe-area-inset-bottom)) + 32px);
-      flex-direction: column;
-      gap: 8px;
-      pointer-events: none;
+      left: 0;
+      right: 0;
+      bottom: 0;
+      height: 56px;
+      padding: 4px;
+      box-sizing: border-box;
+      align-items: center;
+      gap: 4px;
+      overflow-x: auto;
+      overflow-y: hidden;
+      scrollbar-width: none;
+      overscroll-behavior: contain;
+      touch-action: pan-x;
+      pointer-events: auto;
     }
     #mobile-hud.visible { display: flex; }
+    #mobile-hud::-webkit-scrollbar { display: none; }
     #mobile-hud .hud-row {
       display: flex;
-      gap: 8px;
-      justify-content: flex-end;
+      gap: 4px;
+      flex-shrink: 0;
       pointer-events: none;
     }
     #mobile-hud button {
       pointer-events: auto;
+      flex-shrink: 0;
       width: 48px;
       height: 48px;
       min-width: 48px;
@@ -158,41 +170,55 @@
       padding: 0 14px;
       font-size: 12px;
     }
-    @media (max-width: 900px), (pointer: coarse) {
-      #mobile-hud { display: flex; }
-    }
-    @media (max-width: 900px) and (max-height: 600px) and (orientation: landscape),
-           (pointer: coarse) and (max-height: 600px) and (orientation: landscape) {
-      #mobile-hud {
-        flex-direction: row;
-        align-items: center;
-        /* The compact sketch banner owns the thin strip immediately above this row.
-           Sit just three pixels above the ImGui status bar at 447px-high landscape
-           instead of consuming that banner strip with the taller mobile clearance. */
-        bottom: calc(max(0px, env(safe-area-inset-bottom)) + 32px);
-      }
+    #mobile-hud [hidden] { display: none; }
+    #mobile-hud.text-input .camera-controls,
+    #mobile-hud.text-input [data-cmd="undo"] { display: none; }
+    #mobile-input {
+      position: absolute;
+      z-index: 19;
+      width: 2px;
+      min-height: 16px;
+      margin: 0;
+      padding: 0;
+      border: 0;
+      outline: none;
+      resize: none;
+      overflow: hidden;
+      font: 16px/1 system-ui, sans-serif;
+      opacity: 0.01;
+      pointer-events: none;
+      -webkit-user-select: text;
+      user-select: text;
+      touch-action: manipulation;
     }
   </style>
 </head>
 <body>
-  <canvas id="canvas" tabindex="0" oncontextmenu="event.preventDefault()"></canvas>
-  <div id="status">Loading Chudware…</div>
-  <div id="unsupported" role="alert" aria-live="assertive"><div class="wrap"
-       id="unsupported-body"></div></div>
-  <div id="mobile-hud" aria-label="Camera controls">
+  <div id="app-surface">
+    <canvas id="canvas" tabindex="0" aria-label="Chudware modeling workspace" oncontextmenu="event.preventDefault()"></canvas>
+    <textarea id="mobile-input" aria-label="Keyboard input for the selected Chudware field"
+              tabindex="-1" autocomplete="off" autocorrect="off" autocapitalize="off"
+              spellcheck="false" enterkeyhint="enter"></textarea>
+    <div id="status">Loading Chudware…</div>
+  <div id="mobile-hud" role="toolbar" aria-label="Workspace and camera controls">
     <div class="hud-row">
-      <button type="button" data-cmd="menu" class="wide" title="Toggle panels">Menu</button>
+      <button type="button" data-cmd="files" class="wide" title="Toggle files and feature tree">Files</button>
+      <button type="button" data-cmd="chat" class="wide" title="Toggle chat">Chat</button>
+      <button type="button" data-cmd="keyboard" class="wide" title="Open software keyboard" hidden>Keyboard</button>
       <button type="button" data-cmd="undo" title="Undo">↶</button>
     </div>
-    <div class="hud-row">
+    <div class="hud-row camera-controls">
       <button type="button" data-cmd="orbit" class="active" title="Orbit mode">Orbit</button>
       <button type="button" data-cmd="pan" title="Pan mode">Pan</button>
     </div>
-    <div class="hud-row">
+    <div class="hud-row camera-controls">
       <button type="button" data-cmd="zoom_in" title="Zoom in">＋</button>
       <button type="button" data-cmd="zoom_out" title="Zoom out">－</button>
     </div>
   </div>
+  </div>
+  <div id="unsupported" role="alert" aria-live="assertive"><div class="wrap"
+       id="unsupported-body"></div></div>
   <script type="text/javascript">
     window.__chudwareLogs = [];
     function chudwareLog(kind, text) {
@@ -221,10 +247,8 @@
     //     PTHREAD_POOL_SIZE=8 (host/CMakeLists.txt), so the worker pool cannot start
     //     without shared memory
     //   * WebGL2                            — MAX_WEBGL_VERSION=2, the only renderer
-    // Without this check a browser missing any of them downloaded ~12 MB and then sat
-    // on "Loading Chudware…" or printed a raw "Exception: …", which is what an iPhone
-    // in Lockdown Mode does: Lockdown Mode disables WebAssembly in Safari outright.
-    // Lockdown Mode is per-site excludable, so this is an instruction, not an apology.
+    // Missing capabilities can reflect browser version, security policy, extensions,
+    // GPU availability or server isolation headers; detect requirements, not causes.
     (function preflight() {
       var isApple = /iPad|iPhone|iPod/.test(navigator.userAgent) ||
                     (/Mac/.test(navigator.userAgent) && 'ontouchend' in document);
@@ -251,25 +275,17 @@
 
       var html = '<h1>Chudware can\u2019t run in this browser</h1>' +
                  '<p class="why">' + reason + '</p>';
-      // Any missing hard requirement on an Apple browser: Lockdown Mode is the cause worth
-      // naming first. Newer Safari runs JIT-less Wasm under Lockdown Mode but still withholds
-      // shared memory, so keying this on WebAssembly alone would send those users the generic
-      // "use a current browser" text while they are already on the newest one.
       if (isApple && missing.length) {
         html +=
-          '<p><strong>Lockdown Mode is the usual cause.</strong> It disables WebAssembly and ' +
-          'shared memory in Safari, and WebAssembly is what Chudware is compiled to. You can ' +
-          'keep Lockdown Mode on everywhere else and allow just this site:</p>' +
-          '<ol>' +
-          '<li>Open this page in Safari and tap <code>a\u1d00</code> in the address bar.</li>' +
-          '<li>Choose <em>Turn off Lockdown Mode\u2026</em> \u2192 <em>Turn Off for This ' +
-          'Website</em>, then reload.</li>' +
-          '</ol>' +
-          '<p class="dim">Same exclusion from Settings: <em>Privacy &amp; Security</em> ' +
-          '\u2192 <em>Lockdown Mode</em> \u2192 <em>Configure Web Browsing</em> \u2192 ' +
-          '<em>Excluded Safari Websites</em>.</p>' +
-          '<p class="dim">If Lockdown Mode is already off for this site, the browser is ' +
-          'simply too old \u2014 Chudware needs Safari 16.4 or newer.</p>';
+          '<p>Chudware requires WebAssembly, shared memory and WebGL2. Use an up-to-date ' +
+          'Safari and check browser or device restrictions. WebGL2 can also be unavailable ' +
+          'because of GPU or browser settings.</p>' +
+          '<p>If you use Lockdown Mode, its restrictions may affect these capabilities. ' +
+          'Only if you trust this site and your security needs allow it, consider a per-site ' +
+          'exception in Safari or Settings. This check cannot determine whether Lockdown ' +
+          'Mode is enabled.</p>' +
+          '<p class="dim">Shared memory also requires cross-origin isolation. Network filters ' +
+          'or extensions can interfere with the required server headers.</p>';
       } else if (missing.length) {
         html +=
           '<p>Chudware runs as WebAssembly with a shared-memory worker pool and WebGL2. ' +
@@ -295,161 +311,308 @@
       var hud = document.getElementById('mobile-hud');
       if (hud) hud.style.display = 'none';
     })();
-    // ---- DPR-aware canvas sizing helpers ----------------------------------------
-    function syncCanvasBackingStore(c) {
-      if (!c) return;
-      try {
-        var r = c.getBoundingClientRect();
-        var dpr = window.devicePixelRatio || 1;
-        var w = Math.max(64, Math.floor(r.width * dpr));
-        var h = Math.max(64, Math.floor(r.height * dpr));
-        if (c.width !== w) c.width = w;
-        if (c.height !== h) c.height = h;
-      } catch (e) {}
+    var runtimeReady = false;
+    var surface = document.getElementById('app-surface');
+    var hud = document.getElementById('mobile-hud');
+    function mobileSurface() {
+      return surface.clientWidth <= 900 || window.matchMedia('(pointer: coarse)').matches;
+    }
+    function refreshHudVisibility() {
+      hud.classList.toggle('visible', runtimeReady && !window.__chudwareUnsupported && mobileSurface());
+    }
+    function syncSurface() {
+      var vv = window.visualViewport;
+      surface.style.setProperty('--viewport-left', (vv ? vv.offsetLeft : 0) + 'px');
+      surface.style.setProperty('--viewport-top', (vv ? vv.offsetTop : 0) + 'px');
+      surface.style.setProperty('--viewport-width', (vv ? vv.width : window.innerWidth) + 'px');
+      surface.style.setProperty('--viewport-height', (vv ? vv.height : window.innerHeight) + 'px');
+      refreshHudVisibility();
+      // GLFW observes #app-surface and owns canvas backing-store changes after startup.
+    }
+    syncSurface();
+    window.addEventListener('resize', syncSurface);
+    window.addEventListener('orientationchange', syncSurface);
+    window.matchMedia('(pointer: coarse)').addEventListener('change', refreshHudVisibility);
+    if (window.visualViewport) {
+      window.visualViewport.addEventListener('resize', syncSurface);
+      window.visualViewport.addEventListener('scroll', syncSurface);
     }
 
-    // ---- Touch → pointer bridge for ImGui (single finger = left click/drag) ----
-    // Multitouch (2+ fingers) is handled natively in app.cpp; we only synthesize
-    // mouse-like pointer events for the single-finger case so ImGui receives input.
+    // ---- Canvas-only touch → GLFW mouse bridge ---------------------------------
+    window.__chudwareTouches = [];
     (function installTouchBridge() {
       var canvas = document.getElementById('canvas');
-      if (!canvas) return;
+      var ids = new Set();
       var activeId = null;
-      var lastX = 0, lastY = 0;
-      var multi = false;
+      var lastX = 0, lastY = 0, startX = 0, startY = 0;
+      var pressed = false, multi = false, scrolling = false;
+      var lastTouchAt = -Infinity;
 
-      function clientToCanvas(t) {
-        var r = canvas.getBoundingClientRect();
-        return {
-          x: t.clientX - r.left,
-          y: t.clientY - r.top,
-          clientX: t.clientX,
-          clientY: t.clientY
-        };
+      function fire(type, buttons) {
+        canvas.dispatchEvent(new MouseEvent(type, {
+          bubbles: true, cancelable: true, view: window,
+          clientX: lastX, clientY: lastY, button: 0, buttons: buttons
+        }));
       }
-      function fire(type, x, y, clientX, clientY, buttons) {
-        // Prefer PointerEvent so ImGui_ImplGlfw (pointer path) sees it; fall back to MouseEvent.
-        var opts = {
-          bubbles: true,
-          cancelable: true,
-          view: window,
-          clientX: clientX,
-          clientY: clientY,
-          screenX: clientX,
-          screenY: clientY,
-          button: 0,
-          buttons: buttons,
-          pointerId: 1,
-          pointerType: 'touch',
-          isPrimary: true,
-          width: 1,
-          height: 1,
-          pressure: buttons ? 0.5 : 0
-        };
-        try {
-          if (typeof PointerEvent === 'function') {
-            canvas.dispatchEvent(new PointerEvent(type, opts));
-            return;
+      function release(cancel) {
+        if (pressed) {
+          if (cancel) {
+            var x = lastX, y = lastY;
+            lastX = lastY = -10000;
+            fire('mousemove', 1);
+            fire('mouseup', 0);
+            lastX = x; lastY = y;
+          } else {
+            fire('mouseup', 0);
           }
-        } catch (e) {}
-        var mtype = type === 'pointerdown' ? 'mousedown'
-                  : type === 'pointerup' || type === 'pointercancel' ? 'mouseup'
-                  : 'mousemove';
-        try {
-          canvas.dispatchEvent(new MouseEvent(mtype, opts));
-        } catch (e2) {}
+          pressed = false;
+        }
       }
-
+      function track(ev) {
+        var rect = canvas.getBoundingClientRect();
+        var touches = [];
+        var remaining = new Set();
+        for (var i = 0; i < ev.touches.length; ++i) {
+          var t = ev.touches[i];
+          if (!ids.has(t.identifier)) continue;
+          remaining.add(t.identifier);
+          touches.push({ id: t.identifier, x: t.clientX - rect.left, y: t.clientY - rect.top });
+        }
+        ids = remaining;
+        window.__chudwareTouches = touches;
+        lastTouchAt = performance.now();
+        if (ev.cancelable) ev.preventDefault();
+      }
       canvas.addEventListener('touchstart', function(ev) {
-        if (ev.touches.length >= 2) {
-          // Hand multitouch to C++ (gesture); cancel any single-finger synthetic press.
+        for (var i = 0; i < ev.changedTouches.length; ++i)
+          ids.add(ev.changedTouches[i].identifier);
+        track(ev);
+        if (ids.size >= 2) {
           multi = true;
-          if (activeId !== null) {
-            fire('pointerup', lastX, lastY, lastX, lastY, 0);
-            activeId = null;
-          }
-          // Still preventDefault so the page doesn't scroll/zoom under us.
-          if (ev.cancelable) ev.preventDefault();
+          release(true);
+          activeId = null;
+          scrolling = false;
           return;
         }
-        multi = false;
+        if (multi || activeId !== null || !runtimeReady) return;
         var t = ev.changedTouches[0];
         activeId = t.identifier;
-        var p = clientToCanvas(t);
-        lastX = p.clientX; lastY = p.clientY;
-        canvas.focus();
-        fire('pointerdown', p.x, p.y, p.clientX, p.clientY, 1);
-        if (ev.cancelable) ev.preventDefault();
+        lastX = startX = t.clientX;
+        lastY = startY = t.clientY;
+        canvas.focus({ preventScroll: true });
+        // contrib GLFW listens for mouse events, not PointerEvents. Position must
+        // reach GLFW before the press or the click uses the previous cursor position.
+        fire('mousemove', 0);
+        pressed = true;
+        fire('mousedown', 1);
       }, { passive: false });
-
       canvas.addEventListener('touchmove', function(ev) {
-        if (multi || ev.touches.length >= 2) {
-          multi = true;
-          if (ev.cancelable) ev.preventDefault();
-          return;
-        }
-        if (activeId === null) return;
-        var t = null;
+        track(ev);
+        if (multi || activeId === null) return;
         for (var i = 0; i < ev.changedTouches.length; ++i) {
-          if (ev.changedTouches[i].identifier === activeId) { t = ev.changedTouches[i]; break; }
-        }
-        if (!t) return;
-        var p = clientToCanvas(t);
-        lastX = p.clientX; lastY = p.clientY;
-        fire('pointermove', p.x, p.y, p.clientX, p.clientY, 1);
-        if (ev.cancelable) ev.preventDefault();
-      }, { passive: false });
-
-      function endTouch(ev) {
-        if (ev.touches && ev.touches.length >= 2) {
-          multi = true;
-          if (ev.cancelable) ev.preventDefault();
-          return;
-        }
-        if (activeId === null) {
-          // Leaving multitouch back to zero fingers — just clear multi flag.
-          if (!ev.touches || ev.touches.length === 0) multi = false;
-          if (ev.cancelable) ev.preventDefault();
-          return;
-        }
-        var t = null;
-        for (var i = 0; i < ev.changedTouches.length; ++i) {
-          if (ev.changedTouches[i].identifier === activeId) { t = ev.changedTouches[i]; break; }
-        }
-        if (!t) {
-          // Another finger ended; if no fingers left, cancel synthetic press.
-          if (!ev.touches || ev.touches.length === 0) {
-            fire('pointerup', lastX, lastY, lastX, lastY, 0);
-            activeId = null;
-            multi = false;
+          var t = ev.changedTouches[i];
+          if (t.identifier !== activeId) continue;
+          var deltaY = lastY - t.clientY;
+          lastX = t.clientX;
+          lastY = t.clientY;
+          if (!scrolling && window.__chudwareTouchScroll &&
+              Math.abs(lastY - startY) > 10 && Math.abs(lastY - startY) > Math.abs(lastX - startX)) {
+            scrolling = true;
+            release(true);
           }
-          if (ev.cancelable) ev.preventDefault();
-          return;
+          fire('mousemove', pressed ? 1 : 0);
+          if (scrolling && deltaY)
+            canvas.dispatchEvent(new WheelEvent('wheel', {
+              bubbles: true, cancelable: true, clientX: lastX, clientY: lastY,
+              deltaY: deltaY, deltaMode: 0
+            }));
+          break;
         }
-        var p = clientToCanvas(t);
-        fire('pointerup', p.x, p.y, p.clientX, p.clientY, 0);
-        activeId = null;
-        multi = (ev.touches && ev.touches.length >= 2);
-        if (ev.cancelable) ev.preventDefault();
+      }, { passive: false });
+      function endTouch(ev) {
+        track(ev);
+        for (var i = 0; i < ev.changedTouches.length; ++i) {
+          var t = ev.changedTouches[i];
+          if (t.identifier !== activeId) continue;
+          lastX = t.clientX;
+          lastY = t.clientY;
+          fire('mousemove', pressed ? 1 : 0);
+          release(ev.type === 'touchcancel');
+          activeId = null;
+          scrolling = false;
+        }
+        if (ev.type === 'touchcancel') {
+          release(true);
+          activeId = null;
+          scrolling = false;
+          multi = ids.size > 0;
+        }
+        // A 2→1 transition never starts a fresh drag; wait for all canvas fingers up.
+        if (!ids.size) {
+          release();
+          activeId = null;
+          multi = scrolling = false;
+        }
       }
       canvas.addEventListener('touchend', endTouch, { passive: false });
       canvas.addEventListener('touchcancel', endTouch, { passive: false });
+      window.addEventListener('blur', function() {
+        release(true);
+        activeId = null;
+        ids.clear();
+        window.__chudwareTouches = [];
+        multi = scrolling = false;
+      });
+      // preventDefault normally cancels compatibility mouse events. Also block
+      // browsers that deliver them anyway, before GLFW's document capture listeners.
+      ['mousedown', 'mouseup', 'mousemove', 'click', 'dblclick'].forEach(function(type) {
+        window.addEventListener(type, function(ev) {
+          if (ev.target !== canvas || !ev.isTrusted) return;
+          var fromTouch = ev.sourceCapabilities ? ev.sourceCapabilities.firesTouchEvents
+                                               : performance.now() - lastTouchAt < 800;
+          if (fromTouch) {
+            ev.preventDefault();
+            ev.stopImmediatePropagation();
+          }
+        }, true);
+      });
     })();
 
     // ---- Mobile HUD → WASM ccall -------------------------------------------------
     function callChudware(name, sig, args) {
+      if (!runtimeReady || window.__chudwareUnsupported) return null;
       try {
         if (typeof Module !== 'undefined' && typeof Module.ccall === 'function') {
           return Module.ccall(name, null, sig || [], args || []);
         }
-        // Fallback: direct underscore export (KEEPALIVE symbols).
+        // Numeric KEEPALIVE calls may use direct exports; UTF-8 strings require ccall.
         var fn = (typeof Module !== 'undefined') ? Module['_' + name] : null;
-        if (typeof fn === 'function') return fn.apply(null, args || []);
+        if (typeof fn === 'function' && (!sig || sig.indexOf('string') < 0))
+          return fn.apply(null, args || []);
       } catch (e) {
         chudwareLog('err', 'hud call ' + name + ': ' + e);
       }
       return null;
     }
+    // The textarea is a transient IME/clipboard buffer, not a second document.
+    // A sentinel gives software keyboards something to delete even between commits.
+    var textInput = document.getElementById('mobile-input');
+    var textInputWanted = false;
+    var composing = false;
+    var compositionCommit = null;
+    var compositionResetTimer = 0;
+    var inputSentinel = '\u200b';
+    function resetTextInput() {
+      textInput.value = inputSentinel;
+      textInput.setSelectionRange(1, 1);
+    }
+    function sendInputKey(key) {
+      if (textInputWanted)
+        callChudware('chudware_mobile_key', ['number'], [key]);
+    }
+    function sendInputText(text) {
+      if (!textInputWanted || !text) return;
+      // A pasted newline is text, not the Enter shortcut that submits a composer.
+      callChudware('chudware_mobile_text', ['string'], [text.replace(/\r\n?/g, '\n')]);
+    }
+    resetTextInput();
+    window.chudwareTextInput = function(visible, x, y, lineHeight) {
+      var wanted = !!visible && runtimeReady && mobileSurface();
+      textInputWanted = wanted;
+      hud.classList.toggle('text-input', wanted);
+      hud.querySelector('[data-cmd="keyboard"]').hidden = !wanted;
+      if (!wanted) {
+        if (document.activeElement === textInput) textInput.blur();
+        return;
+      }
+      // Keep the real focus target at the ImGui caret, inside the visible editor
+      // above the reserved HUD strip. 16px font avoids Safari's focus zoom.
+      var height = Math.max(16, Math.min(Number(lineHeight) || 16, 48));
+      textInput.style.left = Math.max(0, Math.min(Number(x) || 0, surface.clientWidth - 2)) + 'px';
+      textInput.style.top = Math.max(0, Math.min(Number(y) || 0, surface.clientHeight - 56 - height)) + 'px';
+      textInput.style.height = height + 'px';
+      // Do not focus here: this callback runs outside a trusted user gesture.
+    };
+    ['keydown', 'keyup', 'keypress'].forEach(function(type) {
+      window.addEventListener(type, function(ev) {
+        if (hud.contains(ev.target)) {
+          ev.stopImmediatePropagation();
+          return;
+        }
+        if (ev.target !== textInput) return;
+        ev.stopImmediatePropagation();
+        if (type !== 'keydown' || composing || ev.isComposing || ev.keyCode === 229) return;
+        var key = ev.key === 'Backspace' ? 0 : ev.key === 'Enter' ? 1 : ev.key === 'Escape' ? 2 : -1;
+        if (key >= 0) {
+          ev.preventDefault();
+          sendInputKey(key);
+          resetTextInput();
+          if (key === 2) textInput.blur();
+        }
+      }, true);
+    });
+    textInput.addEventListener('beforeinput', function(ev) {
+      ev.stopPropagation();
+      if (composing || ev.isComposing || !ev.cancelable) return;
+      var type = ev.inputType || '';
+      if (type.indexOf('delete') === 0 || type === 'insertParagraph' || type === 'insertLineBreak') {
+        ev.preventDefault();
+        sendInputKey(type.indexOf('delete') === 0 ? 0 : 1);
+        resetTextInput();
+      }
+    });
+    textInput.addEventListener('input', function(ev) {
+      ev.stopPropagation();
+      if (composing || ev.isComposing) return;
+      var type = ev.inputType || '';
+      // Some engines emit the final input before compositionend, others after.
+      // compositionend commits once; its trailing input must never commit again.
+      if (compositionCommit !== null &&
+          (type === 'insertCompositionText' || type === 'insertFromComposition' || ev.data === compositionCommit)) {
+        resetTextInput();
+        return;
+      }
+      if (type.indexOf('delete') === 0) sendInputKey(0);
+      else if (type === 'insertParagraph' || type === 'insertLineBreak') sendInputKey(1);
+      else {
+        var value = textInput.value;
+        sendInputText(value.charAt(0) === inputSentinel ? value.slice(1) : value);
+      }
+      resetTextInput();
+    });
+    textInput.addEventListener('compositionstart', function(ev) {
+      ev.stopPropagation();
+      clearTimeout(compositionResetTimer);
+      composing = true;
+      compositionCommit = null;
+    });
+    textInput.addEventListener('compositionend', function(ev) {
+      ev.stopPropagation();
+      composing = false;
+      compositionCommit = ev.data || '';
+      sendInputText(compositionCommit);
+      resetTextInput();
+      compositionResetTimer = setTimeout(function() {
+        compositionCommit = null;
+        if (!composing) resetTextInput();
+      }, 0);
+    });
+    textInput.addEventListener('paste', function(ev) {
+      ev.stopPropagation();
+      if (!ev.clipboardData || composing) return;
+      ev.preventDefault();
+      sendInputText(ev.clipboardData.getData('text/plain'));
+      resetTextInput();
+    });
+    ['focus', 'blur'].forEach(function(type) {
+      textInput.addEventListener(type, function() {
+        var focused = document.activeElement === textInput;
+        var button = hud.querySelector('[data-cmd="keyboard"]');
+        button.textContent = focused ? 'Hide keyboard' : 'Keyboard';
+        button.setAttribute('aria-pressed', String(focused));
+      });
+    });
+
 
     (function installHud() {
       var hud = document.getElementById('mobile-hud');
@@ -460,23 +623,20 @@
         if (orbit) orbit.classList.toggle('active', mode === 0);
         if (pan) pan.classList.toggle('active', mode === 1);
       }
-      // Show HUD on coarse pointer / narrow CSS width (CSS media also gates it).
-      function refreshHudVisibility() {
-        var narrow = window.matchMedia('(max-width: 900px)').matches;
-        var coarse = window.matchMedia('(pointer: coarse)').matches;
-        hud.classList.toggle('visible', narrow || coarse);
-      }
-      refreshHudVisibility();
-      window.addEventListener('resize', refreshHudVisibility);
-      window.addEventListener('orientationchange', refreshHudVisibility);
-
-      hud.addEventListener('pointerdown', function(ev) {
-        // Stop the synthetic events from also hitting the canvas underneath.
-        ev.stopPropagation();
+      // Keep DOM controls away from GLFW document listeners without preventing
+      // native button activation, horizontal HUD scrolling or textarea focus.
+      ['mousedown', 'mouseup', 'mousemove', 'pointerdown', 'pointerup',
+       'touchstart', 'touchmove', 'touchend', 'touchcancel'].forEach(function(type) {
+        window.addEventListener(type, function(ev) {
+          if (hud.contains(ev.target) || ev.target === textInput) {
+            if (type === 'mousedown' && hud.contains(ev.target)) ev.preventDefault();
+            ev.stopPropagation();
+          }
+        }, { capture: true, passive: false });
       });
       hud.addEventListener('click', function(ev) {
         var btn = ev.target.closest('button[data-cmd]');
-        if (!btn) return;
+        if (!btn || !runtimeReady) return;
         ev.preventDefault();
         ev.stopPropagation();
         var cmd = btn.getAttribute('data-cmd');
@@ -498,8 +658,21 @@
           case 'undo':
             callChudware('chudware_mobile_undo', [], []);
             break;
-          case 'menu':
-            callChudware('chudware_mobile_toggle_menu', [], []);
+          case 'files':
+            callChudware('chudware_mobile_toggle_panel', ['number'], [0]);
+            break;
+          case 'chat':
+            callChudware('chudware_mobile_toggle_panel', ['number'], [1]);
+            break;
+          case 'keyboard':
+            // This must remain synchronous inside a trusted tap for iOS Safari.
+            if (ev.isTrusted && textInputWanted) {
+              if (document.activeElement === textInput) textInput.blur();
+              else {
+                resetTextInput();
+                textInput.focus({ preventScroll: true });
+              }
+            }
             break;
         }
       });
@@ -518,8 +691,9 @@
           : undefined,
       canvas: (function() {
         var c = document.getElementById('canvas');
-        // Size the drawing buffer to CSS × DPR before first GL frame.
-        syncCanvasBackingStore(c);
+        // Bootstrap at CSS size only; GLFW owns DPR and the backing store.
+        c.width = Math.max(1, surface.clientWidth);
+        c.height = Math.max(1, surface.clientHeight);
         // Tab-backgrounding (or GPU memory pressure) can drop the WebGL context. preventDefault
         // lets the browser fire 'webglcontextrestored'; without a restore path the app's GL
         // resources (mesh VBOs, shaders, textures) are gone and the viewport stays blank —
@@ -562,6 +736,9 @@
         if (left > 0) setStatus('Loading… (' + left + ' remaining)');
       },
       onAbort: function(what) {
+        runtimeReady = false;
+        refreshHudVisibility();
+        window.chudwareTextInput(false, 0, 0, 16);
         setStatus('Aborted: ' + what, true);
         chudwareLog('err', 'abort: ' + what);
       },
@@ -570,11 +747,10 @@
       onRuntimeInitialized: function() {
         setStatus('Runtime ready');
         chudwareLog('out', 'onRuntimeInitialized');
+        runtimeReady = true;
+        syncSurface();
         var c = document.getElementById('canvas');
-        if (c) {
-          syncCanvasBackingStore(c);
-          c.focus();
-        }
+        if (c) c.focus({ preventScroll: true });
         // Cleared once the module has run healthily for a while, so an occasional
         // context loss later still gets its full reload budget.
         setTimeout(function() {

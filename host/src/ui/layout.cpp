@@ -36,6 +36,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#ifdef __EMSCRIPTEN__
+#include <emscripten.h>
+#endif
 
 // Overlay layout: the dockspace hosts ONLY the central document windows, tabbed in one node, so
 // the viewport runs edge to edge between the ribbon and the status bar. The FeatureManager and
@@ -347,6 +350,12 @@ void drawLeftPane(AppState& st,
 
     const auto& pal = ui::palette;
     const float S = ui::uiScale;
+#ifdef __EMSCRIPTEN__
+    const bool mobile = ImGui::GetIO().DisplaySize.x <= 900.0f ||
+                        EM_ASM_INT({ return window.matchMedia('(pointer: coarse)').matches; });
+#else
+    const bool mobile = false;
+#endif
 
     // ---- pinned-column geometry --------------------------------------------------------------
     // Anchored to the overlay band app.cpp publishes each frame (ribbon bottom -> status-bar top),
@@ -370,7 +379,8 @@ void drawLeftPane(AppState& st,
     // the top of the viewport band; the horizontal icon rail (fix 1) fills the space the doc tabs
     // used to occupy above it.
     const float colY = band.minY + topMargin;
-    const float colH = std::max(120.0f * S, band.maxY - margin - colY);
+    const float availableH = std::max(1.0f, band.maxY - margin - colY);
+    const float colH = mobile ? availableH : std::max(120.0f * S, availableH);
 
     // ONE bubble radius shared by the invisible window (clip/interaction shape) and the drawn
     // glass, so the user's per-group rounding knob can't desync the corners: the resolved
@@ -408,20 +418,25 @@ void drawLeftPane(AppState& st,
     // own buttons; unlike Electronics the size is NOT forced (FirstUseEver below), so the user keeps
     // the ability to widen it and the min-width constraint is what guarantees the fit.
     const bool mfgWs  = (st.activeWorkspace == AppState::Workspace::Manufacture);
-    const float minW = (mfgWs ? 360.0f : 250.0f) * panelSc;
+    const float availableW = std::max(1.0f, band.maxX - band.minX - margin * 2.0f);
+    const float minW = mobile ? std::min(availableW, 250.0f * panelSc)
+                             : (mfgWs ? 360.0f : 250.0f) * panelSc;
     // Electronics (PCB/Schematic Manager) runs a little wider than the Model FeatureManager — its
     // layer/net rows carry a swatch + label + eye toggle, so the extra width keeps them uncramped
     // (Hunter red-pen). Forced (Always) on that workspace so it reliably applies to the shared,
     // otherwise user-resized column; the doc-tab strip re-anchors to this edge each frame, so a wider
     // Electronics column just pushes its own tabs right — Model stays at its own persisted width.
     const bool ecadWs = (st.activeWorkspace == AppState::Workspace::Electronics);
-    const float defW = (ecadWs ? 360.0f : mfgWs ? 380.0f : 320.0f) * panelSc;
-    const float maxW = std::max(minW + 40.0f * S,
-                                std::min(560.0f * panelSc, (band.maxX - band.minX) * 0.42f));
-    const float winH = s_anim.tick(s_collapsed, colH);
+    const float defW = mobile ? std::min(availableW, 420.0f * panelSc)
+                             : (ecadWs ? 360.0f : mfgWs ? 380.0f : 320.0f) * panelSc;
+    const float maxW = mobile ? availableW
+                             : std::max(minW + 40.0f * S,
+                                        std::min(560.0f * panelSc, (band.maxX - band.minX) * 0.42f));
+    const float animatedH = s_anim.tick(s_collapsed, colH);
+    const float winH = mobile ? std::min(animatedH, colH) : animatedH;
     ImGui::SetNextWindowPos(ImVec2(colX, colY), ImGuiCond_Always);
     ImGui::SetNextWindowSize(ImVec2(defW, winH),
-                             (wantReset || ecadWs) ? ImGuiCond_Always : ImGuiCond_FirstUseEver);
+                             (mobile || wantReset || ecadWs) ? ImGuiCond_Always : ImGuiCond_FirstUseEver);
     ImGui::SetNextWindowSizeConstraints(ImVec2(minW, winH), ImVec2(maxW, winH));
     ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, bubbleDp * S);
     ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);

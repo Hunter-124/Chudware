@@ -15,6 +15,10 @@
 #include "../appearance_common.h"  // ui::kMaterials (material swatch colors)
 #include "../layout.h"        // ui::setEvalRibbonDock (Evaluate-tab inspector dock strip)
 #include "../web_capabilities.h"  // ui::webGapReason (T-RF12: WASM-build ribbon gating)
+#include "kit.h"
+#ifdef __EMSCRIPTEN__
+#include <emscripten.h>
+#endif
 
 #include <algorithm>
 #include <cmath>
@@ -1853,11 +1857,17 @@ float drawRibbon(int& activeTab, bool visible, bool showSimulationTools, bool sh
             }
     }
 
+#ifdef __EMSCRIPTEN__
+    const bool mobile = ImGui::GetIO().DisplaySize.x <= 900.0f ||
+                        EM_ASM_INT({ return window.matchMedia('(pointer: coarse)').matches; });
+#else
+    const bool mobile = false;
+#endif
     float s      = ui::uiScale;
-    float tabH   = kTabH  * s;
+    float tabH   = mobile ? ui::metrics::px(44.0f) : kTabH * s;
     // Shared snapped body height — panel, buttons, caption, and chrome all use this.
-    float bodyH2 = ribbon_bodyH();
-    float totalH = tabH + bodyH2 + kBottomPad * s;
+    float bodyH2 = mobile ? ui::metrics::px(44.0f) : ribbon_bodyH();
+    float totalH = (mobile ? tabH : tabH + bodyH2) + kBottomPad * s;
 
     ImGuiViewport* vp = ImGui::GetMainViewport();
     // Use the caller-provided ACTUAL title-bar height. The old self-computed GetFrameHeight() used
@@ -1910,6 +1920,21 @@ float drawRibbon(int& activeTab, bool visible, bool showSimulationTools, bool sh
     float tabX = wPos.x + 6.0f * s;
     float tabY = wPos.y + tabTopPad;
 
+    if (mobile) {
+        ImGui::SetCursorScreenPos(ImVec2(tabX, tabY));
+        ImGui::SetNextItemWidth(vp->Size.x * 0.5f - ui::metrics::px(8.0f));
+        ImGui::PushStyleVar(ImGuiStyleVar_FramePadding,
+                            ImVec2(ui::metrics::px(10.0f),
+                                   (tabH - ImGui::GetFontSize()) * 0.5f));
+        if (ImGui::BeginCombo("##ribbon_tabs", kRibbonTabs[activeTab])) {
+            for (int i = 0; i < kRibbonTabCount; ++i) {
+                if (!ribbon_tabVisible(i, showSimulationTools, showPcbTools, showDrawingTools)) continue;
+                if (ImGui::Selectable(kRibbonTabs[i], activeTab == i)) activeTab = i;
+            }
+            ImGui::EndCombo();
+        }
+        ImGui::PopStyleVar();
+    } else {
     for (int i = 0; i < kRibbonTabCount; ++i) {
         if (!ribbon_tabVisible(i, showSimulationTools, showPcbTools, showDrawingTools)) continue;
         const char* tabLabel = kRibbonTabs[i];
@@ -1965,6 +1990,7 @@ float drawRibbon(int& activeTab, bool visible, bool showSimulationTools, bool sh
                     ImGui::ColorConvertFloat4ToU32(lc), tabLabel);
 
         tabX += tw + 2.0f * s;
+    }
     }
 
     dl->AddLine(ImVec2(wPos.x,              wPos.y + tabH),
@@ -2043,7 +2069,7 @@ float drawRibbon(int& activeTab, bool visible, bool showSimulationTools, bool sh
     // any group has to be hidden. (The sketch Finish/Cancel controls now live inline in the Sketch
     // group's New-Sketch slot, so no right-edge cluster width is reserved anymore.)
     float chevronW  = 22.0f * s;                // reserved for overflow '»' button
-    float bodyW     = vp->Size.x - 8.0f * s;    // ##RibbonBody child width == the clip edge
+    float bodyW     = (mobile ? vp->Size.x * 0.5f : vp->Size.x) - 8.0f * s;
     float availW    = bodyW - chevronW;
 
     // Compute natural widths at COL_BIG (per-column small-zone measuring — defect 1)
@@ -2097,6 +2123,12 @@ float drawRibbon(int& activeTab, bool visible, bool showSimulationTools, bool sh
             natW[gi]            = 0.0f;
         }
     }
+    // Phones use the existing command overflow instead of spending the landscape
+    // viewport on a full-height ribbon. Every group and split-button variant remains available.
+    if (mobile) {
+        for (auto& group : groups) group.collapse = COL_HIDDEN;
+        std::fill(natW.begin(), natW.end(), 0.0f);
+    }
 
     // Determine if we need the chevron
     bool anyHidden = false;
@@ -2114,7 +2146,8 @@ float drawRibbon(int& activeTab, bool visible, bool showSimulationTools, bool sh
     // WindowPadding MUST be zero: theme default (~15×13 scaled) would offset SetCursorPos content
     // relative to GetWindowPos-based panel rects, so tiles and the group pill no longer share an
     // origin. Pad is applied explicitly via ribbon_groupPadY() so panel and buttons agree.
-    ImGui::SetCursorScreenPos(ImVec2(wPos.x + 4.0f * s, wPos.y + tabH + 2.0f * s));
+    ImGui::SetCursorScreenPos(ImVec2(wPos.x + (mobile ? vp->Size.x * 0.5f : 0.0f) + 4.0f * s,
+                                    wPos.y + (mobile ? 0.0f : tabH) + 2.0f * s));
     ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0, 0, 0, 0));
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.0f, 0.0f));
     ImGui::BeginChild("##RibbonBody",
@@ -2363,7 +2396,7 @@ float drawRibbon(int& activeTab, bool visible, bool showSimulationTools, bool sh
     // Evaluate-tab inspector dock: publish the dead space to the RIGHT of the last group so the
     // Zebra / Symmetry windows pin INSIDE the ribbon strip (Hunter red-pen: dock, don't float).
     // curX is the last group's right edge (child-local); the child spans vp->Size.x - 8*s.
-    if (std::strcmp(actTabName, "Evaluate") == 0) {
+    if (!mobile && std::strcmp(actTabName, "Evaluate") == 0) {
         const ImVec2 cwp = ImGui::GetWindowPos();
         const float gpad = kGroupPadX * s * 0.5f;
         const float dockL = cwp.x + curX + gpad + (anyHidden ? 26.0f * s : 0.0f);
@@ -2375,9 +2408,20 @@ float drawRibbon(int& activeTab, bool visible, bool showSimulationTools, bool sh
 
     // --- C25-W3G: overflow chevron ---
     if (anyHidden) {
-        float bh = ribbon_contentH();
-        if (ribbon_overflowChevron(curX + 2.0f * s, ribbon_groupPadY(), bh))
-            ImGui::OpenPopup("##ribbon_overflow");
+        if (mobile) {
+            ImGui::SetCursorPos(ImVec2(ui::metrics::px(2.0f), 0.0f));
+            if (ui::kit::secondaryButton("Commands", true, nullptr,
+                                         ImVec2(bodyW - ui::metrics::px(4.0f),
+                                                bodyH2 - ui::metrics::px(4.0f))))
+                ImGui::OpenPopup("##ribbon_overflow");
+            ImGui::SetNextWindowSizeConstraints(ImVec2(0, 0),
+                ImVec2(vp->Size.x - ui::metrics::px(12.0f),
+                       std::max(ui::metrics::px(44.0f), vp->Size.y - totalH - titleBarH)));
+        } else {
+            float bh = ribbon_contentH();
+            if (ribbon_overflowChevron(curX + 2.0f * s, ribbon_groupPadY(), bh))
+                ImGui::OpenPopup("##ribbon_overflow");
+        }
 
         if (ImGui::BeginPopup("##ribbon_overflow", ImGuiWindowFlags_NoMove)) {
             // Draw hidden groups as flyout rows using the same flyout style
@@ -2400,13 +2444,14 @@ float drawRibbon(int& activeTab, bool visible, bool showSimulationTools, bool sh
                 auto overflowRow = [&](const ui::RibbonCmd* cmd, float indent) {
                     bool enabled = ribbon_cmdEnabled(cmd);
                     ImVec2 cp0 = ImGui::GetCursorScreenPos();
-                    float rowH   = snap(ui::metrics::px(28.0f));
+                    float rowH   = snap(ui::metrics::px(mobile ? 44.0f : 28.0f));
                     float iconSz = snap(ui::metrics::px(20.0f));
                     float pad    = snap(ui::metrics::U(2));
                     float gapX   = snap(ui::metrics::px(6.0f));
                     float padX   = pad + indent;
                     float popW   = padX + iconSz + gapX +
                                    ImGui::CalcTextSize(cmd->label).x + pad;
+                    if (mobile) popW = std::min(popW, vp->Size.x - ui::metrics::px(36.0f));
 
                     ImGui::PushID(cmd->cmd_id);
                     ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(0, 0));
@@ -2434,7 +2479,13 @@ float drawRibbon(int& activeTab, bool visible, bool showSimulationTools, bool sh
                         float ty = snap(cp0.y + (rowH - ImGui::GetTextLineHeight()) * 0.5f);
                         ImU32 tCol = enabled ? ui::Palette::toU32(ui::palette.text)
                                              : ui::Palette::toU32(ui::palette.textDisabled);
-                        odl->AddText(nullptr, 0.0f, ImVec2(tx, ty), tCol, cmd->label);
+                        if (mobile) {
+                            const std::string label = ui::kit::elide(cmd->label,
+                                std::max(1.0f, popW - padX - iconSz - gapX - pad));
+                            odl->AddText(nullptr, 0.0f, ImVec2(tx, ty), tCol, label.c_str());
+                        } else {
+                            odl->AddText(nullptr, 0.0f, ImVec2(tx, ty), tCol, cmd->label);
+                        }
                     }
                     if (rowClicked && enabled) {
                         ribbon_fire(cmd->cmd_id);
@@ -2448,7 +2499,13 @@ float drawRibbon(int& activeTab, bool visible, bool showSimulationTools, bool sh
                         if (std::strcmp(sc->sub_of, cmd->cmd_id) == 0)
                             overflowRow(sc, ui::metrics::U(3));
                 }
-                for (const auto* cmd : grp.smCmds) overflowRow(cmd, 0.0f);
+                for (const auto* cmd : grp.smCmds) {
+                    overflowRow(cmd, 0.0f);
+                    if (mobile)
+                        for (const auto* sc : grp.subCmds)
+                            if (std::strcmp(sc->sub_of, cmd->cmd_id) == 0)
+                                overflowRow(sc, ui::metrics::U(3));
+                }
                 ImGui::Separator();
             }
             ImGui::EndPopup();

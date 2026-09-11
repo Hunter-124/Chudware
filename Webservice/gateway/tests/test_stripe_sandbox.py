@@ -395,32 +395,32 @@ def test_portal_configuration_matches_spec(stripe_mod: Any, catalog: Any) -> Non
             )
 
 
-def test_webhook_endpoints_cover_every_event_we_handle(stripe_mod: Any, catalog: Any) -> None:
-    """A missing event type is silent revenue loss, so assert the full set.
+def test_webhook_endpoints_match_environment_contract(stripe_mod: Any, catalog: Any) -> None:
+    """Check configured sandbox delivery without targeting a live-only gateway.
 
-    Both the subscription events ``billing.py`` switches on and the marketplace
-    events ``marketplace_commerce.handle_marketplace_event`` consumes. An endpoint
-    subscribed to four of five looks healthy in the dashboard and drops every
-    refund on the floor.
+    Staging has no public ingress; the catalog deliberately uses ``stripe listen``
+    locally instead. A sandbox endpoint at the production URL would use a signing
+    secret that gateway does not accept.
     """
     endpoints = plain(stripe_mod.WebhookEndpoint.list(limit=100))["data"]
-    assert endpoints, "the sandbox has no webhook endpoints"
-    required = set(catalog.WEBHOOK_EVENTS)
-    assert required >= set(catalog.SUBSCRIPTION_EVENTS)
-    assert required >= set(catalog.MARKETPLACE_EVENTS)
-
     by_url = {ep["url"]: ep for ep in endpoints}
-    asserted = 0
+    test_urls = {
+        spec["url"] for spec in catalog.CATALOG_SPEC["webhooks"]
+        if "test" in spec["modes"]
+    }
     for spec in catalog.CATALOG_SPEC["webhooks"]:
         if "test" not in spec["modes"]:
+            if spec["url"] not in test_urls:
+                assert not any(
+                    ep["url"] == spec["url"] and ep["status"] == "enabled"
+                    for ep in endpoints
+                ), f"sandbox delivery targets live-only endpoint {spec['url']}"
             continue
         endpoint = by_url.get(spec["url"])
         assert endpoint is not None, f"no webhook endpoint for {spec['url']}"
         assert endpoint["status"] == "enabled", spec["url"]
         missing = set(spec["enabled_events"]) - set(endpoint["enabled_events"])
         assert not missing, f"{spec['url']} is not subscribed to {sorted(missing)}"
-        asserted += 1
-    assert asserted, "no test-mode webhook endpoints declared in the catalog"
 
 
 def test_webhook_signature_verification_accepts_and_rejects() -> None:

@@ -3919,3 +3919,33 @@ code was changed to obtain that result. Gate and followup evidence is archived
 under `ME-490/Engineering/Verification/me490_all_axes_final_gate`; its pinned
 runtime matches the staged normal-launch copies. This is a development build,
 not a tagged release or rover clearance approval.
+
+## 2026-09-11 — mobile browser workspace input and layout
+
+`host/wasm/shell.html` and `host/src/app.cpp` now size the WASM GUI in CSS pixels,
+with GLFW alone owning the DPR-scaled drawing buffer. A safe-area/visualViewport
+surface and reserved 56px HUD keep controls above the keyboard/browser chrome.
+`title_bar.cpp`, `widgets/ribbon.cpp`, `layout.cpp`, and `copilot/panel.cpp` provide
+compact workspace/command menus and independently toggled, bounded Files/Chat
+drawers. The shell sends actual GLFW mouse events, cancels presses when a touch
+becomes a scroll or pinch, and supplies a trusted-tap textarea keyboard bridge.
+UTF-8/composition, control-key ordering, first-input focus, and pasted newlines
+use ImGui's existing input queue. `viewport_panel.cpp` owns viewport-hit-tested
+two-finger pan/zoom instead of the former global-window touch tracker.
+
+Native and WASM builds pass; GUI lint is clean and all 15 preloaded assets match.
+An isolated real gateway/PostgreSQL/hostd smoke opened a saved box through the
+touch file picker, created a new document through File, exercised orbit/pinch,
+Files/Chat and command scrolling, and verified first-focus text, backspace,
+multiline paste without submission, and a single IME commit. Chromium touch
+viewports covered 360/390/430px phones, 844x390 landscape, a 390x500 reduced
+viewport, 1024x768 tablet and 1365x768 desktop, with DPR 1/2/3 and no page overflow.
+Physical iOS/Safari keyboard and notch behavior remain device-verification items.
+An initial direct-RPC unsaved-document injection hit a WASM worker
+exception; saved-file loading and normal UI document creation passed after reload.
+
+The existing production gate also required a sandbox webhook despite the
+provisioner's deliberate live-only endpoint policy. The sandbox test now checks
+the declared environment contract and rejects enabled sandbox delivery to a
+live-only URL. No Stripe configuration or live billing changed. The real
+sandbox endpoint check and seven provisioning tests pass.

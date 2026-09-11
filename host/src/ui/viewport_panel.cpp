@@ -13,6 +13,9 @@
 
 #include "imgui.h"
 #include "imgui_internal.h"   // GetWindowDockNode + DockNodeBeginAmendTabBar (tab-bar "+" New file)
+#ifdef __EMSCRIPTEN__
+#include <emscripten.h>
+#endif
 
 #include "viewport_panel.h"
 
@@ -54,6 +57,75 @@ static ShortcutBar   s_shortcutBar;
 static ViewSelector  s_viewSelector;   // C25 W2-E: glass-box view selector (Space)
 static SectionTool   s_sectionTool;    // C25 W3-J: section-view (impl owned by section_tool agent)
 static float         s_huFade = 0.25f; // heads-up toolbar idle opacity (ramps on hover)
+
+#ifdef __EMSCRIPTEN__
+// Touch points belong to shell.html and are canvas-local CSS coordinates.
+// Gesture ownership is latched for the entire contact sequence: crossing a
+// drawer, or lifting one finger after a pinch, never starts a fresh orbit.
+static bool wasmViewportTouches(AppState& st, Renderer& renderer, ImVec2 min,
+                                ImVec2 max, int viewportHeight, bool cameraEnabled) {
+    double points[4] = {};
+    const int count = EM_ASM_INT({
+        var touches = window.__chudwareTouches || [];
+        for (var i = 0; i < Math.min(2, touches.length); ++i) {
+            setValue($0 + i * 16, touches[i].x, 'double');
+            setValue($0 + i * 16 + 8, touches[i].y, 'double');
+        }
+        return touches.length;
+    }, points);
+    static int previousFrame = -1;
+    static bool blocked = false, pinched = false, havePair = false;
+    static ImVec2 previousMid;
+    static float previousDistance = 0.0f;
+    const int frame = ImGui::GetFrameCount();
+    if (count == 0) {
+        previousFrame = frame;
+        blocked = pinched = havePair = false;
+        return false;
+    }
+    if (previousFrame != frame - 1) blocked = true;
+    previousFrame = frame;
+    ImGuiContext& g = *ImGui::GetCurrentContext();
+    ImGuiWindow* viewportWindow = ImGui::GetCurrentWindow();
+    const ImGuiID surfaceId = ImGui::GetItemID();
+    const ImVec2 origin = ImGui::GetMainViewport()->Pos;
+    ImVec2 p[2] = {ImVec2((float)points[0] + origin.x, (float)points[1] + origin.y),
+                   ImVec2((float)points[2] + origin.x, (float)points[3] + origin.y)}; // gui-lint: allow — array indices, not pixel literals
+    auto onSurface = [&](ImVec2 point) {
+        if (!ImRect(min, max).Contains(point)) return false;
+        ImGuiWindow* hovered = nullptr;
+        ImGuiWindow* underMoving = nullptr;
+        ImGui::FindHoveredWindowEx(point, false, &hovered, &underMoving);
+        return hovered == viewportWindow;
+    };
+    if (!onSurface(p[0]) || (count > 1 && !onSurface(p[1])) ||
+        ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopupId) ||
+        (g.ActiveId != 0 && g.ActiveId != surfaceId))
+        blocked = true;
+    if (count > 1) pinched = true;
+    if (count != 2 || blocked || !cameraEnabled) {
+        havePair = false;
+        return blocked || pinched;
+    }
+    const ImVec2 mid((p[0].x + p[1].x) * 0.5f, (p[0].y + p[1].y) * 0.5f);
+    const float dx = p[1].x - p[0].x, dy = p[1].y - p[0].y;
+    const float distance = std::sqrt(dx * dx + dy * dy);
+    if (havePair && distance > 1.0f && previousDistance > 1.0f) {
+        cancelCameraAnimation();
+        const auto& camera = renderer.camera();
+        const float worldPerPixel = renderer.worldPerPixel(viewportHeight);
+        const float moveX = mid.x - previousMid.x, moveY = mid.y - previousMid.y;
+        st.pan[0] += (-camera.right.x * moveX + camera.up.x * moveY) * worldPerPixel;
+        st.pan[1] += (-camera.right.y * moveX + camera.up.y * moveY) * worldPerPixel;
+        st.pan[2] += (-camera.right.z * moveX + camera.up.z * moveY) * worldPerPixel;
+        st.zoom = std::clamp(st.zoom * distance / previousDistance, 0.1f, 10.0f);
+    }
+    previousMid = mid;
+    previousDistance = distance;
+    havePair = true;
+    return true;
+}
+#endif
 
 // ---- Liquid-glass v2 host port (H6a: local://glass_host.md) ----
 // Published viewport image rect (screen coords) + the live Renderer, kept for the registered
@@ -2928,7 +3000,13 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
         // label instead of the viewport. That silently killed EVERY navigation and picking path
         // gated on imgHovered (orbit, pan, zoom, selection) for as long as the scrim was up —
         // the user could watch the AI build the part but could not move the camera.
+#ifdef __EMSCRIPTEN__
+        const bool touchOwnsNavigation = wasmViewportTouches(
+            st, renderer, cr0, cr1, vh, !inSketch && !inSketch3d);
+        const bool imgHovered = ImGui::IsItemHovered() && !touchOwnsNavigation;
+#else
         const bool imgHovered = ImGui::IsItemHovered();
+#endif
         // Drop TARGET (Wave 3A item 5): dropping an in-app Explorer file row onto the viewport opens
         // it. The payload is the dragged file's absolute path (NUL-terminated); we hand it to the
         // GL-thread request pump via st.requestOpenPath, which routes CAD vs ECAD by extension — the

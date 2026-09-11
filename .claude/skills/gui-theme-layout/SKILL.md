@@ -22,6 +22,7 @@ modals. What individual panels *contain* belongs to their own specialist skills.
 | `host/src/ui/file_dialog.cpp`, `equations_dialog.cpp`, `profiler_window.cpp` | App-level modals |
 | `host/src/ui/toast.cpp`, `cursors.cpp` | Notifications, cursor set |
 | `host/src/ui/provider_usage.h/.cpp` | THE subscription_accounts / subscription_usage poller — Settings Accounts and the composer usage rings both read it. Never add a second poller |
+| `host/wasm/shell.html`, `host/src/app.cpp` | Browser mobile surface: safe-area/visualViewport wrapper, CSS-pixel UI scale, reserved 56px HUD, exclusive Files/Chat drawers, queued UTF-8/control-key IME bridge. GLFW owns DPR backing-store sizing; never multiply CSS metrics by DPR |
 
 ## The shared vocabulary — `ui::kit` and `ui::anim`
 

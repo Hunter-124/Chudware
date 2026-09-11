@@ -14,6 +14,7 @@
 #ifdef __EMSCRIPTEN__
 #include <emscripten.h>
 #include <emscripten/html5.h>
+#include <deque>
 // Worker stderr often never reaches the page console under PROXY_TO_PTHREAD;
 // always mirror the last checkpoint onto #status via the browser main thread.
 inline void wasmBootDom(const char *msg) {
@@ -2191,14 +2192,10 @@ void startLoginWizard(AppState &, const std::string &);
 
 #ifdef __EMSCRIPTEN__
 #include <GLFW/emscripten_glfw3.h>
-// One-time: hand canvas sizing to the contrib.glfw3 port. With target "window"
-// it keeps the canvas CSS size, the drawing-buffer (backing store, DPR-scaled),
-// and the GLFW window size all synced to the browser viewport, firing normal
-// framebuffer-size callbacks — so ImGui io.DisplaySize and the ribbon/dockspace
-// layout always span the full window, and it survives fullscreen transitions.
-// Replaces manual innerWidth polling / canvas pinning.
+// Shell owns the safe-area/visualViewport CSS rectangle; GLFW owns the
+// DPR-scaled backing store and keeps its logical window in CSS pixels.
 static void wasmSetupCanvasResize(GLFWwindow *win) {
-  emscripten_glfw_make_canvas_resizable(win, "window", nullptr);
+  emscripten_glfw_make_canvas_resizable(win, "#app-surface", nullptr);
 }
 
 // ---- WASM mobile control scheme
@@ -2207,10 +2204,7 @@ static void wasmSetupCanvasResize(GLFWwindow *win) {
 // camera gestures. Desktop / wide viewports keep byte-identical behaviour;
 // everything here is EMSCRIPTEN-only.
 static bool g_wasmMobile = false;
-static bool g_wasmMobileApplied = false;
-static float g_wasmBaseScale = 1.0f;
 static constexpr float kWasmMobileWidthPx = 900.0f;
-static constexpr float kWasmMobileScaleBump = 1.35f;
 
 // Pending HUD commands (posted from EMSCRIPTEN_KEEPALIVE exports on the browser
 // thread; drained once per frame on the main loop so we never touch
@@ -2222,7 +2216,8 @@ enum class WasmHudCmd : int {
   ZoomIn,
   ZoomOut,
   Undo,
-  ToggleMenu,
+  ToggleFiles,
+  ToggleChat,
 };
 static volatile int g_wasmHudCmd = 0; // WasmHudCmd
 
@@ -2252,54 +2247,28 @@ static bool wasmIsNarrowViewport(GLFWwindow *win) {
   return (w > 0 && (float)w <= kWasmMobileWidthPx) || coarse != 0;
 }
 
-static void wasmApplyMobileLayout(AppState &st, float &scale, bool mobile) {
-  if (mobile == g_wasmMobileApplied && mobile == g_wasmMobile)
+static void wasmApplyMobileLayout(AppState &st, bool mobile) {
+  if (mobile == g_wasmMobile)
     return;
+  static bool desktopTree = true, desktopChat = true;
+  static bool desktopTreeCollapsed = false, desktopChatCollapsed = false;
   g_wasmMobile = mobile;
-  g_wasmMobileApplied = mobile;
   if (mobile) {
-    // Bump uiScale for larger touch targets without reloading fonts
-    // (FontGlobalScale keeps glyphs readable). applyTheme re-scales style
-    // paddings/spacings from the base.
-    float mscale = g_wasmBaseScale * kWasmMobileScaleBump;
-    if (mscale > 3.5f)
-      mscale = 3.5f;
-    scale = mscale;
-    st.scale = mscale;
-    ui::applyTheme(ui::activeTheme, mscale);
-    ImGui::GetIO().FontGlobalScale = kWasmMobileScaleBump;  // gui-lint: allow — wasm mobile only; applyTheme above carries the real HiDPI scale
-    // Collapse both pinned columns into their header strips so the 3D surface
-    // dominates.
-    st.settings.fmCollapsed = true;
-    st.settings.copilotCollapsed = true;
-    st.showFeatureTree = true;
-    st.showAIPanel = true;
-    std::fprintf(stderr, "[wasm-mobile] narrow layout on (scale=%.2f)\n",
-                 mscale);
+    desktopTree = st.showFeatureTree;
+    desktopChat = st.showAIPanel;
+    desktopTreeCollapsed = st.settings.fmCollapsed;
+    desktopChatCollapsed = st.settings.copilotCollapsed;
+    st.showFeatureTree = false;
+    st.showAIPanel = false;
   } else {
-    scale = g_wasmBaseScale;
-    st.scale = g_wasmBaseScale;
-    ui::applyTheme(ui::activeTheme, g_wasmBaseScale);
-    ImGui::GetIO().FontGlobalScale = 1.0f;  // gui-lint: allow — wasm mobile only; resets the bump above
-    st.showFeatureTree = true;
-    st.showAIPanel = true;
-    std::fprintf(stderr, "[wasm-mobile] desktop layout restored (scale=%.2f)\n",
-                 g_wasmBaseScale);
+    st.showFeatureTree = desktopTree;
+    st.showAIPanel = desktopChat;
+    st.settings.fmCollapsed = desktopTreeCollapsed;
+    st.settings.copilotCollapsed = desktopChatCollapsed;
+    ui::resetOverlayColumns();
   }
 }
 
-// Keep the layout.cpp / copilot static collapse flags in sync with settings
-// while mobile. Those columns seed once from settings on first draw; after that
-// they own a local bool. Writing settings alone is not enough once they've
-// drawn, so we re-assert via settings every frame and also set the statics
-// indirectly: the columns already write settings on chevron click, and they
-// read settings only at init — so on the first mobile transition we need them
-// collapsed BEFORE first draw. loadSettings runs before the first frame, so
-// setting fmCollapsed/copilotCollapsed before the first
-// drawLeftPane/drawAIPanel call is sufficient for cold start. For a mid-session
-// resize into narrow, we re-set the settings; if the columns are already
-// expanded the user can still collapse via the HUD "Menu" toggle which flips
-// them.
 static void wasmDrainHudCommands(AppState &st) {
   int cmd = g_wasmHudCmd;
   g_wasmHudCmd = 0;
@@ -2344,21 +2313,20 @@ static void wasmDrainHudCommands(AppState &st) {
     }
     break;
   }
-  case WasmHudCmd::ToggleMenu: {
-    // Drawer toggle: hide/show both side columns. Cold-start already seeds them
-    // collapsed via settings.fmCollapsed before first draw; mid-session the
-    // columns own a static collapse flag we cannot flip from here, so
-    // visibility is the reliable drawer mechanism (showFeatureTree /
-    // showAIPanel).
-    const bool show = !(st.showFeatureTree && st.showAIPanel);
-    st.showFeatureTree = show;
-    st.showAIPanel = show;
-    if (show) {
-      st.settings.fmCollapsed = false;
-      st.settings.copilotCollapsed = false;
-      ui::resetOverlayColumns();
+  case WasmHudCmd::ToggleFiles:
+  case WasmHudCmd::ToggleChat: {
+    const bool files = (WasmHudCmd)cmd == WasmHudCmd::ToggleFiles;
+    const bool show = !(files ? st.showFeatureTree : st.showAIPanel);
+    if (files) {
+      st.showFeatureTree = show;
+      if (show) st.settings.fmCollapsed = false;
+      if (g_wasmMobile) st.showAIPanel = false;
+    } else {
+      st.showAIPanel = show;
+      if (show) st.settings.copilotCollapsed = false;
+      if (g_wasmMobile) st.showFeatureTree = false;
     }
-    st.toast(ui::ToastLevel::Info, show ? "Panels shown" : "Panels hidden");
+    if (show) ui::resetOverlayColumns();
     break;
   }
   default:
@@ -2366,118 +2334,70 @@ static void wasmDrainHudCommands(AppState &st) {
   }
 }
 
-// Multitouch camera: 1 finger is handled by the JS touch→pointer bridge
-// (orbit/pan via LMB). 2 fingers: pinch = zoom, two-finger drag = pan. Applied
-// directly to st.yaw/pitch/zoom/pan.
-static void wasmProcessMultitouch(AppState &st, GLFWwindow *win) {
-  // Poll active touch points from the JS-filled list each frame.
-  int n = 0;
-  double x0 = 0, y0 = 0, x1 = 0, y1 = 0;
-  n = EM_ASM_INT(
-      {
-        var t = window.__chudwareTouches;
-        if (!t || !t.length)
-          return 0;
-        var a = t[0];
-        var b = t.length > 1 ? t[1] : null;
-        setValue($0, a.x, 'double');
-        setValue($1, a.y, 'double');
-        if (b) {
-          setValue($2, b.x, 'double');
-          setValue($3, b.y, 'double');
-          return t.length;
-        }
-        return 1;
-      },
-      &x0, &y0, &x1, &y1);
-  (void)win;
-  static bool s_havePrev = false;
-  static double s_prevMidX = 0, s_prevMidY = 0, s_prevDist = 0;
-  if (n < 2) {
-    s_havePrev = false;
-    return;
-  }
-  const double midX = 0.5 * (x0 + x1);
-  const double midY = 0.5 * (y0 + y1);
-  const double dx = x1 - x0, dy = y1 - y0;
-  const double dist = std::sqrt(dx * dx + dy * dy);
-  if (!s_havePrev || dist < 1.0) {
-    s_prevMidX = midX;
-    s_prevMidY = midY;
-    s_prevDist = dist;
-    s_havePrev = true;
-    return;
-  }
-  const float ddx = (float)(midX - s_prevMidX);
-  const float ddy = (float)(midY - s_prevMidY);
-  const float distRatio =
-      (s_prevDist > 1.0) ? (float)(dist / s_prevDist) : 1.0f;
+// Browser events can arrive during ASYNCIFY yields. Queue them until the next
+// NewFrame rather than mutating ImGui while a widget is running.
+struct WasmTextEvent {
+  std::string text;
+  ImGuiKey key = ImGuiKey_None;
+};
+static std::deque<WasmTextEvent> g_wasmTextEvents;
+static ImGuiKey g_wasmTextKeyDown = ImGuiKey_None;
 
-  // Two-finger pan: shift orbit target in camera plane (screen pixels → rough
-  // world via zoom). Without a live worldPerPx we approximate: larger zoom =>
-  // smaller world step.
-  if (std::fabs(ddx) > 0.5f || std::fabs(ddy) > 0.5f) {
-    // Approximate camera right/up from yaw/pitch (matches renderer dir
-    // convention).
-    const float yawR = st.yaw * 0.01745329252f;
-    const float pitR = st.pitch * 0.01745329252f;
-    // right = normalize(cross(worldUp, dir))? — renderer uses:
-    //   dir = (cos(p)*sin(y), -cos(p)*cos(y), sin(p))
-    //   up  = (-sin(p)*sin(y), sin(p)*cos(y), cos(p))
-    //   right = cross(up, dir) ... use horizontal basis from yaw alone for pan
-    //   feel:
-    const float cy = std::cos(yawR), sy = std::sin(yawR);
-    const float cp = std::cos(pitR), sp = std::sin(pitR);
-    // right ≈ (cos(y), sin(y), 0) in this convention? dir_xy = (sin y, -cos y)
-    // right = (cos y, sin y, 0)
-    float Rx = cy, Ry = sy, Rz = 0.0f;
-    float Ux = -sp * sy, Uy = sp * cy, Uz = cp;
-    // world-per-px estimate: at zoom=1, ~1 unit per 40 px feels CAD-like; scale
-    // 1/zoom.
-    float z = st.zoom < 0.05f ? 0.05f : st.zoom;
-    float wpp = 1.0f / (40.0f * z);
-    // Drag right moves model right → target shifts left (-R); drag down →
-    // target up (+U).
-    st.pan[0] += (-Rx * ddx + Ux * ddy) * wpp;
-    st.pan[1] += (-Ry * ddx + Uy * ddy) * wpp;
-    st.pan[2] += (-Rz * ddx + Uz * ddy) * wpp;
+static void wasmDrainTextInput() {
+  ImGuiIO &io = ImGui::GetIO();
+  // Moving focus to the browser IME is still focus inside this application.
+  // GLFW reports canvas blur; without the matching focus event NewFrame drops
+  // the first text batch while clearing input for the apparent focus loss.
+  if (EM_ASM_INT({
+        return document.hasFocus() &&
+               document.activeElement === document.getElementById('mobile-input');
+      }))
+    io.AddFocusEvent(true);
+  if (g_wasmTextKeyDown != ImGuiKey_None) {
+    io.AddKeyEvent(g_wasmTextKeyDown, false);
+    g_wasmTextKeyDown = ImGuiKey_None;
+    return; // Release gets its own frame, including repeated Backspace.
   }
-  // Pinch zoom: ratio > 1 = fingers apart = zoom in.
-  if (std::fabs(distRatio - 1.0f) > 0.001f) {
-    st.zoom *= distRatio;
-    if (st.zoom < 0.1f)
-      st.zoom = 0.1f;
-    if (st.zoom > 10.0f)
-      st.zoom = 10.0f;
+  if (g_wasmTextEvents.empty()) return;
+  const auto &event = g_wasmTextEvents.front();
+  if (event.key != ImGuiKey_None) {
+    io.AddKeyEvent(event.key, true);
+    g_wasmTextKeyDown = event.key;
+  } else {
+    io.AddInputCharactersUTF8(event.text.c_str());
   }
-  s_prevMidX = midX;
-  s_prevMidY = midY;
-  s_prevDist = dist;
+  // Text must be consumed before a following Enter can submit the widget.
+  g_wasmTextEvents.pop_front();
 }
 
-// JS touch tracker used by wasmProcessMultitouch (installed once).
-static void wasmInstallTouchTracker() {
-  EM_ASM({
-    if (window.__chudwareTouchTracker)
-      return;
-    window.__chudwareTouchTracker = true;
-    window.__chudwareTouches = [];
-    function sync(ev) {
-      var list = [];
-      for (var i = 0; i < ev.touches.length; ++i) {
-        var t = ev.touches[i];
-        list.push({id : t.identifier, x : t.clientX, y : t.clientY});
+static void wasmPublishTextInput() {
+  const auto &ime = ImGui::GetCurrentContext()->PlatformImeData;
+  const ImVec2 origin = ImGui::GetMainViewport()->Pos;
+  const auto &context = *ImGui::GetCurrentContext();
+  bool scrollable = false;
+  const bool movingWindow = context.ActiveIdWindow &&
+                           context.ActiveId == context.ActiveIdWindow->MoveId;
+  // A list/menu button press must be cancellable into a scroll. Text editing
+  // and directional drag/slider widgets retain their own gesture.
+  const bool buttonPress = context.ActiveIdSource == ImGuiInputSource_Mouse &&
+                           context.ActiveIdUsingNavDirMask == 0 &&
+                           context.InputTextState.ID != context.ActiveId;
+  if (context.ActiveId == 0 || movingWindow || buttonPress) {
+    for (ImGuiWindow *window = context.HoveredWindow; window; window = window->ParentWindow) {
+      if (window->ScrollMax.y > 0.0f &&
+          (window->Flags & (ImGuiWindowFlags_ChildWindow | ImGuiWindowFlags_Popup)) &&
+          !(window->Flags & ImGuiWindowFlags_NoScrollWithMouse)) {
+        scrollable = true;
+        break;
       }
-      window.__chudwareTouches = list;
     }
-    var opts = {};
-    opts.passive = true;
-    opts.capture = true;
-    window.addEventListener('touchstart', sync, opts);
-    window.addEventListener('touchmove', sync, opts);
-    window.addEventListener('touchend', sync, opts);
-    window.addEventListener('touchcancel', sync, opts);
-  });
+  }
+  EM_ASM({
+    window.__chudwareTouchScroll = !!$4;
+    if (window.chudwareTextInput)
+      window.chudwareTextInput(!!$0, $1, $2, $3);
+  }, ImGui::GetIO().WantTextInput, ime.InputPos.x - origin.x,
+     ime.InputPos.y - origin.y, ime.InputLineHeight, scrollable);
 }
 
 extern "C" {
@@ -2493,8 +2413,18 @@ EMSCRIPTEN_KEEPALIVE void chudware_mobile_zoom_step(int dir) {
 EMSCRIPTEN_KEEPALIVE void chudware_mobile_undo(void) {
   g_wasmHudCmd = (int)WasmHudCmd::Undo;
 }
-EMSCRIPTEN_KEEPALIVE void chudware_mobile_toggle_menu(void) {
-  g_wasmHudCmd = (int)WasmHudCmd::ToggleMenu;
+EMSCRIPTEN_KEEPALIVE void chudware_mobile_toggle_panel(int panel) {
+  if (panel == 0 || panel == 1)
+    g_wasmHudCmd = (int)(panel == 0 ? WasmHudCmd::ToggleFiles : WasmHudCmd::ToggleChat);
+}
+EMSCRIPTEN_KEEPALIVE void chudware_mobile_text(const char *utf8) {
+  if (utf8 && *utf8)
+    g_wasmTextEvents.push_back({utf8, ImGuiKey_None});
+}
+EMSCRIPTEN_KEEPALIVE void chudware_mobile_key(int key) {
+  constexpr ImGuiKey keys[] = {ImGuiKey_Backspace, ImGuiKey_Enter, ImGuiKey_Escape};
+  if (key >= 0 && key < 3)
+    g_wasmTextEvents.push_back({{}, keys[key]});
 }
 
 } // extern "C"
@@ -2630,9 +2560,15 @@ int run_gui(const char *screenshotPath, const char *openPath) {
   static std::string iniPath = appdataAppDir() + "/imgui_gui_v6.ini";
   io.IniFilename = shot ? nullptr : iniPath.c_str();
 
+#ifdef __EMSCRIPTEN__
+  // GLFW's browser content scale is DPR. ImGui's display/mouse space is CSS
+  // pixels, so DPR must affect only the framebuffer, never fonts or metrics.
+  float scale = 1.0f;
+#else
   float xs = 1.0f, ys = 1.0f;
   glfwGetWindowContentScale(win, &xs, &ys);
   float scale = shot ? 1.0f : (xs > ys ? xs : ys);
+#endif
   // CHUDWARE_SCALE overrides the content scale (incl. in screenshot mode) so
   // HiDPI layout can be reproduced/verified headlessly. Clamped to a sane
   // range.
@@ -2641,23 +2577,6 @@ int run_gui(const char *screenshotPath, const char *openPath) {
     if (v >= 0.5f && v <= 4.0f)
       scale = v;
   }
-#ifdef __EMSCRIPTEN__
-  // Capture the desktop/base content scale before any mobile bump so a wide
-  // resize can restore it.
-  g_wasmBaseScale = scale;
-  // Cold-start narrow viewport: bump scale early so loadFonts/applyTheme
-  // already use touch sizes. (Fonts are loaded once; FontGlobalScale later
-  // compensates if the window resizes into mobile.)
-  if (!shot && wasmIsNarrowViewport(win)) {
-    float mscale = g_wasmBaseScale * kWasmMobileScaleBump;
-    if (mscale > 3.5f)
-      mscale = 3.5f;
-    scale = mscale;
-    g_wasmMobile = true;
-    g_wasmMobileApplied = true;
-    std::fprintf(stderr, "[wasm-mobile] startup narrow scale=%.2f\n", scale);
-  }
-#endif
 
   // Theme: honour CHUDWARE_THEME env override, then persisted setting, then LIGHT
   // default (owner default 2026-07-14). Applied once here; the settings load at
@@ -2759,15 +2678,6 @@ int run_gui(const char *screenshotPath, const char *openPath) {
   st.entitlementAiVerified = true;
 #endif
   st.mfgMirror = std::make_shared<ui::MfgMirror>();
-#ifdef __EMSCRIPTEN__
-  wasmInstallTouchTracker();
-  if (g_wasmMobile) {
-    // Start with side columns collapsed so the 3D surface dominates on phones.
-    // loadSettings below may overwrite; we re-assert after it.
-    st.settings.fmCollapsed = true;
-    st.settings.copilotCollapsed = true;
-  }
-#endif
   st.win = win;
   st.shot = shot;
   st.scale = scale;
@@ -2982,27 +2892,7 @@ int run_gui(const char *screenshotPath, const char *openPath) {
     }
   }
 #ifdef __EMSCRIPTEN__
-  if (g_wasmMobile || wasmIsNarrowViewport(win)) {
-    g_wasmMobile = true;
-    g_wasmMobileApplied = true;
-    st.settings.fmCollapsed = true;
-    st.settings.copilotCollapsed = true;
-    // Hide the full side drawers initially; HUD Menu re-shows them.
-    // Keep showFeatureTree true so the collapsed header strip still draws
-    // (collapse UX); only the body is rolled up via fmCollapsed.
-    if (scale < g_wasmBaseScale * kWasmMobileScaleBump * 0.99f) {
-      float mscale = g_wasmBaseScale * kWasmMobileScaleBump;
-      if (mscale > 3.5f)
-        mscale = 3.5f;
-      scale = mscale;
-      st.scale = mscale;
-      ui::applyTheme(ui::activeTheme, mscale);
-      ImGui::GetIO().FontGlobalScale = kWasmMobileScaleBump;  // gui-lint: allow — wasm mobile only
-    } else {
-      st.scale = scale;
-      ImGui::GetIO().FontGlobalScale = kWasmMobileScaleBump;  // gui-lint: allow — wasm mobile only
-    }
-  }
+  wasmApplyMobileLayout(st, wasmIsNarrowViewport(win));
 #endif
 
   // Ordinary viewport/Measure picks resolve off the GL thread. Editing wells keep
@@ -4660,9 +4550,9 @@ int run_gui(const char *screenshotPath, const char *openPath) {
     // deltas.
     {
       const bool mobile = wasmIsNarrowViewport(win);
-      wasmApplyMobileLayout(st, scale, mobile);
+      wasmApplyMobileLayout(st, mobile);
     }
-    // canvas sizing handled by wasmSetupCanvasResize (port tracks the window)
+    // Canvas sizing follows #app-surface, including software-keyboard changes.
     // First frames: minimal paint only — full UI path is too deep for ASYNCIFY
     // until the rewind stack has settled after a few yields.
     if (s_wasmFrames <= 2) {
@@ -4688,12 +4578,7 @@ int run_gui(const char *screenshotPath, const char *openPath) {
       emscripten_sleep(0);
       continue;
     }
-    // Drain HUD again after warmup so Menu/Orbit/etc. still work once UI is
-    // live.
-    if (g_wasmMobile) {
-      wasmDrainHudCommands(st);
-      wasmProcessMultitouch(st, win);
-    }
+    wasmDrainHudCommands(st);
 #endif
     // T-PERF10: idle render throttle. When nothing needs continuous redraw (no
     // animation, no async RPCs, no camera tween, no headless shot), wait up to
@@ -6643,6 +6528,9 @@ int run_gui(const char *screenshotPath, const char *openPath) {
 
     ImGui_ImplOpenGL3_NewFrame();
     ImGui_ImplGlfw_NewFrame();
+#ifdef __EMSCRIPTEN__
+    wasmDrainTextInput();
+#endif
     // Headless-capture hygiene, same reasoning as the toast suppression above: the
     // window opens under wherever the real cursor happens to sit, so a --ui-screenshot
     // frame can catch a ribbon/button tooltip parked over the very chrome the shot is
@@ -7130,16 +7018,21 @@ int run_gui(const char *screenshotPath, const char *openPath) {
     // bar) ----------
     const float statusH = ImGui::GetTextLineHeight() + 8.0f * scale;
     const float dockTopY = barH + ribbonH + mfgBarH + entBarH;
+#ifdef __EMSCRIPTEN__
+    const float mobileHudH = g_wasmMobile ? 56.0f : 0.0f;
+#else
+    const float mobileHudH = 0.0f;
+#endif
     // Publish the full viewport overlay band BEFORE any panel draws —
     // drawLeftPane (layout.cpp) and the Copilot column read it via
     // ui::overlayBand(). Manufacture no longer owns a separate bottom CAM dock,
     // so every viewport workspace uses the same uninterrupted band.
-    const float bandBottom = vp->Pos.y + vp->Size.y - statusH;
+    const float bandBottom = vp->Pos.y + vp->Size.y - statusH - mobileHudH;
     ui::setOverlayBand(vp->Pos.x, vp->Pos.y + dockTopY, vp->Pos.x + vp->Size.x,
                        bandBottom);
     ImGui::SetNextWindowPos(ImVec2(vp->Pos.x, vp->Pos.y + dockTopY));
     ImGui::SetNextWindowSize(
-        ImVec2(vp->Size.x, vp->Size.y - dockTopY - statusH));
+        ImVec2(vp->Size.x, std::max(1.0f, vp->Size.y - dockTopY - statusH - mobileHudH)));
     ImGui::SetNextWindowViewport(vp->ID);
     ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0);
     ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0);
@@ -7160,7 +7053,7 @@ int run_gui(const char *screenshotPath, const char *openPath) {
     if ((!st.layoutInit && ImGui::DockBuilderGetNode(dockId) == nullptr) ||
         st.resetLayout) {
       buildDefaultLayout(dockId,
-                         ImVec2(vp->Size.x, vp->Size.y - dockTopY - statusH));
+                         ImVec2(vp->Size.x, std::max(1.0f, vp->Size.y - dockTopY - statusH - mobileHudH)));
       st.layoutInit = true;
       st.resetLayout = false;
       // "Reset layout" also restores the pinned glass columns' default
@@ -7200,7 +7093,15 @@ int run_gui(const char *screenshotPath, const char *openPath) {
     ImGui::End();
 
     // ---------- status bar ----------
+#ifdef __EMSCRIPTEN__
+    ImGuiViewport statusViewport;
+    statusViewport.ID = vp->ID;
+    statusViewport.Pos = vp->Pos;
+    statusViewport.Size = ImVec2(vp->Size.x, vp->Size.y - mobileHudH);
+    ui::drawStatusBar(st, &statusViewport, statusH, busy, hostFlags);
+#else
     ui::drawStatusBar(st, vp, statusH, busy, hostFlags);
+#endif
 #ifndef __EMSCRIPTEN__
     ui::tickAccountPanel(st);
     chudware::update::globalUpdater().setEntitlementToken(st.entitlementToken);
@@ -8152,6 +8053,9 @@ int run_gui(const char *screenshotPath, const char *openPath) {
     ui::applyCursorRequest(st, win);
 
     ImGui::Render();
+#ifdef __EMSCRIPTEN__
+    wasmPublishTextInput();
+#endif
     int dw, dh;
     glfwGetFramebufferSize(win, &dw, &dh);
     glViewport(0, 0, dw, dh);

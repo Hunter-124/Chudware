@@ -21,6 +21,31 @@ attribution.
   on 2026-08-10. `/app` is the only client. `deploy/monitor.py` survives as a host
   RAM/disk/GPU sampler and disk-pressure flag.
 
+## Phone and tablet controls
+
+`/app/` uses compact controls at widths up to 900 CSS pixels or with a coarse
+primary pointer. Device pixel ratio affects the rendering buffer, not UI sizing.
+
+- **File** opens/saves documents; **More** contains Settings, Search, Web and the
+  project folder. The workspace button selects Model, Drawing, Simulation and the
+  other available workspaces.
+- The ribbon's tab selector and **Commands** menu expose the full command groups.
+  Drag vertically to scroll long command menus.
+- **Files** and **Chat** toggle separate drawers; only one is open at a time.
+- Tap a text field, then **Keyboard** in the bottom bar to open the phone keyboard.
+  **Hide keyboard** dismisses it. Unicode/composition and multiline paste feed the
+  selected field; pasting a newline does not submit chat.
+- Drag on the model to orbit, or choose **Pan**. Pinch to zoom and drag two fingers
+  to pan. After a pinch, lift both fingers before starting another one-finger drag.
+  Camera gestures do not start over a drawer or menu.
+- The canvas follows the browser's visible viewport and safe-area insets. The
+  bottom control strip is reserved space, not an overlay over the composer.
+
+WebAssembly, WebGL2, and cross-origin-isolated shared memory remain required.
+Browser/device restrictions can disable them; the startup panel identifies missing
+capabilities. Mobile layout and input are exercised in Chromium touch emulation;
+physical iOS/Safari keyboard and safe-area behavior still require device checks.
+
 ## IP note — before any PUBLIC deployment
 
 The WASM bundle ships the full GUI as downloadable bytecode. Behind the current

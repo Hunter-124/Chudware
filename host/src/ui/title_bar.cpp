@@ -948,9 +948,18 @@ void drawTitleBar(AppState& st, bool maximized, float& barHOut) {
     chrome::HitLayout& hitLayout = *st.hitLayout;
 
     float s = ui::uiScale;
+#ifdef __EMSCRIPTEN__
+    const bool mobile = ImGui::GetIO().DisplaySize.x <= 900.0f ||
+                        EM_ASM_INT({ return window.matchMedia('(pointer: coarse)').matches; });
+#else
+    const bool mobile = false;
+#endif
 
+    const float framePadY = mobile ? std::max(ui::metrics::titleFramePadY(),
+                                              (ui::metrics::px(48.0f) - ImGui::GetFontSize()) * 0.5f)
+                                   : ui::metrics::titleFramePadY();
     ImGui::PushStyleVar(ImGuiStyleVar_FramePadding,
-                        ImVec2(ui::metrics::titleFramePadX(), ui::metrics::titleFramePadY()));
+                        ImVec2(ui::metrics::titleFramePadX(), framePadY));
     const float barH = ImGui::GetFrameHeight();
     hitLayout.titleBarHeight = (int)barH;
     hitLayout.clearSpans();  // reset fine-grained spans each frame
@@ -992,7 +1001,7 @@ void drawTitleBar(AppState& st, bool maximized, float& barHOut) {
             const float wordH = ImGui::GetTextLineHeight();
             ImGui::PopFont();
             const float lockupW = markSz + markGap + wordW;
-            if (12.0f * s + lockupW + 18.0f * s < rightGroupStartRelX - 240.0f * s) {
+            if (!mobile && 12.0f * s + lockupW + 18.0f * s < rightGroupStartRelX - 240.0f * s) {
                 ImDrawList* dl = ImGui::GetWindowDrawList();
                 const ImVec2 markMin(winX + 12.0f * s,
                                      ImGui::GetWindowPos().y + ImFloor((barH - markSz) * 0.5f));
@@ -1041,7 +1050,8 @@ void drawTitleBar(AppState& st, bool maximized, float& barHOut) {
 
         // Start x: just after logo (screen-relative → then convert to screen-absolute for SetCursorScreenPos).
         // logoEndRelX is already window-relative cursor position; convert to screen.
-        const float leftGroupStartScreenX = winX + logoEndRelX + 14.0f * s;  // gap off the logo
+        const float leftGroupStartScreenX = winX + (mobile ? ui::metrics::px(6.0f)
+                                                                          : logoEndRelX + 14.0f * s);
         // If logo wasn't drawn, cursor is at 12*s (rel). LogoEndRelX covers both cases.
 
         float cx = leftGroupStartScreenX;  // current screen x for left group placement
@@ -1058,6 +1068,22 @@ void drawTitleBar(AppState& st, bool maximized, float& barHOut) {
             if (res.clicked) ImGui::OpenPopup("##file_popup");
             cx += fileW + chipGap;
         }
+        if (mobile) {
+            const float moreW = chipMeasureW("More", padX, boldFont, iconSz, iconGap);
+            auto res = drawChipAt("##tb_more", "More", ImVec2(cx, barTopScreenY + chipVPad),
+                                  moreW, chipH, false, chipRound, boldFont,
+                                  TbIcon::Settings, iconSz, iconGap);
+            if (res.clicked) ImGui::OpenPopup("##toolbar_more");
+            ImGui::SetNextWindowPos(ImVec2(cx, barTopScreenY + barH), ImGuiCond_Always);
+            if (ImGui::BeginPopup("##toolbar_more")) {
+                if (ImGui::MenuItem("Search commands")) st.showCommandSearch = true;
+                if (ImGui::MenuItem("Settings")) st.openSettings = true;
+                if (ImGui::MenuItem("Web", nullptr, st.showWeb)) st.showWeb = !st.showWeb;
+                if (ImGui::MenuItem("Project folder")) openProjectFolderAction(st);
+                ImGui::EndPopup();
+            }
+            cx += moreW + chipGap;
+        } else {
 
         // Liquid-glass divider in the gap between File and Search.
         {
@@ -1129,6 +1155,7 @@ void drawTitleBar(AppState& st, bool maximized, float& barHOut) {
             if (res.clicked) st.showWeb = !st.showWeb;
             cx += webW + chipGap;
         }
+        }
 
         // File popup (positioned below the File chip).
         const float filePopupScreenX = leftGroupStartScreenX;
@@ -1143,6 +1170,7 @@ void drawTitleBar(AppState& st, bool maximized, float& barHOut) {
         hitLayout.menuLeft  = (int)(leftGroupStartScreenX - winX);
         hitLayout.menuRight = (int)(cx - winX);
 
+        if (!mobile) {
         // ---- Subtle vertical separator between left group and workspace tabs ----
         {
             ImDrawList* dl = ImGui::GetWindowDrawList();
@@ -1178,6 +1206,7 @@ void drawTitleBar(AppState& st, bool maximized, float& barHOut) {
             ImU32 sepCol = ui::Palette::toU32(ui::palette.border);
             sepCol = (sepCol & 0x00FFFFFF) | 0x60000000u;
             dl->AddLine(ImVec2(sepScreenX, sepY0), ImVec2(sepScreenX, sepY1), sepCol, 1.5f * s);
+        }
         }
 
         // Left group ends here (screen-absolute); convert to window-relative for centering math.
@@ -1234,6 +1263,35 @@ void drawTitleBar(AppState& st, bool maximized, float& barHOut) {
         float totalTabsW = measureStrip(/*iconOnly=*/false);
         const bool iconOnly = (totalTabsW + 8.0f * s > centerZoneW);
         if (iconOnly) totalTabsW = measureStrip(/*iconOnly=*/true);
+        if (mobile) {
+            const char* workspaceLabel = "Workspace";
+            for (const auto& tab : kTabs)
+                if (tab.ws == st.activeWorkspace) workspaceLabel = tab.label;
+            const float pickerX = cx + chipGap;
+            const float pickerW = std::max(ui::metrics::px(1.0f),
+                                           winX + rightGroupStartRelX - pickerX);
+            const std::string pickerLabel = ui::kit::elide(workspaceLabel,
+                std::max(1.0f, pickerW - padX * 2.0f - iconSz - iconGap));
+            auto res = drawChipAt("##workspace_picker", pickerLabel.c_str(),
+                                  ImVec2(pickerX, barTopScreenY + chipVPad),
+                                  pickerW, chipH, true, chipRound, boldFont,
+                                  TbIcon::Model, iconSz, iconGap);
+            if (res.clicked) ImGui::OpenPopup("##workspace_menu");
+            ImGui::SetNextWindowPos(ImVec2(pickerX, barTopScreenY + barH), ImGuiCond_Always);
+            ImGui::SetNextWindowSizeConstraints(ImVec2(0, 0),
+                ImVec2(ImGui::GetMainViewport()->Size.x - ui::metrics::px(12.0f),
+                       std::max(ui::metrics::px(44.0f), ImGui::GetMainViewport()->Size.y - barH)));
+            if (ImGui::BeginPopup("##workspace_menu")) {
+                for (int i = 0; i < kTabCount; ++i) {
+                    if (!tabVisible(i)) continue;
+                    if (ImGui::MenuItem(kTabs[i].label, nullptr, st.activeWorkspace == kTabs[i].ws)) {
+                        st.activeWorkspace = kTabs[i].ws;
+                        st.showWeb = false;
+                    }
+                }
+                ImGui::EndPopup();
+            }
+        } else {
 
         // Compute where tabs start, window-relative, then convert to screen for drawing.
         float tabsStartRelX;
@@ -1293,6 +1351,7 @@ void drawTitleBar(AppState& st, bool maximized, float& barHOut) {
 
             tx += chipW + tabGapX;
             drewPrevTab = true;
+        }
         }
 
 #ifndef __EMSCRIPTEN__

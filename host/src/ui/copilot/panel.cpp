@@ -27,6 +27,9 @@
 #include "gl_compat.h"           // glDeleteTextures — LRU eviction of render thumbnails
 #include "ui/chudcode_session_actions.h"  // Chudcode session recovery (export/branch/repair/close)
 #include <string_view>
+#ifdef __EMSCRIPTEN__
+#include <emscripten.h>
+#endif
 
 namespace ui {
 
@@ -1877,6 +1880,12 @@ static void drawArtifactsPanel(AppState& st, bool busy) {
 
 void drawAIPanel(AppState& st, bool busy, bool canRun) {
     if (!st.showAIPanel) return;
+#ifdef __EMSCRIPTEN__
+    const bool mobile = ImGui::GetIO().DisplaySize.x <= 900.0f ||
+                        EM_ASM_INT({ return window.matchMedia('(pointer: coarse)').matches; });
+#else
+    const bool mobile = false;
+#endif
 
     // Keep the local-endpoint model list fresh whenever the copilot panel exists — BEFORE the
     // visibility gate below, so discovery runs even when the pane is occluded. Without this, a
@@ -1921,7 +1930,8 @@ void drawAIPanel(AppState& st, bool busy, bool canRun) {
         // Copilot column starts flush at the top of the viewport band — same rule as drawLeftPane,
         // keeping the two pinned columns sharing their top edge.
         const float colY = band.minY + 4.0f * ui::uiScale;   // match left-pane top (doc_tabs / FM)
-        const float colH = std::max(120.0f * ui::uiScale, band.maxY - margin - colY);
+        const float availableH = std::max(1.0f, band.maxY - margin - colY);
+        const float colH = mobile ? availableH : std::max(120.0f * ui::uiScale, availableH);
         // "Reset layout" (slot 1 = Copilot column) restores the default width + expands it.
         if (ui::takeOverlayColumnReset(1)) {
             s_paneW = 0.0f;
@@ -1939,16 +1949,23 @@ void drawAIPanel(AppState& st, bool busy, bool canRun) {
             s_cpCollapsed = true;
             s_cpAnim.snap(true, colH);  // snap immediately — headless captures must not depend on frame count
         }
-        const float maxW = std::max((band.maxX - band.minX) * 0.5f,
-                                    ui::metrics::dockRightMin());
-        s_paneW = std::min(std::max(s_paneW, ui::metrics::dockRightMin()), maxW);
+        const float availableW = std::max(1.0f, band.maxX - band.minX - marginX * 2.0f);
+        const float maxW = mobile ? availableW
+                                  : std::max((band.maxX - band.minX) * 0.5f,
+                                             ui::metrics::dockRightMin());
+        const float paneW = mobile ? std::min(availableW, ui::metrics::dockRightTarget())
+                                  : std::min(std::max(s_paneW, ui::metrics::dockRightMin()), maxW);
+        if (!mobile) s_paneW = paneW;
 
         // T-G21: vertical collapse — the column rolls UP to its header row (drawCopilotHeader)
         // instead of shrinking to a pill in both axes (mirrors the FeatureManager column; see
         // ui::PanelCollapseAnim). Width is unaffected by collapse.
-        const float winH = s_cpAnim.tick(s_cpCollapsed, colH);
-        ImGui::SetNextWindowPos(ImVec2(band.maxX - marginX - s_paneW, colY), ImGuiCond_Always);
-        ImGui::SetNextWindowSize(ImVec2(s_paneW, winH), ImGuiCond_Always);
+        const float animatedH = s_cpAnim.tick(s_cpCollapsed, colH);
+        const float winH = mobile ? std::min(animatedH, colH) : animatedH;
+        ImGui::SetNextWindowPos(ImVec2(band.maxX - marginX - paneW, colY), ImGuiCond_Always);
+        ImGui::SetNextWindowSize(ImVec2(paneW, winH), ImGuiCond_Always);
+        if (mobile)
+            ImGui::SetNextWindowSizeConstraints(ImVec2(1.0f, 1.0f), ImVec2(paneW, colH));
         flags |= ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
                  ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoCollapse |
                  ImGuiWindowFlags_NoDocking | ImGuiWindowFlags_NoScrollbar |
@@ -1986,7 +2003,7 @@ void drawAIPanel(AppState& st, bool busy, bool canRun) {
 
     // Invisible left-edge resize hit-zone (design rule: no visible splitter bars). Dragging the
     // strip left widens the column; clamped at the top of the next frame.
-    if (overlay) {
+    if (overlay && !mobile) {
         const ImVec2 keep = ImGui::GetCursorPos();
         ImGui::SetCursorScreenPos(ImGui::GetWindowPos());
         ImGui::InvisibleButton("##copilot_resize",
@@ -2049,7 +2066,7 @@ void drawAIPanel(AppState& st, bool busy, bool canRun) {
     // runtime banner down is gated on bodyVisible() so a collapsed column costs nothing per frame.
     s_cpAnim.measureHeader();
     if (s_cpAnim.bodyVisible()) {
-        drawRuntimeBanner(st);
+        if (!mobile) drawRuntimeBanner(st);
 
         // Settings / Sessions / Tasks / Artifacts overlays replace the chat log (and hide the
         // composer) while open. They are mutually exclusive (the header toggles clear the
@@ -2078,7 +2095,7 @@ void drawAIPanel(AppState& st, bool busy, bool canRun) {
             reserve = bottomClearance;
         }
         float chatH = ImGui::GetContentRegionAvail().y - reserve;
-        if (chatH < ui::metrics::px(120.0f)) chatH = ui::metrics::px(120.0f);
+        chatH = std::max(chatH, mobile ? 1.0f : ui::metrics::px(120.0f));
 
         // ONE SCROLL REGION PER VIEW. All five views used to share the id "chatlog", so ImGui kept
         // ONE scroll state for them: opening Sessions after scrolling the chat log landed mid-list,
@@ -2114,6 +2131,7 @@ void drawAIPanel(AppState& st, bool busy, bool canRun) {
         ImGui::BeginChild(viewId, ImVec2(0, chatH), ImGuiChildFlags_AlwaysUseWindowPadding,
                           ImGuiWindowFlags_NoScrollbar);
         if (padR > padL) ImGui::Indent(padL - padR);   // negative: pull the LEFT edge back to padL
+        if (mobile && overlayOpen) drawRuntimeBanner(st);
         if (st.showAISettingsOverlay) {
             drawAISettingsBody(st, busy);
         } else if (st.showTaskList || st.showArtifacts || st.showSessionsPicker) {
@@ -2167,10 +2185,20 @@ void drawAIPanel(AppState& st, bool busy, bool canRun) {
         // Composer is hidden under the header overlays (sessions / settings / tasks / artifacts).
         if (!overlayOpen) {
             ImGui::Dummy(ImVec2(0, ui::metrics::U(1)));
+            if (mobile)
+                ImGui::BeginChild("##mobile_composer",
+                    ImVec2(0, std::max(1.0f, ImGui::GetContentRegionAvail().y - bottomClearance)),
+                    ImGuiChildFlags_None, ImGuiWindowFlags_NoScrollbar);
             ImGui::BeginGroup();
+            // Keep runtime actions scrollable with the composer on a keyboard-shortened screen.
+            if (mobile) drawRuntimeBanner(st);
             drawComposer(st, busy, canRun);
             ImGui::EndGroup();
             s_composerH = ImGui::GetItemRectSize().y + ui::metrics::U(1);
+            if (mobile) {
+                ui::drawWindowPillScrollbarV(chatSurf());
+                ImGui::EndChild();
+            }
             ImGui::Dummy(ImVec2(0, bottomClearance));
         } else {
             ImGui::Dummy(ImVec2(0, bottomClearance));

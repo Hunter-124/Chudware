@@ -3950,6 +3950,36 @@ the declared environment contract and rejects enabled sandbox delivery to a
 live-only URL. No Stripe configuration or live billing changed. The real
 sandbox endpoint check and seven provisioning tests pass.
 
+## 2026-09-11 — unblock the mobile release's public mesher dependency
+
+The first mobile promotion passed Stripe/source audits but stopped compiling
+`core/sim/mesher.cpp`: the deployed `9554579` Polyhedral-FEA pin lacked
+`mesh/fill_progress.hpp`. The local `CHUDWARE_POLYMESH_ROOT` override had masked
+that mismatch. Public `master` contains a separate 22-commit product-release
+sequence after the same baseline, so it was not overwritten.
+
+With explicit approval to publish the required upstream changes, reviewed the
+seven-commit source delta and published a sanitized squash as
+`Hunter-124/Polyhedral-FEA` branch `cad-fill-progress`, commit
+`ef464dc1236666770985c75a8fb50a512a463f62`. Private project details were removed
+from commentary and the private commit history was not published. The private
+working checkout was not changed. CAD now pins this immutable public revision.
+
+Release review reproduced and repaired SparseLU's premature `info()` query,
+the unused CHOLMOD lambda in strict disabled builds, and an early refinement
+ceiling that bypassed bounded automatic coarsening. Both runtime regressions
+failed before their fixes and pass afterward. Five mesh-budget cases, eight
+focused solver/refinement/geometry cases, and the isolated forced-LU cantilever
+pass. Fill observation preserves exact geometry, runs callbacks synchronously,
+propagates cancellation, and restores nested observer scope. The real CLI solved
+a STEP plate with 31,808 quadratic tets and 146,205 free DOFs through CHOLMOD;
+all numeric arrays in the 49,176-point VTU are finite.
+
+The CAD configure log now confirms `PINNED FETCH` from the public repository,
+with no local-source override. The engine/daemon and selected tests build;
+`mesh`, `mesh_quality`, `mesher_advanced`, and `tet10_thin_wall` all pass
+(334 seconds total). All nine `scripts/check.py` source gates pass.
+
 ## 2026-09-11 — independent body material persistence
 
 Fixed a production Chudware session reproduction where `set_material("A36",

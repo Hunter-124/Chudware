@@ -90,6 +90,16 @@ CHUDWARE_POLYMESH_ROOT=~/Repositories/Polyhedral-FEA-private ./build.sh core   #
 scripts/run_mission.py --workspace <project> --sessions-dir ~/Documents/Chudware/Sessions --prompt-file p.md --model claude-opus-5   # headless agent turn; --resume for follow-ups
 ```
 
+Before shipping a Polyhedral-FEA API change, validate the public pin in
+`core/cmake/ProvisionPolymesh.cmake` without a local source override. A successful
+private-tree build does not prove production can fetch the headers it needs.
+The configure log must say **PINNED FETCH**, not **LOCAL SOURCE**; clear
+`POLYMESH_SOURCE_DIR` and reset a previously overridden `POLYMESH_ROOT` to
+`<CAD>/third_party/polymesh` when checking that path. The public
+`cad-fill-progress` branch is the CAD integration line; standalone product
+`master` can advance independently. Never publish private history just to move
+the pin.
+
 Gate semantics: OCCT-absent and runtime-venv-absent are **SKIPs, not failures** — the gate
 stays green on an unprovisioned box. Python pytest sweeps run per unit under `services/`,
 plus `tools/` and `training/`, when the runtime venv exists.

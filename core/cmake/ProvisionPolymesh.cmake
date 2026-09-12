@@ -15,11 +15,11 @@
 #
 # LICENSE: BSD-3-Clause, statically linked.
 
-# The source commit is immutable and identical in the public upstream and the internal
-# maintenance mirror. Keep the public repository as the credential-free default so CAD CI
-# never depends on private-repository access; maintainers may point POLYMESH_REPOSITORY at
-# https://github.com/Hunter-124/Polyhedral-FEA-private.git when working against that mirror.
-set(POLYMESH_COMMIT "955457901e5fe9ba7d46c4cafee710000df9f4bd"
+# Pin an immutable, publicly fetchable CAD integration revision (cad-fill-progress).
+# The standalone product's master may advance independently. Keep the public
+# repository as the credential-free default so CAD CI never depends on private
+# source access; local maintenance trees opt in through POLYMESH_SOURCE_DIR.
+set(POLYMESH_COMMIT "ef464dc1236666770985c75a8fb50a512a463f62"
     CACHE STRING "Polyhedral-FEA commit to build" FORCE)
 set(POLYMESH_REPOSITORY "https://github.com/Hunter-124/Polyhedral-FEA.git"
     CACHE STRING

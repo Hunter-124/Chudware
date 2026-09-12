@@ -13,7 +13,7 @@
 # deployment and that supersedes the tag gate. The tradeoff is real and is
 # accepted deliberately: a bad master commit reaches customers in one build
 # cycle instead of waiting for a human to cut a tag. What buys that back is the
-# strict gate below (linux-gate must be green for this exact commit), the
+# blocking Stripe/source gates below, the
 # post-deploy verification step, and the automatic rollback -- which is why
 # Webservice/deploy/rollback.sh and retained releases had to exist before this
 # file could.
@@ -36,10 +36,6 @@ on:
   # the first place, so the real gate runs inline below instead.
   push:
     branches: [master]
-  # Still honoured: a green linux-gate is a fine reason to re-check and deploy.
-  workflow_run:
-    workflows: [linux-gate]
-    types: [completed]
   workflow_dispatch:
     inputs:
       force:
@@ -60,18 +56,17 @@ permissions:
 # Never cancel a deploy mid-flight. update.sh takes a pg_dump backup, rebuilds
 # the engine, relinks WASM and swaps a symlink; a cancellation between the
 # backup and the swap leaves the box in a state no later run reasons about.
-# Runs queue instead, which also serialises the double-fire described below.
+# GitHub retains one running and one pending run, not a FIFO queue. Only
+# master pushes and explicit manual requests may replace the pending request;
+# old CI-completion events must not displace a newer master deployment.
 concurrency:
   group: deploy-prod
   cancel-in-progress: false
 
 jobs:
-  # Live Stripe verification, ahead of the promotion. Deliberately a separate
-  # job calling the reusable workflow rather than another inline step in
-  # `deploy`: that job executes ON livingroom-pc as liveuser, and a suite whose
-  # job is to create charges and refunds has no business running on the
-  # production gateway host with production's environment in scope. The reusable
-  # workflow pins itself to cc-linux-build for exactly that reason.
+  # Live Stripe verification runs in a separate reusable job before promotion.
+  # It resolves sandbox credentials independently; never source production's
+  # gateway.env into this job. The reusable workflow enforces test-only keys.
   #
   # This IS a blocking gate, unlike the three advisory workflow states read in
   # the preflight step. The distinction that makes it safe to block on is the one
@@ -101,17 +96,8 @@ jobs:
     # stopped being subscribed to an event we settle money on, shipping is the
     # wrong move.
     needs: stripe-gate
-    # The job runs for a direct master push, for a green linux-gate, or for a
-    # manual dispatch. The fork clause still matters on the workflow_run path: a
-    # fork's workflow_run carries the fork's head_repository, and deploying a
-    # fork commit to production would be a remote code execution path. `push`
-    # only ever fires for branches in this repository, so it cannot carry one.
-    if: >-
-      github.event_name == 'workflow_dispatch' ||
-      github.event_name == 'push' ||
-      (github.event.workflow_run.conclusion == 'success' &&
-       github.event.workflow_run.head_branch == 'master' &&
-       github.event.workflow_run.head_repository.full_name == github.repository)
+    # Only this repository's master pushes and authorized manual dispatches
+    # trigger the workflow. There is no external workflow_run payload to trust.
     # livingroom-pc: the production box. This is not spare build capacity being
     # abused -- update.sh only works here. It reads gateway.env and the
     # entitlement credential, drives `systemctl --user` units, and swaps the
@@ -144,10 +130,9 @@ jobs:
       # is the chudcode-v0.3.0 linux-x64 release asset. Deployment never fetches.
       CHUDWARE_CHUD_BIN: /home/liveuser/chudware-web-data/chud
       # The commit whose gates are being checked and which must still be
-      # master's tip at deploy time. workflow_run carries it explicitly;
-      # a manual dispatch uses the ref it was dispatched against.
-      TARGET_SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
-      TRIGGERED_BY: ${{ github.event.workflow_run.name || github.event_name }}
+      # master's tip at deploy time. A manual dispatch uses its selected ref.
+      TARGET_SHA: ${{ github.sha }}
+      TRIGGERED_BY: ${{ github.event_name }}
       FORCE_DEPLOY: ${{ inputs.force || false }}
       ALERT_TITLE: "[deploy-prod] Continuous deployment to production failed"
       GH_TOKEN: ${{ github.token }}
@@ -272,9 +257,8 @@ jobs:
           #      previous retained release, and a filed issue, if any of it
           #      fails.
           #
-          # Double-fire is harmless: `concurrency: deploy-prod` with
-          # cancel-in-progress false serialises runs, and a second run finds
-          # this commit already recorded as deployed and skips below.
+          # A repeated manual request is safe: promotions are serialized and
+          # a later run skips a commit already recorded as deployed.
           #
           # workflow_dispatch with force=true still overrides the drift guard
           # and the already-deployed check, and says so loudly in both the log
@@ -286,7 +270,7 @@ jobs:
 
           target="${TARGET_SHA:-}"
           if [ -z "${target}" ]; then
-            echo "::error title=No target commit::neither workflow_run.head_sha nor github.sha resolved"
+            echo "::error title=No target commit::github.sha did not resolve"
             exit 1
           fi
           echo "trigger: ${TRIGGERED_BY}"

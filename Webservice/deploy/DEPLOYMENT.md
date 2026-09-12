@@ -204,9 +204,9 @@ Production is **continuous**: it tracks canonical `master`, not tags.
   `livingroom-pc` self-hosted Linux runner, and invoke
   `/home/liveuser/Repositories/CAD/Webservice/deploy/update.sh staging`.
 - **Production:** `.github/workflows/deploy-prod.yml` fires on every push to
-  canonical `master` (and on a green `linux-gate`, and on manual dispatch).
+  canonical `master` and on manual dispatch.
 
-  **No CI workflow blocks the deploy, and that is measured rather than lax.**
+  **Platform CI workflows are advisory; the live Stripe sandbox gate blocks promotion.**
   On the current fleet not one of them can conclude: `fast-gate` and
   `native-build` both matrix onto `cc-mac-arm` (macbook-air-m2, offline) and
   `native-build` only reports success when all four legs pass; `linux-gate` is
@@ -219,6 +219,9 @@ Production is **continuous**: it tracks canonical `master`, not tags.
   read and reported into the run log and summary; none of them vetoes a release.
 
   What gates instead actually runs, in order:
+
+  The separate **live Stripe sandbox gate** must succeed before promotion starts.
+  The platform-build workflow states are advisory, not a substitute for this gate.
 
   1. **`scripts/check.py`, inline** — nine deterministic source audits, ~17 s,
      including icon-atlas coverage and ribbon-command-to-handler routing, the
@@ -234,9 +237,11 @@ Production is **continuous**: it tracks canonical `master`, not tags.
   3. **Post-deploy verification**, then **automatic rollback** to the previous
      retained release plus a filed issue if any of it fails.
 
-  Restoring a CI pre-gate is a matter of bringing `macbook-air-m2` back online
-  and burning down the `linux-gate` backlog; the `workflow_run` trigger is still
-  wired, so a green `linux-gate` re-enters this same path with no edit needed.
+  Deployment is triggered only by master pushes and explicit manual dispatches.
+  CI-completion events do not enqueue deployments: GitHub's concurrency group
+  retains only one pending run, so an older CI completion could otherwise cancel
+  the pending deployment of a newer master commit. Active promotions are never
+  cancelled. Use `workflow_dispatch` to retry a failed promotion.
 
   It runs on the single `cc-linux-livingroom` runner as `liveuser` and invokes:
 

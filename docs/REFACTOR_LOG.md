@@ -3980,6 +3980,17 @@ with no local-source override. The engine/daemon and selected tests build;
 `mesh`, `mesh_quality`, `mesher_advanced`, and `tet10_thin_wall` all pass
 (334 seconds total). All nine `scripts/check.py` source gates pass.
 
+The queued promotion `34660550926` was then cancelled when an older Linux gate's
+completion scheduled `34666614854`. GitHub concurrency retains one pending run,
+not a FIFO queue; the redundant completion event displaced the newer master push.
+Removed the obsolete `workflow_run` trigger and its payload-dependent branches.
+Master pushes and explicit manual requests remain the only production triggers;
+active promotions, the Stripe gate, source audits, builds, verification, and
+rollback retain their existing protection. The workflow policy reports zero
+errors (two unrelated advisories), and all ten embedded shell steps pass
+`bash -n` using literal YAML bodies. Production promotion is tracked separately;
+a successful workflow with a skipped promotion is not deployment evidence.
+
 ## 2026-09-11 — independent body material persistence
 
 Fixed a production Chudware session reproduction where `set_material("A36",

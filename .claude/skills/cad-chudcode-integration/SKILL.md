@@ -201,6 +201,13 @@ python3 scripts/pin_chudcode.py stage --target linux-x86_64 \
 canonical filename atomically. Only explicit `fetch` performs network I/O. Pin all five targets
 atomically; partial lock updates are invalid.
 
+For retained-release recovery, validate that release's notices with
+`--lock <release>/CHUDCODE_ARTIFACT.lock verify-notices --source-dir <release>`,
+then its binary with `verify --target <host-target> --input <release>/bin/chud`.
+The global `check-lock` publication gate requires all platforms and is not a
+host-specific restorability check. Notice hashes remain mandatory even when
+another platform's download is unpinned.
+
 ## Shared UI vocabulary
 
 CAD's `assets/ui-shared-manifest.json` must be byte-identical to Chudcode's file and declare

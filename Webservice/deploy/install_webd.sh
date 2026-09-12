@@ -31,6 +31,14 @@ fatal() {
   exit 1
 }
 
+# Match update.sh's pre-mutation refusal contract. Call only before service
+# definitions, the live release, or running services have been changed.
+refuse() {
+  echo "[webd] REFUSED: $*" >&2
+  echo "[webd] live release and running services were not changed" >&2
+  exit 4
+}
+
 # Retention depth for `releases/`, counting the release this run promotes. Before
 # this existed the previous release was deleted the instant a promotion succeeded,
 # which meant a bad build reaching production had nothing behind it to restore.
@@ -288,22 +296,6 @@ built_at_utc=$BUILT_AT_UTC
 EOF
 echo "[webd] joint release validated (sha ${JOINT_SHA:0:12})"
 
-# Install service definitions before moving `current`, so daemon-reload failure
-# cannot leave freshly promoted bits paired with stale service policy.
-UNIT_DIR="$HOME/.config/systemd/user"
-mkdir -p "$UNIT_DIR"
-install_unit() {
-  local src="$1" dst="$2" tmp
-  tmp="$dst.staging.$$"
-  cp "$src" "$tmp"
-  mv -f "$tmp" "$dst"
-}
-install_unit "$STAGE_ROOT/chudware-hostd.service" "$UNIT_DIR/chudware-hostd.service"
-install_unit "$ROOT/Webservice/deploy/chudware-gateway.service" "$UNIT_DIR/chudware-gateway.service"
-install_unit "$ROOT/Webservice/deploy/chudware-gateway-staging.service" "$UNIT_DIR/chudware-gateway-staging.service"
-systemctl --user daemon-reload || fatal "systemd user daemon-reload failed"
-systemctl --user enable chudware-hostd.service >/dev/null || fatal "could not enable chudware-hostd.service"
-echo "[webd] systemd units installed"
 
 CURRENT_JOINT=""
 if [ -f "$DST/current/deploy-manifest" ]; then
@@ -320,7 +312,7 @@ if [ "$RESTART" = 1 ] && { [ "$RUNNING" = 0 ] || [ "$RUNNING_JOINT" != "$JOINT_S
 fi
 
 if [ "$RUNNING" = 1 ] && [ "$RESTART" = 0 ] && [ "$NEEDS_PROMOTION" = 1 ]; then
-  fatal "hostd is running; refusing to promote a new joint release without --restart"
+  refuse "hostd is running; refusing to promote a new joint release without --restart"
 fi
 
 # Read systemd-style KEY=value entries without sourcing a secrets file as shell.
@@ -394,56 +386,72 @@ case "$REQUIRE_IDLE" in 0|1) ;; *) fatal "CHUDWARE_WEBD_REQUIRE_IDLE must be 0 o
 if [ "$RUNNING" = 1 ] && { [ "$NEEDS_RESTART" = 1 ] || [ "$REQUIRE_IDLE" = 1 ]; }; then
   DATA_ROOT="${CHUDWARE_WEB_DATA:-$HOME/chudware-web-data}"
   GATEWAY_ENV="${CHUDWARE_WEB_GATEWAY_ENV:-$DATA_ROOT/gateway.env}"
-  [ -r "$GATEWAY_ENV" ] || fatal "gateway env unreadable at $GATEWAY_ENV; cannot authenticate drain health"
+  [ -r "$GATEWAY_ENV" ] || refuse "gateway env unreadable at $GATEWAY_ENV; cannot authenticate drain health"
   FILE_DATA_ROOT="$(read_env_value "$GATEWAY_ENV" CHUDWARE_WEB_DATA)"
   [ -z "$FILE_DATA_ROOT" ] || DATA_ROOT="$FILE_DATA_ROOT"
   DATA_ROOT="${DATA_ROOT/#\~/$HOME}"
   HEALTH_EMAIL="${CHUDWARE_WEBD_HEALTH_EMAIL:-$(read_env_value "$GATEWAY_ENV" CHUDWARE_WEBD_HEALTH_EMAIL)}"
   if [ -z "$HEALTH_EMAIL" ]; then
     HEALTH_DB_URL="$(read_env_value "$GATEWAY_ENV" CHUDWARE_DB_URL)"
-    [ -n "$HEALTH_DB_URL" ] || fatal "CHUDWARE_DB_URL missing from $GATEWAY_ENV; cannot select a loopback identity"
-    command -v psql >/dev/null 2>&1 || fatal "psql not found; install postgresql to read the account store"
+    [ -n "$HEALTH_DB_URL" ] || refuse "CHUDWARE_DB_URL missing from $GATEWAY_ENV; cannot select a loopback identity"
+    command -v psql >/dev/null 2>&1 || refuse "psql not found; install postgresql to read the account store"
     if ! HEALTH_EMAIL="$(with_pgpass "$HEALTH_DB_URL" psql --no-password -tAXq -v ON_ERROR_STOP=1 -c \
       "SELECT email FROM accounts WHERE status='active' ORDER BY CASE role WHEN 'admin' THEN 0 ELSE 1 END, email LIMIT 1")"; then
-      fatal "could not read an active loopback identity from the account store"
+      refuse "could not read an active loopback identity from the account store"
     fi
   fi
-  [ -n "$HEALTH_EMAIL" ] || fatal "no active account available for authenticated drain health"
+  [ -n "$HEALTH_EMAIL" ] || refuse "no active account available for authenticated drain health"
   HEALTH_PORT="${CHUDWARE_WEB_GATEWAY_PORT:-8300}"
   [[ "$HEALTH_PORT" =~ ^[0-9]+$ ]] && [ "$HEALTH_PORT" -ge 1 ] && [ "$HEALTH_PORT" -le 65535 ] \
-    || fatal "invalid loopback gateway port: $HEALTH_PORT"
+    || refuse "invalid loopback gateway port: $HEALTH_PORT"
   HEALTH_URL="http://127.0.0.1:$HEALTH_PORT"
   MAXW="${CHUDWARE_WEBD_RESTART_MAX_WAIT:-600}"
-  [[ "$MAXW" =~ ^[0-9]+$ ]] || fatal "CHUDWARE_WEBD_RESTART_MAX_WAIT must be a non-negative integer"
+  [[ "$MAXW" =~ ^[0-9]+$ ]] || refuse "CHUDWARE_WEBD_RESTART_MAX_WAIT must be a non-negative integer"
   HEALTH_DB_URL="${HEALTH_DB_URL:-$(read_env_value "$GATEWAY_ENV" CHUDWARE_DB_URL)}"
-  [ -n "$HEALTH_DB_URL" ] || fatal "CHUDWARE_DB_URL missing from $GATEWAY_ENV; cannot mint a drain health session"
+  [ -n "$HEALTH_DB_URL" ] || refuse "CHUDWARE_DB_URL missing from $GATEWAY_ENV; cannot mint a drain health session"
   GATEWAY_DIR="$ROOT/Webservice/gateway"
   GATEWAY_PY="$GATEWAY_DIR/.venv/bin/python"
-  [ -x "$GATEWAY_PY" ] || fatal "gateway venv python missing at $GATEWAY_PY; cannot mint a drain health session"
+  [ -x "$GATEWAY_PY" ] || refuse "gateway venv python missing at $GATEWAY_PY; cannot mint a drain health session"
   # The session must outlive the whole drain wait, or a long poll would start
   # failing on an expired cookie and look like an unreachable gateway.
   if ! HEALTH_SID="$(cd "$GATEWAY_DIR" && CHUDWARE_DB_URL="$HEALTH_DB_URL" \
     "$GATEWAY_PY" -m authn ops-session --email "$HEALTH_EMAIL" --ttl-seconds "$((MAXW + 60))")"; then
-    fatal "could not mint an ops session for $HEALTH_EMAIL; refusing unauthenticated drain"
+    refuse "could not mint an ops session for $HEALTH_EMAIL; refusing unauthenticated drain"
   fi
-  [ -n "$HEALTH_SID" ] || fatal "ops session for $HEALTH_EMAIL was empty; refusing unauthenticated drain"
+  [ -n "$HEALTH_SID" ] || refuse "ops session for $HEALTH_EMAIL was empty; refusing unauthenticated drain"
   waited=0
   while :; do
     if ! active="$(probe_engine_bridges)"; then
-      fatal "authenticated $HEALTH_URL/healthz unreachable or missing engine_bridges; refusing restart"
+      refuse "authenticated $HEALTH_URL/healthz unreachable or missing engine_bridges; refusing restart"
     fi
     if [ "$active" = 0 ]; then
       echo "[webd] authenticated drain reports zero active engine bridges"
       break
     fi
     if [ "$waited" -ge "$MAXW" ]; then
-      fatal "$active engine bridge(s) still active after ${MAXW}s; refusing to drop users"
+      refuse "$active engine bridge(s) still active after ${MAXW}s; refusing to drop users"
     fi
     echo "[webd] $active engine bridge(s) active — deferring promotion/restart (${waited}s/${MAXW}s)"
     sleep 5
     waited=$((waited + 5))
   done
 fi
+# Install service definitions before moving `current`, so daemon-reload failure
+# cannot leave freshly promoted bits paired with stale service policy.
+UNIT_DIR="$HOME/.config/systemd/user"
+mkdir -p "$UNIT_DIR"
+install_unit() {
+  local src="$1" dst="$2" tmp
+  tmp="$dst.staging.$$"
+  cp "$src" "$tmp"
+  mv -f "$tmp" "$dst"
+}
+install_unit "$STAGE_ROOT/chudware-hostd.service" "$UNIT_DIR/chudware-hostd.service"
+install_unit "$ROOT/Webservice/deploy/chudware-gateway.service" "$UNIT_DIR/chudware-gateway.service"
+install_unit "$ROOT/Webservice/deploy/chudware-gateway-staging.service" "$UNIT_DIR/chudware-gateway-staging.service"
+systemctl --user daemon-reload || fatal "systemd user daemon-reload failed"
+systemctl --user enable chudware-hostd.service >/dev/null || fatal "could not enable chudware-hostd.service"
+echo "[webd] systemd units installed"
 
 LEGACY_BIN=""
 LEGACY_APP=""

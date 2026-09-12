@@ -536,10 +536,20 @@ def _parser() -> argparse.ArgumentParser:
         if name != "verify":
             command.add_argument("--output", type=Path, required=True)
     sub.add_parser("check-lock")
-    stage_notice_parser = sub.add_parser(
-        "stage-notices", help="verify and stage the two artifact-locked Chudcode notices"
+    verify_notice_parser = sub.add_parser(
+        "verify-notices",
+        help="verify locked notices independently of binary target availability",
     )
-    stage_notice_parser.add_argument("--source-dir", type=Path, default=DEFAULT_NOTICE_DIR)
+    verify_notice_parser.add_argument(
+        "--source-dir", type=Path, default=DEFAULT_NOTICE_DIR
+    )
+    stage_notice_parser = sub.add_parser(
+        "stage-notices",
+        help="verify and stage the two artifact-locked Chudcode notices",
+    )
+    stage_notice_parser.add_argument(
+        "--source-dir", type=Path, default=DEFAULT_NOTICE_DIR
+    )
     stage_notice_parser.add_argument("--output-dir", type=Path, required=True)
     return parser
 
@@ -571,9 +581,7 @@ def main(argv: list[str] | None = None) -> int:
             result = pin_lock(args)
         elif args.command == "check-lock":
             lock = load_lock(args.lock)
-            notice_evidence = verify_notices(
-                args.lock.parent, lock_path=args.lock
-            )
+            notice_evidence = verify_notices(args.lock.parent, lock_path=args.lock)
             result = {
                 "lock": str(args.lock),
                 "version": lock["version"],
@@ -581,6 +589,10 @@ def main(argv: list[str] | None = None) -> int:
                 "targets": len(lock["artifacts"]),
                 "notices": notice_evidence["notices"],
             }
+        elif args.command == "verify-notices":
+            result = verify_notices(
+                args.source_dir, lock_path=args.lock, require_pinned=False
+            )
         elif args.command == "stage-notices":
             result = stage_notices(
                 args.output_dir, source=args.source_dir, lock_path=args.lock

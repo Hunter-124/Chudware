@@ -197,8 +197,10 @@ validate_release() {
     || reject_candidate "$id" "Chudcode notice no longer matches its deploy manifest" || return 1
   [ "$(sha256sum "$dir/CHUDCODE-THIRD-PARTY-NOTICES.txt" | cut -d' ' -f1)" = "$third_party_sha" ] \
     || reject_candidate "$id" "Chudcode third-party notices no longer match their deploy manifest" || return 1
+  # A retained release needs its own target, not every platform's download.
+  # Validate notices independently; the binary check below requires the Linux pin.
   "$PYTHON" "$ROOT/scripts/pin_chudcode.py" \
-    --lock "$dir/CHUDCODE_ARTIFACT.lock" check-lock >/dev/null 2>&1 \
+    --lock "$dir/CHUDCODE_ARTIFACT.lock" verify-notices --source-dir "$dir" >/dev/null 2>&1 \
     || reject_candidate "$id" "Chudcode notices do not satisfy their artifact lock" || return 1
   "$PYTHON" "$ROOT/scripts/pin_chudcode.py" \
     --lock "$dir/CHUDCODE_ARTIFACT.lock" verify \

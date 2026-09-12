@@ -3991,6 +3991,28 @@ errors (two unrelated advisories), and all ten embedded shell steps pass
 `bash -n` using literal YAML bodies. Production promotion is tracked separately;
 a successful workflow with a skipped promotion is not deployment evidence.
 
+Run `34671349919` then passed the production native/WASM build and validated joint
+`d1fff6d004cf`, but refused promotion after one browser bridge remained for 600
+seconds. The live release/link and running joint remained
+`20260905T043941Z-bcb447fb22a8-42710` / `bcb447fb22a8…`. Fixed
+`install_webd.sh` to report drain/authentication refusals as exit 4, matching the
+updater/CI contract, and install service definitions only after idle is proven.
+A full-installer smoke using real native, Chudcode, and browser artifacts with an
+isolated control-plane fixture reproduced exit 1 plus changed unit files before
+the fix. Busy/unreachable cases now exit 4 with units, release link, and running
+joint unchanged; an injected reload failure after idle admission still exits 1.
+
+The rollback alert was also misleading: its all-platform `check-lock` rejected
+otherwise valid retained Linux releases because ARM download pins were absent.
+Added `pin_chudcode.py verify-notices`; rollback now verifies notice hashes
+independently and still verifies the actual Linux binary against its own lock.
+The global publication check remains strict. Read-only execution of the actual
+candidate validator on the production host rejected the current release before
+the fix and accepted all three retained releases afterward, without changing any
+release files or restarting services. The targeted artifact/deployment suite
+passes 27 cases and all nine source gates pass. Removed source-text/wording and
+incidental checked-in pin assertions rather than repinning brittle tests.
+
 ## 2026-09-11 — independent body material persistence
 
 Fixed a production Chudware session reproduction where `set_material("A36",

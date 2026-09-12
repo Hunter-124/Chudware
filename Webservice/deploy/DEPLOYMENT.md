@@ -144,6 +144,11 @@ minting or telemetry fails or when active bridges do not drain. Anonymous
 `/healthz` intentionally remains the bare `{"ok": true}` liveness contract and
 must not be used for drain decisions.
 
+Drain failures are pre-mutation refusals (exit 4): service definitions are installed
+only after the idle proof succeeds. CI leaves the existing release in place rather
+than attempting rollback. Save work, close browser workspace tabs, and retry the
+deployment once the bridges disconnect.
+
 ### Release retention and rollback
 
 `install_webd.sh` keeps the newest `CHUDWARE_WEBD_KEEP_RELEASES` release
@@ -189,6 +194,10 @@ step:
 - `--force` skips the bridge drain, for when production is already broken and
   waiting out `CHUDWARE_WEBD_RESTART_MAX_WAIT` protects nobody.
 - Exit 0 restored, 1 failure, 2 usage error or no rollback target available.
+- Retained-release validation checks the Linux binary and both notices against
+  that release's artifact lock. Unavailable downloads for other architectures
+  do not make a verified Linux release unrestorable. The global `check-lock`
+  publication gate still requires every target to be pinned.
 
 Rollback restores an already-built tree and never touches PostgreSQL. A
 promotion whose schema migration is not backward compatible is therefore not
@@ -313,8 +322,8 @@ the native daemon by design. Continuous deployment therefore means materially
 more restarts than a tag cadence did. `CHUDWARE_WEBD_RESTART_MAX_WAIT`
 (default 600s) is what keeps those restarts from dropping active users: the
 installer waits for authenticated `engine_bridges` to reach 0 and fails closed
-instead of restarting under load. Shortening that wait trades user sessions
-for deploy latency.
+instead of restarting under load. Expiry refuses the deployment; shortening the
+wait does not authorize disconnecting users.
 
 Production WASM builds default to CMake `MinSizeRel`; Release's `wasm-opt -O3`
 peaked above 9 GiB RSS and was OOM-killed on the 16 GiB deployment host.

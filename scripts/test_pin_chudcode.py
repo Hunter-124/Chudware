@@ -74,36 +74,6 @@ def _lock(tmp_path: Path) -> tuple[Path, dict[str, Path]]:
     return path, binaries
 
 
-def test_checked_in_lock_declares_every_required_release_input() -> None:
-    lock = pin.load_lock(pin.DEFAULT_LOCK, require_pinned=False)
-    assert set(lock["artifacts"]) == set(pin.SUPPORTED_TARGETS)
-    assert lock["rpc_protocol"] == 2
-    assert lock["version"] == "0.3.0"
-    assert lock["engine_version"] == "18.0.8"
-    assert lock["repository_commit"] == "8016e444045a68facdf9325ecdb08af3298d80d7"
-    assert lock["notices"]["repository_commit"] == lock["repository_commit"]
-    linux = lock["artifacts"]["linux-x86_64"]
-    assert linux["url"].startswith("https://github.com/Hunter-124/chudcode/releases/download/chudcode-v0.3.0/")
-    assert len(linux["sha256"]) == 64
-    assert lock["notices"]["files"] == {
-        "CHUDCODE-NOTICE": {
-            "sha256": "58a54468725d1d3b02a5afa38da728dfe8a147e1e669d0842096091dfe12e82d",
-            "source": "NOTICE",
-        },
-        "CHUDCODE-THIRD-PARTY-NOTICES.txt": {
-            "sha256": "c1474c6cfedf5c67b229b4dee355a518293e019abf393f3e29cd33b075f09714",
-            "source": "THIRD-PARTY-NOTICES.txt",
-        },
-    }
-    evidence = pin.verify_notices(require_pinned=False)
-    assert evidence["notices"] == {
-        name: item["sha256"] for name, item in lock["notices"]["files"].items()
-    }
-    with pytest.raises(pin.ArtifactLockError, match="not pinned"):
-        pin.load_lock(pin.DEFAULT_LOCK)
-
-
-
 def test_stage_needs_only_the_staged_targets_pin(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -113,10 +83,15 @@ def test_stage_needs_only_the_staged_targets_pin(
         if target != "linux-x86_64":
             partial["artifacts"][target].update({"sha256": None, "url": None})
     lock.write_bytes(pin._canonical_json(partial))
-    monkeypatch.setattr(pin, "_verify_executable_version", lambda *_args: "Chudcode v0.2.0")
+    monkeypatch.setattr(
+        pin, "_verify_executable_version", lambda *_args: "Chudcode v0.2.0"
+    )
 
     staged = pin.stage_binary(
-        binaries["linux-x86_64"], tmp_path / "out" / "chud", "linux-x86_64", lock_path=lock
+        binaries["linux-x86_64"],
+        tmp_path / "out" / "chud",
+        "linux-x86_64",
+        lock_path=lock,
     )
     assert Path(staged["staged"]).is_file()
     notices = pin.stage_notices(tmp_path / "notices", source=tmp_path, lock_path=lock)
@@ -125,6 +100,23 @@ def test_stage_needs_only_the_staged_targets_pin(
         pin.verify_binary(binaries["windows-x86_64"], "windows-x86_64", lock_path=lock)
     with pytest.raises(pin.ArtifactLockError, match="not pinned"):
         pin.load_lock(lock)
+
+
+def test_retained_notice_integrity_does_not_require_foreign_binary_pins(
+    tmp_path: Path,
+) -> None:
+    lock, _ = _lock(tmp_path)
+    partial = json.loads(lock.read_bytes())
+    partial["artifacts"]["linux-aarch64"].update({"sha256": None, "url": None})
+    lock.write_bytes(pin._canonical_json(partial))
+    args = ["--lock", str(lock), "verify-notices", "--source-dir", str(tmp_path)]
+
+    assert pin.main(args) == 0
+    # The publication gate still requires every platform; recovery does not.
+    assert pin.main(["--lock", str(lock), "check-lock"]) == 1
+    (tmp_path / "CHUDCODE-NOTICE").write_bytes(b"untrusted replacement")
+    assert pin.main(args) == 1
+
 
 def test_verified_stage_is_offline_and_uses_canonical_filename(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch

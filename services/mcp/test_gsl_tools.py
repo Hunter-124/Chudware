@@ -450,49 +450,126 @@ def test_describe_results_modal_study_and_named_lookup():
 # ---------------------------------------------------------------- describe_assembly (T-F8)
 
 
-def test_describe_assembly_single_part_ok():
-    """describe_assembly on a plain single-body part narrates without crashing — either the
-    graceful no-bodies phrase or a placement narrative with real numerals and attribution."""
+def _new_description_boxes(name: str, offset: float) -> str:
+    created, _ = _call("new_part", {"name": name, "fresh": True})
+    assert created["ok"], created
+    doc = created["doc_id"]
+    result, _ = _call("add_features", {"doc_id": doc, "ops": [
+        {"type": "box", "name": "Base", "mode": "new", "at": [0, 0, 0],
+         "params": {"length": 10, "width": 10, "height": 10}},
+        {"type": "box", "name": "Neighbor", "mode": "new", "at": [offset, 0, 0],
+         "params": {"length": 10, "width": 10, "height": 10}},
+    ]})
+    assert result["ok"], result
+    return doc
+
+
+def test_describe_assembly_native_threshold_bound_not_measured_gap():
+    # The 2 mm gap is inside legacy quick=True's 10 mm exact-distance window.
+    doc = _new_description_boxes("gsl_threshold_description", 12)
+    result, _ = _call("describe_assembly", {"doc_id": doc})
+    assert result["ok"] and result["collision_free"], result
+    fit = result["fit"]
+    assert fit["complete"] and fit["pairs_checked"] == fit["pairs_total"] == 1, fit
+    assert not fit["interferences"], fit
+    clearance, = fit["clearances"]
+    assert clearance.get("distance") is None, clearance
+    assert clearance["distance_lower_bound_mm"] == pytest.approx(2, abs=1e-5), clearance
+    text = result["text"].lower()
+    assert "lower bound" in text and "not measured" in text, result
+    assert "tightest gap" not in text and "2.00 mm gap" not in text, result
+
+
+def test_describe_assembly_native_clash_preserves_volume():
+    doc = _new_description_boxes("gsl_clashing_description", 6)
+    result, _ = _call("describe_assembly", {"doc_id": doc})
+    assert result["ok"] and result["collision_free"] is False, result
+    fit = result["fit"]
+    assert fit["complete"] and fit["pairs_checked"] == fit["pairs_total"] == 1, fit
+    assert fit["ok"] is False, fit
+    clash, = fit["interferences"]
+    assert clash["volume"] == pytest.approx(400, abs=1e-5), clash
+    assert "400.00 mm^3 overlap" in result["text"], result
+
+
+def test_describe_assembly_one_body_does_not_qualify_collision_free():
     doc = _new_plate_with_hole()
-    r, _ = _call("describe_assembly", {"doc_id": doc})
-    assert r is not None and r.get("ok"), r
-    text = r.get("text", "")
-    if "No bodies found" in text:
-        # Graceful degradation phrase per contracts/narration.md.
-        assert "add components" in text, text
-    else:
-        # Placement narrative: bbox numerals + the per-line and trailing attributions.
-        assert "component(s) / bod" in text, text
-        assert "(source: asm_world_bodies)" in text, text
-        assert re.search(r"\d+(\.\d+)?", text), text
-        assert ("(Source: asm_world_bodies, eval_interference, doc_solve_mates — "
-                "numbers narrated, never recomputed)") in text, text
+    result, _ = _call("describe_assembly", {"doc_id": doc})
+    assert result["ok"] and result["collision_free"] is False, result
+    assert result["fit"]["pairs_checked"] == result["fit"]["pairs_total"] == 0, result
+    assert "not a collision-free qualification" in result["text"], result
+    assert "0.00 mm gap" not in result["text"], result
 
 
-def test_describe_assembly_multibody_fit_report():
-    """On a multi-body part (transform copy), describe_assembly names both bodies and reports
-    fit — either a FIT REPORT block (interference) or the no-interference clearance line."""
-    r, _ = _call("new_part", {"name": "gsl_asm"})
-    doc = r["doc_id"]
-    ops = [
-        cb.feat("box", "Base",
-                {"length": cb.dim(30), "width": cb.dim(20), "height": cb.dim(10)}),
-        cb.feat("transform", "Copy",
-                {"mode": "copy", "translate": [50.0, 0.0, 0.0]}),
-    ]
-    r2, _ = _call("add_features", {"ops": ops, "doc_id": doc})
-    if not (r2 and r2.get("ok")):
-        pytest.skip(f"transform copy not available: {r2}")
-    r3, _ = _call("describe_assembly", {"doc_id": doc})
-    assert r3 is not None and r3.get("ok"), r3
-    text = r3.get("text", "")
-    if "No bodies found" in text:
-        pytest.skip("asm_world_bodies reports no bodies for a transform-copy part")
-    assert "(source: asm_world_bodies)" in text, text
-    # Two world-placed bodies 50mm apart never overlap: expect a fit verdict either way.
-    assert ("FIT REPORT" in text or "no interference detected" in text
-            or "Fit/clearance: not available" in text), text
-    assert re.search(r"\d+(\.\d+)?", text), text
+@pytest.mark.parametrize("failure_kind", ["pair", "geometry", "missing_report"])
+def test_describe_assembly_incomplete_fit_cannot_pass(monkeypatch, failure_kind):
+    doc = _new_description_boxes("gsl_incomplete_description", 12)
+    native_call = cb.call
+
+    def fail_fit(method, params=None):
+        report = native_call(method, params)
+        if method != "eval_interference":
+            return report
+        if failure_kind == "missing_report":
+            return {}
+        report["ok"] = False
+        report["complete"] = False
+        report["pairs_checked"] = 0
+        pair = report["clearances"].pop()
+        if failure_kind == "pair":
+            report["pair_failures"] = [
+                {"a": pair["a"], "b": pair["b"], "reason": "boolean_failed"}]
+        else:
+            report["geometry_failures"] = [
+                {"name": pair["a"], "reason": "invalid_geometry"}]
+        return report
+
+    monkeypatch.setattr(cb, "call", fail_fit)
+    result, _ = _call("describe_assembly", {"doc_id": doc})
+    assert result["ok"] is False and result["collision_free"] is False, result
+    assert "incomplete" in result["text"].lower(), result
+    assert "no volumetric interference" not in result["text"].lower(), result
+    assert "0.00 mm gap" not in result["text"], result
+    if failure_kind != "missing_report":
+        reason = "boolean_failed" if failure_kind == "pair" else "invalid_geometry"
+        assert reason in result["text"], result
+        failures = result["fit"]["pair_failures" if failure_kind == "pair"
+                                 else "geometry_failures"]
+        assert failures[0]["reason"] == reason, result
+
+
+def test_describe_assembly_fit_error_is_not_a_success(monkeypatch):
+    doc = _new_plate_with_hole()
+    native_call = cb.call
+
+    def fail_fit(method, params=None):
+        if method == "eval_interference":
+            raise cb.CoreError("Overlap evaluation failed", code="geometry_error")
+        return native_call(method, params)
+
+    monkeypatch.setattr(cb, "call", fail_fit)
+    result, _ = _call("describe_assembly", {"doc_id": doc})
+    assert result["ok"] is False and result["code"] == "geometry_error", result
+    assert not result.get("collision_free"), result
+
+
+@pytest.mark.parametrize("failed_method", ["asm_world_bodies", "doc_solve_mates",
+                                          "eval_interference"])
+def test_describe_assembly_connection_loss_remains_structured(monkeypatch, failed_method):
+    doc = _new_plate_with_hole()
+    native_call = cb.call
+
+    def lose_engine(method, params=None):
+        if method == failed_method:
+            raise cb.CoreError("Engine session lost", code="engine_connection_lost",
+                               detail={"method": method})
+        return native_call(method, params)
+
+    monkeypatch.setattr(cb, "call", lose_engine)
+    result, _ = _call("describe_assembly", {"doc_id": doc})
+    assert result["ok"] is False and result["code"] == "engine_connection_lost", result
+    assert result["detail"]["method"] == failed_method, result
+    assert not result.get("collision_free"), result
 
 
 # ---------------------------------------------------------------- describe_board (T-F8)

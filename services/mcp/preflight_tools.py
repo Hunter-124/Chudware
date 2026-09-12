@@ -12,21 +12,20 @@ Internal seam:
     result dict; caller attaches ``advisory_items`` to its own response and, if
     the verdict is ``fail``, calls ``log_preflight_override`` after applying.
 
-    A shadow-clone dry-run costs ~8 engine RPCs (doc_tree, doc_new, replay
-    doc_apply_ops, per-check measures, doc_tree again, doc_close) on the hottest
-    tool in the product.  ``skip_reason`` gates it: batches whose verdict none of
-    the four checks could plausibly change (a lone primitive with no refs, a
-    rename / set_units / set_material / set_appearance / eq_set) skip the clone.
+    Prediction uses native scratch state with a copied compile-cache index, not
+    a replay of the complete source history. ``skip_reason`` avoids prediction
+    for batches whose verdict none of the four checks could plausibly change
+    (a lone primitive with no refs, or metadata-only changes).
     Every decision — skip or run — is recorded in ``preflight_decisions()`` and
     the skip reason rides back on the envelope, so it is never silent.
 
 Env:
     ``CHUDWARE_PREFLIGHT=0``       — off entirely (verdict "skipped", "disabled").
-    ``CHUDWARE_PREFLIGHT=always``  — force the clone even for trivial batches.
+    ``CHUDWARE_PREFLIGHT=always``  — force prediction even for trivial batches.
     ``CHUDWARE_PREFLIGHT_MAX_OPS`` — batch size above which the gate always runs
-                                     the clone (default 3).
+                                     prediction (default 3).
 
-Freedom rule: a failed preflight NEVER blocks the caller.
+Freedom rule: a fail verdict is advisory; engine connection loss still aborts.
 """
 from __future__ import annotations
 
@@ -45,9 +44,9 @@ _log = logging.getLogger(__name__)
 
 # ------------------------------------------------------------------ complexity gate
 
-# Metadata-only ops: no geometry, no refs to resolve, nothing for a shadow-clone
-# rebuild to predict.  (Op kinds are the closed vocabulary in
-# core/doc/op_registry.cpp; everything NOT listed here runs the clone.)
+# Metadata-only ops: no geometry or refs for the rebuild to predict.
+# Op kinds are the closed vocabulary in core/doc/op_registry.cpp;
+# everything NOT listed here runs prediction.
 _METADATA_OPS: frozenset[str] = frozenset({
     "rename", "set_units", "set_material", "set_appearance", "set_folder", "eq_set",
 })
@@ -64,7 +63,7 @@ _DIM_KEYS: frozenset[str] = frozenset({
     "r1", "r2", "major_r", "minor_r", "size",
 })
 
-# Boolean/subtractive placement — the clone's rebuild_predict earns its keep here.
+# Boolean/subtractive placement benefits from native rebuild prediction.
 _SUBTRACTIVE_MODES: frozenset[str] = frozenset({
     "cut", "subtract", "intersect", "common", "remove",
 })
@@ -98,9 +97,9 @@ def _num(raw: Any) -> Optional[float]:
 
 
 def skip_reason(ops: Any) -> Optional[str]:
-    """Why the shadow-clone dry-run is pointless for *ops* — or None to run it.
+    """Why native scratch prediction is pointless for *ops* — or None to run it.
 
-    Runs the clone for anything preflight can actually rule on: a ref to resolve
+    Runs prediction for anything preflight can actually rule on: a ref to resolve
     (``refs_resolve``), a cut/boolean/shell/fillet/chamfer/pattern or any sketch,
     assembly, delete, reorder, rollback, suppress or paste op (``rebuild_predict``
     / ``downstream_impact``), a non-positive dimension (``params_sane``), or a
@@ -173,7 +172,7 @@ def run_auto_preflight(doc_id: str, tool: str, ops: list) -> dict:
     with a ``skipped``/``skipped_detail`` pair when the run was suppressed —
     ``disabled`` (CHUDWARE_PREFLIGHT=0), ``trivial`` (complexity gate, see
     :func:`skip_reason`) or ``error``.  ``CHUDWARE_PREFLIGHT=always`` forces the
-    clone past the gate for debugging.
+    prediction past the gate for debugging.
     """
     mode = os.environ.get("CHUDWARE_PREFLIGHT", "1").strip().lower()
     if mode in ("0", "false", "off", "no"):
@@ -226,15 +225,15 @@ def register_preflight_tools(mcp: FastMCP) -> None:
         doc_id: Optional[str] = None,
         tool: str = "add_features",
     ) -> str:
-        """Dry-run validate planned ops on a shadow clone of the document.
+        """Dry-run planned ops in cached native scratch state.
 
         Checks planned ops BEFORE they touch the document:
         - ``refs_resolve``: stable ids / names in ops exist in the current tree.
         - ``params_sane``: positive dimensions; fillet radius vs adjacent wall;
           hole depth vs body extent.
-        - ``rebuild_predict``: predicted feature_status after apply (no rollback
-          needed — uses a throwaway clone).
-        - ``downstream_impact``: features referencing entities you are editing.
+        - ``rebuild_predict``: native candidate feature_status and document status,
+          without changing live geometry, history, revisions or cache state.
+        - ``downstream_impact``: live features referencing entities you are editing.
 
         Returns an ``aicad.preflight/1`` JSON object.  ``verdict`` is one of:
         ``pass``, ``warn``, ``fail``, or ``skipped`` (budget exceeded or disabled).
@@ -243,6 +242,9 @@ def register_preflight_tools(mcp: FastMCP) -> None:
 
         **Read-only**: this tool NEVER mutates the live document.  It is safe to
         call speculatively before any destructive edit.
+        Existing history is not cold-replayed. Edited geometry, invalidated
+        suffixes and cache misses can still be expensive; no wall-clock bound
+        is guaranteed.
 
         Typical use:
             1. Before ``add_features``: call ``preflight_ops(ops)`` to catch

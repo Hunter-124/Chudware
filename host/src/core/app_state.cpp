@@ -1257,7 +1257,7 @@ FitReport parseFit(const nlohmann::json& f) {
     FitReport r;
     if (!f.is_object()) return r;
     r.present = true;
-    r.ok = f.value("ok", true);
+    r.ok = f.value("ok", false) && f.value("complete", true);
     r.summary = jstr(f, "summary");
     auto pairs = [](const nlohmann::json& arr, const char* valKey) {
         std::vector<FitPair> v;
@@ -1267,7 +1267,14 @@ FitReport parseFit(const nlohmann::json& f) {
                 FitPair fp;
                 fp.a = jstr(e, "a");
                 fp.b = jstr(e, "b");
-                fp.value = jnum(e, valKey);
+                if (e.contains("distance_lower_bound_mm") && e["distance_lower_bound_mm"].is_number())
+                    fp.distanceLowerBoundMm = e["distance_lower_bound_mm"].get<double>();
+                else if (e.contains(valKey) && e[valKey].is_number()) {
+                    if (e.value("approx", false))
+                        fp.distanceLowerBoundMm = e[valKey].get<double>();
+                    else
+                        fp.value = e[valKey].get<double>();
+                }
                 v.push_back(std::move(fp));
             }
         return v;

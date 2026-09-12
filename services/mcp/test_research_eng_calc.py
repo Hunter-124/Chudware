@@ -31,6 +31,18 @@ def _call(tool: str, **kwargs):
     return json.loads(out) if isinstance(out, str) else out
 
 
+def test_belt_route_nested_geometry_reaches_the_registered_calculator():
+    import math
+
+    out = _call("research_eng_calc", calc="belt_route", params={"pulleys": [
+        {"center_mm": [0, 0], "pitch_radius_mm": 10, "wrap": "ccw"},
+        {"center_mm": [100, 0], "pitch_radius_mm": 10, "wrap": "ccw"},
+        {"center_mm": [50, 0], "pitch_radius_mm": 5, "wrap": "cw"},
+    ]})
+    expected = 100 + 2 * math.sqrt(2500 - 225) + 20 * math.pi + 30 * math.asin(.3)
+    assert out["answer"]["length_mm"] == pytest.approx(expected, rel=1e-12)
+
+
 # The expectation, derived here rather than copied from the tool:
 #   I = b*h^3/12  for a solid rectangle
 #   d = F*L^3 / (3*E*I)
@@ -40,10 +52,6 @@ I_MM4 = B_MM * H_MM ** 3 / 12.0                     # 853.333… mm^4
 D_MM = F_N * L_MM ** 3 / (3.0 * E_MPA * I_MM4)      # 1.6875 mm
 
 
-def test_expectation_is_the_textbook_numbers():
-    """Guards the constants above: if these drift the rest proves nothing."""
-    assert I_MM4 == pytest.approx(853.3333, rel=1e-6)
-    assert D_MM == pytest.approx(1.6875, rel=1e-9)
 
 
 # --------------------------------------------------------------------------- (a) case

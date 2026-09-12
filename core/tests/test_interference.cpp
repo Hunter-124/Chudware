@@ -128,7 +128,13 @@ TEST_CASE("eval_interference: transform-copied overlapping boxes report the exac
     });
     Built b = build("XformOverlap", ops);
 
-    json ir = doc_eval_interference(b.id);
+    json params = json::object();
+    SUBCASE("exact default") {}
+    SUBCASE("threshold still computes the real Common") { params["clearance_mode"] = "threshold"; }
+    json ir = doc_eval_interference(b.id, params);
+    CHECK(ir.at("complete") == true);
+    CHECK(ir.at("pairs_checked") == 1);
+    CHECK(ir.at("pairs_total") == 1);
     REQUIRE(ir.contains("interferences"));
     REQUIRE_MESSAGE(ir["interferences"].size() == 1,
                     "expected exactly one interfering pair, got: " << ir.dump());
@@ -348,7 +354,10 @@ TEST_CASE("eval_interference: flush-stacked boxes report a contacts entry with i
     CHECK_MESSAGE(plain.at("contacts").empty(),
                   "contacts should be empty without include_coincident: " << plain.dump());
 
-    json ir = doc_eval_interference(b.id, json{{"include_coincident", true}});
+    json params{{"include_coincident", true}};
+    SUBCASE("exact default") {}
+    SUBCASE("threshold must measure coincident contact") { params["clearance_mode"] = "threshold"; }
+    json ir = doc_eval_interference(b.id, params);
     CHECK_MESSAGE(ir.at("interferences").empty(),
                   "flush-stacked boxes must not read as an overlap: " << ir.dump());
     REQUIRE_MESSAGE(!ir.at("contacts").empty(),
@@ -374,6 +383,74 @@ TEST_CASE("eval_interference: min_clearance_mm tags a below-threshold gap with a
         CHECK(c.value("warning", std::string()) == "below min clearance");
     }
     CHECK_MESSAGE(found, "no ~0.05mm clearance entry in: " << ir.at("clearances").dump());
+}
+
+TEST_CASE("eval_interference: threshold classifies every pair without inventing exact gaps") {
+    // Cylinders are separated but their AABBs overlap: Common, not an AABB alone,
+    // must prove the close pair has no volumetric interference.
+    Built b = build("ThresholdCylinders", json::array({
+        cyl("A", 10, 10, {0, 0, 0}, {{"merge", false}}),
+        cyl("B", 10, 10, {15, 15, 0}, {{"merge", false}}),
+        box("Far", 10, 10, 10, {100, 100, 0}, {{"merge", false}}),
+    }));
+    const json classified = doc_eval_interference(b.id, {{"clearance_mode", "threshold"}});
+    INFO(classified.dump(2));
+    REQUIRE(classified.at("complete") == true);
+    CHECK(classified.at("ok") == true);
+    CHECK(classified.at("pairs_total") == 3);
+    CHECK(classified.at("pairs_checked") == 3);
+    CHECK(classified.at("scope").at("checked_members") == 3);
+    CHECK(classified.at("interferences").empty());
+    CHECK(classified.at("pair_failures").empty());
+    CHECK(classified.at("geometry_failures").empty());
+    REQUIRE(classified.at("clearances").size() == 3);
+    for (const auto& pair : classified.at("clearances")) {
+        CHECK(pair.at("distance_status") == "lower_bound");
+        CHECK(pair.at("distance_lower_bound_mm").get<double>() >= 0);
+        CHECK_FALSE(pair.contains("distance"));
+    }
+    CHECK(classified.at("clearances")[0].at("distance_lower_bound_mm") == 0.0);
+
+    // Omitted mode and explicit exact both retain all minimum distances.
+    const json exact = doc_eval_interference(b.id);
+    REQUIRE(exact.at("complete") == true);
+    REQUIRE(exact.at("clearances").size() == 3);
+    CHECK(exact.at("clearances")[0].at("distance").get<double>() ==
+          doctest::Approx(1.2132034356).epsilon(1e-6));
+    for (const auto& pair : exact.at("clearances")) {
+        CHECK(pair.at("distance").is_number());
+        CHECK_FALSE(pair.contains("distance_lower_bound_mm"));
+    }
+    CHECK(doc_eval_interference(b.id, {{"clearance_mode", "exact"}}) == exact);
+    CHECK_THROWS(doc_eval_interference(b.id, {{"clearance_mode", "approximate"}}));
+    CHECK_THROWS(doc_eval_interference(b.id, {{"clearance_mode", false}}));
+}
+
+TEST_CASE("eval_interference: inconclusive threshold bounds require exact positive clearance") {
+    Built b = build("ThresholdPositiveClearance", json::array({
+        cyl("A", 10, 10, {0, 0, 0}, {{"merge", false}}),
+        cyl("B", 10, 10, {15, 15, 0}, {{"merge", false}}),
+        box("Far", 10, 10, 10, {100, 100, 0}, {{"merge", false}}),
+    }));
+    double requested = 0.5;
+    bool below_minimum = false;
+    SUBCASE("exact gap proves the request satisfied despite overlapping AABBs") {}
+    SUBCASE("exact gap proves a clearance violation") { requested = 2; below_minimum = true; }
+    const json report = doc_eval_interference(b.id, {
+        {"clearance_mode", "threshold"}, {"min_clearance_mm", requested},
+        {"members", {"b1", "b2"}}, {"quick", true}});
+    INFO(report.dump(2));
+    REQUIRE(report.at("complete") == true);
+    CHECK(report.at("pairs_checked") == 1);
+    CHECK(report.at("pairs_total") == 1);
+    CHECK(report.at("scope").at("total_members") == 3);
+    CHECK(report.at("scope").at("checked_members") == 2);
+    REQUIRE(report.at("clearances").size() == 1);
+    const auto& pair = report.at("clearances")[0];
+    CHECK(pair.at("distance_status") == "exact");
+    CHECK(pair.at("distance").get<double>() == doctest::Approx(1.2132034356).epsilon(1e-6));
+    CHECK_FALSE(pair.contains("distance_lower_bound_mm"));
+    CHECK((pair.value("warning", std::string()) == "below min clearance") == below_minimum);
 }
 
 TEST_CASE("model integrity: positive gap is proximity, not touching, and nearest is exact") {
@@ -832,6 +909,16 @@ TEST_CASE("assembly health: surviving surface is inspected and missing sources p
     const json census = doc_eval_model_integrity(did, json::object());
     REQUIRE(census["solids"].size() == 1);
     REQUIRE(census["non_solids"].size() == 1);
+    const json interference = doc_eval_interference(did, {{"clearance_mode", "threshold"}});
+    CHECK(interference.at("ok") == false);
+    CHECK(interference.at("complete") == false);
+    CHECK(interference.at("pairs_total") == 1);
+    CHECK(interference.at("pairs_checked") == 0);
+    CHECK(interference.at("clearances").empty());
+    REQUIRE(interference.at("pair_failures").size() == 1);
+    CHECK(interference.at("pair_failures")[0].at("reason") == "member_geometry_unavailable");
+    REQUIRE(interference.at("geometry_failures").size() == 1);
+    CHECK(interference.at("geometry_failures")[0].at("name") == "Surface");
     const int surface_id = census["non_solids"][0]["body_id"].get<int>();
     const json health = chudware::doc::doc_eval_solid_health(did, 0);
     REQUIRE(health["bodies"].size() == 2);
@@ -883,6 +970,11 @@ TEST_CASE("invalid solid topology always produces an evaluate-check error") {
     chudware::doc::doc_import_file(fixture.path.string(), id, false, "brep");
     const json health = chudware::doc::doc_eval_solid_health(id, 1);
     REQUIRE(health["bodies"][0]["brep_valid"] == false);
+    const json interference = doc_eval_interference(id, {{"clearance_mode", "threshold"}});
+    CHECK(interference.at("ok") == false);
+    CHECK(interference.at("complete") == false);
+    REQUIRE(interference.at("geometry_failures").size() == 1);
+    CHECK(interference.at("geometry_failures")[0].at("reason") == "invalid_geometry");
     const json checked = chudware::doc::doc_eval_check(id, 1);
     CHECK(std::any_of(checked["issues"].begin(), checked["issues"].end(),
         [](const json& issue) {

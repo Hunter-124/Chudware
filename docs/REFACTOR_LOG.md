@@ -4259,3 +4259,185 @@ skips. The outer one-hour command timed out while the systemd service continued;
 its abandoned output pipe was reattached without restarting passed stages.
 `recovered_tail.out` preserves the actual final gate summary and PASS.
 The temporary watchdog executable and output-recovery helper were removed.
+
+## 2026-09-12 — selected-face finishes and cached native preflight
+
+Source parts now persist visual-only face finishes through `set_appearance`
+and registered `set_material(..., faces=...)`. Exact unique face SIDs and
+canonical fingerprints guard assignment and rendering; ambiguous selections
+reject the transaction, stale records remain inert, and clearing affects only
+the specified records. Physical material identities do not change. Compile
+cache keys, AICM appearance regions, native reopen, direct rendering and nested
+assembly propagation retain the finishes.
+
+A production cylindrical-face refusal exposed inconsistent SID inputs:
+geometry queries classified bores/bosses, while descriptor-based validation
+omitted that classification. Both paths now share the existing geometric
+concavity helper. The retained multibody bore/boss regression failed before
+the correction with `unknown face SID` and now verifies query-authored finishes,
+viewport-pick clearing and isolation from the other body.
+
+Native preflight now uses unregistered scratch state with copied mutable cache
+indexes and shared immutable payloads instead of serializing/replaying a cold
+clone. It preserves source revision, geometry, history, warm state and live
+dependent documents, and returns actual rebuild diagnostics. Missing diagnostics
+or revision races are not passing rebuilds; connection loss fails closed.
+The removed post-call deadline never bounded native execution: cached preflight
+avoids replay but does not promise a deadline for changed geometry.
+
+Focused verification: four native suites (`appearance`, `selectors`, `picks`,
+`render_view`) pass, as do 198 preflight/incremental/connection-loss/MCP tests
+and 94 material-resolution tests. A registered production smoke exercised
+face set/clear/reopen/nesting and cached preflight source isolation. The actual
+desktop opened its saved specimen using the corrected pinned library and
+rendered the distinct top and side finishes; it exited normally with the source
+hash unchanged. Numeric APRG transport is covered by the native loader tests,
+not inferred from screenshot colors. Project evidence is recorded in
+`me490_native_face_preflight_smoke.json` and `me490_native_face_desktop_proof.json`.
+
+Added sourced SKF GE10E ring, SSAB Domex 355MC sheet and ISO 10642 class 010.9
+reduced-head screw records. SKF's undisclosed alloy/density/stiffness/strength
+remain absent; both mass and isotropic FEA resolution refuse substitution.
+The complete bearing's 11 g catalog mass is not a per-ring density. Domex uses
+the published 355 MPa minimum yield and 430 MPa lower ultimate bound, with
+separately identified nominal elastic/density data. The reduced-head screw's
+bulk 10.9 properties do not establish finished-fastener loadability. A direct
+resolver smoke verified these values, refusals and phosphated SKF appearance.
+
+The cast Shore A85 tread gap now has a distinct Polytek PT Flex 85 product
+record: nominal base-product density 1.06 g/cm³ and natural yellow/amber
+appearance. It is not printed TPU95A or generic black plastic. Compatible black
+dye is a documented process option, not a sourced compound-density certificate.
+Conflicting manufacturer tensile values are retained as a caveat, not imported
+as strength; the resolver smoke permits nominal mass and refuses isotropic FEA.
+SKF's initial CN range is separately sourced to its actual catalogue Table 3,
+not the previously cited three-page product sheet or an installed-clearance claim.
+
+## 2026-09-12 — exact registered belt-route geometry
+
+Added `belt_route` to the existing deterministic engineering calculator
+registry, reachable through `list_calcs` and `research_eng_calc`; no parallel
+tool catalog or outside-harness project solver. Ordered pitch/neutral circles
+and signed wrap senses determine exact common tangents and circular wraps,
+including backside idlers. Results expose every endpoint, arc and length;
+impossible, obstructed and self-crossing/touching routes refuse. Normalized
+coordinates keep the geometric predicates separate from physical tolerances.
+The calculator deliberately does not turn supplier center-distance tolerances
+into belt-length allowances or claim tension, strength or hardware clearance.
+
+Synthetic equal/unequal two-pulley, convex three-pulley and reversed backside
+routes were exercised against independent closed-form lengths. Focused
+calculator and registered-tool tests passed (78 tests), including impossible
+tangents and a backside route crossing or kissing the opposite span. Removed
+the old test that merely asserted its own beam-reference arithmetic.
+
+## 2026-09-12 — nonbinding native saves and explicit interference thresholds
+
+Recovery and live-publication saves now serialize an unregistered cached
+snapshot instead of moving the live document into an autosave directory.
+Snapshot component paths retain their original source base without rewriting
+the live relative tree. Ordinary batch project saves preserve an established
+destination even when given a display name; failed metadata reads cannot
+silently select a new destination. Human undo history is not cleared by a
+nonbinding snapshot.
+
+An explicit static interference threshold mode shares motion classification:
+after completed overlap classification, zero-clearance/no-contact checks no
+longer run irrelevant exact distance optimization through helical curves.
+Default exact work remains available. Bounds, measured gaps, unavailable
+distances and incomplete evidence stay distinct in registered narration,
+archived fit cards and desktop results; no minimum measured gap or internal
+OCCT cancellation guarantee is invented.
+
+Native library/daemon and desktop builds passed. Focused native persistence,
+interference, motion and appearance suites passed (4/4). Registered threshold
+tests passed (7), in-process preflight/save/loss tests passed (50), the isolated
+daemon relative-save regression passed (1), and save-policy/recovery/route
+tests passed (111). Actual threaded-wheel and clean teammate bundle workflows
+remain separate production acceptance checks.
+
+Added a sourced plain ISO 7089 class 300 HV washer selection, including the
+listed BelMetric M12 SKU and Westfield dimensional/hardness tolerances.
+It replaces neither a supplier certificate nor a joint qualification.
+Nominal steel density/elasticity remain explicit assumptions; a fresh resolver
+smoke accepted nominal mass and plain appearance and refused isotropic FEA,
+without converting hardness to invented yield or tensile strength.
+
+## 2026-09-12 — implicit fit checks and initial face-cache display
+
+The real threaded wheel completed a 253-pair threshold check, then exposed
+another exact-distance path through `describe_assembly`'s legacy `quick:true`.
+A debugger capture found OCCT curve/curve global optimization, with autosave
+waiting on the document mutex. `gsl_tools.py` and `cad_motion_tools.py` now
+request collision-only threshold classification explicitly. Narration retains
+raw fit evidence; steering retains per-frame accounting and failures through
+the registered turning-radius response. Missing or incomplete checks cannot
+qualify collision-free motion. Native-backed descriptor and motion regressions
+passed (53 tests); the full threaded descriptor is a separate production check.
+
+The display-cache semantic epoch advances to `chudware-geomcache/3`. A native
+regression reproduces an older writer preserving a red selected-face override
+while retaining a blue cached mesh: before the fix, reopen accepted that cache
+and initially displayed the wrong face color. The fixed reopen rejects the
+older epoch and the actual AICM loader sees the authored red face immediately.
+Focused appearance, export, motion and interference CTests passed (4/4).
+
+A clean production teammate mission created and normally saved a fresh nested
+relative-source bundle, moved it to a second folder, hid the original sources,
+edited and restored a real hub feature, and reopened the full ten-solid result.
+All fourteen final native-file hashes matched the proof. The final native
+integrity query checked 45/45 pairs: eight touching and 37 proximity relations,
+no overlaps or failures; this is not load-path or strength approval. A subsequent
+post-proof `doc_list` connection-loss event remains recorded, not hidden.
+
+The actual desktop zero-pair guard was visually observed: it displays
+`No body pairs checked`, not a collision-free result. The surrounding `asm`
+screenshot scenario failed to insert its peg after a stale-revision response,
+so this is not a passing assembly/mate scenario. Bound-only desktop display
+was not visually exercised; its native/Python representation is tested.
+
+## 2026-09-12 — exact face finishes and ME-490 handoff pivot
+
+The production inboard wheel carrier exposed two distinct planar faces per
+short SID. Full query selectors were being reduced to the SID and rejected.
+Native finish assignment now compares complete canonical fingerprints, retains
+independent records for colliding SIDs, and clears either an exact target or an
+entire explicitly requested SID bucket. Partial/stale/ambiguous selections
+remain refusals. The cache semantic epoch is 4. The actual regression failed
+before the fix with `ambiguous_face_sid`; after the fix all 14 appearance cases
+and 967 assertions passed, including different colors, native save/reopen,
+exact clear, and stale-fingerprint rejection.
+
+The user redirected ME-490 to organization, UA Box publication, university
+website workspace access, and a Desktop continuation report. Further physical
+optimization, FEA and presentation replacement are paused. Prior full-gate
+results are not a green release: native 108/108 passed before this extension;
+the Python gate encountered a live-dispatch DAG fixture and nested native
+thread-pool failures. The hermetic DAG fix passed 347 tests with guidance;
+bounded native threads passed the unchanged contact regression in 156 seconds.
+The complete gate still requires a final run. The approved presentation and
+all failed/partial study evidence must remain preserved.
+
+## 2026-09-12 — metadata-safe organization and UA Box workspace
+
+Added native `doc_file_operations` in `stepplus.cpp` and the JSON dispatcher,
+with registered MCP inspection/relocation adapters, mode policy, category/menu
+reachability and regenerated catalogs. Copies preserve stable identities,
+authored geometry/poses/finishes and opaque payloads, rebase supported references
+relative to the new owner, and invalidate optional caches without solving.
+The real project exposed historical `/meta` paths misclassified as required
+geometry inputs; a regression failed before the generic documentary-metadata
+correction, then the complete native cache suite passed 23 cases/4847 assertions.
+
+The gateway now supports a configured, verified-UA-only team default backed by
+an independently authorized Box FUSE mount. Explicit personal/team selection
+wins, absent mounts fail closed, shared chats remain private, and account
+plans/admin/AI grants are unchanged. Expired-trial access is workspace-scoped.
+Mounted storage exposed blocking filesystem/quota work on the event loop:
+file handlers now run in FastAPI's threadpool, with synchronized rate limits
+and bounded root-shared mutation locks. External Box/native writers are not
+covered by those process locks. The focused gateway suite passed 216 cases,
+including health responsiveness during slow storage and cross-surface quota
+admission. The production engine was intentionally not restarted or upgraded;
+its existing recovery state and browser/desktop version alignment remain
+explicit continuation items.

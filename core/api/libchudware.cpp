@@ -71,6 +71,7 @@
 #include "doc/export2d.h"
 #include "doc/drawing_session.h"
 #include "doc/session.h"
+#include "doc/stepplus.h"
 #include "doc/formats.h"
 #include "doc/validate.h"
 #include "doc/op_registry.h"
@@ -3177,9 +3178,12 @@ static int chudware_call_inner(const char* method, const char* params_json, char
                                 params.value("doc_id", std::string()),
                                 params.value("study_id", std::string())),
                             out_json, 0);
+            if (m == "doc_file_operations")
+                return emit(chudware::doc::native_file_operations(params), out_json, 0);
             if (m == "doc_save")
                 return emit(chudware::doc::doc_save(params.value("doc_id", std::string()),
-                                                 params.value("path", std::string())),
+                                                 params.value("path", std::string()),
+                                                 params.value("preserve_path", false)),
                             out_json, 0);
             if (m == "doc_open")
                 return emit(chudware::doc::doc_open(params.value("path", std::string()),

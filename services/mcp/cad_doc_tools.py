@@ -12,6 +12,8 @@ import json
 import math
 import os
 import re
+from pathlib import Path
+from uuid import uuid4
 
 from .cad_common import (
     _CUR,
@@ -6510,6 +6512,112 @@ def _normalize_add_features_args(ops: Any, doc_id: Optional[str], extra: dict,
 
 
 
+_NATIVE_FILE_REPLY_LIMIT = 32_768
+_NATIVE_FILE_PLAN_LIMIT = 16 * 1024 * 1024
+
+
+def _native_file_path(value: Any, field: str, *, native: bool = False) -> str:
+    """Resolve and authorize a file through the existing filesystem jail."""
+    from .fs_tools import _canonical_target
+
+    if not isinstance(value, str) or not value.strip() or "\0" in value:
+        raise ValueError(f"{field} must be a non-empty path string")
+    if not Path(value).is_absolute():
+        raise ValueError(f"{field} must be an absolute path")
+    target, blocked = _canonical_target(value, allow_missing=True)
+    if blocked:
+        raise cb.CoreError(blocked["hint"], code=blocked["reason"],
+                           detail={"field": field})
+    assert target is not None
+    if native and target.suffix.lower() != ".step+":
+        raise ValueError(f"{field} must name a native .step+ file")
+    return str(target)
+
+
+def _native_report_path(value: str) -> str:
+    if isinstance(value, str) and os.path.lexists(value):
+        raise FileExistsError("output_path already exists; choose a new .json file")
+    path = _native_file_path(value, "output_path")
+    if Path(path).suffix.lower() != ".json":
+        raise ValueError("output_path must end in .json (never a native CAD file)")
+    if os.path.lexists(path):
+        raise FileExistsError("output_path already exists; choose a new .json file")
+    if not Path(path).parent.is_dir():
+        raise ValueError("output_path parent directory must already exist")
+    return path
+
+
+def _native_file_reply(result: dict, output_path: Optional[str] = None) -> str:
+    """Keep native outcomes intact in an artifact; bound only the chat projection."""
+    text = json.dumps(result, ensure_ascii=True, indent=2)
+    report_error = None
+    if output_path:
+        try:
+            # Recheck symlinks/root immediately before the exclusive report write.
+            output_path = _native_report_path(output_path)
+            with open(output_path, "x", encoding="utf-8") as stream:
+                stream.write(text)
+                stream.write("\n")
+        except Exception as exc:  # noqa: BLE001 — native writes may already have succeeded
+            report_error = str(exc)[:512]
+    if not output_path and len(text) <= _NATIVE_FILE_REPLY_LIMIT:
+        return _dumps(result)
+    files = result.get("files", [])
+    failures = result.get("failures", [])
+    summary = {
+        "ok": result.get("ok", False),
+        "action": result.get("action"),
+        "file_count": len(files),
+        "succeeded_count": sum(isinstance(f, dict) and f.get("ok") is True for f in files),
+        "failed_count": sum(isinstance(f, dict) and f.get("ok") is False for f in files),
+        "failure_count": len(failures),
+        "full_result_in_response": False,
+    }
+    preview = []
+    for failure in failures[:5]:
+        failure_text = json.dumps(failure)
+        if len(failure_text) > 1024:
+            preview.append({"preview": failure_text[:1024], "truncated": True})
+        else:
+            preview.append(failure)
+    summary["failures_preview"] = preview
+    summary["failures_omitted"] = max(0, len(failures) - len(preview))
+    if output_path and report_error is None:
+        summary.update(output_path=output_path, report_written=True)
+    else:
+        summary["report_written"] = False
+        summary["hint"] = ("Full metadata omitted. Inspect smaller path batches or supply "
+                           "a new guarded output_path to inspect_native_files.")
+        if report_error:
+            # Do not turn completed native relocations into an apparent no-write refusal.
+            summary.update(native_ok=result.get("ok", False), ok=False,
+                           report_error=report_error, requested_output_path=output_path)
+            summary["hint"] = ("Native outcomes above remain valid; report persistence failed. "
+                               "Inspect the destinations before retrying any relocation.")
+    for key in ("error", "reason", "message", "code"):
+        if key in result:
+            summary[key] = str(result[key])[:512]
+    return _dumps(summary)
+
+
+def _native_file_error(exc: Exception, action: str) -> str:
+    text = _err(exc)
+    if len(text) <= _NATIVE_FILE_REPLY_LIMIT:
+        return text
+    return _dumps({"ok": False, "action": action, "error": str(exc)[:2048],
+                   "code": str(getattr(exc, "code", ""))[:256], "error_detail_omitted": True})
+
+
+def _native_plan_object(pairs: list[tuple[str, Any]]) -> dict:
+    """Reject duplicate JSON keys, especially silently overwritten path-map entries."""
+    obj = {}
+    for key, value in pairs:
+        if key in obj:
+            raise ValueError(f"relocation plan contains a duplicate JSON key: {key[:200]}")
+        obj[key] = value
+    return obj
+
+
 def register_cad_doc_tools(mcp: FastMCP) -> None:
     """CAD document-lifecycle MCP tools (T-RF8 split of cad_tools.py): new_part, add_features, get_part, undo/redo, save/close/recover, configurations, material, engine_profile, cad_guide."""
 
@@ -7848,7 +7956,8 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
     @mcp.tool()
     def set_material(material: Union[str, dict, list],
                      body: Optional[Union[str, int]] = None,
-                     doc_id: Optional[str] = None) -> str:
+                     doc_id: Optional[str] = None,
+                     faces: Optional[list[Union[str, dict]]] = None) -> str:
         """Set physical material identity and rendered appearance for a part or body.
 
         A material NAME resolves through the engineering material registry. With body=,
@@ -7862,10 +7971,27 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
         body: "b1", "b2", ... or ordinal; default all bodies.
         Mass/FEA calls still take their own material/density input for the solve.
         The native tree exposes both the document default and body_materials overrides.
+
+        faces: nonempty face SID strings (e.g. "F123abc") or complete face selector
+        dicts from query_geometry, scoped to the required body. Face assignment accepts
+        ONLY an explicit appearance dict/RGB and is visual-only. A SID must be unique;
+        a complete fingerprint can distinguish faces sharing a SID by exact geometry.
+        Ordinal hints and partial/fuzzy fingerprints cannot disambiguate a face.
+        {"color": None} with a full selector clears only that exact override; a SID
+        clears all stored overrides bearing that SID, including stale records.
+        Stored face_appearances are exposed by get_part; stale fingerprints never paint
+        a different face after a geometry edit. Assembly finishes belong in source parts.
         """
         try:
             d = _doc(doc_id)
-            ap = _resolve_appearance(material)
+            if faces is not None:
+                if body is None or not isinstance(faces, list) or not faces:
+                    raise ValueError("set_material: faces requires a body and nonempty explicit list")
+                if not isinstance(material, (dict, list)):
+                    raise ValueError("set_material: faces accepts explicit appearance dict/RGB only, not a material name")
+            clear_faces = (faces is not None and isinstance(material, dict)
+                           and "color" in material and material["color"] is None)
+            ap = {"color": None} if clear_faces else _resolve_appearance(material)
             material_key = None
             registry_material = False
             unsupported_identity = None
@@ -7896,7 +8022,7 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
                 targets = [f"b{body}"]
             else:
                 targets = [str(body)]
-            if body is not None and targets[0] not in {
+            if body is not None and not clear_faces and targets[0] not in {
                     f"b{i + 1}" for i in range(len(bodies))}:
                 raise ValueError(f"set_material: body {targets[0]!r} is not present in this part")
             ops = []
@@ -7905,13 +8031,16 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
                 if body is not None:
                     identity["id"] = targets[0]
                 ops.append(identity)
-            ops.extend({"op": "set_appearance", "id": key, **ap} for key in targets)
+            ops.extend({"op": "set_appearance", "id": key, **ap,
+                        **({"faces": faces} if faces is not None else {})} for key in targets)
             r = cb.call("doc_apply_ops", {"doc_id": d, "ops": ops})
             out = {"ok": True, "doc_id": d, "bodies": targets,
                    "appearance": ap, "material_key": material_key,
                    "engineering_material_set": bool(material_key),
                    "material_registry_resolved": registry_material,
                    "revision": r.get("revision")}
+            if faces is not None:
+                out["faces"] = faces
             if unsupported_identity:
                 out["warning"] = (
                     f"stored engineering material identity {unsupported_identity!r}, but the "
@@ -8073,6 +8202,111 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
             return _err(e)
 
 
+
+    @mcp.tool()
+    def inspect_native_files(paths: list[str], output_path: Optional[str] = None) -> str:
+        """Inspect native .step+ metadata WITHOUT opening a document or evaluating geometry.
+
+        paths: absolute native file paths inside CHUDWARE_FS_ROOT. Returns native schema,
+        document name/id, canonical document_hash (FNV, NOT SHA256), feature ids/labels/types,
+        component ids/names/sources/transforms/fixed flags and literal/resolved dependencies.
+        Unsupported dependency formats and per-file errors are reported, never guessed.
+        Dependencies are metadata only: their files are not imported, compiled or solved.
+
+        For large inventories supply output_path: a NEW absolute .json report path inside
+        the project root, with an existing parent. Persists the FULL native result and
+        returns counts, bounded failure previews and output_path. Existing files are never
+        overwritten. Without output_path, replies above 32 KiB become an explicit summary;
+        repeat with output_path or smaller batches for full metadata. Native CAD is read-only.
+        """
+        try:
+            if not isinstance(paths, list) or not paths:
+                raise ValueError("paths must be a non-empty list of absolute .step+ paths")
+            guarded = [_native_file_path(p, f"paths[{i}]", native=True)
+                       for i, p in enumerate(paths)]
+            report = _native_report_path(output_path) if output_path is not None else None
+            result = cb.call("doc_file_operations", {"action": "inspect", "paths": guarded})
+            return _native_file_reply(result, report)
+        except Exception as exc:  # noqa: BLE001
+            return _native_file_error(exc, "inspect")
+
+    @mcp.tool()
+    def relocate_native_files(plan_path: str) -> str:
+        """Copy native .step+ files with metadata-only renames/rebased references; NEVER solve.
+
+        plan_path: absolute, project-jailed UTF-8 JSON file (at most 16 MiB), containing
+        {"entries":[{"path":"/old.step+","destination":"/new.step+","name":"Human name",
+                     "component_names":{"component_id":"Human component name"}}],
+         "path_map":{"/old/dependency.step+":"/new/dependency.step+"}}.
+        name/component_names are optional; path_map may be empty. All source, destination,
+        and map key/value paths must be absolute and inside CHUDWARE_FS_ROOT. The wrapper
+        supplies action="relocate". Do not include feature edits or feature-name renames.
+
+        Native preflight checks the WHOLE plan for malformed maps/collisions/overwrites
+        before writing any CAD. Original files remain untouched. Each copy changes ONLY
+        document/component display names and declared file-reference strings: resolve old
+        relative references at the old parent, apply path_map, then rebase at the new
+        parent, including unmapped dependencies. IDs, feature parameters except file refs,
+        materials/finishes, mates, reference frames, poses and embedded model data survive;
+        stale optional display/BREP caches are invalidated, not re-provenanced.
+        Unsupported dependency forms are surfaced rather than guessed. No geometry
+        compilation, assembly solve, flattening, or Python native-container editing occurs.
+
+        I/O failures can leave honest partial copies; inspect failures before retrying.
+        The full native outcome is saved to a unique .result-<id>.json beside the plan;
+        reply contains counts, bounded failures and output_path. A report-write failure
+        preserves native_ok/counts and must NOT be treated as proof nothing was copied.
+        """
+        try:
+            source = _native_file_path(plan_path, "plan_path")
+            if not Path(source).is_file():
+                raise ValueError("plan_path must name an existing regular JSON file")
+            with open(source, "rb") as stream:
+                data = stream.read(_NATIVE_FILE_PLAN_LIMIT + 1)
+            if len(data) > _NATIVE_FILE_PLAN_LIMIT:
+                raise ValueError("relocation plan exceeds 16 MiB")
+            plan = json.loads(data.decode("utf-8"), object_pairs_hook=_native_plan_object)
+            if not isinstance(plan, dict) or set(plan) != {"entries", "path_map"}:
+                raise ValueError("plan must contain exactly entries and path_map")
+            if not isinstance(plan["entries"], list) or not plan["entries"]:
+                raise ValueError("entries must be a non-empty list")
+            if not isinstance(plan["path_map"], dict):
+                raise ValueError("path_map must be an object of absolute paths")
+            entries = []
+            for i, entry in enumerate(plan["entries"]):
+                if (not isinstance(entry, dict) or not {"path", "destination"} <= set(entry)
+                        or set(entry) - {"path", "destination", "name", "component_names"}):
+                    raise ValueError(f"entries[{i}] requires path/destination; only name/"
+                                     "component_names are optional")
+                if "name" in entry and not isinstance(entry["name"], str):
+                    raise ValueError(f"entries[{i}].name must be a string")
+                names = entry.get("component_names", {})
+                if not isinstance(names, dict) or any(
+                        not isinstance(v, str) for v in names.values()):
+                    raise ValueError(f"entries[{i}].component_names must map ids to strings")
+                source_path = _native_file_path(
+                    entry["path"], f"entries[{i}].path", native=True)
+                destination = _native_file_path(
+                    entry["destination"], f"entries[{i}].destination", native=True)
+                if os.path.lexists(entry["destination"]):
+                    raise FileExistsError(
+                        f"entries[{i}].destination already exists; no files were copied")
+                entries.append({**entry, "path": source_path, "destination": destination})
+            path_map = {}
+            for old, new in plan["path_map"].items():
+                guarded_old = _native_file_path(old, "path_map key")
+                guarded_new = _native_file_path(new, "path_map value")
+                if guarded_old in path_map:
+                    raise ValueError("path_map contains duplicate normalized source paths")
+                path_map[guarded_old] = guarded_new
+            report = _native_report_path(str(
+                Path(source).with_name(f"native-relocation.result-{uuid4().hex}.json")))
+            result = cb.call("doc_file_operations", {
+                "action": "relocate", "entries": entries, "path_map": path_map,
+            })
+            return _native_file_reply(result, report)
+        except Exception as exc:  # noqa: BLE001
+            return _native_file_error(exc, "relocate")
 
     @mcp.tool()
     def save_part(path: Optional[str] = None, doc_id: Optional[str] = None,

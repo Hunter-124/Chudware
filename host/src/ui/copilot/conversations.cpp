@@ -581,10 +581,16 @@ static nlohmann::json rawActivityToJson(const ActivityItem& a) {
 static nlohmann::json rawFitToJson(const FitReport& fit) {
     nlohmann::json interferences = nlohmann::json::array();
     for (const auto& p : fit.interferences)
-        interferences.push_back({{"a", p.a}, {"b", p.b}, {"value", p.value}});
+        interferences.push_back({{"a", p.a}, {"b", p.b},
+                                 {"value", p.value ? nlohmann::json(*p.value) : nlohmann::json(nullptr)}});
     nlohmann::json clearances = nlohmann::json::array();
-    for (const auto& p : fit.clearances)
-        clearances.push_back({{"a", p.a}, {"b", p.b}, {"value", p.value}});
+    for (const auto& p : fit.clearances) {
+        nlohmann::json pair = {{"a", p.a}, {"b", p.b},
+            {"value", p.value ? nlohmann::json(*p.value) : nlohmann::json(nullptr)}};
+        if (p.distanceLowerBoundMm)
+            pair["distance_lower_bound_mm"] = *p.distanceLowerBoundMm;
+        clearances.push_back(std::move(pair));
+    }
     return {
         {"present", fit.present},
         {"ok", fit.ok},

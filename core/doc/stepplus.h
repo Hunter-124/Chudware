@@ -54,6 +54,11 @@ StepPlusDoc editable_container_open(const std::string& path,
 // Canonical document.json bytes used by every editable container and nested source.
 std::string editable_document_json(const nlohmann::json& doc);
 
+// Metadata-only inspection and copy-only relocation of native files. Never compiles
+// geometry or registers a session. Relocation preserves authored data and invalidates
+// optional display/BREP caches; destinations must not exist.
+nlohmann::json native_file_operations(const nlohmann::json& params);
+
 
 // --- persisted-geometry cache keys (fast cold-open) --------------------------------
 // doc_save may embed the compiled tessellation + ops-response as extra `cache.aicm` /

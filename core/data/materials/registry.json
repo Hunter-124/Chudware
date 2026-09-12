@@ -2,6 +2,149 @@
   "version": "v1",
   "provenance_note": "Engineering fact table compiled from public handbooks, standards and manufacturer datasheets. Record-level property_basis distinguishes typical/nominal data, published minima, characteristic values and analyst assumptions. Engineering selections are not received-stock certificates or design allowables; incomplete constitutive data must not be replaced with invented isotropic properties. No MatWeb/MakeItFrom/Matmatch content.",
   "materials": {
+    "polyurethane_polytek_ptflex85_cast": {
+      "name": "Polytek PT Flex 85 cast polyurethane",
+      "category": "plastic",
+      "aliases": ["Polytek PT Flex 85", "PT Flex 85"],
+      "condition": "Two-component cast RTV polyurethane, 1A:1B by weight, natural yellow/amber. The linked bulletin specifies 16 hours at 60 C for its tabulated properties.",
+      "constitutive_model": "polymer_incomplete",
+      "mechanical": {"density_g_cm3": 1.06},
+      "property_basis": {
+        "density_g_cm3": "Nominal base-product mass estimate from manufacturer specific gravity 1.06; not measured finished-casting density and not a pigmented/additive compound certificate.",
+        "hardness_shore_a": 85,
+        "mix_ratio_by_weight": "1A:1B",
+        "natural_cured_color": "Yellow/Amber",
+        "tensile_data_conflict_psi": {"current_product_page": 1064, "linked_bulletin": 842},
+        "strength_note": "Conflicting published tensile values are not imported as design strength; tensile break stress is not yield.",
+        "black_color_process": "Manufacturer permits PolyColor Black dye up to 0.5 percent of total mixed weight, added to Part B before Part A. This base-product record does not certify the resulting compound density or properties."
+      },
+      "constitutive_gaps": [
+        "Elastic/compressibility and hyperelastic/viscoelastic calibration",
+        "Tread traction, abrasion, hysteresis, bond/retention and cyclic durability",
+        "Actual finished-casting density, cure and additive effects",
+        "Outdoor durability; the bulletin warns against outdoor storage and UV degradation"
+      ],
+      "selection_status": "Sourced cast Shore A85 engineering product option, not a certified vehicle tread or a substitute for printed TPU95A.",
+      "appearance": {"color": [0.72, 0.44, 0.08], "metallic": 0.0, "roughness": 0.75},
+      "finish_note": "Illustrative natural yellow/amber casting, not measured colorimetry. Black requires a documented compatible coloring process; do not silently label natural material black.",
+      "provenance": {
+        "source_type": "manufacturer",
+        "source": "Polytek PT Flex 85 current product specifications and linked PT Flex Series technical bulletin, internal date December 9, 2020",
+        "url": "https://polytek.com/products/pt-flex-85-liquid-rubber",
+        "urls": ["https://polytek.com/content/pdf/technicalbulletin/Polytek_TB_PTFlexSeries_5-5-2021.pdf"],
+        "accessed_date": "2026-09-12"
+      }
+    },
+    "steel_ssab_domex355mc_sheet": {
+      "name": "SSAB Domex 355MC hot-rolled sheet",
+      "category": "metal",
+      "aliases": ["SSAB Domex 355MC"],
+      "condition": "As-supplied SSAB Domex 355MC, EN 10149-2 S355MC, 1.80-16.00 mm sheet; no credit for altered heat treatment or weld-affected properties.",
+      "constitutive_model": "isotropic",
+      "mechanical": {
+        "E_mpa": 210000,
+        "nu": 0.3,
+        "density_g_cm3": 7.85,
+        "yield_mpa": 355,
+        "ultimate_mpa": 430
+      },
+      "property_basis": {
+        "E_mpa": "Structural-steel design value from SteelConstruction.info / SCI, not a measured Domex coupon",
+        "nu": "Structural-steel design value from SteelConstruction.info / SCI",
+        "density_g_cm3": "Nominal structural-steel density, as in the existing steel_a36 engineering record; not manufacturer-certified stock mass",
+        "yield_mpa": "Manufacturer minimum ReH, longitudinal test, 1.80-16.00 mm",
+        "ultimate_mpa": "Manufacturer lower bound of 430-550 MPa longitudinal tensile range",
+        "thickness_range_mm": [1.8, 16.0],
+        "fatigue_note": "No fatigue/endurance value or welded-joint allowable is supplied"
+      },
+      "selection_status": "Engineering stock selection; require received-stock thickness and material certificate. These values do not qualify the finished carrier or its joints.",
+      "appearance": {"color": [0.40, 0.42, 0.44], "metallic": 0.8, "roughness": 0.5},
+      "finish_note": "Illustrative bare steel. Apply a selected corrosion-protection finish separately; preserve specified fit and fastener seating surfaces.",
+      "provenance": {
+        "source_type": "manufacturer",
+        "source": "SSAB Domex 355MC product dimensions and mechanical properties; SCI structural-steel elastic design values",
+        "url": "https://www.ssab.com/en/brands-and-products/ssab-domex/product-offer/355mc",
+        "urls": ["https://steelconstruction.info/topics/design/steel-material-properties/"],
+        "accessed_date": "2026-09-12"
+      }
+    },
+    "steel_iso10642_010_9_reduced_head": {
+      "name": "ISO 10642 class 010.9 reduced-loadability countersunk screw steel",
+      "category": "metal",
+      "aliases": ["ISO 10642 010.9 screw steel"],
+      "condition": "Class 10.9 steel mechanical-property basis with ISO 10642 reduced-head product designation 010.9; not a full-loadability ISO 898-1 fastener.",
+      "constitutive_model": "isotropic",
+      "mechanical": {
+        "E_mpa": 210000,
+        "nu": 0.3,
+        "density_g_cm3": 7.85,
+        "yield_mpa": 940,
+        "ultimate_mpa": 1040
+      },
+      "property_basis": {
+        "E_mpa": "Nominal steel elastic value, same basis as steel_iso898_1_class10_9",
+        "nu": "Nominal steel elastic value, same basis as steel_iso898_1_class10_9",
+        "density_g_cm3": "Nominal steel density, not a supplier mass certificate",
+        "yield_mpa": "ISO 898-1 class 10.9 bulk mechanical-property minimum; not the assembled countersunk head capacity",
+        "ultimate_mpa": "ISO 898-1 class 10.9 material tensile-strength minimum; do not multiply by thread area alone to rate this head",
+        "head_to_thread_loadability_ratio": 0.8,
+        "head_loadability_basis": "ISO 10642:2026 notes 80 percent head loadability for all sizes and property classes; apply the standard's actual minimum ultimate-load table and marking for the selected screw",
+        "head_geometry_note": "Reduced head, socket penetration and bearing-surface alignment must be modeled/checked separately; a bulk-steel FoS is not a finished-screw capacity certificate"
+      },
+      "selection_status": "Engineering material identity for a separately sourced ISO 10642 010.9 product. Requires actual size, head/socket geometry, thread engagement and reduced-loadability check.",
+      "appearance": {"color": [0.12, 0.13, 0.14], "metallic": 0.7, "roughness": 0.45},
+      "finish_note": "Illustrative black finish only; use the selected supplier finish, not an assumed coating from the property class.",
+      "provenance": {
+        "source_type": "standard",
+        "source": "ISO 10642:2026 reduced-head scope and 80 percent loadability note; ISO 898-1 class 10.9 material basis",
+        "url": "https://www.iso.org/standard/90795.html",
+        "urls": ["https://www.iso.org/obp/ui#!iso:std:iso:10642:ed-4:v1:en"],
+        "accessed_date": "2026-09-12"
+      }
+    },
+    "steel_skf_ge10e_rings_unspecified_grade": {
+      "name": "SKF GE 10 E through-hardened phosphated bearing steel",
+      "category": "metal",
+      "aliases": ["SKF GE 10 E bearing rings"],
+      "condition": "Manufacturer bearing rings, through-hardened, ground and phosphated; sliding surfaces carry running-in lubricant. Exact steel grade and heat-treatment values are not disclosed by these SKF sources.",
+      "constitutive_model": "bearing_catalog_incomplete",
+      "mechanical": {},
+      "property_basis": {
+        "catalog_component_mass_kg": 0.011,
+        "catalog_component_mass_scope": "Complete GE 10 E bearing, both rings together; not a per-ring mass or bulk density.",
+        "basic_dynamic_load_rating_kn": 8.15,
+        "basic_static_load_rating_kn": 40.5,
+        "rating_scope": "Manufacturer bearing ratings, not allowable rover loads or a bulk-steel yield stress.",
+        "nominal_dimensions_mm": {"d": 10, "D": 19, "B": 9, "C": 6, "dk": 16},
+        "catalog_tilt_deg": 12,
+        "initial_radial_internal_clearance_class": "CN",
+        "initial_radial_internal_clearance_um": [32, 68],
+        "clearance_basis": "SKF spherical plain bearing catalogue Table 3, steel/steel metric bearings with bore diameter up to and including 12 mm. Initial radial internal clearance before mounting, not a one-sided raceway gap or installed operating clearance."
+      },
+      "constitutive_gaps": [
+        "Exact alloy, bulk density, elastic constants and strength values for these purchased rings",
+        "Installed operating clearance after shaft and housing fits",
+        "Application-specific bearing life, lubrication schedule and combined-load qualification"
+      ],
+      "selection_status": "Purchased-component engineering selection. Use the catalog mass once per complete bearing; do not substitute another supplier's 100Cr6 yield or infer geometry clearance from the CN label.",
+      "appearance": {
+        "color": [0.18, 0.19, 0.20],
+        "metallic": 0.65,
+        "roughness": 0.5
+      },
+      "finish_note": "Illustrative dark phosphated steel, not measured colorimetry. Preserve factory ground contact surfaces and lubricant; do not paint raceways or claim hard-chromium plating for the E steel/steel design.",
+      "provenance": {
+        "source_type": "manufacturer",
+        "source": "SKF GE 10 E metric product data and radial spherical plain bearing general specifications",
+        "url": "https://www.skf.com/au/products/plain-bearings/spherical-plain-bearings-rod-ends/radial/productid-GE%2010%20E",
+        "urls": [
+          "https://www.skf.com/us/products/plain-bearings/spherical-plain-bearings-rod-ends/radial/general-bearing-specifications",
+          "https://www.skf.com/us/products/plain-bearings/spherical-plain-bearings-rod-ends/principles/design-of-bearing-arrangements/radial-location",
+          "https://cdn.skfmediahub.skf.com/api/public/0901d19680154a05/pdf_preview_medium/0901d19680154a05_pdf_preview_medium.pdf"
+        ],
+        "accessed_date": "2026-09-12"
+      }
+    },
     "brake_housing_jagwire_cgxsl_5mm_black": {
       "name": "Jagwire BHL100 CGX-SL 5 mm black brake housing",
       "category": "composite",
@@ -85,6 +228,43 @@
         "source": "Ensinger TECAMID66 natural stock-shape datasheet, 2023-07-19 version AD",
         "source_type": "manufacturer_datasheet",
         "url": "https://www.ensinger-online.com/modules/public/sheet/createsheet.php?FILENAME=TECAMID_66_natural_0.PDF&FL=0&SID=792&ZOOM=1.2"
+      }
+    },
+    "steel_iso7089_300hv_washer": {
+      "name": "Carbon steel washer, ISO 7089 hardness class 300 HV",
+      "category": "metal",
+      "aliases": ["ISO 7089 300 HV washer"],
+      "condition": "Normal-series square-edge plain carbon-steel washer, hardness class 300 HV (300-400 HV); actual nominal size and supplier acceptance selected separately.",
+      "constitutive_model": "washer_hardness_class_incomplete",
+      "mechanical": {"density_g_cm3": 7.85, "E_mpa": 210000, "nu": 0.3},
+      "property_basis": {
+        "density_g_cm3": "Conventional steel nominal mass estimate, not measured supplier product density",
+        "E_mpa": "Conventional steel elastic assumption, not specified by washer hardness class",
+        "nu": "Conventional steel elastic assumption",
+        "hardness_hv": "Supplier ISO 7089 specification: class 300 HV spans 300-400 HV; no conversion to yield or tensile strength"
+      },
+      "catalogue": {
+        "hardness_hv_range": [300, 400],
+        "example_m12_sku": "WFHV-ISO7089-12-PLN",
+        "example_m12_dimensions_mm": {
+          "bore_nominal": 13.0, "bore_maximum": 13.27,
+          "outside_nominal": 24.0, "outside_minimum": 23.48,
+          "thickness_nominal": 2.5, "thickness_minimum": 2.3, "thickness_maximum": 2.7
+        }
+      },
+      "constitutive_gaps": [
+        "Actual alloy, yield, tensile strength, local bearing capacity and fatigue properties are not supplied",
+        "Hardness-class compatibility does not qualify washer bending, substrate bearing, preload or a complete joint"
+      ],
+      "selection_status": "Sourced engineering selection; listed supplier SKU is not procurement, availability or batch certification.",
+      "appearance": {"color": [0.52, 0.54, 0.57], "metallic": 0.8, "roughness": 0.4},
+      "finish_note": "Illustrative plain hardened-steel appearance, not zinc plating or a certified protective coating.",
+      "provenance": {
+        "source_type": "supplier_specification_and_analyst_assumptions",
+        "source": "Westfield ISO 7089 hardness/dimensional specification; BelMetric hardened plain ISO 7089 product and M12 SKU. Nominal elasticity/density are separate analyst assumptions.",
+        "url": "https://www.westfieldfasteners.co.uk/Standards/Washer-ISO7089-M.html",
+        "urls": ["https://belmetric.com/iso-flat-washer-steel-hv-300-plain-iso-7089/"],
+        "accessed_date": "2026-09-12"
       }
     },
     "steel_iso898_2_class10_nut": {

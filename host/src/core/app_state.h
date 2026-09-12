@@ -14,6 +14,7 @@
 #include <deque>
 #include <functional>
 #include <mutex>
+#include <optional>
 #include <set>
 #include <string>
 #include <thread>
@@ -337,7 +338,8 @@ struct PartInfo {
 };
 struct FitPair {
     std::string a, b;
-    double value = 0;  // overlap mm^3 (interference) or gap mm (clearance)
+    std::optional<double> value;  // exact overlap mm^3 or gap mm; absent is not zero
+    std::optional<double> distanceLowerBoundMm;
 };
 struct FitReport {
     bool present = false;

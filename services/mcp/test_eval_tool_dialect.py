@@ -533,6 +533,83 @@ def test_canonical_calls_still_work_through_fastmcp(part):
     assert json.loads(_text(mass))["ok"] is True
 
 
+@pytest.fixture(scope="module")
+def interference_threshold_doc() -> str:
+    """Separate cylinders with overlapping AABBs, plus a remote member."""
+    return _new_doc("eval_threshold_cylinders", [
+        {"op": "add_feature", "feature": {
+            "type": "cylinder", "name": name,
+            "params": {"radius": 10, "height": 10, "at": at,
+                       "centered": False, "merge": False}}}
+        for name, at in (("A", [0, 0, 0]), ("B", [15, 15, 0]), ("Far", [100, 100, 0]))
+    ])
+
+
+@pytest.mark.parametrize("surface", ["agent", "fastmcp"])
+def test_interference_threshold_and_exact_default_remain_distinct(interference_threshold_doc, surface):
+    def check(**params):
+        args = {"doc_id": interference_threshold_doc, **params}
+        if surface == "agent":
+            return _call("check_interference", **args)
+        return json.loads(_text(asyncio.run(
+            _fastmcp_tools().get_tool("check_interference").run(args))))
+
+    threshold = check(clearance_mode="threshold")
+    assert threshold["ok"] and threshold["complete"], threshold
+    assert threshold["pairs_checked"] == threshold["pairs_total"] == 3
+    assert threshold["interferences"] == threshold["pair_failures"] == []
+    assert len(threshold["clearances"]) == 3
+    assert all("distance" not in pair and pair["distance_status"] == "lower_bound"
+               for pair in threshold["clearances"])
+    assert threshold["clearances"][0]["distance_lower_bound_mm"] == 0
+    assert "tightest gap" not in threshold["summary"].lower()
+
+    exact = check()
+    assert exact["complete"] and exact["pairs_checked"] == 3, exact
+    assert len(exact["clearances"]) == 3
+    assert exact["clearances"][0]["distance"] == pytest.approx(1.2132034356, abs=1e-6)
+    assert all("distance_lower_bound_mm" not in pair for pair in exact["clearances"])
+    assert check(clearance_mode="exact")["clearances"] == exact["clearances"]
+
+    scoped = check(clearance_mode="threshold", min_clearance_mm=2, members=["b1", "b2"])
+    assert scoped["complete"] and scoped["pairs_checked"] == scoped["pairs_total"] == 1, scoped
+    assert scoped["scope"]["total_members"] == 3
+    assert len(scoped["clearances"]) == 1
+    close = scoped["clearances"][0]
+    assert close["distance"] == pytest.approx(1.2132034356, abs=1e-6)
+    assert close["warning"] == "below min clearance"
+    assert close["distance_status"] == "exact"
+    assert "distance_lower_bound_mm" not in close
+
+
+def test_interference_unknown_clearance_mode_refused(interference_threshold_doc):
+    out = _call("check_interference", doc_id=interference_threshold_doc,
+                clearance_mode="approximate")
+    assert out["ok"] is False
+    assert "clearance_mode" in out["error"]
+    with pytest.raises(Exception, match="clearance_mode"):
+        asyncio.run(_fastmcp_tools().get_tool("check_interference").run(
+            {"doc_id": interference_threshold_doc, "clearance_mode": "approximate"}))
+
+
+def test_interference_narration_does_not_turn_bounds_or_unknowns_into_gaps():
+    from services.mcp.fit_narration import _format_fit
+
+    text = _format_fit({"clearances": [
+        {"a": "Bound", "b": "B", "distance_lower_bound_mm": 0},
+        {"a": "Measured", "b": "B", "distance": 4.25},
+        {"a": "Unknown", "b": "B"},
+    ]})
+    rows = text.splitlines()
+    bound = next(row for row in rows if "Bound" in row)
+    measured = next(row for row in rows if "Measured" in row)
+    unknown = next(row for row in rows if "Unknown" in row)
+    assert "lower bound" in bound and "not measured" in bound
+    assert "0.00 mm gap" not in bound
+    assert "4.25 mm gap" in measured
+    assert "not measured" in unknown and "0.00" not in unknown
+
+
 # --------------------------------------------------------------------------
 # The handle round-trip: what these tools TELL the model to do must work
 # (live 2026-07-29 — all three of these failed before the fix)

@@ -1,41 +1,35 @@
-"""Preflight — dry-run plan validation on shadow doc clones (aicad.preflight/1).
+"""Preflight — cached native scratch validation (aicad.preflight/1).
 
 Pillar 20 §2.10 + contracts/advisor.md §10.  Shape frozen 2026-07-04.
 
 Every mutating-tool family can call ``run_preflight(doc_id, tool, ops)`` before
 touching the live document.  The function:
 
-1.  Serialises the live doc via ``doc_tree`` (read-only).
-2.  Creates a throwaway clone via ``doc_new`` + ``doc_apply_ops``.
-3.  Applies the *planned* ops on the clone.
-4.  Runs the four check classes (refs_resolve, params_sane, rebuild_predict,
-    downstream_impact).
-5.  Returns an ``aicad.preflight/1`` envelope with advisory_items ready for
-    injection.
-6.  Closes the throwaway clone — zero live-doc side effects guaranteed by
-    structure (the live doc_id is never passed to a mutating RPC).
+1. Reads the live tree and runs reference/parameter/downstream checks.
+2. Predicts the candidate through ``doc_dry_run_ops``: an unregistered native
+   scratch session with a private copy of the live incremental-cache index.
+3. Returns an ``aicad.preflight/1`` envelope with advisory items.
+
+No registered clone, history replay, mesh publication, or live mutation occurs.
 
 Freedom rule: ``verdict: "fail"`` NEVER blocks the caller.  Applying a
 failed-preflight mutation without a dispute is a ``preflight_overridden`` ledger
 event (audit trigger per §11).
 
-Performance guard: clone+apply is skipped for docs exceeding the size threshold
-(``_CLONE_BUDGET_S = 2.0`` s wall-clock, threshold ``_FEATURE_COUNT_LIMIT``).
-Skips emit ``verdict: "skipped"`` with ``skipped: "budget"`` — never silent.
+The feature-count admission guard emits an explicit budget skip. There is no
+wall-clock guarantee: cache misses and genuinely edited geometry can be expensive.
 """
 from __future__ import annotations
 
 import hashlib
 import json
 import os
-import time
 import uuid
 from typing import Any
 
 # ------------------------------------------------------------------ constants
 
 _FEATURE_COUNT_LIMIT: int = int(os.environ.get("CHUDWARE_PREFLIGHT_FEATURE_LIMIT", "200"))
-_CLONE_BUDGET_S: float = float(os.environ.get("CHUDWARE_PREFLIGHT_BUDGET_S", "2.0"))
 
 # ------------------------------------------------------------------ ledger shim
 #
@@ -78,7 +72,7 @@ def run_preflight(
     tool: str,
     ops: list[dict],
 ) -> dict:
-    """Dry-run *ops* on a shadow clone of *doc_id*.
+    """Dry-run *ops* in a cached native scratch session for *doc_id*.
 
     Returns an ``aicad.preflight/1`` dict. Unexpected advisory errors degrade to
     a warn item; engine connection loss propagates because document identity is uncertain.
@@ -155,75 +149,32 @@ def _run(doc_id: str, tool: str, ops: list[dict]) -> dict:
         return _skipped_envelope(doc_id, tool, ops, reason="budget",
                                  detail=f"doc has {len(features)} features (limit {_FEATURE_COUNT_LIMIT})")
 
-    # 2. Build throwaway clone via serialization (never in-place).
-    clone_id: str | None = None
-    try:
-        clone_id, clone_ops = _clone_doc(live_tree, cb)
-        t0 = time.monotonic()
+    checks: list[dict] = []
+    predicted: dict = {}
+    checks.extend(_check_refs_resolve(ops, doc_id, cb))
+    checks.extend(_check_params_sane(ops, doc_id, cb))
+    downstream = _check_downstream_impact(ops, doc_id, cb)
+    checks.extend(_check_rebuild_predict(ops, doc_id, cb, CoreError, predicted))
+    checks.append({
+        "check": "downstream_impact",
+        "result": "warn" if downstream else "pass",
+        "detail": (f"{len(downstream)} downstream feature(s) reference edited entities"
+                   if downstream else "no downstream features affected"),
+        "refs": {"features": [d["feature"] for d in downstream]} if downstream else {},
+    })
 
-        try:
-            cb.call("doc_apply_ops", {"doc_id": clone_id, "ops": clone_ops})
-        except CoreError as exc:
-            if exc.code == "engine_connection_lost":
-                raise
-            # Malformed original; clone_id is still a valid (empty) doc.
-
-        elapsed = time.monotonic() - t0
-
-        # Performance guard on clone+apply wall time.
-        if elapsed > _CLONE_BUDGET_S:
-            return _skipped_envelope(doc_id, tool, ops, reason="budget",
-                                     detail=f"clone+apply took {elapsed:.1f}s (limit {_CLONE_BUDGET_S}s)")
-
-        # 3. Run four check classes.
-        checks: list[dict] = []
-        predicted: dict = {}
-        downstream: list[dict] = []
-
-        checks.extend(_check_refs_resolve(ops, clone_id, cb))
-        checks.extend(_check_params_sane(ops, clone_id, cb))
-        checks.extend(_check_rebuild_predict(ops, clone_id, cb, CoreError, predicted))
-        downstream = _check_downstream_impact(ops, clone_id, cb)
-        if downstream:
-            checks.append({
-                "check": "downstream_impact",
-                "result": "warn",
-                "detail": f"{len(downstream)} downstream feature(s) reference edited entities",
-                "refs": {"features": [d["feature"] for d in downstream]},
-            })
-        else:
-            checks.append({
-                "check": "downstream_impact",
-                "result": "pass",
-                "detail": "no downstream features affected",
-                "refs": {},
-            })
-
-        # 4. Verify live doc is unchanged (assertion — belt+suspenders).
-        live_tree_after = cb.call("doc_tree", {"doc_id": doc_id})
-        live_revision_after = live_tree_after.get("revision", -1)
-        if live_revision_after != live_revision_before:
-            # Something went wrong — report it but do not block.
-            checks.append({
-                "check": "refs_resolve",
-                "result": "warn",
-                "detail": (
-                    f"INTERNAL: live doc revision changed during preflight "
-                    f"({live_revision_before} -> {live_revision_after}); "
-                    "preflight results may be invalid"
-                ),
-                "refs": {},
-            })
-
-    except CoreError as exc:
-        if exc.code == "engine_connection_lost":
-            # The ordinal clone id may now name another document. Do not reconnect
-            # from finally just to close it, or mask the original unknown outcome.
-            clone_id = None
-        raise
-    finally:
-        if clone_id:
-            _close_clone(clone_id, cb)
+    # Other clients may edit between read-only RPCs. A prediction then describes
+    # a different revision than the checks; never advertise it as a clean pass.
+    live_tree_after = cb.call("doc_tree", {"doc_id": doc_id})
+    live_revision_after = live_tree_after.get("revision", -1)
+    source_revision = predicted.pop("source_revision", live_revision_before)
+    if live_revision_after != live_revision_before or source_revision != live_revision_before:
+        checks.append({
+            "check": "rebuild_predict",
+            "result": "warn",
+            "detail": "live revision changed during preflight; prediction may be stale",
+            "refs": {},
+        })
 
     # 5. Compute overall verdict.
     results = [c["result"] for c in checks]
@@ -243,60 +194,16 @@ def _run(doc_id: str, tool: str, ops: list[dict]) -> dict:
     )
 
 
-# ------------------------------------------------------------------ clone helpers
-
-def _clone_doc(live_tree: dict, cb: Any) -> tuple[str, list[dict]]:
-    """Create a throwaway doc and return (clone_id, ops_to_replay).
-
-    The clone is a new empty part; we rebuild it by replaying the original tree's
-    equations and features in order — the same pattern used by the verify bench.
-    """
-    name = (live_tree.get("name") or "preflight_clone") + "_pf"
-    # `internal: True` tells hostd's shared doc registry this doc is a throwaway: it is
-    # registered normally (attach/close/GC bookkeeping unchanged) but never fanned out as
-    # doc.opened/doc.changed/doc.closed to the other clients on the shared daemon. Without
-    # it the desktop GUI faithfully opened a visible mirror tab for this shadow clone on
-    # EVERY add_features call — what users reported as "the AI creates a new part for every
-    # operation". An older engine that does not know the param simply ignores it, degrading
-    # to the old visible-tab behaviour rather than erroring.
-    r = cb.call("doc_new", {"kind": "part", "name": name, "internal": True})
-    clone_id = r.get("doc_id") or r.get("id")
-    if not clone_id:
-        raise RuntimeError("doc_new returned no doc_id")
-
-    ops: list[dict] = []
-    # Equations first (features may reference them).
-    for eq in (live_tree.get("equations") or {}).get("globals") or []:
-        ops.append({"op": "eq_set", "name": eq["name"], "expr": str(eq.get("expr", eq.get("value", 0)))})
-    # Features in tree order.
-    for feat in (live_tree.get("features") or []):
-        ops.append({"op": "add_feature", "feature": feat})
-
-    return clone_id, ops
-
-
-def _close_clone(clone_id: str, cb: Any) -> None:
-    # cb.call dispatches ENGINE RPCs — the engine verb is `doc_close` (see cad_tools.close_part,
-    # which itself calls doc_close). `close_part` is an MCP *tool* name, not an engine RPC, so the
-    # old call raised "unknown method" every time and the throwaway preflight clone leaked forever
-    # (auto-preflight fires on every add_features → dozens of stale `_pf` docs pinned in the engine).
-    try:
-        cb.call("doc_close", {"doc_id": clone_id})
-    except Exception as exc:  # noqa: BLE001
-        if getattr(exc, "code", None) == "engine_connection_lost":
-            raise
-        pass
-
 
 # ------------------------------------------------------------------ check runners
 
-def _check_refs_resolve(ops: list[dict], clone_id: str, cb: Any) -> list[dict]:
-    """Check that stable ids/names referenced in planned ops exist in the clone."""
+def _check_refs_resolve(ops: list[dict], doc_id: str, cb: Any) -> list[dict]:
+    """Check stable ids/names against the live document, before candidate ops."""
     checks = []
     missing: list[str] = []
 
     try:
-        tree_resp = cb.call("doc_tree", {"doc_id": clone_id})
+        tree_resp = cb.call("doc_tree", {"doc_id": doc_id})
         tree = tree_resp.get("tree") or {}
         known_ids: set[str] = set()
         known_names: set[str] = set()
@@ -311,8 +218,8 @@ def _check_refs_resolve(ops: list[dict], clone_id: str, cb: Any) -> list[dict]:
         # If doc_tree fails, skip this check rather than false-fail.
         return []
 
-    # The clone carries the LIVE tree only — the planned ops have not been
-    # applied to it — so a ref to a feature an earlier op in this same batch
+    # The queried tree is the LIVE tree — the planned ops have not been
+    # applied — so a ref to a feature an earlier op in this same batch
     # creates is legitimate. Accumulate declarations as we walk (mirrors
     # guardrails.check_refs_resolve_ids, which hard-blocks on the same rule).
     # RESERVED_DATUMS comes from the same module for the same reason: a kernel
@@ -351,13 +258,10 @@ def _check_refs_resolve(ops: list[dict], clone_id: str, cb: Any) -> list[dict]:
     return checks
 
 
-# Public alias for HARD ref-integrity (WI-15 / guardrails). Full preflight stays
-# advisory (freedom rule); this cheap id-set check is what the harness hard-rejects on.
-check_refs_resolve = _check_refs_resolve  # noqa: F841 — re-export
 
 
 
-def _check_params_sane(ops: list[dict], clone_id: str, cb: Any) -> list[dict]:
+def _check_params_sane(ops: list[dict], doc_id: str, cb: Any) -> list[dict]:
     """Check parameters for obvious invalidity (negative dims, fillet vs wall, hole depth vs extent)."""
     issues: list[str] = []
 
@@ -383,12 +287,12 @@ def _check_params_sane(ops: list[dict], clone_id: str, cb: Any) -> list[dict]:
             radius = (r_val.get("value") if isinstance(r_val, dict) else r_val) if r_val else None
             if radius and isinstance(radius, (int, float)) and radius > 0:
                 try:
-                    meas = cb.call("doc_eval_measure", {"doc_id": clone_id,
+                    meas = cb.call("doc_eval_measure", {"doc_id": doc_id,
                                                          "target": {"of": "wall", "adjacent": True}})
                     wall = meas.get("min_thickness") or meas.get("thickness")
                     if wall and isinstance(wall, (int, float)) and radius >= wall:
                         issues.append(
-                            f"{fname}: radius {radius} >= adjacent wall {wall:.3f} on clone"
+                            f"{fname}: radius {radius} >= adjacent live wall {wall:.3f}"
                         )
                 except Exception as exc:  # noqa: BLE001
                     if getattr(exc, "code", None) == "engine_connection_lost":
@@ -401,7 +305,7 @@ def _check_params_sane(ops: list[dict], clone_id: str, cb: Any) -> list[dict]:
             depth = (d_val.get("value") if isinstance(d_val, dict) else d_val) if d_val else None
             if depth and isinstance(depth, (int, float)) and depth > 0:
                 try:
-                    meas = cb.call("doc_eval_measure", {"doc_id": clone_id,
+                    meas = cb.call("doc_eval_measure", {"doc_id": doc_id,
                                                          "target": {"of": "body", "axis": "all"}})
                     extents = meas.get("extents") or {}
                     max_extent = max(
@@ -433,14 +337,14 @@ def _check_params_sane(ops: list[dict], clone_id: str, cb: Any) -> list[dict]:
 
 def _check_rebuild_predict(
     ops: list[dict],
-    clone_id: str,
+    doc_id: str,
     cb: Any,
     CoreError: type,
     predicted: dict,
 ) -> list[dict]:
-    """Apply planned ops on clone; capture feature_status and solver dof."""
+    """Run candidate ops in native scratch state and retain rebuild diagnostics."""
     try:
-        resp = cb.call("doc_apply_ops", {"doc_id": clone_id, "ops": ops})
+        resp = cb.call("doc_dry_run_ops", {"doc_id": doc_id, "ops": ops})
     except CoreError as exc:
         if getattr(exc, "code", None) == "engine_connection_lost":
             raise
@@ -458,10 +362,12 @@ def _check_rebuild_predict(
         return [{
             "check": "rebuild_predict",
             "result": "warn",
-            "detail": f"unexpected error during clone apply: {exc}",
+            "detail": f"unexpected error during native dry-run: {exc}",
             "refs": {},
         }]
 
+    if "source_revision" in resp:
+        predicted["source_revision"] = resp["source_revision"]
     rebuild = resp.get("rebuild") or {}
     fs = rebuild.get("feature_status") or []
     predicted["feature_status"] = [
@@ -471,6 +377,7 @@ def _check_rebuild_predict(
     ]
     predicted["dof"] = rebuild.get("dof")
     predicted["interference_delta"] = None  # populated by downstream check if needed
+    predicted["doc_status"] = rebuild.get("doc_status")
 
     failed = [s for s in fs if not s.get("ok")]
     warned = [s for s in fs if s.get("ok") and s.get("warning")]
@@ -485,6 +392,18 @@ def _check_rebuild_predict(
             "detail": f"{len(failed)} feature(s) fail rebuild: {detail}",
             "refs": {"features": [s.get("id") for s in failed]},
         }]
+    if resp.get("ok") is False:
+        return [{
+            "check": "rebuild_predict", "result": "fail",
+            "detail": str(resp.get("error") or "native dry-run refused candidate"),
+            "refs": {},
+        }]
+    if resp.get("ok") is not True or not isinstance(rebuild.get("feature_status"), list):
+        return [{
+            "check": "rebuild_predict", "result": "warn",
+            "detail": "native dry-run did not provide candidate rebuild diagnostics",
+            "refs": {},
+        }]
     if warned:
         detail = "; ".join(
             f"{s.get('id','?')}: {s.get('warning','?')}" for s in warned
@@ -498,12 +417,12 @@ def _check_rebuild_predict(
     return [{
         "check": "rebuild_predict",
         "result": "pass",
-        "detail": f"all {len(fs)} feature(s) rebuild ok on clone",
+        "detail": f"all {len(fs)} feature(s) rebuild ok in native scratch state",
         "refs": {},
     }]
 
 
-def _check_downstream_impact(ops: list[dict], clone_id: str, cb: Any) -> list[dict]:
+def _check_downstream_impact(ops: list[dict], doc_id: str, cb: Any) -> list[dict]:
     """Walk the feature tree for features referencing entities touched by the planned ops.
 
     Returns a list of downstream impact entries: [{feature, relation}, ...].
@@ -515,7 +434,7 @@ def _check_downstream_impact(ops: list[dict], clone_id: str, cb: Any) -> list[di
         if not isinstance(op, dict):
             continue
         feat = op.get("feature") or {}
-        fid = feat.get("id")
+        fid = op.get("id") or feat.get("id")
         fname = feat.get("name")
         if op.get("op") in ("edit_feature", "set_param") and fid:
             edited_ids.add(fid)
@@ -527,7 +446,7 @@ def _check_downstream_impact(ops: list[dict], clone_id: str, cb: Any) -> list[di
 
     downstream: list[dict] = []
     try:
-        tree_resp = cb.call("doc_tree", {"doc_id": clone_id})
+        tree_resp = cb.call("doc_tree", {"doc_id": doc_id})
         tree = tree_resp.get("tree") or {}
         for feat in (tree.get("features") or []):
             fid = feat.get("id") or ""
@@ -550,7 +469,7 @@ def _check_downstream_impact(ops: list[dict], clone_id: str, cb: Any) -> list[di
     # Also try doc_adjacency if available.
     for eid in edited_ids:
         try:
-            adj = cb.call("doc_adjacency", {"doc_id": clone_id, "feature": eid})
+            adj = cb.call("doc_adjacency", {"doc_id": doc_id, "feature": eid})
             for dep in (adj.get("dependents") or []):
                 dep_id = dep.get("id") or dep.get("feature") or ""
                 if dep_id and dep_id not in edited_ids:

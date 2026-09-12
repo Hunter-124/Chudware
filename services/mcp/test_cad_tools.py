@@ -384,6 +384,48 @@ def test_set_material_body_identity_survives_save_reopen(tmp_path):
         cb.call("doc_close", {"doc_id": reopened or doc})
 
 
+def test_set_material_selected_faces_preserves_physics_and_reopens(tmp_path):
+    doc = _new_plate_with_hole()
+    reopened = None
+    try:
+        named, _ = _call("set_material", {"material": "A36", "doc_id": doc})
+        assert named["ok"], named
+        before = cb.call("doc_tree", {"doc_id": doc})
+        queried, _ = _call("query_geometry", {"query": "top", "doc_id": doc})
+        selected = queried["matches"][0]
+        painted, _ = _call("set_material", {
+            "material": {"color": [0.9, 0.1, 0.05], "metallic": 0.8, "roughness": 0.2},
+            "body": "b1", "doc_id": doc, "faces": [selected]})
+        assert painted["ok"] and not painted["engineering_material_set"], painted
+        state, _ = _call("get_part", {"doc_id": doc})
+        assert state["tree"]["material"] == before["tree"]["material"]
+        assert state["tree"]["appearances"] == before["tree"]["appearances"]
+        for args in (
+            {"material": "brass", "body": "b1", "faces": [selected]},
+            {"material": [1, 0, 0], "faces": [selected]},
+            {"material": [1, 0, 0], "body": "b1", "faces": []},
+            {"material": [1, 0, 0], "body": "b1", "faces": [selected, "Fffffff"]},
+        ):
+            rejected, _ = _call("set_material", {**args, "doc_id": doc})
+            assert not rejected.get("ok"), rejected
+            assert cb.call("doc_tree", {"doc_id": doc})["revision"] == state["revision"]
+        path = tmp_path / "selected_face_finish.step+"
+        cb.call("doc_save", {"doc_id": doc, "path": str(path)})
+        cb.call("doc_close", {"doc_id": doc})
+        reopened = cb.call("doc_open", {"path": str(path)})["doc_id"]
+        loaded, _ = _call("get_part", {"doc_id": reopened})
+        assert loaded["tree"]["face_appearances"] == state["tree"]["face_appearances"]
+        cleared, _ = _call("set_material", {
+            "material": {"color": None}, "body": 1, "doc_id": reopened, "faces": [selected["sid"]]})
+        assert cleared["ok"], cleared
+        tree = cb.call("doc_tree", {"doc_id": reopened})["tree"]
+        assert not tree.get("face_appearances")
+        assert tree["material"] == before["tree"]["material"]
+        assert tree["appearances"] == before["tree"]["appearances"]
+    finally:
+        cb.call("doc_close", {"doc_id": reopened or doc})
+
+
 def test_set_material_unknown_name_errors():
     doc = _new_plate_with_hole()
     r, _ = _call("set_material", {"material": "unobtanium", "doc_id": doc})
@@ -440,6 +482,90 @@ def test_save_part_native_stepplus_roundtrips():
     types = {f.get("type") for f in feats}
     assert {"box", "hole"} <= types, (types, feats)
     os.unlink(r["path"])
+
+
+def test_saved_relative_assembly_survives_batch_autosave_and_reopen(tmp_path, monkeypatch):
+    """Editing a delivered bundle must not relocate its relative child-source base."""
+    import zipfile
+    from services.mcp import cad_common as C
+
+    project = tmp_path / "project"
+    bundle = project / "verification" / "teammate bundle"
+    bundle.mkdir(parents=True)
+    destination = bundle / "chosen assembly.step+"
+    monkeypatch.setenv("CHUDWARE_PROJECT_SAVE_DIR", str(project))
+    monkeypatch.setenv("CHUDWARE_AUTOSAVE_DIR", str(tmp_path / "recovery"))
+    monkeypatch.setenv("CHUDWARE_HANDOFF_DIR", str(tmp_path / "handoff"))
+    # Exercise the real standalone publisher synchronously; never leave a timer
+    # that could mutate another test's engine or outlive tmp_path.
+    monkeypatch.setattr(C, "_PUBLISH_MIN_INTERVAL_S", 0)
+    monkeypatch.setattr(C, "_PUB_THROTTLE", {})
+    monkeypatch.setattr(C, "_PUB", {"rev": None, "docs": {}, "active": None})
+    docs = []
+    children = []
+    try:
+        for name, size in (("first", (10, 4, 3)), ("second", (6, 5, 2))):
+            part = cb.call("doc_new", {"name": name, "resume_if_open": False})["doc_id"]
+            docs.append(part)
+            built = cb.call("doc_apply_ops", {"doc_id": part, "ops": [
+                cb.feat("box", name, dict(zip(("length", "width", "height"), size)))
+            ]})
+            assert all(s["ok"] for s in built["rebuild"]["feature_status"]), built
+            child = bundle / f"{name}.step+"
+            cb.call("doc_save", {"doc_id": part, "path": str(child)})
+            children.append(child)
+        child_bytes = {child: child.read_bytes() for child in children}
+        asm = cb.call("doc_new", {"name": "relative handoff", "kind": "assembly",
+                                   "resume_if_open": False})["doc_id"]
+        docs.append(asm)
+        inserted = cb.call("doc_apply_ops", {"doc_id": asm, "ops": [
+            {"op": "asm_insert_component", "name": child.stem, "fixed": True,
+             "source": {"path": str(child)},
+             "transform": [1, 0, 0, i * 30, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1]}
+            for i, child in enumerate(children)
+        ]})
+        components = [inserted["id_map"][f"${i}"] for i in range(2)]
+        saved, _ = _call("save_part", {"doc_id": asm, "path": str(destination)})
+        assert saved["ok"], saved
+
+        edited, _ = _call("add_features", {"doc_id": asm, "ops": [
+            {"op": "asm_edit_component", "id": component,
+             "source": {"path": child.name}}
+            for component, child in zip(components, children)
+        ]})
+        assert edited["ok"], edited
+        assert edited["saved_path"] == str(destination)
+        assert len(cb.call("asm_world_bodies", {"doc_id": asm})["bodies"]) == 2
+        assert cb.call("eval_mass", {"doc_id": asm})["volume_mm3"] == pytest.approx(180)
+        live = next(d for d in cb.call("doc_list", {})["docs"] if d["doc_id"] == asm)
+        assert live["path"] == str(destination)
+        saved, _ = _call("save_part", {"doc_id": asm, "path": str(destination)})
+        assert saved["ok"], saved
+        assert not (project / "relative_handoff.step+").exists()
+        with zipfile.ZipFile(destination) as archive:
+            tree = json.loads(archive.read("document.json"))
+        assert [c["source"]["path"] for c in tree["components"]] == [
+            child.name for child in children]
+
+        cb.call("doc_close", {"doc_id": asm})
+        docs.remove(asm)
+        reopened = cb.call("doc_open", {"path": str(destination)})["doc_id"]
+        docs.append(reopened)
+        # A real post-open edit forces a rebuild rather than accepting display cache.
+        edited, _ = _call("add_features", {"doc_id": reopened, "ops": [
+            {"op": "asm_edit_component", "id": components[1],
+             "transform": [1, 0, 0, 40, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1]}
+        ]})
+        assert edited["ok"], edited
+        assert edited["saved_path"] == str(destination)
+        assert len(cb.call("asm_world_bodies", {"doc_id": reopened})["bodies"]) == 2
+        assert cb.call("eval_mass", {"doc_id": reopened})["volume_mm3"] == pytest.approx(180)
+        saved, _ = _call("save_part", {"doc_id": reopened, "path": str(destination)})
+        assert saved["ok"], saved
+        assert {child: child.read_bytes() for child in children} == child_bytes
+    finally:
+        for doc in reversed(docs):
+            cb.call("doc_close", {"doc_id": doc})
 
 
 def test_save_part_replaces_a_cad_extension_instead_of_stacking_one():

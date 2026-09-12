@@ -28,6 +28,7 @@
 #include <BRepAdaptor_Surface.hxx>
 #include <BRepBndLib.hxx>
 #include <BRepGProp.hxx>
+#include <BRepLProp_SLProps.hxx>
 #include <BRep_Tool.hxx>
 #include <GProp_GProps.hxx>
 #include <GeomAbs_CurveType.hxx>
@@ -130,6 +131,45 @@ std::optional<Eigen::Vector3d> representative_dir(
 
 }  // namespace
 
+// GEOMETRIC concavity of a cylindrical face (C5). The raw face Orientation() flag is NOT
+// reliable for bore-vs-fillet classification after boolean+fillet operations: OCCT may store
+// either orientation depending on how the face was (re)built, so a convex corner fillet can
+// come back REVERSED and a bore FORWARD. Instead we decide concavity from real geometry:
+//   1. outward material normal n  = geometric surface normal, flipped when the face is REVERSED
+//      (so n points OUT of the solid, away from material — the build123d normal_at convention).
+//   2. radial-outward direction r = from the cylinder axis to a point on the surface.
+//   n·r < 0  ->  the outward normal points TOWARD the axis: the void is the central cylinder and
+//                material wraps its outside -> a BORE / hole -> concave.
+//   n·r > 0  ->  the outward normal points AWAY from the axis: material is the central cylinder
+//                (a boss / convex-corner fillet) -> convex.
+// Returns nullopt when the normal is undefined (degenerate) so the caller can fall back to
+// the radius heuristic instead of guessing.
+std::optional<bool> cylinder_face_concave(const TopoDS_Face& f) {
+    try {
+        BRepAdaptor_Surface sa(f);
+        if (sa.GetType() != GeomAbs_Cylinder) return std::nullopt;
+        const double u = (sa.FirstUParameter() + sa.LastUParameter()) / 2.0;
+        const double v = (sa.FirstVParameter() + sa.LastVParameter()) / 2.0;
+        BRepLProp_SLProps sl(sa, u, v, 1, 1e-7);
+        if (!sl.IsNormalDefined()) return std::nullopt;
+        gp_Dir gn = sl.Normal();  // geometric normal (orientation-independent)
+        gp_Vec n(gn);
+        if (f.Orientation() == TopAbs_REVERSED) n.Reverse();  // -> outward material normal
+
+        // Surface point + radial-outward direction (point projected onto the cylinder axis).
+        const gp_Pnt p = sl.Value();
+        const gp_Ax1 ax = sa.Cylinder().Axis();
+        const gp_Pnt a0 = ax.Location();
+        const gp_Vec ad(ax.Direction());
+        gp_Vec ap(a0, p);                       // axis-origin -> surface point
+        gp_Vec radial = ap - ad * ap.Dot(ad);   // remove the axial component
+        if (radial.Magnitude() < 1e-9) return std::nullopt;
+
+        return n.Dot(radial) < 0.0;  // outward normal points toward the axis -> concave bore
+    } catch (const Standard_Failure&) {
+        return std::nullopt;
+    }
+}
 // --------------------------------------------------------------------------- describe_faces
 
 std::vector<TopoInfo> describe_faces(const TopoDS_Shape& shape,
@@ -168,6 +208,7 @@ std::vector<TopoInfo> describe_faces(const TopoDS_Shape& shape,
         std::optional<Eigen::Vector3d> plane_axis;  // I3: signed outward plane normal
         std::optional<Eigen::Vector3d> axis_loc;    // I3: a point ON the cyl/cone axis
         std::optional<double> radius;               // GSL Stage 0: round-geometry size (mm)
+        std::optional<bool> concave;
         try {
             if (st == GeomAbs_Plane) {
                 gp_Dir plane_normal = adaptor.Plane().Axis().Direction();
@@ -182,6 +223,7 @@ std::vector<TopoInfo> describe_faces(const TopoDS_Shape& shape,
                 axis_loc = Eigen::Vector3d(ax.Location().X(), ax.Location().Y(),
                                            ax.Location().Z());
                 radius = adaptor.Cylinder().Radius();
+                concave = cylinder_face_concave(face);
             } else if (st == GeomAbs_Cone) {
                 gp_Ax1 ax = adaptor.Cone().Axis();
                 axis = unit_axis(ax.Direction());
@@ -223,7 +265,8 @@ std::vector<TopoInfo> describe_faces(const TopoDS_Shape& shape,
         info.owner = owner;
         info.hint_index = idx;
         info.rep_dir = rep_dir;
-        info.radius = radius;  // GSL Stage 0 (concavity is set on the picks/QCand read-back path)
+        info.radius = radius;
+        info.concave = concave;
         result.push_back(std::move(info));
     }
     return result;

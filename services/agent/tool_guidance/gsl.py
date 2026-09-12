@@ -55,9 +55,12 @@ ENTRIES: dict[str, dict[str, Any]] = {
     },
     "describe_assembly": {
         "prompt_note": (
-            "Run solve_mates first — placements and gaps are narrated as "
-            "stored, so stale mate state means stale numbers. For a single "
-            "solid part use describe_part."
+            "Queries pre-solve world placements, runs a live mate solve, then "
+            "checks collision-only threshold fit (exact overlap volumes, "
+            "clearance bounds, no minimum measured gap). Run solve_mates first "
+            "when placement rows must reflect the solved pose. Inspect fit "
+            "completeness/failures; zero checked pairs cannot qualify collision-free. "
+            "For a single solid part use describe_part."
         ),
     },
     "describe_results": {

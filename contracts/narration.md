@@ -333,3 +333,41 @@ Open questions (<N>):
 7. Add a test in `test_gsl_tools.py` with at least: (a) graceful-no-data case, and (b)
    happy-path case asserting key slot presence (MPa, mm, Hz, etc.) and at least one
    numeral via regex.
+
+## 2026-09-12 — Superseding collision-only assembly narration contract
+
+This section supersedes the `describe_assembly` section above wherever it describes
+gap distances, graceful fit-unavailable success, or numbers being “never recomputed.”
+Those exact-gap/no-recompute claims and the historical output skeleton are obsolete
+for assembly narration. Other narration tools retain their own data-source contracts.
+
+`describe_assembly` performs these native operations in order:
+
+1. `asm_world_bodies` queries the current world-frame placement snapshot.
+2. `doc_solve_mates` performs a live mate solve and may update placements. The placement
+   rows remain the pre-solve snapshot; call `solve_mates` first when those rows must
+   reflect the solved pose. Non-connection mate errors are narrated explicitly.
+3. `eval_interference` evaluates current geometry with `clearance_mode="threshold"`,
+   `min_clearance_mm=0`, and `include_coincident=false`. This collision-only request
+   retains exact Boolean Common overlap volumes and complete geometry/pair-failure
+   accounting without requesting exact minimum-distance calculations for close pairs.
+
+The reply retains `bodies` and adds the unmodified native report as `fit`, including
+`complete`, `pairs_checked`, `pairs_total`, `pair_failures`, and `geometry_failures`.
+Top-level `ok` means a complete fit report was available for narration, not that the
+bodies do not clash: a complete report of a real clash has `ok=true`, `fit.ok=false`,
+and `collision_free=false`. `collision_free=true` requires complete, failure-free
+coverage of at least one pair and a passing native fit result. One-body reports can
+be narrated successfully but are explicitly not collision-free qualifications.
+Empty geometry, missing coverage metadata, incomplete checks, and fit errors do not
+produce passing descriptions. Known overlaps and native failure details remain visible
+even when a check is incomplete. Engine connection loss remains a structured failure,
+including its code/detail, rather than becoming advisory “not available” text.
+
+`_format_fit` is implemented in `services/mcp/fit_narration.py` and imported by
+`gsl_tools.py`. It formats `distance_lower_bound_mm` as a **lower bound (not measured)**.
+Absent exact distances remain unmeasured, never numeric zero. A genuine zero lower bound
+may be printed as such; it is not an exact zero gap. Assembly narration explicitly says
+that no minimum measured gap is available and does not report an exact tightest gap.
+Its source attribution distinguishes the pre-solve placement snapshot, live mate solve,
+and live threshold classification/overlap-volume evaluation.

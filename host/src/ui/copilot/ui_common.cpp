@@ -347,14 +347,25 @@ void drawFitReadout(const FitReport& fit, bool detailed) {
     if (!detailed) return;
     for (const auto& f : fit.interferences) {
         ImGui::PushStyleColor(ImGuiCol_Text, bad);
-        ImGui::BulletText("interference  %s <-> %s : %.1f mm\xc2\xb3", f.a.c_str(),
-                          f.b.c_str(), f.value);
+        if (f.value)
+            ImGui::BulletText("interference  %s <-> %s : %.1f mm\xc2\xb3", f.a.c_str(),
+                              f.b.c_str(), *f.value);
+        else
+            ImGui::BulletText("interference  %s <-> %s : volume unavailable", f.a.c_str(),
+                              f.b.c_str());
         ImGui::PopStyleColor();
     }
     for (const auto& f : fit.clearances) {
         ImGui::PushStyleColor(ImGuiCol_Text, dim);
-        ImGui::BulletText("clearance  %s <-> %s : %.2f mm", f.a.c_str(), f.b.c_str(),
-                          f.value);
+        if (f.distanceLowerBoundMm)
+            ImGui::BulletText("clearance  %s <-> %s : >= %.2f mm (lower bound, not measured)",
+                              f.a.c_str(), f.b.c_str(), *f.distanceLowerBoundMm);
+        else if (f.value)
+            ImGui::BulletText("clearance  %s <-> %s : %.2f mm", f.a.c_str(), f.b.c_str(),
+                              *f.value);
+        else
+            ImGui::BulletText("clearance  %s <-> %s : exact gap not measured",
+                              f.a.c_str(), f.b.c_str());
         ImGui::PopStyleColor();
     }
 }

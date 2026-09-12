@@ -658,3 +658,43 @@ TEST_CASE("doc_render_view: nested multibody appearances shade each face without
     CHECK(cleared[0] == 0);
     CHECK(cleared[1] == 0);
 }
+
+TEST_CASE("doc_render_view: selected-face finish colors only its face and clear restores it") {
+    using namespace chudware::doc;
+    const auto id = make_box_doc();
+    const auto selected = doc_query(id, {{"of", "face"}, {"side", "top"}}).at("matches").at(0);
+    const auto shot = tmp_png("selected_finish");
+    struct RemoveShot {
+        std::string path;
+        ~RemoveShot() { std::error_code ec; fs::remove(path, ec); }
+    } cleanup{shot};
+    auto red_pixels = [&](const std::string& view) {
+        REQUIRE(doc_render_view(id, shot, view, false).value("ok", false));
+        const auto image = decode_png(shot);
+        REQUIRE(image.ok());
+        size_t red = 0;
+        // Sample the face interior, not shared silhouette pixels where raster
+        // coverage can expose an edge of the opposite face.
+        size_t samples = 0;
+        for (int y = image.h * 2 / 5; y < image.h * 3 / 5; ++y) {
+            for (int x = image.w * 2 / 5; x < image.w * 3 / 5; ++x) {
+                const size_t i = static_cast<size_t>(y * image.w + x) * 3;
+                if (image.px[i] > 60 && image.px[i] > 3 * image.px[i + 1] &&
+                    image.px[i] > 3 * image.px[i + 2]) ++red;
+                ++samples;
+            }
+        }
+        return static_cast<double>(red) / samples;
+    };
+    const auto baseline = red_pixels("top");
+    doc_apply_ops(id, -1, json::array({
+        {{"op", "set_appearance"}, {"id", "b1"}, {"faces", {selected}}, {"color", {0.95, 0.01, 0.01}},
+         {"metallic", 0.8}, {"roughness", 0.15}},
+    }), false);
+    CHECK(red_pixels("top") > 0.9);
+    CHECK(red_pixels("bottom") == baseline);
+    doc_apply_ops(id, -1, json::array({
+        {{"op", "set_appearance"}, {"id", "b1"}, {"faces", {selected.at("sid")}}, {"color", nullptr}},
+    }), false);
+    CHECK(red_pixels("top") == baseline);
+}

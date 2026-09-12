@@ -347,6 +347,10 @@ struct CompileCache {
 
 std::shared_ptr<CompileCache> make_compile_cache() { return std::make_shared<CompileCache>(); }
 
+std::shared_ptr<CompileCache> copy_compile_cache(const CompileCache& source) {
+    return std::make_shared<CompileCache>(source);
+}
+
 nlohmann::json compile_cache_stats() {
     return {{"compiles", g_cc_compiles.load(std::memory_order_relaxed)},
             {"full_hits", g_cc_full_hits.load(std::memory_order_relaxed)},
@@ -1715,6 +1719,82 @@ void apply_doc_appearance(const json& doc, uint32_t body_num,
     }
 }
 
+FaceSidInventory face_sid_inventory(const TopoDS_Shape& shape) {
+    FaceSidInventory inventory;
+    const auto descriptors = describe_faces(shape);
+    TopTools_IndexedMapOfShape faces;
+    TopExp::MapShapes(shape, TopAbs_FACE, faces);
+    size_t ordinal = 0;
+    for (TopExp_Explorer ex(shape, TopAbs_FACE); ex.More(); ex.Next(), ++ordinal) {
+        // describe_faces enumerates occurrences, while AICM enumerates unique topology.
+        const uint32_t id = static_cast<uint32_t>(faces.FindIndex(ex.Current()));
+        json selector = make_selector(descriptors.at(ordinal));
+        selector.erase("hint_index");
+        selector.erase("owner_feature");
+        auto& candidates = inventory[selector.at("sid").get<std::string>()];
+        if (std::none_of(candidates.begin(), candidates.end(),
+                         [id](const auto& candidate) { return candidate.first == id; }))
+            candidates.emplace_back(id, std::move(selector));
+    }
+    return inventory;
+}
+
+void apply_doc_face_appearances(const json& doc, uint32_t body_num,
+                                const TopoDS_Shape& shape, aicm::AicmBody& body) {
+    body.appearance_regions.clear();
+    const auto all = doc.find("face_appearances");
+    const std::string key = "b" + std::to_string(body_num);
+    if (all == doc.end() || !all->is_object() || !all->contains(key)) return;
+    const auto& records = all->at(key);
+    if (!records.is_object() || records.empty()) return;
+    const auto inventory = face_sid_inventory(shape);
+    std::map<uint32_t, const json*> overrides;
+    for (auto it = records.begin(); it != records.end(); ++it) {
+        const auto& record = it.value();
+        if (!record.is_object() || !record.contains("selector") ||
+            !record["selector"].is_object() || !record.contains("appearance")) continue;
+        const auto match = inventory.find(record["selector"].value("sid", std::string()));
+        if (match == inventory.end()) continue;
+        uint32_t face_id = 0;
+        size_t matches = 0;
+        for (const auto& candidate : match->second)
+            if (record["selector"] == candidate.second) { face_id = candidate.first; ++matches; }
+        if (matches == 1) overrides.emplace(face_id, &record["appearance"]);
+    }
+    if (overrides.empty()) return;
+    // Full coverage keeps the existing range consumers simple and preserves the
+    // body's default finish on unselected faces (including nested assembly sources).
+    TopTools_IndexedMapOfShape faces;
+    TopExp::MapShapes(shape, TopAbs_FACE, faces);
+    for (uint32_t id = 1; id <= static_cast<uint32_t>(faces.Extent()); ++id) {
+        aicm::AppearanceRegion region;
+        region.first_face = id;
+        region.face_count = 1;
+        std::copy(body.color, body.color + 3, region.color);
+        region.metallic = body.metallic;
+        region.roughness = body.roughness;
+        const auto override = overrides.find(id);
+        if (override != overrides.end()) {
+            const auto& ap = *override->second;
+            const auto& color = ap.is_array() ? ap : ap.at("color");
+            for (int k = 0; k < 3; ++k) region.color[k] = color.at(k).get<float>();
+            if (ap.is_object()) {
+                region.metallic = ap.value("metallic", region.metallic);
+                region.roughness = ap.value("roughness", region.roughness);
+            }
+        }
+        if (!body.appearance_regions.empty()) {
+            auto& previous = body.appearance_regions.back();
+            if (std::equal(previous.color, previous.color + 3, region.color) &&
+                previous.metallic == region.metallic && previous.roughness == region.roughness) {
+                ++previous.face_count;
+                continue;
+            }
+        }
+        body.appearance_regions.push_back(region);
+    }
+}
+
 CompileResult compile_document(const json& doc, const json& env_json, CompileCache* cache,
                                ::geom::DisplayQuality quality) {
     CompileResult result;
@@ -2417,7 +2497,8 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
         // the post-loop AICM colors) -> serve the whole previous result.
         const uint64_t full_key = cc_fnv1a(
             doc.contains("appearances") ? doc["appearances"].dump() : std::string(),
-            chain.back());
+            cc_fnv1a(doc.contains("face_appearances") ? doc["face_appearances"].dump() : std::string(),
+                     chain.back()));
         if (cache->last_result && cache->full_key == full_key &&
             cache->chain == chain) {
             CompileResult out = *cache->last_result;
@@ -8715,6 +8796,7 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
     const float color[3] = {0.71f, 0.76f, 0.82f};  // default dielectric grey
     uint32_t body_num = 1;
     const bool has_appearances = doc.contains("appearances") && doc["appearances"].is_object();
+    const auto face_appearances = doc.find("face_appearances");
     // Per-TShape stats cache: volume/area/face-count/edge-count are geometry-only (location-
     // invariant), so instanced bodies that SHARE a TShape (e.g. the 4 wheels) compute the
     // mass props ONCE. Keyed by (TShape*, is_surface) so a surface vs solid use of the same
@@ -8770,7 +8852,12 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
             std::tuple<const void*, bool, uint64_t> ck;
             if (cacheable)
                 ck = std::make_tuple(static_cast<const void*>(shape.TShape().get()),
-                                     is_surface, appearance_hash(bcolor, bmetal, brough));
+                                     is_surface, cc_fnv1a(
+                                         face_appearances != doc.end() &&
+                                                 face_appearances->contains("b" + std::to_string(body_num))
+                                             ? face_appearances->at("b" + std::to_string(body_num)).dump()
+                                             : std::string(),
+                                         appearance_hash(bcolor, bmetal, brough)));
 
             std::shared_ptr<const CachedBody> hit;
             if (cacheable) {
@@ -8810,6 +8897,7 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
             aicm::AicmBody b = ::geom::tessellate_body(shape, body_num, sid, bcolor,
                                                        defl.lin, defl.ang,
                                                        bmetal, brough);
+            apply_doc_face_appearances(doc, body_num, shape, b);
             result.shapes.push_back(shape);  // AICM order: shapes[i] <-> body ordinal i+1
             ++body_num;
             // Per-body stats: SURFACE bodies report meaningful AREA + face/edge counts
@@ -8994,7 +9082,8 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
         cache->snaps = std::move(new_snaps);
         cache->full_key = cc_fnv1a(
             doc.contains("appearances") ? doc["appearances"].dump() : std::string(),
-            cache->chain.back());
+            cc_fnv1a(doc.contains("face_appearances") ? doc["face_appearances"].dump() : std::string(),
+                     cache->chain.back()));
         cache->last_result = std::move(stored);
     }
 

@@ -71,6 +71,7 @@
       "describe_toolpaths",
       "get_part",
       "hover",
+      "inspect_native_files",
       "list_calcs",
       "list_parts",
       "list_standard_parts",
@@ -162,6 +163,7 @@
       "wall_thickness"
     ],
     "plan": [
+      "inspect_native_files",
       "advise",
       "ask_user",
       "bearing_life",
@@ -267,6 +269,7 @@
   },
   "mutating_tools": [
     "add_features",
+    "relocate_native_files",
     "asm_add_component",
     "asm_mate",
     "board_from_schematic",
@@ -292,6 +295,7 @@
     "solve_mates"
   ],
   "edit_denied": [
+    "relocate_native_files",
     "close_part",
     "corporate_activate",
     "corporate_spawn_worker",

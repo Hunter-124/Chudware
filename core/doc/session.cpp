@@ -3796,6 +3796,78 @@ json mark_group_stale(Session& s, const std::string& group, const std::string& r
     return marked;
 }
 
+// Short SIDs may collide. A complete query fingerprint can disambiguate them,
+// but topology ordinals and partial/fuzzy fingerprints never select a finish.
+std::string appearance_face_sid(const json& face) {
+    if (face.is_object() && face.contains("kind") && face["kind"] != "face")
+        throw OpError("invalid_op", "set_appearance: selector kind must be face");
+    const json sid = face.is_object() ? face.value("sid", json()) : face;
+    if (!sid.is_string())
+        throw OpError("invalid_op", "set_appearance: faces require face SIDs or selectors with sid");
+    const auto value = sid.get<std::string>();
+    if (value.size() != 7 || value[0] != 'F' ||
+        !std::all_of(value.begin() + 1, value.end(),
+                     [](char c) { return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'); }))
+        throw OpError("invalid_op", "set_appearance: invalid face SID '" + value + "'");
+    return value;
+}
+
+struct FaceAppearanceChange {
+    std::string body;
+    json appearance;
+    std::vector<json> faces;
+};
+
+FaceAppearanceChange parse_face_appearance_change(const json& doc, const json& op) {
+    if (doc.value("schema", std::string()) != "aicad.part/1")
+        throw OpError("invalid_op", "set_appearance: assign face finishes in the source part");
+    FaceAppearanceChange change;
+    change.body = op.value("id", std::string());
+    const auto& id = change.body;
+    if (id.size() < 2 || id[0] != 'b' || id[1] < '1' || id[1] > '9' ||
+        !std::all_of(id.begin() + 2, id.end(), [](char c) { return c >= '0' && c <= '9'; }))
+        throw OpError("invalid_op", "set_appearance: faces require a part body id such as b1");
+    if (!op["faces"].is_array() || op["faces"].empty())
+        throw OpError("invalid_op", "set_appearance: faces must be a nonempty explicit list");
+    if (!op.contains("color"))
+        throw OpError("invalid_op", "set_appearance: faces require explicit RGB or null to clear");
+    if (!op["color"].is_null()) {
+        if (!op["color"].is_array() || op["color"].size() != 3)
+            throw OpError("invalid_op", "set_appearance: face color must be three finite numbers");
+        auto number = [](const json& value) {
+            if (!value.is_number() || !std::isfinite(value.get<double>()))
+                throw OpError("invalid_op", "set_appearance: appearance values must be finite numbers");
+            return std::clamp(value.get<double>(), 0.0, 1.0);
+        };
+        json color = json::array();
+        for (const auto& value : op["color"]) color.push_back(number(value));
+        change.appearance = {{"color", std::move(color)}};
+        for (const char* finish : {"metallic", "roughness"})
+            if (op.contains(finish)) change.appearance[finish] = number(op[finish]);
+    }
+    change.faces.reserve(op["faces"].size());
+    for (const auto& face : op["faces"]) {
+        const auto sid = appearance_face_sid(face);
+        bool geometric = false;
+        for (const char* field : {"surf", "centroid", "axis", "area_or_len", "normal",
+                                  "side", "concavity", "radius"})
+            geometric = geometric || face.contains(field);
+        if (!geometric) {
+            change.faces.emplace_back(sid);
+            continue;
+        }
+        json selector;
+        for (const char* field : {"kind", "surf", "centroid", "axis", "area_or_len",
+                                  "normal", "side", "concavity", "radius", "sid"}) {
+            if (!face.contains(field))
+                throw OpError("invalid_op", "set_appearance: pass a complete query_geometry face fingerprint");
+            selector[field] = face[field];
+        }
+        change.faces.push_back(std::move(selector));
+    }
+    return change;
+}
+
 void apply_one(json& doc, const json& op, std::size_t idx, IdGen& gen, json& id_map) {
     if (!op.is_object() || !op.contains("op") || !op["op"].is_string())
         throw OpError("unsupported", "op[" + std::to_string(idx) + "]: missing 'op'",
@@ -3867,6 +3939,8 @@ void apply_one(json& doc, const json& op, std::size_t idx, IdGen& gen, json& id_
         // colour alone stores a bare [r,g,b]. The batch bumps the revision, so the AICM re-bakes.
         const std::string id = op.value("id", std::string());
         if (id.empty()) throw OpError("invalid_op", "set_appearance: missing body id");
+        if (op.contains("faces"))
+            throw OpError("invalid_op", "set_appearance: face finishes require a final-part transaction");
         if (!doc.contains("appearances") || !doc["appearances"].is_object())
             doc["appearances"] = json::object();
         json& ap = doc["appearances"];
@@ -4039,7 +4113,7 @@ json warm_and_respond(Session& s, CompileResult r, const json& id_map, bool with
     s.compiled_rev = s.revision;
     // Cross-doc dependency notify (feat(xdoc)): stamp dependents stale when this doc
     // rebuilds. Called unlocked-variant since DocLock is already held by the caller.
-    dep_notify_unlocked(s.doc_id, s.revision);
+    if (s.owns_journal) dep_notify_unlocked(s.doc_id, s.revision);
     return resp;
 }
 
@@ -4744,9 +4818,14 @@ json apply_ops_locked(Session& s, long base_revision, const json& input_ops, boo
     if (s.is_assembly()) bind_assembly_reference_frames(working);
     json id_map = json::object();
     IdGen gen(working);
+    std::vector<FaceAppearanceChange> face_changes;
     for (std::size_t i = 0; i < ops.size(); ++i) {
         if (s.is_assembly()) assembly_ops[i] = assembly_transform_op(working, ops[i], id_map);
-        apply_one(working, ops[i], i, gen, id_map);
+        if (ops[i].is_object() && ops[i].value("op", std::string()) == "set_appearance" &&
+            ops[i].contains("faces"))
+            face_changes.push_back(parse_face_appearance_change(working, ops[i]));
+        else
+            apply_one(working, ops[i], i, gen, id_map);
     }
 
     // T-W2 auto-coincident: on a sketch-mutating batch, pin touching endpoints (within
@@ -4795,6 +4874,73 @@ json apply_ops_locked(Session& s, long base_revision, const json& input_ops, boo
         }
         throw OpError("invalid_op", "resulting document failed validation: " + joined,
                       {{"index", -1}, {"reason", errs.front()}, {"all_errors", errs}});
+    }
+
+    // Resolve against final geometry, then apply finish changes in request order.
+    // Record ids are opaque: distinct exact fingerprints may share a short SID.
+    std::map<std::string, FaceSidInventory> face_inventories;
+    if (std::any_of(face_changes.begin(), face_changes.end(),
+                    [](const auto& change) { return !change.appearance.is_null(); })) {
+        const auto candidate = compile_document(working, env_from_doc(working),
+            inc_rebuild_enabled() ? s.compile_cache.get() : nullptr, s.display_quality);
+        if (!candidate.ok)
+            throw OpError("invalid_op", "set_appearance: final part geometry did not compile");
+        for (const auto& change : face_changes) {
+            if (change.appearance.is_null() ||
+                face_inventories.find(change.body) != face_inventories.end()) continue;
+            size_t ordinal = 0;
+            try { ordinal = std::stoull(change.body.substr(1)); } catch (...) {}
+            if (ordinal == 0 || ordinal > candidate.shapes.size())
+                throw OpError("invalid_op", "set_appearance: body '" + change.body + "' is not present");
+            face_inventories.emplace(change.body, face_sid_inventory(candidate.shapes[ordinal - 1]));
+        }
+    }
+    for (const auto& change : face_changes) {
+        for (const auto& face : change.faces) {
+            const auto sid = appearance_face_sid(face);
+            const bool exact = face.is_object();
+            if (change.appearance.is_null()) {
+                if (!working.contains("face_appearances") ||
+                    !working["face_appearances"].contains(change.body)) continue;
+                auto& records = working["face_appearances"][change.body];
+                for (auto it = records.begin(); it != records.end();) {
+                    const auto selector = it.value().find("selector");
+                    const bool same = selector != it.value().end() && selector->is_object() &&
+                        (exact ? *selector == face : selector->value("sid", std::string()) == sid);
+                    if (same || (!exact && it.key() == sid)) it = records.erase(it);
+                    else ++it;
+                }
+                if (records.empty()) working["face_appearances"].erase(change.body);
+                if (working["face_appearances"].empty()) working.erase("face_appearances");
+                continue;
+            }
+            const auto& inventory = face_inventories.at(change.body);
+            const auto bucket = inventory.find(sid);
+            const json* selected = nullptr;
+            size_t matches = 0;
+            if (bucket != inventory.end())
+                for (const auto& [face_id, selector] : bucket->second)
+                    if (!exact || selector == face) { selected = &selector; ++matches; }
+            if (matches != 1)
+                throw OpError("invalid_op", "set_appearance: face " + sid +
+                    (matches == 0 ? " is unknown in " : " is ambiguous in ") + change.body,
+                    {{"body", change.body}, {"sid", sid},
+                     {"reason", matches == 0 ? (exact ? "unknown_face_fingerprint" : "unknown_face_sid")
+                                             : "ambiguous_face_sid"}});
+            auto& records = working["face_appearances"][change.body];
+            std::string record_id;
+            for (auto it = records.begin(); it != records.end(); ++it)
+                if (it.value().contains("selector") && it.value()["selector"] == *selected) {
+                    record_id = it.key();
+                    break;
+                }
+            if (record_id.empty()) {
+                record_id = sid;
+                for (size_t suffix = 1; records.contains(record_id); ++suffix)
+                    record_id = sid + ":" + std::to_string(suffix);
+            }
+            records[record_id] = {{"selector", *selected}, {"appearance", change.appearance}};
+        }
     }
 
     const json pose_transport = transport_carried_poses(s, working, ops);
@@ -5457,17 +5603,42 @@ json doc_apply_ops(const std::string& doc_id, long base_revision, const json& op
     return apply_ops_locked(s, base_revision, ops, coalesce, with_tess);
 }
 
+// Scratch callers share frozen compilation payloads, never mutable session ownership.
+static void seed_cached_scratch(Session& scratch, const Session& live) {
+    scratch.doc_id = live.doc_id;
+    scratch.doc = live.doc;
+    scratch.revision = live.revision;
+    scratch.path = live.path;
+    scratch.display_quality = live.display_quality;
+    scratch.active_sketch = live.active_sketch;
+    if (scratch.active_sketch) {
+        scratch.active_sketch->drag_ctx.reset();
+        scratch.active_sketch->drag_ctx_revision = -1;
+    }
+    scratch.asm_warm = live.asm_warm;
+    scratch.compile_cache = copy_compile_cache(*live.compile_cache);
+}
+
+static void absolutize_component_paths(json& doc, const std::filesystem::path& base) {
+    if (!doc.is_object() || !doc.contains("components")) return;
+    for (json& component : doc["components"]) {
+        if (!component.contains("source") || !component["source"].is_object()) continue;
+        json& source = component["source"];
+        if (!source.contains("path") || !source["path"].is_string()) continue;
+        const std::filesystem::path ref(source["path"].get<std::string>());
+        if (!ref.empty() && ref.is_relative())
+            source["path"] = (base / ref).lexically_normal().string();
+    }
+}
+
 json doc_dry_run_ops(const std::string& doc_id, const json& ops) {
     DocLock lk;
     Session& live = require_session(doc_id);
-    // Clone the live doc into a scratch session; apply_ops_locked there so the live
-    // session (and its revision/undo stacks) is never touched. base_revision = -1
-    // skips the optimistic-concurrency guard (matches ops_emit.dry_run, which builds
-    // the would-be document directly off the doc dict with no revision check).
+    // Unregistered scratch state: no journal, mesh publication, or dependency
+    // notifications. Copy the mutable cache index, retaining its frozen prefix
+    // checkpoints instead of cold-replaying the live feature history.
     Session scratch;
-    scratch.doc_id = live.doc_id;  // any value; never registered/persisted.
-    scratch.doc = live.doc;        // deep copy of the feature tree json.
-    scratch.revision = live.revision;
+    seed_cached_scratch(scratch, live);
     try {
         // apply_ops_locked THROWS on a structural/validation rejection (caught below) but
         // RETURNS an in-band rejection on a compile failure (per the batch-atomicity contract:
@@ -5475,7 +5646,10 @@ json doc_dry_run_ops(const std::string& doc_id, const json& ops) {
         // rebuild.feature_status). The dry-run gate must report {ok:false} for BOTH, so we
         // inspect the returned feature_status for any ok:false and compose the same error
         // string shape (the failing features' messages joined) the throw path produces.
-        json resp = apply_ops_locked(scratch, -1, ops, /*coalesce=*/true);
+        json resp = apply_ops_locked(scratch, -1, ops, /*coalesce=*/true,
+                                     /*with_tess=*/false);
+        json result = {{"ok", true}, {"source_revision", live.revision},
+                       {"rebuild", resp.at("rebuild")}};
         std::vector<std::string> feat_errs;
         if (resp.contains("rebuild") && resp["rebuild"].is_object() &&
             resp["rebuild"].contains("feature_status") &&
@@ -5493,9 +5667,10 @@ json doc_dry_run_ops(const std::string& doc_id, const json& ops) {
                 if (i) joined += "; ";
                 joined += feat_errs[i];
             }
-            return json{{"ok", false}, {"error", "op batch rejected: " + joined}};
+            result["ok"] = false;
+            result["error"] = "op batch rejected: " + joined;
         }
-        return json{{"ok", true}};
+        return result;
     } catch (const OpError& e) {
         // Compose the error string the SAME way ops_emit.dry_run does:
         //   reason = env["message"]; if detail.all_errors: reason + " | " + "; ".join(all_errors[:5])
@@ -7679,6 +7854,7 @@ static std::vector<aicm::AicmBody> tessellate_session_bodies(Session& s) {
                 ::geom::display_deflections(s.display_quality, shp);
             bodies.push_back(::geom::tessellate_body(shp, id, "b" + std::to_string(id), bcolor,
                                                      d.lin, d.ang, bmetal, brough));
+            apply_doc_face_appearances(s.doc, id, shp, bodies.back());
             ++id;
         } catch (...) {
         }
@@ -11081,14 +11257,14 @@ json eval_overlap_bbox(const TopoDS_Shape& common_shape) {
 // instead of a `clearances` one (SW-parity "coincident faces" gap, docs/SW_PARITY_SPEC.md).
 // `min_clearance_mm` (B4, default 0) tags a `clearances` entry below it with
 // `"warning":"below min clearance"`.
-// Motion needs threshold classification, not a complete minimum-distance table.
-// In that internal mode a proven-safe bound is explicitly a lower bound; exact
-// distance remains mandatory whenever clearance/contact cannot be decided by it.
+// Threshold mode (also used by motion) classifies requested clearance, not a
+// complete minimum-distance table. Bounds are explicitly lower bounds; exact
+// distance remains mandatory whenever clearance/contact cannot be decided by them.
 json interference_report(const std::vector<std::pair<std::string, TopoDS_Shape>>& members,
                          bool include_coincident = false, double min_clearance_mm = 0.0,
                          bool quick = false,
                          const std::vector<std::string>& component_ids = {},
-                         bool include_overlap_mesh = true, bool classify_motion = false) {
+                         bool include_overlap_mesh = true, bool classify_threshold = false) {
     const std::size_t n = members.size();
     constexpr double INTERFERENCE_EPS = 1e-3;
     constexpr double kCoincidentTol = 1e-6;
@@ -11109,7 +11285,7 @@ json interference_report(const std::vector<std::pair<std::string, TopoDS_Shape>>
                 failure = "missing_geometry";
             else if (!TopExp_Explorer(shape, TopAbs_SOLID).More())
                 failure = "geometry_has_no_solids";
-            else if (classify_motion && !BRepCheck_Analyzer(shape).IsValid())
+            else if (classify_threshold && !BRepCheck_Analyzer(shape).IsValid())
                 failure = "invalid_geometry";
             else {
                 GProp_GProps props;
@@ -11117,7 +11293,7 @@ json interference_report(const std::vector<std::pair<std::string, TopoDS_Shape>>
                 const double volume = std::abs(props.Mass());
                 // Never clean shared source topology: motion is an immutable snapshot.
                 BRepBndLib::AddOptimal(shape, boxes[i], Standard_False,
-                                      classify_motion ? Standard_True : Standard_False);
+                                      classify_threshold ? Standard_True : Standard_False);
                 if (!std::isfinite(volume) || volume <= 0.0)
                     failure = "invalid_geometry_volume";
                 else if (boxes[i].IsVoid() || boxes[i].IsOpen())
@@ -11216,15 +11392,16 @@ json interference_report(const std::vector<std::pair<std::string, TopoDS_Shape>>
                     pair["overlap_mesh"] = eval_overlap_mesh(common_shape);
                 }
                 interferences.push_back(std::move(pair));
-            } else if (classify_motion &&
+            } else if (classify_threshold &&
                        (min_clearance_mm <= 0.0 || gap_lb >= min_clearance_mm) &&
                        (!include_coincident || gap_lb > kCoincidentTol)) {
                 // An overlapping AABB reaches here only after a completed Common
                 // proved no interfering volume. With no clearance/contact request,
                 // that classification is complete even for nearly touching faces.
                 pair["distance_lower_bound_mm"] = gap_lb;
+                pair["distance_status"] = "lower_bound";
                 clearances.push_back(std::move(pair));
-            } else if (quick && gap_lb > quick_window_mm) {
+            } else if (!classify_threshold && quick && gap_lb > quick_window_mm) {
                 pair["distance"] = gap_lb;
                 pair["approx"] = true;
                 clearances.push_back(std::move(pair));
@@ -11241,6 +11418,7 @@ json interference_report(const std::vector<std::pair<std::string, TopoDS_Shape>>
                         continue;
                     }
                     pair["distance"] = value;
+                    if (classify_threshold) pair["distance_status"] = "exact";
                     if (include_coincident && value <= kCoincidentTol)
                         contacts.push_back(std::move(pair));
                     else {
@@ -11278,9 +11456,10 @@ json interference_report(const std::vector<std::pair<std::string, TopoDS_Shape>>
                       (*biggest)["b"].get<std::string>().c_str(),
                       (*biggest)["volume"].get<double>());
         summary = buf;
-    } else if (classify_motion) {
+    } else if (classify_threshold) {
         summary = n < 2 ? "No body pairs to check (1 body)." :
-                         "No volumetric interference; requested clearance classified.";
+                         "No volumetric interference; requested clearance classified "
+                         "(see warnings). Exact minimum gaps not computed for every pair.";
     } else if (!clearances.empty()) {
         const auto tightest = std::min_element(clearances.begin(), clearances.end(),
             [](const json& a, const json& b) {
@@ -11296,6 +11475,7 @@ json interference_report(const std::vector<std::pair<std::string, TopoDS_Shape>>
         summary = n < 2 ? "No body pairs to check (1 body)." : "No interference detected.";
     return {{"ok", complete && interferences.empty()}, {"complete", complete},
             {"summary", summary}, {"pairs_checked", pairs_checked},
+            {"clearance_mode", classify_threshold ? "threshold" : "exact"},
             {"pairs_total", n < 2 ? 0 : n * (n - 1) / 2},
             {"pair_failures", std::move(pair_failures)},
             {"geometry_failures", std::move(geometry_failures)}, {"parts", std::move(parts)},
@@ -11313,6 +11493,14 @@ json interference_report(const std::vector<std::pair<std::string, TopoDS_Shape>>
 json doc_eval_interference(const std::string& doc_id, const json& params) {
     DocLock lk;
     Session& s = require_session(doc_id);
+    std::string clearance_mode = "exact";
+    if (params.contains("clearance_mode")) {
+        if (!params["clearance_mode"].is_string())
+            throw OpError("invalid_op", "clearance_mode must be 'exact' or 'threshold'");
+        clearance_mode = params["clearance_mode"].get<std::string>();
+        if (clearance_mode != "exact" && clearance_mode != "threshold")
+            throw OpError("invalid_op", "clearance_mode must be 'exact' or 'threshold'");
+    }
 
     std::vector<std::pair<std::string, TopoDS_Shape>> members;
     std::vector<std::string> component_ids;
@@ -11417,6 +11605,7 @@ json doc_eval_interference(const std::string& doc_id, const json& params) {
     if (members.empty())
         return json{{"ok", false}, {"reason", "insufficient_bodies"},
                     {"body_count", 0}, {"complete", false}, {"pairs_checked", 0},
+                    {"clearance_mode", clearance_mode},
                     {"scope", scope},
                     {"pair_failures", json::array()}, {"geometry_failures", source_failures},
                     {"summary", "Interference requires bodies; this document has none."}};
@@ -11434,7 +11623,7 @@ json doc_eval_interference(const std::string& doc_id, const json& params) {
     const bool quick = params.contains("quick") && params["quick"].is_boolean() &&
                        params["quick"].get<bool>();
     json report = interference_report(members, include_coincident, min_clearance_mm, quick,
-                                      component_ids);
+                                      component_ids, true, clearance_mode == "threshold");
     report["scope"] = std::move(scope);
     if (!source_failures.empty()) {
         report["ok"] = false;
@@ -13291,7 +13480,7 @@ static int bake_import_features(json& doc) {
     return baked;
 }
 
-json doc_save(const std::string& doc_id, const std::string& path) {
+json doc_save(const std::string& doc_id, const std::string& path, bool preserve_path) {
     // W12+: embed every open drawing whose live source is this doc as a drawings/<id>.json
     // entry. Gather them BEFORE taking the session lock — drawings_for_source takes the
     // (separate) drawing lock, and a drawing projection takes drawing->session, so doing it
@@ -13300,7 +13489,23 @@ json doc_save(const std::string& doc_id, const std::string& path) {
     std::map<std::string, std::string> drawing_entries = drawings_for_source(doc_id);
 
     DocLock lk;
-    Session& s = require_session(doc_id);
+    Session& live = require_session(doc_id);
+    std::unique_ptr<Session> snapshot;
+    if (preserve_path) {
+        snapshot = std::make_unique<Session>();
+        seed_cached_scratch(*snapshot, live);
+        // Do not copy large caches only to erase them below. All other embedded
+        // studies/attachments survive; the drawing set is refreshed separately.
+        for (const auto& [name, data] : live.extra_entries)
+            if (name != "cache.json" && name != "cache.aicm" &&
+                name != "cache.brep" && name != "geometry.step" &&
+                name.rfind("drawings/", 0) != 0)
+                snapshot->extra_entries.emplace(name, data);
+        const auto base = live.path.empty() ? std::filesystem::current_path()
+            : std::filesystem::absolute(live.path).parent_path();
+        absolutize_component_paths(snapshot->doc, base);
+    }
+    Session& s = snapshot ? *snapshot : live;
     const std::string target = !path.empty() ? path : s.path;
     if (target.empty())
         throw OpError("io_error",
@@ -13416,7 +13621,9 @@ json doc_save(const std::string& doc_id, const std::string& path) {
     std::string out = stepplus_save(s.doc, target, s.extra_entries);
     s.path = out;
     s.dirty = false;
-    return json{{"path", out}};
+    json result = {{"path", out}};
+    if (preserve_path) result["preserve_path"] = true;
+    return result;
 }
 
 json doc_open(const std::string& path, bool as_solid, bool detach_path) {
@@ -13454,17 +13661,8 @@ json doc_open(const std::string& path, bool as_solid, bool detach_path) {
     sp->path = detach_path ? std::string() : path;
     // Detached imports must retain relative component references without retaining
     // the source's save destination. Resolve against the container, not process cwd.
-    if (detach_path && sp->is_assembly() && sp->doc.contains("components")) {
-        const auto base = std::filesystem::absolute(path).parent_path();
-        for (json& component : sp->doc["components"]) {
-            if (!component.contains("source") || !component["source"].is_object()) continue;
-            json& source = component["source"];
-            if (!source.contains("path") || !source["path"].is_string()) continue;
-            const std::filesystem::path ref(source["path"].get<std::string>());
-            if (!ref.empty() && ref.is_relative())
-                source["path"] = (base / ref).lexically_normal().string();
-        }
-    }
+    if (detach_path && sp->is_assembly())
+        absolutize_component_paths(sp->doc, std::filesystem::absolute(path).parent_path());
     sp->extra_entries = std::move(loaded.extra);
     // Stamp the document's own id to the new session id (mirrors blank_part).
     if (sp->doc.is_object()) sp->doc["id"] = sp->doc_id;

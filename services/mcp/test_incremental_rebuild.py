@@ -164,6 +164,77 @@ def test_suppress_unsuppress_roundtrip(part):
     assert _mass(did)["volume_mm3"] == pytest.approx(v0, rel=1e-12)
 
 
+def test_dry_run_reuses_large_cached_source_without_replay():
+    """A long source history is already compiled; prediction executes only the
+    appended candidate, not the existing features, and leaves the source cache hot."""
+    from services.agent.advisor.preflight import run_preflight
+
+    did = cb.call("doc_new", {"name": "cached_preflight_source"})["doc_id"]
+    try:
+        ops = [{"op": "add_feature", "feature": {
+            "type": "box", "name": f"History{i}", "suppressed": i > 0,
+            "params": {"length": 40, "width": 30, "height": 20},
+        }} for i in range(128)]
+        initial = _apply(did, ops)
+        assert all(s["ok"] for s in _fs(initial))
+        before = cb.call("doc_tree", {"doc_id": did})
+        mass_before = _mass(did)
+        candidate = [{"op": "add_feature", "feature": {
+            "type": "fillet", "params": {"radius": 2},
+            "refs": {"edges": [{"of": "edge", "side": "+z"}]},
+        }}]
+        prediction = run_preflight(did, "add_features", candidate)
+        assert prediction["verdict"] == "pass", prediction
+        diagnostics = prediction["predicted"]["doc_status"]
+        assert (diagnostics["features_reused"], diagnostics["features_executed"]) == (128, 1)
+        assert cb.call("doc_tree", {"doc_id": did}) == before
+        # A shared mutable index would now contain the candidate chain. Querying
+        # the untouched source must still be a full cache hit, not a prefix rebuild.
+        counters_before = cb.call("prof_contention", {})["compile_cache"]
+        unchanged = cb.call("doc_dry_run_ops", {"doc_id": did, "ops": []})
+        counters_after = cb.call("prof_contention", {})["compile_cache"]
+        assert unchanged["ok"]
+        assert _counters(unchanged) == (128, 0)
+        assert counters_after["full_hits"] - counters_before["full_hits"] == 1
+        assert _mass(did) == mass_before
+    finally:
+        cb.call("doc_close", {"doc_id": did})
+
+
+@pytest.mark.parametrize("outcome", ["success", "compile_failure", "structural_failure"])
+def test_dry_run_preserves_geometry_cache_and_undo(part, outcome):
+    did, fids = part
+    original = cb.call("doc_tree", {"doc_id": did})["tree"]
+    original_mass = _mass(did)
+    _apply(did, [{"op": "edit_feature", "id": fids[0], "params": {"length": 60}}])
+    before = cb.call("doc_tree", {"doc_id": did})
+    mass_before = _mass(did)
+    candidate = [{"op": "edit_feature", "id": fids[0], "params": {"length": 45}}]
+    if outcome == "compile_failure":
+        candidate.append({"op": "add_feature", "feature": {
+            "type": "fillet", "params": {"radius": 1e6},
+            "refs": {"edges": [{"of": "edge", "side": "+z"}]},
+        }})
+    elif outcome == "structural_failure":
+        candidate.append({"op": "edit_feature", "id": "missing", "params": {"length": 1}})
+    dry = cb.call("doc_dry_run_ops", {"doc_id": did, "ops": candidate})
+    assert dry["ok"] is (outcome == "success")
+    if outcome == "compile_failure":
+        assert any(not s["ok"] for s in _fs(dry))
+    assert cb.call("doc_tree", {"doc_id": did}) == before
+    # A scratch rebuild must not replace the source's compile index, even after
+    # changing its first feature or rejecting a candidate after compilation.
+    counters_before = cb.call("prof_contention", {})["compile_cache"]
+    unchanged = cb.call("doc_dry_run_ops", {"doc_id": did, "ops": []})
+    counters_after = cb.call("prof_contention", {})["compile_cache"]
+    assert unchanged["ok"]
+    assert counters_after["full_hits"] - counters_before["full_hits"] == 1
+    assert _mass(did) == mass_before
+    cb.call("doc_undo", {"doc_id": did})
+    assert cb.call("doc_tree", {"doc_id": did})["tree"] == original
+    assert _mass(did) == original_mass
+
+
 def test_profiler_reports_cache_section():
     prof = cb.call("prof_contention", {})
     cc = prof.get("compile_cache")

@@ -81,11 +81,12 @@ nlohmann::json doc_apply_ops(const std::string& doc_id, long base_revision,
                              const nlohmann::json& ops, bool coalesce, bool with_tess = true);
 
 // Stateless dry-run validation (engine.doc.ops dry_run, used by the agent modeler/
-// fixer path). Clones the live session's current doc into a scratch session and runs
-// the op batch against it WITHOUT mutating the live session or bumping its revision.
-// Returns {"ok": true} on success, or {"ok": false, "error": "<message>"} where the
-// error string is composed EXACTLY like ops_emit.dry_run: the OpError message, and if
-// detail.all_errors is present, message + " | " + "; ".join(all_errors[:5]).
+// fixer path). Copies the live tree and mutable compile-cache index into an
+// unregistered scratch session; unchanged cached prefixes are not replayed.
+// Never mutates the live session, publishes meshes, or notifies dependents.
+// Returns {ok, source_revision, rebuild} with the candidate rebuild diagnostics
+// (including in-band failures), or {ok:false, error} for structural exceptions.
+// Failure error strings retain the ops_emit.dry_run composition.
 nlohmann::json doc_dry_run_ops(const std::string& doc_id, const nlohmann::json& ops);
 
 nlohmann::json doc_undo(const std::string& doc_id);     // bumps revision +1
@@ -559,7 +560,11 @@ nlohmann::json doc_formats();
 // Persist the session to `path` (or its current path if `path` is empty) as a
 // .step+ container. Clears the dirty flag, records the path. Returns {"path": ...}.
 // Throws OpError("io_error") if no path is available, or on a write failure.
-nlohmann::json doc_save(const std::string& doc_id, const std::string& path);
+// preserve_path writes a nonbinding snapshot from cached scratch state: the live
+// path, dirty flag, tree and revision are unchanged, and snapshot-only relative
+// component paths are resolved against the live destination before serialization.
+nlohmann::json doc_save(const std::string& doc_id, const std::string& path,
+                        bool preserve_path = false);
 
 // Open a document at `path` into a FRESH session, rebuild it, and return the ops-response
 // + "doc_id" + "warnings". A native .step+ container is read as a feature tree; ANY OTHER

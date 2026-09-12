@@ -655,6 +655,246 @@ TEST_CASE("stepplus mesh-cache exception does not admit oversized source or unkn
     check_stepplus_limit(path, "per-entry expanded byte limit");
 }
 
+namespace {
+struct NativeFileFixture {
+    fs::path root = tmp_path("native_files_" + std::to_string(
+        std::chrono::steady_clock::now().time_since_epoch().count()));
+    NativeFileFixture() { REQUIRE(fs::create_directory(root)); }
+    ~NativeFileFixture() {
+        std::error_code ec;
+        fs::remove_all(root, ec);
+    }
+};
+
+std::string native_file_bytes(const fs::path& path) {
+    std::ifstream input(path, std::ios::binary);
+    REQUIRE(input.good());
+    return std::string(std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>());
+}
+
+std::map<std::string, std::string> native_zip_payloads(const fs::path& path) {
+    mz_zip_archive zip{};
+    REQUIRE(mz_zip_reader_init_file(&zip, path.string().c_str(), 0));
+    std::map<std::string, std::string> entries;
+    for (mz_uint i = 0; i < mz_zip_reader_get_num_files(&zip); ++i) {
+        mz_zip_archive_file_stat stat{};
+        REQUIRE(mz_zip_reader_file_stat(&zip, i, &stat));
+        std::string bytes(static_cast<std::size_t>(stat.m_uncomp_size), '\0');
+        REQUIRE(mz_zip_reader_extract_to_mem(&zip, i, bytes.data(), bytes.size(), 0));
+        entries.emplace(stat.m_filename, std::move(bytes));
+    }
+    REQUIRE(mz_zip_reader_end(&zip));
+    return entries;
+}
+}  // namespace
+
+TEST_CASE("stepplus native relocation preserves models and rebases mapped and retained references") {
+    using chudware::doc::native_file_operations;
+    NativeFileFixture fixture;
+    const auto old_dir = fixture.root / "old";
+    const auto assembly_path = old_dir / "assembly.step+";
+    const auto part_path = old_dir / "part.step+";
+    const auto new_assembly = fixture.root / "organized" / "assemblies" / "Main.step+";
+    const auto new_part = fixture.root / "organized" / "parts" / "Bearing.step+";
+    fs::create_directories(old_dir);
+    const auto mapped_source = fixture.root / "vendor" / "catalog.step";
+    const auto mapped_target = fixture.root / "organized" / "vendor" / "Catalog.step";
+    fs::create_directories(mapped_target.parent_path());
+    { std::ofstream vendor(mapped_target); vendor << "opaque neutral dependency"; }
+    bool absolute_sources = false;
+    SUBCASE("originally relative mapped sources") {}
+    SUBCASE("originally absolute mapped sources") { absolute_sources = true; }
+    const json pose = json::array({1.0, 0.0, 0.0, 12.123456789012345,
+                                  0.0, 1.0, 0.0, -3.25, 0.0, 0.0, 1.0, 9.75,
+                                  0.0, 0.0, 0.0, 1.0});
+    const json assembly{
+        {"schema", "aicad.asm/1"}, {"id", "stable-assembly"}, {"name", "Old assembly"},
+        {"components", json::array({
+            {{"id", "k1"}, {"name", "Old bearing"},
+             {"source", {{"path", absolute_sources ? part_path.string() : "part.step+"}}},
+             {"transform", pose}, {"fixed", true}},
+            {{"id", "k2"}, {"name", "Retained vendor"}, {"source", {{"path", "../vendor/retained.step"}}},
+             {"transform", pose}, {"fixed", false}}})},
+        {"mates", json::array({
+            {{"id", "m1"}, {"type", "angle"}, {"value", 0.2718281828459045},
+             {"reference_frames", {{"a", pose}, {"b", pose}}}}
+        })}};
+    const json part{
+        {"schema", "aicad.part/1"}, {"id", "stable-part"}, {"name", "Old part"},
+        {"meta", {{"provenance", {{"source_path", "/historical/unavailable.step+"},
+                                 {"snapshot", {{"path", R"(C:\old\assembly.step+)"}}}}}}},
+        {"features", json::array({
+            {{"id", "f1"}, {"type", "import"}, {"name", "Do not rename this expression target"},
+             {"params", {{"source_path", "../vendor/retained.step"}, {"format", "step"},
+                         {"embedded_brep", std::string("opaque\0model", 12)}}}},
+            {{"id", "f2"}, {"type", "import"}, {"name", "Historical URI"},
+             {"params", {{"path", "https://supplier.invalid/original.step"},
+                         {"source_path", absolute_sources ? mapped_source.string() : "../vendor/catalog.step"},
+                         {"embedded_brep", "a second opaque model"}, {"format", "step"}}}},
+            {{"id", "f3"}, {"type", "sweep"}, {"name", "Geometric path is not a filename"},
+             {"params", {{"mode", "new"}}}, {"refs", {{"path", {{"feature", "curve1"}}}}}}})},
+        {"materials", {{"f1#1", {{"name", "Steel"}, {"density", 7850.0}}}}},
+        {"face_finishes", {{"F123", {{"fingerprint", "exact-face"}, {"color", {0.2, 0.3, 0.4}}}}}}};
+    const json meta{{"container", "aicad.step+/1"}, {"created", "original timestamp"},
+                    {"future_meta", {{"preserve", true}}}, {"name", "Old assembly"}};
+    const std::string geometry("unparsed STEP\0bytes\n", 19);
+    const std::string unknown(1024 * 1024, 'Q');
+    write_zip(assembly_path, {{"meta.json", meta.dump()}, {"document.json", assembly.dump()},
+                             {"geometry.step", geometry}, {"future/", ""}, {"future/payload.bin", unknown},
+                             {"thumbnail.png", "original thumbnail"}, {"cache.brep", "obsolete BREP"},
+                             {"cache.aicm", "obsolete display"}, {"cache.json", R"({"solved":true})"}},
+              MZ_NO_COMPRESSION);
+    write_zip(part_path, {{"meta.json", meta.dump()}, {"document.json", part.dump()},
+                         {"geometry.step", ""}, {"future.bin", std::string("\0\xff", 2)}},
+              MZ_NO_COMPRESSION);
+    const auto original_assembly = native_file_bytes(assembly_path);
+    const auto original_part = native_file_bytes(part_path);
+    const auto inspected = native_file_operations({{"action", "inspect"},
+        {"paths", json::array({assembly_path.string(), part_path.string()})}});
+    REQUIRE_MESSAGE(inspected["ok"] == true, inspected.dump());
+    CHECK(inspected["files"][0]["components"][0]["transform"] == pose);
+    CHECK(inspected["files"][1]["dependencies"][0]["required"] == false);
+    CHECK(inspected["files"][1]["dependencies"][0]["exists"] == false);
+    CHECK(inspected["files"][1]["dependencies"][2]["format"] == "uri");
+    CHECK(inspected["files"][1]["dependencies"][2]["rewrite"] == false);
+    for (std::size_t i = 3; i < inspected["files"][1]["dependencies"].size(); ++i) {
+        CHECK(inspected["files"][1]["dependencies"][i]["required"] == false);
+        CHECK_FALSE(inspected["files"][1]["dependencies"][i].value("rewrite", true));
+    }
+    const auto relocated = native_file_operations({
+        {"action", "relocate"},
+        {"entries", json::array({
+            {{"path", assembly_path.string()}, {"destination", new_assembly.string()}, {"name", "Main"},
+             {"component_names", {{"k1", "Bearing"}}}},
+            {{"path", part_path.string()}, {"destination", new_part.string()}, {"name", "Bearing"}}})},
+        {"path_map", {{assembly_path.string(), new_assembly.string()}, {part_path.string(), new_part.string()},
+                      {mapped_source.string(), mapped_target.string()}}}});
+    REQUIRE_MESSAGE(relocated["ok"] == true, relocated.dump());
+    CHECK(native_file_bytes(assembly_path) == original_assembly);
+    CHECK(native_file_bytes(part_path) == original_part);
+    const auto assembly_entries = native_zip_payloads(new_assembly);
+    const auto part_entries = native_zip_payloads(new_part);
+    json expected_assembly = assembly;
+    expected_assembly["name"] = "Main";
+    expected_assembly["components"][0]["name"] = "Bearing";
+    expected_assembly["components"][0]["source"]["path"] = "../parts/Bearing.step+";
+    expected_assembly["components"][1]["source"]["path"] = "../../vendor/retained.step";
+    json expected_part = part;
+    expected_part["name"] = "Bearing";
+    expected_part["features"][0]["params"]["source_path"] = "../../vendor/retained.step";
+    expected_part["features"][1]["params"]["source_path"] = "../vendor/Catalog.step";
+    CHECK(json::parse(assembly_entries.at("document.json")) == expected_assembly);
+    CHECK(json::parse(part_entries.at("document.json")) == expected_part);
+    CHECK(assembly_entries.at("geometry.step") == geometry);
+    CHECK(part_entries.at("geometry.step") == "");
+    CHECK(assembly_entries.at("future/payload.bin") == unknown);
+    CHECK(assembly_entries.at("future/") == "");
+    CHECK(part_entries.at("future.bin") == std::string("\0\xff", 2));
+    CHECK(assembly_entries.at("thumbnail.png") == "original thumbnail");
+    CHECK(part_entries.count("thumbnail.png") == 0);
+    CHECK(assembly_entries.count("cache.brep") == 0);
+    CHECK(assembly_entries.count("cache.aicm") == 0);
+    CHECK(assembly_entries.count("cache.json") == 0);
+    json expected_meta = meta;
+    expected_meta["name"] = "Main";
+    CHECK(json::parse(assembly_entries.at("meta.json")) == expected_meta);
+    const auto after = native_file_operations({{"action", "inspect"},
+        {"paths", json::array({new_assembly.string(), new_part.string()})}});
+    REQUIRE_MESSAGE(after["ok"] == true, after.dump());
+    for (int i = 0; i < 2; ++i) {
+        CHECK(after["files"][i]["immutable_document_hash"] == inspected["files"][i]["immutable_document_hash"]);
+        CHECK(after["files"][i]["document_id"] == inspected["files"][i]["document_id"]);
+    }
+    // A STORED highly-compressible unknown entry remains admissible to normal open.
+    CHECK(chudware::doc::stepplus_open(new_assembly.string()).extra.at("future/payload.bin") == unknown);
+}
+
+TEST_CASE("stepplus native preflight refuses missing and colliding targets before any writes") {
+    using chudware::doc::native_file_operations;
+    NativeFileFixture fixture;
+    const auto source = fixture.root / "source.step+";
+    const auto other = fixture.root / "other.step+";
+    const auto destination = fixture.root / "new" / "copy.step+";
+    const json doc{{"schema", "aicad.part/1"}, {"id", "preserve-id"}, {"name", "Original"},
+                   {"features", json::array()}};
+    chudware::doc::stepplus_save(doc, source.string(), {});
+    chudware::doc::stepplus_save(doc, other.string(), {});
+    const auto source_bytes = native_file_bytes(source);
+    const auto other_bytes = native_file_bytes(other);
+    json entries = json::array({{{"path", source.string()}, {"destination", destination.string()}}});
+    json path_map = json::object();
+    SUBCASE("later missing source") {
+        entries.push_back({{"path", (fixture.root / "missing.step+").string()},
+                           {"destination", (fixture.root / "missing-copy.step+").string()}});
+    }
+    SUBCASE("later destination would overwrite source") {
+        entries.push_back({{"path", other.string()}, {"destination", source.string()}});
+    }
+    SUBCASE("missing destination field") {
+        entries.push_back({{"path", other.string()}});
+    }
+    SUBCASE("case-colliding destinations") {
+        entries.push_back({{"path", other.string()},
+                           {"destination", (fixture.root / "new" / "COPY.step+").string()}});
+    }
+    SUBCASE("case-colliding planned directory names") {
+        entries.push_back({{"path", other.string()},
+                           {"destination", (fixture.root / "NEW" / "other-copy.step+").string()}});
+    }
+    SUBCASE("planned file is another destination parent") {
+        entries.push_back({{"path", other.string()},
+                           {"destination", (destination / "nested.step+").string()}});
+    }
+    SUBCASE("dangling symlink is an occupied destination") {
+        const auto link = fixture.root / "dangling.step+";
+        std::error_code ec;
+        fs::create_symlink(fixture.root / "nonexistent.step+", link, ec);
+        if (ec) return;  // symlink creation may require privileges on Windows
+        entries[0]["destination"] = link.string();
+    }
+    SUBCASE("case-colliding existing destination") {
+        entries[0]["destination"] = (fixture.root / "SOURCE.step+").string();
+    }
+    SUBCASE("path map disagrees with plan") {
+        path_map[source.string()] = (fixture.root / "wrong.step+").string();
+    }
+    SUBCASE("unknown component id") {
+        entries[0]["component_names"] = {{"does-not-exist", "Typo"}};
+    }
+    const auto result = native_file_operations({{"action", "relocate"}, {"entries", entries},
+                                                 {"path_map", path_map}});
+    CHECK_FALSE(result.value("ok", true));
+    REQUIRE_FALSE(result["failures"].empty());
+    CHECK_FALSE(fs::exists(destination));
+    CHECK_FALSE(fs::exists(destination.parent_path()));
+    CHECK(native_file_bytes(source) == source_bytes);
+    CHECK(native_file_bytes(other) == other_bytes);
+    for (const auto& file : result["files"]) CHECK(file["status"] == "not_written");
+}
+
+TEST_CASE("stepplus native inspection skips oversized cache expansion and exposes unsupported sources") {
+    using chudware::doc::native_file_operations;
+    NativeFileFixture fixture;
+    const auto source = fixture.root / "source.step+";
+    const auto destination = fixture.root / "copy.step+";
+    const json doc{{"schema", "aicad.asm/1"}, {"name", "Metadata only"},
+                   {"components", json::array({
+                       {{"id", "k1"}, {"name", "Opaque"},
+                        {"source", {{"embedded", "unrecognized snapshot format"}}}}})}};
+    write_zip(source, {{"meta.json", R"({"container":"aicad.step+/1"})"},
+                       {"document.json", doc.dump()}, {"cache.brep", std::string(8 * 1024 * 1024, 'B')}});
+    const auto inspected = native_file_operations({{"action", "inspect"}, {"paths", {source.string()}}});
+    REQUIRE_MESSAGE(inspected["ok"] == true, inspected.dump());
+    CHECK(inspected["files"][0]["dependencies"][0]["supported"] == false);
+    const auto result = native_file_operations({{"action", "relocate"},
+        {"entries", json::array({{{"path", source.string()}, {"destination", destination.string()}}})}});
+    CHECK_FALSE(result.value("ok", true));
+    CHECK_FALSE(fs::exists(destination));
+    CHECK(chudware::doc::native_file_operations({{"action", "inspect"},
+          {"paths", {source.string()}}})["files"][0]["document_hash"] ==
+          inspected["files"][0]["document_hash"]);
+}
+
 TEST_CASE("sim_cache: hash is stable and kind-scoped") {
     json s = cube_static_study();
     const std::string a = chudware::sim::cache::hash_fea_study(Kind::FeaStatic, s);

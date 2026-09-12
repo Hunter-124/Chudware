@@ -4,6 +4,28 @@ from __future__ import annotations
 from typing import Any
 
 ENTRIES: dict[str, dict[str, Any]] = {
+    "inspect_native_files": {
+        "prompt_note": (
+            "Inventory .step+ metadata without import/open/compile/solve. Pass absolute "
+            "project-root paths and a NEW .json output_path for large inventories; full "
+            "results live there, not in the bounded chat summary. document_hash is native "
+            "canonical FNV, not SHA256. Unsupported dependencies and failures are evidence, "
+            "not permission to unzip or hand-edit CAD containers."
+        ),
+    },
+    "relocate_native_files": {
+        "prompt_note": (
+            "Metadata-only COPY via the native serializer, not a geometry operation. "
+            "Supply plan_path to JSON containing entries (absolute path/destination, optional "
+            "document name/component_names) and an absolute old-to-new path_map. Inspect "
+            "first; never rename feature labels or rebuild/solve to organize files. "
+            "Sources remain unchanged and destination overwrites are refused. Relative "
+            "references, including unmapped dependencies, are rebased. The unique result "
+            "JSON beside the plan records every native outcome; partial failure may mean "
+            "some copies exist. Read it before retrying, and never treat report failure "
+            "as proof that no native files were written."
+        ),
+    },
     "analyze_stl_geometry": {
         "prompt_note": (
             "Alias of check_geometry_health. Takes doc_id, not a file path "

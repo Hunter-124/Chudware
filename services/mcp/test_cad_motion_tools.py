@@ -28,7 +28,7 @@ import pytest
 
 from services.mcp import core_bridge as cb
 from services.mcp.cad_motion_tools import (
-    _axis_rotation16, _mat_mul16, _pose_check, _turn_center_2d,
+    _axis_rotation16, _mat_mul16, _pose_check, _turn_center_2d, steer_pose_sweep,
 )
 
 # The test vehicle, in mm. Wheels are Ø600 x 200 discs whose kingpin bore runs vertically
@@ -316,6 +316,20 @@ def test_check_interference_names_the_first_steer_angle_that_clashes(rover):
                   "axis": _axis("FL", "FR"), "angle_deg": 30}})
     assert clean["ok"], clean
     assert clean["interference"]["checked"] is True
+    assert clean["interference"]["complete"] is True
+    assert clean["interference"]["frames_checked"] == 3
+    for frame in clean["trajectory"]:
+        assert frame["interference"] is False
+        assert frame["interference_complete"] is True
+        report = frame["interference_report"]
+        assert report["pairs_checked"] == report["pairs_total"] == 36
+        # A threshold proof is enough even for the 1 mm wheel/kingpin gap:
+        # there must be no invented exact minimum in that non-overlapping pair.
+        pin, wheel = rover["ids"]["FL"]
+        clearance = next(c for c in report["clearances"]
+                         if {c["component_a"], c["component_b"]} == {pin, wheel})
+        assert "distance" not in clearance
+        assert clearance["distance_status"] == "lower_bound"
     assert clean["first_interference_deg"] is None, clean["interference"]
 
     locked = _call("steering_turning_radius", {
@@ -323,9 +337,120 @@ def test_check_interference_names_the_first_steer_angle_that_clashes(rover):
         "steer": {"components": ["wheel_FL", "wheel_FR"],
                   "axis": _axis("FL", "FR"), "angle_deg": 60}})
     assert locked["ok"], locked
+    assert locked["interference"]["complete"] is True
+    assert locked["interference"]["frames_checked"] == 5
+    assert [f["interference"] for f in locked["trajectory"]] == [
+        False, False, False, False, True]
     assert locked["first_interference_deg"] == pytest.approx(60.0, abs=1e-6)
     pair = locked["interference"]["detail"][0]
     assert {pair["a"], pair["b"]} == {"chassis", "wheel_FL"}, pair
+    assert rover["ids"]["FL"][1] in (pair["component_a"], pair["component_b"])
+    assert pair["overlap_volume_mm3"] > 0
+    assert locked["trajectory"][-1]["collision_detail"][0] == pair
+
+
+@pytest.mark.parametrize("failure,failed_step", [
+    ("pair", 1), ("pair", 2), ("geometry", 1), ("unfinished_pair", 1),
+    ("missing_accounting", 1), ("missing_complete", 1),
+    ("failed_reply", 1), ("exception", 1),
+])
+def test_incomplete_steer_check_preserves_poses_and_known_collision(
+        rover, monkeypatch, failure, failed_step):
+    """An incomplete check cannot certify a sweep or erase a real full-lock hit."""
+    original = cb.call
+    sample = 0
+
+    def interrupted_check(op, args=None, **kwargs):
+        nonlocal sample
+        if op != "eval_interference":
+            return original(op, args, **kwargs)
+        i = sample
+        sample += 1
+        if i == failed_step and failure == "exception":
+            raise cb.CoreError("overlap evaluation failed", code="geometry_failed",
+                               detail={"operation": "common"})
+        report = original(op, args, **kwargs)
+        if i != failed_step:
+            return report
+        if failure == "pair":
+            report["complete"] = False
+            report["pairs_checked"] -= 1
+            report["pair_failures"] = [{
+                "component_a": rover["ids"]["FL"][0],
+                "component_b": rover["ids"]["FL"][1], "reason": "common_failed"}]
+        elif failure == "geometry":
+            report["complete"] = False
+            report["geometry_failures"] = [{
+                "component": rover["ids"]["FL"][0], "reason": "missing_geometry"}]
+        elif failure == "unfinished_pair":
+            report["pairs_checked"] -= 1
+        elif failure == "missing_accounting":
+            del report["pairs_total"]
+        elif failure == "missing_complete":
+            del report["complete"]
+        elif failure == "failed_reply":
+            return {"ok": False, "error": "overlap evaluation failed"}
+        return report
+
+    monkeypatch.setattr(cb, "call", interrupted_check)
+    out = _call("steering_turning_radius", {
+        "doc_id": rover["doc_id"], "steps": 3, "check_interference": True,
+        "steer": {"components": ["wheel_FL", "wheel_FR"],
+                  "axis": _axis("FL", "FR"), "angle_deg": 60}})
+    assert out["ok"] is False
+    assert out["interference"]["checked"] is True
+    assert out["interference"]["complete"] is False
+    assert out["interference"]["frames_checked"] == 2
+    assert [f["value"] for f in out["trajectory"]] == [0, 30, 60]
+    assert all(f["converged"] and f["pose_check"]["ok"] for f in out["trajectory"])
+    failed = out["trajectory"][failed_step]
+    assert failed["interference_complete"] is False
+    assert failed["interference"] is (True if failed_step == 2 else None)
+    assert [f["i"] for f in out["interference"]["check_failures"]] == [failed_step]
+    if failure == "pair":
+        assert out["interference"]["pair_failures"][0]["i"] == failed_step
+        assert failed["pair_failures"][0]["reason"] == "common_failed"
+    elif failure == "geometry":
+        assert out["interference"]["geometry_failures"][0]["i"] == failed_step
+        assert failed["geometry_failures"][0]["component"] == rover["ids"]["FL"][0]
+    elif failure == "exception":
+        assert failed["interference_report"]["code"] == "geometry_failed"
+        assert failed["interference_report"]["detail"]["operation"] == "common"
+    assert out["interference"]["first_collision_step"] == 2
+    assert out["interference"]["first_collision_value"] == 60
+    assert out["trajectory"][-1]["interference"] is True
+    hit = out["interference"]["detail"][0]
+    assert {hit["a"], hit["b"]} == {"chassis", "wheel_FL"}
+    assert hit["overlap_volume_mm3"] > 0
+    assert rover["ids"]["FL"][1] in (hit["component_a"], hit["component_b"])
+
+
+def test_steer_check_connection_loss_aborts_without_replaying_motion(rover, monkeypatch):
+    original = cb.call
+    checks = 0
+    lost = False
+    later_mutations = []
+
+    def disconnected_check(op, args=None, **kwargs):
+        nonlocal checks, lost
+        if lost and op == "doc_apply_ops":
+            later_mutations.append(op)
+        if op == "eval_interference":
+            checks += 1
+            if checks == 2:
+                lost = True
+                raise cb.CoreError("engine disconnected", code="engine_connection_lost")
+        return original(op, args, **kwargs)
+
+    monkeypatch.setattr(cb, "call", disconnected_check)
+    with pytest.raises(cb.CoreError) as exc:
+        steer_pose_sweep(
+            rover["doc_id"],
+            {"components": ["wheel_FL", "wheel_FR"],
+             "axis": _axis("FL", "FR"), "angle_deg": 60},
+            None, 3, True, "test_steer_connection_loss")
+    assert exc.value.code == "engine_connection_lost"
+    assert later_mutations == []
 
 
 def test_the_steer_drive_never_touches_the_callers_document(rover):

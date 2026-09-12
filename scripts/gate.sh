@@ -36,6 +36,12 @@
 # teaching the audit the sketch3d_mode.cpp handler file + the reveng_ prefix dispatcher.
 set -euo pipefail
 
+# COLMAP/FAISS and BLAS can nest independent native worker pools. Bound their
+# defaults before Python imports either runtime; explicit caller limits win.
+export OMP_NUM_THREADS="${OMP_NUM_THREADS:-${CHUDWARE_SIM_THREADS:-4}}"
+export OPENBLAS_NUM_THREADS="${OPENBLAS_NUM_THREADS:-1}"
+export MKL_NUM_THREADS="${MKL_NUM_THREADS:-1}"
+
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO"
 

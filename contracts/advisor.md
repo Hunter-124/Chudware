@@ -819,3 +819,50 @@ Validators (`services/agent/pipeline/manifest.py::VALID_KINDS`) accept both;
 mission compilation routes them like `report`-class deliverables (buildable by
 a role granted the corresponding make_* tool). Consumers MUST tolerate the new
 kinds per the existing conformance rules.
+
+## Cached native preflight isolation (2026-09-12, supersedes §10 clone mechanism)
+
+Preflight uses `doc_dry_run_ops` on unregistered native scratch state. It copies
+the live compile-cache index and reuses immutable cached results, instead of
+serializing the live feature history into another registered document and
+replaying every feature. Successful and failed predictions must leave the live
+tree, revision, geometry, undo history and compile-cache state unchanged. Scratch
+work must not publish document events or invalidate dependent live documents.
+
+The native response retains `ok`/`error` and adds `source_revision` plus the actual
+candidate `rebuild` diagnostics when compilation is reached. The advisor keeps
+feature and document failures, warns when diagnostics are absent, and warns if
+the source revision changes across its read-only checks. Reference, parameter
+and downstream checks inspect live state; they do not claim post-edit geometry.
+An ordinary fail verdict remains advisory; engine connection loss propagates
+without replay or mutation.
+
+This removes unconditional cold replay, not the cost of rebuilding genuinely
+edited geometry, an invalidated suffix, an uncached source or an assembly solve.
+There is no guaranteed two-second wall-clock deadline. Feature-count admission
+remains an explicit `skipped` outcome, not a passing prediction.
+
+## Exact planar belt routing (2026-09-13, additive calculator)
+
+`research_eng_calc(calc="belt_route", params={"pulleys":[...]})` uses the
+existing calculator registry and `aicad.calc/1` envelope. Each ordered row is
+`{"center_mm":[x,y],"pitch_radius_mm":r,"wrap":"ccw"|"cw"}`. The last pulley
+connects back to the first. Centers must be measured in one common oriented
+plane; radii describe the belt's neutral/pitch line, not uncorrected outside
+diameters. Opposite wrap senses give internal common tangents for backside
+idlers. Wrap sense describes belt travel around a circle, not shaft speed.
+
+The answer contains `length_mm`, separate straight/arc totals, every tangent
+endpoint and span length, and each pulley’s entry/exit, wrap angle and arc
+length. It uses exact common-tangent and directed-arc geometry, not a
+linearized tensioner gain. Impossible tangents, obstructed routes and
+crossed/self-touching planar loops refuse without a length answer. The
+reported numerical tolerance is floating-point geometry tolerance, not an
+engineering clearance allowance.
+
+This is a neutral-line geometry calculator, not a physical clash, preload,
+compliance, belt-strength or supplier-tolerance qualification. A catalog
+center-distance tolerance is not implicitly treated as a pitch-length
+tolerance. Callers must source the neutral-line offset and tolerance
+measurement conditions, evaluate actual mechanism positions, and bind
+native measurements through the existing `prefilled` provenance field.

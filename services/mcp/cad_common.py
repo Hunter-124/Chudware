@@ -73,9 +73,9 @@ _DOC_ALIASES: dict = {}
 _LAST_VOLUME: dict = {}
 
 # Save discipline (user-vs-AI ownership): the engine revision this doc was last DELIVERED at
-# (save_part / export_part to a file). The engine `dirty` flag is NOT a usable "undelivered
-# work" signal here — the MCP autosave timer calls doc_save to a temp path, which clears dirty
-# without the agent having delivered anything. Revision IS reliable: it's monotonic and bumped
+# (save_part / export_part to a file). Native saves also happen automatically via
+# _project_save, so a clean engine `dirty` flag alone is not proof of explicit delivery.
+# Revision IS reliable: it's monotonic and bumped
 # only by mutating ops (never by a save), so `current_revision > _LAST_DELIVER_REV[doc]` means
 # "edited since the last real save". close_part uses it to nudge the agent to save its work.
 _LAST_DELIVER_REV: dict = {}
@@ -1471,7 +1471,7 @@ def _publish_current(doc_id: str, _deferred: bool = False) -> Optional[dict]:
         # servers both holding doc-cpp00000001 would otherwise write the SAME live-doc-cpp00000001
         # .step+ and clobber each other's mirror. _SESSION_ID makes every process's files disjoint.
         step = d / f"live-{_SESSION_ID}-{key}.step+"
-        cb.call("doc_save", {"doc_id": doc_id, "path": str(step)})
+        cb.call("doc_save", {"doc_id": doc_id, "path": str(step), "preserve_path": True})
         if _PUB["rev"] is None:
             # Seed from any existing control file so the rev keeps rising across MCP restarts.
             try:
@@ -1705,15 +1705,11 @@ def _autosave(doc_id: Optional[str], name: Optional[str] = None) -> None:
     server restart — e.g. after a client timeout killed it — can reload THIS session's
     work instead of dropping every open document. Best-effort; never raises.
 
-    NO-OP IN DAEMON MODE, and this is the ONE place that decision is made. chudware-hostd is
-    the single autosave authority there (core/hostd/autosave.cpp): writing a second snapshot
-    from here repoints the daemon doc's `path` OUTSIDE the daemon's recovery tier AND clears
-    its dirty flag, which defeats hostd's retire-if-unsaved GC gate (server.cpp gcCloseDoc
-    only recognizes its own dir via isAutosavePath) — an abandoned, never-delivered agent doc
-    then gets closed without ever reaching the orphan tier. The two aggregate entry points
-    (_autosave_all_open, start_periodic_autosave) each carried their own copy of this guard
-    while the ~7 direct per-tool call sites carried none; the guard belongs here, at the
-    single write, so a new call site cannot reintroduce the hole."""
+    NO-OP IN DAEMON MODE: chudware-hostd owns the one recovery scheduler and orphan
+    tier there. Keep the guard at this single write, not just aggregate entry points,
+    so direct tool callers cannot create a competing recovery authority. Standalone
+    snapshots use preserve_path so they never rebind the document's deliverable/base
+    directory or clear its dirty flag."""
     if not doc_id or cb._daemon_mode():
         return
     try:
@@ -1734,7 +1730,7 @@ def _autosave(doc_id: Optional[str], name: Optional[str] = None) -> None:
         # sidecar so recovery can still restore the agent's original handle via _DOC_ALIASES.
         stem = f"{_SESSION_ID}-{doc_id}"
         path = _autosave_dir() / f"{stem}.step+"
-        cb.call("doc_save", {"doc_id": doc_id, "path": str(path)})
+        cb.call("doc_save", {"doc_id": doc_id, "path": str(path), "preserve_path": True})
         meta = {"session": _SESSION_ID, "doc_id": doc_id, "name": name or "",
                 "saved_at": time.time()}
         (_autosave_dir() / f"{stem}.json").write_text(json.dumps(meta))
@@ -1791,37 +1787,49 @@ def _default_deliverable_path(doc_id: str, suffix: str) -> str:
     return str(directory / f"{_project_save_stem(name, doc_id)}{suffix}")
 
 
-def _project_save(doc_id: Optional[str], name: Optional[str] = None) -> Optional[str]:
-    """Save the doc as a DELIVERABLE native .step+ in the user's project folder
-    (<CHUDWARE_PROJECT_SAVE_DIR>/<safe_stem>.step+) and return the written path.
+def _is_recovery_path(path: str) -> bool:
+    """Recognize snapshot directories, never a deliverable by filename alone."""
+    from services import paths as _paths  # noqa: PLC0415
 
-    Unlike _autosave (crash recovery, session-prefixed, hidden appdata dir) this is the
-    user's own file: it is NOT session-prefixed, so it stays stable and openable across
-    runs and overwrites itself as the part is revised. Returns None when the env var is
-    unset (the default — nothing changes for existing callers/tests). Save errors are
-    best-effort, except engine connection loss: callers must not claim durable success."""
+    roots = [_autosave_dir(), _handoff_dir()]
+    roots.extend(root / "hostd_autosave" for root in _paths.data_roots())
+    if os.name != "nt":
+        # hostd's POSIX stateDir follows XDG even when APPDATA is set.
+        roots.append(Path(os.environ.get("XDG_DATA_HOME") or
+                          os.path.expanduser("~/.local/share")) / "Chudware" /
+                     "hostd_autosave")
+    resolved = Path(path).resolve()
+    return any(resolved.is_relative_to(root.resolve()) for root in roots)
+
+
+def _project_save(doc_id: Optional[str], name: Optional[str] = None) -> Optional[str]:
+    """Refresh the doc's real native deliverable, or choose its first project path.
+
+    An established native destination owns the assembly's relative-source base directory;
+    automatic saves must not relocate it to <CHUDWARE_PROJECT_SAVE_DIR>/<safe_stem>.step+.
+    Only new/detached documents and recovery snapshots receive that default destination.
+    Unset project configuration remains a no-op. Save errors are best-effort, except
+    engine connection loss: callers must not claim durable success."""
     if not doc_id:
         return None
     try:
         root = os.environ.get("CHUDWARE_PROJECT_SAVE_DIR")
         if not root:
             return None
-        d = Path(root)
-        d.mkdir(parents=True, exist_ok=True)
-        if not d.is_dir():
-            return None
-        # Resolve the doc's real name from the engine when the caller didn't pass one.
-        if not name:
-            try:
-                for e in (cb.call("doc_list", {}) or {}).get("docs", []):
-                    if isinstance(e, dict) and e.get("doc_id") == doc_id:
-                        name = e.get("name") or ""
-                        break
-            except Exception as exc:  # noqa: BLE001
-                if getattr(exc, "code", None) == "engine_connection_lost":
-                    raise
-                pass
-        path = d / f"{_project_save_stem(name, doc_id)}.step+"
+        # Always inspect live metadata, even when a caller supplied the name. A failed
+        # lookup must fail the best-effort save, not guess a path and move the document.
+        entry = next((e for e in (cb.call("doc_list", {}) or {}).get("docs", [])
+                      if isinstance(e, dict) and e.get("doc_id") == doc_id), {})
+        current = entry.get("path")
+        if (isinstance(current, str) and current.lower().endswith(".step+")
+                and not _is_recovery_path(current)):
+            path = Path(current)
+        else:
+            d = Path(os.path.abspath(os.path.expanduser(root)))
+            d.mkdir(parents=True, exist_ok=True)
+            if not d.is_dir():
+                return None
+            path = d / f"{_project_save_stem(name or entry.get('name'), doc_id)}.step+"
         r = cb.call("doc_save", {"doc_id": doc_id, "path": str(path)})
         written = r.get("path", str(path)) if isinstance(r, dict) else str(path)
         if not os.path.exists(written):
@@ -1886,8 +1894,7 @@ def _needs_project_save(entry: dict) -> bool:
     if entry.get("dirty"):
         return True
     try:
-        return os.path.realpath(os.path.dirname(path)).startswith(
-            os.path.realpath(str(_autosave_dir())))
+        return _is_recovery_path(path)
     except OSError:
         return False
 

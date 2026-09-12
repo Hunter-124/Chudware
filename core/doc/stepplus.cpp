@@ -11,6 +11,8 @@
 #include "doc/stepplus.h"
 
 #include <array>
+#include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -71,6 +73,21 @@ bool is_known_entry(const std::string& name, bool owns_geometry_step) {
            name == "document.json" ||
            (owns_geometry_step && name == "geometry.step");
 }
+
+bool is_geometry_cache(const std::string& name) {
+    return name == "cache.json" || name == "cache.aicm" || name == "cache.brep";
+}
+
+// An exclusive staging directory prevents unrelated saves from sharing "<path>.tmp".
+// Publishing a hard link is atomic and, unlike rename, never replaces a destination.
+struct NativeStage {
+    std::filesystem::path directory;
+    ~NativeStage() {
+        if (directory.empty()) return;
+        std::error_code ec;
+        std::filesystem::remove_all(directory, ec);
+    }
+};
 
 // ------------------------------------------------------------------ thumbnail PNG
 void put_u32_be(std::string& out, uint32_t v) {
@@ -174,15 +191,37 @@ std::string editable_document_json(const json& doc) {
 
 
 // ---------------------------------------------------------------- shared editable-container save
-std::string editable_container_save(const json& doc, const std::string& path,
+static std::string editable_container_save_impl(const json& doc, const std::string& path,
                                     const std::map<std::string, std::string>& extra,
                                     const std::string& container, const std::string& kind,
-                                    const std::string& format_name) {
+                                    const std::string& format_name,
+                                    const json* preserved_meta = nullptr,
+                                    bool exclusive = false) {
     const bool owns_geometry_step = container.rfind("aicad.step+/", 0) == 0;
     namespace fs = std::filesystem;
     fs::path out_path(path);
     fs::path tmp_path = out_path;
     tmp_path += ".tmp";
+    NativeStage stage;
+    if (exclusive) {
+        std::error_code ec;
+        fs::create_directories(out_path.parent_path(), ec);
+        if (ec) io_error("native relocate: cannot create destination parent: " + ec.message());
+        static std::atomic<uint64_t> serial{0};
+        for (int attempt = 0; attempt < 100; ++attempt) {
+            auto candidate = out_path.parent_path() /
+                (".native-relocate-" + std::to_string(
+                    std::chrono::steady_clock::now().time_since_epoch().count()) + "-" +
+                 std::to_string(serial.fetch_add(1)));
+            if (fs::create_directory(candidate, ec)) {
+                stage.directory = std::move(candidate);
+                break;
+            }
+            if (ec) io_error("native relocate: cannot create staging directory: " + ec.message());
+        }
+        if (stage.directory.empty()) io_error("native relocate: cannot reserve staging directory");
+        tmp_path = stage.directory / "container.tmp";
+    }
 
     const std::string now = iso_utc_now();
     json meta = {
@@ -194,6 +233,10 @@ std::string editable_container_save(const json& doc, const std::string& path,
         {"units", doc.contains("units") ? doc["units"] : json{{"system", "MMGS"}}},
         {"name", doc.value("name", std::string("Untitled"))},
     };
+    if (preserved_meta) {
+        meta = *preserved_meta;
+        if (doc.contains("name")) meta["name"] = doc["name"];
+    }
 
     // Canonical dump: sorted keys and lossless numeric serialization.
     const std::string document = editable_document_json(doc);
@@ -202,7 +245,7 @@ std::string editable_container_save(const json& doc, const std::string& path,
     // thumbnail: reuse a carried one if present, else the flat-grey placeholder.
     std::string thumb;
     auto th = extra.find("thumbnail.png");
-    thumb = (th != extra.end()) ? th->second : placeholder_png();
+    thumb = (th != extra.end()) ? th->second : (preserved_meta ? std::string() : placeholder_png());
 
     // Essential/forward-compatible payloads have priority over the optional mesh.
     // Reserve their expanded bytes before deciding whether its STORED blob fits.
@@ -244,9 +287,11 @@ std::string editable_container_save(const json& doc, const std::string& path,
     };
 
     // thumbnail FIRST + STORED, then the deflated JSON entries.
-    add("thumbnail.png", thumb, /*stored=*/true);
-    add("meta.json", meta_json, /*stored=*/false);
-    add("document.json", document, /*stored=*/false);
+    if (!preserved_meta || th != extra.end()) add("thumbnail.png", thumb, /*stored=*/true);
+    // Relocation uses STORED entries: a previously STORED, highly compressible
+    // payload must not become an inadmissible compression-ratio archive on resave.
+    add("meta.json", meta_json, /*stored=*/preserved_meta != nullptr);
+    add("document.json", document, /*stored=*/preserved_meta != nullptr);
     // geometry.step: the contracted AP214 snapshot of the last successful rebuild
     // (contracts/stepplus.md §1). doc_save puts the bytes in `extra` after a fully-ok
     // rebuild; we write it as an entry we OWN so it lands right after document.json and
@@ -256,8 +301,8 @@ std::string editable_container_save(const json& doc, const std::string& path,
     // forward-compatible entry and survives through the loop verbatim.
     if (owns_geometry_step) {
         const auto geom = extra.find("geometry.step");
-        if (geom != extra.end() && !geom->second.empty())
-            add("geometry.step", geom->second, /*stored=*/false);
+        if (geom != extra.end() && (!geom->second.empty() || preserved_meta))
+            add("geometry.step", geom->second, /*stored=*/preserved_meta != nullptr);
     }
     // Preserve unknown entries (forward-compat) — never clobber the entries we own.
     // cache.aicm (the persisted-geometry mesh blob) is written STORED, not deflated: it is
@@ -273,7 +318,7 @@ std::string editable_container_save(const json& doc, const std::string& path,
         if (owns_geometry_step && name == "cache.aicm" && data.size() > mesh_cache_budget)
             continue;
         // cache.aicm + studies/*/results.npz are large binary blobs — STORED (no deflate).
-        const bool stored = (name == "cache.aicm") ||
+        const bool stored = preserved_meta || (name == "cache.aicm") ||
                             (name.rfind("studies/", 0) == 0 && name.find("/results.") != std::string::npos);
         add(name, data, /*stored=*/stored);
     }
@@ -287,12 +332,20 @@ std::string editable_container_save(const json& doc, const std::string& path,
     mz_zip_writer_end(&zip);
 
     std::error_code ec;
-    fs::rename(tmp_path, out_path, ec);  // atomic replace (MoveFileEx on Windows)
+    if (exclusive) fs::create_hard_link(tmp_path, out_path, ec);
+    else fs::rename(tmp_path, out_path, ec);  // ordinary save retains atomic replacement
     if (ec) {
         fs::remove(tmp_path, ec);
         io_error("doc_save: cannot replace '" + out_path.string() + "'");
     }
     return out_path.string();
+}
+
+std::string editable_container_save(const json& doc, const std::string& path,
+                                    const std::map<std::string, std::string>& extra,
+                                    const std::string& container, const std::string& kind,
+                                    const std::string& format_name) {
+    return editable_container_save_impl(doc, path, extra, container, kind, format_name);
 }
 
 std::string stepplus_save(const json& doc, const std::string& path,
@@ -303,9 +356,12 @@ std::string stepplus_save(const json& doc, const std::string& path,
 }
 
 // ---------------------------------------------------------------- shared editable-container open
-StepPlusDoc editable_container_open(const std::string& path,
+enum class NativeReadMode { Open, Metadata, Relocate };
+
+static StepPlusDoc editable_container_open_impl(const std::string& path,
                                     const std::string& expected_prefix,
-                                    const std::string& format_name) {
+                                    const std::string& format_name,
+                                    NativeReadMode mode = NativeReadMode::Open) {
     if (!std::filesystem::exists(path)) io_error("doc_open: no such file: " + path);
     const bool owns_geometry_step = expected_prefix == "aicad.step+/";
 
@@ -313,6 +369,10 @@ StepPlusDoc editable_container_open(const std::string& path,
     std::memset(&zip, 0, sizeof(zip));
     if (!mz_zip_reader_init_file(&zip, path.c_str(), 0))
         io_error("doc_open: not a valid " + format_name + " (zip) container: " + path);
+    struct ReaderGuard {
+        mz_zip_archive& zip;
+        ~ReaderGuard() { if (zip.m_pState) mz_zip_reader_end(&zip); }
+    } guard{zip};
 
     const mz_uint count = mz_zip_reader_get_num_files(&zip);
     if (count > kMaxArchiveEntries) {
@@ -320,13 +380,27 @@ StepPlusDoc editable_container_open(const std::string& path,
         archive_limit_error("entry count limit", format_name);
     }
     mz_uint64 aggregate_expanded = 0;
+    std::set<std::string> entry_names;
     for (mz_uint i = 0; i < count; ++i) {
         mz_zip_archive_file_stat st;
         if (!mz_zip_reader_file_stat(&zip, i, &st)) {
             mz_zip_reader_end(&zip);
             io_error("doc_open: invalid .step+ archive metadata");
         }
-        if (st.m_is_directory) continue;
+        if (mode != NativeReadMode::Open && !entry_names.insert(st.m_filename).second) {
+            mz_zip_reader_end(&zip);
+            io_error("native file operation: duplicate archive entry");
+        }
+        if (mode != NativeReadMode::Open &&
+            mz_zip_reader_get_filename(&zip, i, nullptr, 0) > sizeof(st.m_filename))
+            io_error("native file operation: archive entry name is too long to preserve");
+        if (st.m_is_directory && mode != NativeReadMode::Relocate) continue;
+        // Inspection reads only the two JSON members. Relocation drops stale caches
+        // before allocating, but validates every payload it promises to preserve.
+        if (mode == NativeReadMode::Metadata &&
+            std::strcmp(st.m_filename, "meta.json") != 0 &&
+            std::strcmp(st.m_filename, "document.json") != 0) continue;
+        if (mode == NativeReadMode::Relocate && is_geometry_cache(st.m_filename)) continue;
         // Admit the optional mesh only after all required/unknown payloads have
         // passed their unchanged limits and reserved the aggregate byte budget.
         if (owns_geometry_step && std::strcmp(st.m_filename, "cache.aicm") == 0)
@@ -353,6 +427,7 @@ StepPlusDoc editable_container_open(const std::string& path,
         if (idx < 0) return false;
         mz_zip_archive_file_stat st;
         if (!mz_zip_reader_file_stat(&zip, static_cast<mz_uint>(idx), &st)) return false;
+        if (st.m_is_directory) return false;
         out.resize(static_cast<std::size_t>(st.m_uncomp_size));
         if (out.empty()) return true;
         return mz_zip_reader_extract_to_mem(&zip, static_cast<mz_uint>(idx), out.data(), out.size(),
@@ -396,13 +471,25 @@ StepPlusDoc editable_container_open(const std::string& path,
         mz_zip_reader_end(&zip);
         io_error(std::string("doc_open: bad document.json: ") + e.what());
     }
+    if (mode == NativeReadMode::Metadata) {
+        mz_zip_reader_end(&zip);
+        return result;
+    }
+    if (mode == NativeReadMode::Relocate) result.extra.emplace("meta.json", meta_bytes);
 
     // Carry every entry we don't own back onto the session for forward-compat resave.
     for (mz_uint i = 0; i < count; ++i) {
         mz_zip_archive_file_stat st;
         if (!mz_zip_reader_file_stat(&zip, i, &st)) continue;
         const std::string name = st.m_filename;
-        if (is_known_entry(name, owns_geometry_step) || st.m_is_directory) continue;
+        if (st.m_is_directory && mode != NativeReadMode::Relocate) continue;
+        if (mode == NativeReadMode::Relocate) {
+            if (name == "meta.json" || name == "document.json") continue;
+            if (is_geometry_cache(name)) {
+                result.warnings.push_back("invalidated:" + name);
+                continue;
+            }
+        } else if (is_known_entry(name, owns_geometry_step)) continue;
         if (owns_geometry_step && name == "cache.aicm") {
             // A STORED mesh cannot expand during decompression. It may use the
             // remaining bounded archive budget; compressed meshes retain the
@@ -419,10 +506,17 @@ StepPlusDoc editable_container_open(const std::string& path,
         // STORED entries (method 0 — e.g. cache.aicm) carry the persisted-geometry mesh. Extract
         // them raw with MZ_ZIP_FLAG_COMPRESSED_DATA so miniz skips BOTH inflate and CRC; for a
         // STORED entry the compressed bytes are the data. Allocate the destination exactly once.
-        const mz_uint flags = (st.m_method == 0) ? MZ_ZIP_FLAG_COMPRESSED_DATA : 0;
+        const mz_uint flags = (mode == NativeReadMode::Open && st.m_method == 0)
+                                 ? MZ_ZIP_FLAG_COMPRESSED_DATA : 0;
         std::string data(static_cast<std::size_t>(st.m_uncomp_size), '\0');
         if (!data.empty() &&
-            !mz_zip_reader_extract_to_mem(&zip, i, data.data(), data.size(), flags)) continue;
+            !mz_zip_reader_extract_to_mem(&zip, i, data.data(), data.size(), flags)) {
+            if (mode == NativeReadMode::Relocate) {
+                mz_zip_reader_end(&zip);
+                io_error("native relocate: cannot preserve entry '" + name + "'");
+            }
+            continue;
+        }
         result.extra.emplace(name, std::move(data));
     }
 
@@ -430,8 +524,485 @@ StepPlusDoc editable_container_open(const std::string& path,
     return result;
 }
 
+StepPlusDoc editable_container_open(const std::string& path,
+                                    const std::string& expected_prefix,
+                                    const std::string& format_name) {
+    return editable_container_open_impl(path, expected_prefix, format_name);
+}
+
 StepPlusDoc stepplus_open(const std::string& path) {
     return editable_container_open(path, "aicad.step+/", ".step+");
+}
+
+namespace {
+namespace fs = std::filesystem;
+constexpr std::size_t kMaxNativeFiles = 4096;
+constexpr std::size_t kMaxNativePathBytes = 32768;
+
+[[noreturn]] void native_invalid(const std::string& message) {
+    throw OpError("invalid_argument", "native file operation: " + message);
+}
+
+std::string native_string(const json& value, const char* field) {
+    if (!value.is_string()) native_invalid(std::string(field) + " must be a string");
+    const auto& text = value.get_ref<const std::string&>();
+    if (text.empty() || text.size() > kMaxNativePathBytes ||
+        text.find('\0') != std::string::npos)
+        native_invalid(std::string(field) + " must be nonempty and bounded without NUL");
+    return text;
+}
+
+fs::path native_absolute(const json& value, const char* field) {
+    fs::path path(native_string(value, field));
+    if (!path.is_absolute()) native_invalid(std::string(field) + " must be absolute");
+    return fs::weakly_canonical(path);
+}
+
+std::string native_fold(std::string text) {
+    for (char& c : text) if (c >= 'A' && c <= 'Z') c += 'a' - 'A';
+    return text;
+}
+
+// Check components as well as the leaf: "Parts/X" and existing "parts/x" must
+// not become two different files merely because this host is case-sensitive.
+void native_destination_available(const fs::path& destination) {
+    fs::path parent = destination.root_path();
+    for (const auto& component : destination.relative_path()) {
+        if (fs::is_directory(parent)) {
+            const auto folded = native_fold(component.string());
+            for (const auto& sibling : fs::directory_iterator(parent)) {
+                const auto name = sibling.path().filename().string();
+                if (native_fold(name) == folded && name != component.string())
+                    native_invalid("case-colliding destination: " + destination.string());
+            }
+        }
+        parent /= component;
+    }
+    // symlink_status also rejects dangling symlinks, which exists() alone misses.
+    if (fs::exists(fs::symlink_status(destination)))
+        native_invalid("destination already exists: " + destination.string());
+}
+
+std::string native_pointer_token(const std::string& token) {
+    std::string escaped;
+    for (char c : token) {
+        if (c == '~') escaped += "~0";
+        else if (c == '/') escaped += "~1";
+        else escaped += c;
+    }
+    return escaped;
+}
+
+struct NativeReferences {
+    json dependencies = json::array();
+    std::set<std::string> recognized;
+};
+
+void native_reference(NativeReferences& refs, const json& value,
+                      const std::string& pointer, const std::string& kind,
+                      const fs::path& parent, bool supported = true,
+                      const std::string& reason = {}, bool required = true) {
+    refs.recognized.insert(pointer);
+    json row{{"json_pointer", pointer}, {"kind", kind}, {"literal", value},
+             {"supported", supported}, {"required", required}};
+    if (!reason.empty()) row["reason"] = reason;
+    if (!required) row["usage"] = "embedded_provenance";
+    if (!value.is_string() || value.get_ref<const std::string&>().empty()) {
+        row["supported"] = false;
+        row["reason"] = "file reference must be a nonempty string";
+    } else {
+        const auto& literal = value.get_ref<const std::string&>();
+        // Embedded imports retain historical URI provenance verbatim. It is not a
+        // file dependency and is never opened, rebased, or passed through path_map.
+        if (supported && !required && literal.size() <= kMaxNativePathBytes &&
+            literal.find('\0') == std::string::npos && literal.find("://") != std::string::npos) {
+            row["format"] = "uri";
+            row["rewrite"] = false;
+        } else if (literal.size() > kMaxNativePathBytes || literal.find('\0') != std::string::npos ||
+                   literal.find("://") != std::string::npos || literal.find('\\') != std::string::npos ||
+                   (literal.size() > 1 && literal[1] == ':')) {
+            row["supported"] = false;
+            row["reason"] = "unsupported URI or foreign-platform path";
+        } else if (supported) {
+            const fs::path path(literal);
+            const auto resolved = fs::weakly_canonical(path.is_absolute() ? path : parent / path);
+            row["resolved_path"] = resolved.string();
+            row["exists"] = fs::exists(resolved);
+            row["format"] = "filesystem";
+            row["rewrite"] = true;
+        }
+    }
+    refs.dependencies.push_back(std::move(row));
+}
+
+// Inventory unknown path-bearing fields without interpreting arbitrary metadata as
+// a native source schema. In particular an opaque embedded source is not a pathname.
+void native_unknown_references(const json& value, const std::string& pointer,
+                               const fs::path& parent, NativeReferences& refs,
+                               unsigned depth = 0) {
+    if (depth > 64) native_invalid("document nesting exceeds 64");
+    if (value.is_object()) {
+        for (const auto& [key, child] : value.items()) {
+            const auto at = pointer + "/" + native_pointer_token(key);
+            if (refs.recognized.count(at)) continue;
+            // Feature refs.path is a curve/datum selector (sweep/surf_sweep), not
+            // an external file. Do not misclassify geometric reference syntax.
+            if (key == "refs") continue;
+            if (key == "path" || key == "source_path" || key == "base_dir" ||
+                key == "source_base_dir" || key == "snapshot_base_dir") {
+                if (pointer == "/meta" || pointer.compare(0, 6, "/meta/") == 0) {
+                    // Free-form document metadata records provenance, not geometry
+                    // inputs. Preserve historical paths (including foreign paths)
+                    // verbatim rather than rewriting evidence or blocking a move.
+                    refs.dependencies.push_back({
+                        {"json_pointer", at}, {"kind", "metadata"}, {"literal", child},
+                        {"supported", true}, {"required", false}, {"rewrite", false},
+                        {"usage", "documentary_metadata"}});
+                } else {
+                    native_reference(refs, child, at, "unknown", parent, false,
+                                     "path field outside a supported native dependency schema");
+                }
+            } else {
+                native_unknown_references(child, at, parent, refs, depth + 1);
+            }
+        }
+    } else if (value.is_array()) {
+        for (std::size_t i = 0; i < value.size(); ++i)
+            native_unknown_references(value[i], pointer + "/" + std::to_string(i),
+                                      parent, refs, depth + 1);
+    } else if (value.is_number_float() && !std::isfinite(value.get<double>())) {
+        native_invalid("document contains a non-finite number");
+    }
+}
+
+NativeReferences native_references(const json& doc, const fs::path& parent) {
+    if (!doc.is_object()) native_invalid("document.json must be an object");
+    const auto schema = doc.value("schema", std::string());
+    if (schema != "aicad.part/1" && schema != "aicad.asm/1")
+        native_invalid("unsupported document schema: " + schema);
+    NativeReferences refs;
+    if (doc.contains("components")) {
+        if (!doc["components"].is_array()) native_invalid("components must be an array");
+        for (std::size_t i = 0; i < doc["components"].size(); ++i) {
+            const auto& component = doc["components"][i];
+            const auto prefix = "/components/" + std::to_string(i) + "/source";
+            if (!component.is_object() || !component.contains("source") ||
+                !component["source"].is_object()) {
+                native_reference(refs, nullptr, prefix, "component", parent, false,
+                                 "component source must be an object");
+                continue;
+            }
+            const auto& source = component["source"];
+            if (source.contains("path"))
+                native_reference(refs, source["path"], prefix + "/path", "component", parent);
+            if (source.contains("embedded"))
+                native_reference(refs, source["embedded"], prefix + "/embedded",
+                                 "embedded_component", parent, false,
+                                 "opaque embedded component source has no supported relocation base");
+            if (!source.contains("path") && !source.contains("embedded"))
+                native_reference(refs, source, prefix, "component", parent, false,
+                                 "unknown component source format");
+        }
+    }
+    if (doc.contains("features")) {
+        if (!doc["features"].is_array()) native_invalid("features must be an array");
+        for (std::size_t i = 0; i < doc["features"].size(); ++i) {
+            const auto& feature = doc["features"][i];
+            if (!feature.is_object()) native_invalid("feature must be an object");
+            if (feature.value("type", std::string()) != "import") continue;
+            if (!feature.contains("params") || !feature["params"].is_object())
+                native_invalid("import params must be an object");
+            const bool embedded = feature["params"].contains("embedded_brep") &&
+                feature["params"]["embedded_brep"].is_string() &&
+                !feature["params"]["embedded_brep"].get_ref<const std::string&>().empty();
+            for (const char* key : {"source_path", "path"}) {
+                if (feature["params"].contains(key))
+                    native_reference(refs, feature["params"][key],
+                        "/features/" + std::to_string(i) + "/params/" + key, "import", parent,
+                        true, {}, !embedded);
+            }
+        }
+    }
+    native_unknown_references(doc, "", parent, refs);
+    return refs;
+}
+
+json native_metadata(const json& doc, const fs::path& path, const NativeReferences& refs) {
+    json features = json::array(), components = json::array();
+    if (doc.contains("features")) for (const auto& feature : doc["features"]) {
+        json row = json::object();
+        for (const char* key : {"id", "type", "name", "label", "suppressed"})
+            if (feature.contains(key)) row[key] = feature[key];
+        features.push_back(std::move(row));
+    }
+    if (doc.contains("components")) for (const auto& component : doc["components"]) {
+        json row = json::object();
+        for (const char* key : {"id", "name", "source", "transform", "fixed", "suppressed"})
+            if (component.contains(key)) row[key] = component[key];
+        components.push_back(std::move(row));
+    }
+    return {{"ok", true}, {"path", path.string()}, {"schema", doc.at("schema")},
+            {"name", doc.value("name", json())}, {"document_id", doc.value("id", json())},
+            {"document_hash", stepplus_doc_hash(doc)},
+            {"document_hash_algorithm", "native-canonical-fnv64-excluding-root-id"},
+            {"features", std::move(features)}, {"components", std::move(components)},
+            {"dependencies", refs.dependencies}};
+}
+
+// This is an invariant hash, NOT a geometry hash: mask only the explicitly mutable
+// display names and supported filesystem references. All IDs, feature labels,
+// embedded model data, finishes, mates, frames and placements remain represented.
+std::string fnv1a_hex(const std::string& s);
+std::string native_immutable_hash(json doc, const json& dependencies) {
+    doc.erase("name");
+    if (doc.contains("components"))
+        for (auto& component : doc["components"]) component.erase("name");
+    for (const auto& dependency : dependencies)
+        if (dependency.value("supported", false) && dependency.value("rewrite", false))
+            doc[json::json_pointer(dependency["json_pointer"].get<std::string>())] = nullptr;
+    return fnv1a_hex(editable_document_json(doc));
+}
+
+struct NativeStamp {
+    uintmax_t size;
+    fs::file_time_type modified;
+};
+NativeStamp native_stamp(const fs::path& path) {
+    if (!fs::is_regular_file(path)) native_invalid("source is not a regular file: " + path.string());
+    return {fs::file_size(path), fs::last_write_time(path)};
+}
+void native_check_stamp(const fs::path& path, const NativeStamp& stamp) {
+    const auto current = native_stamp(path);
+    if (current.size != stamp.size || current.modified != stamp.modified)
+        io_error("native relocate: source changed during operation: " + path.string());
+}
+}  // namespace
+
+json native_file_operations(const json& params) {
+    json result{{"ok", false}, {"action", nullptr}, {"files", json::array()},
+                {"failures", json::array()}};
+    auto failure = [&](const std::exception& error, const std::string& path = {}) {
+        json row{{"ok", false}, {"message", error.what()}};
+        if (!path.empty()) row["path"] = path;
+        const auto* op = dynamic_cast<const OpError*>(&error);
+        row["code"] = op ? op->code : "io_error";
+        result["failures"].push_back(row);
+        return row;
+    };
+    try {
+        if (!params.is_object() || !params.contains("action")) native_invalid("action is required");
+        const auto action = native_string(params["action"], "action");
+        result["action"] = action;
+        if (action == "inspect") {
+            if (!params.contains("paths") || !params["paths"].is_array() ||
+                params["paths"].empty() || params["paths"].size() > kMaxNativeFiles)
+                native_invalid("paths must contain 1..4096 absolute filenames");
+            for (const auto& value : params["paths"]) {
+                std::string original;
+                try {
+                    original = native_string(value, "path");
+                    const auto path = native_absolute(value, "path");
+                    const auto stamp = native_stamp(path);
+                    const auto loaded = editable_container_open_impl(
+                        path.string(), "aicad.step+/", ".step+", NativeReadMode::Metadata);
+                    const auto refs = native_references(loaded.doc, path.parent_path());
+                    auto row = native_metadata(loaded.doc, path, refs);
+                    row["immutable_document_hash"] = native_immutable_hash(loaded.doc, refs.dependencies);
+                    row["immutable_document_hash_algorithm"] =
+                        "native-canonical-fnv64-masked-display-names-and-file-references";
+                    native_check_stamp(path, stamp);
+                    row["original_path"] = original;
+                    result["files"].push_back(std::move(row));
+                } catch (const std::exception& error) {
+                    result["files"].push_back(failure(error, original));
+                }
+            }
+        } else if (action == "relocate") {
+            if (!params.contains("entries") || !params["entries"].is_array() ||
+                params["entries"].empty() || params["entries"].size() > kMaxNativeFiles)
+                native_invalid("entries must contain 1..4096 relocation objects");
+            struct Entry {
+                fs::path path, destination;
+                NativeStamp stamp;
+                json options;
+                std::string document_hash;
+            };
+            std::vector<Entry> entries;
+            std::map<std::string, std::string> path_map;
+            std::set<std::string> sources, destinations;
+            std::map<std::string, std::string> destination_components;
+            if (params.contains("path_map")) {
+                if (!params["path_map"].is_object() || params["path_map"].size() > kMaxNativeFiles)
+                    native_invalid("path_map must be an object with at most 4096 entries");
+                for (const auto& [old_path, new_path] : params["path_map"].items()) {
+                    const auto old_key = native_absolute(old_path, "path_map source").string();
+                    const auto new_key = native_absolute(new_path, "path_map destination").string();
+                    if (!path_map.emplace(old_key, new_key).second)
+                        native_invalid("duplicate canonical path_map source");
+                }
+            }
+            // Complete the plan preflight before any directory or archive is written.
+            for (const auto& item : params["entries"]) {
+                if (!item.is_object() || !item.contains("path") || !item.contains("destination"))
+                    native_invalid("each entry requires path and destination");
+                const auto path = native_absolute(item["path"], "path");
+                native_destination_available(fs::path(native_string(item["destination"], "destination")));
+                const auto destination = native_absolute(item["destination"], "destination");
+                if (!sources.insert(native_fold(path.string())).second)
+                    native_invalid("duplicate source: " + path.string());
+                if (!destinations.insert(native_fold(destination.string())).second)
+                    native_invalid("duplicate or case-colliding destination: " + destination.string());
+                if (native_fold(path.string()) == native_fold(destination.string()))
+                    native_invalid("source and destination must differ");
+                native_destination_available(destination);
+                if (item.contains("name")) native_string(item["name"], "name");
+                if (item.contains("component_names")) {
+                    if (!item["component_names"].is_object() ||
+                        item["component_names"].size() > kMaxNativeFiles)
+                        native_invalid("component_names must be a bounded object");
+                    for (const auto& [id, name] : item["component_names"].items()) {
+                        native_string(id, "component id");
+                        native_string(name, "component name");
+                    }
+                }
+                const auto inserted = path_map.emplace(path.string(), destination.string());
+                if (!inserted.second && inserted.first->second != destination.string())
+                    native_invalid("path_map disagrees with relocation entry: " + path.string());
+                entries.push_back({path, destination, native_stamp(path), item, {}});
+            }
+            for (const auto& entry : entries) {
+                fs::path prefix = entry.destination.root_path();
+                for (const auto& component : entry.destination.relative_path()) {
+                    prefix /= component;
+                    const auto spelling = prefix.string();
+                    const auto folded = native_fold(spelling);
+                    const auto inserted = destination_components.emplace(folded, spelling);
+                    if (!inserted.second && inserted.first->second != spelling)
+                        native_invalid("case-colliding planned destination directories: " + spelling);
+                    if (prefix != entry.destination && destinations.count(folded))
+                        native_invalid("planned destination is also a parent directory: " + spelling);
+                }
+            }
+            std::set<std::string> mapped_destinations;
+            for (const auto& [source, destination] : path_map) {
+                if (native_fold(source) == native_fold(destination) ||
+                    sources.count(native_fold(destination)) ||
+                    !mapped_destinations.insert(native_fold(destination)).second)
+                    native_invalid("path_map contains same-file, source overwrite, or colliding targets");
+                // A mapping may name a copy in a later batch. Closure is reported
+                // by inspection, not guessed or enforced by loading dependencies.
+            }
+            // Inspect all source trees first: unsupported references or misspelled
+            // component IDs must not leave an avoidable half-relocated batch.
+            // Retain only bounded hash/stamp records, never document trees or
+            // embedded BREP across files. Large libraries remain one-file-at-a-time.
+            for (auto& entry : entries) {
+                auto loaded = editable_container_open_impl(entry.path.string(), "aicad.step+/",
+                                                           ".step+", NativeReadMode::Metadata);
+                auto refs = native_references(loaded.doc, entry.path.parent_path());
+                for (const auto& dependency : refs.dependencies)
+                    if (!dependency.value("supported", false))
+                        native_invalid("unsupported dependency in " + entry.path.string() +
+                                       " at " + dependency["json_pointer"].get<std::string>());
+                if (entry.options.contains("component_names")) {
+                    std::set<std::string> ids;
+                    if (loaded.doc.contains("components"))
+                        for (const auto& c : loaded.doc["components"])
+                            if (c.contains("id") && c["id"].is_string()) ids.insert(c["id"].get<std::string>());
+                    for (const auto& [id, name] : entry.options["component_names"].items())
+                        if (!ids.count(id)) native_invalid("unknown component id: " + id);
+                }
+                entry.document_hash = fnv1a_hex(editable_document_json(loaded.doc));
+                native_check_stamp(entry.path, entry.stamp);
+            }
+            for (auto& entry : entries) {
+                json row{{"ok", false}, {"path", entry.path.string()},
+                         {"original_path", entry.options["path"]},
+                         {"destination", entry.destination.string()}, {"status", "not_written"}};
+                try {
+                    native_check_stamp(entry.path, entry.stamp);
+                    native_destination_available(entry.destination);
+                    auto loaded = editable_container_open_impl(entry.path.string(), "aicad.step+/",
+                                                               ".step+", NativeReadMode::Relocate);
+                    if (fnv1a_hex(editable_document_json(loaded.doc)) != entry.document_hash)
+                        io_error("native relocate: source document changed");
+                    const auto dependencies = native_references(loaded.doc, entry.path.parent_path()).dependencies;
+                    row["source_document_hash"] = stepplus_doc_hash(loaded.doc);
+                    const auto immutable_hash = native_immutable_hash(loaded.doc, dependencies);
+                    if (entry.options.contains("name")) loaded.doc["name"] = entry.options["name"];
+                    if (entry.options.contains("component_names") && loaded.doc.contains("components"))
+                        for (auto& c : loaded.doc["components"]) {
+                            const auto id = c.value("id", std::string());
+                            if (entry.options["component_names"].contains(id))
+                                c["name"] = entry.options["component_names"][id];
+                        }
+                    json rewrites = json::array();
+                    for (const auto& dependency : dependencies) {
+                        if (!dependency.value("rewrite", false)) continue;
+                        const auto resolved = dependency["resolved_path"].get<std::string>();
+                        const auto mapped = path_map.find(resolved);
+                        const fs::path target(mapped == path_map.end() ? resolved : mapped->second);
+                        const auto relative = target.lexically_relative(entry.destination.parent_path());
+                        const auto replacement = relative.empty() ? target.string() : relative.generic_string();
+                        loaded.doc[json::json_pointer(dependency["json_pointer"].get<std::string>())] = replacement;
+                        auto rewrite = dependency;
+                        rewrite["destination_literal"] = replacement;
+                        rewrite["destination_resolved_path"] = target.string();
+                        rewrites.push_back(std::move(rewrite));
+                    }
+                    if (native_immutable_hash(loaded.doc, dependencies) != immutable_hash)
+                        io_error("native relocate: immutable document invariant changed");
+                    row["immutable_document_hash"] = immutable_hash;
+                    row["immutable_document_hash_algorithm"] = "native-canonical-fnv64-masked-display-names-and-file-references";
+                    row["document_hash"] = stepplus_doc_hash(loaded.doc);
+                    row["document_hash_algorithm"] = "native-canonical-fnv64-excluding-root-id";
+                    row["dependency_rewrites"] = std::move(rewrites);
+                    row["invalidated_caches"] = json::array();
+                    for (const auto& warning : loaded.warnings)
+                        if (warning.rfind("invalidated:", 0) == 0)
+                            row["invalidated_caches"].push_back(warning.substr(12));
+                    json preserved = json::array();
+                    for (const auto& [name, bytes] : loaded.extra)
+                        if (name != "meta.json")
+                            preserved.push_back({{"name", name}, {"bytes", bytes.size()},
+                                                 {"native_fnv64", fnv1a_hex(bytes)}});
+                    row["preserved_entries"] = std::move(preserved);
+                    const auto meta = json::parse(loaded.extra.at("meta.json"));
+                    native_check_stamp(entry.path, entry.stamp);
+                    editable_container_save_impl(loaded.doc, entry.destination.string(), loaded.extra,
+                        kContainer, loaded.doc["schema"] == "aicad.asm/1" ? "assembly" : "part",
+                        ".step+", &meta, true);
+                    row["status"] = "written";
+                    // If an outside writer races publication, keep the new copy and
+                    // report it as written-but-failed rather than concealing the output.
+                    native_check_stamp(entry.path, entry.stamp);
+                    row["ok"] = true;
+                } catch (const std::exception& error) {
+                    auto failed = failure(error, entry.path.string());
+                    row["code"] = failed["code"];
+                    row["message"] = failed["message"];
+                    if (row["status"] != "written") row["status"] = "failed";
+                }
+                result["files"].push_back(std::move(row));
+            }
+        } else native_invalid("action must be inspect or relocate");
+    } catch (const std::exception& error) {
+        failure(error);
+        if (result["action"] == "relocate" && result["files"].empty() &&
+            params.contains("entries") && params["entries"].is_array() &&
+            params["entries"].size() <= kMaxNativeFiles) {
+            for (const auto& item : params["entries"]) {
+                json row{{"ok", false}, {"status", "not_written"}, {"reason", "preflight_failed"}};
+                if (item.is_object()) {
+                    if (item.contains("path")) row["path"] = item["path"];
+                    if (item.contains("destination")) row["destination"] = item["destination"];
+                }
+                result["files"].push_back(std::move(row));
+            }
+        }
+    }
+    result["ok"] = result["failures"].empty();
+    return result;
 }
 
 // --- persisted-geometry cache keys ------------------------------------------------
@@ -559,7 +1130,11 @@ std::string stepplus_cache_engine_key() {
     // /2 invalidates pre-fix centered:false placement (bbox tolerance padding), whose
     // nearly-coplanar split faces disagree with selectors from a fresh feature rebuild.
     // Both display replay and assembly BREP loading must reject that old snapshot.
-    static constexpr const char* kCacheSchema = "chudware-geomcache/2";
+    // /3 invalidates display snapshots from before selected-face finishes and the
+    // shared cylindrical bore/boss fingerprint. Old cached colors cannot override
+    // the authored face metadata retained in document.json.
+    // /4 binds finishes to exact fingerprints even when their short SIDs collide.
+    static constexpr const char* kCacheSchema = "chudware-geomcache/4";
 #ifdef OCC_VERSION_COMPLETE
     return std::string(kCacheSchema) + ";occt=" OCC_VERSION_COMPLETE;
 #else

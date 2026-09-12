@@ -18,12 +18,14 @@ NARRATION TOOLS — compact text summaries of every domain state:
     Returns a graceful 'no results attached' message when no study exists.
 
   describe_assembly([doc_id])
-    Narrates an assembly or multi-body part: per-component world-frame bounding
-    boxes and origins (from asm_world_bodies), interference/clearance pairs
-    (volumes + gap distances from eval_interference), and mate solve status.
-    Use INSTEAD of dumping asm_world_bodies JSON.
-    Call solve_mates first for the latest placement. To validate that mating
-    interfaces LINE UP (hole patterns, coaxial bores, flush contact faces,
+    Queries pre-solve world-frame bounding boxes and origins, runs a live mate
+    solve, then eval_interference with clearance_mode='threshold',
+    min_clearance_mm=0 and include_coincident=False. Exact clash volumes remain;
+    clearance bounds are not measured gaps. No minimum measured gap is reported.
+    Returns raw fit completeness, checked/total pairs and failures; incomplete
+    or no-pair reports cannot qualify collision-free. Use INSTEAD of raw JSON.
+    Call solve_mates first if placement rows must show the solved pose. To validate
+    that mating interfaces LINE UP (hole patterns, coaxial bores, flush contact faces,
     fastener pass-through) — not just that nothing clashes — run interface_check.
 
   describe_board([doc_id])

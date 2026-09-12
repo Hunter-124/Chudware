@@ -61,3 +61,33 @@ A cache that does not fit is skipped before allocation/decompression, and writer
 omit mesh caches that exceed the budget left by all other payloads. Entry-count,
 per-entry, aggregate-expansion and compression-ratio limits remain unchanged for
 source documents and unknown entries; caches cannot crowd out that data.
+
+## 5. Nonbinding recovery snapshots (2026-09-12)
+
+Native `doc_save(..., preserve_path=true)` produces the same container format
+from cached scratch without rebinding or clearing the live document. Relative
+component paths in that snapshot resolve against the live document's original
+directory, not the recovery directory. Unknown entries remain preserved;
+discarded geometry/cache entries are regenerated under the existing rules.
+This does not embed external component files or make an assembly portable by
+itself. Ordinary saved relative-source bundles still require those files to
+travel with the containing assembly. See `doc_ops.md` §24.
+
+## 6. Selected-face display-cache epoch (2026-09-12)
+
+The native geometry/display semantic key is now `chudware-geomcache/3` plus
+the OCCT version. Epoch 3 invalidates caches produced before selected-face
+finishes and shared cylindrical bore/boss fingerprints were supported.
+An older writer may preserve unknown authored appearance fields while
+retaining an unpainted display cache; matching document content alone is
+therefore insufficient. Reopen must treat the older epoch as a cache miss,
+then compile the authoritative source appearance without requiring a later
+user edit or lazy rebuild to correct the initial display.
+
+## 7. Exact-fingerprint display-cache epoch (2026-09-12)
+
+The current semantic key is `chudware-geomcache/4` plus the OCCT version.
+Epoch 4 extends §6: exact selected-face fingerprints can independently paint
+faces that share a coarse short SID. Older display caches must not hide this
+authored distinction. Invalidated caches rebuild from the native source;
+neither an ordinal guess nor a rewritten old engine identity is permitted.

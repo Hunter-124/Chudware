@@ -35,6 +35,7 @@
 
 class TopoDS_Shape;
 class TopoDS_Edge;
+class TopoDS_Face;
 
 namespace chudware::doc {
 
@@ -60,9 +61,8 @@ struct TopoInfo {
     // read-back is no longer ambiguous about which way a face points (W1/W5). resolve() still
     // ignores it; the scored fingerprint is unchanged.
     std::optional<Eigen::Vector3d> rep_dir;
-    // GSL Stage 0 — semantics the kernel already computes (QCand carries them) that make_selector
-    // now emits so the LLM read-back is self-describing instead of raw B-rep numerics:
-    std::optional<bool> concave;    // cylinder/cone face: true=bore/inner, false=boss/outer; nullopt=N/A
+    // Shared by geometry queries and viewport picks; concavity participates in stable SIDs.
+    std::optional<bool> concave;    // cylindrical face: true=bore, false=boss; nullopt=N/A
     std::optional<double> radius;   // cylinder/cone/sphere face or circle edge radius (mm); nullopt=N/A
 };
 
@@ -74,6 +74,9 @@ struct ResolveResult {
 };
 
 // --- OCCT describers (enumerate sub-shapes -> descriptors) ---
+// Geometry-based bore/boss classification shared with the query candidate path.
+std::optional<bool> cylinder_face_concave(const TopoDS_Face& face);
+
 // surf/curve type strings per contract: faces plane|cylinder|cone|sphere|torus|
 // bspline|other; edges line|circle|ellipse|bspline|other. axis from the adaptor
 // (plane normal, cylinder/cone/circle/ellipse axis, line direction). centroid+measure

@@ -2000,9 +2000,15 @@ void EvaluateDialogs::drawExclusiveWindow(AppState& st) {
                 for (const auto& p : result_["clearances"]) {
                     std::string a = p.value("a", std::string("?"));
                     std::string b = p.value("b", std::string("?"));
-                    double d = p.value("distance", 0.0);
-                    ImGui::BulletText("%s <-> %s : %s", a.c_str(), b.c_str(),
-                                      evalLen(st, d).c_str());
+                    std::string reading = "exact gap not measured";
+                    if (p.contains("distance_lower_bound_mm") && p["distance_lower_bound_mm"].is_number())
+                        reading = ">= " + evalLen(st, p["distance_lower_bound_mm"].get<double>()) +
+                                  " (lower bound, not measured)";
+                    else if (p.contains("distance") && p["distance"].is_number()) {
+                        reading = evalLen(st, p["distance"].get<double>());
+                        if (p.value("approx", false)) reading += " (lower bound, not measured)";
+                    }
+                    ImGui::BulletText("%s <-> %s : %s", a.c_str(), b.c_str(), reading.c_str());
                 }
             }
             if (!hasPairs && !hasClear && !result_.contains("summary")) {

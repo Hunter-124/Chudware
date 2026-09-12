@@ -1144,29 +1144,32 @@ def _describe_results_text(doc_id: str, study_name: Optional[str] = None) -> str
 
 
 def _describe_assembly_text(doc_id: str) -> str:
-    """Narrate an assembly's world placement, fit/clearance, and mate summary.
+    """Narrate world placement, a live mate solve, and collision-only fit.
 
-    Data sources (in call order):
-    1. asm_world_bodies  — body names, placements, bounding boxes
-    2. eval_interference — pairwise clash (volume) and gap (distance) data
-    3. doc_solve_mates   — top-level DOF/converged summary string (best-effort)
-
-    Numbers narrated verbatim from the tool payloads — never recomputed.
+    Calls asm_world_bodies, then doc_solve_mates (which can update placements),
+    then eval_interference in zero-clearance threshold mode. The native fit check
+    evaluates geometry and exact overlap volumes, not minimum measured gaps.
+    Placement rows describe the pre-solve snapshot; solve_mates first when those
+    rows must reflect the solved pose. Preserve the raw fit evidence in the reply.
     """
     # 1. World-placed bodies
     try:
         wb_r = cb.call("asm_world_bodies", {"doc_id": doc_id, "explode": False})
     except Exception as e:  # noqa: BLE001
-        return _dumps({"ok": False, "error": f"asm_world_bodies failed: {e}"})
+        return _err(e)
+
+    if wb_r.get("ok") is False:
+        return _dumps(wb_r)
 
     bodies = wb_r.get("bodies", [])
     is_multi = wb_r.get("multibody_part", False)
     n = len(bodies)
 
     if n == 0:
-        return _dumps({"ok": True, "text":
+        return _dumps({"ok": False, "collision_free": False, "bodies": bodies, "text":
                        "No bodies found in this document — "
-                       "add components (assembly) or features (part) first."})
+                       "add components (assembly) or features (part) first. "
+                       "No collision qualification is possible without checked body pairs."})
 
     doc_kind = "multi-body part" if is_multi else "assembly"
     lines = [f'Assembly "{doc_id}" — {n} component(s) / bod(y/ies) [{doc_kind}]']
@@ -1200,6 +1203,10 @@ def _describe_assembly_text(doc_id: str) -> str:
     # 3. Solve/DOF summary, including solved-pose freedom beside mechanism mobility.
     try:
         sm_r = cb.call("doc_solve_mates", {"doc_id": doc_id})
+        if sm_r.get("ok") is False:
+            if sm_r.get("code") == "engine_connection_lost":
+                return _dumps(sm_r)
+            lines.append(f"\nMate solve failed: {sm_r.get('error') or sm_r.get('reason') or sm_r}")
         rebuild = sm_r.get("rebuild") or {}
         status = rebuild.get("doc_status") or sm_r.get("status") or ""
         if status:
@@ -1209,31 +1216,52 @@ def _describe_assembly_text(doc_id: str) -> str:
                 if "residual_dof" in rebuild:
                     freedom += f", residual_dof: {rebuild['residual_dof']}"
                 lines.append(f"  {freedom}")
-        else:
+        elif sm_r.get("ok") is not False:
             lines.append("\nMate solve: solve completed (DOF detail not available via read RPC — "
                          "call solve_mates for the live result)")
-    except Exception:  # noqa: BLE001
-        lines.append("\nMate solve: not available for this document type")
+    except Exception as e:  # noqa: BLE001
+        if getattr(e, "code", None) == "engine_connection_lost":
+            raise
+        lines.append(f"\nMate solve: not available for this document type ({e})")
 
-    # 4. Interference / clearance (best-effort)
+    # 4. Live collision classification: no hidden exact-distance work for close pairs.
     try:
-        # quick=True (asm-fea F4): narration only needs interference volumes (exact either
-        # way) + the tightest gap; far-pair clearances come back as bbox gaps ("approx")
-        # instead of paying exact all-pairs B-rep distances — 40 bodies took ~400s exact.
         if_r = cb.call("eval_interference", {"doc_id": doc_id,
-                                             "include_coincident": False,
-                                             "min_clearance_mm": 0.0,
-                                             "quick": True})
-        fit_text = _format_fit(if_r)
-        if fit_text:
-            lines.append("")
-            lines.extend(fit_text.splitlines())
-        elif not if_r.get("interferences"):
-            n_pairs = len(if_r.get("clearances", []))
-            lines.append(f"\nFit: no interference detected ({n_pairs} clearance pair(s))  "
-                         "(source: eval_interference)")
-    except Exception:  # noqa: BLE001
-        lines.append("\nFit/clearance: not available for this document")
+                                            "include_coincident": False,
+                                            "min_clearance_mm": 0.0,
+                                            "clearance_mode": "threshold"})
+    except Exception as e:  # noqa: BLE001
+        return _err(e)
+    if if_r.get("code") == "engine_connection_lost":
+        return _dumps({**if_r, "ok": False})
+    checked = if_r.get("pairs_checked")
+    total = if_r.get("pairs_total")
+    complete = (
+        if_r.get("complete") is True
+        and type(checked) is int and type(total) is int
+        and checked == total and checked >= 0
+        and not if_r.get("pair_failures") and not if_r.get("geometry_failures")
+        and not if_r.get("error")
+        and (if_r.get("ok") is True or bool(if_r.get("interferences")))
+    )
+    if complete:
+        lines.append("\n" + _format_fit(if_r))
+        if checked == 0:
+            lines.append("No body pairs checked; this is not a collision-free qualification.")
+    else:
+        lines.append("\n" + _format_fit({
+            **if_r,
+            "summary": "Interference check incomplete; collision-free status is not established.",
+        }))
+        for failure in if_r.get("geometry_failures", []):
+            lines.append(f"  Geometry failure: {failure}")
+        for failure in if_r.get("pair_failures", []):
+            lines.append(f"  Pair failure: {failure}")
+        if if_r.get("error"):
+            lines.append(f"  Fit error: {if_r['error']}")
+    lines.append(f"  Pair coverage: {checked if checked is not None else 'unknown'} checked / "
+                 f"{total if total is not None else 'unknown'} total.")
+    lines.append("  Collision-only threshold check; minimum measured gap is not available.")
 
     # 5. Placement provenance: a transform-placed component nobody re-checked is the failure
     #    mode this narration exists to catch (a merged wheel exported off-frame).
@@ -1241,9 +1269,12 @@ def _describe_assembly_text(doc_id: str) -> str:
         lines.append(f"\nWARNING {w} — re-run check_interference and confirm the mating "
                      "references with measure_between / fit_cylinder_axis before exporting")
 
-    lines.append("\n(Source: asm_world_bodies, eval_interference, doc_solve_mates — "
-                 "numbers narrated, never recomputed)")
-    return _dumps({"ok": True, "text": "\n".join(lines), "bodies": bodies})
+    lines.append("\n(Source: asm_world_bodies pre-solve placement snapshot; doc_solve_mates "
+                 "live solve; eval_interference live threshold classification and overlap volumes)")
+    return _dumps({"ok": complete, "text": "\n".join(lines), "bodies": bodies,
+                   "fit": if_r,
+                   "collision_free": complete and checked > 0 and if_r.get("ok") is True
+                   and not if_r.get("interferences")})
 
 
 def _board_power_lines(engs: list, label: str) -> list:
@@ -2261,11 +2292,13 @@ def register_gsl_tools(mcp: FastMCP) -> None:
         """Compact narrative of an assembly (or multi-body part) — world placement, fit/clearance,
         and mate solve summary. Use INSTEAD of dumping asm_world_bodies JSON.
 
-        Returns per-component bounding boxes and world-frame origins, interference/clearance pairs
-        from check_interference (volumes and gap distances), and the top-level mate solve status.
-        Narrates existing numbers only — never recomputes. Works on assembly docs (components placed
-        by mates) and multi-body parts (transform-assembled bodies). Returns a graceful message when
-        no bodies are present. Call solve_mates first to update the assembly placement.
+        Queries world-frame bounding boxes/origins, runs doc_solve_mates, then evaluates
+        collision-only fit with clearance_mode='threshold', min_clearance_mm=0 and
+        include_coincident=False. Overlap volumes remain exact; clearance lower bounds
+        are not measured gaps and no tightest measured gap is reported. Returns raw fit
+        completeness, pair coverage and failures; no-pair or incomplete results cannot
+        qualify collision-free. Works on assembly docs and multi-body parts.
+        Call solve_mates first if the pre-solve placement rows must show the solved pose.
         """
         try:
             return _describe_assembly_text(_doc(doc_id))

@@ -180,6 +180,9 @@ struct CompileResult {
 // (consumed) bodies of one compile, not N copies of the model.
 struct CompileCache;
 std::shared_ptr<CompileCache> make_compile_cache();
+// Copy the mutable cache index; frozen checkpoints/results remain shared just as
+// they do across incremental compiles. Caller holds the source session's lock.
+std::shared_ptr<CompileCache> copy_compile_cache(const CompileCache& source);
 // Global compile-cache counters for the profiler: {full_hits, features_reused,
 // features_executed, compiles} since engine start (process-wide, all docs).
 nlohmann::json compile_cache_stats();
@@ -213,6 +216,15 @@ CompileResult compile_document(const nlohmann::json& doc, const nlohmann::json& 
 // and the apply-ops tess metadata so both report the same colour.
 void apply_doc_appearance(const nlohmann::json& doc, uint32_t body_num,
                           float color[3], float& metallic, float& roughness);
+
+// Exact SID inventory paired with actual TopExp::MapShapes 1-based face IDs. A SID
+// may have multiple candidates (quantized hash collision); never choose one by ordinal.
+using FaceSidInventory = std::map<std::string, std::vector<std::pair<uint32_t, nlohmann::json>>>;
+FaceSidInventory face_sid_inventory(const TopoDS_Shape& shape);
+// Persisted face_appearances[bN][record_id] = {selector, appearance}; record ids are opaque.
+// Only exact, uniquely matching fingerprints paint faces. Stale/ambiguous records stay inert.
+void apply_doc_face_appearances(const nlohmann::json& doc, uint32_t body_num,
+                                const TopoDS_Shape& shape, aicm::AicmBody& body);
 
 // One push-pull plan: which feature/param a dragged face drives + the new value
 // (port of engine/doc/instant3d.py plan_edit). `draggable==false` carries a `reason`.

@@ -373,6 +373,9 @@ After a successful **gui** `doc_save`, hostd clears that doc's undo/redo history
 ```
 
 to **all** subscribers (including the saver). GUIs grey local undo/redo until a subsequent edit.
+Nonbinding snapshot saves (`preserve_path:true`, §24) are not human Save
+operations and do not clear history or emit `doc.history_cleared`.
+
 
 ### 6.3 `doc_clear_history` RPC
 
@@ -642,3 +645,171 @@ It does not compile the assembly as an empty part or return local source
 coordinates. An out-of-range body refuses; it never falls back to querying
 the whole assembly. Unscoped queries retain whole-document behavior.
 This allows `interface_check` to compare real placed component faces.
+
+## 22. Selected-face visual finishes (2026-09-12)
+
+On a source part, `set_appearance` additionally accepts a nonempty `faces`
+array of stable `Fxxxxxx` SIDs or face selector objects containing `kind:"face"`
+and `sid`. `id:"bN"` selects the source body. New assignments require explicit
+RGB `color`; optional `metallic` and `roughness` inherit the body's values when
+omitted. This changes appearance only, never document or body physical material.
+
+Selections resolve uniquely against the final candidate geometry before the
+operation batch commits. Unknown or ambiguous SIDs reject the batch. Ordinal-only
+and fuzzy matching are not supported. Records persist as
+`face_appearances[bN][SID] = {selector, appearance}`, where `selector` is the
+canonical geometric fingerprint without owner or ordinal hints.
+Cylindrical faces use the same geometry-derived bore/boss classification in
+queries, viewport picks and appearance validation, so their SIDs agree.
+Rendering requires both a unique SID and the saved fingerprint; stale records
+remain inspectable but do not paint another face. `color:null` clears only the
+listed stored SIDs, including records whose face or body no longer exists.
+
+The registered `set_material` tool exposes the same visual-only selection via
+`faces`, appended after its existing parameters. Use an appearance dict or RGB
+list, not a physical material name; `{"color":null}` clears selected overrides.
+Default `get_part`/`doc_tree` exposes the persisted records. Native save/open,
+compiled AICM, direct rendering and nested source-part assemblies preserve them.
+Desktop APRG rendering uses color, metallic and roughness; the existing software
+rasterizer uses region colors without claiming equivalent PBR shading.
+
+## 23. Cached native dry-run diagnostics (2026-09-12)
+
+`doc_dry_run_ops(doc_id, ops)` compiles a candidate in unregistered scratch
+state seeded from the live source's compile cache and relative-path context.
+It copies mutable cache indexes while retaining immutable cached payloads.
+Neither success nor failure may change the source tree, revision, geometry,
+undo history or compile cache, or notify dependent live documents.
+
+The response retains its `ok`/`error` fields and includes `source_revision`.
+When candidate compilation is reached it also returns the actual `rebuild`
+diagnostics, including feature status, document status and cache statistics.
+Callers must inspect those diagnostics rather than treating an absent report
+as a passing rebuild. This avoids cold source replay; it does not impose a
+deadline on expensive changed geometry or cache misses.
+
+## 24. Nonbinding native snapshots and batch save destinations (2026-09-12)
+
+`doc_save(doc_id, path, preserve_path=false)` retains ordinary Save semantics:
+the successful destination becomes the live path and clears dirty state.
+With `preserve_path:true`, serialization runs in unregistered cached scratch.
+Success or failure must leave the live path, tree, revision, dirty state and
+undo history unchanged. Path-backed component references in the snapshot are
+resolved against the live source destination before serialization; the live
+relative references are not rewritten. The response includes the written
+`path` and `preserve_path:true`. This is a nonbinding snapshot, not a general
+Save As relative-path migration or a self-contained dependency bundle.
+
+MCP autosave, legacy live publication, daemon autosave and orphan retirement
+use nonbinding snapshots. Normal batch project saves retain an existing
+non-recovery `.step+` destination even when a display name is supplied.
+New, detached and recovered documents select the configured project directory.
+Metadata failure must not guess a new destination; connection loss propagates.
+
+## 25. Explicit interference classification versus exact clearance (2026-09-12)
+
+Native `eval_interference` and registered `check_interference` accept
+`clearance_mode:"exact"|"threshold"`, default `"exact"`. Existing exact-mode
+distance work is unchanged, including explicitly requested legacy `quick`
+approximations. Threshold mode shares motion's conservative classification:
+valid AABB separation may prove a bound; otherwise exact Boolean Common
+classifies overlap with the unchanged volume tolerance.
+
+At zero minimum clearance with `include_coincident:false`, completed overlap
+classification does not run an unnecessary exact curve-distance optimization.
+Positive-clearance and coincident-contact requests still use exact distance
+whenever bounds cannot decide the requested classification. Threshold mode
+does not substitute legacy `quick` approximations for that required work.
+
+A bound-only pair carries `distance_status:"lower_bound"` and
+`distance_lower_bound_mm`, without `distance`. A pair actually measured in
+threshold mode carries `distance_status:"exact"` and `distance`. Missing
+distance is not zero. Legacy `approx:true` values remain explicitly bounds
+in narration and desktop fit displays.
+
+Member scopes, expected/checked pair counts and failure evidence are retained.
+Failed geometry or pair work makes the report incomplete, never collision-free.
+`ok` means complete with no classified volumetric interference; requested
+minimum-clearance warnings remain separate. Threshold reports do not claim an
+assembly-wide tightest measured gap. Neither mode guarantees cancellation or
+a wall-clock bound inside OCCT validity, Boolean or exact-distance algorithms.
+
+## 26. Implicit collision-only consumers (2026-09-12)
+
+Registered `describe_assembly` and the component-axis steering sweep request
+zero-clearance, no-coincident threshold classification instead of implicit
+exact distances. Legacy `quick:true` is not an equivalent performance policy:
+close pairs can still enter exact curve-distance optimization.
+
+Assembly narration retains the native fit report and an explicit
+`collision_free` qualification. Complete narration may report real overlaps;
+zero checked pairs, missing accounting, geometry failures or pair failures
+cannot qualify a document as collision-free. See `narration.md` for the
+placement snapshot and live mate-solve ordering.
+
+Steering samples retain pair accounting, failures and collision witnesses.
+The aggregate reports `complete`, `frames_checked` and indexed failures;
+requested incomplete checks make the sweep unsuccessful without discarding
+valid sampled poses or known collisions. Connection loss aborts subsequent
+motion mutations. `steering_turning_radius(check_interference=true)` exposes
+the sampled trajectory so this evidence survives the registered tool boundary.
+
+## 27. Exact selected-face fingerprints (2026-09-12)
+
+This extends §22. Short SIDs are coarse lookup buckets, not globally unique
+topology identities. A SID string or SID-only selector still requires a unique
+face in the selected body. A complete `query_geometry` face selector instead
+requires exactly one identical canonical fingerprint within its SID bucket;
+owner and ordinal hints do not participate. Partial geometric selectors,
+stale fingerprints, and genuinely identical ambiguous candidates are refused.
+
+Several faces sharing a SID may retain independent finishes. Records remain
+`face_appearances[bN][record_id] = {selector, appearance}`, but `record_id` is
+opaque; the authoritative target is `selector`, not the dictionary key.
+Rendering also requires a unique exact fingerprint, rather than SID uniqueness.
+Clearing with a complete fingerprint clears only that target; clearing with a
+SID clears all stored records carrying that SID, including stale records.
+Assignments resolve against final batch geometry and apply in request order.
+
+## 28. Native file metadata operations (2026-09-12)
+
+`doc_file_operations` is an internal JSON dispatch operation for closed native
+`.step+` files, not a document edit/compile/solve operation. The registered MCP
+adapters are `inspect_native_files(paths, output_path?)` and
+`relocate_native_files(plan_path)`. Every explicit adapter path is absolute and
+inside `CHUDWARE_FS_ROOT`; the browser's raw engine bridge refuses this RPC.
+
+Inspection accepts `{action:"inspect", paths:[...]}`. Relocation accepts
+`{action:"relocate", entries:[{path,destination,name?,component_names?}],
+path_map:{old_absolute:new_absolute}}`. Entries name distinct source and
+destination files. Optional component names are keyed by stable component ID.
+The complete plan is preflighted before writes: no overwrite, case-colliding
+destination, malformed/disagreeing map, unsupported source schema, or unknown
+component ID. Native processing is bounded one source at a time.
+
+Copies change only document/component display names and authoritative file
+references: component `source.path` and import `params.source_path`/`path`.
+Mapped filesystem references always become relative to the destination parent,
+including originally absolute references. Unmapped references are rebased to
+retain their resolved target. The caller must establish required dependency
+closure before treating the copied project as portable.
+
+Embedded-BREP import paths are optional provenance; historical URI provenance
+remains literal. Free-form document `meta` paths are documentary metadata,
+reported with `required:false`, `rewrite:false`, and
+`usage:"documentary_metadata"`. They must not be rewritten into a new claim of
+verification or treated as unknown geometry inputs. Unsupported authoritative
+reference forms remain explicit refusals.
+
+Feature IDs/names, document/component IDs, other parameters, materials, finishes,
+mates, reference frames, poses, embedded model data, `geometry.step` and unknown
+archive payloads survive. Optional stale display/BREP caches are invalidated;
+their engine identity is never forged. Native canonical and masked immutable
+hashes are FNV64, explicitly not SHA256. Original source files are never removed.
+File copies publish exclusively through the native atomic serializer.
+
+Results are `{ok,action,files,failures}` with per-file `ok` and status. I/O races
+may leave explicitly reported partial copies; this is not an all-files atomic
+transaction. MCP persists large inspection results and every relocation result
+in guarded, non-overwriting JSON artifacts. A failed artifact write preserves
+native outcome counts and warns that copies may already exist.

@@ -199,7 +199,13 @@ std::vector<TopoDS_Shape> load_bodies(
                 appearance.face_count = static_cast<uint32_t>(faces.Extent());
                 apply_doc_appearance(loaded.doc, ++ordinal, appearance.color,
                                      appearance.metallic, appearance.roughness);
-                appearances.push_back({appearance});
+                aicm::AicmBody styled;
+                std::copy(appearance.color, appearance.color + 3, styled.color);
+                styled.metallic = appearance.metallic;
+                styled.roughness = appearance.roughness;
+                apply_doc_face_appearances(loaded.doc, ordinal, shape, styled);
+                if (styled.appearance_regions.empty()) appearances.push_back({appearance});
+                else appearances.push_back(std::move(styled.appearance_regions));
             }
         };
         // Solved-bodies fast path: a part saved after a fully-ok rebuild embeds its compiled

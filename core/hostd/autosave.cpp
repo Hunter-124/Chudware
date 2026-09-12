@@ -260,8 +260,9 @@ void Autosave::saveDirtyDocs() {
         fs::create_directories(sessionDir_, ec);
         json result;
         const std::string path = sessionDir_ + "/" + id + ".step+";
-        if (core::cpp_core().call("doc_save", json{{"doc_id", id}, {"path", path}}, result,
-                                  err)) {
+        if (core::cpp_core().call("doc_save",
+                                  json{{"doc_id", id}, {"path", path}, {"preserve_path", true}},
+                                  result, err)) {
             if (rev >= 0) {
                 std::lock_guard<std::mutex> lk(revMtx_);
                 lastSavedRev_[id] = rev;
@@ -349,7 +350,9 @@ bool Autosave::retireDoc(const std::string& docId, const std::string& name) {
     const std::string base = orphanDir_ + "/" + stem;
     json result;
     std::string err;
-    if (!core::cpp_core().call("doc_save", json{{"doc_id", docId}, {"path", base + ".step+"}},
+    if (!core::cpp_core().call("doc_save",
+                               json{{"doc_id", docId}, {"path", base + ".step+"},
+                                    {"preserve_path", true}},
                                result, err)) {
         log().line("doc-gc: retire doc_save(%s) failed: %s", docId.c_str(), err.c_str());
         return false;

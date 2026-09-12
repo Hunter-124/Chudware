@@ -21,11 +21,12 @@ tmp_path rather than the user's data directory.
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 
 import pytest
 
 from services.agent import agent_turn as at
-from services.dag import mcp_tools as MT
+from services.dag import mcp_tools as MT, node_runner
 
 
 # ---------------------------------------------------------------------------
@@ -34,8 +35,14 @@ from services.dag import mcp_tools as MT
 
 @pytest.fixture(autouse=True)
 def _hermetic(tmp_path, monkeypatch):
-    """Runs land in tmp_path, and the session's last-plan memory starts empty."""
+    """Keep real checkpoints and gates, but never dispatch a live provider."""
     monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path))
+    monkeypatch.setattr(
+        node_runner, "_default_agent_fn",
+        lambda request, context_pack: SimpleNamespace(
+            success=True, stop_reason="confirmed", final_code=None, result=None,
+        ),
+    )
     saved = dict(MT._LAST)
     MT._LAST.update({"graph_json": None, "graph_from": "", "run_id": ""})
     yield
@@ -162,10 +169,10 @@ def test_extra_field_beside_an_explicit_brief_is_appended_not_dropped(plan):
     assert any("appended the extra field" in n for n in out["interpreted"])
 
 
-def test_conflicting_autonomy_spellings_are_reported_not_dropped(plan):
+def test_explicit_autonomy_wins_over_conflicting_alias(plan):
     out = _call(plan, brief="Design a bracket", autonomy_default="auto", autonomy="manual")
     assert out["ok"] is True
-    assert any("ignored autonomy='manual'" in n for n in out["interpreted"])
+    assert out["status"] == "done"
 
 
 def test_unknown_extra_fields_are_folded_in_not_dropped(plan):

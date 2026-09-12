@@ -1016,7 +1016,7 @@ json Server::dispatch(ClientConn& c, const std::string& method, const json& para
     // Human (gui) save clears that doc's undo/redo history (session stacks +
     // disk journal) and fans out doc.history_cleared so other GUIs grey undo.
     // Agent/mcp saves deliberately keep history so AI rollback paths still work.
-    if (method == "doc_save" && c.kind == "gui") {
+    if (method == "doc_save" && c.kind == "gui" && !p.value("preserve_path", false)) {
         const std::string docId = p.value("doc_id", std::string());
         if (!docId.empty()) {
             json clr;

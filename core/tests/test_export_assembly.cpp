@@ -443,3 +443,56 @@ TEST_CASE("component source replacement changes saved and exported geometry with
     for (const fs::path& path : {a, b, replacement, saved, output})
         fs::remove(path);
 }
+
+TEST_CASE("nonbinding snapshot preserves live relative sources and unsaved state") {
+    using namespace chudware::doc;
+    const fs::path directory = tmp("nonbinding_snapshot");
+    fs::create_directories(directory / "source");
+    fs::create_directories(directory / "recovery");
+    const fs::path a = directory / "source/a.step";
+    const fs::path b = directory / "source/b.step";
+    const fs::path saved = directory / "source/assembly.step+";
+    const fs::path snapshot = directory / "recovery/snapshot.step+";
+    const std::string id = make_two_part_assembly(a, b);
+    doc_save(id, saved.string());
+    doc_apply_ops(id, -1, json::array({
+        {{"op", "asm_edit_component"}, {"id", "k1"}, {"source", {{"path", "a.step"}}}},
+        {{"op", "asm_edit_component"}, {"id", "k2"}, {"source", {{"path", "b.step"}}}}
+    }), false);
+    const auto live_state = [&]() {
+        const json listed = doc_list();
+        for (const json& row : listed.at("docs"))
+            if (row.at("doc_id") == id) return row;
+        return json();
+    };
+    const json before = live_state();
+    const json tree = doc_tree(id).at("tree");
+    REQUIRE(before.at("dirty") == true);
+    doc_save(id, snapshot.string(), true);
+    const json after = live_state();
+    CHECK(after.at("path") == before.at("path"));
+    CHECK(after.at("dirty") == true);
+    CHECK(after.at("revision") == before.at("revision"));
+    CHECK(doc_tree(id).at("tree") == tree);
+    const std::string recovered = doc_open(snapshot.string()).at("doc_id");
+    CHECK(doc_bbox(recovered).at("max").at(0).get<double>() == doctest::Approx(60.0));
+    const auto shapes = doc_tessellate_bodies(recovered);
+    REQUIRE(shapes.size() == 2);
+    doc_close(recovered);
+    // A failed snapshot must not clear pending edits or change their base path.
+    const fs::path invalid = directory / "recovery/directory.step+";
+    fs::create_directories(invalid);
+    CHECK_THROWS(doc_save(id, invalid.string(), true));
+    CHECK(live_state().at("path") == before.at("path"));
+    CHECK(live_state().at("dirty") == true);
+    CHECK(doc_tree(id).at("tree") == tree);
+    // Ordinary Save still binds and clears dirty, with relative children intact.
+    doc_save(id, saved.string());
+    CHECK(live_state().at("dirty") == false);
+    doc_close(id);
+    const std::string reopened = doc_open(saved.string()).at("doc_id");
+    CHECK(doc_tessellate_bodies(reopened).size() == 2);
+    CHECK(doc_bbox(reopened).at("max").at(0).get<double>() == doctest::Approx(60.0));
+    doc_close(reopened);
+    fs::remove_all(directory);
+}

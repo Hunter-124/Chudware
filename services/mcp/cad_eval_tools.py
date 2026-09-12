@@ -6,6 +6,7 @@ from mcp.server.fastmcp import Image
 from pydantic import Field
 from typing import Annotated
 from typing import Any
+from typing import Literal
 from typing import Optional
 from typing import Union
 import json
@@ -1375,16 +1376,21 @@ def register_cad_eval_tools(mcp: FastMCP) -> None:
                            include_coincident: Optional[bool] = None,
                            min_clearance_mm: Optional[float] = None,
                            members: Optional[list[str]] = None,
+                           clearance_mode: Literal["exact", "threshold"] = "exact",
                            **kwargs: Annotated[Any, Field(default=None)]) -> str:
         """Clash/clearance check — do the bodies OVERLAP, and if not, how tight is the gap?
 
         Runs a pairwise interference analysis over every body in the document (for an assembly
         doc, over the world-placed component bodies). For each pair it reports either an
         INTERFERENCE (overlap volume in mm^3 — a real collision the design must not have) or a
-        CLEARANCE (minimum gap in mm). Use it to validate that mating/instanced parts fit without
-        clashing, or to find the tightest gap in an assembly. For overlap WITHIN a single part's
-        own features (two bosses merged, a cut swallowing a boss) use check_feature_overlap
-        instead — this tool only sees whole bodies/components.
+        CLEARANCE. clearance_mode="exact" (default) measures each noninterfering pair's
+        minimum gap. clearance_mode="threshold" classifies overlap and requested clearance,
+        avoiding unrequested exact gap work. With zero minimum clearance and no coincident
+        request, completed overlap classification never launches exact distance work.
+        Positive clearance/contact requests still require exact distances when conservative
+        bounds cannot decide them. Bounds are distance_lower_bound_mm, NOT measured gaps;
+        threshold mode cannot claim a tightest gap. For overlap WITHIN a single part's own
+        features use check_feature_overlap instead — this tool sees whole bodies/components.
         members: optional exact member names, e.g. ["b434", "b435"] for a multi-body part;
         assembly names match parts[].name. Checks only pairs WITHIN this selection. Unknown
         names are refused. Omit or pass [] to check all members. A scoped result does not
@@ -1398,11 +1404,14 @@ def register_cad_eval_tools(mcp: FastMCP) -> None:
         accepted as min_clearance= / clearance= / clearance_mm= / min_gap_mm=, and
         include_coincident= as coincident= / include_contacts= (echoed in `interpreted`).
 
-        Returns {ok, summary, pairs_checked, parts:[{name,bbox,volume}],
-        interferences:[{a,b,volume}], clearances:[{a,b,distance}], contacts:[{a,b,distance}]}.
-        ok is True only when NOTHING interferes. An EMPTY document is refused with
-        reason="insufficient_bodies" (a check on nothing is not a verification); a single
-        body returns ok with pairs_checked=0.
+        Returns {ok, complete, clearance_mode, summary, pairs_checked, pairs_total,
+        parts:[{name,bbox,volume}], interferences:[{a,b,volume}], clearances, contacts}.
+        A threshold clearance has distance_status="lower_bound" and distance_lower_bound_mm,
+        or distance_status="exact" and distance; contacts carry exact distance.
+        ok is True only when the check is complete and NOTHING interferes; minimum-clearance
+        violations remain warnings. Failures mean incomplete, never collision-free. An EMPTY
+        document is refused with reason="insufficient_bodies"; a single body returns ok with
+        pairs_checked=0, which is not pairwise verification evidence.
         """
         d = None
         try:
@@ -1423,11 +1432,14 @@ def register_cad_eval_tools(mcp: FastMCP) -> None:
                     "clearance is a NUMBER of millimetres, e.g. min_clearance_mm=0.2."
                 ) from None
             include_coincident = bool(coincident)
+            if clearance_mode not in ("exact", "threshold"):
+                raise ValueError("check_interference: clearance_mode must be 'exact' or 'threshold'.")
             _reject_unknown("check_interference", extra,
-                            "it takes doc_id=, include_coincident=, min_clearance_mm= and members=.")
+                            "it takes doc_id=, include_coincident=, min_clearance_mm=, members= "
+                            "and clearance_mode='exact'|'threshold'.")
             d = _doc(doc_id)
             params = {"doc_id": d, "include_coincident": include_coincident,
-                      "min_clearance_mm": min_clearance_mm}
+                      "min_clearance_mm": min_clearance_mm, "clearance_mode": clearance_mode}
             if members is not None:
                 params["members"] = members
             res = cb.call("eval_interference", params)

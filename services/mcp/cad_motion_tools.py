@@ -220,7 +220,9 @@ def _clash_row(hit: dict) -> dict:
     that proves an overlap would dwarf the whole reply, and the pair plus its volume and
     overlap box is what a clearance claim is made from.
     """
-    keep = ("a", "b", "volume", "volume_mm3", "overlap_volume_mm3", "distance",
+    keep = ("a", "b", "component_a", "component_b",
+            "volume", "volume_mm3", "overlap_volume_mm3", "distance",
+            "distance_status", "distance_lower_bound_mm",
             "overlap_bbox", "kind")
     return {k: hit[k] for k in keep if k in hit}
 # ----------------------------------------------------------------- steer drive
@@ -530,6 +532,10 @@ def steer_pose_sweep(doc_id: str, steer, rear_steer, steps: int,
         trajectory = []
         first_hit = None
         interferences = []
+        frames_checked = 0
+        pair_failures = []
+        geometry_failures = []
+        check_failures = []
         drive_by_id = {d["component"]: d for d in drives}
         for i in range(steps):
             scale = i / (steps - 1) if steps > 1 else 1.0
@@ -573,13 +579,54 @@ def steer_pose_sweep(doc_id: str, steer, rear_steer, steps: int,
                 frame["solve_error"] = rep["message"]
             if not pose_check["ok"]:
                 frame["solve_error"] = "driver_pose_mismatch: solved pose violates axis line"
+            frame.update({"interference": None, "interference_complete": False,
+                          "collisions": [], "collision_detail": [],
+                          "pair_failures": [], "geometry_failures": []})
             if check_interference and frame["converged"]:
-                ir = cb.call("eval_interference",
-                             {"doc_id": clone, "include_coincident": False,
-                              "min_clearance_mm": 0.0}) or {}
+                try:
+                    ir = cb.call("eval_interference",
+                                 {"doc_id": clone, "include_coincident": False,
+                                  "min_clearance_mm": 0.0,
+                                  "clearance_mode": "threshold"}) or {}
+                except Exception as exc:  # noqa: BLE001 — retain the valid pose
+                    if getattr(exc, "code", None) == "engine_connection_lost":
+                        raise
+                    ir = {"ok": False, "complete": False, "error": str(exc)}
+                    for key in ("code", "detail"):
+                        if getattr(exc, key, None) is not None:
+                            ir[key] = getattr(exc, key)
+                if ir.get("code") == "engine_connection_lost":
+                    raise cb.CoreError(ir.get("error") or "Engine session lost",
+                                       code="engine_connection_lost", detail=ir.get("detail"))
                 hits = [_clash_row(h) for h in (ir.get("interferences") or [])
                         if isinstance(h, dict)]
-                frame["collisions"] = hits
+                checked, total = ir.get("pairs_checked"), ir.get("pairs_total")
+                complete = (
+                    ir.get("complete") is True
+                    and type(checked) is int and type(total) is int
+                    and 0 <= checked == total
+                    and not ir.get("pair_failures") and not ir.get("geometry_failures")
+                    and not ir.get("error")
+                    # Evaluate's ok=false also denotes a genuine collision.
+                    and (ir.get("ok") is True or bool(hits)))
+                frames_checked += int(complete)
+                frame.update({
+                    "interference": True if hits else False if complete else None,
+                    "interference_complete": complete,
+                    "pairs_checked": checked, "pairs_total": total,
+                    "pair_failures": ir.get("pair_failures") or [],
+                    "geometry_failures": ir.get("geometry_failures") or [],
+                    "collisions": hits, "collision_detail": hits,
+                    "interference_report": {**ir, "interferences": hits},
+                })
+                pair_failures.extend({"i": i, **f} for f in frame["pair_failures"])
+                geometry_failures.extend({"i": i, **f} for f in frame["geometry_failures"])
+                if not complete:
+                    failure = {"i": i, "reason": "interference_check_incomplete"}
+                    for key in ("error", "code", "detail"):
+                        if key in ir:
+                            failure[key] = ir[key]
+                    check_failures.append(failure)
                 if hits and first_hit is None:
                     first_hit = {"step": i, "value": frame["value"],
                                  "detail": hits[:8]}
@@ -587,8 +634,9 @@ def steer_pose_sweep(doc_id: str, steer, rear_steer, steps: int,
             trajectory.append(frame)
 
         bad = [f["i"] for f in trajectory if not f["converged"]]
+        interference_complete = bool(check_interference) and frames_checked == steps
         out = {
-            "ok": not bad,
+            "ok": not bad and (not check_interference or interference_complete),
             "doc_id": doc_id,
             "mate_id": None,
             "driver": {"type": "steer", "unit": "deg", "start": 0.0, "stop": primary,
@@ -604,6 +652,11 @@ def steer_pose_sweep(doc_id: str, steer, rear_steer, steps: int,
             "pose_check": {"ok": all(f["pose_check"]["ok"] for f in trajectory),
                            "frames": [{"i": f["i"], **f["pose_check"]} for f in trajectory]},
             "interference": {"checked": bool(check_interference),
+                             "complete": interference_complete,
+                             "frames_checked": frames_checked,
+                             "pair_failures": pair_failures,
+                             "geometry_failures": geometry_failures,
+                             "check_failures": check_failures,
                              "first_collision_step":
                                  first_hit["step"] if first_hit else None,
                              "first_collision_value":
@@ -615,6 +668,8 @@ def steer_pose_sweep(doc_id: str, steer, rear_steer, steps: int,
                 "the mate network did not converge around the steered pose at step(s) "
                 f"{bad}: " + str(next(f.get("solve_error") for f in trajectory
                                       if not f["converged"])))
+        elif check_interference and not interference_complete:
+            out["error"] = "motion interference check is incomplete"
         return out
     finally:
         try:
@@ -1481,6 +1536,8 @@ def register_cad_motion_tools(mcp: FastMCP) -> None:
                 "assumptions": assumptions,
                 "warnings": warnings,
             }
+            if check_interference:
+                result["trajectory"] = trajectory
             if tightest:
                 kin = tightest.get("kinematic") or {}
                 result["summary"] = (

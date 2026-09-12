@@ -1397,8 +1397,11 @@ void AsmPanels::drawInterferenceBody(AppState& st) {
         auto clear = r.contains("clearances") && r["clearances"].is_array()
             ? r["clearances"] : nlohmann::json::array();
         bool clash = !inter.empty();
-        pushText(clash ? pal.statusErr : pal.statusOk);
-        ImGui::TextUnformatted(clash ? "Interference detected" : "No interference");
+        const bool verified = r.value("complete", false) && r.value("pairs_checked", 0) > 0;
+        pushText(clash || !verified ? pal.statusErr : pal.statusOk);
+        ImGui::TextUnformatted(!r.value("complete", false) ? "Interference check incomplete" :
+                              clash ? "Interference detected" :
+                              verified ? "No interference" : "No body pairs checked");
         ImGui::PopStyleColor();
         ImGui::Spacing();
         if (ImGui::BeginTable("##inter_tbl", 3,
@@ -1421,7 +1424,15 @@ void AsmPanels::drawInterferenceBody(AppState& st) {
                 ImGui::TableNextRow();
                 ImGui::TableNextColumn(); ImGui::TextUnformatted(it.value("a", std::string()).c_str());
                 ImGui::TableNextColumn(); ImGui::TextUnformatted(it.value("b", std::string()).c_str());
-                ImGui::TableNextColumn(); ImGui::Text("%.3f mm gap", it.value("distance", 0.0));
+                ImGui::TableNextColumn();
+                if (it.contains("distance_lower_bound_mm") && it["distance_lower_bound_mm"].is_number())
+                    ImGui::Text(">= %.3f mm (lower bound, not measured)",
+                                it["distance_lower_bound_mm"].get<double>());
+                else if (it.contains("distance") && it["distance"].is_number())
+                    ImGui::Text("%.3f mm %s", it["distance"].get<double>(),
+                                it.value("approx", false) ? "lower bound (not measured)" : "gap");
+                else
+                    ImGui::TextUnformatted("Exact gap not measured");
             }
             ImGui::EndTable();
         }

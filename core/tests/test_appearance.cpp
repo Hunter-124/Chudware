@@ -13,9 +13,12 @@
 #include <vector>
 
 #include <nlohmann/json.hpp>
+#include <Standard_Version.hxx>
 
 #include "doc/session.h"
 #include "doc/stepplus.h"
+#include "doc/document.h"
+#include "../../ui/viewport/render/aicm_loader.h"
 #include "geom/aicm.h"
 
 using json = nlohmann::json;
@@ -36,7 +39,7 @@ std::string make_box_doc() {
                                       {"height", dimv(12)}}}}}},
     });
     json resp = doc_apply_ops(id, -1, ops, false);
-    REQUIRE(resp.value("volume", 0.0) > 0.0);
+    REQUIRE(resp.value("volume", 0.0) == Approx(40.0 * 24.0 * 12.0));
     return id;
 }
 
@@ -78,6 +81,236 @@ void check_face_appearance(const aicm::AicmBody& body, uint32_t face_id,
     CHECK(appearance.roughness == Approx(expected.roughness));
 }
 }  // namespace
+
+TEST_CASE("selected face finish: body defaults, physics, caches and native nesting survive set and clear") {
+    using namespace chudware::doc;
+    const auto id = make_box_doc();
+    AppearanceFiles files(id);
+    doc_apply_ops(id, -1, json::array({
+        {{"op", "set_material"}, {"key", "aluminum_6061"}},
+        {{"op", "set_material"}, {"id", "b1"}, {"key", "steel_a36"}},
+        {{"op", "set_appearance"}, {"id", "b1"}, {"color", {0.1, 0.2, 0.8}},
+         {"metallic", 0.2}, {"roughness", 0.7}},
+    }), false);
+    const auto before = doc_tree(id).at("tree");
+    auto cache = make_compile_cache();
+    const auto initial = compile_document(before, json::object(), cache.get());
+    REQUIRE(initial.ok);
+    const auto inventory = face_sid_inventory(initial.shapes.at(0));
+    REQUIRE(inventory.size() == 6);
+    const auto selected = inventory.begin()->first;
+    const auto face_id = inventory.begin()->second.at(0).first;
+    const auto response = set_appearance(id, {
+        {"faces", {selected}}, {"color", {0.9, 0.05, 0.1}}, {"metallic", 0.95}, {"roughness", 0.12}});
+    const auto tree = response.at("tree");
+    CHECK(tree.at("material") == before.at("material"));
+    CHECK(tree.at("body_materials") == before.at("body_materials"));
+    CHECK(response.at("volume").get<double>() == Approx(initial.volume));
+    const auto direct = doc_tessellate_bodies(id);
+    REQUIRE(direct.size() == 1);
+    for (const auto& face : direct[0].faces.vec()) {
+        const auto ap = face_appearance(direct[0], face.face_id);
+        CHECK(ap.color[0] == Approx(face.face_id == face_id ? 0.9 : 0.1));
+        CHECK(ap.metallic == Approx(face.face_id == face_id ? 0.95 : 0.2));
+        CHECK(ap.roughness == Approx(face.face_id == face_id ? 0.12 : 0.7));
+    }
+    // Same retained compile cache + unchanged TShapes: metadata must change both
+    // full-result and per-body cache keys, and the serialized APRG must reach its loader.
+    auto check_compiled = [&](const json& document, bool painted) {
+        const auto compiled = compile_document(document, json::object(), cache.get());
+        REQUIRE(compiled.ok);
+        render::DocMesh mesh;
+        std::string error;
+        REQUIRE(render::parseAicm(compiled.aicm.data(), compiled.aicm.size(), mesh, error));
+        REQUIRE(mesh.bodies.size() == 1);
+        for (const auto& face : mesh.bodies[0].faces) {
+            float red = mesh.bodies[0].color[0], metal = mesh.bodies[0].metallic;
+            float rough = mesh.bodies[0].roughness;
+            for (const auto& ap : mesh.bodies[0].appearance_regions)
+                if (face.face_id >= ap.first_face && face.face_id - ap.first_face < ap.face_count) {
+                    red = ap.color[0]; metal = ap.metallic; rough = ap.roughness;
+                }
+            const bool chosen = painted && face.face_id == face_id;
+            CHECK(red == Approx(chosen ? 0.9 : 0.1));
+            CHECK(metal == Approx(chosen ? 0.95 : 0.2));
+            CHECK(rough == Approx(chosen ? 0.12 : 0.7));
+        }
+    };
+    check_compiled(tree, true);
+    check_compiled(tree, true); // whole-result hit
+    auto path = files.dir / "face_finish.step+";
+    doc_save(id, path.string());
+    const std::string reopened = doc_open(path.string()).at("doc_id");
+    CHECK(doc_tree(reopened).at("tree").at("face_appearances") == tree.at("face_appearances"));
+    auto current = reopened;
+    for (int depth = 0; depth < 3; ++depth) {
+        const auto bodies = doc_tessellate_bodies(current);
+        REQUIRE(bodies.size() == 1);
+        for (const auto& face : bodies[0].faces.vec()) {
+            const auto ap = face_appearance(bodies[0], face.face_id);
+            CHECK(ap.color[0] == Approx(face.face_id == face_id ? 0.9 : 0.1));
+            CHECK(ap.metallic == Approx(face.face_id == face_id ? 0.95 : 0.2));
+            CHECK(ap.roughness == Approx(face.face_id == face_id ? 0.12 : 0.7));
+        }
+        if (depth == 2) break;
+        current = doc_new("assembly", "FaceFinishAssembly").at("doc_id");
+        doc_apply_ops(current, -1, json::array({
+            {{"op", "asm_insert_component"}, {"source", {{"path", path.string()}}}, {"fixed", true}},
+        }), false);
+        path = files.dir / ("nested" + std::to_string(depth) + ".step+");
+        doc_save(current, path.string());
+    }
+    const auto cleared = set_appearance(id, {{"faces", {selected}}, {"color", nullptr}}).at("tree");
+    CHECK_FALSE(cleared.contains("face_appearances"));
+    check_compiled(cleared, false);
+    const auto restored = doc_tessellate_bodies(id);
+    for (const auto& face : restored.at(0).faces.vec())
+        check_face_appearance(restored[0], face.face_id, direct[0]);
+}
+
+TEST_CASE("selected face finish: queried bores and bosses match viewport picks in a multibody part") {
+    using namespace chudware::doc;
+    const auto id = make_box_doc();
+    doc_apply_ops(id, -1, json::array({
+        {{"op", "add_feature"}, {"feature", {{"type", "cylinder"},
+            {"params", {{"radius", 10}, {"height", 20}, {"mode", "new"}}}}}},
+        {{"op", "add_feature"}, {"feature", {{"type", "cylinder"},
+            {"params", {{"radius", 5}, {"height", 20}, {"mode", "cut"}}}}}},
+        {{"op", "set_appearance"}, {"id", "b2"}, {"color", {0.1, 0.2, 0.8}}},
+    }), false);
+    const auto queried = doc_query(id, {
+        {"of", "face"}, {"body_id", 2}, {"surf", "cylinder"}}).at("matches");
+    REQUIRE(queried.size() == 2);
+    for (const auto& selected : queried) {
+        const bool bore = selected.at("concavity") == "bore";
+        set_appearance(id, {{"id", "b2"}, {"faces", {selected}},
+            {"color", {bore ? 0.9 : 0.4, 0.05, 0.1}}, {"metallic", 0.95}, {"roughness", 0.12}});
+    }
+    const auto bodies = doc_tessellate_bodies(id);
+    REQUIRE(bodies.size() == 2);
+    CHECK(bodies[0].appearance_regions.empty());
+    for (const auto& face : bodies[1].faces.vec()) {
+        const auto picked = doc_resolve_pick(id, 2, "face", face.face_id).at("selector");
+        const auto appearance = face_appearance(bodies[1], face.face_id);
+        if (picked.at("surf") == "cylinder") {
+            const bool bore = picked.at("concavity") == "bore";
+            CHECK(appearance.color[0] == Approx(bore ? 0.9 : 0.4));
+            CHECK(appearance.metallic == Approx(0.95));
+            CHECK(appearance.roughness == Approx(0.12));
+            // Clearing through a viewport pick must remove the finish authored by query.
+            set_appearance(id, {{"id", "b2"}, {"faces", {picked}}, {"color", nullptr}});
+        } else {
+            CHECK(appearance.color[0] == Approx(0.1));
+        }
+    }
+    CHECK_FALSE(doc_tree(id).at("tree").contains("face_appearances"));
+    CHECK(doc_tessellate_bodies(id).at(1).appearance_regions.empty());
+}
+
+TEST_CASE("selected face finish: unknown and colliding SIDs reject the entire transaction") {
+    using namespace chudware::doc;
+    const auto id = make_box_doc();
+    const auto shape = compile_document(doc_tree(id).at("tree"), json::object()).shapes.at(0);
+    const auto sid = face_sid_inventory(shape).begin()->first;
+    const auto before = doc_tree(id);
+    CHECK_THROWS_AS(set_appearance(id, {{"faces", {sid, "Fffffff"}}, {"color", {1, 0, 0}}}), OpError);
+    CHECK(doc_tree(id) == before);
+    CHECK_THROWS_AS(set_appearance(id, {{"faces", json::array()}, {"color", {1, 0, 0}}}), OpError);
+    CHECK_THROWS_AS(set_appearance(id, {{"faces", {1}}, {"color", {1, 0, 0}}}), OpError);
+    CHECK_THROWS_AS(set_appearance(id, {{"faces", {{{"kind", "edge"}, {"sid", sid}}}},
+                                        {"color", {1, 0, 0}}}), OpError);
+    const auto fid = before.at("tree").at("features").at(0).at("id");
+    doc_apply_ops(id, -1, json::array({
+        {{"op", "edit_feature"}, {"id", fid}, {"params", {{"height", 0.02}}}},
+    }), false);
+    const auto thin = doc_tree(id);
+    const auto thin_shape = compile_document(thin.at("tree"), json::object()).shapes.at(0);
+    const auto inventory = face_sid_inventory(thin_shape);
+    std::string collision;
+    for (const auto& [key, candidates] : inventory)
+        if (candidates.size() > 1) { collision = key; break; }
+    REQUIRE_FALSE(collision.empty()); // opposite faces round onto the same SID grid
+    CHECK_THROWS_AS(doc_apply_ops(id, -1, json::array({
+        {{"op", "set_material"}, {"key", "steel_a36"}},
+        {{"op", "set_appearance"}, {"id", "b1"}, {"faces", {collision}}, {"color", {1, 0, 0}}},
+    }), false), OpError);
+    CHECK(doc_tree(id) == thin);
+}
+
+TEST_CASE("selected face finish: exact fingerprints distinguish faces sharing a SID") {
+    using namespace chudware::doc;
+    const auto id = make_box_doc();
+    AppearanceFiles files(id);
+    const auto fid = doc_tree(id).at("tree").at("features").at(0).at("id");
+    doc_apply_ops(id, -1, json::array({
+        {{"op", "edit_feature"}, {"id", fid}, {"params", {{"height", 0.02}}}},
+    }), false);
+    const auto shape = compile_document(doc_tree(id).at("tree"), json::object()).shapes.at(0);
+    const auto inventory = face_sid_inventory(shape);
+    std::vector<std::pair<uint32_t, json>> collision;
+    for (const auto& [sid, candidates] : inventory)
+        if (candidates.size() == 2) { collision = candidates; break; }
+    REQUIRE(collision.size() == 2);
+    const auto first = collision[0].second, second = collision[1].second;
+    set_appearance(id, {{"faces", {first}}, {"color", {1, 0, 0}}});
+    set_appearance(id, {{"faces", {second}}, {"color", {0, 1, 0}}});
+    auto check_colors = [&](const std::string& current, bool first_painted, bool second_painted) {
+        const auto bodies = doc_tessellate_bodies(current);
+        REQUIRE(bodies.size() == 1);
+        const auto live_shape = compile_document(doc_tree(current).at("tree"), json::object()).shapes.at(0);
+        const auto live_inventory = face_sid_inventory(live_shape);
+        for (const auto& [face_id, selector] : live_inventory.at(first.at("sid").get<std::string>())) {
+            const auto appearance = face_appearance(bodies[0], face_id);
+            const bool red = selector == first && first_painted;
+            const bool green = selector == second && second_painted;
+            CHECK(appearance.color[0] == Approx(red ? 1.0 : green ? 0.0 : bodies[0].color[0]));
+            CHECK(appearance.color[1] == Approx(green ? 1.0 : red ? 0.0 : bodies[0].color[1]));
+        }
+    };
+    check_colors(id, true, true);
+    const auto path = files.dir / "colliding_face_finishes.step+";
+    doc_save(id, path.string());
+    const std::string reopened = doc_open(path.string()).at("doc_id");
+    check_colors(reopened, true, true);
+    set_appearance(reopened, {{"faces", {first}}, {"color", nullptr}});
+    check_colors(reopened, false, true);
+    set_appearance(reopened, {{"faces", {first}}, {"color", {1, 0, 0}}});
+    auto stale = second;
+    stale["centroid"][2] = 0.021;
+    const auto before = doc_tree(reopened);
+    CHECK_THROWS_AS(set_appearance(reopened, {{"faces", {stale}}, {"color", {0, 0, 1}}}), OpError);
+    CHECK(doc_tree(reopened) == before);
+    set_appearance(reopened, {{"faces", {first.at("sid")}}, {"color", nullptr}});
+    check_colors(reopened, false, false);
+}
+
+TEST_CASE("selected face finish: stale fingerprints are inert even when a changed face keeps its SID") {
+    using namespace chudware::doc;
+    const auto id = make_box_doc();
+    const auto selected = doc_query(id, {{"of", "face"}, {"side", "top"}}).at("matches").at(0);
+    const auto sid = selected.at("sid");
+    set_appearance(id, {{"faces", {selected}}, {"color", {1, 0, 0}}});
+    const auto tree = doc_tree(id).at("tree");
+    const auto fid = tree.at("features").at(0).at("id");
+    doc_apply_ops(id, -1, json::array({
+        {{"op", "edit_feature"}, {"id", fid}, {"params", {{"height", 12.02}}}},
+    }), false);
+    const auto now = doc_query(id, {{"of", "face"}, {"side", "top"}}).at("matches").at(0);
+    CHECK(now.at("sid") == sid);
+    const auto bodies = doc_tessellate_bodies(id);
+    REQUIRE(bodies.size() == 1);
+    CHECK(bodies[0].appearance_regions.empty());
+    CHECK(doc_tree(id).at("tree").at("face_appearances") == tree.at("face_appearances"));
+    set_appearance(id, {{"faces", {sid}}, {"color", nullptr}});
+    CHECK_FALSE(doc_tree(id).at("tree").contains("face_appearances"));
+    // A new assignment must resolve against geometry AFTER all ops, not the old ordinal.
+    const auto before = doc_tree(id);
+    CHECK_THROWS_AS(doc_apply_ops(id, -1, json::array({
+        {{"op", "set_appearance"}, {"id", "b1"}, {"faces", {sid}}, {"color", {1, 0, 0}}},
+        {{"op", "edit_feature"}, {"id", fid}, {"params", {{"height", 20}}}},
+    }), false), OpError);
+    CHECK(doc_tree(id) == before);
+}
 
 TEST_CASE("set_appearance: full material (color+metallic+roughness) writes doc and bakes onto body") {
     std::string id = make_box_doc();
@@ -326,4 +559,44 @@ TEST_CASE("assembly appearance: a descendant edit invalidates the outer saved di
     CHECK(color[0].get<float>() == Approx(0.05f));
     CHECK(color[2].get<float>() == Approx(0.9f));
     REQUIRE(doc_close(after.at("doc_id").get<std::string>()));
+}
+
+TEST_CASE("selected face finish: an older display-cache epoch cannot hide a saved override") {
+    using namespace chudware::doc;
+    const auto id = make_box_doc();
+    AppearanceFiles files(id);
+    const auto path = files.dir / "old_face_cache.step+";
+    set_appearance(id, {{"color", {0.1, 0.2, 0.8}}});
+    doc_save(id, path.string());
+    const auto unpainted_mesh = stepplus_open(path.string()).extra.at("cache.aicm");
+    const auto compiled = compile_document(doc_tree(id).at("tree"), json::object());
+    REQUIRE(compiled.ok);
+    const auto inventory = face_sid_inventory(compiled.shapes.at(0));
+    REQUIRE(inventory.size() == 6);
+    const auto selected = inventory.begin()->first;
+    const auto face_id = inventory.begin()->second.at(0).first;
+    set_appearance(id, {{"faces", {selected}}, {"color", {0.9, 0.05, 0.1}}});
+    doc_save(id, path.string());
+    auto stored = stepplus_open(path.string());
+    auto header = json::parse(stored.extra.at("cache.json"));
+    // A prior writer preserves unknown document fields but does not render them.
+    // Its otherwise matching cache must not supersede the authored face finish.
+    header["engine"] = "chudware-geomcache/2;occt=" OCC_VERSION_COMPLETE;
+    stored.extra["cache.json"] = header.dump();
+    stored.extra["cache.aicm"] = unpainted_mesh;
+    stepplus_save(stored.doc, path.string(), stored.extra);
+    REQUIRE(doc_close(id));
+    const auto reopened = doc_open(path.string());
+    CHECK_FALSE(reopened.value("cache_hit", false));
+    // Inspect the immediate host display, before any lazy geometry recompilation.
+    render::DocMesh mesh;
+    std::string error;
+    REQUIRE(render::loadAicmFile(reopened.at("tess").at("aicm_path"), mesh, error));
+    REQUIRE(mesh.bodies.size() == 1);
+    float red = mesh.bodies[0].color[0];
+    for (const auto& region : mesh.bodies[0].appearance_regions)
+        if (face_id >= region.first_face && face_id - region.first_face < region.face_count)
+            red = region.color[0];
+    CHECK(red == Approx(0.9));
+    REQUIRE(doc_close(reopened.at("doc_id").get<std::string>()));
 }

@@ -23,8 +23,7 @@ class _Tools:
 
 @pytest.mark.parametrize("background", [False, True])
 @pytest.mark.parametrize("phase", [
-    "doc_list", "doc_checkpoint", "doc_query", "clone_replay", "clone_proposed",
-    "doc_close", "live_apply",
+    "doc_list", "doc_checkpoint", "doc_query", "doc_dry_run_ops", "live_apply",
 ])
 def test_registered_mutation_stops_at_connection_loss(monkeypatch, phase, background):
     tools = _Tools()
@@ -37,21 +36,16 @@ def test_registered_mutation_stops_at_connection_loss(monkeypatch, phase, backgr
     monkeypatch.setattr(cad_common, "_DOC_ALIASES", {})
     calls = []
     live_mutations = []
-    clone_applies = 0
     failed = False
     detail = {"method": "doc_apply_ops", "outcome": "unknown", "retryable": False}
 
     def engine(method, params=None):
-        nonlocal clone_applies, failed
+        nonlocal failed
         params = params or {}
         stage = method
         if method == "doc_apply_ops":
-            if params.get("doc_id") == "clone":
-                clone_applies += 1
-                stage = "clone_replay" if clone_applies == 1 else "clone_proposed"
-            else:
-                stage = "live_apply"
-                live_mutations.append(params)
+            stage = "live_apply"
+            live_mutations.append(params)
         calls.append(stage)
         if failed:
             pytest.fail(f"engine called after ambiguous loss: {stage}")
@@ -63,12 +57,12 @@ def test_registered_mutation_stops_at_connection_loss(monkeypatch, phase, backgr
             )
         if method == "doc_list":
             return {"docs": [{"doc_id": "live", "name": "Part"}]}
-        if method == "doc_new":
-            return {"doc_id": "clone"}
         if method == "doc_checkpoint":
             return {"checkpoint": "before"}
         if method == "doc_tree":
             return {"revision": 1, "tree": {"name": "Part", "features": []}}
+        if method == "doc_dry_run_ops":
+            return {"ok": True, "source_revision": 1, "rebuild": {"feature_status": []}}
         if method == "doc_apply_ops":
             return {"revision": 1, "rebuild": {"feature_status": []}}
         return {}

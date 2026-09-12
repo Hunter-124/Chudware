@@ -561,3 +561,76 @@ class TestPrefill:
         vals, prov = prefill_inputs("nonexistent", "doc1", querier=q)
         assert vals == {}
         assert prov == {}
+
+
+class TestBeltRoute:
+    @staticmethod
+    def pulley(x, y, radius, wrap="ccw"):
+        return {"center_mm": [x, y], "pitch_radius_mm": radius, "wrap": wrap}
+
+    @pytest.mark.parametrize("centers,radii,expected", [
+        ([(0, 0), (100, 0)], [10, 10], 200 + 20 * math.pi),
+        ([(0, 0), (100, 0)], [10, 20],
+         2 * math.sqrt(100**2 - 10**2) + 30 * math.pi + 20 * math.asin(.1)),
+        ([(0, 0), (100, 0), (50, 80)], [10, 10, 10],
+         100 + 2 * math.hypot(50, 80) + 20 * math.pi),
+    ])
+    def test_open_tangents_and_convex_hull_arcs(self, centers, radii, expected):
+        result = run_calc("belt_route", {"pulleys": [
+            self.pulley(*center, radius) for center, radius in zip(centers, radii)]})
+        assert result["ok"], result
+        answer = result["answer"]
+        assert answer["length_mm"] == pytest.approx(expected, rel=1e-12)
+        assert answer["straight_length_mm"] + answer["arc_length_mm"] == pytest.approx(expected)
+
+    def test_backside_wrap_and_reversed_travel_preserve_exact_tangency(self):
+        pulleys = [self.pulley(0, 0, 10), self.pulley(100, 0, 10),
+                   self.pulley(50, 0, 5, "cw")]
+        # Two internal tangents meet a backside idler. This is not the
+        # convex-hull perimeter and the idler's wrap subtracts from winding.
+        expected = (100 + 2 * math.sqrt(50**2 - 15**2)
+                    + 20 * math.pi + 30 * math.asin(.3))
+        answer = run_calc("belt_route", {"pulleys": pulleys})["answer"]
+        assert answer["length_mm"] == pytest.approx(expected, rel=1e-12)
+        assert answer["wraps"][2]["angle_deg"] == pytest.approx(math.degrees(2 * math.asin(.3)))
+        for span in answer["spans"]:
+            a, b = span["start_mm"], span["end_mm"]
+            tangent = [b[k] - a[k] for k in (0, 1)]
+            assert math.hypot(*tangent) == pytest.approx(span["length_mm"])
+            for endpoint, index in ((a, span["from_pulley"]), (b, span["to_pulley"])):
+                circle = pulleys[index]
+                radius = [endpoint[k] - circle["center_mm"][k] for k in (0, 1)]
+                assert math.hypot(*radius) == pytest.approx(circle["pitch_radius_mm"])
+                assert sum(radius[k] * tangent[k] for k in (0, 1)) == pytest.approx(0, abs=1e-10)
+        reverse = [{**row, "wrap": "cw" if row["wrap"] == "ccw" else "ccw"}
+                   for row in reversed(pulleys)]
+        reversed_answer = run_calc("belt_route", {"pulleys": reverse})["answer"]
+        assert reversed_answer["length_mm"] == pytest.approx(expected, rel=1e-12)
+        assert reversed_answer["signed_wrap_rad"] == pytest.approx(-2 * math.pi)
+
+    @pytest.mark.parametrize("idler_y", [-8, -5])
+    def test_backside_route_cannot_cut_or_kiss_the_other_span(self, idler_y):
+        result = run_calc("belt_route", {"pulleys": [
+            self.pulley(0, 0, 10), self.pulley(100, 0, 10),
+            self.pulley(50, idler_y, 5, "cw")]})
+        assert not result["ok"]
+        assert "answer" not in result
+
+    def test_crossed_belt_is_not_reported_as_a_simple_planar_loop(self):
+        result = run_calc("belt_route", {"pulleys": [
+            self.pulley(0, 0, 10), self.pulley(100, 0, 10, "cw")]})
+        assert not result["ok"]
+        assert "answer" not in result
+
+    def test_nested_circles_have_no_positive_tangent(self):
+        result = run_calc("belt_route", {"pulleys": [
+            self.pulley(0, 0, 10), self.pulley(5, 0, 20)]})
+        assert not result["ok"]
+        assert "answer" not in result
+
+    @pytest.mark.parametrize("value", [True, float("nan")])
+    def test_invalid_pitch_radius_cannot_become_a_length(self, value):
+        result = run_calc("belt_route", {"pulleys": [
+            self.pulley(0, 0, value), self.pulley(100, 0, 10)]})
+        assert not result["ok"]
+        assert "answer" not in result

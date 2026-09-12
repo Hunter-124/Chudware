@@ -1894,6 +1894,8 @@ if(CHUDWARE_WITH_OCCT)
   # bodies; the test drives the op end to end (doc field + both tess paths + .step+ round-trip).
   add_executable(test_appearance
     tests/test_appearance.cpp)
+  target_sources(test_appearance PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../ui/viewport/render/aicm_loader.cpp)
   target_include_directories(test_appearance PRIVATE
     ${doctest_SOURCE_DIR}
     ${OpenCASCADE_INCLUDE_DIR})

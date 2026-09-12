@@ -1,10 +1,10 @@
 """Deliverable project-save tests (CHUDWARE_PROJECT_SAVE_DIR).
 
 When the agent worker jails a run to a user's project folder it sets
-CHUDWARE_PROJECT_SAVE_DIR; new_part and the successful add_features path then write the
-doc as a real, openable native .step+ at <dir>/<safe_stem>.step+ and report it back as
-`saved_path`. Unset (the default) must change nothing, and a failed save must never fail
-the tool call. These run WITHOUT an engine: core_bridge.call is faked.
+CHUDWARE_PROJECT_SAVE_DIR; new_part and the successful add_features path then refresh the
+doc's chosen native destination (or assign <dir>/<safe_stem>.step+ to a fresh document).
+Unset configuration changes nothing. Ordinary save failures are best-effort, but engine
+connection loss propagates. These run WITHOUT an engine: core_bridge.call is faked.
 
 Run:  python3 -m pytest services/mcp/test_project_save.py -q -p no:randomly
 """
@@ -31,6 +31,7 @@ class _FakeEngine:
 
     def __init__(self):
         self.names: dict = {}
+        self.paths: dict = {}
         self.saves: list = []
         self.exports: list = []
 
@@ -40,7 +41,8 @@ class _FakeEngine:
             self.names[_DOC] = p.get("name") or "part"
             return {"doc_id": _DOC, "revision": 0}
         if method == "doc_list":
-            return {"docs": [{"doc_id": d, "name": n, "revision": 1}
+            return {"docs": [{"doc_id": d, "name": n, "revision": 1,
+                              "path": self.paths.get(d)}
                              for d, n in self.names.items()]}
         if method == "asm_world_bodies":
             return {"bodies": [{"name": "Block"}]}
@@ -48,6 +50,8 @@ class _FakeEngine:
             path = p.get("path")
             self.saves.append(path)
             Path(path).write_text("STEP+ fake payload")
+            if not p.get("preserve_path"):
+                self.paths[p["doc_id"]] = path
             return {"path": path}
         if method == "export_file":
             path = p.get("path")
@@ -72,6 +76,8 @@ def engine(monkeypatch, tmp_path):
     monkeypatch.setattr(C.cb, "call", fake.call)
     # Keep the crash-recovery autosave hermetic too (add_features still calls _autosave).
     monkeypatch.setenv("CHUDWARE_AUTOSAVE_DIR", str(tmp_path / "autosave"))
+    monkeypatch.setenv("CHUDWARE_HANDOFF_DIR", str(tmp_path / "handoff"))
+    monkeypatch.setenv("CHUDWARE_ENGINE_DAEMON", "1")
     yield fake
 
 
@@ -200,11 +206,92 @@ def test_project_save_never_raises_on_engine_failure(engine, monkeypatch, tmp_pa
     assert r["ok"] is True and "saved_path" not in r
 
 
-def test_stem_falls_back_to_doc_id(monkeypatch, tmp_path):
+def test_stem_falls_back_to_doc_id(engine, monkeypatch, tmp_path):
     monkeypatch.setenv("CHUDWARE_PROJECT_SAVE_DIR", str(tmp_path))
-    path = C._project_save(_DOC, "!!!...")
-    # engine fake has no doc named _DOC registered via new_part here, but doc_list is
-    # best-effort; the stem must fall back to the doc_id, not produce an empty name.
-    assert path is None or path.endswith(".step+")
-    assert C._project_save_stem("!!!...", _DOC) == _DOC
+    engine.names[_DOC] = "!!!..."
+    assert C._project_save(_DOC) == str(tmp_path / f"{_DOC}.step+")
+    assert (tmp_path / f"{_DOC}.step+").is_file()
     assert C._project_save_stem("a b-c_d", _DOC) == "a_b-c_d"
+
+
+def test_project_save_preserves_chosen_destination_even_with_supplied_name(
+        engine, monkeypatch, tmp_path):
+    project = tmp_path / "project"
+    destination = tmp_path / "teammate bundle" / "chosen.step+"
+    destination.parent.mkdir()
+    monkeypatch.setenv("CHUDWARE_PROJECT_SAVE_DIR", str(project))
+    engine.names[_DOC] = "assembly"
+    engine.call("doc_save", {"doc_id": _DOC, "path": str(destination)})
+
+    written = C._project_save(_DOC, "renamed assembly")
+
+    assert written == str(destination)
+    assert engine.paths[_DOC] == str(destination)
+    assert not project.exists()
+
+
+@pytest.mark.parametrize("origin", ["detached", "mcp", "hostd", "orphan", "handoff"])
+def test_recovery_or_detached_doc_gets_project_deliverable(
+        engine, monkeypatch, tmp_path, origin):
+    from services import paths
+
+    project = tmp_path / "project"
+    data = tmp_path / "data"
+    monkeypatch.setattr(paths, "data_roots", lambda: [data])
+    monkeypatch.setenv("CHUDWARE_PROJECT_SAVE_DIR", str(project))
+    engine.names[_DOC] = "recovered"
+    candidates = {
+        "detached": None,
+        "mcp": tmp_path / "autosave" / "session-doc.step+",
+        "hostd": data / "hostd_autosave" / "instance" / "session" / "doc.step+",
+        "orphan": data / "hostd_autosave" / "instance" / "orphaned" / "doc.step+",
+        "handoff": tmp_path / "handoff" / "live-session-doc.step+",
+    }
+    prior = candidates[origin]
+    if prior is not None:
+        prior.parent.mkdir(parents=True, exist_ok=True)
+        prior.write_text("recovery evidence")
+        engine.paths[_DOC] = str(prior)
+
+    written = C._project_save(_DOC, "recovered")
+
+    assert written == str(project / "recovered.step+")
+    assert engine.paths[_DOC] == written
+    if prior is not None:
+        assert prior.read_text() == "recovery evidence"
+
+
+def test_recovery_directory_prefix_is_still_a_real_destination(
+        engine, monkeypatch, tmp_path):
+    monkeypatch.setenv("CHUDWARE_PROJECT_SAVE_DIR", str(tmp_path / "project"))
+    destination = tmp_path / "autosave_deliverables" / "chosen.step+"
+    destination.parent.mkdir()
+    engine.names[_DOC] = "chosen"
+    engine.call("doc_save", {"doc_id": _DOC, "path": str(destination)})
+
+    assert C._project_save(_DOC) == str(destination)
+
+
+@pytest.mark.parametrize("code", ["engine_connection_lost", "io_error"])
+def test_metadata_failure_never_guesses_a_new_destination(
+        engine, monkeypatch, tmp_path, code):
+    monkeypatch.setenv("CHUDWARE_PROJECT_SAVE_DIR", str(tmp_path / "project"))
+
+    class MetadataFailure(RuntimeError):
+        pass
+
+    failure = MetadataFailure("document metadata unavailable")
+    failure.code = code
+
+    def unavailable(method, params=None):
+        if method == "doc_list":
+            raise failure
+        return engine.call(method, params)
+
+    monkeypatch.setattr(C.cb, "call", unavailable)
+    if code == "engine_connection_lost":
+        with pytest.raises(MetadataFailure):
+            C._project_save(_DOC, "supplied name")
+    else:
+        assert C._project_save(_DOC, "supplied name") is None
+    assert engine.saves == []

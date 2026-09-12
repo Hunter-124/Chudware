@@ -33,15 +33,16 @@ PrivateTmp=yes
 PrivateDevices=yes
 ProtectSystem=strict
 ProtectHome=read-only
-# The gateway has four explicit writable roots under ProtectHome=read-only:
+# The gateway has five explicit writable roots under ProtectHome=read-only:
 # - chudware-web-data: database/config/runtime data
 # - chudware-web: staged web daemon data
 # - ME489: per-identity bucket roots
+# - Documents/ME489/.../CAD_Build: configured CAD workspaces, including new accounts
 # - chudware-releases: signed release staging (`incoming/`) and published installers
 #
 # Omitting the release root made `/api/releases/ci/upload/*` fail with EROFS even though
 # Unix ownership/mode were correct, so a multi-hour nightly build could never publish.
-ReadWritePaths=%h/chudware-web-data %h/chudware-web %h/ME489 %h/chudware-releases
+ReadWritePaths=%h/chudware-web-data %h/chudware-web %h/ME489 %h/chudware-releases %h/Documents/ME489/Crimson_Crankers_Program/01_Design_Package/CAD_Build
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectKernelLogs=yes

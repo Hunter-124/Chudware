@@ -530,7 +530,15 @@ def _authorize_daemon_response(
         message = json.loads(line)
     except ValueError:
         return line
-    if not isinstance(message, dict) or "id" not in message:
+    if not isinstance(message, dict):
+        return line
+    if "id" not in message:
+        # Registry notifications are broadcast by the shared daemon. Apply the
+        # same document capabilities as requests before exposing titles/snapshots.
+        event_doc_ids: list[str] = []
+        _collect_doc_ids(message, event_doc_ids)
+        if any(doc_id not in capabilities for doc_id in event_doc_ids):
+            return None
         return line
     request = pending.pop(message.get("id"), None)
     if request is None:

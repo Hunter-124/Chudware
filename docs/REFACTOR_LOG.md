@@ -4013,6 +4013,27 @@ release files or restarting services. The targeted artifact/deployment suite
 passes 27 cases and all nine source gates pass. Removed source-text/wording and
 incidental checked-in pin assertions rather than repinning brittle tests.
 
+Promotion `34691023676` deployed `c0fbc8628` successfully, including running-daemon
+verification. Live touch-emulated Chrome then exposed a separate startup abort:
+gateway logs recorded unauthorized document requests while another account was
+connected. Registry notifications bypassed response authorization, exposing a
+foreign `doc.opened` title and triggering an unauthorized mirror request. The
+gateway now applies existing document capabilities to nested notification IDs.
+The regression failed with a leaked private title before the fix and passes
+with authorized updates delivered and foreign events withheld.
+
+`engine_backend.cpp` also treated every error code as a string, although the
+gateway emits numeric JSON-RPC codes. A real IPC probe reproduced type_error.302;
+the fixed backend preserves the numeric refusal without throwing, and both
+loading retries and read-only upgrades still succeed. No exception-catching flag
+or authorization relaxation was introduced.
+
+Production logs additionally showed EROFS when creating a new account workspace.
+The production gateway unit now grants its existing default CAD workspace root
+write access, not all of Documents. An actual systemd sandbox probe reproduced
+EROFS before the change; afterward workspace writes succeed while an unrelated
+Documents directory remains read-only. Staging's write grants are unchanged.
+
 ## 2026-09-11 — independent body material persistence
 
 Fixed a production Chudware session reproduction where `set_material("A36",

@@ -281,14 +281,15 @@ static bool callDispatch(chudware_ipc::EngineClient* cl, const std::string& meth
     if (!daemonMode()) return core::cpp_core().call(method, params, result, err);
     bool ok = cl->call(method, params, result, err, timeoutMs, onEvent);
     if (!ok && result.is_object()) {
-        const std::string code = result.value("code", std::string());
-        if (code == "loading") {
+        const auto code = result.find("code");
+        if (code != result.end() && *code == "loading") {
             std::string werr;
             if (waitEngineReady(*cl, werr))
                 ok = cl->call(method, params, result, err, timeoutMs, onEvent);
             else if (err.empty())
                 err = werr;
-        } else if (code == "read_only" && params.is_object() && params.contains("doc_id")) {
+        } else if (code != result.end() && *code == "read_only" &&
+                   params.is_object() && params.contains("doc_id")) {
             // The user edited a doc this client only VIEWS (an agent's mirror
             // tab): human steering wins — upgrade the attach to rw and retry
             // once. Documented Phase 4 choice: auto-upgrade over new UI.

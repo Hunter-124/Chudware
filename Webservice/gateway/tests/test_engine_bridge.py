@@ -77,12 +77,22 @@ class FakeDaemon:
         self._loop = loop
         asyncio.set_event_loop(loop)
 
-        async def boot() -> None:
-            await asyncio.start_unix_server(self._client, path=str(self.sock_path))
+        async def boot() -> asyncio.AbstractServer:
+            server = await asyncio.start_unix_server(self._client, path=str(self.sock_path))
             self._started.set()
+            return server
 
-        loop.run_until_complete(boot())
-        loop.run_forever()
+        server = loop.run_until_complete(boot())
+        try:
+            loop.run_forever()
+        finally:
+            server.close()
+            loop.run_until_complete(server.wait_closed())
+            pending = asyncio.all_tasks(loop)
+            for task in pending:
+                task.cancel()
+            loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+            loop.close()
 
     async def _client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         self._writers.append(writer)
@@ -111,7 +121,9 @@ class FakeDaemon:
                         "revision": 0,
                     }
                     result = {"doc_id": doc_id, "revision": 0}
-                    await self._broadcast({"event": "doc.opened", "doc_id": doc_id})
+                    await self._broadcast(
+                        {"event": "doc.opened", "data": {"doc_id": doc_id, "name": self.docs[doc_id]["name"]}}
+                    )
                 elif method == "doc_list":
                     result = {"docs": list(self.docs.values())}
                 elif method == "doc_close":
@@ -119,7 +131,7 @@ class FakeDaemon:
                 elif method == "doc_apply_ops":
                     result = {"ok": True, "revision": 1}
                     await self._broadcast(
-                        {"event": "doc.changed", "doc_id": params.get("doc_id"), "revision": 1}
+                        {"event": "doc.changed", "data": {"doc_id": params.get("doc_id"), "revision": 1}}
                     )
                 elif method == "agent_ask_v2" and params.get("_test_emit_usage"):
                     event = {
@@ -240,19 +252,25 @@ class TestEngineBridge:
         assert hello["user"] == {"id": "demo@example.com", "display": "Demo User"}
         assert hello["pid"] == 42  # untouched passthrough
 
-    def test_rpc_roundtrip_and_event_fanout(self, daemon, client):
-        with client.websocket_connect("/engine", headers=DEV_HEADERS) as ws1:
-            _rpc(ws1, 1, "hello")
-            with client.websocket_connect("/engine", headers=ADMIN_HEADERS) as ws2:
-                _rpc(ws2, 1, "hello")
-                assert _rpc(ws1, 2, "ping")["result"]["pong"] is True
-                resp = _rpc(ws1, 3, "doc_new", {"name": "Part1"})
-                assert resp["result"]["doc_id"] == "d1"
-                resp = _rpc(ws1, 4, "doc_apply_ops", {"doc_id": "d1", "ops": []})
-                assert resp["result"]["revision"] == 1
-                # ws2 sees the daemon's fanout events (id-less lines).
-                events = [json.loads(ws2.receive_text())["event"] for _ in range(2)]
-                assert events == ["doc.opened", "doc.changed"]
+    def test_document_events_do_not_cross_account_boundaries(self, daemon, client):
+        with client.websocket_connect("/engine", headers=DEV_HEADERS) as owner:
+            _rpc(owner, 1, "hello")
+            with client.websocket_connect("/engine", headers=ADMIN_HEADERS) as other:
+                _rpc(other, 1, "hello")
+                doc_id = _rpc(owner, 2, "doc_new", {"name": "Private Part"})["result"]["doc_id"]
+                owner.send_json(
+                    {"id": 3, "method": "doc_apply_ops", "params": {"doc_id": doc_id, "ops": []}}
+                )
+                changed = owner.receive_json()
+                assert changed["event"] == "doc.changed"
+                assert changed["data"]["doc_id"] == doc_id
+                assert owner.receive_json()["result"]["revision"] == 1
+
+                # The daemon wrote both events before this ping. A plain next-frame
+                # read proves neither the private title nor its update leaked.
+                other.send_json({"id": 2, "method": "ping", "params": {}})
+                assert other.receive_json() == {"id": 2, "result": {"pong": True}}
+                assert _rpc(other, 3, "doc_tree", {"doc_id": doc_id})["error"]["code"] == -32004
 
     def test_document_capabilities_isolate_accounts_and_reconnect(
         self, daemon, tmp_path, monkeypatch

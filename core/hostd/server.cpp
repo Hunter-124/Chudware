@@ -1062,11 +1062,10 @@ bool Server::agentWorkInFlight() const {
 // Background watchdog: force-restart the daemon when a tracked engine call blows its tier's
 // ceiling (engine_watchdog.h). An OCCT call cannot be interrupted in-process, so a genuine hang
 // is only recoverable by ending the process; systemd (Restart=on-failure) respawns and docs
-// recover from autosave (explicit/user-gated — no auto-replay loop). Interactive rebuilds trip
-// the fast ceiling. Sims/agents/exports/imports/opens/saves are still exempt from THAT, but no
-// longer from every ceiling: they answer to the far more generous long ceiling, whose only job
-// is to make sure a call that will never return cannot hold inflight above 0 and lock the
-// daemon out of idle-exit permanently.
+// recover from autosave (explicit/user-gated — no auto-replay loop). Bounded non-modeling calls
+// use the fast ceiling; modeling/rebuilds, sims, agents and I/O use the long ceiling. Rebuild
+// cost scales with document size, including shadow preflight and cold activation. Both tiers
+// remain bounded so a hung call cannot prevent idle exit permanently.
 void Server::watchdogLoop() {
     const long long longCeilingMs = engineWatchdogLongMs();
     while (!stopping_.load()) {

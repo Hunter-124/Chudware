@@ -826,3 +826,78 @@ TEST_CASE("mesher: plain STEP bar follows requested size without a feature flood
     }
     std::filesystem::remove(step);
 }
+
+TEST_CASE("local refine: centroid grading leaves the distant background alone") {
+    const auto step = write_step(
+        BRepPrimAPI_MakeCylinder(8.0, 60.0).Shape(), "bounded_local_band");
+    MeshOptions options;
+    options.order = 2;
+    options.target_size_mm = 4.0;
+    const auto background = mesh_step(step, options);
+    check_mesh_quality(background, "local-band background");
+
+    options.local_refine.size_mm = 0.5;
+    options.local_refine.band_mm = 1.5;
+    options.local_refine.label = "end-face seating";
+    for (int x = -2; x <= 2; ++x)
+        for (int y = -2; y <= 2; ++y)
+            options.local_refine.points.insert(
+                options.local_refine.points.end(),
+                {static_cast<double>(x), static_cast<double>(y), 0.0});
+    SUBCASE("explicit depth bounds the transition") {
+        options.local_refine.max_depth_mm = 1.5;
+    }
+    SUBCASE("unset depth stops where grading reaches the background") {
+        options.local_refine.max_depth_mm = 0.0;
+    }
+    const auto refined = mesh_step(step, options);
+    check_mesh_quality(refined, "bounded local band");
+    INFO(refined.note);
+    CHECK(refined.local_refine_achieved_mm <=
+          chudware::sim::kLocalContractSlack * options.local_refine.size_mm);
+    REQUIRE(refined.local_refine_waves > 0);
+    REQUIRE(refined.local_refine_outside_transition_checks > 0);
+    CHECK(refined.local_refine_outside_transition_marks == 0);
+    if (options.local_refine.max_depth_mm > 0.0)
+        CHECK(refined.local_refine_transition_depth_mm <=
+              options.local_refine.max_depth_mm * (1.0 + 1e-12));
+
+    // Distant curved-boundary cells include edges longer than the background
+    // target. A local request must not globally chase those edges down to h.
+    const auto far_cells = [](const MeshOut &mesh) {
+        std::vector<double> longest;
+        for (int e = 0; e < mesh.n_elems; ++e) {
+            std::array<int, 4> nodes{};
+            bool far = true;
+            for (int a = 0; a < 4; ++a) {
+                nodes[a] = mesh.tets[e * mesh.nodes_per_elem + a];
+                far &= mesh.points[3 * nodes[a] + 2] > 30.0;
+            }
+            if (!far) continue;
+            double length2 = 0.0;
+            for (int a = 0; a < 4; ++a)
+                for (int b = a + 1; b < 4; ++b) {
+                    double edge2 = 0.0;
+                    for (int axis = 0; axis < 3; ++axis) {
+                        const double d = mesh.points[3 * nodes[a] + axis] -
+                                         mesh.points[3 * nodes[b] + axis];
+                        edge2 += d * d;
+                    }
+                    length2 = std::max(length2, edge2);
+                }
+            longest.push_back(std::sqrt(length2));
+        }
+        REQUIRE_FALSE(longest.empty());
+        return std::make_pair(longest.size(),
+                              *std::max_element(longest.begin(), longest.end()));
+    };
+    const auto before = far_cells(background);
+    const auto after = far_cells(refined);
+    MESSAGE("distant cells " << before.first << " -> " << after.first
+            << ", maximum longest edge " << before.second << " -> " << after.second
+            << ", outside centroid marks "
+            << refined.local_refine_outside_transition_marks);
+    REQUIRE(before.second > 1.02 * options.target_size_mm);
+    CHECK(after.second > 1.02 * options.target_size_mm);
+    std::filesystem::remove(step);
+}

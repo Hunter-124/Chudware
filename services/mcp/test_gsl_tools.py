@@ -866,16 +866,18 @@ def test_assembly_native_roundtrip_keeps_live_geometry(tmp_path, monkeypatch):
         assert assembly["ok"] and content, assembly
         did = assembly["doc_id"]
         docs.append(did)
-        ops = [{"op": "asm_insert_component", "source": {"path": str(path)},
-                "name": f"Block{index}", "fixed": True,
-                "transform": [1, 0, 0, index * 20, 0, 1, 0, 0,
-                              0, 0, 1, 0, 0, 0, 0, 1]}
-               for index, path in enumerate(paths)]
-        added, _ = _call("add_features", {"doc_id": did, "ops": ops})
-        assert added["ok"], added
+        for index, source in enumerate(paths):
+            added, _ = _call("asm_add_component", {
+                "doc_id": did, "path": str(source), "name": f"Block{index}",
+                "fixed": True, "at": [index*20, 0, 0]})
+            assert added["ok"], added
+        scoped, _ = _call("check_interference", {"doc_id": did, "members": ["Block0"]})
+        assert scoped["ok"] and scoped["pairs_checked"] == 0, scoped
+        assert scoped["scope"]["checked_members"] == 1, scoped
         path = tmp_path / "assembly.step+"
         saved, content = _call("save_part", {"doc_id": did, "path": str(path)})
         assert saved["ok"] and content, saved
+        assert any(w.startswith("placement_unverified:") for w in saved.get("warnings", [])), saved
         cb.call("doc_close", {"doc_id": did})
         docs.remove(did)
         opened, _ = _call("import_part", {"path": str(path)})
@@ -889,6 +891,13 @@ def test_assembly_native_roundtrip_keeps_live_geometry(tmp_path, monkeypatch):
         assert described["digest"]["bbox_mm"] == pytest.approx([30, 8, 6])
         mass = cb.call("eval_mass", {"doc_id": did})
         assert mass.get("volume_mm3", mass.get("volume")) == pytest.approx(960)
+        checked, _ = _call("check_interference", {"doc_id": did})
+        assert checked["complete"] and checked["pairs_checked"] == 1, checked
+        assert checked["clearances"][0]["distance"] == pytest.approx(10), checked
+        verified, _ = _call("save_part", {"doc_id": did, "path": str(path)})
+        assert verified["ok"], verified
+        assert not any(w.startswith("placement_unverified:")
+                       for w in verified.get("warnings", [])), verified
         target = cb.call("doc_new", {"name": "flattened_roundtrip"})["doc_id"]
         docs.append(target)
         imported, _ = _call("import_part", {"path": str(path), "into": target})

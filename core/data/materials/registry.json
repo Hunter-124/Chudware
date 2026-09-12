@@ -2,6 +2,604 @@
   "version": "v1",
   "provenance_note": "Engineering fact table compiled from public handbooks, standards and manufacturer datasheets. Record-level property_basis distinguishes typical/nominal data, published minima, characteristic values and analyst assumptions. Engineering selections are not received-stock certificates or design allowables; incomplete constitutive data must not be replaced with invented isotropic properties. No MatWeb/MakeItFrom/Matmatch content.",
   "materials": {
+    "brake_housing_jagwire_cgxsl_5mm_black": {
+      "name": "Jagwire BHL100 CGX-SL 5 mm black brake housing",
+      "category": "composite",
+      "aliases": [
+        "Jagwire CGX-SL 5mm black",
+        "Jagwire BHL100"
+      ],
+      "condition": "Brake-system housing: high-carbon coiled steel around a continuously lubricated Slick-Lube inner liner, black outer jacket; 50 m stock box",
+      "constitutive_model": "brake_housing_incomplete",
+      "mechanical": {},
+      "property_basis": {
+        "nominal_od_mm": 5.0,
+        "manufacturer_part_number": "BHL100",
+        "ean": "4715910019238",
+        "stock_length_m": 50,
+        "construction": "High carbon, low compression coiled steel with continuously lubricated Slick-Lube liner",
+        "mass_note": "Whole-housing bulk density and linear mass not published by this source; never substitute solid steel density."
+      },
+      "constitutive_gaps": [
+        "Bulk density and linear mass",
+        "Liner/jacket resin and exact inner diameter",
+        "Effective compression/bending stiffness, minimum bend radius, termination strength and fatigue"
+      ],
+      "selection_status": "Engineering selection for brake housing envelopes; not a purchased-part certificate or complete brake performance qualification.",
+      "appearance": {
+        "color": [
+          0.045,
+          0.045,
+          0.05
+        ],
+        "metallic": 0,
+        "roughness": 0.8
+      },
+      "finish_note": "Factory black jacket, lubricated internal liner; no exterior paint. CAD outside envelope is not a homogeneous solid material.",
+      "provenance": {
+        "source_type": "manufacturer",
+        "source": "Jagwire Brake Housing 5mm CGX-SL Slick-Lube product and black BHL100 variant table",
+        "url": "https://www.jagwire.com/en/article/155-591/brake-housing-5mm-cgx-sl-slick-lube",
+        "urls": [
+          "https://www.jagwire.com/en/article/155-601/brake-housing-5mm-cgx-sl-slick-lube"
+        ],
+        "accessed_date": "2026-09-12"
+      }
+    },
+    "pa66_ensinger_tecamid66_natural": {
+      "name": "Ensinger TECAMID 66 natural PA66",
+      "category": "plastic",
+      "aliases": [
+        "TECAMID 66 natural"
+      ],
+      "condition": "Extruded stock shapes, machined reference specimens; data directly after machining in standard German climate",
+      "constitutive_model": "polymer_incomplete",
+      "mechanical": {
+        "density_g_cm3": 1.15,
+        "E_mpa": 3500,
+        "yield_mpa": 84
+      },
+      "property_basis": {
+        "density_g_cm3": "Manufacturer guideline, not guaranteed",
+        "E_mpa": "Tensile modulus, ISO 527-2 at 1mm/min; not flexural modulus",
+        "yield_mpa": "Tensile yield, ISO 527-2 at 50mm/min; not an allowable or locking-insert proof",
+        "color": "Manufacturer ivory opaque"
+      },
+      "constitutive_gaps": [
+        "Poisson ratio",
+        "Moisture, temperature, creep, fatigue and processing-specific behavior",
+        "Locking-insert retention and prevailing-torque qualification"
+      ],
+      "selection_status": "Engineering stock-grade selection, not evidence of supplied molded inserts or certified locking nuts",
+      "appearance": {
+        "color": [
+          0.88,
+          0.85,
+          0.74
+        ],
+        "metallic": 0.0,
+        "roughness": 0.5
+      },
+      "finish_note": "Bare natural ivory PA66, illustrative tint. Do not coat locking/contact surfaces. Manufacturer lists poor weathering resistance; protect and qualify service exposure.",
+      "provenance": {
+        "source": "Ensinger TECAMID66 natural stock-shape datasheet, 2023-07-19 version AD",
+        "source_type": "manufacturer_datasheet",
+        "url": "https://www.ensinger-online.com/modules/public/sheet/createsheet.php?FILENAME=TECAMID_66_natural_0.PDF&FL=0&SID=792&ZOOM=1.2"
+      }
+    },
+    "steel_iso898_2_class10_nut": {
+      "name": "Steel nuts, ISO 898-2 property class 10",
+      "category": "metal",
+      "aliases": [],
+      "condition": "ISO 898-2:2022 class 10 nut; thread and geometry selected separately",
+      "constitutive_model": "nut_property_class_incomplete",
+      "mechanical": {
+        "density_g_cm3": 7.85,
+        "E_mpa": 210000,
+        "nu": 0.3
+      },
+      "property_basis": {
+        "density_g_cm3": "Conventional steel analyst mass approximation, not measured product density",
+        "E_mpa": "Conventional steel analyst elastic assumption, not specified by property class",
+        "nu": "Conventional steel analyst assumption",
+        "property_class": "Class 10 NUT under ISO 898-2, not bolt class 10.9"
+      },
+      "constitutive_gaps": [
+        "Nut proof load, yield, supplier/coating certificate and torque/clamp qualification",
+        "ISO 898-2 does not specify prevailing torque or locking process"
+      ],
+      "selection_status": "Engineering selection, not purchased product or strength qualification",
+      "appearance": {
+        "color": [
+          0.24,
+          0.25,
+          0.27
+        ],
+        "metallic": 0.65,
+        "roughness": 0.38
+      },
+      "finish_note": "Selected zinc-flake protection, illustrative dark-grey tint; qualify coating friction and thread fit. Threadlocker is an assembly process, not constitutive strength.",
+      "provenance": {
+        "source": "ISO 898-2:2022 official scope; elastic constants and density explicitly analyst assumptions",
+        "source_type": "standard_scope_and_analyst_assumptions",
+        "url": "https://www.iso.org/standard/79349.html"
+      }
+    },
+    "finnish_birch_plywood_24mm_17ply": {
+      "name": "Finnish birch plywood 24 mm 17-ply",
+      "category": "composite",
+      "aliases": [
+        "Finnish birch 24mm 17ply"
+      ],
+      "condition": "Birch throughout, standard cross-banded seventeen-ply panel, nominal 24 mm; handbook mean 23.2 mm",
+      "constitutive_model": "orthotropic_incomplete",
+      "mechanical": {
+        "density_g_cm3": 0.68
+      },
+      "property_basis": {
+        "density_g_cm3": "Mean design density at 65% RH, not a guaranteed mass",
+        "characteristic_density_kg_m3": 630,
+        "nominal_thickness_mm": 24,
+        "ply_count": 17,
+        "mean_thickness_mm": 23.2,
+        "finnish_thickness_tolerance_mm": [
+          22.9,
+          23.7
+        ],
+        "membrane_E1_mpa": 9052,
+        "membrane_E2_mpa": 8448,
+        "panel_shear_G12_mpa": 620,
+        "characteristic_tension_mpa": [
+          38.8,
+          36.2
+        ],
+        "characteristic_compression_mpa": [
+          26.9,
+          25.1
+        ],
+        "characteristic_panel_shear_mpa": 9.5,
+        "density_condition": "Mechanical specimens conditioned at 20 C and 65% RH; characteristic density distinct from mean density"
+      },
+      "constitutive_gaps": [
+        "Selected panel homogenized E3 and three independent Poisson ratios",
+        "Moisture/time reductions and through-thickness, rolling/interlaminar, bolt-bearing and edge-failure data",
+        "Complete qualified orthotropic constitutive/failure model; no isotropic substitute"
+      ],
+      "selection_status": "Engineering thickness candidate, not evidence of original Comet stock, received product or assembly fit",
+      "appearance": {
+        "color": [
+          0.72,
+          0.51,
+          0.28
+        ],
+        "metallic": 0.0,
+        "roughness": 0.65
+      },
+      "finish_note": "Illustrative natural birch tint, not measured color or wood-grain texture. Seal faces, cut edges and holes; qualify adhesive-bond surfaces separately.",
+      "provenance": {
+        "source": "Finnish Forest Industries Federation, Handbook of Finnish Plywood (2002), Tables 2-3, 3-1, 3-2 and 3-7; membrane not bending moduli",
+        "source_type": "industry_handbook",
+        "url": "https://thomesnorthamerica.com/wp-content/uploads/finnish_plywood_handbook.pdf"
+      }
+    },
+    "aluminum_6061_tig_as_welded": {
+      "name": "6061 T6 feedstock, TIG-welded as-welded assembly",
+      "category": "metal",
+      "aliases": [],
+      "condition": "T6 feedstock; finished weld/HAZ condition not T6-qualified",
+      "constitutive_model": "welded_region_incomplete",
+      "mechanical": {
+        "density_g_cm3": 2.7,
+        "E_mpa": 70000
+      },
+      "property_basis": {
+        "density_g_cm3": "Alloy reference density; homogeneous mass approximation, not weld certification",
+        "E_mpa": "Alloy reference, not guaranteed",
+        "local_HAZ_note": "EN1999-1-1:2007 6061 MIG HAZ115MPa; conditional TIG t<=6mm factor0.8 gives92MPa, NOT a whole-body yield"
+      },
+      "constitutive_gaps": [
+        "Weld/filler procedure, HAZ extent and thickness-qualified strengths",
+        "Whole-body yield, Poisson ratio, fatigue, residual stress"
+      ],
+      "selection_status": "Engineering selection/reference, not purchased product or strength qualification.",
+      "appearance": {
+        "color": [
+          0.76,
+          0.79,
+          0.82
+        ],
+        "metallic": 0.65,
+        "roughness": 0.4
+      },
+      "finish_note": "Selected clear anodizing after welding; weld/parent shade variation accepted. Isolate dissimilar metals. No coating-thickness or life claim.",
+      "provenance": {
+        "source_type": "manufacturer_reference",
+        "urls": [
+          "https://ucpcdn.thyssenkrupp.com/_legacy/UCPthyssenkruppBAMXUK/assets.files/material-data-sheets/aluminium/aluminium-6061.pdf",
+          "https://www.hydro.com/Document/Index?name=Alloy%206061.pdf&id=560718"
+        ],
+        "source": "6061 T6 feedstock, TIG-welded as-welded assembly: linked manufacturer/reference data and project source audit"
+      }
+    },
+    "steel_en10270_1_dh_bezinal": {
+      "name": "Bekaert EN10270-1 DH spring wire, Bezinal",
+      "category": "metal",
+      "aliases": [],
+      "condition": "Cold-drawn DH round wire, supplier-finished Bezinal; 0.18-10mm product wire range",
+      "constitutive_model": "spring_wire_incomplete",
+      "mechanical": {
+        "density_g_cm3": 7.85,
+        "E_mpa": 206000
+      },
+      "property_basis": {
+        "density_g_cm3": "Gutekunst DH nominal substrate value; excludes coating",
+        "E_mpa": "Gutekunst nominal/reference, not Bekaert lot guarantee",
+        "G_mpa": 81500
+      },
+      "constitutive_gaps": [
+        "Diameter-specific tensile minimum, yield, Poisson ratio",
+        "Fatigue, relaxation and formed spring rate/load qualification"
+      ],
+      "selection_status": "Engineering selection/reference, not purchased product or strength qualification.",
+      "appearance": {
+        "color": [
+          0.62,
+          0.64,
+          0.66
+        ],
+        "metallic": 0.6,
+        "roughness": 0.4
+      },
+      "finish_note": "Factory Bezinal wire coating; forming/stress relief and coating damage require process qualification. Not black oxide or bare aluminum.",
+      "provenance": {
+        "source_type": "manufacturer_reference",
+        "urls": [
+          "https://www.bekaert.com/en/products/consumer-goods/sports-leisure/music-wire",
+          "https://blog.federnshop.com/en/spring-steel-wires-and-their-properties/"
+        ],
+        "source": "Bekaert EN10270-1 DH spring wire, Bezinal: linked manufacturer/reference data and project source audit"
+      }
+    },
+    "steel_c75s_hardened_spring_strip": {
+      "name": "C75S 1.1248 hardened spring strip",
+      "category": "metal",
+      "aliases": [],
+      "condition": "Gutekunst MK75 H+AP material B reference; hard stock0.2-2.0mm, other gauges require source confirmation",
+      "constitutive_model": "spring_strip_incomplete",
+      "mechanical": {
+        "density_g_cm3": 7.85,
+        "E_mpa": 210000
+      },
+      "property_basis": {
+        "density_g_cm3": "SIJ C75S typical alloy reference",
+        "E_mpa": "SIJ typical alloy reference",
+        "tensile_range_mpa": [
+          1600,
+          1800
+        ],
+        "tensile_range_note": "Gutekunst hard-strip reference, NOT yield"
+      },
+      "constitutive_gaps": [
+        "Yield, Poisson ratio, fatigue, clip force and bend-radius qualification"
+      ],
+      "selection_status": "Engineering selection/reference, not purchased product or strength qualification.",
+      "appearance": {
+        "color": [
+          0.3,
+          0.31,
+          0.33
+        ],
+        "metallic": 0.5,
+        "roughness": 0.45
+      },
+      "finish_note": "Selected DELTA-TONE9000 zinc-flake plus compatible DELTA-SEAL; qualify pretreatment, cure versus temper, coating build and fit. No automatic hydrogen-safety claim.",
+      "provenance": {
+        "source_type": "manufacturer_reference",
+        "urls": [
+          "https://www.gutekunst-formfedern.de/files/gutekunst/stories/produkte/pdf/lagpro-bandstahl.pdf",
+          "https://www.sij-americas.com/products/steel/category/long-product/siqual-1248-1",
+          "https://www.doerken.com/us/en/solutions/doerken-coatings/zinc-flake-basecoats"
+        ],
+        "source": "C75S 1.1248 hardened spring strip: linked manufacturer/reference data and project source audit"
+      }
+    },
+    "stainless_sus420j2_rotor": {
+      "name": "SUS420J2 quenched-tempered rotor stainless",
+      "category": "metal",
+      "aliases": [],
+      "condition": "JIS G4305/G4313 grade; final rotor temper/hardness unqualified",
+      "constitutive_model": "rotor_stainless_incomplete",
+      "mechanical": {
+        "density_g_cm3": 7.75,
+        "E_mpa": 200000
+      },
+      "property_basis": {
+        "density_g_cm3": "TOKKIN manufacturer reference",
+        "E_mpa": "TOKKIN manufacturer reference",
+        "reference_stock_thickness_mm": [
+          0.03,
+          2.5
+        ],
+        "reference_stock_width_mm": [
+          3,
+          300
+        ],
+        "stock_limit_note": "Thicker rotor cannot claim this TOKKIN stock product; separate supplier confirmation required",
+        "thermal_conductivity_w_m_k": 24.7,
+        "specific_heat_j_kg_k": 460
+      },
+      "constitutive_gaps": [
+        "Final hardness, yield/UTS, Poisson ratio, fatigue and hot strength",
+        "Rotor-pad compatibility and runout acceptance"
+      ],
+      "selection_status": "Engineering selection/reference, not purchased product or strength qualification.",
+      "appearance": {
+        "color": [
+          0.72,
+          0.75,
+          0.78
+        ],
+        "metallic": 0.85,
+        "roughness": 0.3
+      },
+      "finish_note": "Heat treat then precision finish both friction faces; clean bare stainless swept surfaces, no paint/oil/polymer coating.",
+      "provenance": {
+        "source_type": "manufacturer_reference",
+        "urls": [
+          "https://www.tokkin.com/search/stainless-steels/martensitic/420j2/",
+          "https://www.far-brake.com/en/service_info?id=44",
+          "https://www.newfren.com/en/Products/Brake-discs.html"
+        ],
+        "source": "SUS420J2 quenched-tempered rotor stainless: linked manufacturer/reference data and project source audit"
+      }
+    },
+    "cable_carl_stahl_316_7x19_1p5": {
+      "name": "Carl Stahl AISI316 7x19 cable, 1.50mm SE000029",
+      "category": "composite",
+      "aliases": [],
+      "condition": "Uncoated6x19-WSC/7x19 flexible stainless wire rope; actual strands plus voids",
+      "constitutive_model": "wire_rope_incomplete",
+      "mechanical": {},
+      "property_basis": {
+        "nominal_diameter_mm": 1.5,
+        "linear_mass_kg_m": 0.009,
+        "minimum_breaking_force_n": 1590,
+        "mass_note": "Catalog linear mass, NOT bulk density or working load"
+      },
+      "constitutive_gaps": [
+        "Effective continuum density/stiffness, yield, fatigue, stretch",
+        "Terminations, bend radius and brake working load"
+      ],
+      "selection_status": "Engineering selection/reference, not purchased product or strength qualification.",
+      "appearance": {
+        "color": [
+          0.68,
+          0.71,
+          0.74
+        ],
+        "metallic": 0.8,
+        "roughness": 0.3
+      },
+      "finish_note": "Uncoated stainless core; keep liner, housing reinforcement and jacket separate. Never apply bulk316 density to a filled rope envelope as exact mass.",
+      "provenance": {
+        "source_type": "manufacturer_reference",
+        "urls": [
+          "https://www.carlstahl-technocables.com/gb/en/products/wire-ropes-and-strands/stainless-steel-wire-rope/"
+        ],
+        "source": "Carl Stahl AISI316 7x19 cable, 1.50mm SE000029: linked manufacturer/reference data and project source audit"
+      }
+    },
+    "belt_optibelt_omega_8m_20": {
+      "name": "Optibelt OMEGA8M20 reinforced synchronous belt",
+      "category": "composite",
+      "aliases": [],
+      "condition": "CR compound, glass tension cord, PA tooth fabric; HTD/RPP-compatible ISO13050 profile",
+      "constitutive_model": "reinforced_belt_incomplete",
+      "mechanical": {},
+      "property_basis": {
+        "linear_mass_kg_m": 0.116,
+        "linear_mass_basis": "0.058kg/m per10mm width, scaled to20mm; catalog reference, not bulk density",
+        "hardness_shore_a": [
+          67,
+          77
+        ],
+        "minimum_pulley_teeth": 22,
+        "minimum_pulley_pitch_diameter_mm": 56.02,
+        "minimum_backside_idler_diameter_mm": 60,
+        "temperature_range_c": [
+          -30,
+          100
+        ]
+      },
+      "constitutive_gaps": [
+        "Effective bulk density, orthotropic stiffness, cord allowables and fatigue",
+        "Supplier pitch-length availability, engagement/tension/service factor"
+      ],
+      "selection_status": "Engineering selection/reference, not purchased product or strength qualification.",
+      "appearance": {
+        "color": [
+          0.035,
+          0.04,
+          0.045
+        ],
+        "metallic": 0,
+        "roughness": 0.9
+      },
+      "finish_note": "As-supplied black belt/fabric; no paint, tooth lubricant or sealant. Verify minimum idler/pulley dimensions, not merely pitch compatibility.",
+      "provenance": {
+        "source_type": "manufacturer_reference",
+        "urls": [
+          "https://www.optibelt.com/fileadmin/pdf/datenblaetter/Technical-Data-Sheet-optibelt-OMEGA-8M.pdf"
+        ],
+        "source": "Optibelt OMEGA8M20 reinforced synchronous belt: linked manufacturer/reference data and project source audit"
+      }
+    },
+    "friction_scanpac_rf38_upper_mass": {
+      "name": "Scan-Pac RF38 friction lining (upper-bound reference mass)",
+      "category": "composite",
+      "aliases": [],
+      "condition": "Rigid molded non-asbestos metallic-filled friction composite; currently linked RF38.pdf revision",
+      "constitutive_model": "friction_composite_incomplete",
+      "mechanical": {
+        "density_g_cm3": 2.29
+      },
+      "property_basis": {
+        "density_g_cm3": "UPPER END of publishedSG2.11-2.29 reference range for conservative mass, NOT measured or exact density",
+        "density_range_g_cm3": [
+          2.11,
+          2.29
+        ],
+        "normal_friction_reference": 0.39,
+        "hot_friction_reference": 0.4,
+        "friction_note": "SAEJ661 laboratory references, NOT guaranteed rover coefficients",
+        "source_conflict": "Do not blend older tds-RF38.pdf values with currently linked RF38.pdf"
+      },
+      "constitutive_gaps": [
+        "Yield, E, Poisson ratio and thermal constants",
+        "Pad retention/backing, minimum thickness, rotor pairing and wet/hot duty"
+      ],
+      "selection_status": "Engineering selection/reference, not purchased product or strength qualification.",
+      "appearance": {
+        "color": [
+          0.16,
+          0.15,
+          0.14
+        ],
+        "metallic": 0.05,
+        "roughness": 0.9
+      },
+      "finish_note": "Bare clean friction face; never oil, paint or seal. Separate lining from backing and attachment.",
+      "provenance": {
+        "source_type": "manufacturer_reference",
+        "urls": [
+          "https://www.scanpac.com/cm/pdfs/RF38.pdf",
+          "https://www.scanpac.com/molded/"
+        ],
+        "source": "Scan-Pac RF38 friction lining (upper-bound reference mass): linked manufacturer/reference data and project source audit"
+      }
+    },
+    "bowden_cablecraft_c005_housing": {
+      "name": "Cablecraft CMA C005 composite Bowden housing",
+      "category": "composite",
+      "aliases": [],
+      "condition": "Braided-reinforced conduit: black PA jacket and TFE liner; braid alloy and nylon grade unspecified",
+      "constitutive_model": "bowden_housing_incomplete",
+      "mechanical": {},
+      "property_basis": {
+        "nominal_id_mm": 1.91,
+        "nominal_od_mm": 5.92,
+        "recommended_max_cable_diameter_mm": 1.6,
+        "source_pages": "printed1 and28",
+        "mass_note": "Whole-conduit mass/density unpublished; not bulk PA"
+      },
+      "constitutive_gaps": [
+        "Effective density/stiffness, braid alloy and nylon subtype",
+        "Conduit compression, bend radius, cyclic efficiency and terminals"
+      ],
+      "selection_status": "Engineering selection/reference, not purchased product or strength qualification.",
+      "appearance": {
+        "color": [
+          0.045,
+          0.045,
+          0.05
+        ],
+        "metallic": 0,
+        "roughness": 0.8
+      },
+      "finish_note": "As-extruded black jacket. Keep PTFE liner and separate stainless pull cable distinct; no invented braid alloy or lubrication requirement.",
+      "provenance": {
+        "source_type": "manufacturer_reference",
+        "urls": [
+          "https://cablecraft.com/wp-content/uploads/2024/03/Cable-Manufacturing-Catalog.pdf"
+        ],
+        "source": "Cablecraft CMA C005 composite Bowden housing: linked manufacturer/reference data and project source audit"
+      }
+    },
+    "silicone_esi_chunky_black_grip": {
+      "name": "ESI Chunky black silicone grip",
+      "category": "elastomer",
+      "aliases": [],
+      "condition": "Manufacturer silicone grip family; verify actual22mmbar,32mminstalledOD and5-1/8inlength fit",
+      "constitutive_model": "silicone_grip_incomplete",
+      "mechanical": {},
+      "property_basis": {
+        "catalog_product_mass_g": 60,
+        "catalog_mass_tolerance_percent": 5,
+        "mass_basis_note": "Product/plug inclusion basis not established; not per-body mass or bulk density",
+        "designed_bar_diameter_mm": 22,
+        "installed_diameter_mm": 32,
+        "length_in": 5.125
+      },
+      "constitutive_gaps": [
+        "Formulation, density, modulus, hardness and strength",
+        "Actual geometry/fit, wet retention and tear qualification"
+      ],
+      "selection_status": "Engineering selection/reference, not purchased product or strength qualification.",
+      "appearance": {
+        "color": [
+          0.065,
+          0.065,
+          0.07
+        ],
+        "metallic": 0,
+        "roughness": 0.85
+      },
+      "finish_note": "Uncoated silicone. Manufacturer Black is dark charcoal gray, not metallic black. Keep silicone contamination away from bond/finish stations.",
+      "provenance": {
+        "source_type": "manufacturer_reference",
+        "urls": [
+          "https://esigrips.com/products/chunky"
+        ],
+        "source": "ESI Chunky black silicone grip: linked manufacturer/reference data and project source audit"
+      }
+    },
+    "adhesive_3m_dp620ns_black": {
+      "name": "3M Scotch-Weld DP620NS black polyurethane adhesive",
+      "category": "adhesive",
+      "aliases": [],
+      "condition": "Two-part1:1volume polyurethane; older3M-authored February2019 TDS, current formulation requires confirmation",
+      "constitutive_model": "adhesive_joint_incomplete",
+      "mechanical": {
+        "E_mpa": 903.213205405008
+      },
+      "property_basis": {
+        "E_mpa": "Typical cured adhesive coupon ASTM D638131000psi, NOT TPU or joint modulus",
+        "uncured_base_density_lb_us_gal": [
+          9.0,
+          9.4
+        ],
+        "uncured_accelerator_density_lb_us_gal": [
+          9.5,
+          9.9
+        ],
+        "density_note": "Only uncured components sourced; cured density absent",
+        "typical_elongation_percent": 110,
+        "typical_hardness_shore_d": 50
+      },
+      "constitutive_gaps": [
+        "Cured density, Poisson ratio, yield and joint constitutive data",
+        "Actual printedTPU/birch preparation, peel/shear/creep/fatigue and wet-aged joint qualification"
+      ],
+      "selection_status": "Engineering selection/reference, not purchased product or strength qualification.",
+      "appearance": {
+        "color": [
+          0.035,
+          0.035,
+          0.04
+        ],
+        "metallic": 0,
+        "roughness": 0.65
+      },
+      "finish_note": "Development selection only. Bare clean dry birch bond footprint; mask clearcoat away. TPU preparation requires actual-print compatibility/coupon verification. No qualified structural POM bond.",
+      "provenance": {
+        "source_type": "manufacturer_reference",
+        "urls": [
+          "https://www.3m.com/3M/en_US/p/d/b40066434/",
+          "https://tapes-store.com/wp-content/uploads/2025/04/3M_Scotch-Weld_Urethane_Adhesive_DP620NS_Black.pdf"
+        ],
+        "source": "3M Scotch-Weld DP620NS black polyurethane adhesive: linked manufacturer/reference data and project source audit"
+      }
+    },
     "steel_42crmo4_qt_round_le40": {
       "name": "42CrMo4 +QT round <=40 mm (750 MPa minimum)",
       "category": "metal",

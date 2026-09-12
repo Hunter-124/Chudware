@@ -55,6 +55,7 @@ from __future__ import annotations
 import difflib
 import os
 import re
+import signal
 import subprocess
 from pathlib import Path
 from typing import Any, Optional
@@ -301,7 +302,7 @@ MAX_GREP_MATCHES = 500           # fs_grep match cap
 MAX_GREP_FILES = 5000            # fs_grep files-scanned cap
 GREP_MAX_FILE_BYTES = 8 * 1024 * 1024   # skip files larger than this in fs_grep
 SHELL_DEFAULT_TIMEOUT_S = 60
-SHELL_MAX_TIMEOUT_S = 900
+SHELL_MAX_TIMEOUT_S = 24 * 60 * 60
 SHELL_MAX_OUTPUT_BYTES = 96 * 1024
 
 DOC_EXTS = {
@@ -822,6 +823,23 @@ def register_fs_tools(mcp) -> None:
         return _ok(path=str(p), replacements=(occurrences if replace_all else 1))
 
 
+def _kill_shell_process_tree(proc: subprocess.Popen) -> None:
+    """Stop the isolated command tree, including children of an exited shell."""
+    if os.name == "posix":
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    else:
+        subprocess.run(
+            ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5,
+            check=False,
+        )
+        if proc.poll() is None:
+            proc.kill()
+
+
 def register_shell_tools(mcp) -> None:
     """Register the ``shell`` family: run_shell (kept separate so it toggles independently)."""
 
@@ -834,7 +852,11 @@ def register_shell_tools(mcp) -> None:
         that root (a command that ``cd``s or uses absolute paths can still reach outside it
         — this is a starting-directory jail, not a full sandbox; the destructive-pattern
         guard above is the other half of the safety story, not a substitute for one).
-        Output over ~96 KB is truncated. Returns
+        timeout_s is honored exactly from 1 to 86400 seconds (default 60; zero uses
+        the default). Out-of-range requests refuse before execution, never clamp.
+        On timeout the isolated POSIX process group / Windows process tree is killed.
+        Output over 96 KiB is truncated and decoded as UTF-8 with replacement,
+        including partial timeout output. Returns
         {ok, exit_code, output, truncated, timed_out}. Risk: write.
         """
         if not command.strip():
@@ -843,8 +865,13 @@ def register_shell_tools(mcp) -> None:
             if rx.search(command):
                 return _err("blocked",
                             "command matches a destructive-pattern guard and was refused")
-        timeout = max(1, min(int(timeout_s) if timeout_s else SHELL_DEFAULT_TIMEOUT_S,
-                             SHELL_MAX_TIMEOUT_S))
+        try:
+            timeout = int(timeout_s) if timeout_s else SHELL_DEFAULT_TIMEOUT_S
+        except (TypeError, ValueError, OverflowError):
+            return _err("invalid_timeout", "timeout_s must be an integer number of seconds")
+        if not 1 <= timeout <= SHELL_MAX_TIMEOUT_S:
+            return _err("invalid_timeout",
+                        f"timeout_s must be between 1 and {SHELL_MAX_TIMEOUT_S} seconds")
         root = _workspace_root()
         workdir = cwd or (str(root) if root else None)
         if workdir and not Path(workdir).is_dir():
@@ -854,20 +881,41 @@ def register_shell_tools(mcp) -> None:
             if blocked:
                 return blocked
         try:
-            proc = subprocess.run(
-                command, shell=True, cwd=workdir, capture_output=True,
-                timeout=timeout, text=True, errors="replace",
+            proc = subprocess.Popen(
+                command, shell=True, cwd=workdir,
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                start_new_session=os.name == "posix",
+                creationflags=(subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0),
             )
-        except subprocess.TimeoutExpired as exc:
-            partial = (exc.stdout or "") + (exc.stderr or "")
-            return _ok(exit_code=124, timed_out=True, truncated=len(partial) > SHELL_MAX_OUTPUT_BYTES,
-                       output=partial[:SHELL_MAX_OUTPUT_BYTES])
+            timed_out = False
+            cleanup_failed = False
+            try:
+                try:
+                    output, _ = proc.communicate(timeout=timeout)
+                except subprocess.TimeoutExpired:
+                    timed_out = True
+                    _kill_shell_process_tree(proc)
+                    try:
+                        output, _ = proc.communicate(timeout=5)
+                    except subprocess.TimeoutExpired as exc:
+                        # An escaped descendant still owns the pipe. Never turn cleanup
+                        # into an unbounded wait or report complete tree termination.
+                        output = exc.output or b""
+                        cleanup_failed = True
+            finally:
+                if proc.stdout is not None:
+                    proc.stdout.close()
         except Exception as exc:  # noqa: BLE001
             return _err("exec_failed", str(exc))
-        output = (proc.stdout or "") + (proc.stderr or "")
         truncated = len(output) > SHELL_MAX_OUTPUT_BYTES
+        text = output[:SHELL_MAX_OUTPUT_BYTES].decode("utf-8", errors="replace")
         if truncated:
-            output = output[:SHELL_MAX_OUTPUT_BYTES] + "\n… [output truncated]"
-        return _ok(exit_code=proc.returncode, timed_out=False, truncated=truncated,
-                   output=output)
+            text += "\n… [output truncated]"
+        result = _ok(exit_code=124 if timed_out else proc.returncode,
+                     timed_out=timed_out, truncated=truncated, output=text)
+        if cleanup_failed:
+            result.update(_err("cleanup_failed",
+                              "Command timed out; an escaped descendant kept output open "
+                              "after process-tree termination"))
+        return result
 

@@ -191,6 +191,10 @@ TEST_CASE("eval_interference: members filter shrinks the pairwise set") {
     CHECK(one["parts"][0]["name"].get<std::string>() == n0);
     CHECK_MESSAGE(one["interferences"].empty(),
                   "one member cannot form a pair: " << one.dump());
+    CHECK(one["scope"]["kind"] == "members");
+    CHECK(one["scope"]["checked_members"] == 1);
+    CHECK(one["scope"]["total_members"] == 3);
+    CHECK(one["pairs_checked"] == 0);
 
     // Two overlapping names (exclude far C) -> still one interference.
     // A is b1, B is b2 for merge:false boxes in order.
@@ -206,6 +210,11 @@ TEST_CASE("eval_interference: members filter shrinks the pairwise set") {
     json c_only = doc_eval_interference(b.id, json{{"members", json::array({n2})}});
     CHECK(c_only["parts"].size() == 1);
     CHECK(c_only["interferences"].empty());
+
+    // Never turn an invalid requested pair into a clean single-member result.
+    CHECK_THROWS(doc_eval_interference(b.id, json{{"members", json::array({n0, "missing"})}}));
+    CHECK_THROWS(doc_eval_interference(b.id, json{{"members", json::array({n0, 7})}}));
+    CHECK_THROWS(doc_eval_interference(b.id, json{{"members", n0}}));
 }
 
 // (2) box + boss + engulfing cut -> doc_eval_feature_overlap must report a boss_swallowed
@@ -710,6 +719,28 @@ TEST_CASE("assembly health: mating surfaces are not self-piercing solid skins") 
     CHECK(census["pairs"][0]["distance_mm"].get<double>() == doctest::Approx(0.0));
     CHECK(census["pairs"][0]["overlap_volume_mm3"].get<double>() == doctest::Approx(0.0));
     CHECK(census["islands"].size() == 1);
+}
+
+TEST_CASE("solid health: tangent fused stock imprints do not open the skin") {
+    // A round base overlaps both rectangular ears. Their outside faces are tangent
+    // to the cylinder, leaving internal imprint edges inside otherwise closed faces.
+    const Built fork = build("TangentForkHealth", json::array({
+        cyl("Base", 19.0, 5.0, {0, 0, 0},
+            {{"axis", {0, -1, 0}}, {"centered", true}, {"merge", false}}),
+        box("LeftEar", 5.0, 22.0, 16.0, {-16.5, -9.5, 0},
+            {{"centered", true}, {"merge", true}, {"mode", "add"}}),
+        box("RightEar", 5.0, 22.0, 16.0, {16.5, -9.5, 0},
+            {{"centered", true}, {"merge", true}, {"mode", "add"}})
+    }));
+    const json health = chudware::doc::doc_eval_solid_health(fork.id, 1);
+    const json& body = health.at("bodies").at(0);
+    REQUIRE(body["brep_valid"] == true);
+    CHECK(body["free_edges"]["count"] == 0);
+    CHECK(body["is_watertight"] == true);
+    CHECK(body["sound"] == true);
+    const json checked = chudware::doc::doc_eval_check(fork.id, 1);
+    CHECK(checked["issues"].empty());
+    chudware::doc::doc_close(fork.id);
 }
 
 TEST_CASE("model integrity: two patterns of one seed keep distinct world identities and graph nodes") {

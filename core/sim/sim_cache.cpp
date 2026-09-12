@@ -419,6 +419,16 @@ std::string hash_fea_study(Kind kind, const json& study) {
         return {};
     if (!study.is_object()) return {};
     json s = study;
+    if (kind == Kind::FeaStatic) {
+        const char* selected = std::getenv("CHUDWARE_FEA_SOLVER");
+        const std::string backend = selected ? selected : "";
+        s["_native_linear_solver"] = {{"requested_backend", backend}};
+        if (backend == "iccg") {
+            const char* limit = std::getenv("CHUDWARE_FEA_ICCG_MAX_ITERATIONS");
+            s["_native_linear_solver"]["iteration_limit"] =
+                limit && limit[0] ? limit : "10000";
+        }
+    }
     if (s.contains("step_path")) {
         if (!s["step_path"].is_string()) return {};
         const std::string path = s["step_path"].get<std::string>();

@@ -409,7 +409,9 @@ nlohmann::json doc_eval_symmetry(const std::string& doc_id, int body_id,
 // of a `clearances` one (SW-parity "coincident faces" gap); `min_clearance_mm` (default 0)
 // tags any clearance entry below it with `"warning":"below min clearance"`; `members`
 // (array of part-name strings) restricts pairwise checks to those names (case-sensitive
-// exact match; absent/empty = all). Each interferences[] item also carries
+// exact match; absent/empty = all; malformed/unknown names are refused). `scope` records
+// all/member scope and selected/total counts; `complete` applies ONLY to that scope.
+// Each interferences[] item also carries
 // `overlap_volume_mm3` (same as volume), `overlap_bbox` [[min],[max]] world mm, and
 // `overlap_mesh` {positions:[x,y,z,...], indices:[i0,i1,i2,...]} (empty arrays on mesh fail).
 // Imported compound members are exploded to SOLID(s) before the Common op.

@@ -309,10 +309,12 @@ def _face_hist(doc_id: str) -> dict:
     """GSL Stage 1a — a cheap topological snapshot for the add_features write-diff: count faces
     by shape (surf) and by bore/boss concavity (the Stage-0 semantics now in the read-back), so
     a build op can confirm WHAT it changed, not just that the volume moved. Best-effort: returns
-    an empty hist on any error (the write-diff degrades to a volume-only signal)."""
+    an empty hist on advisory errors; engine connection loss must stop the mutation."""
     try:
         res = cb.call("doc_query", {"doc_id": doc_id, "query": {"of": "face"}})
-    except Exception:  # noqa: BLE001
+    except Exception as exc:  # noqa: BLE001
+        if getattr(exc, "code", None) == "engine_connection_lost":
+            raise
         return {}
     hist: dict = {"total": 0, "surf": {}, "bore": 0, "boss": 0}
     for m in res.get("matches", []):
@@ -708,7 +710,9 @@ def _doc(doc_id: Optional[str]) -> str:
         docs = [e for e in (cb.call("doc_list", {}) or {}).get("docs", [])
                 if isinstance(e, dict) and e.get("doc_id")]
         listed = True
-    except Exception:  # noqa: BLE001 — doc_list unavailable: fall back to legacy behavior
+    except Exception as exc:  # noqa: BLE001
+        if getattr(exc, "code", None) == "engine_connection_lost":
+            raise
         docs, listed = [], False
 
     def _ambiguous(candidates: Optional[list] = None,
@@ -932,7 +936,7 @@ def _teach_undo_denied(e: "CoreError") -> str:
 
 
 def _err(e: Exception) -> str:
-    """Render an engine error as a structured, fixable result (not a transport failure)."""
+    """Render an engine or connection failure with its structured code and detail."""
     if isinstance(e, CoreError):
         if e.code == "undo_denied":
             return _teach_undo_denied(e)
@@ -1794,8 +1798,8 @@ def _project_save(doc_id: Optional[str], name: Optional[str] = None) -> Optional
     Unlike _autosave (crash recovery, session-prefixed, hidden appdata dir) this is the
     user's own file: it is NOT session-prefixed, so it stays stable and openable across
     runs and overwrites itself as the part is revised. Returns None when the env var is
-    unset (the default — nothing changes for existing callers/tests). Best-effort; a
-    failed deliverable save must NEVER fail the tool call, so this never raises."""
+    unset (the default — nothing changes for existing callers/tests). Save errors are
+    best-effort, except engine connection loss: callers must not claim durable success."""
     if not doc_id:
         return None
     try:
@@ -1813,7 +1817,9 @@ def _project_save(doc_id: Optional[str], name: Optional[str] = None) -> Optional
                     if isinstance(e, dict) and e.get("doc_id") == doc_id:
                         name = e.get("name") or ""
                         break
-            except Exception:  # noqa: BLE001
+            except Exception as exc:  # noqa: BLE001
+                if getattr(exc, "code", None) == "engine_connection_lost":
+                    raise
                 pass
         path = d / f"{_project_save_stem(name, doc_id)}.step+"
         r = cb.call("doc_save", {"doc_id": doc_id, "path": str(path)})
@@ -1826,7 +1832,9 @@ def _project_save(doc_id: Optional[str], name: Optional[str] = None) -> Optional
         except Exception:  # noqa: BLE001 — a mirror must never fail a save
             pass
         return written
-    except Exception:  # noqa: BLE001
+    except Exception as exc:  # noqa: BLE001
+        if getattr(exc, "code", None) == "engine_connection_lost":
+            raise
         return None
 
 
@@ -2490,6 +2498,8 @@ def _start_job(kind: str, fn, progress: Optional[dict] = None) -> str:
         except Exception as e:  # noqa: BLE001
             with _JOB_LOCK:
                 _JOBS[jid].update(status="error", error=str(e), done_at=time.time())
+                if isinstance(e, CoreError):
+                    _JOBS[jid].update(code=e.code, detail=e.detail)
 
     # Daemon thread: a long OpenFOAM/FEA solve must never block server (or test) shutdown.
     _threading.Thread(target=_run, name=f"chudware-job-{kind}", daemon=True).start()
@@ -2504,12 +2514,12 @@ _SYNC_SOLVE_BUDGET_S = float(os.environ.get("CHUDWARE_MCP_SYNC_BUDGET_S", "45") 
 
 def _solve_sync_or_handoff(kind: str, fn, progress: Optional[dict] = None,
                            budget_s: float = _SYNC_SOLVE_BUDGET_S) -> dict:
-    """Run a heavy solve so it can NEVER time out the transport and drop the session.
+    """Run heavy work on the owning process's thread with a bounded inline reply wait.
 
     Always runs on a worker thread (via _start_job). For a synchronous request we poll
     the job up to `budget_s`; if it finishes we return the result inline (small solves
     behave exactly as before). If it overruns, we LEAVE it running and return the job_id
-    so the call returns in time — the agent polls get_job() instead of losing the session.
+    for polling with get_job(). This does not make the work durable or cancellable.
     """
     jid = _start_job(kind, fn, progress)
     deadline = time.time() + max(1.0, budget_s)
@@ -2524,14 +2534,15 @@ def _solve_sync_or_handoff(kind: str, fn, progress: Optional[dict] = None,
         if st == "done":
             return snap.get("result") or {"ok": False, "error": "no result"}
         if st == "error":
-            return {"ok": False, "error": snap.get("error", "solve failed")}
+            return {"ok": False, "error": snap.get("error", "solve failed"),
+                    **{key: snap[key] for key in ("code", "detail") if key in snap}}
         time.sleep(interval)
         if interval < 0.1:
             interval = min(0.1, interval * 1.5)
     return {"ok": True, "job_id": jid, "status": "running", "auto_backgrounded": True,
             "note": (f"solve still running after {budget_s:.0f}s — continued in the BACKGROUND "
-                     f"to avoid a transport timeout (which would drop open documents). "
-                     f"Open parts were autosaved. Poll get_job('{jid}').")}
+                     f"to keep the tool reply responsive. This process-local job is not "
+                     f"restart-durable or cancellable. Poll get_job('{jid}').")}
 
 
 # --- durable (out-of-process) sim jobs ---------------------------------------------------

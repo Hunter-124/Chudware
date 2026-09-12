@@ -2558,8 +2558,15 @@ static int chudware_call_inner(const char* method, const char* params_json, char
                 params.value("nu", 0.0), params.value("yield_mpa", 250.0),
                 geti("fixed_nodes"), getd("nodal_forces"),
                 params.value("nodes_per_elem", 4));
-            if (!r.ok) return emit(json{{"ok", false}, {"error", r.error}}, out_json, 0);
-            return emit(json{{"ok", true},
+            auto emit_static = [&](json value) {
+                if (r.iterative.iteration_limit > 0)
+                    value["provenance"] = {
+                        {"solver", r.solver},
+                        {"linear_solver", chudware::sim::fea_iterative_report_json(r)}};
+                return emit(std::move(value), out_json, 0);
+            };
+            if (!r.ok) return emit_static(json{{"ok", false}, {"error", r.error}});
+            return emit_static(json{{"ok", true},
                              {"displacement", r.displacement},
                              {"disp_magnitude", r.disp_magnitude},
                              {"von_mises", r.von_mises},
@@ -2567,8 +2574,7 @@ static int chudware_call_inner(const char* method, const char* params_json, char
                              {"summary",
                               {{"max_von_mises_mpa", r.max_von_mises_mpa},
                                {"max_disp_mm", r.max_disp_mm},
-                               {"min_fos", r.min_fos}}}},
-                        out_json, 0);
+                               {"min_fos", r.min_fos}}}});
         }
         if (m == "sim_fea_modal") {
             // Modal FEA (engine/sim/fea_modal.py parity probe). Params: points[n*3],

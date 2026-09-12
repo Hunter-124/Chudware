@@ -27,12 +27,14 @@
 #include <mutex>
 #include <set>
 #include <string>
+#include <stdexcept>
 #include <unordered_map>
 #include <vector>
 
 #include <thread>
 
 #include <Eigen/Dense>
+#include <Eigen/IterativeLinearSolvers>
 #include <Eigen/SparseCholesky>
 #include <Eigen/SparseCore>
 #include <Eigen/SparseLU>
@@ -48,6 +50,43 @@
 #include "util/thread_pool.h"
 
 namespace chudware::sim {
+
+bool fea_static_uses_iccg() {
+    const char* value = std::getenv("CHUDWARE_FEA_SOLVER");
+    return value && std::strcmp(value, "iccg") == 0;
+}
+
+nlohmann::json fea_iterative_report_json(const FeaStaticResult& r) {
+    using nlohmann::json;
+    const auto& info = r.iterative;
+    json steps = json::array();
+    double worst = 0.0;
+    bool finite = true;
+    for (const auto& step : info.solves) {
+        steps.push_back({{"iterations", step.iterations},
+                         {"relative_residual", std::isfinite(step.relative_residual)
+                             ? json(step.relative_residual) : json(nullptr)},
+                         {"converged", step.converged}});
+        finite = finite && std::isfinite(step.relative_residual);
+        worst = std::max(worst, step.relative_residual);
+    }
+    return json{{"backend", r.solver},
+                {"relative_tolerance", info.tolerance},
+                {"iteration_limit_per_solve", info.iteration_limit},
+                {"iterations_total", info.total_iterations},
+                {"relative_residual_max", finite && !steps.empty()
+                    ? json(worst) : json(nullptr)},
+                {"aggregation", "one entry per attempted linear solve, in active-set order"},
+                {"solves", std::move(steps)},
+                {"conditioning_warning", r.conditioning_warning},
+                {"memory", {{"model", "inspected_sparse_storage_bound_not_measured_peak"},
+                            {"stage", info.admission_stage},
+                            {"maximum_projected_peak_bytes", info.maximum_projected_peak_bytes},
+                            {"projected_peak_bytes", info.projected_peak_bytes},
+                            {"resident_at_admission_bytes", info.resident_at_admission_bytes},
+                            {"free_dofs", info.free_dofs},
+                            {"stored_nonzeros", info.stored_nonzeros}}}};
+}
 
 namespace {
 
@@ -163,7 +202,13 @@ struct BlockPattern {
 // coupled by something other than an element (bond ties, contact candidates).
 BlockPattern build_block_pattern(int n_nodes, const std::vector<int>& tets, int stride,
                                  const std::vector<int>& reduced,
-                                 const std::vector<std::array<int, 2>>& extra_pairs) {
+                                 const std::vector<std::array<int, 2>>& extra_pairs,
+                                 const SimCancelToken& cancel_token) {
+    auto check_cancel = [&]() {
+        if (cancel_token && cancel_token->load(std::memory_order_relaxed))
+            throw std::runtime_error("fea_static: cancelled");
+    };
+    check_cancel();
     BlockPattern bp;
     bp.free_node.assign(static_cast<std::size_t>(n_nodes), -1);
     for (int nid = 0; nid < n_nodes; ++nid)
@@ -176,6 +221,7 @@ BlockPattern build_block_pattern(int n_nodes, const std::vector<int>& tets, int 
     // second hash pass for no memory saving).
     std::vector<int64_t> off(static_cast<std::size_t>(nfn) + 1, 0);
     for (std::size_t e = 0; e < n_elems; ++e) {
+        if ((e & 4095) == 0) check_cancel();
         const int* tn = &tets[e * static_cast<std::size_t>(stride)];
         int nf = 0;
         for (int j = 0; j < stride; ++j)
@@ -197,6 +243,7 @@ BlockPattern build_block_pattern(int n_nodes, const std::vector<int>& tets, int 
     std::vector<int64_t> cur(off.begin(), off.end() - 1);
     auto push = [&](int r, int c) { flat[static_cast<std::size_t>(cur[static_cast<std::size_t>(r)]++)] = c; };
     for (std::size_t e = 0; e < n_elems; ++e) {
+        if ((e & 4095) == 0) check_cancel();
         const int* tn = &tets[e * static_cast<std::size_t>(stride)];
         for (int a = 0; a < stride; ++a) {
             const int r = bp.free_node[static_cast<std::size_t>(tn[a])];
@@ -213,19 +260,27 @@ BlockPattern build_block_pattern(int n_nodes, const std::vector<int>& tets, int 
         if (ra >= 0) { push(ra, ra); if (rb >= 0) push(ra, rb); }
         if (rb >= 0) { push(rb, rb); if (ra >= 0) push(rb, ra); }
     }
-    // Pass 2: sort/unique each row into the final compact column list.
+    // Sort/unique first, then allocate exactly the deduplicated adjacency. In
+    // particular do not grow col geometrically beside the duplicate workspace.
     bp.start.assign(static_cast<std::size_t>(nfn) + 1, 0);
-    bp.col.clear();
-    bp.col.reserve(flat.size() / 4 + 1);
+    int64_t unique_count = 0;
     for (int r = 0; r < nfn; ++r) {
+        if ((r & 1023) == 0) check_cancel();
         int* b = flat.data() + off[static_cast<std::size_t>(r)];
         int* e2 = flat.data() + cur[static_cast<std::size_t>(r)];
         std::sort(b, e2);
-        e2 = std::unique(b, e2);
-        bp.start[static_cast<std::size_t>(r)] = static_cast<int>(bp.col.size());
-        bp.col.insert(bp.col.end(), b, e2);
+        cur[static_cast<std::size_t>(r)] = std::unique(b, e2) - b;
+        unique_count += cur[static_cast<std::size_t>(r)];
+        // Guard before narrowing offsets, not after integer overflow.
+        if (unique_count > 2000000000LL / 9)
+            throw std::length_error("fea_static: reduced pattern exceeds the 32-bit sparse index limit");
+        bp.start[static_cast<std::size_t>(r) + 1] = static_cast<int>(unique_count);
     }
-    bp.start[static_cast<std::size_t>(nfn)] = static_cast<int>(bp.col.size());
+    bp.col.reserve(static_cast<std::size_t>(unique_count));
+    for (int r = 0; r < nfn; ++r) {
+        const int* b = flat.data() + off[static_cast<std::size_t>(r)];
+        bp.col.insert(bp.col.end(), b, b + cur[static_cast<std::size_t>(r)]);
+    }
     return bp;
 }
 
@@ -756,6 +811,9 @@ inline uint64_t factor_system_key(const std::vector<double>& points, const std::
                            double E_mpa, double nu, const std::vector<int>& fixed_nodes,
                            int nodes_per_elem, const std::vector<BondSpring>& bond_springs) {
     uint64_t h = factor_fnv1a(points.data(), points.size() * sizeof(double));
+    // A forced backend must never reuse another backend's retained factor.
+    const char* backend = std::getenv("CHUDWARE_FEA_SOLVER");
+    if (backend) h = factor_fnv1a(backend, std::strlen(backend), h);
     h = factor_fnv1a(tets.data(), tets.size() * sizeof(int), h);
     h = factor_fnv1a(&E_mpa, sizeof E_mpa, h);
     h = factor_fnv1a(&nu, sizeof nu, h);
@@ -1163,6 +1221,167 @@ private:
     double waited_ms_ = 0.0;
 };
 
+// All forecasts below are storage bounds, not empirical RSS calibrations. Saturate
+// before arithmetic overflow; the governor remains the sole budget authority.
+uint64_t storage_bytes(long double bytes) {
+    return bytes >= static_cast<long double>(UINT64_MAX)
+               ? UINT64_MAX : static_cast<uint64_t>(std::ceil(bytes));
+}
+
+bool admit_iccg(long double additional, const char* stage, FeaStaticResult& res) {
+    auto& report = res.iterative;
+    report.resident_at_admission_bytes = chudware::governor::process_rss_bytes();
+    report.projected_peak_bytes =
+        storage_bytes(additional + report.resident_at_admission_bytes);
+    report.maximum_projected_peak_bytes =
+        std::max(report.maximum_projected_peak_bytes, report.projected_peak_bytes);
+    report.admission_stage = stage;
+    // Count ALL resident process allocations (mesh, contact candidates, caches,
+    // other documents), not just this solve. Comparing that total with the live
+    // available-memory envelope is intentionally conservative, never a credit.
+    return chudware::governor::admit(report.projected_peak_bytes, stage, res.error);
+}
+
+// Natural ordering makes symbolic workspace bounded without a fill-ordering
+// extrapolation. Eigen's limited-memory IC keeps at most the input lower triangle
+// (dropping by original column count), but may shift its PRECONDITIONER. K itself
+// is never shifted. Neither successful IC nor CG certifies absence of rigid modes.
+class IccgSolver {
+    Eigen::IncompleteCholesky<double, Eigen::Lower, Eigen::NaturalOrdering<int>> ic_;
+    bool analyzed_ = false;
+public:
+    bool solve(const Eigen::SparseMatrix<double>& K, const Eigen::VectorXd& rhs,
+               Eigen::VectorXd& u, const SimCancelToken& token, FeaStaticResult& res) {
+        auto& report = res.iterative;
+        report.solves.emplace_back();
+        auto& step = report.solves.back();
+        step.relative_residual = std::numeric_limits<double>::infinity();
+        int residual_iteration = -1;
+        auto cancelled = [&]() {
+            return token && token->load(std::memory_order_relaxed);
+        };
+        auto fail = [&](const char* why) {
+            if (step.iterations > 0 && residual_iteration != step.iterations &&
+                u.size() == rhs.size()) {
+                const double norm = rhs.stableNorm();
+                const Eigen::VectorXd residual = K * u - rhs;
+                step.relative_residual = norm > 0.0
+                    ? residual.stableNorm() / norm : residual.stableNorm();
+            }
+            res.error = std::string("fea_static: ICCG ") + why +
+                        " (iterations=" + std::to_string(step.iterations) +
+                        ", limit=" + std::to_string(report.iteration_limit) + ")";
+            return false;
+        };
+        if (cancelled()) return fail("cancelled");
+        for (int col = 0; col < K.cols(); ++col) {
+            if (!(K.coeff(col, col) > 0.0)) return fail("non-positive diagonal");
+            for (Eigen::SparseMatrix<double>::InnerIterator it(K, col); it; ++it)
+                if (!std::isfinite(it.value())) return fail("non-finite matrix");
+            if ((col & 1023) == 0 && cancelled()) return fail("cancelled");
+        }
+        const long double nnz = K.nonZeros(), n = K.rows(), lower = (nnz + n) / 2;
+        // Recheck the live budget after assembly / waiting for the solve gate and
+        // on every contact numeric update. Existing K/base values/old IC are in
+        // process RSS; forecast the NEW factorization workspace and solve vectors.
+        if (!admit_iccg((nnz + 2 * lower) * (sizeof(double) + sizeof(int)) +
+                       lower * (sizeof(int) + 5 * sizeof(void*)) +
+                       n * (sizeof(std::list<int>) + 16 * sizeof(double) + 8 * sizeof(int)),
+                       "ICCG numeric update (storage bound)", res))
+            return false;
+        if (!analyzed_) {
+            ic_.analyzePattern(K);
+            analyzed_ = true;
+        }
+        // MUST refresh numerics on EVERY contact active-set matrix. Eigen's
+        // factorize is synchronous; cancellation is checked immediately around it.
+        if (cancelled()) return fail("cancelled");
+        ic_.factorize(K);
+        if (cancelled()) return fail("cancelled");
+        if (ic_.info() != Eigen::Success) return fail("incomplete Cholesky failed");
+        const double rhs_norm = rhs.stableNorm();
+        if (!std::isfinite(rhs_norm)) return fail("non-finite right-hand side norm");
+        u = Eigen::VectorXd::Zero(rhs.size());
+        Eigen::VectorXd r = rhs, z(rhs.size()), p(rhs.size()), ap(rhs.size()), truth(rhs.size());
+        auto true_residual = [&]() {
+            truth.noalias() = K * u;
+            truth -= rhs;
+            step.relative_residual = rhs_norm > 0.0
+                ? truth.stableNorm() / rhs_norm : truth.stableNorm();
+            residual_iteration = step.iterations;
+            return std::isfinite(step.relative_residual) && u.allFinite();
+        };
+        if (rhs_norm == 0.0) {
+            step.converged = true_residual() && step.relative_residual == 0.0;
+            return step.converged || fail("non-finite zero-load solution");
+        }
+        step.relative_residual = 1.0;  // u=0, nonzero RHS
+        residual_iteration = 0;
+        z = ic_.solve(r);
+        double rz = r.dot(z);
+        if (!z.allFinite() || !std::isfinite(rz) || rz <= 0.0)
+            return fail("non-positive preconditioned residual");
+        p = z;
+        double best = 1.0;
+        int stale = 0;
+        for (int i = 0; i < report.iteration_limit; ++i) {
+            if (cancelled()) return fail("cancelled");
+            ap.noalias() = K * p;
+            const double curvature = p.dot(ap);
+            if (!ap.allFinite() || !std::isfinite(curvature) || curvature <= 0.0) {
+                return fail("negative or zero curvature (indefinite/singular system)");
+            }
+            const double alpha = rz / curvature;
+            if (!std::isfinite(alpha)) return fail("non-finite step");
+            u.noalias() += alpha * p;
+            r.noalias() -= alpha * ap;
+            ++step.iterations;
+            ++report.total_iterations;
+            const double recursive = r.stableNorm() / rhs_norm;
+            if (!std::isfinite(recursive) || !u.allFinite())
+                return fail("non-finite iterate");
+            // Independently check acceptance; periodically replace drifted residuals
+            // and restart the direction, never accept a relaxed/degraded threshold.
+            const bool checkpoint = recursive <= report.tolerance ||
+                                    step.iterations % 32 == 0 ||
+                                    step.iterations == report.iteration_limit;
+            bool restart = false;
+            if (checkpoint) {
+                if (!true_residual()) return fail("non-finite true residual");
+                if (cancelled()) return fail("cancelled");
+                if (step.relative_residual <= report.tolerance) {
+                    step.converged = true;
+                    return true;
+                }
+                if (step.relative_residual < best * (1.0 - 64 * std::numeric_limits<double>::epsilon())) {
+                    best = step.relative_residual;
+                    stale = 0;
+                } else if (++stale >= 16) {
+                    return fail("stagnated without satisfying true residual tolerance");
+                }
+                // Preserve conjugacy unless the recursively updated residual has
+                // actually drifted; blind periodic restarts can stall elastic modes.
+                ap = truth + r;  // residual drift; previous K*p is no longer needed
+                restart = ap.stableNorm() > 0.1 * r.stableNorm();
+                if (restart) r = -truth;
+            }
+            if (step.iterations == report.iteration_limit)
+                return fail("iteration limit reached");
+            if (cancelled()) return fail("cancelled");
+            z = ic_.solve(r);
+            if (cancelled()) return fail("cancelled");
+            const double next_rz = r.dot(z);
+            if (!z.allFinite() || !std::isfinite(next_rz) || next_rz <= 0.0) {
+                return fail("non-positive preconditioned residual");
+            }
+            if (restart) p = z;
+            else p = z + (next_rz / rz) * p;
+            rz = next_rz;
+        }
+        return fail("iteration limit reached");
+    }
+};
+
 }  // namespace
 
 // The single implementation behind fea_static_solve (contact_springs empty — every
@@ -1187,6 +1406,36 @@ static FeaStaticResult solve_impl(const std::vector<double>& points,
                                  const FeaMaterials& materials) {
     FeaProf prof;
     FeaStaticResult res;
+    const bool iterative = fea_static_uses_iccg();
+    if (iterative) {
+        res.solver = "ICCG(IncompleteCholesky,Natural)";
+        res.iterative.iteration_limit = 10000;
+        if (const char* value = std::getenv("CHUDWARE_FEA_ICCG_MAX_ITERATIONS")) {
+            char* end = nullptr;
+            const long limit = std::strtol(value, &end, 10);
+            if (end == value || *end || limit < 1 || limit > 1000000) {
+                res.error = "fea_static: CHUDWARE_FEA_ICCG_MAX_ITERATIONS must be an integer in [1,1000000]";
+                return res;
+            }
+            res.iterative.iteration_limit = static_cast<int>(limit);
+        }
+        if (plasticity && plasticity->enabled) {
+            res.error = "fea_static: ICCG supports linear elasticity and frictionless penalty contact only; plasticity is unsupported";
+            return res;
+        }
+        res.conditioning_warning =
+            "ICCG convergence checks the loaded equations, not positive definiteness "
+            "or engineering validity. Incomplete Cholesky may shift its preconditioner "
+            "(never the physical stiffness); unexcited rigid/near-zero modes can "
+            "remain undetected. Existing fixture, contact, equilibrium and stabilizer "
+            "acceptance still applies.";
+    }
+    if (points.size() > static_cast<size_t>(std::numeric_limits<int>::max()) ||
+        tets.size() / static_cast<size_t>(std::max(1, nodes_per_elem)) >
+            static_cast<size_t>(std::numeric_limits<int>::max())) {
+        res.error = "fea_static: mesh exceeds the 32-bit DOF/element index limit";
+        return res;
+    }
     const int n_nodes = static_cast<int>(points.size() / 3);
     auto cancelled = [&]() {
         return cancel_token && cancel_token->load(std::memory_order_relaxed);
@@ -1206,7 +1455,7 @@ static FeaStaticResult solve_impl(const std::vector<double>& points,
         res.error = "fea_static: points length must be divisible by 3";
         return res;
     }
-    if (static_cast<int>(nodal_forces.size()) != n_dof) {
+    if (nodal_forces.size() != points.size()) {
         res.error = "fea_static: nodal_forces length must be n_nodes*3";
         return res;
     }
@@ -1217,6 +1466,23 @@ static FeaStaticResult solve_impl(const std::vector<double>& points,
     if (tets.size() % static_cast<size_t>(nodes_per_elem) != 0) {
         res.error = "fea_static: tets length must be divisible by nodes_per_elem";
         return res;
+    }
+    if (iterative) {
+        // Before ANY large solver allocation: duplicate node adjacency (npe^2
+        // per element, four per spring), compact adjacency at most as large, two
+        // int64 offset arrays, maps/flags and contact working copies. No matrix
+        // or incomplete factor is allocated to discover whether it fits.
+        const long double nodes = points.size() / 3;
+        const long double extras = static_cast<long double>(bond_springs.size()) +
+                                   contact_springs.size();
+        const long double slots = static_cast<long double>(tets.size()) *
+                                  nodes_per_elem + 4 * extras;
+        const long double workspace = 2 * slots * sizeof(int) +
+            nodes * (2 * sizeof(int64_t) + 12 * sizeof(int)) +
+            extras * (2 * sizeof(ContactPair) + 4 * sizeof(int)) +
+            (32ull << 20);
+        if (!admit_iccg(workspace, "ICCG pattern workspace (storage bound)", res))
+            return res;
     }
     const bool heterogeneous = !materials.materials.empty();
     const std::size_t elem_count = tets.size() / static_cast<std::size_t>(nodes_per_elem);
@@ -1474,8 +1740,11 @@ static FeaStaticResult solve_impl(const std::vector<double>& points,
     // does plasticity — the tangent changes with the material state at every Newton
     // iteration, and the key cannot see a state either. Material tables also bypass
     // this scalar-material key so changing an assignment cannot reuse stale stiffness.
+    // ICCG deliberately retains no prepared system: residual verification needs
+    // K, whereas this cache retains direct factors only. Never borrow a direct
+    // entry or hide an extra stiffness copy inside its factor accounting.
     const bool use_factor_cache =
-        (tet10 || hex8) && !contact_mode && !plastic_mode && !heterogeneous;
+        (tet10 || hex8) && !contact_mode && !plastic_mode && !heterogeneous && !iterative;
     uint64_t sys_key = 0;
     if (use_factor_cache) {
         sys_key = factor_system_key(points, tets, E_mpa, nu, fixed_nodes, nodes_per_elem,
@@ -1617,8 +1886,43 @@ static FeaStaticResult solve_impl(const std::vector<double>& points,
         }
         for (const ContactPair& cp : pairs) extra_pairs.push_back({cp.a, cp.b});
 
-        const BlockPattern bp =
-            build_block_pattern(n_nodes, tets, stride, reduced, extra_pairs);
+        BlockPattern bp;
+        try {
+            bp = build_block_pattern(n_nodes, tets, stride, reduced, extra_pairs, cancel_token);
+        } catch (const std::exception& e) {
+            res.error = e.what();
+            return res;
+        }
+        if (iterative) {
+            auto& report = res.iterative;
+            report.free_dofs = static_cast<uint64_t>(n_free);
+            report.stored_nonzeros = 9ull * bp.col.size();
+            const long double nnz = report.stored_nonzeros, n = n_free;
+            const long double lower = (nnz + n) / 2;
+            // Inspected Eigen IncompleteCholesky storage:
+            // K(double/int CSC); lower L and L_save; reserve another full sparse
+            // temporary for selfadjoint assignment/reallocation; listCol contains
+            // at most one allocated list link per visited lower entry. Five pointer
+            // widths plus index bound each link including allocator overhead/alignment.
+            // Per DOF: CSC starts, scale, firstElt/col_irow/col_pattern, col_vals,
+            // list heads and CG/RHS/active-set vectors. Recovery arrays coexist only
+            // later, but include them as well rather than relying on allocator release.
+            const long double sparse = (2 * nnz + 2 * lower) *
+                                       (sizeof(double) + sizeof(int));
+            const long double lists = lower * (sizeof(int) + 5 * sizeof(void*)) +
+                                      n * sizeof(std::list<int>);
+            const long double vectors = n * (16 * sizeof(double) + 8 * sizeof(int));
+            const long double recovery = static_cast<long double>(n_nodes) *
+                                         (40 * sizeof(double) + 12 * sizeof(int)) +
+                                         static_cast<long double>(n_tets) * 2 * sizeof(double);
+            const long double contact = contact_mode
+                ? nnz * sizeof(double) + static_cast<long double>(pairs.size()) *
+                  (2 * sizeof(ContactPair) + 16 * sizeof(double)) : 0;
+            if (!admit_iccg(sparse + lists + vectors + recovery + contact + (40ull << 20),
+                            "ICCG matrix/preconditioner/recovery (storage bound)", res))
+                return res;
+        }
+        if (cancelled()) return cancel_result();
         prof.note("nodes=%d  n_dof=%d  n_elems=%d  nodes/elem=%d  free_dof=%d", n_nodes, n_dof,
                   n_tets, nodes_per_elem, n_free);
         prof.note("pattern: %d free nodes, %d blocks, nnz=%lld (~%.1f MB, %.0f B/elem)",
@@ -2640,14 +2944,20 @@ static FeaStaticResult solve_impl(const std::vector<double>& points,
             // repeated work.
             const std::size_t knnz = static_cast<std::size_t>(Kff.nonZeros());
             std::vector<double> base_values(kval, kval + knnz);
-            auto solver = make_solver(requested_solver_kind());
-            const bool symbolic_ok = solver->analyze(Kff);
+            auto solver = iterative ? std::unique_ptr<FactorSolver>{}
+                                    : make_solver(requested_solver_kind());
+            IccgSolver iccg;
+            const bool symbolic_ok = solver && solver->analyze(Kff);
             prof.mark("contact symbolic analyze");
             std::string solver_label;
             auto solve_iteration = [&](const Eigen::VectorXd& rhs,
                                        Eigen::VectorXd& out) -> bool {
                 const int nthreads = fea_solver_threads(n_free);
                 apply_solver_thread_cap(nthreads);
+                if (iterative) {
+                    solver_label = res.solver;
+                    return iccg.solve(Kff, rhs, out, cancel_token, res);
+                }
                 if (symbolic_ok && solver->factorize(Kff)) {
                     out = solver->solve(rhs);
                     if (out.size() == n_free) {
@@ -2757,6 +3067,7 @@ static FeaStaticResult solve_impl(const std::vector<double>& points,
                     }
                 }
                 if (!solve_iteration(ffc, uf)) {
+                    if (iterative) return res;  // preserve exact failure; never direct fallback
                     res.error =
                         "fea_static: contact iteration " + std::to_string(iter) +
                         " failed to factor the penalty-augmented system (singular): the "
@@ -2839,20 +3150,26 @@ static FeaStaticResult solve_impl(const std::vector<double>& points,
             const int nthreads = fea_solver_threads(n_free);
             apply_solver_thread_cap(nthreads);
             std::string label;
-            prof.note("solver=%s (%d threads)", make_solver(requested_solver_kind())->label(),
+            prof.note("solver=%s (%d threads)", iterative ? res.solver.c_str() : make_solver(requested_solver_kind())->label(),
                       nthreads);
             bool spd_rejected = false;
-            std::unique_ptr<FactorSolver> built =
-                factor_and_solve(Kff, ff, uf, label, spd_rejected);
+            std::unique_ptr<FactorSolver> built;
+            if (iterative) {
+                IccgSolver iccg;
+                if (!iccg.solve(Kff, ff, uf, cancel_token, res)) return res;
+                label = res.solver;
+            } else {
+                built = factor_and_solve(Kff, ff, uf, label, spd_rejected);
+            }
             prof.mark("analyze+factorize+solve");
-            if (!built) {
+            if (!iterative && !built) {
                 res.error = "fea_static: sparse factorization failed (singular system)";
                 return res;
             }
             solved = true;
             res.solver = label;
             prof.note("solver used=%s  factor=%.1f MB", label.c_str(),
-                      static_cast<double>(built->factor_bytes()) / 1.048576e6);
+                      built ? static_cast<double>(built->factor_bytes()) / 1.048576e6 : 0.0);
             // A strict Cholesky refusing this matrix means the MODEL has a
             // (near-)zero-stiffness mode — see factor_and_solve. Say so, and localize
             // it: the usual carrier is an element sharing TWO CORNERS OR FEWER with

@@ -218,6 +218,10 @@ struct MeshQualityFacts {
     // rather than reported as a row of zeros.
     bool local_refine_active = false;
     int local_refine_waves = 0;
+    double local_refine_transition_depth_mm = 0.0;
+    std::uint64_t local_refine_transition_marks = 0;
+    std::uint64_t local_refine_outside_transition_marks = 0;
+    std::uint64_t local_refine_outside_transition_checks = 0;
     int local_refine_smoothing_passes = 0;
     double local_refine_jacobian_min_before = 0.0;
     double local_refine_jacobian_min_after = 0.0;
@@ -297,6 +301,10 @@ json mesh_quality_json(const MeshQualityFacts& quality, std::size_t n_nodes,
     if (quality.local_refine_active)
         out["local_refine"] =
             json{{"waves", quality.local_refine_waves},
+                 {"transition_depth_mm", quality.local_refine_transition_depth_mm},
+                 {"transition_marks", quality.local_refine_transition_marks},
+                 {"outside_transition_marks", quality.local_refine_outside_transition_marks},
+                 {"outside_transition_checks", quality.local_refine_outside_transition_checks},
                  {"smoothing_passes", quality.local_refine_smoothing_passes},
                  {"jacobian_min_before", quality.local_refine_jacobian_min_before},
                  {"jacobian_min_after", quality.local_refine_jacobian_min_after},
@@ -854,7 +862,8 @@ bool resolve_mesh(const json &study, std::vector<double> &points,
                   std::vector<int> &tets, int &nodes_per_elem,
                   std::string &mesh_type_used, std::string &note,
                   std::optional<MeshAdvisor> &advisor,
-                  detail::MeshQualityFacts &quality, std::string &err) {
+                  detail::MeshQualityFacts &quality, std::string &err,
+                  bool iterative_solver = false) {
   nodes_per_elem = 4;
   mesh_type_used.clear();
   note.clear();
@@ -934,7 +943,8 @@ bool resolve_mesh(const json &study, std::vector<double> &points,
     return true;
   }
   if (has_step) {
-    const MeshOptions options = mesh_options_from_study(study);
+    MeshOptions options = mesh_options_from_study(study);
+    options.iterative_solver = iterative_solver;
     const std::string step_path = study["step_path"].get<std::string>();
     auto mesh = mesh_step_cached(step_path, options);
     quality.governor = mesh_governor_json(*mesh);
@@ -1141,6 +1151,10 @@ bool resolve_mesh(const json &study, std::vector<double> &points,
     if (mesh->local_refine_size_mm > 0.0) {
       quality.local_refine_active = true;
       quality.local_refine_waves = mesh->local_refine_waves;
+      quality.local_refine_transition_depth_mm = mesh->local_refine_transition_depth_mm;
+      quality.local_refine_transition_marks = mesh->local_refine_transition_marks;
+      quality.local_refine_outside_transition_marks = mesh->local_refine_outside_transition_marks;
+      quality.local_refine_outside_transition_checks = mesh->local_refine_outside_transition_checks;
       quality.local_refine_smoothing_passes = mesh->local_refine_smoothing_passes;
       quality.local_refine_jacobian_min_before =
           mesh->local_refine_jacobian_min_before;
@@ -2969,7 +2983,8 @@ static nlohmann::json fea_run_static_impl(
         report_progress("mesh.begin", 0);
         chudware::prof::phases::PhaseScope _p("mesh");
         if (!resolve_mesh(study, points, tets, nodes_per_elem, mesh_type_used,
-                          mesh_note, mesh_advisor, mesh_quality, err))
+                          mesh_note, mesh_advisor, mesh_quality, err,
+                          fea_static_uses_iccg()))
             return json{{"ok", false}, {"error", err},
                         {"provenance", {{"governor", mesh_quality.governor}}}};
     }
@@ -3970,13 +3985,14 @@ static nlohmann::json fea_run_static_impl(
     }
     // Governor admission: refuse a solve that would blow past the host's memory
     // budget with a clear, actionable error instead of OOM-crashing the process
-    // (the GUI/MCP already render {"ok":false,"error"} gracefully). The projected
-    // peak comes from governor::fea_peak_bytes — MEASURED peak RSS of this very
-    // path, safety-factored — so it is compared to the budget as-is.
+    // (the GUI/MCP already render {"ok":false,"error"} gracefully).
+    // Direct modes retain the calibrated direct-factor RSS model unchanged.
+    // ICCG is admitted inside the kernel, before pattern allocation and again on
+    // measured free-DOF/nnz storage, not against a direct fill extrapolation.
     {
         std::string why;
         const size_t n_elems_est = tets.size() / static_cast<size_t>(nodes_per_elem);
-        if (!chudware::governor::admit_fea(n_elems_est, nodes_per_elem, 3,
+        if (!fea_static_uses_iccg() && !chudware::governor::admit_fea(n_elems_est, nodes_per_elem, 3,
                                            "static FEA solve", why)) {
             if (mesh_quality.governor.is_object())
                 mesh_quality.governor["reason"] = "memory_admission";
@@ -4093,6 +4109,25 @@ static nlohmann::json fea_run_static_impl(
                    : fea_static_solve(points, tets, E_mpa, nu, yield_mpa, fixed_nodes,
                                       nodal_forces, nodes_per_elem, bond_springs,
                                       job.token(), element_materials));
+    if (r.iterative.iteration_limit > 0) {
+        // Keep the mesh-count evidence, but never label a direct-factor
+        // extrapolation as the memory estimate governing this iterative solve.
+        if (!mesh_quality.governor.is_object()) mesh_quality.governor = json::object();
+        mesh_quality.governor["direct_reference_estimate_gb"] =
+            mesh_quality.governor.value("estimate_gb", json(nullptr));
+        mesh_quality.governor["estimate_gb"] =
+            r.iterative.maximum_projected_peak_bytes / 1073741824.0;
+        mesh_quality.governor["solve_memory_model"] =
+            "inspected_sparse_storage_bound_not_measured_peak";
+        mesh_quality.governor["solve_admission_stage"] = r.iterative.admission_stage;
+    }
+    auto solver_provenance = [&]() {
+        json provenance = detail::provenance_json(r.solver.c_str());
+        provenance["governor"] = mesh_quality.governor;
+        if (r.iterative.iteration_limit > 0)
+            provenance["linear_solver"] = fea_iterative_report_json(r);
+        return provenance;
+    };
     // The contact block is EVIDENCE, so it rides on the refusal too: a reader has to be
     // able to see how many pairs there were and how far the active set got.
     //
@@ -4261,6 +4296,7 @@ static nlohmann::json fea_run_static_impl(
         json fail{{"ok", false}, {"error", msg}, {"notes", notes}};
         if (contact_enabled || interfaces_enabled) fail["contact"] = contact_json();
         if (plastic_enabled) fail["plasticity"] = plasticity_json();
+        fail["provenance"] = solver_provenance();
         return fail;
     }
     // A non-converged active set is not a contact solution: the displacements belong to
@@ -4291,6 +4327,7 @@ static nlohmann::json fea_run_static_impl(
             {"contact", contact_json()},
             {"notes", notes}};
         if (plastic_enabled) fail["plasticity"] = plasticity_json();
+        fail["provenance"] = solver_provenance();
         return fail;
     }
     // The load crossed the interface through too few pairs to be a contact patch:
@@ -4303,6 +4340,7 @@ static nlohmann::json fea_run_static_impl(
                   {"contact", contact_json()},
                   {"notes", notes}};
         if (plastic_enabled) fail["plasticity"] = plasticity_json();
+        fail["provenance"] = solver_provenance();
         return fail;
     }
     if (nodes_per_elem == 10) notes.push_back("second-order (tet10) elements");
@@ -4522,6 +4560,8 @@ static nlohmann::json fea_run_static_impl(
                              : "chudware/fea_static [" + r.solver + "]";
         out["provenance"] = detail::provenance_json(solver_route.c_str());
         out["provenance"]["governor"] = mesh_quality.governor;
+        if (r.iterative.iteration_limit > 0)
+            out["provenance"]["linear_solver"] = fea_iterative_report_json(r);
         out["provenance"]["material_mode"] = per_body_material ? "per_body" : "single";
         out["material"] = material_packet;
         out["material"]["interface_stiffness_rule"] = "softer_body_E";
@@ -5732,6 +5772,7 @@ inline uint64_t mesh_opts_key(const MeshOptions &options, uint64_t hash) {
   hash = fnv1a(&options.max_size_mm, sizeof options.max_size_mm, hash);
   hash = fnv1a(&options.learned_advisor, sizeof options.learned_advisor, hash);
   hash = fnv1a(&options.advisor_max_dof, sizeof options.advisor_max_dof, hash);
+  hash = fnv1a(&options.iterative_solver, sizeof options.iterative_solver, hash);
   // Whether the study declared its interfaces changes the MESH itself
   // (overlapping solids fused into one body versus kept separate), so it is
   // part of the key: serving the fused mesh to a contact study would hand it a

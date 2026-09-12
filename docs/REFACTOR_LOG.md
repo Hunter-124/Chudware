@@ -4056,3 +4056,163 @@ Optional V&V/modeling/benchmark/AppImage switches remained unset; those skips
 are not claims of having exercised their extended suites. The gate's real
 thermal board result was 133.3956 C. Separate project wheel/contact studies
 are engineering work and are not software-gate strength approvals.
+
+## 2026-09-11 — additional product-qualified material selections
+
+Added thirteen sourced records for welded 6061, DH spring wire, C75S strip,
+SUS420J2 rotor stock, 316 wire rope, Optibelt OMEGA 8M, RF38 lining, Bowden
+housing, silicone grips, DP620NS adhesive, class-10 nuts, 24 mm/17-ply Finnish
+birch plywood, and natural machined PA66. Missing constitutive data remains
+missing. Linear mass is not bulk density; RF38 density is an upper bound;
+nut class 10 is not bolt class 10.9. Product dimensions and stock-condition
+limits accompany the records rather than implying that unlike CAD geometry
+is the catalog product. The belt's minimum backside-idler diameter is 60 mm.
+
+A production harness smoke saved/reopened all thirteen identities and their
+appearances. Eight 10 mm cubes returned density-derived masses, five records
+without bulk density refused mass calculation, and all thirteen incomplete
+models refused native isotropic FEA before meshing. An explicit density
+override changed a mass calculation without changing the saved identity.
+Evidence: ME-490 `Engineering/Verification/me490_harness_additional_catalog_verified.json`.
+Installed-registry material tests: 94 passed.
+
+## 2026-09-11 — honored shell deadlines and bounded timeout cleanup
+
+The registered `run_shell` tool silently clamped a requested long analysis to
+900 seconds, then could leave child solvers running after killing only the
+shell. Timeout output could also be bytes rather than JSON-safe text.
+The tool now honors 1–86400 seconds, retains its 60-second default, and
+refuses out-of-range deadlines before executing anything. POSIX commands
+have an isolated process group; Windows commands use process-tree termination.
+Timeout cleanup has a bounded drain and explicitly refuses completion when
+an escaped descendant still owns the output pipe. Combined output is capped
+in bytes and decoded consistently, including partial non-UTF-8 timeout output.
+
+Three regressions failed before the repair; all 34 filesystem-tool tests
+passed afterward. A real registered-tool call timed out at one second,
+returned its Unicode/non-UTF-8 partial output as text with exit 124, and
+prevented the child's delayed file write. Its throwaway probe was removed.
+Evidence: ME-490 `Engineering/Verification/run_shell_timeout_probe_result.json`.
+Windows process-tree termination was implemented but not runtime-tested here.
+Interrupted engineering outputs are quarantined, not accepted as valid results.
+
+## 2026-09-11 — classify solid skin boundaries rather than imprint ancestors
+
+A native three-feature fork reproduction exposed two false free edges where
+round stock overlaps tangent rectangular ears. Those imprints are internal
+to closed faces; having one ancestor face does not make them skin boundaries.
+Both `doc_eval_check` and `doc_eval_solid_health` now count oriented boundary
+uses. Seams contribute two uses; embedded INTERNAL/EXTERNAL occurrences do
+not contribute skin boundaries or hide a genuine single-use boundary.
+Degenerate-edge handling and independent BRep/orientation/self-intersection
+checks remain in force.
+
+The reproduction failed four assertions before the fix and passes afterward.
+All 22 native interference/health tests pass (331 assertions), including
+open surfaces, invalid orientation, missing assembly sources, placed bodies
+and distinct touching solids. This corrects the health classifier, not the
+geometry or a structural-strength result.
+
+Fresh production-harness verification (`ME-490/Engineering/Verification/
+me490_harness_native_health_accepted.json`) found all 252 bodies in 88 drivetrain
+clones sound. It separately retained the two genuinely self-intersecting steering
+uprights among 19 bodies; the classifier repair did not waive those failures.
+
+## 2026-09-12 — bounded native ownership and exact selected-pair checks
+
+The watchdog now reserves the short deadline for ping/test-stall probes.
+Document rebuilds, preflights, undo/redo and lock-taking native calls use the
+bounded long deadline (3600 seconds by default). This is not durable background
+modeling or cancellable OCCT execution. `DaemonSessionLost` distinguishes lost
+established write/reply delivery from an initial pre-dispatch startup failure.
+Ambiguous delivery reports `engine_connection_lost`, an unknown outcome and
+`retryable:false`; it is not replayed or routed through the legacy engine.
+The next explicit request may reconnect. Rebind documents from their saved
+sources rather than reusing ordinal clone IDs after session loss. Checkpoint,
+preflight, rollback and save paths preserve that refusal instead of manufacturing
+a success or closing a potentially reused clone ID.
+
+The registered `check_interference(members=[...])` now exposes the existing native
+exact-name pair scope. Unknown or malformed selections are refused, not silently
+reduced to fewer bodies. Reports identify selected versus total membership;
+`complete` applies only to that scope. Only a complete document-wide check clears
+transform-placement warnings. Three invalid-selection regressions failed before
+the fix; the complete native interference suite passes 22 cases/338 assertions.
+Four registered-tool tests also pass, including saved/reopened placement warnings
+after a partial check and their removal only after the full exact check.
+
+The standalone watchdog check and 85 transport/modeling-loss/preflight/filesystem
+tests passed. A retained project correction was explicitly saved/reopened and
+hash-archived before cancelling its redundant document-wide read-only query;
+its continuation uses the scoped production tool, not an inferred query result.
+
+## 2026-09-12 — bounded interface refinement and explicit native ICCG
+
+`core/sim/mesher.cpp` materializes the centroid Eigen vector instead of returning
+an expression referencing a dead local. Centroid grading stops at its computed
+transition depth rather than marking the distant background once the requested
+size has saturated. Boundary owners, conforming closure, delivered size and
+quality floors remain enforced. Reports distinguish transition and outside-region
+centroid marks from closure. The regression exposed 4237/3810 outside marks before
+the bound; afterward both are zero and distant coarse cells remain coarse.
+The full advanced mesher suite passes 10 cases/213 assertions.
+
+`CHUDWARE_FEA_SOLVER=iccg` explicitly selects guarded incomplete-Cholesky PCG for
+linear static/frictionless contact; direct solving remains the default and is
+never an automatic fallback. PCG retains a fresh true-residual gate of 1e-10,
+bounded iterations and cancellation checks. Every changed active-set matrix
+refreshes its numerical preconditioner. Nonfinite/breakdown/stagnation/exhaustion
+paths refuse. Plasticity is unsupported, and iterative convergence is not a
+positive-definiteness certificate for buckling prestress or structural safety.
+
+Iterative mesh admission skips only the direct-factor count model, not mesh
+allocation limits. Solver admission uses the actual reduced sparse pattern and
+includes matrix/preconditioner/workspace/recovery storage and process RSS.
+Provenance records per-step iterations/residuals and current/maximum projected
+memory. Mesh, prepared-system and outer static-result caches include solver
+policy; the ICCG iteration limit cannot be bypassed by a cached successful result.
+The iterative path does not reuse a direct-factor-only prepared cache.
+Six ICCG cases pass 1978 assertions; complete contact and simulation-cache CTests
+also pass. These are software proofs, not a solved ME-490 hub contact study.
+
+The staged production API also passed an isolated synthetic 60×10×10 mm bar
+smoke: 8991 DOFs, 282 ICCG iterations and a fresh relative residual of
+6.651358227687084e-11 against the unchanged 1e-10 gate. Provenance and native
+setup/result/VTU hashes are retained in
+`me490_harness_iccg_native_smoke.json`. This is an iterative API smoke, not a
+reduced-load substitute for the unchanged five-body 765 Nm hub contact study.
+
+## 2026-09-12 — sourced housing and independently checked external membrane
+
+Added the distinct Jagwire BHL100 CGX-SL 5 mm brake-housing identity. Its steel
+coil, lubricated liner and black jacket are a composite envelope, not a solid
+steel cable. Missing bulk density and constitutive properties stay missing.
+The sourced material resolver suite passes 94 tests; physical selection,
+cross-sections and native refusal/persistence evidence remain project artifacts.
+
+ME-490's project-local `Engineering/Analysis` now contains an explicitly external
+scikit-fem quadratic isoparametric membrane backend with SciPy CG/PyAMG.
+It stores reduced stiffness plus constrained reaction rows, enforces finite
+cgroup memory admission and preserves raw integration-point fields. Float64
+PCG/AMG uses bounded defect correction with streamed long-double residuals and
+accumulated/raw fields; all correction stages share the original iteration
+budget. The true-residual gates were not relaxed. Ordinary engineering JSON/VTU
+summaries remain float64; this is not an all-wide stiffness assembly.
+
+Registered `run_shell` verification passed the analytic coupons, all nine retained
+CCX coarse comparisons and tighter-solve/higher-quadrature sensitivity checks at
+their original limits. Evidence is under `orthotropic_direct2d_run03`; failed
+runs remain preserved. The separate 9.2 mm PCD350 candidate completed nine coarse
+cases in run04, failed the sourced component-stress screen, and refused the first
+h=1 case on memory admission. No fine-mesh convergence or wheel qualification is
+claimed. None of this adds or advertises a native orthotropic Chudware solver.
+
+## 2026-09-12 — native corrections release gate
+
+The complete gate at `/tmp/chudware-gate-372191` reported PASS: native/GUI/WASM
+builds, all core CTests, 9904 Python tests, hostd/web parity, Linux packaging,
+13 golden-demo legs and both GUI captures. Unset opt-in suites remain explicit
+skips. The outer one-hour command timed out while the systemd service continued;
+its abandoned output pipe was reattached without restarting passed stages.
+`recovered_tail.out` preserves the actual final gate summary and PASS.
+The temporary watchdog executable and output-recovery helper were removed.

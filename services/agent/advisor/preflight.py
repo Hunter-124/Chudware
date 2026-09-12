@@ -80,8 +80,8 @@ def run_preflight(
 ) -> dict:
     """Dry-run *ops* on a shadow clone of *doc_id*.
 
-    Returns an ``aicad.preflight/1`` dict.  Never raises — any unexpected error
-    degrades to a single ``warn`` item so the caller always gets a usable envelope.
+    Returns an ``aicad.preflight/1`` dict. Unexpected advisory errors degrade to
+    a warn item; engine connection loss propagates because document identity is uncertain.
 
     Parameters
     ----------
@@ -96,6 +96,8 @@ def run_preflight(
     try:
         return _run(doc_id, tool, ops)
     except Exception as exc:  # noqa: BLE001
+        if getattr(exc, "code", None) == "engine_connection_lost":
+            raise
         return _envelope(
             doc_id=doc_id, tool=tool, ops=ops,
             verdict="warn",
@@ -161,14 +163,15 @@ def _run(doc_id: str, tool: str, ops: list[dict]) -> dict:
 
         try:
             cb.call("doc_apply_ops", {"doc_id": clone_id, "ops": clone_ops})
-        except CoreError:
-            pass  # malformed original; clone_id is still a valid (empty) doc
+        except CoreError as exc:
+            if exc.code == "engine_connection_lost":
+                raise
+            # Malformed original; clone_id is still a valid (empty) doc.
 
         elapsed = time.monotonic() - t0
 
         # Performance guard on clone+apply wall time.
         if elapsed > _CLONE_BUDGET_S:
-            _close_clone(clone_id, cb)
             return _skipped_envelope(doc_id, tool, ops, reason="budget",
                                      detail=f"clone+apply took {elapsed:.1f}s (limit {_CLONE_BUDGET_S}s)")
 
@@ -212,6 +215,12 @@ def _run(doc_id: str, tool: str, ops: list[dict]) -> dict:
                 "refs": {},
             })
 
+    except CoreError as exc:
+        if exc.code == "engine_connection_lost":
+            # The ordinal clone id may now name another document. Do not reconnect
+            # from finally just to close it, or mask the original unknown outcome.
+            clone_id = None
+        raise
     finally:
         if clone_id:
             _close_clone(clone_id, cb)
@@ -273,7 +282,9 @@ def _close_clone(clone_id: str, cb: Any) -> None:
     # (auto-preflight fires on every add_features → dozens of stale `_pf` docs pinned in the engine).
     try:
         cb.call("doc_close", {"doc_id": clone_id})
-    except Exception:  # noqa: BLE001
+    except Exception as exc:  # noqa: BLE001
+        if getattr(exc, "code", None) == "engine_connection_lost":
+            raise
         pass
 
 
@@ -294,7 +305,9 @@ def _check_refs_resolve(ops: list[dict], clone_id: str, cb: Any) -> list[dict]:
                 known_ids.add(f["id"])
             if f.get("name"):
                 known_names.add(f["name"])
-    except Exception:  # noqa: BLE001
+    except Exception as exc:  # noqa: BLE001
+        if getattr(exc, "code", None) == "engine_connection_lost":
+            raise
         # If doc_tree fails, skip this check rather than false-fail.
         return []
 
@@ -377,7 +390,9 @@ def _check_params_sane(ops: list[dict], clone_id: str, cb: Any) -> list[dict]:
                         issues.append(
                             f"{fname}: radius {radius} >= adjacent wall {wall:.3f} on clone"
                         )
-                except Exception:  # noqa: BLE001
+                except Exception as exc:  # noqa: BLE001
+                    if getattr(exc, "code", None) == "engine_connection_lost":
+                        raise
                     pass  # measure may not apply — skip, not a hard fail
 
         # Hole: depth should not exceed body extent (best-effort).
@@ -396,7 +411,9 @@ def _check_params_sane(ops: list[dict], clone_id: str, cb: Any) -> list[dict]:
                         issues.append(
                             f"{fname}: hole depth {depth} > body max extent {max_extent:.3f}"
                         )
-                except Exception:  # noqa: BLE001
+                except Exception as exc:  # noqa: BLE001
+                    if getattr(exc, "code", None) == "engine_connection_lost":
+                        raise
                     pass
 
     if issues:
@@ -425,6 +442,8 @@ def _check_rebuild_predict(
     try:
         resp = cb.call("doc_apply_ops", {"doc_id": clone_id, "ops": ops})
     except CoreError as exc:
+        if getattr(exc, "code", None) == "engine_connection_lost":
+            raise
         predicted["feature_status"] = []
         predicted["dof"] = None
         return [{
@@ -523,7 +542,9 @@ def _check_downstream_impact(ops: list[dict], clone_id: str, cb: Any) -> list[di
                     "feature": fid or fname,
                     "relation": "references edited feature",
                 })
-    except Exception:  # noqa: BLE001
+    except Exception as exc:  # noqa: BLE001
+        if getattr(exc, "code", None) == "engine_connection_lost":
+            raise
         pass
 
     # Also try doc_adjacency if available.
@@ -539,7 +560,9 @@ def _check_downstream_impact(ops: list[dict], clone_id: str, cb: Any) -> list[di
                     }
                     if entry not in downstream:
                         downstream.append(entry)
-        except Exception:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001
+            if getattr(exc, "code", None) == "engine_connection_lost":
+                raise
             pass
 
     return downstream

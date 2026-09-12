@@ -12,6 +12,8 @@ Semantics preserved vs the legacy in-process ctypes path:
   * The engine loads asynchronously in the daemon; a {"code":"loading"} reply is
     absorbed here by polling daemon_status until ready (bounded), so callers
     still see the old "load blocks until done" behavior.
+  * A lost reply is outcome-unknown: never replay that RPC. Only a subsequent
+    explicit call reconnects; callers must recover document identity explicitly.
   * Daemon push events (doc.changed etc., Phase 3) buffer in-process; MCP tool
     layers drain them via poll_events() to surface _foreign_edits notes.
 
@@ -52,6 +54,18 @@ from typing import Optional
 
 class DaemonError(RuntimeError):
     """Transport-level daemon failure (connect/spawn/protocol)."""
+
+
+class DaemonSessionLost(DaemonError):
+    """The established engine connection is unusable; never switch engines."""
+
+    code = "engine_connection_lost"
+
+    def __init__(self, message: str, method: str, outcome: str = "unknown"):
+        super().__init__(
+            f"{method}: engine connection lost; outcome {outcome}. {message}"
+        )
+        self.detail = {"method": method, "outcome": outcome, "retryable": False}
 
 
 def _fnv1a64_hex(s: str) -> str:
@@ -323,7 +337,7 @@ def _spawn_hostd_detached(hostd: Path) -> "subprocess.Popen":
 
 
 class DaemonClient:
-    """One connection to chudware-hostd. Thread-safe; reconnects once on EOF."""
+    """One connection to chudware-hostd. Thread-safe; never replays a lost reply."""
 
     ENGINE_READY_BUDGET_S = 300.0  # cold OCCT load headroom
     # Spawn gate (see connect()): once a spawn+connect cycle has failed, refuse to
@@ -345,10 +359,20 @@ class DaemonClient:
         self._stale_retry_done = False  # one drain-replace attempt per client
         self._spawn_block_until = 0.0  # monotonic deadline; 0 = spawning allowed
         self._spawn_fail_streak = 0
+        self._session_established = False
 
     # ---------------------------------------------------------------- connect
 
     def connect(self, spawn: bool = True, budget_s: float = 15.0) -> None:
+        try:
+            self._connect(spawn, budget_s)
+        except (DaemonError, OSError) as e:
+            self._disconnect()
+            if self._session_established:
+                raise DaemonSessionLost(str(e), "connect", "not_dispatched") from e
+            raise DaemonError(str(e)) from e
+
+    def _connect(self, spawn: bool, budget_s: float) -> None:
         _reap_spawned()
         hostd = resolve_hostd_bin()
         self._sock_path = socket_path(hostd)
@@ -446,6 +470,7 @@ class DaemonClient:
         self.server_info = self._call_raw(
             "hello", {"client": "mcp", "pid": os.getpid(), "proto": 1}
         )
+        self._session_established = True
         self._drain_replace_if_stale(hostd, spawn)
 
     def _note_spawn_failed(self) -> None:
@@ -509,9 +534,18 @@ class DaemonClient:
 
     def close(self) -> None:
         with self._lock:
-            if self._sock:
+            self._disconnect()
+
+    def _disconnect(self) -> None:
+        """Drop a failed connection while retaining its established-session history."""
+        if self._sock is not None:
+            try:
                 self._sock.close()
-                self._sock = None
+            except OSError:
+                pass
+            self._sock = None
+        self._buf = b""
+        self._events.clear()
 
     # ---------------------------------------------------------------- wire I/O
 
@@ -567,41 +601,43 @@ class DaemonClient:
     # ---------------------------------------------------------------- public
 
     def call(self, method: str, params: Optional[dict] = None) -> dict:
-        """Blocking RPC with loading-absorption and one reconnect on EOF."""
+        """Blocking RPC; only an explicit loading refusal permits redispatch."""
         with self._lock:
-            for attempt in (1, 2):
-                if self._sock is None:
-                    # Reconnect inline (also re-spawns if the daemon died).
-                    self._lock.release()
-                    try:
-                        self.connect()
-                    finally:
-                        self._lock.acquire()
-                try:
+            if self._sock is None:
+                self.connect()
+            outcome = "unknown"
+            try:
+                result = self._call_raw(method, params or {})
+                if result.get("_is_error") and result.get("code") == "loading":
+                    # hostd explicitly refused dispatch: readiness polling cannot
+                    # have applied this operation, unlike a lost operation reply.
+                    outcome = "not_dispatched"
+                    readiness_error = self._wait_engine_ready()
+                    if readiness_error is not None:
+                        return readiness_error
+                    outcome = "unknown"
                     result = self._call_raw(method, params or {})
-                    if result.get("_is_error") and result.get("code") == "loading":
-                        self._wait_engine_ready()
-                        result = self._call_raw(method, params or {})
-                    return result
-                except (DaemonError, OSError) as e:
-                    # OSError covers a dead peer noticed on write (BrokenPipe)
-                    # rather than on read — same reconnect-once handling.
-                    self._sock = None
-                    if attempt == 2:
-                        raise DaemonError(str(e)) from e
-        raise DaemonError("unreachable")  # pragma: no cover
+                return result
+            except (DaemonError, OSError) as e:
+                # Even sendall failure can follow a partial/complete delivery.
+                # Do not infer a restart, reissue ordinal doc_ids, or fall back
+                # into an unrelated native engine. Next explicit call reconnects.
+                self._disconnect()
+                raise DaemonSessionLost(str(e), method, outcome) from e
 
-    def _wait_engine_ready(self) -> None:
+    def _wait_engine_ready(self) -> Optional[dict]:
         deadline = time.monotonic() + self.ENGINE_READY_BUDGET_S
         while time.monotonic() < deadline:
             st = self._call_raw("daemon_status", {})
             state = st.get("state")
             if state == "ready":
-                return
+                return None
             if state == "failed":
-                raise DaemonError(f"engine failed to load in hostd: {st}")
+                return {"_is_error": True, "code": "engine_failed",
+                        "message": f"engine failed to load in hostd: {st}"}
             time.sleep(0.25)
-        raise DaemonError("engine load timed out in hostd")
+        return {"_is_error": True, "code": "engine_load_timeout",
+                "message": "engine load timed out in hostd"}
 
     def poll_events(self) -> list[dict]:
         """Drain buffered daemon push events (arrive interleaved with responses).
@@ -659,12 +695,10 @@ _client_lock = threading.Lock()
 
 
 def client() -> DaemonClient:
-    """Process singleton, connected on first use."""
+    """Process singleton; its first call connects under the connection lock."""
     global _client
-    if _client is None or not _client.connected():
+    if _client is None:
         with _client_lock:
             if _client is None:
                 _client = DaemonClient()
-            if not _client.connected():
-                _client.connect()
     return _client

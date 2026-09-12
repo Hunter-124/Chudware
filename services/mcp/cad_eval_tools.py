@@ -1374,6 +1374,7 @@ def register_cad_eval_tools(mcp: FastMCP) -> None:
     def check_interference(doc_id: Optional[str] = None,
                            include_coincident: Optional[bool] = None,
                            min_clearance_mm: Optional[float] = None,
+                           members: Optional[list[str]] = None,
                            **kwargs: Annotated[Any, Field(default=None)]) -> str:
         """Clash/clearance check — do the bodies OVERLAP, and if not, how tight is the gap?
 
@@ -1384,6 +1385,10 @@ def register_cad_eval_tools(mcp: FastMCP) -> None:
         clashing, or to find the tightest gap in an assembly. For overlap WITHIN a single part's
         own features (two bosses merged, a cut swallowing a boss) use check_feature_overlap
         instead — this tool only sees whole bodies/components.
+        members: optional exact member names, e.g. ["b434", "b435"] for a multi-body part;
+        assembly names match parts[].name. Checks only pairs WITHIN this selection. Unknown
+        names are refused. Omit or pass [] to check all members. A scoped result does not
+        verify placement of the rest of the document; scope and pair counts are explicit.
 
         include_coincident: also classify near-zero-clearance face-touching pairs (distance
         <= 1e-6 mm) as `contacts` entries instead of clearances — the "coincident faces" case
@@ -1419,13 +1424,15 @@ def register_cad_eval_tools(mcp: FastMCP) -> None:
                 ) from None
             include_coincident = bool(coincident)
             _reject_unknown("check_interference", extra,
-                            "it takes doc_id=, include_coincident= and min_clearance_mm=.")
+                            "it takes doc_id=, include_coincident=, min_clearance_mm= and members=.")
             d = _doc(doc_id)
-            res = cb.call("eval_interference", {"doc_id": d, "include_coincident": include_coincident,
-                                                "min_clearance_mm": min_clearance_mm})
-            # This IS the verification step for transform-placed components: record that it
-            # ran at the doc's current revision so save_part/export_part stop warning.
-            if res.get("reason") != "insufficient_bodies":
+            params = {"doc_id": d, "include_coincident": include_coincident,
+                      "min_clearance_mm": min_clearance_mm}
+            if members is not None:
+                params["members"] = members
+            res = cb.call("eval_interference", params)
+            # Only a complete document-wide check verifies transform placement.
+            if not members and res.get("complete", False):
                 note_interference_check(d)
             return _dumps(_interpreted({"ok": res.get("ok", True), "doc_id": d, **res}, notes))
         except Exception as e:  # noqa: BLE001

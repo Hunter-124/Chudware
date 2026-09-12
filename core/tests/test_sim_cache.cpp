@@ -666,6 +666,30 @@ TEST_CASE("sim_cache: hash is stable and kind-scoped") {
     CHECK(chudware::sim::cache::hash_fea_study(Kind::FeaStatic, s) != a);
 }
 
+TEST_CASE("sim_cache: selected solver and iterative limits cannot reuse another result") {
+    EnvGuard backend("CHUDWARE_FEA_SOLVER");
+    EnvGuard limit("CHUDWARE_FEA_ICCG_MAX_ITERATIONS");
+    CacheSidecarGuard cache(tmp_path("solver_policy"));
+    const auto study = cube_static_study();
+    chudware::test::setEnvironment("CHUDWARE_FEA_SOLVER", "ldlt");
+    const auto direct = chudware::sim::fea_run_static(study);
+    REQUIRE_MESSAGE(direct.value("ok", false), direct.dump());
+
+    chudware::test::setEnvironment("CHUDWARE_FEA_SOLVER", "iccg");
+    chudware::test::setEnvironment("CHUDWARE_FEA_ICCG_MAX_ITERATIONS", "10000");
+    const auto iterative = chudware::sim::fea_run_static(study);
+    REQUIRE_MESSAGE(iterative.value("ok", false), iterative.dump());
+    CHECK_FALSE(iterative.value("cache_hit", true));
+    CHECK(chudware::sim::fea_run_static(study).value("cache_hit", false));
+
+    // A cached successful solve must not hide an invalid newly selected limit.
+    chudware::test::setEnvironment("CHUDWARE_FEA_ICCG_MAX_ITERATIONS", "0");
+    const auto invalid = chudware::sim::fea_run_static(study);
+    CHECK_FALSE(invalid.value("ok", true));
+    chudware::test::setEnvironment("CHUDWARE_FEA_SOLVER", "ldlt");
+    CHECK(chudware::sim::fea_run_static(study).value("cache_hit", false));
+}
+
 TEST_CASE("sim_cache: exact finite hashes never alias rounded inputs") {
     json a = {{"mesh_fineness", 1.0}, {"solver", {{"tol", 1.0}}}};
     json b = a;

@@ -135,7 +135,7 @@ private:
     // hard-drain deadline: a client that will not leave on its own is dropped.
     void disconnectAllClients();
     // Engine-call watchdog: track the in-flight engine RPC per client thread (one at a time —
-    // clientLoop is sequential) so a background thread can detect a wedged interactive rebuild
+    // clientLoop is sequential) so a background thread can detect an overdue engine call
     // and self-heal via restart. See engine_watchdog.h for the policy.
     void beginInflight(int clientId, const std::string& method);
     void endInflight(int clientId);
@@ -187,10 +187,8 @@ private:
     mutable std::mutex inflightMtx_;
     std::map<int, InflightCall> inflight_;   // clientId -> current engine call (absent = idle)
     std::thread watchdog_;
-    // 90s: safely above any healthy interactive rebuild (they're milliseconds — a pathological
-    // one could not even be reproduced) yet BELOW the 120s client RPC timeout, so a wedged
-    // interactive op self-heals (restart -> socket close -> gateway closes the WS) before the
-    // client gives up with a raw "engine call timed out" — the client reconnects instead.
+    // 90s for bounded non-modeling calls (engine_watchdog.h). Modeling/rebuild calls use
+    // the separate long ceiling because their cost scales with document size.
     // 0 = disabled. Env override: CHUDWARE_HOSTD_ENGINE_WATCHDOG_S.
     long long engineWatchdogMs_ = 90000;
 };

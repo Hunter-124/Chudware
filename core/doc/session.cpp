@@ -9834,6 +9834,31 @@ static std::size_t eval_shape_index(const EvalShapeSet& shapes, const std::strin
     return static_cast<std::size_t>(it - shapes.body_ids.begin());
 }
 
+struct EvalEdgeBoundaryUses {
+    int boundary = 0;
+    bool embedded = false;
+
+    bool is_free() const { return boundary == 1 || (boundary == 0 && !embedded); }
+};
+
+static std::vector<EvalEdgeBoundaryUses> eval_edge_boundary_uses(
+    const TopoDS_Shape& shape, const TopTools_IndexedMapOfShape& edges) {
+    std::vector<EvalEdgeBoundaryUses> uses(edges.Extent() + 1);
+    // Count oriented skin uses, not ancestor faces. A seam has two boundary uses
+    // on one face; a boolean imprint can be INTERNAL to that face and have none.
+    for (TopExp_Explorer faces(shape, TopAbs_FACE); faces.More(); faces.Next()) {
+        for (TopExp_Explorer it(faces.Current(), TopAbs_EDGE); it.More(); it.Next()) {
+            const TopoDS_Shape& edge = it.Current();
+            auto& use = uses[edges.FindIndex(edge)];
+            if (edge.Orientation() == TopAbs_FORWARD || edge.Orientation() == TopAbs_REVERSED)
+                ++use.boundary;
+            else
+                use.embedded = true;
+        }
+    }
+    return uses;
+}
+
 // engine/doc/evaluate.py::check via worker.py::_eval_check. BRepCheck_Analyzer +
 // free-edge / tiny-edge / sliver-face census. Returns {"issues":[{kind,severity,text}]}.
 json doc_eval_check(const std::string& doc_id, int body_id) {
@@ -9881,41 +9906,16 @@ json doc_eval_check(const std::string& doc_id, int body_id) {
                                   {"text", "BRepCheck analyzer reported invalid topology"}});
     }
 
-    // Free-edge census: edges with fewer than 2 adjacent faces — BUT a SEAM edge of a
-    // periodic face (the 0°/360° closure of a cylinder/sphere/full-revolve) and a
-    // DEGENERATE edge (a cone apex / sphere pole) are real, watertight B-rep topology that
-    // legitimately bound just one face. MapShapesAndAncestors lists a seam's parent face a
-    // single time, so the naive "< 2 faces == free" census flagged every cylindrical bore /
-    // fillet / chamfer seam as a "free edge" and reported valid CLOSED solids as open shells
-    // (bugs H3/H4/H5/J4). Exclude seams (BRep_Tool::IsClosed(edge,face)) and degenerate edges
-    // so only the genuine boundary of an open shell (a lone face, an unsewn import) is
-    // counted. This is precise — a real free edge has NO seam/degenerate marker, so an
-    // honestly-open shell still reports its real free-edge count.
-    TopTools_IndexedDataMapOfShapeListOfShape anc_map;
-    TopExp::MapShapesAndAncestors(shape, TopAbs_EDGE, TopAbs_FACE, anc_map);
+    // INTERNAL/EXTERNAL imprints do not bound the skin. Count boundary occurrences
+    // so embedded edges cannot hide a genuine single-use edge on another face.
     TopTools_IndexedMapOfShape edge_map;
     TopExp::MapShapes(shape, TopAbs_EDGE, edge_map);
-
+    const auto boundary_uses = eval_edge_boundary_uses(shape, edge_map);
     int free_edges = 0;
     for (int ei = 1; ei <= edge_map.Extent(); ++ei) {
-        const TopoDS_Shape& edge_sh = edge_map.FindKey(ei);
-        int n_faces = anc_map.Contains(edge_sh) ? anc_map.FindFromKey(edge_sh).Extent() : 0;
-        if (n_faces >= 2) continue;  // shared by two faces -> interior, never free
-        const TopoDS_Edge& edge = TopoDS::Edge(edge_sh);
-        // A degenerate edge (cone apex / sphere pole) bounds one face but is not free.
-        if (BRep_Tool::Degenerated(edge)) continue;
-        // A seam edge is closed on its (single) parent face — periodic-surface closure, not
-        // a free boundary. The face appears once in the ancestor list yet the edge is glued
-        // to itself across the seam, so it is fully shared.
-        bool is_seam = false;
-        if (anc_map.Contains(edge_sh)) {
-            const TopTools_ListOfShape& faces = anc_map.FindFromKey(edge_sh);
-            for (TopTools_ListIteratorOfListOfShape it(faces); it.More(); it.Next()) {
-                if (BRep_Tool::IsClosed(edge, TopoDS::Face(it.Value()))) { is_seam = true; break; }
-            }
-        }
-        if (is_seam) continue;
-        ++free_edges;
+        const TopoDS_Edge& edge = TopoDS::Edge(edge_map.FindKey(ei));
+        if (!BRep_Tool::Degenerated(edge) && boundary_uses[ei].is_free())
+            ++free_edges;
     }
     if (free_edges > 0)
         issues.push_back(json{{"kind", "free_edges"},
@@ -10520,6 +10520,7 @@ json doc_eval_solid_health(const std::string& doc_id, int body_id) {
 
         TopTools_IndexedDataMapOfShapeListOfShape anc;
         TopExp::MapShapesAndAncestors(shape, TopAbs_EDGE, TopAbs_FACE, anc);
+        const auto boundary_uses = eval_edge_boundary_uses(shape, emap);
 
         json free_sids = json::array();
         json nm_sids = json::array();
@@ -10528,7 +10529,6 @@ json doc_eval_solid_health(const std::string& doc_id, int body_id) {
         for (int ei = 1; ei <= emap.Extent(); ++ei) {
             const TopoDS_Shape& esh = emap.FindKey(ei);
             const TopoDS_Edge& edge = TopoDS::Edge(esh);
-            const int n_faces = anc.Contains(esh) ? anc.FindFromKey(esh).Extent() : 0;
             std::string sid;
             try {
                 sid = make_selector(chudware::doc::edge_info(edge, ei - 1))
@@ -10549,8 +10549,8 @@ json doc_eval_solid_health(const std::string& doc_id, int body_id) {
             if (is_seam) ++seam_edges;
             if (degenerate) ++degenerate_edges;
             if (!degenerate && eval_edge_length(edge) < TINY_EDGE_MM) tiny_sids.push_back(sid);
-            if (n_faces > 2) { nm_sids.push_back(sid); continue; }
-            if (n_faces >= 2 || degenerate || is_seam) continue;
+            if (boundary_uses[ei].boundary > 2) { nm_sids.push_back(sid); continue; }
+            if (degenerate || !boundary_uses[ei].is_free()) continue;
             free_sids.push_back(sid);
         }
         b["free_edges"] = json{{"count", (int)free_sids.size()}, {"sids", free_sids}};
@@ -11363,15 +11363,35 @@ json doc_eval_interference(const std::string& doc_id, const json& params) {
                 source_failures.push_back({{"feature", status.id},
                                            {"reason", "part_feature_build_failed"}});
     }
-    // Optional `members` filter: case-sensitive exact match on the same names emitted in
-    // parts[]/interferences[]. Absent or empty preserves all-members behaviour.
-    if (params.contains("members") && params["members"].is_array() &&
-        !params["members"].empty()) {
-        std::unordered_set<std::string> keep;
-        for (const auto& m : params["members"]) {
-            if (m.is_string()) keep.insert(m.get<std::string>());
-        }
-        if (!keep.empty()) {
+    // Optional exact-name scope. Reject unknown/malformed selectors rather than
+    // silently narrowing a requested pair to a clean single-member result.
+    json scope = {{"kind", "all"}, {"total_members", members.size()}};
+    if (params.contains("members")) {
+        const auto& requested = params["members"];
+        if (!requested.is_array())
+            throw OpError("invalid_op", "members must be an array of exact member names");
+        if (!requested.empty()) {
+            std::unordered_map<std::string, bool> keep;
+            for (const auto& name : requested) {
+                if (!name.is_string() || name.get_ref<const std::string&>().empty())
+                    throw OpError("invalid_op", "members must contain nonempty member names");
+                keep.emplace(name.get<std::string>(), false);
+            }
+            for (const auto& member : members) {
+                const auto found = keep.find(member.first);
+                if (found != keep.end()) found->second = true;
+            }
+            json unknown = json::array();
+            for (const auto& entry : keep)
+                if (!entry.second) unknown.push_back(entry.first);
+            if (!unknown.empty()) {
+                json available = json::array();
+                for (const auto& member : members) available.push_back(member.first);
+                throw OpError("unknown_member", "Interference scope contains unknown member names",
+                              {{"unknown", unknown}, {"available", available}});
+            }
+            scope["kind"] = "members";
+            scope["requested_members"] = requested;
             std::vector<std::pair<std::string, TopoDS_Shape>> filtered;
             std::vector<std::string> filtered_ids;
             filtered.reserve(members.size());
@@ -11389,6 +11409,7 @@ json doc_eval_interference(const std::string& doc_id, const json& params) {
             source_failures = std::move(filtered_failures);
         }
     }
+    scope["checked_members"] = members.size();
     // An EMPTY document is the trap: `check_interference` on nothing "passes" and the
     // caller records a verified placement (ME 490 O-38). A single body, or a `members`
     // filter that keeps one, is a legitimate no-pair result and stays ok:true with
@@ -11396,6 +11417,7 @@ json doc_eval_interference(const std::string& doc_id, const json& params) {
     if (members.empty())
         return json{{"ok", false}, {"reason", "insufficient_bodies"},
                     {"body_count", 0}, {"complete", false}, {"pairs_checked", 0},
+                    {"scope", scope},
                     {"pair_failures", json::array()}, {"geometry_failures", source_failures},
                     {"summary", "Interference requires bodies; this document has none."}};
     const bool include_coincident = params.contains("include_coincident") &&
@@ -11413,6 +11435,7 @@ json doc_eval_interference(const std::string& doc_id, const json& params) {
                        params["quick"].get<bool>();
     json report = interference_report(members, include_coincident, min_clearance_mm, quick,
                                       component_ids);
+    report["scope"] = std::move(scope);
     if (!source_failures.empty()) {
         report["ok"] = false;
         report["complete"] = false;

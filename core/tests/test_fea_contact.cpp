@@ -21,6 +21,8 @@
 #include <set>
 #include <string>
 #include <vector>
+#include "environment_test_support.h"
+#include "util/resource_governor.h"
 
 #include "sim/fea_contact.h"
 #include "sim/fea_run.h"
@@ -210,6 +212,69 @@ void jitter_layer(Mesh& m, int base, int nr, int nt, int nz, int layer, double a
             m.points[at] = cx + dx * (r + d) / r;
             m.points[at + 1] = cy + dy * (r + d) / r;
         }
+}
+
+struct SolverEnvironment {
+    std::string name, value;
+    bool present;
+    SolverEnvironment(const char* key, const char* setting) : name(key) {
+        const char* old = std::getenv(key);
+        present = old != nullptr;
+        if (old) value = old;
+        chudware::test::setOrUnsetEnvironment(key, setting);
+    }
+    ~SolverEnvironment() {
+        chudware::test::setOrUnsetEnvironment(name.c_str(), present ? value.c_str() : nullptr);
+    }
+};
+
+struct MemoryProbeScope {
+    chudware::governor::HostMemoryProbe previous;
+    explicit MemoryProbeScope(chudware::governor::HostMemoryProbe probe)
+        : previous(chudware::governor::set_host_memory_probe(probe)) {}
+    ~MemoryProbeScope() { chudware::governor::set_host_memory_probe(previous); }
+};
+
+void compare_linear_fields(const FeaStaticResult& actual, const FeaStaticResult& direct) {
+    REQUIRE_MESSAGE(actual.ok, actual.error);
+    REQUIRE_MESSAGE(direct.ok, direct.error);
+    REQUIRE(actual.displacement.size() == direct.displacement.size());
+    double squared_error = 0.0, squared_reference = 0.0;
+    for (size_t i = 0; i < direct.displacement.size(); ++i) {
+        squared_error += std::pow(actual.displacement[i] - direct.displacement[i], 2);
+        squared_reference += direct.displacement[i] * direct.displacement[i];
+    }
+    CHECK(std::sqrt(squared_error / squared_reference) < 2e-6);
+    const auto norm = [](const std::array<double, 3>& v) {
+        return std::hypot(v[0], v[1], v[2]);
+    };
+    const double force_scale = std::max(
+        {1.0, norm(direct.applied_force_n), norm(direct.reaction_force_n)});
+    const double moment_scale = std::max(
+        {1.0, norm(direct.applied_moment_nmm), norm(direct.reaction_moment_nmm)});
+    std::array<double, 3> force_error{}, moment_error{}, moment_balance{};
+    for (int d = 0; d < 3; ++d) {
+        force_error[d] = actual.reaction_force_n[d] - direct.reaction_force_n[d];
+        moment_error[d] = actual.reaction_moment_nmm[d] - direct.reaction_moment_nmm[d];
+        moment_balance[d] = actual.reaction_moment_nmm[d] + actual.applied_moment_nmm[d];
+    }
+    // Relative vector accuracy must not become an absolute tolerance on a
+    // symmetry-zero component. All components still contribute to each norm.
+    CHECK(norm(force_error) / force_scale < 2e-6);
+    CHECK(norm(moment_error) / moment_scale < 2e-6);
+    CHECK(norm(moment_balance) / moment_scale < 2e-5);
+    CHECK(actual.equilibrium_error_pct < 1e-4);
+    REQUIRE(actual.element_von_mises.size() == direct.element_von_mises.size());
+    for (size_t e = 0; e < direct.element_von_mises.size(); ++e) {
+        CHECK(actual.element_von_mises[e] ==
+              doctest::Approx(direct.element_von_mises[e]).epsilon(2e-5).scale(1.0));
+        CHECK(actual.element_factor_of_safety[e] ==
+              doctest::Approx(direct.element_factor_of_safety[e]).epsilon(2e-5).scale(1.0));
+    }
+    for (const auto& step : actual.iterative.solves) {
+        CHECK(step.converged);
+        CHECK(step.relative_residual <= 1e-10);
+    }
 }
 
 }  // namespace
@@ -1521,4 +1586,175 @@ TEST_CASE("contact: an open saddle cannot carry a load outside its normal cone")
     candidates.springs.front().normal = {-1, 0, 0};
     CHECK_FALSE(chudware::sim::fea_contact_support_cone(
         candidates, 0, {0, 0, -1446}).excludes_load);
+}
+
+TEST_CASE("ICCG: heterogeneous bonded bars preserve direct displacements stresses and reactions") {
+    Mesh m;
+    add_box(m, 2, 2, 4, 0, 0, 0, 4, 4, 8);
+    const size_t first_elements = m.tets.size() / 4;
+    const int first_nodes = static_cast<int>(m.points.size() / 3);
+    const auto lower_interface = nodes_at_z(m, 8);
+    add_box(m, 2, 2, 4, 0, 0, 8, 4, 4, 8);
+    chudware::sim::FeaMaterials materials;
+    materials.materials = {{200000, 0, 500}, {70000, 0, 200}};
+    materials.elem_material.assign(m.tets.size() / 4, 1);
+    std::fill(materials.elem_material.begin(),
+              materials.elem_material.begin() + first_elements, 0);
+    std::vector<chudware::sim::BondSpring> bonds;
+    for (size_t i = 0; i < lower_interface.size(); ++i)
+        bonds.push_back({lower_interface[i], first_nodes + static_cast<int>(i), 1e6});
+    const auto fixed = nodes_at_z(m, 0), top = nodes_at_z(m, 16);
+    std::vector<double> loads(m.points.size(), 0.0);
+    // Consistent triangular traction, with eccentric x loading to test moments.
+    for (int j = 0; j < 2; ++j) for (int i = 0; i < 2; ++i) {
+        const int a = top[j * 3 + i], b = top[j * 3 + i + 1];
+        const int c = top[(j + 1) * 3 + i], d = top[(j + 1) * 3 + i + 1];
+        for (int n : {a, b, d, a, d, c}) {
+            loads[n * 3 + 2] -= 40.0 / 3.0;
+            loads[n * 3] += 1.0;
+        }
+    }
+    SolverEnvironment backend("CHUDWARE_FEA_SOLVER", "ldlt");
+    const auto direct = chudware::sim::fea_static_solve(
+        m.points, m.tets, kE, 0, 500, fixed, loads, 4, bonds, {}, materials);
+    chudware::test::setEnvironment("CHUDWARE_FEA_SOLVER", "iccg");
+    const auto iterative = chudware::sim::fea_static_solve(
+        m.points, m.tets, kE, 0, 500, fixed, loads, 4, bonds, {}, materials);
+    compare_linear_fields(iterative, direct);
+    // Reassign the soft body: compliance must change, not merely copy table fields.
+    materials.materials[1].E_mpa *= 2;
+    const auto stiffer = chudware::sim::fea_static_solve(
+        m.points, m.tets, kE, 0, 500, fixed, loads, 4, bonds, {}, materials);
+    REQUIRE_MESSAGE(stiffer.ok, stiffer.error);
+    CHECK(stiffer.max_disp_mm < iterative.max_disp_mm);
+}
+
+TEST_CASE("ICCG: changing unilateral bore active sets match direct contact and moments") {
+    Mesh m;
+    add_tube(m, 2, 16, 2, 3, 5, 0, 10, 0, 0);
+    add_tube(m, 2, 16, 2, 5.1, 9, 0, 10, 0, 0);
+    ContactCandidateOptions options;
+    options.max_gap_mm = 0.4;
+    const auto candidates = fea_contact_candidates(m.points, m.tets, 4, kE, options);
+    REQUIRE(candidates.error.empty());
+    std::vector<int> fixed, pin;
+    for (int i = 0; i < static_cast<int>(m.points.size() / 3); ++i) {
+        const double radius = std::hypot(m.points[i * 3], m.points[i * 3 + 1]);
+        if (std::abs(radius - 9) < 1e-6) fixed.push_back(i);
+        if (radius < 5.05) pin.push_back(i);
+    }
+    std::vector<double> loads(m.points.size(), 0.0);
+    for (int n : pin) loads[n * 3] = 1500.0 / pin.size();
+    SolverEnvironment backend("CHUDWARE_FEA_SOLVER", "ldlt");
+    FeaContactReport direct_report, iterative_report;
+    const auto direct = fea_static_solve_contact(
+        m.points, m.tets, kE, kNu, kYield, fixed, loads, 4, {},
+        candidates.springs, FeaContactOptions{}, direct_report);
+    chudware::test::setEnvironment("CHUDWARE_FEA_SOLVER", "iccg");
+    const auto iterative = fea_static_solve_contact(
+        m.points, m.tets, kE, kNu, kYield, fixed, loads, 4, {},
+        candidates.springs, FeaContactOptions{}, iterative_report);
+    compare_linear_fields(iterative, direct);
+    REQUIRE(iterative_report.converged);
+    CHECK(iterative_report.active_pairs == direct_report.active_pairs);
+    CHECK(iterative_report.active_pairs < iterative_report.candidate_pairs);
+    CHECK(iterative_report.contact_iterations > 1);
+    CHECK(iterative_report.tangential_force_fraction ==
+          doctest::Approx(direct_report.tangential_force_fraction).epsilon(1e-5).scale(1e-8));
+    REQUIRE(iterative_report.groups.size() == direct_report.groups.size());
+    for (size_t i = 0; i < direct_report.groups.size(); ++i)
+        CHECK(iterative_report.groups[i].contact_force_n ==
+              doctest::Approx(direct_report.groups[i].contact_force_n).epsilon(2e-6));
+}
+
+TEST_CASE("ICCG: iteration exhaustion and cancellation never return a direct answer") {
+    Mesh m;
+    add_box(m, 3, 3, 8, 0, 0, 0, 4, 4, 20);
+    const auto fixed = nodes_at_z(m, 0), top = nodes_at_z(m, 20);
+    std::vector<double> loads(m.points.size(), 0.0);
+    for (int n : top) loads[n * 3] = 100.0 / top.size();
+    SolverEnvironment backend("CHUDWARE_FEA_SOLVER", "iccg");
+    SolverEnvironment limit("CHUDWARE_FEA_ICCG_MAX_ITERATIONS", "1");
+    const auto failed = chudware::sim::fea_static_solve(
+        m.points, m.tets, kE, kNu, kYield, fixed, loads);
+    CHECK_FALSE(failed.ok);
+    CHECK(failed.displacement.empty());
+    REQUIRE(failed.iterative.solves.size() == 1);
+    CHECK(failed.iterative.solves[0].iterations == 1);
+    CHECK(failed.iterative.solves[0].relative_residual > 1e-10);
+    const auto token = std::make_shared<std::atomic<bool>>(true);
+    const auto cancelled = chudware::sim::fea_static_solve(
+        m.points, m.tets, kE, kNu, kYield, fixed, loads, 4, {}, token);
+    CHECK_FALSE(cancelled.ok);
+    CHECK(cancelled.error.find("cancelled") != std::string::npos);
+    CHECK(cancelled.displacement.empty());
+}
+
+TEST_CASE("ICCG: conservative governor refusal survives explicit iterative selection") {
+    SolverEnvironment backend("CHUDWARE_FEA_SOLVER", "iccg");
+    SolverEnvironment governor("CHUDWARE_GOVERNOR", "1");
+    MemoryProbeScope memory(+[]() -> chudware::governor::HostMem {
+        return {1024 * 1024, 1024 * 1024};
+    });
+    Mesh m;
+    add_box(m, 1, 1, 1, 0, 0, 0, 1, 1, 1);
+    std::vector<double> loads(m.points.size(), 0.0);
+    for (int n : nodes_at_z(m, 1)) loads[n * 3 + 2] = -1;
+    const auto result = chudware::sim::fea_static_solve(
+        m.points, m.tets, kE, kNu, kYield, nodes_at_z(m, 0), loads);
+    CHECK_FALSE(result.ok);
+    CHECK(result.displacement.empty());
+    CHECK(result.iterative.solves.empty());
+    CHECK(result.iterative.projected_peak_bytes > chudware::governor::budget_bytes());
+    // Selecting ICCG does not change the calibrated direct-mode policy.
+    std::string error;
+    CHECK_FALSE(chudware::governor::admit_fea(100000, 10, 3, "direct reference", error));
+}
+
+TEST_CASE("ICCG: memory lost after adjacency discovery refuses before matrix allocation") {
+    SolverEnvironment backend("CHUDWARE_FEA_SOLVER", "iccg");
+    SolverEnvironment governor("CHUDWARE_GOVERNOR", "1");
+    static unsigned queries;
+    queries = 0;
+    MemoryProbeScope memory(+[]() -> chudware::governor::HostMem {
+        if (++queries == 1) return {1ull << 40, 1ull << 40};
+        return {1024 * 1024, 1024 * 1024};
+    });
+    Mesh m;
+    add_box(m, 1, 1, 1, 0, 0, 0, 1, 1, 1);
+    std::vector<double> loads(m.points.size(), 0.0);
+    for (int n : nodes_at_z(m, 1)) loads[n * 3 + 2] = -1;
+    const auto result = chudware::sim::fea_static_solve(
+        m.points, m.tets, kE, kNu, kYield, nodes_at_z(m, 0), loads);
+    CHECK_FALSE(result.ok);
+    CHECK(result.displacement.empty());
+    CHECK(result.iterative.solves.empty());
+    CHECK(result.iterative.free_dofs == 12);
+    CHECK(result.iterative.stored_nonzeros > 0);
+    CHECK(result.iterative.projected_peak_bytes > chudware::governor::budget_bytes());
+}
+
+TEST_CASE("ICCG: cancellation arriving after admission discards the in-flight solve") {
+    SolverEnvironment backend("CHUDWARE_FEA_SOLVER", "iccg");
+    SolverEnvironment governor("CHUDWARE_GOVERNOR", "1");
+    static chudware::sim::SimCancelToken token;
+    static unsigned queries;
+    token = std::make_shared<std::atomic<bool>>(false);
+    queries = 0;
+    MemoryProbeScope memory(+[]() -> chudware::governor::HostMem {
+        // A deterministic external cancellation while the solver is running,
+        // rather than a timing-sensitive sleeping thread or a pre-cancelled job.
+        if (++queries >= 2) token->store(true, std::memory_order_relaxed);
+        return {1ull << 40, 1ull << 40};
+    });
+    Mesh m;
+    add_box(m, 2, 2, 3, 0, 0, 0, 4, 4, 6);
+    std::vector<double> loads(m.points.size(), 0.0);
+    for (int n : nodes_at_z(m, 6)) loads[n * 3 + 2] = -10;
+    const auto result = chudware::sim::fea_static_solve(
+        m.points, m.tets, kE, kNu, kYield, nodes_at_z(m, 0), loads, 4, {}, token);
+    CHECK_FALSE(result.ok);
+    CHECK(result.error.find("cancelled") != std::string::npos);
+    CHECK(result.displacement.empty());
+    token.reset();
 }

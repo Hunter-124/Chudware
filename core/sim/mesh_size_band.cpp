@@ -86,11 +86,12 @@ SizeBand resolve_size_band(const TopoDS_Shape &shape,
   // Eigen SparseLU, tet10 6k-149k through CHOLMOD) and carries a 1.25x safety
   // factor. The measured table, the two solver families and the safety factor
   // are documented above the calibration in core/util/resource_governor.cpp.
-  // 0 means "no limit" (governor disabled or platform unknown).
+  // 0 means no direct-factor model: disabled/unknown governor or an iterative
+  // solve admitted later against its actual pattern. Mesh ceilings remain active.
   const int nodes_per_element = options.order == 2 ? 10 : 4;
   const uint64_t memory_budget = chudware::governor::budget_bytes();
   const long memory_element_limit =
-      memory_budget == UINT64_MAX
+      memory_budget == UINT64_MAX || options.iterative_solver
           ? 0L
           : static_cast<long>(std::min<uint64_t>(
                 chudware::governor::fea_element_limit(memory_budget, nodes_per_element, 3),
@@ -106,6 +107,10 @@ SizeBand resolve_size_band(const TopoDS_Shape &shape,
   const double budget_gb =
       memory_budget == UINT64_MAX ? 0.0
                                   : static_cast<double>(memory_budget) / 1073741824.0;
+  if (options.iterative_solver)
+    append_note("iterative solver: direct-factor element-count limit is inapplicable; "
+                "mesh allocation remains bounded and actual sparse-pattern solve "
+                "admission follows meshing");
 
   // ── The element CEILING is a memory number, not a constant ──────────────────
   // polymesh's pre-flight guard refuses a fill past `element_ceiling`, and its

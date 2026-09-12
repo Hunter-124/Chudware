@@ -6,8 +6,12 @@ document routing through office_extract, and correct risk classification via the
 """
 from __future__ import annotations
 
+import json
 import os
+import signal
+import sys
 import tempfile
+import time
 
 import pytest
 
@@ -413,7 +417,59 @@ def test_run_shell_blocks_destructive():
         assert not r["ok"] and r["reason"] == "blocked", bad
 
 
-def test_run_shell_timeout():
-    t = _tools()
-    r = t["run_shell"]("sleep 5", timeout_s=1)
+def test_run_shell_timeout_preserves_json_safe_partial_output(tmp_path):
+    script = tmp_path / "partial_output.py"
+    script.write_text(
+        "import os, time\n"
+        "os.write(1, b'out\\xe2\\x98\\x83\\n')\n"
+        "os.write(2, b'err\\xff\\n')\n"
+        "time.sleep(2)\n"
+    )
+    r = _tools()["run_shell"](f'"{sys.executable}" "{script}"', timeout_s=1)
     assert r["ok"] and r["timed_out"] and r["exit_code"] == 124
+    assert "out\u2603" in r["output"] and "err\ufffd" in r["output"]
+    json.dumps(r)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX process-group lifecycle")
+def test_run_shell_timeout_stops_descendant_writes(tmp_path):
+    marker = tmp_path / "orphan_write"
+    pids = tmp_path / "pids.json"
+    child = tmp_path / "child.py"
+    child.write_text(
+        "import time\nfrom pathlib import Path\n"
+        f"time.sleep(2)\nPath({str(marker)!r}).write_text('orphan')\n"
+    )
+    parent = tmp_path / "parent.py"
+    parent.write_text(
+        "import json, os, subprocess, sys, time\nfrom pathlib import Path\n"
+        f"child = subprocess.Popen([sys.executable, {str(child)!r}])\n"
+        f"Path({str(pids)!r}).write_text(json.dumps([os.getpid(), child.pid]))\n"
+        "time.sleep(10)\n"
+    )
+    try:
+        result = _tools()["run_shell"](
+            f'"{sys.executable}" "{parent}"', timeout_s=1)
+        assert result["timed_out"] and result["exit_code"] == 124
+        assert pids.exists(), "the child must have launched before the deadline"
+        time.sleep(2.2)
+        assert not marker.exists(), "a timed-out command left a writable descendant"
+    finally:
+        if pids.exists():
+            for pid in json.loads(pids.read_text()):
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+
+
+def test_run_shell_refuses_out_of_range_deadline_before_execution(tmp_path):
+    from services.mcp.fs_tools import SHELL_MAX_TIMEOUT_S
+
+    marker = tmp_path / "launched"
+    script = tmp_path / "must_not_run.py"
+    script.write_text(f"from pathlib import Path\nPath({str(marker)!r}).touch()\n")
+    result = _tools()["run_shell"](
+        f'"{sys.executable}" "{script}"', timeout_s=SHELL_MAX_TIMEOUT_S + 1)
+    assert not result["ok"] and result["reason"] == "invalid_timeout"
+    assert not marker.exists()

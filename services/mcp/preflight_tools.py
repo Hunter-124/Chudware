@@ -169,7 +169,7 @@ def _skipped(doc_id: str, tool: str, reason: str, detail: str) -> dict:
 def run_auto_preflight(doc_id: str, tool: str, ops: list) -> dict:
     """Run preflight automatically inside mutating tools.
 
-    Returns an aicad.preflight/1 dict.  Never raises.  ``verdict`` is "skipped"
+    Returns an aicad.preflight/1 dict; engine connection loss propagates. ``verdict`` is "skipped"
     with a ``skipped``/``skipped_detail`` pair when the run was suppressed —
     ``disabled`` (CHUDWARE_PREFLIGHT=0), ``trivial`` (complexity gate, see
     :func:`skip_reason`) or ``error``.  ``CHUDWARE_PREFLIGHT=always`` forces the
@@ -192,6 +192,8 @@ def run_auto_preflight(doc_id: str, tool: str, ops: list) -> dict:
                 f"forced (CHUDWARE_PREFLIGHT={mode})" if forced else "non-trivial batch")
         return result
     except Exception as exc:  # noqa: BLE001
+        if getattr(exc, "code", None) == "engine_connection_lost":
+            raise
         _record(doc_id, tool, ops, False, f"error: {exc}")
         return _skipped(doc_id, tool, "error", str(exc))
 
@@ -266,7 +268,7 @@ def register_preflight_tools(mcp: FastMCP) -> None:
             return cur
 
         # A stringified ops batch (JSON or Python-repr) used to sail straight into
-        # run_preflight/_run, which never raises — it degraded into a "warn" item whose
+        # run_preflight/_run, which downgraded advisory errors into a "warn" item whose
         # detail was a raw internal AttributeError instead of ever validating the batch.
         # Coerce at THIS entry point so the model gets a teaching error, not a wasted
         # dry-run that silently skipped every check.

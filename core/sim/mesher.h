@@ -153,6 +153,13 @@ struct MeshOut {
   double local_refine_achieved_mm = 0.0;  // coarsest element left at the seeds
   int local_refine_waves = 0;             // LEB waves spent
   int local_refine_elems_added = 0;
+  // Cumulative centroid-grading candidate marks across waves, before deduplication
+  // with boundary owners. Closure may extend beyond this depth; direct centroid
+  // marks may not. Counts do not include interface-face owners or closure cells.
+  double local_refine_transition_depth_mm = 0.0;
+  uint64_t local_refine_transition_marks = 0;
+  uint64_t local_refine_outside_transition_marks = 0;
+  uint64_t local_refine_outside_transition_checks = 0;
   bool local_refine_ceiling_bound = false;
   uint64_t local_refine_element_ceiling = 0;
   // What stopped the delivery short, when something did (a bisection closure
@@ -313,6 +320,9 @@ struct MeshOptions {
   MeshLocalRefine local_refine;
   // Measurements from preceding legs of the same geometry/order ladder.
   std::vector<MeshGovernorProbe> governor_probes;
+  // Keep mesh allocation ceilings, but defer solver admission to the actual
+  // sparse pattern rather than applying a direct-factor element-count model.
+  bool iterative_solver = false;
 };
 
 bool validate_mesh_options(const MeshOptions &options, std::string &error);

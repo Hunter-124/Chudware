@@ -10,16 +10,13 @@
 //
 // TWO TIERS, because "overdue" means wildly different things per RPC. Every call the daemon
 // tracks (Server::beginInflight — engine passthrough only) falls in exactly one of them:
-//   * FAST (engineMethodWatchdogged): the interactive modelling RPCs a healthy engine always
-//     answers in well under a second. Ceiling ~90 s, CHUDWARE_HOSTD_ENGINE_WATCHDOG_S.
-//   * LONG (everything else — run_fea_*, run_cfd_*, agent_*, cam_*, export_*, import_*,
-//     doc_open, doc_save, reverse_*): legitimately minutes-long by design, so the fast ceiling
-//     must never touch them. They are NOT exempt from every ceiling though — an unbounded call
-//     holds its dispatch thread forever, Server::Status::inflight never returns to 0, and
-//     idleExpired() can therefore never fire again: the daemon becomes unkillable by its own
-//     self-healing. Hence a deliberately huge second ceiling
-//     (CHUDWARE_HOSTD_ENGINE_WATCHDOG_LONG_S) whose only job is to catch a call that will
-//     NEVER return.
+//   * FAST (engineMethodWatchdogged): bounded, non-modeling calls such as ping.
+//     Ceiling ~90 s, CHUDWARE_HOSTD_ENGINE_WATCHDOG_S.
+//   * LONG (everything else, including modeling/rebuild mutations): work scales with
+//     document/input size and may legitimately take minutes. This also covers shadow
+//     preflight doc_apply_ops and cold doc_activate rebuilds without caller hints.
+//     CHUDWARE_HOSTD_ENGINE_WATCHDOG_LONG_S bounds these calls so a genuine hang cannot
+//     hold inflight above zero and prevent idle exit forever.
 // The tiers are disjoint: a method is judged by exactly one ceiling, never both.
 #pragma once
 
@@ -27,10 +24,9 @@
 
 namespace hostd {
 
-// True for the interactive modelling RPCs a healthy engine always answers in well under a second.
+// Only calls that cannot rebuild geometry or wait on a document's modeling lock belong here.
 inline bool engineMethodWatchdogged(std::string_view m) {
-    return m == "doc_apply_ops" || m == "doc_rebuild" || m == "doc_undo" ||
-           m == "doc_redo" || m == "doc_activate" || m == "doc_regen" ||
+    return m == "ping" ||
            m == "__hostd_test_stall";  // test-only probe (server.cpp), never a real client RPC
 }
 

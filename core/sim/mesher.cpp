@@ -833,6 +833,10 @@ struct LocalContract {
   double core_mm = 0.0;      // width of the flat request zone (seed spacing)
   int waves = 0;
   int elems_added = 0;
+  double transition_depth_mm = 0.0;
+  uint64_t transition_marks = 0;
+  uint64_t outside_transition_marks = 0;
+  uint64_t outside_transition_checks = 0;
   std::size_t elems = 0;         // element count after refinement
   std::size_t element_ceiling = 0;
   bool ceiling_bound = false;    // stopped because the next wave breaks the ceiling
@@ -2482,11 +2486,14 @@ void deliver_local_contract(const LoadedModel &loaded, const MeshOptions &option
       ? std::max(kBeta, (background - request.size_mm) /
                            (request.max_depth_mm - core_mm))
       : kBeta;
-  auto want = [&](const Eigen::Vector3d &p) {
-    const double outside = std::max(0.0, seed_distance(p) - core_mm);
+  contract.transition_depth_mm =
+      core_mm + (background - request.size_mm) / grade;
+  auto want = [&](double distance) {
+    const double outside = std::max(0.0, distance - core_mm);
     return std::min(background, request.size_mm + grade * outside);
   };
-  auto centroid_of = [&](const pm::fea::NodalElement &element) {
+  // Materialize the vector: a deduced Eigen expression would retain this local.
+  auto centroid_of = [&](const pm::fea::NodalElement &element) -> Eigen::Vector3d {
     Eigen::Vector3d centroid = Eigen::Vector3d::Zero();
     for (std::uint32_t n : element.nodes)
       centroid += nodal.nodes[n];
@@ -2801,10 +2808,18 @@ void deliver_local_contract(const LoadedModel &loaded, const MeshOptions &option
     std::vector<std::size_t> marks;
     scan(&marks);
     for (std::size_t e = 0; e < nodal.elements.size(); ++e) {
+      const double distance = seed_distance(centroid_of(nodal.elements[e]));
+      const bool outside = distance >= contract.transition_depth_mm;
+      if (outside) {
+        ++contract.outside_transition_checks;
+        continue;
+      }
       // 1.02: land just under the target rather than oscillating on it.
-      if (longest_edge_mm(nodal, nodal.elements[e]) >
-          want(centroid_of(nodal.elements[e])) * 1.02)
+      if (longest_edge_mm(nodal, nodal.elements[e]) > want(distance) * 1.02) {
         marks.push_back(e);
+        ++contract.transition_marks;
+        if (outside) ++contract.outside_transition_marks;
+      }
     }
     std::sort(marks.begin(), marks.end());
     marks.erase(std::unique(marks.begin(), marks.end()), marks.end());
@@ -3357,6 +3372,10 @@ bool build_mesh(const LoadedModel &loaded, const MeshOptions &options, double h,
     out.local_refine_achieved_mm = contract.achieved_mm;
     out.local_refine_waves = contract.waves;
     out.local_refine_elems_added = contract.elems_added;
+    out.local_refine_transition_depth_mm = contract.transition_depth_mm;
+    out.local_refine_transition_marks = contract.transition_marks;
+    out.local_refine_outside_transition_marks = contract.outside_transition_marks;
+    out.local_refine_outside_transition_checks = contract.outside_transition_checks;
     out.local_refine_ceiling_bound = contract.ceiling_bound;
     out.local_refine_element_ceiling = contract.element_ceiling;
     out.local_refine_limit = contract.note;
@@ -3388,9 +3407,9 @@ bool build_mesh(const LoadedModel &loaded, const MeshOptions &options, double h,
     if (options.local_refine.max_depth_mm > 0.0) {
       char depth[192];
       std::snprintf(depth, sizeof(depth),
-          "direct refinement band depth capped at %.4g mm (3 interface layers: "
-          "2 fine + 1 graded); conforming closure neighbours may extend beyond",
-          options.local_refine.max_depth_mm);
+          "direct centroid grading depth %.4g mm (requested cap %.4g mm); "
+          "conforming closure neighbours may extend beyond",
+          contract.transition_depth_mm, options.local_refine.max_depth_mm);
       append_note(out.note, depth);
     }
     if (contract.waves > 0) {
@@ -4101,7 +4120,8 @@ bool mesh_loaded_model(const LoadedModel &loaded, const MeshOptions &options,
       .advisor_max_dof = options.advisor_max_dof,
       .declared_interfaces = options.declared_interfaces,
       .local_refine = {},
-      .governor_probes = options.governor_probes};
+      .governor_probes = options.governor_probes,
+      .iterative_solver = options.iterative_solver};
   if (!mesh_background(loaded, background, budget, out)) {
     budget.stamp(out);
     return false;
@@ -4430,6 +4450,14 @@ bool mesh_separate_solids(const std::vector<BodyGroup> &bodies,
     combined.local_refine_waves =
         std::max(combined.local_refine_waves, part.local_refine_waves);
     combined.local_refine_elems_added += part.local_refine_elems_added;
+    combined.local_refine_transition_depth_mm =
+        std::max(combined.local_refine_transition_depth_mm,
+                 part.local_refine_transition_depth_mm);
+    combined.local_refine_transition_marks += part.local_refine_transition_marks;
+    combined.local_refine_outside_transition_marks +=
+        part.local_refine_outside_transition_marks;
+    combined.local_refine_outside_transition_checks +=
+        part.local_refine_outside_transition_checks;
     combined.local_refine_ceiling_bound |= part.local_refine_ceiling_bound;
     combined.local_refine_element_ceiling =
         std::max(combined.local_refine_element_ceiling,

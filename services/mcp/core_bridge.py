@@ -277,8 +277,8 @@ def available() -> bool:
 #     sharing, no per-process copy).
 #   CHUDWARE_ENGINE_DAEMON=0 -> explicit opt-out: legacy in-process ctypes load
 #     (kept at least one release as the safety net; removal is a named N+1 task).
-# During release N a daemon TRANSPORT failure falls back to legacy with a loud
-# warning rather than bricking the session; N+1 makes it a hard error.
+# Only initial startup failure before an engine session is established permits
+# legacy fallback. Lost replies and failed reconnects must never switch engines.
 _DAEMON_FALLBACK_WARNED = False
 
 
@@ -290,7 +290,7 @@ def _daemon_mode() -> bool:
 def active_daemon_mode() -> bool:
     """True when calls are ACTUALLY going through the daemon right now: daemon
     mode is selected AND we have not fallen back to the legacy in-process engine
-    after a transport failure. Gates daemon-only behavior that would be wrong on
+    after an initial startup failure. Gates daemon-only behavior that would be wrong on
     the fallback path (e.g. skipping the legacy .step+ handoff publisher)."""
     return _daemon_mode() and not _DAEMON_FALLBACK_WARNED
 
@@ -342,20 +342,22 @@ def call(method: str, params: Optional[dict] = None) -> dict:
     returned as-is so the caller can surface it without an exception.
     """
     global _DAEMON_FALLBACK_WARNED
-    # STICKY fallback: once a transport failure demotes us to the in-process
+    # STICKY fallback: once an initial startup failure demotes us to the in-process
     # engine we stay there for the life of this process. Retrying the daemon
     # per-call re-pays the full connect/spawn budget (~15 s) on EVERY engine
     # call — measured 150x slowdown (docs/review/PERF_AUDIT_2026-07-11.md §1) — and
     # switching back mid-session would strand doc_ids created in the in-process
     # engine. Recovery = restart the server (the warning says so).
     if _daemon_mode() and not _DAEMON_FALLBACK_WARNED:
-        from .daemon_bridge import DaemonError
+        from .daemon_bridge import DaemonError, DaemonSessionLost
 
         try:
             return _call_via_daemon(method, params)
+        except DaemonSessionLost as e:
+            raise CoreError(str(e), code=e.code, detail=e.detail) from e
         except DaemonError as e:
-            # Transport-level failure only (spawn/connect/EOF-after-retry) — RPC
-            # errors surface above as CoreError and must NOT trigger fallback.
+            # Initial startup failure only: no operation reached this engine.
+            # Established-session loss and native RPC errors never trigger fallback.
             _DAEMON_FALLBACK_WARNED = True
             print(
                 f"[core_bridge] WARNING: hostd unavailable ({e}); falling back to "

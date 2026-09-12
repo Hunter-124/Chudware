@@ -2733,7 +2733,9 @@ def _repair_merged_boolean_operands(ops: Any, doc_id: str, notes: list) -> Any:
         snap = cb.call("doc_tree", {"doc_id": doc_id}) or {}
         tree = snap.get("tree") or {}
         owner = snap.get("owner_map") or {}
-    except Exception:  # noqa: BLE001 — a probe failure must never break a valid batch
+    except Exception as exc:  # noqa: BLE001
+        if getattr(exc, "code", None) == "engine_connection_lost":
+            raise
         return ops
     bodies_of = {fid: set(v.get("bodies") or ())
                  for fid, v in owner.items() if isinstance(v, dict)}
@@ -2844,7 +2846,9 @@ def _asm_repose_refusal(ops: Any, doc_id: str) -> Optional[dict]:
         return None
     try:
         tree = (cb.call("doc_tree", {"doc_id": doc_id}) or {}).get("tree") or {}
-    except Exception:  # noqa: BLE001 — a probe failure must never block a valid batch
+    except Exception as exc:  # noqa: BLE001
+        if getattr(exc, "code", None) == "engine_connection_lost":
+            raise
         return None
     comps = {c.get("id"): c for c in (tree.get("components") or []) if isinstance(c, dict)}
     mated: dict = {}
@@ -5475,7 +5479,9 @@ def _sid_roster(doc_id: str, kind: str, limit: int = 12) -> list:
     """The document's live sids of one kind, for a teaching error."""
     try:
         res = cb.call("doc_query", {"doc_id": doc_id, "query": {"of": kind}}) or {}
-    except Exception:  # noqa: BLE001
+    except Exception as exc:  # noqa: BLE001
+        if getattr(exc, "code", None) == "engine_connection_lost":
+            raise
         return []
     out = []
     for m in res.get("matches") or []:
@@ -6125,7 +6131,9 @@ def _resolve_doc_name_refs(ops: Any, doc_id: str, notes: list) -> Any:
         return ops
     try:
         tree = (cb.call("doc_tree", {"doc_id": doc_id}) or {}).get("tree") or {}
-    except Exception:  # noqa: BLE001 — a probe failure must never break a valid batch
+    except Exception as exc:  # noqa: BLE001
+        if getattr(exc, "code", None) == "engine_connection_lost":
+            raise
         return ops
     seen: dict = {}
     for f in tree.get("features") or []:
@@ -7381,7 +7389,9 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
                 ckpt = None
                 try:
                     ckpt = cb.call("doc_checkpoint", {"doc_id": d}).get("checkpoint")
-                except Exception:  # noqa: BLE001
+                except Exception as exc:  # noqa: BLE001
+                    if getattr(exc, "code", None) == "engine_connection_lost":
+                        raise
                     ckpt = None
 
                 # GSL Stage 1a — snapshot the PRE-op topology for the write-diff (W2).
@@ -7395,14 +7405,18 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
                 try:
                     from services.mcp.preflight_tools import run_auto_preflight
                     _pf_result = run_auto_preflight(d, "add_features", ops)
-                except Exception:  # noqa: BLE001
+                except Exception as exc:  # noqa: BLE001
+                    if getattr(exc, "code", None) == "engine_connection_lost":
+                        raise
                     pass
 
                 r = cb.call("doc_apply_ops", {"doc_id": d, "ops": ops})
                 fs = (r.get("rebuild") or {}).get("feature_status", [])
                 try:
                     _enrich_zero_volume_errors(fs, ops, r.get("id_map") or {})
-                except Exception:  # noqa: BLE001 — enrichment must never mask a failure
+                except Exception as exc:  # noqa: BLE001
+                    if getattr(exc, "code", None) == "engine_connection_lost":
+                        raise
                     pass
                 # doc_apply_ops already returns the rebuilt tree.  Match each status against
                 # that authoritative tree instead of paying for a second doc_tree RPC just to
@@ -7468,7 +7482,9 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
                     try:
                         cb.call("doc_revert", {"doc_id": d, "checkpoint": ckpt})
                         reverted = True
-                    except Exception:  # noqa: BLE001
+                    except Exception as exc:  # noqa: BLE001
+                        if getattr(exc, "code", None) == "engine_connection_lost":
+                            raise
                         reverted = False
                     fail = [{"id": s.get("id"), "error": s.get("error")} for s in fs
                             if not s.get("ok")]
@@ -7567,14 +7583,18 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
                 if ok:
                     try:
                         bbox_after = cb.call("doc_bbox", {"doc_id": d})
-                    except Exception:  # noqa: BLE001
+                    except Exception as exc:  # noqa: BLE001
+                        if getattr(exc, "code", None) == "engine_connection_lost":
+                            raise
                         bbox_after = None
                     try:
                         out["changes"] = _write_diff(
                             before_hist, _face_hist(d), before_vol, vol_after,
                             warnings=[f["warning"] for f in feats if f.get("warning")],
                             bbox=bbox_after)
-                    except Exception:  # noqa: BLE001
+                    except Exception as exc:  # noqa: BLE001
+                        if getattr(exc, "code", None) == "engine_connection_lost":
+                            raise
                         out["changes"] = {
                             "summary": "geometry changed but write-diff unavailable",
                             "faces_delta": None,
@@ -7613,7 +7633,9 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
                                     "pairs": pairs,
                                     "dead_features": dead,
                                 }
-                        except Exception:  # noqa: BLE001
+                        except Exception as exc:  # noqa: BLE001
+                            if getattr(exc, "code", None) == "engine_connection_lost":
+                                raise
                             pass
                 # Push the updated part to the desktop app's viewport (if it's open) so the user
                 # watches it build. Best-effort; only when something actually got built.
@@ -7684,7 +7706,9 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
                                     "(ascii_ruled), the constraint summary, grid/index for "
                                     "cell-addressed edits, and findings. "
                                     + str(readbacks[0].get("hint") or ""))
-                    except Exception:  # noqa: BLE001
+                    except Exception as exc:  # noqa: BLE001
+                        if getattr(exc, "code", None) == "engine_connection_lost":
+                            raise
                         pass
                 return out
 
@@ -7707,6 +7731,10 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
             # before; a heavy one that overruns the budget keeps running and returns a job_id so
             # the transport call returns in time and the session survives.
             raw = _solve_sync_or_handoff("add_features", _apply)
+            if isinstance(raw, dict) and raw.get("code") == "engine_connection_lost":
+                if interpreted:
+                    raw["interpreted"] = interpreted
+                return _dumps(raw)
             if created and isinstance(raw, dict):
                 raw["created_doc"] = created
             if (mint_requested_name is not None and isinstance(raw, dict)
@@ -8171,6 +8199,7 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
         elif snap["status"] == "error":
             out["ok"] = False
             out["error"] = snap["error"]
+            out.update({key: snap[key] for key in ("code", "detail") if key in snap})
         return _dumps(out)
 
 

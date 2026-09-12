@@ -1,10 +1,9 @@
-// Linear-static FEA on tet4 meshes — C++ port of engine/sim/fea_static.py.
+// Linear-static FEA on tet4, tet10 and hex8 meshes.
 //
-// First solver of the simulation rewrite. The numerics (tet4 strain-displacement,
-// isotropic elasticity, global stiffness assembly, von Mises recovery) mirror the
-// Python oracle exactly; the sparse direct solve uses Eigen::SparseLU in place of
-// scipy.sparse.linalg.spsolve. CUDA acceleration (batched assembly / a GPU sparse
-// solve) is a later optimization layer on top of this correct CPU core.
+// The default sparse direct solver follows the CHOLMOD/LDLT/LU ladder. Explicit
+// CHUDWARE_FEA_SOLVER=iccg selects bounded, incomplete-Cholesky preconditioned CG
+// for linear elasticity and frictionless unilateral penalty contact, with no
+// direct fallback. Assembly, material laws and stress/reaction recovery are shared.
 //
 // Boundary conditions arrive ALREADY RESOLVED to mesh nodes: a list of fixed node
 // indices (each pins all 3 of its DOFs to zero) and a per-node force vector. The
@@ -33,6 +32,33 @@ struct FeaMaterial {
 struct FeaMaterials {
     std::vector<FeaMaterial> materials;
     std::vector<uint16_t> elem_material;
+};
+
+// Explicit opt-in only; direct solver selection/defaults are unchanged.
+// ICCG supports linear elasticity (including unilateral penalty contact), not plasticity.
+// True relative residual tolerance is 1e-10 (never degraded). The per-linear-solve
+// budget defaults to 10000 iterations; CHUDWARE_FEA_ICCG_MAX_ITERATIONS accepts
+// 1..1000000. Reports always contain the actual limit and all active-set solves.
+bool fea_static_uses_iccg();
+
+struct FeaLinearSolveStep {
+    int iterations = 0;
+    double relative_residual = 0.0;  // independently evaluated ||K*u-rhs|| / ||rhs||
+    bool converged = false;
+};
+
+struct FeaIterativeReport {
+    double tolerance = 1e-10;
+    int iteration_limit = 0;  // per linear solve, not per contact study
+    uint64_t total_iterations = 0;
+    // One entry per attempted linear solve, in active-set order for contact.
+    std::vector<FeaLinearSolveStep> solves;
+    uint64_t projected_peak_bytes = 0;  // latest admission's storage bound, NOT measured peak
+    uint64_t maximum_projected_peak_bytes = 0;  // largest bound across admission stages
+    uint64_t resident_at_admission_bytes = 0;  // measured process RSS, includes mesh
+    uint64_t free_dofs = 0;
+    uint64_t stored_nonzeros = 0;
+    std::string admission_stage;
 };
 
 struct FeaStaticResult {
@@ -110,6 +136,7 @@ struct FeaStaticResult {
     // surfaces it as provenance.solver and as a solver_notes line, so a result
     // always says how it was computed.
     std::string solver;
+    FeaIterativeReport iterative;
     // Milliseconds this solve spent queued behind another heavy solve on the
     // process-wide solve gate (0 = it started immediately). Reported so a slow run
     // that was merely waiting is not mistaken for a slow solve.
@@ -122,6 +149,8 @@ struct FeaStaticResult {
     // fallback factorization returned finite numbers and the equilibrium residual
     // came out small. Surfaced as a solver_notes line; ok stays true, because the
     // field is still the most useful thing to look at while diagnosing the mesh.
+    // ICCG also reports that convergence cannot certify SPD or rule out unexcited
+    // rigid modes; it never pretends a shifted incomplete factor is an SPD test.
     std::string conditioning_warning;
     // Nodes eliminated because no element, bond tie or contact pair references them:
     // their rows in the reduced system are exactly zero, so keeping them free makes
@@ -133,7 +162,7 @@ struct FeaStaticResult {
 
     // Prepared-system (factor) cache observability. factor_cache_hit means this solve
     // reused the reduced DOF map + assembled K + numeric factorization and only
-    // re-solved the RHS (load-only repeat). Always false on the tet4 parity path.
+    // re-solved the RHS (load-only repeat). Always false for tet4 and ICCG.
     bool factor_cache_hit = false;
 
     // ── Elastic-plastic state (empty unless FeaPlasticity::enabled) ──────────
@@ -145,6 +174,9 @@ struct FeaStaticResult {
     // of the state variable rather than a smoothed one.
     std::vector<double> equivalent_plastic_strain;
 };
+
+// Shared evidence serialization for both native static result entry points.
+nlohmann::json fea_iterative_report_json(const FeaStaticResult& result);
 
 // Factor-cache counters (tet10/hex8 prepared-system reuse). Thread-safe.
 struct FeaFactorCacheStats {

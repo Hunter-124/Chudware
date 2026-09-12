@@ -14,11 +14,11 @@ namespace data {
 // s = hex-key (metadata); bh_* = ISO 7380 button head; fh_d = ISO 10642 flat
 // head Ø (90°); hex_af = hex-head/nut width across flats; nut_t = hex-nut
 // thickness (ISO 4032); wash_* = ISO 7089 flat washer; insert_od = heat-set
-// insert outside Ø (0 = not offered).
+// insert outside Ø (0 = not offered); hex_h = ISO 4017 nominal head height.
 struct MetricRow {
     const char* size;
     double d, pitch, dk, k, s, bh_d, bh_h, fh_d, hex_af, nut_t,
-        wash_id, wash_od, wash_t, insert_od;
+        wash_id, wash_od, wash_t, insert_od, hex_h;
 };
 
 // Imperial/SAE fastener row (Unified). d = major Ø; pitch from TPI; shcs_* =

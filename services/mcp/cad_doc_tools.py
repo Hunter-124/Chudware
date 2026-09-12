@@ -7821,19 +7821,19 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
     def set_material(material: Union[str, dict, list],
                      body: Optional[Union[str, int]] = None,
                      doc_id: Optional[str] = None) -> str:
-        """Set the document material and its rendered body appearance.
+        """Set physical material identity and rendered appearance for a part or body.
 
-        A material NAME resolves through the engineering material registry, persists as the
-        document's authoritative material key, and also applies the matching visual finish to
-        the selected body/bodies. This keeps native .step+ metadata, drawing title-block checks
-        and rendered appearance aligned. An explicit appearance dict or RGB list has no
-        engineering identity and therefore changes appearance only.
+        A material NAME resolves through the engineering material registry. With body=,
+        its key is saved in body_materials for only that body; the document material
+        remains the default for other bodies. Without body=, the whole part receives
+        the material and previous body overrides are cleared. An explicit appearance
+        dict or RGB list changes visuals only, preserving physical material identity.
 
         material: registry name/designation (A36, 4140, 6061-T6, PETG, ...) or an explicit
                   appearance {"color":[r,g,b], "metallic"?:0..1, "roughness"?:0..1}.
         body: "b1", "b2", ... or ordinal; default all bodies.
-        Mass/FEA calls still take their own material/density input for the solve, but the stored
-        document key is now available for drawings and manufacturing metadata.
+        Mass/FEA calls still take their own material/density input for the solve.
+        The native tree exposes both the document default and body_materials overrides.
         """
         try:
             d = _doc(doc_id)
@@ -7858,19 +7858,25 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
                     # engineering identity instead of silently retaining default 6061.
                     material_key = _material_norm(material).replace(" ", "_")
                     unsupported_identity = material_key
-            # Resolve target body keys. None -> all bodies (an empty op batch returns the tess
-            # body list without mutating the doc); int -> "b<n>"; str -> the key as given.
+            # Resolve the live body inventory before accepting a selected-body identity.
+            info = cb.call("asm_world_bodies", {"doc_id": d})
+            bodies = info.get("bodies", [])
             if body is None:
-                info = cb.call("doc_apply_ops", {"doc_id": d, "ops": []})
-                n = len(info.get("tess", {}).get("bodies", [])) or 1
+                n = len(bodies) or 1
                 targets = [f"b{i + 1}" for i in range(n)]
             elif isinstance(body, int):
                 targets = [f"b{body}"]
             else:
                 targets = [str(body)]
+            if body is not None and targets[0] not in {
+                    f"b{i + 1}" for i in range(len(bodies))}:
+                raise ValueError(f"set_material: body {targets[0]!r} is not present in this part")
             ops = []
             if material_key:
-                ops.append({"op": "set_material", "key": material_key})
+                identity = {"op": "set_material", "key": material_key}
+                if body is not None:
+                    identity["id"] = targets[0]
+                ops.append(identity)
             ops.extend({"op": "set_appearance", "id": key, **ap} for key in targets)
             r = cb.call("doc_apply_ops", {"doc_id": d, "ops": ops})
             out = {"ok": True, "doc_id": d, "bodies": targets,

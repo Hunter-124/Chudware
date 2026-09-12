@@ -8,18 +8,20 @@ namespace data {
 
 // Metric fasteners (ISO). See parts_data.h for column meanings.
 const std::vector<MetricRow>& metric() {
-    //                size     d   pitch  dk     k     s    bh_d  bh_h  fh_d  hex_af nut_t wid   wod   wt   ins_od
+    // ISO 4017 nominal head heights k (not socket-head k), table 1:
+    // https://www.westfieldfasteners.co.uk/Standards/ScrewBolt-HexHd4017-M-THRfull.html
+    //                size     d   pitch  dk     k     s    bh_d  bh_h  fh_d  hex_af nut_t wid   wod   wt   ins_od hex_h
     static const std::vector<MetricRow> t = {
-        {"M1.6", 1.6, 0.35,  3.0,  1.6,  1.5,  3.0,  1.0,  3.6,  3.2,  1.3,  1.8,  4.0,  0.3,  0.0},
-        {"M2",   2.0, 0.40,  3.8,  2.0,  1.5,  3.8,  1.3,  4.4,  4.0,  1.6,  2.2,  5.5,  0.3,  3.6},
-        {"M2.5", 2.5, 0.45,  4.5,  2.5,  2.0,  4.7,  1.5,  5.5,  5.0,  2.0,  2.7,  6.0,  0.5,  4.0},
-        {"M3",   3.0, 0.50,  5.5,  3.0,  2.5,  5.7,  1.65, 6.3,  5.5,  2.4,  3.2,  7.0,  0.5,  4.6},
-        {"M4",   4.0, 0.70,  7.0,  4.0,  3.0,  7.6,  2.2,  8.4,  7.0,  3.2,  4.3,  9.0,  0.8,  5.9},
-        {"M5",   5.0, 0.80,  8.5,  5.0,  4.0,  9.5,  2.75, 10.4, 8.0,  4.0,  5.3,  10.0, 1.0,  6.4},
-        {"M6",   6.0, 1.00,  10.0, 6.0,  5.0,  10.5, 3.3,  12.6, 10.0, 5.0,  6.4,  12.0, 1.6,  8.1},
-        {"M8",   8.0, 1.25,  13.0, 8.0,  6.0,  14.0, 4.4,  17.3, 13.0, 6.5,  8.4,  16.0, 1.6,  0.0},
-        {"M10",  10.0,1.50,  16.0, 10.0, 8.0,  17.5, 5.5,  20.0, 16.0, 8.0,  10.5, 20.0, 2.0,  0.0},
-        {"M12",  12.0,1.75,  18.0, 12.0, 10.0, 21.0, 6.6,  24.0, 18.0, 10.0, 13.0, 24.0, 2.5,  0.0},
+        {"M1.6", 1.6, 0.35,  3.0,  1.6,  1.5,  3.0,  1.0,  3.6,  3.2,  1.3,  1.8,  4.0,  0.3,  0.0, 1.1},
+        {"M2",   2.0, 0.40,  3.8,  2.0,  1.5,  3.8,  1.3,  4.4,  4.0,  1.6,  2.2,  5.5,  0.3,  3.6, 1.4},
+        {"M2.5", 2.5, 0.45,  4.5,  2.5,  2.0,  4.7,  1.5,  5.5,  5.0,  2.0,  2.7,  6.0,  0.5,  4.0, 1.7},
+        {"M3",   3.0, 0.50,  5.5,  3.0,  2.5,  5.7,  1.65, 6.3,  5.5,  2.4,  3.2,  7.0,  0.5,  4.6, 2.0},
+        {"M4",   4.0, 0.70,  7.0,  4.0,  3.0,  7.6,  2.2,  8.4,  7.0,  3.2,  4.3,  9.0,  0.8,  5.9, 2.8},
+        {"M5",   5.0, 0.80,  8.5,  5.0,  4.0,  9.5,  2.75, 10.4, 8.0,  4.0,  5.3,  10.0, 1.0,  6.4, 3.5},
+        {"M6",   6.0, 1.00,  10.0, 6.0,  5.0,  10.5, 3.3,  12.6, 10.0, 5.0,  6.4,  12.0, 1.6,  8.1, 4.0},
+        {"M8",   8.0, 1.25,  13.0, 8.0,  6.0,  14.0, 4.4,  17.3, 13.0, 6.5,  8.4,  16.0, 1.6,  0.0, 5.3},
+        {"M10",  10.0,1.50,  16.0, 10.0, 8.0,  17.5, 5.5,  20.0, 16.0, 8.0,  10.5, 20.0, 2.0,  0.0, 6.4},
+        {"M12",  12.0,1.75,  18.0, 12.0, 10.0, 21.0, 6.6,  24.0, 18.0, 10.0, 13.0, 24.0, 2.5,  0.0, 7.5},
     };
     return t;
 }
@@ -136,8 +138,8 @@ std::vector<Family> catalog() {
     f.push_back({"fhcs", "Flat Head Cap Screw", "Screws", "ISO 10642 / DIN 7991",
                  "90° countersunk head; sits flush in a csink.", true,
                  metric_sizes(2.5, 8), kScrewLengths});
-    f.push_back({"hex_bolt", "Hex Head Bolt", "Screws", "ISO 4017 (M), ASME B18.2.1 (in)",
-                 "External hex head; wrench-driven.", true,
+    f.push_back({"hex_bolt", "Hex Head Bolt", "Screws", "ISO 4017 nominal envelope (M); approximate envelope (in)",
+                 "External hex head; simplified unthreaded geometry, no property-class certification.", true,
                  metric_plus_sae(3, 12), kScrewLengths});
     f.push_back({"hex_nut", "Hex Nut", "Nuts", "ISO 4032 (M), ASME B18.2.2 (in)",
                  "Standard hex nut.", false, metric_plus_sae(2, 12), {}});

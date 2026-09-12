@@ -901,9 +901,7 @@ void expand_standard_part(json& doc, const json& feat, std::size_t idx,
     // size / thread / designation — models often say "thread":"m3".
     const std::string size = param_str({"size", "thread", "designation", "bore"});
     const double length_mm = param_len();
-    json options = json::object();
-    if (params.contains("options") && params["options"].is_object())
-        options = params["options"];
+    const json options = params.value("options", json::object());
 
     if (family.empty()) {
         throw OpError("invalid_op",
@@ -3843,8 +3841,25 @@ void apply_one(json& doc, const json& op, std::size_t idx, IdGen& gen, json& id_
     } else if (k == "set_units") {
         if (op.contains("system")) doc["units"]["system"] = op["system"];
     } else if (k == "set_material") {
-        doc["material"] = op.contains("key") && !op["key"].is_null()
-                              ? json{{"key", op["key"]}} : json(nullptr);
+        const json material = op.contains("key") && !op["key"].is_null()
+                                  ? json{{"key", op["key"]}} : json(nullptr);
+        if (op.contains("id")) {
+            if (doc.value("schema", std::string()) != "aicad.part/1")
+                throw OpError("invalid_op", "set_material: assign assembly materials in the source part");
+            const std::string id = op.value("id", std::string());
+            if (id.size() < 2 || id[0] != 'b' || id[1] < '1' || id[1] > '9' ||
+                !std::all_of(id.begin() + 2, id.end(), [](char c) { return c >= '0' && c <= '9'; }))
+                throw OpError("invalid_op", "set_material: expected a part body id such as b1");
+            if (!material.is_null()) {
+                doc["body_materials"][id] = material;
+            } else if (doc.contains("body_materials")) {
+                doc["body_materials"].erase(id);
+                if (doc["body_materials"].empty()) doc.erase("body_materials");
+            }
+        } else {
+            doc["material"] = material;
+            doc.erase("body_materials");
+        }
     } else if (k == "set_appearance") {
         // C26 body colour + C32-A RealView material (doc_ops.md). `id` is a body key ("b<ordinal>"
         // for a part body, component id for assembly). A null/absent `color` clears the body back to
@@ -8435,7 +8450,11 @@ json doc_query(const std::string& doc_id, const json& query) {
                       ? query["body_id"].get<int>() : 0;
     TopoDS_Shape shape;
     if (body_id >= 1) {
-        CompileResult r = compile_session(s);
+        CompileResult r;
+        if (s.is_assembly())
+            r.shapes = gather_export_shapes(s);
+        else
+            r = compile_session(s);
         if (r.shapes.empty())
             throw_no_bodies(doc_id, r, "query");
         if (body_id > static_cast<int>(r.shapes.size()))

@@ -591,3 +591,54 @@ angle pin retains its authored direction as well as its prescribed phase and
 coincident origin; satisfying only the phase with a reversed pin is invalid.
 Its existing phase-alignment convention is unchanged. Point coincidence and
 ordinary direction-only angle mates keep their existing constraints.
+
+## 19. Body-scoped physical material identity (2026-09-11)
+
+`set_material` accepts an optional `id:"bN"` on part documents, using the
+same 1-based body identifiers as `set_appearance`. A non-null `key` with an
+`id` stores `body_materials[id] = {"key": key}` without replacing the part's
+`material` default. A null or omitted `key` removes that body's override,
+restoring inheritance from the default. The empty override map is removed.
+Body override keys must have canonical positive ordinals (`b1`, not `b0`
+or `b01`), and values must be objects containing a string `key`.
+
+Without `id`, the operation replaces the whole-part material and clears all
+body overrides. This preserves whole-part assignment semantics when the part
+previously had mixed materials. `set_appearance` does not alter either physical
+material field. The fields are exposed by the document tree and persist through
+native save/open.
+
+The MCP `set_material(body=...)` tool checks the live body inventory with a
+read-only query before assigning an override; an absent body refuses without
+changing material, appearance, or document revision. Body identifiers refer to
+the current part inventory, not an assembly's source-component material.
+These identity fields do not change the explicit material/density inputs of
+mass or FEA calls.
+
+## 20. Material catalog and standard fastener limits (2026-09-11)
+
+Material identities may name density-only or direction-dependent registry
+records. A mass query with an explicit material name resolves its density
+without requiring isotropic stiffness or yield data; an explicit density
+still takes precedence. Isotropic FEA refuses records marked with a
+non-isotropic or incomplete constitutive model before meshing. Registry
+appearances take precedence over family heuristics, including natural POM.
+These rules do not make saved body material identities implicit analysis inputs.
+
+Metric `hex_bolt` geometry uses tabulated ISO 4017 nominal head heights,
+including 7.5 mm for M12. `options.standard` accepts `ISO4017` or `ISO 4017`
+for this family; other standards, unknown options, mechanical-property
+claims such as `property_class`, and non-object options refuse rather than
+silently generating a different request. The native geometry is a schematic
+thread envelope, not a full tolerance or thread-form model. SAE hex-bolt
+dimensions remain explicitly approximate. A class 10.9 material identity
+does not certify purchased fastener mechanical properties.
+
+## 21. Body-scoped assembly geometry queries (2026-09-11)
+
+`doc_query` with a positive 1-based `query.body_id` selects a world-placed
+assembly body in the same order as the un-exploded assembly/export inventory.
+It does not compile the assembly as an empty part or return local source
+coordinates. An out-of-range body refuses; it never falls back to querying
+the whole assembly. Unscoped queries retain whole-document behavior.
+This allows `interface_check` to compare real placed component faces.

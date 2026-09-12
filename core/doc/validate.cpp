@@ -1965,6 +1965,21 @@ vector<string> validate_part(const json& doc) {
             errs.push_back("material: must be null or {key}");
         }
     }
+    if (doc.contains("body_materials")) {
+        const json& assignments = doc["body_materials"];
+        if (!assignments.is_object()) {
+            errs.push_back("body_materials: must be an object keyed by part body id");
+        } else {
+            for (auto it = assignments.begin(); it != assignments.end(); ++it) {
+                const string& id = it.key();
+                const bool valid_id = id.size() >= 2 && id[0] == 'b' &&
+                    id[1] >= '1' && id[1] <= '9' &&
+                    std::all_of(id.begin() + 2, id.end(), [](char c) { return c >= '0' && c <= '9'; });
+                if (!valid_id || !it.value().is_object() || !get(it.value(), "key").is_string())
+                    errs.push_back("body_materials." + id + ": expected bN: {key}, N >= 1");
+            }
+        }
+    }
     auto eqres = validate_equations(doc, "");
     errs.insert(errs.end(), eqres.first.begin(), eqres.first.end());
     const std::set<string>& globals_names = eqres.second;

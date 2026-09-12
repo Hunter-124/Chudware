@@ -5,7 +5,7 @@ The worked example: a 4-hole plate stack (bracket + plate). A deliberately MISAL
 must be FLAGGED with the correct position delta; the CORRECTED (registered) version must PASS.
 
 Also covers the shared doc_query `body_id` selector this tool depends on (T-BL49 engine change):
-per-body face selection + out-of-range guard + default (bodies[-1]) behavior.
+per-body face selection, world-placed assembly bodies and the out-of-range guard.
 
 Run:  python -m pytest services/mcp/test_interface_check.py -v
 """
@@ -117,7 +117,56 @@ def test_doc_query_body_id_out_of_range():
     doc = _build_stack(dx=0.0)
     with pytest.raises(cb.CoreError) as exc:
         cb.call("doc_query", {"doc_id": doc, "query": {"of": "face", "surf": "round", "body_id": 99}})
-    assert "body_id" in str(exc.value) or "out of range" in str(exc.value), str(exc.value)
+    assert exc.value.code == "invalid_op"
+
+
+@pytest.mark.parametrize("dx", [0.0, 1.5])
+def test_interface_check_world_placed_assembly(tmp_path, dx):
+    """A real assembly must measure placed component faces, not its empty part tree."""
+    plate = _fresh_doc("interface_source")
+    assembly = None
+    try:
+        result, _ = _call("add_features", {"doc_id": plate, "ops": [
+            cb.feat("box", "Plate", {"length": cb.dim(60), "width": cb.dim(40),
+                                    "height": cb.dim(10)}),
+            cb.feat("bolt_circle", "Holes", {"diameter": 6, "count": 4, "pcd": 30},
+                    {"face": {"of": "face", "side": "top"}}),
+        ]})
+        assert result["ok"], result
+        path = str(tmp_path / "interface_source.step+")
+        result, _ = _call("save_part", {"doc_id": plate, "path": path})
+        assert result["ok"], result
+        result, _ = _call("new_assembly", {"name": f"interface_assembly_{next(_STACK_SEQ)}"})
+        assert result["ok"], result
+        assembly = result["doc_id"]
+        for placement in ([100, 200, 30], [100 + dx, 200, 40]):
+            result, _ = _call("asm_add_component",
+                              {"doc_id": assembly, "path": path, "at": placement})
+            assert result["ok"], result
+        for body, center in enumerate(([100, 200, 30], [100 + dx, 200, 40]), 1):
+            result = cb.call("doc_query", {"doc_id": assembly,
+                             "query": {"of": "face", "surf": "round", "body_id": body}})
+            cylinders = [m for m in result["matches"] if m["surf"] == "cylinder"]
+            assert len(cylinders) == 4, result
+            mean = [sum(face["centroid"][axis] for face in cylinders) / 4
+                    for axis in range(3)]
+            assert mean == pytest.approx(center, abs=1e-6)
+        with pytest.raises(cb.CoreError):
+            cb.call("doc_query", {"doc_id": assembly,
+                    "query": {"of": "face", "body_id": 3}})
+        result, _ = _call("interface_check",
+                          {"doc_id": assembly, "components": ["k1", "k2"]})
+        assert result["ok"] is (dx == 0), result
+        assert len(result["pairs"]) == 1, result
+        holes = result["pairs"][0]["checks"]["hole_pattern"]
+        assert holes["status"] == ("pass" if dx == 0 else "fail"), holes
+        records = holes["matched"] if dx == 0 else holes["misaligned"]
+        assert len(records) == 4, holes
+        assert [record["pos_delta_mm"] for record in records] == pytest.approx([dx] * 4)
+    finally:
+        if assembly is not None:
+            _call("close_part", {"doc_id": assembly})
+        _call("close_part", {"doc_id": plate})
 
 
 # --- the worked regression: misaligned flagged, corrected passes -------------------------------

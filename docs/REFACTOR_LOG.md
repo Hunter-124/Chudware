@@ -3949,3 +3949,69 @@ provisioner's deliberate live-only endpoint policy. The sandbox test now checks
 the declared environment contract and rejects enabled sandbox delivery to a
 live-only URL. No Stripe configuration or live billing changed. The real
 sandbox endpoint check and seven provisioning tests pass.
+
+## 2026-09-11 — independent body material persistence
+
+Fixed a production Chudware session reproduction where `set_material("A36",
+body="b2")` recolored only b2 but silently replaced the entire part's physical
+material. `core/doc/session.cpp` now stores body overrides independently of
+the part default; `core/doc/validate.cpp` validates their shape and body keys;
+`services/mcp/cad_doc_tools.py` forwards the selected body and checks its
+presence through the read-only world-body inventory. Whole-part assignment
+clears overrides; appearance-only changes preserve identity. The regression
+in `test_cad_tools.py` covers save/reopen, absent-body refusal without revision
+change, appearance edits, and whole-part replacement. Removed a preset-helper
+echo test and an incidental error-wording assertion. Native/GUI builds and
+targeted material tests pass. A resumed compiled Chudcode/hostd session
+independently saved, closed, and reopened a two-body aluminum/steel part;
+ME-490's `Engineering/Verification/me490_harness_material_verified.json`
+retains the actual calls and source/output hashes. This verifies persisted
+identity, not automatic mass/FEA material inheritance; those APIs retain
+explicit analysis inputs. The additive operation contract is in `doc_ops.md`.
+
+## 2026-09-11 — condition-qualified materials and metric bolt geometry
+
+Added source- and product-condition-qualified material records for the ME-490
+workflow. The 42CrMo4 hub's 70 mm flat-stock selection uses the supplier's
+550 MPa minimum, not a thinner or smaller round-stock rating. Wood, printed
+TPU, HDPE, natural POM and bearing bronze retain incomplete constitutive
+markers rather than fabricated isotropic constants. Density-only mass queries
+now work without stiffness/yield fields; isotropic FEA refuses those incomplete
+models before meshing. Registry appearances preserve product-specific colors.
+
+Replaced the metric hex-bolt head-height heuristic with nominal ISO 4017
+values and made standard/options refusals explicit through native entrypoints.
+SAE geometry remains marked approximate. A real production harness session
+saved/reopened the selected material identities, measured a 10 mm TPU cube
+at 1.22 g (or 2.7 g with explicit density override), observed the native FEA
+refusal, and measured the corrected M12x40 BRep at 7.5 mm head height,
+18 mm across flats and 47.5 mm total length. Its isolated four-component
+hardware stack completed all six interference pairs without overlap;
+no shaft engagement or manufacturing qualification is implied.
+Evidence: ME-490 `Engineering/Verification/me490_harness_catalog_bolt_verified.json`.
+Targeted material tests: 98 passed; native `parts` CTest passed.
+
+## 2026-09-11 — assembly body-specific interface queries
+
+An actual hub hardware harness session exposed `interface_check` failing with
+“document has no bodies to query” on a valid assembly. The scoped `doc_query`
+branch compiled the assembly as a part while the unscoped branch already used
+world-placed export shapes. Reused that existing assembly collection in the
+scoped branch; part behavior and out-of-range refusal remain unchanged.
+
+Two real-engine regressions failed before the fix and passed afterward:
+translated plate stacks at 0 mm and 1.5 mm hole-pattern offsets. All 14
+interface tests pass. A fresh production Chudcode session independently
+measured both components' world coordinates, observed the aligned pass and
+four 1.5 mm mismatch findings, and verified body 3 refuses on a two-body
+assembly. It also queried the actual hub/washer stack successfully.
+Evidence: ME-490 `Engineering/Verification/me490_harness_assembly_query_verified.json`.
+
+The combined material, fastener and assembly-query unit passed the complete
+`scripts/gate.sh` run in `/tmp/chudware-gate-3344546`: native/GUI/WASM builds,
+all 108 CTests, service/tool/training suites, hostd and web-parity probes,
+FIN25 golden demo (13 pass, 0 fail, 1 skip), and host/slash screenshot smokes.
+Optional V&V/modeling/benchmark/AppImage switches remained unset; those skips
+are not claims of having exercised their extended suites. The gate's real
+thermal board result was 133.3956 C. Separate project wheel/contact studies
+are engineering work and are not software-gate strength approvals.

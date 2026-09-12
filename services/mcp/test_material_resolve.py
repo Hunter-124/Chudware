@@ -399,3 +399,57 @@ def test_a_genuinely_zero_modulus_is_still_rejected():
     from services.mcp.cad_common import _resolve_material
     with pytest.raises(ValueError, match="E_mpa must be > 0"):
         _resolve_material({"e_mpa": 0, "nu": 0.33})
+
+
+def test_density_only_tread_measures_mass_but_refuses_isotropic_fea():
+    """Published filament density is sufficient for mass, never a substitute for a model."""
+    material = "tpu_ultimaker_s95a_black"
+    doc = _call("new_part", {"name": "density_only_tread", "fresh": True})["doc_id"]
+    built = _call("add_features", {"doc_id": doc, "ops": [
+        {"type": "box", "name": "Solid", "params": {
+            "length": 10, "width": 10, "height": 10}}]})
+    assert built["ok"], built
+    assigned = _call("set_material", {"doc_id": doc, "material": material})
+    assert assigned["ok"], assigned
+    mass = _call("measure_part", {"doc_id": doc, "material": material})
+    assert mass["mass"]["mass_g"] == pytest.approx(1.22, rel=1e-6), mass
+    explicit = _call("measure_part", {
+        "doc_id": doc, "material": material, "density_g_cm3": 2.7})
+    assert explicit["mass"]["mass_g"] == pytest.approx(2.7, rel=1e-6), explicit
+    default = _call("measure_part", {"doc_id": doc})
+    assert default["mass"]["mass_g"] == pytest.approx(7.85, rel=1e-6), default
+    with pytest.raises(ValueError):
+        _resolve_material(material)
+
+
+def test_plywood_density_does_not_authorize_isotropic_elasticity():
+    assert _cc._resolve_material_density("finnish_birch_plywood_9mm_7ply") == 0.68
+    with pytest.raises(ValueError):
+        _resolve_material("finnish_birch_plywood_9mm_7ply")
+    # Even complete-looking scalar properties cannot erase an explicit orthotropic model.
+    with pytest.raises(ValueError):
+        _resolve_material({"constitutive_model": "orthotropic", "E_mpa": 10000,
+                           "nu": 0.3, "yield_mpa": 30, "density_g_cm3": 0.68})
+
+
+def test_selected_section_strengths_do_not_fall_back_to_generic_alloys():
+    shaft = _resolve_material("42CrMo4+QT 750")
+    hub = _resolve_material("42CrMo4+QT 650")
+    plate = _resolve_material("6061-T6 unwelded plate 240")
+    assert shaft["yield_mpa"] == 750
+    assert hub["yield_mpa"] == 650
+    assert plate["yield_mpa"] == 240
+    assert _resolve_material("6061-T6")["yield_mpa"] == 276
+    with pytest.raises(ValueError):
+        _resolve_material("4140")
+
+
+def test_product_registry_appearance_overrides_generic_family_and_is_copied():
+    # "natural" would otherwise lose to generic "plastic"; product black is not silver.
+    natural = _cc._resolve_appearance("Ensinger TECAFORM AH natural POM-C")
+    black = _cc._resolve_appearance("UltiMaker S-series TPU 95A black")
+    assert natural["metallic"] == black["metallic"] == 0
+    assert natural["color"] == [0.9, 0.89, 0.85]
+    assert black["color"] == [0.045, 0.045, 0.05]
+    natural["color"][0] = 0
+    assert _cc._resolve_appearance("TECAFORM AH natural")["color"][0] == 0.9

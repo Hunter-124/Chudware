@@ -2829,18 +2829,19 @@ def _material_candidates(raw: object) -> list:
     return out
 
 
-def _material_registry_row(name: str) -> Optional[dict]:
-    """One designation -> the FULL registry's own properties, in flat fea_table shape.
-
-    Returns None when the name is not a registry key/name/alias, or when no engine bridge
-    is reachable (the caller then falls through to the normal unknown-material error).
-    The shape is EXACTLY the fea_table row shape — this dict is handed to the C++ solver
-    as study.material, so no extra keys are added."""
+def _material_registry_record(name: str) -> Optional[dict]:
+    """Read a full registry record without inventing properties when the bridge is absent."""
     try:
         rec = cb.call("material_get", {"name": name}).get("result")
     except Exception:  # noqa: BLE001 — no engine / RPC unavailable: not a resolution
         return None
-    if not isinstance(rec, dict):
+    return rec if isinstance(rec, dict) else None
+
+
+def _material_registry_row(name: str) -> Optional[dict]:
+    """Flatten mechanical data, retaining a non-isotropic model restriction for validation."""
+    rec = _material_registry_record(name)
+    if rec is None:
         return None
     mech = rec.get("mechanical")
     if not isinstance(mech, dict):
@@ -2849,6 +2850,8 @@ def _material_registry_row(name: str) -> Optional[dict]:
     for f in ("E_mpa", "nu", "density_g_cm3", "yield_mpa", "ultimate_mpa", "endurance_mpa"):
         if f in mech:
             row[f] = mech[f]
+    if rec.get("constitutive_model", "isotropic") != "isotropic":
+        row["constitutive_model"] = rec["constitutive_model"]
     return row
 
 
@@ -2965,6 +2968,19 @@ def _canonical_material_keys(material: dict) -> dict:
     return out
 
 
+def _resolve_material_density(material: Union[str, dict, None]) -> float:
+    """Resolve mass density independently of whether an isotropic FEA model is available."""
+    mat = (_canonical_material_keys(material) if isinstance(material, dict)
+           else _resolve_material_name(material))
+    density = mat.get("density_g_cm3")
+    if (isinstance(density, bool) or not isinstance(density, (int, float))
+            or not math.isfinite(density) or density <= 0):
+        raise ValueError(
+            f"Material {material!r} carries no finite positive density_g_cm3; "
+            "pass density_g_cm3= explicitly to compute mass.")
+    return float(density)
+
+
 def _resolve_material(material: Union[str, dict, None]) -> dict:
     """Resolve a material name or explicit dict to a validated properties dict.
 
@@ -2977,6 +2993,12 @@ def _resolve_material(material: Union[str, dict, None]) -> dict:
         mat = _canonical_material_keys(material)
     else:
         mat = _resolve_material_name(material)
+    model = mat.pop("constitutive_model", "isotropic")
+    if model != "isotropic":
+        raise ValueError(
+            f"Material {material!r} has constitutive_model={model!r}, not a qualified "
+            "isotropic FEA model. Its density may be used for mass, but missing or "
+            "directional stiffness/strength must not be replaced with isotropic defaults.")
     # F4: validate that the resolved dict has physically plausible mechanical properties.
     # A zero or missing E_mpa means the C++ will reject the study with a cryptic error;
     # catch it here with a useful message that names the offending material.
@@ -3074,6 +3096,14 @@ def _resolve_appearance(material: Union[str, dict, list, tuple]) -> dict:
         return ap
     if isinstance(material, (list, tuple)):
         return {"color": [float(c) for c in material][:3]}
+    # Product-specific looks outrank generic family tokens (e.g. black printed TPU or
+    # natural POM). These are illustrative finishes, not mechanical qualifications.
+    for candidate in _material_candidates(material):
+        record = _material_registry_record(candidate)
+        if record is not None:
+            if isinstance(record.get("appearance"), dict):
+                return _resolve_appearance(record["appearance"])
+            break
     key = str(material).strip().lower()
     key = _APPEARANCE_ALIASES.get(key, key)
     if key not in _APPEARANCE_PRESETS:

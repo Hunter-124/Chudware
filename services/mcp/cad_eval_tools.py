@@ -37,7 +37,7 @@ from .cad_common import (
     _reading_from_measure,
     _render_view_png,
     _resolve_feature_ref,
-    _resolve_material,
+    _resolve_material_density,
     _resolve_measure_target,
     _resolve_one_selector,
     _roster_text,
@@ -1013,8 +1013,9 @@ def register_cad_eval_tools(mcp: FastMCP) -> None:
 
         density_g_cm3 sets the material density used for mass (default 7.85 = steel). Also
         accepted as density= / density_g_cc= / material_density= / rho=, or as a NAME —
-        material="aluminum" resolves against the same material table the solvers use and
-        the density it picked comes back in `interpreted`. set_material stores document
+        material="aluminum" resolves its density from the material registry, including
+        density-only/orthotropic records without isotropic FEA data. The density it picked
+        comes back in `interpreted`. set_material stores document
         identity and appearance, but it deliberately does NOT choose this calculation's
         density; pass material= or density_g_cm3= here. Also runs a geometry sanity check
         (closed/valid solid).
@@ -1042,17 +1043,12 @@ def register_cad_eval_tools(mcp: FastMCP) -> None:
             # A material NAME is the spelling a model reaches for once it has decided the
             # part is aluminium. set_material stores that document identity + appearance,
             # while this calculation deliberately owns its density argument. Resolve the
-            # name against the solver table and echo the exact density used.
+            # name against the density registry and echo the exact density used.
             named = extra.pop("material", None)
             named = _one_alias("measure_part", "material", extra,
                                ("material_name", "mat"), named, notes)
             if named is not None and density is None:
-                props = _resolve_material(named)
-                resolved = props.get("density_g_cm3")
-                if not isinstance(resolved, (int, float)) or resolved <= 0:
-                    raise ValueError(
-                        f"measure_part(material={named!r}): that material carries no density, "
-                        f"so mass cannot be computed. Pass density_g_cm3= directly.")
+                resolved = _resolve_material_density(named)
                 density = resolved
                 notes.append(f"material={named!r} resolved to density_g_cm3={resolved} — mass "
                              f"is computed from this explicit density; stored document material "

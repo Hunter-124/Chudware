@@ -175,7 +175,6 @@ std::string family_keys_csv() {
 
 PartBuild build(const std::string& family, const std::string& size_in,
                 double length_mm, const json& options) {
-    (void)options;
     json ops = json::array();
     json specs;
     std::string name;
@@ -190,6 +189,20 @@ PartBuild build(const std::string& family, const std::string& size_in,
     // Resolve a fastener row (metric first, then SAE) for the screw/nut/washer set.
     const data::MetricRow* m = data::find_metric(size);
     const data::SaeRow* sae = m ? nullptr : data::find_sae(size);
+
+    if (!options.is_object()) bad("parts options must be an object");
+    for (auto it = options.begin(); it != options.end(); ++it) {
+        if (it.key() == "property_class")
+            bad("unsupported option property_class: generated geometry does not certify fastener mechanical properties");
+        if (it.key() != "standard")
+            bad("unsupported parts option: " + it.key());
+        // This validates the nominal envelope only, not threads, tolerances,
+        // material, or certification. Other standard selections are not implemented.
+        if (!it.value().is_string() || family != "hex_bolt" || !m ||
+            (it.value() != "ISO 4017" && it.value() != "ISO4017"))
+            bad("unsupported standard for " + family + " " + size +
+                ": only metric hex_bolt ISO 4017 nominal dimensions can be selected");
+    }
 
     auto need_len = [&](double dflt) -> double {
         return (length_mm > 0.0) ? length_mm : dflt;
@@ -220,12 +233,18 @@ PartBuild build(const std::string& family, const std::string& size_in,
         specs = {{"thread_d", m->d}, {"head_d", m->fh_d}, {"head_h", hh}, {"length", L}};
         name = "FHCS " + size + " x" + std::to_string((int)L);
     } else if (family == "hex_bolt") {
-        double d, af;
-        if (m) { d = m->d; af = m->hex_af; }
-        else if (sae) { d = sae->d; af = sae->hex_af; }
+        double d, af, head_h;
+        if (m) { d = m->d; af = m->hex_af; head_h = m->hex_h; }
+        else if (sae) {
+            d = sae->d; af = sae->hex_af;
+            // Legacy approximate SAE envelope, NOT ASME B18.2.1 dimensional compliance.
+            // The published table gives tolerance bounds for >=1/4 inch only:
+            // https://boltport.com/standards/asme-b18.2.1/hex-bolts/
+            // Numbered sizes in this catalog are outside that table's scope.
+            head_h = 0.66 * d;
+        }
         else bad("unknown size for hex_bolt: " + size);
         const double L = need_len(16.0);
-        const double head_h = 0.66 * d;
         emit_hex_prism(ops, "head", af, head_h);
         ops.push_back(op_cylinder("shank", d / 2.0, L, head_h, "boss"));
         specs = {{"thread_d", d}, {"hex_af", af}, {"head_h", head_h}, {"length", L}};

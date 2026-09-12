@@ -958,9 +958,7 @@ static json parts_make_impl(const json& params, int& rc) {
             length = params["length_mm"].get<double>();
         else if (params.contains("length") && params["length"].is_number())
             length = params["length"].get<double>();
-        const json opts = (params.contains("options") && params["options"].is_object())
-                              ? params["options"]
-                              : json::object();
+        const json opts = params.value("options", json::object());
         chudware::parts::PartBuild pb = chudware::parts::build(family, size, length, opts);
         const std::string nm = params.value("name", pb.name);
         json nresp = chudware::doc::doc_new("part", nm);

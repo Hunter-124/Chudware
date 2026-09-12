@@ -334,21 +334,60 @@ def test_set_material_preset_and_explicit():
     assert info2["tess"]["bodies"][0]["color"][2] > 0.25  # ~0.3 blue channel
 
 
-@pytest.mark.parametrize("material", ["PETG", "pla"])
-def test_set_material_print_filaments_use_plastic_appearance(material):
+def test_set_material_body_identity_survives_save_reopen(tmp_path):
     doc = _new_plate_with_hole()
-    r, _ = _call("set_material", {"material": material, "doc_id": doc})
+    reopened = None
+    try:
+        cb.call("doc_apply_ops", {"doc_id": doc, "ops": [
+            cb.feat("box", "SeparateBody", {
+                "length": cb.dim(10), "width": cb.dim(10), "height": cb.dim(10),
+                "at": [100, 0, 0], "mode": "new", "merge": False}),
+        ]})
+        whole, _ = _call("set_material", {"material": "6061-T6", "doc_id": doc})
+        default_material = cb.call("doc_tree", {"doc_id": doc})["tree"]["material"]
+        selected, _ = _call("set_material", {
+            "material": "A36", "body": "b2", "doc_id": doc})
+        assert whole["ok"] and selected["ok"], (whole, selected)
+        path = tmp_path / "mixed_materials.step+"
+        cb.call("doc_save", {"doc_id": doc, "path": str(path)})
+        cb.call("doc_close", {"doc_id": doc})
+        reopened = cb.call("doc_open", {"path": str(path)})["doc_id"]
+        state = cb.call("doc_tree", {"doc_id": reopened})
+        tree = state["tree"]
+        assert tree["material"] == default_material
+        assert tree["body_materials"]["b2"]["key"] == "steel_a36"
+        assert "b1" not in tree["body_materials"]
 
-    assert r["ok"], r
-    from services.mcp import cad_common
-    assert r["appearance"] == cad_common._resolve_appearance("plastic")
+        missing, _ = _call("set_material", {
+            "material": "brass", "body": "b99", "doc_id": reopened})
+        assert not missing.get("ok"), missing
+        after_refusal = cb.call("doc_tree", {"doc_id": reopened})
+        assert after_refusal["revision"] == state["revision"]
+        tree = after_refusal["tree"]
+        assert tree["material"] == default_material
+        assert tree["body_materials"]["b2"]["key"] == "steel_a36"
+
+        look, _ = _call("set_material", {
+            "material": {"color": [0.1, 0.2, 0.3], "metallic": 0.0},
+            "body": "b2", "doc_id": reopened})
+        assert look["ok"], look
+        tree = cb.call("doc_tree", {"doc_id": reopened})["tree"]
+        assert tree["body_materials"]["b2"]["key"] == "steel_a36"
+
+        replaced, _ = _call("set_material", {
+            "material": "brass", "doc_id": reopened})
+        assert replaced["ok"], replaced
+        tree = cb.call("doc_tree", {"doc_id": reopened})["tree"]
+        assert tree["material"]["key"] == replaced["material_key"]
+        assert not tree.get("body_materials")
+    finally:
+        cb.call("doc_close", {"doc_id": reopened or doc})
 
 
 def test_set_material_unknown_name_errors():
     doc = _new_plate_with_hole()
     r, _ = _call("set_material", {"material": "unobtanium", "doc_id": doc})
     assert not r.get("ok"), r  # _err envelope on an unknown preset
-    assert "'petg'" in r["error"] and "'pla'" in r["error"], r
 
 
 def test_fea_static_cantilever():

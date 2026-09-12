@@ -8,6 +8,9 @@
 #include "parts/parts.h"
 #include "parts/parts_data.h"
 
+#include <algorithm>
+#include <limits>
+
 using namespace chudware::parts;
 
 // Find the first add_feature op of a given primitive/feature type.
@@ -70,6 +73,64 @@ TEST_CASE("SHCS imperial 1/4-20 resolves SAE table") {
     const json* shank = find_feat(pb.ops, "cylinder");
     REQUIRE(shank);
     CHECK(cyl_radius(*shank) == doctest::Approx(6.35 / 2.0));
+}
+
+TEST_CASE("metric hex bolt envelopes use ISO 4017 head dimensions and under-head lengths") {
+    // Independent nominal s/k values from Westfield's ISO 4017 table 1.
+    // Exercise even the small sizes accepted by build() outside the UI size menu.
+    const struct { const char* size; double d, af, head_h; } cases[] = {
+        {"M1.6", 1.6, 3.2, 1.1}, {"M2", 2.0, 4.0, 1.4},
+        {"M2.5", 2.5, 5.0, 1.7}, {"M3", 3.0, 5.5, 2.0},
+        {"M4", 4.0, 7.0, 2.8}, {"M5", 5.0, 8.0, 3.5},
+        {"M6", 6.0, 10.0, 4.0}, {"M8", 8.0, 13.0, 5.3},
+        {"M10", 10.0, 16.0, 6.4}, {"M12", 12.0, 18.0, 7.5},
+    };
+    for (const auto& c : cases) {
+        INFO("hex bolt " << c.size);
+        const PartBuild pb = build("hex_bolt", c.size, 40.0, {{"standard", "ISO4017"}});
+        const json* head = find_feat(pb.ops, "extrude");
+        const json* shank = find_feat(pb.ops, "cylinder");
+        REQUIRE(head);
+        REQUIRE(shank);
+        // Check the emitted solid dimensions, not just the catalog metadata.
+        CHECK((*head)["params"]["depth"]["value"].get<double>() == doctest::Approx(c.head_h));
+        CHECK(cyl_radius(*shank) == doctest::Approx(c.d / 2.0));
+        CHECK_FALSE((*shank)["params"]["centered"].get<bool>());
+        const double shank_z = (*shank)["params"]["at"][2].get<double>();
+        const double shank_h = (*shank)["params"]["height"]["value"].get<double>();
+        CHECK(shank_z == doctest::Approx(c.head_h));
+        CHECK(shank_h == doctest::Approx(40.0));
+        CHECK(shank_z + shank_h == doctest::Approx(c.head_h + 40.0));
+        // The current hex orientation has vertical flats at x = +/- af/2.
+        double xmin = std::numeric_limits<double>::infinity();
+        double xmax = -std::numeric_limits<double>::infinity();
+        for (const json& op : pb.ops) {
+            if (op.value("op", "") != "sketch_add_entity") continue;
+            for (const char* endpoint : {"p1", "p2"}) {
+                const double x = op["entity"][endpoint][0].get<double>();
+                xmin = std::min(xmin, x);
+                xmax = std::max(xmax, x);
+            }
+        }
+        CHECK(xmin == doctest::Approx(-c.af / 2.0));
+        CHECK(xmax == doctest::Approx(c.af / 2.0));
+    }
+}
+
+TEST_CASE("parts refuse unimplemented standard and property-class selections") {
+    const PartBuild metric = build("hex_bolt", "M12", 40.0, {{"standard", "ISO 4017"}});
+    const json* head = find_feat(metric.ops, "extrude");
+    REQUIRE(head);
+    CHECK((*head)["params"]["depth"]["value"].get<double>() == doctest::Approx(7.5));
+    CHECK_THROWS_AS(build("hex_bolt", "M12", 40.0, {{"standard", "DIN 933"}}), std::invalid_argument);
+    CHECK_THROWS_AS(build("hex_bolt", "1/4-20", 40.0, {{"standard", "ISO4017"}}), std::invalid_argument);
+    CHECK_THROWS_AS(build("hex_bolt", "1/4-20", 40.0, {{"standard", "ASME B18.2.1"}}), std::invalid_argument);
+    CHECK_THROWS_AS(build("shcs", "M12", 40.0, {{"standard", "ISO4017"}}), std::invalid_argument);
+    CHECK_THROWS_AS(build("hex_bolt", "M12", 40.0,
+                          {{"standard", "ISO4017"}, {"property_class", "10.9"}}), std::invalid_argument);
+    CHECK_THROWS_AS(build("hex_bolt", "M12", 40.0, {{"property_class", nullptr}}), std::invalid_argument);
+    CHECK_THROWS_AS(build("hex_bolt", "M12", 40.0, {{"standard", 4017}}), std::invalid_argument);
+    CHECK_THROWS_AS(build("hex_bolt", "M12", 40.0, {{"finish", "zinc"}}), std::invalid_argument);
 }
 
 TEST_CASE("hex nut M5 — hex prism + central bore") {

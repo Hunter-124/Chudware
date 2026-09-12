@@ -1,7 +1,323 @@
 {
   "version": "v1",
-  "provenance_note": "First-party engineering fact table: public handbook nominal values (ASM Metals Reference, MMPDS/MIL-HDBK-5 nominal, manufacturer public datasheets). Nominal engineering priors for first-pass sizing, not certified allowables. No MatWeb/MakeItFrom/Matmatch content.",
+  "provenance_note": "Engineering fact table compiled from public handbooks, standards and manufacturer datasheets. Record-level property_basis distinguishes typical/nominal data, published minima, characteristic values and analyst assumptions. Engineering selections are not received-stock certificates or design allowables; incomplete constitutive data must not be replaced with invented isotropic properties. No MatWeb/MakeItFrom/Matmatch content.",
   "materials": {
+    "steel_42crmo4_qt_round_le40": {
+      "name": "42CrMo4 +QT round <=40 mm (750 MPa minimum)",
+      "category": "metal",
+      "aliases": ["42CrMo4+QT 750", "42CrMo4 +QT round <=40mm"],
+      "condition": "+QT, EN ISO 683-2 / 1.7225, round-bar ruling section at heat treatment <=40 mm",
+      "constitutive_model": "isotropic",
+      "mechanical": {
+        "E_mpa": 210000,
+        "nu": 0.3,
+        "density_g_cm3": 7.8,
+        "yield_mpa": 750,
+        "ultimate_mpa": 1000
+      },
+      "property_basis": {
+        "E_mpa": "typical, Ovako",
+        "nu": "typical, Ovako",
+        "density_g_cm3": "typical, Ovako",
+        "yield_mpa": "minimum: >16 to 40 mm round bar; conservative combined <=40 mm envelope subject to supplier confirmation at band boundaries",
+        "ultimate_mpa": "minimum of 1000-1200 MPa tensile range for >16 to 40 mm round bar",
+        "section_note": "The <16 mm band has 900 MPa minimum yield. Ruling section is stock/effective section during heat treatment, not a subsequently machined neck. Not a flat-stock diameter rule."
+      },
+      "selection_status": "Engineering selection; require section-qualified mechanical acceptance and EN 10204 3.1 certificate. No received-stock certification.",
+      "appearance": {"color": [0.56, 0.58, 0.62], "metallic": 0.85, "roughness": 0.25},
+      "finish_note": "Illustrative machined steel. Protect exposed non-fit surfaces; mask bearing/key/seal fits. No coating or surface-hardening certification.",
+      "provenance": {
+        "source": "Saarstahl 42CrMo4/42CrMoS4 +QT table p1 (DIN EN 10083); Ovako 42CrMo4 mechanical/other properties and EN ISO 683-2 designation",
+        "source_type": "manufacturer",
+        "url": "https://www.saarstahl.com/app/uploads/2024/03/20160318093454-42CrMo4-42CrMoS4-.pdf",
+        "urls": ["https://steelnavigator.ovako.com/steel-grades/42crmo4/"]
+      }
+    },
+    "steel_42crmo4_qt_round_gt40_le100": {
+      "name": "42CrMo4 +QT round >40-100 mm (650 MPa minimum)",
+      "category": "metal",
+      "aliases": ["42CrMo4+QT 650", "42CrMo4 +QT round >40-100mm"],
+      "condition": "+QT, EN ISO 683-2 / 1.7225, round-bar ruling section at heat treatment >40 to 100 mm",
+      "constitutive_model": "isotropic",
+      "mechanical": {
+        "E_mpa": 210000,
+        "nu": 0.3,
+        "density_g_cm3": 7.8,
+        "yield_mpa": 650,
+        "ultimate_mpa": 900
+      },
+      "property_basis": {
+        "E_mpa": "typical, Ovako",
+        "nu": "typical, Ovako",
+        "density_g_cm3": "typical, Ovako",
+        "yield_mpa": "minimum for >40 to 100 mm round ruling section",
+        "ultimate_mpa": "minimum of 900-1100 MPa tensile range",
+        "section_note": "Not applicable to arbitrary 100 mm plate: the separate flat-stock 650 MPa band is 20-60 mm thickness; 60-100 mm flat stock is 550 MPa. A machined neck does not reset the heat-treatment section."
+      },
+      "selection_status": "Engineering selection; require section-qualified mechanical acceptance and EN 10204 3.1 certificate. A generic 4140 chemistry or hardness callout is not equivalent.",
+      "appearance": {"color": [0.56, 0.58, 0.62], "metallic": 0.85, "roughness": 0.25},
+      "finish_note": "Illustrative machined steel; protect exposed non-fit surfaces and mask functional fits.",
+      "provenance": {
+        "source": "Saarstahl 42CrMo4/42CrMoS4 +QT table p1, separate round diameter/flat thickness rows; Ovako typical elastic/physical properties",
+        "source_type": "manufacturer",
+        "url": "https://www.saarstahl.com/app/uploads/2024/03/20160318093454-42CrMo4-42CrMoS4-.pdf",
+        "urls": ["https://steelnavigator.ovako.com/steel-grades/42crmo4/"]
+      }
+    },
+    "steel_42crmo4_qt_flat_gt60_lt100": {
+      "name": "42CrMo4 +QT flat 60<t<100 mm (550 MPa minimum)",
+      "category": "metal",
+      "aliases": ["42CrMo4 +QT flat 70mm"],
+      "condition": "+QT, 1.7225, flat-stock ruling thickness at heat treatment strictly between 60 and 100 mm",
+      "constitutive_model": "isotropic",
+      "mechanical": {
+        "E_mpa": 210000,
+        "nu": 0.3,
+        "density_g_cm3": 7.8,
+        "yield_mpa": 550,
+        "ultimate_mpa": 800
+      },
+      "property_basis": {
+        "E_mpa": "typical, Ovako",
+        "nu": "typical, Ovako",
+        "density_g_cm3": "typical, Ovako",
+        "yield_mpa": "Saarstahl minimum for flat stock 60<t<100 mm at heat treatment",
+        "ultimate_mpa": "minimum of 800-950 MPa tensile range",
+        "section_note": "Select a nominal 70 mm flat blank when machining a 60 mm deep hub, retaining machining allowance without claiming the thinner-stock 650 MPa minimum. Round-bar diameter is a separate qualification."
+      },
+      "selection_status": "Engineering selection; require actual product/heat-treatment section and EN 10204 3.1 certification. Not a received-stock certificate.",
+      "appearance": {"color": [0.56, 0.58, 0.62], "metallic": 0.85, "roughness": 0.25},
+      "finish_note": "Illustrative machined steel; protect exposed non-fit surfaces and mask functional fits.",
+      "provenance": {
+        "source": "Saarstahl 42CrMo4/42CrMoS4 +QT table p1, flat thickness row; Ovako typical elastic/physical properties",
+        "source_type": "manufacturer",
+        "url": "https://www.saarstahl.com/app/uploads/2024/03/20160318093454-42CrMo4-42CrMoS4-.pdf",
+        "urls": ["https://steelnavigator.ovako.com/steel-grades/42crmo4/"]
+      }
+    },
+    "aluminum_6061_t6_plate_unwelded_min240": {
+      "name": "EN AW-6061 T6/T651 unwelded plate (240 MPa minimum)",
+      "category": "metal",
+      "aliases": ["6061-T6 unwelded plate 240", "6061-T651 unwelded plate 240"],
+      "condition": "EN 485-2 sheet/plate, T6/T651, unwelded parent metal, thickness <=150 mm for the stated yield minimum",
+      "constitutive_model": "isotropic",
+      "mechanical": {
+        "E_mpa": 70000,
+        "nu": 0.3,
+        "density_g_cm3": 2.7,
+        "yield_mpa": 240
+      },
+      "property_basis": {
+        "E_mpa": "Eurocode aluminum elastic design convention, also typical supplier value",
+        "nu": "EN 1999-1-1:2007 section 3.2.5 design convention, not separately measured",
+        "density_g_cm3": "nominal supplier/Eurocode physical value",
+        "yield_mpa": "EN 485-2 Rp0.2 minimum, supplier sheet/plate table through 150 mm",
+        "tensile_minimum_note": "Relevant thin plate has Rm minimum 290 MPa, but thicker-plate minima differ; no single ultimate_mpa is assigned across the full thickness range.",
+        "section_note": "Do not apply to welded HAZ or extrusions. Confirm the selected product/thickness against the supplier table. Typical 276 MPa is not a guaranteed plate yield."
+      },
+      "selection_status": "Engineering selection, not a mill certificate or weld qualification.",
+      "appearance": {"color": [0.83, 0.85, 0.88], "metallic": 0.9, "roughness": 0.35},
+      "finish_note": "Illustrative aluminum; clear sealed anodize recommended on exposed surfaces with fit allowance and separately qualified bonding preparation. No strength credit.",
+      "provenance": {
+        "source": "thyssenkrupp 6061 datasheet pp2-3,5; EN 1999-1-1:2007 section 3.2.5",
+        "source_type": "manufacturer_and_standard",
+        "url": "https://ucpcdn.thyssenkruppBAMXUK/assets.files/material-data-sheets/aluminium/aluminium-6061.pdf",
+        "urls": ["https://www.normsplash.com/FreeDownload/169419891/UNE-EN-1999-1-1-2007-en.pdf"]
+      }
+    },
+    "finnish_birch_plywood_9mm_7ply": {
+      "name": "Finnish birch plywood 9 mm 7-ply",
+      "category": "composite",
+      "aliases": ["Finnish birch 9mm 7ply", "Finnish birch plywood 9 mm seven ply"],
+      "condition": "Birch throughout, standard cross-banded seven-ply panel, nominal 9 mm; handbook density at 65% relative humidity",
+      "constitutive_model": "orthotropic_incomplete",
+      "mechanical": {"density_g_cm3": 0.68},
+      "property_basis": {
+        "density_g_cm3": "mean design density, Table 3-1; not a guaranteed mass or lower bound",
+        "characteristic_density_kg_m3": 630,
+        "nominal_thickness_mm": 9,
+        "ply_count": 7,
+        "density_condition": "Handbook mechanical specimens conditioned at 20 C and 65% RH; characteristic density is distinct from mean density."
+      },
+      "constitutive_gaps": ["Selected panel homogenized E3 and three independent Poisson ratios", "Moisture/time reductions and through-thickness, rolling/interlaminar, bolt-bearing and edge-failure data", "Complete qualified orthotropic constitutive/failure model; no isotropic E/nu/yield substitute"],
+      "selection_status": "Engineering panel selection, not evidence of the original Comet stock or received product certification.",
+      "appearance": {"color": [0.72, 0.51, 0.28], "metallic": 0.0, "roughness": 0.65},
+      "finish_note": "Illustrative natural birch tint, not measured color or wood-grain texture. Seal faces, cut edges and holes; qualify adhesive-bond surfaces separately. Actual sealant/product unqualified.",
+      "provenance": {
+        "source": "Finnish Forest Industries Federation, Handbook of Finnish Plywood (2002), sections 2.1/3.1, Tables 2-3 and 3-1; primary-organization handbook hosted by supplier",
+        "source_type": "industry_handbook",
+        "url": "https://thomesnorthamerica.com/wp-content/uploads/finnish_plywood_handbook.pdf"
+      }
+    },
+    "tpu_ultimaker_s95a_black": {
+      "name": "UltiMaker S-series TPU 95A black",
+      "category": "plastic",
+      "aliases": ["UltiMaker TPU 95A black", "Ultimaker S-series TPU95A black"],
+      "condition": "Printed on S5, 100% infill, 0.15 mm layers, AA0.4, Cura 4.9; 2.85 mm filament",
+      "constitutive_model": "printed_elastomer_incomplete",
+      "mechanical": {"density_g_cm3": 1.22},
+      "property_basis": {
+        "density_g_cm3": "manufacturer nominal material density; not effective density of a partially filled print",
+        "printed_tensile_modulus_mpa": {"XY": 67, "YZ": 67, "Z": 56},
+        "printed_tensile_modulus_spread_mpa": {"XY": 6, "YZ": 2, "Z": 3},
+        "printed_tensile_break_mpa": {"XY": 23.7, "YZ": 37.9, "Z": 6.4},
+        "printed_tensile_break_spread_mpa": {"XY": 2.1, "YZ": 1.6, "Z": 0.5},
+        "hardness_shore_a": 96,
+        "hardness_shore_d": 48,
+        "value_class": "Typical printed-specimen values, not guaranteed minima; no yield point. Break stress is not yield."
+      },
+      "constitutive_gaps": ["Poisson/compressibility data", "Full directional stress-strain, hyperelastic/viscoelastic calibration, cyclic/fatigue and print/bond qualification"],
+      "selection_status": "Engineering filament/process selection, not certified tread capacity.",
+      "appearance": {"color": [0.045, 0.045, 0.05], "metallic": 0.0, "roughness": 0.8},
+      "finish_note": "Illustrative black uncoated tread. Black color does not qualify UV resistance; manufacturer excludes long-term UV/moisture immersion.",
+      "provenance": {
+        "source": "UltiMaker printed TPU 95A TDS pp2-3; filename v5.00, internal footer v2.00 dated 29 Apr 2022",
+        "source_type": "manufacturer",
+        "url": "https://um-support-files.ultimaker.com/materials/2.85mm/tds/TPU-95A/Ultimaker-TPU95A-TDS-v5.00.pdf",
+        "urls": ["https://ultimaker.com/materials/s-series-tpu-95a/"]
+      }
+    },
+    "hdpe_king_starboard_black": {
+      "name": "King StarBoard marine HDPE black",
+      "category": "plastic",
+      "aliases": ["King StarBoard black", "King StarBoard HDPE black"],
+      "condition": "Marine-grade HDPE sheet, factory matte, black, unpainted",
+      "constitutive_model": "polymer_incomplete",
+      "mechanical": {"density_g_cm3": 0.955},
+      "property_basis": {
+        "density_g_cm3": "nominal physical-property value",
+        "tensile_modulus_psi": 255000,
+        "flexural_modulus_psi": 185000,
+        "tensile_yield_psi": ">4100",
+        "compressive_stress_at_10pct_strain_psi": 4950,
+        "value_class": "All values explicitly nominal, not procurement minima or sustained-load allowables; flexural modulus is the nominal bending datum."
+      },
+      "constitutive_gaps": ["Poisson ratio", "Temperature/time-dependent creep, relaxation, fatigue and permanent-load allowables"],
+      "selection_status": "Engineering product selection, not evidence of supplied seat stock or certification.",
+      "appearance": {"color": [0.09, 0.10, 0.12], "metallic": 0.0, "roughness": 0.75},
+      "finish_note": "Illustrative black factory-matte surface; retain factory finish and clean edges, no painting required.",
+      "provenance": {
+        "source": "King StarBoard Physical Properties p1 nominal values/disclaimer; manufacturer product/color/HDPE identification",
+        "source_type": "manufacturer",
+        "url": "https://www.kingplastic.com/wp-content/uploads/2014/05/King-StarBoard-Physical-Properties.pdf",
+        "urls": ["https://www.kingplastic.com/products/king-starboard/"]
+      }
+    },
+    "pom_c_ensinger_tecaform_ah_natural": {
+      "name": "Ensinger TECAFORM AH natural POM-C",
+      "category": "plastic",
+      "aliases": ["TECAFORM AH natural", "Ensinger acetal TECAFORM AH natural"],
+      "condition": "Unfilled POM-C stock, machined natural surface, protected from prolonged weather",
+      "constitutive_model": "polymer_incomplete",
+      "mechanical": {"density_g_cm3": 1.41},
+      "property_basis": {
+        "density_g_cm3": "manufacturer guideline value",
+        "tensile_modulus_mpa": 2800,
+        "tensile_yield_mpa": 67,
+        "compressive_modulus_mpa": 2300,
+        "compressive_stress_mpa_at_strain_pct": {"1": 20, "2": 35, "5": 68},
+        "value_class": "Guideline short-term test values; manufacturer prohibits treating them as specifications. Compressive 20 MPa at 1% strain is not a creep-safe allowable."
+      },
+      "constitutive_gaps": ["Poisson ratio", "Temperature/time-dependent creep, clamp relaxation, compression curves, fatigue and certified lower bounds"],
+      "selection_status": "Engineering stock selection, not received-stock certification.",
+      "appearance": {"color": [0.9, 0.89, 0.85], "metallic": 0.0, "roughness": 0.5},
+      "finish_note": "Illustrative natural machined acetal. Poor weathering and difficult bonding; shield from prolonged sunlight, do not assume adhesive retention or indefinite clamp load.",
+      "provenance": {
+        "source": "Ensinger TECAFORM AH natural TDS p1, version AF 19 Jul 2023, properties and disclaimer",
+        "source_type": "manufacturer",
+        "url": "https://www.ensinger-online.com/modules/public/sheet/createsheet.php?SID=1344&FL=0&FILENAME=TECAFORM_AH_natural_0.PDF&ZOOM=1.2"
+      }
+    },
+    "steel_iso898_1_class10_9": {
+      "name": "ISO 898-1 class 10.9 full-loadability fastener steel",
+      "category": "metal",
+      "aliases": ["ISO898-1 class10.9", "ISO 898-1 class 10.9"],
+      "condition": "ISO 898-1:2013 class 10.9, full-loadability bolts/screws; reduced-head products excluded",
+      "constitutive_model": "isotropic",
+      "mechanical": {
+        "E_mpa": 210000,
+        "nu": 0.3,
+        "density_g_cm3": 7.85,
+        "yield_mpa": 940,
+        "ultimate_mpa": 1040
+      },
+      "property_basis": {
+        "E_mpa": "analyst steel elastic-screening assumption, not ISO 898-1 requirement",
+        "nu": "analyst steel elastic-screening assumption, not ISO 898-1 requirement",
+        "density_g_cm3": "analyst steel mass assumption, not ISO 898-1 requirement",
+        "yield_mpa": "minimum Rp0.2, not designation nominal yield 900",
+        "ultimate_mpa": "minimum tensile strength, not yield",
+        "proof_stress_mpa": 830,
+        "proof_stress_basis": "ISO 898-1:2013 Table 3"
+      },
+      "selection_status": "Engineering full-loadability fastener selection; require traceable manufacturer. No certificate, preload, torque-clamp, fatigue or shear capacity implied.",
+      "appearance": {"color": [0.56, 0.58, 0.62], "metallic": 0.85, "roughness": 0.35},
+      "finish_note": "Illustrative metallic fastener. Manufacturer ISO 10683 zinc-flake with defined friction/topcoat recommended, subject to small-thread/internal-drive suitability; no coating or preload certification.",
+      "provenance": {
+        "source": "ISO 898-1:2013 Table 3 p8, scope exclusions pp1-2, designation section 5; elastic constants separately labeled analyst assumptions",
+        "source_type": "standard_and_analyst_assumptions",
+        "url": "https://cdn.standards.iteh.ai/samples/60610/e211f7b6697643f192d041ceceb1f2be/ISO-898-1-2013.pdf",
+        "urls": ["https://www.bossard.com/global-en/product-solutions/components-specific-solutions/fastener-coatings/corrosion-protection-coatings/"]
+      }
+    },
+    "bronze_c93200_b505_m07": {
+      "name": "C93200 SAE 660 continuous-cast ASTM B505 M07",
+      "category": "metal",
+      "aliases": ["C93200 B505 M07", "SAE660 B505 M07"],
+      "condition": "Continuous-cast C93200/SAE660, ASTM B505/B505M temper M07",
+      "constitutive_model": "isotropic_incomplete",
+      "mechanical": {"density_g_cm3": 8.91},
+      "property_basis": {
+        "density_g_cm3": "typical",
+        "elastic_modulus_ksi": 14500,
+        "elastic_modulus_basis": "typical",
+        "tensile_minimum_ksi": 35,
+        "yield_at_0_5pct_extension_minimum_ksi": 20,
+        "yield_note": "0.5% extension-under-load convention is NOT 0.2% offset or a proven elastic/J2 limit. Sand/centrifugal cast forms have different lower minima and are not this stock selection."
+      },
+      "constitutive_gaps": ["Poisson ratio", "0.2%-offset/elastic-limit data", "Lubrication-dependent PV, friction and wear limits"],
+      "selection_status": "Engineering continuous-cast stock selection, not certification or a dry-running bearing rating.",
+      "appearance": {"color": [0.68, 0.46, 0.22], "metallic": 0.9, "roughness": 0.3},
+      "finish_note": "Illustrative bronze. Running bore unpainted and finished for separately selected lubrication regime.",
+      "provenance": {
+        "source": "Copper Development Association C93200 mechanical/physical/specification tables; Morgan Bronze ASTM B505 supply",
+        "source_type": "industry_and_manufacturer",
+        "url": "https://alloys.copper.org/alloy/C93200",
+        "urls": ["https://morganbronze.com/astm-b505-c93200-bronze/"]
+      }
+    },
+    "steel_100cr6_ovako803j_qtm": {
+      "name": "Ovako 803J 100Cr6 +Q/T(m)",
+      "category": "metal",
+      "aliases": ["Ovako 803J martensitic 100Cr6"],
+      "condition": "Ovako 803J martensitic +Q/T(m); product/application-dependent, not generic 52100",
+      "constitutive_model": "isotropic",
+      "mechanical": {
+        "E_mpa": 210000,
+        "nu": 0.3,
+        "density_g_cm3": 7.8,
+        "yield_mpa": 1700,
+        "ultimate_mpa": 2300
+      },
+      "property_basis": {
+        "E_mpa": "typical",
+        "nu": "typical",
+        "density_g_cm3": "typical",
+        "yield_mpa": "supplier-listed minimum for the named variant/condition, subject to product/application disclaimer and contractual confirmation",
+        "ultimate_mpa": "typical, not minimum",
+        "hardness_hrc": 61,
+        "hardness_basis": "typical",
+        "section_note": "Supplier notes hardenability approximately a ring with 17 mm wall; this does not qualify arbitrary sections."
+      },
+      "selection_status": "Engineering condition-specific selection only. Require supplier confirmation; actual bearing capacity/life uses bearing catalog ratings, not bulk steel yield.",
+      "appearance": {"color": [0.69, 0.71, 0.74], "metallic": 0.88, "roughness": 0.2},
+      "finish_note": "Illustrative finished bearing steel; retain manufacturer race finish, seals and grease, do not coat raceways.",
+      "provenance": {
+        "source": "Ovako 100Cr6 variant 803J mechanical/other properties, general information and disclaimer",
+        "source_type": "manufacturer",
+        "url": "https://steelnavigator.ovako.com/steel-grades/100cr6/"
+      }
+    },
     "steel_a36": {
       "name": "Mild steel (A36)",
       "category": "metal",

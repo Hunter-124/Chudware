@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import threading
 import time
 from collections import deque
 from pathlib import Path
@@ -33,13 +34,14 @@ class RateLimiter:
     bound (the gateway runs under ``MemoryMax=1G``).
     """
 
-    __slots__ = ("limit", "window", "max_keys", "_hits")
+    __slots__ = ("limit", "window", "max_keys", "_hits", "_lock")
 
     def __init__(self, limit: int, window_sec: float, max_keys: int = 4096) -> None:
         self.limit = limit
         self.window = window_sec
         self.max_keys = max_keys
         self._hits: dict[str, Deque[float]] = {}
+        self._lock = threading.Lock()
 
     def _prune(self, bucket: Deque[float], now: float) -> None:
         cutoff = now - self.window
@@ -48,24 +50,26 @@ class RateLimiter:
 
     def check(self, key: str) -> bool:
         """Record a hit for ``key``. False once the window budget is spent."""
-        now = time.monotonic()
-        bucket = self._hits.get(key)
-        if bucket is None:
-            if len(self._hits) >= self.max_keys:
-                self._sweep(now)
-            bucket = self._hits.setdefault(key, deque())
-        self._prune(bucket, now)
-        if len(bucket) >= self.limit:
-            return False
-        bucket.append(now)
-        return True
+        with self._lock:
+            now = time.monotonic()
+            bucket = self._hits.get(key)
+            if bucket is None:
+                if len(self._hits) >= self.max_keys:
+                    self._sweep(now)
+                bucket = self._hits.setdefault(key, deque())
+            self._prune(bucket, now)
+            if len(bucket) >= self.limit:
+                return False
+            bucket.append(now)
+            return True
 
     def retry_after(self, key: str) -> int:
         """Whole seconds until ``key`` regains budget (>= 1 when throttled)."""
-        bucket = self._hits.get(key)
-        if not bucket:
-            return 0
-        return max(1, int(self.window - (time.monotonic() - bucket[0])) + 1)
+        with self._lock:
+            bucket = self._hits.get(key)
+            if not bucket:
+                return 0
+            return max(1, int(self.window - (time.monotonic() - bucket[0])) + 1)
 
     def _sweep(self, now: float) -> None:
         cutoff = now - self.window
@@ -165,6 +169,16 @@ def dir_size_bytes(root: Path, *, cap: int | None = None) -> int:
     return total
 
 
+# Bounded stripes avoid an ever-growing lock table for arbitrary account roots.
+# This serializes this gateway process, not external Box/native filesystem writers.
+_STORAGE_WRITE_LOCKS = tuple(threading.RLock() for _ in range(64))
+
+
+def storage_write_lock(root: Path):
+    """Hold across quota preflight, mutation and final accounting of one root."""
+    return _STORAGE_WRITE_LOCKS[hash(root) % len(_STORAGE_WRITE_LOCKS)]
+
+
 def enforce_disk_quota(
     email: str,
     plan: str,
@@ -187,6 +201,7 @@ def enforce_disk_quota(
 
 __all__ = [
     "RateLimiter",
+    "storage_write_lock",
     "api_writes",
     "uploads",
     "chat_messages",

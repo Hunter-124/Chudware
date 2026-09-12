@@ -1,17 +1,17 @@
-"""Per-account workspace file API + aicm mesh fetch for the web-native client.
+"""Authorized workspace file API + aicm mesh fetch for the web-native client.
 
-/workspace/* is rooted at the CALLER's per-account tree
-(``settings.user_workspace_root(user_slug(email))``), created on demand. Any
-``*.ua.edu`` account is auto-approved, so the workspace MUST be tenant-
-isolated: every path resolution is clamped under the caller's own root, the
-copilot chat store and recents list are per-account files inside that root,
-and mutating endpoints carry per-account rate limits, upload caps, and disk
-quotas. An admin may opt into the LEGACY single-tenant shared tree
-(``settings.workspace_root`` itself) with ``?scope=shared`` — the legacy
-content is never moved or deleted, and non-admins can never address it.
+The caller's explicitly selected team or personal tree is the path jail.
+Without a selection, verified University of Alabama accounts default to the
+configured live Box-backed team; all others keep their isolated personal tree.
+Team membership, institutional verification and owner funding are rechecked by
+orgs.resolve_team_bucket. Chats remain per-account even in a shared workspace;
+file recents belong to the selected tree. Rate limits remain per-account.
+An admin may explicitly select the legacy shared tree with ?scope=shared.
 
 The daemon reads and writes the SAME paths directly (doc_open/doc_save take
 server-side paths) — bytes only cross the wire for import/export.
+Blocking filesystem handlers are synchronous FastAPI routes so mounted I/O and
+recursive quota checks run in the threadpool, never on the ASGI event loop.
 
 /files/aicm serves tessellation payloads the daemon publishes for its clients:
 either plain files (tmp chudware_cpp_docs / state dir / the caller's own
@@ -31,27 +31,31 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import APIRouter, File, Form, HTTPException, Request, UploadFile
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 
 try:
+    from . import orgs
     from .auth import User, get_current_user
     from .accounts import get_account
     from .config import settings
     from .limits import (
         api_writes,
         enforce_disk_quota,
+        storage_write_lock,
         dir_size_bytes,
         enforce_upload_size,
         uploads,
         user_slug,
     )
 except ImportError:  # uvicorn app:app from package dir
+    import orgs
     from auth import User, get_current_user
     from accounts import get_account
     from config import settings
     from limits import (
         api_writes,
         enforce_disk_quota,
+        storage_write_lock,
         dir_size_bytes,
         enforce_upload_size,
         uploads,
@@ -96,23 +100,38 @@ def _ws_root() -> Path:
 
 
 def _caller_root(request: Request, scope: str = "") -> tuple[User, Path]:
-    """Resolve the one root this caller is allowed to address.
-
-    Default is the account's own tree, created on demand. ``scope=shared`` is
-    an admin-only escape hatch onto the legacy shared tree; any other scope
-    value is rejected so a typo cannot silently widen access.
-    """
+    """Resolve the selected authorized CAD tree, defaulting to institutional storage."""
     user = get_current_user(request)
     if scope == "shared":
         if user.role != "admin":
             raise HTTPException(status_code=403, detail="scope=shared requires admin")
         return user, _ws_root()
-    if scope:
+    if scope and scope != "personal":
         raise HTTPException(status_code=400, detail="unknown scope")
+    team = orgs.selected_workspace_team(request, user.email, scope)
+    if team:
+        bucket = orgs.resolve_team_bucket(
+            user.email, team, write=request.method not in {"GET", "HEAD"}
+        )
+        request.state.workspace_team = bucket
+        bucket.root.mkdir(parents=True, exist_ok=True)
+        return user, bucket.root.resolve()
     _ws_root()  # base must still be configured (503 on misconfig)
     root = settings.user_workspace_root(user_slug(user.email))
     root.mkdir(parents=True, exist_ok=True)
     return user, root.resolve()
+
+
+@router.post("/workspace/selection")
+def workspace_selection(request: Request, body: dict[str, Any]) -> JSONResponse:
+    user = get_current_user(request)
+    selection = str(body.get("team") or "")
+    if selection != "personal":
+        orgs.resolve_team_bucket(user.email, selection, write=False)
+    response = JSONResponse({"ok": True, "team": selection})
+    response.set_cookie("chudware_workspace", selection, httponly=True,
+                        secure=request.url.scheme == "https", samesite="lax", path="/")
+    return response
 
 
 def _resolve(root: Path, rel: str, *, must_exist: bool = True) -> Path:
@@ -152,7 +171,7 @@ def _content_length(request: Request) -> int | None:
 
 
 @router.get("/workspace/list")
-async def workspace_list(request: Request, dir: str = "", scope: str = "") -> dict[str, Any]:
+def workspace_list(request: Request, dir: str = "", scope: str = "") -> dict[str, Any]:
     _, root = _caller_root(request, scope)
     base = _resolve(root, dir)
     if not base.is_dir():
@@ -183,7 +202,7 @@ async def workspace_list(request: Request, dir: str = "", scope: str = "") -> di
 
 
 @router.get("/workspace/download")
-async def workspace_download(request: Request, path: str, scope: str = "") -> FileResponse:
+def workspace_download(request: Request, path: str, scope: str = "") -> FileResponse:
     _, root = _caller_root(request, scope)
     target = _resolve(root, path)
     if not target.is_file():
@@ -193,147 +212,156 @@ async def workspace_download(request: Request, path: str, scope: str = "") -> Fi
 
 
 @router.post("/workspace/upload")
-async def workspace_upload(
-    request: Request,
-    file: UploadFile = File(...),
-    dir: str = Form(""),
-    scope: str = "",
-) -> dict[str, Any]:
+def workspace_upload(request: Request,
+file: UploadFile = File(...),
+dir: str = Form(""),
+scope: str = "",) -> dict[str, Any]:
+    
     user, root = _caller_root(request, scope)
-    api_writes.enforce(user.email, "writes")
-    uploads.enforce(user.email, "uploads")
-    declared = _content_length(request)
-    cap = enforce_upload_size(declared)
-    account = get_account(user.email)
-    plan = getattr(account, "plan", "trial")
-    enforce_disk_quota(
-        user.email,
-        plan,
-        root,
-        incoming_bytes=declared or 0,
-    )
-    base = _resolve(root, dir)
-    if not base.is_dir():
-        raise HTTPException(status_code=400, detail="not a directory")
-    name = Path(file.filename or "upload.bin").name  # strip any client dirs
-    if name.startswith(".") or not name:
-        raise HTTPException(status_code=400, detail="bad filename")
-    target = base / name
-    if target.is_symlink():
-        raise HTTPException(status_code=400, detail="symlink not allowed")
-    size = 0
-    try:
-        with target.open("wb") as out:
-            while chunk := await file.read(1 << 20):
-                size += len(chunk)
-                # Chunked uploads have no Content-Length — enforce the cap
-                # DURING streaming and leave no partial file behind.
-                if size > cap:
-                    raise HTTPException(
-                        status_code=413,
-                        detail=f"upload too large — {cap // (1024 * 1024)} MiB max",
-                    )
-                out.write(chunk)
-        # Content-Length can be absent or dishonest. The completed file is
-        # inside root now, so this final check binds the quota to actual bytes.
-        enforce_disk_quota(user.email, plan, root)
-    except BaseException:
-        target.unlink(missing_ok=True)
-        raise
-    log.info("workspace upload: %s (%d bytes) by %s", target, size, user.email)
-    # abs_path is part of the WASM client contract (fs_backend.h): the client
-    # feeds it straight to the daemon's doc_open. It can only ever name a file
-    # inside this caller's own root.
-    return {"ok": True, "path": str(target.relative_to(root)),
-            "abs_path": str(target), "bytes": size}
+    with storage_write_lock(root):
+        api_writes.enforce(user.email, "writes")
+        uploads.enforce(user.email, "uploads")
+        declared = _content_length(request)
+        cap = enforce_upload_size(declared)
+        account = get_account(user.email)
+        team = getattr(request.state, "workspace_team", None)
+        plan = team.owner_plan if team else getattr(account, "plan", "trial")
+        enforce_disk_quota(
+            user.email,
+            plan,
+            root,
+            incoming_bytes=declared or 0,
+        )
+        base = _resolve(root, dir)
+        if not base.is_dir():
+            raise HTTPException(status_code=400, detail="not a directory")
+        name = Path(file.filename or "upload.bin").name  # strip any client dirs
+        if name.startswith(".") or not name:
+            raise HTTPException(status_code=400, detail="bad filename")
+        target = base / name
+        if target.is_symlink():
+            raise HTTPException(status_code=400, detail="symlink not allowed")
+        size = 0
+        try:
+            with target.open("wb") as out:
+                while chunk := file.file.read(1 << 20):
+                    size += len(chunk)
+                    # Chunked uploads have no Content-Length — enforce the cap
+                    # DURING streaming and leave no partial file behind.
+                    if size > cap:
+                        raise HTTPException(
+                            status_code=413,
+                            detail=f"upload too large — {cap // (1024 * 1024)} MiB max",
+                        )
+                    out.write(chunk)
+            # Content-Length can be absent or dishonest. The completed file is
+            # inside root now, so this final check binds the quota to actual bytes.
+            enforce_disk_quota(user.email, plan, root)
+        except BaseException:
+            target.unlink(missing_ok=True)
+            raise
+        log.info("workspace upload: %s (%d bytes) by %s", target, size, user.email)
+        # abs_path is part of the WASM client contract (fs_backend.h): the client
+        # feeds it straight to the daemon's doc_open. It can only ever name a file
+        # inside this caller's own root.
+        return {"ok": True, "path": str(target.relative_to(root)),
+                "abs_path": str(target), "bytes": size}
 
 
 @router.post("/workspace/mkdir")
-async def workspace_mkdir(request: Request, body: dict[str, Any], scope: str = "") -> dict[str, Any]:
+def workspace_mkdir(request: Request, body: dict[str, Any], scope: str = "") -> dict[str, Any]:
+    
     user, root = _caller_root(request, scope)
-    api_writes.enforce(user.email, "writes")
-    target = _resolve(root, str(body.get("path", "")), must_exist=False)
-    target.mkdir(parents=True, exist_ok=True)
-    return {"ok": True, "path": str(target.relative_to(root))}
+    with storage_write_lock(root):
+        api_writes.enforce(user.email, "writes")
+        target = _resolve(root, str(body.get("path", "")), must_exist=False)
+        target.mkdir(parents=True, exist_ok=True)
+        return {"ok": True, "path": str(target.relative_to(root))}
 
 
 @router.post("/workspace/rename")
-async def workspace_rename(request: Request, body: dict[str, Any], scope: str = "") -> dict[str, Any]:
+def workspace_rename(request: Request, body: dict[str, Any], scope: str = "") -> dict[str, Any]:
+    
     user, root = _caller_root(request, scope)
-    api_writes.enforce(user.email, "writes")
-    src = _resolve(root, str(body.get("src", "")))
-    dst = _resolve(root, str(body.get("dst", "")), must_exist=False)
-    if dst.exists():
-        raise HTTPException(status_code=409, detail="destination exists")
-    src.rename(dst)
-    return {"ok": True, "path": str(dst.relative_to(root))}
+    with storage_write_lock(root):
+        api_writes.enforce(user.email, "writes")
+        src = _resolve(root, str(body.get("src", "")))
+        dst = _resolve(root, str(body.get("dst", "")), must_exist=False)
+        if dst.exists():
+            raise HTTPException(status_code=409, detail="destination exists")
+        src.rename(dst)
+        return {"ok": True, "path": str(dst.relative_to(root))}
 
 
 @router.post("/workspace/delete")
-async def workspace_delete(request: Request, body: dict[str, Any], scope: str = "") -> dict[str, Any]:
+def workspace_delete(request: Request, body: dict[str, Any], scope: str = "") -> dict[str, Any]:
+    
     user, root = _caller_root(request, scope)
-    api_writes.enforce(user.email, "writes")
-    target = _resolve(root, str(body.get("path", "")))
-    if target == root:
-        raise HTTPException(status_code=400, detail="refusing to delete root")
-    if target.is_dir():
-        shutil.rmtree(target)
-    else:
-        target.unlink()
-    return {"ok": True}
+    with storage_write_lock(root):
+        api_writes.enforce(user.email, "writes")
+        target = _resolve(root, str(body.get("path", "")))
+        if target == root:
+            raise HTTPException(status_code=400, detail="refusing to delete root")
+        if target.is_dir():
+            shutil.rmtree(target)
+        else:
+            target.unlink()
+        return {"ok": True}
 
 
 @router.post("/workspace/copy")
-async def workspace_copy(request: Request, body: dict[str, Any], scope: str = "") -> dict[str, Any]:
+def workspace_copy(request: Request, body: dict[str, Any], scope: str = "") -> dict[str, Any]:
     """Copy a file or directory within the caller's workspace under quota."""
     user, root = _caller_root(request, scope)
-    api_writes.enforce(user.email, "writes")
-    src = _resolve(root, str(body.get("src", "")))
-    dst = _resolve(root, str(body.get("dst", "")), must_exist=False)
-    recursive = bool(body.get("recursive", True))
-    if src == root:
-        raise HTTPException(status_code=400, detail="refusing to copy root")
-    if dst == root or dst == src:
-        raise HTTPException(status_code=400, detail="bad destination")
-    if src.is_dir():
-        if not recursive:
-            raise HTTPException(status_code=400, detail="directory copy requires recursive=true")
-        if dst.exists():
-            raise HTTPException(status_code=409, detail="destination exists")
-        incoming = dir_size_bytes(src)
-    else:
-        if not src.is_file():
-            raise HTTPException(status_code=400, detail="not a file")
-        if dst.exists() and dst.is_dir():
-            dst = _resolve(root, str((dst / src.name).relative_to(root)), must_exist=False)
-        if dst.exists():
-            raise HTTPException(status_code=409, detail="destination exists")
-        incoming = src.stat().st_size
-
-    account = get_account(user.email)
-    plan = getattr(account, "plan", "trial")
-    enforce_disk_quota(user.email, plan, root, incoming_bytes=incoming)
-    try:
-        dst.parent.mkdir(parents=True, exist_ok=True)
+    with storage_write_lock(root):
+        api_writes.enforce(user.email, "writes")
+        src = _resolve(root, str(body.get("src", "")))
+        dst = _resolve(root, str(body.get("dst", "")), must_exist=False)
+        recursive = bool(body.get("recursive", True))
+        if src == root:
+            raise HTTPException(status_code=400, detail="refusing to copy root")
+        if dst == root or dst == src:
+            raise HTTPException(status_code=400, detail="bad destination")
         if src.is_dir():
-            shutil.copytree(src, dst)
+            if not recursive:
+                raise HTTPException(status_code=400, detail="directory copy requires recursive=true")
+            if dst.exists():
+                raise HTTPException(status_code=409, detail="destination exists")
+            incoming = dir_size_bytes(src)
         else:
-            shutil.copy2(src, dst)
-        # Bind enforcement to actual copied bytes if the source changed during
-        # the copy. Rejection removes the whole destination before returning.
-        enforce_disk_quota(user.email, plan, root)
-    except BaseException:
-        if dst.is_dir() and not dst.is_symlink():
-            shutil.rmtree(dst, ignore_errors=True)
-        else:
-            dst.unlink(missing_ok=True)
-        raise
-    log.info("workspace copy: %s -> %s by %s", src, dst, user.email)
-    return {"ok": True, "path": str(dst.relative_to(root))}
+            if not src.is_file():
+                raise HTTPException(status_code=400, detail="not a file")
+            if dst.exists() and dst.is_dir():
+                dst = _resolve(root, str((dst / src.name).relative_to(root)), must_exist=False)
+            if dst.exists():
+                raise HTTPException(status_code=409, detail="destination exists")
+            incoming = src.stat().st_size
+    
+        account = get_account(user.email)
+        team = getattr(request.state, "workspace_team", None)
+        plan = team.owner_plan if team else getattr(account, "plan", "trial")
+        enforce_disk_quota(user.email, plan, root, incoming_bytes=incoming)
+        try:
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            if src.is_dir():
+                shutil.copytree(src, dst)
+            else:
+                shutil.copy2(src, dst)
+            # Bind enforcement to actual copied bytes if the source changed during
+            # the copy. Rejection removes the whole destination before returning.
+            enforce_disk_quota(user.email, plan, root)
+        except BaseException:
+            if dst.is_dir() and not dst.is_symlink():
+                shutil.rmtree(dst, ignore_errors=True)
+            else:
+                dst.unlink(missing_ok=True)
+            raise
+        log.info("workspace copy: %s -> %s by %s", src, dst, user.email)
+        return {"ok": True, "path": str(dst.relative_to(root))}
 
 
 @router.get("/workspace/recents")
-async def workspace_recents_get(request: Request, scope: str = "") -> dict[str, Any]:
+def workspace_recents_get(request: Request, scope: str = "") -> dict[str, Any]:
     """Load the caller's durable recent-files list (<root>/.chudware_recents.json)."""
     _, root = _caller_root(request, scope)
     path = root / _RECENTS_NAME
@@ -356,28 +384,29 @@ async def workspace_recents_get(request: Request, scope: str = "") -> dict[str, 
 
 
 @router.put("/workspace/recents")
-async def workspace_recents_put(request: Request, body: dict[str, Any], scope: str = "") -> dict[str, Any]:
+def workspace_recents_put(request: Request, body: dict[str, Any], scope: str = "") -> dict[str, Any]:
     """Persist the caller's recent-files list inside their own workspace root."""
     user, root = _caller_root(request, scope)
-    api_writes.enforce(user.email, "writes")
-    raw = body.get("files", []) if isinstance(body, dict) else []
-    files: list[str] = []
-    if isinstance(raw, list):
-        seen: set[str] = set()
-        for e in raw:
-            if not isinstance(e, str):
-                continue
-            p = e.strip()
-            if not p or p in seen:
-                continue
-            seen.add(p)
-            files.append(p)
-            if len(files) >= _RECENTS_MAX:
-                break
-    path = root / _RECENTS_NAME
-    path.write_text(json.dumps({"files": files}, indent=2), encoding="utf-8")
-    log.info("workspace recents: wrote %d entries for %s", len(files), user.email)
-    return {"ok": True, "files": files}
+    with storage_write_lock(root):
+        api_writes.enforce(user.email, "writes")
+        raw = body.get("files", []) if isinstance(body, dict) else []
+        files: list[str] = []
+        if isinstance(raw, list):
+            seen: set[str] = set()
+            for e in raw:
+                if not isinstance(e, str):
+                    continue
+                p = e.strip()
+                if not p or p in seen:
+                    continue
+                seen.add(p)
+                files.append(p)
+                if len(files) >= _RECENTS_MAX:
+                    break
+        path = root / _RECENTS_NAME
+        path.write_text(json.dumps({"files": files}, indent=2), encoding="utf-8")
+        log.info("workspace recents: wrote %d entries for %s", len(files), user.email)
+        return {"ok": True, "files": files}
 
 
 def _chat_path(root: Path) -> Path:
@@ -476,16 +505,17 @@ def _atomic_write_json(path: Path, data: dict[str, Any]) -> None:
 
 
 @router.get("/workspace/chat")
-async def workspace_chat_get(request: Request, scope: str = "") -> dict[str, Any]:
+def workspace_chat_get(request: Request, scope: str = "") -> dict[str, Any]:
     """Return the caller's complete flat chat store, or an empty object if absent."""
-    _, root = _caller_root(request, scope)
+    # Conversations are private even while collaborating on a shared CAD tree.
+    _, root = _caller_root(request, "personal")
     return _load_chat_store(root)
 
 
 @router.put("/workspace/chat")
 async def workspace_chat_put(request: Request, scope: str = "") -> dict[str, Any]:
     """Atomically replace the caller's complete flat v2 chat store."""
-    user, root = _caller_root(request, scope)
+    user, root = _caller_root(request, "personal")
     api_writes.enforce(user.email, "writes")
     declared = _content_length(request)
     if declared is not None and declared > _CHAT_MAX_BODY:
@@ -526,7 +556,7 @@ def _aicm_allowlist(caller_root: Path | None) -> list[Path]:
 
 
 @router.get("/files/aicm")
-async def files_aicm(request: Request, path: str = "", shm: str = "", scope: str = "") -> FileResponse:
+def files_aicm(request: Request, path: str = "", shm: str = "", scope: str = "") -> FileResponse:
     """Serve one daemon-published tessellation payload (file or shm object)."""
     if path.startswith(_SHM_URI_PREFIX):
         shm, path = path[len(_SHM_URI_PREFIX):], ""

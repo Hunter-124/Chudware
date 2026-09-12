@@ -747,3 +747,81 @@ def test_deleting_an_org_removes_it_from_every_members_view(client, staffed):
         assert int(cur.fetchone()["n"]) == 0
         cur.execute("SELECT count(*) AS n FROM org_members WHERE org_id = %s", (org_id,))
         assert int(cur.fetchone()["n"]) == 0
+
+
+def _university(client, monkeypatch, tmp_path):
+    data = _create_org(client, name="University of Alabama")
+    org_id = data["id"]
+    with db.tx() as cur:
+        cur.execute("SELECT id FROM teams WHERE org_id = %s", (org_id,))
+        team_id = str(cur.fetchone()["id"])
+    root = tmp_path / "box"
+    root.mkdir()
+    monkeypatch.setattr(settings, "university_org_id", org_id)
+    monkeypatch.setattr(settings, "university_team_id", team_id)
+    monkeypatch.setattr(settings, "university_workspace_root", str(root))
+    original = Path.is_mount
+    monkeypatch.setattr(Path, "is_mount", lambda p: p == root or original(p))
+    return team_id, root
+
+
+@pytest.mark.parametrize("email,verified,allowed", [
+    ("student@ua.edu", True, True),
+    ("student@crimson.ua.edu", True, True),
+    ("student@crimson.ua.edu", False, False),
+    ("student@notua.edu", True, False),
+    ("student@ua.edu.attacker.example", True, False),
+])
+def test_university_requires_verified_domain_boundary(client, monkeypatch, tmp_path, email, verified, allowed):
+    team_id, root = _university(client, monkeypatch, tmp_path)
+    _seed(email)
+    with db.tx() as cur:
+        cur.execute(
+            "INSERT INTO credentials(email,password_hash,email_verified) VALUES (%s,'unused',%s)",
+            (email, verified),
+        )
+    (root / "project.txt").write_text("university project")
+    headers = {"X-Dev-User": email}
+    response = client.get("/workspace/list", headers=headers)
+    assert response.status_code == 200
+    assert (response.json()["root"] == str(root)) is allowed
+    direct = client.get("/api/bucket/download", params={"team": team_id, "path": "project.txt"}, headers=headers)
+    assert direct.status_code == (200 if allowed else 404)
+    assert accounts.get_account(email).role == "user"
+    assert accounts.get_account(email).plan == "trial"
+    assert not accounts.get_account(email).ai_grant
+
+
+def test_university_selection_mount_loss_and_suspension(client, monkeypatch, tmp_path):
+    team_id, root = _university(client, monkeypatch, tmp_path)
+    email = "verified@crimson.ua.edu"
+    _seed(email)
+    with db.tx() as cur:
+        cur.execute("INSERT INTO oauth_identities(provider,subject,email) VALUES ('google','university-test',%s)", (email,))
+    headers = {"X-Dev-User": email}
+    assert client.get("/workspace/list", headers=headers).json()["root"] == str(root)
+    selected = client.post("/workspace/selection", headers=headers, json={"team": "personal"})
+    assert selected.status_code == 200
+    assert client.get("/workspace/list", headers=headers).json()["root"] != str(root)
+    assert client.get("/workspace/list", params={"team": team_id}, headers=headers).json()["root"] == str(root)
+    monkeypatch.setattr(Path, "is_mount", lambda p: False)
+    assert client.get("/workspace/list", params={"team": team_id}, headers=headers).status_code == 503
+    accounts.set_status(email, "suspended", decided_by="test")
+    assert client.get("/workspace/list", params={"team": team_id}, headers=headers).status_code == 403
+
+
+def test_university_expired_trial_does_not_unlock_other_services(client, monkeypatch, tmp_path):
+    _, root = _university(client, monkeypatch, tmp_path)
+    email = "expired@ua.edu"
+    _seed(email)
+    with db.tx() as cur:
+        cur.execute("INSERT INTO oauth_identities(provider,subject,email) VALUES ('google','expired-university',%s)", (email,))
+        cur.execute("UPDATE accounts SET trial_ends_at = 1 WHERE email = %s", (email,))
+    headers = {"X-Dev-User": email}
+    assert client.get("/workspace/list", headers=headers).json()["root"] == str(root)
+    portal = client.get("/api/portal/account", headers=headers)
+    assert portal.status_code == 200
+    assert portal.json()["workspace"]["storage_provider"] == "box"
+    assert client.get("/api/portal/usage", headers=headers).status_code == 403
+    assert client.get("/api/provider-keys", headers=headers).status_code == 403
+    assert accounts.get_account(email).trial_ends_at == 1

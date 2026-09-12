@@ -18,6 +18,9 @@ needs a higher role", which is not a leak because membership is already known
 to the caller. The site-wide ``admin`` account role deliberately grants nothing
 here: operating the gateway is not the same thing as being inside a customer's
 organization, and ``accounts.role`` is never consulted below.
+The operator-configured university team additionally requires active, verified
+institutional identity even for an org manager. Domain admission enrolls
+eligible accounts as ordinary members; it never changes account entitlements.
 
 Storage is PostgreSQL via ``db.tx()`` (schema in
 ``migrations/0015_organizations.sql``). Every mutation authorizes and acts in
@@ -29,6 +32,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import re
 import secrets
 import uuid
 from dataclasses import dataclass
@@ -255,6 +259,7 @@ def _team_payload(row: dict[str, Any], org_role: str) -> dict[str, Any]:
         "role": _effective_team_role(row.get("team_role"), org_role),
         "member_count": int(row.get("member_count") or 0),
         "bucket_url": team_bucket_url(team_id),
+        "storage_provider": "box" if team_id == settings.university_team_id else "local",
         "created_at": _epoch(row.get("created_at")),
     }
 
@@ -333,6 +338,71 @@ def _pending_invitations_for(cur, email: str) -> list[dict[str, Any]]:
 
 
 # ---------------------------------------------------------------------------
+
+def university_eligible(email: str) -> bool:
+    """Only active, server-verified ua.edu identities qualify; never claims."""
+    if not (settings.university_org_id and settings.university_team_id
+            and settings.university_workspace_root):
+        return False
+    email = (email or "").strip().lower()
+    if email.count("@") != 1:
+        return False
+    domain = email.split("@", 1)[1]
+    if domain != "ua.edu" and not (
+        domain.endswith(".ua.edu")
+        and all(re.fullmatch(r"[a-z0-9](?:[a-z0-9-]*[a-z0-9])?", p)
+                for p in domain.split("."))
+    ):
+        return False
+    with tx() as cur:
+        cur.execute(
+            """SELECT 1 FROM accounts a WHERE a.email = %s AND a.status = 'active'
+               AND (EXISTS (SELECT 1 FROM credentials c WHERE c.email = a.email
+                            AND c.email_verified = TRUE)
+                    OR EXISTS (SELECT 1 FROM oauth_identities i WHERE i.email = a.email))""",
+            (email,),
+        )
+        return cur.fetchone() is not None
+
+
+def university_team(email: str) -> str:
+    """Enroll a proven university identity as an ordinary member, idempotently."""
+    if not university_eligible(email):
+        return ""
+    org_id = canonical_uuid(settings.university_org_id)
+    team_id = canonical_uuid(settings.university_team_id)
+    with tx() as cur:
+        cur.execute("SELECT 1 FROM teams WHERE id = %s AND org_id = %s", (team_id, org_id))
+        if cur.fetchone() is None:
+            raise HTTPException(503, "university workspace is not provisioned")
+        cur.execute(
+            "INSERT INTO org_members (org_id,email,role) VALUES (%s,%s,'member') ON CONFLICT DO NOTHING",
+            (org_id, email),
+        )
+        cur.execute(
+            "INSERT INTO team_members (team_id,email,role) VALUES (%s,%s,'member') ON CONFLICT DO NOTHING",
+            (team_id, email),
+        )
+    return team_id
+
+
+def selected_workspace_team(request, email: str, scope: str = "", team: str = "") -> str:
+    """Explicit request selection, then browser selection, then university default."""
+    selection = scope or team or request.query_params.get("team", "") or request.cookies.get("chudware_workspace", "")
+    if selection in {"personal", "shared"}:
+        return ""
+    if selection:
+        return canonical_uuid(selection)
+    return university_team(email)
+
+
+def university_root() -> Path:
+    root = Path(settings.university_workspace_root).expanduser()
+    # Fail closed when FUSE disappears: never write a disconnected local shadow.
+    if not root.is_absolute() or not root.is_mount():
+        raise HTTPException(503, "university Box workspace mount is unavailable")
+    return root.resolve()
+
 # Shared bucket resolution (consumed by bucket.py)
 # ---------------------------------------------------------------------------
 
@@ -361,6 +431,7 @@ class TeamBucket:
             "role": _effective_team_role(self.team_role or None, self.org_role),
             "org_role": self.org_role,
             "bucket_url": team_bucket_url(self.team_id),
+            "storage_provider": "box" if self.team_id == settings.university_team_id else "local",
         }
 
 
@@ -376,6 +447,11 @@ def resolve_team_bucket(email: str, team_id: str, *, write: bool) -> TeamBucket:
     """
     email = (email or "").strip().lower()
     team_id = canonical_uuid(team_id)
+    university = team_id == settings.university_team_id
+    if university:
+        if not university_eligible(email):
+            raise HTTPException(404, "team not found")
+        university_team(email)
     with tx() as cur:
         cur.execute(
             """
@@ -423,7 +499,7 @@ def resolve_team_bucket(email: str, team_id: str, *, write: bool) -> TeamBucket:
         team_role=team_role or "",
         owner_email=owner_email,
         owner_plan=owner_plan,
-        root=settings.team_bucket_root(org_id, team_id),
+        root=university_root() if university else settings.team_bucket_root(org_id, team_id),
     )
 
 
@@ -472,6 +548,7 @@ def _caller(request: Request) -> User:
 @router.get("")
 async def list_organizations(request: Request) -> dict[str, Any]:
     """Every org the caller belongs to, its visible teams, and open invites."""
+    university_team(_caller(request).email)
     user = _caller(request)
     email = user.email.lower()
     with tx() as cur:

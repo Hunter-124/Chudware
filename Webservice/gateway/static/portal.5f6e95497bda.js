@@ -140,14 +140,16 @@
 
   function applyCloudGate() {
     var allowed = Boolean(state.account && state.account.cloud);
+    var workspace = state.account && state.account.workspace;
+    var appUrl = "/app/?team=" + encodeURIComponent(workspace ? workspace.id : "personal");
     var topbar = el("open-cloud");
-    topbar.href = allowed ? "/app/" : "#billing";
+    topbar.href = allowed ? appUrl : "#billing";
     arrowLink(topbar, allowed ? "Open Chudware" : "Get cloud access", "↗");
     var hero = el("hero-cloud");
-    hero.href = allowed ? "/app/" : "#billing";
-    hero.textContent = allowed ? "Open cloud workspace" : "Upgrade to Studio";
+    hero.href = allowed ? appUrl : "#billing";
+    hero.textContent = allowed ? (workspace ? "Open " + workspace.name : "Open cloud workspace") : "Upgrade to Studio";
     var dest = el("dest-cloud");
-    dest.href = allowed ? "/app/" : "#billing";
+    dest.href = allowed ? appUrl : "#billing";
     dest.classList.toggle("gated", !allowed);
     arrowLink(el("dest-cloud-cta"), allowed ? "Open workspace" : "Included with Studio — upgrade", "→");
   }
@@ -178,7 +180,9 @@
     el("renewal-label").textContent = account.paid_through ? "Renews " + date(account.paid_through) : "No paid renewal scheduled";
     var days = relativeDays(account.trial_ends_at);
     el("trial-countdown").textContent = days === null ? "Not on trial" : days > 0 ? days + " day" + (days === 1 ? "" : "s") + " remaining" : "Trial ended";
-    el("account-summary").textContent = account.plan === "trial"
+    el("account-summary").textContent = account.workspace
+      ? account.workspace.org_name + " / " + account.workspace.name + (account.workspace.storage_provider === "box" ? " is your selected live Box-backed workspace. " : " is your selected shared workspace. ") + "Account plan and AI credits are unchanged."
+      : account.plan === "trial"
       ? "Your trial includes the browser workspace and native desktop apps."
       : account.cloud
         ? "Your " + titleCase(account.plan) + " plan includes the browser workspace and native desktop apps."

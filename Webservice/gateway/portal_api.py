@@ -13,11 +13,12 @@ from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
 
 try:
-    from . import accounts, authn, billing, credits, entitlement, releases
+    from . import accounts, authn, billing, credits, entitlement, releases, orgs
     from .auth import get_current_user
     from .limits import api_writes
     from .plans import limits_for
 except ImportError:  # uvicorn app:app from package dir
+    import orgs
     import accounts  # type: ignore
     import authn  # type: ignore
     import billing  # type: ignore
@@ -47,6 +48,9 @@ async def portal_account(request: Request) -> dict[str, Any]:
     except ValueError:
         limits = limits_for("trial")
     credential = authn.get_credential(user.email)
+    team_id = orgs.selected_workspace_team(request, user.email)
+    workspace = orgs.resolve_team_bucket(user.email, team_id, write=False).context() if team_id else None
+    paid_cloud = bool(limits.cloud) and not (account.plan == "trial" and authn.trial_expired(user.email))
     return {
         "email": account.email,
         "display": account.display,
@@ -60,7 +64,8 @@ async def portal_account(request: Request) -> dict[str, Any]:
         "credit_balance": account.credit_balance,
         "credit_ceiling_monthly": account.credit_ceiling_monthly,
         "ai_grant": bool(account.ai_grant),
-        "cloud": bool(limits.cloud),
+        "cloud": paid_cloud or bool(workspace and orgs.university_eligible(user.email)),
+        "workspace": workspace,
         "desktop": bool(limits.desktop),
         "linked_identities": authn.oauth_providers_for(user.email),
         "has_password": credential is not None,

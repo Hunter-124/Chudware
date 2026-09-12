@@ -19,9 +19,11 @@ from pathlib import PurePosixPath
 from typing import Any
 from urllib.parse import urlsplit
 
-from fastapi import APIRouter, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, HTTPException, WebSocket, WebSocketDisconnect
 
 try:
+    from . import orgs
+    from . import authn
     from .accounts import get_account
     from .auth import AuthError, revalidate_websocket_user
     from .credits import actor_for, reconcile_reservation, reserve_turn, usage_cost
@@ -31,6 +33,8 @@ try:
     from .limits import user_slug
     from .plans import limits_for
 except ImportError:  # uvicorn app:app from package dir
+    import orgs
+    import authn
     from accounts import get_account
     from auth import AuthError, revalidate_websocket_user
     from credits import actor_for, reconcile_reservation, reserve_turn, usage_cost
@@ -120,7 +124,7 @@ def _inject_identity(line: str, email: str, display: str) -> str:
 _PATH_KEYS = frozenset({
     "path", "src", "dst", "dest", "file", "filename", "out", "out_path",
     "output", "output_path", "source", "target", "aicm_path", "export_path",
-    "doc_path", "save_path", "project_dir", "dir",
+    "doc_path", "save_path", "project_dir", "dir", "workspace_dir",
 })
 
 
@@ -516,7 +520,10 @@ def _owned_doc_entry(entry: Any, allowed_roots: list[PurePosixPath]) -> bool:
     if not isinstance(raw, str) or not raw or not os.path.isabs(raw):
         return False
     candidate = PurePosixPath(os.path.normpath(raw))
-    return any(candidate == root or candidate.is_relative_to(root) for root in allowed_roots[:2])
+    return any(
+        (candidate == root or candidate.is_relative_to(root))
+        for root in allowed_roots if str(root) not in {"/tmp", "/dev/shm"}
+    )
 
 
 def _authorize_daemon_response(
@@ -740,7 +747,17 @@ async def engine_ws(ws: WebSocket) -> None:
         cloud_allowed = bool(account and limits_for(account.plan).cloud)
     except ValueError:
         cloud_allowed = False
-    if not cloud_allowed:
+    try:
+        selected_team = orgs.selected_workspace_team(ws, user.email)
+        if selected_team:
+            orgs.resolve_team_bucket(user.email, selected_team, write=True)
+    except HTTPException:
+        await ws.close(code=4403, reason="workspace unavailable")
+        return
+    university_access = (orgs.university_eligible(user.email)
+                         and selected_team == settings.university_team_id)
+    expired_trial = bool(account and account.plan == "trial" and authn.trial_expired(user.email))
+    if (not cloud_allowed or expired_trial) and not university_access:
         log.info(
             "engine bridge refused for %s: plan %s has no cloud access",
             user.email,
@@ -781,19 +798,20 @@ async def engine_ws(ws: WebSocket) -> None:
         # workspace + bucket trees, plus the shared scratch dirs the client uses
         # for mesh/tess payloads (those carry no other account's data).
         slug = user_slug(user.email)
-        allowed_roots = [
+        personal_roots = [
             PurePosixPath(os.path.normpath(str(settings.user_workspace_root(slug)))),
             PurePosixPath(os.path.normpath(str(settings.user_bucket_root(slug)))),
             PurePosixPath("/dev/shm"),
             PurePosixPath("/tmp"),
         ]
+        allowed_roots = personal_roots
         active_actor: dict[str, Any] | None = None
         active_reservation: dict[str, Any] | None = None
         document_capabilities: set[str] = set()
         pending_requests: dict[Any, tuple[str, set[str]]] = {}
 
         async def ws_to_daemon() -> None:
-            nonlocal active_actor, active_reservation
+            nonlocal active_actor, active_reservation, allowed_roots
             max_frame = settings.ws_max_message_bytes
             while True:
                 line = await ws.receive_text()
@@ -801,6 +819,24 @@ async def engine_ws(ws: WebSocket) -> None:
                     current_user = revalidate_websocket_user(ws.scope, require_cloud=True)
                 except AuthError as exc:
                     await ws.close(code=4401 if exc.status == 401 else 4403)
+                    return
+                try:
+                    team_bucket = orgs.resolve_team_bucket(
+                        current_user.email, selected_team, write=True
+                    ) if selected_team else None
+                except HTTPException:
+                    await ws.close(code=4403, reason="workspace no longer available")
+                    return
+                workspace_root = (team_bucket.root if team_bucket else
+                                  settings.user_workspace_root(slug))
+                allowed_roots = personal_roots + (
+                    [PurePosixPath(str(workspace_root))] if team_bucket else []
+                )
+                current_account = get_account(current_user.email)
+                expired = bool(current_account and current_account.plan == "trial"
+                               and authn.trial_expired(current_user.email))
+                if expired and selected_team != settings.university_team_id:
+                    await ws.close(code=4403, reason="trial expired")
                     return
                 if len(line.encode("utf-8")) > max_frame:
                     log.warning(
@@ -823,7 +859,7 @@ async def engine_ws(ws: WebSocket) -> None:
                         line, -32004, "document not authorized for this connection"
                     ))
                     continue
-                if method == "agent_admin_turn":
+                if method in {"agent_admin_turn", "doc_file_operations"}:
                     await ws.send_text(_rpc_error(
                         line, -32601, "method unavailable on web bridge"
                     ))
@@ -849,6 +885,21 @@ async def engine_ws(ws: WebSocket) -> None:
                         line, -32003, "administrator authorization required"
                     ))
                     continue
+                if method in _AGENT_TURN_PROVIDER_METHODS:
+                    if expired:
+                        await ws.send_text(_rpc_error(line, -32003, "trial expired; university access covers workspace only"))
+                        continue
+                    message = json.loads(line)
+                    params = message.setdefault("params", {})
+                    if not isinstance(params, dict):
+                        await ws.send_text(_rpc_error(line, -32602, "params must be an object"))
+                        continue
+                    options = params.get("options")
+                    if not isinstance(options, dict):
+                        options = {}
+                        params["options"] = options
+                    options["workspace_dir"] = str(workspace_root)
+                    line = json.dumps(message, separators=(",", ":"))
                 offender = path_violation(line, allowed_roots)
                 if offender is not None:
                     log.warning(

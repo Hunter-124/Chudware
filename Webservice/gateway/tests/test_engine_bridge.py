@@ -508,13 +508,14 @@ class TestEngineBridge:
         doc_calls = [c for c in daemon.calls if c.get("method") == "doc_new"]
         assert all("name" in c["params"] for c in doc_calls) or not doc_calls
 
-    def test_browser_cannot_invoke_internal_admin_worker_directly(self, daemon, client):
+    @pytest.mark.parametrize("method", ["agent_admin_turn", "doc_file_operations"])
+    def test_browser_cannot_invoke_internal_rpc_directly(self, daemon, client, method):
         with client.websocket_connect("/engine", headers=DEV_HEADERS) as ws:
-            response = _rpc(ws, 76, "agent_admin_turn", {
+            response = _rpc(ws, 76, method, {
                 "request": "bypass metering", "provider": "mock",
             })
         assert response["error"]["code"] == -32601
-        assert not any(call["method"] == "agent_admin_turn" for call in daemon.calls)
+        assert not any(call["method"] == method for call in daemon.calls)
 
 
     def test_studio_pool_reserves_reconciles_and_stops_at_zero(

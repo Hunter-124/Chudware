@@ -759,3 +759,77 @@ def test_team_bucket_quota_comes_from_the_org_owner_plan(client, monkeypatch):
     assert r.status_code == 507
     # The same account's personal tree is unaffected: that one is Bob's plan.
     assert _upload_bucket(client, B, name="big.bin", data=b"y" * 50).status_code == 200
+
+
+@pytest.mark.parametrize("surface", ["workspace", "bucket"])
+def test_slow_storage_does_not_block_gateway_health(client, monkeypatch, surface):
+    """A network-backed quota scan must not monopolize the ASGI event loop."""
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Event
+    import gateway.bucket as bucket_mod
+
+    entered = Event()
+    release = Event()
+
+    def slow_quota(*args, **kwargs):
+        entered.set()
+        assert release.wait(10), "storage operation was never released"
+
+    module = workspace_mod if surface == "workspace" else bucket_mod
+    upload = _upload_ws if surface == "workspace" else _upload_bucket
+    monkeypatch.setattr(module, "enforce_disk_quota", slow_quota)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        writing = pool.submit(upload, client, A, name="slow-storage.txt")
+        try:
+            assert entered.wait(5), "upload did not enter storage operation"
+            health = pool.submit(client.get, "/healthz")
+            assert health.result(timeout=2).status_code == 200
+        finally:
+            release.set()
+        assert writing.result(timeout=5).status_code == 200
+
+
+def test_workspace_and_bucket_serialize_team_quota_mutations(client, monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
+    from threading import Event
+    import gateway.bucket as bucket_mod
+
+    _, team_id = _org_with_bob(client)
+    original_limits = plans.limits_for
+    import gateway.limits as limits_mod
+    monkeypatch.setattr(limits_mod, "limits_for",
+                        lambda plan: replace(original_limits(plan), storage_quota_bytes=20_000))
+    entered = Event()
+    release = Event()
+    second_admitted = Event()
+    original_quota = workspace_mod.enforce_disk_quota
+    original_scope = bucket_mod._caller_scope
+
+    def held_quota(*args, **kwargs):
+        entered.set()
+        assert release.wait(10)
+        return original_quota(*args, **kwargs)
+
+    def admitted_scope(*args, **kwargs):
+        result = original_scope(*args, **kwargs)
+        second_admitted.set()
+        return result
+
+    monkeypatch.setattr(workspace_mod, "enforce_disk_quota", held_quota)
+    monkeypatch.setattr(bucket_mod, "_caller_scope", admitted_scope)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first = pool.submit(client.post, "/workspace/upload?team=" + team_id,
+                            headers=A, files={"file": ("first.bin", b"a" * 12_000)})
+        try:
+            assert entered.wait(5)
+            second = pool.submit(client.post, "/api/bucket/upload?team=" + team_id,
+                                 headers=B, files={"files": ("second.bin", b"b" * 12_000)})
+            assert second_admitted.wait(5)
+            # B has authorized the same root, but cannot mutate it halfway
+            # through A's quota admission. This is only a gateway-process lock.
+            with pytest.raises(FutureTimeout):
+                second.result(timeout=0.5)
+        finally:
+            release.set()
+        assert first.result(timeout=5).status_code == 200
+        assert second.result(timeout=5).status_code == 507

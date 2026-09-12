@@ -20,11 +20,15 @@ from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse, Response
 
 try:
+    from . import orgs
+    from . import authn
     from .accounts import get_account
     from .auth import get_current_user
     from .config import settings
     from .plans import limits_for
 except ImportError:  # uvicorn app:app from package dir
+    import orgs
+    import authn
     from accounts import get_account
     from auth import get_current_user
     from config import settings
@@ -223,8 +227,12 @@ def _upgrade_response(request: Request) -> HTMLResponse | None:
     """Return the cloud-plan upgrade page, or None when /app is entitled."""
     user = get_current_user(request)
     account = get_account(user.email)
+    if (orgs.university_eligible(user.email)
+            and orgs.selected_workspace_team(request, user.email) == settings.university_team_id):
+        return None
     try:
-        if account is not None and limits_for(account.plan).cloud:
+        if (account is not None and limits_for(account.plan).cloud
+                and not (account.plan == "trial" and authn.trial_expired(user.email))):
             return None
     except ValueError:
         pass
@@ -250,7 +258,7 @@ async def app_redirect(request: Request) -> Response:
         return upgrade
     index = _resolve_under_app("")
     return RedirectResponse(
-        url="/app/",
+        url="/app/" + ("?" + request.url.query if request.url.query else ""),
         status_code=307,
         headers=_coop_headers(index),
     )
@@ -262,7 +270,15 @@ async def app_index(request: Request) -> Response:
     upgrade = _upgrade_response(request)
     if upgrade is not None:
         return upgrade
-    return _file_response(_resolve_under_app(""), request)
+    response = _file_response(_resolve_under_app(""), request)
+    selection = request.query_params.get("team")
+    if selection is not None:
+        user = get_current_user(request)
+        if selection != "personal":
+            orgs.resolve_team_bucket(user.email, selection, write=False)
+        response.set_cookie("chudware_workspace", selection, httponly=True,
+                            secure=request.url.scheme == "https", samesite="lax", path="/")
+    return response
 
 
 @router.get("/app/{asset_path:path}", response_model=None)

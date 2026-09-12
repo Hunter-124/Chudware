@@ -326,7 +326,14 @@ class AuthMiddleware:
 
         set_dev_cookie: str | None = None
         try:
-            user, set_dev_cookie = self._authenticate(headers, cookies, query)
+            workspace_surface = (
+                path in {"/", "/api/me", "/api/portal/account", "/bucket", "/app", "/engine"}
+                or path.startswith(("/workspace/", "/api/bucket/", "/api/orgs",
+                                    "/app/", "/portal-assets/", "/files/aicm"))
+            )
+            user, set_dev_cookie = self._authenticate(
+                headers, cookies, query, allow_university=workspace_surface
+            )
         except AuthError as exc:
             if scope["type"] == "websocket":
                 await send(
@@ -404,7 +411,15 @@ class AuthMiddleware:
             except Exception:
                 scope["state"] = {"user": user, "user_email": user.email}
 
-    def _resolve_user(self, email: str) -> User:
+    @staticmethod
+    def _university_access(email: str) -> bool:
+        try:
+            from .orgs import university_eligible
+        except ImportError:
+            from orgs import university_eligible
+        return university_eligible(email)
+
+    def _resolve_user(self, email: str, *, allow_university: bool = False) -> User:
         """Map a verified email to an authorized User, or raise 403.
 
         Authorization lives in the account store (``accounts.py``): an identity
@@ -425,7 +440,7 @@ class AuthMiddleware:
             )
         # The trial is the one entitlement whose expiry the status column does
         # not encode. Checked here so every entry path enforces it identically.
-        if account.plan == "trial" and authn.trial_expired(email):
+        if account.plan == "trial" and authn.trial_expired(email) and not (allow_university and self._university_access(email)):
             raise AuthError(
                 "trial expired",
                 status=403,
@@ -447,6 +462,7 @@ class AuthMiddleware:
         headers: dict[str, str],
         cookies: dict[str, str],
         query: dict[str, str] | None = None,
+        *, allow_university: bool = False,
     ) -> tuple[User | None, str | None]:
         """Return (user, set_dev_cookie_email).
 
@@ -470,7 +486,7 @@ class AuthMiddleware:
                     email=None,
                 )
             email = email.strip().lower()
-            user = self._resolve_user(email)
+            user = self._resolve_user(email, allow_university=allow_university)
             return user, (email if from_query else None)
 
         # The account store is the authority on identity and role, so the
@@ -487,7 +503,7 @@ class AuthMiddleware:
             session_email = authn.lookup_session(sid)
             if session_email:
                 try:
-                    return self._resolve_user(session_email), None
+                    return self._resolve_user(session_email, allow_university=allow_university), None
                 except AuthError as exc:
                     # This is the whole reason sessions are rows rather than
                     # signed cookies: a denied or suspended decision has to END
@@ -545,7 +561,7 @@ class AuthMiddleware:
         if not email or "@" not in email:
             raise AuthError("token missing email claim", status=401)
 
-        user = self._resolve_user(email)
+        user = self._resolve_user(email, allow_university=allow_university)
         return user, None
 
     def _deny_http(
@@ -619,14 +635,16 @@ def revalidate_websocket_user(
         else:
             # Access JWTs are authoritative credentials too; re-run signature,
             # expiry, and principal checks rather than trusting handshake state.
-            principal_user, _ = AuthMiddleware(lambda *_: None)._authenticate(headers, cookies)
+            principal_user, _ = AuthMiddleware(lambda *_: None)._authenticate(
+                headers, cookies, allow_university=require_cloud
+            )
             if principal_user is None or principal_user.email != user.email:
                 raise AuthError("invalid session", status=401)
 
     account = accounts.get_account(user.email)
     if not accounts.is_authorized(account):
         raise AuthError("account not approved", status=403, email=user.email)
-    if account.plan == "trial" and authn.trial_expired(user.email):
+    if account.plan == "trial" and authn.trial_expired(user.email) and not (require_cloud and AuthMiddleware._university_access(user.email)):
         raise AuthError("trial expired", status=403, email=user.email)
     current = User(
         email=account.email,
@@ -645,7 +663,7 @@ def revalidate_websocket_user(
             cloud = bool(limits_for(account.plan).cloud)
         except ValueError:
             cloud = False
-        if not cloud:
+        if not cloud and not AuthMiddleware._university_access(current.email):
             raise AuthError("plan no longer authorized", status=403, email=current.email)
     return current
 

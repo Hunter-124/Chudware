@@ -203,6 +203,10 @@ class Settings:
     # team scopes live under organizations/<org UUID>/teams/<team UUID> and are
     # authorized from PostgreSQL memberships on every request.
     bucket_root: Path = field(default_factory=Path)
+    # Operator-provisioned institutional collaboration, never a paid/AI grant.
+    university_org_id: str = field(default_factory=lambda: _env("CHUDWARE_WEB_UNIVERSITY_ORG_ID", "") or "")
+    university_team_id: str = field(default_factory=lambda: _env("CHUDWARE_WEB_UNIVERSITY_TEAM_ID", "") or "")
+    university_workspace_root: str = field(default_factory=lambda: _env("CHUDWARE_WEB_UNIVERSITY_WORKSPACE_ROOT", "") or "")
     # WASM web client static root (served at /app) + client perf traces.
     app_dir: Path = field(default_factory=Path)
     perf_traces_dir: Path = field(default_factory=Path)

@@ -805,3 +805,98 @@ Provider credentials are only attached server-side to a canonical,
 provider-matching endpoint. Client-supplied `api_key`, `base_url`, and
 `auth_mode` fields are stripped. `agent_provider_*` remains admin-only. Do not
 set `CHUDWARE_WEB_SHARE_PROVIDER_KEYS=1` in a public environment.
+
+## University of Alabama Box workspace
+
+Production remains `livingroom-pc`, user `liveuser`, gateway port 8300; do not
+start the inactive development gateway or restart unrelated services.
+`provision_university_workspace.py` uses the existing production database and
+environment to create the University of Alabama organization and ME-490 team.
+The existing paid operator is the org owner/funder; the already verified
+`haedmonds@crimson.ua.edu` identity is a team manager, not a platform admin.
+No credential, account plan, credit balance, AI grant or provider setting changes.
+
+The three `CHUDWARE_WEB_UNIVERSITY_{ORG_ID,TEAM_ID,WORKSPACE_ROOT}` settings
+enable the institution policy. Active accounts must have a verified password
+credential or a linked identity produced by the existing verified OAuth flow.
+Eligibility matches exactly `ua.edu` or valid dot-subdomains, including
+`crimson.ua.edu`; self-declared addresses, lookalikes and suspended users fail.
+Eligible users enroll as ordinary org/team members. This is a domain admission
+policy: deleting a membership alone does not revoke domain eligibility; suspend
+the account to revoke its access. Team writes retain the live organization
+owner's active Studio/Enterprise funding check.
+
+Default `/workspace/*`, bucket files, portal workspace metadata and `/engine`
+resolve the same team root. Explicit `team=<uuid>` or `scope=personal` wins;
+`POST /workspace/selection` stores the browser's authenticated selection.
+`/app/?team=<uuid|personal>` selects it when launching the browser app.
+Chat history stays private in the account's personal tree. Expired-trial UA
+access is limited to the portal/workspace surfaces; it does not renew the
+trial, grant desktop licenses, enable other services, or authorize AI turns.
+
+Install `chudware-university-box.service` as a `liveuser` user unit with rclone
+at `~/chudware-web-data/university/bin/rclone` and an independently authorized,
+mode-0600 Box config at `~/chudware-web-data/university/secrets/rclone.conf`.
+The private remote pins `root_folder_id = 417549774517`, the dedicated
+`Team 5 Human-Powered Rover Program Development and Sustainability/Chudware Workspace`
+child; the unit therefore mounts `box:` at
+`~/chudware-web-data/university/ME-490`. Existing teammate folders are untouched.
+The mount uses persistent VFS full caching, 5-second deferred upload,
+5-second Box change-notification polling and a one-hour directory-cache ceiling,
+with recursive metadata refresh on startup. The earlier 15-second ceiling
+expired while a large quota scan was still traversing the tree; a post-upload
+scan alone took about54 seconds. Change notifications provide live invalidation
+without repeatedly re-fetching every unchanged remote directory.
+Polling is required: without it a cached direct read remained stale until a
+directory listing; with polling, a remote overwrite reached direct cached reads
+in 6–13 seconds across the deployment smokes. Writes are asynchronous, not a promise of
+instant remote durability; wait for the rclone upload queue to drain and verify
+Box bytes before declaring a delivery. Concurrent external edits use Box
+versions/last-write behavior, not CAD merge or distributed locking.
+Mounted filesystem handlers run in FastAPI's threadpool, not the ASGI event
+loop: quota scans and a slow remote file must not freeze other tenants or
+`/healthz`. Upload caps and full owner-plan quota checks remain enforced.
+The limiter is thread-safe. Bounded, root-keyed process locks serialize gateway
+uploads/copies and tree mutations across both file APIs, including preflight
+and final quota accounting; they are not distributed locks and cannot make
+quota admission atomic against direct Box or native-daemon writers.
+The corrected production smoke returned HTTP 200 for a public authenticated
+upload in 67.316s while 268 concurrent loopback health probes had zero errors
+and a maximum latency of 2.19ms. This proves gateway responsiveness, not fast
+per-upload accounting: full remote quota scans can still be slow. The upload's
+Box bytes and bucket download matched, the smoke file was deleted remotely,
+and the VFS queue/error counters finished at zero.
+
+The rclone control socket is **Unix-only**, inside the mode-0700 secrets
+directory, with mode0700 itself: `secrets/rc.sock`. It is not a TCP listener,
+public route or anonymous Box share. `--rc-no-auth` here relies on that
+same-user filesystem boundary; rclone RC is shell-equivalent authority and
+must never be moved to a network listener without proper authentication.
+Check pending uploads without reading credentials:
+
+```sh
+~/chudware-web-data/university/bin/rclone rc \
+  --unix-socket ~/chudware-web-data/university/secrets/rc.sock vfs/stats
+```
+
+Require `diskCache.uploadsQueued = 0`, `uploadsInProgress = 0`,
+`erroredFiles = 0` and `outOfSpace = false` before stopping a delivery mount.
+The original workstation's Box credentials remain untouched; its independent
+OAuth grant is separate from the production mount's grant.
+
+**Never copy an in-use Box refresh token to a second host.** Box refresh tokens
+are one-use; see <https://rclone.org/box/#invalid-refresh-token>. Authorize a
+separate OAuth grant, or explicitly transfer sole credential authority after
+stopping all old consumers. Never make an anonymous share. Gateway resolution
+requires a real mount (`Path.is_mount()`), so an absent mount returns 503
+instead of silently writing an unsynchronized local directory. An offline
+remote can still leave pending writes in the persistent VFS cache: preserve
+that cache and inspect the service journal before stopping/replacing it.
+
+After the curated project upload, start/enable only the university mount,
+exercise a round-trip through the mount and Box, deploy the gateway at the
+normal clean boundary, and sign in with the actual university OAuth account.
+Check portal name/backing, Files and CAD browser roots, explicit Personal,
+save/reopen in the Box-backed project, unverified/outside isolation, and account
+plan/AI/admin invariants. Independent Box OAuth and actual project upload are
+runtime prerequisites; source configuration alone is not a live deployment.

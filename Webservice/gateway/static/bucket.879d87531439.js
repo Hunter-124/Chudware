@@ -324,6 +324,7 @@
       var q = new URLSearchParams(params || {});
       var id = teamId !== undefined ? teamId : (state.team ? state.team.id : null);
       if (id) q.set("team", id);
+      else q.set("scope", "personal");
       return q.toString();
     }
 
@@ -344,6 +345,7 @@
               id: team.id,
               name: team.name,
               role: team.role || "",
+              storageProvider: team.storage_provider,
               memberCount: team.member_count,
               orgName: org.name,
               orgRole: org.role || "",
@@ -379,7 +381,7 @@
         var t = state.team;
         scopeGlyphEl.className = "dest-glyph is-team";
         scopeKindEl.className = "dest-kind is-team";
-        scopeKindEl.textContent = "Shared team space";
+        scopeKindEl.textContent = t.storageProvider === "box" ? "Live Box-backed team space" : "Shared team space";
         scopeTitleEl.textContent = t.name;
         var role = t.role ? titleCase(t.role) : titleCase(t.orgRole) + " (organization)";
         scopeContextEl.textContent =
@@ -404,7 +406,17 @@
       history.replaceState(null, "", "/bucket?" + q.toString());
     }
 
-    function selectDestination(team) {
+    async function selectDestination(team) {
+      try {
+        await request("/workspace/selection", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ team: team ? team.id : "personal" }),
+        });
+      } catch (e) {
+        setStatus(errText(e), "error");
+        return;
+      }
       state.team = team;
       state.dir = "";
       syncUrl();
@@ -823,16 +835,26 @@
       var requested = standalone
         ? new URLSearchParams(window.location.search).get("team")
         : null;
+      var explicitSelection = Boolean(requested);
       await loadDestinations();
+      if (!requested) {
+        var account = await request("/api/portal/account", null, READ_TIMEOUT_MS);
+        requested = account.workspace ? account.workspace.id : "personal";
+      }
       var chosen = null;
       if (requested && requested !== "personal") {
         chosen = state.teams.find(function (t) { return t.id === requested; }) || null;
         if (!chosen) {
-          setNotice("That team isn't available from this account. Showing " +
-                    (state.teams.length ? "your first team" : "your personal files") + " instead.");
+          throw new Error("That selected team is no longer available. Choose Personal explicitly in the URL (?team=personal) or return to your account.");
         }
       }
-      if (!chosen && requested !== "personal") chosen = state.teams[0] || null;
+      if (explicitSelection) {
+        await request("/workspace/selection", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ team: chosen ? chosen.id : "personal" }),
+        });
+      }
       state.team = chosen;
       syncUrl();
       renderDestinations();

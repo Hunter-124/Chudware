@@ -410,26 +410,23 @@ static ChipResult drawChipAt(const char* btnId,
 }
 
 // ---- Active-project status control (title bar) --------------------------
-// Distinct from the workspace-tab chips on purpose: this is a persistent piece of
-// app state (which project folder is active), not a page switch. It reads as a
-// compact recessed "field" — tight corners, a leading status dot, an elided label
+// Distinct from the modeling-tab chips on purpose: this selects a personal/team
+// workspace on web or a project folder on desktop, rather than a modeling page.
+// It reads as a compact recessed "field" — tight corners, a leading status dot, an elided label
 // and a trailing chevron that signals "click opens a switcher" — where the tabs
 // are borderless pills that only wash on hover/active.
 //
-// COMPACTNESS IS A CONSTRAINT HERE, NOT A STYLE PREFERENCE. The label can be a
-// tenant string derived from an email address ("someone@example.com"), roughly 3x
-// the width of a folder name, and the centered workspace-tab strip pays for every
-// pixel this control takes: once the strip no longer fits it collapses to
-// icon-only. So the text is capped and elided, the full name lives in the tooltip,
-// and the chrome is one glass slab instead of the old always-on triple bloom.
+// COMPACTNESS IS A CONSTRAINT HERE, NOT A STYLE PREFERENCE. The centered tab strip
+// pays for every pixel this control takes: once the strip no longer fits it
+// collapses to icon-only. Web uses a simple "Workspace" label; native folder names
+// are capped and elided, with the full name in the tooltip.
 //
 // "Project Folder" affordance (File > Open Project Folder..., and the title-bar
 // active-project chip below) — same trigger, platform-appropriate target:
 //   - Native: an OS folder picker choosing the CAD workspace dir (unchanged).
-//   - Web: the native-dialog stand-in (openFolderDialog()'s Emscripten branch)
-//     browses /workspace/* — the engine's live doc tree, not a place a team
-//     drops arbitrary files. The Team Bucket (/bucket) is that place, so on
-//     web this opens a centered overlay with the bucket UI mounted as content.
+//   - Web: a centered overlay mounts the portable bucket UI for choosing a
+//     personal or team workspace and browsing its files. Opening a workspace
+//     reloads CAD through /app/ after the surface confirms with the user.
 //     NOT an <iframe src="/bucket">: Cloudflare Access refuses to let its own
 //     protected app be framed at all — even same-origin — which is the
 //     "chudware.com refused to connect" error an iframe here produces.
@@ -455,9 +452,9 @@ static ChipResult drawChipAt(const char* btnId,
 //     window.ChudwareBucket.mount(root) for later clones, and it installs its
 //     document-level drag/drop listeners internally exactly once. Assets are
 //     memoized by absolute URL so reopening never re-adds a <link>/<script>.
-//     Fire-and-forget (no path is picked/returned), so no Asyncify and no
-//     setActiveProjectDir() call — the bucket is independent of the CAD
-//     workspace.
+//     No path is picked/returned, so no Asyncify or setActiveProjectDir() call:
+//     the portable surface owns workspace navigation; browsing files alone
+//     does not switch the active CAD workspace.
 static void openProjectFolderAction(AppState& st) {
 #ifdef __EMSCRIPTEN__
     (void)st;
@@ -481,7 +478,7 @@ static void openProjectFolderAction(AppState& st) {
             overlay.id = 'chudware-bucket-modal';
             overlay.setAttribute('role', 'dialog');
             overlay.setAttribute('aria-modal', 'true');
-            overlay.setAttribute('aria-label', 'Project Folder \u2014 Team Bucket');
+            overlay.setAttribute('aria-label', 'Workspaces and files');
             overlay.style.cssText =
                 'position:fixed;inset:0;z-index:999999;background:rgba(4,7,11,0.62);' +
                 'display:flex;align-items:center;justify-content:center;font-family:' +
@@ -505,7 +502,7 @@ static void openProjectFolderAction(AppState& st) {
                 'border-bottom:1px solid #1b2630;flex:0 0 auto;' +
                 'display:flex;align-items:center;';
             var titleLbl = document.createElement('span');
-            titleLbl.textContent = 'Project Folder \u2014 Team Bucket';
+            titleLbl.textContent = 'Workspaces and files';
             var spacer = document.createElement('span');
             spacer.style.cssText = 'flex:1 1 auto;';
             var closeBtn = document.createElement('button');
@@ -562,7 +559,7 @@ static void openProjectFolderAction(AppState& st) {
         function fail(err) {
             st.loading = false;
             var msg = (err && err.message) ? err.message : String(err);
-            var note = status('Team Bucket did not load: ' + msg, 'error');
+            var note = status('Workspaces and files did not load: ' + msg, 'error');
             var retry = document.createElement('button');
             retry.type = 'button';
             retry.textContent = 'Try again';
@@ -641,7 +638,7 @@ static void openProjectFolderAction(AppState& st) {
         function load() {
             if (st.loading) return;
             st.loading = true;
-            status('Loading Team Bucket\u2026', 'info');
+            status('Loading workspaces and files\u2026', 'info');
             if (st.template) { activate(); return; }
             fetch('/bucket', { credentials: 'same-origin' }).then(function (r) {
                 if (!r.ok) throw new Error('HTTP ' + r.status);
@@ -673,7 +670,11 @@ static ChipResult drawActiveProjectControl(AppState& st, ImVec2 p0, float h, ImF
     const float S = ui::uiScale;
     const std::string project = ui::plmProjectName(st);
     const bool hasProject = !project.empty();
+#ifdef __EMSCRIPTEN__
+    const char* label = "Workspace";
+#else
     const char* label = hasProject ? project.c_str() : "Open project\xe2\x80\xa6";
+#endif
 
     ImFont* font = boldFont ? boldFont : ImGui::GetFont();
     const float padX    = 8.0f * S;
@@ -768,10 +769,14 @@ static ChipResult drawActiveProjectControl(AppState& st, ImVec2 p0, float h, ImF
     // Discoverability: a compact slab with no visible verb, and the label may be elided —
     // so the tooltip always names the destination in full plus the action.
     if (hovered) {
+#ifdef __EMSCRIPTEN__
+        ImGui::SetTooltip("Choose a personal or team workspace and browse files");
+#else
         if (hasProject)
             ImGui::SetTooltip("Active project folder\n%s\n\nClick to change it", project.c_str());
         else
             ImGui::SetTooltip("No project folder is open\n\nClick to choose one");
+#endif
     }
     return {clicked, hovered};
 }

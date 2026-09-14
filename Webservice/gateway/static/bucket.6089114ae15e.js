@@ -3,7 +3,7 @@
  * Two hosts, one implementation:
  *   1. the standalone /bucket page, where this script is deferred and mounts
  *      the .bucket-surface node it finds in the document;
- *   2. the desktop app's "Project Folder — Team Bucket" modal, which imports
+ *   2. the cloud app's "Workspaces and files" modal, which imports
  *      that same .bucket-surface node from fetched /bucket HTML, links this
  *      file's stylesheet, and loads this script ONCE. Every later open calls
  *      window.ChudwareBucket.mount(freshRoot).
@@ -27,6 +27,8 @@
   var UPLOAD_HARD_CAP_BYTES = 95 * 1024 * 1024;      // safety margin under Cloudflare's 100MB/request cap
   var UPLOAD_BATCH_MAX_FILES = 100;
   var UPLOAD_CONCURRENCY = 3;
+  // Shared across mounts so reopening the modal cannot hide an active transfer.
+  var activeUploads = 0;
 
   // A hung GET must never leave the surface sitting on a spinner: every read
   // is bounded and surfaces a retryable error instead.
@@ -253,7 +255,7 @@
         scopeContextEl, scopeGlyphEl, destSelect, dropZone, fileInput, folderInput,
         progressEl, inputDialog, confirmDialog, newFolderBtn, uploadBtn,
         uploadFolderBtn, promptTitle, promptLabel, promptConfirm, promptField,
-        confirmTitle, confirmBody, confirmAccept;
+        confirmTitle, confirmBody, confirmAccept, openWorkspaceBtn;
     try {
       listEl = need("list");
       crumbsEl = need("crumbs");
@@ -265,6 +267,7 @@
       scopeContextEl = need("scope-context");
       scopeGlyphEl = need("scope-glyph");
       destSelect = need("dest-select");
+      openWorkspaceBtn = need("open-workspace-btn");
       dropZone = need("drop-zone");
       fileInput = need("file-input");
       folderInput = need("folder-input");
@@ -298,6 +301,9 @@
       dir: "",
       team: null,   // null => personal; else an entry of state.teams
       teams: [],    // flattened accessible teams from /api/orgs
+      ready: false,
+      destinationsLoaded: false,
+      opening: false,
     };
     var listSeq = 0;
     var dragTimer = null;
@@ -318,8 +324,15 @@
       noticeEl.hidden = !msg;
     }
 
-    // Every bucket call carries the selected destination. Personal scope sends
-    // no team parameter at all, so the API's existing personal behavior applies.
+    function updateControls() {
+      destSelect.disabled = !state.destinationsLoaded || state.opening;
+      openWorkspaceBtn.disabled = !state.ready || state.opening;
+      newFolderBtn.disabled = uploadBtn.disabled = uploadFolderBtn.disabled =
+        !state.ready || state.opening;
+    }
+
+    // Every bucket call carries the selected destination, including explicit
+    // personal scope, independent of the CAD workspace selection cookie.
     function bucketQuery(params, teamId) {
       var q = new URLSearchParams(params || {});
       var id = teamId !== undefined ? teamId : (state.team ? state.team.id : null);
@@ -337,43 +350,48 @@
 
     async function loadDestinations() {
       var teams = [];
-      try {
-        var payload = await request("/api/orgs", null, READ_TIMEOUT_MS);
-        (payload.organizations || []).forEach(function (org) {
-          (org.teams || []).forEach(function (team) {
-            teams.push({
-              id: team.id,
-              name: team.name,
-              role: team.role || "",
-              storageProvider: team.storage_provider,
-              memberCount: team.member_count,
-              orgName: org.name,
-              orgRole: org.role || "",
-            });
+      var payload = await request("/api/orgs", null, READ_TIMEOUT_MS);
+      if (!Array.isArray(payload.organizations)) {
+        throw new Error("The workspace list response was invalid.");
+      }
+      payload.organizations.forEach(function (org) {
+        (org.teams || []).forEach(function (team) {
+          teams.push({
+            id: String(team.id),
+            name: team.name,
+            role: team.role || "",
+            storageProvider: team.storage_provider,
+            memberCount: team.member_count,
+            orgName: org.name,
+            orgRole: org.role || "",
           });
         });
-      } catch (e) {
-        setNotice("Could not load your teams (" + errText(e) +
-                  "). Personal files still work — use Retry below to look again.");
-      }
+      });
       state.teams = teams;
+      state.destinationsLoaded = true;
     }
 
     function renderDestinations() {
       destSelect.textContent = "";
+      if (!state.ready) {
+        var placeholder = new Option("Choose a workspace", "");
+        placeholder.disabled = true;
+        destSelect.appendChild(placeholder);
+      }
       destSelect.appendChild(new Option("Personal — only you", "personal"));
       state.teams.forEach(function (t) {
         destSelect.appendChild(new Option(t.orgName + " / " + t.name, t.id));
       });
-      destSelect.value = state.team ? state.team.id : "personal";
+      destSelect.value = state.ready ? (state.team ? state.team.id : "personal") : "";
     }
 
     function renderPending() {
       scopeGlyphEl.className = "dest-glyph";
       scopeKindEl.className = "dest-kind is-pending";
-      scopeKindEl.textContent = "Destination";
-      scopeTitleEl.textContent = "Files";
-      scopeContextEl.textContent = "Checking which destinations you can use…";
+      scopeKindEl.textContent = "Workspace";
+      scopeTitleEl.textContent = "Workspaces and files";
+      scopeContextEl.textContent = "Loading your workspaces…";
+      openWorkspaceBtn.textContent = "Open workspace";
     }
 
     function renderScope() {
@@ -391,9 +409,11 @@
         scopeGlyphEl.className = "dest-glyph is-personal";
         scopeKindEl.className = "dest-kind is-personal";
         scopeKindEl.textContent = "Personal space";
-        scopeTitleEl.textContent = "Personal files";
+        scopeTitleEl.textContent = "Personal workspace";
         scopeContextEl.textContent = "Private to your account — no one else can see these files.";
       }
+      openWorkspaceBtn.textContent = "Open workspace — " +
+        (state.team ? state.team.name : "Personal");
       if (standalone) {
         document.title = (state.team ? state.team.name : "Personal files") + " — Chudware";
       }
@@ -406,30 +426,58 @@
       history.replaceState(null, "", "/bucket?" + q.toString());
     }
 
-    async function selectDestination(team) {
-      try {
-        await request("/workspace/selection", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ team: team ? team.id : "personal" }),
-        });
-      } catch (e) {
-        setStatus(errText(e), "error");
-        return;
-      }
+    function selectDestination(team) {
       state.team = team;
+      state.ready = true;
       state.dir = "";
+      setNotice("");
       syncUrl();
+      renderDestinations();
       renderScope();
-      destSelect.value = team ? team.id : "personal";
+      updateControls();
       setStatus("");
       refresh();
     }
 
     destSelect.addEventListener("change", function () {
+      if (!state.destinationsLoaded || state.opening) return;
       var value = destSelect.value;
-      selectDestination(value === "personal" ? null :
-        state.teams.find(function (t) { return t.id === value; }) || null);
+      var team = state.teams.find(function (t) { return t.id === value; });
+      if (value !== "personal" && !team) {
+        setNotice("That workspace is unavailable. Choose another workspace or retry.");
+        return;
+      }
+      selectDestination(team || null);
+    });
+
+    openWorkspaceBtn.addEventListener("click", async function () {
+      if (!state.ready || state.opening) return;
+      if (activeUploads) {
+        setStatus("Wait for uploads to finish before opening a workspace.", "err");
+        return;
+      }
+      var teamId = state.team ? state.team.id : "personal";
+      var name = state.team ? state.team.name : "Personal";
+      state.opening = true;
+      updateControls();
+      try {
+        if (!standalone && !await askConfirm({
+          title: "Open " + name + " workspace?",
+          body: "Save your work before continuing. Opening this workspace reloads CAD in this tab. Unsaved changes will be lost.",
+          confirmLabel: "Open workspace",
+          primary: true,
+        })) return;
+        if (activeUploads) {
+          setStatus("Wait for uploads to finish before opening a workspace.", "err");
+          return;
+        }
+        window.location.assign("/app/?team=" + encodeURIComponent(teamId));
+      } catch (e) {
+        setStatus("Could not open the workspace: " + errText(e), "err");
+      } finally {
+        state.opening = false;
+        updateControls();
+      }
     });
 
     // ----------------------------------------------------------------- crumbs
@@ -557,6 +605,7 @@
     }
 
     async function refresh() {
+      if (!state.ready) return;
       var seq = ++listSeq;
       renderCrumbs();
       listEl.setAttribute("aria-busy", "true");
@@ -643,6 +692,8 @@
         confirmTitle.textContent = opts.title;
         confirmBody.textContent = opts.body;
         confirmAccept.textContent = opts.confirmLabel || "Delete";
+        confirmAccept.className = opts.primary ? "btn primary" : "btn danger";
+        confirmDialog.returnValue = "";
         function onClose() {
           confirmDialog.removeEventListener("close", onClose);
           resolve(confirmDialog.returnValue === "confirm");
@@ -694,6 +745,7 @@
     }
 
     newFolderBtn.addEventListener("click", async function () {
+      if (!state.ready || state.opening) return;
       var name = await promptDialog({
         title: "New folder",
         label: "Folder name (created in " + scopeLabel() + ")",
@@ -725,6 +777,10 @@
 
     async function uploadEntries(entries) {
       if (!entries || !entries.length) return;
+      if (!state.ready || state.opening) {
+        setStatus("Choose a loaded workspace before uploading files.", "err");
+        return;
+      }
       // Freeze the destination at drop time: switching scope or folder while an
       // upload runs must not redirect the remaining batches.
       var dir = state.dir;
@@ -763,9 +819,14 @@
 
       setStatus("Uploading " + plural(entries.length, "file") + " to " + destination +
                 (totalBatches > 1 ? " in " + plural(totalBatches, "part") : "") + "…");
-      var workers = [];
-      for (var i = 0; i < Math.min(UPLOAD_CONCURRENCY, totalBatches); i++) workers.push(worker());
-      await Promise.all(workers);
+      activeUploads++;
+      try {
+        var workers = [];
+        for (var i = 0; i < Math.min(UPLOAD_CONCURRENCY, totalBatches); i++) workers.push(worker());
+        await Promise.all(workers);
+      } finally {
+        activeUploads--;
+      }
 
       progressEl.hidden = true;
       var msg = "Uploaded " + plural(uploadedCount, "file") + " to " + destination + ".";
@@ -825,40 +886,43 @@
     // -------------------------------------------------------------------- init
 
     async function init() {
+      state.ready = false;
+      state.destinationsLoaded = false;
+      state.team = null;
+      state.dir = "";
+      ++listSeq;
+      updateControls();
       setNotice("");
+      setStatus("");
+      setCount("");
+      crumbsEl.textContent = "";
       renderPending();
+      destSelect.textContent = "";
+      destSelect.appendChild(new Option("Loading workspaces…", ""));
       listEl.setAttribute("aria-busy", "true");
       showListState("loading", {
-        title: "Loading your destinations…",
-        body: "Finding the personal and shared team spaces you can write to.",
+        title: "Loading your workspaces…",
+        body: "Finding your personal and shared team workspaces.",
       });
-      var requested = standalone
-        ? new URLSearchParams(window.location.search).get("team")
-        : null;
-      var explicitSelection = Boolean(requested);
+      var requested = new URLSearchParams(window.location.search).get("team");
       await loadDestinations();
-      if (!requested) {
+      if (requested === null) {
         var account = await request("/api/portal/account", null, READ_TIMEOUT_MS);
-        requested = account.workspace ? account.workspace.id : "personal";
+        requested = account.workspace ? String(account.workspace.id) : "personal";
       }
       var chosen = null;
-      if (requested && requested !== "personal") {
+      if (requested !== "personal") {
         chosen = state.teams.find(function (t) { return t.id === requested; }) || null;
         if (!chosen) {
-          throw new Error("That selected team is no longer available. Choose Personal explicitly in the URL (?team=personal) or return to your account.");
+          throw new Error("The selected team is unavailable. Choose another workspace above, or retry to reload your teams.");
         }
       }
-      if (explicitSelection) {
-        await request("/workspace/selection", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ team: chosen ? chosen.id : "personal" }),
-        });
-      }
       state.team = chosen;
+      state.ready = true;
       syncUrl();
       renderDestinations();
       renderScope();
+      updateControls();
       await refresh();
     }
 
@@ -866,16 +930,26 @@
     // unexpected failure still ends on a labelled, retryable state.
     function start() {
       init().catch(function (e) {
+        state.ready = false;
+        if (state.destinationsLoaded) {
+          renderDestinations();
+        } else {
+          destSelect.textContent = "";
+          destSelect.appendChild(new Option("Workspaces unavailable", ""));
+        }
+        updateControls();
         scopeGlyphEl.className = "dest-glyph";
         scopeKindEl.className = "dest-kind is-pending";
-        scopeKindEl.textContent = "Destination";
-        scopeTitleEl.textContent = "Files";
-        scopeContextEl.textContent = "Destination list unavailable — retry below.";
-        setNotice("This file browser could not start: " + errText(e));
+        scopeKindEl.textContent = "Workspace";
+        scopeTitleEl.textContent = "Workspace unavailable";
+        scopeContextEl.textContent = state.destinationsLoaded
+          ? "Choose a workspace above, or retry below."
+          : "Workspace list unavailable — retry below.";
+        setNotice("Could not load your workspace: " + errText(e));
         listEl.setAttribute("aria-busy", "false");
         showListState("error", {
-          title: "Couldn't open your files",
-          body: "Loading destinations failed before any folder could be read.",
+          title: "Couldn't load your workspace",
+          body: "No workspace has been selected. Your CAD session has not changed.",
           detail: errText(e),
           action: "Retry",
           onAction: start,

@@ -810,6 +810,38 @@ def test_university_selection_mount_loss_and_suspension(client, monkeypatch, tmp
     assert client.get("/workspace/list", params={"team": team_id}, headers=headers).status_code == 403
 
 
+def test_open_workspace_rebinds_files_and_rejects_another_teams_link(client, monkeypatch, tmp_path):
+    """The app-entry link switches subsequent file calls, not merely its URL."""
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    monkeypatch.setattr(settings, "workspace_root", workspace)
+    app_dir = tmp_path / "app"
+    app_dir.mkdir()
+    (app_dir / "index.html").write_text("<!doctype html><title>CAD</title>")
+    monkeypatch.setattr(settings, "app_dir", app_dir)
+    team = _team_of(_create_org(client), "General")
+    team_root = settings.team_bucket_root(team["org_id"], team["id"])
+    team_root.mkdir(parents=True)
+    (team_root / "team-project.txt").write_text("shared design")
+
+    opened = client.get("/app/", params={"team": team["id"]}, headers=H_OWNER)
+    assert opened.status_code == 200, opened.text
+    listing = client.get("/workspace/list", headers=H_OWNER).json()
+    assert listing["root"] == str(team_root)
+    assert "team-project.txt" in {entry["name"] for entry in listing["files"]}
+
+    other = _team_of(_create_org(client, H_OUTSIDER, "Other team"), "General")
+    denied = client.get("/app/", params={"team": other["id"]}, headers=H_OWNER)
+    assert denied.status_code == 404
+    assert client.get("/workspace/list", headers=H_OWNER).json()["root"] == str(team_root)
+
+    personal = client.get("/app/", params={"team": "personal"}, headers=H_OWNER)
+    assert personal.status_code == 200, personal.text
+    listing = client.get("/workspace/list", headers=H_OWNER).json()
+    assert listing["root"] != str(team_root)
+    assert "team-project.txt" not in {entry["name"] for entry in listing["files"]}
+
+
 def test_university_expired_trial_does_not_unlock_other_services(client, monkeypatch, tmp_path):
     _, root = _university(client, monkeypatch, tmp_path)
     email = "expired@ua.edu"

@@ -4598,3 +4598,24 @@ same one nonfatal FAIL-RECORDED as the preceding native gate:
 No reverse-engineering code or assertion was changed to conceal that failure.
 The optional AppImage, V&V, modeling-combination, and larger benchmark stages
 remained opt-in skips. Logs: `/tmp/chudware-gate-assembly-perf-20260914/`.
+
+## 2026-09-14 — explicit cloud workspace switching
+
+`host/src/ui/title_bar.cpp` now presents the cloud project control as **Workspace**
+and opens **Workspaces and files**; native folder selection is unchanged.
+`Webservice/gateway/static/bucket.html` and its content-hashed JS/CSS put an explicit
+**Open workspace** action beside the readable personal/team chooser. Browsing files
+no longer writes the CAD workspace cookie: only same-tab `/app/?team=…` navigation
+commits a switch through the existing authorized app-entry route and recreates the
+CAD connection. Embedded navigation warns to save first, supports cancellation,
+and refuses while uploads are active, including across modal remounts. Failed
+discovery and unavailable selected teams cannot silently select personal storage;
+Retry or an accessible choice recovers. Browser smoke exercised the real portable
+surface and title-bar JS bridge with local team fixtures: selection, cancel/open,
+discovery failure/retry, unavailable-team recovery, upload blocking, and remount.
+Real-PostgreSQL gateway coverage in `test_orgs.py` proves app-entry selection changes
+subsequent file access and rejects unauthorized teams without changing the previous
+selection. Removed `test_bucket_ui.py`'s markup/default-pinning test rather than
+re-pinning it to the new loading state; its serving/CSP/hash checks remain.
+Live account membership and cloud deployment are separate from these local checks;
+no team provisioning or access policy changed.

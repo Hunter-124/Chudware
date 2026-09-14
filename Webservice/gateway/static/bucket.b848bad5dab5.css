@@ -5,7 +5,7 @@
  *   .bucket-page     the standalone /bucket document shell (skip link, topbar,
  *                    centered page frame). Only bucket.html sets this class.
  *   .bucket-surface  the portable file-manager surface. bucket.html keeps it
- *                    inside <main>; the desktop app's Project Folder modal
+ *                    inside <main>; the cloud app's workspace modal
  *                    imports that one node and links this stylesheet as-is.
  *
  * No rule selects html/body/:root or a bare element at top level, so linking
@@ -301,6 +301,11 @@
 .bucket-surface .dest-picker select:hover { border-color: var(--teal-2); }
 .bucket-surface .dest-picker select:focus-visible { border-color: var(--teal); box-shadow: var(--ring); }
 .bucket-surface .dest-picker select:disabled { opacity: .6; cursor: default; }
+.bucket-surface .dest-picker .open-workspace {
+  white-space: normal;
+  overflow-wrap: anywhere;
+  min-width: 0;
+}
 
 /* ------------------------------------------------------------------ notice */
 
@@ -410,6 +415,7 @@
 }
 .bucket-surface .btn.danger:hover { background: rgba(255, 113, 133, .1); border-color: var(--danger); }
 .bucket-surface .btn.danger:focus-visible { border-color: var(--danger); box-shadow: 0 0 0 3px rgba(255, 113, 133, .2); }
+.bucket-surface .btn:disabled { opacity: .6; cursor: default; }
 
 /* --------------------------------------------------------------- drop zone */
 

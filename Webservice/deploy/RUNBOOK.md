@@ -817,14 +817,18 @@ The existing paid operator is the org owner/funder; the already verified
 No credential, account plan, credit balance, AI grant or provider setting changes.
 
 The three `CHUDWARE_WEB_UNIVERSITY_{ORG_ID,TEAM_ID,WORKSPACE_ROOT}` settings
-enable the institution policy. Active accounts must have a verified password
-credential or a linked identity produced by the existing verified OAuth flow.
+enable automatic institutional enrollment. For that enrollment, active accounts
+must have a verified password credential or a linked identity produced by the
+existing verified OAuth flow.
 Eligibility matches exactly `ua.edu` or valid dot-subdomains, including
 `crimson.ua.edu`; self-declared addresses, lookalikes and suspended users fail.
 Eligible users enroll as ordinary org/team members. This is a domain admission
 policy: deleting a membership alone does not revoke domain eligibility; suspend
-the account to revoke its access. Team writes retain the live organization
-owner's active Studio/Enterprise funding check.
+the account to revoke its access. Existing organization owners/admins and explicitly
+invited team members also have access through ordinary membership checks, without
+requiring a UA address. Removing an external member revokes that member's access;
+platform-admin status alone never grants team access. Team writes retain the live
+organization owner's active Studio/Enterprise funding check.
 
 Default `/workspace/*`, bucket files, portal workspace metadata and `/engine`
 resolve the same team root. Explicit `team=<uuid>` or `scope=personal` wins;

@@ -4619,3 +4619,15 @@ selection. Removed `test_bucket_ui.py`'s markup/default-pinning test rather than
 re-pinning it to the new loading state; its serving/CSP/hash checks remain.
 Live account membership and cloud deployment are separate from these local checks;
 no team provisioning or access policy changed.
+
+## 2026-09-14 — ME-490 external owner access
+
+Production ME-490 appeared in the paid external organization's owner's team list
+but `orgs.resolve_team_bucket` rejected the owner before evaluating membership:
+the automatic UA enrollment criterion had also become a mandatory access criterion.
+The resolver now attempts verified-UA enrollment and then applies the existing
+organization/team membership checks to everyone. No accounts, roles, invitations,
+funding requirements, or domain enrollment criteria are changed. `test_orgs.py`
+covers external-owner selection/write, outsider and platform-admin isolation,
+invited external-member reads, and revocation. The targeted organization,
+tenant-isolation and bucket delivery suites pass 104 tests.

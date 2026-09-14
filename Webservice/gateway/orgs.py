@@ -449,8 +449,8 @@ def resolve_team_bucket(email: str, team_id: str, *, write: bool) -> TeamBucket:
     team_id = canonical_uuid(team_id)
     university = team_id == settings.university_team_id
     if university:
-        if not university_eligible(email):
-            raise HTTPException(404, "team not found")
+        # Verified UA identities may auto-enroll; existing owners and invited
+        # members use the same membership checks as every other team below.
         university_team(email)
     with tx() as cur:
         cur.execute(

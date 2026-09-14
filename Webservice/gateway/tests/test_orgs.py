@@ -765,6 +765,44 @@ def _university(client, monkeypatch, tmp_path):
     return team_id, root
 
 
+def test_university_external_owner_can_open_and_write_workspace(client, monkeypatch, tmp_path):
+    team_id, root = _university(client, monkeypatch, tmp_path)
+    assert not orgs.university_eligible(OWNER)
+    selected = client.post("/workspace/selection", headers=H_OWNER, json={"team": team_id})
+    assert selected.status_code == 200, selected.text
+    assert client.get("/workspace/list", headers=H_OWNER).json()["root"] == str(root)
+    uploaded = client.post(
+        "/api/bucket/upload", headers=H_OWNER, params={"team": team_id},
+        files=[("files", ("project.txt", b"shared project"))], data={"dir": ""},
+    )
+    assert uploaded.status_code == 200, uploaded.text
+    assert (root / "project.txt").read_bytes() == b"shared project"
+    for headers in (H_OUTSIDER, H_SITE_ADMIN):
+        denied = client.get(
+            "/api/bucket/download", headers=headers,
+            params={"team": team_id, "path": "project.txt"},
+        )
+        assert denied.status_code == 404
+
+
+def test_university_invited_external_member_loses_access_on_removal(client, monkeypatch, tmp_path):
+    team_id, root = _university(client, monkeypatch, tmp_path)
+    _join(client, settings.university_org_id, MEMBER, H_MEMBER)
+    assert not orgs.university_eligible(MEMBER)
+    (root / "project.txt").write_text("team design")
+    url = "/api/bucket/download"
+    params = {"team": team_id, "path": "project.txt"}
+    opened = client.get(url, headers=H_MEMBER, params=params)
+    assert opened.status_code == 200, opened.text
+    assert opened.text == "team design"
+    with db.tx() as cur:
+        cur.execute("DELETE FROM team_members WHERE team_id=%s AND email=%s", (team_id, MEMBER))
+    assert client.get(url, headers=H_MEMBER, params=params).status_code == 404
+    assert client.post(
+        "/workspace/selection", headers=H_MEMBER, json={"team": team_id},
+    ).status_code == 404
+
+
 @pytest.mark.parametrize("email,verified,allowed", [
     ("student@ua.edu", True, True),
     ("student@crimson.ua.edu", True, True),

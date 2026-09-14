@@ -31,6 +31,7 @@ import io
 import json
 import zipfile
 from dataclasses import dataclass, field
+from pathlib import Path
 
 from services.plm.canonical import canonical_dump
 
@@ -100,18 +101,23 @@ class ExplodedItem:
     extras: dict[str, bytes] = field(default_factory=dict)  # verbatim-preserved entries
 
 
-def explode_container(raw: bytes) -> ExplodedItem:
+def explode_container(raw: bytes | Path, *, canonical_document: bytes | None = None) -> ExplodedItem:
     """Explode a ``.step+`` / ``.ecad+`` ZIP container into its parts.
 
     ``document.json`` is re-serialized canonically (§0) so the shadow-tree blob is
     byte-stable across saves that do not change the model. Every other entry is
     preserved verbatim so restore is lossless.
+
+    A file-backed input seeks past derived geometry instead of copying the
+    archive. ``canonical_document`` is an already-canonical vault blob: an
+    exact byte match needs no parse/re-serialization. Changed recipes still
+    canonicalize normally, and every preserved ZIP member is still CRC-checked.
     """
     doc_bytes: bytes | None = None
     thumb: bytes | None = None
     extras: dict[str, bytes] = {}
 
-    with zipfile.ZipFile(io.BytesIO(raw), "r") as zf:
+    with zipfile.ZipFile(io.BytesIO(raw) if isinstance(raw, bytes) else raw, "r") as zf:
         for name in zf.namelist():
             if is_derived_entry(name):
                 continue  # solved state — never committed to history (rebuilds)
@@ -129,8 +135,11 @@ def explode_container(raw: bytes) -> ExplodedItem:
     # Canonicalize document.json for byte-stability (§0). If it is already
     # canonical this is a no-op; if not, we store the canonical form so diffing
     # stays false-positive-free.
-    doc = json.loads(doc_bytes.decode("utf-8"))
-    canonical = canonical_dump(doc).encode("utf-8")
+    if canonical_document is not None and doc_bytes == canonical_document:
+        canonical = canonical_document
+    else:
+        doc = json.loads(doc_bytes.decode("utf-8"))
+        canonical = canonical_dump(doc).encode("utf-8")
 
     return ExplodedItem(document_json=canonical, thumbnail_png=thumb, extras=extras)
 

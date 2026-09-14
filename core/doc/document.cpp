@@ -1796,7 +1796,7 @@ void apply_doc_face_appearances(const json& doc, uint32_t body_num,
 }
 
 CompileResult compile_document(const json& doc, const json& env_json, CompileCache* cache,
-                               ::geom::DisplayQuality quality) {
+                               ::geom::DisplayQuality quality, bool with_display) {
     CompileResult result;
     const EnvMap env = parse_env(env_json);
 
@@ -2490,6 +2490,7 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
         // Display quality bakes into the AICM this result carries, so it belongs in the
         // chain seed: switching quality is a cache MISS (full and prefix) and re-meshes.
         h = cc_fnv1a(::geom::display_quality_name(quality), h);
+        h = cc_fnv1a(with_display ? "display" : "component_geometry", h);
         chain.push_back(h);
         for (std::size_t i = 0; i < n_features; ++i)
             chain.push_back(cc_fnv1a(features[i].dump(), chain.back()));
@@ -8811,7 +8812,7 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
         const char* v = std::getenv("CHUDWARE_TESS_CACHE");
         return !(v && v[0] == '0' && v[1] == '\0');
     }();
-    CompileCache* bc = (use_cache && tess_cache_on) ? cache : nullptr;
+    CompileCache* bc = (use_cache && tess_cache_on && with_display) ? cache : nullptr;
     std::map<std::tuple<const void*, bool, uint64_t>,
              std::shared_ptr<const CachedBody>> new_body_cache;
     // Bit-exact hash of a body's baked appearance (color+metal+rough) PLUS the display
@@ -8833,6 +8834,15 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
         const TopoDS_Shape& shape = std::get<SolidResult>(*results.at(sid)).shape;
         if (shape.IsNull()) continue;
         try {
+            if (!with_display) {
+                // Components need the same per-body Fine triangulation as the
+                // editable part, but never consume this part's display packet.
+                const auto defl = ::geom::display_deflections(quality, shape);
+                ::geom::mesh_body(shape, defl.lin, defl.ang);
+                result.shapes.push_back(shape);
+                ++body_num;
+                continue;
+            }
             // Per-body appearance (C26 colour + C32-A material) baked into the AICM so the host
             // render + doc_render_png reflect a set_appearance op. Default dielectric grey unless
             // doc["appearances"]["b<body_num>"] overrides.
@@ -8953,9 +8963,9 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
     }
     if (bc) bc->body_cache = std::move(new_body_cache);
 
-    result.body_count = static_cast<int>(bodies.size());
+    result.body_count = static_cast<int>(with_display ? bodies.size() : result.shapes.size());
     const auto _write_t0 = std::chrono::steady_clock::now();
-    result.aicm = aicm::write_aicm(bodies);
+    if (with_display) result.aicm = aicm::write_aicm(bodies);
     result.tess_write_ms = std::chrono::duration<double, std::milli>(
                                std::chrono::steady_clock::now() - _write_t0).count();
     result.tess_ms = std::chrono::duration<double, std::milli>(
@@ -8972,7 +8982,7 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
     // from CompileCkpt for the reused prefix — this phase only INVERTS them into the
     // host-facing {fid:{bodies,faces,edges}} map for surviving AICM bodies. On a
     // pure-prefix edit owner_ms collapses to this cheap inversion.
-    {
+    if (with_display) {
         json om = json::object();
         auto ensure = [&](const std::string& fid) -> json& {
             if (!om.contains(fid))
@@ -9006,7 +9016,7 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
     // Datums build no body, so they never reach the AICM. Surface each resolved datum's geometry
     // (keyed by feature, in tree order) so the host can draw it as a reference overlay. A feature
     // that errored has no entry in `results`, so it is simply skipped (no datum drawn).
-    for (const json& raw : features.is_array() ? features : empty) {
+    for (const json& raw : with_display && features.is_array() ? features : empty) {
         if (!raw.is_object()) continue;
         const std::string id = raw.value("id", std::string());
         if (id.empty()) continue;

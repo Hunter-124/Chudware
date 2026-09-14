@@ -158,6 +158,34 @@ def test_history_exports_thumbnails(project, tmp_path_factory):
             _assert_no_git_vocab(str(e.get(field) or ""))
 
 
+def test_history_and_outside_scan_do_not_query_remote_locks(project, monkeypatch):
+    from services.plm import remote
+    from services.plm.vault import Vault
+
+    v = Vault.open(project)
+    try:
+        m = v.manifest()
+        m["remotes"] = [{"id": "offline", "url": "/offline"}]
+        from services.plm import manifest
+        v._commit_sibling("manifest.json", manifest.dumps(m), scope="design")
+    finally:
+        v.close()
+    queries = []
+
+    def offline_locks(*args, **kwargs):
+        queries.append(True)
+        return {"ok": False, "reason": "offline"}
+
+    monkeypatch.setattr(remote, "list_locks", offline_locks)
+    history = _call("plm_history", path=str(project))
+    assert history["ok"] and history["entries"][0]["commit"] == history["head"]
+    outside = _call("plm_record_outside", path=str(project))
+    assert outside == {"ok": True, "committed": False}
+    assert queries == []
+    assert _call("plm_status", path=str(project))["ok"]
+    assert queries == [True]  # Explicit status still asks for fresh remote state.
+
+
 def test_save_rejects_release_kind(project):
     out = _call("plm_save", path=str(project), kind="release")
     assert out["ok"] is False and out["reason"] == "invalid_mode"

@@ -496,3 +496,212 @@ TEST_CASE("nonbinding snapshot preserves live relative sources and unsaved state
     doc_close(reopened);
     fs::remove_all(directory);
 }
+
+TEST_CASE("nested load cache follows changed descendant geometry and appearance") {
+    using namespace chudware::doc;
+    const fs::path part = tmp("cache_descendant_part.step+");
+    const fs::path nested = tmp("cache_descendant_assembly.step+");
+    save_box_part(part);
+    auto source = stepplus_open(part.string()).doc;
+    source["appearances"]["b1"] = {0.8, 0.1, 0.2};
+    stepplus_save(source, part.string(), {});
+    json child{{"schema", "aicad.asm/1"}, {"components", json::array({
+        {{"id", "leaf"}, {"fixed", true}, {"source", {{"path", part.string()}}}}
+    })}};
+    stepplus_save(child, nested.string(), {});
+    const auto parent_time = fs::last_write_time(nested);
+    const auto part_time = fs::last_write_time(part);
+    json root{{"schema", "aicad.asm/1"}, {"components", json::array({
+        {{"id", "left"}, {"fixed", true}, {"source", {{"path", nested.string()}}}},
+        {{"id", "right"}, {"fixed", true}, {"source", {{"path", nested.string()}}},
+         {"transform", {1,0,0,100, 0,1,0,0, 0,0,1,0, 0,0,0,1}}}
+    })}};
+    const auto fingerprints = asm_component_fingerprints(root, {});
+    for (int warm = 0; warm < 2; ++warm) {
+        const auto built = compile_assembly(root);
+        REQUIRE(built.converged);
+        REQUIRE(built.bodies.size() == 2);
+        CHECK(total_volume({placed_world_shape(built.bodies[0]),
+                            placed_world_shape(built.bodies[1])}) == doctest::Approx(2000));
+        CHECK(built.bodies[1].transform[3] == doctest::Approx(100));
+        REQUIRE_FALSE(built.bodies[0].appearance_regions.empty());
+        CHECK(built.bodies[0].appearance_regions[0].color[0] == doctest::Approx(0.8));
+    }
+    source["features"][0]["params"]["length"] = 20.0;
+    source["appearances"]["b1"] = {0.2, 0.1, 0.8};
+    stepplus_save(source, part.string(), {});
+    // Keep the containing assembly unchanged, and use a one-tick child timestamp
+    // delta to catch the old lossy double-converted mtime identity.
+    fs::last_write_time(part, part_time + fs::file_time_type::duration(1));
+    CHECK(fs::last_write_time(nested) == parent_time);
+    CHECK_FALSE(asm_fingerprints_match(root, {}, fingerprints));
+    const auto changed = compile_assembly(root);
+    REQUIRE(changed.converged);
+    REQUIRE(changed.bodies.size() == 2);
+    CHECK(total_volume({placed_world_shape(changed.bodies[0]),
+                        placed_world_shape(changed.bodies[1])}) == doctest::Approx(4000));
+    CHECK(changed.bodies[1].transform[3] == doctest::Approx(100));
+    REQUIRE_FALSE(changed.bodies[0].appearance_regions.empty());
+    CHECK(changed.bodies[0].appearance_regions[0].color[0] == doctest::Approx(0.2));
+    fs::remove(part); fs::remove(nested);
+}
+
+TEST_CASE("parallel cyclic native roots report failure and recover after descendant repair") {
+    using namespace chudware::doc;
+    const fs::path part = tmp("cache_cycle_part.step+");
+    const fs::path a = tmp("cache_cycle_a.step+"), b = tmp("cache_cycle_b.step+");
+    save_box_part(part);
+    const auto component = [](const char* id, const fs::path& path) {
+        return json{{"id", id}, {"fixed", true}, {"source", {{"path", path.string()}}}};
+    };
+    const json left{{"schema", "aicad.asm/1"}, {"components", json::array({
+        component("leaf", part), component("other", b)
+    })}};
+    json right{{"schema", "aicad.asm/1"}, {"components", json::array({
+        component("leaf", part), component("other", a)
+    })}};
+    stepplus_save(left, a.string(), {});
+    stepplus_save(right, b.string(), {});
+    const json root{{"schema", "aicad.asm/1"}, {"components", json::array({
+        component("a", a), component("b", b)
+    })}};
+    for (int warm = 0; warm < 2; ++warm) {
+        const auto broken = compile_assembly(root);
+        CHECK_FALSE(broken.converged);
+        REQUIRE(broken.component_status.size() == 2);
+        for (const auto& status : broken.component_status) {
+            CHECK_FALSE(status.ok);
+            REQUIRE(status.error.has_value());
+            CHECK(status.error->find("cyclic component reference") != std::string::npos);
+        }
+    }
+    right["components"].erase(1);
+    stepplus_save(right, b.string(), {});
+    const auto repaired = compile_assembly(root);
+    REQUIRE(repaired.converged);
+    REQUIRE(repaired.bodies.size() == 2);
+    CHECK(total_volume({placed_world_shape(repaired.bodies[0]),
+                        placed_world_shape(repaired.bodies[1])}) == doctest::Approx(3000));
+    fs::remove(part); fs::remove(a); fs::remove(b);
+}
+
+TEST_CASE("nested legacy import invalidates cached geometry when only external source changes") {
+    using namespace chudware::doc;
+    const fs::path neutral = tmp("cache_legacy_source.brep");
+    const fs::path part = tmp("cache_legacy_part.step+");
+    const fs::path nested = tmp("cache_legacy_assembly.step+");
+    const auto box = BRepPrimAPI_MakeBox(10.0, 10.0, 10.0).Shape();
+    export_bodies({box}, neutral.string(), "brep");
+    json source{{"schema", "aicad.part/1"}, {"features", json::array({
+        {{"id", "imported"}, {"type", "import"},
+         {"params", {{"source_path", neutral.string()}, {"format", "brep"}}}}
+    })}};
+    SUBCASE("unconfigured file-backed import") {}
+    SUBCASE("active configuration overrides embedded provenance with a file source") {
+        source["features"][0]["params"]["embedded_brep"] = "unused embedded provenance";
+        source["features"][0]["params"]["source_path"] = "unused original path";
+        source["configurations"] = json::array({{
+            {"name", "FileSource"}, {"param_overrides", {
+                {"imported.embedded_brep", ""}, {"imported.source_path", neutral.string()}
+            }}
+        }});
+        source["active_configuration"] = "FileSource";
+    }
+    const json header{{"engine", stepplus_cache_engine_key()},
+                      {"doc_hash", stepplus_doc_hash(source)}, {"solved", true}};
+    stepplus_save(source, part.string(), {{"cache.json", header.dump()},
+                                          {"cache.brep", brep_cache_encode({box})}});
+    const json child{{"schema", "aicad.asm/1"}, {"components", json::array({
+        {{"id", "leaf"}, {"fixed", true}, {"source", {{"path", part.string()}}}}
+    })}};
+    stepplus_save(child, nested.string(), {});
+    const json root{{"schema", "aicad.asm/1"}, {"components", json::array({
+        {{"id", "nested"}, {"fixed", true}, {"source", {{"path", nested.string()}}}}
+    })}};
+    const auto before = compile_assembly(root);
+    REQUIRE(before.converged);
+    REQUIRE(before.bodies.size() == 1);
+    CHECK(total_volume({placed_world_shape(before.bodies[0])}) == doctest::Approx(1000));
+    const auto fingerprints = asm_component_fingerprints(root, {});
+    const auto source_time = fs::last_write_time(neutral);
+    export_bodies({BRepPrimAPI_MakeBox(20.0, 10.0, 10.0).Shape()}, neutral.string(), "brep");
+    fs::last_write_time(neutral, source_time + fs::file_time_type::duration(1));
+    CHECK_FALSE(asm_fingerprints_match(root, {}, fingerprints));
+    const auto after = compile_assembly(root);
+    REQUIRE(after.converged);
+    REQUIRE(after.bodies.size() == 1);
+    CHECK(total_volume({placed_world_shape(after.bodies[0])}) == doctest::Approx(2000));
+    fs::remove(neutral); fs::remove(part); fs::remove(nested);
+}
+
+TEST_CASE("symlinked native assemblies fingerprint each relative source directory") {
+    using namespace chudware::doc;
+    const fs::path directory = tmp("cache_symlink_context");
+    fs::create_directories(directory / "left");
+    fs::create_directories(directory / "right");
+    struct RemoveDirectory {
+        fs::path path;
+        ~RemoveDirectory() { std::error_code ec; fs::remove_all(path, ec); }
+    } cleanup{directory};
+    const fs::path shared = directory / "shared.step+";
+    const fs::path container = directory / "container.step+";
+    const json shared_doc{{"schema", "aicad.asm/1"}, {"components", json::array({
+        {{"id", "part"}, {"fixed", true}, {"source", {{"path", "part.step+"}}}}
+    })}};
+    stepplus_save(shared_doc, shared.string(), {});
+    for (const auto* side : {"left", "right"}) {
+        std::error_code ec;
+        fs::create_symlink(shared, directory / side / "sub.step+", ec);
+        if (ec) return;  // symlink creation may require privileges on Windows
+        save_box_part(directory / side / "part.step+");
+    }
+    const json child{{"schema", "aicad.asm/1"}, {"components", json::array({
+        {{"id", "left"}, {"fixed", true}, {"source", {{"path", "left/sub.step+"}}}},
+        {{"id", "right"}, {"fixed", true}, {"source", {{"path", "right/sub.step+"}}}}
+    })}};
+    stepplus_save(child, container.string(), {});
+    const json root{{"schema", "aicad.asm/1"}, {"components", json::array({
+        {{"id", "nested"}, {"fixed", true}, {"source", {{"path", container.string()}}}}
+    })}};
+    const auto before = compile_assembly(root);
+    REQUIRE(before.converged);
+    REQUIRE(before.bodies.size() == 1);
+    CHECK(total_volume({placed_world_shape(before.bodies[0])}) == doctest::Approx(2000));
+    const auto fingerprints = asm_component_fingerprints(root, {});
+    const auto right = directory / "right/part.step+";
+    auto updated = stepplus_open(right.string()).doc;
+    updated["features"][0]["params"]["length"] = 20.0;
+    stepplus_save(updated, right.string(), {});
+    CHECK_FALSE(asm_fingerprints_match(root, {}, fingerprints));
+    const auto after = compile_assembly(root);
+    REQUIRE(after.converged);
+    REQUIRE(after.bodies.size() == 1);
+    CHECK(total_volume({placed_world_shape(after.bodies[0])}) == doctest::Approx(3000));
+}
+
+TEST_CASE("component geometry mode preserves curved display across compile cache mode switches") {
+    using namespace chudware::doc;
+    const json source{{"schema", "aicad.part/1"}, {"features", json::array({
+        {{"id", "cyl"}, {"type", "cylinder"},
+         {"params", {{"radius", 5.0}, {"height", 30.0}}}}
+    })}};
+    const auto cache = make_compile_cache();
+    const auto displayed = compile_document(source, json::object(), cache.get());
+    REQUIRE(displayed.ok);
+    REQUIRE(displayed.shapes.size() == 1);
+    const auto component = compile_document(source, json::object(), cache.get(),
+                                             ::geom::DisplayQuality::Fine, false);
+    REQUIRE(component.ok);
+    REQUIRE(component.shapes.size() == 1);
+    const auto deflections = ::geom::display_deflections(
+        ::geom::DisplayQuality::Fine, component.shapes[0]);
+    const float color[3] = {0.71f, 0.76f, 0.82f};
+    const auto extracted = ::geom::tessellate_body(
+        component.shapes[0], 1, "cyl", color, deflections.lin, deflections.ang);
+    // A component consumer extracts exactly the standalone part's curved display,
+    // even though the component compile did not allocate a serialized part packet.
+    CHECK(aicm::write_aicm({extracted}) == displayed.aicm);
+    const auto displayed_again = compile_document(source, json::object(), cache.get());
+    REQUIRE(displayed_again.ok);
+    CHECK(displayed_again.aicm == displayed.aicm);
+}

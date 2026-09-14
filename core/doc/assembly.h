@@ -3,10 +3,10 @@
 // An assembly document (``aicad.asm/1``) is rebuilt very differently from a part:
 //
 //   1. Component loading — each non-suppressed component's ``source.path`` is opened
-//      (parts cached per path+mtime). Native child assemblies resolve recursively,
-//      preserving their local placements (provisional if unsolved); their descendant geometry is not
-//      cached by the parent file's mtime. Bare neutral/mesh files use formats.cpp.
-//      The resulting local-frame solids and topology describe mate references.
+//      (cached per resolved path + exact size/mtime and recursive dependency identity).
+//      Native child assemblies resolve recursively and retain local placements
+//      (provisional if unsolved). Bare neutral/mesh files use formats.cpp. Local
+//      topology descriptions are computed only when mate references require them.
 //      Embedded-only sources are unsupported and produce explicit component errors.
 //
 //   2. Mate-ref resolution — every mate ref {component, selector} resolves the selector
@@ -117,10 +117,11 @@ AssemblyResult compile_assembly(const nlohmann::json& doc,
                                 const std::optional<chudware::mate::Drag>& drag = std::nullopt);
 
 // Fingerprints of every non-suppressed component's resolved source file, followed by
-// nested descendants ([{path, size, mtime}] — the same file identity as the load cache).
+// nested descendants and legacy file-backed imports ([{path, size, mtime}]).
 // Written into persisted-geometry cache headers so doc_open detects child appearance
 // and geometry changes even when the containing assembly file has not changed.
 // Missing files fingerprint as size/mtime 0; repeated/cyclic sources are traversed once.
+// Only source JSON is read; display meshes, BREP, studies and attachments are skipped.
 nlohmann::json asm_component_fingerprints(const nlohmann::json& doc,
                                           const std::string& base_dir);
 

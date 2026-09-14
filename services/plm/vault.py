@@ -67,19 +67,20 @@ _SCHEMA_KIND = {
 # keyed by the resolved project root and reused across short-lived Vaults in
 # the same process (hostd / web worker bridge).
 #
-# Fast path: if a tracked working file's (mtime_ns, size) matches the stamp
-# captured at the last full content compare against the same HEAD, reuse that
-# dirty verdict without re-reading/exploding the container. Same philosophy as
-# cad_graph.py's mtime fast-path.
-#
-# Correctness bound: a rewrite that keeps both mtime and size identical (rare;
-# same-second equal-size write) may be missed until the TTL elapses or a
-# vault mutation invalidates the entry. Explicit save/checkpoint/add/untrack/
-# restore/release paths always drop the cache for this root.
-_DIRTY_CACHE_TTL_S = 30.0
-# root -> {"t": monotonic, "head": str|None,
-#          "items": {item_id: {"stamp": hashable, "dirty": bool}}}
+# Fast path: reuse a verdict only against the same HEAD and unchanged working
+# stat fingerprint (mtime, ctime, size, inode). Same-size rewrites preserving
+# mtime therefore invalidate immediately on platforms with change-time ctime.
+# Windows ctime is creation time: recheck each item's content after a bounded
+# age measured AFTER its last comparison (never an expiring whole-scan TTL).
+# Explicit mutations always drop the cache for this root.
+# root -> {"head": str|None, "items": {item_id: {"stamp": tuple, "dirty": bool}}}
 _dirty_scan_cache: dict[str, dict[str, Any]] = {}
+_STAT_RECHECK_S: float | None = 30.0 if os.name == "nt" else None
+
+
+def _stat_cache_expired(entry: dict[str, Any]) -> bool:
+    return (_STAT_RECHECK_S is not None
+            and time.monotonic() - entry.get("recorded_at", 0.0) >= _STAT_RECHECK_S)
 
 
 def _vault_cache_key(project_dir: str | os.PathLike) -> str:
@@ -137,7 +138,8 @@ def _explode_cache_put(key: str, stamp: tuple[int, int, int, int],
     if size > _EXPLODE_CACHE_MAX_BYTES:
         return  # a single container larger than the whole budget is not cached
     _explode_cache[key] = {"stamp": stamp, "exploded": exploded,
-                           "doc": doc, "bytes": size, "recorded_ns": time.time_ns()}
+                           "doc": doc, "bytes": size, "recorded_ns": time.time_ns(),
+                           "recorded_at": time.monotonic()}
     _explode_cache_bytes += size
     while _explode_cache_bytes > _EXPLODE_CACHE_MAX_BYTES:
         oldest = next(iter(_explode_cache))  # insertion-ordered
@@ -154,7 +156,10 @@ def _explode_cache_get(key: str, stamp: tuple[int, int, int, int] | None
     entry = _explode_cache.get(key)
     if entry is None or entry["stamp"] != stamp:
         return None
-    if int(stamp[0]) >= int(entry["recorded_ns"]):
+    if _stat_cache_expired(entry):
+        _explode_cache_drop(key)
+        return None
+    if max(int(stamp[0]), int(stamp[1])) >= int(entry["recorded_ns"]):
         # Written in the same tick we recorded: the stat tuple cannot prove the
         # bytes are the ones we exploded. Re-read instead of trusting it.
         _explode_cache_drop(key)
@@ -169,8 +174,8 @@ def _explode_cache_drop(key: str) -> None:
         _explode_cache_bytes -= int(old["bytes"])
 
 
-def _tree_working_stamp(root: Path) -> tuple[tuple[str, int, int], ...]:
-    """Mtime/size fingerprint of a generic tree item (exclusion-filtered).
+def _tree_working_stamp(root: Path) -> tuple[tuple[str, int, int, int, int], ...]:
+    """Stat fingerprint of a generic tree item (exclusion-filtered).
 
     Mirrors :func:`generic_snapshot._snapshot_tree` walk policy so a stamp hit
     means the files that would be content-hashed are unchanged on disk.
@@ -179,7 +184,7 @@ def _tree_working_stamp(root: Path) -> tuple[tuple[str, int, int], ...]:
         _EXCLUDE_DIR_PREFIXES,
         _EXCLUDE_DIRS,
     )
-    out: list[tuple[str, int, int]] = []
+    out: list[tuple[str, int, int, int, int]] = []
     try:
         if not root.is_dir():
             return tuple()
@@ -198,7 +203,8 @@ def _tree_working_stamp(root: Path) -> tuple[tuple[str, int, int], ...]:
                 except OSError:
                     continue
                 rel = abs_path.relative_to(root).as_posix()
-                out.append((rel, int(st.st_mtime_ns), int(st.st_size)))
+                out.append((rel, int(st.st_mtime_ns), int(st.st_ctime_ns),
+                            int(st.st_size), int(st.st_ino)))
     except OSError:
         return tuple()
     out.sort()
@@ -297,7 +303,7 @@ class Vault:
             "head": head,
             "dirty": self._dirty_items(m),
             "ai_mode": m.get("ai_mode", "assisted"),
-            "auto_commit": self.auto_commit(),
+            "auto_commit": bool(m.get("auto_commit", True)),
             "items": [self._item_view(it) for it in m["items"]],
             "remotes": m.get("remotes", []),
             "locks": locks,
@@ -346,21 +352,19 @@ class Vault:
                     break
             return entries
 
-        # per-item pass over the scope-filtered chain. Each commit's tree is read
-        # at most once even though a commit is inspected as both "this commit"
-        # and (on the next step) "the parent", and each tree is dropped as soon
-        # as the walk moves past it.
-        trees: dict[str, dict[str, bytes]] = {}
-
-        def tree_at(commit: str) -> dict[str, bytes]:
-            t = trees.get(commit)
-            if t is None:
-                t = self._bind.read_tree(commit)
-                trees[commit] = t
-            return t
-
+        # Compare content-addressed blob ids, not decoded project snapshots.
+        # CAD history depends only on document.json; generic history includes
+        # all item content except regenerated metadata, exactly as before.
         def signature_at(commit: str) -> object | None:
-            return self._item_content_signature(tree_at(commit), item_id)
+            prefix = snapshot.item_prefix(item_id)
+            doc = self._bind.entry_at(commit, prefix + "document.json")
+            if doc is not None and doc[0] != 0o040000:
+                return doc[1]
+            ids = self._bind.subtree_ids(commit, prefix)
+            if not ids:
+                return None
+            return tuple(sorted((path, oid) for path, oid in ids.items()
+                                if path[len(prefix):] not in ("meta.json", "summary.txt")))
 
         entries = []
         chain = scoped_chain()
@@ -374,40 +378,12 @@ class Vault:
                 parent is not None and parent_sig is not None and parent_sig == cur_sig)
             if emit:
                 entries.append(
-                    self._entry_view(commit, tree_at(commit), item_id, meta=cmeta))
+                    self._entry_view_light(commit, item_id=item_id, meta=cmeta))
                 if limit is not None and len(entries) >= limit:
                     break
             cur, cur_sig = parent, parent_sig
-            trees.pop(commit, None)  # the newer-side tree is never needed again
         return entries
 
-    def _item_content_signature(self, tree: dict[str, bytes],
-                                item_id: str) -> object | None:
-        """A change signature for one item at a history point — the CAD
-        document.json blob, or (for generic items) the sorted content-blob map
-        excluding the per-commit-regenerated meta.json/summary.txt.
-
-        Returns ``None`` when the item has no blobs at all under its prefix,
-        i.e. **the item does not exist at this history point** — which is
-        distinct from a present-but-empty item.
-        """
-        p = snapshot.item_prefix(item_id)
-        doc = tree.get(p + "document.json")
-        if doc is not None:
-            return doc
-        sig: list[tuple[str, bytes]] = []
-        present = False
-        for path, data in tree.items():
-            if not path.startswith(p):
-                continue
-            present = True
-            tail = path[len(p):]
-            if tail in ("meta.json", "summary.txt"):
-                continue
-            sig.append((path, data))
-        if not present:
-            return None
-        return tuple(sorted(sig))
 
     # -- writing -----------------------------------------------------------
 
@@ -719,10 +695,10 @@ class Vault:
         """
         op = str(op or "list")
         head = self._bind.head_commit()
-        head_tree = self._bind.read_tree(head) if head else {}
         try:
             fname = planning.file_name(entity)
-            coll = planning.load(head_tree.get(fname), entity)
+            raw = self._bind.read_blob_at(head, fname) if head else None
+            coll = planning.load(raw, entity)
             if op == "list":
                 return {"items": planning.entities(coll, entity)}
             action = {"create": "create", "update": "edit", "delete": "delete"}.get(op)
@@ -1360,8 +1336,8 @@ class Vault:
     def _working_stamp(self, it: dict[str, Any]) -> object | None:
         """Stat fingerprint of an item's working path, or None if unreadable.
 
-        Containers/files: ``(mtime_ns, size)``. Tree items: sorted per-file
-        ``(rel, mtime_ns, size)`` tuples under the exclusion walk. Links have
+        Containers/files: ``(mtime_ns, ctime_ns, size, inode)``. Tree items:
+        sorted per-file tuples under the exclusion walk. Links have
         no working file (content lives in the shadow tree only) — stamped as
         the sentinel ``("link",)`` so they still cache.
         """
@@ -1380,7 +1356,8 @@ class Vault:
                 if not path.is_file():
                     return ("missing",)
                 st = path.stat()
-                return ("file", int(st.st_mtime_ns), int(st.st_size))
+                return ("file", int(st.st_mtime_ns), int(st.st_ctime_ns),
+                        int(st.st_size), int(st.st_ino))
             except OSError:
                 return ("missing",)
         path = self.project_dir / it["path"]
@@ -1388,7 +1365,8 @@ class Vault:
             if not path.is_file():
                 return None
             st = path.stat()
-            return ("container", int(st.st_mtime_ns), int(st.st_size))
+            return ("container", int(st.st_mtime_ns), int(st.st_ctime_ns),
+                    int(st.st_size), int(st.st_ino))
         except OSError:
             return None
 
@@ -1398,26 +1376,21 @@ class Vault:
         Hot path for overview/status. On a warm process, unchanged working files
         skip ``snapshot.explode_container`` / generic content hashing via the
         module-level stamp cache (see ``_dirty_scan_cache``). A full compare
-        always runs on cache miss, TTL expiry, HEAD change, or stamp mismatch.
+        always runs on cache miss, HEAD change, or stamp mismatch.
         """
         head = self._bind.head_commit()
         if head is None:
             return [it["item_id"] for it in m["items"]]
 
         root_key = _vault_cache_key(self.project_dir)
-        now = time.monotonic()
         cached = _dirty_scan_cache.get(root_key)
-        if (cached is None
-                or cached.get("head") != head
-                or (now - float(cached.get("t", 0.0))) > _DIRTY_CACHE_TTL_S):
+        if cached is None or cached.get("head") != head:
             item_cache: dict[str, dict[str, Any]] = {}
-            cached = {"t": now, "head": head, "items": item_cache}
+            cached = {"head": head, "items": item_cache}
             _dirty_scan_cache[root_key] = cached
         else:
             item_cache = cached["items"]
-            cached["t"] = now  # sliding freshness while the process keeps reading
 
-        tree: dict[str, bytes] | None = None  # lazy — only for generic is_dirty
         dirty: list[str] = []
         live_ids: set[str] = set()
 
@@ -1441,7 +1414,9 @@ class Vault:
                 continue
 
             prev = item_cache.get(iid)
-            if prev is not None and prev.get("stamp") == stamp:
+            if (prev is not None and prev.get("stamp") == stamp
+                    and not _stat_cache_expired(prev)
+                    and self._stamp_is_stable(stamp, prev.get("recorded_ns", 0))):
                 if prev.get("dirty"):
                     dirty.append(iid)
                 continue
@@ -1450,25 +1425,32 @@ class Vault:
             is_dirty = False
             dt = it.get("doc_type")
             if dt and dt in doctypes.GENERIC_DOC_TYPES:
-                if tree is None:
-                    tree = self._bind.read_tree(head)
-                is_dirty = generic_snapshot.is_dirty(it, self.project_dir, tree)
+                item_tree = self._bind.read_subtree(head, snapshot.item_prefix(iid))
+                is_dirty = generic_snapshot.is_dirty(it, self.project_dir, item_tree)
             else:
                 path = self.project_dir / it["path"]
+                head_doc = self._bind.read_blob_at(
+                    head, snapshot.item_prefix(iid) + "document.json")
                 try:
-                    exploded = snapshot.explode_container(path.read_bytes())
+                    cache_key = f"{root_key}\x00{it['path']}"
+                    container_stamp = stamp[1:]
+                    hit = _explode_cache_get(cache_key, container_stamp)
+                    if hit is not None:
+                        exploded = hit["exploded"]
+                    else:
+                        exploded = snapshot.explode_container(path, canonical_document=head_doc)
+                        import json
+                        _explode_cache_put(cache_key, container_stamp, exploded,
+                                           json.loads(exploded.document_json))
                 except Exception:
                     # A malformed tracked container is not clean: surface it as
                     # dirty so callers do not mistake corruption for no change.
                     is_dirty = True
                 else:
-                    # Path-direct HEAD blob — avoid flattening hundreds of item
-                    # trees just to compare document.json on cold overview.
-                    head_doc = self._bind.read_blob_at(
-                        head, snapshot.item_prefix(iid) + "document.json")
                     is_dirty = head_doc != exploded.document_json
 
-            item_cache[iid] = {"stamp": stamp, "dirty": is_dirty}
+            item_cache[iid] = {"stamp": stamp, "dirty": is_dirty,
+                               "recorded_ns": time.time_ns(), "recorded_at": time.monotonic()}
             if is_dirty:
                 dirty.append(iid)
 
@@ -1478,10 +1460,19 @@ class Vault:
             del item_cache[k]
         return dirty
 
+    @staticmethod
+    def _stamp_is_stable(stamp: tuple, recorded_ns: int) -> bool:
+        """Reject racily-clean files written in the comparison's clock tick."""
+        if stamp[0] in ("container", "file"):
+            return max(stamp[1], stamp[2]) < recorded_ns
+        if stamp[0] == "tree":
+            return all(max(row[1], row[2]) < recorded_ns for row in stamp[1])
+        return True
+
     def _item_view(self, it: dict[str, Any]) -> dict[str, Any]:
         return items_mod.item_view(it)
 
-    def _entry_view_light(self, commit: str, *,
+    def _entry_view_light(self, commit: str, *, item_id: str | None = None,
                           meta: dict[str, Any] | None = None) -> dict[str, Any]:
         """Entry view without flattening the whole commit tree.
 
@@ -1502,10 +1493,8 @@ class Vault:
         participants = None
         thumb_ref = None
         summary = ""
-        # Prefer an item_id recorded in a trailer-free scan: read the live
-        # manifest at HEAD once would be wrong for old commits. Instead walk
-        # the commit's items/ tree one level deep (names only, no blob load).
-        pick_iid = self._first_item_id_at(commit)
+        # Resolve the representative at this commit, never from today's manifest.
+        pick_iid = item_id if item_id is not None else self._first_item_id_at(commit)
         if pick_iid is not None:
             prefix = snapshot.item_prefix(pick_iid)
             mraw = self._bind.read_blob_at(commit, prefix + "meta.json")
@@ -1519,7 +1508,8 @@ class Vault:
                     participants = md.get("participants")
                 except Exception:
                     pass
-            if self._bind.read_blob_at(commit, prefix + "thumbnail.png") is not None:
+            thumb_entry = self._bind.entry_at(commit, prefix + "thumbnail.png")
+            if thumb_entry is not None and thumb_entry[0] != 0o040000:
                 thumb_ref = prefix + "thumbnail.png"
             sraw = self._bind.read_blob_at(commit, prefix + "summary.txt")
             if sraw:
@@ -1535,21 +1525,10 @@ class Vault:
     def _first_item_id_at(self, commit: str) -> str | None:
         """First ``items/<id>/`` child name at *commit* without full flatten."""
         try:
-            c = self._bind._repo[commit.encode("ascii")]  # noqa: SLF001
-            from dulwich.objects import Tree
-            root = self._bind._repo[c.tree]  # noqa: SLF001
-            if not isinstance(root, Tree):
+            entry = self._bind.entry_at(commit, "items")
+            if entry is None or entry[0] != 0o040000:
                 return None
-            items_sha = None
-            for entry in root.items():
-                if entry.path == b"items":
-                    items_sha = entry.sha
-                    break
-            if items_sha is None:
-                return None
-            items_tree = self._bind._repo[items_sha]  # noqa: SLF001
-            if not isinstance(items_tree, Tree):
-                return None
+            items_tree = self._bind._read_object(entry[1])  # noqa: SLF001
             for entry in items_tree.items():
                 name = entry.path.decode("utf-8", "replace")
                 if name:

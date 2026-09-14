@@ -153,3 +153,24 @@ Graphify/Sourcegraph analogue over CAD projects: how parts/features/mates/BOM/do
   (heuristic link suggestions: same_folder / name_match / shared_keyword /
   content_mention, confidence-ranked), `plm_graph_brief` (one-node dossier).
   `cad_graph_link` src/dst accept cross-project qualified refs.
+
+### Compressed derived cache and complete source freshness (2026-09-13)
+
+- The derived cache storage paths above are superseded by `.plm/graph.json.gz`
+  and `.plm/graph.prev.json.gz`. Both hold compact gzip-compressed JSON; the graph
+  schema, node/edge content and RPC response shapes are unchanged.
+- Legacy uncompressed caches are not authoritative and are regenerated from
+  project sources on first use. Overlay files and UI layout files keep their
+  existing paths and formats.
+- Cache reads and writes admit at most 64 MiB compressed and 1 GiB expanded.
+  Invalid, corrupt or oversized caches are misses, never partial graph results.
+  Publication is atomic; invalidation retains the previous compressed graph for
+  change-diff consumers.
+- Freshness records every candidate source under the requested walk policy,
+  including unreadable containers and files beyond the existing file-node display
+  cap. Capturing this fingerprint before extraction prevents a large project from
+  writing a cache that its own source scan immediately rejects.
+- The cache additionally records internal source stat identities (nanosecond
+  modification/change times, size, inode and mode) during that same scan.
+  Restoring read permissions invalidates previously omitted source content without
+  requiring an mtime change. Public mtime and source-count fields are unchanged.

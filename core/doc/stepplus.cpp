@@ -356,7 +356,7 @@ std::string stepplus_save(const json& doc, const std::string& path,
 }
 
 // ---------------------------------------------------------------- shared editable-container open
-enum class NativeReadMode { Open, Metadata, Relocate };
+enum class NativeReadMode { Open, Document, Component, Metadata, Relocate };
 
 static StepPlusDoc editable_container_open_impl(const std::string& path,
                                     const std::string& expected_prefix,
@@ -364,6 +364,7 @@ static StepPlusDoc editable_container_open_impl(const std::string& path,
                                     NativeReadMode mode = NativeReadMode::Open) {
     if (!std::filesystem::exists(path)) io_error("doc_open: no such file: " + path);
     const bool owns_geometry_step = expected_prefix == "aicad.step+/";
+    const bool read_only = mode == NativeReadMode::Document || mode == NativeReadMode::Component;
 
     mz_zip_archive zip;
     std::memset(&zip, 0, sizeof(zip));
@@ -387,11 +388,11 @@ static StepPlusDoc editable_container_open_impl(const std::string& path,
             mz_zip_reader_end(&zip);
             io_error("doc_open: invalid .step+ archive metadata");
         }
-        if (mode != NativeReadMode::Open && !entry_names.insert(st.m_filename).second) {
+        if (mode != NativeReadMode::Open && !read_only && !entry_names.insert(st.m_filename).second) {
             mz_zip_reader_end(&zip);
             io_error("native file operation: duplicate archive entry");
         }
-        if (mode != NativeReadMode::Open &&
+        if (mode != NativeReadMode::Open && !read_only &&
             mz_zip_reader_get_filename(&zip, i, nullptr, 0) > sizeof(st.m_filename))
             io_error("native file operation: archive entry name is too long to preserve");
         if (st.m_is_directory && mode != NativeReadMode::Relocate) continue;
@@ -471,7 +472,9 @@ static StepPlusDoc editable_container_open_impl(const std::string& path,
         mz_zip_reader_end(&zip);
         io_error(std::string("doc_open: bad document.json: ") + e.what());
     }
-    if (mode == NativeReadMode::Metadata) {
+    if (mode == NativeReadMode::Metadata || mode == NativeReadMode::Document ||
+        (mode == NativeReadMode::Component &&
+         result.doc.value("schema", std::string()) == "aicad.asm/1")) {
         mz_zip_reader_end(&zip);
         return result;
     }
@@ -483,6 +486,8 @@ static StepPlusDoc editable_container_open_impl(const std::string& path,
         if (!mz_zip_reader_file_stat(&zip, i, &st)) continue;
         const std::string name = st.m_filename;
         if (st.m_is_directory && mode != NativeReadMode::Relocate) continue;
+        if (mode == NativeReadMode::Component && name != "cache.json" && name != "cache.brep")
+            continue;
         if (mode == NativeReadMode::Relocate) {
             if (name == "meta.json" || name == "document.json") continue;
             if (is_geometry_cache(name)) {
@@ -506,7 +511,7 @@ static StepPlusDoc editable_container_open_impl(const std::string& path,
         // STORED entries (method 0 — e.g. cache.aicm) carry the persisted-geometry mesh. Extract
         // them raw with MZ_ZIP_FLAG_COMPRESSED_DATA so miniz skips BOTH inflate and CRC; for a
         // STORED entry the compressed bytes are the data. Allocate the destination exactly once.
-        const mz_uint flags = (mode == NativeReadMode::Open && st.m_method == 0)
+        const mz_uint flags = ((mode == NativeReadMode::Open || read_only) && st.m_method == 0)
                                  ? MZ_ZIP_FLAG_COMPRESSED_DATA : 0;
         std::string data(static_cast<std::size_t>(st.m_uncomp_size), '\0');
         if (!data.empty() &&
@@ -532,6 +537,16 @@ StepPlusDoc editable_container_open(const std::string& path,
 
 StepPlusDoc stepplus_open(const std::string& path) {
     return editable_container_open(path, "aicad.step+/", ".step+");
+}
+
+json stepplus_read_document(const std::string& path) {
+    return editable_container_open_impl(path, "aicad.step+/", ".step+",
+                                        NativeReadMode::Document).doc;
+}
+
+StepPlusDoc stepplus_open_component(const std::string& path) {
+    return editable_container_open_impl(path, "aicad.step+/", ".step+",
+                                        NativeReadMode::Component);
 }
 
 namespace {

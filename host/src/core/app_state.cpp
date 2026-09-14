@@ -3064,10 +3064,6 @@ void setActiveProjectDir(AppState& st, const std::string& absDir) {
     st.pushRecentProject(absDir);
     st.activeWorkspace = AppState::Workspace::PLM;
     ui::plmInvalidate();         // drop PLM caches → refetch against the new dir
-    // Capture drift since last session (files copied in / edited outside). Best
-    // effort — a failure must never block the switch.
-    nlohmann::json p;
-    p["path"] = absDir;
-    p["project_dir"] = absDir;
-    st.rpc.call("plm_record_outside", p, [](const core::RpcResult&) {});
+    // The PLM hub records outside changes once when it adopts this project.
+    // Scheduling it here too repeats the full working-tree scan before loading.
 }

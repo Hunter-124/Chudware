@@ -205,7 +205,12 @@ struct PlmHubState {
 
     // items (Files page)
     int         itemsGen = -1; bool itemsLoading = false; std::string itemsErr;
+    std::string itemsProjectDir;         // also consumed by the quickbar outside PLM
     std::vector<PlmItemRow> items;
+    unsigned long long itemsRevision = 0; // changes only when the row vector is replaced
+    unsigned long long filesViewRevision = 0;
+    int filesViewFilter = -1, filesViewSort = -1;
+    std::vector<size_t> filesView;        // filtered/sorted indices, never dangling pointers
     std::string selectedItem;
     int         kindFilter = 0;           // 0 = all; else index into a filter list
     int         sortMode   = 0;           // Files sort: 0 name,1 type,2 rev,3 status,4 unsaved
@@ -228,6 +233,7 @@ struct PlmHubState {
 
     // planning (Planning/Issues pages)
     int         planGen = -1; bool planLoading = false; std::string planErr;
+    int planPending = 0;
     std::vector<PlmTaskRow>      allTasks;
     std::vector<PlmIssueRow>     issues;
     std::vector<PlmMilestoneRow> milestones;
@@ -244,6 +250,9 @@ struct PlmHubState {
 
     // git (Git page) — real git / GitHub client
     int         gitGen = -1; bool gitLoading = false; std::string gitErr;
+    int gitPending = 0;
+    int gitDetailsGen = -1, gitDetailsPending = 0;
+    bool gitDetailsLoading = false;
     bool        gitIsRepo = false; bool gitMissing = false;
     std::string gitBranch, gitUpstream;
     int         gitAhead = 0, gitBehind = 0; bool gitClean = true;
@@ -253,6 +262,7 @@ struct PlmHubState {
     std::vector<PlmGitBranchRow>  gitBranches;
     std::vector<PlmGitRemoteRow>  gitRemotes;
     std::vector<std::string>      gitTree;           // tracked files (code browser)
+    unsigned long long gitTreeRevision = 0;
     std::string gitSelectedFile, gitFileContent;     // selected file + its content
     bool        gitFileTruncated = false;
     // GitHub (gh) side
@@ -340,7 +350,7 @@ void        plmEnsureWhereUsed(AppState& st);   // fetches for g_plmHub.wuTarget
 void        plmEnsureVersionGraph(AppState& st);
 void        plmEnsurePlanning(AppState& st);
 void        plmEnsureSettings(AppState& st);
-void        plmEnsureGit(AppState& st);
+void        plmEnsureGit(AppState& st, bool details = true);
 void        plmEnsureTeam(AppState& st);     // remotes + advisory locks (plm_status)
 // The shared location that lock/presence actions run against: the first
 // non-reserved remote advertising advisory locks (nullptr = none configured).

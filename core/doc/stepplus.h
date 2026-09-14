@@ -40,6 +40,14 @@ std::string stepplus_save(const nlohmann::json& doc, const std::string& path,
 // Read a .step+ container at `path`. Validates the container version (major == 1).
 // Throws OpError("io_error", ...) if the file is missing/corrupt or not a .step+ .
 StepPlusDoc stepplus_open(const std::string& path);
+
+// Read-only component/dependency consumers never resave the returned payload.
+// These retain normal-open archive admission checks but skip unrelated payload I/O.
+// Document reads return only document.json; component reads additionally return the
+// solved cache.json/cache.brep entries for parts (assemblies rebuild descendants).
+// Use stepplus_open for editable sessions so unknown entries survive a later save.
+nlohmann::json stepplus_read_document(const std::string& path);
+StepPlusDoc stepplus_open_component(const std::string& path);
 // Shared editable-container machinery used by .step+ and standalone .draw+.
 // `container` is the exact meta.json identity (for example "aicad.draw+/1");
 // `kind` is the meta.json document kind. `expected_prefix` includes the trailing

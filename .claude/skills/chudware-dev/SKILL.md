@@ -281,6 +281,17 @@ judgment).
   save/reopen must not redefine zero; exact-current-value sweeps must not apply
   the current angle twice. Legacy binding preserves first-observed interpretation,
   not a reconstructed original datum.
+- **Assembly loading retains geometry, not discarded component display packets (2026-09-13).**
+  `compile_document(..., quality, with_display=false)` is the assembly-only lane:
+  it keeps exact per-body Fine triangulation through shared `geom::mesh_body`, but
+  skips AICM extraction/serialization and display stats. The default remains true;
+  compile-cache identity includes the mode. Do not remove the initial meshing:
+  compound-relative deflections can otherwise coarsen small bodies. Selective
+  `stepplus_read_document` / `stepplus_open_component` avoid unrelated ZIP payloads;
+  ordinary editable `stepplus_open` still preserves them. Session assembly display
+  reuse keys on result identity, revision, quality and explode state. A
+  `preserve_path` save republishes the same handoff URI from a scratch session, so
+  it must invalidate the live display cache even without a revision change.
 - **Assemblies report honestly (2026-09-08).** `doc_bbox` / `eval_mass` / native import
   gather assembly world solids; `describe_part` states the body count; `save_part` /
   `export_part` refuse an empty document (`allow_empty`); `check_interference` refuses an

@@ -229,6 +229,31 @@ def test_untrack_keeps_history(tmp_path):
     v.close()
 
 
+def test_item_history_retains_empty_creation_and_tree_renames(tmp_path):
+    source = tmp_path / "firmware"
+    source.mkdir()
+    v = Vault.open(tmp_path)
+    try:
+        item = v.add_item("firmware", doc_type="software")
+        iid = item["item_id"]
+        created = v._bind.head_commit()
+        v.checkpoint("metadata-only checkpoint")
+        (source / "a.txt").write_text("same bytes\n")
+        populated = v.checkpoint("add source")["commit"]
+        (source / "a.txt").rename(source / "b.txt")
+        renamed = v.checkpoint("rename source")["commit"]
+        v.plan("create", "task", data={"title": "Review firmware"})
+        v.checkpoint("no content change")
+        entries = v.history(iid)
+        assert [entry["commit"] for entry in entries] == [renamed, populated, created]
+        assert v.history(iid, limit=1) == entries[:1]
+        assert v.history(iid, scope="all") == entries
+        v.untrack_item(iid)
+        assert v.history(iid) == entries
+    finally:
+        v.close()
+
+
 def test_link_repo_reference_only(tmp_path):
     v = Vault.open(tmp_path)
     item = v.link_repo("git@example.com:fw.git", "Firmware")

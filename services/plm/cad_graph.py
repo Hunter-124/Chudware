@@ -12,7 +12,7 @@ Kinds (edges): CONTAINS|DEPENDS_ON|MATES|INSTANCE_OF|REFERENCES|DERIVES_FROM|
                DOCUMENTS|SIMULATES|MANUFACTURES
 
 ``origin`` is always ``extracted`` (deterministic from doc data) or
-``inferred`` (heuristic). Cache lives at ``<project>/.plm/graph.json`` and is
+``inferred`` (heuristic). Cache lives at ``<project>/.plm/graph.json.gz`` and is
 keyed by source-file mtimes; recompute is always allowed.
 
 Walk policy
@@ -40,11 +40,14 @@ calls after a successful checkpoint (best-effort; never raises into AI-VC).
 """
 from __future__ import annotations
 
+import gzip
 import hashlib
 import io
+import zlib
 import json
 import os
 import re
+import tempfile
 import time
 import zipfile
 from concurrent.futures import ThreadPoolExecutor
@@ -63,11 +66,10 @@ _MULTIBODY_MAX = 2
 DEFAULT_MAX_NODES = 5000
 DEFAULT_MAX_EDGES = 10000
 
-# Reject an on-disk cache larger than this BEFORE parsing it. A legacy/corrupt
-# cache (built before meta was bounded) can be hundreds of MB and block the
-# worker thread for minutes inside json.loads. Over the cap → treat as invalid
-# and rebuild (the rebuild overwrites it via _save_cache).
-MAX_CACHE_BYTES = 64 * 1024 * 1024  # 64 MiB
+# Bound both stored and expanded cache bytes before JSON parsing. Compression
+# keeps legitimate large graphs cacheable without dropping any nodes or edges.
+MAX_CACHE_BYTES = 64 * 1024 * 1024
+MAX_CACHE_EXPANDED_BYTES = 1024 * 1024 * 1024
 # Cap how many co-owners of the same bare dim+value form a complete
 # REFERENCES clique. Without this, a common bool/flag (merge=true across
 # hundreds of extrudes) emits O(n²) edges and bloats the on-disk cache.
@@ -216,12 +218,20 @@ def build_graph(
     if (not force and root is not None
             and not (open_docs or {})):
         cached = _load_cache_if_valid(
-            root, sources=None,
+            root,
             include_archive=include_archive,
             archive_names=sorted(archive_names),
         )
         if cached is not None:
             return cached
+
+    # Freshness tracks every candidate, even files excluded by the existing
+    # display cap or currently unreadable containers. Otherwise a large project
+    # writes a keyset its own fast scan can never validate. Capture BEFORE reads
+    # so a concurrent edit invalidates the next request rather than going stale.
+    source_states: dict[str, list[int]] = {}
+    source_mtimes = (_source_mtimes_fast(root, skip_names=skip_names,
+                                        source_states=source_states) if root else {})
 
     sources = _collect_sources(
         root, open_docs or {}, skip_names=skip_names,
@@ -236,14 +246,6 @@ def build_graph(
         if len(file_recs) > MAX_FILE_NODES:
             files_truncated = len(file_recs) - MAX_FILE_NODES
             file_recs = file_recs[:MAX_FILE_NODES]
-    if not force and root is not None:
-        cached = _load_cache_if_valid(
-            root, sources + file_recs,
-            include_archive=include_archive,
-            archive_names=sorted(archive_names),
-        )
-        if cached is not None:
-            return cached
 
     nodes: list[dict[str, Any]] = []
     edges: list[dict[str, Any]] = []
@@ -270,7 +272,7 @@ def build_graph(
             return
         edges.append({
             "src": src, "dst": dst, "kind": kind,
-            "meta": _sanitize_meta(meta or {}), "origin": origin,
+            "meta": meta or {}, "origin": origin,
         })
         if kind == "DEPENDS_ON":
             dep_pairs.add((src, dst))
@@ -905,8 +907,10 @@ def build_graph(
         "edges": edges,
         "generated_at": generated_at,
         "project_dir": str(root) if root else None,
-        "mtimes": {s["key"]: s["mtime"]
-                   for s in (sources + file_recs) if s.get("key")},
+        "mtimes": {**source_mtimes,
+                   **{s["key"]: s["mtime"] for s in sources
+                      if str(s.get("key", "")).startswith("open:")}},
+        "source_states": source_states,
         "filter": {
             "include_archive": bool(include_archive),
             "exclude_dirs": sorted(archive_names),
@@ -964,12 +968,16 @@ def get_graph(
         root = Path(project_dir)
         cp = _cache_path(root)
         try:
-            cache_mtime = cp.stat().st_mtime if cp.is_file() else 0.0
+            cache_stat = cp.stat()
+            cache_mtime = cache_stat.st_mtime
+            cache_mtime_ns = cache_stat.st_mtime_ns
         except OSError:
             cache_mtime = 0.0
+            cache_mtime_ns = 0
         if cache_mtime > 0.0:
             skip = _skip_dir_names(include_archive=include_archive)
-            fast = _source_mtimes_fast(root, skip_names=skip)
+            source_states: dict[str, list[int]] = {}
+            fast = _source_mtimes_fast(root, skip_names=skip, source_states=source_states)
             newest = max(fast.values()) if fast else 0.0
             n_files = sum(1 for k in fast
                           if not str(k).startswith("overlay:")
@@ -977,6 +985,7 @@ def get_graph(
             count_ok = (if_sources_count is None
                         or n_files == int(if_sources_count))
             if (cache_mtime + 1e-6 >= newest
+                    and all(state[1] <= cache_mtime_ns for state in source_states.values())
                     and abs(newest - float(if_mtimes_max)) <= 1e-6
                     and count_ok):
                 return {"ok": True, "unchanged": True,
@@ -1674,14 +1683,14 @@ def on_ai_vc_checkpoint(
 def invalidate_cache(project_dir: str | os.PathLike) -> None:
     """Drop the on-disk cache so the next get rebuilds.
 
-    The old cache is kept as ``graph.prev.json`` (renamed, not deleted) so
+    The old cache is kept as ``graph.prev.json.gz`` (renamed, not deleted) so
     :func:`load_cached_graph` still has a "before" snapshot for change-diffs
     after an overlay mutation.
     """
     p = _cache_path(Path(project_dir))
     try:
         if p.is_file():
-            prev = p.with_name("graph.prev.json")
+            prev = p.with_name("graph.prev.json.gz")
             try:
                 p.replace(prev)
             except OSError:
@@ -1777,11 +1786,9 @@ def _read_container(path: Path) -> tuple[dict | None, list[str], str | None]:
     changes — the freshness signal preview/thumbnail caches key on
     (surfaced as meta.dh on the doc node)."""
     try:
-        raw = path.read_bytes()
-    except OSError:
-        return None, [], None
-    try:
-        with zipfile.ZipFile(io.BytesIO(raw)) as zf:
+        # ZIP seeks directly to document.json; never copy cached geometry or
+        # simulation payloads just to inspect the design recipe.
+        with zipfile.ZipFile(path) as zf:
             names = zf.namelist()
             if "document.json" not in names:
                 return None, [], None
@@ -1850,7 +1857,13 @@ def _manifest_items_by_path(root: Path) -> dict[str, dict[str, Any]]:
     """
     try:
         from services.plm.vault import Vault
-        m = Vault.open(root).manifest()
+        if not Vault.exists(root):
+            return {}
+        v = Vault.open(root)
+        try:
+            m = v.manifest()
+        finally:
+            v.close()
         return {str(it.get("path") or ""): it
                 for it in (m.get("items") or []) if it.get("path")}
     except Exception:  # noqa: BLE001
@@ -1971,10 +1984,32 @@ def _walk_project_folders(
 
 
 def _cache_path(root: Path) -> Path:
-    return root / ".plm" / "graph.json"
+    return root / ".plm" / "graph.json.gz"
 
 
-def _overlay_mtime(root: Path) -> float:
+def _read_cache(path: Path) -> dict[str, Any] | None:
+    """Decode a bounded compressed cache; legacy JSON caches rebuild once."""
+    try:
+        with path.open("rb") as stream:
+            raw = stream.read(MAX_CACHE_BYTES + 1)
+        if len(raw) > MAX_CACHE_BYTES:
+            return None
+        with gzip.GzipFile(fileobj=io.BytesIO(raw)) as stream:
+            expanded = stream.read(MAX_CACHE_EXPANDED_BYTES + 1)
+        if len(expanded) > MAX_CACHE_EXPANDED_BYTES:
+            return None
+        data = json.loads(expanded)
+        return data if isinstance(data, dict) else None
+    except (OSError, EOFError, ValueError, zlib.error):
+        return None
+
+
+def _source_state(st: os.stat_result) -> list[int]:
+    """JSON-stable file identity, including permission and metadata changes."""
+    return [st.st_mtime_ns, st.st_ctime_ns, st.st_size, st.st_ino, st.st_mode]
+
+
+def _overlay_mtime(root: Path, source_states: dict[str, list[int]] | None = None) -> float:
     """Newest mtime across the graph overlays (0 when all absent).
 
     graph_links / keywords / graph_config all change the built graph, so all
@@ -1986,7 +2021,10 @@ def _overlay_mtime(root: Path) -> float:
         p = root / ".plm" / name
         try:
             if p.is_file():
-                newest = max(newest, p.stat().st_mtime)
+                st = p.stat()
+                newest = max(newest, st.st_mtime)
+                if source_states is not None:
+                    source_states[f"overlay:{name}"] = _source_state(st)
         except OSError:
             continue
     return newest
@@ -1996,6 +2034,7 @@ def _source_mtimes_fast(
     root: Path,
     *,
     skip_names: frozenset[str],
+    source_states: dict[str, list[int]] | None = None,
 ) -> dict[str, float]:
     """Scan source container + file-node mtimes without reading zip contents.
 
@@ -2003,6 +2042,9 @@ def _source_mtimes_fast(
     on-disk graph without re-parsing every .step+. File-node sources
     (contracts/cad_graph.md file-node addendum) share the ``file:<rel>`` key
     namespace — containers always end .step+/.ecad+, file nodes never do.
+    When requested, source_states records stronger stat identity from the same
+    scan, so restoring access to an unreadable file invalidates its cached
+    omission even when its content mtime has not changed.
     """
     out: dict[str, float] = {}
     if not root.is_dir():
@@ -2020,11 +2062,15 @@ def _source_mtimes_fast(
             fp = Path(dirpath) / fn
             try:
                 rel = str(fp.relative_to(root)).replace("\\", "/")
-                out[f"file:{rel}"] = fp.stat().st_mtime
+                st = fp.stat()
+                key = f"file:{rel}"
+                out[key] = st.st_mtime
+                if source_states is not None:
+                    source_states[key] = _source_state(st)
             except OSError:
                 continue
     # overlays participate in invalidation (mutations also invalidate_cache)
-    om = _overlay_mtime(root)
+    om = _overlay_mtime(root, source_states)
     if om > 0:
         out["overlay:graph_links"] = om
     return out
@@ -2057,97 +2103,36 @@ def _filter_matches(
 
 def _load_cache_if_valid(
     root: Path,
-    sources: list[dict[str, Any]] | None = None,
     *,
     include_archive: bool = False,
     archive_names: list[str] | None = None,
 ) -> dict | None:
-    """Return cached graph when still valid.
-
-    Fast path: if cache mtime is newer than every source .step+/.ecad+ (and
-    the overlay) under the same skip policy, serve without re-reading
-    containers. Falls back to the full key-set mtime compare when *sources*
-    is supplied (normal build_graph path already collected them).
-    """
+    """Validate the complete source fingerprint before serving a cached graph."""
     cp = _cache_path(root)
-    if not cp.is_file():
-        return None
     try:
         st = cp.stat()
-        cache_mtime = st.st_mtime
     except OSError:
         return None
-    # Guard BOTH parse paths below: never json.loads a pathologically large
-    # cache. Over the cap → invalid → caller rebuilds.
     if st.st_size > MAX_CACHE_BYTES:
         return None
-
     skip = _skip_dir_names(
-        include_archive=include_archive,
-        exclude_dirs=archive_names,
-    )
-
-    # --- fast path: cache fresher than all source files --------------------
-    try:
-        fast_mtimes = _source_mtimes_fast(root, skip_names=skip)
-        newest_src = max(fast_mtimes.values()) if fast_mtimes else 0.0
-        if cache_mtime + 1e-6 >= newest_src:
-            data = json.loads(cp.read_text(encoding="utf-8"))
-            if not isinstance(data, dict):
-                return None
-            if not _filter_matches(
-                    data, include_archive=include_archive,
-                    archive_names=archive_names):
-                return None
-            cached_mtimes = data.get("mtimes") or {}
-            # Prefer caller-supplied sources; else the fast mtime scan.
-            if sources is not None:
-                current = {s["key"]: s["mtime"] for s in sources if s.get("key")}
-            else:
-                current = dict(fast_mtimes)
-            cached_files = {k: v for k, v in cached_mtimes.items()
-                            if not str(k).startswith("overlay:")
-                            and not str(k).startswith("open:")}
-            current_files = {k: v for k, v in current.items()
-                             if not str(k).startswith("overlay:")
-                             and not str(k).startswith("open:")}
-            if set(cached_files) != set(current_files):
-                return None
-            for k, mt in current_files.items():
-                if abs(float(cached_files.get(k, -1)) - float(mt)) > 1e-6:
-                    return None
-            data["ok"] = True
-            return data
-    except Exception:  # noqa: BLE001
-        # fall through to full parse path
-        pass
-
-    # --- full path: parse cache + compare recorded mtimes ------------------
-    try:
-        data = json.loads(cp.read_text(encoding="utf-8"))
-    except Exception:  # noqa: BLE001
+        include_archive=include_archive, exclude_dirs=archive_names)
+    source_states: dict[str, list[int]] = {}
+    current = _source_mtimes_fast(root, skip_names=skip, source_states=source_states)
+    if st.st_mtime + 1e-6 < max(current.values(), default=0.0):
         return None
-    if not isinstance(data, dict):
+    data = _read_cache(cp)
+    if data is None or not _filter_matches(
+            data, include_archive=include_archive, archive_names=archive_names):
         return None
-    if not _filter_matches(
-            data, include_archive=include_archive,
-            archive_names=archive_names):
+    if data.get("source_states") != source_states:
         return None
-    cached_mtimes = data.get("mtimes") or {}
-    if sources is None:
+    cached = {k: v for k, v in (data.get("mtimes") or {}).items()
+              if not str(k).startswith("open:")}
+    if cached.keys() != current.keys():
         return None
-    current = {s["key"]: s["mtime"] for s in sources if s.get("key")}
-    # ignore open: keys for durable cache equality (ephemeral)
-    cached_cmp = {k: v for k, v in cached_mtimes.items()
-                  if not str(k).startswith("open:")
-                  and not str(k).startswith("overlay:")}
-    current_cmp = {k: v for k, v in current.items()
-                   if not str(k).startswith("open:")}
-    if set(cached_cmp) != set(current_cmp):
+    if any(abs(float(cached[k]) - float(mt)) > 1e-6 for k, mt in current.items()):
         return None
-    for k, mt in current_cmp.items():
-        if abs(float(cached_cmp.get(k, -1)) - float(mt)) > 1e-6:
-            return None
     data["ok"] = True
     return data
 
@@ -2156,16 +2141,16 @@ def load_cached_graph(project_dir: str | os.PathLike) -> dict[str, Any] | None:
     """Read the on-disk cached graph as-is (no validity check), else None.
 
     Used by the change-diff RPC: the cached graph is the "before" snapshot a
-    fresh rebuild is compared against. Falls back to ``graph.prev.json`` —
+    fresh rebuild is compared against. Falls back to ``graph.prev.json.gz`` —
     :func:`invalidate_cache` renames the cache there so a mutation doesn't
     destroy the baseline. Size-guarded like the cache loader.
     """
     root = Path(project_dir)
-    for cp in (_cache_path(root), root / ".plm" / "graph.prev.json"):
+    for cp in (_cache_path(root), root / ".plm" / "graph.prev.json.gz"):
         try:
             if not cp.is_file() or cp.stat().st_size > MAX_CACHE_BYTES:
                 continue
-            data = json.loads(cp.read_text(encoding="utf-8"))
+            data = _read_cache(cp)
             if isinstance(data, dict):
                 return data
         except Exception:  # noqa: BLE001
@@ -2176,24 +2161,31 @@ def load_cached_graph(project_dir: str | os.PathLike) -> dict[str, Any] | None:
 def _save_cache(root: Path, graph: dict[str, Any]) -> None:
     """Atomic cache write (tmp + os.replace). Never leaves a partial file."""
     cp = _cache_path(root)
+    tmp: Path | None = None
     try:
         cp.parent.mkdir(parents=True, exist_ok=True)
-        tmp = cp.with_name(cp.name + ".tmp")
-        payload = json.dumps(graph, sort_keys=True, indent=2, default=str)
+        payload = json.dumps(graph, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
+        if len(payload) > MAX_CACHE_EXPANDED_BYTES:
+            return
         # write + fsync so a crash mid-write can't leave a half file that
         # rename would then promote.
-        with open(tmp, "w", encoding="utf-8") as fh:
-            fh.write(payload)
+        with tempfile.NamedTemporaryFile(mode="wb", dir=cp.parent,
+                                         prefix=cp.name + ".", suffix=".tmp", delete=False) as fh:
+            tmp = Path(fh.name)
+            with gzip.GzipFile(fileobj=fh, mode="wb", compresslevel=1, mtime=0) as compressed:
+                compressed.write(payload)
             fh.flush()
             try:
                 os.fsync(fh.fileno())
             except OSError:
                 pass
+        if tmp.stat().st_size > MAX_CACHE_BYTES:
+            tmp.unlink()
+            return
         os.replace(tmp, cp)
     except OSError:
         try:
-            tmp = cp.with_name(cp.name + ".tmp")
-            if tmp.is_file():
+            if tmp is not None and tmp.is_file():
                 tmp.unlink()
         except OSError:
             pass

@@ -56,6 +56,12 @@ bool display_quality_parse(const std::string& name, DisplayQuality& out);
 // renders and the GUI in the same process agree.
 DisplayQuality default_display_quality();
 
+// Populate the same per-face triangulations as tessellate_body, without extracting
+// or allocating an AICM packet. Component compilers retain these exact meshes for
+// the final assembly display pass rather than serializing discarded part packets.
+DisplayDeflections mesh_body(const TopoDS_Shape& shape, double lin_deflection = 0.0,
+                              double ang_deflection = 0.35);
+
 // Tessellate one OCCT shape into an AICM body.
 //   lin_deflection / ang_deflection : BRepMesh tolerances (mm, radians).
 //   lin_deflection <= 0 (the default) selects the size-relative auto value

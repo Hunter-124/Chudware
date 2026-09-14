@@ -240,6 +240,18 @@ struct IntegrityMemo {
     std::map<std::pair<std::size_t, std::size_t>, IntegrityPairMetrics> pairs;
 };
 
+// Reuse an already published assembly display while its geometry and view are unchanged.
+// Bytes remain owned by the handoff cache, not duplicated in every document session.
+struct AssemblyDisplay {
+    std::weak_ptr<AssemblyResult> source;
+    long revision = -1;
+    ::geom::DisplayQuality quality = ::geom::default_display_quality();
+    bool exploded = false;
+    double factor = 0.0;
+    std::string path;
+    json bodies;
+};
+
 struct Session {
     // T-PERF5: per-doc mutex. Locked by DocLock::acquire / require_session; never
     // touched while holding g_registry_mtx (pin-then-lock). Non-copyable/non-movable
@@ -287,6 +299,7 @@ struct Session {
     // C20 — assembly state. asm_result is the last assembly compile; asm_warm seeds the
     // next mate solve; explode_active/explode_factor drive tessellation-time offsets.
     std::shared_ptr<AssemblyResult> asm_result;        // nullptr until first assembly rebuild
+    AssemblyDisplay asm_display;
     chudware::mate::WarmMap asm_warm;
     bool explode_active = false;
     double explode_factor = 1.0;
@@ -4416,6 +4429,19 @@ void invalidate_warm_for_authored_poses(Session& s, const json& doc_after, const
 // assembly's cache.aicm without re-tessellating.
 std::pair<std::string, json> write_aicm_assembly(Session& s,
                                                  std::vector<uint8_t>* blob_out = nullptr) {
+    auto& display = s.asm_display;
+    if (s.asm_result && display.source.lock() == s.asm_result &&
+        display.revision == s.revision && display.quality == s.display_quality &&
+        display.exploded == s.explode_active &&
+        (!s.explode_active || display.factor == s.explode_factor)) {
+        chudware::aicm_handoff::Mapping mapped;
+        std::string error;
+        if (chudware::aicm_handoff::map(display.path, mapped, error)) {
+            if (blob_out) blob_out->assign(mapped.data, mapped.data + mapped.size);
+            chudware::aicm_handoff::unmap(mapped);
+            return {display.path, display.bodies};
+        }
+    }
     json bodies_meta = json::array();
     std::vector<aicm::AicmBody> tesses;
     std::map<std::string, Eigen::Vector3d> offsets;
@@ -4517,6 +4543,9 @@ std::pair<std::string, json> write_aicm_assembly(Session& s,
         aicm::write_aicm_file(target.string(), tesses);
         path = std::filesystem::absolute(target).string();
     }
+    if (!path.empty() && s.asm_result)
+        display = {s.asm_result, s.revision, s.display_quality, s.explode_active,
+                   s.explode_factor, path, bodies_meta};
     return {path, bodies_meta};
 }
 
@@ -13492,6 +13521,9 @@ json doc_save(const std::string& doc_id, const std::string& path, bool preserve_
     Session& live = require_session(doc_id);
     std::unique_ptr<Session> snapshot;
     if (preserve_path) {
+        // Snapshot tessellation republishes this doc/revision without its live
+        // exploded view. The live display must be regenerated on next activation.
+        live.asm_display.source.reset();
         snapshot = std::make_unique<Session>();
         seed_cached_scratch(*snapshot, live);
         // Do not copy large caches only to erase them below. All other embedded

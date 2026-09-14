@@ -190,6 +190,26 @@ DisplayQuality default_display_quality() {
     return q;
 }
 
+DisplayDeflections mesh_body(const TopoDS_Shape& shape, double lin_deflection, double ang_deflection) {
+    // Use exactly the display mesher settings for both standalone parts and
+    // assembly components. In particular, retain the smooth-render angular clamp.
+    const double eff_ang = (ang_deflection > 0.0)
+                               ? std::min(ang_deflection, kDisplayMaxAngularDeflection)
+                               : kDisplayMaxAngularDeflection;
+    const double eff_lin =
+        (lin_deflection > 0.0) ? lin_deflection : auto_linear_deflection(shape);
+    // BRepMesh is face-incremental: already matching triangulations are retained.
+    const auto start = std::chrono::steady_clock::now();
+    BRepMesh_IncrementalMesh mesher(shape, eff_lin, Standard_False,
+                                    eff_ang, Standard_True);
+    mesher.Perform();
+    g_tess_mesh_ns.fetch_add(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - start).count(), std::memory_order_relaxed);
+    g_tess_bodies.fetch_add(1, std::memory_order_relaxed);
+    return {eff_lin, eff_ang};
+}
+
 aicm::AicmBody tessellate_body(const TopoDS_Shape& shape, uint32_t body_id,
                                const std::string& name, const float color[3],
                                double lin_deflection, double ang_deflection,
@@ -203,30 +223,7 @@ aicm::AicmBody tessellate_body(const TopoDS_Shape& shape, uint32_t body_id,
     body.metallic = metallic;
     body.roughness = roughness;
 
-    // Smooth-render clamp (display path): never let a curved face facet worse than
-    // kDisplayMaxAngularDeflection. A coarse caller angular value (the 0.35 rad default) would
-    // otherwise render a faceted cylinder; a FINER request passes through unchanged. Linear
-    // deflection: an explicit positive caller value is used as-is; the <=0 default selects
-    // the size-relative auto value (auto_linear_deflection) so huge parts don't mesh at a
-    // fixed 0.05 mm — the angular term is the one that was binding on curved faces.
-    const double eff_ang = (ang_deflection > 0.0)
-                               ? std::min(ang_deflection, kDisplayMaxAngularDeflection)
-                               : kDisplayMaxAngularDeflection;
-    const double eff_lin =
-        (lin_deflection > 0.0) ? lin_deflection : auto_linear_deflection(shape);
-
-    // Mesh the shape (parallel, absolute deflection) — same call as tessellate.py.
-    // BRepMesh is face-incremental: a face whose TShape already carries a matching
-    // triangulation is skipped, so on a downstream edit only the changed faces re-mesh.
-    const auto _mesh_t0 = std::chrono::steady_clock::now();
-    BRepMesh_IncrementalMesh mesher(shape, eff_lin, Standard_False,
-                                    eff_ang, Standard_True);
-    mesher.Perform();
-    const auto _mesh_t1 = std::chrono::steady_clock::now();
-    g_tess_mesh_ns.fetch_add(
-        std::chrono::duration_cast<std::chrono::nanoseconds>(_mesh_t1 - _mesh_t0).count(),
-        std::memory_order_relaxed);
-    g_tess_bodies.fetch_add(1, std::memory_order_relaxed);
+    const auto deflections = mesh_body(shape, lin_deflection, ang_deflection);
 
     // Everything past meshing — the topology index maps + the triangle/edge/vertex
     // extraction — is the "extract" cost (distinct from BRepMesh above).
@@ -350,7 +347,7 @@ aicm::AicmBody tessellate_body(const TopoDS_Shape& shape, uint32_t body_id,
         if (pts.empty()) {
             try {
                 BRepAdaptor_Curve crv(edge);
-                GCPnts_TangentialDeflection disc(crv, eff_lin, eff_ang);
+                GCPnts_TangentialDeflection disc(crv, deflections.lin, deflections.ang);
                 for (int ni = 1; ni <= disc.NbPoints(); ++ni) {
                     gp_Pnt p = disc.Value(ni);
                     pts.push_back(static_cast<float>(p.X()));

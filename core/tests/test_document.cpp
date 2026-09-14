@@ -71,6 +71,7 @@
 #include "doc/session.h"   // doc_new/doc_apply_ops (top-level-option hoist regression)
 #include "doc/stepplus.h"  // stepplus_save (craft a persisted broken-import doc on disk)
 #include "aicm_loader.h"  // host loader (host/src/render on the include path)
+#include "util/aicm_handoff.h"
 
 using json = nlohmann::json;
 using chudware::doc::CompileResult;
@@ -2425,6 +2426,54 @@ TEST_CASE("doc_apply_ops mesh response opt-out preserves assembly poses and diag
     CHECK(hi[0] == doctest::Approx(50.0));
     CHECK(hi[1] == doctest::Approx(70.0));
     CHECK(hi[2] == doctest::Approx(90.0));
+}
+
+TEST_CASE("assembly display reuse follows explode changes and released handoffs") {
+    using namespace chudware::doc;
+    const std::string seed = doc_new("assembly", "DisplayReuse").at("doc_id");
+    const auto dir = std::filesystem::temp_directory_path() / seed;
+    std::filesystem::create_directories(dir);
+    struct Cleanup {
+        std::filesystem::path dir;
+        ~Cleanup() { std::error_code ec; std::filesystem::remove_all(dir, ec); }
+    } cleanup{dir};
+    const auto source = dir / "block.brep";
+    REQUIRE(BRepTools::Write(BRepPrimAPI_MakeBox(10, 20, 30).Shape(), source.string().c_str()));
+    const auto path = dir / "assembly.step+";
+    stepplus_save(json{
+        {"schema", "aicad.asm/1"}, {"name", "DisplayReuse"},
+        {"components", json::array({
+            {{"id", "block"}, {"source", {{"path", source.string()}}}, {"fixed", true}}
+        })},
+        {"mates", json::array()},
+        {"explode", json::array({
+            {{"component", "block"}, {"vector", {1, 0, 0}}, {"distance", 100.0}}
+        })}
+    }, path.string(), {});
+    const json opened = doc_open(path.string());
+    const std::string id = opened.at("doc_id");
+    auto check_display = [&](const json& response, double x) {
+        render::DocMesh mesh;
+        std::string error;
+        REQUIRE_MESSAGE(render::loadAicmFile(response.at("tess").at("aicm_path"), mesh, error), error);
+        REQUIRE(mesh.bodies.size() == 1);
+        double lo[3], hi[3];
+        bbox(mesh.bodies[0], lo, hi);
+        CHECK(lo[0] == doctest::Approx(x));
+        CHECK(hi[0] == doctest::Approx(x + 10.0));
+        CHECK(response.at("revision") == opened.at("revision"));
+    };
+    check_display(doc_activate(id), 0.0);
+    check_display(doc_set_explode_state(id, true, 0.5), 50.0);
+    doc_save(id, (dir / "autosave.step+").string(), true);
+    check_display(doc_activate(id), 50.0);
+    check_display(doc_activate(id), 50.0);
+    check_display(doc_set_explode_state(id, true, 1.0), 100.0);
+    check_display(doc_set_explode_state(id, false, 1.0), 0.0);
+    chudware::aicm_handoff::release_doc(id);
+    check_display(doc_activate(id), 0.0);
+    doc_close(id);
+    doc_close(seed);
 }
 
 // P0 DEADLOCK REGRESSION: a rejected op batch must NOT leave the process-global session

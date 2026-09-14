@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cctype>
+#include <chrono>
 #include <cmath>
 #include <cstdlib>
 #include <filesystem>
@@ -66,18 +67,19 @@ struct LoadedComponent {
     TopoDS_Shape compound;                        // compound_of(bodies), built ONCE — a stable
                                                   // TShape so downstream per-shape caches
                                                   // (assembly tess cache) hit across rebuilds
-    std::vector<TopoInfo> faces;                  // across all bodies, flat
-    std::vector<TopoInfo> edges;
-    std::vector<TopoInfo> verts;
-    std::vector<TopoDS_Shape> face_shapes;        // parallel kernel faces (analytic mate datums)
-    std::vector<TopoDS_Shape> edge_shapes;
+    mutable std::once_flag faces_once, edges_once, verts_once;
+    mutable std::vector<TopoInfo> faces;          // populated only for mate resolution
+    mutable std::vector<TopoInfo> edges;
+    mutable std::vector<TopoInfo> verts;
+    mutable std::vector<TopoDS_Shape> face_shapes;
+    mutable std::vector<TopoDS_Shape> edge_shapes;
     std::vector<aicm::AppearanceRegion> appearance_regions;  // compound face IDs, not bodies
     std::string error;                          // incomplete source; surviving geometry retained
 };
 
-// Keyed by abspath:mtime. Values are shared_future-of-shared_ptr so concurrent loaders of
-// the SAME file share one load (first caller populates, the rest wait), while loads of
-// DIFFERENT files run fully in parallel — the mutex only guards the map itself.
+// Keyed by resolved path + exact file identity (+ current descendants for native files).
+// Shared futures single-flight top-level loads; recursive loads never wait on an
+// unfinished future, since its owner may itself be waiting on this branch.
 std::mutex g_cache_mtx;
 std::map<std::string, std::shared_future<std::shared_ptr<const LoadedComponent>>> g_load_cache;
 
@@ -123,9 +125,44 @@ json env_from_doc(const json& doc) {
     return env;
 }
 
-// Nested loads bypass the shared-future cache: waiting on an ancestor's promise
-// would deadlock on a reference cycle. Assemblies are not cached by their own
-// mtime, because a referenced descendant can change independently.
+// Embedded imports are self-contained. Legacy imports read source_path directly
+// (relative to the process directory, matching compile_document, not the container).
+std::vector<std::string> external_import_paths(const json& doc) {
+    std::vector<std::string> paths;
+    if (!doc.contains("features") || !doc["features"].is_array()) return paths;
+    const json* features = &doc["features"];
+    const auto* config = resolve_active_config(doc).second;
+    json configured;
+    if (config && ((config->contains("param_overrides") && !(*config)["param_overrides"].empty()) ||
+                   (config->contains("suppressions") && !(*config)["suppressions"].empty()))) {
+        configured = config_effective_features(*features, config);
+        features = &configured;
+    }
+    for (const auto& feature : *features) {
+        if (!feature.is_object() || !feature.contains("type") || feature["type"] != "import")
+            continue;
+        const auto& params = feature.contains("params") && feature["params"].is_object()
+                                 ? feature["params"] : feature;
+        if ((feature.contains("suppressed") && feature["suppressed"] == true) ||
+            (params.contains("suppressed") && params["suppressed"] == true)) continue;
+        const auto field = [&](const char* key) -> const json* {
+            auto it = params.find(key);
+            if (it != params.end()) return &*it;
+            it = feature.find(key);
+            return it == feature.end() ? nullptr : &*it;
+        };
+        const auto* embedded = field("embedded_brep");
+        if (embedded && embedded->is_string() &&
+            !embedded->get_ref<const std::string&>().empty()) continue;
+        const auto* path = field("source_path");
+        if (path && path->is_string() && !path->get_ref<const std::string&>().empty())
+            paths.push_back(path->get_ref<const std::string&>());
+    }
+    return paths;
+}
+
+// The recursion stack crosses synchronous nested assembly loads. Check it before
+// consulting shared cache entries, including entries completed by a different root.
 thread_local std::vector<std::string> loading_paths;
 
 void append_load_error(std::string& error, const std::string& detail) {
@@ -135,7 +172,7 @@ void append_load_error(std::string& error, const std::string& detail) {
 
 // Load local-frame solids for a component file (port of assembly.py::_load_bodies).
 std::vector<TopoDS_Shape> load_bodies(
-    const std::string& abspath, bool& cacheable,
+    const std::string& abspath,
     std::vector<std::vector<aicm::AppearanceRegion>>& appearances, std::string& error) {
     const std::string canonical = std::filesystem::weakly_canonical(abspath).string();
     if (std::find(loading_paths.begin(), loading_paths.end(), canonical) != loading_paths.end())
@@ -145,9 +182,8 @@ std::vector<TopoDS_Shape> load_bodies(
     struct PopPath { ~PopPath() { loading_paths.pop_back(); } } pop_path;
     const std::string low = lower(abspath);
     if (ends_with(low, ".step+") || ends_with(low, ".stepplus")) {
-        StepPlusDoc loaded = stepplus_open(abspath);  // throws OpError on a bad file
+        StepPlusDoc loaded = stepplus_open_component(abspath);  // throws on a bad file
         if (loaded.doc.value("schema", std::string()) == "aicad.asm/1") {
-            cacheable = false;
             AssemblyResult ar = compile_assembly(
                 loaded.doc, std::filesystem::path(abspath).parent_path().string());
             for (const AsmComponentStatus& st : ar.component_status)
@@ -213,7 +249,7 @@ std::vector<TopoDS_Shape> load_bodies(
         // header. When the engine key + doc hash still match, those bodies ARE the exact
         // compile_document output — load them directly and skip the rebuild AND the re-mesh.
         // Any mismatch/corruption falls through to the full compile.
-        {
+        if (external_import_paths(loaded.doc).empty()) {
             auto cj = loaded.extra.find("cache.json");
             auto cb = loaded.extra.find("cache.brep");
             if (cj != loaded.extra.end() && cb != loaded.extra.end()) {
@@ -232,7 +268,8 @@ std::vector<TopoDS_Shape> load_bodies(
                 } catch (...) { /* stale/corrupt cache -> full compile below */ }
             }
         }
-        CompileResult r = compile_document(loaded.doc, env_from_doc(loaded.doc));
+        CompileResult r = compile_document(loaded.doc, env_from_doc(loaded.doc), nullptr,
+                                           ::geom::DisplayQuality::Fine, false);
         for (const FeatureStatus& st : r.statuses)
             if (!st.ok)
                 append_load_error(error, "feature '" + st.id + "' in '" + abspath +
@@ -258,13 +295,13 @@ std::vector<TopoDS_Shape> load_bodies(
 
 TopoDS_Shape compound_of(const std::vector<TopoDS_Shape>& bodies);  // defined below
 
-// Describe every face/edge/vertex of the component's bodies (local frame) for mate
-// resolution (port of assembly.py::_describe_component). Flat across all bodies in
-// body order; indices re-numbered contiguously.
-LoadedComponent describe_component(
+// Build the stable local compound and its appearance-face identity map. Analytic
+// descriptions are deferred until a mate selector needs them.
+std::shared_ptr<const LoadedComponent> describe_component(
     std::vector<TopoDS_Shape> bodies,
     const std::vector<std::vector<aicm::AppearanceRegion>>& appearances, std::string error) {
-    LoadedComponent lc;
+    auto result = std::make_shared<LoadedComponent>();
+    LoadedComponent& lc = *result;
     lc.bodies = std::move(bodies);
     lc.error = std::move(error);
     lc.compound = compound_of(lc.bodies);
@@ -310,54 +347,99 @@ LoadedComponent describe_component(
             assigned_faces = compound_id;
         }
     }
-    int fidx = 0, eidx = 0, vidx = 0;
-    for (const TopoDS_Shape& bo : lc.bodies) {
-        std::vector<TopoInfo> faces = describe_faces(bo);
-        for (TopoInfo& info : faces) { info.index = fidx; info.hint_index = fidx; ++fidx; }
-        // parallel kernel faces (TopExp order matches describe_faces)
-        for (TopExp_Explorer ex(bo, TopAbs_FACE); ex.More(); ex.Next())
-            lc.face_shapes.push_back(ex.Current());
-        lc.faces.insert(lc.faces.end(), faces.begin(), faces.end());
+    return result;
+}
 
-        std::vector<TopoInfo> edges = describe_edges(bo);
-        for (TopoInfo& info : edges) { info.index = eidx; info.hint_index = eidx; ++eidx; }
-        for (TopExp_Explorer ex(bo, TopAbs_EDGE); ex.More(); ex.Next())
-            lc.edge_shapes.push_back(ex.Current());
-        lc.edges.insert(lc.edges.end(), edges.begin(), edges.end());
+// Analytic face/edge/vertex descriptions are expensive and have no display use.
+// Repeated components share this once-only work only when a mate actually needs it.
+void ensure_component_topology(const LoadedComponent& lc, const std::string& kind) {
+    // A face mate never needs edge/vertex descriptions. Keep each kind once-only
+    // independently so later edits can request additional kinds without rebuilding.
+    if (kind == "face") std::call_once(lc.faces_once, [&] {
+        // call_once permits retry after an exception: discard partial descriptions.
+        lc.faces.clear(); lc.face_shapes.clear();
+        int index = 0;
+        for (const TopoDS_Shape& bo : lc.bodies) {
+            auto faces = describe_faces(bo);
+            for (auto& info : faces) { info.index = index; info.hint_index = index; ++index; }
+            for (TopExp_Explorer ex(bo, TopAbs_FACE); ex.More(); ex.Next())
+                lc.face_shapes.push_back(ex.Current());
+            lc.faces.insert(lc.faces.end(), faces.begin(), faces.end());
+        }
+    });
+    if (kind == "edge") std::call_once(lc.edges_once, [&] {
+        lc.edges.clear(); lc.edge_shapes.clear();
+        int index = 0;
+        for (const TopoDS_Shape& bo : lc.bodies) {
+            auto edges = describe_edges(bo);
+            for (auto& info : edges) { info.index = index; info.hint_index = index; ++index; }
+            for (TopExp_Explorer ex(bo, TopAbs_EDGE); ex.More(); ex.Next())
+                lc.edge_shapes.push_back(ex.Current());
+            lc.edges.insert(lc.edges.end(), edges.begin(), edges.end());
+        }
+    });
+    if (kind == "vertex") std::call_once(lc.verts_once, [&] {
+        lc.verts.clear();
+        int index = 0;
+        for (const TopoDS_Shape& bo : lc.bodies) {
+            auto verts = describe_vertices(bo);
+            for (auto& info : verts) { info.index = index; info.hint_index = index; ++index; }
+            lc.verts.insert(lc.verts.end(), verts.begin(), verts.end());
+        }
+    });
+}
 
-        std::vector<TopoInfo> verts = describe_vertices(bo);
-        for (TopoInfo& info : verts) { info.index = vidx; info.hint_index = vidx; ++vidx; }
-        lc.verts.insert(lc.verts.end(), verts.begin(), verts.end());
+std::string component_file_stamp(const std::string& abspath) {
+    std::error_code ec;
+    const auto time = std::filesystem::last_write_time(abspath, ec);
+    const auto mtime = ec ? 0 : time.time_since_epoch().count();
+    const auto bytes = std::filesystem::file_size(abspath, ec);
+    return std::to_string(mtime) + ":" + std::to_string(ec ? 0 : bytes);
+}
+
+// Cache only the parsed source, never a traversal result: every fingerprint request
+// still stats every descendant, so edits below an unchanged assembly invalidate it.
+std::shared_ptr<const json> component_document(const std::string& path) {
+    struct Entry { std::string stamp; std::shared_ptr<const json> doc; };
+    static std::map<std::string, Entry> cache;
+    const std::string stamp = component_file_stamp(path);
+    {
+        std::lock_guard<std::mutex> lock(g_cache_mtx);
+        auto it = cache.find(path);
+        if (it != cache.end() && it->second.stamp == stamp) return it->second.doc;
     }
-    return lc;
+    auto doc = std::make_shared<const json>(stepplus_read_document(path));
+    if (component_file_stamp(path) == stamp) {
+        std::lock_guard<std::mutex> lock(g_cache_mtx);
+        cache[path] = {stamp, doc};
+    }
+    return doc;
 }
 
 std::string component_cache_key(const std::string& abspath) {
-    double mtime = 0.0;
-    std::error_code ec;
-    auto ftime = std::filesystem::last_write_time(abspath, ec);
-    if (!ec) mtime = static_cast<double>(ftime.time_since_epoch().count());
-    return abspath + ":" + std::to_string(static_cast<long long>(mtime));
+    std::string key = abspath + ":" + component_file_stamp(abspath);
+    const std::string low = lower(abspath);
+    if (ends_with(low, ".step+") || ends_with(low, ".stepplus")) {
+        const auto doc = component_document(abspath);
+        if (doc->value("schema", std::string()) == "aicad.asm/1" ||
+            !external_import_paths(*doc).empty())
+            key += ":" + asm_component_fingerprints(
+                *doc, std::filesystem::path(abspath).parent_path().string()).dump();
+    }
+    return key;
 }
 
 std::shared_ptr<const LoadedComponent> load_component(const std::string& path,
                                                      const std::string& base_dir) {
-    const std::string abspath = resolve_source_path(path, base_dir);
-    if (!loading_paths.empty()) {
-        bool cacheable = false;
-        std::vector<std::vector<aicm::AppearanceRegion>> appearances;
-        std::string error;
-        auto bodies = load_bodies(abspath, cacheable, appearances, error);
-        return std::make_shared<const LoadedComponent>(
-            describe_component(std::move(bodies), appearances, std::move(error)));
-    }
+    // Preserve the caller's directory when resolving a symlinked assembly's
+    // relative children. Canonical identity is only for cycle detection.
+    const std::string abspath = std::filesystem::absolute(
+        resolve_source_path(path, base_dir)).string();
+    const std::string canonical = std::filesystem::weakly_canonical(abspath).string();
+    if (std::find(loading_paths.begin(), loading_paths.end(), canonical) != loading_paths.end())
+        throw OpError("import_failed", "cyclic component reference: " + canonical,
+                      {{"path", canonical}});
     const std::string key = component_cache_key(abspath);
-
-    // WHY: find-or-install-a-placeholder happens in ONE g_cache_mtx acquisition below (no
-    // check-then-insert gap) — the first caller for this key installs a promise and loads
-    // OUTSIDE the lock; every concurrent caller for the SAME key copies the shared_future
-    // (never a bare reference into the map) WHILE STILL HOLDING the lock, then waits on
-    // that copy instead of loading twice. Loads of DIFFERENT keys still run fully in parallel.
     std::shared_future<std::shared_ptr<const LoadedComponent>> fut;
     std::shared_ptr<std::promise<std::shared_ptr<const LoadedComponent>>> mine;
     {
@@ -370,14 +452,22 @@ std::shared_ptr<const LoadedComponent> load_component(const std::string& path,
             fut = g_load_cache[key] = mine->get_future().share();
         }
     }
+    auto load = [&] {
+        std::vector<std::vector<aicm::AppearanceRegion>> appearances;
+        std::string error;
+        auto bodies = load_bodies(abspath, appearances, error);
+        return describe_component(std::move(bodies), appearances, std::move(error));
+    };
+    // A→B and B→A can be owned by different prefetch workers. An unfinished
+    // recursive hit must load locally (the path stack reports the eventual cycle),
+    // not wait. Finished values, including leaf parts, are safe to share everywhere.
+    if (!mine && !loading_paths.empty() &&
+        fut.wait_for(std::chrono::seconds(0)) != std::future_status::ready)
+        return load();
     if (mine) {
         try {
-            bool cacheable = true;
-            std::vector<std::vector<aicm::AppearanceRegion>> appearances;
-            std::string error;
-            auto bodies = load_bodies(abspath, cacheable, appearances, error);
-            auto lc = std::make_shared<const LoadedComponent>(
-                describe_component(std::move(bodies), appearances, std::move(error)));
+            auto lc = load();
+            const bool cacheable = lc->error.empty() && component_cache_key(abspath) == key;
             mine->set_value(lc);
             if (!cacheable) {
                 std::lock_guard<std::mutex> lk(g_cache_mtx);
@@ -385,13 +475,11 @@ std::shared_ptr<const LoadedComponent> load_component(const std::string& path,
             }
         } catch (...) {
             mine->set_exception(std::current_exception());
-            // A failed load is NOT cached (pre-existing semantics: a fixed file re-loads).
-            // Waiters already holding `fut` still get the exception; the map just forgets it.
             std::lock_guard<std::mutex> lk(g_cache_mtx);
             g_load_cache.erase(key);
         }
     }
-    return fut.get();  // pins uncached nested assemblies through their caller's solve
+    return fut.get();
 }
 
 // ---------------------------------------------------------------- mate-ref geometry
@@ -412,6 +500,7 @@ double bbox_diag(const std::vector<TopoDS_Shape>& bodies) {
 bool selector_to_mategeom(const json& selector, const LoadedComponent& lc,
                           chudware::mate::MateGeom& out) {
     const std::string kind = selector.value("kind", std::string());
+    ensure_component_topology(lc, kind);
     double diag = bbox_diag(lc.bodies);
 
     if (kind == "face") {
@@ -750,25 +839,41 @@ AssemblyResult compile_assembly(const json& doc, const std::string& base_dir,
     const json mates = (doc.contains("mates") && doc["mates"].is_array())
                            ? doc["mates"] : json::array();
 
+    std::map<std::string, std::set<std::string>> mate_components;
+    for (const auto& mate : mates) {
+        if (mate.value("suppressed", false) || !mate.contains("refs") || !mate["refs"].is_array())
+            continue;
+        for (const auto& ref : mate["refs"])
+            if (ref.is_object() && ref.contains("selector") && ref["selector"].is_object())
+                mate_components[ref.value("component", std::string())].insert(
+                    ref["selector"].value("kind", std::string()));
+    }
     // --- load every component -------------------------------------------
     // Prefetch pass: components are independent, so uncached loads (compile or cache.brep
-    // decode, both CPU-bound) run in parallel worker threads; the per-key shared_future in
-    // load_component dedups same-file components. The serial loop below then hits the cache.
+    // decode, both CPU-bound) run in bounded top-level worker threads. Repeated
+    // source paths share both successful loads and failures within this compilation.
     // Kill-switch: CHUDWARE_ASM_PARALLEL_LOAD=0.
     std::map<std::string, std::shared_ptr<const LoadedComponent>> prefetched;
+    std::map<std::string, std::exception_ptr> prefetch_errors;
     {
         const char* env = std::getenv("CHUDWARE_ASM_PARALLEL_LOAD");
         const bool par = loading_paths.empty() && !(env && env[0] == '0');
         if (par && components.size() > 1) {
             std::vector<std::string> paths;
+            std::set<std::string> unique_paths;
+            std::map<std::string, std::set<std::string>> mate_paths;
             for (const json& comp : components) {
                 const std::string p = comp.contains("source") && comp["source"].is_object()
                                           ? comp["source"].value("path", std::string())
                                           : std::string();
-                if (!p.empty()) paths.push_back(p);
+                if (!p.empty() && unique_paths.insert(p).second) paths.push_back(p);
+                const auto needed = mate_components.find(comp.value("id", std::string()));
+                if (needed != mate_components.end())
+                    mate_paths[p].insert(needed->second.begin(), needed->second.end());
             }
             const unsigned hw = std::max(2u, std::thread::hardware_concurrency());
             std::vector<std::shared_ptr<const LoadedComponent>> pins(paths.size());
+            std::vector<std::exception_ptr> errors(paths.size());
             const std::size_t n_workers = std::min<std::size_t>(paths.size(), hw);
             std::atomic<std::size_t> next{0};
             std::vector<std::thread> pool;
@@ -778,13 +883,20 @@ AssemblyResult compile_assembly(const json& doc, const std::string& base_dir,
                     for (std::size_t i = next.fetch_add(1); i < paths.size();
                          i = next.fetch_add(1)) {
                         try {
-                            pins[i] = load_component(paths[i], base_dir);
-                        } catch (...) { /* reported per-component in the serial loop */ }
+                            auto component = load_component(paths[i], base_dir);
+                            const auto needed = mate_paths.find(paths[i]);
+                            if (needed != mate_paths.end())
+                                for (const auto& kind : needed->second)
+                                    ensure_component_topology(*component, kind);
+                            pins[i] = std::move(component);
+                        } catch (...) { errors[i] = std::current_exception(); }
                     }
                 });
             for (std::thread& t : pool) t.join();
-            for (std::size_t i = 0; i < paths.size(); ++i)
+            for (std::size_t i = 0; i < paths.size(); ++i) {
                 if (pins[i]) prefetched.emplace(paths[i], std::move(pins[i]));
+                else if (errors[i]) prefetch_errors.emplace(paths[i], errors[i]);
+            }
         }
     }
     std::map<std::string, std::shared_ptr<const LoadedComponent>> loaded;
@@ -799,9 +911,16 @@ AssemblyResult compile_assembly(const json& doc, const std::string& base_dir,
             if (path.empty())
                 throw OpError("import_failed", "component '" + cid + "' has no source.path",
                               {{"component", cid}});
+            auto failure = prefetch_errors.find(path);
+            if (failure != prefetch_errors.end()) std::rethrow_exception(failure->second);
             auto ready = prefetched.find(path);
-            loaded[cid] = ready == prefetched.end() ? load_component(path, base_dir)
-                                                    : ready->second;
+            if (ready == prefetched.end())
+                ready = prefetched.emplace(path, load_component(path, base_dir)).first;
+            const auto needed = mate_components.find(cid);
+            if (needed != mate_components.end())
+                for (const auto& kind : needed->second)
+                    ensure_component_topology(*ready->second, kind);
+            loaded[cid] = ready->second;
             st.ok = loaded[cid]->error.empty();
             if (!st.ok) st.error = loaded[cid]->error;
         } catch (const std::exception& exc) {
@@ -939,40 +1058,49 @@ AssemblyResult compile_assembly(const json& doc, const std::string& base_dir,
 
 json asm_component_fingerprints(const json& doc, const std::string& base_dir) {
     json fp = json::array();
+    auto append_path = [&](const std::string& abspath) {
+        uint64_t size = 0;
+        long long mtime = 0;
+        std::error_code ec;
+        auto sz = std::filesystem::file_size(abspath, ec);
+        if (!ec) size = static_cast<uint64_t>(sz);
+        auto ft = std::filesystem::last_write_time(abspath, ec);
+        if (!ec) mtime = static_cast<long long>(ft.time_since_epoch().count());
+        fp.push_back({{"path", abspath}, {"size", size}, {"mtime", mtime}});
+    };
     auto append_components = [&](const json& assembly, const std::string& directory) {
-        if (!assembly.contains("components") || !assembly["components"].is_array()) return;
+        if (assembly.contains("components") && assembly["components"].is_array())
         for (const json& c : assembly["components"]) {
             if (c.value("suppressed", false)) continue;
             const std::string path = c.contains("source") && c["source"].is_object()
                                          ? c["source"].value("path", std::string())
                                          : std::string();
-            const std::string abspath = path.empty() ? path : resolve_source_path(path, directory);
-            uint64_t size = 0;
-            long long mtime = 0;
-            std::error_code ec;
-            auto sz = std::filesystem::file_size(abspath, ec);
-            if (!ec) size = static_cast<uint64_t>(sz);
-            auto ft = std::filesystem::last_write_time(abspath, ec);
-            if (!ec) mtime = static_cast<long long>(ft.time_since_epoch().count());
-            fp.push_back({{"path", abspath}, {"size", size}, {"mtime", mtime}});
+            append_path(path.empty() ? path : resolve_source_path(path, directory));
         }
+        for (const auto& path : external_import_paths(assembly))
+            append_path(resolve_source_path(path, {}));
     };
     append_components(doc, base_dir);
     // Keep the original direct-component rows first, then append descendant rows in
     // breadth-first order. A child assembly's own mtime cannot fingerprint its sources.
-    // Repeated/cyclic references still have a row, but each source is traversed only once.
-    std::set<std::string> visited;
+    // A file symlink can open the same JSON in different relative-source directories.
+    // Visit each canonical file + canonical parent context once; directory aliases
+    // collapse, but distinct adjacent part files remain independent dependencies.
+    std::set<std::pair<std::string, std::string>> visited;
     for (size_t i = 0; i < fp.size(); ++i) {
         const std::string path = fp[i].at("path").get<std::string>();
         const std::string low = lower(path);
         if (!ends_with(low, ".step+") && !ends_with(low, ".stepplus")) continue;
         std::error_code ec;
         const auto canonical = std::filesystem::weakly_canonical(path, ec);
-        if (!visited.insert(ec ? path : canonical.string()).second) continue;
+        const std::string identity = ec ? path : canonical.string();
+        const auto parent = std::filesystem::weakly_canonical(
+            std::filesystem::path(path).parent_path(), ec);
+        if (!visited.emplace(identity, ec ? std::filesystem::path(path).parent_path().string()
+                                          : parent.string()).second) continue;
         try {
-            const StepPlusDoc child = stepplus_open(path);
-            if (child.doc.value("schema", std::string()) == "aicad.asm/1")
-                append_components(child.doc, std::filesystem::path(path).parent_path().string());
+            const auto child = component_document(identity);
+            append_components(*child, std::filesystem::path(path).parent_path().string());
         } catch (...) {
             // Missing/unreadable sources retain their direct row (including zero size/mtime).
             // Compilation reports their component error; fingerprinting never hides them.

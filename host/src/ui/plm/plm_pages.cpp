@@ -390,7 +390,7 @@ void plmDrawOverviewPage(AppState& st) {
     auto& H = g_plmHub;
     const float S = ui::uiScale;
     plmEnsureOverview(st);
-    plmEnsureGit(st);
+    plmEnsureGit(st, false);
     plmEnsurePlanning(st);
 
     if (!H.ovErr.empty()) { plmError(H.ovErr); return; }
@@ -928,29 +928,37 @@ void drawFilesTab(AppState& st) {
     if (H.itemsLoading && H.items.empty()) { plmSpinner("Loading"); endList(); return; }
     if (!H.itemsErr.empty()) { plmError(H.itemsErr); endList(); return; }
 
-    // build a filtered + sorted view (pointers into H.items — no copies)
-    std::vector<const PlmItemRow*> view;
-    view.reserve(H.items.size());
-    for (const auto& it : H.items)
-        if (passesFilter(it, H.kindFilter)) view.push_back(&it);
-    std::stable_sort(view.begin(), view.end(),
-        [&](const PlmItemRow* a, const PlmItemRow* b) {
+    // Rebuild only when rows or controls change, not on every rendered frame.
+    if (H.filesViewRevision != H.itemsRevision ||
+        H.filesViewFilter != H.kindFilter || H.filesViewSort != H.sortMode) {
+        auto& view = H.filesView;
+        view.clear();
+        view.reserve(H.items.size());
+        for (size_t i = 0; i < H.items.size(); ++i)
+            if (passesFilter(H.items[i], H.kindFilter)) view.push_back(i);
+        std::stable_sort(view.begin(), view.end(), [&](size_t ai, size_t bi) {
+            const auto& a = H.items[ai];
+            const auto& b = H.items[bi];
             switch (H.sortMode) {
-                case 1: return a->kind + a->docType < b->kind + b->docType;
+                case 1: return a.kind + a.docType < b.kind + b.docType;
                 case 2: {  // revision, highest first
-                    const std::string& ra = !a->rev.empty() ? a->rev : a->workingRev;
-                    const std::string& rb = !b->rev.empty() ? b->rev : b->workingRev;
+                    const std::string& ra = !a.rev.empty() ? a.rev : a.workingRev;
+                    const std::string& rb = !b.rev.empty() ? b.rev : b.workingRev;
                     return ra > rb;
                 }
-                case 3: return a->lifecycle < b->lifecycle;
-                case 4: return a->dirty > b->dirty;   // unsaved first
-                default: return a->path < b->path;    // name A→Z
+                case 3: return a.lifecycle < b.lifecycle;
+                case 4: return a.dirty > b.dirty;
+                default: return a.path < b.path;
             }
         });
+        H.filesViewRevision = H.itemsRevision;
+        H.filesViewFilter = H.kindFilter;
+        H.filesViewSort = H.sortMode;
+    }
 
     int shown = 0;
-    for (const PlmItemRow* itp : view) {
-        const auto& it = *itp;
+    for (size_t index : H.filesView) {
+        const auto& it = H.items[index];
         ++shown;
         ImGui::PushID(it.itemId.c_str());
         bool sel = (H.selectedItem == it.itemId);
@@ -1118,19 +1126,16 @@ void plmDrawHistoryPage(AppState& st) {
             }
             ImGui::EndCombo();
         }
-        // person choices are the people actually present in the cached rows
-        std::vector<std::string> authors;
-        for (const auto& e : H.history)
-            if (!e.author.empty() &&
-                std::find(authors.begin(), authors.end(), e.author) == authors.end())
-                authors.push_back(e.author);
-        std::sort(authors.begin(), authors.end());
+        // Derive choices only while the picker is open.
         ImGui::SameLine();
         if (ImGui::GetContentRegionAvail().x < authW + 8 * S) ImGui::NewLine();
         ImGui::SetNextItemWidth(authW);
         if (ImGui::BeginCombo("##hist_author",
                 H.histAuthorFilter.empty() ? "Anyone"
                                            : H.histAuthorFilter.c_str())) {
+            std::set<std::string> authors;
+            for (const auto& e : H.history)
+                if (!e.author.empty()) authors.insert(e.author);
             if (ImGui::Selectable("Anyone", H.histAuthorFilter.empty()))
                 H.histAuthorFilter.clear();
             for (const auto& a : authors)
@@ -1275,7 +1280,7 @@ void plmDrawReleasesPage(AppState& st) {
     auto& H = g_plmHub;
     const float S = ui::uiScale;
     plmEnsureItems(st);
-    plmEnsureGit(st);        // so releases can surface git activity too
+    plmEnsureGit(st, false); // releases consume status/history, not the Git browser
 
     plmSectionHeader("Releases", "ok_badge");
     dimText("Stamp the next revision and freeze the design.");
@@ -2748,19 +2753,24 @@ void plmDrawGitPage(AppState& st) {
         ImGui::BeginChild("##git_files", ImVec2(listW, innerH - headerH), ImGuiChildFlags_Borders);
         ui::popGlassChildStyle();
         if (H.gitTree.empty()) {
-            dimText(H.gitLoading ? "Loading\xe2\x80\xa6" : "No tracked files yet.");
+            dimText(H.gitDetailsLoading ? "Loading\xe2\x80\xa6" : "No tracked files yet.");
         } else {
             struct Node { std::map<std::string, Node> dirs; std::vector<std::string> files; };
-            Node root;
-            for (const auto& path : H.gitTree) {
-                Node* cur = &root;
-                size_t start = 0;
-                for (;;) {
-                    size_t slash = path.find('/', start);
-                    if (slash == std::string::npos) { cur->files.push_back(path.substr(start)); break; }
-                    cur = &cur->dirs[path.substr(start, slash - start)];
-                    start = slash + 1;
+            static Node root;
+            static unsigned long long treeRevision = 0;
+            if (treeRevision != H.gitTreeRevision) {
+                root = Node{};
+                for (const auto& path : H.gitTree) {
+                    Node* cur = &root;
+                    size_t start = 0;
+                    for (;;) {
+                        size_t slash = path.find('/', start);
+                        if (slash == std::string::npos) { cur->files.push_back(path.substr(start)); break; }
+                        cur = &cur->dirs[path.substr(start, slash - start)];
+                        start = slash + 1;
+                    }
                 }
+                treeRevision = H.gitTreeRevision;
             }
             static std::set<std::string> s_open;   // expanded folders (full path + '/')
             // Folders and files each carry one consistent hue — folders yellow-green,

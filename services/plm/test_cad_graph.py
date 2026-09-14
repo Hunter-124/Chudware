@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import io
 import json
+import gzip
 import os
 import time
 import zipfile
@@ -225,7 +226,7 @@ def test_build_graph_nodes_and_edges(project: Path):
     assert refs, "expected shared-dim REFERENCES edges"
     assert any(e.get("meta", {}).get("dim") in ("wall", "hole_d") for e in refs)
 
-    cache = project / ".plm" / "graph.json"
+    cache = project / ".plm" / "graph.json.gz"
     assert cache.is_file()
 
 
@@ -313,7 +314,7 @@ def test_open_docs_merge(tmp_path: Path):
 
 
 def test_on_ai_vc_checkpoint_hook(project: Path):
-    cache = project / ".plm" / "graph.json"
+    cache = project / ".plm" / "graph.json.gz"
     if cache.exists():
         cache.unlink()
     cad_graph.on_ai_vc_checkpoint(project_dir=str(project), doc_id="uuid-part-a")
@@ -635,13 +636,11 @@ def test_get_graph_truncation_caps(project: Path):
 def test_cache_fast_path_serves_without_rescan(project: Path):
     """Warm cache with matching filter is served on the next non-force build."""
     g1 = cad_graph.build_graph(project, force=True)
-    t1 = g1["generated_at"]
-    assert (project / ".plm" / "graph.json").is_file()
-    assert "filter" in g1
 
     g2 = cad_graph.build_graph(project, force=False)
-    assert g2["generated_at"] == t1
-    assert g2["filter"]["include_archive"] is False
+    assert g2["nodes"] == g1["nodes"]
+    assert g2["edges"] == g1["edges"]
+    assert g2["filter"] == g1["filter"]
 
     # flipping include_archive must miss the default cache
     g3 = cad_graph.build_graph(project, force=False, include_archive=True)
@@ -656,8 +655,9 @@ def test_path_is_archive_helper():
     assert not cad_graph.path_is_archive(None)
 
 
-def test_oversized_cache_bypassed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    """Cache files over MAX_CACHE_BYTES are ignored and rebuilt, not json.loads'd."""
+@pytest.mark.parametrize("limit", ["MAX_CACHE_BYTES", "MAX_CACHE_EXPANDED_BYTES"])
+def test_oversized_cache_bypassed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, limit):
+    """Stored and expanded byte limits reject an unsafe cache without losing the graph."""
     _write(tmp_path, "Part.step+", {
         "schema": "aicad.part/1", "id": "p-oversized", "name": "Part",
         "features": [{"id": "f1", "type": "box", "name": "Box",
@@ -665,19 +665,82 @@ def test_oversized_cache_bypassed(tmp_path: Path, monkeypatch: pytest.MonkeyPatc
     })
     plm = tmp_path / ".plm"
     plm.mkdir()
-    bloated = plm / "graph.json"
-    # Bigger than the monkeypatched cap; must never be parsed.
-    bloated.write_bytes(b'{"ok": true, "pad": "' + (b"x" * 200) + b'"}')
-    assert bloated.stat().st_size > 100
-    monkeypatch.setattr(cad_graph, "MAX_CACHE_BYTES", 100)
+    bloated = plm / "graph.json.gz"
+    bloated.write_bytes(gzip.compress(json.dumps({"nodes": [{"id": "unsafe"}],
+                                                "pad": "x" * 1000}).encode()))
+    monkeypatch.setattr(cad_graph, limit, 50)
+    assert cad_graph.load_cached_graph(tmp_path) is None
 
     g = cad_graph.build_graph(tmp_path, force=False)
     assert g["ok"] is True
     assert any(n["kind"] == "part" for n in g["nodes"])
-    # rebuild overwrote the bloated cache with a sane one
-    new_size = (tmp_path / ".plm" / "graph.json").stat().st_size
-    assert new_size <= 256 * 1024
-    assert new_size < bloated.stat().st_size or True  # rewritten; just bound size
+
+
+def test_corrupt_deflate_cache_rebuilds_project_graph(project: Path):
+    expected = cad_graph.build_graph(project, force=True)
+    # Valid gzip header followed by a reserved DEFLATE block type: zlib.error,
+    # not gzip.BadGzipFile, EOFError or JSONDecodeError.
+    (project / ".plm" / "graph.json.gz").write_bytes(
+        bytes.fromhex("1f8b0800000000000003") + b"\x07" + b"\x00" * 8)
+    assert cad_graph.load_cached_graph(project) is None
+    rebuilt = cad_graph.build_graph(project)
+    assert rebuilt["nodes"] == expected["nodes"]
+    assert rebuilt["edges"] == expected["edges"]
+
+
+def test_cache_fingerprint_includes_capped_files_and_unreadable_containers(tmp_path, monkeypatch):
+    monkeypatch.setattr(cad_graph, "MAX_FILE_NODES", 2)
+    for name in ("a.txt", "b.txt", "c.txt", "d.txt"):
+        (tmp_path / name).write_text(name)
+    (tmp_path / "Broken.step+").write_bytes(b"not yet a valid container")
+    graph = cad_graph.build_graph(tmp_path)
+    assert graph["files_truncated"] == 2
+    cached = cad_graph._load_cache_if_valid(tmp_path)
+    assert cached is not None
+    assert cached["nodes"] == graph["nodes"]
+    assert cached["edges"] == graph["edges"]
+    # An old-mtime addition still invalidates and changes the visible capped set.
+    stamp = (tmp_path / "a.txt").stat()
+    (tmp_path / "0.txt").write_text("new first file")
+    os.utime(tmp_path / "0.txt", ns=(stamp.st_atime_ns, stamp.st_mtime_ns))
+    changed = cad_graph.build_graph(tmp_path)
+    assert "file:0.txt" in {node["id"] for node in changed["nodes"]}
+    assert changed["files_truncated"] == 3
+
+
+def test_restoring_container_permission_invalidates_cache_and_change_probe(tmp_path, monkeypatch):
+    _write(tmp_path, "Part.step+", {
+        "schema": "aicad.part/1", "id": "permission-part", "name": "Part",
+        "features": [{"id": "f1", "type": "box", "params": {"w": 1}}],
+    })
+    path = tmp_path / "Part.step+"
+    real_read = cad_graph._read_container
+
+    def permission_aware_read(candidate):
+        # Deterministic even when the test runner can bypass filesystem permissions.
+        if candidate.stat().st_mode & 0o400 == 0:
+            return None, [], None
+        return real_read(candidate)
+
+    monkeypatch.setattr(cad_graph, "_read_container", permission_aware_read)
+    path.chmod(0o000)
+    try:
+        before = cad_graph.get_graph(tmp_path)
+        assert not any(node["kind"] == "part" for node in before["nodes"])
+        stamp = path.stat()
+        assert cad_graph._load_cache_if_valid(tmp_path) is not None
+        path.chmod(0o600)
+        assert path.stat().st_mtime_ns == stamp.st_mtime_ns
+        assert cad_graph._load_cache_if_valid(tmp_path) is None
+        after = cad_graph.get_graph(
+            tmp_path, if_mtimes_max=before["sources_mtime_max"],
+            if_sources_count=before["sources_count"])
+        assert after.get("unchanged") is not True
+        assert "doc:Part.step+" in {node["id"] for node in after["nodes"]}
+        assert after["sources_mtime_max"] == before["sources_mtime_max"]
+        assert after["sources_count"] == before["sources_count"]
+    finally:
+        path.chmod(0o600)
 
 
 def test_meta_bounding_caps():
@@ -938,9 +1001,9 @@ def test_invalidate_keeps_prev_baseline(project: Path):
     g1 = cad_graph.get_graph(project)  # warm cache
     assert cad_graph.load_cached_graph(project) is not None
     cad_graph.invalidate_cache(project)
-    prev = project / ".plm" / "graph.prev.json"
+    prev = project / ".plm" / "graph.prev.json.gz"
     assert prev.is_file()
-    assert not (project / ".plm" / "graph.json").exists()
+    assert not (project / ".plm" / "graph.json.gz").exists()
     old = cad_graph.load_cached_graph(project)
     assert old is not None
     assert len(old.get("nodes") or []) == len(g1["nodes"])

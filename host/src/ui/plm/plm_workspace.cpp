@@ -455,7 +455,7 @@ bool plmBusy() {
         case PlmPage::Planning:
         case PlmPage::Issues:   return H.planLoading;
         case PlmPage::Releases: return H.gitLoading;
-        case PlmPage::Git:      return H.gitLoading;
+        case PlmPage::Git:      return H.gitLoading || H.gitDetailsLoading;
         case PlmPage::Team:     return H.teamLoading;
         case PlmPage::Compare:  return plmCompareBusy();
         case PlmPage::Versions: return H.versionsGraph.loading;

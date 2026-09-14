@@ -685,6 +685,26 @@ def test_unchanged_container_is_not_re_exploded(tmp_path, monkeypatch):
         v.close()
 
 
+def test_dirty_scan_checks_preserved_members_with_unchanged_canonical_recipe(tmp_path):
+    path = tmp_path / "Bracket.step+"
+    canonical = snapshot.explode_container(_container(_part())).document_json
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_STORED) as zf:
+        zf.writestr("document.json", canonical)
+        zf.writestr("source.dat", b"unique_extra")
+    v = Vault.open(tmp_path)
+    try:
+        iid = v.manifest()["items"][0]["item_id"]
+        assert v.status()["dirty"] == []
+        # Keep the recipe exact but break a preserved member's CRC.
+        path.write_bytes(path.read_bytes().replace(b"unique_extra", b"broken_extra"))
+        assert v.status()["dirty"] == [iid]
+        with pytest.raises(VaultError) as exc:
+            v.save()
+        assert exc.value.reason == "corrupt_item"
+    finally:
+        v.close()
+
+
 def test_history_limit_stops_decoding_the_chain(tmp_path, monkeypatch):
     _write(tmp_path, "Bracket.step+", _part(1.0))
     v = Vault.open(tmp_path)

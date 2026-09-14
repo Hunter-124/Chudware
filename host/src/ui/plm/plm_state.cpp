@@ -258,6 +258,16 @@ PlmLockRow parseLock(const nlohmann::json& x) {
     return l;
 }
 
+// Keep each fan-out single-flight until every response has arrived. Invalidation
+// during a batch discards its payloads and the next ensure schedules one fresh batch.
+bool finishGitFetch(int gen, bool details) {
+    auto& H = g_plmHub;
+    int& pending = details ? H.gitDetailsPending : H.gitPending;
+    bool& loading = details ? H.gitDetailsLoading : H.gitLoading;
+    loading = --pending != 0;
+    return gen == H.generation;
+}
+
 }  // namespace
 
 bool plmOk(const core::RpcResult& r, std::string& hint) {
@@ -359,10 +369,9 @@ std::string plmProjectName(AppState& st) {
 
 void plmEnsureOverview(AppState& st) {
     auto& H = g_plmHub;
-    // Hub-open drift capture: when the overview first binds a project folder,
-    // record on-disk changes made outside the editor. Complements
-    // setActiveProjectDir (which already fires this on explicit folder pick).
-    // Idempotent per projectDir; no-op when the working tree matches history.
+    // Every hub page enters here before dispatch. Capture on-disk changes once
+    // when binding a project, including explicit folder picks and restored paths.
+    // No-op when the working tree matches history.
     {
         std::string proj = st.plmProjectPath();
         if (!proj.empty() && proj != H.outsideRecordedFor && st.workerStarted) {
@@ -378,6 +387,7 @@ void plmEnsureOverview(AppState& st) {
     st.rpc.call("plm_overview", pathParam(st), [gen](const core::RpcResult& r) {
         auto& H = g_plmHub;
         H.ovLoading = false;
+        if (gen != H.generation) return;
         H.ovGen = gen;
         if (!plmOk(r, H.ovErr)) return;
         H.ovErr.clear();
@@ -405,16 +415,21 @@ void plmEnsureOverview(AppState& st) {
 
 void plmEnsureItems(AppState& st) {
     auto& H = g_plmHub;
-    if (H.itemsLoading || H.itemsGen == H.generation) return;
+    const std::string proj = st.plmProjectPath();
+    if (proj.empty() || H.itemsLoading ||
+        (H.itemsGen == H.generation && H.itemsProjectDir == proj)) return;
     H.itemsLoading = true;
     int gen = H.generation;
-    st.rpc.call("plm_item_list", pathParam(st), [gen](const core::RpcResult& r) {
+    st.rpc.call("plm_item_list", pathParam(st), [gen, proj, &st](const core::RpcResult& r) {
         auto& H = g_plmHub;
         H.itemsLoading = false;
+        if (gen != H.generation || proj != st.plmProjectPath()) return;
         H.itemsGen = gen;
+        H.itemsProjectDir = proj;
         if (!plmOk(r, H.itemsErr)) return;
         H.itemsErr.clear();
         H.items.clear();
+        ++H.itemsRevision;
         if (auto it = r.result.find("items"); it != r.result.end() && it->is_array())
             for (const auto& row : *it) H.items.push_back(parseItem(row));
     });
@@ -425,13 +440,16 @@ void plmEnsureHistory(AppState& st) {
     if (H.histLoading || H.histGen == H.generation) return;
     H.histLoading = true;
     int gen = H.generation;
+    const int scope = H.histScope;
+    const std::string item = H.histItemFilter;
     nlohmann::json p = pathParam(st);
     p["limit"] = 100;
     p["scope"] = (H.histScope == 1) ? "planning" : (H.histScope == 2) ? "all" : "design";
     if (!H.histItemFilter.empty()) p["item_id"] = H.histItemFilter;
-    st.rpc.call("plm_history", p, [gen](const core::RpcResult& r) {
+    st.rpc.call("plm_history", p, [gen, scope, item](const core::RpcResult& r) {
         auto& H = g_plmHub;
         H.histLoading = false;
+        if (gen != H.generation || scope != H.histScope || item != H.histItemFilter) return;
         H.histGen = gen;
         if (!plmOk(r, H.histErr)) return;
         H.histErr.clear();
@@ -453,6 +471,7 @@ void plmEnsureWhereUsed(AppState& st) {
     st.rpc.call("plm_where_used", p, [gen, target](const core::RpcResult& r) {
         auto& H = g_plmHub;
         H.wuLoading = false;
+        if (gen != H.generation || target != H.wuTarget) return;
         H.wuGen = gen;
         H.wuFor = target;
         H.wuRows.clear();
@@ -478,12 +497,18 @@ void plmEnsureVersionGraph(AppState& st) {
     if (!V.available || V.loading || V.gen == g_plmHub.generation) return;
     V.loading = true;
     const int gen = g_plmHub.generation;
+    const int scope = V.scope;
+    // Project switches reset V and can start a replacement before this reply.
+    static unsigned long long latestRequest = 0;
+    const auto request = ++latestRequest;
     nlohmann::json p = pathParam(st);
     p["limit"] = 400;
     p["scope"] = (V.scope == 0) ? "design" : (V.scope == 1) ? "planning" : "all";
-    st.rpc.call("plm_version_graph", p, [gen](const core::RpcResult& r) {
+    st.rpc.call("plm_version_graph", p, [gen, scope, request](const core::RpcResult& r) {
         auto& V = g_plmHub.versionsGraph;
+        if (request != latestRequest) return;
         V.loading = false;
+        if (gen != g_plmHub.generation || scope != V.scope) return;
         V.gen = gen;
         if (versionRpcAbsent(r)) {
             V.available = false;
@@ -536,13 +561,18 @@ void plmEnsurePlanning(AppState& st) {
     auto& H = g_plmHub;
     if (H.planLoading || H.planGen == H.generation) return;
     H.planLoading = true;
-    H.planGen = H.generation;  // fire all three; each writes its own vector
+    const int gen = H.generation;
+    H.planGen = gen;
+    H.planErr.clear();
+    H.planPending = 3;
     auto call = [&](const char* entity, int slot) {
         nlohmann::json p = pathParam(st);
         p["op"] = "list";
         p["entity"] = entity;
-        st.rpc.call("plm_plan", p, [slot](const core::RpcResult& r) {
+        st.rpc.call("plm_plan", p, [slot, gen](const core::RpcResult& r) {
             auto& H = g_plmHub;
+            H.planLoading = --H.planPending != 0;
+            if (gen != H.generation) return;
             std::string h;
             if (plmOk(r, h)) {
                 if (auto it = r.result.find("items"); it != r.result.end() && it->is_array()) {
@@ -556,7 +586,6 @@ void plmEnsurePlanning(AppState& st) {
             } else {
                 H.planErr = h;
             }
-            H.planLoading = false;  // any completion clears the spinner
         });
     };
     call("task", 0);
@@ -565,33 +594,24 @@ void plmEnsurePlanning(AppState& st) {
 }
 
 void plmEnsureSettings(AppState& st) {
-    auto& H = g_plmHub;
-    if (H.setLoading || H.setGen == H.generation) return;
-    H.setLoading = true;
-    int gen = H.generation;
-    st.rpc.call("plm_status", pathParam(st), [gen](const core::RpcResult& r) {
-        auto& H = g_plmHub;
-        H.setLoading = false;
-        H.setGen = gen;
-        if (!plmOk(r, H.setErr)) return;
-        H.setErr.clear();
-        H.partPrefix = getStr(r.result, "part_number_prefix");
-        H.aiMode     = getStr(r.result, "ai_mode");
-        if (auto it = r.result.find("auto_commit");
-            it != r.result.end() && it->is_boolean())
-            H.autoCommit = it->get<bool>();
-    });
+    // Settings and Team are slices of the same status response. The Team fetch
+    // fills both, preserving its 60-second advisory-lock refresh.
+    if (g_plmHub.setGen != g_plmHub.generation) plmEnsureTeam(st);
 }
 
-void plmEnsureGit(AppState& st) {
+namespace {
+void ensureGitHistory(AppState& st) {
     auto& H = g_plmHub;
     if (H.gitLoading || H.gitGen == H.generation) return;
     H.gitLoading = true;
-    H.gitGen = H.generation;  // fan out; each callback fills its own slice
+    H.gitGen = H.generation;
+    H.gitPending = 2;
+    const int gen = H.generation;
 
     // git status — branch, ahead/behind, changed files, is-repo/missing state.
-    st.rpc.call("git_status", pathParam(st), [](const core::RpcResult& r) {
+    st.rpc.call("git_status", pathParam(st), [gen](const core::RpcResult& r) {
         auto& H = g_plmHub;
+        if (!finishGitFetch(gen, false)) return;
         std::string h;
         if (plmOk(r, h)) {
             H.gitIsRepo = true; H.gitMissing = false; H.gitErr.clear();
@@ -609,12 +629,12 @@ void plmEnsureGit(AppState& st) {
             H.gitIsRepo  = false;
             H.gitErr     = h;
         }
-        H.gitLoading = false;
     });
 
     st.rpc.call("git_log", [&]{ nlohmann::json p = pathParam(st); p["limit"] = 60; return p; }(),
-                [](const core::RpcResult& r) {
+                [gen](const core::RpcResult& r) {
         auto& H = g_plmHub; std::string h;
+        if (!finishGitFetch(gen, false)) return;
         if (!plmOk(r, h)) return;
         H.gitLog.clear();
         if (auto c = r.result.find("commits"); c != r.result.end() && c->is_array())
@@ -622,9 +642,21 @@ void plmEnsureGit(AppState& st) {
         H.gitTotalCommits = r.result.value("total_commits", 0);
         H.gitCommits24h   = r.result.value("commits_24h", 0);
     });
+}
+} // namespace
 
-    st.rpc.call("git_branches", pathParam(st), [](const core::RpcResult& r) {
+void plmEnsureGit(AppState& st, bool details) {
+    ensureGitHistory(st);
+    auto& H = g_plmHub;
+    if (!details || H.gitDetailsLoading || H.gitDetailsGen == H.generation) return;
+    H.gitDetailsLoading = true;
+    H.gitDetailsGen = H.generation;
+    H.gitDetailsPending = 7;
+    const int gen = H.generation;
+
+    st.rpc.call("git_branches", pathParam(st), [gen](const core::RpcResult& r) {
         auto& H = g_plmHub; std::string h;
+        if (!finishGitFetch(gen, true)) return;
         if (!plmOk(r, h)) return;
         H.gitBranches.clear();
         if (auto b = r.result.find("branches"); b != r.result.end() && b->is_array())
@@ -637,8 +669,9 @@ void plmEnsureGit(AppState& st) {
             }
     });
 
-    st.rpc.call("git_remotes", pathParam(st), [](const core::RpcResult& r) {
+    st.rpc.call("git_remotes", pathParam(st), [gen](const core::RpcResult& r) {
         auto& H = g_plmHub; std::string h;
+        if (!finishGitFetch(gen, true)) return;
         if (!plmOk(r, h)) return;
         H.gitRemotes.clear();
         if (auto rm = r.result.find("remotes"); rm != r.result.end() && rm->is_array())
@@ -650,24 +683,28 @@ void plmEnsureGit(AppState& st) {
             }
     });
 
-    st.rpc.call("git_tree", pathParam(st), [](const core::RpcResult& r) {
+    st.rpc.call("git_tree", pathParam(st), [gen](const core::RpcResult& r) {
         auto& H = g_plmHub; std::string h;
+        if (!finishGitFetch(gen, true)) return;
         if (!plmOk(r, h)) return;
         H.gitTree.clear();
+        ++H.gitTreeRevision;
         if (auto f = r.result.find("files"); f != r.result.end() && f->is_array())
             for (const auto& row : *f) if (row.is_string()) H.gitTree.push_back(row.get<std::string>());
     });
 
     // GitHub side (gh) — auth, repo, PRs, issues. All degrade quietly.
-    st.rpc.call("git_gh_auth_status", pathParam(st), [](const core::RpcResult& r) {
+    st.rpc.call("git_gh_auth_status", pathParam(st), [gen](const core::RpcResult& r) {
         auto& H = g_plmHub; std::string h;
+        if (!finishGitFetch(gen, true)) return;
         if (!plmOk(r, h)) { H.ghAuthed = false; return; }
         H.ghAuthed = r.result.value("authed", false);
         H.ghUser   = getStr(r.result, "user");
     });
 
-    st.rpc.call("git_repo_info", pathParam(st), [](const core::RpcResult& r) {
+    st.rpc.call("git_repo_info", pathParam(st), [gen](const core::RpcResult& r) {
         auto& H = g_plmHub; std::string h;
+        if (!finishGitFetch(gen, true)) return;
         if (!plmOk(r, h)) { H.ghRepoName.clear(); return; }
         H.ghRepoName  = getStr(r.result, "name");
         H.ghRepoOwner = getStr(r.result, "owner");
@@ -675,16 +712,18 @@ void plmEnsureGit(AppState& st) {
         H.ghRepoUrl   = getStr(r.result, "url");
     });
 
-    st.rpc.call("git_pr_list", pathParam(st), [](const core::RpcResult& r) {
+    st.rpc.call("git_pr_list", pathParam(st), [gen](const core::RpcResult& r) {
         auto& H = g_plmHub; std::string h;
+        if (!finishGitFetch(gen, true)) return;
         if (!plmOk(r, h)) { H.gitPrs.clear(); return; }
         H.gitPrs.clear();
         if (auto p = r.result.find("prs"); p != r.result.end() && p->is_array())
             for (const auto& row : *p) H.gitPrs.push_back(parseGitRef(row));
     });
 
-    st.rpc.call("git_issue_list", pathParam(st), [](const core::RpcResult& r) {
+    st.rpc.call("git_issue_list", pathParam(st), [gen](const core::RpcResult& r) {
         auto& H = g_plmHub; std::string h;
+        if (!finishGitFetch(gen, true)) return;
         if (!plmOk(r, h)) { H.gitIssues.clear(); return; }
         H.gitIssues.clear();
         if (auto i = r.result.find("issues"); i != r.result.end() && i->is_array())
@@ -702,18 +741,29 @@ void plmEnsureTeam(AppState& st) {
                        (ImGui::GetTime() - H.teamFetchedAt > 60.0);
     if (!stale) return;
     H.teamLoading = true;
+    H.setLoading = true;
     const int gen = H.generation;
     st.rpc.call("plm_status", pathParam(st), [gen](const core::RpcResult& r) {
         auto& H = g_plmHub;
         H.teamLoading = false;
+        H.setLoading = false;
+        if (gen != H.generation) return;
+        H.setGen = gen;
         H.teamGen = gen;
         H.teamFetchedAt = ImGui::GetTime();
         std::string hint;
         if (!plmOk(r, hint)) {
             H.teamErr = plmTeamFriendlyError(plmReason(r), hint);
+            H.setErr = hint;
             return;
         }
         H.teamErr.clear();
+        H.setErr.clear();
+        H.partPrefix = getStr(r.result, "part_number_prefix");
+        H.aiMode = getStr(r.result, "ai_mode");
+        if (auto it = r.result.find("auto_commit");
+            it != r.result.end() && it->is_boolean())
+            H.autoCommit = it->get<bool>();
         H.remotes.clear();
         H.locks.clear();
         if (auto rs = r.result.find("remotes"); rs != r.result.end() && rs->is_array())

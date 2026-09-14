@@ -100,7 +100,6 @@ def _bump_and_maybe_repack(v: Any) -> None:
 def _plm_open(params: dict, _emit: Callable) -> dict:
     """Open (auto-creating) the vault for a project folder — zero-config."""
     def run(v: Any) -> dict:
-        v.repack()  # pack loose objects once on open (long-lived accumulation)
         m = v.manifest()
         return {"ok": True, "project_id": m["project"]["id"], "manifest": m}
     return _with_vault(params, run)
@@ -122,8 +121,6 @@ def _plm_status(params: dict, _emit: Callable) -> dict:
 def _plm_history(params: dict, _emit: Callable) -> dict:
     """The timeline. With ``thumb_dir``: export per-entry thumbnails to files."""
     def run(v: Any) -> dict:
-        from services.plm import snapshot
-
         item_id = (params or {}).get("item_id") or None
         limit = int((params or {}).get("limit") or 0) or None
         scope = str((params or {}).get("scope", "design") or "design")
@@ -139,15 +136,14 @@ def _plm_history(params: dict, _emit: Callable) -> dict:
                 dest = td / f'{e["commit"]}.png'
                 if not dest.exists():
                     try:
-                        tree = v._bind.read_tree(e["commit"])  # noqa: SLF001 — same package
-                        raw = tree.get(ref)
+                        raw = v._bind.read_blob_at(e["commit"], ref)  # noqa: SLF001
                         if raw:
                             dest.write_bytes(raw)
                     except Exception:  # noqa: BLE001 — thumbnails are best-effort
                         continue
                 if dest.exists():
                     e["thumbnail_file"] = str(dest)
-        return {"ok": True, "entries": entries, "head": v.status()["head"]}
+        return {"ok": True, "entries": entries, "head": v._bind.head_commit()}
     return _with_vault(params, run)
 
 def _plm_version_graph(params: dict, _emit: Callable) -> dict:
@@ -377,7 +373,7 @@ def _plm_record_outside(params: dict, _emit: Callable) -> dict:
         try:
             on_disk = {p.relative_to(v.project_dir).as_posix()
                        for p in v._project_containers()}
-            dirty = v.status().get("dirty") or []
+            dirty = v._dirty_items(m)
         except Exception as exc:  # noqa: BLE001
             return {
                 "ok": False,

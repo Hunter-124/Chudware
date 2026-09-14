@@ -20,6 +20,7 @@ struct QuickState {
     std::string proj;        // project folder this state was resolved for
     std::string docBase;     // active document file name (basename)
     bool        loading = false;
+    unsigned long long itemsRevision = 0;
     bool        haveItem = false;
     std::string itemId, partNumber, rev, workingRev, lifecycle;
     bool        dirty = false;
@@ -57,38 +58,43 @@ std::string activeDocPath(AppState& st) {
     return "";
 }
 
-// Refetch the active document's item when the (project, document) pair changes.
+// Resolve against the hub's shared list. Changing document tabs only changes the
+// local lookup; it must not reload every item in the project.
 void resolve(AppState& st) {
-    std::string proj = st.plmProjectPath();
-    std::string docBase = baseName(activeDocPath(st));
-    if (proj == q.proj && docBase == q.docBase) return;
-    q.proj = proj; q.docBase = docBase;
-    q.haveItem = false; q.itemId.clear(); q.showRelease = false;
-    if (proj.empty() || docBase.empty() || q.loading) return;
-    q.loading = true;
-    st.rpc.call("plm_item_list", pathParam(st), [docBase](const core::RpcResult& r) {
-        q.loading = false;
-        std::string h;
-        if (!plmOk(r, h)) return;
-        auto items = r.result.find("items");
-        if (items == r.result.end() || !items->is_array()) return;
-        for (const auto& it : *items) {
-            if (!it.is_object()) continue;
-            if (baseName(jstr(it, "path")) != docBase) continue;
-            q.haveItem  = true;
-            q.itemId    = jstr(it, "item_id");
-            q.partNumber= jstr(it, "part_number");
-            q.rev       = jstr(it, "rev");
-            q.workingRev= jstr(it, "working_rev");
-            q.lifecycle = jstr(it, "lifecycle");
-            q.dirty     = it.contains("dirty") && it["dirty"].is_boolean() && it["dirty"].get<bool>();
-            break;
-        }
-    });
+    const std::string proj = st.plmProjectPath();
+    const std::string docBase = baseName(activeDocPath(st));
+    const bool changed = proj != q.proj || docBase != q.docBase;
+    if (changed) {
+        q.proj = proj; q.docBase = docBase;
+        q.haveItem = false; q.itemId.clear(); q.showRelease = false;
+        q.itemsRevision = 0;
+    }
+    q.loading = false;
+    if (proj.empty() || docBase.empty() || !st.workerStarted) return;
+    plmEnsureItems(st);
+    const auto& H = g_plmHub;
+    q.loading = H.itemsLoading;
+    if (H.itemsProjectDir != proj || H.itemsGen != H.generation ||
+        !H.itemsErr.empty() || q.itemsRevision == H.itemsRevision) return;
+    q.itemsRevision = H.itemsRevision;
+    q.haveItem = false;
+    q.itemId.clear();
+    for (const auto& it : H.items) {
+        if (baseName(it.path) != docBase) continue;
+        q.haveItem = true;
+        q.itemId = it.itemId;
+        q.partNumber = it.partNumber;
+        q.rev = it.rev;
+        q.workingRev = it.workingRev;
+        q.lifecycle = it.lifecycle;
+        q.dirty = it.dirty;
+        break;
+    }
 }
 
 void refetch() {  // force a re-resolve next frame (after a mutation)
     q.proj.clear(); q.docBase.clear();
+    plmInvalidate(); // the quickbar and hub must observe the same post-mutation list
 }
 
 void discardDraft(AppState& st, std::string itemId) {
@@ -497,17 +503,19 @@ void plmAutoRecordSave(AppState& st, const std::string& savedAbsPath) {
     if (!st.workerStarted) return;
     const std::string proj = st.plmProjectPath();
     if (proj.empty() || savedAbsPath.empty()) return;
-    if (!g_plmHub.autoCommit) return;  // cached; default true before first fetch
     // The saved file must live under the project folder.
     std::string a = savedAbsPath, p = proj;
     for (char& c : a) if (c == '\\') c = '/';
     for (char& c : p) if (c == '\\') c = '/';
     if (!p.empty() && p.back() != '/') p += '/';
     if (a.rfind(p, 0) != 0) return;  // file must sit inside the project folder
+    // Dirty badges follow disk saves even when automatic history is disabled.
+    plmInvalidate();
+    if (!g_plmHub.autoCommit) return;
     nlohmann::json params; params["path"] = proj;
     st.rpc.call("plm_save", params, [&st](const core::RpcResult& r) {
         std::string h;
-        if (plmOk(r, h)) { refetch(); plmInvalidate(); return; }
+        if (plmOk(r, h)) { refetch(); return; }
         st.toast(ui::ToastLevel::Warn, "Couldn't record history: " + h);
     });
 }

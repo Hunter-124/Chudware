@@ -6,6 +6,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <unordered_map>
@@ -38,7 +39,7 @@ constexpr const char* kUriPrefix = "aicm-shm://";
 std::mutex g_mu;
 
 struct CacheEntry {
-    std::vector<uint8_t> bytes;
+    std::shared_ptr<const std::vector<uint8_t>> bytes;
     std::string uri;
 };
 std::unordered_map<std::string, CacheEntry> g_cache;
@@ -59,6 +60,7 @@ struct MapImpl {
     size_t map_size = 0;
 #endif
     std::vector<uint8_t> heap;
+    std::shared_ptr<const std::vector<uint8_t>> retained;
 };
 
 std::string sanitize(const std::string& s) {
@@ -312,14 +314,12 @@ std::string publish(const std::string& key, const uint8_t* data, size_t n) {
     if (uri.empty()) uri = publish_file(key, data, n);
     if (uri.empty()) return {};
 
+    CacheEntry e;
+    e.bytes = n ? std::make_shared<const std::vector<uint8_t>>(data, data + n)
+                : std::make_shared<const std::vector<uint8_t>>();
+    e.uri = uri;
     {
         std::lock_guard<std::mutex> lk(g_mu);
-        CacheEntry e;
-        if (data && n)
-            e.bytes.assign(data, data + n);
-        else
-            e.bytes.clear();
-        e.uri = uri;
         g_cache[key] = std::move(e);
     }
     return uri;
@@ -332,17 +332,17 @@ bool map(const std::string& uri, Mapping& out, std::string& err) {
         return false;
     }
 
-    // Same-process fast path: heap copy from the producer cache.
+    // Pin immutable producer bytes; replacement/release cannot invalidate a reader.
     {
         std::lock_guard<std::mutex> lk(g_mu);
         for (const auto& kv : g_cache) {
             if (kv.second.uri == uri) {
                 auto* impl = new MapImpl;
                 impl->kind = MapImpl::Heap;
-                impl->heap = kv.second.bytes;
+                impl->retained = kv.second.bytes;
                 out.impl = impl;
-                out.data = impl->heap.data();
-                out.size = impl->heap.size();
+                out.data = impl->retained->data();
+                out.size = impl->retained->size();
                 return true;
             }
         }

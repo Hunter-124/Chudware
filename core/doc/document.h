@@ -36,6 +36,7 @@
 #include <map>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include <nlohmann/json.hpp>
@@ -187,6 +188,12 @@ std::shared_ptr<CompileCache> copy_compile_cache(const CompileCache& source);
 // features_executed, compiles} since engine start (process-wide, all docs).
 nlohmann::json compile_cache_stats();
 
+// Shared configuration interpretation for compilation and dependency inspection.
+// The resolved configuration pointer borrows from doc; null means implicit Default.
+std::pair<std::string, const nlohmann::json*> resolve_active_config(const nlohmann::json& doc);
+nlohmann::json config_effective_features(const nlohmann::json& features,
+                                         const nlohmann::json* config);
+
 // Compile a document into geometry. `doc` = {"features":[ ... ]}. `env` maps
 // equation variable names to numbers (for expression-valued params / dims).
 //
@@ -203,10 +210,14 @@ nlohmann::json compile_cache_stats();
 // `quality` (display tessellation): selects the BRepMesh linear/angular deflections the
 // AICM display bodies are meshed at (geom::display_deflections). Defaults to Fine — the
 // smooth-display tier — so a caller that does not care gets the best-looking mesh.
+// `with_display=false` is for component geometry consumers: retain exact per-body
+// triangulations at `quality`, shapes/statuses/count, but omit AICM extraction and
+// serialization, body statistics, picking owner-map inversion and datum display data.
 CompileResult compile_document(const nlohmann::json& doc, const nlohmann::json& env,
                                CompileCache* cache = nullptr,
                                ::geom::DisplayQuality quality =
-                                   ::geom::DisplayQuality::Fine);
+                                   ::geom::DisplayQuality::Fine,
+                               bool with_display = true);
 
 // Per-body appearance (C26 colour + C32-A RealView material) for AICM body ordinal `body_num`
 // (1-based). Reads doc["appearances"]["b<body_num>"] — a bare [r,g,b] (colour only) or

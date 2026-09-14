@@ -4441,3 +4441,67 @@ including health responsiveness during slow storage and cross-surface quota
 admission. The production engine was intentionally not restarted or upgraded;
 its existing recovery state and browser/desktop version alignment remain
 explicit continuation items.
+
+## 2026-09-13 — measured PLM and assembly loading reductions
+
+Profiled read-only ME-490 sources and isolated native runs, without restarting
+the live daemon. PLM (`services/plm/{vault,gitbind,worker_rpc,snapshot,cad_graph}.py`)
+now avoids open-time Git maintenance and redundant status/network scans, reads
+history by content-addressed subtrees instead of whole commits, seeks native ZIP
+documents without copying derived geometry, and retains truthful dirty verdicts
+against HEAD and strong file identities. The former global 30-second dirty TTL
+expired during the scan itself: on 5,652 tracked items, the immediately following
+overview fell from 76.02 profiled seconds to 0.142 seconds. The cold dirty scan
+still takes 58.15 profiled seconds (83.49 before the final dirty changes); large
+noncanonical recipes and Git blob reads remain real work. Windows, where Python
+ctime is creation time, retains bounded per-entry rechecks in both verdict and
+exploded-container caches. The full CAD graph had 80,623 nodes/1,555,555 edges and
+an 808,143,528-byte pretty cache that its own 64 MiB reader rejected on every use.
+Compact bounded gzip storage is 20,041,948 bytes; cold profiled build is
+108.47 → 28.89 seconds and validated warm load 4.175 seconds, with exact graph
+equality. Complete source stat coverage includes display-capped and unreadable
+files; restored permissions and corrupt DEFLATE caches are regression-covered.
+
+Native loading (`core/doc/{assembly,stepplus,document,session}`,
+`core/geom/tessellate`, `core/util/aicm_handoff`) now uses selective archive reads,
+recursive dependency-aware component reuse, parallel selector-kind-only analytic
+topology, and assembly-only compilation without discarded part display packets.
+Shared meshing retains the identical per-body Fine settings. Session activation
+reuses a valid assembly display publication; mapping immutable in-process AICM
+data pins storage rather than copying it. Publication replacement/release and
+preserve-path autosaves retain correct reader lifetime and exploded-view state.
+The real 284-component Rover had 278 unique sources, none with compiled caches:
+fresh-process open improved 62.424 → 54.906 seconds (12%), activation
+2.83–2.90 seconds → 15.8–19.0 milliseconds, and peak RSS 4,396 → 3,271 MiB (26%).
+All 431,190,175 display bytes retain SHA-256
+`d17fbeaacf9fe6b6ef7faa31be00c00f615ef315c4dd76a1b04404838461f2d0`;
+284 bodies, mate convergence and zero component errors are unchanged.
+Cold opening is still substantial; no geometry, material or display-quality
+reduction is hidden in these gains.
+
+The PLM GUI (`host/src/ui/plm/` and `host/src/core/app_state.cpp`) shares item/status
+responses across pages and the document quickbar, caches sorted file indices and
+the Git directory tree, and defers seven detailed Git requests until Git/Planning
+needs them. One hub entry point owns outside-change recording; asynchronous
+fanouts retain loading and generation/filter fences. Dirty badges invalidate on
+saves even with automatic history disabled. Actual isolated desktop Files and
+Git scenarios completed: Files fetched two basic Git endpoints, Git fetched all
+nine, and each captured outside changes exactly once. The final PLM suite passed
+403 tests; native cache/lifetime/appearance, nested dependency, cycle, symlink,
+configuration, and display-mode regressions accompany these changes.
+Both desktop and native builds passed and runtime staging used atomic replacement;
+the live daemon was not force-stopped. The AST-only developer code graph refresh
+completed; its existing extraction gaps remain visible (334 files yielded no AST
+nodes and 19 SQL files require the optional `tree_sitter_sql` dependency).
+
+The complete isolated `scripts/gate.sh` exited PASS: all 108 native targets,
+all nine source audits, desktop/WASM builds, daemon lifecycle, web parity,
+Linux packaging and GUI/golden-demo smokes passed. Its per-unit Python sweep
+reported 9,982 passed and one nonfatal FAIL-RECORDED:
+`services/mcp/test_reveng_e2e_scan.py::test_full_reconstruction_numbers`.
+A focused rerun diagnosed `reveng_build_parametric` refusing with
+`backend_not_provisioned` because no dense/mesh capability or reconstructed mesh
+was available. No reverse-engineering code or test was changed to hide that
+environmental failure. Optional AppImage, V&V, modeling-combination and larger
+benchmark stages remained opt-in skips. Gate logs:
+`/tmp/chudware-gate-loading-perf-gate-20260913/`.

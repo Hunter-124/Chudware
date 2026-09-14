@@ -14,6 +14,7 @@
 
 #include "geom/aicm.h"
 #include "aicm_loader.h"
+#include "util/aicm_handoff.h"
 
 namespace {
 
@@ -256,4 +257,32 @@ TEST_CASE("appearance material channels reject nonfinite and out-of-range values
             CHECK_FALSE(render::parseAicm(bytes.data(), bytes.size(), doc, err));
         }
     }
+}
+
+TEST_CASE("mapped mesh survives replacement and release of its publication") {
+    using namespace chudware::aicm_handoff;
+    const std::string key = "test_aicm_retained_reader";
+    const auto original = aicm::write_aicm({tiny_body()});
+    auto replacement_body = tiny_body();
+    replacement_body.name = "Replacement";
+    const auto replacement = aicm::write_aicm({replacement_body});
+    struct Reader {
+        Mapping mapping;
+        ~Reader() { unmap(mapping); }
+    } old_reader, new_reader;
+    struct Cleanup {
+        std::string key;
+        ~Cleanup() { release(key); }
+    } cleanup{key};
+    std::string error;
+    REQUIRE(map(publish(key, original), old_reader.mapping, error));
+    REQUIRE(map(publish(key, replacement), new_reader.mapping, error));
+    release(key);
+    render::DocMesh old_mesh, new_mesh;
+    REQUIRE(render::parseAicm(old_reader.mapping.data, old_reader.mapping.size, old_mesh, error));
+    REQUIRE(render::parseAicm(new_reader.mapping.data, new_reader.mapping.size, new_mesh, error));
+    REQUIRE(old_mesh.bodies.size() == 1);
+    REQUIRE(new_mesh.bodies.size() == 1);
+    CHECK(old_mesh.bodies[0].name == "Tiny");
+    CHECK(new_mesh.bodies[0].name == "Replacement");
 }

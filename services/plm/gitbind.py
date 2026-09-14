@@ -33,6 +33,7 @@ import os
 import shutil
 import subprocess
 import time
+from collections import OrderedDict
 from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
@@ -121,6 +122,9 @@ class GitBinding:
     def __init__(self, repo: Repo, vault_dir: Path) -> None:
         self._repo = repo
         self._vault_dir = vault_dir
+        # Path reads share decoded commit/tree objects within one RPC. Bound
+        # metadata only: never retain geometry blobs here.
+        self._read_cache: OrderedDict[bytes, Commit | Tree] = OrderedDict()
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -187,40 +191,71 @@ class GitBinding:
         hit = _tree_cache_get(commit_hex)
         if hit is not None:
             return hit.get(path)
-        try:
-            commit = self._repo[commit_hex.encode("ascii")]
-        except KeyError:
-            return None
-        node_id = commit.tree
-        parts = [p for p in path.split("/") if p]
-        if not parts:
+        entry = self.entry_at(commit_hex, path)
+        if entry is None or entry[0] == 0o040000:
             return None
         try:
-            for i, part in enumerate(parts):
-                tree = self._repo[node_id]
-                if not isinstance(tree, Tree):
-                    return None
-                name = part.encode("utf-8")
-                found = None
-                for entry in tree.items():
-                    if entry.path == name:
-                        found = entry
-                        break
-                if found is None:
-                    return None
-                if i == len(parts) - 1:
-                    obj = self._repo[found.sha]
-                    if isinstance(obj, Tree):
-                        return None
-                    return obj.data
-                node_id = found.sha
+            return self._repo[entry[1]].data
         except KeyError:
             return None
-        return None
+
+    def _read_object(self, oid: bytes) -> Commit | Tree:
+        hit = self._read_cache.get(oid)
+        if hit is not None:
+            self._read_cache.move_to_end(oid)
+            return hit
+        obj = self._repo[oid]
+        if not isinstance(obj, (Commit, Tree)):
+            raise TypeError("expected commit or tree")
+        self._read_cache[oid] = obj
+        if len(self._read_cache) > 256:
+            self._read_cache.popitem(last=False)
+        return obj
+
+    def entry_at(self, commit_hex: str, path: str) -> tuple[int, bytes] | None:
+        """Resolve a path to its mode/object id without reading its blob."""
+        try:
+            commit = self._read_object(commit_hex.encode("ascii"))
+            entry = (0o040000, commit.tree)
+            for part in filter(None, path.split("/")):
+                if entry[0] != 0o040000:
+                    return None
+                tree = self._read_object(entry[1])
+                entry = tree[part.encode("utf-8")]
+            return entry
+        except KeyError:
+            return None
+
+    def subtree_ids(self, commit_hex: str, prefix: str) -> dict[str, bytes]:
+        """Map blob paths beneath a directory to ids, without decoding blobs."""
+        entry = self.entry_at(commit_hex, prefix)
+        if entry is None or entry[0] != 0o040000:
+            return {}
+        out: dict[str, bytes] = {}
+
+        def walk(oid: bytes, base: str) -> None:
+            for child in self._read_object(oid).items():
+                path = base + child.path.decode("utf-8")
+                if child.mode == 0o040000:
+                    walk(child.sha, path + "/")
+                else:
+                    out[path] = child.sha
+
+        walk(entry[1], prefix.rstrip("/") + "/")
+        return out
+
+    def read_subtree(self, commit_hex: str, prefix: str) -> dict[str, bytes]:
+        """Read only one item's blobs, reusing a warm whole-tree snapshot."""
+        prefix = prefix.rstrip("/") + "/"
+        hit = _tree_cache_get(commit_hex)
+        if hit is not None:
+            return {path: data for path, data in hit.items() if path.startswith(prefix)}
+        return {path: self._repo[oid].data
+                for path, oid in self.subtree_ids(commit_hex, prefix).items()}
 
     def commit_meta(self, commit_hex: str) -> dict[str, Any]:
         """Return commit-level metadata (author, timestamp, message, parents)."""
-        return _meta_from_commit(commit_hex, self._repo[commit_hex.encode("ascii")])
+        return _meta_from_commit(commit_hex, self._read_object(commit_hex.encode("ascii")))
 
     def iter_log(self) -> Iterator[tuple[str, dict[str, Any]]]:
         """Yield ``(commit_id, meta)`` newest-first along the linear parent chain.
@@ -233,7 +268,7 @@ class GitBinding:
         """
         head = self.head_commit()
         while head is not None:
-            meta = _meta_from_commit(head, self._repo[head.encode("ascii")])
+            meta = _meta_from_commit(head, self._read_object(head.encode("ascii")))
             yield head, meta
             parents = meta["parents"]
             head = parents[0] if parents else None

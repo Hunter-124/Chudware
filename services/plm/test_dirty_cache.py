@@ -170,3 +170,42 @@ def test_windows_same_stat_rewrites_are_rechecked_without_reusing_explode(tmp_pa
         assert v.status()["dirty"] == []
     finally:
         v.close()
+
+
+@pytest.mark.parametrize("before,after", [(True, 1), (1, 1.0), (-0.0, 0.0)])
+def test_dirty_comparison_preserves_json_scalar_distinctions(tmp_path, before, after):
+    """Python-equal scalars must not hide a changed canonical recipe."""
+    _write(tmp_path, "Bracket.step+", _part(before))
+    v = Vault.open(tmp_path)
+    try:
+        iid = v.manifest()["items"][0]["item_id"]
+        assert v.status()["dirty"] == []
+        _write(tmp_path, "Bracket.step+", _part(after))
+        assert v.status()["dirty"] == [iid]
+        v.save()
+        assert v.status()["dirty"] == []
+    finally:
+        v.close()
+
+
+def test_reformatted_recipe_reuses_canonical_content_without_losing_extras(tmp_path):
+    doc = _part()
+    doc["notes"] = 'Bräckét \U0001d11e: {}, [], "quoted", \\path\n'
+    _write(tmp_path, "Bracket.step+", doc)
+    v = Vault.open(tmp_path)
+    try:
+        iid = v.manifest()["items"][0]["item_id"]
+        prefix = f"items/{iid}/"
+        original = v._bind.read_blob_at(v._bind.head_commit(), prefix + "document.json")
+        # Different key order, whitespace and Unicode spelling; identical recipe.
+        with zipfile.ZipFile(tmp_path / "Bracket.step+", "w") as zf:
+            zf.writestr("document.json", json.dumps(
+                dict(reversed(list(doc.items()))), ensure_ascii=False, separators=(",", ":")))
+            zf.writestr("source.dat", b"preserved source attachment")
+        assert v.status()["dirty"] == []
+        saved = v.save()["commit"]
+        assert v._bind.read_blob_at(saved, prefix + "document.json") == original
+        assert v._bind.read_blob_at(
+            saved, prefix + "extra/source.dat") == b"preserved source attachment"
+    finally:
+        v.close()

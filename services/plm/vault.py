@@ -24,6 +24,8 @@ from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
+from dulwich.objects import Blob
+
 from services.plm import assist, doctypes, generic_snapshot, gitbind, manifest, snapshot
 from services.plm import history as hist  # aliased: Vault.history() method shadows the name
 from services.plm import items as items_mod
@@ -115,7 +117,8 @@ def _invalidate_dirty_cache(project_dir: str | os.PathLike) -> None:
 # same-tick rewrite re-explodes instead of silently committing stale blobs.
 _EXPLODE_CACHE_MAX_BYTES = 64 * 1024 * 1024
 # "<resolved root>\0<rel>" -> {"stamp": tuple, "exploded": ExplodedItem,
-#                              "doc": dict, "bytes": int}
+#                              "doc": dict|None, "bytes": int}
+# Dirty scans retain canonical bytes; decode metadata only if a later save needs it.
 _explode_cache: dict[str, dict[str, Any]] = {}
 _explode_cache_bytes = 0
 
@@ -130,7 +133,7 @@ def _container_stamp(path: Path) -> tuple[int, int, int, int] | None:
 
 
 def _explode_cache_put(key: str, stamp: tuple[int, int, int, int],
-                       exploded: snapshot.ExplodedItem, doc: dict[str, Any]) -> None:
+                       exploded: snapshot.ExplodedItem, doc: dict[str, Any] | None = None) -> None:
     global _explode_cache_bytes
     _explode_cache_drop(key)
     size = len(exploded.document_json) + len(exploded.thumbnail_png or b"")
@@ -1189,6 +1192,9 @@ class Vault:
             if cached is not None:
                 exploded = cached["exploded"]
                 doc = cached["doc"]
+                if doc is None:
+                    doc = _json.loads(exploded.document_json.decode("utf-8"))
+                    cached["doc"] = doc
             else:
                 try:
                     raw = path.read_bytes()
@@ -1429,25 +1435,33 @@ class Vault:
                 is_dirty = generic_snapshot.is_dirty(it, self.project_dir, item_tree)
             else:
                 path = self.project_dir / it["path"]
-                head_doc = self._bind.read_blob_at(
-                    head, snapshot.item_prefix(iid) + "document.json")
+                head_path = snapshot.item_prefix(iid) + "document.json"
+                entry = self._bind.entry_at(head, head_path)
+                head_oid = entry[1] if entry is not None and entry[0] != 0o040000 else None
                 try:
                     cache_key = f"{root_key}\x00{it['path']}"
                     container_stamp = stamp[1:]
                     hit = _explode_cache_get(cache_key, container_stamp)
                     if hit is not None:
                         exploded = hit["exploded"]
+                        is_dirty = Blob.from_string(exploded.document_json).id != head_oid
                     else:
-                        exploded = snapshot.explode_container(path, canonical_document=head_doc)
-                        import json
-                        _explode_cache_put(cache_key, container_stamp, exploded,
-                                           json.loads(exploded.document_json))
+                        head_doc = None
+
+                        def reference_document(raw: bytes) -> bytes | None:
+                            nonlocal head_doc
+                            head_doc = (raw if Blob.from_string(raw).id == head_oid
+                                        else self._bind.read_blob_at(head, head_path))
+                            return head_doc
+
+                        exploded = snapshot.explode_container(
+                            path, reference_document=reference_document)
+                        is_dirty = head_doc != exploded.document_json
+                        _explode_cache_put(cache_key, container_stamp, exploded)
                 except Exception:
                     # A malformed tracked container is not clean: surface it as
                     # dirty so callers do not mistake corruption for no change.
                     is_dirty = True
-                else:
-                    is_dirty = head_doc != exploded.document_json
 
             item_cache[iid] = {"stamp": stamp, "dirty": is_dirty,
                                "recorded_ns": time.time_ns(), "recorded_at": time.monotonic()}

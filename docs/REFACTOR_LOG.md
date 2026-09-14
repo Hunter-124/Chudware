@@ -4505,3 +4505,39 @@ was available. No reverse-engineering code or test was changed to hide that
 environmental failure. Optional AppImage, V&V, modeling-combination and larger
 benchmark stages remained opt-in skips. Gate logs:
 `/tmp/chudware-gate-loading-perf-gate-20260913/`.
+
+## 2026-09-14 — cold PLM comparison without redundant blob decoding
+
+The next measured pass changes `services/plm/{snapshot,vault}.py` and
+`test_dirty_cache.py`. Dirty scans compare working recipes to Git blob ids before
+reading historical content: ME-490's 4,728 native containers now require only
+247 reference-blob reads. The snapshot reference resolver runs after retained
+ZIP members have been read and CRC-checked. Noncanonical recipes compare through
+the C-backed, sorted JSON encoder before reusing the exact canonical vault bytes;
+the persisted pretty format is unchanged. This deliberately distinguishes booleans,
+integers, floats and signed zero rather than using Python value equality.
+The bounded explode cache retains recipe bytes but defers metadata parsing until
+a save needs it. Save/restore content, attachments, HEAD invalidation, file-stamp
+freshness and Windows bounded rechecks remain covered.
+
+Fresh-process, unprofiled scans of the same read-only ME-490 HEAD
+`ff291512f8b87a9f36696d9232b8bdbadc11b41e` fell from **24.017 to 9.535 seconds**
+(60%); peak RSS fell from **662.5 to 392.9 MiB**. Both contain 5,652 manifest
+items and report zero dirty items. The complete overview response is identical,
+SHA-256 `dc49a92da8c8fad291993e654cb131b8511d00bbddfc52c4bbdc5374529b501f`.
+The real worker overview entrypoint, opening/closing its own Vault each time,
+took **9.095 seconds cold / 0.072 seconds warm** with the same response hash.
+These are backend measurements, not desktop wall-clock latency, and are not
+directly comparable with the earlier profiled 58-second scan.
+
+Verification: **407 PLM tests pass**, all nine `scripts/check.py` gates pass,
+and the desktop build and atomic runtime staging pass. New regression cases cover
+scalar representation changes and a reformatted Unicode recipe followed by a save
+that preserves both canonical bytes and its attachment. Native assembly code is
+unchanged; its approximately 55-second cold Rover open remains a separate bottleneck.
+The full native/agent gate was not rerun for this PLM-only pass; its previously
+documented reverse-engineering backend-provisioning failure remains unresolved.
+Measurements are retained under `scratch/plm_cold_*.json` and
+`scratch/plm_overview_final.json`; disposable probe scripts/profiles were removed.
+The project was mounted read-only during real-data probes, and the user's running
+application and recovery state were not restarted or modified.

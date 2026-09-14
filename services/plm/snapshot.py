@@ -30,6 +30,7 @@ from __future__ import annotations
 import io
 import json
 import zipfile
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -101,7 +102,9 @@ class ExplodedItem:
     extras: dict[str, bytes] = field(default_factory=dict)  # verbatim-preserved entries
 
 
-def explode_container(raw: bytes | Path, *, canonical_document: bytes | None = None) -> ExplodedItem:
+def explode_container(
+    raw: bytes | Path, *, reference_document: Callable[[bytes], bytes | None] | None = None,
+) -> ExplodedItem:
     """Explode a ``.step+`` / ``.ecad+`` ZIP container into its parts.
 
     ``document.json`` is re-serialized canonically (§0) so the shadow-tree blob is
@@ -109,9 +112,10 @@ def explode_container(raw: bytes | Path, *, canonical_document: bytes | None = N
     preserved verbatim so restore is lossless.
 
     A file-backed input seeks past derived geometry instead of copying the
-    archive. ``canonical_document`` is an already-canonical vault blob: an
-    exact byte match needs no parse/re-serialization. Changed recipes still
-    canonicalize normally, and every preserved ZIP member is still CRC-checked.
+    archive. ``reference_document`` resolves the canonical vault bytes from the
+    working recipe; it can recognize a Git object id without reading that blob.
+    Equivalent JSON reuses those canonical bytes without pretty-printing again.
+    Every preserved ZIP member is still read and CRC-checked first.
     """
     doc_bytes: bytes | None = None
     thumb: bytes | None = None
@@ -132,14 +136,20 @@ def explode_container(raw: bytes | Path, *, canonical_document: bytes | None = N
     if doc_bytes is None:
         raise ValueError("container has no document.json")
 
-    # Canonicalize document.json for byte-stability (§0). If it is already
-    # canonical this is a no-op; if not, we store the canonical form so diffing
-    # stays false-positive-free.
-    if canonical_document is not None and doc_bytes == canonical_document:
-        canonical = canonical_document
+    reference = reference_document(doc_bytes) if reference_document is not None else None
+    if doc_bytes == reference:
+        canonical = reference
     else:
         doc = json.loads(doc_bytes.decode("utf-8"))
-        canonical = canonical_dump(doc).encode("utf-8")
+        # No indent selects the C encoder. Its scalar formatting matches the
+        # canonical writer, unlike Python equality (True == 1 == 1.0, -0.0 == 0.0).
+        # Only reuse a reference when the full normalized representation agrees.
+        if (reference is not None
+                and json.dumps(doc, sort_keys=True)
+                == json.dumps(json.loads(reference.decode("utf-8")), sort_keys=True)):
+            canonical = reference
+        else:
+            canonical = canonical_dump(doc).encode("utf-8")
 
     return ExplodedItem(document_json=canonical, thumbnail_png=thumb, extras=extras)
 

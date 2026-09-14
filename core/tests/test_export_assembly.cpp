@@ -704,4 +704,5 @@ TEST_CASE("component geometry mode preserves curved display across compile cache
     const auto displayed_again = compile_document(source, json::object(), cache.get());
     REQUIRE(displayed_again.ok);
     CHECK(displayed_again.aicm == displayed.aicm);
+    CHECK(displayed_again.owner_map == displayed.owner_map);
 }

@@ -199,10 +199,11 @@ DisplayDeflections mesh_body(const TopoDS_Shape& shape, double lin_deflection, d
     const double eff_lin =
         (lin_deflection > 0.0) ? lin_deflection : auto_linear_deflection(shape);
     // BRepMesh is face-incremental: already matching triangulations are retained.
+    // The shape-taking constructor performs the mesh; a second Perform repeats
+    // topology/deflection validation even when every triangulation is reusable.
     const auto start = std::chrono::steady_clock::now();
     BRepMesh_IncrementalMesh mesher(shape, eff_lin, Standard_False,
                                     eff_ang, Standard_True);
-    mesher.Perform();
     g_tess_mesh_ns.fetch_add(
         std::chrono::duration_cast<std::chrono::nanoseconds>(
             std::chrono::steady_clock::now() - start).count(), std::memory_order_relaxed);

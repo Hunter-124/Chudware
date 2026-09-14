@@ -1419,6 +1419,23 @@ std::string dof_summary(int dof, bool over, int n_comp, int n_fixed) {
 // numpy.linalg.matrix_rank with an explicit absolute tol: count singular values > tol.
 int matrix_rank_abs(const MatrixXd& M, double tol) {
     if (M.size() == 0) return 0;
+    if (std::min(M.rows(), M.cols()) >= 128 && M.allFinite()) {
+        Eigen::BDCSVD<MatrixXd> fast(M);
+        if (fast.info() == Eigen::Success) {
+            const auto& values = fast.singularValues();
+            // Keep the existing absolute cutoff. Near it, retain the original Jacobi
+            // calculation rather than letting a different SVD's roundoff decide rank.
+            const double guard = 8 * Eigen::NumTraits<double>::epsilon()
+                               * static_cast<double>(std::max(M.rows(), M.cols())) * M.norm();
+            bool decisive = values.allFinite() && std::isfinite(guard);
+            int rank = 0;
+            for (int i = 0; i < values.size(); ++i) {
+                if (std::abs(values(i) - tol) <= guard) decisive = false;
+                if (values(i) > tol) ++rank;
+            }
+            if (decisive) return rank;
+        }
+    }
     Eigen::JacobiSVD<MatrixXd> svd(M);
     const auto& sv = svd.singularValues();
     int r = 0;
@@ -1433,6 +1450,7 @@ struct Builders {
     std::string mid;
     MateBuilder* builder;
     solver::ResidualFunc rfunc;
+    solver::JacobianFunc jfunc;
     int m;
     std::string type;   // mate type, for the residual report
     std::string cid_a;  // the two components this mate couples (for group scoping)
@@ -1500,14 +1518,9 @@ void classify_mates(std::vector<Builders>& builders, const VectorXd& x, double t
     std::vector<int> local_column(x.size(), -1);
     for (auto& b : builders) {
         const std::vector<int>& idx = b.builder->idx();
-        // rebuild jfunc (matches Python building a fresh jfunc via make()[1]).
-        auto built = b.builder->make();
-        solver::JacobianFunc jfunc = std::get<1>(built);
         // sub-vector x[idx]
         VectorXd xsub(idx.size());
         for (size_t i = 0; i < idx.size(); ++i) xsub(static_cast<int>(i)) = x(idx[i]);
-        MatrixXd Jb = jfunc(xsub);
-        VectorXd rb = b.rfunc(xsub);
         // Untouched variable groups form independent diagonal blocks. With an
         // absolute singular-value threshold their cached ranks add exactly; only
         // groups touched by this mate need to be factored again.
@@ -1527,23 +1540,32 @@ void classify_mates(std::vector<Builders>& builders, const VectorXd& x, double t
         }
         std::sort(columns.begin(), columns.end());
         columns.erase(std::unique(columns.begin(), columns.end()), columns.end());
-        for (size_t i = 0; i < columns.size(); ++i)
-            local_column[columns[i]] = static_cast<int>(i);
+        MatrixXd candidate;
+        int new_rank = base_rank;
+        // Rank cannot exceed the number of columns. Once these groups already
+        // span every variable, this mate cannot add rank; only its residual can
+        // distinguish redundant from conflicting. Rejected mates change no group.
+        if (base_rank < static_cast<int>(columns.size())) {
+            const MatrixXd Jb = b.jfunc(xsub);
+            for (size_t i = 0; i < columns.size(); ++i)
+                local_column[columns[i]] = static_cast<int>(i);
 
-        MatrixXd candidate = MatrixXd::Zero(prior_rows + Jb.rows(), columns.size());
-        Eigen::Index row = 0;
-        for (int id : touched) {
-            const Group& group = groups[id];
-            for (size_t i = 0; i < group.columns.size(); ++i)
-                candidate.col(local_column[group.columns[i]]).segment(row, group.rows.rows())
-                    = group.rows.col(static_cast<int>(i));
-            row += group.rows.rows();
+            candidate = MatrixXd::Zero(prior_rows + Jb.rows(), columns.size());
+            Eigen::Index row = 0;
+            for (int id : touched) {
+                const Group& group = groups[id];
+                for (size_t i = 0; i < group.columns.size(); ++i)
+                    candidate.col(local_column[group.columns[i]]).segment(row, group.rows.rows())
+                        = group.rows.col(static_cast<int>(i));
+                row += group.rows.rows();
+            }
+            for (size_t i = 0; i < idx.size(); ++i)
+                candidate.col(local_column[idx[i]]).tail(Jb.rows()) = Jb.col(static_cast<int>(i));
+            new_rank = matrix_rank_abs(candidate, rank_tol);
         }
-        for (size_t i = 0; i < idx.size(); ++i)
-            candidate.col(local_column[idx[i]]).tail(Jb.rows()) = Jb.col(static_cast<int>(i));
-        const int new_rank = matrix_rank_abs(candidate, rank_tol);
         const int gained = new_rank - base_rank;
         if (gained <= 0) {
+            const VectorXd rb = b.rfunc(xsub);
             if (rb.size() > 0 && rb.cwiseAbs().maxCoeff() > rtol)
                 conflicting.push_back(b.mid);
             else
@@ -1729,12 +1751,13 @@ MateSolveResult solve_mates(const json& components, const json& mates,
         Builders br;
         br.mid = mid;
         br.builder = bptr.get();
-        br.rfunc = rfunc;
+        br.rfunc = std::move(rfunc);
+        br.jfunc = std::move(jfunc);
         br.m = m;
         br.type = mtype;
         br.cid_a = cid_a;
         br.cid_b = cid_b;
-        builders.push_back(br);
+        builders.push_back(std::move(br));
         builder_store.push_back(std::move(bptr));
         mate_records.push_back({mid, ""});
     }

@@ -4541,3 +4541,60 @@ Measurements are retained under `scratch/plm_cold_*.json` and
 `scratch/plm_overview_final.json`; disposable probe scripts/profiles were removed.
 The project was mounted read-only during real-data probes, and the user's running
 application and recovery state were not restarted or modified.
+
+## 2026-09-14 — cold assembly loading and large mate diagnostics
+
+The next native pass changes `core/geom/tessellate.cpp`, `core/doc/document.cpp`,
+and `core/mate/mate.cpp`. OCCT's shape-taking `BRepMesh_IncrementalMesh` constructor
+already performs meshing; the second `Perform()` was another validation pass.
+Geometry-only component compilation now omits host-picking ownership maps that
+its consumer never reads. Display-mode cache identity is unchanged, and the
+existing geometry/display mode-switch regression now also checks picking owners.
+Neither change adjusts Fine deflection, tessellation quality, or source geometry.
+
+Mate classification retains the analytic Jacobian callback already registered
+with the pose solver and evaluates residuals only for rejected mates. When the
+prior groups already span every candidate column, rank cannot increase: the
+candidate allocation and SVD are skipped, but the residual still distinguishes
+redundant from conflicting. Rejected mates still contribute no rows or group
+merges. Large remaining rank calculations use Eigen's divide-and-conquer SVD
+with the existing absolute singular-value cutoff. Unsuccessful/nonfinite results
+and values near the cutoff fall back to the original Jacobi SVD. The global DOF
+QR, pose solver, convergence tolerances, and restart policy are unchanged.
+
+Fresh-process, unprofiled Rover opens fell from **53.652 to 37.851 seconds (29%)**.
+Activation remains **17 ms**. Separate stage probes put mate classification at
+**15.798 seconds before / 2.224 seconds after**; pose solving was already seated
+and took less than a millisecond. Component loading, about 30 seconds, is now the
+dominant measured stage. These are native `doc_open`/`doc_activate` timings, not
+desktop frame timings, and variable scheduling/RSS is not a claimed memory win.
+
+Both runs contain 284 components and 284 bodies, no component errors, and exactly
+431,190,175 AICM bytes with SHA-256
+`d17fbeaacf9fe6b6ef7faa31be00c00f615ef315c4dd76a1b04404838461f2d0`.
+The complete rebuild response also matches: component records, every mate status,
+DOF 94, residual DOF 19, convergence, tolerances, and maximum residual
+`1.1102230246251565e-14`. Every one of Rover's 20 accelerated rank calculations
+was additionally checked against the original Jacobi SVD. All 105 extracted-helper
+stress cases matched it, including cutoff neighbours, zero, scaled, ill-conditioned,
+and rectangular matrices. A long grounded-chain regression checks chronological
+acceptance and the redundant/conflicting distinction after saturated bridges.
+
+A disconnected global-QR candidate passed 400 numerical comparisons but did not
+materially improve this assembly; it and its extra code were discarded. All phase
+probes, numerical self-check instrumentation, throwaway programs, and the sampled
+profile have been removed. Measurement/response JSON remains in
+`scratch/assembly_*.json`, with the comparison summary in
+`scratch/assembly_verification.json`. Real project data was mounted read-only
+and shared-memory packets were isolated; the live application was not restarted.
+The AST-only developer graph refresh completed; the previously recorded 334
+empty-file extractions and 19 SQL files lacking `tree_sitter_sql` remain visible.
+
+The full isolated `scripts/gate.sh` exited PASS: all 108 native targets, nine
+source audits, desktop/WASM builds, daemon lifecycle, web parity, Linux packaging,
+and GUI/golden-demo smokes passed. Its Python sweep reported 9,986 passed and the
+same one nonfatal FAIL-RECORDED as the preceding native gate:
+`services/mcp/test_reveng_e2e_scan.py::test_full_reconstruction_numbers`.
+No reverse-engineering code or assertion was changed to conceal that failure.
+The optional AppImage, V&V, modeling-combination, and larger benchmark stages
+remained opt-in skips. Logs: `/tmp/chudware-gate-assembly-perf-20260914/`.

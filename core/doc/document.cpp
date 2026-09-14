@@ -8778,7 +8778,8 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
         result.statuses.push_back(std::move(st));
         // T-PERF7a: attribute owners only for solids THIS feature produced (the
         // reused prefix already carries face_owners/edge_owners from its checkpoint).
-        if (st.ok) {
+        // Geometry-only component compilation never consumes host picking ownership.
+        if (with_display && st.ok) {
             for (std::size_t k = solids_before; k < solid_order.size(); ++k)
                 update_owners_for(solid_order[k]);
         }

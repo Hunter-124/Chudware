@@ -201,6 +201,64 @@ TEST_CASE("mate diagnostics preserve chronological groups through late merges") 
     CHECK(out["transforms"]["datum"].get<std::vector<double>>() == ident16());
 }
 
+TEST_CASE("saturated mate groups still distinguish redundancy from conflict") {
+    for (double distance : {0.0, 1.0}) {
+        CAPTURE(distance);
+        json input;
+        input["components"] = json::array({
+            {{"id", "frame"}, {"transform", ident16()}, {"fixed", true}},
+            {{"id", "a"}, {"transform", ident16()}},
+            {{"id", "b"}, {"transform", ident16()}},
+            {{"id", "c"}, {"transform", ident16()}},
+        });
+        input["mates"] = json::array();
+        input["resolved_geometry"] = json::array();
+        // Diagnose the authored configuration without moving it or restarting.
+        input["max_iter"] = 0;
+        input["time_budget_ms"] = 0.0;
+        auto add_mate = [&](const std::string& id, const std::string& type,
+                            const std::string& a, const std::string& b) {
+            input["mates"].push_back({{"id", id}, {"type", type},
+                                     {"refs", {{{"component", a}}, {{"component", b}}}}});
+            for (int side = 0; side < 2; ++side)
+                input["resolved_geometry"].push_back(geom_entry(
+                    id, side, "plane", {0, 0, 0}, {0, 0, 1}, {0, 0, 1}, 0.0));
+        };
+        add_mate("lock_a", "lock", "frame", "a");
+        add_mate("lock_b", "lock", "frame", "b");
+        add_mate("rejected_bridge", "lock", "a", "b");
+        // A new component still adds six constraints after the rejected bridge.
+        add_mate("lock_c", "lock", "b", "c");
+        // Grow one group into a long grounded chain before rejecting another
+        // bridge. Its early locks must retain their chronological ownership.
+        constexpr int chain_length = 24;
+        std::string last = "c";
+        for (int i = 0; i < chain_length; ++i) {
+            const std::string next = "chain_" + std::to_string(i);
+            input["components"].push_back({
+                {"id", next}, {"transform", xform({3.0 * (i + 1), 0, 0}, {0, 0, 0})}});
+            add_mate("lock_" + next, "lock", last, next);
+            last = next;
+        }
+        add_mate("late_bridge", "lock", last, "a");
+        add_mate("offset", "distance", "frame", last);
+        input["mates"].back()["value"] = distance;
+
+        const json out = solve_mates_json(input);
+        CHECK(out["dof"].get<int>() == 0);
+        CHECK(out["over_defined"].get<bool>() == (distance != 0.0));
+        std::vector<std::string> expected = {"ok", "ok", "redundant", "ok"};
+        expected.insert(expected.end(), chain_length, "ok");
+        expected.push_back("redundant");
+        expected.push_back(distance == 0.0 ? "redundant" : "conflicting");
+        REQUIRE(out["mate_status"].size() == expected.size());
+        for (size_t i = 0; i < expected.size(); ++i) {
+            CAPTURE(i);
+            CHECK(out["mate_status"][i]["status"].get<std::string>() == expected[i]);
+        }
+    }
+}
+
 TEST_CASE("fixed-only mate diagnostics retain authored poses with zero DOF") {
     const auto authored = xform({3, 4, 5}, {0, 0, 0});
     json input;

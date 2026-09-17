@@ -1,9 +1,9 @@
 """Stripe Checkout, Customer Portal, and idempotent billing webhooks.
 
-The browser may select only a plan or named credit pack. Price ids, amounts,
-education eligibility, and entitlement dates are server-authoritative. Stripe
-webhook event ids are inserted in the same re-entrant PostgreSQL transaction as
-every resulting account or credit-ledger mutation.
+Subscription checkout remains active. Legacy credit-pack prices and webhook
+accounting are retained, but customer credit checkout is unavailable unless its
+explicit feature gate is enabled. Stripe price ids, amounts, education
+eligibility, and entitlement dates remain server-authoritative.
 """
 
 from __future__ import annotations
@@ -47,6 +47,7 @@ class BillingConfig:
     webhook_secret: str
     success_url: str
     cancel_url: str
+    credit_pack_checkout_enabled: bool
     desktop_price: str
     desktop_edu_price: str
     studio_price: str
@@ -64,6 +65,7 @@ def load_config(source: Any = None) -> BillingConfig:
         webhook_secret=source.stripe_webhook_secret.strip(),
         success_url=source.stripe_success_url.strip(),
         cancel_url=source.stripe_cancel_url.strip(),
+        credit_pack_checkout_enabled=bool(source.credit_pack_checkout_enabled),
         desktop_price=source.stripe_price_desktop.strip(),
         desktop_edu_price=source.stripe_price_desktop_edu.strip(),
         studio_price=source.stripe_price_studio.strip(),
@@ -620,6 +622,11 @@ async def create_credit_checkout(
     body: CreditCheckoutRequest, request: Request
 ) -> dict[str, str]:
     cfg = load_config()
+    if not cfg.credit_pack_checkout_enabled:
+        raise HTTPException(
+            503,
+            "credit pack purchases are not available; connect your own AI provider",
+        )
     _require_configured(cfg)
     user = get_current_user(request)
     pack = (body.pack or "").strip().lower()

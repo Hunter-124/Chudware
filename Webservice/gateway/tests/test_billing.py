@@ -301,21 +301,22 @@ class TestCheckout:
             assert response.status_code == 400
         assert "checkouts" not in captured
 
-    def test_credit_pack_checkout_is_one_time_and_server_priced(
+    def test_credit_pack_checkout_refuses_when_legacy_prices_are_configured(
         self, client, stripe_config, monkeypatch
     ):
         captured = {}
+        monkeypatch.setattr(settings, "credit_pack_checkout_enabled", False)
         _install_fake_stripe(monkeypatch, captured)
         response = client.post(
             "/api/billing/credits/checkout",
             json={"pack": "starter", "amount": 1, "price": "price_evil"},
             headers=DEV_HEADERS,
         )
-        assert response.status_code == 200
-        sent = captured["checkouts"][0]
-        assert sent["mode"] == "payment"
-        assert sent["line_items"] == [{"price": "price_credits_starter", "quantity": 1}]
-        assert sent["metadata"]["chudware_pack"] == "starter"
+        assert response.status_code == 503
+        assert response.json()["detail"] == (
+            "credit pack purchases are not available; connect your own AI provider"
+        )
+        assert "checkouts" not in captured
 
     def test_existing_customer_reused(self, client, store, stripe_config, monkeypatch):
         captured = {}

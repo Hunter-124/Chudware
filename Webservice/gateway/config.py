@@ -281,6 +281,12 @@ class Settings:
     # Unset is a supported deployment state. Once any subscription billing
     # credential is present, __post_init__ requires the complete set so the
     # gateway cannot take payment without being able to resolve its webhook.
+    # Credit-pack checkout is unfinished and therefore opt-in independently of
+    # subscription billing. Legacy price ids stay configured so delayed
+    # webhooks and historic admin reporting can still recognize old sessions.
+    credit_pack_checkout_enabled: bool = field(
+        default_factory=lambda: _env_bool("CHUDWARE_CREDIT_PACK_CHECKOUT_ENABLED", False)
+    )
     stripe_secret_key: str = field(
         default_factory=lambda: _env("CHUDWARE_WEB_STRIPE_SECRET_KEY", "") or ""
     )

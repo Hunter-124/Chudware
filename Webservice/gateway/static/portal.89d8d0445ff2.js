@@ -241,10 +241,6 @@
     window.location.assign(result.url);
   }
 
-  async function buyCredits(pack) {
-    var result = await api("/api/billing/credits/checkout", { method: "POST", body: JSON.stringify({ pack: pack }) });
-    window.location.assign(result.url);
-  }
 
   async function loadBilling() {
     if (state.loaded.billing) return;
@@ -258,13 +254,7 @@
       unavailable.appendChild(cell);
       table.appendChild(unavailable);
       el("billing-portal").disabled = true;
-      qa(".plan-action,.pack-action").forEach(function (button) {
-        button.disabled = true;
-        // A disabled control has to say why. The plan buttons are covered by
-        // the note beside "Manage payment details"; the credit packs sit in
-        // their own section, so they carry the reason as their label.
-        if (button.classList.contains("pack-action")) button.textContent = "Payments not set up";
-      });
+      qa(".plan-action").forEach(function (button) { button.disabled = true; });
       note.textContent = "Payments are not set up on this deployment yet — contact support to change your plan.";
       state.loaded.billing = true;
       return;
@@ -1755,7 +1745,6 @@
   el("signout-all").addEventListener("click", async function () { if (!window.confirm("Sign out every session, including this browser?")) return; try { await api("/api/portal/signout-everywhere", { method: "POST" }); window.location.assign("/"); } catch (error) { showMessage(error.message, true); } });
   el("billing-portal").addEventListener("click", function () { openBillingPortal().catch(function (error) { showMessage(error.message, true); }); });
   qa(".plan-action").forEach(function (button) { button.addEventListener("click", function () { choosePlan(button.dataset.plan).catch(function (error) { showMessage(error.message, true); }); }); });
-  qa(".pack-action").forEach(function (button) { button.addEventListener("click", function () { buyCredits(button.dataset.pack).catch(function (error) { showMessage(error.message, true); }); }); });
   el("byok-form").addEventListener("submit", async function (event) {
     event.preventDefault();
     var status = el("byok-status");

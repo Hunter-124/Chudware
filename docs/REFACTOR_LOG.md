@@ -4631,3 +4631,20 @@ funding requirements, or domain enrollment criteria are changed. `test_orgs.py`
 covers external-owner selection/write, outsider and platform-admin isolation,
 invited external-member reads, and revocation. The targeted organization,
 tenant-isolation and bucket delivery suites pass 104 tests.
+
+## 2026-09-17 — bring-your-own-provider website billing
+
+The account portal no longer offers AI credit packs or routes marketplace errors
+to a top-up flow. Billing links to the existing AI setup for customer-owned
+provider subscriptions and API keys. `CHUDWARE_CREDIT_PACK_CHECKOUT_ENABLED`
+defaults off and refuses credit checkout before contacting Stripe, even when old
+pack price IDs remain configured. Subscription billing, existing grants,
+historical accounting, and delayed payment webhooks are unchanged. Removed stale
+hard-coded portal subscription prices; checkout remains authoritative. Provider
+cards fill the available width and the existing-grant card stays hidden until the
+account response permits it. Rehashed the changed portal and marketplace assets.
+Verification: 33 billing/portal tests passed, followed by the final asset-delivery
+test after rehashing; browser smoke with isolated account/API fixtures exercised
+Billing → AI setup, the visible API-key form, hidden grant card, and absence of
+purchase controls. Production rollout requires a gateway restart and leaving the
+new checkout switch unset or off; no provider credentials or runtime changed.

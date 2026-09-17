@@ -1339,8 +1339,7 @@ td:first-child {
 
 /* ---------- view: plans & billing ---------- */
 
-.plans .card,
-.packs .card {
+.plans .card {
   display: flex;
   flex-direction: column;
 }
@@ -1408,31 +1407,12 @@ td:first-child {
   margin-top: auto;
 }
 
-.packs strong {
-  margin: 14px 0 0;
-  font-size: 1.2rem;
-}
-
-.packs button {
-  margin-top: auto;
-}
 
 .invoice-link {
   color: var(--teal);
   text-decoration: none;
 }
 
-@media(max-width:1050px) {
-  .packs {
-    grid-template-columns: repeat(3, minmax(0, 1fr))!important;
-  }
-}
-
-@media(max-width:780px) {
-  .packs {
-    grid-template-columns: 1fr!important;
-  }
-}
 
 /* ---------- view: usage & credits ---------- */
 
@@ -1552,6 +1532,10 @@ td:first-child {
 }
 
 /* ---------- view: ai setup ---------- */
+
+.setup-options {
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 18rem), 1fr));
+}
 
 .setup-options .card {
   min-height: 300px;

@@ -459,7 +459,7 @@
       if (data.kind === "credits") { item.owned = true; item.can = item.can || {}; item.can.download = true; browse.items.forEach(function (card) { if (card.id === item.id) card.owned = true; }); one("#mk-buy-actions").innerHTML = buyActionsHtml(item); message.textContent = "Purchased. Your new balance is " + credits(data.balance_after) + "."; showNotice("Model added to your library.", false); }
     } catch (e) {
       message.dataset.error = "true";
-      if (e.code === "insufficient_credits") message.innerHTML = 'Not enough credits. <a href="/portal#billing">Top up credits</a> and try again.';
+      if (e.code === "insufficient_credits") message.textContent = "Not enough credits for this purchase. Credit top-ups are not available.";
       else if (e.code === "connect_incomplete") message.textContent = "This seller cannot accept cash yet. Try credits if they are offered.";
       else if (e.code === "already_owned") { item.owned = true; item.can = item.can || {}; item.can.download = true; one("#mk-buy-actions").innerHTML = buyActionsHtml(item); message.dataset.error = "false"; message.textContent = "You already own this model. Download is ready."; }
       else if (e.status === 401) message.innerHTML = '<a href="/login">Sign in</a> to buy this model.';

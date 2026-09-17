@@ -1,0 +1,141 @@
+---
+/** Compact progressive brand illustration for the About page. */
+---
+
+<figure class="tess-mark" data-tess>
+  <div class="tess-mark-stage">
+    <img
+      class="tess-mark-fallback"
+      data-tess-fallback
+      src="/assets/logo.svg"
+      width="320"
+      height="320"
+      alt="The Chudware tesseract brand mark"
+    />
+    <canvas class="tess-mark-canvas" data-tess-canvas aria-hidden="true" hidden></canvas>
+  </div>
+</figure>
+
+<style>
+  @layer reset, tokens, base, components, pages, responsive, motion;
+
+  @layer components {
+    .tess-mark {
+      display: grid;
+      gap: var(--s3);
+      margin: 0;
+    }
+
+    .tess-mark-stage {
+      position: relative;
+      aspect-ratio: 4 / 3;
+      overflow: hidden;
+      border: var(--border) solid var(--line);
+      border-radius: var(--radius);
+      background:
+        radial-gradient(circle at 50% 48%, var(--technical-wash), transparent 58%),
+        var(--bg-deep);
+      contain: strict;
+    }
+
+    .tess-mark-fallback,
+    .tess-mark-canvas {
+      position: absolute;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+    }
+
+    .tess-mark-fallback {
+      box-sizing: border-box;
+      object-fit: contain;
+      padding: clamp(var(--s5), 12%, var(--s8));
+      filter: drop-shadow(0 0 2rem var(--technical-wash));
+    }
+
+    .tess-mark-canvas {
+      display: block;
+      opacity: 0;
+      transition: opacity .45s var(--ease);
+    }
+
+    .tess-mark-canvas[data-ready] { opacity: 1; }
+    .tess-mark-fallback[hidden] { display: none; }
+
+  }
+
+  @layer motion {
+    @media (prefers-reduced-motion: reduce) {
+      .tess-mark-canvas { transition: none; }
+    }
+  }
+</style>
+
+<script>
+  import { createTesseract, type TesseractHandle } from '../scripts/tesseract';
+
+  for (const root of document.querySelectorAll<HTMLElement>('[data-tess]')) {
+    const canvas = root.querySelector<HTMLCanvasElement>('[data-tess-canvas]');
+    const fallback = root.querySelector<HTMLElement>('[data-tess-fallback]');
+    if (!canvas) continue;
+
+    const still = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+    let mark: TesseractHandle | null = null;
+    let retry = 0;
+    let attempts = 0;
+
+    const showFallback = () => {
+      delete canvas.dataset.ready;
+      canvas.hidden = true;
+      fallback?.removeAttribute('hidden');
+    };
+
+    const teardown = () => {
+      window.clearTimeout(retry);
+      mark?.destroy();
+      mark = null;
+      showFallback();
+    };
+
+    const boot = () => {
+      if (mark) return;
+      canvas.hidden = false;
+      try {
+        mark = createTesseract(canvas, {
+          still,
+          onLost() {
+            mark = null;
+            showFallback();
+          },
+        });
+      } catch {
+        mark = null;
+      }
+
+      if (mark) {
+        attempts = 0;
+        canvas.dataset.ready = '';
+        fallback?.setAttribute('hidden', '');
+      } else if (++attempts < 4) {
+        showFallback();
+        retry = window.setTimeout(boot, 400);
+      } else {
+        showFallback();
+      }
+    };
+
+    canvas.addEventListener('webglcontextrestored', () => {
+      attempts = 0;
+      boot();
+    });
+
+    if ('IntersectionObserver' in window) {
+      new IntersectionObserver((entries) => {
+        if (entries[entries.length - 1]?.isIntersecting) boot();
+        else teardown();
+      }).observe(root);
+    } else {
+      showFallback();
+    }
+  }
+</script>

@@ -2,15 +2,15 @@
 import BaseLayout from '../layouts/BaseLayout.astro';
 ---
 <BaseLayout
-  title="Engineering CAD from design through production"
-  description="Chudware is built for engineers: parametric modeling, assemblies, simulation, CAM, electronics, PLM, and AI-assisted workflows in one browser or desktop workspace."
+  title="AI-first CAD for engineers"
+  description="AI-first CAD for engineers. Describe an intended change, let an agent work in the open model, then review editable features and measurements alongside the rest of your engineering work."
 >
   <header class="home-hero">
     <div class="wrap home-hero-grid">
       <div class="home-hero-copy">
-        <p class="eyebrow">Engineering CAD · Browser and desktop</p>
-        <h1>Chudware is built for engineers.</h1>
-        <p class="lede">Model parts, assemble systems, run simulation, prepare toolpaths, develop electronics, manage product data, and use AI tools in one workspace.</p>
+        <p class="eyebrow">Engineering workspace · Browser and desktop</p>
+        <h1>AI-first CAD for engineers.</h1>
+        <p class="lede">Describe the change you intend. An agent works in the open model, then you review editable features and measurements before saving a revision.</p>
         <div class="actions">
           <a class="button" href="/gallery/">See product work</a>
           <a class="button button-secondary" href="/product/">Explore the product</a>
@@ -18,17 +18,33 @@ import BaseLayout from '../layouts/BaseLayout.astro';
         <ul class="home-hero-facts" aria-label="Product fundamentals">
           <li>Exact B-rep solids</li>
           <li>Editable feature history</li>
-          <li>STEP, IGES, BREP, and mesh exchange</li>
+          <li>Measurements for engineering review</li>
         </ul>
       </div>
       <figure class="home-hero-media">
         <a href="/gallery/#modeling" aria-label="View the modeling workspace in the gallery">
           <img src="/images/modeling.png" width="1600" height="900" alt="Chudware modeling workspace showing a parametric enclosure and its editable feature tree" fetchpriority="high" />
         </a>
-        <figcaption><span>Modeling workspace</span><a href="/gallery/#modeling">View full image</a></figcaption>
+        <figcaption><span>Modeling example</span><a href="/gallery/#modeling">Request and result</a></figcaption>
       </figure>
     </div>
   </header>
+
+  <section class="section home-ai" aria-labelledby="ai-title">
+    <div class="wrap split">
+      <header class="section-heading">
+        <p class="eyebrow">AI in the engineering loop</p>
+        <h2 id="ai-title">Describe the intent. Review the result.</h2>
+        <p class="lede">Brief the intended change and constraints. The copilot uses normal modeling tools in the open document, and its sketches and features stay editable in the same feature tree.</p>
+        <div class="actions"><a class="button button-secondary" href="/docs/ai-copilot/">Read the AI copilot guide</a></div>
+      </header>
+      <ol class="home-ai-steps" aria-label="AI copilot workflow">
+        <li><span>1</span><div><strong>Connect</strong><p>Connect a supported provider account or add an API key issued by the provider.</p></div></li>
+        <li><span>2</span><div><strong>Describe</strong><p>Name the intended change, critical dimensions, and what must not change.</p></div></li>
+        <li><span>3</span><div><strong>Review</strong><p>Inspect editable features and check critical measurements before saving a revision.</p></div></li>
+      </ol>
+    </div>
+  </section>
 
   <section class="section home-capabilities" aria-labelledby="capabilities-title">
     <div class="wrap">
@@ -71,21 +87,6 @@ import BaseLayout from '../layouts/BaseLayout.astro';
     </div>
   </section>
 
-  <section class="section home-ai" aria-labelledby="ai-title">
-    <div class="wrap split">
-      <header class="section-heading">
-        <p class="eyebrow">AI in the engineering loop</p>
-        <h2 id="ai-title">Use your own AI provider account.</h2>
-        <p class="lede">Connect a supported provider, give the copilot the open design as context, and review normal sketches, features, measurements, and files after it works.</p>
-        <div class="actions"><a class="button button-secondary" href="/docs/ai-copilot/">Read the AI copilot guide</a></div>
-      </header>
-      <ol class="home-ai-steps" aria-label="AI copilot workflow">
-        <li><span>1</span><div><strong>Connect</strong><p>Use your provider key or provider account.</p></div></li>
-        <li><span>2</span><div><strong>Describe</strong><p>State the engineering outcome and constraints.</p></div></li>
-        <li><span>3</span><div><strong>Inspect</strong><p>Review the resulting model, analysis, or project artifact.</p></div></li>
-      </ol>
-    </div>
-  </section>
 
   <section class="section cta-band">
     <div class="wrap section-heading">

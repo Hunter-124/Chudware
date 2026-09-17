@@ -48,6 +48,7 @@ function mount(root: HTMLElement) {
   const create = FACTORIES[root.dataset.show ?? ''];
   const canvas = root.querySelector<HTMLCanvasElement>('[data-show-canvas]');
   const panel = root.querySelector<HTMLElement>('[data-show-panel]');
+  const caption = root.querySelector<HTMLElement>('[data-show-caption]');
   const status = root.querySelector<HTMLElement>('[data-show-status]');
   const rows = Array.from(root.querySelectorAll<HTMLElement>('[data-show-row]'));
   if (!create || !canvas || !panel) return;
@@ -66,6 +67,7 @@ function mount(root: HTMLElement) {
     // The panel duplicates the instrument already visible inside the
     // screenshot, so it belongs to the live render only.
     panel.hidden = true;
+    if (caption) caption.hidden = true;
   };
 
   const teardown = () => {
@@ -78,28 +80,36 @@ function mount(root: HTMLElement) {
   const boot = () => {
     if (stage) return;
     canvas.hidden = false;
-    stage = create(canvas, {
-      still,
-      onLost() {
-        stage = null;
-        showShot();
-      },
-      onProgress(index, active) {
-        for (let i = 0; i < rows.length; i++) {
-          rows[i].dataset.state = !active || i < index ? 'done' : i === index ? 'building' : 'pending';
-        }
-        if (status) {
-          status.textContent = active
-            ? `${activeVerb} ${rows[index]?.dataset.showLabel ?? ''}`
-            : doneText;
-        }
-      },
-    });
+    try {
+      stage = create(canvas, {
+        still,
+        onLost() {
+          stage = null;
+          showShot();
+        },
+        onProgress(index, active) {
+          for (let i = 0; i < rows.length; i++) {
+            rows[i].dataset.state = !active || i < index ? 'done' : i === index ? 'building' : 'pending';
+          }
+          if (status) {
+            status.textContent = active
+              ? `${activeVerb} ${rows[index]?.dataset.showLabel ?? ''}`
+              : doneText;
+          }
+        },
+      });
+    } catch {
+      // Shader compilation, driver startup, and renderer construction are all
+      // optional enhancement paths. The authentic product capture remains the
+      // visible source of truth if any of them fails.
+      stage = null;
+    }
 
     if (stage) {
       attempts = 0;
       canvas.dataset.ready = '';
       panel.hidden = false;
+      if (caption) caption.hidden = false;
     } else if (++attempts < 4) {
       showShot();
       retry = window.setTimeout(boot, 400);
@@ -115,13 +125,17 @@ function mount(root: HTMLElement) {
 
   // Observe the framed box rather than the canvas: the canvas is hidden while
   // the render is down and a hidden element never intersects anything again.
-  new IntersectionObserver(
-    (entries) => {
-      if (entries[entries.length - 1]?.isIntersecting) boot();
-      else teardown();
-    },
-    { rootMargin: '100% 0px' },
-  ).observe(root);
+  if ('IntersectionObserver' in window) {
+    new IntersectionObserver(
+      (entries) => {
+        if (entries[entries.length - 1]?.isIntersecting) boot();
+        else teardown();
+      },
+      { rootMargin: '100% 0px' },
+    ).observe(root);
+  } else {
+    showShot();
+  }
 }
 
 for (const root of document.querySelectorAll<HTMLElement>('[data-show]')) mount(root);

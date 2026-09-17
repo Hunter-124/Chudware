@@ -4675,3 +4675,25 @@ real account-generated Linux command were exercised. No private session
 history, provider credential, or scratch capture profile was published.
 Portal commit `1745f2afa` was deployed separately; the live authenticated credit
 checkout probe returned 503, with no purchase attempt, and gateway health passed.
+
+## 2026-09-17 — AI-first positioning and progressive visuals
+
+The homepage now leads with AI-first CAD for engineers and the describe, edit,
+review workflow. About is available in both navigation variants. The tesseract
+renderer returns as a bounded About-page illustration rather than a full-screen
+hero; its static SVG remains available without JavaScript or WebGL. Modeling
+and CAM keep their product captures when enhancement is unavailable, including
+renderer initialization exceptions. Illustration labels appear only alongside
+the active illustrations. Visitor-facing implementation commentary was removed
+from captions and introductory copy; gallery scenario disclosures remain.
+
+Verification: the 38-page build and three-image provenance check passed.
+The link audit resolved 1,882 internal links, assets, and anchors without errors.
+All 37 routed pages passed desktop/mobile overflow, primary-heading, About-nav,
+and JavaScript-error checks. About, modeling, and CAM retained their static
+visuals with JavaScript disabled, script requests blocked, WebGL unavailable,
+and WebGL initialization throwing. Tesseract context-loss recovery, offscreen
+teardown/remount, and pixel-stable reduced motion were exercised in Chromium.
+The original website deployment succeeded; its live download catalog returned
+0.1.1 on Windows, Linux, and macOS. The personal LinkedIn link remains pending
+an exact URL from the owner; no profile URL or personal tagline was invented.
